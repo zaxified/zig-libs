@@ -57,8 +57,19 @@ deliberate trust decision, not an oversight — see "Threat model" for what
 trusting an unauthenticated hint costs). Without a usable hint, `hi` simply
 drops to the probed size, and bisection proceeds as usual. The loop
 terminates because `mid = lo + (hi-lo)/2` is always strictly inside
-`(lo, hi)` once `hi - lo >= 2`, so every iteration shrinks the interval;
-termination is therefore structural, not merely typical.
+`(lo, hi)` once `hi - lo >= 2`, so every iteration shrinks the interval —
+**given `searchWith`'s own `ceiling > floor` precondition holds**, which it
+now checks itself (`error.CeilingTooLow` otherwise — see "Limits and
+refusals"). That check used to be a bare `std.debug.assert`, and an audit
+(2026-08-18) found the gap that left: `assert` compiles out entirely in
+ReleaseFast/ReleaseSmall, so a caller of this `pub` function — which this
+doc comment itself invites, for substituting a transport — violating the
+precondition in that lane didn't panic, it underflowed `hi - lo` on
+unsigned `u16` arithmetic and looped from a huge wrapped starting value
+until killed (confirmed: 15+ seconds, see CHANGELOG.md). Termination is
+structural now for every call that returns a `Result` at all; a call that
+would have violated the precondition gets a checked error instead of a
+hang, in every build mode alike.
 
 **The black-hole signal.** Two booleans accumulate across the whole search:
 `saw_frag_needed` (set by any `.frag_needed` outcome, from *any* candidate
@@ -101,16 +112,95 @@ Too Big carrying a forged MTU hint is trusted the same way a genuine one is
 attacker's spoof responds to (a hint outside `(lo, size)` is discarded), so
 a forgery can steer the reported MTU down within that range, or clear
 `blackhole` by supplying `saw_frag_needed`, but cannot claim a size larger
-than what has already failed. This is a path-measurement tool, not a
-security boundary, matching `traceroute`'s own stated posture. Malformed/
-hostile ICMP bytes never panic — `classify` reads fixed offsets only after
-`icmp.echo.parseV4`/`parseV6`'s own bounds-checked parse has already
-validated the message
-shape, and additionally guards its own 8-byte minimum before reading the
-MTU-hint offsets; see the fuzz test. Out of scope: non-Linux platforms,
-continuous/background monitoring, UDP/TCP-based PMTU probing methods
-(this module is ICMP/DF-bit only, per RFC 1191/8201), automatic
-egress-interface resolution.
+than what has already failed.
+
+**That is the weaker of the two directions, and an audit (2026-08-18) found
+this document only ever named that one.** The stronger direction: a
+forged, matching *echo reply* (not a Frag-Needed/Packet-Too-Big) triggers
+`applyOutcome`'s `.ok` arm, which sets `lo.* = size` **unconditionally** —
+`classify` accepts it on ident+seq match alone, no payload check, no
+binding to anything about the specific probe beyond those two fields. A
+single forged echo reply matching ident+seq for the very first (ceiling
+-size) probe converges the *entire* search immediately to
+`mtu = ceiling, blackhole = false` — a **falsely large** reported MTU. This
+is the more dangerous direction, not merely the missing half of a
+symmetric weakness: `blackhole = false` and a big number is exactly the
+"everything's fine" signal a caller trusts and stops investigating on — the
+one shape this module exists to independently confirm before a caller
+believes it, and the one direction the spoofed-hint case above structurally
+*cannot* produce (a hint can only push the answer down, or clear
+`blackhole`, never claim a size larger than something that already failed).
+This is not a new hole — `probe`'s live path was already, and remains,
+completely unauthenticated end to end, same as `traceroute` states for
+itself — it is a direction of the *same* hole this document previously did
+not name.
+
+*What stands between an attacker and a successful forgery, and for whom.*
+Two ICMP fields gate acceptance: `ident` (whatever the sibling `icmp`
+module's `Socket.open` assigned — RAW sockets: the process's own PID
+`& 0xffff`, a handful of guesses on a freshly started process, often
+single digits in a container; DGRAM sockets: a kernel-assigned ephemeral
+port, ~28000 possible values on this host's default range) and `seq`
+(entirely this module's own choice). Neither is a secret from an **on-path**
+attacker — one who can observe this session's real ICMP traffic (a
+compromised router on the path, a monitoring tap) sees every real ident,
+seq, and payload byte the moment a probe leaves the wire, and needs to
+guess nothing. No value this module could randomize, pad, or nonce inside
+its own probe packets changes that; this module's posture toward an
+on-path attacker is, and stays, exactly `traceroute`'s own stated one —
+**not a security boundary** — and no code change below alters that
+sentence's truth.
+
+Against a **blind off-path** attacker — one spoofing source addresses
+without seeing this session's real traffic, who must therefore *guess*
+ident+seq — the picture is different, and was worse than documented before
+this audit: `seq` started at the fixed value 1 and incremented by exactly 1
+per attempt, so a blind attacker needed only to guess `ident` once and then
+spray roughly the first ~15–20 sequential `seq` values to land a forged
+reply on every probe the search would ever issue, for either address family
+or socket kind. `probe` now seeds `seq` from a per-call `getrandom(2)` draw
+(`randomStartSeq`, Linux-only direct syscall, matching the posture `ssh`/
+`bulletproofs` already use elsewhere in this repo for the same reason —
+CONVENTIONS.md §2.2's named deliberate exceptions to threading `std.Io`
+through for a random draw) rather than the fixed value 1. A blind attacker
+now has to guess a full unknown 16-bit `seq` in addition to `ident`, raising
+the cost of a successful blind forgery by roughly `2^16`. This is a real,
+honestly-scoped improvement and nothing more: 16 bits is not a
+cryptographic margin, `ident` for a RAW-socket session is still PID-shaped
+and not randomized by this module (that value belongs to the sibling `icmp`
+module, outside this module's own surface), and a sufficiently
+high-volume, sufficiently patient blind spoofer is not ruled out — only
+made materially more expensive. It does **nothing at all** for an attacker
+who is not blind, per the paragraph above.
+
+Two further candidates were considered and deliberately **not** implemented:
+- **Randomizing `ident` from within `pathmtu`.** Not this module's value to
+  change — it is assigned by the sibling `icmp` module's `Socket.open` (PID
+  for RAW, kernel ephemeral port for DGRAM) and this module does not touch
+  `icmp`'s internals. Would need `icmp` module changes, out of this
+  module's scope.
+- **A per-probe nonce woven into the echo payload, checked on receipt.**
+  Technically reachable entirely within `classify` (which already sees the
+  raw ICMP bytes past the echo header) without touching `icmp`. Not added:
+  its only genuine benefit over the `seq` randomization above is a larger
+  guess space against the *same* attacker class (blind off-path) — it adds
+  no protection against an on-path attacker either, for the same reason
+  `seq`/`ident` don't (the payload is just as visible on the wire as the
+  header). Given the marginal benefit is "harder to blind-guess by more
+  bits," not "stops a new attacker," it did not clear the bar for the added
+  complexity (payload construction, `classify` signature, per-attempt nonce
+  bookkeeping) — an honest "raises the bar further against the same limited
+  attacker" is not the same claim as "closes the gap," and this document
+  does not want to imply the latter for a module whose live path is, and
+  states itself to be, unauthenticated.
+
+Malformed/hostile ICMP bytes never panic — `classify` reads fixed offsets
+only after `icmp.echo.parseV4`/`parseV6`'s own bounds-checked parse has
+already validated the message shape, and additionally guards its own
+8-byte minimum before reading the MTU-hint offsets; see the fuzz test. Out
+of scope: non-Linux platforms, continuous/background monitoring, UDP/TCP-
+based PMTU probing methods (this module is ICMP/DF-bit only, per RFC
+1191/8201), automatic egress-interface resolution.
 
 ## Limits and refusals
 
@@ -122,11 +212,51 @@ egress-interface resolution.
 - **Starting ceiling** (`default_ceiling_mtu = 1500`, `Options.ceiling_mtu`,
   or `Options.iface`'s `SIOCGIFMTU` reading, in that priority) —
   `error.CeilingTooLow` if the resolved ceiling is at or below the floor;
-  refused rather than silently returning a fabricated `Result`.
+  refused rather than silently returning a fabricated `Result`. `searchWith`
+  itself now enforces the equivalent `ceiling > floor` precondition (see
+  "The search invariant" above) as a checked error, not only `probe()`.
 - **`max_probe_mtu = 9000`** — the fixed stack buffer `LiveProber` builds
-  echo requests in (covers common jumbo-frame ceilings); also clamps a
-  larger `Options.iface`-derived ceiling down. No allocator is used anywhere
-  in this module.
+  echo requests in (covers common jumbo-frame ceilings; zero-filled once at
+  construction, not `undefined` — see below), and the hard cap `probe()`
+  enforces on any ceiling it will ever search up to. An `Options.iface`-
+  derived ceiling above this is **clamped** down silently (an
+  auto-*derived* value, not a stated caller expectation); an explicit
+  `Options.ceiling_mtu` above this is **refused** (`error.CeilingTooHigh`),
+  not clamped — a caller who names a ceiling this module can never probe is
+  stating an expectation the module cannot meet, and answering with a
+  `Result` bounded by a smaller, unrequested ceiling would silently answer
+  a different question than the one asked, the same failure shape
+  `CeilingTooLow` above already refuses rather than commits. No allocator
+  is used anywhere in this module.
+
+  An audit (2026-08-18) found that `Options.ceiling_mtu` previously flowed
+  into `LiveProber` completely unchecked: `probe()` clamped only the
+  `iface`-derived ceiling (`@min(m, max_probe_mtu)`), so a caller-supplied
+  `ceiling_mtu` above 9000 reached `LiveProber.attempt`'s
+  `payload_len = wire_size - ip_header_len` slice into the fixed
+  `[max_probe_mtu]u8` buffer unclamped. In Debug/ReleaseSafe this panicked
+  (`index out of bounds`); in **ReleaseFast, Zig's own slice-bounds check
+  compiles out along with every other runtime safety check** — `attempt`
+  read past the end of the buffer, handed the over-length slice to
+  `sendTo`/`sendto(2)`, and the kernel put whatever was on the stack past
+  that 9000 bytes onto the wire as ICMP echo payload: a stack-memory
+  disclosure to the probed destination, returning a fabricated
+  `Result{ .mtu = <the bogus ceiling>, .blackhole = false }` rather than an
+  error (confirmed: `mtu=20000 blackhole=false` for `ceiling_mtu = 20000`,
+  followed by a SIGSEGV on return from the corrupted stack frame). Fixed by
+  refusing (`error.CeilingTooHigh`) before any of it is built, so the
+  buffer invariant holds for every caller by construction, not only a
+  polite one; `LiveProber.attempt` also carries a defense-in-depth
+  `@panic`-based check on the same condition (deliberately not another
+  `std.debug.assert` — the same reasoning as above: an `assert` here would
+  repeat the exact failure mode that let this bug through ReleaseFast in
+  the first place). Separately, `LiveProber.buf` is now zero-filled at
+  construction rather than `undefined`: `echo.writeEchoRequest` only
+  writes the 8-byte echo header, and payload bytes beyond it were
+  previously whatever the stack last held — leaking uninitialized stack
+  content as ICMP payload on every probe, not only the out-of-bounds one
+  above (smaller blast radius, same root cause; found while fixing the
+  headline defect).
 
 ## Anchoring
 

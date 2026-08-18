@@ -295,6 +295,17 @@ pub const SearchError = error{
     /// The floor MTU (68 v4 / 1280 v6) itself never got a reply -- this
     /// isn't a PMTU question, the destination is unreachable outright.
     Unreachable,
+    /// `ceiling` was at or below `floor` -- nothing to search. `searchWith`
+    /// is `pub` and its own doc comment recommends it directly to a
+    /// consumer substituting their own transport, so this precondition is
+    /// enforced here as a checked error rather than relying on `probe()`'s
+    /// own `CeilingTooLow` guard (see "probe: live path" below) -- a caller
+    /// reaching `searchWith` directly gets none of that guard's protection.
+    /// Previously a bare `std.debug.assert`: compiled out entirely in
+    /// ReleaseFast/ReleaseSmall, so a violated precondition made `hi - lo`
+    /// underflow on unsigned `u16` arithmetic in the loop below and hang
+    /// rather than panic (found by audit, 2026-08-18; see CHANGELOG.md).
+    CeilingTooLow,
 };
 
 /// One probe outcome's effect on the search state: narrows `(lo, hi)`
@@ -337,7 +348,7 @@ fn applyOutcome(size: u16, outcome: ProbeOutcome, lo: *u16, hi: *u16, saw_frag_n
 /// supplies a real ICMP-backed `Prober`; this function is what the offline
 /// `FakeProber` tests exercise directly.
 pub fn searchWith(prober: Prober, floor: u16, ceiling: u16, iface_mtu: ?u32) SearchError!Result {
-    std.debug.assert(ceiling > floor);
+    if (ceiling <= floor) return error.CeilingTooLow;
 
     if (prober.probe(floor) != .ok) return error.Unreachable;
 
@@ -436,6 +447,17 @@ pub const ProbeError = error{
     /// `Options.ceiling_mtu` (or the interface MTU it fell back to) was at
     /// or below the protocol floor -- nothing to search.
     CeilingTooLow,
+    /// `Options.ceiling_mtu` was set above `max_probe_mtu` (9000) --
+    /// refused, not silently capped. A caller who names a ceiling this
+    /// module can never probe is stating an expectation the module cannot
+    /// meet; answering with a `Result` bounded by a smaller, unrequested
+    /// ceiling would quietly answer a different question than the one
+    /// asked, the same failure shape `CeilingTooLow` above already refuses
+    /// rather than commits. `Options.iface`'s auto-*derived* ceiling is
+    /// unaffected by this error and still clamps silently -- see
+    /// SPEC.md "Limits and refusals" for why the two cases are handled
+    /// differently.
+    CeilingTooHigh,
     Unexpected,
 };
 
@@ -455,7 +477,17 @@ const LiveProber = struct {
     retries: u8,
     timeout_ms: u32,
     seq: u16 = 1,
-    buf: [max_probe_mtu]u8 = undefined,
+    // Zero-filled, not `undefined`: `writeEchoRequest` only touches the
+    // 8-byte echo header (see its own doc comment -- "payload bytes beyond
+    // the header are expected to be pre-filled ... by the caller"), and a
+    // probe wire size larger than the header leaves the rest of this
+    // buffer as whatever was last in it. `undefined` on a stack field means
+    // that remainder is stale stack content, echoed onto the wire as ICMP
+    // payload on every single probe, not only the out-of-bounds case fixed
+    // alongside this (found while fixing that; same root cause, smaller
+    // blast radius -- in-bounds, but still someone else's stack bytes on
+    // the wire).
+    buf: [max_probe_mtu]u8 = @splat(0),
 
     fn prober(self: *LiveProber) Prober {
         return .{ .ctx = self, .probeFn = probeFn };
@@ -467,6 +499,21 @@ const LiveProber = struct {
     }
 
     fn attempt(self: *LiveProber, wire_size: u16) ProbeOutcome {
+        // Defense in depth for the exact invariant an audit found broken
+        // (2026-08-18; see CHANGELOG.md): `probe()` refuses any
+        // `ceiling_mtu` above `max_probe_mtu` before this prober is ever
+        // built (`ProbeError.CeilingTooHigh`), and `searchWith` never
+        // probes a size above its own `ceiling` argument, so this can
+        // never trip in practice. Deliberately **not** a
+        // `std.debug.assert` -- that check, and Zig's own slice-bounds
+        // check on `self.buf[0..payload_len]` below, both compile out
+        // entirely in ReleaseFast/ReleaseSmall, which is exactly how the
+        // original bug read past the end of this buffer and handed the
+        // over-length slice to `sendTo`. `@panic` does not compile out in
+        // any mode.
+        if (wire_size < self.ip_header_len or wire_size - self.ip_header_len > self.buf.len)
+            @panic("pathmtu: LiveProber.attempt: wire_size exceeds probe buffer capacity");
+
         const payload_len = wire_size - self.ip_header_len;
         const efamily: echo.Family = switch (self.family) {
             .v4 => .v4,
@@ -509,6 +556,31 @@ const LiveProber = struct {
     }
 };
 
+/// Best-effort per-session starting `seq`, drawn from `getrandom(2)` rather
+/// than the previous fixed value 1 -- raises the bar against a *blind*
+/// off-path spoofer, who must now guess a full 16-bit unknown instead of
+/// spraying the first ~20 sequential values; does nothing against an
+/// on-path attacker, who reads the real value off the wire. See SPEC.md
+/// "Threat model" for the full reasoning and honest scope. Linux-only
+/// direct syscall, matching the `getrandom`-direct, panic-avoided-here
+/// posture `ssh`/`bulletproofs` use elsewhere in this repo
+/// (CONVENTIONS.md §2.2) -- except this value is not a secret (it only
+/// needs to be hard to *blindly guess*, never to stay confidential), so
+/// unlike a key draw, a syscall failure falls back to the old fixed value
+/// rather than aborting the process: that only returns this session to the
+/// pre-existing, already-documented baseline exposure, never to something
+/// worse or silently misrepresented as safe.
+fn randomStartSeq() u16 {
+    var buf: [2]u8 = undefined;
+    while (true) {
+        const rc = linux.getrandom(&buf, buf.len, 0);
+        const signed: isize = @bitCast(rc);
+        if (signed == buf.len) return std.mem.readInt(u16, &buf, .little);
+        if (signed == -@as(isize, @intFromEnum(linux.E.INTR))) continue;
+        return 1; // getrandom unavailable: fall back to the old fixed start
+    }
+}
+
 fn pollOnce(fd: i32, events: i16, wait_ns: u64) void {
     var pfd = [1]linux.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
     var ts: linux.timespec = .{
@@ -536,6 +608,18 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
         .v6 => min_mtu_v6,
     };
 
+    // Refused, not clamped: an explicit `ceiling_mtu` above what this
+    // module can ever probe is a caller stating an expectation the module
+    // cannot meet (see `ProbeError.CeilingTooHigh`'s doc comment). This is
+    // the one value on this path that used to flow unchecked into
+    // `LiveProber`'s fixed `max_probe_mtu`-sized stack buffer (audit,
+    // 2026-08-18; see CHANGELOG.md) -- checked here, before anything is
+    // built from it, so the buffer invariant holds by construction for
+    // every caller, not only a polite one.
+    if (opts.ceiling_mtu) |c| {
+        if (c > max_probe_mtu) return error.CeilingTooHigh;
+    }
+
     var iface_mtu: ?u32 = null;
     if (opts.iface) |name| iface_mtu = ifaceMtu(name) catch null;
 
@@ -561,6 +645,10 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
         },
         .retries = opts.retries,
         .timeout_ms = opts.timeout_ms,
+        // Off-path-blind-spoofing hardening (audit finding #3, 2026-08-18;
+        // see SPEC.md "Threat model" for exactly which attacker this does
+        // and does not raise the bar against). Was a fixed 1.
+        .seq = randomStartSeq(),
     };
 
     return searchWith(lp.prober(), floor, ceiling, iface_mtu);
@@ -800,6 +888,94 @@ test "searchWith: iface_mtu passes through unchanged" {
     var fp: FakeProber = .{ .real_mtu = 1300, .explicit_icmp = true };
     const r = try searchWith(fp.prober(), min_mtu_v4, default_ceiling_mtu, 9000);
     try testing.expectEqual(@as(?u32, 9000), r.iface_mtu);
+}
+
+// -- regression: audit findings, 2026-08-18 -----------------------------------
+//
+// Three confirmed defects: (1) an unclamped `Options.ceiling_mtu` overran
+// `LiveProber`'s fixed 9000-byte stack buffer -- Debug/ReleaseSafe panicked,
+// ReleaseFast read/sent adjacent stack memory as ICMP payload and returned a
+// fabricated `Result`. (2) `searchWith`'s `ceiling > floor` precondition was
+// a bare `std.debug.assert` -- compiled out in ReleaseFast, where a violated
+// precondition underflowed `hi - lo` on `u16` and hung. (3) the threat model
+// didn't name the "forged reply converges instantly to a falsely LARGE MTU"
+// direction of its own already-documented lack of authentication. See
+// SPEC.md "Threat model" and "Limits and refusals" for the full writeup.
+//
+// (1) and (2) were confirmed against the unfixed code with out-of-tree
+// repros before this fix (index-out-of-bounds panic in Debug matching the
+// audit's exact `root.zig:480`/`index 19980, len 9000`; a fabricated
+// `mtu=20000 blackhole=false` plus SIGSEGV-on-return in ReleaseFast for (1);
+// a 15s-plus hang in ReleaseFast for (2)) -- and re-confirmed red against
+// `git show HEAD:modules/pathmtu/src/root.zig` for the two tests below (see
+// this task's final report for the exact transcript).
+
+test "regression (finding #1): probe() refuses ceiling_mtu above max_probe_mtu instead of overrunning the buffer" {
+    // No live socket/privilege needed: `probe()` checks `ceiling_mtu`
+    // before ever opening one, so this runs unconditionally (not
+    // live-gated) and exercises the exact `.{ .ceiling_mtu = 20000 }` shape
+    // the audit's out-of-tree repro used.
+    const dest = netaddr.parseIp("127.0.0.1").?;
+    const r = probe(dest, .{ .timeout_ms = 200, .retries = 0, .ceiling_mtu = 20000 });
+    try testing.expectError(error.CeilingTooHigh, r);
+}
+
+test "regression (finding #1): max_probe_mtu itself is still accepted (refusal is > max_probe_mtu, not >=)" {
+    // A boundary check on the fix itself: 9000 is a valid ceiling (it's the
+    // buffer size, a probe AT that size fits exactly), only something
+    // larger is refused.
+    const dest = netaddr.parseIp("127.0.0.1").?;
+    const r = probe(dest, .{ .timeout_ms = 200, .retries = 0, .ceiling_mtu = max_probe_mtu }) catch |err| switch (err) {
+        // Environment-dependent (no CAP_NET_RAW / ping_group_range): the
+        // point of this test is that the ceiling itself wasn't refused, so
+        // any error other than CeilingTooHigh proves that.
+        error.CeilingTooHigh => return error.TestUnexpectedResult,
+        else => return, // any other outcome (including success) is fine
+    };
+    _ = r;
+}
+
+test "regression (finding #2): searchWith(ceiling <= floor) is a checked error, not a hang or a panic" {
+    const Always = struct {
+        fn probeFn(_: *anyopaque, _: u16) ProbeOutcome {
+            return .ok;
+        }
+    };
+    var dummy: u8 = 0;
+    const p: Prober = .{ .ctx = &dummy, .probeFn = Always.probeFn };
+    // ceiling == floor: violates the documented precondition. Before the
+    // fix this was a bare `std.debug.assert` -- panicked in Debug, and in
+    // ReleaseFast fell through into `hi - lo` underflowing on `u16` and
+    // looping until killed (confirmed: 15s+ hang against the unfixed code,
+    // see the comment above this section).
+    try testing.expectError(error.CeilingTooLow, searchWith(p, 1500, 1500, null));
+    // ceiling < floor: same guard, other side.
+    try testing.expectError(error.CeilingTooLow, searchWith(p, 1500, 1499, null));
+}
+
+test "regression (finding #3): probe's live path no longer starts seq at the fixed, predictable value 1" {
+    // Not a full anti-spoofing proof (impossible to test the absence of a
+    // successful blind forgery from inside a unit test) -- just confirms
+    // the mechanism this mitigation actually depends on: `randomStartSeq`
+    // is not a constant. A mutation that hardcoded it back to `1` would
+    // pass every other test in this file (the live/loopback tests never
+    // observe `seq` at all) and only fail here.
+    var seen_nonzero = false;
+    var seen_distinct = false;
+    var first: ?u16 = null;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        const s = randomStartSeq();
+        if (s != 0) seen_nonzero = true;
+        if (first) |f| {
+            if (f != s) seen_distinct = true;
+        } else first = s;
+    }
+    // getrandom(2) is effectively always available on this host; a fixed
+    // fallback of 1 for all 32 draws would be indistinguishable from
+    // "never randomized" and is the exact regression this guards against.
+    try testing.expect(seen_nonzero);
+    try testing.expect(seen_distinct);
 }
 
 // -- real-capture goldens (client--router--server veth sandbox, 2026-08-18) --
