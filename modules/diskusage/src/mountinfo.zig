@@ -85,12 +85,29 @@ pub fn freeAll(gpa: std.mem.Allocator, entries: []MountinfoEntry) void {
 /// `mounts.parseMounts` and `procnet`'s parsers.
 pub fn parseMountinfo(gpa: std.mem.Allocator, text: []const u8) ![]MountinfoEntry {
     var out: std.ArrayList(MountinfoEntry) = .empty;
-    errdefer freeAll(gpa, out.toOwnedSlice(gpa) catch &.{});
+    // NOT `freeAll(gpa, out.toOwnedSlice(gpa) catch &.{})`: toOwnedSlice can
+    // itself allocate (to shrink the backing buffer to `items.len`), so on
+    // the exact same allocator-failure path this errdefer exists to guard
+    // against, that call can *also* fail — the `catch &.{}` then silently
+    // substitutes an empty slice and every already-collected entry leaks
+    // (caught by the FailingAllocator sweep test below). Free `out.items`
+    // directly and `deinit` the backing buffer instead: neither allocates,
+    // so this cannot itself fail.
+    errdefer {
+        for (out.items) |e| e.free(gpa);
+        out.deinit(gpa);
+    }
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         if (parseLine(gpa, line)) |entry| {
+            // parseLine's own errdefers discharge (without firing) the
+            // moment it returns successfully, so none of entry's seven
+            // heap-owned fields have any cleanup registered here — arm one
+            // before the fallible append, or a failed append leaks all
+            // seven.
+            errdefer entry.free(gpa);
             try out.append(gpa, entry);
         } else |_| {
             continue;
@@ -256,6 +273,36 @@ test "parseMountinfo: empty text yields zero entries, not an error" {
     const entries = try parseMountinfo(testing.allocator, "");
     defer freeAll(testing.allocator, entries);
     try testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "parseMountinfo: no leak whichever allocation fails, incl. the outer append" {
+    // parseLine's own errdefers discharge (without firing) once it returns
+    // successfully, so by the time control is back in parseMountinfo none of
+    // the entry's seven heap fields have any cleanup registered at all. If
+    // `out.append` then fails, all seven leaked — worse than mounts.zig's
+    // single-field leak, since parseMountinfo registered nothing.
+    const text = "36 35 98:0 / / rw,noatime shared:1 - ext3 /dev/root rw,errors=continue\n";
+
+    // Discover exactly how many allocations one fully successful parse
+    // makes, so the sweep below is complete without a guessed bound.
+    var counter = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const baseline = try parseMountinfo(counter.allocator(), text);
+    freeAll(testing.allocator, baseline);
+    const total_allocs = counter.alloc_index;
+
+    // Fail at every possible point in turn, including the very last
+    // allocation (the outer `out.append` growth) — `std.testing.allocator`
+    // is the real backing store under every FailingAllocator below and
+    // reports any leak at test teardown.
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        if (parseMountinfo(fa.allocator(), text)) |entries| {
+            freeAll(testing.allocator, entries);
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
 }
 
 // `readMountinfo` is the live-file entry point (see README's API example) —

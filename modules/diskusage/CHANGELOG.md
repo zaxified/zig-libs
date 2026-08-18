@@ -5,6 +5,53 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Fix (post-tag audit): two findings.
+
+  **Citation fix + stated assumption.** `SPEC.md` and `statfs.zig`'s
+  `PackedGeneric32` doc comment claimed `arch/x86/include/uapi/asm/statfs.h`
+  sets `ARCH_PACK_STATFS64`, "the same as ARM" — checked against this host's
+  real kernel headers and false: x86's header defines only
+  `ARCH_PACK_COMPAT_STATFS64`, for the separate `compat_statfs64` struct: ARM
+  really does set `ARCH_PACK_STATFS64` directly, x86 never does. A native
+  32-bit x86 kernel's own `statfs64` is therefore unpacked
+  (`NaturalGeneric32`, 88 bytes), not the 84-byte `PackedGeneric32` `.x86`
+  was already mapped to. Kept the `.x86 => .packed32` mapping rather than
+  changing it: `compat_statfs64` — what a 32-bit process gets under an
+  x86_64 kernel's compat syscall layer — shares `PackedGeneric32`'s exact
+  layout, and that compat case, not a native i386 kernel, is the realistic
+  `.x86` deployment (native 32-bit x86 kernels are essentially extinct).
+  That assumption was previously unstated; now documented at the mapping
+  site (`family`'s `switch` in `statfs.zig`), in `PackedGeneric32`'s and
+  `NaturalGeneric32`'s doc comments, and in a new "x86 compat-layer
+  assumption" note in `SPEC.md`, which also notes the severity bound: the
+  kernel's own `sz`-mismatch check means a wrong assumption for a given
+  target surfaces as `EINVAL`, not silent corruption.
+
+  **Leak fixes, allocator-failure path.** Neither `mounts.parseMounts` nor
+  `mountinfo.parseMountinfo` was tested under allocation failure
+  (`FailingAllocator`: zero hits in the module before this). Both leaked on
+  their `out.append` growth allocation: `mounts.zig` had `errdefer`s for
+  `device`/`mount_point`/`fs_type` but not `options`, so a failed append
+  leaked only `options`; `mountinfo.zig`'s `parseLine` returns a
+  fully-owned `MountinfoEntry` whose own `errdefer`s discharge on its
+  successful return, so `parseMountinfo` had no cleanup registered for any
+  of its seven fields at all — a failed append there leaked the whole
+  entry. Fixed by arming an `errdefer` (`gpa.free(options)` /
+  `entry.free(gpa)`) immediately before each fallible `append`. Writing the
+  `FailingAllocator` sweep test (every allocation-failure index from 0
+  through a fully-successful run's total, `std.testing.allocator` as the
+  real backing store so any leak is reported at test teardown) also
+  surfaced a third, related leak in both files' existing top-of-function
+  `errdefer freeAll(gpa, out.toOwnedSlice(gpa) catch &.{})`: `toOwnedSlice`
+  can itself allocate (to shrink-to-fit), so on the same allocator-failure
+  path this errdefer exists to guard, that call could also fail, and
+  `catch &.{}` silently substituted an empty slice — leaking every
+  already-collected entry. Replaced with a `free`+`deinit` errdefer that
+  cannot itself allocate. Confirmed both tests fail (6 and 15 leaked
+  allocations respectively, `std.testing.allocator`'s `DebugAllocator`
+  reporting them at teardown) against the pre-fix source, and pass clean
+  after.
+
 - **2026-08-18** — Fix: `mounts.readMounts`/`mountinfo.readMountinfo` called
   `std.Io.File.read(io, &buf)`, which does not exist in Zig 0.16 (`File` only
   has `readStreaming`/`readPositional`/`reader`/`readerStreaming`) — a

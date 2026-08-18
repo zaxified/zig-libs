@@ -26,7 +26,7 @@ half, transcribed from the kernel UAPI headers rather than assumed:
 |---|---|---|---|---|
 | `Native64` | `statfs` (no size arg) | `include/uapi/asm-generic/statfs.h`, `__BITS_PER_LONG == 64` branch | 120 | x86_64, aarch64, riscv64, loongarch64, and the native ABI of powerpc64/s390x/sparc64/mips64 (n64) |
 | `MipsStatfs64` | `statfs64` | `arch/mips/include/uapi/asm/statfs.h` | 96 | `.mips`/`.mipsel` (o32); `.mips64`/`.mips64el` built n32 (`gnuabin32`/`muslabin32`) |
-| `PackedGeneric32` | `statfs64` | asm-generic, packed (`ARCH_PACK_STATFS64 = packed,aligned(4)`) per `arch/arm/…/statfs.h` and `arch/x86/…/statfs.h` | 84 | arm/armeb/thumb/thumbeb, x86 (i386) |
+| `PackedGeneric32` | `statfs64` | asm-generic, packed (`packed,aligned(4)`) — ARM sets `ARCH_PACK_STATFS64` directly, per `arch/arm/…/statfs.h`; x86 packs only the separate `compat_statfs64` struct, via `ARCH_PACK_COMPAT_STATFS64` in `arch/x86/…/statfs.h` — see "x86 compat-layer assumption" below | 84 | arm/armeb/thumb/thumbeb, x86 (i386) |
 | `NaturalGeneric32` | `statfs64` | asm-generic, no arch override (natural C alignment) | 88 | powerpc(32), m68k, sparc(32), xtensa, riscv32, loongarch32, arc, csky, hexagon, or1k |
 
 Family selection (`statfs.zig`'s `family` comptime constant) mirrors
@@ -34,6 +34,46 @@ Family selection (`statfs.zig`'s `family` comptime constant) mirrors
 case. `x32` (`x86_64` target, `gnux32`/`muslx32` ABI) is refused at compile
 time rather than guessed at — not a target of this collection, and nobody
 had a kernel header to check it against.
+
+**x86 compat-layer assumption.** The real `arch/x86/include/uapi/asm/
+statfs.h` on this host reads:
+
+```c
+#define ARCH_PACK_COMPAT_STATFS64 __attribute__((packed,aligned(4)))
+#include <asm-generic/statfs.h>
+```
+
+— it defines `ARCH_PACK_COMPAT_STATFS64` and never touches
+`ARCH_PACK_STATFS64` at all. (ARM's header, by contrast, really does define
+`ARCH_PACK_STATFS64` directly:
+`#define ARCH_PACK_STATFS64 __attribute__((packed,aligned(4)))`.) A native
+32-bit x86 kernel's own `statfs64` therefore falls through to the generic
+header's *unpacked* fallback (`#ifndef ARCH_PACK_STATFS64 #define
+ARCH_PACK_STATFS64 #endif`) — i.e. `NaturalGeneric32` (88 bytes), the same
+struct every other architecture with no per-arch override gets — not the
+84-byte `PackedGeneric32` this module assigns to `.x86`.
+
+What x86 actually packs is a *different* kernel struct, `compat_statfs64`
+(also confirmed against the real header: same fields, same order, same
+84-byte packed layout as `PackedGeneric32`) — the struct a 32-bit userspace
+process gets when it calls `statfs64` under an x86_64 kernel's 32-bit compat
+syscall table. This module keeps `.x86 => .packed32` (`family`'s `switch` in
+`statfs.zig`), deliberately choosing to model that compat case rather than a
+native i386 kernel, because native 32-bit x86 kernels are essentially
+extinct while 32-bit x86 userspace under an x86_64 kernel (multilib/compat)
+is the realistic deployment for anything this module would actually run on.
+That assumption was previously unstated anywhere in this file — it is now.
+
+It is also unverified by this repository (no i386 kernel, native or
+compat-hosting, in CI) and could in principle be wrong for a genuinely
+native i386 target. The severity of being wrong is bounded by the same
+self-checking property documented below: `do_statfs64` rejects a caller
+whose `sz` argument does not match its own struct's size, so a native i386
+kernel handed this module's 84-byte `PackedGeneric32` buffer (its own
+`statfs64` being 88 bytes) returns `EINVAL` rather than reading back a
+silently-misaligned `Usage` — a loud failure, not silent corruption, and no
+worse than the unverified-but-EINVAL-bounded status the Anchoring/Open
+sections already give `NaturalGeneric32`/`MipsStatfs64`.
 
 **Why `statfs64`, not `statfs`, wherever it exists.** The plain `statfs`
 struct's counters are kernel `long` — 32 bits on a 32-bit kernel ABI, which
@@ -220,3 +260,9 @@ Not applicable — no secret material is handled anywhere in this module.
   investigated further here: out of scope for a `diskusage` fix, and o32
   (`.mips`/`.mipsel`) — the concrete target this module's requirements
   named — builds and analyzes cleanly.
+- `.x86`'s mapping to `PackedGeneric32` assumes a 32-bit process under an
+  x86_64 kernel's compat syscall layer, not a native i386 kernel — see the
+  "x86 compat-layer assumption" note above for the header text this rests
+  on and the `EINVAL` bound on being wrong. Not further verified here: no
+  i386 kernel, native or compat-hosting, is available in this collection's
+  CI to check the assumption against a live syscall either way.

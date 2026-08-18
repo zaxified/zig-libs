@@ -80,7 +80,18 @@ fn isOctalDigit(c: u8) bool {
 /// row should not sink the whole table, matching `procnet`'s parsers.
 pub fn parseMounts(gpa: std.mem.Allocator, text: []const u8) ![]MountEntry {
     var out: std.ArrayList(MountEntry) = .empty;
-    errdefer freeAll(gpa, out.toOwnedSlice(gpa) catch &.{});
+    // NOT `freeAll(gpa, out.toOwnedSlice(gpa) catch &.{})`: toOwnedSlice can
+    // itself allocate (to shrink the backing buffer to `items.len`), so on
+    // the exact same allocator-failure path this errdefer exists to guard
+    // against, that call can *also* fail — the `catch &.{}` then silently
+    // substitutes an empty slice and every already-collected entry leaks
+    // (caught by the FailingAllocator sweep test below). Free `out.items`
+    // directly and `deinit` the backing buffer instead: neither allocates,
+    // so this cannot itself fail.
+    errdefer {
+        for (out.items) |e| e.free(gpa);
+        out.deinit(gpa);
+    }
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -110,6 +121,7 @@ pub fn parseMounts(gpa: std.mem.Allocator, text: []const u8) ![]MountEntry {
             gpa.free(fs_type);
             continue;
         };
+        errdefer gpa.free(options);
 
         try out.append(gpa, .{
             .device = device,
@@ -215,6 +227,37 @@ test "parseMounts: empty text yields zero entries, not an error" {
     const entries = try parseMounts(testing.allocator, "");
     defer freeAll(testing.allocator, entries);
     try testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "parseMounts: no leak whichever allocation fails, incl. the outer append" {
+    // A single well-formed row exercises every allocation parseMounts makes
+    // for one entry: unescapeOctal(device), unescapeOctal(mount_point),
+    // dupe(fs_type), dupe(options), then `out.append` moving all four into
+    // the entries list. `options` had no errdefer, so a failure at that last
+    // append leaked it while device/mount_point/fs_type (which DO have
+    // errdefers) were correctly freed.
+    const text = "sysfs /sys sysfs rw,nosuid 0 0\n";
+
+    // Discover exactly how many allocations one fully successful parse
+    // makes, so the sweep below is complete without a guessed bound.
+    var counter = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const baseline = try parseMounts(counter.allocator(), text);
+    freeAll(testing.allocator, baseline);
+    const total_allocs = counter.alloc_index;
+
+    // Fail at every possible point in turn, including the very last
+    // allocation (the outer `out.append` growth) — `std.testing.allocator`
+    // is the real backing store under every FailingAllocator below and
+    // reports any leak at test teardown.
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        if (parseMounts(fa.allocator(), text)) |entries| {
+            freeAll(testing.allocator, entries);
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
 }
 
 // `readMounts` is the live-file entry point a consumer actually reaches for

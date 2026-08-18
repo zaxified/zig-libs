@@ -200,14 +200,32 @@ comptime {
 }
 
 /// asm-generic `statfs64` (`include/uapi/asm-generic/statfs.h`) as used
-/// *packed* — `ARCH_PACK_STATFS64 = __attribute__((packed,aligned(4)))` —
-/// which is what `arch/arm/include/uapi/asm/statfs.h` and
-/// `arch/x86/include/uapi/asm/statfs.h` (the i386 half) both set explicitly,
-/// each citing the same reason: avoid 8-byte alignment padding after the two
-/// leading 32-bit words so 32-bit and 64-bit userspace agree on the layout.
-/// `align(4)` on the `u64` fields below reproduces that packing — without it
+/// *packed* — `packed,aligned(4)` — which is what
+/// `arch/arm/include/uapi/asm/statfs.h` sets directly via
+/// `ARCH_PACK_STATFS64`, citing the reason: avoid 8-byte alignment padding
+/// after the two leading 32-bit words so 32-bit and 64-bit userspace agree
+/// on the layout.
+///
+/// **x86 is different, and it matters.** `arch/x86/include/uapi/asm/
+/// statfs.h` never defines `ARCH_PACK_STATFS64` — it defines only
+/// `ARCH_PACK_COMPAT_STATFS64`, which packs the *separate*
+/// `compat_statfs64` struct (what a 32-bit process gets calling `statfs64`
+/// under an x86_64 kernel's compat syscall layer). A native i386 kernel's
+/// own `statfs64` therefore falls through to the generic header's unpacked
+/// default — `NaturalGeneric32` below, not this struct. What IS packed on
+/// x86, `compat_statfs64`, happens to share this exact field layout (same
+/// fields, same order, same 84-byte packed size) — which is why `.x86` maps
+/// here rather than to `NaturalGeneric32`, but the mapping is deliberately
+/// modelling the compat-layer case (32-bit process, 64-bit kernel), not a
+/// native 32-bit x86 kernel. See SPEC.md's "x86 compat-layer assumption"
+/// note for why that is taken as the realistic `.x86` deployment (native
+/// 32-bit x86 kernels are essentially extinct) and for the `EINVAL` safety
+/// net if the assumption is ever wrong for a given target.
+///
+/// `align(4)` on the `u64` fields below reproduces the packing — without it
 /// Zig's default `extern struct` layout would insert the same trailing pad
-/// `NaturalGeneric32` has, which is wrong for these two architectures.
+/// `NaturalGeneric32` has, which is wrong for both ARM's native `statfs64`
+/// and x86's `compat_statfs64`.
 const PackedGeneric32 = extern struct {
     type: u32,
     bsize: u32,
@@ -236,7 +254,14 @@ comptime {
 /// statfs.h` (no override file exists for these in the kernel tree, so the
 /// generic header's `#ifndef ARCH_PACK_STATFS64 #define ARCH_PACK_STATFS64
 /// #endif` leaves it empty and natural C alignment applies): powerpc(32),
-/// m68k, sparc(32), xtensa, riscv32, loongarch32, arc, csky, hexagon, or1k.
+/// m68k, sparc(32), xtensa, riscv32, loongarch32, arc, csky, hexagon, or1k —
+/// and, at the header level, a *native* i386 kernel's own `statfs64` too:
+/// `arch/x86/include/uapi/asm/statfs.h` never defines `ARCH_PACK_STATFS64`
+/// (only `ARCH_PACK_COMPAT_STATFS64`, for the different `compat_statfs64`
+/// struct), so a native i386 kernel falls through to this same unpacked
+/// default. `family`'s `switch` does not route `.x86` here — see
+/// `PackedGeneric32`'s doc comment and SPEC.md for why the compat-layer case
+/// is taken as the realistic `.x86` deployment instead.
 /// The two leading `u32` fields already sum to 8 bytes, so there is no
 /// *internal* padding gap either way — the only difference from
 /// `PackedGeneric32` is 4 bytes of *trailing* padding, because an
@@ -296,7 +321,16 @@ const family: Family = switch (builtin.cpu.arch) {
         else => .native64,
     },
     .mips, .mipsel => .mips32,
-    .arm, .armeb, .thumb, .thumbeb, .x86 => .packed32,
+    .arm, .armeb, .thumb, .thumbeb => .packed32,
+    // .x86 (i386): `.packed32` here is `compat_statfs64` (32-bit process
+    // under an x86_64 kernel's compat syscall layer), NOT a native i386
+    // kernel's own `statfs64` (which is unpacked — see NaturalGeneric32).
+    // Stated explicitly because the two are different kernel structs that
+    // happen to share this one's byte layout: this module assumes the
+    // compat case is the realistic `.x86` deployment (native 32-bit x86
+    // kernels are essentially extinct) — SPEC.md's "x86 compat-layer
+    // assumption" note has the full reasoning and the EINVAL safety net.
+    .x86 => .packed32,
     .powerpc,
     .powerpcle,
     .m68k,
