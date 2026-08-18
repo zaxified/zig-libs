@@ -2688,12 +2688,17 @@ const PortableBaselineStep = struct {
             }
         }
 
-        std.log.info(
-            "check-portable: {d} (module, target) pair(s) swept -- {d} pass, {d} known-failure (baseline), {d} NEW failure, {d} STALE baseline entr(y/ies), {d} SKIPPED (inconclusive)",
-            .{ self.pairs.len, n_ok, n_known_fail, n_new_fail, n_stale, n_inconclusive },
-        );
-
-        if (failed) return step.fail("check-portable: baseline drift -- see errors above", .{});
+        // Silent on success, like every sibling gate here: `scripts/test.sh`
+        // treats ANY stderr from a check step as a failure, precisely so a
+        // step cannot exit 0 while its own output says otherwise. A summary
+        // printed unconditionally turns that protection into a false alarm.
+        if (failed) {
+            std.log.warn(
+                "check-portable: {d} (module, target) pair(s) swept -- {d} pass, {d} known-failure (baseline), {d} NEW failure, {d} STALE baseline entr(y/ies), {d} SKIPPED (inconclusive)",
+                .{ self.pairs.len, n_ok, n_known_fail, n_new_fail, n_stale, n_inconclusive },
+            );
+            return step.fail("check-portable: baseline drift -- see errors above", .{});
+        }
     }
 };
 
@@ -2804,7 +2809,6 @@ const PortableTableStep = struct {
             );
             return step.fail("check-portable-table: stale table in {s}", .{readme_path});
         }
-        std.log.info("check-portable-table: {s}'s Portability table is up to date", .{readme_path});
     }
 };
 
