@@ -207,6 +207,10 @@ harness_smoke() {
     step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
     step "check-portable-table" zig build check-portable-table
+    # ~30s when modules/http/src/Client.zig (or anything it pulls in) changed
+    # content, near-instant otherwise (Zig's own cache). See the script's
+    # header for what it checks and why one target, not two.
+    step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
     run_modules "$plain $netns"
     graph_save
     summary
@@ -1030,6 +1034,18 @@ cmd_changed() {
     step "check-portable" zig build check-portable
     step "check-portable-table" zig build check-portable-table
 
+    # `modules/http/sizeprobe/` proves requestPlain/requestStreamingPlain/
+    # putFilePlain never pull in TLS (CONVENTIONS.md-adjacent doc on
+    # `Client.zig`'s `dialPlain`), and it has its OWN standalone build.zig
+    # that nothing else in the repo referenced -- an artefact whose check
+    # never runs is worse than none (same lesson as the portability table
+    # above). Builds both probes for x86_64-linux-musl only and asserts
+    # zero TLS/certificate/curve/hash symbols in the plaintext one; see the
+    # script for why one target is enough and why this is a symbol-presence
+    # check rather than a byte-count one. ~30s when Client.zig's content
+    # actually changed, near-instant otherwise.
+    step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
+
     if [[ -z "$closure" ]]; then
         graph_save
         summary
@@ -1113,6 +1129,8 @@ cmd_all() {
     step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
     step "check-portable-table" zig build check-portable-table
+    # See cmd_changed's comment on this same step for what it checks.
+    step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
     # programs nothing else builds: they are not tests, and `scripts/ctgrind.sh`
     # -- which needs valgrind -- is deliberately NOT in this gate. Left alone
@@ -1252,6 +1270,12 @@ Usage: scripts/test.sh [subcommand] [args]
                         source scan for `std.heap.page_allocator` and its
                         siblings reaching outside a caller-supplied allocator
                         (CONVENTIONS.md §1.2), sub-second warm.
+                        `scripts/check-http-sizeprobe.sh` likewise: rebuilds
+                        modules/http/sizeprobe/ (its own standalone build.zig,
+                        x86_64-linux-musl only) and asserts the plaintext
+                        http.Client entry points link zero TLS/certificate/
+                        curve/hash symbols. ~30s when Client.zig's content
+                        changed, near-instant otherwise (Zig's own cache).
   build [FLAGS]         the same gate as `all`, stopping after the compile:
                         every static check, then every module compiled, and no
                         test run at all. For the Debug lane, whose whole claim

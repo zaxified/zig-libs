@@ -3115,6 +3115,100 @@ test "putFilePlain: streams a real file over a plaintext loopback PUT" {
     try testing.expectEqual(@as(u16, 200), status);
 }
 
+// Regression tests for `requestInnerPlain`/`requestStreamingPlain`'s `owned`
+// double-free fix (see their doc comments a few hundred lines up). The
+// TLS-side equivalents — "pool: stale-conn retry whose redial ALSO fails
+// does not double-free conn" and "pool: requestStreaming's stale-conn retry
+// whose redial ALSO fails does not double-free conn", both further down —
+// were added in the same commit that fixed `requestInner`/`requestStreaming`
+// and reproduced by reverting the fix; `requestInnerPlain`/
+// `requestStreamingPlain` got the identical idiom one commit earlier (caught
+// pre-commit when it segfaulted a test during development) but shipped with
+// no test of their own that survives to catch a regression. These two are
+// that test, built by pointing the exact same origins at the Plain entry
+// points instead — `staleConnNoRedialOrigin`/`staleConnRstNoRedialOrigin`
+// (both defined further down, alongside their first use) are already
+// TLS-free raw-socket servers, so nothing about the origin changes, only
+// which client method dials it.
+test "requestPlain: pool: stale-conn retry whose redial ALSO fails does not double-free conn" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("requestPlain stale-conn redial-fail test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+
+    const port = listener.socket.address.getPort();
+    var hung_up = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, staleConnNoRedialOrigin, .{ io, &listener, &hung_up });
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var res1 = try client.requestPlain(.get, url, .{});
+    drainAndDeinit(&res1);
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    while (!hung_up.load(.acquire)) std.atomic.spinLoopHint();
+    thread.join();
+
+    // Close the listening socket entirely — nothing is left to accept the
+    // retry's redial, so it fails with `error.ConnectFailed` instead of
+    // succeeding, forcing `requestInnerPlain`'s retry branch to hit the
+    // `conn.destroy(); conn = try c.dialPlain(url);` path and return an
+    // error afterward — exactly the shape the fixed `owned` flag guards.
+    listener.deinit(io);
+
+    try testing.expectError(error.ConnectFailed, client.requestPlain(.get, url, .{}));
+}
+
+// `requestStreamingPlain`'s retry fires only off a WRITE failure, same as
+// `requestStreaming`'s (see that test's comment further down): a plain FIN
+// close does not fail a small buffered write, so this needs the hard-RST
+// origin and a tiny `write_buffer_size` to force the request head through a
+// real `write(2)` that the RST can actually fail.
+test "requestStreamingPlain: pool: stale-conn retry whose redial ALSO fails does not double-free conn" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("requestStreamingPlain redial-fail test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+
+    const port = listener.socket.address.getPort();
+    var hung_up = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, staleConnRstNoRedialOrigin, .{ io, &listener, &hung_up });
+
+    // Same reasoning as `requestStreaming`'s own test: without a tiny
+    // buffer the whole request head stays under the default 4KB write
+    // buffer and never touches the socket until a later flush, so the RST
+    // would never be observed at this call at all.
+    var client = Client.init(io, testing.allocator, .{ .write_buffer_size = 8 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    // Populate the pool via an ordinary GET against the same origin
+    // (`staleConnRstNoRedialOrigin` answers any request the same way).
+    var res1 = try client.requestPlain(.get, url, .{});
+    drainAndDeinit(&res1);
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    while (!hung_up.load(.acquire)) std.atomic.spinLoopHint();
+    thread.join();
+    listener.deinit(io);
+
+    try testing.expectError(error.ConnectFailed, client.requestStreamingPlain(.put, url, .{}, 0));
+}
+
 // ── tests (connection pool: loopback + white-box) ────────────────────────────
 
 /// GET → "ok"; POST → echoes the body. Used by every pool loopback test

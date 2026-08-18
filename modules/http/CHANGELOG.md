@@ -5,6 +5,52 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — test/tooling only, no API change. Closed two gaps an audit of the
+  two entries below found.
+  **(1) Regression tests for the Plain-side `owned` double-free fix.** The entry below
+  added dedicated crash-reproducing tests for `requestInner`/`requestStreaming`
+  (`"pool: stale-conn retry whose redial ALSO fails does not double-free conn"` and the
+  `requestStreaming` counterpart); `requestInnerPlain`/`requestStreamingPlain` got the
+  identical `owned`-boolean fix one commit earlier (caught pre-commit when it segfaulted
+  a test during development) but shipped with no test of their own that would catch a
+  regression. New tests `"requestPlain: pool: stale-conn retry whose redial ALSO fails
+  does not double-free conn"` and `"requestStreamingPlain: pool: stale-conn retry whose
+  redial ALSO fails does not double-free conn"` mirror the existing pair exactly, reusing
+  the same raw-socket origins (`staleConnNoRedialOrigin`/`staleConnRstNoRedialOrigin` —
+  already TLS-free, so nothing about the origin changes) — the streaming one needs the
+  same treatment its TLS-side counterpart did: `staleConnRstNoRedialOrigin`'s hard
+  `SO_LINGER{onoff=1,linger=0}` RST plus `write_buffer_size = 8`, because
+  `requestStreamingPlain`'s retry fires only off a **write** failure and a plain FIN
+  close does not fail a small buffered write. Verified in both directions, the way the
+  entry below did: reverting each `owned = false;` alone reproduces the exact
+  double-free — a segfault inside `Conn.destroy`, called a second time from
+  `errdefer if (owned) conn.destroy();` — and restoring both is green.
+  `zig build test-http` — 444/444 pass, native, `-Doptimize=ReleaseFast` and
+  `-Doptimize=ReleaseSafe` both included.
+  **(2) `modules/http/sizeprobe/` is now gated.** It is the only proof of the plaintext
+  split's central claim (zero TLS symbols, ~325 KB saved — see the split's own entry
+  below) and had its own standalone `build.zig` that nothing in the repo referenced: not
+  the root `build.zig`, not `scripts/test.sh`, not CI — an artefact whose check never
+  runs is worse than none, because it still looks authoritative. `scripts/
+  check-http-sizeprobe.sh` wires it into `scripts/test.sh` beside the other `check-*`
+  steps (all three call sites: `harness_smoke`, `cmd_changed`, `cmd_all`/`cmd_build`).
+  Chosen level: build BOTH probes (catches rot in either) for `x86_64-linux-musl` only,
+  and assert `probe_after_syms` links **zero** TLS/certificate/curve/hash symbols — the
+  property that actually matters and is stable under unrelated code churn, not an exact
+  byte count that drifts for reasons unrelated to this property and gets disabled once it
+  starts failing. One target, not the two `sizeprobe/run.sh` cross-builds for the
+  measured size delta: the property under gate is a Sema *reachability* fact (does the
+  plaintext call graph name a TLS/crypto decl at all), which does not vary by
+  architecture the way the 32-bit/big-endian bugs `check-portable` hunts for do, so a
+  second cross-compile would double this gate's wall time for zero additional coverage
+  of what it asserts; the mips-linux-musleabi leg and the byte-count table stay in
+  `run.sh`, run by hand before a tag. ~30s when `Client.zig` (or anything it pulls in)
+  actually changed content, near-instant otherwise (Zig's own build cache); silent on
+  success, since `scripts/test.sh`'s `step` treats any stderr as a FAIL even at exit 0.
+  Verified it fires: temporarily made `dialPlain` reach `ensureCaBundle()` behind a
+  runtime `url.scheme == .https` check (mirroring the original bug's shape — a *runtime*
+  branch Sema cannot prove dead) — the gate failed, listing the linked `Certificate`/hash
+  symbols by name; reverted, gate green and silent again.
 - **2026-08-18** — **BEHAVIOURAL, not breaking** — fixed the double-free the entry
   below left in place in the shipped `requestInner`/`requestStreaming`: a dial
   failure immediately after the stale-connection retry's `conn.destroy()` left
