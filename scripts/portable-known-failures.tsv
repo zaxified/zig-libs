@@ -106,7 +106,5 @@
 #     narrow in `transport.zig` also fires (11 errors total, same build).
 #
 # module	target	reason
-blobstore	linux32	std/atomic.zig:53:31: error: expected 32-bit integer type or smaller; found 64-bit integer type (64-bit atomic RMW unsupported at the mips32 baseline; same class as ramcache, see header)
-filestore	linux32	std/atomic.zig:53:31: error: expected 32-bit integer type or smaller; found 64-bit integer type (64-bit atomic RMW unsupported at the mips32 baseline; same class as ramcache, see header)
 traceroute	linux32	modules/traceroute/src/root.zig:678:44: error: expected type 'usize', found 'u64' (from = routers[probe_index % routers.len])
 wireguard	linux32	modules/wireguard/src/handshake.zig:57:47: error: wireguard/handshake.zig assumes a little-endian host -- module's own deliberate @compileError guard (fix recipe in the message); modules/wireguard/src/transport.zig:286:41 also has an independent usize<-u64 narrow (11 errors total)
