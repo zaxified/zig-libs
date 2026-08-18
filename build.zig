@@ -398,8 +398,8 @@ pub fn build(b: *std.Build) void {
         one.dependOn(&run.step);
     }
 
-    // `zig build check-portable` — compile every `platform = .any` module for a
-    // 32-bit target.
+    // `zig build check-portable` — compile every `platform = .any` module's
+    // TESTS for a 32-bit target, checked against a known-failures baseline.
     //
     // WHY A BUILD STEP AND NOT A COMPTIME CHECK. The obvious idea is a
     // `comptime` assertion inside the module, and it cannot work: comptime is
@@ -412,16 +412,46 @@ pub fn build(b: *std.Build) void {
     // `platform = .any` for months while being unbuildable on half of what that
     // claim covers.
     //
-    // Compile-only on purpose: `zig build-obj` type-checks and generates code
-    // for the whole module without a wasm runtime in the loop, which is what
-    // makes it cheap enough for the change-aware gate.
+    // ⭐ `addTest`, NOT `addObject`. This gate originally used `zig build-obj`,
+    // and that was a structural blind spot: Zig analyses a container's function
+    // BODIES lazily, only once something calls them, and `build-obj` never
+    // calls anything -- it type-checks signatures and stops. Measured
+    // 2026-08-18: `modules/http/src/Server.zig`'s `formatHttpDate` indexes
+    // `day_names[day.day % 7]` where `day.day` is a `u47` -- a real compile
+    // error on any 32-bit target, since a `u47` cannot implicitly narrow to a
+    // 32-bit `usize` -- and `check-portable` reported 196/196 green anyway,
+    // because nothing in an object build ever CALLS `formatHttpDate`. A `zig
+    // build-obj` of the whole module can be 100% green while every public
+    // function in it is unbuildable. `addTest` compiles the module's own test
+    // binary -- the real entry point that calls the module's real functions --
+    // which is what forces the bodies to be analysed. It is deliberately NOT
+    // run (`--test-no-exec` shape: depend on the `Compile` step, never wrap it
+    // in `addRunArtifact`) -- wasm32 has no host to run it on anyway, and the
+    // gate only ever needed the compile+link to happen, not the result.
+    //
+    // wasm32-**wasi**, not wasm32-freestanding. `usize`/pointer width -- the
+    // property this gate exists to probe -- comes from the CPU arch
+    // (`wasm32`), not the OS tag, so this does not weaken the check. Freestanding
+    // has no OS at all, and the default Zig test runner needs one (it reaches
+    // `std.Io.Threaded` for its RNG seed, `posix.STDIN_FILENO`, argv, ...);
+    // `addObject` never instantiated that runner, so freestanding was never
+    // exercised against it before. Measured: an `addTest` at wasm32-freestanding
+    // fails to compile the STD TEST RUNNER itself (`posix.system` has no
+    // `getrandom`/`IOV_MAX`/`STDIN_FILENO` for freestanding) on a trivial module
+    // with no bug at all -- that is a gap in `std`'s freestanding surface, not a
+    // finding about any module here, and it would drown every real result.
+    // wasi gives the runner the OS surface it needs while keeping 32-bit
+    // pointers, which is the only property this gate is measuring.
     //
     // The list is read from the sources rather than repeated here. `pub const
     // meta` is the canonical declaration (CONVENTIONS.md), and a second list in
     // this file would drift from it silently -- the failure mode being a module
     // that quietly stops being checked.
-    const portable = b.step("check-portable", "Compile every platform=.any module for wasm32");
-    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const portable = b.step(
+        "check-portable",
+        "Compile every platform=.any module's tests for wasm32, checked against scripts/portable-known-failures.tsv",
+    );
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
     var wasm_mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
     for (module_list) |m| {
         wasm_mods.put(m.name, b.createModule(.{
@@ -434,21 +464,66 @@ pub fn build(b: *std.Build) void {
         const mod = wasm_mods.get(m.name).?;
         for (m.deps) |dep| mod.addImport(dep, wasm_mods.get(dep).?);
     }
+    // Names of every `platform = .any` module, in `module_list` order --
+    // handed to `PortableBaselineStep` below so its `make` fn does not have to
+    // re-derive the eligible set (and cannot drift from what actually got a
+    // `portable-<name>` step created for it).
+    var portable_names: std.ArrayList([]const u8) = .empty;
     for (module_list) |m| {
         if (!declaresAnyPlatform(b, b.graph.io, m.name)) continue;
-        const obj = b.addObject(.{
+        portable_names.append(b.allocator, m.name) catch @panic("OOM");
+
+        // Same shape as the per-module `test-<name>` step in pass 2 above: a
+        // module with `test_deps` gets a second module object carrying the
+        // extra imports, so the wasm compile forces analysis of exactly the
+        // same test bodies the module's own `zig build test-<name>` does.
+        const test_root = if (m.test_deps.len == 0) wasm_mods.get(m.name).? else blk: {
+            const t = b.createModule(.{
+                .root_source_file = b.path(b.fmt("modules/{s}/src/root.zig", .{m.name})),
+                .target = wasm_target,
+                .optimize = .ReleaseSmall,
+            });
+            for (m.deps) |dep| t.addImport(dep, wasm_mods.get(dep).?);
+            for (m.test_deps) |dep| t.addImport(dep, wasm_mods.get(dep).?);
+            break :blk t;
+        };
+        const wasm_test = b.addTest(.{
             .name = b.fmt("portable-{s}", .{m.name}),
-            .root_module = wasm_mods.get(m.name).?,
+            .root_module = test_root,
         });
-        portable.dependOn(&obj.step);
         // Per-module step, the same shape as `test-<name>`: a red 196-module
         // step that does not say which module is red is one nobody runs twice.
+        // Deliberately UNGATED by the known-failures baseline below -- this is
+        // the module's true, unmasked status, for `zig build portable-<name>`
+        // by hand.
         const one = b.step(
             b.fmt("portable-{s}", .{m.name}),
-            b.fmt("Compile {s} for wasm32", .{m.name}),
+            b.fmt("Compile {s}'s tests for wasm32 (true status, not baseline-checked)", .{m.name}),
         );
-        one.dependOn(&obj.step);
+        one.dependOn(&wasm_test.step);
     }
+    // The gate itself does NOT `dependOn` the per-module compile steps above --
+    // doing so would make `check-portable` red for every module already on the
+    // known-failures baseline, which is the opposite of what a baseline is for
+    // (CONVENTIONS.md has no baseline precedent for a whole-module failure, but
+    // `check-global-alloc`'s `global-alloc-ok:` markers set the standard this
+    // follows: an entry means "seen and accounted for", not "ignored", and a
+    // STALE entry -- one that now passes -- is itself a failure). Instead
+    // `PortableBaselineStep` re-invokes `zig build portable-<name>...` as a
+    // subprocess (the same shape `DarkTestsStep` uses to shell out to
+    // `dark-tests.sh`), reads the per-module PASS/FAIL from `--summary all`,
+    // and diffs that against `scripts/portable-known-failures.tsv` itself.
+    const portable_baseline = b.allocator.create(PortableBaselineStep) catch @panic("OOM");
+    portable_baseline.* = .{
+        .step = std.Build.Step.init(.{
+            .id = .custom,
+            .name = "check-portable",
+            .owner = b,
+            .makeFn = PortableBaselineStep.make,
+        }),
+        .module_names = portable_names.items,
+    };
+    portable.dependOn(&portable_baseline.step);
 
     // `zig build check-testonly` — prove a test-only dep really is test-only.
     //
@@ -1977,6 +2052,310 @@ fn checkUapi(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
 /// builds nothing. That path is the gate; this step is the standalone entry
 /// point for a CI shape that does not go through the driver, and for running
 /// the check by hand. `-Ddark-module=<name>` narrows it.
+/// Data file listing `check-portable`'s known-failure baseline: one `<module>
+/// TAB <reason>` row per `platform = .any` module whose wasm32 test compile is
+/// currently red, with the reason taken from the actual compiler error (never
+/// invented). See `scripts/portable-known-failures.tsv`'s own header for the
+/// full contract.
+const portable_baseline_path = "scripts/portable-known-failures.tsv";
+
+/// A parsed `scripts/portable-known-failures.tsv` row.
+const PortableBaselineEntry = struct { module: []const u8, reason: []const u8 };
+
+/// Parse `scripts/portable-known-failures.tsv`: blank lines and `#`-comment
+/// lines are skipped, every other line is `<module>\t<reason>` with a
+/// non-empty reason. Malformed rows are reported through `failed` rather than
+/// silently skipped -- a row this gate cannot parse is a row it cannot enforce,
+/// which is exactly the kind of silent hole `check-changelog`'s "exists != is
+/// a changelog" lesson says not to leave.
+fn parsePortableBaseline(
+    b: *std.Build,
+    io: std.Io,
+    failed: *bool,
+) []const PortableBaselineEntry {
+    const src = b.build_root.handle.readFileAlloc(io, portable_baseline_path, b.allocator, .limited(1024 * 1024)) catch |err| {
+        std.log.err("check-portable: cannot read {s}: {t}", .{ portable_baseline_path, err });
+        failed.* = true;
+        return &.{};
+    };
+    var entries: std.ArrayList(PortableBaselineEntry) = .empty;
+    var seen = std.StringHashMap(void).init(b.allocator);
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |raw_line| {
+        line_no += 1;
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse {
+            std.log.err("{s}:{d}: expected `<module>\\t<reason>`, no tab found: {s}", .{ portable_baseline_path, line_no, line });
+            failed.* = true;
+            continue;
+        };
+        const module = std.mem.trim(u8, line[0..tab], " \t");
+        const reason = std.mem.trim(u8, line[tab + 1 ..], " \t");
+        if (module.len == 0) {
+            std.log.err("{s}:{d}: empty module name", .{ portable_baseline_path, line_no });
+            failed.* = true;
+            continue;
+        }
+        if (reason.len == 0) {
+            std.log.err(
+                "{s}:{d}: module '{s}' has no reason -- an entry nobody can argue with is one nobody will revisit " ++
+                    "(see CONVENTIONS.md's `global-alloc-ok:` rule for why a reason is required)",
+                .{ portable_baseline_path, line_no, module },
+            );
+            failed.* = true;
+            continue;
+        }
+        if (seen.contains(module)) {
+            std.log.err("{s}:{d}: module '{s}' is listed twice", .{ portable_baseline_path, line_no, module });
+            failed.* = true;
+            continue;
+        }
+        seen.put(module, {}) catch @panic("OOM");
+        entries.append(b.allocator, .{ .module = module, .reason = reason }) catch @panic("OOM");
+    }
+    return entries.items;
+}
+
+/// `zig build check-portable`'s baseline verdict. See the long comment at its
+/// call site (in `build()`) for why this is a subprocess re-invocation rather
+/// than a plain `dependOn` of the `portable-<name>` compile steps: the whole
+/// point of a baseline is that a KNOWN failure must not turn the gate red, and
+/// the build-step graph has no way to swallow a dependency's failure short of
+/// not depending on it.
+///
+/// Verdict per module (compared against `scripts/portable-known-failures.tsv`):
+///
+///   pass, not listed   — fine, the common case.
+///   fail, listed        — fine, an accounted-for baseline entry.
+///   fail, NOT listed    — gate fails: a new/unlisted regression.
+///   pass, listed        — gate fails: a STALE entry. Without this half the
+///                         list can only ever grow, which is exactly how a
+///                         baseline rots into a lie nobody re-reads --
+///                         `feedback_closing_summary_lies` in CML's own memory
+///                         is the same failure shape one layer up.
+/// Best-effort slice of `text` (the sweep subprocess's combined stdout+stderr)
+/// covering module `name`'s own compile: from just after the previous
+/// `failed command:` line to the end of the `failed command:` line that names
+/// `--name portable-<name>`. `zig build`'s own diagnostics for a failed
+/// `Compile` step are printed immediately before the `failed command:` line
+/// that names it, which is what makes this work without parsing the tree
+/// output. NOT exact under concurrent compilation (`zig build` interleaves
+/// output from parallel jobs by line, so a neighbour's diagnostic can land in
+/// the slice) -- it exists to save a round trip to `zig build portable-<name>`
+/// by hand, not to be machine-parsed itself.
+fn findModuleErrorBlock(b: *std.Build, text: []const u8, name: []const u8) ?[]const u8 {
+    const marker = b.fmt("--name portable-{s} ", .{name});
+    const marker_idx = std.mem.indexOf(u8, text, marker) orelse return null;
+    const start: usize = if (std.mem.lastIndexOf(u8, text[0..marker_idx], "failed command:")) |prev|
+        (std.mem.indexOfScalarPos(u8, text, prev, '\n') orelse prev) + 1
+    else
+        0;
+    const end = std.mem.indexOfScalarPos(u8, text, marker_idx, '\n') orelse text.len;
+    if (start >= end) return null;
+    return text[start..end];
+}
+
+const PortableBaselineStep = struct {
+    step: std.Build.Step,
+    /// Every `platform = .any` module, in `module_list` order — computed once
+    /// in `build()` so this can't drift from which modules actually got a
+    /// `portable-<name>` step.
+    module_names: []const []const u8,
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *PortableBaselineStep = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const io = b.graph.io;
+
+        var failed = false;
+        const baseline = parsePortableBaseline(b, io, &failed);
+
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(b.allocator, b.graph.zig_exe);
+        try argv.append(b.allocator, "build");
+        for (self.module_names) |name| {
+            try argv.append(b.allocator, b.fmt("portable-{s}", .{name}));
+        }
+        // Reuse exactly the cache this build is already using, so the
+        // subprocess sees a warm cache instead of recompiling std for wasm32
+        // from scratch. Omitted when the outer build used the ambient default
+        // (a null `.path` means "relative to cwd", which the subprocess's own
+        // `cwd` below already reproduces).
+        if (b.cache_root.path) |p| {
+            try argv.append(b.allocator, "--cache-dir");
+            try argv.append(b.allocator, p);
+        }
+        if (b.graph.global_cache_root.path) |p| {
+            try argv.append(b.allocator, "--global-cache-dir");
+            try argv.append(b.allocator, p);
+        }
+        // Cap the subprocess's OWN internal concurrency. Left at the default
+        // (all cores), ~195 concurrent wasm32 LLVM-backend compiles under
+        // memory pressure produce zig build-runner failures with NO
+        // `file:line: error:` diagnostic at all -- indistinguishable, from
+        // this step's own summary parsing, from a real compile failure.
+        // Measured 2026-08-18 on this host (8 cores, ~2 GiB free RAM, swap
+        // full): 71 modules that compile cleanly in isolation came back
+        // "failure" this way under unbounded `-j`; `-j4` reproduced the
+        // isolated (correct) result. `scripts/test.sh` uses `-j1` elsewhere in
+        // this repo, but for a different reason (serializing live-peer RUN
+        // steps, not compile memory pressure) -- `-j4` here is this step's
+        // own bound, not a reuse of that one.
+        try argv.append(b.allocator, "-j4");
+        try argv.append(b.allocator, "--summary");
+        try argv.append(b.allocator, "all");
+
+        const result = std.process.run(b.allocator, io, .{
+            .argv = argv.items,
+            .cwd = .{ .dir = b.build_root.handle },
+            .stdout_limit = .unlimited,
+            .stderr_limit = .unlimited,
+        }) catch |err| {
+            std.log.err("check-portable: could not run the wasm32 sweep: {t}", .{err});
+            return step.fail("check-portable: subprocess spawn failed", .{});
+        };
+        defer b.allocator.free(result.stdout);
+        defer b.allocator.free(result.stderr);
+
+        // Both streams, concatenated: `--summary all`'s step-status lines are
+        // stdout, and a module's own compile errors are stderr, but only the
+        // former is parsed below -- this is just so a human reading the
+        // logged text after a failure sees both.
+        var combined: std.ArrayList(u8) = .empty;
+        try combined.appendSlice(b.allocator, result.stdout);
+        try combined.appendSlice(b.allocator, result.stderr);
+
+        // Top-level step-status lines sit at column 0: `portable-http success`
+        // / `portable-http cached` / `portable-http failure` / `portable-http
+        // transitive failure` / `portable-http skipped` / `portable-http
+        // skipped (not enough memory)`. Source of truth for that exact
+        // vocabulary: zig 0.16's `lib/compiler/build_runner.zig`, the
+        // `StepNames.write`-shaped switch on `Step.State` -- `.success` prints
+        // `cached` when `result_cached` (a step the runner determined, from a
+        // PRIOR run, needed no rebuild -- still a pass, not "not run") or
+        // `success` otherwise; `.dependency_failure` prints `transitive
+        // failure`; `.skipped`/`.skipped_oom` print `skipped`/`skipped (not
+        // enough memory)`.
+        //
+        // ⭐ MEASURED 2026-08-18: an earlier version of this parser accepted
+        // only a bare `success` suffix as a pass. Rerun against an ALREADY-WARM
+        // cache (the normal case once `check-portable` has run once), every
+        // module printed `cached` instead, and the gate reported "0 pass, 115
+        // NEW failure" -- 115 modules that compile cleanly in isolation,
+        // reported as regressions purely because the cache had already done
+        // the work. This is a distinct failure mode from the cache-corruption
+        // trap (no missing `file:line: error:` diagnostic; the subprocess
+        // genuinely succeeded) but shares the same symptom -- a "failure" this
+        // step itself manufactured, not one the compiler reported.
+        //
+        // `skipped`/`skipped (not enough memory)` are neither a pass nor a
+        // compiler-reported failure -- the runner chose not to attempt the
+        // step at all (`skipped_oom` specifically means the runner's own
+        // memory-pressure heuristic declined to run it). Recording those as
+        // `.inconclusive` rather than folding them into "fail" keeps a
+        // memory-constrained host from manufacturing baseline-drift errors
+        // the same way the `cached`-as-failure bug did.
+        const Verdict = enum { passed, failed, inconclusive };
+        var status = std.StringHashMap(Verdict).init(b.allocator);
+        var it = std.mem.splitScalar(u8, combined.items, '\n');
+        while (it.next()) |raw_line| {
+            if (raw_line.len == 0 or raw_line[0] == ' ' or raw_line[0] == '+' or raw_line[0] == '|') continue;
+            const prefix = "portable-";
+            if (!std.mem.startsWith(u8, raw_line, prefix)) continue;
+            const rest = raw_line[prefix.len..];
+            const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+            const name = rest[0..sp];
+            const suffix = std.mem.trim(u8, rest[sp + 1 ..], " \r");
+            const verdict: Verdict = if (std.mem.eql(u8, suffix, "success") or std.mem.eql(u8, suffix, "cached"))
+                .passed
+            else if (std.mem.startsWith(u8, suffix, "skipped"))
+                .inconclusive
+            else
+                .failed; // "failure", "transitive failure", or anything not yet invented
+            status.put(name, verdict) catch @panic("OOM");
+        }
+
+        var baseline_by_module = std.StringHashMap([]const u8).init(b.allocator);
+        for (baseline) |e| baseline_by_module.put(e.module, e.reason) catch @panic("OOM");
+
+        var n_ok: usize = 0;
+        var n_known_fail: usize = 0;
+        var n_new_fail: usize = 0;
+        var n_stale: usize = 0;
+        var n_inconclusive: usize = 0;
+        for (self.module_names) |name| {
+            const verdict = status.get(name) orelse {
+                std.log.err("check-portable: no `portable-{s}` line in the sweep output -- was it built?", .{name});
+                failed = true;
+                continue;
+            };
+            const listed_reason = baseline_by_module.get(name);
+            switch (verdict) {
+                .inconclusive => {
+                    // The runner skipped this step (commonly `skipped (not
+                    // enough memory)` under host memory pressure) rather than
+                    // actually attempting the compile. This is NOT evidence of
+                    // either a pass or a failure -- counting it as either would
+                    // make the gate's verdict depend on host load rather than
+                    // on the code, which is exactly the trap this whole step
+                    // exists to avoid falling into (see the `cached`-as-failure
+                    // note above). Fails the gate so it gets re-run rather than
+                    // silently accepted or silently blamed on the module.
+                    n_inconclusive += 1;
+                    std.log.err(
+                        "check-portable: '{s}' was SKIPPED by the build runner (not attempted -- commonly a host " ++
+                            "memory-pressure decision, not a compiler verdict) -- re-run rather than trusting this result",
+                        .{name},
+                    );
+                    failed = true;
+                },
+                .passed => if (listed_reason == null) {
+                    n_ok += 1;
+                } else {
+                    n_stale += 1;
+                    std.log.err(
+                        "check-portable: '{s}' is listed in {s} (\"{s}\") but now PASSES for wasm32 -- stale baseline " ++
+                            "entry, remove the row",
+                        .{ name, portable_baseline_path, listed_reason.? },
+                    );
+                    failed = true;
+                },
+                .failed => if (listed_reason != null) {
+                    n_known_fail += 1;
+                } else {
+                    n_new_fail += 1;
+                    std.log.err(
+                        "check-portable: '{s}' fails to compile for wasm32 and is not in {s} -- either fix it or add a " ++
+                            "baseline entry naming the real compiler error",
+                        .{ name, portable_baseline_path },
+                    );
+                    // Surface the actual diagnostic, not just the module name --
+                    // otherwise a red gate tells a developer WHICH module without
+                    // WHY, and they are back to running `zig build portable-<name>`
+                    // by hand to find out. `result.stderr` (folded into `combined`
+                    // above) is where the compiler's own `file:line: error:` text
+                    // lives; print the module's own slice of it rather than the
+                    // whole multi-hundred-line sweep.
+                    if (findModuleErrorBlock(b, combined.items, name)) |block| {
+                        std.log.err("check-portable: '{s}' compiler output:\n{s}", .{ name, block });
+                    }
+                    failed = true;
+                },
+            }
+        }
+
+        std.log.info(
+            "check-portable: {d} module(s) swept -- {d} pass, {d} known-failure (baseline), {d} NEW failure, {d} STALE baseline entr(y/ies), {d} SKIPPED (inconclusive)",
+            .{ self.module_names.len, n_ok, n_known_fail, n_new_fail, n_stale, n_inconclusive },
+        );
+
+        if (failed) return step.fail("check-portable: baseline drift -- see errors above", .{});
+    }
+};
+
 const DarkTestsStep = struct {
     step: std.Build.Step,
     /// From `-Ddark-module`; empty means every module. Carried on the step
