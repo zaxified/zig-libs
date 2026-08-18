@@ -1256,7 +1256,7 @@ fn nowNsBench() u64 {
 }
 
 test "bench (opt-in via BBS_BENCH): computeB-shape loop vs Pippenger MSM crossover" {
-    if (std.testing.environ.getPosix("BBS_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("BBS_BENCH") == null) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xF4F4_CAFE);

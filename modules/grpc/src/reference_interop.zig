@@ -107,10 +107,10 @@ fn skip(reason: []const u8) error{SkipZigTest} {
 /// `$GRPC_PYTHON` if set, else the interpreter this repository's grpcio
 /// virtualenv lives in, else a bare `python3`. `buf` backs the middle case.
 fn interpreter(buf: []u8) []const u8 {
-    if (std.process.Environ.getPosix(std.testing.environ, "GRPC_PYTHON")) |p| {
+    if (testkit.getEnv("GRPC_PYTHON")) |p| {
         if (p.len != 0) return p;
     }
-    if (std.process.Environ.getPosix(std.testing.environ, "HOME")) |home| {
+    if (testkit.getEnv("HOME")) |home| {
         const path = std.fmt.bufPrint(buf, "{s}/.cache/zig-libs-grpc/bin/python", .{home}) catch return "python3";
         std.Io.Dir.cwd().access(testing.io, path, .{}) catch return "python3";
         return path;

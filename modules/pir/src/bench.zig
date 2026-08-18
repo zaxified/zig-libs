@@ -105,7 +105,7 @@ fn benchShardOverhead(
 }
 
 test "bench (opt-in via PIR_BENCH)" {
-    if (std.testing.environ.getPosix("PIR_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("PIR_BENCH") == null) return error.SkipZigTest;
     std.debug.print(
         "\n=== pir answerRange sharding overhead (F4) — single-threaded sum-of-shards vs whole-DB answer ===\n",
         .{},

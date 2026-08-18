@@ -189,7 +189,7 @@ fn benchSize(comptime bits: comptime_int, rand: std.Random) void {
 }
 
 test "bench (opt-in via MONTINT_BENCH)" {
-    if (std.testing.environ.getPosix("MONTINT_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("MONTINT_BENCH") == null) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0xB0FFED_BEEF);
     const rand = prng.random();
     std.debug.print("\n=== montint full-table bench (asm_active={}) ===\n", .{montint.asm_active});

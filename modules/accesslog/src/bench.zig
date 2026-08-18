@@ -163,7 +163,7 @@ fn nsPerRecord(dt: u64) f64 {
 }
 
 test "bench (opt-in via ACCESSLOG_BENCH): UTF-8 sanitization cost per record" {
-    if (std.testing.environ.getPosix("ACCESSLOG_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("ACCESSLOG_BENCH") == null) return error.SkipZigTest;
 
     var buf: [4096]u8 = undefined;
     std.debug.print(

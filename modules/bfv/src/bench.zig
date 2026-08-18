@@ -277,7 +277,7 @@ fn benchRescale(comptime P: params.Params, iters: usize) void {
 }
 
 test "bench (opt-in via BFV_BENCH)" {
-    if (std.testing.environ.getPosix("BFV_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("BFV_BENCH") == null) return error.SkipZigTest;
     std.debug.print("\n=== bfv arithmetic bench (old path vs new path, same binary) ===\n", .{});
     benchModmul();
 

@@ -115,7 +115,7 @@ fn report(name: []const u8, r: Result) void {
 }
 
 test "pagecache: F3 copy/allocation cost of a page read, copying seam vs borrow seam" {
-    if (std.testing.environ.getPosix("PAGECACHE_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("PAGECACHE_BENCH") == null) return error.SkipZigTest;
 
     // NOT std.testing.allocator: its per-allocation bookkeeping is the same
     // order as the page copy this bench exists to measure.

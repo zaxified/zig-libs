@@ -29,7 +29,7 @@ fn nowNs() u64 {
 const k256_label = if (field.field_asm_active) "k256-ASM " else "k256-PORT";
 
 test "bench (opt-in via K256_BENCH)" {
-    if (std.testing.environ.getPosix("K256_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("K256_BENCH") == null) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0x2B15_C0DE);
     const rand = prng.random();
     std.debug.print("\n=== k256 bench (field_asm={}, glv={}) ===\n", .{

@@ -15,6 +15,7 @@
 const std = @import("std");
 const report = @import("report.zig");
 const mms = @import("mms.zig");
+const testkit = @import("testkit");
 
 fn nowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
@@ -56,7 +57,7 @@ const captured_report = [_]u8{
 };
 
 test "bench (opt-in via IEC61850_BENCH): F4 report decode cost, by-value vs out-param" {
-    if (std.testing.environ.getPosix("IEC61850_BENCH") == null) return error.SkipZigTest;
+    if (testkit.getEnv("IEC61850_BENCH") == null) return error.SkipZigTest;
 
     const iters: usize = 200_000;
 

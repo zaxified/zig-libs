@@ -36,6 +36,7 @@ fn nowNs() u64 {
 }
 
 fn enabled() bool {
+    if (@import("builtin").target.os.tag == .windows) return false;
     return std.testing.environ.getPosix("TFHE_BENCH") != null;
 }
 

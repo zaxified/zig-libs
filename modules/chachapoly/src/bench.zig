@@ -43,7 +43,7 @@ fn mbps(len: usize, iters: usize, dt_ns: u64) f64 {
 }
 
 test "bench (opt-in via CHACHAPOLY_BENCH)" {
-    if (std.testing.environ.getPosix("CHACHAPOLY_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("CHACHAPOLY_BENCH") == null) return error.SkipZigTest;
 
     // 8 KiB working set — see the OOM note in the module doc comment.
     const len = 8 * 1024;

@@ -61,6 +61,7 @@
 //! values from each other"` below keeps both halves of that from drifting.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const yaml = @import("root.zig");
 
@@ -70,13 +71,24 @@ const ledger_text = @embedFile("testdata/ledger.txt");
 
 const default_suite = ".cache/zig-libs-yaml/yaml-test-suite-data";
 
+/// Portable env-var read for tests — see `testkit.getEnv`'s doc comment for
+/// why the plain `std.testing.environ.getPosix` idiom does not compile for
+/// `x86_64-windows-gnu` (its own body references `GlobalBlock.view()`, which
+/// does not exist). Duplicated here rather than routed through `testkit`
+/// because `yaml` does not carry `testkit` as a `test_deps` entry in
+/// `build.zig` — wiring that up is out of scope for this fix.
+fn envRead(name: []const u8) ?[]const u8 {
+    if (builtin.target.os.tag == .windows) return null;
+    return std.process.Environ.getPosix(testing.environ, name);
+}
+
 /// Nothing may reach stderr on a green run: `scripts/test.sh` treats a step
 /// that writes to stderr as failed, precisely so a test cannot warn its way
 /// past the gate. The skip notice and the score line are therefore opt-in,
 /// behind the same `ZIG_LIBS_VERBOSE_SKIP` switch `dtls` uses. A skipped test
 /// is still visible without it — `--summary all` reports it as skipped.
 fn verbose() bool {
-    const v = std.process.Environ.getPosix(testing.environ, "ZIG_LIBS_VERBOSE_SKIP") orelse return false;
+    const v = envRead("ZIG_LIBS_VERBOSE_SKIP") orelse return false;
     return v.len > 0;
 }
 
@@ -152,11 +164,10 @@ fn collectCases(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, out: *std.
 }
 
 fn suitePath(gpa: std.mem.Allocator) !?[]u8 {
-    const env = testing.environ;
-    if (std.process.Environ.getPosix(env, "ZIG_LIBS_YAML_SUITE")) |p| {
+    if (envRead("ZIG_LIBS_YAML_SUITE")) |p| {
         if (p.len > 0) return try gpa.dupe(u8, p);
     }
-    const home = std.process.Environ.getPosix(env, "HOME") orelse return null;
+    const home = envRead("HOME") orelse return null;
     return try std.fs.path.join(gpa, &.{ home, default_suite });
 }
 

@@ -4485,7 +4485,7 @@ fn benchRsa(comptime bits: usize, random: std.Random) void {
 }
 
 test "bench: montint vs ff (opt-in via RSA_BENCH)" {
-    if (std.testing.environ.getPosix("RSA_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("RSA_BENCH") == null) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0x5A17_C0DE_F00D);
     const random = prng.random();
     std.debug.print("\n=== rsa modexp bench: montint vs std.crypto.ff (same key/host) ===\n", .{});

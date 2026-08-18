@@ -2286,7 +2286,7 @@ fn flushThrough(w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// Dump one secure sequence's raw exchange when `OPCUA_CAPTURE_DIR` is set —
 /// the client-side counterpart of `server_interop.zig`'s `Driver.dumpCapture`.
 fn dumpSecureCapture(io: std.Io, tag: []const u8, c2s: []const u8, s2c: []const u8) void {
-    const dir_path = std.process.Environ.getPosix(std.testing.environ, "OPCUA_CAPTURE_DIR") orelse return;
+    const dir_path = testkit.getEnv("OPCUA_CAPTURE_DIR") orelse return;
     var path_buf: [256]u8 = undefined;
     if (std.fmt.bufPrint(&path_buf, "{s}/{s}-c2s.bin", .{ dir_path, tag })) |path| {
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = c2s }) catch {};
@@ -2304,7 +2304,7 @@ fn dumpSecureCapture(io: std.Io, tag: []const u8, c2s: []const u8, s2c: []const 
 /// third-party ciphertext without needing the (ephemeral, OS-entropy-seeded,
 /// never persisted) RSA keypair that produced them via the OPN handshake.
 fn dumpSecureKeys(io: std.Io, tag: []const u8, keys: security.ChannelKeys) void {
-    const dir_path = std.process.Environ.getPosix(std.testing.environ, "OPCUA_CAPTURE_DIR") orelse return;
+    const dir_path = testkit.getEnv("OPCUA_CAPTURE_DIR") orelse return;
     var path_buf: [256]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}-keys.bin", .{ dir_path, tag }) catch return;
     var blob: [32 + 32 + 16 + 32 + 32 + 16]u8 = undefined;

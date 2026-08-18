@@ -405,7 +405,7 @@ test "a GOOSE subscriber configured from SCL accepts the publisher SCL describes
 // All three print `SKIPPED: …` and pass when no peer is present.
 
 fn envVar(name: []const u8) ?[]const u8 {
-    return std.process.Environ.getPosix(std.testing.environ, name);
+    return testkit.getEnv(name);
 }
 
 const Endpoint = struct { host: []const u8, port: u16 };

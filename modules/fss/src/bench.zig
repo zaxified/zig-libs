@@ -217,7 +217,7 @@ fn benchPrgPair(comptime n_bits: usize) !void {
 }
 
 test "bench (opt-in via FSS_BENCH)" {
-    if (std.testing.environ.getPosix("FSS_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("FSS_BENCH") == null) return error.SkipZigTest;
 
     std.debug.print(
         "\n=== fss PRG: SHA-256 vs fixed-key AES (hardware AES: {}) ===\n",

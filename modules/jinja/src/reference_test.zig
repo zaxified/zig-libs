@@ -84,7 +84,7 @@ fn runReference(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
 
     // Regeneration hook: this is exactly how testdata/golden.json is produced,
     // so the two oracles can never be produced by different procedures.
-    if (std.process.Environ.getPosix(std.testing.environ, "ZIG_LIBS_JINJA_REGEN")) |path| {
+    if (testkit.getEnv("ZIG_LIBS_JINJA_REGEN")) |path| {
         if (path.len > 0) {
             var f = try std.Io.Dir.cwd().createFile(io, path, .{});
             defer f.close(io);

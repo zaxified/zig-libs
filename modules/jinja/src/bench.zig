@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const testkit = @import("testkit");
 
 fn nowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
@@ -128,7 +129,7 @@ fn benchContext(arena: std.mem.Allocator, n_rows: usize) !root.Value {
 }
 
 test "bench (opt-in via JINJA_BENCH): what a caller-owned template cache would buy" {
-    if (std.testing.environ.getPosix("JINJA_BENCH") == null) return error.SkipZigTest;
+    if (testkit.getEnv("JINJA_BENCH") == null) return error.SkipZigTest;
     // NOT `std.testing.allocator`: that is a `DebugAllocator` with guard pages
     // and per-allocation bookkeeping, and it costs ~50 us per render here —
     // an order of magnitude more than anything jinja does, which would drown

@@ -22,6 +22,7 @@
 //! side is already a module: `netsim`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const meta = .{
     .platform = .any,
@@ -43,6 +44,34 @@ pub const expectBytes = @import("golden.zig").expectBytes;
 
 // ── skips ────────────────────────────────────────────────────────────────
 
+/// Portable env-var read for tests.
+///
+/// (`std.posix.getenv` does not exist in Zig 0.16; `std.testing.environ` +
+/// `Environ.getPosix` is this repo's env-read pattern in tests.) That idiom
+/// does not compile for `x86_64-windows-gnu`: `Environ.Block` resolves to
+/// `GlobalBlock` there, which has no `.view()` method (`WindowsBlock`, which
+/// does, is not the type `native_os == .windows` selects) — so `getPosix`'s
+/// own body fails to compile for that target, regardless of how the result is
+/// used. Measured 2026-08-18: this was one defect copy-pasted into 42
+/// call sites across 26 modules (`if (std.testing.environ.getPosix("X_BENCH")
+/// == null) return error.SkipZigTest;` and this module's own `verboseSkip`),
+/// blocking the Windows cross-compile of every one of them.
+///
+/// The `if` below is a comptime-known branch — `builtin.target.os.tag` is
+/// fixed at compile time — so Sema never analyses the `getPosix` call for a
+/// Windows target and the compile error above never triggers. Returning
+/// `null` is the honest answer for what this repo uses env reads for in
+/// tests: bench opt-ins and skip-reason toggles, neither of which has a
+/// Windows-side story to tell (`Environ.getWindows` exists but returns
+/// WTF-16 and needs an allocator to become UTF-8 — real plumbing this call
+/// is not worth for a bench gate). A caller that truly needs the Windows
+/// value should call `std.process.Environ.getWindows` directly and own that
+/// conversion; this helper is deliberately not it.
+pub fn getEnv(name: []const u8) ?[]const u8 {
+    if (builtin.target.os.tag == .windows) return null;
+    return std.process.Environ.getPosix(std.testing.environ, name);
+}
+
 /// Whether a skipping test may explain itself on stderr.
 ///
 /// Off by default, and that default is load-bearing: `zig build test` prints a
@@ -51,8 +80,6 @@ pub const expectBytes = @import("golden.zig").expectBytes;
 /// COUNT still reaches the summary either way. Set `ZIG_LIBS_VERBOSE_SKIP` to
 /// any non-empty value when you want the reasons.
 ///
-/// (`std.posix.getenv` does not exist in Zig 0.16; `std.testing.environ` +
-/// `Environ.getPosix` is this repo's env-read pattern in tests.)
 /// ⚠ The NAME is not pinned by any test here, and cannot be: a test that reads
 /// the same literal it is checking is circular, and a test binary cannot set a
 /// variable for itself. A typo'd name would silently mean "never verbose"
@@ -63,7 +90,7 @@ pub const expectBytes = @import("golden.zig").expectBytes;
 pub const verbose_skip_env = "ZIG_LIBS_VERBOSE_SKIP";
 
 pub fn verboseSkip() bool {
-    return verboseEnabled(std.process.Environ.getPosix(std.testing.environ, verbose_skip_env));
+    return verboseEnabled(getEnv(verbose_skip_env));
 }
 
 /// The decision, split out from the environment read so it can be tested.
@@ -107,6 +134,17 @@ test "verboseSkip agrees with the logic for the ambient environment" {
     // Weak by construction -- it reads the same constant the function does, so
     // it cannot catch a wrong NAME (see verbose_skip_env's warning). It does
     // catch the read being wired to the wrong predicate.
-    const raw = std.process.Environ.getPosix(std.testing.environ, verbose_skip_env);
+    const raw = getEnv(verbose_skip_env);
     try std.testing.expectEqual(verboseEnabled(raw), verboseSkip());
+}
+
+test "getEnv returns null on windows without touching Environ.getPosix" {
+    // The reason this helper exists at all: on windows, calling
+    // Environ.getPosix would fail to *compile*, not just return null. This
+    // test only runs on windows when someone actually executes a windows
+    // test binary (CI here never does — cross-compiled only), but it pins
+    // the honest-null behavior for the platform this file cannot otherwise
+    // demonstrate a build failure for.
+    if (builtin.target.os.tag != .windows) return;
+    try std.testing.expectEqual(@as(?[]const u8, null), getEnv("ANYTHING"));
 }

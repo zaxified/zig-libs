@@ -85,7 +85,7 @@ fn callDrainSrmIterator(db: *const Lsdb, iface: u8) usize {
 }
 
 test "bench (opt-in via ISIS_LSDB_BENCH): F7 flooding-flag query cost, idle and busy" {
-    if (std.testing.environ.getPosix("ISIS_LSDB_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("ISIS_LSDB_BENCH") == null) return error.SkipZigTest;
 
     // NOT std.testing.allocator: a DebugAllocator's per-allocation bookkeeping
     // would dwarf the O(n) vs O(#queued) difference this bench exists to show.

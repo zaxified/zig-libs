@@ -546,7 +546,7 @@ const Driver = struct {
     /// Dump the captured streams when `OPCUA_CAPTURE_DIR` is set — how the
     /// goldens were cut, and how the rawshark cross-check was fed.
     fn dumpCapture(d: *Driver, tag: []const u8) void {
-        const dir_path = std.process.Environ.getPosix(std.testing.environ, "OPCUA_CAPTURE_DIR") orelse return;
+        const dir_path = testkit.getEnv("OPCUA_CAPTURE_DIR") orelse return;
         var path_buf: [256]u8 = undefined;
         if (std.fmt.bufPrint(&path_buf, "{s}/{s}-c2s.bin", .{ dir_path, tag })) |path| {
             std.Io.Dir.cwd().writeFile(d.io, .{ .sub_path = path, .data = d.capture_c2s.items }) catch {};
@@ -1953,7 +1953,7 @@ fn runProcess(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !Pod
 /// The interpreter to drive `asyncua` with: `$OPCUA_PYTHON` if set (point it
 /// at a virtualenv), otherwise whatever `python3` resolves to.
 fn pythonInterpreter() []const u8 {
-    return std.process.Environ.getPosix(std.testing.environ, "OPCUA_PYTHON") orelse "python3";
+    return testkit.getEnv("OPCUA_PYTHON") orelse "python3";
 }
 
 test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/write/call/subscribe, Sign + encrypted username, token renewal" {

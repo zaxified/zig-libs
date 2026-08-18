@@ -45,7 +45,7 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 fn envVar(name: []const u8) ?[]const u8 {
-    return std.process.Environ.getPosix(testing.environ, name);
+    return testkit.getEnv(name);
 }
 
 fn sleepMs(ms: u64) void {

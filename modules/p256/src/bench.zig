@@ -30,7 +30,7 @@ fn nowNs() u64 {
 const p256_label = if (field.field_asm_active) "p256-ASM " else "p256-PORT";
 
 test "bench (opt-in via P256_BENCH)" {
-    if (std.testing.environ.getPosix("P256_BENCH") == null) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("P256_BENCH") == null) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0x2B15_9256);
     const rand = prng.random();
     std.debug.print("\n=== p256 bench (field_asm={}, fast_scalarmul={}) ===\n", .{
