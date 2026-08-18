@@ -147,8 +147,9 @@ pub const Options = struct {
     /// is checked out of / returned to the pool instead, so a gateway that
     /// churns h2 upstream connections reuses a bounded set of slabs rather
     /// than allocating one per dial. **The pool's `slab_size` MUST equal
-    /// `read_buffer_size + write_buffer_size`** (asserted in `connectH2c`) —
-    /// it serves exactly that one size class. The h1 path deliberately does
+    /// `read_buffer_size + write_buffer_size`** (`connectH2c` returns
+    /// `error.BufferPoolSizeMismatch` otherwise) — it serves exactly that
+    /// one size class. The h1 path deliberately does
     /// NOT use it: h1's idle `Pool` already recycles whole warm connections
     /// (buffers included), so h1 never churns per-request buffers the way a
     /// fresh h2c dial does. Shared across threads (the pool is internally
@@ -234,6 +235,11 @@ pub const Error = error{
     /// does not fall back to a weaker source, so this is fail-closed rather
     /// than silently-degraded randomness.
     EntropyUnavailable,
+    /// `connectH2c`: `Options.buffer_pool` is set, but its `slab_size` does
+    /// not equal `read_buffer_size + write_buffer_size` — the pool serves
+    /// one size class and this dial needs a different one. Checked before
+    /// any allocation or I/O.
+    BufferPoolSizeMismatch,
 };
 
 /// `io` must support the net + async vtable operations (e.g.
@@ -683,11 +689,23 @@ pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Op
     url.writeHostHeaderValue(&auth_w) catch return error.BadUrl;
 
     const slab_len = c.options.read_buffer_size + c.options.write_buffer_size;
+    // Slab from the shared pool when one is configured (its size class must
+    // match this layout), else a fresh allocation freed on close. Checked
+    // BEFORE any allocation: `Options.buffer_pool` and
+    // `read_buffer_size`/`write_buffer_size` are two independently
+    // caller-supplied config points with no type-level link between them, so
+    // a mismatch is an ordinary caller-config mistake, not something the
+    // type system can rule out. This used to be `std.debug.assert`, which
+    // compiles to nothing in ReleaseFast/ReleaseSmall; the very next lines
+    // slice the acquired slab by fixed offset (`slab[0..read_buffer_size]`,
+    // `slab[read_buffer_size..]`) with no length check of their own, so a
+    // mismatched pool meant an unchecked out-of-bounds slice — or a silently
+    // undersized write buffer — in exactly the modes people deploy.
+    if (c.options.buffer_pool) |bp| {
+        if (bp.slab_size != slab_len) return error.BufferPoolSizeMismatch;
+    }
     const hs = try c.gpa.create(H2Session);
     errdefer c.gpa.destroy(hs);
-    // Slab from the shared pool when one is configured (its size class must
-    // match this layout), else a fresh allocation freed on close.
-    if (c.options.buffer_pool) |bp| std.debug.assert(bp.slab_size == slab_len);
     const slab = if (c.options.buffer_pool) |bp| try bp.acquire() else try c.gpa.alloc(u8, slab_len);
     errdefer if (c.options.buffer_pool) |bp| bp.release(slab) else c.gpa.free(slab);
     const authority = try c.gpa.dupe(u8, auth_w.buffered());
@@ -1780,6 +1798,38 @@ test "setupBody framing decisions on fabricated heads" {
     // Neither → read-until-close.
     setupBody(&conn, .get, try h1.ResponseHead.parse("HTTP/1.1 200 OK\r\n"));
     try testing.expect(conn.body == .until_close);
+}
+
+test "connectH2c: buffer pool size mismatch is a checked error, not UB" {
+    // The fail-open regression this guards: `std.debug.assert(bp.slab_size
+    // == slab_len)` used to be the only thing standing between this
+    // caller-config mistake and the very next lines, which slice the
+    // acquired slab by fixed offset (`slab[0..read_buffer_size]`,
+    // `slab[read_buffer_size..]`) with no length check of their own —
+    // compiled to nothing in ReleaseFast/ReleaseSmall. This test is
+    // meaningful in every optimize mode: the check now runs before any
+    // allocation or I/O, so no live server is needed to exercise it.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var bp = BufferPool.init(gpa, 128, 0); // deliberately not read+write_buffer_size
+    defer bp.deinit();
+    var client = Client.init(io, gpa, .{
+        .buffer_pool = &bp,
+        .read_buffer_size = 4096,
+        .write_buffer_size = 4096,
+    });
+    defer client.deinit();
+
+    try testing.expectError(
+        error.BufferPoolSizeMismatch,
+        client.connectH2c("127.0.0.1", 1, .{}),
+    );
+    // The mismatch was caught before the pool (or the allocator) was ever
+    // touched for this dial.
+    try testing.expectEqual(@as(usize, 0), bp.checkoutCount());
 }
 
 // ── tests (h2c dogfood: our h2 client against our h2c server, loopback) ─────

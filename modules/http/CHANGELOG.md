@@ -5,6 +5,63 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — **BREAKING (narrow)** — three fail-open `std.debug.assert` guards on
+  caller-supplied sizing became checked errors / a defensive restructure, the same
+  `reset()` shape as the 2026-08-13 entry below: `assert` is `if (!ok) unreachable;`,
+  compiled to nothing in `ReleaseFast`/`ReleaseSmall`, so each was a precondition that
+  held only in the modes nobody ships.
+  - `range.zig`'s `MultipartRanges.writeBody` — this morning's `7dff02d` added
+    `std.debug.assert(r.end < data.len)` ahead of `data[r.start..r.end+1]` as a guard
+    against a caller passing `data`/`ranges` resolved against different `total`s (R2 and
+    R3 are deliberately decoupled — a `ResolvedRange` set can be resolved long before the
+    `data` it is later served against is even chosen). `writeBody` now returns
+    `WriteBodyError!void` (`std.Io.Writer.Error || error{RangeOutOfBounds}`), pre-checking
+    every range against `data.len` **before** writing anything, so a mismatch fails
+    atomically rather than emitting a truncated multipart body. Verified no in-repo caller
+    reaches the old bug: `staticfiles` (the module's only in-repo consumer) never calls
+    `writeBody` — it falls back to a full 200 on multi-range requests — so this was an
+    unsound public API with no live blast radius yet, not a shipped defect.
+  - `bufpool.zig`'s `BufferPool.release` — `std.debug.assert(slab.len == p.slab_size)` was
+    the only guard against a caller returning a wrong-sized slab into the shared idle
+    pool. Restructured instead of erroring: a mismatched `slab` is now freed rather than
+    pooled, so `acquire`'s "always exactly `slab_size`" postcondition holds
+    unconditionally rather than by caller cooperation — no signature change, `release`
+    still never fails. Matters because a bad slab re-entering the pool would surface
+    downstream, at `Client.connectH2c`, which trusts an acquired slab's length without
+    re-checking.
+  - `Client.zig`'s `connectH2c` — `std.debug.assert(bp.slab_size == slab_len)` guarded
+    `slab[0..read_buffer_size]` / `slab[read_buffer_size..]`, a fixed-offset split with no
+    length check of its own. `Options.buffer_pool` and `read_buffer_size`/
+    `write_buffer_size` are two independently caller-supplied config points with no
+    type-level link, so a checked error is the right shape here (not a restructure): the
+    check now runs before any allocation or I/O and returns the new `Error.
+    BufferPoolSizeMismatch`.
+  Swept the rest of `modules/http/` for the same shape (an `assert` immediately guarding
+  an index/slice/cast of caller-supplied data) and found nothing else load-bearing: every
+  other `std.debug.assert` in the module either guards a pure state-machine/protocol
+  invariant with no adjacent unchecked memory op (`Server.zig`'s `bind`/`beginGzip`/
+  `beginStreaming`, `h2.zig`'s role/window-sign/assembly checks, `h2_server.zig`'s
+  `removeJob`, `proxy.zig`'s backend-XOR), or sits ahead of an operation that is
+  independently self-bounded regardless of the assert (`h2_client.zig`'s `readBody` uses
+  `@min(buf.len, src.len)`; `Client.zig`'s pool reap loop guards `reap_n < max_reap_batch`
+  in the loop condition itself; `h2.zig`'s `parseFrame` validates `payload.len` per frame
+  type independently of the `payload.len == h.length` assert). Two are flagged for a
+  follow-up, not fixed here (out of proportion for this pass — both ripple through
+  multiple call sites' signatures/error sets): `h2.zig`'s `FrameHeader.encode`
+  (`std.debug.assert(h.length <= max_allowed_frame_size)` ahead of three `@intCast`s that
+  shift-and-narrow `h.length` into wire bytes — `encodeRawFrame`, the public primitive
+  every frame encoder calls, does not itself bound `payload.len` before handing it to
+  `FrameHeader.length`, so a payload over 16 MiB reaches the narrowing casts unchecked in
+  `ReleaseFast`); and `Server.zig`'s `ResponseWriter.init`
+  (`std.debug.assert(opts.compression == null or opts.gzip_scratch != null)` ahead of
+  `beginGzip`'s `rw.gzip_scratch.?` — the one in-repo caller, `serveOne`, already computes
+  the safe combination before calling `init`, so this is reachable only via direct
+  `ResponseWriter` construction outside `serveStream`, but `init` is `pub` and the two
+  `InitOptions` fields have no type-level link either).
+  `zig build test-http` — 436/436 pass, native, `-Doptimize=ReleaseFast` included (the
+  mode all three old asserts vanished in). Three new tests pin the fixes; each is
+  meaningful in every optimize mode, unlike the assert it replaces, because each now
+  exercises real control flow rather than a safety check.
 - **2026-08-18** — `check-portable` (wasm32-wasi 32-bit probe) fixes, 10 sites across 3
   files, none behavior-changing on a 64-bit host. `http` is a hub dependency (19 `.any`
   modules import it — acme, cookies, cors, grpc, health, idempotency, jwt, mcp-http,

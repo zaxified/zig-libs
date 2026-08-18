@@ -446,28 +446,59 @@ pub const MultipartRanges = struct {
         return total;
     }
 
+    /// Error surfaced by `writeBody` when `data` cannot back the ranges it
+    /// was asked to serve — see `writeBody`'s doc comment.
+    pub const WriteBodyError = std.Io.Writer.Error || error{
+        /// A range's `end` (0-based, inclusive) does not fit in `data` — i.e.
+        /// `data.len` is not the `total` the ranges were resolved against.
+        /// The caller passed a mismatched `data`/`ranges` pair; nothing was
+        /// written to `w`.
+        RangeOutOfBounds,
+    };
+
     /// Write the full multipart body, taking each part's bytes from `data`
     /// (the entire selected representation; `data.len` must equal the `total`
-    /// used to resolve the ranges, so `data[r.start .. r.end + 1]` is in bounds).
-    /// For representations not held in memory, use the lower-level
-    /// `writePartHeader` / `writeClose` and stream each range's bytes yourself.
+    /// used to resolve the ranges, so `data[r.start .. r.end + 1]` is in
+    /// bounds). Every range is checked against `data.len` **before** any
+    /// byte is written, so a mismatch fails atomically with
+    /// `error.RangeOutOfBounds` rather than emitting a truncated multipart
+    /// body. For representations not held in memory, use the lower-level
+    /// `writePartHeader` / `writeClose` and stream each range's bytes
+    /// yourself.
+    ///
+    /// This is a caller contract on a public API taking caller-supplied
+    /// `data`: `resolve`/`resolveSpec` guarantee every range's `end` is
+    /// `< total`, but nothing ties `total` to `data.len` at the type level —
+    /// `ranges` may have been resolved long before `data` is even chosen (R2
+    /// and R3 are deliberately decoupled, see the module doc). A checked
+    /// error is therefore the right shape, not `std.debug.assert`: an
+    /// `unreachable` behind `assert` is compiled to nothing in
+    /// `ReleaseFast`/`ReleaseSmall` (`std.debug.assert` is exactly
+    /// `if (!ok) unreachable;`), so the narrowing cast below would run on an
+    /// unchecked out-of-bounds slice in the modes production binaries
+    /// actually ship — memory-safety UB, not a caught error.
     pub fn writeBody(
         self: MultipartRanges,
         w: *std.Io.Writer,
         ranges: []const ResolvedRange,
         data: []const u8,
-    ) std.Io.Writer.Error!void {
+    ) WriteBodyError!void {
+        // Preflight every range before writing anything: an atomic
+        // succeed-fully-or-write-nothing contract, not a partial multipart
+        // body followed by an error mid-stream.
+        for (ranges) |r| {
+            if (r.end >= data.len) return error.RangeOutOfBounds;
+        }
         for (ranges) |r| {
             try self.writePartHeader(w, r);
             // `ResolvedRange.start`/`.end` are `u64` -- deliberately wide so a
             // representation can be described independent of any one host's
             // address space (RFC 7233 puts no bound on a resource's size).
-            // The doc comment's invariant (`data.len == total` used to
-            // resolve `ranges`) is what makes narrowing to `usize` safe here:
-            // `resolve` clamps every range to `total`, and `data` is an
-            // actual in-memory slice, so `r.end` can never exceed `data.len`
-            // - 1, which is itself `usize`-representable by construction.
-            std.debug.assert(r.end < data.len);
+            // The preflight loop above is what makes narrowing to `usize`
+            // safe here (r.end < data.len, checked, not assumed), and
+            // `r.start <= r.end` always holds by construction of
+            // `ResolvedRange` (see `resolveSpec`), so both casts are in
+            // range whenever the loop above didn't already return.
             try w.writeAll(data[@intCast(r.start)..@intCast(r.end + 1)]);
             try w.writeAll("\r\n");
         }
@@ -898,6 +929,36 @@ test "MultipartRanges.writeBody: byte-exact multipart/byteranges envelope" {
         "\r\n" ++
         "--SEP--\r\n";
     try testing.expectEqualStrings(expected, w.written());
+}
+
+test "MultipartRanges.writeBody: mismatched data/total is a checked error, not UB" {
+    // The fail-open regression this guards: `resolve` was called against
+    // `total = 10`, but `writeBody` is then handed a SHORTER `data` slice —
+    // exactly the caller mistake `std.debug.assert(r.end < data.len)` used
+    // to be the only guard against. That assert compiles to nothing in
+    // `ReleaseFast`/`ReleaseSmall` (it is `if (!ok) unreachable;`), so this
+    // test is meaningful in EVERY optimize mode: Debug and ReleaseSafe would
+    // have caught the old bug via a panic (a crash, not a returned error,
+    // and a crash the caller cannot recover from), while ReleaseFast/
+    // ReleaseSmall would have silently sliced out of bounds — this test
+    // fails in exactly the modes where the old code would not have panicked
+    // at all, which is the point.
+    const data = "0123456789"; // len 10
+    const mp = MultipartRanges{ .boundary = "SEP", .content_type = "text/plain" };
+    var specbuf: [4]ByteRangeSpec = undefined;
+    // Resolved against total = 20: `-2` (suffix) resolves to [18, 19].
+    const specs = try parse("bytes=0-3, -2", &specbuf);
+    var out: [4]ResolvedRange = undefined;
+    const ranges = resolve(specs, 20, &out);
+    try testing.expectEqual(@as(usize, 2), ranges.len);
+    try testing.expectEqual(@as(u64, 19), ranges[1].end);
+
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try testing.expectError(error.RangeOutOfBounds, mp.writeBody(&w.writer, ranges, data));
+    // Preflight-checked before any write: nothing landed in `w`, not even
+    // the first (in-bounds) range's part.
+    try testing.expectEqual(@as(usize, 0), w.written().len);
 }
 
 test "MultipartRanges.bodyLen matches writeBody's output length" {

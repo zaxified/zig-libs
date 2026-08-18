@@ -97,8 +97,28 @@ pub const BufferPool = struct {
     /// `slab_size`) to the idle reserve, or free it when the reserve is
     /// already at `max_idle_slabs` or its own bookkeeping cannot grow.
     /// Never fails, never leaks.
+    ///
+    /// A `slab` whose length does not match `slab_size` is freed rather than
+    /// pooled — never retained in `idle`. `acquire`'s whole contract is that
+    /// every slab it hands out is exactly `slab_size` bytes, which every
+    /// consumer of this shared pool trusts without re-checking (e.g.
+    /// `Client.connectH2c` slices an acquired slab into
+    /// `read_buffer_size`/`write_buffer_size` halves by fixed offset, no
+    /// length check of its own). A `std.debug.assert` here used to be the
+    /// only thing standing between a caller's size mistake and that promise
+    /// — compiled to nothing in `ReleaseFast`/`ReleaseSmall`, so in the
+    /// modes production binaries ship a wrong-sized slab would have entered
+    /// `idle` silently and come back out of a LATER, unrelated `acquire()`
+    /// call to code with no way to know it was ever mis-sized. Refusing to
+    /// pool it makes `acquire`'s postcondition hold unconditionally instead
+    /// of by caller cooperation, and does so without breaking the "never
+    /// fails" signature — there is no error to return or ignore, the pool
+    /// just declines to remember the bad slab.
     pub fn release(p: *BufferPool, slab: []u8) void {
-        std.debug.assert(slab.len == p.slab_size);
+        if (slab.len != p.slab_size) {
+            p.gpa.free(slab);
+            return;
+        }
         var keep = false;
         {
             lockSpin(&p.mutex);
@@ -194,6 +214,36 @@ test "bufpool: idle reserve is bounded by max_idle_slabs" {
     p.release(r0);
     p.release(r1);
     p.release(r2);
+}
+
+test "bufpool: release refuses a mis-sized slab (never pools it, never leaks it)" {
+    // The fail-open regression this guards: `std.debug.assert(slab.len ==
+    // p.slab_size)` used to be the only guard here, compiled to nothing in
+    // ReleaseFast/ReleaseSmall. Without a runtime check, a wrong-sized slab
+    // would have entered `idle` and come back out of a LATER `acquire()` to
+    // code that trusts `acquire`'s "always exactly slab_size" contract
+    // without re-checking (`Client.connectH2c` slices its acquired slab by
+    // fixed offset). This test is meaningful in every optimize mode: it
+    // exercises real control flow, not a safety check that only exists in
+    // some of them.
+    var p = BufferPool.init(testing.allocator, 128, 4);
+    defer p.deinit();
+
+    // A slab this pool did NOT hand out (wrong size), freed with the same
+    // allocator so `release`'s fallback free is itself valid.
+    const foreign = try testing.allocator.alloc(u8, 64);
+    p.release(foreign);
+    try testing.expectEqual(@as(usize, 0), p.idleCount());
+
+    // The pool's own slabs are unaffected: still exactly slab_size, still
+    // reused normally.
+    const a = try p.acquire();
+    try testing.expectEqual(@as(usize, 128), a.len);
+    p.release(a);
+    try testing.expectEqual(@as(usize, 1), p.idleCount());
+    const b = try p.acquire();
+    try testing.expectEqual(a.ptr, b.ptr); // reused, not a fresh alloc
+    p.release(b);
 }
 
 test "bufpool: max_idle_slabs 0 disables retention" {
