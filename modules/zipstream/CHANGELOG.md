@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`), test-only: a corrupted-entry test
+  allocated `a.alloc(u8, lying_entry.uncompressed_size)` directly; `uncompressed_size`
+  stays `u64` in production deliberately (zip64 entries can legitimately exceed a 32-bit
+  `usize` — that's what the real `entry.uncompressed_size > max_output` guard exists to
+  reject before any real allocation happens), so it fails to compile as an allocation
+  count on a 32-bit target. This test sets it to a small literal (`1 << 20`) itself a few
+  lines up, so the value is always in-range here; added a documented `@intCast` rather
+  than touching the field's production type. Compile-only, identical semantics — no new
+  test. Verified: `zig build portable-zipstream` and `zig build test-zipstream
+  --summary all` (32/32) both green.
 - **2026-08-11** — Security re-audit, two further findings fixed, plus a doc correction.
   The delivered 1 GiB `default_max_output` ceiling was pinned by nothing — both
   bomb-cap tests passed `initMax` their own explicit values, so raising the shipped

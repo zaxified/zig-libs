@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`): `createGeneratorsWithSeed`'s
+  generator-index loop counter `i` was `u64`, used both to index `out[i - 1]` and to
+  serialize `I2OSP(i, 8)` into the wire format — the array index fails to compile on a
+  32-bit target. `i` only ever ranges over `1..=count`, and `count` is already `usize`
+  (it bounds the `allocator.alloc` call), so there was no actual need for `u64`; narrowed
+  `i` to `usize` (`writeInt(u64, ...)` still accepts it via ordinary implicit widening).
+  Pure type annotation, identical semantics on every target that already built — no new
+  test. Verified: `zig build portable-bbs` no longer errors on this site (a separate,
+  pre-existing `[wasi-surface]` gap — `clock_gettime`/`Environ.view`, unrelated to this
+  fix — still blocks the module) and `zig build test-bbs --summary all` (42/43, 1
+  pre-existing skip).
 - **2026-08-13** — Test-only, neither BREAKING nor BEHAVIOURAL: `bbs.zig` gained a
   seam test proving `calculateRandomScalars`'s `entropy.fill` draw is
   actually read (two draws of the same count from the same `io` must

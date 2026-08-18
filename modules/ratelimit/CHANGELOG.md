@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`): `Limiter.allowAt`'s two
+  `@fieldParentPtr("node", ...)` recoveries of `*Entry` from the intrusive
+  `std.DoublyLinkedList.Node` failed to compile on a 32-bit target, same root cause as
+  aaa-gate's identical pattern: `Entry.bucket.updated_ns` (`u64`) gives `Entry` a
+  stricter alignment than the list node's own fields require there. Wrapped both in
+  `@alignCast`, safe because every `Entry` is allocated via `gpa.create(Entry)` (always
+  `Entry`-aligned, `node` at offset 0) — matching the idiom already used throughout
+  http/ipcbus/zipstream/aaa-gate. Compile-only, identical semantics — no new test.
+  Verified: `zig build portable-ratelimit` no longer errors on this site (the module
+  still fails that gate via its own live-loopback integration test's thread-spawn/
+  `clock_gettime` `[wasi-surface]` gaps, unrelated to this fix and not in scope here) and
+  `zig build test-ratelimit --summary all` (32/32) is green.
 - **2026-08-13** — Test-only, no behaviour change: two regression tests close a coverage gap the
   2026-08-13 `end()` entry below left open. (1) `"middleware: an OUTER middleware writing after
   next.run still lands its header"` pins the property that entry's prose claims — reverting to the

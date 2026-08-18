@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`), test-only: "pow ladder agrees with
+  repeated multiplication" looped `for (0..e)` where `e: u64` — a for-range bound must be
+  `usize`, which fails to compile on a 32-bit target. `pow`'s real API keeps `e: u64`
+  deliberately (a Goldilocks exponent can genuinely range up to the field modulus,
+  ~2^64, e.g. inversion via `pow(a, P - 2)`); this test only ever exercises `e =
+  rnd.int(u8)` (0..255) to cross-check against repeated multiplication, so narrowing just
+  the loop bound is always in-range by construction. Compile-only, identical semantics —
+  no new test. Verified: `zig build portable-rescue` and `zig build test-rescue
+  --summary all` (46/46) both green.
 - **2026-08-14** — Documentation, neither BREAKING nor BEHAVIOURAL.
   `params.zig` called itself "a line-by-line port" of the authors' sage
   reference while the same doc comment said everything in it is derived

@@ -308,10 +308,14 @@ test "arbitrary input never panics" {
     for (0..4000) |_| {
         seed = seed *% 6364136223846793005 +% 1442695040888963407;
         var s = seed;
-        const n = 1 + (s % buf.len);
+        // `s % buf.len` is always `< buf.len` (24) regardless of `s`'s width,
+        // so the cast can never truncate a value that reaches it — this is
+        // a fuzz byte-count bound, not a quantity that needed `u64`.
+        const n: usize = 1 + @as(usize, @intCast(s % buf.len));
         for (buf[0..n]) |*b| {
             s = s *% 6364136223846793005 +% 1442695040888963407;
-            b.* = alphabet[(s >> 33) % alphabet.len];
+            // Same always-in-range modulo as `n` above.
+            b.* = alphabet[@as(usize, @intCast((s >> 33) % alphabet.len))];
         }
         const out = dumpEvents(testing.allocator, buf[0..n]) catch continue;
         testing.allocator.free(out);

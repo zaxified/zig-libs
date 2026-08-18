@@ -221,7 +221,15 @@ pub fn createGeneratorsWithSeed(allocator: std.mem.Allocator, count: usize, seed
     const out = try allocator.alloc(G1.Affine, count);
     errdefer allocator.free(out);
     var v = expandMessage(expand_len, seed_message, seed_dst);
-    var i: u64 = 1;
+    // `i` only ever ranges over `1..=count`, and `count` is already `usize`
+    // (it bounds the `allocator.alloc` above) — there is no value `i` can
+    // hold that a `usize` can't. The `u64` here was accidental width, not a
+    // requirement: the draft's `I2OSP(i, 8)` is the WIRE format (an 8-byte
+    // big-endian field), not a claim that `i` itself needs 64-bit range, and
+    // `std.mem.writeInt(u64, ...)` accepts a `usize` argument via ordinary
+    // implicit widening on every host. Narrowed rather than cast at the
+    // boundary; identical semantics, so no new test.
+    var i: usize = 1;
     while (i <= count) : (i += 1) {
         var input: [expand_len + 8]u8 = undefined;
         input[0..expand_len].* = v;

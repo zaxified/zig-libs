@@ -398,12 +398,12 @@ pub const Sim = struct {
         }
 
         var delay: Time = link.cfg.latency;
-        if (link.cfg.jitter > 0) delay += self.prng.below(link.cfg.jitter + 1);
+        if (link.cfg.jitter > 0) delay += self.prng.belowWide(link.cfg.jitter + 1);
         if (link.cfg.bandwidth) |bw| {
             if (bw > 0) delay += payload.len / bw;
         }
         if (link.cfg.reorder_extra > 0 and self.prng.permille(link.cfg.reorder_permille))
-            delay += self.prng.below(link.cfg.reorder_extra + 1);
+            delay += self.prng.belowWide(link.cfg.reorder_extra + 1);
         if (link.delay_pending > 0) {
             delay += link.delay_pending;
             link.delay_pending = 0;

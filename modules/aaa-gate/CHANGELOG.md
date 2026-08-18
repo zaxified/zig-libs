@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`): `Throttle.decide`'s two
+  `@fieldParentPtr("node", ...)` recoveries of `*Entry` from the intrusive
+  `std.DoublyLinkedList.Node` failed to compile on a 32-bit target — `Entry.last_ns`/
+  `suppressed` (`u64`) give `Entry` a stricter alignment than the list node's own fields
+  alone require there, so the compiler can't prove the recovered pointer's alignment from
+  `tail`'s declared type. Wrapped both in `@alignCast`, safe because every `Entry` is
+  allocated via `gpa.create(Entry)` (always `Entry`-aligned, `node` at offset 0) — the
+  same idiom already used throughout http/ipcbus/zipstream for identical intrusive
+  lists. Compile-only, identical semantics — no new test. Verified: `zig build
+  portable-aaa-gate` no longer errors on this site (the module still fails that gate via
+  its own live-loopback integration test's thread-spawn/`clock_gettime`
+  `[wasi-surface]` gaps, unrelated to this fix) and `zig build test-aaa-gate --summary
+  all` (45/45) is green.
 - **2026-08-17** — Bearer parity with the API-key half, plus two escape hatches. New
   `TokenVerifyFn` + `Options.token_verify`/`token_verify_ctx`: the bearer mirror of
   `api_key_verify` — consulted after the static token set misses, outside the lock, and

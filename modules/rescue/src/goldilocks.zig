@@ -303,9 +303,15 @@ test "pow ladder agrees with repeated multiplication" {
     const rnd = prng.random();
     for (0..64) |_| {
         const a = fromU64(rnd.int(u64));
+        // `pow`'s real API takes `e: u64` deliberately — a Goldilocks
+        // exponent can genuinely range up to the field modulus (~2^64), e.g.
+        // inversion via `pow(a, P - 2)`. This test only exercises a TINY
+        // exponent (`rnd.int(u8)`, 0..255) to cross-check against repeated
+        // multiplication, so narrowing it back down for the loop bound is
+        // always in-range by construction, not a truncation risk.
         const e: u64 = rnd.int(u8);
         var expected: u64 = 1;
-        for (0..e) |_| expected = mul(expected, a);
+        for (0..@as(usize, @intCast(e))) |_| expected = mul(expected, a);
         try std.testing.expectEqual(expected, pow(a, e));
     }
 }

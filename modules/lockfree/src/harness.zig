@@ -61,7 +61,14 @@ pub const StressConfig = struct {
     producers: usize,
     consumers: usize,
     /// Items each producer enqueues (its disjoint tagged range `[0,n)`).
-    per_producer: u64,
+    /// `usize`, not `u64`: this is a stress-test item COUNT that directly
+    /// sizes `total`/`seen`/list-capacity allocations below, all of which are
+    /// already `usize`-bounded — there is no run this harness can perform
+    /// that needs more than `usize` items per producer. The packed
+    /// `(pid,seq)` wire encoding stays `u64` (`encode`'s `seq: u64`) because
+    /// that value shares bits with `pid` in a fixed-width tag, which is a
+    /// different concern from how many items get generated.
+    per_producer: usize,
 };
 
 /// The outcome of a stress run's multiset check.
@@ -99,7 +106,13 @@ pub fn verify(
             const pid = decodePid(v);
             const seq = decodeSeq(v);
             if (pid >= cfg.producers or seq >= cfg.per_producer) return .corrupted;
-            const idx = pid * cfg.per_producer + seq;
+            // `seq` is decoded as `u64` (it shares the packed wire word with
+            // `pid`), but the guard just above proved `seq < cfg.per_producer`
+            // and `cfg.per_producer` is `usize` — so this cast can never
+            // truncate a value that reaches it; a `seq` that didn't fit
+            // `usize` would already have failed the guard as `.corrupted`.
+            const seq_idx: usize = @intCast(seq);
+            const idx = pid * cfg.per_producer + seq_idx;
             if (seen[idx]) return .duplicated;
             seen[idx] = true;
             count += 1;
@@ -140,7 +153,7 @@ fn Runner(comptime Adapter: type) type {
             adapter: *Adapter,
             producers_done: std.atomic.Value(usize),
             failed: std.atomic.Value(bool),
-            per_producer: u64,
+            per_producer: usize,
             producers: usize,
             allocator: std.mem.Allocator,
         };
@@ -154,7 +167,7 @@ fn Runner(comptime Adapter: type) type {
             defer sh.adapter.deinitThread(ctx);
             defer _ = sh.producers_done.fetchAdd(1, .release);
 
-            var seq: u64 = 0;
+            var seq: usize = 0;
             while (seq < sh.per_producer) : (seq += 1) {
                 sh.adapter.enqueue(ctx, encode(pid, seq)) catch {
                     sh.failed.store(true, .release);

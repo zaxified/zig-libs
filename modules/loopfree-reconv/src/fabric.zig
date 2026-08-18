@@ -292,7 +292,13 @@ pub const Fabric = struct {
             // `onTimer`'s FIB_APPLY_BASE arm would then apply the WRONG
             // node's next-hop with no way to detect it. Fail loud instead.
             std.debug.assert(self.next_pending_id - self.applied_pending_id < MAX_PENDING);
-            const slot = self.next_pending_id % MAX_PENDING;
+            // `next_pending_id` is a genuinely-unbounded `u64` sequence
+            // number (it never wraps for the run's lifetime and is folded
+            // into the netsim timer id below), but `% MAX_PENDING` (a
+            // `usize` constant = 256) always yields a value `< 256` no
+            // matter how wide the dividend is — the cast can never truncate
+            // a value that reaches it, for any `next_pending_id`.
+            const slot: usize = @intCast(self.next_pending_id % MAX_PENDING);
             self.pending[slot] = .{ .node = n, .next_hop = new_tree.pred[n] };
             const apply_time: netsim.Time = base + @as(netsim.Time, @intCast(k)) * self.step_gap;
             try sim.setTimer(0, apply_time - now, FIB_APPLY_BASE + self.next_pending_id);
@@ -384,13 +390,27 @@ pub const Fabric = struct {
             try self.deliverAt(sim, node, frame_id);
             try sim.setTimer(node, self.origin_period, ORIGIN_TIMER);
         } else if (timer_id >= FIB_APPLY_BASE) {
-            const slot = (timer_id - FIB_APPLY_BASE) % MAX_PENDING;
+            // Same unconditionally-in-range modulo as above.
+            const slot: usize = @intCast((timer_id - FIB_APPLY_BASE) % MAX_PENDING);
             const upd = self.pending[slot];
             self.next_hop[upd.node] = upd.next_hop;
             self.applied_pending_id += 1;
         } else if (timer_id >= CONDUCTOR_BASE) {
-            const idx = timer_id - CONDUCTOR_BASE;
-            if (idx < self.schedule.len) try self.applyTopologyChange(sim, self.schedule[idx]);
+            // Unlike the two slots above, this index is NOT taken modulo
+            // anything — it is checked directly against `self.schedule.len`
+            // (a real `usize` bound), so it needs an actual boundary
+            // decision rather than an always-safe cast. `timer_id -
+            // CONDUCTOR_BASE` is itself a `u64` sequence offset; guard the
+            // comparison and the indexing on the `usize` side so a
+            // wildly-out-of-range `timer_id` (which would already be a bug
+            // elsewhere — this module only ever hands back ids it minted
+            // itself) fails the bounds check instead of being silently
+            // truncated into an in-range but WRONG index.
+            const raw_idx = timer_id - CONDUCTOR_BASE;
+            if (raw_idx < self.schedule.len) {
+                const idx: usize = @intCast(raw_idx);
+                try self.applyTopologyChange(sim, self.schedule[idx]);
+            }
         }
     }
 

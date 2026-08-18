@@ -124,8 +124,8 @@ pub fn generate(gpa: Allocator, seed: u64, topo: Topo, cfg: Config) Error!FaultT
     const n = prng.below(cfg.max_events + 1);
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const t: Time = prng.below(cfg.horizon);
-        const repair_t: Time = t + 1 + prng.below(cfg.horizon / 2 + 1);
+        const t: Time = prng.belowWide(cfg.horizon);
+        const repair_t: Time = t + 1 + prng.belowWide(cfg.horizon / 2 + 1);
         const has_links = topo.links.len > 0;
 
         // Weighted kind selection. Duplication is over-weighted so that

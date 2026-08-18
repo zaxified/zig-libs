@@ -758,12 +758,23 @@ const Throttle = struct {
         // nothing pending (lossless memory release), then enforce the cap
         // (evicting the LRU tail may drop its pending count — documented).
         while (t.lru.last) |tail| {
-            const e: *Entry = @fieldParentPtr("node", tail);
+            // `Entry.last_ns`/`suppressed` (u64) give `Entry` a stricter
+            // alignment than `std.DoublyLinkedList.Node`'s own fields alone
+            // would require on a 32-bit target, so `@fieldParentPtr` cannot
+            // prove the recovered `*Entry` meets it from `tail`'s declared
+            // type alone. `@alignCast` is safe here (not a truncation/cast
+            // risk like the usize-narrowing sites) because every `Entry` in
+            // this map is allocated via `gpa.create(Entry)`, which always
+            // returns `Entry`-aligned storage with `node` at offset 0 — this
+            // is the same `@alignCast(@fieldParentPtr(...))` idiom already
+            // used throughout http/ipcbus/zipstream for identical intrusive
+            // lists.
+            const e: *Entry = @alignCast(@fieldParentPtr("node", tail));
             if (e.suppressed != 0 or now_ns -| e.last_ns < window_ns) break;
             t.removeEntry(gpa, e);
         }
         if (t.map.count() >= max_keys)
-            t.removeEntry(gpa, @fieldParentPtr("node", t.lru.last.?));
+            t.removeEntry(gpa, @alignCast(@fieldParentPtr("node", t.lru.last.?)));
 
         t.insert(gpa, key, now_ns) catch {}; // OOM → fail open (documented)
         return 0;

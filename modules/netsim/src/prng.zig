@@ -44,6 +44,20 @@ pub const Prng = struct {
         return @intCast(p.next() % @as(u64, n));
     }
 
+    /// Same contract as `below`, but for bounds that are inherently wider
+    /// than a pointer-width `usize` — netsim's own `Time = u64` clock
+    /// (simulated horizons, jitter, latencies) is not an index count and
+    /// must not be forced through `usize` on a 32-bit host. Draw and bound
+    /// both stay `u64` on every target, so there is no narrowing conversion
+    /// here and nothing to truncate: this is a width fix, not a
+    /// checked-boundary fix. Use `below` for anything that indexes a slice
+    /// or array (those bounds are already `usize` by construction and stay
+    /// that way); use `belowWide` for anything typed `Time`/`u64`.
+    pub fn belowWide(p: *Prng, n: u64) u64 {
+        if (n == 0) return 0;
+        return p.next() % n;
+    }
+
     /// True with probability num/den.
     pub fn chance(p: *Prng, num: usize, den: usize) bool {
         return p.below(den) < num;
@@ -97,4 +111,29 @@ test "below is total: an empty range yields 0 in every build, never a modulo by 
     try std.testing.expect(seen[0] > 0 and seen[1] > 0);
     // `chance` inherits the rule: an empty denominator is never "true".
     try std.testing.expect(!p.chance(0, 0));
+}
+
+test "belowWide is total (n=0 -> 0) and stays in range for bounds beyond 32-bit usize" {
+    var p = Prng.init(0x1234);
+    // Same degenerate-range rule as `below`.
+    try std.testing.expectEqual(@as(u64, 0), p.belowWide(0));
+    // The boundary this function exists for: `n` bigger than any 32-bit
+    // `usize` could hold. Before `belowWide`, this bound could not even be
+    // passed to `below` on a 32-bit target (`u64` -> `usize` does not
+    // implicitly narrow) — this pins that the draw is both in-range and NOT
+    // silently truncated to the low 32 bits of the bound.
+    const big_n: u64 = (@as(u64, 1) << 40) + 7; // > max(u32), well within u64
+    var max_seen: u64 = 0;
+    for (0..256) |_| {
+        const v = p.belowWide(big_n);
+        try std.testing.expect(v < big_n);
+        if (v > max_seen) max_seen = v;
+    }
+    // If the bound (or the draw) had been truncated to u32 somewhere, every
+    // value would land under 2^32; over 256 draws from a >2^40 range that
+    // would be an absurd coincidence, so this is a real behavioural pin, not
+    // a tautology of `v < big_n` alone.
+    try std.testing.expect(max_seen >= (@as(u64, 1) << 32));
+    // And the maximum possible bound must not divide-by-zero or misbehave.
+    try std.testing.expect(p.belowWide(std.math.maxInt(u64)) < std.math.maxInt(u64));
 }

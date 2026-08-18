@@ -636,6 +636,15 @@ pub const OpenSecretKeyError = error{
     UnsupportedKdf,
     PasswordRequired,
     WrongPassword,
+    /// `raw.mem_limit` (the on-disk `mem_limit_le(8)` field, attacker/file
+    /// controlled) does not fit this host's `usize`. Rejected rather than
+    /// truncated: `Params.fromLimits` takes mem_limit as the scrypt memory
+    /// COST parameter, so silently truncating it would silently downgrade
+    /// the KDF's memory-hardness instead of failing — a security-relevant
+    /// wrong answer, not just an inconvenience. Only reachable on hosts
+    /// where `usize` is narrower than 64 bits; the value is a real 64-bit
+    /// on-disk quantity with no reason to assume it fits 32 bits.
+    MemLimitTooLarge,
 };
 
 /// Decrypt (if needed) and load a `RawSecretKey`. Pass `password = null`
@@ -661,7 +670,8 @@ pub fn openSecretKey(
         // Plaintext; chk intentionally unchecked (see module doc comment).
     } else if (std.mem.eql(u8, &raw.kdf_alg, &kdf_alg_scrypt)) {
         const pw = password orelse return error.PasswordRequired;
-        const params = std.crypto.pwhash.scrypt.Params.fromLimits(raw.ops_limit, raw.mem_limit);
+        const mem_limit: usize = std.math.cast(usize, raw.mem_limit) orelse return error.MemLimitTooLarge;
+        const params = std.crypto.pwhash.scrypt.Params.fromLimits(raw.ops_limit, mem_limit);
         var stream: [encrypted_block_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &stream);
         try std.crypto.pwhash.scrypt.kdf(allocator, &stream, pw, &raw.salt, params);
@@ -887,6 +897,26 @@ test "encrypted secret key: seal + open round-trip, wrong password rejected" {
 
     try std.testing.expectError(error.WrongPassword, openSecretKey(gpa, raw, "wrong password"));
     try std.testing.expectError(error.PasswordRequired, openSecretKey(gpa, raw, null));
+}
+
+test "openSecretKey: the mem_limit-fits-usize guard rejects what does not fit, for any usize width" {
+    // `raw.mem_limit` is a real on-disk `u64` (`mem_limit_le(8)`); `openSecretKey`
+    // now runs `std.math.cast(usize, raw.mem_limit) orelse
+    // error.MemLimitTooLarge` before that value ever reaches
+    // `scrypt.Params.fromLimits`/`scrypt.kdf`. This test pins the cast's
+    // behaviour directly rather than driving it through a full
+    // `openSecretKey` call: this dev host's `usize` is 64-bit, so no real
+    // `u64` value actually overflows it here, and forcing the overflow by
+    // constructing a `RawSecretKey` with an astronomical `mem_limit` would
+    // ask `scrypt.kdf` to allocate memory proportional to that limit before
+    // the guard could stop it in a build where the guard doesn't apply — the
+    // exact DoS this guard exists to prevent, not something to reproduce in
+    // a test. `u32` stands in for "a `usize` this value doesn't fit" so the
+    // assertion is host-width-independent; `zig build portable-minisign`
+    // (wasm32, real 32-bit `usize`) is what proves this exact guard compiles
+    // and type-checks for a target where it actually fires.
+    try std.testing.expectEqual(@as(?u32, null), std.math.cast(u32, @as(u64, std.math.maxInt(u32)) + 1));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), std.math.cast(u32, @as(u64, std.math.maxInt(u32))));
 }
 
 test "openSecretKey rejects an unrecognized sig_alg/chk_alg/kdf_alg tag" {

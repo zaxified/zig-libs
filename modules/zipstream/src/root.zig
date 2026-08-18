@@ -1115,7 +1115,12 @@ test "EntryReader: a size lie beyond physical EOF errors cleanly, not UB" {
     var er: EntryReader = undefined;
     try er.init(&archive, &lying_entry, &window);
 
-    const buf = try a.alloc(u8, lying_entry.uncompressed_size);
+    // `uncompressed_size` stays `u64` in production (zip64 entries can
+    // legitimately exceed a 32-bit `usize`; that's what `entry.uncompressed_size
+    // > max_output` at line ~290 guards before any real allocation happens).
+    // This test sets it to a small literal (`1 << 20`) itself a few lines up,
+    // so the value here is always in-range and the cast is safe.
+    const buf = try a.alloc(u8, @as(usize, @intCast(lying_entry.uncompressed_size)));
     defer a.free(buf);
     // Reading the full (lying) declared size must hit a clean error instead
     // of looping forever or reading past the allocation. Before the CRC-32

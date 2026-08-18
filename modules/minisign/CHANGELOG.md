@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`) AND a real hardening fix, not just a
+  type change: `openSecretKey` passed `raw.mem_limit` (a `u64` straight off the wire —
+  `mem_limit_le(8)`) directly to `scrypt.Params.fromLimits(ops_limit: u64, mem_limit:
+  usize)`, which fails to compile on a 32-bit target. Unlike the pure narrowing fixes
+  elsewhere this pass, `mem_limit` is genuinely attacker/file-controlled and genuinely can
+  exceed a 32-bit `usize` — silently truncating it would silently downgrade scrypt's
+  memory-hardness parameter instead of failing, a security-relevant wrong answer, not a
+  crash. Added `OpenSecretKeyError.MemLimitTooLarge` and `std.math.cast(usize,
+  raw.mem_limit) orelse return error.MemLimitTooLarge` ahead of the `fromLimits` call —
+  an error return, not a cast, per CONVENTIONS' guidance for values that can genuinely
+  overflow at runtime. New test pins the `std.math.cast` mechanism directly (using `u32`
+  as a width-independent stand-in for "a usize this doesn't fit," since this dev host's
+  native `usize` is 64-bit and no real `u64` value overflows it here) — deliberately NOT
+  driven through a full `openSecretKey` call, because a genuinely-oversized `mem_limit`
+  would ask `scrypt.kdf` to allocate memory proportional to that limit, which is exactly
+  the DoS this guard exists to prevent. `zig build portable-minisign` (wasm32, real
+  32-bit `usize`) is what proves the guarded code path itself compiles and type-checks
+  for a target where it can actually fire; behaviourally verified only for the
+  cast-mechanism unit test and the unchanged-common-case regression, not for the overflow
+  branch end-to-end. Verified: `zig build portable-minisign` green, `zig build
+  test-minisign --summary all` (30/30) green.
 - **2026-08-14** — Licensing record. Not breaking and not behavioural — no code
   changed, only what the module says about one function. `isPrintableComment`
   is a port of `is_printable` from jedisct1/minisign — its own doc comment has

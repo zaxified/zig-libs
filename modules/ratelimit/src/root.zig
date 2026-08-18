@@ -358,13 +358,22 @@ pub const Limiter = struct {
         // idle memory without a timer thread), then enforce the cap.
         if (ttl_ns != 0) {
             while (l.lru.last) |tail| {
-                const e: *Entry = @fieldParentPtr("node", tail);
+                // `Entry.bucket.updated_ns` (u64) gives `Entry` a stricter
+                // alignment than `std.DoublyLinkedList.Node` alone requires
+                // on a 32-bit target; `@fieldParentPtr` can't prove the
+                // recovered `*Entry` meets it from `tail`'s declared type.
+                // `@alignCast` is safe (not a truncation risk) because every
+                // `Entry` is allocated via `gpa.create(Entry)`, which always
+                // returns `Entry`-aligned storage with `node` at offset 0 —
+                // the same idiom used throughout http/ipcbus/zipstream/
+                // aaa-gate for identical intrusive lists.
+                const e: *Entry = @alignCast(@fieldParentPtr("node", tail));
                 if (now_ns -| e.bucket.updated_ns <= ttl_ns) break;
                 l.removeEntry(e);
             }
         }
         if (l.map.count() >= l.options.max_keys)
-            l.removeEntry(@fieldParentPtr("node", l.lru.last.?));
+            l.removeEntry(@alignCast(@fieldParentPtr("node", l.lru.last.?)));
 
         var bucket: TokenBucket = .full(cfg, now_ns);
         const decision = bucket.allowAt(cfg, now_ns);

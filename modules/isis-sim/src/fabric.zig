@@ -517,7 +517,17 @@ pub const Fabric = struct {
             try self.coldRestart(node, now);
         } else if (timer_id >= fail_timer_base) {
             const ns = &self.nodes[node];
-            const f = self.failures.items[timer_id - fail_timer_base];
+            // `timer_id` is `u64` because `fail_timer_base = 1 << 32` is used
+            // as a tag bit to distinguish this timer class from `timer_poll`/
+            // `timer_restart`, but the recovered index `k` is bounded by
+            // `self.failures.items.len` — a scenario-authored list of link
+            // failures this same process appended via `failLinkAt`, never an
+            // externally supplied count. It cannot reach anywhere near
+            // `usize`'s range on any host without first exhausting memory to
+            // grow `failures` that large, so the cast is safe; not a checked
+            // boundary that can plausibly fail at runtime.
+            const k: usize = @intCast(timer_id - fail_timer_base);
+            const f = self.failures.items[k];
             const other = if (f.a == node) f.b else f.a;
             if (self.ifaceOf(node, other)) |iface| ns.link_failed[iface] = true;
             // Re-originate without the lost neighbour, at a higher sequence.
