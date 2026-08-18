@@ -6,7 +6,12 @@ The module has two backends over one shared vocabulary: the portable **JSON buil
 **native nfnetlink** path. `src/types.zig` holds the enums both speak (`Family`, `ChainType`,
 `Hook`, `Policy`, `Op`, `MetaKey`, `PayloadBase`, `LimitPer`/`LimitUnit`, `SetFlag`,
 `SetDataType`, …); `src/root.zig` re-exports them unchanged, so the JSON builder's public surface
-is exactly what it always was. Files: `types.zig` (vocabulary + kernel mappings), `nl.zig`
+is exactly what it always was. `types.zig` also holds the raw kernel constant structs
+(`NFPROTO`, `NF`, `NFT`), which are the numeric ABI `TableInfo.family`/`ChainInfo.policy`/etc.
+are expressed in once decoded off the wire; those are re-exported from `root.zig` too, so a
+consumer decoding a dump never has to name `nftables.types` — `Family.fromNfproto`/
+`Policy.fromVerdict` recover the typed enum from the raw byte the same way. Files: `types.zig`
+(vocabulary + kernel mappings), `nl.zig`
 (thin alias layer over `netlink.codec`), `wire.zig` (nfnetlink framing/objects/batch/decoders), `expr.zig` (rule
 expressions + register model), `socket.zig` (nfnetlink policy over `netlink.Socket`'s transport, Linux-only), `goldens.zig` (captured
 `nft` traffic), `consistency.zig` (JSON↔native proof), `root.zig` (JSON builder + facade).
@@ -43,6 +48,21 @@ the kernel put them in the register (`expr.regU32` vs `expr.portBytes`).
 `sendmsg`. The kernel stages every command and commits only when `BATCH_END` arrives with no
 failure — one bad command aborts the transaction and *nothing* is applied. `finish()` is
 idempotent. `bytes()` before `finish()` is deliberately not a valid batch.
+
+**Dump requests.** `Socket.listTables`/`listChains`/`listSets`/`listRules` (and
+`wire.buildDumpRequest`/`buildRuleDumpRequest` underneath) take `family: ?Family`, not
+`Family`: `null` sends `nfgen_family = NFPROTO_UNSPEC` (0), which asks the kernel for objects
+of every family in one request — the framing `nft list ruleset` itself uses — instead of a
+caller walking all six families. `Family` stays non-optional everywhere else (`TableSpec`,
+`Batch.deleteTable`/`deleteChain`/`deleteSet`, `expr.Program.init`, `Hook.num`, …): those are
+all request-*building* paths where the object being created, deleted or matched must name one
+real family, and an `unspec` value there would be silently wrong rather than merely unusual —
+which is why the fix is an optional parameter on the four dump entry points rather than an
+`.unspec` member on `Family` itself. Every decoded result already carries its own concrete
+family byte (`TableInfo.family` etc., a raw `NFPROTO_*` `u8`, recoverable as a typed `Family`
+via `Family.fromNfproto`), so a mixed-family reply loses no information. `listSetElems` keeps
+a required `Family`: it already names one specific, already-resolved table/set, not a
+family-wide sweep, so there is nothing to widen.
 
 **Error attribution.** Per-command failures come back as `NLMSG_ERROR` carrying that command's
 sequence number; a failure of the commit stage is reported against the `BATCH_BEGIN` sequence.
@@ -171,6 +191,11 @@ order because the captured message also carried the userdata stamp).
   `commit` returns `error.NotFound`, `lastFailure()` reports `stage = .message`, `index = 1`,
   `command = "NEWRULE"`, `code = -2`, and the table created by command #0 is **not** in the
   ruleset — the transaction was rolled back whole.
+- *Unspec-family sweep.* Two tables in two different families (`inet` and `ip`); one
+  `listTables(null)` call (`nfgen_family = NFPROTO_UNSPEC`, the framing `nft list ruleset`
+  uses) returns both in a single dump, each tagged with its own real family byte — proof
+  against a real kernel, not just that the request bytes are right (that half is pinned
+  offline in `wire.zig`'s "family = null sends NFPROTO_UNSPEC" test).
 - *JSON ↔ native consistency.* One `inet` table, four chains (a default-drop `input` base chain,
   a `helper` regular chain reached by `jump`, and `post`/`pre` NAT base chains), a named
   `ipv4_addr` set, and 13 rules spanning the statement/expression list this survey tracks:

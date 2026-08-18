@@ -101,6 +101,29 @@ pub const Family = enum {
             .netdev => NFPROTO.NETDEV,
         };
     }
+
+    /// Reverse of `.nfproto()` — recovers the typed family from a decoded
+    /// `nfgen_family` byte, e.g. `TableInfo.family`/`ChainInfo.family`/
+    /// `RuleInfo.family`/`SetInfo.family` after an **unspec** dump
+    /// (`Socket.listTables(null)` and friends) has swept every family in one
+    /// round trip. Returns null for `NFPROTO.UNSPEC` (0) and any byte this
+    /// module does not model — a dump *request* may legitimately name
+    /// `unspec` to ask for everything, but every *object* the kernel hands
+    /// back names one concrete family, never 0, so this mapping is total
+    /// over what a real dump reply can contain. `@tagName(family.fromNfproto(b).?)`
+    /// is exactly the JSON schema token (`"ip"`/`"inet"`/…) for that family —
+    /// there is no separate "family name" string table to keep in sync.
+    pub fn fromNfproto(byte: u8) ?Family {
+        return switch (byte) {
+            NFPROTO.IPV4 => .ip,
+            NFPROTO.IPV6 => .ip6,
+            NFPROTO.INET => .inet,
+            NFPROTO.ARP => .arp,
+            NFPROTO.BRIDGE => .bridge,
+            NFPROTO.NETDEV => .netdev,
+            else => null,
+        };
+    }
 };
 
 /// Base chain type.
@@ -166,6 +189,20 @@ pub const Policy = enum {
         return switch (self) {
             .accept => NF.ACCEPT,
             .drop => NF.DROP,
+        };
+    }
+
+    /// Reverse of `.verdict()` — recovers the typed policy from a decoded
+    /// `ChainInfo.policy` (`?i32`). A base chain's policy is only ever
+    /// `NF_ACCEPT` or `NF_DROP` — the kernel does not accept any other verdict
+    /// there — so this mapping is total for anything `ChainInfo.policy` can
+    /// hold; null means the byte was neither, which cannot happen for a real
+    /// base chain but is reported rather than assumed.
+    pub fn fromVerdict(v: i32) ?Policy {
+        return switch (v) {
+            NF.ACCEPT => .accept,
+            NF.DROP => .drop,
+            else => null,
         };
     }
 };
@@ -533,6 +570,21 @@ test "family to nfgen_family follows NFPROTO_*" {
     try testing.expectEqual(@as(u8, 3), Family.arp.nfproto());
     try testing.expectEqual(@as(u8, 7), Family.bridge.nfproto());
     try testing.expectEqual(@as(u8, 5), Family.netdev.nfproto());
+}
+
+test "fromNfproto reverses nfproto for every Family member, and rejects unspec" {
+    inline for ([_]Family{ .ip, .ip6, .inet, .arp, .bridge, .netdev }) |f| {
+        try testing.expectEqual(f, Family.fromNfproto(f.nfproto()).?);
+    }
+    try testing.expectEqual(@as(?Family, null), Family.fromNfproto(NFPROTO.UNSPEC));
+    try testing.expectEqual(@as(?Family, null), Family.fromNfproto(255));
+}
+
+test "fromVerdict reverses verdict for every Policy member, and rejects other verdicts" {
+    try testing.expectEqual(Policy.accept, Policy.fromVerdict(Policy.accept.verdict()).?);
+    try testing.expectEqual(Policy.drop, Policy.fromVerdict(Policy.drop.verdict()).?);
+    // A verdict a base chain policy can never actually hold.
+    try testing.expectEqual(@as(?Policy, null), Policy.fromVerdict(NFT.JUMP));
 }
 
 test "hook numbering is per-family" {

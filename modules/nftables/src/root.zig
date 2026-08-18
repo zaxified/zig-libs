@@ -84,6 +84,20 @@ pub const LimitUnit = types.LimitUnit;
 pub const SetFlag = types.SetFlag;
 pub const SetDataType = types.SetDataType;
 
+// ── kernel constant structs (for interpreting a decoded dump) ──────────────
+// `TableInfo.family`/`ChainInfo.family`/`RuleInfo.family`/`SetInfo.family`
+// are raw `u8`, and `ChainInfo.policy` is a raw `?i32` — the kernel's own
+// numeric ABI, not the vocabulary enums above. A consumer that only imports
+// `nftables` still needs these three structs to interpret those bytes
+// (`nftables.NFPROTO.INET`, `nftables.NF.DROP`) without reaching past this
+// module into `nftables.types`. `Family.fromNfproto`/`Policy.fromVerdict`
+// (both in `types.zig`, re-exported above as `Family`/`Policy`) go one step
+// further and recover the typed enum directly, when the family/policy is
+// exactly what those enums already model.
+pub const NFPROTO = types.NFPROTO;
+pub const NF = types.NF;
+pub const NFT = types.NFT;
+
 // ── native nfnetlink backend ────────────────────────────────────────────────
 
 /// Netlink message/attribute primitives (with the big-endian accessors
@@ -1136,6 +1150,34 @@ test "enum tokens: families, hooks, chain types, policies, special flags" {
     // Tokens that are not Zig identifiers:
     try expectJson("\"fully-random\"", NatFlag.fully_random);
     try expectJson("\"tcp reset\"", RejectType.tcp_reset);
+}
+
+test "NFPROTO/NF/NFT are re-exported and interpret a decoded dump using only root-level names" {
+    // Same shape as procnet's `netaddr` re-export test: a consumer that
+    // imports only `nftables` (never `nftables.types`) must still be able to
+    // interpret what `Socket.listChains`/`listRules`/etc. hand back —
+    // `RuleInfo.family` is a raw `u8` and `ChainInfo.policy` is a raw `?i32`,
+    // the kernel's own numeric ABI, not the vocabulary enums. `@This().NFPROTO`
+    // / `@This().NF` / `@This().NFT` fail to compile if the re-export lines
+    // above are ever removed or renamed, which is the load-bearing part of
+    // this test; the checks below then confirm they are the SAME constants
+    // `Family.nfproto()`/`Policy.verdict()` produce, not look-alike copies,
+    // by round-tripping a decoded-shaped `ChainInfo` through them.
+    const decoded: @This().ChainInfo = .{
+        .family = @This().NFPROTO.INET,
+        .policy = @This().NF.DROP,
+    };
+    try testing.expect(decoded.family == @This().Family.inet.nfproto());
+    try testing.expect(decoded.policy.? == @This().Policy.drop.verdict());
+    // `Family.fromNfproto`/`Policy.fromVerdict` (types.zig, re-exported here
+    // as `Family`/`Policy`) go one step further: straight from the raw byte
+    // back to the typed enum, still without naming `nftables.types`.
+    try testing.expectEqual(@This().Family.inet, @This().Family.fromNfproto(decoded.family).?);
+    try testing.expectEqual(@This().Policy.drop, @This().Policy.fromVerdict(decoded.policy.?).?);
+    // NFT (the nftables-only verdict codes: jump/goto/continue/return) is
+    // re-exported the same way, though no root-level struct field currently
+    // carries one of its values to round-trip against.
+    try testing.expectEqual(@as(i32, -3), @This().NFT.JUMP);
 }
 
 test "expression shapes" {

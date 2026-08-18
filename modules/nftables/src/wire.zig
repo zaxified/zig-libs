@@ -748,26 +748,44 @@ pub const Batch = struct {
 
 // ── dump requests (outside any batch) ───────────────────────────────────────
 
+/// `nfgen_family` for a dump request: the family's own `nfproto()`, or
+/// `NFPROTO_UNSPEC` (0) when the caller wants every family swept in one
+/// request — see `buildDumpRequest`/`buildRuleDumpRequest`.
+fn dumpNfproto(family: ?Family) u8 {
+    return if (family) |f| f.nfproto() else types.NFPROTO.UNSPEC;
+}
+
 /// A bare `NFT_MSG_GET*` + `NLM_F_DUMP` request — 20 fixed bytes, no
 /// allocator. Dumps are *not* batched: they are ordinary nfnetlink
 /// request/response traffic.
-pub fn buildDumpRequest(seq: u32, cmd: u8, family: Family) [nl.header_len + nfgenmsg_len]u8 {
+///
+/// `family = null` sends `nfgen_family = NFPROTO_UNSPEC` (0), which asks the
+/// kernel for objects of **every** family in this one request — the same
+/// framing `nft list ruleset` uses. Without it, a caller wanting the whole
+/// ruleset must walk all six families itself, one dump per family per object
+/// kind. Every decoded result already carries its own concrete family byte
+/// (`TableInfo.family` etc., recoverable as a typed `Family` via
+/// `Family.fromNfproto`), so mixing families in one reply loses no
+/// information.
+pub fn buildDumpRequest(seq: u32, cmd: u8, family: ?Family) [nl.header_len + nfgenmsg_len]u8 {
     var req: [nl.header_len + nfgenmsg_len]u8 = @splat(0);
     std.mem.writeInt(u32, req[0..4], req.len, native_endian);
     std.mem.writeInt(u16, req[4..6], nftMsg(cmd), native_endian);
     std.mem.writeInt(u16, req[6..8], nl.NLM_F_REQUEST | nl.NLM_F_DUMP, native_endian);
     std.mem.writeInt(u32, req[8..12], seq, native_endian);
-    req[nl.header_len] = family.nfproto();
+    req[nl.header_len] = dumpNfproto(family);
     req[nl.header_len + 1] = NFNETLINK_V0;
     // res_id (__be16) stays 0.
     return req;
 }
 
 /// `NFT_MSG_GETRULE` + `NLM_F_DUMP` scoped to one table/chain. Caller frees.
+/// `family = null` sweeps every family in one request — see
+/// `buildDumpRequest`.
 pub fn buildRuleDumpRequest(
     gpa: std.mem.Allocator,
     seq: u32,
-    family: Family,
+    family: ?Family,
     table: ?[]const u8,
     chain: ?[]const u8,
 ) BuildError![]u8 {
@@ -781,7 +799,7 @@ pub fn buildRuleDumpRequest(
         seq,
         0,
     );
-    try appendNfgenmsg(gpa, &list, family.nfproto(), 0);
+    try appendNfgenmsg(gpa, &list, dumpNfproto(family), 0);
     if (table) |t| try nl.appendAttrString(gpa, &list, NFTA_RULE.TABLE, t);
     if (chain) |c| try nl.appendAttrString(gpa, &list, NFTA_RULE.CHAIN, c);
     nl.finishHeader(&list, h);
@@ -1196,6 +1214,26 @@ test "dump requests are 20 fixed bytes with the right type and family" {
         0x00, 0x00, 0x00, 0x00, // pid
         0x02, 0x00, 0x00, 0x00, // NFPROTO_IPV4, v0, res_id 0
     }, &req);
+}
+
+test "family = null sends NFPROTO_UNSPEC, not a per-family walk" {
+    // This is the whole point of Gap A: a caller wanting the full ruleset
+    // passes `null` once instead of looping over all six families. If a
+    // future edit regressed `null` back to defaulting to one concrete
+    // family (or to looping internally and building six requests), the
+    // fixed nfgen_family byte below would no longer be 0.
+    if (native_endian != .little) return error.SkipZigTest;
+    const req = buildDumpRequest(7, NFT_MSG.GETTABLE, null);
+    try testing.expectEqual(@as(u8, types.NFPROTO.UNSPEC), req[nl.header_len]);
+    try testing.expectEqual(@as(u8, 0), req[nl.header_len]);
+
+    const gpa = testing.allocator;
+    const rreq = try buildRuleDumpRequest(gpa, 9, null, null, null);
+    defer gpa.free(rreq);
+    var it: nl.MessageIterator = .{ .buf = rreq };
+    const m = (try it.next()).?;
+    const hdr = try parseNfgenmsg(m.payload);
+    try testing.expectEqual(@as(u8, types.NFPROTO.UNSPEC), hdr.family);
 }
 
 test "scoped rule and set-element dump requests carry their names" {

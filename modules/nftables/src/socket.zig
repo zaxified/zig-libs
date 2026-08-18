@@ -297,7 +297,10 @@ pub const Socket = struct {
     pub const SetList = List(wire.SetInfo);
     pub const SetElemList = List(wire.SetElemInfo);
 
-    pub fn listTables(self: *Socket, family: Family) DumpError!TableList {
+    /// `family = null` sweeps every family in one dump — see
+    /// `wire.buildDumpRequest`. Each result's `.family` names the concrete
+    /// family the kernel reported that object under (`Family.fromNfproto`).
+    pub fn listTables(self: *Socket, family: ?Family) DumpError!TableList {
         var out: TableList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.TableInfo) = .empty;
@@ -314,7 +317,8 @@ pub const Socket = struct {
         return out;
     }
 
-    pub fn listChains(self: *Socket, family: Family) DumpError!ChainList {
+    /// `family = null` sweeps every family in one dump — see `listTables`.
+    pub fn listChains(self: *Socket, family: ?Family) DumpError!ChainList {
         var out: ChainList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.ChainInfo) = .empty;
@@ -334,7 +338,8 @@ pub const Socket = struct {
         return out;
     }
 
-    pub fn listSets(self: *Socket, family: Family) DumpError!SetList {
+    /// `family = null` sweeps every family in one dump — see `listTables`.
+    pub fn listSets(self: *Socket, family: ?Family) DumpError!SetList {
         var out: SetList = .{ .arena = std.heap.ArenaAllocator.init(self.nl.gpa), .items = &.{} };
         errdefer out.arena.deinit();
         var items: std.ArrayList(wire.SetInfo) = .empty;
@@ -353,10 +358,12 @@ pub const Socket = struct {
     }
 
     /// Dump the rules of one chain (or of everything when `table`/`chain` are
-    /// null). `RuleInfo.expressions` is copied into the result's arena.
+    /// null). `family = null` additionally sweeps every family in one dump —
+    /// see `listTables`. `RuleInfo.expressions` is copied into the result's
+    /// arena.
     pub fn listRules(
         self: *Socket,
-        family: Family,
+        family: ?Family,
         table: ?[]const u8,
         chain: ?[]const u8,
     ) DumpError!RuleList {
@@ -539,11 +546,15 @@ fn skipUnprivileged(sock: *Socket, what: []const u8, err: anyerror) void {
 }
 
 /// Best-effort teardown; never fails a test.
-fn dropTestTable(sock: *Socket) void {
+fn dropTable(sock: *Socket, family: Family, name: []const u8) void {
     var b = sock.beginBatch(.{}) catch return;
     defer b.deinit();
-    b.deleteTable(.inet, test_table) catch return;
+    b.deleteTable(family, name) catch return;
     sock.commit(&b) catch {};
+}
+
+fn dropTestTable(sock: *Socket) void {
+    dropTable(sock, .inet, test_table);
 }
 
 test "live: native batch round-trip — create, list, delete" {
@@ -758,5 +769,60 @@ test "live: a bad batch is rolled back atomically and names the failing command"
             if (f.message.len > 0) ": " else "",
             f.message,
         },
+    );
+}
+
+const test_table_ip = "zig_nftables_live_ip";
+
+test "live: an unspec-family dump returns objects from multiple families in one request" {
+    // The whole point of Gap A: `nft list ruleset` sends ONE GETTABLE with
+    // nfgen_family = 0 and gets every family back, instead of walking all six
+    // families itself. This proves the kernel actually does that — not just
+    // that this module builds the byte right (see wire.zig's offline
+    // "family = null sends NFPROTO_UNSPEC" test for that half) — by putting a
+    // table in two *different* families and confirming a single
+    // `listTables(null)` call surfaces both, each tagged with its own real
+    // family byte.
+    var sock = liveSocket("unspec sweep") orelse return;
+    defer sock.close();
+    dropTestTable(&sock);
+    dropTable(&sock, .ip, test_table_ip);
+
+    var b = try sock.beginBatch(.{});
+    defer b.deinit();
+    try b.addTable(.{ .family = .inet, .name = test_table });
+    try b.addTable(.{ .family = .ip, .name = test_table_ip });
+    sock.commit(&b) catch |err| switch (err) {
+        error.KernelRejected, error.AccessDenied, error.NotSupported, error.WouldBlock => {
+            skipUnprivileged(&sock, "unspec sweep", err);
+            return error.SkipZigTest;
+        },
+        else => return err,
+    };
+    defer {
+        dropTestTable(&sock);
+        dropTable(&sock, .ip, test_table_ip);
+    }
+
+    var tables = try sock.listTables(null); // nfgen_family = NFPROTO_UNSPEC
+    defer tables.deinit();
+    var saw_inet = false;
+    var saw_ip = false;
+    for (tables.items) |t| {
+        if (std.mem.eql(u8, t.name, test_table)) {
+            try testing.expectEqual(@as(u8, types.NFPROTO.INET), t.family);
+            saw_inet = true;
+        }
+        if (std.mem.eql(u8, t.name, test_table_ip)) {
+            try testing.expectEqual(@as(u8, types.NFPROTO.IPV4), t.family);
+            saw_ip = true;
+        }
+    }
+    try testing.expect(saw_inet);
+    try testing.expect(saw_ip);
+
+    if (verboseSkip()) std.debug.print(
+        "\nLIVE nftables unspec sweep: one dump returned both an inet and an ip table.\n",
+        .{},
     );
 }

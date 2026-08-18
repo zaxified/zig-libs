@@ -110,6 +110,16 @@ for (rules.items) |rule| {
     var it = rule.exprIterator();
     while (try it.next()) |e| std.log.info("expr {s}", .{e.name});
 }
+
+// Or the whole ruleset in one round trip per object kind — pass `null`
+// instead of a family to sweep every family at once, the same framing
+// `nft list ruleset` uses.
+var all_tables = try sock.listTables(null);
+defer all_tables.deinit();
+for (all_tables.items) |t| {
+    // t.family is the raw NFPROTO_* byte; recover the typed enum:
+    std.log.info("table {s} in {?s}", .{ t.name, if (nft.Family.fromNfproto(t.family)) |f| @tagName(f) else null });
+}
 ```
 
 The socket itself is the sibling `netlink` module's: `Socket` wraps a
@@ -148,8 +158,10 @@ hatch for hand-built expressions and deliberately does not touch the allocator.
   payloads a stock `nft` put on the wire, captured with
   `unshare -rn strace -f -e trace=sendmsg -e write=all -xx -s 8192 -e abbrev=none nft …`.
   Each golden names the exact command it came from.
-- **Live tests** under `unshare -rn`: a native create/list/delete round-trip, and
-  a deliberately bad batch proving the kernel rolled the whole transaction back.
+- **Live tests** under `unshare -rn`: a native create/list/delete round-trip, a
+  deliberately bad batch proving the kernel rolled the whole transaction back,
+  and an unspec-family dump (`listTables(null)`) proving a single request
+  returns objects from more than one family.
 - **JSON ↔ native consistency**: the native batch is applied in a netns, then
   `nft -j list ruleset` decompiles it and the result is compared against what the
   JSON builder emits for the same ruleset.
