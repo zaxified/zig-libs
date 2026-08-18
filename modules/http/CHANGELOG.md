@@ -5,6 +5,48 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — `check-portable` (wasm32-wasi 32-bit probe) fixes, 10 sites across 3
+  files, none behavior-changing on a 64-bit host. `http` is a hub dependency (19 `.any`
+  modules import it — acme, cookies, cors, grpc, health, idempotency, jwt, mcp-http,
+  openapi, ratelimit, requestid, router, security-headers, sessions, staticfiles,
+  tracecontext, validate, webhooksig), so `Server.zig:2696`'s `day_names[day.day % 7]`
+  (`day.day` is `u47`, indexing wants `usize`) alone was blocking the wasm32 compile of
+  all of them. Fixed, plus everything else the wasm32 test-binary compile turned up once
+  that first error stopped hiding the rest:
+  - `Server.zig:2696` — index with `@intCast(day.day % 7)`. `day.day` stays `u47` (a
+    deliberately wide day counter); the `% 7` bounds the *result* to 0..6 before the cast,
+    so the narrowing can never truncate real bits regardless of target width — casting the
+    bounded result, not the wide field, is the safe direction.
+  - `Server.zig:4595`/`:4610`, `h2_server.zig:3218` — `Reader.take()` wants an exact
+    `usize`; the caller had a `?u64` `content_length`. `content_length` itself stays `u64`
+    (RFC 9110 puts no bound on it, and `ContentLengthReader` streams it rather than
+    materializing the whole body) — only these three test call sites, which read a short
+    literal body straight into memory, cast down at the call.
+  - `range.zig:462` (`MultipartRanges.writeBody`, the only production-code site) + 3
+    mirrored test sites — `data[r.start .. r.end + 1]` wants `usize` bounds;
+    `ResolvedRange.start`/`.end` stay `u64` (a representation's byte offsets are not bounded
+    by any one host's address space per RFC 7233). The doc'd invariant (`data.len == total`
+    used to `resolve()` the ranges) is what makes the cast safe — `resolve` clamps every
+    range to `total`, and `data` is an actual in-memory slice, so `r.end` can never exceed
+    `data.len - 1`. `writeBody` also gained a `std.debug.assert(r.end < data.len)` ahead of
+    the cast as a guard against a caller passing mismatched `data`/`ranges`.
+  - `h2_server.zig`: `FrameWatcher.data_bytes` and the `StagedReader`/`awaitAtLeast` plumbing
+    around it narrowed from `atomic.Value(u64)`/`u64` to `atomic.Value(usize)`/`usize`. Both
+    are private test-harness types tallying bytes already sitting in an in-memory
+    `ArrayList`, so `usize` is the *correct* width, not just a target-compatible one; this
+    also sidesteps wasm32-baseline's lack of 64-bit atomic load/RMW support.
+  Verified: `zig build portable-http` no longer reports any `modules/http/src/*` error (the
+  25 that remain are `[wasi-surface]` gaps in `lockfree`/`workerpool`, both fixed by other
+  work, plus `http`'s own `std.Thread.spawn`/`clock_gettime` wasi-surface findings, which a
+  real-threads 32-bit target would not hit). `zig build test-http` — 433/433 pass, native,
+  unchanged. Cascade check: `zig build portable-acme` and `zig build portable-staticfiles`
+  both now fail only on their own `[wasi-surface]` thread-spawn/libc findings — the
+  `day.day`-cascade error is gone from both, confirming the fix clears the shared blocker.
+  Compile-only fixes (provably safe by a bound already in the value — modulo or an
+  in-memory-slice invariant — not independently testable without a >4 GiB buffer this host
+  cannot allocate): the `Server.zig`/`range.zig` `@intCast` sites. Has behavioral coverage
+  from pre-existing tests (the atomic narrowing changes what the existing flow-control
+  tests already assert byte-for-byte): the `h2_server.zig` `usize` narrowing.
 - **2026-08-18** — **BREAKING (narrow) + additive** — three fixes from the same audit report,
   landed together: this module has the most consumers in the collection (three, two outside
   the repo), so every change was checked for "does an existing caller passing no new options

@@ -459,7 +459,16 @@ pub const MultipartRanges = struct {
     ) std.Io.Writer.Error!void {
         for (ranges) |r| {
             try self.writePartHeader(w, r);
-            try w.writeAll(data[r.start .. r.end + 1]);
+            // `ResolvedRange.start`/`.end` are `u64` -- deliberately wide so a
+            // representation can be described independent of any one host's
+            // address space (RFC 7233 puts no bound on a resource's size).
+            // The doc comment's invariant (`data.len == total` used to
+            // resolve `ranges`) is what makes narrowing to `usize` safe here:
+            // `resolve` clamps every range to `total`, and `data` is an
+            // actual in-memory slice, so `r.end` can never exceed `data.len`
+            // - 1, which is itself `usize`-representable by construction.
+            std.debug.assert(r.end < data.len);
+            try w.writeAll(data[@intCast(r.start)..@intCast(r.end + 1)]);
             try w.writeAll("\r\n");
         }
         try self.writeClose(w);
@@ -756,7 +765,10 @@ fn rangeHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void 
         .not_satisfiable => try rw.writeAll(""),
         .single => {
             const r = applied.ranges[0];
-            try rw.writeAll(golden_body[r.start .. r.end + 1]);
+            // `r.start`/`r.end` (`u64`) < `golden_body.len` (`total` passed
+            // to `apply`), so narrowing to `usize` for this in-memory slice
+            // cannot truncate -- see `writeBody`'s comment above.
+            try rw.writeAll(golden_body[@intCast(r.start)..@intCast(r.end + 1)]);
         },
         .multiple => try rw.writeAll("MULTI"), // R3 owns the real multipart body
     }
@@ -930,7 +942,8 @@ test "MultipartRanges: streaming writePartHeader/writeClose equals writeBody" {
     defer b.deinit();
     for (ranges) |r| {
         try mp.writePartHeader(&b.writer, r);
-        try b.writer.writeAll(data[r.start .. r.end + 1]);
+        // See `writeBody`'s comment: `r.end` < `data.len` by construction.
+        try b.writer.writeAll(data[@intCast(r.start)..@intCast(r.end + 1)]);
         try b.writer.writeAll("\r\n");
     }
     try mp.writeClose(&b.writer);
@@ -951,7 +964,8 @@ fn multiHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void 
         },
         .single => {
             const r = applied.ranges[0];
-            try rw.writeAll(mp_body[r.start .. r.end + 1]);
+            // See `writeBody`'s comment: `r.end` < `mp_body.len` by construction.
+            try rw.writeAll(mp_body[@intCast(r.start)..@intCast(r.end + 1)]);
         },
         .not_satisfiable => try rw.writeAll(""),
         .multiple => {

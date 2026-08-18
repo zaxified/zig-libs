@@ -3214,7 +3214,11 @@ test "h2c integration: the same handler serves HTTP/1.1 and HTTP/2 over loopback
         const res = try h1.ResponseHead.parse(try h1.readHead(&sr.interface, &head_buf));
         try testing.expectEqual(@as(u16, 200), res.status);
         try testing.expectEqualStrings("text/plain", res.header("content-type").?);
-        const n = res.content_length.?;
+        // `content_length` is `?u64` at the protocol layer; this test reads a
+        // short literal body straight into `h1_body_buf` (`[64]u8`), so
+        // narrowing to `usize` here -- both for the array slice bound and
+        // for `Reader.take`'s argument -- is safe by construction.
+        const n: usize = @intCast(res.content_length.?);
         @memcpy(h1_body_buf[0..n], try sr.interface.take(n));
         h1_body = h1_body_buf[0..n];
     }
@@ -3615,7 +3619,15 @@ fn awaitFlag(io: std.Io, flag: *std.atomic.Value(bool)) error{GateTimeout}!void 
     }
 }
 
-fn awaitAtLeast(io: std.Io, c: *std.atomic.Value(u64), n: u64) error{GateTimeout}!void {
+// `c`/`n` are `usize`, not `u64`: the only counter ever passed here is
+// `FrameWatcher.data_bytes`, a private test-harness tally of bytes written
+// into an in-memory `std.ArrayList(u8)` -- inherently `usize`-bounded, since
+// you cannot buffer more than `usize` bytes in the first place. A `u64` here
+// would also hit wasm32-baseline's lack of 64-bit atomic RMW/load support
+// (`@atomicLoad`/`@atomicRmw` cap out at the target's register width); the
+// widest real use is `2 * fc_body_len` (192 KiB), nowhere near overflowing
+// even a 32-bit `usize`.
+fn awaitAtLeast(io: std.Io, c: *std.atomic.Value(usize), n: usize) error{GateTimeout}!void {
     const deadline = nowNs(io) + @as(i96, gate_timeout_ms) * std.time.ns_per_ms;
     while (c.load(.acquire) < n) {
         if (nowNs(io) >= deadline) return error.GateTimeout;
@@ -3723,8 +3735,8 @@ const StagedReader = struct {
         /// server has spent N octets of window", not a boolean. A stage with
         /// empty `bytes` is then a pure barrier (useful as the last stage, to
         /// keep EOF from racing the workers).
-        counter: ?*std.atomic.Value(u64) = null,
-        at_least: u64 = 0,
+        counter: ?*std.atomic.Value(usize) = null, // see awaitAtLeast's comment
+        at_least: usize = 0,
         bytes: []const u8,
     };
 
@@ -3777,8 +3789,11 @@ const FrameWatcher = struct {
     goaway: std.atomic.Value(bool) = .init(false),
     refused: std.atomic.Value(u32) = .init(0),
     /// Total DATA payload octets written — i.e. exactly the send-window
-    /// credit the server has spent.
-    data_bytes: std.atomic.Value(u64) = .init(0),
+    /// credit the server has spent. `usize`, not `u64`: this only ever counts
+    /// bytes already sitting in `buf` (an in-memory `ArrayList`), so it can
+    /// never need to represent more than `usize` can hold — see
+    /// `awaitAtLeast`'s comment for the rest of the reasoning.
+    data_bytes: std.atomic.Value(usize) = .init(0),
     writer: Writer,
 
     fn init(gpa: Allocator, buffer: []u8) FrameWatcher {

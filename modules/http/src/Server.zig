@@ -2693,7 +2693,13 @@ pub fn formatHttpDate(epoch_seconds: i64, buf: *[http_date_len]u8) []const u8 {
     const secs = es.getDaySeconds();
     var w: Writer = .fixed(buf);
     w.print("{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
-        day_names[day.day % 7], // 1970-01-01 was a Thursday
+        // `day.day` (`std.time.epoch.EpochDay.day`) is a `u47` -- deliberately
+        // wide so the day counter doesn't overflow for any representable
+        // epoch second, decades past `usize`'s 32-bit range on that target.
+        // `% 7` bounds the result to 0..6 before the cast, so narrowing to
+        // `usize` here can never truncate real bits, unlike a raw `@intCast`
+        // of `day.day` itself would risk on a 32-bit host.
+        day_names[@as(usize, @intCast(day.day % 7))], // 1970-01-01 was a Thursday
         month_day.day_index + 1,
         month_names[month_day.month.numeric() - 1],
         year_day.year,
@@ -4592,7 +4598,12 @@ test "integration: handler sees the loopback peer + rising request index; on_con
     try sw.interface.flush();
     const res1 = try h1.ResponseHead.parse(try h1.readHead(&sr.interface, &head_buf));
     try testing.expectEqual(@as(u16, 200), res1.status);
-    const body1 = try sr.interface.take(res1.content_length.?);
+    // `content_length` is `?u64` (RFC 9110 allows values past `usize` on a
+    // 32-bit host; `ContentLengthReader` streams it rather than materializing
+    // the whole thing). This test reads a tiny literal body straight into
+    // memory via `take`, which is inherently `usize`-bounded, so casting down
+    // here -- not narrowing the wire-protocol field -- is the safe direction.
+    const body1 = try sr.interface.take(@intCast(res1.content_length.?));
     try testing.expect(std.mem.startsWith(u8, body1, "127.0.0.1:"));
     try testing.expect(std.mem.endsWith(u8, body1, " #0"));
 
@@ -4601,7 +4612,7 @@ test "integration: handler sees the loopback peer + rising request index; on_con
     try sw.interface.flush();
     const res2 = try h1.ResponseHead.parse(try h1.readHead(&sr.interface, &head_buf));
     try testing.expectEqual(@as(u16, 200), res2.status);
-    const body2 = try sr.interface.take(res2.content_length.?);
+    const body2 = try sr.interface.take(@intCast(res2.content_length.?)); // see body1 above
     try testing.expect(std.mem.startsWith(u8, body2, "127.0.0.1:"));
     try testing.expect(std.mem.endsWith(u8, body2, " #1"));
 
