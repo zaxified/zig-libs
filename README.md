@@ -144,6 +144,9 @@ zig build test           # run all module tests
 zig build test-<name>    # run one module's tests
 zig build check-catalog  # verify build.zig's module_list ↔ modules/ ↔ this README agree
 zig build check-changelog # verify every module has a dated, well-formed CHANGELOG.md
+zig build check-portable  # verify every meta.targets claim against scripts/portable-known-failures.tsv
+zig build check-portable-table # verify the README "Portability" table matches meta.targets + the baseline
+zig build gen-portable-table   # regenerate that table (run after changing a module's meta.targets)
 ```
 
 `scripts/test.sh` is the entry point for contributors: it maps changed files onto the
@@ -201,6 +204,57 @@ recorded with each module that has any, not at the repository root.
 
 Every module is imported by its `name` (`@import("http")`); hyphenated names work too
 (`@import("security-headers")`). `Deps` are sibling modules; everything else is `std`-only.
+
+<!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
+### Portability — claimed vs. verified
+
+Every one of the 228 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI matrix executes every module's tests in `ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That claim is not repeated below for all 228 modules — a linux64-only module has nothing further to show here.
+
+37 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair's test binary and checks the result against [`scripts/portable-known-failures.tsv`](scripts/portable-known-failures.tsv): of 38 declared pairs, 34 currently compile clean and 4 are known-failing, tracked there with the real compiler error rather than silently dropped.
+
+**A blank cell means the module never claimed that target.** That is a different fact from a `known-failing` cell next to it — one is an absent claim, the other is a claim currently broken and tracked — and this table exists so the two are never shown as the same thing.
+
+| Module | linux32 | windows | wasm32 |
+|---|---|---|---|
+| `blobmsg` | compiles | — | — |
+| `blobstore` | known-failing | — | — |
+| `conntrack` | compiles | — | — |
+| `csvstream` | — | compiles | — |
+| `datefmt` | — | compiles | — |
+| `decimal` | — | compiles | — |
+| `diagnostics` | — | compiles | — |
+| `diskusage` | compiles | — | — |
+| `dns` | compiles | — | — |
+| `encoding` | — | compiles | — |
+| `filestore` | known-failing | — | — |
+| `framing` | compiles | — | — |
+| `hashdigest` | compiles | — | — |
+| `icmp` | compiles | — | — |
+| `json5` | — | compiles | — |
+| `l2disco` | compiles | — | — |
+| `mcp` | — | compiles | — |
+| `minisign` | — | compiles | — |
+| `netlink` | compiles | — | — |
+| `nl80211` | compiles | — | — |
+| `numparse` | — | compiles | — |
+| `probe` | compiles | — | — |
+| `procnet` | compiles | — | — |
+| `procrun` | — | compiles | — |
+| `qr` | — | — | compiles |
+| `qrscan` | — | — | compiles |
+| `rawsock` | compiles | — | — |
+| `reconcilable` | — | compiles | compiles |
+| `sealedbox` | compiles | — | — |
+| `sntp` | compiles | — | — |
+| `stun` | compiles | — | — |
+| `tar` | compiles | — | — |
+| `traceroute` | known-failing | — | — |
+| `tz` | — | compiles | — |
+| `uci` | compiles | — | — |
+| `wireguard` | known-failing | — | — |
+| `zipstream` | — | compiles | — |
+
+<!-- END GENERATED: check-portable-table -->
 
 ### Web / HTTP & API — an internet-facing service, no reverse proxy required
 

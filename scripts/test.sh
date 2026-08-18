@@ -206,6 +206,7 @@ harness_smoke() {
     step "check-fuzz" zig build check-fuzz
     step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
+    step "check-portable-table" zig build check-portable-table
     run_modules "$plain $netns"
     graph_save
     summary
@@ -1027,6 +1028,7 @@ cmd_changed() {
     # covers wasm32 and arm32 too, and until this step existed nothing had ever
     # compiled for either.
     step "check-portable" zig build check-portable
+    step "check-portable-table" zig build check-portable-table
 
     if [[ -z "$closure" ]]; then
         graph_save
@@ -1110,6 +1112,7 @@ cmd_all() {
     step "check-fuzz" zig build check-fuzz
     step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
+    step "check-portable-table" zig build check-portable-table
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
     # programs nothing else builds: they are not tests, and `scripts/ctgrind.sh`
     # -- which needs valgrind -- is deliberately NOT in this gate. Left alone

@@ -496,6 +496,21 @@ pub fn build(b: *std.Build) void {
         module_targets.put(m.name, parsed.targets) catch @panic("OOM");
     }
 
+    // Snapshot of `module_targets` as a plain, deterministically-sorted slice
+    // -- `check-portable-table` (below) renders a README table from this, and
+    // a hash map's iteration order is not something a checked-in file's row
+    // order should depend on. Same data as `module_targets`, just ordered.
+    var portable_decls: std.ArrayList(PortableDecl) = .empty;
+    {
+        var it = module_targets.iterator();
+        while (it.next()) |e| portable_decls.append(b.allocator, .{ .module = e.key_ptr.*, .targets = e.value_ptr.* }) catch @panic("OOM");
+    }
+    std.mem.sort(PortableDecl, portable_decls.items, {}, struct {
+        fn lessThan(_: void, x: PortableDecl, y: PortableDecl) bool {
+            return std.mem.lessThan(u8, x.module, y.module);
+        }
+    }.lessThan);
+
     // Pass 2: one Module graph per cross-compiled target -- same shape as
     // pass 1 in `build()` above (the native `mods` map), just once per
     // `PortableTarget.query()`.
@@ -591,6 +606,53 @@ pub fn build(b: *std.Build) void {
         .decl_errors = portable_decl_errors.items,
     };
     portable.dependOn(&portable_baseline.step);
+
+    // `zig build check-portable-table` / `zig build gen-portable-table` — the
+    // consumer-facing half of the schema above. `check-portable` proves a
+    // claim; nothing until now let a consumer SEE it without reading 228
+    // `root.zig` files and a TSV. This renders the README's "Portability"
+    // table from exactly the two sources `check-portable` itself reads --
+    // `module_targets`' declared sets (snapshotted into `portable_decls`
+    // above) and `scripts/portable-known-failures.tsv` -- so the table can
+    // never assert a status the gate did not itself check, and a stale table
+    // (edited by hand, or left behind after a module's `.targets` changed)
+    // fails the build exactly as a stale baseline row does. Two named steps
+    // sharing one `make`: `check-portable-table` (the gate; `.write = false`)
+    // and `gen-portable-table` (the fix; `.write = true`), so "verify" and
+    // "regenerate" can never drift into two different rendering paths.
+    const portable_table_check = b.allocator.create(PortableTableStep) catch @panic("OOM");
+    portable_table_check.* = .{
+        .step = std.Build.Step.init(.{
+            .id = .custom,
+            .name = "check-portable-table",
+            .owner = b,
+            .makeFn = PortableTableStep.make,
+        }),
+        .decls = portable_decls.items,
+        .decl_errors = portable_decl_errors.items,
+        .write = false,
+    };
+    b.step(
+        "check-portable-table",
+        "Verify README.md's generated Portability table matches meta.targets + the known-failures baseline",
+    ).dependOn(&portable_table_check.step);
+
+    const portable_table_gen = b.allocator.create(PortableTableStep) catch @panic("OOM");
+    portable_table_gen.* = .{
+        .step = std.Build.Step.init(.{
+            .id = .custom,
+            .name = "gen-portable-table",
+            .owner = b,
+            .makeFn = PortableTableStep.make,
+        }),
+        .decls = portable_decls.items,
+        .decl_errors = portable_decl_errors.items,
+        .write = true,
+    };
+    b.step(
+        "gen-portable-table",
+        "Regenerate README.md's Portability table from meta.targets + the known-failures baseline",
+    ).dependOn(&portable_table_gen.step);
 
     // `zig build check-testonly` — prove a test-only dep really is test-only.
     //
@@ -2190,6 +2252,13 @@ const cross_compile_targets = [_]PortableTarget{ .wasm32, .windows, .linux32 };
 /// declaration.
 const PortablePair = struct { module: []const u8, target: PortableTarget };
 
+/// A module's full declared set, as read from `meta.targets` -- the raw
+/// material `check-portable-table`'s generator groups into rows. Distinct
+/// from `PortablePair` (one declared (module, target) pair each): this is
+/// one entry per MODULE, carrying its whole declared set including the
+/// mandatory `.linux64`.
+const PortableDecl = struct { module: []const u8, targets: []const PortableTarget };
+
 /// A module's `meta.targets` declaration, or the reason it could not be read.
 /// `err == null` iff `targets` is a valid, non-empty, duplicate-free set that
 /// includes `.linux64` (CONVENTIONS.md §4). Read from the module's own source
@@ -2627,6 +2696,195 @@ const PortableBaselineStep = struct {
         if (failed) return step.fail("check-portable: baseline drift -- see errors above", .{});
     }
 };
+
+/// README.md markers `PortableTableStep` locates the generated table
+/// between. Everything from just after the begin marker to just before the
+/// end marker is fully owned by the generator -- both are regenerated
+/// verbatim on every run, so no hand-added blank line or trailing space in
+/// that span can ever survive a `gen-portable-table` run to cause a diff
+/// `check-portable-table` cannot explain.
+const portable_table_begin_marker = "<!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->";
+const portable_table_end_marker = "<!-- END GENERATED: check-portable-table -->";
+
+/// `zig build check-portable-table` (verify) / `zig build gen-portable-table`
+/// (write) — renders the README.md "Portability" table from the same two
+/// sources `check-portable` itself reads (see the long comment at both
+/// steps' call site in `build()`), then either diffs it against what is
+/// checked in (`write = false`, fails on any difference) or writes it
+/// (`write = true`).
+///
+/// SHAPE OF THE TABLE, AND WHY NOT ALL 228 MODULES. Every module claims
+/// `.linux64` -- repeating "linux64: claimed, tested" on 228 rows would
+/// assert nothing a reader does not already know from the collection's own
+/// bar (CONVENTIONS.md §6/§7). The table instead lists only the modules that
+/// declare a target BEYOND `.linux64` -- the ~40 (module, target) pairs
+/// `check-portable` actually sweeps -- because that is where the claimed/
+/// verified distinction this whole schema exists for actually lives. A
+/// blank cell (never claimed) and a `known-failing` cell (claimed, declared,
+/// currently broken, tracked in the baseline) are deliberately different
+/// strings: collapsing them back into one signal is the exact bug this
+/// campaign spent the day removing (CONVENTIONS.md §4's `meta.targets`
+/// intro).
+const PortableTableStep = struct {
+    step: std.Build.Step,
+    /// Every module's full declared set (`portable_decls` in `build()`),
+    /// sorted by module name so row order does not depend on hash-map
+    /// iteration.
+    decls: []const PortableDecl,
+    /// Same list `check-portable` itself fails on -- a module whose
+    /// `meta.targets` could not be read makes the table's data untrustworthy,
+    /// not just incomplete, so this step fails on it too rather than quietly
+    /// omitting the module.
+    decl_errors: []const []const u8,
+    /// `false` = verify (fails the build if README.md disagrees with the
+    /// freshly rendered table); `true` = write the rendered table into
+    /// README.md.
+    write: bool,
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *PortableTableStep = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const io = b.graph.io;
+        const verb = if (self.write) "gen-portable-table" else "check-portable-table";
+
+        var failed = false;
+        for (self.decl_errors) |e| {
+            std.log.err("{s}: {s}", .{ verb, e });
+            failed = true;
+        }
+        const baseline = parsePortableBaseline(b, io, &failed);
+        if (failed) {
+            return step.fail(
+                "{s}: cannot generate the table -- fix the meta.targets/baseline errors above (see `zig build check-portable`)",
+                .{verb},
+            );
+        }
+
+        var baseline_by_pair = std.StringHashMap([]const u8).init(b.allocator);
+        for (baseline) |e| baseline_by_pair.put(portablePairKey(b, e.module, e.target), e.reason) catch @panic("OOM");
+
+        const body = renderPortableTable(b, self.decls, baseline_by_pair) catch @panic("OOM");
+
+        const readme_path = "README.md";
+        const readme = b.build_root.handle.readFileAlloc(io, readme_path, b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
+            std.log.err("{s}: cannot read {s}: {t}", .{ verb, readme_path, err });
+            return step.fail("{s}: cannot read {s}", .{ verb, readme_path });
+        };
+
+        const content_start = (std.mem.indexOf(u8, readme, portable_table_begin_marker) orelse {
+            std.log.err("{s}: {s} has no `{s}` marker", .{ verb, readme_path, portable_table_begin_marker });
+            return step.fail("{s}: begin marker missing from {s}", .{ verb, readme_path });
+        }) + portable_table_begin_marker.len;
+        const end_idx = std.mem.indexOfPos(u8, readme, content_start, portable_table_end_marker) orelse {
+            std.log.err("{s}: {s} has a begin marker but no matching `{s}` after it", .{ verb, readme_path, portable_table_end_marker });
+            return step.fail("{s}: end marker missing from {s}", .{ verb, readme_path });
+        };
+
+        const new_readme = std.mem.concat(b.allocator, u8, &.{ readme[0..content_start], "\n", body, "\n", readme[end_idx..] }) catch @panic("OOM");
+
+        if (self.write) {
+            if (std.mem.eql(u8, new_readme, readme)) {
+                std.log.info("gen-portable-table: {s} already up to date", .{readme_path});
+                return;
+            }
+            b.build_root.handle.writeFile(io, .{ .sub_path = readme_path, .data = new_readme }) catch |err| {
+                std.log.err("gen-portable-table: cannot write {s}: {t}", .{ readme_path, err });
+                return step.fail("gen-portable-table: write failed", .{});
+            };
+            std.log.info("gen-portable-table: {s} updated", .{readme_path});
+            return;
+        }
+
+        if (!std.mem.eql(u8, new_readme, readme)) {
+            std.log.err(
+                "check-portable-table: {s}'s generated Portability table is STALE against meta.targets / {s} -- " ++
+                    "run `zig build gen-portable-table` and commit the result",
+                .{ readme_path, portable_baseline_path },
+            );
+            return step.fail("check-portable-table: stale table in {s}", .{readme_path});
+        }
+        std.log.info("check-portable-table: {s}'s Portability table is up to date", .{readme_path});
+    }
+};
+
+/// Renders the body that goes between the two `portable_table_*_marker`
+/// lines: prose (with every number computed here, never typed) followed by
+/// one row per module that declares a target beyond `.linux64`.
+fn renderPortableTable(
+    b: *std.Build,
+    decls: []const PortableDecl,
+    baseline_by_pair: std.StringHashMap([]const u8),
+) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(b.allocator);
+    const w = &out.writer;
+
+    var rows: std.ArrayList(PortableDecl) = .empty;
+    var n_pairs: usize = 0;
+    var n_pass: usize = 0;
+    var n_fail: usize = 0;
+    for (decls) |d| {
+        if (d.targets.len <= 1) continue; // `.linux64` only -- nothing to show
+        try rows.append(b.allocator, d);
+        for (d.targets) |t| {
+            if (t == .linux64) continue;
+            n_pairs += 1;
+            if (baseline_by_pair.contains(portablePairKey(b, d.module, t))) n_fail += 1 else n_pass += 1;
+        }
+    }
+
+    try w.print(
+        "### Portability — claimed vs. verified\n\n" ++
+            "Every one of the {d} modules above claims `.linux64` (Linux, amd64 or arm64) — the " ++
+            "collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually " ++
+            "**run**, not merely compiled: the CI matrix executes every module's tests in " ++
+            "`ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That " ++
+            "claim is not repeated below for all {d} modules — a linux64-only module has nothing " ++
+            "further to show here.\n\n" ++
+            "{d} of them additionally claim a cross-compile target in `meta.targets` " ++
+            "(CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of " ++
+            "these targets has a host to run on here) each declared pair's test binary and " ++
+            "checks the result against " ++
+            "[`scripts/portable-known-failures.tsv`](scripts/portable-known-failures.tsv): of " ++
+            "{d} declared pairs, {d} currently compile clean and {d} are known-failing, tracked " ++
+            "there with the real compiler error rather than silently dropped.\n\n" ++
+            "**A blank cell means the module never claimed that target.** That is a different " ++
+            "fact from a `known-failing` cell next to it — one is an absent claim, the other is " ++
+            "a claim currently broken and tracked — and this table exists so the two are never " ++
+            "shown as the same thing.\n\n",
+        .{ module_list.len, module_list.len, rows.items.len, n_pairs, n_pass, n_fail },
+    );
+
+    try w.writeAll("| Module | linux32 | windows | wasm32 |\n|---|---|---|---|\n");
+    for (rows.items) |d| {
+        // Deliberately NOT `[`name`](modules/name/README.md)` -- that is the
+        // exact needle `catalogRowNeedle` (in `checkCatalog`) searches the
+        // whole README for to locate a module's REAL catalog row further
+        // down the file; reusing it here would make `indexOf` find this
+        // table's row first and feed `readmeDepsCell` the wrong line. Plain
+        // backticks name the module without colliding with that needle.
+        try w.print("| `{s}` |", .{d.module});
+        inline for (.{ PortableTarget.linux32, PortableTarget.windows, PortableTarget.wasm32 }) |t| {
+            var declared = false;
+            for (d.targets) |dt| {
+                if (dt == t) {
+                    declared = true;
+                    break;
+                }
+            }
+            if (!declared) {
+                try w.writeAll(" — |");
+            } else if (baseline_by_pair.contains(portablePairKey(b, d.module, t))) {
+                try w.writeAll(" known-failing |");
+            } else {
+                try w.writeAll(" compiles |");
+            }
+        }
+        try w.writeAll("\n");
+    }
+
+    return out.toOwnedSlice();
+}
 
 const DarkTestsStep = struct {
     step: std.Build.Step,
