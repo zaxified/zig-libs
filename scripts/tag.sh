@@ -23,6 +23,7 @@
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+source scripts/test-lib.sh   # for _zl_cap_argv (memory cap); see the lane loop below
 
 dry_run=0
 all_lanes=0
@@ -115,7 +116,14 @@ for lane in "${lanes[@]}"; do
     log="$LOG_DIR/${label//[^a-zA-Z0-9]/_}.log"
     printf 'tag.sh: lane %-24s ... ' "$label"
     start=$(date +%s)
-    if bash scripts/test.sh $lane >"$log" 2>&1; then
+    # Each lane runs INSIDE the memory cap, not beside it. `scripts/test.sh`
+    # sources test-lib.sh but never calls `_zl_cap_argv`, so a bare
+    # `test.sh all` is unbounded — and three of them in a row is what killed
+    # a desktop here on 2026-08-18: the kernel OOM killer picks its victim by
+    # size, and under an IDE that victim is the editor. Capping the lane means
+    # a runaway dies as one red lane (exit 137) instead.
+    _zl_cap_argv
+    if ${_ZL_CAP[@]+"${_ZL_CAP[@]}"} bash scripts/test.sh $lane >"$log" 2>&1; then
         printf 'OK   %ss\n' "$(($(date +%s) - start))"
     else
         printf 'FAILED %ss\n' "$(($(date +%s) - start))"

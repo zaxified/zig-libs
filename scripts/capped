@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Run any command under the same memory cap `scripts/test.sh` applies to every
-# step it runs. For ad-hoc invocations that bypass the driver:
+# Run any command under this repo's memory cap. For ad-hoc invocations, and for
+# anything that shells out to a driver which does NOT cap for itself:
+#
+# ⚠ `scripts/test.sh` does NOT apply this cap. It sources test-lib.sh but never
+# calls `_zl_cap_argv`, so a bare `test.sh all` is unbounded. This header used
+# to claim the opposite, which is how three uncapped lanes came to kill a
+# desktop on 2026-08-18. `scripts/tag.sh` now caps each lane itself; `test.sh`
+# still relies on being invoked through here.
 #
 #     scripts/capped zig build test-yaml --summary all
 #     ZIGLIBS_MEM_MAX=24G scripts/capped zig build test
