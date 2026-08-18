@@ -20,6 +20,43 @@ on:
       - "20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
       - "20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].[0-9]*"
   pull_request:
+  # ⭐ THE FULL MATRIX, ON DEMAND, OVER ANY BRANCH — added 2026-08-18, and the
+  # reason is a tag that had to be deleted the same day.
+  #
+  # Until this existed, a tag push was the ONLY event that ran the full matrix.
+  # So when `qrscan` failed on the ReleaseFast amd64 lane and passed on every
+  # local lane, the only way to observe the failure again — or to observe that a
+  # fix had worked — was to mint another tag. A tag ASSERTS every module passed
+  # every lane; minting one to find out whether that is true inverts what it
+  # means, and each iteration leaves a false claim behind that consumers pin to.
+  #
+  # `lane` selects ONE entry of the matrix instead of all four, because that is
+  # what debugging a single red lane actually needs. Four lanes to re-check one
+  # is ~50 runner-minutes for ~12 minutes of answer, and the other three are
+  # already known green.
+  #
+  # ⚠ THE DEFAULT IS `all`, deliberately. A one-lane run is the special case and
+  # should be chosen; the dropdown makes that one click. A default of whichever
+  # lane happened to be red on the day this was written would have aged into a
+  # trap the first time someone ran it expecting the matrix.
+  #
+  # ⚠ A GREEN DISPATCH RUN IS NOT A TAG-GRADE CLAIM. It may have run one lane
+  # over an unmerged branch. The `gate` job says so in its log rather than
+  # leaving the tick to be misread — and note that a dispatch ON MAIN also
+  # becomes what the README's badge shows, so a green one-lane run there can
+  # repaint a badge that a four-lane run had turned red.
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: "Which full-matrix lane to run"
+        type: choice
+        default: all
+        options:
+          - all
+          - ReleaseSafe amd64
+          - ReleaseFast amd64
+          - strict Debug amd64 (compile only)
+          - ReleaseSafe arm64
 
 # Least privilege. The gate reads the repository and nothing else — it opens no
 # issue, pushes no tag, publishes no package — so saying so here means a
@@ -83,7 +120,7 @@ concurrency:
 # TSO and needed no hardware. Portability is a different question and hardware
 # is the only thing that answers it.
 #
-# TWO SHAPES, and the split is the point.
+# TWO SHAPES, and the split is the point. (Three EVENTS now reach them.)
 #
 #   pull_request        -> `test.sh changed`, one lane. Tests the modules the
 #                          branch touched plus their reverse-dependency
@@ -91,6 +128,10 @@ concurrency:
 #   push to main        -> the same scoped lane, against the previous head.
 #   tag                 -> `test.sh all`, every optimize lane and both
 #                          architectures.
+#   workflow_dispatch   -> the SAME full shape, over any branch, and optionally
+#                          narrowed to one lane. It claims nothing about the
+#                          commit; it exists so that reproducing a red lane no
+#                          longer requires minting a tag to do it.
 #
 # THE FULL MATRIX RUNS ON TAGS AND NOT ON EVERY PUSH, decided 2026-08-14 after
 # the first run of it took over 95 minutes per lane. A tag is the only thing in
@@ -182,7 +223,11 @@ concurrency:
 # with — that stops being true the moment a second one does.
 jobs:
   scoped:
-    if: "!startsWith(github.ref, 'refs/tags/')"
+    # ⚠ AND NOT ON A DISPATCH EITHER. A manual run exists to exercise the FULL
+    # lanes over a branch; running the scoped one alongside would add a second
+    # shape to a run whose whole point is to isolate one, and the `gate` job
+    # below requires exactly one shape to have run.
+    if: "!startsWith(github.ref, 'refs/tags/') && github.event_name != 'workflow_dispatch'"
     runs-on: ubuntu-26.04
     # A scoped lane is minutes — but this job is no longer always scoped. When
     # the harness moves, `test.sh changed` escalates to the full gate here (see
@@ -288,24 +333,37 @@ jobs:
           fi
           bash scripts/test.sh changed "$base"
 
-  full:
-    if: startsWith(github.ref, 'refs/tags/')
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: ReleaseSafe amd64
-            args: "-Doptimize=ReleaseSafe"
-            cmd: all
-            cachekey: relsafe
-            cache: true
-            runner: ubuntu-26.04
-          - name: ReleaseFast amd64
-            args: "-Doptimize=ReleaseFast"
-            cmd: all
-            cachekey: relfast
-            cache: true
-            runner: ubuntu-26.04
+  # ⭐ THE LANE TABLE LIVES IN A JOB NOW, not in `strategy.matrix.include`, and
+  # `workflow_dispatch`'s `lane` input is why. A job-level `if:` cannot see the
+  # `matrix` context — GitHub gives it `github`, `needs`, `vars` and `inputs`
+  # and nothing else — so selecting one entry of a matrix means BUILDING that
+  # matrix, which is only possible from a job output through `fromJSON`.
+  #
+  # ⚠ THE OBVIOUS ALTERNATIVE WAS REJECTED FOR A REASON THIS FILE ALREADY KNOWS.
+  # Keeping the static matrix and skipping the STEPS of the lanes nobody asked
+  # for would leave three jobs reporting `success` having compiled nothing — the
+  # same "a tick that means no work happened" shape the `gate` job at the bottom
+  # exists to refuse. A lane either runs, or is not in the matrix.
+  plan:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    name: plan lanes
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.lanes.outputs.matrix }}
+      selected: ${{ steps.lanes.outputs.selected }}
+    steps:
+      - name: Choose the lanes
+        id: lanes
+        env:
+          # A tag runs everything; only a dispatch can ask for less. `inputs` is
+          # empty on a tag push, hence the fallback.
+          WANT: ${{ inputs.lane || 'all' }}
+        run: |
+          set -euo pipefail
+          lanes=()
+          lanes+=('{"name":"ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"all","cachekey":"relsafe","cache":true,"runner":"ubuntu-26.04"}')
+          lanes+=('{"name":"ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"all","cachekey":"relfast","cache":true,"runner":"ubuntu-26.04"}')
           # ⚠ `build`, NOT `all` — this lane COMPILES every module in real Debug
           # and runs no test, and that is the whole claim it can support. Nobody
           # consumes this collection in Debug: it ships source, and the mode is
@@ -322,30 +380,48 @@ jobs:
           # in Debug: zero. Tests that SKIP in Debug: fifteen, so this lane gave
           # 48/63 where its siblings gave 63/63. See `cmd_build` in
           # scripts/test.sh for the measurement.
-          - name: strict Debug amd64 (compile only)
-            args: "-Dstrict-debug"
-            cmd: build
-            cachekey: strictdebug
-            cache: false
-            runner: ubuntu-26.04
+          lanes+=('{"name":"strict Debug amd64 (compile only)","args":"-Dstrict-debug","cmd":"build","cachekey":"strictdebug","cache":false,"runner":"ubuntu-26.04"}')
           # ONE arm64 lane, not three. What a second architecture buys is
-          # portability coverage -- alignment and endianness assumptions, atomics,
-          # and the asm-vs-fallback dispatch above -- and none of that varies by
-          # optimize mode, so the other two would mostly recompile the same
-          # surface. ReleaseSafe is the mode chosen because it is the one that has
-          # already caught a real defect here (see below). The day this lane fails
+          # portability coverage -- alignment and endianness assumptions,
+          # atomics, and the asm-vs-fallback dispatch above -- and none of that
+          # varies by optimize mode, so the other two would mostly recompile the
+          # same surface. ReleaseSafe is the mode chosen because it is the one
+          # that has already caught a real defect here. The day this lane fails
           # something the amd64 ReleaseSafe lane passes, add the other two rather
           # than arguing about it.
-          - name: ReleaseSafe arm64
-            args: "-Doptimize=ReleaseSafe"
-            cmd: all
-            # ⚠ NOT `relsafe-arm64`. The architecture is in the key template
-            # now (see the cache step), and carrying it here as well is what
-            # made this entry's key an extension of the amd64 lane's restore
-            # prefix — which is how an amd64 job came to restore this tree.
-            cachekey: relsafe
-            cache: true
-            runner: ubuntu-26.04-arm
+          #
+          # ⚠ ITS cachekey IS `relsafe`, NOT `relsafe-arm64`. The architecture is
+          # in the key template already (see the cache step), and carrying it
+          # here as well is what made this entry's key an extension of the amd64
+          # lane's restore prefix — which is how an amd64 job came to restore an
+          # aarch64 object tree.
+          lanes+=('{"name":"ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"all","cachekey":"relsafe","cache":true,"runner":"ubuntu-26.04-arm"}')
+
+          sel=$(printf '%s\n' "${lanes[@]}" | jq -s -c --arg want "$WANT" \
+            '[ .[] | select($want == "all" or .name == $want) ]')
+          n=$(printf '%s' "$sel" | jq 'length')
+          # An input matching nothing must not read as "nothing to do". The
+          # `choice` type makes a typo unlikely from the UI, but the API accepts
+          # arbitrary strings for a dispatch, and an empty matrix produces a
+          # SKIPPED `full` job — which the gate would then have to interpret.
+          if [ "$n" -eq 0 ]; then
+            echo "::error::no lane named '$WANT'; known lanes:"
+            printf '%s\n' "${lanes[@]}" | jq -r '"  - " + .name'
+            exit 1
+          fi
+          names=$(printf '%s' "$sel" | jq -r '[.[].name] | join(", ")')
+          echo "requested: $WANT"
+          echo "running $n lane(s): $names"
+          echo "matrix={\"include\":$sel}" >> "$GITHUB_OUTPUT"
+          echo "selected=$names" >> "$GITHUB_OUTPUT"
+
+  full:
+    # No `if:` of its own: a job whose `needs` was skipped is skipped too, so
+    # `plan`'s condition is the single place the full shape is routed.
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     name: full — ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     # ⭐ A CEILING WE CHOOSE, instead of the one GitHub imposes. Twice — on
@@ -615,7 +691,9 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [scoped, full]
+    # `plan` is here only for its `selected` output — the gate reads no result
+    # from it. A failed `plan` is still caught, because `full` is then skipped.
+    needs: [scoped, full, plan]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
@@ -624,9 +702,13 @@ jobs:
           SCOPED: ${{ needs.scoped.result }}
           FULL: ${{ needs.full.result }}
           IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+          # ⚠ A DISPATCH RUNS THE FULL SHAPE, and the gate must expect that or it
+          # would demand `scoped` on a run where `scoped` is correctly idle.
+          IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+          SELECTED: ${{ needs.plan.outputs.selected }}
         run: |
-          echo "scoped=$SCOPED  full=$FULL  tag=$IS_TAG"
-          if [ "$IS_TAG" = true ]; then
+          echo "scoped=$SCOPED  full=$FULL  tag=$IS_TAG  dispatch=$IS_DISPATCH"
+          if [ "$IS_TAG" = true ] || [ "$IS_DISPATCH" = true ]; then
             ran_name=full;   ran=$FULL;   idle_name=scoped; idle=$SCOPED
           else
             ran_name=scoped; ran=$SCOPED; idle_name=full;   idle=$FULL
@@ -645,5 +727,13 @@ jobs:
           fi
           if [ "$rc" -eq 0 ]; then
             echo "gate: $ran_name passed, $idle_name correctly did not run"
+          fi
+          # ⚠ AND A GREEN DISPATCH IS NOT WHAT A GREEN TAG IS. It may have run a
+          # single lane, over a branch that is not main. Said here because this
+          # job's tick is the one thing anyone reads, and the two ticks look
+          # identical.
+          if [ "$IS_DISPATCH" = true ]; then
+            echo "note: manual run, lanes = ${SELECTED:-unknown}. This is NOT a"
+            echo "      full-matrix claim unless every lane was selected."
           fi
           exit "$rc"

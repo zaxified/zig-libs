@@ -46,12 +46,16 @@ if [[ "$template" != *'runner.arch'* ]]; then
     exit 1
 fi
 
+# ⚠ THE LANES ARE JSON NOW, not `cachekey:` YAML lines — they moved into the
+# `plan` job on 2026-08-18 so that `workflow_dispatch` could select one of them
+# (a job-level `if:` cannot see the `matrix` context). This check found zero
+# keys the moment they moved and failed, which is the behaviour its author
+# wanted from it; the pattern is updated here rather than loosened.
 keys=()
-while IFS= read -r line; do
-    k="${line#*cachekey:}"
-    k="${k// /}"
+while IFS= read -r k; do
     [[ -n "$k" ]] && keys+=("$k")
-done < <(grep -E '^[[:space:]]*cachekey:' "$ci" || true)
+done < <(grep -oE '"cachekey"[[:space:]]*:[[:space:]]*"[^"]+"' "$ci" |
+    sed -E 's/.*:[[:space:]]*"([^"]+)"/\1/' || true)
 
 if [[ ${#keys[@]} -lt 2 ]]; then
     echo "check-ci-cache-keys: found ${#keys[@]} cachekey value(s) in $ci; expected at least 2" >&2
