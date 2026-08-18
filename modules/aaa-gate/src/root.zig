@@ -323,7 +323,22 @@ pub const Options = struct {
     extra_tokens: []const []const u8 = &.{},
     /// Caller-supplied bearer verifier (dynamic store); tried after the
     /// static token set. See `TokenVerifyFn` — must compare in constant
-    /// time. Its presence alone closes the bearer open plane.
+    /// time. Its presence alone closes the bearer open plane, and that
+    /// presence is fixed at `init`: `token_verify`/`token_verify_ctx` are
+    /// read only from `Options` — there is no `addToken`-style call to
+    /// attach or detach a verifier on a running gate. So *whether the
+    /// plane is open at all* is a startup decision, made once when the
+    /// gate is built; nothing here changes it later. What *does* stay live
+    /// is *which* credentials an already-configured verifier accepts, if
+    /// it reads its own backing store dynamically (e.g. re-reading a token
+    /// file per call) — that rotates with zero gate-side action, the same
+    /// way `addToken`/`removeToken` rotate the static set. The reason a
+    /// verifier closes the plane even with an empty static set: its mere
+    /// presence is a statement that credentials exist somewhere the gate
+    /// cannot enumerate, so "the static set is empty" must not be read as
+    /// "nothing is configured" — that misreading is exactly what would
+    /// silently reopen the plane out from under a caller who thought a
+    /// verifier meant auth was on.
     token_verify: ?TokenVerifyFn = null,
     /// Opaque pointer handed to every `token_verify` call.
     token_verify_ctx: ?*anyopaque = null,
@@ -353,7 +368,10 @@ pub const Options = struct {
     extra_api_keys: []const []const u8 = &.{},
     /// Caller-supplied API-key verifier (dynamic store); tried after the
     /// static key set. See `ApiKeyVerifyFn` — must compare in constant
-    /// time. Its presence alone closes the API-key open plane.
+    /// time. Its presence alone closes the API-key open plane. Same
+    /// startup-vs-live split as `token_verify` (see there): whether this
+    /// plane is open is decided once at `init`, while which keys an
+    /// already-configured verifier accepts can still change live.
     api_key_verify: ?ApiKeyVerifyFn = null,
     /// Opaque pointer handed to every `api_key_verify` call.
     api_key_verify_ctx: ?*anyopaque = null,

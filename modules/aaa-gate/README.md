@@ -124,6 +124,23 @@ middleware's `state` points at it).
   under `allow_when_unconfigured = true`, because the verifier *is* the
   configuration. Rotation then needs no `addToken`/`removeToken` call and
   no plaintext kept around to diff into the gate.
+  **This makes "is auth on" a startup decision, not a runtime one.**
+  `token_verify`/`token_verify_ctx` (and `api_key_verify` likewise) are
+  set only in `Options` at `Gate.init` — there is no call to attach or
+  detach a verifier on a gate that is already serving. So enabling or
+  disabling auth by adding or removing a verifier needs a **restart**.
+  What does *not* need one is *which* credentials an already-configured
+  verifier accepts: if it re-reads its own backing store per call (a
+  token file, an external secret store), that rotates on the next gated
+  request with no gate-side action at all — the same zero-restart
+  rotation `addToken`/`removeToken` give the static set, just decided
+  by the verifier instead of the gate. The reason the plane still closes
+  with an empty static set is the same one behind the mechanism above: a
+  verifier's presence is itself a statement that credentials exist
+  somewhere the gate cannot enumerate, so an empty static set must never
+  be read as "nothing is configured" — that misreading is exactly what
+  would reopen the plane out from under a caller who configured a
+  verifier believing auth was on.
 - **API-key scheme (`auth_mode`).** Besides bearer, the gate accepts an
   API key. `Options.auth_mode` selects `.bearer` (default — unchanged),
   `.api_key`, or `.either`. The key arrives in the `X-Api-Key` header
@@ -169,8 +186,11 @@ middleware's `state` points at it).
   with `Identity.scheme == .open` (the old dev/demo default), set
   `allow_when_unconfigured = true` explicitly — configuring any token/key
   closes the plane regardless.
-- **Audit** = a hook (`on_audit(entry)`), never a logger. Fires
-  synchronously for every **authenticated mutation** (after the handler:
+- **Audit** = a hook (`on_audit(entry)`), never a logger. Without it, a
+  denied request leaves no trace anywhere in the gate — wiring `on_audit`
+  is what makes denials observable at all, not an optional add-on to a
+  visibility the gate already has. Fires synchronously for every
+  **authenticated mutation** (after the handler:
   final status + the `target`/`detail` the handler set on the Identity;
   a handler error is audited as the 500 the server will send) and every
   **denial** (401, any method; empty target/detail). Authenticated reads
