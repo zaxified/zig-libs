@@ -865,6 +865,16 @@ test "serialize: golden vector — fixed little-endian bytes, computed independe
 }
 
 test "serialize rejects a length that overflows the u32 wire field" {
+    // The whole scenario needs a `usize` length that exceeds `u32::max`. On a
+    // 32-bit target `usize` and `u32` share the same range, so no such length
+    // is representable at all there — the guard this test exercises can never
+    // fire on that target, and the `1 << 33` literal used to construct the
+    // fixture doesn't fit `Log2Int(usize)` (`u5`) either. `@sizeOf(usize)` is
+    // comptime-known, so this branches away at compile time rather than
+    // skipping at runtime — the alternative would still need `1 << 33` to
+    // type-check on a target where it cannot.
+    if (@sizeOf(usize) < 8) return error.SkipZigTest;
+
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -319,7 +319,10 @@ test "measure: a well-mixed transcript (exponential holds, full pool) preserves 
     // Arrivals clustered 0..11; departures deliberately re-ordered vs arrival
     // and spread over ~a few mean-delays so several are plausible for each.
     const deps = [_]Time{ 55, 30, 80, 42, 12, 95, 61, 25, 70, 38, 105, 48 };
-    var i: u64 = 0;
+    // `usize`, not `u64`: this loop indexes the fixed test array `deps[i]`,
+    // and every other use of `i` here (`tr`'s `arr: Time`/`id: u64` params)
+    // widens implicitly from `usize` — there was no actual need for `u64`.
+    var i: usize = 0;
     while (i < deps.len) : (i += 1) {
         try list.append(gpa, tr(0, i, deps[i], i));
     }
@@ -374,7 +377,10 @@ test "reorderStats: order-preserving transcripts score exactly zero" {
     // FifoMix picture. Later arrival can never depart first.
     var list: std.ArrayListUnmanaged(Transit) = .empty;
     defer list.deinit(gpa);
-    var i: u64 = 0;
+    // `usize`, not `u64`: reused below to index `deps_sorted[i]`, and neither
+    // loop needs `u64` range — `tr`'s `arr`/`dep: Time` and `id: u64` params
+    // all widen implicitly from `usize`.
+    var i: usize = 0;
     while (i < 8) : (i += 1) try list.append(gpa, tr(0, i * 10, i * 10 + 40, i));
     const st = reorderStats(list.items);
     try testing.expect(st.pairs >= 10); // plenty of co-resident pairs examined
@@ -400,7 +406,11 @@ test "reorderStats: an interleaved (memoryless-looking) transcript scores near 1
     // The well-mixed synthetic from the `measure` test: clustered arrivals,
     // departures genuinely re-ordered vs arrival.
     const deps = [_]Time{ 55, 30, 80, 42, 12, 95, 61, 25, 70, 38, 105, 48 };
-    var i: u64 = 0;
+    // `usize`, not `u64`: same reasoning as the sibling "well-mixed
+    // transcript" test above — this loop indexes the fixed test array
+    // `deps[i]`, and `tr`'s `arr: Time`/`id: u64` params both widen
+    // implicitly from `usize`, so there was no actual need for `u64`.
+    var i: usize = 0;
     while (i < deps.len) : (i += 1) try list.append(gpa, tr(0, i, deps[i], i));
     const st = reorderStats(list.items);
     try testing.expect(st.pairs >= 30);

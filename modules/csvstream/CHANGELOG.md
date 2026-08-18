@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`): a test indexed the in-memory
+  `body` fixture with `rec.byte_offset` directly; `byte_offset` is `u64` deliberately (a
+  real file offset can exceed a 32-bit `usize`), which fails to compile as a slice index
+  on a 32-bit target. Added the same narrowing `@intCast` already used one test above for
+  `chunk_start_in_file` — `body` here is a 25-byte in-memory literal, so the live value is
+  always tiny and the cast is safe without changing `byte_offset`'s production type.
+  Compile-only; no behavioural test added. Verified: `zig build portable-csvstream` and
+  `zig build test-csvstream --summary all` (73/73) both green.
 - **2026-08-14** — `zig build check-fuzz` coverage restored: `src/line.zig` already had
   two `testing.fuzz` harnesses on the real decode entry points (`LineIterator.next`,
   `splitFields`) — genuinely running, catching nothing — but they were spelled `t.fuzz(`

@@ -702,7 +702,11 @@ fn primitiveRootOfUnity2Pow32() Fr {
 /// `Fr.pow`) then `computePowers`.
 pub fn computeRootsOfUnity(allocator: std.mem.Allocator, order: usize) ![]Fr {
     std.debug.assert(isPowerOfTwo(order));
-    std.debug.assert(order <= (@as(usize, 1) << 32));
+    // The `2^32` bound is a property of BLS12-381's Fr multiplicative group
+    // order (the largest power-of-two root of unity it has), not of the host
+    // pointer width — compare in `u64`, not `usize`, so the literal `32`
+    // shift stays valid on a 32-bit target where `Log2Int(usize)` is `u5`.
+    std.debug.assert(@as(u64, order) <= (@as(u64, 1) << 32));
     const root_32 = primitiveRootOfUnity2Pow32();
     const log2_order: u6 = std.math.log2_int(usize, order);
     const shift: u6 = 32 - log2_order;
@@ -808,7 +812,7 @@ fn scalarWindowDigit(bytes: *const [32]u8, bit_off: usize, c: usize) usize {
         const b = bit_off + i;
         if (b >= 256) break;
         const bit: usize = (bytes[31 - (b >> 3)] >> @as(u3, @intCast(b & 7))) & 1;
-        digit |= bit << @as(u6, @intCast(i));
+        digit |= bit << @as(std.math.Log2Int(usize), @intCast(i));
     }
     return digit;
 }
@@ -843,7 +847,7 @@ pub fn g1Msm(allocator: std.mem.Allocator, points: []const g1.Affine, scalars: [
     for (scalar_bytes, scalars) |*bytes, s| bytes.* = s.toBytes();
 
     const c = msmWindowBits(points.len);
-    const n_buckets = (@as(usize, 1) << @as(u6, @intCast(c))) - 1; // digit 0 excluded
+    const n_buckets = (@as(usize, 1) << @as(std.math.Log2Int(usize), @intCast(c))) - 1; // digit 0 excluded
     const buckets = try allocator.alloc(g1.Jacobian, n_buckets);
     defer allocator.free(buckets);
 

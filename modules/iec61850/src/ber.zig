@@ -236,7 +236,7 @@ pub fn encodeLength(v: usize, out: []u8) Error!usize {
     out[0] = 0x80 | @as(u8, @intCast(n - 1));
     var i: usize = 1;
     while (i < n) : (i += 1) {
-        const shift: u6 = @intCast((n - 1 - i) * 8);
+        const shift: std.math.Log2Int(usize) = @intCast((n - 1 - i) * 8);
         out[i] = @truncate(v >> shift);
     }
     return n;

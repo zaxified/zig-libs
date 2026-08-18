@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`): the "huge index" overflow test
+  built `wrapping_index` from a hardcoded `1 << 63`, which doesn't fit `usize` on a
+  32-bit target. The literal's job was "half of `usize`'s range, rounded up, so `* 2`
+  wraps" — a target-relative property, not a 64-bit-specific one — so replaced it with
+  `(std.math.maxInt(usize) / 2) + 1`, which equals the original `1 << 63` exactly on
+  64-bit and generalizes correctly to any width. Compile-only, identical behaviour on
+  every target that already built. Verified: `zig build portable-enip` and
+  `zig build test-enip --summary all` (164/167, 3 pre-existing skips) both green.
 - **2026-08-14** — Provenance corrected: README stated that no third-party source
   had been consulted as a design reference, while `src/connmgr.zig:250` cites
   `epan/dissectors/packet-cip.c` and the internal `hf_cip_cm_fwo_*` field

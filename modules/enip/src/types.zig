@@ -547,7 +547,10 @@ test "TagData.at reports OutOfRange instead of wrapping on a huge index" {
     const td = try TagData.decode(&payload);
     try testing.expectEqual(@as(?usize, 2), td.type.elementSize());
     // i * 2 wraps to 0 -> element 0 ("1") would come back as if in range.
-    const wrapping_index: usize = (1 << 63);
+    // Target-relative, not a hardcoded 64-bit literal: "half of usize's
+    // range, rounded up" is what makes `* 2` wrap regardless of pointer
+    // width (on 64-bit this equals the original `1 << 63` exactly).
+    const wrapping_index: usize = (std.math.maxInt(usize) / 2) + 1;
     try testing.expectError(error.OutOfRange, td.at(wrapping_index));
     // i * 2 wraps to `start = data.len - n`, i.e. the LAST element.
     try testing.expectError(error.OutOfRange, td.at(wrapping_index + 3));

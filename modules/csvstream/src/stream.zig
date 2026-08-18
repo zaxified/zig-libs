@@ -318,7 +318,11 @@ test "ChunkReader: tiny chunk_size splits on record boundaries across many chunk
         // here the body ends in '\n' so all chunks end on it).
         try t.expectEqual(@as(u8, '\n'), chunk[chunk.len - 1]);
         // The chunk's bytes must equal the source at chunk_start_in_file.
-        try t.expectEqualStrings(body[cr.chunk_start_in_file..][0..chunk.len], chunk);
+        // `chunk_start_in_file` is `u64` deliberately (a real file offset can
+        // exceed a 32-bit `usize`); this test slices a 20-byte in-memory
+        // `body`, so the live value is always tiny and the narrowing cast is
+        // safe here without changing the field's production type.
+        try t.expectEqualStrings(body[@as(usize, @intCast(cr.chunk_start_in_file))..][0..chunk.len], chunk);
         seen += chunk.len;
         chunks += 1;
     }
@@ -350,7 +354,12 @@ test "StreamReader: records carry absolute file offsets across chunk boundaries"
         try t.expectEqualStrings(e.bytes, rec.bytes);
         try t.expectEqual(e.off, rec.byte_offset);
         // THE POINT: the reported offset indexes the exact source bytes.
-        try t.expectEqualStrings(body[rec.byte_offset..][0..rec.bytes.len], rec.bytes);
+        // `byte_offset` is `u64` deliberately (a real file offset can exceed a
+        // 32-bit `usize`), same as `chunk_start_in_file` above; this test
+        // slices a 25-byte in-memory `body`, so the live value is always tiny
+        // and the narrowing cast is safe without changing the field's
+        // production type.
+        try t.expectEqualStrings(body[@as(usize, @intCast(rec.byte_offset))..][0..rec.bytes.len], rec.bytes);
         if (rec.byte_offset >= 7) crossed_chunk = true;
     }
     try t.expect((try sr.next()) == null);

@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`): the `"serialize rejects a length
+  that overflows the u32 wire field"` test crafted an oversized slice via
+  `(@as(usize, 1) << 33)` to probe the `error.TooLarge` guard. On a 32-bit target
+  `usize` and `u32` share the same range, so no `usize` length can ever exceed
+  `u32::max` there — the scenario is unreachable, and the `<< 33` literal doesn't fit
+  `Log2Int(usize)` (`u5`) either. Gated the whole test behind
+  `if (@sizeOf(usize) < 8) return error.SkipZigTest;`, a comptime-known condition Zig
+  prunes at compile time (verified: the guarded shift compiles for `wasm32-wasi` and
+  still runs — unskipped — on native 64-bit, 19/19). Compile-only; the guard changes no
+  behaviour on any target the module actually ships on.
 - **2026-08-18** — Portability fix: `serialize`/`deserialize` wrote/read every multi-byte
   wire field (`u32` lengths, `i64`/`f64` cells, `i128` `.decimal` cells) via
   `std.mem.toBytes`/`bytesToValue`, which use the host's *native* byte order —

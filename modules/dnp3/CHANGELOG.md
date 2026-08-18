@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`), and a latent 32-bit correctness
+  bug it uncovered: `Cursor.item_pos` and the class-0 static-scan's `scan_stride`
+  constant (`1 << 32`) were typed `usize`. The `1 << 32` literal doesn't fit `usize` on a
+  32-bit target, so this was first a compile error there — but retyping only the literal
+  would have left a real defect: the class-0 scan packs `kind_index * scan_stride +
+  point_index` into `item_pos`, and DNP3 object headers carry a full 32-bit range
+  qualifier, so a point index can itself approach `2^32`. On a 32-bit host a `usize`
+  `item_pos` would silently overflow as soon as the resumable scan crossed from the
+  first `PointKind` into the second, not merely fail to compile. Retyped `item_pos`
+  (the `Cursor` field and `emitStatics`'s parameter) and `scan_stride` to fixed-width
+  `u64`, narrowing back to `usize` only at the one point that indexes the (seven-entry)
+  `kinds` array. Compile-only on every target that already built (64-bit); on a 32-bit
+  target this also fixes a real overflow, though no 32-bit CI lane exercises it yet, so
+  no new behavioural test was added — the fix is verified by inspection plus the
+  existing native suite. Verified: `zig build portable-dnp3` and
+  `zig build test-dnp3 --summary all` (142/142) both green. `fleetsim` shares this exact
+  defect (it reaches this same `outstation.zig:1160`) and its portable gate is fixed
+  transitively by this change — no `fleetsim` source changed, so no entry there.
 - **2026-08-12** — **BEHAVIOURAL, not breaking** — the outstation's select-before-operate
   interlock is now bound to the peer that issued the SELECT, and `Session.feedFrame`
   filters the data-link **source** by default. Previously the arming bound sequence number,

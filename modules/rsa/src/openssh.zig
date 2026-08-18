@@ -374,8 +374,13 @@ pub const Blowfish = struct {
 pub fn eksBlowfishSetup(cost: u6, salt: []const u8, key: []const u8) Blowfish {
     var st = Blowfish.initial;
     st.expandState(salt, key);
-    const n = @as(usize, 1) << cost;
-    var i: usize = 0;
+    // `n` is an iteration count, not a memory-sized quantity, so it is typed
+    // as the fixed-width `u64` the `cost: u6` parameter already implies
+    // (`Log2Int(u64) == u6`) rather than platform `usize` — on a 32-bit
+    // target `Log2Int(usize)` is `u5`, which would silently cap `cost` at 31
+    // instead of the full range the parameter type promises.
+    const n: u64 = @as(u64, 1) << cost;
+    var i: u64 = 0;
     while (i < n) : (i += 1) {
         st.expand0State(salt);
         st.expand0State(key);

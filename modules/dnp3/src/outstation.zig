@@ -601,8 +601,12 @@ pub const Outstation = struct {
         reads: [max_read_headers]ReadRequest,
         read_count: usize,
         read_pos: usize,
-        /// Progress inside `reads[read_pos]`.
-        item_pos: usize,
+        /// Progress inside `reads[read_pos]`. `u64`, not `usize`: the class-0
+        /// static scan below packs `kind_index * scan_stride + point_index`
+        /// into this field, and `scan_stride` alone is `2^32` — on a 32-bit
+        /// host a `usize` `item_pos` would overflow as soon as the scan
+        /// crossed into the second `PointKind`, not merely fail to compile.
+        item_pos: u64,
         /// How many events this response series has already emitted.
         events_sent: usize,
     };
@@ -1126,7 +1130,9 @@ pub const Outstation = struct {
             const kinds = std.enums.values(PointKind);
             while (cursor.item_pos < kinds.len * scan_stride) {
                 const kind_index = cursor.item_pos / scan_stride;
-                const kind = kinds[kind_index];
+                // `kind_index` is bounded by `kinds.len` (seven point kinds),
+                // never anywhere near `u64`'s range — narrow for indexing.
+                const kind = kinds[@as(usize, @intCast(kind_index))];
                 const n = self.db.count(kind);
                 var within = cursor.item_pos % scan_stride;
                 if (n == 0) {
@@ -1156,8 +1162,11 @@ pub const Outstation = struct {
 
     /// Stride reserved per point kind inside a class-0 cursor. It has to
     /// exceed any realistic point count for one kind; the cursor stores
-    /// `kind_index * scan_stride + point_index`.
-    const scan_stride: usize = 1 << 32;
+    /// `kind_index * scan_stride + point_index`. `u64`: DNP3 object headers
+    /// carry a full 32-bit range qualifier, so a point index can itself
+    /// approach `2^32` — this needs headroom above that on every host, not
+    /// just ones with a 64-bit `usize`.
+    const scan_stride: u64 = 1 << 32;
 
     /// Emits static objects for `kind` in `[start, stop]`, resuming at
     /// `item_pos`. Returns true when the whole range fitted.
@@ -1169,7 +1178,7 @@ pub const Outstation = struct {
         stop: u32,
         out: []u8,
         pos: *usize,
-        item_pos: *usize,
+        item_pos: *u64,
     ) bool {
         // Safe in u32 *only* because `parseReadHeader` has already bounded both
         // ends against the database (`stop < n`, `stop >= start`) before this

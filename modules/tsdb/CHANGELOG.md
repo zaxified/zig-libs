@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — Portability fix (`check-portable`): same defect and fix as
+  `kvtree`'s 2026-08-18 entry — two crash-injection tests mixed a `usize` `crash_at`
+  directly with the splitmix64-style `0x9e3779b97f4a7c15` constant feeding
+  `SimStorage.reorder_seed` (`u64`), which doesn't fit `usize` on a 32-bit target.
+  Widened `crash_at` to `u64` for the mixing expression rather than truncating the
+  constant. Compile-only, identical produced seed on every target that already built.
+  Verified: `zig build portable-tsdb` and `zig build test-tsdb --summary all` (32/32)
+  both green.
 - **2026-08-06** — Security audit: five findings fixed, one documented as accepted (not
   defects) — part of the collection-wide audit. Modeled on Prometheus TSDB / OpenTSDB /
   InfluxDB TSM (design ref), over `kvtree` (design reference, not a test anchor).

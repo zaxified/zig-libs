@@ -545,7 +545,12 @@ test "real Db: crash at a commit recovers to a committed prefix (gated)" {
                 for (&keybufs, &keys, 0..) |*kb, *key, k|
                     key.* = try std.fmt.bufPrint(kb, "r{d}i{d:0>2}-{d}", .{ round, crash_at, k });
 
-                sim.reorder_seed = 0xfab1e +% (round *% 64 + crash_at) *% 0x9e3779b97f4a7c15;
+                // `reorder_seed` is `u64` and its splitmix64-style mixing
+                // constant is genuinely a 64-bit magic number — do the
+                // mixing arithmetic in `u64`, not in `round`/`crash_at`'s
+                // native `usize` (which the constant doesn't fit on a
+                // 32-bit target).
+                sim.reorder_seed = 0xfab1e +% (@as(u64, round) *% 64 + @as(u64, crash_at)) *% 0x9e3779b97f4a7c15;
                 sim.ops_until_crash = crash_at;
                 var inflight_txn: ?u64 = null;
                 attempt: {

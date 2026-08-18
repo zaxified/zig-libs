@@ -936,7 +936,11 @@ test "series ids are allocated atomically — a crash never strands a half-regis
             var fx = try Fixture.init(gpa);
             defer fx.deinit();
             fx.sim.crash_mode = mode;
-            fx.sim.reorder_seed = 0x51d +% crash_at *% 0x9e3779b97f4a7c15;
+            // `reorder_seed` is `u64` and its splitmix64-style mixing constant
+            // is genuinely a 64-bit magic number — mix in `u64`, not in
+            // `crash_at`'s native `usize` (which the constant doesn't fit on
+            // a 32-bit target).
+            fx.sim.reorder_seed = 0x51d +% @as(u64, crash_at) *% 0x9e3779b97f4a7c15;
 
             const first = try fx.db.seriesId("base", &.{});
             fx.sim.ops_until_crash = crash_at;
@@ -993,7 +997,8 @@ test "retention: a crash mid-sweep leaves a consistent tree; re-running finishes
             var fx = try Fixture.init(gpa);
             defer fx.deinit();
             fx.sim.crash_mode = mode;
-            fx.sim.reorder_seed = 0x7d5b +% crash_at *% 0x9e3779b97f4a7c15;
+            // Same target-relative mixing fix as the sibling test above.
+            fx.sim.reorder_seed = 0x7d5b +% @as(u64, crash_at) *% 0x9e3779b97f4a7c15;
 
             const ids = try seedGrid(&fx, 3, 24);
             defer gpa.free(ids);

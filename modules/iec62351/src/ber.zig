@@ -125,7 +125,7 @@ pub fn writeHeader(out: []u8, tag: u8, content_len: usize) Error!usize {
     out[1] = @intCast(0x80 | n);
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const shift: u6 = @intCast(8 * (n - 1 - i));
+        const shift: std.math.Log2Int(usize) = @intCast(8 * (n - 1 - i));
         out[2 + i] = @truncate(content_len >> shift);
     }
     return hdr;
