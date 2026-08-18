@@ -60,7 +60,7 @@ fn Builder.init(a: Allocator, columns: []const Column) Builder;
 fn Builder.appendRow(self: *Builder, cells: []const Value) !void;
 fn Builder.toOwned(self: *Builder) !Dataset;
 
-// binary (compact, exact round-trip) + JSON
+// binary (compact, exact round-trip, explicit little-endian regardless of host) + JSON
 fn serialize(a: Allocator, d: Dataset) ![]u8;
 fn deserialize(a: Allocator, bytes: []const u8) !Dataset; // error.Corrupt on truncation/bad tag
 fn toJson(a: Allocator, d: Dataset) ![]u8; // {"columns":[...],"rows":[...]}; non-finite float -> null
@@ -101,6 +101,24 @@ greater, and 1970-01-01 lands on ordinal 0. This is enough for range
 filtering, sorting and day-difference arithmetic. It is **not independently
 verified against every historical calendar reform** — treat it as a monotonic
 ordering key, not a certified calendar-math primitive.
+
+### Binary wire format — explicit little-endian, cross-host
+
+`serialize`/`deserialize` write and read **explicit little-endian**
+(`std.mem.writeInt`/`readInt(..., .little)`) for every multi-byte field —
+`u32` lengths, `i64`/`f64` cells, `i128` `.decimal` cells — regardless of the
+host's native byte order. Floats are bit-cast to a same-width integer before
+the explicit-endian write and bit-cast back on read: the IEEE-754 bit
+*pattern* is host-independent, only its byte order is, so this round-trips
+correctly on a big-endian host too. A fixed golden byte vector (checked into
+the test suite, computed independently of this module) pins that contract,
+and it is verified live by running the test suite under `qemu-s390x` against
+a `-Dtarget=s390x-linux-musl` (big-endian) build. On a little-endian host the
+wire bytes are unchanged — this module's own tests assert the golden vector
+byte-for-byte against `serialize`'s output. This matters for `dataset`
+consumers that persist or ship the binary format across machines (e.g. a
+cache written on one host and read on another) rather than only round-tripping
+within a single process.
 
 ## Known ceiling (by design, not a bug)
 

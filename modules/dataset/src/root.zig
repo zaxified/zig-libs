@@ -301,13 +301,47 @@ pub const Builder = struct {
 
 // ── binary (de)serialization ────────────────────────────────────────────────
 // Compact self-describing encoding so a Dataset can be stored in a byte-based
-// cache (or shipped over a wire). Little-endian. Round-trips exactly.
+// cache (or shipped over a wire). Little-endian on the wire — enforced via
+// explicit `std.mem.writeInt`/`readInt(..., .little)` on every multi-byte
+// field (u32 lengths, i64/f64 cells via bit pattern, i128 decimal cells),
+// independent of host endianness. Round-trips exactly, and a fixed golden
+// byte vector (below) pins the on-wire byte layout itself, not just
+// same-process round-tripping.
 
 pub const SerializeError = error{ OutOfMemory, TooLarge };
 pub const DeserializeError = error{ Corrupt, OutOfMemory };
 
+/// Append `v` on the wire as explicit little-endian, regardless of host
+/// endianness (`std.mem.toBytes`/`bytesToValue` write/read the *native*
+/// representation, which is only accidentally little-endian on every host
+/// this has run on so far — see the module doc comment above `serialize`).
 fn putU32(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: u32) SerializeError!void {
-    try buf.appendSlice(a, &std.mem.toBytes(v));
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    try buf.appendSlice(a, &b);
+}
+
+fn putI64(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: i64) SerializeError!void {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(i64, &b, v, .little);
+    try buf.appendSlice(a, &b);
+}
+
+/// Floats go through their IEEE-754 bit pattern, not `std.mem.toBytes`: the
+/// bit pattern itself (sign/exponent/mantissa layout) is host-independent,
+/// only the *byte order* of those bits varies by host, so bit-casting to a
+/// same-width unsigned integer and writing THAT as explicit little-endian is
+/// correct on a big-endian host too — unlike `toBytes`, which would emit the
+/// bits in native (big-endian) byte order under a format that claims
+/// little-endian.
+fn putF64(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: f64) SerializeError!void {
+    try putI64(buf, a, @bitCast(v));
+}
+
+fn putI128(buf: *std.ArrayList(u8), a: std.mem.Allocator, v: i128) SerializeError!void {
+    var b: [16]u8 = undefined;
+    std.mem.writeInt(i128, &b, v, .little);
+    try buf.appendSlice(a, &b);
 }
 
 /// Narrow a `usize` length to the `u32` wire field, rejecting (rather than
@@ -331,11 +365,11 @@ pub fn serialize(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
                 .null => try buf.append(a, 0),
                 .int => |i| {
                     try buf.append(a, 1);
-                    try buf.appendSlice(a, &std.mem.toBytes(i));
+                    try putI64(&buf, a, i);
                 },
                 .float => |f| {
                     try buf.append(a, 2);
-                    try buf.appendSlice(a, &std.mem.toBytes(f));
+                    try putF64(&buf, a, f);
                 },
                 .text => |t| {
                     try buf.append(a, 3);
@@ -350,7 +384,7 @@ pub fn serialize(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
                 // whatever already-serialized bytes use them) never renumber.
                 .decimal => |r| {
                     try buf.append(a, 5);
-                    try buf.appendSlice(a, &std.mem.toBytes(r));
+                    try putI128(&buf, a, r);
                 },
             }
         }
@@ -367,7 +401,19 @@ const Cursor = struct {
         return self.bytes[self.pos .. self.pos + n];
     }
     fn u32v(self: *Cursor) DeserializeError!u32 {
-        return std.mem.bytesToValue(u32, try self.take(4));
+        return std.mem.readInt(u32, (try self.take(4))[0..4], .little);
+    }
+    fn i64v(self: *Cursor) DeserializeError!i64 {
+        return std.mem.readInt(i64, (try self.take(8))[0..8], .little);
+    }
+    /// See `putF64`: read the bits as explicit little-endian, then reinterpret
+    /// as f64 — the inverse of the host-independent bit-pattern trick used to
+    /// write it, so this is correct on a big-endian host too.
+    fn f64v(self: *Cursor) DeserializeError!f64 {
+        return @bitCast(try self.i64v());
+    }
+    fn i128v(self: *Cursor) DeserializeError!i128 {
+        return std.mem.readInt(i128, (try self.take(16))[0..16], .little);
     }
     fn byte(self: *Cursor) DeserializeError!u8 {
         return (try self.take(1))[0];
@@ -418,14 +464,14 @@ pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dat
         for (r) |*v| {
             v.* = switch (try cur.byte()) {
                 0 => .null,
-                1 => .{ .int = std.mem.bytesToValue(i64, try cur.take(8)) },
-                2 => .{ .float = std.mem.bytesToValue(f64, try cur.take(8)) },
+                1 => .{ .int = try cur.i64v() },
+                2 => .{ .float = try cur.f64v() },
                 3 => blk: {
                     const tlen = try cur.u32v();
                     break :blk .{ .text = try a.dupe(u8, try cur.take(tlen)) };
                 },
                 4 => .{ .bool = (try cur.byte()) != 0 },
-                5 => .{ .decimal = std.mem.bytesToValue(i128, try cur.take(16)) },
+                5 => .{ .decimal = try cur.i128v() },
                 else => return DeserializeError.Corrupt,
             };
         }
@@ -688,6 +734,134 @@ test "serialize / deserialize round-trip" {
     try testing.expect(out.cell(1, "sym").?.isNull());
     try testing.expectEqual(ColumnType.bool, out.columns[3].type);
     try testing.expectError(DeserializeError.Corrupt, deserialize(a, bytes[0 .. bytes.len - 3]));
+}
+
+test "serialize: golden vector — fixed little-endian bytes, computed independently of this module" {
+    // This is the test that actually catches an endianness bug: a round-trip
+    // (encode-then-decode in the same process) passes on ANY host, because
+    // whatever byte order `serialize` chooses, `deserialize` undoes the same
+    // way. It cannot tell native-endian encoding apart from the documented
+    // little-endian contract. This test can, because `golden` below is a
+    // LITERAL byte constant — never a value read back out of `serialize`,
+    // `std.mem.nativeToLittle`, or any other code under test — computed
+    // independently with Python's `struct.pack('<...', ...)` (a
+    // well-established, host-endianness-independent oracle for
+    // little-endian wire encoding) from this exact Dataset. It pins the
+    // documented contract (little-endian on the wire, regardless of host),
+    // not merely today's behavior on this (little-endian) CI host.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // One column of every `ColumnType` (int/float/text/bool/date/decimal),
+    // exercising every cell tag (0..5) across two rows: row 0 has a real
+    // value in every column, row 1 is all-null (so the null tag, and every
+    // column's "does a null cell round-trip" path, is covered too).
+    const cols = [_]Column{
+        .{ .name = "n", .type = .int },
+        .{ .name = "f", .type = .float },
+        .{ .name = "t", .type = .text },
+        .{ .name = "b", .type = .bool },
+        .{ .name = "d", .type = .date },
+        .{ .name = "m", .type = .decimal },
+    };
+    const rows = [_][]const Value{
+        &.{
+            .{ .int = 7 },
+            .{ .float = 1.25 },
+            .{ .text = "hi" },
+            .{ .bool = true },
+            .{ .text = "2024-01-31" }, // date column, Value.text representation
+            .{ .decimal = 1_500_000_000_000 }, // 1.5 at decimal_scale
+        },
+        &.{ .null, .null, .null, .null, .null, .null },
+    };
+    const src = Dataset{ .columns = &cols, .rows = &rows };
+
+    // Computed by: python3 -c "
+    //   import struct
+    //   def u32(v): return struct.pack('<I', v)
+    //   def i64(v): return struct.pack('<q', v)
+    //   def f64(v): return struct.pack('<d', v)
+    //   def i128(v):
+    //       if v < 0: v += 1 << 128
+    //       return v.to_bytes(16, 'little')
+    //   ..." (full script run once, output pasted below verbatim).
+    const golden = [_]u8{
+        // ncol = 6
+        0x06, 0x00, 0x00, 0x00,
+        // col "n": name_len=1, "n", type=int(0)
+        0x01, 0x00, 0x00, 0x00,
+        0x6e, 0x00,
+        // col "f": name_len=1, "f", type=float(1)
+        0x01, 0x00,
+        0x00, 0x00, 0x66, 0x01,
+        // col "t": name_len=1, "t", type=text(2)
+        0x01, 0x00, 0x00, 0x00,
+        0x74, 0x02,
+        // col "b": name_len=1, "b", type=bool(3)
+        0x01, 0x00,
+        0x00, 0x00, 0x62, 0x03,
+        // col "d": name_len=1, "d", type=date(4)
+        0x01, 0x00, 0x00, 0x00,
+        0x64, 0x04,
+        // col "m": name_len=1, "m", type=decimal(5)
+        0x01, 0x00,
+        0x00, 0x00, 0x6d, 0x05,
+        // nrow = 2
+        0x02, 0x00, 0x00, 0x00,
+        // row0: n = int 7 (tag 1, i64 LE)
+        0x01, 0x07, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00,
+        // row0: f = float 1.25 (tag 2, f64 LE bit pattern)
+        0x02, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0xf4, 0x3f,
+        // row0: t = text "hi" (tag 3, u32 LE len=2, bytes)
+        0x03, 0x02,
+        0x00, 0x00, 0x00, 0x68,
+        0x69,
+        // row0: b = bool true (tag 4, 0x01)
+        0x04, 0x01,
+        // row0: d = text "2024-01-31" (tag 3, u32 LE len=10, bytes)
+        0x03,
+        0x0a, 0x00, 0x00, 0x00,
+        0x32, 0x30, 0x32, 0x34,
+        0x2d, 0x30, 0x31, 0x2d,
+        0x33, 0x31,
+        // row0: m = decimal 1_500_000_000_000 (tag 5, i128 LE)
+        0x05, 0x00,
+        0x98, 0xf7, 0x3e, 0x5d,
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00,
+        // row1: all six cells null (tag 0)
+        0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00,
+    };
+
+    const bytes = try serialize(a, src);
+    try testing.expectEqualSlices(u8, &golden, bytes);
+
+    // Feed the SAME literal golden bytes (not `bytes` from above) into
+    // deserialize, so a bug that made both serialize AND deserialize agree on
+    // some other (wrong) byte order — which the byte-comparison above would
+    // also catch, but belt-and-suspenders — is caught here too.
+    const out = try deserialize(a, &golden);
+    try testing.expectEqual(@as(i64, 7), out.cell(0, "n").?.int);
+    try testing.expectEqual(@as(f64, 1.25), out.cell(0, "f").?.float);
+    try testing.expectEqualStrings("hi", out.cell(0, "t").?.text);
+    try testing.expect(out.cell(0, "b").?.bool);
+    try testing.expectEqualStrings("2024-01-31", out.cell(0, "d").?.text);
+    try testing.expectEqual(@as(i128, 1_500_000_000_000), out.cell(0, "m").?.decimal);
+    try testing.expect(out.cell(1, "n").?.isNull());
+    try testing.expect(out.cell(1, "f").?.isNull());
+    try testing.expect(out.cell(1, "t").?.isNull());
+    try testing.expect(out.cell(1, "b").?.isNull());
+    try testing.expect(out.cell(1, "d").?.isNull());
+    try testing.expect(out.cell(1, "m").?.isNull());
 }
 
 test "serialize rejects a length that overflows the u32 wire field" {

@@ -30,7 +30,20 @@ Canonical in-memory columnar-typed table — the seam between data sources and c
   = 0): equal dates compare equal, later dates compare greater. It is a monotonic ordering key, **not
   independently verified against every historical calendar reform**.
 - Serialize/deserialize is a compact binary wire format with exact round-trip (`error.Corrupt` on
-  truncation/bad tag) plus a JSON projection (non-finite float → null).
+  truncation/bad tag) plus a JSON projection (non-finite float → null). **Explicit little-endian on
+  the wire, independent of host byte order** — every multi-byte field (`u32` lengths, `i64`/`f64`
+  cells, `i128` decimal cells) goes through `std.mem.writeInt`/`readInt(..., .little)`, not
+  `std.mem.toBytes`/`bytesToValue` (which write/read the host's *native* representation — silently
+  correct on every little-endian CI lane, silently wrong cross-endian). Floats are bit-cast to their
+  same-width integer before the explicit-endian write, then bit-cast back on read — the IEEE-754 bit
+  *pattern* is host-independent, only its byte order is, so this is correct on a big-endian host too.
+  A fixed golden byte vector (computed independently, outside this module, with Python's
+  `struct.pack('<...')`) pins the documented little-endian contract; a same-process round-trip cannot
+  — encode and decode agree with each other regardless of which byte order either one actually uses.
+  Cross-verified by running the suite under `qemu-s390x` against a `-Dtarget=s390x-linux-musl`
+  (big-endian) build. On a little-endian host the wire bytes are unchanged by this fix — verified
+  byte-for-byte against the golden vector — so no existing little-endian-host payload (e.g. a wgs
+  cache) is invalidated.
 - **Known ceiling, by design:** row-major, boxed-`Value` representation (each cell a tagged union,
   each row a slice of them) — simple and allocator-friendly, not a typed columnar layout. No
   SIMD-friendly per-column scans or Arrow-style memory density; fine for dashboard-sized result sets,
@@ -50,8 +63,10 @@ correctness.
 `Value` coercion/comparison/ordering (`asFloat`/`asInt`/`cast`/`eql`/`order` incl. null<bool<numeric<
 text, and `decimal`'s exact-raw-i128 compare/coercion), `Dataset` accessors (`columnIndex`/
 `columnType`/`cell`/`floatColumn`/`seriesXY`), `concat` (same-schema append + `error.SchemaMismatch`),
-binary serialize/deserialize round-trip + corruption rejection (incl. the new `decimal` wire tag),
-`toJson` shape (incl. non-finite float → null, exact placed-point `decimal`), `parseIsoDate` +
+binary serialize/deserialize round-trip + corruption rejection (incl. the new `decimal` wire tag), a
+fixed little-endian golden byte vector asserted byte-for-byte against `serialize`'s output and fed to
+`deserialize` (cross-checked live under `qemu-s390x`, `-Dtarget=s390x-linux-musl`), `toJson` shape
+(incl. non-finite float → null, exact placed-point `decimal`), `parseIsoDate` +
 `Date.ordinal` monotonic ordering, `Builder` incremental construction.
 
 ## Backlog / deferred
@@ -80,4 +95,7 @@ src/root.zig.
 - **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
-**What the tests actually contain.** internal tabular Value/Dataset abstraction, no wire format
+**What the tests actually contain.** internal tabular Value/Dataset abstraction, plus one wire-format
+oracle: the little-endian golden byte vector above. It pins this module's own documented on-wire
+contract (there is no external spec/RFC for it), so it does not change the Class C grade — it is a
+brute-force reference for our own invariant, not an outside conformance target.
