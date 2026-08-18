@@ -99,10 +99,6 @@ bn254	std/crypto/ff.zig:918:27: error: evaluation exceeded 1000 backwards branch
 chachapoly	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_20286' has no member named 'VDSO' [wasi-surface]
 cookies	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
 cors	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-csvstream	modules/csvstream/src/stream.zig:321:41: expected type 'usize', found 'u64'
-dataset	modules/dataset/src/root.zig:877:87: type 'u5' cannot represent integer value '33'
-df-elect	modules/netsim/src/fault.zig:127:39: expected type 'usize', found 'u64' (netsim cascade)
-dnp3	modules/dnp3/src/outstation.zig:1160:34: type 'usize' cannot represent integer value '4294967296'
 enip	modules/enip/src/types.zig:550:38: type 'usize' cannot represent integer value '9223372036854775808'
 fleetsim	modules/dnp3/src/outstation.zig:1160:34: type 'usize' cannot represent integer value '4294967296'
 fss	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_31141' has no member named 'VDSO' [wasi-surface]
@@ -113,25 +109,17 @@ http	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (da
 idempotency	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
 iec104	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/iec104/src/transport.zig:294) [wasi-surface]
 iec61850	modules/iec61850/src/ber.zig:240:33: expected type 'u5', found 'u6'
-iec62351	modules/iec62351/src/ber.zig:129:47: expected type 'u5', found 'u6'
 imap	std/os/linux.zig:63:34: error: struct 'os.linux.arch_bits__struct_17602' has no member named 'syscall2' [wasi-surface]
 isis-lsdb	std/c.zig:10660:12: error: dependency on libc must be explicitly specified in the build command [wasi-surface]
-isis-sim	modules/isis-sim/src/fabric.zig:520:52: expected type 'usize', found 'u64'
 jinja	std/c.zig:10660:12: error: dependency on libc must be explicitly specified in the build command [wasi-surface]
 jwe	std/math.zig:781:24: error: evaluation exceeded 1000 backwards branches
 jwt	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
 k256	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_98286' has no member named 'VDSO' [wasi-surface]
 kv	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/kv/src/root.zig:1456) [wasi-surface]
-kvtree	modules/kvtree/src/harness.zig:548:75: type 'usize' cannot represent integer value '11400714819323198485'
-liveness-hyst	modules/netsim/src/sim.zig:401:75: expected type 'usize', found 'u64' (netsim cascade)
 lockfree	modules/lockfree/src/harness.zig:92:44: expected type 'usize', found 'u64'
-loopfree-reconv	modules/loopfree-reconv/src/fabric.zig:296:26: expected type 'usize', found 'u64'
-loopix	modules/loopix/src/adversary.zig:324:44: expected type 'usize', found 'u64'
 mcp-http	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-minisign	modules/minisign/src/root.zig:664:85: expected type 'usize', found 'u64'
 montint	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_14521' has no member named 'VDSO' [wasi-surface]
 mqtt	std/atomic.zig:21:32: error: expected 32-bit integer type or smaller; found 64-bit integer type (reached via modules/mqtt/src/broker.zig:632)
-netsim	modules/netsim/src/fault.zig:127:39: expected type 'usize', found 'u64' (netsim's own defect; df-elect/liveness-hyst/raft cascade from this)
 opcua	std/os/linux.zig:63:34: error: struct 'os.linux.arch_bits__struct_39351' has no member named 'syscall2' [wasi-surface]
 openapi	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
 p256	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_119161' has no member named 'VDSO' [wasi-surface]
@@ -141,12 +129,10 @@ poseidon	std/crypto/ff.zig:918:27: error: evaluation exceeded 1000 backwards bra
 probe	modules/probe/src/root.zig:640:13: probe.PosixConnector is Linux-only (raw socket syscalls, no libc) -- module's own comptime gate [wasi-surface]
 procrun	modules/procrun/src/root.zig:272:17: type 'void' has no members -- std.posix wait-status API is void on wasi [wasi-surface]
 protobuf	std/process/Environ.zig:608:23: error: no field or member function named 'view' in 'process.Environ.GlobalBlock' (reached via modules/testkit/src/root.zig:66) [wasi-surface]
-raft	modules/netsim/src/fault.zig:127:39: expected type 'usize', found 'u64' (netsim cascade)
 ramcache	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/ramcache/src/sharded.zig:1609) [wasi-surface]
 ratelimit	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade; also has its own @fieldParentPtr alignment error)
 readthrough	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/readthrough/src/tests.zig:301) [wasi-surface]
 requestid	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-rescue	modules/rescue/src/goldilocks.zig:308:17: expected type 'usize', found 'u64'
 router	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
 rsa	modules/rsa/src/openssh.zig:377:32: expected type 'u5', found 'u6'
 s7comm	std/c.zig:10948:12: error: dependency on libc must be explicitly specified in the build command (reached via modules/s7comm/src/transport.zig:102) [wasi-surface]
@@ -160,11 +146,9 @@ syslog	std/c.zig:11468:12: error: dependency on libc must be explicitly specifie
 testkit	std/process/Environ.zig:608:23: error: no field or member function named 'view' in 'process.Environ.GlobalBlock' (reached via modules/testkit/src/root.zig:110) [wasi-surface]
 tfhe	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_26619' has no member named 'VDSO' [wasi-surface]
 tracecontext	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-tsdb	modules/tsdb/src/root.zig:939:56: type 'usize' cannot represent integer value '11400714819323198485'
 upstream	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/upstream/src/root.zig:1246) [wasi-surface]
 validate	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade; also reaches std.os.linux VDSO independently)
 webhooksig	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
 workerpool	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/workerpool/src/root.zig:311) [wasi-surface]
 xmss	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/xmss/src/root.zig:1126) [wasi-surface]
 yaml	modules/yaml/src/root.zig:312:21: expected type 'usize', found 'u64'
-zipstream	modules/zipstream/src/root.zig:1118:44: expected type 'usize', found 'u64'
