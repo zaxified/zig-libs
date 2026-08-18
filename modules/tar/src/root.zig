@@ -51,6 +51,7 @@ const flate = std.compress.flate;
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .any, // codec is platform-pure; only packDir is Linux (statx)
     .role = .both, // reader + writer
     .concurrency = .reentrant, // no globals; one Reader/Writer per stream

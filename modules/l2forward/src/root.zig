@@ -114,6 +114,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // One thread/loop owns it, lock-free by design — no cross-thread scaling

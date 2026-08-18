@@ -94,6 +94,7 @@ pub const meta = .{
     // in each SPEC.md's closing "Status" line instead, using the catalog's
     // `extract` (built) / `gap` (not yet built) vocabulary. All phases P1-P6
     // have landed, so SPEC.md's Status line uses `extract`.
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation (no I/O, no wire framing of its own) -> util, not .codec
     .concurrency = .reentrant, // no shared/global state; PublicKey/SecretKey are plain value types

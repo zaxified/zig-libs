@@ -64,6 +64,7 @@ const std = @import("std");
 pub const meta = .{
     // Every codec, the client and the device are pure computation; only the
     // optional UdpTransport touches std.Io.net.
+    .targets = .{.linux64},
     .platform = .any,
     .role = .both, // client + device (responder)
     // One Client/Device owns its transaction table, subscriptions and

@@ -61,6 +61,7 @@ const linux = std.os.linux;
 const hashdigest = @import("hashdigest");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .posix, // atomic rename-on-commit; advisory flock; std.Io filesystem API
     .role = .util,
     .concurrency = .reentrant, // shared state (refcounts, gc) is coordinated via advisory flock

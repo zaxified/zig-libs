@@ -109,6 +109,7 @@ pub const psSignWithSecret = credential.psSignWithSecret;
 pub const psVerifyPlain = credential.psVerifyPlain;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure Fr/G1/G2/pairing math over bls12_381
     .role = .util,
     .concurrency = .reentrant, // no shared state; the one entropy source (keygen/proveCredential) takes a portable std.Io, no raw getrandom(2)

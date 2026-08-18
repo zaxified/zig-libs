@@ -33,6 +33,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure arithmetic; no I/O, no clock
     .role = .util,
     .concurrency = .single_owner, // one Accumulator per probe stream; not shared

@@ -32,6 +32,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec, // pure computation over caller buffers, no I/O
     .concurrency = .single_owner, // one owner per Sealer/Opener; lock-free

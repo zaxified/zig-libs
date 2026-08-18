@@ -62,6 +62,7 @@ pub const expectedRound = verify.expectedRound;
 pub const bls12_381 = @import("bls12_381");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure parse + verify; no I/O, no syscalls
     .role = .client, // a beacon-client core (verification + codec half); transport is the caller's
     .concurrency = .reentrant, // every type is a plain value; no shared state, no globals

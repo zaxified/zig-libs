@@ -50,6 +50,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .posix, // atomic rename-on-commit; std.Io filesystem API
     .role = .util,
     .concurrency = .reentrant, // no shared state bar a process-local ingest counter

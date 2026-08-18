@@ -30,6 +30,7 @@ const std = @import("std");
 const chachapoly = @import("chachapoly");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,

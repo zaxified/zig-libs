@@ -47,6 +47,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation over caller-supplied keys/bytes — no owned socket/transport
     .concurrency = .reentrant, // no globals; every type here is a plain caller-owned value

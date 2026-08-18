@@ -70,6 +70,7 @@ const http = @import("http");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // The validator core is pure; middleware state is immutable after init

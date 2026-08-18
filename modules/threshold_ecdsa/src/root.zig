@@ -114,6 +114,7 @@ pub const aux_proofs = @import("aux_proofs.zig");
 pub const gate = @import("gate.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation (no I/O of its own)
     // KeyShare/PublicKeys/AuxParams are plain value types (or thin

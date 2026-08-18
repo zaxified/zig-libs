@@ -83,6 +83,7 @@ pub const groth16Verify = groth16.verify;
 pub const Groth16Error = groth16.Groth16Error;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing
     .concurrency = .reentrant, // every type is a plain value type, no shared state

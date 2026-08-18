@@ -46,6 +46,7 @@ pub const FieldIterator = codec.FieldIterator;
 pub const Value = codec.Value;
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .linux, // client = raw unix-socket syscalls; codec itself is .any
     .role = .client,
     .concurrency = .reentrant, // no globals; one Client per thread/loop

@@ -36,6 +36,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant, // pure functions over caller-owned buffers; no shared state

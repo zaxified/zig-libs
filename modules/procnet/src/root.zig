@@ -48,6 +48,7 @@ const builtin = @import("builtin");
 pub const netaddr = @import("netaddr");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .linux,
     .role = .util,
     .concurrency = .reentrant,

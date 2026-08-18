@@ -60,6 +60,7 @@ const Allocator = std.mem.Allocator;
 const kvtree = @import("kvtree");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // all I/O via kvtree → kv's Storage seam (std.Io)
     .role = .both, // sharded read+write store router
     // Per-shard single-owner (kvtree's contract), cross-shard parallel. The

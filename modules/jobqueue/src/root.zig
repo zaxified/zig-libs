@@ -53,6 +53,7 @@ const kv = @import("kv");
 pub const meta = .{
     // The OS-default wall/monotonic clocks use posix `clock_gettime`; both
     // are injectable, everything else is pure logic + the `kv` store.
+    .targets = .{.linux64},
     .platform = .posix,
     .role = .both,
     // One owner drives the queue and the caller-driven maintenance sweep

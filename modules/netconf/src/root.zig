@@ -46,6 +46,7 @@ pub const reply = @import("reply.zig");
 pub const client = @import("client.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .client,
     // One Client owns one session's framer, message-id counter and buffers;

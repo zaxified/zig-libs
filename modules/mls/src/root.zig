@@ -366,6 +366,7 @@ pub const ExternalPsk = group.ExternalPsk;
 pub const GroupPolicy = group.Policy;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     // Pure computation over caller-supplied bytes/keys, like the sibling
     // `hpke`/`signal` modules — no owned socket/transport of its own. Part

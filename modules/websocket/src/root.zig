@@ -19,6 +19,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .both, // server (accept/parse-inbound-masked) + client (request/parse-inbound-unmasked)
     .concurrency = .reentrant, // no shared/global state; a `Connection` is single-owner if shared across calls

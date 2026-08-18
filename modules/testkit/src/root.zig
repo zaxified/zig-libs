@@ -25,6 +25,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .single_owner,

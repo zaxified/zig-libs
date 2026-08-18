@@ -14,6 +14,7 @@ const datefmt = @import("datefmt");
 const tz_data = @import("tz_data.zig");
 
 pub const meta = .{
+    .targets = .{ .linux64, .windows },
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,

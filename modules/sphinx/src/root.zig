@@ -57,6 +57,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec, // pure wire framing + crypto core, no I/O of its own
     .concurrency = .reentrant, // no shared/global state; every type here is a plain value type

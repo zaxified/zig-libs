@@ -39,6 +39,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure computation — no I/O, threads, or libc
     .role = .util,
     .concurrency = .reentrant, // value types + caller-supplied buffers, no shared state

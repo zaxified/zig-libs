@@ -60,6 +60,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure codec over caller-owned byte slices, no I/O, no peer/connection state
     .role = .codec,
     .concurrency = .reentrant, // no shared/global state; every call is over caller-owned values

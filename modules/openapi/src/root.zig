@@ -53,6 +53,7 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // `Generator.build` itself is a pure function of an immutable

@@ -78,6 +78,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation over caller-supplied bytes — no I/O, no CoAP framing of its own
     // A `SecurityContext` is mutable per-connection state (the Sender

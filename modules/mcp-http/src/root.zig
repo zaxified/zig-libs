@@ -100,6 +100,7 @@ const http = @import("http");
 const mcp = @import("mcp");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .server,
     // Reentrant except the shared mcp.Server — inject Lock under a threaded

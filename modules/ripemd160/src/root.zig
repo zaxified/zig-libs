@@ -45,6 +45,7 @@ const mem = std.mem;
 const math = std.math;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure computation, no OS calls
     .role = .util,
     .concurrency = .reentrant, // Ripemd160 is a plain value type; no shared state

@@ -118,6 +118,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation (no I/O, no wire framing) -> util
     .concurrency = .reentrant, // no shared/global state; Modulus/Fe/Proof are plain value types

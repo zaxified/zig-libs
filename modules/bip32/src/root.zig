@@ -60,6 +60,7 @@ pub const parsePath = bip32_impl.parsePath;
 pub const derivePath = bip32_impl.derivePath;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant, // pure functions over caller-owned buffers; no shared state

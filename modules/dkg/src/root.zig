@@ -32,6 +32,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure protocol logic verified in-process; no OS/network I/O
     .role = .util,
     .concurrency = .single_owner,

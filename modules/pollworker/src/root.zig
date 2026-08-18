@@ -19,6 +19,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .linux,
     .role = .util,
     .concurrency = .single_owner,

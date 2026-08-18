@@ -83,6 +83,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure computation; the entropy seam is entropy.SecureSource over a portable std.Io, no raw getrandom(2)
     .role = .util,
     .concurrency = .reentrant, // no shared state; caller supplies all inputs

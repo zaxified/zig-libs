@@ -34,6 +34,7 @@ const http = @import("http");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure logic over the Fetcher seam; HttpFetcher uses `http`
     .role = .client,
     .concurrency = .reentrant, // no shared state anywhere

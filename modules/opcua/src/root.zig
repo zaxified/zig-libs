@@ -29,6 +29,7 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure codec + a caller-supplied stream; no socket of its own
     .role = .both, // client (this file) + server/device (`server.zig` over `nodestore.zig`)
     .concurrency = .single_owner, // caller-owned state, no locks: one loop owns a Server + its Connections

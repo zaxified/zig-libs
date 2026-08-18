@@ -181,8 +181,50 @@ Every `modules/<name>/src/root.zig` declares a `pub const meta` block — **this
 canonical source of a module's metadata**; a module's README shows a *derived* view of
 it, and SPEC.md does not restate it. Vocabulary:
 
+- `targets`: **a claim `zig build check-portable` enforces, not documentation.** A
+  non-empty, duplicate-free set drawn from `PortableTarget` (`build.zig`):
+  - `.linux64` — Linux, amd64 or arm64. The collection's baseline: every module in
+    `module_list` already proves this by existing (§6/§7 — tests green in all three
+    release lanes on the native runner, plus the CI matrix's arm64 lane), so it is
+    **mandatory in every module's set** and is never itself cross-compiled by the gate.
+  - `.linux32` — 32-bit, **big-endian, soft-float** Linux, representative target
+    `mips-linux-musl` + `mips32,soft_float` (taken verbatim from AXP's own cross-compile
+    probe, `~/workspace/axp/docs/feasibility-mips.md` — their device-agent architecture;
+    ath79 24Kc has no FPU, so soft-float is load-bearing, not a default). Named as that
+    specific architecture rather than a wider "any 32-bit Linux" class on purpose: endianness is a
+    defect class a little-endian 32-bit probe (wasm32, i686, mipsel, arm) cannot catch — a
+    module with an implicit little-endian assumption in a multi-byte wire field passes
+    every OTHER lane here (all little-endian, all but this one 64-bit) and only breaks on
+    a real big-endian target. A wider class would let a module pass on a little-endian
+    32-bit probe and claim readiness for the big-endian target it was never actually
+    built for — an unverified claim wearing a verified one's label, which is what this
+    schema exists to stop doing.
+  - `.windows` — `x86_64-windows-gnu` (bxp's gui-bridge).
+  - `.wasm32` — `wasm32-wasi` (qr/qrscan's static-footprint use case; wasi supplies the OS
+    surface the default test runner needs while keeping 32-bit pointers — see
+    `build.zig`'s `check-portable` comment for why wasi and not freestanding).
+
+  **This is a claim about what the gate has checked, not about where the code might
+  incidentally run.** Declare a target only once `zig build portable-<name>-<target>`
+  either passes or is added to `scripts/portable-known-failures.tsv` with the real
+  compiler error as the reason — never because the code "should" work there. A module
+  that never intends a target (raw `std.Thread`/libc/`std.os.linux` use with no wasm or
+  embedded audience) simply omits it; that is not a defect and does not need a baseline
+  row. `check-portable` fails on either direction of drift: a declared target that is not
+  swept, and a declared-and-swept target whose compile is red without a baseline entry.
+  A module with no `.targets` field at all (or one missing `.linux64`) fails the gate —
+  "undeclared" is not read as "any", the confusion this schema replaces.
 - `platform`: `.any` (cross-OS) · `.posix` · `.linux` (raw syscalls / no-libc — a
-  conscious ceiling, not a bug).
+  conscious ceiling, not a bug). **Historical/descriptive only as of 2026-08-18 — not
+  gate-enforced.** It predates `targets` and conflated two different claims (where a
+  module's author *intends* it to run, versus where anyone has *proven* it runs) into one
+  field consumers read as the latter; measured proof was 41 `.any` modules failing to
+  cross-compile for Windows and 64 failing for wasm32 while all of them claimed `.any`.
+  `targets` is the enforceable claim now. `platform` is kept, unchanged, because ~40
+  existing SPEC.md/README.md/root.zig doc-comment references quote it in prose (grepped
+  2026-08-18 — all prose, no machine reader besides the removed `declaresAnyPlatform` in
+  `build.zig`); a new module may still set it for that coarse, human-facing description,
+  but `targets` is what a consumer should trust and what CI checks.
 - `role`: `.client` · `.server` · `.codec` (pure wire, no I/O) · `.both` · `.util`.
 - `concurrency`: `.reentrant` (no shared state — safe if not shared) · `.threadsafe`
   (internally synchronized) · `.single_owner` (one thread/loop owns the state, lock-free)

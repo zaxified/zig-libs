@@ -40,6 +40,7 @@ const isis = @import("isis");
 const lsdb_mod = @import("isis-lsdb");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .single_owner,

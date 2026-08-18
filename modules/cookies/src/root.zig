@@ -15,6 +15,7 @@ const std = @import("std");
 const http = @import("http");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant, // no state; results borrow the input header

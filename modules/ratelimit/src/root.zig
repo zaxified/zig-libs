@@ -60,6 +60,7 @@ const http = @import("http");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // `Limiter` is internally synchronized (documented spinlock around an

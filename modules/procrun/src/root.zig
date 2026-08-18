@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const argsafe = @import("argsafe");
 
 pub const meta = .{
+    .targets = .{ .linux64, .windows },
     .platform = .any, // full behavior on POSIX; Windows compiles (reap-race is POSIX-only)
     .role = .util,
     .concurrency = .reentrant, // no shared module state (aside from the SIGCHLD-fixup guard)

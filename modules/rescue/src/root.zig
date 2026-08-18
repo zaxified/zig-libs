@@ -87,6 +87,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure 64-bit integer arithmetic — no OS, no libc, no entropy
     .role = .util, // a hash function; no I/O, no wire format of its own
     .concurrency = .reentrant, // every entry point is a pure function of its arguments

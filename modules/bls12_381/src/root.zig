@@ -71,6 +71,7 @@ pub const G2 = g2;
 pub const Gt = pairing.Gt;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing beyond point (de)serialization
     .concurrency = .reentrant, // every type is a plain value type; kzg's only global is a write-once atomic memo of the embedded (compile-time-constant) trusted setup

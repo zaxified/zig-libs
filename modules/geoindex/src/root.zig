@@ -27,6 +27,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure logic; no OS dependency
     .role = .util,
     .concurrency = .reentrant, // a frozen buffer is immutable → any number of concurrent readers

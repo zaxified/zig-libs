@@ -26,6 +26,7 @@ const search = @import("search.zig");
 const distance = @import("distance.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure logic; no OS dependency
     .role = .util,
     .concurrency = .reentrant, // a frozen buffer is immutable → concurrent readers, no sync

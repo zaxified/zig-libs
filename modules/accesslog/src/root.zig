@@ -66,6 +66,7 @@ const std = @import("std");
 const http = @import("http");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     // Pure functions over caller-supplied data / a caller-supplied Writer;

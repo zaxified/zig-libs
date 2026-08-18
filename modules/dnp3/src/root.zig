@@ -72,6 +72,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     // master = the pure codecs (build request / parse response);
     // outstation = a real stateful responder in `outstation.zig`.

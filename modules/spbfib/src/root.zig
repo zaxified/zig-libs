@@ -34,6 +34,7 @@ const spf = @import("isis-spf");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .single_owner,

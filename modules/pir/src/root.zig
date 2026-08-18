@@ -79,6 +79,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure computation — no threads / OS / libc / entropy source
     .role = .codec, // query/answer/reconstruct + byte codecs; no I/O of any kind
     .concurrency = .reentrant, // no shared state; every input is caller-supplied

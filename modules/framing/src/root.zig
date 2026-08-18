@@ -13,6 +13,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

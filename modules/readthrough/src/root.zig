@@ -67,6 +67,7 @@ const Allocator = std.mem.Allocator;
 const ramcache = @import("ramcache");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // std.Io futex + std.Thread + std.atomic are all cross-OS
     .role = .util,
     .concurrency = .threadsafe, // internally synchronized (SpinLock + std.Io futex)

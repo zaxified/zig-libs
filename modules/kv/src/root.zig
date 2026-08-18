@@ -65,6 +65,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // all I/O via std.Io through the Storage seam
     .role = .both, // embedded read+write store
     // Internally synchronized: one coarse spinlock over all operations

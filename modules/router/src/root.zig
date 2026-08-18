@@ -60,6 +60,7 @@ const std = @import("std");
 const http = @import("http");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .server,
     // Building (add/use/group) is single-owner; a built Router is immutable

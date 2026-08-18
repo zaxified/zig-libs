@@ -89,6 +89,7 @@ pub const aeskw = alg.aeskw;
 pub const ecdhes = alg.ecdhes;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec, // pure wire codec + crypto dispatch, no I/O of its own
     .concurrency = .reentrant, // no shared/global state; every call is self-contained

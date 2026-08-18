@@ -51,6 +51,7 @@ const kvtree = @import("kvtree");
 const ramcache = @import("ramcache");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // all I/O forwarded to the wrapped Storage seam
     .role = .util, // a transparent adapter between kvtree's pager and Storage
     // Wraps a single-owner ramcache and a single-writer kvtree; one owner.

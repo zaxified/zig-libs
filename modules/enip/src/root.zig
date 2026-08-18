@@ -63,6 +63,7 @@ const verboseSkip = testkit.verboseSkip;
 pub const meta = .{
     // The codecs, the client's logic and the adapter are pure computation;
     // only the optional TcpTransport/UdpDiscovery adapters touch std.Io.net.
+    .targets = .{.linux64},
     .platform = .any,
     .role = .both, // client + adapter
     // One Client/Adapter owns one connection's buffers, session handle and

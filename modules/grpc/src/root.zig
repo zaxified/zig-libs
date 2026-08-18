@@ -58,6 +58,7 @@ const std = @import("std");
 const protobuf = @import("protobuf");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .both,
     .concurrency = .single_owner, // one task drives a Channel's session

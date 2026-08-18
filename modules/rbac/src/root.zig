@@ -28,6 +28,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure in-memory logic, no OS calls
     .role = .util,
     .concurrency = .reentrant, // no shared global state; caller owns each Engine/Policy/Attributes instance

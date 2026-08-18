@@ -70,6 +70,7 @@ const entropy = @import("entropy");
 const csrf = @import("csrf.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .server,
     // The Manager is immutable once built; the only mutable state is the

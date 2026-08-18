@@ -33,6 +33,11 @@ const Scalar = scalar.Scalar;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const meta = .{
+    // Had no `.targets`/`.platform` at all before this line -- pure
+    // secp256k1 scalar/point arithmetic + SHA-256, no I/O, no syscalls, so
+    // the collection's baseline is the only real claim (CONVENTIONS.md §4).
+    .targets = .{.linux64},
+    .platform = .any,
     .name = "bolt3",
     .summary = "Lightning BOLT#3 key derivation (Appendix E): per-commitment + revocation public/secret keys over secp256k1",
     .status = "build",

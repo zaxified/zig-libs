@@ -89,6 +89,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{ .linux64, .windows },
     .platform = .any,
     .role = .server,
     .concurrency = .reentrant, // no globals; one Server instance = one owner

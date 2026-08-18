@@ -31,6 +31,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{ .linux64, .wasm32 },
     .platform = .any,
     .role = .codec, // pure computation: no allocator, no I/O, no syscalls
     .concurrency = .reentrant, // no shared state; every buffer is caller- or stack-owned

@@ -78,6 +78,7 @@ pub const handshake = @import("handshake.zig");
 pub const transport = @import("transport.zig");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,
     .concurrency = .reentrant, // no globals; one Wireguard per thread/loop

@@ -22,6 +22,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     // `.client`, not `.both`: this module FORMATS and SENDS syslog messages
     // and has no receiver — there is no parser and no listener in its public

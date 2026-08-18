@@ -109,6 +109,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // no syscall of its own; `std.Io` carries the OS-specific half
     .role = .util,
     // No state whatsoever — `fill` is a pure function of its arguments, and

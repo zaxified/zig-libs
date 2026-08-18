@@ -68,6 +68,7 @@ const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no allocation
     // No globals. Bare `SecretKey` mutation is caller-owned and NOT safe to

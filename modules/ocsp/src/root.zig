@@ -94,6 +94,7 @@ pub const der_writer = @import("der_writer.zig");
 const Builder = der_writer.Builder;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure request-build + response-verify logic; no I/O, no wire framing
     .concurrency = .reentrant, // no shared/global state; value-in / value-out

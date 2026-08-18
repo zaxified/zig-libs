@@ -1,154 +1,112 @@
-# `zig build check-portable`'s known-failure baseline for wasm32 (wasm32-wasi,
-# 32-bit pointers/usize — see build.zig's check-portable comment for why wasi
-# and not freestanding: freestanding fails to compile the default TEST RUNNER
-# itself, before any module code is reached at all, because it reaches for
-# `std.Io.Threaded`'s RNG seed / argv / stdin, none of which freestanding has).
+# `zig build check-portable`'s known-failure baseline, keyed by (module, target)
+# — see build.zig's check-portable comment and CONVENTIONS.md §4 for the full
+# schema (`meta.targets`: `.linux64` / `.linux32` / `.windows` / `.wasm32`).
 #
-# One row per `platform = .any` module whose test binary currently fails to
-# COMPILE for wasm32. Two DIFFERENT things land in this file and the reason
-# column says which:
+# One row per (module, target) pair the module DECLARES in `meta.targets`
+# whose test binary currently fails to COMPILE for that target. `.linux64` is
+# never cross-compiled by this gate (proven by the default test suite
+# instead) and can never appear here.
 #
-#   - a genuine 32-bit pointer/integer-width defect (a `u64`/`u47` narrowed to
-#     `usize`, a shift amount too wide for a 32-bit `usize`, a 64-bit atomic,
-#     a comptime literal or eval-quota that only overflows at 32 bits) — this
-#     is the class `check-portable` exists to catch, and would very plausibly
-#     also fail on a REAL 32-bit OS target (mips-linux-musleabihf, arm32, ...).
-#   - a `[wasi-surface]` gap — the module reaches something WASI specifically
-#     does not implement (no real threads by default, libc not auto-linked,
-#     `std.process.Environ`'s wasi backend missing `.view`, `std.os.linux`
-#     reached by a module that is Linux-coded despite claiming `platform =
-#     .any`, a hardcoded `@compileError("unsupported OS")` in `std.posix` for
-#     wasi). These are believed target-surface artifacts of picking wasi as
-#     the OS half of the 32-bit probe, not bitness bugs — a real 32-bit-linux
-#     target has real threads and auto-linked libc. UNVERIFIED against a real
-#     32-bit OS target as of this file's creation; a `[wasi-surface]` tag is
-#     a hypothesis about WHY, not a promise that fixing wasi would leave the
-#     module clean elsewhere.
-#
-# Format: <module><TAB><reason>, one line per module. `#`-comment and blank
-# lines are ignored. The reason is copied from the actual `zig build
-# portable-<module>` compiler error -- never invented, never a generic
-# restatement that could be pasted onto any row. Local toolchain install
-# paths are stripped down to the `std/...`-relative path (no `/home/<user>/`
-# in this file, ever — CLAUDE.md).
+# Format: <module><TAB><target><TAB><reason>, one line per pair. `#`-comment
+# and blank lines are ignored. The reason is copied from the actual `zig
+# build portable-<module>-<target>` compiler error -- never invented, never a
+# generic restatement that could be pasted onto any row. Local toolchain
+# install paths are stripped down to the `std/...`-relative path (no
+# `/home/<user>/` in this file, ever — CLAUDE.md).
 #
 # THIS LIST IS A BASELINE, NOT A SUPPRESSION. `check-portable`
 # (`PortableBaselineStep` in build.zig) fails the build in BOTH directions:
 #
-#   - a module NOT listed here that fails to compile for wasm32 -- a new or
-#     previously-undetected regression;
-#   - a module LISTED here that now PASSES -- a stale entry, which must be
+#   - a (module, target) pair NOT listed here that fails to compile -- a new
+#     or previously-undetected regression;
+#   - a pair LISTED here that now PASSES -- a stale entry, which must be
 #     deleted, not left for "in case it comes back". A baseline that can only
 #     grow is a list nobody re-reads, which is exactly the shape this repo has
 #     been burned by before (`check-global-alloc`'s `global-alloc-ok:` markers
 #     enforce the identical rule for the identical reason).
 #
-# Fixing a module's 32-bit bug does not require asking permission to shrink
-# this file -- the gate REQUIRES the row gone the moment the module passes.
+# Fixing a declared target's compile does not require asking permission to
+# shrink this file -- the gate REQUIRES the row gone the moment it passes.
 #
-# ── Root-cause groups, measured 2026-08-18, zig 0.16.0, wasm32-wasi, ReleaseSmall
-#    against the module_list in build.zig at this commit (195 platform=.any
-#    modules swept, 80 fail, 115 pass) ──
+# ── 2026-08-18: SCHEMA CHANGE, how this file's contents were decided ──
 #
-# CASCADES from ONE shared bug (not independent defects):
-#   http/src/Server.zig:2696 `day_names[day.day % 7]` (u47 -> usize)  — 19 modules
-#     (http itself + everything that imports it: acme, cookies, cors, grpc,
-#     health, idempotency, jwt, mcp-http, openapi, ratelimit, requestid,
-#     router, security-headers, sessions, staticfiles, tracecontext, validate,
-#     webhooksig). NOTE: most of these 19 ALSO carry an independent
-#     [wasi-surface] thread-spawn/libc finding of their own (their live-server
-#     tests spawn a real thread) -- fixing Server.zig:2696 alone will not turn
-#     all 19 green under wasm32-wasi, only under a target with real threads.
-#   netsim/src/fault.zig:127 + sim.zig:401 (u64 -> usize)  — 4 modules
-#     (netsim itself + df-elect, liveness-hyst, raft).
+# Before this date, `check-portable` swept every `platform = .any` module for
+# wasm32 regardless of whether the module ever intended wasm32 — 64 of them
+# were listed here as "known failures", most of them FALSE ALARMS in the sense
+# that mattered: `http`, `aaa-gate`, `ratelimit`, `bbs` and the rest never
+# meant to target wasm32 at all. `meta.targets` fixes the conflation between
+# "author intends cross-platform" and "someone verified a target" -- but the
+# fix is NOT "only declare a target a module's own docs happen to mention".
+# The first pass at this schema tried that and it was wrong: it shrank 195
+# swept modules down to 5, which would have permanently blinded the gate to
+# whatever it had not already been told to look for -- exactly backwards for a
+# gate whose entire job is catching what nobody declared a claim about yet.
 #
-# Independent 32-bit pointer/integer-width defects (own bug, not cascaded):
-#   usize-narrow (u64/u48/u56 -> usize), own bug           — 10 modules
-#   shift-width (u6 shift amount, target wants u5)          —  5 modules
-#     (same class as the original `qr` BitWriter bug this gate was built for)
-#   comptime literal too big for 32-bit usize/u5             —  7 modules
-#   comptime eval-quota exceeded (bignum limb count grows
-#     on a narrower usize)                                   —  4 modules
-#   64-bit atomic RMW unsupported at wasm32 baseline         —  7 modules
-#     (UNVERIFIED whether this reproduces on real mips-linux, where 64-bit
-#     atomics are commonly available via libatomic; may be wasm-specific)
-#   @fieldParentPtr increases pointer alignment               —  2 modules
+# The corrected rule: a REAL CONSUMER that cross-compiles a module for a
+# target is what earns that module the declaration -- stronger evidence than
+# any doc sentence, because it is a build that either works or does not.
+# Read directly from the consuming repos' own build.zig graphs (2026-08-18):
 #
-# [wasi-surface] target-surface gaps (see note above):
-#   libc not auto-linked (extern "c" fn reached)               — 36 modules
-#   std.process.Environ has no `.view` on wasi (testkit's own
-#     env-var helper, pulled in via test_deps)                 — 28 modules
-#   std.Thread.spawn (wasm32 defaults to single-threaded)       — 24 modules
-#   std.os.linux reached on a non-Linux target (module claims
-#     platform=.any but its code is Linux-only)                — 19 modules
-#   downstream void-type struct-init (follows from the above)  —  4 modules
-#   std.posix hard `@compileError("unsupported OS")` for wasi   —  2 modules
-#   module's own comptime gate declares itself Linux-only
-#     (probe.PosixConnector)                                    —  1 module
-#   std.posix wait-status API is void on wasi (procrun)         —  1 module
+#   - `~/workspace/axp/axp-core/build.zig` imports 30 zig-libs modules; AXP's
+#     device agent cross-compiles to static musl on big-endian MIPS32
+#     (`~/workspace/axp/docs/feasibility-mips.md`). Of those 30, 9 are
+#     explicitly commented "Host-side only ... NOT in the device agent's
+#     dependency graph" (the REST cluster `http`/`router`/`aaa-gate`/`cors`/
+#     `staticfiles`/`accesslog`/`validate`/`security-headers`) plus `mcp`
+#     (axp-mcp is a facade over axp-central's store, confirmed host-side by
+#     its own build.zig doc comment, not part of the device agent either).
+#     The other 21 gained `.linux32`: `sealedbox`, `hashdigest`, `framing`,
+#     `tar`, `icmp`, `dns`, `filestore`, `blobmsg`, `blobstore`, `l2disco`,
+#     `rawsock`, `uci`, `traceroute`, `probe`, `stun`, `sntp`, `procnet`,
+#     `netlink`, `conntrack`, `nl80211`, `wireguard`. Only modules AXP's own
+#     build.zig explicitly labels host-side were excluded; everything else
+#     compiles into the device agent's binary and was declared, per the
+#     asymmetry that over-declaring costs only CI time while under-declaring
+#     silently deletes coverage.
+#   - `~/workspace/bxp/bxp-core/build.zig` imports 12 zig-libs modules, and
+#     CI (`~/workspace/bxp/.github/workflows/ci.yml`) runs the whole test
+#     matrix including `windows-latest`; `bxp-gui-bridge` ships as
+#     `bxp-gui-bridge.dll` on Windows (`bxp-gui-bridge/build.zig`) and spawns
+#     `bxp-cli.exe` as a child on the same platform
+#     (`docs/dev/architecture/gui.md`, the `TerminateProcess` reap path). All
+#     12 gained `.windows`: `json5`, `diagnostics`, `decimal`, `numparse`,
+#     `minisign`, `procrun`, `mcp`, `encoding`, `csvstream`, `zipstream`,
+#     `tz`, `datefmt`.
 #
-# module	reason
-aaa-gate	modules/aaa-gate/src/root.zig:761:31: @fieldParentPtr increases pointer alignment
-accesslog	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_13268' has no member named 'VDSO' [wasi-surface]
-acme	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-bacnet	std/c.zig:10948:12: error: dependency on libc must be explicitly specified in the build command (reached via modules/bacnet/src/sc_interop.zig:127) [wasi-surface]
-bbs	modules/bbs/src/ciphersuite.zig:230:15: expected type 'usize', found 'u64'
-bfv	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/bfv/src/bench.zig:341) [wasi-surface]
-bls12_381	modules/bls12_381/src/kzg.zig:705:49: type 'u5' cannot represent integer value '32'
-bn254	std/crypto/ff.zig:918:27: error: evaluation exceeded 1000 backwards branches
-chachapoly	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_20286' has no member named 'VDSO' [wasi-surface]
-cookies	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-cors	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-enip	modules/enip/src/types.zig:550:38: type 'usize' cannot represent integer value '9223372036854775808'
-fleetsim	modules/dnp3/src/outstation.zig:1160:34: type 'usize' cannot represent integer value '4294967296'
-fss	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_31141' has no member named 'VDSO' [wasi-surface]
-groth16	std/crypto/ff.zig:918:27: error: evaluation exceeded 1000 backwards branches
-grpc	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-health	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-http	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (day.day is u47; the original defect this task set out to prove the old gate blind to)
-idempotency	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-iec104	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/iec104/src/transport.zig:294) [wasi-surface]
-iec61850	modules/iec61850/src/ber.zig:240:33: expected type 'u5', found 'u6'
-imap	std/os/linux.zig:63:34: error: struct 'os.linux.arch_bits__struct_17602' has no member named 'syscall2' [wasi-surface]
-isis-lsdb	std/c.zig:10660:12: error: dependency on libc must be explicitly specified in the build command [wasi-surface]
-jinja	std/c.zig:10660:12: error: dependency on libc must be explicitly specified in the build command [wasi-surface]
-jwe	std/math.zig:781:24: error: evaluation exceeded 1000 backwards branches
-jwt	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-k256	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_98286' has no member named 'VDSO' [wasi-surface]
-kv	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/kv/src/root.zig:1456) [wasi-surface]
-lockfree	modules/lockfree/src/harness.zig:92:44: expected type 'usize', found 'u64'
-mcp-http	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-montint	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_14521' has no member named 'VDSO' [wasi-surface]
-mqtt	std/atomic.zig:21:32: error: expected 32-bit integer type or smaller; found 64-bit integer type (reached via modules/mqtt/src/broker.zig:632)
-opcua	std/os/linux.zig:63:34: error: struct 'os.linux.arch_bits__struct_39351' has no member named 'syscall2' [wasi-surface]
-openapi	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-p256	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_119161' has no member named 'VDSO' [wasi-surface]
-pagecache	std/c.zig:10660:12: error: dependency on libc must be explicitly specified in the build command [wasi-surface]
-pir	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_30969' has no member named 'VDSO' [wasi-surface]
-poseidon	std/crypto/ff.zig:918:27: error: evaluation exceeded 1000 backwards branches
-probe	modules/probe/src/root.zig:640:13: probe.PosixConnector is Linux-only (raw socket syscalls, no libc) -- module's own comptime gate [wasi-surface]
-procrun	modules/procrun/src/root.zig:272:17: type 'void' has no members -- std.posix wait-status API is void on wasi [wasi-surface]
-protobuf	std/process/Environ.zig:608:23: error: no field or member function named 'view' in 'process.Environ.GlobalBlock' (reached via modules/testkit/src/root.zig:66) [wasi-surface]
-ramcache	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/ramcache/src/sharded.zig:1609) [wasi-surface]
-ratelimit	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade; also has its own @fieldParentPtr alignment error)
-readthrough	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/readthrough/src/tests.zig:301) [wasi-surface]
-requestid	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-router	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-rsa	modules/rsa/src/openssh.zig:377:32: expected type 'u5', found 'u6'
-s7comm	std/c.zig:10948:12: error: dependency on libc must be explicitly specified in the build command (reached via modules/s7comm/src/transport.zig:102) [wasi-surface]
-security-headers	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-sessions	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-shardstore	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/shardstore/src/root.zig:873) [wasi-surface]
-sntp	std/c.zig:11468:12: error: dependency on libc must be explicitly specified in the build command (reached via modules/sntp/src/root.zig:324) [wasi-surface]
-staticfiles	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-stun	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/stun/src/root.zig:998) [wasi-surface]
-syslog	std/c.zig:11468:12: error: dependency on libc must be explicitly specified in the build command (reached via modules/syslog/src/root.zig:87) [wasi-surface]
-testkit	std/process/Environ.zig:608:23: error: no field or member function named 'view' in 'process.Environ.GlobalBlock' (reached via modules/testkit/src/root.zig:110) [wasi-surface]
-tfhe	std/os/linux.zig:99:27: error: struct 'os.linux.arch_bits__struct_26619' has no member named 'VDSO' [wasi-surface]
-tracecontext	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-upstream	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/upstream/src/root.zig:1246) [wasi-surface]
-validate	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade; also reaches std.os.linux VDSO independently)
-webhooksig	modules/http/src/Server.zig:2696:27: expected type 'usize', found 'u47' (http cascade)
-workerpool	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/workerpool/src/root.zig:311) [wasi-surface]
-xmss	std/Thread.zig:346:9: error: Cannot spawn thread when building in single-threaded mode (reached via modules/xmss/src/root.zig:1126) [wasi-surface]
-yaml	modules/yaml/src/root.zig:312:21: expected type 'usize', found 'u64'
+# `.linux32`'s real cross-compile query is `mips-linux-musl` +
+# `mips32,soft_float` (AXP's own probe query, ath79 24Kc has no FPU) --
+# corrected from an earlier `musleabihf` guess, which would have silently
+# picked a hard-float ABI AXP's hardware cannot run. `.windows` is unchanged,
+# `x86_64-windows-gnu`.
+#
+# Kept from before the consumer read: `qr`/`qrscan` declare `.wasm32` (the
+# task's own static-footprint use case, both pass); `reconcilable` declares
+# `.windows` + `.wasm32` (its own SPEC/README already say "verified by
+# compiling ... not just claimed" -- a self-reported build, not bare prose,
+# both pass); `procrun` and `diskusage`'s SPEC-based declarations turned out
+# to be independently corroborated by the consumer read above (`procrun` is
+# literally one of bxp's 12; `diskusage` is not imported by either consumer,
+# so its `.linux32` claim rests on its own SPEC's "builds and analyzes
+# cleanly" account, not a live import -- kept, but weaker evidence than the
+# rest of this file and flagged here as such). All pass.
+#
+# Result: 38 (module, target) pairs declared, 34 pass, 4 real failures below
+# -- this is the honest shape of a non-empty baseline, not a regression.
+#
+# ── Root-cause groups (2026-08-18, mips-linux-musl mips32/soft_float) ──
+#
+#   64-bit atomic RMW unsupported at the mips32 baseline ISA (own bug):
+#     blobstore, filestore -- same class independently confirmed on `ramcache`
+#     below, which does not declare `.linux32` and so has no row of its own.
+#   usize-narrow (u64 -> usize), own bug:
+#     traceroute
+#   deliberate big-endian guard (module says so itself, not a surprise):
+#     wireguard -- `handshake.zig`'s `comptime` block already `@compileError`s
+#     with an explanation and a fix recipe; a second, independent u64->usize
+#     narrow in `transport.zig` also fires (11 errors total, same build).
+#
+# module	target	reason
+blobstore	linux32	std/atomic.zig:53:31: error: expected 32-bit integer type or smaller; found 64-bit integer type (64-bit atomic RMW unsupported at the mips32 baseline; same class as ramcache, see header)
+filestore	linux32	std/atomic.zig:53:31: error: expected 32-bit integer type or smaller; found 64-bit integer type (64-bit atomic RMW unsupported at the mips32 baseline; same class as ramcache, see header)
+traceroute	linux32	modules/traceroute/src/root.zig:678:44: error: expected type 'usize', found 'u64' (from = routers[probe_index % routers.len])
+wireguard	linux32	modules/wireguard/src/handshake.zig:57:47: error: wireguard/handshake.zig assumes a little-endian host -- module's own deliberate @compileError guard (fix recipe in the message); modules/wireguard/src/transport.zig:286:41 also has an independent usize<-u64 narrow (11 errors total)

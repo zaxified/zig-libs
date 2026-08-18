@@ -30,6 +30,7 @@ const ColumnType = ds.ColumnType;
 const Value = ds.Value;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

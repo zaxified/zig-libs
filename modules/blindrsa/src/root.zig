@@ -91,6 +91,7 @@ const std = @import("std");
 const rsa = @import("rsa");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .both, // both a .client role (blind/finalize) and a .server role (blindSign) live in one module — CONVENTIONS.md's split rule only forces separate modules when they are separate DELIVERABLES, which RSABSSA's tight client/server coupling (shared Context/salt/hash conventions) argues against
     .concurrency = .reentrant, // no shared/global state; everything here is plain value types + explicit buffers

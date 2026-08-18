@@ -85,6 +85,7 @@ const probe = @import("probe");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure logic; health I/O goes through the injected seam
     .role = .client,
     // pick/report/call/healthTick internally synchronized (pool spinlock +

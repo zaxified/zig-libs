@@ -29,6 +29,7 @@ const std = @import("std");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .any, // lookupIp's RFC 6724 ordering kicks in on Linux only
     .role = .client,
     .concurrency = .blocking, // every lookup blocks; one owner per Resolver

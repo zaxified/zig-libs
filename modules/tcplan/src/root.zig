@@ -41,6 +41,7 @@ pub const plan = @import("plan.zig");
 const compile_mod = @import("compile.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .linux, // produces Linux tc plans (built on the `tc` module)
     .role = .util, // pure compiler: plan in, no I/O
     .concurrency = .reentrant, // no shared state; caller-supplied allocator

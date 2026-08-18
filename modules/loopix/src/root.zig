@@ -36,6 +36,7 @@ const netsim = @import("netsim");
 const sphinx = @import("sphinx");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure discrete-event simulation, no OS/network I/O
     .role = .util,
     .concurrency = .single_owner,

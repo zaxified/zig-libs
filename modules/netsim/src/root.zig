@@ -41,6 +41,7 @@ const fault_mod = @import("fault.zig");
 const shrink_mod = @import("shrink.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure simulation, no OS/network I/O
     .role = .util,
     .concurrency = .single_owner,

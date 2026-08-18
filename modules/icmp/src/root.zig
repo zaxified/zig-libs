@@ -39,6 +39,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .linux, // raw syscalls (ICMP sockets), no portable fallback
     .role = .client,
     .concurrency = .single_owner, // one thread/loop owns a Pinger (stop() is signal-safe)

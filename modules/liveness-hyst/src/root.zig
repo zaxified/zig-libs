@@ -24,6 +24,7 @@ const latency_stats = @import("latency-stats");
 const core = @import("core.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .single_owner,

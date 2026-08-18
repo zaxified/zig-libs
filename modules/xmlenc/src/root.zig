@@ -39,6 +39,7 @@ const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

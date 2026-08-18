@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const net = std.Io.net;
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .any,
     .role = .client,
     .concurrency = .reentrant,

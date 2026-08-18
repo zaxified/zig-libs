@@ -58,6 +58,7 @@ const verboseSkip = testkit.verboseSkip;
 pub const meta = .{
     // Codecs, state machines, client PDU logic and the responder are pure
     // computation; only the optional TcpTransport touches std.Io.net.
+    .targets = .{.linux64},
     .platform = .any,
     .role = .both, // client + server, publisher + subscriber
     // One Client/Server owns one association's buffers and invoke ids; one

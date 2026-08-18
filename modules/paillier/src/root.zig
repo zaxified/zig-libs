@@ -64,6 +64,7 @@ const std = @import("std");
 const montint = @import("montint");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation (no I/O of its own)
     // PublicKey/SecretKey/Ciphertext are plain value types, no shared/global

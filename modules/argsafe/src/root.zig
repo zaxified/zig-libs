@@ -29,6 +29,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure byte checks; argv semantics are POSIX (see README)
     .role = .util,
     .concurrency = .reentrant, // no shared state; every fn is pure over its args

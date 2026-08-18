@@ -30,6 +30,7 @@ pub const meta = .{
     // way); the module logic is portable. The optional off-tree sanitizer
     // lane discussed in SPEC is x86_64-linux, but that is a build-lane detail,
     // not a ceiling on the module — so `.any`, not `.linux`.
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // Internally synchronized, lock-free: the queue is safe for M producers +

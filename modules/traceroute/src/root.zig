@@ -93,6 +93,7 @@ const latency = @import("latency-stats");
 const linux = std.os.linux;
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .linux, // live path = raw ICMP socket (icmp.Socket); engine is pure
     .role = .client,
     .concurrency = .single_owner, // one trace run owns its transport + buffers

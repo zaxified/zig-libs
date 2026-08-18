@@ -94,6 +94,7 @@ const StdChaCha = std.crypto.stream.chacha.ChaCha20IETF;
 const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec, // pure computation, no I/O
     .concurrency = .reentrant, // no shared state

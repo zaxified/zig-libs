@@ -43,6 +43,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

@@ -71,6 +71,7 @@ const linux = std.os.linux;
 const BPF = linux.BPF;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .linux, // raw std.os.linux.BPF syscalls — a conscious ceiling
     .role = .util,
     // One Reader/attach handle per owner; no shared globals. Not

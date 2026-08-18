@@ -21,6 +21,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .any, // file API goes through std.Io; pure hashing is allocation-free
     .role = .util,
     .concurrency = .reentrant, // one-shot fns are pure; Hasher/MultiHasher are single-owner

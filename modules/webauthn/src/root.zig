@@ -74,6 +74,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure verification logic — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no shared/global state; every function takes its inputs as parameters

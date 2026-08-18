@@ -115,6 +115,7 @@ pub const IFLA_BRIDGE = bridge.IFLA_BRIDGE;
 pub const RTEXT_FILTER = bridge.RTEXT_FILTER;
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,
     .concurrency = .reentrant, // no globals; one Socket per thread/loop

@@ -41,6 +41,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{ .linux64, .windows },
     .platform = .any, // pure integer logic, no OS calls
     .role = .util,
     .concurrency = .reentrant, // no shared state, no allocation

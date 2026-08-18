@@ -50,6 +50,7 @@ comptime {
 }
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .linux,
     .role = .both,
     .concurrency = .reentrant, // no shared state; one Socket per thread/loop

@@ -30,6 +30,7 @@ const std = @import("std");
 const ascii = std.ascii;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure byte logic, no OS calls
     .role = .codec, // pure wire format, no I/O of its own
     .concurrency = .reentrant, // no shared state, no allocation

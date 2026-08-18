@@ -37,6 +37,7 @@ const Allocator = std.mem.Allocator;
 const kv = @import("kv");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // all I/O via kv's Storage seam (std.Io)
     .role = .both, // embedded ordered read+write store
     // Single writer; MVCC readers take lockless immutable snapshots (the COW

@@ -103,6 +103,7 @@ const kvtree = @import("kvtree");
 pub const meta = .{
     // `jobqueue`'s default wall/monotonic clocks use posix `clock_gettime`
     // (both injectable); everything else is portable.
+    .targets = .{.linux64},
     .platform = .posix,
     .role = .both,
     // The public write-side API is single-owner (one coordinator thread);

@@ -158,6 +158,7 @@ const scalar_mod = Secp256k1.scalar;
 pub const Scalar = scalar_mod.Scalar;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; all types are plain values

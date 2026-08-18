@@ -100,6 +100,7 @@ pub const skToPk = keys.skToPk;
 pub const bls12_381 = @import("bls12_381");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure computation; the one entropy source (calculateRandomScalars) takes a portable std.Io, no raw getrandom(2)
     .role = .util, // no I/O, no wire framing beyond point/scalar (de)serialization
     .concurrency = .reentrant, // every type is a plain value; no globals

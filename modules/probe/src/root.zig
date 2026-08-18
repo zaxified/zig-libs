@@ -82,6 +82,7 @@ pub const meta = .{
     // Pure engine; `LiveConnector` is cross-OS via std.Io.net. `PosixConnector`
     // is Linux, but its syscalls are only analysed if it is referenced, so a
     // non-Linux consumer of the engine still builds.
+    .targets = .{ .linux64, .linux32 },
     .platform = .any,
     .role = .client,
     .concurrency = .single_owner, // one prober run owns its results; fan-out threads touch disjoint slots

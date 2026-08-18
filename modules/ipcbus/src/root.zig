@@ -20,6 +20,7 @@ const framing = @import("framing");
 const linux = std.os.linux;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .linux,
     .role = .server,
     .concurrency = .single_owner,

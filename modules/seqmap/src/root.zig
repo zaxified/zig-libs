@@ -35,6 +35,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure logic, no OS calls
     .role = .util,
     .concurrency = .reentrant, // no shared/global state; don't share one instance

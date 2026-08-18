@@ -56,6 +56,7 @@ pub const Scalar = scalar.Scalar;
 pub const field_asm_active = field.field_asm_active;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // portable Solinas everywhere; amd64 MULX/ADX is an accel path
     .role = .util, // pure computation — no I/O
     .concurrency = .reentrant, // no globals; all values are plain types

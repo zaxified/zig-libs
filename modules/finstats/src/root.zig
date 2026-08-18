@@ -16,6 +16,7 @@ const Column = dsmod.Column;
 const Value = dsmod.Value;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,

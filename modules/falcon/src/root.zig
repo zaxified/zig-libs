@@ -50,6 +50,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; keys are plain value types

@@ -54,6 +54,7 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no CBOR/CTAP wire framing
     .concurrency = .reentrant, // no globals; all state is caller-held values

@@ -32,6 +32,7 @@ const std = @import("std");
 const kvtree = @import("kvtree");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // all I/O via kvtree → kv's Storage seam
     .role = .util, // a layer over a store the caller owns
     // Inherits kvtree's model: one writer at a time; readers take MVCC

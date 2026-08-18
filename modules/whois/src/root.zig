@@ -29,6 +29,7 @@ const std = @import("std");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // codec/logic; the optional TcpTransport helper is posix
     .role = .client,
     .concurrency = .reentrant, // no shared state anywhere

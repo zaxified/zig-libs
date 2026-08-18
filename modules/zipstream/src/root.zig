@@ -46,6 +46,7 @@ const Allocator = std.mem.Allocator;
 const native_endian_is_le = builtin.target.cpu.arch.endian() == .little;
 
 pub const meta = .{
+    .targets = .{ .linux64, .windows },
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

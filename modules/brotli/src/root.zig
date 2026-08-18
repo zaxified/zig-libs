@@ -15,6 +15,19 @@
 
 const std = @import("std");
 
+// Had no `pub const meta` block at all before this line (checkCatalog's deps
+// check has a documented exception for it, since it is zero-dep) -- pure
+// compression/decompression over caller-owned buffers, no I/O, no syscalls,
+// so the collection's baseline is the only real claim (CONVENTIONS.md §4).
+pub const meta = .{
+    .targets = .{.linux64},
+    .platform = .any,
+    .role = .codec,
+    .concurrency = .reentrant,
+    .model_after = "RFC 7932 Brotli; encoder output checked against google/brotli",
+    .deps = .{},
+};
+
 const decoder = @import("decoder.zig");
 const encoder = @import("encoder.zig");
 

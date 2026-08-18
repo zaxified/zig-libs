@@ -46,6 +46,7 @@ const std = @import("std");
 const noise = @import("noise");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .single_owner, // one Initiator/Responder = one session's state

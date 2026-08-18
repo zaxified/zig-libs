@@ -45,6 +45,7 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // The middleware only reads its immutable config; readiness is as

@@ -84,6 +84,7 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,
     .concurrency = .reentrant, // no globals; one Ethtool/EventSocket per thread

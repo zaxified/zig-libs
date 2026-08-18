@@ -106,6 +106,7 @@ pub const Ristretto255 = std.crypto.ecc.Ristretto255;
 const scalar = Ristretto255.scalar;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no allocation, no RNG
     .concurrency = .reentrant, // no globals; all types are plain values

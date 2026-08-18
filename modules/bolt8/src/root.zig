@@ -35,6 +35,7 @@ pub const handshake = @import("handshake.zig");
 pub const transport = @import("transport.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .both, // both sides of Noise_XK (initiator/responder) + transport
     // One Initiator/Responder/Transport instance = one caller-owned

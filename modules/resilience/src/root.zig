@@ -132,6 +132,7 @@ pub const meta = .{
     // Default Clock (posix clock_gettime errno form) and default Delay
     // (posix nanosleep) are posix; both are injectable, everything else is
     // pure logic.
+    .targets = .{.linux64},
     .platform = .posix,
     .role = .util,
     // CircuitBreaker internally synchronized (documented spinlock);

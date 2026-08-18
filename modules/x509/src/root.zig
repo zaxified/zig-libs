@@ -151,6 +151,7 @@ pub const Spki = safe.Spki;
 pub const SpkiError = safe.SpkiError;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure verification logic; no I/O, no wire framing of its own
     .concurrency = .reentrant, // no shared/global state; every function is a pure value-in/value-out check

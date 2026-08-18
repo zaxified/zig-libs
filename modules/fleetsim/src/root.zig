@@ -54,6 +54,7 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // the core is pure; only `tcp.zig` needs a POSIX socket
     .role = .server, // it answers masters
     .concurrency = .single_owner, // one thread owns a Fleet; no locks anywhere

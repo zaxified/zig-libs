@@ -77,6 +77,7 @@ const std = @import("std");
 const entropy = @import("entropy");
 
 pub const meta = .{
+    .targets = .{ .linux64, .windows },
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,

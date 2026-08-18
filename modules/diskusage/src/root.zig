@@ -37,6 +37,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .linux, // raw statfs(2)/statfs64(2) syscalls + /proc reads, no portable fallback
     .role = .util,
     .concurrency = .reentrant, // no shared state; every call is independent

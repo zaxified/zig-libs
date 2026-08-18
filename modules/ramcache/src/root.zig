@@ -84,6 +84,7 @@ const std = @import("std");
 pub const Sharded = @import("sharded.zig").Sharded;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // Describes `Cache`, this module's primary type: one thread/loop owns it,

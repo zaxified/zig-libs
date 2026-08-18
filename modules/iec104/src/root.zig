@@ -58,6 +58,7 @@ const verboseSkip = testkit.verboseSkip;
 pub const meta = .{
     // The codecs and the state machine are pure computation; only the
     // optional TcpTransport touches std.Io.net.
+    .targets = .{.linux64},
     .platform = .any,
     .role = .both, // controlling station (client) + controlled station (outstation)
     // One Client/Server owns one connection's framer, sequence counters and

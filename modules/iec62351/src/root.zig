@@ -76,6 +76,7 @@ pub const SvReplayGuard = replay.SvGuard;
 pub const TlsProfile = tlsprofile.Profile;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure verification/policy logic over caller-supplied bytes; no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; the replay guards are plain values owned by the caller

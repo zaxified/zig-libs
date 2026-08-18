@@ -338,6 +338,7 @@ pub const KeyExchange = connection.KeyExchange;
 pub const Entropy = connection.Entropy;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .both, // client (Connection.clientInit) and server (Connection.serverInit)
     // One Connection instance = one caller-owned association with its own

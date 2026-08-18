@@ -40,6 +40,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{ .linux64, .linux32 },
     .platform = .any, // pure codec — no syscalls, no sockets
     .role = .codec, // parse/build frame payloads only
     .concurrency = .reentrant, // no shared state; safe if not shared

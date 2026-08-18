@@ -28,6 +28,7 @@ const std = @import("std");
 const qr = @import("qr");
 
 pub const meta = .{
+    .targets = .{ .linux64, .wasm32 },
     .platform = .any,
     .role = .codec, // pure arithmetic over a caller-owned buffer
     .concurrency = .reentrant,

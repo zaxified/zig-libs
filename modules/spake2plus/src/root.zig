@@ -107,6 +107,7 @@ const scalar_mod = P256.scalar;
 const Scalar = scalar_mod.Scalar;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; keys/points are plain value types

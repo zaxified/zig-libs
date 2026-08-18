@@ -56,6 +56,7 @@ const Allocator = std.mem.Allocator;
 const bitcointx = @import("bitcointx");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant, // no shared/global state; every call is over caller-owned values

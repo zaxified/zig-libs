@@ -185,6 +185,7 @@ const http = @import("http");
 const router = @import("router");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure logic over the Fetcher seam; HttpFetcher uses `http`
     .role = .both, // P6 = a `router` middleware guarding routes (server); P7 = an OAuth2/OIDC client building auth/token requests and accepting ID Tokens (relying party).
     .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server)

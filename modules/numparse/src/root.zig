@@ -20,6 +20,7 @@ const std = @import("std");
 const Decimal = @import("decimal").Decimal;
 
 pub const meta = .{
+    .targets = .{ .linux64, .windows },
     .platform = .any, // pure logic, no OS calls
     .role = .util,
     .concurrency = .reentrant, // no shared state, no allocation

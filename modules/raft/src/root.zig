@@ -48,6 +48,7 @@ const std = @import("std");
 const netsim = @import("netsim");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure simulation-verified logic, no OS/network I/O
     .role = .util,
     .concurrency = .single_owner,

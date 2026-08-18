@@ -53,6 +53,7 @@ pub const SealError = envelope.SealError;
 pub const OpenError = envelope.OpenError;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,

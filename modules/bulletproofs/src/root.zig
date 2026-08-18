@@ -101,6 +101,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .linux, // prove()'s internal getrandom(2) blinding is Linux-only (see Caveats); verify/codec paths are portable
     .role = .util, // pure computation — no I/O, no wire framing of its own
     .concurrency = .reentrant, // no globals; all types are plain values

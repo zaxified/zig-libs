@@ -85,6 +85,7 @@ const BackoffSpinLock = struct {
 pub const meta = .{
     // std.Thread + std.atomic + the std.Io futex are cross-OS; the pool logic
     // is portable. (The blocking wait needs an `Io`, which the caller supplies.)
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // `submit`, `Submitter.submit`, and the job accounting are safe from any

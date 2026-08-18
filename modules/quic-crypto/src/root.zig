@@ -93,6 +93,7 @@ pub const HeaderForm = headerprot.HeaderForm;
 pub const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     // Pure crypto/codec over caller-supplied bytes — both directions (seal
     // for the sender, open for the receiver; apply/remove header protection).

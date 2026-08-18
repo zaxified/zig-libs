@@ -29,6 +29,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure logic; the monotonic-clock use is test-only benchmarking
     .role = .util,
     .concurrency = .reentrant, // a frozen buffer is immutable → any number of concurrent readers

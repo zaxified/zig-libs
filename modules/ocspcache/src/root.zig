@@ -63,6 +63,7 @@ const der = std.crypto.Certificate.der;
 const Element = der.Element;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // fetch + cache logic; I/O goes through the injectable Transport seam
     .concurrency = .single_owner, // one thread/loop owns a Cache; callers add their own locking if shared

@@ -122,6 +122,7 @@ pub const sealAuthPsk = schedule.sealAuthPsk;
 pub const openAuthPsk = schedule.openAuthPsk;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     // Pure computation over caller-supplied bytes/keys — no owned socket,
     // no wire framing of its own (an application picks how `enc` +

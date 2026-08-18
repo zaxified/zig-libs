@@ -19,7 +19,14 @@
 const std = @import("std");
 
 pub const meta = .{
-    .platform = .any, // .any | .posix | .linux
+    // `.linux64` is mandatory (the collection's baseline -- proven by the
+    // default test suite, not cross-compiled). Add `.linux32`/`.windows`/
+    // `.wasm32` only once `zig build portable-<name>-<target>` actually
+    // passes, or is baselined in scripts/portable-known-failures.tsv with
+    // the real compiler error -- never because the code "should" work
+    // there. See CONVENTIONS.md §4.
+    .targets = .{.linux64},
+    .platform = .any, // .any | .posix | .linux -- historical/descriptive only, see CONVENTIONS.md §4
     .role = .util, // .client | .server | .codec | .both | .util
     .concurrency = .reentrant, // .reentrant | .threadsafe | .single_owner | .blocking
     .model_after = "<reference impl in another language>",

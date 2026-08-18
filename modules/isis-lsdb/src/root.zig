@@ -58,6 +58,7 @@ const std = @import("std");
 const isis = @import("isis");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .single_owner,

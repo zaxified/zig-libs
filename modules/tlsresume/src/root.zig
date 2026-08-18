@@ -64,6 +64,7 @@ pub const StrikeRegister = replay.StrikeRegister;
 pub const EarlyDataContext = earlydata.EarlyDataContext;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     // Server-side only, by design (RFC 8446 §4.2.11/§4.6.1 resumption is
     // symmetric in principle, but the client half already exists —

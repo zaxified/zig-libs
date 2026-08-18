@@ -128,6 +128,7 @@ const datefmt = @import("datefmt");
 const P256PublicKey = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec, // consumes an untrusted wire document into a trusted result
     .concurrency = .reentrant,

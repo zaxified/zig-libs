@@ -90,6 +90,7 @@ const Writer = std.Io.Writer;
 const mem = std.mem;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .server,
     // A `Handler` is created once and shared read-only across the server's

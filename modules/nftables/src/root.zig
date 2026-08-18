@@ -51,6 +51,7 @@ pub const meta = .{
     // The JSON builder and the whole wire layer are portable; only `Socket`
     // is Linux-gated (behind `builtin.os.tag`, so this module still builds
     // everywhere).
+    .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant, // Socket itself is single_owner

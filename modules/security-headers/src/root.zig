@@ -91,6 +91,7 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // An initialized SecurityHeaders is immutable; the middleware only reads

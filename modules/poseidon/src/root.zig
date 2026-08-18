@@ -81,6 +81,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure field arithmetic — no OS, no libc, no entropy source
     .role = .util, // a hash function; no I/O, no wire format of its own
     .concurrency = .reentrant, // instances are immutable after init(); share one freely

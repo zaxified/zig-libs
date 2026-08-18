@@ -18,6 +18,7 @@ pub const bolt2 = @import("bolt2.zig");
 pub const bolt7 = @import("bolt7.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure transform over caller-owned byte slices, no I/O
     .role = .codec,
     .concurrency = .reentrant, // no shared/global state

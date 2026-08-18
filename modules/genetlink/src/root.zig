@@ -49,6 +49,7 @@ const codec = netlink.codec;
 const native_endian = builtin.cpu.arch.endian();
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,
     .concurrency = .reentrant, // no globals; one Socket per thread/loop

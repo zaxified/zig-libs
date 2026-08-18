@@ -49,6 +49,7 @@ pub const meta = .{
     // Binary-Packet-Protocol write path — so the whole module is Linux-only,
     // not just an optional corner. (One of CONVENTIONS §2's two deliberate
     // hand-rolled-entropy exceptions, alongside `bulletproofs`.)
+    .targets = .{.linux64},
     .platform = .linux,
     .role = .both,
     // One Transport instance = one caller-owned connection with its own

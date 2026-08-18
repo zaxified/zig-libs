@@ -51,6 +51,7 @@ const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     // Each Graph/Tree instance is caller-owned, single-threaded value state —

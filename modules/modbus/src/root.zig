@@ -42,6 +42,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // codec + client + server are portable; TcpTransport uses std.Io.net
     .role = .both, // master (Client) + slave (server.Server) + shared wire codec
     .concurrency = .single_owner, // Client tracks the TCP transaction id; Server owns its data bank

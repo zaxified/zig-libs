@@ -122,6 +122,7 @@ const HkdfSha512 = std.crypto.kdf.hkdf.HkdfSha512;
 const timing_safe = std.crypto.timing_safe;
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no allocation, no RNG
     .concurrency = .reentrant, // no globals; all state is caller-held values

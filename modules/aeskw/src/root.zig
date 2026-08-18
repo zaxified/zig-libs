@@ -38,6 +38,19 @@
 const std = @import("std");
 const aes = std.crypto.core.aes;
 
+// Had no `pub const meta` block at all before this line (checkCatalog's deps
+// check has a documented exception for it, since it is zero-dep) -- pure
+// block-cipher arithmetic over caller-owned buffers, no I/O, no syscalls, so
+// the collection's baseline is the only real claim (CONVENTIONS.md §4).
+pub const meta = .{
+    .targets = .{.linux64},
+    .platform = .any,
+    .role = .codec,
+    .concurrency = .reentrant,
+    .model_after = "RFC 3394 AES Key Wrap",
+    .deps = .{},
+};
+
 /// RFC 3394 §2.2.3.1 default initial value — the integrity-check register's
 /// expected value after a correct unwrap.
 pub const default_iv = [8]u8{ 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6 };

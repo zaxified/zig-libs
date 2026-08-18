@@ -35,6 +35,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // codec + client are portable; TcpTransport uses std.Io.net
     .role = .client, // client + reusable wire codec
     .concurrency = .single_owner, // one owner drives feed/poll/tick

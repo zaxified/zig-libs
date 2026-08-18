@@ -27,6 +27,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure logic; `systemSource` helper is Linux-only
     .role = .util,
     .concurrency = .reentrant,

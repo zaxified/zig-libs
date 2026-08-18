@@ -59,6 +59,7 @@ const router = @import("router");
 const http = @import("http");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .posix, // default latency clock uses the posix clock_gettime errno form
     .role = .util,
     // Internally synchronized: atomics for counter/gauge, documented

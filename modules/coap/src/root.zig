@@ -34,6 +34,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure codec over a caller-provided datagram
     .role = .util,
     .concurrency = .reentrant, // no shared state; slices borrow the caller's buffers

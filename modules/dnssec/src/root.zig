@@ -40,6 +40,7 @@ const std = @import("std");
 const dns = @import("dns");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure validation logic; no I/O, no socket of its own
     .concurrency = .reentrant, // no shared/global state

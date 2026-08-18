@@ -28,6 +28,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // portable CIOS everywhere; amd64 asm is an accel path
     .role = .util,
     .concurrency = .reentrant, // immutable modulus; no shared state

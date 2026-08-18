@@ -47,6 +47,7 @@ const p256 = @import("p256");
 pub const c14n = @import("c14n.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure verification logic over a parsed tree — no I/O, no wire framing
     .concurrency = .reentrant,

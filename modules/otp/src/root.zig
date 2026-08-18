@@ -30,6 +30,7 @@
 const std = @import("std");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any, // pure computation, allocation-free
     .role = .util,
     .concurrency = .reentrant, // all functions are pure

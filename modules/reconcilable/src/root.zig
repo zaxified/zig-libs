@@ -47,6 +47,7 @@ const std = @import("std");
 pub const meta = .{
     // No syscall, no clock, no thread: `tick` is handed the instant. The
     // `resilience` dep is used only for its pure `Retry`/`Jitter` value types.
+    .targets = .{ .linux64, .windows, .wasm32 },
     .platform = .any,
     .role = .util,
     // One owner drives enqueue/tick; the reconcile pass may re-enter the same

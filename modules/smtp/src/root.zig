@@ -64,6 +64,7 @@ pub const client = @import("client.zig");
 pub const live_golden = @import("live_golden.zig");
 
 pub const meta = .{
+    .targets = .{.linux64},
     .platform = .any,
     .role = .client,
     // One Session/Client owns one conversation's parser, capability set and
