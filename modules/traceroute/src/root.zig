@@ -658,7 +658,11 @@ const FakeTransport = struct {
         else
             f.behaviors[ttl - 1];
 
-        const probe_index = (f.sends - 1) % 16; // varies within a hop
+        // Bounded to [0, 16) by construction (`% 16`), so the narrowing to
+        // `usize` below is provably in range on every host width this
+        // collection targets, not a truncation of `f.sends` (which is not
+        // itself bounded -- a trace can run arbitrarily many probes).
+        const probe_index: usize = @intCast((f.sends - 1) % 16); // varies within a hop
 
         var bytes: []u8 = undefined;
         var from: ?netaddr.Ip = null;

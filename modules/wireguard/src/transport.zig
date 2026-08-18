@@ -283,7 +283,7 @@ pub fn ReplayWindow(comptime bits: usize) type {
             const n = counter + 1;
             if (n > self.last) return true; // ahead of the window: fresh
             if (self.last - n > capacity) return false; // fell off the trailing edge
-            return self.bitmap[(n >> 6) & (blocks - 1)] & bit(n) == 0;
+            return self.bitmap[blockIndex(n >> 6)] & bit(n) == 0;
         }
 
         /// Record `counter` as accepted, sliding the window forward if it is a
@@ -304,11 +304,11 @@ pub fn ReplayWindow(comptime bits: usize) type {
                     @memset(&self.bitmap, 0);
                 } else {
                     var i = from + 1;
-                    while (i <= to) : (i += 1) self.bitmap[i & (blocks - 1)] = 0;
+                    while (i <= to) : (i += 1) self.bitmap[blockIndex(i)] = 0;
                 }
                 self.last = n;
             }
-            self.bitmap[(n >> 6) & (blocks - 1)] |= bit(n);
+            self.bitmap[blockIndex(n >> 6)] |= bit(n);
         }
 
         /// The highest counter committed so far, or null if none.
@@ -323,6 +323,24 @@ pub fn ReplayWindow(comptime bits: usize) type {
 
         fn bit(n: u64) u64 {
             return @as(u64, 1) << @truncate(n);
+        }
+
+        /// Map a block number (`x = (counter + 1) >> 6`, for either the current
+        /// counter or one being scanned over between `from` and `to`) down to
+        /// the `[blocks]u64` array index it circularly aliases. `x` itself is
+        /// an unbounded `u64` -- it is derived from the attacker-controlled
+        /// wire counter -- but `& (blocks - 1)` masks it into `[0, blocks)`
+        /// right here, so the narrowing to `usize` is provably in range on
+        /// every host width this collection targets (`blocks` is at most
+        /// `bits / 64`, and `bits` is a caller-chosen comptime constant, never
+        /// attacker data). This is a bounded mask-then-cast, not a truncation
+        /// of the attacker-controlled counter itself -- no distinct `x` values
+        /// that matter to the caller collide, because both `accepts` and
+        /// `commit` only ever compare/index positions already known to be
+        /// within `capacity` of `self.last`, i.e. within `blocks` of each
+        /// other.
+        fn blockIndex(x: u64) usize {
+            return @intCast(x & (@as(u64, blocks) - 1));
         }
     };
 }

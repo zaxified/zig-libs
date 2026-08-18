@@ -210,7 +210,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 
 Every one of the 228 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI matrix executes every module's tests in `ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That claim is not repeated below for all 228 modules — a linux64-only module has nothing further to show here.
 
-35 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair's test binary and checks the result against [`scripts/portable-known-failures.tsv`](scripts/portable-known-failures.tsv): of 36 declared pairs, 34 currently compile clean and 2 are known-failing, tracked there with the real compiler error rather than silently dropped.
+35 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair's test binary and checks the result against [`scripts/portable-known-failures.tsv`](scripts/portable-known-failures.tsv): of 36 declared pairs, 35 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
 **A blank cell means the module never claimed that target.** That is a different fact from a `known-failing` cell next to it — one is an absent claim, the other is a claim currently broken and tracked — and this table exists so the two are never shown as the same thing.
 
@@ -246,7 +246,7 @@ Every one of the 228 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | `sntp` | compiles | — | — |
 | `stun` | compiles | — | — |
 | `tar` | compiles | — | — |
-| `traceroute` | known-failing | — | — |
+| `traceroute` | compiles | — | — |
 | `tz` | — | compiles | — |
 | `uci` | compiles | — | — |
 | `wireguard` | known-failing | — | — |
