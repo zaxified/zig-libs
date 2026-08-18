@@ -966,14 +966,28 @@ const Fit = struct {
         const rx = [3]f64{ self.txx, self.txy, self.tx };
         const ry = [3]f64{ self.tyx, self.tyy, self.ty };
 
-        var g: Grid = undefined;
-        g.ax = @floatCast(inv[0][0] * rx[0] + inv[0][1] * rx[1] + inv[0][2] * rx[2]);
-        g.bx = @floatCast(inv[1][0] * rx[0] + inv[1][1] * rx[1] + inv[1][2] * rx[2]);
-        g.cx = @floatCast(inv[2][0] * rx[0] + inv[2][1] * rx[1] + inv[2][2] * rx[2]);
-        g.ay = @floatCast(inv[0][0] * ry[0] + inv[0][1] * ry[1] + inv[0][2] * ry[2]);
-        g.by = @floatCast(inv[1][0] * ry[0] + inv[1][1] * ry[1] + inv[1][2] * ry[2]);
-        g.cy = @floatCast(inv[2][0] * ry[0] + inv[2][1] * ry[1] + inv[2][2] * ry[2]);
-        return g;
+        // A whole-struct literal, and the perspective terms spelled out rather
+        // than left to `Grid`'s declared defaults. This used to be
+        // `var g: Grid = undefined;` followed by six field assignments, which
+        // silently skipped `gx` and `gy`: `= undefined` does not apply default
+        // field values, so an affine fit returned a grid whose perspective terms
+        // were whatever the stack held. `Grid.at` divides by
+        // `gx*x + gy*y + 1`, so every sampled module moved by an amount that
+        // depended on the caller's stack, and the large symbols — where the
+        // module coordinates are biggest and so the error is multiplied most —
+        // failed to decode. Debug and ReleaseSafe fill `undefined` with 0xaa,
+        // which reads back as a float near zero and hid it; ReleaseFast does
+        // not. Being affine is a *result* of this fit, so it is written down.
+        return .{
+            .ax = @floatCast(inv[0][0] * rx[0] + inv[0][1] * rx[1] + inv[0][2] * rx[2]),
+            .bx = @floatCast(inv[1][0] * rx[0] + inv[1][1] * rx[1] + inv[1][2] * rx[2]),
+            .cx = @floatCast(inv[2][0] * rx[0] + inv[2][1] * rx[1] + inv[2][2] * rx[2]),
+            .ay = @floatCast(inv[0][0] * ry[0] + inv[0][1] * ry[1] + inv[0][2] * ry[2]),
+            .by = @floatCast(inv[1][0] * ry[0] + inv[1][1] * ry[1] + inv[1][2] * ry[2]),
+            .cy = @floatCast(inv[2][0] * ry[0] + inv[2][1] * ry[1] + inv[2][2] * ry[2]),
+            .gx = 0,
+            .gy = 0,
+        };
     }
 };
 
@@ -1889,6 +1903,28 @@ test "the least-squares fit reproduces the grid it was sampled from" {
         try t.expect(@abs(want[0] - have[0]) < 0.01);
         try t.expect(@abs(want[1] - have[1]) < 0.01);
     }
+}
+
+test "an affine fit says so: its perspective terms are zero, not left over" {
+    const t = std.testing;
+    // `Fit` solves the affine normal equations only — it has no term that could
+    // express perspective — so `gx` and `gy` are part of its answer and must be
+    // exactly zero. They were once left unwritten behind a `var g: Grid =
+    // undefined`, which does not apply `Grid`'s declared defaults, and
+    // `Grid.at` then divided every sampled point by `gx*x + gy*y + 1` built
+    // from stack garbage. Asserted on the terms rather than on a sampled point
+    // because the Debug fill pattern reads back as roughly -3e-13: near enough
+    // to zero that every position check downstream still passed, and far enough
+    // from it to lose the largest symbols in ReleaseFast.
+    const truth: Grid = .{ .ax = 4.1, .bx = -1.7, .cx = 31.5, .ay = 1.6, .by = 4.3, .cy = -12.25 };
+    var fit: Fit = .{};
+    for ([_][2]f32{ .{ 3, 3 }, .{ 60, 3 }, .{ 3, 60 }, .{ 30, 30 }, .{ 58, 46 }, .{ 12, 51 } }) |mp| {
+        const p = truth.at(mp[0], mp[1]);
+        fit.add(mp[0], mp[1], p[0], p[1]);
+    }
+    const got = fit.solve() orelse return error.Singular;
+    try t.expectEqual(@as(f32, 0), got.gx);
+    try t.expectEqual(@as(f32, 0), got.gy);
 }
 
 test "a broken ring has the finder ratio in both axes and is still not a finder" {
