@@ -92,6 +92,11 @@ const g_add_chain_nat =
     "09000300706f737400000000080007006e61740014000480080001000000000408000200000000641400000011000100" ++
     "02000000000000000000000a";
 
+// ### nft delete chain inet filter input2
+const g_del_chain =
+    "140000001000010000000000000000000000000a2c000000050a01000100000000000000010000000b00010066696c7465" ++
+    "7200000b000300696e707574320000140000001100010002000000000000000000000a";
+
 // ### nft add rule inet filter input tcp dport 22 counter accept
 const g_rule_tcp_dport =
     "140000001000010000000000000000000000000a24010000060a010c0100000000000000010000000b00010066696c74" ++
@@ -222,11 +227,25 @@ const g_rule_dnat =
     "6e6174002c00028008000100000000010800020000000002080003000000000108000500000000020800070000000002" ++
     "140000001100010002000000000000000000000a";
 
+// ### nft insert rule inet filter input counter accept — no NLM_F_APPEND,
+// unlike `add rule` above, which is the whole distinction `insertRule` exists
+// to carry (see wire.zig's `insertRule` doc comment).
+const g_insert_rule =
+    "140000001000010000000000000000000000000a74000000060a01040100000000000000010000000b00010066696c7465" ++
+    "7200000a000200696e70757400000048000480140001800c000100636f756e7465720004000280300001800e000100696d" ++
+    "6d6564696174650000001c0002800800010000000000100002800c00028008000100000000011400000011000100020000" ++
+    "00000000000000000a";
+
 // ### nft add set inet filter blocked '{ type ipv4_addr; flags interval; }'
 const g_add_set =
     "140000001000010000000000000000000000000a60000000090a01040100000000000000010000000b00010066696c74" ++
     "657200000c000200626c6f636b65640008000300000000040800040000000007080005000000000408000a0000000001" ++
     "14000d0000040200000003080004040000000100140000001100010002000000000000000000000a";
+
+// ### nft delete set inet filter tmpset
+const g_del_set =
+    "140000001000010000000000000000000000000a2c0000000b0a01000100000000000000010000000b00010066696c7465" ++
+    "7200000b000200746d707365740000140000001100010002000000000000000000000a";
 
 // ### nft add element inet filter blocked '{ 10.0.0.1 }'
 // Three elements, not one: an interval set stores a singleton as
@@ -238,10 +257,24 @@ const g_add_element =
     "00000000100002800c000180080001000a0000011800038008000300000000010c000180080001000a00000214000000" ++
     "1100010002000000000000000000000a";
 
+// ### nft delete element inet filter blocked '{ 10.0.0.1 }' — against a
+// *non-interval* set, unlike the add-element golden above: a single wire
+// element, no synthetic INTERVAL_END neighbours.
+const g_del_element =
+    "140000001000010000000000000000000000000a400000000e0a01000100000000000000010000000b00010066696c7465" ++
+    "7200000c000200626c6f636b65640014000380100001800c000180080001000a0000011400000011000100020000000000" ++
+    "00000000000a";
+
 // ### nft delete rule inet filter input handle 4
 const g_del_rule =
     "140000001000010000000000000000000000000a38000000080a01000100000000000000010000000b00010066696c74" ++
     "657200000a000200696e7075740000000c0003000000000000000004140000001100010002000000000000000000000a";
+
+// ### nft flush chain inet filter input — a handle-less DELRULE, table+chain
+// only, same shape as delete-rule above minus NFTA_RULE_HANDLE.
+const g_flush_chain =
+    "140000001000010000000000000000000000000a2c000000080a01000100000000000000010000000b00010066696c7465" ++
+    "7200000a000200696e707574000000140000001100010002000000000000000000000a";
 
 // ### one `nft -f` run with three commands = ONE batch (the batch-framing proof):
 // ###   add table inet multi
@@ -315,6 +348,13 @@ test "golden: add nat base chain without a policy" {
     try expectGolden(g_add_chain_nat, try b.finish());
 }
 
+test "golden: delete chain" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.deleteChain(.inet, "filter", "input2");
+    try expectGolden(g_del_chain, try b.finish());
+}
+
 test "golden: rule — tcp dport 22 counter accept" {
     var p = expr.Program.init(gpa, .inet);
     defer p.deinit();
@@ -351,6 +391,26 @@ test "golden: rule — ip daddr 10.0.0.1 drop" {
     var p = expr.Program.init(gpa, .inet);
     defer p.deinit();
     _ = p.ipDaddr(.{ 10, 0, 0, 1 }).drop();
+
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.addRule(.{
+        .family = .inet,
+        .table = "filter",
+        .chain = "input",
+        .exprs = try p.finish(),
+    });
+    try expectGolden(g_rule_ip_daddr, try b.finish());
+}
+
+test "golden: ipv4Bytes(10,0,0,1) is byte-identical to the .{10,0,0,1} literal" {
+    // ipv4Bytes had no call site anywhere in the module before this test —
+    // reusing the exact golden above, but building the address through the
+    // helper instead of a bare array literal, proves it wires into a real
+    // rule correctly rather than merely compiling.
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.ipDaddr(expr.ipv4Bytes(10, 0, 0, 1)).drop();
 
     var b = try nftBatch();
     defer b.deinit();
@@ -524,6 +584,34 @@ test "golden: rule — tcp dport 80 dnat to 10.0.0.5:8080 (two live registers)" 
     try expectGolden(g_rule_dnat, try b.finish());
 }
 
+test "golden: insert rule — no NLM_F_APPEND, unlike add rule" {
+    var p = expr.Program.init(gpa, .inet);
+    defer p.deinit();
+    _ = p.counter().accept();
+
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.insertRule(.{
+        .family = .inet,
+        .table = "filter",
+        .chain = "input",
+        .exprs = try p.finish(),
+    });
+    const bytes = try b.finish();
+    try expectGolden(g_insert_rule, bytes);
+
+    // The byte-exact match above already proves NLM_F_APPEND is absent, but
+    // spell it out: this is the one flag bit that distinguishes `insertRule`
+    // from `addRule` (see both doc comments in wire.zig), so assert it
+    // directly against the decoded header rather than only via opaque bytes.
+    var it: nl.MessageIterator = .{ .buf = bytes };
+    _ = try it.next(); // BATCH_BEGIN
+    const cmd = (try it.next()).?;
+    try testing.expectEqual(wire.nftMsg(wire.NFT_MSG.NEWRULE), cmd.type);
+    try testing.expect(cmd.flags & nl.NLM_F_CREATE != 0);
+    try testing.expect(cmd.flags & nl.NLM_F_APPEND == 0);
+}
+
 test "golden: add set (ipv4_addr, interval)" {
     var b = try nftBatch();
     defer b.deinit();
@@ -539,6 +627,13 @@ test "golden: add set (ipv4_addr, interval)" {
     try expectGolden(g_add_set, try b.finish());
 }
 
+test "golden: delete set" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.deleteSet(.inet, "filter", "tmpset");
+    try expectGolden(g_del_set, try b.finish());
+}
+
 test "golden: add element to an interval set (three wire elements)" {
     var b = try nftBatch();
     defer b.deinit();
@@ -550,11 +645,27 @@ test "golden: add element to an interval set (three wire elements)" {
     try expectGolden(g_add_element, try b.finish());
 }
 
+test "golden: delete element from a non-interval set (one wire element)" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.deleteSetElems(.inet, "filter", "blocked", &.{
+        .{ .key = &.{ 10, 0, 0, 1 } },
+    });
+    try expectGolden(g_del_element, try b.finish());
+}
+
 test "golden: delete rule by handle" {
     var b = try nftBatch();
     defer b.deinit();
     try b.deleteRule(.inet, "filter", "input", 4);
     try expectGolden(g_del_rule, try b.finish());
+}
+
+test "golden: flush chain — handle-less DELRULE" {
+    var b = try nftBatch();
+    defer b.deinit();
+    try b.flushChain(.inet, "filter", "input");
+    try expectGolden(g_flush_chain, try b.finish());
 }
 
 test "golden: one multi-command batch (table + chain + rule in a single sendmsg)" {

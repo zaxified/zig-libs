@@ -1095,6 +1095,12 @@ test "ipv4 prefix masks" {
     try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, &ipv4MaskBytes(32));
 }
 
+test "ipv4Bytes packs its four octets in argument order, unmodified" {
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 1 }, &ipv4Bytes(10, 0, 0, 1));
+    try testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, &ipv4Bytes(255, 255, 255, 255));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &ipv4Bytes(0, 0, 0, 0));
+}
+
 test "a byte-aligned prefix shortens the load instead of masking" {
     var p = Program.init(testing.allocator, .inet);
     defer p.deinit();

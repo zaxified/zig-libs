@@ -1362,6 +1362,56 @@ test "builder and manual statement slice produce identical JSON" {
     try expectWellFormed(j1);
 }
 
+test "logWith and withComment: builder output matches an equivalent manual rule" {
+    // logWith/withComment had no call site anywhere in the module before this
+    // test. Mirrors "builder and manual statement slice produce identical
+    // JSON" above, but exercises the two untested siblings of `log()` and the
+    // plain `comment` field: `logWith` (the full-options form of `log`) and
+    // `withComment` (sets `RuleBuilder.comment`, consumed by `apply()`).
+    var rs1 = Ruleset.init(testing.allocator);
+    defer rs1.deinit();
+    var b = rs1.rule(.inet, "filter", "input");
+    try b.tcpDport(num(22))
+        .logWith(.{ .prefix = "ssh: ", .group = 1, .snaplen = 128, .queue_threshold = 10, .level = .info })
+        .accept()
+        .withComment("allow ssh")
+        .apply();
+
+    var rs2 = Ruleset.init(testing.allocator);
+    defer rs2.deinit();
+    try rs2.add(.{ .rule = .{
+        .family = .inet,
+        .table = "filter",
+        .chain = "input",
+        .expr = &.{
+            .{ .match = .{
+                .op = .eq,
+                .left = payloadField(.tcp, "dport"),
+                .right = num(22),
+            } },
+            .{ .log = .{ .prefix = "ssh: ", .group = 1, .snaplen = 128, .queue_threshold = 10, .level = .info } },
+            .accept,
+        },
+        .comment = "allow ssh",
+    } });
+
+    const j1 = try rs1.toJson(testing.allocator);
+    defer testing.allocator.free(j1);
+    const j2 = try rs2.toJson(testing.allocator);
+    defer testing.allocator.free(j2);
+    try testing.expectEqualStrings(j1, j2);
+    try expectWellFormed(j1);
+    // Pin the full-options log shape and the comment placement in one string,
+    // rather than trusting the cross-check alone.
+    try testing.expectEqualStrings(
+        "{\"nftables\":[{\"add\":{\"rule\":{\"family\":\"inet\",\"table\":\"filter\",\"chain\":\"input\"," ++
+            "\"expr\":[{\"match\":{\"op\":\"==\",\"left\":{\"payload\":{\"protocol\":\"tcp\",\"field\":\"dport\"}}," ++
+            "\"right\":22}},{\"log\":{\"prefix\":\"ssh: \",\"group\":1,\"snaplen\":128,\"queue-threshold\":10," ++
+            "\"level\":\"info\"}},{\"accept\":null}],\"comment\":\"allow ssh\"}}}]}",
+        j1,
+    );
+}
+
 // ── optional live check against the nft binary ──────────────────────────────
 // `nft -c -j -f -` parses and validates without applying anything. JSON
 // parse/schema errors are reported before the netlink stage, so even without
