@@ -1342,6 +1342,38 @@ test "on_evict safety net: a dirty entry evicted before flush is still persisted
     try testing.expectEqualStrings("3", rig.sink.peek("cc").?);
 }
 
+/// Poll `drain()` (never `flushAll` — its `flushOneSync` backstop would mask a
+/// broken safety net) until quiescent, bounded by WALL-CLOCK time, never an
+/// iteration count. `drain()` itself is a cheap non-blocking pass, but the
+/// pool workers that actually do the flushing are real OS threads
+/// (`workerpool` spawns them via `std.Thread.spawn`); an iteration-bounded
+/// spin races the scheduler, not the workers. In `ReleaseFast` a no-op pass
+/// through `drain()` costs tens of nanoseconds, so a 100_000-iteration bound
+/// can burn its whole budget in well under a millisecond of wall time — nowhere
+/// near enough for two starved OS threads to be scheduled, run an in-memory
+/// sink write, and post the completion back, on a host where every core is
+/// already oversubscribed (the ~215-module full test lane, or a single core
+/// under `taskset -c 0` deliberately, either one starves the workers the same
+/// way). A correct implementation always converges given enough real time —
+/// there is no path where the safety net can spin forever without the workers
+/// making progress — so the fix is a deadline, not a longer iteration count.
+/// 10s is generous for a handful of in-memory sink writes; between `drain()`
+/// passes it parks on the same `completion_gen` futex `flushAll` waits on,
+/// rather than busy-spinning the CPU the workers need.
+fn drainUntilQuiescent(c: *Coordinator) void {
+    const deadline_ns = std.Io.Timestamp.now(c.io, .awake).nanoseconds + 10 * std.time.ns_per_s;
+    while (c.pendingCount() > 0) {
+        c.drain();
+        if (c.pendingCount() == 0) return;
+        if (std.Io.Timestamp.now(c.io, .awake).nanoseconds >= deadline_ns) return;
+        const gen = c.completion_gen.load(.acquire);
+        c.io.futexWaitTimeout(u32, &c.completion_gen.raw, gen, .{ .duration = .{
+            .raw = .fromMilliseconds(20),
+            .clock = .awake,
+        } }) catch {};
+    }
+}
+
 test "on_evict safety net: the evicted entry reaches the sink via drain() ALONE (no flushAll backstop)" {
     var rig: Rig = undefined;
     rig.init();
@@ -1367,8 +1399,7 @@ test "on_evict safety net: the evicted entry reaches the sink via drain() ALONE 
     // `drain()` has no such backstop — `kick` can only reach a key that is no
     // longer resident in the cache through the orphan set `on_evict` fills, so
     // this loop persists all three ONLY if the safety net works.
-    var spins: usize = 0;
-    while (c.pendingCount() > 0 and spins < 100_000) : (spins += 1) c.drain();
+    drainUntilQuiescent(c);
 
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqual(@as(usize, 3), rig.sink.count());
@@ -1418,8 +1449,7 @@ test "over-budget value: acked write is reachable by drain() ALONE (non-admissio
     try testing.expect(c.orphans.contains("big"));
 
     // drain() ALONE — no flushAll backstop.
-    var spins: usize = 0;
-    while (c.pendingCount() > 0 and spins < 100_000) : (spins += 1) c.drain();
+    drainUntilQuiescent(c);
 
     try testing.expectEqual(@as(usize, 0), c.pendingCount());
     try testing.expectEqual(@as(usize, 2), rig.sink.count());
