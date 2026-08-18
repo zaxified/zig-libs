@@ -333,7 +333,17 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
 
         var reused = false;
         var conn = try c.acquireConn(url, &reused);
-        errdefer conn.destroy();
+        // `owned` guards the errdefer below across the two places later in
+        // this same iteration that explicitly `conn.destroy()` and then may
+        // still return an error (the stale-connection retry's redial, and
+        // the redirect path a few lines down): a bare `errdefer
+        // conn.destroy()` would fire AGAIN on the already-freed `conn` in
+        // either case — a real double-free, reproduced by the
+        // "stale-conn retry whose redial ALSO fails" test below (it used to
+        // segfault inside `destroy`, called from this very `errdefer`). Same
+        // idiom as `requestInnerPlain`'s `owned` flag; see its doc comment.
+        var owned = true;
+        errdefer if (owned) conn.destroy();
 
         const head = c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive) catch |err| retry: {
             // Retry exactly once, and only when BOTH hold: (1) `conn` came
@@ -360,7 +370,9 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
             // half of that guard.)
             try c.checkDeadline(deadline);
             conn.destroy();
+            owned = false;
             conn = try c.dialConn(url);
+            owned = true;
             break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive);
         };
 
@@ -381,11 +393,21 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
             const buf = try c.gpa.alloc(u8, cap);
             errdefer c.gpa.free(buf);
             const resolved = try http.resolveLocation(url, location, buf);
+            // Parsed BEFORE `conn.destroy()` below (same "check-before-destroy"
+            // ordering as `requestInnerPlain`'s redirect branch — see its
+            // `owned` doc comment): `resolveLocation` copies an absolute
+            // `http(s)://` Location header through verbatim, so a peer can
+            // send one that fails `Url.parse` — that used to be checked
+            // AFTER `conn.destroy()`, another `errdefer if (owned) …`-class
+            // double-free, just gated on a malformed redirect target instead
+            // of a failed redial.
+            const next_url = http.Url.parse(resolved) catch return error.BadRedirect;
 
             conn.destroy();
+            owned = false;
             if (url_owned) |s| c.gpa.free(s);
             url_owned = buf;
-            url = http.Url.parse(resolved) catch return error.BadRedirect;
+            url = next_url;
             if (head.status != 307 and head.status != 308) current_body = null;
             current_method = next_method;
             continue;
@@ -610,7 +632,12 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
 
     var reused = false;
     var conn = try c.acquireConn(url, &reused);
-    errdefer conn.destroy();
+    // See `requestInner`/`requestInnerPlain`'s `owned` doc comment: a bare
+    // `errdefer conn.destroy()` would double-free if the redial below fails
+    // (reproduced by the `requestInner` regression test — this site has the
+    // identical shape, and its own regression test below reproduces it too).
+    var owned = true;
+    errdefer if (owned) conn.destroy();
 
     writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch |err| {
         // Narrower than `request`'s retry: safe here ONLY because nothing
@@ -625,7 +652,9 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
         // same class of failure any other backend outage already produces.
         if (!reused or !isStaleConnError(err)) return err;
         conn.destroy();
+        owned = false;
         conn = try c.dialConn(url);
+        owned = true;
         try writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled);
     };
     return .{
@@ -3378,6 +3407,136 @@ test "pool: a stale reused connection (peer already closed it) is retried once t
     defer testing.allocator.free(body);
     try testing.expectEqualStrings("ok", body);
     try testing.expectEqual(@as(usize, 2), client.dialCount()); // original dial + the retry's redial
+}
+
+/// Same shape as `staleConnOrigin` but deliberately does NOT accept a second
+/// connection: the test closes the listener right after this returns, so the
+/// stale-connection retry's redial has nowhere to connect and must fail.
+fn staleConnNoRedialOrigin(io: std.Io, listener: *net.Server, hung_up: *std.atomic.Value(bool)) void {
+    const s1 = listener.accept(io) catch return;
+    {
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [1024]u8 = undefined;
+        var sr = s1.reader(io, &rbuf);
+        var sw = s1.writer(io, &wbuf);
+        var head_buf: [1024]u8 = undefined;
+        _ = h1.readHead(&sr.interface, &head_buf) catch {};
+        sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") catch {};
+        sw.interface.flush() catch {};
+    }
+    s1.close(io);
+    hung_up.store(true, .release);
+}
+
+/// Same as `staleConnNoRedialOrigin`, but closes with a hard RST
+/// (`SO_LINGER{onoff=1,linger=0}`) instead of a graceful FIN.
+/// `requestStreaming`'s stale-conn retry triggers off a failed WRITE (it
+/// never reads a response before deciding to retry) — a plain FIN close only
+/// fails the pooled connection's *next read*, since a single write into an
+/// already-half-closed socket is typically still accepted into the local
+/// send buffer without error. Forcing RST makes the pooled connection's next
+/// write genuinely fail, which is what this test needs to reach the retry
+/// path at all.
+fn staleConnRstNoRedialOrigin(io: std.Io, listener: *net.Server, hung_up: *std.atomic.Value(bool)) void {
+    const s1 = listener.accept(io) catch return;
+    {
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [1024]u8 = undefined;
+        var sr = s1.reader(io, &rbuf);
+        var sw = s1.writer(io, &wbuf);
+        var head_buf: [1024]u8 = undefined;
+        _ = h1.readHead(&sr.interface, &head_buf) catch {};
+        sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") catch {};
+        sw.interface.flush() catch {};
+    }
+    const l = std.posix.linger{ .onoff = 1, .linger = 0 };
+    std.posix.setsockopt(s1.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&l)) catch {};
+    s1.close(io);
+    hung_up.store(true, .release);
+}
+
+// Regression test for the double-free `requestInner`/`requestStreaming` had
+// in their stale-connection retry: `errdefer conn.destroy()` stayed armed
+// across the explicit `conn.destroy()` that precedes the redial, so a
+// redial failure (this test forces one by closing the listener before the
+// retry) freed the same `conn` a second time. Before the fix this crashed
+// under `testing.allocator`'s double-free detector instead of returning
+// `error.ConnectFailed`.
+test "pool: stale-conn retry whose redial ALSO fails does not double-free conn" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("stale-conn redial-fail test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+
+    const port = listener.socket.address.getPort();
+    var hung_up = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, staleConnNoRedialOrigin, .{ io, &listener, &hung_up });
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var res1 = try client.request(.get, url, .{});
+    drainAndDeinit(&res1);
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    while (!hung_up.load(.acquire)) std.atomic.spinLoopHint();
+    thread.join();
+
+    // Close the listening socket entirely — nothing is left to accept the
+    // retry's redial, so it fails with `error.ConnectFailed` instead of
+    // succeeding the way the sibling test above exercises.
+    listener.deinit(io);
+
+    try testing.expectError(error.ConnectFailed, client.request(.get, url, .{}));
+}
+
+// `requestStreaming` has the byte-identical stale-retry shape as
+// `requestInner` above (`conn.destroy(); conn = try c.dialConn(url);` under
+// what used to be a bare `errdefer conn.destroy()`), fixed with the same
+// `owned` idiom. This is its regression test.
+test "pool: requestStreaming's stale-conn retry whose redial ALSO fails does not double-free conn" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("requestStreaming redial-fail test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+
+    const port = listener.socket.address.getPort();
+    var hung_up = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, staleConnRstNoRedialOrigin, .{ io, &listener, &hung_up });
+
+    // A tiny `write_buffer_size` forces `writeRequestHead`'s buffered writer
+    // to drain (an actual `write(2)`) partway through the request line —
+    // otherwise the whole head (well under the 4KB default buffer) never
+    // touches the socket until some later flush, and the RST above would
+    // never be observed at this call at all.
+    var client = Client.init(io, testing.allocator, .{ .write_buffer_size = 8 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    // Populate the pool via an ordinary GET against the same origin
+    // (`staleConnRstNoRedialOrigin` answers any request the same way).
+    var res1 = try client.request(.get, url, .{});
+    drainAndDeinit(&res1);
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    while (!hung_up.load(.acquire)) std.atomic.spinLoopHint();
+    thread.join();
+    listener.deinit(io);
+
+    try testing.expectError(error.ConnectFailed, client.requestStreaming(.put, url, .{}, 0));
 }
 
 test "pool: max_idle_per_host and max_idle_total cap eviction (oldest first)" {

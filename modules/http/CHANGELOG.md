@@ -5,6 +5,43 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — **BEHAVIOURAL, not breaking** — fixed the double-free the entry
+  below left in place in the shipped `requestInner`/`requestStreaming`: a dial
+  failure immediately after the stale-connection retry's `conn.destroy()` left
+  `errdefer conn.destroy()` armed over an already-freed `conn`, so the errdefer
+  fired again on the same pointer. Reproduced directly for both functions
+  (not just reasoned from the shape): a raw-socket test origin serves one
+  request then hangs up, so the pool hands the next call a stale connection;
+  the listener is then closed before the retry's redial, forcing that redial
+  to fail too. Against the pre-fix code this segfaulted inside `Conn.destroy`
+  — called a second time from the `errdefer` — in both `requestInner` (via
+  `client.request`) and `requestStreaming` (which needed a tiny
+  `write_buffer_size` to force the request head's buffered write to actually
+  hit the socket, since the ordinary 4 KiB buffer never drains for a head
+  that small). Fixed with the same `owned`-boolean idiom the plaintext path
+  already used (`errdefer if (owned) conn.destroy()`, `owned` toggled around
+  each explicit `conn.destroy()`), so the module now has one double-free-safe
+  idiom instead of two. While re-reading `requestInner`'s redirect branch for
+  the same shape, found a second, independent instance: `conn.destroy()` ran
+  *before* `url = http.Url.parse(resolved) catch return error.BadRedirect;`,
+  so a redirect `Location` header that resolves to text `Url.parse` rejects
+  (a live, peer-controlled input — `resolveLocation` copies an absolute
+  `http(s)://` Location through verbatim, only length-checked) hit the same
+  bare-errdefer-over-a-freed-`conn` bug. Reordered to parse before
+  destroying, matching the ordering `requestInnerPlain`'s redirect branch
+  already used. Swept the rest of the module for the same
+  `conn.destroy(); … try …` shape (`connectH2c` and everywhere else that
+  dials): no other instance found — every other fallible dial in the module
+  is a first-ever dial with nothing already destroyed to double-free.
+  **What changes for a caller of `Client.request`/`requestStreaming`:** in
+  the narrow case of a redial-after-stale-detect failing, or a malformed
+  absolute-URL redirect target, the call now returns the ordinary typed error
+  (e.g. `error.ConnectFailed`, `error.BadRedirect`) instead of the process
+  crashing or corrupting the allocator via a double-free — no API/signature
+  change, and every other path is untouched. Pinned by two new regression
+  tests (`"pool: stale-conn retry whose redial ALSO fails does not
+  double-free conn"` and the `requestStreaming` counterpart); `zig build
+  test-http` — 442/442 pass, `-Doptimize=ReleaseFast` included.
 - **2026-08-18** — **ADDITIVE** — `Client` gains a plaintext-only call graph:
   `requestPlain`/`requestStreamingPlain`/`putFilePlain` mirror
   `request`/`requestStreaming`/`putFile` exactly (redirect/retry/pooling
