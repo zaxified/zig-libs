@@ -137,22 +137,18 @@ pub fn readMounts(gpa: std.mem.Allocator, io: std.Io) !?[]MountEntry {
 /// Local to this module rather than a shared dependency on `procnet`
 /// (SPEC.md explains why: disk usage is a distinct module axis, and this is
 /// a handful of lines, not the kind of duplication `testkit` exists for).
+/// Same idiom as `procnet.readVirtualFile`: `std.Io.File` has no plain
+/// `read` method in 0.16 — go through `File.Reader.initStreaming` and its
+/// `allocRemaining`, which is also what actually forces `/proc` to be read
+/// to EOF rather than trusting a (always-0) `stat` size.
 fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
     var dir = std.Io.Dir.cwd();
     var file = dir.openFile(io, path, .{}) catch return null;
     defer file.close(io);
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(gpa);
     var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = file.read(io, &buf) catch break;
-        if (n == 0) break;
-        out.appendSlice(gpa, buf[0..n]) catch break;
-        if (out.items.len >= limit) break;
-    }
-    if (out.items.len > limit) out.shrinkRetainingCapacity(limit);
-    return out.toOwnedSlice(gpa) catch null;
+    var fr = std.Io.File.Reader.initStreaming(file, io, &buf);
+    return fr.interface.allocRemaining(gpa, .limited(limit)) catch null;
 }
 
 const testing = std.testing;
@@ -219,6 +215,30 @@ test "parseMounts: empty text yields zero entries, not an error" {
     const entries = try parseMounts(testing.allocator, "");
     defer freeAll(testing.allocator, entries);
     try testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+// `readMounts` is the live-file entry point a consumer actually reaches for
+// (see README's API example) — `parseMounts` alone being tested is exactly
+// how this module shipped a compile error in `readVirtualFile`'s body: no
+// test forced it to be semantically analysed. `/proc/self/mounts` is
+// guaranteed present on any Linux host this module builds for (`meta.platform
+// = .linux`), same assumption `statfs.zig`'s live `query("/")` test makes, so
+// this runs unconditionally rather than behind a skip.
+test "readMounts: live /proc/self/mounts round-trips through the real Io reader" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const entries = try readMounts(testing.allocator, io) orelse
+        return error.SkipZigTest; // /proc not mounted — not expected on this module's Linux-only target, but not this test's job to assert that
+    defer freeAll(testing.allocator, entries);
+
+    try testing.expect(entries.len > 0);
+    var found_root = false;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.mount_point, "/")) found_root = true;
+    }
+    try testing.expect(found_root);
 }
 
 // `/proc/self/mounts` is kernel-emitted, but per `procnet`'s own threat-model

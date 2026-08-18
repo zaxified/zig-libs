@@ -68,6 +68,36 @@ equal). `df`(1) reports "Available" and computes its use-percentage from
 wrong field, which is exactly the bug this module's doc comments are written
 to prevent.
 
+**Use-percentage rounding: this module does not compute one, and the two
+common `df` implementations disagree on how.** `Usage` exposes the raw block
+counters (`blocks_total`/`blocks_free`/`blocks_available`) and byte
+convenience wrappers (`totalBytes`/`freeBytes`/`availableBytes`); it
+deliberately stops short of a "percent used" number, because there is no
+single correct rounding rule to bake in — a consumer replacing `df` output
+has to pick one, and the two real-world implementations pick differently:
+
+- **coreutils `df`** rounds *up* (`df.c`'s `usage_percent` in GNU coreutils
+  computes `used`/`total` and takes the `ceiling`, so any nonzero remainder
+  bumps the percentage to the next whole number).
+- **busybox `df`** rounds to the *nearest* whole percent:
+  `(used*100 + denom/2) / denom` (integer division with a pre-added half-
+  denominator, the standard round-half-up-via-integer-arithmetic idiom;
+  `denom` is `total`, `used` is `total - available`).
+
+The two disagree exactly at the boundary a truncating/flooring implementation
+would also get wrong, and disagree with each other by construction whenever
+the true percentage has a nonzero fractional part below `.5` (round-up says
+one more than round-to-nearest). This is not a hypothetical: measured on real
+OpenWRT 25.12.4 hardware, `/boot` at a true 36.37% used prints **36%** under
+busybox's `df` and **37%** under a round-up implementation — a one-point
+difference from the identical underlying `f_blocks`/`f_bavail` numbers, pure
+rounding-rule choice. A consumer computing a percentage from this module's
+`Usage` fields should pick one of the two conventions above deliberately
+(most OpenWRT/embedded targets — this module's `.linux32` audience — report
+busybox's round-to-nearest; most desktop/server Linux reports coreutils'
+round-up) rather than inventing a third (e.g. plain truncation, which matches
+neither and would read low compared to both real-world tools).
+
 **`/proc/self/mounts` and `/proc/self/mountinfo`.** Both covered — see
 `README.md`'s "Why this exists" section for the choice between them (short
 version: `mounts` for the common `df`-adjacent case and its stable four-
