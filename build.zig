@@ -154,6 +154,7 @@ const module_list = [_]Module{
     .{ .name = "tc", .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "traceroute", .deps = &.{ "icmp", "netaddr", "latency-stats" } },
     .{ .name = "probe", .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
+    .{ .name = "pathmtu", .deps = &.{ "icmp", "netaddr" } },
     .{ .name = "l2disco", .deps = &.{"netaddr"} },
     .{ .name = "upstream", .deps = &.{ "resilience", "probe" } },
     .{ .name = "jwt", .deps = &.{ "http", "router", "p256" } },

@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 228 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`, compiling
+**Status:** 229 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`, compiling
 clean in `-Dstrict-debug`) · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -208,9 +208,9 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 228 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI matrix executes every module's tests in `ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That claim is not repeated below for all 228 modules — a linux64-only module has nothing further to show here.
+Every one of the 229 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI matrix executes every module's tests in `ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That claim is not repeated below for all 229 modules — a linux64-only module has nothing further to show here.
 
-35 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair's test binary and checks the result against [`scripts/portable-known-failures.tsv`](scripts/portable-known-failures.tsv): of 36 declared pairs, 35 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
+36 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair's test binary and checks the result against [`scripts/portable-known-failures.tsv`](scripts/portable-known-failures.tsv): of 37 declared pairs, 36 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
 **A blank cell means the module never claimed that target.** That is a different fact from a `known-failing` cell next to it — one is an absent claim, the other is a claim currently broken and tracked — and this table exists so the two are never shown as the same thing.
 
@@ -235,6 +235,7 @@ Every one of the 228 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | `netlink` | compiles | — | — |
 | `nl80211` | compiles | — | — |
 | `numparse` | — | compiles | — |
+| `pathmtu` | compiles | — | — |
 | `probe` | compiles | — | — |
 | `procnet` | compiles | — | — |
 | `procrun` | — | compiles | — |
@@ -329,6 +330,7 @@ Every one of the 228 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | [`rdap`](modules/rdap/README.md) | RDAP client (RFC 7480–7484) — JSON-over-HTTPS whois successor: query URLs, typed response model, IANA bootstrap, fetch seam | any | http, netaddr |
 | [`icmp`](modules/icmp/README.md) | ICMP echo (ping) engine — v4/v6 codec, batched socket, pacing | **linux** | seqmap, netaddr |
 | [`traceroute`](modules/traceroute/README.md) | ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, load-balanced-path aware | **linux** | icmp, netaddr, latency-stats |
+| [`pathmtu`](modules/pathmtu/README.md) | Path MTU discovery — kernel-cache read (`query`) **and** an authoritative DF-bit binary search (`probe`) that detects ICMP black holes the cache can't see | **linux** | icmp, netaddr |
 | [`probe`](modules/probe/README.md) | TCP-connect reachability prober — up/refused/timeout + RTT, fan-out with bounded concurrency, latency aggregation | any | netaddr, latency-stats |
 | [`l2disco`](modules/l2disco/README.md) | Layer-2/neighbor discovery codec — LLDP (802.1AB) + CDP + ARP (RFC 826) + DHCP options (RFC 2131/2132) + MAC helper | any | netaddr |
 | [`isis`](modules/isis/README.md) | IS-IS (ISO/IEC 10589) PDU codec — common header + TLV framework + IIH/LSP PDUs + SPB (802.1aq) TLVs; pure bounds-checked encode/decode, wire foundation for an SPB control plane | any | — |
