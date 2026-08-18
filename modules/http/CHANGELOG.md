@@ -5,6 +5,72 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-18** — **ADDITIVE** — `Client` gains a plaintext-only call graph:
+  `requestPlain`/`requestStreamingPlain`/`putFilePlain` mirror
+  `request`/`requestStreaming`/`putFile` exactly (redirect/retry/pooling
+  behavior unchanged) but return `error.UnsupportedScheme` for any
+  `https://` URL — direct or via a redirect hop — instead of dialing TLS.
+  `request`/`requestStreaming`/`putFile` themselves are **source- and
+  behavior-unchanged**; `dialConn` is now a two-line dispatcher onto two new
+  private decls, `dialPlain` and `dialTls` (split out of its former single
+  body), and those two existing entry points still go through `dialConn`
+  exactly as before.
+  - **Why:** a consumer (AXP, a device agent on an 8 MB router overlay)
+    measured `http.Client` at **+351 000 B (+49%) on x86-64
+    musl/ReleaseSmall and +607 200 B on big-endian MIPS32** for two
+    plaintext one-shot operations (a `putFile` upload, a `request` +
+    `streamRemaining` fetch, both to an IP literal, no TLS/redirects/reuse).
+    A follow-up measurement attributed 89.8% of that (325 760 B) to one
+    cause: `dialConn` computed `tls_needed` from a *runtime* URL value, so
+    its `if (tls_needed)` branch forced Sema to analyse the whole TLS client
+    (handshake state machine, X.509 parse/verify, every hash/curve/AEAD it
+    pulls in) for every caller regardless of which branch ever actually ran.
+    Refactoring the branches *inside* `dialConn` was tried first and does
+    not help — a dispatcher that still names both `dialPlain` and `dialTls`
+    keeps both reachable from anything that calls it. Only a caller that
+    never mentions the TLS-side decl at all — the new entry points — drops
+    the reference; this is the same mechanism that already gives HTTP/2
+    (`connectH2c`, its own entry point `dialConn` never calls) zero cost
+    when unused.
+  - **Measured:** `modules/http/sizeprobe/` (a standalone probe, not wired
+    into `zig build` — see its README) builds static `ReleaseSmall`
+    executables performing the same two call sites AXP measured, once
+    through the TLS-capable entry points and once through the new
+    plaintext-only ones: **324 888 B saved on x86-64-linux-musl** (within
+    1 KB of the 325 760 B predicted for "the TLS reference" alone) and
+    **685 328 B saved on mips-linux-musleabi** (big-endian MIPS32). `nm` on
+    an unstripped build of the plaintext-only probe shows **zero**
+    `tls.Client`/`Certificate`/curve/hash symbols on either target (the same
+    grep matches 196 symbols on the TLS-capable probe, proving the grep
+    itself is not vacuous).
+  - **A real bug found and fixed along the way, scoped to the new code
+    only:** the naive port of `requestInner`/`requestStreaming`'s
+    stale-connection-retry shape (`conn.destroy(); conn = try
+    c.dialPlain(url);` inside a scope still covered by `errdefer
+    conn.destroy()`) double-frees `conn` if the redial fails, or — new to
+    the plaintext path — if a same-scope scheme check on a redirect target
+    returns an error after the old connection was already destroyed. Fixed
+    in `requestInnerPlain`/`requestStreamingPlain` with an explicit `owned`
+    boolean guarding the `errdefer`, and the redirect-scheme check was
+    reordered to run *before* `conn.destroy()` rather than after. **The
+    same latent shape exists in the shipped `requestInner`/
+    `requestStreaming`** (a dial failure immediately after the
+    stale-connection retry's `conn.destroy()`) — left untouched per this
+    change's no-behavior-change constraint on existing callers; narrow and
+    only reachable when a redial right after a stale-pooled-connection
+    failure itself fails.
+  - **Regression guard, honestly scoped:** a Zig test
+    (`"requestPlain/requestStreamingPlain/putFilePlain: https:// is
+    rejected before any dial"`) proves the *behavioral* half —
+    `error.UnsupportedScheme` and `dialCount() == 0`, i.e. no socket ever
+    opens — plus loopback functional tests prove the plaintext path
+    actually works (GET/POST/PUT-a-real-file, pooling). No Zig test can
+    prove a symbol's *absence* from a differently-scoped binary — that is
+    what `sizeprobe/` is for, and it is not part of `zig build test-http`.
+  - Docs: README.md gains a "Plaintext-only client" subsection under
+    "Client API" plus a bullet in "Client behavior notes"; SPEC.md's design
+    section and Verification section both gain an entry.
+
 - **2026-08-18** — **BREAKING (narrow)** — three fail-open `std.debug.assert` guards on
   caller-supplied sizing became checked errors / a defensive restructure, the same
   `reset()` shape as the 2026-08-13 entry below: `assert` is `if (!ok) unreachable;`,

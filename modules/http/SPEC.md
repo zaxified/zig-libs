@@ -65,6 +65,41 @@ lalinsky/dusty (1.1 client), Go net/http (redirect semantics, server shape, gzip
 7230/9110 (1.1), 7541 (HPACK), 9113 (h2), 7301 (ALPN), 7233 (Range), 9110 §8.8/12 (conditional/
 content-negotiation), 7578 (multipart); TLS via `std.crypto.tls`. See NOTICE.
 
+**`Client` has a plaintext-only call graph, decl-level, no flag.**
+`Client.requestPlain`/`requestStreamingPlain`/`putFilePlain` mirror
+`request`/`requestStreaming`/`putFile` (redirect/retry/pooling unchanged,
+`error.UnsupportedScheme` on any `https://`, including a redirect hop that
+lands there) but reach the network through `acquireConnPlain`→`dialPlain`
+instead of `acquireConn`→`dialConn`. This exists because `dialConn` computed
+`tls_needed` from a *runtime* URL value, so its `if (tls_needed)` branch was
+a genuine runtime branch that forced Sema to analyse the whole TLS client
+(handshake state machine, X.509 parse/verify, every hash/curve/AEAD it
+pulls in) for every caller regardless of which branch ever executed — a
+consumer measured this at +351 000 B / +49% on x86-64 musl/ReleaseSmall
+(+607 200 B on big-endian MIPS32) for two plaintext-only operations, 89.8%
+of it (325 760 B) attributed to that one reference. `dialConn` is now a
+two-line dispatcher onto `dialPlain`/`dialTls` (split out of its former
+single body) — `request`/`requestStreaming`/`putFile` still go through it
+unchanged, so they still cost what they always cost, TLS included; the
+plaintext-only entry points never call `dialConn` or `dialTls` at all, which
+is the part that actually matters — a shared dispatcher still names both
+halves, so any caller reaching it keeps referencing TLS regardless of which
+branch runs (verified: refactoring only the branches *inside* one shared
+`dialConn` does not remove the cost, only removing the call does). No build
+option, no comptime flag: two call graphs that happen to share everything
+that doesn't touch TLS (`Conn`, `Pool`, `sendAndReadHead`,
+`writeRequestHead`/`readResponseHead`, `runBounded`, …), each reached from a
+different, statically-distinguishable entry point — the same mechanism
+`connectH2c` already used for HTTP/2's zero cost when unused (its own entry
+point, never called from `dialConn`). Measured in
+`modules/http/sizeprobe/` (not wired into `zig build`): 324 888 B saved on
+x86-64-musl/ReleaseSmall, 685 328 B on mips-linux-musleabi (BE MIPS32,
+static, two isolated call sites mirroring the consumer's measurement); `nm`
+on an unstripped build of the plaintext-only probe shows zero
+`tls.Client`/`Certificate`/curve/hash symbols on either target (196 on the
+TLS-capable probe, for contrast). See README.md's "Plaintext-only client"
+section and `sizeprobe/README.md` for the full numbers and methodology.
+
 **Auto-header suppression now agrees between the socket and socket-free
 paths.** `StreamOptions.server_name`/`.now` were always `?[]const u8`/`?Now`
 (null = omit), because `serveStream` is the composable codec layer a caller
@@ -151,6 +186,21 @@ streaming surface (8 tests red, 2 of them curl's). h2 upstreaming: loopback h1-p
 large-body flow control + concurrent clients over one shared upstream connection + 502 on dead
 backend); pool-level multiplex (two streams in flight on one connection), sequential-reuse and
 buffer-pool reuse/bounded proofs. Run: `zig build test-http`.
+
+**Plaintext-only client (`requestPlain`/`requestStreamingPlain`/`putFilePlain`):**
+a Zig test proves the *behavioral* half — `error.UnsupportedScheme` on
+`https://` (direct or via redirect) with `dialCount()` staying 0, i.e. no
+socket is ever opened for it — plus loopback functional tests (GET, POST,
+PUT-a-real-file, pooling) proving the plaintext path works, not just rejects.
+What no Zig test can show — a symbol's *absence* from a differently-scoped
+binary is not an observable of any already-linked test binary — is proved
+separately by `modules/http/sizeprobe/` (not wired into `zig build`): two
+minimal executables per target, one calling only the TLS-capable entry
+points and one calling only the plaintext-only ones, `nm`'d for zero
+`tls.Client`/`Certificate`/curve/hash symbols and compared for size. See
+`sizeprobe/README.md` for the measured numbers (last run: 324 888 B saved on
+x86-64-musl/ReleaseSmall, 685 328 B on mips-linux-musleabi/ReleaseSmall,
+static).
 
 **Fuzz harnesses (HD1):** every untrusted-wire parser has a `std.testing.fuzz` harness asserting
 "typed error or valid result, never a panic" — `h1.RequestHead.parse`/`ResponseHead.parse`/

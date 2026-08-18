@@ -396,6 +396,110 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
     }
 }
 
+/// `request`'s plaintext-only twin: identical redirect/retry/pooling
+/// behavior, but every dial goes through `acquireConnPlain`/`dialPlain`
+/// instead of `acquireConn`/`dialConn` — so this function's own text, and
+/// everything it calls, must never name `dialConn`/`dialTls`/`ensureCaBundle`
+/// either (see `dialPlain`'s doc comment). `http://` only: an `https://`
+/// URL, whether passed in directly or reached via a redirect hop, fails with
+/// `error.UnsupportedScheme` rather than silently downgrading or upgrading —
+/// this client speaks TLS to nothing, ever.
+///
+/// This and `requestInnerPlain`/`acquireConnPlain` are intentionally a
+/// separate copy of `request`/`requestInner`/`acquireConn` rather than a
+/// shared implementation parameterized on which dialer to use: a shared
+/// implementation would have to name both dialers from one place, which is
+/// exactly the reachability trap `dialConn`'s dispatcher already
+/// demonstrates (see its doc comment) — the duplication here is what keeps
+/// this call graph provably TLS-free rather than merely usually-TLS-free.
+pub fn requestPlain(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
+    const deadline = c.totalDeadline() orelse return c.requestInnerPlain(method, url_text, options);
+    return runBounded(c.io, deadline, requestInnerPlain, .{ c, method, url_text, options }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => c.requestInnerPlain(method, url_text, options),
+        else => |e| e,
+    };
+}
+
+fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions) Error!Response {
+    const deadline = c.totalDeadline();
+
+    var url = try http.Url.parse(url_text);
+    if (url.scheme != .http) return error.UnsupportedScheme;
+    const original_url = url;
+    var current_method = method;
+    var current_body = options.body;
+    var url_owned: ?[]u8 = null;
+    defer if (url_owned) |s| c.gpa.free(s);
+
+    var redirects: u8 = 0;
+    while (true) {
+        try c.checkDeadline(deadline);
+
+        const strip_sensitive = crossOrigin(original_url, url);
+        const plan: BodyPlan = if (current_body) |b| .{ .content_length = b.len } else .none;
+
+        var reused = false;
+        var conn = try c.acquireConnPlain(url, &reused);
+        // `owned` guards the errdefer below across the two places later in
+        // this same iteration that explicitly `conn.destroy()` and then may
+        // still return an error (the stale-connection retry's redial, and
+        // the redirect-scheme check): a bare `errdefer conn.destroy()` would
+        // fire AGAIN on the already-freed `conn` in either case — this is a
+        // real double-free this function hit during development (see the
+        // "a redirect to https:// fails closed" test, which forces the
+        // redirect-branch case) — so ownership is tracked explicitly instead
+        // of assumed from scope alone.
+        var owned = true;
+        errdefer if (owned) conn.destroy();
+
+        const head = c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive) catch |err| retry: {
+            if (!reused or !isStaleConnError(err)) return err;
+            try c.checkDeadline(deadline);
+            conn.destroy();
+            owned = false;
+            conn = try c.dialPlain(url);
+            owned = true;
+            break :retry try c.sendAndReadHead(conn, current_method, url, options.headers, plan, current_body, strip_sensitive);
+        };
+
+        redirect: {
+            if (!options.follow_redirects) break :redirect;
+            const next_method = http.redirectMethodFor(head.status, current_method) orelse break :redirect;
+            const location = head.header("location") orelse {
+                if (head.status == 307 or head.status == 308) break :redirect;
+                return error.BadRedirect;
+            };
+            if (redirects >= c.options.max_redirects) return error.TooManyRedirects;
+            redirects += 1;
+
+            const cap = "https://".len + url.host.len + ":65535[]".len +
+                url.path.len + location.len + http.max_merged_path;
+            const buf = try c.gpa.alloc(u8, cap);
+            errdefer c.gpa.free(buf);
+            const resolved = try http.resolveLocation(url, location, buf);
+            const next_url = http.Url.parse(resolved) catch return error.BadRedirect;
+            // A redirect can point anywhere, including `https://`; this
+            // client never dials TLS, so that is a clean typed error here
+            // rather than a silent scheme change. Checked BEFORE
+            // `conn.destroy()` below (see `owned`'s doc comment) so this
+            // return can never double-free it.
+            if (next_url.scheme != .http) return error.UnsupportedScheme;
+
+            conn.destroy();
+            owned = false;
+            if (url_owned) |s| c.gpa.free(s);
+            url_owned = buf;
+            url = next_url;
+            if (head.status != 307 and head.status != 308) current_body = null;
+            current_method = next_method;
+            continue;
+        }
+
+        setupBody(conn, current_method, head);
+        return .{ .status = head.status, .reason = head.reason, .head = head, .conn = conn };
+    }
+}
+
 /// A response with its (single-use) connection. Slices in `head`/`reason`
 /// stay valid until `deinit`.
 pub const Response = struct {
@@ -531,6 +635,39 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     };
 }
 
+/// `requestStreaming`'s plaintext-only twin — see `requestPlain`'s doc
+/// comment for why this is a separate decl rather than a shared
+/// implementation. `http://` only: `error.UnsupportedScheme` on `https://`,
+/// checked before any dial. No redirect support either way (unchanged from
+/// `requestStreaming`): a streamed body cannot be replayed.
+pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions, content_length: ?u64) Error!Upload {
+    std.debug.assert(options.body == null);
+    const url = try http.Url.parse(url_text);
+    if (url.scheme != .http) return error.UnsupportedScheme;
+    const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
+
+    var reused = false;
+    var conn = try c.acquireConnPlain(url, &reused);
+    // See `requestInnerPlain`'s `owned` doc comment: a bare
+    // `errdefer conn.destroy()` would double-free if the redial below fails.
+    var owned = true;
+    errdefer if (owned) conn.destroy();
+
+    writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch |err| {
+        if (!reused or !isStaleConnError(err)) return err;
+        conn.destroy();
+        owned = false;
+        conn = try c.dialPlain(url);
+        owned = true;
+        try writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled);
+    };
+    return .{
+        .conn = conn,
+        .method = method,
+        .chunked = if (content_length == null) h1.ChunkedWriter.init(conn.plainWriter(), conn.body_buf) else null,
+    };
+}
+
 // ── convenience helpers ─────────────────────────────────────────────────────
 
 /// GET `url` and return the body (caller owns), requiring a 2xx status
@@ -572,6 +709,31 @@ pub fn putFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u
     const size = (file.stat(c.io) catch return error.ReadFailed).size;
 
     var up = try c.requestStreaming(.put, url, options, size);
+    var fbuf: [64 * 1024]u8 = undefined;
+    var fr = file.reader(c.io, &fbuf);
+    fr.interface.streamExact64(up.writer(), size) catch |err| {
+        up.abort();
+        return switch (err) {
+            error.WriteFailed => error.WriteFailed,
+            else => error.ReadFailed,
+        };
+    };
+    var res = try up.finish();
+    defer res.deinit();
+    return res.status;
+}
+
+/// `putFile`'s plaintext-only twin (see `requestPlain`'s doc comment for why
+/// this is a separate decl): PUT `dir/sub_path` to `url` streamed with a
+/// Content-Length, `http://` only. `Upload.finish`/`Upload.abort` are shared
+/// with `putFile` — they operate on the already-dialed `*Conn` and name
+/// nothing from `tls`.
+pub fn putFilePlain(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u8, options: RequestOptions) Error!u16 {
+    var file = dir.openFile(c.io, sub_path, .{}) catch return error.ReadFailed;
+    defer file.close(c.io);
+    const size = (file.stat(c.io) catch return error.ReadFailed).size;
+
+    var up = try c.requestStreamingPlain(.put, url, options, size);
     var fbuf: [64 * 1024]u8 = undefined;
     var fr = file.reader(c.io, &fbuf);
     fr.interface.streamExact64(up.writer(), size) catch |err| {
@@ -1093,6 +1255,29 @@ fn acquireConn(c: *Client, url: http.Url, reused: *bool) Error!*Conn {
     return c.dialConn(url);
 }
 
+/// `acquireConn`'s plaintext-only twin: same pool checkout, but a miss dials
+/// through `dialPlain` directly, never `dialConn` (see `dialPlain`'s doc
+/// comment for why that indirection is the whole point). Rejects a
+/// non-`http` scheme itself, before touching the pool or the network, so a
+/// caller that got here via a redirect to `https://` fails the same way a
+/// caller that started there does. The pool is shared with `acquireConn`'s
+/// callers: it is keyed by `(scheme, host, port)`, so an entry a plaintext
+/// caller can ever match was necessarily dialed with `scheme = .http` — by
+/// `dialPlain` (this path) or by `dialConn`'s dispatch (the TLS-capable
+/// path, which also plaintext-dials `.http` origins) — either way a
+/// plaintext connection, safe to hand back here.
+fn acquireConnPlain(c: *Client, url: http.Url, reused: *bool) Error!*Conn {
+    if (url.scheme != .http) return error.UnsupportedScheme;
+    if (c.options.pool.enabled) {
+        if (c.pool.acquire(url.scheme, url.host, url.port, c.nowMs())) |conn| {
+            reused.* = true;
+            return conn;
+        }
+    }
+    reused.* = false;
+    return c.dialPlain(url);
+}
+
 /// Write the request head + optional in-memory body, flush, and read back
 /// the response head — one full h1 exchange on an already-acquired `conn`.
 /// Factored out of `request`'s hop loop so the stale-pooled-connection retry
@@ -1150,20 +1335,98 @@ fn nowMs(c: *Client) i64 {
     return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_ms));
 }
 
+/// Dial fresh, dispatching on `url.scheme`. Thin on purpose: this decl
+/// (and `acquireConn`, its only caller) is what `request`/`requestStreaming`/
+/// `putFile` still go through, so it must keep naming BOTH halves to keep
+/// TLS support for those callers unchanged. That is also exactly why
+/// `requestPlain`/`requestStreamingPlain`/`putFilePlain` do NOT call this —
+/// see `dialPlain`'s doc comment for the reachability argument.
 fn dialConn(c: *Client, url: http.Url) Error!*Conn {
+    if (url.scheme == .https) return c.dialTls(url);
+    return c.dialPlain(url);
+}
+
+/// Dial a fresh plaintext (`http://`) connection: allocate the buffer slab,
+/// connect the socket, done — no CA bundle, no TLS record layer.
+///
+/// **Reachability contract:** this function's own body must never name
+/// `tls`, `ensureCaBundle`, or `Certificate` — that is the entire mechanism
+/// behind the plaintext client's size saving (see `README.md`'s
+/// "Plaintext-only client" section and `sizeprobe/`). Sema only has to
+/// analyse a textually-referenced call; a plaintext-only entry point
+/// (`requestPlain` et al.) reaches this decl directly and never reaches
+/// `dialConn`/`dialTls`, so the TLS handshake state machine, X.509
+/// parse/verify and every hash/curve/AEAD it pulls in are never part of that
+/// binary's call graph. Splitting the branches *inside* one shared `dialConn`
+/// was tried first and does not work: a dispatcher that still names both
+/// `dialPlain` and `dialTls` keeps both reachable from every caller that
+/// goes through it, TLS-only or not — only a caller that never mentions the
+/// TLS-side decl at all drops the reference. Mirrors `dialTls` structurally;
+/// keep the two in sync by hand if the shared parts (buffer accounting,
+/// `Conn` init, dial bookkeeping) change.
+fn dialPlain(c: *Client, url: http.Url) Error!*Conn {
     const o = &c.options;
     const io = c.io;
-    const tls_needed = url.scheme == .https;
-    if (tls_needed and o.tls.verify == .strict) try c.ensureCaBundle();
 
-    // Buffer slab layout. For TLS the socket-facing buffers must hold a full
+    const total = o.read_buffer_size + o.write_buffer_size + o.max_head_bytes + body_scratch_len;
+
+    const conn = try c.gpa.create(Conn);
+    errdefer c.gpa.destroy(conn);
+    const slab = try c.gpa.alloc(u8, total);
+    errdefer c.gpa.free(slab);
+
+    var off: usize = 0;
+    const sock_r = slab[off..][0..o.read_buffer_size];
+    off += o.read_buffer_size;
+    const sock_w = slab[off..][0..o.write_buffer_size];
+    off += o.write_buffer_size;
+    const head_buf = slab[off..][0..o.max_head_bytes];
+    off += o.max_head_bytes;
+    const body_buf = slab[off..][0..body_scratch_len];
+
+    const stream = try c.connectStream(url);
+    errdefer stream.close(io);
+    _ = c.dial_count.fetchAdd(1, .monotonic);
+
+    conn.* = .{
+        .client = c,
+        .stream = stream,
+        .sr = undefined,
+        .sw = undefined,
+        .tls_client = null,
+        .slab = slab,
+        .head_buf = head_buf,
+        .body_buf = body_buf,
+        .body = .unset,
+        .origin = undefined,
+        .keep_alive_eligible = false,
+    };
+    conn.origin.set(url.scheme, url.port, url.host);
+    // The stream reader/writer must be initialized at the connection's final
+    // heap address.
+    conn.sr = stream.reader(io, sock_r);
+    conn.sw = stream.writer(io, sock_w);
+    return conn;
+}
+
+/// Dial a fresh `https://` connection: same buffer-slab/`Conn`/dial-count
+/// bookkeeping as `dialPlain`, plus the CA bundle load and the TLS handshake.
+/// Never called except through `dialConn`'s dispatch — see that decl and
+/// `dialPlain`'s doc comment for why that indirection matters for the
+/// plaintext-only entry points.
+fn dialTls(c: *Client, url: http.Url) Error!*Conn {
+    const o = &c.options;
+    const io = c.io;
+    if (o.tls.verify == .strict) try c.ensureCaBundle();
+
+    // Buffer slab layout. The socket-facing buffers must hold a full
     // ciphertext record; the plaintext read buffer additionally holds the
     // decoded response head (mirrors std.http.Client's sizing).
     const record_len = tls.Client.min_buffer_len;
-    const sock_r_len = if (tls_needed) record_len else o.read_buffer_size;
-    const sock_w_len = if (tls_needed) record_len else o.write_buffer_size;
-    const tls_r_len = if (tls_needed) record_len + o.read_buffer_size else 0;
-    const tls_w_len = if (tls_needed) o.write_buffer_size else 0;
+    const sock_r_len = record_len;
+    const sock_w_len = record_len;
+    const tls_r_len = record_len + o.read_buffer_size;
+    const tls_w_len = o.write_buffer_size;
     const total = sock_r_len + sock_w_len + tls_r_len + tls_w_len + o.max_head_bytes + body_scratch_len;
 
     const conn = try c.gpa.create(Conn);
@@ -1207,40 +1470,38 @@ fn dialConn(c: *Client, url: http.Url) Error!*Conn {
     conn.sr = stream.reader(io, sock_r);
     conn.sw = stream.writer(io, sock_w);
 
-    if (tls_needed) {
-        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
-        // The caller handed us `io` for sockets; `random`'s silent fallback
-        // on `EntropyUnavailable` would spend that same capability on TLS key
-        // material too — this seeds the ClientHello random and key share for
-        // every HTTPS request, so fail closed instead.
-        try io.randomSecure(&entropy);
-        conn.tls_client = tls.Client.init(&conn.sr.interface, &conn.sw.interface, .{
-            .host = switch (o.tls.verify) {
-                .strict => .{ .explicit = url.host },
-                .insecure_no_verify => .no_verification,
-            },
-            .ca = switch (o.tls.verify) {
-                .strict => .{ .bundle = .{
-                    .gpa = c.gpa,
-                    .io = io,
-                    .lock = &c.ca_lock,
-                    .bundle = &c.ca_bundle,
-                } },
-                .insecure_no_verify => .no_verification,
-            },
-            .read_buffer = tls_r,
-            .write_buffer = tls_w,
-            .entropy = &entropy,
-            .realtime_now = std.Io.Clock.real.now(io),
-            // Fine for HTTP: framing (Content-Length/chunked) detects
-            // truncation at the layer above.
-            .allow_truncation_attacks = true,
-        }) catch |err| switch (err) {
-            error.ReadFailed, error.WriteFailed => return error.ConnectFailed,
-            error.Canceled => return error.Canceled,
-            else => return error.TlsFailed,
-        };
-    }
+    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+    // The caller handed us `io` for sockets; `random`'s silent fallback
+    // on `EntropyUnavailable` would spend that same capability on TLS key
+    // material too — this seeds the ClientHello random and key share for
+    // every HTTPS request, so fail closed instead.
+    try io.randomSecure(&entropy);
+    conn.tls_client = tls.Client.init(&conn.sr.interface, &conn.sw.interface, .{
+        .host = switch (o.tls.verify) {
+            .strict => .{ .explicit = url.host },
+            .insecure_no_verify => .no_verification,
+        },
+        .ca = switch (o.tls.verify) {
+            .strict => .{ .bundle = .{
+                .gpa = c.gpa,
+                .io = io,
+                .lock = &c.ca_lock,
+                .bundle = &c.ca_bundle,
+            } },
+            .insecure_no_verify => .no_verification,
+        },
+        .read_buffer = tls_r,
+        .write_buffer = tls_w,
+        .entropy = &entropy,
+        .realtime_now = std.Io.Clock.real.now(io),
+        // Fine for HTTP: framing (Content-Length/chunked) detects
+        // truncation at the layer above.
+        .allow_truncation_attacks = true,
+    }) catch |err| switch (err) {
+        error.ReadFailed, error.WriteFailed => return error.ConnectFailed,
+        error.Canceled => return error.Canceled,
+        else => return error.TlsFailed,
+    };
     return conn;
 }
 
@@ -2664,6 +2925,165 @@ test "live: redirect follow (http → https)" {
     };
     defer res.deinit();
     try testing.expect(res.status >= 200 and res.status < 400);
+}
+
+// ── tests (plaintext-only client: requestPlain / requestStreamingPlain / putFilePlain) ──
+
+// What this test guarantees and what it does not: it proves requestPlain/
+// requestStreamingPlain/putFilePlain reject https:// BEHAVIORALLY —
+// error.UnsupportedScheme, and dialCount() stays 0 (the scheme check runs
+// before acquireConnPlain, so no socket is ever opened, TLS or otherwise).
+// It does NOT prove the compiled binary excludes TLS code — a Zig test only
+// observes runtime behavior of one already-linked binary (the whole test
+// suite, TLS included), so a symbol vanishing from the executable is not a
+// thing this test, or any Zig test, can see. THAT property — the actual
+// size/reachability saving this split exists for — is proved separately in
+// sizeprobe/ (build two minimal executables, one importing only the
+// plaintext entry points, and nm it for zero tls.Client/Certificate/curve/
+// hash symbols; see its README and CHANGELOG.md's entry for the measured
+// numbers). What THIS test catches is a different, real regression: someone
+// routing requestPlain through acquireConn/dialConn again (e.g. "simplify
+// away the duplication") — dial count would then jump on the https:// case,
+// and if the target happened to be a real host it would dial TLS
+// successfully instead of failing closed.
+test "requestPlain/requestStreamingPlain/putFilePlain: https:// is rejected before any dial" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+
+    // Never resolved/dialed if the guard holds — RFC 5737 TEST-NET-1 would
+    // hang or refuse if a real connect were attempted, which `dialCount()`
+    // catches deterministically (no reliance on wall-clock timing).
+    const https_url = "https://192.0.2.1/";
+
+    try testing.expectError(error.UnsupportedScheme, client.requestPlain(.get, https_url, .{}));
+    try testing.expectEqual(@as(usize, 0), client.dialCount());
+
+    try testing.expectError(error.UnsupportedScheme, client.requestStreamingPlain(.put, https_url, .{}, 0));
+    try testing.expectEqual(@as(usize, 0), client.dialCount());
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "x" });
+    try testing.expectError(error.UnsupportedScheme, client.putFilePlain(https_url, tmp.dir, "f.txt", .{}));
+    try testing.expectEqual(@as(usize, 0), client.dialCount());
+
+    // Also unsupported schemes entirely (never reaches the client at all —
+    // `Url.parse` itself rejects it) behave the same way.
+    try testing.expectError(error.UnsupportedScheme, client.requestPlain(.get, "ftp://192.0.2.1/", .{}));
+    try testing.expectEqual(@as(usize, 0), client.dialCount());
+}
+
+test "requestPlain: a redirect to https:// fails closed instead of silently upgrading" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try testing.allocator.create(Server);
+    defer testing.allocator.destroy(server);
+    server.* = Server.init(io, testing.allocator, .{ .handler = plainRedirectToHttpsHandler });
+    server.bind() catch |err| {
+        server.deinit();
+        std.debug.print("plaintext redirect test loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    try testing.expectError(error.UnsupportedScheme, client.requestPlain(.get, url, .{}));
+    // The redirect hop itself dialed nothing new (this test's only dial is
+    // the plaintext request that received the 302); the point under test is
+    // that following it into `https://` never happens.
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+}
+
+fn plainRedirectToHttpsHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    _ = req;
+    rw.status = 302;
+    try rw.setHeader("Location", "https://elsewhere.example/final");
+    try rw.writeAll("");
+}
+
+test "requestPlain: plaintext GET/POST loopback works and pools exactly like request" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var res1 = try client.requestPlain(.get, url, .{});
+    drainAndDeinit(&res1);
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    // Second request to the same origin: pooled connection reused, exactly
+    // as `acquireConn`'s own pool tests prove for `request` — the pool is
+    // shared, so this is also indirect proof `acquireConnPlain` and
+    // `acquireConn` agree on what is poolable.
+    var res2 = try client.requestPlain(.get, url, .{});
+    drainAndDeinit(&res2);
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
+
+    var up = try client.requestStreamingPlain(.post, url, .{}, 5);
+    try up.writer().writeAll("hello");
+    var res3 = try up.finish();
+    defer res3.deinit();
+    try testing.expectEqual(@as(u16, 200), res3.status);
+    const body = try res3.readAllAlloc(testing.allocator, 64);
+    defer testing.allocator.free(body);
+    try testing.expectEqualStrings("hello", body);
+}
+
+test "putFilePlain: streams a real file over a plaintext loopback PUT" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try poolTestLoopback(io, 0);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const payload = "the quick brown fox jumps over the lazy dog";
+    try tmp.dir.writeFile(io, .{ .sub_path = "upload.bin", .data = payload });
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const status = try client.putFilePlain(url, tmp.dir, "upload.bin", .{});
+    try testing.expectEqual(@as(u16, 200), status);
 }
 
 // ── tests (connection pool: loopback + white-box) ────────────────────────────

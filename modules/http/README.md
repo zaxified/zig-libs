@@ -79,6 +79,57 @@ var res2 = try up.finish();
 defer res2.deinit();
 ```
 
+### Plaintext-only client
+
+`Client.requestPlain` / `Client.requestStreamingPlain` / `Client.putFilePlain`
+are `http://`-only twins of `request`/`requestStreaming`/`putFile` — same
+redirect/retry/pooling behavior, `error.UnsupportedScheme` on `https://`
+(checked before any dial, including a redirect hop that points there). They
+exist for one measured reason: a consumer shipping a device agent on an 8 MB
+router overlay measured `http.Client` at **+351 000 B on x86-64
+musl/ReleaseSmall (+49%) and +607 200 B on big-endian MIPS32** for two
+plaintext one-shot operations (a `putFile` upload and a `request` +
+`streamRemaining` fetch, both to an IP literal, no TLS) — attributed almost
+entirely (**89.8%, 325 760 B**) to one thing: `dialConn` computing
+`tls_needed` from a runtime URL value meant the `if (tls_needed)` branch
+forced every caller, plaintext-only or not, to pull in the whole TLS client
+(handshake state machine, X.509 parse/verify, every hash/curve/AEAD it uses).
+
+```zig
+var client = http.Client.init(threaded.io(), gpa, .{});
+defer client.deinit();
+
+_ = try client.putFilePlain("http://10.0.0.1:9070/v1/backup", std.Io.Dir.cwd(), "db.tar", .{});
+
+var res = try client.requestPlain(.get, "http://10.0.0.1:9070/v1/status", .{});
+defer res.deinit();
+_ = try res.reader().streamRemaining(some_writer);
+
+// error.UnsupportedScheme, not a TLS attempt:
+_ = client.requestPlain(.get, "https://example.com/", .{});
+```
+
+`request`/`requestStreaming`/`putFile` are **unchanged** — they still go
+through `dialConn` (now a two-line dispatcher onto `dialPlain`/`dialTls`)
+and still cost what they always cost, TLS included; `requestPlain` and
+friends are a separate call graph (`acquireConnPlain`/`dialPlain`) that never
+names `dialConn`/`dialTls`/`ensureCaBundle`, so nothing forces Sema to
+analyse the TLS client for a binary that only calls the plaintext entry
+points — the same mechanism that already gives HTTP/2 (`connectH2c`, its own
+entry point `dialConn` never calls) its zero cost when unused.
+
+**Measured saving** (`modules/http/sizeprobe/`, static `ReleaseSmall`, the
+same two call sites as the AXP measurement above):
+
+| target | before (TLS-capable entry points) | after (plaintext-only entry points) | delta |
+|---|---:|---:|---:|
+| x86_64-linux-musl | 490 408 B | 165 520 B | **324 888 B** |
+| mips-linux-musleabi (BE MIPS32) | 923 904 B | 238 576 B | **685 328 B** |
+
+`nm` on an unstripped build of the plaintext-only probe shows **zero**
+`tls.Client`/`Certificate`/curve/hash symbols on either target (196 such
+symbols on the TLS-capable probe, for contrast — see the sizeprobe README).
+
 ### HTTP/2 client: multiplexed, and incremental in both directions
 
 `Client.connectH2c` (cleartext h2c, prior knowledge) / `connectH2Over` (a
@@ -518,6 +569,10 @@ covers the client population; `deflate` adds nothing over it).
   (`Connection: close` on every request).
 - **TLS:** `std.crypto.tls.Client`, system CA bundle loaded lazily once per
   Client; `tls.verify = .insecure_no_verify` opt-out for testing.
+- **Plaintext-only entry points:** `requestPlain`/`requestStreamingPlain`/
+  `putFilePlain` never reference the TLS client at all (see "Plaintext-only
+  client" above) — use them when every target is `http://` and binary size
+  matters; `request`/`requestStreaming`/`putFile` are unaffected either way.
 - **Timeouts:** both budgets are enforced, and neither by the socket layer —
   std 0.16.0 has no per-read deadline and `Io.Threaded` panics outright ("TODO
   implement netConnectIpPosix with timeout") if `ConnectOptions.timeout` is
