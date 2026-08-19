@@ -2856,7 +2856,13 @@ fn renderPortableTable(
             "**A blank cell means the module never claimed that target.** That is a different " ++
             "fact from a `known-failing` cell next to it — one is an absent claim, the other is " ++
             "a claim currently broken and tracked — and this table exists so the two are never " ++
-            "shown as the same thing.\n\n",
+            "shown as the same thing.\n\n" ++
+            "**A row states that the module compiles for that target. It does not state that a " ++
+            "binary containing the module links for it.** Link-time reach limits are a property " ++
+            "of the consuming binary's total text size, not of any single module: on 32-bit MIPS " ++
+            "a branch's `PC16` fixup reaches ±128 KB, and a large enough consumer overruns it no " ++
+            "matter which modules it picked. What that looks like, and what to do about it, is " ++
+            "under *Consumer gotchas* below.\n\n",
         .{ module_list.len, module_list.len, rows.items.len, n_pairs, n_pass, n_fail },
     );
 

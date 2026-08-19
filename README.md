@@ -214,6 +214,8 @@ Every one of the 229 modules above claims `.linux64` (Linux, amd64 or arm64) —
 
 **A blank cell means the module never claimed that target.** That is a different fact from a `known-failing` cell next to it — one is an absent claim, the other is a claim currently broken and tracked — and this table exists so the two are never shown as the same thing.
 
+**A row states that the module compiles for that target. It does not state that a binary containing the module links for it.** Link-time reach limits are a property of the consuming binary's total text size, not of any single module: on 32-bit MIPS a branch's `PC16` fixup reaches ±128 KB, and a large enough consumer overruns it no matter which modules it picked. What that looks like, and what to do about it, is under *Consumer gotchas* below.
+
 | Module | linux32 | windows | wasm32 |
 |---|---|---|---|
 | `blobmsg` | compiles | — | — |
@@ -254,6 +256,20 @@ Every one of the 229 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | `zipstream` | — | compiles | — |
 
 <!-- END GENERATED: check-portable-table -->
+
+### Consumer gotchas
+
+Failures that are not a defect in any module, and whose error message does not say so.
+
+**`out of range PC16 fixup` when cross-building for 32-bit MIPS.** Seen on
+`mips-linux-musl` with `-Dcpu=mips32,soft_float` in `ReleaseSmall`: a large function that
+inlines many call-site bodies grows past the ±128 KB reach of a MIPS `PC16` branch fixup,
+and the link fails. The message names no symbol, no module and no file, so the natural
+first suspect is whichever module was added last — but the threshold belongs to the
+binary's total text size, and adding *any* code can cross it. The fix is on the consumer
+side: mark the inlined leaf bodies `noinline`, at the cost of one call each. Neither
+`mips32r2` nor `ReleaseSafe` reproduces it, so comparing against either one is the quickest
+way to recognise it.
 
 ### Web / HTTP & API — an internet-facing service, no reverse proxy required
 
