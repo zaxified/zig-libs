@@ -63,20 +63,21 @@ VM_OPENWRT_URL="https://downloads.openwrt.org/releases/25.12.4/targets/x86/64/op
 VM_OPENWRT_GZ=1  # fetched file is gzip-compressed; decompress after verifying the .gz's own sha256
 VM_OPENWRT_GZ_SHA256="9d080bcae28d7cdf86dabb4b29c10d36d89e0bd79e20a4799454380bc1619695"
 # Of a *pristine* decompression of the .gz above — computed directly from a
-# fresh download, NOT from axp's local copy. Those two turned out to
-# DIFFER (same 126353408 byte size, different sha256): axp's copy has
-# apparently been booted without -snapshot at some point in its own history
-# and picked up real state. Pinning the checksum from the local copy would
+# fresh download, NOT from a local copy lying around this machine. Those two
+# turned out to DIFFER (same 126353408 byte size, different sha256): the local
+# copy had apparently been booted without -snapshot at some point in its own
+# history and picked up real state. Pinning the checksum from a local copy would
 # have been circular (it'd "verify" a possibly-modified image against
 # itself) — exactly the supply-chain hole this manifest exists to close.
 # Verified by fetching+decompressing independently and diffing both sha256s.
 VM_OPENWRT_SHA256="0a9ef9a7364d5a45ad495529af06aa17b14b6fa41cba4f7d0114b48dd9cb396b"
-# A fresh clone has no axp checkout; this is just a fast-path so the common
-# case (this dev machine) doesn't re-download 126 MB it already has — BUT
-# fetch-images.sh verifies it against VM_OPENWRT_SHA256 above before trusting
-# it, and falls back to a real download on a mismatch (which, per the note
-# above, is exactly what happens with this specific local copy today).
-VM_OPENWRT_LOCAL_REUSE="$HOME/workspace/axp/DEV/vm-openwrt/openwrt-25.12.4-x86-64-ext4.img"
+# Optional fast-path: point this at an image this machine already has and
+# fetch-images.sh will copy instead of re-downloading 126 MB. Empty by
+# default, so a fresh clone always downloads. Either way fetch-images.sh
+# verifies the result against VM_OPENWRT_SHA256 above before trusting it and
+# falls back to a real download on a mismatch — a stale or booted-without-
+# -snapshot local copy is caught, not trusted.
+VM_OPENWRT_LOCAL_REUSE="${VM_OPENWRT_LOCAL_REUSE:-}"
 
 # ── openwrt provisioning: the official ImageBuilder ──────────────────────
 # Same pinned release as the stock image above, from the same target
@@ -128,8 +129,8 @@ VM_OPENWRT_IB_ARTIFACT="openwrt-25.12.4-x86-64-generic-ext4-combined.img.gz"
 #                           policer (modules/tc/src/root.zig, "filter action
 #                           list" test), so it is required, and no amount of
 #                           kmod-sched* guessing would have produced it.
-#   kmod-ifb              — ifb.ko (ingress redirect target; wanted by the
-#                           planned S2 edge-shaper work).
+#   kmod-ifb              — ifb.ko (ingress redirect target; wanted by
+#                           edge-shaper work).
 #   kmod-veth             — veth.ko (pairs for netns-style topologies).
 #
 # Not listed and not needed: sch_fq_codel is built into this kernel

@@ -231,7 +231,7 @@ arbitrary bytes:
 ## 8. Deferred / out of scope
 
 - **Key agreement / handshake.** No Noise/HPKE/X25519 here — the key is an
-  input. A future module (or the S1b orchestrator) performs the handshake and
+  input. A future module (or the fabric orchestrator) performs the handshake and
   hands `aeadframe` the per-tenant key.
 - **Key-rotation policy.** *When* to `bumpEpoch` vs install a fresh key (time,
   byte count, message count, forward-secrecy target) is a caller policy; this
@@ -250,7 +250,7 @@ arbitrary bytes:
   rekey are dropped as `EpochMismatch`; a multi-epoch opener (keeping the
   previous epoch's key+window alive during a transition window) is not built.
 - **Multi-channel / tenant map.** One `Channel` is one `(key, epoch)` context.
-  The I-SID → channel map (S1b) is orchestration glue above this module.
+  The I-SID → channel map is orchestration glue above this module.
 - **Concurrency.** `single_owner`: a `Sealer`/`Opener` is owned by one
   thread/loop and holds no lock. Sharing one across threads is the caller's to
   synchronise.

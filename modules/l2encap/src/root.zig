@@ -11,8 +11,7 @@
 //! addressing and crypto, this encapsulation carries **no backbone MAC
 //! addresses** — that is the deliberate difference from full 802.1ah PBB.
 //! Standalone codec: no network, no clock, no allocation on the decode path.
-//! Consumer: the S1b L2-over-WireGuard data plane. See
-//! ~/CML/S1B-scada-l2vpn-venture-plan.md.
+//! Consumer: an L2-over-WireGuard data plane.
 //!
 //! ## Wire format
 //! Every encapsulated frame is an 8-byte header followed by the opaque customer

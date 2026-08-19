@@ -19,15 +19,15 @@ needs to learn from.
 - **Deps:** `icmp` (echo codec + DF-capable socket for `probe`), `netaddr`
   (`Ip` addressing).
 
-Provenance: clean-room from the RFCs above. AXP's own prior ~25-line
-kernel-cache implementation (same organization, not a third-party project)
+Provenance: clean-room from the RFCs above. A prior in-house ~25-line
+kernel-cache implementation (our own code, not a third-party project)
 was read as the starting point for `query` and is superseded by this
 module — no root `NOTICE` entry applies (no third-party source studied or
 ported).
 
 ## Why two functions
 
-`query` is what AXP had: set `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` to
+`query` is what that prior implementation did: set `IP_MTU_DISCOVER`/`IPV6_MTU_DISCOVER` to
 `PMTUDISC_DO` on a connected UDP socket, send one oversized nudge datagram,
 read `IP_MTU`/`IPV6_MTU` back. Instant, unprivileged, and correct whenever
 the kernel's PMTU cache has actually been populated by a real ICMP message.

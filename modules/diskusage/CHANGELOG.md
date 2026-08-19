@@ -55,7 +55,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-08-18** — Fix: `mounts.readMounts`/`mountinfo.readMountinfo` called
   `std.Io.File.read(io, &buf)`, which does not exist in Zig 0.16 (`File` only
   has `readStreaming`/`readPositional`/`reader`/`readerStreaming`) — a
-  compile error a real consumer (AXP) hit on the obvious entry point. Neither
+  compile error a real consumer hit on the obvious entry point. Neither
   function was called by any test in this module, so the bodies were never
   semantically analysed and every gate stayed green (the same "never
   analysed, therefore never checked" shape the repo's build-system-level

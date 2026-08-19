@@ -8,7 +8,7 @@
 //! the KEY ESTABLISHMENT (Noise/HPKE/X25519 handshake) is OUT OF SCOPE — the
 //! 32-byte key is an input, supplied by a caller/future module.
 //!
-//! The S1b consumer is per-tenant L2VPN confidentiality: one `Channel` per
+//! The motivating consumer is per-tenant L2VPN confidentiality: one `Channel` per
 //! I-SID (the I-SID → channel map is the orchestrator's glue), giving
 //! cryptographic tenant isolation over the shared encrypted backbone. The `aad`
 //! argument is the tenant/context binding — a record opens only against the

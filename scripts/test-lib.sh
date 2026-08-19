@@ -4,8 +4,7 @@
 # ships bash 3.2 (no associative arrays), where `declare -A` evaluates the
 # key as arithmetic and errors out. "Sets" of module names are represented
 # as space-padded strings (" a b c ") and tested with a `case " $s " in`
-# glob, which works on any bash. See bxp/scripts/test-lib.sh for the sibling
-# implementation this one is patterned after.
+# glob, which works on any bash.
 
 # ── the netns-wrapped module set ──────────────────────────────────────────
 # Modules whose tests open AF_NETLINK/raw sockets gated on CAP_NET_ADMIN or

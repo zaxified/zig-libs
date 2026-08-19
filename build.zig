@@ -2194,11 +2194,11 @@ const PortableTarget = enum {
     /// default test suite, never cross-compiled by this gate.
     linux64,
     /// 32-bit, BIG-ENDIAN Linux, soft-float. Representative target
-    /// `mips-linux-musl` + `mips32,soft_float` -- AXP's real device-agent
-    /// query, taken verbatim from `~/workspace/axp/docs/feasibility-mips.md`
-    /// (their own cross-compile probe, ath79 24Kc has no FPU so soft-float is
-    /// load-bearing, not incidental -- `musleabihf` would silently pick a
-    /// hard-float ABI AXP's actual hardware cannot run). Named as that
+    /// `mips-linux-musl` + `mips32,soft_float` -- a downstream device agent's
+    /// real cross-compile query, taken verbatim from its own probe (an ath79
+    /// 24Kc has no FPU, so soft-float is load-bearing, not incidental --
+    /// `musleabihf` would silently pick a hard-float ABI that hardware cannot
+    /// run). Named as that
     /// specific architecture rather than "any 32-bit Linux" because
     /// endianness is exactly the defect class a little-endian 32-bit probe
     /// (wasm32, i686, mipsel, arm) cannot catch: a module that reads/writes a
@@ -2211,8 +2211,8 @@ const PortableTarget = enum {
     /// unverified claim wearing a verified one's label, the exact
     /// bait-and-switch this schema replaces.
     linux32,
-    /// `x86_64-windows-gnu` -- bxp's gui-bridge (`bxp-gui-bridge.dll`) and its
-    /// spawned `bxp-cli.exe` child.
+    /// `x86_64-windows-gnu` -- a downstream GUI bridge ships a DLL there, and
+    /// spawns a CLI child on the same platform.
     windows,
     /// `wasm32-wasi`. The pointer-width probe this gate originally shipped
     /// with (see the long comment at `check-portable`'s call site in
@@ -2233,7 +2233,7 @@ const PortableTarget = enum {
             .linux32 => .{
                 .cpu_arch = .mips,
                 .os_tag = .linux,
-                .abi = .musl, // static musl, NOT musleabihf -- AXP's hardware has no FPU
+                .abi = .musl, // static musl, NOT musleabihf -- the target hardware has no FPU
                 .cpu_features_add = std.Target.mips.featureSet(&.{ .mips32, .soft_float }),
             },
             .windows => .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
@@ -2428,9 +2428,7 @@ fn parsePortableBaseline(
 ///   fail, NOT listed    — gate fails: a new/unlisted regression.
 ///   pass, listed        — gate fails: a STALE entry. Without this half the
 ///                         list can only ever grow, which is exactly how a
-///                         baseline rots into a lie nobody re-reads --
-///                         `feedback_closing_summary_lies` in CML's own memory
-///                         is the same failure shape one layer up.
+///                         baseline rots into a lie nobody re-reads.
 /// Best-effort slice of `text` (the sweep subprocess's combined stdout+stderr)
 /// covering (module, target) pair's own compile: from just after the previous
 /// `failed command:` line to the end of the `failed command:` line that names

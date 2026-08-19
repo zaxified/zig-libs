@@ -40,7 +40,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   which is why it is named, explicit and not the default. Before 2026-08-11 the promise "one session
   cannot consume another's sampling reply" was written without this qualifier while the stateless
   mode silently shared peer 0 — the promise was true of the configuration it described and false of
-  the default one. Latent, not exploited: only `bxp-gui` speaks HTTP/SSE today.
+  the default one. Latent, not exploited: only one consumer speaks HTTP/SSE today.
 - **The `application/json` body is exactly one JSON object.** The server may write several lines for
   one message (progress notifications, and now server→client requests) before the response line;
   only the last is the body and the earlier ones are pushed to the session's `GET` queue (dropped on

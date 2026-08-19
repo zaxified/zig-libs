@@ -188,9 +188,9 @@ it, and SPEC.md does not restate it. Vocabulary:
     release lanes on the native runner, plus the CI matrix's arm64 lane), so it is
     **mandatory in every module's set** and is never itself cross-compiled by the gate.
   - `.linux32` — 32-bit, **big-endian, soft-float** Linux, representative target
-    `mips-linux-musl` + `mips32,soft_float` (taken verbatim from AXP's own cross-compile
-    probe, `~/workspace/axp/docs/feasibility-mips.md` — their device-agent architecture;
-    ath79 24Kc has no FPU, so soft-float is load-bearing, not a default). Named as that
+    `mips-linux-musl` + `mips32,soft_float` (taken verbatim from a downstream device
+    agent's own cross-compile probe: an ath79 24Kc has no FPU, so soft-float is
+    load-bearing here, not a default). Named as that
     specific architecture rather than a wider "any 32-bit Linux" class on purpose: endianness is a
     defect class a little-endian 32-bit probe (wasm32, i686, mipsel, arm) cannot catch — a
     module with an implicit little-endian assumption in a multi-byte wire field passes
@@ -199,7 +199,7 @@ it, and SPEC.md does not restate it. Vocabulary:
     32-bit probe and claim readiness for the big-endian target it was never actually
     built for — an unverified claim wearing a verified one's label, which is what this
     schema exists to stop doing.
-  - `.windows` — `x86_64-windows-gnu` (bxp's gui-bridge).
+  - `.windows` — `x86_64-windows-gnu` (a downstream GUI bridge ships a DLL there).
   - `.wasm32` — `wasm32-wasi` (qr/qrscan's static-footprint use case; wasi supplies the OS
     surface the default test runner needs while keeping 32-bit pointers — see
     `build.zig`'s `check-portable` comment for why wasi and not freestanding).

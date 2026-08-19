@@ -13,7 +13,7 @@ corner cases. Standalone codec: no sockets, no wall-clock read.
 - **Model after:** IP fragmentation/reassembly (RFC 791 §3.2) with RFC 5722 §3
   overlap rejection, hardened.
 
-Consumer: the S1b L2-over-WireGuard data plane. See
+Consumer: an L2-over-WireGuard data plane. See
 [`SPEC.md`](SPEC.md) for the full threat model and the wire format.
 
 ## Wire format

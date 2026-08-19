@@ -42,8 +42,8 @@ Canonical in-memory columnar-typed table — the seam between data sources and c
   — encode and decode agree with each other regardless of which byte order either one actually uses.
   Cross-verified by running the suite under `qemu-s390x` against a `-Dtarget=s390x-linux-musl`
   (big-endian) build. On a little-endian host the wire bytes are unchanged by this fix — verified
-  byte-for-byte against the golden vector — so no existing little-endian-host payload (e.g. a wgs
-  cache) is invalidated.
+  byte-for-byte against the golden vector — so no existing little-endian-host payload (e.g. a
+  consumer's on-disk cache) is invalidated.
 - **Known ceiling, by design:** row-major, boxed-`Value` representation (each cell a tagged union,
   each row a slice of them) — simple and allocator-friendly, not a typed columnar layout. No
   SIMD-friendly per-column scans or Arrow-style memory density; fine for dashboard-sized result sets,

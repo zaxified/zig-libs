@@ -7,7 +7,7 @@ can share one encrypted WireGuard backbone between provider edges (PEs), and it
 supplies the two pure per-frame forwarding decisions (TTL, split-horizon) a PE
 needs. It is a codec only: no socket, no clock, no allocation on decode.
 
-Status: **gap** — the S1b L2-over-WireGuard data plane needs a tenant tag + loop
+Status: **gap** — an L2-over-WireGuard data plane needs a tenant tag + loop
 backstop that neither WireGuard nor `ethfrag` provides; this fills exactly that
 slot. Model + rationale below; full design/threat notes in
 [SPEC.md](SPEC.md).

@@ -33,7 +33,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   format change on little-endian hosts** — the wire bytes are byte-for-byte identical
   before and after this fix (the golden vector documents the *pre-existing* de facto
   byte layout, which the old native-endian code happened to already produce on every
-  little-endian host); no existing little-endian-host payload (e.g. a wgs cache) is
+  little-endian host); no existing little-endian-host payload (e.g. a consumer's cache) is
   invalidated.
 - **2026-07-18** — Security audit: two findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this).

@@ -15,7 +15,7 @@ Fermat, no primality assumption.
 
 ## Why it exists (std-gap, not a dup)
 
-The deep audit (`~/CML/audit/modules/{rsa,paillier,vdf}.md`) measured every
+The internal deep audit (`rsa`, `paillier`, `vdf`) measured every
 bignum-crypto module in this repo — all backed by `std.crypto.ff` — at ~8–29×
 OpenSSL:
 

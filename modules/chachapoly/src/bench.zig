@@ -139,7 +139,7 @@ test "bench (opt-in via CHACHAPOLY_BENCH)" {
         std.debug.print("aead encrypt       : ours {d:>8.0} MB/s   std {d:>8.0} MB/s   ({d:.2}x)\n", .{ ours, theirs, ours / theirs });
     }
 
-    // ── the S1b / WireGuard case: one MTU-sized packet, not a bulk stream.
+    // ── the WireGuard case: one MTU-sized packet, not a bulk stream.
     //    Short messages are where a lane-parallel MAC can LOSE: it must build
     //    the r^1..r^L power table before the first wide group. This line is the
     //    regression guard for that. ──

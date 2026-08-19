@@ -9,7 +9,7 @@ the core. It owns the per-tenant state (MAC learning + membership); the sibling 
 builds the actual on-wire frame. Pure, deterministic, time-injected, bounded: no
 socket, no clock, no thread — the caller drives `now` and all I/O.
 
-Status: **gap** — the S1b L2-over-WireGuard data plane needs the per-tenant
+Status: **gap** — an L2-over-WireGuard data plane needs the per-tenant
 MAC-learning + replication brain that `l2encap` deliberately does *not* carry
 (its SPEC's deferred list names "MAC learning" and "the actual next-hop
 selection" as out of scope); this fills exactly that slot. Model + rationale

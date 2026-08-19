@@ -29,7 +29,7 @@ Two independent paths sharing one `Result`/`Options` shape:
   needed; no ICMP is sent or parsed here). `SOL.IP`/`SOL.IPV6`
   `MTU_DISCOVER = PMTUDISC_DO`, connect, one oversized nudge send (`EMSGSIZE`
   expected and ignored), `getsockopt(IP_MTU`/`IPV6_MTU)`. This is
-  deliberately AXP's own proven approach, unchanged in shape — the value
+  deliberately the prior in-house proven approach, unchanged in shape — the value
   this module adds is `probe`, not a rewrite of what already worked.
 - **`probe`** — a pure binary-search engine (`searchWith`) behind an
   injectable `Prober` seam (`ctx: *anyopaque` + a function pointer — the

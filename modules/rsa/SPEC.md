@@ -39,7 +39,7 @@ mod n, public op mod n) is routed through `montint`; the deep audit measured pla
 at ~29× OpenSSL for the CRT sign, and `montint` closes most of that gap. `MontParams` are
 precomputed once per key at construction, so no per-operation setup cost is paid.
 
-**Hardening (post-audit, see `~/CML/audit/modules/rsa.md`).** The CRT private op (`privateOpCrt`)
+**Hardening (post-audit).** The CRT private op (`privateOpCrt`)
 carries both fault- and side-channel countermeasures: F3 (Bellcore/BDL) — every CRT private op
 re-encrypts the recovered `m` and checks `m^e ≡ c (mod n)`, returning `error.FaultDetected` on
 mismatch rather than handing an attacker a faulty value that could factor `n`; F2 (base blinding) —

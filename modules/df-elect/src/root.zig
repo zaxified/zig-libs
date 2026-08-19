@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! df-elect — Designated-Forwarder election + split-horizon, partition-correct.
 //!
-//! The #2 jewel of the S1b fabric (see ~/CML/S1B-scada-l2vpn-venture-plan.md §5): a
+//! Built for an encrypted L2VPN fabric over WireGuard: a
 //! customer site dual-homed to two edge nodes forms an edge segment; exactly one node
 //! must be the Designated Forwarder for BUM traffic toward the site, deterministically
 //! from link-state, and — the hard part — correct under arbitrary network partition

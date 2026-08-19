@@ -99,7 +99,7 @@ no malformed frame, and it was ours.)
 **What is still not closed anywhere in the data plane:** a transient forwarding
 loop among PEs during control-plane reconvergence, when member sets disagree.
 That requires a loop-free BUM distribution tree and a reverse-path-forwarding
-check, which are **control-plane** computations (the S1b `loopfree-reconv` /
+check, which are **control-plane** computations (the `loopfree-reconv` /
 SPB-tree work), not something a stateless codec can assert. The header's job is
 to carry the *necessary inputs* (source id + hop count + BUM bit) to those
 decisions; the TTL backstop guarantees that even a loop the control plane briefly
@@ -146,7 +146,7 @@ does not claim, per-frame authentication (see deferred list).
   only *classifies* a frame as BUM and supplies the split-horizon predicate.
 - **Control plane** — I-SID↔tenant binding distribution, PE-id assignment,
   BUM-tree computation, reverse-path-forwarding check, adjacency/reconvergence
-  (the S1b `df-elect` / `loopfree-reconv` / `liveness-hyst` modules).
+  (the `df-elect` / `loopfree-reconv` / `liveness-hyst` modules).
 - **MAC learning** and the customer-side bridging state.
 - **VLAN-in-I-SID / QinQ mapping** — mapping a customer 802.1Q VID to an I-SID is
   a provisioning decision above this codec; the customer frame (tags and all) is
@@ -231,7 +231,7 @@ already cited (root `NOTICE` §0).
 No Fable-tier piece was needed: the header is a clean-room layout from published
 overlay specs and the two decision helpers are total pure functions. The genuinely
 hard part of the fabric — loop-free BUM-tree reconvergence and designated-forwarder
-election under partition — is intentionally **not** here; it lives in the S1b
+election under partition — is intentionally **not** here; it lives in the
 `loopfree-reconv` / `df-elect` modules, which this codec feeds.
 
 ## Status

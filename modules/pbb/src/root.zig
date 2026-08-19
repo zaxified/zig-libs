@@ -17,8 +17,8 @@
 //!
 //! Standalone codec: no network, no clock, and **no allocation on the decode
 //! path** — `decode` returns the customer bytes as a subslice of the input.
-//! Concurrency `.reentrant` (no shared state). Consumer: the S1b SCADA/OT L2VPN
-//! fabric's real-Ethernet edge. See ~/CML/S1B-scada-l2vpn-venture-plan.md.
+//! Concurrency `.reentrant` (no shared state). Consumer: the real-Ethernet edge
+//! of an encrypted SCADA/OT L2VPN fabric.
 //!
 //! ## Wire format (IEEE 802.1Q-2014 clause 9.7 I-TAG + clause 25/26 PBB)
 //! The backbone frame, in order (FCS is a frame-level trailer and out of scope):

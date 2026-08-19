@@ -186,7 +186,7 @@ and the `std.testing.fuzz` target. Green in Debug and
 No Fable-tier piece was needed: the frame is a clean-room layout from a published
 standard and the codec is total over its decoded field space. The hard fabric
 problems (loop-free BUM-tree reconvergence, designated-forwarder election) live in
-the S1b `loopfree-reconv` / `df-elect` modules, which this codec feeds; forwarding
+the `loopfree-reconv` / `df-elect` modules, which this codec feeds; forwarding
 state lives in `l2forward`.
 
 ## Status

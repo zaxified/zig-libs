@@ -6,7 +6,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-08-18** — **BEHAVIOURAL, not breaking:** two API gaps closed after a
-  consumer (AXP) adopted the native read path and hit both. (1) `Socket.listTables`/
+  consumer adopted the native read path and hit both. (1) `Socket.listTables`/
   `listChains`/`listSets`/`listRules`, and `wire.buildDumpRequest`/`buildRuleDumpRequest`,
   now take `family: ?Family` instead of `Family` — `null` sends `nfgen_family =
   NFPROTO_UNSPEC` (0), the same framing `nft list ruleset` uses to sweep every family in

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! Size probe, "before" half: mirrors AXP's two device-agent call sites —
+//! Size probe, "before" half: mirrors a device agent's two call sites —
 //! one plaintext PUT upload, one plaintext GET + streamRemaining fetch, both
 //! to an IP literal — through the ORIGINAL, TLS-capable entry points
 //! (`Client.request` / `Client.putFile`) that every existing caller
-//! (`request`/`requestStreaming`/`putFile` — `wgs` included) still uses
+//! (`request`/`requestStreaming`/`putFile`) still uses
 //! unchanged. This binary's size is the baseline half of the plaintext-only
 //! client A/B measured in `../README.md`'s "Plaintext-only client" section
 //! and `../CHANGELOG.md`. See `run.sh` for how it is built and compared

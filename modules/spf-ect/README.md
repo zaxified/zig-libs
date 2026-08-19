@@ -10,8 +10,8 @@ Also provides a disjointness-*minimizing* second tree (PRP mode) — a greedy
 equal-cost tie-break that steers onto unused links wherever the graph offers
 one; **not** a max-flow disjoint-path guarantee.
 
-Pure graph algorithm, zero I/O. Shared kernel of the SPB simulator (S1) and the
-encrypted SCADA L2VPN fabric (S1b).
+Pure graph algorithm, zero I/O. Shared kernel of an SPB simulator and an
+encrypted SCADA/OT L2VPN fabric.
 
 - **Status:** complete — both tiers implemented and property-tested.
   **Platform:** any.

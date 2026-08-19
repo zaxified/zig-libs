@@ -20,7 +20,7 @@
 #
 # ONE target only: x86_64-linux-musl. `sizeprobe/run.sh` also cross-builds
 # mips-linux-musleabi (big-endian MIPS32) for the measured size DELTA on
-# both of AXP's targets, but the property this gate checks -- whether the
+# both of that consumer's targets, but the property this gate checks -- whether the
 # plaintext call graph references TLS/crypto decls at all -- is a Sema
 # reachability fact, not a codegen one: it does not vary by target the way
 # the 32-bit/big-endian bugs `check-portable` hunts for do (see that gate's

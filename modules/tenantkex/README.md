@@ -1,6 +1,6 @@
 # tenantkex
 
-Per-tenant key exchange for the S1b L2VPN fabric: two provider edges (PEs) that
+Per-tenant key exchange for an encrypted L2VPN fabric: two provider edges (PEs) that
 already share the encrypted WireGuard backbone run, **per tenant**, an
 independent authenticated `Noise_IK` handshake (via the `noise` module) and
 derive the two directional 32-byte transport keys that feed a pair of

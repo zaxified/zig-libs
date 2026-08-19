@@ -8,8 +8,8 @@ and no third-party IS-IS source or dissector was ported or studied).
 
 ## Scope
 
-A **pure wire codec** for IS-IS PDUs and TLVs — the control-plane byte layer the
-SPB (IEEE 802.1aq) fabric of the S1b venture runs on. This module encodes and
+A **pure wire codec** for IS-IS PDUs and TLVs — the control-plane byte layer an
+SPB (IEEE 802.1aq) fabric runs on. This module encodes and
 decodes; it holds no state. The adjacency FSM, LSP database, flooding/SRM-SSN,
 SPF, and the SPB tree computation are separate consumer modules built on top.
 

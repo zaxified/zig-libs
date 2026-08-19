@@ -96,7 +96,7 @@ order; `contextString = "OPRFV1-" ‖ I2OSP(mode,1) ‖ "-" ‖
   no call site can branch on the scalar. Not verified by re-reading the
   source — verified with a ctgrind-style valgrind/memcheck run, **mode,
   switch and counts stated** (the shape the previous sentence lacked, per
-  `~/CML/20260808-zig-libs-audit/modules/ct25519.md`'s F6 to-do): the harness
+  the internal audit's `ct25519` F6 to-do): the harness
   lives in `ct25519` (`modules/ct25519/src/ctgrind_harness.zig`, run by
   `scripts/ctgrind.sh ct25519`) since it is `ct25519`, not `voprf`, that
   performs the multiply, and all nine of the call sites named above reduce

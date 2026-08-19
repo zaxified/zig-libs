@@ -81,14 +81,14 @@ pub const Route = struct {
 /// ceiling needs on the order of 254 concatenated near-max-metric hops — not
 /// a fixture that can be driven RED at a defensible size, and no path this
 /// module's own callers construct can plausibly reach it. Left as a known,
-/// intentionally deferred gap rather than shipped unproven; see W2
-/// `isis-spf` F2 in `~/CML/audit`.
+/// intentionally deferred gap rather than shipped unproven (internal audit
+/// W2 `isis-spf` F2).
 pub const max_link_metric: u32 = 0xFFFFFF;
 
 /// Tuning for `computeWith`. The defaults are the correct/safe behaviour.
 ///
 /// This struct deliberately does NOT expose a way to disable the ISO §7.2.8.2
-/// two-way connectivity check — see W2 `isis-spf` F6 in `~/CML/audit`: that
+/// two-way connectivity check — internal audit W2 `isis-spf` F6: that
 /// knob used to be a public field here (`require_two_way: bool = true`),
 /// reachable by any production caller with nothing stopping it from being
 /// passed `false` by accident. The deliberately-WRONG two-way-disabled path

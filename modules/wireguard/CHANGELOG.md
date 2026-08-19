@@ -63,8 +63,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   downstream consumer's own code) does. Verified the negative too: adding `_ =
   wireguard.handshake;` to the same standalone consumer reproduces the exact
   guard error. **Recommendation: keep the guard as-is.** No known consumer
-  ships this module's data plane on big-endian hardware (AXP's device agent
-  uses only the control-plane functions above, for which the guard already
+  ships this module's data plane on big-endian hardware (the one device-agent
+  consumer uses only the control-plane functions above, for which the guard already
   never fires); rewriting the wire boundary now would be exactly the "rewrite
   the crypto data plane for a target nobody ships it on" trade this module has
   already declined elsewhere. `zig build portable-wireguard-linux32` fails on

@@ -200,7 +200,7 @@ rebuild?" before committing to a 2-3 minute wait.
 | `kmod-netem` | `sch_netem` | its own top-level package, NOT under the `kmod-sched-*` namespace |
 | `kmod-sched-flower` | `cls_flower` | separate package, own .ko |
 | `kmod-sched-act-police` | `act_police` | the tc suite's "filter action list" test chains a u32 filter into a policer action; not part of sched-core |
-| `kmod-ifb` | `ifb.ko` | future S2 edge-shaper work |
+| `kmod-ifb` | `ifb.ko` | edge-shaper work |
 | `kmod-veth` | `veth.ko` | netns-style topologies |
 
 How those names were established — three checks, no guessing:
@@ -457,10 +457,10 @@ everywhere it can run at all.
 Both pinned in `scripts/vm/manifest.sh` with exact URLs and checksums,
 verified after every download — a mismatch deletes the partial file and
 aborts loudly rather than booting something unverified. `scripts/vm/
-fetch-images.sh` prefers an existing local copy of the OpenWRT image
-(`~/workspace/axp/DEV/vm-openwrt/`) over re-downloading 126 MB this dev
-machine already has, but the download path is exercised and works from a
-fresh clone too (this is only a fast-path, not the only path).
+fetch-images.sh` will prefer an existing local copy of the OpenWRT image over
+re-downloading 126 MB when `VM_OPENWRT_LOCAL_REUSE` points at one, but that is
+empty by default and the download path is what a fresh clone takes (the reuse
+is only a fast-path, not the only path).
 
 Neither image is ever committed — see the repo's `.gitignore`
 (`scripts/vm/images/`, `scripts/vm/work/`). That covers the provisioned

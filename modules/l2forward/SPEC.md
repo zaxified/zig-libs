@@ -100,7 +100,7 @@ in the steady state, and it was ours.)
 What is still **not** closed here: a transient forwarding loop among PEs during
 control-plane reconvergence, when the member sets of different PEs disagree.
 That needs a loop-free BUM distribution tree and a reverse-path-forwarding
-check, which are **control-plane** computations (the S1b `loopfree-reconv` /
+check, which are **control-plane** computations (the `loopfree-reconv` /
 SPB-tree work), not something a per-frame forwarding table can assert. The
 always-correct data-plane backstop for that residue is `l2encap`'s **TTL**: a
 loop the control plane briefly allows dies after at most `initial_ttl` PE hops.
@@ -234,7 +234,7 @@ forward at line rate across N cores against ONE `Table` needs an external
 lock serialising the read path the kernel deliberately keeps parallel, which
 gives up exactly the throughput scaling `br_fdb_find_rcu` provides.
 
-**This module confirmed sits on the real S1b L2VPN data-plane path** (F1, the
+**This module confirmed sits on a real L2VPN data-plane path** (F1, the
 split-horizon fix, is what makes that concrete — this is not a hypothetical
 consumer), so the ceiling is worth stating rather than leaving implicit:
 
@@ -263,7 +263,7 @@ consumer), so the ceiling is worth stating rather than leaving implicit:
 ## Deliberately deferred (out of scope by design, not oversight)
 
 - **Designated-forwarder (DF) election** — which PE forwards BUM into a
-  multi-homed site; that is the separate S1b `df-elect` module, which the caller
+  multi-homed site; that is the separate `df-elect` module, which the caller
   consults before/around `forward`.
 - **Loop-free BUM distribution trees / reverse-path-forwarding check** — this
   module does simple ingress replication to the full member set; a pruned

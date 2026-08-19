@@ -13,7 +13,7 @@ by two facts:
 1. **Measured gap.** std's curve is portable pure-Zig (a fiat-crypto Montgomery
    field, no asm, no endomorphism, a generic windowed ladder), which the repo
    audit measured at **~16× ECDSA-P256 sign / ~9× verify slower than OpenSSL's
-   nistz256** (`~/CML/audit/modules/ctap2pin.md`, `perf/bignum-std.md`). That sits
+   nistz256** (measured in the internal deep audit, `ctap2pin` + bignum perf). That sits
    on the P2 internet-facing HTTPS-API hot path (JWT ES256 verify per request,
    TLS), on 2FA/WebAuthn (`ctap2pin`), `spake2plus`, and the P-256 suites of
    `hpke`/`voprf`/`mls`/`jwe` — all of which ride `std.crypto.ecc.P256`, and we

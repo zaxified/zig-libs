@@ -8,9 +8,9 @@
 # documented probe rather than a unit test or a repo-wide `check-*` step).
 #
 # For each of two targets (x86_64-linux-musl, and mips-linux-musleabi — a
-# big-endian MIPS32 target, the other one AXP originally measured), builds
-# via ./build.zig four executables that each perform the two call sites AXP
-# measured (one plaintext PUT upload, one plaintext GET + streamRemaining
+# big-endian MIPS32 target, the other one the consumer originally measured),
+# builds via ./build.zig four executables that each perform the two call sites
+# that consumer measured (one plaintext PUT upload, one plaintext GET + streamRemaining
 # fetch, both to an IP literal that refuses the connection — this probe
 # measures the LINKED BINARY, not a live exchange):
 #   - probe_before      through request()/putFile()             (TLS-capable, stripped)

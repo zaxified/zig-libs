@@ -78,7 +78,7 @@
 //! - **Consumer**: a dead-man-switch / scheduled-disclosure primitive
 //!   (encrypt a secret NOW, guarantee it becomes readable at/after a
 //!   known future WALL-CLOCK time without any single party holding the
-//!   key early) — this repo's S1b-adjacent "encrypted disclosure"
+//!   key early) — this repo's "encrypted disclosure"
 //!   surface, and the generic use case `drand/tlock`'s own README
 //!   documents (sealed bids, embargoed documents, voting).
 

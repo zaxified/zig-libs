@@ -86,8 +86,7 @@ Phase 1 designs two anchor paths and scaffolds toward the first:
 
 ## 5. The Fable-vs-Opus tier call — **this core is Opus, not Fable**
 
-This is the key deliverable. The matured Fable-tier heuristic
-(`~/CML/BACKLOG-todo.md`, `feedback_fable_tier_heuristic`) is: **a complete
+This is the key deliverable. The matured tier heuristic is: **a complete
 deterministic anchor pushes a task toward Opus; Fable is reserved for cores
 where self-consistent tests can pass while the code is subtly wrong** (no oracle
 catches it) — FHE noise budgets, a NIZK soundness argument with no checking

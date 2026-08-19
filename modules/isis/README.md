@@ -2,7 +2,7 @@
 
 A pure-Zig **IS-IS (ISO/IEC 10589) PDU codec** — encode *and* decode the wire
 format of the link-state routing protocol, including the **SPB (IEEE 802.1aq /
-RFC 6329)** control-plane TLVs the S1b fabric runs on. It is a codec only: it
+RFC 6329)** control-plane TLVs an SPB fabric runs on. It is a codec only: it
 turns byte buffers into typed PDUs/TLVs and back. There is **no state machine**
 here — no adjacency FSM, no LSP database, no flooding, no SPF; those consume
 this module.

@@ -7,8 +7,8 @@
 //! Modeled after Ongaro & Ousterhout, "In Search of an Understandable Consensus
 //! Algorithm" (extended version) — Figure 2 (state + RPCs), Figure 3 (safety
 //! properties), §5.2–§5.4 (election, replication, the election restriction and
-//! the Figure-8 commit rule). It runs INSIDE `netsim` exactly like the S1b
-//! fabric jewels: a `netsim.Protocol` consumer, a live invariant checker, a
+//! the Figure-8 commit rule). It runs INSIDE `netsim` exactly like this
+//! collection's other fabric protocols: a `netsim.Protocol` consumer, a live invariant checker, a
 //! deliberately-broken positive control, and a property/shrink/teeth harness.
 //!
 //! **Status: consensus-safety core IMPLEMENTED; gate flipped; full suite runs.**

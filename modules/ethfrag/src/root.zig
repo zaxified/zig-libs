@@ -5,7 +5,7 @@
 //! it, with strict overlap/duplicate/timeout rejection and hard resource bounds
 //! (the IP-fragmentation CVE playbook — teardrop, overlap, resource exhaustion —
 //! treated as adversarial input, not corner cases). Standalone codec, no network.
-//! Consumer: the S1b L2-over-WireGuard data plane. See ~/CML/S1B-scada-l2vpn-venture-plan.md.
+//! Consumer: an L2-over-WireGuard data plane.
 //!
 //! ## Wire format
 //! Every fragment is an 8-byte header followed by its payload slice:

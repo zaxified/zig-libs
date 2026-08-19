@@ -47,37 +47,30 @@
 # any doc sentence, because it is a build that either works or does not.
 # Read directly from the consuming repos' own build.zig graphs (2026-08-18):
 #
-#   - `~/workspace/axp/axp-core/build.zig` imports 30 zig-libs modules; AXP's
-#     device agent cross-compiles to static musl on big-endian MIPS32
-#     (`~/workspace/axp/docs/feasibility-mips.md`). Of those 30, 9 are
-#     explicitly commented "Host-side only ... NOT in the device agent's
-#     dependency graph" (the REST cluster `http`/`router`/`aaa-gate`/`cors`/
-#     `staticfiles`/`accesslog`/`validate`/`security-headers`) plus `mcp`
-#     (axp-mcp is a facade over axp-central's store, confirmed host-side by
-#     its own build.zig doc comment, not part of the device agent either).
+#   - A device agent that cross-compiles to static musl on big-endian MIPS32
+#     imports 30 modules. Of those 30, 9 are explicitly commented host-side
+#     only and NOT in the agent's dependency graph (the REST cluster
+#     `http`/`router`/`aaa-gate`/`cors`/`staticfiles`/`accesslog`/`validate`/
+#     `security-headers`) plus `mcp` (a facade over a host-side store).
 #     The other 21 gained `.linux32`: `sealedbox`, `hashdigest`, `framing`,
 #     `tar`, `icmp`, `dns`, `filestore`, `blobmsg`, `blobstore`, `l2disco`,
 #     `rawsock`, `uci`, `traceroute`, `probe`, `stun`, `sntp`, `procnet`,
-#     `netlink`, `conntrack`, `nl80211`, `wireguard`. Only modules AXP's own
-#     build.zig explicitly labels host-side were excluded; everything else
-#     compiles into the device agent's binary and was declared, per the
-#     asymmetry that over-declaring costs only CI time while under-declaring
-#     silently deletes coverage.
-#   - `~/workspace/bxp/bxp-core/build.zig` imports 12 zig-libs modules, and
-#     CI (`~/workspace/bxp/.github/workflows/ci.yml`) runs the whole test
-#     matrix including `windows-latest`; `bxp-gui-bridge` ships as
-#     `bxp-gui-bridge.dll` on Windows (`bxp-gui-bridge/build.zig`) and spawns
-#     `bxp-cli.exe` as a child on the same platform
-#     (`docs/dev/architecture/gui.md`, the `TerminateProcess` reap path). All
-#     12 gained `.windows`: `json5`, `diagnostics`, `decimal`, `numparse`,
-#     `minisign`, `procrun`, `mcp`, `encoding`, `csvstream`, `zipstream`,
-#     `tz`, `datefmt`.
+#     `netlink`, `conntrack`, `nl80211`, `wireguard`. Only modules that
+#     consumer's own build.zig labels host-side were excluded; everything else
+#     compiles into the agent's binary and was declared, per the asymmetry
+#     that over-declaring costs only CI time while under-declaring silently
+#     deletes coverage.
+#   - A second consumer imports 12 modules and runs its whole test matrix on
+#     `windows-latest`; its GUI bridge ships as a DLL on Windows and spawns a
+#     CLI child on the same platform. All 12 gained `.windows`: `json5`,
+#     `diagnostics`, `decimal`, `numparse`, `minisign`, `procrun`, `mcp`,
+#     `encoding`, `csvstream`, `zipstream`, `tz`, `datefmt`.
 #
 # `.linux32`'s real cross-compile query is `mips-linux-musl` +
-# `mips32,soft_float` (AXP's own probe query, ath79 24Kc has no FPU) --
-# corrected from an earlier `musleabihf` guess, which would have silently
-# picked a hard-float ABI AXP's hardware cannot run. `.windows` is unchanged,
-# `x86_64-windows-gnu`.
+# `mips32,soft_float` (that consumer's own probe query; an ath79 24Kc has no
+# FPU) -- corrected from an earlier `musleabihf` guess, which would have
+# silently picked a hard-float ABI the hardware cannot run. `.windows` is
+# unchanged, `x86_64-windows-gnu`.
 #
 # Kept from before the consumer read: `qr`/`qrscan` declare `.wasm32` (the
 # task's own static-footprint use case, both pass); `reconcilable` declares
@@ -85,7 +78,8 @@
 # compiling ... not just claimed" -- a self-reported build, not bare prose,
 # both pass); `procrun` and `diskusage`'s SPEC-based declarations turned out
 # to be independently corroborated by the consumer read above (`procrun` is
-# literally one of bxp's 12; `diskusage` is not imported by either consumer,
+# literally one of the second consumer's 12; `diskusage` is not imported by
+# either consumer,
 # so its `.linux32` claim rests on its own SPEC's "builds and analyzes
 # cleanly" account, not a live import -- kept, but weaker evidence than the
 # rest of this file and flagged here as such). All pass.
@@ -106,4 +100,4 @@
 #     narrow in `transport.zig` also fires (11 errors total, same build).
 #
 # module	target	reason
-wireguard	linux32	modules/wireguard/src/handshake.zig:57: the module's own deliberate @compileError guard. DECISION, NOT DEBT: keep it. createInitiation/createResponse assign msg.type/sender_index/receiver_index (the only multi-byte ints in the wire structs) natively and MAC over asBytes(&msg), so a big-endian host produces a self-consistent but non-interoperable handshake -- worse than a build failure. The guard's fix recipe is mechanically right but understates scope: 28 asBytes/memcpy sites treat struct layout as wire bytes (6 production, ~20 in the byte-exact KATs that anchor this module) and no production bytes->struct parser exists yet, so real support is a wire-boundary rewrite of the crypto data plane. Measured: a control-plane-only consumer (open/setDevice/keyFromBase64/AllowedIp.parse) cross-compiles clean for mips-linux-musl and never trips the guard -- Zig analyses handshake.zig only on an actual reference, which this module's own test forces and a consumer does not. AXP ships exactly that path; on OpenWRT the data plane is the kernel's. Revisit only if someone ships the userspace data plane big-endian.
+wireguard	linux32	modules/wireguard/src/handshake.zig:57: the module's own deliberate @compileError guard. DECISION, NOT DEBT: keep it. createInitiation/createResponse assign msg.type/sender_index/receiver_index (the only multi-byte ints in the wire structs) natively and MAC over asBytes(&msg), so a big-endian host produces a self-consistent but non-interoperable handshake -- worse than a build failure. The guard's fix recipe is mechanically right but understates scope: 28 asBytes/memcpy sites treat struct layout as wire bytes (6 production, ~20 in the byte-exact KATs that anchor this module) and no production bytes->struct parser exists yet, so real support is a wire-boundary rewrite of the crypto data plane. Measured: a control-plane-only consumer (open/setDevice/keyFromBase64/AllowedIp.parse) cross-compiles clean for mips-linux-musl and never trips the guard -- Zig analyses handshake.zig only on an actual reference, which this module's own test forces and a consumer does not. The device-agent consumer ships exactly that path; on OpenWRT the data plane is the kernel's. Revisit only if someone ships the userspace data plane big-endian.

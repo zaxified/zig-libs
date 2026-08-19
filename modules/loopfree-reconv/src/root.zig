@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! loopfree-reconv — loop-free reconvergence transitions for a link-state fabric.
 //!
-//! The #1 jewel of the S1b fabric (see ~/CML/S1B-scada-l2vpn-venture-plan.md §5):
+//! Built for an encrypted L2VPN fabric over WireGuard:
 //! during convergence, nodes hold inconsistent FIBs and a transient forwarding loop
 //! on an L2 overlay is a broadcast storm. This module computes an ordered-FIB / RPF
 //! transition schedule so that no transient loop can form, verified in `netsim` with

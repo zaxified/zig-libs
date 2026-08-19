@@ -98,7 +98,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   private decls, `dialPlain` and `dialTls` (split out of its former single
   body), and those two existing entry points still go through `dialConn`
   exactly as before.
-  - **Why:** a consumer (AXP, a device agent on an 8 MB router overlay)
+  - **Why:** a consumer (a device agent on an 8 MB router overlay)
     measured `http.Client` at **+351 000 B (+49%) on x86-64
     musl/ReleaseSmall and +607 200 B on big-endian MIPS32** for two
     plaintext one-shot operations (a `putFile` upload, a `request` +
@@ -117,7 +117,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     when unused.
   - **Measured:** `modules/http/sizeprobe/` (a standalone probe, not wired
     into `zig build` — see its README) builds static `ReleaseSmall`
-    executables performing the same two call sites AXP measured, once
+    executables performing the same two call sites that consumer measured, once
     through the TLS-capable entry points and once through the new
     plaintext-only ones: **324 888 B saved on x86-64-linux-musl** (within
     1 KB of the 325 760 B predicted for "the TLS reference" alone) and

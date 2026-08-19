@@ -44,14 +44,14 @@
 //! the non-CRT private op mod n, and the public op mod n) is routed through the
 //! sibling `montint` module — a full-radix-2^64, Montgomery-resident,
 //! constant-time modexp that is ~3× faster than `std.crypto.ff` on the portable
-//! path (the deep audit measured `ff` at ~29× OpenSSL for the CRT sign; see
-//! `~/CML/audit/modules/rsa.md`). `ff` is retained for key derivation, the CRT
+//! path (the internal deep audit measured `ff` at ~29× OpenSSL for the CRT
+//! sign). `ff` is retained for key derivation, the CRT
 //! recombination arithmetic (Garner), reductions, and all serialization; only
 //! the exponentiation primitive moved. The `montint` moduli + Montgomery
 //! constants are precomputed ONCE per key at construction and carried on the
 //! key (`MontParams`), so no per-operation setup cost is paid.
 //!
-//! SECURITY (audit F2/F3, see `~/CML/audit/modules/rsa.md`): the CRT private op
+//! SECURITY (internal audit F2/F3): the CRT private op
 //! (`privateOpCrt`) now carries both fault- and side-channel countermeasures.
 //! F3 (Bellcore/BDL): every CRT private op re-encrypts the recovered `m` and
 //! checks `m^e ≡ c (mod n)`, returning `error.FaultDetected` on mismatch rather

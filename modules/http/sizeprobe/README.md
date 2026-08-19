@@ -9,7 +9,7 @@ proves cannot be a `zig build test-http` assertion.
 
 ## What this proves, and how
 
-AXP (a device-agent consumer on an 8 MB router overlay) measured
+A consumer — a device agent on an 8 MB router overlay — measured
 `http.Client` at +351 000 B on x86-64 musl/ReleaseSmall and +607 200 B on
 big-endian MIPS32 for two plaintext one-shot operations — a `putFile` upload
 and a `request` + `streamRemaining` fetch, both to an IP literal, no TLS. A
@@ -29,10 +29,10 @@ client for a binary that only calls the plaintext entry points. `request`/
 what they always cost — TLS included.
 
 `run.sh` builds, for two targets (x86_64-linux-musl and mips-linux-musleabi
-— big-endian MIPS32, the second target AXP measured), two pairs of static
+— big-endian MIPS32, the second target that consumer measured), two pairs of static
 `ReleaseSmall` executables via `build.zig`:
 
-- `probe_before.zig` — the two AXP call sites through `request`/`putFile`
+- `probe_before.zig` — the consumer's two call sites through `request`/`putFile`
   (the original, TLS-capable entry points every existing caller still uses).
 - `probe_after.zig` — the same two call sites through `requestPlain`/
   `putFilePlain` (the new split).
@@ -45,7 +45,7 @@ necessarily come from different builds of the same source.
 
 ## Last measured numbers (2026-08-18, zig 0.16.0)
 
-| target | probe_before | probe_after | delta | AXP's real-agent delta |
+| target | probe_before | probe_after | delta | the real agent's delta |
 |---|---:|---:|---:|---:|
 | x86_64-linux-musl | 490 408 B | 165 520 B | **324 888 B** | 351 000 B (+49%, fuller agent) |
 | mips-linux-musleabi (BE MIPS32) | 923 904 B | 238 576 B | **685 328 B** | 607 200 B (fuller agent) |
@@ -53,8 +53,8 @@ necessarily come from different builds of the same source.
 The x86_64 delta (324 888 B) lands within 1 KB of the 325 760 B the earlier
 attribution measurement predicted for "the TLS reference" alone — strong
 confirmation this split removes exactly that cost and nothing else. The MIPS
-delta is larger in this isolated two-call-site probe than in AXP's real
-agent because AXP's agent carries substantial non-HTTP code that dilutes the
+delta is larger in this isolated two-call-site probe than in the real
+agent, because that agent carries substantial non-HTTP code that dilutes the
 same absolute TLS cost into a smaller percentage; the mechanism is identical.
 
 `nm -C zig-out/<target>/bin/probe_after_syms` reports **zero** matches for

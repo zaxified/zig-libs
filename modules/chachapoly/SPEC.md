@@ -95,7 +95,7 @@ module promises `m` is zeroed, so the delegated failure path re-adds the
 `delegate_max_bytes` and `aead_delegate_max` are guarded by a test-build path
 witness (`chacha_path` / `aead_path`) that asserts which engine each length was
 routed to; a mis-routing is otherwise byte-invisible. `wide_min_groups` has
-**no** such witness — see the audit note in `~/CML/20260808-zig-libs-audit/`.
+**no** such witness — flagged as such by the internal audit.
 
 ## Poly1305 — lane-parallel above a threshold, std's scalar core below it
 

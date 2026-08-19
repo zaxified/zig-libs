@@ -44,7 +44,7 @@
 //! reports 1500 — the interface's own MTU, silently wrong; `probe` still
 //! finds 1300, and marks it `blackhole = true`.**
 //!
-//! ## Surface, and what the AXP proposal's shape did not survive
+//! ## Surface, and what the original proposal's shape did not survive
 //!
 //! `query`/`probe` and `Result{ mtu, source, blackhole, iface_mtu }` are
 //! close to the proposal's suggested surface, with three changes. `probe`
@@ -88,8 +88,8 @@
 //!
 //! Provenance: clean-room from RFC 1191 (IPv4 PMTUD) / RFC 8201 (IPv6 PMTUD)
 //! / RFC 4443 §3.2 (Packet Too Big) and `ip(7)`/`ipv6(7)`'s
-//! `IP_MTU_DISCOVER`/`IP_MTU` documentation. AXP's own prior ~25-line
-//! implementation (same organization, not a third-party project) was read
+//! `IP_MTU_DISCOVER`/`IP_MTU` documentation. A prior in-house ~25-line
+//! implementation (our own code, not a third-party project) was read
 //! as the starting point for `query` and is superseded by this module — see
 //! this file's own NOTICE-equivalent note in SPEC.md; no root `NOTICE` entry
 //! applies (no third-party source studied or ported). Design method for
@@ -186,7 +186,7 @@ const ipv6_header_len: u16 = 40;
 /// and DF set".
 const v4_frag_needed_code: u8 = 4;
 
-/// RFC 863 discard port — matches AXP's own approach: nothing needs to be
+/// RFC 863 discard port — matches the prior in-house approach: nothing needs to be
 /// listening, the datagram only exists to nudge PMTUD and is never expected
 /// to be delivered to an application.
 const control_port: u16 = 9;

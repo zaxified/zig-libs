@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! liveness-hyst — BFD-like link-liveness estimator with hysteresis.
 //!
-//! The #3 jewel of the S1b fabric (see ~/CML/S1B-scada-l2vpn-venture-plan.md §5):
+//! Built for an encrypted L2VPN fabric over WireGuard:
 //! WireGuard has no fast liveness and internet paths (LTE/satellite) flap, so a naive
 //! BFD timer turns a degraded link into fabric-wide oscillation. This estimator combines
 //! echo-probe timing with jitter/loss statistics (`latency-stats`) and Babel-style metric

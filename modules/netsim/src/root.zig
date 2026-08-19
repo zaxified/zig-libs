@@ -14,7 +14,7 @@
 //!
 //! This is the VOPR methodology proven in `kv`, generalized from a single store
 //! to a network. It is the harness that model-checks fabric algorithms
-//! (loop-free reconvergence, DF-election, liveness) and serves the axp fleet-sim;
+//! (loop-free reconvergence, DF-election, liveness) and serves a fleet simulator;
 //! the algorithms themselves are separate consumer modules that plug in a
 //! `Protocol` (step/handler + invariant) — netsim bakes in no fabric specifics.
 //!

@@ -31,8 +31,8 @@ goes one step further: there is **no clock seam**, injected or otherwise.
 `tick`, `enqueueAfter`, `finish` and every `RollbackTimer` method take the
 instant as a parameter. Reasons, in order of weight:
 
-1. **Both real consumers already own a loop.** The S1b control plane and the S2
-   shaper each run an existing event loop (`pollworker`, a netlink socket
+1. **Both real consumers already own a loop.** An L2VPN control plane and an
+   edge shaper each run an existing event loop (`pollworker`, a netlink socket
    loop). A reconciler that owned a thread would be a second scheduler to
    synchronise with, and every apply it performs would have to cross back to
    the loop thread that owns the netlink/WireGuard handles anyway. Owning a
@@ -189,7 +189,8 @@ The two semantics that are design decisions rather than mechanics:
   returns `.too_late` and leaves the timer to fire. The alternative (a late
   confirm cancels the rollback) races an in-flight rollback against a
   confirmation, leaving the device in a state neither side believes it is in.
-  Fail closed, toward the known-good config. This is why S1b can use it: the
+  Fail closed, toward the known-good config. This is why a remote-edge consumer
+  can use it: the
   confirmation channel is the very path the change might have severed, so a
   confirmation *arriving late* is exactly the signal that something is wrong.
 - **`.expired` fires exactly once.** A rollback is not generally idempotent —
@@ -284,7 +285,7 @@ One test, one property — which is what a mutation is supposed to show.
 
 - A `Reconciler` that owns several key *kinds* (upstream's manager/controller
   split). Today each kind is its own `Reconciler` instance with its own `Ctx`;
-  that is sufficient for S1b and S2 and avoids type erasure. Revisit only if a
+  that is sufficient for both consumers and avoids type erasure. Revisit only if a
   consumer needs cross-kind ordering.
 - Optional per-key metrics (time-in-queue, reconcile duration). Deliberately
   absent: it would require a clock inside the module (§2). If wanted, the

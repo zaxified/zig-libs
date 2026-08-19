@@ -119,7 +119,7 @@ points — the same mechanism that already gives HTTP/2 (`connectH2c`, its own
 entry point `dialConn` never calls) its zero cost when unused.
 
 **Measured saving** (`modules/http/sizeprobe/`, static `ReleaseSmall`, the
-same two call sites as the AXP measurement above):
+same two call sites as the consumer measurement above):
 
 | target | before (TLS-capable entry points) | after (plaintext-only entry points) | delta |
 |---|---:|---:|---:|

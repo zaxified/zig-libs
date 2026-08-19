@@ -14,7 +14,7 @@ This module **composes** existing AEADs — it implements no cipher or MAC. The
 it is never reused under one key; the sequence counter is monotonic and refuses
 to wrap; the receiver runs a sliding-window replay filter; and the
 caller-supplied `aad` cryptographically pins each record to its context (tenant
-/ I-SID / channel), the isolation binding for the S1b per-tenant L2VPN case.
+/ I-SID / channel), the isolation binding for the per-tenant L2VPN case.
 
 **Every guarantee above is per-record, not per-stream.** There is no
 end-of-stream marker in the wire format — a truncated transport silently
