@@ -29,6 +29,28 @@
 //! Reflective dispatch (`jsonStringify`, `format`, anything reached through
 //! `std.testing.refAllDecls`) needs no special case: those declarations are
 //! public, so they get referenced here like any other.
+//!
+//! ## What a reference does and does not analyse — measured, not assumed
+//!
+//! Taking a reference analyses a *non-generic* body completely, including code
+//! in branches no call would take. It cannot analyse a generic body at all,
+//! because a generic function has no body until it is instantiated. Measured on
+//! 0.16 over five shapes of deliberate error, reference vs. call:
+//!
+//! | error sits in                              | `_ = &f` | a real call |
+//! |--------------------------------------------|----------|-------------|
+//! | the body, top level                        | caught   | caught      |
+//! | a runtime `if` branch                      | caught   | caught      |
+//! | an `inline for` over a `comptime T`'s fields | missed | caught      |
+//! | a body taking `anytype`                    | missed   | caught      |
+//! | a branch selected by a `comptime` parameter| missed   | caught      |
+//!
+//! So this step's claim is exactly: **every non-generic public declaration is
+//! analysed.** 171 of the collection's 9603 public functions (1.8%) are generic
+//! and stay outside it; they are analysed whenever some test instantiates them,
+//! and not at all when none does. Upstream has the same observation open as
+//! ziglang/zig#22953. Narrowing the claim is deliberate — a step that says it
+//! covers those 171 would be the very thing this file exists to prevent.
 
 const std = @import("std");
 

@@ -330,7 +330,7 @@ pub fn build(b: *std.Build) void {
 
     // Gate for the "a body nothing references is never analysed" class — see
     // the `force_mod` block in pass 2 for what it compiles and why.
-    const check_pubfn_reach = b.step("check-pubfn-reach", "Analyse every public declaration, including the ones no test reaches");
+    const check_pubfn_reach = b.step("check-pubfn-reach", "Analyse every non-generic public declaration, including the ones no test reaches");
 
     // Pass 1: create each module so inter-module deps can be wired in pass 2.
     var mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
