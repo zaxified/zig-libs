@@ -74,6 +74,11 @@ pub const ecMul = precompiles.ecMul;
 pub const ecPairing = precompiles.ecPairing;
 pub const ecPairingCheck = precompiles.ecPairingCheck;
 pub const PrecompileError = precompiles.PrecompileError;
+/// `ecPairing`/`ecPairingCheck` allocate, so their error set is WIDER than
+/// `PrecompileError`. Re-exported because a caller who names one of those two
+/// functions in their own signature otherwise has to know that the convenient
+/// top-level alias next to it is the wrong, narrower one.
+pub const EcPairingError = precompiles.EcPairingError;
 
 // Part 6 — Groth16 zkSNARK verifier, re-exported at the top level (see
 // groth16.zig's module doc comment):
