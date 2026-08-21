@@ -328,6 +328,10 @@ pub fn build(b: *std.Build) void {
         "Only build tests whose name contains this substring (repeatable)",
     ) orelse &.{};
 
+    // Gate for the "a body nothing references is never analysed" class — see
+    // the `force_mod` block in pass 2 for what it compiles and why.
+    const check_pubfn_reach = b.step("check-pubfn-reach", "Analyse every public declaration, including the ones no test reaches");
+
     // Pass 1: create each module so inter-module deps can be wired in pass 2.
     var mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
     for (module_list) |m| {
@@ -397,6 +401,38 @@ pub fn build(b: *std.Build) void {
         // Per-module test step: `zig build test-<name>`.
         const one = b.step(b.fmt("test-{s}", .{m.name}), b.fmt("Test the {s} module", .{m.name}));
         one.dependOn(&run.step);
+
+        // `check-pubfn-reach`: compile a second root over the SAME module graph
+        // whose only job is to take a reference to every public declaration.
+        //
+        // ⭐ This is not redundant with `unit_tests` above, and that is the
+        // entire point. Zig analyses a function body only when something
+        // references it, so `unit_tests` — an `addTest` over the module root —
+        // walks straight past any `pub fn` no test calls. Proven by mutation on
+        // 2026-08-21: a deliberate type error injected into `nftables`
+        // `RuleBuilder.reject()` compiled AND linked a 20 MB test binary that
+        // exited 0 green, while this step went red on it.
+        //
+        // Measured the same day: 403 of 9626 public functions are unreachable
+        // from any test, spread over 106 modules, 90 of them declared in a
+        // module's own `root.zig` — i.e. on the published surface. All 403
+        // compile today, so this is a standing guard over a risk surface, not a
+        // burn-down of known breakage.
+        //
+        // Compile-only, like `check-testonly`'s probes: the forcing test has no
+        // behaviour to run, and a reference that reaches code generation has
+        // already proven what the step exists to prove.
+        const force_mod = b.createModule(.{
+            .root_source_file = b.path("scripts/force-pubfn-reach.zig"),
+            .target = target,
+            .optimize = if (m.heavy) heavy_optimize else optimize,
+        });
+        force_mod.addImport("m", test_root);
+        const force_tests = b.addTest(.{
+            .name = b.fmt("force-{s}", .{m.name}),
+            .root_module = force_mod,
+        });
+        check_pubfn_reach.dependOn(&force_tests.step);
     }
 
     // `zig build check-portable` — compile every module's TESTS for each

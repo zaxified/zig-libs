@@ -207,6 +207,15 @@ harness_smoke() {
     step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
     step "check-portable-table" zig build check-portable-table
+    # The class no other gate can see: Zig analyses a function body only when
+    # something references it, so a `pub fn` no test reaches can be outright
+    # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626
+    # public functions are unreachable from any test, across 106 modules, 90 of
+    # them on a module's own published `root.zig` surface. Demonstrated by
+    # mutation the same day -- a deliberate type error in an unreachable
+    # `nftables` function compiled, linked and ran green under `test-nftables`,
+    # and only this step went red on it.
+    step "check-pubfn-reach" zig build check-pubfn-reach
     # ~30s when modules/http/src/Client.zig (or anything it pulls in) changed
     # content, near-instant otherwise (Zig's own cache). See the script's
     # header for what it checks and why one target, not two.
@@ -1033,6 +1042,15 @@ cmd_changed() {
     # compiled for either.
     step "check-portable" zig build check-portable
     step "check-portable-table" zig build check-portable-table
+    # The class no other gate can see: Zig analyses a function body only when
+    # something references it, so a `pub fn` no test reaches can be outright
+    # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626
+    # public functions are unreachable from any test, across 106 modules, 90 of
+    # them on a module's own published `root.zig` surface. Demonstrated by
+    # mutation the same day -- a deliberate type error in an unreachable
+    # `nftables` function compiled, linked and ran green under `test-nftables`,
+    # and only this step went red on it.
+    step "check-pubfn-reach" zig build check-pubfn-reach
 
     # `modules/http/sizeprobe/` proves requestPlain/requestStreamingPlain/
     # putFilePlain never pull in TLS (CONVENTIONS.md-adjacent doc on
@@ -1129,6 +1147,15 @@ cmd_all() {
     step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
     step "check-portable-table" zig build check-portable-table
+    # The class no other gate can see: Zig analyses a function body only when
+    # something references it, so a `pub fn` no test reaches can be outright
+    # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626
+    # public functions are unreachable from any test, across 106 modules, 90 of
+    # them on a module's own published `root.zig` surface. Demonstrated by
+    # mutation the same day -- a deliberate type error in an unreachable
+    # `nftables` function compiled, linked and ran green under `test-nftables`,
+    # and only this step went red on it.
+    step "check-pubfn-reach" zig build check-pubfn-reach
     # See cmd_changed's comment on this same step for what it checks.
     step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
