@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — Re-exported `VerifyKey`. It is the type of `Config.idp_key`, a field on
+  this module's own public config, but `xmldsig` was imported privately here, so a consumer
+  had to take a direct dependency on `xmldsig` just to name the value it hands to `saml`.
+  Additive. Found by writing `example/main.zig` — the first code to configure this module
+  from outside.
+
 - **2026-08-06** — Security audit: five findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Verified: against real
   `xmlsec1`-produced XML-Encryption and OpenSSL-signed fixtures.
