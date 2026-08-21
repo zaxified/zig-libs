@@ -117,10 +117,16 @@ pub const Transport = struct {
 
         var l_be: [2]u8 = undefined;
         std.mem.writeInt(u16, &l_be, @intCast(m.len), .big);
-        try self.tx.cipher.encryptWithAd("", &l_be, out[0..length_frame_len]);
+        self.tx.cipher.encryptWithAd("", &l_be, out[0..length_frame_len]) catch |e| return switch (e) {
+            error.BufferTooSmall => error.BufferWrongSize,
+            else => |other| other,
+        };
         self.tx.maybeRotate();
 
-        try self.tx.cipher.encryptWithAd("", m, out[length_frame_len..]);
+        self.tx.cipher.encryptWithAd("", m, out[length_frame_len..]) catch |e| return switch (e) {
+            error.BufferTooSmall => error.BufferWrongSize,
+            else => |other| other,
+        };
         self.tx.maybeRotate();
     }
 
@@ -129,7 +135,10 @@ pub const Transport = struct {
     /// caller must then read `l + 16` more bytes for (`recvMessage`).
     pub fn recvLength(self: *Transport, lc: *const [length_frame_len]u8) RecvError!u16 {
         var l_be: [2]u8 = undefined;
-        try self.rx.cipher.decryptWithAd("", lc, &l_be);
+        self.rx.cipher.decryptWithAd("", lc, &l_be) catch |e| return switch (e) {
+            error.BufferTooSmall => error.BufferWrongSize,
+            else => |other| other,
+        };
         self.rx.maybeRotate();
         return std.mem.readInt(u16, &l_be, .big);
     }
@@ -138,7 +147,10 @@ pub const Transport = struct {
     /// hand (`c.len == out.len + 16`).
     pub fn recvMessage(self: *Transport, c: []const u8, out: []u8) RecvError!void {
         if (c.len != out.len + 16) return error.BufferWrongSize;
-        try self.rx.cipher.decryptWithAd("", c, out);
+        self.rx.cipher.decryptWithAd("", c, out) catch |e| return switch (e) {
+            error.BufferTooSmall => error.BufferWrongSize,
+            else => |other| other,
+        };
         self.rx.maybeRotate();
     }
 };

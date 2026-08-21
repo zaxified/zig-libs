@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-21** — **Breaking:** `pemDecode` gained `error.LabelTooLong`, and
+  `PemDecodeError`/`KeyPemError`/`CertError` name it. The caller-supplied label length was
+  an `std.debug.assert` guarding two `bufPrint(...) catch unreachable` calls, so in
+  `ReleaseFast`/`ReleaseSmall` an over-long label reached the `unreachable` instead of
+  being rejected. `pemBlockCount` has the same precondition and is unchanged — it returns
+  a plain `usize`, so fixing it needs an API decision, not a patch.
+
 - **2026-08-13** — Test-only, neither BREAKING nor BEHAVIOURAL: `jws.zig` gained a
   seam test proving `generateKeyPair`'s `entropy.fill` draw is actually read
   (two keys from the same `io` must differ) and that the production

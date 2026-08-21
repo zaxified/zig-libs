@@ -165,14 +165,14 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 ad: []const u8,
                 plaintext: []const u8,
                 out: []u8,
-            ) error{NonceExhausted}!void {
+            ) error{ NonceExhausted, BufferTooSmall }!void {
                 if (!self.has_key) {
-                    std.debug.assert(out.len >= plaintext.len);
+                    if (out.len < plaintext.len) return error.BufferTooSmall;
                     @memcpy(out[0..plaintext.len], plaintext);
                     return;
                 }
                 if (self.n == max_nonce) return error.NonceExhausted;
-                std.debug.assert(out.len >= plaintext.len + TAGLEN);
+                if (out.len < plaintext.len + TAGLEN) return error.BufferTooSmall;
                 Cipher.encrypt(
                     out[0..plaintext.len],
                     out[plaintext.len..][0..TAGLEN],
@@ -196,16 +196,16 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 ad: []const u8,
                 ciphertext: []const u8,
                 out: []u8,
-            ) error{ DecryptionFailed, NonceExhausted }!void {
+            ) error{ DecryptionFailed, NonceExhausted, BufferTooSmall }!void {
                 if (!self.has_key) {
-                    std.debug.assert(out.len >= ciphertext.len);
+                    if (out.len < ciphertext.len) return error.BufferTooSmall;
                     @memcpy(out[0..ciphertext.len], ciphertext);
                     return;
                 }
                 if (ciphertext.len < TAGLEN) return error.DecryptionFailed;
                 if (self.n == max_nonce) return error.NonceExhausted;
                 const msg_len = ciphertext.len - TAGLEN;
-                std.debug.assert(out.len >= msg_len);
+                if (out.len < msg_len) return error.BufferTooSmall;
                 Cipher.decrypt(
                     out[0..msg_len],
                     ciphertext[0..msg_len],
@@ -304,8 +304,9 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 self: *SymmetricState,
                 plaintext: []const u8,
                 out: []u8,
-            ) error{NonceExhausted}!void {
-                std.debug.assert(out.len == plaintext.len + self.cipher_state.overhead());
+            ) error{ NonceExhausted, BufferTooSmall }!void {
+                if (out.len != plaintext.len + self.cipher_state.overhead())
+                    return error.BufferTooSmall;
                 try self.cipher_state.encryptWithAd(&self.h, plaintext, out);
                 self.mixHash(out);
             }
@@ -319,9 +320,11 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 self: *SymmetricState,
                 ciphertext: []const u8,
                 out: []u8,
-            ) error{ DecryptionFailed, NonceExhausted }!void {
-                std.debug.assert(ciphertext.len >= self.cipher_state.overhead());
-                std.debug.assert(out.len == ciphertext.len - self.cipher_state.overhead());
+            ) error{ DecryptionFailed, NonceExhausted, BufferTooSmall }!void {
+                if (ciphertext.len < self.cipher_state.overhead())
+                    return error.BufferTooSmall;
+                if (out.len != ciphertext.len - self.cipher_state.overhead())
+                    return error.BufferTooSmall;
                 try self.cipher_state.decryptWithAd(&self.h, ciphertext, out);
                 self.mixHash(ciphertext);
             }

@@ -521,7 +521,7 @@ fn collectDnsNames(
 
 // ── PEM ─────────────────────────────────────────────────────────────────────
 
-pub const PemDecodeError = error{ OutOfMemory, MissingPemBlock, InvalidPem };
+pub const PemDecodeError = error{ OutOfMemory, MissingPemBlock, InvalidPem, LabelTooLong };
 
 const max_pem_label_len = 48;
 
@@ -554,7 +554,10 @@ fn writePem(w: *std.Io.Writer, label: []const u8, b64_text: []const u8) std.Io.W
 /// Decode the FIRST `-----BEGIN <label>-----` block in `text` (other labels
 /// are skipped). Caller owns the returned DER bytes.
 pub fn pemDecode(gpa: Allocator, label: []const u8, text: []const u8) PemDecodeError![]u8 {
-    std.debug.assert(label.len <= max_pem_label_len);
+    // Not an assert: the label is caller-supplied and both `bufPrint`s below
+    // end in `catch unreachable`. An assert compiles out in ReleaseFast and
+    // ReleaseSmall, so an over-long label would reach that `unreachable`.
+    if (label.len > max_pem_label_len) return error.LabelTooLong;
     var begin_buf: [max_pem_label_len + 16]u8 = undefined;
     var end_buf: [max_pem_label_len + 16]u8 = undefined;
     const begin = std.fmt.bufPrint(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
@@ -585,7 +588,7 @@ pub fn pemBlockCount(label: []const u8, text: []const u8) usize {
 
 // ── EC private key (RFC 5915) ───────────────────────────────────────────────
 
-pub const KeyPemError = error{ OutOfMemory, MissingPemBlock, InvalidPem, MalformedKey };
+pub const KeyPemError = error{ OutOfMemory, MissingPemBlock, InvalidPem, MalformedKey, LabelTooLong };
 
 /// Serialize a P-256 key pair as an openssl-compatible `EC PRIVATE KEY`
 /// PEM (RFC 5915: version 1, private scalar, curve OID, public point).
@@ -636,7 +639,7 @@ fn ecPrivateKeyFromDer(bytes: []const u8) (ReadError || error{MalformedKey})!Es2
 
 // ── certificate notAfter ────────────────────────────────────────────────────
 
-pub const CertError = error{ OutOfMemory, MissingPemBlock, InvalidPem, MalformedCertificate };
+pub const CertError = error{ OutOfMemory, MissingPemBlock, InvalidPem, MalformedCertificate, LabelTooLong };
 
 /// `notAfter` (epoch seconds, UTC) of the FIRST certificate in a PEM chain.
 /// Parsing is `std.crypto.Certificate` (independent of this file's encoder),

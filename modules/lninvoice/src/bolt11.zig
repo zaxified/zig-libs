@@ -394,7 +394,11 @@ pub fn decode(allocator: Allocator, invoice_str: []const u8) DecodeError!Invoice
     // ── signature ──
     const sig_bytes = try bitpack.quintetsToBytesStrict(allocator, data[sig_start..]);
     defer allocator.free(sig_bytes);
-    std.debug.assert(sig_bytes.len == 65); // structural: 104 quintets = 520 bits = 65 bytes exactly
+    // Invariant, not a bounds check: `data.len < 7 + 104` is rejected above and
+    // `sig_start = data.len - 104`, so this slice is exactly 104 quintets =
+    // 520 bits = 65 bytes. Safe to keep as an assert -- nothing here depends on
+    // it surviving ReleaseFast.
+    std.debug.assert(sig_bytes.len == 65);
     const sig_r = sig_bytes[0..32].*;
     const sig_s = sig_bytes[32..64].*;
     if (sig_bytes[64] > 3) return error.InvalidRecoveryId;
