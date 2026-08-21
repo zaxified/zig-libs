@@ -363,6 +363,10 @@ pub fn build(b: *std.Build) void {
         .makeFn = checkExampleDecls,
     });
     check_examples.dependOn(check_example_decls);
+    // Also reachable on its own: the flag/tree disagreement it catches has
+    // nothing to do with whether the examples compile, and it answers in
+    // milliseconds where the sweep takes minutes.
+    b.step("check-example-decls", "Check `.example` flags against the tree").dependOn(check_example_decls);
 
     // Pass 1: create each module so inter-module deps can be wired in pass 2.
     var mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
