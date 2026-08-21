@@ -99,10 +99,10 @@ const module_list = [_]Module{
     .{ .name = "icmp", .deps = &.{ "seqmap", "netaddr" } },
     .{ .name = "mcp" },
     .{ .name = "mcp-http", .deps = &.{ "router", "http", "mcp" } },
-    .{ .name = "coap" },
+    .{ .name = "coap", .example = true },
     .{ .name = "kv" },
     .{ .name = "kvtree", .deps = &.{"kv"} },
-    .{ .name = "blobmsg" },
+    .{ .name = "blobmsg", .example = true },
     .{ .name = "tar" },
     .{ .name = "latency-stats" },
     .{ .name = "pping" },
@@ -140,7 +140,7 @@ const module_list = [_]Module{
     .{ .name = "rsa", .deps = &.{"montint"}, .heavy = true },
     .{ .name = "blindrsa", .deps = &.{"rsa"} },
     .{ .name = "ssh", .deps = &.{"rsa"}, .heavy = true },
-    .{ .name = "netconf", .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"} },
+    .{ .name = "netconf", .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "nftables", .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "trie" },
     .{ .name = "fuzzysearch", .deps = &.{"trie"} },
@@ -161,9 +161,9 @@ const module_list = [_]Module{
     .{ .name = "bacnet", .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"} },
     .{ .name = "whois", .deps = &.{"netaddr"} },
     .{ .name = "uci" },
-    .{ .name = "mqtt" },
+    .{ .name = "mqtt", .example = true },
     .{ .name = "snmp", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "wireguard", .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" } },
+    .{ .name = "wireguard", .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" }, .example = true },
     .{ .name = "tc", .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "traceroute", .deps = &.{ "icmp", "netaddr", "latency-stats" } },
     .{ .name = "probe", .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
@@ -183,7 +183,7 @@ const module_list = [_]Module{
     .{ .name = "blobstore", .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .deps = &.{"netaddr"} },
     .{ .name = "diskusage" },
-    .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"} },
+    .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "procrun", .deps = &.{"argsafe"} },
     .{ .name = "dataset" },
     .{ .name = "tabular", .deps = &.{"dataset"} },
@@ -230,7 +230,7 @@ const module_list = [_]Module{
     .{ .name = "falcon" },
     .{ .name = "hqc", .heavy = true },
     .{ .name = "dtls", .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "tlsresume" },
+    .{ .name = "tlsresume", .example = true },
     .{ .name = "quic-crypto", .deps = &.{"chachapoly"} },
     .{ .name = "sandbox" },
     .{ .name = "bip340", .deps = &.{"k256"} },
@@ -495,6 +495,15 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             });
             example_mod.addImport(m.name, mod);
+            // Its declared `deps` too — they are published modules, so a real
+            // consumer can depend on them exactly as this example does. What
+            // an example must NOT get is `test_deps` or any private
+            // declaration, and it gets neither. `conntrack` and `wireguard`
+            // are the honest case: their own docs describe `netlink` as the
+            // shared transport a caller reaches for, so forcing them to
+            // re-export its attribute codec would invent API to satisfy a
+            // rule rather than a consumer.
+            for (m.deps) |dep| example_mod.addImport(dep, mods.get(dep).?);
             const example = b.addExecutable(.{
                 .name = b.fmt("example-{s}", .{m.name}),
                 .root_module = example_mod,
