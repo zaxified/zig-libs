@@ -131,6 +131,12 @@ pub const ConfigError = error{
     EmptyPsk,
     EmptyPskIdentity,
     NoCipherSuites,
+    /// `Config.cipher_suites` offers a suite this module cannot install keys
+    /// for. Both CCM suites are in that position on Zig 0.16, whose std ships
+    /// only a 13-byte-nonce CCM. Caught here rather than after a completed
+    /// handshake, where it used to surface as `error.UnsupportedSuite` from
+    /// `installApplicationKeys`.
+    UnsupportedSuite,
     /// `Config.hello_retry` was set with an empty `cookie_secret`: the
     /// cookie's MAC would be keyed by nothing, so anyone could mint one.
     EmptyCookieSecret,
@@ -279,7 +285,16 @@ pub const Config = struct {
     psk_identity: []const u8 = &.{},
     psk: []const u8 = &.{},
     /// Preference order, most-preferred first.
-    cipher_suites: []const CipherSuite = &.{.aes_128_ccm_8_sha256},
+    /// Defaults to AES-128-GCM, the one mandatory-to-implement TLS 1.3 suite.
+    /// It used to default to `.aes_128_ccm_8_sha256` -- the CoAP profile's
+    /// choice, and the obvious pick for this module's target consumer -- but
+    /// `suiteParams` returns null for both CCM suites, because 0.16 std ships
+    /// only a 13-byte-nonce CCM. So that default passed `validate`, completed a
+    /// handshake, and failed at `installApplicationKeys` with
+    /// `error.UnsupportedSuite`: a config that could never work, in the mode a
+    /// consumer was most likely to reach for. Name a CCM suite explicitly and
+    /// `validate` now says no immediately (see below).
+    cipher_suites: []const CipherSuite = &.{.aes_128_gcm_sha256},
 
     // ── certificate mode (RFC 8446 §4.4), all ADDITIVE / optional — see
     // this file's "certificate mode" section further down. Leaving every
@@ -350,6 +365,13 @@ pub const Config = struct {
     /// empty `psk` is still rejected.
     pub fn validate(self: Config) ConfigError!void {
         if (self.cipher_suites.len == 0) return error.NoCipherSuites;
+        // A suite with no `suiteParams` entry cannot have keys installed, so
+        // offering it is a config error, not a negotiation outcome. Rejecting
+        // it here instead of at `installApplicationKeys` is the difference
+        // between a bad config and a handshake that completes and then dies.
+        for (self.cipher_suites) |suite| {
+            if (suiteParams(suite) == null) return error.UnsupportedSuite;
+        }
         if (self.hello_retry) |hr| {
             // Both are security-load-bearing, and a zero-length value for
             // either yields a cookie that still LOOKS like a cookie: without

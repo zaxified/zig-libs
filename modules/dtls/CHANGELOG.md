@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-21** — **Breaking (in the direction of working):** `Config.cipher_suites` now
+  defaults to `.aes_128_gcm_sha256`, and `Config.validate` rejects any suite this module
+  cannot install keys for with the new `ConfigError.UnsupportedSuite`. The old default was
+  `.aes_128_ccm_8_sha256` — the CoAP profile's choice, and so the one a consumer was most
+  likely to inherit by omission — but `suiteParams` returns null for both CCM suites because
+  Zig 0.16's std ships only a 13-byte-nonce CCM. That config passed `validate`, completed a
+  handshake, and only then failed at `installApplicationKeys`. Nothing can have depended on
+  the old default: it could never complete a connection. Found by writing `example/main.zig`.
+
 - **2026-08-12** — **BREAKING:** `startHandshake` and `handleFlight` take a `dtls.Entropy`
   instead of a `std.Random`. `Entropy` is a two-armed tagged union —
   `.csprng` (production) and `.seeded_for_test` — so the entropy choice is
