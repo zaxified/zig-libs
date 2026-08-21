@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — Added `verify`, an alias for `bn254.groth16Verify`. It was already
+  reachable as `groth16.bn254.groth16Verify` (the namespace is re-exported), so this is
+  symmetry rather than a fix: the module published `Proof` and `VerifyingKey` but not the
+  one function that judges them, which sent a first-time consumer looking. Found by writing
+  `example/main.zig`.
+
 - **2026-08-14** — Docs-only: `SPEC.md` gained a `**Fuzz exemption:** EMIT-ONLY`
   entry — this module is the Groth16 PROVER (the verifier, and its fuzz
   coverage, live in the sibling `bn254` module); its own only byte-accepting

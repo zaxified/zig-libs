@@ -227,7 +227,7 @@ const module_list = [_]Module{
     .{ .name = "dnssec", .deps = &.{ "dns", "rsa" } },
     .{ .name = "dnp3", .deps = &.{"aeskw"} },
     .{ .name = "slhdsa", .heavy = true },
-    .{ .name = "falcon" },
+    .{ .name = "falcon", .example = true },
     .{ .name = "hqc", .heavy = true },
     .{ .name = "dtls", .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "tlsresume", .example = true },
@@ -247,14 +247,14 @@ const module_list = [_]Module{
     .{ .name = "bolt3", .deps = &.{"k256"} },
     .{ .name = "hpke", .deps = &.{ "p256", "chachapoly", "entropy" } },
     .{ .name = "adaptor", .deps = &.{ "bip340", "k256" } },
-    .{ .name = "frost", .deps = &.{ "bip340", "k256" } },
+    .{ .name = "frost", .deps = &.{ "bip340", "k256" }, .example = true },
     .{ .name = "oscore" },
     .{ .name = "spake2plus", .deps = &.{"p256"} },
     .{ .name = "ct25519" },
     .{ .name = "voprf", .deps = &.{"ct25519"} },
     .{ .name = "opaque", .deps = &.{ "voprf", "ct25519" } },
     .{ .name = "bulletproofs", .deps = &.{"ct25519"} },
-    .{ .name = "xmss", .heavy = true },
+    .{ .name = "xmss", .heavy = true, .example = true },
     .{ .name = "minisign", .deps = &.{"entropy"}, .heavy = true },
     .{ .name = "otp" },
     .{ .name = "ctap2pin", .deps = &.{"p256"} },
@@ -283,20 +283,20 @@ const module_list = [_]Module{
     .{ .name = "ecvrf", .deps = &.{"ct25519"} },
     .{ .name = "fss" },
     .{ .name = "pir", .deps = &.{"fss"} },
-    .{ .name = "bfv", .deps = &.{"entropy"} },
-    .{ .name = "groth16", .deps = &.{"bn254"} },
+    .{ .name = "bfv", .deps = &.{"entropy"}, .example = true },
+    .{ .name = "groth16", .deps = &.{"bn254"}, .example = true },
     // Not heavy: the parameter derivation + all 30 tests run in 5s under
     // -Dstrict-debug, well under the >15s threshold (and a Debug compile of
     // this module is ~1s against ~27s at ReleaseSafe, so marking it heavy
     // would cost more than it saves).
-    .{ .name = "poseidon", .deps = &.{ "bn254", "bls12_381" }, .test_deps = &.{"testkit"} },
+    .{ .name = "poseidon", .deps = &.{ "bn254", "bls12_381" }, .test_deps = &.{"testkit"}, .example = true },
     // Not heavy, despite the inverse S-box (72 multiplies per element per
     // half-round). Measured serially on this host: strict-Debug compile ~8.5s
     // + run ~1.0s = 9.5s, under the >15s threshold — and a ReleaseSafe compile
     // of this module is ~46s (comptime SHAKE256 derivation + heavily unrolled
     // field code), so marking it heavy would cost 5x what it saves.
     .{ .name = "rescue" },
-    .{ .name = "tfhe", .deps = &.{"entropy"}, .heavy = true },
+    .{ .name = "tfhe", .deps = &.{"entropy"}, .heavy = true, .example = true },
     .{ .name = "montint", .heavy = true },
     .{ .name = "chachapoly" },
     .{ .name = "k256" },

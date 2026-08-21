@@ -109,6 +109,32 @@ pub fn main() !void {
         error.SignatureVerificationFailed => return error.WrongRejectionReason,
     }
 
+    // ── persisting the private key ───────────────────────────────────────
+    // The signing key serialises to the standard 1281-byte encoding, and
+    // that blob decodes back into a `SecretKey` which can recompute the
+    // public key — enough for an auditor to confirm a stored key matches a
+    // published one.
+    //
+    // It is NOT enough to sign again. `signRandomized` wants a `SigningKey`
+    // (the NTRU basis plus its ffSampling tree) and only `generateKeyPair`
+    // produces one; the wire encoding deliberately omits the `G` half of the
+    // basis, and nothing here recovers it. So an appliance that restarts has
+    // to keep the generated key in memory for its whole life, or rotate.
+    const stored: [falcon.SecretKey.encoded_length]u8 = pair.signing_key.toSecretKeyBytes();
+    const reloaded = falcon.SecretKey.fromBytes(&stored) catch |err| switch (err) {
+        error.InvalidSecretKey => {
+            std.debug.print("stored private key is corrupt\n", .{});
+            return;
+        },
+    };
+    const recomputed = reloaded.publicKey() catch |err| switch (err) {
+        // `f` not invertible mod q means the stored bytes are not a Falcon
+        // basis at all, however well-formed they looked.
+        error.InvalidSecretKey => return error.StoredKeyIsNotABasis,
+    };
+    if (!std.mem.eql(u8, &recomputed.toBytes(), &rom_key)) return error.StoredKeyDoesNotMatchRom;
+    std.debug.print("stored private key re-derives the published public key\n", .{});
+
     // ── interop with the reference implementation's envelope ─────────────
     // Falcon's NIST API ships one blob: 2-byte big-endian signature length,
     // nonce, message, signature. `openNistSignedMessage` reads that layout

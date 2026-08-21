@@ -55,7 +55,8 @@ pub const fft = @import("fft.zig");
 pub const msm = @import("msm.zig");
 pub const r1cs = @import("r1cs.zig");
 pub const qap = @import("qap.zig");
-pub const prover = @import("prover.zig");
+pub const bn254 = @import("bn254");
+const prover = @import("prover.zig");
 pub const snarkjs_export = @import("snarkjs_export.zig");
 
 // Convenience re-exports.
@@ -67,6 +68,15 @@ pub const Term = r1cs.Term;
 pub const ProvingKey = prover.ProvingKey;
 pub const VerifyingKey = prover.VerifyingKey;
 pub const Proof = prover.Proof;
+/// Check a proof against its verifying key and public inputs — the property
+/// this module's first paragraph names as what a correct proof *is*.
+///
+/// It lives in `bn254` and consumes exactly the two types re-exported above.
+/// It was always reachable as `groth16.bn254.groth16Verify`, since the whole
+/// namespace is re-exported; spelling it here is symmetry, not rescue —
+/// publishing a proof type without the one function that judges it made a
+/// consumer go looking. Found by writing `example/main.zig`.
+pub const verify = bn254.groth16Verify;
 pub const ToxicWaste = prover.ToxicWaste;
 pub const KeyPair = prover.KeyPair;
 pub const Randomizers = prover.Randomizers;
