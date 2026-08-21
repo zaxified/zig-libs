@@ -342,6 +342,11 @@ reference, not a re-explanation of everything the README already covers.
    (§8). Nothing needs adding to the root `CHANGELOG.md`: it carries no per-module index
    (removed 2026-08-14, §8).
 
+7. If either trigger in §7.2 fires — 25 or more `pub fn`, or a public `init` plus three
+   or more `self` methods — write `modules/<name>/example/main.zig` and set
+   `.example = true` on the `module_list` entry. `zig build example-<name>` builds it
+   alone; `zig build check-example-decls` fails if the flag and the file disagree.
+
 `modules/_template/README.md` carries the complete step-by-step list, including the two
 things this narrative does not repeat because a gate owns them: the root README catalog row
 + module count (`zig build check-catalog`) and the module's own anchor grade in its SPEC.md.
@@ -386,6 +391,51 @@ the distinctions that make the skips correct.
   golden byte-comparison, the verbose-skip convention); it is wired via `test_deps`, so it
   never reaches the module a consumer imports (§6.1). Anything that legitimately differs per
   module — netns setup, capability probing, fake clocks — stays hand-rolled locally.
+
+### 7.2 Consumer examples — when a module must ship one
+
+A module's own tests live inside the module. They therefore cannot notice the one class
+of defect that only shows up at the import boundary: a type needed to call the API that
+the root never re-exports, an error nobody outside can name, a config default that does
+not work, memory handed to a caller with no way to release it. Nothing in a green test
+run says the published API is *sufficient*.
+
+`modules/<name>/example/main.zig` is that missing consumer, and `zig build check-examples`
+compiles it against the **published** module — declared `deps` only, no `test_deps`, no
+private declarations. `zig build example-<name>` builds one on its own.
+`zig build check-example-decls` keeps the tree and `module_list`'s `.example` flags in
+agreement, in both directions.
+
+**A module ships an example when either trigger fires:**
+
+* **Size — 25 or more `pub fn`.** Past that, the surface has an assembly order, and
+  assembly order is what an outside caller gets wrong first. Every defect this gate has
+  found so far was in a module over the threshold.
+* **State — a public `init` plus three or more methods on `self`.** Here the sequence of
+  calls *is* the API, however few functions there are, and a test that drives the sequence
+  from inside proves nothing about whether an outsider can.
+
+**Deliberately not a trigger: "the module allocates."** It fires on roughly half the
+collection, and the ownership contract it worries about is already provable from inside
+with `std.testing.allocator`. What is *not* provable from inside is a leak masked by an
+arena — a module whose own tests allocate from an `ArenaAllocator` cannot distinguish a
+function that frees its scratch from one that does not. That is a test-allocator problem,
+not an example problem; an example is an expensive way to reach it.
+
+**Equally not a trigger: "another module in this collection already imports it."** That
+was the original rule and it selected against complexity — it exempted the ten largest
+modules here, because size and in-collection reuse correlate. This workspace ships source
+to integrators it never meets; an in-repo importer is a late check on the loudest
+mistakes, not a substitute for the first outside caller.
+
+Write the example as the smallest *coherent* thing a real caller does — parse a real
+frame, drive a handshake to completion, run the state machine through its states — not a
+tour of every function. If the module allocates, allocate from `std.heap.DebugAllocator`
+and panic on `.leak`, so the example is also a leak detector. Handle at least one error by
+name. `modules/l2disco/example/main.zig` is the reference for register and length.
+
+If writing the example needs something the module does not publish, that is the finding:
+fix the module, do not reach around the boundary.
 
 ### 7.1 Optimize modes — what each CI lane proves
 
