@@ -46,11 +46,22 @@
 //! | a branch selected by a `comptime` parameter| missed   | caught      |
 //!
 //! So this step's claim is exactly: **every non-generic public declaration is
-//! analysed.** 171 of the collection's 9603 public functions (1.8%) are generic
-//! and stay outside it; they are analysed whenever some test instantiates them,
-//! and not at all when none does. Upstream has the same observation open as
-//! ziglang/zig#22953. Narrowing the claim is deliberate — a step that says it
-//! covers those 171 would be the very thing this file exists to prevent.
+//! analysed.** Upstream has the same observation open as ziglang/zig#22953.
+//! Narrowing the claim is deliberate — a step that claimed the generic half
+//! would be the very thing this file exists to prevent.
+//!
+//! Measured over the same walk this file performs: **418 distinct generic
+//! bodies**, reachable by 529 qualified public paths, in 67 modules. (A `grep`
+//! over signatures lands far short of that — 124 of the 418 have a multi-line
+//! signature and 111 of the paths are aliases onto a body already counted.)
+//! They are analysed whenever some test instantiates them, and not at all when
+//! none does — so the question that matters is not how many are generic but how
+//! many nothing instantiates. On 2026-08-21 that was **six**, in four modules,
+//! each confirmed by injecting a deliberate error and watching the module's own
+//! suite stay green. All six now have a test that instantiates them, and the
+//! same injection turns every one of those suites red. Re-measure when the
+//! collection grows; the technique is a `@compileLog` probe in the body, since
+//! a probe in a generic body only fires once something instantiates it.
 
 const std = @import("std");
 

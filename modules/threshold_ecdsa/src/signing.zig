@@ -631,6 +631,16 @@ pub fn identifyAbortCulprit(shares: []const root.KeyShare, transcripts: anytype)
 
 // ── tests ────────────────────────────────────────────────────────────────
 
+test "identifyAbortCulprit is analysed even though nothing may call it" {
+    // It is `noreturn` and panics -- a documented GG20 stub -- so no test can
+    // call it. It is also generic (`transcripts: anytype`), which means a
+    // reference does not analyse its body either and `check-pubfn-reach` is
+    // blind to it. `@TypeOf` of a call instantiates the body for its return
+    // type without emitting the call, which is the only way to keep a broken
+    // edit to this function from compiling green.
+    try std.testing.expectEqual(noreturn, @TypeOf(identifyAbortCulprit(&[_]root.KeyShare{}, {})));
+}
+
 const testing = std.testing;
 
 /// Fast test-only ring-Pedersen aux params: derives a genuine (if not

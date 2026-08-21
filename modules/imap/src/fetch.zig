@@ -624,6 +624,22 @@ const Fx = struct {
     }
 };
 
+test "Message.find returns the first item carrying the requested tag" {
+    const t = std.testing;
+    const items = [_]Item{
+        .{ .uid = 7 },
+        .{ .rfc822_size = 4096 },
+        .{ .internal_date = "17-Jul-1996 02:44:25 -0700" },
+    };
+    const m: Message = .{ .seq = 1, .items = &items };
+
+    try t.expectEqual(@as(?u32, 7), m.uid());
+    try t.expectEqual(@as(i64, 4096), m.find(.rfc822_size).?.rfc822_size);
+    try t.expectEqualStrings("17-Jul-1996 02:44:25 -0700", m.find(.internal_date).?.internal_date);
+    // A tag that was not fetched is absent, not a default.
+    try t.expectEqual(@as(?Item, null), m.find(.flags));
+}
+
 test "RFC 9051 §7.5.2: the ENVELOPE example" {
     var f: Fx = undefined;
     f.init("(\"Wed, 17 Jul 1996 02:23:25 -0700 (PDT)\" " ++

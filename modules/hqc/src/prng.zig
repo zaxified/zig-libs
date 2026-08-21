@@ -393,6 +393,48 @@ test "barrettReduce matches naive mod for a broad sweep" {
     }
 }
 
+test "the *Vec wrappers equal sampler + writeSupportToVector on the same stream" {
+    const t = std.testing;
+    const P = params.hqc128;
+    const seed = "vec-wrapper differential seed";
+
+    // Rejection sampler: wrapper vs. the two steps it wraps.
+    {
+        var xof_a = Xof.init(seed);
+        var got = [_]u64{0} ** ((P.n + 63) / 64);
+        sampleFixedWeightRejectionVec(&xof_a, P.n, P.nMu(), P.rejectionThreshold(), P.omega, &got);
+
+        var xof_b = Xof.init(seed);
+        var support: [P.omega]u32 = undefined;
+        sampleFixedWeightRejection(&xof_b, P.n, P.nMu(), P.rejectionThreshold(), P.omega, &support);
+        var want = [_]u64{0} ** ((P.n + 63) / 64);
+        writeSupportToVector(P.omega, &support, &want);
+
+        try t.expectEqualSlices(u64, &want, &got);
+        var w: u32 = 0;
+        for (got) |word| w += @popCount(word);
+        try t.expectEqual(@as(u32, P.omega), w);
+    }
+
+    // Biased sampler: same shape.
+    {
+        var xof_a = Xof.init(seed);
+        var got = [_]u64{0} ** ((P.n + 63) / 64);
+        sampleFixedWeightBiasedVec(&xof_a, P.n, P.omega_r, &got);
+
+        var xof_b = Xof.init(seed);
+        var support: [P.omega_r]u32 = undefined;
+        sampleFixedWeightBiased(&xof_b, P.n, P.omega_r, &support);
+        var want = [_]u64{0} ** ((P.n + 63) / 64);
+        writeSupportToVector(P.omega_r, &support, &want);
+
+        try t.expectEqualSlices(u64, &want, &got);
+        var w: u32 = 0;
+        for (got) |word| w += @popCount(word);
+        try t.expectEqual(@as(u32, P.omega_r), w);
+    }
+}
+
 test "sampleFixedWeightRejection: exact weight, no duplicates, in range" {
     const t = std.testing;
     const P = params.hqc128;

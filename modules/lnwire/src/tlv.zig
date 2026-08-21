@@ -263,6 +263,29 @@ fn hexBytes(allocator: Allocator, hex: []const u8) ![]u8 {
     return out;
 }
 
+test "truncated integers: minimal length, minimal encoding, round-trip" {
+    const t = std.testing;
+    // BOLT#1 truncated integers drop leading zero bytes; zero encodes empty.
+    try t.expectEqual(@as(usize, 0), truncatedLen(u64, 0));
+    try t.expectEqual(@as(usize, 1), truncatedLen(u64, 0xff));
+    try t.expectEqual(@as(usize, 2), truncatedLen(u64, 0x0100));
+    try t.expectEqual(@as(usize, 8), truncatedLen(u64, std.math.maxInt(u64)));
+
+    var buf: [8]u8 = undefined;
+    try t.expectEqualSlices(u8, &.{}, try encodeTruncated(u64, 0, &buf));
+    try t.expectEqualSlices(u8, &.{0xff}, try encodeTruncated(u64, 0xff, &buf));
+    try t.expectEqualSlices(u8, &.{ 0x01, 0x00 }, try encodeTruncated(u64, 0x0100, &buf));
+
+    // The encoding is exactly what the decoder accepts, at every width.
+    for ([_]u64{ 0, 1, 0xff, 0x0100, 0x123456, std.math.maxInt(u64) }) |v| {
+        const enc = try encodeTruncated(u64, v, &buf);
+        try t.expectEqual(v, try decodeTruncated(u64, enc));
+    }
+
+    // `out` shorter than the minimal encoding is refused, not truncated.
+    try t.expectError(error.BufferTooSmall, encodeTruncated(u64, 0x0100, buf[0..1]));
+}
+
 test "hexBytes self-check" {
     const allocator = testing.allocator;
     const b = try hexBytes(allocator, "fd00fd");
