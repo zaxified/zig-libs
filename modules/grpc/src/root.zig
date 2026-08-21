@@ -83,6 +83,21 @@ pub const statusToError = status_mod.toError;
 pub const statusFromError = status_mod.fromError;
 /// The status a non-200 HTTP response maps to.
 pub const statusFromHttpStatus = status_mod.fromHttpStatus;
+/// Parse a `grpc-status` trailer value. Strict on purpose — a leading `+`,
+/// surrounding whitespace or trailing junk is `null`, never a silent `.ok`.
+///
+/// Published because `frame.Deframer` invites a consumer to read this
+/// envelope from somewhere else (gRPC-Web, a proxy, a capture), and such a
+/// consumer then has to read the status trailer too. Leaving this inside the
+/// module made every one of them reimplement the one validation this module
+/// considers safety-critical. Found by writing `example/main.zig`: the first
+/// code ever to consume this module from outside could not do it.
+pub const statusParse = status_mod.parse;
+/// `grpc-message` is percent-encoded on the wire; these are that codec.
+pub const statusDecodeMessage = status_mod.decodeMessage;
+pub const statusDecodeMessageAlloc = status_mod.decodeMessageAlloc;
+pub const statusEncodeMessage = status_mod.encodeMessage;
+pub const statusEncodedMessageLen = status_mod.encodedMessageLen;
 
 // ── framing ─────────────────────────────────────────────────────────────────
 

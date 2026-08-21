@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-21** — Published `statusParse` and the `grpc-message` percent-codec
+  (`statusDecodeMessage`, `statusDecodeMessageAlloc`, `statusEncodeMessage`,
+  `statusEncodedMessageLen`). They existed and were `pub` inside the module, but the
+  root re-exported only `Status`, `StatusError`, `statusToError`, `statusFromError`
+  and `statusFromHttpStatus` — so a consumer taking `frame.Deframer`'s own invitation
+  to read this envelope from elsewhere (gRPC-Web, a proxy, a capture) could not parse
+  the status trailer without reimplementing the one validation this module calls
+  safety-critical: never letting a leading `+`, whitespace or trailing junk read as
+  `.ok`. Additive; nothing existing changes. Found by writing `example/main.zig` —
+  the first code ever to consume this module from outside.
+
 - **2026-08-13** — **BEHAVIOURAL, not breaking** (server) — response metadata that cannot be
   written now turns the RPC `INTERNAL` (13) instead of passing as OK. `Call.finish`
   wrote `initial_md` / `trailing_md` with a bare `catch {}`, so once the
