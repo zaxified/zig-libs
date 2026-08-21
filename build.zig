@@ -24,6 +24,19 @@ const Module = struct {
     /// exists to tell `scripts/test.sh` what to re-test, and a change to
     /// testkit must re-test everything whose tests use it.
     test_deps: []const []const u8 = &.{},
+    /// This module ships `example/main.zig`: a consumer binary built by
+    /// `zig build check-examples` against the PUBLISHED module — `deps` only,
+    /// no `test_deps`, no reach into anything the module does not export.
+    ///
+    /// Declared here rather than probed from the tree so that both directions
+    /// are checkable: an example that stops building is red, and so is one
+    /// added without saying so (or a declaration whose file is gone).
+    ///
+    /// Scope survey 2026-08-21: 78 of 229 modules already have an in-repo
+    /// consumer, and 93 more have a public surface under 25 functions (a third
+    /// of those anchored to published vectors, where an internal vector test
+    /// beats an example). The 57 with neither get one, widest surface first.
+    example: bool = false,
     /// Compute-bound: the tests are dominated by arithmetic (pairings,
     /// hash-based signatures, FHE, scrypt, RSA), which an unoptimized Debug
     /// build makes ~5x slower — `bls12_381` alone goes 35s -> 182s. These
@@ -155,7 +168,7 @@ const module_list = [_]Module{
     .{ .name = "traceroute", .deps = &.{ "icmp", "netaddr", "latency-stats" } },
     .{ .name = "probe", .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
     .{ .name = "pathmtu", .deps = &.{ "icmp", "netaddr" } },
-    .{ .name = "l2disco", .deps = &.{"netaddr"} },
+    .{ .name = "l2disco", .deps = &.{"netaddr"}, .example = true },
     .{ .name = "upstream", .deps = &.{ "resilience", "probe" } },
     .{ .name = "jwt", .deps = &.{ "http", "router", "p256" } },
     .{ .name = "rbac" },
@@ -332,6 +345,11 @@ pub fn build(b: *std.Build) void {
     // the `force_mod` block in pass 2 for what it compiles and why.
     const check_pubfn_reach = b.step("check-pubfn-reach", "Analyse every non-generic public declaration, including the ones no test reaches");
 
+    // `check-examples` — build `modules/<name>/example/main.zig` as a real
+    // consumer binary. See the `example` block in pass 2 for the one class it
+    // covers that no test in this repository can.
+    const check_examples = b.step("check-examples", "Build each module's example as an outside consumer would");
+
     // Pass 1: create each module so inter-module deps can be wired in pass 2.
     var mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
     for (module_list) |m| {
@@ -433,6 +451,56 @@ pub fn build(b: *std.Build) void {
             .root_module = force_mod,
         });
         check_pubfn_reach.dependOn(&force_tests.step);
+
+        // ⭐ The one class nothing else here can cover: **is the published API
+        // sufficient to do the job?**
+        //
+        // Every test in this collection lives in the same file as the code it
+        // tests, so it reads private declarations freely and its build carries
+        // `test_deps` the published module never gets. It can therefore pass
+        // while a function is unreachable from outside, a type needed to call
+        // it is not exported, or an error is not nameable. That is not a
+        // hypothetical either — it is exactly how `diskusage` shipped two
+        // functions that did not compile: nothing had ever imported it.
+        //
+        // So the example is wired to `mod` — the module `b.addModule`
+        // published, with `deps` only and NO `test_deps`, exactly what
+        // `@import("<name>")` hands a downstream project.
+        //
+        // Demonstrated on `l2disco`, 2026-08-21, by dropping the `pub` from a
+        // type its public API needs: `zig build test-l2disco` stayed green
+        // (the tests are inside, they never cross the boundary) and so did
+        // `check-pubfn-reach` (the declaration still exists, it is just no
+        // longer public, so the walk silently covers less) — only this step
+        // went red. The three gates are complements, not overlaps.
+        //
+        // Compile-only, like every other check step here: nothing installs or
+        // runs the artifact, so the build passes `-fno-emit-bin` and this does
+        // NOT cover consumer-BINARY facts — link-time reach (a MIPS `PC16`
+        // fixup overflows at ±128 KB) or what a module drags in (`http`'s
+        // TLS-vs-plaintext split was 334 KB). That class needs a linked,
+        // measured binary; `scripts/check-http-sizeprobe.sh` is the one place
+        // this repository does it today.
+        //
+        // Scoped, not universal (survey 2026-08-21): 78 of 229 modules already
+        // have an in-repo consumer, so their boundary is exercised by real
+        // code; 93 more have a public surface under 25 functions, a third of
+        // them anchored to published test vectors, where an internal vector
+        // test is strictly stronger than an example. The 57 that are left have
+        // no consumer AND a wide surface — those get examples, largest first.
+        if (m.example) {
+            const example_mod = b.createModule(.{
+                .root_source_file = b.path(b.fmt("modules/{s}/example/main.zig", .{m.name})),
+                .target = target,
+                .optimize = optimize,
+            });
+            example_mod.addImport(m.name, mod);
+            const example = b.addExecutable(.{
+                .name = b.fmt("example-{s}", .{m.name}),
+                .root_module = example_mod,
+            });
+            check_examples.dependOn(&example.step);
+        }
     }
 
     // `zig build check-portable` — compile every module's TESTS for each

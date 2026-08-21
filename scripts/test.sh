@@ -216,6 +216,12 @@ harness_smoke() {
     # `nftables` function compiled, linked and ran green under `test-nftables`,
     # and only this step went red on it.
     step "check-pubfn-reach" zig build check-pubfn-reach
+    # The one class no test here can cover: is the PUBLISHED API sufficient to
+    # do the job? Every test lives in the file it tests, so it reads private
+    # declarations and its build carries `test_deps` a consumer never gets.
+    # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
+    # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
+    step "check-examples" zig build check-examples
     # ~30s when modules/http/src/Client.zig (or anything it pulls in) changed
     # content, near-instant otherwise (Zig's own cache). See the script's
     # header for what it checks and why one target, not two.
@@ -1051,6 +1057,12 @@ cmd_changed() {
     # `nftables` function compiled, linked and ran green under `test-nftables`,
     # and only this step went red on it.
     step "check-pubfn-reach" zig build check-pubfn-reach
+    # The one class no test here can cover: is the PUBLISHED API sufficient to
+    # do the job? Every test lives in the file it tests, so it reads private
+    # declarations and its build carries `test_deps` a consumer never gets.
+    # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
+    # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
+    step "check-examples" zig build check-examples
 
     # `modules/http/sizeprobe/` proves requestPlain/requestStreamingPlain/
     # putFilePlain never pull in TLS (CONVENTIONS.md-adjacent doc on
@@ -1156,6 +1168,12 @@ cmd_all() {
     # `nftables` function compiled, linked and ran green under `test-nftables`,
     # and only this step went red on it.
     step "check-pubfn-reach" zig build check-pubfn-reach
+    # The one class no test here can cover: is the PUBLISHED API sufficient to
+    # do the job? Every test lives in the file it tests, so it reads private
+    # declarations and its build carries `test_deps` a consumer never gets.
+    # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
+    # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
+    step "check-examples" zig build check-examples
     # See cmd_changed's comment on this same step for what it checks.
     step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
