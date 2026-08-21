@@ -72,6 +72,7 @@ pub fn xirr(a: std.mem.Allocator, d: Dataset, spec: XirrSpec) Error!f64 {
     const vi = try mustIndex(d, spec.value_col);
 
     var cfs: std.ArrayList(Cashflow) = .empty;
+    defer cfs.deinit(a);
     for (d.rows) |r| {
         const fl = r[fi].asFloat() orelse 0;
         if (@abs(fl) > 1e-6) {
@@ -224,6 +225,7 @@ pub fn quantileSorted(sorted: []const f64, q: f64) f64 {
 /// Quantile of an unsorted slice (sorts a copy).
 pub fn quantile(a: std.mem.Allocator, xs: []const f64, q: f64) Error!f64 {
     const s = try a.dupe(f64, xs);
+    defer a.free(s);
     std.mem.sort(f64, s, {}, f64lt);
     return quantileSorted(s, q);
 }
@@ -291,6 +293,7 @@ pub const RiskSpec = struct {
 pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Dataset {
     const ri = try mustIndex(d, spec.ret_col);
     const rvals = try a.alloc(f64, d.rows.len);
+    defer a.free(rvals);
     for (d.rows, 0..) |r, i| rvals[i] = r[ri].asFloat() orelse 0;
 
     const sq = @sqrt(spec.periods_per_year);
@@ -304,6 +307,7 @@ pub fn riskMetrics(a: std.mem.Allocator, d: Dataset, spec: RiskSpec) Error!Datas
     const downside = if (rvals.len > 0) @sqrt(dsum / @as(f64, @floatFromInt(rvals.len))) * sq else 0;
 
     const rsorted = try a.dupe(f64, rvals);
+    defer a.free(rsorted);
     std.mem.sort(f64, rsorted, {}, f64lt);
     const q05 = quantileSorted(rsorted, 0.05);
     const var95 = -q05;
@@ -639,6 +643,7 @@ pub fn xirrPrecise(a: std.mem.Allocator, d: Dataset, spec: XirrPreciseSpec) Erro
     const vi = try mustIndex(d, spec.value_col);
 
     var cfs: std.ArrayList(Cashflow) = .empty;
+    defer cfs.deinit(a);
     for (d.rows) |r| {
         const fl = r[fi].asFloat() orelse 0;
         if (@abs(fl) > 1e-6) {
@@ -855,6 +860,7 @@ pub const ParametricRiskSpec = struct {
 pub fn parametricRisk(a: std.mem.Allocator, d: Dataset, spec: ParametricRiskSpec) Error!Dataset {
     const ri = try mustIndex(d, spec.ret_col);
     const rvals = try a.alloc(f64, d.rows.len);
+    defer a.free(rvals);
     for (d.rows, 0..) |r, i| rvals[i] = r[ri].asFloat() orelse 0;
 
     const m = mean(rvals);
@@ -1120,6 +1126,47 @@ const Fix = struct {
         return self.arena.allocator();
     }
 };
+
+test "scratch allocations are released (std.testing.allocator, not an arena)" {
+    // ⭐ Every other test here runs on `Fix`, whose allocator is an
+    // ArenaAllocator: it bulk-frees on `deinit`, so a function that never
+    // released its scratch looked identical to one that did. `xirr`,
+    // `xirrPrecise`, `quantile`, `riskMetrics` and `parametricRisk` all leaked
+    // under any other allocator, which is what a long-lived consumer uses.
+    // Found by writing `example/main.zig` against a DebugAllocator.
+    //
+    // `std.testing.allocator` fails the test on an outstanding allocation, so
+    // this is the one test in the file that can see the class at all.
+    const a = testing.allocator;
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "flow", .type = .float },
+        .{ .name = "v", .type = .float },
+        .{ .name = "ret", .type = .float },
+    };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2023-01-01" }, .{ .float = 100 }, .{ .float = 100 }, .{ .float = 0.01 } },
+        &.{ .{ .text = "2023-07-01" }, .{ .float = 0 }, .{ .float = 150 }, .{ .float = -0.02 } },
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 0 }, .{ .float = 200 }, .{ .float = 0.03 } },
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+
+    _ = try xirr(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v" });
+    _ = try xirrPrecise(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v" });
+    _ = try quantile(a, &[_]f64{ 0.3, 0.1, 0.2 }, 0.5);
+
+    // The returned one-row Datasets are the caller's (`oneRow` allocates
+    // columns, the row and the row slice); freeing them here leaves only the
+    // scratch these functions allocate internally, which is the point.
+    const rm = try riskMetrics(a, d, .{ .ret_col = "ret" });
+    a.free(rm.rows[0]);
+    a.free(rm.rows);
+    a.free(rm.columns);
+    const pr = try parametricRisk(a, d, .{ .ret_col = "ret" });
+    a.free(pr.rows[0]);
+    a.free(pr.rows);
+    a.free(pr.columns);
+}
 
 test "xirr: ~100% on a doubling over one year" {
     var f = Fix.init();

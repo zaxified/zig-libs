@@ -75,7 +75,7 @@ const module_list = [_]Module{
     // strings, the hyphen is fine (cf. the community's "known-folders").
     .{ .name = "security-headers", .deps = &.{ "router", "http" } },
     .{ .name = "cors", .deps = &.{ "router", "http" } },
-    .{ .name = "metrics", .deps = &.{ "router", "http" } },
+    .{ .name = "metrics", .deps = &.{ "router", "http" }, .example = true },
     .{ .name = "validate", .deps = &.{ "router", "http", "netaddr" }, .example = true },
     .{ .name = "openapi", .deps = &.{ "router", "http" } },
     .{ .name = "health", .deps = &.{ "router", "http" } },
@@ -125,13 +125,13 @@ const module_list = [_]Module{
     .{ .name = "netsim" },
     .{ .name = "loopfree-reconv", .deps = &.{ "netsim", "spf-ect" } },
     .{ .name = "df-elect", .deps = &.{"netsim"} },
-    .{ .name = "raft", .deps = &.{"netsim"} },
+    .{ .name = "raft", .deps = &.{"netsim"}, .example = true },
     .{ .name = "liveness-hyst", .deps = &.{ "netsim", "latency-stats" } },
-    .{ .name = "loopix", .deps = &.{ "netsim", "sphinx" } },
+    .{ .name = "loopix", .deps = &.{ "netsim", "sphinx" }, .example = true },
     .{ .name = "lockfree" },
     .{ .name = "workerpool", .deps = &.{"lockfree"} },
     .{ .name = "shardstore", .deps = &.{"kvtree"} },
-    .{ .name = "writebehind", .deps = &.{ "ramcache", "workerpool", "jobqueue", "kvtree" } },
+    .{ .name = "writebehind", .deps = &.{ "ramcache", "workerpool", "jobqueue", "kvtree" }, .example = true },
     .{ .name = "pagecache", .deps = &.{ "kvtree", "ramcache" } },
     .{ .name = "tsdb", .deps = &.{"kvtree"} },
     .{ .name = "entropy" },
@@ -151,11 +151,11 @@ const module_list = [_]Module{
     .{ .name = "tcplan", .deps = &.{"tc"} },
     .{ .name = "modbus" },
     .{ .name = "iec104", .test_deps = &.{"testkit"} },
-    .{ .name = "fleetsim", .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"} },
+    .{ .name = "fleetsim", .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "smtp", .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "imap", .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "iec61850", .deps = &.{"xml"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "iec62351", .deps = &.{ "x509", "rsa" } },
+    .{ .name = "iec62351", .deps = &.{ "x509", "rsa" }, .example = true },
     .{ .name = "s7comm", .test_deps = &.{"testkit"} },
     .{ .name = "enip", .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
     .{ .name = "bacnet", .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"} },
@@ -180,15 +180,15 @@ const module_list = [_]Module{
     .{ .name = "aeskw" },
     .{ .name = "jwe", .deps = &.{ "rsa", "p256", "aescbc", "aeskw" }, .example = true },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" } },
-    .{ .name = "blobstore", .deps = &.{"hashdigest"} },
+    .{ .name = "blobstore", .deps = &.{"hashdigest"}, .example = true },
     .{ .name = "procnet", .deps = &.{"netaddr"} },
     .{ .name = "diskusage" },
     .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "procrun", .deps = &.{"argsafe"} },
     .{ .name = "dataset" },
-    .{ .name = "tabular", .deps = &.{"dataset"} },
+    .{ .name = "tabular", .deps = &.{"dataset"}, .example = true },
     .{ .name = "jsonshape", .deps = &.{"dataset"} },
-    .{ .name = "finstats", .deps = &.{"dataset"} },
+    .{ .name = "finstats", .deps = &.{"dataset"}, .example = true },
     .{ .name = "filestore" },
     .{ .name = "framing" },
     .{ .name = "datefmt" },
@@ -212,7 +212,7 @@ const module_list = [_]Module{
     .{ .name = "argsafe" },
     .{ .name = "sessions", .deps = &.{ "router", "http", "cookies", "ramcache", "entropy" } },
     .{ .name = "jobqueue", .deps = &.{"kv"} },
-    .{ .name = "reconcilable", .deps = &.{"resilience"} },
+    .{ .name = "reconcilable", .deps = &.{"resilience"}, .example = true },
     .{ .name = "llmclient", .deps = &.{"http"} },
     .{ .name = "rawsock", .deps = &.{"netaddr"} },
     .{ .name = "encoding" },
@@ -224,9 +224,9 @@ const module_list = [_]Module{
     .{ .name = "x509", .deps = &.{"rsa"} },
     .{ .name = "ocsp", .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
     .{ .name = "ocspcache", .deps = &.{ "ocsp", "http", "x509" } },
-    .{ .name = "dnssec", .deps = &.{ "dns", "rsa" } },
+    .{ .name = "dnssec", .deps = &.{ "dns", "rsa" }, .example = true },
     .{ .name = "dnp3", .deps = &.{"aeskw"} },
-    .{ .name = "slhdsa", .heavy = true },
+    .{ .name = "slhdsa", .heavy = true, .example = true },
     .{ .name = "falcon", .example = true },
     .{ .name = "hqc", .heavy = true },
     .{ .name = "dtls", .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .example = true },
@@ -238,12 +238,12 @@ const module_list = [_]Module{
     .{ .name = "bitcointx", .deps = &.{"bip340"} },
     .{ .name = "psbt", .deps = &.{ "bitcointx", "bitcoinscript" } },
     .{ .name = "bitcoinscript", .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" } },
-    .{ .name = "btcp2p", .deps = &.{"bitcointx"} },
+    .{ .name = "btcp2p", .deps = &.{"bitcointx"}, .example = true },
     .{ .name = "lnwire" },
-    .{ .name = "lninvoice", .deps = &.{ "bech32", "k256", "lnwire", "bip340" } },
-    .{ .name = "musig2", .deps = &.{ "bip340", "k256" } },
+    .{ .name = "lninvoice", .deps = &.{ "bech32", "k256", "lnwire", "bip340" }, .example = true },
+    .{ .name = "musig2", .deps = &.{ "bip340", "k256" }, .example = true },
     .{ .name = "sphinx", .deps = &.{"k256"} },
-    .{ .name = "bolt8", .deps = &.{ "noise", "k256" } },
+    .{ .name = "bolt8", .deps = &.{ "noise", "k256" }, .example = true },
     .{ .name = "bolt3", .deps = &.{"k256"} },
     .{ .name = "hpke", .deps = &.{ "p256", "chachapoly", "entropy" } },
     .{ .name = "adaptor", .deps = &.{ "bip340", "k256" } },
@@ -253,14 +253,14 @@ const module_list = [_]Module{
     .{ .name = "ct25519" },
     .{ .name = "voprf", .deps = &.{"ct25519"} },
     .{ .name = "opaque", .deps = &.{ "voprf", "ct25519" } },
-    .{ .name = "bulletproofs", .deps = &.{"ct25519"} },
+    .{ .name = "bulletproofs", .deps = &.{"ct25519"}, .example = true },
     .{ .name = "xmss", .heavy = true, .example = true },
-    .{ .name = "minisign", .deps = &.{"entropy"}, .heavy = true },
+    .{ .name = "minisign", .deps = &.{"entropy"}, .heavy = true, .example = true },
     .{ .name = "otp" },
     .{ .name = "ctap2pin", .deps = &.{"p256"} },
     .{ .name = "bls12_381", .deps = &.{"entropy"}, .heavy = true },
-    .{ .name = "bbs", .deps = &.{ "bls12_381", "entropy" } },
-    .{ .name = "coconut", .deps = &.{"bls12_381"}, .heavy = true },
+    .{ .name = "bbs", .deps = &.{ "bls12_381", "entropy" }, .example = true },
+    .{ .name = "coconut", .deps = &.{"bls12_381"}, .heavy = true, .example = true },
     .{ .name = "tlock", .deps = &.{ "bls12_381", "entropy" } },
     // `tlock` is a TEST-only dep: `ibe/src/kat_test.zig` drives `ibe`'s own
     // encrypt/decrypt through `ibe.Scheme` with drand's ciphersuite, to
@@ -273,16 +273,16 @@ const module_list = [_]Module{
     .{ .name = "decaf448", .deps = &.{"ed448"} },
     .{ .name = "paillier", .deps = &.{"montint"}, .heavy = true },
     .{ .name = "threshold_ecdsa", .deps = &.{ "paillier", "montint" }, .heavy = true },
-    .{ .name = "dkg", .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true },
+    .{ .name = "dkg", .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true, .example = true },
     .{ .name = "vdf", .deps = &.{"montint"} },
     .{ .name = "signal", .deps = &.{ "chachapoly", "ct25519", "entropy" } },
     .{ .name = "mls", .deps = &.{"hpke"}, .example = true },
-    .{ .name = "megolm", .deps = &.{ "aescbc", "entropy" } },
+    .{ .name = "megolm", .deps = &.{ "aescbc", "entropy" }, .example = true },
     .{ .name = "ebpf", .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "xdp-classifier", .deps = &.{"ebpf"} },
     .{ .name = "ecvrf", .deps = &.{"ct25519"} },
     .{ .name = "fss" },
-    .{ .name = "pir", .deps = &.{"fss"} },
+    .{ .name = "pir", .deps = &.{"fss"}, .example = true },
     .{ .name = "bfv", .deps = &.{"entropy"}, .example = true },
     .{ .name = "groth16", .deps = &.{"bn254"}, .example = true },
     // Not heavy: the parameter derivation + all 30 tests run in 5s under
@@ -295,7 +295,7 @@ const module_list = [_]Module{
     // + run ~1.0s = 9.5s, under the >15s threshold — and a ReleaseSafe compile
     // of this module is ~46s (comptime SHAKE256 derivation + heavily unrolled
     // field code), so marking it heavy would cost 5x what it saves.
-    .{ .name = "rescue" },
+    .{ .name = "rescue", .example = true },
     .{ .name = "tfhe", .deps = &.{"entropy"}, .heavy = true, .example = true },
     .{ .name = "montint", .heavy = true },
     .{ .name = "chachapoly" },
@@ -349,6 +349,20 @@ pub fn build(b: *std.Build) void {
     // consumer binary. See the `example` block in pass 2 for the one class it
     // covers that no test in this repository can.
     const check_examples = b.step("check-examples", "Build each module's example as an outside consumer would");
+
+    // A declaration that can drift is a gate that quietly covers less. An
+    // example file added without `.example = true` is never built -- eight of
+    // them sat that way for one afternoon and `check-examples` stayed green,
+    // which is the exact failure mode this whole family of steps exists to
+    // catch. So the flag and the tree are checked against each other.
+    const check_example_decls = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    check_example_decls.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "check-example-decls",
+        .owner = b,
+        .makeFn = checkExampleDecls,
+    });
+    check_examples.dependOn(check_example_decls);
 
     // Pass 1: create each module so inter-module deps can be wired in pass 2.
     var mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
@@ -1161,6 +1175,26 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
     var stdout = std.Io.File.stdout().writerStreaming(b.graph.io, &buf);
     try stdout.interface.writeAll(out.written());
     try stdout.interface.flush();
+}
+
+fn checkExampleDecls(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    var failed = false;
+    for (module_list) |m| {
+        const path = b.fmt("modules/{s}/example/main.zig", .{m.name});
+        const present = if (b.build_root.handle.access(io, path, .{})) |_| true else |_| false;
+        if (present and !m.example) {
+            std.debug.print("check-example-decls: {s} has {s} but no `.example = true` in module_list -- it is never built\n", .{ m.name, path });
+            failed = true;
+        }
+        if (!present and m.example) {
+            std.debug.print("check-example-decls: {s} declares `.example = true` but {s} is missing\n", .{ m.name, path });
+            failed = true;
+        }
+    }
+    if (failed) return error.ExampleDeclarationMismatch;
 }
 
 fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
