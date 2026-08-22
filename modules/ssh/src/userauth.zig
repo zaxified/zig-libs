@@ -359,12 +359,77 @@ fn awaitAuthReply(t: *transport.Transport, scratch: []u8) UserauthError!AuthRepl
 /// verifying the real signature. Returning true does NOT by itself
 /// authenticate anyone: `serveUserauth` still requires a valid, session-id-
 /// bound signature.
-pub const AuthorizedKeyCheck = *const fn (user: []const u8, algorithm: []const u8, key_blob: []const u8) bool;
+/// ⚠ `user`, `algorithm` and `key_blob` are all borrowed for the duration of
+/// the call: they point into the packet scratch buffer the next packet
+/// reuses. A hook that keeps any of them must copy it.
+///
+/// `ctx` is the caller's own state, handed back untouched — a bare `*const
+/// fn` forced a server with two concurrent connections to keep its
+/// `authorized_keys` policy in a global. Same idiom as
+/// `transport.HostKeyVerifier`; leave `ctx` at `transport.no_context` for a
+/// stateless hook.
+pub const AuthorizedKeyCheck = struct {
+    ctx: *anyopaque = transport.no_context,
+    checkFn: *const fn (ctx: *anyopaque, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool,
+
+    pub fn check(self: AuthorizedKeyCheck, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
+        return self.checkFn(self.ctx, user, algorithm, key_blob);
+    }
+};
 
 /// Server policy hook for the §8 `password` method. Implementations should
 /// compare in constant time (`std.crypto.timing_safe.eql`) and rate-limit;
 /// neither is this module's business.
-pub const PasswordCheck = *const fn (user: []const u8, password: []const u8) bool;
+///
+/// ⚠ `user` and `password` are borrowed for the duration of the call only —
+/// `password` points at the peer's plaintext secret inside `serveUserauth`'s
+/// scratch buffer, which is scrubbed and freed when it returns. Copy nothing
+/// unless you scrub your copy too.
+pub const PasswordCheck = struct {
+    ctx: *anyopaque = transport.no_context,
+    checkFn: *const fn (ctx: *anyopaque, user: []const u8, password: []const u8) bool,
+
+    pub fn check(self: PasswordCheck, user: []const u8, password: []const u8) bool {
+        return self.checkFn(self.ctx, user, password);
+    }
+};
+
+/// Why `serveUserauth` returned `error.AuthenticationFailed`.
+///
+/// RFC 4252 §5.1 gives the *wire* no field for a reason — SSH_MSG_USERAUTH_
+/// FAILURE carries a method name-list and a partial-success flag and nothing
+/// else, and that is deliberate: telling an unauthenticated peer why it
+/// failed is an oracle. This is for the SERVER's own operator instead — the
+/// distinction `sshd` writes into its log and nothing reaches the client.
+/// Set through `AuthConfig.failure`; the last refusal wins, which is the one
+/// worth logging.
+pub const AuthFailure = enum {
+    /// The peer offered no method this server has enabled — including the
+    /// conventional §5.2 `"none"` probe, and a request for a service other
+    /// than `ssh-connection`.
+    no_acceptable_method,
+    /// The `publickey` request named a signature algorithm this module
+    /// cannot verify at all.
+    unsupported_algorithm,
+    /// The `publickey` request's parts disagree with each other: the key
+    /// blob's type is not the one the named algorithm implies (RFC 8332 §3's
+    /// `rsa-sha2-*`/`ssh-rsa` pairing included), or the signature blob names
+    /// a different algorithm than the request did. The "announce ed25519,
+    /// present an RSA blob" confusion shape.
+    algorithm_mismatch,
+    /// `AuthConfig.authorized_key` said no. The hook's own richer reason
+    /// (no such user, key not in the file, key revoked) belongs in its own
+    /// `ctx` — it has one now.
+    unauthorized_key,
+    /// The key was authorized, but the signature over the session-id-bound
+    /// request blob did not verify. A replay, or a client signing against
+    /// another connection's session id.
+    bad_signature,
+    /// `AuthConfig.password` said no.
+    wrong_password,
+    /// The peer sent SSH_MSG_DISCONNECT instead of another credential.
+    peer_disconnected,
+};
 
 pub const AuthConfig = struct {
     /// Enables the `publickey` method when set.
@@ -387,6 +452,13 @@ pub const AuthConfig = struct {
     /// socket (see SPEC.md → Threat model), so the read deadline belongs to
     /// the caller that does.
     max_attempts: u32 = 20,
+    /// Optional out-pointer for why authentication failed — the same idiom
+    /// `transport.HostKeyPolicy.failure` and `sntp`'s Kiss-o'-Death code use,
+    /// because `error.AuthenticationFailed` cannot carry a payload. Written
+    /// on every refusal, so after `serveUserauth` returns it holds the LAST
+    /// one: what a server would log. Untouched on success and on unrelated
+    /// failures, so do not read it unless the call failed.
+    failure: ?*AuthFailure = null,
 };
 
 /// Which method actually succeeded.
@@ -441,7 +513,10 @@ pub fn serveUserauth(
         const pkt = try t.recvPacket(scratch);
         switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
-            .SSH_MSG_DISCONNECT => return error.AuthenticationFailed,
+            .SSH_MSG_DISCONNECT => {
+                if (config.failure) |out| out.* = .peer_disconnected;
+                return error.AuthenticationFailed;
+            },
             .SSH_MSG_USERAUTH_REQUEST => {},
             // RFC 4252: the connection protocol only becomes available after
             // SSH_MSG_USERAUTH_SUCCESS. A CHANNEL_OPEN here is a client
@@ -467,6 +542,7 @@ pub fn serveUserauth(
         // §5: authenticating for any service other than the connection
         // protocol is not something this module supports.
         if (!std.mem.eql(u8, service, connection_service)) {
+            if (config.failure) |out| out.* = .no_acceptable_method;
             attempts += 1;
             try sendFailure(t, config);
             continue;
@@ -484,7 +560,8 @@ pub fn serveUserauth(
                 // The query phase answered PK_OK; the client will now send
                 // the signed request. Not an attempt.
                 .pk_ok_sent => continue,
-                .failure => {
+                .failure => |why| {
+                    if (config.failure) |out| out.* = why;
                     attempts += 1;
                     try sendFailure(t, config);
                     continue;
@@ -496,13 +573,14 @@ pub fn serveUserauth(
             const change = try c.boolean();
             const password = try c.string();
             if (password.len > max_password_len) return error.NameTooLong;
-            if (!change and config.password.?(user, password)) {
+            if (!change and config.password.?.check(user, password)) {
                 try sendSuccess(t);
                 var res = AuthResult{ .method = .password };
                 @memcpy(res.user_buf[0..user.len], user);
                 res.user_len = user.len;
                 return res;
             }
+            if (config.failure) |out| out.* = .wrong_password;
             attempts += 1;
             try sendFailure(t, config);
             continue;
@@ -510,6 +588,7 @@ pub fn serveUserauth(
 
         // "none" (§5.2, the conventional way a client asks which methods are
         // available) and anything unsupported both land here.
+        if (config.failure) |out| out.* = .no_acceptable_method;
         attempts += 1;
         try sendFailure(t, config);
     }
@@ -517,7 +596,13 @@ pub fn serveUserauth(
     return error.AuthenticationFailed;
 }
 
-const PublickeyOutcome = enum { success, failure, pk_ok_sent };
+const PublickeyOutcome = union(enum) {
+    success,
+    /// Refused, with the reason `serveUserauth` records in
+    /// `AuthConfig.failure`.
+    failure: AuthFailure,
+    pk_ok_sent,
+};
 
 /// The `publickey` half of `serveUserauth`. `c` is positioned just after the
 /// method name.
@@ -538,12 +623,14 @@ fn servePublickey(
     // of the type that algorithm implies (RFC 8332 §3 for the rsa-sha2-*
     // name/`ssh-rsa` blob-type split). Rejecting a mismatch here stops an
     // "announce ed25519, present an RSA blob" style confusion at the door.
-    const want_blob_type = transport.keyBlobTypeFor(algorithm) orelse return .failure;
+    const want_blob_type = transport.keyBlobTypeFor(algorithm) orelse
+        return .{ .failure = .unsupported_algorithm };
     var kc = Cursor{ .b = key_blob };
-    const blob_type = kc.string() catch return .failure;
-    if (!std.mem.eql(u8, blob_type, want_blob_type)) return .failure;
+    const blob_type = kc.string() catch return .{ .failure = .algorithm_mismatch };
+    if (!std.mem.eql(u8, blob_type, want_blob_type)) return .{ .failure = .algorithm_mismatch };
 
-    if (!config.authorized_key.?(user, algorithm, key_blob)) return .failure;
+    if (!config.authorized_key.?.check(user, algorithm, key_blob))
+        return .{ .failure = .unauthorized_key };
 
     if (!has_signature) {
         // §7 query phase: SSH_MSG_USERAUTH_PK_OK || string alg || string blob.
@@ -572,11 +659,12 @@ fn servePublickey(
     // blob announcing a different algorithm than the request did cannot slip
     // through: it either fails to verify or is an unsupported algorithm.
     var sc = Cursor{ .b = signature };
-    const sig_algorithm = sc.string() catch return .failure;
-    if (!std.mem.eql(u8, sig_algorithm, algorithm)) return .failure;
+    const sig_algorithm = sc.string() catch return .{ .failure = .bad_signature };
+    if (!std.mem.eql(u8, sig_algorithm, algorithm)) return .{ .failure = .algorithm_mismatch };
 
     transport.verifySignature(blob_type, key_blob, signature, bw.buffered()) catch |e| switch (e) {
-        error.HostKeyVerificationFailed, error.UnsupportedAlgorithm, error.ProtocolError => return .failure,
+        error.HostKeyVerificationFailed, error.ProtocolError => return .{ .failure = .bad_signature },
+        error.UnsupportedAlgorithm => return .{ .failure = .unsupported_algorithm },
         else => return e,
     };
     return .success;
@@ -737,16 +825,16 @@ fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
     tr.session_id = transport.SessionId.from("fuzz-session-id");
 
     const res = serveUserauth(&tr, std.testing.allocator, .{
-        .authorized_key = struct {
-            fn f(_: []const u8, _: []const u8, _: []const u8) bool {
+        .authorized_key = .{ .checkFn = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
                 return true;
             }
-        }.f,
-        .password = struct {
-            fn f(_: []const u8, _: []const u8) bool {
+        }.f },
+        .password = .{ .checkFn = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const u8) bool {
                 return true;
             }
-        }.f,
+        }.f },
     }) catch return;
     // A success must never carry a user name longer than the declared bound.
     std.debug.assert(res.user().len <= max_user_len);
@@ -772,11 +860,11 @@ test "serveUserauth: an oversize peer string is a typed error, not a panic" {
     tr.session_id = transport.SessionId.from("session");
 
     try t.expectError(error.ProtocolError, serveUserauth(&tr, t.allocator, .{
-        .authorized_key = struct {
-            fn f(_: []const u8, _: []const u8, _: []const u8) bool {
+        .authorized_key = .{ .checkFn = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
                 return true;
             }
-        }.f,
+        }.f },
     }));
 }
 
@@ -792,11 +880,11 @@ test "serveUserauth: an oversize packet length is rejected by the framing layer"
     tr.session_id = transport.SessionId.from("session");
 
     try t.expectError(error.ProtocolError, serveUserauth(&tr, t.allocator, .{
-        .password = struct {
-            fn f(_: []const u8, _: []const u8) bool {
+        .password = .{ .checkFn = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const u8) bool {
                 return true;
             }
-        }.f,
+        }.f },
     }));
 }
 
@@ -844,12 +932,12 @@ test "serveUserauth: a received plaintext password does not survive in the freed
     tr.session_id = transport.SessionId.from("session");
 
     const res = try serveUserauth(&tr, fba.allocator(), .{
-        .password = struct {
-            fn f(u: []const u8, p: []const u8) bool {
+        .password = .{ .checkFn = struct {
+            fn f(_: *anyopaque, u: []const u8, p: []const u8) bool {
                 return std.mem.eql(u8, u, "alice") and
                     std.mem.eql(u8, p, "s3cr3t-correct-horse-battery");
             }
-        }.f,
+        }.f },
     });
     // Positive control: the exchange really happened (an authentication that
     // never ran would trivially leave no password behind).
@@ -941,13 +1029,16 @@ test "servePublickey: an ed25519 key blob, its OWN valid signature, wrapped in a
 
     var c = Cursor{ .b = rw.buffered() };
     const outcome = try servePublickey(&tr, &c, user, connection_service, session_id, .{
-        .authorized_key = struct {
-            fn f(_: []const u8, _: []const u8, _: []const u8) bool {
+        .authorized_key = .{ .checkFn = struct {
+            fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
                 return true;
             }
-        }.f,
+        }.f },
     });
-    try t.expectEqual(PublickeyOutcome.failure, outcome);
+    // Not merely "refused": refused for the RIGHT reason — the blob-type
+    // cross-check, which is the one thing standing between this forged
+    // request and a successful login.
+    try t.expectEqual(AuthFailure.algorithm_mismatch, outcome.failure);
 }
 
 test "delivered DoS-limit defaults are pinned to their documented values" {
@@ -964,4 +1055,204 @@ test "delivered DoS-limit defaults are pinned to their documented values" {
     try t.expectEqual(@as(usize, 4 * 1024), max_signature_len);
     try t.expectEqual(@as(usize, 8 * 1024), max_banner_len);
     try t.expectEqual(@as(u32, 20), (AuthConfig{}).max_attempts);
+}
+
+// ── the policy seam: caller context, and the reason a refusal happened ─────
+
+/// Frame one RFC 4252 §5 SSH_MSG_USERAUTH_REQUEST for `method`, with
+/// `tail` appended verbatim (the method-specific fields).
+fn frameAuthRequest(out: []u8, payload_buf: []u8, method: []const u8, tail: []const u8) ![]const u8 {
+    var pw: std.Io.Writer = .fixed(payload_buf);
+    try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+    try messages.writeString(&pw, "alice");
+    try messages.writeString(&pw, connection_service);
+    try messages.writeString(&pw, method);
+    try pw.writeAll(tail);
+    return framePackets(out, &.{pw.buffered()});
+}
+
+/// One `serveUserauth` run over a canned request stream.
+fn runServeUserauth(framed: []const u8, config: AuthConfig) !AuthResult {
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [4096]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+    tr.session_id = transport.SessionId.from("session");
+    return serveUserauth(&tr, std.testing.allocator, config);
+}
+
+/// A `PasswordCheck` whose accepted secret lives in the caller's own struct.
+const PasswordPolicy = struct {
+    accepts: []const u8,
+    calls: usize = 0,
+
+    fn f(ctx: *anyopaque, user: []const u8, password: []const u8) bool {
+        const self: *PasswordPolicy = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return std.mem.eql(u8, user, "alice") and std.mem.eql(u8, password, self.accepts);
+    }
+
+    fn hook(self: *PasswordPolicy) PasswordCheck {
+        return .{ .ctx = self, .checkFn = f };
+    }
+};
+
+test "the userauth policy hooks carry the caller's own context" {
+    // Deficiency #1 on the server half: a bare `*const fn` gave a server no
+    // way to hand two connections two different policies without a global.
+    // Same wire request, two contexts, two opposite verdicts — a test that
+    // could not be written at all against the old seam.
+    const t = std.testing;
+    var tail_buf: [64]u8 = undefined;
+    var tw: std.Io.Writer = .fixed(&tail_buf);
+    try tw.writeByte(0); // not a password-change request
+    try messages.writeString(&tw, "hunter2");
+
+    var wire: [512]u8 = undefined;
+    var payload: [256]u8 = undefined;
+    const framed = try frameAuthRequest(&wire, &payload, "password", tw.buffered());
+
+    var accepting: PasswordPolicy = .{ .accepts = "hunter2" };
+    const res = try runServeUserauth(framed, .{ .password = accepting.hook() });
+    try t.expectEqualStrings("alice", res.user());
+    try t.expectEqual(AuthMethod.password, res.method);
+    try t.expectEqual(@as(usize, 1), accepting.calls);
+
+    // The identical request, refused — only the context differs.
+    var refusing: PasswordPolicy = .{ .accepts = "something-else" };
+    var why: AuthFailure = .peer_disconnected; // a wrong value to overwrite
+    try t.expectError(error.AuthenticationFailed, runServeUserauth(framed, .{
+        .password = refusing.hook(),
+        .max_attempts = 1,
+        .failure = &why,
+    }));
+    try t.expectEqual(@as(usize, 1), refusing.calls);
+    try t.expectEqual(AuthFailure.wrong_password, why);
+}
+
+test "serveUserauth reports WHY it refused, which the wire deliberately cannot" {
+    // Deficiency #2 on the server half. RFC 4252 §5.1 gives
+    // SSH_MSG_USERAUTH_FAILURE no reason field — deliberately, since telling
+    // an unauthenticated peer why is an oracle — so the reason has to reach
+    // the server's OWN operator some other way. Before this it could not:
+    // every refusal was one `error.AuthenticationFailed`.
+    const t = std.testing;
+    var refusing: PasswordPolicy = .{ .accepts = "never-matches" };
+
+    // A method this server has not enabled (`publickey` with no
+    // `authorized_key` hook installed), and the conventional §5.2 `"none"`
+    // probe, are both "nothing you offered is on the menu".
+    {
+        var wire: [512]u8 = undefined;
+        var payload: [256]u8 = undefined;
+        const framed = try frameAuthRequest(&wire, &payload, "none", "");
+        var why: AuthFailure = .bad_signature;
+        try t.expectError(error.AuthenticationFailed, runServeUserauth(framed, .{
+            .password = refusing.hook(),
+            .max_attempts = 1,
+            .failure = &why,
+        }));
+        try t.expectEqual(AuthFailure.no_acceptable_method, why);
+    }
+
+    // Authenticating for a service other than `ssh-connection` (§5) is the
+    // same verdict, reached down a different arm.
+    {
+        var payload: [256]u8 = undefined;
+        var pw: std.Io.Writer = .fixed(&payload);
+        try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST));
+        try messages.writeString(&pw, "alice");
+        try messages.writeString(&pw, "some-other-service");
+        try messages.writeString(&pw, "password");
+        var wire: [512]u8 = undefined;
+        const framed = try framePackets(&wire, &.{pw.buffered()});
+        var why: AuthFailure = .bad_signature;
+        try t.expectError(error.AuthenticationFailed, runServeUserauth(framed, .{
+            .password = refusing.hook(),
+            .max_attempts = 1,
+            .failure = &why,
+        }));
+        try t.expectEqual(AuthFailure.no_acceptable_method, why);
+    }
+
+    // A peer that gives up and disconnects is not a rejected credential, and
+    // an operator's log must not read as though it were.
+    {
+        var payload: [64]u8 = undefined;
+        var pw: std.Io.Writer = .fixed(&payload);
+        try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_DISCONNECT));
+        var wire: [256]u8 = undefined;
+        const framed = try framePackets(&wire, &.{pw.buffered()});
+        var why: AuthFailure = .bad_signature;
+        try t.expectError(error.AuthenticationFailed, runServeUserauth(framed, .{
+            .password = refusing.hook(),
+            .failure = &why,
+        }));
+        try t.expectEqual(AuthFailure.peer_disconnected, why);
+    }
+}
+
+test "AuthorizedKeyCheck: the caller's context decides, and its refusal is named" {
+    // The `publickey` half of the same two deficiencies, driven through
+    // `servePublickey` so the query phase is exercised without needing a
+    // live peer to answer SSH_MSG_USERAUTH_PK_OK.
+    const t = std.testing;
+    const gpa = t.allocator;
+    const key: AuthKey = .{ .ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic([_]u8{3} ** 32) };
+    const blob = try key.publicBlob(gpa);
+    defer gpa.free(blob);
+
+    const KeyPolicy = struct {
+        authorized: []const u8,
+        seen_user: []const u8 = "",
+        seen_algorithm: []const u8 = "",
+        calls: usize = 0,
+
+        fn f(ctx: *anyopaque, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.seen_user = user;
+            self.seen_algorithm = algorithm;
+            return std.mem.eql(u8, key_blob, self.authorized);
+        }
+    };
+
+    // The signature-less §7 query for that key.
+    var rbuf: [1024]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&rbuf);
+    try rw.writeByte(0); // has_signature = FALSE
+    try messages.writeString(&rw, "ssh-ed25519");
+    try messages.writeString(&rw, blob);
+
+    var dummy_in: std.Io.Reader = .fixed(&.{});
+    var dummy_out_buf: [1024]u8 = undefined;
+
+    // Context A authorizes this exact blob → the query is answered PK_OK.
+    {
+        var policy: KeyPolicy = .{ .authorized = blob };
+        var dummy_out: std.Io.Writer = .fixed(&dummy_out_buf);
+        var tr = transport.Transport.init(&dummy_in, &dummy_out);
+        var c = Cursor{ .b = rw.buffered() };
+        const outcome = try servePublickey(&tr, &c, "alice", connection_service, "session", .{
+            .authorized_key = .{ .ctx = &policy, .checkFn = KeyPolicy.f },
+        });
+        try t.expectEqual(PublickeyOutcome.pk_ok_sent, outcome);
+        try t.expectEqual(@as(usize, 1), policy.calls);
+        // …and the hook was told who and with what, not just shown a blob.
+        try t.expectEqualStrings("alice", policy.seen_user);
+        try t.expectEqualStrings("ssh-ed25519", policy.seen_algorithm);
+    }
+
+    // Context B authorizes a different key → refused, and named as the
+    // POLICY's refusal rather than as a malformed or unsupported request.
+    {
+        var policy: KeyPolicy = .{ .authorized = "some other key" };
+        var dummy_out: std.Io.Writer = .fixed(&dummy_out_buf);
+        var tr = transport.Transport.init(&dummy_in, &dummy_out);
+        var c = Cursor{ .b = rw.buffered() };
+        const outcome = try servePublickey(&tr, &c, "alice", connection_service, "session", .{
+            .authorized_key = .{ .ctx = &policy, .checkFn = KeyPolicy.f },
+        });
+        try t.expectEqual(AuthFailure.unauthorized_key, outcome.failure);
+    }
 }

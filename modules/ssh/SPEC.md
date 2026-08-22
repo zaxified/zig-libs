@@ -35,10 +35,27 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `server_host_key_algorithms` (ssh-ed25519, rsa-sha2-256/512, ecdsa-sha2-nistp256),
   `encryption_algorithms` (chacha20-poly1305@openssh.com, aes256-ctr, aes256-gcm@openssh.com,
   aes128-gcm@openssh.com), `mac_algorithms` (hmac-sha2-256), `compression_algorithms` (none only).
-- **Host-key trust is entirely the caller's concern (client side).** `HostKeyVerifier` is a plain
-  callback — no known_hosts file, TOFU policy or pinning lives in this module. Symmetrically,
-  **user-key trust is the caller's concern on the server side**: `userauth.AuthorizedKeyCheck` is
-  the one-line-of-`authorized_keys` seam, and this module never reads the filesystem for it.
+- **Host-key trust is entirely the caller's concern (client side).** `HostKeyVerifier` is a
+  caller-supplied policy — no known_hosts file, TOFU policy or pinning lives in this module.
+  Symmetrically, **user-key trust is the caller's concern on the server side**:
+  `userauth.AuthorizedKeyCheck` is the one-line-of-`authorized_keys` seam, and this module never
+  reads the filesystem for it.
+- **Every caller-supplied policy carries a `ctx: *anyopaque` and is called through it.**
+  `transport.HostKeyVerifier`, `userauth.AuthorizedKeyCheck`, `userauth.PasswordCheck` and
+  `connection.CommandHandler` are `{ ctx, fn(ctx, …) }` structs, not bare `*const fn`. A process
+  holding several connections gives each its own policy state without a global, which is what Go's
+  `HostKeyCallback` closure and russh's `check_server_key` handler method also do. ⚠ Every slice
+  handed to such a callback is borrowed for the duration of that call only — notably
+  `HostKeyInfo.key_blob`, which points into the handshake's packet scratch; a callback that keeps
+  one must copy it.
+- **A refusal says why, to the caller — never to the peer.** `transport.HostKeyPolicy.failure` and
+  `userauth.AuthConfig.failure` are optional out-pointers (the idiom `sntp` uses for its
+  Kiss-o'-Death code) filled in with a `HostKeyFailure` / `AuthFailure` before the corresponding
+  error is returned. They exist because an error set cannot carry a payload and one
+  `error.HostKeyVerificationFailed` covered four different situations — unknown host, changed key,
+  revoked key, user declined — plus this module's own signature/algorithm refusals. Nothing about
+  them reaches the wire: RFC 4252 §5.1's SSH_MSG_USERAUTH_FAILURE still carries no reason at all
+  (see "Known limits" below), deliberately.
 - **Userauth key material is the same union as host keys.** `userauth.AuthKey == server.HostKey`:
   the wire formats for "a public key blob plus a signature made by it" are identical whether the
   key authenticates a host during KEX or a user during RFC 4252, so `publicBlob`/`sign`/
@@ -65,9 +82,11 @@ so the security properties below are in effect, not aspirational.
 
 1. **Exchange hash / host-key authentication (part 1).** `H` is computed and verified exactly per
    RFC 8731 §4 / RFC 4253 §8 (client verifies the server's signature over `H`; server signs `H`).
-   `verify_host_key`'s result gates whether the client proceeds — a caller that always returns
-   `true` has no host-key security at all, but that is a caller-policy choice this module
-   deliberately does not make.
+   `HostKeyPolicy.verifier`'s verdict gates whether the client proceeds — a caller that always
+   answers `.accept` has no host-key security at all, but that is a caller-policy choice this
+   module deliberately does not make. The verifier is given the host and port the caller dialled
+   (`HostKeyInfo.host`/`.port`) precisely so that answering it *properly* — a known_hosts lookup —
+   does not require the caller to smuggle them in through a global.
 2. **Userauth session-id binding (part 2) — the load-bearing new property.** The RFC 4252 §7
    `publickey` signature is computed over `string session_id || byte 50 || string user || string
    service || string "publickey" || boolean TRUE || string alg || string key_blob` and nothing

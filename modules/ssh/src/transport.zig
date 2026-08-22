@@ -35,9 +35,9 @@ const Poly1305 = std.crypto.onetimeauth.Poly1305;
 const Hmac = std.crypto.auth.hmac.Hmac(Sha256);
 
 /// The sibling `rsa` module's public-key type — referenced here so a
-/// `HostKeyVerifier` implementation (or the eventual `curve25519Kex` body)
-/// can parse an `rsa-sha2-*` host key with `rsa.PublicKey.fromBytes` and
-/// verify its signature with `rsa.verifyPkcs1v15`, per RFC 8332.
+/// `HostKeyVerifier` implementation can parse an `rsa-sha2-*` host key with
+/// `rsa.PublicKey.fromBytes` and verify its signature with
+/// `rsa.verifyPkcs1v15`, per RFC 8332.
 pub const RsaPublicKey = rsa.PublicKey;
 
 pub const TransportError = std.Io.Reader.Error || std.Io.Writer.Error ||
@@ -627,11 +627,162 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
 
 // ── key exchange (RFC 8731 curve25519-sha256) ───────────────────────────────
 
-/// Caller-supplied host-key trust policy: given the host-key type embedded in
-/// the wire blob (e.g. `"ssh-ed25519"`, `"ssh-rsa"`, `"ecdsa-sha2-nistp256"`)
-/// and the raw wire key blob `K_S`, returns whether to trust it. Whatever
-/// known_hosts/TOFU/pinning policy backs this belongs to the caller.
-pub const HostKeyVerifier = *const fn (key_type: []const u8, key_blob: []const u8) bool;
+/// Filler for `ctx` when a policy callback keeps no state of its own. It is a
+/// valid, uniquely-addressed pointer (a `*anyopaque` may not be null) that
+/// this module never dereferences and never writes — so it costs one unread
+/// byte of `.bss` and does not make anything shared, `meta.concurrency =
+/// .single_owner` included.
+var no_context_storage: u8 = 0;
+pub const no_context: *anyopaque = &no_context_storage;
+
+/// What a host-key policy is shown about the key being offered.
+///
+/// ⚠ **Every slice here is borrowed for the duration of the call only.**
+/// `key_blob` in particular points into the handshake's packet scratch buffer,
+/// which is reused by the very next packet; `key_type` points into `key_blob`.
+/// A verifier that keeps either (to write a `known_hosts` line, to pin a key)
+/// must copy it before returning. `host` outlives the call — it is the
+/// caller's own string, handed straight back — but relying on that couples the
+/// callback to `HostKeyPolicy`'s lifetime, so copy that too if it is kept.
+pub const HostKeyInfo = struct {
+    /// The host this connection was opened to, exactly as the caller named it
+    /// in `HostKeyPolicy.host` — empty if the caller supplied none. With
+    /// `port`, this is the lookup key of every `known_hosts`-style database,
+    /// which is why the verifier is told it: the module cannot derive it, it
+    /// is handed a `std.Io.Reader`/`Writer` and never sees an address.
+    host: []const u8,
+    /// The TCP port, from `HostKeyPolicy.port`. OpenSSH's `known_hosts` writes
+    /// a bare host for 22 and `[host]:port` otherwise; that formatting is the
+    /// caller's, so both halves arrive unjoined.
+    port: u16,
+    /// Host-key type from inside the wire blob, e.g. `"ssh-ed25519"`,
+    /// `"ssh-rsa"`, `"ecdsa-sha2-nistp256"` — the second field of a
+    /// `known_hosts` line.
+    key_type: []const u8,
+    /// The raw wire host-key blob `K_S`, type prefix included: exactly what
+    /// the base64 field of a `known_hosts` line decodes to, and what
+    /// `ssh-keygen -lf` fingerprints.
+    key_blob: []const u8,
+};
+
+/// Why a caller's host-key policy refused a key.
+///
+/// These are the four cases every `known_hosts`-style policy has to tell
+/// apart — collapsing them into one `false` was the old seam's defect: the
+/// caller got `error.HostKeyVerificationFailed` and no way to know whether it
+/// had just met a new host or was being attacked.
+pub const HostKeyRejection = enum {
+    /// No entry for this host at all, and the policy does not do
+    /// trust-on-first-use (or does, and the human said nothing).
+    unknown_host,
+    /// An entry exists for this host AND this key type, with different key
+    /// material. The dangerous one: a rotated key or a machine in the middle,
+    /// and the client cannot tell which.
+    key_mismatch,
+    /// A matching entry is marked revoked (OpenSSH's `@revoked` marker).
+    revoked,
+    /// The host is unknown and a human was asked and said no. Distinct from
+    /// `unknown_host` because nothing is wrong — the user simply declined.
+    declined,
+    /// Any other caller policy (an expired pin, an unacceptable key type, a
+    /// failed lookup). The policy's own richer reason belongs in its `ctx`.
+    other,
+};
+
+/// A host-key policy's answer.
+pub const HostKeyVerdict = union(enum) {
+    /// Trust this key; the handshake continues to the signature check.
+    accept,
+    /// Refuse. The handshake fails with `error.HostKeyVerificationFailed` and
+    /// this reason reaches the caller through `HostKeyPolicy.failure`.
+    reject: HostKeyRejection,
+};
+
+/// Caller-supplied host-key trust policy: shown the offered key (and the host
+/// it came from), answers whether to trust it. Whatever known_hosts/TOFU/
+/// pinning policy backs this belongs to the caller — this module holds no
+/// opinion and touches no filesystem.
+///
+/// A context pointer rather than a bare `*const fn`, because a bare one forces
+/// every caller with more than one connection to keep its policy in a
+/// file-scope or per-thread global. Same shape as Go's `HostKeyCallback`
+/// closure and russh's `check_server_key` (a method on the caller's own
+/// handler), and the same `ctx` + fn-pointer idiom this repo already uses for
+/// caller-supplied behaviour elsewhere (e.g. `bacnet`'s `Transport`,
+/// `fleetsim`'s `Node`).
+///
+///     const Policy = struct {
+///         known_hosts: []const u8,
+///         fn verify(ctx: *anyopaque, key: ssh.transport.HostKeyInfo) ssh.transport.HostKeyVerdict {
+///             const self: *Policy = @ptrCast(@alignCast(ctx));
+///             ...
+///         }
+///         fn verifier(self: *Policy) ssh.transport.HostKeyVerifier {
+///             return .{ .ctx = self, .verifyFn = verify };
+///         }
+///     };
+pub const HostKeyVerifier = struct {
+    /// Opaque caller state, handed back to `verifyFn` untouched. Leave it at
+    /// `no_context` for a stateless policy.
+    ctx: *anyopaque = no_context,
+    verifyFn: *const fn (ctx: *anyopaque, key: HostKeyInfo) HostKeyVerdict,
+
+    pub fn verify(self: HostKeyVerifier, key: HostKeyInfo) HostKeyVerdict {
+        return self.verifyFn(self.ctx, key);
+    }
+};
+
+/// Why the client half of a key exchange refused the server's host key.
+///
+/// Written through `HostKeyPolicy.failure` before `clientHandshake`/`connect`
+/// returns `error.HostKeyVerificationFailed` or `error.UnsupportedAlgorithm`.
+/// The point of the union is that the caller can tell **its own** refusal from
+/// **this module's**: the two need completely different messages, and before
+/// this existed a caller could only guess by re-checking whether its own
+/// verifier had run.
+pub const HostKeyFailure = union(enum) {
+    /// The caller's `HostKeyVerifier` said no, with the reason it gave.
+    policy: HostKeyRejection,
+    /// The verifier accepted, but `K_S`'s type or the signature blob's
+    /// algorithm name disagrees with the host-key algorithm KEXINIT negotiated
+    /// (RFC 8332 §3.1's `rsa-sha2-*`/`ssh-rsa` pairing included). A server
+    /// signing with something other than what it agreed to.
+    algorithm_mismatch,
+    /// The verifier accepted, but the signature over the exchange hash `H`
+    /// does not verify under the offered key. The key is not the server's.
+    bad_signature,
+    /// The negotiated host-key algorithm, or the one named inside the
+    /// signature blob, is not one this module can verify.
+    unsupported_algorithm,
+};
+
+/// The client's whole host-key stance for one handshake: who decides, what
+/// host is being dialled, and where to put the reason if the answer is no.
+///
+/// Replaces the bare `HostKeyVerifier` argument the handshake entry points
+/// used to take. `failure` is the same optional-out-pointer idiom this repo
+/// uses for `sntp`'s Kiss-o'-Death code and `jinja`'s diagnostic: an error set
+/// cannot carry a payload, so a caller that wants more than the error name
+/// passes somewhere to put it, and one that does not passes `null` and pays
+/// nothing.
+pub const HostKeyPolicy = struct {
+    /// The caller's trust decision. Required — this module has no default,
+    /// deliberately: a defaulted "accept anything" is precisely the mistake
+    /// the seam exists to prevent.
+    verifier: HostKeyVerifier,
+    /// The host this connection was dialled to, passed through to
+    /// `HostKeyInfo.host` verbatim. Empty means the caller did not say; a
+    /// `known_hosts`-style verifier then cannot look anything up, so supply
+    /// it.
+    host: []const u8 = "",
+    /// The TCP port, passed through to `HostKeyInfo.port`.
+    port: u16 = 22,
+    /// Optional out-pointer for the refusal reason. Written only when the
+    /// handshake refuses the host key; untouched on success and on unrelated
+    /// failures (a dead socket, a KEX failure), so a caller must not read it
+    /// unless the handshake failed.
+    failure: ?*HostKeyFailure = null,
+};
 
 /// Largest `K`-as-hashed encoding: mpint of a 4096-bit (512-byte) DH shared
 /// secret is `uint32 len || <=1 sign-pad || 512 bytes` = 517 bytes.
@@ -823,10 +974,60 @@ pub fn verifySignature(key_type: []const u8, k_s: []const u8, sig_blob: []const 
     } else return error.UnsupportedAlgorithm;
 }
 
+/// The client-side host-key gate, shared verbatim by all three KEX methods:
+/// parse the key type out of `K_S`, put the key to the caller's policy, then
+/// run this module's own two checks (negotiated-algorithm agreement, then the
+/// signature over `H`).
+///
+/// Every refusal is recorded in `policy.failure` — when the caller asked for
+/// one — *before* the error is returned, which is the whole point: three
+/// distinct refusals used to arrive as one indistinguishable
+/// `error.HostKeyVerificationFailed`.
+fn gateHostKey(
+    policy: HostKeyPolicy,
+    k_s: []const u8,
+    sig: []const u8,
+    h: []const u8,
+    negotiated_host_key_algorithm: []const u8,
+) TransportError!void {
+    var ksr = SliceReader{ .b = k_s };
+    const key_type = try ksr.string();
+
+    switch (policy.verifier.verify(.{
+        .host = policy.host,
+        .port = policy.port,
+        .key_type = key_type,
+        .key_blob = k_s,
+    })) {
+        .accept => {},
+        .reject => |why| {
+            if (policy.failure) |out| out.* = .{ .policy = why };
+            return error.HostKeyVerificationFailed;
+        },
+    }
+
+    checkHostKeyAlgorithmAgreement(negotiated_host_key_algorithm, key_type, sig) catch |e| {
+        if (policy.failure) |out| switch (e) {
+            error.HostKeyVerificationFailed => out.* = .algorithm_mismatch,
+            error.UnsupportedAlgorithm => out.* = .unsupported_algorithm,
+            else => {},
+        };
+        return e;
+    };
+    verifySignature(key_type, k_s, sig, h) catch |e| {
+        if (policy.failure) |out| switch (e) {
+            error.HostKeyVerificationFailed => out.* = .bad_signature,
+            error.UnsupportedAlgorithm => out.* = .unsupported_algorithm,
+            else => {},
+        };
+        return e;
+    };
+}
+
 /// Run the client side of curve25519-sha256 key exchange (RFC 8731):
 /// SSH_MSG_KEX_ECDH_INIT (`Q_C`) → SSH_MSG_KEX_ECDH_REPLY (`K_S`, `Q_S`,
 /// signature), compute `K` and `H`, verify the host key via
-/// `verify_host_key`, cross-check `negotiated_host_key_algorithm` against
+/// `policy.verifier`, cross-check `negotiated_host_key_algorithm` against
 /// `K_S`/the signature blob, then verify the signature over `H`.
 pub fn curve25519Kex(
     r: *std.Io.Reader,
@@ -836,7 +1037,7 @@ pub fn curve25519Kex(
     server_kexinit_payload: []const u8,
     client_id: []const u8,
     server_id: []const u8,
-    verify_host_key: HostKeyVerifier,
+    policy: HostKeyPolicy,
     negotiated_host_key_algorithm: []const u8,
 ) TransportError!KexResult {
     var seed: [32]u8 = undefined;
@@ -887,11 +1088,7 @@ pub fn curve25519Kex(
         sh.final(&h);
     }
 
-    var ksr = SliceReader{ .b = k_s };
-    const key_type = try ksr.string();
-    if (!verify_host_key(key_type, k_s)) return error.HostKeyVerificationFailed;
-    try checkHostKeyAlgorithmAgreement(negotiated_host_key_algorithm, key_type, sig);
-    try verifySignature(key_type, k_s, sig, &h);
+    try gateHostKey(policy, k_s, sig, &h, negotiated_host_key_algorithm);
 
     // Legacy path: `k_enc_len == 0` makes `buildCipher` mpint-encode
     // `shared_secret` on demand (byte-identical to the pre-widening result).
@@ -1062,7 +1259,7 @@ pub fn dhGroupKex(
     server_kexinit_payload: []const u8,
     client_id: []const u8,
     server_id: []const u8,
-    verify_host_key: HostKeyVerifier,
+    policy: HostKeyPolicy,
     kex_name: []const u8,
     negotiated_host_key_algorithm: []const u8,
 ) TransportError!KexResult {
@@ -1141,11 +1338,7 @@ pub fn dhGroupKex(
         res.k_enc_len = @intCast(kw.buffered().len);
     }
 
-    var ksr = SliceReader{ .b = k_s };
-    const key_type = try ksr.string();
-    if (!verify_host_key(key_type, k_s)) return error.HostKeyVerificationFailed;
-    try checkHostKeyAlgorithmAgreement(negotiated_host_key_algorithm, key_type, sig);
-    try verifySignature(key_type, k_s, sig, res.hash());
+    try gateHostKey(policy, k_s, sig, res.hash(), negotiated_host_key_algorithm);
 
     return res;
 }
@@ -1201,7 +1394,7 @@ pub fn mlkem768x25519Kex(
     server_kexinit_payload: []const u8,
     client_id: []const u8,
     server_id: []const u8,
-    verify_host_key: HostKeyVerifier,
+    policy: HostKeyPolicy,
     negotiated_host_key_algorithm: []const u8,
 ) TransportError!KexResult {
     // X25519 ephemeral.
@@ -1266,11 +1459,7 @@ pub fn mlkem768x25519Kex(
         sh.final(res.exchange_hash[0..32]);
     }
 
-    var ksr = SliceReader{ .b = k_s };
-    const key_type = try ksr.string();
-    if (!verify_host_key(key_type, k_s)) return error.HostKeyVerificationFailed;
-    try checkHostKeyAlgorithmAgreement(negotiated_host_key_algorithm, key_type, sig);
-    try verifySignature(key_type, k_s, sig, res.hash());
+    try gateHostKey(policy, k_s, sig, res.hash(), negotiated_host_key_algorithm);
 
     return res;
 }
@@ -1526,7 +1715,12 @@ pub const Transport = struct {
     /// curve25519 key exchange → key derivation → SSH_MSG_NEWKEYS both ways →
     /// install `read_cipher`/`write_cipher`. After this returns, the
     /// connection is an encrypted transport ready for userauth (part 2).
-    pub fn clientHandshake(t: *Transport, gpa: std.mem.Allocator, verify_host_key: HostKeyVerifier) TransportError!void {
+    ///
+    /// `policy` carries the caller's whole host-key stance: who decides
+    /// (`HostKeyPolicy.verifier`), which host is being dialled (so the
+    /// verifier can look it up), and optionally where to write the reason if
+    /// the key is refused (`HostKeyPolicy.failure`).
+    pub fn clientHandshake(t: *Transport, gpa: std.mem.Allocator, policy: HostKeyPolicy) TransportError!void {
         const local_id = IdentificationString{ .softwareversion = software_version };
         const v_s = try exchangeVersions(gpa, t.reader, t.writer, local_id);
         defer gpa.free(v_s);
@@ -1584,11 +1778,11 @@ pub const Transport = struct {
         // only ever returns a name from `kex_algorithms`; every one of those
         // dispatches to a working implementation here.
         var kex_result = if (isMlkemKex(neg.kex))
-            try mlkem768x25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key, neg.host_key)
+            try mlkem768x25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, policy, neg.host_key)
         else if (isCurve25519Kex(neg.kex))
-            try curve25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key, neg.host_key)
+            try curve25519Kex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, policy, neg.host_key)
         else
-            try dhGroupKex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, verify_host_key, neg.kex, neg.host_key);
+            try dhGroupKex(t.reader, t.writer, &none_w, i_c, i_s, v_c, v_s, policy, neg.kex, neg.host_key);
         defer kex_result.zeroize();
 
         if (t.session_id == null) t.session_id = SessionId.from(kex_result.hash());
@@ -1661,14 +1855,25 @@ pub const Transport = struct {
 };
 
 /// Convenience: `Transport.init` followed by `.clientHandshake`.
+///
+///     var failure: ssh.transport.HostKeyFailure = undefined;
+///     var t = ssh.transport.connect(&sr.interface, &sw.interface, gpa, .{
+///         .verifier = my_policy.verifier(),
+///         .host = host,
+///         .port = port,
+///         .failure = &failure,
+///     }) catch |err| switch (err) {
+///         error.HostKeyVerificationFailed => return report(failure),
+///         else => return err,
+///     };
 pub fn connect(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     gpa: std.mem.Allocator,
-    verify_host_key: HostKeyVerifier,
+    policy: HostKeyPolicy,
 ) TransportError!Transport {
     var t = Transport.init(reader, writer);
-    try t.clientHandshake(gpa, verify_host_key);
+    try t.clientHandshake(gpa, policy);
     return t;
 }
 
@@ -1979,14 +2184,14 @@ test "DhGroup.rejectsDegeneratePeerValue: RFC 4253 §8 upper bound (F1 regressio
     }
 }
 
-/// A `HostKeyVerifier` never actually reached by the KEX-level replay tests
+/// A `HostKeyPolicy` never actually reached by the KEX-level replay tests
 /// below (the degenerate-`f` check fails before host-key verification is
 /// ever consulted) — present only to satisfy `dhGroupKex`'s signature.
-fn unreachableHostKeyVerifier(key_type: []const u8, key_blob: []const u8) bool {
-    _ = key_type;
-    _ = key_blob;
-    unreachable;
-}
+const unreachable_policy: HostKeyPolicy = .{ .verifier = .{ .verifyFn = struct {
+    fn f(_: *anyopaque, _: HostKeyInfo) HostKeyVerdict {
+        unreachable;
+    }
+}.f } };
 
 /// Builds a raw (unencrypted, `.none` cipher) `SSH_MSG_KEXDH_REPLY` packet
 /// carrying `f_mag` as the peer's DH public value, written into `out`.
@@ -2045,63 +2250,239 @@ test "curve25519Kex (client): rejects a KEX_ECDH_REPLY carrying the identity poi
 
     try std.testing.expectError(
         error.KexFailed,
-        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachableHostKeyVerifier, "ssh-ed25519"),
+        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachable_policy, "ssh-ed25519"),
     );
 }
 
-fn alwaysRejectHostKey(key_type: []const u8, key_blob: []const u8) bool {
-    _ = key_type;
-    _ = key_blob;
-    return false;
-}
+/// A policy that refuses everything, and records what it was shown so the
+/// test below can assert the seam handed it the host it was dialling.
+const RecordingReject = struct {
+    seen_host: []const u8 = "",
+    seen_port: u16 = 0,
+    seen_key_type: []const u8 = "",
+    calls: usize = 0,
+    reason: HostKeyRejection = .key_mismatch,
 
-test "curve25519Kex (client): a caller `HostKeyVerifier` that returns false actually aborts the handshake" {
-    // The caller's host-key TRUST decision (known_hosts pinning / TOFU) —
-    // `if (!verify_host_key(...)) return error.HostKeyVerificationFailed`.
-    // Reading the source, this looks obviously right, which is exactly why
-    // it has no test: nothing here has ever needed the callback to say no.
-    // A regression that ignored the return value would silently turn host-
-    // key pinning into decoration — this module would still "work" against
-    // any host, including a MITM's.
-    //
-    // `K_S` deliberately names an algorithm `verifySignature` does not
-    // implement: real code must never reach it (the gate returns
-    // `HostKeyVerificationFailed` first), so if a mutation ever lets control
-    // flow fall through to `verifySignature`, this fails with
-    // `error.UnsupportedAlgorithm` instead — a different, loudly wrong
-    // error — rather than coincidentally reproducing the same error the gate
-    // itself would have produced.
-    var k_s_buf: [64]u8 = undefined;
-    var ksw: std.Io.Writer = .fixed(&k_s_buf);
-    try messages.writeString(&ksw, "not-a-supported-algorithm");
+    fn verify(ctx: *anyopaque, key: HostKeyInfo) HostKeyVerdict {
+        const self: *RecordingReject = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.seen_host = key.host;
+        self.seen_port = key.port;
+        self.seen_key_type = key.key_type;
+        return .{ .reject = self.reason };
+    }
+
+    fn policy(self: *RecordingReject, host: []const u8, port: u16, failure: ?*HostKeyFailure) HostKeyPolicy {
+        return .{
+            .verifier = .{ .ctx = self, .verifyFn = verify },
+            .host = host,
+            .port = port,
+            .failure = failure,
+        };
+    }
+};
+
+/// Build a KEXDH_REPLY whose `K_S` names `key_type` and whose signature blob
+/// names `sig_algo`. Both are well-formed on the wire and neither is
+/// verifiable, which is the point: the tests below drive the host-key gate
+/// and must never reach `verifySignature` for real.
+fn fakeUnverifiableReply(
+    key_type: []const u8,
+    sig_algo: []const u8,
+    k_s_buf: []u8,
+    reply_buf: []u8,
+) ![]const u8 {
+    var ksw: std.Io.Writer = .fixed(k_s_buf);
+    try messages.writeString(&ksw, key_type);
     try messages.writeString(&ksw, "blob");
     const k_s = ksw.buffered();
+
+    var sig_buf: [128]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sig_buf);
+    try messages.writeString(&sw, sig_algo);
+    try messages.writeString(&sw, "not-a-real-signature");
 
     // A non-degenerate Q_S so the earlier identity check does not short-
     // circuit before the host-key gate is even reached.
     const q_s = (try X25519.KeyPair.generateDeterministic([_]u8{0x5c} ** 32)).public_key;
 
-    var reply_buf: [16384]u8 = undefined;
-    var payload_buf: [256]u8 = undefined;
+    var payload_buf: [512]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&payload_buf);
     try pw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_KEXDH_REPLY));
     try messages.writeString(&pw, k_s);
     try messages.writeString(&pw, &q_s);
-    try messages.writeString(&pw, "not-a-real-signature");
+    try messages.writeString(&pw, sw.buffered());
     var none_w: CipherState = .none;
-    var w0: std.Io.Writer = .fixed(&reply_buf);
+    var w0: std.Io.Writer = .fixed(reply_buf);
     try writePacket(&w0, &none_w, pw.buffered());
-    const reply = w0.buffered();
+    return w0.buffered();
+}
 
+/// `curve25519Kex` over one canned reply, with `policy` and one bit of
+/// scratch per call — every host-key test below is this plus assertions.
+fn kexWith(key_type: []const u8, sig_algo: []const u8, negotiated: []const u8, policy: HostKeyPolicy) !void {
+    var k_s_buf: [64]u8 = undefined;
+    var reply_buf: [16384]u8 = undefined;
+    const reply = try fakeUnverifiableReply(key_type, sig_algo, &k_s_buf, &reply_buf);
     var r: std.Io.Reader = .fixed(reply);
     var out_scratch: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out_scratch);
     var none: CipherState = .none;
+    _ = try curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", policy, negotiated);
+}
 
+/// The reply/negotiation pair used by the rejection tests. Both name an
+/// algorithm `keyBlobTypeFor` does not know, so a mutation that skipped the
+/// caller's verdict altogether would fail with `error.UnsupportedAlgorithm`
+/// — a different, loudly wrong error — instead of coincidentally
+/// reproducing the `error.HostKeyVerificationFailed` the gate itself
+/// produces.
+const unknown_algo = "not-a-supported-algorithm";
+
+test "curve25519Kex (client): a caller `HostKeyVerifier` that rejects actually aborts the handshake" {
+    // The caller's host-key TRUST decision (known_hosts pinning / TOFU).
+    // Reading the source, this looks obviously right, which is exactly why
+    // it had no test for so long: nothing here has ever needed the callback
+    // to say no. A regression that ignored the verdict would silently turn
+    // host-key pinning into decoration — this module would still "work"
+    // against any host, including a MITM's.
+    var recorder: RecordingReject = .{};
     try std.testing.expectError(
         error.HostKeyVerificationFailed,
-        curve25519Kex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", alwaysRejectHostKey, "ssh-ed25519"),
+        kexWith(unknown_algo, unknown_algo, unknown_algo, recorder.policy("h", 22, null)),
     );
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+}
+
+test "the host-key seam hands the verifier the host and port it is verifying" {
+    // Deficiency #3 of the old seam: the verifier got the key type and the
+    // blob and nothing else — but host+port ARE the lookup key of every
+    // known_hosts database, so a caller had to smuggle them in through a
+    // global. Asserted through the real KEX entry point, not through
+    // `gateHostKey` directly, because the plumbing between the two is what
+    // used not to exist.
+    const t = std.testing;
+    var recorder: RecordingReject = .{};
+    try t.expectError(
+        error.HostKeyVerificationFailed,
+        kexWith(unknown_algo, unknown_algo, unknown_algo, recorder.policy("router.example.net", 2222, null)),
+    );
+    try t.expectEqualStrings("router.example.net", recorder.seen_host);
+    try t.expectEqual(@as(u16, 2222), recorder.seen_port);
+    // And the key type, parsed out of `K_S` by the seam rather than by the
+    // caller — the second field of a known_hosts line.
+    try t.expectEqualStrings(unknown_algo, recorder.seen_key_type);
+}
+
+test "the host-key seam carries the caller's OWN rejection reason back out" {
+    // Deficiency #2: `bool` collapsed unknown-host / mismatch / revoked /
+    // declined into one `error.HostKeyVerificationFailed`. Each reason must
+    // now arrive verbatim at the caller of the handshake — the callee
+    // knowing it is not enough, since it is `gateHostKey` that turns the
+    // verdict into an error.
+    const t = std.testing;
+    for ([_]HostKeyRejection{ .unknown_host, .key_mismatch, .revoked, .declined, .other }) |reason| {
+        var recorder: RecordingReject = .{ .reason = reason };
+        var failure: HostKeyFailure = .bad_signature; // a wrong value to overwrite
+        try t.expectError(
+            error.HostKeyVerificationFailed,
+            kexWith(unknown_algo, unknown_algo, unknown_algo, recorder.policy("h", 22, &failure)),
+        );
+        try t.expectEqual(HostKeyFailure{ .policy = reason }, failure);
+    }
+}
+
+/// A policy that trusts everything — file-scope so the tests below can share
+/// it. NOT exported: "accept anything" is precisely the answer this seam
+/// exists to stop a caller from reaching for by accident.
+const accept_all: HostKeyVerifier = .{ .verifyFn = struct {
+    fn f(_: *anyopaque, _: HostKeyInfo) HostKeyVerdict {
+        return .accept;
+    }
+}.f };
+
+test "the host-key seam tells the caller's refusal apart from this module's own" {
+    // The other half of deficiency #2, and the one that lets a caller drop
+    // its "did my verifier even run?" bookkeeping: a key the CALLER accepted
+    // and this module then refused must not look like a policy rejection.
+    const t = std.testing;
+
+    // The blob's type does not match what KEXINIT negotiated (RFC 8332
+    // §3.1) — a server signing with something other than what it agreed to.
+    {
+        var failure: HostKeyFailure = .{ .policy = .revoked }; // wrong value to overwrite
+        try t.expectError(
+            error.HostKeyVerificationFailed,
+            kexWith("ssh-rsa", "ssh-ed25519", "ssh-ed25519", .{ .verifier = accept_all, .failure = &failure }),
+        );
+        try t.expectEqual(HostKeyFailure.algorithm_mismatch, failure);
+    }
+    // Type and negotiation agree, but the signature blob names a third
+    // algorithm — still an agreement failure, still ours and not the
+    // caller's.
+    {
+        var failure: HostKeyFailure = .{ .policy = .revoked };
+        try t.expectError(
+            error.HostKeyVerificationFailed,
+            kexWith("ssh-ed25519", "rsa-sha2-256", "ssh-ed25519", .{ .verifier = accept_all, .failure = &failure }),
+        );
+        try t.expectEqual(HostKeyFailure.algorithm_mismatch, failure);
+    }
+    // Everything agrees; the signature itself is what does not verify.
+    {
+        var failure: HostKeyFailure = .{ .policy = .revoked };
+        try t.expectError(
+            error.HostKeyVerificationFailed,
+            kexWith("ssh-ed25519", "ssh-ed25519", "ssh-ed25519", .{ .verifier = accept_all, .failure = &failure }),
+        );
+        try t.expectEqual(HostKeyFailure.bad_signature, failure);
+    }
+    // And an algorithm this module cannot verify at all is its own answer,
+    // not a silent `bad_signature`.
+    {
+        var failure: HostKeyFailure = .{ .policy = .revoked };
+        try t.expectError(
+            error.UnsupportedAlgorithm,
+            kexWith(unknown_algo, unknown_algo, unknown_algo, .{ .verifier = accept_all, .failure = &failure }),
+        );
+        try t.expectEqual(HostKeyFailure.unsupported_algorithm, failure);
+    }
+}
+
+test "two policies over two contexts give two different answers, no global in sight" {
+    // Deficiency #1: with a bare fn pointer this test cannot be written at
+    // all — both connections would consult the same file-scope state. Two
+    // verifiers built over two different contexts must answer the same key
+    // differently, and the two answers must reach the caller differently.
+    const t = std.testing;
+    const Pinned = struct {
+        want: []const u8,
+        fn f(ctx: *anyopaque, key: HostKeyInfo) HostKeyVerdict {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return if (std.mem.eql(u8, self.want, key.key_type)) .accept else .{ .reject = .key_mismatch };
+        }
+    };
+    var pins_ed25519: Pinned = .{ .want = "ssh-ed25519" };
+    var pins_the_offered_one: Pinned = .{ .want = unknown_algo };
+
+    // `pins_ed25519` refuses: the offered type is not the one it pinned.
+    var failure_a: HostKeyFailure = .bad_signature;
+    try t.expectError(error.HostKeyVerificationFailed, kexWith(unknown_algo, unknown_algo, unknown_algo, .{
+        .verifier = .{ .ctx = &pins_ed25519, .verifyFn = Pinned.f },
+        .failure = &failure_a,
+    }));
+    try t.expectEqual(HostKeyFailure{ .policy = .key_mismatch }, failure_a);
+
+    // `pins_the_offered_one` accepts the very same key, so the handshake
+    // gets past the gate and fails at an algorithm this module cannot
+    // verify — a DIFFERENT error, which is what proves the two contexts
+    // really diverged rather than both refusing for the same reason.
+    var failure_b: HostKeyFailure = .bad_signature;
+    try t.expectError(error.UnsupportedAlgorithm, kexWith(unknown_algo, unknown_algo, unknown_algo, .{
+        .verifier = .{ .ctx = &pins_the_offered_one, .verifyFn = Pinned.f },
+        .failure = &failure_b,
+    }));
+    try t.expectEqual(HostKeyFailure.unsupported_algorithm, failure_b);
 }
 
 test "dhGroupKex (client): rejects a KEXDH_REPLY carrying f == p or f == p-1" {
@@ -2119,7 +2500,7 @@ test "dhGroupKex (client): rejects a KEXDH_REPLY carrying f == p or f == p-1" {
 
         try std.testing.expectError(
             error.KexFailed,
-            dhGroupKex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachableHostKeyVerifier, kex_name, "ssh-ed25519"),
+            dhGroupKex(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", unreachable_policy, kex_name, "ssh-ed25519"),
         );
     }
 }
@@ -2332,22 +2713,39 @@ test "checkHostKeyAlgorithmAgreement: an unknown negotiated algorithm name is Un
 
 // ── live interop test against a real OpenSSH sshd (gated) ───────────────────
 
+/// A pinning host-key policy for the live `sshd` tests: it holds the ed25519
+/// public key read out of the host-key file `sshd` was started with, and
+/// accepts only that. Per-instance state, not file-scope `var`s — one
+/// instance per connection is what lets the same test dial the same server
+/// twice with two different pins.
 const HostKeyCapture = struct {
-    var expected_ed25519: [32]u8 = undefined;
-    var matched: bool = false;
+    expected_ed25519: [32]u8 = undefined,
+    matched: bool = false,
+    seen_host: []const u8 = "",
+    seen_port: u16 = 0,
 
-    fn verify(key_type: []const u8, key_blob: []const u8) bool {
-        matched = false;
-        if (!std.mem.eql(u8, key_type, "ssh-ed25519")) return false;
-        var sr = SliceReader{ .b = key_blob };
-        _ = (sr.string() catch return false); // type
-        const pk = sr.string() catch return false;
-        if (pk.len != 32) return false;
-        if (std.mem.eql(u8, pk, &expected_ed25519)) {
-            matched = true;
-            return true;
-        }
-        return false;
+    fn verify(ctx: *anyopaque, key: HostKeyInfo) HostKeyVerdict {
+        const self: *HostKeyCapture = @ptrCast(@alignCast(ctx));
+        self.matched = false;
+        self.seen_host = key.host;
+        self.seen_port = key.port;
+        if (!std.mem.eql(u8, key.key_type, "ssh-ed25519")) return .{ .reject = .other };
+        var sr = SliceReader{ .b = key.key_blob };
+        _ = (sr.string() catch return .{ .reject = .other }); // type
+        const pk = sr.string() catch return .{ .reject = .other };
+        if (pk.len != 32) return .{ .reject = .other };
+        if (!std.mem.eql(u8, pk, &self.expected_ed25519)) return .{ .reject = .key_mismatch };
+        self.matched = true;
+        return .accept;
+    }
+
+    fn policy(self: *HostKeyCapture, host: []const u8, port: u16, failure: ?*HostKeyFailure) HostKeyPolicy {
+        return .{
+            .verifier = .{ .ctx = self, .verifyFn = verify },
+            .host = host,
+            .port = port,
+            .failure = failure,
+        };
     }
 };
 
@@ -2416,7 +2814,8 @@ fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
 
     const pub_path = try std.fmt.allocPrint(gpa, "{s}.pub", .{hk_path});
     defer gpa.free(pub_path);
-    HostKeyCapture.expected_ed25519 = readEd25519PubFromKeyFile(gpa, io, pub_path) catch return error.SkipZigTest;
+    var pin: HostKeyCapture = .{};
+    pin.expected_ed25519 = readEd25519PubFromKeyFile(gpa, io, pub_path) catch return error.SkipZigTest;
 
     // Pick a loopback port.
     var portbuf: [2]u8 = undefined;
@@ -2476,8 +2875,12 @@ fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
     var sw = stream.writer(io, &wbuf);
 
     var transport = Transport.init(&sr.interface, &sw.interface);
-    try transport.clientHandshake(gpa, HostKeyCapture.verify);
-    try std.testing.expect(HostKeyCapture.matched);
+    try transport.clientHandshake(gpa, pin.policy("127.0.0.1", port, null));
+    try std.testing.expect(pin.matched);
+    // The seam handed the policy the host and port this connection was
+    // dialled to — against a real `sshd`, not a canned reply.
+    try std.testing.expectEqualStrings("127.0.0.1", pin.seen_host);
+    try std.testing.expectEqual(port, pin.seen_port);
 
     // The real end-to-end proof: an encrypted SERVICE_REQUEST that decrypts
     // to a SERVICE_ACCEPT under the negotiated cipher + MAC.
@@ -2510,6 +2913,36 @@ fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
     } else {
         try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_c2s.?);
         try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_s2c.?);
+    }
+
+    // ── the refusal path, against the same real server ────────────────────
+    //
+    // Dial the SAME `sshd` again with a policy pinned to a different key.
+    // This is the case every known_hosts client has to get right, and the
+    // one the old `bool` seam could not report: the caller must learn that
+    // the host key CHANGED (`.key_mismatch`) rather than merely that
+    // "verification failed", because the two demand opposite reactions —
+    // one is a first contact to record, the other is a machine in the
+    // middle to abort on.
+    {
+        var wrong_pin: HostKeyCapture = .{ .expected_ed25519 = [_]u8{0xAB} ** 32 };
+        var stream2 = addr.connect(io, .{ .mode = .stream }) catch return error.SkipZigTest;
+        defer stream2.close(io);
+        var rbuf2: [32 * 1024]u8 = undefined;
+        var wbuf2: [32 * 1024]u8 = undefined;
+        var sr2 = stream2.reader(io, &rbuf2);
+        var sw2 = stream2.writer(io, &wbuf2);
+        var t2 = Transport.init(&sr2.interface, &sw2.interface);
+
+        var failure: HostKeyFailure = .bad_signature; // a wrong value to overwrite
+        try std.testing.expectError(
+            error.HostKeyVerificationFailed,
+            t2.clientHandshake(gpa, wrong_pin.policy("127.0.0.1", port, &failure)),
+        );
+        try std.testing.expectEqual(HostKeyFailure{ .policy = .key_mismatch }, failure);
+        try std.testing.expect(!wrong_pin.matched);
+        try std.testing.expectEqualStrings("127.0.0.1", wrong_pin.seen_host);
+        try std.testing.expectEqual(port, wrong_pin.seen_port);
     }
 }
 

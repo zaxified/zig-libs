@@ -1258,11 +1258,14 @@ test "HostKey.fromOpenSSH rejects a non-rsa/ed25519 key type" {
 
 // ── self-consistency: our client ↔ our server over loopback TCP ─────────────
 
-fn acceptAnyHostKey(key_type: []const u8, key_blob: []const u8) bool {
-    _ = key_type;
-    _ = key_blob;
-    return true;
-}
+/// These tests dial our OWN server, whose host key the test itself
+/// generated, so the trust decision is already discharged by construction.
+/// Never a template for real code — see `transport.HostKeyPolicy`.
+const accept_any_host_key: transport.HostKeyPolicy = .{ .verifier = .{ .verifyFn = struct {
+    fn f(_: *anyopaque, _: transport.HostKeyInfo) transport.HostKeyVerdict {
+        return .accept;
+    }
+}.f }, .host = "127.0.0.1" };
 
 /// Bind a listener on an ephemeral loopback port (retrying on collisions).
 fn listenLoopback(io: std.Io, port_out: *u16) !std.Io.net.Server {
@@ -1416,7 +1419,7 @@ const SelfTestClient = struct {
         var wbuf: [32 * 1024]u8 = undefined;
         var sr = stream.reader(io, &rbuf);
         var sw = stream.writer(io, &wbuf);
-        var t = try transport.connect(&sr.interface, &sw.interface, gpa, acceptAnyHostKey);
+        var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
 
         var pbuf: [8192]u8 = undefined;
         try t.requestService("ssh-userauth", &pbuf);
@@ -1552,7 +1555,7 @@ const DirectKexClient = struct {
         var sr = stream.reader(io, &rbuf);
         var sw = stream.writer(io, &wbuf);
         var none: transport.CipherState = .none;
-        var res = try transport.dhGroupKex(&sr.interface, &sw.interface, &none, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, acceptAnyHostKey, self.kex_name, self.negotiated_host_key_algorithm);
+        var res = try transport.dhGroupKex(&sr.interface, &sw.interface, &none, dkx_i_c, dkx_i_s, dkx_v_c, dkx_v_s, accept_any_host_key, self.kex_name, self.negotiated_host_key_algorithm);
         defer res.zeroize();
         self.hash_len = res.hash_len;
         @memcpy(self.hash[0..res.hash_len], res.hash());

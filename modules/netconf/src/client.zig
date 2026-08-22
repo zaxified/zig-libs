@@ -928,9 +928,11 @@ fn envVar(name: []const u8) ?[]const u8 {
 /// The live test dials a server the operator named in the environment, so
 /// there is no known-hosts database to check against — host-key policy is
 /// explicitly the caller's job (see `ssh.transport.HostKeyVerifier`).
-fn acceptAnyHostKey(_: []const u8, _: []const u8) bool {
-    return true;
-}
+const accept_any_host_key: ssh.transport.HostKeyVerifier = .{ .verifyFn = struct {
+    fn f(_: *anyopaque, _: ssh.transport.HostKeyInfo) ssh.transport.HostKeyVerdict {
+        return .accept;
+    }
+}.f };
 
 fn liveRoundTrip(advertise: []const []const u8, want: framing.Dialect) !void {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
@@ -969,7 +971,11 @@ fn liveRoundTrip(advertise: []const []const u8, want: framing.Dialect) !void {
 
     // Real SSH: transport handshake, RFC 4252 password auth, RFC 4254
     // "subsystem" request — the exact stack RFC 6242 §2 mandates.
-    var t = try ssh.transport.connect(&sr.interface, &sw.interface, gpa, acceptAnyHostKey);
+    var t = try ssh.transport.connect(&sr.interface, &sw.interface, gpa, .{
+        .verifier = accept_any_host_key,
+        .host = host,
+        .port = port,
+    });
     var scratch: [4096]u8 = undefined;
     try t.requestService("ssh-userauth", &scratch);
     try ssh.userauth.authenticatePassword(&t, gpa, user, password);

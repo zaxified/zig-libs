@@ -70,14 +70,37 @@ consulted or copied anywhere in this module.
 const ssh = @import("ssh");
 
 // ── client: connect → authenticate → run a command ────────────────────────
-fn verifyHostKey(key_type: []const u8, key_blob: []const u8) bool {
-    // caller's own known_hosts/TOFU/pinning policy — return true to trust.
-    _ = key_type;
-    _ = key_blob;
-    return true;
-}
+// The host-key policy is yours: a struct of your own reached through `ctx`.
+// `key.key_blob` does NOT outlive the call — copy it if you keep it.
+const KnownHosts = struct {
+    path: []const u8,
 
-var t = try ssh.transport.connect(&reader, &writer, gpa, verifyHostKey);
+    fn verify(ctx: *anyopaque, key: ssh.transport.HostKeyInfo) ssh.transport.HostKeyVerdict {
+        const self: *KnownHosts = @ptrCast(@alignCast(ctx));
+        return switch (lookUp(self.path, key.host, key.port, key.key_type, key.key_blob)) {
+            .match => .accept,
+            .absent => .{ .reject = .unknown_host }, // or prompt, then .accept
+            .different => .{ .reject = .key_mismatch },
+        };
+    }
+};
+
+var policy: KnownHosts = .{ .path = "~/.ssh/known_hosts" };
+var failure: ssh.transport.HostKeyFailure = undefined;
+var t = ssh.transport.connect(&reader, &writer, gpa, .{
+    .verifier = .{ .ctx = &policy, .verifyFn = KnownHosts.verify },
+    .host = "router.example.net", // what the verifier looks up
+    .port = 22,
+    .failure = &failure, // optional: WHY it was refused
+}) catch |err| switch (err) {
+    error.HostKeyVerificationFailed, error.UnsupportedAlgorithm => {
+        // `failure` distinguishes our own refusal (`.policy = .key_mismatch`,
+        // `.unknown_host`, `.revoked`, `.declined`) from the module's
+        // (`.algorithm_mismatch`, `.bad_signature`, `.unsupported_algorithm`).
+        return report(failure);
+    },
+    else => return err,
+};
 
 // RFC 4252 publickey (requests the ssh-userauth service, then authenticates;
 // the signature is bound to t.session_id).
@@ -105,13 +128,15 @@ while (...) {
 try s.close();
 
 // ── server: accept → authenticate → serve one session channel ─────────────
-fn authorizedKey(user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
-    // caller's own authorized_keys policy.
+fn authorizedKey(ctx: *anyopaque, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
+    // caller's own authorized_keys policy, over caller's own state.
+    const self: *Server = @ptrCast(@alignCast(ctx));
     _ = algorithm;
-    return std.mem.eql(u8, user, "alice") and std.mem.eql(u8, key_blob, alice_blob);
+    return std.mem.eql(u8, user, "alice") and std.mem.eql(u8, key_blob, self.alice_blob);
 }
 
 fn runCommand(
+    ctx: *anyopaque,
     a: std.mem.Allocator,
     user: []const u8,
     command: []const u8,
@@ -119,6 +144,7 @@ fn runCommand(
     stdout: *std.ArrayList(u8),
     stderr: *std.ArrayList(u8),
 ) ssh.connection.CommandError!u32 {
+    _ = ctx;
     _ = stdin;
     try stdout.print(a, "hello {s}, you asked for {s}\n", .{ user, command });
     _ = stderr;
@@ -128,8 +154,15 @@ fn runCommand(
 const host_key = try ssh.server.HostKey.fromOpenSSH(openssh_key_v1_text, null);
 var st = try ssh.server.accept(&reader, &writer, gpa, .{ .host_keys = &.{host_key} });
 
-const auth = try ssh.userauth.serveUserauth(&st, gpa, .{ .authorized_key = authorizedKey });
-try ssh.connection.serveSession(&st, gpa, .{ .user = auth.user(), .exec = runCommand });
+var why: ssh.userauth.AuthFailure = undefined; // optional: what to log
+const auth = try ssh.userauth.serveUserauth(&st, gpa, .{
+    .authorized_key = .{ .ctx = &server_state, .checkFn = authorizedKey },
+    .failure = &why,
+});
+try ssh.connection.serveSession(&st, gpa, .{
+    .user = auth.user(),
+    .exec = .{ .ctx = &server_state, .runFn = runCommand },
+});
 ```
 
 Top-level shortcuts: `ssh.authenticate` (client publickey auth),
@@ -139,8 +172,8 @@ Top-level shortcuts: `ssh.authenticate` (client publickey auth),
 
 See `src/transport.zig` for the full client transport API (algorithm
 name-list constants, `KexInit`, `exchangeVersions`, `Packet`/`CipherState`/
-`readPacket`/`writePacket`, `HostKeyVerifier`, `NegotiatedAlgorithms`,
-`Transport`/`connect`),
+`readPacket`/`writePacket`, `HostKeyVerifier`/`HostKeyInfo`/`HostKeyVerdict`/
+`HostKeyPolicy`/`HostKeyFailure`, `NegotiatedAlgorithms`, `Transport`/`connect`),
 `src/server.zig` for the server transport API (`HostKey`, `ServerConfig`,
 `serverHandshake`/`accept`), `src/userauth.zig` and `src/connection.zig` for
 parts 2 and 3, and `SPEC.md` for the design/threat notes and what is

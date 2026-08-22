@@ -15,6 +15,12 @@
 //! host patterns, per-key-type entries, `@revoked` markers, the OpenSSH
 //! mismatch warning, and a TOFU prompt that appends the accepted key.
 //!
+//! The whole policy is one `KnownHosts` value on `runClient`'s stack, reached
+//! through `HostKeyVerifier.ctx`; it says *why* it refused with a
+//! `HostKeyVerdict`, and reads the module's own reason back out of
+//! `HostKeyPolicy.failure`. Two connections in one process would just be two
+//! of these.
+//!
 //! What this module does NOT have, and what this demo therefore refuses
 //! plainly rather than failing somewhere obscure: no PTY, no interactive
 //! shell, no port forwarding, no agent (SPEC.md "Backlog / deferred"). One
@@ -103,7 +109,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 /// Not written yet. The mirror image of the client below: listen, offer a host
 /// key, and discharge `userauth.AuthorizedKeyCheck` against a real
 /// `authorized_keys` file the same way the client discharges
-/// `transport.HostKeyVerifier` against `known_hosts`. Deliberately left as a
+/// `transport.HostKeyVerifier` against `known_hosts` — over its own `ctx`,
+/// and reporting its refusals through `AuthConfig.failure`. Deliberately left as a
 /// stub rather than half-built, so that whoever writes it starts from the
 /// module's `server.zig` / `connection.serveSession` API and not from a shape
 /// guessed here.
@@ -175,17 +182,17 @@ fn runClient(
 
     // ── the trust decision ────────────────────────────────────────────────
     //
-    // `transport.HostKeyVerifier` is a bare `*const fn (key_type, key_blob)
-    // bool` with no context parameter, so everything the callback needs has to
-    // reach it through file scope. That is a real limitation of the seam, not
-    // a style choice here — a caller with two concurrent connections cannot
-    // give them different policies without a per-thread global.
-    host_policy.io = io;
-    host_policy.gpa = gpa;
-    host_policy.path = opts.known_hosts;
-    host_policy.pattern = pattern;
-    host_policy.accept_new = opts.accept_new;
-    host_policy.outcome = .not_called;
+    // Everything the policy needs lives in this one struct, on this stack, and
+    // reaches the callback through `HostKeyVerifier.ctx`. Two connections in
+    // one process would simply be two of these — no globals, no per-thread
+    // state, which is exactly what the seam's context pointer buys.
+    var policy: KnownHosts = .{
+        .io = io,
+        .gpa = gpa,
+        .path = opts.known_hosts,
+        .pattern = pattern,
+        .accept_new = opts.accept_new,
+    };
 
     // ── connect ───────────────────────────────────────────────────────────
     const addr = std.Io.net.IpAddress.parse(opts.host, opts.port) catch |err| {
@@ -203,16 +210,30 @@ fn runClient(
     var sr = stream.reader(io, &rbuf);
     var sw = stream.writer(io, &wbuf);
 
-    var transport = ssh.transport.connect(&sr.interface, &sw.interface, gpa, verifyHostKey) catch |err| {
-        // `HostKeyVerificationFailed` is the one error whose real cause lives
-        // in our own callback, so translate it back into the user's terms
-        // instead of printing the module's error name.
-        if (err == error.HostKeyVerificationFailed) {
-            reportHostKeyFailure();
-        } else {
+    // `failure` is where the module writes WHY the host key was refused —
+    // our own verdict, or its own signature/algorithm checks. Without it a
+    // caller sees one `error.HostKeyVerificationFailed` for four different
+    // situations and has to keep its own bookkeeping to tell them apart.
+    var failure: ssh.transport.HostKeyFailure = undefined;
+    var transport = ssh.transport.connect(&sr.interface, &sw.interface, gpa, .{
+        .verifier = policy.verifier(),
+        // The host and port the verifier looks up in known_hosts. The module
+        // cannot know them — it is handed a reader and a writer, never an
+        // address — so the caller says.
+        .host = opts.host,
+        .port = opts.port,
+        .failure = &failure,
+    }) catch |err| switch (err) {
+        // The two errors that mean "we refused this server's identity";
+        // `failure` is meaningful for exactly these.
+        error.HostKeyVerificationFailed, error.UnsupportedAlgorithm => {
+            reportHostKeyFailure(failure);
+            return local_failure_exit;
+        },
+        else => {
             std.debug.print("ssh-demo: handshake failed: {t}\n", .{err});
-        }
-        return local_failure_exit;
+            return local_failure_exit;
+        },
     };
 
     if (opts.verbose) printNegotiated(&transport);
@@ -371,218 +392,214 @@ fn printNegotiated(t: *const ssh.transport.Transport) void {
 // known_hosts — the caller's half of the trust decision
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Everything `verifyHostKey` needs, at file scope because
-/// `transport.HostKeyVerifier` carries no context pointer (see `runClient`).
-const host_policy = struct {
-    var io: std.Io = undefined;
-    var gpa: Allocator = undefined;
+/// The caller's half of the trust decision, in one struct: where the
+/// `known_hosts` file is, which host pattern to look up in it, and what to do
+/// about a host that is not there yet.
+///
+/// It used to be a set of file-scope `var`s — the seam handed the callback
+/// nothing but the key type and the blob, so there was nowhere else to put
+/// this. `HostKeyVerifier.ctx` is what makes it an ordinary value on
+/// `runClient`'s stack instead.
+const KnownHosts = struct {
+    io: std.Io,
+    gpa: Allocator,
     /// `known_hosts` path, and the host pattern to look up in it.
-    var path: []const u8 = "";
+    path: []const u8,
     /// This is also the name printed in every user-facing message: it is
     /// exactly what the file records, so naming anything else would tell the
     /// user to go looking for a line that is not there.
-    var pattern: []const u8 = "";
-    var accept_new: bool = false;
-    var outcome: Outcome = .not_called;
-    /// Line number of the offending entry, for the mismatch/revoked message.
-    var offending_line: usize = 0;
+    pattern: []const u8,
+    accept_new: bool,
 
-    const Outcome = enum {
-        not_called,
-        /// A matching entry was already there.
-        known,
-        /// Unknown host, accepted and recorded.
-        accepted_new,
-        /// Unknown host, the user said no.
-        declined,
-        /// Same host, same key type, DIFFERENT key.
-        mismatch,
-        /// An `@revoked` entry matched.
-        revoked,
-    };
-};
-
-/// The `transport.HostKeyVerifier` this demo installs. Called from inside the
-/// key exchange with the server's `K_S` blob; `key_blob` is a slice into the
-/// handshake's scratch buffer and does NOT outlive this call, so anything kept
-/// (the known_hosts line we append) is copied here and now.
-///
-/// Returning `false` fails the handshake with
-/// `error.HostKeyVerificationFailed`. There is no way to report *why* through
-/// the seam, which is why the reason is stashed in `host_policy.outcome` and
-/// printed by `reportHostKeyFailure` once the error surfaces.
-fn verifyHostKey(key_type: []const u8, key_blob: []const u8) bool {
-    const gpa = host_policy.gpa;
-    const io = host_policy.io;
-
-    const text = std.Io.Dir.cwd().readFileAlloc(io, host_policy.path, gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
-        // No known_hosts yet is the normal first-run state, not an error.
-        error.FileNotFound => "",
-        else => {
-            std.debug.print("ssh-demo: cannot read {s}: {t}\n", .{ host_policy.path, err });
-            host_policy.outcome = .declined;
-            return false;
-        },
-    };
-    defer if (text.len != 0) gpa.free(text);
-
-    switch (lookupKnownHost(text, host_policy.pattern, key_type, key_blob)) {
-        .match => {
-            host_policy.outcome = .known;
-            std.debug.print("debug1: Host '{s}' is known and matches the {s} host key.\n", .{
-                host_policy.pattern,
-                displayKeyType(key_type),
-            });
-            return true;
-        },
-        .revoked => |line| {
-            host_policy.outcome = .revoked;
-            host_policy.offending_line = line;
-            std.debug.print(
-                \\@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-                \\@       WARNING: REVOKED HOST KEY WAS OFFERED!             @
-                \\@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-                \\The {s} host key for {s} is marked @revoked in {s}:{d}.
-                \\
-            , .{ displayKeyType(key_type), host_policy.pattern, host_policy.path, line });
-            return false;
-        },
-        .mismatch => |line| {
-            host_policy.outcome = .mismatch;
-            host_policy.offending_line = line;
-            warnMismatch(key_type, key_blob, line);
-            return false;
-        },
-        .unknown => return trustOnFirstUse(key_type, key_blob),
+    fn verifier(self: *KnownHosts) ssh.transport.HostKeyVerifier {
+        return .{ .ctx = self, .verifyFn = verify };
     }
-}
 
-/// The loud one. A key that changed is either an administrator who rotated it
-/// or someone sitting between us and the server, and the client cannot tell
-/// the two apart — so it refuses and says so in a way nobody scrolls past.
-fn warnMismatch(key_type: []const u8, key_blob: []const u8, line: usize) void {
-    var fp_buf: [64]u8 = undefined;
-    std.debug.print(
-        \\@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-        \\@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!      @
-        \\@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-        \\IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
-        \\Someone could be eavesdropping on you right now (man-in-the-middle attack)!
-        \\It is also possible that a host key has just been changed.
-        \\The fingerprint for the {s} key sent by the remote host is
-        \\SHA256:{s}.
-        \\Please contact your system administrator.
-        \\Add correct host key in {s} to get rid of this message.
-        \\Offending {s} key in {s}:{d}
-        \\Host key verification failed.
-        \\
-    , .{
-        displayKeyType(key_type),
-        fingerprint(key_blob, &fp_buf),
-        host_policy.path,
-        displayKeyType(key_type),
-        host_policy.path,
-        line,
-    });
-}
+    /// The `transport.HostKeyVerifier` callback. Called from inside the key
+    /// exchange with the server's `K_S` blob.
+    ///
+    /// ⚠ `key.key_blob` (and `key.key_type`, which points into it) is a slice
+    /// into the handshake's scratch buffer and does NOT outlive this call, so
+    /// anything kept — the known_hosts line appended below — is copied here
+    /// and now.
+    fn verify(ctx: *anyopaque, key: ssh.transport.HostKeyInfo) ssh.transport.HostKeyVerdict {
+        const self: *KnownHosts = @ptrCast(@alignCast(ctx));
 
-/// First contact. There is no cryptographic way to check a key we have never
-/// seen — the honest options are to ask the human or to refuse, and every real
-/// client asks. `--accept-new` answers "yes" in advance (OpenSSH's
-/// `StrictHostKeyChecking=accept-new`), which still refuses a *mismatch*: the
-/// two cases are not the same risk and must not share a switch.
-fn trustOnFirstUse(key_type: []const u8, key_blob: []const u8) bool {
-    var fp_buf: [64]u8 = undefined;
-    const fp = fingerprint(key_blob, &fp_buf);
+        const text = std.Io.Dir.cwd().readFileAlloc(self.io, self.path, self.gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+            // No known_hosts yet is the normal first-run state, not an error.
+            error.FileNotFound => "",
+            else => {
+                std.debug.print("ssh-demo: cannot read {s}: {t}\n", .{ self.path, err });
+                return .{ .reject = .other };
+            },
+        };
+        defer if (text.len != 0) self.gpa.free(text);
 
-    if (!host_policy.accept_new) {
-        std.debug.print(
-            \\The authenticity of host '{s}' can't be established.
-            \\{s} key fingerprint is SHA256:{s}.
-            \\This key is not known by any other names.
-            \\
-        , .{ host_policy.pattern, displayKeyType(key_type), fp });
-        // Separate call so the trailing space survives — the prompt must not
-        // end in a newline, and a trailing space inside a `\\` literal is
-        // exactly the kind of thing an editor silently strips.
-        std.debug.print("Are you sure you want to continue connecting (yes/no)? ", .{});
-
-        if (!readYes()) {
-            std.debug.print("Host key verification failed.\n", .{});
-            host_policy.outcome = .declined;
-            return false;
+        switch (lookupKnownHost(text, self.pattern, key.key_type, key.key_blob)) {
+            .match => {
+                std.debug.print("debug1: Host '{s}' is known and matches the {s} host key.\n", .{
+                    self.pattern,
+                    displayKeyType(key.key_type),
+                });
+                return .accept;
+            },
+            .revoked => |line| {
+                std.debug.print(
+                    \\@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                    \\@       WARNING: REVOKED HOST KEY WAS OFFERED!             @
+                    \\@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                    \\The {s} host key for {s} is marked @revoked in {s}:{d}.
+                    \\
+                , .{ displayKeyType(key.key_type), self.pattern, self.path, line });
+                return .{ .reject = .revoked };
+            },
+            .mismatch => |line| {
+                self.warnMismatch(key, line);
+                return .{ .reject = .key_mismatch };
+            },
+            .unknown => return self.trustOnFirstUse(key),
         }
     }
 
-    host_policy.outcome = .accepted_new;
-    appendKnownHost(key_type, key_blob) catch |err| {
-        // OpenSSH warns and continues here, and so do we: the connection is no
-        // less safe than the user just said it was — they simply get asked
-        // again next time.
-        std.debug.print("Failed to add the host to the list of known hosts ({s}): {t}\n", .{ host_policy.path, err });
-        return true;
-    };
-    std.debug.print("Warning: Permanently added '{s}' ({s}) to the list of known hosts.\n", .{
-        host_policy.pattern,
-        displayKeyType(key_type),
-    });
-    return true;
-}
+    /// The loud one. A key that changed is either an administrator who rotated
+    /// it or someone sitting between us and the server, and the client cannot
+    /// tell the two apart — so it refuses and says so in a way nobody scrolls
+    /// past.
+    fn warnMismatch(self: *KnownHosts, key: ssh.transport.HostKeyInfo, line: usize) void {
+        var fp_buf: [64]u8 = undefined;
+        std.debug.print(
+            \\@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+            \\@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!      @
+            \\@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+            \\IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+            \\Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+            \\It is also possible that a host key has just been changed.
+            \\The fingerprint for the {s} key sent by the remote host is
+            \\SHA256:{s}.
+            \\Please contact your system administrator.
+            \\Add correct host key in {s} to get rid of this message.
+            \\Offending {s} key in {s}:{d}
+            \\Host key verification failed.
+            \\
+        , .{
+            displayKeyType(key.key_type),
+            fingerprint(key.key_blob, &fp_buf),
+            self.path,
+            displayKeyType(key.key_type),
+            self.path,
+            line,
+        });
+    }
 
-/// Read one line from stdin and accept only a literal `yes`, the way `ssh`
-/// does — a bare `y` or an empty line (someone leaning on return) must not be
-/// enough to pin a key forever.
-fn readYes() bool {
-    var buf: [64]u8 = undefined;
-    var r = std.Io.File.stdin().reader(host_policy.io, &buf);
-    const line = (r.interface.takeDelimiter('\n') catch return false) orelse return false;
-    return std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "yes");
-}
+    /// First contact. There is no cryptographic way to check a key we have
+    /// never seen — the honest options are to ask the human or to refuse, and
+    /// every real client asks. `--accept-new` answers "yes" in advance
+    /// (OpenSSH's `StrictHostKeyChecking=accept-new`), which still refuses a
+    /// *mismatch*: the two cases are not the same risk and must not share a
+    /// switch.
+    fn trustOnFirstUse(self: *KnownHosts, key: ssh.transport.HostKeyInfo) ssh.transport.HostKeyVerdict {
+        var fp_buf: [64]u8 = undefined;
+        const fp = fingerprint(key.key_blob, &fp_buf);
 
-/// Append `pattern keytype base64` — the exact OpenSSH line format, so the
-/// file this demo writes stays usable by `ssh` and `ssh-keygen -F`.
-///
-/// Read-modify-write rather than an append-mode open: `std.Io.Dir` has no
-/// append flag, and for a file this size the difference is not worth a second
-/// mechanism. A production client would use `createFileAtomic` and hold a lock
-/// so two concurrent connections cannot interleave.
-fn appendKnownHost(key_type: []const u8, key_blob: []const u8) !void {
-    const gpa = host_policy.gpa;
-    const io = host_policy.io;
-    const cwd = std.Io.Dir.cwd();
+        if (!self.accept_new) {
+            std.debug.print(
+                \\The authenticity of host '{s}' can't be established.
+                \\{s} key fingerprint is SHA256:{s}.
+                \\This key is not known by any other names.
+                \\
+            , .{ self.pattern, displayKeyType(key.key_type), fp });
+            // Separate call so the trailing space survives — the prompt must
+            // not end in a newline, and a trailing space inside a `\\` literal
+            // is exactly the kind of thing an editor silently strips.
+            std.debug.print("Are you sure you want to continue connecting (yes/no)? ", .{});
 
-    const old = cwd.readFileAlloc(io, host_policy.path, gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => try gpa.dupe(u8, ""),
-        else => return err,
-    };
-    defer gpa.free(old);
+            if (!self.readYes()) {
+                std.debug.print("Host key verification failed.\n", .{});
+                return .{ .reject = .declined };
+            }
+        }
 
-    const enc = std.base64.standard.Encoder;
-    const b64 = try gpa.alloc(u8, enc.calcSize(key_blob.len));
-    defer gpa.free(b64);
-    _ = enc.encode(b64, key_blob);
+        self.appendKnownHost(key) catch |err| {
+            // OpenSSH warns and continues here, and so do we: the connection
+            // is no less safe than the user just said it was — they simply get
+            // asked again next time.
+            std.debug.print("Failed to add the host to the list of known hosts ({s}): {t}\n", .{ self.path, err });
+            return .accept;
+        };
+        std.debug.print("Warning: Permanently added '{s}' ({s}) to the list of known hosts.\n", .{
+            self.pattern,
+            displayKeyType(key.key_type),
+        });
+        return .accept;
+    }
 
-    var file = try cwd.createFile(io, host_policy.path, .{ .truncate = true });
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(io, &buf);
-    try fw.interface.writeAll(old);
-    if (old.len != 0 and old[old.len - 1] != '\n') try fw.interface.writeAll("\n");
-    try fw.interface.print("{s} {s} {s}\n", .{ host_policy.pattern, key_type, b64 });
-    try fw.interface.flush();
-}
+    /// Read one line from stdin and accept only a literal `yes`, the way `ssh`
+    /// does — a bare `y` or an empty line (someone leaning on return) must not
+    /// be enough to pin a key forever.
+    fn readYes(self: *KnownHosts) bool {
+        var buf: [64]u8 = undefined;
+        var r = std.Io.File.stdin().reader(self.io, &buf);
+        const line = (r.interface.takeDelimiter('\n') catch return false) orelse return false;
+        return std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "yes");
+    }
 
-/// Printed once the handshake error has come back out of the module, because
-/// `HostKeyVerifier` cannot carry a reason with it.
-fn reportHostKeyFailure() void {
-    switch (host_policy.outcome) {
-        .mismatch, .revoked, .declined => {}, // already said, loudly
-        .not_called => std.debug.print(
-            "ssh-demo: host key rejected before our verifier ran — the server's key type or signature did not match what was negotiated\n",
+    /// Append `pattern keytype base64` — the exact OpenSSH line format, so the
+    /// file this demo writes stays usable by `ssh` and `ssh-keygen -F`.
+    ///
+    /// Read-modify-write rather than an append-mode open: `std.Io.Dir` has no
+    /// append flag, and for a file this size the difference is not worth a
+    /// second mechanism. A production client would use `createFileAtomic` and
+    /// hold a lock so two concurrent connections cannot interleave.
+    fn appendKnownHost(self: *KnownHosts, key: ssh.transport.HostKeyInfo) !void {
+        const cwd = std.Io.Dir.cwd();
+
+        const old = cwd.readFileAlloc(self.io, self.path, self.gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => try self.gpa.dupe(u8, ""),
+            else => return err,
+        };
+        defer self.gpa.free(old);
+
+        const enc = std.base64.standard.Encoder;
+        const b64 = try self.gpa.alloc(u8, enc.calcSize(key.key_blob.len));
+        defer self.gpa.free(b64);
+        _ = enc.encode(b64, key.key_blob);
+
+        var file = try cwd.createFile(self.io, self.path, .{ .truncate = true });
+        defer file.close(self.io);
+        var buf: [4096]u8 = undefined;
+        var fw = file.writer(self.io, &buf);
+        try fw.interface.writeAll(old);
+        if (old.len != 0 and old[old.len - 1] != '\n') try fw.interface.writeAll("\n");
+        try fw.interface.print("{s} {s} {s}\n", .{ self.pattern, key.key_type, b64 });
+        try fw.interface.flush();
+    }
+};
+
+/// Printed once the handshake error has come back out of the module. The
+/// module fills in `HostKeyFailure` before it returns, so this is a plain
+/// switch over what actually happened — no "did my verifier even run?"
+/// bookkeeping, which is what this used to be.
+fn reportHostKeyFailure(failure: ssh.transport.HostKeyFailure) void {
+    switch (failure) {
+        // Our own policy already said its piece, loudly, at the moment it
+        // decided — except for the cases it cannot reach from here.
+        .policy => |why| switch (why) {
+            .key_mismatch, .revoked, .declined => {},
+            .unknown_host => std.debug.print("ssh-demo: host is not in the known_hosts file\n", .{}),
+            .other => std.debug.print("ssh-demo: the host key was refused by local policy\n", .{}),
+        },
+        // The three below are the module's refusals, not ours, and each names
+        // a different thing for the user to go and check.
+        .algorithm_mismatch => std.debug.print(
+            "ssh-demo: the server signed with a different host-key algorithm than it negotiated\n",
             .{},
         ),
-        .known, .accepted_new => std.debug.print(
-            "ssh-demo: we accepted the host key but the handshake still failed — check the server's signature algorithm\n",
+        .bad_signature => std.debug.print(
+            "ssh-demo: we trusted the host key, but the server could not prove it holds the private half\n",
+            .{},
+        ),
+        .unsupported_algorithm => std.debug.print(
+            "ssh-demo: the server's host-key algorithm is not one this module can verify\n",
             .{},
         ),
     }

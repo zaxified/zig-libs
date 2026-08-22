@@ -554,14 +554,43 @@ pub const CommandError = std.mem.Allocator.Error || error{CommandFailed};
 /// EOF. What "run" means (a real process, a routing table, a NETCONF
 /// session) is entirely the caller's business — this module never spawns
 /// anything.
-pub const CommandHandler = *const fn (
-    gpa: std.mem.Allocator,
-    user: []const u8,
-    command: []const u8,
-    stdin: []const u8,
-    stdout: *std.ArrayList(u8),
-    stderr: *std.ArrayList(u8),
-) CommandError!u32;
+/// ⚠ `user`, `command` and `stdin` are borrowed for the duration of the call
+/// (`command` and `stdin` point into `serveSession`'s own buffers); copy
+/// anything kept. `stdout`/`stderr` are appended to with `gpa` and owned by
+/// `serveSession`.
+///
+/// `ctx` is the caller's own state, handed back untouched — same idiom as
+/// `transport.HostKeyVerifier`. Without it a server handling two connections
+/// (or two virtual hosts) has nowhere but a global to keep what the handler
+/// dispatches on. Leave it at `transport.no_context` for a stateless handler.
+///
+/// A reason for refusing is already expressible here and needs no separate
+/// channel: that is exactly what the returned exit status and `stderr` are,
+/// and RFC 4254 §6.10 delivers both to the client.
+pub const CommandHandler = struct {
+    ctx: *anyopaque = transport.no_context,
+    runFn: *const fn (
+        ctx: *anyopaque,
+        gpa: std.mem.Allocator,
+        user: []const u8,
+        command: []const u8,
+        stdin: []const u8,
+        stdout: *std.ArrayList(u8),
+        stderr: *std.ArrayList(u8),
+    ) CommandError!u32,
+
+    pub fn run(
+        self: CommandHandler,
+        gpa: std.mem.Allocator,
+        user: []const u8,
+        command: []const u8,
+        stdin: []const u8,
+        stdout: *std.ArrayList(u8),
+        stderr: *std.ArrayList(u8),
+    ) CommandError!u32 {
+        return self.runFn(self.ctx, gpa, user, command, stdin, stdout, stderr);
+    }
+};
 
 pub const ServeConfig = struct {
     /// The authenticated identity (`userauth.AuthResult.user()`), passed
@@ -802,7 +831,7 @@ fn runCommand(
     var err_out: std.ArrayList(u8) = .empty;
     defer err_out.deinit(gpa);
 
-    const status = handler(gpa, config.user, command, stdin, &out, &err_out) catch |e| switch (e) {
+    const status = handler.run(gpa, config.user, command, stdin, &out, &err_out) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CommandFailed => return error.CommandFailed,
     };
@@ -1090,37 +1119,68 @@ test "acceptBounded: a canceled wait surfaces Canceled, not an idle poll timeout
 /// How long any test here waits for a peer it has already started.
 const accept_timeout_ms: i32 = 30_000;
 
-fn acceptAnyHostKey(key_type: []const u8, key_blob: []const u8) bool {
-    _ = key_type;
-    _ = key_blob;
-    return true;
-}
+/// Loopback tests dial an in-process server whose host key the test itself
+/// generated, so there is nothing to look up — the trust decision is already
+/// discharged by construction. Never a template for real code.
+const accept_any_host_key: transport.HostKeyPolicy = .{ .verifier = .{ .verifyFn = struct {
+    fn f(_: *anyopaque, _: transport.HostKeyInfo) transport.HostKeyVerdict {
+        return .accept;
+    }
+}.f }, .host = "127.0.0.1" };
 
 fn testKey(seed_byte: u8) userauth.AuthKey {
     const seed: [32]u8 = [_]u8{seed_byte} ** 32;
     return .{ .ed25519 = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable };
 }
 
-/// The single authorized key of the test server, as a wire blob. Set by the
-/// harness before each run (tests are sequential within a process).
+/// The single authorized key of the test server, as a wire blob. Lives on
+/// the stack of the harness that built the key and reaches the hook through
+/// `AuthorizedKeyCheck.ctx` — it used to be a file-scope `var` set before
+/// each run, which is exactly the workaround the context pointer removes.
 const Authorized = struct {
-    var blob: []const u8 = &.{};
+    blob: []const u8,
 
-    fn check(user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
+    fn check(ctx: *anyopaque, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
+        const self: *Authorized = @ptrCast(@alignCast(ctx));
         return std.mem.eql(u8, user, "alice") and
             std.mem.eql(u8, algorithm, "ssh-ed25519") and
-            std.mem.eql(u8, key_blob, blob);
+            std.mem.eql(u8, key_blob, self.blob);
+    }
+
+    fn hook(self: *Authorized) userauth.AuthorizedKeyCheck {
+        return .{ .ctx = self, .checkFn = check };
     }
 };
 
-fn checkPassword(user: []const u8, password: []const u8) bool {
-    return std.mem.eql(u8, user, "alice") and std.mem.eql(u8, password, "correct horse");
-}
+const check_password: userauth.PasswordCheck = .{ .checkFn = struct {
+    fn f(_: *anyopaque, user: []const u8, password: []const u8) bool {
+        return std.mem.eql(u8, user, "alice") and std.mem.eql(u8, password, "correct horse");
+    }
+}.f };
 
 /// Test command handler: echoes identity/stdin, writes to stderr, and exits
 /// with a distinctive non-zero status so `exit-status` cannot be faked by a
 /// default.
+///
+/// It also opens its reply with a label taken from `CommandHandler.ctx`, and
+/// every loopback case uses its OWN label — so the asserted stdout is only
+/// right if `serveSession` really handed this handler the context THIS
+/// connection was configured with, rather than some other connection's or
+/// none.
+const ExecLabel = struct {
+    label: []const u8,
+
+    fn handler(self: *ExecLabel) CommandHandler {
+        return .{ .ctx = self, .runFn = testExecHandler };
+    }
+};
+
+/// The label the fuzz/reject tests use — they assert nothing about stdout,
+/// so one shared instance is honest here.
+var fuzz_label: ExecLabel = .{ .label = "fuzz" };
+
 fn testExecHandler(
+    ctx: *anyopaque,
     gpa: std.mem.Allocator,
     user: []const u8,
     command: []const u8,
@@ -1128,13 +1188,14 @@ fn testExecHandler(
     stdout: *std.ArrayList(u8),
     stderr: *std.ArrayList(u8),
 ) CommandError!u32 {
+    const self: *ExecLabel = @ptrCast(@alignCast(ctx));
     if (std.mem.eql(u8, command, "big")) {
         // Larger than the tiny window the `big` case advertises, so the
         // send path must actually block on SSH_MSG_CHANNEL_WINDOW_ADJUST.
         try stdout.appendNTimes(gpa, 'x', 100_000);
         return 0;
     }
-    try stdout.print(gpa, "ran '{s}' as {s}", .{ command, user });
+    try stdout.print(gpa, "[{s}] ran '{s}' as {s}", .{ self.label, command, user });
     if (stdin.len > 0) try stdout.print(gpa, " stdin='{s}'", .{stdin});
     try stderr.appendSlice(gpa, "diagnostic");
     return 7;
@@ -1195,7 +1256,7 @@ const ClientCtx = struct {
         var wbuf: [32 * 1024]u8 = undefined;
         var sr = stream.reader(io, &rbuf);
         var sw = stream.writer(io, &wbuf);
-        var t = try transport.connect(&sr.interface, &sw.interface, gpa, acceptAnyHostKey);
+        var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
 
         var pbuf: [16 * 1024]u8 = undefined;
         try t.requestService("ssh-userauth", &pbuf);
@@ -1269,7 +1330,18 @@ fn runCase(case: Case) !ClientCtx {
     const host_key: server_mod.HostKey = testKey(0x33);
     const client_blob = try testKey(0x11).publicBlob(gpa);
     defer gpa.free(client_blob);
-    Authorized.blob = client_blob;
+    var authorized: Authorized = .{ .blob = client_blob };
+    // One label per case, ALL alive at once — a server handling several
+    // connections holds several of these, which is the whole reason the
+    // handler needs a context pointer at all. Keeping the others alive rather
+    // than using a single local is also what gives the assertions teeth: a
+    // handler that reads anything other than the pointer it was handed picks
+    // up a neighbouring case's label, and the expected stdout no longer
+    // matches. (A single local would be reused at the same stack address
+    // every run and the substitution would be invisible.)
+    var exec_labels: [std.meta.fields(Case).len]ExecLabel = undefined;
+    inline for (std.meta.fields(Case), 0..) |f, i| exec_labels[i] = .{ .label = f.name };
+    const exec_label = &exec_labels[@intFromEnum(case)];
 
     var port: u16 = 0;
     var listener = try testListenLoopback(io, &port);
@@ -1279,7 +1351,7 @@ fn runCase(case: Case) !ClientCtx {
     const th = try std.Thread.spawn(.{}, ClientCtx.run, .{&ctx});
 
     var server_err: ?anyerror = null;
-    serverSide(io, &listener, gpa, host_key, case) catch |e| {
+    serverSide(io, &listener, gpa, host_key, case, &authorized, exec_label) catch |e| {
         server_err = e;
     };
     // Always join before reporting: the client thread owns allocations the
@@ -1306,6 +1378,8 @@ fn serverSide(
     gpa: std.mem.Allocator,
     host_key: server_mod.HostKey,
     case: Case,
+    authorized: *Authorized,
+    exec_label: *ExecLabel,
 ) !void {
     var stream = try acceptBounded(io, listener, accept_timeout_ms);
     defer stream.close(io);
@@ -1318,8 +1392,8 @@ fn serverSide(
     var t = try server_mod.accept(&sr.interface, &sw.interface, gpa, .{ .host_keys = &keys });
 
     const auth_config = userauth.AuthConfig{
-        .authorized_key = Authorized.check,
-        .password = checkPassword,
+        .authorized_key = authorized.hook(),
+        .password = check_password,
         .banner = "zig-libs ssh test server\n",
         .max_attempts = 4,
     };
@@ -1346,7 +1420,7 @@ fn serverSide(
 
     try serveSession(&t, gpa, .{
         .user = auth.user(),
-        .exec = testExecHandler,
+        .exec = exec_label.handler(),
         .window_size = 16 * 1024,
         .max_packet_size = 8 * 1024,
     });
@@ -1362,7 +1436,8 @@ test "loopback: publickey auth → session channel → exec → stdout/stderr/ex
     defer t.allocator.free(ctx.stdout);
     defer t.allocator.free(ctx.stderr);
     try expectClientOk(&ctx);
-    try t.expectEqualStrings("ran 'whoami' as alice stdin='from-the-client'", ctx.stdout);
+    // The `[happy]` prefix comes from THIS case's own `CommandHandler.ctx`.
+    try t.expectEqualStrings("[happy] ran 'whoami' as alice stdin='from-the-client'", ctx.stdout);
     try t.expectEqualStrings("diagnostic", ctx.stderr);
     try t.expectEqual(@as(?u32, 7), ctx.exit_status);
 }
@@ -1382,7 +1457,9 @@ test "loopback: password auth (RFC 4252 §8) → exec" {
     defer t.allocator.free(ctx.stdout);
     defer t.allocator.free(ctx.stderr);
     try expectClientOk(&ctx);
-    try t.expectEqualStrings("ran 'whoami' as alice stdin='from-the-client'", ctx.stdout);
+    // A DIFFERENT label from the `.happy` case above, in the same process:
+    // the two connections' handler contexts must not be the same one.
+    try t.expectEqualStrings("[password] ran 'whoami' as alice stdin='from-the-client'", ctx.stdout);
 }
 
 test "loopback: 100 KB of output through a 16 KB window (flow control actually runs)" {
@@ -1559,7 +1636,7 @@ test "live interop: our client → real OpenSSH sshd — publickey auth + exec +
     var sr = stream.reader(io, &rbuf);
     var sw = stream.writer(io, &wbuf);
 
-    var t = try transport.connect(&sr.interface, &sw.interface, gpa, acceptAnyHostKey);
+    var t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
     // RFC 4252 publickey against a real sshd — the session-id binding has to
     // be byte-exact or OpenSSH rejects the signature.
     try userauth.authenticate(&t, gpa, user, client_key);
@@ -1577,17 +1654,25 @@ test "live interop: our client → real OpenSSH sshd — publickey auth + exec +
 
 /// Our server's authorized key for the live `ssh`-client test.
 const LiveAuthorized = struct {
-    var blob: [512]u8 = undefined;
-    var blob_len: usize = 0;
+    blob: [512]u8 = undefined,
+    blob_len: usize = 0,
 
-    fn check(user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
+    fn check(ctx: *anyopaque, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
+        const self: *LiveAuthorized = @ptrCast(@alignCast(ctx));
         _ = user;
         _ = algorithm;
-        return std.mem.eql(u8, key_blob, blob[0..blob_len]);
+        return std.mem.eql(u8, key_blob, self.blob[0..self.blob_len]);
+    }
+
+    fn hook(self: *LiveAuthorized) userauth.AuthorizedKeyCheck {
+        return .{ .ctx = self, .checkFn = check };
     }
 };
 
+const live_exec_handler: CommandHandler = .{ .runFn = liveExecHandler };
+
 fn liveExecHandler(
+    _: *anyopaque,
     gpa: std.mem.Allocator,
     user: []const u8,
     command: []const u8,
@@ -1637,6 +1722,7 @@ test "live interop: real OpenSSH ssh client → our server — publickey auth + 
         }
     }
     // Authorize exactly that key: parse its wire blob out of the .pub line.
+    var live_authorized: LiveAuthorized = .{};
     {
         const pub_path = try std.fmt.allocPrint(gpa, "{s}.pub", .{ck_path});
         defer gpa.free(pub_path);
@@ -1647,9 +1733,9 @@ test "live interop: real OpenSSH ssh client → our server — publickey auth + 
         const b64 = it.next() orelse return error.SkipZigTest;
         const dec = std.base64.standard.Decoder;
         const n = dec.calcSizeForSlice(b64) catch return error.SkipZigTest;
-        if (n > LiveAuthorized.blob.len) return error.SkipZigTest;
-        dec.decode(LiveAuthorized.blob[0..n], b64) catch return error.SkipZigTest;
-        LiveAuthorized.blob_len = n;
+        if (n > live_authorized.blob.len) return error.SkipZigTest;
+        dec.decode(live_authorized.blob[0..n], b64) catch return error.SkipZigTest;
+        live_authorized.blob_len = n;
     }
 
     var port: u16 = 0;
@@ -1692,7 +1778,7 @@ test "live interop: real OpenSSH ssh client → our server — publickey auth + 
 
     // Real OpenSSH client, our RFC 4252 verifier: it must produce a
     // session-id-bound signature our `serveUserauth` accepts.
-    const auth = try userauth.serveUserauth(&t, gpa, .{ .authorized_key = LiveAuthorized.check });
+    const auth = try userauth.serveUserauth(&t, gpa, .{ .authorized_key = live_authorized.hook() });
     try std.testing.expectEqualStrings("alice", auth.user());
 
     // …and our RFC 4254 server must give it output + an exit status. The
@@ -1700,7 +1786,7 @@ test "live interop: real OpenSSH ssh client → our server — publickey auth + 
     // handler as soon as the request arrives.
     try serveSession(&t, gpa, .{
         .user = auth.user(),
-        .exec = liveExecHandler,
+        .exec = live_exec_handler,
         .stdin_mode = .ignore,
     });
 
@@ -1779,7 +1865,7 @@ fn fuzzServeSession(_: void, smith: *std.testing.Smith) !void {
     // Small window/packet bounds so the flow-control arithmetic is exercised
     // near its edges rather than under a 2 MiB default that never closes.
     serveSession(&tr, std.testing.allocator, .{
-        .exec = testExecHandler,
+        .exec = fuzz_label.handler(),
         .window_size = 64,
         .max_packet_size = 128,
         .max_input = 4096,
@@ -1807,7 +1893,7 @@ test "serveSession REJECT: a peer that overruns the advertised window" {
     var tr = transport.Transport.init(&r, &sink);
 
     try t.expectError(error.WindowOverrun, serveSession(&tr, t.allocator, .{
-        .exec = testExecHandler,
+        .exec = fuzz_label.handler(),
         .window_size = 16,
         .max_packet_size = 4096,
     }));
@@ -1832,7 +1918,7 @@ test "serveSession REJECT: a channel request for a channel that is not open" {
     var tr = transport.Transport.init(&r, &sink);
 
     try t.expectError(error.ChannelClosed, serveSession(&tr, t.allocator, .{
-        .exec = testExecHandler,
+        .exec = fuzz_label.handler(),
     }));
 }
 
@@ -1864,7 +1950,7 @@ test "serveSession REJECT: a non-session channel type gets OPEN_FAILURE, not a c
     var tr = transport.Transport.init(&r, &sink);
 
     try t.expectError(error.ChannelClosed, serveSession(&tr, t.allocator, .{
-        .exec = testExecHandler,
+        .exec = fuzz_label.handler(),
     }));
 
     // The reply we did send must be an OPEN_FAILURE for channel 5.
