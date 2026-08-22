@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `TcpTransport` now surfaces `error.Canceled` (a new
+  `TransportError` variant) instead of `error.ReadFailed`/`error.WriteFailed`
+  when a blocked read or write is interrupted by `std.Io`'s `Future.cancel`.
+  Covers both the direct blocking read and the `read_timeout_ms` poll path,
+  which is not itself a `std.Io` cancellation point and needed an explicit
+  `checkCancel` after the wait to see the request at all.
 - **2026-08-06** — Security audit: an unauthenticated 43-byte Read Var request could
   drive an out-of-bounds read one byte past a registered memory area; fixed, along with
   4 further findings.
