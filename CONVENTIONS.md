@@ -214,6 +214,17 @@ it, and SPEC.md does not restate it. Vocabulary:
   swept, and a declared-and-swept target whose compile is red without a baseline entry.
   A module with no `.targets` field at all (or one missing `.linux64`) fails the gate —
   "undeclared" is not read as "any", the confusion this schema replaces.
+
+  **What a declared target covers: the tests AND the whole public surface.** Each declared
+  pair compiles twice — the module's test binary, and the same forcing root
+  `check-pubfn-reach` uses on the native target, which takes a reference to every
+  non-generic public declaration. Without the second compile the claim silently shrinks to
+  "the part of the module some test happens to call compiles there", because Zig analyses
+  a body only when something references it (measured on native, 2026-08-21: 403 of 9626
+  public functions are reachable from no test). Demonstrated on `decimal`, 2026-08-22, with
+  a `pub fn` no test calls whose body fails to compile for Windows: `zig build test-decimal`
+  green, `check-pubfn-reach` green (the body is fine on Linux), the pair's test compile
+  green — only the pair's forcing compile red.
 - `platform`: `.any` (cross-OS) · `.posix` · `.linux` (raw syscalls / no-libc — a
   conscious ceiling, not a bug). **Historical/descriptive only as of 2026-08-18 — not
   gate-enforced.** It predates `targets` and conflated two different claims (where a

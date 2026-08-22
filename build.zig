@@ -713,9 +713,38 @@ pub fn build(b: *std.Build) void {
             const cross_test = b.addTest(.{ .name = step_name, .root_module = test_root });
             const one = b.step(
                 step_name,
-                b.fmt("Compile {s}'s tests for {s} (true status, not baseline-checked)", .{ m.name, ct.label() }),
+                b.fmt("Compile {s}'s tests and public surface for {s} (true status, not baseline-checked)", .{ m.name, ct.label() }),
             );
             one.dependOn(&cross_test.step);
+
+            // ⭐ The cross compile above is an `addTest` over the module root,
+            // and therefore carries the SAME blind spot `check-pubfn-reach`
+            // exists to close on the native target: Zig analyses a function
+            // body only when something references it, so a `pub fn` no test
+            // reaches is never checked against this target at all. Measured
+            // 2026-08-21 on native: 403 of 9626 public functions are in that
+            // position. Without this, "module X compiles for Windows" means
+            // "the part of X some test happens to call compiles for Windows",
+            // which is exactly the kind of claim this repository keeps finding
+            // to be weaker than it reads.
+            //
+            // So each declared (module, target) pair also compiles the forcing
+            // root. Deliberately part of `portable-<name>-<target>` rather than
+            // a new gate: the pair is the unit `scripts/portable-known-failures.tsv`
+            // is keyed by, so a pair that already fails stays one row, and a
+            // pair that starts failing BECAUSE of this fails as itself rather
+            // than under a second baseline that would have to be kept in sync.
+            const cross_force_mod = b.createModule(.{
+                .root_source_file = b.path("scripts/force-pubfn-reach.zig"),
+                .target = cross_resolved[ti],
+                .optimize = .ReleaseSmall,
+            });
+            cross_force_mod.addImport("m", test_root);
+            const cross_force = b.addTest(.{
+                .name = b.fmt("force-{s}", .{step_name}),
+                .root_module = cross_force_mod,
+            });
+            one.dependOn(&cross_force.step);
 
             if (is_declared) portable_pairs.append(b.allocator, .{ .module = m.name, .target = ct }) catch @panic("OOM");
         }
@@ -3069,7 +3098,10 @@ fn renderPortableTable(
             "further to show here.\n\n" ++
             "{d} of them additionally claim a cross-compile target in `meta.targets` " ++
             "(CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of " ++
-            "these targets has a host to run on here) each declared pair's test binary and " ++
+            "these targets has a host to run on here) each declared pair TWICE — the test " ++
+            "binary, and a second root that takes a reference to every non-generic public " ++
+            "declaration, because Zig analyses a body only when something references it and a " ++
+            "`pub fn` no test reaches would otherwise never meet this target at all — and " ++
             "checks the result against " ++
             "[`scripts/portable-known-failures.tsv`](scripts/portable-known-failures.tsv): of " ++
             "{d} declared pairs, {d} currently compile clean and {d} are known-failing, tracked " ++
@@ -3078,8 +3110,8 @@ fn renderPortableTable(
             "fact from a `known-failing` cell next to it — one is an absent claim, the other is " ++
             "a claim currently broken and tracked — and this table exists so the two are never " ++
             "shown as the same thing.\n\n" ++
-            "**A row states that the module compiles for that target. It does not state that a " ++
-            "binary containing the module links for it.** Link-time reach limits are a property " ++
+            "**A row states that the module's tests and its whole public surface compile for " ++
+            "that target. It does not state that a binary containing the module links for it.** Link-time reach limits are a property " ++
             "of the consuming binary's total text size, not of any single module: on 32-bit MIPS " ++
             "a branch's `PC16` fixup reaches ±128 KB, and a large enough consumer overruns it no " ++
             "matter which modules it picked. What that looks like, and what to do about it, is " ++

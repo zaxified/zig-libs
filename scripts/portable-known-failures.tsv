@@ -3,7 +3,10 @@
 # schema (`meta.targets`: `.linux64` / `.linux32` / `.windows` / `.wasm32`).
 #
 # One row per (module, target) pair the module DECLARES in `meta.targets`
-# whose test binary currently fails to COMPILE for that target. `.linux64` is
+# that currently fails to COMPILE for that target. A pair is two compiles --
+# the module's test binary, and a forcing root that references every
+# non-generic public declaration, so a `pub fn` no test reaches is checked
+# against the target too -- and one row covers the pair either way. `.linux64` is
 # never cross-compiled by this gate (proven by the default test suite
 # instead) and can never appear here.
 #
