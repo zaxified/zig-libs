@@ -50,6 +50,35 @@ Per-module design/threat-model lives in each module's `SPEC.md`.
   at all, so a consumer has nothing to bring. The line is "don't reimplement what a proxy
   or std already does safely", not "no handshake code in this repo".
 
+- **A cancellation is not a transport failure — never let it arrive as one.** `std.Io`
+  cancelation does unblock a thread parked in a socket read, but the reason is erased on
+  the way out: `std.Io.Reader.Error` is exactly `{ReadFailed, EndOfStream}` and cannot
+  carry `Canceled`. The real cause survives only in the *concrete* reader's out-of-band
+  field (`std.Io.net.Stream.Reader.err`, `std.Io.File.Reader.err`). So:
+  - A module that **owns the fd** must consult that field before reporting a failure, and
+    its transport error set must carry a `Canceled` variant. Collapsing everything into
+    one `ReadFailed`/`TransportFailed` leaves a caller unable to tell its own cancelation
+    from a dead peer.
+  - A module that takes a **foreign** `*std.Io.Reader` must not guess — it has no
+    concrete reader to ask. Document at its entry point that a cancelation reaches it as
+    `ReadFailed` and that the caller who supplied the reader owns the recovery.
+  - Datagram sockets are the easy case and must not be made hard: `Socket.ReceiveError`
+    and `SendError` already include `Io.Cancelable`, so `error.Canceled` arrives intact.
+    Flattening it there destroys information std handed over correctly.
+  - ⚠ **A read timeout built on a raw `std.posix.poll` cannot see a cancelation at all.**
+    `posix.poll` retries on `EINTR`, and a thread waiting in an unregistered call is never
+    signalled by `Threaded` in the first place — so the wait runs to completion and the
+    canceled read is reported as an idle round. Call `io.checkCancel()` once the wait
+    ends, on both the timed-out and the failed path. (It *acknowledges* the request and
+    reports it exactly once — convert it at the call site, never ask twice.) A raw
+    `std.posix.read` is worse still: it is not cancelable at all, and must be routed
+    through `std.Io`.
+  - Prefer one exhaustive widener over scattered `catch return error.X` sites, and switch
+    on `error.ReadFailed` explicitly rather than `else` — that way the *next* variant is a
+    compile error instead of a silent mis-map.
+  - `Timeout` / "nothing this round" and `Canceled` are three different things together
+    with a real failure. Never fold any of them into another.
+
 ### 2.1 Zeroization of secret material
 
 `std.crypto.secureZero` clears **the storage you name it on, and nothing else**. The compiler is
