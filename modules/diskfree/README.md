@@ -1,4 +1,4 @@
-# diskusage
+# diskfree
 
 Filesystem space + mount table, without spawning `df`/`mount`: a raw
 `statfs(2)`/`statfs64(2)` syscall wrapper (total/free/available bytes, inode
@@ -41,7 +41,7 @@ just "how full is this filesystem, and what's mounted". Folding it into
 `procnet` would mean a consumer that only wants `df`-style numbers pulling in
 socket-table and conntrack-flow parsing to get them, for a coincidence of
 directory (`/proc`) rather than a shared concern. A sibling module keeps the
-dependency honest: `diskusage` imports nothing, and nothing that wants disk
+dependency honest: `diskfree` imports nothing, and nothing that wants disk
 space has to import ARP/routing/socket parsing to get it.
 
 What would have made the other call correct: if disk usage were *itself*
@@ -52,11 +52,11 @@ not a `/proc` read at all; the `/proc/self/mounts`/`mountinfo` half is
 ## API
 
 ```zig
-const diskusage = @import("diskusage");
+const diskfree = @import("diskfree");
 
 // statfs(2): total/free/available bytes, inodes, block size, fs type magic.
-const u = try diskusage.query("/var/log");
-// or: diskusage.statfs.query(...) — same function, submodule path.
+const u = try diskfree.query("/var/log");
+// or: diskfree.statfs.query(...) — same function, submodule path.
 std.log.info("{d} MB available of {d} MB", .{
     u.availableBytes() / (1024 * 1024),
     u.totalBytes() / (1024 * 1024),
@@ -67,15 +67,15 @@ defer threaded.deinit();
 const io = threaded.io();
 
 // /proc/self/mounts — device, mount point, fs type, options.
-if (try diskusage.mounts.readMounts(gpa, io)) |mnts| {
-    defer diskusage.mounts.freeAll(gpa, mnts);
+if (try diskfree.mounts.readMounts(gpa, io)) |mnts| {
+    defer diskfree.mounts.freeAll(gpa, mnts);
     for (mnts) |m| std.log.info("{s} on {s} ({s})", .{ m.device, m.mount_point, m.fs_type });
 }
 
 // /proc/self/mountinfo — mount ID/parent ID/root/major:minor, for anything
 // that needs the mount tree or must tell a bind mount from a full one.
-if (try diskusage.mountinfo.readMountinfo(gpa, io)) |mnts| {
-    defer diskusage.mountinfo.freeAll(gpa, mnts);
+if (try diskfree.mountinfo.readMountinfo(gpa, io)) |mnts| {
+    defer diskfree.mountinfo.freeAll(gpa, mnts);
     for (mnts) |m| std.log.info("id={d} parent={d} {s} -> {s}", .{ m.mount_id, m.parent_id, m.mount_source, m.mount_point });
 }
 ```

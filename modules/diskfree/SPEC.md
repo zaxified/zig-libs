@@ -1,4 +1,4 @@
-# `diskusage` — specification
+# `diskfree` — specification
 
 Design + threat notes for auditors. Usage: see [`./README.md`](./README.md).
 
@@ -219,7 +219,7 @@ Not applicable — no secret material is handled anywhere in this module.
   inside `std.Io.Threaded`'s generic Linux file-mapping code and the
   `MipsN32` syscall table (missing `.llseek`, an `arg6: u32` vs `u64`
   mismatch), not in anything this module wrote; it looks like a gap in Zig
-  0.16.0's own std support for that specific ABI variant, not a `diskusage`
+  0.16.0's own std support for that specific ABI variant, not a `diskfree`
   defect, and n32 (as opposed to o32, `.mips`/`.mipsel`, which build and
   analyze cleanly) is not the concrete target this module's requirements
   named.
@@ -257,7 +257,7 @@ Not applicable — no secret material is handled anywhere in this module.
   the failure is inside Zig 0.16.0's own `std.Io.Threaded`/`std.os.linux`
   support for that target (a `.llseek` syscall missing from the `MipsN32`
   table, an `arg6` width mismatch), unrelated to this module's code. Not
-  investigated further here: out of scope for a `diskusage` fix, and o32
+  investigated further here: out of scope for a `diskfree` fix, and o32
   (`.mips`/`.mipsel`) — the concrete target this module's requirements
   named — builds and analyzes cleanly.
 - `.x86`'s mapping to `PackedGeneric32` assumes a 32-bit process under an

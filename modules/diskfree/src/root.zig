@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! diskusage — `statfs(2)`/`statfs64(2)` disk-space query plus
+//! diskfree — `statfs(2)`/`statfs64(2)` disk-space query plus
 //! `/proc/self/mounts` and `/proc/self/mountinfo` parsers: "what is mounted
 //! and how full is it", without spawning `df`/`mount`.
 //!
@@ -24,13 +24,13 @@
 //! Basic usage:
 //!
 //! ```zig
-//! const diskusage = @import("diskusage");
+//! const diskfree = @import("diskfree");
 //!
-//! const u = try diskusage.statfs.query("/var/log");
+//! const u = try diskfree.statfs.query("/var/log");
 //! std.log.info("available: {d} MB", .{u.availableBytes() / (1024 * 1024)});
 //!
-//! const mnts = try diskusage.mounts.readMounts(gpa, io) orelse &.{};
-//! defer diskusage.mounts.freeAll(gpa, mnts);
+//! const mnts = try diskfree.mounts.readMounts(gpa, io) orelse &.{};
+//! defer diskfree.mounts.freeAll(gpa, mnts);
 //! for (mnts) |m| std.log.info("{s} on {s} ({s})", .{ m.device, m.mount_point, m.fs_type });
 //! ```
 

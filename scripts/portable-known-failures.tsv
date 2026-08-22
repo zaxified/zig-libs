@@ -79,9 +79,9 @@
 # task's own static-footprint use case, both pass); `reconcilable` declares
 # `.windows` + `.wasm32` (its own SPEC/README already say "verified by
 # compiling ... not just claimed" -- a self-reported build, not bare prose,
-# both pass); `procrun` and `diskusage`'s SPEC-based declarations turned out
+# both pass); `procrun` and `diskfree`'s SPEC-based declarations turned out
 # to be independently corroborated by the consumer read above (`procrun` is
-# literally one of the second consumer's 12; `diskusage` is not imported by
+# literally one of the second consumer's 12; `diskfree` is not imported by
 # either consumer,
 # so its `.linux32` claim rests on its own SPEC's "builds and analyzes
 # cleanly" account, not a live import -- kept, but weaker evidence than the

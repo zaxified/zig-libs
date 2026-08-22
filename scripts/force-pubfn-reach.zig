@@ -3,7 +3,7 @@
 //! Zig analyses a function body only when something references it. So a `pub
 //! fn` that no test reaches can be outright non-compiling and still pass a
 //! fully green gate — the compiler never looks inside it. That is not
-//! hypothetical: `diskusage`'s `readMounts` and `readMountinfo` did not compile
+//! hypothetical: `diskfree`'s `readMounts` and `readMountinfo` did not compile
 //! on Zig 0.16 and an outside consumer found it, not this repo's CI.
 //!
 //! This file is compiled once per module, with the module under test imported

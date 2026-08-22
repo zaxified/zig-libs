@@ -1,4 +1,4 @@
-# diskusage — changelog
+# diskfree — changelog
 
 Newest first. See the root [`CHANGELOG.md`](../../CHANGELOG.md) for which
 release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
@@ -65,7 +65,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   read loop. Added a live test for each (`readMounts`/`readMountinfo` against
   this host's real `/proc/self/mounts`/`mountinfo`, same "run unconditionally,
   no root needed" posture as `statfs.zig`'s live `query("/")` test) so both
-  entry points are now reached by `zig build test-diskusage`. Documented the
+  entry points are now reached by `zig build test-diskfree`. Documented the
   `df` use-percentage rounding-convention split (coreutils rounds up, busybox
   rounds to nearest) in `SPEC.md`, per the same consumer's OpenWRT
   measurement (`/boot` at 36.37% prints 36 under busybox, 37 under round-up);

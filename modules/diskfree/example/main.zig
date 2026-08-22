@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 
-//! `diskusage-demo` — a `df(1)`-shaped command-line tool built on the
-//! `diskusage` module: filesystem space for every mounted filesystem (or a
+//! `diskfree-demo` — a `df(1)`-shaped command-line tool built on the
+//! `diskfree` module: filesystem space for every mounted filesystem (or a
 //! given set of paths), plus the two mount-table views the module parses.
 //!
 //! ⚠⚠ **This is the `df` question, not the `du` one — say it plainly, because
 //! the module's own name invites the opposite guess.** `du` walks a
 //! directory tree, `lstat`s every file, and *accumulates* real disk
-//! allocation (`st_blocks`) per subtree. `diskusage` does none of that: it
+//! allocation (`st_blocks`) per subtree. `diskfree` does none of that: it
 //! is a `statfs(2)`/`statfs64(2)` syscall wrapper (whole-filesystem space)
 //! plus `/proc/self/mounts`/`mountinfo` parsers. This demo therefore walks
 //! no directories, stats no files, and accumulates no sizes — it can only
@@ -39,16 +39,16 @@
 //! cannot express at all — its four columns have no field for it. That is
 //! the concrete answer to "what does the richer parser give you".
 //!
-//! Built against the PUBLISHED module (`@import("diskusage")`) only.
+//! Built against the PUBLISHED module (`@import("diskfree")`) only.
 
 const std = @import("std");
-const diskusage = @import("diskusage");
+const diskfree = @import("diskfree");
 
 const Allocator = std.mem.Allocator;
 
 const not_du_banner =
-    \\diskusage-demo answers the `df` question (how full is this filesystem?),
-    \\NOT the `du` one (how much space do these files use?). The `diskusage`
+    \\diskfree-demo answers the `df` question (how full is this filesystem?),
+    \\NOT the `du` one (how much space do these files use?). The `diskfree`
     \\module walks no directories and stats no files -- it wraps statfs(2) and
     \\parses /proc/self/mounts. A real `du` would need a raw stat/lstat syscall
     \\wrapper first (st_blocks + st_dev, neither in std.Io.File.Stat) plus a
@@ -57,16 +57,16 @@ const not_du_banner =
 ;
 
 const usage_text =
-    \\diskusage-demo -- a df(1)-shaped tool for the `diskusage` module.
+    \\diskfree-demo -- a df(1)-shaped tool for the `diskfree` module.
     \\NOT a `du` tool -- see the banner above (run with no flags) or the header
     \\comment in example/main.zig for why, and what building `du` would need.
     \\
     \\usage:
-    \\  diskusage-demo [-a] [path ...]     filesystem space report (df-shaped)
-    \\  diskusage-demo --mounts             /proc/self/mounts table (mtab-shaped)
-    \\  diskusage-demo --mountinfo          /proc/self/mountinfo table (adds
+    \\  diskfree-demo [-a] [path ...]     filesystem space report (df-shaped)
+    \\  diskfree-demo --mounts             /proc/self/mounts table (mtab-shaped)
+    \\  diskfree-demo --mountinfo          /proc/self/mountinfo table (adds
     \\                                      propagation info `mounts` can't show)
-    \\  diskusage-demo --margin [path ...]  f_bfree vs f_bavail, explained
+    \\  diskfree-demo --margin [path ...]  f_bfree vs f_bavail, explained
     \\
     \\  -a            include pseudo/dummy filesystems (0 total blocks) --
     \\                same idea as df's own -a
@@ -177,11 +177,11 @@ fn runSpace(gpa: Allocator, io: std.Io, opts: Options) !u8 {
 
     if (opts.n_paths > 0) {
         // Explicit paths: query each directly, like `df /some/path ...`.
-        const mnts = try diskusage.mounts.readMounts(gpa, io);
-        defer if (mnts) |m| diskusage.mounts.freeAll(gpa, m);
+        const mnts = try diskfree.mounts.readMounts(gpa, io);
+        defer if (mnts) |m| diskfree.mounts.freeAll(gpa, m);
 
         for (opts.paths[0..opts.n_paths]) |p| {
-            const u = diskusage.statfs.query(p) catch |err| {
+            const u = diskfree.statfs.query(p) catch |err| {
                 try out.print("{s:<16} {s:>10} {s:>10} {s:>10} {s:>5} {s} ({t})\n", .{ p, "-", "-", "-", "-", p, err });
                 unreadable += 1;
                 continue;
@@ -194,11 +194,11 @@ fn runSpace(gpa: Allocator, io: std.Io, opts: Options) !u8 {
             trackMargin(u, device, label, &max_margin_1k, &max_margin_row, &max_margin_row_len);
         }
     } else {
-        const mnts = try diskusage.mounts.readMounts(gpa, io) orelse @constCast(&.{});
-        defer diskusage.mounts.freeAll(gpa, mnts);
+        const mnts = try diskfree.mounts.readMounts(gpa, io) orelse @constCast(&.{});
+        defer diskfree.mounts.freeAll(gpa, mnts);
 
         for (mnts) |m| {
-            const u = diskusage.statfs.query(m.mount_point) catch {
+            const u = diskfree.statfs.query(m.mount_point) catch {
                 unreadable += 1;
                 continue;
             };
@@ -241,7 +241,7 @@ fn runSpace(gpa: Allocator, io: std.Io, opts: Options) !u8 {
     return 0;
 }
 
-fn printSpaceRow(out: *std.Io.Writer, device: []const u8, mount_point: []const u8, u: diskusage.Usage) !void {
+fn printSpaceRow(out: *std.Io.Writer, device: []const u8, mount_point: []const u8, u: diskfree.Usage) !void {
     const total_1k = u.totalBytes() / 1024;
     // Matches real df/gnudf/uutils-df exactly (verified against both --
     // see CHANGELOG): "Used" is total minus RAW free (f_bfree), not minus
@@ -280,7 +280,7 @@ fn formatUsePercent(buf: *[5]u8, used_1k: u64, avail_1k: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:>3}%", .{pct}) catch "?";
 }
 
-fn trackMargin(u: diskusage.Usage, device: []const u8, mount_point: []const u8, max_margin_1k: *u64, row_buf: []u8, row_len: *usize) void {
+fn trackMargin(u: diskfree.Usage, device: []const u8, mount_point: []const u8, max_margin_1k: *u64, row_buf: []u8, row_len: *usize) void {
     const free_1k = u.freeBytes() / 1024;
     const avail_1k = u.availableBytes() / 1024;
     if (free_1k <= avail_1k) return;
@@ -298,8 +298,8 @@ fn trackMargin(u: diskusage.Usage, device: []const u8, mount_point: []const u8, 
 /// the usage text's caveat: no `realpath` in 0.16, so this is best-effort on
 /// an already-reasonable (typically absolute) path, not a guaranteed-exact
 /// resolution the way `df PATH` does via `st_dev`.
-fn bestMatch(path: []const u8, entries: []diskusage.mounts.MountEntry) ?diskusage.mounts.MountEntry {
-    var best: ?diskusage.mounts.MountEntry = null;
+fn bestMatch(path: []const u8, entries: []diskfree.mounts.MountEntry) ?diskfree.mounts.MountEntry {
+    var best: ?diskfree.mounts.MountEntry = null;
     var best_len: usize = 0;
     for (entries) |e| {
         if (e.mount_point.len > best_len and std.mem.startsWith(u8, path, e.mount_point)) {
@@ -334,17 +334,17 @@ fn runMargin(gpa: Allocator, io: std.Io, opts: Options) !u8 {
 
     if (opts.n_paths > 0) {
         for (opts.paths[0..opts.n_paths]) |p| {
-            const u = diskusage.statfs.query(p) catch |err| {
+            const u = diskfree.statfs.query(p) catch |err| {
                 try out.print("{s:<16} (unreadable: {t})\n", .{ p, err });
                 continue;
             };
             try printMarginRow(out, p, u);
         }
     } else {
-        const mnts = try diskusage.mounts.readMounts(gpa, io) orelse @constCast(&.{});
-        defer diskusage.mounts.freeAll(gpa, mnts);
+        const mnts = try diskfree.mounts.readMounts(gpa, io) orelse @constCast(&.{});
+        defer diskfree.mounts.freeAll(gpa, mnts);
         for (mnts) |m| {
-            const u = diskusage.statfs.query(m.mount_point) catch continue;
+            const u = diskfree.statfs.query(m.mount_point) catch continue;
             if (u.blocks_total == 0) continue; // dummy fs -- nothing to show
             try printMarginRow(out, m.mount_point, u);
         }
@@ -354,7 +354,7 @@ fn runMargin(gpa: Allocator, io: std.Io, opts: Options) !u8 {
     return 0;
 }
 
-fn printMarginRow(out: *std.Io.Writer, label: []const u8, u: diskusage.Usage) !void {
+fn printMarginRow(out: *std.Io.Writer, label: []const u8, u: diskfree.Usage) !void {
     const free_1k = u.freeBytes() / 1024;
     const avail_1k = u.availableBytes() / 1024;
     const margin = if (free_1k >= avail_1k) free_1k - avail_1k else 0;
@@ -366,8 +366,8 @@ fn printMarginRow(out: *std.Io.Writer, label: []const u8, u: diskusage.Usage) !v
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn runMounts(gpa: Allocator, io: std.Io) !u8 {
-    const mnts = try diskusage.mounts.readMounts(gpa, io) orelse @constCast(&.{});
-    defer diskusage.mounts.freeAll(gpa, mnts);
+    const mnts = try diskfree.mounts.readMounts(gpa, io) orelse @constCast(&.{});
+    defer diskfree.mounts.freeAll(gpa, mnts);
 
     var buf: [8192]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
@@ -393,8 +393,8 @@ fn runMounts(gpa: Allocator, io: std.Io) !u8 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn runMountinfo(gpa: Allocator, io: std.Io) !u8 {
-    const mnts = try diskusage.mountinfo.readMountinfo(gpa, io) orelse @constCast(&.{});
-    defer diskusage.mountinfo.freeAll(gpa, mnts);
+    const mnts = try diskfree.mountinfo.readMountinfo(gpa, io) orelse @constCast(&.{});
+    defer diskfree.mountinfo.freeAll(gpa, mnts);
 
     var buf: [8192]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);

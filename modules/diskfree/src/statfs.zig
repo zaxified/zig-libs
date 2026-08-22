@@ -29,7 +29,7 @@ const linux = std.os.linux;
 
 comptime {
     if (builtin.os.tag != .linux)
-        @compileError("diskusage.statfs is Linux-only (raw statfs/statfs64 syscalls, no portable fallback)");
+        @compileError("diskfree.statfs is Linux-only (raw statfs/statfs64 syscalls, no portable fallback)");
 }
 
 /// Kernel `__kernel_fsid_t` — two opaque 32-bit words identifying the
@@ -302,7 +302,7 @@ const family: Family = switch (builtin.cpu.arch) {
         // x32 (ILP32 pointers over the x86_64 syscall ABI) is neither
         // verified nor targeted by this collection — refuse rather than
         // guess at a struct layout nobody has checked.
-        .gnux32, .muslx32 => @compileError("diskusage.statfs: x32 ABI statfs64 layout not verified — not a target of this collection"),
+        .gnux32, .muslx32 => @compileError("diskfree.statfs: x32 ABI statfs64 layout not verified — not a target of this collection"),
         else => .native64,
     },
     .aarch64,
@@ -345,7 +345,7 @@ const family: Family = switch (builtin.cpu.arch) {
     .hexagon,
     .or1k,
     => .natural32,
-    else => @compileError("diskusage.statfs: no statfs64 struct layout verified for this target architecture"),
+    else => @compileError("diskfree.statfs: no statfs64 struct layout verified for this target architecture"),
 };
 
 fn toUsage(comptime T: type, raw: T) Usage {
@@ -454,7 +454,7 @@ test "query: root filesystem gives internally consistent numbers" {
 }
 
 test "query: missing path returns FileNotFound, not a garbage Usage" {
-    try testing.expectError(error.FileNotFound, query("/this/path/does/not/exist/diskusage-test"));
+    try testing.expectError(error.FileNotFound, query("/this/path/does/not/exist/diskfree-test"));
 }
 
 test "totalBytes/freeBytes/availableBytes: saturate rather than wrap on a corrupt block_size" {

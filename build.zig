@@ -182,7 +182,7 @@ const module_list = [_]Module{
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" }, .example = true },
     .{ .name = "blobstore", .deps = &.{"hashdigest"}, .example = true },
     .{ .name = "procnet", .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "diskusage", .example = true },
+    .{ .name = "diskfree", .example = true },
     .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "procrun", .deps = &.{"argsafe"} },
     .{ .name = "dataset", .example = true },
@@ -478,7 +478,7 @@ pub fn build(b: *std.Build) void {
         // `test_deps` the published module never gets. It can therefore pass
         // while a function is unreachable from outside, a type needed to call
         // it is not exported, or an error is not nameable. That is not a
-        // hypothetical either — it is exactly how `diskusage` shipped two
+        // hypothetical either — it is exactly how `diskfree` shipped two
         // functions that did not compile: nothing had ever imported it.
         //
         // So the example is wired to `mod` — the module `b.addModule`
