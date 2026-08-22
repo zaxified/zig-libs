@@ -5,7 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-08-18** — **BREAKING:** `initialize` no longer advertises the `resources`/`prompts`
+- **2026-08-22** — Two transport-boundary fixes:
+  - `readLine` now discards an unterminated final line — the stream ends, or a
+    cancelable read is canceled, mid-line — instead of handing the fragment
+    to `handleMessage` as if it were complete. Previously that produced a
+    `-32700` parse-error response written to a peer that, in the EOF/cancel
+    case, is already gone. Matches the official Python SDK (silently
+    discards a trailing fragment on EOF, verified up to ~4 MiB) and the Rust
+    SDK's own reversal (PR #833 answered it, PR #940 reverted after issue
+    #938 showed it causes an error-bounce loop: the peer reads the error
+    response as more invalid input and answers with another error). The
+    `max_line_len` overflow path already worked this way; this makes the
+    plain-EOF/cancel path match it.
+  - **BREAKING (minor):** `Error` gains a `Canceled` variant — a public API
+    widening affecting every function that returns `Error!…`, though only
+    `serveStdio` can actually produce it: a `std.Io` cancelation of its
+    blocked read now surfaces as `error.Canceled` instead of being folded
+    into the ordinary `{}` "session end" return. `serve` cannot make this
+    distinction itself (it is handed only a foreign `*std.Io.Reader`
+    interface, not the concrete reader the cancelation state lives on) and
+    keeps returning `{}` for EOF, cancelation and a dead peer alike — see
+    its doc comment for how a caller with its own concrete reader recovers
+    the distinction, and `serveStdio`'s for how it does. A consumer with an
+    exhaustive `switch` over `mcp.Error` needs a new arm (or an `else`). `initialize` no longer advertises the `resources`/`prompts`
   capability keys unconditionally. Each is now present only when its own catalog is non-empty at
   the moment `initialize` is answered (`resources` also counts resource templates); `tools` is
   unchanged — still present in every result, empty catalog or not. A server that registers only

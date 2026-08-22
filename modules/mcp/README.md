@@ -64,6 +64,10 @@ not supported** (MCP doesn't use them) → `-32600`.
 **Newline-delimited JSON** — the MCP stdio framing: every
 message in either direction is exactly one JSON object followed by one `\n`
 (raw newlines inside spliced JSON are stripped). No `Content-Length` headers.
+A final line that never gets its `\n` — the stream ends, or a cancelable read
+is canceled, mid-line — is discarded rather than answered as a parse error:
+there is no peer left to usefully receive that reply, and answering it risks
+an error-bounce loop with one that only looks gone.
 
 ## API
 
@@ -99,10 +103,15 @@ try server.addTool(.{
     .ctx = &app,                                              // ← threaded to every call
 });
 
-// stdio (the MCP stdio transport):
+// stdio (the MCP stdio transport). Returns `error.Canceled`, not a plain
+// `{}`, when a `std.Io` cancelation interrupts the blocked read:
 try server.serveStdio(io);
 
-// or any reader/writer pair (pipe, socket, test harness):
+// or any reader/writer pair (pipe, socket, test harness). `serve` cannot
+// tell a cancelation apart from the peer hanging up -- it only sees the
+// foreign `*std.Io.Reader` interface -- so both return a plain `{}`; a
+// caller on a cancelable reader recovers the distinction from its own
+// concrete reader's out-of-band `err` field (see the doc comment):
 try server.serve(reader, writer);
 
 // or one message at a time:

@@ -49,8 +49,17 @@ the zig-libs authors (MIT).
   brace-matcher rejects NDJSON/arrays); `isError:true` marks a tool failure.
 - **Never-panic error policy.** Malformed input becomes the proper JSON-RPC error (-32700/-32600/
   -32601/-32602/-32603, plus MCP's -32002 for an unresolvable `resources/read` uri), never a panic
-  or a Zig error; only OOM and transport write-failure surface as `error`. A request (has `id`)
-  gets exactly one response; a notification (no `id`) gets none.
+  or a Zig error; only OOM and transport write-failure surface as `error` from `handleMessage`. A
+  request (has `id`) gets exactly one response; a notification (no `id`) gets none. A line that is
+  never completed with a `\n` — the stream ends or is canceled mid-line — never reaches
+  `handleMessage` at all: `readLine` discards it, matching the max_line_len overflow path, instead
+  of answering a fragment with -32700 (ecosystem-verified: the official Python SDK discards it
+  silently on EOF; the Rust SDK answered it once and reverted after that produced an error-bounce
+  loop with the peer). `serve`/`serveStdio` add `Canceled` to `Error` on top of that: `serveStdio`
+  (which owns its reader) surfaces a `std.Io` cancelation of the blocked read as `error.Canceled`
+  instead of folding it into the ordinary `{}` "session end" return; `serve` itself cannot make
+  that distinction — it is handed only a `*std.Io.Reader` interface, not the concrete reader its
+  cancelation state lives on — see `serve`'s doc comment.
 - **Server→client requests are issue-now / correlate-later, by necessity.** `handleMessage` takes
   one message and one writer and owns no reader; under `mcp-http` the client's answer arrives on a
   *different HTTP request*, which cannot be serviced while the first is parked (the same constraint

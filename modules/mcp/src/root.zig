@@ -219,8 +219,11 @@ pub const spec_anchor_index = [_]MethodAnchor{
 
 /// Everything `handleMessage`/`serve` can fail with. Malformed *input* never
 /// surfaces here (it becomes a JSON-RPC error response); only allocation
-/// failure and transport write failure do.
-pub const Error = error{ OutOfMemory, WriteFailed };
+/// failure, transport write failure, and -- from `serveStdio` only -- a
+/// `std.Io` cancelation of the blocked read surface here. `handleMessage`,
+/// `handleMessageFrom` and `serve` itself never produce `Canceled`; see
+/// `serveStdio`'s doc comment for why only it can.
+pub const Error = error{ OutOfMemory, WriteFailed, Canceled };
 
 /// Pick the protocol version to answer with: the client's requested one if we
 /// support it, else our latest. `requested` is null when the client omits it.
@@ -1905,16 +1908,23 @@ pub const Server = struct {
     /// Serve newline-delimited JSON-RPC until EOF: read one line, handle it,
     /// repeat. Works over any reader/writer pair — stdio, an in-memory pipe,
     /// a socket. A read failure ends the loop like EOF (a dying peer is a
-    /// session end, not a server error).
+    /// session end, not a server error); an unterminated trailing fragment
+    /// (the stream ends, or is canceled, mid-line) is discarded rather than
+    /// handed to `handleMessage` as if it were a complete line — see
+    /// `readLine`'s doc comment.
     ///
-    /// This also swallows a `std.Io` cancellation of the blocked read inside
-    /// `readLine`: it is a read failure like any other, so `serve` just
-    /// returns `{}` as though the peer hung up cleanly — it does not surface
-    /// as an error at all, let alone a distinguishable one. A caller driving
-    /// `serve` on a cancelable task and needing to tell "canceled" from
-    /// "peer disconnected" has to inspect `in`'s own concrete reader (its
-    /// out-of-band `err` field, e.g. `std.Io.net.Stream.Reader.err` /
-    /// `std.Io.File.Reader.err`) after `serve` returns, not `serve`'s result.
+    /// `serve` takes a *foreign* `*std.Io.Reader` — an interface, not a
+    /// concrete reader — so it cannot itself tell a `std.Io` cancelation of
+    /// the blocked read apart from the peer actually hanging up: both simply
+    /// end `readLine`'s loop, and `serve` returns `{}` either way, exactly as
+    /// for a clean EOF. A caller driving `serve` on a cancelable task and
+    /// needing to tell "canceled" from "peer disconnected" has to inspect its
+    /// own concrete reader's out-of-band `err` field after `serve` returns
+    /// (e.g. `std.Io.net.Stream.Reader.err` / `std.Io.File.Reader.err`) —
+    /// `serve` is handed only the interface and has no such field to consult
+    /// on the caller's behalf. `serveStdio`, which owns its reader, does
+    /// exactly this and surfaces `error.Canceled` instead of `{}`; see its
+    /// doc comment.
     pub fn serve(self: *Server, in: *std.Io.Reader, out: *std.Io.Writer) Error!void {
         var line_buf: std.ArrayList(u8) = .empty;
         defer line_buf.deinit(self.gpa);
@@ -1926,12 +1936,36 @@ pub const Server = struct {
     /// Built-in stdio transport: newline-delimited JSON-RPC over
     /// stdin/stdout — the MCP stdio framing. Buffers are internal; every
     /// response line is flushed before the next read.
+    ///
+    /// Unlike `serve`, this function owns its reader (`stdin_reader` is a
+    /// concrete `std.Io.File.Reader`, never exposed to the caller), so it is
+    /// the one place in this module that *can* recover a `std.Io` cancelation
+    /// of the blocked read: after `serve` returns -- which, per its own doc
+    /// comment, cannot distinguish "canceled" from "stdin closed" and always
+    /// returns `{}` -- `recoverFileCancel` inspects `stdin_reader.err` and
+    /// surfaces `error.Canceled` instead of the ordinary session-end `{}`. A
+    /// plain EOF (stdin closed) still returns `{}`, and any other read
+    /// failure keeps meaning session end.
     pub fn serveStdio(self: *Server, io: std.Io) Error!void {
         var read_buf: [64 * 1024]u8 = undefined;
         var write_buf: [64 * 1024]u8 = undefined;
         var stdin_reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
         var stdout_writer = std.Io.File.stdout().writerStreaming(io, &write_buf);
-        return self.serve(&stdin_reader.interface, &stdout_writer.interface);
+        try self.serve(&stdin_reader.interface, &stdout_writer.interface);
+        try recoverFileCancel(&stdin_reader);
+    }
+
+    /// Distinguish a canceled wait from a genuine EOF/read failure on a
+    /// `std.Io.File.Reader` that `serve` has already swallowed into a plain
+    /// `{}` return. `std.Io.Reader.Error` is exactly `{ReadFailed,
+    /// EndOfStream}` and cannot carry `Canceled`; the concrete reader records
+    /// the real cause in its own out-of-band `err` field instead. Split out
+    /// of `serveStdio` so this recovery step -- the one line the whole
+    /// change is about -- can be exercised in a test against any
+    /// `std.Io.File.Reader`, not only the real process stdin `serveStdio`
+    /// hard-codes.
+    fn recoverFileCancel(reader: *const std.Io.File.Reader) Error!void {
+        if (reader.err) |e| if (e == error.Canceled) return error.Canceled;
     }
 
     /// Handle exactly one JSON-RPC message: parse it, dispatch it, write the
@@ -2468,7 +2502,11 @@ fn buildPromptResult(jw: *std.json.Stringify, prompt: *const Prompt, req: *const
 
 // ── response senders (build one line on the arena, write it, flush) ─────────
 
-fn flushLine(out: *std.Io.Writer, line: []const u8) Error!void {
+// Deliberately `std.Io.Writer.Error!void`, not the module's `Error`: this
+// only ever calls writer functions, so it must not carry `Canceled` -- doing
+// so would force it into every caller's error set, including `SendError`
+// (sampling/elicitation senders), which never touches a canceled read.
+fn flushLine(out: *std.Io.Writer, line: []const u8) std.Io.Writer.Error!void {
     try out.writeAll(line);
     try out.flush();
 }
@@ -2529,19 +2567,28 @@ pub const max_line_len: usize = 16 * 1024 * 1024;
 
 /// Read one newline-terminated line into the reusable buffer (grows as
 /// needed up to `max_line_len`, so a tools/call line carrying a large payload
-/// is handled). Returns the line slice (without '\n'), or null at EOF. A read
-/// failure — or a line that would exceed `max_line_len` — counts as EOF, so a
-/// peer that never terminates a line cannot exhaust memory.
+/// is handled). Returns the line slice (without '\n'), or null when no
+/// *complete* line is available: EOF, a read failure (including a `std.Io`
+/// cancelation reaching `takeByte` as an ordinary error -- see `serve`'s doc
+/// comment for how a caller recovers that distinction), or a line that would
+/// exceed `max_line_len`.
+///
+/// In every one of those cases any partial line already buffered is
+/// discarded, never handed back as though it were complete. A truncated
+/// fragment is not valid JSON-RPC; answering it would turn it into a
+/// `-32700` parse-error response written to a peer that, in the EOF/cancel
+/// case, is already gone -- matching the official Python SDK (silently
+/// discards a trailing unterminated fragment on EOF) and the ecosystem
+/// consensus the Rust SDK arrived at the hard way: it briefly answered
+/// unparseable stdio input (PR #833) and reverted it (PR #940) after that
+/// produced an error-bounce loop with the peer (issue #938).
 fn readLine(gpa: std.mem.Allocator, reader: *std.Io.Reader, buf: *std.ArrayList(u8)) Error!?[]u8 {
     buf.clearRetainingCapacity();
     while (true) {
-        const byte = reader.takeByte() catch {
-            if (buf.items.len == 0) return null;
-            return buf.items;
-        };
+        const byte = reader.takeByte() catch return null;
         if (byte == '\n') return buf.items;
-        // Cap the buffer: an unterminated/over-long line is treated as a
-        // read failure (session end), bounding memory to max_line_len.
+        // Cap the buffer: an unterminated/over-long line is discarded like
+        // any other read failure, bounding memory to max_line_len.
         if (buf.items.len >= max_line_len) return null;
         try buf.append(gpa, byte);
     }
@@ -3177,14 +3224,18 @@ test "integration: full round-trip over an in-memory pipe (serve)" {
     defer s.deinit();
 
     // The canonical MCP session: initialize -> initialized -> tools/list ->
-    // tools/call, plus a malformed line mid-stream (the loop must survive it)
-    // and a final line without a trailing newline.
+    // tools/call, plus a malformed line mid-stream (the loop must survive
+    // it). The last line is newline-terminated like every other -- an
+    // unterminated final line is its own edge case, covered separately by
+    // "serve: an unterminated trailing fragment produces no parse-error
+    // response (no error-bounce)".
     const input =
         \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"cli","version":"1.0"}}}
         \\{"jsonrpc":"2.0","method":"notifications/initialized"}
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
         \\this is not json
         \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"text":"round-trip"}}}
+        \\
     ;
     var in: std.Io.Reader = .fixed(input);
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -3553,6 +3604,88 @@ test "serve: blank lines and CRLF line endings are tolerated" {
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n",
         aw.written(),
     );
+}
+
+test "readLine: an unterminated final fragment is discarded on EOF, not returned as a line" {
+    // Evidence for this behavior (cited in readLine's doc comment, not
+    // re-measured here): the official MCP Python SDK 2.0.0 silently
+    // discards a trailing unterminated fragment on EOF; the Rust SDK
+    // answered it instead (PR #833) and reverted after that produced an
+    // error-bounce loop with the peer (issue #938, PR #940). A stream that
+    // ends mid-line must be treated like the max_line_len overflow path
+    // already is: readLine returns null, never the partial bytes.
+    const alloc = testing.allocator;
+    var in: std.Io.Reader = .fixed("{\"jsonrpc\":\"2.0\",\"id\":1,\"meth");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try testing.expect(try readLine(alloc, &in, &buf) == null);
+}
+
+test "serve: an unterminated trailing fragment produces no parse-error response (no error-bounce)" {
+    var s = testServer(null);
+    defer s.deinit();
+    // The second "line" never gets its trailing '\n' -- the stream just ends
+    // mid-message, exactly as it would on a cancel or a peer that dies
+    // mid-write.
+    const input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"meth";
+    var in: std.Io.Reader = .fixed(input);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.serve(&in, &aw.writer);
+    // Only the complete first line gets a response. The truncated second
+    // line must not become a -32700 parse-error line written to a peer that,
+    // on a real EOF/cancel, is already gone.
+    try testing.expectEqualStrings(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n",
+        aw.written(),
+    );
+}
+
+test "serveStdio's cancel recovery: a canceled blocked read surfaces error.Canceled (mutation-critical)" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+
+    // `serveStdio` hard-codes `std.Io.File.stdin()`, so it cannot be driven
+    // from a test without hijacking the real process stdin. Instead this
+    // exercises the exact two production calls `serveStdio` makes -- `serve`
+    // then `recoverFileCancel` -- against a `std.Io.File.Reader` backed by a
+    // pipe nobody writes to, so the blocked read is a real syscall a
+    // `std.Io.Threaded` cancel can interrupt. Measured with a standalone
+    // probe first (same shape as CANCEL-SPEC.md's socket probe, adapted to a
+    // pipe): the blocked `takeByte` returns in 0ms once `Future.cancel` is
+    // called, with `reader.err == error.Canceled` while the interface-level
+    // result is the ordinary `error.ReadFailed` -- `std.Io.Reader.Error`
+    // cannot carry `Canceled`, only the concrete reader's out-of-band field
+    // can.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.PipeFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]); // never written to: keeps the read genuinely blocked
+
+    var s = testServer(null);
+    defer s.deinit();
+
+    const Ctx = struct {
+        fn run(server: *Server, rfd: i32, io_: std.Io) Error!void {
+            var read_buf: [64]u8 = undefined;
+            var reader = (std.Io.File{ .handle = rfd, .flags = .{ .nonblocking = false } })
+                .readerStreaming(io_, &read_buf);
+            var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer aw.deinit();
+            try server.serve(&reader.interface, &aw.writer);
+            try Server.recoverFileCancel(&reader);
+        }
+    };
+
+    var fut = try io.concurrent(Ctx.run, .{ &s, fds[0], io });
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }
 
 test "readLine: an over-long unterminated line is capped, not buffered unbounded (audit CRIT)" {
@@ -4932,6 +5065,7 @@ test "integration: ask on one call, act on the next (the two-call shape)" {
         \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask"}}
         \\{"jsonrpc":"2.0","id":1,"result":{"action":"accept","content":{"name":"octocat"}}}
         \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"whoami"}}
+        \\
     ;
     var in: std.Io.Reader = .fixed(input);
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
