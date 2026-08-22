@@ -105,12 +105,26 @@ pub const TcpEmitter = struct {
         e.stream.close(e.io);
     }
 
-    pub fn send(e: *TcpEmitter, msg: *const Message) !void {
+    /// Failures reported by `send`. `Canceled`: the blocking write was
+    /// canceled through the `std.Io` cancellation protocol (`Future.cancel`).
+    /// Surfaced instead of `WriteFailed` — `Io.Writer.Error` cannot carry it
+    /// directly, so the concrete `std.Io.net.Stream.Writer`'s out-of-band
+    /// `err` field is inspected before falling back to `WriteFailed`.
+    pub const SendError = error{ Canceled, NoSpaceLeft } || std.Io.Writer.Error;
+
+    pub fn send(e: *TcpEmitter, msg: *const Message) SendError!void {
         const payload = try message.bufPrint(msg, &e.scratch);
         var wbuf: [32]u8 = undefined; // holds the "MSG-LEN SP" prefix
         var sw = e.stream.writer(e.io, &wbuf);
-        try writeOctetCounted(&sw.interface, payload);
-        try sw.interface.flush();
+        writeOctetCounted(&sw.interface, payload) catch return writeFailure(&sw);
+        sw.interface.flush() catch return writeFailure(&sw);
+    }
+
+    /// Distinguish a canceled wait from a genuine write failure. `Io.Writer`'s
+    /// error set cannot carry `Canceled`; the concrete writer records it here.
+    fn writeFailure(sw: *std.Io.net.Stream.Writer) SendError {
+        if (sw.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.WriteFailed;
     }
 };
 
