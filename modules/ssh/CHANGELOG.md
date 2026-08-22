@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — New public field `Transport.negotiated` (`transport.NegotiatedAlgorithms`):
+  the KEX/host-key/cipher/MAC wire names KEXINIT actually negotiated (RFC 4253 §7.1),
+  client and server side. Before this, `clientHandshake`/`serverHandshake` computed these
+  as local variables and dropped them — a caller had no way to reproduce `ssh -v`'s
+  negotiation banner, which both Go's `ssh.ConnMetadata` and russh's `check_server_key`
+  callback expose. Sweep of the whole handshake path (client + server) found no other
+  dropped negotiated parameter worth exposing the same way (the peer's raw version-
+  identification string is also currently dropped, but exposing it needs `Transport` to
+  own allocated memory, a materially bigger change, left open). Lifetimes: every field
+  resolves to one of this module's own `pub const` name-list entries, or (server-side host
+  key) a `HostKey.algorithmName()` literal — never a slice into a peer-parsed `KexInit`'s
+  name-list, which is `gpa`-freed once the handshake that decoded it returns. Fixing this
+  on the server side required also fixing `server.zig`'s private `pickFirst`, which
+  previously returned the match from the *client's* (freed-on-return) name-list rather
+  than from this module's own static one — harmless while its result was used only
+  inside `serverHandshake`, but exactly the dangling-pointer shape `NegotiatedAlgorithms`
+  cannot tolerate once held past the function returning. Proven with new assertions
+  against a real `sshd`/`ssh` (the existing live OpenSSH interop tests, both files):
+  observed to fail (16/100 tests, exactly the live-interop ones) with the two
+  `t.negotiated = ...` assignments reverted, pass restored (100/100) — Debug, ReleaseSafe
+  and ReleaseFast.
 - **2026-08-22** — `server.zig` and `connection.zig`'s test-only `acceptBounded` (the
   `poll(2)`-bounded accept wait every self-interop/live-interop test goes through) now
   recovers a `std.Io` cancellation. `std.posix.poll` retries on `EINTR` and a thread

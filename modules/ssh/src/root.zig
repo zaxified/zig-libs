@@ -10,7 +10,11 @@
 //! Protocol, `chacha20-poly1305@openssh.com` / `aes256-ctr`+`hmac-sha2-256` /
 //! `aes{128,256}-gcm@openssh.com` ciphers, and host-key verify (client) /
 //! signing (server) for ssh-ed25519, rsa-sha2-256/512 (via the `rsa` module)
-//! and ecdsa-sha2-nistp256.
+//! and ecdsa-sha2-nistp256. `Transport.negotiated`
+//! (`transport.NegotiatedAlgorithms`) exposes the negotiated KEX/host-key/
+//! cipher/MAC wire names once a handshake completes, client and server side —
+//! diagnostics parity with `ssh -v`'s negotiation banner, which this module
+//! otherwise has no way to reproduce.
 //!
 //! Part 2 — userauth (`userauth.zig`): the `publickey` method (RFC 4252 §7,
 //! including the two-phase query → SSH_MSG_USERAUTH_PK_OK → signed-request

@@ -1437,11 +1437,33 @@ fn pickFirst(client: []const []const u8, server: []const []const u8) ?[]const u8
     return null;
 }
 
-const Negotiated = struct {
+/// The algorithm names actually negotiated during KEXINIT (RFC 4253 §7.1),
+/// kept on `Transport` once a handshake completes so a caller can reproduce
+/// `ssh -v`'s "kex: ... cipher: ... MAC: ..." negotiation banner — before
+/// this existed, the negotiated names were local variables inside the
+/// handshake and simply dropped, with no way for a caller to learn what was
+/// negotiated at all (both Go's `ssh.ConnMetadata` and russh's
+/// `check_server_key` callback arguments expose the equivalent).
+///
+/// Every field here is either one of this module's own `pub const` name-list
+/// entries (`kex_algorithms` / `server_host_key_algorithms` /
+/// `encryption_algorithms` / `mac_algorithms`) or, server-side, a
+/// `server.HostKey.algorithmName()` literal — NEVER a slice into a peer-
+/// parsed `KexInit`'s name-list, which is freed once the handshake that
+/// decoded it returns. That is what lets every string here safely outlive
+/// the `Transport` with no ownership/freeing of its own: see `pickFirst`
+/// (this file) and its server-side mirror for where that is enforced.
+pub const NegotiatedAlgorithms = struct {
     kex: []const u8,
     host_key: []const u8,
     cipher_c2s: []const u8,
     cipher_s2c: []const u8,
+    /// `null` when the matching direction's cipher is a self-authenticating
+    /// AEAD cipher (`isAeadCipher`) — RFC 4253 §7.1 still carries a MAC
+    /// name-list then, but nothing is negotiated from it (`ssh -v` prints
+    /// "MAC: <implicit>" for the same case).
+    mac_c2s: ?[]const u8,
+    mac_s2c: ?[]const u8,
 };
 
 /// True for a self-authenticating AEAD cipher (no separate negotiated MAC):
@@ -1452,19 +1474,22 @@ pub fn isAeadCipher(name: []const u8) bool {
         std.mem.eql(u8, name, "aes128-gcm@openssh.com");
 }
 
-fn negotiate(server_kex: KexInit) TransportError!Negotiated {
+fn negotiate(server_kex: KexInit) TransportError!NegotiatedAlgorithms {
     const kex = pickFirst(&kex_algorithms, server_kex.kex_algorithms) orelse return error.UnsupportedAlgorithm;
     const host_key = pickFirst(&server_host_key_algorithms, server_kex.server_host_key_algorithms) orelse return error.UnsupportedAlgorithm;
     const c2s = pickFirst(&encryption_algorithms, server_kex.encryption_algorithms_client_to_server) orelse return error.UnsupportedAlgorithm;
     const s2c = pickFirst(&encryption_algorithms, server_kex.encryption_algorithms_server_to_client) orelse return error.UnsupportedAlgorithm;
-    // MAC only matters for a non-AEAD cipher; require one is agreeable then.
-    if (!isAeadCipher(c2s)) {
-        _ = pickFirst(&mac_algorithms, server_kex.mac_algorithms_client_to_server) orelse return error.UnsupportedAlgorithm;
-    }
-    if (!isAeadCipher(s2c)) {
-        _ = pickFirst(&mac_algorithms, server_kex.mac_algorithms_server_to_client) orelse return error.UnsupportedAlgorithm;
-    }
-    return .{ .kex = kex, .host_key = host_key, .cipher_c2s = c2s, .cipher_s2c = s2c };
+    // MAC only matters for a non-AEAD cipher; require one is agreeable then,
+    // and keep the name (previously discarded to `_`) for diagnostics.
+    const mac_c2s: ?[]const u8 = if (isAeadCipher(c2s))
+        null
+    else
+        pickFirst(&mac_algorithms, server_kex.mac_algorithms_client_to_server) orelse return error.UnsupportedAlgorithm;
+    const mac_s2c: ?[]const u8 = if (isAeadCipher(s2c))
+        null
+    else
+        pickFirst(&mac_algorithms, server_kex.mac_algorithms_server_to_client) orelse return error.UnsupportedAlgorithm;
+    return .{ .kex = kex, .host_key = host_key, .cipher_c2s = c2s, .cipher_s2c = s2c, .mac_c2s = mac_c2s, .mac_s2c = mac_s2c };
 }
 
 // ── Transport ────────────────────────────────────────────────────────────
@@ -1479,6 +1504,12 @@ pub const Transport = struct {
     /// Fixed for the connection's lifetime once the first KEX completes (the
     /// exchange hash `H`; up to 64 bytes for a SHA-512 first KEX).
     session_id: ?SessionId = null,
+    /// The algorithm names KEXINIT actually negotiated (RFC 4253 §7.1) —
+    /// `null` until a handshake completes, then set for the connection's
+    /// lifetime. Diagnostics only (e.g. an `ssh -v`-style banner); nothing
+    /// in this module reads it back. See `NegotiatedAlgorithms` for why the
+    /// strings inside are safe to hold onto with no separate lifetime.
+    negotiated: ?NegotiatedAlgorithms = null,
 
     /// A `std.Io` cancellation of a blocking read on `reader` reaches this
     /// transport as plain `error.ReadFailed` — `std.Io.Reader.Error` is only
@@ -1545,6 +1576,7 @@ pub const Transport = struct {
         defer server_kex.deinit(gpa);
 
         const neg = try negotiate(server_kex);
+        t.negotiated = neg;
         // NB: a server that sets first_kex_packet_follows with a wrong guess is
         // not handled here (real OpenSSH never guesses); part 1 assumes none.
 
@@ -2461,6 +2493,23 @@ fn liveInterop(kex_name: []const u8, cipher_name: []const u8) !void {
             .aes128 => try std.testing.expectEqualStrings("aes128-gcm@openssh.com", cipher_name),
         },
         .none => return error.ProtocolError,
+    }
+
+    // `Transport.negotiated` must report exactly what this real `sshd` was
+    // forced (via `-o KexAlgorithms=...`/`-o Ciphers=...`) to negotiate —
+    // the strongest available proof, since it is checked against a real
+    // independent SSH implementation rather than against ourselves.
+    const neg = transport.negotiated orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(kex_name, neg.kex);
+    try std.testing.expectEqualStrings("ssh-ed25519", neg.host_key); // this test's sshd only holds an ed25519 host key
+    try std.testing.expectEqualStrings(cipher_name, neg.cipher_c2s);
+    try std.testing.expectEqualStrings(cipher_name, neg.cipher_s2c);
+    if (isAeadCipher(cipher_name)) {
+        try std.testing.expect(neg.mac_c2s == null);
+        try std.testing.expect(neg.mac_s2c == null);
+    } else {
+        try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_c2s.?);
+        try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_s2c.?);
     }
 }
 

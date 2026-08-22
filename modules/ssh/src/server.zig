@@ -802,11 +802,25 @@ fn buildCipher(name: []const u8, dir: Direction, kr: transport.KexResult, sid: [
 
 /// First name on `preferred` that `available` also lists (RFC 4253 §7.1 —
 /// the *client's* list is the preference order, so the server passes the
-/// client's list first). Mirrors transport.zig's private `pickFirst`.
+/// client's list first). Mirrors transport.zig's private `pickFirst`, with
+/// one deliberate difference: this always returns the matching entry FROM
+/// `available`, never from `preferred`.
+///
+/// `preferred` is always `client_kex`'s freshly-`decode`d, `gpa`-owned
+/// name-list here (`serverHandshake` frees it via `client_kex.deinit(gpa)`
+/// before returning), while `available` is always one of this module's own
+/// `pub const` static arrays (or, for the host-key case, a
+/// `HostKey.algorithmName()` literal). Returning from `preferred` would hand
+/// back a pointer into memory `serverHandshake` frees before the caller ever
+/// sees it — exactly what `NegotiatedAlgorithms` on `Transport` cannot
+/// tolerate, since it must stay valid for the connection's lifetime.
+/// Returning from `available` instead costs nothing (the two strings are
+/// byte-identical by construction — `std.mem.eql` just confirmed it) and
+/// makes every negotiated name here `'static`-equivalent for free.
 fn pickFirst(preferred: []const []const u8, available: []const []const u8) ?[]const u8 {
     for (preferred) |p| {
         for (available) |a| {
-            if (std.mem.eql(u8, p, a)) return p;
+            if (std.mem.eql(u8, p, a)) return a;
         }
     }
     return null;
@@ -912,15 +926,33 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
         return error.UnsupportedAlgorithm;
     const cipher_s2c = pickFirst(client_kex.encryption_algorithms_server_to_client, &transport.encryption_algorithms) orelse
         return error.UnsupportedAlgorithm;
-    // MAC only matters for a non-AEAD cipher (mirrors the client's policy).
-    if (!transport.isAeadCipher(cipher_c2s)) {
-        _ = pickFirst(client_kex.mac_algorithms_client_to_server, &transport.mac_algorithms) orelse
+    // MAC only matters for a non-AEAD cipher (mirrors the client's policy),
+    // and the name (previously discarded to `_`) is kept for diagnostics.
+    const mac_c2s: ?[]const u8 = if (transport.isAeadCipher(cipher_c2s))
+        null
+    else
+        pickFirst(client_kex.mac_algorithms_client_to_server, &transport.mac_algorithms) orelse
             return error.UnsupportedAlgorithm;
-    }
-    if (!transport.isAeadCipher(cipher_s2c)) {
-        _ = pickFirst(client_kex.mac_algorithms_server_to_client, &transport.mac_algorithms) orelse
+    const mac_s2c: ?[]const u8 = if (transport.isAeadCipher(cipher_s2c))
+        null
+    else
+        pickFirst(client_kex.mac_algorithms_server_to_client, &transport.mac_algorithms) orelse
             return error.UnsupportedAlgorithm;
-    }
+
+    // Record what got negotiated (RFC 4253 §7.1) on `t` for the connection's
+    // lifetime — see `transport.NegotiatedAlgorithms` for why every field
+    // here (`kex_name`/`hk.algorithmName()`/`cipher_c2s`/`cipher_s2c` all
+    // resolve to a `pickFirst`-returned-from-`available` or static-literal
+    // string) is safe to keep past this function returning and freeing
+    // `client_kex`.
+    t.negotiated = .{
+        .kex = kex_name,
+        .host_key = hk.algorithmName(),
+        .cipher_c2s = cipher_c2s,
+        .cipher_s2c = cipher_s2c,
+        .mac_c2s = mac_c2s,
+        .mac_s2c = mac_s2c,
+    };
 
     // RFC 4253 §7: a wrongly-guessed first KEX packet must be discarded
     // (OpenSSH never guesses; this is spec completeness).
@@ -1778,6 +1810,24 @@ fn liveOpensshClient(keygen_type: []const u8, hostkey_algo: []const u8, kex_name
             },
             .none => return error.ProtocolError,
         }
+    }
+
+    // `Transport.negotiated` must report exactly what the real `ssh` client
+    // was forced (via `-o KexAlgorithms=.../-o Ciphers=.../-o
+    // HostKeyAlgorithms=...`) to negotiate — the server-side counterpart of
+    // the client-side check in transport.zig's `liveInterop`, and likewise
+    // checked against a real independent SSH implementation.
+    const neg = t.negotiated orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(kex_name, neg.kex);
+    try std.testing.expectEqualStrings(hostkey_algo, neg.host_key);
+    try std.testing.expectEqualStrings(cipher_name, neg.cipher_c2s);
+    try std.testing.expectEqualStrings(cipher_name, neg.cipher_s2c);
+    if (transport.isAeadCipher(cipher_name)) {
+        try std.testing.expect(neg.mac_c2s == null);
+        try std.testing.expect(neg.mac_s2c == null);
+    } else {
+        try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_c2s.?);
+        try std.testing.expectEqualStrings("hmac-sha2-256", neg.mac_s2c.?);
     }
 
     // The client's next encrypted packet must decrypt to its userauth

@@ -14,7 +14,9 @@ as the server. No `@panic` stubs remain in this module.
   `chacha20-poly1305@openssh.com` / `aes256-ctr`+`hmac-sha2-256` /
   `aes{128,256}-gcm@openssh.com` ciphers, and host-key *verification* (client)
   / *signing* (server) for ssh-ed25519, rsa-sha2-256/512 (via the `rsa` module)
-  and ecdsa-sha2-nistp256.
+  and ecdsa-sha2-nistp256. Once a handshake completes, `Transport.negotiated`
+  reports the negotiated KEX/host-key/cipher/MAC wire names (both roles) —
+  diagnostics parity with `ssh -v`'s negotiation banner.
 - **Part 2 — userauth** (`userauth.zig`): the `publickey` method (RFC 4252 §7)
   including the two-phase query → `SSH_MSG_USERAUTH_PK_OK` → signed-request
   flow, and the `password` method (§8), plus `_FAILURE`/`_SUCCESS`/`_BANNER` —
@@ -137,7 +139,8 @@ Top-level shortcuts: `ssh.authenticate` (client publickey auth),
 
 See `src/transport.zig` for the full client transport API (algorithm
 name-list constants, `KexInit`, `exchangeVersions`, `Packet`/`CipherState`/
-`readPacket`/`writePacket`, `HostKeyVerifier`, `Transport`/`connect`),
+`readPacket`/`writePacket`, `HostKeyVerifier`, `NegotiatedAlgorithms`,
+`Transport`/`connect`),
 `src/server.zig` for the server transport API (`HostKey`, `ServerConfig`,
 `serverHandshake`/`accept`), `src/userauth.zig` and `src/connection.zig` for
 parts 2 and 3, and `SPEC.md` for the design/threat notes and what is
