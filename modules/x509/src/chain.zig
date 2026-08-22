@@ -15,10 +15,13 @@
 //! `nameConstraints` (`checkNameConstraints`) and extended-key-usage
 //! chaining (`checkExtendedKeyUsage`). Per-link signature verification
 //! reuses `std.crypto.Certificate.Parsed.verify` for every algorithm std can
-//! parse (RSA PKCS1v15, ECDSA P-256/P-384, Ed25519); the one gap std cannot
-//! even parse — RSASSA-PSS (RFC 4055) — is filled by `verifyPssLink`, which
-//! does its own raw-DER walk (`parseShape`, shared with the rest of this
-//! file) and calls this repo's `rsa.verifyPss`.
+//! parse (RSA PKCS1v15, ECDSA P-256/P-384, Ed25519). Two algorithms std
+//! cannot even parse are filled in here, both through the same raw-DER walk
+//! (`parseShape`) and both for the same underlying reason — std's OID table
+//! is closed and neither OID is in it: RSASSA-PSS (RFC 4055) via
+//! `verifyPssLink` and this repo's `rsa.verifyPss`, and ML-DSA (RFC 9881)
+//! via `verifyMlDsaLink` and std's own `std.crypto.sign.mldsa`. Which OIDs
+//! this module recognises is `algorithm.zig`, not std.
 //!
 //! **Out of scope, by design, not silently skipped:** CRL/OCSP revocation
 //! checking (RFC 5280 §6.3 — a separate online/offline data-fetching
@@ -35,6 +38,7 @@ const std = @import("std");
 const Certificate = std.crypto.Certificate;
 const der = Certificate.der;
 const extensions = @import("extensions.zig");
+const algorithm = @import("algorithm.zig");
 const rsa = @import("rsa");
 
 /// One certificate's DER bytes. A bare `[]const u8` alias rather than a
@@ -69,7 +73,23 @@ pub const VerifiedChain = struct {
     /// Number of certificates from (and including) the leaf up to (and
     /// including) the certificate whose issuer matched a trust anchor.
     depth: u32,
-    leaf: Certificate.Parsed,
+    /// The verified leaf, in std's own parse. `null` — and only null — when
+    /// the leaf uses an algorithm `std.crypto.Certificate` has no name for
+    /// (RSASSA-PSS, ML-DSA), because `Certificate.parse` fails outright on
+    /// those and there is no honest `Parsed` to hand back: its
+    /// `signature_algorithm` field is an exhaustive enum with no variant for
+    /// them. The chain is fully verified either way, `expected_host`
+    /// included — this field is a convenience view, not the result.
+    ///
+    /// Null here is deliberately loud. The alternative was a `Parsed` whose
+    /// `signature_algorithm` names an algorithm the certificate does not
+    /// use, which a caller cannot tell from the truth.
+    leaf: ?Certificate.Parsed,
+    /// The leaf's DER, always present — what `leaf` would have described.
+    leaf_der: CertDer,
+    /// The leaf's SubjectPublicKeyInfo algorithm, in this module's own union,
+    /// which unlike std's can name every algorithm this module verifies.
+    leaf_pub_key_algo: algorithm.PubKeyAlgo,
     /// Index into the `trust_anchors` slice passed to `verifyChain` that
     /// terminated the path.
     trust_anchor_index: usize,
@@ -134,13 +154,15 @@ pub const VerifyChainError = error{
 /// Once a path exists, this function makes two more passes over it:
 /// `checkPathLength` leaf-to-anchor (pathLenConstraint bookkeeping) and
 /// `checkNameConstraints`/`checkExtendedKeyUsage` anchor-to-leaf
-/// (accumulated name constraints and EKU chaining). Finally the leaf is
-/// parsed via `std.crypto.Certificate.parse` (fails here, not earlier, if
-/// the LEAF itself is RSASSA-PSS-signed — see root.zig's doc comment: a
-/// PSS-signed non-leaf link is fully supported via `verifyPssLink`, but
-/// `VerifiedChain.leaf`'s type is `Certificate.Parsed`, which std cannot
-/// produce for a PSS-signed certificate) and `expected_host`, if set, is
-/// checked via `Parsed.verifyHostName`.
+/// (accumulated name constraints and EKU chaining). Finally `expected_host`,
+/// if set, is checked via `Parsed.verifyHostName`, and the leaf is parsed via
+/// `std.crypto.Certificate.parse` for `VerifiedChain.leaf`.
+///
+/// A leaf whose algorithm std cannot name (RSASSA-PSS, ML-DSA) no longer
+/// fails the whole call the way it did before `algorithm.zig` existed: it is
+/// verified like any other, `VerifiedChain.leaf` is `null`, and the hostname
+/// check runs against `hostNameView` — this module's own walk of the two name
+/// fields `verifyHostName` reads — so it is neither skipped nor weakened.
 pub fn verifyChain(
     gpa: std.mem.Allocator,
     chain: []const CertDer,
@@ -203,12 +225,26 @@ pub fn verifyChain(
     }
 
     const leaf_cert: Certificate = .{ .buffer = path[0].der, .index = 0 };
-    const leaf_parsed = try leaf_cert.parse();
-    if (opts.expected_host) |host| try leaf_parsed.verifyHostName(host);
+    const leaf_shape = try parseShape(leaf_cert);
+    // std can parse most leaves; for the ones it cannot name at all, the
+    // hostname check runs against a `Parsed` synthesized from this module's
+    // own walk. `verifyHostName` reads only the two name fields, and
+    // `synthesizeParsed` fills both from the certificate — so the check is
+    // the same check, not a weakened one.
+    const leaf_parsed: ?Certificate.Parsed = leaf_cert.parse() catch |err| switch (err) {
+        error.CertificateHasUnrecognizedObjectId => null,
+        else => |e| return e,
+    };
+    if (opts.expected_host) |host| {
+        const for_host = leaf_parsed orelse try hostNameView(leaf_cert, leaf_shape);
+        try for_host.verifyHostName(host);
+    }
 
     return .{
         .depth = @intCast(path.len - 1),
         .leaf = leaf_parsed,
+        .leaf_der = path[0].der,
+        .leaf_pub_key_algo = leaf_shape.pub_key_algo,
         .trust_anchor_index = path[path.len - 1].anchor_index.?,
     };
 }
@@ -404,6 +440,10 @@ fn checkIsCaSigner(cand_der: CertDer) VerifyChainError!void {
 fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyChainError!void {
     const subject_shape = try parseShape(.{ .buffer = subject_der, .index = 0 });
 
+    if (algorithm.MlDsa.map.get(subject_shape.sig_alg_oid) != null) {
+        return verifyMlDsaLink(subject_der, issuer_der, now_sec);
+    }
+
     if (Certificate.AlgorithmCategory.map.get(subject_shape.sig_alg_oid) == .rsassa_pss) {
         const issuer_shape = try parseShape(.{ .buffer = issuer_der, .index = 0 });
         const issuer_pub_key = try rsa.PublicKey.fromDer(issuer_shape.spki);
@@ -415,11 +455,70 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyCha
 
     const issuer_cert: Certificate = .{ .buffer = issuer_der, .index = 0 };
     const issuer_parsed = issuer_cert.parse() catch |err| switch (err) {
-        error.CertificateHasUnrecognizedObjectId => partialIssuerParsed(issuer_cert, try parseShape(issuer_cert)),
+        error.CertificateHasUnrecognizedObjectId => try partialIssuerParsed(issuer_cert, try parseShape(issuer_cert)),
         else => |e| return e,
     };
 
     try subject_parsed.verify(issuer_parsed, now_sec);
+}
+
+/// Verifies an ML-DSA link (RFC 9881) — the second algorithm this module
+/// verifies itself rather than delegating, for the same reason as
+/// RSASSA-PSS: `std.crypto.Certificate` cannot name the OID, so
+/// `Certificate.parse()` fails on such a certificate before returning
+/// anything. Unlike PSS the obstacle is only the *table* — the signature
+/// mathematics is `std.crypto.sign.mldsa`, std's own and measured faster
+/// than OpenSSL 3.5 on every operation.
+///
+/// Public for the same reason `verifyPssLink` is: a consumer holding one
+/// certificate and its issuer should be able to check that link without
+/// building a path — and it is what makes the parameter-set check directly
+/// testable, which through `verifyChain` alone it is not (path building
+/// collapses a failed trust-anchor candidate into `NoTrustedPath`).
+pub fn verifyMlDsaLink(
+    subject_der: CertDer,
+    issuer_der: CertDer,
+    now_sec: i64,
+) VerifyChainError!void {
+    const subject_shape = try parseShape(.{ .buffer = subject_der, .index = 0 });
+    const set = algorithm.MlDsa.map.get(subject_shape.sig_alg_oid) orelse
+        return error.CertificateSignatureAlgorithmUnsupported;
+
+    // Same `@intCast` reasoning as `verifyPssLink`: real certificate dates
+    // are well inside i64, and this asserts it rather than truncating.
+    if (now_sec < @as(i64, @intCast(subject_shape.not_before))) return error.CertificateNotYetValid;
+    if (now_sec > @as(i64, @intCast(subject_shape.not_after))) return error.CertificateExpired;
+
+    const issuer_shape = try parseShape(.{ .buffer = issuer_der, .index = 0 });
+
+    // The subject's signatureAlgorithm names a parameter set; the issuer's
+    // key must BE that parameter set. ML-DSA sizes differ per level, so a
+    // mismatch would otherwise surface as a length error and read like a
+    // corrupt certificate instead of the algorithm confusion it is.
+    switch (issuer_shape.pub_key_algo) {
+        .ml_dsa => |issuer_set| if (issuer_set != set) return error.CertificateSignatureAlgorithmMismatch,
+        else => return error.CertificateSignatureAlgorithmMismatch,
+    }
+
+    const key_bytes = issuer_der[issuer_shape.pub_key_slice.start..issuer_shape.pub_key_slice.end];
+
+    switch (set) {
+        inline else => |comptime_set| {
+            const Impl = algorithm.MlDsa.Impl(comptime_set);
+            // Both lengths are fixed by the parameter set, so a certificate
+            // that disagrees is rejected before any slice is reinterpreted.
+            if (key_bytes.len != Impl.PublicKey.encoded_length) return error.CertificatePublicKeyInvalid;
+            if (subject_shape.signature.len != Impl.Signature.encoded_length) return error.CertificateSignatureInvalidLength;
+
+            const pub_key = Impl.PublicKey.fromBytes(key_bytes[0..Impl.PublicKey.encoded_length].*) catch
+                return error.CertificatePublicKeyInvalid;
+            const sig = Impl.Signature.fromBytes(subject_shape.signature[0..Impl.Signature.encoded_length].*) catch
+                return error.CertificateSignatureInvalid;
+            // Pure ML-DSA with an empty context string, which is what
+            // RFC 9881 §4 specifies for certificate signatures.
+            sig.verify(subject_shape.message, pub_key) catch return error.CertificateSignatureInvalid;
+        },
+    }
 }
 
 // ── raw-DER structural walk (PSS-safe: never calls Certificate.parse) ──────
@@ -465,7 +564,11 @@ const Shape = struct {
     /// Full `SubjectPublicKeyInfo` TLV — feed directly to
     /// `rsa.PublicKey.fromDer`.
     spki: []const u8,
-    pub_key_algo: Certificate.Parsed.PubKeyAlgo,
+    /// This module's own algorithm union, not std's: std's cannot name
+    /// ML-DSA, and `parseShape` must be able to describe a certificate std
+    /// declines to parse at all (that is already true for RSASSA-PSS).
+    /// `algorithm.PubKeyAlgo.toStd` converts back for the delegated paths.
+    pub_key_algo: algorithm.PubKeyAlgo,
     pub_key_slice: der.Element.Slice,
 };
 
@@ -491,11 +594,20 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
 
     const pub_key_alg_seq = try extensions.parseElement(bytes, pub_key_info.slice.start);
     const pub_key_alg_oid = try extensions.parseElement(bytes, pub_key_alg_seq.slice.start);
-    const pub_key_algo: Certificate.Parsed.PubKeyAlgo = switch (try Certificate.parseAlgorithmCategory(bytes, pub_key_alg_oid)) {
-        inline .rsaEncryption, .rsassa_pss, .curveEd25519 => |tag| @unionInit(Certificate.Parsed.PubKeyAlgo, @tagName(tag), {}),
-        .X9_62_id_ecPublicKey => pk: {
-            const params_elem = try extensions.parseElement(bytes, pub_key_alg_oid.slice.end);
-            break :pk .{ .X9_62_id_ecPublicKey = try Certificate.parseNamedCurve(bytes, params_elem) };
+    if (pub_key_alg_oid.identifier.tag != .object_identifier) return error.CertificateFieldHasWrongDataType;
+    const pub_key_alg_oid_bytes = bytes[pub_key_alg_oid.slice.start..pub_key_alg_oid.slice.end];
+    const pub_key_algo: algorithm.PubKeyAlgo = switch (algorithm.fromOid(pub_key_alg_oid_bytes) orelse
+        return error.CertificateHasUnrecognizedObjectId) {
+        // ML-DSA's AlgorithmIdentifier carries no parameters at all
+        // (RFC 9881 §3), so unlike the EC branch there is nothing to read
+        // after the OID.
+        .ml_dsa => |set| .{ .ml_dsa = set },
+        .std_category => |category| switch (category) {
+            inline .rsaEncryption, .rsassa_pss, .curveEd25519 => |tag| @unionInit(algorithm.PubKeyAlgo, @tagName(tag), {}),
+            .X9_62_id_ecPublicKey => pk: {
+                const params_elem = try extensions.parseElement(bytes, pub_key_alg_oid.slice.end);
+                break :pk .{ .X9_62_id_ecPublicKey = try Certificate.parseNamedCurve(bytes, params_elem) };
+            },
         },
     };
     const pub_key_elem = try extensions.parseElement(bytes, pub_key_alg_seq.slice.end);
@@ -536,7 +648,7 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
 /// SubjectPublicKeyInfo, a wholly separate field, parses fine on its own).
 /// The other fields are never read through this value and are set to inert
 /// placeholders.
-fn partialIssuerParsed(cert: Certificate, shape: Shape) Certificate.Parsed {
+fn partialIssuerParsed(cert: Certificate, shape: Shape) error{CertificateSignatureAlgorithmUnsupported}!Certificate.Parsed {
     return .{
         .certificate = cert,
         .issuer_slice = shape.issuer_slice,
@@ -544,13 +656,90 @@ fn partialIssuerParsed(cert: Certificate, shape: Shape) Certificate.Parsed {
         .common_name_slice = der.Element.Slice.empty,
         .signature_slice = der.Element.Slice.empty,
         .signature_algorithm = .sha256WithRSAEncryption,
-        .pub_key_algo = shape.pub_key_algo,
+        // An ML-DSA issuer never reaches here: `verifyLink` routes those to
+        // `verifyMlDsaLink` before any std parse is attempted, and this value
+        // exists only to be handed to `Certificate.Parsed.verify`.
+        .pub_key_algo = shape.pub_key_algo.toStd() orelse return error.CertificateSignatureAlgorithmUnsupported,
         .pub_key_slice = shape.pub_key_slice,
         .message_slice = der.Element.Slice.empty,
         .subject_alt_name_slice = der.Element.Slice.empty,
         .validity = .{ .not_before = 0, .not_after = 0 },
         .version = .v3,
     };
+}
+
+/// A `Certificate.Parsed` carrying ONLY what `Parsed.verifyHostName` reads:
+/// the certificate buffer, the subject DN, the commonName attribute inside
+/// it, and the raw `subjectAltName` extnValue. For a leaf whose algorithm
+/// `Certificate.parse` refuses to name (RSASSA-PSS, ML-DSA), this is how the
+/// hostname check still runs against the real fields instead of being
+/// skipped — skipping it would be a fail-open hole exactly where a
+/// post-quantum deployment would first notice it.
+///
+/// Every other field is an inert placeholder, so this value must never be
+/// handed to `Parsed.verify` (`partialIssuerParsed` exists for that, and
+/// refuses rather than placeholder an algorithm it cannot name). It does not
+/// escape this file.
+fn hostNameView(cert: Certificate, shape: Shape) VerifyChainError!Certificate.Parsed {
+    return .{
+        .certificate = cert,
+        .issuer_slice = shape.issuer_slice,
+        .subject_slice = shape.subject_slice,
+        .common_name_slice = try findCommonNameSlice(cert, shape.subject_slice),
+        .subject_alt_name_slice = try findSanSlice(cert),
+        .signature_slice = der.Element.Slice.empty,
+        .signature_algorithm = .sha256WithRSAEncryption,
+        .pub_key_algo = .rsaEncryption,
+        .pub_key_slice = shape.pub_key_slice,
+        .message_slice = der.Element.Slice.empty,
+        .validity = .{ .not_before = shape.not_before, .not_after = shape.not_after },
+        .version = .v3,
+    };
+}
+
+/// The `commonName` AttributeTypeAndValue inside an already-located subject
+/// `RDNSequence`, as offsets into the certificate. Mirrors the walk
+/// `std.crypto.Certificate.parse` performs over the same bytes (RDNSequence
+/// -> RelativeDistinguishedName SET -> AttributeTypeAndValue SEQUENCE), and
+/// like std keeps the LAST commonName when a DN carries several. An empty
+/// slice when there is none — `verifyHostName` then has nothing to fall back
+/// on and rejects, which is the fail-closed direction.
+fn findCommonNameSlice(cert: Certificate, subject_slice: der.Element.Slice) VerifyChainError!der.Element.Slice {
+    const bytes = cert.buffer;
+    var common_name = der.Element.Slice.empty;
+    var name_i = subject_slice.start;
+    while (name_i < subject_slice.end) {
+        const rdn = try extensions.parseElement(bytes, name_i);
+        name_i = rdn.slice.end;
+        var rdn_i = rdn.slice.start;
+        while (rdn_i < rdn.slice.end) {
+            const atav = try extensions.parseElement(bytes, rdn_i);
+            rdn_i = atav.slice.end;
+            var atav_i = atav.slice.start;
+            while (atav_i < atav.slice.end) {
+                const ty_elem = try extensions.parseElement(bytes, atav_i);
+                const val = try extensions.parseElement(bytes, ty_elem.slice.end);
+                atav_i = val.slice.end;
+                const ty = Certificate.parseAttribute(bytes, ty_elem) catch |err| switch (err) {
+                    error.CertificateHasUnrecognizedObjectId => continue,
+                    else => |e| return e,
+                };
+                if (ty == .commonName) common_name = val.slice;
+            }
+        }
+    }
+    return common_name;
+}
+
+/// `findSan`'s answer as offsets rather than bytes — `Certificate.Parsed`
+/// stores slices into the certificate, not pointers.
+fn findSanSlice(cert: Certificate) VerifyChainError!der.Element.Slice {
+    const slice = (try extensions.findExtensions(cert)) orelse return der.Element.Slice.empty;
+    var it = extensions.iterate(slice, cert);
+    while (try it.next()) |entry| {
+        if (entry.id == .subject_alt_name) return entry.value_slice;
+    }
+    return der.Element.Slice.empty;
 }
 
 // ── small extension lookups shared by the algorithm above ──────────────────

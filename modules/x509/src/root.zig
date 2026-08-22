@@ -11,7 +11,8 @@
 //! RFC 4158-style path building with backtracking over multiple
 //! same-subject-DN candidates, per-link signature verification (RSA
 //! PKCS1v15/ECDSA P-256+P-384/Ed25519 via `std.crypto.Certificate.Parsed.verify`,
-//! RSASSA-PSS via this module's own `verifyPssLink` + the `rsa` module),
+//! RSASSA-PSS via this module's own `verifyPssLink` + the `rsa` module,
+//! ML-DSA-44/65/87 via `verifyMlDsaLink` + std's `std.crypto.sign.mldsa`),
 //! basicConstraints/keyUsage CA-signer enforcement, pathLenConstraint
 //! bookkeeping with the self-issued-certificate exception, accumulated
 //! nameConstraints, extended-key-usage chaining, and hostname matching
@@ -52,6 +53,16 @@
 //!   (`error.CertificateHasUnrecognizedObjectId`) on a PSS-signed
 //!   certificate before verification is even reached. See
 //!   `chain.zig`'s `verifyPssLink` for the isolated gap-filler.
+//! - **A closed algorithm table.** `AlgorithmCategory`/`Algorithm` are
+//!   exhaustive enums with `StaticStringMap` OID tables, so an algorithm std
+//!   does not carry cannot be added from outside — the failure is
+//!   `error.CertificateHasUnrecognizedObjectId` at `Certificate.parse`, i.e.
+//!   before anything is verified. ML-DSA (RFC 9881, 2025-10) is the current
+//!   instance: std has the *primitives* (`std.crypto.sign.mldsa`, measured
+//!   faster than OpenSSL 3.5 on every operation) but no X.509 name for them.
+//!   `algorithm.zig` is this module's own table for exactly that reason; it
+//!   consults std's first and passes std's answers through unchanged, so no
+//!   certificate resolves differently than it did before.
 //! - **Multi-certificate path building / RFC 5280 §6 policy: NOT provided.**
 //!   `Certificate.Bundle` stores a flat set of trust anchors keyed by
 //!   subject DN and its `verify` finds exactly ONE issuer candidate
@@ -67,7 +78,9 @@
 //! **Verdict:** the real gap is path-building + RFC 5280 §6 POLICY on top of
 //! std's already-correct single-link parse/verify — not re-parsing DER or
 //! re-implementing signature crypto (both reused directly, except the
-//! narrow RSA-PSS carve-out above). This module is built ON
+//! narrow RSA-PSS and ML-DSA carve-outs above, neither of which adds a
+//! parser or an algorithm: only a lookup std has no seam for). This module
+//! is built ON
 //! `std.crypto.Certificate`, not instead of it.
 //!
 //! ## What this module provides
@@ -120,6 +133,12 @@
 const std = @import("std");
 
 pub const extensions = @import("extensions.zig");
+
+/// This module's own AlgorithmIdentifier OID table — the one thing that could
+/// not be borrowed from `std.crypto.Certificate`, whose table is a closed
+/// enum. Public because `VerifiedChain.leaf_pub_key_algo` is one of its
+/// types: a caller has to be able to name what was verified.
+pub const algorithm = @import("algorithm.zig");
 pub const chain = @import("chain.zig");
 
 /// Certificate-DER safety guard: a recursive-descent DER well-formedness
@@ -138,6 +157,12 @@ pub const verifyChain = chain.verifyChain;
 pub const Options = chain.Options;
 pub const VerifiedChain = chain.VerifiedChain;
 pub const VerifyChainError = chain.VerifyChainError;
+pub const PubKeyAlgo = algorithm.PubKeyAlgo;
+pub const MlDsa = algorithm.MlDsa;
+/// Single-link verification for the two algorithms std cannot parse, for
+/// consumers holding a certificate and its issuer without a path to build.
+pub const verifyPssLink = chain.verifyPssLink;
+pub const verifyMlDsaLink = chain.verifyMlDsaLink;
 
 /// `x509.spkiOf(cert_der)` — the supported way to name a certificate's public
 /// key without verifying anything about the certificate: it returns the
@@ -155,7 +180,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure verification logic; no I/O, no wire framing of its own
     .concurrency = .reentrant, // no shared/global state; every function is a pure value-in/value-out check
-    .model_after = "RFC 5280 (X.509 v3 / PKIX); built on std.crypto.Certificate (MIT) for DER + single-link verify",
+    .model_after = "RFC 5280 (X.509 v3 / PKIX) + RFC 9881 (ML-DSA in X.509); built on std.crypto.Certificate (MIT) for DER + single-link verify",
     .deps = .{"rsa"}, // rsa.PublicKey / rsa.verifyPss for the RSASSA-PSS gap (see chain.zig's verifyPssLink)
 };
 
@@ -166,6 +191,7 @@ pub const meta = .{
 // here too.
 test {
     _ = extensions;
+    _ = algorithm;
     _ = chain;
     _ = safe;
 }

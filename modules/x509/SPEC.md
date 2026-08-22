@@ -189,6 +189,15 @@ against both a real generated fixture (CA vs. leaf, via
   `checkPathLength`'s self-issued exception, tested both as a rejection
   (pathLenConstraint exceeded) and as a positive case (a self-issued
   rollover certificate correctly NOT counted).
+- Neither gap-filler treats "this module verifies it, not std" as "skip
+  verification". The ML-DSA path (`verifyMlDsaLink`) checks the validity
+  window, requires the issuer's key to be the SAME FIPS 204 parameter set the
+  subject's `signatureAlgorithm` names (an ML-DSA-44 signature under an
+  ML-DSA-65 key is an algorithm mismatch, reported as one rather than
+  surfacing as a key-length error), rejects a public key or signature whose
+  length is not the one that parameter set fixes, and verifies pure ML-DSA
+  with an empty context string per RFC 9881 §4. Each of those four is checked
+  by a test that goes red when the check alone is removed.
 - The RSA-PSS gap (`verifyPssLink`) never treats "certificate uses PSS" as
   "skip verification" — a PSS-signed link is fully verified via this
   module's own DER walk + `rsa.verifyPss`, including RFC 4055's exact
@@ -218,7 +227,7 @@ sub-algorithms (`buildPath`, `checkNameConstraints`, `checkPathLength`,
 `chain_test.zig` (`zig build test-x509`, green in Debug and
 ReleaseFast), including an openssl-3.5-generated oracle chain per supported
 signature algorithm (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256, ECDSA P-384,
-Ed25519) and dedicated rejection-case hierarchies (expired/not-yet-valid,
+Ed25519, ML-DSA-44/65/87) and dedicated rejection-case hierarchies (expired/not-yet-valid,
 name-constraint violation, non-CA issuer, pathLenConstraint exceeded,
 self-issued not counted, tampered signature, EKU mismatch, unknown anchor).
 

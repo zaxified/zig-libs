@@ -126,6 +126,11 @@ pub const ExtensionEntry = struct {
     /// unwrapped one level — callers parse this per-extension, e.g.
     /// `parseBasicConstraints`).
     value: []const u8,
+    /// The same bytes as offsets into the certificate buffer. `value` is
+    /// enough to parse an extension; this is for the callers that must hand
+    /// a `std.crypto.Certificate.Parsed`-shaped slice back to std (which
+    /// stores offsets, not pointers).
+    value_slice: der.Element.Slice,
 };
 
 pub const IterateError = der.Element.ParseError || error{CertificateFieldHasWrongDataType};
@@ -168,6 +173,7 @@ pub const ExtensionIterator = struct {
             .oid = oid_bytes,
             .critical = critical,
             .value = it.bytes[value_elem.slice.start..value_elem.slice.end],
+            .value_slice = value_elem.slice,
         };
     }
 };

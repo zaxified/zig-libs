@@ -19,6 +19,8 @@
 const std = @import("std");
 const testing = std.testing;
 const chain_mod = @import("chain.zig");
+const algorithm = @import("algorithm.zig");
+const Certificate = std.crypto.Certificate;
 const extensions = @import("extensions.zig");
 const rsa = @import("rsa");
 const fx = @import("fixtures_test.zig");
@@ -417,4 +419,159 @@ test "parsePssParams: mismatched digest vs MGF1 inner hash rejected (this module
     const seq = [_]u8{ 0x30, content.len } ++ content;
 
     try testing.expectError(error.UnsupportedPssParams, chain_mod.parsePssParams(&seq));
+}
+
+// ── ML-DSA (RFC 9881): the algorithms std's table cannot name ──────────────
+//
+// These hierarchies are `@embedFile`d DER rather than byte literals like the
+// rest of `fixtures_test.zig`: an ML-DSA-87 certificate is 7.5 KB, and three
+// full chains as hex arrays would be some 3000 lines of generated source for
+// no benefit. `data/*.der` are the exact bytes OpenSSL 3.5.5 emitted.
+//
+// Same oracle discipline as every hierarchy above: each chain was accepted by
+// `openssl verify -CAfile root -untrusted inter leaf` at generation time, and
+// these tests re-verify the same bytes through THIS module. A pass means both
+// implementations agree; `verifyChain` reaching them at all is what the OID
+// map in `algorithm.zig` bought.
+
+const mldsa = struct {
+    const root44 = @embedFile("data/root_mldsa44.der");
+    const inter44 = @embedFile("data/inter_mldsa44.der");
+    const leaf44 = @embedFile("data/leaf_mldsa44.der");
+    const root65 = @embedFile("data/root_mldsa65.der");
+    const inter65 = @embedFile("data/inter_mldsa65.der");
+    const leaf65 = @embedFile("data/leaf_mldsa65.der");
+    const root87 = @embedFile("data/root_mldsa87.der");
+    const inter87 = @embedFile("data/inter_mldsa87.der");
+    const leaf87 = @embedFile("data/leaf_mldsa87.der");
+    /// An ML-DSA-65 CA whose subject DN is byte-identical to the ML-DSA-44
+    /// intermediate's, so path building accepts it as `leaf44`'s issuer and
+    /// the parameter-set check is the only thing standing in the way.
+    const impostor65 = @embedFile("data/impostor_mldsa65.der");
+};
+
+// The ML-DSA fixtures were generated later than the rest, so they carry their
+// own validity window (notBefore 2026-08-22, `-days 3650`).
+const now_valid_mldsa: i64 = 1798761600; // 2027-01-01T00:00:00Z
+
+test "valid ML-DSA-44 chain verifies (openssl-oracle cross-checked)" {
+    const chain = [_]chain_mod.CertDer{ mldsa.leaf44, mldsa.inter44 };
+    const anchors = [_]chain_mod.CertDer{mldsa.root44};
+    const result = try chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid_mldsa });
+    try testing.expectEqual(@as(u32, 2), result.depth);
+}
+
+test "valid ML-DSA-65 chain verifies (openssl-oracle cross-checked); hostname + EKU positive" {
+    const chain = [_]chain_mod.CertDer{ mldsa.leaf65, mldsa.inter65 };
+    const anchors = [_]chain_mod.CertDer{mldsa.root65};
+    _ = try chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{
+        .now_sec = now_valid_mldsa,
+        .expected_host = "leaf.example.org",
+        .required_eku = .server_auth,
+    });
+}
+
+test "valid ML-DSA-87 chain verifies (openssl-oracle cross-checked)" {
+    const chain = [_]chain_mod.CertDer{ mldsa.leaf87, mldsa.inter87 };
+    const anchors = [_]chain_mod.CertDer{mldsa.root87};
+    _ = try chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid_mldsa });
+}
+
+test "ML-DSA: an issuer key of the wrong parameter set is named, not mistaken for corruption" {
+    // Without the parameter-set check in `verifyMlDsaLink`, this reaches the
+    // length comparison instead: an ML-DSA-65 key is 1952 bytes where 44
+    // wants 1312, so the failure would surface as CertificatePublicKeyInvalid
+    // and read like a damaged certificate rather than the algorithm confusion
+    // it is.
+    // Checked through `verifyMlDsaLink` directly: `verifyChain`'s path
+    // builder collapses a failed trust-anchor candidate into NoTrustedPath,
+    // which would hide exactly the distinction under test.
+    try testing.expectError(
+        error.CertificateSignatureAlgorithmMismatch,
+        chain_mod.verifyMlDsaLink(mldsa.leaf44, mldsa.impostor65, now_valid_mldsa),
+    );
+
+    // And the same call with the RIGHT issuer succeeds, so the test above is
+    // not passing for some unrelated reason.
+    try chain_mod.verifyMlDsaLink(mldsa.leaf44, mldsa.inter44, now_valid_mldsa);
+}
+
+test "ML-DSA: a leaf presented to the wrong parameter set's anchor finds no path" {
+    // The three hierarchies are independent, so their DNs differ and this
+    // never reaches a signature check at all — it covers path building, not
+    // `verifyMlDsaLink`. The test above is the one that reaches the
+    // parameter-set comparison.
+    const chain = [_]chain_mod.CertDer{ mldsa.leaf44, mldsa.inter87 };
+    const anchors = [_]chain_mod.CertDer{mldsa.root87};
+    try testing.expectError(
+        error.NoTrustedPath,
+        chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid_mldsa }),
+    );
+}
+
+test "ML-DSA: a tampered tbsCertificate is rejected, not ignored" {
+    // Guards the shape where a signature is decoded and then never checked
+    // against the message. Deliberately NOT a flipped signature byte: that is
+    // caught by `Signature.fromBytes`'s own encoding validation, so such a
+    // test passes even with the `verify` call deleted — verified by mutation.
+    // Editing the signed bytes instead can only be caught by verification.
+    var tampered: [mldsa.leaf65.len]u8 = mldsa.leaf65.*;
+    const cn = std.mem.indexOf(u8, &tampered, "leaf.example.org").?;
+    tampered[cn] = 'x'; // same length, so the DER stays structurally valid
+
+    const chain = [_]chain_mod.CertDer{ &tampered, mldsa.inter65 };
+    const anchors = [_]chain_mod.CertDer{mldsa.root65};
+    try testing.expectError(
+        error.CertificateSignatureInvalid,
+        chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid_mldsa }),
+    );
+}
+
+test "ML-DSA: expiry and not-yet-valid are checked on the ML-DSA path too" {
+    const chain = [_]chain_mod.CertDer{ mldsa.leaf65, mldsa.inter65 };
+    const anchors = [_]chain_mod.CertDer{mldsa.root65};
+    try testing.expectError(
+        error.CertificateNotYetValid,
+        chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_before }),
+    );
+    try testing.expectError(
+        error.CertificateExpired,
+        chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_after }),
+    );
+}
+
+test "ML-DSA: the result reports the algorithm std cannot name, and says so by nulling leaf" {
+    const chain = [_]chain_mod.CertDer{ mldsa.leaf65, mldsa.inter65 };
+    const anchors = [_]chain_mod.CertDer{mldsa.root65};
+    const result = try chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid_mldsa });
+
+    // `leaf` is std's view, and std has no name for ML-DSA. Null rather than
+    // a `Parsed` whose `signature_algorithm` says sha256WithRSAEncryption.
+    try testing.expect(result.leaf == null);
+    try testing.expectEqual(algorithm.MlDsa.ml_dsa_65, result.leaf_pub_key_algo.ml_dsa);
+    try testing.expectEqualSlices(u8, mldsa.leaf65, result.leaf_der);
+}
+
+test "classic algorithms keep std's parsed leaf — nulling is specific, not blanket" {
+    const chain = [_]chain_mod.CertDer{ &fx.leaf_ed, &fx.inter_ed };
+    const anchors = [_]chain_mod.CertDer{&fx.root_ed};
+    const result = try chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid });
+
+    try testing.expect(result.leaf != null);
+    try testing.expectEqual(Certificate.AlgorithmCategory.curveEd25519, result.leaf_pub_key_algo.toStd().?);
+}
+
+test "ML-DSA: a wrong hostname is still rejected on the synthesized-name path" {
+    // The hostname check for an ML-DSA leaf runs against `hostNameView`, not
+    // against `Certificate.parse`. A view that returned empty name fields
+    // would reject everything and look like it worked; the positive case is
+    // the ML-DSA-65 test above, and this is its negative half.
+    const chain = [_]chain_mod.CertDer{ mldsa.leaf65, mldsa.inter65 };
+    const anchors = [_]chain_mod.CertDer{mldsa.root65};
+    try testing.expectError(error.CertificateHostMismatch, chain_mod.verifyChain(
+        testing.allocator,
+        &chain,
+        &anchors,
+        .{ .now_sec = now_valid_mldsa, .expected_host = "not-the-leaf.example.org" },
+    ));
 }

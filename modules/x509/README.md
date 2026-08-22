@@ -14,7 +14,7 @@ DER parsing for the extension fields `std.crypto.Certificate` omits
 path-building/policy decision layer (`chain.zig`): RFC 4158-style path
 building with backtracking over multiple same-subject-DN candidates,
 per-link signature verification (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256/P-384,
-Ed25519), basicConstraints/keyUsage CA-signer enforcement,
+Ed25519, ML-DSA-44/65/87), basicConstraints/keyUsage CA-signer enforcement,
 pathLenConstraint bookkeeping (self-issued-certificate exception included),
 accumulated nameConstraints, extended-key-usage chaining, and hostname
 matching. `zig build test-x509` cross-checks real
@@ -51,6 +51,23 @@ const verified = try x509.verifyChain(gpa, chain_der, trust_anchors_der, .{
 - **Platform:** any. **Role:** util (pure verification logic, no I/O of its
   own). **Concurrency:** reentrant — every function is value-in/value-out,
   no shared/global state.
+### Algorithms std cannot name
+
+`std.crypto.Certificate`'s OID tables (`AlgorithmCategory`, `Algorithm`) are
+exhaustive enums: an algorithm std does not carry cannot be added from
+outside, and a certificate using one fails at `Certificate.parse` with
+`error.CertificateHasUnrecognizedObjectId` — before any verification is
+attempted. That is why `algorithm.zig` exists. It is a lookup table and
+nothing else: the DER walk is still std's, and the signature mathematics is
+still std's (`std.crypto.sign.mldsa` for ML-DSA, this repo's `rsa` module for
+PSS). std's table is consulted first and its answers pass through unchanged.
+
+Consequence for callers: `VerifiedChain.leaf` is `?Certificate.Parsed`, and is
+null exactly for a leaf std cannot parse (RSASSA-PSS, ML-DSA). Use
+`leaf_der` and `leaf_pub_key_algo`, which are always populated. Nothing about
+verification changes — `expected_host` included, which is checked against the
+certificate's real names on every path.
+
 - **Deps:** `rsa` (for `rsa.PublicKey`/`rsa.verifyPss` — the RSASSA-PSS
   certificate-link gap `std.crypto.Certificate` cannot handle at all, since
   it can't even parse a PSS-signed certificate).
@@ -67,8 +84,9 @@ See `src/root.zig`'s module doc comment for the full recon; summary:
   *recognized* but never extracted).
 - Real single-link verify (`Parsed.verify`): issuer/subject name match +
   validity window + signature, for RSA PKCS1v15, ECDSA P-256/P-384, and
-  Ed25519. **No RSA-PSS support** — `Certificate.parse` itself rejects a
-  PSS-signed certificate (unrecognized signature-algorithm OID).
+  Ed25519. **No RSA-PSS and no ML-DSA support** — `Certificate.parse` itself
+  rejects such a certificate (unrecognized signature-algorithm OID), and the
+  table naming those OIDs is closed to extension.
 - **No multi-certificate path building or RFC 5280 §6 policy anywhere in
   std.** `Certificate.Bundle` does a single hashmap lookup for one issuer
   candidate by subject DN (no multi-candidate handling); `Certificate.Chain`
