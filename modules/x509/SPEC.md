@@ -198,6 +198,15 @@ against both a real generated fixture (CA vs. leaf, via
   length is not the one that parameter set fixes, and verifies pure ML-DSA
   with an empty context string per RFC 9881 §4. Each of those four is checked
   by a test that goes red when the check alone is removed.
+- The SLH-DSA path (`verifySlhDsaLink`) is the same shape over twelve
+  parameter sets. The parameter-set check matters MORE there than for ML-DSA,
+  not less: `s` and `f` differ only in signature size and share a public-key
+  length, and the two hash families at the same category share BOTH lengths —
+  so for SHA2-128s against SHAKE-128s the set comparison is the only thing
+  distinguishing an algorithm mismatch from a forged signature.
+- `slhdsa.verify` returns `bool`, not an error union. The lengths are still
+  checked explicitly before it, so a size mismatch is reported as a size
+  mismatch rather than arriving as a bare `false` that reads as a forgery.
 - The RSA-PSS gap (`verifyPssLink`) never treats "certificate uses PSS" as
   "skip verification" — a PSS-signed link is fully verified via this
   module's own DER walk + `rsa.verifyPss`, including RFC 4055's exact
@@ -227,7 +236,7 @@ sub-algorithms (`buildPath`, `checkNameConstraints`, `checkPathLength`,
 `chain_test.zig` (`zig build test-x509`, green in Debug and
 ReleaseFast), including an openssl-3.5-generated oracle chain per supported
 signature algorithm (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256, ECDSA P-384,
-Ed25519, ML-DSA-44/65/87) and dedicated rejection-case hierarchies (expired/not-yet-valid,
+Ed25519, ML-DSA-44/65/87, SLH-DSA in both hash families) and dedicated rejection-case hierarchies (expired/not-yet-valid,
 name-constraint violation, non-CA issuer, pathLenConstraint exceeded,
 self-issued not counted, tampered signature, EKU mismatch, unknown anchor).
 

@@ -14,7 +14,8 @@ DER parsing for the extension fields `std.crypto.Certificate` omits
 path-building/policy decision layer (`chain.zig`): RFC 4158-style path
 building with backtracking over multiple same-subject-DN candidates,
 per-link signature verification (RSA PKCS1v15, RSASSA-PSS, ECDSA P-256/P-384,
-Ed25519, ML-DSA-44/65/87), basicConstraints/keyUsage CA-signer enforcement,
+Ed25519, ML-DSA-44/65/87, all twelve SLH-DSA parameter sets),
+basicConstraints/keyUsage CA-signer enforcement,
 pathLenConstraint bookkeeping (self-issued-certificate exception included),
 accumulated nameConstraints, extended-key-usage chaining, and hostname
 matching. `zig build test-x509` cross-checks real
@@ -58,12 +59,19 @@ exhaustive enums: an algorithm std does not carry cannot be added from
 outside, and a certificate using one fails at `Certificate.parse` with
 `error.CertificateHasUnrecognizedObjectId` — before any verification is
 attempted. That is why `algorithm.zig` exists. It is a lookup table and
-nothing else: the DER walk is still std's, and the signature mathematics is
-still std's (`std.crypto.sign.mldsa` for ML-DSA, this repo's `rsa` module for
-PSS). std's table is consulted first and its answers pass through unchanged.
+nothing else: the DER walk is still std's, and no signature mathematics is
+written here either (`std.crypto.sign.mldsa` for ML-DSA, this repo's `rsa`
+module for PSS, this repo's `slhdsa` for SLH-DSA — std has no SLH-DSA at
+all). std's table is consulted first and its answers pass through unchanged.
+
+SLH-DSA coverage is two-tier and the split is deliberate: two full OpenSSL
+hierarchies, one per hash family, plus one self-signed certificate for each of
+the twelve parameter sets — a self-signed certificate is a link whose issuer
+is itself, so it exercises the OID lookup, the length checks and the
+verification without a 1.2 MB fixture set.
 
 Consequence for callers: `VerifiedChain.leaf` is `?Certificate.Parsed`, and is
-null exactly for a leaf std cannot parse (RSASSA-PSS, ML-DSA). Use
+null exactly for a leaf std cannot parse (RSASSA-PSS, ML-DSA, SLH-DSA). Use
 `leaf_der` and `leaf_pub_key_algo`, which are always populated. Nothing about
 verification changes — `expected_host` included, which is checked against the
 certificate's real names on every path.
@@ -84,7 +92,7 @@ See `src/root.zig`'s module doc comment for the full recon; summary:
   *recognized* but never extracted).
 - Real single-link verify (`Parsed.verify`): issuer/subject name match +
   validity window + signature, for RSA PKCS1v15, ECDSA P-256/P-384, and
-  Ed25519. **No RSA-PSS and no ML-DSA support** — `Certificate.parse` itself
+  Ed25519. **No RSA-PSS, no ML-DSA and no SLH-DSA support** — `Certificate.parse` itself
   rejects such a certificate (unrecognized signature-algorithm OID), and the
   table naming those OIDs is closed to extension.
 - **No multi-certificate path building or RFC 5280 §6 policy anywhere in

@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — **SLH-DSA (RFC 9882) certificates verify — all twelve FIPS
+  205 parameter sets.** `x509.verifySlhDsaLink` joins the ML-DSA path added
+  the same day; the module gained a `slhdsa` dependency, since std has no
+  SLH-DSA at all (unlike ML-DSA, where only the X.509 *name* was missing).
+  This is what owning the OID table bought: the algorithm is one table entry
+  and one dispatch arm, not a redesign.
+
+  The parameter-set check carries more weight here than for ML-DSA. `s` and
+  `f` share a public-key length, and the two hash families at the same
+  security category share both lengths — so SHA2-128s against SHAKE-128s is
+  distinguished from a forged signature by the set comparison alone.
+
+  Coverage is two-tier and stated rather than implied: two full OpenSSL 3.5.5
+  hierarchies (one per hash family) plus one self-signed certificate per
+  parameter set — a self-signed certificate is a link whose issuer is itself.
+  Twelve full hierarchies would be 1.2 MB of fixtures to re-prove path
+  building eleven more times. All fourteen certificates were accepted by
+  `openssl verify` at generation time.
+
 - **2026-08-22** — **ML-DSA (RFC 9881) certificates verify.** `verifyChain`
   now accepts ML-DSA-44/65/87 links and leaves, via the new
   `x509.verifyMlDsaLink` and std's `std.crypto.sign.mldsa`. The obstacle was
@@ -23,7 +42,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   leaf's bytes, always present) and `leaf_pub_key_algo` (this module's own
   algorithm union, which unlike std's can name every algorithm this module
   verifies). `leaf` is null exactly when std cannot parse the leaf at all —
-  RSASSA-PSS and now ML-DSA — because `Parsed.signature_algorithm` is an
+  RSASSA-PSS, and now ML-DSA and SLH-DSA — because `Parsed.signature_algorithm` is an
   exhaustive enum with no variant for either, so any value there would be a
   wrong answer a caller could not distinguish from a right one.
 

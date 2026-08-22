@@ -221,7 +221,7 @@ const module_list = [_]Module{
     .{ .name = "stun", .deps = &.{"netaddr"}, .example = true },
     .{ .name = "opcua", .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .example = true },
     .{ .name = "noise", .deps = &.{"chachapoly"}, .example = true },
-    .{ .name = "x509", .deps = &.{"rsa"}, .example = true },
+    .{ .name = "x509", .deps = &.{ "rsa", "slhdsa" }, .example = true },
     .{ .name = "ocsp", .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
     .{ .name = "ocspcache", .deps = &.{ "ocsp", "http", "x509" }, .example = true },
     .{ .name = "dnssec", .deps = &.{ "dns", "rsa" }, .example = true },

@@ -575,3 +575,113 @@ test "ML-DSA: a wrong hostname is still rejected on the synthesized-name path" {
         .{ .now_sec = now_valid_mldsa, .expected_host = "not-the-leaf.example.org" },
     ));
 }
+
+// ── SLH-DSA (RFC 9882): twelve parameter sets, all of them checked ─────────
+//
+// Coverage is deliberately two-tier, and the split is stated rather than
+// implied. Two FULL hierarchies — one per hash family — carry the path logic
+// and the X.509 encoding assumptions. Twelve SELF-SIGNED certificates, one
+// per parameter set, carry the OID-to-parameter-set wiring: a self-signed
+// certificate is a link whose issuer is itself, so `verifySlhDsaLink` on it
+// exercises exactly the lookup, the length checks and the verification.
+//
+// Not twelve full hierarchies: an SLH-DSA-SHAKE-256f certificate is 50 KB,
+// so that would be 1.2 MB of fixtures to re-prove path building eleven more
+// times. Every one of the fourteen certificates was accepted by
+// `openssl verify` at generation time.
+
+const slh = struct {
+    const root_sha2 = @embedFile("data/root_slh_sha2_128s.der");
+    const inter_sha2 = @embedFile("data/inter_slh_sha2_128s.der");
+    const leaf_sha2 = @embedFile("data/leaf_slh_sha2_128s.der");
+    const root_shake = @embedFile("data/root_slh_shake_128s.der");
+    const inter_shake = @embedFile("data/inter_slh_shake_128s.der");
+    const leaf_shake = @embedFile("data/leaf_slh_shake_128s.der");
+
+    /// One self-signed certificate per FIPS 205 parameter set, in the same
+    /// order `algorithm.SlhDsa` declares them.
+    const selfsigned = [_][]const u8{
+        @embedFile("data/slh_self_sha2_128s.der"),
+        @embedFile("data/slh_self_sha2_128f.der"),
+        @embedFile("data/slh_self_sha2_192s.der"),
+        @embedFile("data/slh_self_sha2_192f.der"),
+        @embedFile("data/slh_self_sha2_256s.der"),
+        @embedFile("data/slh_self_sha2_256f.der"),
+        @embedFile("data/slh_self_shake_128s.der"),
+        @embedFile("data/slh_self_shake_128f.der"),
+        @embedFile("data/slh_self_shake_192s.der"),
+        @embedFile("data/slh_self_shake_192f.der"),
+        @embedFile("data/slh_self_shake_256s.der"),
+        @embedFile("data/slh_self_shake_256f.der"),
+    };
+};
+
+test "valid SLH-DSA-SHA2-128s chain verifies (openssl-oracle cross-checked); hostname + EKU positive" {
+    const chain = [_]chain_mod.CertDer{ slh.leaf_sha2, slh.inter_sha2 };
+    const anchors = [_]chain_mod.CertDer{slh.root_sha2};
+    const result = try chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{
+        .now_sec = now_valid_mldsa,
+        .expected_host = "leaf.example.org",
+        .required_eku = .server_auth,
+    });
+    try testing.expectEqual(@as(u32, 2), result.depth);
+    try testing.expect(result.leaf == null);
+    try testing.expectEqual(algorithm.SlhDsa.sha2_128s, result.leaf_pub_key_algo.slh_dsa);
+}
+
+test "valid SLH-DSA-SHAKE-128s chain verifies (the other hash family)" {
+    const chain = [_]chain_mod.CertDer{ slh.leaf_shake, slh.inter_shake };
+    const anchors = [_]chain_mod.CertDer{slh.root_shake};
+    _ = try chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid_mldsa });
+}
+
+test "SLH-DSA: all twelve parameter sets verify, each against its own OID" {
+    // A self-signed certificate is a link whose issuer is itself. Any
+    // mis-wiring between OID, parameter set and implementation fails here:
+    // the wrong `Impl` gives the wrong lengths for ten of the twelve, and for
+    // the `s`/`f` pair that shares a key length it gives a false signature.
+    for (slh.selfsigned, 0..) |cert, i| {
+        errdefer std.debug.print("parameter set index {d}\n", .{i});
+        try chain_mod.verifySlhDsaLink(cert, cert, now_valid_mldsa);
+    }
+}
+
+test "SLH-DSA: every self-signed fixture reports the parameter set its OID names" {
+    const order = [_]algorithm.SlhDsa{
+        .sha2_128s,  .sha2_128f,  .sha2_192s,  .sha2_192f,  .sha2_256s,  .sha2_256f,
+        .shake_128s, .shake_128f, .shake_192s, .shake_192f, .shake_256s, .shake_256f,
+    };
+    // Guards the fixture list itself: a duplicated or misordered @embedFile
+    // would still pass the test above, since every entry would verify — just
+    // not as the set the list claims.
+    for (slh.selfsigned, order) |cert, want| {
+        const anchors = [_]chain_mod.CertDer{cert};
+        const one = [_]chain_mod.CertDer{cert};
+        const result = try chain_mod.verifyChain(testing.allocator, &one, &anchors, .{ .now_sec = now_valid_mldsa });
+        try testing.expectEqual(want, result.leaf_pub_key_algo.slh_dsa);
+    }
+}
+
+test "SLH-DSA: a tampered tbsCertificate is rejected, not ignored" {
+    var tampered: [slh.leaf_sha2.len]u8 = slh.leaf_sha2.*;
+    const cn = std.mem.indexOf(u8, &tampered, "leaf.example.org").?;
+    tampered[cn] = 'x';
+
+    const chain = [_]chain_mod.CertDer{ &tampered, slh.inter_sha2 };
+    const anchors = [_]chain_mod.CertDer{slh.root_sha2};
+    try testing.expectError(
+        error.CertificateSignatureInvalid,
+        chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid_mldsa }),
+    );
+}
+
+test "SLH-DSA: mixing the two hash families at the same size is an algorithm mismatch" {
+    // SHA2-128s and SHAKE-128s have IDENTICAL key and signature lengths, so
+    // every length check passes and only the parameter-set comparison stands
+    // between them. Without it this reaches verification and returns a bare
+    // false, reported as a forged signature rather than the confusion it is.
+    try testing.expectError(
+        error.CertificateSignatureAlgorithmMismatch,
+        chain_mod.verifySlhDsaLink(slh.leaf_sha2, slh.root_shake, now_valid_mldsa),
+    );
+}

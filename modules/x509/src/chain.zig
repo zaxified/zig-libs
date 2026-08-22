@@ -15,13 +15,15 @@
 //! `nameConstraints` (`checkNameConstraints`) and extended-key-usage
 //! chaining (`checkExtendedKeyUsage`). Per-link signature verification
 //! reuses `std.crypto.Certificate.Parsed.verify` for every algorithm std can
-//! parse (RSA PKCS1v15, ECDSA P-256/P-384, Ed25519). Two algorithms std
-//! cannot even parse are filled in here, both through the same raw-DER walk
-//! (`parseShape`) and both for the same underlying reason — std's OID table
-//! is closed and neither OID is in it: RSASSA-PSS (RFC 4055) via
-//! `verifyPssLink` and this repo's `rsa.verifyPss`, and ML-DSA (RFC 9881)
-//! via `verifyMlDsaLink` and std's own `std.crypto.sign.mldsa`. Which OIDs
-//! this module recognises is `algorithm.zig`, not std.
+//! parse (RSA PKCS1v15, ECDSA P-256/P-384, Ed25519). Three algorithms std
+//! cannot even parse are filled in here, all through the same raw-DER walk
+//! (`parseShape`) and all for the same underlying reason — std's OID table
+//! is closed and none of the three OIDs is in it: RSASSA-PSS (RFC 4055) via
+//! `verifyPssLink` and this repo's `rsa.verifyPss`, ML-DSA (RFC 9881) via
+//! `verifyMlDsaLink` and std's own `std.crypto.sign.mldsa`, and SLH-DSA
+//! (RFC 9882, all twelve FIPS 205 parameter sets) via `verifySlhDsaLink` and
+//! this repo's `slhdsa`. Which OIDs this module recognises is
+//! `algorithm.zig`, not std.
 //!
 //! **Out of scope, by design, not silently skipped:** CRL/OCSP revocation
 //! checking (RFC 5280 §6.3 — a separate online/offline data-fetching
@@ -158,7 +160,7 @@ pub const VerifyChainError = error{
 /// if set, is checked via `Parsed.verifyHostName`, and the leaf is parsed via
 /// `std.crypto.Certificate.parse` for `VerifiedChain.leaf`.
 ///
-/// A leaf whose algorithm std cannot name (RSASSA-PSS, ML-DSA) no longer
+/// A leaf whose algorithm std cannot name (RSASSA-PSS, ML-DSA, SLH-DSA) no longer
 /// fails the whole call the way it did before `algorithm.zig` existed: it is
 /// verified like any other, `VerifiedChain.leaf` is `null`, and the hostname
 /// check runs against `hostNameView` — this module's own walk of the two name
@@ -444,6 +446,10 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyCha
         return verifyMlDsaLink(subject_der, issuer_der, now_sec);
     }
 
+    if (algorithm.SlhDsa.map.get(subject_shape.sig_alg_oid) != null) {
+        return verifySlhDsaLink(subject_der, issuer_der, now_sec);
+    }
+
     if (Certificate.AlgorithmCategory.map.get(subject_shape.sig_alg_oid) == .rsassa_pss) {
         const issuer_shape = try parseShape(.{ .buffer = issuer_der, .index = 0 });
         const issuer_pub_key = try rsa.PublicKey.fromDer(issuer_shape.spki);
@@ -517,6 +523,59 @@ pub fn verifyMlDsaLink(
             // Pure ML-DSA with an empty context string, which is what
             // RFC 9881 §4 specifies for certificate signatures.
             sig.verify(subject_shape.message, pub_key) catch return error.CertificateSignatureInvalid;
+        },
+    }
+}
+
+/// Verifies an SLH-DSA link (RFC 9882) — the third algorithm this module
+/// verifies itself, for the same reason as the other two: the OID is not in
+/// `std.crypto.Certificate`'s closed table. Structurally identical to
+/// `verifyMlDsaLink`; the differences are twelve parameter sets instead of
+/// three, and this repo's own `slhdsa` module instead of std (std has no
+/// SLH-DSA at all).
+///
+/// `slhdsa`'s `verify` returns `bool` rather than an error union and is
+/// documented never to panic on a wrong-length signature — the length checks
+/// below are still made explicitly, so a size mismatch is reported as one
+/// instead of arriving as a bare `false` indistinguishable from a forgery.
+pub fn verifySlhDsaLink(
+    subject_der: CertDer,
+    issuer_der: CertDer,
+    now_sec: i64,
+) VerifyChainError!void {
+    const subject_shape = try parseShape(.{ .buffer = subject_der, .index = 0 });
+    const set = algorithm.SlhDsa.map.get(subject_shape.sig_alg_oid) orelse
+        return error.CertificateSignatureAlgorithmUnsupported;
+
+    if (now_sec < @as(i64, @intCast(subject_shape.not_before))) return error.CertificateNotYetValid;
+    if (now_sec > @as(i64, @intCast(subject_shape.not_after))) return error.CertificateExpired;
+
+    const issuer_shape = try parseShape(.{ .buffer = issuer_der, .index = 0 });
+
+    // Same reasoning as the ML-DSA path: the subject's signatureAlgorithm
+    // names a parameter set and the issuer's key must BE it. Here it matters
+    // more, not less — two sets share a public-key length for every security
+    // category (`s` and `f` differ only in signature size), so a length check
+    // alone would let an `s` key through for an `f` signature.
+    switch (issuer_shape.pub_key_algo) {
+        .slh_dsa => |issuer_set| if (issuer_set != set) return error.CertificateSignatureAlgorithmMismatch,
+        else => return error.CertificateSignatureAlgorithmMismatch,
+    }
+
+    const key_bytes = issuer_der[issuer_shape.pub_key_slice.start..issuer_shape.pub_key_slice.end];
+
+    switch (set) {
+        inline else => |comptime_set| {
+            const Impl = algorithm.SlhDsa.Impl(comptime_set);
+            if (key_bytes.len != Impl.public_key_length) return error.CertificatePublicKeyInvalid;
+            if (subject_shape.signature.len != Impl.signature_length) return error.CertificateSignatureInvalidLength;
+
+            const pub_key = Impl.PublicKey.fromBytes(key_bytes[0..Impl.public_key_length].*);
+            // Pure SLH-DSA with an empty context string (RFC 9882 §4), the
+            // same convention RFC 9881 sets for ML-DSA.
+            if (!Impl.verify(subject_shape.signature, subject_shape.message, pub_key, "")) {
+                return error.CertificateSignatureInvalid;
+            }
         },
     }
 }
@@ -598,10 +657,11 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
     const pub_key_alg_oid_bytes = bytes[pub_key_alg_oid.slice.start..pub_key_alg_oid.slice.end];
     const pub_key_algo: algorithm.PubKeyAlgo = switch (algorithm.fromOid(pub_key_alg_oid_bytes) orelse
         return error.CertificateHasUnrecognizedObjectId) {
-        // ML-DSA's AlgorithmIdentifier carries no parameters at all
-        // (RFC 9881 §3), so unlike the EC branch there is nothing to read
-        // after the OID.
+        // Neither post-quantum AlgorithmIdentifier carries parameters at
+        // all (RFC 9881 §3, RFC 9882 §3), so unlike the EC branch there is
+        // nothing to read after the OID.
         .ml_dsa => |set| .{ .ml_dsa = set },
+        .slh_dsa => |set| .{ .slh_dsa = set },
         .std_category => |category| switch (category) {
             inline .rsaEncryption, .rsassa_pss, .curveEd25519 => |tag| @unionInit(algorithm.PubKeyAlgo, @tagName(tag), {}),
             .X9_62_id_ecPublicKey => pk: {

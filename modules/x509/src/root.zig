@@ -12,7 +12,9 @@
 //! same-subject-DN candidates, per-link signature verification (RSA
 //! PKCS1v15/ECDSA P-256+P-384/Ed25519 via `std.crypto.Certificate.Parsed.verify`,
 //! RSASSA-PSS via this module's own `verifyPssLink` + the `rsa` module,
-//! ML-DSA-44/65/87 via `verifyMlDsaLink` + std's `std.crypto.sign.mldsa`),
+//! ML-DSA-44/65/87 via `verifyMlDsaLink` + std's `std.crypto.sign.mldsa`,
+//! all twelve SLH-DSA parameter sets via `verifySlhDsaLink` + the `slhdsa`
+//! module),
 //! basicConstraints/keyUsage CA-signer enforcement, pathLenConstraint
 //! bookkeeping with the self-issued-certificate exception, accumulated
 //! nameConstraints, extended-key-usage chaining, and hostname matching
@@ -60,6 +62,9 @@
 //!   before anything is verified. ML-DSA (RFC 9881, 2025-10) is the current
 //!   instance: std has the *primitives* (`std.crypto.sign.mldsa`, measured
 //!   faster than OpenSSL 3.5 on every operation) but no X.509 name for them.
+//!   SLH-DSA (RFC 9882) is the other, and there std has neither — the
+//!   implementation is this repo's own `slhdsa`, anchored on NIST ACVP
+//!   vectors.
 //!   `algorithm.zig` is this module's own table for exactly that reason; it
 //!   consults std's first and passes std's answers through unchanged, so no
 //!   certificate resolves differently than it did before.
@@ -78,8 +83,8 @@
 //! **Verdict:** the real gap is path-building + RFC 5280 §6 POLICY on top of
 //! std's already-correct single-link parse/verify — not re-parsing DER or
 //! re-implementing signature crypto (both reused directly, except the
-//! narrow RSA-PSS and ML-DSA carve-outs above, neither of which adds a
-//! parser or an algorithm: only a lookup std has no seam for). This module
+//! narrow RSA-PSS, ML-DSA and SLH-DSA carve-outs above, none of which adds
+//! a parser: what they add is a lookup std has no seam for). This module
 //! is built ON
 //! `std.crypto.Certificate`, not instead of it.
 //!
@@ -159,10 +164,12 @@ pub const VerifiedChain = chain.VerifiedChain;
 pub const VerifyChainError = chain.VerifyChainError;
 pub const PubKeyAlgo = algorithm.PubKeyAlgo;
 pub const MlDsa = algorithm.MlDsa;
+pub const SlhDsa = algorithm.SlhDsa;
 /// Single-link verification for the two algorithms std cannot parse, for
 /// consumers holding a certificate and its issuer without a path to build.
 pub const verifyPssLink = chain.verifyPssLink;
 pub const verifyMlDsaLink = chain.verifyMlDsaLink;
+pub const verifySlhDsaLink = chain.verifySlhDsaLink;
 
 /// `x509.spkiOf(cert_der)` — the supported way to name a certificate's public
 /// key without verifying anything about the certificate: it returns the
@@ -181,7 +188,7 @@ pub const meta = .{
     .role = .util, // pure verification logic; no I/O, no wire framing of its own
     .concurrency = .reentrant, // no shared/global state; every function is a pure value-in/value-out check
     .model_after = "RFC 5280 (X.509 v3 / PKIX) + RFC 9881 (ML-DSA in X.509); built on std.crypto.Certificate (MIT) for DER + single-link verify",
-    .deps = .{"rsa"}, // rsa.PublicKey / rsa.verifyPss for the RSASSA-PSS gap (see chain.zig's verifyPssLink)
+    .deps = .{ "rsa", "slhdsa" }, // rsa.verifyPss for the RSASSA-PSS gap; slhdsa for RFC 9882 certificates (std has no SLH-DSA)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────────
