@@ -417,6 +417,22 @@ fn udpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, rb
     }
 }
 
+/// Distinguish a canceled wait from a genuine read/write failure using the
+/// concrete `Stream.Reader`/`Stream.Writer`'s out-of-band `err` field —
+/// `Io.Reader.Error`/`Io.Writer.Error` cannot carry `Canceled` themselves.
+/// `tcpExchange` is the only place in this file that owns a TCP fd directly
+/// (`udpExchange` gets `Io.Cancelable` intact from `Socket.Send`/
+/// `ReceiveTimeoutError` already, nothing to recover there).
+fn readFailure(sr: *const net.Stream.Reader) Error {
+    if (sr.err) |e| if (e == error.Canceled) return error.Canceled;
+    return error.NetworkFailed;
+}
+
+fn writeFailure(sw: *const net.Stream.Writer) Error {
+    if (sw.err) |e| if (e == error.Canceled) return error.Canceled;
+    return error.NetworkFailed;
+}
+
 /// One TCP round-trip: 2-byte big-endian length prefix both ways
 /// (RFC 1035 §4.2.2). Returns a gpa-owned response.
 fn tcpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
@@ -434,16 +450,22 @@ fn tcpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 
     var wbuf: [message.max_query_len + 2]u8 = undefined;
     var sw = stream.writer(io, &wbuf);
     const w = &sw.interface;
-    w.writeInt(u16, @intCast(packet.len), .big) catch return error.NetworkFailed;
-    w.writeAll(packet) catch return error.NetworkFailed;
-    w.flush() catch return error.NetworkFailed;
+    w.writeInt(u16, @intCast(packet.len), .big) catch return writeFailure(&sw);
+    w.writeAll(packet) catch return writeFailure(&sw);
+    w.flush() catch return writeFailure(&sw);
 
     var tbuf: [4096]u8 = undefined;
     var sr = stream.reader(io, &tbuf);
-    const len = sr.interface.takeInt(u16, .big) catch return error.NetworkFailed;
+    const len = sr.interface.takeInt(u16, .big) catch |e| switch (e) {
+        error.EndOfStream => return error.NetworkFailed,
+        error.ReadFailed => return readFailure(&sr),
+    };
     const out = try r.gpa.alloc(u8, len);
     errdefer r.gpa.free(out);
-    sr.interface.readSliceAll(out) catch return error.NetworkFailed;
+    sr.interface.readSliceAll(out) catch |e| switch (e) {
+        error.EndOfStream => return error.NetworkFailed,
+        error.ReadFailed => return readFailure(&sr),
+    };
     return out;
 }
 
@@ -758,4 +780,41 @@ test "live: DoH-JSON via dns.google/resolve" {
     defer parsed.deinit();
     try testing.expectEqual(@as(u32, 0), parsed.value.Status);
     try testing.expect(parsed.value.Answer.len > 0);
+}
+
+// ── tests (cancellation, offline) ────────────────────────────────────────────
+//
+// `tcpExchange` is the only place in this file that owns a TCP fd directly.
+// `Future.cancel` does unblock a thread parked in a real `std.Io` read, but
+// `Io.Reader.Error` cannot carry `Canceled` itself — the reason survives only
+// in the concrete `Stream.Reader`'s out-of-band `err` field, which
+// `readFailure` now consults. This drives `tcpExchange` against a loopback
+// listener nobody ever accepts: `connect` and the length-prefixed write both
+// still succeed (the kernel completes the handshake and buffers the write on
+// its own), so the read genuinely parks in `takeInt`, waiting for a response
+// length prefix that never arrives.
+
+test "tcpExchange: a canceled blocking read surfaces Canceled, not NetworkFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 0: an ephemeral port cannot collide with a parallel test run.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch {
+        std.debug.print("live dns test skipped: loopback listen failed\n", .{});
+        return error.SkipZigTest;
+    };
+    defer listener.socket.close(io);
+
+    var r = Resolver.init(io, testing.allocator, .{
+        .port = listener.socket.address.ip4.port,
+        .transport = .tcp,
+    });
+    defer r.deinit();
+
+    var packet = [_]u8{ 0, 1, 2, 3 };
+    var fut = try io.concurrent(Resolver.tcpExchange, .{ &r, netaddr.parseIp("127.0.0.1").?, &packet });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }
