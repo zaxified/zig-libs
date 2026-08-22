@@ -579,8 +579,8 @@ pub fn pemDecode(gpa: Allocator, label: []const u8, text: []const u8) PemDecodeE
 }
 
 /// Number of `-----BEGIN <label>-----` blocks in `text`.
-pub fn pemBlockCount(label: []const u8, text: []const u8) usize {
-    std.debug.assert(label.len <= max_pem_label_len);
+pub fn pemBlockCount(label: []const u8, text: []const u8) error{LabelTooLong}!usize {
+    if (label.len > max_pem_label_len) return error.LabelTooLong;
     var begin_buf: [max_pem_label_len + 16]u8 = undefined;
     const begin = std.fmt.bufPrint(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
     return std.mem.count(u8, text, begin);
@@ -967,8 +967,14 @@ test "PEM: encode/decode round-trip, wrapping, labels, garbage" {
     const picked = try pemDecode(testing.allocator, "CERTIFICATE", noisy);
     defer testing.allocator.free(picked);
     try testing.expectEqualSlices(u8, payload, picked);
-    try testing.expectEqual(@as(usize, 1), pemBlockCount("CERTIFICATE", noisy));
-    try testing.expectEqual(@as(usize, 1), pemBlockCount("EC PRIVATE KEY", noisy));
+    try testing.expectEqual(@as(usize, 1), try pemBlockCount("CERTIFICATE", noisy));
+    try testing.expectEqual(@as(usize, 1), try pemBlockCount("EC PRIVATE KEY", noisy));
+
+    // The length guard used to be an `std.debug.assert`, which compiles out of
+    // ReleaseFast/ReleaseSmall — the over-long label then reached the
+    // `bufPrint(...) catch unreachable` below it.
+    const too_long = "A" ** (max_pem_label_len + 1);
+    try testing.expectError(error.LabelTooLong, pemBlockCount(too_long, noisy));
 
     try testing.expectError(error.MissingPemBlock, pemDecode(testing.allocator, "CERTIFICATE REQUEST", noisy));
     try testing.expectError(error.InvalidPem, pemDecode(

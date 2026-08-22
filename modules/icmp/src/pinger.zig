@@ -308,6 +308,10 @@ pub const RunError = error{
     /// assert here compiles out of exactly the modes that would suffer from
     /// being wrong.
     SendBufferTooSmall,
+    /// A receive slot is shorter than the batch slab it indexes. `init` sizes
+    /// the slab so this cannot happen; reported for the same reason as
+    /// `SendBufferTooSmall` — an assert compiles out of the release modes.
+    RecvSlabTooSmall,
 } || Socket.OpenError;
 
 pub const Pinger = struct {
@@ -540,7 +544,7 @@ pub const Pinger = struct {
         try self.dispatchDue();
         now = monoNow();
 
-        self.drainReplies();
+        try self.drainReplies();
 
         // All probes resolved and nothing left to send: the remaining
         // timeout events only guarded duplicate detection — like fping,
@@ -858,7 +862,7 @@ pub const Pinger = struct {
     }
 
     /// Read and process every already-received reply (non-blocking).
-    fn drainReplies(self: *Pinger) void {
+    fn drainReplies(self: *Pinger) RunError!void {
         // One realtime/monotonic pair converts kernel receive timestamps
         // (CLOCK_REALTIME) to the engine's monotonic clock.
         const mono_now = monoNow();
@@ -872,7 +876,8 @@ pub const Pinger = struct {
             if (maybe_sock != null) {
                 const sock = self.socketFor(fam);
                 while (true) {
-                    const infos = sock.recvBatch(&self.recv_batch);
+                    const infos = sock.recvBatch(&self.recv_batch) catch
+                        return error.RecvSlabTooSmall;
                     if (infos.len == 0) break;
                     for (infos) |info| {
                         const recv_mono = if (info.timestamp_real_ns) |ts_real|

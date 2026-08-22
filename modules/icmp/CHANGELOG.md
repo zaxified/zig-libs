@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — **Breaking:** `Socket.recvBatch` returns
+  `error{SlabTooSmall}![]const RecvInfo` instead of `[]const RecvInfo`, and
+  `pinger.RunError` gained `RecvSlabTooSmall`. The `batch_max * slot_size` slab
+  requirement was an `std.debug.assert`, so in ReleaseFast/ReleaseSmall a short
+  slab let `recvmmsg` write past its end. Both operands are runtime values, so
+  unlike the fixed-size writers below the requirement cannot move into the type.
+  `Pinger` sizes its own slab and never returns the new error.
+
 - **2026-08-22** — **Breaking:** `echo.writeTimestampRequest` takes
   `*[timestamp_msg_len]u8` instead of `[]u8`, and `echo.writeEchoRequest` returns
   `error{BufferTooSmall}!void` instead of `void`. Both guarded their buffer with

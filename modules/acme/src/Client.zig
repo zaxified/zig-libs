@@ -345,7 +345,11 @@ pub fn obtain(c: *Client, domains: []const []const u8) Error!Certificate {
         c.noteProblem(cpr.body);
         return error.AcmeProblem;
     }
-    if (x509.pemBlockCount("CERTIFICATE", cpr.body) == 0) return error.MalformedResponse;
+    // The label is a literal well under `max_pem_label_len`, so `LabelTooLong`
+    // cannot occur here; mapping it to 0 keeps the branch fail-closed anyway
+    // rather than widening `Error` with a variant no caller can trigger.
+    const chain_blocks = x509.pemBlockCount("CERTIFICATE", cpr.body) catch 0;
+    if (chain_blocks == 0) return error.MalformedResponse;
     const not_after = x509.certNotAfter(c.gpa, cpr.body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,

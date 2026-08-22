@@ -393,8 +393,14 @@ pub const RecvBatch = struct {
 /// Read up to batch_max packets with one recvmmsg call. Returns the empty
 /// slice when the socket is drained (EAGAIN) or on transient errors; a
 /// full slice means more packets may be waiting — call again.
-pub fn recvBatch(self: *const Socket, b: *RecvBatch) []const RecvInfo {
-    std.debug.assert(b.slab.len >= batch_max * b.slot_size);
+///
+/// `error.SlabTooSmall` when `b` does not carry the `batch_max * slot_size`
+/// bytes its own documentation requires. This was an `std.debug.assert`,
+/// which `ReleaseFast`/`ReleaseSmall` compile out — and the kernel then
+/// writes past the end of the slab, because both operands are runtime
+/// values the type system cannot relate.
+pub fn recvBatch(self: *const Socket, b: *RecvBatch) error{SlabTooSmall}![]const RecvInfo {
+    if (b.slab.len < batch_max * b.slot_size) return error.SlabTooSmall;
     for (0..batch_max) |i| {
         b.iovs[i] = .{ .base = b.slab.ptr + i * b.slot_size, .len = b.slot_size };
         b.msgs[i] = .{
@@ -451,4 +457,17 @@ fn parseControl(control: []const u8, info: *RecvInfo) void {
         // CMSG_NXTHDR: advance by len rounded up to cmsghdr alignment.
         off += std.mem.alignForward(usize, cmsg.len, cmsg_align);
     }
+}
+
+test "recvBatch rejects an undersized slab instead of letting the kernel write past it" {
+    // fd -1 is never reached: the size check runs before recvmmsg, which is
+    // the whole point — the old `std.debug.assert` compiled out of
+    // ReleaseFast/ReleaseSmall and the kernel wrote `batch_max * slot_size`
+    // bytes into a slab that was shorter than that.
+    const sock: Socket = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 1 };
+
+    const slot_size = 64;
+    var short: [batch_max * slot_size - 1]u8 = undefined;
+    var b: RecvBatch = .{ .slab = &short, .slot_size = slot_size };
+    try std.testing.expectError(error.SlabTooSmall, sock.recvBatch(&b));
 }
