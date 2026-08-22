@@ -56,6 +56,13 @@ pub const TransportError = error{
     WriteFailed,
     /// The peer closed the stream.
     EndOfStream,
+    /// The blocking operation was canceled through the `std.Io` cancellation
+    /// protocol (`Future.cancel`). Surfaced instead of `ReadFailed`/
+    /// `WriteFailed` so a caller can tell a canceled wait from a real
+    /// transport failure. Part of the vtable contract for a `Transport` that
+    /// *does* own a socket; `SshTransport` below owns none and never
+    /// produces it — see its doc comment.
+    Canceled,
 };
 
 /// The byte-stream seam. One blocking `read`, one `write`; no timeouts, no
@@ -468,6 +475,16 @@ pub const Client = struct {
 /// `read` consumes whatever the SSH session has already buffered before
 /// pumping for more, and clears the session's `stdout` as it goes so a long
 /// session cannot grow it without bound.
+///
+/// This adapter never produces `error.Canceled`. It owns no file descriptor
+/// to recover a cancellation from: `pumpOnce` below folds a failure from
+/// `ssh.connection.Session` into `ReadFailed` already, and by the time it
+/// gets there the real socket is two layers further down, behind
+/// `ssh.transport.Transport`'s type-erased `*std.Io.Reader` — the concrete
+/// reader whose out-of-band `err` field would carry `Canceled` belongs to
+/// whoever built that `std.Io.Reader` in the first place, not to this module.
+/// A caller that needs to tell a cancel from a dead SSH connection has to
+/// inspect that reader itself (see `ssh`'s own transport doc comment).
 pub const SshTransport = struct {
     session: *ssh.connection.Session,
     /// True once the channel reported EOF/close.

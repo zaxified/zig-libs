@@ -155,7 +155,10 @@ reference implementation of the same seam.
 ### Types
 
 - `Transport` — `{ ctx, vtable{ read, write } }`; `SshTransport.init(&ssh_session)` is the
-  ready-made one. `TransportError` = `ReadFailed` / `WriteFailed` / `EndOfStream`.
+  ready-made one. `TransportError` = `ReadFailed` / `WriteFailed` / `EndOfStream` /
+  `Canceled` — the last is part of the vtable contract for a transport that owns a socket
+  and can recover a `std.Io` cancellation from it; `SshTransport` owns none and never
+  produces it.
 - `Framer` — `init(gpa, dialect, Limits)`, `feed`, `next`, `setDialect`, `atBoundary`;
   `framing.writeMessage` / `writeChunked` / `frameAlloc` on the encode side. `Limits`
   bounds message size, chunk size and un-terminated pending input.
