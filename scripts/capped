@@ -2,11 +2,21 @@
 # Run any command under this repo's memory cap. For ad-hoc invocations, and for
 # anything that shells out to a driver which does NOT cap for itself:
 #
-# ⚠ `scripts/test.sh` does NOT apply this cap. It sources test-lib.sh but never
-# calls `_zl_cap_argv`, so a bare `test.sh all` is unbounded. This header used
-# to claim the opposite, which is how three uncapped lanes came to kill a
-# desktop on 2026-08-18. `scripts/tag.sh` now caps each lane itself; `test.sh`
-# still relies on being invoked through here.
+# ⚠ This header has now been wrong in BOTH directions, so read the current
+# arrangement rather than remembering one:
+#
+#   * It once claimed `test.sh` capped itself when it did not -- three uncapped
+#     lanes killed a desktop on 2026-08-18.
+#   * It then claimed `test.sh` "never calls `_zl_cap_argv`", which was also
+#     false: `step()` had been wrapping every command in its own scope.
+#
+# Since 2026-08-22 `test.sh` re-execs the WHOLE run inside one scope and skips
+# the per-step wrapper, because the per-step cap could not bound a run: each
+# scope is destroyed with `--collect` when its step ends and anything it left in
+# tmpfs reparents to the uncapped user slice, so the charges accumulated while
+# every individual step stayed under the limit. `scripts/tag.sh` caps each lane
+# itself. This wrapper is for ad-hoc commands and for anything else that does
+# not cap for itself.
 #
 #     scripts/capped zig build test-yaml --summary all
 #     ZIGLIBS_MEM_MAX=24G scripts/capped zig build test

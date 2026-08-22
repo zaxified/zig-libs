@@ -133,14 +133,36 @@ problem**. Set `ZIG_LIBS_VERBOSE_SKIP=1` to see why something skipped; the skip
 
 ## Memory cap
 
-Every command `test.sh` runs goes inside a transient cgroup limited to
-`ZIGLIBS_MEM_MAX` (default `12G`). A test that allocates without bound is then
-killed by **its own** cgroup — one red step with exit 137 and an explicit
-message — instead of by the kernel's global OOM killer, which picks its victim
-by size and so takes down whatever is biggest on the machine. Under an IDE that
-is the editor, because every build and test is a child of the editor's cgroup.
-This is not a hypothetical: a `test` binary at 15.4 GB RSS killed the whole
-session here, `constraint=CONSTRAINT_NONE, global_oom` in the kernel log.
+`test.sh` re-execs itself inside **one** transient cgroup limited to
+`ZIGLIBS_RUN_MEM_MAX` (default `20G`) and runs everything there. A run that
+allocates without bound is then killed by **its own** cgroup — one red step with
+exit 137 and an explicit message — instead of by the kernel's global OOM killer,
+which picks its victim by `oom_score_adj` rather than by who filled memory.
+Under an IDE that victim is the editor. Not hypothetical, twice over: a `test`
+binary at 15.4 GB RSS killed the session here, and on 2026-08-22 an editor
+window died with `global_oom` while the gate was mid-run.
+
+**One cap for the run, not one per step, and the difference is the whole
+point.** Each step used to get its own scope. That bounds a single runaway test
+and cannot bound a run, for two reasons found the hard way:
+
+- `--collect` destroys a step's scope when the step ends, and whatever it left
+  in tmpfs is **reparented to the uncapped user slice**. Charges accumulate
+  across steps while every individual step stays politely under its limit.
+- `/tmp` is tmpfs on a desktop — RAM, evictable only to swap — and `step()`
+  captures every command's stdout and stderr into `mktemp` files. A full run's
+  logs are gigabytes of it. The 2026-08-22 crash was 15.7 GB of shmem against
+  511 MB of swap, `all_unreclaimable? yes`, with the sum of every process's RSS
+  only 9 GB. Nothing on the machine looked large; the memory was in files.
+
+`test.sh` therefore also points `TMPDIR` at `.zig-cache/gate-tmp` (on disk) when
+it would otherwise be `/tmp`, so step logs never occupy RAM at all. Set `TMPDIR`
+yourself to override.
+
+Verify the cap rather than trusting it: `ZIGLIBS_RUN_MEM_MAX` set absurdly low
+must produce exit 137, and a *warm* cache is not a test — a fully cached
+`zig build` allocates almost nothing and sails under a 150 MB cap. Force real
+work (`--cache-dir` to a fresh directory) or you are measuring nothing.
 
 The `12G` default is measured: a full `zig build test` across every module
 peaks at **4.1 GiB** for the whole parallel build, and the largest individual
@@ -148,8 +170,14 @@ test binary is 115 MB. That leaves roughly 3x headroom over a legitimate full
 run while still stopping a runaway an order of magnitude smaller than the one
 that caused the crash.
 
-    ZIGLIBS_MEM_MAX=24G scripts/test.sh all    # raise it
-    ZIGLIBS_MEM_MAX=off scripts/test.sh        # disable the wrapper
+    ZIGLIBS_RUN_MEM_MAX=28G scripts/test.sh all   # raise it
+    ZIGLIBS_RUN_MEM_MAX=off scripts/test.sh       # disable the whole-run scope
+
+`ZIGLIBS_MEM_MAX` (default `12G`) still exists and still wraps each command —
+but only when the run is NOT already inside the whole-run scope, since a
+transient scope cannot spawn another. It is what `scripts/capped` and
+`scripts/tag.sh`'s per-lane wrapping use. Two names for two meanings, kept
+separate so raising one cannot silently mean the other.
 
 For anything that bypasses the driver — a bare `zig build test-<module>` while
 iterating — use the same cap through `scripts/capped`:

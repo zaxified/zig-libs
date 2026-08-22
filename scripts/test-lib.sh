@@ -124,6 +124,11 @@ _ZL_CAP=()
 _zl_cap_argv() {
     _ZL_CAP=()
     local max="${ZIGLIBS_MEM_MAX:-12G}"
+    # Already inside test.sh's whole-run scope: a transient scope cannot spawn
+    # another, so wrapping here would cost a failing D-Bus round trip per step
+    # and cap nothing. The outer scope is the stronger guarantee anyway -- it
+    # bounds the SUM, which is what the per-step cap could never do.
+    [[ -z "${_ZL_IN_RUN_SCOPE:-}" ]] || return 0
     [[ $_ZL_CAP_OK -eq 1 && "$max" != "off" ]] || return 0
     _ZL_CAP=(systemd-run --user --scope -q --collect
         -p "MemoryMax=$max" -p MemorySwapMax=0 --)
@@ -367,7 +372,11 @@ step() {
     if [[ $rc -eq 137 && $_ZL_CAP_OK -eq 1 ]]; then
         # 137 = SIGKILL. Inside the cap that is nearly always the cgroup OOM
         # killer, and the raw number tells you nothing on its own.
-        echo "  -> SIGKILL: almost certainly exceeded ZIGLIBS_MEM_MAX=${ZIGLIBS_MEM_MAX:-12G}."
+        if [[ -n "${_ZL_IN_RUN_SCOPE:-}" ]]; then
+            echo "  -> SIGKILL: the run exceeded ZIGLIBS_RUN_MEM_MAX=${ZIGLIBS_RUN_MEM_MAX:-20G} (one cap for the WHOLE run, not this step alone)."
+        else
+            echo "  -> SIGKILL: almost certainly exceeded ZIGLIBS_MEM_MAX=${ZIGLIBS_MEM_MAX:-12G}."
+        fi
         echo "     Shrink the test's footprint; raise the cap only if it is genuinely that large."
     fi
     echo

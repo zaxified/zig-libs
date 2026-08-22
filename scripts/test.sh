@@ -33,6 +33,52 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/test-lib.sh"
+
+# ── one cgroup around the WHOLE run ────────────────────────────────────────
+#
+# `step()` already puts each command in its own transient scope with a memory
+# cap, which bounds any single runaway test. That is not enough, and the gap
+# cost a desktop on 2026-08-22.
+#
+# Two reasons the per-step cap does not bound a run:
+#
+#   1. `--collect` destroys each scope when its step ends, and anything the
+#      step left in tmpfs is REPARENTED to the (uncapped) user slice. So the
+#      charges accumulate across steps while every individual step stays
+#      politely under the limit.
+#   2. `/tmp` is tmpfs on a typical desktop -- RAM, evictable only to swap --
+#      and `step()` captures every command's stdout and stderr into `mktemp`
+#      files there. A full run's logs are gigabytes of it.
+#
+# What that looked like: 15.7 GB of shmem, 30 of 31 GB anonymous,
+# `all_unreclaimable? yes` with 511 MB of swap, and the kernel's global OOM
+# killer taking the editor -- which it picks by `oom_score_adj`, so the thing
+# that dies is never the thing that filled memory.
+#
+# So the run re-execs itself inside ONE scope before doing anything. Inside it
+# the per-step wrapper is skipped (a transient scope cannot spawn another),
+# which is correct: one cap over the sum is what was missing, not a tighter one
+# per part. `ZIGLIBS_RUN_MEM_MAX=off` opts out; the per-step limit keeps its own
+# `ZIGLIBS_MEM_MAX`, deliberately a separate name because the two mean
+# different things.
+if [[ -z "${_ZL_IN_RUN_SCOPE:-}" ]]; then
+    _zl_run_max="${ZIGLIBS_RUN_MEM_MAX:-20G}"
+    if [[ $_ZL_CAP_OK -eq 1 && "$_zl_run_max" != "off" ]]; then
+        export _ZL_IN_RUN_SCOPE=1
+        exec systemd-run --user --scope -q --collect \
+            -p "MemoryMax=$_zl_run_max" -p MemorySwapMax=0 -- "$0" "$@"
+    fi
+fi
+
+# Step logs off tmpfs. `mktemp` follows TMPDIR, and on a desktop the default is
+# RAM. This is the other half of the fix above: capping the run stops the
+# machine dying, and moving the logs stops the run dying of its own output.
+if [[ -z "${TMPDIR:-}" || "$TMPDIR" == "/tmp" ]]; then
+    _zl_disk_tmp="$REPO_ROOT/.zig-cache/gate-tmp"
+    mkdir -p "$_zl_disk_tmp"
+    export TMPDIR="$_zl_disk_tmp"
+fi
+
 export ZIGLIBS_TEST_T0="$(_now)"
 
 cd "$REPO_ROOT"
