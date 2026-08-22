@@ -217,7 +217,7 @@ const module_list = [_]Module{
     .{ .name = "rawsock", .deps = &.{"netaddr"} },
     .{ .name = "encoding" },
     .{ .name = "syslog" },
-    .{ .name = "sntp" },
+    .{ .name = "sntp", .example = true },
     .{ .name = "stun", .deps = &.{"netaddr"}, .example = true },
     .{ .name = "opcua", .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .example = true },
     .{ .name = "noise", .deps = &.{"chachapoly"}, .example = true },
