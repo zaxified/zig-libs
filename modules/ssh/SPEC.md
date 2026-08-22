@@ -199,8 +199,10 @@ Parts 1-3 are implemented. What is deliberately *not* here:
   running (`.collect_until_eof`, the default) or running immediately with empty stdin
   (`.ignore`). Streaming a handler's stdin/stdout as it runs would need a different handler shape.
 - **Rekeying** (RFC 4253 §9) is still not represented in `Transport`; the fixed algorithm-menu
-  constants are still not runtime-configurable; RFC 8731 §5's published curve25519-sha256 vectors
-  are still not wired as an independent KAT.
+  constants are still not runtime-configurable. RFC 8731 publishes no curve25519-sha256 test
+  vectors anywhere — its §5 is IANA Considerations only, and the RFC as a whole has no
+  vectors/examples section — so there is no independent KAT to wire for it; this was a
+  misstatement in an earlier revision of this note, not an open task.
 
 ## Status
 
