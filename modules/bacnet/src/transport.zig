@@ -27,6 +27,13 @@ pub const TransportError = error{
     RecvFailed,
     /// The caller's buffer is smaller than the datagram that arrived.
     DatagramTooLarge,
+    /// The blocking send or receive was canceled through the `std.Io`
+    /// cancellation protocol (`Future.cancel`). Surfaced instead of
+    /// `SendFailed`/`RecvFailed` because a canceled wait is not a transport
+    /// failure — the socket is fine, the caller just stopped waiting on it —
+    /// and a caller (e.g. a poll loop torn down mid-`recv`) needs to tell the
+    /// two apart.
+    Canceled,
 };
 
 /// A received datagram: the octets, and who sent them.
@@ -138,7 +145,13 @@ pub const UdpTransport = struct {
         const dest: std.Io.net.IpAddress = .{
             .ip4 = .{ .bytes = to.ip, .port = to.port },
         };
-        self.socket.send(self.io, &dest, bytes) catch return error.SendFailed;
+        // `Socket.SendError` already carries `Io.Cancelable` (unlike
+        // `std.Io.Reader.Error`, which cannot express it) — no out-of-band
+        // field to consult, just don't flatten what std handed us.
+        self.socket.send(self.io, &dest, bytes) catch |e| switch (e) {
+            error.Canceled => return error.Canceled,
+            else => return error.SendFailed,
+        };
     }
 
     fn sendFn(ctx: *anyopaque, to: bvll.BipAddress, bytes: []const u8) TransportError!void {
@@ -162,10 +175,18 @@ pub const UdpTransport = struct {
                     // An idle link is not an error — it is the normal state of
                     // a BACnet client between transactions.
                     error.Timeout => return null,
+                    // `Socket.ReceiveError`/`ReceiveTimeoutError` already carry
+                    // `Io.Cancelable` directly, so there is no out-of-band
+                    // field to consult here (unlike `std.Io.Reader.Error`) —
+                    // just pass it through instead of relabeling it a failure.
+                    error.Canceled => return error.Canceled,
                     else => return error.RecvFailed,
                 };
             }
-            break :blk self.socket.receive(self.io, buf) catch return error.RecvFailed;
+            break :blk self.socket.receive(self.io, buf) catch |e| switch (e) {
+                error.Canceled => return error.Canceled,
+                else => return error.RecvFailed,
+            };
         };
         // Annex J is IPv4-only. An IPv6 datagram on this socket is either an
         // IPv4-mapped address (which converts) or something that has no
@@ -349,4 +370,29 @@ test "loop transport: a datagram larger than the caller's buffer is an error" {
     var ok: [16]u8 = undefined;
     const got = (try ep.transport().recv(&ok)).?;
     try testing.expectEqualStrings("0123456789", got.bytes);
+}
+
+// Real-socket test: proves `Socket.ReceiveError`'s `Io.Cancelable` survives
+// `recvFn` instead of being relabeled `RecvFailed`. Uses `UdpTransport` on an
+// ephemeral local port that nothing ever sends to, so `receive` is genuinely
+// blocked in the kernel when the cancel lands.
+const RecvTask = struct {
+    fn run(t: Transport, buf: []u8) TransportError!?Received {
+        return t.recv(buf);
+    }
+};
+
+test "udp transport: a cancel during a blocked receive surfaces Canceled, not RecvFailed" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tp = try UdpTransport.open(io, .{ .port = 0 });
+    defer tp.close();
+
+    var buf: [max_datagram]u8 = undefined;
+    var fut = try io.concurrent(RecvTask.run, .{ tp.transport(), &buf });
+    try io.sleep(.fromMilliseconds(200), .awake);
+
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }
