@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `Response.readAllAlloc` stops laundering a canceled body read
+  into `error.ReadFailed`. `std.Io.Reader.LimitedAllocError` (`allocRemaining`'s
+  error set) is exactly `{OutOfMemory, ReadFailed, StreamTooLong}` — no
+  `Canceled` variant to switch on — but the `else` arm that used to catch
+  `ReadFailed` threw away the real cause a call after `Conn.readFailure` had
+  already recovered it from `conn.sr.err`/`.sw.err` (the same recovery every
+  other read/write site in this file already uses, see its doc comment at
+  `Client.zig:1039`). The switch is now exhaustive over the three actual
+  variants (`error.ReadFailed => res.conn.readFailure()`), so the next variant
+  `LimitedAllocError` grows is a compile error here too, not a silent
+  mis-map. Pinned by a new loopback test whose peer sends a `Content-Length: 5`
+  head and then no body at all, so the read is genuinely parked when a
+  concurrent task cancels it; confirmed to fail (`expected error.Canceled,
+  found error.ReadFailed`) with the fix reverted to the old `else` arm, and to
+  pass restored. `zig build test-http` — 449/449.
 - **2026-08-22** — `Server`'s per-connection reader and writer stop reporting a
   canceled connection as a stalled peer. Internal change, no API surface moved:
   `Client` already carried `Canceled` in its `Error` set and already recovered it

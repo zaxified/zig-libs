@@ -240,6 +240,77 @@ test "Client: request/response types are re-exported flatly" {
     try testing.expectEqualStrings("claude-opus-4-8", req.model);
 }
 
+// ── tests (cancellation, loopback) ──────────────────────────────────────────
+//
+// `create`'s body read goes through `http.Client.Response.readAllAlloc`, and
+// `mapHttpError` already names `error.Canceled` explicitly (see above) — so
+// once `http` itself stopped laundering a canceled body read into
+// `error.ReadFailed` (its `Client.zig:552`, this campaign's root fix), this
+// path is fixed for free, with no change needed in this file. Proven here
+// rather than assumed: the fake peer answers a `Content-Length: 5` head and
+// sends none of the body, so the read is genuinely parked in the kernel when
+// the test cancels it.
+
+const CreateCancelPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    stop: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *CreateCancelPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var wbuf: [256]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") catch {};
+        sw.interface.flush() catch {};
+        while (p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+};
+
+fn createOnce(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!std.json.Parsed(Message) {
+    return c.create(gpa, req);
+}
+
+test "Client.create: a canceled body read surfaces error.Canceled, not error.HttpFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("llmclient cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: CreateCancelPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, CreateCancelPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var http_client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer http_client.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const base_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{port});
+
+    var c: Client = .init(&http_client, "sk-test-key");
+    c.base_url = base_url;
+
+    const req: MessageRequest = .{
+        .max_tokens = 16,
+        .messages = &.{types.MessageParam.user(&.{types.textBlock("hi")})},
+    };
+
+    var fut = try io.concurrent(createOnce, .{ &c, testing.allocator, req });
+    // Long enough that the head has arrived and the body read is the one
+    // parked in the kernel.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
 // Real network call against the live API — skipped unconditionally.
 //
 // This module is pure Zig (no libc), and 0.16's `std.process.Environ`

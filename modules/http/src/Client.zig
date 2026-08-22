@@ -550,10 +550,17 @@ pub const Response = struct {
     /// Read the whole remaining body into an allocated buffer
     /// (`error.BodyTooLarge` beyond `max_len`).
     pub fn readAllAlloc(res: *Response, gpa: std.mem.Allocator, max_len: usize) Error![]u8 {
+        // `std.Io.Reader.LimitedAllocError` is exactly `{OutOfMemory,
+        // ReadFailed, StreamTooLong}` — an `else` arm here used to fold
+        // `ReadFailed` in blind, discarding the same `error.Canceled` that
+        // `Conn.readFailure` already recovers one call away in `sendAndReadHead`
+        // (see its doc comment: both TLS and plaintext funnel through the same
+        // socket reader, so this one check covers a chunked, Content-Length,
+        // or until-close body alike).
         return res.reader().allocRemaining(gpa, .limited(max_len)) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.StreamTooLong => error.BodyTooLarge,
-            else => error.ReadFailed,
+            error.ReadFailed => res.conn.readFailure(),
         };
     }
 
@@ -2594,6 +2601,79 @@ test "dialConn: TLS key material fails CLOSED when randomSecure has no entropy" 
     // void, so a client that used it would hand the ClientHello random and key
     // share a degraded seed with nothing to check.
     try testing.expectError(error.EntropyUnavailable, client.request(.get, url, .{}));
+}
+
+// ── tests (cancellation) ─────────────────────────────────────────────────────
+//
+// `Response.readAllAlloc` used to fold every body-read failure into
+// `error.ReadFailed` via a bare `else` arm — a call after `Conn.readFailure`
+// had already recovered `error.Canceled` from `conn.sr.err`/`.sw.err`, and
+// erasing it a second time here made an `std.Io` cancelation indistinguishable
+// from a dead peer. This peer answers the response head immediately
+// (`Content-Length: 5`) and then sends none of the declared body, so the
+// caller's body read really is parked in the kernel when the cancel arrives.
+
+const HeadThenSilentPeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    stop: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *HeadThenSilentPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [1024]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        var sw = s.writer(p.io, &wbuf);
+        var head_buf: [1024]u8 = undefined;
+        _ = h1.readHead(&sr.interface, &head_buf) catch {};
+        sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") catch {};
+        sw.interface.flush() catch {};
+        // Hold the connection open with no body bytes ever sent, until the
+        // test is done with it — closing early would hand the client a clean
+        // `EndOfStream` instead of leaving the read genuinely parked.
+        while (p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+};
+
+fn readAllAllocOnce(res: *Response, gpa: std.mem.Allocator) Error![]u8 {
+    return res.readAllAlloc(gpa, 64);
+}
+
+test "readAllAlloc: a canceled body read surfaces Canceled, not ReadFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("readAllAlloc cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: HeadThenSilentPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, HeadThenSilentPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    // Pooling off: a canceled connection must be destroyed, not recycled, and
+    // that path is exercised elsewhere — keeping it out here isolates the one
+    // property under test.
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var res = try client.request(.get, url, .{});
+    defer res.deinit();
+
+    var fut = try io.concurrent(readAllAllocOnce, .{ &res, testing.allocator });
+    // Long enough that the body read is certainly parked in the kernel.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }
 
 // ── tests (timeout enforcement) ─────────────────────────────────────────────

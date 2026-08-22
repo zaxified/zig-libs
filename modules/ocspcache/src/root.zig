@@ -207,6 +207,12 @@ pub const FetchError = error{
     TransportFailed,
     /// The response body exceeded `FetchRequest.max_response_bytes`.
     ResponseTooLarge,
+    /// The fetch was canceled through the `std.Io` cancellation protocol
+    /// (`Future.cancel`) while blocked on the network. Kept apart from
+    /// `TransportFailed` so a caller — e.g. a refresh scheduler shutting
+    /// down — can tell "we gave up waiting" from "the responder is
+    /// unreachable"; the two call for different retry decisions.
+    Canceled,
     OutOfMemory,
 };
 
@@ -236,15 +242,25 @@ pub fn httpTransport(client: *http.Client) Transport {
 fn httpFetch(context: *anyopaque, gpa: std.mem.Allocator, req: FetchRequest) FetchError!FetchResponse {
     const client: *http.Client = @ptrCast(@alignCast(context));
     const method: http.Method = if (req.method == .post) .post else .get;
+    // `http.Client.Error` is deliberately wide (dial, TLS, protocol, redirect
+    // failures...) and this boundary deliberately narrows all of it to one
+    // `TransportFailed` — that collapse is the point of this seam. The one
+    // variant that must survive by name is `Canceled`: folding it into
+    // `TransportFailed` would tell a caller its scheduler shutdown looked
+    // like a dead responder.
     var response = client.request(method, req.url, .{
         .headers = if (req.method == .post) &post_content_type_header else &.{},
         .body = if (req.method == .post) req.body else null,
-    }) catch return error.TransportFailed;
+    }) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return error.TransportFailed,
+    };
     defer response.deinit();
 
     const body = response.readAllAlloc(gpa, req.max_response_bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.BodyTooLarge => return error.ResponseTooLarge,
+        error.Canceled => return error.Canceled,
         else => return error.TransportFailed,
     };
     return .{ .status = response.status, .body = body };
@@ -329,6 +345,9 @@ pub const RefreshError = error{
     Malformed,
     /// The responder was unreachable, or the transport failed otherwise.
     TransportFailed,
+    /// The fetch was canceled through the `std.Io` cancellation protocol
+    /// while waiting on the responder — see `FetchError.Canceled`.
+    Canceled,
     /// The fetched response exceeded `Config.max_response_bytes`.
     ResponseTooLarge,
     /// The responder returned an HTTP status other than 200.
@@ -492,6 +511,7 @@ pub const Cache = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.ResponseTooLarge => return error.ResponseTooLarge,
             error.TransportFailed => return error.TransportFailed,
+            error.Canceled => return error.Canceled,
         };
         defer self.gpa.free(resp.body);
 
@@ -664,6 +684,109 @@ test "buildGetUrl: percent-encodes reserved base64 characters" {
     try testing.expect(std.mem.indexOf(u8, b64_segment, "%2B") != null or
         std.mem.indexOf(u8, b64_segment, "%2F") != null or
         std.mem.indexOf(u8, b64_segment, "%3D") != null);
+}
+
+// ── tests (cancellation) ─────────────────────────────────────────────────────
+//
+// `httpFetch` — the production `Transport` behind `httpTransport` — used to
+// fold `error.Canceled` from the underlying `http.Client` into
+// `error.TransportFailed` at both of its `catch` sites: the initial
+// `client.request` call, and the `readAllAlloc` body read one call later
+// (the latter only recoverable once `http`'s own root cause was fixed — see
+// `Client.zig:552`/its `CHANGELOG.md`). Both peers below hold a real accepted
+// loopback connection open with nothing sent past whatever they are told to
+// send, so the client call really is parked in the kernel when the test
+// cancels it.
+
+const CancelTestPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    stop: std.atomic.Value(u32) = .init(0),
+    /// false: the peer answers nothing at all, so `client.request`'s
+    /// connect/head wait is what blocks. true: the peer answers a head
+    /// declaring a 5-byte body and then sends none of it, so the head read
+    /// completes and the *body* read (`readAllAlloc`) is what blocks.
+    send_head: bool,
+
+    fn run(p: *CancelTestPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        if (p.send_head) {
+            var wbuf: [256]u8 = undefined;
+            var sw = s.writer(p.io, &wbuf);
+            sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") catch {};
+            sw.interface.flush() catch {};
+        }
+        while (p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+};
+
+fn fetchOnce(transport: Transport, gpa: std.mem.Allocator, req: FetchRequest) FetchError!FetchResponse {
+    return transport.fetch(gpa, req);
+}
+
+test "httpFetch: a canceled connect/head wait surfaces error.Canceled, not error.TransportFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("ocspcache cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: CancelTestPeer = .{ .io = io, .listener = &listener, .send_head = false };
+    const peer_thread = try std.Thread.spawn(.{}, CancelTestPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    const transport = httpTransport(&client);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var fut = try io.concurrent(fetchOnce, .{ transport, testing.allocator, FetchRequest{ .url = url, .max_response_bytes = 1024 } });
+    // Long enough that the connect/head wait is certainly parked.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+test "httpFetch: a canceled body wait surfaces error.Canceled, not error.TransportFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("ocspcache cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: CancelTestPeer = .{ .io = io, .listener = &listener, .send_head = true };
+    const peer_thread = try std.Thread.spawn(.{}, CancelTestPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    const transport = httpTransport(&client);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var fut = try io.concurrent(fetchOnce, .{ transport, testing.allocator, FetchRequest{ .url = url, .max_response_bytes = 1024 } });
+    // Long enough that the head has definitely arrived and the body read is
+    // the one parked in the kernel.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
