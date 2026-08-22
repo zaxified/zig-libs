@@ -39,6 +39,29 @@ len_1 = 64, len_2 = 3, len = 67):
 hypertree signing); the SHA-512 and SHAKE suites (§5 OPTIONAL; RFC only
 REQUIRES the SHA2-256 sets).
 
+**CNSA 2.0 posture — the scope above happens to be exactly the approved
+one.** NSA's CNSA 2.0 FAQ (v2.1) approves the two NIST SP 800-208 stateful
+hash-based schemes for national-security systems, LMS **and** XMSS, and
+excludes their multi-tree variants: *"the multitree algorithms HSS and
+XMSSMT are not allowed."* This module implements single-tree XMSS and
+deliberately does not implement XMSS^MT, so the algorithm it offers is on
+the approved list and the one it omits is on the excluded list. Any SP
+800-208 parameter set is permitted, so the SHA-256 restriction above is a
+scope choice, not a compliance one. SLH-DSA (FIPS 205) is *not* part of
+CNSA 2.0 — so for a CNSA-governed firmware-signing chain this module, not
+this collection's `slhdsa`, is the relevant one.
+
+**What compliance a software library cannot supply.** The same FAQ requires
+signature *generation* and state management to happen in validated hardware
+(*"signing and state management in hardware, such as an HSM"*, with backup
+flows that prevent state re-use, and no waivers). Signature *verification*
+needs only CAVP validation. A pure-software implementation can therefore
+serve the verifier — the side a firmware image is checked on — but a
+CNSA-governed signer must hold the key and its index in an HSM, whatever
+this code does. The stateful-key hazards this module documents below are
+the same ones that requirement exists to remove; treat `sign` here as
+correct-but-not-compliant unless the state lives in hardware.
+
 **Auth-path traversal — BDS, implemented (not the naive recompute).** RFC
 8391 explicitly leaves auth-path computation implementation-defined
 ([BDS09] is cited but not mandated). This module ports the

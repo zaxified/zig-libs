@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — SPEC.md records the CNSA 2.0 posture: NSA approves LMS and
+  XMSS but excludes HSS and XMSS^MT, so this module's single-tree scope is the
+  approved one and its omission is the excluded one. Also records what a
+  software implementation cannot supply — CNSA requires signature *generation*
+  and state management in validated hardware; only verification is servable
+  from software.
 - **2026-07-18** — Security audit: two findings fixed, one documented as accepted (not
   defects) — part of the collection-wide audit. Modeled on `XMSS/xmss-reference` (C,
   Huelsing et al.) (design reference, not a test anchor).
