@@ -173,3 +173,35 @@ pub const root_ratchets = [_]RootRatchet{
         .cks = "D7B68481554F80558E13F8D64932053E7940025DD5AB319D75A5613CD1014B86",
     },
 };
+
+// ── PQXDH key-derivation chain (Part 3) ────────────────────────────────────
+
+/// PQXDH's `SK = KDF(F || DH1 || DH2 || DH3 [|| DH4] || SS)`, computed by an
+/// INDEPENDENT implementation: `scripts/pqxdh-kdf-check.py`, written from
+/// Python's `hmac`/`hashlib` alone, sharing no code with `pqxdh.zig`.
+///
+/// Unlike the Double Ratchet vectors above, these are NOT from libsignal, and
+/// the difference matters enough to state plainly: **Signal publishes no
+/// byte-exact PQXDH vectors** — checked 2026-08-22, neither the spec page nor
+/// libsignal's source carries known-answer data for the composed agreement. So
+/// this is a weaker class of anchor than the ratchet's: it is a second
+/// implementation of the same arithmetic rather than the protocol's authors'
+/// own output. It catches the mistake this composition is actually prone to —
+/// a term in the wrong order, a missing `F` prefix, the wrong salt length,
+/// `info` fed to extract instead of expand — and it does not catch a shared
+/// misreading of the spec. `pqxdh.zig`'s module doc comment says the same
+/// thing to anyone reading from that side.
+///
+/// The inputs are deliberately fake and each a distinct constant byte, so
+/// swapping any two terms changes the answer. Regenerate with
+/// `scripts/pqxdh-kdf-check.py`.
+pub const pqxdh_kdf = struct {
+    /// `SK` for DH1=0x01.., DH2=0x02.., DH3=0x03.., DH4=0x04.., SS=0x05..
+    pub const with_one_time_prekey = "74683c230441224d300be36d3bf9c107172118d271470fd8d71732d1a53d9acd";
+    /// The same without `DH4` — Bob published no one-time curve prekey.
+    pub const without_one_time_prekey = "479da32b61e31b3fd5cee24c45aff7947f5e100668a8f470bdc876190b15aa0d";
+    /// `SS` and `DH3` swapped. A value the implementation must NEVER produce:
+    /// it is what putting the KEM secret in the wrong position looks like, and
+    /// both sides of a round trip would agree on it just as happily.
+    pub const ss_and_dh3_swapped = "a9207c8b993b7c020cd474825e77153c75537d8dd56abda18b1b6decda38325e";
+};

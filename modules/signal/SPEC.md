@@ -261,9 +261,44 @@ exact bytes and that nonce isn't published).
   message before its chain exists), `KeyAgreementFailed` (pathological
   low-order ratchet key), plus `Allocator.Error`.
 - **Out of scope**: header encryption (spec §4 — headers here are
-  cleartext, so the ratchet public key + counters are observable), PQXDH
-  seeding, and a stability-committed session-persistence byte format
-  (`State` is an in-memory value only).
+  cleartext, so the ratchet public key + counters are observable) and a
+  stability-committed session-persistence byte format (`State` is an
+  in-memory value only). PQXDH seeding was in this list until 2026-08-22;
+  it is now Part 3 (`pqxdh.zig`), and the ratchet is seeded from
+  `pqxdh.Agreement.ratchetAssociatedData()` rather than the full AD — see
+  below.
+
+## PQXDH (Part 3, `pqxdh.zig`)
+
+- **Algorithm, and a discrepancy that matters.** The published spec names
+  round-3 Crystals-Kyber-1024 and cites the *initial public draft* of FIPS
+  203. Deployments use FIPS 203 **final** ML-KEM-1024; the two are not
+  wire-compatible (different FO transform, domain separation, matrix index),
+  and libsignal keeps `Kyber1024` and `MLKEM1024` as separate key types —
+  itself the evidence that they do not interoperate. This module implements
+  ML-KEM-1024 and does not claim to be the spec's literal KEM.
+- **Every KEM prekey is signed**, one-time and last-resort alike, while curve
+  one-time prekeys are not. Not an inconsistency in the spec: a curve
+  prekey's contribution is authenticated by the DH against Bob's identity
+  key, and a KEM prekey's is not, so the XEdDSA signature is the only thing
+  binding it to Bob. `initiate` verifies both and reports which failed.
+- **Associated data is 1632 bytes**: `Encode(IKA) || Encode(IKB) ||
+  Encode(PQPKB)`. The third term is required because an ML-KEM ciphertext
+  does not commit to the public key it was produced under — omit it and an
+  attacker who can substitute Bob's published KEM prekey does so without the
+  authenticated data changing. It binds where the key is used (the initial
+  message); the ratchet keeps X3DH's 64 bytes, because 1568 extra bytes per
+  message would protect a key that no longer participates.
+- **Implicit rejection is not an error path.** Decapsulating a ciphertext
+  under the wrong ML-KEM secret key SUCCEEDS and returns a shared secret;
+  that is FIPS 203's design. So a substituted KEM prekey shows up as a
+  mismatched `SK` and a failing first AEAD, never as a `decaps` error. The
+  absence of an error here is deliberate and tested, so it does not read as a
+  missing check.
+- **Not claimed**: byte-compatibility with Signal's own servers. Like
+  `x3dh.zig`, this file uses its own `info` string — the spec leaves `info`
+  application-specific — so a session opened here will not interoperate with
+  libsignal even though the construction matches.
 
 ## Verification
 
@@ -321,6 +356,18 @@ provided.
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** X3DH agreement+codec only self round-trip; XEdDSA has libsignal KAT (kat_test.zig)
+**What the tests actually contain.** X3DH agreement+codec only self round-trip; XEdDSA has libsignal KAT (kat_test.zig); the Double Ratchet KDFs have libsignal vectors (interop_vectors.zig); PQXDH's KDF chain is checked against an INDEPENDENT second implementation (`scripts/pqxdh-kdf-check.py`), not against the protocol's authors
 
 **How it got there.** No external oracle exists for what remains. Signal publishes no official X3DH KAT; own Python oracle would be REDERIVED
+
+**PQXDH specifically (2026-08-22).** Signal publishes no byte-exact PQXDH
+vectors either — checked against both the spec page and libsignal's source.
+The composition is therefore anchored one class weaker than the ratchet: a
+second implementation of the same arithmetic, written from Python's
+`hmac`/`hashlib` with no shared code. That catches a term in the wrong order,
+a missing `F` prefix, the wrong salt length, or `info` fed to extract instead
+of expand. It does NOT catch a shared misreading of the spec, and saying so is
+the point of writing it down. The round trip is explicitly not treated as
+evidence for the KDF chain: Alice and Bob agree on a misplaced KEM secret just
+as happily as on a correct one, so the swapped-order value is pinned as an
+answer the code must never produce.

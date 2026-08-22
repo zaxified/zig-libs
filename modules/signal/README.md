@@ -1,13 +1,21 @@
 # signal
 
 The Signal Protocol's core cryptographic building blocks, on `std.crypto`.
-A two-part arc, now BOTH complete — together a usable Signal-style
+A three-part arc, all complete — together a usable Signal-style
 end-to-end-encrypted session:
 
 - **Part 1: X3DH** — Extended Triple Diffie-Hellman, the asynchronous
   initial key-agreement (signal.org/docs/specifications/x3dh) — plus
   **XEdDSA** (signal.org/docs/specifications/xeddsa), the Montgomery-
   keypair signature scheme X3DH uses to sign a signed prekey.
+- **Part 3: PQXDH** — the post-quantum successor to X3DH
+  (signal.org/docs/specifications/pqxdh): the same Diffie-Hellman
+  agreements plus one **ML-KEM-1024** encapsulation against a signed
+  post-quantum prekey, so recorded traffic survives a future quantum
+  adversary. Signal has run this by default since 2023, which makes X3DH
+  alone the legacy path. **The spec text still names round-3
+  Crystals-Kyber-1024 and cites a FIPS 203 draft; deployments use FIPS 203
+  final ML-KEM, and the two do not interoperate** — this implements ML-KEM.
 - **Part 2: Double Ratchet** — the per-message forward-secret/
   post-compromise-secure ratchet
   (signal.org/docs/specifications/doubleratchet), seeded with X3DH's `SK`
@@ -134,8 +142,58 @@ defer allocator.free(pt);                          // pt == "hello"
   security (each DH ratchet re-randomizes the root key). `decrypt` is
   **transactional** — a tampered message never advances or corrupts the
   session (fail-closed).
-- **Out of scope**: header encryption (HE), PQXDH seeding, and a stable
-  on-disk session-persistence format. See [SPEC.md](SPEC.md).
+- **Out of scope**: header encryption (HE) and a stable on-disk
+  session-persistence format. See [SPEC.md](SPEC.md). (PQXDH seeding was in
+  this list until 2026-08-22 and is now Part 3 — seed the ratchet with
+  `PqAgreement.ratchetAssociatedData()`, not the full 1632-byte AD; see the
+  walkthrough below for why they differ.)
+
+## PQXDH walkthrough (Part 3)
+
+The flow is X3DH's with one addition, and one seam worth knowing about
+before you hit it.
+
+```zig
+// Bob, ahead of time. Every KEM prekey is signed — one-time and
+// last-resort alike, unlike curve one-time prekeys, because a curve prekey
+// is authenticated by the DH against Bob's identity key and a KEM prekey
+// has nothing equivalent.
+const bob_kem = signal.generateKemPreKey(bob_ik, 100, true, z, io);
+
+// Alice, with Bob offline. Verifies BOTH signatures before deriving
+// anything, and distinguishes which one failed: they are different keys on
+// different rotation schedules.
+const opened = try signal.pqInitiate(gpa, alice_ik, bundle, "", io);
+
+// Seed the ratchet — with the 64-byte form, not the full AD.
+var alice = try signal.initAlice(
+    opened.agreement.shared_secret,
+    opened.agreement.ratchetAssociatedData(),
+    bob_spk.key_pair.public_key,
+    io,
+);
+```
+
+**Why two associated-data values.** PQXDH's `AD` is 1632 bytes:
+`Encode(IKA) || Encode(IKB) || Encode(PQPKB)`. The third term is required
+because ML-KEM's ciphertext does not commit to the public key it was
+produced under — without it, an attacker who can swap Bob's published KEM
+prekey does so without the authenticated data changing. That binding
+matters for the initial message, which is where the KEM key is used.
+Carrying 1568 extra bytes into every subsequent ratchet message would
+protect a key that no longer participates, so the ratchet keeps X3DH's
+64-byte `Encode(IKA) || Encode(IKB)`, and `ratchetAssociatedData()` is the
+bridge. Passing the full value does not compile, which is the intent.
+
+**What anchors this.** Less than the rest of this module, and the
+difference is stated rather than smoothed over: Signal publishes no
+byte-exact PQXDH vectors (checked 2026-08-22 — neither the spec page nor
+libsignal). XEdDSA carries libsignal's own vector and ML-KEM-1024 is
+anchored by std's FIPS 203 vectors, but the composition is checked against
+an independent implementation of the same arithmetic
+(`scripts/pqxdh-kdf-check.py`). A round trip cannot catch a misplaced KEM
+secret — Alice and Bob would agree on the wrong answer together — so the
+wrong answer is pinned as a value the code must never produce.
 
 ## Import graph
 

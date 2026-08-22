@@ -275,7 +275,7 @@ const module_list = [_]Module{
     .{ .name = "threshold_ecdsa", .deps = &.{ "paillier", "montint" }, .heavy = true, .example = true },
     .{ .name = "dkg", .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true, .example = true },
     .{ .name = "vdf", .deps = &.{"montint"} },
-    .{ .name = "signal", .deps = &.{ "chachapoly", "ct25519", "entropy" } },
+    .{ .name = "signal", .deps = &.{ "chachapoly", "ct25519", "entropy" }, .example = true },
     .{ .name = "mls", .deps = &.{"hpke"}, .example = true },
     .{ .name = "megolm", .deps = &.{ "aescbc", "entropy" }, .example = true },
     .{ .name = "ebpf", .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },

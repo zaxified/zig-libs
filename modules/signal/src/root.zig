@@ -8,6 +8,17 @@
 //!     (signal.org/docs/specifications/x3dh), plus **XEdDSA**
 //!     (`xeddsa.zig`) — the Montgomery-keypair signature scheme X3DH uses
 //!     to sign a signed prekey (signal.org/docs/specifications/xeddsa).
+//!   - **Part 3: PQXDH** (`pqxdh.zig`) — the post-quantum successor to X3DH
+//!     (signal.org/docs/specifications/pqxdh): the same three-or-four
+//!     Diffie-Hellman agreements plus one **ML-KEM-1024** encapsulation
+//!     against a signed post-quantum prekey, so traffic recorded today
+//!     survives a future quantum adversary. Signal has run PQXDH by default
+//!     since 2023, which makes X3DH alone the legacy path rather than the
+//!     current one. Note the algorithm: the spec text still names round-3
+//!     Crystals-Kyber-1024 and cites a FIPS 203 *draft*, while deployments
+//!     use FIPS 203 final ML-KEM-1024 — the two are not wire-compatible, and
+//!     this file implements ML-KEM. `pqxdh.zig`'s own doc comment has the
+//!     detail, including why there are no published vectors to anchor on.
 //!   - **Part 2: Double Ratchet** (`ratchet.zig`) — the per-message
 //!     forward-secret/post-compromise-secure ratchet
 //!     (signal.org/docs/specifications/doubleratchet) that X3DH's output
@@ -15,7 +26,7 @@
 //!     initial root key `RK`, `AD` is mixed into every message's AEAD
 //!     associated data.
 //!
-//! **Status: Part 1 + Part 2 COMPLETE.** X3DH's DH+HKDF composition, both
+//! **Status: Parts 1-3 COMPLETE.** X3DH's DH+HKDF composition, both
 //! wire codecs (`PreKeyBundle`, `InitialMessage`), and XEdDSA
 //! (`xeddsa.sign`/`xeddsa.verify` — the one genuinely novel piece of
 //! cryptography here, a Montgomery->Edwards point conversion std does not
@@ -51,7 +62,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation over caller-supplied keys/bytes — no owned socket/transport
     .concurrency = .reentrant, // no globals; every type here is a plain caller-owned value
-    .model_after = "Signal X3DH (signal.org/docs/specifications/x3dh) + XEdDSA (signal.org/docs/specifications/xeddsa) + Double Ratchet (signal.org/docs/specifications/doubleratchet); std.crypto.dh.X25519 supplies the DH (agreement + ratchet), std.crypto.ecc.Edwards25519/std.crypto.hash.sha2.Sha512 supply XEdDSA's building blocks, std.crypto.kdf.hkdf.HkdfSha256 supplies the KDFs (X3DH + KDF_RK), std.crypto.auth.hmac.sha2.HmacSha256 supplies KDF_CK, the chachapoly sibling (byte-exact to std.crypto.aead.chacha_poly.ChaCha20Poly1305) supplies the ratchet AEAD",
+    .model_after = "Signal X3DH (signal.org/docs/specifications/x3dh) + PQXDH (signal.org/docs/specifications/pqxdh, over std.crypto.kem.ml_kem.MLKem1024 -- FIPS 203 final, NOT the round-3 Kyber the spec text still names) + XEdDSA (signal.org/docs/specifications/xeddsa) + Double Ratchet (signal.org/docs/specifications/doubleratchet); std.crypto.dh.X25519 supplies the DH (agreement + ratchet), std.crypto.ecc.Edwards25519/std.crypto.hash.sha2.Sha512 supply XEdDSA's building blocks, std.crypto.kdf.hkdf.HkdfSha256 supplies the KDFs (X3DH + KDF_RK), std.crypto.auth.hmac.sha2.HmacSha256 supplies KDF_CK, the chachapoly sibling (byte-exact to std.crypto.aead.chacha_poly.ChaCha20Poly1305) supplies the ratchet AEAD",
     // chachapoly: the ratchet AEAD (byte-exact to std; one audited
     // ChaCha20-Poly1305 across the repo). ct25519: the constant-time
     // secret-scalar ladder XEdDSA signs on. entropy: the seed behind
@@ -62,6 +73,7 @@ pub const meta = .{
 
 pub const xeddsa = @import("xeddsa.zig");
 pub const x3dh = @import("x3dh.zig");
+pub const pqxdh = @import("pqxdh.zig");
 pub const ratchet = @import("ratchet.zig");
 
 // Flat re-exports of the X3DH surface — the module most callers use.
@@ -76,6 +88,19 @@ pub const initiate = x3dh.initiate;
 pub const initiateUnverified = x3dh.initiateUnverified;
 pub const respond = x3dh.respond;
 pub const generateSignedPreKey = x3dh.generateSignedPreKey;
+
+// Flat re-exports of the PQXDH surface (Part 3). Deliberately prefixed rather
+// than shadowing the X3DH names: the two protocols have DIFFERENT bundles,
+// messages and associated data, and a caller who mixed them would get a
+// bundle that silently fails to decode rather than a compile error.
+pub const PqPreKeyBundle = pqxdh.PreKeyBundle;
+pub const PqInitialMessage = pqxdh.InitialMessage;
+pub const PqAgreement = pqxdh.Agreement;
+pub const KemPreKey = pqxdh.KemPreKey;
+pub const pqInitiate = pqxdh.initiate;
+pub const pqInitiateUnverified = pqxdh.initiateUnverified;
+pub const pqRespond = pqxdh.respond;
+pub const generateKemPreKey = pqxdh.generateKemPreKey;
 
 // Flat re-exports of the Double Ratchet surface (Part 2).
 pub const RatchetState = ratchet.State;
@@ -92,6 +117,7 @@ pub const initBob = ratchet.State.initBob;
 test {
     _ = xeddsa;
     _ = x3dh;
+    _ = pqxdh;
     _ = ratchet;
     _ = @import("kat_test.zig");
 }
