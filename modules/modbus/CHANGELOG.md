@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `TransportError` gained a `Canceled` variant so a `std.Io`
+  cancellation (`Future.cancel`) surfaces distinctly from `TransportFailed`
+  and from `Timeout`. `TcpTransport.exchangeFn` recovers it from the concrete
+  reader's/writer's out-of-band `err` field instead of collapsing every
+  failure into `TransportFailed`.
 - **2026-08-11** — Security audit: two findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Verified: Byte-exact
   vs the Modbus Application Protocol V1.1b3 worked wire examples for

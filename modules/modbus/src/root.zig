@@ -192,7 +192,15 @@ pub fn exceptionError(code: u8) ExceptionError {
 }
 
 /// Failures a `Transport` implementation may report.
-pub const TransportError = error{ TransportFailed, Timeout };
+pub const TransportError = error{
+    TransportFailed,
+    Timeout,
+    /// The blocking operation was canceled through the `std.Io` cancellation
+    /// protocol (`Future.cancel`). Surfaced instead of `TransportFailed` so a
+    /// caller can tell a canceled wait from a real transport failure or from
+    /// `Timeout`, which is a distinct, non-cancel outcome.
+    Canceled,
+};
 
 // ── CRC-16 (Modbus) ─────────────────────────────────────────────────────────
 
@@ -675,8 +683,8 @@ pub const TcpTransport = struct {
 
         var wbuf: [tcp.max_adu_len]u8 = undefined;
         var sw = t.stream.writer(t.io, &wbuf);
-        sw.interface.writeAll(request) catch return error.TransportFailed;
-        sw.interface.flush() catch return error.TransportFailed;
+        sw.interface.writeAll(request) catch return writeFailure(&sw);
+        sw.interface.flush() catch return writeFailure(&sw);
 
         // Strict request/reply: read the 7-byte MBAP header, then exactly
         // the bytes its length field announces.
@@ -684,18 +692,84 @@ pub const TcpTransport = struct {
         var sr = t.stream.reader(t.io, &rbuf);
         const r = &sr.interface;
         if (reply_buf.len < tcp.header_len) return error.TransportFailed;
-        r.readSliceAll(reply_buf[0..tcp.header_len]) catch return error.TransportFailed;
+        r.readSliceAll(reply_buf[0..tcp.header_len]) catch |e| switch (e) {
+            error.EndOfStream => return error.TransportFailed,
+            error.ReadFailed => return readFailure(&sr),
+        };
         const len_field: usize = std.mem.readInt(u16, reply_buf[4..6], .big);
         const total = 6 + len_field;
         if (len_field < 1 or total > reply_buf.len) return error.TransportFailed;
-        r.readSliceAll(reply_buf[tcp.header_len..total]) catch return error.TransportFailed;
+        r.readSliceAll(reply_buf[tcp.header_len..total]) catch |e| switch (e) {
+            error.EndOfStream => return error.TransportFailed,
+            error.ReadFailed => return readFailure(&sr),
+        };
         return total;
+    }
+
+    /// Distinguish a canceled wait from a genuine read failure. `Io.Reader`'s
+    /// error set cannot carry `Canceled`; the concrete reader records it here.
+    fn readFailure(sr: *std.Io.net.Stream.Reader) TransportError {
+        if (sr.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.TransportFailed;
+    }
+
+    /// The writer side of `readFailure`.
+    fn writeFailure(sw: *std.Io.net.Stream.Writer) TransportError {
+        if (sw.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.TransportFailed;
     }
 };
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+// ── cancellation ─────────────────────────────────────────────────────────
+//
+// `Future.cancel` does unblock a thread parked in `TcpTransport.exchangeFn`'s
+// read, but the reason is erased on the way out unless the concrete reader's
+// out-of-band `err` field is inspected first — `Io.Reader.Error` itself has
+// no `Canceled` variant. This test runs against a listener that accepts and
+// then never writes, so the read really is parked when the cancel arrives.
+
+fn acceptOne(srv: *std.Io.net.Server, io: std.Io) std.Io.net.Server.AcceptError!std.Io.net.Stream {
+    return srv.accept(io);
+}
+
+/// The blocking call under test, on its own thread so it can be canceled.
+fn exchangeOnce(t: *TcpTransport, request: []const u8, reply_buf: []u8) TransportError![]const u8 {
+    return t.transport().exchange(request, reply_buf);
+}
+
+test "a canceled exchange read surfaces Canceled, not TransportFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 0: an ephemeral port cannot collide with a parallel test run.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer srv.deinit(io);
+
+    var accept_fut = try io.concurrent(acceptOne, .{ &srv, io });
+    var t = TcpTransport.connect(io, srv.socket.address) catch |err| {
+        if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer t.close();
+    var peer = try accept_fut.await(io);
+    defer peer.close(io);
+
+    var reply_buf: [tcp.max_adu_len]u8 = undefined;
+    var fut = try io.concurrent(exchangeOnce, .{ &t, &.{ 0x00, 0x01 }, &reply_buf });
+    // Long enough that the read is certainly parked in the kernel.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
 
 // A scripted transport: records the request ADU, replies from a fixed
 // buffer. Lets every client test run offline from spec wire examples.
