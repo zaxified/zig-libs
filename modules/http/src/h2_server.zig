@@ -369,6 +369,18 @@ pub const Limits = struct {
 /// error occurs. The client preface has NOT been consumed — the whole
 /// stream from byte 0 (preface + frames) is read here. `out` is flushed
 /// after every batch of frames. Never fails: all errors end the connection.
+///
+/// `in`/`out` are the caller's and this function opens no socket, so a
+/// `std.Io` cancelation of a blocking read is *not* recovered here: it
+/// arrives as plain `error.ReadFailed` (`std.Io.Reader.Error` is only
+/// `{ReadFailed, EndOfStream}` and cannot carry `Canceled`) and simply ends
+/// the connection like any other read failure. The real cause survives in
+/// the out-of-band `err` field of the concrete reader the caller supplied
+/// (`std.Io.net.Stream.Reader.err` / `std.Io.File.Reader.err`), and that is
+/// where a caller who must tell a cancelation from a dead peer looks.
+/// Reached through `Server.connMain` (`enable_h2c`) the readers handed in
+/// are that server's own `TimeoutReader`/`TimeoutWriter`, which do the
+/// recovery on the fd they own — nothing extra is needed there.
 /// The `Limits` -> `h2.Connection.Options` wiring, factored out of `serve`
 /// so a test can assert what the SHIPPED defaults actually become on the
 /// protocol core — a limit that never reaches `h2.Connection` bounds
@@ -422,6 +434,9 @@ pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
 ///         }),
 ///         .http11, .unknown => // Server.serveStream — the h1 equivalent
 ///     }
+///
+/// See `serve` on why a canceled read reaches here as `error.ReadFailed`
+/// and where its real cause is recoverable: the transport is yours.
 pub fn serveStream(
     gpa: Allocator,
     in: *Reader,

@@ -5,6 +5,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `Server`'s per-connection reader and writer stop reporting a
+  canceled connection as a stalled peer. Internal change, no API surface moved:
+  `Client` already carried `Canceled` in its `Error` set and already recovered it
+  from `Conn.sr.err`/`Conn.sw.err`, and `BindError`/`ServeError` already carried it
+  for the listener — the connection path was the half that did not. Two distinct
+  blind spots.
+  **(1) The stall timeouts are raw `poll(2)`, which is not a `std.Io` cancelation
+  point at all.** `std.posix.poll` restarts itself on `EINTR`, and a thread parked
+  in a syscall `std.Io` never registered is not signalled in the first place — so a
+  `Group.cancel` over the connection tasks (the shutdown a consumer running `serve`
+  on its own task performs) left every idle keep-alive connection sitting out its
+  full `read_timeout_ms`, and then filing itself as `timed_out`: a slowloris, by the
+  server's own account. `TimeoutReader.streamFn` and `TimeoutWriter.pollOut` now ask
+  `Io.checkCancel` once the wait ends, on the timed-out **and** the poll-failed path.
+  **(2) Past the poll, the reason was flattened.** `Reader.StreamError` /
+  `Writer.Error` cannot carry `error.Canceled`, so std parks the real cause on the
+  concrete `net.Stream.Reader.err` / `.Writer.err`; both wrappers now take the
+  concrete socket reader/writer instead of a bare interface and consult that field
+  in `readFailure`/`writeFailure` before mapping.
+  Because neither vtable's error set can be widened, the recovered verdict is
+  recorded out of band in `canceled`, beside the existing `timed_out` and for the
+  same reason std does it — and deliberately *beside* it, not folded into it: a peer
+  that stopped talking and a connection its own server abandoned are different
+  events. Four tests, one per fixed path (read/write × poll/socket), each confirmed
+  to fail with its own fix reverted and to pass with it restored.
+  `h2_server.serve`/`serveStream` are untouched: they take a caller-supplied
+  `*Reader`/`*Writer` and own no fd, so they have no concrete reader to ask. Served
+  over `Server`'s own socket (`enable_h2c`) they get the fixed wrappers for free;
+  used as the BYO-TLS entry point, recovery belongs to whoever owns the transport.
 - **2026-08-22** — `proxy` sizes its address-formatting buffer as
   `netaddr.max_ip_text_len` rather than a hand-picked 64, following `netaddr.formatIp`'s
   new fixed-size parameter.

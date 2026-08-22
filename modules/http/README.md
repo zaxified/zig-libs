@@ -500,6 +500,17 @@ poll — then none of these fire):
 
 0 (or null for the size limits) disables the individual bound.
 
+A **cancelation is not a stall.** Cancel the connection tasks (`Group.cancel`
+on the group `serve` fills, or cancel the task `serve` itself runs on) and
+each connection leaves its read or write wait immediately, rather than
+sitting out the remaining `read_timeout_ms`/`write_timeout_ms` first — the
+`poll(2)` above is not a `std.Io` cancelation point and had to be made to ask
+explicitly. Handing a caller-owned stream to `serveStream` (the BYO-TLS
+entry) is the exception: there is no fd to consult there, a cancelation
+arrives as `error.ReadFailed`, and recovering the real cause from the
+concrete reader's `err` field belongs to whoever built it. Both entry points
+say so in their doc comments.
+
 ## Response compression (Phase 2.2)
 
 Negotiated **gzip** response compression, `Options.compression: ?Compression`

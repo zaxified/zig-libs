@@ -748,10 +748,13 @@ fn connMain(s: *Server, stream: net.Stream) void {
     // lets the timeout check see leftover bytes); the stream reader itself
     // is unbuffered. Same shape on the write side: the TimeoutWriter owns
     // the buffer so every socket write passes its writability poll.
+    // The wrappers take the concrete socket reader/writer, not just their
+    // interfaces: `err` — the only place a cancelation survives — lives on
+    // the concrete type.
     var sr = stream.reader(s.io, read_buf[0..0]);
-    var tr: TimeoutReader = .init(&sr.interface, stream.socket.handle, o.read_timeout_ms, o.request_timeout_ms, read_buf);
+    var tr: TimeoutReader = .init(&sr, s.io, o.read_timeout_ms, o.request_timeout_ms, read_buf);
     var sw = stream.writer(s.io, write_buf[0..0]);
-    var tw: TimeoutWriter = .init(&sw.interface, stream.socket.handle, o.write_timeout_ms, write_buf);
+    var tw: TimeoutWriter = .init(&sw, s.io, o.write_timeout_ms, write_buf);
 
     // h2c (opt-in): a connection that opens with the HTTP/2 client preface
     // is served as HTTP/2 with the same handler; anything else falls
@@ -846,9 +849,29 @@ fn monotonicNowNs() u64 {
 /// re-checked on every refill, a dribbling client (one byte per poll
 /// window) is bounded too — the stall timeout alone cannot do that.
 ///
+/// Cancelation is recorded out of band, in `canceled`, for the same reason
+/// std records it out of band on the socket reader: `Reader.StreamError`
+/// cannot carry `error.Canceled`, so a vtable implementation has nowhere to
+/// *return* it however well it knows. Two separate blind spots feed that
+/// field. The `poll` below is not a `std.Io` cancelation point at all — it
+/// restarts itself on `EINTR`, and a thread parked in a syscall `std.Io`
+/// never registered is not signalled in the first place, so the wait runs
+/// its full timeout and the abandoned connection reports itself as a
+/// stalled peer; `checkCanceled` after the wait is what closes that. And
+/// once the read does reach the socket, the reason it failed survives only
+/// on `src.err`, which `readFailure` consults before flattening.
+///
+/// `timed_out` and `canceled` stay separate deliberately: a peer that
+/// stopped talking and a connection its own server gave up on are different
+/// events, and folding either into the other is how a shutdown comes to
+/// look like a slowloris.
+///
 /// Not movable after `reader` has been handed out.
 const TimeoutReader = struct {
-    in: *Reader,
+    io: std.Io,
+    /// The socket reader itself, not just its interface — the concrete type
+    /// is what carries `err`, and that is where a cancelation lives.
+    src: *net.Stream.Reader,
     handle: net.Socket.Handle,
     timeout_ms: u32,
     request_timeout_ms: u32,
@@ -856,11 +879,13 @@ const TimeoutReader = struct {
     deadline_ns: u64 = 0,
     reader: Reader,
     timed_out: bool = false,
+    canceled: bool = false,
 
-    fn init(in: *Reader, handle: net.Socket.Handle, timeout_ms: u32, request_timeout_ms: u32, buffer: []u8) TimeoutReader {
+    fn init(src: *net.Stream.Reader, io: std.Io, timeout_ms: u32, request_timeout_ms: u32, buffer: []u8) TimeoutReader {
         return .{
-            .in = in,
-            .handle = handle,
+            .io = io,
+            .src = src,
+            .handle = src.stream.socket.handle,
             .timeout_ms = timeout_ms,
             .request_timeout_ms = request_timeout_ms,
             .reader = .{
@@ -879,9 +904,33 @@ const TimeoutReader = struct {
         t.deadline_ns = monotonicNowNs() + @as(u64, t.request_timeout_ms) * std.time.ns_per_ms;
     }
 
+    /// `Io.checkCancel` *acknowledges* the request — it reports a pending
+    /// cancelation exactly once and returns void ever after — so the answer
+    /// is banked here and never asked for a second time. True means "this
+    /// wait ended because the connection was canceled".
+    fn checkCanceled(t: *TimeoutReader) bool {
+        t.io.checkCancel() catch {
+            t.canceled = true;
+            return true;
+        };
+        return false;
+    }
+
+    /// A read that reached the socket and failed: recover the real cause
+    /// from the concrete reader before it is flattened into an anonymous
+    /// `ReadFailed`. Only one distinction is load-bearing here — a canceled
+    /// wait must not be filed as a dead or stalled peer.
+    fn readFailure(t: *TimeoutReader) Reader.Error {
+        if (t.src.err) |err| {
+            if (err == error.Canceled) t.canceled = true;
+        }
+        return error.ReadFailed;
+    }
+
     fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const t: *TimeoutReader = @alignCast(@fieldParentPtr("reader", r));
-        if (have_poll_timeouts and t.in.bufferedLen() == 0 and
+        const in = &t.src.interface;
+        if (have_poll_timeouts and in.bufferedLen() == 0 and
             (t.timeout_ms != 0 or t.deadline_ns != 0))
         {
             var wait_ms: u64 = if (t.timeout_ms != 0) t.timeout_ms else std.math.maxInt(i32);
@@ -900,13 +949,24 @@ const TimeoutReader = struct {
                 .revents = 0,
             }};
             const timeout: i32 = std.math.cast(i32, wait_ms) orelse std.math.maxInt(i32);
-            const ready = std.posix.poll(&fds, timeout) catch return error.ReadFailed;
+            // Both ways out of the wait have to ask, and neither can be
+            // skipped: a `poll` that failed outright swallowed the
+            // cancelation's signal exactly as one that ran to term did.
+            const ready = std.posix.poll(&fds, timeout) catch {
+                _ = t.checkCanceled();
+                return error.ReadFailed;
+            };
             if (ready == 0) {
+                if (t.checkCanceled()) return error.ReadFailed;
                 t.timed_out = true;
                 return error.ReadFailed;
             }
         }
-        return t.in.stream(w, limit);
+        return in.stream(w, limit) catch |err| switch (err) {
+            error.EndOfStream => error.EndOfStream,
+            error.WriteFailed => error.WriteFailed,
+            error.ReadFailed => t.readFailure(),
+        };
     }
 };
 
@@ -917,24 +977,52 @@ const TimeoutReader = struct {
 /// connection task. Caveat (mirror of the read side): a peer that drains a
 /// trickle restarts the window per write — only full stalls are bounded.
 ///
+/// `canceled` is the writer half of `TimeoutReader.canceled`, there for the
+/// same two reasons: `Writer.Error` is exactly `{WriteFailed}` and cannot
+/// carry a cancelation, and the writability `poll` below is no more a
+/// `std.Io` cancelation point than the readability one is.
+///
 /// Not movable after `writer` has been handed out.
 const TimeoutWriter = struct {
-    out: *Writer,
+    io: std.Io,
+    /// The socket writer itself — `err` is the writer-side equivalent of
+    /// `net.Stream.Reader.err`.
+    dst: *net.Stream.Writer,
     handle: net.Socket.Handle,
     timeout_ms: u32,
     writer: Writer,
     timed_out: bool = false,
+    canceled: bool = false,
 
-    fn init(out: *Writer, handle: net.Socket.Handle, timeout_ms: u32, buffer: []u8) TimeoutWriter {
+    fn init(dst: *net.Stream.Writer, io: std.Io, timeout_ms: u32, buffer: []u8) TimeoutWriter {
         return .{
-            .out = out,
-            .handle = handle,
+            .io = io,
+            .dst = dst,
+            .handle = dst.stream.socket.handle,
             .timeout_ms = timeout_ms,
             .writer = .{
                 .vtable = &.{ .drain = drainFn },
                 .buffer = buffer,
             },
         };
+    }
+
+    /// See `TimeoutReader.checkCanceled` — the acknowledgement is one-shot,
+    /// so it is banked, not re-asked.
+    fn checkCanceled(t: *TimeoutWriter) bool {
+        t.io.checkCancel() catch {
+            t.canceled = true;
+            return true;
+        };
+        return false;
+    }
+
+    /// The writer side of `TimeoutReader.readFailure`.
+    fn writeFailure(t: *TimeoutWriter) Writer.Error {
+        if (t.dst.err) |err| {
+            if (err == error.Canceled) t.canceled = true;
+        }
+        return error.WriteFailed;
     }
 
     fn pollOut(t: *TimeoutWriter) Writer.Error!void {
@@ -945,8 +1033,12 @@ const TimeoutWriter = struct {
             .revents = 0,
         }};
         const timeout: i32 = std.math.cast(i32, t.timeout_ms) orelse std.math.maxInt(i32);
-        const ready = std.posix.poll(&fds, timeout) catch return error.WriteFailed;
+        const ready = std.posix.poll(&fds, timeout) catch {
+            _ = t.checkCanceled();
+            return error.WriteFailed;
+        };
         if (ready == 0) {
+            if (t.checkCanceled()) return error.WriteFailed;
             t.timed_out = true;
             return error.WriteFailed;
         }
@@ -958,7 +1050,12 @@ const TimeoutWriter = struct {
         var rem = bytes;
         while (rem.len != 0) {
             try t.pollOut();
-            const n = try t.out.write(rem);
+            // Spelled out rather than caught bare: if `Writer.Error` ever
+            // grows a second tag, this becomes a compile error instead of a
+            // silent mis-map.
+            const n = t.dst.interface.write(rem) catch |err| switch (err) {
+                error.WriteFailed => return t.writeFailure(),
+            };
             rem = rem[n..];
         }
     }
@@ -1066,6 +1163,17 @@ pub const StreamBuffers = struct {
 /// nothing — `http.protocolFromAlpn` returns `.unknown`), hand the TLS
 /// connection's plaintext reader/writer here (`h2_server.serveStream` is
 /// the "h2" counterpart).
+///
+/// Cancelation is the caller's to recover here, unlike on the socket path.
+/// A `std.Io` cancelation of a blocking read on `in` arrives as plain
+/// `error.ReadFailed` — `std.Io.Reader.Error` is only
+/// `{ReadFailed, EndOfStream}` and has nowhere to put `Canceled` — and this
+/// function owns no fd, so it has no concrete reader to ask. The real cause
+/// survives in the out-of-band `err` field of the reader/writer the caller
+/// built (`std.Io.net.Stream.Reader.err`, `std.Io.File.Reader.err`); a
+/// caller that must tell a canceled connection from a dead peer inspects
+/// that field. `connMain`'s own wrappers do exactly this on the socket it
+/// owns — see `TimeoutReader`.
 pub fn serveStream(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers) void {
     serveLoop(opts, in, out, bufs, null);
 }
@@ -4775,4 +4883,179 @@ test "integration: negotiated gzip compression over loopback" {
         defer testing.allocator.free(body);
         try testing.expectEqualStrings("hello", body);
     }
+}
+
+// ── tests (cancelation) ─────────────────────────────────────────────────────
+//
+// `Future.cancel` does release a thread parked in a socket read, but nothing
+// in `std.Io.Reader`/`Writer`'s error sets can carry the reason out — so the
+// four tests below assert on `TimeoutReader`/`TimeoutWriter`'s out-of-band
+// `canceled`, which is where std's own `Stream.Reader.err` idiom is
+// continued. Each covers one blind spot, and each was proven by reverting
+// its fix and watching it go red:
+//
+//   * parked in the stall-timeout `poll` — the raw `poll` is not a `std.Io`
+//     cancelation point at all, and without `checkCanceled` the abandoned
+//     connection files itself as `timed_out`, a stalled peer;
+//   * parked in the socket read itself — the cancelation is on `src.err`
+//     and is otherwise flattened into an anonymous `ReadFailed`;
+//   * and the two writer-side mirrors of both.
+//
+// The peer accepts and then neither reads nor writes, so the operation under
+// test really is parked when the cancelation arrives.
+
+fn acceptOne(server: *net.Server, io: std.Io) net.Server.AcceptError!net.Stream {
+    return server.accept(io);
+}
+
+/// A loopback listener on an ephemeral port — a fixed one collides as soon
+/// as several modules' tests run at the same time.
+fn cancelListener(io: std.Io) !net.Server {
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    return addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+}
+
+/// A connected pair whose accepted end never reads and never writes: `conn`
+/// is the side the wrapper under test owns.
+const SilentPeer = struct {
+    conn: net.Stream,
+    peer: net.Stream,
+
+    /// `error.SkipZigTest` when loopback is unusable, which is how the rest
+    /// of this file's socket tests behave on a sandboxed runner.
+    fn open(io: std.Io, server: *net.Server) !SilentPeer {
+        var accept_fut = try io.concurrent(acceptOne, .{ server, io });
+        const conn = server.socket.address.connect(io, .{ .mode = .stream }) catch |err| {
+            if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
+            std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        return .{ .conn = conn, .peer = try accept_fut.await(io) };
+    }
+
+    fn close(self: *SilentPeer, io: std.Io) void {
+        self.peer.close(io);
+        self.conn.close(io);
+    }
+
+    /// Shrink both halves of the pipe, best effort. A write only parks once
+    /// our send buffer AND the peer's receive buffer are full; at loopback
+    /// defaults that is megabytes of pointless memcpy before the writer
+    /// tests reach the state they are about.
+    fn shrink(self: *SilentPeer) void {
+        const small = std.mem.toBytes(@as(c_int, 2048));
+        std.posix.setsockopt(self.conn.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &small) catch {};
+        std.posix.setsockopt(self.peer.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+    }
+};
+
+/// The blocking read under test, on its own task so it can be canceled.
+fn cancelReadOnce(t: *TimeoutReader) Reader.Error!u8 {
+    return t.reader.takeByte();
+}
+
+/// Push until the write parks. Bounded, so a kernel that somehow never
+/// blocks cannot spin the suite instead of failing it.
+fn cancelWriteUntilBlocked(t: *TimeoutWriter) Writer.Error!void {
+    const chunk: [4096]u8 = @splat('x');
+    var left: usize = 8 << 20;
+    while (left != 0) : (left -= chunk.len) try t.writer.writeAll(&chunk);
+}
+
+test "cancel: a cancelation during the read stall poll is not filed as a stalled peer" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try cancelListener(io);
+    defer server.deinit(io);
+    var pair = try SilentPeer.open(io, &server);
+    defer pair.close(io);
+
+    var buf: [64]u8 = undefined;
+    var sr = pair.conn.reader(io, buf[0..0]);
+    // 600 ms: `poll` restarts on the cancelation's signal, so the task can
+    // only return once the stall timeout genuinely elapses — long enough to
+    // be unambiguous, short enough not to weigh on the module's suite.
+    var tr: TimeoutReader = .init(&sr, io, 600, 0, &buf);
+
+    var fut = try io.concurrent(cancelReadOnce, .{&tr});
+    try io.sleep(.fromMilliseconds(100), .awake);
+    // `Reader.Error` cannot say more than this — which is the whole problem.
+    try testing.expectError(error.ReadFailed, fut.cancel(io));
+    try testing.expect(tr.canceled);
+    try testing.expect(!tr.timed_out);
+}
+
+test "cancel: a canceled socket read is recovered from the reader's err field" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try cancelListener(io);
+    defer server.deinit(io);
+    var pair = try SilentPeer.open(io, &server);
+    defer pair.close(io);
+
+    var buf: [64]u8 = undefined;
+    var sr = pair.conn.reader(io, buf[0..0]);
+    // No stall timeout and no request deadline: the read skips `poll`
+    // entirely and parks inside `std.Io`, where the cancelation lands on
+    // `sr.err` instead.
+    var tr: TimeoutReader = .init(&sr, io, 0, 0, &buf);
+
+    var fut = try io.concurrent(cancelReadOnce, .{&tr});
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.ReadFailed, fut.cancel(io));
+    try testing.expect(tr.canceled);
+    try testing.expect(!tr.timed_out);
+}
+
+test "cancel: a cancelation during the write stall poll is not filed as a stalled peer" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try cancelListener(io);
+    defer server.deinit(io);
+    var pair = try SilentPeer.open(io, &server);
+    defer pair.close(io);
+    pair.shrink();
+
+    var buf: [1024]u8 = undefined;
+    var sw = pair.conn.writer(io, buf[0..0]);
+    var tw: TimeoutWriter = .init(&sw, io, 600, &buf);
+
+    var fut = try io.concurrent(cancelWriteUntilBlocked, .{&tw});
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try testing.expectError(error.WriteFailed, fut.cancel(io));
+    try testing.expect(tw.canceled);
+    try testing.expect(!tw.timed_out);
+}
+
+test "cancel: a canceled socket write is recovered from the writer's err field" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try cancelListener(io);
+    defer server.deinit(io);
+    var pair = try SilentPeer.open(io, &server);
+    defer pair.close(io);
+    pair.shrink();
+
+    var buf: [1024]u8 = undefined;
+    var sw = pair.conn.writer(io, buf[0..0]);
+    // No write stall timeout: `pollOut` is skipped and the write parks in
+    // `std.Io`, where the cancelation lands on `sw.err`.
+    var tw: TimeoutWriter = .init(&sw, io, 0, &buf);
+
+    var fut = try io.concurrent(cancelWriteUntilBlocked, .{&tw});
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.WriteFailed, fut.cancel(io));
+    try testing.expect(tw.canceled);
+    try testing.expect(!tw.timed_out);
 }
