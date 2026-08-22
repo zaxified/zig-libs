@@ -205,6 +205,14 @@ pub const Connection = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
 
+    /// A `std.Io` cancellation of a blocking read reaches this connection as
+    /// plain `error.ReadFailed` — `std.Io.Reader.Error` is only
+    /// `{ReadFailed, EndOfStream}` and has nowhere to put `Canceled`. The real
+    /// cause survives in the concrete reader's out-of-band `err` field
+    /// (`std.Io.net.Stream.Reader.err` / `std.Io.File.Reader.err`, both
+    /// `?Error` with `Error` including `Io.Cancelable`); a caller that needs
+    /// to tell a cancel from a dead connection inspects that field on the
+    /// reader it supplied, not anything returned from here.
     pub fn init(reader: *std.Io.Reader, writer: *std.Io.Writer) Connection {
         return .{ .reader = reader, .writer = writer };
     }
@@ -293,6 +301,7 @@ pub const Connection = struct {
 /// Hello/Acknowledge handshake (§7.1.2/§7.1.3) for `endpoint_url` in one call.
 /// Equivalent to `Connection.init` followed by `.hello(...)` for callers that
 /// don't need to customize the `Hello` request's buffer-size/limit fields.
+/// See `Connection.init` on canceled reads surfacing as `error.ReadFailed`.
 pub fn connect(reader: *std.Io.Reader, writer: *std.Io.Writer, endpoint_url: []const u8) TransportError!Connection {
     var conn = Connection.init(reader, writer);
     _ = try conn.hello(.{

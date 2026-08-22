@@ -1480,6 +1480,13 @@ pub const Transport = struct {
     /// exchange hash `H`; up to 64 bytes for a SHA-512 first KEX).
     session_id: ?SessionId = null,
 
+    /// A `std.Io` cancellation of a blocking read on `reader` reaches this
+    /// transport as plain `error.ReadFailed` — `std.Io.Reader.Error` is only
+    /// `{ReadFailed, EndOfStream}` and cannot carry `Canceled`. The real cause
+    /// survives only in the concrete reader's out-of-band `err` field
+    /// (`std.Io.net.Stream.Reader.err` / `std.Io.File.Reader.err`); a caller
+    /// that needs to tell a cancel from a dead connection inspects the reader
+    /// it built and passed in here, not anything `TransportError` returns.
     pub fn init(reader: *std.Io.Reader, writer: *std.Io.Writer) Transport {
         return .{ .reader = reader, .writer = writer };
     }
