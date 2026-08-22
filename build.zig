@@ -1203,8 +1203,74 @@ fn checkExampleDecls(step: *std.Build.Step, options: std.Build.Step.MakeOptions)
             std.debug.print("check-example-decls: {s} declares `.example = true` but {s} is missing\n", .{ m.name, path });
             failed = true;
         }
+        // A module OVER either §7.2 trigger and carrying no example is the
+        // failure this step exists for. Without it the rule is prose: the
+        // scope was picked once, by hand, and the next module to cross the
+        // threshold would cross it silently -- which is exactly how the ten
+        // largest modules here went years without an outside caller.
+        if (!m.example) {
+            const t = try exampleTriggers(b, io, m.name);
+            if (t.pub_fns >= example_pub_fn_threshold) {
+                std.debug.print("check-example-decls: {s} has {d} `pub fn` (threshold {d}) and no example -- see CONVENTIONS.md 7.2\n", .{ m.name, t.pub_fns, example_pub_fn_threshold });
+                failed = true;
+            } else if (t.has_init and t.self_methods >= example_self_method_threshold) {
+                std.debug.print("check-example-decls: {s} has `init` plus {d} `self` methods (threshold {d}) and no example -- see CONVENTIONS.md 7.2\n", .{ m.name, t.self_methods, example_self_method_threshold });
+                failed = true;
+            }
+        }
     }
     if (failed) return error.ExampleDeclarationMismatch;
+}
+
+/// CONVENTIONS.md §7.2. Both numbers are thresholds on a MEASURED shape, not
+/// taste: every defect the example gate has found so far sat in a module over
+/// the first one, and the second exists because a small module whose calls
+/// must happen in an order is misassembled by an outsider just as easily as a
+/// large one.
+const example_pub_fn_threshold = 25;
+const example_self_method_threshold = 3;
+
+/// Count the two shapes §7.2 keys on, over a module's own sources.
+///
+/// Deliberately textual, and deliberately line-anchored: `pub fn` has to start
+/// the line (after indentation) so a doc comment quoting one does not count.
+/// A signature that puts its first parameter on the next line is undercounted
+/// as a `self` method -- the effect is that the gate asks for FEWER examples
+/// than the rule does, never more, so a module can slip past this check but
+/// never be failed by it wrongly. The alternative, parsing Zig here, would put
+/// a second implementation of the language in the build script.
+fn exampleTriggers(b: *std.Build, io: std.Io, name: []const u8) !struct {
+    pub_fns: usize,
+    self_methods: usize,
+    has_init: bool,
+} {
+    var pub_fns: usize = 0;
+    var self_methods: usize = 0;
+    var has_init = false;
+
+    var dir = b.build_root.handle.openDir(io, b.fmt("modules/{s}/src", .{name}), .{ .iterate = true }) catch
+        return .{ .pub_fns = 0, .self_methods = 0, .has_init = false };
+    defer dir.close(io);
+
+    var walker = try dir.walk(b.allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const src = try dir.readFileAlloc(io, entry.path, b.allocator, .limited(8 * 1024 * 1024));
+        var lines = std.mem.splitScalar(u8, src, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trimStart(u8, line, " \t");
+            if (!std.mem.startsWith(u8, trimmed, "pub fn ")) continue;
+            pub_fns += 1;
+            const rest = trimmed["pub fn ".len..];
+            if (std.mem.startsWith(u8, rest, "init")) has_init = true;
+            const paren = std.mem.indexOfScalar(u8, rest, '(') orelse continue;
+            const args = std.mem.trimStart(u8, rest[paren + 1 ..], " \t");
+            if (std.mem.startsWith(u8, args, "self")) self_methods += 1;
+        }
+    }
+    return .{ .pub_fns = pub_fns, .self_methods = self_methods, .has_init = has_init };
 }
 
 fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {

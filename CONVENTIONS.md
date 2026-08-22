@@ -404,7 +404,9 @@ run says the published API is *sufficient*.
 compiles it against the **published** module — declared `deps` only, no `test_deps`, no
 private declarations. `zig build example-<name>` builds one on its own.
 `zig build check-example-decls` keeps the tree and `module_list`'s `.example` flags in
-agreement, in both directions.
+agreement in both directions, **and fails a module that is over either trigger below and
+has no example at all** — otherwise the scope below would be a list picked by hand once,
+and the next module to cross the threshold would cross it silently.
 
 **A module ships an example when either trigger fires:**
 
@@ -428,11 +430,20 @@ modules here, because size and in-collection reuse correlate. This workspace shi
 to integrators it never meets; an in-repo importer is a late check on the loudest
 mistakes, not a substitute for the first outside caller.
 
+The trigger counts are textual and line-anchored (`pub fn` must start the line), so a
+signature that wraps its first parameter onto the next line is undercounted. That error
+is one-directional on purpose: the gate can ask for fewer examples than the rule does,
+never more, and a build script that parsed Zig to do better would be a second
+implementation of the language.
+
 Write the example as the smallest *coherent* thing a real caller does — parse a real
 frame, drive a handshake to completion, run the state machine through its states — not a
 tour of every function. If the module allocates, allocate from `std.heap.DebugAllocator`
 and panic on `.leak`, so the example is also a leak detector. Handle at least one error by
-name. `modules/l2disco/example/main.zig` is the reference for register and length.
+name — unless the module's public surface is genuinely infallible, which three of them
+are (`ramcache`, `liveness-hyst`, `isis-dis`); there, exercise the effects instead of
+inventing a failure. `modules/l2disco/example/main.zig` is the reference for register and
+length.
 
 If writing the example needs something the module does not publish, that is the finding:
 fix the module, do not reach around the boundary.
