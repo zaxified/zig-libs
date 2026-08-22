@@ -39,6 +39,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   needs the out-of-band `reader.err`/`writer.err` inspection pattern used elsewhere in this
   collection (`enip`, `ssh`), not the direct-propagation fix applied here — and was left
   alone as a separate, unassigned piece of work.
+
+  That leftover piece is now done too. Two new private helpers, shared by both server
+  shapes — `readData` (`serveTcpOn`'s and `serveTcpMulti`'s `readVec`) and `writeAllChecked`
+  (`flush`'s and `writeTo`'s `writeAll`) — consult `reader.err`/`writer.err` before falling
+  back to the prior behavior, reusing the `Canceled` variant `tcp.Error` already carries
+  rather than adding a second one. `readVec`/`writeAll` sit behind `readable`'s poll gate, so
+  it is tempting to assume the poll-side fix already covers them, but it does not: `readVec`
+  reaches `std.Io`'s own network read (a genuine, cancelable call, unlike the raw poll)
+  whenever more is asked for than is already buffered, which is always true here — the
+  request always spans the whole remaining read buffer. A new test drives the shared
+  `readData` directly against a silent peer, the same probe shape as the poll-based tests
+  above but parked in the read itself rather than the readiness wait in front of it (mutated:
+  `expected error.Canceled, found 0`; restored: green, 84/92, 8 skipped — the skips are the
+  pre-existing env-gated live-device tests, unrelated to this change). The write side
+  (`writeAllChecked`, used by `flush` and `writeTo`/`flushMulti`) has no dedicated test, for
+  the same reason `flushUdp`'s send-side fix above has none: reliably parking a thread inside
+  a blocking TCP write long enough for a cancel to land needs a full kernel send buffer, not
+  reproducible here — it was made by inspection and symmetry with the read side instead.
 - **2026-08-11** — Security audit: seven findings fixed, one documented as accepted (not
   defects) — part of the collection-wide audit. Modeled on ModbusPal / Kepware simulator
   (design ref); composes `netsim` + 7 protocol responders (design reference, not a test

@@ -92,6 +92,46 @@ fn checkCanceled(io: std.Io) error{Canceled}!void {
     io.checkCancel() catch return error.Canceled;
 }
 
+/// Distinguish a canceled wait from a genuine read/write failure using the
+/// concrete `Stream.Reader`/`Stream.Writer`'s out-of-band `err` field —
+/// `Io.Reader.Error`/`Io.Writer.Error` are exactly `{ReadFailed, EndOfStream}`
+/// / `{WriteFailed}` and cannot carry `Canceled` themselves.
+fn readCanceled(reader: *const std.Io.net.Stream.Reader) bool {
+    return if (reader.err) |e| e == error.Canceled else false;
+}
+
+fn writeCanceled(writer: *const std.Io.net.Stream.Writer) bool {
+    return if (writer.err) |e| e == error.Canceled else false;
+}
+
+/// The TCP data-transfer read, shared by `serveTcpOn` and `serveTcpMulti`.
+/// Unlike `readable`'s raw `poll`, this is a genuine blocking `std.Io` call
+/// (`Io.Reader.readVec` reaches the network only once its own buffer is
+/// exhausted, at `net.zig`'s `readVec` → `io.vtable.netRead`), so it *is* a
+/// real cancellation point and needs the `err`-field recovery, not a
+/// `checkCancel` call. `0` means "stop the session" either way — end of
+/// stream or an ordinary failure — matching this file's existing convention;
+/// only a cancel gets a different exit, so the caller can tell it apart from
+/// the peer just going away.
+fn readData(reader: *std.Io.net.Stream.Reader, vec: [][]u8) error{Canceled}!usize {
+    return reader.interface.readVec(vec) catch |e| switch (e) {
+        error.EndOfStream => 0,
+        error.ReadFailed => if (readCanceled(reader)) return error.Canceled else 0,
+    };
+}
+
+/// The TCP data-transfer write, shared by `flush` and `writeTo`. `true` on
+/// success; `false` on an ordinary failure, preserving each caller's existing
+/// "stop and keep what was already sent" behavior; `error.Canceled` when the
+/// wait was canceled, which must not be mistaken for either.
+fn writeAllChecked(writer: *std.Io.net.Stream.Writer, bytes: []const u8) error{Canceled}!bool {
+    writer.interface.writeAll(bytes) catch {
+        if (writeCanceled(writer)) return error.Canceled;
+        return false;
+    };
+    return true;
+}
+
 /// True when the fd has something to read, false when the wait elapsed with
 /// nothing there.
 ///
@@ -191,7 +231,6 @@ pub fn serveTcpOn(
     var reader = stream.reader(io, rbuf);
     var writer = stream.writer(io, wbuf);
     const r = &reader.interface;
-    const w = &writer.interface;
 
     const start = nowMs();
     // A carry buffer for a frame split across two reads.
@@ -206,7 +245,7 @@ pub fn serveTcpOn(
         if (r.bufferedLen() == 0 and !try readable(io, stream.socket.handle, opts.idle_ms)) {
             // Idle: still advance so timers and unsolicited traffic fire.
             _ = try fleet.advance(t);
-            if (try flush(fleet, node, w, &report)) continue else continue;
+            if (try flush(fleet, node, &writer, &report)) continue else continue;
         }
 
         // `readVec`, not `readSliceShort`: the latter keeps reading until the
@@ -214,8 +253,8 @@ pub fn serveTcpOn(
         // waiting for 8 KiB that the master will never send. One underlying
         // read is exactly what a framed stream wants.
         var vec: [1][]u8 = .{buf[carry..]};
-        const n = r.readVec(&vec) catch break; // EndOfStream / ReadFailed
-        if (n == 0) break; // peer closed
+        const n = try readData(&reader, &vec);
+        if (n == 0) break; // peer closed, or a genuine failure
         report.bytes_in += n;
         const have = carry + n;
 
@@ -231,27 +270,33 @@ pub fn serveTcpOn(
         }
 
         _ = try fleet.advance(t);
-        _ = try flush(fleet, node, w, &report);
+        _ = try flush(fleet, node, &writer, &report);
     }
 
     // One last drain so a reply produced on the way out is not lost.
     _ = try fleet.advance(nowMs() - start);
-    _ = try flush(fleet, node, w, &report);
+    _ = try flush(fleet, node, &writer, &report);
     report.duration_ms = nowMs() - start;
     return report;
 }
 
-fn flush(fleet: *Fleet, node: NodeId, w: *std.Io.Writer, report: *Report) !bool {
+/// Takes the concrete `Stream.Writer`, not the abstract `Io.Writer` interface
+/// it embeds, so a failed `writeAll`/`flush` can be checked against its
+/// out-of-band `err` field — `Io.Writer.Error` cannot carry `Canceled`.
+fn flush(fleet: *Fleet, node: NodeId, writer: *std.Io.net.Stream.Writer, report: *Report) !bool {
     var any = false;
     for (fleet.outbound()) |f| {
         if (f.node != node) continue;
         const bytes = fleet.frameBytes(f);
-        w.writeAll(bytes) catch return any;
+        if (!try writeAllChecked(writer, bytes)) return any;
         report.bytes_out += bytes.len;
         report.frames_out += 1;
         any = true;
     }
-    if (any) w.flush() catch return any;
+    if (any) writer.interface.flush() catch {
+        if (writeCanceled(writer)) return error.Canceled;
+        return any;
+    };
     return any;
 }
 
@@ -451,7 +496,7 @@ pub fn serveTcpMulti(
             if (!has_buffered and revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) == 0) continue;
 
             var vec: [1][]u8 = .{p.buf[p.carry..]};
-            const n = p.reader.interface.readVec(&vec) catch 0;
+            const n = try readData(&p.reader, &vec);
             if (n == 0) {
                 closePeer(io, peers, slot, last_peer);
                 live -= 1;
@@ -516,22 +561,27 @@ fn flushMulti(
         const bytes = fleet.frameBytes(f);
         if (last_peer[b]) |slot| {
             if (peers[slot].active and peers[slot].binding == b) {
-                writeTo(&peers[slot], bytes, report);
+                try writeTo(&peers[slot], bytes, report);
                 continue;
             }
         }
         // Unsolicited: nobody asked, so tell everyone on that listener.
         for (peers) |*p| {
-            if (p.active and p.binding == b) writeTo(p, bytes, report);
+            if (p.active and p.binding == b) try writeTo(p, bytes, report);
         }
     }
     for (peers) |*p| {
-        if (p.active) p.writer.interface.flush() catch {};
+        if (p.active) p.writer.interface.flush() catch {
+            if (writeCanceled(&p.writer)) return error.Canceled;
+        };
     }
 }
 
-fn writeTo(p: *Peer, bytes: []const u8, report: *MultiReport) void {
-    p.writer.interface.writeAll(bytes) catch return;
+/// A failed write is otherwise silently dropped here — an unsolicited-traffic
+/// fan-out to several peers must not let one dead peer stop the others — but
+/// a cancel is not "this peer is dead", so it still has to reach the caller.
+fn writeTo(p: *Peer, bytes: []const u8, report: *MultiReport) error{Canceled}!void {
+    if (!try writeAllChecked(&p.writer, bytes)) return;
     report.bytes_out += bytes.len;
     report.frames_out += 1;
 }
@@ -990,6 +1040,64 @@ test "serveUdp: a canceled receive wait surfaces Canceled, not an idle round" {
     // tests above: the loop is otherwise unbounded, and a broken cancel path
     // must fail fast rather than hang the suite.
     var fut = try io.concurrent(serveUdp, .{ gpa, io, &f, @as(NodeId, 0), addr, Options{ .idle_ms = 600, .run_ms = 3000 } });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+// ── the TCP data-transfer read/write fold ───────────────────────────────────
+//
+// `readable`'s raw `poll` is not the only place a cancel could be lost.
+// `serveTcpOn`/`serveTcpMulti` only ever call into `Io.Reader.readVec` once
+// `readable` (or a peer already known to be readable) says there is
+// something there, but `readVec` itself reaches the network — a genuine
+// `std.Io` call, and a real cancellation point distinct from the poll gate in
+// front of it — whenever more is asked for than is already buffered, which is
+// always true here (`buf[carry..]` spans the whole remaining read buffer).
+// `readData`, the helper both loops now share, is what recovers the reason
+// from `reader.err`; this drives it directly against a silent peer, the same
+// probe shape as the poll-based tests above but parked in the read itself.
+
+fn readOnce(reader: *std.Io.net.Stream.Reader, buf: []u8) error{Canceled}!usize {
+    var vec: [1][]u8 = .{buf};
+    return readData(reader, &vec);
+}
+
+test "readData: a canceled blocking read surfaces Canceled, not 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 0: an ephemeral port cannot collide with a parallel test run.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch {
+        if (verboseSkip()) std.debug.print("SKIPPED: loopback listen failed\n", .{});
+        return error.SkipZigTest;
+    };
+    defer listener.socket.close(io);
+
+    // Loopback `connect` succeeds as soon as the SYN is queued in the kernel
+    // backlog, so a plain sequential connect-then-accept is enough here —
+    // unlike the `serveTcpOn` cancellation test above, nothing under test
+    // runs between the two.
+    var client = listener.socket.address.connect(io, .{ .mode = .stream }) catch {
+        if (verboseSkip()) std.debug.print("SKIPPED: loopback connect failed\n", .{});
+        return error.SkipZigTest;
+    };
+    defer client.close(io);
+    var accepted = listener.accept(io) catch {
+        if (verboseSkip()) std.debug.print("SKIPPED: loopback accept failed\n", .{});
+        return error.SkipZigTest;
+    };
+    defer accepted.close(io);
+
+    var rbuf: [64]u8 = undefined;
+    var reader = accepted.reader(io, &rbuf);
+    var buf: [64]u8 = undefined;
+
+    // Nothing is ever written to `accepted`, and the reader's own buffer
+    // starts empty, so the read genuinely parks in `io.vtable.netRead`.
+    var fut = try io.concurrent(readOnce, .{ &reader, &buf });
     try io.sleep(.fromMilliseconds(100), .awake);
     try testing.expectError(error.Canceled, fut.cancel(io));
 }
