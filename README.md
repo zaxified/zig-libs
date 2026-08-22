@@ -423,7 +423,7 @@ way to recognise it.
 | [`sealedbox`](modules/sealedbox/README.md) | NaCl `crypto_box_seal` — anonymous-sender X25519 public-key encryption, plus base64/hex key serialization. | any | — |
 | [`minisign`](modules/minisign/README.md) | minisign file format (jedisct1/minisign) — Ed25519 sign/verify for signed files/releases, including scrypt-encrypted secret keys. | any | entropy |
 | [`rsa`](modules/rsa/README.md) | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint |
-| [`x509`](modules/x509/README.md) | X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks. | any | rsa |
+| [`x509`](modules/x509/README.md) | X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates. | any | rsa, slhdsa |
 | [`paillier`](modules/paillier/README.md) | Paillier additively-homomorphic public-key encryption (EUROCRYPT 1999) — 2048-bit keygen, encrypt/decrypt, homomorphic add; const-time decrypt path. | any | montint |
 | [`threshold_ecdsa`](modules/threshold_ecdsa/README.md) | GG20 threshold ECDSA over secp256k1 (t-of-n) — dealer keygen through online signing, producing standard verifiable ECDSA sigs. **Audit warranted before production use.** | any | paillier, montint |
 | [`dkg`](modules/dkg/README.md) | Dealer-free Distributed Key Generation (GJKR) for `threshold_ecdsa` — bias-resistant secp256k1 key sharing feeding threshold signing. | any | threshold_ecdsa, paillier |
