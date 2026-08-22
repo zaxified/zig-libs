@@ -7,8 +7,10 @@
 //! Scope so far: compact-token **parsing** into typed models (P1),
 //! **registered-claims validation** (`exp`/`nbf`/`iat`/`iss`/`aud`, P1),
 //! **JWS signature verification** (P2+P3) for HS256/384/512 (HMAC-SHA-2),
-//! ES256/ES384 (ECDSA P-256/P-384), EdDSA (Ed25519) and RS256/384/512
-//! (RSASSA-PKCS1-v1_5, the OIDC default) — plus the one-call
+//! ES256/ES384 (ECDSA P-256/P-384), EdDSA (Ed25519), RS256/384/512
+//! (RSASSA-PKCS1-v1_5, the OIDC default) and **ML-DSA-44/65/87** (RFC 9964,
+//! the post-quantum FIPS-204 signatures, with `kty:"AKP"` JWKs) — plus the
+//! one-call
 //! `parseAndVerify` that chains all three — and **JWKS key sets** (P4,
 //! RFC 7517): parse a `{"keys":[…]}` document into a typed `JwkSet`,
 //! select the key by the token header's `kid`, and verify via
@@ -264,6 +266,15 @@ pub const Alg = enum {
     PS384,
     PS512,
     EdDSA,
+    /// RFC 9964 §2: ML-DSA (FIPS 204) for JOSE. The `alg` strings carry
+    /// hyphens, so the enum fields do too -- `std.meta.stringToEnum` matches
+    /// on the field NAME, and an escaped identifier keeps `fromString` a
+    /// one-liner instead of a hand-written table that could drift from the
+    /// registry. Pure ML-DSA only: RFC 9964 does not specify HashML-DSA, and
+    /// requires the FIPS-204 context string to be empty.
+    @"ML-DSA-44",
+    @"ML-DSA-65",
+    @"ML-DSA-87",
     none,
     unknown,
 
@@ -640,6 +651,13 @@ const p256_mod = @import("p256");
 pub const EcdsaP256Sha256 = p256_mod.EcdsaP256Sha256;
 pub const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 pub const Ed25519 = std.crypto.sign.Ed25519;
+/// ML-DSA (FIPS 204) parameter sets, as RFC 9964 names them for JOSE. Pure
+/// std: measured on the audit host (2026-08-22, ReleaseFast) std's ML-DSA-65
+/// verify costs 57 us against OpenSSL 3.5.5's 255 us on the same machine, so
+/// there is no p256-style reason to carry our own.
+pub const MlDsa44 = std.crypto.sign.mldsa.MLDSA44;
+pub const MlDsa65 = std.crypto.sign.mldsa.MLDSA65;
+pub const MlDsa87 = std.crypto.sign.mldsa.MLDSA87;
 
 const hmac_sha2 = std.crypto.auth.hmac.sha2;
 const sha2 = std.crypto.hash.sha2;
@@ -680,6 +698,14 @@ pub const Key = union(enum) {
     ed25519: Ed25519.PublicKey,
     /// RSA public key for RS256/RS384/RS512 (RSASSA-PKCS1-v1_5).
     rsa: RsaPublicKey,
+    /// ML-DSA public keys (RFC 9964 / FIPS 204). One variant per parameter
+    /// set rather than one variant plus a tag, because the three are distinct
+    /// types with distinct key lengths -- a mismatched pair is then a compile
+    /// error here and an `AlgKeyMismatch` at the seam, never a length check
+    /// somebody forgets.
+    ml_dsa_44: MlDsa44.PublicKey,
+    ml_dsa_65: MlDsa65.PublicKey,
+    ml_dsa_87: MlDsa87.PublicKey,
 
     /// P-256 key from raw big-endian affine coordinates — exactly a JWK's
     /// decoded `x`/`y` (RFC 7518 §6.2.1).
@@ -707,6 +733,24 @@ pub const Key = union(enum) {
     pub fn ed25519FromBytes(bytes: [32]u8) KeyError!Key {
         const pk = Ed25519.PublicKey.fromBytes(bytes) catch return error.InvalidKey;
         return .{ .ed25519 = pk };
+    }
+
+    /// ML-DSA public key from the raw FIPS-204 encoding — exactly a JWK's
+    /// decoded `pub` member (RFC 9964 §5), no extra framing. The length is
+    /// carried by the array type, so a key of one parameter set cannot reach
+    /// another's variant.
+    pub fn mlDsa44FromBytes(bytes: [MlDsa44.PublicKey.encoded_length]u8) KeyError!Key {
+        return .{ .ml_dsa_44 = MlDsa44.PublicKey.fromBytes(bytes) catch return error.InvalidKey };
+    }
+
+    /// ML-DSA-65 public key from its raw FIPS-204 encoding.
+    pub fn mlDsa65FromBytes(bytes: [MlDsa65.PublicKey.encoded_length]u8) KeyError!Key {
+        return .{ .ml_dsa_65 = MlDsa65.PublicKey.fromBytes(bytes) catch return error.InvalidKey };
+    }
+
+    /// ML-DSA-87 public key from its raw FIPS-204 encoding.
+    pub fn mlDsa87FromBytes(bytes: [MlDsa87.PublicKey.encoded_length]u8) KeyError!Key {
+        return .{ .ml_dsa_87 = MlDsa87.PublicKey.fromBytes(bytes) catch return error.InvalidKey };
     }
 
     /// RSA key from big-endian modulus + public-exponent bytes — exactly a
@@ -792,7 +836,39 @@ pub fn verify(parsed: *const ParsedToken, key: Key) VerifyError!void {
             },
             else => return error.AlgKeyMismatch,
         },
+        // RFC 9964 §2. `Signature.verify` is FIPS-204 pure ML-DSA with an
+        // EMPTY context string, which is what the RFC requires ("The ctx
+        // parameter MUST be the empty string"); HashML-DSA is deliberately
+        // not offered because the RFC does not specify it.
+        .@"ML-DSA-44" => switch (key) {
+            .ml_dsa_44 => |pk| try verifyMlDsa(MlDsa44, pk, parsed),
+            else => return error.AlgKeyMismatch,
+        },
+        .@"ML-DSA-65" => switch (key) {
+            .ml_dsa_65 => |pk| try verifyMlDsa(MlDsa65, pk, parsed),
+            else => return error.AlgKeyMismatch,
+        },
+        .@"ML-DSA-87" => switch (key) {
+            .ml_dsa_87 => |pk| try verifyMlDsa(MlDsa87, pk, parsed),
+            else => return error.AlgKeyMismatch,
+        },
     }
+}
+
+/// Verify a JWS signature under one ML-DSA parameter set (RFC 9964 §2).
+///
+/// The signature length is checked against the parameter set BEFORE decoding,
+/// so a signature sized for another set is a `BadSignature` rather than a
+/// decode error that could be mistaken for a malformed token.
+fn verifyMlDsa(
+    comptime Scheme: type,
+    pk: Scheme.PublicKey,
+    parsed: *const ParsedToken,
+) VerifyError!void {
+    const n = Scheme.Signature.encoded_length;
+    if (parsed.signature.len != n) return error.BadSignature;
+    const sig = Scheme.Signature.fromBytes(parsed.signature[0..n].*) catch return error.BadSignature;
+    sig.verify(parsed.signing_input, pk) catch return error.BadSignature;
 }
 
 /// Errors from the one-call `parseAndVerify`.
@@ -917,8 +993,12 @@ pub const JwkSkipReason = enum {
     not_an_object,
     /// `kty` is absent (it is the only REQUIRED member, RFC 7517 §4.1).
     missing_kty,
-    /// `kty` is none of RSA / EC / OKP / oct.
+    /// `kty` is none of RSA / EC / OKP / AKP / oct.
     unsupported_kty,
+    /// A `kty:"AKP"` key without the `alg` member. RFC 9964 makes `alg`
+    /// REQUIRED on AKP keys: the parameter set is carried there, NOT inferred
+    /// from the key length, so a key without it cannot be typed at all.
+    missing_alg,
     /// EC/OKP without the `crv` member.
     missing_crv,
     /// `crv` names a curve this module does not support (P-521, X25519, …).
@@ -1055,6 +1135,8 @@ pub const JwkSet = struct {
 /// - `kty:"EC"`, `crv:"P-256"|"P-384"` — `x`/`y` →
 ///   `ecdsaP256FromCoords`/`ecdsaP384FromCoords` (ES256/ES384).
 /// - `kty:"OKP"`, `crv:"Ed25519"` — `x` → `ed25519FromBytes` (EdDSA).
+/// - `kty:"AKP"` (RFC 9964 §5) — REQUIRED `alg` + `pub` → `mlDsa44FromBytes`
+///   / `mlDsa65FromBytes` / `mlDsa87FromBytes` (ML-DSA-44/65/87).
 /// - `kty:"oct"` — `k` → `.hmac`. Accepted ONLY here (a locally-configured,
 ///   trusted set for HS* dev/test setups); a *symmetric* key has no business
 ///   in a *published* JWKS — anyone who can read it can mint tokens — so the
@@ -1139,6 +1221,7 @@ const JwkFailure = error{
     UnsupportedKty,
     MissingCrv,
     UnsupportedCrv,
+    MissingAlg,
     MissingMember,
     InvalidBase64,
     InvalidKeyMaterial,
@@ -1153,6 +1236,7 @@ fn skipReason(err: JwkFailure) JwkSkipReason {
         error.UnsupportedKty => .unsupported_kty,
         error.MissingCrv => .missing_crv,
         error.UnsupportedCrv => .unsupported_crv,
+        error.MissingAlg => .missing_alg,
         error.MissingMember => .missing_member,
         error.InvalidBase64 => .invalid_base64,
         error.InvalidKeyMaterial => .invalid_key,
@@ -1207,6 +1291,42 @@ fn jwkFromValue(
             const x = try jwkMaterial(arena, obj, "x");
             if (x.len != 32) return error.InvalidKeyMaterial;
             break :blk Key.ed25519FromBytes(x[0..32].*) catch return error.InvalidKeyMaterial;
+        }
+        if (std.mem.eql(u8, kty, "AKP")) {
+            // RFC 9964 §5: `pub` is the raw FIPS-204 public key, base64url,
+            // and `alg` is REQUIRED because an AKP key carries its parameter
+            // set nowhere else. Deliberately NOT inferred from `pub.len`,
+            // even though the three lengths are distinct: inferring it would
+            // accept a key whose `alg` says one set and whose bytes are
+            // another, which is the algorithm-confusion shape RFC 8725 exists
+            // to close. `priv` (a 32-byte seed) has no business in a
+            // verification key and is simply never read.
+            const alg = (try jwkString(obj, "alg")) orelse return error.MissingAlg;
+            const pub_bytes = try jwkMaterial(arena, obj, "pub");
+            const set = Alg.fromString(alg);
+            switch (set) {
+                .@"ML-DSA-44" => {
+                    const n = MlDsa44.PublicKey.encoded_length;
+                    if (pub_bytes.len != n) return error.InvalidKeyMaterial;
+                    break :blk Key.mlDsa44FromBytes(pub_bytes[0..n].*) catch
+                        return error.InvalidKeyMaterial;
+                },
+                .@"ML-DSA-65" => {
+                    const n = MlDsa65.PublicKey.encoded_length;
+                    if (pub_bytes.len != n) return error.InvalidKeyMaterial;
+                    break :blk Key.mlDsa65FromBytes(pub_bytes[0..n].*) catch
+                        return error.InvalidKeyMaterial;
+                },
+                .@"ML-DSA-87" => {
+                    const n = MlDsa87.PublicKey.encoded_length;
+                    if (pub_bytes.len != n) return error.InvalidKeyMaterial;
+                    break :blk Key.mlDsa87FromBytes(pub_bytes[0..n].*) catch
+                        return error.InvalidKeyMaterial;
+                },
+                // An AKP key naming any other algorithm is a key type this
+                // module cannot verify with, not a malformed one.
+                else => return error.UnsupportedKty,
+            }
         }
         if (std.mem.eql(u8, kty, "oct")) {
             // RFC 7518 §6.4.1: k — the symmetric secret. A symmetric key in a
@@ -3962,6 +4082,149 @@ test "verify: EdDSA generated round-trip through a full token" {
     // A different keypair's public key → BadSignature.
     const other = try Ed25519.KeyPair.generateDeterministic([_]u8{0x25} ** 32);
     try testing.expectError(error.BadSignature, verify(&parsed, .{ .ed25519 = other.public_key }));
+}
+
+// The RFC 9964 Appendix A.1 vectors live in their own file (they are ~9 KB of
+// base64), and a bare `@import` re-export would NOT pull their tests into this
+// binary -- see CONVENTIONS.md §6 step 3, the dark-tests rule.
+test {
+    _ = @import("rfc9964_vectors.zig");
+}
+
+test "verify: ML-DSA-65 round-trip through a full token (RFC 9964)" {
+    // Self-consistency for the WIRING, not for the algorithm: ML-DSA itself is
+    // anchored by std's own FIPS-204 vectors, and what this file adds is the
+    // JOSE binding (alg name, empty context, raw signature bytes). Those are
+    // what this exercises.
+    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x31} ** 32);
+    const key = try Key.mlDsa65FromBytes(kp.public_key.toBytes());
+
+    // An ML-DSA-65 signature is 3309 bytes -> ~4412 base64url characters, so
+    // the token buffer is an order of magnitude past what an ES256 test needs.
+    var buf: [8192]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"ML-DSA-65"}
+    ,
+        \\{"exp":1000,"sub":"user-1"}
+    );
+    const sig = try kp.sign(si, null);
+    const sig_bytes = sig.toBytes();
+    try testing.expectEqual(@as(usize, 3309), sig_bytes.len);
+    const token = finishToken(&buf, si.len, &sig_bytes);
+
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try testing.expectEqual(Alg.@"ML-DSA-65", parsed.alg);
+    try verify(&parsed, key);
+
+    // Tampered payload under the same signature -> BadSignature.
+    var buf2: [8192]u8 = undefined;
+    const si2 = signingInputInto(&buf2,
+        \\{"alg":"ML-DSA-65"}
+    ,
+        \\{"exp":1000,"sub":"user-2"}
+    );
+    const forged = finishToken(&buf2, si2.len, &sig_bytes);
+    var p_forged = try parse(testing.allocator, forged);
+    defer p_forged.deinit();
+    try testing.expectError(error.BadSignature, verify(&p_forged, key));
+
+    // A different key of the SAME parameter set -> BadSignature.
+    const other = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x32} ** 32);
+    try testing.expectError(error.BadSignature, verify(&parsed, .{ .ml_dsa_65 = other.public_key }));
+
+    // A key of a DIFFERENT parameter set -> AlgKeyMismatch, not BadSignature:
+    // the mismatch is caught by the alg/key pairing, before any verification.
+    const kp44 = try MlDsa44.KeyPair.generateDeterministic([_]u8{0x33} ** 32);
+    try testing.expectError(error.AlgKeyMismatch, verify(&parsed, .{ .ml_dsa_44 = kp44.public_key }));
+}
+
+test "verify: ML-DSA sizes are exactly FIPS 204's, which is what a JWS carries" {
+    // RFC 9964 §2 puts the raw FIPS-204 encodings on the wire with no extra
+    // framing, so these lengths ARE the interop contract. Pinned as constants
+    // rather than derived, so a change in std shows up here as a failure
+    // instead of silently redefining what we claim to accept.
+    try testing.expectEqual(@as(usize, 1312), MlDsa44.PublicKey.encoded_length);
+    try testing.expectEqual(@as(usize, 1952), MlDsa65.PublicKey.encoded_length);
+    try testing.expectEqual(@as(usize, 2592), MlDsa87.PublicKey.encoded_length);
+    try testing.expectEqual(@as(usize, 2420), MlDsa44.Signature.encoded_length);
+    try testing.expectEqual(@as(usize, 3309), MlDsa65.Signature.encoded_length);
+    try testing.expectEqual(@as(usize, 4627), MlDsa87.Signature.encoded_length);
+}
+
+test "parseJwks: kty AKP carries its parameter set in alg, and verifies a token" {
+    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x41} ** 32);
+    const pk_bytes = kp.public_key.toBytes();
+
+    var pub_b64: [3000]u8 = undefined;
+    const pub_s = pub_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&pub_b64, &pk_bytes).len];
+
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(testing.allocator);
+    try doc.appendSlice(testing.allocator, "{\"keys\":[{\"kty\":\"AKP\",\"kid\":\"pq1\",\"alg\":\"ML-DSA-65\",\"pub\":\"");
+    try doc.appendSlice(testing.allocator, pub_s);
+    try doc.appendSlice(testing.allocator, "\"}]}");
+
+    var set = try parseJwks(testing.allocator, doc.items);
+    defer set.deinit();
+    try testing.expectEqual(@as(usize, 1), set.keys.len);
+    try testing.expectEqual(@as(usize, 0), set.skipped.len);
+    try testing.expect(set.keys[0].key == .ml_dsa_65);
+
+    var buf: [8192]u8 = undefined;
+    const si = signingInputInto(&buf,
+        \\{"alg":"ML-DSA-65","kid":"pq1"}
+    ,
+        \\{"exp":1000,"sub":"user-1"}
+    );
+    const sig = try kp.sign(si, null);
+    const token = finishToken(&buf, si.len, &sig.toBytes());
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try verifyWithJwks(&parsed, set);
+}
+
+test "parseJwks: an AKP key without alg is skipped -- the set is NOT inferred from pub's length" {
+    // RFC 9964 makes alg REQUIRED on AKP keys. The three public-key lengths
+    // are distinct, so inferring the parameter set would "work" -- and would
+    // accept a key whose alg claims one set and whose bytes are another, which
+    // is the algorithm-confusion shape RFC 8725 §3.1 exists to close.
+    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x42} ** 32);
+    const pk_bytes = kp.public_key.toBytes();
+    var pub_b64: [3000]u8 = undefined;
+    const pub_s = pub_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&pub_b64, &pk_bytes).len];
+
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(testing.allocator);
+    try doc.appendSlice(testing.allocator, "{\"keys\":[{\"kty\":\"AKP\",\"kid\":\"pq1\",\"pub\":\"");
+    try doc.appendSlice(testing.allocator, pub_s);
+    try doc.appendSlice(testing.allocator, "\"}]}");
+
+    var set = try parseJwks(testing.allocator, doc.items);
+    defer set.deinit();
+    try testing.expectEqual(@as(usize, 0), set.keys.len);
+    try testing.expectEqual(@as(usize, 1), set.skipped.len);
+    try testing.expectEqual(JwkSkipReason.missing_alg, set.skipped[0].reason);
+}
+
+test "parseJwks: an AKP key whose pub length contradicts its alg is skipped" {
+    const kp = try MlDsa44.KeyPair.generateDeterministic([_]u8{0x43} ** 32);
+    const pk_bytes = kp.public_key.toBytes(); // 1312 bytes: an ML-DSA-44 key
+    var pub_b64: [3000]u8 = undefined;
+    const pub_s = pub_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&pub_b64, &pk_bytes).len];
+
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(testing.allocator);
+    // ...presented as ML-DSA-65, whose keys are 1952 bytes.
+    try doc.appendSlice(testing.allocator, "{\"keys\":[{\"kty\":\"AKP\",\"alg\":\"ML-DSA-65\",\"pub\":\"");
+    try doc.appendSlice(testing.allocator, pub_s);
+    try doc.appendSlice(testing.allocator, "\"}]}");
+
+    var set = try parseJwks(testing.allocator, doc.items);
+    defer set.deinit();
+    try testing.expectEqual(@as(usize, 0), set.keys.len);
+    try testing.expectEqual(@as(usize, 1), set.skipped.len);
+    try testing.expectEqual(JwkSkipReason.invalid_key, set.skipped[0].reason);
 }
 
 test "verify: alg none is always rejected, key or no key (RFC 8725 §2.1)" {

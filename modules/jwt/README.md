@@ -5,8 +5,10 @@ and an OIDC *relying party* (RP). The validator side: compact-serialization
 parsing (RFC 7515 §3.1) into typed models, registered-claims validation
 (RFC 7519 §4.1), JWS signature verification (RFC 7515 §5.2 + RFC 7518)
 for **HS256/384/512** (HMAC-SHA-2), **ES256/ES384** (ECDSA P-256/P-384),
-**EdDSA** (Ed25519, RFC 8037) and **RS256/384/512** (RSASSA-PKCS1-v1_5,
-RFC 8017 — the OIDC default), and **JWKS key sets** (RFC 7517): parse a
+**EdDSA** (Ed25519, RFC 8037), **RS256/384/512** (RSASSA-PKCS1-v1_5,
+RFC 8017 — the OIDC default) and **ML-DSA-44/65/87** (RFC 9964 — the
+post-quantum FIPS-204 signatures, keys as `kty:"AKP"` JWKs), and **JWKS key
+sets** (RFC 7517): parse a
 `{"keys":[…]}` document into a typed `JwkSet`, select the key by the token
 header's `kid`, verify via `verifyWithJwks`/`parseVerifyJwks`. The signature
 core hand-rolls no crypto — `std.base64.url_safe_no_pad` for the segments,
