@@ -94,7 +94,13 @@ pub const tx_headroom = 16;
 pub const max_filter_levels = 128;
 
 /// Failures a `Transport` implementation may report.
-pub const TransportError = error{TransportFailed};
+pub const TransportError = error{
+    TransportFailed,
+    /// The blocking operation was canceled through the `std.Io` cancellation
+    /// protocol (`Future.cancel`). Surfaced instead of `TransportFailed` so a
+    /// caller can tell a canceled wait from a real transport failure.
+    Canceled,
+};
 
 /// Outgoing byte seam to one connected client (reversed `client.Transport`).
 /// Implementations must take all bytes or fail; the broker never retries
@@ -126,6 +132,10 @@ pub const Error = error{
     RxBufferFull,
     /// The connection's `Transport` write failed.
     TransportFailed,
+    /// The connection's `Transport` write was canceled through the `std.Io`
+    /// cancellation protocol — distinct from `TransportFailed`: the peer did
+    /// nothing wrong, the broker's own thread was told to stop.
+    Canceled,
     /// SUBSCRIBE carried more filters than `max_filters_per_subscribe`.
     TooManySubscriptions,
     /// `accept` refused a new connection: `Config.max_connections` reached.
@@ -227,8 +237,16 @@ pub const Connection = struct {
     }
 
     /// Raw write — assumes `tx_lock` is held (fan-out / SUBACK-retained path).
+    ///
+    /// Widened explicitly (not `catch return error.TransportFailed`) so a
+    /// variant added to `TransportError` cannot silently arrive here as
+    /// something else — which is exactly how a canceled write used to come
+    /// out indistinguishable from the peer having actually failed.
     fn write(c: *Connection, bytes: []const u8) Error!void {
-        c.transport.write(bytes) catch return error.TransportFailed;
+        c.transport.write(bytes) catch |e| return switch (e) {
+            error.TransportFailed => error.TransportFailed,
+            error.Canceled => error.Canceled,
+        };
     }
 
     /// Take `tx_lock` for a standalone control-packet write (CONNACK / PUBACK /
@@ -1061,14 +1079,27 @@ pub const Broker = struct {
         }
 
         // Off the global lock: deliver to each subscriber under its own
-        // tx_lock. A failure is contained to that subscriber (FIX B).
+        // tx_lock. A failure is contained to that subscriber (FIX B) — but a
+        // `Canceled` delivery is not a subscriber failure at all: it means
+        // *this* fan-out thread was told to stop (broker shutdown mid-publish
+        // through the `std.Io` cancellation protocol), not that the peer
+        // misbehaved. Disconnecting every remaining subscriber because the
+        // publisher's own thread was canceled would turn a clean shutdown
+        // into a mass, unrelated teardown, so the loop aborts instead —
+        // still releasing every reference it took first (FIX A's invariant:
+        // `remove` must never spin on a fan-out that will not touch these
+        // connections again).
         for (targets.items) |t| {
             var failed = false;
             {
                 t.conn.tx_lock.lock();
                 defer t.conn.tx_lock.unlock();
                 if (t.conn.state == .connected) {
-                    b.deliverLocked(t.conn, pub_pkt.topic, pub_pkt.payload, minQos(pub_pkt.qos, t.qos), false) catch {
+                    b.deliverLocked(t.conn, pub_pkt.topic, pub_pkt.payload, minQos(pub_pkt.qos, t.qos), false) catch |e| {
+                        if (e == error.Canceled) {
+                            for (targets.items) |tt| _ = tt.conn.refs.fetchSub(1, .release);
+                            return e;
+                        }
                         failed = true;
                     };
                 }
@@ -1245,7 +1276,11 @@ pub const TcpServer = struct {
 
         var read_buf: [4096]u8 = undefined;
         while (true) {
-            if (!waitReadable(stream.socket.handle, connTimeoutMs(s.broker.config, conn))) {
+            // `null` = this thread was canceled while waiting (broker/server
+            // shutdown): reap the connection exactly like any other exit path
+            // here, same as a real transport failure would.
+            const readable = waitReadable(s.io, stream.socket.handle, connTimeoutMs(s.broker.config, conn)) orelse return;
+            if (!readable) {
                 // Pre-CONNECT: keep_alive_s is still 0 (unset) — bound the wait
                 // by connect_timeout_ms so a client that never sends CONNECT
                 // can't pin this slot/thread forever.
@@ -1255,9 +1290,14 @@ pub const TcpServer = struct {
             }
             // Take-over (FIX C) or a contained delivery failure (FIX B) shuts
             // this socket down and flips the connection to .disconnected; the
-            // read then returns 0/err and we reap promptly.
-            const n = std.posix.read(stream.socket.handle, &read_buf) catch return;
-            if (n == 0) return; // client closed (or socket shut down for reaping)
+            // read then returns EndOfStream/ReadFailed and we reap promptly.
+            // Routed through `std.Io.net.Stream.Reader` (not a raw
+            // `std.posix.read`) so a cancel arriving mid-read can actually
+            // interrupt it — a raw read restarts on the signal `Future.cancel`
+            // sends (EINTR) exactly like the `waitReadable` poll below.
+            var sr = stream.reader(s.io, &read_buf);
+            sr.interface.fillMore() catch return;
+            const n = sr.interface.bufferedLen();
             s.broker.feed(conn, read_buf[0..n]) catch return;
             const disp = s.broker.process(conn, milliTimestamp()) catch return;
             if (disp == .close) return;
@@ -1279,8 +1319,15 @@ const SocketTransport = struct {
         const t: *SocketTransport = @ptrCast(@alignCast(ctx));
         var wbuf: [512]u8 = undefined;
         var sw = t.stream.writer(t.io, &wbuf);
-        sw.interface.writeAll(bytes) catch return error.TransportFailed;
-        sw.interface.flush() catch return error.TransportFailed;
+        sw.interface.writeAll(bytes) catch return writeFailure(&sw);
+        sw.interface.flush() catch return writeFailure(&sw);
+    }
+
+    /// Distinguish a canceled wait from a genuine write failure. `Io.Writer`'s
+    /// error set cannot carry `Canceled`; the concrete writer records it here.
+    fn writeFailure(sw: *std.Io.net.Stream.Writer) TransportError {
+        if (sw.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.TransportFailed;
     }
 
     /// FIX C: shut the stream down so a blocked read in the owner thread wakes
@@ -1293,12 +1340,26 @@ const SocketTransport = struct {
 };
 
 /// Poll a socket for readability, bounded by `timeout_ms` (-1 = indefinitely).
-/// Returns true if data is ready, false on timeout. A poll failure is reported
-/// as "ready" so the blocking read surfaces the real error.
-fn waitReadable(handle: std.Io.net.Socket.Handle, timeout_ms: i32) bool {
+/// Returns true if data is ready, false on timeout, `null` if this thread was
+/// canceled through `std.Io` while waiting. A poll failure (other than a
+/// cancel) is reported as "ready" so the blocking read surfaces the real
+/// error.
+///
+/// `std.posix.poll` is **not** a registered `std.Io` operation: it restarts
+/// itself on `EINTR`, so the signal `Future.cancel` sends is swallowed and
+/// the wait would otherwise run to its full timeout — indefinitely, for an
+/// idle keep-alive connection (`timeout_ms == -1`). `io.checkCancel` is
+/// checked explicitly after the wait ends, on both the "timed out" and the
+/// "poll itself failed" paths, so a cancel is never mistaken for either.
+fn waitReadable(io: std.Io, handle: std.Io.net.Socket.Handle, timeout_ms: i32) ?bool {
     var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
-    const ready = std.posix.poll(&fds, timeout_ms) catch return true;
-    return ready != 0;
+    const ready = std.posix.poll(&fds, timeout_ms) catch {
+        io.checkCancel() catch return null;
+        return true;
+    };
+    if (ready != 0) return true;
+    io.checkCancel() catch return null;
+    return false;
 }
 
 /// The poll timeout (ms) for one iteration of `connMain`'s read loop.
@@ -1319,6 +1380,61 @@ fn milliTimestamp() i64 {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+// ── cancellation ─────────────────────────────────────────────────────────
+//
+// `waitReadable` backs `TcpServer.connMain`'s per-connection read loop. Its
+// `std.posix.poll` is not a registered `std.Io` operation, so the signal
+// `Future.cancel` would otherwise rely on is never even sent to a thread
+// parked in it — the exact non-obvious defect this whole cancellation effort
+// exists to close. Without the explicit `io.checkCancel` inside
+// `waitReadable`, a canceled connection handler thread would sit through the
+// *entire* poll timeout before ever reacting — indefinitely, for an idle
+// keep-alive connection (`timeout_ms == -1` in production).
+//
+// The cancel therefore only becomes visible once the poll's own timeout
+// elapses (there is nothing here that interrupts it early) — keep the
+// configured timeout small, as enip's equivalent test does, or this slows
+// the module suite down.
+
+fn acceptOne(server: *std.Io.net.Server, io: std.Io) std.Io.net.Server.AcceptError!std.Io.net.Stream {
+    return server.accept(io);
+}
+
+/// The blocking call under test, on its own thread so it can be canceled.
+fn waitReadableOnce(io: std.Io, handle: std.Io.net.Socket.Handle, timeout_ms: i32) ?bool {
+    return waitReadable(io, handle, timeout_ms);
+}
+
+test "a cancel during waitReadable's poll surfaces as null, not a timeout" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 0: an ephemeral port cannot collide with a parallel test run.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer server.deinit(io);
+
+    var accept_fut = try io.concurrent(acceptOne, .{ &server, io });
+    var client_stream = std.Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream }) catch |err| {
+        if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer client_stream.close(io);
+    var peer = try accept_fut.await(io);
+    defer peer.close(io);
+
+    // Nobody ever writes: the poll is genuinely parked for its whole timeout.
+    var fut = try io.concurrent(waitReadableOnce, .{ io, client_stream.socket.handle, @as(i32, 600) });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    const result = fut.cancel(io);
+    try testing.expectEqual(@as(?bool, null), result);
+}
 
 /// Scripted fake client side of the seam: captures everything the broker writes
 /// to this connection so tests can decode it in wire order. `fail` (flipped on

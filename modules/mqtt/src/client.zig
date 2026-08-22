@@ -35,7 +35,13 @@ const packet = @import("packet.zig");
 const topic_rules = @import("topic.zig");
 
 /// Failures a `Transport` implementation may report.
-pub const TransportError = error{TransportFailed};
+pub const TransportError = error{
+    TransportFailed,
+    /// The blocking operation was canceled through the `std.Io` cancellation
+    /// protocol (`Future.cancel`). Surfaced instead of `TransportFailed` so a
+    /// caller can tell a canceled wait from a real transport failure.
+    Canceled,
+};
 
 /// Outgoing byte seam. Implementations must either take all bytes or fail;
 /// the client never retries partial writes.
@@ -503,14 +509,41 @@ pub const TcpTransport = struct {
         const t: *TcpTransport = @ptrCast(@alignCast(ctx));
         var wbuf: [512]u8 = undefined;
         var sw = t.stream.writer(t.io, &wbuf);
-        sw.interface.writeAll(bytes) catch return error.TransportFailed;
-        sw.interface.flush() catch return error.TransportFailed;
+        sw.interface.writeAll(bytes) catch return writeFailure(&sw);
+        sw.interface.flush() catch return writeFailure(&sw);
     }
 
     /// Read whatever bytes are available (blocking for at least one);
     /// hand them to `Client.feed`.
+    ///
+    /// This used to be a raw `std.posix.read` on the socket handle — which
+    /// is *not* a registered `std.Io` operation, so `Future.cancel` cannot
+    /// reach a thread parked in it at all (worse than a raw `poll`: that at
+    /// least gets a signal that restarts it; this gets nothing). Routing the
+    /// read through `std.Io.net.Stream.Reader.fillMore` — one underlying
+    /// read, buffered straight into the caller's own `buf` since it is used
+    /// as the reader's backing storage — makes the wait a real cancellation
+    /// point while keeping the "one read, partial fill is fine" contract.
     pub fn readSome(t: *TcpTransport, buf: []u8) TransportError!usize {
-        return std.posix.read(t.stream.socket.handle, buf) catch error.TransportFailed;
+        var sr = t.stream.reader(t.io, buf);
+        sr.interface.fillMore() catch |e| switch (e) {
+            error.EndOfStream => return 0,
+            error.ReadFailed => return readFailure(&sr),
+        };
+        return sr.interface.bufferedLen();
+    }
+
+    /// Distinguish a canceled wait from a genuine read failure. `Io.Reader`'s
+    /// error set cannot carry `Canceled`; the concrete reader records it here.
+    fn readFailure(sr: *std.Io.net.Stream.Reader) TransportError {
+        if (sr.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.TransportFailed;
+    }
+
+    /// The writer side of `readFailure`.
+    fn writeFailure(sw: *std.Io.net.Stream.Writer) TransportError {
+        if (sw.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.TransportFailed;
     }
 };
 
@@ -965,4 +998,53 @@ test "rx buffer is bounded: overflow is a typed error" {
 test "TcpTransport compiles (never dialed in tests)" {
     // Reference-only: forces semantic analysis of the std.Io.net adapter.
     std.testing.refAllDecls(TcpTransport);
+}
+
+// ── cancellation ─────────────────────────────────────────────────────────
+//
+// `Future.cancel` unblocks a thread parked in `TcpTransport.readSome`, but
+// only because `readSome` now routes through `std.Io.net.Stream.Reader`
+// instead of a raw `std.posix.read` (see the comment on `readSome`) — and
+// even then the reason is erased on the way out unless the concrete reader's
+// out-of-band `err` field is inspected first. This test runs against a
+// listener that accepts and then never writes, so the read really is parked
+// when the cancel arrives.
+
+fn acceptOne(server: *std.Io.net.Server, io: std.Io) std.Io.net.Server.AcceptError!std.Io.net.Stream {
+    return server.accept(io);
+}
+
+/// The blocking call under test, on its own thread so it can be canceled.
+fn readSomeOnce(t: *TcpTransport, buf: []u8) TransportError!usize {
+    return t.readSome(buf);
+}
+
+test "a canceled readSome surfaces Canceled, not TransportFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 0: an ephemeral port cannot collide with a parallel test run.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer server.deinit(io);
+
+    var accept_fut = try io.concurrent(acceptOne, .{ &server, io });
+    var t = TcpTransport.connect(io, server.socket.address) catch |err| {
+        if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer t.close();
+    var peer = try accept_fut.await(io);
+    defer peer.close(io);
+
+    var buf: [64]u8 = undefined;
+    var fut = try io.concurrent(readSomeOnce, .{ &t, &buf });
+    // Long enough that the read is certainly parked in the kernel.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }

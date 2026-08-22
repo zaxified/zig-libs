@@ -71,6 +71,7 @@ pub const Broker = broker.Broker;
 pub const Connection = broker.Connection;
 pub const BrokerConfig = broker.Config;
 pub const BrokerTransport = broker.Transport;
+pub const BrokerTransportError = broker.TransportError;
 pub const TcpServer = broker.TcpServer;
 
 // Optional authentication / ACL seam for the broker (default allow-all).

@@ -80,7 +80,11 @@ limitations have now been fixed:
   subscriber re-encode (which allocates a fresh packet id) always fits — no delivery can fail on
   buffer size at all. (With `min(publisher, granted)` QoS a delivered packet never exceeds the
   inbound one, so the failure now cannot arise from sizing; the containment guards residual
-  transport failures.)
+  transport failures.) `error.Canceled` — the fan-out thread itself being canceled through the
+  `std.Io` cancellation protocol, not a peer misbehaving — is deliberately **not** contained this
+  way: containing it would flag every remaining subscriber in this publish's target set as failed
+  and disconnect them for something none of them did. The fan-out loop instead releases its
+  reference on every target and aborts the publish.
 - **Session take-over closes the superseded socket.** *(FIX C)* `takeover` marks the old
   connection `.disconnected`, drops its routing state and now calls `Transport.close` (a socket
   *shutdown*, not a close) so a read loop blocked with `keep_alive_s == 0` wakes immediately and its
