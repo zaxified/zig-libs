@@ -45,8 +45,10 @@ switch (parsed.document) {
         _ = o.object_class;                 // .domain / .ip_network / .autnum / …
         _ = o.ldh_name;                     // + handle, status, nameservers, links…
         _ = o.eventDate("expiration");      // events by action
-        _ = o.entityWithRole("registrar");  // roles + jCard fn/org/email best-effort
+        const registrar = o.entityWithRole("registrar").?; // roles + jCard fn/org/email best-effort
+        _ = registrar.entityWithRole("abuse"); // an entity's own nested entities (RFC 9083 §5.1)
         _ = o.linkHref("related");          // registry → registrar link
+        _ = o.redacted;                     // GDPR disclosures (RFC 9537)
     },
     .rdap_error => |e| _ = e.error_code,    // RFC 7480 §5.3 typed error
 }
@@ -62,8 +64,15 @@ _ = rdap.bootstrapLookup(&b, "com"); // exact-key primitive
 // Client over the fetch seam ("GET url → status + body"); offline testable
 var client: rdap.Client = .{ .fetcher = my_fetcher, .gpa = gpa };
 var body_buf: [64 * 1024]u8 = undefined;
-var doc = try client.query("https://rdap.verisign.com/com/v1", .domain,
-    "example.com", .{ .follow_related = true }, &body_buf);
+var status: u16 = undefined; // filled only on error.HttpStatus; pass null to ignore
+var doc = client.query("https://rdap.verisign.com/com/v1", .domain,
+    "example.com", .{ .follow_related = true }, &body_buf, &status) catch |err| {
+    if (err == error.HttpStatus) {
+        // status now holds the real HTTP code, e.g. distinguish 429 (back off)
+        // from 500 (server error) — the one signal error.HttpStatus itself can't carry.
+    }
+    return err;
+};
 defer doc.deinit();
 
 // Optional real fetcher over our http.Client (the only network-touching code)
@@ -73,4 +82,6 @@ client.fetcher = hf.fetcher();
 
 HTTP 404 maps to `error.NotFound`; a non-2xx status with an RDAP error body
 returns the typed `rdap_error` document; non-2xx without one is
-`error.HttpStatus`. No test touches the network.
+`error.HttpStatus`, and `Client.query`'s `status_out` out-parameter carries
+the real HTTP status in that case (e.g. telling a 429 rate limit apart from a
+500 server error). No test touches the network.

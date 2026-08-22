@@ -12,10 +12,13 @@
 //!   `application/rdap+json` Accept header (RFC 7480 §4.2).
 //! - **Response model** (RFC 9083/7483): `parseResponse` maps the RDAP JSON
 //!   into a typed `Object` (class, handle, names, status, events, entities
-//!   with roles + best-effort jCard fn/org/email, nameservers, links,
-//!   notices/remarks, ip-network and autnum ranges) or a typed `RdapError`
-//!   (RFC 7480 §5.3). Servers vary wildly — missing, extra and wrong-typed
-//!   fields are tolerated everywhere; only malformed JSON errors out.
+//!   with roles + best-effort jCard fn/org/email + their own nested entities
+//!   (RFC 9083 §5.1, e.g. registrar → abuse contact, bounded by
+//!   `max_entity_depth`), nameservers with glue addresses, links,
+//!   notices/remarks, publicIds, GDPR `redacted` disclosures (RFC 9537),
+//!   ip-network and autnum ranges) or a typed `RdapError` (RFC 7480 §5.3).
+//!   Servers vary wildly — missing, extra and wrong-typed fields are
+//!   tolerated everywhere; only malformed JSON errors out.
 //! - **Bootstrap** (RFC 9224/7484): `parseBootstrap` reads an IANA bootstrap
 //!   registry file; `Bootstrap.lookupDomain` / `.lookupIp` / `.lookupAsn`
 //!   resolve the authoritative RDAP base URL (longest-match semantics),
@@ -141,6 +144,18 @@ pub const Event = struct {
     actor: ?[]const u8 = null,
 };
 
+/// Cap on how many `entities[].entities[]…` levels `mapEntities` will
+/// recurse into. RDAP nests entities to carry role-specific sub-contacts
+/// (registrar → abuse, RFC 9083 §5.1) — the real captured golden in
+/// `goldens.zig` nests exactly one level. Nothing on the wire bounds how
+/// deep a hostile or broken server could go, so this caps the *mapping*
+/// recursion `parseResponse` adds on top of `std.json`'s own tree. Matches
+/// this module's tolerant-parsing policy (see the module doc comment):
+/// entities nested past this depth are silently dropped rather than
+/// rejecting the whole response. 8 is generous for anything a real registry
+/// emits — matches the bound `devlink` uses for its own JSON-shaped nesting.
+pub const max_entity_depth: u32 = 8;
+
 /// One `entities[]` member (RFC 9083 §5.1) — handle + roles, plus a
 /// best-effort extraction of fn/org/email from the jCard `vcardArray`.
 pub const Entity = struct {
@@ -149,17 +164,67 @@ pub const Entity = struct {
     full_name: ?[]const u8 = null, // jCard "fn"
     org: ?[]const u8 = null, // jCard "org"
     email: ?[]const u8 = null, // jCard "email"
+    /// This entity's own `links[]` (RFC 9083 §4.2) — e.g. a "self" link to
+    /// its RDAP record, or "about" pointing at a sub-registrar's own RDAP API.
+    links: []const Link = &.{},
+    /// `publicIds[]` (RFC 9083 §4.8) — third-party identifiers, e.g. an
+    /// IANA Registrar ID.
+    public_ids: []const PublicId = &.{},
+    /// This entity's own nested `entities[]` — RDAP's shape for
+    /// role-specific sub-contacts (registrar → abuse, RFC 9083 §5.1).
+    /// Bounded to `max_entity_depth` levels; see its doc comment.
+    entities: []const Entity = &.{},
 
     pub fn hasRole(e: *const Entity, role: []const u8) bool {
         for (e.roles) |r| if (std.ascii.eqlIgnoreCase(r, role)) return true;
         return false;
     }
+
+    /// First entity directly nested under `e` (one level — `e.entities`,
+    /// not deeper) carrying `role`. Chain calls to go further, e.g.
+    /// `o.entityWithRole("registrar").?.entityWithRole("abuse")`.
+    pub fn entityWithRole(e: *const Entity, role: []const u8) ?*const Entity {
+        for (e.entities) |*sub| if (sub.hasRole(role)) return sub;
+        return null;
+    }
 };
 
-/// One `nameservers[]` member (RFC 9083 §5.2), names only.
+/// One `nameservers[]` member (RFC 9083 §5.2), names + optional glue
+/// addresses.
 pub const Nameserver = struct {
+    /// A nameserver is itself an RDAP object (RFC 9083 §5.2) and carries its
+    /// own `handle` — distinct from the containing domain's `handle`.
+    handle: ?[]const u8 = null,
     ldh_name: ?[]const u8 = null,
     unicode_name: ?[]const u8 = null,
+    /// `ipAddresses.v4` — glue A records, when the server includes them.
+    ipv4_addresses: []const []const u8 = &.{},
+    /// `ipAddresses.v6` — glue AAAA records.
+    ipv6_addresses: []const []const u8 = &.{},
+    status: []const []const u8 = &.{},
+};
+
+/// One `publicIds[]` member (RFC 9083 §4.8) — a third-party identifier for
+/// the object, e.g. an IANA Registrar ID on an entity.
+pub const PublicId = struct {
+    /// The JSON "type" member — named `id_type` because `type` is reserved
+    /// in Zig.
+    id_type: []const u8 = "",
+    identifier: []const u8 = "",
+};
+
+/// One `redacted[]` member (RFC 9537) — which field(s) a privacy policy
+/// (typically GDPR) removed or altered, and how.
+pub const Redacted = struct {
+    /// `name.type` when present (a registry-defined label, e.g. "Registry
+    /// Domain ID"), else `name.description` (free text) — RFC 9537 §3
+    /// requires exactly one of the two on `name`.
+    name: ?[]const u8 = null,
+    pre_path: ?[]const u8 = null, // JSONPath of the affected field(s)
+    post_path: ?[]const u8 = null,
+    replacement_path: ?[]const u8 = null,
+    path_lang: ?[]const u8 = null, // default "jsonpath" when absent
+    method: ?[]const u8 = null, // "removal" / "emptyValue" / "partialValue" / "referenceRemoval"
 };
 
 /// One `links[]` member (RFC 9083 §4.2). Entries without an `href` are
@@ -189,6 +254,9 @@ pub const RdapError = struct {
 /// object classes; unused members stay at their defaults. All slices are
 /// owned by the surrounding `Parsed` arena.
 pub const Object = struct {
+    /// `rdapConformance[]` (RFC 9083 §4.1) — extension tags the server
+    /// claims support for, e.g. `"redacted"` when `redacted` below is used.
+    rdap_conformance: []const []const u8 = &.{},
     object_class: ObjectClass = .other,
     object_class_name: []const u8 = "",
     handle: ?[]const u8 = null,
@@ -214,6 +282,11 @@ pub const Object = struct {
     notices: []const Notice = &.{},
     remarks: []const Notice = &.{},
     port43: ?[]const u8 = null,
+    /// `publicIds[]` (RFC 9083 §4.8) — third-party identifiers for this
+    /// object.
+    public_ids: []const PublicId = &.{},
+    /// `redacted[]` (RFC 9537) — GDPR/privacy redaction disclosures.
+    redacted: []const Redacted = &.{},
 
     /// `eventDate` of the first event with this action
     /// (ASCII case-insensitive), e.g. "registration", "expiration".
@@ -306,6 +379,14 @@ fn getStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+fn getObj(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .object => |o| o,
+        else => null,
+    };
+}
+
 fn dupField(
     a: std.mem.Allocator,
     obj: std.json.ObjectMap,
@@ -356,6 +437,7 @@ fn mapError(a: std.mem.Allocator, obj: std.json.ObjectMap) error{OutOfMemory}!Rd
 
 fn mapObject(a: std.mem.Allocator, obj: std.json.ObjectMap) error{OutOfMemory}!Object {
     var o: Object = .{};
+    o.rdap_conformance = try strListField(a, obj, "rdapConformance");
     if (getStr(obj, "objectClassName")) |s| {
         o.object_class_name = try a.dupe(u8, s);
         o.object_class = classFromName(s);
@@ -373,11 +455,13 @@ fn mapObject(a: std.mem.Allocator, obj: std.json.ObjectMap) error{OutOfMemory}!O
     o.port43 = try dupField(a, obj, "port43");
     o.status = try strListField(a, obj, "status");
     o.events = try mapEvents(a, obj.get("events"));
-    o.entities = try mapEntities(a, obj.get("entities"));
+    o.entities = try mapEntities(a, obj.get("entities"), 0);
     o.nameservers = try mapNameservers(a, obj.get("nameservers"));
     o.links = try mapLinks(a, obj.get("links"));
     o.notices = try mapNotices(a, obj.get("notices"));
     o.remarks = try mapNotices(a, obj.get("remarks"));
+    o.public_ids = try mapPublicIds(a, obj.get("publicIds"));
+    o.redacted = try mapRedacted(a, obj.get("redacted"));
     return o;
 }
 
@@ -398,7 +482,15 @@ fn mapEvents(a: std.mem.Allocator, v_opt: ?std.json.Value) error{OutOfMemory}![]
     return try list.toOwnedSlice(a);
 }
 
-fn mapEntities(a: std.mem.Allocator, v_opt: ?std.json.Value) error{OutOfMemory}![]const Entity {
+/// `depth` is the number of `entities[].entities[]…` hops already taken to
+/// reach this call (0 at the top level); recursion stops silently past
+/// `max_entity_depth` — see its doc comment for why that is a drop, not an
+/// error.
+fn mapEntities(
+    a: std.mem.Allocator,
+    v_opt: ?std.json.Value,
+    depth: u32,
+) error{OutOfMemory}![]const Entity {
     const arr = arrayOf(v_opt) orelse return &.{};
     var list: std.ArrayList(Entity) = .empty;
     for (arr.items) |item| {
@@ -409,9 +501,56 @@ fn mapEntities(a: std.mem.Allocator, v_opt: ?std.json.Value) error{OutOfMemory}!
         var ent: Entity = .{
             .handle = try dupField(a, eo, "handle"),
             .roles = try strListField(a, eo, "roles"),
+            .links = try mapLinks(a, eo.get("links")),
+            .public_ids = try mapPublicIds(a, eo.get("publicIds")),
         };
         if (eo.get("vcardArray")) |vc| try extractVcard(a, vc, &ent);
+        if (depth < max_entity_depth) {
+            ent.entities = try mapEntities(a, eo.get("entities"), depth + 1);
+        }
         try list.append(a, ent);
+    }
+    return try list.toOwnedSlice(a);
+}
+
+/// Shared by `Object.public_ids` and `Entity.public_ids`.
+fn mapPublicIds(a: std.mem.Allocator, v_opt: ?std.json.Value) error{OutOfMemory}![]const PublicId {
+    const arr = arrayOf(v_opt) orelse return &.{};
+    var list: std.ArrayList(PublicId) = .empty;
+    for (arr.items) |item| {
+        const po = switch (item) {
+            .object => |x| x,
+            else => continue,
+        };
+        try list.append(a, .{
+            .id_type = if (getStr(po, "type")) |s| try a.dupe(u8, s) else "",
+            .identifier = if (getStr(po, "identifier")) |s| try a.dupe(u8, s) else "",
+        });
+    }
+    return try list.toOwnedSlice(a);
+}
+
+fn mapRedacted(a: std.mem.Allocator, v_opt: ?std.json.Value) error{OutOfMemory}![]const Redacted {
+    const arr = arrayOf(v_opt) orelse return &.{};
+    var list: std.ArrayList(Redacted) = .empty;
+    for (arr.items) |item| {
+        const ro = switch (item) {
+            .object => |x| x,
+            else => continue,
+        };
+        var name: ?[]const u8 = null;
+        if (getObj(ro, "name")) |n| {
+            name = try dupField(a, n, "type");
+            if (name == null) name = try dupField(a, n, "description");
+        }
+        try list.append(a, .{
+            .name = name,
+            .pre_path = try dupField(a, ro, "prePath"),
+            .post_path = try dupField(a, ro, "postPath"),
+            .replacement_path = try dupField(a, ro, "replacementPath"),
+            .path_lang = try dupField(a, ro, "pathLang"),
+            .method = try dupField(a, ro, "method"),
+        });
     }
     return try list.toOwnedSlice(a);
 }
@@ -473,9 +612,14 @@ fn mapNameservers(
             .object => |x| x,
             else => continue,
         };
+        const ip_obj = getObj(no, "ipAddresses");
         try list.append(a, .{
+            .handle = try dupField(a, no, "handle"),
             .ldh_name = try dupField(a, no, "ldhName"),
             .unicode_name = try dupField(a, no, "unicodeName"),
+            .status = try strListField(a, no, "status"),
+            .ipv4_addresses = if (ip_obj) |io| try strListField(a, io, "v4") else &.{},
+            .ipv6_addresses = if (ip_obj) |io| try strListField(a, io, "v6") else &.{},
         });
     }
     return try list.toOwnedSlice(a);
@@ -741,7 +885,9 @@ pub const Client = struct {
         error{
             /// HTTP 404 — the queried object does not exist (RFC 7480 §5.3).
             NotFound,
-            /// Non-2xx status without a parseable RDAP error body.
+            /// Non-2xx status without a parseable RDAP error body. `query`'s
+            /// `status_out` parameter carries the actual status code, since
+            /// this error itself cannot.
             HttpStatus,
         };
 
@@ -757,6 +903,17 @@ pub const Client = struct {
     /// the per-response byte cap (reused for the optional related-link hop —
     /// safe, because `Parsed` owns arena copies of everything). Returns a
     /// `Parsed` the caller must `deinit`.
+    ///
+    /// `status_out`, if non-null, is filled with the HTTP status of the
+    /// *primary* fetch when (and only when) `query` returns
+    /// `error.HttpStatus` — a non-2xx response without a parseable RDAP
+    /// error body, e.g. a bare 429 or 500 from a proxy in front of the
+    /// registry. Without it a caller cannot tell a rate limit from a server
+    /// error and so cannot implement backoff. The (rare, best-effort)
+    /// related-link hop never writes to it: a failed hop already falls back
+    /// to the first document silently, and reporting that hop's status
+    /// through the same out-pointer would misattribute it to the query the
+    /// caller actually asked about.
     pub fn query(
         c: *Client,
         base_url: []const u8,
@@ -764,10 +921,11 @@ pub const Client = struct {
         value: []const u8,
         options: QueryOptions,
         body_buf: []u8,
+        status_out: ?*u16,
     ) QueryError!Parsed {
         var url_buf: [max_url_len]u8 = undefined;
         const url = try buildUrl(&url_buf, base_url, query_type, value);
-        var parsed = try c.fetchAndParse(url, body_buf);
+        var parsed = try c.fetchAndParse(url, body_buf, status_out);
         if (!options.follow_related) return parsed;
 
         const related_opt: ?[]const u8 = switch (parsed.document) {
@@ -778,22 +936,26 @@ pub const Client = struct {
         if (!isHttpUrl(related)) return parsed;
         const related_url = http.Url.parse(related) catch return parsed;
         if (isSpecialUseHost(related_url.host)) return parsed; // SSRF guard
-        const followed = c.fetchAndParse(related, body_buf) catch return parsed;
+        const followed = c.fetchAndParse(related, body_buf, null) catch return parsed;
         parsed.deinit();
         return followed;
     }
 
-    fn fetchAndParse(c: *Client, url: []const u8, body_buf: []u8) QueryError!Parsed {
+    fn fetchAndParse(c: *Client, url: []const u8, body_buf: []u8, status_out: ?*u16) QueryError!Parsed {
         const res = try c.fetcher.fetch(url, body_buf);
         if (res.status == 404) return error.NotFound;
         const failure = res.status < 200 or res.status >= 300;
         var parsed = parseResponse(c.gpa, res.body) catch |err| {
-            if (err != error.OutOfMemory and failure) return error.HttpStatus;
+            if (err != error.OutOfMemory and failure) {
+                if (status_out) |so| so.* = res.status;
+                return error.HttpStatus;
+            }
             return err;
         };
         if (failure and parsed.document != .rdap_error) {
             // A failure status must carry an RDAP error body to be typed.
             parsed.deinit();
+            if (status_out) |so| so.* = res.status;
             return error.HttpStatus;
         }
         return parsed;
@@ -1200,8 +1362,14 @@ test "parse: wrong-typed members degrade to defaults (never panic)" {
         \\  "ldhName": 7,
         \\  "status": 42,
         \\  "events": "nope",
-        \\  "entities": [7, {"roles": {"a": 1}, "vcardArray": ["vcard", "oops"]}],
-        \\  "nameservers": [null],
+        \\  "rdapConformance": "nope",
+        \\  "publicIds": "nope",
+        \\  "redacted": [{"name": "not-an-object"}, "junk", {"prePath": 5}],
+        \\  "entities": [7, {
+        \\    "roles": {"a": 1}, "vcardArray": ["vcard", "oops"],
+        \\    "entities": "not-an-array", "links": "nope", "publicIds": "nope"
+        \\  }],
+        \\  "nameservers": [null, {"objectClassName": "nameserver", "ipAddresses": "oops"}],
         \\  "links": [{"rel": "self"}, "junk"],
         \\  "notices": [{"description": "not-an-array"}],
         \\  "startAutnum": "12x",
@@ -1215,15 +1383,179 @@ test "parse: wrong-typed members degrade to defaults (never panic)" {
     try testing.expect(o.ldh_name == null);
     try testing.expectEqual(@as(usize, 0), o.status.len);
     try testing.expectEqual(@as(usize, 0), o.events.len);
+    try testing.expectEqual(@as(usize, 0), o.rdap_conformance.len);
+    try testing.expectEqual(@as(usize, 0), o.public_ids.len);
+    // A non-object entry and a wrong-typed "name" are dropped; an object
+    // with an unusable "name" (wrong type on both type/description) still
+    // survives as a redacted entry with name == null.
+    try testing.expectEqual(@as(usize, 2), o.redacted.len);
+    try testing.expect(o.redacted[0].name == null);
+    try testing.expect(o.redacted[1].pre_path == null); // prePath: 5 is not a string
     try testing.expectEqual(@as(usize, 1), o.entities.len); // the object survives
     try testing.expectEqual(@as(usize, 0), o.entities[0].roles.len);
     try testing.expect(o.entities[0].email == null);
-    try testing.expectEqual(@as(usize, 0), o.nameservers.len);
+    try testing.expectEqual(@as(usize, 0), o.entities[0].entities.len); // "not-an-array" → empty, not a panic
+    try testing.expectEqual(@as(usize, 0), o.entities[0].links.len);
+    try testing.expectEqual(@as(usize, 0), o.entities[0].public_ids.len);
+    try testing.expectEqual(@as(usize, 1), o.nameservers.len); // null entry dropped, object entry survives
+    try testing.expectEqual(@as(usize, 0), o.nameservers[0].ipv4_addresses.len); // "ipAddresses": "oops" → empty
+    try testing.expectEqual(@as(usize, 0), o.nameservers[0].ipv6_addresses.len);
     try testing.expectEqual(@as(usize, 0), o.links.len); // no href → dropped
     try testing.expectEqual(@as(usize, 1), o.notices.len);
     try testing.expectEqual(@as(usize, 0), o.notices[0].description.len);
     try testing.expect(o.start_autnum == null);
     try testing.expect(o.port43 == null);
+}
+
+test "parse: nested entities (RFC 9083 §5.1 registrar → abuse contact)" {
+    const json =
+        \\{
+        \\  "objectClassName": "domain",
+        \\  "entities": [
+        \\    {
+        \\      "objectClassName": "entity",
+        \\      "handle": "REGISTRAR-1",
+        \\      "roles": ["registrar"],
+        \\      "links": [
+        \\        {"rel": "self", "href": "https://rdap.example/entity/REGISTRAR-1"}
+        \\      ],
+        \\      "entities": [
+        \\        {
+        \\          "objectClassName": "entity",
+        \\          "roles": ["abuse"],
+        \\          "vcardArray": ["vcard", [
+        \\            ["email", {}, "text", "abuse@registrar.example"]
+        \\          ]]
+        \\        },
+        \\        {
+        \\          "objectClassName": "entity",
+        \\          "roles": ["technical"]
+        \\        }
+        \\      ]
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed = try parseResponse(testing.allocator, json);
+    defer parsed.deinit();
+    const o = &parsed.document.object;
+
+    const registrar = o.entityWithRole("registrar").?;
+    try testing.expectEqual(@as(usize, 1), registrar.links.len);
+    try testing.expectEqualStrings(
+        "https://rdap.example/entity/REGISTRAR-1",
+        registrar.links[0].href,
+    );
+    try testing.expectEqual(@as(usize, 2), registrar.entities.len);
+    const abuse = registrar.entityWithRole("abuse").?;
+    try testing.expectEqualStrings("abuse@registrar.example", abuse.email.?);
+    try testing.expectEqual(@as(usize, 0), abuse.entities.len);
+    try testing.expect(registrar.entityWithRole("technical") != null);
+    try testing.expect(registrar.entityWithRole("billing") == null);
+    // Object.entityWithRole only searches the top level — it does not reach
+    // through nested entities on its own; chaining is the caller's job.
+    try testing.expect(o.entityWithRole("abuse") == null);
+}
+
+test "parse: entities nested past max_entity_depth are dropped, not an error (tolerant policy)" {
+    // hop-h entities are wrapped one level deeper than hop-(h-1); a sentinel
+    // "BOTTOM" object several hops past max_entity_depth checks that the
+    // parser simply stops descending there rather than rejecting the whole
+    // response (this module's tolerant-parsing policy — see the module doc
+    // comment).
+    const levels = max_entity_depth + 3;
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("{\"objectClassName\":\"domain\",\"entities\":[");
+    for (0..levels) |i| {
+        try w.print("{{\"objectClassName\":\"entity\",\"handle\":\"L{d}\",\"entities\":[", .{i});
+    }
+    try w.writeAll("{\"objectClassName\":\"entity\",\"handle\":\"BOTTOM\"}");
+    for (0..levels) |_| try w.writeAll("]}");
+    try w.writeAll("]}");
+
+    var parsed = try parseResponse(testing.allocator, w.buffered());
+    defer parsed.deinit();
+    const o = &parsed.document.object;
+
+    var cur: *const Entity = &o.entities[0];
+    try testing.expectEqualStrings("L0", cur.handle.?);
+    var hops: usize = 0;
+    while (cur.entities.len > 0) {
+        cur = &cur.entities[0];
+        hops += 1;
+    }
+    try testing.expectEqual(@as(usize, max_entity_depth), hops);
+    var name_buf: [8]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&name_buf, "L{d}", .{max_entity_depth});
+    try testing.expectEqualStrings(expected, cur.handle.?);
+}
+
+test "parse: rdapConformance[] (RFC 9083 §4.1), publicIds[] (§4.8), redacted[] (RFC 9537)" {
+    const json =
+        \\{
+        \\  "rdapConformance": ["rdap_level_0", "redacted"],
+        \\  "objectClassName": "domain",
+        \\  "publicIds": [{"type": "Some Registry ID", "identifier": "XYZ-1"}],
+        \\  "redacted": [
+        \\    {
+        \\      "name": {"type": "Registrant Name"},
+        \\      "prePath": "$.entities[?(@.roles[0]=='registrant')]",
+        \\      "method": "removal"
+        \\    },
+        \\    {
+        \\      "name": {"description": "custom label"},
+        \\      "postPath": "$.foo",
+        \\      "pathLang": "jsonpath",
+        \\      "method": "emptyValue"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed = try parseResponse(testing.allocator, json);
+    defer parsed.deinit();
+    const o = &parsed.document.object;
+
+    try testing.expectEqual(@as(usize, 2), o.rdap_conformance.len);
+    try testing.expectEqualStrings("redacted", o.rdap_conformance[1]);
+
+    try testing.expectEqual(@as(usize, 1), o.public_ids.len);
+    try testing.expectEqualStrings("Some Registry ID", o.public_ids[0].id_type);
+    try testing.expectEqualStrings("XYZ-1", o.public_ids[0].identifier);
+
+    try testing.expectEqual(@as(usize, 2), o.redacted.len);
+    try testing.expectEqualStrings("Registrant Name", o.redacted[0].name.?);
+    try testing.expectEqualStrings("removal", o.redacted[0].method.?);
+    // "name.description" is the fallback when "name.type" is absent.
+    try testing.expectEqualStrings("custom label", o.redacted[1].name.?);
+    try testing.expectEqualStrings("$.foo", o.redacted[1].post_path.?);
+    try testing.expectEqualStrings("emptyValue", o.redacted[1].method.?);
+}
+
+test "parse: nameserver ipAddresses.v4/v6 (RFC 9083 §5.2 glue addresses)" {
+    const json =
+        \\{
+        \\  "objectClassName": "domain",
+        \\  "nameservers": [
+        \\    {
+        \\      "objectClassName": "nameserver",
+        \\      "ldhName": "ns1.example.com",
+        \\      "ipAddresses": {"v4": ["192.0.2.1"], "v6": ["2001:db8::1", "2001:db8::2"]}
+        \\    },
+        \\    {"objectClassName": "nameserver", "ldhName": "ns2.example.com"}
+        \\  ]
+        \\}
+    ;
+    var parsed = try parseResponse(testing.allocator, json);
+    defer parsed.deinit();
+    const o = &parsed.document.object;
+
+    try testing.expectEqual(@as(usize, 1), o.nameservers[0].ipv4_addresses.len);
+    try testing.expectEqualStrings("192.0.2.1", o.nameservers[0].ipv4_addresses[0]);
+    try testing.expectEqual(@as(usize, 2), o.nameservers[0].ipv6_addresses.len);
+    try testing.expectEqualStrings("2001:db8::2", o.nameservers[0].ipv6_addresses[1]);
+    try testing.expectEqual(@as(usize, 0), o.nameservers[1].ipv4_addresses.len);
+    try testing.expectEqual(@as(usize, 0), o.nameservers[1].ipv6_addresses.len);
 }
 
 test "bootstrap: DNS registry KAT (RFC 9224 shape)" {
@@ -1393,6 +1725,7 @@ test "client: end-to-end domain query via canned fetch" {
         "example.com",
         .{},
         &buf,
+        null,
     );
     defer parsed.deinit();
 
@@ -1418,35 +1751,56 @@ test "client: 404 → NotFound; other failures typed or HttpStatus" {
         .{ .url = "https://r.example/domain/bad.example", .status = 400, .body = err_body },
         .{ .url = "https://r.example/domain/broken.example", .status = 500, .body = "<html>oops" },
         .{ .url = "https://r.example/domain/weird.example", .status = 403, .body = "{}" },
+        .{ .url = "https://r.example/domain/limited.example", .status = 429, .body = "{}" },
     } };
     var client: Client = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
     var buf: [1024]u8 = undefined;
 
     try testing.expectError(
         error.NotFound,
-        client.query("https://r.example", .domain, "gone.example", .{}, &buf),
+        client.query("https://r.example", .domain, "gone.example", .{}, &buf, null),
     );
 
     // Failure status + RDAP error body → typed rdap_error document.
-    var parsed = try client.query("https://r.example", .domain, "bad.example", .{}, &buf);
+    var parsed = try client.query("https://r.example", .domain, "bad.example", .{}, &buf, null);
     defer parsed.deinit();
     try testing.expectEqual(@as(i64, 400), parsed.document.rdap_error.error_code);
     try testing.expectEqualStrings("Bad Request", parsed.document.rdap_error.title.?);
 
-    // Failure status + unparseable body → HttpStatus.
+    // Failure status + unparseable body → HttpStatus, and status_out carries the
+    // real HTTP status (500) — the signal a caller needs to tell a server error
+    // from a rate limit, which the bare error variant cannot carry.
+    var status: u16 = 0;
     try testing.expectError(
         error.HttpStatus,
-        client.query("https://r.example", .domain, "broken.example", .{}, &buf),
+        client.query("https://r.example", .domain, "broken.example", .{}, &buf, &status),
     );
-    // Failure status + JSON that is not an RDAP error → HttpStatus (no leak).
+    try testing.expectEqual(@as(u16, 500), status);
+
+    // Failure status + JSON that is not an RDAP error → HttpStatus (no leak),
+    // status_out still carries the real code (403, distinct from the 500 above).
+    status = 0;
     try testing.expectError(
         error.HttpStatus,
-        client.query("https://r.example", .domain, "weird.example", .{}, &buf),
+        client.query("https://r.example", .domain, "weird.example", .{}, &buf, &status),
     );
+    try testing.expectEqual(@as(u16, 403), status);
+
+    // The motivating case: 429 (rate limit) is distinguishable from 500
+    // (server error) purely from status_out — this is the signal a caller
+    // needs to implement backoff, which this module otherwise has no
+    // client-side rate limiting of its own to provide.
+    status = 0;
+    try testing.expectError(
+        error.HttpStatus,
+        client.query("https://r.example", .domain, "limited.example", .{}, &buf, &status),
+    );
+    try testing.expectEqual(@as(u16, 429), status);
+
     // Unknown URL → transport failure.
     try testing.expectError(
         error.FetchFailed,
-        client.query("https://other.example", .domain, "x.example", .{}, &buf),
+        client.query("https://other.example", .domain, "x.example", .{}, &buf, null),
     );
 }
 
@@ -1472,6 +1826,7 @@ test "client: follows one related link (registry → registrar)" {
         "example.com",
         .{ .follow_related = true },
         &buf,
+        null,
     );
     defer parsed.deinit();
 
@@ -1500,6 +1855,7 @@ test "client: failed related hop falls back to the first document" {
         "example.com",
         .{ .follow_related = true },
         &buf,
+        null,
     );
     defer parsed.deinit();
 
@@ -1563,6 +1919,7 @@ test "client: related link at a loopback host is refused, falls back to the firs
         "example.com",
         .{ .follow_related = true },
         &buf,
+        null,
     );
     defer parsed.deinit();
 
@@ -1594,6 +1951,7 @@ test "client: related link at a private (RFC 1918) host is refused" {
         "example.com",
         .{ .follow_related = true },
         &buf,
+        null,
     );
     defer parsed.deinit();
 

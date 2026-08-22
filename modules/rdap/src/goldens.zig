@@ -11,11 +11,13 @@
 //! about what "typical" RDAP JSON looks like. A real registry's response
 //! carries operational details no one would think to hand-author: ICANN's
 //! GDPR "redacted" extension (an entire top-level array naming which fields
-//! were stripped and why), nested `entities` inside an `entities` member
-//! (registrar → abuse contact), a `publicIds` array this module doesn't
-//! model at all, and a top-level object with NO `handle` member (redacted
-//! away) — none of which the hand-typed `domain_json` KAT in `root.zig`
-//! exercises, because it was written to be complete rather than real.
+//! were stripped and why, RFC 9537), nested `entities` inside an `entities`
+//! member (registrar → abuse contact), a `publicIds` array, and a top-level
+//! object with NO `handle` member (redacted away) — none of which the
+//! hand-typed `domain_json` KAT in `root.zig` exercises, because it was
+//! written to be complete rather than real. All four are modeled now
+//! (`Entity.entities`, `Object.redacted`, `Object`/`Entity.public_ids`,
+//! `Object.handle` staying `null`) — this fixture is what found the gaps.
 //!
 //! ## Capture recipe
 //!
@@ -331,6 +333,17 @@ test "golden: real iana.org RDAP response (Public Interest Registry, 2026-08-01)
     // exercise.
     try testing.expect(o.handle == null);
 
+    // rdapConformance (RFC 9083 §4.1) names the "redacted" extension the
+    // registry actually used above.
+    try testing.expectEqual(@as(usize, 4), o.rdap_conformance.len);
+    try testing.expectEqualStrings("redacted", o.rdap_conformance[3]);
+
+    // redacted[] (RFC 9537) — the disclosure for the handle removal above.
+    try testing.expectEqual(@as(usize, 1), o.redacted.len);
+    try testing.expectEqualStrings("Registry Domain ID", o.redacted[0].name.?);
+    try testing.expectEqualStrings("$.handle", o.redacted[0].pre_path.?);
+    try testing.expectEqualStrings("removal", o.redacted[0].method.?);
+
     try testing.expectEqual(@as(usize, 3), o.status.len);
     try testing.expectEqualStrings("server delete prohibited", o.status[0]);
     try testing.expectEqualStrings("server transfer prohibited", o.status[1]);
@@ -347,17 +360,46 @@ test "golden: real iana.org RDAP response (Public Interest Registry, 2026-08-01)
     try testing.expectEqualStrings("a.iana-servers.net", o.nameservers[1].ldh_name.?);
     try testing.expectEqualStrings("b.iana-servers.net", o.nameservers[2].ldh_name.?);
     try testing.expectEqualStrings("c.iana-servers.net", o.nameservers[3].ldh_name.?);
+    // Only the first nameserver carries glue addresses (RFC 9083 §5.2
+    // ipAddresses) in this capture; the other three have none.
+    try testing.expectEqual(@as(usize, 1), o.nameservers[0].ipv4_addresses.len);
+    try testing.expectEqualStrings("199.4.138.53", o.nameservers[0].ipv4_addresses[0]);
+    try testing.expectEqual(@as(usize, 1), o.nameservers[0].ipv6_addresses.len);
+    try testing.expectEqualStrings("2001:500:89::53", o.nameservers[0].ipv6_addresses[0]);
+    try testing.expectEqual(@as(usize, 0), o.nameservers[1].ipv4_addresses.len);
+    // A nameserver is itself an RDAP object (RFC 9083 §5.2) — it carries its
+    // own handle, distinct from the domain's.
+    try testing.expectEqualStrings(
+        "3e8d4ce66df346d29017385432feb76f-LROR",
+        o.nameservers[0].handle.?,
+    );
+    try testing.expectEqual(@as(usize, 1), o.nameservers[0].status.len);
+    try testing.expectEqualStrings("associated", o.nameservers[0].status[0]);
 
-    // Only the TOP-LEVEL entities array is mapped (one entry: the
-    // registrar) — the registrar's own nested "entities" (its abuse
-    // contact) is not flattened into o.entities. That is this module's
-    // documented one-level scope, not a bug; asserted explicitly here so a
-    // future change to that scope is a deliberate, visible decision.
+    // The top-level entities array has one entry (the registrar); its own
+    // nested "entities" (the abuse contact, RFC 9083 §5.1) is now carried on
+    // Entity.entities rather than being dropped.
     try testing.expectEqual(@as(usize, 1), o.entities.len);
     const registrar = o.entityWithRole("registrar").?;
     try testing.expectEqualStrings("299", registrar.handle.?);
     try testing.expectEqualStrings("CSC Corporate Domains, Inc.", registrar.full_name.?);
     try testing.expect(registrar.email == null); // email lives on the NESTED abuse entity, not here
+
+    // publicIds (RFC 9083 §4.8) on the registrar entity: the IANA Registrar ID.
+    try testing.expectEqual(@as(usize, 1), registrar.public_ids.len);
+    try testing.expectEqualStrings("IANA Registrar ID", registrar.public_ids[0].id_type);
+    try testing.expectEqualStrings("299", registrar.public_ids[0].identifier);
+
+    // The registrar's own links (RFC 9083 §4.2): "self" + "about".
+    try testing.expectEqual(@as(usize, 2), registrar.links.len);
+
+    // The nested abuse contact — this is the gap that made this fixture
+    // worth capturing in the first place: it is unreachable without
+    // Entity.entities.
+    try testing.expectEqual(@as(usize, 1), registrar.entities.len);
+    const abuse = registrar.entityWithRole("abuse").?;
+    try testing.expectEqualStrings("domainabuse@cscglobal.com", abuse.email.?);
+    try testing.expectEqual(@as(usize, 0), abuse.entities.len); // no further nesting in this capture
 
     try testing.expectEqualStrings(
         "https://rdap.publicinterestregistry.org/rdap/domain/iana.org",
