@@ -4,7 +4,9 @@
 //! `ssh` module (userauth/RFC 4252 and channels/RFC 4254 are later parts,
 //! stubbed in `root.zig` but not implemented here).
 //!
-//! Implements: version exchange (§4.2), KEXINIT negotiation (§7.1),
+//! Implements: version exchange (§4.2), KEXINIT negotiation (§7.1) including
+//! RFC 8308 extension negotiation (`ext-info-c` and SSH_MSG_EXT_INFO's
+//! `server-sig-algs`, kept on `Transport.server_sig_algs`),
 //! curve25519-sha256 (RFC 8731) key exchange, the RFC 4253 §6 Binary Packet
 //! Protocol, RFC 4253 §7.2 key derivation, and the two ciphers
 //! `chacha20-poly1305@openssh.com` (OpenSSH `PROTOCOL.chacha20poly1305`) and
@@ -111,6 +113,157 @@ pub const mac_algorithms = [_][]const u8{
 pub const compression_algorithms = [_][]const u8{
     "none",
 };
+
+// ── RFC 8308 extension negotiation ─────────────────────────────────────────
+
+/// RFC 8308 §2.1 indicator a CLIENT appends to its KEXINIT `kex_algorithms`
+/// to say "I will accept SSH_MSG_EXT_INFO from you".
+pub const ext_info_c = "ext-info-c";
+
+/// RFC 8308 §2.1 indicator a SERVER appends to its KEXINIT `kex_algorithms`.
+/// The two names differ precisely so that neither can ever be *negotiated* as
+/// a key-exchange method (§2.2: if one were, "the parties MUST disconnect").
+/// Here that is structural rather than checked: `kex_algorithms` above — the
+/// list `negotiate` and its server-side mirror actually match against —
+/// contains neither name, and the indicator is appended only while ENCODING
+/// our KEXINIT (`offeredKexAlgorithms`). The test "the RFC 8308 indicators are
+/// never negotiable" pins that.
+pub const ext_info_s = "ext-info-s";
+
+/// The public-key SIGNATURE algorithms this module can verify in an RFC 4252
+/// §7 `publickey` request — i.e. exactly what a server here may advertise in
+/// RFC 8308 §3.1 `server-sig-algs`.
+///
+/// Deliberately NOT `server_host_key_algorithms`, which happens to hold the
+/// same four names for a different reason (which HOST keys a client will
+/// accept during KEX). The single source of truth for "can this be verified"
+/// is `keyBlobTypeFor` + `verifySignature`, and the test "server-sig-algs
+/// names exactly what the verifier accepts" ties this list to them in both
+/// directions, so adding an algorithm to one without the other fails the
+/// build's test step rather than putting a name on the wire that the server
+/// would then reject.
+///
+/// Ordered strongest-hash-first for the one key type where the name does not
+/// determine the key (`ssh-rsa` blobs are signed either `rsa-sha2-512` or
+/// `rsa-sha2-256`): a client picking from this list gets SHA-512. RFC 8308
+/// §3.1 attaches no meaning to the order on the wire.
+pub const public_key_algorithms = [_][]const u8{
+    "ssh-ed25519",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+    "ecdsa-sha2-nistp256",
+};
+
+/// Our own KEXINIT `kex_algorithms` name-list with the RFC 8308 §2.1
+/// indicator for `role` appended, written into `out` (which must hold
+/// `kex_algorithms.len + 1` entries).
+///
+/// Sending the indicator is what makes this side "prepared to accept an
+/// SSH_MSG_EXT_INFO message from the peer" (§2.2) — so both `clientHandshake`
+/// and `server.serverHandshake` must actually handle one after it, which they
+/// do in `Transport.requestService` / `userauth.awaitAuthReply` (client) and
+/// by ignoring an unsolicited one (server).
+pub fn offeredKexAlgorithms(out: *[kex_algorithms.len + 1][]const u8, role: enum { client, server }) []const []const u8 {
+    @memcpy(out[0..kex_algorithms.len], &kex_algorithms);
+    out[kex_algorithms.len] = switch (role) {
+        .client => ext_info_c,
+        .server => ext_info_s,
+    };
+    return out[0..];
+}
+
+/// Did the peer's KEXINIT `kex_algorithms` carry `indicator` (RFC 8308 §2.1)?
+///
+/// The gate on sending SSH_MSG_EXT_INFO at all: §2.2 permits it only to a peer
+/// that advertised the indicator for its own role, and such a peer must see
+/// NOTHING otherwise — not an empty EXT_INFO — because to it message 7 is an
+/// unknown transport message. Callers pass the indicator for the peer's role,
+/// never their own: a server looks for `ext_info_c`.
+///
+/// Exact name comparison, not a prefix or substring one — `ext-info-c` and
+/// `ext-info-s` share eight characters and differ only in the one that decides
+/// the role.
+pub fn offersExtInfo(peer_kex_algorithms: []const []const u8, indicator: []const u8) bool {
+    for (peer_kex_algorithms) |name| {
+        if (std.mem.eql(u8, name, indicator)) return true;
+    }
+    return false;
+}
+
+/// RFC 8308 §3.1 `server-sig-algs`, as a client keeps it: the peer's name-list
+/// reduced, at parse time, to which of OUR `public_key_algorithms` the server
+/// said it accepts.
+///
+/// Reducing on receipt rather than storing the raw list is what lets this be
+/// a plain value on `Transport` with no allocator and no lifetime: OpenSSH's
+/// own `server-sig-algs` is ~600 bytes of names (certificate and FIDO key
+/// types this module cannot sign with at all), and every one of them that is
+/// not in `public_key_algorithms` is information a client here can do nothing
+/// with. Nothing is truncated — an unrecognized name is *decided about*, not
+/// dropped for lack of room (RFC 8308 §2.5: "MUST ignore unrecognized").
+pub const ServerSigAlgs = struct {
+    accepted: [public_key_algorithms.len]bool = @splat(false),
+
+    /// Does the server accept `algorithm` for `publickey` authentication?
+    /// False for a name this module cannot sign with either way.
+    pub fn accepts(self: ServerSigAlgs, algorithm: []const u8) bool {
+        for (public_key_algorithms, self.accepted) |name, ok| {
+            if (ok and std.mem.eql(u8, name, algorithm)) return true;
+        }
+        return false;
+    }
+
+    /// The first of `candidates` (caller's preference order) the server
+    /// accepts, or null if it accepts none of them.
+    pub fn pick(self: ServerSigAlgs, candidates: []const []const u8) ?[]const u8 {
+        for (candidates) |c| {
+            if (self.accepts(c)) return c;
+        }
+        return null;
+    }
+};
+
+/// Decode an SSH_MSG_EXT_INFO payload (RFC 8308 §2.3: `byte 7 || uint32
+/// nr-extensions || nr-extensions * (string name || string value)`), keeping
+/// only `server-sig-algs`. `payload` includes the message-type byte.
+///
+/// Returns null when the message carried no `server-sig-algs` — a legal
+/// EXT_INFO (§2.5 requires ignoring extensions we do not recognize, and there
+/// is no minimum count), not an error.
+pub fn parseExtInfo(payload: []const u8) TransportError!?ServerSigAlgs {
+    var c = messages.Cursor{ .b = payload[1..] };
+    const count = try c.uint32();
+    // No separate bound on `count` is needed: every iteration reads two
+    // `Cursor.string`s out of a fixed payload, so a count larger than the
+    // message can hold ends the loop with `error.ProtocolError` on the first
+    // read past the end — the peer's uint32 sizes nothing.
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const name = try c.string();
+        const value = try c.string();
+        if (!std.mem.eql(u8, name, "server-sig-algs")) continue;
+        var out: ServerSigAlgs = .{};
+        var it = std.mem.splitScalar(u8, value, ',');
+        while (it.next()) |algo| {
+            for (public_key_algorithms, &out.accepted) |known, *ok| {
+                if (std.mem.eql(u8, algo, known)) ok.* = true;
+            }
+        }
+        return out;
+    }
+    return null;
+}
+
+/// Encode an SSH_MSG_EXT_INFO carrying exactly one extension, RFC 8308 §3.1
+/// `server-sig-algs` with `algorithms` as its name-list.
+pub fn encodeServerSigAlgs(w: *std.Io.Writer, algorithms: []const []const u8) TransportError!void {
+    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_EXT_INFO));
+    var nb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &nb, 1, .big);
+    try w.writeAll(&nb);
+    try messages.writeString(w, "server-sig-algs");
+    try messages.writeNameList(w, algorithms);
+}
 
 // ── entropy ────────────────────────────────────────────────────────────────
 
@@ -1699,6 +1852,15 @@ pub const Transport = struct {
     /// in this module reads it back. See `NegotiatedAlgorithms` for why the
     /// strings inside are safe to hold onto with no separate lifetime.
     negotiated: ?NegotiatedAlgorithms = null,
+    /// What the server said it accepts for RFC 4252 `publickey`, from its RFC
+    /// 8308 §3.1 `server-sig-algs` — `null` until (and unless) a server sends
+    /// SSH_MSG_EXT_INFO. `userauth.authenticatePublickey` reads it to choose
+    /// the signature algorithm for the caller's key instead of naming one
+    /// blind; RFC 8308 §3.1 is explicit that a client "MUST NOT make any
+    /// assumptions about the server's public key algorithm support" when it
+    /// is absent, so `null` means "fall back to the key's own name", never
+    /// "accepts nothing".
+    server_sig_algs: ?ServerSigAlgs = null,
 
     /// A `std.Io` cancellation of a blocking read on `reader` reaches this
     /// transport as plain `error.ReadFailed` — `std.Io.Reader.Error` is only
@@ -1734,9 +1896,14 @@ pub const Transport = struct {
         var cookie: [16]u8 = undefined;
         fillRandom(&cookie);
         const empty: []const []const u8 = &.{};
+        // RFC 8308 §2.1: append `ext-info-c` so the server may send us
+        // SSH_MSG_EXT_INFO. `requestService` and `userauth.awaitAuthReply`
+        // accept one at each of the RFC's two opportunities, which is what
+        // §2.2 requires of anyone who sends the indicator.
+        var offered_kex: [kex_algorithms.len + 1][]const u8 = undefined;
         const local_kex = KexInit{
             .cookie = cookie,
-            .kex_algorithms = &kex_algorithms,
+            .kex_algorithms = offeredKexAlgorithms(&offered_kex, .client),
             .server_host_key_algorithms = &server_host_key_algorithms,
             .encryption_algorithms_client_to_server = &encryption_algorithms,
             .encryption_algorithms_server_to_client = &encryption_algorithms,
@@ -1835,8 +2002,16 @@ pub const Transport = struct {
     }
 
     /// Send SSH_MSG_SERVICE_REQUEST for `service` and wait for the matching
-    /// SSH_MSG_SERVICE_ACCEPT (skipping SSH_MSG_IGNORE/DEBUG). Proves the
-    /// encrypted channel end-to-end.
+    /// SSH_MSG_SERVICE_ACCEPT (skipping SSH_MSG_IGNORE/DEBUG, and consuming
+    /// an RFC 8308 SSH_MSG_EXT_INFO). Proves the encrypted channel
+    /// end-to-end.
+    ///
+    /// This is where the server's *first* RFC 8308 §2.4 opportunity lands: a
+    /// server that saw our `ext-info-c` sends SSH_MSG_EXT_INFO as the first
+    /// packet after its SSH_MSG_NEWKEYS, so it arrives before (or interleaved
+    /// with) SERVICE_ACCEPT. Before this, any EXT_INFO here was
+    /// `error.ProtocolError` — harmless only because we never advertised
+    /// `ext-info-c` and so were never sent one.
     pub fn requestService(t: *Transport, service: []const u8, buf: []u8) TransportError!void {
         var sbuf: [256]u8 = undefined;
         var w: std.Io.Writer = .fixed(&sbuf);
@@ -1847,10 +2022,28 @@ pub const Transport = struct {
             const pkt = try t.recvPacket(buf);
             switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
                 .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
+                .SSH_MSG_EXT_INFO => {
+                    try t.takeExtInfo(pkt.payload);
+                    continue;
+                },
                 .SSH_MSG_SERVICE_ACCEPT => return,
                 else => return error.ProtocolError,
             }
         }
+    }
+
+    /// Absorb an SSH_MSG_EXT_INFO payload the peer sent us (RFC 8308 §2.4),
+    /// recording `server-sig-algs` on `t`. `pub` because the RFC gives a
+    /// server TWO opportunities to send it and the second one — immediately
+    /// before SSH_MSG_USERAUTH_SUCCESS — is read by `userauth.zig`, a layer
+    /// above this file.
+    ///
+    /// A message with no `server-sig-algs` leaves `t.server_sig_algs`
+    /// untouched rather than clearing it: §2.5 requires ignoring what we do
+    /// not recognize, and a second EXT_INFO that carried only, say,
+    /// `delay-compression` must not erase what the first one told us.
+    pub fn takeExtInfo(t: *Transport, payload: []const u8) TransportError!void {
+        if (try parseExtInfo(payload)) |algs| t.server_sig_algs = algs;
     }
 };
 
@@ -1886,6 +2079,209 @@ test "algorithm name-lists are non-empty" {
     try t.expect(encryption_algorithms.len > 0);
     try t.expect(mac_algorithms.len > 0);
     try t.expect(compression_algorithms.len > 0);
+    try t.expect(public_key_algorithms.len > 0);
+}
+
+// ── RFC 8308 tests ─────────────────────────────────────────────────────────
+
+test "server-sig-algs names exactly what the verifier accepts" {
+    const t = std.testing;
+    // Forwards: nothing is advertised that `userauth.servePublickey` would
+    // then refuse with `.unsupported_algorithm` — `keyBlobTypeFor` is the
+    // first gate every `publickey` request passes.
+    for (public_key_algorithms) |name| {
+        try t.expect(keyBlobTypeFor(name) != null);
+    }
+    // Backwards, and this is the half that matters: every algorithm the
+    // verifier CAN accept is advertised. A server that verifies
+    // `ecdsa-sha2-nistp256` but omits it from `server-sig-algs` sends a
+    // client with only that key away for no reason — the exact defect this
+    // extension exists to prevent, one algorithm further along. The list is
+    // spelled out rather than derived from `keyBlobTypeFor` so that adding a
+    // branch there without adding the name here fails HERE.
+    const verifiable = [_][]const u8{ "ssh-ed25519", "rsa-sha2-256", "rsa-sha2-512", "ecdsa-sha2-nistp256" };
+    try t.expectEqual(verifiable.len, public_key_algorithms.len);
+    for (verifiable) |name| {
+        try t.expect(pickFirst(&public_key_algorithms, &.{name}) != null);
+    }
+}
+
+test "the RFC 8308 indicators are never negotiable" {
+    const t = std.testing;
+    // RFC 8308 §2.2: were an indicator ever selected as the key-exchange
+    // method, "the parties MUST disconnect". This module makes that
+    // impossible instead of detecting it: `negotiate` (client) and
+    // `serverHandshake`'s `pickFirst` (server) both match against
+    // `kex_algorithms`, and the indicator is added only when ENCODING. So the
+    // invariant to pin is that the negotiation list itself stays clean —
+    // appending `ext-info-c` to `kex_algorithms` "to advertise it" is the
+    // mistake this catches.
+    for (kex_algorithms) |name| {
+        try t.expect(!std.mem.eql(u8, name, ext_info_c));
+        try t.expect(!std.mem.eql(u8, name, ext_info_s));
+    }
+    var offered: [kex_algorithms.len + 1][]const u8 = undefined;
+    const as_client = offeredKexAlgorithms(&offered, .client);
+    try t.expectEqual(kex_algorithms.len + 1, as_client.len);
+    try t.expectEqualStrings(ext_info_c, as_client[as_client.len - 1]);
+    try t.expectEqualStrings(kex_algorithms[0], as_client[0]);
+    const as_server = offeredKexAlgorithms(&offered, .server);
+    try t.expectEqualStrings(ext_info_s, as_server[as_server.len - 1]);
+    // §2.2: "Implementations MUST NOT send an incorrect indicator name for
+    // their role" — the two roles must not produce the same name.
+    try t.expect(!std.mem.eql(u8, ext_info_c, ext_info_s));
+}
+
+test "offersExtInfo: the gate on sending EXT_INFO at all" {
+    const t = std.testing;
+    // A real OpenSSH client's list, indicator second from last.
+    const openssh_client = [_][]const u8{
+        "mlkem768x25519-sha256", "curve25519-sha256",            "diffie-hellman-group14-sha256",
+        ext_info_c,              "kex-strict-c-v00@openssh.com",
+    };
+    try t.expect(offersExtInfo(&openssh_client, ext_info_c));
+    // Role discipline: a server looking for the CLIENT's indicator must not
+    // be satisfied by its own. Nothing in this list is `ext-info-s`.
+    try t.expect(!offersExtInfo(&openssh_client, ext_info_s));
+
+    // A peer that did not advertise gets nothing — RFC 8308 §2.2. This is the
+    // branch our own client can never take (it always advertises), so it is
+    // only ever exercised here.
+    const silent = [_][]const u8{ "curve25519-sha256", "diffie-hellman-group14-sha256" };
+    try t.expect(!offersExtInfo(&silent, ext_info_c));
+    try t.expect(!offersExtInfo(&.{}, ext_info_c));
+
+    // Exact match, not prefix/substring: these are the near-misses that a
+    // `startsWith`/`indexOf` implementation would wrongly accept.
+    const near = [_][]const u8{ "ext-info", "ext-info-c-v00@example.com", "xext-info-c" };
+    try t.expect(!offersExtInfo(&near, ext_info_c));
+}
+
+test "EXT_INFO round-trip: server-sig-algs encodes and parses back" {
+    const t = std.testing;
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try encodeServerSigAlgs(&w, &.{ "rsa-sha2-512", "ssh-ed25519" });
+    const payload = w.buffered();
+    try t.expectEqual(@as(u8, 7), payload[0]);
+
+    const algs = (try parseExtInfo(payload)).?;
+    try t.expect(algs.accepts("rsa-sha2-512"));
+    try t.expect(algs.accepts("ssh-ed25519"));
+    // Not advertised, and not silently assumed: the whole point of the
+    // extension is that absence is information.
+    try t.expect(!algs.accepts("rsa-sha2-256"));
+    try t.expect(!algs.accepts("ecdsa-sha2-nistp256"));
+    // Preference order is the CALLER's, not the wire's.
+    try t.expectEqualStrings("rsa-sha2-512", algs.pick(&.{ "rsa-sha2-512", "rsa-sha2-256" }).?);
+    try t.expect(algs.pick(&.{"rsa-sha2-256"}) == null);
+}
+
+test "EXT_INFO: a real OpenSSH server-sig-algs list parses to the four we can sign with" {
+    const t = std.testing;
+    // Verbatim from OpenSSH 10.2p1's SSH_MSG_EXT_INFO. RFC 8308 §2.5 requires
+    // ignoring unrecognized names, and here that is most of the list —
+    // certificate and FIDO key types this module has no signer for. Reducing
+    // on receipt is what keeps `ServerSigAlgs` a fixed-size value.
+    const real = "ssh-ed25519-cert-v01@openssh.com,ecdsa-sha2-nistp256-cert-v01@openssh.com," ++
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com,ecdsa-sha2-nistp521-cert-v01@openssh.com," ++
+        "sk-ssh-ed25519-cert-v01@openssh.com,sk-ecdsa-sha2-nistp256-cert-v01@openssh.com," ++
+        "rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com,ssh-ed25519," ++
+        "ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,sk-ssh-ed25519@openssh.com," ++
+        "sk-ecdsa-sha2-nistp256@openssh.com,rsa-sha2-512,rsa-sha2-256";
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_EXT_INFO));
+    var nb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &nb, 1, .big);
+    try w.writeAll(&nb);
+    try messages.writeString(&w, "server-sig-algs");
+    try messages.writeString(&w, real);
+
+    const algs = (try parseExtInfo(w.buffered())).?;
+    try t.expect(algs.accepts("ssh-ed25519"));
+    try t.expect(algs.accepts("rsa-sha2-512"));
+    try t.expect(algs.accepts("rsa-sha2-256"));
+    try t.expect(algs.accepts("ecdsa-sha2-nistp256"));
+    // `rsa-sha2-512-cert-v01@openssh.com` contains `rsa-sha2-512` as a
+    // prefix; a substring match would wrongly claim we can use the cert type.
+    try t.expect(!algs.accepts("rsa-sha2-512-cert-v01@openssh.com"));
+}
+
+test "EXT_INFO: an extension we do not know is skipped, not mistaken for server-sig-algs" {
+    const t = std.testing;
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_EXT_INFO));
+    var nb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &nb, 2, .big);
+    try w.writeAll(&nb);
+    // §2.5: "MUST tolerate any sequence of bytes -- including null bytes at
+    // any position -- in an unknown extension's extension-value".
+    try messages.writeString(&w, "delay-compression");
+    try messages.writeString(&w, "\x00\xff\x00zlib@openssh.com\x00");
+    try messages.writeString(&w, "server-sig-algs");
+    try messages.writeString(&w, "ssh-ed25519");
+
+    const algs = (try parseExtInfo(w.buffered())).?;
+    try t.expect(algs.accepts("ssh-ed25519"));
+    try t.expect(!algs.accepts("rsa-sha2-256"));
+
+    // An EXT_INFO with no server-sig-algs at all is legal and says nothing.
+    var b2: [64]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&b2);
+    try w2.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_EXT_INFO));
+    std.mem.writeInt(u32, &nb, 1, .big);
+    try w2.writeAll(&nb);
+    try messages.writeString(&w2, "no-flow-control");
+    try messages.writeString(&w2, "p");
+    try t.expect((try parseExtInfo(w2.buffered())) == null);
+}
+
+test "EXT_INFO: a truncated or over-counted message is a typed error, not a panic" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_EXT_INFO));
+    var nb: [4]u8 = undefined;
+    // A count of 4 billion over a payload holding one pair: the loop must end
+    // on the Cursor's bounds check, never allocate or spin on the peer's
+    // number.
+    std.mem.writeInt(u32, &nb, 0xffff_ffff, .big);
+    try w.writeAll(&nb);
+    try messages.writeString(&w, "server-sig");
+    try messages.writeString(&w, "x");
+    try t.expectError(error.ProtocolError, parseExtInfo(w.buffered()));
+    // Message-type byte only.
+    try t.expectError(error.ProtocolError, parseExtInfo(&[_]u8{7}));
+}
+
+test "takeExtInfo: a later EXT_INFO without server-sig-algs does not erase the first" {
+    const t = std.testing;
+    var in_buf: [1]u8 = .{0};
+    var out_buf: [1]u8 = undefined;
+    var r: std.Io.Reader = .fixed(&in_buf);
+    var w: std.Io.Writer = .fixed(&out_buf);
+    var tr = Transport.init(&r, &w);
+    try t.expect(tr.server_sig_algs == null);
+
+    var b1: [128]u8 = undefined;
+    var w1: std.Io.Writer = .fixed(&b1);
+    try encodeServerSigAlgs(&w1, &.{"rsa-sha2-512"});
+    try tr.takeExtInfo(w1.buffered());
+    try t.expect(tr.server_sig_algs.?.accepts("rsa-sha2-512"));
+
+    // RFC 8308 §2.4's second opportunity, carrying something else entirely.
+    var b2: [128]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&b2);
+    try w2.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_EXT_INFO));
+    var nb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &nb, 1, .big);
+    try w2.writeAll(&nb);
+    try messages.writeString(&w2, "elevation");
+    try messages.writeString(&w2, "y");
+    try tr.takeExtInfo(w2.buffered());
+    try t.expect(tr.server_sig_algs.?.accepts("rsa-sha2-512"));
 }
 
 test "CipherState/Packet/Transport are constructible" {

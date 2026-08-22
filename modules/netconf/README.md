@@ -50,7 +50,7 @@ Over SSH (RFC 6242 §2 — subsystem `netconf`):
 // 1. A normal SSH session from the sibling module, up to the subsystem request.
 var t = try ssh.transport.connect(&reader, &writer, gpa, verifyHostKey);
 try t.requestService("ssh-userauth", &scratch);
-try ssh.userauth.authenticatePassword(&t, gpa, user, password);
+try ssh.userauth.authenticatePassword(&t, gpa, user, password, .{});
 
 var session = try ssh.openSession(&t, gpa, .{});
 defer session.deinit();

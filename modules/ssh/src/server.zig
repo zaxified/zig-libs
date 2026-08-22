@@ -421,6 +421,24 @@ pub const ServerConfig = struct {
     /// from this same module advertise consistent software; a real server
     /// deployment will usually want to override it.
     server_software: []const u8 = transport.software_version,
+    /// RFC 8308 §3.1 `server-sig-algs`: the public-key signature algorithms
+    /// this server will accept for RFC 4252 `publickey` authentication, sent
+    /// in SSH_MSG_EXT_INFO to any client that advertised `ext-info-c`.
+    ///
+    /// The default is everything `userauth.serveUserauth` can verify. Narrow
+    /// it — do not widen it — when the caller's own `AuthorizedKeyCheck`
+    /// refuses some of them: §3.1 says the server "MUST enumerate all public
+    /// key algorithms it might accept", and a name here that the hook then
+    /// refuses is worse than silence, because a client that owns only such a
+    /// key will offer it, be rejected, and have no second choice. A server
+    /// whose policy is "rsa-sha2-512 only" sets this to that one name and an
+    /// OpenSSH client signs with SHA-512 the first time.
+    ///
+    /// Set to an empty slice to suppress the extension entirely (no
+    /// SSH_MSG_EXT_INFO is sent at all — an empty `server-sig-algs` would
+    /// claim this server accepts no public key, which is a different and
+    /// false statement).
+    server_sig_algs: []const []const u8 = &transport.public_key_algorithms,
 };
 
 // ── server-side (responder-role) key exchange ───────────────────────────────
@@ -835,11 +853,12 @@ fn pickFirst(preferred: []const []const u8, available: []const []const u8) ?[]co
 ///
 /// Sequence: version exchange (reused `transport.exchangeVersions` —
 /// role-symmetric) → KEXINIT exchange (our `server_host_key_algorithms`
-/// list is built from `config.host_keys`) → client-preference negotiation →
-/// `curve25519KexServer` → NEWKEYS both ways → cipher install with the
-/// server direction mapping (write = s2c, read = c2s) → respond to the
-/// client's SSH_MSG_SERVICE_REQUEST `"ssh-userauth"` with
-/// SSH_MSG_SERVICE_ACCEPT.
+/// list is built from `config.host_keys`, plus RFC 8308's `ext-info-s`) →
+/// client-preference negotiation → `curve25519KexServer` → NEWKEYS both ways
+/// → cipher install with the server direction mapping (write = s2c, read =
+/// c2s) → RFC 8308 SSH_MSG_EXT_INFO with `server-sig-algs`, if the client
+/// advertised `ext-info-c` → respond to the client's
+/// SSH_MSG_SERVICE_REQUEST `"ssh-userauth"` with SSH_MSG_SERVICE_ACCEPT.
 ///
 /// After this returns, `t` is an encrypted transport ready for userauth —
 /// out of scope in THIS FILE, but implemented server-side by
@@ -868,9 +887,13 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     var cookie: [16]u8 = undefined;
     fillRandom(&cookie);
     const empty: []const []const u8 = &.{};
+    // RFC 8308 §2.1: append `ext-info-s`, the server's half of the indicator
+    // pair. §2.2 makes this a promise to process a client's SSH_MSG_EXT_INFO,
+    // which the post-NEWKEYS loop below honours by consuming one.
+    var offered_kex: [transport.kex_algorithms.len + 1][]const u8 = undefined;
     const local_kex = transport.KexInit{
         .cookie = cookie,
-        .kex_algorithms = &transport.kex_algorithms,
+        .kex_algorithms = transport.offeredKexAlgorithms(&offered_kex, .server),
         .server_host_key_algorithms = hk_names,
         .encryption_algorithms_client_to_server = &transport.encryption_algorithms,
         .encryption_algorithms_server_to_client = &transport.encryption_algorithms,
@@ -908,6 +931,13 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     var creader: std.Io.Reader = .fixed(cpkt.payload[1..]);
     var client_kex = try transport.KexInit.decode(gpa, &creader);
     defer client_kex.deinit(gpa);
+
+    // RFC 8308 §2.2: SSH_MSG_EXT_INFO may be sent ONLY to a peer that
+    // advertised the indicator for its role. A client that did not must see
+    // no EXT_INFO at all — not an empty one — because to such a client
+    // message 7 is an unknown transport message it would answer
+    // SSH_MSG_UNIMPLEMENTED.
+    const client_wants_ext_info = transport.offersExtInfo(client_kex.kex_algorithms, transport.ext_info_c);
 
     // 3. Negotiate (client-preference order per RFC 4253 §7.1).
     const kex_name = pickFirst(client_kex.kex_algorithms, &transport.kex_algorithms) orelse
@@ -997,12 +1027,38 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     t.write_cipher = try buildCipher(cipher_s2c, .s2c, kex_result, sid, sent);
     t.read_cipher = try buildCipher(cipher_c2s, .c2s, kex_result, sid, rcvd);
 
+    // 6b. RFC 8308 §2.4, the server's FIRST opportunity: SSH_MSG_EXT_INFO
+    // "following the server's first SSH_MSG_NEWKEYS message", i.e. the first
+    // packet we encrypt. It has to be here and not later: `server-sig-algs`
+    // is what tells a client which signature algorithm to use for a key whose
+    // blob type does not name one, and an OpenSSH client decides that before
+    // it sends its first SSH_MSG_USERAUTH_REQUEST — without this it logs
+    // "send_pubkey_test: no mutual signature algorithm" and never offers an
+    // RSA key at all. The RFC's second opportunity (immediately before
+    // SSH_MSG_USERAUTH_SUCCESS) exists for extensions that only make sense
+    // once the user is known; `server-sig-algs` is not one, so we use the
+    // first and only the first.
+    if (client_wants_ext_info and config.server_sig_algs.len > 0) {
+        var ebuf: [1024]u8 = undefined;
+        var ew: std.Io.Writer = .fixed(&ebuf);
+        try transport.encodeServerSigAlgs(&ew, config.server_sig_algs);
+        try t.sendPacket(ew.buffered());
+    }
+
     // 7. SSH_MSG_SERVICE_REQUEST "ssh-userauth" → SSH_MSG_SERVICE_ACCEPT
     // (responder mirror of `transport.Transport.requestService`).
     while (true) {
         const pkt = try t.recvPacket(scratch);
         switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
+            // The client's own RFC 8308 §2.4 opportunity — OpenSSH always
+            // takes it once we advertise `ext-info-s`, sending
+            // `publickey-hostbound@openssh.com` and `ping@openssh.com`. This
+            // module implements no client-sent extension, and §2.5 says to
+            // ignore what we do not recognize; what it must NOT do is treat
+            // the message as a protocol error, which is what having promised
+            // `ext-info-s` and then refusing the reply would be.
+            .SSH_MSG_EXT_INFO => continue,
             .SSH_MSG_SERVICE_REQUEST => {
                 var cur = WireCursor{ .b = pkt.payload[1..] };
                 const service = try cur.string();

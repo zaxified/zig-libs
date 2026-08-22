@@ -5,6 +5,79 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22 — RFC 8308 extension negotiation, both roles. Fixes a real
+  interoperability defect: a real OpenSSH client would not authenticate with an
+  RSA user key against this server at all.** BREAKING in one small place —
+  `userauth.authenticatePassword` takes an options struct.
+
+  The module implemented no `SSH_MSG_EXT_INFO`, so it never sent
+  `server-sig-algs`. An `ssh-rsa` public-key blob names no hash — RFC 8332 §3
+  pairs it with both `rsa-sha2-256` and `rsa-sha2-512` — so a client that is not
+  told which the server accepts will not guess. Real `ssh` says
+  `send_pubkey_test: no mutual signature algorithm` and never sends the request;
+  `-o PubkeyAcceptedAlgorithms=rsa-sha2-256` does not help, because the refusal
+  is on the *server's* silence, not the client's list. `ssh-ed25519` and
+  `ecdsa-sha2-nistp256` were unaffected, each having exactly one signature
+  algorithm name — which is why 107 tests and a nine-lane live-OpenSSH interop
+  suite all passed: our own client names an RSA algorithm itself, and every live
+  lane used ed25519. It took building the example's server half to meet a
+  foreign client holding an RSA key.
+
+  **Server.** `serverHandshake` appends `ext-info-s` to its KEXINIT
+  `kex_algorithms` (RFC 8308 §2.1) and, if the client advertised `ext-info-c`,
+  sends `SSH_MSG_EXT_INFO` with `server-sig-algs` as the first packet after its
+  `SSH_MSG_NEWKEYS` — the RFC's first opportunity (§2.4), which is the one that
+  matters because a client decides its signature algorithm before its first
+  `SSH_MSG_USERAUTH_REQUEST`. A client that did *not* advertise the indicator is
+  sent nothing at all, not an empty message: to such a peer message 7 is an
+  unknown transport message (§2.2). What is advertised is
+  `ServerConfig.server_sig_algs`, defaulting to `transport.public_key_algorithms`
+  — the four names `userauth.serveUserauth` can actually verify, tied to
+  `keyBlobTypeFor`/`verifySignature` by a test in both directions so the list
+  cannot drift into promising something the verifier would refuse. A caller whose
+  own `AuthorizedKeyCheck` is stricter narrows it (the example does, under
+  `--strict-rsa`); an empty slice suppresses the extension.
+
+  **Client.** `clientHandshake` appends `ext-info-c`, and
+  `Transport.requestService` / `userauth.awaitAuthReply` accept
+  `SSH_MSG_EXT_INFO` at both of the RFC's opportunities, recording the result on
+  `Transport.server_sig_algs`. `userauth.authenticatePublickey` then picks the
+  strongest algorithm the server said it accepts for this key's type instead of
+  naming one blind — so an RSA key that `AuthKey.fromOpenSSH` pinned to
+  `rsa-sha2-256` now signs `rsa-sha2-512` when the server takes it, which also
+  closes the "no supported way to ask for `rsa-sha2-512`" gap for the common
+  case. If the server sent no extension the key's own name is used, unchanged:
+  §3.1 says a client "MUST NOT make any assumptions" then. The indicators are
+  appended only while *encoding* a KEXINIT — `transport.kex_algorithms`, the list
+  both sides negotiate against, stays clean, so §2.2's "if these names become
+  negotiated ... the parties MUST disconnect" cannot arise.
+
+  Accepting a *peer's* `SSH_MSG_EXT_INFO` is not optional once the indicator is
+  sent (§2.2), and OpenSSH clients always send one back
+  (`publickey-hostbound@openssh.com`, `ping@openssh.com`): the server's
+  service-request loop ignores it per §2.5 rather than failing, which it would
+  have done before.
+
+  **`userauth.BannerHandler`** — `awaitAuthReply` validated
+  `SSH_MSG_USERAUTH_BANNER` (RFC 4252 §5.4) and then discarded it, with no seam
+  at all; real `ssh` shows a server's banner and this module could not.
+  `PublickeyOptions.banner` and the new `PasswordOptions.banner` deliver it, with
+  the caller's `ctx`, the same idiom as the other seams. ⚠ `authenticatePassword`
+  therefore takes a fifth argument, `opts: PasswordOptions` — pass `.{}` for the
+  previous behaviour. §5.4's warning that the text may carry control sequences is
+  the caller's to act on; the example filters it the way OpenSSH's `strnvis`
+  does.
+
+  Proof, since the missing test is the point: a new live-interop lane runs a real
+  `ssh` with an **RSA** user key against our server, and a second runs **our
+  client** with an RSA key against a real `sshd` configured
+  `PubkeyAcceptedAlgorithms=rsa-sha2-512` — an oracle for the client half,
+  because `fromOpenSSH` hands us that key pinned to SHA-256. Removing the
+  server's `EXT_INFO` send fails the first (`EndOfStream` — the client leaves
+  without sending a credential) and leaves the second green; making the client
+  ignore `server-sig-algs` fails the second (`AuthenticationFailed`) and leaves
+  the first green.
+
 - **2026-08-22 — BREAKING.** The four caller-supplied policy seams
   (`transport.HostKeyVerifier`, `userauth.AuthorizedKeyCheck`,
   `userauth.PasswordCheck`, `connection.CommandHandler`) were bare `*const fn` pointers.

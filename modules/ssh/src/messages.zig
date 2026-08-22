@@ -20,6 +20,12 @@ pub const MessageType = enum(u8) {
     SSH_MSG_DEBUG = 4,
     SSH_MSG_SERVICE_REQUEST = 5,
     SSH_MSG_SERVICE_ACCEPT = 6,
+    /// RFC 8308 §2.3 extension negotiation. Deliberately numbered in the
+    /// RFC 4253 §11.4 "transport, generic" range 1-19 the RFC set aside, so a
+    /// peer that does not know it answers SSH_MSG_UNIMPLEMENTED rather than
+    /// dropping the connection — which is also why RFC 8308 §2.2 forbids
+    /// sending it to a peer that did not advertise `ext-info-c`/`ext-info-s`.
+    SSH_MSG_EXT_INFO = 7,
     SSH_MSG_KEXINIT = 20,
     SSH_MSG_NEWKEYS = 21,
     /// Generic KEX-method-specific init message. For the elliptic-curve /

@@ -10,7 +10,9 @@
 //! Protocol, `chacha20-poly1305@openssh.com` / `aes256-ctr`+`hmac-sha2-256` /
 //! `aes{128,256}-gcm@openssh.com` ciphers, and host-key verify (client) /
 //! signing (server) for ssh-ed25519, rsa-sha2-256/512 (via the `rsa` module)
-//! and ecdsa-sha2-nistp256. `Transport.negotiated`
+//! and ecdsa-sha2-nistp256, plus RFC 8308 extension negotiation
+//! (`ext-info-c`/`ext-info-s` and SSH_MSG_EXT_INFO carrying
+//! `server-sig-algs`) in both roles. `Transport.negotiated`
 //! (`transport.NegotiatedAlgorithms`) exposes the negotiated KEX/host-key/
 //! cipher/MAC wire names once a handshake completes, client and server side —
 //! diagnostics parity with `ssh -v`'s negotiation banner, which this module
@@ -59,7 +61,7 @@ pub const meta = .{
     // One Transport instance = one caller-owned connection with its own
     // sequence-number/cipher state; nothing shared/global.
     .concurrency = .single_owner,
-    .model_after = "RFC 4253/4251/4252/4254 + RFC 8731 (curve25519-sha256) + RFC 8332/8709/5656 (host+user key algorithms); design ref ringtailsoftware/misshod (MIT) shape only, no source copied",
+    .model_after = "RFC 4253/4251/4252/4254 + RFC 8731 (curve25519-sha256) + RFC 8332/8709/5656 (host+user key algorithms) + RFC 8308 (ext-info / server-sig-algs); design ref ringtailsoftware/misshod (MIT) shape only, no source copied",
     .deps = .{"rsa"},
 };
 

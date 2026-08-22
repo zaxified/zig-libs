@@ -1227,6 +1227,33 @@ const ClientCtx = struct {
     stdout: []u8 = &.{},
     stderr: []u8 = &.{},
     exit_status: ?u32 = null,
+    /// What `userauth.BannerHandler` delivered, copied out of the packet
+    /// scratch (the seam borrows). `banner_len == 0` means the handler was
+    /// never called — which is the whole assertion: the server below always
+    /// sets `AuthConfig.banner`.
+    banner_buf: [128]u8 = undefined,
+    banner_len: usize = 0,
+    banner_calls: usize = 0,
+
+    fn banner(self: *const ClientCtx) []const u8 {
+        return self.banner_buf[0..self.banner_len];
+    }
+
+    fn showBanner(ctx: *anyopaque, message: []const u8, language: []const u8) void {
+        const self: *ClientCtx = @ptrCast(@alignCast(ctx));
+        self.banner_calls += 1;
+        // RFC 4252 §5.4 sends a language tag alongside; the test server sends
+        // it empty, and capturing it is how we notice if the seam ever hands
+        // the handler the wrong string.
+        if (language.len != 0) return;
+        const n = @min(message.len, self.banner_buf.len);
+        @memcpy(self.banner_buf[0..n], message[0..n]);
+        self.banner_len = n;
+    }
+
+    fn bannerHandler(self: *ClientCtx) userauth.BannerHandler {
+        return .{ .ctx = self, .showFn = showBanner };
+    }
 
     fn run(self: *ClientCtx) void {
         self.inner() catch |e| {
@@ -1293,9 +1320,9 @@ const ClientCtx = struct {
                 try t.sendDisconnect(.no_more_auth_methods_available, "give up");
                 return;
             },
-            .password => try userauth.authenticatePassword(&t, gpa, "alice", "correct horse"),
+            .password => try userauth.authenticatePassword(&t, gpa, "alice", "correct horse", .{ .banner = self.bannerHandler() }),
             .happy_no_probe => try userauth.authenticatePublickey(&t, gpa, "alice", key, .{ .probe_first = false }),
-            else => try userauth.authenticatePublickey(&t, gpa, "alice", key, .{}),
+            else => try userauth.authenticatePublickey(&t, gpa, "alice", key, .{ .banner = self.bannerHandler() }),
         }
 
         if (self.case == .request_after_close) {
@@ -1462,6 +1489,28 @@ test "loopback: password auth (RFC 4252 §8) → exec" {
     try t.expectEqualStrings("[password] ran 'whoami' as alice stdin='from-the-client'", ctx.stdout);
 }
 
+test "loopback: the server's USERAUTH_BANNER reaches the client's seam (RFC 4252 §5.4)" {
+    const t = std.testing;
+    // Both methods, because the banner is not tied to one: `serveUserauth`
+    // sends `AuthConfig.banner` once before the first verdict whichever
+    // method the client picked, and the seam lives in the reply loop both
+    // share.
+    for ([_]Case{ .happy, .password }) |case| {
+        var ctx = try runCase(case);
+        defer t.allocator.free(ctx.stdout);
+        defer t.allocator.free(ctx.stderr);
+        try expectClientOk(&ctx);
+        // Before this seam existed the banner was parsed, length-checked and
+        // dropped — a caller could not observe it at all, so this assertion
+        // could not have been written.
+        try t.expectEqualStrings("zig-libs ssh test server\n", ctx.banner());
+        // Exactly once: §5.4 allows a banner at any point, and `serveUserauth`
+        // guards with `banner_sent`. A second delivery would mean the guard
+        // stopped working.
+        try t.expectEqual(@as(usize, 1), ctx.banner_calls);
+    }
+}
+
 test "loopback: 100 KB of output through a 16 KB window (flow control actually runs)" {
     const t = std.testing;
     var ctx = try runCase(.big_output);
@@ -1536,7 +1585,18 @@ fn writeFile(io: std.Io, path: []const u8, contents: []const u8) !void {
     try fw.interface.flush();
 }
 
-test "live interop: our client → real OpenSSH sshd — publickey auth + exec + exit-status" {
+/// Drive our whole client stack — `transport.connect` →
+/// `userauth.authenticate` → `exec` — against a real `sshd`.
+///
+/// `client_key_type` is what `ssh-keygen` mints for the user key, and
+/// `sshd_pubkey_algorithms` (when non-empty) is passed as
+/// `PubkeyAcceptedAlgorithms`, which is BOTH what `sshd` puts in its RFC 8308
+/// `server-sig-algs` and what it will actually verify. Setting it to a single
+/// `rsa-sha2-512` is therefore a real oracle for the client half of RFC 8308:
+/// `AuthKey.fromOpenSSH` pins an RSA key to `rsa-sha2-256`, so a client that
+/// does not read `server-sig-algs` signs with SHA-256 and this `sshd` refuses
+/// it.
+fn liveOurClientExec(client_key_type: []const u8, sshd_pubkey_algorithms: []const u8) !void {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1558,14 +1618,16 @@ test "live interop: our client → real OpenSSH sshd — publickey auth + exec +
         cwd.deleteTree(io, dir_path) catch {};
     }
 
-    // Host key + client key, both from the real ssh-keygen.
+    // Host key + client key, both from the real ssh-keygen. The HOST key stays
+    // ed25519 in every case: `PubkeyAcceptedAlgorithms` below constrains the
+    // USER key, and mixing the two would make a failure ambiguous.
     const hk_path = try std.fmt.allocPrint(gpa, "{s}/hk", .{dir_path});
     defer gpa.free(hk_path);
     const ck_path = try std.fmt.allocPrint(gpa, "{s}/ck", .{dir_path});
     defer gpa.free(ck_path);
-    for ([_][]const u8{ hk_path, ck_path }) |p| {
+    for ([_][]const u8{ hk_path, ck_path }, [_][]const u8{ "ed25519", client_key_type }) |p, kt| {
         var child = std.process.spawn(io, .{
-            .argv = &.{ "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "zig-ssh-exec-test", "-f", p },
+            .argv = &.{ "ssh-keygen", "-q", "-t", kt, "-N", "", "-C", "zig-ssh-exec-test", "-f", p },
             .stdout = .ignore,
             .stderr = .ignore,
         }) catch return error.SkipZigTest;
@@ -1596,6 +1658,14 @@ test "live interop: our client → real OpenSSH sshd — publickey auth + exec +
     defer gpa.free(port_opt);
     const ak_opt = try std.fmt.allocPrint(gpa, "AuthorizedKeysFile={s}", .{ak_path});
     defer gpa.free(ak_opt);
+    // `PubkeyAcceptedAlgorithms` is what `sshd` advertises in `server-sig-algs`
+    // AND what it enforces, so it is a real oracle rather than a hint. Passing
+    // the default (an empty extra option) leaves the case unconstrained.
+    const alg_opt = if (sshd_pubkey_algorithms.len == 0)
+        try gpa.dupe(u8, "PubkeyAuthentication=yes")
+    else
+        try std.fmt.allocPrint(gpa, "PubkeyAcceptedAlgorithms={s}", .{sshd_pubkey_algorithms});
+    defer gpa.free(alg_opt);
 
     var sshd = std.process.spawn(io, .{
         .argv = &.{
@@ -1612,6 +1682,7 @@ test "live interop: our client → real OpenSSH sshd — publickey auth + exec +
             "PubkeyAuthentication=yes",        "-o",
             "PasswordAuthentication=no",       "-o",
             "KbdInteractiveAuthentication=no", "-o",
+            alg_opt,                           "-o",
             ak_opt,
         },
         .stdout = .ignore,
@@ -1652,9 +1723,25 @@ test "live interop: our client → real OpenSSH sshd — publickey auth + exec +
     try std.testing.expectEqual(@as(?u32, 7), res.exit_status);
 }
 
-/// Our server's authorized key for the live `ssh`-client test.
+test "live interop: our client → real OpenSSH sshd — publickey auth + exec + exit-status" {
+    try liveOurClientExec("ed25519", "");
+}
+
+// The client half of RFC 8308, and the mirror of the server-side RSA lane
+// below. `sshd` here accepts `rsa-sha2-512` and nothing else, and says so in
+// `server-sig-algs`; `AuthKey.fromOpenSSH` hands us the key pinned to
+// `rsa-sha2-256`. A client that signs with the name its own key carries is
+// refused — `error.AuthenticationFailed` — so passing proves the client
+// actually read the extension and re-chose, rather than being lucky.
+test "live interop: our client → real OpenSSH sshd — RSA user key the server only accepts as rsa-sha2-512" {
+    try liveOurClientExec("rsa", "rsa-sha2-512");
+}
+
+/// Our server's authorized key for the live `ssh`-client test. The buffer is
+/// sized for the largest blob the cases below can produce (an rsa-4096 blob
+/// is ~535 bytes, over the 512 this held while only ed25519 was exercised).
 const LiveAuthorized = struct {
-    blob: [512]u8 = undefined,
+    blob: [1024]u8 = undefined,
     blob_len: usize = 0,
 
     fn check(ctx: *anyopaque, user: []const u8, algorithm: []const u8, key_blob: []const u8) bool {
@@ -1687,7 +1774,19 @@ fn liveExecHandler(
     return 3;
 }
 
-test "live interop: real OpenSSH ssh client → our server — publickey auth + exec + exit-status" {
+/// Drive a real OpenSSH `ssh` client, authenticating with a `user_key_type`
+/// user key, through our whole server stack: `server.accept` →
+/// `userauth.serveUserauth` → `serveSession`.
+///
+/// `user_key_type` is the only knob because it is the only thing that has
+/// ever made this differ: an `ed25519` (or `ecdsa`) user key has exactly one
+/// signature algorithm, so a client can offer it with no information from the
+/// server, whereas an `rsa` key's blob type (`ssh-rsa`) names no hash and the
+/// client will not guess one — it needs the server's RFC 8308
+/// `server-sig-algs`. That is why the `rsa` case below is the regression test
+/// for EXT_INFO and the `ed25519` case is not: with EXT_INFO removed the
+/// `ed25519` case still passes.
+fn liveSshClientExec(user_key_type: []const u8) !void {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1712,7 +1811,7 @@ test "live interop: real OpenSSH ssh client → our server — publickey auth + 
     defer gpa.free(ck_path);
     {
         var child = std.process.spawn(io, .{
-            .argv = &.{ "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "zig-ssh-srvexec", "-f", ck_path },
+            .argv = &.{ "ssh-keygen", "-q", "-t", user_key_type, "-N", "", "-C", "zig-ssh-srvexec", "-f", ck_path },
             .stdout = .ignore,
             .stderr = .ignore,
         }) catch return error.SkipZigTest;
@@ -1729,7 +1828,7 @@ test "live interop: real OpenSSH ssh client → our server — publickey auth + 
         const text = cwd.readFileAlloc(io, pub_path, gpa, .limited(4096)) catch return error.SkipZigTest;
         defer gpa.free(text);
         var it = std.mem.tokenizeScalar(u8, text, ' ');
-        _ = it.next() orelse return error.SkipZigTest; // "ssh-ed25519"
+        _ = it.next() orelse return error.SkipZigTest; // key type, e.g. "ssh-ed25519"
         const b64 = it.next() orelse return error.SkipZigTest;
         const dec = std.base64.standard.Decoder;
         const n = dec.calcSizeForSlice(b64) catch return error.SkipZigTest;
@@ -1794,6 +1893,21 @@ test "live interop: real OpenSSH ssh client → our server — publickey auth + 
     const out = try cwd.readFileAlloc(io, out_path, gpa, .limited(4096));
     defer gpa.free(out);
     try std.testing.expectEqualStrings("zig-libs ran: uname -a\n3\n", out);
+}
+
+test "live interop: real OpenSSH ssh client → our server — publickey auth + exec + exit-status" {
+    try liveSshClientExec("ed25519");
+}
+
+// The RFC 8308 regression test. A real `ssh` will not offer an RSA user key
+// to a server that never sent `server-sig-algs` — it logs `send_pubkey_test:
+// no mutual signature algorithm` and never sends the request at all, so this
+// fails at `serveUserauth` with `error.AuthenticationFailed`. It is the only
+// test in this module that a foreign client's *algorithm* selection can
+// break: our own client names an RSA signature algorithm itself, so every
+// loopback test is blind to it.
+test "live interop: real OpenSSH ssh client → our server — RSA user key (RFC 8308 server-sig-algs)" {
+    try liveSshClientExec("rsa");
 }
 
 // ── offline reject tests (crafted wire input, no socket, no threads) ───────

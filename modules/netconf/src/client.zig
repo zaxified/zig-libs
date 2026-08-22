@@ -978,7 +978,9 @@ fn liveRoundTrip(advertise: []const []const u8, want: framing.Dialect) !void {
     });
     var scratch: [4096]u8 = undefined;
     try t.requestService("ssh-userauth", &scratch);
-    try ssh.userauth.authenticatePassword(&t, gpa, user, password);
+    // `.{}` = no `BannerHandler`: this is a test harness, and a NETCONF
+    // server's RFC 4252 §5.4 banner has nowhere to go here.
+    try ssh.userauth.authenticatePassword(&t, gpa, user, password, .{});
 
     var session = try ssh.openSession(&t, gpa, .{});
     defer session.deinit();

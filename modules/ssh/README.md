@@ -16,12 +16,18 @@ as the server. No `@panic` stubs remain in this module.
   / *signing* (server) for ssh-ed25519, rsa-sha2-256/512 (via the `rsa` module)
   and ecdsa-sha2-nistp256. Once a handshake completes, `Transport.negotiated`
   reports the negotiated KEX/host-key/cipher/MAC wire names (both roles) —
-  diagnostics parity with `ssh -v`'s negotiation banner.
+  diagnostics parity with `ssh -v`'s negotiation banner. **RFC 8308 extension
+  negotiation** is here too, both roles: `ext-info-c`/`ext-info-s` and
+  `SSH_MSG_EXT_INFO` carrying `server-sig-algs`.
 - **Part 2 — userauth** (`userauth.zig`): the `publickey` method (RFC 4252 §7)
   including the two-phase query → `SSH_MSG_USERAUTH_PK_OK` → signed-request
   flow, and the `password` method (§8), plus `_FAILURE`/`_SUCCESS`/`_BANNER` —
   both roles. The signature is bound to the transport's session id (see
-  SPEC.md §2: that binding is the security property).
+  SPEC.md §2: that binding is the security property). The signature *algorithm*
+  comes from the server's `server-sig-algs` when it sent one, which is what
+  makes a real `ssh` willing to offer an **RSA** user key at all: an `ssh-rsa`
+  blob names no hash, and a client that is not told will not guess. A server's
+  `_BANNER` reaches the caller through `userauth.BannerHandler`.
 - **Part 3 — connection protocol** (`connection.zig`): `"session"` channels
   with real RFC 4254 §5.2 window/flow control, `CHANNEL_DATA` /
   `_EXTENDED_DATA` (stderr) / `_EOF` / `_CLOSE`, and the `"exec"` /
@@ -36,7 +42,8 @@ no skips.
 
 - **Model after:** RFC 4253 (Transport) / RFC 4251 (Architecture — wire types)
   / RFC 4252 (Authentication) / RFC 4254 (Connection) / RFC 8731
-  (curve25519-sha256) / RFC 8332, 8709, 5656 (host+user key algorithms).
+  (curve25519-sha256) / RFC 8332, 8709, 5656 (host+user key algorithms) /
+  RFC 8308 (extension negotiation, `server-sig-algs`).
   Design reference: ringtailsoftware/misshod (MIT) for architecture *shape*
   only — no source copied.
 - **Platform:** linux — the transport's `fillRandom` is a raw `getrandom(2)`
@@ -106,10 +113,11 @@ var t = ssh.transport.connect(&reader, &writer, gpa, .{
 // the signature is bound to t.session_id).
 const key = try ssh.userauth.AuthKey.fromOpenSSH(id_ed25519_text, null);
 try ssh.authenticate(&t, gpa, "alice", key);
-// ...or step-by-step / other methods:
+// ...or step-by-step / other methods — and this is the form that can show the
+// server's RFC 4252 §5.4 banner, which `authenticate` above has nowhere to put:
 // try t.requestService("ssh-userauth", &buf);
-// try ssh.userauth.authenticatePublickey(&t, gpa, "alice", key, .{});
-// try ssh.userauth.authenticatePassword(&t, gpa, "alice", secret);
+// try ssh.userauth.authenticatePublickey(&t, gpa, "alice", key, .{ .banner = my_banner });
+// try ssh.userauth.authenticatePassword(&t, gpa, "alice", secret, .{});
 
 // RFC 4254 exec: one call, stdout + stderr + exit status.
 var r = try ssh.exec(&t, gpa, "uname -a", .{});
@@ -152,7 +160,14 @@ fn runCommand(
 }
 
 const host_key = try ssh.server.HostKey.fromOpenSSH(openssh_key_v1_text, null);
-var st = try ssh.server.accept(&reader, &writer, gpa, .{ .host_keys = &.{host_key} });
+var st = try ssh.server.accept(&reader, &writer, gpa, .{
+    .host_keys = &.{host_key},
+    // RFC 8308 `server-sig-algs`, sent to any client that offered `ext-info-c`.
+    // Defaults to every algorithm `serveUserauth` can verify; narrow it (never
+    // widen it) if `authorized_key` below refuses some of them — advertising a
+    // name that hook then rejects leaves a client with nothing to fall back to.
+    .server_sig_algs = &.{ "ssh-ed25519", "rsa-sha2-512" },
+});
 
 var why: ssh.userauth.AuthFailure = undefined; // optional: what to log
 const auth = try ssh.userauth.serveUserauth(&st, gpa, .{

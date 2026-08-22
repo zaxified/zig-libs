@@ -34,10 +34,9 @@
 //! What this module does NOT have, and what this demo therefore refuses
 //! plainly rather than failing somewhere obscure: no PTY, no interactive
 //! shell, no port forwarding, no agent (SPEC.md "Backlog / deferred"); one
-//! session channel at a time, so a concurrent second one is refused; no
-//! SSH_MSG_EXT_INFO, so a real `ssh` will not offer an RSA user key to this
-//! server at all. Every one of those is said out loud at startup rather than
-//! left to be discovered as a hang.
+//! session channel at a time, so a concurrent second one is refused. Every one
+//! of those is said out loud at startup rather than left to be discovered as a
+//! hang.
 //!
 //! Built against the PUBLISHED module (`@import("ssh")`) only — no
 //! `test_deps`, no reaching into `src/`.
@@ -306,6 +305,21 @@ fn runServer(
     return 0;
 }
 
+/// What this server advertises in RFC 8308 `server-sig-algs` by default:
+/// everything `ssh.userauth.serveUserauth` can verify, which is the module's
+/// own `transport.public_key_algorithms`. Spelled out rather than referenced
+/// so the two lines below can differ, and so the startup banner can print the
+/// same text the wire carries.
+const default_sig_algs = [_][]const u8{ "ssh-ed25519", "rsa-sha2-512", "rsa-sha2-256", "ecdsa-sha2-nistp256" };
+const default_sig_algs_text = "ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256";
+
+/// …and what it advertises under `--strict-rsa`, whose whole point is that
+/// `rsa-sha2-256` is refused. Advertising a name this server's own hook then
+/// refuses is worse than saying nothing: the client offers it, gets one
+/// USERAUTH_FAILURE, and has no second algorithm to fall back to.
+const strict_rsa_sig_algs = [_][]const u8{ "ssh-ed25519", "rsa-sha2-512", "ecdsa-sha2-nistp256" };
+const strict_rsa_sig_algs_text = "ssh-ed25519,rsa-sha2-512,ecdsa-sha2-nistp256";
+
 /// Printed once at startup. Every line is a place where this module stops and
 /// a reader would otherwise meet a hang or a silence instead of an answer —
 /// the module's boundaries said out loud, which is the whole reason this
@@ -327,13 +341,19 @@ fn printServerBoundaries(opts: *const ServerOptions) void {
         \\  - a command's output is buffered whole before ANY of it is sent:
         \\    `CommandHandler` is a one-shot function, not a pipe, so `tail -f`
         \\    would produce nothing until it ended. Capped at {d} bytes.
-        \\  - no SSH_MSG_EXT_INFO / `server-sig-algs` (RFC 8308), so an OpenSSH
-        \\    client will NOT authenticate with an RSA user key here: it says
-        \\    "no mutual signature algorithm" and never sends one. ed25519 and
-        \\    ecdsa user keys are unaffected, and so is this demo's own client,
-        \\    which names rsa-sha2-256 without being told.
+        \\  - no keyboard-interactive, no hostbased, no certificates: an OpenSSH
+        \\    client with only one of those is out of luck (SPEC.md "Backlog").
         \\
-    , .{ max_sessions_per_connection, opts.max_output });
+        \\ssh-demo: what it DOES advertise (RFC 8308 SSH_MSG_EXT_INFO):
+        \\  server-sig-algs = {s}
+        \\  That name-list is why a real `ssh` will offer an RSA user key here:
+        \\  an `ssh-rsa` blob names no hash, so a client that is not told will
+        \\  not guess ("send_pubkey_test: no mutual signature algorithm").
+        \\
+    , .{ max_sessions_per_connection, opts.max_output, if (opts.strict_rsa)
+        strict_rsa_sig_algs_text
+    else
+        default_sig_algs_text });
 }
 
 fn parseServerArgs(
@@ -647,6 +667,14 @@ const ServerState = struct {
 
         var t = ssh.server.accept(&sr.interface, &sw.interface, self.gpa, .{
             .host_keys = self.host_keys,
+            // RFC 8308 §3.1 says a server "MUST enumerate all public key
+            // algorithms it might accept" — *might accept*, so the answer is
+            // this server's policy, not the module's capability. `--strict-rsa`
+            // makes `AuthorizedKeys.check` refuse `rsa-sha2-256`, so leaving it
+            // in the advertised list would send an RSA client to sign with a
+            // hash we then reject, with nothing left to try. Narrowing here
+            // instead makes an OpenSSH client sign SHA-512 the first time.
+            .server_sig_algs = if (self.opts.strict_rsa) &strict_rsa_sig_algs else &default_sig_algs,
         }) catch |err| {
             std.debug.print("ssh-demo: handshake with {s} failed: {t}\n", .{ peer, err });
             return;
@@ -693,12 +721,11 @@ const ServerState = struct {
                 // named here so a reader is not left guessing.
                 if (self.keys.why == .not_called and self.passwords.attempts == 0) {
                     std.debug.print(
-                        \\ssh-demo: no credential ever reached this server's hooks. If the client
-                        \\  was OpenSSH offering an RSA key, it will have said "no mutual signature
-                        \\  algorithm" and given up without sending one: this module never sends
-                        \\  SSH_MSG_EXT_INFO / `server-sig-algs` (RFC 8308), so an OpenSSH client
-                        \\  has no way to learn that rsa-sha2-256/512 are acceptable and refuses to
-                        \\  guess. ed25519 and ecdsa user keys are unaffected.
+                        \\ssh-demo: no credential ever reached this server's hooks — the client gave
+                        \\  up before offering one. With OpenSSH, `ssh -v` says which: "no mutual
+                        \\  signature algorithm" means its key type is not in the `server-sig-algs`
+                        \\  this server advertised (see the startup banner); "no more authentication
+                        \\  methods" means it had no key of any advertised type to offer.
                         \\
                     , .{});
                 }
@@ -2052,6 +2079,33 @@ fn displayKeyType(key_type: []const u8) []const u8 {
 // authentication
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Show the server's SSH_MSG_USERAUTH_BANNER (RFC 4252 §5.4) the way real
+/// `ssh` does: on stderr, before the login concludes, with the text
+/// SANITISED. §5.4 warns the message "may contain control character
+/// sequences" — it arrives from an as-yet-unauthenticated server, so printing
+/// it raw would let that server drive the user's terminal (cursor moves,
+/// colour, a fake password prompt). OpenSSH filters it through `strnvis`;
+/// this keeps printable ASCII plus newline and tab, and shows anything else
+/// as `?`.
+const banner_printer: ssh.userauth.BannerHandler = .{
+    .showFn = struct {
+        fn f(_: *anyopaque, message: []const u8, language: []const u8) void {
+            _ = language; // §5.4 sends one; nothing here is localised.
+            var line: [256]u8 = undefined;
+            var n: usize = 0;
+            for (message) |c| {
+                line[n] = if (c == '\n' or c == '\t' or (c >= 0x20 and c < 0x7f)) c else '?';
+                n += 1;
+                if (n == line.len) {
+                    std.debug.print("{s}", .{line[0..n]});
+                    n = 0;
+                }
+            }
+            if (n > 0) std.debug.print("{s}", .{line[0..n]});
+        }
+    }.f,
+};
+
 /// `publickey` first, `password` as the fallback — the order every SSH client
 /// uses, and the reason the module's `authenticate` takes a key rather than a
 /// list of methods: choosing between them is policy, so it is ours.
@@ -2061,9 +2115,24 @@ fn authenticateClient(
     transport: *ssh.transport.Transport,
     opts: *const ClientOptions,
 ) bool {
+    // RFC 4252 §5: the `ssh-userauth` service is requested ONCE per
+    // connection, whichever method follows — requesting it twice is a
+    // protocol error. Doing it here rather than inside the publickey branch
+    // is what lets both methods go through the per-method entry points, which
+    // is in turn what lets both pass a `BannerHandler`.
+    {
+        var buf: [8 * 1024]u8 = undefined;
+        transport.requestService("ssh-userauth", &buf) catch |err| {
+            std.debug.print("ssh-demo: ssh-userauth was refused: {t}\n", .{err});
+            return false;
+        };
+    }
+
     if (!opts.force_password) {
         if (loadIdentity(gpa, io, opts.identity)) |key| {
-            if (ssh.authenticate(transport, gpa, opts.user, key)) |_| {
+            if (ssh.userauth.authenticatePublickey(transport, gpa, opts.user, key, .{
+                .banner = banner_printer,
+            })) |_| {
                 std.debug.print("debug1: Authentication succeeded (publickey).\n", .{});
                 return true;
             } else |err| switch (err) {
@@ -2094,16 +2163,9 @@ fn authenticateClient(
         gpa.free(password);
     }
 
-    if (opts.force_password) {
-        // Nothing has requested `ssh-userauth` yet on this path.
-        var buf: [8 * 1024]u8 = undefined;
-        transport.requestService("ssh-userauth", &buf) catch |err| {
-            std.debug.print("ssh-demo: ssh-userauth was refused: {t}\n", .{err});
-            return false;
-        };
-    }
-
-    ssh.userauth.authenticatePassword(transport, gpa, opts.user, password) catch |err| switch (err) {
+    ssh.userauth.authenticatePassword(transport, gpa, opts.user, password, .{
+        .banner = banner_printer,
+    }) catch |err| switch (err) {
         error.AuthenticationFailed => {
             std.debug.print("ssh-demo: permission denied for user {s}\n", .{opts.user});
             return false;

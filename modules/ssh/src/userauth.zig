@@ -13,7 +13,15 @@
 //!   - the `publickey` method (§7) including the two-phase
 //!     query→SSH_MSG_USERAUTH_PK_OK→signed-request flow,
 //!   - the `password` method (§8), without the password-change sub-protocol,
-//!   - SSH_MSG_USERAUTH_FAILURE / _SUCCESS / _BANNER.
+//!   - SSH_MSG_USERAUTH_FAILURE / _SUCCESS / _BANNER (the banner reaching the
+//!     caller through `BannerHandler`, not dropped).
+//!
+//! RFC 8308 is what decides which signature algorithm a `publickey` request
+//! names. The transport layer records the server's `server-sig-algs` on
+//! `Transport.server_sig_algs`; `signingKeyFor` below turns that into the
+//! algorithm this key signs with, which matters for exactly one key type —
+//! an `ssh-rsa` blob names no hash, so `rsa-sha2-256` and `rsa-sha2-512` are
+//! both valid for it and a peer has to say which it will take.
 //!
 //! **The load-bearing security property is the session-id binding.** The
 //! `publickey` signature (§7) is computed over
@@ -135,11 +143,45 @@ pub fn signedBlob(
 
 // ── client side ────────────────────────────────────────────────────────────
 
+/// Caller seam for SSH_MSG_USERAUTH_BANNER (RFC 4252 §5.4): the server's
+/// message to a human, sent before authentication concludes. Real `ssh`
+/// prints it; this module used to validate it and drop it on the floor, with
+/// no way for a caller to get at it at all.
+///
+/// ⚠ `message` and `language` are borrowed for the duration of the call —
+/// they point into the packet scratch buffer the next packet reuses. §5.4
+/// also warns that the text is attacker-controlled: it "may contain control
+/// character sequences", so a handler that writes it to a terminal should
+/// filter it (`ssh` does).
+///
+/// `ctx` is the caller's own state, handed back untouched — same idiom as
+/// `AuthorizedKeyCheck` and `transport.HostKeyVerifier`; leave it at
+/// `transport.no_context` for a stateless handler.
+pub const BannerHandler = struct {
+    ctx: *anyopaque = transport.no_context,
+    showFn: *const fn (ctx: *anyopaque, message: []const u8, language: []const u8) void,
+
+    pub fn show(self: BannerHandler, message: []const u8, language: []const u8) void {
+        self.showFn(self.ctx, message, language);
+    }
+};
+
+/// Client-side `password` options. Only a banner seam for now — the §8
+/// method has no `probe_first` equivalent and authenticates for
+/// `ssh-connection` unconditionally.
+pub const PasswordOptions = struct {
+    /// Where to deliver an SSH_MSG_USERAUTH_BANNER; `null` discards it.
+    banner: ?BannerHandler = null,
+};
+
 /// Client-side `publickey` options.
 pub const PublickeyOptions = struct {
     /// Service to authenticate for (RFC 4252 §5). Only `ssh-connection` is
     /// meaningful; exposed for completeness.
     service: []const u8 = connection_service,
+    /// Where to deliver an SSH_MSG_USERAUTH_BANNER. `null` keeps the old
+    /// behavior: the banner is still bounds-checked, then discarded.
+    banner: ?BannerHandler = null,
     /// Do the RFC 4252 §7 two-phase flow: first a signature-less *query*
     /// request, and only after SSH_MSG_USERAUTH_PK_OK the real signed one.
     /// This is what OpenSSH does (it avoids computing a signature — and
@@ -157,8 +199,13 @@ pub const PublickeyOptions = struct {
 /// use `authenticate` below, which does both.
 ///
 /// Returns normally on SSH_MSG_USERAUTH_SUCCESS; `error.AuthenticationFailed`
-/// on SSH_MSG_USERAUTH_FAILURE. SSH_MSG_USERAUTH_BANNER (§5.4) is skipped,
-/// SSH_MSG_IGNORE/DEBUG are skipped.
+/// on SSH_MSG_USERAUTH_FAILURE. SSH_MSG_USERAUTH_BANNER (§5.4) goes to
+/// `opts.banner` if the caller set one; SSH_MSG_IGNORE/DEBUG are skipped and
+/// an RFC 8308 SSH_MSG_EXT_INFO is absorbed.
+///
+/// The signature algorithm is NOT simply `key.algorithmName()`: if the server
+/// sent `server-sig-algs` (RFC 8308 §3.1), the strongest name it accepts for
+/// this key's type is used instead. See `signingKeyFor`.
 pub fn authenticatePublickey(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
@@ -191,13 +238,19 @@ pub fn authenticatePublickeyBoundTo(
     const scratch = try gpa.alloc(u8, scratch_len);
     defer gpa.free(scratch);
 
-    const algorithm = key.algorithmName();
-    const blob = try key.publicBlob(gpa);
+    // RFC 8308 §3.1: prefer a signature algorithm the server SAID it accepts
+    // over the one this key happens to be pinned to. Only `ssh-rsa` keys have
+    // a choice at all (their blob type names no hash), and `fromOpenSSH` pins
+    // those to `rsa-sha2-256` — so a server that accepts `rsa-sha2-512` now
+    // gets SHA-512 without the caller having to reach into the key.
+    const signing_key = signingKeyFor(key, t.server_sig_algs);
+    const algorithm = signing_key.algorithmName();
+    const blob = try signing_key.publicBlob(gpa);
     defer gpa.free(blob);
 
     if (opts.probe_first) {
         try sendPublickeyRequest(t, gpa, user, opts.service, algorithm, blob, null);
-        switch (try awaitAuthReply(t, scratch)) {
+        switch (try awaitAuthReply(t, scratch, opts.banner)) {
             .pk_ok => {},
             .failure => return error.AuthenticationFailed,
             // A server must not conclude authentication from a query that
@@ -214,15 +267,42 @@ pub fn authenticatePublickeyBoundTo(
     defer gpa.free(to_sign);
     var bw: std.Io.Writer = .fixed(to_sign);
     try signedBlob(&bw, session_id, user, opts.service, algorithm, blob);
-    const signature = try key.sign(gpa, bw.buffered());
+    const signature = try signing_key.sign(gpa, bw.buffered());
     defer gpa.free(signature);
 
     try sendPublickeyRequest(t, gpa, user, opts.service, algorithm, blob, signature);
-    switch (try awaitAuthReply(t, scratch)) {
+    switch (try awaitAuthReply(t, scratch, opts.banner)) {
         .success => return,
         .failure => return error.AuthenticationFailed,
         .pk_ok => return error.ProtocolError,
     }
+}
+
+/// `key`, with its RFC 4252 §7 signature algorithm chosen against the
+/// server's RFC 8308 §3.1 `server-sig-algs` instead of blindly.
+///
+/// Only the `ssh-rsa` variant can differ from `key` itself: `ssh-ed25519` and
+/// `ecdsa-sha2-nistp256` each have exactly one signature algorithm name,
+/// which is why a foreign server never had to tell our client anything for
+/// those to work — and why the whole defect this function exists for was
+/// invisible until an RSA user key met a real OpenSSH peer.
+///
+/// `server_sig_algs` is `null` when the server sent no SSH_MSG_EXT_INFO. RFC
+/// 8308 §3.1: a client then "MUST NOT make any assumptions about the server's
+/// public key algorithm support" — so the key's own name is used unchanged,
+/// exactly as before this existed. The same fallback covers a server that
+/// sent the extension but named nothing we can sign with: §3.1 explicitly
+/// allows a client to "send a user authentication request using a public key
+/// algorithm not included in server-sig-algs", and one refused attempt is a
+/// better answer than refusing to try.
+fn signingKeyFor(key: AuthKey, server_sig_algs: ?transport.ServerSigAlgs) AuthKey {
+    const algs = server_sig_algs orelse return key;
+    if (key != .rsa) return key;
+    // Strongest first — `pick` walks in the caller's preference order.
+    const chosen = algs.pick(&.{ "rsa-sha2-512", "rsa-sha2-256" }) orelse return key;
+    var out = key;
+    out.rsa.hash = if (std.mem.eql(u8, chosen, "rsa-sha2-512")) .sha2_512 else .sha2_256;
+    return out;
 }
 
 /// Client: authenticate as `user` with `password` (RFC 4252 §8). Same
@@ -233,11 +313,17 @@ pub fn authenticatePublickeyBoundTo(
 /// transport — which is exactly why RFC 4252 §8 requires the transport to
 /// provide confidentiality. This function scrubs its own request buffer, but
 /// cannot scrub the packet-encoding scratch inside `writePacket`.
+///
+/// `opts` exists only so a password client can be shown the server's
+/// SSH_MSG_USERAUTH_BANNER too — the §5.4 banner is not tied to a method, and
+/// "log in with a password" is precisely the case where a server has
+/// something to say first.
 pub fn authenticatePassword(
     t: *transport.Transport,
     gpa: std.mem.Allocator,
     user: []const u8,
     password: []const u8,
+    opts: PasswordOptions,
 ) UserauthError!void {
     if (user.len > max_user_len) return error.NameTooLong;
     if (password.len > max_password_len) return error.NameTooLong;
@@ -259,7 +345,7 @@ pub fn authenticatePassword(
     try messages.writeString(&w, password);
     try t.sendPacket(w.buffered());
 
-    switch (try awaitAuthReply(t, scratch)) {
+    switch (try awaitAuthReply(t, scratch, opts.banner)) {
         .success => return,
         .failure => return error.AuthenticationFailed,
         // SSH_MSG_USERAUTH_PASSWD_CHANGEREQ shares message number 60; the
@@ -310,20 +396,32 @@ const AuthReply = enum { success, failure, pk_ok };
 
 /// Read packets until one is an authentication verdict, skipping the
 /// informational messages RFC 4252/4253 allow at any point (BANNER, IGNORE,
-/// DEBUG). Anything else from the peer is a protocol error rather than
-/// something to guess about.
-fn awaitAuthReply(t: *transport.Transport, scratch: []u8) UserauthError!AuthReply {
+/// DEBUG) and absorbing an RFC 8308 SSH_MSG_EXT_INFO. Anything else from the
+/// peer is a protocol error rather than something to guess about.
+fn awaitAuthReply(t: *transport.Transport, scratch: []u8, banner: ?BannerHandler) UserauthError!AuthReply {
     var seen: usize = 0;
     while (seen < 64) : (seen += 1) {
         const pkt = try t.recvPacket(scratch);
         switch (@as(messages.MessageType, @enumFromInt(msgType(pkt)))) {
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
+            // RFC 8308 §2.4's SECOND opportunity: a server may send EXT_INFO
+            // "immediately preceding" SSH_MSG_USERAUTH_SUCCESS, and §2.4 says
+            // a client that sent `ext-info-c` "MUST accept a server's
+            // SSH_MSG_EXT_INFO at both opportunities but MUST NOT require
+            // it". Our `clientHandshake` always sends the indicator, so this
+            // arm is not optional.
+            .SSH_MSG_EXT_INFO => {
+                try t.takeExtInfo(pkt.payload);
+                continue;
+            },
             .SSH_MSG_USERAUTH_BANNER => {
-                // §5.4: string message || string language tag. Validated
-                // (bounded) and discarded — displaying it is caller policy.
+                // §5.4: string message || string language tag. Bounded, then
+                // handed to the caller's seam if it has one — displaying it
+                // is still caller policy, but there is now a way to.
                 var c = Cursor{ .b = pkt.payload[1..] };
                 const msg = try c.string();
                 if (msg.len > max_banner_len) return error.NameTooLong;
+                if (banner) |h| h.show(msg, try c.string());
                 continue;
             },
             .SSH_MSG_USERAUTH_SUCCESS => return .success,

@@ -35,6 +35,31 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `server_host_key_algorithms` (ssh-ed25519, rsa-sha2-256/512, ecdsa-sha2-nistp256),
   `encryption_algorithms` (chacha20-poly1305@openssh.com, aes256-ctr, aes256-gcm@openssh.com,
   aes128-gcm@openssh.com), `mac_algorithms` (hmac-sha2-256), `compression_algorithms` (none only).
+  One list is caller-narrowable, and only downward: `ServerConfig.server_sig_algs` (below).
+- **RFC 8308 extension negotiation, both roles.** The client appends `ext-info-c` and the server
+  `ext-info-s` to the `kex_algorithms` they *send* (§2.1); `transport.kex_algorithms`, the list both
+  sides negotiate against, never contains either, so §2.2's "if these names become negotiated as key
+  exchange methods, the parties MUST disconnect" is structurally unreachable rather than checked at
+  runtime. A server that saw `ext-info-c` sends `SSH_MSG_EXT_INFO` carrying `server-sig-algs` (§3.1)
+  as the first packet after its `SSH_MSG_NEWKEYS` — §2.4's first opportunity, which is the one that
+  matters: a client chooses its signature algorithm before its first `SSH_MSG_USERAUTH_REQUEST`. A
+  client that did not advertise the indicator is sent **nothing**, not an empty message, because to
+  such a peer message 7 is an unknown transport message. Both roles accept a peer's
+  `SSH_MSG_EXT_INFO` at both §2.4 opportunities and ignore extensions they do not implement (§2.5);
+  this module sends none as a client.
+  **Why it is load-bearing rather than cosmetic:** an `ssh-rsa` key blob names no hash, so
+  `rsa-sha2-256` and `rsa-sha2-512` are both valid for it and a client that is not told will not
+  guess — real `ssh` logs `send_pubkey_test: no mutual signature algorithm` and never offers the key.
+  `ssh-ed25519` and `ecdsa-sha2-nistp256` each have exactly one name and were never affected.
+  What a server advertises is `ServerConfig.server_sig_algs`, defaulting to
+  `transport.public_key_algorithms` — the four names `serveUserauth` can verify, pinned to
+  `keyBlobTypeFor`/`verifySignature` by a test in both directions. A caller whose own
+  `AuthorizedKeyCheck` is stricter **narrows** it; widening it would advertise a name the hook then
+  refuses, leaving a client with one failed attempt and no second choice. Verification is *not*
+  restricted to the advertised list — §3.1 explicitly allows a client to use an algorithm not in it.
+  Client side, `userauth.authenticatePublickey` picks the strongest name the server accepts for the
+  key's type from `Transport.server_sig_algs`, falling back to the key's own name when the server
+  sent no extension (§3.1: a client "MUST NOT make any assumptions" then).
 - **Host-key trust is entirely the caller's concern (client side).** `HostKeyVerifier` is a
   caller-supplied policy — no known_hosts file, TOFU policy or pinning lives in this module.
   Symmetrically, **user-key trust is the caller's concern on the server side**:
@@ -188,7 +213,19 @@ environment with OpenSSH installed.
     signature;
   - **real `ssh` client → our server: the real client's `publickey` signature verified by our
     `serveUserauth`, then `exec` served by our `serveSession`**, asserting the client's captured
-    stdout and the exit status it reports (3).
+    stdout and the exit status it reports (3);
+  - **the two RFC 8308 lanes, which are the only tests here a foreign peer's *algorithm choice*
+    can break.** (a) A real `ssh` with an **RSA** user key against our server: `ssh-ed25519` and
+    `ecdsa` user keys each have exactly one signature algorithm, so a client can offer them
+    knowing nothing about the server, and every other lane above is blind to `server-sig-algs`.
+    (b) **Our client** with an RSA user key against a real `sshd` run with
+    `PubkeyAcceptedAlgorithms=rsa-sha2-512` — an oracle for the client half, because
+    `AuthKey.fromOpenSSH` hands us that key pinned to `rsa-sha2-256`, so a client that does not
+    read the extension signs with a hash this `sshd` refuses. Each lane was mutation-checked
+    against the *other* half of the feature and stayed green, so neither is standing in for the
+    other: removing the server's `EXT_INFO` send fails only (a) (`EndOfStream` — the real client
+    leaves without ever sending a credential), and making the client ignore `server-sig-algs`
+    fails only (b) (`AuthenticationFailed`).
 
   Both live tests were confirmed to actually execute (not silently skip) by poisoning their
   assertions and observing the failures. Caveat inherited from the pre-existing live-test harness:
@@ -217,6 +254,35 @@ Parts 1-3 are implemented. What is deliberately *not* here:
   `ServeConfig.stdin_mode` chooses between buffering CHANNEL_DATA until the client's EOF and then
   running (`.collect_until_eof`, the default) or running immediately with empty stdin
   (`.ignore`). Streaming a handler's stdin/stdout as it runs would need a different handler shape.
+- **Nothing answers SSH_MSG_UNIMPLEMENTED (RFC 4253 §11.4).** A message this module does not
+  recognise ends the connection with `error.ProtocolError`; the RFC's answer is message 3, naming
+  the offending sequence number, with the connection continuing. This is why RFC 8308 §2.2 forbids
+  sending `SSH_MSG_EXT_INFO` to a peer that did not advertise the indicator — an unaware peer is
+  *supposed* to shrug it off, and here it would not have. It is also the shape that made the
+  EXT_INFO work bidirectional: having advertised `ext-info-s`, the server must tolerate the
+  client's reply rather than call it a protocol error.
+- **A wrongly-guessed first KEX packet is handled server-side only.** RFC 4253 §7 lets a peer set
+  `first_kex_packet_follows` and send its guessed KEX packet immediately; if the guess disagrees
+  with what was negotiated, the receiver MUST discard that packet. `serverHandshake` does
+  (`client_kex.first_kex_packet_follows`); `clientHandshake` decodes the server's flag and ignores
+  it, so a *guessing server* would desynchronise our client by one packet. No known implementation
+  guesses — OpenSSH never sets the flag — and neither side of this is covered by a test, so the
+  server's discard path is untested code as much as the client's is missing code. Recorded rather
+  than half-fixed: an honest fix is the mirror of the server's branch **plus** a mock peer that
+  actually guesses wrong, which no harness here has.
+- **The client sends no RFC 8308 extensions of its own.** It advertises `ext-info-c` (which is what
+  makes the server send `server-sig-algs`) and accepts a server's `SSH_MSG_EXT_INFO`, but sends
+  none itself: `delay-compression` needs compression, `no-flow-control` contradicts the §5.2 window
+  accounting, and `elevation` is Windows-specific.
+- **`languages_client_to_server`/`languages_server_to_client` are decoded and never read**, and the
+  `reserved` `uint32` likewise. Both are per RFC 4253 §7.1: the language name-lists are advisory
+  (this module sends them empty) and `reserved` is "for future extension", to be sent as 0. Named
+  here only because "decoded and discarded" is otherwise indistinguishable from an oversight.
+- **`kex-strict-*-v00@openssh.com` (OpenSSH's strict-KEX hardening) is not implemented and not
+  advertised.** An OpenSSH client offers `kex-strict-c-v00@openssh.com` on every connection; this
+  module never sends the server half, so the mode stays off, which is the safe direction —
+  advertising it without the sequence-number reset and the "no unexpected messages during KEX"
+  discipline it names would be the dangerous half.
 - **Rekeying** (RFC 4253 §9) is still not represented in `Transport`; the fixed algorithm-menu
   constants are still not runtime-configurable. RFC 8731 publishes no curve25519-sha256 test
   vectors anywhere — its §5 is IANA Considerations only, and the RFC as a whole has no
