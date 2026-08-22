@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — `example/main.zig` became `modbus-demo`, one binary with two
+  modes (`server` and `client`) that exchange real frames over a real TCP
+  socket instead of an in-process loopback. The server half is the listen /
+  accept / delimit-MBAP / dispatch loop the module deliberately does not ship
+  (`handleAdu` is a pure function by design); the client half reads all four
+  data areas, writes a coil and registers, builds the three server-only PDUs
+  (0x07, 0x08, 0x11) by hand, and provokes an exception. Cross-checked live
+  against pymodbus 3.14.0 in both directions — its `ModbusTcpClient` against
+  our server, our client against its `ModbusTcpServer`. Two gaps the demo
+  surfaced, both documented in the example rather than worked around:
+  `Client.exchangePdu` is private, so "use `Client`'s framing" for a
+  hand-built PDU means re-implementing it; and `TcpTransport` has no read
+  deadline, so a master blocks forever whenever a slave legitimately stays
+  silent (`TransportError.Timeout` is unreachable through that transport).
 - **2026-08-22** — `TransportError` gained a `Canceled` variant so a `std.Io`
   cancellation (`Future.cancel`) surfaces distinctly from `TransportFailed`
   and from `Timeout`. `TcpTransport.exchangeFn` recovers it from the concrete
