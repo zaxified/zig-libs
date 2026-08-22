@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `TcpTransport` now surfaces `error.Canceled` (a new
+  `TransportError` variant) instead of `error.ReadFailed`/`error.WriteFailed`
+  when a blocked read or write is interrupted by `std.Io`'s `Future.cancel`.
+  Covers both the direct blocking read and the `read_timeout_ms` poll path,
+  which is not itself a `std.Io` cancellation point and needed an explicit
+  `checkCancel` after the wait to see the request at all. Separately,
+  `Client.awaitNotification`'s retry loop used to catch every `poll` failure
+  — including `Canceled` — and just try again, so a canceled wait came back
+  indistinguishable from "no termination arrived yet" (`error.NoResponse`
+  after burning through every round). It now propagates `Canceled`
+  immediately and leaves every other transient failure retrying as before.
+  The `Link`/`LinkError` seam (GOOSE/SV, layer-2) is untouched — this module
+  takes no raw socket of its own for it, so there is nothing here that owns
+  an fd to recover a cancellation from.
 - **2026-08-18** — Portability fix (`check-portable`): `ber.encodeLength`'s multi-byte
   branch shifted its `usize` length by a hardcoded `shift: u6`. On a 32-bit target
   `Log2Int(usize)` is `u5`, so `v >> shift` failed to compile (`u6` doesn't coerce down

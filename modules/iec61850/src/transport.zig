@@ -46,10 +46,16 @@ pub const TransportError = error{
     WriteFailed,
     /// The peer closed the stream.
     EndOfStream,
+    /// The blocking operation was canceled through the `std.Io` cancellation
+    /// protocol (`Future.cancel`). Surfaced instead of `ReadFailed`/
+    /// `WriteFailed` so a caller can tell a canceled wait from a real
+    /// transport failure.
+    Canceled,
 };
 
 /// A byte stream. `read` returning 0 means "nothing available this round" and
-/// is **not** end of stream — that is `error.EndOfStream`.
+/// is **not** end of stream — that is `error.EndOfStream` — and not a
+/// cancellation either, which is `error.Canceled`.
 pub const Transport = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -139,15 +145,48 @@ pub const TcpTransport = struct {
         self.read_timeout_ms = milliseconds;
     }
 
-    fn waitReadable(self: *TcpTransport) bool {
+    /// `std.posix.poll` is **not** a `std.Io` cancellation point: it restarts
+    /// itself on `EINTR`, so the signal `Future.cancel` sends is swallowed and
+    /// the wait still runs to its full timeout. Without the explicit
+    /// `checkCanceled` below, a canceled read would come back as `false` and
+    /// then as `0` from `readFn` — "nothing available this round" — and the
+    /// caller would keep polling a connection it had already abandoned.
+    fn waitReadable(self: *TcpTransport) TransportError!bool {
         const ms = self.read_timeout_ms orelse return true;
         var fds = [_]std.posix.pollfd{.{
             .fd = self.stream.socket.handle,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        const n = std.posix.poll(&fds, @intCast(ms)) catch return true;
-        return n != 0;
+        // A poll that fails outright defers to the real read, which reports
+        // the failure properly — but a cancel must not be lost on that path.
+        const n = std.posix.poll(&fds, @intCast(ms)) catch {
+            try self.checkCanceled();
+            return true;
+        };
+        if (n != 0) return true;
+        try self.checkCanceled();
+        return false;
+    }
+
+    /// `Io.checkCancel` acknowledges the request, so it reports a pending
+    /// cancel exactly once — the answer has to be turned into the error here
+    /// and not asked for again.
+    fn checkCanceled(self: *TcpTransport) TransportError!void {
+        self.io.checkCancel() catch return error.Canceled;
+    }
+
+    /// Distinguish a canceled wait from a genuine read failure. `Io.Reader`'s
+    /// error set cannot carry `Canceled`; the concrete reader records it here.
+    fn readFailure(self: *TcpTransport) TransportError {
+        if (self.reader.?.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.ReadFailed;
+    }
+
+    /// The writer side of `readFailure`.
+    fn writeFailure(self: *TcpTransport) TransportError {
+        if (self.writer.?.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.WriteFailed;
     }
 
     pub fn transport(self: *TcpTransport) Transport {
@@ -169,16 +208,20 @@ pub const TcpTransport = struct {
         self.ensure();
         if (buf.len < tpkt.header_len) return error.ReadFailed;
         const r = &self.reader.?.interface;
-        if (r.bufferedLen() == 0 and !self.waitReadable()) return 0;
+        if (r.bufferedLen() == 0 and !try self.waitReadable()) return 0;
         r.readSliceAll(buf[0..tpkt.header_len]) catch |e| switch (e) {
             error.EndOfStream => return error.EndOfStream,
-            else => return error.ReadFailed,
+            error.ReadFailed => return self.readFailure(),
         };
         const total = tpkt.peekLength(buf[0..tpkt.header_len]) catch return error.ReadFailed;
         if (total > buf.len) return error.ReadFailed;
         // Past the header there is no graceful idle: a stall here means the
-        // peer stopped mid-packet and the connection is unusable.
-        r.readSliceAll(buf[tpkt.header_len..total]) catch return error.ReadFailed;
+        // peer stopped mid-packet and the connection is unusable, so even a
+        // clean close counts as a failure. A cancel is still a cancel.
+        r.readSliceAll(buf[tpkt.header_len..total]) catch |e| switch (e) {
+            error.EndOfStream => return error.ReadFailed,
+            error.ReadFailed => return self.readFailure(),
+        };
         return total;
     }
 
@@ -186,8 +229,8 @@ pub const TcpTransport = struct {
         const self: *TcpTransport = @ptrCast(@alignCast(ctx));
         self.ensure();
         const w = &self.writer.?.interface;
-        w.writeAll(bytes) catch return error.WriteFailed;
-        w.flush() catch return error.WriteFailed;
+        w.writeAll(bytes) catch return self.writeFailure();
+        w.flush() catch return self.writeFailure();
     }
 };
 
@@ -506,4 +549,96 @@ fn regressionReadFrame(t: Transport, buf: []u8) !usize {
         if (n != 0) return n;
     }
     return error.ReadTimeout;
+}
+
+// ── cancellation ───────────────────────────────────────────────────────────
+//
+// `Future.cancel` does unblock a thread parked in a socket read, but the
+// reason is erased twice on the way out: `Io.Reader.Error` has no `Canceled`
+// variant (only the concrete reader's out-of-band `err` field keeps it), and
+// this file used to fold every reader failure into `error.ReadFailed`. Both
+// tests below run against a listener that accepts and then never writes, so
+// the read really is parked when the cancel arrives.
+
+fn acceptOne(
+    server: *std.Io.net.Server,
+    io: std.Io,
+) std.Io.net.Server.AcceptError!std.Io.net.Stream {
+    return server.accept(io);
+}
+
+/// The blocking call under test, on its own thread so it can be canceled.
+fn readOnce(t: *TcpTransport, buf: []u8) TransportError!usize {
+    return t.transport().read(buf);
+}
+
+/// A connected `TcpTransport` plus the accepted peer that will stay silent.
+const SilentPeer = struct {
+    tt: TcpTransport,
+    peer: std.Io.net.Stream,
+
+    /// `error.SkipZigTest` when loopback is not usable, which is how the rest
+    /// of the collection's socket tests behave on a sandboxed runner.
+    fn open(io: std.Io, server: *std.Io.net.Server) !SilentPeer {
+        var accept_fut = try io.concurrent(acceptOne, .{ server, io });
+        const tt = TcpTransport.connect(io, server.socket.address) catch |err| {
+            if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
+            if (verboseSkip()) std.debug.print("loopback connect failed ({t}), skipping\n", .{err});
+            return error.SkipZigTest;
+        };
+        return .{ .tt = tt, .peer = try accept_fut.await(io) };
+    }
+
+    fn close(self: *SilentPeer, io: std.Io) void {
+        self.peer.close(io);
+        self.tt.close();
+    }
+};
+
+fn silentListener(io: std.Io) !std.Io.net.Server {
+    // Port 0: an ephemeral port cannot collide with a parallel test run.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    return addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        if (verboseSkip()) std.debug.print("loopback listen failed ({t}), skipping\n", .{err});
+        return error.SkipZigTest;
+    };
+}
+
+test "a canceled blocking read surfaces Canceled, not ReadFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    var buf: [4096]u8 = undefined;
+    var fut = try io.concurrent(readOnce, .{ &fixture.tt, &buf });
+    // Long enough that the read is certainly parked in the kernel.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+test "a cancel during the read timeout's poll is not reported as an idle round" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    // With a timeout set, the read never reaches `std.Io` at all: it waits in
+    // `poll(2)`, which restarts on the cancel's signal. The cancel therefore
+    // only becomes visible after the full 600 ms elapse — and a `waitReadable`
+    // that did not ask `std.Io` would return `false`, making `read` answer `0`
+    // for "nothing available this round" and the caller poll on forever.
+    fixture.tt.setReadTimeout(600);
+    var buf: [4096]u8 = undefined;
+    var fut = try io.concurrent(readOnce, .{ &fixture.tt, &buf });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }

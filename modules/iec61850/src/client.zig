@@ -707,7 +707,17 @@ pub const Client = struct {
         if (self.last_notification) |n| return n;
         var i: u32 = 0;
         while (i < rounds) : (i += 1) {
-            _ = self.poll() catch continue;
+            // A `Canceled` read means the caller's own wait was interrupted,
+            // not that this round found nothing — swallowing it here as just
+            // another failed round would make a canceled wait indistinguishable
+            // from "no termination yet", and the loop would spin `rounds` more
+            // times on a connection nothing is going to answer on. Every other
+            // failure keeps retrying as before: `poll` reading a transient
+            // hiccup is exactly what this loop exists to ride out.
+            _ = self.poll() catch |e| {
+                if (e == error.Canceled) return error.Canceled;
+                continue;
+            };
             if (self.last_notification) |n| return n;
         }
         return error.NoResponse;
@@ -1020,4 +1030,37 @@ test "invoke ids advance and never reach the reserved zero" {
     try testing.expectEqual(@as(u32, std.math.maxInt(u32)), c.takeInvokeId());
     try testing.expectEqual(@as(u32, 1), c.takeInvokeId());
     try testing.expectEqual(@as(u32, 2), c.takeInvokeId());
+}
+
+/// A `Transport` double whose `read` always answers `error.Canceled`, standing
+/// in for a real socket whose blocked read was interrupted by `std.Io`'s
+/// cancellation protocol.
+const CancelingLink = struct {
+    fn readFn(ctx: *anyopaque, buf: []u8) transport.TransportError!usize {
+        _ = ctx;
+        _ = buf;
+        return error.Canceled;
+    }
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) transport.TransportError!void {
+        _ = ctx;
+        _ = bytes;
+    }
+    fn transport_(self: *CancelingLink) transport.Transport {
+        return .{ .ctx = self, .vtable = &.{ .read = readFn, .write = writeFn } };
+    }
+};
+
+test "awaitNotification propagates Canceled instead of retrying it as an empty round" {
+    var link: CancelingLink = .{};
+    var buf: [8192]u8 = undefined;
+    var c = try Client.init(link.transport_(), &buf, .{});
+    // Bypass the handshake: this test is only about how a poll failure is
+    // classified, not about association setup.
+    c.connected = true;
+    // A large round count pins the bug this guards against: before the fix,
+    // `_ = self.poll() catch continue;` swallowed `Canceled` exactly like any
+    // other transient failure and looped all the way to `error.NoResponse` —
+    // indistinguishable from "nothing arrived yet". A canceled wait must come
+    // back immediately, on the first round, as `error.Canceled`.
+    try testing.expectError(error.Canceled, c.awaitNotification(1000));
 }
