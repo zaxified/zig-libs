@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `TransportError` and `client.Error` gained a `Canceled` variant, and
+  `TcpTransport` now recovers it at the socket boundary. A `std.Io` cancellation
+  (`Future.cancel`) was being erased twice on its way to a caller: `Io.Reader.Error` has
+  no `Canceled` variant — the concrete `std.Io.net.Stream.Reader` keeps the real cause in
+  its out-of-band `err` field — and `readFn`/`writeFn` then folded every failure into
+  `ReadFailed`/`WriteFailed`, so an orderly shutdown was indistinguishable from a dead
+  peer. `readFn`/`writeFn` consult that `err` field before mapping, and `client` widens
+  transport errors through one exhaustive `fromTransport` switch instead of four
+  hand-written ones, so a future variant cannot silently arrive as something else.
+  Separately, `waitReadable` (the `poll(2)` behind `setReadTimeout`) is **not** a `std.Io`
+  cancellation point: `std.posix.poll` restarts itself on `EINTR`, so the cancel's signal
+  was swallowed and a canceled read came back as `0` — "nothing available this round" —
+  leaving a caller polling a connection it had already abandoned. It now asks
+  `Io.checkCancel` once the wait ends. `UdpDiscovery` needed no change: it is not a
+  `Transport`, and `Socket.receive`/`receiveTimeout` already carry `Io.Cancelable`.
+  Two tests cover it (blocking read, and the `poll` path); both were confirmed to fail
+  with the recovery removed.
 - **2026-08-18** — Portability fix (`check-portable`): the "huge index" overflow test
   built `wrapping_index` from a hardcoded `1 << 63`, which doesn't fit `usize` on a
   32-bit target. The literal's job was "half of `usize`'s range, rounded up, so `* 2`

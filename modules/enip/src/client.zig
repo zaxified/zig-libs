@@ -38,6 +38,11 @@ pub const Error = error{
     ReadFailed,
     WriteFailed,
     EndOfStream,
+    /// The blocking operation was canceled through the `std.Io` cancellation
+    /// protocol (`Future.cancel`). Surfaced instead of `ReadFailed`/
+    /// `WriteFailed` so a caller can tell a canceled wait from a real
+    /// transport failure.
+    Canceled,
     /// The peer answered a different command than was asked.
     UnexpectedCommand,
     /// The peer answered with a non-zero encapsulation status.
@@ -99,6 +104,21 @@ pub const Connection = struct {
 /// come out of the caller's slice.
 pub const min_buffer: usize = 1024;
 
+/// Widens a `TransportError` into the client's error set.
+///
+/// Written as an exhaustive switch rather than a catch-all so that a variant
+/// added to the seam cannot silently arrive here as something else — which is
+/// exactly how `Canceled` used to come out as `ReadFailed`, telling a caller
+/// its connection had died when it had only been shut down.
+fn fromTransport(e: transport.TransportError) Error {
+    return switch (e) {
+        error.ReadFailed => error.ReadFailed,
+        error.WriteFailed => error.WriteFailed,
+        error.EndOfStream => error.EndOfStream,
+        error.Canceled => error.Canceled,
+    };
+}
+
 pub const Client = struct {
     t: Transport,
     tx: []u8,
@@ -136,11 +156,7 @@ pub const Client = struct {
             .data = data,
             .total_len = 0,
         }, self.rx) catch return error.BufferTooSmall;
-        self.t.write(framed) catch |e| return switch (e) {
-            error.WriteFailed => error.WriteFailed,
-            error.ReadFailed => error.ReadFailed,
-            error.EndOfStream => error.EndOfStream,
-        };
+        self.t.write(framed) catch |e| return fromTransport(e);
         return self.readMessage(command);
     }
 
@@ -150,11 +166,7 @@ pub const Client = struct {
         // message is present, and stop rather than spin if it never is.
         var rounds: usize = 0;
         while (rounds < 4096) : (rounds += 1) {
-            const n = self.t.read(self.rx[got..]) catch |e| return switch (e) {
-                error.EndOfStream => error.EndOfStream,
-                error.WriteFailed => error.WriteFailed,
-                else => error.ReadFailed,
-            };
+            const n = self.t.read(self.rx[got..]) catch |e| return fromTransport(e);
             got += n;
             if (got < encap.header_len) continue;
             const total = encap.peekTotalLen(self.rx[0..encap.header_len]) catch
@@ -204,7 +216,7 @@ pub const Client = struct {
             .data = &.{},
             .total_len = 0,
         }, self.rx) catch return error.BufferTooSmall;
-        self.t.write(framed) catch return error.WriteFailed;
+        self.t.write(framed) catch |e| return fromTransport(e);
         self.registered = false;
         self.session_handle = 0;
         self.connection = null;
@@ -221,7 +233,7 @@ pub const Client = struct {
             .data = &.{},
             .total_len = 0,
         }, self.rx) catch return error.BufferTooSmall;
-        self.t.write(framed) catch return error.WriteFailed;
+        self.t.write(framed) catch |e| return fromTransport(e);
     }
 
     // ── the list commands ──────────────────────────────────────────────────
