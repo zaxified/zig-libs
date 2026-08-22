@@ -10,7 +10,18 @@ const procnet = @import("root.zig");
 /// One neighbor-table row.
 pub const ArpEntry = struct {
     ip: netaddr.Ip,
+    /// The neighbour's link-layer address. Six bytes because `hw_type` is
+    /// `0x1` (`ARPHRD_ETHER`) for everything this parser accepts: the field
+    /// is fixed-width, so a row whose `HW address` column is not six
+    /// colon-separated octets is skipped rather than truncated into it.
     mac: [6]u8,
+    /// Raw `ARPHRD_*` hardware type (`linux/if_arp.h`) from the hex `HW type`
+    /// column — `0x1` = `ARPHRD_ETHER`. Captured because it is what says
+    /// whether `mac` is an Ethernet address at all; media with a wider
+    /// address (`ARPHRD_INFINIBAND` = `0x20`, 20 bytes) do not fit `mac` and
+    /// are skipped by `parseMac`, so a caller that wants to know that a
+    /// neighbour was dropped for that reason needs this column, not a guess.
+    hw_type: u16,
     /// Raw `ATF_*` flags (`linux/if_arp.h`) from the hex `Flags` column
     /// (e.g. `0x2` = `ATF_COM`, complete entry; `0x0` = incomplete).
     flags: u16,
@@ -49,17 +60,19 @@ pub fn parseArp(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Erro
         if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
         var f = std.mem.tokenizeAny(u8, line, " \t");
         const ip_s = f.next() orelse continue;
-        _ = f.next() orelse continue; // HW type
+        const hw_type_s = f.next() orelse continue;
         const flags_s = f.next() orelse continue;
         const mac_s = f.next() orelse continue;
-        _ = f.next() orelse continue; // Mask (always "*")
+        _ = f.next() orelse continue; // Mask — the kernel prints a literal "*" for every row
         const dev_s = f.next() orelse "";
 
         const ip = netaddr.parseIp(ip_s) orelse continue;
         const mac = parseMac(mac_s) orelse continue;
-        const flags = std.fmt.parseInt(u16, flags_s, 0) catch continue; // "0x2" — base 0 auto-detects
+        // Base 0 auto-detects the "0x" the kernel prints on both columns.
+        const hw_type = std.fmt.parseInt(u16, hw_type_s, 0) catch continue;
+        const flags = std.fmt.parseInt(u16, flags_s, 0) catch continue;
 
-        var e: ArpEntry = .{ .ip = ip, .mac = mac, .flags = flags };
+        var e: ArpEntry = .{ .ip = ip, .mac = mac, .hw_type = hw_type, .flags = flags };
         e.device_len = procnet.copyClamped(&e.device_buf, dev_s);
         try out.append(gpa, e);
     }
@@ -94,6 +107,23 @@ test "parseArp: real /proc/net/arp fixture" {
     try testing.expectEqual([6]u8{ 0x00, 0x0c, 0x29, 0xf4, 0x43, 0x0b }, entries[2].mac);
     try testing.expectEqual(@as(u16, 2), entries[2].flags);
     try testing.expectEqualStrings("vmnet1", entries[2].device());
+
+    // The `HW type` column, which this parser used to tokenize past: every
+    // row of a real Ethernet host is 0x1 (ARPHRD_ETHER).
+    for (entries) |e| try testing.expectEqual(@as(u16, 1), e.hw_type);
+}
+
+test "parseArp: hw_type is read from its own column, not confused with flags" {
+    // The two hex columns are adjacent and both "0x"-prefixed, so a
+    // one-token slip reads the wrong one and nothing looks obviously wrong.
+    // This row makes them differ: hw type 0x20 (ARPHRD_INFINIBAND), flags
+    // 0x2 (ATF_COM).
+    const text = "hdr\n10.0.1.9 0x20 0x2 aa:bb:cc:dd:ee:ff * ib0\n";
+    const entries = try parseArp(testing.allocator, text);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(@as(u16, 0x20), entries[0].hw_type);
+    try testing.expectEqual(@as(u16, 0x2), entries[0].flags);
 }
 
 test "parseArp: empty table (header only)" {

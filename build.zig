@@ -181,7 +181,7 @@ const module_list = [_]Module{
     .{ .name = "jwe", .deps = &.{ "rsa", "p256", "aescbc", "aeskw" }, .example = true },
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" }, .example = true },
     .{ .name = "blobstore", .deps = &.{"hashdigest"}, .example = true },
-    .{ .name = "procnet", .deps = &.{"netaddr"} },
+    .{ .name = "procnet", .deps = &.{"netaddr"}, .example = true },
     .{ .name = "diskusage" },
     .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "procrun", .deps = &.{"argsafe"} },

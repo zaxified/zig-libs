@@ -15,6 +15,12 @@ pub const RouteEntry = struct {
     /// The next-hop gateway, or null for an on-link/direct route (the
     /// kernel prints an all-zero gateway for those).
     gateway: ?netaddr.Ip,
+    /// Raw `RTF_*` flags (`linux/route.h`) from the hex `Flags` column, as
+    /// `route -n` prints them in its own `Flags` column: `0x1` = `RTF_UP`,
+    /// `0x2` = `RTF_GATEWAY`, `0x4` = `RTF_HOST`, ... Captured because
+    /// `RTF_UP` is the only column that says whether a row is a live route
+    /// at all, and no other field in this struct implies it.
+    flags: u16,
     metric: u32,
     iface_buf: [procnet.if_name_max]u8 = @splat(0),
     iface_len: u8 = 0,
@@ -75,9 +81,9 @@ pub fn parseRoutes(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.E
         const iface_s = f.next() orelse continue;
         const dhex = f.next() orelse continue;
         const ghex = f.next() orelse continue;
-        _ = f.next() orelse continue; // Flags
-        _ = f.next() orelse continue; // RefCnt
-        _ = f.next() orelse continue; // Use
+        const flags_s = f.next() orelse continue;
+        _ = f.next() orelse continue; // RefCnt — kernel prints a constant 0 here
+        _ = f.next() orelse continue; // Use — a lookup counter, not route state
         const metric_s = f.next() orelse continue;
         const mhex = f.next() orelse continue;
 
@@ -85,12 +91,16 @@ pub fn parseRoutes(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.E
         const gw = leHexToV4(ghex) orelse continue;
         const mask_ip = leHexToV4(mhex) orelse continue;
         if (!isContiguousMask(mask_ip.v4)) continue; // F3: not a real CIDR mask
+        // `/proc/net/route` prints Flags as bare hex with NO "0x" prefix,
+        // unlike `/proc/net/arp`'s columns — base 16, not base 0.
+        const flags = std.fmt.parseInt(u16, flags_s, 16) catch continue;
 
         var mask_bits: u8 = 0;
         for (mask_ip.v4) |byte| mask_bits += @popCount(byte);
         var e: RouteEntry = .{
             .dest = .{ .addr = dst, .bits = mask_bits },
             .gateway = if (gw.v4[0] == 0 and gw.v4[1] == 0 and gw.v4[2] == 0 and gw.v4[3] == 0) null else gw,
+            .flags = flags,
             .metric = std.fmt.parseInt(u32, metric_s, 10) catch 0,
         };
         e.iface_len = procnet.copyClamped(&e.iface_buf, iface_s);
@@ -128,6 +138,39 @@ test "parseRoutes: real /proc/net/route fixture" {
     try testing.expectEqual(netaddr.Ip{ .v4 = .{ 10, 0, 1, 0 } }, entries[1].dest.addr);
     try testing.expectEqual(@as(u8, 24), entries[1].dest.bits);
     try testing.expectEqual(@as(?netaddr.Ip, null), entries[1].gateway);
+
+    // The `Flags` column, which this parser used to tokenize past. The
+    // default route is 0x0003 = RTF_UP|RTF_GATEWAY; the on-link routes are
+    // 0x0001 = RTF_UP alone. Note these are bare hex, no "0x" prefix —
+    // parsing them base-0 like `arp.zig`'s columns would read 3 as 3 and
+    // then silently mis-read any row whose flags happen to start with a
+    // digit sequence base-0 rejects.
+    try testing.expectEqual(@as(u16, 0x0003), entries[0].flags);
+    try testing.expectEqual(@as(u16, 0x0001), entries[1].flags);
+}
+
+test "parseRoutes: Flags is read as bare hex — base 0 would silently mis-read it" {
+    // `/proc/net/route` prints Flags with no "0x", so `parseInt(.., 0)` —
+    // the base `arp.zig` correctly uses for ITS "0x"-prefixed columns —
+    // falls back to decimal here and is wrong without erroring.
+    //   "0011" = RTF_UP|RTF_DYNAMIC = 17. Base 0 reads it as 17? No: 17
+    //   decimal is 11, so base 0 yields 11 (RTF_UP|RTF_GATEWAY|RTF_HOST|
+    //   RTF_REINSTATE) — a different, entirely plausible-looking flag set.
+    // The second row is the case where base 0 does not merely mis-read but
+    // drops the route: "001C" is not decimal at all, so a base-10/base-0
+    // parse errors and the row is skipped.
+    const text =
+        \\hdr
+        \\eth0 0001000A 8A01000A 0011 0 0 100 00FFFFFF 0 0 0
+        \\eth1 0002000A 8A01000A 001C 0 0 200 00FFFFFF 0 0 0
+        \\
+    ;
+    const entries = try parseRoutes(testing.allocator, text);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqual(@as(u16, 0x11), entries[0].flags);
+    try testing.expect(entries[0].flags != 11); // what a base-0 parse would give
+    try testing.expectEqual(@as(u16, 0x1C), entries[1].flags);
 }
 
 test "parseRoutes: empty table (header only)" {

@@ -5,6 +5,58 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — **`readVirtualFile`'s `limit` now truncates instead of returning nothing.**
+  It was `allocRemaining(...) catch null`, and `allocRemaining` returns `error.StreamTooLong`
+  the moment the limit is reached — so an oversized table returned NULL and every row in it
+  disappeared, exactly on the busy machines where the bound matters. `/proc/net/tcp` runs about
+  150 bytes per row against a 512 KiB limit, so a host past roughly 3 500 sockets reported ZERO
+  sockets; `/proc/net/nf_conntrack` past 4 MiB reported zero flows with `total = 0`, which a
+  caller cannot tell from "the conntrack module is not loaded". SPEC.md had promised the
+  behaviour that is now implemented ("the caller gets a truncated/capped view instead") — the
+  code disagreed with its own spec. The truncated tail's last partial row is skipped as
+  malformed, like any other. `sockets.socket_table_read_limit` names the socket-table bound so
+  the number is visible rather than inline.
+- **2026-08-23** — **`SocketEntry` now carries the columns `parseTable` used to tokenize past.**
+  `remote`/`remote_port` (the `rem_address` column — a caller could not reproduce `ss`'s default
+  Peer Address:Port at all), `uid` (`ss -e`), `tx_queue`/`rx_queue` (`ss`'s Send-Q/Recv-Q, which
+  are in `ss`'s DEFAULT output), and `inode`. `inode` is the structural one: **it is the only key
+  that maps a socket to a process**, so without it there was no `ss -p` to build. `port` is
+  renamed `local_port` now that the type has a peer port to be symmetric with; there were no
+  consumers of the old name outside this module. A row must now carry every column through
+  `inode` to be accepted — admitting a short row with a defaulted `inode = 0` would be
+  indistinguishable from the kernel's own `0` for an orphaned socket.
+- **2026-08-23** — **Added the socket-inode → process join, `process.indexSocketOwners`** — what
+  `ss -p` and `lsof -i` do: scan `/proc/<pid>/fd/*` for a symlink whose target is
+  `socket:[<inode>]`. Deliberately opt-in; `readSockets` does not call it and there is no combined
+  wrapper, because (a) it costs one `readlink` per open descriptor of every visible process —
+  measured at 45 ms on an ordinary desktop, 390 processes and ~6 900 descriptors, against well
+  under a millisecond for reading all four socket tables — and (b) the result is honestly partial:
+  `/proc/<pid>/fd` is `0500`, so an unprivileged sweep is refused every other user's process.
+  Verified live that real `ss -p` does exactly the same thing, silently leaving the process column
+  blank for another uid's socket in a non-root run. `SocketOwnerIndex` therefore reports
+  `scanned`/`denied`/`vanished`/`truncated` next to the owners, and `findAll` returns every holder
+  of one inode (a socket survives `fork` and `SCM_RIGHTS`, so "the" owner is not a function) and
+  never matches inode `0`. Measured on a real accept queue: two ESTABLISHED sockets waiting to be
+  `accept(2)`-ed both carry inode `0`, so without that guard every orphan on the machine would be
+  attributed to whichever process sorted first.
+- **2026-08-23** — Two more columns that were read and thrown away: `ArpEntry.hw_type` (the
+  `ARPHRD_*` word — the field that says whether `mac` is an Ethernet address at all; media with
+  wider addresses do not fit the fixed `[6]u8` and are skipped, and nothing else recorded why) and
+  `RouteEntry.flags` (the `RTF_*` word `route -n` prints as its `Flags` column — `RTF_UP` is the
+  only thing saying whether a row is a live route, and no other field implies it). ⚠
+  `/proc/net/route` prints Flags as bare hex with no `0x`, unlike `/proc/net/arp`'s columns, so
+  the two are parsed with different bases on purpose: base 0 here reads `0011` as decimal 11
+  instead of `0x11`, silently, and drops any row whose flags contain a hex letter.
+- **2026-08-23** — Added `example/main.zig`: `procnet-demo`, an `ss(8)`-shaped socket lister
+  (`-tulnpe`) plus `-r` routes, `-N` neighbours, `-s` snapshot. Diffed against real `ss` from
+  iproute2 6.19.0 — see SPEC.md "Verification" for what that comparison does and does not prove.
+  The demo drove the `SocketEntry` doc comment's correction about `tx_queue`: for a LISTENING
+  socket `ss` prints the configured backlog in Send-Q and `/proc/net/tcp` prints `0`. Measured
+  against a `listen(3)` socket holding two un-accepted connections, `ss` reported `Recv-Q 2
+  Send-Q 3` while the file printed `00000000:00000002` — rx 2, agreeing exactly, and tx 0. The
+  backlog is not in the text file; `ss` reads it over `NETLINK_SOCK_DIAG`.
+- **2026-08-23** — README DEFER list: added `/proc/net/unix`, which was neither implemented nor
+  listed. An omission missing from the list of omissions reads as coverage.
 - **2026-08-18** — **BREAKING:** `comm_max` 16 → 64. It was documented as `TASK_COMM_LEN`
   (`linux/sched.h`), but that constant bounds a task's `comm` *inside the kernel* — it does
   NOT bound what `/proc/<pid>/stat` prints. The kernel's `fs/proc/array.c` renders `comm`

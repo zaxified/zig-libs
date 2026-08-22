@@ -112,20 +112,61 @@ pub const ProcessEntry = process.ProcessEntry;
 pub const parseProcStat = process.parseProcStat;
 pub const listProcesses = process.listProcesses;
 
+// The socket-inode → process join (`ss -p`). Opt-in and never called by
+// `readSockets` — see `process.indexSocketOwners` for why.
+pub const SocketOwner = process.SocketOwner;
+pub const SocketOwnerIndex = process.SocketOwnerIndex;
+pub const SocketOwnerOptions = process.SocketOwnerOptions;
+pub const parseSocketInode = process.parseSocketInode;
+pub const indexSocketOwners = process.indexSocketOwners;
+
 // ── virtual-file reading ────────────────────────────────────────────────────
 
-/// Read a `/proc` or `/sys` file (or any regular file up to `limit` bytes),
-/// or null if it cannot be opened / read. Uses a *streaming* reader: `/proc`
-/// and `/sys` files report size 0 from `stat` (they are generated on read,
-/// not backed by disk blocks), so the default positional whole-file read
-/// would come back empty — streaming to EOF is the only correct way to read
-/// them. Caller owns the returned slice (`gpa.free`).
+/// Read a `/proc` or `/sys` file (or any regular file), or null if it cannot
+/// be opened / read. Uses a *streaming* reader: `/proc` and `/sys` files
+/// report size 0 from `stat` (they are generated on read, not backed by disk
+/// blocks), so the default positional whole-file read would come back empty
+/// — streaming to EOF is the only correct way to read them. Caller owns the
+/// returned slice (`gpa.free`).
+///
+/// ⚠ `limit` TRUNCATES; it does not reject. A file longer than `limit` comes
+/// back as its first `limit` bytes, with the last line likely cut mid-row —
+/// which every parser here then skips as malformed, so the caller gets a
+/// short table rather than nothing.
+///
+/// That is a deliberate repair of the opposite behaviour: this used to be
+/// `allocRemaining(...) catch null`, and `allocRemaining` returns
+/// `error.StreamTooLong` the moment the limit is reached, so an oversized
+/// table returned NULL and the whole file's worth of rows disappeared. The
+/// effect was worst exactly where the bound matters — the busy machine.
+/// `/proc/net/tcp` runs ~150 bytes per row against a 512 KiB limit, so a host
+/// with more than about 3 500 sockets reported ZERO sockets, and
+/// `/proc/net/nf_conntrack` past 4 MiB (roughly 20 000 flows, a routine
+/// figure on a NAT gateway and a trivial one under a conntrack flood)
+/// reported zero flows with `total = 0` — indistinguishable from "the
+/// conntrack module is not loaded". SPEC.md already promised the behaviour
+/// implemented here: "an adversarially huge `/proc` table ... cannot force
+/// unbounded allocation — the caller gets a truncated/capped view instead".
 pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);
     var buf: [4096]u8 = undefined;
     var fr = std.Io.File.Reader.initStreaming(file, io, &buf);
-    return fr.interface.allocRemaining(gpa, .limited(limit)) catch null;
+
+    var list: std.ArrayList(u8) = .empty;
+    fr.interface.appendRemaining(gpa, &list, .limited(limit)) catch |err| switch (err) {
+        // Everything read so far is already in `list` (documented contract
+        // of `appendRemaining`), and it is the bounded prefix we asked for.
+        error.StreamTooLong => {},
+        else => {
+            list.deinit(gpa);
+            return null;
+        },
+    };
+    return list.toOwnedSlice(gpa) catch {
+        list.deinit(gpa);
+        return null;
+    };
 }
 
 /// Copy as much of `s` as fits into `buf`, truncating rather than failing —
@@ -325,6 +366,54 @@ test "meminfoKb / firstFloat" {
     try testing.expectEqual(@as(u64, 0), meminfoKb(mi, "MemAvailable:"));
 }
 
+test "readVirtualFile: a file past `limit` truncates to the prefix, it does not vanish" {
+    // Regression for a defect the SPEC already described the fix for: this
+    // used to be `allocRemaining(...) catch null`, and `allocRemaining`
+    // errors `StreamTooLong` the instant the limit is reached, so an
+    // oversized table returned NULL — every row lost, and (for conntrack)
+    // indistinguishable from "the module is not loaded".
+    //
+    // `/proc` cannot be made oversized on demand, so this uses a real file
+    // of known length. `readVirtualFile` reads it with the same streaming
+    // path it uses for `/proc` (the file's `stat` size is never consulted),
+    // which is what makes the substitution fair.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 100 rows of 10 bytes each.
+    var payload: [1000]u8 = undefined;
+    for (0..100) |i| _ = std.fmt.bufPrint(payload[i * 10 ..][0..10], "row{d:0>6}\n", .{i}) catch unreachable;
+    {
+        var f = try tmp.dir.createFile(io, "big.txt", .{});
+        defer f.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        try w.interface.writeAll(&payload);
+        try w.interface.flush();
+    }
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/big.txt", .{&tmp.sub_path});
+
+    // Under the limit: the whole file, unchanged.
+    const whole = readVirtualFile(testing.allocator, io, path, 4096) orelse
+        return error.ReadVirtualFileReturnedNull;
+    defer testing.allocator.free(whole);
+    try testing.expectEqual(@as(usize, 1000), whole.len);
+
+    // Over it: a non-null, exactly-`limit`-byte prefix — NOT null, and not
+    // the whole file either.
+    const cut = readVirtualFile(testing.allocator, io, path, 250) orelse
+        return error.ReadVirtualFileReturnedNullOnOversizedFile;
+    defer testing.allocator.free(cut);
+    try testing.expectEqual(@as(usize, 250), cut.len);
+    try testing.expectEqualStrings(payload[0..250], cut);
+}
+
 test "copyClamped truncates instead of overflowing" {
     var buf: [4]u8 = undefined;
     const n = copyClamped(&buf, "hello");
@@ -402,12 +491,17 @@ test "smoke: snapshot() and listProcesses() run against the real /proc" {
 // rather than counted. This is also a STRONGER wiring oracle than the count ever
 // was, since it checks the parsed fields and not merely how many rows came back.
 //
-// ⚠ "ALMOST CERTAINLY", and that word is doing real work — the entry types are
-// not uniquely identifying. `SocketEntry` is {proto, local, port, state} with no
-// inode, so a listener can close and a DIFFERENT socket can reuse the port
-// before the second read, presenting as the same entry across a window it was
-// absent from. Measured: 1 failure in 20 runs under a loop that closes thirty
-// listeners at a time and immediately reopens them.
+// ⚠ "ALMOST CERTAINLY", and that word used to do real work — the entry types
+// were not uniquely identifying. `SocketEntry` was {proto, local, port, state}
+// with no inode, so a listener could close and a DIFFERENT socket reuse the
+// port before the second read, presenting as the same entry across a window it
+// was absent from. Measured then: 1 failure in 20 runs under a loop that closes
+// thirty listeners at a time and immediately reopens them. `SocketEntry` now
+// carries the socket's INODE, which the kernel does not reuse anywhere near as
+// eagerly as a port number, and the socket key below includes it — so that
+// particular artifact is now closed at the source rather than only absorbed by
+// the repeatability rule below. The rule stays: it is what keeps the mutations
+// deterministic, and it costs nothing.
 //
 // So the last of it is closed by what actually distinguishes the two cases,
 // which is not the size of a window but REPEATABILITY. A wrong path or a
@@ -505,10 +599,15 @@ test "smoke: readSockets/readArp/readRoutes/readConntrack are wired to the right
         // the direct side would disagree with the wrapper on `proto` for the
         // two udp tables — a difference in the ORACLE, not in the code under
         // test. Compare on the fields both sides derive the same way.
-        const Key = struct { local: netaddr.Ip, port: u16, state: SockState };
+        const Key = struct { local: netaddr.Ip, port: u16, state: SockState, inode: u64 };
         fn keys(gpa: std.mem.Allocator, rows: []const SocketEntry) anyerror![]Key {
             const out = try gpa.alloc(Key, rows.len);
-            for (rows, out) |r, *k| k.* = .{ .local = r.local, .port = r.port, .state = r.state };
+            for (rows, out) |r, *k| k.* = .{
+                .local = r.local,
+                .port = r.local_port,
+                .state = r.state,
+                .inode = r.inode,
+            };
             return out;
         }
         fn directSockets(gpa: std.mem.Allocator, io_: std.Io) anyerror![]Key {
