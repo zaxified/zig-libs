@@ -70,6 +70,12 @@ pub const Report = struct {
 pub const Error = error{
     BindFailed,
     NoPeer,
+    /// A blocking wait was canceled through the `std.Io` cancellation
+    /// protocol (`Future.cancel`) — an accept/read-readiness poll, or a UDP
+    /// `receiveTimeout`/`send`. Surfaced instead of an ordinary idle round
+    /// (or a silently truncated flush) so a caller shutting a session down
+    /// can tell its own cancellation from "nothing arrived yet".
+    Canceled,
 } || fleet_mod.Error;
 
 /// Monotonic milliseconds. The one place real time enters this module.
@@ -79,10 +85,33 @@ pub fn nowMs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
 
-fn readable(handle: std.posix.fd_t, ms: u32) bool {
+/// `Io.checkCancel` acknowledges the request and reports it exactly once;
+/// the answer has to be converted into an error right here, not asked for
+/// again.
+fn checkCanceled(io: std.Io) error{Canceled}!void {
+    io.checkCancel() catch return error.Canceled;
+}
+
+/// True when the fd has something to read, false when the wait elapsed with
+/// nothing there.
+///
+/// `std.posix.poll` is not a `std.Io` cancellation point: it retries on
+/// `EINTR`, and a thread parked in it is never signalled by `Threaded` at
+/// all, so the wait runs to its full `ms` regardless of a pending
+/// `Future.cancel` — which would otherwise come back as an ordinary "nothing
+/// yet" round, leaving a caller that canceled a session polling a peer it has
+/// already abandoned. `checkCanceled` recovers it on both exit paths: a poll
+/// that fails outright still defers to the real read for the failure itself
+/// (unchanged from before), but not before a cancel gets its turn.
+fn readable(io: std.Io, handle: std.posix.fd_t, ms: u32) error{Canceled}!bool {
     var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
-    const n = std.posix.poll(&fds, @intCast(ms)) catch return true;
-    return n != 0;
+    const n = std.posix.poll(&fds, @intCast(ms)) catch {
+        try checkCanceled(io);
+        return true;
+    };
+    if (n != 0) return true;
+    try checkCanceled(io);
+    return false;
 }
 
 /// Bind `address`, accept one TCP peer, and drive `node` from it until the peer
@@ -111,7 +140,7 @@ pub fn serveTcp(
         // blocks forever on a quiet listener.
         if (opts.run_ms != 0) {
             const budget: u32 = @intCast(@min(opts.run_ms - elapsed, @as(u64, std.math.maxInt(u32))));
-            if (!readable(listener.socket.handle, budget)) {
+            if (!try readable(io, listener.socket.handle, budget)) {
                 if (total.connected) break;
                 return error.NoPeer;
             }
@@ -174,7 +203,7 @@ pub fn serveTcpOn(
         if (opts.run_ms != 0 and t >= opts.run_ms) break;
         if (opts.max_frames != 0 and report.frames_in >= opts.max_frames) break;
 
-        if (r.bufferedLen() == 0 and !readable(stream.socket.handle, opts.idle_ms)) {
+        if (r.bufferedLen() == 0 and !try readable(io, stream.socket.handle, opts.idle_ms)) {
             // Idle: still advance so timers and unsolicited traffic fire.
             _ = try fleet.advance(t);
             if (try flush(fleet, node, w, &report)) continue else continue;
@@ -368,7 +397,16 @@ pub fn serveTcpMulti(
             timeout = @intCast(@min(@as(u64, opts.idle_ms), left));
         }
         if (buffered) timeout = 0;
+        // Same hazard as `readable` above, for a set of descriptors instead
+        // of one: `poll` is not a cancellation point, so a canceled wait
+        // would otherwise run to its full `timeout` and come back
+        // indistinguishable from an ordinary empty round — on the timed-out
+        // path (`ready == 0`) as much as on the "poll itself failed" path
+        // (folded into `ready == 0` here too, since neither carries a peer to
+        // blame). `checkCanceled` recovers it before the loop treats either
+        // as "nothing to do this round".
         const ready = std.posix.poll(fds[0..n_fds], @intCast(timeout)) catch 0;
+        if (ready == 0) try checkCanceled(io);
 
         if (ready != 0 and listener_fds != 0) {
             for (fds[0..listener_fds], 0..) |fd, i| {
@@ -543,6 +581,14 @@ pub fn serveUdp(
                 _ = try flushUdp(fleet, node, io, &socket, last_peer, &report);
                 continue;
             },
+            // Unlike the stream transports, `Socket.ReceiveTimeoutError`
+            // already carries `Io.Cancelable` intact — there is no
+            // out-of-band field to consult, so the only defect possible here
+            // is throwing the variant away. Propagate it instead of letting
+            // it fall into the catch-all below, where a canceled wait would
+            // otherwise come back as an ordinary (if premature) end of
+            // session.
+            error.Canceled => return error.Canceled,
             else => break,
         };
         if (msg.data.len == 0) continue;
@@ -570,7 +616,13 @@ fn flushUdp(
     for (fleet.outbound()) |f| {
         if (f.node != node) continue;
         const bytes = fleet.frameBytes(f);
-        socket.send(io, &dest, bytes) catch return any;
+        // `Socket.SendError` carries `Io.Cancelable` intact too; the same
+        // reasoning as the receive side above applies — a canceled send must
+        // not come back looking like an ordinary truncated flush.
+        socket.send(io, &dest, bytes) catch |e| switch (e) {
+            error.Canceled => return error.Canceled,
+            else => return any,
+        };
         report.bytes_out += bytes.len;
         report.frames_out += 1;
         any = true;
@@ -817,4 +869,127 @@ test "serveTcp: one master round-trips over a real socket (no env gate)" {
     try testing.expect(report.frames_out >= 4);
     try testing.expect(report.bytes_in > 0);
     try testing.expect(f.stats(node).replied >= 4);
+}
+
+// ── cancellation ───────────────────────────────────────────────────────────
+//
+// `Future.cancel` unblocks a thread parked in a real `std.Io` call, but
+// `readable`'s (and `serveTcpMulti`'s) wait is a raw `std.posix.poll`, which
+// is outside `std.Io` entirely: it retries on `EINTR`, and a thread inside it
+// is never signalled by `Threaded` at all, so the wait ran to its full
+// timeout regardless — and used to come back as an ordinary idle round rather
+// than `error.Canceled`. Both tests below use a small `idle_ms` because the
+// canceled wait still costs its full timeout before `checkCanceled` gets a
+// turn (`fut.cancel` waits for the task to actually return).
+
+/// `io.concurrent` builds an `ArgsTuple` from the callee's signature at
+/// comptime, which cannot be done for `serveTcpOn`'s `listener: anytype` —
+/// this gives it a concrete one.
+fn serveTcpOnConcrete(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    fleet: *Fleet,
+    node: NodeId,
+    listener: *std.Io.net.Server,
+    opts: Options,
+) !Report {
+    return serveTcpOn(gpa, io, fleet, node, listener, opts);
+}
+
+test "serveTcpOn: a canceled idle-read wait surfaces Canceled, not an idle round" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fleet.init(gpa, .{ .seed = 77 });
+    defer f.deinit();
+
+    const adapters = @import("adapters.zig");
+    var holdings = [_]u16{0} ** 4;
+    var slave = adapters.Modbus.init(
+        .{ .unit_id = 1, .framing = .tcp },
+        .{ .holding_registers = .{ .base = 0, .values = &holdings } },
+    );
+    const node = try f.addNode(.{ .node = slave.node(), .tag = 1 });
+
+    // Port 0: an ephemeral port cannot collide with a parallel test run.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch {
+        if (verboseSkip()) std.debug.print("SKIPPED: loopback listen failed\n", .{});
+        return error.SkipZigTest;
+    };
+    defer listener.socket.close(io);
+
+    // A peer that connects and then says nothing. TCP `connect` succeeds as
+    // soon as the SYN is queued in the kernel backlog, before `accept` is
+    // ever called, so `serveTcpOn`'s own accept (a real `std.Io` call)
+    // returns immediately and the loop parks in the idle-read wait under
+    // test.
+    var client = listener.socket.address.connect(io, .{ .mode = .stream }) catch {
+        if (verboseSkip()) std.debug.print("SKIPPED: loopback connect failed\n", .{});
+        return error.SkipZigTest;
+    };
+    defer client.close(io);
+
+    // `run_ms` is a safety net only: the cancel below always arrives well
+    // inside it. It exists so that if cancellation recovery were ever broken
+    // again, this test would fail fast instead of hanging the suite — the
+    // loop is otherwise unbounded (`Options.run_ms` defaults to 0, "forever").
+    var fut = try io.concurrent(serveTcpOnConcrete, .{ gpa, io, &f, node, &listener, Options{ .idle_ms = 600, .run_ms = 3000 } });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+test "serveTcpMulti: a canceled readiness wait surfaces Canceled, not an idle round" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fleet.init(gpa, .{ .seed = 88 });
+    defer f.deinit();
+
+    // No peer ever connects, so the loop sits polling the listener fd alone
+    // — the many-descriptor path `serveTcpOn` doesn't exercise.
+    const bindings = [_]Binding{
+        .{ .node = 0, .address = .{ .ip4 = .loopback(0) } },
+    };
+
+    // See the `run_ms` note in the `serveTcpOn` test above: a safety net, not
+    // part of the path under test.
+    var fut = try io.concurrent(serveTcpMulti, .{ gpa, io, &f, &bindings, MultiOptions{ .idle_ms = 600, .run_ms = 3000 } });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    _ = fut.cancel(io) catch |e| switch (e) {
+        error.Canceled => return,
+        error.BindFailed => {
+            if (verboseSkip()) std.debug.print("SKIPPED: loopback bind failed\n", .{});
+            return error.SkipZigTest;
+        },
+        else => return e,
+    };
+    return error.TestUnexpectedResult;
+}
+
+test "serveUdp: a canceled receive wait surfaces Canceled, not an idle round" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fleet.init(gpa, .{ .seed = 99 });
+    defer f.deinit();
+
+    // Nothing ever sends to this port, and no node needs to be registered:
+    // `flushUdp` returns before touching `fleet`/`node` at all while
+    // `last_peer` is still null, so a plain `0` stands in for the node id.
+    // Port 0: an ephemeral port cannot collide with a parallel test run.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+
+    // `run_ms` is a safety net only, same reasoning as the TCP cancellation
+    // tests above: the loop is otherwise unbounded, and a broken cancel path
+    // must fail fast rather than hang the suite.
+    var fut = try io.concurrent(serveUdp, .{ gpa, io, &f, @as(NodeId, 0), addr, Options{ .idle_ms = 600, .run_ms = 3000 } });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }
