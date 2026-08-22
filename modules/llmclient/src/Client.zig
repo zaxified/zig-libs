@@ -182,20 +182,21 @@ pub const EventIterator = struct {
     /// The event's memory is valid until the next `next()` call or
     /// `deinit()` — copy anything you need to keep.
     ///
-    /// Unlike `create`/`stream`'s own `mapHttpError`, a `std.Io` cancellation
-    /// of the blocked body read here cannot come back as `error.Canceled`:
-    /// `it.res.reader()` (from `http.Client.Response`) is a plain
-    /// `*std.Io.Reader`, and `http.Client` does not expose the concrete
-    /// reader underneath it, so there is no `err` field on this side to
-    /// recover the real cause from. It surfaces as `error.HttpFailed`,
-    /// indistinguishable from an actual dropped connection.
+    /// A `std.Io` cancellation of the blocked body read surfaces as
+    /// `error.Canceled`, not `error.HttpFailed`. `it.res.reader()` (from
+    /// `http.Client.Response`) is a plain `*std.Io.Reader` and still cannot
+    /// carry `Canceled` itself, but `http.Client.Response.readFailure()`
+    /// now exists precisely to answer this from outside `http` — see its
+    /// doc comment. This mirrors what `create`/`stream`'s `mapHttpError`
+    /// already does for the connect phase.
     pub fn next(it: *EventIterator) Error!?StreamEvent {
         _ = it.arena.reset(.retain_capacity);
         const a = it.arena.allocator();
         while (true) {
             const raw = it.parser.next() catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.EndOfStream, error.ReadFailed, error.LineTooLong => return error.HttpFailed,
+                error.EndOfStream, error.LineTooLong => return error.HttpFailed,
+                error.ReadFailed => return mapHttpError(it.res.readFailure()),
             };
             const ev = raw orelse return null;
             if (ev.data.len == 0) continue;
@@ -305,6 +306,60 @@ test "Client.create: a canceled body read surfaces error.Canceled, not error.Htt
     };
 
     var fut = try io.concurrent(createOnce, .{ &c, testing.allocator, req });
+    // Long enough that the head has arrived and the body read is the one
+    // parked in the kernel.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+/// `stream` returns as soon as the head arrives; the SSE body read that
+/// this test cancels only happens inside `next()`, so both live in one
+/// task — `it.deinit()` (closing the connection) runs as this function's
+/// own defer, exactly like `create`'s internal `defer res.deinit()`.
+fn streamNextOnce(c: *Client, gpa: std.mem.Allocator, req: MessageRequest) Error!?StreamEvent {
+    var it = try c.stream(gpa, req);
+    defer it.deinit();
+    return it.next();
+}
+
+test "EventIterator.next: a canceled body read surfaces error.Canceled, not error.HttpFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("llmclient stream cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    // Same peer shape as `create`'s cancel test: answers a `Content-Length: 5`
+    // head and then sends none of the declared bytes, so `EventIterator.next`'s
+    // first SSE line read is genuinely parked in the kernel when the cancel
+    // arrives.
+    var peer: CreateCancelPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, CreateCancelPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var http_client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer http_client.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const base_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{port});
+
+    var c: Client = .init(&http_client, "sk-test-key");
+    c.base_url = base_url;
+
+    const req: MessageRequest = .{
+        .max_tokens = 16,
+        .stream = true,
+        .messages = &.{types.MessageParam.user(&.{types.textBlock("hi")})},
+    };
+
+    var fut = try io.concurrent(streamNextOnce, .{ &c, testing.allocator, req });
     // Long enough that the head has arrived and the body read is the one
     // parked in the kernel.
     try io.sleep(.fromMilliseconds(200), .awake);

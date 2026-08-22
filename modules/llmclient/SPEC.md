@@ -35,7 +35,9 @@ that is a caller configuration choice, not a module gap. `sse_parse` makes two d
 documented simplifications vs. the full WHATWG grammar (LF/CRLF only, no persisted "last event ID
 buffer" across dispatch groups) — acceptable for a well-behaved API like Anthropic's, not a
 generic browser-grade parser; malformed/hostile SSE bytes resolve to typed errors
-(`EndOfStream`/`ReadFailed`/`LineTooLong` surfaced as `error.HttpFailed`), not panics. Out of
+(`EndOfStream`/`LineTooLong` surfaced as `error.HttpFailed`; `ReadFailed` goes through
+`http.Client.Response.readFailure()` first and surfaces as `error.Canceled` when a
+`std.Io` cancelation is the real cause, `error.HttpFailed` otherwise), not panics. Out of
 scope: OpenAI-compatible variant, retries/429 backoff (compose with `resilience` instead),
 token-counting endpoint, prompt-caching tooling beyond the plain `cache_control` field, files/
 vision content blocks, the Batch API, and connection reuse (each request opens a fresh connection

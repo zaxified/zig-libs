@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `EventIterator.next` now surfaces a canceled SSE body read as
+  `Error.Canceled`, closing the gap the previous entry (below) flagged and left
+  open. `http.Client.Response` gained a public `readFailure()` accessor (an
+  `http`-side API addition, approved separately — see its changelog) that asks
+  the same question `readAllAlloc`'s internal `Conn.readFailure` already
+  answered; `next`'s `error.ReadFailed` arm now calls it through the existing
+  `mapHttpError`, the same widener `create`/`stream` use for the connect phase.
+  The stale doc comment this module carried since the gap was first found (it
+  said the cancel was unrecoverable "because `http.Client` does not expose the
+  concrete reader") is now false and has been replaced with what actually
+  happens.
+  New loopback test (`EventIterator.next: a canceled body read surfaces
+  error.Canceled, not error.HttpFailed`), proven by mutation: reverting
+  `Response.readFailure()` to unconditionally return `error.ReadFailed` turned
+  it red (`expected error.Canceled, found error.HttpFailed`); restoring it is
+  green.
+  `zig build test-llmclient` — 24/25 (1 unconditionally-skipped live test).
 - **2026-08-22** — No code change; verified and pinned. `Client.create`'s body read
   goes through `http.Client.Response.readAllAlloc`, and `mapHttpError` already
   named `error.Canceled` explicitly for it — so once `http` stopped laundering a

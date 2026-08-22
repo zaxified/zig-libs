@@ -606,7 +606,12 @@ covers the client population; `deflate` adds nothing over it).
   a dead peer. This is what lets the connection pool tell its own canceled
   wait apart from a genuinely stale pooled connection worth a transparent
   retry; folding the two together would let a retry start with the
-  cancelation that triggered it already spent.
+  cancelation that triggered it already spent. A caller reading a response
+  body through `Response.reader()` directly (rather than `readAllAlloc`) gets
+  a bare `*std.Io.Reader`, whose own error set cannot carry `Canceled` either
+  — call `Response.readFailure()` right after such a read reports
+  `error.ReadFailed` to recover the same distinction (`llmclient`'s
+  `EventIterator.next`, built on `reader()`, is the reference consumer).
 - **Decompression is the caller's job** (`Accept-Encoding: identity` is sent
   by default); adopt `std.compress` at the call site if you ask for gzip.
 - 1xx interim responses are skipped (101 returned as-is); HEAD/204/304

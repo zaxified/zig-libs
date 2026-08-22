@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — **Public API addition.** New `Response.readFailure() Error`:
+  recovers the same `error.Canceled`-vs-`error.ReadFailed` distinction
+  `Conn.readFailure` already gives `readAllAlloc` internally, but for a caller
+  driving `reader()` directly. Before this, `Response.conn`'s field was public
+  but its type (`Conn`) is private to `Client.zig`, so nothing outside this
+  file could ask the question at all — closing that gap needed a new seam, not
+  a fix, which is why it waited for explicit approval rather than shipping with
+  the rest of this campaign. `Conn` itself stays private; only the one
+  accessor is exposed. Consumed immediately by `llmclient`'s
+  `EventIterator.next` (see that module's changelog).
+  No new test in this module — the mutation proof lives in `llmclient`, the
+  first real consumer of the new accessor (reverting it there turns
+  `llmclient`'s `EventIterator.next` cancelation test red).
+  `zig build test-http` — 453/453 (unaffected; existing internal call sites
+  are unchanged).
 - **2026-08-22** — Closed the remaining cancelation collapses in `Client`: three
   more `else`-shaped body-transfer catches, and a distinct, sharper bug in the
   request-head write that `readAllAlloc`'s fix (entry below) did not touch.

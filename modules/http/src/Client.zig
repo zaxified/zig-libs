@@ -547,6 +547,21 @@ pub const Response = struct {
         };
     }
 
+    /// Recover the real cause behind an `error.ReadFailed` reported by
+    /// `reader()` (or anything built on it — a line/SSE parser, a manual
+    /// `readSliceShort`, …). `*std.Io.Reader`'s own error set is exactly
+    /// `{ReadFailed, EndOfStream}` (CONVENTIONS.md §2) and cannot carry
+    /// `error.Canceled`, so a caller driving `reader()` directly — unlike
+    /// `readAllAlloc`, which already does this internally — has no way to
+    /// tell a `std.Io` cancelation from a dead connection. This is that
+    /// missing seam: it asks the same question `Conn.readFailure` answers
+    /// for `readAllAlloc`, without making `Conn` itself public. Call it
+    /// right after `reader()` (or a parser over it) reports
+    /// `error.ReadFailed` — it describes that failure, not a future one.
+    pub fn readFailure(res: *Response) Error {
+        return res.conn.readFailure();
+    }
+
     /// Read the whole remaining body into an allocated buffer
     /// (`error.BodyTooLarge` beyond `max_len`).
     pub fn readAllAlloc(res: *Response, gpa: std.mem.Allocator, max_len: usize) Error![]u8 {
