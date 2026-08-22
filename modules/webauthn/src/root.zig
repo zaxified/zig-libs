@@ -182,6 +182,13 @@ pub fn parseCredentialKey(value: cbor.Value) KeyError!CoseKey {
     return switch (try cbor.cose.parseKey(value)) {
         .ec2 => |k| .{ .ec2 = k },
         .okp => |k| .{ .okp = k },
+        // AKP (RFC 9964, `kty` 7) carries ML-DSA keys. WebAuthn has not
+        // registered ML-DSA -- draft-vitap-ml-dsa-webauthn is a draft, with no
+        // COSE algorithm assigned for WebAuthn use -- so a credential
+        // presenting one is a key type this module cannot verify with, and
+        // saying so is the honest answer. Accepting it here would mean
+        // claiming an attestation path that does not exist yet.
+        .akp => error.UnsupportedKty,
     };
 }
 

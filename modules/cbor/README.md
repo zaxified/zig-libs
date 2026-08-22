@@ -2,7 +2,7 @@
 
 CBOR — Concise Binary Object Representation ([RFC 8949](https://www.rfc-editor.org/rfc/rfc8949))
 codec, plus a minimal [COSE](https://www.rfc-editor.org/rfc/rfc9052) (RFC 9052) layer on top
-(`cose.zig`): parsing `COSE_Key` (EC2/OKP) and `COSE_Sign1`, and building the `Sig_structure` bytes
+(`cose.zig`): parsing `COSE_Key` (EC2/OKP/AKP) and `COSE_Sign1`, and building the `Sig_structure` bytes
 a signer/verifier needs. This is the keystone that unblocks WebAuthn/FIDO2 (attestation objects,
 authenticator data, COSE public keys) and any other CBOR/COSE-based wire format in this collection.
 
@@ -112,7 +112,8 @@ zig fmt --check modules/cbor
 - **No bignum (RFC 8949 §3.4.3, tags 2/3) arithmetic.** A bignum tag decodes structurally (tag
   number + the byte-string payload, like any other tag) but this module does no big-integer math
   on it — consumers that need the numeric value convert the byte string themselves.
-- **COSE scope:** only `COSE_Key` (EC2/OKP; RSA and symmetric key types return
+- **COSE scope:** only `COSE_Key` (EC2/OKP/AKP; RSA and symmetric key types return
   `error.UnsupportedKty`) and `COSE_Sign1`. No `COSE_Mac0`, `COSE_Encrypt0`, or full `COSE_Sign`
-  (multi-signer). Private-key material (COSE label `-4`, `d`) is never parsed or emitted — this is
-  a verifier/public-key-consumer layer, not a key-storage format.
+  (multi-signer). Private-key material (COSE label `-4` `d` for EC2/OKP, `-2` `priv` for AKP) is
+  never parsed or emitted — this is a verifier/public-key-consumer layer, not a key-storage
+  format.

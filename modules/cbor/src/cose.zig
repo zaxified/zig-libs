@@ -40,9 +40,21 @@ pub const label_x: i64 = -2;
 pub const label_y: i64 = -3;
 // label -4 ("d", the private key) is intentionally never referenced here.
 
+/// AKP key-type-specific parameter labels (RFC 9964 §3). Note that these
+/// REUSE label numbers -1 and -2, which mean `crv` and `x` for EC2/OKP: COSE
+/// key parameter labels are scoped to the key type, so the same integer is a
+/// different parameter depending on `kty`. That is why `parseKey` must read
+/// `kty` before it reads anything else.
+pub const label_pub: i64 = -1;
+// label -2 ("priv", the private key seed) is intentionally never referenced
+// here, for the same reason as EC2/OKP's -4: this module parses public keys.
+
 /// COSE key type values (RFC 9052 §7, Table 4 / IANA COSE Key Types).
 pub const kty_okp: i64 = 1;
 pub const kty_ec2: i64 = 2;
+/// Algorithm Key Pair (RFC 9964 §3) — a generic public/private key pair whose
+/// bytes are formatted by whatever `alg` says. Used here for ML-DSA.
+pub const kty_akp: i64 = 7;
 
 /// A selection of COSE algorithm identifiers (RFC 9053 §2/§7, IANA COSE
 /// Algorithms) — the ones a WebAuthn/COSE consumer of this module is likely
@@ -52,6 +64,11 @@ pub const alg_es256: i64 = -7;
 pub const alg_eddsa: i64 = -8;
 pub const alg_es384: i64 = -35;
 pub const alg_es512: i64 = -36;
+/// ML-DSA (FIPS 204) via RFC 9964 §8.1. Pure ML-DSA with an empty context
+/// string; the RFC specifies no HashML-DSA algorithm.
+pub const alg_ml_dsa_44: i64 = -48;
+pub const alg_ml_dsa_65: i64 = -49;
+pub const alg_ml_dsa_87: i64 = -50;
 
 /// COSE elliptic-curve identifiers (RFC 9053 §7.1, Table 22).
 pub const crv_p256: i64 = 1;
@@ -71,8 +88,8 @@ pub const KeyError = error{
     MissingField,
     /// A field is present but the wrong CBOR type (e.g. `x` isn't a byte string).
     WrongType,
-    /// `kty` is present and well-typed but not EC2 (2) or OKP (1) — the only
-    /// two key types this module models.
+    /// `kty` is present and well-typed but not EC2 (2), OKP (1) or AKP (7) —
+    /// the key types this module models.
     UnsupportedKty,
     /// Two entries in the map share the same integer label. RFC 9052 §3:
     /// "Labels in each of the maps MUST be unique. When processing messages,
@@ -107,9 +124,24 @@ pub const OkpKey = struct {
     x: []const u8,
 };
 
+/// An AKP (algorithm key pair) public key (RFC 9964 §3): opaque `pub` bytes
+/// whose format is decided entirely by `alg`, which is why `alg` is required
+/// here and optional for EC2/OKP.
+pub const AkpKey = struct {
+    /// REQUIRED for AKP keys (RFC 9964 §3: "The alg ... is REQUIRED for all
+    /// AKP keys"). For ML-DSA it also fixes the parameter set, and therefore
+    /// the length `pub_bytes` must have — deliberately NOT inferred from that
+    /// length, which would accept a key whose `alg` and bytes disagree.
+    alg: i64,
+    /// The `pub` parameter (label -1): the raw algorithm-defined public key.
+    /// For ML-DSA this is the FIPS 204 encoding, unwrapped.
+    pub_bytes: []const u8,
+};
+
 pub const Key = union(enum) {
     ec2: Ec2Key,
     okp: OkpKey,
+    akp: AkpKey,
 };
 
 fn labelValue(label: i64) Value {
@@ -187,12 +219,25 @@ pub fn parseKey(value: Value) KeyError!Key {
     if (hasDuplicateLabel(entries)) return error.DuplicateLabel;
     const kty = try requiredIntField(entries, label_kty);
     const alg = try intField(entries, label_alg);
-    const crv = try requiredIntField(entries, label_crv);
-    const x = try bstrField(entries, label_x);
 
+    // `kty` decides what the negative labels MEAN, so nothing below -1 may be
+    // read before this switch: -1 is `crv` for EC2/OKP and `pub` for AKP.
     return switch (kty) {
-        kty_ec2 => .{ .ec2 = .{ .alg = alg, .crv = crv, .x = x, .y = try bstrField(entries, label_y) } },
-        kty_okp => .{ .okp = .{ .alg = alg, .crv = crv, .x = x } },
+        kty_ec2 => .{ .ec2 = .{
+            .alg = alg,
+            .crv = try requiredIntField(entries, label_crv),
+            .x = try bstrField(entries, label_x),
+            .y = try bstrField(entries, label_y),
+        } },
+        kty_okp => .{ .okp = .{
+            .alg = alg,
+            .crv = try requiredIntField(entries, label_crv),
+            .x = try bstrField(entries, label_x),
+        } },
+        kty_akp => .{ .akp = .{
+            .alg = alg orelse return error.MissingField,
+            .pub_bytes = try bstrField(entries, label_pub),
+        } },
         else => error.UnsupportedKty,
     };
 }

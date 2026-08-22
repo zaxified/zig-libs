@@ -123,3 +123,75 @@ test "negative: RFC 9052 C.2.1 vector truncated to a 3-element array -> NotSign1
     const decoded = try cbor.decode(a, bytes, .{});
     try testing.expectError(error.NotSign1, cose.parseSign1(decoded));
 }
+
+// ── RFC 9964 Appendix A.2 — ML-DSA COSE keys (`kty` 7 / AKP) ────────────────
+
+/// Verify one published example under its parameter set.
+fn checkMlDsaVector(comptime Scheme: type, v: kat.rfc9964_a2.Vector, a: std.mem.Allocator) !void {
+    // The COSE_Key parses, and its `pub` is what the signature verifies under.
+    const key_bytes = try hexDecode(a, v.key_hex);
+    const decoded = try cbor.decode(a, key_bytes, .{});
+    const key = try cose.parseKey(decoded);
+    try testing.expect(key == .akp);
+    try testing.expectEqual(v.alg, key.akp.alg);
+
+    const pk_raw = try hexDecode(a, v.public_key_hex);
+    try testing.expectEqual(v.pk_len, pk_raw.len);
+    // The RFC's `raw_public_key` and the key's `pub` member are the same
+    // bytes -- worth asserting rather than assuming, because it is the join
+    // between "this module parsed a key" and "that key verifies signatures".
+    try testing.expectEqualSlices(u8, pk_raw, key.akp.pub_bytes);
+
+    const tbs = try hexDecode(a, v.to_be_signed_hex);
+    const sig_raw = try hexDecode(a, v.signature_hex);
+    try testing.expectEqual(v.sig_len, sig_raw.len);
+
+    const pk = try Scheme.PublicKey.fromBytes(pk_raw[0..Scheme.PublicKey.encoded_length].*);
+    const sig = try Scheme.Signature.fromBytes(sig_raw[0..Scheme.Signature.encoded_length].*);
+    // Pure ML-DSA, empty context -- RFC 9964 §2 requires exactly that.
+    try sig.verify(tbs, pk);
+
+    // One flipped byte of the signed data must break it, so a passing run
+    // above cannot be `verify` accepting anything.
+    tbs[tbs.len - 1] +%= 1;
+    try testing.expectError(error.SignatureVerificationFailed, sig.verify(tbs, pk));
+}
+
+test "RFC 9964 A.2: every published ML-DSA COSE key parses and its signature verifies" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const mldsa = std.crypto.sign.mldsa;
+    try checkMlDsaVector(mldsa.MLDSA44, kat.rfc9964_a2.ml_dsa_44, a);
+    try checkMlDsaVector(mldsa.MLDSA65, kat.rfc9964_a2.ml_dsa_65, a);
+    try checkMlDsaVector(mldsa.MLDSA87, kat.rfc9964_a2.ml_dsa_87, a);
+}
+
+test "RFC 9964 A.2: the AKP labels are read per key type, not globally" {
+    // COSE parameter labels are scoped to `kty`: -1 is `crv` for EC2/OKP and
+    // `pub` for AKP. An implementation that read -1 as `crv` before looking at
+    // `kty` would reject every AKP key with a type error. This pins that the
+    // published key -- whose -1 is a 1312-byte bstr, not a curve id -- goes
+    // through.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try hexDecode(a, kat.rfc9964_a2.ml_dsa_44.key_hex);
+    const key = try cose.parseKey(try cbor.decode(a, bytes, .{}));
+    try testing.expectEqual(cose.kty_akp, @as(i64, 7));
+    try testing.expectEqual(cose.alg_ml_dsa_44, key.akp.alg);
+    try testing.expectEqual(@as(usize, 1312), key.akp.pub_bytes.len);
+}
+
+test "AKP without alg is rejected: RFC 9964 makes it REQUIRED" {
+    // Built by removing the `alg` entry from the published key rather than by
+    // inventing a map, so what is tested is the real shape minus one field.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pk_raw = try hexDecode(a, kat.rfc9964_a2.ml_dsa_44.public_key_hex);
+    const entries = try a.alloc(cbor.MapEntry, 2);
+    entries[0] = .{ .key = .{ .uint = 1 }, .value = .{ .uint = 7 } }; // kty: AKP
+    entries[1] = .{ .key = .{ .negint = 0 }, .value = .{ .bytes = pk_raw } }; // pub: CBOR negint 0 encodes -1
+    try testing.expectError(error.MissingField, cose.parseKey(.{ .map = entries }));
+}
