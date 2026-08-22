@@ -36,10 +36,47 @@ decades-old approach (nmap's `-sT`, fping's parallel sweep) — behavior modeled
 third-party source consulted or copied; there is no `probe` entry in NOTICE (nothing derived
 requires attribution). Deps `netaddr` + `latency-stats` are sibling modules.
 
+### Cancelation is not a transport failure
+
+`Status` carries a fifth value, `canceled`, alongside `up`/`refused`/`timeout`/`error`.
+`std.Io.net`'s `ConnectError` includes `Io.Cancelable` (`error.Canceled`) — a caller that
+canceled its own `std.Io` task (`Future.cancel`) while a `LiveConnector` connect was
+blocked, not a fact about the target. `LiveConnector.classifyErr` used to fold it into the
+`else => .@"error"` arm, which meant a caller that canceled a sweep mid-flight saw the
+targets it never actually finished probing reported as dead hosts — wrong data, not just a
+mislabeled error, since `.@"error"` reads as "we tried and it failed" and `.canceled` means
+"we didn't get an answer because our own caller pulled the plug". `PosixConnector` cannot
+produce this value: its connect/poll/getsockopt path is plain `std.os.linux` syscalls,
+entirely outside `std.Io`'s cancellation registry, so nothing in it ever observes a
+cancelation (the same limitation the `-poll`-based-timeout note in `CONVENTIONS.md` §2
+describes for other modules) — `connectImpl`'s exhaustive switch marks that arm
+`unreachable` rather than silently accepting a value its own code path never produces.
+
+Two shapes were on the table for surfacing this; both preserve the existing outcome-record
+API, so the choice was between doing that (shape A, taken) versus not doing it at all
+(shape B, rejected):
+
+* **(A, taken) add `Status.canceled`.** Small, additive to the public enum; every switch on
+  `Status` becomes non-exhaustive until it is updated (found and fixed both sites this
+  module has — `classifyErr` and `PosixConnector.connectImpl`). A canceled repetition still
+  produces a `Result`/`TargetResult` sample, just correctly labeled.
+* **(B, rejected) make the fan-out stop instead of recording an outcome.** Rejected on two
+  grounds. First, it cannot be built without (A) as a prerequisite: the `Connector` vtable's
+  `connectFn(ctx, target, timeout_ns) ConnectOutcome` has no `io` parameter and no error
+  channel, so `runFanout`/`probeMany` — which never touch `std.Io` directly, by design (the
+  doc comment: "fully offline-testable against a scripted fake connector... the tests never
+  open a socket") — have no way to learn a cancelation happened at all except by reading it
+  back out of the very `Status` value (A) already adds. Second, building it properly would
+  still mean widening `ManyError` with a `Canceled` variant and inventing a "never attempted"
+  representation distinct from `.canceled` for whichever `TargetResult.samples` entries a
+  stopped fan-out never reached — a real API break, layered on top of (A) rather than instead
+  of it, for a benefit (A, held by a caller who already gets a fully-labeled batch back) can
+  already approximate: check for any `.canceled` sample in the results `probeMany` returns.
+
 ### Underlying error alongside `Status`
 
-`ConnectOutcome`/`Result` classify every connect into `up`/`refused`/`timeout`/`error`, and that
-classification is unchanged by this — but two different failures can classify the same way
+`ConnectOutcome`/`Result` classify every connect into `up`/`refused`/`timeout`/`canceled`/
+`error`, and that classification is unchanged by this — but two different failures can classify the same way
 (`EHOSTUNREACH`/`ENETUNREACH`/`EACCES` are all `.error`), and the classification alone throws away
 which one actually happened. `errno: ?i32` and `err_name: ?[]const u8` carry it: `PosixConnector`
 sets `errno` to the raw `SO_ERROR`/`connect()` code (`classifyErrno`'s input, preserved rather than

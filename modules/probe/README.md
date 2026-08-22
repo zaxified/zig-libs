@@ -7,9 +7,10 @@ and how fast? Complements the sibling `icmp` (host liveness) and `traceroute`
 The technique is `nmap -sT` / `fping`-style: attempt a TCP connection; a completed
 handshake is `up` (with the measured connect RTT), an actively refused connection
 is `refused` (a fast, definitive negative — host present, port closed), no answer
-within the timeout is `timeout`, and a DNS/other failure is `error`. Repeat N times
-per target for min/avg/max/loss, and fan out across a target list with a bounded
-worker count.
+within the timeout is `timeout`, a DNS/other failure is `error`, and an attempt the
+caller's own `std.Io` cancellation cut short is `canceled` (distinct from `error` —
+nothing about the host failed). Repeat N times per target for min/avg/max/loss, and
+fan out across a target list with a bounded worker count.
 
 **Pick the right connector.** `PosixConnector` (recommended, Linux) does a
 non-blocking connect and a `poll` bounded by your budget, then reads
@@ -47,12 +48,15 @@ Layers: `probeTcp` — one connect attempt → `Result { kind, rtt_ns, errno, er
 An optional app-level check hook runs after the handshake. `Target.parse`
 accepts `host:port` and `[v6]:port`.
 
-`Result`'s classification into `Status` (`up`/`refused`/`timeout`/`error`) stays the
-whole decision surface, but a non-`up` result also carries the connector's underlying
-error: `errno` (the raw `SO_ERROR`/`connect()` code) from `PosixConnector`, `err_name`
-(a `@errorName` string) from `LiveConnector` — never both, and both null for `.up`.
-Useful when the four-way classification alone is not enough, e.g. logging
-`EHOSTUNREACH` vs `ENETUNREACH` even though both are `.error`.
+`Result`'s classification into `Status` (`up`/`refused`/`timeout`/`canceled`/`error`)
+stays the whole decision surface, but a non-`up` result also carries the connector's
+underlying error: `errno` (the raw `SO_ERROR`/`connect()` code) from `PosixConnector`,
+`err_name` (a `@errorName` string) from `LiveConnector` — never both, and both null
+for `.up`. Useful when the classification alone is not enough, e.g. logging
+`EHOSTUNREACH` vs `ENETUNREACH` even though both are `.error`. `canceled` is
+`LiveConnector`-only: it means the caller's own `std.Io` task was canceled
+(`Future.cancel`) while this attempt was in flight, not that anything about the
+target failed — `PosixConnector`'s raw-syscall path never produces it.
 
 ```zig
 const probe = @import("probe");
@@ -64,7 +68,7 @@ const r = probe.probeTcp(.{ .host = "10.0.0.7", .port = 443 }, .{
 });
 switch (r.kind) {
     .up => {}, // r.rtt_ns is the connect latency
-    .refused, .timeout, .@"error" => {},
+    .refused, .timeout, .canceled, .@"error" => {},
 }
 ```
 

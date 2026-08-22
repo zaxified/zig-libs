@@ -11,8 +11,10 @@
 //! a `host:port`; a completed handshake means the service is `up` (with the
 //! measured connect RTT), an actively refused connection is `refused` (a
 //! definitive, fast negative — the host is there, the port is closed), no
-//! answer within the timeout is `timeout`, and a DNS/other failure is
-//! `error`. Repeat N times per target to get min/avg/max/loss (via the
+//! answer within the timeout is `timeout`, a DNS/other failure is `error`,
+//! and an attempt cut short by the caller's own `std.Io` cancellation is
+//! `canceled` — distinct from `error`, since nothing about the host actually
+//! failed. Repeat N times per target to get min/avg/max/loss (via the
 //! sibling `latency-stats`), and fan out across a target list with a worker
 //! limit.
 //!
@@ -94,12 +96,20 @@ pub const meta = .{
 
 /// Outcome class of a single connect attempt.
 ///
-///  * `up`      — the TCP handshake completed; the service accepts connections.
-///  * `refused` — the peer actively refused (RST / ECONNREFUSED): a definitive
-///                negative (host reachable, port closed) — a fast, useful signal.
-///  * `timeout` — no answer within the timeout (filtered / dropped / slow).
+///  * `up`       — the TCP handshake completed; the service accepts connections.
+///  * `refused`  — the peer actively refused (RST / ECONNREFUSED): a definitive
+///                 negative (host reachable, port closed) — a fast, useful signal.
+///  * `timeout`  — no answer within the timeout (filtered / dropped / slow).
+///  * `canceled` — the attempt was interrupted by the caller's `std.Io`
+///                 cancellation (`Future.cancel`) before it completed. Distinct
+///                 from `error` on purpose: nothing about the host or network
+///                 failed, so folding this into `error` would report a live
+///                 target as down. Only `LiveConnector` can produce it —
+///                 `PosixConnector`'s raw syscalls sit outside `std.Io`'s
+///                 cancellation registry and never see a cancelation (see its
+///                 doc comment).
 ///  * `error`   — DNS failure, unreachable network, or any other error.
-pub const Status = enum { up, refused, timeout, @"error" };
+pub const Status = enum { up, refused, timeout, canceled, @"error" };
 
 /// One probe attempt's result. `rtt_ns` is the connect round-trip and is
 /// non-null only for `.up`. `errno`/`err_name` carry whichever connector's
@@ -469,6 +479,12 @@ pub const LiveConnector = struct {
         const status: Status = switch (e) {
             error.ConnectionRefused => .refused,
             error.Timeout => .timeout,
+            // `std.Io.net`'s `ConnectError` includes `Io.Cancelable` (i.e.
+            // `error.Canceled`) — a caller that canceled the sweep, not a
+            // failure of this connect attempt. Must be checked explicitly:
+            // an `else` here would silently fold it into `.@"error"` and
+            // report a canceled probe as a dead host.
+            error.Canceled => .canceled,
             else => .@"error",
         };
         // The classification above is unchanged; this only adds what
@@ -625,6 +641,11 @@ pub const PosixConnector = struct {
             .up => overBudget(rtt, timeout_ns),
             .timeout => .{ .status = .timeout, .rtt_ns = rtt, .errno = v.errno },
             .refused, .@"error" => .{ .status = v.status, .errno = v.errno },
+            // `connectBounded` never produces this: it is plain
+            // `std.os.linux` syscalls, outside `std.Io`'s cancellation
+            // registry, so there is nothing here to observe a cancelation
+            // (see `Status.canceled`'s doc comment).
+            .canceled => unreachable,
         };
     }
 
@@ -839,16 +860,23 @@ const FakeConnector = struct {
     }
 };
 
-test "LiveConnector.classifyErr: refused/timeout/other map to distinct Status" {
+test "LiveConnector.classifyErr: refused/timeout/canceled/other map to distinct Status" {
     // Only the `.up` path is reachable from the hermetic live test below (a
     // bound-but-not-accepting listener never actually refuses or times out),
     // so the connect-error classification is exercised directly here.
     try testing.expectEqual(Status.refused, LiveConnector.classifyErr(error.ConnectionRefused).status);
     try testing.expectEqual(Status.timeout, LiveConnector.classifyErr(error.Timeout).status);
     try testing.expectEqual(Status.@"error", LiveConnector.classifyErr(error.NameResolutionFailed).status);
-    // None of the three collapse into each other.
+    // `std.Io.net`'s `ConnectError` includes `Io.Cancelable` (`error.Canceled`)
+    // — a caller-initiated cancelation, not a transport/DNS failure. Before
+    // this it fell into the `else` arm above and was reported as `.@"error"`,
+    // making a canceled probe indistinguishable from a dead host.
+    try testing.expectEqual(Status.canceled, LiveConnector.classifyErr(error.Canceled).status);
+    // None of the four collapse into each other.
     try testing.expect(LiveConnector.classifyErr(error.ConnectionRefused).status !=
         LiveConnector.classifyErr(error.Timeout).status);
+    try testing.expect(LiveConnector.classifyErr(error.Canceled).status !=
+        LiveConnector.classifyErr(error.NameResolutionFailed).status);
 }
 
 test "LiveConnector.classifyErr carries the Zig error name, not just the Status" {
@@ -1720,4 +1748,56 @@ test "live: a signal storm interrupts poll without extending the budget" {
     // interruption could not return before ~800 ms; recomputing the remainder
     // returns at ~200 ms.
     try testing.expect(el < 500 * std.time.ns_per_ms);
+}
+
+// ── cancelation: a canceled connect must not be reported as a dead host ─────
+
+const CancelTask = struct {
+    fn run(c: Connector, target: Target) ConnectOutcome {
+        // 0 = no budget: `LiveConnector` cannot abort the connect syscall
+        // itself anyway (see "the std path ignores the same budget" above),
+        // so the only thing that ends this attempt is the cancelation
+        // delivered below.
+        return c.connect(target, 0);
+    }
+};
+
+test "live: canceling a blocked connect surfaces .canceled, not .error" {
+    // Same black hole as the earlier `LiveConnector` tests, but this time the
+    // connect is canceled through the real `std.Io` protocol (`io.concurrent`
+    // + `Future.cancel`) instead of being abandoned. Before the `classifyErr`
+    // fix, `std.Io.net`'s `ConnectError` (which carries `Io.Cancelable`) fell
+    // into the `else => .@"error"` arm, so a caller that canceled a fan-out
+    // mid-sweep saw a live-but-unprobed target reported exactly like a dead
+    // one — the defect this test pins.
+    //
+    // Deliberately placed last in the file, not next to its thematic sibling
+    // "the std path ignores the same budget": that test detaches a
+    // `LiveConnector` thread whose black hole only turns into an RST (and the
+    // thread only then closes its socket) when ITS `bh.deinit()` runs, with
+    // no guarantee of when after that the detached thread actually observes
+    // it — measured: placing this test immediately afterward let that
+    // trailing cleanup land inside "attempts do not leak a descriptor"'s own
+    // before/after window and fail it on an fd neither test touched.
+    var bh = try BlackHole.init();
+    defer bh.deinit();
+
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var lc: LiveConnector = .{ .io = io };
+    var buf: [24]u8 = undefined;
+    const t = try bh.target(&buf);
+
+    var fut = try io.concurrent(CancelTask.run, .{ lc.connector(), t });
+    // Give the connect syscall time to actually block before canceling it —
+    // a black hole never answers, so this is well inside the attempt.
+    try io.sleep(.fromMilliseconds(300), .awake);
+    const out = fut.cancel(io);
+
+    try testing.expectEqual(Status.canceled, out.status);
+    // The underlying Zig error name survives too, same contract as every
+    // other `LiveConnector` classification.
+    try testing.expectEqualStrings("Canceled", out.err_name.?);
 }
