@@ -708,6 +708,10 @@ pub const FetchError = error{
     FetchFailed,
     /// The body did not fit the caller's buffer (byte cap).
     ResponseTooLarge,
+    /// The blocked wait was canceled through the `std.Io` cancellation
+    /// protocol (`Future.cancel`). Surfaced instead of `FetchFailed` so a
+    /// caller can tell a canceled wait from a real transport failure.
+    Canceled,
 };
 
 /// The one I/O operation RDAP needs: GET `url` (with the RDAP Accept
@@ -871,19 +875,38 @@ pub const HttpFetcher = struct {
         const f: *HttpFetcher = @ptrCast(@alignCast(ctx));
         var res = f.client.request(.get, url, .{
             .headers = &.{accept_header},
-        }) catch return error.FetchFailed;
+        }) catch |err| return mapFetchError(err);
         defer res.deinit();
 
-        const n = res.reader().readSliceShort(body_buf) catch return error.FetchFailed;
+        const n = res.reader().readSliceShort(body_buf) catch |err| switch (err) {
+            error.ReadFailed => return mapFetchError(res.readFailure()),
+        };
         if (n == body_buf.len) {
             // Buffer exactly full — distinguish "fit exactly" from "more coming".
             var extra: [1]u8 = undefined;
-            const m = res.reader().readSliceShort(&extra) catch return error.FetchFailed;
+            const m = res.reader().readSliceShort(&extra) catch |err| switch (err) {
+                error.ReadFailed => return mapFetchError(res.readFailure()),
+            };
             if (m != 0) return error.ResponseTooLarge;
         }
         return .{ .status = res.status, .body_len = n };
     }
 };
+
+/// Widen an `http.Client.Error` to `FetchError`, the one place this module
+/// touches the network. `error.Canceled` is the only variant worth telling
+/// apart from a plain transport failure — everything else already collapsed
+/// into `FetchFailed` before cancelation recovery existed, and stays that
+/// way. Covers both `client.request()` itself (the connect/send phase,
+/// which `http.Client.Error` already carries `Canceled` for) and
+/// `Response.readFailure()` (the blocked-body-read phase, recovered from the
+/// concrete reader's out-of-band `err` field — see CONVENTIONS.md §2).
+fn mapFetchError(err: http.Client.Error) FetchError {
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        else => error.FetchFailed,
+    };
+}
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
@@ -1583,6 +1606,71 @@ test "HttpFetcher compiles (never dialed in tests)" {
     // without any network activity.
     _ = HttpFetcher.fetchFn;
     _ = HttpFetcher.fetcher;
+}
+
+// ── tests (cancellation, loopback) ──────────────────────────────────────────
+//
+// `HttpFetcher.fetchFn` drives `res.reader()` directly rather than
+// `readAllAlloc`, which is exactly the shape `http.Client.Response
+// .readFailure()` (2c03d99) exists to unblock — `*std.Io.Reader`'s error set
+// cannot carry `Canceled`, and `Conn` is private, so this module has no
+// concrete reader of its own to consult. Proven here rather than assumed:
+// the fake peer answers a `Content-Length: 5` head and sends none of the
+// body, so the read is genuinely parked in the kernel when the test cancels
+// it.
+
+const FetchCancelPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    stop: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *FetchCancelPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var wbuf: [256]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n") catch {};
+        sw.interface.flush() catch {};
+        while (p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+};
+
+fn fetchOnce(f: Fetcher, url: []const u8, body_buf: []u8) FetchError!Fetcher.Response {
+    return f.fetch(url, body_buf);
+}
+
+test "HttpFetcher.fetchFn: a canceled body read surfaces error.Canceled, not error.FetchFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("rdap fetch cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: FetchCancelPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, FetchCancelPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var http_client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer http_client.deinit();
+    var hf: HttpFetcher = .{ .client = &http_client };
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var body_buf: [256]u8 = undefined;
+
+    var fut = try io.concurrent(fetchOnce, .{ hf.fetcher(), url, &body_buf });
+    // Long enough that the head has arrived and the body read is the one
+    // parked in the kernel.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }
 
 // ── fuzz: RDAP response + IANA bootstrap JSON parse, never panics ──────────

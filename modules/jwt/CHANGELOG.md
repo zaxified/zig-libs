@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `HttpFetcher.fetchFn` no longer folds a canceled body read into
+  `error.FetchFailed`: `FetchError` gained a `Canceled` variant, and the request +
+  both `readSliceShort` sites now consult `http.Client.Response.readFailure()`
+  (added in `2c03d99` for exactly this) via a new `mapFetchError` widener. Public
+  API addition — a caller matching exhaustively on `FetchError`, `DiscoverError`,
+  `FetchJwksError`, or any error set built from them needs a new arm.
+  `RefreshError`'s own `discover`/`fetchJwks` catches stay unaffected: they already
+  widen with `else`, so a cancelation lands as `DiscoveryFailed`/`JwksFetchFailed`,
+  consistent with `RefreshError`'s documented collapsing of the detailed sets.
+  Proven by mutation: reverting the widener to always return `FetchFailed` fails
+  the new cancellation test.
 - **2026-08-22** — ML-DSA (FIPS 204) verification per RFC 9964: `alg` values
   `ML-DSA-44`/`-65`/`-87`, `kty:"AKP"` JWKs (`pub` + a REQUIRED `alg`), and the
   matching `Key` variants and constructors. Pure ML-DSA with an empty context
