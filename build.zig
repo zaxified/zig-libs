@@ -182,7 +182,7 @@ const module_list = [_]Module{
     .{ .name = "rdap", .deps = &.{ "http", "netaddr" }, .example = true },
     .{ .name = "blobstore", .deps = &.{"hashdigest"}, .example = true },
     .{ .name = "procnet", .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "diskusage" },
+    .{ .name = "diskusage", .example = true },
     .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "procrun", .deps = &.{"argsafe"} },
     .{ .name = "dataset", .example = true },
