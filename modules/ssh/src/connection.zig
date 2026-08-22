@@ -1036,17 +1036,55 @@ fn testListenLoopback(io: std.Io, port_out: *u16) !std.Io.net.Server {
 /// ⛔ Not `SO_RCVTIMEO`: `std.Io.Threaded` panics on the `EAGAIN` it produces
 /// ("programmer bug caused syscall error: AGAIN"). `poll(2)` on the raw handle
 /// sidesteps `std.Io` and is what `opcua`'s driver uses for the same reason.
+///
+/// That same sidestep means `std.posix.poll` is not a cancellation point: it
+/// retries on `EINTR`, and a thread parked in it is never signalled by
+/// `Threaded` at all, so the wait runs to its full `timeout_ms` regardless of
+/// a pending `Future.cancel` — which would otherwise surface as an ordinary
+/// `error.AcceptPollFailed` or as `error.PeerNeverConnected`, indistinguishable
+/// from a peer that genuinely never showed up. `checkCanceled` recovers it
+/// once the wait ends, on both exit paths.
+fn checkCanceled(io: std.Io) error{Canceled}!void {
+    // `Io.checkCancel` acknowledges the request and reports it exactly once;
+    // the answer has to be converted into an error right here, not asked for
+    // again.
+    io.checkCancel() catch return error.Canceled;
+}
+
 fn acceptBounded(io: std.Io, listener: *std.Io.net.Server, timeout_ms: i32) !std.Io.net.Stream {
     var fds = [_]std.posix.pollfd{.{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
-    const n = std.posix.poll(&fds, timeout_ms) catch return error.AcceptPollFailed;
-    // A peer this test started itself and that never arrived is a FINDING, not
-    // a reason to skip.
-    if (n == 0) return error.PeerNeverConnected;
+    const n = std.posix.poll(&fds, timeout_ms) catch {
+        try checkCanceled(io);
+        return error.AcceptPollFailed;
+    };
+    if (n == 0) {
+        try checkCanceled(io);
+        // A peer this test started itself and that never arrived is a
+        // FINDING, not a reason to skip.
+        return error.PeerNeverConnected;
+    }
     return listener.accept(io);
+}
+
+test "acceptBounded: a canceled wait surfaces Canceled, not an idle poll timeout" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try testListenLoopback(io, &port);
+    defer listener.deinit(io);
+
+    // Nobody connects: the poll inside `acceptBounded` is genuinely parked
+    // for the whole of this timeout, exactly like the accept wait a real
+    // caller would cancel on shutdown.
+    var fut = try io.concurrent(acceptBounded, .{ io, &listener, @as(i32, 5000) });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try std.testing.expectError(error.Canceled, fut.cancel(io));
 }
 
 /// How long any test here waits for a peer it has already started.

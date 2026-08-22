@@ -1266,17 +1266,57 @@ fn listenLoopback(io: std.Io, port_out: *u16) !std.Io.net.Server {
 /// Measured, not guessed. `poll(2)` on the raw handle stays outside `std.Io`
 /// entirely, which is why it works — and it is what `opcua`'s interop driver
 /// already uses for the same reason.
+///
+/// Staying outside `std.Io` cuts both ways: `std.posix.poll` also is not a
+/// cancellation point. It retries on `EINTR`, and a thread parked in it is
+/// never signalled by `Threaded` at all, so the wait runs to its full
+/// `timeout_ms` regardless of a pending `Future.cancel` — which would
+/// otherwise come back as an ordinary `error.AcceptPollFailed` or, worse, as
+/// `error.PeerNeverConnected` indistinguishable from a peer that genuinely
+/// never showed up. `checkCanceled` recovers it once the wait ends, on both
+/// exit paths.
+fn checkCanceled(io: std.Io) error{Canceled}!void {
+    // `Io.checkCancel` acknowledges the request and reports it exactly once;
+    // the answer has to be converted into an error right here, not asked for
+    // again.
+    io.checkCancel() catch return error.Canceled;
+}
+
 fn acceptBounded(io: std.Io, listener: *std.Io.net.Server, timeout_ms: i32) !std.Io.net.Stream {
     var fds = [_]std.posix.pollfd{.{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
-    const n = std.posix.poll(&fds, timeout_ms) catch return error.AcceptPollFailed;
-    // A connection that never arrives is a FAILURE, not a skip: the peer was
-    // present enough to be spawned, so "it did not connect" is a finding.
-    if (n == 0) return error.PeerNeverConnected;
+    const n = std.posix.poll(&fds, timeout_ms) catch {
+        try checkCanceled(io);
+        return error.AcceptPollFailed;
+    };
+    if (n == 0) {
+        try checkCanceled(io);
+        // A connection that never arrives is a FAILURE, not a skip: the peer
+        // was present enough to be spawned, so "it did not connect" is a
+        // finding.
+        return error.PeerNeverConnected;
+    }
     return listener.accept(io);
+}
+
+test "acceptBounded: a canceled wait surfaces Canceled, not an idle poll timeout" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try listenLoopback(io, &port);
+    defer listener.deinit(io);
+
+    // Nobody connects: the poll inside `acceptBounded` is genuinely parked
+    // for the whole of this timeout, exactly like the accept wait a real
+    // caller would cancel on shutdown.
+    var fut = try io.concurrent(acceptBounded, .{ io, &listener, @as(i32, 5000) });
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try std.testing.expectError(error.Canceled, fut.cancel(io));
 }
 
 /// How long any test here waits for a peer it has already started. Generous
