@@ -142,6 +142,13 @@ pub const Client = struct {
     /// from are the caller's encrypted ones. Gates `login`.
     tls_active: bool = false,
 
+    /// A `std.Io` cancellation of a blocking read on `r` reaches this client
+    /// as plain `error.ReadFailed` — `std.Io.Reader.Error` is only
+    /// `{ReadFailed, EndOfStream}` and cannot carry `Canceled`. The real
+    /// cause survives only in the concrete reader's out-of-band `err` field
+    /// (`std.Io.net.Stream.Reader.err` / `std.Io.File.Reader.err`); a caller
+    /// that needs to tell a cancel from a dead connection inspects the
+    /// reader it built and passed in here, not anything `Error` returns.
     pub fn init(
         gpa: Allocator,
         r: *std.Io.Reader,

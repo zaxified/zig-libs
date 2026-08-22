@@ -504,6 +504,17 @@ pub const rtu = struct {
 /// reply ADU into `reply_buf`, return its length. Implementations own all
 /// framing-boundary concerns (MBAP length prefix on TCP, t3.5 silence on
 /// serial). Tests drive the client from fixed buffers through this seam.
+///
+/// `TransportError.Canceled` exists so an implementation *can* report a
+/// `std.Io` cancellation distinctly from a genuine transport failure — but
+/// only if it recovers that cause itself. A blocked `std.Io.Reader`/`Writer`
+/// call collapses `Canceled` into `error.ReadFailed`/`WriteFailed` on its
+/// own (`std.Io.Reader.Error`/`Writer.Error` have no room for it); the real
+/// cause survives only in the concrete reader's/writer's out-of-band `err`
+/// field. `TcpTransport.exchangeFn` below (`readFailure`/`writeFailure`) is
+/// the reference for that recovery — any other `exchangeFn` wrapping
+/// `std.Io` I/O needs the same check, or a cancel silently reads as
+/// `error.TransportFailed`.
 pub const Transport = struct {
     ctx: *anyopaque,
     exchangeFn: *const fn (ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize,

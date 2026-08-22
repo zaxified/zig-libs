@@ -181,6 +181,14 @@ pub const EventIterator = struct {
     /// The next parsed stream event, or null at a clean end of stream.
     /// The event's memory is valid until the next `next()` call or
     /// `deinit()` — copy anything you need to keep.
+    ///
+    /// Unlike `create`/`stream`'s own `mapHttpError`, a `std.Io` cancellation
+    /// of the blocked body read here cannot come back as `error.Canceled`:
+    /// `it.res.reader()` (from `http.Client.Response`) is a plain
+    /// `*std.Io.Reader`, and `http.Client` does not expose the concrete
+    /// reader underneath it, so there is no `err` field on this side to
+    /// recover the real cause from. It surfaces as `error.HttpFailed`,
+    /// indistinguishable from an actual dropped connection.
     pub fn next(it: *EventIterator) Error!?StreamEvent {
         _ = it.arena.reset(.retain_capacity);
         const a = it.arena.allocator();

@@ -1906,6 +1906,15 @@ pub const Server = struct {
     /// repeat. Works over any reader/writer pair — stdio, an in-memory pipe,
     /// a socket. A read failure ends the loop like EOF (a dying peer is a
     /// session end, not a server error).
+    ///
+    /// This also swallows a `std.Io` cancellation of the blocked read inside
+    /// `readLine`: it is a read failure like any other, so `serve` just
+    /// returns `{}` as though the peer hung up cleanly — it does not surface
+    /// as an error at all, let alone a distinguishable one. A caller driving
+    /// `serve` on a cancelable task and needing to tell "canceled" from
+    /// "peer disconnected" has to inspect `in`'s own concrete reader (its
+    /// out-of-band `err` field, e.g. `std.Io.net.Stream.Reader.err` /
+    /// `std.Io.File.Reader.err`) after `serve` returns, not `serve`'s result.
     pub fn serve(self: *Server, in: *std.Io.Reader, out: *std.Io.Writer) Error!void {
         var line_buf: std.ArrayList(u8) = .empty;
         defer line_buf.deinit(self.gpa);

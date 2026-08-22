@@ -59,6 +59,17 @@ pub const TransportError = error{
 
 /// The byte-stream seam. One blocking `read`, one `write`; no timeouts, no
 /// threads, no ownership.
+///
+/// `TransportError` has no room for `Canceled` — same shape as
+/// `std.Io.Reader.Error`/`std.Io.Writer.Error`, and for the same reason: an
+/// implementation of `read`/`write` that blocks inside `std.Io` (a
+/// `std.Io.net.Stream.Reader`/`Writer`, or a plain `std.Io.Reader` handed
+/// down from somewhere else) sees any `std.Io` cancellation collapse to a
+/// generic failure at that boundary. If a caller of `Client` needs to tell a
+/// canceled wait from a dead connection, the implementation of this vtable
+/// is where that has to happen — inspect the concrete reader's/writer's
+/// out-of-band `err` field before mapping to `error.ReadFailed`/
+/// `error.WriteFailed`, the way `TcpTransport` in `modbus` does it.
 pub const Transport = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
