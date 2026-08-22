@@ -265,6 +265,20 @@ The `dtls.keyschedule` and `dtls.aead` modules are the KAT-validated crypto
 core; `dtls.record`/`handshake`/`flight`/`messages` are the pure framing
 layer — all usable standalone.
 
+## Post-quantum: not here, and the sibling paths differ
+
+Both `.cert_dhe` groups are classical (X25519, secp256r1). A consumer who
+picks `dtls` over the collection's other TLS-family paths drops to a purely
+classical exchange **silently** — `std.crypto.tls.Client` (what the `http`
+client uses) offers `x25519_ml_kem768`, and [`ssh`](../ssh) offers
+`mlkem768x25519-sha256` first. Nothing in DTLS 1.3 negotiates a hybrid by
+default in the field either, so this is a gap against the opt-in tier rather
+than against a shipping default — but it is a gap, and it is not blocked on a
+primitive: `std.crypto.kem.hybrid.MlKem768X25519` is ready-made and measures
+faster than std's own X25519. `SPEC.md`'s threat-model section has the
+measurements and the exact wiring (group `0x11ec`, share sizes, and the
+combiner trap that makes `ssh`'s construction non-reusable here).
+
 ## Verify
 
 ```sh

@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — Documented the absence of a post-quantum key exchange in
+  `SPEC.md`, `README.md` and the module doc comment. It is written down
+  because the failure mode is an assumption, not an oversight: the other
+  TLS-family paths a consumer reaches for (`std.crypto.tls.Client`, and `ssh`)
+  do offer an ML-KEM hybrid, so picking `dtls` silently drops to a classical
+  exchange. Includes what closing it would take and why the primitive is not
+  the obstacle.
 - **2026-08-21** — **Breaking (in the direction of working):** `Config.cipher_suites` now
   defaults to `.aes_128_gcm_sha256`, and `Config.validate` rejects any suite this module
   cannot install keys for with the new `ConfigError.UnsupportedSuite`. The old default was

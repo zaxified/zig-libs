@@ -277,6 +277,36 @@ follow-up.
   migration beyond the connection-ID field already framed in `record.zig`.
   (X.509/certificate auth was in this list originally — see "Certificate
   mode" above for what landed and what of it is still genuinely deferred.)
+- **No post-quantum key exchange, and that is a real exposure, not a shrug.**
+  Both `.cert_dhe` groups are classical (X25519, secp256r1), so a `.cert_dhe`
+  session is recorded-now-decrypted-later once a cryptographically relevant
+  quantum computer exists. What makes this worth writing down rather than
+  leaving implicit: the sibling path a consumer might assume is equivalent is
+  NOT. `std.crypto.tls.Client` — which this collection's `http` client uses —
+  offers `x25519_ml_kem768` and gets the hybrid whenever the peer supports it,
+  and `ssh` in this collection offers `mlkem768x25519-sha256` first. A
+  consumer who reaches for `dtls` instead therefore drops from a hybrid to a
+  purely classical exchange **silently**, on the reasonable assumption that
+  one TLS-family module in a collection behaves like the others.
+  - Closing it is not blocked on a primitive: Zig 0.16 ships
+    `std.crypto.kem.ml_kem.MLKem768` and, ready-made,
+    `std.crypto.kem.hybrid.MlKem768X25519`. Measured on this repo's audit
+    host (2026-08-22, ReleaseFast), std's ML-KEM-768 costs **less** than its
+    own X25519: keygen 52 vs 54 µs, encaps 29 µs, decaps 43 µs — and beats
+    OpenSSL 3.5.5's own ML-KEM-768 (65/40/60 µs) on the same machine. Cost is
+    not the reason this is missing; nobody has wired the `key_share` group.
+  - What it needs: the `X25519MLKEM768` named group (0x11ec) as a third
+    `key_share` option, its 1216-byte client share / 1120-byte server share,
+    and the concatenated secret into the SAME key schedule the two classical
+    groups already feed. Note the trap `ssh` documents: identical wire sizes
+    do NOT imply an identical construction — TLS concatenates
+    `ss_ML-KEM ‖ ss_X25519` per draft-ietf-tls-ecdhe-mlkem, while `ssh` hashes
+    `SHA256(ss_M ‖ ss_X)`. Reusing the wrong combiner would interoperate with
+    nothing.
+  - Scope note: nothing in DTLS 1.3 negotiates a PQ hybrid by DEFAULT in the
+    field either (as of 2026-08: wolfSSL and mbedTLS have it opt-in, WebRTC's
+    hybrid DTLS-SRTP keying is still in design), so this is a gap against the
+    *opt-in* tier, not against a shipping default.
 - Once `keyschedule.pskBinder` is implemented, it MUST be checked (server
   side) before trusting the offered PSK identity — a missing check is the
   single highest-impact bug this module could ship with.

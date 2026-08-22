@@ -24,6 +24,16 @@
 //!     no `peer_verify` policy and a `.cert_dhe` server with no `cert`, so a
 //!     Config that sets nothing but the mode can no longer complete an
 //!     unauthenticated handshake in the mode named for authentication.
+//!
+//!     ⚠ **Both groups are classical — there is no post-quantum hybrid here.**
+//!     A `.cert_dhe` session is recorded-now-decrypted-later. Do not assume
+//!     parity with the other TLS-family paths a consumer might reach for:
+//!     `std.crypto.tls.Client` offers `x25519_ml_kem768` and `ssh` offers
+//!     `mlkem768x25519-sha256` first, so choosing `dtls` silently drops to a
+//!     classical exchange. The primitive is not the obstacle (`std.crypto.kem
+//!     .hybrid.MlKem768X25519` is ready-made and measures faster than std's
+//!     own X25519); nobody has wired the group. SPEC.md's threat-model
+//!     section carries the numbers and what wiring it would take.
 //!   - `.cert_dhe_insecure_unauthenticated`: the same (EC)DHE exchange with
 //!     peer authentication switched off — encryption to an unknown party,
 //!     indistinguishable from encryption to an active MITM. Spelled out in
