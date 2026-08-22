@@ -230,28 +230,141 @@ pub fn encodeRequest(out: *[packet_len]u8, transmit: Timestamp) void {
     out.* = p.encode();
 }
 
+/// Registered Kiss-o'-Death reason codes (RFC 5905 §7.4, Figure 13 "Kiss
+/// Codes"). Sent in `reference_id` when `stratum == 0`.
+pub const KissCode = enum {
+    /// ACST — the association belongs to a unicast server.
+    acst,
+    /// AUTH — server authentication failed.
+    auth,
+    /// AUTO — Autokey sequence failed.
+    auto,
+    /// BCST — the association belongs to a broadcast server.
+    bcst,
+    /// CRYP — cryptographic authentication or identification failed.
+    cryp,
+    /// DENY — access denied by remote server. RFC 5905 §7.4: the client
+    /// MUST demobilize any association to that server and stop sending it
+    /// packets.
+    deny,
+    /// DROP — lost peer in symmetric mode.
+    drop,
+    /// INIT — the association has not yet synchronized for the first time.
+    init,
+    /// MCST — the association belongs to a dynamically discovered server.
+    mcst,
+    /// NKEY — no key found; the key was never installed or is not trusted.
+    nkey,
+    /// RATE — rate exceeded: the server temporarily denied access because
+    /// the client exceeded the rate threshold. RFC 5905 §7.4: the client
+    /// MUST immediately reduce its polling interval to that server, and
+    /// continue reducing it each time RATE is received again.
+    rate,
+    /// RMOT — alteration of the association from a remote host running
+    /// ntpdc.
+    rmot,
+    /// RSTR — access denied due to local policy. RFC 5905 §7.4: same
+    /// mandatory response as `deny` — demobilize and stop sending.
+    rstr,
+    /// STEP — a step change in system time has occurred, but the
+    /// association has not yet resynchronized.
+    step,
+    /// Not one of the 14 codes above. Covers RFC 5905 §7.4's "X"-prefixed
+    /// experimental range ("reserved for unregistered experimentation and
+    /// development and MUST be ignored if not recognized") and any other
+    /// four-byte value, including non-ASCII bytes — `reference_id` is an
+    /// opaque wire field, not guaranteed text from a hostile or buggy peer.
+    /// `KissOfDeath.raw` always keeps the original bytes for a caller that
+    /// wants to log or re-inspect them.
+    unrecognized,
+};
+
+/// Parse a raw 4-byte `reference_id` into a `KissCode` per the RFC 5905
+/// §7.4 table. Deliberately total (never fails): an unrecognized or
+/// malformed value maps to `.unrecognized` rather than an error, matching
+/// the RFC's own instruction to ignore codes it doesn't define.
+pub fn parseKissCode(raw: [4]u8) KissCode {
+    const table = .{
+        .{ "ACST", KissCode.acst },
+        .{ "AUTH", KissCode.auth },
+        .{ "AUTO", KissCode.auto },
+        .{ "BCST", KissCode.bcst },
+        .{ "CRYP", KissCode.cryp },
+        .{ "DENY", KissCode.deny },
+        .{ "DROP", KissCode.drop },
+        .{ "INIT", KissCode.init },
+        .{ "MCST", KissCode.mcst },
+        .{ "NKEY", KissCode.nkey },
+        .{ "RATE", KissCode.rate },
+        .{ "RMOT", KissCode.rmot },
+        .{ "RSTR", KissCode.rstr },
+        .{ "STEP", KissCode.step },
+    };
+    inline for (table) |entry| {
+        if (std.mem.eql(u8, &raw, entry[0])) return entry[1];
+    }
+    return .unrecognized;
+}
+
+/// A Kiss-o'-Death signal, decoded from a `stratum == 0` reply.
+pub const KissOfDeath = struct {
+    /// The parsed reason, per `parseKissCode`.
+    code: KissCode,
+    /// The original 4 ASCII bytes from `reference_id`, kept regardless of
+    /// `code` (e.g. to log an `.unrecognized` value).
+    raw: [4]u8,
+};
+
 /// Errors from validating a server response.
 pub const DecodeError = error{
     /// Not exactly 48 bytes.
     InvalidLength,
+    /// The reply's version number is 0 (RFC 4330 §5 sanity check 4, as
+    /// corrected by RFC Errata 2263 — the published text names the LI
+    /// field, but the errata, verified by an RFC 4330 author, confirms the
+    /// intended field is VN: "Zero is a legal value for the LI field under
+    /// normal conditions. Zero is not legal for [the] VN field").
+    InvalidVersion,
     /// The reply is not in server mode (mode 4).
     NotServerMode,
-    /// Stratum 0 — a Kiss-o'-Death packet (RFC 4330 §8). The four ASCII bytes
-    /// of the kiss code are in `reference_id`; inspect the returned packet via
-    /// `decode` if you need them.
+    /// Stratum 0 — a Kiss-o'-Death packet (RFC 4330 §8, RFC 5905 §7.4). Pass
+    /// a non-null `kiss_out` to `decodeResponse` to get the parsed reason.
     KissOfDeath,
+    /// Stratum 16 or above: RFC 5905 §7.3 Figure 11 defines 16 as
+    /// "unsynchronized" and 17-255 as reserved (RFC 4330 §4 calls the whole
+    /// 16-255 range simply "reserved"). Neither is a valid, synchronized
+    /// time source, so both are rejected the same way.
+    UnsynchronizedStratum,
+    /// The reply's Transmit Timestamp (T3) is the all-zero sentinel RFC
+    /// 4330 uses for "not set" — RFC 4330 §5 sanity check 4 says to discard
+    /// such a reply (the server hasn't set its own clock yet).
+    TransmitTimestampUnset,
 };
 
 /// A validated server reply. Alias of `Packet` — the `originate`/`receive`/
 /// `transmit` fields carry T1/T2/T3 respectively.
 pub const Reply = Packet;
 
-/// Decode + validate a server response: exactly 48 bytes, server mode, and
-/// non-zero stratum (stratum 0 is surfaced as `error.KissOfDeath`).
-pub fn decodeResponse(bytes: []const u8) DecodeError!Reply {
+/// Decode + validate a server response: exactly 48 bytes, a non-zero
+/// version, server mode, a stratum in 1..15, and a set (non-zero) transmit
+/// timestamp — the RFC 4330 §5 sanity-check list (item 4, VN-corrected per
+/// Errata 2263) plus RFC 5905's stratum range.
+///
+/// On `error.KissOfDeath` (stratum 0), if `kiss_out` is non-null it is
+/// filled in with the parsed reason code and the raw `reference_id` bytes —
+/// callers that need to honour RATE (back off) or distinguish DENY/RSTR
+/// (stop sending) from anything else don't have to re-decode the packet
+/// themselves. Pass `null` to ignore it.
+pub fn decodeResponse(bytes: []const u8, kiss_out: ?*KissOfDeath) DecodeError!Reply {
     const p = Packet.decode(bytes) catch return error.InvalidLength;
+    if (p.version == 0) return error.InvalidVersion;
     if (p.mode != .server) return error.NotServerMode;
-    if (p.stratum == 0) return error.KissOfDeath;
+    if (p.stratum == 0) {
+        if (kiss_out) |out| out.* = .{ .code = parseKissCode(p.reference_id), .raw = p.reference_id };
+        return error.KissOfDeath;
+    }
+    if (p.stratum >= 16) return error.UnsynchronizedStratum;
+    if (p.transmit.isZero()) return error.TransmitTimestampUnset;
     return p;
 }
 
@@ -367,7 +480,11 @@ pub const QueryResult = struct {
 /// e.g. `try std.Io.net.IpAddress.parse("162.159.200.1", 123)`), over UDP.
 /// Works for IPv4 and IPv6. Fills T1 just before sending and T4 right after
 /// receiving, then validates the reply and computes offset + delay.
-pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions) QueryError!QueryResult {
+///
+/// `kiss_out` is forwarded to `decodeResponse` — pass a non-null pointer to
+/// learn the Kiss-o'-Death reason on `error.KissOfDeath` (e.g. to back off on
+/// RATE), or `null` to ignore it.
+pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out: ?*KissOfDeath) QueryError!QueryResult {
     // Bind a datagram socket on the wildcard address of the server's family.
     const bind_addr: net.IpAddress = switch (server) {
         .ip4 => .{ .ip4 = .unspecified(0) },
@@ -403,7 +520,7 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions) QueryErro
 
         // T4: local receive instant.
         const t4 = nowTimestamp();
-        const reply = try decodeResponse(incoming.data);
+        const reply = try decodeResponse(incoming.data, kiss_out);
         // RFC 4330 §5 origin-timestamp check: reject unless the reply echoes
         // back the T1 we sent. Must happen before the reply is trusted for
         // anything else (offset/delay computation below).
@@ -493,7 +610,7 @@ test "decodeResponse: canned server reply" {
     // transmit (T3) = seconds 0x0000_0065, fraction 0.
     std.mem.writeInt(u32, bytes[40..44], 0x0000_0065, .big);
 
-    const reply = try decodeResponse(&bytes);
+    const reply = try decodeResponse(&bytes, null);
     try testing.expectEqual(@as(u8, 2), reply.stratum);
     try testing.expectEqual(Mode.server, reply.mode);
     try testing.expectEqual(@as(i8, -20), reply.precision);
@@ -504,16 +621,51 @@ test "decodeResponse: canned server reply" {
 
 test "decodeResponse: rejects wrong length" {
     const short = [_]u8{0} ** 40;
-    try testing.expectError(error.InvalidLength, decodeResponse(&short));
+    try testing.expectError(error.InvalidLength, decodeResponse(&short, null));
     const long = [_]u8{0} ** 56;
-    try testing.expectError(error.InvalidLength, decodeResponse(&long));
+    try testing.expectError(error.InvalidLength, decodeResponse(&long, null));
 }
 
 test "decodeResponse: rejects non-server mode" {
     var bytes = [_]u8{0} ** packet_len;
     bytes[0] = 0x23; // mode 3 (client)
     bytes[1] = 2;
-    try testing.expectError(error.NotServerMode, decodeResponse(&bytes));
+    try testing.expectError(error.NotServerMode, decodeResponse(&bytes, null));
+}
+
+test "decodeResponse: rejects version 0 (RFC 4330 §5 item 4, VN per Errata 2263)" {
+    var bytes = [_]u8{0} ** packet_len;
+    bytes[0] = 0x04; // LI=0, VN=0, Mode=4 (server)
+    bytes[1] = 2; // stratum 2
+    std.mem.writeInt(u32, bytes[40..44], 1, .big); // non-zero transmit, isolates the VN check
+    try testing.expectError(error.InvalidVersion, decodeResponse(&bytes, null));
+}
+
+test "decodeResponse: stratum 16 and above is UnsynchronizedStratum" {
+    var bytes = [_]u8{0} ** packet_len;
+    bytes[0] = 0x24; // VN=4, server mode
+    std.mem.writeInt(u32, bytes[40..44], 1, .big); // non-zero transmit
+    bytes[1] = 16;
+    try testing.expectError(error.UnsynchronizedStratum, decodeResponse(&bytes, null));
+    bytes[1] = 255;
+    try testing.expectError(error.UnsynchronizedStratum, decodeResponse(&bytes, null));
+}
+
+test "decodeResponse: stratum 15 (top of the valid secondary-reference range) is accepted" {
+    var bytes = [_]u8{0} ** packet_len;
+    bytes[0] = 0x24; // VN=4, server mode
+    bytes[1] = 15;
+    std.mem.writeInt(u32, bytes[40..44], 1, .big); // non-zero transmit
+    const reply = try decodeResponse(&bytes, null);
+    try testing.expectEqual(@as(u8, 15), reply.stratum);
+}
+
+test "decodeResponse: rejects an all-zero Transmit Timestamp (RFC 4330 §5 item 4)" {
+    var bytes = [_]u8{0} ** packet_len;
+    bytes[0] = 0x24; // VN=4, server mode
+    bytes[1] = 2; // stratum 2, well clear of KissOfDeath/UnsynchronizedStratum
+    // bytes[40..48] (transmit) left all-zero.
+    try testing.expectError(error.TransmitTimestampUnset, decodeResponse(&bytes, null));
 }
 
 test "decodeResponse: stratum 0 is Kiss-o'-Death" {
@@ -521,7 +673,66 @@ test "decodeResponse: stratum 0 is Kiss-o'-Death" {
     bytes[0] = 0x24; // server mode
     bytes[1] = 0; // stratum 0 → KoD
     @memcpy(bytes[12..16], "RATE");
-    try testing.expectError(error.KissOfDeath, decodeResponse(&bytes));
+    try testing.expectError(error.KissOfDeath, decodeResponse(&bytes, null));
+}
+
+test "decodeResponse: surfaces the parsed Kiss-o'-Death code and raw bytes via kiss_out" {
+    var bytes = [_]u8{0} ** packet_len;
+    bytes[0] = 0x24; // server mode
+    bytes[1] = 0; // stratum 0 → KoD
+    @memcpy(bytes[12..16], "RATE");
+
+    var kod: KissOfDeath = undefined;
+    try testing.expectError(error.KissOfDeath, decodeResponse(&bytes, &kod));
+    try testing.expectEqual(KissCode.rate, kod.code);
+    try testing.expectEqualSlices(u8, "RATE", &kod.raw);
+}
+
+test "decodeResponse: an unregistered/malformed kiss code maps to .unrecognized, not an error" {
+    var bytes = [_]u8{0} ** packet_len;
+    bytes[0] = 0x24;
+    bytes[1] = 0;
+    @memcpy(bytes[12..16], "XABC"); // RFC 5905 §7.4: "X"-prefixed experimental range
+
+    var kod: KissOfDeath = undefined;
+    try testing.expectError(error.KissOfDeath, decodeResponse(&bytes, &kod));
+    try testing.expectEqual(KissCode.unrecognized, kod.code);
+    try testing.expectEqualSlices(u8, "XABC", &kod.raw);
+
+    // A genuinely malformed (non-ASCII) value is likewise `.unrecognized`,
+    // never a decode failure — decodeResponse must not panic on it either.
+    bytes[12] = 0xFF;
+    bytes[13] = 0x00;
+    bytes[14] = 0x01;
+    bytes[15] = 0xFE;
+    try testing.expectError(error.KissOfDeath, decodeResponse(&bytes, &kod));
+    try testing.expectEqual(KissCode.unrecognized, kod.code);
+}
+
+test "parseKissCode: covers every RFC 5905 §7.4 registered code" {
+    const cases = [_]struct { raw: *const [4]u8, code: KissCode }{
+        .{ .raw = "ACST", .code = .acst },
+        .{ .raw = "AUTH", .code = .auth },
+        .{ .raw = "AUTO", .code = .auto },
+        .{ .raw = "BCST", .code = .bcst },
+        .{ .raw = "CRYP", .code = .cryp },
+        .{ .raw = "DENY", .code = .deny },
+        .{ .raw = "DROP", .code = .drop },
+        .{ .raw = "INIT", .code = .init },
+        .{ .raw = "MCST", .code = .mcst },
+        .{ .raw = "NKEY", .code = .nkey },
+        .{ .raw = "RATE", .code = .rate },
+        .{ .raw = "RMOT", .code = .rmot },
+        .{ .raw = "RSTR", .code = .rstr },
+        .{ .raw = "STEP", .code = .step },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.code, parseKissCode(c.raw.*));
+    }
+    // DENY and RSTR are the two distinct "must stop sending" codes — the
+    // whole reason this module can no longer conflate them behind one
+    // opaque error.
+    try testing.expect(parseKissCode("DENY".*) != parseKissCode("RSTR".*));
 }
 
 test "verifyOriginate: rejects a reply whose originate != t1 (off-path spoof defense)" {
@@ -681,7 +892,7 @@ test "golden: real SNTP reply captured from time.google.com, frozen" {
         0xee, 0x18, 0x7a, 0x1c, 0xf6, 0x98, 0x9f, 0x86,
     };
 
-    const reply = try decodeResponse(&captured_reply);
+    const reply = try decodeResponse(&captured_reply, null);
     try testing.expectEqual(LeapIndicator.no_warning, reply.leap);
     try testing.expectEqual(@as(u3, 4), reply.version);
     try testing.expectEqual(Mode.server, reply.mode);
@@ -737,6 +948,10 @@ fn fuzzDecodeResponse(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
 
-    const reply = decodeResponse(buf[0..len]) catch return;
+    // Always pass a live kiss_out so the KissOfDeath write path (new in this
+    // sweep) is exercised by the same never-panics fuzz target, not just the
+    // main decode path.
+    var kod: KissOfDeath = undefined;
+    const reply = decodeResponse(buf[0..len], &kod) catch return;
     verifyOriginate(reply, reply.originate) catch return;
 }
