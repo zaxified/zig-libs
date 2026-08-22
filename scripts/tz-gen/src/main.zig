@@ -62,6 +62,17 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.startsWith(u8, entry.path, "posix/")) continue;
         if (std.mem.startsWith(u8, entry.path, "right/")) continue;
 
+        // `localtime` and `posixrules` are installed by the OS, not shipped
+        // by IANA: on a Debian/Ubuntu host `localtime` symlinks to
+        // `/etc/localtime` -- the BUILD MACHINE's configured timezone -- and
+        // `posixrules` to a legacy US-rules zone. Emitting them puts a
+        // machine-specific value into a committed table under a name no
+        // consumer should look up, and makes the output depend on who ran
+        // this. Skipped by name because that is what they are: names, not a
+        // directory prefix like the two above.
+        if (std.mem.eql(u8, entry.path, "localtime")) continue;
+        if (std.mem.eql(u8, entry.path, "posixrules")) continue;
+
         _ = parse_arena.reset(.retain_capacity);
         const pa = parse_arena.allocator();
 
@@ -121,7 +132,12 @@ fn readVersion(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir) ![]const u8
     // tzdata.zi starts with a "# version <rel>" line.
     // tzdata.zi is the full zic source (~1 MB); we only read its first line.
     const bytes = root.readFileAlloc(io, "tzdata.zi", gpa, .limited(4 << 20)) catch {
-        return root.readFileAlloc(io, "+VERSION", gpa, .limited(64)) catch error.NoVersion;
+        // `+VERSION` is the whole file, and it ends with a newline. Left in,
+        // it lands mid-sentence in the generated header comment and breaks
+        // the line -- which is how it was found.
+        const raw = root.readFileAlloc(io, "+VERSION", gpa, .limited(64)) catch return error.NoVersion;
+        defer gpa.free(raw);
+        return gpa.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
     };
     defer gpa.free(bytes);
     var it = std.mem.tokenizeAny(u8, bytes, " \n\r");

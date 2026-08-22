@@ -5,7 +5,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 ## Design & invariants
 IANA time-zone offset lookup: zone name → UTC offset/DST at a given instant. Pure logic, no OS calls,
 no filesystem — the whole tzdata table is a compiled-in Zig array (`tz_data.zig`, generated ahead of
-time by the `tz-gen` tool, not ported into this module). Each of the 600 IANA zones
+time by the `tz-gen` tool, not ported into this module). Each of the 598 IANA zones
 carries an explicit list of UTC-offset transitions from 1970 onward (real tzdata transition history,
 `zic` output); `offsetAt` binary-searches that list for the offset in effect at a given Unix instant.
 Past the last explicit transition (tzdata typically stops emitting these around 2037/2038), it falls
@@ -47,15 +47,26 @@ than by these tests alone).
   Feb 29 exist. (Note: the *POSIX day-number* that lands on Feb 29 is 59, not 60 — Jn is 1-based so
   `J60`≡March 1 always, and the zero-based `n` only reaches Feb 29 at index 59; `n=60` is March 1 in a
   leap year too, so `59` is the number that actually demonstrates the divergence.)
-- **tzdata refresh cadence tooling:** the `tz-gen` generator now lives in this repo at
+- **tzdata refresh cadence tooling:** the `tz-gen` generator lives in this repo at
   `scripts/tz-gen/`, so the pinned release can be re-derived rather than only trusted. It stays out of
-  `modules/` on purpose — it reads the host's `/usr/share/zoneinfo` and is the sole user of `std.Tz`,
+  `modules/` on purpose — it reads a compiled zoneinfo tree and is the sole user of `std.Tz`,
   both of which the module's no-filesystem/no-syscalls threat model above rules out — and `scripts/` is
   outside `build.zig.zon`'s `.paths`, so a consumer still fetches nothing but the generated table. This
   module still has no loader to redirect and no version accessor to add; `tz_data.zig`'s header comment
   states the pinned release (tzdata 2026a) and the regeneration command. A "point the loader at a fresh
   tzdata dir" helper does not apply (the table is compile-time-embedded, by design). Refreshing the
   pinned release remains a `tz-gen`-tool concern, not a `tz` (this module)-API concern.
+- **"Re-derived" means from the PINNED release, not from this machine.** `scripts/tz-gen/fetch-and-build.sh`
+  fetches `tzdata<release>.tar.gz` from IANA (SHA-256 pinned in `scripts/tz-gen/checksums.txt`),
+  compiles it with the system `zic -b fat`, and hands that tree to the generator; `--check` regenerates
+  to a temp file and diffs, exiting non-zero on any difference. Handing the generator
+  `/usr/share/zoneinfo` instead re-derives the table from whatever release THIS distro shipped, which
+  is how the claim came to be false in practice — that tree was 2026c against a 2026a pin. The script
+  never falls back to it: a missing `zic` is a hard failure, because a silent fall-back would produce
+  a table that looks regenerated and is not.
+- **`-b fat` is load-bearing.** With `zic -b slim`, zic omits the transitions the POSIX-TZ footer can
+  regenerate. This module reads transitions, so a slim tree yields a different (smaller, and
+  differently-behaved before the footer takes over) table from identical input data.
 
 ## Status
 `extract · any · util · reentrant` + deps: `datefmt` — canonical source is `pub const meta` in

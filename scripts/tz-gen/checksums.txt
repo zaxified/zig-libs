@@ -1,0 +1,10 @@
+# SHA-256 of the IANA tzdata release tarballs this repo pins.
+#
+# IANA publishes only a detached PGP signature (.asc) alongside each release,
+# no checksum file, so these are recorded here after fetching. Verify a NEW
+# line against the .asc before adding it; never edit an existing line to make
+# a mismatch go away.
+#
+# Format: "<sha256>  <tarball>", i.e. sha256sum output.
+
+77b541725937bb53bd92bd484c0b43bec8545e2d3431ee01f04ef8f2203ba2b7  tzdata2026a.tar.gz

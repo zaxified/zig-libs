@@ -5839,6 +5839,4 @@ pub const zones = [_]Zone{
     .{ .name = "W-SU", .init_off = 10800, .init_dst = false, .trans = &t241, .posix = "MSK-3" },
     .{ .name = "WET", .init_off = 3600, .init_dst = false, .trans = &t236, .posix = "WET0WEST,M3.5.0/1,M10.5.0" },
     .{ .name = "Zulu", .init_off = 0, .init_dst = false, .trans = &[_]Transition{}, .posix = "UTC0" },
-    .{ .name = "localtime", .init_off = 3600, .init_dst = false, .trans = &t226, .posix = "CET-1CEST,M3.5.0,M10.5.0/3" },
-    .{ .name = "posixrules", .init_off = -18000, .init_dst = false, .trans = &t100, .posix = "EST5EDT,M3.2.0,M11.1.0" },
 };

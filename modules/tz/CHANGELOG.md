@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — **Behavioural:** two entries left the table, taking it from 600 zones to 598.
+  `localtime` and `posixrules` are not IANA zones at all: on a Debian/Ubuntu host
+  `/usr/share/zoneinfo/localtime` symlinks to `/etc/localtime`, so the committed table carried
+  **the generator machine's own configured timezone** under that name (CET here), and
+  `posixrules` symlinks to a legacy US-rules zone. Neither is in the tzdata tarball, neither is
+  a name a caller should look up, and both made the output depend on who ran the generator.
+  `offsetAt("localtime", ...)` now returns the same not-found result as any other unknown name.
+
+- **2026-08-22** — `scripts/tz-gen/fetch-and-build.sh`: the pinned release is now re-derivable
+  **anywhere**, not only on a machine that happens to have that release installed. The claim in
+  `SPEC.md` and the 2026-08-16 entry below — that `tz_data.zig`'s pin "can be re-derived rather
+  than only trusted" — was true of the tool and false in practice: the tool reads a compiled
+  zoneinfo tree, the tree to hand it was `/usr/share/zoneinfo`, and that is the DISTRO's zic
+  output at the DISTRO's release. This host runs 2026c against a 2026a pin, so re-deriving the
+  table here produced a different one.
+
+  The script fetches `tzdata<release>.tar.gz` from IANA against a SHA-256 pinned in
+  `scripts/tz-gen/checksums.txt`, compiles it with the system `zic -b fat`, and generates from
+  that tree. `--check` regenerates to a temp file and diffs the committed table, exiting non-zero
+  on any difference — verified against a real mismatch, not just a clean run. A missing `zic` is a
+  hard failure rather than a fall-back to the host tree, because a fall-back would emit a table
+  that looks regenerated and is not.
+
+  With the two host artifacts above removed, `modules/tz/src/tz_data.zig` now reproduces
+  byte-for-byte from tzdata 2026a.
+
+- **2026-08-22** — `tz-gen` trims the `+VERSION` fallback it reads when a zoneinfo tree has no
+  `tzdata.zi`. The file ends with a newline, which landed mid-sentence in the generated header
+  comment and split the line.
+
 - **2026-08-16** — The `tz-gen` generator moved into this repo at `scripts/tz-gen/`, closing the
   "tzdata refresh cadence tooling" deferral in `SPEC.md`. No code or API change here — what changes
   is that `tz_data.zig`'s pinned release can now be re-derived and bumped rather than only trusted,
