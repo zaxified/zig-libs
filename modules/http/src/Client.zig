@@ -646,7 +646,13 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch |err| {
+    writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
+        // Recover the real cause the same way `sendAndReadHead` does, and
+        // BEFORE `isStaleConnError` looks at it: `writeRequestHead` itself
+        // can only ever hand back `error.WriteFailed`, so without this a
+        // cancelation would masquerade as a dead pooled connection and get
+        // retried below with the cancelation already spent.
+        const mapped = conn.writeFailure();
         // Narrower than `request`'s retry: safe here ONLY because nothing
         // of the caller-driven body has been touched yet — just the fixed
         // request head, which we can regenerate byte-for-byte on a fresh
@@ -657,12 +663,12 @@ pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, o
         // that cannot be replayed, so a stale connection discovered mid- or
         // post-body surfaces as a normal request failure instead — the
         // same class of failure any other backend outage already produces.
-        if (!reused or !isStaleConnError(err)) return err;
+        if (!reused or !isStaleConnError(mapped)) return mapped;
         conn.destroy();
         owned = false;
         conn = try c.dialConn(url);
         owned = true;
-        try writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled);
+        writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
     };
     return .{
         .conn = conn,
@@ -689,13 +695,17 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
     var owned = true;
     errdefer if (owned) conn.destroy();
 
-    writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch |err| {
-        if (!reused or !isStaleConnError(err)) return err;
+    writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch {
+        // See `requestStreaming`'s identical catch for why this must consult
+        // `conn.writeFailure()` before `isStaleConnError` rather than trust
+        // `writeRequestHead`'s own always-`WriteFailed` result.
+        const mapped = conn.writeFailure();
+        if (!reused or !isStaleConnError(mapped)) return mapped;
         conn.destroy();
         owned = false;
         conn = try c.dialPlain(url);
         owned = true;
-        try writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled);
+        writeRequestHead(conn.plainWriter(), method, url, options.headers, c.options.user_agent, plan, false, !c.options.pool.enabled) catch return conn.writeFailure();
     };
     return .{
         .conn = conn,
@@ -727,9 +737,15 @@ pub fn getToFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const
     defer file.close(c.io);
     var fbuf: [64 * 1024]u8 = undefined;
     var fw = file.writer(c.io, &fbuf);
+    // `Reader.StreamRemainingError` is exactly `{ReadFailed, WriteFailed}`.
+    // `WriteFailed` here is the local file write (`fw`), which stays a
+    // plain failure; `ReadFailed` is the network body read, and
+    // `Conn.readFailure` is what recovers a cancelation from it instead of
+    // reporting a dead peer — see `readAllAlloc` right above, the same
+    // collapse this one had.
     const n = res.reader().streamRemaining(&fw.interface) catch |err| switch (err) {
         error.WriteFailed => return error.WriteFailed,
-        else => return error.ReadFailed,
+        error.ReadFailed => return res.conn.readFailure(),
     };
     fw.interface.flush() catch return error.WriteFailed;
     return n;
@@ -748,11 +764,21 @@ pub fn putFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u
     var fbuf: [64 * 1024]u8 = undefined;
     var fr = file.reader(c.io, &fbuf);
     fr.interface.streamExact64(up.writer(), size) catch |err| {
-        up.abort();
-        return switch (err) {
-            error.WriteFailed => error.WriteFailed,
-            else => error.ReadFailed,
+        // `Reader.StreamError` is exactly `{ReadFailed, WriteFailed,
+        // EndOfStream}`. `ReadFailed`/`EndOfStream` here are the local file
+        // read (`fr`) and keep their existing mapping unchanged; `WriteFailed`
+        // is the network body write (`up.writer()`, draining into
+        // `up.conn`), and `Conn.writeFailure` is what recovers a
+        // cancelation from it instead of reporting a dead peer — the same
+        // collapse `readAllAlloc`/`getToFile` had on the read side. Must run
+        // BEFORE `abort()`: that destroys `up.conn`, and `writeFailure`
+        // needs it alive to read `conn.sw.err`.
+        const mapped: Error = switch (err) {
+            error.WriteFailed => up.conn.writeFailure(),
+            error.ReadFailed, error.EndOfStream => error.ReadFailed,
         };
+        up.abort();
+        return mapped;
     };
     var res = try up.finish();
     defer res.deinit();
@@ -772,12 +798,15 @@ pub fn putFilePlain(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []co
     var up = try c.requestStreamingPlain(.put, url, options, size);
     var fbuf: [64 * 1024]u8 = undefined;
     var fr = file.reader(c.io, &fbuf);
+    // See `putFile`'s identical catch for why `WriteFailed` alone routes
+    // through `Conn.writeFailure`, and why that must run before `abort()`.
     fr.interface.streamExact64(up.writer(), size) catch |err| {
-        up.abort();
-        return switch (err) {
-            error.WriteFailed => error.WriteFailed,
-            else => error.ReadFailed,
+        const mapped: Error = switch (err) {
+            error.WriteFailed => up.conn.writeFailure(),
+            error.ReadFailed, error.EndOfStream => error.ReadFailed,
         };
+        up.abort();
+        return mapped;
     };
     var res = try up.finish();
     defer res.deinit();
@@ -1329,7 +1358,17 @@ fn sendAndReadHead(
     body: ?[]const u8,
     strip_sensitive: bool,
 ) Error!h1.ResponseHead {
-    try writeRequestHead(conn.plainWriter(), method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled);
+    // `writeRequestHead`'s own `w: *std.Io.Writer` parameter has nowhere to
+    // carry `Canceled` — like every other `std.Io.Writer` call, it can only
+    // ever report the bare `error.WriteFailed` — so a cancelation reaching
+    // the head write must be recovered from `conn`'s own writer here,
+    // exactly as the body write two lines down already does. Skipping this
+    // would let a genuine cancelation surface as `WriteFailed`, which
+    // `isStaleConnError` (see `requestInner`'s retry) treats as a dead
+    // pooled connection worth retrying — with the cancelation already
+    // spent, the retry then blocks a second time with nothing left to
+    // interrupt it.
+    writeRequestHead(conn.plainWriter(), method, url, headers, c.options.user_agent, plan, strip_sensitive, !c.options.pool.enabled) catch return conn.writeFailure();
     if (body) |b| conn.plainWriter().writeAll(b) catch return conn.writeFailure();
     try conn.flushAll();
     return readResponseHead(conn);
@@ -2673,6 +2712,217 @@ test "readAllAlloc: a canceled body read surfaces Canceled, not ReadFailed" {
     var fut = try io.concurrent(readAllAllocOnce, .{ &res, testing.allocator });
     // Long enough that the body read is certainly parked in the kernel.
     try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+fn getToFileOnce(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u8) Error!u64 {
+    return c.getToFile(url, dir, sub_path);
+}
+
+// `getToFile` had the identical `else`-arm collapse `readAllAlloc` had (both
+// catch the same `Reader.StreamRemainingError`) — same peer shape reused.
+test "getToFile: a canceled body read surfaces Canceled, not ReadFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("getToFile cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: HeadThenSilentPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, HeadThenSilentPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var fut = try io.concurrent(getToFileOnce, .{ &client, url, tmp.dir, "out.bin" });
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+// The write-side counterpart: a peer that accepts and never reads a single
+// byte, so a client body (or, with padded headers, a request head) big
+// enough to overrun the kernel's send/receive buffers genuinely parks in a
+// `write`, not merely in a wait for a response that never comes. RCVBUF is
+// shrunk so a modest payload is enough to fill the pipe quickly.
+const SilentReadPeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    stop: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *SilentReadPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        const small = std.mem.toBytes(@as(c_int, 2048));
+        std.posix.setsockopt(s.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+        while (p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+};
+
+fn putFileOnce(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u8) Error!u16 {
+    return c.putFile(url, dir, sub_path, .{});
+}
+
+test "putFile: a canceled body write surfaces Canceled, not WriteFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("putFile cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: SilentReadPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, SilentReadPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Large enough to overrun the shrunk receive window plus the OS's
+    // default send buffer and genuinely block, without needing several
+    // seconds to write on loopback.
+    {
+        var f = try tmp.dir.createFile(io, "upload.bin", .{});
+        defer f.close(io);
+        var wbuf: [64 * 1024]u8 = undefined;
+        var fw = f.writer(io, &wbuf);
+        const chunk: [64 * 1024]u8 = @splat('x');
+        var left: usize = 4 << 20; // 4 MiB
+        while (left != 0) : (left -= chunk.len) try fw.interface.writeAll(&chunk);
+        try fw.interface.flush();
+    }
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var fut = try io.concurrent(putFileOnce, .{ &client, url, tmp.dir, "upload.bin" });
+    // Long enough that a 4 MiB body write against a starved receiver is
+    // certainly parked in the kernel, not merely still copying.
+    try io.sleep(.fromMilliseconds(300), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+fn requestOnce(c: *Client, url: []const u8, options: RequestOptions) Error!Response {
+    return c.request(.get, url, options);
+}
+
+// The defect this guards is upstream of the body: `sendAndReadHead`'s call
+// to `writeRequestHead` used a bare `try`, so a cancelation during the
+// *head* write (before any body byte) surfaced as plain `WriteFailed` no
+// matter how deliberately `Conn.writeFailure` recovered `Canceled` two
+// lines below it. Worse than the read-side collapses above: `WriteFailed`
+// is exactly what `isStaleConnError` treats as a dead pooled connection
+// worth silently retrying — see `requestInner`'s retry comment on why a
+// spent cancelation must never reach that check. A padded header, not a
+// body, is what fills the pipe here, to isolate the head-write path
+// specifically from the (already-correct) body-write line beside it.
+test "request: a canceled request-head write surfaces Canceled, not WriteFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("request head-write cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: SilentReadPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, SilentReadPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    // Well past the kernel's `tcp_wmem` autotuning ceiling (4 MiB on this
+    // host, which a smaller padding was observed to fit under entirely
+    // without ever blocking) — heap-allocated, not stack: too big for a
+    // test thread's stack.
+    const padding = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(padding);
+    @memset(padding, 'x');
+
+    // `total_timeout_ms = 0`: with the (30 s) default, `request` routes
+    // through `runBounded`, whose OWN cancelation handling — already
+    // correct, unrelated to this fix — would report `error.Canceled`
+    // regardless of what `sendAndReadHead` does. Zeroing it makes `request`
+    // call `requestInner` directly on *this* task, so the cancelation this
+    // test issues is the one that has to reach the blocked write itself.
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false }, .total_timeout_ms = 0 });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const headers = [_]http.Header{.{ .name = "X-Pad", .value = padding }};
+
+    var fut = try io.concurrent(requestOnce, .{ &client, url, RequestOptions{ .headers = &headers } });
+    // Long enough that a 16 MiB head write against a starved receiver is
+    // certainly parked in the kernel, not merely still copying.
+    try io.sleep(.fromMilliseconds(300), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+fn requestStreamingOnce(c: *Client, url: []const u8, options: RequestOptions) Error!Upload {
+    return c.requestStreaming(.put, url, options, 5);
+}
+
+// `requestStreaming`'s own head-write catch had the identical bug
+// `sendAndReadHead` did, with a sharper consequence: since
+// `writeRequestHead` can only ever report `error.WriteFailed`, a canceled
+// head write on a fresh (non-reused) connection used to be indistinguishable
+// from any other write failure — harmless here only because `!reused` short
+// circuits the retry. `requestStreaming` doesn't route through `runBounded`
+// (unlike `request`), so no `total_timeout_ms` override is needed for this
+// task's own cancelation to reach the blocked write directly.
+test "requestStreaming: a canceled request-head write surfaces Canceled, not WriteFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("requestStreaming head-write cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: SilentReadPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, SilentReadPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    const padding = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(padding);
+    @memset(padding, 'x');
+
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const headers = [_]http.Header{.{ .name = "X-Pad", .value = padding }};
+
+    var fut = try io.concurrent(requestStreamingOnce, .{ &client, url, RequestOptions{ .headers = &headers } });
+    try io.sleep(.fromMilliseconds(300), .awake);
     try testing.expectError(error.Canceled, fut.cancel(io));
 }
 

@@ -598,6 +598,15 @@ covers the client population; `deflate` adds nothing over it).
   concurrency (single-threaded build, or a `Threaded` at its
   `concurrent_limit`) — there is then nothing to cancel and only the
   between-phase deadline checks apply.
+- **A cancelation is not a transport failure.** `Error.Canceled` is distinct
+  from `WriteFailed`/`ReadFailed` everywhere the client owns the socket —
+  dialing, the request-head write, the in-memory/streamed body, the response
+  head and body reads (`readAllAlloc`, `getToFile`, `putFile`/`putFilePlain`)
+  — recovered from the connection's own reader/writer rather than reported as
+  a dead peer. This is what lets the connection pool tell its own canceled
+  wait apart from a genuinely stale pooled connection worth a transparent
+  retry; folding the two together would let a retry start with the
+  cancelation that triggered it already spent.
 - **Decompression is the caller's job** (`Accept-Encoding: identity` is sent
   by default); adopt `std.compress` at the call site if you ask for gzip.
 - 1xx interim responses are skipped (101 returned as-is); HEAD/204/304

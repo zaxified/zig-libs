@@ -5,6 +5,57 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — Closed the remaining cancelation collapses in `Client`: three
+  more `else`-shaped body-transfer catches, and a distinct, sharper bug in the
+  request-head write that `readAllAlloc`'s fix (entry below) did not touch.
+  **Body transfer.** `getToFile`, `putFile` and `putFilePlain` had the identical
+  shape `readAllAlloc` did — `res.reader().streamRemaining(...)` /
+  `fr.interface.streamExact64(...)` caught with `error.WriteFailed => ...,
+  else => error.ReadFailed`. Each stream pairs a network endpoint with a local
+  file endpoint, so only one arm of each was actually the network side: the
+  `else` in `getToFile` (reading the response body) and the named
+  `error.WriteFailed` in `putFile`/`putFilePlain` (writing the request body).
+  Those now route through `Conn.readFailure`/`writeFailure`; the local-file arms
+  (`getToFile`'s file write, `putFile`'s file read) are unchanged; local I/O
+  errors were already documented to collapse and ordinary files do not block
+  indefinitely the way a silent network peer legitimately can, so there was no
+  cancelation there to recover. In `putFile`/`putFilePlain`, recovering the
+  cause has to happen **before** `Upload.abort()`, which destroys the
+  connection `writeFailure` needs to read — reordered accordingly.
+  **Request-head write.** A layer under all of the above: `writeRequestHead`'s
+  own `w: *std.Io.Writer` parameter has nowhere to carry `Canceled` (like every
+  `std.Io.Writer` call, a cancelation reaches it as bare `error.WriteFailed`),
+  and every call site — `sendAndReadHead` (used by `request`/`requestPlain`) and
+  both attempts in `requestStreaming`/`requestStreamingPlain` — used a bare
+  `try`/`catch return error.WriteFailed` instead of asking `conn.writeFailure()`
+  first. This one is worse than the body-side collapses: `error.WriteFailed` is
+  exactly what `isStaleConnError` treats as a dead pooled connection worth a
+  transparent retry, so a task-level cancelation landing during the head write
+  of a *reused* connection used to be silently retried with the cancelation
+  already spent, per the exact failure mode `Conn.readFailure`'s doc comment
+  warns about — just reached from an angle that fix did not cover. All four
+  call sites now consult `conn.writeFailure()` before `isStaleConnError` looks
+  at the result.
+  Four new tests, each confirmed to fail with its own fix reverted and to pass
+  restored: `getToFile`/`putFile` reuse the same silent-peer shapes `readAllAlloc`
+  and the two `Server` cancelation tests established; the two head-write tests
+  pad a header past the kernel's `tcp_wmem` autotuning ceiling (this client has
+  no seam to shrink its own `SO_SNDBUF`, unlike `Server`'s tests, which own both
+  ends of the loopback pair) against a peer that never reads a byte.
+  `putFilePlain`'s and `requestStreamingPlain`'s fixes are structurally identical
+  to `putFile`'s/`requestStreaming`'s and share `Conn.writeFailure`; not
+  separately mutation-tested.
+  Examined and left alone: `h2_client.Session.init`'s own `flushWire` (called
+  from `Client.zig`'s h2 dial paths) already collapses any writer failure,
+  `Canceled` included, one layer below where `Client.zig` could recover it —
+  naming the variant at the call site here would be cosmetic; the actual fix
+  belongs in `h2_client.zig`, out of this sweep. `dir.createFile`/`openFile`/
+  `file.stat` fold `File.OpenError`/`StatError` (which carry `Io.Cancelable`
+  directly, no `err`-field recovery needed) into one arm too, but that is a
+  documented, deliberate mapping ("File-system failures map to
+  `error.WriteFailed`/`error.ReadFailed`") predating this sweep, not an
+  oversight — left as documented.
+  `zig build test-http` — 453/453.
 - **2026-08-22** — `Response.readAllAlloc` stops laundering a canceled body read
   into `error.ReadFailed`. `std.Io.Reader.LimitedAllocError` (`allocRemaining`'s
   error set) is exactly `{OutOfMemory, ReadFailed, StreamTooLong}` — no
