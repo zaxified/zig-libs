@@ -46,7 +46,7 @@ const st = pinger.stats(id);                     // sent/recv/loss, min/avg/max 
 
 // The codec — pure, no I/O.
 var pkt: [icmp.echo.echo_header_len + 56]u8 = @splat(0);
-icmp.echo.writeEchoRequest(.v4, &pkt, ident, seq); // checksum filled for v4
+try icmp.echo.writeEchoRequest(.v4, &pkt, ident, seq); // errors if pkt < header
 const reply = icmp.echo.parseV4(bytes, strip_ip_header); // .echo_reply | .icmp_error | .ignored
 
 // The socket — DGRAM-first with RAW fallback.

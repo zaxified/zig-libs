@@ -524,7 +524,13 @@ const LiveProber = struct {
         while (tries <= self.retries) : (tries += 1) {
             const seq = self.seq;
             self.seq +%= 1;
-            echo.writeEchoRequest(efamily, self.buf[0..payload_len], self.sock.ident, seq);
+            // `attempt` already panics above when `wire_size` overruns the
+            // buffer; this is the same caller error at the other end -- a
+            // probe smaller than the ICMP header itself. A panic holds in
+            // every optimize mode, which is the whole reason the writer
+            // stopped using `std.debug.assert` for it.
+            echo.writeEchoRequest(efamily, self.buf[0..payload_len], self.sock.ident, seq) catch
+                @panic("pathmtu: LiveProber.attempt: wire_size smaller than the ICMP header");
 
             const send_result = switch (self.dest) {
                 .v4 => |*sa| self.sock.sendTo(@ptrCast(sa), @sizeOf(linux.sockaddr.in), self.buf[0..payload_len]),
@@ -723,7 +729,7 @@ test "mtuHintV6: reads the 4-byte MTU field, treats zero as absent" {
 
 test "classify v4: matching echo reply is ok, mismatched ident/seq is ignored" {
     var buf: [echo.echo_header_len]u8 = @splat(0);
-    echo.writeEchoRequest(.v4, &buf, 0x1234, 7);
+    try echo.writeEchoRequest(.v4, &buf, 0x1234, 7);
     buf[0] = echo.v4.echo_reply;
     try testing.expectEqual(Classified.ok, classify(.v4, false, &buf, 0x1234, 7).?);
     try testing.expectEqual(@as(?Classified, null), classify(.v4, false, &buf, 0x1234, 8));

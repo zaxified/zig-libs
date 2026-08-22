@@ -310,7 +310,13 @@ pub fn traceWith(
 
             const packet = pkt_buf[0 .. echo.echo_header_len + opts.payload_size];
             @memset(packet, 0);
-            echo.writeEchoRequest(family, packet, opts.ident, seq);
+            // `packet` is sliced to `echo_header_len + payload_size` two
+            // lines up, so it cannot be short. A panic rather than
+            // `unreachable`: `unreachable` is undefined behaviour in the
+            // release modes, which is the fail-open shape this writer's new
+            // signature exists to remove.
+            echo.writeEchoRequest(family, packet, opts.ident, seq) catch
+                @panic("traceroute: probe buffer smaller than the ICMP header");
 
             // A transport failure stops the trace here, but — unlike
             // InvalidOptions/OutOfMemory above, which happen before any probe
@@ -997,7 +1003,7 @@ test "responses with a foreign ident are ignored" {
     // A garbage packet that IS a well-formed echo reply, but for someone
     // else's ident — must not resolve any probe.
     var alien: [echo.echo_header_len]u8 = @splat(0);
-    echo.writeEchoRequest(.v4, &alien, 0x1111, 7);
+    try echo.writeEchoRequest(.v4, &alien, 0x1111, 7);
     alien[0] = echo.v4.echo_reply;
     var f: FakeTransport = .{ .behaviors = &.{ .{ .garbage = &alien }, .reply } };
     defer f.deinit();
@@ -1018,7 +1024,7 @@ test "responses with an out-of-range seq (matching ident) are ignored" {
     const bad_seqs = [_]u16{ 6, 9999 };
     for (bad_seqs) |bad_seq| {
         var alien: [echo.echo_header_len]u8 = @splat(0);
-        echo.writeEchoRequest(.v4, &alien, ident, bad_seq);
+        try echo.writeEchoRequest(.v4, &alien, ident, bad_seq);
         alien[0] = echo.v4.echo_reply;
         var f: FakeTransport = .{ .behaviors = &.{.{ .garbage = &alien }} };
         defer f.deinit();

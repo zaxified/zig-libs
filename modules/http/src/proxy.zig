@@ -522,7 +522,7 @@ fn buildForwardedFor(buf: []u8, req: *Server.Request) ?[]const u8 {
         .ip4 => |a| .{ .v4 = a.bytes },
         .ip6 => |a| .{ .v6 = a.bytes },
     };
-    var ip_buf: [64]u8 = undefined;
+    var ip_buf: [netaddr.max_ip_text_len]u8 = undefined;
     const ip_text = netaddr.formatIp(ip.unmap(), &ip_buf);
 
     var w: std.Io.Writer = .fixed(buf);

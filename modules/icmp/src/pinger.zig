@@ -303,6 +303,11 @@ pub const RunError = error{
     IcmpTimestampRequiresIpv4,
     /// Config.oiface does not name an existing interface.
     UnknownInterface,
+    /// A send slot is shorter than the ICMP header. `init` sizes the slab so
+    /// this cannot happen; it is reported rather than asserted because an
+    /// assert here compiles out of exactly the modes that would suffer from
+    /// being wrong.
+    SendBufferTooSmall,
 } || Socket.OpenError;
 
 pub const Pinger = struct {
@@ -679,11 +684,20 @@ pub const Pinger = struct {
             return error.SequenceSpaceExhausted;
 
         if (self.cfg.icmp_timestamp) {
-            echo.writeTimestampRequest(buf, sock.ident, seq, originateMs());
+            // `init` sizes `pkt_len` to exactly `timestamp_msg_len` on this
+            // branch, so the slice is the whole buffer; the reslice is what
+            // hands the writer the fixed-size type it now asks for.
+            echo.writeTimestampRequest(buf[0..echo.timestamp_msg_len], sock.ident, seq, originateMs());
         } else {
             if (self.cfg.random_payload)
                 self.prng.random().bytes(buf[echo.echo_header_len..]);
-            echo.writeEchoRequest(t.addr.family(), buf, sock.ident, seq);
+            // `init` sizes every send slot to `echo_header_len` plus the
+            // configured payload, so this cannot be short. Propagated rather
+            // than swallowed anyway: the point of the writer returning an
+            // error instead of asserting is that no caller decides the check
+            // is unnecessary and puts the fail-open guard back.
+            echo.writeEchoRequest(t.addr.family(), buf, sock.ident, seq) catch
+                return error.SendBufferTooSmall;
         }
 
         t.attempts +%= 1;
@@ -1058,7 +1072,7 @@ test "seqmap correlation: a parsed reply resolves to its probe" {
 
     const seq = try sm.add(42, 3, 123_456);
     var pkt: [echo.echo_header_len]u8 = @splat(0);
-    echo.writeEchoRequest(.v4, &pkt, 0xcafe, seq);
+    try echo.writeEchoRequest(.v4, &pkt, 0xcafe, seq);
     pkt[0] = echo.v4.echo_reply; // kernel echoes the id/seq back
     const parsed = echo.parseV4(&pkt, false);
     const entry = sm.fetch(parsed.echo_reply.seq).?;

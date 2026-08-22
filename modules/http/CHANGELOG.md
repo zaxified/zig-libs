@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `proxy` sizes its address-formatting buffer as
+  `netaddr.max_ip_text_len` rather than a hand-picked 64, following `netaddr.formatIp`'s
+  new fixed-size parameter.
 - **2026-08-18** — test/tooling only, no API change. Closed two gaps an audit of the
   two entries below found.
   **(1) Regression tests for the Plain-side `owned` double-free fix.** The entry below

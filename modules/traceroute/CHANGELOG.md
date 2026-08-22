@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — Adjusted to `icmp.echo.writeEchoRequest` reporting a short buffer.
+  The probe slice cannot be short, and the impossible branch panics rather than using
+  `unreachable`, which is undefined behaviour in the release modes — the same fail-open
+  shape the new signature exists to remove.
 - **2026-08-18** — Portability: `linux32` (`mips-linux-musl`, `mips32,soft_float`)
   compile fix, no behavior change. `FakeTransport.sendImpl` (the offline test
   injector's `.time_exceeded_multi` path) indexed `routers` with a bare

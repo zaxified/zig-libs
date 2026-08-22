@@ -242,9 +242,16 @@ pub const max_ip_text_len = 45;
 
 /// Format an address canonically: dotted quad for v4, RFC 5952 for v6
 /// (lowercase, longest zero run compressed leftmost, IPv4-mapped rendered
-/// mixed as `::ffff:a.b.c.d`). Asserts `buf.len >= max_ip_text_len`.
-pub fn formatIp(ip: Ip, buf: []u8) []const u8 {
-    std.debug.assert(buf.len >= max_ip_text_len);
+/// mixed as `::ffff:a.b.c.d`).
+///
+/// `buf` is a pointer to an array, not a slice, so "too small a buffer" is a
+/// compile error rather than a runtime one. It used to be a slice guarded by
+/// `std.debug.assert`, which is `if (!ok) unreachable` and therefore compiled
+/// OUT of ReleaseFast and ReleaseSmall -- exactly the modes an integrator
+/// ships. A caller who passed a short buffer got a clean crash while testing
+/// and a silent write past the end of it in production. A caller holding a
+/// larger buffer passes `buf[0..max_ip_text_len]`.
+pub fn formatIp(ip: Ip, buf: *[max_ip_text_len]u8) []const u8 {
     switch (ip) {
         .v4 => |q| return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ q[0], q[1], q[2], q[3] }) catch unreachable,
         .v6 => |b| {
@@ -543,10 +550,12 @@ pub fn parsePrefix(text: []const u8) ?Prefix {
 }
 
 /// Format as CIDR notation, the address part canonical per `formatIp`.
-/// Asserts `buf.len >= max_prefix_text_len`.
-pub fn formatPrefix(p: Prefix, buf: []u8) []const u8 {
-    std.debug.assert(buf.len >= max_prefix_text_len);
-    const ip_text = formatIp(p.addr, buf);
+///
+/// Array pointer rather than slice for the same reason as `formatIp`: the size
+/// requirement is checked by the compiler, not by an assert that disappears in
+/// the release modes.
+pub fn formatPrefix(p: Prefix, buf: *[max_prefix_text_len]u8) []const u8 {
+    const ip_text = formatIp(p.addr, buf[0..max_ip_text_len]);
     const bits_text = std.fmt.bufPrint(buf[ip_text.len..], "/{d}", .{p.bits}) catch unreachable;
     return buf[0 .. ip_text.len + bits_text.len];
 }

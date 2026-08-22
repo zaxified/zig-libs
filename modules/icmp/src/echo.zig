@@ -64,8 +64,16 @@ pub fn checksum(data: []const u8) u16 {
 /// Fill `buf` with an ICMP echo request. `buf.len` must be
 /// `echo_header_len + payload_size`; payload bytes beyond the header are
 /// expected to be pre-filled (pattern or zeroes) by the caller.
-pub fn writeEchoRequest(family: Family, buf: []u8, ident: u16, seq: u16) void {
-    std.debug.assert(buf.len >= echo_header_len);
+///
+/// The length is checked and reported, not asserted. `std.debug.assert` is
+/// `if (!ok) unreachable`, so it compiles OUT of ReleaseFast and ReleaseSmall
+/// -- the modes an integrator ships -- and a caller who passed a short buffer
+/// got a clean crash while testing and a silent write past the end of it in
+/// production. Unlike the fixed-size writers here, this buffer is genuinely
+/// variable-length (header plus caller-chosen payload), so the requirement
+/// cannot be expressed in the type.
+pub fn writeEchoRequest(family: Family, buf: []u8, ident: u16, seq: u16) error{BufferTooSmall}!void {
+    if (buf.len < echo_header_len) return error.BufferTooSmall;
     buf[0] = switch (family) {
         .v4 => v4.echo_request,
         .v6 => v6.echo_request,
@@ -81,10 +89,12 @@ pub fn writeEchoRequest(family: Family, buf: []u8, ident: u16, seq: u16) void {
     }
 }
 
-/// Fill `buf` (>= timestamp_msg_len) with an ICMP timestamp request
-/// (fping --icmp-timestamp; IPv4 only).
-pub fn writeTimestampRequest(buf: []u8, ident: u16, seq: u16, originate_ms: u32) void {
-    std.debug.assert(buf.len >= timestamp_msg_len);
+/// Fill `buf` with an ICMP timestamp request (IPv4 only).
+///
+/// Array pointer rather than slice: the message is exactly `timestamp_msg_len`
+/// bytes, so the size requirement belongs in the type where the compiler
+/// enforces it, instead of in an assert that disappears in the release modes.
+pub fn writeTimestampRequest(buf: *[timestamp_msg_len]u8, ident: u16, seq: u16, originate_ms: u32) void {
     buf[0] = v4.timestamp_request;
     buf[1] = 0;
     buf[2] = 0;
@@ -222,7 +232,7 @@ test "checksum odd length" {
 
 test "golden: v4 echo request wire bytes" {
     var buf: [echo_header_len + 4]u8 = @splat(0);
-    writeEchoRequest(.v4, &buf, 0x1234, 7);
+    try writeEchoRequest(.v4, &buf, 0x1234, 7);
     // type=8 code=0; checksum = ~(0x0800 + 0x1234 + 0x0007) = 0xe5c4.
     const expected = [_]u8{ 0x08, 0x00, 0xe5, 0xc4, 0x12, 0x34, 0x00, 0x07, 0, 0, 0, 0 };
     try std.testing.expectEqualSlices(u8, &expected, &buf);
@@ -230,14 +240,14 @@ test "golden: v4 echo request wire bytes" {
 
 test "golden: v6 echo request wire bytes (checksum kernel-filled)" {
     var buf: [echo_header_len]u8 = @splat(0);
-    writeEchoRequest(.v6, &buf, 0xbeef, 513);
+    try writeEchoRequest(.v6, &buf, 0xbeef, 513);
     const expected = [_]u8{ 128, 0x00, 0x00, 0x00, 0xbe, 0xef, 0x02, 0x01 };
     try std.testing.expectEqualSlices(u8, &expected, &buf);
 }
 
 test "echo request round-trip v4 dgram" {
     var buf: [echo_header_len + 8]u8 = @splat(0);
-    writeEchoRequest(.v4, &buf, 0xabcd, 42);
+    try writeEchoRequest(.v4, &buf, 0xabcd, 42);
     // Packet checksum must verify (sum over whole packet == 0).
     try std.testing.expectEqual(@as(u16, 0), checksum(&buf));
     // A reply differs only in type; emulate kernel echo by flipping type.
@@ -250,7 +260,7 @@ test "echo request round-trip v4 dgram" {
 
 test "echo request round-trip v6" {
     var buf: [echo_header_len + 16]u8 = @splat(0xa5);
-    writeEchoRequest(.v6, &buf, 0x00ff, 65535);
+    try writeEchoRequest(.v6, &buf, 0x00ff, 65535);
     var reply = buf;
     reply[0] = v6.echo_reply;
     const parsed = parseV6(&reply);
@@ -586,7 +596,7 @@ test "comptime checksum" {
         const data = [_]u8{ 0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7 };
         std.debug.assert(checksum(&data) == 0x220d);
         var pkt: [echo_header_len + 4]u8 = @splat(0);
-        writeEchoRequest(.v4, &pkt, 0x1234, 7);
+        try writeEchoRequest(.v4, &pkt, 0x1234, 7);
         std.debug.assert(checksum(&pkt) == 0); // packet must verify
     }
 }
@@ -599,7 +609,7 @@ test "checksum property: inserting the checksum makes packets verify" {
     var pkt: [echo_header_len + 56]u8 = undefined;
     for (0..1000) |_| {
         random.bytes(&pkt);
-        writeEchoRequest(.v4, &pkt, random.int(u16), random.int(u16));
+        try writeEchoRequest(.v4, &pkt, random.int(u16), random.int(u16));
         try std.testing.expectEqual(@as(u16, 0), checksum(&pkt));
     }
 }

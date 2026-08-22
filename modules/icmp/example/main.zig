@@ -18,7 +18,13 @@ pub fn main() !void {
     // the reply a peer would send back — round-tripping through the same
     // RFC 1071 checksum the kernel checks on the way in.
     var req: [icmp.echo.echo_header_len]u8 = undefined;
-    icmp.echo.writeEchoRequest(.v4, &req, 0xbeef, 1);
+    // The writer reports a short buffer rather than asserting, so a consumer
+    // has to acknowledge it. `&req` is an array pointer of exactly the header
+    // length, so the branch is unreachable here -- but it is nameable, which
+    // an assert compiled out of ReleaseFast never was.
+    icmp.echo.writeEchoRequest(.v4, &req, 0xbeef, 1) catch |err| switch (err) {
+        error.BufferTooSmall => unreachable,
+    };
 
     // Simulate the peer's answer: same packet, type flipped to echo_reply,
     // checksum recomputed (the only two octets that legitimately change).

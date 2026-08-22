@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-22** — `LiveProber.attempt` panics on a probe smaller than the ICMP header,
+  matching the panic it already had for the opposite bound, now that
+  `icmp.echo.writeEchoRequest` reports a short buffer instead of asserting.
 - **2026-08-18** — Audit fixes (three confirmed defects, found before this
   module was ever tagged):
   - **Critical — stack-memory disclosure.** `Options.ceiling_mtu` flowed
