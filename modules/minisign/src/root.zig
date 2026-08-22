@@ -778,6 +778,78 @@ pub const SignedFile = struct {
     global_signature: [signature_length]u8,
 };
 
+// ── streaming (digest-based) signing / verification ──────────────────────────
+//
+// `signMessage`/`verifyMessage` need the whole message resident in RAM even
+// for `.prehashed`, because they compute the BLAKE2b-512 digest internally.
+// A caller signing/verifying a multi-gigabyte file wants to stream it through
+// `std.crypto.hash.blake2.Blake2b512.update` in fixed-size chunks instead —
+// this module owns that entry point because *which bytes get signed* is a
+// correctness-relevant part of the wire format (the digest, tagged
+// `sig_alg_prehashed`), not filesystem plumbing. Opening the file and
+// looping over it is the caller's/example's job (SPEC.md "Out of scope").
+//
+// There is no digest-based entry point for `sig_alg_legacy`: that algorithm
+// signs the raw file bytes directly, so it cannot stream by construction —
+// signing it still requires the whole message in RAM via `signMessage`.
+
+/// Sign a **precomputed** BLAKE2b-512 digest directly. Always produces a
+/// `sig_alg_prehashed` ("ED") signature — identical to what `signMessage(kp,
+/// message, .prehashed)` produces, given `digest ==
+/// Blake2b512.hash(message)`, since both funnel into the same
+/// `key_pair.ed25519.sign(&digest, null)` call.
+pub fn signDigest(key_pair: KeyPair, digest: [prehash_length]u8) !RawSignature {
+    const sig = try key_pair.ed25519.sign(&digest, null);
+    return .{ .sig_alg = sig_alg_prehashed, .key_number = key_pair.key_number, .signature = sig.toBytes() };
+}
+
+/// Verify a signature against a precomputed BLAKE2b-512 digest. Rejects
+/// (`error.UnsupportedAlgorithm`) a `sig_alg_legacy`-tagged signature rather
+/// than checking it against the digest: a legacy signature was never made
+/// over a digest, so verifying it against one would silently check the
+/// wrong bytes and could accept a signature that never authenticated this
+/// content.
+pub fn verifyDigest(public_key: RawPublicKey, digest: [prehash_length]u8, sig: RawSignature) VerifyMessageError!void {
+    if (!std.mem.eql(u8, &sig.key_number, &public_key.key_number)) return error.KeyIdMismatch;
+    if (!std.mem.eql(u8, &sig.sig_alg, &sig_alg_prehashed)) return error.UnsupportedAlgorithm;
+    const pk = try std.crypto.sign.Ed25519.PublicKey.fromBytes(public_key.key);
+    const signature = std.crypto.sign.Ed25519.Signature.fromBytes(sig.signature);
+    try signature.verify(&digest, pk);
+}
+
+/// `signFile`'s streaming counterpart: sign a precomputed digest, then the
+/// trusted comment. Pass the result + `trusted_comment` to
+/// `writeSignatureFile`, exactly as with `signFile`.
+pub fn signFileDigest(
+    allocator: std.mem.Allocator,
+    key_pair: KeyPair,
+    digest: [prehash_length]u8,
+    trusted_comment: []const u8,
+) !SignedFile {
+    const sig = try signDigest(key_pair, digest);
+    const gsig = try signTrustedComment(allocator, key_pair, sig, trusted_comment);
+    return .{ .signature = sig, .global_signature = gsig };
+}
+
+/// `verifyFile`'s streaming counterpart: verify both layers (digest/key-id,
+/// then trusted comment) against a precomputed digest instead of a
+/// resident message buffer.
+pub fn verifyFileDigest(
+    allocator: std.mem.Allocator,
+    public_key: RawPublicKey,
+    digest: [prehash_length]u8,
+    parsed: ParsedSignature,
+) !void {
+    try verifyDigest(public_key, digest, parsed.signature);
+    try verifyTrustedComment(
+        allocator,
+        public_key,
+        parsed.signature,
+        parsed.trusted_comment,
+        parsed.global_signature,
+    );
+}
+
 /// Sign both layers at once: the message (under `algorithm`) and the
 /// trusted comment. Pass the result + `trusted_comment` to
 /// `writeSignatureFile`.
@@ -864,6 +936,64 @@ test "sign/verify round-trip, both algorithms, plus tamper + wrong-key-id" {
         wrong_sig.key_number[0] ^= 0xff;
         try std.testing.expectError(error.KeyIdMismatch, verifyMessage(pk, msg, wrong_sig));
     }
+}
+
+test "signDigest/verifyDigest: byte-exact against signMessage/verifyMessage's own .prehashed path" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const kp = KeyPair.generate(io);
+    const pk = kp.publicKey();
+    const msg = "streaming digest message";
+    const digest = prehash(msg);
+
+    // Same key, same bytes, two entry points -> identical signature.
+    const via_message = try signMessage(kp, msg, .prehashed);
+    const via_digest = try signDigest(kp, digest);
+    try std.testing.expectEqual(via_message, via_digest);
+
+    try verifyDigest(pk, digest, via_digest);
+    try verifyMessage(pk, msg, via_digest); // interchangeable on the verify side too
+
+    // tampered digest
+    var bad_digest = digest;
+    bad_digest[0] ^= 0xff;
+    try std.testing.expectError(error.SignatureVerificationFailed, verifyDigest(pk, bad_digest, via_digest));
+
+    // wrong key id
+    var wrong_sig = via_digest;
+    wrong_sig.key_number[0] ^= 0xff;
+    try std.testing.expectError(error.KeyIdMismatch, verifyDigest(pk, digest, wrong_sig));
+
+    // a legacy-tagged signature is never valid input to the digest path,
+    // even if the bytes happen to be unrelated garbage.
+    var legacy_shaped = via_digest;
+    legacy_shaped.sig_alg = sig_alg_legacy;
+    try std.testing.expectError(error.UnsupportedAlgorithm, verifyDigest(pk, digest, legacy_shaped));
+
+    // full signFileDigest/verifyFileDigest round trip, including the
+    // trusted-comment layer.
+    const signed = try signFileDigest(gpa, kp, digest, "streaming trusted comment");
+    const written = blk: {
+        var buf: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeSignatureFile(&w, "untrusted", signed.signature, "streaming trusted comment", signed.global_signature);
+        break :blk try gpa.dupe(u8, w.buffered());
+    };
+    defer gpa.free(written);
+    const parsed = try parseSignatureFile(written);
+    try verifyFileDigest(gpa, pk, digest, parsed);
+
+    // tampered trusted comment
+    try std.testing.expectError(
+        error.SignatureVerificationFailed,
+        verifyFileDigest(gpa, pk, digest, .{
+            .untrusted_comment = parsed.untrusted_comment,
+            .signature = parsed.signature,
+            .algorithm = parsed.algorithm,
+            .trusted_comment = "a different comment",
+            .global_signature = parsed.global_signature,
+        }),
+    );
 }
 
 test "unencrypted secret key: seal is a no-op wrapper, chk stays zero, openSecretKey needs no password" {

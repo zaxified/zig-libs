@@ -59,9 +59,19 @@ pub fn writePublicKeyFile(w: *std.Io.Writer, untrusted_comment: []const u8, key:
 pub fn writeSecretKeyFile(w: *std.Io.Writer, untrusted_comment: []const u8, key: RawSecretKey) !void;
 pub fn writeSignatureFile(w: *std.Io.Writer, untrusted_comment: []const u8, signature: RawSignature, trusted_comment: []const u8, global_signature: [64]u8) !void;
 
-// sign / verify
+// sign / verify (whole message resident in RAM)
 pub fn signFile(allocator, key_pair: KeyPair, message: []const u8, algorithm: Algorithm, trusted_comment: []const u8) !SignedFile;
 pub fn verifyFile(allocator, public_key: RawPublicKey, message: []const u8, parsed: ParsedSignature) !void;
+
+// sign / verify a PRECOMPUTED BLAKE2b-512 digest instead — this is what
+// lets a caller stream a multi-gigabyte file (e.g. via
+// std.crypto.hash.blake2.Blake2b512.update in a chunked read loop) rather
+// than holding it resident in RAM. Prehashed ("ED") only — the legacy
+// ("Ed") algorithm signs raw file bytes directly and cannot stream.
+pub fn signDigest(key_pair: KeyPair, digest: [64]u8) !RawSignature;
+pub fn verifyDigest(public_key: RawPublicKey, digest: [64]u8, sig: RawSignature) !void;
+pub fn signFileDigest(allocator, key_pair: KeyPair, digest: [64]u8, trusted_comment: []const u8) !SignedFile;
+pub fn verifyFileDigest(allocator, public_key: RawPublicKey, digest: [64]u8, parsed: ParsedSignature) !void;
 ```
 
 ## Example
@@ -83,6 +93,12 @@ const pk = try minisign.parsePublicKeyFile(pub_key_text);
 const parsed = try minisign.parseSignatureFile(sig_file_text);
 try minisign.verifyFile(gpa, pk.key, message, parsed); // error.SignatureVerificationFailed / .KeyIdMismatch on failure
 ```
+
+`example/main.zig` is a full `minisign-demo` command-line tool (`-G`/`-S`/`-V`/`-R`/`-C`,
+real file I/O, streaming `-S`/`-V` in the default prehashed mode) built entirely on this
+public API — the module itself stays buffer-in/writer-out and does no filesystem I/O
+(SPEC.md "Out of scope"). Its output has been cross-checked in both directions against
+the real `minisign` binary; see the module CHANGELOG.
 
 ## Verify
 

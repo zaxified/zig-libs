@@ -94,6 +94,42 @@ test "byte-exact re-sign: real password decrypts the real encrypted key and repr
     try std.testing.expectEqual(expect.global_signature, signed.global_signature);
 }
 
+test "streaming (digest-based) path is byte-exact against real minisign output too" {
+    // Same evidence as "byte-exact re-sign", but through signDigest/
+    // verifyFileDigest rather than signFile/verifyFile — proves the
+    // streaming entry points added for the CLI example are not a second,
+    // divergent code path but produce the identical wire bytes a real
+    // `minisign -S` run did, and that verifyFileDigest accepts them.
+    const gpa = std.testing.allocator;
+    const pub_key = try m.parsePublicKeyFile(kat.unencrypted_public_key_file);
+    const sec_key = try m.parseSecretKeyFile(kat.unencrypted_secret_key_file);
+    const kp = try m.openSecretKey(gpa, sec_key.key, null);
+
+    var digest: [m.prehash_length]u8 = undefined;
+    std.crypto.hash.blake2.Blake2b512.hash(kat.message, &digest, .{});
+
+    const expect = try m.parseSignatureFile(kat.prehashed_signature_file);
+    const signed = try m.signFileDigest(gpa, kp, digest, "trusted comment test 1");
+    try std.testing.expectEqual(expect.signature, signed.signature);
+    try std.testing.expectEqual(expect.global_signature, signed.global_signature);
+
+    try m.verifyFileDigest(gpa, pub_key.key, digest, expect);
+
+    // A digest from tampered content must not verify against the real
+    // signature.
+    var bad_digest = digest;
+    bad_digest[0] ^= 0xff;
+    try std.testing.expectError(error.SignatureVerificationFailed, m.verifyFileDigest(gpa, pub_key.key, bad_digest, expect));
+
+    // The real LEGACY fixture is not a valid digest-path input: it is
+    // signed over raw bytes, not a BLAKE2b-512 digest, so verifyFileDigest
+    // must reject it by algorithm tag rather than attempt (and possibly
+    // spuriously fail or, worse, succeed) an Ed25519 check against the
+    // wrong bytes.
+    const legacy_parsed = try m.parseSignatureFile(kat.legacy_signature_file);
+    try std.testing.expectError(error.UnsupportedAlgorithm, m.verifyFileDigest(gpa, pub_key.key, digest, legacy_parsed));
+}
+
 test "negative: wrong password on the real encrypted key is rejected" {
     const gpa = std.testing.allocator;
     const sec_key = try m.parseSecretKeyFile(kat.encrypted_secret_key_file);

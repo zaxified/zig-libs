@@ -138,11 +138,42 @@ authenticated — that's what the global signature is for.
   attacker-controlled files should cap total input size themselves before
   calling `parse*File`.
 
+## Streaming (digest-based signing/verification)
+
+`signMessage`/`verifyMessage`/`signFile`/`verifyFile` need the whole message
+resident in RAM even for the `.prehashed` algorithm, because they compute the
+BLAKE2b-512 digest internally. `signDigest`/`verifyDigest`/
+`signFileDigest`/`verifyFileDigest` take a **precomputed** digest instead, so
+a caller can stream an arbitrarily large file through
+`std.crypto.hash.blake2.Blake2b512.update` in fixed-size chunks — never
+holding more than one chunk resident — and still get exactly the signature
+`signMessage(kp, message, .prehashed)` would have produced (`digest ==
+Blake2b512.hash(message)` is the only precondition; `kat_test.zig`'s
+"streaming (digest-based) path is byte-exact against real minisign output
+too" pins this against a real fixture, not just self-consistency).
+
+This has **no legacy (`"Ed"`) equivalent** — that algorithm signs the raw
+file bytes directly, so a caller who wants it still needs the whole message
+via `signMessage`/`signFile`. `verifyDigest` rejects a legacy-tagged
+signature with `error.UnsupportedAlgorithm` rather than attempting to check
+it against a digest it was never signed over.
+
+The digest itself is not this module's concern — it is exactly the
+public `std.crypto.hash.blake2.Blake2b512` type, so opening the file and
+looping over it stays where the rest of file I/O lives (see "Out of scope"
+below and `example/main.zig`'s `digestFile`).
+
 ## Out of scope
 
-- The minisign CLI itself (key generation prompts, `-C`/`-R`/`-Q` flows,
-  file I/O, terminal password entry) — this module is the format + crypto
-  library underneath such a tool, not the tool.
+- The minisign CLI's own I/O and interactive concerns: file access, the
+  `~/.minisign/minisign.key` / `./minisign.pub` / `<file>.minisig` default
+  path convention, and terminal password entry — this module is the format +
+  crypto library underneath such a tool, not the tool. `example/main.zig` is
+  a full `minisign-demo` CLI (`-G`/`-S`/`-V`/`-R`/`-C`) built entirely on the
+  module's public API (see README) to prove that split holds: nothing it
+  needed was missing except the streaming entry points above, which are
+  correctness-relevant (which bytes get signed) rather than I/O and so live
+  here, not there.
 - `-P <base64 pubkey>` is covered (`parsePublicKeyBase64`); nothing else
   CLI-specific.
 
@@ -165,6 +196,19 @@ binary (`kat_vectors.zig` documents the exact commands):
   password, and truncated files at several distinct cut points (missing
   line vs. corrupted base64 length), each asserted against the specific
   typed error it must produce.
+- **Streaming path, same anchor**: `signDigest`/`verifyFileDigest` re-sign
+  and re-verify the same real fixture through the digest-based entry points,
+  asserting byte-exact equality with the real `minisign`-produced signature
+  — proving the streaming API is not a second, divergent code path from the
+  whole-buffer one.
+
+Beyond the module's own tests, `example/main.zig`'s `minisign-demo` CLI has
+been run end to end against the real `minisign` 0.12 binary in both
+directions — its `-G`/`-S`/`-V` output accepted by real `minisign -V`, and
+real `minisign -G`/`-S` output accepted by `minisign-demo -V` — for both
+algorithms and for a file larger than the CLI's 64 KiB streaming chunk size
+(confirming genuine multi-chunk streaming, not a single `update()` call).
+See the module CHANGELOG for the dated entry.
 
 ## Anchoring
 
