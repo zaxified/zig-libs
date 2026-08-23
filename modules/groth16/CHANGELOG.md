@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — Added `Groth16Error`, the error set `verify` returns. The
+  2026-08-22 entry below re-exported the function and left its error set
+  behind, so a caller that wanted to handle `error.WrongPublicInputCount` by
+  name still had to reach through `groth16.bn254.Groth16Error` — half a
+  publication. Same omission `bn254`'s own root fixed one commit earlier
+  (`a2bdcb33`). Pinned by a test that names the set through this root, from a
+  file outside it.
+
 - **2026-08-22** — Added `verify`, an alias for `bn254.groth16Verify`. It was already
   reachable as `groth16.bn254.groth16Verify` (the namespace is re-exported), so this is
   symmetry rather than a fix: the module published `Proof` and `VerifyingKey` but not the

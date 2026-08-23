@@ -22,6 +22,42 @@ const r1cs = @import("r1cs.zig");
 const prover = @import("prover.zig");
 const Fr = field.Fr;
 
+test "root re-export: `verify`'s error set is nameable through THIS module's root" {
+    // Reached through `root.zig` the way a consumer reaches it -- a test
+    // written inside `root.zig` itself would pass on a non-`pub` decl, and
+    // would still pass if the alias were dropped entirely as long as some
+    // local name existed. From out here, both regress.
+    const groth16 = @import("root.zig");
+
+    // `groth16.verify` returns `Groth16Error!bool`. Binding the call to a
+    // variable of THAT declared type is what ties the two together: if the
+    // alias named some other error set, or a wider one, this stops compiling
+    // rather than quietly passing.
+    const vk = groth16.VerifyingKey{
+        .alpha_g1 = bn254.G1.Affine.identity,
+        .beta_g2 = bn254.G2.Affine.identity,
+        .gamma_g2 = bn254.G2.Affine.identity,
+        .delta_g2 = bn254.G2.Affine.identity,
+        // One base => zero public inputs is the only shape this vk accepts.
+        .ic = &.{bn254.G1.Affine.identity},
+    };
+    const proof = groth16.Proof{
+        .a = bn254.G1.Affine.identity,
+        .b = bn254.G2.Affine.identity,
+        .c = bn254.G1.Affine.identity,
+    };
+    // Two public inputs against a one-base vk: the call-shape mismatch, and
+    // the only error `verify` has. Rejected before any curve arithmetic, so
+    // the identity points above are never touched.
+    const bad_shape = [_]Fr{ field.frFromU64(1), field.frFromU64(2) };
+    const got: groth16.Groth16Error!bool = groth16.verify(vk, proof, &bad_shape);
+    try std.testing.expectError(error.WrongPublicInputCount, got);
+
+    // The alias must be the same set the sibling module declares, not a
+    // look-alike that happens to spell one member the same way.
+    try std.testing.expect(groth16.Groth16Error == bn254.Groth16Error);
+}
+
 test "cross-stack consistency: QAP divisibility == R1CS satisfaction (the ungated anchor)" {
     // This is the strongest thing provable WITHOUT the prover core: the whole
     // FFT/interpolation/vanishing-division stack is correct iff its

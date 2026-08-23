@@ -185,9 +185,6 @@ pub const max_redirect_inflated = 1 << 20;
 
 // ── configuration ────────────────────────────────────────────────────────────
 
-/// Which element(s) the SP will accept a valid signature on. `.either` (the
-/// default) accepts a signed Assertion OR a signed enclosing Response; both are
-/// pinned to the consumed assertion by the XSW defense regardless.
 /// The IdP's signing key, as `Config.idp_key` takes it.
 ///
 /// Re-exported because it is the type of a field on this module's own public
@@ -196,6 +193,9 @@ pub const max_redirect_inflated = 1 << 20;
 /// `example/main.zig`, the first code to configure this module from outside.
 pub const VerifyKey = xmldsig.VerifyKey;
 
+/// Which element(s) the SP will accept a valid signature on. `.either` (the
+/// default) accepts a signed Assertion OR a signed enclosing Response; both are
+/// pinned to the consumed assertion by the XSW defense regardless.
 pub const SignaturePolicy = enum { assertion, response, either };
 
 /// Which `<saml:SubjectConfirmation>` method(s) the SP will accept.

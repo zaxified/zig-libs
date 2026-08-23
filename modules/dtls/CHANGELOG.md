@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — `Connection.suite`'s field initialiser is no longer
+  `.aes_128_ccm_8_sha256`. It now shares `Config.cipher_suites`' default
+  through a single `default_cipher_suites` constant, so the pre-negotiation
+  value of a public field can no longer be a suite this module has no
+  `suiteParams` entry for. The 2026-08-21 entry below fixed `Config`'s copy of
+  that default and left this one behind; sharing the constant is what makes
+  them impossible to separate again. No behaviour change on any path — every
+  read of `suite` for record protection is preceded by a write — and the
+  field's doc comment now records exactly that, rather than implying a test
+  covers it. Also closes the 2026-08-21 fix's own verification gap: every
+  handshake test named `.cipher_suites` explicitly, so the DEFAULT never
+  travelled end to end and `ConfigError.UnsupportedSuite` had no test at all.
+  Both now do.
+
 - **2026-08-22** — Documented the absence of a post-quantum key exchange in
   `SPEC.md`, `README.md` and the module doc comment. It is written down
   because the failure mode is an assumption, not an oversight: the other

@@ -127,6 +127,18 @@ pub const CipherSuite = enum(u16) {
     aes_128_ccm_8_sha256 = 0x1305,
 };
 
+/// `Config.cipher_suites`'s default, and the value `Connection.suite` holds
+/// before a handshake has negotiated anything. ONE constant for both so the
+/// two cannot drift apart: they did, and the drift is exactly how a default
+/// that `suiteParams` has no entry for survived on `Connection.suite` after
+/// `Config`'s copy had been fixed.
+///
+/// AES-128-GCM is TLS 1.3's one mandatory-to-implement suite and one of the
+/// two `suiteParams` actually wires. Any value here MUST have a
+/// `suiteParams` entry — a default without one is a config that can never
+/// complete a connection, which is what `.aes_128_ccm_8_sha256` was.
+const default_cipher_suites = [_]CipherSuite{.aes_128_gcm_sha256};
+
 pub const ConfigError = error{
     EmptyPsk,
     EmptyPskIdentity,
@@ -294,7 +306,7 @@ pub const Config = struct {
     /// `error.UnsupportedSuite`: a config that could never work, in the mode a
     /// consumer was most likely to reach for. Name a CCM suite explicitly and
     /// `validate` now says no immediately (see below).
-    cipher_suites: []const CipherSuite = &.{.aes_128_gcm_sha256},
+    cipher_suites: []const CipherSuite = &default_cipher_suites,
 
     // ── certificate mode (RFC 8446 §4.4), all ADDITIVE / optional — see
     // this file's "certificate mode" section further down. Leaving every
@@ -1217,7 +1229,23 @@ pub const Connection = struct {
     epoch: u16 = 0,
 
     // ── application-data record state (post-handshake) ──────────────────
-    suite: CipherSuite = .aes_128_ccm_8_sha256,
+    /// The negotiated suite. NOT load-bearing before negotiation: every path
+    /// that reads it for record protection is preceded by a write —
+    /// `serverProcessClientHello` and the client's ServerHello handler both
+    /// assign it before any protected record is built, and
+    /// `installApplicationKeys` assigns it again; `protectRecord` is behind a
+    /// `state != .connected` guard and `protectHandshakeMessage` is only
+    /// reachable after one of those writes. So no test can catch this
+    /// initialiser TRAVELLING, and none here claims to: the test below reads
+    /// the field on a freshly-`clientInit`ed `Connection`, which pins the
+    /// value a consumer can observe, not a behaviour.
+    ///
+    /// It still matters what the value is. It used to be
+    /// `.aes_128_ccm_8_sha256` — the suite `suiteParams` has no entry for —
+    /// left behind when `Config.cipher_suites`' identical default was fixed
+    /// (86d09f8f). Sharing `default_cipher_suites` with `Config` is what
+    /// makes the two impossible to separate again.
+    suite: CipherSuite = default_cipher_suites[0],
     write_keys: DirKeys = .{},
     read_keys: DirKeys = .{},
     /// Next record sequence number to send in the application epoch.
@@ -3689,6 +3717,29 @@ test "Config.validate: rejects an empty cipher-suite list" {
     try testing.expectError(error.NoCipherSuites, cfg.validate());
 }
 
+test "Config.validate: rejects a suite this module cannot install keys for" {
+    // `ConfigError.UnsupportedSuite`'s only test. Both CCM suites are in that
+    // position on 0.16 (`suiteParams` returns null for both — std ships only
+    // a 13-byte-nonce CCM), and naming one must fail HERE, at config time,
+    // not after a handshake has completed and spent a flight.
+    for ([_]CipherSuite{ .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 }) |ccm| {
+        const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret", .cipher_suites = &.{ccm} };
+        try testing.expectError(error.UnsupportedSuite, cfg.validate());
+        // …and the guard must look at the WHOLE list, not just its head: a
+        // usable first preference does not excuse an unusable second.
+        const cfg_tail = Config{
+            .role = .client,
+            .psk_identity = "id",
+            .psk = "secret",
+            .cipher_suites = &.{ .aes_128_gcm_sha256, ccm },
+        };
+        try testing.expectError(error.UnsupportedSuite, cfg_tail.validate());
+    }
+    // The same rejection through the constructor a consumer actually calls.
+    const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret", .cipher_suites = &.{.aes_128_ccm_8_sha256} };
+    try testing.expectError(error.UnsupportedSuite, Connection.clientInit(cfg));
+}
+
 test "Config.validate: accepts a sane config" {
     const cfg = Config{ .role = .client, .psk_identity = "id", .psk = "secret" };
     try cfg.validate();
@@ -3933,6 +3984,64 @@ test "handshake: full client<->server loopback interop — AES-128-GCM" {
 
 test "handshake: full client<->server loopback interop — ChaCha20-Poly1305" {
     try loopbackHandshake(.chacha20_poly1305_sha256);
+}
+
+// ── the DEFAULT cipher suite, driven end to end ─────────────────────────
+//
+// Every other handshake test above names `.cipher_suites` explicitly, so
+// until this one existed the DEFAULT never travelled: the value a consumer
+// inherits by saying nothing was the one value nothing exercised. That is
+// how `.aes_128_ccm_8_sha256` — a suite `suiteParams` has no entry for —
+// sat there as the default through a green suite (86d09f8f).
+//
+// This test is deliberately NOT a `validate()` test. `validate`'s
+// unusable-suite guard is a second, independent fix from the same commit,
+// and a test that only proves the guard rejects CCM would stay green with
+// the broken default restored and the guard deleted — the exact pre-fix
+// state. So this drives the default through `startHandshake` ->
+// `handleFlight` -> `installApplicationKeys` -> a real protected record,
+// where an unusable default fails as `error.NoCipherSuiteOverlap` at
+// `selectCipherSuite` with or without the guard.
+
+test "handshake: the DEFAULT cipher_suites completes a handshake and protects records" {
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    // No `.cipher_suites` on either side: this is what a consumer gets by
+    // saying nothing, which is the whole point of the test.
+    var client = try Connection.clientInit(.{ .role = .client, .psk_identity = psk_identity, .psk = psk });
+    var server = try Connection.serverInit(.{ .role = .server, .psk_identity = psk_identity, .psk = psk });
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x2d} ** 32);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    try driveHandshake(&client, &server, seededForTest(&csprng), &buf1, &buf2);
+
+    // The suite that actually travelled is the DEFAULT — read out of the
+    // default itself rather than repeated as a literal, so this cannot drift
+    // into pinning some other suite that happens to work.
+    const default_suite = (Config{ .role = .client }).cipher_suites[0];
+    try testing.expectEqual(default_suite, client.suite);
+    try testing.expectEqual(default_suite, server.suite);
+
+    // `installApplicationKeys` ran (that is what puts a `Connection` in
+    // `.connected`) and the keys it derived are real: an application record
+    // built under the default suite deprotects on the other side. This is
+    // the step the old default died at.
+    var wire: [256]u8 = undefined;
+    var plain: [256]u8 = undefined;
+    const msg = "the default suite carried a record";
+    const rec = try client.send(msg, &wire);
+    try testing.expectEqualSlices(u8, msg, try server.recv(rec, &plain));
+}
+
+test "Connection.suite: the pre-negotiation value is a suite this module can use" {
+    // Reads a public field on a freshly-constructed `Connection`, before any
+    // negotiation has assigned it. This pins the VALUE, not a behaviour —
+    // see the field's own doc comment for why no behavioural test exists.
+    var conn = try Connection.clientInit(.{ .role = .client, .psk_identity = "id", .psk = "secret" });
+    defer conn.deinit();
+    try testing.expect(suiteParams(conn.suite) != null);
+    try testing.expectEqual((Config{ .role = .client }).cipher_suites[0], conn.suite);
 }
 
 test "cipher suite negotiation: SERVER's own preference order wins, not the client's offer order" {

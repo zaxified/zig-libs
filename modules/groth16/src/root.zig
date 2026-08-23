@@ -84,6 +84,13 @@ pub const Proof = prover.Proof;
 /// publishing a proof type without the one function that judges it made a
 /// consumer go looking. Found by writing `example/main.zig`.
 pub const verify = bn254.groth16Verify;
+/// `verify`'s error set. Published here for the same reason `verify` is:
+/// a consumer that reaches the function through this root could not name
+/// the set it returns without reaching through `groth16.bn254` as well —
+/// which is exactly the omission `a2bdcb33` fixed one layer down, in
+/// `bn254`'s own root. A re-exported function whose error set is not
+/// re-exported with it is only half published.
+pub const Groth16Error = bn254.Groth16Error;
 pub const ToxicWaste = prover.ToxicWaste;
 pub const KeyPair = prover.KeyPair;
 pub const Randomizers = prover.Randomizers;

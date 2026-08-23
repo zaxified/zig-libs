@@ -87,6 +87,42 @@ open and close between two reads, and `ss` prefers netlink and can legitimately 
 files do not — so the strong claim is the controlled-socket one and the whole-machine figure is a
 snapshot, not an invariant.
 
+### Unverified limit: the hex address decode on a big-endian target
+
+`meta.targets` declares `.linux32`, which this repository's build defines as
+**MIPS** (`mips-linux-musl`, soft-float) — the collection's one **big-endian**
+lane, chosen precisely because endianness is the defect class every other lane
+cannot catch. The address decoders have never been *run* there, and this
+section exists so that is written down rather than implied.
+
+What the code assumes. `leHexWord` (`src/sockets.zig`) and its twin
+`leHexToV4` (`src/routes.zig`) parse each 8-hex-char group with
+`parseInt(u32, s, 16)` and then emit the parsed integer's **low** byte as the
+**first** address octet — i.e. they assume the kernel printed the `__be32` as
+a little-endian host word. That assumption is the one those functions' own doc
+comments state, and it is the one every fixture under `src/testdata/` was
+captured under: those captures come from little-endian hosts, so they confirm
+the decode on little-endian and say nothing at all about big-endian.
+
+Why the gate does not settle it. `check-portable` **compiles** every module
+for `.linux32`; it never executes anything there. A byte-order assumption is
+invisible to a compiler — the code is well-typed either way — so a green
+`portable-procnet-linux32` row is a statement about types, not about decoded
+addresses. There is no big-endian host and no big-endian capture in this
+repository, so nothing here can decide the question in either direction.
+
+**Neither "broken on big-endian" nor "fine on big-endian" is claimed.** What
+would settle it, precisely: capture `/proc/net/tcp` **and** `/proc/net/tcp6`
+on a big-endian Linux host (MIPS, s390x, or a big-endian qemu-system guest)
+together with the ground-truth addresses of the sockets in them — e.g. `ss
+-tuln` output taken on that same host at the same moment — then replay those
+captures through `parseTcp` as a fixture and compare the decoded `netaddr.Ip`
+values against that ground truth. One such pair of files, checked in beside
+the existing little-endian fixtures, converts this section from an unverified
+limit into either a passing test or a bug report. Until then `.linux32` in
+`meta.targets` should be read as "compiles there", not "decodes correctly
+there".
+
 ## Backlog / deferred
 Per the module README's "DEFER" list: `/proc/net/unix` (the AF_UNIX table, `ss -x` — a different row
 shape entirely: a filesystem path or an abstract NUL-containing name, no address/port pair, so it

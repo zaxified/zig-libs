@@ -14,7 +14,14 @@
 
 const std = @import("std");
 
-/// Alias so consumers spell the atomic type through the module.
+/// Alias so code here spells the atomic type through the module. Generic, so
+/// it has no body until something instantiates it — see the test at the foot
+/// of this file, which is the only instantiation in the repository and the
+/// only reason a broken edit to this line does not compile green.
+///
+/// NOT re-exported by `root.zig` today (its four neighbours below are), so a
+/// consumer cannot yet spell `lockfree.Atomic`; whether it should be is an
+/// API question, not a defect in this line.
 pub fn Atomic(comptime T: type) type {
     return std.atomic.Value(T);
 }
@@ -100,6 +107,34 @@ pub const SpinLock = struct {
 // ── tests (all mechanical, all run today) ────────────────────────────────────
 
 const testing = std.testing;
+
+test "Atomic instantiates, and is the type it claims to alias" {
+    // `check-pubfn-reach` cannot analyse a generic body: there is none until
+    // something instantiates it. Nothing in this repository instantiated
+    // `Atomic`, so a deliberate semantic error in its body left
+    // `test-lockfree`, `check-pubfn-reach` AND `example-lockfree` green — the
+    // same class 924a3148 closed for six other generics.
+    const A = Atomic(u32);
+
+    // The property that makes it an ALIAS rather than merely something
+    // atomic-shaped: it must hand back the very type it names. A body that
+    // wrapped the value in a struct of its own would still compile, still
+    // load and store, and still be wrong.
+    try testing.expect(A == std.atomic.Value(u32));
+    // …and it must be a function OF T, not a constant type.
+    try testing.expect(Atomic(u64) != A);
+
+    var v: A = .init(7);
+    try testing.expectEqual(@as(u32, 7), v.load(.monotonic));
+    try testing.expectEqual(@as(u32, 7), v.fetchAdd(5, .acq_rel)); // returns the PREVIOUS value
+    try testing.expectEqual(@as(u32, 12), v.load(.acquire));
+    v.store(3, .release);
+    try testing.expect(v.cmpxchgStrong(3, 9, .acq_rel, .monotonic) == null); // CAS won
+    // CAS lost: the value is 9, not the 4 that was expected, and the failure
+    // hands back what was actually there.
+    try testing.expectEqual(@as(u32, 9), v.cmpxchgStrong(4, 5, .acq_rel, .monotonic).?);
+    try testing.expectEqual(@as(u32, 9), v.load(.monotonic));
+}
 
 test "Backoff escalates then yields without overflow" {
     var b: Backoff = .{};
