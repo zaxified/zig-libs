@@ -24,6 +24,22 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Tooling:** two module sets that the shell scripts kept their own copies of
+  now have one source each. Which modules talk to a **live external peer** is
+  `.live` on the `module_list` entry, beside `heavy` and `example` where the
+  same kind of fact already lived; it was a string in `scripts/test-lib.sh`
+  read by three scripts, so a module that gained a live peer and was not added
+  kept running in parallel — the exact flakiness that variable exists to
+  prevent, and invisible until it bit. Which modules own a **constant-time
+  harness** is now derived from `modules/<m>/src/ctgrind_harness.zig` existing:
+  that fact was written out three times (build.zig's `ctgrind_harnesses`,
+  `ctgrind.sh`'s `ALL_MODULES`, and implicitly its `TARGETS` keys), so a
+  harness added without editing all three was never measured with every gate
+  still green. `zig build module-graph` publishes both, the scripts read them
+  from there, and `ctgrind.sh` now refuses to run when a harness in the tree
+  has no recipe — previously that case reported "no harness for module", which
+  was the opposite of true.
+
 - **Tooling:** the README module catalog is now **generated in full** —
   `zig build gen-catalog`, gated by `check-catalog-table`. Each row's
   description and Platform cell come from the module's own `meta.doc` /

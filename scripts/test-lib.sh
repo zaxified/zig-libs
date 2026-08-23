@@ -70,7 +70,23 @@ NETNS_MODULES="netlink genetlink nl80211 ethtool devlink tc conntrack nftables w
 # `jinja` is deliberately absent: its live peer is a Python script it runs to
 # completion, not a network peer with a clock, and its one failure this week was
 # a version drift in the oracle.
-LIVE_MODULES="opcua ssh dtls imap"
+# DERIVED, not listed. The set itself is declared once, as `.live` on the
+# module_list entry in build.zig, and published by `zig build module-graph`
+# (column 4). It used to be spelled out here and consumed by three scripts, so
+# a module that gained a live peer and was not added kept running in parallel
+# -- the exact failure this variable exists to prevent, invisible until it went
+# flaky. Queried once and cached; callers use `$(live_modules)`.
+_ZL_LIVE_CACHE=""
+live_modules() {
+    if [[ -z "$_ZL_LIVE_CACHE" ]]; then
+        _ZL_LIVE_CACHE="$(zig build module-graph 2>/dev/null | awk -F'\t' '$4=="live"{printf "%s ", $1}')"
+        [[ -n "$_ZL_LIVE_CACHE" ]] || {
+            echo "test-lib.sh: module-graph reported no live modules -- refusing to run the live set in parallel on a guess" >&2
+            exit 1
+        }
+    fi
+    printf '%s' "$_ZL_LIVE_CACHE"
+}
 
 # Sub-second timing via bash 5+ EPOCHREALTIME; fall back to whole seconds.
 # EPOCHREALTIME honours the locale's decimal point (e.g. "1.234,56" in

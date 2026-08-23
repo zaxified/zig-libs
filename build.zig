@@ -68,6 +68,20 @@ const Module = struct {
     /// memory) is given up. Pass `-Dstrict-debug` to force real Debug — that
     /// is what the CI matrix does. Threshold: >15s measured serially.
     heavy: bool = false,
+    /// This module's tests talk to a REAL external peer -- a running server, a
+    /// foreign client -- not a fixture. Such tests are run serially, because
+    /// four of them at once turned a module that passes 98/98 alone into 3/3
+    /// failures: the contention is between the live peers, not the CPU.
+    ///
+    /// Declared rather than probed: nothing in the tree distinguishes a socket
+    /// opened against a real peer from one opened against a fixture. It lives
+    /// HERE, next to `heavy` and `example`, because it is the same kind of fact
+    /// about the same thing, and `module-graph` publishes it so the shell
+    /// scripts stop keeping their own copy of the list.
+    ///
+    /// `jinja` is deliberately absent: its live peer is a Python script it runs
+    /// to completion, not a network peer with a clock.
+    live: bool = false,
 };
 
 const module_list = [_]Module{
@@ -161,7 +175,7 @@ const module_list = [_]Module{
     .{ .name = "sealedbox", .libs = &.{"crypto"} },
     .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{"montint"}, .heavy = true, .example = true },
     .{ .name = "blindrsa", .libs = &.{"crypto"}, .deps = &.{"rsa"} },
-    .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .heavy = true, .example = true },
+    .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .heavy = true, .example = true, .live = true },
     .{ .name = "netconf", .libs = &.{"net"}, .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "trie", .libs = &.{"storage"}, .example = true },
@@ -175,7 +189,7 @@ const module_list = [_]Module{
     .{ .name = "iec104", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "fleetsim", .libs = &.{"net"}, .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "smtp", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "imap", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "imap", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true, .live = true },
     .{ .name = "iec61850", .libs = &.{"net"}, .deps = &.{"xml"}, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "iec62351", .libs = &.{"net"}, .deps = &.{ "x509", "rsa" }, .example = true },
     .{ .name = "s7comm", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
@@ -242,7 +256,7 @@ const module_list = [_]Module{
     .{ .name = "syslog", .libs = &.{"net"} },
     .{ .name = "sntp", .libs = &.{"net"}, .example = true },
     .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .example = true },
+    .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .example = true, .live = true },
     .{ .name = "noise", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .example = true },
     .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa" }, .example = true },
     .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
@@ -252,7 +266,7 @@ const module_list = [_]Module{
     .{ .name = "slhdsa", .libs = &.{"crypto"}, .heavy = true, .example = true },
     .{ .name = "falcon", .libs = &.{"crypto"}, .example = true },
     .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true, .example = true },
-    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .example = true, .live = true },
     .{ .name = "tlsresume", .libs = &.{"crypto"}, .example = true },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{"chachapoly"} },
     .{ .name = "sandbox", .libs = &.{"os"}, .example = true },
@@ -1140,13 +1154,13 @@ pub fn build(b: *std.Build) void {
 
     const ctgrind = b.step("ctgrind", "Build the constant-time harnesses into <prefix>/ctgrind/ (run them with scripts/ctgrind.sh)");
     const check_ctgrind = b.step("check-ctgrind", "Compile every ctgrind harness — rot guard, runs no valgrind");
-    for (ctgrind_harnesses) |name| {
+    for (ctgrindHarnesses(b)) |name| {
         const src = b.path(b.fmt("modules/{s}/src/ctgrind_harness.zig", .{name}));
         const deps = blk: {
             for (module_list) |m| {
                 if (std.mem.eql(u8, m.name, name)) break :blk m.deps;
             }
-            @panic("ctgrind_harnesses names a module that is not in module_list");
+            unreachable; // derived FROM module_list
         };
 
         var selected = ctgrind_only.len == 0;
@@ -1219,15 +1233,20 @@ pub fn build(b: *std.Build) void {
 /// drives it through the code whose constant-time property that module's
 /// SPEC.md claims. Adding a row here is what puts the new harness into
 /// `zig build ctgrind` and into the `check-ctgrind` rot guard.
-const ctgrind_harnesses = [_][]const u8{
-    "chachapoly",
-    "ct25519",
-    "decaf448",
-    "ecvrf",
-    "ed448",
-    "k256",
-    "montint",
-};
+/// Which modules own a constant-time harness. DERIVED, never listed: the fact
+/// is `modules/<m>/src/ctgrind_harness.zig` existing, and that file is its own
+/// declaration. It used to be written out three times — here, and twice in
+/// `scripts/ctgrind.sh` — so a harness added without editing all three was
+/// simply never measured, with every gate still green. `module-graph` publishes
+/// the derived set so the script reads it instead of keeping a fourth copy.
+fn ctgrindHarnesses(b: *std.Build) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (module_list) |m| {
+        b.build_root.handle.access(b.graph.io, b.fmt("modules/{s}/src/ctgrind_harness.zig", .{m.name}), .{}) catch continue;
+        out.append(b.allocator, m.name) catch @panic("OOM");
+    }
+    return out.items;
+}
 
 /// `zig build module-graph` — dump module_list as TSV so tooling does not have
 /// to parse Zig source. One line per module:
@@ -1244,6 +1263,7 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
     var out: std.Io.Writer.Allocating = .init(b.allocator);
     defer out.deinit();
     const w = &out.writer;
+    const harnesses = ctgrindHarnesses(b);
 
     for (module_list) |m| {
         try w.print("{s}\t{s}\t", .{ m.name, if (m.heavy) "heavy" else "light" });
@@ -1261,7 +1281,19 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
             try w.writeAll(dep);
             n += 1;
         }
-        try w.writeAll("\n");
+        // Columns 4 and 5 exist so the shell scripts stop keeping their own
+        // copies of these two module sets. `live` is declared in `module_list`;
+        // `ct` is derived from the tree (the harness file is its own
+        // declaration). Both were duplicated into scripts/ before this.
+        try w.print("\t{s}\t{s}\n", .{
+            if (m.live) "live" else "-",
+            if (blk: {
+                for (harnesses) |h| {
+                    if (std.mem.eql(u8, h, m.name)) break :blk true;
+                }
+                break :blk false;
+            }) "ct" else "-",
+        });
     }
 
     // Straight to stdout: this step's whole purpose is its output, and the

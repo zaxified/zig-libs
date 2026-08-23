@@ -90,7 +90,15 @@ EXPECTED_FILE="$SCRIPT_DIR/ctgrind-expected.tsv"
 #            per-module allowlist is how a fail-open rule grows back one
 #            pattern at a time. Widen it only with a measured log showing the
 #            frame belongs to result formatting and to nothing else.
-ALL_MODULES=(chachapoly ct25519 decaf448 ecvrf ed448 k256 montint)
+# DERIVED from the tree via `zig build module-graph` (column 5), whose own
+# source is `modules/<m>/src/ctgrind_harness.zig` existing. This was a literal
+# list here AND in build.zig AND implicitly in TARGETS below, so a harness added
+# without editing all three was never measured and nothing went red.
+mapfile -t ALL_MODULES < <(zig build module-graph 2>/dev/null | awk -F'\t' '$5=="ct"{print $1}')
+if [[ ${#ALL_MODULES[@]} -eq 0 ]]; then
+    echo "ctgrind: module-graph reported no harnesses — refusing to pass vacuously" >&2
+    exit 2
+fi
 
 declare -A TARGETS=(
     [chachapoly]="poly1305"
@@ -174,8 +182,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 if [[ ${#MODULES[@]} -eq 0 ]]; then MODULES=("${ALL_MODULES[@]}"); fi
+# ALL_MODULES is derived from the tree now, so a harness added without a recipe
+# here shows up on its own -- and would otherwise be "measured" with no targets,
+# i.e. silently not measured at all. Both the named and the default (= every
+# harness) case go through this, and the two messages are different questions:
+# a name that has no harness is a typo, a harness that has no recipe is a gap.
 for m in "${MODULES[@]}"; do
-    [[ -n "${TARGETS[$m]:-}" ]] || { echo "ctgrind: no harness for module '$m'" >&2; exit 2; }
+    if [[ ! -f "$REPO_ROOT/modules/$m/src/ctgrind_harness.zig" ]]; then
+        echo "ctgrind: no harness for module '$m' (expected modules/$m/src/ctgrind_harness.zig)" >&2
+        exit 2
+    fi
+    [[ -n "${TARGETS[$m]:-}" ]] || { echo "ctgrind: modules/$m/src/ctgrind_harness.zig exists but ctgrind.sh has no TARGETS entry for it — add one (plus MODES/PATTERN/WITNESS) or the harness is never driven" >&2; exit 2; }
+    [[ -n "${MODES[$m]:-}" ]] || { echo "ctgrind: modules/$m/src/ctgrind_harness.zig exists but ctgrind.sh has no MODES entry for it" >&2; exit 2; }
 done
 
 if ! command -v valgrind >/dev/null 2>&1; then

@@ -131,8 +131,8 @@ graph_load() {
         exit 1
     fi
     G_TSV="$tsv"
-    local name heavy deps
-    while IFS=$'\t' read -r name heavy deps; do
+    local name heavy deps live ct
+    while IFS=$'\t' read -r name heavy deps live ct; do
         [[ -z "$name" ]] && continue
         G_NAMES+=("$name")
         G_HEAVY+=("$heavy")
@@ -393,7 +393,7 @@ run_modules() {
         case " $NETNS_MODULES " in
             *" $m "*) netns+=("$m"); continue ;;
         esac
-        case " $LIVE_MODULES " in
+        case " $(live_modules) " in
             *" $m "*) live+=("$m") ;;
             *) rest+=("$m") ;;
         esac
@@ -421,7 +421,7 @@ run_modules() {
     # ⭐ LAST, AND GENUINELY ONE AT A TIME — one `zig build` per module. These
     # talk to a real peer with a clock on both ends; running them beside 215
     # other test binaries measures the scheduler rather than the interop. See
-    # LIVE_MODULES in test-lib.sh for the full reasoning, including what this
+    # `live_modules` in test-lib.sh for the full reasoning, including what this
     # deliberately stops covering.
     #
     # ⚠⚠ `-j1` DID NOT DO THIS, and the step carried the word "serial" in its

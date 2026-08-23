@@ -134,7 +134,8 @@ if [[ -z "$summary_file" ]]; then
     # the same reason: `zig build test-netlink` on a bare dev host FAILS rather
     # than skipping, and a module whose build failed produces no count line.
     #
-    # LIVE_MODULES is split off for a related reason: those tests talk to a real
+    # The live set (`live_modules`, derived from build.zig's `.live`) is split
+    # off for a related reason: those tests talk to a real
     # third-party peer and can fail under contention, and a module whose tests
     # FAILED prints no count line either — which this check would then report as
     # a phantom dark test. Serial, same as the gate.
@@ -143,7 +144,7 @@ if [[ -z "$summary_file" ]]; then
         case " $NETNS_MODULES " in
             *" $m "*) netns+=("test-$m"); continue ;;
         esac
-        case " $LIVE_MODULES " in
+        case " $(live_modules) " in
             *" $m "*) live+=("test-$m") ;;
             *) plain+=("test-$m") ;;
         esac
