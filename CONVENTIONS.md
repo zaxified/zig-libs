@@ -292,6 +292,20 @@ prose:
   also theirs. `zig build gen-libs-table` renders them into README's *Libraries* table.
 - **No default.** Copying `_template` leaves a wrong answer rather than no answer, which
   the gate catches; an unfiled module would slip through silently.
+- **Generated, not merely checked.** `zig build gen-catalog` moves a module's catalog row
+  under the section its `.libs[0]` names and rewrites the row's Deps cell from `.deps`.
+  Edit the field, run it, commit — the README follows. A guard that keeps two lists in
+  sync is an admission that they should be one list; `check-catalog` stays as the
+  tripwire, but the arrangement now has an authoritative source rather than a twin.
+- **What is NOT generated, and why.** The row's one-line description and its Platform
+  cell stay hand-written. Measured before deciding: the 230 blurbs are 30 KB of prose
+  that exists nowhere else — only 28 overlap the module's own `//!` comment and 221 of
+  230 differ from its README's opening paragraph, because an index entry and an opening
+  paragraph are not the same piece of writing. Moving that into `module_list` would drown
+  the one property the list has, which is that a taxonomy can be read at a glance. The
+  Platform cell reads `any (packer: linux)` / `amd64 asm + portable fallback` — prose
+  carrying nuance the `meta.platform` enum does not have. **Prose stays where a human
+  writes it; facts live on the catalog entry and every view of them is rendered.**
 
 **Why here and not in `meta`.** This is a hand-written note about where a module
 *belongs*, not a property of its code, and a taxonomy is reviewed as a **list**: you only
@@ -312,7 +326,8 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 | Fact | Lives in | Everywhere else |
 |---|---|---|
 | meta tags (platform/role/concurrency/model_after/deps) | `pub const meta` in `src/root.zig` | README shows a derived view; SPEC does not restate |
-| which **library** a module belongs to | `.libs` on the `module_list` entry in `build.zig` | README's *Libraries* table is generated from it (`gen-libs-table`), and the catalog section a row is printed under must match `.libs[0]` |
+| which **library** a module belongs to | `.libs` on the `module_list` entry in `build.zig` | README's *Libraries* table and the catalog section a row is printed under are both **generated** from it — `zig build gen-libs-table` + `zig build gen-catalog` |
+| a module's sibling deps | `.deps` on the `module_list` entry in `build.zig` | the README catalog row's Deps cell is **generated** from it (`gen-catalog`); `meta.deps` in `root.zig` is a second hand-written copy that `check-catalog` holds to agreement (see below) |
 | one-line module purpose | root `README.md` catalog table | — |
 | paragraph purpose + API + import + verify steps | `modules/<m>/README.md` | — |
 | design & invariants, threat-model, verification detail, per-module backlog | `modules/<m>/SPEC.md` | — |

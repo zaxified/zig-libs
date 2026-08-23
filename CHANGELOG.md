@@ -24,6 +24,18 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Tooling:** `zig build gen-catalog` renders the parts of the README module
+  catalog that are views of `module_list` rather than prose — a row's section
+  placement from `.libs[0]`, its Deps cell from `.deps`. Both were previously
+  only *guarded* against drift, which keeps two lists in sync instead of making
+  them one; the guards stay as tripwires but the arrangement now has an
+  authoritative source. Verified by reproducing all 230 Deps cells byte-exactly
+  from the field before anything else changed. The one-line description and the
+  Platform cell are deliberately left hand-written: measured, the blurbs are
+  30 KB of prose existing nowhere else (221 of 230 differ from the module's own
+  README opening), and the Platform cell carries nuance the `meta.platform`
+  enum does not have.
+
 - **Taxonomy:** modules are now filed into six **libraries** — `web`, `net`,
   `storage`, `crypto`, `format`, `os` — via a required `.libs` field on the
   `module_list` entry, first entry primary. `zig-libs` was already a plural
