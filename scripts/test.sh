@@ -245,7 +245,9 @@ harness_smoke() {
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "tag.sh self-test" ./scripts/test-tag.sh
     step "check-ci-cache-keys" ./scripts/check-ci-cache-keys.sh
+    step "check-scripts-doc" zig build check-scripts-doc
     step "check-catalog" zig build check-catalog
+    step "check-uapi" zig build check-uapi
     step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly
     step "check-ctgrind" zig build check-ctgrind
@@ -1202,7 +1204,9 @@ cmd_all() {
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "tag.sh self-test" ./scripts/test-tag.sh
     step "check-ci-cache-keys" ./scripts/check-ci-cache-keys.sh
+    step "check-scripts-doc" zig build check-scripts-doc
     step "check-catalog" zig build check-catalog
+    step "check-uapi" zig build check-uapi
     step "check-changelog" zig build check-changelog
     step "check-testonly" zig build check-testonly
     step "check-fuzz" zig build check-fuzz

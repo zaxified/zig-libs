@@ -24,6 +24,26 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Tooling / audit of the repo root and `scripts/`:** `chk2` and `chk2b` —
+  5547 NUL bytes each, identical, referenced by nothing, committed by accident
+  in `55dd448` — deleted from the repo root. `zig build check-uapi` is now in
+  the gate: it works and passes (689 kernel constants matched, 0 mismatched,
+  across five modules) but nothing ran it, and being host-dependent was a
+  reason not to fold it into `check-catalog`, never a reason not to run it —
+  it skips rather than fails when python3 or the headers are missing. Wiring it
+  in exposed why it never was: its summary went through `std.log.info`, which
+  writes to stderr, and the driver treats "exit 0 with anything on stderr" as a
+  failure — deliberately, after four defects of exactly that shape. The summary
+  goes to stdout now. New
+  `zig build check-scripts-doc` requires every file in `scripts/` to be named
+  in `scripts/README.md`; that README is the only map of the harness and had
+  drifted three entries, one of them `check-http-sizeprobe.sh`, which the gate
+  runs on every invocation. `scripts/check-citations.py` stays manual and now
+  says why: measured on `dns` it pairs an `RFC NNNN` mention with any nearby
+  quoted string, so a quoted SPEC.md heading reports as a mismatch. Also
+  removed a dead `catalogRowModule` left behind when the catalog row-mover
+  became the full renderer.
+
 - **Tooling:** two module sets that the shell scripts kept their own copies of
   now have one source each. Which modules talk to a **live external peer** is
   `.live` on the `module_list` entry, beside `heavy` and `example` where the

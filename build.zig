@@ -892,6 +892,13 @@ pub fn build(b: *std.Build) void {
         b.step(cfg[1], cfg[2]).dependOn(&st.step);
     }
 
+    // `zig build check-scripts-doc` — see `checkScriptsDoc`.
+    {
+        const st = b.allocator.create(std.Build.Step) catch @panic("OOM");
+        st.* = std.Build.Step.init(.{ .id = .custom, .name = "check-scripts-doc", .owner = b, .makeFn = checkScriptsDoc });
+        b.step("check-scripts-doc", "Verify scripts/README.md names every file in scripts/").dependOn(st);
+    }
+
     // `zig build check-testonly` — prove a test-only dep really is test-only.
     //
     // The claim `test_deps` makes is that the PUBLISHED module never needs
@@ -1084,8 +1091,18 @@ pub fn build(b: *std.Build) void {
     // headers installed can still build and test every module normally, so
     // this step SKIPS (does not fail the build) whenever either is missing
     // -- see `checkUapi` below and the script's own header-missing handling.
-    // Run it explicitly (or from whatever wires `scripts/check-citations.py`
-    // into CI, which has the same host-dependency shape).
+    // It is in the gate now (`scripts/test.sh`). Being host-dependent was the
+    // reason it is not folded into `check-catalog`; it was never a reason not
+    // to RUN it, and for months nothing did -- an audit found it reachable
+    // only by typing the step name, with no record of when it last passed. It
+    // skips rather than fails when python3 or the headers are missing, which
+    // is exactly what makes it safe to run everywhere.
+    //
+    // `scripts/check-citations.py` has the same host-dependency shape but is
+    // NOT gated, for a different reason: measured on `dns`, it pairs an `RFC
+    // NNNN` mention with any nearby quoted string, so a quoted SPEC.md heading
+    // reports as a citation mismatch. It stays a manual tool until its
+    // precision is gate-grade.
     const check_uapi = b.step("check-uapi", "Diff hardcoded kernel UAPI constants against installed kernel headers");
     const check_uapi_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
     check_uapi_inner.* = std.Build.Step.init(.{
@@ -1701,13 +1718,39 @@ fn metaStringField(src: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The module named by a catalog row's first cell, or null if the line is not
-/// a catalog row. Shares the row shape `catalogRowNeedle` enforces.
-fn catalogRowModule(line: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, line, "| [`")) return null;
-    const rest = line["| [`".len..];
-    const tick = std.mem.indexOfScalar(u8, rest, '`') orelse return null;
-    return rest[0..tick];
+/// `zig build check-scripts-doc` — every file in `scripts/` must be named in
+/// `scripts/README.md`.
+///
+/// That README is the only map of the harness, and it is hand-written, so it
+/// drifts silently in the one direction that matters: a tool that nobody
+/// documented is a tool nobody knows to run. Found by audit with three already
+/// missing, one of them `check-http-sizeprobe.sh`, which `test.sh` runs on
+/// every gate.
+///
+/// Directories count as documented when named with a trailing slash
+/// (`hooks/`), since the README describes them as units rather than per file.
+fn checkScriptsDoc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    const readme = try b.build_root.handle.readFileAlloc(io, "scripts/README.md", b.allocator, .limited(4 * 1024 * 1024));
+
+    var dir = try b.build_root.handle.openDir(io, "scripts", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    var failed = false;
+    while (try it.next(io)) |e| {
+        if (std.mem.eql(u8, e.name, "README.md")) continue;
+        const needle = if (e.kind == .directory) b.fmt("`{s}/`", .{e.name}) else b.fmt("`{s}`", .{e.name});
+        if (std.mem.indexOf(u8, readme, needle) == null) {
+            std.log.err(
+                "scripts/{s} is not mentioned in scripts/README.md — add a row for it (the README is the only map of the harness, and an undocumented tool is one nobody knows to run)",
+                .{e.name},
+            );
+            failed = true;
+        }
+    }
+    if (failed) return step.fail("scripts/README.md does not cover scripts/", .{});
 }
 
 const LibsTableStep = struct {
@@ -2851,7 +2894,17 @@ fn checkUapi(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
     defer b.allocator.free(result.stdout);
     defer b.allocator.free(result.stderr);
 
-    if (result.stdout.len > 0) std.log.info("{s}", .{result.stdout});
+    // The script's own stdout goes to OUR stdout, not through `std.log`, which
+    // writes to stderr. `scripts/test.sh` treats "exit 0 with anything on
+    // stderr" as a failure -- deliberately, after four defects of exactly that
+    // shape -- so routing a success summary through `std.log.info` made this
+    // step unrunnable from the gate, which is a large part of why it never was.
+    if (result.stdout.len > 0) {
+        var buf: [4096]u8 = undefined;
+        var stdout = std.Io.File.stdout().writerStreaming(b.graph.io, &buf);
+        stdout.interface.writeAll(result.stdout) catch {};
+        stdout.interface.flush() catch {};
+    }
     if (result.stderr.len > 0) std.log.err("{s}", .{result.stderr});
 
     switch (result.term) {
