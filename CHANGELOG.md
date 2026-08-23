@@ -24,6 +24,17 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Packaging fix:** `build.zig.zon`'s `.paths` did not list `LICENSE` or
+  `NOTICE`, so neither was part of the package. `.paths` decides what a
+  consumer actually receives; a file outside it is visible on GitHub and absent
+  from every fetched copy. For an MIT collection that means the permission
+  notice did not travel with the code, and `NOTICE` — the file written
+  specifically to tell a consumer whether consuming this obliges them to
+  anything beyond MIT — never reached one. Both are listed now, and
+  `zig build check-package` keeps them there. **This changes the package hash**,
+  so a consumer pinning by hash re-pins at the next tag, which they would be
+  doing anyway.
+
 - **Tooling / audit of the repo root and `scripts/`:** `chk2` and `chk2b` —
   5547 NUL bytes each, identical, referenced by nothing, committed by accident
   in `55dd448` — deleted from the repo root. `zig build check-uapi` is now in

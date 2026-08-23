@@ -3,6 +3,12 @@
     .version = "0.0.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x411fad481a34245a,
+    // What a consumer actually receives. A file not listed here is NOT part of
+    // the package, however visible it is on GitHub -- which is how `LICENSE`
+    // and `NOTICE` came to be missing from every fetched copy of an MIT
+    // collection whose NOTICE exists to answer, for the consumer, whether
+    // consuming it obliges them to anything beyond MIT. `zig build
+    // check-package` keeps both listed.
     .paths = .{
         "build.zig",
         "build.zig.zon",
@@ -10,6 +16,8 @@
         "README.md",
         "CHANGELOG.md",
         "CONVENTIONS.md",
+        "LICENSE",
+        "NOTICE",
     },
     .dependencies = .{},
 }

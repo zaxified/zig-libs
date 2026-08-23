@@ -341,6 +341,7 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 | license attribution / provenance | `NOTICE` | README/SPEC only point to it, never restate the terms |
 | which modules have a LIVE external peer | `.live` on the `module_list` entry | `zig build module-graph` publishes it; the shell scripts derive theirs from that, never a list of their own |
 | which modules have a constant-time harness | `modules/<m>/src/ctgrind_harness.zig` **existing** | derived — build.zig scans for it, `module-graph` publishes it, `scripts/ctgrind.sh` reads it from there |
+| what a consumer receives when they fetch this package | `build.zig.zon`'s `.paths` | `zig build check-package` requires `LICENSE` and `NOTICE` to be in it — a file outside `.paths` is visible on GitHub and absent from every fetched copy |
 | all repo rules | this file (`CONVENTIONS.md`) | — |
 | module catalog | root `README.md` table | — |
 

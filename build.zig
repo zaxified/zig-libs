@@ -892,6 +892,13 @@ pub fn build(b: *std.Build) void {
         b.step(cfg[1], cfg[2]).dependOn(&st.step);
     }
 
+    // `zig build check-package` — see `checkPackagePaths`.
+    {
+        const st = b.allocator.create(std.Build.Step) catch @panic("OOM");
+        st.* = std.Build.Step.init(.{ .id = .custom, .name = "check-package", .owner = b, .makeFn = checkPackagePaths });
+        b.step("check-package", "Verify build.zig.zon's .paths ships LICENSE and NOTICE").dependOn(st);
+    }
+
     // `zig build check-scripts-doc` — see `checkScriptsDoc`.
     {
         const st = b.allocator.create(std.Build.Step) catch @panic("OOM");
@@ -1716,6 +1723,45 @@ fn metaStringField(src: []const u8, field: []const u8) ?[]const u8 {
         out.append(gpa, src[i]) catch @panic("OOM");
     }
     return null;
+}
+
+/// `zig build check-package` — the files a consumer legally needs must be in
+/// `build.zig.zon`'s `.paths`.
+///
+/// `.paths` decides what is IN the package; anything else is visible on GitHub
+/// and absent from every fetched copy. `LICENSE` and `NOTICE` were both
+/// missing, which for an MIT collection means the permission notice did not
+/// travel with the code, and the one file written to tell a consumer whether
+/// consuming this obliges them to anything beyond MIT never reached one.
+///
+/// Only these two are checked. The rest of `.paths` is a judgement about what
+/// is useful to ship; these two are not.
+fn checkPackagePaths(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    const zon = try b.build_root.handle.readFileAlloc(io, "build.zig.zon", b.allocator, .limited(64 * 1024));
+    const paths_at = std.mem.indexOf(u8, zon, ".paths = .{") orelse
+        return step.fail("check-package: build.zig.zon has no `.paths` block", .{});
+    const paths_end = std.mem.indexOfPos(u8, zon, paths_at, "},") orelse zon.len;
+    const paths = zon[paths_at..paths_end];
+
+    var failed = false;
+    for ([_][]const u8{ "LICENSE", "NOTICE" }) |needed| {
+        b.build_root.handle.access(io, needed, .{}) catch {
+            std.log.err("check-package: {s} does not exist in the repo root", .{needed});
+            failed = true;
+            continue;
+        };
+        if (std.mem.indexOf(u8, paths, b.fmt("\"{s}\"", .{needed})) == null) {
+            std.log.err(
+                "check-package: build.zig.zon's `.paths` does not list \"{s}\" -- it exists in the repo but is not part of the package, so no consumer who fetches this ever receives it",
+                .{needed},
+            );
+            failed = true;
+        }
+    }
+    if (failed) return step.fail("check-package: the package omits a file consumers need", .{});
 }
 
 /// `zig build check-scripts-doc` — every file in `scripts/` must be named in
