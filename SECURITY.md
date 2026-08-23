@@ -3,8 +3,10 @@
 ## Supported versions
 
 zig-libs is pre-1.0; only the `main` branch is supported. Fixes land on
-`main` — there are no backported release branches yet. Pin a commit if you
-need a stable point.
+`main` — there are no backported release branches yet. For a stable point, pin
+a dated release **tag**, not a bare commit: a tag asserts that every module
+cleared every lane at that commit, and a bare commit asserts nothing. See
+README's *Versioning & stability*, which this page used to contradict.
 
 ## Reporting a vulnerability
 
