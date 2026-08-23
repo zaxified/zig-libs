@@ -60,6 +60,63 @@ const usage_text =
     \\
 ;
 
+/// Build a tree whose byte total is known by construction, walk it, and check
+/// the module agrees. The sizes are arithmetic a reader can redo, not a number
+/// copied back out of a previous run.
+fn selfDemo(io: std.Io, gpa: Allocator) !u8 {
+    const base = ".zig-cache/diskusage-demo";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, base) catch {};
+    defer cwd.deleteTree(io, base) catch {};
+    try cwd.createDirPath(io, base ++ "/sub/deep");
+
+    const files = [_]struct { path: []const u8, len: usize }{
+        .{ .path = "a.bin", .len = 1000 },
+        .{ .path = "sub/b.bin", .len = 2000 },
+        .{ .path = "sub/deep/c.bin", .len = 3000 },
+    };
+    var apparent_total: u64 = 0;
+    for (files) |f| {
+        const blob = try gpa.alloc(u8, f.len);
+        defer gpa.free(blob);
+        @memset(blob, 'x');
+        const full = try std.fmt.allocPrint(gpa, base ++ "/{s}", .{f.path});
+        defer gpa.free(full);
+        try cwd.writeFile(io, .{ .sub_path = full, .data = blob });
+        apparent_total += f.len;
+    }
+
+    const report = try diskusage.scanPath(gpa, io, base, .{});
+
+    if (report.total.apparent_bytes != apparent_total) {
+        std.debug.print(
+            "diskusage-demo: apparent total {d}, expected {d}\n",
+            .{ report.total.apparent_bytes, apparent_total },
+        );
+        return error.ApparentTotalMismatch;
+    }
+    if (report.regular_files != files.len) {
+        std.debug.print(
+            "diskusage-demo: counted {d} regular files, expected {d}\n",
+            .{ report.regular_files, files.len },
+        );
+        return error.FileCountMismatch;
+    }
+    // Real allocation is the filesystem's business -- block size and tail
+    // packing -- so it is not pinned to a number. But 6000 bytes of written
+    // data cannot occupy zero blocks, and on any real filesystem it occupies
+    // at least as much as it apparently is only by coincidence, so the one
+    // safe assertion is that something was allocated.
+    if (report.total.allocated_bytes == 0) return error.AllocatedBytesZero;
+
+    std.debug.print(
+        "diskusage-demo: {d} files, {d} apparent bytes, {d} allocated -- totals check out\n" ++
+            "run with a path to use it as du(1); --help for options\n",
+        .{ report.regular_files, report.total.apparent_bytes, report.total.allocated_bytes },
+    );
+    return 0;
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     // A DebugAllocator that panics on leak makes the example a leak detector
     // for the module's ownership contract (CONVENTIONS.md §7.2).
@@ -83,13 +140,22 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return 0;
     }
 
+    // No path given -> demonstrate and CHECK, rather than walking the current
+    // directory. Defaulting to `.` is right for `du` and wrong for an example:
+    // it printed six thousand lines whose content depended on the state of
+    // this repository's build caches, and asserted nothing, so it agreed with
+    // any answer the module gave. `zig build run-examples` runs every example
+    // in the collection, and a gate cannot be built out of output like that.
+    // Named paths still behave exactly like `du`.
+    if (opts.n_paths == 0) return selfDemo(io, gpa);
+
     var out_buf: [16 * 1024]u8 = undefined;
     var out_w = std.Io.File.stdout().writer(io, &out_buf);
     const out = &out_w.interface;
 
     var any_error = false;
     var i: usize = 0;
-    const paths = if (opts.n_paths == 0) &[_][]const u8{"."} else opts.paths[0..opts.n_paths];
+    const paths = opts.paths[0..opts.n_paths];
     while (i < paths.len) : (i += 1) {
         if (try runOne(gpa, io, out, paths[i], opts)) any_error = true;
     }

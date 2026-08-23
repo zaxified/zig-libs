@@ -59,6 +59,8 @@ const usage_text =
     \\smtp-demo — an SMTP client demo for the `smtp` module, with a prop server.
     \\
     \\usage:
+    \\  smtp-demo                self-demo: real client + prop server, one
+    \\                           process, loopback only, asserted (no args)
     \\  smtp-demo server [options]
     \\  smtp-demo client [options]
     \\
@@ -106,10 +108,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     _ = args.skip(); // argv[0]
 
-    const mode = args.next() orelse {
-        std.debug.print("{s}", .{usage_text});
-        return local_failure_exit;
-    };
+    const mode = args.next() orelse return runSelfDemo(gpa, io);
 
     if (std.mem.eql(u8, mode, "server")) return runServer(gpa, io, &args);
     if (std.mem.eql(u8, mode, "client")) return runClient(gpa, io, &args);
@@ -120,6 +119,161 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     std.debug.print("smtp-demo: unknown mode '{s}' (expected `server` or `client`)\n\n{s}", .{ mode, usage_text });
     return local_failure_exit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// self-demo (no arguments): the real client against the prop server, one
+// process, every interesting value asserted
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Same `SocketTransport` seam, same prop server, same message `client` mode
+// sends — see the file comment for what the prop server genuinely exercises
+// (transport, framing, the pipelined group, the DATA terminator) versus what
+// it fakes (there is no real mailbox; only the STARTTLS/AUTH/RCPT machinery
+// is real). The prop server runs as a concurrent task on an ephemeral port;
+// the main task drives `smtp.Client` through the same handshake, send and
+// bounce that `client` mode does, asserting each step instead of only
+// printing it.
+
+/// Accept exactly one connection and serve it with the prop server's command
+/// loop, then return. Split out so the self-demo can run it as a concurrent
+/// task against a listener it bound itself (ephemeral port).
+fn acceptOneConnection(gpa: std.mem.Allocator, io: std.Io, listener: *std.Io.net.Server, opts: ServerOptions) !u8 {
+    var stream = try listener.accept(io);
+    serveConnection(gpa, io, opts, &stream);
+    stream.close(io);
+    return 0;
+}
+
+fn runSelfDemo(gpa: std.mem.Allocator, io: std.Io) !u8 {
+    const bind_addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var listener = bind_addr.listen(io, .{}) catch |err| {
+        std.debug.print("smtp-demo self-demo: cannot listen on 127.0.0.1:0: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    const server_opts: ServerOptions = .{
+        .listen = "127.0.0.1",
+        .port = port,
+        .reject = default_reject,
+        .starttls = true,
+        .inject = false,
+        .once = true,
+    };
+    var accept_fut = io.concurrent(acceptOneConnection, .{ gpa, io, &listener, server_opts }) catch |err| {
+        std.debug.print("smtp-demo self-demo: no concurrency available ({t}); cannot self-demo\n", .{err});
+        return local_failure_exit;
+    };
+    // Idempotent (`Future.await`/`cancel` doc comment): runs on every exit
+    // path, including an early `return` below, and costs nothing if the
+    // explicit `await` near the end already ran.
+    defer _ = accept_fut.cancel(io) catch @as(u8, 0);
+
+    const connect_addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    var stream = connect_addr.connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("smtp-demo self-demo: cannot connect to 127.0.0.1:{d}: {t}\n", .{ port, err });
+        return local_failure_exit;
+    };
+    defer stream.close(io);
+
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    var sock: SocketTransport = .{ .io = io, .reader = &sr, .writer = &sw };
+
+    std.debug.print("smtp-demo self-demo: connected to an in-process prop server at 127.0.0.1:{d}\n\n", .{port});
+
+    var client = try smtp.Client.init(gpa, sock.transport(), .{
+        .session = .{
+            .ehlo_domain = "reports.example.org",
+            .tls = .required,
+            .credentials = .{ .username = "reports@example.org", .password = "s3cret" },
+        },
+        .tls = .{ .ctx = &sock, .upgrade = SocketTransport.upgrade },
+    });
+    defer client.deinit();
+
+    std.debug.print("[1] greeting, EHLO, STARTTLS, second EHLO, AUTH\n", .{});
+    try client.connect();
+
+    // The pre-STARTTLS capability list was discarded (RFC 3207 §4.2); this
+    // one, from the post-handshake EHLO, is what a real send relies on.
+    const caps = client.serverCapabilities();
+    if (!caps.pipelining) @panic("smtp-demo self-demo: expected PIPELINING advertised");
+    if (!caps.eightbitmime) @panic("smtp-demo self-demo: expected 8BITMIME advertised");
+    if (!caps.auth.plain) @panic("smtp-demo self-demo: expected AUTH PLAIN advertised post-STARTTLS");
+
+    const msg: smtp.Message = .{
+        .from = .{ .name = "Nightly Reports", .addr = "reports@example.org" },
+        .to = &.{
+            .{ .name = "Ops", .addr = "ops@example.net" },
+            .{ .addr = "archive@example.net" },
+        },
+        .subject = "Latency report, 2026-08-21",
+        .date = .{ .unix = 1_787_270_400, .offset_minutes = 120 }, // 2026-08-21T00:00Z, rendered +0200
+        .body = .{ .multipart = .{
+            .subtype = .mixed,
+            .parts = &.{
+                .{ .text = .{ .body = "Two edges over the 30 ms budget. Details attached.\r\n" } },
+                .{ .attachment = .{
+                    .filename = "latency-2026-08-21.csv",
+                    .content_type = "text/csv",
+                    .data = report_csv,
+                } },
+            },
+        } },
+    };
+    // A fixed seed keeps this reproducible; the real CSPRNG choice belongs
+    // to a real sender, same caveat as `client` mode.
+    var prng: std.Random.DefaultPrng = .init(0x5EED_1234);
+
+    std.debug.print("\n[2] MAIL FROM / RCPT TO x2 / DATA\n", .{});
+    const doc = try client.sendMessage(msg, prng.random(), .{}, .{
+        .to = &.{ "ops@example.net", "archive@example.net" },
+    });
+    defer gpa.free(doc);
+    if (doc.len == 0) @panic("smtp-demo self-demo: expected a non-empty rendered RFC 5322 document");
+
+    // The bounce is the point: a partly-accepted transaction, asserted
+    // per-recipient rather than just counted.
+    var ops_accepted = false;
+    var archive_bounced = false;
+    for (client.recipients()) |r| {
+        if (std.mem.eql(u8, r.addr, "ops@example.net")) {
+            if (!r.accepted) @panic("smtp-demo self-demo: expected ops@example.net to be accepted");
+            ops_accepted = true;
+        } else if (std.mem.eql(u8, r.addr, "archive@example.net")) {
+            if (r.accepted) @panic("smtp-demo self-demo: expected archive@example.net to bounce (it is the prop's --reject default)");
+            if (r.code != 550) @panic("smtp-demo self-demo: expected a 550 bounce code for archive@example.net");
+            archive_bounced = true;
+        }
+    }
+    if (!ops_accepted or !archive_bounced) @panic("smtp-demo self-demo: recipient outcomes did not match either expectation");
+
+    std.debug.print("\n[3] QUIT\n", .{});
+    try client.quit();
+    if (client.state() != .closed) @panic("smtp-demo self-demo: expected state .closed after QUIT");
+
+    const accept_result = accept_fut.await(io) catch |err| {
+        std.debug.print("smtp-demo self-demo: server task ended abnormally: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    if (accept_result != 0) @panic("smtp-demo self-demo: server task reported failure");
+
+    std.debug.print(
+        "\nsmtp-demo self-demo: OK\n" ++
+            "  real smtp.Client against the prop server (real transport, framing,\n" ++
+            "  pipelined group and DATA terminator; canned relay policy), both in\n" ++
+            "  this process, over 127.0.0.1 -- EHLO/STARTTLS/AUTH, a multipart send\n" ++
+            "  to two recipients with one bounce, and QUIT were all asserted above.\n" ++
+            "  no real network, no root, no external daemon.\n" ++
+            "  see --help for the server/client subcommands this binary also offers.\n",
+        .{},
+    );
+    return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

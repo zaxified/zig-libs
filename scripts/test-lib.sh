@@ -377,6 +377,26 @@ step() {
         return 0
     fi
 
+    if [[ $rc -eq 0 && -n "${ZL_STEP_STDERR_IS_OUTPUT:-}" ]]; then
+        # This step runs PROGRAMS, not checkers, and their normal narration
+        # goes to stderr -- `std.debug.print` writes there, which is what all
+        # 230 examples use. The rule below exists to catch a checker that
+        # reports success while complaining; a program that says what it
+        # proved is not that. Its exit status still decides.
+        #
+        # ⚠ Set this ONLY where stderr is the step's ordinary output channel.
+        # Four defects of the exit-0-and-complains shape are why the rule is
+        # there, and `check-uapi` sat unwired for months because its summary
+        # went to stderr and it therefore could not pass.
+        local dots_n=$(( _ZL_OK_COL - 5 - ${#label} ))
+        (( dots_n < 3 )) && dots_n=3
+        local dots
+        dots=$(printf '.%.0s' $(seq 1 $dots_n))
+        printf '  %s %s OK %6ss\n' "$label" "$dots" "$dur"
+        rm -f "$out" "$err"
+        return 0
+    fi
+
     if [[ $rc -eq 0 ]]; then
         # Exit 0 but stderr wrote something — treat as a failure so it can
         # never pass silently in CI or a work loop.

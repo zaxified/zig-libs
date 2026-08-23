@@ -386,6 +386,16 @@ pub fn build(b: *std.Build) void {
     // covers that no test in this repository can.
     const check_examples = b.step("check-examples", "Build each module's example as an outside consumer would");
 
+    // `run-examples` — the same set, LINKED AND RUN. Compiling an example
+    // cannot see the class of defect examples exist to find: on 2026-08-23 a
+    // single sweep of this step found a dangling stack slice in `btcp2p`
+    // (whose own tests passed because they read the slice in the same
+    // expression), a leak in `ethfrag`, a wrong-tag union read in `iec104`,
+    // and twelve examples that had never run at all. It is a separate step
+    // from `check-examples` only because it costs a link plus a process per
+    // module; both are wired into the full lane.
+    const run_examples = b.step("run-examples", "Build AND run every module's example");
+
     // CONVENTIONS.md 7.2: a module over either trigger must have an example.
     // This used to also reconcile a `.example` bool in `module_list` against
     // the tree -- a declaration that could drift, and did: eight example files
@@ -582,6 +592,7 @@ pub fn build(b: *std.Build) void {
             // that would drift the way `.example` did.
             const run_example = b.addRunArtifact(example);
             b.step(b.fmt("run-example-{s}", .{m.name}), b.fmt("Build AND run the {s} example", .{m.name})).dependOn(&run_example.step);
+            run_examples.dependOn(&run_example.step);
         }
     }
 

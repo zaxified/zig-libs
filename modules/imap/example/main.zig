@@ -53,6 +53,8 @@ const usage_text =
     \\imap-demo — an IMAP4rev2 client demo for the `imap` module, with a prop server.
     \\
     \\usage:
+    \\  imap-demo                self-demo: real client + prop server, one
+    \\                           process, loopback only, asserted (no args)
     \\  imap-demo server [options]
     \\  imap-demo client [options]
     \\
@@ -107,10 +109,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     _ = args.skip(); // argv[0]
 
-    const mode = args.next() orelse {
-        std.debug.print("{s}", .{usage_text});
-        return local_failure_exit;
-    };
+    const mode = args.next() orelse return runSelfDemo(gpa, io);
 
     if (std.mem.eql(u8, mode, "server")) return runServer(io, &args);
     if (std.mem.eql(u8, mode, "client")) return runClient(gpa, io, &args);
@@ -121,6 +120,160 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     std.debug.print("imap-demo: unknown mode '{s}' (expected `server` or `client`)\n\n{s}", .{ mode, usage_text });
     return local_failure_exit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// self-demo (no arguments): the real client against the prop server, one
+// process, every interesting value asserted
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The prop server IS the fixture peer the module doc talks about: real
+// framing, real tag matching, real per-state refusals, over a real loopback
+// socket — only the mailbox CONTENTS are canned (RFC 9051's own examples;
+// see the file comment). It runs as a concurrent task on an ephemeral port;
+// the main task drives `imap.Client` through the exact sequence `client`
+// mode does, asserting each step instead of only printing it.
+
+/// Accept exactly one connection and serve it with the prop server's command
+/// loop, then return. Split out so the self-demo can run it as a concurrent
+/// task against a listener it bound itself (ephemeral port).
+fn acceptOneConnection(io: std.Io, listener: *std.Io.net.Server, opts: ServerOptions) !u8 {
+    var stream = try listener.accept(io);
+    serveConnection(io, opts, &stream);
+    stream.close(io);
+    return 0;
+}
+
+fn runSelfDemo(gpa: std.mem.Allocator, io: std.Io) !u8 {
+    const bind_addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var listener = bind_addr.listen(io, .{}) catch |err| {
+        std.debug.print("imap-demo self-demo: cannot listen on 127.0.0.1:0: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    const server_opts: ServerOptions = .{ .listen = "127.0.0.1", .port = port, .starttls = true, .inject = false, .once = true };
+    var accept_fut = io.concurrent(acceptOneConnection, .{ io, &listener, server_opts }) catch |err| {
+        std.debug.print("imap-demo self-demo: no concurrency available ({t}); cannot self-demo\n", .{err});
+        return local_failure_exit;
+    };
+    // Idempotent (`Future.await`/`cancel` doc comment): runs on every exit
+    // path, including an early `return` below, and costs nothing if the
+    // explicit `await` near the end already ran.
+    defer _ = accept_fut.cancel(io) catch @as(u8, 0);
+
+    const connect_addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    var stream = connect_addr.connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("imap-demo self-demo: cannot connect to 127.0.0.1:{d}: {t}\n", .{ port, err });
+        return local_failure_exit;
+    };
+    defer stream.close(io);
+
+    var rbuf: [16384]u8 = undefined;
+    var wbuf: [16384]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+    defer std.crypto.secureZero(u8, &wbuf);
+
+    var c = imap.Client.init(gpa, &sr.interface, &sw.interface, .{
+        .on_unilateral = onUnilateral,
+        .allow_plaintext_auth = false,
+    });
+    defer c.deinit();
+
+    std.debug.print("imap-demo self-demo: connected to an in-process prop server at 127.0.0.1:{d}\n\n", .{port});
+
+    std.debug.print("[1] greeting\n", .{});
+    const greeting = try c.greet();
+    if (greeting.status != .ok) @panic("imap-demo self-demo: greeting status was not OK");
+    if (!c.hasCap("STARTTLS")) @panic("imap-demo self-demo: expected STARTTLS advertised pre-TLS");
+    if (!c.hasCap("LOGINDISABLED")) @panic("imap-demo self-demo: expected LOGINDISABLED advertised pre-TLS");
+
+    // The refusal that never reaches the wire: a password over cleartext.
+    // The prop server advertises LOGINDISABLED, so the module's own
+    // capability check fires before the (also-refused) plaintext check does.
+    std.debug.print("\n[2] LOGIN before any encryption — must be refused locally\n", .{});
+    if (c.login("gray", "hunter2")) |_| {
+        @panic("imap-demo self-demo: plaintext LOGIN was unexpectedly accepted");
+    } else |err| switch (err) {
+        error.LoginDisabled => {},
+        else => {
+            std.debug.print("    unexpected error: {s}\n", .{describe(err)});
+            return local_failure_exit;
+        },
+    }
+
+    std.debug.print("\n[3] STARTTLS\n", .{});
+    _ = try c.startTls();
+    // ⚠ No handshake performed — see the file comment. Still asserted:
+    // `tlsEstablished` must accept the same plaintext streams handed back.
+    _ = try c.tlsEstablished(&sr.interface, &sw.interface);
+    if (c.hasCap("LOGINDISABLED")) @panic("imap-demo self-demo: LOGINDISABLED should be gone from the post-STARTTLS list");
+    if (!c.hasCap("AUTH=PLAIN")) @panic("imap-demo self-demo: expected AUTH=PLAIN post-STARTTLS");
+
+    std.debug.print("\n[4] LOGIN\n", .{});
+    _ = try c.login("gray", "hunter2");
+    if (c.state != .authenticated) @panic("imap-demo self-demo: expected state .authenticated after LOGIN");
+
+    std.debug.print("\n[5] SELECT INBOX\n", .{});
+    _ = try c.select("INBOX", false);
+    if (c.mailbox.exists != 3) @panic("imap-demo self-demo: expected 3 EXISTS");
+    if (c.mailbox.uid_validity != 3857529045) @panic("imap-demo self-demo: UIDVALIDITY mismatch");
+    if (c.mailbox.uid_next != 4392) @panic("imap-demo self-demo: UIDNEXT mismatch");
+    if (c.mailbox.read_only) @panic("imap-demo self-demo: expected read-write SELECT");
+
+    var results = std.heap.ArenaAllocator.init(gpa);
+    defer results.deinit();
+
+    std.debug.print("\n[6] SEARCH NOT SEEN\n", .{});
+    const unseen = try c.searchMessages(results.allocator(), false, .{}, &.{ .not_flag = &.{"\\Seen"} });
+    if (unseen.numbers.len != 2 or unseen.numbers[0] != 2 or unseen.numbers[1] != 3) {
+        @panic("imap-demo self-demo: expected SEARCH to report messages 2 and 3");
+    }
+
+    std.debug.print("\n[7] FETCH 2,3 (UID ENVELOPE RFC822.SIZE)\n", .{});
+    const msgs = try c.fetchMessages(results.allocator(), "2,3", false, .{
+        .uid = true,
+        .envelope = true,
+        .rfc822_size = true,
+    });
+    if (msgs.len != 2) @panic("imap-demo self-demo: expected 2 FETCH results");
+    var saw_summary = false;
+    var saw_reply = false;
+    for (msgs) |m| {
+        const env = switch (m.find(.envelope) orelse continue) {
+            .envelope => |e| e,
+            else => continue,
+        };
+        const subject = env.subject orelse continue;
+        if (std.mem.eql(u8, subject, "IMAP4rev2 WG mtg summary and minutes")) saw_summary = true;
+        if (std.mem.eql(u8, subject, "Re: minutes")) saw_reply = true;
+        std.debug.print("    #{d} uid={?d} \"{s}\"\n", .{ m.seq, m.uid(), subject });
+    }
+    if (!saw_summary or !saw_reply) @panic("imap-demo self-demo: RFC 9051 example envelopes not found in FETCH results");
+
+    std.debug.print("\n[8] LOGOUT\n", .{});
+    try c.logout();
+    if (c.state != .logout) @panic("imap-demo self-demo: expected state .logout after LOGOUT");
+
+    const accept_result = accept_fut.await(io) catch |err| {
+        std.debug.print("imap-demo self-demo: server task ended abnormally: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    if (accept_result != 0) @panic("imap-demo self-demo: server task reported failure");
+
+    std.debug.print(
+        "\nimap-demo self-demo: OK\n" ++
+            "  real imap.Client against the prop server (real framing, tags, state\n" ++
+            "  and refusals; canned mailbox contents), both in this process, over\n" ++
+            "  127.0.0.1 -- greeting, the pre-TLS LOGIN refusal, STARTTLS, LOGIN,\n" ++
+            "  SELECT, SEARCH and FETCH were all asserted above.\n" ++
+            "  no real network, no root, no external daemon.\n" ++
+            "  see --help for the server/client subcommands this binary also offers.\n",
+        .{},
+    );
+    return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

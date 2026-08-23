@@ -73,6 +73,8 @@ const usage_text =
     \\http-demo — an HTTP/1.1 + h2c client/server demo for the `http` module.
     \\
     \\usage:
+    \\  http-demo                       self-demo: real server + real client,
+    \\                                  loopback only, asserted (no args needed)
     \\  http-demo server [options]
     \\  http-demo client <url> [options]
     \\
@@ -135,10 +137,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     _ = args.skip(); // argv[0]
 
-    const mode = args.next() orelse {
-        std.debug.print("{s}", .{usage_text});
-        return local_failure_exit;
-    };
+    const mode = args.next() orelse return runSelfDemo(gpa, io);
 
     if (std.mem.eql(u8, mode, "server")) return runServer(gpa, io, &args);
     if (std.mem.eql(u8, mode, "client")) return runClient(gpa, io, &args);
@@ -149,6 +148,144 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     std.debug.print("http-demo: unknown mode '{s}' (expected `server` or `client`)\n\n{s}", .{ mode, usage_text });
     return local_failure_exit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// self-demo (no arguments): a real server and a real client, one process,
+// loopback only, every interesting value asserted
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Reuses the SAME handler (`handle`) that `server` mode serves, and the SAME
+// `http.Client` that `client` mode uses — this is not a separate fixture, it
+// is the module's server and the module's client, wired to each other. The
+// server's accept loop runs as a concurrent task on `io` (`Server.shutdown`
+// is documented safe from another task); the main task drives two requests
+// over one pooled keep-alive connection, and `--once` on the server means
+// that connection closing is what ends the accept loop.
+
+fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
+    var state: ServerState = .{
+        .io = io,
+        .verbose = false,
+        .h2c = false,
+        .once = true, // one connection served, then the accept loop returns
+    };
+    var server: http.Server = .init(io, gpa, .{
+        .handler = handle,
+        .context = state.context(),
+        .addr = "127.0.0.1",
+        .port = 0, // ephemeral: Server.boundAddress() reports what the kernel picked
+        .max_body_bytes = 64 << 20,
+        .server_name = "http-demo/1.0 (zig-libs-http self-demo)",
+        .on_conn_state = onConnState,
+        .on_conn_state_ctx = state.context(),
+    });
+    defer server.deinit();
+    state.server = &server;
+
+    server.bind() catch |err| {
+        std.debug.print("http-demo self-demo: cannot bind 127.0.0.1:0: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    const port = server.boundAddress().getPort();
+
+    var serve_fut = io.concurrent(http.Server.serve, .{&server}) catch |err| {
+        std.debug.print("http-demo self-demo: no concurrency available ({t}); cannot self-demo\n", .{err});
+        return local_failure_exit;
+    };
+    // `Server.deinit` above may only run after `serve` has returned. This
+    // defer, declared AFTER `defer server.deinit()`, runs BEFORE it on every
+    // exit path (including an early `return` below) — `shutdown` wakes the
+    // accept loop and `await` is documented idempotent, so calling it again
+    // explicitly on the success path below (to surface a real failure) costs
+    // nothing here.
+    defer {
+        server.shutdown();
+        serve_fut.await(io) catch {};
+    }
+
+    var client: http.Client = .init(io, gpa, .{ .user_agent = "http-demo-selfdemo/1.0" });
+    // Closing the client's pooled connection is what makes the SECOND
+    // request's connection close observable to the server if the handler
+    // itself has not already done so — see the /truncate request below.
+    var client_closed = false;
+    defer if (!client_closed) client.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const hello_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello?name=selfdemo", .{port}) catch unreachable;
+
+    // ── request 1: GET /hello — the positive path, every field asserted ────
+    var res = client.request(.get, hello_url, .{}) catch |err| {
+        std.debug.print("http-demo self-demo: GET /hello failed: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    if (res.status != 200) @panic("http-demo self-demo: /hello did not answer 200");
+    const content_type = res.header("content-type") orelse @panic("http-demo self-demo: /hello has no content-type");
+    if (!std.mem.eql(u8, content_type, "text/plain; charset=utf-8")) {
+        @panic("http-demo self-demo: /hello content-type mismatch");
+    }
+    const route_header = res.header("x-demo-route") orelse @panic("http-demo self-demo: /hello missing X-Demo-Route");
+    if (!std.mem.eql(u8, route_header, "/hello")) @panic("http-demo self-demo: X-Demo-Route mismatch");
+    const body = res.readAllAlloc(gpa, 8 << 20) catch |err| {
+        std.debug.print("http-demo self-demo: reading /hello body failed: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    defer gpa.free(body);
+    res.deinit();
+    if (!std.mem.startsWith(u8, body, "hello, GET /hello?name=selfdemo\n")) @panic("http-demo self-demo: /hello body prefix mismatch");
+    if (std.mem.indexOf(u8, body, "query:      name=selfdemo\n") == null) {
+        @panic("http-demo self-demo: /hello did not echo the query string");
+    }
+
+    // ── request 2: GET /truncate — the negative path. The handler declares a
+    // Content-Length it never honours and then fails (see `serveTruncate`);
+    // the head is already on the wire, so the module cannot turn this into a
+    // clean error status — it closes the connection instead. A client that
+    // read this as a clean EOF would silently accept a truncated body, so
+    // `readAllAlloc` FAILING here is the assertion, not an accident. This
+    // request rides the SAME pooled connection as request 1 (both to the
+    // same host:port), and the server closing it is what makes `--once`'s
+    // "one connection served" true and ends the accept loop below. ────────
+    var trunc_url_buf: [64]u8 = undefined;
+    const trunc_url = std.fmt.bufPrint(&trunc_url_buf, "http://127.0.0.1:{d}/truncate", .{port}) catch unreachable;
+    var res2 = client.request(.get, trunc_url, .{}) catch |err| {
+        std.debug.print("http-demo self-demo: opening /truncate failed: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    if (res2.status != 200) @panic("http-demo self-demo: /truncate did not answer 200 before truncating");
+    const trunc_body_result = res2.readAllAlloc(gpa, 8 << 20);
+    if (trunc_body_result) |b| {
+        gpa.free(b);
+        @panic("http-demo self-demo: /truncate's lying Content-Length was not caught — the body read must fail");
+    } else |_| {
+        // Any error is the point: the connection died mid-body against a
+        // declared length. `readFailure()` (see the client demo's
+        // cancellation section) names the precise cause when the caller
+        // needs it; here the FAILURE itself is what is being proven.
+    }
+    res2.deinit();
+
+    client.deinit();
+    client_closed = true;
+
+    server.shutdown();
+    serve_fut.await(io) catch |err| {
+        std.debug.print("http-demo self-demo: server accept loop ended abnormally: {t}\n", .{err});
+        return local_failure_exit;
+    };
+
+    std.debug.print(
+        "http-demo self-demo: OK\n" ++
+            "  real http.Server + real http.Client, one process, over 127.0.0.1:{d}.\n" ++
+            "  GET /hello?name=selfdemo -> 200, content-type asserted, X-Demo-Route\n" ++
+            "  asserted, body prefix and echoed query asserted.\n" ++
+            "  GET /truncate -> 200 head, then the body read FAILED as asserted (the\n" ++
+            "  handler's lying Content-Length, caught rather than silently truncated).\n" ++
+            "  no TLS, no real network beyond loopback.\n" ++
+            "  see --help for the server/client subcommands this binary also offers.\n",
+        .{port},
+    );
+    return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

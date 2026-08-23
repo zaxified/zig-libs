@@ -455,6 +455,20 @@ run_modules() {
         local -a targets=()
         for m in "${rest[@]}"; do targets+=("test-$m"); done
         step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+
+        # RUN the affected modules' examples too. `check-examples` above only
+        # compiles, and compiling cannot see the class an example exists to
+        # catch -- a dangling slice, a leak, a wrong-tag union read. The full
+        # lane runs all 230 in about two minutes; here it is only the modules
+        # this change can reach, so the dev loop keeps its speed and a broken
+        # example is caught now rather than at tag time.
+        local -a run_targets=()
+        for m in "${rest[@]}"; do
+            [[ -f "modules/$m/example/main.zig" ]] && run_targets+=("run-example-$m")
+        done
+        if [[ ${#run_targets[@]} -gt 0 ]]; then
+            ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples (${#run_targets[@]} modules)" zig build "${run_targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
+        fi
     fi
 
     if [[ ${#netns[@]} -gt 0 ]]; then
@@ -1163,6 +1177,13 @@ cmd_changed() {
     # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
     # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
     step "check-examples" zig build check-examples
+    # And RUN them. Compiling an example cannot see what examples are for: one
+    # sweep of this step on 2026-08-23 found a dangling stack slice in
+    # `btcp2p` whose own tests passed (they read the slice in the same
+    # expression, before the stack slot was reused), a leak in `ethfrag`, a
+    # wrong-tag union read in `iec104`, and twelve examples that had never run
+    # at all. ~2 minutes for all 230; only the full lane pays it.
+    ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples" zig build run-examples
 
     # `modules/http/sizeprobe/` proves requestPlain/requestStreamingPlain/
     # putFilePlain never pull in TLS (CONVENTIONS.md-adjacent doc on
@@ -1279,6 +1300,9 @@ cmd_all() {
     # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
     # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
     step "check-examples" zig build check-examples
+    # See cmd_all's comment on this one: compiling an example is not what
+    # examples are for, and a tag is exactly where that must not be assumed.
+    ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples" zig build run-examples
     # See cmd_changed's comment on this same step for what it checks.
     step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone

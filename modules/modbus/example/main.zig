@@ -109,10 +109,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     _ = args.skip(); // argv[0]
 
-    const mode = args.next() orelse {
-        std.debug.print("{s}", .{usage_text});
-        return local_failure_exit;
-    };
+    const mode = args.next() orelse return runSelfDemo(io);
 
     if (std.mem.eql(u8, mode, "server")) return runServer(io, &args);
     if (std.mem.eql(u8, mode, "client")) return runClient(io, &args);
@@ -123,6 +120,109 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     std.debug.print("modbus-demo: unknown mode '{s}' (expected `server` or `client`)\n\n{s}", .{ mode, usage_text });
     return local_failure_exit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// no arguments — self-demo
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Everything `server`/`client` show, folded into one process: a server thread
+// listens on an EPHEMERAL loopback port (`:0`, so this can never collide with
+// a real slave someone left running) and a client on the calling thread reads
+// and writes it, asserting every value that comes back. `std.Io.Threaded` is
+// documented "Thread-safe", so the SAME `io` drives both sides — the socket
+// handle is the only thing crossing the thread boundary, and `serveConnection`
+// below (the same one `server` mode uses) is reused as-is.
+
+fn runSelfDemo(io: std.Io) !u8 {
+    var coils = initialCoils();
+    var discrete_inputs = initialDiscreteInputs();
+    var holding_registers = initialHoldingRegisters();
+    var input_registers = initialInputRegisters();
+
+    const db: modbus.server.DataBank = .{
+        .coils = .{ .base = 0, .values = &coils },
+        .discrete_inputs = .{ .base = 0, .values = &discrete_inputs },
+        .holding_registers = .{ .base = 0, .values = &holding_registers },
+        .input_registers = .{ .base = 0, .values = &input_registers },
+    };
+    var server: modbus.server.Server = .init(.{ .unit_id = 1, .framing = .tcp }, db);
+
+    const listen_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try listen_addr.listen(io, .{});
+    defer listener.deinit(io);
+    // `:0` resolves to the real port only once bound — `Socket.address` is
+    // where that resolution lands (net.zig: "Contains the resolved ephemeral
+    // port number if requested").
+    const port = listener.socket.address.getPort();
+
+    const thread = try std.Thread.spawn(.{}, selfDemoServerThread, .{ io, &server, &listener });
+    defer thread.join();
+
+    const connect_addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var tcp = try modbus.TcpTransport.connect(io, connect_addr);
+    defer tcp.close();
+    var client: modbus.Client = .init(.tcp, tcp.transport());
+
+    std.debug.print("modbus-demo: self-demo — server and client in one process, loopback port {d}\n", .{port});
+
+    // 1. Read all four areas and assert every value against the fixtures that
+    // seeded the data bank — the same values `server` mode prints, now
+    // checked rather than eyeballed.
+    var coils_out: [area_len]bool = undefined;
+    try client.readCoils(1, 0, &coils_out);
+    if (!std.mem.eql(bool, &coils_out, &initialCoils())) @panic("FC 01 coils did not match the seeded data bank");
+
+    var discrete_out: [area_len]bool = undefined;
+    try client.readDiscreteInputs(1, 0, &discrete_out);
+    if (!std.mem.eql(bool, &discrete_out, &initialDiscreteInputs())) @panic("FC 02 discrete inputs did not match the seeded data bank");
+
+    var holding_out: [area_len]u16 = undefined;
+    try client.readHoldingRegisters(1, 0, &holding_out);
+    if (!std.mem.eql(u16, &holding_out, &initialHoldingRegisters())) @panic("FC 03 holding registers did not match the seeded data bank");
+
+    var input_out: [area_len]u16 = undefined;
+    try client.readInputRegisters(1, 0, &input_out);
+    if (!std.mem.eql(u16, &input_out, &initialInputRegisters())) @panic("FC 04 input registers did not match the seeded data bank");
+    std.debug.print("[1] all four areas read back exactly as seeded\n", .{});
+
+    // 2. Write a coil and a register, and prove the write landed by reading
+    // it back through a SEPARATE request — an echoed reply alone would not
+    // prove the data bank changed (see writeAndReadBack's doc comment above).
+    try client.writeSingleCoil(1, 1, true);
+    try client.readCoils(1, 0, &coils_out);
+    if (!coils_out[1]) @panic("FC 05 write single coil did not take effect");
+
+    try client.writeSingleRegister(1, 2, 0xBEEF);
+    var reg_back: [1]u16 = undefined;
+    try client.readHoldingRegisters(1, 2, &reg_back);
+    if (reg_back[0] != 0xBEEF) @panic("FC 06 write single register did not take effect");
+    std.debug.print("[2] coil {d} write and register {d} write both confirmed by a fresh read\n", .{ 1, 2 });
+
+    // 3. The exception path: an address outside every configured window MUST
+    // come back as a named protocol exception, not a silent wrong answer.
+    var oob: [1]u16 = undefined;
+    if (client.readHoldingRegisters(1, out_of_window_addr, &oob)) |_| {
+        @panic("FC 03 at an out-of-window address was answered instead of raising IllegalDataAddress");
+    } else |err| {
+        if (err != error.IllegalDataAddress) return err;
+    }
+    std.debug.print("[3] a read outside every window correctly raised EXCEPTION IllegalDataAddress\n", .{});
+
+    std.debug.print("modbus-demo: self-demo passed — see `modbus-demo server`/`client` for the full walkthrough\n", .{});
+    return 0;
+}
+
+/// One accepted connection, served with the exact same loop `server` mode
+/// uses. Returns when the client closes its side (the normal ending) or on
+/// any I/O error — either way there is nothing further for this thread to do.
+fn selfDemoServerThread(io: std.Io, server: *modbus.server.Server, listener: *std.Io.net.Server) void {
+    var stream = listener.accept(io) catch |err| {
+        std.debug.print("modbus-demo: self-demo: accept failed: {t}\n", .{err});
+        return;
+    };
+    serveConnection(io, server, &stream);
+    stream.close(io);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -70,6 +70,8 @@ const usage_text =
     \\snmp-demo — an SNMP v2c manager/agent demo for the `snmp` module.
     \\
     \\usage:
+    \\  snmp-demo                   self-demo: agent + manager, one process,
+    \\                              loopback only, asserted (no args needed)
     \\  snmp-demo agent   [options]
     \\  snmp-demo manager [options]
     \\
@@ -120,10 +122,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     _ = args.skip(); // argv[0]
 
-    const mode = args.next() orelse {
-        std.debug.print("{s}", .{usage_text});
-        return local_failure_exit;
-    };
+    const mode = args.next() orelse return runSelfDemo(io);
 
     if (std.mem.eql(u8, mode, "agent")) return runAgent(io, &args);
     if (std.mem.eql(u8, mode, "manager")) return runManager(io, &args);
@@ -159,6 +158,87 @@ const mib = [_]MibEntry{
     // the way a write-only object does; writing it emits the notification.
     .{ .oid = test_notify_oid, .value = .no_such_instance },
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// self-demo (no arguments): agent + manager, one process, both real
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Both halves come out of THIS module (see the file comment): `serveAgent`
+// is the exact loop `agent` mode runs, `readScalars`/`walkIfDescr`/
+// `askForNotification`/`receiveNotification` are the exact steps `manager`
+// mode runs. Nothing here is a separate fixture. The agent runs as a
+// concurrent task on an ephemeral loopback port (never the conventional
+// 1161/1162, so this never collides with a real two-terminal run); the
+// manager drives it from the main task and every one of those four helpers'
+// bool return is asserted rather than merely printed — they already return
+// `false` on exactly the outcomes worth panicking on.
+
+fn runSelfDemo(io: std.Io) !u8 {
+    const agent_bind = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var agent_sock = agent_bind.bind(io, .{ .mode = .dgram }) catch |err| {
+        std.debug.print("snmp-demo self-demo: cannot bind the agent socket: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    defer agent_sock.close(io);
+    const agent_port = agent_sock.address.getPort();
+
+    const notify_bind = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var notify_sock = notify_bind.bind(io, .{ .mode = .dgram }) catch |err| {
+        std.debug.print("snmp-demo self-demo: cannot bind the notification socket: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    defer notify_sock.close(io);
+    const notify_port = notify_sock.address.getPort();
+
+    const agent_opts: AgentOptions = .{
+        .listen = "127.0.0.1",
+        .port = agent_port,
+        .community = "public",
+        .trap_port = notify_port,
+        .once = true,
+    };
+    var agent_fut = io.concurrent(serveAgent, .{ io, &agent_sock, agent_opts }) catch |err| {
+        std.debug.print("snmp-demo self-demo: no concurrency available ({t}); cannot self-demo\n", .{err});
+        return local_failure_exit;
+    };
+    // Idempotent (`Future.await`/`cancel` doc comment): calling `await` again
+    // explicitly below, to check the agent's own result, costs nothing here.
+    defer _ = agent_fut.cancel(io) catch @as(u8, 0);
+
+    const agent_addr = std.Io.net.IpAddress.parse("127.0.0.1", agent_port) catch unreachable;
+    var udp = snmp.UdpTransport.open(io, agent_addr, .{
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } },
+    }) catch |err| {
+        std.debug.print("snmp-demo self-demo: cannot open a UDP socket to the agent: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    defer udp.close();
+    var client = snmp.Client.init(udp.transport(), .{ .version = .v2c });
+
+    std.debug.print("snmp-demo self-demo: polling an in-process agent at 127.0.0.1:{d}\n\n", .{agent_port});
+
+    if (!readScalars(&client, "public")) @panic("snmp-demo self-demo: readScalars failed");
+    if (!walkIfDescr(&client, "public")) @panic("snmp-demo self-demo: walkIfDescr failed");
+    if (!askForNotification(&client, "public")) @panic("snmp-demo self-demo: askForNotification failed");
+    if (!receiveNotification(io, &notify_sock)) @panic("snmp-demo self-demo: receiveNotification failed");
+
+    const agent_result = agent_fut.await(io) catch |err| {
+        std.debug.print("snmp-demo self-demo: agent task ended abnormally: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    if (agent_result != 0) @panic("snmp-demo self-demo: agent loop reported failure");
+
+    std.debug.print(
+        "\nsnmp-demo self-demo: OK\n" ++
+            "  real snmp.Client (manager) polled a real agent loop, both in this\n" ++
+            "  process, over 127.0.0.1 -- GetRequest scalars, a GetNext walk, a\n" ++
+            "  SetRequest, and an acknowledged InformRequest, all asserted above.\n" ++
+            "  no real network, no root, no external daemon.\n" ++
+            "  see --help for the agent/manager subcommands this binary also offers.\n",
+        .{},
+    );
+    return 0;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // agent mode
@@ -214,6 +294,16 @@ fn runAgent(io: std.Io, args: *std.process.Args.Iterator) !u8 {
     );
     printMib();
 
+    return serveAgent(io, &sock, opts);
+}
+
+/// The agent's receive/answer loop, split out of `runAgent` so the self-demo
+/// can drive it against a socket it bound itself (an ephemeral port, so it
+/// never collides with a real agent or a concurrent CI run) without going
+/// through argv parsing. Does NOT close `sock` — the caller bound it and the
+/// caller closes it, in both the CLI (`runAgent`, via `defer`) and the
+/// self-demo (after `io.concurrent`-ing this very function).
+fn serveAgent(io: std.Io, sock: *std.Io.net.Socket, opts: AgentOptions) !u8 {
     const started = std.Io.Clock.Timestamp.now(io, .awake);
 
     // SNMP is one datagram in, one datagram out — no framing, no connection

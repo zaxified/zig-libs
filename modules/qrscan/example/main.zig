@@ -96,6 +96,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     _ = args.next(); // argv[0]
 
+    // No arguments at all -> self-demo. `probe` is a value copy (the POSIX
+    // iterator is just a slice), so peeking here consumes nothing the loop
+    // below would otherwise see.
+    var probe = args;
+    if (probe.next() == null) return runSelfDemo(gpa, io);
+
     var verbose = false;
     var quiet = false;
     var paths: std.ArrayList([]const u8) = .empty;
@@ -130,6 +136,119 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// no arguments — self-demo
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `qrscan` has no encoder of its own (`meta.deps = .{"qr"}`, one-directional):
+// its self-demo therefore encodes with `qr.encode`, rasterises the symbol
+// into an actual pixel bitmap, writes that bitmap as a REAL PGM file on disk
+// (the twenty-line format this program already reads for any input `magick`
+// cannot produce directly), and then reads it back through this program's
+// OWN `loadImage` -> `qrscan.scan` -> `qr.decodePart` path — the exact code
+// `scanOne` runs against a file from the command line. That is a genuine
+// exercise of the finder/binariser, not a shortcut that hands `scan` a matrix
+// it already knows the answer to.
+
+fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
+    try selfDemoCase(gpa, io, ".zig-cache/qrscan-selfdemo-1.pgm", "zig-libs qrscan module -- self-demo round trip", .{});
+
+    // The "not trivially easy" case: a long payload at the highest
+    // error-correction level, forcing a bigger, denser symbol than the short
+    // case above -- more modules for the finder/binariser to get right, not
+    // just more bytes for the codec.
+    const hard_text = "zig-libs qrscan module self-demo, harder case: a longer payload at ECC level H, " ++
+        "forcing a bigger, denser version than the short case above. Rasterised to a real PGM file, " ++
+        "located and sampled back by qrscan.scan() -- not handed the matrix directly -- decoded with " ++
+        "qr.decodePart(), and compared byte-for-byte against this exact string.";
+    try selfDemoCase(gpa, io, ".zig-cache/qrscan-selfdemo-2.pgm", hard_text, .{ .ecc = .high });
+
+    try printOut(io, "self-demo passed: both symbols were located and decoded back off a real PGM file\n", .{});
+    return 0;
+}
+
+fn selfDemoCase(gpa: Allocator, io: std.Io, path: []const u8, text: []const u8, opts: qr.Options) !void {
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, text, opts);
+
+    // 6 px/module is comfortably above the module's stated 3 px/module floor
+    // (see `marginNote` below), so this proves normal-condition scanning, not
+    // a worst-case angle or resolution.
+    const scale: u32 = 6;
+    const quiet: u32 = qr.quiet_zone;
+    const raster = try rasterizeMatrix(gpa, &m, scale, quiet);
+    defer gpa.free(raster.luma);
+
+    try writePgmFile(io, path, raster);
+    // Delete the file regardless of what happens below -- this demo must
+    // leave nothing behind, success or failure.
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch |err| {
+        std.debug.print("qrscan-demo: self-demo: could not remove {s}: {t}\n", .{ path, err });
+    };
+
+    // From here down this is exactly `readAndDecode`'s body: load the file
+    // this program's own reader understands, size the scratch buffer with
+    // `qrscan.scratchSize` (never guessed), scan, and decode the part.
+    var image = try loadImage(gpa, io, path);
+    defer image.deinit(gpa);
+
+    const scratch = try gpa.alloc(u8, qrscan.scratchSize(image.width, image.height));
+    defer gpa.free(scratch);
+    const img: qrscan.Image = .{ .luma = image.luma, .width = image.width, .height = image.height, .stride = image.width };
+    const found = qrscan.scan(img, scratch) catch |err| {
+        std.debug.print("qrscan-demo: self-demo: {s} was not located: {t}\n", .{ path, err });
+        return err;
+    };
+
+    var buf: [max_message]u8 = undefined;
+    const part = qr.decodePart(&found.matrix, &buf) catch |err| {
+        std.debug.print("qrscan-demo: self-demo: {s} was located but did not decode: {t}\n", .{ path, err });
+        return err;
+    };
+    if (part.sequence != null) @panic("qrscan-demo: self-demo: symbol unexpectedly carries a structured-append header");
+    if (!std.mem.eql(u8, part.data, text)) @panic("qrscan-demo: self-demo: decoded text read back off the PGM does not match the input");
+
+    try printOut(io, "{s}: {d}x{d} px, module_px {d:.2}, decoded {d} bytes correctly\n", .{
+        path, image.width, image.height, found.module_px, part.data.len,
+    });
+}
+
+const Raster = struct { luma: []u8, width: u32, height: u32 };
+
+/// Render `m` to a tight-row 8-bit luma bitmap: `quiet` modules of white
+/// border, then `scale` pixels per module, matching `modules/qr/example`'s
+/// `renderPng` layout exactly -- this file just skips PNG's compression and
+/// framing, since PGM does not have any.
+fn rasterizeMatrix(gpa: Allocator, m: *const qr.Matrix, scale: u32, quiet: u32) !Raster {
+    const n = @as(u32, m.size) + 2 * quiet;
+    const px = n * scale;
+    const luma = try gpa.alloc(u8, @as(usize, px) * px);
+    errdefer gpa.free(luma);
+    for (0..px) |y| {
+        const my = @as(u32, @intCast(y)) / scale;
+        for (0..px) |x| {
+            const mx = @as(u32, @intCast(x)) / scale;
+            const dark = mx >= quiet and my >= quiet and
+                mx < quiet + m.size and my < quiet + m.size and
+                m.isDark(@intCast(mx - quiet), @intCast(my - quiet));
+            luma[y * px + x] = if (dark) 0 else 255;
+        }
+    }
+    return .{ .luma = luma, .width = px, .height = px };
+}
+
+/// `P5\n{width} {height}\n255\n` then raw samples -- the format `decodePgm`
+/// below reads, written by hand rather than through any image library.
+fn writePgmFile(io: std.Io, path: []const u8, raster: Raster) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var wbuf: [256]u8 = undefined;
+    var fw = file.writer(io, &wbuf);
+    try fw.interface.print("P5\n{d} {d}\n255\n", .{ raster.width, raster.height });
+    try fw.interface.writeAll(raster.luma);
+    try fw.interface.flush();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

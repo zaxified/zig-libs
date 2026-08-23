@@ -94,6 +94,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     _ = args.next(); // argv[0]
 
+    // No arguments at all -> self-demo. `probe` is a value copy (the POSIX
+    // iterator is just a slice), so peeking here consumes nothing `parseArgs`
+    // below would otherwise see.
+    var probe = args;
+    if (probe.next() == null) return runSelfDemo(gpa, io);
+
     var opts = parseArgs(gpa, init, &args) catch |err| switch (err) {
         error.BadUsage => {
             try printOut(io, "{s}", .{usage_text});
@@ -114,6 +120,69 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .sign => runSign(gpa, io, opts),
         .verify => runVerify(gpa, io, opts),
     };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// no arguments — self-demo
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A throwaway key pair, entirely in memory: sign a message, verify it, then
+// prove the two ways verification MUST fail — a tampered message and a wrong
+// public key — are each rejected by a distinct named error rather than one
+// generic "no". No files touch disk here; `-G`/`-S`/`-V` above are what
+// exercises the on-disk formats this module does not own itself (see the
+// file doc comment).
+
+fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
+    var kp = minisign.KeyPair.generate(io);
+    defer kp.wipe();
+
+    const message = "zig-libs minisign module -- self-demo message, signed and verified in one process.";
+    const trusted_comment = "self-demo trusted comment";
+
+    const signed = try minisign.signFile(gpa, kp, message, .prehashed, trusted_comment);
+    const parsed: minisign.ParsedSignature = .{
+        .untrusted_comment = "",
+        .signature = signed.signature,
+        .algorithm = .prehashed,
+        .trusted_comment = trusted_comment,
+        .global_signature = signed.global_signature,
+    };
+
+    // 1. The honest path: right message, right key.
+    try minisign.verifyFile(gpa, kp.publicKey(), message, parsed);
+    std.debug.print("[1] signed and verified a {d}-byte message with a fresh key pair\n", .{message.len});
+
+    // 2. A tampered message must be rejected, and rejected by the SPECIFIC
+    // error the crypto layer names for a bad signature -- not swallowed into
+    // a generic failure.
+    var tampered_buf: [message.len]u8 = undefined;
+    @memcpy(&tampered_buf, message);
+    tampered_buf[0] ^= 0x01;
+    if (minisign.verifyFile(gpa, kp.publicKey(), &tampered_buf, parsed)) |_| {
+        @panic("minisign-demo: self-demo: a tampered message was ACCEPTED");
+    } else |err| {
+        if (err != error.SignatureVerificationFailed) return err;
+    }
+    std.debug.print("[2] a one-byte-flipped message was correctly rejected: error.SignatureVerificationFailed\n", .{});
+
+    // 3. A different key pair's public key must also be rejected. Two
+    // independently random 8-byte key ids collide with probability ~2^-64,
+    // so `verifyMessage`'s own key-id check is expected to fire first
+    // (`KeyIdMismatch`); the crypto check (`SignatureVerificationFailed`) is
+    // accepted too so this cannot flake on that astronomically unlikely
+    // coincidence.
+    var wrong_kp = minisign.KeyPair.generate(io);
+    defer wrong_kp.wipe();
+    if (minisign.verifyFile(gpa, wrong_kp.publicKey(), message, parsed)) |_| {
+        @panic("minisign-demo: self-demo: a signature verified against the WRONG public key");
+    } else |err| {
+        if (err != error.KeyIdMismatch and err != error.SignatureVerificationFailed) return err;
+        std.debug.print("[3] verifying against a different key pair's public key was correctly rejected: {t}\n", .{err});
+    }
+
+    std.debug.print("minisign-demo: self-demo passed — see -G/-S/-V for the on-disk file formats\n", .{});
+    return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

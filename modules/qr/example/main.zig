@@ -81,6 +81,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var args = init.args.iterate();
     _ = args.next(); // argv[0]
 
+    // No arguments at all -> self-demo. `probe` is a value copy (the POSIX
+    // iterator is just a slice), so peeking here does not consume anything
+    // `parseArgs` below would otherwise see.
+    var probe = args;
+    if (probe.next() == null) return runSelfDemo(gpa, io);
+
     const opts = parseArgs(&args) catch |err| switch (err) {
         error.BadUsage => {
             try printOut(io, "{s}", .{usage_text});
@@ -96,6 +102,155 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         runSequence(gpa, io, opts, n)
     else
         runSingle(gpa, io, opts);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// no arguments — self-demo
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Round-trips two symbols through a REAL PNG file on disk: encode, write the
+// narrow PNG this file's own `renderPng` produces, read the bytes back with
+// `readPngLuma` below (a reader that trusts only the shape this encoder
+// actually emits — 8-bit grayscale, filter None on every row, one IDAT — and
+// refuses anything else by name), resample module centres off the pixels, and
+// `qr.decode()` the RECONSTRUCTED matrix. That is a different code path from
+// `runSingle`'s self-check, which decodes the in-memory `Matrix` `encode` just
+// filled in directly: this proves the PNG on disk actually carries the
+// symbol, not just that `encode`/`decode` agree with each other in RAM.
+//
+// `qr` depends on nothing (`meta.deps = .{}`), so `qrscan`'s finder/binariser
+// is not reachable from here — this file cannot demonstrate LOCATING a symbol
+// in a photograph, only that the bits a real image file carries decode back
+// to the input. That coverage gap is `qrscan`'s self-demo, not this one's.
+
+fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
+    try selfDemoCase(gpa, io, ".zig-cache/qr-selfdemo-1.png", "zig-libs qr module -- self-demo round trip", .{});
+
+    // The "not trivially easy" case: long enough to force a multi-block
+    // symbol (several version steps up from the short case above) and at the
+    // highest error-correction level, so the codeword layout this exercises
+    // is the one with the most Reed-Solomon blocks to get right.
+    const hard_text = "zig-libs qr module self-demo, harder case: a longer payload at ECC level H, " ++
+        "forcing a bigger version with several interleaved Reed-Solomon blocks instead of the single " ++
+        "block the short case above uses. Round-tripped through the same real PNG file and byte-for-byte " ++
+        "compared against this exact string once decoded back out of the image that was written to disk.";
+    try selfDemoCase(gpa, io, ".zig-cache/qr-selfdemo-2.png", hard_text, .{ .ecc = .high });
+
+    try printOut(io, "self-demo passed: both symbols round-tripped through a real PNG file byte-for-byte\n", .{});
+    return 0;
+}
+
+fn selfDemoCase(gpa: Allocator, io: std.Io, path: []const u8, text: []const u8, opts: qr.Options) !void {
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, text, opts);
+
+    const scale: u32 = 4;
+    const quiet: u8 = qr.quiet_zone;
+    const bytes = try renderPng(gpa, &m, scale, quiet);
+    defer gpa.free(bytes);
+    try writeWholeFile(io, path, bytes);
+    // Delete the file regardless of what happens below -- this demo must
+    // leave nothing behind, success or failure.
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch |err| {
+        std.debug.print("qr-demo: self-demo: could not remove {s}: {t}\n", .{ path, err });
+    };
+
+    const raster = try readPngLuma(gpa, io, path);
+    defer gpa.free(raster.pixels);
+
+    var reconstructed: qr.Matrix = .{ .size = m.size };
+    @memset(&reconstructed.bits, 0);
+    for (0..m.size) |y| {
+        for (0..m.size) |x| {
+            // Sample the centre of the module's block, exactly as `renderPng`
+            // laid it out: `quiet` modules of border, then `scale` pixels per
+            // module.
+            const px = (quiet + x) * scale + scale / 2;
+            const py = (quiet + y) * scale + scale / 2;
+            const v = raster.pixels[py * raster.width + px];
+            reconstructed.setDark(@intCast(x), @intCast(y), v < 128);
+        }
+    }
+
+    var buf: [max_message]u8 = undefined;
+    const got = qr.decode(&reconstructed, &buf) catch |err| {
+        std.debug.print("qr-demo: self-demo: {s} did not decode back off disk: {t}\n", .{ path, err });
+        return err;
+    };
+    if (!std.mem.eql(u8, got, text)) @panic("qr-demo: self-demo: decoded text read back from the PNG does not match the input");
+
+    try printOut(io, "{s}: version {d} ({d}x{d} modules), {d}x{d} px PNG, decoded {d} bytes back off disk, matches input\n", .{
+        path, m.version, m.size, m.size, raster.width, raster.height, got.len,
+    });
+}
+
+/// Read back exactly the narrow shape `renderPng` writes: 8-bit grayscale
+/// (colour type 0), non-interlaced, filter None on every row, one `IDAT`. Not
+/// a general PNG reader -- see `modules/qrscan/example/main.zig`'s `decodePng`
+/// for one of those; this one is deliberately as narrow as its writer and
+/// refuses anything its writer would never produce, by name.
+const PngLuma = struct { pixels: []u8, width: u32, height: u32 };
+
+fn readPngLuma(gpa: Allocator, io: std.Io, path: []const u8) !PngLuma {
+    const file = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024));
+    defer gpa.free(file);
+
+    if (file.len < png_signature.len or !std.mem.eql(u8, file[0..png_signature.len], &png_signature))
+        return error.NotAPng;
+
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var have_ihdr = false;
+    var idat: std.Io.Writer.Allocating = .init(gpa);
+    defer idat.deinit();
+
+    var off: usize = png_signature.len;
+    while (true) {
+        if (off + 8 > file.len) return error.CorruptPng;
+        const len = std.mem.readInt(u32, file[off..][0..4], .big);
+        const kind = file[off + 4 ..][0..4];
+        if (off + 12 + len > file.len) return error.CorruptPng;
+        const data = file[off + 8 ..][0..len];
+        off += 12 + len;
+
+        if (std.mem.eql(u8, kind, "IHDR")) {
+            if (len != 13) return error.CorruptPng;
+            width = std.mem.readInt(u32, data[0..4], .big);
+            height = std.mem.readInt(u32, data[4..8], .big);
+            if (data[8] != 8) return error.UnexpectedPngShape; // bit depth
+            if (data[9] != 0) return error.UnexpectedPngShape; // colour type: grayscale
+            if (data[12] != 0) return error.UnexpectedPngShape; // interlace: none
+            have_ihdr = true;
+        } else if (std.mem.eql(u8, kind, "IDAT")) {
+            if (!have_ihdr) return error.CorruptPng;
+            try idat.writer.writeAll(data);
+        } else if (std.mem.eql(u8, kind, "IEND")) {
+            break;
+        }
+    }
+    if (!have_ihdr or width == 0 or height == 0) return error.CorruptPng;
+
+    const row_bytes = width; // 8-bit grayscale: one sample byte per pixel
+    const raw = try gpa.alloc(u8, (row_bytes + 1) * height);
+    defer gpa.free(raw);
+
+    var src: std.Io.Reader = .fixed(idat.written());
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var inflate: std.compress.flate.Decompress = .init(&src, .zlib, &window);
+    inflate.reader.readSliceAll(raw) catch return error.CorruptPng;
+
+    const pixels = try gpa.alloc(u8, @as(usize, width) * height);
+    errdefer gpa.free(pixels);
+    for (0..height) |y| {
+        const filter = raw[y * (row_bytes + 1)];
+        // This file's own writer (`renderPng`) always writes filter 0
+        // ("None") -- anything else means the writer changed shape and this
+        // reader's narrowing assumption no longer holds.
+        if (filter != 0) return error.UnexpectedPngShape;
+        const row = raw[y * (row_bytes + 1) + 1 ..][0..row_bytes];
+        @memcpy(pixels[y * width ..][0..width], row);
+    }
+    return .{ .pixels = pixels, .width = width, .height = height };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

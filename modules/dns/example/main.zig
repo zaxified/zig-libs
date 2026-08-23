@@ -69,6 +69,7 @@ const usage_text =
     \\dns-demo -- a dig(1)-shaped query tool for the `dns` module.
     \\
     \\usage:
+    \\  dns-demo                                       self-demo (no network needed)
     \\  dns-demo [@server] name [type] [options]
     \\  dns-demo [@server] -x <addr> [options]        reverse (PTR) lookup
     \\
@@ -116,6 +117,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+
+    // No arguments at all: self-demo instead of the `dig`-shaped tool. Only
+    // a genuinely empty argv triggers this -- any real (even malformed)
+    // usage still goes through `parseArgs` below and gets the usual error.
+    {
+        var probe = init.args.iterate();
+        _ = probe.next(); // argv[0]
+        if (probe.next() == null) return runSelfDemo(gpa, io);
+    }
 
     var args = init.args.iterate();
     _ = args.next(); // argv[0]
@@ -367,6 +377,154 @@ fn runDohJson(gpa: Allocator, io: std.Io, out: *std.Io.Writer, opts: Options, na
     try out.writeAll(
         ";; NOTE: DoH-JSON is text throughout (RDATA arrives as a string, not wire\n" ++
             ";; bytes), so unlike the binary path there is nothing to render as raw hex here.\n",
+    );
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// self-demo (no arguments): fixture responder over loopback, real wire bytes
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The module publishes no response *encoder* (`Resolver` is a client; only
+// `encodeQuery` is public) so a fixture server here cannot legitimately build
+// an answer through the module's own API. Rather than hand-roll a synthetic
+// one -- which would test this file's idea of the wire format, not a real
+// server's -- these are the SAME captured bytes `modules/dns/src/goldens.zig`
+// carries (2026-08-01, live against Google Public DNS 8.8.8.8; see that
+// file's doc comment for the capture recipe and provenance). Reproduced
+// here, not re-derived, with only the 2-byte query id patched to match each
+// request -- exactly what a real server does, and the only field
+// `Resolver.query` itself checks (`decodeResponse`: id + QR bit; nothing
+// else about the response is validated against the request).
+
+/// `example.com A` via 8.8.8.8, two real answers.
+const self_demo_a_example_com = "\x10\x01\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00\x07\x65\x78\x61" ++
+    "\x6d\x70\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\xc0\x0c\x00" ++
+    "\x01\x00\x01\x00\x00\x01\x2c\x00\x04\xac\x42\x93\xf3\xc0\x0c\x00" ++
+    "\x01\x00\x01\x00\x00\x01\x2c\x00\x04\x68\x14\x17\x9a";
+
+/// `zz-nonexistent-domain-a1b2c3-zig-libs-test.com A` via 8.8.8.8, a real
+/// NXDOMAIN with a mid-name-compressed SOA authority record.
+const self_demo_name = "zz-nonexistent-domain-a1b2c3-zig-libs-test.com";
+const self_demo_nxdomain = "\x10\x06\x81\x83\x00\x01\x00\x00\x00\x01\x00\x00\x2a\x7a\x7a\x2d" ++
+    "\x6e\x6f\x6e\x65\x78\x69\x73\x74\x65\x6e\x74\x2d\x64\x6f\x6d\x61" ++
+    "\x69\x6e\x2d\x61\x31\x62\x32\x63\x33\x2d\x7a\x69\x67\x2d\x6c\x69" ++
+    "\x62\x73\x2d\x74\x65\x73\x74\x03\x63\x6f\x6d\x00\x00\x01\x00\x01" ++
+    "\xc0\x37\x00\x06\x00\x01\x00\x00\x03\x84\x00\x3d\x01\x61\x0c\x67" ++
+    "\x74\x6c\x64\x2d\x73\x65\x72\x76\x65\x72\x73\x03\x6e\x65\x74\x00" ++
+    "\x05\x6e\x73\x74\x6c\x64\x0c\x76\x65\x72\x69\x73\x69\x67\x6e\x2d" ++
+    "\x67\x72\x73\xc0\x37\x6a\x6d\xe9\xa9\x00\x00\x07\x08\x00\x00\x03" ++
+    "\x84\x00\x09\x3a\x80\x00\x00\x03\x84";
+
+/// A one-shot UDP DNS server on loopback: reads a query, replies with a
+/// canned real capture (id patched), twice, then stops. Errors are logged
+/// and swallowed here -- a fixture that never answers surfaces as a real
+/// `error.Timeout` on the resolver side below, which is the honest failure.
+const FixtureServer = struct {
+    io: std.Io,
+    sock: net.Socket,
+
+    fn run(f: *FixtureServer) void {
+        f.serveOne(self_demo_a_example_com) catch |err| {
+            std.debug.print("dns-demo self-demo: fixture (A answer) failed: {t}\n", .{err});
+        };
+        f.serveOne(self_demo_nxdomain) catch |err| {
+            std.debug.print("dns-demo self-demo: fixture (NXDOMAIN) failed: {t}\n", .{err});
+        };
+    }
+
+    fn serveOne(f: *FixtureServer, golden: []const u8) !void {
+        var rbuf: [message.max_query_len]u8 = undefined;
+        const deadline_t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(3000), .clock = .awake } };
+        const incoming = try f.sock.receiveTimeout(f.io, &rbuf, deadline_t.toDeadline(f.io));
+        if (incoming.data.len < 2) return error.MalformedQuery;
+
+        var resp_buf: [256]u8 = undefined;
+        std.debug.assert(golden.len <= resp_buf.len);
+        @memcpy(resp_buf[0..golden.len], golden);
+        resp_buf[0] = incoming.data[0]; // echo the query id -- the only
+        resp_buf[1] = incoming.data[1]; // thing decodeResponse checks
+        try f.sock.send(f.io, &incoming.from, resp_buf[0..golden.len]);
+    }
+};
+
+/// No arguments: prove the module end to end over loopback with no real
+/// network, no root and no external daemon -- a resolver exchanging with an
+/// in-process fixture responder that replays real captured wire bytes.
+fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
+    const bind_addr = net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    const fixture_sock = bind_addr.bind(io, .{ .mode = .dgram }) catch |err| {
+        std.debug.print("dns-demo self-demo: cannot bind a loopback fixture socket: {t}\n", .{err});
+        return 1;
+    };
+    const fixture_port = fixture_sock.address.getPort();
+
+    var fixture: FixtureServer = .{ .io = io, .sock = fixture_sock };
+    var fixture_fut = io.concurrent(FixtureServer.run, .{&fixture}) catch |err| {
+        fixture_sock.close(io);
+        std.debug.print("dns-demo self-demo: no concurrency available ({t}); cannot self-demo offline\n", .{err});
+        return 1;
+    };
+    errdefer fixture_sock.close(io);
+    errdefer _ = fixture_fut.cancel(io);
+
+    var resolver: Resolver = .init(io, gpa, .{
+        .servers = &[1]netaddr.Ip{.{ .v4 = .{ 127, 0, 0, 1 } }},
+        .port = fixture_port,
+        .timeout_ms = 2000,
+        .attempts = 1,
+        .use_search = false,
+    });
+    defer resolver.deinit();
+
+    // 1) a real positive answer: two A records for example.com.
+    var msg = try resolver.query("example.com", .a);
+    defer msg.deinit();
+    if (msg.rcode() != .no_error) @panic("dns-demo self-demo: expected NOERROR from the fixture");
+    if (msg.answers.len != 2) @panic("dns-demo self-demo: expected 2 A answers from the fixture");
+    if (!std.mem.eql(u8, msg.answers[0].name, "example.com")) @panic("dns-demo self-demo: unexpected owner name");
+    const ip0 = msg.answers[0].data.a;
+    const ip1 = msg.answers[1].data.a;
+    if (!std.mem.eql(u8, &ip0, &[4]u8{ 172, 66, 147, 243 })) @panic("dns-demo self-demo: unexpected A #1");
+    if (!std.mem.eql(u8, &ip1, &[4]u8{ 104, 20, 23, 154 })) @panic("dns-demo self-demo: unexpected A #2");
+
+    // 2) a real negative answer: NXDOMAIN with a compressed SOA authority.
+    var msg2 = try resolver.query(self_demo_name, .a);
+    defer msg2.deinit();
+    if (msg2.rcode() != .nx_domain) @panic("dns-demo self-demo: expected NXDOMAIN from the fixture");
+    if (msg2.answers.len != 0) @panic("dns-demo self-demo: NXDOMAIN must carry zero answers");
+    if (msg2.authorities.len != 1 or msg2.authorities[0].data != .soa) {
+        @panic("dns-demo self-demo: expected exactly one SOA authority record");
+    }
+    if (!std.mem.eql(u8, msg2.authorities[0].data.soa.mname, "a.gtld-servers.net")) {
+        @panic("dns-demo self-demo: SOA mname mismatch");
+    }
+
+    _ = fixture_fut.await(io);
+    fixture_sock.close(io);
+
+    std.debug.print(
+        "dns-demo self-demo: OK\n" ++
+            "  queried an in-process fixture UDP responder on loopback (127.0.0.1:{d}),\n" ++
+            "  which replayed REAL captured wire bytes (see src/goldens.zig) with only\n" ++
+            "  the query id patched to match.\n" ++
+            "  example.com A -> {d}.{d}.{d}.{d}, {d}.{d}.{d}.{d} (2 answers, asserted)\n" ++
+            "  {s} A -> NXDOMAIN, SOA authority mname={s} (asserted)\n" ++
+            "  no real network, no root, no external daemon.\n" ++
+            "  see --help for the dig-shaped subcommands this binary also offers.\n",
+        .{
+            fixture_port,
+            ip0[0],
+            ip0[1],
+            ip0[2],
+            ip0[3],
+            ip1[0],
+            ip1[1],
+            ip1[2],
+            ip1[3],
+            self_demo_name,
+            msg2.authorities[0].data.soa.mname,
+        },
     );
     return 0;
 }
