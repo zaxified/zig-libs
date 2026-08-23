@@ -20,6 +20,16 @@ pub fn main() !void {
     defer if (da.deinit() == .leak) @panic("leak");
     const gpa = da.allocator();
 
+    // `lockfree.Atomic` spelled the way a consumer spells it. This is here
+    // rather than in the module's own tests because only an outside caller can
+    // prove the RE-EXPORT exists: the alias was public inside `atomic.zig` for
+    // its whole life while `root.zig` published its four neighbours and not it,
+    // so nothing in the module could tell the difference. Delete the export and
+    // this file stops compiling.
+    var flag = lockfree.Atomic(u32).init(0);
+    if (flag.fetchAdd(7, .acq_rel) != 0 or flag.load(.acquire) != 7)
+        return error.AtomicAliasMisbehaved;
+
     // A tight domain (one slot) so the registry-exhaustion error is easy to
     // trigger and name from outside.
     var domain = try lockfree.Domain.init(gpa, .{ .max_participants = 1 });

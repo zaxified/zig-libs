@@ -14,14 +14,10 @@
 
 const std = @import("std");
 
-/// Alias so code here spells the atomic type through the module. Generic, so
-/// it has no body until something instantiates it — see the test at the foot
-/// of this file, which is the only instantiation in the repository and the
-/// only reason a broken edit to this line does not compile green.
-///
-/// NOT re-exported by `root.zig` today (its four neighbours below are), so a
-/// consumer cannot yet spell `lockfree.Atomic`; whether it should be is an
-/// API question, not a defect in this line.
+/// Alias so code spells the atomic type through the module: `lockfree.Atomic`.
+/// Generic, so it has no body until something instantiates it — see the test at
+/// the foot of this file, which is the only instantiation in the repository and
+/// the only reason a broken edit to this line does not compile green.
 pub fn Atomic(comptime T: type) type {
     return std.atomic.Value(T);
 }

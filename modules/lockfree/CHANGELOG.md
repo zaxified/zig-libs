@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-24** — `Atomic` is re-exported by the module root, so a consumer can spell
+  `lockfree.Atomic` (a generic alias for `std.atomic.Value`). It was public inside
+  `atomic.zig` from the start while `root.zig` published its four neighbours —
+  `Backoff`, `SpinLock`, `CachePadded`, `cache_line` — and omitted this one, so it was
+  reachable from nowhere outside the module. Nothing inside could notice: only an
+  outside caller can tell a missing re-export from a present one, which is why the
+  example is where the export is now pinned rather than a unit test. Additive; no
+  existing name changes meaning.
+
 - **2026-08-18** — Portability fix (`check-portable`): `StressConfig.per_producer` was
   `u64` while `StressConfig.producers` (its sibling field) was already `usize`; it only
   ever sizes allocations/loop bounds (`total = producers * per_producer`,

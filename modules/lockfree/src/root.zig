@@ -50,6 +50,7 @@ pub const meta = .{
 pub const gate = @import("gate.zig");
 
 const atomic = @import("atomic.zig");
+pub const Atomic = atomic.Atomic;
 pub const Backoff = atomic.Backoff;
 pub const SpinLock = atomic.SpinLock;
 pub const CachePadded = atomic.CachePadded;
