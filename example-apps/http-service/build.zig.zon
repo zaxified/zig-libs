@@ -1,0 +1,31 @@
+.{
+    .name = .http_service,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xe486bf192c6d2305,
+    .paths = .{ "build.zig", "build.zig.zon", "src", "init.sh", "README.md" },
+    .dependencies = .{
+        // Pinned to a dated release tag. A tag asserts one thing: every module
+        // cleared every lane at that commit. Bumped by `scripts/tag.sh` when a
+        // new tag is cut, so a copy taken from tag T is built against T.
+        //
+        // NOTE: this app was written against APIs added after 2026-08-19 (see
+        // README "Written against this working tree" for the list), so it will
+        // not build against this pinned tag until the next tag is cut — the
+        // pin still points at the last release, as every app's manifest does.
+        .zig_libs = .{
+            .url = "git+https://github.com/zaxified/zig-libs#2026-08-19",
+            .hash = "zig_libs-0.0.0-WiQ0GiHC8gLLy_JZG4Vl-Z2CWT4F8pJILf7CsHL0DVcM",
+        },
+        // To follow the development branch instead, or to pin one commit,
+        // replace the two lines above with one of these and run
+        // `zig fetch --save <url>` to fill in the matching hash:
+        //
+        //   .url = "git+https://github.com/zaxified/zig-libs#main",
+        //   .url = "git+https://github.com/zaxified/zig-libs#<40-char-commit-sha>",
+        //
+        // Both are content-pinned by `.hash` all the same, so neither floats:
+        // `#main` stops resolving the moment main moves. Only the tag is a
+        // stable point, and only the tag carries the all-lanes-green claim.
+    },
+}

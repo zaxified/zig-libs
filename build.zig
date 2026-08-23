@@ -1304,6 +1304,13 @@ const example_apps = [_]struct {
     modules: []const []const u8,
 }{
     .{ .name = "ssh-demo", .modules = &.{"ssh"} },
+    .{ .name = "http-service", .modules = &.{
+        "http",       "router",    "cors",        "security-headers",
+        "ratelimit",  "requestid", "health",      "throttle",
+        "abuseguard", "aaa-gate",  "idempotency", "tracecontext",
+        "webhooksig", "openapi",   "ramcache",    "accesslog",
+        "netaddr",
+    } },
 };
 
 /// Does an `example-apps/` entry already discharge this module's obligation?
