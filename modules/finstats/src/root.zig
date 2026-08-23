@@ -122,9 +122,19 @@ pub const XirrSpec = struct {
     /// wanted and means the same thing at every magnitude.
     ///
     /// `null` restores the pre-2026-08-23 absolute-only test exactly, for a
-    /// caller who needs to reproduce old numbers bit-for-bit. Switching it on
-    /// moves results by less than 1e-8 for cashflows of 1e6 and up, and by as
-    /// much as the whole answer below ~1.
+    /// caller who needs to reproduce old numbers bit-for-bit. That is an
+    /// escape hatch for reproducing a number, not a mode to settle on: what it
+    /// costs is a function of how big the cashflows are, measured on one
+    /// +10 %/year question asked at twelve magnitudes (error in percentage
+    /// points of the annual rate, `rate_tol = null` against the default):
+    ///
+    ///     cashflow   0.01  |  0.1  |   1   |   3   |  30   |  1e3  |  1e6
+    ///     error p.p. 440.  |  5.98 | 0.464 | 0.073 | 0.006 | 3e-4  |  ~0
+    ///
+    /// So it is invisible for a portfolio denominated in thousands and up, it
+    /// crosses a basis point somewhere around 30, and below ~1 — daily returns,
+    /// unit-denominated holdings, a small account — the old threshold is met
+    /// before bisection has done any work and the answer is not an answer.
     rate_tol: ?f64 = 1e-9,
 };
 
