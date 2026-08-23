@@ -5,7 +5,8 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 ## Design & invariants
 
 - **Per request:** adopt the incoming `X-Request-Id` header (default name) when `trust_incoming` is
-  set *and* the value validates (non-empty, ≤ 200 bytes, all printable non-space ASCII) — a
+  set *and* the value validates (non-empty, ≤ `max_adopt_len` = 200 bytes, and every byte in
+  `[A-Za-z0-9._-]`) — a
   malformed or over-long incoming value is never trusted, a fresh ID is generated instead.
   Otherwise generate. Echo the ID back on the response under the same header. Clean-room from the
   conventional `X-Request-Id` correlation-ID pattern (nginx `request_id`, Envoy `x-request-id`) — a
