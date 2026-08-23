@@ -570,6 +570,18 @@ pub fn build(b: *std.Build) void {
             // which fails on every OTHER module still missing one.
             const one_example = b.step(b.fmt("example-{s}", .{m.name}), b.fmt("Build the {s} example", .{m.name}));
             one_example.dependOn(&example.step);
+            // `zig build run-example-<name>` — and this one links and RUNS it.
+            // Worth its own step because compiling an example is not what
+            // examples are for: every leak this repository has found through
+            // one was found by running it under a leak-checking allocator
+            // (14 in `finstats` alone, 2026-08-23), and a compile cannot see
+            // any of them. Deliberately NOT wired into `check-examples`: some
+            // examples want a socket, a daemon or root, and the moment the
+            // sweep runs them it either fails on a laptop with no network or
+            // grows a hand-kept list of which ones are safe -- a declaration
+            // that would drift the way `.example` did.
+            const run_example = b.addRunArtifact(example);
+            b.step(b.fmt("run-example-{s}", .{m.name}), b.fmt("Build AND run the {s} example", .{m.name})).dependOn(&run_example.step);
         }
     }
 

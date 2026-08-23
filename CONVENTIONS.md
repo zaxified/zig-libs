@@ -450,8 +450,10 @@ reference, not a re-explanation of everything the README already covers.
 7. If either trigger in §7.2 fires — 25 or more `pub fn`, or a public `init` plus three
    or more `self` methods — write `modules/<name>/example/main.zig`. Nothing to
    declare: the file itself is the declaration, and `build.zig` picks it up from the
-   tree. `zig build example-<name>` builds it alone; `zig build check-example-rule`
-   fails a module that owes one and has none.
+   tree. `zig build example-<name>` builds it alone, `zig build run-example-<name>`
+   links and runs it — do that, under a leak-checking allocator, because compiling
+   an example is not what examples are for. `zig build check-example-rule` fails a
+   module that owes one and has none.
 
 `modules/_template/README.md` carries the complete step-by-step list, including the two
 things this narrative does not repeat because a gate owns them: the root README catalog row
