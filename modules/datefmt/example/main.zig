@@ -22,7 +22,7 @@ pub fn main() !void {
     // A malformed month has to fail by NAME so a caller can tell "bad
     // template" from "bad data".
     if (datefmt.parse("2026-13-01", "YYYY-MM-DD")) |_| {
-        std.debug.print("unexpected: month 13 accepted\n", .{});
+        return error.Month13UnexpectedlyAccepted;
     } else |err| switch (err) {
         error.InvalidDate => std.debug.print("parse(\"2026-13-01\"): InvalidDate (expected)\n", .{}),
         else => return err,
@@ -44,7 +44,7 @@ pub fn main() !void {
     // Reject Feb 31 the way the module's own doc comment says it must —
     // NOT normalised forward into March.
     if (datefmt.parseXsdDateTime("2026-02-31T00:00:00Z")) |_| {
-        std.debug.print("unexpected: 2026-02-31 accepted\n", .{});
+        return error.Feb31UnexpectedlyAccepted;
     } else |err| switch (err) {
         error.InvalidDateTime => std.debug.print("parseXsdDateTime(\"2026-02-31...\"): InvalidDateTime (expected)\n", .{}),
     }
@@ -54,11 +54,18 @@ pub fn main() !void {
     // (Jan 31 + 1 month -> Feb 28/29, not Mar 3).
     const period_start = datefmt.DateParts{ .year = 2026, .month = 1, .day = 31 };
     const next_period = datefmt.addMonths(period_start, 1);
+    if (next_period.year != 2026 or next_period.month != 2 or next_period.day != 28) {
+        return error.MonthEndClampingWrong;
+    }
     std.debug.print("2026-01-31 + 1 month = {d:0>4}-{d:0>2}-{d:0>2}\n", .{ next_period.year, next_period.month, next_period.day });
 
     // The last Sunday of March/October — the DST-boundary primitive named
     // in the module's own doc comment.
     const dst_start = datefmt.nthWeekdayOfMonth(2026, 3, 7, -1).?;
     const dst_end = datefmt.nthWeekdayOfMonth(2026, 10, 7, -1).?;
+    // Independently verified against the Gregorian calendar: the last Sunday
+    // of March 2026 is the 29th, and of October 2026 is the 25th.
+    if (dst_start.month != 3 or dst_start.day != 29) return error.DstStartWrong;
+    if (dst_end.month != 10 or dst_end.day != 25) return error.DstEndWrong;
     std.debug.print("EU summer time 2026: {d:0>2}-{d:0>2} .. {d:0>2}-{d:0>2}\n", .{ dst_start.month, dst_start.day, dst_end.month, dst_end.day });
 }

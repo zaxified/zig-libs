@@ -34,7 +34,7 @@ pub fn main() !void {
     // nameable so an ingest pipeline can quarantine the bad record instead
     // of aborting the whole batch.
     if (builder.add(120.0, 14.0, 999)) |_| {
-        std.debug.print("unexpected: out-of-range latitude accepted\n", .{});
+        return error.OutOfRangeLatitudeUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.OutOfRange => std.debug.print("add(lat=120): OutOfRange (expected)\n", .{}),
         else => return err,

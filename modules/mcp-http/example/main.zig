@@ -50,7 +50,7 @@ pub fn main() !void {
         .input_schema = "{\"type\":\"object\"}",
         .handler = shoutTool,
     })) |_| {
-        std.debug.print("unexpected: duplicate tool name accepted\n", .{});
+        return error.DuplicateToolUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.DuplicateTool => std.debug.print("addTool(\"shout\" again): DuplicateTool (expected)\n", .{}),
         error.OutOfMemory => return err,
@@ -110,5 +110,7 @@ pub fn main() !void {
         .response_body = &response_body_buf,
         .chunk = &chunk_buf,
     });
-    std.debug.print("tools/call response body: {s}\n", .{bodyOf(out2.buffered())});
+    const call_body = bodyOf(out2.buffered());
+    std.debug.print("tools/call response body: {s}\n", .{call_body});
+    if (std.mem.indexOf(u8, call_body, "\"HELLO\"") == null) return error.ToolCallResultMissingUppercasedText;
 }

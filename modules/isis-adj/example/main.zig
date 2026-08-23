@@ -41,10 +41,12 @@ pub fn main() !void {
     // FSM untouched — a real router sees garbage on the wire routinely
     // (corruption, a mid-negotiation link flap) and must not crash on it.
     const garbage = [_]u8{0xFF} ** 24;
-    _ = a.rxHelloBytes(&garbage, 1) catch |err| switch (err) {
+    if (a.rxHelloBytes(&garbage, 1)) |_| {
+        return error.GarbagePduUnexpectedlyAccepted;
+    } else |err| switch (err) {
         error.BadDiscriminator => std.debug.print("garbage PDU correctly rejected, FSM unchanged (state={s})\n", .{@tagName(a.currentState())}),
         else => return err,
-    };
+    }
 
     var t: isis_adj.Time = 1;
     var round: usize = 0;
@@ -59,12 +61,17 @@ pub fn main() !void {
     }
 
     std.debug.print("converged: a={s} b={s}\n", .{ @tagName(a.currentState()), @tagName(b.currentState()) });
+    // The retry loop above is bounded (6 rounds) precisely so a stalled
+    // handshake does not hang the example forever — but a bound that is
+    // never reached under correct behavior must not be silently accepted as
+    // "the loop ended, so print whatever state we're in". Both sides must
+    // actually have reached .up.
+    if (a.currentState() != .up or b.currentState() != .up) return error.AdjacencyUnexpectedlyNotConverged;
 
     // Once Up, a hold-timer expiry (no more hellos arriving) must bring the
     // adjacency back down — the other half of the lifecycle a caller drives.
     const hold_deadline = t + a.nextHelloDue() + 100;
     const down_effect = a.tick(hold_deadline);
-    if (down_effect.adjacency_down) |reason| {
-        std.debug.print("hold expiry: adjacency down, reason={s}\n", .{@tagName(reason)});
-    }
+    const reason = down_effect.adjacency_down orelse return error.HoldExpiryUnexpectedlyDidNotBringAdjacencyDown;
+    std.debug.print("hold expiry: adjacency down, reason={s}\n", .{@tagName(reason)});
 }

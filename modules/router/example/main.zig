@@ -50,7 +50,7 @@ pub fn main() !void {
     // or panicking — a route table built from config data needs this to be
     // catchable by name.
     if (r.get("/users/:id", hUser)) |_| {
-        std.debug.print("unexpectedly re-registered /users/:id\n", .{});
+        return error.DuplicateRouteUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.DuplicateRoute => std.debug.print("duplicate route rejected (DuplicateRoute)\n", .{}),
         else => return err,

@@ -30,7 +30,7 @@ pub fn main() !void {
     if (hashdigest.matchesAlgo(.blake3, incoming, digest)) {
         std.debug.print("incoming blob verified against announced digest\n", .{});
     } else {
-        std.debug.print("incoming blob REJECTED: digest mismatch\n", .{});
+        return error.IdenticalBlobUnexpectedlyRejected;
     }
 
     // A tampered blob must not verify — content-address check protects the
@@ -38,6 +38,8 @@ pub fn main() !void {
     const tampered = "release-manifest-v3: 42 objects, digest algo blake2";
     if (!hashdigest.matchesAlgo(.blake3, tampered, digest)) {
         std.debug.print("tampered blob correctly rejected\n", .{});
+    } else {
+        return error.TamperedBlobUnexpectedlyAccepted;
     }
 
     // A streaming hasher for a blob assembled from several network reads,
@@ -56,7 +58,7 @@ pub fn main() !void {
     // this being a nameable error, not a crash.
     var tiny: [8]u8 = undefined;
     if (hashdigest.hex(.sha3_256, blob, &tiny)) |_| {
-        std.debug.print("unexpectedly fit into the tiny buffer\n", .{});
+        return error.TinyBufferUnexpectedlyFit;
     } else |err| switch (err) {
         error.ShortBuffer => std.debug.print("tiny record buffer correctly rejected (ShortBuffer)\n", .{}),
     }
@@ -71,6 +73,6 @@ pub fn main() !void {
     if (hashdigest.sha256File(io, "modules/hashdigest/example/main.zig", &file_hex)) |n| {
         std.debug.print("this example file: {d} bytes, sha256={s}\n", .{ n, file_hex });
     } else {
-        std.debug.print("could not read this example file for hashing\n", .{});
+        return error.ExampleFileUnexpectedlyUnreadable;
     }
 }

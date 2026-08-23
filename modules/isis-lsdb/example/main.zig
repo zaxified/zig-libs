@@ -48,7 +48,7 @@ pub fn main() !void {
     bad_buf[bad_len - 3] ^= 0xFF; // corrupt a payload byte after stamping
     const bad = bad_buf[0..bad_len];
     if (db.insert(bad, 0, 0)) |_| {
-        std.debug.print("unexpected: corrupted LSP accepted\n", .{});
+        return error.CorruptedLspUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.CorruptedLsp => std.debug.print("insert(corrupted): CorruptedLsp (expected)\n", .{}),
         else => return err,

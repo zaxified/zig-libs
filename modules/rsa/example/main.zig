@@ -6,9 +6,13 @@
 //! encrypt/decrypt of a short secret to the same key pair's public half.
 //!
 //! Built by `zig build check-examples` against the PUBLISHED module — no
-//! access to anything `rsa` does not export. The modulus size below (512
-//! bits) is a toy size chosen ONLY so this example compiles and would run
-//! fast — a real deployment needs >= 2048 bits.
+//! access to anything `rsa` does not export. The modulus size below (1024
+//! bits) is a toy size chosen ONLY so this example runs fast — a real
+//! deployment needs >= 2048 bits. It must stay large enough for OAEP/SHA-256
+//! to fit the label hash twice plus the message (§7.1.1 step 1.b): 512 bits
+//! is NOT enough (64-byte modulus < 66-byte OAEP floor for SHA-256 alone,
+//! before the message), so `encryptOaep` below always failed with
+//! `MessageTooLong` at 512 bits regardless of what was encrypted.
 
 const std = @import("std");
 const rsa = @import("rsa");
@@ -20,7 +24,7 @@ pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE_1234_5678);
     const random = prng.random();
 
-    var kp = try rsa.generate(random, 512, 65537);
+    var kp = try rsa.generate(random, 1024, 65537);
     defer kp.secret_key.deinit();
 
     const doc = "invoice #4021: pay 1200.00 EUR by 2026-09-01";
@@ -31,9 +35,11 @@ pub fn main() !void {
 
     // A tampered document must fail verification by name.
     const tampered = "invoice #4021: pay 9200.00 EUR by 2026-09-01";
-    rsa.verifyPkcs1v15(kp.public_key, Sha256, tampered, sig) catch |err| switch (err) {
+    if (rsa.verifyPkcs1v15(kp.public_key, Sha256, tampered, sig)) |_| {
+        return error.TamperedDocumentUnexpectedlyVerified;
+    } else |err| switch (err) {
         error.SignatureVerificationFailed => std.debug.print("tampered document correctly rejected\n", .{}),
-    };
+    }
 
     // OAEP: encrypt a short secret to the public key, decrypt with the
     // private half. `label` is the RFC 8017 associated-data string —
@@ -44,12 +50,13 @@ pub fn main() !void {
 
     var pt_buf: [rsa.max_modulus_len]u8 = undefined;
     const pt = try rsa.decryptOaep(kp.secret_key, Sha256, ct, "", &pt_buf);
-    std.debug.print("OAEP round-trip matches original: {}\n", .{std.mem.eql(u8, secret, pt)});
+    if (!std.mem.eql(u8, secret, pt)) return error.OaepRoundTripMismatch;
+    std.debug.print("OAEP round-trip matches original\n", .{});
 
     // Generation itself validates its own parameters and names the
     // rejection rather than panicking on a caller mistake (odd bit count).
     if (rsa.generate(random, 513, 65537)) |_| {
-        std.debug.print("unexpectedly generated an odd-bit-count key\n", .{});
+        return error.OddBitCountKeyUnexpectedlyGenerated;
     } else |err| switch (err) {
         error.InvalidBits => std.debug.print("odd bit count correctly rejected (InvalidBits)\n", .{}),
         error.InvalidExponent => return err,

@@ -33,17 +33,19 @@ pub fn main() !void {
     // false or panic — a caller building an accept/reject gate depends on
     // this being a nameable error.
     const tampered = "deploy release v3 to the EDGE fleet";
-    ed448.ed448.verify(sig, tampered, ctx, kp.public_key) catch |err| switch (err) {
+    if (ed448.ed448.verify(sig, tampered, ctx, kp.public_key)) |_| {
+        return error.TamperedMessageUnexpectedlyVerified;
+    } else |err| switch (err) {
         error.SignatureVerificationFailed => std.debug.print("tampered message correctly rejected\n", .{}),
         else => return err,
-    };
+    }
 
     // RFC 8032's context string is capped at 255 bytes; sign() has to
     // reject an oversized one rather than truncate it silently (silent
     // truncation would let two different contexts collide).
     var huge_ctx: [ed448.ed448.max_context_length + 1]u8 = @splat('x');
     if (ed448.ed448.sign(kp, message, &huge_ctx)) |_| {
-        std.debug.print("unexpectedly signed with an oversized context\n", .{});
+        return error.OversizedContextUnexpectedlySigned;
     } else |err| switch (err) {
         error.ContextTooLong => std.debug.print("oversized context correctly rejected (ContextTooLong)\n", .{}),
     }
@@ -57,5 +59,6 @@ pub fn main() !void {
 
     const alice_shared = try ed448.x448.scalarmult(alice.secret_key, bob.public_key);
     const bob_shared = try ed448.x448.scalarmult(bob.secret_key, alice.public_key);
-    std.debug.print("X448 shared secret agrees: {}\n", .{std.mem.eql(u8, &alice_shared, &bob_shared)});
+    if (!std.mem.eql(u8, &alice_shared, &bob_shared)) return error.X448SharedSecretMismatch;
+    std.debug.print("X448 shared secret agrees\n", .{});
 }

@@ -42,13 +42,11 @@ pub fn main() !void {
         .last_log_term = 2,
     }).encode(&rv_buf);
 
+    // This buffer was just encoded above, not received off a real wire, so a
+    // decode failure here means encode/decode disagree with each other, not
+    // "malformed peer datagram" — a module regression, not an expected path.
     const rv_req = raft.RequestVoteReq.decode(&rv_buf) catch |err| switch (err) {
-        // A decode failure here is a malformed peer datagram, not our bug —
-        // handled by name, not swallowed into `catch unreachable`.
-        error.Truncated, error.InvalidEncoding => {
-            std.debug.print("malformed RequestVote, ignoring\n", .{});
-            return;
-        },
+        error.Truncated, error.InvalidEncoding => return err,
     };
 
     const vote = raft.handleRequestVote(current_term, voted_for, log.info(), rv_req);
@@ -57,6 +55,10 @@ pub fn main() !void {
     std.debug.print("RequestVote from node {d}: grant={}, term now {d}\n", .{
         rv_req.candidate_id, vote.grant, current_term,
     });
+    // The candidate's term (4) is ahead of ours (3), we have not voted this
+    // term, and its log (last entry term=2, index=2) is at least as
+    // up-to-date as ours (term=2, index=2) — §5.4.1 grants the vote.
+    if (!vote.grant) return error.VoteUnexpectedlyDenied;
 
     // ── AppendEntries from the leader we just voted for ─────────────────────
     //
@@ -80,19 +82,17 @@ pub fn main() !void {
     }).encode(&ae_buf);
 
     var entry_scratch: [max_entries_per_msg]raft.LogEntry = undefined;
+    // Same reasoning as above: this is our own just-encoded buffer, so a
+    // decode failure is encode/decode disagreeing, not a hostile peer.
     const ae_req = raft.AppendEntriesReq.decode(ae_buf[0..ae_len], &entry_scratch) catch |err| switch (err) {
-        error.Truncated, error.InvalidEncoding => {
-            std.debug.print("malformed AppendEntries, ignoring\n", .{});
-            return;
-        },
+        error.Truncated, error.InvalidEncoding => return err,
     };
 
     const outcome = raft.handleAppendEntries(current_term, &log, commit_index, ae_req);
     if (outcome.term_advanced) current_term = outcome.new_term;
-    if (!outcome.success) {
-        std.debug.print("AppendEntries rejected (consistency check failed)\n", .{});
-        return;
-    }
+    // prevLogIndex=2/prevLogTerm=2 matches this follower's log exactly, so
+    // §5.3's consistency check must pass.
+    if (!outcome.success) return error.AppendEntriesUnexpectedlyRejected;
 
     // The kernel decided WHAT to do (conflict-only truncation, which entries
     // to append, where commitIndex may advance); applying that verdict to the

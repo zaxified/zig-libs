@@ -92,11 +92,18 @@ pub fn main() !void {
     // window and backs off; both risky changes apply and arm their 20-tick
     // rollback timers.
     _ = r.tick(0);
+    const record0_applied = world.records[0].live_ip == world.records[0].desired_ip;
     std.debug.print("t=0: record0 applied={} risky0 applied={} risky1 applied={}\n", .{
-        world.records[0].live_ip == world.records[0].desired_ip,
+        record0_applied,
         world.risky[0].applied,
         world.risky[1].applied,
     });
+    // record0 has no flaky window, so it must apply on the very first pass;
+    // both risky changes unconditionally set `applied` on their first
+    // reconcile, regardless of whether they are later confirmed or reverted.
+    if (!record0_applied) return error.Record0UnexpectedlyNotApplied;
+    if (!world.risky[0].applied) return error.Risky0UnexpectedlyNotApplied;
+    if (!world.risky[1].applied) return error.Risky1UnexpectedlyNotApplied;
 
     // An external health probe confirms risky change 0 well inside its
     // window. Confirming is NOT something the reconcile pass does on its
@@ -114,13 +121,32 @@ pub fn main() !void {
 
     std.debug.print("risky0: reverted={} (confirmed in time)\n", .{world.risky[0].reverted});
     std.debug.print("risky1: reverted={} (nobody confirmed it)\n", .{world.risky[1].reverted});
+    // risky0 was confirmed at t=10, well inside its 20-tick window armed at
+    // t=0, so it must NOT have reverted; risky1 was never confirmed and the
+    // drain runs past its deadline, so it must have reverted.
+    if (world.risky[0].reverted) return error.Risky0UnexpectedlyReverted;
+    if (!world.risky[1].reverted) return error.Risky1UnexpectedlyNotReverted;
+
+    const record1_applied = world.records[1].live_ip == world.records[1].desired_ip;
     std.debug.print("record1: applied={} after {d} attempt(s)\n", .{
-        world.records[1].live_ip == world.records[1].desired_ip,
+        record1_applied,
         world.records[1].applies,
     });
+    // The drain runs well past record1's flaky window (upstream_flaky_until
+    // = 15), so it must have landed — exactly once, since reconcileRecord
+    // never fails again once past the window and nothing re-enqueues it.
+    if (!record1_applied) return error.Record1UnexpectedlyNotApplied;
+    if (world.records[1].applies != 1) return error.Record1UnexpectedApplyCount;
 
     const stats = r.stats();
     std.debug.print("reconciler stats: passes={d} failed={d} pending={d}\n", .{
         stats.reconciled, stats.failed, r.pending(),
     });
+    // Exactly one failure is expected (record1's single flaky-window miss at
+    // t=0); by t=30 every queued item has either applied or been reverted,
+    // so nothing should still be pending. `stats.reconciled` (the raw pass
+    // count) depends on backoff/requeue scheduling internals this example
+    // does not derive independently, so it stays a printed observation.
+    if (stats.failed != 1) return error.UnexpectedFailureCount;
+    if (r.pending() != 0) return error.UnexpectedPendingCount;
 }

@@ -25,22 +25,24 @@ pub fn main() !void {
     // three additions.
     var total = Decimal.zero;
     for (line_items) |s| {
+        // Every line item above is well-formed, so a parse failure here would
+        // mean the fixture and the module disagree about "well-formed".
         const amount = Decimal.parse(s) catch |err| switch (err) {
-            error.InvalidCharacter, error.Overflow => {
-                std.debug.print("skipping malformed line item {s}\n", .{s});
-                continue;
-            },
+            error.InvalidCharacter, error.Overflow => return err,
         };
+        // Three small amounts cannot overflow a decimal wide enough to hold
+        // real invoice totals; a failure here is a module regression, not an
+        // expected outcome.
         total = total.add(amount) catch |err| switch (err) {
-            error.Overflow => {
-                std.debug.print("running total overflowed, aborting\n", .{});
-                return;
-            },
+            error.Overflow => return err,
         };
     }
 
     var buf: [Decimal.str_buf_len]u8 = undefined;
     std.debug.print("subtotal: {s}\n", .{total.toString(&buf)});
+    // 19.99 + 5.50 + 100.00, worked out independently of the module.
+    const expected_subtotal = try Decimal.parse("125.49");
+    if (!total.eql(expected_subtotal)) return error.SubtotalWrong;
 
     // Add 8.25% sales tax. mul rounds the 12th fractional digit
     // half-away-from-zero, matching what a caller sees on a receipt.
@@ -49,6 +51,12 @@ pub fn main() !void {
     const grand_total = try total.add(tax);
     std.debug.print("tax: {s}\n", .{tax.toString(&buf)});
     std.debug.print("grand total: {s}\n", .{grand_total.toString(&buf)});
+    // 125.49 * 0.0825 = 10.352925, worked out by hand (well within mul's
+    // 12-fractional-digit precision, so no rounding applies).
+    const expected_tax = try Decimal.parse("10.352925");
+    if (!tax.eql(expected_tax)) return error.TaxWrong;
+    const expected_grand_total = try Decimal.parse("135.842925");
+    if (!grand_total.eql(expected_grand_total)) return error.GrandTotalWrong;
 
     // Split the grand total across 3 invoices, rounded to the cent. divRound
     // computes the quotient at an explicit result scale, resolving the
@@ -58,17 +66,18 @@ pub fn main() !void {
     const three = try Decimal.fromInt(3);
     const share = grand_total.divRound(three, 2, .half_even) catch |err| switch (err) {
         error.DivisionByZero => unreachable, // three is a compile-time-known nonzero literal
-        error.Overflow => {
-            std.debug.print("split overflowed\n", .{});
-            return;
-        },
+        error.Overflow => return err, // a three-figure invoice split cannot overflow
     };
     std.debug.print("per-invoice share (of 3): {s}\n", .{share.toString(&buf)});
+    // 135.842925 / 3 = 45.280975, half_even to 2dp: the digit after the
+    // rounding position is 0 (< 5), so it rounds down to 45.28.
+    const expected_share = try Decimal.parse("45.28");
+    if (!share.eql(expected_share)) return error.ShareWrong;
 
     // A caller-triggered division by zero must be nameable from outside the
     // module, not just observable as "some error".
     if (Decimal.one.div(Decimal.zero)) |_| {
-        unreachable;
+        return error.DivisionByZeroUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.DivisionByZero => std.debug.print("division by zero correctly rejected\n", .{}),
         error.Overflow => return err,
@@ -79,4 +88,8 @@ pub fn main() !void {
     const raw_reading = try Decimal.parse("42.126");
     const rounded = try raw_reading.rescale(2, .half_even);
     std.debug.print("reading rounded to 2dp: {s}\n", .{rounded.toString(&buf)});
+    // 42.126 half_even to 2dp: the digit after the rounding position is 6
+    // (>= 5), so it rounds up to 42.13.
+    const expected_rounded = try Decimal.parse("42.13");
+    if (!rounded.eql(expected_rounded)) return error.RescaleWrong;
 }

@@ -36,7 +36,7 @@ pub fn main() !void {
 
     switch (icmp.echo.parseV4(&reply, false)) {
         .echo_reply => |r| std.debug.print("parsed echo_reply: ident=0x{x} seq={d}\n", .{ r.ident, r.seq }),
-        .icmp_error, .ignored => std.debug.print("unexpected: reply not recognised as echo_reply\n", .{}),
+        .icmp_error, .ignored => return error.EchoReplyUnexpectedlyNotRecognised,
     }
 
     // ── the scheduler, as a real caller drives it ───────────────────────
@@ -50,7 +50,7 @@ pub fn main() !void {
     // A malformed target: the parse error must be nameable from outside so
     // a caller can reject bad config before ever opening a socket.
     if (pinger.addTarget("not-an-ip-address")) |_| {
-        std.debug.print("unexpected: bad address accepted\n", .{});
+        return error.BadAddressUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.InvalidAddress => std.debug.print("addTarget(\"not-an-ip-address\"): InvalidAddress (expected)\n", .{}),
         error.OutOfMemory => return err,

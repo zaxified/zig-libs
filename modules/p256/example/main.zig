@@ -38,7 +38,7 @@ pub fn main() !void {
     @memcpy(&tampered_buf, payload);
     tampered_buf[tampered_buf.len - 2] = '0'; // exp ...9 -> ...0
     if (sig.verify(&tampered_buf, key_pair.public_key)) |_| {
-        std.debug.print("unexpected: tampered payload verified\n", .{});
+        return error.TamperedPayloadUnexpectedlyVerified;
     } else |err| switch (err) {
         error.SignatureVerificationFailed => std.debug.print("verify(tampered payload): SignatureVerificationFailed (expected)\n", .{}),
         else => return err,
@@ -49,5 +49,6 @@ pub fn main() !void {
     // same key reproduces the exact same signature bytes — no nonce-reuse
     // hazard for a caller that signs the same claims twice.
     const sig_again = try Ecdsa.KeyPair.sign(key_pair, payload, null);
-    std.debug.print("re-sign same payload: identical bytes = {}\n", .{std.mem.eql(u8, &raw, &sig_again.toBytes())});
+    if (!std.mem.eql(u8, &raw, &sig_again.toBytes())) return error.DeterministicSignatureUnexpectedlyDiffered;
+    std.debug.print("re-sign same payload: identical bytes\n", .{});
 }

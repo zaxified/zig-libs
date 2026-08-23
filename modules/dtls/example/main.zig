@@ -81,48 +81,39 @@ pub fn main() !void {
     // Retransmission is caller-clocked: nothing here sleeps or owns a timer,
     // so a device driving this from its own event loop decides when to ask.
     if (try device.poll(500, &to_gateway)) |_| {
-        std.debug.print("unexpected: retransmitted before the timeout\n", .{});
-        return;
+        return error.RetransmittedBeforeTimeout;
     }
     const retry = (try device.poll(1_000, &to_gateway)) orelse {
-        std.debug.print("nothing to retransmit\n", .{});
-        return;
+        return error.NoRetransmissionAfterTimeout;
     };
     std.debug.print("retransmitted ClientHello at t=1000 ({d} bytes)\n", .{retry.len});
 
+    // Both sides share the provisioned PSK and an overlapping cipher suite,
+    // so this flight must be accepted — these arms exist to name what the
+    // module reports for a wrong PSK or no shared suite, not to happen here.
     const flight2 = gateway.handleFlight(retry, entropy, 1_000, &to_device) catch |err| switch (err) {
-        // A wrong PSK, or a ClientHello someone edited in flight: the binder
-        // does not verify. The gateway learns nothing about which, and the
-        // caller decides whether to answer at all — this module sends no
-        // alerts of its own.
-        error.BinderVerifyFailed, error.NoMatchingPskIdentity => {
-            std.debug.print("unknown or unauthenticated device, dropping\n", .{});
-            return;
-        },
-        // The device and the gateway share no suite either can protect
-        // records with.
-        error.NoCipherSuiteOverlap => {
-            std.debug.print("no cipher suite in common\n", .{});
-            return;
-        },
+        error.BinderVerifyFailed, error.NoMatchingPskIdentity => return error.HandshakeUnexpectedlyUnauthenticated,
+        error.NoCipherSuiteOverlap => return error.HandshakeUnexpectedlyLackedCipherOverlap,
         else => return err,
     };
     // A flight split across datagrams is consumed but not yet complete: read
     // another datagram and feed the same connection. This is the field a
     // caller can ignore and still behave correctly, because an incomplete
-    // flight also yields an empty `out`.
+    // flight also yields an empty `out`. Here the whole flight arrives in one
+    // datagram, so this must never trigger.
     if (flight2.need_more_data) {
-        std.debug.print("gateway is waiting for the rest of the flight\n", .{});
-        return;
+        return error.GatewayUnexpectedlyIncomplete;
     }
 
     const device_finished = try device.handleFlight(flight2.out, entropy, 1_000, &to_gateway);
     if (!device_finished.done) {
-        std.debug.print("device did not reach connected\n", .{});
-        return;
+        return error.DeviceUnexpectedlyNotConnected;
     }
 
     const gateway_done = try gateway.handleFlight(device_finished.out, entropy, 1_000, &to_device);
+    if (!gateway_done.done) {
+        return error.GatewayUnexpectedlyNotConnected;
+    }
     std.debug.print("handshake complete: device={s} gateway={s} (done={})\n", .{
         @tagName(device.state),
         @tagName(gateway.state),
@@ -146,7 +137,7 @@ pub fn main() !void {
     @memcpy(forged[0..record.len], record);
     forged[record.len - 1] ^= 0x80;
     if (gateway.recv(forged[0..record.len], &plain)) |_| {
-        std.debug.print("unexpected: forged record was accepted\n", .{});
+        return error.ForgedRecordUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.DecryptionFailed => std.debug.print("forged record rejected\n", .{}),
         else => return err,
@@ -156,7 +147,7 @@ pub fn main() !void {
     // anti-replay window is 64 records wide, so an attacker echoing a
     // captured measurement back cannot make it count twice.
     if (gateway.recv(record, &plain)) |_| {
-        std.debug.print("unexpected: replayed record was accepted twice\n", .{});
+        return error.ReplayedRecordUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.ReplayedRecord => std.debug.print("replayed record rejected\n", .{}),
         else => return err,

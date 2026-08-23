@@ -54,6 +54,7 @@ pub fn main() !void {
     const plaintext = try jwe.decryptCompact(gpa, .{ .symmetric = &shared_key }, token, .{});
     defer gpa.free(plaintext);
     std.debug.print("opened: \"{s}\"\n", .{plaintext});
+    if (!std.mem.eql(u8, plaintext, "refresh-token-for-user-42")) return error.DecryptedPlaintextMismatch;
 
     // ── reject: tampered ciphertext ────────────────────────────────────
     // Flip one byte inside the ciphertext segment. GCM's tag must catch
@@ -64,22 +65,28 @@ pub fn main() !void {
     const last_dot = std.mem.lastIndexOfScalar(u8, tampered, '.').?;
     const third_dot = std.mem.lastIndexOfScalar(u8, tampered[0..last_dot], '.').?;
     tampered[third_dot + 5] = if (tampered[third_dot + 5] == 'A') 'B' else 'A';
-    _ = jwe.decryptCompact(gpa, .{ .symmetric = &shared_key }, tampered, .{}) catch |err| switch (err) {
+    if (jwe.decryptCompact(gpa, .{ .symmetric = &shared_key }, tampered, .{})) |leaked| {
+        gpa.free(leaked);
+        return error.TamperedCiphertextUnexpectedlyDecrypted;
+    } else |err| switch (err) {
         error.AuthenticationFailed => {
             std.debug.print("rejected: AuthenticationFailed (tampered ciphertext)\n", .{});
         },
         else => return err,
-    };
+    }
 
     // ── reject: right key bytes, wrong key kind ─────────────────────────
     // `dir` needs a `.symmetric` key; handing it an RSA key structurally
     // cannot decrypt this token — refused before any crypto runs, the JWE
     // analogue of `jwt`'s AlgKeyMismatch algorithm-confusion defense.
     var dummy_priv: [1]u8 = .{0};
-    _ = jwe.decryptCompact(gpa, .{ .password = &dummy_priv }, token, .{}) catch |err| switch (err) {
+    if (jwe.decryptCompact(gpa, .{ .password = &dummy_priv }, token, .{})) |leaked| {
+        gpa.free(leaked);
+        return error.WrongKeyKindUnexpectedlyAccepted;
+    } else |err| switch (err) {
         error.KeyMaterialMismatch => {
             std.debug.print("rejected: KeyMaterialMismatch (dir token needs a symmetric key)\n", .{});
         },
         else => return err,
-    };
+    }
 }

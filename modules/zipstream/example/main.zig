@@ -38,7 +38,7 @@ pub fn main() !void {
         // unpack: `addEntry` gates it through the same `isSafeEntryName`
         // check a caller extracting to disk is told to use itself.
         if (writer.addEntry("../../etc/passwd", "pwned", .{})) |_| {
-            std.debug.print("unexpected: unsafe entry name accepted\n", .{});
+            return error.UnsafeEntryNameUnexpectedlyAccepted;
         } else |err| switch (err) {
             error.ZipUnsafeEntryName => std.debug.print("addEntry(\"../../etc/passwd\"): ZipUnsafeEntryName (expected)\n", .{}),
             else => return err,
@@ -70,6 +70,9 @@ pub fn main() !void {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(gpa);
     try er.reader().appendRemaining(gpa, &content, .unlimited);
-    std.debug.print("summary.csv content:\n{s}", .{content.items});
-    std.debug.print("crc32 verified: {}\n", .{!er.crcMismatch()});
+    const original_summary = "id,total\n1,42\n2,17\n";
+    if (!std.mem.eql(u8, content.items, original_summary)) return error.RoundTripContentMismatch;
+    std.debug.print("summary.csv content round-tripped:\n{s}", .{content.items});
+    if (er.crcMismatch()) return error.Crc32UnexpectedlyMismatched;
+    std.debug.print("crc32 verified: true\n", .{});
 }

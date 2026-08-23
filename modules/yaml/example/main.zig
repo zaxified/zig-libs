@@ -47,9 +47,10 @@ pub fn main() !void {
     // read back identically without the document repeating them on the wire.
     const defaults = doc.root.get("defaults").?;
     const overrides = doc.root.get("overrides").?;
+    if (defaults.mapping.ptr != overrides.mapping.ptr) return error.AliasUnexpectedlyNotSharedStructure;
     std.debug.print(
-        "defaults.timeout_ms={d} overrides.timeout_ms={d} (same slice: {})\n",
-        .{ defaults.get("timeout_ms").?.int, overrides.get("timeout_ms").?.int, defaults.mapping.ptr == overrides.mapping.ptr },
+        "defaults.timeout_ms={d} overrides.timeout_ms={d} (same slice: true)\n",
+        .{ defaults.get("timeout_ms").?.int, overrides.get("timeout_ms").?.int },
     );
 
     // A repeated mapping key is a classic smuggled-disagreement bug (which
@@ -58,7 +59,7 @@ pub fn main() !void {
     // config loader can report the file, not just "parse failed".
     const dup_doc = "a: 1\na: 2\n";
     if (yaml.compose(gpa, dup_doc, .{})) |_| {
-        std.debug.print("unexpected: duplicate key accepted\n", .{});
+        return error.DuplicateKeyUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.DuplicateKey => std.debug.print("compose(duplicate key): DuplicateKey (expected)\n", .{}),
         else => return err,

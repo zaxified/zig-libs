@@ -139,10 +139,8 @@ pub fn main() !void {
     });
     defer add_bob.deinit(gpa);
 
-    const welcome_for_bob = add_bob.welcome orelse {
-        std.debug.print("commit added nobody, so there is no Welcome\n", .{});
-        return;
-    };
+    // This Commit adds bob, so a Welcome for him must exist.
+    const welcome_for_bob = add_bob.welcome orelse return error.NoWelcomeForAddedMember;
 
     var bob_group = mls.Group(S).fromWelcome(gpa, .{
         .welcome_msg = welcome_for_bob,
@@ -152,17 +150,13 @@ pub fn main() !void {
     }) catch |err| switch (err) {
         // The Welcome was not addressed to this client's KeyPackage — an
         // ordinary outcome when a Delivery Service fans one Welcome out to
-        // several clients and each tries its own slot.
-        error.NoMatchingKeyPackage => {
-            std.debug.print("bob: this Welcome is not for us\n", .{});
-            return;
-        },
+        // several clients and each tries its own slot. Here it is addressed
+        // to bob and must be accepted.
+        error.NoMatchingKeyPackage => return error.WelcomeUnexpectedlyNotForBob,
         // The committer's tree does not hash to what the GroupInfo it signed
         // says. Joining anyway would put bob in a group nobody else is in.
-        error.TreeHashMismatch => {
-            std.debug.print("bob: refusing a Welcome whose tree does not match\n", .{});
-            return;
-        },
+        // Here alice's tree is correct and must verify.
+        error.TreeHashMismatch => return error.WelcomeUnexpectedlyHadTreeHashMismatch,
         else => return err,
     };
     defer bob_group.deinit();
@@ -178,32 +172,23 @@ pub fn main() !void {
     });
     defer add_carol.deinit(gpa);
 
+    // This Commit is fresh and well-formed, so bob must process it cleanly —
+    // the named arms below document what each error means, not an outcome
+    // expected here.
     bob_group.processCommit(.{ .commit_msg = add_carol.commit }) catch |err| switch (err) {
         // A Commit for an epoch this member has already left behind, which
         // is what a redelivered message looks like. Checked before anything
         // is mutated, so the group is still usable.
-        error.WrongEpoch => {
-            std.debug.print("bob: stale Commit, ignoring\n", .{});
-            return;
-        },
+        error.WrongEpoch => return error.CommitUnexpectedlyStale,
         // The Commit names proposals by reference that this member never
         // received. It has to collect them and retry, not guess.
-        error.ProposalNotFound => {
-            std.debug.print("bob: missing a referenced proposal\n", .{});
-            return;
-        },
+        error.ProposalNotFound => return error.CommitUnexpectedlyMissingProposal,
         // §12.2: the committed proposal list is not one this member will
         // accept, whatever the signature says.
-        error.InvalidProposalList => {
-            std.debug.print("bob: rejecting an invalid proposal list\n", .{});
-            return;
-        },
+        error.InvalidProposalList => return error.CommitUnexpectedlyInvalidProposalList,
         // Handshake messages framed as `PrivateMessage` need the §9 secret
         // tree driven per epoch, which this group object does not own.
-        error.PrivateHandshakeNotSupported => {
-            std.debug.print("bob: encrypted handshake messages are not supported\n", .{});
-            return;
-        },
+        error.PrivateHandshakeNotSupported => return error.CommitUnexpectedlyPrivate,
         else => return err,
     };
 
@@ -213,7 +198,7 @@ pub fn main() !void {
     // A redelivered Commit is the normal case, not an exception: the epoch
     // check rejects it and leaves the group exactly as it was.
     if (bob_group.processCommit(.{ .commit_msg = add_carol.commit })) |_| {
-        std.debug.print("unexpected: a replayed Commit advanced the epoch\n", .{});
+        return error.ReplayedCommitUnexpectedlyAdvancedEpoch;
     } else |err| switch (err) {
         error.WrongEpoch => std.debug.print("bob: replayed Commit ignored, epoch still {d}\n", .{bob_group.epoch}),
         else => return err,
@@ -227,5 +212,6 @@ pub fn main() !void {
     var bob_key: [32]u8 = undefined;
     try mls.mlsExporter(S, alice_group.secrets.exporter_secret, "example attachment key", "file-1", &alice_key);
     try mls.mlsExporter(S, bob_group.secrets.exporter_secret, "example attachment key", "file-1", &bob_key);
-    std.debug.print("exported keys agree: {}\n", .{std.mem.eql(u8, &alice_key, &bob_key)});
+    if (!std.mem.eql(u8, &alice_key, &bob_key)) return error.ExportedKeysDisagree;
+    std.debug.print("exported keys agree\n", .{});
 }

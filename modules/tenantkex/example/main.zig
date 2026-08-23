@@ -47,15 +47,12 @@ pub fn main() !void {
     defer fin_i_keys.wipe();
 
     std.debug.print("session established, {d}-byte + {d}-byte handshake\n", .{ n1, fin_r.len });
-    std.debug.print("initiator.send == responder.recv: {}\n", .{
-        std.mem.eql(u8, &fin_i_keys.send_key, &fin_r_keys.recv_key),
-    });
-    std.debug.print("initiator.recv == responder.send: {}\n", .{
-        std.mem.eql(u8, &fin_i_keys.recv_key, &fin_r_keys.send_key),
-    });
-    std.debug.print("transcript hash matches on both sides: {}\n", .{
-        std.mem.eql(u8, &fin_i_keys.transcript_hash, &fin_r_keys.transcript_hash),
-    });
+    if (!std.mem.eql(u8, &fin_i_keys.send_key, &fin_r_keys.recv_key)) return error.SendRecvKeyMismatch;
+    std.debug.print("initiator.send == responder.recv: true\n", .{});
+    if (!std.mem.eql(u8, &fin_i_keys.recv_key, &fin_r_keys.send_key)) return error.RecvSendKeyMismatch;
+    std.debug.print("initiator.recv == responder.send: true\n", .{});
+    if (!std.mem.eql(u8, &fin_i_keys.transcript_hash, &fin_r_keys.transcript_hash)) return error.TranscriptHashMismatch;
+    std.debug.print("transcript hash matches on both sides: true\n", .{});
 
     // Tenant isolation: a responder provisioned for a DIFFERENT I-SID must
     // reject the same initiator's msg1 — the prologue mismatch breaks the
@@ -71,7 +68,7 @@ pub fn main() !void {
     var stray_msg1: [tenantkex.message1Len(0)]u8 = undefined;
     const sn1 = try stray_initiator.writeMessage1(rng2.random(), "", &stray_msg1);
     if (mismatched_responder.readMessage1(stray_msg1[0..sn1], &payload_out)) |_| {
-        std.debug.print("unexpectedly accepted a cross-tenant handshake\n", .{});
+        return error.CrossTenantHandshakeUnexpectedlyAccepted;
     } else |err| switch (err) {
         error.DecryptionFailed => std.debug.print(
             "cross-tenant handshake correctly rejected (DecryptionFailed)\n",

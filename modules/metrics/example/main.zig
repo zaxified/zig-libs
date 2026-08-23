@@ -61,11 +61,44 @@ pub fn main() !void {
     std.debug.print("accepted={d} rejected={d} queue_depth={d:.0}\n", .{
         requests.value(), rejected.value(), queue_depth.value(),
     });
+    // 5 samples, one (index 2) rejected: 4 accepted, 1 rejected, and the
+    // queue was set to 5 then dec()'d 5 times back to 0.
+    if (requests.value() != 4) return error.AcceptedCountWrong;
+    if (rejected.value() != 1) return error.RejectedCountWrong;
+    if (queue_depth.value() != 0) return error.QueueDepthWrong;
+
+    std.debug.print("latency: count={d} sum={d:.3}\n", .{ latency.count(), latency.sum() });
+    // Same 5 samples: count is trivially 5, sum is 0.003+0.02+0.08+0.4+0.02.
+    if (latency.count() != 5) return error.HistogramCountWrong;
+    const expected_sum: f64 = 0.003 + 0.02 + 0.08 + 0.4 + 0.02;
+    if (@abs(latency.sum() - expected_sum) > 1e-12) return error.HistogramSumWrong;
+
+    // A name already registered as one instrument kind must be refused as
+    // another — the exposition format has no way to represent a family that
+    // is both a counter and a gauge.
+    if (registry.gauge("orders_total", "wrong kind", &.{})) |_| {
+        return error.WrongTypeUnexpectedlyAccepted;
+    } else |err| switch (err) {
+        error.WrongType => std.debug.print("re-registering \"orders_total\" as a gauge correctly rejected (WrongType)\n", .{}),
+        else => return err,
+    }
 
     // Render straight into a fixed buffer -- no socket, no `http` server --
     // proving `writeText` only needs a `std.Io.Writer`.
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try registry.writeText(&w);
-    std.debug.print("\n--- Prometheus exposition ---\n{s}", .{w.buffered()});
+    const exposition = w.buffered();
+    std.debug.print("\n--- Prometheus exposition ---\n{s}", .{exposition});
+    // The rendered text must carry the same numbers just asserted above, not
+    // just plausible-looking ones.
+    if (std.mem.indexOf(u8, exposition, "orders_total{outcome=\"accepted\"} 4") == null) {
+        return error.ExpositionMissingAcceptedCount;
+    }
+    if (std.mem.indexOf(u8, exposition, "orders_total{outcome=\"rejected\"} 1") == null) {
+        return error.ExpositionMissingRejectedCount;
+    }
+    if (std.mem.indexOf(u8, exposition, "order_queue_depth 0") == null) {
+        return error.ExpositionMissingQueueDepth;
+    }
 }

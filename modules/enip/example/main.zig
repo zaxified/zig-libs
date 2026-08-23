@@ -90,7 +90,7 @@ pub fn main() !void {
     // returning zeroed or stale data — the batch above already showed this
     // as a `null` slot; here it is the direct single-tag form.
     if (client.readTag("NoSuchTag", 1)) |_| {
-        std.debug.print("unexpectedly read a nonexistent tag\n", .{});
+        return error.NonexistentTagUnexpectedlyReadable;
     } else |err| switch (err) {
         error.CipError => std.debug.print("unknown tag correctly refused (CipError)\n", .{}),
         else => return err,

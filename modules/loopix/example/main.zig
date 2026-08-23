@@ -114,6 +114,11 @@ pub fn main() !void {
         "FIFO mix:    min_effective_set={d:.2} max_link_prob={d:.2} holds={}\n",
         .{ fifo.min_effective_set, fifo.max_link_prob, fifo.holds(bound) },
     );
+    // The matching negative control: FIFO's order-preserving hold gives the
+    // adversary a deterministic arrival<->departure correlation, so it must
+    // NOT clear the anonymity bound — this is what proves the bound is
+    // actually discriminating Poisson mixing from a mix that does nothing.
+    if (fifo.holds(bound)) return error.FifoMixUnexpectedlyPassedAnonymityBound;
 }
 
 /// Pick a plausible first-layer mix for a piece of cover traffic (cover does
