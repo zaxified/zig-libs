@@ -65,7 +65,7 @@ const module_list = [_]Module{
     .{ .name = "accesslog", .deps = &.{"http"} },
     .{ .name = "staticfiles", .deps = &.{"http"} },
     .{ .name = "brotli", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "dns", .deps = &.{ "netaddr", "http" } },
+    .{ .name = "dns", .deps = &.{ "netaddr", "http" }, .example = true },
     .{ .name = "ramcache", .example = true },
     .{ .name = "router", .deps = &.{"http"}, .example = true },
     .{ .name = "ratelimit", .deps = &.{ "router", "http", "netaddr" } },
