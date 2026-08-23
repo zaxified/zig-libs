@@ -328,7 +328,13 @@ pub const Scheduler = struct {
 
         snp.sortEntries(entries[0..m]);
 
-        const per = self.cfg.lsp_entries_per_pdu;
+        // `Config.lsp_entries_per_pdu` is caller-supplied and `init`'s
+        // `std.debug.assert` is the only thing that keeps it `>= 1` — and
+        // that assert is compiled OUT in ReleaseFast. Without this clamp a
+        // caller-constructed `Config{ .lsp_entries_per_pdu = 0 }` makes `j ==
+        // i` forever (see `emitCsnp`'s sibling clamp for the sharper failure
+        // mode this exact gap causes there). See CHANGELOG.
+        const per = @max(@as(usize, 1), self.cfg.lsp_entries_per_pdu);
         const src = self.sourceId();
         var i: usize = 0;
         while (i < m) {
@@ -414,7 +420,16 @@ pub const Scheduler = struct {
 
         snp.sortEntries(entries[0..m]);
 
-        const per = self.cfg.lsp_entries_per_pdu;
+        // See the identical clamp + comment in `emitPsnp`. Here the gap is
+        // sharper than a stalled loop: with `per == 0` and `m > 0`, `j ==
+        // i == 0` on the first pass, `j >= m` is false, and `chunk_end =
+        // entries[j - 1]` underflows `j - 1` (`usize` 0 - 1). In
+        // Debug/ReleaseSafe that is a caught "integer overflow" panic; in
+        // ReleaseFast — where safety checks (and `init`'s guarding assert)
+        // are BOTH compiled out — it is an out-of-bounds read at an
+        // address `usize.max` slots past `entries`, undefined behaviour on
+        // a public function driven entirely by caller-supplied `Config`.
+        const per = @max(@as(usize, 1), self.cfg.lsp_entries_per_pdu);
         const src = self.sourceId();
         var i: usize = 0;
         var advertised_to: ?LspId = null;
@@ -1106,4 +1121,77 @@ test "last-sent map is pruned when SRM clears (bounded by the SRM-flagged set)" 
     db.clearSrm(id, 0);
     _ = sched.poll(1, oneUp(0), &db, &out, &scratch);
     try testing.expectEqual(@as(usize, 0), sched.last_sent.count()); // pruned
+}
+
+// ── fail-open guard: Config.lsp_entries_per_pdu is caller-supplied, and
+// `init`'s `std.debug.assert(cfg.lsp_entries_per_pdu >= 1 ...)` is the ONLY
+// thing that ever kept it there — an assert the compiler removes entirely in
+// ReleaseFast. Found while building `example/main.zig` (2026-08-23): the
+// example's own happy path never sets this to 0 (it always goes through
+// `init` with a sane default or a positive override, same as every existing
+// test in this file), so nothing here was ever red — the gap was found by
+// reading `emitPsnp`/`emitCsnp` while writing the example, not by the example
+// itself failing. Fixed at both use sites with `@max(1, ...)` rather than
+// relying on the constructor-time assert (CONVENTIONS: fix the invariant
+// where it is used, not only where it is declared) — see CHANGELOG.
+
+test "fail-open guard: lsp_entries_per_pdu == 0 does not underflow emitCsnp / stall emitPsnp" {
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var lbuf: [128]u8 = undefined;
+    // SSN lands on `arrival` (1), which is also the interface polled below —
+    // exercises emitPsnp's chunker. The DB being non-empty also makes the
+    // very first poll's periodic CSNP non-trivial (m > 0) — exercises
+    // emitCsnp's chunker, where the underflow actually lived.
+    try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), idOf(sys_other, 0));
+
+    // Bypass `Scheduler.init`'s public-API guard on purpose: its assert is
+    // the only thing a Debug/ReleaseSafe build uses to keep this value
+    // sane, and a ReleaseFast build has no such backstop at all — so a
+    // ReleaseFast caller can reach `poll` with this value exactly as this
+    // struct literal does.
+    var sched: Scheduler = .{
+        .alloc = testing.allocator,
+        .cfg = .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 0 },
+    };
+    defer sched.deinit();
+
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    // Must terminate and make real progress (not underflow, not spin
+    // emitting zero-entry PDUs forever) on the very first call — the
+    // underflow this guards against fired on emitCsnp's first pass.
+    const r0 = sched.poll(0, oneUp(arrival), &db, &out, &scratch);
+    try testing.expect(countKind(r0.effects, .psnp) >= 1); // the SSN entry was drained
+    try testing.expect(!db.ssnSet(idOf(sys_other, 0)).?.isSet(arrival)); // actually acked, not spun on
+    _ = sched.poll(1, oneUp(arrival), &db, &out, &scratch); // a second poll: still terminates
+}
+
+test "fail-open guard: lsp_entries_per_pdu == 0 does not underflow emitCsnp's entries[j-1]" {
+    // The sibling test above polls the interface carrying the pending SSN,
+    // so `emitPsnp`'s own `per == 0` stall (bounded by `out.len`) fills
+    // `out` and the outer loop breaks before ever reaching `emitCsnp` for
+    // that interface — it proves emitPsnp's half of the gap, not
+    // emitCsnp's. This test polls iface 0 instead, which has NO SSN
+    // pending (arrivalDb only sets SSN on `arrival`), so `emitPsnp` returns
+    // immediately ("nothing to ack") and control reaches the periodic CSNP
+    // — which fires unconditionally on an interface's first poll — with a
+    // non-empty database (`m == 1`) and `per == 0`. That is exactly the
+    // `entries[j - 1]` underflow this test guards.
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 8 });
+    defer db.deinit();
+    var lbuf: [128]u8 = undefined;
+    try arrivalDb(&db, buildLsp(&lbuf, sys_other, 0, 1, 1000), idOf(sys_other, 0));
+    try testing.expect(db.ssnSet(idOf(sys_other, 0)).?.count() == 1); // only on `arrival`, not iface 0
+
+    var sched: Scheduler = .{
+        .alloc = testing.allocator,
+        .cfg = .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 0 },
+    };
+    defer sched.deinit();
+
+    var out: [16]Effect = undefined;
+    var scratch: [1024]u8 = undefined;
+    const r0 = sched.poll(0, oneUp(0), &db, &out, &scratch);
+    try testing.expect(countKind(r0.effects, .csnp) >= 1); // the periodic CSNP still fired
 }
