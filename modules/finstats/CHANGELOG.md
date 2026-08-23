@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — Three follow-ups to the two entries below, none of which change a number.
+  (1) **The measured `rate_tol = null` cost table in `XirrSpec.rate_tol` is now reproducible.**
+  It published seven cells and named no construction, and an independent attempt using this
+  module's own analogous test as the construction did not reproduce it — four of the seven were
+  off by factors of 2–4 (`M = 30` read `0.006` against a measured `0.023`). The doc comment now
+  states the construction outright (the two dates, the `flow = value = M` / `value = 1.1·M` shape,
+  `opening = .none`, error = |`rate_tol = null` − `rate_tol = 1e-9`| × 100) and carries the table
+  re-measured against it, plus two corrections the old prose got wrong: the crossing of a basis
+  point is between `M = 100` and `M = 300`, not "around 30", and the fall is not monotone — where
+  bisection stops is a chaotic function of scale, so `M = 3` and `M = 10` stop on the identical
+  midpoint. New test *"xirr: the cost of `rate_tol = null` is measured here, not quoted"*
+  re-derives every published cell, so a comment can no longer drift away from the code.
+  (2) **New public constants `bracket_lo` / `bracket_hi` / `default_rate_tol`**, replacing four
+  copies of `-0.99`/`10.0` (bisection's starting bracket, both sign-change checks and Newton's
+  "stepped outside the bracket" test) and four copies of `1e-9` (the four specs that carry a
+  `rate_tol`). Same thesis as unifying `buildCashflows` and `bisect` in the entry below: a
+  byte-identical copy is a byte-identical gap, and Newton's bail-out is precisely *why* the four
+  bracket sites have to agree. Behaviour-identical — the suite is 33/33 either side, and the table
+  test above pins the exact numbers.
+  (3) **New test *"xirrPrecise: the same window, against an independent oracle"***. `xirr` had its
+  windowed answer checked against the time-weighted return; `xirrPrecise` had no equivalent, even
+  though the case the `opening` change exists for — a window whose first row carries a flow, which
+  DOES bracket a root and converges on the IRR of a different question — is exactly the one no
+  runtime guard can catch. Two cashflows have a closed form, so the Newton path is now held to
+  arithmetic at `1e-9` rather than to a second root-finder. Making `xirrPrecise` ignore
+  `spec.opening` used to leave the suite green; it now fails that one test and nothing else.
 - **2026-08-23** — **BREAKING: `opening` is now a REQUIRED field**, and convergence is measured in
   the answer's units. Three things, all closing gaps left open by the change below it the same day.
   (1) `XirrSpec.opening`, `XirrPreciseSpec.opening` and `XirrNodeSpec.opening` lost their `.none`

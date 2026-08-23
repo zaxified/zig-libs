@@ -55,7 +55,12 @@ pinned by tests.
   opening figure taken before it). No default because the sign-change check
   cannot catch a forgotten seed in general — a window whose first row carries a
   flow brackets a root and converges on the IRR of a different question — so
-  the compiler is the only complete detector.
+  the detector is the compiler: omit the field and the call does not build.
+  **That covers source-level construction only.** A spec deserialized from a
+  config file (`std.json.parseFromValue`, say) turns the same omission into a
+  run-time parse error instead, and one parsed with `ignore_unknown_fields`
+  will not even report a MISSPELLED field. If that is your shape, make the mode
+  required a second time in whatever schema the config is written against.
 - **`annualize`** — CAGR `(1 + total_return)^(365.25/days) − 1`.
 - **`twrDaily`** — Modified-Dietz daily return `r = (v − prev − flow) / pe`,
   skipping rows with performance-eligible base `pe ≤ 1e-6`, with an optional
