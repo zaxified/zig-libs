@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 229 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`, compiling
+**Status:** 230 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`, compiling
 clean in `-Dstrict-debug`) · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -225,6 +225,7 @@ Every one of the 229 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | `decimal` | — | compiles | — |
 | `diagnostics` | — | compiles | — |
 | `diskfree` | compiles | — | — |
+| `diskusage` | compiles | — | — |
 | `dns` | compiles | — | — |
 | `encoding` | — | compiles | — |
 | `framing` | compiles | — | — |
@@ -361,6 +362,7 @@ way to recognise it.
 | [`pping`](modules/pping/README.md) | Passive RTT estimation from TCP TSval/TSecr echo matching (RFC 7323 / Pollere pping) — bounded per-direction table, no double-counting of duplicate/delayed ACKs | any | — |
 | [`procnet`](modules/procnet/README.md) | Linux `/proc`+`/sys` parsers — ARP/routes/TCP+UDP sockets/conntrack/process stats/device health, typed | **linux** | netaddr |
 | [`diskfree`](modules/diskfree/README.md) | `statfs`/`statfs64` disk-space query (total/free/available, inodes, block size) + `/proc/self/mounts`+`mountinfo` parsers — what's mounted and how full, no `df`/`mount` subprocess | **linux** | — |
+| [`diskusage`](modules/diskusage/README.md) | `du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary | **linux** | — |
 | [`conntrack`](modules/conntrack/README.md) | Linux ctnetlink (NETLINK_NETFILTER) client — typed conntrack flow dump/get/delete plus event subscription, over `netlink`'s write engine | **linux** | netlink, netaddr |
 | [`rawsock`](modules/rawsock/README.md) | Linux AF_PACKET raw-frame capture + inject — BPF filter, promiscuous mode, typed frame decode | **linux** | netaddr |
 | [`stun`](modules/stun/README.md) | STUN client (RFC 8489) — NAT reflexive-address discovery: XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT | any | netaddr |

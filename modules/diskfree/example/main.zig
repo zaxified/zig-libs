@@ -12,13 +12,13 @@
 //! plus `/proc/self/mounts`/`mountinfo` parsers. This demo therefore walks
 //! no directories, stats no files, and accumulates no sizes — it can only
 //! ever answer "how full is this filesystem", never "how much space do
-//! these files use". A real `du` would need a raw `stat`/`lstat` syscall
-//! wrapper first: the portable `std.Io.File.Stat` this collection otherwise
-//! uses carries neither `st_blocks` (the real block allocation `du` counts,
-//! as opposed to the logical file size) nor `st_dev` (needed to stop at a
-//! filesystem boundary, `du -x`) — `statfs.zig` already sets the precedent
-//! for that kind of raw-syscall wrapper, but writing one is its own unit of
-//! work, not something this module or this demo does today.
+//! these files use". That second question belongs to the sibling
+//! `diskusage` module, which exists for it: the portable `std.Io.File.Stat`
+//! this collection otherwise uses carries neither `st_blocks` (the real
+//! block allocation `du` counts, as opposed to the logical file size) nor
+//! `st_dev` (needed to stop at a filesystem boundary, `du -x`), so it wraps
+//! `statx`/`fstatat` directly — the same kind of raw-syscall wrapper
+//! `statfs.zig` is here.
 //!
 //! **The `f_bfree`/`f_bavail` split is the module's one deliberate
 //! departure from a naive port**, and this demo makes it visible rather than

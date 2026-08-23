@@ -183,6 +183,7 @@ const module_list = [_]Module{
     .{ .name = "blobstore", .deps = &.{"hashdigest"}, .example = true },
     .{ .name = "procnet", .deps = &.{"netaddr"}, .example = true },
     .{ .name = "diskfree", .example = true },
+    .{ .name = "diskusage", .example = true },
     .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "procrun", .deps = &.{"argsafe"} },
     .{ .name = "dataset", .example = true },
