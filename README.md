@@ -569,7 +569,7 @@ way to recognise it.
 | [`qr`](modules/qr/README.md) | QR Code encoder and decoder (ISO/IEC 18004 model 2) — versions 1–40, levels L/M/Q/H, numeric/alphanumeric/byte modes, Reed-Solomon error correction, structured append; SVG and terminal renderers, allocation-free. | any | — |
 | [`qrscan`](modules/qrscan/README.md) | Locate a QR symbol in a grayscale image (luma + stride, camera or canvas) at any rotation and moderate tilt, and sample it into a `qr.Matrix`; block-adaptive binarisation, connected-component finder location, allocation-free. | any | qr |
 | [`tar`](modules/tar/README.md) | ustar/GNU tar reader+writer (preserves uid/gid/mtime) + gzip. | any (packer: linux) | — |
-| [`tz`](modules/tz/README.md) | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (600 zones + POSIX-TZ footer). | any | datefmt |
+| [`tz`](modules/tz/README.md) | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (598 zones + POSIX-TZ footer). | any | datefmt |
 | [`yaml`](modules/yaml/README.md) | YAML 1.2 reader (not 1.1) — scanner → parser → composer over the core schema (no `yes`/`no` booleans); cyclic aliases rejected. | any | — |
 | [`zipstream`](modules/zipstream/README.md) | Streaming ZIP archive reader — walks the central directory once, streams decompressed member bytes on demand. | any | — |
 

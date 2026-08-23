@@ -39,7 +39,7 @@ pub const Zone = struct {
     posix: []const u8,         // POSIX-TZ footer string
 };
 pub const Transition = struct { ts: i64, off: i32, dst: bool };
-pub const zones: []const Zone; // all 600 zones, sorted by name
+pub const zones: []const Zone; // all 598 zones, sorted by name
 ```
 
 `find` binary-searches `zones` by name (case-sensitive, matching IANA
@@ -78,7 +78,7 @@ spelling exactly). `offsetAt`:
 
 Provenance: `src/root.zig` is original work of the zig-libs authors (MIT);
 `src/tz_data.zig` is generated data — the UTC-offset transition tables and
-POSIX-TZ footer rule per zone (600 zones, transitions from 1970 onward),
+POSIX-TZ footer rule per zone (598 zones, transitions from 1970 onward),
 produced ahead of time by the `tz-gen` tool from the IANA Time Zone Database
 (tzdata 2026a release, <https://www.iana.org/time-zones>), which is in the
 PUBLIC DOMAIN ("This file is in the public domain, so clarified as of

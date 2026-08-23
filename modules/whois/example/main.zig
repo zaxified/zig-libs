@@ -68,6 +68,14 @@ fn runLookup(transport: whois.Transport, query: []const u8) bool {
             );
             return false;
         },
+        // Distinct from TransportFailed on purpose: the query was abandoned
+        // by whoever asked for it, so retrying it against another server --
+        // which is exactly what a referral chase would otherwise do -- is
+        // work nobody is waiting for any more.
+        error.Canceled => {
+            std.debug.print("whois-demo: lookup canceled\n", .{});
+            return false;
+        },
         error.ResponseTooLarge => {
             std.debug.print("whois-demo: a reply exceeded the {d}-byte demo buffer\n", .{buf.len});
             return true;

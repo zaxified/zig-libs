@@ -16,7 +16,7 @@ const tz_data = @import("tz_data.zig");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (600 zones + POSIX-TZ footer).",
+    .doc = "IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (598 zones + POSIX-TZ footer).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -247,6 +247,16 @@ fn ruleDateUnix(year: i32, r: Rule, time_secs: i32) ?i64 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+// The zone count is written in this module's `meta.doc` (which renders the
+// root README's catalog row), in its README and in its SPEC. `scripts/tz-gen`
+// can move it: dropping `localtime` and `posixrules` took it from 600 to 598
+// and left three of those four places saying 600. Pin it here, so a
+// regeneration that changes the count cannot land without someone walking past
+// the number.
+test "zone count matches what the documentation states" {
+    try testing.expectEqual(@as(usize, 598), tz_data.zones.len);
+}
 
 test "find: known + unknown zones" {
     try testing.expect(find("Europe/Prague") != null);

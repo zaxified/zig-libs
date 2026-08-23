@@ -107,6 +107,13 @@ pub const TransportError = error{
     TransportFailed,
     /// The reply did not fit the caller's response buffer (byte cap).
     ResponseTooLarge,
+    /// The caller canceled the lookup while it was waiting on the socket.
+    /// Distinct from `TransportFailed` on purpose: a consumer that folds the
+    /// two together retries a request its own caller already abandoned, and
+    /// reports a healthy WHOIS server as a dead one. `Io.Reader`'s error set
+    /// cannot carry this, so the concrete reader records it and the transport
+    /// recovers it -- see CONVENTIONS.md's cancelation invariant.
+    Canceled,
 };
 
 /// The one I/O operation WHOIS needs: connect to `server:port`, send the
@@ -386,27 +393,41 @@ pub const TcpTransport = struct {
         const t: *TcpTransport = @ptrCast(@alignCast(ctx));
 
         const host = std.Io.net.HostName.init(server) catch return error.TransportFailed;
-        const stream = host.connect(t.io, port, .{ .mode = .stream }) catch
-            return error.TransportFailed;
+        const stream = host.connect(t.io, port, .{ .mode = .stream }) catch |e|
+            return if (e == error.Canceled) error.Canceled else error.TransportFailed;
         defer stream.close(t.io);
 
         var wbuf: [max_query_len + 2]u8 = undefined;
         var sw = stream.writer(t.io, &wbuf);
-        sw.interface.writeAll(query) catch return error.TransportFailed;
-        sw.interface.flush() catch return error.TransportFailed;
+        sw.interface.writeAll(query) catch return writeFailure(&sw);
+        sw.interface.flush() catch return writeFailure(&sw);
 
         var rbuf: [4096]u8 = undefined;
         var sr = stream.reader(t.io, &rbuf);
         const n = sr.interface.readSliceShort(response_buf) catch
-            return error.TransportFailed;
+            return readFailure(&sr);
         if (n == response_buf.len) {
             // Buffer exactly full — distinguish "fit exactly" from "more coming".
             var extra: [1]u8 = undefined;
             const m = sr.interface.readSliceShort(&extra) catch
-                return error.TransportFailed;
+                return readFailure(&sr);
             if (m != 0) return error.ResponseTooLarge;
         }
         return n;
+    }
+
+    /// Tell a canceled wait apart from a genuine read failure. `Io.Reader`'s
+    /// error set cannot carry `Canceled`; the concrete reader records it here,
+    /// and this is the only place that reason still exists.
+    fn readFailure(sr: *std.Io.net.Stream.Reader) TransportError {
+        if (sr.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.TransportFailed;
+    }
+
+    /// The writer side of `readFailure`.
+    fn writeFailure(sw: *std.Io.net.Stream.Writer) TransportError {
+        if (sw.err) |e| if (e == error.Canceled) return error.Canceled;
+        return error.TransportFailed;
     }
 };
 
@@ -831,6 +852,60 @@ fn fuzzParseServerRef(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
     _ = parseServerRef(buf[0..len]);
+}
+
+// -- test (cancellation, loopback) -----------------------------------------
+//
+// A WHOIS reply is read until the server closes, so a canceled lookup is
+// parked in the kernel on a socket that will never produce another byte --
+// the shape that used to come back as `TransportFailed` and make a consumer
+// retry a query its own caller had already abandoned. The peer here answers
+// nothing at all, so the read under test is genuinely blocked, not racing a
+// buffered response.
+
+const CancelPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    stop: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *CancelPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        while (p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+};
+
+fn exchangeOnce(t: Transport, server: []const u8, port: u16, buf: []u8) TransportError![]const u8 {
+    return t.exchange(server, port, "example.com\r\n", buf);
+}
+
+test "TcpTransport: a canceled read surfaces error.Canceled, not error.TransportFailed" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("whois cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: CancelPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, CancelPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var tcp: TcpTransport = .{ .io = io };
+    var buf: [256]u8 = undefined;
+
+    var fut = try io.concurrent(exchangeOnce, .{ tcp.transport(), "127.0.0.1", port, &buf });
+    // Long enough that the query has been written and the reply read is the
+    // one parked in the kernel.
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }
 
 test {

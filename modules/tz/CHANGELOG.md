@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — Documentation: `meta.doc`, `README.md` and `SPEC.md` still
+  said 600 zones after the table dropped to 598. The root README's catalog row
+  is rendered from `meta.doc`, so the stale count had propagated there too. A
+  test now pins `zones.len`, so a regeneration that moves the count cannot land
+  without someone walking past the number.
+
 - **2026-08-22** — **Behavioural:** two entries left the table, taking it from 600 zones to 598.
   `localtime` and `posixrules` are not IANA zones at all: on a Debian/Ubuntu host
   `/usr/share/zoneinfo/localtime` symlinks to `/etc/localtime`, so the committed table carried
