@@ -93,6 +93,13 @@ pub fn main() !void {
         "Poisson mix: min_effective_set={d:.2} max_link_prob={d:.2} holds={}\n",
         .{ poisson.min_effective_set, poisson.max_link_prob, poisson.holds(bound) },
     );
+    // The module's own headline claim, asserted rather than printed: Poisson
+    // mixing must clear the deployment's anonymity bound against the global
+    // passive adversary. Printing it made this line green on a run where it
+    // said `holds=false`, which is the half of the pair the FIFO control below
+    // cannot cover -- a negative control only proves the bound REJECTS, never
+    // that it ACCEPTS what it is supposed to.
+    if (!poisson.holds(bound)) return error.PoissonMixUnexpectedlyFailedAnonymityBound;
 
     // Same arrivals, but a FIFO/constant hold instead of the exponential one
     // — what the module's own `fifo_delay` positive control uses. Rebuild
