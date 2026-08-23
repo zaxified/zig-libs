@@ -73,11 +73,58 @@ fi
 # Step logs off tmpfs. `mktemp` follows TMPDIR, and on a desktop the default is
 # RAM. This is the other half of the fix above: capping the run stops the
 # machine dying, and moving the logs stops the run dying of its own output.
-if [[ -z "${TMPDIR:-}" || "$TMPDIR" == "/tmp" ]]; then
+#
+# The test is the FILESYSTEM, not the path. This used to compare `TMPDIR` to
+# the literal `/tmp`, which misses every other way to point at RAM -- and the
+# common one is not exotic: a tool that gives each session its own scratch
+# directory under `/tmp` (`TMPDIR=/tmp/<tool>-1000/<session>`) is still on
+# tmpfs and would have sailed past a string compare.
+# `findmnt -T` resolves a path that is not itself a mount point; `df` is the
+# fallback where util-linux is absent. NOT `df -P --output=fstype`: those two
+# options are mutually exclusive, so that spelling prints an error and an empty
+# answer -- a check that cannot fire, which is the failure mode this whole file
+# exists to avoid. Verified in both directions below.
+_zl_on_ram() {
+    local fs
+    fs="$(findmnt -no FSTYPE -T "$1" 2>/dev/null)"
+    [[ -z "$fs" ]] && fs="$(df --output=fstype "$1" 2>/dev/null | tail -1)"
+    [[ "$fs" == tmpfs || "$fs" == ramfs ]]
+}
+if [[ -z "${TMPDIR:-}" ]] || _zl_on_ram "$TMPDIR"; then
     _zl_disk_tmp="$REPO_ROOT/.zig-cache/gate-tmp"
     mkdir -p "$_zl_disk_tmp"
     export TMPDIR="$_zl_disk_tmp"
 fi
+
+# A cgroup cap bounds THIS run; it cannot bound the machine. Measured here on
+# 2026-08-23: a full run peaked at 4.5 GB against its own 20 GB limit and was
+# never close to it, yet the kernel still fired a GLOBAL oom-kill
+# (`constraint=CONSTRAINT_NONE`) the moment `zig` asked for a page, because a
+# browser was already holding 17.6 GB of 31 and 5.7 GB more sat in tmpfs. The
+# victim is chosen by `oom_score_adj`, so it was not the gate that died.
+#
+# So: say so BEFORE the run, while the choice to wait or close something is
+# still cheap. This warns and continues -- refusing to start would be worse,
+# since the number is a snapshot and a full run is often exactly what someone
+# wants on a loaded machine. `ZIGLIBS_MEM_QUIET=1` silences it.
+_zl_warn_if_memory_tight() {
+    [[ -n "${ZIGLIBS_MEM_QUIET:-}" ]] && return 0
+    local avail_kb total_kb avail_g total_g
+    avail_kb="$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)" || return 0
+    total_kb="$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)" || return 0
+    [[ -z "$avail_kb" || -z "$total_kb" ]] && return 0
+    avail_g=$((avail_kb / 1048576))
+    total_g=$((total_kb / 1048576))
+    # Under a quarter of RAM available is where today's kill happened.
+    if (( avail_kb * 4 < total_kb )); then
+        echo "  ! only ${avail_g} GB of ${total_g} GB available before this run starts." >&2
+        echo "    The run is capped, but a cap cannot stop a GLOBAL oom-kill caused by" >&2
+        echo "    what else is resident -- and the kernel picks its victim by" >&2
+        echo "    oom_score_adj, so the process that dies will not be this one." >&2
+        echo "    Check what is holding memory, or set ZIGLIBS_MEM_QUIET=1." >&2
+    fi
+}
+_zl_warn_if_memory_tight
 
 export ZIGLIBS_TEST_T0="$(_now)"
 
