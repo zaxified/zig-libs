@@ -139,7 +139,16 @@ pub const Message = struct {
 
     /// The command with its NUL padding stripped, e.g. `"version"` not
     /// `"version\x00\x00\x00\x00\x00"`.
-    pub fn commandName(self: Message) []const u8 {
+    ///
+    /// Pointer receiver is load-bearing, not style: `command` is a fixed
+    /// array EMBEDDED in `Message` itself (not a slice into memory owned
+    /// elsewhere), so a by-value `self` would make the returned slice point
+    /// into the callee's own stack-local copy of `Message` -- dangling the
+    /// instant this function returns. A caller that consumes the result
+    /// immediately in the same expression can appear to work by accident
+    /// (the stack slot hasn't been reused yet); one more call in between is
+    /// enough to read back poisoned/garbage bytes instead of the command.
+    pub fn commandName(self: *const Message) []const u8 {
         const end = std.mem.indexOfScalar(u8, &self.command, 0) orelse self.command.len;
         return self.command[0..end];
     }
@@ -335,6 +344,31 @@ test "self round-trip: encodeMessage -> decodeMessage recovers command + payload
     const decoded = try decodeMessage(wire, .testnet3);
     try testing.expectEqualStrings("myecho", decoded.message.commandName());
     try testing.expectEqualSlices(u8, payload, decoded.message.payload);
+}
+
+test "F2 regression: commandName's slice survives an intervening call (not a dangling stack pointer)" {
+    // Before the fix, `commandName(self: Message) []const u8` took its
+    // receiver BY VALUE. `command` is a `[COMMAND_LEN]u8` EMBEDDED in
+    // `Message` (not a slice into caller-owned memory), so `&self.command`
+    // pointed into `commandName`'s own stack-local copy of `self` -- a
+    // frame that is invalid the instant the function returns. Reading the
+    // slice's bytes in the SAME expression that produced it (as in
+    // `testing.expectEqualStrings("version", decoded.message.commandName())`
+    // above) can pass by accident, because nothing has reused that stack
+    // slot yet. This test forces a call in between obtaining the slice and
+    // reading its bytes -- e.g. `std.fmt.bufPrint`, the same shape
+    // `example/main.zig`'s `std.debug.print` call actually tripped over,
+    // where the intervening call clobbered the freed frame with Zig's
+    // undefined-memory poison (0xaa) before the bytes were ever read.
+    const allocator = testing.allocator;
+    const wire = try encodeMessage(allocator, .mainnet, "version", "");
+    defer allocator.free(wire);
+    const decoded = try decodeMessage(wire, .mainnet);
+    const name = decoded.message.commandName();
+
+    var buf: [64]u8 = undefined;
+    const formatted = try std.fmt.bufPrint(&buf, "cmd={s}", .{name});
+    try testing.expectEqualStrings("cmd=version", formatted);
 }
 
 test "hostile: wrong network magic is rejected" {

@@ -71,7 +71,21 @@ pub fn main() !void {
     var spend_tx = try spendingTx(a, &.{}, credit_txid);
 
     const sighash = try bitcointx.legacy.sighash(a, spend_tx, 0, &script_pubkey, SIGHASH_ALL);
-    const sig = try kp.signPrehashed(sighash, null);
+    var sig = try kp.signPrehashed(sighash, null);
+
+    // BIP62 low-S: `ScriptFlags.standard` (used below) enforces that a
+    // signature's S value is <= n/2 (`sigcheck.isLowS`) -- of the two
+    // mathematically valid ECDSA signatures (r, s) and (r, n-s), only the
+    // smaller S is standard. `std.crypto.sign.ecdsa` is a generic ECDSA
+    // implementation with no Bitcoin awareness, so `signPrehashed` returns
+    // whichever of the two the nonce happened to produce. bitcoinscript
+    // itself only ever CHECKS this rule (it is a script verifier, not a
+    // signer, and never produces a signature) -- canonicalizing to low-S is
+    // the Bitcoin-aware caller's responsibility, exactly as a real wallet
+    // does at signing time (e.g. Bitcoin Core's `CKey::Sign`).
+    const neg_s = try std.crypto.ecc.Secp256k1.scalar.neg(sig.s, .big);
+    if (std.mem.order(u8, &neg_s, &sig.s) == .lt) sig.s = neg_s;
+
     var der_buf: [EcdsaSecp256k1Sha256.Signature.der_encoded_length_max]u8 = undefined;
     const der = sig.toDer(&der_buf);
 
@@ -89,11 +103,18 @@ pub fn main() !void {
     try bitcoinscript.verifyScript(a, script_sig.items, &script_pubkey, &.{}, bitcoinscript.ScriptFlags.standard, ctx);
     std.debug.print("P2PKH spend verified\n", .{});
 
-    // An empty scriptSig leaves the interpreter's final stack empty, which
-    // `verifyScript` must reject by a specific named error, not a panic —
-    // exactly the untrusted-input contract the module's docs describe.
-    bitcoinscript.verifyScript(a, &.{}, &script_pubkey, &.{}, bitcoinscript.ScriptFlags.standard, ctx) catch |err| switch (err) {
-        error.EvalFalse => std.debug.print("empty scriptSig correctly rejected: EvalFalse\n", .{}),
+    // An empty scriptSig leaves the stack empty when script_pubkey starts
+    // executing, so P2PKH's very first opcode (OP_DUP) fails its own
+    // precondition (it needs an existing top stack item to duplicate) —
+    // `error.InvalidStackOperation`, not `error.EvalFalse` (which only
+    // applies once evaluation reaches the end with a false top item).
+    // Either way, `verifyScript` must reject this by a specific named
+    // error, not a panic — exactly the untrusted-input contract the
+    // module's docs describe.
+    if (bitcoinscript.verifyScript(a, &.{}, &script_pubkey, &.{}, bitcoinscript.ScriptFlags.standard, ctx)) |_| {
+        return error.EmptyScriptSigUnexpectedlyVerified;
+    } else |err| switch (err) {
+        error.InvalidStackOperation => std.debug.print("empty scriptSig correctly rejected: InvalidStackOperation\n", .{}),
         else => return err,
-    };
+    }
 }

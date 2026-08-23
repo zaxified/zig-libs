@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! What a fabric-algorithm author does with `netsim`: plug a small relay
-//! protocol into a 3-node chain topology, replay it clean to confirm the
+//! protocol into a 4-node chain topology, replay it clean to confirm the
 //! invariant holds, then replay the SAME case with one injected duplicate
 //! fault to show the invariant hook catching the resulting forwarding loop
 //! — netsim's whole reason to exist is making that bug reproducible on
@@ -17,7 +17,7 @@
 const std = @import("std");
 const netsim = @import("netsim");
 
-const node_count = 3;
+const node_count = 4;
 const dest: netsim.NodeId = node_count - 1;
 
 /// A deliberately buggy line-relay: forwards a packet one hop toward `dest`
@@ -93,9 +93,16 @@ pub fn main() !void {
     std.debug.print("clean run: outcome={s} events={d}\n", .{ @tagName(clean.outcome), clean.events_processed });
     if (clean.outcome != .ok) return error.ExpectedCleanRun;
 
-    // One duplicate on the forward link 0->1, scheduled at t=0, starts the
-    // ping-pong loop the invariant is watching for.
-    const trace = [_]netsim.FaultEvent{.{ .time = 0, .kind = .{ .dup_once = .{ .a = 0, .b = 1 } } }};
+    // One duplicate on the forward link 1->2, scheduled at t=0, starts the
+    // ping-pong loop the invariant is watching for. It must target a hop
+    // AFTER the origin: `dup_once` arms by sitting in the event queue at
+    // t=0, but a node's `onStart` send happens synchronously during
+    // bootstrap, before the queue is drained — so faulting the origin link
+    // (0->1) would arm too late to catch that first send. Targeting 1->2
+    // (a queue-driven forward, not a bootstrap send) is what makes this
+    // fire reliably, same as the module's own "invariant hook catches a
+    // forwarding loop" test.
+    const trace = [_]netsim.FaultEvent{.{ .time = 0, .kind = .{ .dup_once = .{ .a = 1, .b = 2 } } }};
     const bad = try netsim.replay(gpa, case, &trace, null);
     std.debug.print("faulty run: outcome={s}\n", .{@tagName(bad.outcome)});
     if (bad.outcome != .violated) return error.ExpectedViolation;

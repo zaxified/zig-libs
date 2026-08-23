@@ -41,8 +41,16 @@ pub fn main() !void {
     std.debug.print("opened: \"{s}\"\n", .{pt[0..m]});
 
     // A record cannot cross a tenant boundary: wrong aad must be nameable
-    // from outside, not just observable as "some error".
-    if (opener.open(&pt, rec[0..n], "isid:0xFFFFFF")) |_| {
+    // from outside, not just observable as "some error". This must be a
+    // FRESH record (an unconsumed sequence number) — `open`'s doc comment
+    // spells out its check order as parse -> epoch -> replay pre-check ->
+    // AEAD verify -> commit, so the replay window is consulted BEFORE
+    // authentication (deliberately: a known-replayed record is rejected
+    // without paying for a decrypt). Reusing the already-opened `rec` here
+    // would hit `error.Replayed` before the AAD mismatch is ever checked.
+    var rec_x: [af.ChaChaChannel.Sealer.sealedLen(msg.len)]u8 = undefined;
+    const nx = try sealer.seal(&rec_x, msg, tenant_a);
+    if (opener.open(&pt, rec_x[0..nx], "isid:0xFFFFFF")) |_| {
         return error.CrossTenantOpenUnexpectedlySucceeded;
     } else |err| switch (err) {
         error.AuthenticationFailed => std.debug.print("cross-tenant open correctly rejected\n", .{}),

@@ -59,8 +59,9 @@ pub fn main() !void {
     if (cache.pin("req-42", now, gen)) |borrow| {
         std.debug.print("pinned: {s} (pinned entries now={d})\n", .{ borrow.bytes, cache.stats.pinned });
         // Mutating other keys while "req-42" is borrowed is safe — it cannot
-        // be chosen as an eviction victim.
-        cache.put("req-99", "other-blob", now, 0, gen);
+        // be chosen as an eviction victim. gen=0 here makes this entry
+        // TTL-only (not generation-tied) — see the gen-bump check below.
+        cache.put("req-99", "other-blob", now, 0, 0);
         cache.release(borrow);
     } else {
         @panic("expected pin to find the entry it was just given");

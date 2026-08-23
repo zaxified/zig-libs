@@ -66,8 +66,37 @@ pub fn main() !void {
     // number. A miss is the SAME call as a hit (module doc: "PROVIDED the
     // caller never skips a query and never retries"), so this is safe to
     // call even when the caller isn't sure the keyword is present.
-    const kw_index = P.keywordIndex("bob");
-    std.debug.print("keywordIndex(\"bob\") = {d}\n", .{kw_index});
+    //
+    // `keywordIndex` is a public, total SHA-256-derived hash of the KEYWORD
+    // ALONE — it has no knowledge of `records` above or their array
+    // positions. A caller doing keyword lookup therefore must lay out ITS
+    // OWN database as a hash table: each record lives at the slot
+    // `keywordIndex(its own keyword)`, and carries that keyword as a key
+    // field so a hit can be told apart, locally, from a colliding miss.
+    // This is the exact convention pir.zig's own "SELF: keyword retrieval"
+    // test pins — building a plain array indexed 0.. and hoping
+    // `keywordIndex("carol")` happens to equal carol's array position would
+    // only work by coincidence.
+    const kw_key_len = 8;
+    const kw_payload_len = 8;
+    const kw_record_len = kw_key_len + kw_payload_len;
+    const Member = struct { kw: []const u8, payload: []const u8 };
+    const members = [_]Member{
+        .{ .kw = "bob", .payload = "member-1" },
+        .{ .kw = "carol", .payload = "member-2" },
+    };
+    var kw_bytes: [P.domain_size * kw_record_len]u8 = undefined;
+    @memset(&kw_bytes, 0); // empty slots read back as an all-zero (clean) miss
+    for (members) |m| {
+        const ix = P.keywordIndex(m.kw);
+        const rec = kw_bytes[ix * kw_record_len ..][0..kw_record_len];
+        @memcpy(rec[0..m.kw.len], m.kw);
+        @memcpy(rec[kw_key_len..][0..m.payload.len], m.payload);
+    }
+    std.debug.print("keywordIndex(\"bob\") = {d}\n", .{P.keywordIndex("bob")});
+
+    const kw_database = try pir.Database.init(&kw_bytes, kw_record_len);
+    const n_words_kw = P.answerWords(kw_record_len);
     // A second query needs its OWN fresh seed pair — reusing `s0`/`s1`
     // here would correlate this lookup with the one above.
     const s0b: fss.prg.Seed = [_]u8{0x33} ** 16;
@@ -75,10 +104,17 @@ pub fn main() !void {
     const kw_shares = try P.queryKeyword("carol", s0b, s1b);
     var kwa0: [1]P.Word = undefined;
     var kwa1: [1]P.Word = undefined;
-    try P.answer(0, kw_shares[0], database, kwa0[0..n_words]);
-    try P.answer(1, kw_shares[1], database, kwa1[0..n_words]);
-    var kw_got: [record_len]u8 = undefined;
-    try P.reconstruct(kwa0[0..n_words], kwa1[0..n_words], &kw_got);
-    std.debug.print("keyword lookup \"carol\" recovered: \"{s}\"\n", .{&kw_got});
-    if (!std.mem.eql(u8, &kw_got, records[2])) return error.WrongRecord;
+    try P.answer(0, kw_shares[0], kw_database, kwa0[0..n_words_kw]);
+    try P.answer(1, kw_shares[1], kw_database, kwa1[0..n_words_kw]);
+    var kw_got: [kw_record_len]u8 = undefined;
+    try P.reconstruct(kwa0[0..n_words_kw], kwa1[0..n_words_kw], &kw_got);
+    std.debug.print("keyword lookup \"carol\" recovered: key=\"{s}\" payload=\"{s}\"\n", .{
+        std.mem.sliceTo(kw_got[0..kw_key_len], 0), kw_got[kw_key_len..],
+    });
+    // The recovered key field must match the keyword asked for — this is
+    // the local hit/collision check a real caller performs before trusting
+    // the payload (a wrong key field here would mean a hash collision, not
+    // a protocol bug).
+    if (!std.mem.eql(u8, kw_got[0.."carol".len], "carol")) return error.WrongRecord;
+    if (!std.mem.eql(u8, kw_got[kw_key_len..], "member-2")) return error.WrongRecord;
 }

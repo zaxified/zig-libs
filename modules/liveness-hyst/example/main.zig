@@ -54,8 +54,19 @@ pub fn main() !void {
     if (est.state() == .down) @panic("a merely-lossy link must not be flushed straight to .down");
 
     // Genuine sustained outage: consecutive timeouts past down_threshold.
+    //
+    // The preceding degraded run already pushed this link's cumulative/
+    // windowed loss over `degraded_loss_threshold` (30% by default), so by
+    // the time this loop starts the estimator classifies it as an already-
+    // lossy link, not a freshly-dying clean one. Per the module's documented
+    // anti-flap design (core.zig's `decide`), a lossy-classified link is
+    // deliberately NOT failed over by the fast 2-consecutive-miss path —
+    // isolated timeout bursts are its normal behavior. It only reaches
+    // `.down` once misses are total and sustained: `degraded_consec_floor`
+    // (18) consecutive timeouts. So this loop must run well past 18 probe
+    // intervals, not just past `down_threshold` in wall-clock time.
     const outage_start = now;
-    while (now - outage_start < 2000) : (now += 200) {
+    while (now - outage_start < 4000) : (now += 200) {
         est.onProbeTimeout(now);
     }
     std.debug.print("after sustained outage: state={s} metric={d:.3} consecutive_timeouts={d}\n", .{
