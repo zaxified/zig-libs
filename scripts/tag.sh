@@ -205,7 +205,20 @@ bump_app_pins() {
     fi
 }
 if [ "${dry_run:-0}" != 1 ]; then
-    bump_app_pins "$tag" || true
+    # ⭐ FATAL, deliberately. This used to be `|| true`, which swallowed the
+    # function's one failure path -- `zig fetch` not producing a package hash --
+    # and cut the tag anyway. The result would have been a released tag whose
+    # example-apps still pin the PREVIOUS one, carried under a tag message that
+    # says every module passed every lane. Nothing downstream could catch it
+    # either: `check-apps.sh` builds the apps with `--fork` against the working
+    # tree, never against the pin, and the README/manifest agreement check stays
+    # happy because both halves stayed on the old tag together.
+    #
+    # A tag that cannot be cut correctly is better than one that is wrong.
+    if ! bump_app_pins "$tag"; then
+        echo "tag.sh: refusing to cut '$tag' — example-apps pins could not be bumped (see above)" >&2
+        exit 1
+    fi
     head_sha="$(git rev-parse HEAD)"
 fi
 

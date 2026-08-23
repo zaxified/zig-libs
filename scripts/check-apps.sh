@@ -61,8 +61,11 @@ for n in "${WANT[@]}"; do
     echo "check-apps: building $n against the working tree"
     ( cd "example-apps/$n" && zig build --fork=../.. ) || {
         echo "check-apps: $n FAILED to build against this commit." >&2
-        echo "            It builds against its pinned tag, so this is a published API this" >&2
-        echo "            commit broke — the signal a consumer would get, one release later." >&2
+        echo "            This build used --fork, i.e. THIS working tree, not the tag the app" >&2
+        echo "            pins — so what broke is a published API this commit changed, and a" >&2
+        echo "            consumer would meet it one release later." >&2
+        echo "            (The app's source is written against the last tag and is bumped to" >&2
+        echo "            the new one by scripts/tag.sh, so the pin is never what fails here.)" >&2
         exit 1
     }
 done
