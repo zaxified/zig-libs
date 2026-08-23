@@ -24,6 +24,23 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **Taxonomy:** modules are now filed into six **libraries** — `web`, `net`,
+  `storage`, `crypto`, `format`, `os` — via a required `.libs` field on the
+  `module_list` entry, first entry primary. `zig-libs` was already a plural
+  with no singular written down anywhere machine-readable: the same grouping
+  existed only as README section headings, which nothing checked, and
+  `testkit` (a test-only harness) had been filed under *Networking*. The
+  primary library and the section a module's catalog row is printed under are
+  now held to agreement in both directions by `check-catalog`, and the
+  `Serialization / OS / agent` catch-all was split, since it does not survive
+  becoming a singular name. A module may carry further libraries it is worth
+  reaching for from — `x509` is `crypto` and `net` — which
+  `zig build gen-libs-table` renders into README's *Libraries* table and
+  `check-libs-table` keeps from going stale. Sixteen modules already had a
+  dependency edge crossing a library boundary; that is where the initial extra
+  tags came from, but the field is a judgement and is deliberately not gated
+  against that evidence.
+
 - **Security audit:** all CRIT/HIGH findings from a collection-wide audit
   were fixed. Findings named for a specific module are detailed in that
   module's own changelog; this line is the pointer for the audit as a

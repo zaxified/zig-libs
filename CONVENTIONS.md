@@ -273,6 +273,38 @@ it, and SPEC.md does not restate it. Vocabulary:
   invented from scratch (e.g. "c-ares", "Java BigDecimal", "nghttp2 + h2spec").
 - `deps`: sibling modules / std it builds on.
 
+### 4.1 Libraries — which `lib` a module belongs to
+
+The repository is `zig-libs`, **plural**. The singular is a **lib**: one of six
+groupings a consumer actually shops in — `web`, `net`, `storage`, `crypto`, `format`,
+`os`. Membership is written on the `module_list` entry, not in `meta` and not in README
+prose:
+
+```zig
+.{ .name = "x509", .libs = &.{ "crypto", "net" }, ... },
+```
+
+- **First entry is primary** and must equal the README catalog section the module's row
+  is printed under. `check-catalog` holds the two to agreement in both directions — move
+  the row or change the field alone and the build fails.
+- **Further entries are the point of the plural.** A module can be worth reaching for
+  from more than one lib, and saying so is how a consumer on `net` learns that `x509` is
+  also theirs. `zig build gen-libs-table` renders them into README's *Libraries* table.
+- **No default.** Copying `_template` leaves a wrong answer rather than no answer, which
+  the gate catches; an unfiled module would slip through silently.
+
+**Why here and not in `meta`.** This is a hand-written note about where a module
+*belongs*, not a property of its code, and a taxonomy is reviewed as a **list**: you only
+notice something is filed wrong by seeing its neighbours. That is not a hypothetical —
+the same taxonomy lived in README section headings for months with nothing checking it,
+and `testkit`, a test-only harness, sat under *Networking* the whole time.
+
+**What is NOT checked.** The extra tags have no oracle: "would be useful for" is a
+judgement, and gating it against, say, the dependency graph would only re-derive what is
+already in `deps` while pretending to verify the judgement. Sixteen modules had a
+dependency edge crossing a lib boundary and that is where the initial extra tags came
+from, but the field is not limited to that evidence.
+
 ## 5. Doc ownership — single source of truth
 
 One fact lives in exactly one place; everywhere else links to it, never restates it.
@@ -280,6 +312,7 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 | Fact | Lives in | Everywhere else |
 |---|---|---|
 | meta tags (platform/role/concurrency/model_after/deps) | `pub const meta` in `src/root.zig` | README shows a derived view; SPEC does not restate |
+| which **library** a module belongs to | `.libs` on the `module_list` entry in `build.zig` | README's *Libraries* table is generated from it (`gen-libs-table`), and the catalog section a row is printed under must match `.libs[0]` |
 | one-line module purpose | root `README.md` catalog table | — |
 | paragraph purpose + API + import + verify steps | `modules/<m>/README.md` | — |
 | design & invariants, threat-model, verification detail, per-module backlog | `modules/<m>/SPEC.md` | — |
@@ -345,8 +378,9 @@ reference, not a re-explanation of everything the README already covers.
    test **fails on purpose** until a real one replaces it) and `README.md` (incl. a
    `Provenance:` line). Add a `SPEC.md` for anything with a real threat model or
    non-obvious design invariant.
-2. Add `.{ .name = "<name>", .deps = &.{ "dep1", ... } }` to `module_list` in
-   `build.zig`.
+2. Add `.{ .name = "<name>", .libs = &.{ "<lib>" }, .deps = &.{ "dep1", ... } }` to
+   `module_list` in `build.zig`. `.libs` has no default, so this is a decision, not a
+   box to leave empty — see §4.1.
 3. **Multi-file modules:** add every new submodule to `root.zig`'s `test { _ = …; }`
    aggregator — a bare `pub const x = @import("x.zig")` re-export does **not** pull `x`'s
    tests into the test binary (the dark-tests rule; it hid 92 never-run tests before it

@@ -36,6 +36,28 @@ const Module = struct {
     /// consumer, and 93 more have a public surface under 25 functions (a third
     /// of those anchored to published vectors, where an internal vector test
     /// beats an example). The 57 with neither get one, widest surface first.
+    /// Which logical library (or libraries) this module belongs to. The
+    /// repository is `zig-libs`, plural: a `lib` is one of the six groupings a
+    /// consumer actually shops in, and this is where that grouping is written
+    /// down. FIRST entry is primary -- the section of the README catalog the
+    /// module's row lives under, which `check-libs` holds to agreement.
+    ///
+    /// This is a hand-written note about where a module BELONGS, not a derived
+    /// fact, and it lives here rather than in README prose or in 231 separate
+    /// `meta` blocks for one reason: a taxonomy is reviewed as a list. You can
+    /// only notice that something is filed wrong by seeing its neighbours.
+    ///
+    /// Extra entries are the point of the plural: a module can be worth
+    /// reaching for from more than one library, and saying so is how a
+    /// consumer on `net` finds out that `x509` is also theirs. Sixteen already
+    /// have a dependency edge crossing a library boundary, which is where the
+    /// initial second tags came from -- but the field is not limited to that
+    /// evidence, because "would be useful for" is not the same relation as
+    /// "is already imported by".
+    ///
+    /// No default: a new module has to be filed, and copying `_template`
+    /// leaves a wrong answer rather than no answer, which the gate catches.
+    libs: []const []const u8,
     example: bool = false,
     /// Compute-bound: the tests are dominated by arithmetic (pairings,
     /// hash-based signatures, FHE, scrypt, RSA), which an unoptimized Debug
@@ -50,8 +72,8 @@ const Module = struct {
 
 const module_list = [_]Module{
     // Test-only harness. Consumers reach it through `test_deps`, never `deps`.
-    .{ .name = "testkit" },
-    .{ .name = "netaddr", .example = true },
+    .{ .name = "testkit", .libs = &.{"os"} },
+    .{ .name = "netaddr", .libs = &.{ "net", "web" }, .example = true },
     // `workerpool` is a TEST-only dep: `h2_server.Options.dispatcher` is an
     // injectable seam (a function pointer + a context pointer), so the
     // published `http` module implements no pool at all — deliberately, since
@@ -60,251 +82,251 @@ const module_list = [_]Module{
     // wire a real `workerpool.WorkerPool` into that seam because the five
     // concurrency invariants can only be exercised by real threads.
     // `zig build check-testonly` proves the published module never needs it.
-    .{ .name = "http", .deps = &.{"netaddr"}, .test_deps = &.{ "testkit", "workerpool" }, .example = true },
-    .{ .name = "websocket", .deps = &.{"http"} },
-    .{ .name = "accesslog", .deps = &.{"http"} },
-    .{ .name = "staticfiles", .deps = &.{"http"} },
-    .{ .name = "brotli", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "dns", .deps = &.{ "netaddr", "http" }, .example = true },
-    .{ .name = "ramcache", .example = true },
-    .{ .name = "router", .deps = &.{"http"}, .example = true },
-    .{ .name = "ratelimit", .deps = &.{ "router", "http", "netaddr" } },
-    .{ .name = "abuseguard", .deps = &.{ "http", "netaddr", "router" } },
-    .{ .name = "throttle", .deps = &.{ "router", "http" } },
+    .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{"netaddr"}, .test_deps = &.{ "testkit", "workerpool" }, .example = true },
+    .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"} },
+    .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{"http"} },
+    .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"} },
+    .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http" }, .example = true },
+    .{ .name = "ramcache", .libs = &.{ "storage", "net" }, .example = true },
+    .{ .name = "router", .libs = &.{"web"}, .deps = &.{"http"}, .example = true },
+    .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" } },
+    .{ .name = "abuseguard", .libs = &.{"web"}, .deps = &.{ "http", "netaddr", "router" } },
+    .{ .name = "throttle", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     // Importable as @import("security-headers") — module names are plain
     // strings, the hyphen is fine (cf. the community's "known-folders").
-    .{ .name = "security-headers", .deps = &.{ "router", "http" } },
-    .{ .name = "cors", .deps = &.{ "router", "http" } },
-    .{ .name = "metrics", .deps = &.{ "router", "http" }, .example = true },
-    .{ .name = "validate", .deps = &.{ "router", "http", "netaddr" }, .example = true },
-    .{ .name = "openapi", .deps = &.{ "router", "http" } },
-    .{ .name = "health", .deps = &.{ "router", "http" } },
-    .{ .name = "requestid", .deps = &.{ "router", "http" } },
-    .{ .name = "linkheader" },
-    .{ .name = "cookies", .deps = &.{"http"} },
-    .{ .name = "idempotency", .deps = &.{ "router", "http", "ramcache" } },
-    .{ .name = "webhooksig", .deps = &.{ "router", "http" } },
-    .{ .name = "tracecontext", .deps = &.{ "router", "http" } },
+    .{ .name = "security-headers", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "cors", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .example = true },
+    .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .example = true },
+    .{ .name = "openapi", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "requestid", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "linkheader", .libs = &.{"format"} },
+    .{ .name = "cookies", .libs = &.{"format"}, .deps = &.{"http"} },
+    .{ .name = "idempotency", .libs = &.{"web"}, .deps = &.{ "router", "http", "ramcache" } },
+    .{ .name = "webhooksig", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "tracecontext", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
-    .{ .name = "aaa-gate", .deps = &.{ "router", "http" } },
-    .{ .name = "resilience", .example = true },
-    .{ .name = "acme", .deps = &.{ "http", "router", "entropy" }, .example = true },
-    .{ .name = "netlink", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "genetlink", .deps = &.{"netlink"} },
-    .{ .name = "nl80211", .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "ethtool", .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "devlink", .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "decimal", .example = true },
-    .{ .name = "seqmap", .example = true },
-    .{ .name = "icmp", .deps = &.{ "seqmap", "netaddr" }, .example = true },
-    .{ .name = "mcp", .example = true },
-    .{ .name = "mcp-http", .deps = &.{ "router", "http", "mcp" }, .example = true },
-    .{ .name = "coap", .example = true },
-    .{ .name = "kv", .example = true },
-    .{ .name = "kvtree", .deps = &.{"kv"}, .example = true },
-    .{ .name = "blobmsg", .example = true },
-    .{ .name = "tar", .example = true },
-    .{ .name = "latency-stats", .example = true },
-    .{ .name = "pping", .example = true },
-    .{ .name = "spf-ect", .example = true },
-    .{ .name = "ethfrag", .example = true },
-    .{ .name = "l2encap" },
-    .{ .name = "l2forward", .example = true },
-    .{ .name = "pbb" },
-    .{ .name = "bumtree", .deps = &.{"spf-ect"} },
-    .{ .name = "spbfib", .deps = &.{"isis-spf"} },
-    .{ .name = "isis", .example = true },
-    .{ .name = "isis-adj", .deps = &.{"isis"}, .example = true },
-    .{ .name = "isis-dis", .deps = &.{"isis"}, .example = true },
-    .{ .name = "isis-lsdb", .deps = &.{"isis"}, .example = true },
-    .{ .name = "isis-flood", .deps = &.{ "isis", "isis-lsdb" } },
-    .{ .name = "isis-spf", .deps = &.{ "isis", "isis-lsdb", "spf-ect" } },
-    .{ .name = "isis-sim", .deps = &.{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf" }, .example = true },
-    .{ .name = "aeadframe", .deps = &.{"chachapoly"}, .example = true },
-    .{ .name = "tenantkex", .deps = &.{"noise"}, .example = true },
-    .{ .name = "netsim", .example = true },
-    .{ .name = "loopfree-reconv", .deps = &.{ "netsim", "spf-ect" }, .example = true },
-    .{ .name = "df-elect", .deps = &.{"netsim"}, .example = true },
-    .{ .name = "raft", .deps = &.{"netsim"}, .example = true },
-    .{ .name = "liveness-hyst", .deps = &.{ "netsim", "latency-stats" }, .example = true },
-    .{ .name = "loopix", .deps = &.{ "netsim", "sphinx" }, .example = true },
-    .{ .name = "lockfree", .example = true },
-    .{ .name = "workerpool", .deps = &.{"lockfree"}, .example = true },
-    .{ .name = "shardstore", .deps = &.{"kvtree"}, .example = true },
-    .{ .name = "writebehind", .deps = &.{ "ramcache", "workerpool", "jobqueue", "kvtree" }, .example = true },
-    .{ .name = "pagecache", .deps = &.{ "kvtree", "ramcache" }, .example = true },
-    .{ .name = "tsdb", .deps = &.{"kvtree"}, .example = true },
-    .{ .name = "entropy" },
-    .{ .name = "hashdigest", .example = true },
-    .{ .name = "sealedbox" },
-    .{ .name = "rsa", .deps = &.{"montint"}, .heavy = true, .example = true },
-    .{ .name = "blindrsa", .deps = &.{"rsa"} },
-    .{ .name = "ssh", .deps = &.{"rsa"}, .heavy = true, .example = true },
-    .{ .name = "netconf", .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "nftables", .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "trie", .example = true },
-    .{ .name = "fuzzysearch", .deps = &.{"trie"} },
-    .{ .name = "geoindex", .example = true },
-    .{ .name = "readthrough", .deps = &.{"ramcache"}, .example = true },
-    .{ .name = "timelock_envelope", .deps = &.{ "tlock", "hqc", "chachapoly", "entropy" } },
-    .{ .name = "drand", .deps = &.{ "bls12_381", "tlock" } },
-    .{ .name = "tcplan", .deps = &.{"tc"}, .example = true },
-    .{ .name = "modbus", .example = true },
-    .{ .name = "iec104", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "fleetsim", .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "smtp", .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "imap", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "iec61850", .deps = &.{"xml"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "iec62351", .deps = &.{ "x509", "rsa" }, .example = true },
-    .{ .name = "s7comm", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "enip", .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "bacnet", .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "whois", .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "uci" },
-    .{ .name = "mqtt", .example = true },
-    .{ .name = "snmp", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "wireguard", .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" }, .example = true },
-    .{ .name = "tc", .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "traceroute", .deps = &.{ "icmp", "netaddr", "latency-stats" } },
-    .{ .name = "probe", .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
-    .{ .name = "pathmtu", .deps = &.{ "icmp", "netaddr" } },
-    .{ .name = "l2disco", .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "upstream", .deps = &.{ "resilience", "probe" }, .example = true },
-    .{ .name = "jwt", .deps = &.{ "http", "router", "p256" }, .example = true },
-    .{ .name = "rbac", .example = true },
-    .{ .name = "xml" },
-    .{ .name = "xmldsig", .deps = &.{ "xml", "rsa", "p256" } },
-    .{ .name = "saml", .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, .heavy = true, .example = true },
-    .{ .name = "xmlenc", .deps = &.{ "xml", "rsa", "aescbc", "aeskw" }, .heavy = true },
-    .{ .name = "aescbc" },
-    .{ .name = "aeskw" },
-    .{ .name = "jwe", .deps = &.{ "rsa", "p256", "aescbc", "aeskw" }, .example = true },
-    .{ .name = "rdap", .deps = &.{ "http", "netaddr" }, .example = true },
-    .{ .name = "blobstore", .deps = &.{"hashdigest"}, .example = true },
-    .{ .name = "procnet", .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "diskfree", .example = true },
-    .{ .name = "diskusage", .example = true },
-    .{ .name = "conntrack", .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "procrun", .deps = &.{"argsafe"} },
-    .{ .name = "dataset", .example = true },
-    .{ .name = "tabular", .deps = &.{"dataset"}, .example = true },
-    .{ .name = "jsonshape", .deps = &.{"dataset"} },
-    .{ .name = "finstats", .deps = &.{"dataset"}, .example = true },
-    .{ .name = "filestore", .example = true },
-    .{ .name = "framing" },
-    .{ .name = "datefmt", .example = true },
-    .{ .name = "diagnostics", .example = true },
-    .{ .name = "json5" },
-    .{ .name = "yaml", .example = true },
-    .{ .name = "jinja", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "cbor" },
-    .{ .name = "protobuf", .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "grpc", .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "webauthn", .deps = &.{ "cbor", "rsa", "p256", "x509" } },
-    .{ .name = "zipstream", .example = true },
-    .{ .name = "qr", .example = true },
-    .{ .name = "qrscan", .deps = &.{"qr"}, .example = true },
-    .{ .name = "tz", .deps = &.{"datefmt"} },
-    .{ .name = "pollworker" },
-    .{ .name = "ipcbus", .deps = &.{"framing"}, .example = true },
-    .{ .name = "csvstream", .example = true },
-    .{ .name = "csvsafe" },
-    .{ .name = "numparse", .deps = &.{"decimal"} },
-    .{ .name = "argsafe" },
-    .{ .name = "sessions", .deps = &.{ "router", "http", "cookies", "ramcache", "entropy" } },
-    .{ .name = "jobqueue", .deps = &.{"kv"} },
-    .{ .name = "reconcilable", .deps = &.{"resilience"}, .example = true },
-    .{ .name = "llmclient", .deps = &.{"http"}, .example = true },
-    .{ .name = "rawsock", .deps = &.{"netaddr"} },
-    .{ .name = "encoding" },
-    .{ .name = "syslog" },
-    .{ .name = "sntp", .example = true },
-    .{ .name = "stun", .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "opcua", .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .example = true },
-    .{ .name = "noise", .deps = &.{"chachapoly"}, .example = true },
-    .{ .name = "x509", .deps = &.{ "rsa", "slhdsa" }, .example = true },
-    .{ .name = "ocsp", .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
-    .{ .name = "ocspcache", .deps = &.{ "ocsp", "http", "x509" }, .example = true },
-    .{ .name = "dnssec", .deps = &.{ "dns", "rsa" }, .example = true },
-    .{ .name = "dnp3", .deps = &.{"aeskw"}, .example = true },
-    .{ .name = "slhdsa", .heavy = true, .example = true },
-    .{ .name = "falcon", .example = true },
-    .{ .name = "hqc", .heavy = true, .example = true },
-    .{ .name = "dtls", .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "tlsresume", .example = true },
-    .{ .name = "quic-crypto", .deps = &.{"chachapoly"} },
-    .{ .name = "sandbox", .example = true },
-    .{ .name = "bip340", .deps = &.{"k256"} },
-    .{ .name = "taproot", .deps = &.{ "bip340", "k256" } },
-    .{ .name = "bitcointx", .deps = &.{"bip340"}, .example = true },
-    .{ .name = "psbt", .deps = &.{ "bitcointx", "bitcoinscript" } },
-    .{ .name = "bitcoinscript", .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" }, .example = true },
-    .{ .name = "btcp2p", .deps = &.{"bitcointx"}, .example = true },
-    .{ .name = "lnwire", .example = true },
-    .{ .name = "lninvoice", .deps = &.{ "bech32", "k256", "lnwire", "bip340" }, .example = true },
-    .{ .name = "musig2", .deps = &.{ "bip340", "k256" }, .example = true },
-    .{ .name = "sphinx", .deps = &.{"k256"} },
-    .{ .name = "bolt8", .deps = &.{ "noise", "k256" }, .example = true },
-    .{ .name = "bolt3", .deps = &.{"k256"} },
-    .{ .name = "hpke", .deps = &.{ "p256", "chachapoly", "entropy" }, .example = true },
-    .{ .name = "adaptor", .deps = &.{ "bip340", "k256" } },
-    .{ .name = "frost", .deps = &.{ "bip340", "k256" }, .example = true },
-    .{ .name = "oscore" },
-    .{ .name = "spake2plus", .deps = &.{"p256"} },
-    .{ .name = "ct25519" },
-    .{ .name = "voprf", .deps = &.{"ct25519"}, .example = true },
-    .{ .name = "opaque", .deps = &.{ "voprf", "ct25519" } },
-    .{ .name = "bulletproofs", .deps = &.{"ct25519"}, .example = true },
-    .{ .name = "xmss", .heavy = true, .example = true },
-    .{ .name = "minisign", .deps = &.{"entropy"}, .heavy = true, .example = true },
-    .{ .name = "otp" },
-    .{ .name = "ctap2pin", .deps = &.{"p256"} },
-    .{ .name = "bls12_381", .deps = &.{"entropy"}, .heavy = true, .example = true },
-    .{ .name = "bbs", .deps = &.{ "bls12_381", "entropy" }, .example = true },
-    .{ .name = "coconut", .deps = &.{"bls12_381"}, .heavy = true, .example = true },
-    .{ .name = "tlock", .deps = &.{ "bls12_381", "entropy" } },
+    .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "resilience", .libs = &.{ "web", "net" }, .example = true },
+    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy" }, .example = true },
+    .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"} },
+    .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "ethtool", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "devlink", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "decimal", .libs = &.{ "storage", "format" }, .example = true },
+    .{ .name = "seqmap", .libs = &.{"net"}, .example = true },
+    .{ .name = "icmp", .libs = &.{"net"}, .deps = &.{ "seqmap", "netaddr" }, .example = true },
+    .{ .name = "mcp", .libs = &.{"os"}, .example = true },
+    .{ .name = "mcp-http", .libs = &.{"os"}, .deps = &.{ "router", "http", "mcp" }, .example = true },
+    .{ .name = "coap", .libs = &.{"net"}, .example = true },
+    .{ .name = "kv", .libs = &.{"storage"}, .example = true },
+    .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{"kv"}, .example = true },
+    .{ .name = "blobmsg", .libs = &.{"format"}, .example = true },
+    .{ .name = "tar", .libs = &.{"format"}, .example = true },
+    .{ .name = "latency-stats", .libs = &.{"net"}, .example = true },
+    .{ .name = "pping", .libs = &.{"net"}, .example = true },
+    .{ .name = "spf-ect", .libs = &.{"net"}, .example = true },
+    .{ .name = "ethfrag", .libs = &.{"net"}, .example = true },
+    .{ .name = "l2encap", .libs = &.{"net"} },
+    .{ .name = "l2forward", .libs = &.{"net"}, .example = true },
+    .{ .name = "pbb", .libs = &.{"net"} },
+    .{ .name = "bumtree", .libs = &.{"net"}, .deps = &.{"spf-ect"} },
+    .{ .name = "spbfib", .libs = &.{"net"}, .deps = &.{"isis-spf"} },
+    .{ .name = "isis", .libs = &.{"net"}, .example = true },
+    .{ .name = "isis-adj", .libs = &.{"net"}, .deps = &.{"isis"}, .example = true },
+    .{ .name = "isis-dis", .libs = &.{"net"}, .deps = &.{"isis"}, .example = true },
+    .{ .name = "isis-lsdb", .libs = &.{"net"}, .deps = &.{"isis"}, .example = true },
+    .{ .name = "isis-flood", .libs = &.{"net"}, .deps = &.{ "isis", "isis-lsdb" } },
+    .{ .name = "isis-spf", .libs = &.{"net"}, .deps = &.{ "isis", "isis-lsdb", "spf-ect" } },
+    .{ .name = "isis-sim", .libs = &.{"net"}, .deps = &.{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf" }, .example = true },
+    .{ .name = "aeadframe", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .example = true },
+    .{ .name = "tenantkex", .libs = &.{"crypto"}, .deps = &.{"noise"}, .example = true },
+    .{ .name = "netsim", .libs = &.{"net"}, .example = true },
+    .{ .name = "loopfree-reconv", .libs = &.{"net"}, .deps = &.{ "netsim", "spf-ect" }, .example = true },
+    .{ .name = "df-elect", .libs = &.{"net"}, .deps = &.{"netsim"}, .example = true },
+    .{ .name = "raft", .libs = &.{"net"}, .deps = &.{"netsim"}, .example = true },
+    .{ .name = "liveness-hyst", .libs = &.{"net"}, .deps = &.{ "netsim", "latency-stats" }, .example = true },
+    .{ .name = "loopix", .libs = &.{"net"}, .deps = &.{ "netsim", "sphinx" }, .example = true },
+    .{ .name = "lockfree", .libs = &.{"net"}, .example = true },
+    .{ .name = "workerpool", .libs = &.{"net"}, .deps = &.{"lockfree"}, .example = true },
+    .{ .name = "shardstore", .libs = &.{"net"}, .deps = &.{"kvtree"}, .example = true },
+    .{ .name = "writebehind", .libs = &.{"net"}, .deps = &.{ "ramcache", "workerpool", "jobqueue", "kvtree" }, .example = true },
+    .{ .name = "pagecache", .libs = &.{"net"}, .deps = &.{ "kvtree", "ramcache" }, .example = true },
+    .{ .name = "tsdb", .libs = &.{"storage"}, .deps = &.{"kvtree"}, .example = true },
+    .{ .name = "entropy", .libs = &.{ "crypto", "web" } },
+    .{ .name = "hashdigest", .libs = &.{ "crypto", "storage" }, .example = true },
+    .{ .name = "sealedbox", .libs = &.{"crypto"} },
+    .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{"montint"}, .heavy = true, .example = true },
+    .{ .name = "blindrsa", .libs = &.{"crypto"}, .deps = &.{"rsa"} },
+    .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .heavy = true, .example = true },
+    .{ .name = "netconf", .libs = &.{"net"}, .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "trie", .libs = &.{"storage"}, .example = true },
+    .{ .name = "fuzzysearch", .libs = &.{"storage"}, .deps = &.{"trie"} },
+    .{ .name = "geoindex", .libs = &.{"storage"}, .example = true },
+    .{ .name = "readthrough", .libs = &.{"net"}, .deps = &.{"ramcache"}, .example = true },
+    .{ .name = "timelock_envelope", .libs = &.{"crypto"}, .deps = &.{ "tlock", "hqc", "chachapoly", "entropy" } },
+    .{ .name = "drand", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "tlock" } },
+    .{ .name = "tcplan", .libs = &.{"net"}, .deps = &.{"tc"}, .example = true },
+    .{ .name = "modbus", .libs = &.{"net"}, .example = true },
+    .{ .name = "iec104", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "fleetsim", .libs = &.{"net"}, .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "smtp", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "imap", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "iec61850", .libs = &.{"net"}, .deps = &.{"xml"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "iec62351", .libs = &.{"net"}, .deps = &.{ "x509", "rsa" }, .example = true },
+    .{ .name = "s7comm", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "enip", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "bacnet", .libs = &.{"net"}, .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "whois", .libs = &.{"net"}, .deps = &.{"netaddr"}, .example = true },
+    .{ .name = "uci", .libs = &.{"os"} },
+    .{ .name = "mqtt", .libs = &.{"net"}, .example = true },
+    .{ .name = "snmp", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" }, .example = true },
+    .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "traceroute", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr", "latency-stats" } },
+    .{ .name = "probe", .libs = &.{"net"}, .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
+    .{ .name = "pathmtu", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr" } },
+    .{ .name = "l2disco", .libs = &.{"net"}, .deps = &.{"netaddr"}, .example = true },
+    .{ .name = "upstream", .libs = &.{"web"}, .deps = &.{ "resilience", "probe" }, .example = true },
+    .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256" }, .example = true },
+    .{ .name = "rbac", .libs = &.{"web"}, .example = true },
+    .{ .name = "xml", .libs = &.{ "web", "net" } },
+    .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256" } },
+    .{ .name = "saml", .libs = &.{"web"}, .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, .heavy = true, .example = true },
+    .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw" }, .heavy = true },
+    .{ .name = "aescbc", .libs = &.{ "web", "crypto" } },
+    .{ .name = "aeskw", .libs = &.{"web"} },
+    .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "aescbc", "aeskw" }, .example = true },
+    .{ .name = "rdap", .libs = &.{"net"}, .deps = &.{ "http", "netaddr" }, .example = true },
+    .{ .name = "blobstore", .libs = &.{"storage"}, .deps = &.{"hashdigest"}, .example = true },
+    .{ .name = "procnet", .libs = &.{"net"}, .deps = &.{"netaddr"}, .example = true },
+    .{ .name = "diskfree", .libs = &.{"net"}, .example = true },
+    .{ .name = "diskusage", .libs = &.{"net"}, .example = true },
+    .{ .name = "conntrack", .libs = &.{"net"}, .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{"argsafe"} },
+    .{ .name = "dataset", .libs = &.{"storage"}, .example = true },
+    .{ .name = "tabular", .libs = &.{"storage"}, .deps = &.{"dataset"}, .example = true },
+    .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{"dataset"} },
+    .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"dataset"}, .example = true },
+    .{ .name = "filestore", .libs = &.{"storage"}, .example = true },
+    .{ .name = "framing", .libs = &.{ "format", "os" } },
+    .{ .name = "datefmt", .libs = &.{"format"}, .example = true },
+    .{ .name = "diagnostics", .libs = &.{"os"}, .example = true },
+    .{ .name = "json5", .libs = &.{"format"} },
+    .{ .name = "yaml", .libs = &.{"format"}, .example = true },
+    .{ .name = "jinja", .libs = &.{"format"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "cbor", .libs = &.{"format"} },
+    .{ .name = "protobuf", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "webauthn", .libs = &.{"crypto"}, .deps = &.{ "cbor", "rsa", "p256", "x509" } },
+    .{ .name = "zipstream", .libs = &.{"format"}, .example = true },
+    .{ .name = "qr", .libs = &.{"format"}, .example = true },
+    .{ .name = "qrscan", .libs = &.{"format"}, .deps = &.{"qr"}, .example = true },
+    .{ .name = "tz", .libs = &.{"format"}, .deps = &.{"datefmt"} },
+    .{ .name = "pollworker", .libs = &.{"os"} },
+    .{ .name = "ipcbus", .libs = &.{"os"}, .deps = &.{"framing"}, .example = true },
+    .{ .name = "csvstream", .libs = &.{"format"}, .example = true },
+    .{ .name = "csvsafe", .libs = &.{"format"} },
+    .{ .name = "numparse", .libs = &.{"format"}, .deps = &.{"decimal"} },
+    .{ .name = "argsafe", .libs = &.{"os"} },
+    .{ .name = "sessions", .libs = &.{"web"}, .deps = &.{ "router", "http", "cookies", "ramcache", "entropy" } },
+    .{ .name = "jobqueue", .libs = &.{"storage"}, .deps = &.{"kv"} },
+    .{ .name = "reconcilable", .libs = &.{"net"}, .deps = &.{"resilience"}, .example = true },
+    .{ .name = "llmclient", .libs = &.{"web"}, .deps = &.{"http"}, .example = true },
+    .{ .name = "rawsock", .libs = &.{"net"}, .deps = &.{"netaddr"} },
+    .{ .name = "encoding", .libs = &.{"format"} },
+    .{ .name = "syslog", .libs = &.{"net"} },
+    .{ .name = "sntp", .libs = &.{"net"}, .example = true },
+    .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"}, .example = true },
+    .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .example = true },
+    .{ .name = "noise", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .example = true },
+    .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa" }, .example = true },
+    .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
+    .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" }, .example = true },
+    .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa" }, .example = true },
+    .{ .name = "dnp3", .libs = &.{"net"}, .deps = &.{"aeskw"}, .example = true },
+    .{ .name = "slhdsa", .libs = &.{"crypto"}, .heavy = true, .example = true },
+    .{ .name = "falcon", .libs = &.{"crypto"}, .example = true },
+    .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true, .example = true },
+    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "tlsresume", .libs = &.{"crypto"}, .example = true },
+    .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{"chachapoly"} },
+    .{ .name = "sandbox", .libs = &.{"os"}, .example = true },
+    .{ .name = "bip340", .libs = &.{"crypto"}, .deps = &.{"k256"} },
+    .{ .name = "taproot", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
+    .{ .name = "bitcointx", .libs = &.{"crypto"}, .deps = &.{"bip340"}, .example = true },
+    .{ .name = "psbt", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "bitcoinscript" } },
+    .{ .name = "bitcoinscript", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" }, .example = true },
+    .{ .name = "btcp2p", .libs = &.{"crypto"}, .deps = &.{"bitcointx"}, .example = true },
+    .{ .name = "lnwire", .libs = &.{"crypto"}, .example = true },
+    .{ .name = "lninvoice", .libs = &.{"crypto"}, .deps = &.{ "bech32", "k256", "lnwire", "bip340" }, .example = true },
+    .{ .name = "musig2", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" }, .example = true },
+    .{ .name = "sphinx", .libs = &.{ "crypto", "net" }, .deps = &.{"k256"} },
+    .{ .name = "bolt8", .libs = &.{"crypto"}, .deps = &.{ "noise", "k256" }, .example = true },
+    .{ .name = "bolt3", .libs = &.{"crypto"}, .deps = &.{"k256"} },
+    .{ .name = "hpke", .libs = &.{"crypto"}, .deps = &.{ "p256", "chachapoly", "entropy" }, .example = true },
+    .{ .name = "adaptor", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
+    .{ .name = "frost", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" }, .example = true },
+    .{ .name = "oscore", .libs = &.{"crypto"} },
+    .{ .name = "spake2plus", .libs = &.{"crypto"}, .deps = &.{"p256"} },
+    .{ .name = "ct25519", .libs = &.{"crypto"} },
+    .{ .name = "voprf", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .example = true },
+    .{ .name = "opaque", .libs = &.{"crypto"}, .deps = &.{ "voprf", "ct25519" } },
+    .{ .name = "bulletproofs", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .example = true },
+    .{ .name = "xmss", .libs = &.{"crypto"}, .heavy = true, .example = true },
+    .{ .name = "minisign", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true, .example = true },
+    .{ .name = "otp", .libs = &.{"crypto"} },
+    .{ .name = "ctap2pin", .libs = &.{"crypto"}, .deps = &.{"p256"} },
+    .{ .name = "bls12_381", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true, .example = true },
+    .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .example = true },
+    .{ .name = "coconut", .libs = &.{"crypto"}, .deps = &.{"bls12_381"}, .heavy = true, .example = true },
+    .{ .name = "tlock", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" } },
     // `tlock` is a TEST-only dep: `ibe/src/kat_test.zig` drives `ibe`'s own
     // encrypt/decrypt through `ibe.Scheme` with drand's ciphersuite, to
     // byte-compare against the genuine drand-Go-produced ciphertext `tlock`
     // already has frozen. The published `ibe` module never imports it --
     // `zig build check-testonly` proves that.
-    .{ .name = "ibe", .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"tlock"}, .heavy = true },
-    .{ .name = "bn254", .heavy = true, .example = true },
-    .{ .name = "ed448", .deps = &.{"entropy"}, .example = true },
-    .{ .name = "decaf448", .deps = &.{"ed448"} },
-    .{ .name = "paillier", .deps = &.{"montint"}, .heavy = true },
-    .{ .name = "threshold_ecdsa", .deps = &.{ "paillier", "montint" }, .heavy = true, .example = true },
-    .{ .name = "dkg", .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true, .example = true },
-    .{ .name = "vdf", .deps = &.{"montint"} },
-    .{ .name = "signal", .deps = &.{ "chachapoly", "ct25519", "entropy" }, .example = true },
-    .{ .name = "mls", .deps = &.{"hpke"}, .example = true },
-    .{ .name = "megolm", .deps = &.{ "aescbc", "entropy" }, .example = true },
-    .{ .name = "ebpf", .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "xdp-classifier", .deps = &.{"ebpf"} },
-    .{ .name = "ecvrf", .deps = &.{"ct25519"} },
-    .{ .name = "fss", .example = true },
-    .{ .name = "pir", .deps = &.{"fss"}, .example = true },
-    .{ .name = "bfv", .deps = &.{"entropy"}, .example = true },
-    .{ .name = "groth16", .deps = &.{"bn254"}, .example = true },
+    .{ .name = "ibe", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"tlock"}, .heavy = true },
+    .{ .name = "bn254", .libs = &.{"crypto"}, .heavy = true, .example = true },
+    .{ .name = "ed448", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .example = true },
+    .{ .name = "decaf448", .libs = &.{"crypto"}, .deps = &.{"ed448"} },
+    .{ .name = "paillier", .libs = &.{"crypto"}, .deps = &.{"montint"}, .heavy = true },
+    .{ .name = "threshold_ecdsa", .libs = &.{"crypto"}, .deps = &.{ "paillier", "montint" }, .heavy = true, .example = true },
+    .{ .name = "dkg", .libs = &.{"crypto"}, .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true, .example = true },
+    .{ .name = "vdf", .libs = &.{"crypto"}, .deps = &.{"montint"} },
+    .{ .name = "signal", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "ct25519", "entropy" }, .example = true },
+    .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{"hpke"}, .example = true },
+    .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy" }, .example = true },
+    .{ .name = "ebpf", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "xdp-classifier", .libs = &.{"net"}, .deps = &.{"ebpf"} },
+    .{ .name = "ecvrf", .libs = &.{"crypto"}, .deps = &.{"ct25519"} },
+    .{ .name = "fss", .libs = &.{"crypto"}, .example = true },
+    .{ .name = "pir", .libs = &.{"crypto"}, .deps = &.{"fss"}, .example = true },
+    .{ .name = "bfv", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .example = true },
+    .{ .name = "groth16", .libs = &.{"crypto"}, .deps = &.{"bn254"}, .example = true },
     // Not heavy: the parameter derivation + all 30 tests run in 5s under
     // -Dstrict-debug, well under the >15s threshold (and a Debug compile of
     // this module is ~1s against ~27s at ReleaseSafe, so marking it heavy
     // would cost more than it saves).
-    .{ .name = "poseidon", .deps = &.{ "bn254", "bls12_381" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "poseidon", .libs = &.{"crypto"}, .deps = &.{ "bn254", "bls12_381" }, .test_deps = &.{"testkit"}, .example = true },
     // Not heavy, despite the inverse S-box (72 multiplies per element per
     // half-round). Measured serially on this host: strict-Debug compile ~8.5s
     // + run ~1.0s = 9.5s, under the >15s threshold — and a ReleaseSafe compile
     // of this module is ~46s (comptime SHAKE256 derivation + heavily unrolled
     // field code), so marking it heavy would cost 5x what it saves.
-    .{ .name = "rescue", .example = true },
-    .{ .name = "tfhe", .deps = &.{"entropy"}, .heavy = true, .example = true },
-    .{ .name = "montint", .heavy = true, .example = true },
-    .{ .name = "chachapoly" },
-    .{ .name = "k256", .example = true },
-    .{ .name = "p256", .example = true },
-    .{ .name = "ripemd160" },
-    .{ .name = "bech32", .deps = &.{"ripemd160"} },
-    .{ .name = "bip32", .deps = &.{ "k256", "ripemd160", "bech32" } },
+    .{ .name = "rescue", .libs = &.{"crypto"}, .example = true },
+    .{ .name = "tfhe", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true, .example = true },
+    .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true, .example = true },
+    .{ .name = "chachapoly", .libs = &.{"crypto"} },
+    .{ .name = "k256", .libs = &.{"crypto"}, .example = true },
+    .{ .name = "p256", .libs = &.{ "crypto", "web" }, .example = true },
+    .{ .name = "ripemd160", .libs = &.{"crypto"} },
+    .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"} },
+    .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" } },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
     // "How to add a module" and the README "Roadmap / Non-goals" sections.
 };
@@ -822,6 +844,22 @@ pub fn build(b: *std.Build) void {
         "Regenerate README.md's Portability table from meta.targets + the known-failures baseline",
     ).dependOn(&portable_table_gen.step);
 
+    // `zig build check-libs-table` / `zig build gen-libs-table` — the
+    // consumer-facing half of `Module.libs`. `check-catalog` proves each
+    // module's PRIMARY library matches the section its row is printed under;
+    // this renders the six-library overview from the same field, so the
+    // cross-tags (the whole point of the plural) are visible without reading
+    // module_list, and a table left behind after a `.libs` edit fails the
+    // build exactly as a stale portability table does.
+    inline for (.{ .{ false, "check-libs-table", "Verify README.md's generated Libraries table matches module_list's `.libs`" }, .{ true, "gen-libs-table", "Regenerate README.md's Libraries table from module_list's `.libs`" } }) |cfg| {
+        const st = b.allocator.create(LibsTableStep) catch @panic("OOM");
+        st.* = .{
+            .step = std.Build.Step.init(.{ .id = .custom, .name = cfg[1], .owner = b, .makeFn = LibsTableStep.make }),
+            .write = cfg[0],
+        };
+        b.step(cfg[1], cfg[2]).dependOn(&st.step);
+    }
+
     // `zig build check-testonly` — prove a test-only dep really is test-only.
     //
     // The claim `test_deps` makes is that the PUBLISHED module never needs
@@ -1303,6 +1341,183 @@ fn exampleTriggers(b: *std.Build, io: std.Io, name: []const u8) !struct {
     return .{ .pub_fns = pub_fns, .self_methods = self_methods, .has_init = has_init };
 }
 
+/// The six libraries `zig-libs` is the plural of, paired with the README
+/// catalog section each one renders as. A `lib` is the unit a consumer shops
+/// in; `Module.libs` is where membership is written down, and this table is
+/// the only place the two names are tied together.
+const lib_sections = [_]struct { lib: []const u8, heading: []const u8 }{
+    .{ .lib = "web", .heading = "### Web / HTTP & API" },
+    .{ .lib = "net", .heading = "### Networking" },
+    .{ .lib = "storage", .heading = "### Data & storage" },
+    .{ .lib = "crypto", .heading = "### Crypto" },
+    .{ .lib = "format", .heading = "### Serialization / formats" },
+    .{ .lib = "os", .heading = "### Host / OS / agent" },
+};
+
+/// The README section a module's catalog row actually sits under: find the
+/// row, then walk back to the nearest `### ` heading. Returns the matching
+/// `lib` name, or null if the row is under a heading that is not a library
+/// (the Portability table, say) or under none at all.
+fn readmeLibOf(readme: []const u8, name: []const u8, b: *std.Build) ?[]const u8 {
+    const at = std.mem.indexOf(u8, readme, catalogRowNeedle(b, name)) orelse return null;
+    // The nearest library heading ABOVE the row wins, compared by position so
+    // that the order of `lib_sections` cannot shadow the order in the file.
+    var best: ?[]const u8 = null;
+    var best_pos: usize = 0;
+    for (lib_sections) |ls| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, readme, from, ls.heading)) |h| : (from = h + 1) {
+            const line_start = h == 0 or readme[h - 1] == '\n';
+            if (line_start and h < at and h >= best_pos) {
+                best_pos = h;
+                best = ls.lib;
+            }
+        }
+    }
+    return best;
+}
+
+/// `Module.libs` is a hand-written note -- which is exactly why it needs a
+/// gate. The README's thematic sections carried the same taxonomy for months
+/// with nothing checking it, and `testkit` (a test-only harness) sat under
+/// "Networking" the whole time. Nobody reads 230 rows looking for that; a
+/// build step does.
+///
+/// Checked: every module is filed, under known names, without repeats, and its
+/// PRIMARY library is the section its catalog row is really printed in. The
+/// extra tags are deliberately not checked against anything -- "would be
+/// useful for" has no oracle, and pretending otherwise would be the fabricated
+/// kind of verification.
+fn checkLibs(readme: []const u8, b: *std.Build, failed: *bool) void {
+    for (module_list) |m| {
+        if (m.libs.len == 0) {
+            std.log.err("module '{s}' has an empty `libs` -- every module belongs to at least one library", .{m.name});
+            failed.* = true;
+            continue;
+        }
+        for (m.libs, 0..) |l, i| {
+            const known = for (lib_sections) |ls| {
+                if (std.mem.eql(u8, ls.lib, l)) break true;
+            } else false;
+            if (!known) {
+                std.log.err("module '{s}' is filed under unknown library '{s}'", .{ m.name, l });
+                failed.* = true;
+            }
+            for (m.libs[0..i]) |prev| {
+                if (std.mem.eql(u8, prev, l)) {
+                    std.log.err("module '{s}' lists library '{s}' twice", .{ m.name, l });
+                    failed.* = true;
+                }
+            }
+        }
+        const actual = readmeLibOf(readme, m.name, b) orelse {
+            std.log.err("module '{s}' has no catalog row under any library section", .{m.name});
+            failed.* = true;
+            continue;
+        };
+        if (!std.mem.eql(u8, actual, m.libs[0])) {
+            std.log.err(
+                "module '{s}' is filed as primary library '{s}' but its README catalog row is printed under '{s}'",
+                .{ m.name, m.libs[0], actual },
+            );
+            failed.* = true;
+        }
+    }
+}
+
+const libs_table_begin_marker = "<!-- BEGIN GENERATED: check-libs-table (source: build.zig module_list `.libs`; regenerate with `zig build gen-libs-table`; do not hand-edit) -->";
+const libs_table_end_marker = "<!-- END GENERATED: check-libs-table -->";
+
+/// Renders the six-library overview. Every number here is counted from
+/// `module_list`, never typed: a hand-written count is the first thing to go
+/// stale, and this table exists precisely so the hand-written `.libs` note has
+/// a consumer-visible form that cannot disagree with it.
+fn renderLibsTable(b: *std.Build) []const u8 {
+    var out: std.Io.Writer.Allocating = .init(b.allocator);
+    const w = &out.writer;
+    w.writeAll(
+        \\### Libraries
+        \\
+        \\`zig-libs` is a plural: a **lib** is one of the six groupings below, and every
+        \\module is filed in exactly one of them — the section its catalog row is printed
+        \\under. A module may additionally be tagged into libraries it is worth reaching
+        \\for from, which is what the last column lists: if you are building on `net`,
+        \\those crypto and format modules are yours too without going looking.
+        \\
+        \\| Library | Filed here | Also worth reaching for from here (own library in brackets) |
+        \\|---|---:|---|
+        \\
+    ) catch @panic("OOM");
+    for (lib_sections) |ls| {
+        var primary: usize = 0;
+        for (module_list) |m| {
+            if (std.mem.eql(u8, m.libs[0], ls.lib)) primary += 1;
+        }
+        w.print("| `{s}` | {d} | ", .{ ls.lib, primary }) catch @panic("OOM");
+        var first = true;
+        for (module_list) |m| {
+            if (std.mem.eql(u8, m.libs[0], ls.lib)) continue;
+            for (m.libs[1..]) |extra| {
+                if (!std.mem.eql(u8, extra, ls.lib)) continue;
+                if (!first) w.writeAll(" · ") catch @panic("OOM");
+                w.print("[`{s}`](modules/{s}/README.md) ({s})", .{ m.name, m.name, m.libs[0] }) catch @panic("OOM");
+                first = false;
+            }
+        }
+        if (first) w.writeAll("—") catch @panic("OOM");
+        w.writeAll(" |\n") catch @panic("OOM");
+    }
+    return out.written();
+}
+
+const LibsTableStep = struct {
+    step: std.Build.Step,
+    /// `false` = verify, `true` = rewrite README.md. Two named steps share one
+    /// `make` so the gate and the fix cannot render differently -- the same
+    /// reason `check-portable-table`/`gen-portable-table` are built this way.
+    write: bool,
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *LibsTableStep = @fieldParentPtr("step", step);
+        const b = step.owner;
+        const io = b.graph.io;
+        const verb = if (self.write) "gen-libs-table" else "check-libs-table";
+
+        const body = renderLibsTable(b);
+        const readme = b.build_root.handle.readFileAlloc(io, "README.md", b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
+            std.log.err("{s}: cannot read README.md: {t}", .{ verb, err });
+            return step.fail("{s}: cannot read README.md", .{verb});
+        };
+        const content_start = (std.mem.indexOf(u8, readme, libs_table_begin_marker) orelse {
+            return step.fail("{s}: begin marker missing from README.md", .{verb});
+        }) + libs_table_begin_marker.len;
+        const end_idx = std.mem.indexOfPos(u8, readme, content_start, libs_table_end_marker) orelse {
+            return step.fail("{s}: end marker missing from README.md", .{verb});
+        };
+        const updated = std.mem.concat(b.allocator, u8, &.{ readme[0..content_start], "\n", body, readme[end_idx..] }) catch @panic("OOM");
+
+        if (self.write) {
+            if (std.mem.eql(u8, updated, readme)) {
+                std.log.info("gen-libs-table: README.md already up to date", .{});
+                return;
+            }
+            b.build_root.handle.writeFile(io, .{ .sub_path = "README.md", .data = updated }) catch |err| {
+                std.log.err("gen-libs-table: cannot write README.md: {t}", .{err});
+                return step.fail("gen-libs-table: write failed", .{});
+            };
+            std.log.info("gen-libs-table: README.md updated", .{});
+            return;
+        }
+        if (!std.mem.eql(u8, updated, readme)) {
+            return step.fail(
+                "check-libs-table: README.md's generated Libraries table is STALE against module_list's `.libs` -- run `zig build gen-libs-table` and commit the result",
+                .{},
+            );
+        }
+    }
+};
+
 fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
     _ = options;
     const b = step.owner;
@@ -1369,6 +1584,7 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
         failed = true;
     }
 
+    checkLibs(readme, b, &failed);
     checkNonGoals(readme, b, &failed);
     try checkProvenance(b, io, &failed);
     try checkAnchors(b, io, &failed);

@@ -202,6 +202,26 @@ recorded with each module that has any, not at the repository root.
 
 ## Modules
 
+<!-- BEGIN GENERATED: check-libs-table (source: build.zig module_list `.libs`; regenerate with `zig build gen-libs-table`; do not hand-edit) -->
+### Libraries
+
+`zig-libs` is a plural: a **lib** is one of the six groupings below, and every
+module is filed in exactly one of them — the section its catalog row is printed
+under. A module may additionally be tagged into libraries it is worth reaching
+for from, which is what the last column lists: if you are building on `net`,
+those crypto and format modules are yours too without going looking.
+
+| Library | Filed here | Also worth reaching for from here (own library in brackets) |
+|---|---:|---|
+| `web` | 35 | [`netaddr`](modules/netaddr/README.md) (net) · [`entropy`](modules/entropy/README.md) (crypto) · [`rsa`](modules/rsa/README.md) (crypto) · [`protobuf`](modules/protobuf/README.md) (format) · [`p256`](modules/p256/README.md) (crypto) |
+| `net` | 76 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) |
+| `storage` | 15 | [`hashdigest`](modules/hashdigest/README.md) (crypto) |
+| `crypto` | 75 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
+| `format` | 19 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
+| `os` | 10 | [`framing`](modules/framing/README.md) (format) |
+<!-- END GENERATED: check-libs-table -->
+
+
 Every module is imported by its `name` (`@import("http")`); hyphenated names work too
 (`@import("security-headers")`). `Deps` are sibling modules; everything else is `std`-only.
 
@@ -372,7 +392,6 @@ way to recognise it.
 | [`netconf`](modules/netconf/README.md) | NETCONF client (RFC 6241) over SSH — RFC 6242 framing, hello/capability exchange, get/get-config/edit-config/commit RPCs with typed replies | any | ssh, xml |
 | [`ebpf`](modules/ebpf/README.md) | eBPF program generation over `std.os.linux.bpf` — bytecode builders (kprobe counter, XDP filter, ring-buffer emitter); real-kernel verifier acceptance unverified in CI | **linux** | netlink |
 | [`xdp-classifier`](modules/xdp-classifier/README.md) | XDP packet classifier for a LibreQoS-style edge shaper — IPv4 prefix→traffic-class via LPM-trie lookup, per-CPU scratch handoff, CPUMAP steering (bpf_redirect_map) | **linux** | ebpf |
-| [`testkit`](modules/testkit/README.md) | Test-only shared harness (hex decoding for KAT vectors, golden byte-comparison, verbose-skip convention); wired via build.zig test_deps, absent from consumer imports | any | — |
 | [`netsim`](modules/netsim/README.md) | Deterministic seeded discrete-event network simulator (latency/loss/partition/clock-skew, failure fuzzer, byte-exact replay) — model-checking harness for fabric algorithms | any | — |
 | [`spf-ect`](modules/spf-ect/README.md) | Deterministic symmetric shortest-path (Dijkstra) with a reversal-invariant ECT tie-break (RFC 6329 idea generalized) + maximally-disjoint second tree; pure graph algorithm | any | — |
 | [`loopfree-reconv`](modules/loopfree-reconv/README.md) | Loop-free reconvergence transitions — two-class ordered-FIB schedule (provably no transient forwarding loop, TTL backstop); netsim-verified under fuzzing | any | netsim, spf-ect |
@@ -494,7 +513,7 @@ way to recognise it.
 | [`rescue`](modules/rescue/README.md) | Rescue-Prime Optimized (RPO) — arithmetization-oriented hash over the Goldilocks field, the alternative to `poseidon` for STARK circuits. | any | — |
 | [`tfhe`](modules/tfhe/README.md) | TFHE/FHEW programmable gate bootstrapping — unbounded-depth FHE via blind rotation over a power-of-two torus. **Toy parameters only, no security level claimed.** | any | entropy |
 
-### Serialization / OS / agent
+### Serialization / formats
 
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
@@ -502,14 +521,6 @@ way to recognise it.
 | [`linkheader`](modules/linkheader/README.md) | Web Linking (RFC 8288) `Link` header build + parse (rel/title/type), plus `pagination` helpers and `find(rel)`; zero-alloc. | any | — |
 | [`cookies`](modules/cookies/README.md) | HTTP cookies (RFC 6265) — request `Cookie` parser plus `Set-Cookie` builder (Secure/HttpOnly/SameSite), injection-guarded. | any | http |
 | [`blobmsg`](modules/blobmsg/README.md) | OpenWRT ubus client + blob/blobmsg wire codec. | **linux** (codec itself: any) | — |
-| [`mcp`](modules/mcp/README.md) | Model Context Protocol server (JSON-RPC 2.0) — tools, resources, prompts, plus server→client sampling and elicitation requests. | any | — |
-| [`mcp-http`](modules/mcp-http/README.md) | MCP Streamable HTTP transport (2025-06-18) — `POST /mcp` with JSON or live SSE, resumable sessions, Origin (DNS-rebind) guard. | any | router, http, mcp |
-| [`uci`](modules/uci/README.md) | OpenWRT UCI config parser + serializer + typed model, with stable round-trip. | any | — |
-| [`argsafe`](modules/argsafe/README.md) | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv`. | any | — |
-| [`procrun`](modules/procrun/README.md) | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe |
-| [`pollworker`](modules/pollworker/README.md) | Single-owner `poll(2)` loop plus a lock-free fork/exec job table, for offloading blocking work off the loop thread. | **linux** | — |
-| [`ipcbus`](modules/ipcbus/README.md) | Same-host unix-socket control plane — a request/reply server plus a capped in-memory scratch key→bytes bus. | **linux** | framing |
-| [`sandbox`](modules/sandbox/README.md) | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
 | [`framing`](modules/framing/README.md) | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | — |
 | [`csvstream`](modules/csvstream/README.md) | Streaming RFC 4180 CSV reader that preserves byte offsets, with bounded memory regardless of file size. | any | — |
 | [`csvsafe`](modules/csvsafe/README.md) | OWASP CSV formula-injection guard (`=`/`+`/`-`/`@` cell leads). | any | — |
@@ -525,7 +536,21 @@ way to recognise it.
 | [`datefmt`](modules/datefmt/README.md) | Civil calendar plus token-based date/time parse/format and calendar arithmetic, correct before 1970. | any | — |
 | [`tz`](modules/tz/README.md) | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (600 zones + POSIX-TZ footer). | any | datefmt |
 | [`numparse`](modules/numparse/README.md) | Locale-aware grouped-number parsing (thousands/decimal separators) into an exact `decimal.Decimal`. | any | decimal |
+
+### Host / OS / agent — process, sandboxing, IPC, and the agent-side glue
+
+| Module | What it does | Platform | Deps |
+|---|---|---|---|
+| [`argsafe`](modules/argsafe/README.md) | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv`. | any | — |
 | [`diagnostics`](modules/diagnostics/README.md) | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion. | any | — |
+| [`ipcbus`](modules/ipcbus/README.md) | Same-host unix-socket control plane — a request/reply server plus a capped in-memory scratch key→bytes bus. | **linux** | framing |
+| [`mcp`](modules/mcp/README.md) | Model Context Protocol server (JSON-RPC 2.0) — tools, resources, prompts, plus server→client sampling and elicitation requests. | any | — |
+| [`mcp-http`](modules/mcp-http/README.md) | MCP Streamable HTTP transport (2025-06-18) — `POST /mcp` with JSON or live SSE, resumable sessions, Origin (DNS-rebind) guard. | any | router, http, mcp |
+| [`pollworker`](modules/pollworker/README.md) | Single-owner `poll(2)` loop plus a lock-free fork/exec job table, for offloading blocking work off the loop thread. | **linux** | — |
+| [`procrun`](modules/procrun/README.md) | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe |
+| [`sandbox`](modules/sandbox/README.md) | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
+| [`testkit`](modules/testkit/README.md) | Test-only shared harness (hex decoding for KAT vectors, golden byte-comparison, verbose-skip convention); wired via build.zig test_deps, absent from consumer imports | any | — |
+| [`uci`](modules/uci/README.md) | OpenWRT UCI config parser + serializer + typed model, with stable round-trip. | any | — |
 
 ## Non-goals — deliberately not built here
 
