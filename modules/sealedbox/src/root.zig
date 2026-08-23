@@ -52,10 +52,16 @@ pub fn sealedLen(plaintext_len: usize) usize {
 
 // ── buffer API (no allocation) ────────────────────────────────────────────────
 
-/// Seal `msg` to `recipient_pk`. `out` must be exactly `msg.len + overhead` bytes.
-/// `io` supplies entropy for the per-message ephemeral keypair.
+/// Seal `msg` to `recipient_pk`. `out` must be exactly `msg.len + overhead`
+/// bytes; a wrong size returns `error.InvalidBufferSize` rather than trusting
+/// the caller. `io` supplies entropy for the per-message ephemeral keypair.
+///
+/// The size check is an error and not `std.debug.assert` on purpose: an assert
+/// is compiled out in ReleaseFast, so the one build where a miscomputed buffer
+/// costs the most is the build where nothing would have caught it. `open`
+/// below has always returned an error for the same class of mistake.
 pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length]u8) !void {
-    std.debug.assert(out.len == msg.len + overhead);
+    if (out.len != msg.len + overhead) return error.InvalidBufferSize;
     try SealedBox.seal(io, out, msg, recipient_pk);
 }
 
@@ -223,6 +229,25 @@ fn parseKeyHex(text: []const u8) KeyEncodingError![32]u8 {
 // a submodule's tests into the test binary — this reference does.
 test {
     _ = @import("kat_test.zig");
+}
+
+// A wrong `out` size used to be `std.debug.assert`, which ReleaseFast removes
+// -- so the mistake was caught in exactly the build where it costs least.
+// Written in terms of `overhead` rather than a literal, so the test measures
+// the mechanism and not one arithmetic result.
+test "seal: a wrong-sized out buffer is an error, not an assert" {
+    const io = std.testing.io;
+    const kp = KeyPair.generate(io);
+    const msg = "sealed-box buffer size check";
+
+    var too_small: [msg.len + overhead - 1]u8 = undefined;
+    try std.testing.expectError(error.InvalidBufferSize, seal(io, &too_small, msg, kp.public_key));
+
+    var too_large: [msg.len + overhead + 1]u8 = undefined;
+    try std.testing.expectError(error.InvalidBufferSize, seal(io, &too_large, msg, kp.public_key));
+
+    var exact: [msg.len + overhead]u8 = undefined;
+    try seal(io, &exact, msg, kp.public_key);
 }
 
 test "round-trip: buffer API, various sizes including empty" {
