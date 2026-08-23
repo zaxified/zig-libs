@@ -35,6 +35,24 @@ for d in example-apps/*/; do
 done
 [ $fail -eq 0 ] || exit 1
 
+# The app README tells a newcomer how to download that one directory, so it
+# spells the tag out in a URL -- a second place the same fact lives. Keep the
+# two from drifting: every dated tag the README names must be the tag its own
+# manifest pins. `scripts/tag.sh` rewrites both together when a tag is cut.
+for d in example-apps/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    [ -f "$d/README.md" ] || { echo "check-apps: example-apps/$n has no README.md -- the download instructions are the point of the directory" >&2; fail=1; continue; }
+    pin="$(sed -n 's|.*zig-libs#\([0-9][0-9-]*\)".*|\1|p' "$d/build.zig.zon" | head -1)"
+    [ -n "$pin" ] || continue   # pinned to a commit or a branch, not a tag
+    while read -r found; do
+        [ "$found" = "$pin" ] && continue
+        echo "check-apps: example-apps/$n/README.md names tag '$found' but build.zig.zon pins '$pin'" >&2
+        fail=1
+    done < <(grep -oE '20[0-9]{2}-[0-9]{2}-[0-9]{2}' "$d/README.md" | sort -u)
+done
+[ $fail -eq 0 ] || exit 1
+
 WANT=("$@")
 [ ${#WANT[@]} -eq 0 ] && WANT=("${DECLARED[@]}")
 

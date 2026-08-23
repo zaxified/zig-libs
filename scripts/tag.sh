@@ -189,8 +189,14 @@ bump_app_pins() {
     rm -rf "$export_dir"
     for z in example-apps/*/build.zig.zon; do
         [ -f "$z" ] || continue
+        oldtag="$(sed -n 's|.*zig-libs#\([0-9][0-9-]*\)".*|\1|p' "$z" | head -1)"
         sed -i "0,/zig-libs#/{s|\(zig-libs#\)[^\"]*|\1$newtag|}" "$z"
         sed -i "0,/\.hash = /{s|\(\.hash = \"\)[^\"]*|\1$pkg_hash|}" "$z"
+        # The README's download URL names the same tag; check-apps.sh fails if
+        # the two disagree, so they move together or not at all.
+        if [ -n "$oldtag" ] && [ -f "$(dirname "$z")/README.md" ]; then
+            sed -i "s|$oldtag|$newtag|g" "$(dirname "$z")/README.md"
+        fi
     done
     if ! git diff --quiet -- example-apps; then
         git add example-apps
