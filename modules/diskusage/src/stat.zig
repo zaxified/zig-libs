@@ -141,6 +141,17 @@ pub const StatError = error{
     /// distinct from `Unexpected`: it is a fact about the host, not a bug.
     Unsupported,
     Unexpected,
+    /// `path` contains an embedded NUL byte. POSIX paths cannot represent
+    /// one: every syscall below takes a NUL-terminated C string, so a NUL
+    /// mid-slice is where the kernel's view of the path would silently stop
+    /// while the caller's did not. Checked up front and reported, rather
+    /// than left to `std.posix.toPosixPath` — which only asserts this in
+    /// safety-checked builds (a crash, not an error) and does nothing at all
+    /// in `ReleaseFast` (a silent truncation to whatever precedes the NUL).
+    /// A public function that takes caller bytes and stats the kernel with
+    /// them must not have a fuzzer-reachable panic or a truncate-and-lie
+    /// path; see the fuzz harness below, which found this.
+    InvalidPath,
 };
 
 /// Which syscall a call should use. Chosen once by `detect` and then passed
@@ -190,6 +201,7 @@ pub fn lstatAt(backend: Backend, dirfd: i32, basename: [*:0]const u8) StatError!
 /// `lstat`-equivalent on a path resolved against the current working
 /// directory (or an absolute path).
 pub fn lstatPath(backend: Backend, path: []const u8) StatError!FileStat {
+    if (std.mem.findScalar(u8, path, 0) != null) return error.InvalidPath;
     const path_z = std.posix.toPosixPath(path) catch return error.NameTooLong;
     return lstatAt(backend, linux.AT.FDCWD, &path_z);
 }
@@ -798,4 +810,90 @@ test "FileStat.id: same inode on different devices is a different identity" {
     const b: FileStat = .{ .mode = 0, .nlink = 2, .size = 0, .blocks = 0, .dev_major = 8, .dev_minor = 2, .ino = 42 };
     try testing.expect(!std.meta.eql(a.id(), b.id()));
     try testing.expect(std.meta.eql(a.id(), a.id()));
+}
+
+// ── fuzz: lstatPath's byte-accepting entry point ────────────────────────────
+//
+// `lstatPath`'s `path` is not a wire format this module decodes — it is
+// handed straight to the kernel — so the contract under fuzz is narrower
+// than a decoder's: not "produces the right `FileStat`" (there is no
+// independent oracle for an arbitrary byte string's meaning as a path) but
+// "never panics, and never silently acts on a different path than the bytes
+// actually given". Every one of `StatError` is a handled outcome; only a
+// crash, or a mismatch between what was asked and what was resolved, is a
+// failure. `lstatPath` takes no allocator and performs none (`toPosixPath`
+// copies into a stack array), so the leak concern that matters for
+// byte-accepting entry points elsewhere in this collection does not apply to
+// it directly — `scan.scanAt` is the one that allocates, but a scan rooted
+// at a fuzzed, almost-certainly-nonexistent path returns from `stat.lstatAt`
+// before any allocation happens (see its source), so it shares this exact
+// entry point rather than needing a second, filesystem-walking harness of
+// its own; walking a real tree from fuzzer-controlled input is also exactly
+// the unbounded-filesystem-recursion risk this module's own tests (see
+// `scan.zig`'s "one_file_system" tests) are deliberately built to avoid.
+//
+// This harness is what found `StatError.InvalidPath` above:
+// `std.posix.toPosixPath` only `assert`s that its input has no embedded
+// NUL — a crash in a safety-checked build (this module's tests run in
+// `Debug`) and a silent truncation to whatever precedes the NUL in
+// `ReleaseFast`, where `assert` compiles away. Neither is "return an
+// error", and a public function that hands caller bytes to the kernel must
+// do the latter. `lstatPath` and `scan.scanAt` now check first.
+fn fuzzCorpusEntry(comptime payload: []const u8) [8 + payload.len]u8 {
+    // Matches `fuzzLstatPath`'s own draw order below: an 8-byte
+    // little-endian length header (what `Smith.valueRangeAtMost(u16, ...)`
+    // reads back during corpus replay), then the path bytes verbatim (what
+    // `Smith.bytes` copies through unchanged — every byte value is in-range
+    // for an unweighted `u8` draw). Building entries this way, instead of
+    // hand-picked magic bytes, keeps them self-documenting and ties the
+    // length header to the payload's actual length rather than a
+    // hand-maintained constant that can drift from it.
+    var out: [8 + payload.len]u8 = undefined;
+    std.mem.writeInt(u64, out[0..8], payload.len, .little);
+    @memcpy(out[8..], payload);
+    return out;
+}
+
+const fuzz_path_buf_len = 8192;
+
+// PATH_MAX is 4096 on Linux; this corpus entry deliberately exceeds it.
+const fuzz_embedded_nul = fuzzCorpusEntry("a\x00b");
+const fuzz_non_utf8 = fuzzCorpusEntry(&[_]u8{ 0xff, 0xfe, 0x80, 0x01, '/', 0xc0 });
+const fuzz_all_slashes = fuzzCorpusEntry("/" ** 300);
+const fuzz_past_path_max = fuzzCorpusEntry("/" ** 5000);
+const fuzz_empty = fuzzCorpusEntry("");
+
+test "fuzz: lstatPath never panics or truncates silently on arbitrary path bytes" {
+    try testing.fuzz({}, fuzzLstatPath, .{ .corpus = &.{
+        &fuzz_embedded_nul,
+        &fuzz_non_utf8,
+        &fuzz_all_slashes,
+        &fuzz_past_path_max,
+        &fuzz_empty,
+    } });
+}
+
+fn fuzzLstatPath(_: void, smith: *std.testing.Smith) !void {
+    var buf: [fuzz_path_buf_len]u8 = undefined;
+    const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+    smith.bytes(buf[0..len]);
+    const path = buf[0..len];
+
+    const backend = detect();
+    const result = lstatPath(backend, path);
+
+    // The one claim this harness can check without an external oracle: an
+    // embedded NUL must be refused outright, never silently resolved as the
+    // bytes before it (which would mean `lstatPath` acted on a shorter path
+    // than the one it was actually given).
+    if (std.mem.findScalar(u8, path, 0) != null) {
+        try testing.expectError(error.InvalidPath, result);
+        return;
+    }
+    // Everything else: any `StatError`, or a real `FileStat` (a fuzzed
+    // path can legitimately land on a real file, e.g. "/" itself), is a
+    // handled outcome. Only a panic — caught by the harness process
+    // crashing, the same way every other `testing.fuzz` target in this
+    // collection is checked — is a failure.
+    _ = result catch {};
 }

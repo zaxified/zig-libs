@@ -92,3 +92,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
   Class B, oracle EXTERNAL (traversal) + REDERIVED (struct layouts); details
   in `SPEC.md`.
+
+  **Fuzzed, and it found a real one.** `lstatPath`'s `path` goes straight to
+  the kernel rather than through a decoder, but a `testing.fuzz(` harness on
+  it caught `std.posix.toPosixPath` doing the wrong thing on an embedded NUL:
+  an `assert` (a crash in this module's safety-checked test build) that
+  compiles away entirely in `ReleaseFast`, where the same input would have
+  silently resolved a *shorter* path than the one the caller passed. Both
+  `lstatPath` and `scanAt` now check for one first and return the new
+  `error.InvalidPath` instead. Mutation-proven: the check removed, the
+  harness crashed exactly as before it existed; restored, green again.

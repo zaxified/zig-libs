@@ -231,6 +231,11 @@ pub fn scanAt(
 
     var report: Report = .{};
 
+    // Same check `stat.lstatPath` makes, and for the same reason: an
+    // embedded NUL is where `toPosixPath` either asserts (safety-checked
+    // builds) or silently truncates the path (ReleaseFast) rather than
+    // erroring — see `stat.StatError.InvalidPath`'s doc comment.
+    if (std.mem.findScalar(u8, path, 0) != null) return error.InvalidPath;
     const path_z = std.posix.toPosixPath(path) catch return error.NameTooLong;
     const root_stat = try stat.lstatAt(backend, base.handle, &path_z);
 

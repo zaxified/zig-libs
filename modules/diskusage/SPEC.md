@@ -218,6 +218,13 @@ Not applicable — no secret material is handled anywhere in this module.
   buffer (`error.NameTooLong`); paths *inside* the tree are not, because every
   entry is stat'd relative to its open parent directory rather than by full
   path.
+- `lstatPath` and `scanAt`/`scanPath` reject a `path` containing an embedded
+  NUL byte with `error.InvalidPath`, checked before `toPosixPath` ever sees
+  it. `toPosixPath` itself only `assert`s the absence of one — a crash in a
+  safety-checked build, and in `ReleaseFast`, where `assert` compiles away, a
+  silent truncation to whatever precedes the NUL: a caller would be told
+  about a shorter path than the one it actually gave. See the "Fuzzing"
+  subsection below.
 - Traversal depth is bounded only by memory: one frame plus one owned path
   copy per open directory.
 - Every total saturates rather than wraps (`+|=`), and a negative `st_size` or
@@ -319,6 +326,22 @@ Two of the eight did not behave as a plain red:
   now counts boundary children with `stat.lstatAt` directly, independently of
   `scanAt`, and the same mutation turns it red. A precondition may never be
   read off the mechanism under test.
+
+**Fuzzing.** `lstatPath`'s `path` is not this module's wire format — it is
+handed straight to the kernel — so `stat.zig` carries a `testing.fuzz(`
+harness on it with a narrower contract than a decoder's: never panic, and
+never act on a different path than the bytes actually given, for arbitrary
+byte content (embedded NUL, non-UTF8 bytes, a path past `PATH_MAX`, one that
+is all slashes). It found `StatError.InvalidPath` above — the harness is what
+turned up the `toPosixPath` assert/truncate hazard, not an audit reading the
+source. `scan.scanAt` shares the same entry point (a scan rooted at a
+fuzzed, near-certainly-nonexistent path returns from `stat.lstatAt` before
+any allocation happens) rather than getting a second harness that would have
+to walk the real filesystem on fuzzer-controlled input — exactly the
+unbounded-traversal risk the symlink mutation above already demonstrates.
+Mutation-proven the same way as the traversal: the NUL check removed,
+observed to crash the harness (`toPosixPath`'s own `assert`), restored,
+observed green again.
 
 ## What is deliberately not done
 
