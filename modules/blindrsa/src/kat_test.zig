@@ -274,6 +274,85 @@ test "blindWithFactor rejects a bad blinding factor: zero, >= n, and gcd(r, n) !
     );
 }
 
+// ── output-buffer-too-small: caller-controlled, was std.debug.assert ───
+//
+// `prepareRandomize`/`blindCore` (via `blind`/`blindWithFactor`)/`blindSign`/
+// `finalize` used to guard their caller-supplied `out`/`blinded_msg_out`
+// buffer with `std.debug.assert`. ReleaseFast compiles that assert out
+// together with the slice bounds check on the write that follows, so an
+// undersized buffer became a silent out-of-bounds write in the build that
+// ships. Each test below is written in terms of the module's own length
+// (`randomizer_len`, the modulus length carried by the RFC vectors/`Context`)
+// rather than a literal, so it keeps measuring the mechanism if those move.
+
+test "prepareRandomize: an out buffer one byte short of randomizer_len + msg.len is an error, not an assert" {
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x50} ** 32);
+    var out: [blindrsa.randomizer_len + 5 - 1]u8 = undefined;
+    try testing.expectError(error.OutputTooSmall, blindrsa.prepareRandomize("hello", csprng.random(), &out));
+
+    var exact: [blindrsa.randomizer_len + 5]u8 = undefined;
+    _ = try blindrsa.prepareRandomize("hello", csprng.random(), &exact);
+}
+
+test "blind/blindWithFactor: a blinded_msg_out one byte short of the modulus length is an error, not an assert" {
+    const pk = try kat.publicKey();
+    const modulus_len = kat.a1.blinded_msg.len;
+    var ctx: blindrsa.Context = undefined;
+
+    var too_small_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const too_small = too_small_buf[0 .. modulus_len - 1];
+    try testing.expectError(
+        error.OutputTooSmall,
+        blindrsa.blindWithFactor(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, &kat.r, &ctx, too_small),
+    );
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x51} ** 32);
+    var salt: [Sha384.digest_length]u8 = undefined;
+    csprng.random().bytes(&salt);
+    try testing.expectError(
+        error.OutputTooSmall,
+        blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, &salt, csprng.random(), &ctx, too_small),
+    );
+
+    // Exact size still works.
+    var exact_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    _ = try blindrsa.blindWithFactor(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, &kat.r, &ctx, exact_buf[0..modulus_len]);
+}
+
+test "blindSign: an out buffer one byte short of the modulus length is an error, not an assert" {
+    const sk = try kat.secretKey();
+    const pk = try kat.publicKey();
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x52} ** 32);
+    const modulus_len = kat.a1.blind_sig.len;
+
+    var too_small_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    try testing.expectError(
+        error.OutputTooSmall,
+        blindrsa.blindSign(sk, pk, csprng.random(), &kat.a1.blinded_msg, too_small_buf[0 .. modulus_len - 1]),
+    );
+
+    var exact_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    _ = try blindrsa.blindSign(sk, pk, csprng.random(), &kat.a1.blinded_msg, exact_buf[0..modulus_len]);
+}
+
+test "finalize: an out buffer one byte short of ctx.modulus_len is an error, not an assert" {
+    const pk = try kat.publicKey();
+    const ctx = blindrsa.Context{
+        .prepared_msg = &kat.a1.prepared_msg,
+        .salt_len = kat.a1.salt.len,
+        .r_inv = kat.a1.inv,
+        .modulus_len = kat.a1.blind_sig.len,
+    };
+    var too_small_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    try testing.expectError(
+        error.OutputTooSmall,
+        blindrsa.finalize(pk, Sha384, &kat.a1.blind_sig, &ctx, too_small_buf[0 .. ctx.modulus_len - 1]),
+    );
+
+    var exact_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    _ = try blindrsa.finalize(pk, Sha384, &kat.a1.blind_sig, &ctx, exact_buf[0..ctx.modulus_len]);
+}
+
 // ── random-path round-trips ─────────────────────────────────────────────
 
 test "random-r blind -> blindSign -> finalize -> verify round-trip over the RFC 4096-bit key (both PSS and PSSZERO)" {
@@ -314,7 +393,7 @@ test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> final
 
     const msg = "blindrsa round-trip smoke test";
     var prep_buf: [blindrsa.randomizer_len + msg.len]u8 = undefined;
-    const prepared_msg = blindrsa.prepareRandomize(msg, random, &prep_buf);
+    const prepared_msg = try blindrsa.prepareRandomize(msg, random, &prep_buf);
 
     var salt: [Sha384.digest_length]u8 = undefined;
     random.bytes(&salt);

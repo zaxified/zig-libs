@@ -744,6 +744,13 @@ fn pollFailed(what: []const u8, err: anyerror) bool {
             error.Timeout => "Timeout — no answer within the deadline. On UDP that is " ++
                 "an agent that is down, a datagram that was lost, or a community it did not accept.",
             error.TransportFailed => "TransportFailed — the socket itself refused the round-trip.",
+            // Distinct from TransportFailed on purpose: the request was
+            // abandoned by whoever asked for it, so retrying it -- what a
+            // poller normally does on the next tick -- is work nobody is
+            // waiting for any more. This demo has no retry loop, so the only
+            // difference visible here is the message; a real poller must
+            // stop instead of scheduling the next attempt.
+            error.Canceled => "Canceled — the request was abandoned by its own caller, not by the agent.",
             error.RequestIdMismatch => "RequestIdMismatch — the answer belongs to a different request.",
             error.UnexpectedPduType => "UnexpectedPduType — the peer answered with something that is not a Response.",
             else => @errorName(err),

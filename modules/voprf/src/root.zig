@@ -614,7 +614,18 @@ pub fn evaluate(comptime mode: Mode, sk: [Ns]u8, input: []const u8) EvaluateErro
 
 // ── VOPRF mode (RFC 9497 §3.3.2) ─────────────────────────────────────────
 
-pub const BlindEvaluateVerifiableError = error{ProofGenerationFailed}; // see blindEvaluate re: the dropped InvalidSecretKey
+pub const BlindEvaluateVerifiableError = error{
+    ProofGenerationFailed, // see blindEvaluate re: the dropped InvalidSecretKey
+    /// `blinded.len == 0`. Returned rather than asserted: `blinded` is a
+    /// caller-supplied slice, and an empty batch has no well-defined proof.
+    EmptyBatch,
+    /// `evaluated_out.len != blinded.len`. Returned rather than asserted:
+    /// both are independent caller-supplied slices, and ReleaseFast compiles
+    /// the assert (and the length check the `for (blinded, evaluated_out)`
+    /// loop performs) out together, so a mismatched `evaluated_out` reads or
+    /// writes past its own bounds in the build that ships.
+    MismatchedLengths,
+};
 
 /// The result of a single-element VOPRF `BlindEvaluate`.
 pub const VerifiableEvaluation = struct {
@@ -648,7 +659,8 @@ pub fn blindEvaluateVerifiableBatch(
     evaluated_out: []Element,
     proof_r: [Ns]u8,
 ) BlindEvaluateVerifiableError!Proof {
-    std.debug.assert(blinded.len >= 1 and evaluated_out.len == blinded.len);
+    if (blinded.len == 0) return error.EmptyBatch;
+    if (evaluated_out.len != blinded.len) return error.MismatchedLengths;
     for (blinded, evaluated_out) |blinded_element, *out| {
         out.* = blindEvaluate(sk, blinded_element);
     }
@@ -715,7 +727,19 @@ pub fn blindPoprf(
 /// server's private key (`t = skS + m == 0`). Per the RFC, a client
 /// triggering this should be assumed to know `skS` — servers seeing it
 /// should rotate their key.
-pub const PoprfEvaluateError = error{ InverseError, ProofGenerationFailed }; // see blindEvaluate re: the dropped InvalidSecretKey
+pub const PoprfEvaluateError = error{
+    InverseError,
+    ProofGenerationFailed, // see blindEvaluate re: the dropped InvalidSecretKey
+    /// `blinded.len == 0`. Returned rather than asserted: `blinded` is a
+    /// caller-supplied slice, and an empty batch has no well-defined proof.
+    EmptyBatch,
+    /// `evaluated_out.len != blinded.len`. Returned rather than asserted:
+    /// both are independent caller-supplied slices, and ReleaseFast compiles
+    /// the assert (and the length check the `for (blinded, evaluated_out)`
+    /// loop performs) out together, so a mismatched `evaluated_out` reads or
+    /// writes past its own bounds in the build that ships.
+    MismatchedLengths,
+};
 
 /// Batched RFC 9497 §3.3.3 `BlindEvaluate(skS, blindedElement, info)`:
 /// `evaluated[i] = (skS + m)^-1 * blinded[i]`, plus one DLEQ proof over
@@ -729,7 +753,8 @@ pub fn blindEvaluatePoprfBatch(
     evaluated_out: []Element,
     proof_r: [Ns]u8,
 ) PoprfEvaluateError!Proof {
-    std.debug.assert(blinded.len >= 1 and evaluated_out.len == blinded.len);
+    if (blinded.len == 0) return error.EmptyBatch;
+    if (evaluated_out.len != blinded.len) return error.MismatchedLengths;
     const m = poprfInfoScalar(info);
     const t = scalar.add(sk, m);
     if (std.mem.allEqual(u8, &t, 0)) return error.InverseError;

@@ -18,14 +18,17 @@
 //! that part of the brief has nothing to exercise here. Noted rather than
 //! invented.
 //!
-//! No named-error negative vectors either: every public function here
-//! returns a plain value, not an error union — HOTP/TOTP take a
-//! caller-owned raw key and counter/time (not untrusted wire bytes), so
-//! there is nothing to fail-closed parse. The module's one fallible-in-
-//! spirit surface is `totpVerify`'s boolean accept/reject, which IS the
-//! RFC 6238 resynchronization behavior a server actually depends on — so
-//! that is what the "negative" section below exercises, per CONVENTIONS.md
-//! §7.2's carve-out for a genuinely infallible public surface.
+//! No named-error negative vectors for HOTP/TOTP itself: `hotp`/`totp` take
+//! a caller-owned raw key and counter/time (not untrusted wire bytes), so
+//! there is nothing to fail-closed parse. `fmtCode`/`hotpFmt`/`totpFmt` DO
+//! return `FmtCodeError!` (an undersized `out` buffer is `error.
+//! OutputTooSmall`, not a panic) but every call below sizes its buffer
+//! correctly, so that path is `try`d rather than exercised negatively here.
+//! The module's one fallible-in-spirit BEHAVIORAL surface is `totpVerify`'s
+//! boolean accept/reject, which IS the RFC 6238 resynchronization behavior a
+//! server actually depends on — so that is what the "negative" section below
+//! exercises, per CONVENTIONS.md §7.2's carve-out for a genuinely infallible
+//! (behaviorally) public surface.
 //!
 //! `modules/otp/src/kat_test.zig` already drives RFC 4226 Appendix D (all
 //! counts 0-9, SHA-1) and the full RFC 6238 Appendix B table (6 times ×
@@ -67,7 +70,7 @@ pub fn main() !void {
     };
     for (hotp_cases) |c| {
         var buf: [6]u8 = undefined;
-        const code = otp.hotpFmt(.sha1, &secret, c.counter, 6, &buf);
+        const code = try otp.hotpFmt(.sha1, &secret, c.counter, 6, &buf);
         std.debug.assert(std.mem.eql(u8, code, c.expected));
         std.debug.print("HOTP SHA1 counter={d}: {s}\n", .{ c.counter, code });
     }
@@ -94,7 +97,7 @@ pub fn main() !void {
         for (totp_cases) |c| {
             if (c.alg != alg) continue;
             var buf: [8]u8 = undefined;
-            const code = otp.totpFmt(alg, &secret, c.unix_time, 30, 0, 8, &buf);
+            const code = try otp.totpFmt(alg, &secret, c.unix_time, 30, 0, 8, &buf);
             std.debug.assert(std.mem.eql(u8, code, c.expected));
             std.debug.print("TOTP {s} t={d}: {s}\n", .{ @tagName(alg), c.unix_time, code });
         }

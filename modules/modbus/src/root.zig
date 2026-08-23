@@ -241,10 +241,17 @@ pub fn bitByteCount(count: usize) usize {
 
 /// Pack bools into bytes LSB-first (first coil = bit 0 of the first byte);
 /// unused high bits of the last byte are zero. `dst` must hold
-/// `bitByteCount(bits.len)` bytes. Returns the written prefix of `dst`.
-pub fn packBits(dst: []u8, bits: []const bool) []u8 {
+/// `bitByteCount(bits.len)` bytes, else `error.BufferTooSmall`. Returns the
+/// written prefix of `dst`.
+///
+/// The size check is an error and not `std.debug.assert` on purpose: `dst`
+/// is a caller-supplied buffer, and ReleaseFast compiles the assert (and the
+/// bounds check on the `dst[i / 8]` writes below) out together, turning an
+/// undersized `dst` into a silent out-of-bounds write in the build that
+/// ships.
+pub fn packBits(dst: []u8, bits: []const bool) error{BufferTooSmall}![]u8 {
     const n = bitByteCount(bits.len);
-    std.debug.assert(dst.len >= n);
+    if (dst.len < n) return error.BufferTooSmall;
     @memset(dst[0..n], 0);
     for (bits, 0..) |bit, i| {
         if (bit) {
@@ -256,9 +263,13 @@ pub fn packBits(dst: []u8, bits: []const bool) []u8 {
 }
 
 /// Unpack `out.len` bits from LSB-first packed bytes. `src` must hold
-/// `bitByteCount(out.len)` bytes.
-pub fn unpackBits(src: []const u8, out: []bool) void {
-    std.debug.assert(src.len >= bitByteCount(out.len));
+/// `bitByteCount(out.len)` bytes, else `error.BufferTooSmall`.
+///
+/// Same rationale as `packBits`: `src` is caller-supplied, and an undersized
+/// one used to be an `std.debug.assert` away from an out-of-bounds read that
+/// ReleaseFast would not catch.
+pub fn unpackBits(src: []const u8, out: []bool) error{BufferTooSmall}!void {
+    if (src.len < bitByteCount(out.len)) return error.BufferTooSmall;
     for (out, 0..) |*bit, i| {
         const shift: u3 = @intCast(i % 8);
         bit.* = (src[i / 8] >> shift) & 1 != 0;
@@ -320,7 +331,7 @@ pub const pdu = struct {
         std.mem.writeInt(u16, buf[1..3], addr, .big);
         std.mem.writeInt(u16, buf[3..5], quantity, .big);
         buf[5] = @intCast(nbytes);
-        _ = packBits(buf[6..total], values);
+        _ = try packBits(buf[6..total], values);
         return buf[0..total];
     }
 
@@ -386,7 +397,9 @@ pub const pdu = struct {
         if (payload.len < 1) return error.ShortFrame;
         const nbytes = bitByteCount(out.len);
         if (payload[0] != nbytes or payload.len != 1 + nbytes) return error.MalformedResponse;
-        unpackBits(payload[1..], out);
+        // payload.len == 1 + nbytes was just checked, so payload[1..].len ==
+        // nbytes == bitByteCount(out.len) exactly: unpackBits cannot fail here.
+        unpackBits(payload[1..], out) catch unreachable;
     }
 
     /// FC 03 / 04 / 17 response: byte count + big-endian registers into
@@ -833,11 +846,31 @@ test "CRC-16 known frames and wire byte order" {
 test "bit packing round trip, LSB-first" {
     const bits = [_]bool{ true, false, true, true, false, false, true, true, true, false };
     var packed_buf: [2]u8 = undefined;
-    const bytes = packBits(&packed_buf, &bits);
+    const bytes = try packBits(&packed_buf, &bits);
     try testing.expectEqualSlices(u8, &.{ 0xCD, 0x01 }, bytes);
     var back: [bits.len]bool = undefined;
-    unpackBits(bytes, &back);
+    try unpackBits(bytes, &back);
     try testing.expectEqualSlices(bool, &bits, &back);
+}
+
+// packBits/unpackBits used to guard their buffer with std.debug.assert
+// before indexing it (dst[i / 8] |= ...; src[i / 8] & ...). ReleaseFast
+// compiles the assert (and the bounds check on those indexes) out together,
+// so an undersized dst/src was a silent out-of-bounds write/read in the
+// build that ships. Written in terms of bitByteCount rather than a literal
+// so it keeps measuring the mechanism if that arithmetic ever changes.
+test "packBits/unpackBits: a buffer one byte short of bitByteCount is an error, not an assert" {
+    const bits = [_]bool{true} ** 10; // bitByteCount(10) == 2
+    const n = bitByteCount(bits.len);
+
+    var short_dst: [1]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, packBits(short_dst[0 .. n - 1], &bits));
+    var exact_dst: [2]u8 = undefined;
+    _ = try packBits(exact_dst[0..n], &bits);
+
+    var out: [bits.len]bool = undefined;
+    try testing.expectError(error.BufferTooSmall, unpackBits(exact_dst[0 .. n - 1], &out));
+    try unpackBits(exact_dst[0..n], &out);
 }
 
 test "spec KAT: FC 01 read coils 20-38" {

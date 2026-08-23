@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — **Breaking:** `sortDestinationsWithSources` returns
+  `error{MismatchedLengths}!void` instead of `void`, and rejects
+  `dsts.len != srcs.len` with an error where it previously used
+  `std.debug.assert`. Both slices are independent caller-supplied arguments,
+  and ReleaseFast compiles the assert (and the bounds check on every
+  `srcs[i]` read/write in the sort loop) out — so a shorter `srcs` slice was
+  an out-of-bounds read/write in release builds. Same shape as
+  `sortDestinations` above, in the same file, noted as left over when that
+  one was fixed.
+
 - **2026-08-23** — **Breaking:** `sortDestinations` returns
   `error{TooManyCandidates}!void` instead of `void`, and rejects
   `dsts.len > max_sort_candidates` with an error where it previously used

@@ -14,7 +14,18 @@ const Oid = oid_mod.Oid;
 const VarBind = message.VarBind;
 
 /// Failures a `Transport` implementation may report.
-pub const TransportError = error{ TransportFailed, Timeout };
+pub const TransportError = error{
+    TransportFailed,
+    Timeout,
+    /// The caller canceled the request while it was waiting on the socket.
+    /// Distinct from `TransportFailed` on purpose: a consumer that folds the
+    /// two together retries a request its own caller already abandoned, and
+    /// reports a healthy agent as a dead one. Unlike a buffered
+    /// `Io.Reader`/`Io.Writer` (whose error sets cannot carry this),
+    /// `std.Io.net.Socket.send`/`.receiveTimeout` report it directly — see
+    /// `UdpTransport.exchangeFn`.
+    Canceled,
+};
 
 /// One blocking request/reply round-trip. `exchangeFn` sends `request` and
 /// writes the reply datagram into `reply_buf`, returning its length.
@@ -237,9 +248,13 @@ pub const UdpTransport = struct {
 
     fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize {
         const t: *UdpTransport = @ptrCast(@alignCast(ctx));
-        t.socket.send(t.io, &t.peer, request) catch return error.TransportFailed;
+        t.socket.send(t.io, &t.peer, request) catch |err| return switch (err) {
+            error.Canceled => error.Canceled,
+            else => error.TransportFailed,
+        };
         const incoming = t.socket.receiveTimeout(t.io, reply_buf, t.timeout) catch |err| switch (err) {
             error.Timeout => return error.Timeout,
+            error.Canceled => return error.Canceled,
             else => return error.TransportFailed,
         };
         if (incoming.flags.trunc) return error.TransportFailed;
@@ -517,4 +532,41 @@ test "walk detects a non-advancing agent -> OidNotIncreasing" {
 
 test "UdpTransport compiles (never sends in tests)" {
     testing.refAllDecls(UdpTransport);
+}
+
+// -- test (cancellation, loopback) -----------------------------------------
+//
+// Mirrors the sibling `whois` module's loopback cancelation test. The peer
+// socket below is bound and reachable (so the request is not bounced by an
+// ICMP port-unreachable) but never sends a reply, so the read under test is
+// genuinely parked in the kernel -- the shape that used to come back as
+// `TransportFailed` and make a consumer retry a request its own caller had
+// already abandoned.
+
+fn exchangeOnce(t: Transport, request: []const u8, reply_buf: []u8) TransportError![]const u8 {
+    return t.exchange(request, reply_buf);
+}
+
+test "UdpTransport: a canceled receive surfaces error.Canceled, not error.TransportFailed" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const peer_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var peer_socket = peer_addr.bind(io, .{ .mode = .dgram }) catch |err| {
+        std.debug.print("snmp cancel test bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer peer_socket.close(io);
+    const peer_port = peer_socket.address.getPort();
+
+    var udp = try UdpTransport.open(io, try std.Io.net.IpAddress.parse("127.0.0.1", peer_port), .{});
+    defer udp.close();
+
+    var reply_buf: [max_message_len]u8 = undefined;
+    var fut = try io.concurrent(exchangeOnce, .{ udp.transport(), "probe", &reply_buf });
+    // Long enough that the request has been sent and the reply receive is
+    // the one parked in the kernel (the peer never answers).
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
 }

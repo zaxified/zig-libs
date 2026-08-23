@@ -48,7 +48,7 @@ test "RFC 4226 Appendix D: formatted codes" {
         const want = try std.fmt.bufPrint(&want_buf, "{d:0>6}", .{v.hotp6});
         try std.testing.expectEqualStrings(
             want,
-            otp.hotpFmt(.sha1, kat.rfc4226_secret, v.count, 6, &buf),
+            try otp.hotpFmt(.sha1, kat.rfc4226_secret, v.count, 6, &buf),
         );
     }
 }
@@ -71,7 +71,7 @@ test "RFC 6238 Appendix B: leading-zero code formats as 07081804" {
     var buf: [8]u8 = undefined;
     try std.testing.expectEqualStrings(
         "07081804",
-        otp.totpFmt(.sha1, kat.rfc6238_secret_sha1, 1111111109, 30, 0, 8, &buf),
+        try otp.totpFmt(.sha1, kat.rfc6238_secret_sha1, 1111111109, 30, 0, 8, &buf),
     );
 }
 

@@ -63,7 +63,7 @@ pub fn main() !void {
     // ── request 1: RSABSSA-SHA384-PSS-Randomized ────────────────────────
     const msg1 = "anonymous-token request #1";
     var prep_buf1: [blindrsa.randomizer_len + msg1.len]u8 = undefined;
-    const prepared1 = blindrsa.prepareRandomize(msg1, random, &prep_buf1);
+    const prepared1 = try blindrsa.prepareRandomize(msg1, random, &prep_buf1);
     var salt1: [Sha384.digest_length]u8 = undefined;
     random.bytes(&salt1);
 
@@ -89,7 +89,7 @@ pub fn main() !void {
     // from session 1 may leak into this one.
     const msg2 = "anonymous-token request #2";
     var prep_buf2: [blindrsa.randomizer_len + msg2.len]u8 = undefined;
-    const prepared2 = blindrsa.prepareRandomize(msg2, random, &prep_buf2);
+    const prepared2 = try blindrsa.prepareRandomize(msg2, random, &prep_buf2);
     var salt2: [Sha384.digest_length]u8 = undefined;
     random.bytes(&salt2);
 
@@ -112,7 +112,7 @@ pub fn main() !void {
     // cannot tell "same underlying message, blinded twice" from "two
     // different messages" by comparing blinded_msg bytes.
     var prep_buf1b: [blindrsa.randomizer_len + msg1.len]u8 = undefined;
-    const prepared1b = blindrsa.prepareRandomize(msg1, random, &prep_buf1b);
+    const prepared1b = try blindrsa.prepareRandomize(msg1, random, &prep_buf1b);
     var salt1b: [Sha384.digest_length]u8 = undefined;
     random.bytes(&salt1b);
     var ctx1b: blindrsa.Context = undefined;

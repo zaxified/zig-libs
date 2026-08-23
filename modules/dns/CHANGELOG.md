@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — **Breaking:** `reverseName` returns
+  `ReverseNameError![]const u8` (`error{OutputTooSmall}`) instead of
+  `[]const u8`. It used to guard `buf.len >= max_reverse_name_len` with
+  `std.debug.assert`; the `std.Io.Writer.fixed` writes inside stay
+  memory-safe regardless (they clamp to the buffer), but every one is
+  `catch unreachable`, so ReleaseFast compiling the assert out turned a
+  too-small `buf` into undefined behaviour (an `unreachable` hit) instead of
+  a clean failure. Found by an audit sweep for this shape. `Resolver.reverse`
+  and the example's `-x` path both size their buffer to exactly
+  `max_reverse_name_len`, so the new error is provably unreachable there
+  (`catch unreachable`).
 - **2026-08-23** — `sortIps` no longer re-checks
   `netaddr.max_sort_candidates` before calling `sortDestinations`; the bound is
   enforced inside `netaddr` now that it returns an error, so the rule lives in

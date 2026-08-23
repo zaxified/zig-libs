@@ -876,8 +876,16 @@ fn destinationBefore(da: Ip, sa: ?Ip, db: Ip, sb: ?Ip) bool {
 /// Both slices are permuted in tandem. Pure and allocation-free — this is the
 /// Go `sortByRFC6724withSrcs` shape, ideal for tests and for callers that
 /// already know their sources.
-pub fn sortDestinationsWithSources(dsts: []Ip, srcs: []?Ip) void {
-    std.debug.assert(dsts.len == srcs.len);
+///
+/// Returns `error.MismatchedLengths` when `dsts.len != srcs.len`. That is an
+/// error and not `std.debug.assert` on purpose: both slices are caller-
+/// supplied and independent, so nothing but the assert kept `srcs[i]` (and
+/// the `srcs[j] = srcs[j - 1]` shuffle below) inside `srcs`'s own bounds —
+/// and ReleaseFast compiles the assert and the bounds check out together, so
+/// a shorter `srcs` became an out-of-bounds read/write in the build that
+/// ships.
+pub fn sortDestinationsWithSources(dsts: []Ip, srcs: []?Ip) error{MismatchedLengths}!void {
+    if (dsts.len != srcs.len) return error.MismatchedLengths;
     if (dsts.len < 2) return;
     // Insertion sort: stable (rule 10), no scratch, and candidate lists from
     // DNS are tiny so O(n²) comparisons are irrelevant.
@@ -917,7 +925,7 @@ pub fn sortDestinations(dsts: []Ip, srcFor: *const fn (Ip) ?Ip) error{TooManyCan
     if (dsts.len < 2) return;
     var srcs: [max_sort_candidates]?Ip = undefined;
     for (dsts, 0..) |d, i| srcs[i] = srcFor(d);
-    sortDestinationsWithSources(dsts, srcs[0..dsts.len]);
+    sortDestinationsWithSources(dsts, srcs[0..dsts.len]) catch unreachable; // lengths match by construction
 }
 
 /// Ask the OS which source address it would pick for `dst`: connect() on a
@@ -1186,7 +1194,7 @@ test "commonPrefixLen per RFC 6724 §2.2" {
 // ── tests: destination ordering (RFC 6724 §10.2 vectors) ────────────────────
 
 fn expectOrder(dsts: []Ip, srcs: []?Ip, expected: []const []const u8) !void {
-    sortDestinationsWithSources(dsts, srcs);
+    try sortDestinationsWithSources(dsts, srcs);
     for (expected, 0..) |e, i| {
         var buf: [max_ip_text_len]u8 = undefined;
         try testing.expectEqualStrings(e, formatIp(dsts[i], &buf));
@@ -1301,6 +1309,23 @@ test "sortDestinations: one past the candidate bound is an error, not a stack wr
 
     // Exactly at the bound still works.
     try sortDestinations(dsts[0..max_sort_candidates], S.srcFor);
+}
+
+// sortDestinationsWithSources used to guard dsts.len == srcs.len with
+// std.debug.assert, which ReleaseFast removes along with the bounds check on
+// every srcs[i] read and srcs[j] = srcs[j - 1] write below it -- and both
+// slices are independent caller-supplied arguments, so nothing else kept
+// srcs in bounds. A caller passing a shorter srcs slice (e.g. mismatched
+// buffers assembled from two different sources) got an out-of-bounds
+// read/write in the build that ships.
+test "sortDestinationsWithSources: mismatched slice lengths are an error, not a stack write" {
+    var dsts = [_]Ip{ mkIp("198.51.100.121"), mkIp("2001:db8:1::1"), mkIp("10.0.0.1") };
+    var short_srcs = [_]?Ip{ mkIp("198.51.100.117"), mkIp("2001:db8:1::2") };
+    try std.testing.expectError(error.MismatchedLengths, sortDestinationsWithSources(&dsts, &short_srcs));
+
+    // Equal lengths still work.
+    var matched_srcs = [_]?Ip{ mkIp("198.51.100.117"), mkIp("2001:db8:1::2"), mkIp("10.0.0.2") };
+    try sortDestinationsWithSources(&dsts, &matched_srcs);
 }
 
 test "systemSource resolves a loopback source on Linux" {

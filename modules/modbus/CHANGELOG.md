@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — **Breaking:** `packBits` and `unpackBits` return
+  `error{BufferTooSmall}!` instead of a plain value/`void`. Both used to
+  guard their caller-supplied `dst`/`src` buffer with `std.debug.assert`
+  before indexing it (`dst[i / 8] |= ...` / `src[i / 8] & ...`); ReleaseFast
+  compiles the assert (and the bounds check on those indexes) out together,
+  so a buffer undersized relative to `bitByteCount` was a silent
+  out-of-bounds write/read in the build that ships. Found by an audit sweep
+  for this shape.
 - **2026-08-23** — `example/main.zig` became `modbus-demo`, one binary with two
   modes (`server` and `client`) that exchange real frames over a real TCP
   socket instead of an in-process loopback. The server half is the listen /

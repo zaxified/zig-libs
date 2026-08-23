@@ -291,14 +291,24 @@ pub fn prepareIdentity(msg: []const u8) []const u8 {
 /// Length of the random prefix `prepareRandomize` prepends (RFC 9474 §4).
 pub const randomizer_len = 32;
 
+pub const PrepareRandomizeError = error{
+    /// `out.len < randomizer_len + msg.len`. Returned rather than asserted:
+    /// `msg` is caller-supplied and can vary in length at runtime, and an
+    /// assert here is compiled out (along with the bounds check) in
+    /// ReleaseFast, turning an undersized `out` into a silent out-of-bounds
+    /// `@memcpy` in the build that ships.
+    OutputTooSmall,
+};
+
 /// RFC 9474 §4 "PrepareRandomize": `prepared_msg = msg_prefix || msg`,
 /// `msg_prefix` a fresh 32-byte random string. Used by the `-Randomized`
 /// variants — binds a fresh randomizer to every `blind` call so that
 /// signing the SAME application-level `msg` twice does not produce
 /// linkable identical `prepared_msg`s. `out.len` must be at least
-/// `randomizer_len + msg.len`; returns the written subslice.
-pub fn prepareRandomize(msg: []const u8, random: std.Random, out: []u8) []const u8 {
-    std.debug.assert(out.len >= randomizer_len + msg.len);
+/// `randomizer_len + msg.len`, else `error.OutputTooSmall`; on success
+/// returns the written subslice.
+pub fn prepareRandomize(msg: []const u8, random: std.Random, out: []u8) PrepareRandomizeError![]const u8 {
+    if (out.len < randomizer_len + msg.len) return error.OutputTooSmall;
     random.bytes(out[0..randomizer_len]);
     @memcpy(out[randomizer_len..][0..msg.len], msg);
     return out[0 .. randomizer_len + msg.len];
@@ -345,6 +355,13 @@ pub const BlindError = PssEncodeError || error{
     /// correct uniform sampler over `[1, n)`; the caller should retry with
     /// fresh randomness.
     InvalidBlindingFactor,
+    /// `blinded_msg_out.len < modulus_len`. Returned rather than asserted:
+    /// `modulus_len` depends on the `PublicKey` passed in, so a fixed-size
+    /// caller buffer sized for a smaller key silently underflows it for a
+    /// larger one — and ReleaseFast compiles the assert (and the bounds
+    /// check on the `toBytes` write) out, turning that into an
+    /// out-of-bounds write in the build that ships.
+    OutputTooSmall,
 };
 
 /// RFC 9474 §4 **Blind** (client): encodes `prepared_msg` via
@@ -440,7 +457,7 @@ fn blindCore(
     const modulus_len = byteLen(modulus_bits);
     const em_bits = modulus_bits - 1;
     const em_len = byteLen(em_bits);
-    std.debug.assert(blinded_msg_out.len >= modulus_len);
+    if (blinded_msg_out.len < modulus_len) return error.OutputTooSmall;
 
     // Step 1: EMSA-PSS-ENCODE.
     var em_buf: [max_modulus_len]u8 = undefined;
@@ -500,6 +517,12 @@ pub const BlindSignError = error{
     /// on a well-formed modulus — a persistent hit means a broken RNG or a
     /// malformed key).
     SigningFailure,
+    /// `out.len < modulus_len`. Returned rather than asserted: `modulus_len`
+    /// depends on `sk`, so a caller buffer sized for a smaller key
+    /// underflows it for a larger one, and ReleaseFast compiles the assert
+    /// (and the `@memcpy`'s bounds check) out — an out-of-bounds write in
+    /// the build that ships.
+    OutputTooSmall,
 };
 
 /// RFC 9474 §4 **BlindSign** (server): signs an opaque `blinded_msg` with
@@ -538,7 +561,7 @@ pub fn blindSign(
 ) BlindSignError![]u8 {
     std.debug.assert(pk.n.v.eql(sk.n.v)); // pk must be sk's public half
     const modulus_len = byteLen(sk.n.bits());
-    std.debug.assert(out.len >= modulus_len);
+    if (out.len < modulus_len) return error.OutputTooSmall;
 
     // Step 1: OS2IP + range check (length exact, value < n).
     if (blinded_msg.len != modulus_len) return error.InvalidBlindedMessage;
@@ -590,6 +613,12 @@ pub fn blindSign(
 pub const FinalizeError = error{
     /// `blind_sig.len != ctx.modulus_len` (RFC 9474 §4 Finalize step 1).
     InvalidBlindSignatureLength,
+    /// `out.len < ctx.modulus_len`. Returned rather than asserted: `ctx`
+    /// carries whatever modulus size `blind` was called with, so a fixed
+    /// caller buffer sized for a smaller key underflows it for a larger
+    /// one, and ReleaseFast compiles the assert (and the `toBytes` write's
+    /// bounds check) out — an out-of-bounds write in the build that ships.
+    OutputTooSmall,
 } || rsa.VerifyPssError;
 
 /// RFC 9474 §4 **Finalize** (client): unblinds `blind_sig` using the
@@ -613,7 +642,7 @@ pub const FinalizeError = error{
 pub fn finalize(pk: rsa.PublicKey, comptime Hash: type, blind_sig: []const u8, ctx: *const Context, out: []u8) FinalizeError![]u8 {
     // Step 1: exact-length check.
     if (blind_sig.len != ctx.modulus_len) return error.InvalidBlindSignatureLength;
-    std.debug.assert(out.len >= ctx.modulus_len);
+    if (out.len < ctx.modulus_len) return error.OutputTooSmall;
     std.debug.assert(byteLen(pk.n.bits()) == ctx.modulus_len); // ctx must match pk
 
     // Step 2: z = OS2IP(blind_sig), fail-closed on z >= n.
@@ -671,7 +700,7 @@ test "prepareIdentity is a no-op" {
 test "prepareRandomize prepends exactly randomizer_len fresh bytes and preserves msg" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x42} ** 32);
     var out: [randomizer_len + 5]u8 = undefined;
-    const prepared = prepareRandomize("hello", csprng.random(), &out);
+    const prepared = try prepareRandomize("hello", csprng.random(), &out);
     try std.testing.expectEqual(@as(usize, randomizer_len + 5), prepared.len);
     try std.testing.expectEqualStrings("hello", prepared[randomizer_len..]);
 }
@@ -680,8 +709,8 @@ test "prepareRandomize is non-deterministic across calls (fresh prefix each time
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x7} ** 32);
     var out1: [randomizer_len + 3]u8 = undefined;
     var out2: [randomizer_len + 3]u8 = undefined;
-    const p1 = prepareRandomize("abc", csprng.random(), &out1);
-    const p2 = prepareRandomize("abc", csprng.random(), &out2);
+    const p1 = try prepareRandomize("abc", csprng.random(), &out1);
+    const p2 = try prepareRandomize("abc", csprng.random(), &out2);
     try std.testing.expect(!std.mem.eql(u8, p1[0..randomizer_len], p2[0..randomizer_len]));
 }
 

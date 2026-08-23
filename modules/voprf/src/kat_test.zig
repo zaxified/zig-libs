@@ -194,6 +194,39 @@ test "VOPRF A.1.2.3: batch size 2 — one proof covers both evaluations" {
     ));
 }
 
+// `blindEvaluateVerifiableBatch` used to guard `blinded.len >= 1 and
+// evaluated_out.len == blinded.len` with std.debug.assert, then fed both
+// slices to a `for (blinded, evaluated_out)` loop. ReleaseFast compiles the
+// assert AND the loop's own runtime length check out together, so a
+// mismatched evaluated_out read or wrote past its own bounds in the build
+// that ships. Written against fresh elements (not KAT-pinned), since these
+// are pure shape checks.
+test "blindEvaluateVerifiableBatch: empty batch and mismatched output length are errors, not asserts" {
+    const pk = try Element.fromBytes(kat.voprf_pk);
+    var no_elements: [0]Element = undefined;
+    try testing.expectError(error.EmptyBatch, voprf.blindEvaluateVerifiableBatch(
+        kat.voprf_sk,
+        pk,
+        &no_elements,
+        &no_elements,
+        kat.voprf_batch.proof_random_scalar,
+    ));
+
+    const blinded = [_]Element{ Element.generator, Element.generator };
+    var short_out: [1]Element = undefined;
+    try testing.expectError(error.MismatchedLengths, voprf.blindEvaluateVerifiableBatch(
+        kat.voprf_sk,
+        pk,
+        &blinded,
+        &short_out,
+        kat.voprf_batch.proof_random_scalar,
+    ));
+
+    // Matched, non-empty lengths still work.
+    var exact_out: [2]Element = undefined;
+    _ = try voprf.blindEvaluateVerifiableBatch(kat.voprf_sk, pk, &blinded, &exact_out, kat.voprf_batch.proof_random_scalar);
+}
+
 // ── POPRF mode (A.1.3) ───────────────────────────────────────────────────
 
 test "POPRF A.1.3: blind, blindEvaluate+proof, finalize all match" {
@@ -274,6 +307,32 @@ test "POPRF A.1.3.3: batch size 2 — one proof covers both evaluations" {
         const output = try voprf.finalizePoprfUnverified(input, blind_scalar, eval_element, v.info);
         try testing.expectEqualSlices(u8, &expected, &output);
     }
+}
+
+// Same shape as blindEvaluateVerifiableBatch above, in blindEvaluatePoprfBatch.
+test "blindEvaluatePoprfBatch: empty batch and mismatched output length are errors, not asserts" {
+    var no_elements: [0]Element = undefined;
+    try testing.expectError(error.EmptyBatch, voprf.blindEvaluatePoprfBatch(
+        kat.poprf_sk,
+        &no_elements,
+        kat.poprf_batch.info,
+        &no_elements,
+        kat.poprf_batch.proof_random_scalar,
+    ));
+
+    const blinded = [_]Element{ Element.generator, Element.generator };
+    var short_out: [1]Element = undefined;
+    try testing.expectError(error.MismatchedLengths, voprf.blindEvaluatePoprfBatch(
+        kat.poprf_sk,
+        &blinded,
+        kat.poprf_batch.info,
+        &short_out,
+        kat.poprf_batch.proof_random_scalar,
+    ));
+
+    // Matched, non-empty lengths still work.
+    var exact_out: [2]Element = undefined;
+    _ = try voprf.blindEvaluatePoprfBatch(kat.poprf_sk, &blinded, kat.poprf_batch.info, &exact_out, kat.poprf_batch.proof_random_scalar);
 }
 
 // ── end-to-end round trips with fresh (non-vector) material ─────────────

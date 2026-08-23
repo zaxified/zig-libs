@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — **Behavioural:** `TransportError` gains `Canceled`, and
+  `UdpTransport.exchangeFn` recovers it from `Socket.send`/`.receiveTimeout`
+  instead of folding every failure into `TransportFailed`. A canceled
+  request was indistinguishable from a dead agent, so a consumer retried a
+  request its own caller had already abandoned. `snmp` was the last sibling
+  of the module-wide cancelation campaign that fixed nine modules and missed
+  `whois` (fixed this morning); this closes the same gap here. Unlike
+  `whois`'s buffered TCP reader/writer, `std.Io.net.Socket.send`/
+  `.receiveTimeout` report `Canceled` directly (`Io.Cancelable` is part of
+  their own error sets), so no concrete-reader recovery dance was needed.
+  Covered by a loopback test that parks a real receive against a bound UDP
+  peer that never replies; mutation-confirmed by folding the two `catch`es
+  back and watching the test report `TransportFailed`.
 - **2026-08-12** — **BREAKING:** `V3Client.Options.initial_salt: ?u64` is replaced by
   `V3Client.Options.salt_seed: ?SaltSeed`, a tagged union with a `.csprng`
   arm and a `.fixed_for_test` arm. The privacy-salt counter is no longer

@@ -82,7 +82,7 @@ pub fn main() !void {
 
     // ── pure sign / verify, against GitHub's published vector ─────────────
     var sig_buf: [webhooksig.signatureBufLen(webhooksig.default_prefix)]u8 = undefined;
-    const signed = webhooksig.sign(github_secret, github_body, &sig_buf);
+    const signed = try webhooksig.sign(github_secret, github_body, &sig_buf);
     if (!std.mem.eql(u8, signed, github_sig)) return error.SignatureMismatch;
     std.debug.print("signed matches GitHub's published vector: {s}\n", .{signed});
 
@@ -109,8 +109,8 @@ pub fn main() !void {
     const body = "{\"action\":\"opened\"}";
     var new_buf: [webhooksig.signatureBufLen(webhooksig.default_prefix)]u8 = undefined;
     var old_buf: [webhooksig.signatureBufLen(webhooksig.default_prefix)]u8 = undefined;
-    const new_sig = webhooksig.sign("new-secret", body, &new_buf);
-    const old_sig = webhooksig.sign("old-secret", body, &old_buf);
+    const new_sig = try webhooksig.sign("new-secret", body, &new_buf);
+    const old_sig = try webhooksig.sign("old-secret", body, &old_buf);
 
     var req_buf: [512]u8 = undefined;
     var resp_buf: [1024]u8 = undefined;

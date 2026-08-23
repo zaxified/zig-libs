@@ -66,7 +66,7 @@ pub fn main() !void {
         netaddr.parseIp("::1"),
         netaddr.parseIp("2001:db8::1"),
     };
-    netaddr.sortDestinationsWithSources(&dsts, &srcs);
+    try netaddr.sortDestinationsWithSources(&dsts, &srcs);
     std.debug.print("connect order:\n", .{});
     for (dsts) |d| {
         var ibuf: [netaddr.max_ip_text_len]u8 = undefined;

@@ -81,12 +81,23 @@ pub fn recordIp(record: Record) ?netaddr.Ip {
 /// Longest output of `reverseName` (v6 nibble form: 32×2 + "ip6.arpa").
 pub const max_reverse_name_len = 72;
 
+pub const ReverseNameError = error{
+    /// `buf.len < max_reverse_name_len`. Returned rather than asserted:
+    /// `buf` is a caller-supplied buffer, and ReleaseFast compiles the
+    /// assert out — the `std.Io.Writer.fixed` writes below stay memory-safe
+    /// either way (they clamp to the buffer), but every one of them is
+    /// `catch unreachable`, so a buffer too small to hold the result turned
+    /// a recoverable "won't fit" into undefined behaviour in the build that
+    /// ships.
+    OutputTooSmall,
+};
+
 /// Build the reverse-lookup name for `ip`: `d.c.b.a.in-addr.arpa` for IPv4
 /// (RFC 1035 §3.5) or the nibble form `…ip6.arpa` for IPv6 (RFC 3596 §2.5).
 /// IPv4-mapped IPv6 addresses are looked up as IPv4, like Go's reverseaddr
-/// and getnameinfo. Asserts `buf.len >= max_reverse_name_len`.
-pub fn reverseName(ip: netaddr.Ip, buf: []u8) []const u8 {
-    std.debug.assert(buf.len >= max_reverse_name_len);
+/// and getnameinfo. `buf.len < max_reverse_name_len` is `error.OutputTooSmall`.
+pub fn reverseName(ip: netaddr.Ip, buf: []u8) ReverseNameError![]const u8 {
+    if (buf.len < max_reverse_name_len) return error.OutputTooSmall;
     var w: std.Io.Writer = .fixed(buf);
     switch (ip.unmap()) {
         .v4 => |b| {
@@ -128,15 +139,15 @@ test "reverseName: IPv4" {
     var buf: [max_reverse_name_len]u8 = undefined;
     try testing.expectEqualStrings(
         "8.8.8.8.in-addr.arpa",
-        reverseName(netaddr.parseIp("8.8.8.8").?, &buf),
+        try reverseName(netaddr.parseIp("8.8.8.8").?, &buf),
     );
     try testing.expectEqualStrings(
         "1.2.0.192.in-addr.arpa",
-        reverseName(netaddr.parseIp("192.0.2.1").?, &buf),
+        try reverseName(netaddr.parseIp("192.0.2.1").?, &buf),
     );
     try testing.expectEqualStrings(
         "255.255.255.255.in-addr.arpa",
-        reverseName(netaddr.parseIp("255.255.255.255").?, &buf),
+        try reverseName(netaddr.parseIp("255.255.255.255").?, &buf),
     );
 }
 
@@ -144,11 +155,11 @@ test "reverseName: IPv6 nibble form (RFC 3596 example)" {
     var buf: [max_reverse_name_len]u8 = undefined;
     try testing.expectEqualStrings(
         "b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.ip6.arpa",
-        reverseName(netaddr.parseIp("4321:0:1:2:3:4:567:89ab").?, &buf),
+        try reverseName(netaddr.parseIp("4321:0:1:2:3:4:567:89ab").?, &buf),
     );
     try testing.expectEqualStrings(
         "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
-        reverseName(netaddr.parseIp("::1").?, &buf),
+        try reverseName(netaddr.parseIp("::1").?, &buf),
     );
 }
 
@@ -156,13 +167,28 @@ test "reverseName: IPv4-mapped IPv6 goes to in-addr.arpa" {
     var buf: [max_reverse_name_len]u8 = undefined;
     try testing.expectEqualStrings(
         "4.4.8.8.in-addr.arpa",
-        reverseName(netaddr.parseIp("::ffff:8.8.4.4").?, &buf),
+        try reverseName(netaddr.parseIp("::ffff:8.8.4.4").?, &buf),
     );
+}
+
+// reverseName used to guard buf.len with std.debug.assert; ReleaseFast
+// compiles it out. The Writer.fixed writes inside stay memory-safe either
+// way (they clamp to the buffer), but every one is `catch unreachable`, so
+// a too-small buf turned a recoverable "won't fit" into undefined behaviour
+// in the build that ships. Written in terms of max_reverse_name_len rather
+// than a literal so it keeps measuring the mechanism if that bound moves.
+test "reverseName: a buf one byte short of max_reverse_name_len is an error, not an assert" {
+    var buf: [max_reverse_name_len]u8 = undefined;
+    try testing.expectError(
+        error.OutputTooSmall,
+        reverseName(netaddr.parseIp("2001:db8::1").?, buf[0 .. max_reverse_name_len - 1]),
+    );
+    _ = try reverseName(netaddr.parseIp("2001:db8::1").?, buf[0..max_reverse_name_len]);
 }
 
 test "reverseName round-trips through the codec" {
     var buf: [max_reverse_name_len]u8 = undefined;
-    const rev = reverseName(netaddr.parseIp("2001:db8::1").?, &buf);
+    const rev = try reverseName(netaddr.parseIp("2001:db8::1").?, &buf);
     var qbuf: [message.max_query_len]u8 = undefined;
     const packet = try encodeQuery(&qbuf, rev, .ptr, .{ .id = 7 });
     var msg = try decode(testing.allocator, packet);

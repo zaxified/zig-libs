@@ -120,11 +120,20 @@ pub fn signatureBufLen(prefix: []const u8) usize {
     return prefix.len + signature_hex_len;
 }
 
+pub const SignError = error{
+    /// `out_buf.len < signatureBufLen(prefix)`. Returned rather than
+    /// asserted: `out_buf` is a caller-supplied buffer, and ReleaseFast
+    /// compiles the assert (and the bounds check on the two `@memcpy`s
+    /// below) out together, turning an undersized buffer into a silent
+    /// out-of-bounds write in the build that ships.
+    OutputTooSmall,
+};
+
 /// Write `<prefix><hex-lowercase-mac>` into `out_buf` and return the
 /// written slice. `out_buf` must be at least `signatureBufLen(prefix)`
-/// bytes. For outbound webhooks and tests.
-pub fn signWithPrefix(prefix: []const u8, secret: []const u8, body: []const u8, out_buf: []u8) []const u8 {
-    std.debug.assert(out_buf.len >= prefix.len + signature_hex_len);
+/// bytes, else `error.OutputTooSmall`. For outbound webhooks and tests.
+pub fn signWithPrefix(prefix: []const u8, secret: []const u8, body: []const u8, out_buf: []u8) SignError![]const u8 {
+    if (out_buf.len < prefix.len + signature_hex_len) return error.OutputTooSmall;
     @memcpy(out_buf[0..prefix.len], prefix);
     const hex = computeHex(secret, body);
     @memcpy(out_buf[prefix.len..][0..signature_hex_len], &hex);
@@ -132,7 +141,7 @@ pub fn signWithPrefix(prefix: []const u8, secret: []const u8, body: []const u8, 
 }
 
 /// `signWithPrefix` with the default `sha256=` prefix (GitHub style).
-pub fn sign(secret: []const u8, body: []const u8, out_buf: []u8) []const u8 {
+pub fn sign(secret: []const u8, body: []const u8, out_buf: []u8) SignError![]const u8 {
     return signWithPrefix(default_prefix, secret, body, out_buf);
 }
 
@@ -341,18 +350,34 @@ test "sign → verify round-trip (default sha256= prefix)" {
     const secret = "topsecret";
     const body = "{\"hello\":\"world\"}";
     var buf: [signatureBufLen(default_prefix)]u8 = undefined;
-    const value = sign(secret, body, &buf);
+    const value = try sign(secret, body, &buf);
 
     try testing.expect(std.mem.startsWith(u8, value, "sha256="));
     try testing.expectEqual(@as(usize, default_prefix.len + signature_hex_len), value.len);
     try testing.expect(verify(secret, body, value)); // the round-trip
 }
 
+// signWithPrefix used to guard out_buf.len with std.debug.assert before two
+// @memcpy calls. ReleaseFast compiles the assert (and the bounds check on
+// those memcpys) out together, so an out_buf undersized relative to
+// signatureBufLen(prefix) was a silent out-of-bounds write in the build that
+// ships. Written in terms of signatureBufLen rather than a literal so it
+// keeps measuring the mechanism if the buffer math ever changes.
+test "signWithPrefix: an out_buf one byte short of signatureBufLen is an error, not an assert" {
+    const secret = "topsecret";
+    const body = "payload";
+    const n = signatureBufLen(default_prefix);
+    var buf: [signatureBufLen(default_prefix)]u8 = undefined;
+
+    try testing.expectError(error.OutputTooSmall, signWithPrefix(default_prefix, secret, body, buf[0 .. n - 1]));
+    _ = try signWithPrefix(default_prefix, secret, body, buf[0..n]);
+}
+
 test "verify: tampered body / wrong secret / malformed all rejected (constant-time compare)" {
     const secret = "topsecret";
     const body = "payload-bytes";
     var buf: [64 + 8]u8 = undefined;
-    const value = sign(secret, body, &buf);
+    const value = try sign(secret, body, &buf);
 
     try testing.expect(verify(secret, body, value)); // baseline pass
     try testing.expect(!verify(secret, "payload-byteS", value)); // one body byte flipped
@@ -467,7 +492,7 @@ test "GitHub docs' published canonical webhook signature (framing anchor, not RF
     const want = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
 
     var buf: [signatureBufLen(default_prefix)]u8 = undefined;
-    try testing.expectEqualStrings(want, sign(secret, body, &buf));
+    try testing.expectEqualStrings(want, try sign(secret, body, &buf));
     try testing.expect(verify(secret, body, want));
 }
 
@@ -475,7 +500,7 @@ test "custom prefix (empty / non-default) signs and verifies" {
     const secret = "s";
     const body = "b";
     var buf: [signature_hex_len]u8 = undefined;
-    const bare = signWithPrefix("", secret, body, &buf);
+    const bare = try signWithPrefix("", secret, body, &buf);
     try testing.expectEqual(@as(usize, signature_hex_len), bare.len);
     try testing.expect(verifyWithPrefix("", secret, body, bare));
     // The bare-hex value must not verify under the default prefix.
@@ -495,15 +520,15 @@ test "Verifier.verifyBody: rotation — old and new secret both accepted, withou
     const body = "event=push";
     var nbuf: [64 + 8]u8 = undefined;
     var obuf: [64 + 8]u8 = undefined;
-    const new_sig = sign("new-secret", body, &nbuf);
-    const old_sig = sign("old-secret", body, &obuf);
+    const new_sig = try sign("new-secret", body, &nbuf);
+    const old_sig = try sign("old-secret", body, &obuf);
 
     try testing.expect(v.verifyBody(body, new_sig)); // current secret
     try testing.expect(v.verifyBody(body, old_sig)); // rotated-out secret still valid
     // `sign` returns a slice INTO its out_buf: signing into `nbuf` here would
     // clobber `new_sig` and silently defang the tampered-body control below.
     var gbuf: [64 + 8]u8 = undefined;
-    try testing.expect(!v.verifyBody(body, sign("gone-secret", body, &gbuf))); // never configured
+    try testing.expect(!v.verifyBody(body, try sign("gone-secret", body, &gbuf))); // never configured
     // Negative control: a signature valid for `body` must NOT verify against a
     // different body — proves the MAC covers the body, not just the secret set.
     try testing.expect(!v.verifyBody("event=pull", new_sig)); // tampered body
@@ -580,7 +605,7 @@ test "middleware: correctly-signed body passes 200 and the handler sees it" {
 
     const body = "{\"action\":\"opened\"}";
     var sbuf: [64 + 8]u8 = undefined;
-    const sig = sign("whsec", body, &sbuf);
+    const sig = try sign("whsec", body, &sbuf);
 
     var reqbuf: [512]u8 = undefined;
     var respbuf: [1024]u8 = undefined;
@@ -597,7 +622,7 @@ test "middleware: missing header, tampered body and wrong secret each → 401" {
 
     const body = "hello-webhook";
     var sbuf: [64 + 8]u8 = undefined;
-    const good = sign("whsec", body, &sbuf);
+    const good = try sign("whsec", body, &sbuf);
 
     var reqbuf: [512]u8 = undefined;
     var respbuf: [1024]u8 = undefined;
@@ -614,7 +639,7 @@ test "middleware: missing header, tampered body and wrong secret each → 401" {
 
     // A signature made with a different secret.
     var wbuf: [64 + 8]u8 = undefined;
-    const wrong = sign("attacker", body, &wbuf);
+    const wrong = try sign("attacker", body, &wbuf);
     var rb3: [512]u8 = undefined;
     try expectStatus(runWire(&r, buildReq(&rb3, null, wrong, body), &respbuf), "401");
 
@@ -636,8 +661,8 @@ test "middleware: custom header name and rotation both accepted over the wire" {
     const body = "rotate-me";
     var nbuf: [64 + 8]u8 = undefined;
     var obuf: [64 + 8]u8 = undefined;
-    const new_sig = sign("new", body, &nbuf);
-    const old_sig = sign("old", body, &obuf);
+    const new_sig = try sign("new", body, &nbuf);
+    const old_sig = try sign("old", body, &obuf);
 
     var reqbuf: [512]u8 = undefined;
     var respbuf: [1024]u8 = undefined;

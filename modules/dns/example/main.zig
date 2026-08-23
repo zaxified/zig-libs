@@ -276,7 +276,9 @@ fn run(gpa: Allocator, io: std.Io, opts: Options) !u8 {
     defer out.flush() catch {};
 
     var name_buf: [dns.max_reverse_name_len]u8 = undefined;
-    const name = if (opts.reverse_ip) |ip| dns.reverseName(ip, &name_buf) else opts.name;
+    // name_buf is sized to exactly max_reverse_name_len: reverseName cannot
+    // fail here.
+    const name = if (opts.reverse_ip) |ip| dns.reverseName(ip, &name_buf) catch unreachable else opts.name;
     const ty: message.Type = if (opts.reverse_ip != null) .ptr else opts.ty;
 
     if (opts.probe_tc and opts.doh_url == null) {

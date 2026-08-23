@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — **Breaking:** `fmtCode`, `hotpFmt`, and `totpFmt` return
+  `FmtCodeError![]u8` (`error{OutputTooSmall}`) instead of `[]u8`. `fmtCode`
+  used to guard `out.len >= digits` with `std.debug.assert` before writing
+  `out[i]` in a loop; ReleaseFast compiles the assert (and the bounds check
+  on those writes) out together, so an out buffer undersized for the
+  requested digit count was a silent out-of-bounds write in the build that
+  ships. Found by an audit sweep for this shape.
 - **2026-08-14** — Docs-only: `SPEC.md` gained a `**Fuzz exemption:** EMIT-ONLY`
   entry — every public function's byte-accepting parameter is the long-lived
   shared secret `key`, provisioned out of band, never resubmitted per

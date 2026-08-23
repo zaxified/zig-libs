@@ -227,7 +227,9 @@ pub fn reverse(r: *Resolver, ip: netaddr.Ip) Error![]const []const u8 {
     }
 
     var rev_buf: [dns.max_reverse_name_len]u8 = undefined;
-    var msg = try r.query(dns.reverseName(ip, &rev_buf), .ptr);
+    // rev_buf is sized to exactly max_reverse_name_len: reverseName cannot
+    // fail here.
+    var msg = try r.query(dns.reverseName(ip, &rev_buf) catch unreachable, .ptr);
     defer msg.deinit();
     for (msg.answers) |rec| switch (rec.data) {
         .ptr => |name| try names.append(r.gpa, try r.gpa.dupe(u8, name)),

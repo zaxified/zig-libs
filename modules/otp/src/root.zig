@@ -106,12 +106,24 @@ pub fn hotp(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5) 
     return dynamicTruncate(alg, key, counter) % pow10[digits];
 }
 
+pub const FmtCodeError = error{
+    /// `out.len < digits`. Returned rather than asserted: `out` is a
+    /// caller-supplied buffer, and ReleaseFast compiles the assert (and the
+    /// bounds check on the `out[i]` writes below) out together, turning an
+    /// undersized buffer into a silent out-of-bounds write in the build
+    /// that ships.
+    OutputTooSmall,
+};
+
 /// Write `code` as exactly `digits` ASCII decimal digits, left-padded with
 /// '0', into the front of `out`; returns the written slice `out[0..digits]`.
-/// Asserts `out.len >= digits` and `code < 10^digits`.
-pub fn fmtCode(code: u32, digits: u5, out: []u8) []u8 {
+/// `out.len < digits` is `error.OutputTooSmall`. Asserts `code < 10^digits`
+/// (a malformed `code`/`digits` pairing is a caller bug, not a runtime
+/// condition — `code` only ever comes from this module's own `hotp`/`totp`,
+/// which cannot produce a value out of range for their own `digits`).
+pub fn fmtCode(code: u32, digits: u5, out: []u8) FmtCodeError![]u8 {
     std.debug.assert(digits >= min_digits and digits <= max_digits);
-    std.debug.assert(out.len >= digits);
+    if (out.len < digits) return error.OutputTooSmall;
     std.debug.assert(code < pow10[digits]);
     var rem = code;
     var i: usize = digits;
@@ -125,7 +137,7 @@ pub fn fmtCode(code: u32, digits: u5, out: []u8) []u8 {
 
 /// `hotp` + `fmtCode` in one call: the zero-left-padded ASCII code (what an
 /// authenticator app displays). Returns `out[0..digits]`.
-pub fn hotpFmt(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5, out: []u8) []u8 {
+pub fn hotpFmt(comptime alg: Algorithm, key: []const u8, counter: u64, digits: u5, out: []u8) FmtCodeError![]u8 {
     return fmtCode(hotp(alg, key, counter, digits), digits, out);
 }
 
@@ -149,7 +161,7 @@ pub fn totp(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u3
 
 /// `totp` + `fmtCode`: the zero-left-padded ASCII code. Returns
 /// `out[0..digits]`.
-pub fn totpFmt(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5, out: []u8) []u8 {
+pub fn totpFmt(comptime alg: Algorithm, key: []const u8, unix_time: u64, period: u32, t0: u64, digits: u5, out: []u8) FmtCodeError![]u8 {
     return fmtCode(totp(alg, key, unix_time, period, t0, digits), digits, out);
 }
 
@@ -189,9 +201,22 @@ pub fn totpVerify(comptime alg: Algorithm, key: []const u8, unix_time: u64, peri
 
 test "fmtCode zero-pads" {
     var buf: [9]u8 = undefined;
-    try std.testing.expectEqualStrings("007081804", fmtCode(7_081_804, 9, &buf));
-    try std.testing.expectEqualStrings("000000", fmtCode(0, 6, &buf));
-    try std.testing.expectEqualStrings("755224", fmtCode(755_224, 6, &buf));
+    try std.testing.expectEqualStrings("007081804", try fmtCode(7_081_804, 9, &buf));
+    try std.testing.expectEqualStrings("000000", try fmtCode(0, 6, &buf));
+    try std.testing.expectEqualStrings("755224", try fmtCode(755_224, 6, &buf));
+}
+
+// fmtCode used to guard out.len >= digits with std.debug.assert, then write
+// out[i] in a loop. ReleaseFast compiles the assert (and the bounds check on
+// those writes) out together, so an out buffer undersized for the requested
+// digit count was a silent out-of-bounds write in the build that ships.
+// Written against min_digits/max_digits rather than a literal so it keeps
+// measuring the mechanism if those move.
+test "fmtCode: an out buffer one byte short of digits is an error, not an assert" {
+    var buf: [max_digits]u8 = undefined;
+    try std.testing.expectError(error.OutputTooSmall, fmtCode(0, max_digits, buf[0 .. max_digits - 1]));
+    // Exact size still works.
+    _ = try fmtCode(0, max_digits, buf[0..max_digits]);
 }
 
 test "totpVerify accepts the correct code and rejects wrong ones (constant-time compare)" {
