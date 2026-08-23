@@ -5,6 +5,38 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — **`statfs.query` refuses a path with an embedded NUL
+  (`StatfsError.InvalidPath`) instead of acting on half of it.** `query` is
+  public API and handed its `path` bytes straight to `std.posix.toPosixPath`,
+  which guards an embedded NUL only with
+  `if (std.debug.runtime_safety) assert(...)` — so it is compiled out exactly
+  where it matters. Measured both ways: in `ReleaseSafe`,
+  `query("/\0/definitely/not/a/real/path")` aborted on that assert (exit
+  134 — a caller passing bytes it did not construct is entitled to an error,
+  not a crash); in `ReleaseFast` the same call returned numbers
+  byte-identical to `query("/")`, a confident answer about a *different*
+  path. The sibling `diskusage` module fixed exactly this in its
+  `stat.lstatPath`/`scan.scanAt`, and this refusal is deliberately the same
+  shape — same error name, same up-front check — so the two answer alike.
+  Mutation-proven: the check removed, the new test aborts on `toPosixPath`'s
+  assert; restored, green.
+- **2026-08-23** — **`readMounts`/`readMountinfo` now TRUNCATE at their 1 MiB
+  cap instead of returning nothing.** Both were
+  `allocRemaining(gpa, .limited(limit)) catch null`, and `allocRemaining`
+  returns `error.StreamTooLong` the moment the limit is reached — so an
+  oversized mount table produced `null`, which is the value both functions'
+  doc comments reserve for "`/proc` is not mounted". A caller cannot tell
+  those two apart, and SPEC.md had already promised the bounded-prefix
+  behaviour. Measured on the defect: with the cap dropped to 300 bytes,
+  `diskfree-demo` printed "-- 0 filesystem(s) shown." and exited 0 on a
+  63-mount host. The truncated tail's last partial row is skipped as
+  malformed, like any other. Both readers' doc comments already said they
+  were the same idiom as `procnet.readVirtualFile`, where this was fixed
+  first; they now are. The caps are named
+  (`mounts.mount_table_read_limit`, `mountinfo.mountinfo_read_limit`) rather
+  than inline so the number is visible. Both copies get their own regression
+  test, because both are their own function — fixing one and not the other
+  is how this pair got here.
 - **2026-08-18** — Fix (post-tag audit): two findings.
 
   **Citation fix + stated assumption.** `SPEC.md` and `statfs.zig`'s

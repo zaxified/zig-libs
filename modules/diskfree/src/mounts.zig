@@ -140,19 +140,43 @@ pub fn parseMounts(gpa: std.mem.Allocator, text: []const u8) ![]MountEntry {
 /// `null`, not an error: on a system where `/proc` is not mounted this is a
 /// legitimate "no data" rather than a hard failure.
 pub fn readMounts(gpa: std.mem.Allocator, io: std.Io) !?[]MountEntry {
-    const text = readVirtualFile(gpa, io, "/proc/self/mounts", 1024 * 1024) orelse return null;
+    const text = readVirtualFile(gpa, io, "/proc/self/mounts", mount_table_read_limit) orelse return null;
     defer gpa.free(text);
     return try parseMounts(gpa, text);
 }
+
+/// Bound on how much of `/proc/self/mounts` is read — generous headroom over
+/// any real host's mount table (this repo's dev host: ~4 KiB for 63 mounts)
+/// while still bounding allocation against a pathological mount count. Named
+/// rather than inline so the number is visible, and so a test can reason
+/// about it: past this the read TRUNCATES, it does not fail — see
+/// `readVirtualFile`.
+pub const mount_table_read_limit = 1024 * 1024;
 
 /// Streaming read of a `/proc`/`/sys` virtual file, bounded by `limit`.
 /// Local to this module rather than a shared dependency on `procnet`
 /// (SPEC.md explains why: disk usage is a distinct module axis, and this is
 /// a handful of lines, not the kind of duplication `testkit` exists for).
 /// Same idiom as `procnet.readVirtualFile`: `std.Io.File` has no plain
-/// `read` method in 0.16 — go through `File.Reader.initStreaming` and its
-/// `allocRemaining`, which is also what actually forces `/proc` to be read
-/// to EOF rather than trusting a (always-0) `stat` size.
+/// `read` method in 0.16 — go through `File.Reader.initStreaming`, which is
+/// also what actually forces `/proc` to be read to EOF rather than trusting
+/// a (always-0) `stat` size.
+///
+/// ⚠ `limit` TRUNCATES; it does not reject. A file longer than `limit` comes
+/// back as its first `limit` bytes, with the last line likely cut mid-row —
+/// which `parseMounts` then skips as malformed, so the caller gets a SHORT
+/// table rather than nothing.
+///
+/// That is a deliberate repair of the opposite behaviour, and of the same
+/// defect `procnet.readVirtualFile` carried (fixed there first): this was
+/// `allocRemaining(gpa, .limited(limit)) catch null`, and `allocRemaining`
+/// returns `error.StreamTooLong` the moment the limit is reached — so an
+/// oversized mount table returned NULL and `readMounts` reported "no data",
+/// which its own doc comment reserves for "`/proc` is not mounted". Those
+/// two are not the same fact and a caller cannot tell them apart. Measured
+/// on this defect: with the cap dropped to 300 bytes, `diskfree-demo`
+/// printed "-- 0 filesystem(s) shown." and exited 0 on a host with 63
+/// mounts. SPEC.md already promised the behaviour implemented here.
 fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
     var dir = std.Io.Dir.cwd();
     var file = dir.openFile(io, path, .{}) catch return null;
@@ -160,7 +184,21 @@ fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: 
 
     var buf: [4096]u8 = undefined;
     var fr = std.Io.File.Reader.initStreaming(file, io, &buf);
-    return fr.interface.allocRemaining(gpa, .limited(limit)) catch null;
+
+    var list: std.ArrayList(u8) = .empty;
+    fr.interface.appendRemaining(gpa, &list, .limited(limit)) catch |err| switch (err) {
+        // Everything read so far is already in `list` (documented contract
+        // of `appendRemaining`), and it is the bounded prefix we asked for.
+        error.StreamTooLong => {},
+        else => {
+            list.deinit(gpa);
+            return null;
+        },
+    };
+    return list.toOwnedSlice(gpa) catch {
+        list.deinit(gpa);
+        return null;
+    };
 }
 
 const testing = std.testing;
@@ -282,6 +320,58 @@ test "readMounts: live /proc/self/mounts round-trips through the real Io reader"
         if (std.mem.eql(u8, e.mount_point, "/")) found_root = true;
     }
     try testing.expect(found_root);
+}
+
+test "readVirtualFile: a file past `limit` truncates to the prefix, it does not vanish" {
+    // Regression for the same defect `procnet.readVirtualFile` carried (see
+    // its test of the same name, fixed there first): this was
+    // `allocRemaining(...) catch null`, and `allocRemaining` errors
+    // `StreamTooLong` the instant the limit is reached — so an oversized
+    // mount table returned NULL and `readMounts` reported the "no data"
+    // outcome its doc comment reserves for "`/proc` is not mounted". Measured
+    // on the defect: with `mount_table_read_limit` dropped to 300,
+    // `diskfree-demo` printed "-- 0 filesystem(s) shown." and exited 0 on a
+    // 63-mount host, indistinguishable from a host with no `/proc`.
+    //
+    // `/proc` cannot be made oversized on demand, so this uses a real file of
+    // known length. `readVirtualFile` reads it through the same streaming
+    // path it uses for `/proc` (the file's `stat` size is never consulted),
+    // which is what makes the substitution fair.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 100 rows of 10 bytes each.
+    var payload: [1000]u8 = undefined;
+    for (0..100) |i| _ = std.fmt.bufPrint(payload[i * 10 ..][0..10], "row{d:0>6}\n", .{i}) catch unreachable;
+    {
+        var f = try tmp.dir.createFile(io, "big.txt", .{});
+        defer f.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        try w.interface.writeAll(&payload);
+        try w.interface.flush();
+    }
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/big.txt", .{&tmp.sub_path});
+
+    // Under the limit: the whole file, unchanged.
+    const whole = readVirtualFile(testing.allocator, io, path, 4096) orelse
+        return error.ReadVirtualFileReturnedNull;
+    defer testing.allocator.free(whole);
+    try testing.expectEqual(@as(usize, 1000), whole.len);
+
+    // Over it: a non-null, exactly-`limit`-byte prefix — NOT null, and not
+    // the whole file either.
+    const cut = readVirtualFile(testing.allocator, io, path, 250) orelse
+        return error.ReadVirtualFileReturnedNullOnOversizedFile;
+    defer testing.allocator.free(cut);
+    try testing.expectEqual(@as(usize, 250), cut.len);
+    try testing.expectEqualStrings(payload[0..250], cut);
 }
 
 // `/proc/self/mounts` is kernel-emitted, but per `procnet`'s own threat-model

@@ -50,16 +50,17 @@ const not_du_banner =
     \\diskfree-demo answers the `df` question (how full is this filesystem?),
     \\NOT the `du` one (how much space do these files use?). The `diskfree`
     \\module walks no directories and stats no files -- it wraps statfs(2) and
-    \\parses /proc/self/mounts. A real `du` would need a raw stat/lstat syscall
-    \\wrapper first (st_blocks + st_dev, neither in std.Io.File.Stat) plus a
-    \\directory walker; neither exists in this module today.
+    \\parses /proc/self/mounts. The `du` question has its own module in this
+    \\collection -- the sibling `diskusage`, which wraps statx/fstatat directly
+    \\for st_blocks and st_dev (neither is in std.Io.File.Stat) and walks the
+    \\tree. Ask that one for per-directory sizes; this demo cannot answer it.
     \\
 ;
 
 const usage_text =
     \\diskfree-demo -- a df(1)-shaped tool for the `diskfree` module.
     \\NOT a `du` tool -- see the banner above (run with no flags) or the header
-    \\comment in example/main.zig for why, and what building `du` would need.
+    \\comment in example/main.zig for why, and which module answers `du`.
     \\
     \\usage:
     \\  diskfree-demo [-a] [path ...]     filesystem space report (df-shaped)

@@ -102,6 +102,18 @@ pub const StatfsError = error{
     TooManySymlinks,
     IoError,
     Unexpected,
+    /// `path` contains an embedded NUL byte. POSIX paths cannot represent
+    /// one: the syscall below takes a NUL-terminated C string, so a NUL
+    /// mid-slice is where the kernel's view of the path would silently stop
+    /// while the caller's did not. Checked up front and reported, rather
+    /// than left to `std.posix.toPosixPath` — which only asserts this in
+    /// safety-checked builds (a crash, not an error) and does nothing at all
+    /// in `ReleaseFast` (a silent truncation to whatever precedes the NUL).
+    /// A public function that takes caller bytes and asks the kernel about
+    /// them must not have a caller-reachable panic or a truncate-and-lie
+    /// path. The sibling `diskusage` module refuses this identically
+    /// (`stat.StatError.InvalidPath`), where a fuzz harness found it.
+    InvalidPath,
 };
 
 // ── Kernel-ABI struct families ──────────────────────────────────────────────
@@ -402,7 +414,16 @@ fn mapErrno(err: std.os.linux.E) StatfsError {
 /// `statfs(2)` on `path`. Follows symlinks (kernel default); the path must
 /// name an existing file or directory anywhere on the target filesystem, not
 /// necessarily its mount point.
+///
+/// A `path` containing an embedded NUL is refused with `error.InvalidPath`
+/// before `toPosixPath` ever sees it — see that error's doc comment for why
+/// `toPosixPath`'s own `assert` is not a refusal.
 pub fn query(path: []const u8) StatfsError!Usage {
+    // Same check `diskusage`'s `stat.lstatPath`/`scan.scanAt` make, and for
+    // the same reason: an embedded NUL is where `toPosixPath` either asserts
+    // (safety-checked builds) or silently truncates the path (ReleaseFast)
+    // rather than erroring — see `StatfsError.InvalidPath`'s doc comment.
+    if (std.mem.findScalar(u8, path, 0) != null) return error.InvalidPath;
     const path_z = std.posix.toPosixPath(path) catch return error.NameTooLong;
     switch (family) {
         .native64 => {
@@ -455,6 +476,28 @@ test "query: root filesystem gives internally consistent numbers" {
 
 test "query: missing path returns FileNotFound, not a garbage Usage" {
     try testing.expectError(error.FileNotFound, query("/this/path/does/not/exist/diskfree-test"));
+}
+
+test "query: a path with an embedded NUL is refused, not silently answered about its prefix" {
+    // `std.posix.toPosixPath` only `assert`s the absence of an embedded NUL,
+    // so it is a refusal in neither optimization mode: in a safety-checked
+    // build it PANICS (`query` is public API — a caller passing bytes it did
+    // not construct is entitled to an error, not an abort), and in
+    // `ReleaseFast` the assert compiles away entirely, the copy stops at the
+    // NUL, and the kernel is asked about a SHORTER path than the caller gave.
+    // Measured before this guard existed: in `ReleaseFast`,
+    // `query("/\x00/definitely/not/a/real/path")` returned byte-identical
+    // numbers to `query("/")` — a confident answer about a different path.
+    try testing.expectError(error.InvalidPath, query("/\x00/definitely/not/a/real/path"));
+
+    // The same defect in its friendlier shape: here the prefix is itself a
+    // valid path, so the truncating build does not even fail — it succeeds,
+    // about "/".
+    try testing.expectError(error.InvalidPath, query("/\x00"));
+
+    // ...and the guard must not have made a NUL-free path unanswerable.
+    const u = try query("/");
+    try testing.expect(u.blocks_total > 0);
 }
 
 test "totalBytes/freeBytes/availableBytes: saturate rather than wrap on a corrupt block_size" {

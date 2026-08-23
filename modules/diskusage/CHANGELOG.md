@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — **`scanAt`'s NUL check was untested, and SPEC.md said the
+  opposite.** No behaviour change; a correction to what was claimed about the
+  coverage of the entry above. SPEC.md's "Fuzzing" paragraph said `scan.scanAt`
+  "shares the same entry point" as `lstatPath` and was therefore covered by
+  that harness. It does not and it was not: `scanAt` carries its own copy of
+  the NUL check and its own `toPosixPath` call, then goes to `stat.lstatAt`
+  directly, so no fuzz input can reach `scan.zig`'s guard. Measured before
+  the new test existed: making the check in `scanAt` unreachable left
+  `zig build test-diskusage` at exit 0, while the same treatment of
+  `lstatPath`'s gave exit 1. The SPEC now says
+  what is true, and the duplicated guard has the duplicated test it needed
+  ("a path with an embedded NUL is refused, not scanned as its prefix",
+  passing a NUL whose prefix is a real directory — the shape a truncating
+  build answers *successfully* about). That mutation is now red.
 - **2026-08-23** — New module: the `du(1)` half of the `du`/`df` pair, taking
   the name `diskfree` was renamed out of (`f35b1f9`). Two layers.
 

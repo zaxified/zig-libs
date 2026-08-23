@@ -158,13 +158,33 @@ Not applicable — no secret material is handled anywhere in this module.
 - `statfs.query`'s path is bounded by `std.posix.toPosixPath`'s
   `PATH_MAX`-derived buffer; a longer path returns `error.NameTooLong`
   rather than truncating.
+- `statfs.query` rejects a `path` containing an embedded NUL byte with
+  `error.InvalidPath`, checked before `toPosixPath` ever sees it.
+  `toPosixPath` itself only `assert`s the absence of one — a crash in a
+  safety-checked build, and in `ReleaseFast`, where `assert` compiles away, a
+  silent truncation to whatever precedes the NUL: the caller would be told
+  about a shorter path than the one it actually gave. Measured: before the
+  check, `query("/\0/definitely/not/a/real/path")` in `ReleaseFast` returned
+  byte-identical numbers to `query("/")`, and in `ReleaseSafe` aborted. The
+  sibling `diskusage` module refuses the same input identically
+  (`stat.StatError.InvalidPath`), where a fuzz harness is what found it.
 - `mounts.readMounts`/`mountinfo.readMountinfo` cap the read at 1MiB
-  (`readVirtualFile`'s `limit` argument) — chosen as generous headroom over
-  any real host's mount table (this repo's own dev host's `/proc/self/mounts`
-  is ~4KiB for 63 mounts) while still bounding allocation against a
-  pathological mount count, matching `procnet`'s `readVirtualFile`
-  discipline (its own doc comment explains why a streaming read is required
-  at all: `/proc` files report size 0 from `stat`).
+  (`mounts.mount_table_read_limit` / `mountinfo.mountinfo_read_limit`) —
+  chosen as generous headroom over any real host's mount table (this repo's
+  own dev host's `/proc/self/mounts` is ~4KiB for 63 mounts) while still
+  bounding allocation against a pathological mount count, matching
+  `procnet`'s `readVirtualFile` discipline (its own doc comment explains why
+  a streaming read is required at all: `/proc` files report size 0 from
+  `stat`). ⚠ That cap **truncates**; it does not reject. A table past the
+  limit comes back as its bounded prefix, its last (cut) row skipped as
+  malformed like any other, so the caller gets a short listing — never an
+  empty one. This too matches `procnet`, and for the same reason it was
+  fixed there: as `allocRemaining(...) catch null` both readers returned
+  `null` on an oversized table, which is the value `readMounts`/
+  `readMountinfo` reserve for "`/proc` is not mounted" — a different fact,
+  and one the caller cannot tell apart. Measured on the defect: the cap
+  dropped to 300 bytes made `diskfree-demo` print "-- 0 filesystem(s)
+  shown." and exit 0 on a 63-mount host.
 - A malformed row in either parser (too few columns, non-numeric IDs, a
   missing `-` separator in `mountinfo`) is skipped, not fatal — one corrupt
   line does not sink the whole table, matching `procnet`'s parsers.

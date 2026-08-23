@@ -752,6 +752,41 @@ test "a missing scan root is fatal, unlike a missing entry inside the tree" {
     try testing.expectError(error.FileNotFound, scanAt(testing.allocator, io, f.tmp.dir, "no-such-thing", .{}));
 }
 
+test "scanAt: a path with an embedded NUL is refused, not scanned as its prefix" {
+    // `scanAt` does NOT reach `stat.lstatPath` — it makes its own NUL check
+    // and its own `toPosixPath` call and then goes straight to
+    // `stat.lstatAt`. So `stat.zig`'s fuzz harness, which covers
+    // `lstatPath`, cannot reach this check at all: the SPEC claimed it
+    // "shares the same entry point", and the mutation says otherwise —
+    // making `scan.zig`'s check unreachable left `zig build test-diskusage`
+    // at exit 0 while the same treatment of `stat.zig`'s gave exit 1. A
+    // duplicated guard needs a duplicated test.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fixture.init(io);
+    defer f.deinit();
+
+    // `plain` is a real directory in the fixture, so this is the shape that
+    // hurts: a build which truncated at the NUL (`ReleaseFast`, where
+    // `toPosixPath`'s `assert` compiles away) would not fail here — it would
+    // return a perfectly successful `Report` for a path the caller never
+    // asked about. In a safety-checked build the same input would abort.
+    try testing.expectError(
+        error.InvalidPath,
+        scanAt(testing.allocator, io, f.tmp.dir, "plain\x00/no-such-thing", .{}),
+    );
+    try testing.expectError(
+        error.InvalidPath,
+        scanAt(testing.allocator, io, f.tmp.dir, "\x00", .{}),
+    );
+
+    // ...and the guard has not made a NUL-free path unscannable.
+    const r = try scanAt(testing.allocator, io, f.tmp.dir, "plain", .{});
+    try testing.expectEqual(@as(u64, 1), r.regular_files);
+}
+
 test "a failing DirSink stops the scan with SinkFailed" {
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();

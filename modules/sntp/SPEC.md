@@ -87,6 +87,6 @@ client · reentrant` + deps: none (std only; `std.Io.net` for the UDP query) —
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/root.zig:671 decodes one real 48-byte reply captured from time.google.com together with the originate timestamp the request actually sent, so verifyOriginate meets a genuinely echoed value; the live query test is SkipZigTest by design and every other fixture is canned
+**What the tests actually contain.** src/root.zig:890 decodes one real 48-byte reply captured from time.google.com together with the originate timestamp the request actually sent, so verifyOriginate meets a genuinely echoed value; the live query test is SkipZigTest by design and every other fixture is canned
 
 **How it got there.** The anchoring work landed. DONE d0e30ca: real time.google.com reply frozen; live test stays skipped by design

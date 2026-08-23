@@ -334,14 +334,22 @@ never act on a different path than the bytes actually given, for arbitrary
 byte content (embedded NUL, non-UTF8 bytes, a path past `PATH_MAX`, one that
 is all slashes). It found `StatError.InvalidPath` above — the harness is what
 turned up the `toPosixPath` assert/truncate hazard, not an audit reading the
-source. `scan.scanAt` shares the same entry point (a scan rooted at a
-fuzzed, near-certainly-nonexistent path returns from `stat.lstatAt` before
-any allocation happens) rather than getting a second harness that would have
-to walk the real filesystem on fuzzer-controlled input — exactly the
+source. `scan.scanAt` does **not** get a second harness: one would have to
+walk the real filesystem on fuzzer-controlled input, exactly the
 unbounded-traversal risk the symlink mutation above already demonstrates.
-Mutation-proven the same way as the traversal: the NUL check removed,
-observed to crash the harness (`toPosixPath`'s own `assert`), restored,
-observed green again.
+⚠ Nor is it covered by `lstatPath`'s — an earlier revision of this paragraph
+claimed `scanAt` "shares the same entry point", and it does not: `scanAt`
+carries its own copy of the NUL check and its own `toPosixPath` call, then
+goes straight to `stat.lstatAt`, so no input to the harness can ever reach
+`scan.zig`'s guard. Measured, *before* the test named below existed: making
+the check in `scanAt` unreachable left `zig build test-diskusage` at exit 0,
+while the same treatment of `stat.zig`'s `lstatPath` gave exit 1 (the fuzz
+harness aborting on `toPosixPath`'s assert). What covers the duplicate
+is a duplicate test — `scan.zig`'s "a path with an embedded NUL is refused,
+not scanned as its prefix", which calls `scanAt` directly with a NUL whose
+prefix is a real directory in the fixture (the shape a truncating build
+answers *successfully* about). Both guards are mutation-proven, each against
+its own test: removed, red; restored, green.
 
 ## What is deliberately not done
 

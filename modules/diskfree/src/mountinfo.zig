@@ -190,14 +190,30 @@ fn tokenOffset(line: []const u8, tok: []const u8) usize {
 /// file (e.g. `/proc` not mounted) — not an error, matching
 /// `mounts.readMounts`.
 pub fn readMountinfo(gpa: std.mem.Allocator, io: std.Io) !?[]MountinfoEntry {
-    const text = readVirtualFile(gpa, io, "/proc/self/mountinfo", 1024 * 1024) orelse return null;
+    const text = readVirtualFile(gpa, io, "/proc/self/mountinfo", mountinfo_read_limit) orelse return null;
     defer gpa.free(text);
     return try parseMountinfo(gpa, text);
 }
 
+/// Bound on how much of `/proc/self/mountinfo` is read — the same 1 MiB
+/// headroom `mounts.mount_table_read_limit` documents, over a table whose
+/// rows are longer. Named rather than inline so the number is visible, and
+/// so a test can reason about it: past this the read TRUNCATES, it does not
+/// fail — see `readVirtualFile`.
+pub const mountinfo_read_limit = 1024 * 1024;
+
 /// Same idiom as `procnet.readVirtualFile`/`mounts.readVirtualFile`:
 /// `std.Io.File` has no plain `read` method in 0.16 — go through
-/// `File.Reader.initStreaming` and its `allocRemaining`.
+/// `File.Reader.initStreaming`, which also forces `/proc` to be read to EOF
+/// rather than trusting a (always-0) `stat` size.
+///
+/// ⚠ `limit` TRUNCATES; it does not reject — identically to
+/// `mounts.readVirtualFile`, whose doc comment carries the full account of
+/// the `allocRemaining(...) catch null` defect both copies had (an oversized
+/// table returned NULL, which `readMountinfo` reports as the "`/proc` is not
+/// mounted" case — a different fact the caller cannot distinguish). The last
+/// line of the truncated tail is cut mid-row and `parseMountinfo` skips it as
+/// malformed, like any other bad row.
 fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
     var dir = std.Io.Dir.cwd();
     var file = dir.openFile(io, path, .{}) catch return null;
@@ -205,7 +221,21 @@ fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: 
 
     var buf: [4096]u8 = undefined;
     var fr = std.Io.File.Reader.initStreaming(file, io, &buf);
-    return fr.interface.allocRemaining(gpa, .limited(limit)) catch null;
+
+    var list: std.ArrayList(u8) = .empty;
+    fr.interface.appendRemaining(gpa, &list, .limited(limit)) catch |err| switch (err) {
+        // Everything read so far is already in `list` (documented contract
+        // of `appendRemaining`), and it is the bounded prefix we asked for.
+        error.StreamTooLong => {},
+        else => {
+            list.deinit(gpa);
+            return null;
+        },
+    };
+    return list.toOwnedSlice(gpa) catch {
+        list.deinit(gpa);
+        return null;
+    };
 }
 
 const testing = std.testing;
@@ -326,6 +356,56 @@ test "readMountinfo: live /proc/self/mountinfo round-trips through the real Io r
         if (std.mem.eql(u8, e.mount_point, "/")) found_root = true;
     }
     try testing.expect(found_root);
+}
+
+test "readVirtualFile: a file past `limit` truncates to the prefix, it does not vanish" {
+    // The second copy of the defect described in `mounts.zig`'s test of the
+    // same name (and fixed in `procnet.readVirtualFile` before either):
+    // `allocRemaining(...) catch null` errors `StreamTooLong` the instant the
+    // limit is reached, so an oversized `/proc/self/mountinfo` returned NULL
+    // and `readMountinfo` reported the "no data" outcome its doc comment
+    // reserves for "`/proc` is not mounted". Both copies get their own test
+    // because both are their own function — a fix to one leaves the other
+    // silently broken, which is how this pair got here.
+    //
+    // Real file of known length, read through the same streaming path `/proc`
+    // takes (the `stat` size is never consulted), which is what makes the
+    // substitution fair.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 100 rows of 10 bytes each.
+    var payload: [1000]u8 = undefined;
+    for (0..100) |i| _ = std.fmt.bufPrint(payload[i * 10 ..][0..10], "row{d:0>6}\n", .{i}) catch unreachable;
+    {
+        var f = try tmp.dir.createFile(io, "big.txt", .{});
+        defer f.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        try w.interface.writeAll(&payload);
+        try w.interface.flush();
+    }
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/big.txt", .{&tmp.sub_path});
+
+    // Under the limit: the whole file, unchanged.
+    const whole = readVirtualFile(testing.allocator, io, path, 4096) orelse
+        return error.ReadVirtualFileReturnedNull;
+    defer testing.allocator.free(whole);
+    try testing.expectEqual(@as(usize, 1000), whole.len);
+
+    // Over it: a non-null, exactly-`limit`-byte prefix — NOT null, and not
+    // the whole file either.
+    const cut = readVirtualFile(testing.allocator, io, path, 250) orelse
+        return error.ReadVirtualFileReturnedNullOnOversizedFile;
+    defer testing.allocator.free(cut);
+    try testing.expectEqual(@as(usize, 250), cut.len);
+    try testing.expectEqualStrings(payload[0..250], cut);
 }
 
 // Same threat model as `mounts.zig`'s fuzz harness (see its doc comment):
