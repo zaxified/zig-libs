@@ -553,13 +553,11 @@ pub const OscoreOption = struct {
         var list: std.ArrayList(u8) = .empty;
         errdefer list.deinit(allocator);
 
-        var piv_wide: [8]u8 = undefined;
+        var piv_wide: [max_partial_iv_bytes]u8 = undefined;
         var piv_bytes: []const u8 = &.{};
         if (opt.partial_iv) |piv| {
-            const n = pivEncodedLen(piv);
-            if (n > max_partial_iv_bytes) return error.PartialIvTooLarge;
-            std.mem.writeInt(u64, &piv_wide, piv, .big);
-            piv_bytes = piv_wide[8 - n ..];
+            if (pivEncodedLen(piv) > max_partial_iv_bytes) return error.PartialIvTooLarge;
+            piv_bytes = encodePartialIv(piv, &piv_wide);
         }
         if (opt.kid_context) |kc| {
             if (kc.len > 255) return error.KidContextTooLong;
@@ -588,6 +586,32 @@ pub const OscoreOption = struct {
         var v = piv;
         while (v != 0) : (v >>= 8) n += 1;
         return n;
+    }
+
+    /// Encodes `piv` in the same minimal-length, big-endian, no-superfluous-
+    /// leading-zero-byte form `encode` uses for the Partial IV field of the
+    /// compressed COSE option (§6.1) — and the SAME form `AadParams.
+    /// request_piv` (§5.4) must carry, since that field is defined as "the
+    /// value of the 'Partial IV' in the COSE object of the request".
+    ///
+    /// A caller protecting its OWN request must build that request's AAD
+    /// with `request_piv` set to the SAME sequence number `protect` is
+    /// about to consume as `ctx.sender.sequence_number` — before `protect`
+    /// returns, there is no `Protected.option.partial_iv` bstr to read it
+    /// back from, and hand-rolling `&.{@intCast(piv)}` (as earlier versions
+    /// of this module's own README usage sample did) truncates and panics
+    /// for any `piv >= 256`. This is the one export this module was
+    /// missing to make that call correctly without duplicating `encode`'s
+    /// private minimal-encoding rule.
+    ///
+    /// Returns a slice into `buf` (`max_partial_iv_bytes` long); `buf` may
+    /// be undefined on entry.
+    pub fn encodePartialIv(piv: u64, buf: *[max_partial_iv_bytes]u8) []const u8 {
+        const n = pivEncodedLen(piv);
+        var wide: [8]u8 = undefined;
+        std.mem.writeInt(u64, &wide, piv, .big);
+        @memcpy(buf[0..n], wide[8 - n ..]);
+        return buf[0..n];
     }
 
     pub const DecodeError = error{ ReservedPartialIvLength, ReservedFlagBits, Truncated };
@@ -1082,6 +1106,22 @@ test "encodeEncStructure wraps external_aad as Enc_structure's third element" {
     try expected.appendSlice(allocator, "Encrypt0");
     try expected.appendSlice(allocator, &.{ 0x40, 0x42, 0xAA, 0xBB });
     try std.testing.expectEqualSlices(u8, expected.items, enc);
+}
+
+test "OscoreOption.encodePartialIv: minimal-length big-endian, matches encode()'s own field" {
+    var buf: [OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &.{0x00}, OscoreOption.encodePartialIv(0, &buf));
+    try std.testing.expectEqualSlices(u8, &.{0x14}, OscoreOption.encodePartialIv(20, &buf));
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x00 }, OscoreOption.encodePartialIv(256, &buf));
+
+    // Cross-check against encode(): the Partial IV bytes it emits after
+    // the flag byte must be exactly what encodePartialIv produces for the
+    // same value.
+    const allocator = std.testing.allocator;
+    const opt = OscoreOption{ .partial_iv = 300 };
+    const wire = try opt.encode(allocator);
+    defer allocator.free(wire);
+    try std.testing.expectEqualSlices(u8, OscoreOption.encodePartialIv(300, &buf), wire[1..]);
 }
 
 test "OscoreOption round-trips through encode/decode, including present-but-empty kid" {

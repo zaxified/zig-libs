@@ -51,9 +51,14 @@ var client_ctx = try oscore.deriveContext(
 // Protect an outgoing message (the caller assembles `plaintext` per
 // §5.3 — CoAP Code + Class E options + payload marker + payload; the
 // sibling `coap` module's job, not this one's).
+var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
 const protected = try oscore.protect(allocator, &client_ctx, plaintext, .{
     .request_kid = client_ctx.sender.id,
-    .request_piv = &.{@intCast(client_ctx.sender.sequence_number)}, // see OscoreOption for the real minimal-length encoding
+    // AadParams.request_piv must carry the SAME minimal-length encoding
+    // `OscoreOption.encode` uses on the wire (§5.4/§6.1) — this message
+    // IS the request, so it is this call's own about-to-be-consumed
+    // sequence number, encoded via the same helper `encode` uses.
+    .request_piv = oscore.OscoreOption.encodePartialIv(client_ctx.sender.sequence_number, &piv_buf),
 }, true, null);
 // protected.option  -> encode via OscoreOption.encode for the CoAP OSCORE option
 // protected.ciphertext -> the CoAP payload
