@@ -47,6 +47,32 @@
 //!
 //! So this step's claim is exactly: **every non-generic public declaration is
 //! analysed.** Upstream has the same observation open as ziglang/zig#22953.
+//!
+//! ⭐ That claim was measured again on 2026-08-23, after an audit found it false
+//! twice over, and both holes are closed here:
+//!
+//! | shape                              | before   | now    |
+//! |------------------------------------|----------|--------|
+//! | `pub fn`                           | caught   | caught |
+//! | `pub noinline fn`                  | caught   | caught |
+//! | `pub export fn`                    | caught   | caught |
+//! | `pub inline fn`                    | **missed** | caught (see `force`) |
+//! | container from a sibling FILE      | **missed** | caught (see `declaredHere`) |
+//!
+//! Each row is a deliberate type error injected into `raft`, run against this
+//! gate, and removed again — not a reading of the code. `pub extern fn` has no
+//! body to analyse and is therefore not a row.
+//!
+//! ⚠ One thing the sibling-file row does NOT buy, stated so it is not read as
+//! more than it is: the walk starts at the module ROOT, so a file the root never
+//! re-exports is never reached, and a `pub fn` inside it stays unanalysed no
+//! matter what this file does. `lockfree`'s `atomic.zig` is the live example —
+//! `root.zig` imports it as a PRIVATE const and re-exports four of its five
+//! declarations, so the fifth (`Atomic`) is `pub` in its own file and reachable
+//! from nowhere. That is arguably the correct scope for a gate about the
+//! PUBLISHED surface, but "every non-generic public declaration is analysed"
+//! should be read as "every one reachable from the module root", and the two are
+//! not the same sentence.
 //! Narrowing the claim is deliberate — a step that claimed the generic half
 //! would be the very thing this file exists to prevent.
 //!
@@ -68,6 +94,11 @@ const std = @import("std");
 /// The module under test. `build.zig` supplies a different one per compilation.
 const m = @import("m");
 
+/// This module's own source files, as `@typeName` spells them: `src/wire.zig`
+/// is `wire`. Generated per compilation by `build.zig` from the tree, so the
+/// list cannot drift from the files it describes. See `declaredHere`.
+const own_files: []const []const u8 = @import("own_files").names;
+
 fn isContainer(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .@"struct", .@"union", .@"enum", .@"opaque" => true,
@@ -78,24 +109,66 @@ fn isContainer(comptime T: type) bool {
 /// Is `Child` declared *inside this module*, rather than re-exported from std
 /// or from a sibling module?
 ///
-/// `@typeName` answers it without a name list. A container this module declares
-/// is either one of its own files (`field`, `state` — a single segment, no dot)
-/// or a type nested in the container being walked (`field.Fe`, whose prefix is
-/// exactly `@typeName(Parent)`). Anything re-exported keeps the fully-qualified
-/// name of where it was declared: `crypto.pcurves.secp256k1.scalar.Scalar`
-/// matches neither test.
-///
 /// This matters because forcing a foreign type tests its owner, not us. Without
 /// it, five modules that re-export a `std.crypto.pcurves` curve type went red on
 /// `sqrt`, which **std itself** guards with `@compileError("unimplemented")` for
 /// field orders not ≡ 3 (mod 4). A sibling zig-libs module re-exported whole
 /// keeps the type name `root`, and is likewise skipped — its own compilation of
 /// this same step already covers it.
+///
+/// ⭐ The two shapes this used to get wrong, both found by audit on 2026-08-23
+/// and both proven by mutation:
+///
+///  1. **A container declared in a sibling FILE of this module.** The old test
+///     compared the prefix before the LAST dot against `@typeName(Parent)`, so
+///     `types.LogEntry` re-exported from `root.zig` as `pub const LogEntry =
+///     types.LogEntry` compared `"types"` against `"root"` and was dropped. The
+///     stated reason for dropping a non-matching prefix — "its own compilation
+///     of this step already covers it" — is true of a sibling MODULE, which is
+///     walked separately, and false of a sibling FILE, which is not walked at
+///     all. A deliberate type error in `raft.LogEntry` left `test-raft`,
+///     `check-pubfn-reach` AND `example-raft` all green.
+///  2. **A generic instantiated inside the container being walked.** Generic
+///     ARGUMENTS contain dots, so the last dot in
+///     `socket.Socket.List(wire.TableInfo)` sits inside the parentheses and the
+///     computed prefix was `socket.Socket.List(wire`, matching nothing.
+///
+/// Both are fixed by asking two positive questions instead of one negative one:
+/// is `Child` nested in `Parent` (prefix match at a `.` boundary, so generic
+/// arguments cannot move it), or does its first path segment name one of THIS
+/// module's own source files?
+///
+/// `own_files` is derived from the tree by `build.zig` — the files are their own
+/// declaration, so a new file needs no edit here. It has to be derived and not
+/// guessed from the name, because the collection contains modules whose own
+/// files are called `os.zig`, `json.zig`, `atomic.zig` and `crypto.zig`: the
+/// same first segment means "ours" in one module and "std's" in the next.
+///
+/// **The limit, stated rather than papered over:** a module that owns a file
+/// named like a std top-level namespace AND re-exports a container from std's
+/// namespace of that name would have the std one walked as if it were ours. No
+/// module does today (`mls`'s `crypto.zig` is the only such file, and every
+/// `crypto.` name it re-exports is its own).
 fn declaredHere(comptime Parent: type, comptime Child: type) bool {
     const name = @typeName(Child);
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse
-        return !std.mem.eql(u8, name, "root"); // own file namespace
-    return std.mem.eql(u8, name[0..dot], @typeName(Parent)); // nested in Parent
+    const parent = @typeName(Parent);
+
+    // Nested in the container being walked: `field.Fe` under `field`. Compared
+    // at a `.` boundary so a generic argument's dots cannot fake a match.
+    if (name.len > parent.len and
+        std.mem.startsWith(u8, name, parent) and
+        name[parent.len] == '.') return true;
+
+    // Otherwise: does the first path segment name one of this module's files?
+    const head = name[0 .. std.mem.indexOfAny(u8, name, ".(") orelse name.len];
+    // `root` is the one segment that is ambiguous by construction: every
+    // module's root file is called `root`, so a sibling zig-libs module
+    // re-exported whole is indistinguishable from ours by name. Ours is the
+    // walk's own starting point and is already covered; a sibling module has
+    // its own compilation of this step.
+    if (std.mem.eql(u8, head, "root")) return false;
+    for (own_files) |f| if (std.mem.eql(u8, f, head)) return true;
+    return false;
 }
 
 /// Reference every public declaration of `T`, recursing into public containers.
@@ -135,10 +208,51 @@ fn forceAll(comptime T: type, comptime depth: u8, comptime seen: []const type) v
             } else {
                 // Taking the address is what forces the body through semantic
                 // analysis; naming the declaration alone does not.
-                _ = &@field(T, decl.name);
+                force(T, decl.name);
             }
         }
     }
+}
+
+/// Reference one non-container declaration hard enough that its body is
+/// analysed.
+///
+/// ⭐ `_ = &decl` is enough for an ordinary function and NOT enough for an
+/// `inline` one: an inline function has no address to take, so the reference
+/// resolves without the compiler ever looking inside. Measured 2026-08-23 —
+/// a `pub inline fn` returning `[]const u8` from a `u8` signature left this
+/// gate green, and the same body as a plain `pub fn` turned it red. The
+/// collection has 23 such declarations and they sit in the hottest crypto code
+/// it owns (`rescue`'s field arithmetic, `tfhe`'s NTT, `bfv`'s modular
+/// reduction), which is the worst place to be carrying an unanalysed body.
+///
+/// A CALL analyses it, so the inline function is wrapped in an ordinary one and
+/// the ORDINARY one has its address taken. The wrapper's parameters supply the
+/// arguments, which is what makes this work where the obvious version does not:
+/// calling with `undefined` arguments fails outright ("use of undefined value
+/// here causes illegal behavior", measured on `bfv`'s `modarith.zig`), because
+/// an inline body is expanded at the call site and the compiler then sees the
+/// undefined values in real code.
+///
+/// Generic and variadic functions are left to the address-of path exactly as
+/// before: a generic body has nothing to analyse until something instantiates
+/// it, which is the limit stated at the top of this file and not a new one.
+fn force(comptime T: type, comptime name: []const u8) void {
+    const d = @field(T, name);
+    const info = @typeInfo(@TypeOf(d));
+    if (comptime info == .@"fn" and info.@"fn".calling_convention == .@"inline" and
+        !info.@"fn".is_generic and !info.@"fn".is_var_args)
+    {
+        const F = @TypeOf(d);
+        const wrapper = struct {
+            fn call(args: std.meta.ArgsTuple(F)) @typeInfo(F).@"fn".return_type.? {
+                return @call(.auto, d, args);
+            }
+        };
+        _ = &wrapper.call;
+        return;
+    }
+    _ = &@field(T, name);
 }
 
 test "every public declaration is analysed" {

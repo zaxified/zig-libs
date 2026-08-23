@@ -333,7 +333,7 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 |---|---|---|
 | meta tags (platform/role/concurrency/model_after/deps) | `pub const meta` in `src/root.zig` | README shows a derived view; SPEC does not restate |
 | which **library** a module belongs to | `.libs` on the `module_list` entry in `build.zig` | README's *Libraries* table and the catalog section a row is printed under are both **generated** from it — `zig build gen-libs-table` + `zig build gen-catalog` |
-| a module's sibling deps | `.deps` on the `module_list` entry in `build.zig` | the README catalog row's Deps cell is **generated** from it (`gen-catalog`); `meta.deps` in `root.zig` is a second hand-written copy that `check-catalog` holds to agreement (see below) |
+| a module's sibling deps | `.deps` on the `module_list` entry in `build.zig` | the README catalog row's Deps cell is **generated** from it (`gen-catalog`), and so is `meta.deps` in `root.zig` (`zig build gen-meta-deps`, since 2026-08-23 — it was the last hand-written twin of this fact, kept in step by `check-catalog` alone). The trailing comment on that line is **not** generated: it says why the dep is there and exists nowhere else |
 | one-line module purpose | `meta.doc` in the module's `src/root.zig` | the root `README.md` catalog table is **generated** from it (`zig build gen-catalog`) |
 | the catalog's Platform cell | `meta.platform_note` in the module's `src/root.zig` | same — generated |
 | paragraph purpose + API + import + verify steps | `modules/<m>/README.md` | — |
@@ -410,7 +410,9 @@ reference, not a re-explanation of everything the README already covers.
 2b. Fill in `meta.doc` (the catalog's one-line entry) and `meta.platform_note` (its
    Platform cell) in `src/root.zig`. `_template` ships both **empty on purpose** — a
    skeleton must not pass off a plausible placeholder as a catalog entry — and
-   `check-catalog` rejects an empty one, so forgetting is loud rather than silent. The
+   `check-catalog-table` (and `gen-catalog`, which refuses to render one) rejects an
+   empty one, so forgetting is loud rather than silent. Not `check-catalog`: that step
+   returns 0 on an empty `meta.doc`, and this line named it wrongly until 2026-08-23. The
    README catalog row is rendered from these; never write it by hand.
 3. **Multi-file modules:** add every new submodule to `root.zig`'s `test { _ = …; }`
    aggregator — a bare `pub const x = @import("x.zig")` re-export does **not** pull `x`'s
@@ -709,9 +711,13 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   section — which names the modules that tag touched — reintroduces them, where a typo'd module
   name is exactly what it catches. A check that currently matches nothing makes no claim that
   can be silently false, which is what separates it from the index checks it outlived.
-  The module-count sentence in the root prose is deliberately NOT checked: `check-catalog`
-  already owns that fact against `module_list.len` in the README, and the sentence is release
-  notes that freeze when a tag is cut. See `checkChangelog` in `build.zig` for the full
+  The module-count sentence in the root prose is deliberately NOT checked, because it is
+  release notes that freeze when a tag is cut. The README's own `**Status:** N modules`
+  line is a different sentence and IS checked, against `module_list.len`, since 2026-08-23:
+  the check existed before that but searched for the substring "N modules" ANYWHERE in the
+  file, and the Portability section's generated sentence contains exactly that string — so
+  the generated copy satisfied the check on the hand-written one's behalf, and a wrong
+  Status line passed all four catalog gates. It is anchored to the Status line now. See `checkChangelog` in `build.zig` for the full
   calibration and for what a green run does not prove.
 - **Maturity = explicit caveats, not tier labels.** Every module meets the same bar (§6/§7:
   tests green in all three release lanes — `ReleaseSafe`, `ReleaseFast`, `-Dstrict-debug` —

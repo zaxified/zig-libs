@@ -214,11 +214,11 @@ those crypto and format modules are yours too without going looking.
 | Library | Filed here | Also worth reaching for from here (own library in brackets) |
 |---|---:|---|
 | `web` | 35 | [`netaddr`](modules/netaddr/README.md) (net) · [`entropy`](modules/entropy/README.md) (crypto) · [`rsa`](modules/rsa/README.md) (crypto) · [`protobuf`](modules/protobuf/README.md) (format) · [`p256`](modules/p256/README.md) (crypto) |
-| `net` | 76 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) |
+| `net` | 74 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) |
 | `storage` | 15 | [`hashdigest`](modules/hashdigest/README.md) (crypto) |
 | `crypto` | 75 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
 | `format` | 19 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
-| `os` | 10 | [`framing`](modules/framing/README.md) (format) |
+| `os` | 12 | [`framing`](modules/framing/README.md) (format) |
 <!-- END GENERATED: check-libs-table -->
 
 
@@ -352,8 +352,6 @@ way to recognise it.
 | [`conntrack`](modules/conntrack/README.md) | Linux ctnetlink (NETLINK_NETFILTER) client — typed conntrack flow dump/get/delete plus event subscription, over `netlink`'s write engine | **linux** | netlink, netaddr |
 | [`devlink`](modules/devlink/README.md) | Linux devlink over genetlink — device/port enumeration, port split/unsplit, parameter/resource inspection, region snapshots, health reporters, eswitch mode | **linux** | genetlink, netlink |
 | [`df-elect`](modules/df-elect/README.md) | Partition-correct Designated-Forwarder election (static link-state total order, duplicate-freedom argument) + split-horizon; bounded-badness model-checked in netsim | any | netsim |
-| [`diskfree`](modules/diskfree/README.md) | `statfs`/`statfs64` disk-space query (total/free/available, inodes, block size) + `/proc/self/mounts`+`mountinfo` parsers — what's mounted and how full, no `df`/`mount` subprocess | **linux** | — |
-| [`diskusage`](modules/diskusage/README.md) | `du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary | **linux** | — |
 | [`dnp3`](modules/dnp3/README.md) | DNP3 (IEEE 1815) base protocol — data-link framing + CRC-16/DNP, application layer, core object library; master + outstation. Secure Auth (g120) scaffolded only, no crypto | any | aeskw |
 | [`dns`](modules/dns/README.md) | RFC 1035 resolver — A/AAAA/PTR/CNAME/NS/MX/TXT/SOA/SRV/CAA over UDP/TCP + DoH | any | netaddr, http |
 | [`dnssec`](modules/dnssec/README.md) | Resolver-side DNSSEC validation (RFC 4033/4034/4035 + NSEC3) — DNSKEY/RRSIG/DS parsing, signature verify (ECDSA/Ed25519/RSA), NSEC/NSEC3 denial-of-existence | any | dns, rsa |
@@ -586,6 +584,8 @@ way to recognise it.
 |---|---|---|---|
 | [`argsafe`](modules/argsafe/README.md) | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv`. | any | — |
 | [`diagnostics`](modules/diagnostics/README.md) | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion. | any | — |
+| [`diskfree`](modules/diskfree/README.md) | `statfs`/`statfs64` disk-space query (total/free/available, inodes, block size) + `/proc/self/mounts`+`mountinfo` parsers — what's mounted and how full, no `df`/`mount` subprocess | **linux** | — |
+| [`diskusage`](modules/diskusage/README.md) | `du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary | **linux** | — |
 | [`ipcbus`](modules/ipcbus/README.md) | Same-host unix-socket control plane — a request/reply server plus a capped in-memory scratch key→bytes bus. | **linux** | framing |
 | [`mcp`](modules/mcp/README.md) | Model Context Protocol server (JSON-RPC 2.0) — tools, resources, prompts, plus server→client sampling and elicitation requests. | any | — |
 | [`mcp-http`](modules/mcp-http/README.md) | MCP Streamable HTTP transport (2025-06-18) — `POST /mcp` with JSON or live SSE, resumable sessions, Origin (DNS-rebind) guard. | any | router, http, mcp |

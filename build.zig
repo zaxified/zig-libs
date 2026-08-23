@@ -217,8 +217,8 @@ const module_list = [_]Module{
     .{ .name = "rdap", .libs = &.{"net"}, .deps = &.{ "http", "netaddr" } },
     .{ .name = "blobstore", .libs = &.{"storage"}, .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .libs = &.{"net"}, .deps = &.{"netaddr"} },
-    .{ .name = "diskfree", .libs = &.{"net"} },
-    .{ .name = "diskusage", .libs = &.{"net"} },
+    .{ .name = "diskfree", .libs = &.{"os"} },
+    .{ .name = "diskusage", .libs = &.{"os"} },
     .{ .name = "conntrack", .libs = &.{"net"}, .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"} },
     .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{"argsafe"} },
     .{ .name = "dataset", .libs = &.{"storage"} },
@@ -415,6 +415,14 @@ pub fn build(b: *std.Build) void {
     // milliseconds where the sweep takes minutes.
     b.step("check-example-rule", "Check CONVENTIONS 7.2: every module over a trigger has an example").dependOn(check_example_rule);
 
+    // The `own_files` list `scripts/force-pubfn-reach.zig` needs, built ONCE per
+    // module and looked up by name. Shared rather than rebuilt at each use so
+    // the native gate and every cross-compiled pair cannot be handed different
+    // lists -- two copies of a derived fact is the shape this repository keeps
+    // finding to have drifted.
+    var own_files_mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
+    for (module_list) |m| own_files_mods.put(m.name, ownFilesModule(b, m.name)) catch @panic("OOM");
+
     // Pass 1: create each module so inter-module deps can be wired in pass 2.
     var mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
     for (module_list) |m| {
@@ -511,6 +519,7 @@ pub fn build(b: *std.Build) void {
             .optimize = if (m.heavy) heavy_optimize else optimize,
         });
         force_mod.addImport("m", test_root);
+        force_mod.addImport("own_files", own_files_mods.get(m.name).?);
         const force_tests = b.addTest(.{
             .name = b.fmt("force-{s}", .{m.name}),
             .root_module = force_mod,
@@ -539,13 +548,21 @@ pub fn build(b: *std.Build) void {
         // longer public, so the walk silently covers less) — only this step
         // went red. The three gates are complements, not overlaps.
         //
-        // Compile-only, like every other check step here: nothing installs or
-        // runs the artifact, so the build passes `-fno-emit-bin` and this does
-        // NOT cover consumer-BINARY facts — link-time reach (a MIPS `PC16`
-        // fixup overflows at ±128 KB) or what a module drags in (`http`'s
-        // TLS-vs-plaintext split was 334 KB). That class needs a linked,
-        // measured binary; `scripts/check-http-sizeprobe.sh` is the one place
-        // this repository does it today.
+        // ⭐ NO LONGER compile-only, and the difference matters. Each example
+        // now also carries a `run-example-<name>` step (below), and a run step
+        // forces the artifact to be emitted and LINKED -- so this compile no
+        // longer passes `-fno-emit-bin`, and consumer-BINARY facts that used to
+        // sit outside it (link-time reach: a MIPS `PC16` fixup overflows at
+        // ±128 KB) are inside it now. What is still outside is what a module
+        // DRAGS IN by size (`http`'s TLS-vs-plaintext split was 334 KB), which
+        // needs a measured binary; `scripts/check-http-sizeprobe.sh` is the one
+        // place this repository does that.
+        //
+        // The comment this replaces said the opposite, and had said it since
+        // the run steps landed: a gate whose documented scope is narrower than
+        // its real one is the same defect as the reverse, just the lucky way
+        // round -- someone reads it and builds a second gate for a class this
+        // one already covers.
         //
         // Scoped, not universal (survey 2026-08-21): 78 of 229 modules already
         // have an in-repo consumer, so their boundary is exercised by real
@@ -568,6 +585,19 @@ pub fn build(b: *std.Build) void {
             // shared transport a caller reaches for, so forcing them to
             // re-export its attribute codec would invent API to satisfy a
             // rule rather than a consumer.
+            //
+            // ⚠ What that argument costs, measured 2026-08-23 rather than left
+            // implied: it was made about two modules and it applies to 151 —
+            // every module with any `.deps` — of which 65 examples really do
+            // import one. For those 65 this step no longer answers "is THIS
+            // module's published API sufficient?" but "is this module PLUS its
+            // published deps sufficient?", which is a weaker question. It is
+            // still the right trade (the alternative invents API), but the
+            // claim above should not be read as covering the other 63.
+            //
+            // ⚠ And the boundary is enforced at USE, not at declaration: a
+            // top-level `const x = @import("testkit");` an example never uses
+            // is not resolved, so it compiles. Only a used import goes red.
             for (m.deps) |dep| example_mod.addImport(dep, mods.get(dep).?);
             const example = b.addExecutable(.{
                 .name = b.fmt("example-{s}", .{m.name}),
@@ -800,6 +830,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseSmall,
             });
             cross_force_mod.addImport("m", test_root);
+            cross_force_mod.addImport("own_files", own_files_mods.get(m.name).?);
             const cross_force = b.addTest(.{
                 .name = b.fmt("force-{s}", .{step_name}),
                 .root_module = cross_force_mod,
@@ -1023,6 +1054,19 @@ pub fn build(b: *std.Build) void {
     // before this existed -- e.g. `hpke` really depends on `p256` via
     // DHKEM(P-256), but its README row said "—" and its own
     // modules/hpke/README.md said "Deps: none".
+    // The fix half of `check-catalog`'s `meta.deps` agreement check: edit
+    // `module_list`'s `.deps`, run this, commit. See `genMetaDeps`.
+    {
+        const gmd = b.allocator.create(std.Build.Step) catch @panic("OOM");
+        gmd.* = std.Build.Step.init(.{
+            .id = .custom,
+            .name = "gen-meta-deps",
+            .owner = b,
+            .makeFn = genMetaDeps,
+        });
+        b.step("gen-meta-deps", "Regenerate every module's `meta.deps` from module_list's `.deps`").dependOn(gmd);
+    }
+
     const check = b.step("check-catalog", "Verify module_list matches modules/ and the README catalog");
     const check_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
     check_inner.* = std.Build.Step.init(.{
@@ -1407,6 +1451,45 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
 /// Whether a module ships an example. The file on disk IS the declaration --
 /// there is no flag to keep in step with it, and so no way for the two to
 /// disagree. Called at configure time, once per module.
+/// A module's own source files, named the way `@typeName` spells them:
+/// `modules/<m>/src/wire.zig` is `wire`. Handed to `scripts/force-pubfn-reach.zig`
+/// so its `declaredHere` can tell a container declared in a sibling FILE of the
+/// module under test (walk it -- nothing else ever will) from one re-exported
+/// out of std or a sibling MODULE (skip it -- that tests its owner, not us).
+///
+/// Derived, never listed: the files ARE the declaration. It cannot be a name
+/// heuristic instead, because this collection owns files called `os.zig`,
+/// `json.zig`, `atomic.zig` and `crypto.zig` -- the same first path segment
+/// means "ours" in one module and "std's" in the next.
+fn moduleFileNamespaces(b: *std.Build, io: std.Io, name: []const u8) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var dir = b.build_root.handle.openDir(io, b.fmt("modules/{s}/src", .{name}), .{ .iterate = true }) catch
+        return &.{};
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(io) catch @panic("walk failed")) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const rel = entry.path[0 .. entry.path.len - ".zig".len];
+        const ns = b.allocator.dupe(u8, rel) catch @panic("OOM");
+        for (ns) |*c| if (c.* == '/') {
+            c.* = '.';
+        };
+        out.append(b.allocator, ns) catch @panic("OOM");
+    }
+    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+/// The options module `scripts/force-pubfn-reach.zig` imports as `own_files`.
+/// Built once per module and shared by the native gate and every cross-compile,
+/// so the two can never be handed different lists.
+fn ownFilesModule(b: *std.Build, name: []const u8) *std.Build.Module {
+    const opts = b.addOptions();
+    opts.addOption([]const []const u8, "names", moduleFileNamespaces(b, b.graph.io, name));
+    return opts.createModule();
+}
+
 fn moduleHasExample(b: *std.Build, name: []const u8) bool {
     const path = b.fmt("modules/{s}/example/main.zig", .{name});
     return if (b.build_root.handle.access(b.graph.io, path, .{})) |_| true else |_| false;
@@ -1430,10 +1513,10 @@ fn checkExampleRule(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
         if (!moduleHasExample(b, m.name) and !appCoversModule(m.name)) {
             const t = try exampleTriggers(b, io, m.name);
             if (t.pub_fns >= example_pub_fn_threshold) {
-                std.debug.print("check-example-decls: {s} has {d} `pub fn` (threshold {d}) and no example -- see CONVENTIONS.md 7.2\n", .{ m.name, t.pub_fns, example_pub_fn_threshold });
+                std.debug.print("check-example-rule: {s} has {d} `pub fn` (threshold {d}) and no example -- see CONVENTIONS.md 7.2\n", .{ m.name, t.pub_fns, example_pub_fn_threshold });
                 failed = true;
             } else if (t.has_init and t.self_methods >= example_self_method_threshold) {
-                std.debug.print("check-example-decls: {s} has `init` plus {d} `self` methods (threshold {d}) and no example -- see CONVENTIONS.md 7.2\n", .{ m.name, t.self_methods, example_self_method_threshold });
+                std.debug.print("check-example-rule: {s} has `init` plus {d} `self` methods (threshold {d}) and no example -- see CONVENTIONS.md 7.2\n", .{ m.name, t.self_methods, example_self_method_threshold });
                 failed = true;
             }
         }
@@ -1446,6 +1529,15 @@ fn checkExampleRule(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
 /// the first one, and the second exists because a small module whose calls
 /// must happen in an order is misassembled by an outsider just as easily as a
 /// large one.
+///
+/// ⚠ Both numbers are DORMANT as of 2026-08-23: all 230 modules carry an
+/// example, so `checkExampleRule` never reaches `exampleTriggers` and the
+/// thresholds decide nothing. Measured, not assumed -- setting both to 1 still
+/// leaves `zig build check-example-rule` at exit 0. The mutation proof this
+/// gate was built on ("a threshold of 12 turns 41 modules red") therefore does
+/// not reproduce any more, and the gate's one live failure mode is a NEW module
+/// added without an example. Worth knowing before reading a green run here as
+/// evidence about the thresholds: it is evidence about the files.
 const example_pub_fn_threshold = 25;
 const example_self_method_threshold = 3;
 
@@ -1480,9 +1572,16 @@ fn exampleTriggers(b: *std.Build, io: std.Io, name: []const u8) !struct {
         var lines = std.mem.splitScalar(u8, src, '\n');
         while (lines.next()) |line| {
             const trimmed = std.mem.trimStart(u8, line, " \t");
-            if (!std.mem.startsWith(u8, trimmed, "pub fn ")) continue;
+            // `pub fn` is not the only spelling of a public function, and the
+            // three others are invisible to a bare `startsWith("pub fn ")`.
+            // Measured 2026-08-23: 23 declarations across `rescue`, `tfhe`,
+            // `bfv`, `vdf`, `montint` and `bitcointx` were uncounted here --
+            // the same keyword `check-pubfn-reach` was also blind to, so one
+            // word hid a declaration from two independent gates at once.
+            const rest = for ([_][]const u8{ "pub fn ", "pub inline fn ", "pub noinline fn ", "pub export fn ", "pub extern fn " }) |kw| {
+                if (std.mem.startsWith(u8, trimmed, kw)) break trimmed[kw.len..];
+            } else continue;
             pub_fns += 1;
-            const rest = trimmed["pub fn ".len..];
             if (std.mem.startsWith(u8, rest, "init")) has_init = true;
             const paren = std.mem.indexOfScalar(u8, rest, '(') orelse continue;
             const args = std.mem.trimStart(u8, rest[paren + 1 ..], " \t");
@@ -1997,8 +2096,33 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
         }
     }
 
-    if (std.mem.indexOf(u8, readme, b.fmt("{d} modules", .{module_list.len})) == null) {
-        std.log.err("README status line does not say \"{d} modules\"", .{module_list.len});
+    // ⭐ Anchored to the Status line, not searched for anywhere in the file.
+    // The previous version looked for the substring "<N> modules" ANYWHERE in
+    // README.md, and the Portability section's GENERATED sentence contains
+    // exactly that string -- so the generated copy satisfied the check on the
+    // hand-written one's behalf. Measured 2026-08-23: editing the Status line
+    // alone to a wrong count left `check-catalog`, `check-catalog-table`,
+    // `check-libs-table` AND `check-portable-table` all at exit 0, while the
+    // same edit to the generated sentence turned `check-portable-table` red.
+    // The most-read number in the file was the one number nothing guarded.
+    const status_needle = "**Status:** ";
+    if (std.mem.indexOf(u8, readme, status_needle)) |at| {
+        const rest = readme[at + status_needle.len ..];
+        const end = std.mem.indexOfNone(u8, rest, "0123456789") orelse rest.len;
+        if (std.fmt.parseInt(usize, rest[0..end], 10)) |claimed| {
+            if (claimed != module_list.len) {
+                std.log.err(
+                    "README's status line says {d} modules, module_list has {d}",
+                    .{ claimed, module_list.len },
+                );
+                failed = true;
+            }
+        } else |_| {
+            std.log.err("README's `{s}` line does not begin with a module count", .{status_needle});
+            failed = true;
+        }
+    } else {
+        std.log.err("README.md has no `{s}` line to check the module count against", .{status_needle});
         failed = true;
     }
 
@@ -4536,6 +4660,66 @@ fn readmeDepsCell(readme: []const u8, name: []const u8, b: *std.Build) ?[]const 
 /// with `mem.indexOf` + quote-scanning, unlike a general `@import` scan
 /// (see the authoritative-source note above `check-catalog`'s definition
 /// in `build()`, and CONVENTIONS.md, for why that stays out of the gate).
+/// `zig build gen-meta-deps` — render every module's `meta.deps` from
+/// `module_list`'s `.deps`.
+///
+/// ⭐ Why this step exists. `d5f23dee` established the rule that "a guard which
+/// keeps two lists in sync is an admission that they should be one list", and
+/// applied it to the README catalog's Deps cell, which has been generated ever
+/// since. `meta.deps` is the SAME twin -- a second hand-written copy of the same
+/// fact in 230 `root.zig` files, held to agreement by `checkDepsMatch` and
+/// nothing else -- and it was left standing. An audit on 2026-08-23 found it.
+///
+/// The trailing comment is NOT generated, and that is the same split the catalog
+/// campaign settled on: facts are rendered, prose stays where a human writes it.
+/// `x509`'s `// rsa.verifyPss for the RSASSA-PSS gap; slhdsa for RFC 9882
+/// certificates (std has no SLH-DSA)` says WHY the dep is there, exists nowhere
+/// else, and would be destroyed by a generator that owned the whole line. So
+/// only the tuple between the braces is rewritten.
+fn genMetaDeps(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    var written: usize = 0;
+    for (module_list) |m| {
+        const path = b.fmt("modules/{s}/src/root.zig", .{m.name});
+        const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(2 * 1024 * 1024)) catch continue;
+
+        const meta_idx = std.mem.indexOf(u8, src, "pub const meta") orelse continue;
+        const meta_end = std.mem.indexOfPos(u8, src, meta_idx, "\n};") orelse src.len;
+        const deps_idx = std.mem.indexOfPos(u8, src, meta_idx, ".deps = .{") orelse continue;
+        if (deps_idx > meta_end) continue;
+        const open = std.mem.indexOfScalarPos(u8, src, deps_idx, '{').?;
+        const close = std.mem.indexOfScalarPos(u8, src, open, '}').?;
+
+        // Spacing follows `zig fmt`, which the repo gates: a one-element tuple
+        // is `.{"http"}` and a longer one is `.{ "a", "b" }`. Getting this wrong
+        // is not cosmetic here -- it would rewrite 76 files that were already
+        // correct, and `check-fmt` would then reject every one of them.
+        var rendered: std.ArrayList(u8) = .empty;
+        const pad = m.deps.len > 1;
+        for (m.deps, 0..) |d, i| {
+            if (i == 0) {
+                if (pad) try rendered.append(b.allocator, ' ');
+            } else try rendered.appendSlice(b.allocator, ", ");
+            try rendered.append(b.allocator, '"');
+            try rendered.appendSlice(b.allocator, d);
+            try rendered.append(b.allocator, '"');
+        }
+        if (pad) try rendered.append(b.allocator, ' ');
+
+        if (std.mem.eql(u8, src[open + 1 .. close], rendered.items)) continue;
+
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(b.allocator, src[0 .. open + 1]);
+        try out.appendSlice(b.allocator, rendered.items);
+        try out.appendSlice(b.allocator, src[close..]);
+        try b.build_root.handle.writeFile(io, .{ .sub_path = path, .data = out.items });
+        written += 1;
+    }
+    if (written > 0) std.log.info("gen-meta-deps: {d} module(s) updated", .{written});
+}
+
 fn metaDepsFromRoot(src: []const u8, b: *std.Build) ?[]const []const u8 {
     const meta_idx = std.mem.indexOf(u8, src, "pub const meta") orelse return null;
     const meta_end = std.mem.indexOfPos(u8, src, meta_idx, "\n};") orelse src.len;
