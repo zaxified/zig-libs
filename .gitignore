@@ -17,3 +17,11 @@ scripts/vm/work/
 # would do routinely — and a path dependency copies the whole working tree, so
 # one build left 279 MB in 70k files here. Never committed, always regenerable.
 zig-pkg/
+
+# example-apps/ are standalone consumer projects, each with its own build root,
+# so each grows its own cache, output tree and package store. Listed BEFORE the
+# directory exists on purpose: the last time an untracked build store appeared
+# here it was 70k files and the editor spent minutes indexing them.
+example-apps/*/.zig-cache/
+example-apps/*/zig-out/
+example-apps/*/zig-pkg/
