@@ -25,7 +25,9 @@ take a REQUIRED `opening` mode selecting whether the first row's `value_col` is 
 starting position, which is what a series sliced to a date-range window needs. It carries no
 default deliberately: the sign-change check cannot catch a forgotten seed in general (a window
 whose first row happens to carry a flow does bracket a root, and converges on the IRR of a
-different question), so a compile error is the only complete detector. Both also narrow the RATE
+different question), so a compile error is the detector — for source-level construction. A caller
+deserializing the spec from config gets a run-time parse error instead, and must make the mode
+required in that schema too. Both also narrow the RATE
 below `rate_tol` (default 1e-9) before returning, because the `1e-2`/`tol` thresholds are on NPV
 and therefore mean different things at different cashflow magnitudes — on a series denominated in
 units of ~0.01 the old test was met at the first midpoint and `xirr` returned 4.505 for a series

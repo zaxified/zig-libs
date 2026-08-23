@@ -102,8 +102,16 @@ pub const XirrSpec = struct {
     /// as if it were a whole history — is the mistake you make by not thinking
     /// about it. The sign-change check below cannot catch that case in general
     /// (a window whose first row carries a flow brackets a root and converges
-    /// on the IRR of a different question), so the only complete detector is
-    /// the compiler: omit this field and the call does not build.
+    /// on the IRR of a different question), so the detector is the compiler:
+    /// omit this field and the call does not build.
+    ///
+    /// That guarantee covers source-level construction only. A caller that
+    /// deserializes this spec — `std.json.parseFromValue` on a config file,
+    /// say — turns the same omission into a parse error at run time instead,
+    /// and one with `ignore_unknown_fields` will not even report a MISSPELLED
+    /// field. If that is your shape, make the mode required a second time in
+    /// whatever schema the config is written against, or the convention is
+    /// merely silent one layer further down, where its author sees it less.
     opening: Opening,
     /// Bisection also has to narrow the RATE to this width before returning,
     /// not just drive |NPV| under `1e-2`. The NPV threshold is absolute, so
