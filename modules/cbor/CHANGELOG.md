@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — `encode` with `EncodeOptions.canonical` no longer leaks. The
+  canonical path allocates a scratch array of `(encoded key, entry)` pairs to
+  sort map entries by encoded-key bytes, plus one buffer per key, and freed
+  neither — so every canonical encode of a map leaked, on the first call, for
+  any caller not using an arena. Found by running the new
+  `example/main.zig` under `DebugAllocator`; the module's own canonical-map
+  tests could not see it, because they run on an `ArenaAllocator`, which frees
+  everything regardless. Confirmed by mutation: with the fix removed,
+  `zig build test-cbor` still passes and `zig build run-example-cbor` reports
+  three leaked allocations.
+
 - **2026-08-22** — `cose.parseKey` accepts the AKP key type (RFC 9964 §3,
   `kty` 7), with the ML-DSA algorithm identifiers -48/-49/-50 and a new
   `Key.akp` variant carrying the required `alg` and the raw `pub` bytes.

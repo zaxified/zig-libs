@@ -591,12 +591,27 @@ fn encodeMap(list: *std.ArrayList(u8), a: Allocator, entries: []const MapEntry, 
         return;
     }
 
+    // `pairs` and each `key_bytes` scratch buffer below are this function's
+    // own allocations, not part of the returned CBOR bytes (which land in
+    // `list`) — they must be freed here regardless of how this function
+    // returns. Previously they were never freed at all; every module test
+    // exercising this path used an ArenaAllocator (kat_test.zig), so the
+    // leak was invisible there and only showed up under a plain allocator —
+    // exactly the class of defect `example/main.zig`'s `DebugAllocator` is
+    // for. `built` tracks how many `pairs[i].key_bytes` are actually owned
+    // allocations at the time the deferred free runs, whether this function
+    // returns normally or via an error partway through the build loop.
     const Pair = struct { key_bytes: []const u8, entry: MapEntry };
     const pairs = try a.alloc(Pair, entries.len);
+    defer a.free(pairs);
+    var built: usize = 0;
+    defer for (pairs[0..built]) |p| a.free(p.key_bytes);
     for (entries, 0..) |e, i| {
         var kbuf: std.ArrayList(u8) = .empty;
+        errdefer kbuf.deinit(a);
         try encodeInto(&kbuf, a, e.key, options);
         pairs[i] = .{ .key_bytes = try kbuf.toOwnedSlice(a), .entry = e };
+        built = i + 1;
     }
     std.mem.sort(Pair, pairs, {}, struct {
         fn lessThan(_: void, x: Pair, y: Pair) bool {
