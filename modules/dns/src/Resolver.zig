@@ -363,8 +363,11 @@ fn readHosts(r: *Resolver) ?[]u8 {
 
 fn sortIps(ips: []netaddr.Ip) void {
     if (comptime builtin.os.tag != .linux) return; // systemSource is Linux-only
-    if (ips.len > 1 and ips.len <= netaddr.max_sort_candidates)
-        netaddr.sortDestinations(ips, netaddr.systemSource);
+    // The candidate bound lives in `netaddr` and is enforced there; an answer
+    // set larger than it is left in the order it arrived rather than being
+    // sorted in part. This used to re-check the length here too, which meant
+    // the rule was written twice and the one that mattered was an assert.
+    netaddr.sortDestinations(ips, netaddr.systemSource) catch {};
 }
 
 // ── transports ──────────────────────────────────────────────────────────────

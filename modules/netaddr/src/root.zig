@@ -902,9 +902,18 @@ pub const max_sort_candidates = 64;
 /// returns the source address the OS would use to reach a destination, or
 /// null when the destination is unusable (no route) — pass `systemSource` on
 /// Linux for glibc-getaddrinfo-like behavior. Each destination is probed
-/// exactly once. Asserts `dsts.len <= max_sort_candidates`.
-pub fn sortDestinations(dsts: []Ip, srcFor: *const fn (Ip) ?Ip) void {
-    std.debug.assert(dsts.len <= max_sort_candidates);
+/// exactly once.
+///
+/// Returns `error.TooManyCandidates` when `dsts.len > max_sort_candidates`.
+/// That is an error and not `std.debug.assert` on purpose: the scratch array
+/// below is a fixed 64-slot **stack** array, ReleaseFast compiles both the
+/// assert and the bounds check out, and `dsts` is typically a resolver's
+/// answer set — data off the wire. A hostname with more than 64 address
+/// records would have written past a stack buffer. Callers that would rather
+/// sort a prefix than fail can slice to `max_sort_candidates` themselves;
+/// silently sorting part of the set would answer a different question.
+pub fn sortDestinations(dsts: []Ip, srcFor: *const fn (Ip) ?Ip) error{TooManyCandidates}!void {
+    if (dsts.len > max_sort_candidates) return error.TooManyCandidates;
     if (dsts.len < 2) return;
     var srcs: [max_sort_candidates]?Ip = undefined;
     for (dsts, 0..) |d, i| srcs[i] = srcFor(d);
@@ -1258,7 +1267,7 @@ test "sortDestinations probes each destination once via the callback" {
         }
     };
     var dsts = [_]Ip{ mkIp("2001:db8::1"), mkIp("10.0.0.1"), mkIp("2001:db8::2") };
-    sortDestinations(&dsts, probe.srcFor);
+    try sortDestinations(&dsts, probe.srcFor);
     try testing.expectEqual(@as(usize, 3), probe.calls);
     var buf: [max_ip_text_len]u8 = undefined;
     try testing.expectEqualStrings("10.0.0.1", formatIp(dsts[0], &buf));
@@ -1269,8 +1278,29 @@ test "destination policy prefers ::1 over 127.0.0.1 like glibc" {
     var dsts = [_]Ip{ mkIp("127.0.0.1"), mkIp("::1") };
     // Skip on hosts with IPv6 disabled (rule 1 then demotes ::1).
     if (systemSource(dsts[1]) == null) return error.SkipZigTest;
-    sortDestinations(&dsts, systemSource);
+    try sortDestinations(&dsts, systemSource);
     try testing.expect(dsts[0].eql(mkIp("::1")));
+}
+
+// `srcs` in `sortDestinations` is a fixed stack array of `max_sort_candidates`
+// slots. The old guard was `std.debug.assert`, which ReleaseFast removes along
+// with the bounds check -- and the slice being sorted is normally a resolver's
+// answer set, i.e. off the wire. Written in terms of the constant, so it keeps
+// measuring the mechanism if the bound ever moves.
+test "sortDestinations: one past the candidate bound is an error, not a stack write" {
+    const n = max_sort_candidates + 1;
+    var dsts: [n]Ip = undefined;
+    for (&dsts, 0..) |*d, i| d.* = .{ .v4 = .{ 10, 0, @intCast(i / 256), @intCast(i % 256) } };
+
+    const S = struct {
+        fn srcFor(_: Ip) ?Ip {
+            return .{ .v4 = .{ 10, 0, 0, 1 } };
+        }
+    };
+    try std.testing.expectError(error.TooManyCandidates, sortDestinations(&dsts, S.srcFor));
+
+    // Exactly at the bound still works.
+    try sortDestinations(dsts[0..max_sort_candidates], S.srcFor);
 }
 
 test "systemSource resolves a loopback source on Linux" {

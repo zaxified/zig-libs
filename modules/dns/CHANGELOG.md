@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — `sortIps` no longer re-checks
+  `netaddr.max_sort_candidates` before calling `sortDestinations`; the bound is
+  enforced inside `netaddr` now that it returns an error, so the rule lives in
+  one place. Behaviour is unchanged: an answer set larger than the bound is
+  left in arrival order.
+
 - **2026-08-22** — `tcpExchange` (the only place in this file that owns a TCP fd directly)
   used to fold every write (`writeInt`/`writeAll`/`flush`) and read (`takeInt`/
   `readSliceAll`) failure into `error.NetworkFailed`, including a canceled `std.Io` wait —
