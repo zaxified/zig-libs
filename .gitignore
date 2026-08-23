@@ -11,3 +11,9 @@ zig-out/
 # See scripts/vm/README.md.
 scripts/vm/images/
 scripts/vm/work/
+
+# Zig's package store. It appears in THIS repo's root whenever anything builds
+# a consumer against us through a `.path` dependency — which `example-apps/`
+# would do routinely — and a path dependency copies the whole working tree, so
+# one build left 279 MB in 70k files here. Never committed, always regenerable.
+zig-pkg/
