@@ -46,6 +46,13 @@ const Allocator = std.mem.Allocator;
 const native_endian_is_le = builtin.target.cpu.arch.endian() == .little;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Streaming ZIP archive reader — walks the central directory once, streams decompressed member bytes on demand.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{ .linux64, .windows },
     .platform = .any,
     .role = .codec,

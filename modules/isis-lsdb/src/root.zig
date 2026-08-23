@@ -58,6 +58,13 @@ const std = @import("std");
 const isis = @import("isis");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "IS-IS link-state database — stores LSPs by LSP-ID, ISO 10589 §7.3 newer-LSP comparison, time-injected aging + MaxAge purge, per-interface SRM/SSN flooding flags; pure",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util,

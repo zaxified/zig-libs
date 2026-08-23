@@ -100,6 +100,13 @@ pub const skToPk = keys.skToPk;
 pub const bls12_381 = @import("bls12_381");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "BBS selective-disclosure signatures over `bls12_381` (draft-irtf-cfrg-bbs-04) — sign many messages, later reveal a chosen subset in zero knowledge.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any, // pure computation; the one entropy source (calculateRandomScalars) takes a portable std.Io, no raw getrandom(2)
     .role = .util, // no I/O, no wire framing beyond point/scalar (de)serialization

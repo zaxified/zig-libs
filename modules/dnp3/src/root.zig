@@ -72,6 +72,13 @@
 const std = @import("std");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "DNP3 (IEEE 1815) base protocol — data-link framing + CRC-16/DNP, application layer, core object library; master + outstation. Secure Auth (g120) scaffolded only, no crypto",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     // master = the pure codecs (build request / parse response);

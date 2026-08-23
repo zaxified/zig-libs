@@ -84,6 +84,13 @@
 //! pinned vs. self-tested.
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "HQC — code-based post-quantum KEM, NIST's structurally-independent backup to lattice-based ML-KEM. Complete keygen, encrypt, decrypt.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing of its own

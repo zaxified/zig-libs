@@ -50,6 +50,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "CBOR (RFC 8949) codec — all 8 major types, canonical encoding option, untrusted-input hardened; plus a minimal COSE (RFC 9052) layer.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec,

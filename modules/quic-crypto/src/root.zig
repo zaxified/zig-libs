@@ -93,6 +93,13 @@ pub const HeaderForm = headerprot.HeaderForm;
 pub const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "RFC 9001 (TLS for QUIC) crypto seam — secret derivation, AEAD packet protection, header protection, key update; engine-agnostic.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     // Pure crypto/codec over caller-supplied bytes — both directions (seal

@@ -101,6 +101,13 @@
 const std = @import("std");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Bulletproofs — zero-knowledge range proofs over Ristretto255, proving a Pedersen-committed value is in range with logarithmic proof size.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "linux",
     .targets = .{.linux64},
     .platform = .linux, // prove()'s internal getrandom(2) blinding is Linux-only (see Caveats); verify/codec paths are portable
     .role = .util, // pure computation — no I/O, no wire framing of its own

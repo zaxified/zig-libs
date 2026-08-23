@@ -94,6 +94,13 @@ const StdChaCha = std.crypto.stream.chacha.ChaCha20IETF;
 const StdAead = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "SIMD-accelerated ChaCha20-Poly1305 AEAD (RFC 8439) — a throughput-specialized, byte-exact duplicate of `std.crypto.aead.chacha_poly`.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any (SIMD via `@Vector`)",
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec, // pure computation, no I/O

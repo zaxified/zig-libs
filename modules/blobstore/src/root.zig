@@ -61,6 +61,13 @@ const linux = std.os.linux;
 const hashdigest = @import("hashdigest");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Content-addressed blob store (git-object/restic style), plus name-addressed and small named-record layers; crash-safe.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "posix",
     .targets = .{.linux64},
     .platform = .posix, // atomic rename-on-commit; advisory flock; std.Io filesystem API
     .role = .util,

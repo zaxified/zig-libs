@@ -103,6 +103,13 @@ const echo = icmp.echo;
 const netaddr = @import("netaddr");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Path MTU discovery — kernel-cache read (`query`) **and** an authoritative DF-bit binary search (`probe`) that detects ICMP black holes the cache can't see",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "**linux**",
     .targets = .{ .linux64, .linux32 },
     .platform = .linux, // raw syscalls (IP_MTU_DISCOVER) + the sibling icmp module's raw/dgram ICMP sockets; no portable fallback
     .role = .client,

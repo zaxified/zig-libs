@@ -28,6 +28,13 @@
 const std = @import("std");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Constant-time Montgomery modular arithmetic over arbitrary odd moduli — faster native-Zig alternative to `std.crypto.ff`, x86-64 asm + portable fallback.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "x86-64 asm + portable fallback",
     .targets = .{.linux64},
     .platform = .any, // portable CIOS everywhere; amd64 asm is an accel path
     .role = .util,

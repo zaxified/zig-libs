@@ -62,6 +62,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Passive RTT estimation from TCP TSval/TSecr echo matching (RFC 7323 / Pollere pping) — bounded per-direction table, no double-counting of duplicate/delayed ACKs",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util,

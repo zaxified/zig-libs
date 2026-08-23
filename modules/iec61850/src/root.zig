@@ -56,6 +56,13 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "IEC 61850 substation automation — MMS (ISO 9506) client over ISO-on-TCP with the ACSI object model, plus GOOSE publish/subscribe + SV sampled values",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     // Codecs, state machines, client PDU logic and the responder are pure
     // computation; only the optional TcpTransport touches std.Io.net.
     .targets = .{.linux64},

@@ -51,6 +51,13 @@ const flate = std.compress.flate;
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "ustar/GNU tar reader+writer (preserves uid/gid/mtime) + gzip.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any (packer: linux)",
     .targets = .{ .linux64, .linux32 },
     .platform = .any, // codec is platform-pure; only packDir is Linux (statx)
     .role = .both, // reader + writer

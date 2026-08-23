@@ -34,6 +34,13 @@ const spf = @import("isis-spf");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "SPB (802.1aq) forwarding addressing — unicast B-MAC FIB from an `isis-spf` route table + SPBM multicast-DA construction; one congruent ECT path per dest, no per-flow ECMP",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util,

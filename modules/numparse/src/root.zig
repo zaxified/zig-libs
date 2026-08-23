@@ -20,6 +20,13 @@ const std = @import("std");
 const Decimal = @import("decimal").Decimal;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Locale-aware grouped-number parsing (thousands/decimal separators) into an exact `decimal.Decimal`.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{ .linux64, .windows },
     .platform = .any, // pure logic, no OS calls
     .role = .util,

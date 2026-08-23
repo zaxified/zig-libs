@@ -44,6 +44,13 @@
 const std = @import("std");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "`du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "**linux**",
     .targets = .{ .linux64, .linux32 },
     .platform = .linux, // raw statx(2)/fstatat(2) syscalls, no libc, no portable fallback
     .role = .util,

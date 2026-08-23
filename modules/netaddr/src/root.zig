@@ -27,6 +27,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "IP parse/format (RFC 5952) + RFC 6724 source/dest selection + CIDR/Prefix ops (contains/overlaps/supernet, range↔prefix)",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any, // pure logic; `systemSource` helper is Linux-only
     .role = .util,

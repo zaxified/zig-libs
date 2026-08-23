@@ -35,6 +35,13 @@ pub const handshake = @import("handshake.zig");
 pub const transport = @import("transport.zig");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Lightning BOLT#8 encrypted transport (`Noise_XK_secp256k1_ChaChaPoly_SHA256`) — handshake plus transport with periodic key rotation.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .both, // both sides of Noise_XK (initiator/responder) + transport

@@ -57,6 +57,13 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Siemens S7 communication — ISO-on-TCP (RFC 1006) plus S7 protocol: connection setup, area read/write (DB/M/I/Q/T/C), PLC info and cyclic services",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     // The codecs, the client's PDU logic and the responder are pure
     // computation; only the optional TcpTransport touches std.Io.net.
     .targets = .{.linux64},

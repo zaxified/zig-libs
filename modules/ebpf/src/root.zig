@@ -71,6 +71,13 @@ const linux = std.os.linux;
 const BPF = linux.BPF;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "eBPF program generation over `std.os.linux.bpf` — bytecode builders (kprobe counter, XDP filter, ring-buffer emitter); real-kernel verifier acceptance unverified in CI",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "**linux**",
     .targets = .{.linux64},
     .platform = .linux, // raw std.os.linux.BPF syscalls — a conscious ceiling
     .role = .util,

@@ -94,6 +94,13 @@ pub const der_writer = @import("der_writer.zig");
 const Builder = der_writer.Builder;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "RFC 6960 OCSP — build an OCSP request and cryptographically verify an OCSP response, for TLS OCSP-stapling.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure request-build + response-verify logic; no I/O, no wire framing

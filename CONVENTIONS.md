@@ -297,15 +297,21 @@ prose:
   Edit the field, run it, commit — the README follows. A guard that keeps two lists in
   sync is an admission that they should be one list; `check-catalog` stays as the
   tripwire, but the arrangement now has an authoritative source rather than a twin.
-- **What is NOT generated, and why.** The row's one-line description and its Platform
-  cell stay hand-written. Measured before deciding: the 230 blurbs are 30 KB of prose
-  that exists nowhere else — only 28 overlap the module's own `//!` comment and 221 of
-  230 differ from its README's opening paragraph, because an index entry and an opening
-  paragraph are not the same piece of writing. Moving that into `module_list` would drown
-  the one property the list has, which is that a taxonomy can be read at a glance. The
-  Platform cell reads `any (packer: linux)` / `amd64 asm + portable fallback` — prose
-  carrying nuance the `meta.platform` enum does not have. **Prose stays where a human
-  writes it; facts live on the catalog entry and every view of them is rendered.**
+- **The whole catalog is generated, prose included.** Each row's description and Platform
+  cell come from the module's own `meta.doc` / `meta.platform_note`; the section comes
+  from `.libs`, the Deps cell from `.deps`. `README.md` holds no catalog fact of its own.
+- **Where each thing lives, and why those two places differ.** Prose lives with the
+  module because it goes stale when the code changes — which is the moment someone is
+  looking at it. The taxonomy lives in `module_list` because a misfiling is only visible
+  next to its neighbours; that is not hypothetical, `testkit` sat under *Networking* for
+  months while the grouping was README prose nothing checked. Putting the 30 KB of blurbs
+  in `module_list` instead would drown the one property that list has: a taxonomy has to
+  be readable at a glance.
+- **Rows are alphabetical**, so ordering is not a third hand-maintained fact.
+- **A module appears in every library it is tagged with** — once in its own section, and
+  again under *Also worth reaching for from …* in each other, with its home in brackets.
+  That is what the many-to-many tag is for: a consumer browsing `net` sees `x509` there,
+  with its description, rather than a cross-reference to follow.
 
 **Why here and not in `meta`.** This is a hand-written note about where a module
 *belongs*, not a property of its code, and a taxonomy is reviewed as a **list**: you only
@@ -328,7 +334,8 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 | meta tags (platform/role/concurrency/model_after/deps) | `pub const meta` in `src/root.zig` | README shows a derived view; SPEC does not restate |
 | which **library** a module belongs to | `.libs` on the `module_list` entry in `build.zig` | README's *Libraries* table and the catalog section a row is printed under are both **generated** from it — `zig build gen-libs-table` + `zig build gen-catalog` |
 | a module's sibling deps | `.deps` on the `module_list` entry in `build.zig` | the README catalog row's Deps cell is **generated** from it (`gen-catalog`); `meta.deps` in `root.zig` is a second hand-written copy that `check-catalog` holds to agreement (see below) |
-| one-line module purpose | root `README.md` catalog table | — |
+| one-line module purpose | `meta.doc` in the module's `src/root.zig` | the root `README.md` catalog table is **generated** from it (`zig build gen-catalog`) |
+| the catalog's Platform cell | `meta.platform_note` in the module's `src/root.zig` | same — generated |
 | paragraph purpose + API + import + verify steps | `modules/<m>/README.md` | — |
 | design & invariants, threat-model, verification detail, per-module backlog | `modules/<m>/SPEC.md` | — |
 | license attribution / provenance | `NOTICE` | README/SPEC only point to it, never restate the terms |
@@ -396,6 +403,11 @@ reference, not a re-explanation of everything the README already covers.
 2. Add `.{ .name = "<name>", .libs = &.{ "<lib>" }, .deps = &.{ "dep1", ... } }` to
    `module_list` in `build.zig`. `.libs` has no default, so this is a decision, not a
    box to leave empty — see §4.1.
+2b. Fill in `meta.doc` (the catalog's one-line entry) and `meta.platform_note` (its
+   Platform cell) in `src/root.zig`. `_template` ships both **empty on purpose** — a
+   skeleton must not pass off a plausible placeholder as a catalog entry — and
+   `check-catalog` rejects an empty one, so forgetting is loud rather than silent. The
+   README catalog row is rendered from these; never write it by hand.
 3. **Multi-file modules:** add every new submodule to `root.zig`'s `test { _ = …; }`
    aggregator — a bare `pub const x = @import("x.zig")` re-export does **not** pull `x`'s
    tests into the test binary (the dark-tests rule; it hid 92 never-run tests before it

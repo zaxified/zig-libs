@@ -56,6 +56,13 @@ const Allocator = std.mem.Allocator;
 const bitcointx = @import("bitcointx");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "BIP174 Partially Signed Bitcoin Transaction (PSBT) v0 — binary (de)serialization plus the Combiner (merge) role, over `bitcointx`.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec,

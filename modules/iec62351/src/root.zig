@@ -76,6 +76,13 @@ pub const SvReplayGuard = replay.SvGuard;
 pub const TlsProfile = tlsprofile.Profile;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "IEC 62351 power-systems security — GOOSE/SV authentication (62351-6) over caller-supplied PDU bytes, MMS application authentication (62351-4), checkable TLS policy",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure verification/policy logic over caller-supplied bytes; no I/O, no wire framing of its own

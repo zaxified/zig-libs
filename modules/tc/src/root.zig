@@ -83,6 +83,13 @@ const netlink = @import("netlink");
 pub const codec = netlink.codec;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Traffic control over rtnetlink — qdiscs (netem/htb/tbf/fq_codel/cake), htb classes, u32/flower filters + action families; byte-exact to iproute2 (retires `tc` shell-outs)",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "**linux**",
     .targets = .{.linux64},
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,

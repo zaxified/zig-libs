@@ -36,6 +36,13 @@ const netsim = @import("netsim");
 const sphinx = @import("sphinx");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Loopix mixnet (Piotrowska et al. — Nym's design) — Poisson mix + cover traffic over `sphinx`, model-checked in netsim against a global-passive-adversary anonymity invariant",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any, // pure discrete-event simulation, no OS/network I/O
     .role = .util,

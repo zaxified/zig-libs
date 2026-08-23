@@ -46,6 +46,13 @@ pub const reply = @import("reply.zig");
 pub const client = @import("client.zig");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "NETCONF client (RFC 6241) over SSH — RFC 6242 framing, hello/capability exchange, get/get-config/edit-config/commit RPCs with typed replies",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .client,

@@ -91,6 +91,13 @@ const std = @import("std");
 const rsa = @import("rsa");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "RSA Blind Signatures (RFC 9474, RSABSSA) over `rsa` — the anonymous-token / Privacy Pass primitive: blind, sign, finalize, verify.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .both, // both a .client role (blind/finalize) and a .server role (blindSign) live in one module — CONVENTIONS.md's split rule only forces separate modules when they are separate DELIVERABLES, which RSABSSA's tight client/server coupling (shared Context/salt/hash conventions) argues against

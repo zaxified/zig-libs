@@ -74,6 +74,13 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "WebAuthn / FIDO2 Relying-Party **verifier** (W3C Level 3) — assertion + registration ceremony checks, plus attestation verification. Verification only.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure verification logic — no I/O, no wire framing of its own

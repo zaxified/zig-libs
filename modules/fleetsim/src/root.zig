@@ -54,6 +54,13 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "In-process simulated device fleet — hosts protocol responders (Modbus, DNP3, IEC 104, S7comm, BACnet, EtherNet/IP, OPC UA) as nodes on one deterministic scheduler",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any, // the core is pure; only `tcp.zig` needs a POSIX socket
     .role = .server, // it answers masters

@@ -31,6 +31,13 @@
 const std = @import("std");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "QR Code encoder and decoder (ISO/IEC 18004 model 2) — versions 1–40, levels L/M/Q/H, numeric/alphanumeric/byte modes, Reed-Solomon error correction, structured append; SVG and terminal renderers, allocation-free.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{ .linux64, .wasm32 },
     .platform = .any,
     .role = .codec, // pure computation: no allocator, no I/O, no syscalls

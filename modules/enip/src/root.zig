@@ -61,6 +61,13 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "EtherNet/IP + CIP — encapsulation layer (register/SendRRData/SendUnitData), CIP messaging, connection manager, tag/symbolic path client for Logix controllers",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     // The codecs, the client's logic and the adapter are pure computation;
     // only the optional TcpTransport/UdpDiscovery adapters touch std.Io.net.
     .targets = .{.linux64},

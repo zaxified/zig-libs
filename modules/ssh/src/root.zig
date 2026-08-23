@@ -50,6 +50,13 @@ pub const userauth = @import("userauth.zig");
 pub const connection = @import("connection.zig");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "SSH-2.0 (RFC 4253) **client + server** — KEX incl. ML-KEM-768 hybrid, userauth (publickey/password) + channels (exec/subsystem); vs OpenSSH-validated. **Linux-only**",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "linux",
     // `transport.zig`/`server.zig` `fillRandom` is a raw `getrandom(2)` loop
     // that `@compileError`s on any non-Linux target, and it is on the core
     // Binary-Packet-Protocol write path — so the whole module is Linux-only,

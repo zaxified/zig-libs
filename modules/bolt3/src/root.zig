@@ -33,6 +33,13 @@ const Scalar = scalar.Scalar;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Lightning BOLT#3 key derivation — per-commitment blinded keys, split-secret revocation keys, shachain secret generation.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     // Had no `.targets`/`.platform` at all before this line -- pure
     // secp256k1 scalar/point arithmetic + SHA-256, no I/O, no syscalls, so
     // the collection's baseline is the only real claim (CONVENTIONS.md §4).

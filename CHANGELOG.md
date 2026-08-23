@@ -24,7 +24,21 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
-- **Tooling:** `zig build gen-catalog` renders the parts of the README module
+- **Tooling:** the README module catalog is now **generated in full** —
+  `zig build gen-catalog`, gated by `check-catalog-table`. Each row's
+  description and Platform cell come from the module's own `meta.doc` /
+  `meta.platform_note`, its section from `module_list`'s `.libs`, its Deps cell
+  from `.deps`; `README.md` holds no catalog fact of its own. The 230 blurbs
+  moved out of the table into the modules verbatim — verified by regenerating
+  and comparing: all 230 rows came back with identical content, so the move was
+  a relocation and not a rewrite. Rows are alphabetical, so ordering stops being
+  a third hand-maintained fact, and a module now appears in **every** library it
+  is tagged with (its home in brackets in the others), which is what the
+  many-to-many tag was for. Prose lives with the module because it goes stale
+  when the code changes; the taxonomy lives in `module_list` because a misfiling
+  is only visible next to its neighbours.
+
+- **Tooling (superseded the same day by the above):** `zig build gen-catalog` first rendered only the parts of the README module
   catalog that are views of `module_list` rather than prose — a row's section
   placement from `.libs[0]`, its Deps cell from `.deps`. Both were previously
   only *guarded* against drift, which keeps two lists in sync instead of making

@@ -24,6 +24,13 @@ const builtin = @import("builtin");
 const argsafe = @import("argsafe");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{ .linux64, .windows },
     .platform = .any, // full behavior on POSIX; Windows compiles (reap-race is POSIX-only)
     .role = .util,

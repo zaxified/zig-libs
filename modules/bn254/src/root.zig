@@ -88,6 +88,13 @@ pub const groth16Verify = groth16.verify;
 pub const Groth16Error = groth16.Groth16Error;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "BN254 / alt-bn128 curve — field tower/groups, optimal-ate pairing, EIP-196/197 EVM precompiles, and a Groth16 zkSNARK **verifier**.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing

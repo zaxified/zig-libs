@@ -71,6 +71,13 @@ pub const G2 = g2;
 pub const Gt = pairing.Gt;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "BLS12-381 pairing-friendly curve — field tower/groups, optimal-ate pairing, hash-to-curve, BLS signatures, KZG commitments, threshold BLS.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing beyond point (de)serialization

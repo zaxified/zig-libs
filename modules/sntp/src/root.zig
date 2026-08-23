@@ -21,6 +21,13 @@ const builtin = @import("builtin");
 const net = std.Io.net;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "SNTP client (RFC 4330) — NTP packet codec + UDP query, clock offset / round-trip delay",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{ .linux64, .linux32 },
     .platform = .any,
     .role = .client,

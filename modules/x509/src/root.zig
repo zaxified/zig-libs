@@ -183,6 +183,13 @@ pub const Spki = safe.Spki;
 pub const SpkiError = safe.SpkiError;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "X.509 certificate-chain / path validation (RFC 5280 §6) — trust-store chain building, extension, name, and signature checks, including post-quantum ML-DSA (RFC 9881) and SLH-DSA (RFC 9882) certificates.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure verification logic; no I/O, no wire framing of its own

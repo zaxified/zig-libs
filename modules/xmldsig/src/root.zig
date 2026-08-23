@@ -47,6 +47,13 @@ const p256 = @import("p256");
 pub const c14n = @import("c14n.zig");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "XML Canonicalization (C14N) + XML-Signature **verification only** — RSA/ECDSA, algorithm allow-list (XSLT/XPath rejected); KeyInfo cert is untrusted, caller must pin trust",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure verification logic over a parsed tree — no I/O, no wire framing

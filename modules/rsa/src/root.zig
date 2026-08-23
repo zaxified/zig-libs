@@ -89,6 +89,13 @@ const montint = @import("montint");
 pub const openssh = @import("openssh.zig");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     // NOTE: CONVENTIONS.md's `meta` tag vocabulary (platform/role/concurrency/
     // model_after/deps) has no dedicated "status" tag; module maturity lives
     // in each SPEC.md's closing "Status" line instead, using the catalog's

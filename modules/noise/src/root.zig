@@ -30,6 +30,13 @@ const std = @import("std");
 const chachapoly = @import("chachapoly");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Generic Noise Protocol Framework (spec rev 34) — handshake patterns (NN/NK/XX/IK) over a comptime-parameterized DH/AEAD/hash suite.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util,

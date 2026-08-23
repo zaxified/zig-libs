@@ -26,6 +26,13 @@
 const std = @import("std");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Lock-free concurrency primitives for shared-memory worker pools — Michael & Scott MPMC queue + Fraser/crossbeam epoch-based reclamation, under a strict seq_cst discipline",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     // std.Thread + std.atomic are cross-OS (kv/resilience use them the same
     // way); the module logic is portable. The optional off-tree sanitizer
     // lane discussed in SPEC is x86_64-linux, but that is a build-lane detail,

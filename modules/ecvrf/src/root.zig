@@ -56,6 +56,13 @@
 const std = @import("std");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "ECVRF-EDWARDS25519-SHA512-TAI (RFC 9381 Verifiable Random Function) — prove/verify a deterministic, unbiasable output under a public key.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation over caller-supplied keys/bytes — no owned socket/transport

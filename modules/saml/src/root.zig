@@ -128,6 +128,13 @@ const datefmt = @import("datefmt");
 const P256PublicKey = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "SAML 2.0 SSO **service-provider** — XSW-hardened Response verification against an IdP key, AuthnRequest builder, IdP-metadata parser; decrypts `EncryptedAssertion` via `xmlenc`",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec, // consumes an untrusted wire document into a trusted result

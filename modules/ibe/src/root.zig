@@ -101,6 +101,13 @@ pub const decrypt = ibe_mod.decrypt;
 pub const bls12_381 = @import("bls12_381");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Standalone Boneh-Franklin Identity-Based Encryption over `bls12_381` — a self-run PKG extracts per-identity keys. Not post-quantum; key escrow is inherent.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any, // pure computation; the one entropy source (setup's Fr.random / ciphersuite.randomSigma) takes a portable std.Io, no raw getrandom(2)
     .role = .util, // no I/O, no wire framing beyond the fixed Ciphertext codec

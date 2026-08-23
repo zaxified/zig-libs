@@ -254,6 +254,7 @@ harness_smoke() {
     step "check-portable" zig build check-portable
     step "check-portable-table" zig build check-portable-table
     step "check-libs-table" zig build check-libs-table
+    step "check-catalog-table" zig build check-catalog-table
     # The class no other gate can see: Zig analyses a function body only when
     # something references it, so a `pub fn` no test reaches can be outright
     # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626
@@ -1096,6 +1097,7 @@ cmd_changed() {
     step "check-portable" zig build check-portable
     step "check-portable-table" zig build check-portable-table
     step "check-libs-table" zig build check-libs-table
+    step "check-catalog-table" zig build check-catalog-table
     # The class no other gate can see: Zig analyses a function body only when
     # something references it, so a `pub fn` no test reaches can be outright
     # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626
@@ -1208,6 +1210,7 @@ cmd_all() {
     step "check-portable" zig build check-portable
     step "check-portable-table" zig build check-portable-table
     step "check-libs-table" zig build check-libs-table
+    step "check-catalog-table" zig build check-catalog-table
     # The class no other gate can see: Zig analyses a function body only when
     # something references it, so a `pub fn` no test reaches can be outright
     # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626

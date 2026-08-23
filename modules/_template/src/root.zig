@@ -19,6 +19,15 @@
 const std = @import("std");
 
 pub const meta = .{
+    // The module catalog's one-line entry -- README.md's table is rendered
+    // from this by `zig build gen-catalog`. EMPTY HERE ON PURPOSE: a copied
+    // template must not ship a plausible-looking wrong answer, and
+    // `check-catalog` rejects an empty one, so forgetting is loud.
+    .doc = "",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Empty here for the same reason as `doc`.
+    .platform_note = "",
     // `.linux64` is mandatory (the collection's baseline -- proven by the
     // default test suite, not cross-compiled). Add `.linux32`/`.windows`/
     // `.wasm32` only once `zig build portable-<name>-<target>` actually

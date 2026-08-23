@@ -348,6 +348,13 @@ pub const KeyExchange = connection.KeyExchange;
 pub const Entropy = connection.Entropy;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "DTLS 1.3 (RFC 9147), PSK mode — key schedule, AEAD record layer, handshake fragmentation/reassembly, anti-replay window.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .both, // client (Connection.clientInit) and server (Connection.serverInit)

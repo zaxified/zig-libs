@@ -122,6 +122,13 @@ pub const sealAuthPsk = schedule.sealAuthPsk;
 pub const openAuthPsk = schedule.openAuthPsk;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "HPKE — Hybrid Public Key Encryption (RFC 9180): DHKEM(X25519/P-256) encap/decap, all four key-schedule modes, AEAD seal/open + export.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     // Pure computation over caller-supplied bytes/keys — no owned socket,

@@ -51,6 +51,13 @@ const Allocator = std.mem.Allocator;
 const kv = @import("kv");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Durable background-job queue over `kv` — lease/retry/dead-letter queue, per-partition FIFO under priority.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "posix",
     // The OS-default wall/monotonic clocks use posix `clock_gettime`; both
     // are injectable, everything else is pure logic + the `kv` store.
     .targets = .{.linux64},

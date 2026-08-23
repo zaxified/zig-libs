@@ -79,6 +79,13 @@
 const std = @import("std");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Two-server Private Information Retrieval over `fss`'s DPF — fetch a record without either server learning the index. **Two colluding servers recover it immediately.**",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any, // pure computation — no threads / OS / libc / entropy source
     .role = .codec, // query/answer/reconstruct + byte codecs; no I/O of any kind

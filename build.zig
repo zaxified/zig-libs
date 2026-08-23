@@ -866,10 +866,16 @@ pub fn build(b: *std.Build) void {
     // generated (see CatalogSectionsStep's doc comment for the measurement
     // that settled that), so this is a formatter for arrangement, not a
     // renderer for content.
-    {
-        const st = b.allocator.create(CatalogSectionsStep) catch @panic("OOM");
-        st.* = .{ .step = std.Build.Step.init(.{ .id = .custom, .name = "gen-catalog", .owner = b, .makeFn = CatalogSectionsStep.make }) };
-        b.step("gen-catalog", "Regenerate README catalog rows from module_list: section placement from `.libs[0]`, the Deps cell from `.deps`").dependOn(&st.step);
+    inline for (.{
+        .{ false, "check-catalog-table", "Verify README.md's module catalog matches module_list + each module's meta.doc/meta.platform_note" },
+        .{ true, "gen-catalog", "Regenerate README.md's module catalog from module_list + each module's meta.doc/meta.platform_note" },
+    }) |cfg| {
+        const st = b.allocator.create(CatalogStep) catch @panic("OOM");
+        st.* = .{
+            .step = std.Build.Step.init(.{ .id = .custom, .name = cfg[1], .owner = b, .makeFn = CatalogStep.make }),
+            .write = cfg[0],
+        };
+        b.step(cfg[1], cfg[2]).dependOn(&st.step);
     }
 
     // `zig build check-testonly` — prove a test-only dep really is test-only.
@@ -1482,132 +1488,185 @@ fn renderLibsTable(b: *std.Build) []const u8 {
     return out.written();
 }
 
-/// Moves each catalog row under the section its `.libs[0]` names, preserving
-/// the row's own text verbatim and its order relative to its new neighbours.
+/// Renders the whole module catalog: for each library section, every module
+/// filed there, alphabetically, followed by the modules whose home is another
+/// library but which are tagged into this one.
 ///
-/// This is what makes `build.zig` the source of truth for the grouping rather
-/// than merely the place it is declared: `check-catalog` proves the README
-/// agrees, and this makes the README agree. Edit `.libs`, run this, commit.
+/// WHERE EACH CELL COMES FROM. The row is assembled from the sources that own
+/// its parts, never from the README:
 ///
-/// The row TEXT is deliberately not generated. Measured before deciding: the
-/// 230 catalog blurbs are 30 KB of prose that exists nowhere else -- only 28
-/// overlap the module's own `//!` doc comment and 221 of 230 differ from its
-/// README's opening paragraph, because an index entry and an opening paragraph
-/// are not the same piece of writing. Moving that into `module_list` would
-/// drown the one property the list has, which is that a taxonomy can be read
-/// at a glance. So: build.zig owns the arrangement, the README owns the prose.
-const CatalogSectionsStep = struct {
+///   Module    -- `module_list`'s `.name`
+///   What it does -- the module's own `meta.doc`
+///   Platform  -- the module's own `meta.platform_note`
+///   Deps      -- `module_list`'s `.deps`
+///   section   -- `module_list`'s `.libs`
+///
+/// Prose lives with the module because it goes stale when the code changes,
+/// which is when someone is looking at it; the taxonomy lives in `module_list`
+/// because a misfiling is only visible next to its neighbours (`testkit`, a
+/// test-only harness, sat under "Networking" for months while the grouping was
+/// README prose that nothing checked).
+///
+/// Alphabetical, so ordering is not a hidden hand-maintained fact of its own.
+///
+/// Two named steps share this `make`: `check-catalog-table` (verify) and
+/// `gen-catalog` (write), the same pairing `check-portable-table` established,
+/// so the gate and the fix cannot render differently.
+const CatalogStep = struct {
     step: std.Build.Step,
+    write: bool,
+
+    const Row = struct {
+        name: []const u8,
+        doc: []const u8,
+        platform_note: []const u8,
+        deps: []const []const u8,
+        home: ?[]const u8, // null = this section is its home
+    };
+
+    fn lessThan(_: void, a: Row, b_row: Row) bool {
+        return std.mem.lessThan(u8, a.name, b_row.name);
+    }
+
+    fn renderRow(b: *std.Build, w: *std.Io.Writer, r: Row) void {
+        const deps = if (r.deps.len == 0) "—" else std.mem.join(b.allocator, ", ", r.deps) catch @panic("OOM");
+        if (r.home) |h| {
+            w.print("| [`{s}`](modules/{s}/README.md) *({s})* | {s} | {s} | {s} |\n", .{ r.name, r.name, h, r.doc, r.platform_note, deps }) catch @panic("OOM");
+        } else {
+            w.print("| [`{s}`](modules/{s}/README.md) | {s} | {s} | {s} |\n", .{ r.name, r.name, r.doc, r.platform_note, deps }) catch @panic("OOM");
+        }
+    }
 
     fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
         _ = options;
+        const self: *CatalogStep = @fieldParentPtr("step", step);
         const b = step.owner;
         const io = b.graph.io;
-        const readme = b.build_root.handle.readFileAlloc(io, "README.md", b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
-            std.log.err("gen-catalog: cannot read README.md: {t}", .{err});
-            return step.fail("gen-catalog: cannot read README.md", .{});
-        };
+        const verb = if (self.write) "gen-catalog" else "check-catalog-table";
 
-        // Bucket every catalog row by the library its module_list entry names.
-        var buckets: [lib_sections.len]std.ArrayList([]const u8) = @splat(.empty);
-        var moved: usize = 0;
-        var lines: std.ArrayList([]const u8) = .empty;
-        var it = std.mem.splitScalar(u8, readme, '\n');
-        var current: ?usize = null;
-        while (it.next()) |line| {
-            for (lib_sections, 0..) |ls, i| {
-                if (std.mem.startsWith(u8, line, ls.heading)) current = i;
+        // Collect each module's prose from its OWN source, which is the point:
+        // a blurb that has drifted from the code is noticed while editing the
+        // code, not while scrolling a 230-row table in another file.
+        var docs = std.StringHashMap(struct { doc: []const u8, note: []const u8 }).init(b.allocator);
+        for (module_list) |m| {
+            const src = b.build_root.handle.readFileAlloc(io, b.fmt("modules/{s}/src/root.zig", .{m.name}), b.allocator, .limited(2 * 1024 * 1024)) catch |err| {
+                std.log.err("{s}: cannot read modules/{s}/src/root.zig: {t}", .{ verb, m.name, err });
+                return step.fail("{s}: cannot read a module root", .{verb});
+            };
+            const doc = metaStringField(src, ".doc = ") orelse {
+                std.log.err("{s}: modules/{s}/src/root.zig has no `meta.doc` -- the catalog entry lives there now", .{ verb, m.name });
+                return step.fail("{s}: missing meta.doc", .{verb});
+            };
+            const note = metaStringField(src, ".platform_note = ") orelse {
+                std.log.err("{s}: modules/{s}/src/root.zig has no `meta.platform_note`", .{ verb, m.name });
+                return step.fail("{s}: missing meta.platform_note", .{verb});
+            };
+            // `_template` ships both empty so a copied skeleton cannot pass off
+            // a plausible placeholder as a catalog entry. An empty cell would
+            // render as a blank table row, which reads like an oversight in the
+            // table rather than an unanswered question in the module.
+            if (doc.len == 0 or note.len == 0) {
+                std.log.err(
+                    "{s}: module '{s}' has an empty `meta.doc`/`meta.platform_note` -- fill them in (the skeleton leaves them blank on purpose)",
+                    .{ verb, m.name },
+                );
+                return step.fail("{s}: unfilled catalog entry", .{verb});
             }
-            if (std.mem.startsWith(u8, line, "### ") or std.mem.startsWith(u8, line, "## ")) {
-                var is_lib = false;
-                for (lib_sections) |ls| {
-                    if (std.mem.startsWith(u8, line, ls.heading)) is_lib = true;
-                }
-                if (!is_lib) current = null;
-            }
-            const owner: ?usize = if (current) |c| blk: {
-                const m = catalogRowModule(line) orelse break :blk null;
-                const entry = for (module_list) |e| {
-                    if (std.mem.eql(u8, e.name, m)) break e;
-                } else break :blk null;
-                const want = for (lib_sections, 0..) |ls, i| {
-                    if (std.mem.eql(u8, ls.lib, entry.libs[0])) break i;
-                } else break :blk null;
-                if (want != c) moved += 1;
-                break :blk want;
-            } else null;
-            if (owner) |o| {
-                buckets[o].append(b.allocator, renderDepsCell(b, line)) catch @panic("OOM");
-            } else {
-                lines.append(b.allocator, renderDepsCell(b, line)) catch @panic("OOM");
-            }
+            docs.put(m.name, .{ .doc = doc, .note = note }) catch @panic("OOM");
         }
 
-        // Re-emit: every section's rows go back directly under its table header.
+        const readme = b.build_root.handle.readFileAlloc(io, "README.md", b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
+            std.log.err("{s}: cannot read README.md: {t}", .{ verb, err });
+            return step.fail("{s}: cannot read README.md", .{verb});
+        };
+
         var out: std.Io.Writer.Allocating = .init(b.allocator);
         const w = &out.writer;
-        var sec: ?usize = null;
-        var header_rows: usize = 0;
-        for (lines.items, 0..) |line, idx| {
-            if (idx != 0) w.writeAll("\n") catch @panic("OOM");
+        var it = std.mem.splitScalar(u8, readme, '\n');
+        var skipping = false;
+        var first_line = true;
+        while (it.next()) |line| {
+            const is_heading = std.mem.startsWith(u8, line, "## ") or std.mem.startsWith(u8, line, "### ");
+            if (skipping and !is_heading) continue;
+            skipping = false;
+            if (!first_line) w.writeAll("\n") catch @panic("OOM");
+            first_line = false;
             w.writeAll(line) catch @panic("OOM");
-            for (lib_sections, 0..) |ls, i| {
-                if (std.mem.startsWith(u8, line, ls.heading)) {
-                    sec = i;
-                    header_rows = 0;
-                }
-            }
-            if (sec) |sc| {
-                if (std.mem.startsWith(u8, line, "|---")) {
-                    header_rows += 1;
-                    for (buckets[sc].items) |row| {
-                        w.writeAll("\n") catch @panic("OOM");
-                        w.writeAll(row) catch @panic("OOM");
+
+            for (lib_sections) |ls| {
+                if (!std.mem.startsWith(u8, line, ls.heading)) continue;
+                var primary: std.ArrayList(Row) = .empty;
+                var secondary: std.ArrayList(Row) = .empty;
+                for (module_list) |m| {
+                    const d = docs.get(m.name).?;
+                    if (std.mem.eql(u8, m.libs[0], ls.lib)) {
+                        primary.append(b.allocator, .{ .name = m.name, .doc = d.doc, .platform_note = d.note, .deps = m.deps, .home = null }) catch @panic("OOM");
+                        continue;
                     }
-                    sec = null;
+                    for (m.libs[1..]) |extra| {
+                        if (!std.mem.eql(u8, extra, ls.lib)) continue;
+                        secondary.append(b.allocator, .{ .name = m.name, .doc = d.doc, .platform_note = d.note, .deps = m.deps, .home = m.libs[0] }) catch @panic("OOM");
+                    }
                 }
+                std.mem.sort(Row, primary.items, {}, lessThan);
+                std.mem.sort(Row, secondary.items, {}, lessThan);
+
+                w.writeAll("\n\n| Module | What it does | Platform | Deps |\n|---|---|---|---|\n") catch @panic("OOM");
+                for (primary.items) |r| renderRow(b, w, r);
+                if (secondary.items.len > 0) {
+                    w.print(
+                        "\n**Also worth reaching for from `{s}`** — these are filed under another library (in brackets), and appear here because a consumer working in `{s}` has a use for them:\n\n| Module | What it does | Platform | Deps |\n|---|---|---|---|\n",
+                        .{ ls.lib, ls.lib },
+                    ) catch @panic("OOM");
+                    for (secondary.items) |r| renderRow(b, w, r);
+                }
+                skipping = true;
             }
         }
         const updated = out.written();
-        if (std.mem.eql(u8, updated, readme)) {
-            std.log.info("gen-catalog: README.md already matches module_list's `.libs`", .{});
+
+        if (self.write) {
+            if (std.mem.eql(u8, updated, readme)) {
+                std.log.info("gen-catalog: README.md already matches the sources", .{});
+                return;
+            }
+            b.build_root.handle.writeFile(io, .{ .sub_path = "README.md", .data = updated }) catch |err| {
+                std.log.err("gen-catalog: cannot write README.md: {t}", .{err});
+                return step.fail("gen-catalog: write failed", .{});
+            };
+            std.log.info("gen-catalog: README.md updated", .{});
             return;
         }
-        b.build_root.handle.writeFile(io, .{ .sub_path = "README.md", .data = updated }) catch |err| {
-            std.log.err("gen-catalog: cannot write README.md: {t}", .{err});
-            return step.fail("gen-catalog: write failed", .{});
-        };
-        std.log.info("gen-catalog: README.md updated ({d} row(s) moved)", .{moved});
+        if (!std.mem.eql(u8, updated, readme)) {
+            return step.fail(
+                "check-catalog-table: README.md's module catalog is STALE against module_list + the modules' `meta.doc`/`meta.platform_note` -- run `zig build gen-catalog` and commit the result",
+                .{},
+            );
+        }
     }
 };
 
-/// Rewrites a catalog row's LAST cell (Deps) from `module_list`, leaving every
-/// other cell untouched. Non-rows pass through.
-///
-/// `check-catalog` already proved this cell agrees with `module_list.deps`. A
-/// guard that keeps two lists in sync is an admission that they should be one
-/// list: the cell is a rendered VIEW of a field, so render it. Order follows
-/// the declaration, which is why running this against the tree it was written
-/// for changes nothing.
-///
-/// The Platform cell next to it is deliberately NOT generated. It reads
-/// "any (packer: linux)", "amd64 asm + portable fallback", "**linux** (codec
-/// itself: any)" -- prose carrying a nuance `meta.platform`'s enum does not
-/// have. Generating it would mean flattening the nuance, not capturing it.
-fn renderDepsCell(b: *std.Build, line: []const u8) []const u8 {
-    const name = catalogRowModule(line) orelse return line;
-    const entry = for (module_list) |e| {
-        if (std.mem.eql(u8, e.name, name)) break e;
-    } else return line;
-    const trimmed = std.mem.trimEnd(u8, line, " \t\r");
-    if (!std.mem.endsWith(u8, trimmed, "|")) return line;
-    const body = trimmed[0 .. trimmed.len - 1];
-    const last_pipe = std.mem.lastIndexOfScalar(u8, body, '|') orelse return line;
-    const rendered = if (entry.deps.len == 0)
-        "—"
-    else
-        std.mem.join(b.allocator, ", ", entry.deps) catch @panic("OOM");
-    return std.mem.concat(b.allocator, u8, &.{ body[0 .. last_pipe + 1], " ", rendered, " |" }) catch @panic("OOM");
+/// The string literal assigned to a `meta` field, e.g. `.doc = "..."`.
+/// Handles `\"` inside the literal; returns the UNESCAPED text, since that is
+/// what belongs in Markdown.
+fn metaStringField(src: []const u8, field: []const u8) ?[]const u8 {
+    const meta_at = std.mem.indexOf(u8, src, "pub const meta = .{") orelse return null;
+    const at = std.mem.indexOfPos(u8, src, meta_at, field) orelse return null;
+    var i = at + field.len;
+    if (i >= src.len or src[i] != '"') return null;
+    i += 1;
+    var out: std.ArrayList(u8) = .empty;
+    const gpa = std.heap.page_allocator;
+    while (i < src.len) : (i += 1) {
+        if (src[i] == '\\' and i + 1 < src.len) {
+            i += 1;
+            out.append(gpa, src[i]) catch @panic("OOM");
+            continue;
+        }
+        if (src[i] == '"') return out.toOwnedSlice(gpa) catch @panic("OOM");
+        out.append(gpa, src[i]) catch @panic("OOM");
+    }
+    return null;
 }
 
 /// The module named by a catalog row's first cell, or null if the line is not

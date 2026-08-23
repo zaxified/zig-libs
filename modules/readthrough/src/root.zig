@@ -67,6 +67,13 @@ const Allocator = std.mem.Allocator;
 const ramcache = @import("ramcache");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Backend-agnostic read-through cache coordinator — serve-from-cache or single-flight-coalesce a miss into one backend fetch, TTL + invalidation + negative caching",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any, // std.Io futex + std.Thread + std.atomic are all cross-OS
     .role = .util,

@@ -45,6 +45,13 @@ const mem = std.mem;
 const math = std.math;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "RIPEMD-160 (ISO/IEC 10118-3) streaming hash, plus `hash160` (`RIPEMD160(SHA256(x))`), the Bitcoin pubkey-hash primitive.",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any, // pure computation, no OS calls
     .role = .util,

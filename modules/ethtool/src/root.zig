@@ -84,6 +84,13 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Ethernet device control over the ethtool netlink family — link settings/state, ring/coalesce/pause/channel params, feature flags, per-queue/driver stats",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "**linux**",
     .targets = .{.linux64},
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,

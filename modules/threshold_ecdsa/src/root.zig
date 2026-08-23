@@ -114,6 +114,13 @@ pub const aux_proofs = @import("aux_proofs.zig");
 pub const gate = @import("gate.zig");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "GG20 threshold ECDSA over secp256k1 (t-of-n) — dealer keygen through online signing, producing standard verifiable ECDSA sigs. **Audit warranted before production use.**",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure computation (no I/O of its own)

@@ -90,6 +90,13 @@ const testkit = @import("testkit");
 const verboseSkip = testkit.verboseSkip;
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Wi-Fi control over nl80211 genetlink — interface/wiphy enumeration, scan trigger + BSS results, connect/disconnect, station/link stats, regulatory domain",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "**linux**",
     .targets = .{ .linux64, .linux32 },
     .platform = .linux, // AF_NETLINK raw syscalls — conscious ceiling
     .role = .client,

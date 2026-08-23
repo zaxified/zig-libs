@@ -101,6 +101,13 @@ const jobqueue = @import("jobqueue");
 const kvtree = @import("kvtree");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Crash-safe write-behind cache coordinator — fast in-memory acks, async flush to a durable `Sink` via `workerpool`; WAL written before ack so a crash-recovered write survives",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     // `jobqueue`'s default wall/monotonic clocks use posix `clock_gettime`
     // (both injectable); everything else is portable.
     .targets = .{.linux64},

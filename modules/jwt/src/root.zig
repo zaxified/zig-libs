@@ -187,6 +187,13 @@ const http = @import("http");
 const router = @import("router");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA, alg-confusion-safe), JWKS-by-kid, OIDC discovery, plus a router Bearer middleware",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any, // pure logic over the Fetcher seam; HttpFetcher uses `http`
     .role = .both, // P6 = a `router` middleware guarding routes (server); P7 = an OAuth2/OIDC client building auth/token requests and accepting ID Tokens (relying party).

@@ -64,6 +64,13 @@ pub const client = @import("client.zig");
 pub const live_golden = @import("live_golden.zig");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "SMTP client (RFC 5321) — ESMTP EHLO negotiation, STARTTLS seam, AUTH PLAIN/LOGIN, pipelining, MIME message composition (RFC 5322/2045)",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .client,

@@ -40,6 +40,13 @@ const std = @import("std");
 const dns = @import("dns");
 
 pub const meta = .{
+    // The module catalog's one-line entry. This IS the source of truth:
+    // README.md's table is rendered from it by `zig build gen-catalog`.
+    .doc = "Resolver-side DNSSEC validation (RFC 4033/4034/4035 + NSEC3) — DNSKEY/RRSIG/DS parsing, signature verify (ECDSA/Ed25519/RSA), NSEC/NSEC3 denial-of-existence",
+    // The catalog's Platform cell. Prose, because it carries nuance the
+    // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
+    // portable fallback". Rendered by `gen-catalog` alongside `doc`.
+    .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util, // pure validation logic; no I/O, no socket of its own
