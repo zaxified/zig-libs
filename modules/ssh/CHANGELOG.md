@@ -5,9 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-08-22 — RFC 8308 extension negotiation, both roles. Fixes a real
+- **2026-08-22** — RFC 8308 extension negotiation, both roles. Fixes a real
   interoperability defect: a real OpenSSH client would not authenticate with an
-  RSA user key against this server at all.** BREAKING in one small place —
+  RSA user key against this server at all. BREAKING in one small place —
   `userauth.authenticatePassword` takes an options struct.
 
   The module implemented no `SSH_MSG_EXT_INFO`, so it never sent
@@ -78,7 +78,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   ignore `server-sig-algs` fails the second (`AuthenticationFailed`) and leaves
   the first green.
 
-- **2026-08-22 — BREAKING.** The four caller-supplied policy seams
+- **2026-08-22** — **BREAKING.** The four caller-supplied policy seams
   (`transport.HostKeyVerifier`, `userauth.AuthorizedKeyCheck`,
   `userauth.PasswordCheck`, `connection.CommandHandler`) were bare `*const fn` pointers.
   Writing a real client on top of them (`modules/ssh/example`) proved they hand a caller too
