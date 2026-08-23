@@ -18,7 +18,12 @@ caller-owned allocator (normally an arena): `Dataset → Dataset` (table/series 
 `Dataset → f64` (scalar reducers) — no hidden state, no I/O. Numeric conventions are exact and
 deliberate (decisions, not bugs): `xirr` is 200-iteration bisection over `[-0.99, 10]`, ACT/365.25
 day-count, tolerance `1e-2` (kept exactly as-is; `xirrPrecise` is an additive Newton-first sibling
-that falls back to the same bracket/bisection on non-convergence); `riskMetrics`' `var95`/`cvar95`
+that falls back to the same bracket/bisection on non-convergence). Both first check that NPV
+changes sign across the bracket and return `error.XirrNoRoot` when it does not — a bracket bound is
+indistinguishable from a real answer at the call site, and used to be returned as one. Both also
+take an `opening` mode selecting whether the first row's `value_col` is seeded as a starting
+position, which is what a series sliced to a date-range window needs; the default `.none` leaves an
+inception-to-date result bit-identical. `riskMetrics`' `var95`/`cvar95`
 are historical (empirical), not a parametric fit — the parametric fit lives in `parametricRisk`
 instead, at a caller-chosen `confidence` (95%/99%/…), where `cornishFisherCVaR` integrates the
 CF-adjusted quantile function (fixed-step trapezoidal quadrature) rather than a naive `φ(z_cf)/α`
@@ -55,6 +60,10 @@ VaR/CVaR and Sharpe/Sortino/Calmar/Ulcer, betaAlpha's cov/var/r² derivation, mo
 reproducible percentile output under the fixed seed, correlationMatrix's min_overlap gating,
 drawdownEpisodes' peak→trough→recovery state machine incl. still-underwater-at-series-end (null
 recovery), xirrPrecise's Newton result plus a forced-fallback case landing on the same answer,
+xirr's windowed behaviour on all three `opening` modes (including one fixture where the two seeding
+conventions give opposite signs, which is what pins the chosen double-count convention) and its
+no-root detection, a single test calling EVERY allocating public function on
+`std.testing.allocator` so scratch that is never released fails the suite,
 gaussianVaR/CVaR against textbook standard-normal values (with the CVaR≥VaR invariant),
 cornishFisherZ collapsing to the raw z-score at zero skew/kurtosis, skewness/excessKurtosis on a
 known symmetric fixture, cornishFisherVaR/CVaR widening the tail vs the Gaussian fit for a

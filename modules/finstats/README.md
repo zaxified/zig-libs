@@ -34,7 +34,19 @@ pinned by tests.
 - **`xirr`** — 200-iteration bisection on NPV = 0 over the bracket
   `[-0.99, 10]`, ACT/365.25 day-count, tolerance `1e-2`. External flows are
   negated (contribution = cash out of your pocket); the last row's `value_col`
-  is the terminal inflow.
+  is the terminal inflow. NPV is checked for a sign change across the bracket
+  first: no sign change means no rate of return lives inside it, and the
+  return is `error.XirrNoRoot` rather than whichever bound bisection walks to.
+  The bracket is deliberately not wider — a genuine +1000 % IRR exists on a
+  small position, so what is wanted is detection, not more room.
+- **`XirrSpec.opening`** — by default the series is assumed to start from
+  nothing (inception-to-date), so external flows plus the terminal value are
+  the whole cashflow list. A series sliced out of the middle of a portfolio's
+  life — a date-range window — opens with a position instead, and must say so
+  or that opening value appears from nowhere. Two readings, because which one
+  applies is invisible in the data: `.value_includes_flow` (the first row's
+  value is an end-of-period figure that already contains that row's flow) and
+  `.value_excludes_flow` (it is an opening figure taken before it).
 - **`annualize`** — CAGR `(1 + total_return)^(365.25/days) − 1`.
 - **`twrDaily`** — Modified-Dietz daily return `r = (v − prev − flow) / pe`,
   skipping rows with performance-eligible base `pe ≤ 1e-6`, with an optional
@@ -90,11 +102,12 @@ pinned by tests.
 ```zig
 const finstats = @import("finstats");
 
-const Error = finstats.Error; // error{ NoSuchColumn, OutOfMemory }
+const Error = finstats.Error;         // error{ NoSuchColumn, OutOfMemory }
+const XirrError = finstats.XirrError; // Error || error{ XirrNoRoot }
 
 // scalar reducers
-fn xirr(a, d: Dataset, spec: XirrSpec) !f64;
-fn xirrPrecise(a, d: Dataset, spec: XirrPreciseSpec) !f64;
+fn xirr(a, d: Dataset, spec: XirrSpec) XirrError!f64;
+fn xirrPrecise(a, d: Dataset, spec: XirrPreciseSpec) XirrError!f64;
 fn annualize(total_return: f64, days: f64) f64;
 fn quantileSorted(sorted: []const f64, q: f64) f64;
 fn quantile(a, xs: []const f64, q: f64) !f64;

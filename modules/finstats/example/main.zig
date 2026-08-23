@@ -61,19 +61,49 @@ pub fn main() !void {
     const gpa = gpa_state.allocator();
 
     // ── xirr: the money-weighted return a "your account" page shows ────
-    // NOTE: `xirr` (like `quantile`/`riskMetrics` below) allocates an
-    // internal scratch buffer from `a` and never frees it — there is no
-    // way for a caller using a plain `gpa` to reclaim that memory; only
-    // wrapping every call in a short-lived arena avoids the leak. Running
-    // this example under `DebugAllocator` reports it on every one of
-    // these three calls. Not something a consumer can work around from
-    // the public API — see this example's accompanying report.
+    // This example is what caught the scratch-buffer leak `xirr`,
+    // `xirrPrecise`, `quantile`, `riskMetrics` and `parametricRisk` all
+    // carried (fixed 2026-08-22): the module's own tests run on an arena,
+    // which bulk-frees regardless, so only a consumer on a plain
+    // `DebugAllocator` — this file — could see it. Left on `gpa` on
+    // purpose so it stays visible if it ever comes back.
     const rate = try finstats.xirr(gpa, flow_dataset, .{
         .date_col = "date",
         .flow_col = "flow",
         .value_col = "value",
     });
     std.debug.print("xirr: {d:.4}\n", .{rate});
+
+    // ── the same account, but only the last 9 months of it ─────────────
+    // A date-range selector ("1Y / YTD / All") hands the reducer a SLICE,
+    // and a slice that starts mid-life opens with a position rather than
+    // with nothing. Say so, or the opening 1150 is money that appeared
+    // from nowhere. `.value_includes_flow` is the right reading here
+    // because `value` is an end-of-day figure: whatever flowed in on the
+    // window's first day is already inside it.
+    const window = Dataset{ .columns = &flow_columns, .rows = flow_rows[1..] };
+    const windowed = try finstats.xirr(gpa, window, .{
+        .date_col = "date",
+        .flow_col = "flow",
+        .value_col = "value",
+        .opening = .value_includes_flow,
+    });
+    std.debug.print("xirr (last 9 months): {d:.4}\n", .{windowed});
+
+    // Forget the seed and there is no rate of return to find: the only
+    // cashflow left is the terminal +1300, and NPV is positive at every
+    // rate in the [-0.99, 10] bracket. That is an error, not a number —
+    // before 2026-08-23 it bisected its way to the bound and returned
+    // 10.0, which renders as a perfectly confident +1000 %.
+    if (finstats.xirr(gpa, window, .{
+        .date_col = "date",
+        .flow_col = "flow",
+        .value_col = "value",
+    })) |wrong| {
+        std.debug.print("unreachable: {d}\n", .{wrong});
+    } else |err| {
+        std.debug.print("xirr (window, unseeded): {t}\n", .{err});
+    }
 
     // ── risk metrics: a single row {ann_vol, downside, var95, cvar95,
     // mdd, ulcer, sharpe, sortino, calmar} ready to bind straight into a

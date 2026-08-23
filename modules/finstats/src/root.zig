@@ -26,6 +26,15 @@ pub const meta = .{
 
 pub const Error = error{ NoSuchColumn, OutOfMemory };
 
+/// `xirr` / `xirrPrecise` / `xirrNode` only. `XirrNoRoot` means NPV does not
+/// change sign anywhere across the `[-0.99, 10]` bracket, so the series has no
+/// internal rate of return inside it. Before 2026-08-23 those functions ran the
+/// bisection anyway and returned whichever bound it walked to — a bracket bound
+/// is indistinguishable from a real answer at the call site, so a windowed
+/// series with an unmodelled opening balance came back as a confident `10.0`
+/// (i.e. +1000 %). See `Opening` for the usual cause.
+pub const XirrError = Error || error{XirrNoRoot};
+
 // ── public API ──────────────────────────────────────────────────────────────
 
 fn mustIndex(d: Dataset, name: []const u8) Error!usize {
@@ -53,38 +62,116 @@ fn f64lt(_: void, a: f64, b: f64) bool {
 
 // ── xirr (bisection over external flows, ACT/365.25 — exact port) ────────────
 
+/// Whether the series starts from nothing, and — if it does not — whether the
+/// first row's `value_col` already contains the flow recorded on that same row.
+///
+/// The default `.none` is right for an inception-to-date series: the portfolio
+/// starts at ~0 and every unit in it arrived as a flow, so external flows plus
+/// the terminal value are the whole story. It is WRONG for a series sliced out
+/// of the middle of a portfolio's life — a date-range window — where the
+/// opening market value would otherwise appear out of nothing, NPV never
+/// crosses zero inside the bracket, and the result is `error.XirrNoRoot`.
+///
+/// Which of the two seeding variants applies is a property of the caller's
+/// data and is invisible in the output, so it has to be stated rather than
+/// guessed:
+pub const Opening = enum {
+    /// No opening position. The series begins at zero (inception-to-date).
+    none,
+    /// `value[0]` is an END-of-period figure that ALREADY includes row 0's own
+    /// flow — the usual shape when `value` is an end-of-day market value and
+    /// `flow` is that day's external contribution. Seeds `-value[0]` at
+    /// `date[0]` and SKIPS row 0's flow, which would otherwise be counted
+    /// twice: once inside the seed and once on its own.
+    value_includes_flow,
+    /// `value[0]` is an OPENING figure taken BEFORE row 0's flow. Seeds
+    /// `-value[0]` at `date[0]` and ALSO keeps row 0's flow.
+    value_excludes_flow,
+};
+
 pub const XirrSpec = struct {
     date_col: []const u8,
     /// External cash flow per row (positive = contribution). null/0 = no flow.
     flow_col: []const u8,
     /// Portfolio value column; the LAST row's value is the terminal flow.
     value_col: []const u8,
+    /// Seed the first row's value as the opening position. See `Opening`.
+    /// Default `.none` keeps an inception-to-date series bit-identical.
+    opening: Opening = .none,
 };
 
 const Cashflow = struct { t: i64, cf: f64 };
 
-/// Dated-flow internal rate of return. 200-iteration bisection on NPV=0 over
-/// [-0.99, 10], ACT/365.25, tolerance 1e-2 (exact port of poc `_xirr`).
-pub fn xirr(a: std.mem.Allocator, d: Dataset, spec: XirrSpec) Error!f64 {
-    if (d.rows.len == 0) return 0;
-    const di = try mustIndex(d, spec.date_col);
-    const fi = try mustIndex(d, spec.flow_col);
-    const vi = try mustIndex(d, spec.value_col);
+/// Resolved column positions, shared by `xirr` and `xirrPrecise`.
+const ColIdx = struct { date: usize, flow: usize, value: usize };
 
-    var cfs: std.ArrayList(Cashflow) = .empty;
-    defer cfs.deinit(a);
-    for (d.rows) |r| {
-        const fl = r[fi].asFloat() orelse 0;
+/// The cashflow list both `xirr` and `xirrPrecise` discount: an optional
+/// opening seed, every external flow, then the terminal value. Shared so the
+/// two cannot drift — they carried a byte-identical copy of this and therefore
+/// a byte-identical gap.
+fn buildCashflows(
+    a: std.mem.Allocator,
+    d: Dataset,
+    idx: ColIdx,
+    opening: Opening,
+    cfs: *std.ArrayList(Cashflow),
+) Error!void {
+    const first = d.rows[0];
+    if (opening != .none) {
+        try cfs.append(a, .{
+            .t = isoDays(first[idx.date].asText() orelse ""),
+            .cf = -(first[idx.value].asFloat() orelse 0),
+        });
+    }
+    for (d.rows, 0..) |r, i| {
+        // `.value_includes_flow` says row 0's flow is already inside the seed.
+        if (i == 0 and opening == .value_includes_flow) continue;
+        const fl = r[idx.flow].asFloat() orelse 0;
         if (@abs(fl) > 1e-6) {
-            try cfs.append(a, .{ .t = isoDays(r[di].asText() orelse ""), .cf = -fl });
+            try cfs.append(a, .{ .t = isoDays(r[idx.date].asText() orelse ""), .cf = -fl });
         }
     }
     const last = d.rows[d.rows.len - 1];
-    try cfs.append(a, .{ .t = isoDays(last[di].asText() orelse ""), .cf = last[vi].asFloat() orelse 0 });
+    try cfs.append(a, .{
+        .t = isoDays(last[idx.date].asText() orelse ""),
+        .cf = last[idx.value].asFloat() orelse 0,
+    });
+}
+
+/// Does NPV change sign across `[lo, hi]`? If it does not, no amount of
+/// bisecting finds a root and the loop below just walks to a bound — which is
+/// what used to be returned as the answer. NaN compares false both ways and so
+/// reports "no root", which is the honest verdict for it too.
+fn bracketHasRoot(items: []const Cashflow, base: i64, lo: f64, hi: f64) bool {
+    const nv_lo = npv(items, base, lo);
+    const nv_hi = npv(items, base, hi);
+    if (nv_lo == 0 or nv_hi == 0) return true; // a bound IS the root
+    return (nv_lo < 0) != (nv_hi < 0);
+}
+
+/// Dated-flow internal rate of return. 200-iteration bisection on NPV=0 over
+/// [-0.99, 10], ACT/365.25, tolerance 1e-2 (exact port of poc `_xirr`).
+///
+/// Returns `error.XirrNoRoot` when NPV does not change sign across the bracket
+/// — most often a windowed series that needs `spec.opening` set. The bracket is
+/// deliberately not widened: a genuine +1000 % IRR exists on a small position,
+/// so what is wanted is detection, not more room.
+pub fn xirr(a: std.mem.Allocator, d: Dataset, spec: XirrSpec) XirrError!f64 {
+    if (d.rows.len == 0) return 0;
+    const idx: ColIdx = .{
+        .date = try mustIndex(d, spec.date_col),
+        .flow = try mustIndex(d, spec.flow_col),
+        .value = try mustIndex(d, spec.value_col),
+    };
+
+    var cfs: std.ArrayList(Cashflow) = .empty;
+    defer cfs.deinit(a);
+    try buildCashflows(a, d, idx, spec.opening, &cfs);
 
     const base = cfs.items[0].t;
     var lo: f64 = -0.99;
     var hi: f64 = 10.0;
+    if (!bracketHasRoot(cfs.items, base, lo, hi)) return error.XirrNoRoot;
     var mid: f64 = 0;
     var i: usize = 0;
     while (i < 200) : (i += 1) {
@@ -124,11 +211,21 @@ pub const XirrNodeSpec = struct {
     out: []const u8 = "xirr",
     /// Multiply the result (e.g. 100 → percent). Default 1 = fraction.
     scale: f64 = 1,
+    /// Seed the first row's value as the opening position. See `Opening`.
+    /// A pipeline step computing over a date-range WINDOW wants this set.
+    opening: Opening = .none,
 };
 
 /// `xirr` node: reduce the dated flow/value series to `{out: xirr·scale}`.
-pub fn xirrNode(a: std.mem.Allocator, d: Dataset, spec: XirrNodeSpec) Error!Dataset {
-    const v = try xirr(a, d, .{ .date_col = spec.date_col, .flow_col = spec.flow_col, .value_col = spec.value_col });
+/// Propagates `error.XirrNoRoot` rather than emitting a number — a widget
+/// showing "–" is the point; a bracket bound in a KPI card looks like data.
+pub fn xirrNode(a: std.mem.Allocator, d: Dataset, spec: XirrNodeSpec) XirrError!Dataset {
+    const v = try xirr(a, d, .{
+        .date_col = spec.date_col,
+        .flow_col = spec.flow_col,
+        .value_col = spec.value_col,
+        .opening = spec.opening,
+    });
     return oneRow(a, &.{.{ spec.out, v * spec.scale }});
 }
 
@@ -249,6 +346,7 @@ pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Da
     const bins = @max(spec.bins, 1);
     const span = if (hi > lo) hi - lo else 1;
     const counts = try a.alloc(u64, bins);
+    defer a.free(counts); // scratch: the returned rows hold copies
     @memset(counts, 0);
     for (d.rows) |r| {
         const v = r[vi].asFloat() orelse continue;
@@ -373,7 +471,9 @@ pub fn betaAlpha(a: std.mem.Allocator, d: Dataset, spec: BetaSpec) Error!Dataset
     const bi = try mustIndex(d, spec.bench_ret_col);
     const n = d.rows.len;
     const p = try a.alloc(f64, n);
+    defer a.free(p); // scratch
     const bm = try a.alloc(f64, n);
+    defer a.free(bm); // scratch
     for (d.rows, 0..) |r, i| {
         p[i] = r[pi].asFloat() orelse 0;
         bm[i] = r[bi].asFloat() orelse 0;
@@ -420,6 +520,11 @@ pub fn monteCarlo(a: std.mem.Allocator, spec: MonteCarloSpec) Error!Dataset {
     // cols[t] = the n path values at month t (t = 0..months)
     const cols_v = try a.alloc([]f64, months + 1);
     for (cols_v) |*c| c.* = try a.alloc(f64, n);
+    // Scratch: `months + 1` path buffers, the largest allocation in the module.
+    defer {
+        for (cols_v) |c| a.free(c);
+        a.free(cols_v);
+    }
     var prng = std.Random.DefaultPrng.init(spec.seed);
     const rnd = prng.random();
     for (0..n) |i| {
@@ -476,8 +581,20 @@ pub fn correlationMatrix(a: std.mem.Allocator, d: Dataset, spec: CorrSpec) Error
     const vi = try mustIndex(d, spec.value_col);
 
     var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(a);
     var maps: std.ArrayList(*std.StringHashMapUnmanaged(f64)) = .empty;
     var key_idx: std.StringArrayHashMapUnmanaged(usize) = .empty;
+    // All three, plus every per-key map, are scratch. The keys and the dates
+    // they index are slices of `d.rows`; the returned Dataset copies the
+    // numbers out, so nothing here outlives the call.
+    defer {
+        for (maps.items) |m| {
+            m.deinit(a);
+            a.destroy(m);
+        }
+        maps.deinit(a);
+        key_idx.deinit(a);
+    }
     for (d.rows) |r| {
         const key = r[ki].asText() orelse continue;
         const date = r[di].asText() orelse continue;
@@ -511,7 +628,9 @@ pub fn correlationMatrix(a: std.mem.Allocator, d: Dataset, spec: CorrSpec) Error
 
 fn pearson(a: std.mem.Allocator, xm: *std.StringHashMapUnmanaged(f64), ym: *std.StringHashMapUnmanaged(f64), min_overlap: usize) Value {
     var xs: std.ArrayList(f64) = .empty;
+    defer xs.deinit(a);
     var ys: std.ArrayList(f64) = .empty;
+    defer ys.deinit(a);
     var it = xm.iterator();
     while (it.next()) |e| {
         if (ym.get(e.key_ptr.*)) |v2| {
@@ -551,6 +670,9 @@ pub fn drawdownEpisodes(a: std.mem.Allocator, d: Dataset, spec: DdEpisodesSpec) 
     const vi = try mustIndex(d, spec.value_col);
     const Ep = struct { peak_d: []const u8, trough_d: []const u8, recovery: ?[]const u8, depth: f64, fall_d: i64, recover_d: ?i64 };
     var eps: std.ArrayList(Ep) = .empty;
+    // Scratch: every `[]const u8` in an `Ep` is borrowed from `d.rows`, so the
+    // returned Dataset does not point into this list and it must be released.
+    defer eps.deinit(a);
 
     var peak: f64 = -1e18;
     var peak_d: []const u8 = "";
@@ -629,6 +751,8 @@ pub const XirrPreciseSpec = struct {
     /// Newton iteration budget before falling back to bisection.
     max_newton_iter: usize = 50,
     initial_guess: f64 = 0.1,
+    /// Seed the first row's value as the opening position. See `Opening`.
+    opening: Opening = .none,
 };
 
 /// Dated-flow IRR via Newton-Raphson (fast, high precision) with an automatic
@@ -636,23 +760,24 @@ pub const XirrPreciseSpec = struct {
 /// whenever Newton fails to converge: derivative underflow, a step landing
 /// outside the bracket, a NaN, or exhausting `max_newton_iter` without
 /// meeting `tol`.
-pub fn xirrPrecise(a: std.mem.Allocator, d: Dataset, spec: XirrPreciseSpec) Error!f64 {
+pub fn xirrPrecise(a: std.mem.Allocator, d: Dataset, spec: XirrPreciseSpec) XirrError!f64 {
     if (d.rows.len == 0) return 0;
-    const di = try mustIndex(d, spec.date_col);
-    const fi = try mustIndex(d, spec.flow_col);
-    const vi = try mustIndex(d, spec.value_col);
+    const idx: ColIdx = .{
+        .date = try mustIndex(d, spec.date_col),
+        .flow = try mustIndex(d, spec.flow_col),
+        .value = try mustIndex(d, spec.value_col),
+    };
 
     var cfs: std.ArrayList(Cashflow) = .empty;
     defer cfs.deinit(a);
-    for (d.rows) |r| {
-        const fl = r[fi].asFloat() orelse 0;
-        if (@abs(fl) > 1e-6) {
-            try cfs.append(a, .{ .t = isoDays(r[di].asText() orelse ""), .cf = -fl });
-        }
-    }
-    const last = d.rows[d.rows.len - 1];
-    try cfs.append(a, .{ .t = isoDays(last[di].asText() orelse ""), .cf = last[vi].asFloat() orelse 0 });
+    try buildCashflows(a, d, idx, spec.opening, &cfs);
     const base = cfs.items[0].t;
+
+    // Checked before Newton, not just before the fallback: Newton is confined
+    // to the same bracket (it bails on a step outside it), so "no sign change
+    // over [-0.99, 10]" means neither phase can succeed. Doing it here also
+    // keeps `xirrPrecise` and `xirr` agreeing on when there is no answer.
+    if (!bracketHasRoot(cfs.items, base, -0.99, 10.0)) return error.XirrNoRoot;
 
     newton: {
         var r: f64 = spec.initial_guess;
@@ -900,6 +1025,7 @@ pub fn trackingRisk(a: std.mem.Allocator, d: Dataset, spec: TrackingSpec) Error!
     const bi = try mustIndex(d, spec.bench_ret_col);
     const n = d.rows.len;
     const active = try a.alloc(f64, n);
+    defer a.free(active); // scratch
     for (d.rows, 0..) |r, i| {
         const p = r[pi].asFloat() orelse 0;
         const b = r[bi].asFloat() orelse 0;
@@ -940,6 +1066,7 @@ pub const OmegaSpec = struct {
 pub fn omegaRatioNode(a: std.mem.Allocator, d: Dataset, spec: OmegaSpec) Error!Dataset {
     const ri = try mustIndex(d, spec.ret_col);
     const xs = try a.alloc(f64, d.rows.len);
+    defer a.free(xs); // scratch
     for (d.rows, 0..) |r, i| xs[i] = r[ri].asFloat() orelse 0;
     return oneRow(a, &.{.{ spec.out, omegaRatio(xs, spec.threshold) }});
 }
@@ -969,6 +1096,7 @@ pub fn rollingApply(a: std.mem.Allocator, d: Dataset, spec: RollingSpec, comptim
     if (spec.date_col.len > 0) di = try mustIndex(d, spec.date_col);
     const n = d.rows.len;
     const vals = try a.alloc(f64, n);
+    defer a.free(vals); // scratch: `reducer` gets a window into it and returns a scalar
     for (d.rows, 0..) |r, i| vals[i] = r[vi].asFloat() orelse 0;
 
     var cols: []Column = undefined;
@@ -1127,48 +1255,114 @@ const Fix = struct {
     }
 };
 
-test "scratch allocations are released (std.testing.allocator, not an arena)" {
+test "scratch allocations are released — EVERY allocating public fn, on std.testing.allocator" {
     // ⭐ Every other test here runs on `Fix`, whose allocator is an
     // ArenaAllocator: it bulk-frees on `deinit`, so a function that never
-    // released its scratch looked identical to one that did. `xirr`,
-    // `xirrPrecise`, `quantile`, `riskMetrics` and `parametricRisk` all leaked
-    // under any other allocator, which is what a long-lived consumer uses.
-    // Found by writing `example/main.zig` against a DebugAllocator.
+    // released its scratch looked identical to one that did.
     //
-    // `std.testing.allocator` fails the test on an outstanding allocation, so
-    // this is the one test in the file that can see the class at all.
+    // The 2026-08-22 pass fixed the five functions `example/main.zig` happened
+    // to call and this test named exactly those five — which is why it stayed
+    // green while `correlationMatrix`, its `pearson` helper (once per MATRIX
+    // CELL) and `drawdownEpisodes` went on leaking. Naming the functions was
+    // the defect: the list is now every public fn that takes an allocator, so
+    // a new one cannot be added without either appearing here or leaving this
+    // test to be edited deliberately.
     const a = testing.allocator;
+    const freeDs = struct {
+        fn f(al: std.mem.Allocator, ds: Dataset) void {
+            for (ds.rows) |r| al.free(r);
+            al.free(ds.rows);
+            al.free(ds.columns);
+        }
+    }.f;
+
     const cols = [_]Column{
         .{ .name = "d", .type = .date },
         .{ .name = "flow", .type = .float },
         .{ .name = "v", .type = .float },
         .{ .name = "ret", .type = .float },
+        .{ .name = "bench", .type = .float },
+        .{ .name = "pe", .type = .float },
+        .{ .name = "cum", .type = .float },
     };
     const rows = [_][]const Value{
-        &.{ .{ .text = "2023-01-01" }, .{ .float = 100 }, .{ .float = 100 }, .{ .float = 0.01 } },
-        &.{ .{ .text = "2023-07-01" }, .{ .float = 0 }, .{ .float = 150 }, .{ .float = -0.02 } },
-        &.{ .{ .text = "2024-01-01" }, .{ .float = 0 }, .{ .float = 200 }, .{ .float = 0.03 } },
+        &.{ .{ .text = "2023-01-01" }, .{ .float = 100 }, .{ .float = 100 }, .{ .float = 0.01 }, .{ .float = 0.008 }, .{ .float = 100 }, .{ .float = 0.0 } },
+        // ⭐ The dip is load-bearing: with a monotonically rising `v` the
+        // `drawdownEpisodes` state machine never appends, so its scratch list
+        // never allocates and removing its `deinit` left this test GREEN. A
+        // call is not coverage until it makes the function allocate.
+        &.{ .{ .text = "2023-07-01" }, .{ .float = 0 }, .{ .float = 90 }, .{ .float = -0.02 }, .{ .float = -0.015 }, .{ .float = 100 }, .{ .float = 0.5 } },
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 0 }, .{ .float = 200 }, .{ .float = 0.03 }, .{ .float = 0.025 }, .{ .float = 150 }, .{ .float = 1.0 } },
     };
     const d: Dataset = .{ .columns = &cols, .rows = &rows };
 
+    // — scalar returns: nothing to free, so anything they allocate is scratch —
     _ = try xirr(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v" });
     _ = try xirrPrecise(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v" });
     _ = try quantile(a, &[_]f64{ 0.3, 0.1, 0.2 }, 0.5);
 
-    // The returned one-row Datasets are the caller's (`oneRow` allocates
-    // columns, the row and the row slice); freeing them here leaves only the
-    // scratch these functions allocate internally, which is the point.
-    const rm = try riskMetrics(a, d, .{ .ret_col = "ret" });
-    a.free(rm.rows[0]);
-    a.free(rm.rows);
-    a.free(rm.columns);
-    const pr = try parametricRisk(a, d, .{ .ret_col = "ret" });
-    a.free(pr.rows[0]);
-    a.free(pr.rows);
-    a.free(pr.columns);
+    // — Dataset returns: the Dataset is the caller's, so free exactly that and
+    //   whatever is still outstanding afterwards is the function's own scratch —
+    freeDs(a, try xirrNode(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v" }));
+    freeDs(a, try annualizeNode(a, d, .{ .value_col = "cum", .date_col = "d" }));
+    freeDs(a, try twrDaily(a, d, .{ .date_col = "d", .value_col = "v", .flow_col = "flow", .pe_col = "pe" }));
+    freeDs(a, try histogram(a, d, .{ .value_col = "v" }));
+    freeDs(a, try riskMetrics(a, d, .{ .ret_col = "ret" }));
+    freeDs(a, try betaAlpha(a, d, .{ .port_ret_col = "ret", .bench_ret_col = "bench", .port_ann = 0.1, .bench_ann = 0.08 }));
+    freeDs(a, try monteCarlo(a, .{ .start = 1000, .mu_ann = 0.07, .vol_ann = 0.15, .monthly = 100, .years = 1, .paths = 32 }));
+    freeDs(a, try drawdownEpisodes(a, d, .{ .date_col = "d", .value_col = "v" }));
+    freeDs(a, try parametricRisk(a, d, .{ .ret_col = "ret" }));
+    freeDs(a, try trackingRisk(a, d, .{ .port_ret_col = "ret", .bench_ret_col = "bench" }));
+    freeDs(a, try omegaRatioNode(a, d, .{ .ret_col = "ret" }));
+    freeDs(a, try rollingApply(a, d, .{ .value_col = "v", .window = 2 }, mean));
+    freeDs(a, try rollingMean(a, d, .{ .value_col = "v", .window = 2 }));
+    freeDs(a, try rollingVolatility(a, d, .{ .value_col = "v", .window = 2 }));
+    freeDs(a, try rollingSharpe(a, d, .{ .value_col = "v", .window = 2 }));
+
+    // `correlationMatrix` wants the long form, and it is the worst of the set:
+    // besides its own three scratch containers it allocates one hash map per
+    // key, and `pearson` allocated two lists for every off-diagonal cell.
+    const ccols = [_]Column{
+        .{ .name = "key", .type = .text },
+        .{ .name = "d", .type = .date },
+        .{ .name = "v", .type = .float },
+    };
+    const crows = [_][]const Value{
+        &.{ .{ .text = "A" }, .{ .text = "2024-01-01" }, .{ .float = 1.0 } },
+        &.{ .{ .text = "A" }, .{ .text = "2024-01-02" }, .{ .float = 2.0 } },
+        &.{ .{ .text = "A" }, .{ .text = "2024-01-03" }, .{ .float = 1.5 } },
+        &.{ .{ .text = "B" }, .{ .text = "2024-01-01" }, .{ .float = 2.0 } },
+        &.{ .{ .text = "B" }, .{ .text = "2024-01-02" }, .{ .float = 3.0 } },
+        &.{ .{ .text = "B" }, .{ .text = "2024-01-03" }, .{ .float = 2.5 } },
+    };
+    freeDs(a, try correlationMatrix(a, .{ .columns = &ccols, .rows = &crows }, .{
+        .key_col = "key",
+        .date_col = "d",
+        .value_col = "v",
+        .min_overlap = 2,
+    }));
+
+    const bcols = [_]Column{
+        .{ .name = "seg", .type = .text },
+        .{ .name = "wp", .type = .float },
+        .{ .name = "wb", .type = .float },
+        .{ .name = "rp", .type = .float },
+        .{ .name = "rb", .type = .float },
+    };
+    const brows = [_][]const Value{
+        &.{ .{ .text = "eq" }, .{ .float = 0.6 }, .{ .float = 0.5 }, .{ .float = 0.10 }, .{ .float = 0.08 } },
+        &.{ .{ .text = "bd" }, .{ .float = 0.4 }, .{ .float = 0.5 }, .{ .float = 0.03 }, .{ .float = 0.04 } },
+    };
+    freeDs(a, try brinsonAttribution(a, .{ .columns = &bcols, .rows = &brows }, .{
+        .segment_col = "seg",
+        .port_weight_col = "wp",
+        .bench_weight_col = "wb",
+        .port_return_col = "rp",
+        .bench_return_col = "rb",
+    }));
 }
 
-test "xirr: ~100% on a doubling over one year" {
+test "xirr: a mid-life window needs `opening`; without it there is no root, and no root is an ERROR" {
     var f = Fix.init();
     defer f.deinit();
     const cols = [_]Column{
@@ -1176,13 +1370,111 @@ test "xirr: ~100% on a doubling over one year" {
         .{ .name = "flow", .type = .float },
         .{ .name = "v", .type = .float },
     };
-    // invest 100 at t0; worth 200 exactly one year later → IRR ≈ 100%
+    // A series that starts mid-life: 1000 already in the position on day one,
+    // no flows at all, 1100 a year later. The money-weighted return is +10 %/y.
     const rows = [_][]const Value{
-        &.{ .{ .text = "2023-01-01" }, .{ .float = 100 }, .{ .float = 100 } },
-        &.{ .{ .text = "2024-01-01" }, .{ .float = 0 }, .{ .float = 200 } },
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 0 }, .{ .float = 1000 } },
+        &.{ .{ .text = "2025-01-01" }, .{ .float = 0 }, .{ .float = 1100 } },
     };
-    const r = try xirr(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .date_col = "d", .flow_col = "flow", .value_col = "v" });
-    try testing.expectApproxEqAbs(@as(f64, 1.0), r, 0.02);
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    const base_spec = XirrSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v" };
+
+    // Seeded: the opening 1000 is a cashflow, so NPV crosses zero at ~+10 %.
+    // (366 calendar days over a 365.25 year → 0.0998, not exactly 0.10.)
+    var seeded = base_spec;
+    seeded.opening = .value_includes_flow;
+    const r = try xirr(f.a(), d, seeded);
+    try testing.expectApproxEqAbs(@as(f64, 0.0998), r, 0.002);
+
+    // Unseeded: the only cashflow is the terminal +1100, so NPV is positive at
+    // every rate in the bracket. This used to bisect its way to `hi` and hand
+    // back 10.0 — a confident +1000 % — which is what reached a KPI card.
+    try testing.expectError(error.XirrNoRoot, xirr(f.a(), d, base_spec));
+    try testing.expectError(error.XirrNoRoot, xirrPrecise(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+    }));
+    // The node propagates it instead of emitting a number.
+    try testing.expectError(error.XirrNoRoot, xirrNode(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+    }));
+}
+
+test "xirr: the two `opening` conventions differ when row 0 carries a flow (pins which one skips it)" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "flow", .type = .float },
+        .{ .name = "v", .type = .float },
+    };
+    // Row 0 has BOTH a 1000 value and a 1000 flow. Whether those are the same
+    // 1000 is invisible in the data, which is the whole reason `Opening` is an
+    // enum rather than a bool: the two readings give wildly different answers.
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 1000 }, .{ .float = 1000 } },
+        &.{ .{ .text = "2025-01-01" }, .{ .float = 0 }, .{ .float = 1100 } },
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+
+    // `value[0]` is end-of-day and already contains the flow → count it once.
+    // 1000 in, 1100 out → the same ~+10 % as the flow-free fixture above.
+    const inc = try xirr(f.a(), d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .value_includes_flow });
+    try testing.expectApproxEqAbs(@as(f64, 0.0998), inc, 0.002);
+
+    // `value[0]` is the opening figure taken BEFORE the flow → 2000 went in for
+    // an 1100 exit. Sign-flipped and nowhere near the other reading.
+    const exc = try xirr(f.a(), d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .value_excludes_flow });
+    try testing.expectApproxEqAbs(@as(f64, -0.449), exc, 0.003);
+    try testing.expect(inc > 0 and exc < 0);
+}
+
+test "xirr: lifetime is untouched, and the same fixture windowed lands on the window's time-weighted return" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "flow", .type = .float },
+        .{ .name = "v", .type = .float },
+    };
+    // Inception-to-date: 1000 in at the start, 500 more a year later, worth
+    // 2100 after two years. `v` is end-of-day, so the 1700 on 2023-01-01
+    // already contains that day's 500 contribution.
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2022-01-01" }, .{ .float = 1000 }, .{ .float = 1000 } },
+        &.{ .{ .text = "2022-07-01" }, .{ .float = 0 }, .{ .float = 1100 } },
+        &.{ .{ .text = "2023-01-01" }, .{ .float = 500 }, .{ .float = 1700 } },
+        &.{ .{ .text = "2023-07-01" }, .{ .float = 0 }, .{ .float = 1900 } },
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 0 }, .{ .float = 2100 } },
+    };
+    const spec = XirrSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v" };
+
+    // Lifetime, default `.none` — the pre-existing path, unchanged.
+    const lifetime = try xirr(f.a(), .{ .columns = &cols, .rows = &rows }, spec);
+    try testing.expect(lifetime > 0.15 and lifetime < 0.30);
+
+    // The last three rows are the "1 year" window. No flows occur inside it
+    // after the seed, so its time-weighted return is exactly 2100/1700 − 1 and
+    // the money-weighted return must agree with it — an oracle, not a range.
+    var windowed_spec = spec;
+    windowed_spec.opening = .value_includes_flow;
+    const windowed = try xirr(f.a(), .{ .columns = &cols, .rows = rows[2..] }, windowed_spec);
+    const twr = 2100.0 / 1700.0 - 1.0; // +23.53 % over 365 days
+    try testing.expectApproxEqAbs(twr, windowed, 0.002);
+
+    // …and the same window WITHOUT the seed shows why `opening` is the fix and
+    // `XirrNoRoot` is only a backstop. ⭐ Here the window's first row happens to
+    // carry a 500 flow, so the un-seeded cashflows are [−500, +2100] — that DOES
+    // bracket a root, and bisection converges on it happily. The answer is the
+    // IRR of a different question (500 in, 2100 out) and comes back finite,
+    // plausibly shaped and more than an order of magnitude wrong. No guard
+    // catches this one: only seeding the opening balance does.
+    const unseeded = try xirr(f.a(), .{ .columns = &cols, .rows = rows[2..] }, spec);
+    try testing.expectApproxEqAbs(@as(f64, 3.204), unseeded, 0.01); // +320 % vs the true +23.5 %
+    try testing.expect(unseeded > 10 * windowed);
 }
 
 test "annualize CAGR" {
