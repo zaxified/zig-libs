@@ -58,7 +58,6 @@ const Module = struct {
     /// No default: a new module has to be filed, and copying `_template`
     /// leaves a wrong answer rather than no answer, which the gate catches.
     libs: []const []const u8,
-    example: bool = false,
     /// Compute-bound: the tests are dominated by arithmetic (pairings,
     /// hash-based signatures, FHE, scrypt, RSA), which an unoptimized Debug
     /// build makes ~5x slower — `bls12_381` alone goes 35s -> 182s. These
@@ -87,7 +86,7 @@ const Module = struct {
 const module_list = [_]Module{
     // Test-only harness. Consumers reach it through `test_deps`, never `deps`.
     .{ .name = "testkit", .libs = &.{"os"} },
-    .{ .name = "netaddr", .libs = &.{ "net", "web" }, .example = true },
+    .{ .name = "netaddr", .libs = &.{ "net", "web" } },
     // `workerpool` is a TEST-only dep: `h2_server.Options.dispatcher` is an
     // injectable seam (a function pointer + a context pointer), so the
     // published `http` module implements no pool at all — deliberately, since
@@ -96,14 +95,14 @@ const module_list = [_]Module{
     // wire a real `workerpool.WorkerPool` into that seam because the five
     // concurrency invariants can only be exercised by real threads.
     // `zig build check-testonly` proves the published module never needs it.
-    .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{"netaddr"}, .test_deps = &.{ "testkit", "workerpool" }, .example = true },
+    .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{"netaddr"}, .test_deps = &.{ "testkit", "workerpool" } },
     .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"} },
-    .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http" }, .example = true },
-    .{ .name = "ramcache", .libs = &.{ "storage", "net" }, .example = true },
-    .{ .name = "router", .libs = &.{"web"}, .deps = &.{"http"}, .example = true },
+    .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
+    .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http" } },
+    .{ .name = "ramcache", .libs = &.{ "storage", "net" } },
+    .{ .name = "router", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "ratelimit", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" } },
     .{ .name = "abuseguard", .libs = &.{"web"}, .deps = &.{ "http", "netaddr", "router" } },
     .{ .name = "throttle", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
@@ -111,8 +110,8 @@ const module_list = [_]Module{
     // strings, the hyphen is fine (cf. the community's "known-folders").
     .{ .name = "security-headers", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "cors", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
-    .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .example = true },
-    .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .example = true },
+    .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" } },
     .{ .name = "openapi", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "requestid", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
@@ -123,181 +122,181 @@ const module_list = [_]Module{
     .{ .name = "tracecontext", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
     .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
-    .{ .name = "resilience", .libs = &.{ "web", "net" }, .example = true },
-    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy" }, .example = true },
-    .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "resilience", .libs = &.{ "web", "net" } },
+    .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy" } },
+    .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"} },
-    .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "ethtool", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "devlink", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "decimal", .libs = &.{ "storage", "format" }, .example = true },
-    .{ .name = "seqmap", .libs = &.{"net"}, .example = true },
-    .{ .name = "icmp", .libs = &.{"net"}, .deps = &.{ "seqmap", "netaddr" }, .example = true },
-    .{ .name = "mcp", .libs = &.{"os"}, .example = true },
-    .{ .name = "mcp-http", .libs = &.{"os"}, .deps = &.{ "router", "http", "mcp" }, .example = true },
-    .{ .name = "coap", .libs = &.{"net"}, .example = true },
-    .{ .name = "kv", .libs = &.{"storage"}, .example = true },
-    .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{"kv"}, .example = true },
-    .{ .name = "blobmsg", .libs = &.{"format"}, .example = true },
-    .{ .name = "tar", .libs = &.{"format"}, .example = true },
-    .{ .name = "latency-stats", .libs = &.{"net"}, .example = true },
-    .{ .name = "pping", .libs = &.{"net"}, .example = true },
-    .{ .name = "spf-ect", .libs = &.{"net"}, .example = true },
-    .{ .name = "ethfrag", .libs = &.{"net"}, .example = true },
+    .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
+    .{ .name = "ethtool", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
+    .{ .name = "devlink", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
+    .{ .name = "decimal", .libs = &.{ "storage", "format" } },
+    .{ .name = "seqmap", .libs = &.{"net"} },
+    .{ .name = "icmp", .libs = &.{"net"}, .deps = &.{ "seqmap", "netaddr" } },
+    .{ .name = "mcp", .libs = &.{"os"} },
+    .{ .name = "mcp-http", .libs = &.{"os"}, .deps = &.{ "router", "http", "mcp" } },
+    .{ .name = "coap", .libs = &.{"net"} },
+    .{ .name = "kv", .libs = &.{"storage"} },
+    .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{"kv"} },
+    .{ .name = "blobmsg", .libs = &.{"format"} },
+    .{ .name = "tar", .libs = &.{"format"} },
+    .{ .name = "latency-stats", .libs = &.{"net"} },
+    .{ .name = "pping", .libs = &.{"net"} },
+    .{ .name = "spf-ect", .libs = &.{"net"} },
+    .{ .name = "ethfrag", .libs = &.{"net"} },
     .{ .name = "l2encap", .libs = &.{"net"} },
-    .{ .name = "l2forward", .libs = &.{"net"}, .example = true },
+    .{ .name = "l2forward", .libs = &.{"net"} },
     .{ .name = "pbb", .libs = &.{"net"} },
     .{ .name = "bumtree", .libs = &.{"net"}, .deps = &.{"spf-ect"} },
     .{ .name = "spbfib", .libs = &.{"net"}, .deps = &.{"isis-spf"} },
-    .{ .name = "isis", .libs = &.{"net"}, .example = true },
-    .{ .name = "isis-adj", .libs = &.{"net"}, .deps = &.{"isis"}, .example = true },
-    .{ .name = "isis-dis", .libs = &.{"net"}, .deps = &.{"isis"}, .example = true },
-    .{ .name = "isis-lsdb", .libs = &.{"net"}, .deps = &.{"isis"}, .example = true },
+    .{ .name = "isis", .libs = &.{"net"} },
+    .{ .name = "isis-adj", .libs = &.{"net"}, .deps = &.{"isis"} },
+    .{ .name = "isis-dis", .libs = &.{"net"}, .deps = &.{"isis"} },
+    .{ .name = "isis-lsdb", .libs = &.{"net"}, .deps = &.{"isis"} },
     .{ .name = "isis-flood", .libs = &.{"net"}, .deps = &.{ "isis", "isis-lsdb" } },
     .{ .name = "isis-spf", .libs = &.{"net"}, .deps = &.{ "isis", "isis-lsdb", "spf-ect" } },
-    .{ .name = "isis-sim", .libs = &.{"net"}, .deps = &.{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf" }, .example = true },
-    .{ .name = "aeadframe", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .example = true },
-    .{ .name = "tenantkex", .libs = &.{"crypto"}, .deps = &.{"noise"}, .example = true },
-    .{ .name = "netsim", .libs = &.{"net"}, .example = true },
-    .{ .name = "loopfree-reconv", .libs = &.{"net"}, .deps = &.{ "netsim", "spf-ect" }, .example = true },
-    .{ .name = "df-elect", .libs = &.{"net"}, .deps = &.{"netsim"}, .example = true },
-    .{ .name = "raft", .libs = &.{"net"}, .deps = &.{"netsim"}, .example = true },
-    .{ .name = "liveness-hyst", .libs = &.{"net"}, .deps = &.{ "netsim", "latency-stats" }, .example = true },
-    .{ .name = "loopix", .libs = &.{"net"}, .deps = &.{ "netsim", "sphinx" }, .example = true },
-    .{ .name = "lockfree", .libs = &.{"net"}, .example = true },
-    .{ .name = "workerpool", .libs = &.{"net"}, .deps = &.{"lockfree"}, .example = true },
-    .{ .name = "shardstore", .libs = &.{"net"}, .deps = &.{"kvtree"}, .example = true },
-    .{ .name = "writebehind", .libs = &.{"net"}, .deps = &.{ "ramcache", "workerpool", "jobqueue", "kvtree" }, .example = true },
-    .{ .name = "pagecache", .libs = &.{"net"}, .deps = &.{ "kvtree", "ramcache" }, .example = true },
-    .{ .name = "tsdb", .libs = &.{"storage"}, .deps = &.{"kvtree"}, .example = true },
+    .{ .name = "isis-sim", .libs = &.{"net"}, .deps = &.{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf" } },
+    .{ .name = "aeadframe", .libs = &.{"crypto"}, .deps = &.{"chachapoly"} },
+    .{ .name = "tenantkex", .libs = &.{"crypto"}, .deps = &.{"noise"} },
+    .{ .name = "netsim", .libs = &.{"net"} },
+    .{ .name = "loopfree-reconv", .libs = &.{"net"}, .deps = &.{ "netsim", "spf-ect" } },
+    .{ .name = "df-elect", .libs = &.{"net"}, .deps = &.{"netsim"} },
+    .{ .name = "raft", .libs = &.{"net"}, .deps = &.{"netsim"} },
+    .{ .name = "liveness-hyst", .libs = &.{"net"}, .deps = &.{ "netsim", "latency-stats" } },
+    .{ .name = "loopix", .libs = &.{"net"}, .deps = &.{ "netsim", "sphinx" } },
+    .{ .name = "lockfree", .libs = &.{"net"} },
+    .{ .name = "workerpool", .libs = &.{"net"}, .deps = &.{"lockfree"} },
+    .{ .name = "shardstore", .libs = &.{"net"}, .deps = &.{"kvtree"} },
+    .{ .name = "writebehind", .libs = &.{"net"}, .deps = &.{ "ramcache", "workerpool", "jobqueue", "kvtree" } },
+    .{ .name = "pagecache", .libs = &.{"net"}, .deps = &.{ "kvtree", "ramcache" } },
+    .{ .name = "tsdb", .libs = &.{"storage"}, .deps = &.{"kvtree"} },
     .{ .name = "entropy", .libs = &.{ "crypto", "web" } },
-    .{ .name = "hashdigest", .libs = &.{ "crypto", "storage" }, .example = true },
+    .{ .name = "hashdigest", .libs = &.{ "crypto", "storage" } },
     .{ .name = "sealedbox", .libs = &.{"crypto"} },
-    .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{"montint"}, .heavy = true, .example = true },
+    .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{"montint"}, .heavy = true },
     .{ .name = "blindrsa", .libs = &.{"crypto"}, .deps = &.{"rsa"} },
-    .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .heavy = true, .live = true, .example = true },
-    .{ .name = "netconf", .libs = &.{"net"}, .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "trie", .libs = &.{"storage"}, .example = true },
+    .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .heavy = true, .live = true },
+    .{ .name = "netconf", .libs = &.{"net"}, .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"} },
+    .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
+    .{ .name = "trie", .libs = &.{"storage"} },
     .{ .name = "fuzzysearch", .libs = &.{"storage"}, .deps = &.{"trie"} },
-    .{ .name = "geoindex", .libs = &.{"storage"}, .example = true },
-    .{ .name = "readthrough", .libs = &.{"net"}, .deps = &.{"ramcache"}, .example = true },
+    .{ .name = "geoindex", .libs = &.{"storage"} },
+    .{ .name = "readthrough", .libs = &.{"net"}, .deps = &.{"ramcache"} },
     .{ .name = "timelock_envelope", .libs = &.{"crypto"}, .deps = &.{ "tlock", "hqc", "chachapoly", "entropy" } },
     .{ .name = "drand", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "tlock" } },
-    .{ .name = "tcplan", .libs = &.{"net"}, .deps = &.{"tc"}, .example = true },
-    .{ .name = "modbus", .libs = &.{"net"}, .example = true },
-    .{ .name = "iec104", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "fleetsim", .libs = &.{"net"}, .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "smtp", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "imap", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true, .live = true },
-    .{ .name = "iec61850", .libs = &.{"net"}, .deps = &.{"xml"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "iec62351", .libs = &.{"net"}, .deps = &.{ "x509", "rsa" }, .example = true },
-    .{ .name = "s7comm", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "enip", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "bacnet", .libs = &.{"net"}, .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "whois", .libs = &.{"net"}, .deps = &.{"netaddr"}, .example = true },
+    .{ .name = "tcplan", .libs = &.{"net"}, .deps = &.{"tc"} },
+    .{ .name = "modbus", .libs = &.{"net"} },
+    .{ .name = "iec104", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
+    .{ .name = "fleetsim", .libs = &.{"net"}, .deps = &.{ "modbus", "dnp3", "iec104", "s7comm", "bacnet", "enip", "opcua", "netsim" }, .test_deps = &.{"testkit"} },
+    .{ .name = "smtp", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
+    .{ .name = "imap", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .live = true },
+    .{ .name = "iec61850", .libs = &.{"net"}, .deps = &.{"xml"}, .test_deps = &.{"testkit"} },
+    .{ .name = "iec62351", .libs = &.{"net"}, .deps = &.{ "x509", "rsa" } },
+    .{ .name = "s7comm", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
+    .{ .name = "enip", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
+    .{ .name = "bacnet", .libs = &.{"net"}, .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"} },
+    .{ .name = "whois", .libs = &.{"net"}, .deps = &.{"netaddr"} },
     .{ .name = "uci", .libs = &.{"os"} },
-    .{ .name = "mqtt", .libs = &.{"net"}, .example = true },
-    .{ .name = "snmp", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" }, .example = true },
-    .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "mqtt", .libs = &.{"net"} },
+    .{ .name = "snmp", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
+    .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" } },
+    .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "traceroute", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr", "latency-stats" } },
     .{ .name = "probe", .libs = &.{"net"}, .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
     .{ .name = "pathmtu", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr" } },
-    .{ .name = "l2disco", .libs = &.{"net"}, .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "upstream", .libs = &.{"web"}, .deps = &.{ "resilience", "probe" }, .example = true },
-    .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256" }, .example = true },
-    .{ .name = "rbac", .libs = &.{"web"}, .example = true },
+    .{ .name = "l2disco", .libs = &.{"net"}, .deps = &.{"netaddr"} },
+    .{ .name = "upstream", .libs = &.{"web"}, .deps = &.{ "resilience", "probe" } },
+    .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256" } },
+    .{ .name = "rbac", .libs = &.{"web"} },
     .{ .name = "xml", .libs = &.{ "web", "net" } },
     .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256" } },
-    .{ .name = "saml", .libs = &.{"web"}, .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, .heavy = true, .example = true },
+    .{ .name = "saml", .libs = &.{"web"}, .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, .heavy = true },
     .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw" }, .heavy = true },
     .{ .name = "aescbc", .libs = &.{ "web", "crypto" } },
     .{ .name = "aeskw", .libs = &.{"web"} },
-    .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "aescbc", "aeskw" }, .example = true },
-    .{ .name = "rdap", .libs = &.{"net"}, .deps = &.{ "http", "netaddr" }, .example = true },
-    .{ .name = "blobstore", .libs = &.{"storage"}, .deps = &.{"hashdigest"}, .example = true },
-    .{ .name = "procnet", .libs = &.{"net"}, .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "diskfree", .libs = &.{"net"}, .example = true },
-    .{ .name = "diskusage", .libs = &.{"net"}, .example = true },
-    .{ .name = "conntrack", .libs = &.{"net"}, .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "aescbc", "aeskw" } },
+    .{ .name = "rdap", .libs = &.{"net"}, .deps = &.{ "http", "netaddr" } },
+    .{ .name = "blobstore", .libs = &.{"storage"}, .deps = &.{"hashdigest"} },
+    .{ .name = "procnet", .libs = &.{"net"}, .deps = &.{"netaddr"} },
+    .{ .name = "diskfree", .libs = &.{"net"} },
+    .{ .name = "diskusage", .libs = &.{"net"} },
+    .{ .name = "conntrack", .libs = &.{"net"}, .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"} },
     .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{"argsafe"} },
-    .{ .name = "dataset", .libs = &.{"storage"}, .example = true },
-    .{ .name = "tabular", .libs = &.{"storage"}, .deps = &.{"dataset"}, .example = true },
+    .{ .name = "dataset", .libs = &.{"storage"} },
+    .{ .name = "tabular", .libs = &.{"storage"}, .deps = &.{"dataset"} },
     .{ .name = "jsonshape", .libs = &.{"storage"}, .deps = &.{"dataset"} },
-    .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"dataset"}, .example = true },
-    .{ .name = "filestore", .libs = &.{"storage"}, .example = true },
+    .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"dataset"} },
+    .{ .name = "filestore", .libs = &.{"storage"} },
     .{ .name = "framing", .libs = &.{ "format", "os" } },
-    .{ .name = "datefmt", .libs = &.{"format"}, .example = true },
-    .{ .name = "diagnostics", .libs = &.{"os"}, .example = true },
+    .{ .name = "datefmt", .libs = &.{"format"} },
+    .{ .name = "diagnostics", .libs = &.{"os"} },
     .{ .name = "json5", .libs = &.{"format"} },
-    .{ .name = "yaml", .libs = &.{"format"}, .example = true },
-    .{ .name = "jinja", .libs = &.{"format"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "yaml", .libs = &.{"format"} },
+    .{ .name = "jinja", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "cbor", .libs = &.{"format"} },
-    .{ .name = "protobuf", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"}, .example = true },
-    .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "protobuf", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"} },
+    .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"} },
     .{ .name = "webauthn", .libs = &.{"crypto"}, .deps = &.{ "cbor", "rsa", "p256", "x509" } },
-    .{ .name = "zipstream", .libs = &.{"format"}, .example = true },
-    .{ .name = "qr", .libs = &.{"format"}, .example = true },
-    .{ .name = "qrscan", .libs = &.{"format"}, .deps = &.{"qr"}, .example = true },
+    .{ .name = "zipstream", .libs = &.{"format"} },
+    .{ .name = "qr", .libs = &.{"format"} },
+    .{ .name = "qrscan", .libs = &.{"format"}, .deps = &.{"qr"} },
     .{ .name = "tz", .libs = &.{"format"}, .deps = &.{"datefmt"} },
     .{ .name = "pollworker", .libs = &.{"os"} },
-    .{ .name = "ipcbus", .libs = &.{"os"}, .deps = &.{"framing"}, .example = true },
-    .{ .name = "csvstream", .libs = &.{"format"}, .example = true },
+    .{ .name = "ipcbus", .libs = &.{"os"}, .deps = &.{"framing"} },
+    .{ .name = "csvstream", .libs = &.{"format"} },
     .{ .name = "csvsafe", .libs = &.{"format"} },
     .{ .name = "numparse", .libs = &.{"format"}, .deps = &.{"decimal"} },
     .{ .name = "argsafe", .libs = &.{"os"} },
     .{ .name = "sessions", .libs = &.{"web"}, .deps = &.{ "router", "http", "cookies", "ramcache", "entropy" } },
     .{ .name = "jobqueue", .libs = &.{"storage"}, .deps = &.{"kv"} },
-    .{ .name = "reconcilable", .libs = &.{"net"}, .deps = &.{"resilience"}, .example = true },
-    .{ .name = "llmclient", .libs = &.{"web"}, .deps = &.{"http"}, .example = true },
+    .{ .name = "reconcilable", .libs = &.{"net"}, .deps = &.{"resilience"} },
+    .{ .name = "llmclient", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "rawsock", .libs = &.{"net"}, .deps = &.{"netaddr"} },
     .{ .name = "encoding", .libs = &.{"format"} },
     .{ .name = "syslog", .libs = &.{"net"} },
-    .{ .name = "sntp", .libs = &.{"net"}, .example = true },
-    .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"}, .example = true },
-    .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .example = true, .live = true },
-    .{ .name = "noise", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .example = true },
-    .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa" }, .example = true },
+    .{ .name = "sntp", .libs = &.{"net"} },
+    .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"} },
+    .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .live = true },
+    .{ .name = "noise", .libs = &.{"crypto"}, .deps = &.{"chachapoly"} },
+    .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa" } },
     .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
-    .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" }, .example = true },
-    .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa" }, .example = true },
-    .{ .name = "dnp3", .libs = &.{"net"}, .deps = &.{"aeskw"}, .example = true },
-    .{ .name = "slhdsa", .libs = &.{"crypto"}, .heavy = true, .example = true },
-    .{ .name = "falcon", .libs = &.{"crypto"}, .example = true },
-    .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true, .example = true },
-    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .example = true, .live = true },
-    .{ .name = "tlsresume", .libs = &.{"crypto"}, .example = true },
+    .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" } },
+    .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa" } },
+    .{ .name = "dnp3", .libs = &.{"net"}, .deps = &.{"aeskw"} },
+    .{ .name = "slhdsa", .libs = &.{"crypto"}, .heavy = true },
+    .{ .name = "falcon", .libs = &.{"crypto"} },
+    .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true },
+    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .live = true },
+    .{ .name = "tlsresume", .libs = &.{"crypto"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{"chachapoly"} },
-    .{ .name = "sandbox", .libs = &.{"os"}, .example = true },
+    .{ .name = "sandbox", .libs = &.{"os"} },
     .{ .name = "bip340", .libs = &.{"crypto"}, .deps = &.{"k256"} },
     .{ .name = "taproot", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
-    .{ .name = "bitcointx", .libs = &.{"crypto"}, .deps = &.{"bip340"}, .example = true },
+    .{ .name = "bitcointx", .libs = &.{"crypto"}, .deps = &.{"bip340"} },
     .{ .name = "psbt", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "bitcoinscript" } },
-    .{ .name = "bitcoinscript", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" }, .example = true },
-    .{ .name = "btcp2p", .libs = &.{"crypto"}, .deps = &.{"bitcointx"}, .example = true },
-    .{ .name = "lnwire", .libs = &.{"crypto"}, .example = true },
-    .{ .name = "lninvoice", .libs = &.{"crypto"}, .deps = &.{ "bech32", "k256", "lnwire", "bip340" }, .example = true },
-    .{ .name = "musig2", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" }, .example = true },
+    .{ .name = "bitcoinscript", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" } },
+    .{ .name = "btcp2p", .libs = &.{"crypto"}, .deps = &.{"bitcointx"} },
+    .{ .name = "lnwire", .libs = &.{"crypto"} },
+    .{ .name = "lninvoice", .libs = &.{"crypto"}, .deps = &.{ "bech32", "k256", "lnwire", "bip340" } },
+    .{ .name = "musig2", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
     .{ .name = "sphinx", .libs = &.{ "crypto", "net" }, .deps = &.{"k256"} },
-    .{ .name = "bolt8", .libs = &.{"crypto"}, .deps = &.{ "noise", "k256" }, .example = true },
+    .{ .name = "bolt8", .libs = &.{"crypto"}, .deps = &.{ "noise", "k256" } },
     .{ .name = "bolt3", .libs = &.{"crypto"}, .deps = &.{"k256"} },
-    .{ .name = "hpke", .libs = &.{"crypto"}, .deps = &.{ "p256", "chachapoly", "entropy" }, .example = true },
+    .{ .name = "hpke", .libs = &.{"crypto"}, .deps = &.{ "p256", "chachapoly", "entropy" } },
     .{ .name = "adaptor", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
-    .{ .name = "frost", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" }, .example = true },
+    .{ .name = "frost", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
     .{ .name = "oscore", .libs = &.{"crypto"} },
     .{ .name = "spake2plus", .libs = &.{"crypto"}, .deps = &.{"p256"} },
     .{ .name = "ct25519", .libs = &.{"crypto"} },
-    .{ .name = "voprf", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .example = true },
+    .{ .name = "voprf", .libs = &.{"crypto"}, .deps = &.{"ct25519"} },
     .{ .name = "opaque", .libs = &.{"crypto"}, .deps = &.{ "voprf", "ct25519" } },
-    .{ .name = "bulletproofs", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .example = true },
-    .{ .name = "xmss", .libs = &.{"crypto"}, .heavy = true, .example = true },
-    .{ .name = "minisign", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true, .example = true },
+    .{ .name = "bulletproofs", .libs = &.{"crypto"}, .deps = &.{"ct25519"} },
+    .{ .name = "xmss", .libs = &.{"crypto"}, .heavy = true },
+    .{ .name = "minisign", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
     .{ .name = "otp", .libs = &.{"crypto"} },
     .{ .name = "ctap2pin", .libs = &.{"crypto"}, .deps = &.{"p256"} },
-    .{ .name = "bls12_381", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true, .example = true },
-    .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .example = true },
-    .{ .name = "coconut", .libs = &.{"crypto"}, .deps = &.{"bls12_381"}, .heavy = true, .example = true },
+    .{ .name = "bls12_381", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
+    .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" } },
+    .{ .name = "coconut", .libs = &.{"crypto"}, .deps = &.{"bls12_381"}, .heavy = true },
     .{ .name = "tlock", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" } },
     // `tlock` is a TEST-only dep: `ibe/src/kat_test.zig` drives `ibe`'s own
     // encrypt/decrypt through `ibe.Scheme` with drand's ciphersuite, to
@@ -305,39 +304,39 @@ const module_list = [_]Module{
     // already has frozen. The published `ibe` module never imports it --
     // `zig build check-testonly` proves that.
     .{ .name = "ibe", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"tlock"}, .heavy = true },
-    .{ .name = "bn254", .libs = &.{"crypto"}, .heavy = true, .example = true },
-    .{ .name = "ed448", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .example = true },
+    .{ .name = "bn254", .libs = &.{"crypto"}, .heavy = true },
+    .{ .name = "ed448", .libs = &.{"crypto"}, .deps = &.{"entropy"} },
     .{ .name = "decaf448", .libs = &.{"crypto"}, .deps = &.{"ed448"} },
     .{ .name = "paillier", .libs = &.{"crypto"}, .deps = &.{"montint"}, .heavy = true },
-    .{ .name = "threshold_ecdsa", .libs = &.{"crypto"}, .deps = &.{ "paillier", "montint" }, .heavy = true, .example = true },
-    .{ .name = "dkg", .libs = &.{"crypto"}, .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true, .example = true },
+    .{ .name = "threshold_ecdsa", .libs = &.{"crypto"}, .deps = &.{ "paillier", "montint" }, .heavy = true },
+    .{ .name = "dkg", .libs = &.{"crypto"}, .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true },
     .{ .name = "vdf", .libs = &.{"crypto"}, .deps = &.{"montint"} },
-    .{ .name = "signal", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "ct25519", "entropy" }, .example = true },
-    .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{"hpke"}, .example = true },
-    .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy" }, .example = true },
-    .{ .name = "ebpf", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "signal", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "ct25519", "entropy" } },
+    .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{"hpke"} },
+    .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy" } },
+    .{ .name = "ebpf", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "xdp-classifier", .libs = &.{"net"}, .deps = &.{"ebpf"} },
     .{ .name = "ecvrf", .libs = &.{"crypto"}, .deps = &.{"ct25519"} },
-    .{ .name = "fss", .libs = &.{"crypto"}, .example = true },
-    .{ .name = "pir", .libs = &.{"crypto"}, .deps = &.{"fss"}, .example = true },
-    .{ .name = "bfv", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .example = true },
-    .{ .name = "groth16", .libs = &.{"crypto"}, .deps = &.{"bn254"}, .example = true },
+    .{ .name = "fss", .libs = &.{"crypto"} },
+    .{ .name = "pir", .libs = &.{"crypto"}, .deps = &.{"fss"} },
+    .{ .name = "bfv", .libs = &.{"crypto"}, .deps = &.{"entropy"} },
+    .{ .name = "groth16", .libs = &.{"crypto"}, .deps = &.{"bn254"} },
     // Not heavy: the parameter derivation + all 30 tests run in 5s under
     // -Dstrict-debug, well under the >15s threshold (and a Debug compile of
     // this module is ~1s against ~27s at ReleaseSafe, so marking it heavy
     // would cost more than it saves).
-    .{ .name = "poseidon", .libs = &.{"crypto"}, .deps = &.{ "bn254", "bls12_381" }, .test_deps = &.{"testkit"}, .example = true },
+    .{ .name = "poseidon", .libs = &.{"crypto"}, .deps = &.{ "bn254", "bls12_381" }, .test_deps = &.{"testkit"} },
     // Not heavy, despite the inverse S-box (72 multiplies per element per
     // half-round). Measured serially on this host: strict-Debug compile ~8.5s
     // + run ~1.0s = 9.5s, under the >15s threshold — and a ReleaseSafe compile
     // of this module is ~46s (comptime SHAKE256 derivation + heavily unrolled
     // field code), so marking it heavy would cost 5x what it saves.
-    .{ .name = "rescue", .libs = &.{"crypto"}, .example = true },
-    .{ .name = "tfhe", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true, .example = true },
-    .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true, .example = true },
+    .{ .name = "rescue", .libs = &.{"crypto"} },
+    .{ .name = "tfhe", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
+    .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "chachapoly", .libs = &.{"crypto"} },
-    .{ .name = "k256", .libs = &.{"crypto"}, .example = true },
-    .{ .name = "p256", .libs = &.{ "crypto", "web" }, .example = true },
+    .{ .name = "k256", .libs = &.{"crypto"} },
+    .{ .name = "p256", .libs = &.{ "crypto", "web" } },
     .{ .name = "ripemd160", .libs = &.{"crypto"} },
     .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"} },
     .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" } },
@@ -387,23 +386,24 @@ pub fn build(b: *std.Build) void {
     // covers that no test in this repository can.
     const check_examples = b.step("check-examples", "Build each module's example as an outside consumer would");
 
-    // A declaration that can drift is a gate that quietly covers less. An
-    // example file added without `.example = true` is never built -- eight of
-    // them sat that way for one afternoon and `check-examples` stayed green,
-    // which is the exact failure mode this whole family of steps exists to
-    // catch. So the flag and the tree are checked against each other.
-    const check_example_decls = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    check_example_decls.* = std.Build.Step.init(.{
+    // CONVENTIONS.md 7.2: a module over either trigger must have an example.
+    // This used to also reconcile a `.example` bool in `module_list` against
+    // the tree -- a declaration that could drift, and did: eight example files
+    // sat unbuilt for an afternoon with `check-examples` green. The bool is
+    // gone; the file on disk is the declaration, so that class cannot recur
+    // and only the rule itself is left to check.
+    const check_example_rule = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    check_example_rule.* = std.Build.Step.init(.{
         .id = .custom,
-        .name = "check-example-decls",
+        .name = "check-example-rule",
         .owner = b,
-        .makeFn = checkExampleDecls,
+        .makeFn = checkExampleRule,
     });
-    check_examples.dependOn(check_example_decls);
-    // Also reachable on its own: the flag/tree disagreement it catches has
-    // nothing to do with whether the examples compile, and it answers in
+    check_examples.dependOn(check_example_rule);
+    // Also reachable on its own: which modules OWE an example has nothing to
+    // do with whether the existing ones compile, and it answers in
     // milliseconds where the sweep takes minutes.
-    b.step("check-example-decls", "Check `.example` flags against the tree").dependOn(check_example_decls);
+    b.step("check-example-rule", "Check CONVENTIONS 7.2: every module over a trigger has an example").dependOn(check_example_rule);
 
     // Pass 1: create each module so inter-module deps can be wired in pass 2.
     var mods = std.StringHashMap(*std.Build.Module).init(b.allocator);
@@ -543,7 +543,7 @@ pub fn build(b: *std.Build) void {
         // them anchored to published test vectors, where an internal vector
         // test is strictly stronger than an example. The 57 that are left have
         // no consumer AND a wide surface — those get examples, largest first.
-        if (m.example) {
+        if (moduleHasExample(b, m.name)) {
             const example_mod = b.createModule(.{
                 .root_source_file = b.path(b.fmt("modules/{s}/example/main.zig", .{m.name})),
                 .target = target,
@@ -1374,22 +1374,20 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
     try stdout.interface.flush();
 }
 
-fn checkExampleDecls(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+/// Whether a module ships an example. The file on disk IS the declaration --
+/// there is no flag to keep in step with it, and so no way for the two to
+/// disagree. Called at configure time, once per module.
+fn moduleHasExample(b: *std.Build, name: []const u8) bool {
+    const path = b.fmt("modules/{s}/example/main.zig", .{name});
+    return if (b.build_root.handle.access(b.graph.io, path, .{})) |_| true else |_| false;
+}
+
+fn checkExampleRule(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
     _ = options;
     const b = step.owner;
     const io = b.graph.io;
     var failed = false;
     for (module_list) |m| {
-        const path = b.fmt("modules/{s}/example/main.zig", .{m.name});
-        const present = if (b.build_root.handle.access(io, path, .{})) |_| true else |_| false;
-        if (present and !m.example) {
-            std.debug.print("check-example-decls: {s} has {s} but no `.example = true` in module_list -- it is never built\n", .{ m.name, path });
-            failed = true;
-        }
-        if (!present and m.example) {
-            std.debug.print("check-example-decls: {s} declares `.example = true` but {s} is missing\n", .{ m.name, path });
-            failed = true;
-        }
         // A module OVER either §7.2 trigger and carrying no example is the
         // failure this step exists for. Without it the rule is prose: the
         // scope was picked once, by hand, and the next module to cross the
@@ -1399,7 +1397,7 @@ fn checkExampleDecls(step: *std.Build.Step, options: std.Build.Step.MakeOptions)
         // same discharge by a different route: a standalone consumer build of
         // the published API, and a stricter one, since it goes through the
         // package machinery rather than an in-repo `addImport`.
-        if (!m.example and !appCoversModule(m.name)) {
+        if (!moduleHasExample(b, m.name) and !appCoversModule(m.name)) {
             const t = try exampleTriggers(b, io, m.name);
             if (t.pub_fns >= example_pub_fn_threshold) {
                 std.debug.print("check-example-decls: {s} has {d} `pub fn` (threshold {d}) and no example -- see CONVENTIONS.md 7.2\n", .{ m.name, t.pub_fns, example_pub_fn_threshold });
@@ -1410,7 +1408,7 @@ fn checkExampleDecls(step: *std.Build.Step, options: std.Build.Step.MakeOptions)
             }
         }
     }
-    if (failed) return error.ExampleDeclarationMismatch;
+    if (failed) return error.ExampleRuleViolation;
 }
 
 /// CONVENTIONS.md §7.2. Both numbers are thresholds on a MEASURED shape, not

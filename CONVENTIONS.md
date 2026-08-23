@@ -448,9 +448,10 @@ reference, not a re-explanation of everything the README already covers.
    (removed 2026-08-14, §8).
 
 7. If either trigger in §7.2 fires — 25 or more `pub fn`, or a public `init` plus three
-   or more `self` methods — write `modules/<name>/example/main.zig` and set
-   `.example = true` on the `module_list` entry. `zig build example-<name>` builds it
-   alone; `zig build check-example-decls` fails if the flag and the file disagree.
+   or more `self` methods — write `modules/<name>/example/main.zig`. Nothing to
+   declare: the file itself is the declaration, and `build.zig` picks it up from the
+   tree. `zig build example-<name>` builds it alone; `zig build check-example-rule`
+   fails a module that owes one and has none.
 
 `modules/_template/README.md` carries the complete step-by-step list, including the two
 things this narrative does not repeat because a gate owns them: the root README catalog row
@@ -508,8 +509,7 @@ run says the published API is *sufficient*.
 `modules/<name>/example/main.zig` is that missing consumer, and `zig build check-examples`
 compiles it against the **published** module — declared `deps` only, no `test_deps`, no
 private declarations. `zig build example-<name>` builds one on its own.
-`zig build check-example-decls` keeps the tree and `module_list`'s `.example` flags in
-agreement in both directions, **and fails a module that is over either trigger below and
+`zig build check-example-rule` **fails a module that is over either trigger below and
 has no example at all** — otherwise the scope below would be a list picked by hand once,
 and the next module to cross the threshold would cross it silently.
 
