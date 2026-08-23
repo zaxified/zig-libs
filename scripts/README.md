@@ -160,9 +160,18 @@ and cannot bound a run, for two reasons found the hard way:
   511 MB of swap, `all_unreclaimable? yes`, with the sum of every process's RSS
   only 9 GB. Nothing on the machine looked large; the memory was in files.
 
-`test.sh` therefore also points `TMPDIR` at `.zig-cache/gate-tmp` (on disk) when
-it would otherwise be `/tmp`, so step logs never occupy RAM at all. Set `TMPDIR`
-yourself to override.
+`test.sh` therefore also points `TMPDIR` at `.zig-cache/gate-tmp` (on disk)
+whenever `TMPDIR` is unset or names a **tmpfs/ramfs**, so step logs never occupy
+RAM at all. The test is the filesystem, not the path: it once compared `TMPDIR`
+to the literal `/tmp`, which misses `/tmp/<anything>/<session>` — the shape a
+tool that gives each session its own scratch directory produces. Set `TMPDIR`
+to a disk-backed directory to override.
+
+A cap bounds the run; it cannot bound the machine. Measured 2026-08-23: a full
+run peaked at 4.5 GB against a 20 GB cap and the kernel still fired a **global**
+oom-kill, because other processes had filled RAM. `test.sh` warns before
+starting when under a quarter of memory is available; `ZIGLIBS_MEM_QUIET=1`
+silences it.
 
 Verify the cap rather than trusting it: `ZIGLIBS_RUN_MEM_MAX` set absurdly low
 must produce exit 137, and a *warm* cache is not a test — a fully cached
