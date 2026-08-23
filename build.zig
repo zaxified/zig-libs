@@ -175,7 +175,7 @@ const module_list = [_]Module{
     .{ .name = "sealedbox", .libs = &.{"crypto"} },
     .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{"montint"}, .heavy = true, .example = true },
     .{ .name = "blindrsa", .libs = &.{"crypto"}, .deps = &.{"rsa"} },
-    .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .heavy = true, .live = true },
+    .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .heavy = true, .live = true, .example = true },
     .{ .name = "netconf", .libs = &.{"net"}, .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "trie", .libs = &.{"storage"}, .example = true },
