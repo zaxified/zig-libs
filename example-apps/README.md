@@ -47,9 +47,12 @@ Both are arranged from outside the app, so its manifest stays the customer's:
    test. That is a wire-compatibility check no in-repo test can be, because
    both sides of an in-repo test are always the same version.
 
-The second one is why **an app is written against the tagged API and never
-against unreleased work** — the source has to compile against both versions, or
-the comparison measures the app instead of the library.
+**The second one is not switched on yet.** It needs two tags that both carry
+`example-apps/`, and only one exists so far, so today an app is written against
+the API in this tree and `zig build --fork=../..` is the check that runs. From
+the release after next, the source has to compile against both the previous tag
+and the commit under test — otherwise the comparison measures the app instead
+of the library — and that constraint lands then, not now.
 
 ## Adding one
 
