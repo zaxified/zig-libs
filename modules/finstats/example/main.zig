@@ -71,6 +71,10 @@ pub fn main() !void {
         .date_col = "date",
         .flow_col = "flow",
         .value_col = "value",
+        // No default on purpose: this series IS the whole history, and saying
+        // so is the one thing that cannot be got wrong by not thinking about
+        // it. See the window below for what the other answer buys.
+        .opening = .none,
     });
     std.debug.print("xirr: {d:.4}\n", .{rate});
 
@@ -99,6 +103,7 @@ pub fn main() !void {
         .date_col = "date",
         .flow_col = "flow",
         .value_col = "value",
+        .opening = .none,
     })) |wrong| {
         std.debug.print("unreachable: {d}\n", .{wrong});
     } else |err| {
@@ -143,6 +148,7 @@ pub fn main() !void {
         .date_col = "date",
         .flow_col = "flow",
         .value_col = "no_such_column",
+        .opening = .none,
     }) catch |err| switch (err) {
         error.NoSuchColumn => {
             std.debug.print("misconfigured KPI node rejected: NoSuchColumn\n", .{});

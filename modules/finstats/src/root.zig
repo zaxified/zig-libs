@@ -96,8 +96,28 @@ pub const XirrSpec = struct {
     /// Portfolio value column; the LAST row's value is the terminal flow.
     value_col: []const u8,
     /// Seed the first row's value as the opening position. See `Opening`.
-    /// Default `.none` keeps an inception-to-date series bit-identical.
-    opening: Opening = .none,
+    ///
+    /// Deliberately has NO default. `.none` was one for a day, and a default
+    /// means the one mistake this type exists to prevent — computing a window
+    /// as if it were a whole history — is the mistake you make by not thinking
+    /// about it. The sign-change check below cannot catch that case in general
+    /// (a window whose first row carries a flow brackets a root and converges
+    /// on the IRR of a different question), so the only complete detector is
+    /// the compiler: omit this field and the call does not build.
+    opening: Opening,
+    /// Bisection also has to narrow the RATE to this width before returning,
+    /// not just drive |NPV| under `1e-2`. The NPV threshold is absolute, so
+    /// what it means depends entirely on the size of the cashflows: on a
+    /// series denominated in units of ~0.01 it is met at the FIRST midpoint
+    /// and `xirr` returns 4.505 — the same silently-plausible nonsense the
+    /// bracket bound used to be. A width in rate-space says what was actually
+    /// wanted and means the same thing at every magnitude.
+    ///
+    /// `null` restores the pre-2026-08-23 absolute-only test exactly, for a
+    /// caller who needs to reproduce old numbers bit-for-bit. Switching it on
+    /// moves results by less than 1e-8 for cashflows of 1e6 and up, and by as
+    /// much as the whole answer below ~1.
+    rate_tol: ?f64 = 1e-9,
 };
 
 const Cashflow = struct { t: i64, cf: f64 };
@@ -138,6 +158,24 @@ fn buildCashflows(
     });
 }
 
+/// The bisection both functions share: 200 halvings of `[lo, hi]`, returning
+/// as soon as |NPV| is under `npv_tol` AND — when `rate_tol` is set — the
+/// bracket has narrowed below it. Callers check `bracketHasRoot` first.
+fn bisect(items: []const Cashflow, base: i64, npv_tol: f64, rate_tol: ?f64) f64 {
+    var lo: f64 = -0.99;
+    var hi: f64 = 10.0;
+    var mid: f64 = 0;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        mid = (lo + hi) / 2.0;
+        const nv_mid = npv(items, base, mid);
+        if (@abs(nv_mid) < npv_tol and (rate_tol == null or (hi - lo) < rate_tol.?)) return mid;
+        const nv_lo = npv(items, base, lo);
+        if ((nv_lo < 0) == (nv_mid < 0)) lo = mid else hi = mid;
+    }
+    return mid;
+}
+
 /// Does NPV change sign across `[lo, hi]`? If it does not, no amount of
 /// bisecting finds a root and the loop below just walks to a bound — which is
 /// what used to be returned as the answer. NaN compares false both ways and so
@@ -169,19 +207,8 @@ pub fn xirr(a: std.mem.Allocator, d: Dataset, spec: XirrSpec) XirrError!f64 {
     try buildCashflows(a, d, idx, spec.opening, &cfs);
 
     const base = cfs.items[0].t;
-    var lo: f64 = -0.99;
-    var hi: f64 = 10.0;
-    if (!bracketHasRoot(cfs.items, base, lo, hi)) return error.XirrNoRoot;
-    var mid: f64 = 0;
-    var i: usize = 0;
-    while (i < 200) : (i += 1) {
-        mid = (lo + hi) / 2.0;
-        const nv_mid = npv(cfs.items, base, mid);
-        if (@abs(nv_mid) < 1e-2) return mid;
-        const nv_lo = npv(cfs.items, base, lo);
-        if ((nv_lo < 0) == (nv_mid < 0)) lo = mid else hi = mid;
-    }
-    return mid;
+    if (!bracketHasRoot(cfs.items, base, -0.99, 10.0)) return error.XirrNoRoot;
+    return bisect(cfs.items, base, 1e-2, spec.rate_tol);
 }
 
 fn npv(items: []const Cashflow, base: i64, r: f64) f64 {
@@ -212,8 +239,11 @@ pub const XirrNodeSpec = struct {
     /// Multiply the result (e.g. 100 → percent). Default 1 = fraction.
     scale: f64 = 1,
     /// Seed the first row's value as the opening position. See `Opening`.
-    /// A pipeline step computing over a date-range WINDOW wants this set.
-    opening: Opening = .none,
+    /// A pipeline step computing over a date-range WINDOW wants this set; it
+    /// has no default so that step cannot forget to say which it is.
+    opening: Opening,
+    /// See `XirrSpec.rate_tol`.
+    rate_tol: ?f64 = 1e-9,
 };
 
 /// `xirr` node: reduce the dated flow/value series to `{out: xirr·scale}`.
@@ -225,6 +255,40 @@ pub fn xirrNode(a: std.mem.Allocator, d: Dataset, spec: XirrNodeSpec) XirrError!
         .flow_col = spec.flow_col,
         .value_col = spec.value_col,
         .opening = spec.opening,
+        .rate_tol = spec.rate_tol,
+    });
+    return oneRow(a, &.{.{ spec.out, v * spec.scale }});
+}
+
+pub const XirrPreciseNodeSpec = struct {
+    date_col: []const u8,
+    flow_col: []const u8,
+    value_col: []const u8,
+    /// See `XirrSpec.opening`. No default, for the same reason.
+    opening: Opening,
+    out: []const u8 = "xirr",
+    /// Multiply the result (e.g. 100 → percent). Default 1 = fraction.
+    scale: f64 = 1,
+    tol: f64 = 1e-8,
+    max_newton_iter: usize = 50,
+    initial_guess: f64 = 0.1,
+    /// See `XirrSpec.rate_tol`.
+    rate_tol: ?f64 = 1e-9,
+};
+
+/// `xirrPrecise` node: the Newton-first sibling of `xirrNode`, for a pipeline
+/// that wants more than bisection's `1e-2` on NPV. Same one-row `{out}` shape,
+/// and the same propagation of `error.XirrNoRoot` instead of a number.
+pub fn xirrPreciseNode(a: std.mem.Allocator, d: Dataset, spec: XirrPreciseNodeSpec) XirrError!Dataset {
+    const v = try xirrPrecise(a, d, .{
+        .date_col = spec.date_col,
+        .flow_col = spec.flow_col,
+        .value_col = spec.value_col,
+        .opening = spec.opening,
+        .tol = spec.tol,
+        .max_newton_iter = spec.max_newton_iter,
+        .initial_guess = spec.initial_guess,
+        .rate_tol = spec.rate_tol,
     });
     return oneRow(a, &.{.{ spec.out, v * spec.scale }});
 }
@@ -752,7 +816,15 @@ pub const XirrPreciseSpec = struct {
     max_newton_iter: usize = 50,
     initial_guess: f64 = 0.1,
     /// Seed the first row's value as the opening position. See `Opening`.
-    opening: Opening = .none,
+    /// No default, for the reason given on `XirrSpec.opening`.
+    opening: Opening,
+    /// Convergence width in rate-space, applied to BOTH phases: Newton returns
+    /// once a step moves the rate by less than this, and the bisection
+    /// fallback narrows the bracket below it. `tol` alone is absolute, so on
+    /// large cashflows Newton could never meet it and always fell through to
+    /// bisection however well it had converged. `null` = the pre-2026-08-23
+    /// absolute-only tests. See `XirrSpec.rate_tol`.
+    rate_tol: ?f64 = 1e-9,
 };
 
 /// Dated-flow IRR via Newton-Raphson (fast, high precision) with an automatic
@@ -789,23 +861,18 @@ pub fn xirrPrecise(a: std.mem.Allocator, d: Dataset, spec: XirrPreciseSpec) Xirr
             if (std.math.isNan(df) or @abs(df) < 1e-14) break :newton; // derivative underflow
             const r_new = r - f / df;
             if (std.math.isNan(r_new) or r_new <= -0.99 or r_new >= 10.0) break :newton; // stepped outside the bracket
+            // Converged in the units of the ANSWER. Without this, cashflows big
+            // enough that |NPV| never drops under an absolute `tol` sent every
+            // call through the fallback no matter how exactly Newton had landed.
+            if (spec.rate_tol) |rt| {
+                if (@abs(r_new - r) < rt) return r_new;
+            }
             r = r_new;
         }
         // ran out of iterations without meeting tol — fall through to bisection
     }
 
-    var lo: f64 = -0.99;
-    var hi: f64 = 10.0;
-    var mid: f64 = 0;
-    var i: usize = 0;
-    while (i < 200) : (i += 1) {
-        mid = (lo + hi) / 2.0;
-        const nv_mid = npv(cfs.items, base, mid);
-        if (@abs(nv_mid) < spec.tol) return mid;
-        const nv_lo = npv(cfs.items, base, lo);
-        if ((nv_lo < 0) == (nv_mid < 0)) lo = mid else hi = mid;
-    }
-    return mid;
+    return bisect(cfs.items, base, spec.tol, spec.rate_tol);
 }
 
 /// d(NPV)/dr for the Newton step above.
@@ -1297,13 +1364,14 @@ test "scratch allocations are released — EVERY allocating public fn, on std.te
     const d: Dataset = .{ .columns = &cols, .rows = &rows };
 
     // — scalar returns: nothing to free, so anything they allocate is scratch —
-    _ = try xirr(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v" });
-    _ = try xirrPrecise(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v" });
+    _ = try xirr(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none });
+    _ = try xirrPrecise(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none });
     _ = try quantile(a, &[_]f64{ 0.3, 0.1, 0.2 }, 0.5);
 
     // — Dataset returns: the Dataset is the caller's, so free exactly that and
     //   whatever is still outstanding afterwards is the function's own scratch —
-    freeDs(a, try xirrNode(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v" }));
+    freeDs(a, try xirrNode(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none }));
+    freeDs(a, try xirrPreciseNode(a, d, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none }));
     freeDs(a, try annualizeNode(a, d, .{ .value_col = "cum", .date_col = "d" }));
     freeDs(a, try twrDaily(a, d, .{ .date_col = "d", .value_col = "v", .flow_col = "flow", .pe_col = "pe" }));
     freeDs(a, try histogram(a, d, .{ .value_col = "v" }));
@@ -1377,7 +1445,7 @@ test "xirr: a mid-life window needs `opening`; without it there is no root, and 
         &.{ .{ .text = "2025-01-01" }, .{ .float = 0 }, .{ .float = 1100 } },
     };
     const d: Dataset = .{ .columns = &cols, .rows = &rows };
-    const base_spec = XirrSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v" };
+    const base_spec = XirrSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none };
 
     // Seeded: the opening 1000 is a cashflow, so NPV crosses zero at ~+10 %.
     // (366 calendar days over a 365.25 year → 0.0998, not exactly 0.10.)
@@ -1394,12 +1462,20 @@ test "xirr: a mid-life window needs `opening`; without it there is no root, and 
         .date_col = "d",
         .flow_col = "flow",
         .value_col = "v",
+        .opening = .none,
     }));
-    // The node propagates it instead of emitting a number.
+    // Both nodes propagate it instead of emitting a number.
     try testing.expectError(error.XirrNoRoot, xirrNode(f.a(), d, .{
         .date_col = "d",
         .flow_col = "flow",
         .value_col = "v",
+        .opening = .none,
+    }));
+    try testing.expectError(error.XirrNoRoot, xirrPreciseNode(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .none,
     }));
 }
 
@@ -1450,9 +1526,9 @@ test "xirr: lifetime is untouched, and the same fixture windowed lands on the wi
         &.{ .{ .text = "2023-07-01" }, .{ .float = 0 }, .{ .float = 1900 } },
         &.{ .{ .text = "2024-01-01" }, .{ .float = 0 }, .{ .float = 2100 } },
     };
-    const spec = XirrSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v" };
+    const spec = XirrSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none };
 
-    // Lifetime, default `.none` — the pre-existing path, unchanged.
+    // Lifetime, `.none` — the whole history, which starts from nothing.
     const lifetime = try xirr(f.a(), .{ .columns = &cols, .rows = &rows }, spec);
     try testing.expect(lifetime > 0.15 and lifetime < 0.30);
 
@@ -1477,6 +1553,121 @@ test "xirr: lifetime is untouched, and the same fixture windowed lands on the wi
     try testing.expect(unseeded > 10 * windowed);
 }
 
+test "xirr: convergence is measured in the ANSWER's units — an absolute NPV threshold is scale-dependent" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "flow", .type = .float },
+        .{ .name = "v", .type = .float },
+    };
+    // The SAME +10 %/year question, asked at two magnitudes. Nothing about the
+    // answer depends on the units the cashflows are denominated in.
+    const small = [_][]const Value{
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 0.01 }, .{ .float = 0.01 } },
+        &.{ .{ .text = "2025-01-01" }, .{ .float = 0 }, .{ .float = 0.011 } },
+    };
+    const large = [_][]const Value{
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 1_000_000 }, .{ .float = 1_000_000 } },
+        &.{ .{ .text = "2025-01-01" }, .{ .float = 0 }, .{ .float = 1_100_000 } },
+    };
+    const spec = XirrSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none };
+
+    const r_small = try xirr(f.a(), .{ .columns = &cols, .rows = &small }, spec);
+    const r_large = try xirr(f.a(), .{ .columns = &cols, .rows = &large }, spec);
+    try testing.expectApproxEqAbs(@as(f64, 0.0998), r_small, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0.0998), r_large, 0.001);
+    try testing.expectApproxEqAbs(r_small, r_large, 1e-6); // scale-free
+
+    // ⭐ `rate_tol = null` restores the pre-2026-08-23 test, which was |NPV| <
+    // 1e-2 and nothing else. On the small series that threshold is met at the
+    // very FIRST midpoint of [-0.99, 10] — so it returned 4.505, i.e. +450 %,
+    // for a series returning 10 %. Same silently-plausible shape as the bracket
+    // bound; the sign-change check cannot see it, because there IS a root here.
+    var legacy = spec;
+    legacy.rate_tol = null;
+    const r_legacy = try xirr(f.a(), .{ .columns = &cols, .rows = &small }, legacy);
+    try testing.expectApproxEqAbs(@as(f64, 4.505), r_legacy, 1e-9);
+    try testing.expect(r_legacy > 40 * r_small);
+}
+
+test "xirrPrecise: a Newton budget too small to meet `tol` still lands on the same answer" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "flow", .type = .float },
+        .{ .name = "v", .type = .float },
+    };
+    // |NPV| < 1e-8 is unreachable at this magnitude in f64, so with only the
+    // absolute test Newton exhausted its budget however exactly it had landed
+    // and every call paid for the bisection fallback as well. The rate-space
+    // return added for that is a WORK saving, not an answer change, and this
+    // test says so rather than pretending otherwise: deleting it leaves the
+    // suite green, because the fallback lands in the same place. Verified by
+    // mutation — it survives, and that is the honest result. What is pinned
+    // here is that the two paths agree.
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 1e9 }, .{ .float = 1e9 } },
+        &.{ .{ .text = "2025-01-01" }, .{ .float = 0 }, .{ .float = 1.1e9 } },
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    const spec = XirrPreciseSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none };
+    const r = try xirrPrecise(f.a(), d, spec);
+    try testing.expectApproxEqAbs(@as(f64, 0.0998), r, 0.001);
+
+    // Two Newton steps from the 0.1 guess, versus the full 50: same answer to
+    // 1e-12 whichever phase produced it.
+    var tight = spec;
+    tight.max_newton_iter = 2;
+    const r2 = try xirrPrecise(f.a(), d, tight);
+    try testing.expectApproxEqAbs(r, r2, 1e-12);
+
+    // And the legacy absolute-only mode agrees too — at THIS magnitude. The
+    // scale-dependence that makes `rate_tol` worth having bites small
+    // cashflows, not large ones; see the `xirr` test above for where it does.
+    var legacy = spec;
+    legacy.rate_tol = null;
+    const r3 = try xirrPrecise(f.a(), d, legacy);
+    try testing.expectApproxEqAbs(r, r3, 1e-12);
+}
+
+test "xirrPreciseNode: emits one-row {xirr}, scaled, and refuses a window it cannot answer" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "flow", .type = .float },
+        .{ .name = "v", .type = .float },
+    };
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2023-01-01" }, .{ .float = 100 }, .{ .float = 100 } },
+        &.{ .{ .text = "2024-01-01" }, .{ .float = 0 }, .{ .float = 200 } }, // IRR ≈ 100%
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    const out = try xirrPreciseNode(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .none,
+        .scale = 100,
+    });
+    try testing.expectEqual(@as(usize, 1), out.rows.len);
+    // Newton, so this lands far tighter than `xirrNode`'s bisection would —
+    // tight enough to show that the answer is NOT 100 %: 365 days over a
+    // 365.25-day year is 2^(365.25/365) − 1 = 100.095 %, and the bisection
+    // test above had to allow ±2 to cover its own imprecision.
+    try testing.expectApproxEqAbs(@as(f64, 100.0949), out.cell(0, "xirr").?.float, 0.001);
+
+    // A mid-life window declared `.none` has no root, and the node says so.
+    try testing.expectError(error.XirrNoRoot, xirrPreciseNode(f.a(), .{ .columns = &cols, .rows = rows[1..] }, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .none,
+    }));
+}
+
 test "annualize CAGR" {
     try testing.expectApproxEqAbs(@as(f64, 1.0), annualize(1.0, 365.25), 1e-9); // double in 1y → 100%
     try testing.expectApproxEqAbs(@as(f64, 0.0), annualize(0.0, 100), 1e-12);
@@ -1494,7 +1685,7 @@ test "xirrNode: emits one-row {xirr}, scaled" {
         &.{ .{ .text = "2023-01-01" }, .{ .float = 100 }, .{ .float = 100 } },
         &.{ .{ .text = "2024-01-01" }, .{ .float = 0 }, .{ .float = 200 } }, // IRR ≈ 100%
     };
-    const out = try xirrNode(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .out = "xirr", .scale = 100 });
+    const out = try xirrNode(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none, .out = "xirr", .scale = 100 });
     try testing.expectEqual(@as(usize, 1), out.rows.len);
     try testing.expectApproxEqAbs(@as(f64, 100), out.cell(0, "xirr").?.float, 2); // ×100 → ~100 %
 }
@@ -1677,13 +1868,13 @@ test "xirrPrecise: known-IRR fixture (100 -> 121 over ~2y = ~10% IRR)" {
         &.{ .{ .text = "2020-01-01" }, .{ .float = 100 }, .{ .float = 100 } },
         &.{ .{ .text = "2022-01-01" }, .{ .float = 0 }, .{ .float = 121 } },
     };
-    const spec = XirrPreciseSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v" };
+    const spec = XirrPreciseSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none };
     const r = try xirrPrecise(f.a(), .{ .columns = &cols, .rows = &rows }, spec);
     try testing.expectApproxEqAbs(@as(f64, 0.0999283), r, 1e-3);
 
     // fallback: max_newton_iter=1 forces Newton to bail before converging;
     // the bisection fallback must still land on the same answer.
-    const fallback_spec = XirrPreciseSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v", .max_newton_iter = 1, .tol = 1e-6 };
+    const fallback_spec = XirrPreciseSpec{ .date_col = "d", .flow_col = "flow", .value_col = "v", .opening = .none, .max_newton_iter = 1, .tol = 1e-6 };
     const r2 = try xirrPrecise(f.a(), .{ .columns = &cols, .rows = &rows }, fallback_spec);
     try testing.expectApproxEqAbs(@as(f64, 0.0999283), r2, 1e-3);
 }

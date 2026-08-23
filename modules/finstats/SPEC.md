@@ -21,9 +21,16 @@ day-count, tolerance `1e-2` (kept exactly as-is; `xirrPrecise` is an additive Ne
 that falls back to the same bracket/bisection on non-convergence). Both first check that NPV
 changes sign across the bracket and return `error.XirrNoRoot` when it does not — a bracket bound is
 indistinguishable from a real answer at the call site, and used to be returned as one. Both also
-take an `opening` mode selecting whether the first row's `value_col` is seeded as a starting
-position, which is what a series sliced to a date-range window needs; the default `.none` leaves an
-inception-to-date result bit-identical. `riskMetrics`' `var95`/`cvar95`
+take a REQUIRED `opening` mode selecting whether the first row's `value_col` is seeded as a
+starting position, which is what a series sliced to a date-range window needs. It carries no
+default deliberately: the sign-change check cannot catch a forgotten seed in general (a window
+whose first row happens to carry a flow does bracket a root, and converges on the IRR of a
+different question), so a compile error is the only complete detector. Both also narrow the RATE
+below `rate_tol` (default 1e-9) before returning, because the `1e-2`/`tol` thresholds are on NPV
+and therefore mean different things at different cashflow magnitudes — on a series denominated in
+units of ~0.01 the old test was met at the first midpoint and `xirr` returned 4.505 for a series
+returning 10 %; `rate_tol = null` restores that behaviour bit-for-bit for a caller pinned to old
+numbers. `xirrPreciseNode` is the Newton-first sibling of `xirrNode`. `riskMetrics`' `var95`/`cvar95`
 are historical (empirical), not a parametric fit — the parametric fit lives in `parametricRisk`
 instead, at a caller-chosen `confidence` (95%/99%/…), where `cornishFisherCVaR` integrates the
 CF-adjusted quantile function (fixed-step trapezoidal quadrature) rather than a naive `φ(z_cf)/α`
@@ -61,8 +68,10 @@ reproducible percentile output under the fixed seed, correlationMatrix's min_ove
 drawdownEpisodes' peak→trough→recovery state machine incl. still-underwater-at-series-end (null
 recovery), xirrPrecise's Newton result plus a forced-fallback case landing on the same answer,
 xirr's windowed behaviour on all three `opening` modes (including one fixture where the two seeding
-conventions give opposite signs, which is what pins the chosen double-count convention) and its
-no-root detection, a single test calling EVERY allocating public function on
+conventions give opposite signs, which is what pins the chosen double-count convention), its
+no-root detection, the same +10 % question asked at two cashflow magnitudes six orders apart
+returning the same rate (and returning 4.505 under `rate_tol = null`, the old behaviour),
+xirrPreciseNode's one-row output, a single test calling EVERY allocating public function on
 `std.testing.allocator` so scratch that is never released fails the suite,
 gaussianVaR/CVaR against textbook standard-normal values (with the CVaR≥VaR invariant),
 cornishFisherZ collapsing to the raw z-score at zero skew/kurtosis, skewness/excessKurtosis on a

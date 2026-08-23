@@ -38,15 +38,24 @@ pinned by tests.
   first: no sign change means no rate of return lives inside it, and the
   return is `error.XirrNoRoot` rather than whichever bound bisection walks to.
   The bracket is deliberately not wider — a genuine +1000 % IRR exists on a
-  small position, so what is wanted is detection, not more room.
-- **`XirrSpec.opening`** — by default the series is assumed to start from
-  nothing (inception-to-date), so external flows plus the terminal value are
-  the whole cashflow list. A series sliced out of the middle of a portfolio's
-  life — a date-range window — opens with a position instead, and must say so
-  or that opening value appears from nowhere. Two readings, because which one
-  applies is invisible in the data: `.value_includes_flow` (the first row's
-  value is an end-of-period figure that already contains that row's flow) and
-  `.value_excludes_flow` (it is an opening figure taken before it).
+  small position, so what is wanted is detection, not more room. Bisection
+  additionally has to narrow the RATE below `rate_tol` (default `1e-9`) before
+  returning: the `1e-2` is a threshold on NPV, so what it means depends on the
+  size of the cashflows, and on a series denominated in units of ~0.01 it is
+  met at the first midpoint and the answer is `4.505`. Set `rate_tol = null`
+  to reproduce the pre-2026-08-23 absolute-only behaviour exactly.
+- **`XirrSpec.opening`** — **required, with no default.** `.none` says the
+  series starts from nothing (inception-to-date), so external flows plus the
+  terminal value are the whole cashflow list. A series sliced out of the middle
+  of a portfolio's life — a date-range window — opens with a position instead
+  and must say so, or that opening value appears from nowhere. Two seeding
+  readings, because which applies is invisible in the data:
+  `.value_includes_flow` (the first row's value is an end-of-period figure that
+  already contains that row's flow) and `.value_excludes_flow` (it is an
+  opening figure taken before it). No default because the sign-change check
+  cannot catch a forgotten seed in general — a window whose first row carries a
+  flow brackets a root and converges on the IRR of a different question — so
+  the compiler is the only complete detector.
 - **`annualize`** — CAGR `(1 + total_return)^(365.25/days) − 1`.
 - **`twrDaily`** — Modified-Dietz daily return `r = (v − prev − flow) / pe`,
   skipping rows with performance-eligible base `pe ≤ 1e-6`, with an optional
@@ -123,7 +132,8 @@ fn excessKurtosis(xs: []const f64) f64;
 fn omegaRatio(xs: []const f64, threshold: f64) f64;
 
 // one-row / series / table producers → Dataset
-fn xirrNode(a, d: Dataset, spec: XirrNodeSpec) !Dataset;       // {out}
+fn xirrNode(a, d: Dataset, spec: XirrNodeSpec) XirrError!Dataset;             // {out}
+fn xirrPreciseNode(a, d: Dataset, spec: XirrPreciseNodeSpec) XirrError!Dataset; // {out}
 fn annualizeNode(a, d: Dataset, spec: AnnualizeNodeSpec) !Dataset; // {out}
 fn twrDaily(a, d: Dataset, spec: TwrSpec) !Dataset;            // {d, r}
 fn histogram(a, d: Dataset, spec: HistogramSpec) !Dataset;     // {bin_lo, bin_hi, count}
