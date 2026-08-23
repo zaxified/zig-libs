@@ -125,6 +125,33 @@ test "KAT: proverFinish reproduces Z, V, TT, key schedule, confirmP, and K_share
     try std.testing.expectEqualSlices(u8, &hexN(32, vec.k_shared), &result.k_shared);
 }
 
+test "KAT: verifierConfirm reproduces Z, V, TT, key schedule, and confirmV, byte-exact — with NO confirmP input" {
+    const vec = v.vectors[0];
+    const result = try spake2plus.verifierConfirm(
+        std.testing.allocator,
+        vec.context,
+        vec.id_prover,
+        vec.id_verifier,
+        hexN(32, vec.w0),
+        hexN(65, vec.l),
+        hexN(32, vec.y),
+        hexN(65, vec.share_p),
+        hexN(65, vec.share_v),
+    );
+    defer std.testing.allocator.free(result.tt);
+
+    try std.testing.expectEqualSlices(u8, &hexN(65, vec.z), &result.z);
+    try std.testing.expectEqualSlices(u8, &hexN(65, vec.v), &result.v);
+    try std.testing.expectEqualSlices(u8, &hexN(570, vec.tt), result.tt);
+    try std.testing.expectEqualSlices(u8, &hexN(32, vec.k_main), &result.k_main);
+    try std.testing.expectEqualSlices(u8, &hexN(32, vec.k_confirm_p), &result.k_confirm_p);
+    try std.testing.expectEqualSlices(u8, &hexN(32, vec.k_confirm_v), &result.k_confirm_v);
+    try std.testing.expectEqualSlices(u8, &hexN(32, vec.confirm_v), &result.confirm_v);
+    // Note what is NOT here: no k_shared field exists on this result type
+    // at all (see VerifierConfirmResult's doc comment) — this is checked
+    // by the type system, not an assertion.
+}
+
 test "KAT: verifierFinish reproduces Z, V, TT, key schedule, confirmV, and K_shared, all byte-exact" {
     const vec = v.vectors[0];
     const result = try spake2plus.verifierFinish(
@@ -224,27 +251,54 @@ test "verifierFinish REJECTS an identity-element registration record L (RFC 9383
     ));
 }
 
-// ── property / round-trip / tamper-rejection harness ────────────────────
-
-test "property: end-to-end Prover<->Verifier run (public API only) agrees on K_shared" {
+// ── the false-anchor fix: a GENUINELY BLIND two-party run ───────────────
+//
+// The property test below this one ("end-to-end Prover<->Verifier run")
+// pre-dates `verifierConfirm` and has to fabricate the Verifier's first
+// (`confirmP`-less) call using the VECTOR's own already-published
+// `confirm_p` — see its own comments. That is exactly the false-anchor
+// shape this module's audit flagged: the test only passes because the
+// answer was known in advance, not because the code can produce it blind.
+//
+// This test drives the SAME two parties through the SAME real message
+// order (`proverStart` -> `verifierStart` -> `verifierConfirm` ->
+// `proverFinish` -> `verifierFinish`, RFC 9383 Appendix A.5) but NEVER
+// reads `vec.confirm_p`/`vec.confirm_v` as an INPUT to any call — every
+// confirmation value fed into a function is one this test's own prior
+// call just produced. The only place `vec.confirm_v` appears is a
+// post-hoc equality check on `verifierConfirm`'s OUTPUT, which is not
+// foreknowledge — it is what makes this a byte-exact KAT rather than a
+// bare property test.
+test "false anchor fix: verifierConfirm lets a genuinely blind Verifier go first, no foreknowledge of either confirmation value" {
     const vec = v.vectors[0];
     const w0 = hexN(32, vec.w0);
     const w1 = hexN(32, vec.w1);
     const l = try spake2plus.computeL(w1);
 
+    // Round 1 — each party's first message needs nothing from the peer.
     const share_p = try spake2plus.proverStart(hexN(32, vec.x), w0);
     const share_v = try spake2plus.verifierStart(hexN(32, vec.y), w0);
 
-    // Verifier computes confirmV first (it cannot see the Prover's
-    // confirmP yet — a live transport would send confirmV before
-    // receiving confirmP; this synchronous harness needs BOTH values up
-    // front, so it fabricates a placeholder confirmP for the Verifier's
-    // own first call, then re-derives confirmV independent of it: the
-    // fix is that verifierFinish's confirmV computation does not depend
-    // on received_confirm_p at all, only on confirming it AFTER —
-    // so calling it once with the correct eventual confirmP (known here
-    // because this is a closed two-party simulation, not a live network)
-    // is equivalent to the real protocol's two-phase exchange.
+    // Round 2a — the Verifier goes FIRST (RFC 9383 Appendix A.5): it
+    // computes and transmits confirmV with no confirmP in existence yet.
+    const verifier_confirm = try spake2plus.verifierConfirm(
+        std.testing.allocator,
+        vec.context,
+        vec.id_prover,
+        vec.id_verifier,
+        w0,
+        l,
+        hexN(32, vec.y),
+        share_p,
+        share_v,
+    );
+    defer std.testing.allocator.free(verifier_confirm.tt);
+    // Not foreknowledge: checking the OUTPUT against the published vector,
+    // not supplying it as an input to make the call succeed.
+    try std.testing.expectEqualSlices(u8, &hexN(32, vec.confirm_v), &verifier_confirm.confirm_v);
+
+    // Round 2b — the Prover receives confirmV (just produced above),
+    // validates it, and only then computes its own confirmP + K_shared.
     const prover_result = try spake2plus.proverFinish(
         std.testing.allocator,
         vec.context,
@@ -255,37 +309,12 @@ test "property: end-to-end Prover<->Verifier run (public API only) agrees on K_s
         hexN(32, vec.x),
         share_p,
         share_v,
-        blk: {
-            // The Verifier's confirmV depends only on (Z, V, TT), which
-            // in turn depend only on (share_p, share_v, w0, l/y) — none
-            // of which depend on the Prover's confirmP. So it is safe to
-            // compute the Verifier's half first and feed its confirmV to
-            // the Prover, exactly mirroring the real wire order.
-            const verifier_probe = try spake2plus.verifierFinish(
-                std.testing.allocator,
-                vec.context,
-                vec.id_prover,
-                vec.id_verifier,
-                w0,
-                l,
-                hexN(32, vec.y),
-                share_p,
-                share_v,
-                // Placeholder — this probe call's own confirmP check is
-                // not the one this test relies on; the REAL check
-                // happens on the second verifierFinish call below, after
-                // the Prover's genuine confirmP is in hand. Use the
-                // vector's own (correct) confirmP so this probe's
-                // ConfirmationMismatch branch is not accidentally
-                // exercised here — the tamper tests below cover that.
-                hexN(32, vec.confirm_p),
-            );
-            defer std.testing.allocator.free(verifier_probe.tt);
-            break :blk verifier_probe.confirm_v;
-        },
+        verifier_confirm.confirm_v,
     );
     defer std.testing.allocator.free(prover_result.tt);
 
+    // Round 2c — the Verifier receives confirmP (just produced above),
+    // validates it, and only then obtains K_shared.
     const verifier_result = try spake2plus.verifierFinish(
         std.testing.allocator,
         vec.context,
@@ -303,6 +332,15 @@ test "property: end-to-end Prover<->Verifier run (public API only) agrees on K_s
     try std.testing.expectEqualSlices(u8, &prover_result.k_shared, &verifier_result.k_shared);
     try std.testing.expectEqualSlices(u8, &hexN(32, vec.k_shared), &prover_result.k_shared);
 }
+
+// ── property / round-trip / tamper-rejection harness ────────────────────
+
+// (The end-to-end Prover<->Verifier property run now lives above, as
+// "false anchor fix: verifierConfirm lets a genuinely blind Verifier go
+// first..." — it used to require fabricating the Verifier's confirmV from
+// the vector's own already-published confirmP; `verifierConfirm` removed
+// that need, so the property test and the false-anchor-fix test would
+// otherwise have been near-duplicates.)
 
 test "property: proverFinish REJECTS a tampered received_confirm_v" {
     const vec = v.vectors[0];

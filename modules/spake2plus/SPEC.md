@@ -8,7 +8,10 @@ for purpose and API. Provenance: see [NOTICE](NOTICE).
 crypto cores (`computeW0W1`, `computeL`, `proverStart`, `verifierStart`,
 `deriveKeys`, `proverFinish`, `verifierFinish`) are all implemented — no
 `@panic`/TODO stub remains in `root.zig`. See "The seven crypto cores"
-below for what each does and how it is anchored.
+below for what each does and how it is anchored. An eighth function,
+`verifierConfirm`, was added additively so the real protocol is drivable
+by two genuinely blind parties — see "Driving the real, blind protocol"
+below.
 
 ## Design
 
@@ -210,10 +213,64 @@ Byte-exact oracle for six of the seven: RFC 9383 Appendix C's OFFICIAL
 P-256/SHA-256 test vector (`kat_vectors.zig`), exercised by
 `kat_test.zig`. `computeTranscript` and `mac` pass against this same
 vector too — the transcript/MAC plumbing the six cores feed into is
-correct independent of them. The property-test layer (end-to-end
-Prover<->Verifier agreement on `K_shared`, tamper rejection of a
-corrupted confirmation MAC or a corrupted share) provides a SECOND,
+correct independent of them. The property-test layer (a genuinely blind
+end-to-end Prover<->Verifier run agreeing on `K_shared`, tamper rejection
+of a corrupted confirmation MAC or a corrupted share) provides a SECOND,
 independent correctness signal beyond the byte-exact numbers.
+
+## Driving the real, blind protocol — `verifierConfirm`
+
+`proverFinish` takes the Verifier's `confirmV` as an input and only then
+produces the Prover's `confirmP`. `verifierFinish` takes the Prover's
+`confirmP` as an input and only then produces the Verifier's `confirmV`
+(plus `K_shared`). Read naively as the whole API, this is circular: each
+function needs the OTHER party's confirmation value before it will run,
+and two blind parties — neither of whom starts out knowing anything the
+other hasn't sent — cannot resolve that on their own.
+
+The circularity is not in the protocol; it was in the API surface.
+RFC 9383 Appendix A.5's own pseudocode is not circular, because the two
+roles are not symmetric in when they act: the Verifier computes and
+transmits `confirmV` FIRST, with no `confirmP` in existence yet; only
+after the Prover receives and validates that `confirmV` does it compute
+and transmit `confirmP`; the Verifier's check of `confirmP` is the LAST
+step of the whole protocol. `verifierFinish` models that last step
+correctly (it is only ever called once `confirmP` genuinely exists) —
+but nothing modeled the EARLIER step, the Verifier's confirmV emission,
+which by construction cannot depend on `confirmP`.
+
+`verifierConfirm` is that earlier step, added additively: the same
+`Z = h*y*(X - w0*M)` / `V = h*y*L` / transcript / key-schedule
+computation `verifierFinish` performs, stopping right after
+`confirmV = MAC(K_confirmV, shareP)` — no `received_confirm_p` parameter,
+because this step runs before that value exists, and NO `K_shared` in
+its return type (`VerifierConfirmResult` has no `k_shared` field at
+all — not merely an unused one). RFC 9383 §3.3 is explicit that neither
+party may consider the protocol complete before validating the peer's
+confirmation; a function that handed back `K_shared` before that
+validation would reintroduce the exact class of defect this addition
+fixes, only worse (a silently-unauthenticated key instead of a stuck
+protocol). `proverFinish` needed no equivalent split: `proverStart`
+already gives the Prover a way to emit its first message (`shareP`) with
+no peer input, and by the time the Prover next acts it already holds
+BOTH `shareV` and the Verifier's `confirmV` — the RFC's own pseudocode
+has the Verifier transmit both of those before the Prover does anything
+else, so `proverFinish`'s existing signature already matches the real
+order.
+
+The real, blind sequence is therefore: `proverStart` -> `verifierStart`
+-> `verifierConfirm` (Verifier sends `confirmV`) -> `proverFinish`
+(validates `confirmV`, sends `confirmP`, returns `K_shared`) ->
+`verifierFinish` (validates `confirmP`, returns the matching
+`K_shared`) — see README.md's "Protocol flow" for the runnable code, and
+`kat_test.zig`'s "false anchor fix" test for a version that drives this
+with the official RFC 9383 vector and no foreknowledge of either
+confirmation value. Constant-time discipline is identical to
+`verifierFinish`: `y`/`w0` are secret, so `mPoint().mul`/`l_point.mul`
+use `P256`'s constant-time `mul`, never `mulPublic`/
+`mulDoubleBasePublic`. Ownership follows the same pattern as the other
+six cores: `verifierConfirm` allocates `TT` via `computeTranscript` and
+returns it caller-owned in `VerifierConfirmResult.tt`.
 
 ## Verification
 

@@ -7,44 +7,30 @@
 //! a wrong password (a device re-commissioned with the wrong passphrase)
 //! and a tampered confirmation MAC on each side.
 //!
-//! **A real, load-bearing awkwardness this example had to work around —
-//! not smoothed over.** `proverFinish`/`verifierFinish` are FUSED: each
-//! one requires the PEER's confirmation MAC as an input parameter before
-//! it will compute (or release) its OWN confirmation MAC as output, and
-//! the confirmation-mismatch error path discards the whole result
-//! (`return error.ConfirmationMismatch` loses the correctly-computed
-//! `confirm_p`/`confirm_v` right along with it — Zig error unions carry
-//! no partial success). For two genuinely blind parties this is circular:
-//! neither side can produce a value to SEND without already possessing a
-//! value only the other side can produce. `kat_test.zig`'s own end-to-end
-//! test works around this by feeding the Verifier's probe call the
-//! test vector's ALREADY-PUBLISHED correct `confirmP` — only possible
-//! because a KAT fixture already knows the answer. A fresh scenario (this
-//! file) does not have that luxury, so `verifierConfirmBootstrap` below
-//! reconstructs the Verifier's `Z`/`V`/`TT`/keys/`confirm_v` from
-//! LOWER-LEVEL PUBLIC primitives this module also exports
-//! (`mPoint`/`nPoint`, `computeTranscript`, `deriveKeys`, `mac`, plus
-//! `p256`'s point arithmetic — every one of them `pub`) to get a genuine,
-//! independently-derived `confirm_v` BEFORE either fused entry point is
-//! called at all. That reconstruction duplicates ~10 lines of
-//! `verifierFinish`'s own internal logic — a real integrator hitting this
-//! for the first time has no way to know that duplication is necessary
-//! without reading `verifierFinish`'s doc comment closely (or this file).
+//! **Real message order, genuinely blind on both sides — no workaround.**
+//! `proverStart` -> `verifierStart` -> `verifierConfirm` (the Verifier
+//! transmits `confirmV` FIRST, per RFC 9383 Appendix A.5 — it has no
+//! `confirmP` yet) -> `proverFinish` (validates `confirmV`, only then
+//! computes+transmits `confirmP`, and returns `K_shared`) ->
+//! `verifierFinish` (validates `confirmP`, returns the matching
+//! `K_shared`). Every step below uses only the module's top-level public
+//! API, in exactly this order — no reconstruction of internal primitives
+//! is needed.
 //!
 //! This is an example in the gate sense — it is built by
 //! `zig build check-examples` against the PUBLISHED module (`deps` only,
 //! no `test_deps`, no access to anything the module does not export).
 //!
 //! `std.heap.DebugAllocator` IS needed here, unlike this task's other five
-//! modules: `computeTranscript` (called by both `proverFinish` and
-//! `verifierFinish`, and by this file's own bootstrap reconstruction)
-//! allocates the transcript buffer `TT` and hands ownership to the
-//! caller — `ProverFinishResult.tt`/`VerifierFinishResult.tt` are
-//! ALLOCATOR-OWNED per their own doc comments, and the confirmation-
-//! mismatch failure paths below are exactly the "allocates and returns
-//! early" shape the module's `errdefer allocator.free(tt)` is supposed to
-//! close; this file exercises that under a real leak detector rather than
-//! trusting the doc comment.
+//! modules: `computeTranscript` (called by `verifierConfirm`,
+//! `proverFinish`, and `verifierFinish`) allocates the transcript buffer
+//! `TT` and hands ownership to the caller — `VerifierConfirmResult.tt`/
+//! `ProverFinishResult.tt`/`VerifierFinishResult.tt` are ALLOCATOR-OWNED
+//! per their own doc comments, and the failure paths below are exactly
+//! the "allocates and returns early" shape the module's own
+//! `errdefer allocator.free(tt)` is supposed to close; this file
+//! exercises that under a real leak detector rather than trusting the
+//! doc comment.
 //!
 //! `modules/spake2plus/src/kat_test.zig` already drives RFC 9383 Appendix
 //! C's official P-256/SHA-256 test vector byte-exact (every published
@@ -66,7 +52,6 @@
 
 const std = @import("std");
 const spake = @import("spake2plus");
-const P256 = @import("p256").P256;
 
 /// Expand a label into `n` pseudo-random bytes via SHA-256 counter-mode
 /// expansion. `spake2plus` has no internal RNG (by design — every
@@ -103,58 +88,14 @@ fn w0w1FromLabel(label: []const u8) spake.W0W1 {
     return spake.computeW0W1(&pbkdf_output) catch unreachable; // length is always 80
 }
 
-/// Reconstructs the Verifier's `Z`/`V`/`TT`/key-schedule/`confirm_v`
-/// PURELY from lower-level public primitives — see the file doc comment
-/// for why this is necessary (the fused `verifierFinish` cannot produce
-/// `confirm_v` without already possessing the Prover's `confirm_p`, which
-/// does not exist yet on a first, genuinely-fresh run). Mirrors
-/// `verifierFinish`'s own internal `Z = h*y*(X - w0*M)` / `V = h*y*L`
-/// computation exactly (h = 1 for P-256).
-fn verifierConfirmBootstrap(
-    gpa: std.mem.Allocator,
-    context: []const u8,
-    id_prover: []const u8,
-    id_verifier: []const u8,
-    w0: [32]u8,
-    l: [65]u8,
-    y: [32]u8,
-    share_p: [65]u8,
-    share_v: [65]u8,
-) !struct { confirm_v: [32]u8, k_shared: [32]u8 } {
-    const x_point = try P256.fromSec1(&share_p);
-    try x_point.rejectIdentity();
-    const l_point = try P256.fromSec1(&l);
-    try l_point.rejectIdentity();
-
-    const w0_m = try spake.mPoint().mul(w0, .big);
-    const diff = x_point.sub(w0_m);
-    const z_point = try diff.mul(y, .big);
-    const v_point = try l_point.mul(y, .big);
-
-    const tt = try spake.computeTranscript(
-        gpa,
-        context,
-        id_prover,
-        id_verifier,
-        share_p,
-        share_v,
-        z_point.toUncompressedSec1(),
-        v_point.toUncompressedSec1(),
-        w0,
-    );
-    defer gpa.free(tt);
-    const keys = spake.deriveKeys(tt);
-    return .{ .confirm_v = spake.mac(&keys.k_confirm_v, &share_p), .k_shared = keys.k_shared };
-}
-
 const SessionResult = struct { k_shared_prover: [32]u8, k_shared_verifier: [32]u8 };
 
 /// One full commissioning session, both roles, using ONLY the module's
-/// public entry points (plus the bootstrap reconstruction above, which is
-/// itself built entirely from public primitives) — the real message
-/// order a live deployment follows: shareP/shareV exchange, then the
-/// Verifier's confirmV (bootstrapped), then the Prover's real confirmP,
-/// then the Verifier's real confirmation check.
+/// public entry points, in the real RFC 9383 Appendix A.5 message order:
+/// shareP/shareV exchange, then the Verifier's confirmV (`verifierConfirm`
+/// — the Verifier has not seen any Prover confirmation yet), then the
+/// Prover's real confirmP (`proverFinish`, which validates confirmV
+/// first), then the Verifier's real confirmation check (`verifierFinish`).
 fn runSession(
     gpa: std.mem.Allocator,
     w0: [32]u8,
@@ -166,11 +107,17 @@ fn runSession(
     x: [32]u8,
     y: [32]u8,
 ) !SessionResult {
-    const share_p = try spake.proverStart(x, w0);
-    const share_v = try spake.verifierStart(y, w0);
+    // Round 1: shares. Neither side needs anything from the other yet.
+    const share_p = try spake.proverStart(x, w0); // Prover -> Verifier
+    const share_v = try spake.verifierStart(y, w0); // Verifier -> Prover
 
-    const bootstrap = try verifierConfirmBootstrap(gpa, context, id_prover, id_verifier, w0, l, y, share_p, share_v);
+    // Round 2a: the Verifier goes first — it transmits confirmV with NO
+    // Prover confirmation in existence yet (RFC 9383 Appendix A.5).
+    const verifier_confirm = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, w0, l, y, share_p, share_v);
+    defer gpa.free(verifier_confirm.tt);
 
+    // Round 2b: the Prover validates confirmV (received above) and only
+    // then computes+transmits its own confirmP, receiving K_shared.
     const prover_result = try spake.proverFinish(
         gpa,
         context,
@@ -181,10 +128,12 @@ fn runSession(
         x,
         share_p,
         share_v,
-        bootstrap.confirm_v,
+        verifier_confirm.confirm_v, // Verifier -> Prover
     );
     defer gpa.free(prover_result.tt);
 
+    // Round 2c: the Verifier validates confirmP (received above) and only
+    // then obtains the matching K_shared.
     const verifier_result = try spake.verifierFinish(
         gpa,
         context,
@@ -195,12 +144,11 @@ fn runSession(
         y,
         share_p,
         share_v,
-        prover_result.confirm_p,
+        prover_result.confirm_p, // Prover -> Verifier
     );
     defer gpa.free(verifier_result.tt);
 
     std.debug.assert(std.mem.eql(u8, &prover_result.k_shared, &verifier_result.k_shared));
-    std.debug.assert(std.mem.eql(u8, &prover_result.k_shared, &bootstrap.k_shared));
 
     return .{ .k_shared_prover = prover_result.k_shared, .k_shared_verifier = verifier_result.k_shared };
 }
@@ -248,7 +196,8 @@ pub fn main() !void {
     const scalars3 = w0w1FromLabel("spake2plus example: session 3 (wrong password) ephemeral scalars");
     const share_p3 = try spake.proverStart(scalars3.w0, wrong_password.w0); // prover's WRONG w0
     const share_v3 = try spake.verifierStart(scalars3.w1, w0); // verifier's CORRECT w0
-    const bootstrap3 = try verifierConfirmBootstrap(gpa, context, id_prover, id_verifier, w0, l, scalars3.w1, share_p3, share_v3);
+    const verifier_confirm3 = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, w0, l, scalars3.w1, share_p3, share_v3);
+    defer gpa.free(verifier_confirm3.tt);
     if (spake.proverFinish(
         gpa,
         context,
@@ -259,7 +208,7 @@ pub fn main() !void {
         scalars3.w0,
         share_p3,
         share_v3,
-        bootstrap3.confirm_v,
+        verifier_confirm3.confirm_v,
     )) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
@@ -271,7 +220,8 @@ pub fn main() !void {
     const scalars4 = w0w1FromLabel("spake2plus example: session 4 (tampered confirmP) ephemeral scalars");
     const share_p4 = try spake.proverStart(scalars4.w0, w0);
     const share_v4 = try spake.verifierStart(scalars4.w1, w0);
-    const bootstrap4 = try verifierConfirmBootstrap(gpa, context, id_prover, id_verifier, w0, l, scalars4.w1, share_p4, share_v4);
+    const verifier_confirm4 = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, w0, l, scalars4.w1, share_p4, share_v4);
+    defer gpa.free(verifier_confirm4.tt);
     var prover_result4 = try spake.proverFinish(
         gpa,
         context,
@@ -282,7 +232,7 @@ pub fn main() !void {
         scalars4.w0,
         share_p4,
         share_v4,
-        bootstrap4.confirm_v,
+        verifier_confirm4.confirm_v,
     );
     defer gpa.free(prover_result4.tt);
     prover_result4.confirm_p[0] ^= 0x01; // tamper the MAC in transit

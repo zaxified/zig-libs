@@ -75,6 +75,25 @@
 //! feeding the Verifier's `shareP`/`confirmP` output into the Prover and
 //! vice versa) agrees on `K_shared`.
 //!
+//! **`verifierConfirm` — an eighth, ADDITIVE function, not one of the
+//! seven cores above.** RFC 9383 Appendix A.5's Verifier flow transmits
+//! `confirmV` BEFORE it has received `confirmP` — but `verifierFinish`
+//! (one of the seven cores) requires `received_confirm_p` as an input
+//! parameter, so it cannot be called yet at that point in a genuinely
+//! blind two-party run. `verifierConfirm` is `verifierFinish`'s `Z`/`V`/
+//! `TT`/key-schedule computation with the `confirmP` check (and the
+//! `K_shared` return) removed — it exists so the real message order
+//! (`proverStart` -> `verifierStart` -> `verifierConfirm` ->
+//! `proverFinish` -> `verifierFinish`) is drivable through public API
+//! alone, with neither party ever needing foreknowledge of the other's
+//! confirmation value. `proverFinish` needed no equivalent split:
+//! `proverStart` already lets the Prover emit its first message with no
+//! peer input, and by the time the Prover acts again it already holds
+//! BOTH `shareV` and the Verifier's `confirmV` (RFC 9383's own pseudocode
+//! has the Verifier transmit both before the Prover does anything else)
+//! — see `verifierConfirm`'s own doc comment and README.md's "Protocol
+//! flow" for the runnable sequence.
+//!
 //! Zig std GAP: yes — `std.crypto.ecc.P256` gives the group (field,
 //! scalar, `basePoint`, `mul`, `mulDoubleBasePublic`, `add`/`sub`/`neg`,
 //! `fromSec1`/`toUncompressedSec1`/`toCompressedSec1`, `P256.scalar.
@@ -749,9 +768,163 @@ pub const VerifierFinishResult = struct {
     k_confirm_v: [hash_length]u8,
 };
 
+pub const VerifierConfirmError = error{
+    OutOfMemory,
+    /// `w0`/`y` out of range, or an intermediate point lands on the
+    /// identity — see `verifierFinish`'s identical guard.
+    InvalidScalar,
+    /// `share_p` (`X`, received from the Prover) or `l` (`L`, this
+    /// Verifier's own registration record) fails to parse / is the
+    /// identity — see `VerifierFinishError.InvalidShareP`'s identical RFC
+    /// 9383 §6 rationale.
+    InvalidShareP,
+};
+
+/// One result of the Verifier's confirmation-EMISSION half — deliberately
+/// NOT the same struct as `VerifierFinishResult`: there is no `k_shared`
+/// field here (see `verifierConfirm`'s doc comment for why that omission
+/// is load-bearing, not an oversight).
+pub const VerifierConfirmResult = struct {
+    /// `confirmV = MAC(K_confirmV, shareP)` (RFC 9383 §3.4) — transmit
+    /// this to the Prover. This is the value RFC 9383 Appendix A.5's
+    /// Verifier flow sends BEFORE it has seen the Prover's `confirmP`.
+    confirm_v: [hash_length]u8,
+    /// `Z = h*y*(X - w0*M)` (RFC 9383 §3.3), UNCOMPRESSED SEC1. Exposed
+    /// for the same byte-exact-KAT reason `VerifierFinishResult.z` is.
+    z: [share_length]u8,
+    /// `V = h*y*L` (RFC 9383 §3.3), UNCOMPRESSED SEC1 — see
+    /// `VerifierFinishResult.v`'s doc comment for the commutativity this
+    /// relies on.
+    v: [share_length]u8,
+    /// The assembled transcript `TT` this call fed to `deriveKeys`.
+    /// ALLOCATOR-OWNED — the caller MUST free this with the same
+    /// `allocator` passed to `verifierConfirm` (mirrors
+    /// `VerifierFinishResult.tt`).
+    tt: []u8,
+    k_main: [hash_length]u8,
+    k_confirm_p: [hash_length]u8,
+    k_confirm_v: [hash_length]u8,
+};
+
+/// RFC 9383 §3.3 / Appendix A.2 `VerifierFinish`'s `Z`/`V` half PLUS
+/// Appendix A.5's Verifier flow's `confirmV`-emission half ONLY — the
+/// half that runs BEFORE the Verifier has received the Prover's
+/// `confirmP`:
+///
+/// ```text
+/// // VerifierFinish (§3.3 / Appendix A.2), Z/V half:
+/// if not_in_subgroup(X): abort                          // group-membership check, RFC 9383 §6
+/// Z = h*y*(X - w0*M)                                     // h = 1 for P-256
+/// V = h*y*L                                              // NOT h*w1*(...) — see VerifierFinishResult.v's doc comment
+///
+/// // Appendix A.5 Verifier, continued (confirmV half only):
+/// TT = ComputeTranscript(Context, idProver, idVerifier, shareP, shareV, Z, V, w0)
+/// (K_confirmP, K_confirmV, K_shared) = ComputeKeySchedule(TT)     // deriveKeys(TT)
+/// confirmV = MAC(K_confirmV, shareP)                      // returned for the caller to transmit
+/// // (expected_confirmP / Receive(confirmP) / the final check and
+/// // K_shared return are `verifierFinish`'s job, called separately once
+/// // confirmP has actually arrived — see this function's own doc comment.)
+/// ```
+///
+/// **Why this function exists, additively, next to `verifierFinish`.**
+/// RFC 9383 Appendix A.5's Verifier pseudocode computes `confirmV` and
+/// transmits it BEFORE it has any `confirmP` to check — the Verifier's
+/// `Transmit(confirmV)` line comes before its `confirmP = Receive()`
+/// line. `verifierFinish` (this file, below) takes `received_confirm_p`
+/// as a required parameter, so it literally cannot be called until
+/// `confirmP` already exists — which makes it unusable for producing the
+/// EARLIER `confirmV` message a genuinely blind Verifier must send
+/// first. This function is that earlier step, split out on its own:
+/// same `Z`/`V`/`TT`/key-schedule computation as `verifierFinish`, same
+/// inputs (everything `verifierFinish` needs EXCEPT `received_confirm_p`,
+/// because this step runs before that value exists), but it stops right
+/// after emitting `confirmV` — it does NOT check anything received from
+/// the Prover, and it deliberately does NOT return `K_shared` (see
+/// `VerifierConfirmResult`'s doc comment): RFC 9383 §3.3 is explicit that
+/// neither party may consider the protocol complete before validating
+/// the peer's confirmation, and `K_shared` is only ever safe to hand back
+/// from `verifierFinish`, once `received_confirm_p` has actually been
+/// checked. A caller drives the real, blind two-party protocol as:
+/// `proverStart` -> `verifierStart` -> `verifierConfirm` (send
+/// `confirm_v`) -> `proverFinish` (validates `confirm_v`, sends
+/// `confirm_p`) -> `verifierFinish` (validates `confirm_p`, both sides
+/// now hold `K_shared`) — see README.md's "Protocol flow" for the full
+/// runnable sequence.
+///
+/// `share_v` is `Y`, ALREADY computed by a prior `verifierStart(y, w0)`
+/// call and passed back in here (same division of labor as
+/// `verifierFinish`). `share_p` is `X`, received from the Prover. `l` is
+/// THIS Verifier's registration record for the Prover (`computeL`'s
+/// output). Both multiplications inside `X - w0*M` -> `y*(...)`, and
+/// `y*L`, are SECRET-touching (`y` is secret) and MUST use `P256`'s
+/// constant-time `mul` — identical constant-time discipline to
+/// `verifierFinish`.
+///
+/// Byte-exact target: RFC 9383 Appendix C's official vector's `Z`, `V`,
+/// `TT`, `K_main`, `K_confirmP`, `K_confirmV`, and `confirmV` (same
+/// values `verifierFinish`'s KAT test already pins — `kat_test.zig`
+/// exercises this function directly too, ahead of `confirmP` ever being
+/// computed).
+pub fn verifierConfirm(
+    allocator: std.mem.Allocator,
+    context: []const u8,
+    id_prover: []const u8,
+    id_verifier: []const u8,
+    w0: [scalar_length]u8,
+    l: [share_length]u8,
+    y: [scalar_length]u8,
+    share_p: [share_length]u8,
+    share_v: [share_length]u8,
+) VerifierConfirmError!VerifierConfirmResult {
+    scalar_mod.rejectNonCanonical(w0, .big) catch return error.InvalidScalar;
+    scalar_mod.rejectNonCanonical(y, .big) catch return error.InvalidScalar;
+
+    // RFC 9383 §6 group-membership checks: the received share X, and this
+    // Verifier's own stored registration record L.
+    const x_point = P256.fromSec1(&share_p) catch return error.InvalidShareP;
+    x_point.rejectIdentity() catch return error.InvalidShareP;
+    const l_point = P256.fromSec1(&l) catch return error.InvalidShareP;
+    l_point.rejectIdentity() catch return error.InvalidShareP;
+
+    // Z = h*y*(X - w0*M), V = h*y*L — h = 1; y/w0 are secret ->
+    // constant-time mul. Identical computation to verifierFinish's own
+    // Z/V half (deliberately not factored into a shared private helper —
+    // this file's own convention keeps each RFC-pseudocode step
+    // legible/self-contained, matching proverStart/proverFinish's
+    // sibling split above).
+    const w0_m = mPoint().mul(w0, .big) catch return error.InvalidScalar;
+    const diff = x_point.sub(w0_m);
+    const z_point = diff.mul(y, .big) catch return error.InvalidScalar;
+    const v_point = l_point.mul(y, .big) catch return error.InvalidScalar;
+    const z = z_point.toUncompressedSec1();
+    const v = v_point.toUncompressedSec1();
+
+    const tt = try computeTranscript(allocator, context, id_prover, id_verifier, share_p, share_v, z, v, w0);
+    errdefer allocator.free(tt);
+
+    const keys = deriveKeys(tt);
+
+    return .{
+        .confirm_v = mac(&keys.k_confirm_v, &share_p),
+        .z = z,
+        .v = v,
+        .tt = tt,
+        .k_main = keys.k_main,
+        .k_confirm_p = keys.k_confirm_p,
+        .k_confirm_v = keys.k_confirm_v,
+    };
+}
+
 /// RFC 9383 §3.3 / Appendix A.2 `VerifierFinish`'s `Z`/`V` half (the
 /// share-generation half is `verifierStart` above) + Appendix A.5's
-/// Verifier flow's confirmation-message half:
+/// Verifier flow's confirmation-message half. **This is the LAST step of
+/// the protocol for the Verifier — it requires `received_confirm_p`,
+/// which a genuinely blind Verifier does not have yet at the point it
+/// must emit its own `confirmV`; for that earlier step, see
+/// `verifierConfirm` above** (this function still recomputes `Z`/`V`/`TT`
+/// from scratch from the same inputs, so it does not depend on
+/// `verifierConfirm` having been called first — only on `confirmP`
+/// actually being in hand by the time THIS function is called):
 ///
 /// ```text
 /// // VerifierFinish (§3.3 / Appendix A.2), Z/V half only:
