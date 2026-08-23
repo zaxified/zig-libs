@@ -164,6 +164,45 @@ if [[ $dry_run -eq 1 ]]; then
     exit 0
 fi
 
+# ── example-apps pins ────────────────────────────────────────────────────────
+# The apps under example-apps/ pin zig-libs by tag, because that is what a
+# person who downloads one needs. Bump them to the tag being cut, so a copy
+# taken from tag T is built against T rather than against T-1.
+#
+# Only possible because example-apps/ is OUTSIDE `.paths`: editing an app does
+# not change the package hash, so the hash written here stays correct after the
+# very commit that writes it. Verified by hashing a clean export with and
+# without an example-apps/ tree — identical.
+#
+# Only the FIRST .url/.hash pair is touched. That is the live pin; the
+# commented `#main` / `#<commit>` alternatives below it are left as written.
+bump_app_pins() {
+    local newtag="$1" export_dir pkg_hash z
+    [ -d example-apps ] || return 0
+    export_dir="$(mktemp -d)"
+    git archive HEAD | tar -x -C "$export_dir"
+    if ! pkg_hash="$(zig fetch "$export_dir" 2>/dev/null)"; then
+        echo "tag.sh: could not compute the package hash — example-apps pins NOT bumped" >&2
+        rm -rf "$export_dir"
+        return 1
+    fi
+    rm -rf "$export_dir"
+    for z in example-apps/*/build.zig.zon; do
+        [ -f "$z" ] || continue
+        sed -i "0,/zig-libs#/{s|\(zig-libs#\)[^\"]*|\1$newtag|}" "$z"
+        sed -i "0,/\.hash = /{s|\(\.hash = \"\)[^\"]*|\1$pkg_hash|}" "$z"
+    done
+    if ! git diff --quiet -- example-apps; then
+        git add example-apps
+        git commit -q -m "example-apps: pin $newtag" -m "Cut by scripts/tag.sh so a copy taken from this tag builds against this tag. example-apps/ is outside build.zig.zon's .paths, so this commit does not change the package hash it just wrote."
+        echo "tag.sh: example-apps pins bumped to $newtag ($pkg_hash)"
+    fi
+}
+if [ "${dry_run:-0}" != 1 ]; then
+    bump_app_pins "$tag" || true
+    head_sha="$(git rev-parse HEAD)"
+fi
+
 git tag -a "$tag" -m "$tag
 
 Every module passed every release lane at $head_sha: ReleaseSafe and

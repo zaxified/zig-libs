@@ -175,7 +175,7 @@ const module_list = [_]Module{
     .{ .name = "sealedbox", .libs = &.{"crypto"} },
     .{ .name = "rsa", .libs = &.{ "crypto", "net", "web" }, .deps = &.{"montint"}, .heavy = true, .example = true },
     .{ .name = "blindrsa", .libs = &.{"crypto"}, .deps = &.{"rsa"} },
-    .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .heavy = true, .example = true, .live = true },
+    .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .heavy = true, .live = true },
     .{ .name = "netconf", .libs = &.{"net"}, .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .example = true },
     .{ .name = "trie", .libs = &.{"storage"}, .example = true },
@@ -892,6 +892,15 @@ pub fn build(b: *std.Build) void {
         b.step(cfg[1], cfg[2]).dependOn(&st.step);
     }
 
+    // `zig build app-list` — the names in `example_apps`, one per line, so
+    // `scripts/check-apps.sh` reads the registry instead of globbing (a glob
+    // would silently include a directory nobody declared).
+    {
+        const st = b.allocator.create(std.Build.Step) catch @panic("OOM");
+        st.* = std.Build.Step.init(.{ .id = .custom, .name = "app-list", .owner = b, .makeFn = printAppList });
+        b.step("app-list", "Print the example-apps/ projects declared in build.zig, one per line").dependOn(st);
+    }
+
     // `zig build check-package` — see `checkPackagePaths`.
     {
         const st = b.allocator.create(std.Build.Step) catch @panic("OOM");
@@ -1257,6 +1266,42 @@ pub fn build(b: *std.Build) void {
 /// drives it through the code whose constant-time property that module's
 /// SPEC.md claims. Adding a row here is what puts the new harness into
 /// `zig build ctgrind` and into the `check-ctgrind` rot guard.
+/// Standalone consumer projects under `example-apps/`. Each has its own
+/// `build.zig`/`build.zig.zon` and pins zig-libs by dated tag, so a copy taken
+/// out of the repo builds on its own -- that is the point: they are what a new
+/// user downloads, and `init.sh` is the one command that gets them running.
+///
+/// We get two more uses out of the same directory, and both are arranged from
+/// OUTSIDE the app so its manifest stays the customer's:
+///
+///   1. `zig build --fork=../..` builds it against the commit under test, so a
+///      published API this collection breaks is caught by something shaped
+///      like a consumer rather than like a test.
+///   2. Two builds of the SAME source at two versions can be run against each
+///      other -- a server from the previous tag against a client from the
+///      commit under test -- which is a wire-compatibility check no in-repo
+///      test can be. That needs the source to compile against BOTH, so an app
+///      is written against the TAGGED API and never against unreleased work.
+///
+/// `modules` is what the app imports. An app importing exactly one module is a
+/// consumer-shaped build of that module's published API, so it discharges that
+/// module's example obligation (CONVENTIONS.md §7.2) exactly as
+/// `modules/<m>/example/` does.
+const example_apps = [_]struct {
+    name: []const u8,
+    modules: []const []const u8,
+}{
+    .{ .name = "ssh-demo", .modules = &.{"ssh"} },
+};
+
+/// Does an `example-apps/` entry already discharge this module's obligation?
+fn appCoversModule(name: []const u8) bool {
+    for (example_apps) |app| {
+        if (app.modules.len == 1 and std.mem.eql(u8, app.modules[0], name)) return true;
+    }
+    return false;
+}
+
 /// Which modules own a constant-time harness. DERIVED, never listed: the fact
 /// is `modules/<m>/src/ctgrind_harness.zig` existing, and that file is its own
 /// declaration. It used to be written out three times — here, and twice in
@@ -1350,7 +1395,11 @@ fn checkExampleDecls(step: *std.Build.Step, options: std.Build.Step.MakeOptions)
         // scope was picked once, by hand, and the next module to cross the
         // threshold would cross it silently -- which is exactly how the ten
         // largest modules here went years without an outside caller.
-        if (!m.example) {
+        // An `example-apps/` project that imports exactly this module is the
+        // same discharge by a different route: a standalone consumer build of
+        // the published API, and a stricter one, since it goes through the
+        // package machinery rather than an in-repo `addImport`.
+        if (!m.example and !appCoversModule(m.name)) {
             const t = try exampleTriggers(b, io, m.name);
             if (t.pub_fns >= example_pub_fn_threshold) {
                 std.debug.print("check-example-decls: {s} has {d} `pub fn` (threshold {d}) and no example -- see CONVENTIONS.md 7.2\n", .{ m.name, t.pub_fns, example_pub_fn_threshold });
@@ -1736,6 +1785,18 @@ fn metaStringField(src: []const u8, field: []const u8) ?[]const u8 {
 ///
 /// Only these two are checked. The rest of `.paths` is a judgement about what
 /// is useful to ship; these two are not.
+fn printAppList(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    var out: std.Io.Writer.Allocating = .init(b.allocator);
+    defer out.deinit();
+    for (example_apps) |app| try out.writer.print("{s}\n", .{app.name});
+    var buf: [512]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(b.graph.io, &buf);
+    try stdout.interface.writeAll(out.written());
+    try stdout.interface.flush();
+}
+
 fn checkPackagePaths(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
     _ = options;
     const b = step.owner;

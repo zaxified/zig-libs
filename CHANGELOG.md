@@ -24,6 +24,28 @@ directory.
 
 ### Collection-wide notes (belong to no single module)
 
+- **New `example-apps/`:** standalone applications built on zig-libs, each its
+  own project with its own `build.zig`/`build.zig.zon` and a dependency pinned
+  to a dated release tag. Copy a directory anywhere, run `./init.sh`, get a
+  binary — the primary purpose, and the manifests are written for it alone.
+  First one is `ssh-demo`, moved out of `modules/ssh/example/` where 2339 lines
+  of client-and-server had been squeezed into the single file that slot allows.
+  Two further uses are arranged from OUTSIDE the app so its manifest stays the
+  customer's: `scripts/check-apps.sh` builds each with `zig build --fork=../..`,
+  overriding the pin with the working tree — the only check here that reaches
+  the published API through the real package machinery — and two builds of the
+  same source at two versions can be run against each other, which is a
+  wire-compatibility check no in-repo test can be, since both sides of one are
+  always the same version. That second use is why an app is written against the
+  TAGGED API and never against unreleased work. `scripts/tag.sh` rewrites the
+  pins when a tag is cut, which works only because `example-apps/` is outside
+  `.paths`: editing an app does not change the package hash, so the hash the
+  bump writes stays correct after the commit that writes it (verified by
+  hashing a clean export with and without an `example-apps/` tree). An app
+  importing exactly one module discharges that module's example obligation —
+  more strictly than `modules/<m>/example/` does, since it goes through the
+  package manager rather than an in-repo `addImport`.
+
 - **Packaging fix:** `build.zig.zon`'s `.paths` did not list `LICENSE` or
   `NOTICE`, so neither was part of the package. `.paths` decides what a
   consumer actually receives; a file outside it is visible on GitHub and absent

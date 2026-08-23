@@ -688,6 +688,32 @@ jobs:
   # reads job RESULTS, and "ran less than it should have" is not visible in a
   # result. Which is worth remembering the next time something here needs
   # asserting — the answer may again be in the driver rather than in this file.
+  # ⚠ NON-BLOCKING ON PURPOSE, until this lane has been debugged in anger.
+  # `gate` does not `need` it and does not read its result, so a red run here
+  # cannot fail a commit. Promote it by adding `consumer` to `gate`'s `needs`
+  # and asserting its result there — and not before it has been green across a
+  # few real tags, because its whole point is a code path (the package manager)
+  # that no other lane exercises.
+  consumer:
+    name: consumer build (non-blocking)
+    needs: [scoped, full, plan]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # Builds every example-apps/ project against THIS commit, through the
+      # package machinery rather than an in-repo addImport. An app builds
+      # against its pinned tag but not against this tree exactly when this
+      # commit broke a published API.
+      - name: example-apps against this commit
+        run: bash scripts/check-apps.sh
+
   gate:
     name: gate
     if: always()
