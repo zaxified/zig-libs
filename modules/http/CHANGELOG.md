@@ -5,6 +5,39 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-23** — **`Client.Options.user_agent` now reaches HTTP/2 too; it was
+  silently dropped there.** Every one of the option's call sites flowed into the
+  HTTP/1 head writer and nowhere else, so the same `Client` with the same
+  options sent `User-Agent` over h1 and nothing at all over h2c — on one route,
+  ours reported `user-agent: null` while curl reported `curl/8.x`. A caller
+  could not tell: nothing errored, and only the peer could see it. `connectH2c`
+  now passes it down as the h2 session's connection-wide default (new
+  `h2_client.Options.user_agent`, `null` by default, so the engine used
+  directly behaves exactly as before). Precedence is h1's: a `user-agent` in the
+  request's own `headers` wins, matched case-insensitively even though the name
+  goes on the h2 wire lowercased (RFC 9113 §8.2.1). Set
+  `h2_client.Options.user_agent` yourself on the BYO-TLS `connectH2Over` path,
+  which has no `Client` to read it from. `Options.user_agent` also gained the
+  doc comment it never had. New loopback test *"h2c dogfood: a client-wide
+  `user_agent` reaches HTTP/2, and a per-request one still wins"* asserts what
+  the SERVER received on both protocols in one test, so the two cannot drift
+  apart again; the example's self-demo asserts the same thing from outside the
+  module. `zig build test-http` — 454/454 (was 453). Mutation-checked twice:
+  renaming the `ua_header` constant and reverting `connectH2c` to pass the
+  caller's options through unchanged each turn the new test red and nothing
+  else.
+- **2026-08-23** — `example/main.zig`: the no-argument self-demo — the run
+  automation performs — now covers h2c and the cancelation seam, and asserts
+  their outcomes. It hard-coded `.h2c = false` and only ever drove HTTP/1.1;
+  the h2c half needed `server --h2c` + `client --h2c` and the cancelation half
+  needed `client --cancel-after`, so the file's own two most valuable pieces
+  ran only when a human typed them. Four legs now: h1 `/hello`, `/truncate`
+  (whose `readFailure()` must NOT say `Canceled` — the control), h2c with two
+  streams opened before either is collected, and `/slow` with the body read
+  canceled mid-flight (`reader()` says `ReadFailed`, `readFailure()` recovers
+  `Canceled`, both asserted). Module code untouched; runs in ~0.3 s on
+  loopback with no network. The `⚠ MODULE GAP` note about `user_agent` on h2
+  is rewritten as the closed finding it now is.
 - **2026-08-22** — **Public API addition.** New `Response.readFailure() Error`:
   recovers the same `error.Canceled`-vs-`error.ReadFailed` distinction
   `Conn.readFailure` already gives `readAllAlloc` internally, but for a caller

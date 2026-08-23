@@ -87,6 +87,11 @@ const Allocator = std.mem.Allocator;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 
+/// The `user-agent` field name, already lowercase for the wire (§8.2.1).
+/// Written once so `Options.user_agent`'s emission and the "did the caller
+/// already supply one?" test cannot name two different headers.
+const ua_header = "user-agent";
+
 /// Everything a `Session` call can fail with. Stream-scoped failures
 /// (`StreamReset`, `StreamRefused`) leave the session usable; the rest of
 /// the connection-scoped ones latch (`Session.broken`) and repeat.
@@ -127,6 +132,17 @@ pub const Options = struct {
     max_continuation_frames: u32 = 32,
     max_reset_streams: u32 = 100,
     max_unproductive_frames: u32 = 1024,
+    /// Connection-wide default `user-agent` (§8.2.1 wants it lowercase on the
+    /// wire, and that is what goes out). Applied to every request this session
+    /// opens **unless** the request's own `headers` already carry a
+    /// `user-agent` (matched case-insensitively, since a caller may well have
+    /// typed `User-Agent`) — the same per-request-wins precedence the HTTP/1
+    /// writer uses. `null` (the default) sends none at all, which is what this
+    /// engine has always done; `Client.connectH2c` fills it in from
+    /// `Client.Options.user_agent` so a client-wide setting reaches h2 exactly
+    /// as it reaches h1. The slice is borrowed, not copied: it must outlive
+    /// the session.
+    user_agent: ?[]const u8 = null,
 };
 
 /// The request *head* — everything `openStream` needs. `RequestOptions`
@@ -282,6 +298,9 @@ pub const Session = struct {
     broken: ?Error = null,
     /// §7 code of the most recent `error.StreamReset`.
     last_reset_code: ?h2.ErrorCode = null,
+    /// `Options.user_agent`, borrowed: the default `user-agent` for every
+    /// request this session opens.
+    user_agent: ?[]const u8 = null,
 
     pub const Goaway = struct { last_stream_id: u31, code: h2.ErrorCode };
 
@@ -299,6 +318,7 @@ pub const Session = struct {
                 .max_reset_streams = options.max_reset_streams,
                 .max_unproductive_frames = options.max_unproductive_frames,
             }),
+            .user_agent = options.user_agent,
         };
         errdefer s.deinit();
         try s.conn.sendPreface(&s.wire);
@@ -384,16 +404,29 @@ pub const Session = struct {
         if (options.authority) |a| {
             if (a.len != 0) try fields.append(arena, .{ .name = ":authority", .value = a });
         }
+        var custom_ua = false;
         for (options.headers) |hd| {
             if (isConnectionSpecific(hd.name) or std.ascii.eqlIgnoreCase(hd.name, "host"))
                 continue;
             if (std.ascii.eqlIgnoreCase(hd.name, "te") and
                 !std.mem.eql(u8, hd.value, "trailers")) continue;
+            // Names are lowercase on the wire (§8.2.1), but the caller may have
+            // typed any case — so the "did they supply one?" test is
+            // case-insensitive, exactly as the h1 head writer's is.
+            if (std.ascii.eqlIgnoreCase(hd.name, ua_header)) custom_ua = true;
             try fields.append(arena, .{
                 .name = try std.ascii.allocLowerString(arena, hd.name),
                 .value = hd.value,
             });
         }
+        // The session-wide default, per request and last: a caller-supplied
+        // `user-agent` wins, which is the precedence h1 has always had. Without
+        // this the field reached h1 and was silently dropped on h2 — the same
+        // `Client.Options.user_agent` producing `user-agent: null` on one of
+        // the client's two protocols.
+        if (!custom_ua) if (s.user_agent) |ua| {
+            try fields.append(arena, .{ .name = ua_header, .value = ua });
+        };
 
         const sid = s.conn.startStream(&s.wire, fields.items, end_stream) catch |err|
             switch (err) {

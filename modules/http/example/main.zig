@@ -43,6 +43,14 @@
 //! side. `/truncate` is the control — the same code, a genuinely broken
 //! connection, and `readFailure()` says `ReadFailed` there.
 //!
+//! **The no-argument self-demo runs all of that**, not a subset: HTTP/1.1,
+//! h2c with two streams in flight on one connection, and the cancelation
+//! against its `/truncate` control — every one of them ASSERTED, since a leg
+//! that only printed would pass while broken. That matters because the
+//! no-argument run is the one automation performs; h2c and cancelation used
+//! to be reachable only by a human typing `--h2c` / `--cancel-after`, so the
+//! two pieces this file exists for were the two nothing ever executed.
+//!
 //! **Directory serving is deliberately absent.** That is the `staticfiles`
 //! module's job, with path-traversal-safe resolution this file has no
 //! business reimplementing. What is here is a small routed handler with a
@@ -73,8 +81,10 @@ const usage_text =
     \\http-demo — an HTTP/1.1 + h2c client/server demo for the `http` module.
     \\
     \\usage:
-    \\  http-demo                       self-demo: real server + real client,
-    \\                                  loopback only, asserted (no args needed)
+    \\  http-demo                       self-demo (no args needed): real server +
+    \\                                  real client on loopback — HTTP/1.1, h2c
+    \\                                  multiplexing and a canceled body read,
+    \\                                  every outcome asserted
     \\  http-demo server [options]
     \\  http-demo client <url> [options]
     \\
@@ -159,22 +169,43 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 // `http.Client` that `client` mode uses — this is not a separate fixture, it
 // is the module's server and the module's client, wired to each other. The
 // server's accept loop runs as a concurrent task on `io` (`Server.shutdown`
-// is documented safe from another task); the main task drives two requests
-// over one pooled keep-alive connection, and `--once` on the server means
-// that connection closing is what ends the accept loop.
+// is documented safe from another task) and the main task drives four legs
+// against it:
+//
+//   1. GET /hello over HTTP/1.1 — the positive path.
+//   2. GET /truncate over the SAME pooled connection — a lying
+//      Content-Length, which must FAIL the body read rather than truncate
+//      silently. `readFailure()` says `ReadFailed`: a broken connection.
+//   3. h2c — the same handler, the same client, over cleartext HTTP/2, with
+//      two streams opened before either is collected so the multiplexing is
+//      exercised and not merely described.
+//   4. GET /slow with the body read CANCELED mid-flight — `readFailure()`
+//      says `Canceled` here, and that leg 2 says something else is the whole
+//      value of the seam.
+//
+// Legs 3 and 4 used to exist only behind `client --h2c` / `client
+// --cancel-after`, i.e. only when a human typed them: the no-argument run —
+// the one the gate performs — reached neither, so the example's two most
+// valuable pieces were never actually run by anything. Everything here is
+// ASSERTED; a leg that only printed would pass while broken.
+//
+// This means the self-demo serves SEVERAL connections, so `--once` (which
+// stops the listener at the first `.closed`) is deliberately off: the
+// explicit `shutdown` at the end is what ends the accept loop.
 
 fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
     var state: ServerState = .{
         .io = io,
         .verbose = false,
-        .h2c = false,
-        .once = true, // one connection served, then the accept loop returns
+        .h2c = true, // one handler, both protocols — leg 3 relies on it
+        .once = false,
     };
     var server: http.Server = .init(io, gpa, .{
         .handler = handle,
         .context = state.context(),
         .addr = "127.0.0.1",
         .port = 0, // ephemeral: Server.boundAddress() reports what the kernel picked
+        .enable_h2c = true,
         .max_body_bytes = 64 << 20,
         .server_name = "http-demo/1.0 (zig-libs-http self-demo)",
         .on_conn_state = onConnState,
@@ -205,11 +236,7 @@ fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
     }
 
     var client: http.Client = .init(io, gpa, .{ .user_agent = "http-demo-selfdemo/1.0" });
-    // Closing the client's pooled connection is what makes the SECOND
-    // request's connection close observable to the server if the handler
-    // itself has not already done so — see the /truncate request below.
-    var client_closed = false;
-    defer if (!client_closed) client.deinit();
+    defer client.deinit();
 
     var url_buf: [64]u8 = undefined;
     const hello_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello?name=selfdemo", .{port}) catch unreachable;
@@ -236,6 +263,11 @@ fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
     if (std.mem.indexOf(u8, body, "query:      name=selfdemo\n") == null) {
         @panic("http-demo self-demo: /hello did not echo the query string");
     }
+    // `Client.Options.user_agent` reached the wire. Asserted on BOTH protocols
+    // (leg 3 repeats it over h2c) because it once reached only one of them.
+    if (std.mem.indexOf(u8, body, selfdemo_ua_line) == null) {
+        @panic("http-demo self-demo: /hello did not see the client's User-Agent over h1");
+    }
 
     // ── request 2: GET /truncate — the negative path. The handler declares a
     // Content-Length it never honours and then fails (see `serveTruncate`);
@@ -258,15 +290,26 @@ fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
         gpa.free(b);
         @panic("http-demo self-demo: /truncate's lying Content-Length was not caught — the body read must fail");
     } else |_| {
-        // Any error is the point: the connection died mid-body against a
-        // declared length. `readFailure()` (see the client demo's
-        // cancellation section) names the precise cause when the caller
-        // needs it; here the FAILURE itself is what is being proven.
+        // The FAILURE is the point — but which failure matters too: this is
+        // the CONTROL for leg 4. `readFailure()` must NOT say `Canceled`
+        // here, or the seam that leg 4 relies on would be answering
+        // "canceled" to everything and proving nothing.
+        const cause = res2.readFailure();
+        if (cause == error.Canceled) {
+            @panic("http-demo self-demo: /truncate reported Canceled — the readFailure() seam does not distinguish");
+        }
     }
     res2.deinit();
 
-    client.deinit();
-    client_closed = true;
+    // ── leg 3: the SAME handler and the SAME client over cleartext HTTP/2 ──
+    // Only reachable by hand (`server --h2c` + `client --h2c`) until this ran
+    // it: `zig build run-example-http` passes no arguments, so the h2c half of
+    // the demo — the thing its own module doc calls the point — was never
+    // executed by the gate.
+    if (runSelfDemoH2c(gpa, &client, port) != 0) return local_failure_exit;
+
+    // ── leg 4: the cancellation seam, asserted ────────────────────────────
+    if (runSelfDemoCancel(io, &client, port) != 0) return local_failure_exit;
 
     server.shutdown();
     serve_fut.await(io) catch |err| {
@@ -278,13 +321,147 @@ fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
         "http-demo self-demo: OK\n" ++
             "  real http.Server + real http.Client, one process, over 127.0.0.1:{d}.\n" ++
             "  GET /hello?name=selfdemo -> 200, content-type asserted, X-Demo-Route\n" ++
-            "  asserted, body prefix and echoed query asserted.\n" ++
+            "  asserted, body prefix, echoed query and User-Agent asserted.\n" ++
             "  GET /truncate -> 200 head, then the body read FAILED as asserted (the\n" ++
-            "  handler's lying Content-Length, caught rather than silently truncated).\n" ++
+            "  handler's lying Content-Length, caught rather than silently truncated),\n" ++
+            "  and readFailure() did NOT call it a cancelation — the control for below.\n" ++
+            "  h2c: two streams opened on ONE connection before either was collected,\n" ++
+            "  both demultiplexed to their own answer, User-Agent asserted there too.\n" ++
+            "  GET /slow with the body read CANCELED mid-body: reader() said ReadFailed\n" ++
+            "  and Response.readFailure() recovered error.Canceled, both asserted.\n" ++
             "  no TLS, no real network beyond loopback.\n" ++
             "  see --help for the server/client subcommands this binary also offers.\n",
         .{port},
     );
+    return 0;
+}
+
+/// What `/hello` and `/headers` must report back for the self-demo's client.
+/// One string, so the h1 leg and the h2c leg cannot assert different things.
+const selfdemo_ua_line = "user-agent: http-demo-selfdemo/1.0\n";
+
+/// Leg 3 — h2c against the same server, two streams in flight at once.
+/// Returns 0 on success; anything else has already printed why.
+fn runSelfDemoH2c(gpa: Allocator, client: *http.Client, port: u16) u8 {
+    const session = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
+        std.debug.print("http-demo self-demo: h2c connect to 127.0.0.1:{d} failed: {t}\n", .{ port, err });
+        return local_failure_exit;
+    };
+    defer session.close();
+
+    // Both opened BEFORE either is awaited: on h1 this would need two
+    // connections, and collecting them in reverse order is what shows the
+    // demux table doing its job rather than a queue.
+    const sid_a = session.request(.get, "/hello?name=h2c-a", .{}) catch |err| {
+        std.debug.print("http-demo self-demo: opening h2 stream a failed: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    const sid_b = session.request(.get, "/hello?name=h2c-b", .{}) catch |err| {
+        std.debug.print("http-demo self-demo: opening h2 stream b failed: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    if (sid_a == sid_b) @panic("http-demo self-demo: h2c handed out one stream id twice");
+
+    var res_b = session.awaitResponse(sid_b) catch |err| {
+        std.debug.print("http-demo self-demo: h2 stream b failed: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    defer res_b.deinit(gpa);
+    var res_a = session.awaitResponse(sid_a) catch |err| {
+        std.debug.print("http-demo self-demo: h2 stream a failed: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    defer res_a.deinit(gpa);
+
+    if (res_a.status != 200 or res_b.status != 200) @panic("http-demo self-demo: h2c /hello did not answer 200");
+    // Each response carries its OWN query back — collected in reverse, so a
+    // demux that mixed the two would land here.
+    if (std.mem.indexOf(u8, res_a.body, "query:      name=h2c-a\n") == null) {
+        @panic("http-demo self-demo: h2c stream a came back with the wrong body");
+    }
+    if (std.mem.indexOf(u8, res_b.body, "query:      name=h2c-b\n") == null) {
+        @panic("http-demo self-demo: h2c stream b came back with the wrong body");
+    }
+    // Header names arrive lowercase over h2 (RFC 9113 §8.2.1) and `header` is
+    // case-insensitive, which is what makes this the same assertion as h1's.
+    const ct = res_a.header("content-type") orelse @panic("http-demo self-demo: h2c /hello has no content-type");
+    if (!std.mem.eql(u8, ct, "text/plain; charset=utf-8")) {
+        @panic("http-demo self-demo: h2c /hello content-type mismatch");
+    }
+    // The client-wide `Options.user_agent` on the OTHER protocol. This is the
+    // assertion the ⚠ MODULE GAP note in `runClientH2c` used to describe as
+    // unmet: it printed `user-agent: null` here while h1 printed the option.
+    if (std.mem.indexOf(u8, res_a.body, selfdemo_ua_line) == null) {
+        @panic("http-demo self-demo: the client's User-Agent did not reach the h2c request");
+    }
+    return 0;
+}
+
+/// Leg 4 — park a body read on `/slow`, cancel it, and assert BOTH answers:
+/// the one the reader's error set can express and the one only
+/// `Response.readFailure()` can. `/truncate` in leg 2 is the control that
+/// keeps this from passing on a seam that always says "canceled".
+///
+/// The timing is one-sided on purpose: the server sleeps
+/// `slow_gap_ms × slow_chunks` in total and the cancel fires after
+/// `cancel_after_ms`, two orders of magnitude earlier, so the "body finished
+/// first" branch is not a race this can lose — it would take a ~20× stall to
+/// reach it, and it is reported rather than silently tolerated.
+fn runSelfDemoCancel(io: std.Io, client: *http.Client, port: u16) u8 {
+    const slow_gap_ms = 40;
+    const slow_chunks = 50;
+    const cancel_after_ms = 120;
+
+    var url_buf: [96]u8 = undefined;
+    const slow_url = std.fmt.bufPrint(
+        &url_buf,
+        "http://127.0.0.1:{d}/slow?ms={d}&n={d}",
+        .{ port, slow_gap_ms, slow_chunks },
+    ) catch unreachable;
+
+    var res = client.request(.get, slow_url, .{}) catch |err| {
+        std.debug.print("http-demo self-demo: GET /slow failed: {t}\n", .{err});
+        return local_failure_exit;
+    };
+    defer res.deinit();
+    if (res.status != 200) @panic("http-demo self-demo: /slow did not answer 200");
+
+    var drain: Drain = .{ .res = &res };
+    var fut = io.concurrent(Drain.run, .{&drain}) catch |err| {
+        // Real and documented: with no spare unit of concurrency there is no
+        // task to cancel, so the demonstration is impossible rather than
+        // merely slow. The accept loop above already needed one, so reaching
+        // this means the pool shrank under us.
+        std.debug.print("http-demo self-demo: no unit of concurrency available ({t}) — cannot cancel\n", .{err});
+        return local_failure_exit;
+    };
+    io.sleep(.fromMilliseconds(cancel_after_ms), .awake) catch {};
+
+    if (fut.cancel(io)) |n| {
+        std.debug.print(
+            "http-demo self-demo: the {d}-chunk /slow body finished in under {d} ms ({d} bytes) — nothing was canceled\n",
+            .{ slow_chunks, cancel_after_ms, n },
+        );
+        return local_failure_exit;
+    } else |err| {
+        // The two answers, both required. `error.Canceled` is what the drain
+        // returns because `readFailure()` recovered it; `error.ReadFailed` is
+        // all the `*std.Io.Reader` could say on its own.
+        if (err != error.Canceled) {
+            std.debug.print("http-demo self-demo: the canceled /slow read reported {t}, not Canceled\n", .{err});
+            return local_failure_exit;
+        }
+        const said = drain.reader_said orelse
+            @panic("http-demo self-demo: the canceled read recorded no reader error at all");
+        if (said != error.ReadFailed) {
+            @panic("http-demo self-demo: the reader did not report ReadFailed for the canceled read");
+        }
+        const recovered = drain.real_cause orelse
+            @panic("http-demo self-demo: readFailure() was never consulted for the canceled read");
+        if (recovered != error.Canceled) {
+            @panic("http-demo self-demo: Response.readFailure() did not recover the cancelation");
+        }
+    }
     return 0;
 }
 
@@ -1038,18 +1215,26 @@ fn runClientH2c(gpa: Allocator, client: *http.Client, url: http.Url, opts: *cons
     // HTTP/1.1 request line and answers 505, which is why this is opt-in on
     // both ends.
     //
-    // ⚠ MODULE GAP, found by running this and visible on `/headers`. The
-    // automatic request fields are written by the h1 request writer and by
-    // nothing else, so the SAME `Client` with the SAME options sends
+    // ⚠ MODULE GAP, found by running this and visible on `/headers` — now
+    // CLOSED (2026-08-23), and worth keeping written down because running the
+    // example is what found it. The automatic request fields were written by
+    // the h1 request writer and by nothing else, so the SAME `Client` with the
+    // SAME options sent
     //
     //     h1:   Host, User-Agent (Options.user_agent), Accept-Encoding
     //     h2c:  :authority only
     //
-    // An `Options.user_agent` a caller set is silently dropped on one of the
-    // client's two protocols — `/hello` prints `user-agent: null` for us and
-    // `curl/8.18.0` for curl, on the same route. Passing it per request via
-    // `RequestOptions.headers` is the workaround; it is not what a
-    // client-wide option promises.
+    // — `/hello` printed `user-agent: null` for us and `curl/8.18.0` for curl
+    // on the same route. `Options.user_agent` now reaches the h2 session as
+    // its connection-wide default; a per-request `user-agent` in
+    // `RequestOptions.headers` still wins, exactly as on h1. The self-demo
+    // asserts it on both protocols so it cannot come back.
+    //
+    // Still asymmetric, and deliberately outside this fix: `Host` has no h2
+    // form at all — `:authority` carries it (§8.3.1) — and h1's
+    // `Accept-Encoding: identity` is an opt-OUT the client sends because it
+    // does not decompress, where h2 sends nothing. A server that compresses
+    // only when asked treats those the same; they are not the same promise.
     const session = client.connectH2c(url.host, url.port, .{}) catch |err| {
         std.debug.print("http-demo: h2c connect to {s}:{d} failed: {t}\n", .{ url.host, url.port, err });
         if (err == error.ConnectFailed) std.debug.print(

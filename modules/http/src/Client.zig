@@ -135,6 +135,16 @@ pub const Options = struct {
     write_buffer_size: usize = 4 * 1024,
     /// Upper bound for a whole response head (status line + headers).
     max_head_bytes: usize = 16 * 1024,
+    /// Client-wide `User-Agent`, sent on every request **on both protocols**:
+    /// the h1 head writer emits it, and `connectH2c` hands it to the h2
+    /// session as its connection-wide default (`h2_client.Options.user_agent`)
+    /// so the same option means the same thing over h2c. A per-request
+    /// `user-agent` in `RequestOptions.headers` overrides it — on h1 the name
+    /// is matched case-insensitively, and on h2 likewise, even though the name
+    /// goes on that wire lowercased (RFC 9113 §8.2.1). Borrowed, not copied:
+    /// it must outlive the `Client`. On the BYO-TLS h2 path
+    /// (`connectH2Over`) there is no `Client` to read this from, so set
+    /// `h2_client.Options.user_agent` on that call yourself.
     user_agent: []const u8 = "zig-libs-http/0.1",
     /// h1 keep-alive connection pooling (see the module doc). Defaults on;
     /// set `.enabled = false` for the old one-connection-per-request
@@ -921,6 +931,10 @@ pub const H2Session = struct {
 /// session that follows is NOT bounded by `total_timeout_ms` — see the
 /// module doc's timeout model for why an h2 session has no single exchange
 /// to put a budget on.
+///
+/// `Options.user_agent` carries over: it becomes the session's default
+/// `user-agent` unless `options.user_agent` is set here (and either is still
+/// overridden per request by a `user-agent` in that request's `headers`).
 pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Options) Error!*H2Session {
     const url: http.Url = .{ .scheme = .http, .host = host, .port = port, .path = "/", .query = "" };
 
@@ -946,6 +960,13 @@ pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Op
     if (c.options.buffer_pool) |bp| {
         if (bp.slab_size != slab_len) return error.BufferPoolSizeMismatch;
     }
+    // A client-wide `Options.user_agent` reaches h2 the same way it reaches
+    // h1: as the session's connection-wide default, overridable per request.
+    // An explicit `h2_client.Options.user_agent` on this call still wins — a
+    // caller who says something here meant it.
+    var h2_options = options;
+    if (h2_options.user_agent == null) h2_options.user_agent = c.options.user_agent;
+
     const hs = try c.gpa.create(H2Session);
     errdefer c.gpa.destroy(hs);
     const slab = if (c.options.buffer_pool) |bp| try bp.acquire() else try c.gpa.alloc(u8, slab_len);
@@ -974,7 +995,7 @@ pub fn connectH2c(c: *Client, host: []const u8, port: u16, options: h2_client.Op
     const o = &hs.owned.?;
     o.sr = stream.reader(c.io, slab[0..c.options.read_buffer_size]);
     o.sw = stream.writer(c.io, slab[c.options.read_buffer_size..]);
-    hs.session = h2_client.Session.init(c.gpa, &o.sr.interface, &o.sw.interface, options) catch |err|
+    hs.session = h2_client.Session.init(c.gpa, &o.sr.interface, &o.sw.interface, h2_options) catch |err|
         switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.WriteFailed,
@@ -2201,6 +2222,10 @@ fn h2LoopbackHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!
         var w: std.Io.Writer = .fixed(&buf);
         _ = try req.reader().streamRemaining(&w);
         try rw.writeAll(w.buffered());
+    } else if (std.mem.eql(u8, req.path, "/ua")) {
+        // Echoes what actually arrived on the wire, so the assertion is about
+        // the request the peer received and not about the option we set.
+        try rw.writeAll(req.header("user-agent") orelse "(none)");
     } else if (std.mem.eql(u8, req.path, "/huge")) {
         var block: [1024]u8 = undefined;
         for (0..huge_blocks) |i| {
@@ -2287,6 +2312,60 @@ test "h2c dogfood: GET, POST and multiplexed requests on one connection (loopbac
         var res = try hs.awaitResponse(sid);
         defer res.deinit(gpa);
         try testing.expectEqual(@as(u16, 404), res.status);
+    }
+}
+
+test "h2c dogfood: a client-wide `user_agent` reaches HTTP/2, and a per-request one still wins (loopback)" {
+    // The regression this pins: `Options.user_agent` was written by the h1
+    // head writer and by nothing else, so the SAME client sent it over h1 and
+    // dropped it silently over h2c — `/hello` reported `user-agent: null` for
+    // us and `curl/8.x` for curl on the same route. Asserted against what the
+    // server received, over a real socket, on both protocols in one test so
+    // the two cannot drift apart again.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try h2LoopbackServer(io);
+    defer testing.allocator.destroy(server);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, h2ServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{ .user_agent = "ua-dogfood/9.9" });
+    defer client.deinit();
+    const hs = client.connectH2c("127.0.0.1", port, .{}) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer hs.close();
+
+    { // The client-wide option, with no per-request header at all.
+        const sid = try hs.request(.get, "/ua", .{});
+        var res = try hs.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expectEqualStrings("ua-dogfood/9.9", res.body);
+    }
+    { // A per-request header wins — and its NAME is matched case-insensitively,
+        // even though §8.2.1 puts it on the wire lowercased, because a caller
+        // writing `User-Agent` means the same thing.
+        const headers = [_]http.Header{.{ .name = "User-Agent", .value = "per-request/1.0" }};
+        const sid = try hs.request(.get, "/ua", .{ .headers = &headers });
+        var res = try hs.awaitResponse(sid);
+        defer res.deinit(gpa);
+        try testing.expectEqualStrings("per-request/1.0", res.body);
+    }
+    { // The same client over HTTP/1.1: identical answer, which is the point.
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/ua", .{port});
+        var res = try client.request(.get, url, .{});
+        defer res.deinit();
+        const body = try res.readAllAlloc(gpa, 4096);
+        defer gpa.free(body);
+        try testing.expectEqualStrings("ua-dogfood/9.9", body);
     }
 }
 
