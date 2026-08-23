@@ -62,23 +62,43 @@ pub fn main() !void {
         std.debug.print("reassembly did not complete\n", .{});
     }
 
-    // Adversarial case: replay the very first fragment for a fresh datagram
-    // id, then replay it again byte-for-byte. RFC 5722 says an exact
-    // duplicate is treated the same as any other overlap and the whole
-    // datagram is dropped, not just the offending fragment.
+    // Adversarial case: replay the first fragment of a still-in-flight
+    // datagram byte-for-byte. RFC 5722 says an exact duplicate is treated
+    // the same as any other overlap and the whole datagram is dropped, not
+    // just the offending fragment.
+    //
+    // This needs a datagram that splits into MORE THAN ONE wire fragment: a
+    // single-fragment datagram completes (and is forgotten) on its very
+    // first insert, so "replaying" its only fragment afterwards would not
+    // overlap anything -- it would just start an unrelated fresh reassembly
+    // that also happens to complete immediately. That is what the previous
+    // version of this example did (MTU 512, 21-byte payload -> 1 fragment),
+    // which is why it printed "unexpectedly accepted" every run instead of
+    // exercising the overlap-rejection path at all. Forcing a small MTU
+    // here keeps the datagram incomplete when the duplicate arrives.
     var r2 = ethfrag.Reassembler.init(gpa, .{ .max_inflight = 4, .timeout_ns = 1_000_000_000 });
     defer r2.deinit();
 
     const replay_id: u16 = 0x1234;
-    const replay_frags = try ethfrag.fragment(gpa, "hello, replayed frame", replay_id, 512, 0);
+    const replay_frags = try ethfrag.fragment(gpa, "hello, replayed frame", replay_id, 16, 0);
     defer ethfrag.freeFragments(gpa, replay_frags);
+    if (replay_frags.len < 2) @panic("test setup error: expected a multi-fragment datagram");
 
-    _ = try r2.insert(replay_frags[0].bytes, 0);
+    switch (try r2.insert(replay_frags[0].bytes, 0)) {
+        .incomplete => {},
+        .complete => @panic("test setup error: first fragment alone should not complete the datagram"),
+    }
     std.debug.print("after first delivery: {d} datagram(s) in flight\n", .{r2.inflightCount()});
 
-    // Same fragment bytes arrive a second time.
-    if (r2.insert(replay_frags[0].bytes, 1)) |_| {
-        std.debug.print("duplicate fragment was unexpectedly accepted\n", .{});
+    // Same fragment bytes arrive a second time while the datagram is still
+    // incomplete -- this must be rejected as an overlap, not silently
+    // accepted or (worse) merged.
+    if (r2.insert(replay_frags[0].bytes, 1)) |result| {
+        switch (result) {
+            .complete => |bytes| gpa.free(bytes),
+            .incomplete => {},
+        }
+        @panic("unexpected: duplicate fragment accepted");
     } else |err| switch (err) {
         error.OverlappingFragment => std.debug.print(
             "duplicate fragment rejected (OverlappingFragment), datagram dropped\n",

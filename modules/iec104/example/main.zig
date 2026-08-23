@@ -46,10 +46,29 @@ fn settle(
                 progress = true;
                 var it = a.objects();
                 while (try it.next()) |obj| {
-                    std.debug.print(
-                        "  ioa={d} cot={s}: on={}\n",
-                        .{ obj.ioa, @tagName(a.header.cause.cot), obj.element.siq.on },
-                    );
+                    // The active field of `obj.element` is determined by
+                    // this ASDU's `type_id`, not by what the *previous*
+                    // ASDU carried: a general interrogation reply is a
+                    // stream of `M_SP_NA_1` data objects (`.siq`) bracketed
+                    // by `C_IC_NA_1` activation-confirmation and
+                    // activation-termination ASDUs (`.qoi`). Reading
+                    // `.siq` unconditionally panics on the bracketing
+                    // ASDUs with "access of union field 'siq' while field
+                    // 'qoi' is active".
+                    switch (a.header.type_id) {
+                        .m_sp_na_1 => std.debug.print(
+                            "  ioa={d} cot={s}: on={}\n",
+                            .{ obj.ioa, @tagName(a.header.cause.cot), obj.element.siq.on },
+                        ),
+                        .c_ic_na_1 => std.debug.print(
+                            "  ioa={d} cot={s}: interrogation qoi={s}\n",
+                            .{ obj.ioa, @tagName(a.header.cause.cot), @tagName(obj.element.qoi) },
+                        ),
+                        else => std.debug.print(
+                            "  ioa={d} cot={s}: type={s}\n",
+                            .{ obj.ioa, @tagName(a.header.cause.cot), @tagName(a.header.type_id) },
+                        ),
+                    }
                 }
             },
             else => progress = true,
@@ -93,7 +112,7 @@ pub fn main() !void {
     // by the flow-control state machine — the error has to be nameable from
     // outside the module for a caller to tell "not up yet" from "wire error".
     if (master.interrogate(47, .station, now)) |_| {
-        std.debug.print("unexpected: interrogation accepted before STARTDT\n", .{});
+        @panic("unexpected: interrogation accepted before STARTDT");
     } else |err| switch (err) {
         error.NotStarted => std.debug.print("interrogate before STARTDT: NotStarted (expected)\n", .{}),
         else => return err,

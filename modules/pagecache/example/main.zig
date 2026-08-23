@@ -27,6 +27,13 @@ pub fn main() !void {
     var sim = kvtree.SimStorage.init(gpa);
     defer sim.deinit();
 
+    // `kv.Storage`'s append-only tripwire assert stays armed by default;
+    // kvtree is a COW page store that legitimately overwrites its
+    // double-buffered meta slots and reused freed pages in place, so it
+    // MUST opt in here, the same way every one of kvtree's own tests and
+    // harnesses do (see `SimStorage.allow_overwrite`'s doc comment).
+    sim.allow_overwrite = true;
+
     var cache = pagecache.PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
     defer cache.deinit();
 

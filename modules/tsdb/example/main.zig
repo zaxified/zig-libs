@@ -22,8 +22,20 @@ pub fn main() !void {
     var sim = tsdb.SimStorage.init(gpa);
     defer sim.deinit();
 
-    // Pure in-memory backend: no cross-process lock needed.
-    var tree = try kvtree.Db.open(gpa, sim.storage(), "metrics.kvt", .{ .lock = .none });
+    // `kv.Storage`'s append-only tripwire assert stays armed by default;
+    // kvtree (which tsdb is built on) is a COW page store that legitimately
+    // overwrites its double-buffered meta slots and reused freed pages in
+    // place, so it MUST opt in here, the same way every one of kvtree's own
+    // tests and harnesses do (see `SimStorage.allow_overwrite`'s doc
+    // comment).
+    sim.allow_overwrite = true;
+
+    // Default (exclusive) locking, even though the backend is in-memory:
+    // the lock is what the second-opener check further down actually
+    // exercises. `.lock = .none` opts OUT of taking it, which would make
+    // that later "second opener is refused" check meaningless -- nothing
+    // would be held for it to contend with.
+    var tree = try kvtree.Db.open(gpa, sim.storage(), "metrics.kvt", .{});
     defer tree.close();
 
     var db = tsdb.Db.init(gpa, &tree);
@@ -75,8 +87,10 @@ pub fn main() !void {
     // A second exclusive opener over the SAME store fails by name rather
     // than corrupting the first opener's COW pages — kvtree's whole
     // correctness case rests on being the sole writer.
-    if (kvtree.Db.open(gpa, sim.storage(), "metrics.kvt", .{})) |_| {
-        std.debug.print("unexpectedly opened a second exclusive handle\n", .{});
+    if (kvtree.Db.open(gpa, sim.storage(), "metrics.kvt", .{})) |second_const| {
+        var second = second_const;
+        second.close();
+        @panic("unexpected: second exclusive handle was opened over a locked store");
     } else |err| switch (err) {
         error.Locked => std.debug.print("second exclusive open correctly rejected (Locked)\n", .{}),
         else => return err,

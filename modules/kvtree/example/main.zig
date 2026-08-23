@@ -25,6 +25,14 @@ pub fn main() !void {
     var sim = kvtree.SimStorage.init(gpa);
     defer sim.deinit();
 
+    // `kv.Storage`'s own append-only tripwire assert stays armed by default
+    // (it exists to catch `kv` consumers that overwrite instead of append);
+    // `kvtree` is a COW page store that legitimately overwrites its
+    // double-buffered meta slots and reused freed pages in place, so — per
+    // `SimStorage.allow_overwrite`'s doc comment — it MUST opt in here, the
+    // same way every one of kvtree's own tests and harnesses do.
+    sim.allow_overwrite = true;
+
     var db = try kvtree.Db.open(gpa, sim.storage(), "routing-table.kvt", .{});
     defer db.close();
 
