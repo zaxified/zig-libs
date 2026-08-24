@@ -186,10 +186,22 @@ and the whole suite is run under it (`zig test -OReleaseSafe -target
 mips-linux-musl --test-cmd qemu-mips --test-cmd-bin`) precisely so the
 native-order tests get evaluated on a big-endian CPU as well as this one.
 
-Still open, and small: no big-endian `tcp6` capture (the BE guest image had no
-IPv6), so the v6 case is covered by a test DERIVED from the measured v4 rule —
-a v6 column is four of the same `__be32`-as-host-word groups — and labelled as
-derived rather than measured.
+Closed the same day for `tcp6` as well. The v6 case was briefly covered by a
+test DERIVED from the measured v4 rule, on the reasoning that a v6 column is
+four of the same `__be32`-as-host-word groups — and on the belief that the
+big-endian guest had no IPv6. That belief was simply wrong: `/proc/net/tcp6`
+exists on it, and only the loopback address had not been configured. So the
+capture was taken too, from the same guest and the same way:
+`ip -6 addr add 2001:db8:1:2:3:4:5:6/128 dev lo`, then
+`dropbear -R -p [2001:db8:1:2:3:4:5:6]:12345`. The address is asymmetric in
+every one of the four words, so a wrong per-word byte order and a wrong WORD
+order would both show. The big-endian kernel wrote it straight through —
+`20010DB8 00010002 00030004 00050006` — where a little-endian kernel writes
+four swapped words, `B80D0120 02000100 04000300 06000500`. The reasoning had
+been right; it is now evidence instead of an argument, in
+`testdata/tcp6-mips-be.txt`, and the test also asserts that reading those bytes
+with the WRONG producer order does not yield the address, so the fixture cannot
+pass for the wrong reason.
 
 ## Backlog / deferred
 Per the module README's "DEFER" list: `/proc/net/unix` (the AF_UNIX table, `ss -x` — a different row

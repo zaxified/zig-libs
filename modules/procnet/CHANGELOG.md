@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-24** — The IPv6 half of the big-endian byte-order rule is measured rather than
+  derived. The same guest that produced the `tcp` capture also produced a `tcp6` one
+  (`testdata/tcp6-mips-be.txt`): a socket bound to `2001:db8:1:2:3:4:5:6`, asymmetric in all
+  four 32-bit words so that both the per-word order and the word order are visible. The
+  big-endian kernel wrote it straight through, `20010DB8 00010002 00030004 00050006`, where a
+  little-endian kernel writes four swapped words. The earlier note that the guest "had no IPv6"
+  was wrong — `/proc/net/tcp6` was there, only the loopback address had not been configured.
+  No code change: the derived rule was correct, it is now evidence.
+
 - **2026-08-24** — **Address hex columns are decoded in the PRODUCING KERNEL's byte order; they
   were always read low-byte-first.** `/proc/net/{tcp,udp,tcp6,udp6,route}` print each address word
   with `%08X` of a `u32` variable holding a `__be32` — the kernel never converts, so the eight hex

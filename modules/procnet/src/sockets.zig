@@ -343,6 +343,13 @@ const udp6_fixture = @embedFile("testdata/udp6.txt");
 /// were CHOSEN when the socket was bound.
 const tcp_be_fixture = @embedFile("testdata/tcp-mips-be.txt");
 
+/// The `tcp6` half of the same measurement, captured the same way on the same
+/// guest: `ip -6 addr add 2001:db8:1:2:3:4:5:6/128 dev lo`, then
+/// `dropbear -R -p [2001:db8:1:2:3:4:5:6]:12345`. The address is deliberately
+/// asymmetric in all four 32-bit words, so BOTH the per-word byte order and
+/// the order of the words themselves are visible in the result.
+const tcp6_be_fixture = @embedFile("testdata/tcp6-mips-be.txt");
+
 test "parseTcp: real /proc/net/tcp fixture (v4)" {
     const entries = try parseTcpWithEndian(testing.allocator, tcp_fixture, .little);
     defer testing.allocator.free(entries);
@@ -573,24 +580,35 @@ test "parseTcp: the endian-less entry point means NATIVE, and the decode shows i
     try testing.expectEqual(want, u_native[0].local);
 }
 
-test "parseTcp: v6 words each follow the producer's byte order" {
-    // No big-endian `tcp6` capture exists (the BE guest had IPv6 out of the
-    // image), so this is DERIVED from the measured v4 rule rather than
-    // captured: a v6 column is four of the same `__be32`-as-host-word groups
-    // concatenated in address order, so each group decodes exactly as the v4
-    // one does. Stated that way so nobody reads it as a second measurement.
+test "parseTcp: v6 words each follow the producer's byte order — measured, not derived" {
+    // Captured from the same big-endian kernel as the v4 fixture. This was
+    // DERIVED until 2026-08-24 ("a v6 column is four v4 groups, so it must
+    // follow"); the reasoning was right, but a rule that has been measured and
+    // one that has been argued are not the same evidence, and this repository
+    // has been caught out by the difference before.
     //
-    // ::1 as a big-endian kernel would print it — the low word is 00000001,
-    // where a little-endian kernel writes 01000000 (as `testdata/tcp6.txt`
-    // really does).
-    const be6 = "hdr\n   0: 00000000000000000000000000000001:0016 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 466 1 0000000000000000 100 0 0 10 5\n";
-    const entries = try parseTcpWithEndian(testing.allocator, be6, .big);
+    // The socket was bound to 2001:db8:1:2:3:4:5:6, asymmetric in every word,
+    // so a wrong per-word order and a wrong WORD order both show up. The
+    // big-endian kernel wrote it straight through:
+    //     20010DB8 00010002 00030004 00050006
+    // A little-endian kernel writes the same address as four swapped words:
+    //     B80D0120 02000100 04000300 06000500
+    const entries = try parseTcpWithEndian(testing.allocator, tcp6_be_fixture, .big);
     defer testing.allocator.free(entries);
     try testing.expectEqual(@as(usize, 1), entries.len);
-    var want: [16]u8 = @splat(0);
-    want[15] = 1;
+    const want: [16]u8 = .{
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x00, 0x02,
+        0x00, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06,
+    };
     try testing.expectEqual(netaddr.Ip{ .v6 = want }, entries[0].local);
-    try testing.expectEqual(@as(u16, 22), entries[0].local_port);
+    try testing.expectEqual(@as(u16, 12345), entries[0].local_port);
+    try testing.expectEqual(SockState.listen, entries[0].state);
+
+    // Read with the wrong producer order the same bytes must NOT come back as
+    // that address -- otherwise the fixture would pass for the wrong reason.
+    const wrong = try parseTcpWithEndian(testing.allocator, tcp6_be_fixture, .little);
+    defer testing.allocator.free(wrong);
+    try testing.expect(!std.meta.eql(netaddr.Ip{ .v6 = want }, wrong[0].local));
 }
 
 test "parseTcp: empty table (header only)" {
