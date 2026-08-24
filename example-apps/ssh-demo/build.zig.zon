@@ -3,7 +3,7 @@
     .version = "0.0.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x339f563df78f9110,
-    .paths = .{ "build.zig", "build.zig.zon", "src", "init.sh", "README.md" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "init.sh", "smoke.sh", "README.md" },
     .dependencies = .{
         // Pinned to a dated release tag. A tag asserts one thing: every module
         // cleared every lane at that commit. Bumped by `scripts/tag.sh` when a
