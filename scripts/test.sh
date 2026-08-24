@@ -455,20 +455,6 @@ run_modules() {
         local -a targets=()
         for m in "${rest[@]}"; do targets+=("test-$m"); done
         step "build+test (${#rest[@]} modules)" zig build "${targets[@]}" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
-
-        # RUN the affected modules' examples too. `check-examples` above only
-        # compiles, and compiling cannot see the class an example exists to
-        # catch -- a dangling slice, a leak, a wrong-tag union read. The full
-        # lane runs all 230 in about two minutes; here it is only the modules
-        # this change can reach, so the dev loop keeps its speed and a broken
-        # example is caught now rather than at tag time.
-        local -a run_targets=()
-        for m in "${rest[@]}"; do
-            [[ -f "modules/$m/example/main.zig" ]] && run_targets+=("run-example-$m")
-        done
-        if [[ ${#run_targets[@]} -gt 0 ]]; then
-            ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples (${#run_targets[@]} modules)" zig build "${run_targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
-        fi
     fi
 
     if [[ ${#netns[@]} -gt 0 ]]; then
@@ -505,6 +491,33 @@ run_modules() {
         for m in "${live[@]}"; do
             step "live interop: $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
         done
+    fi
+
+    # RUN the examples, ONCE, in this lane's optimize mode. `check-examples`
+    # only compiles them, and compiling cannot see the class an example exists
+    # to catch -- a dangling slice, a leak, a wrong-tag union read; one sweep on
+    # 2026-08-23 found all three plus twelve examples that had never run at all.
+    #
+    # ⭐ EVERY GROUP, and that is why this sits down here rather than beside the
+    # `rest` build above. It used to run only `rest`, and `cmd_all`/`cmd_changed`
+    # covered the remaining 14 -- ten netns modules and the four live ones --
+    # with a separate aggregate `zig build run-examples`. That aggregate carried
+    # no `EXTRA_ZIG_ARGS`, so in a release lane it was a SECOND compile of all
+    # 230 in Debug, and in the default lane a second RUN of every binary: the
+    # green ReleaseSafe lane of 2026-08-24 paid 157.8 s for it beside this
+    # step's 1749.5 s, and every scoped push paid ~68 s. Building the target
+    # list from all three groups makes one step cover what two used to.
+    #
+    # Concurrency is unchanged: the aggregate step ran all 230 example binaries
+    # in one `zig build` too. The live modules' SERIAL rule is about their
+    # tests, which hold a timed conversation with a real peer -- not about their
+    # examples, which ran alongside everything else here before and still do.
+    local -a run_targets=()
+    for m in $mods; do
+        [[ -f "modules/$m/example/main.zig" ]] && run_targets+=("run-example-$m")
+    done
+    if [[ ${#run_targets[@]} -gt 0 ]]; then
+        ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples (${#run_targets[@]} modules)" zig build "${run_targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
     fi
 
     local log="$_ZL_KEEP_OUT"
@@ -936,7 +949,7 @@ capability_check() {
     gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root")
 
     # ⭐ THE EXAMPLES' OWN PEERS, and they are a different class from everything
-    # above. `run-examples` RUNS each example (it only compiled them until
+    # above. The gate RUNS each example (it only compiled them until
     # 2026-08-23), and an example whose external judge is missing returns an
     # error — `modules/websocket/example/main.zig` returns
     # `error.PythonPeerFailed`. That is deliberate: the judge is the point of
@@ -954,7 +967,7 @@ capability_check() {
     # example with a third-party judge should cost one line, not a rediscovery.
     local peer
     for peer in \
-        "websockets|websockets==15.0.1|the websocket example, and with it \`zig build run-examples\` and the whole gate"
+        "websockets|websockets==15.0.1|the websocket example, and with it the gate's run-examples step and the whole lane"
     do
         local imp="${peer%%|*}" rest3="${peer#*|}"
         local spec="${rest3%%|*}" what_breaks="${rest3#*|}"
@@ -1222,13 +1235,14 @@ cmd_changed() {
     # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
     # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
     step "check-examples" zig build check-examples
-    # And RUN them. Compiling an example cannot see what examples are for: one
-    # sweep of this step on 2026-08-23 found a dangling stack slice in
-    # `btcp2p` whose own tests passed (they read the slice in the same
-    # expression, before the stack slot was reused), a leak in `ethfrag`, a
-    # wrong-tag union read in `iec104`, and twelve examples that had never run
-    # at all. ~2 minutes for all 230; only the full lane pays it.
-    ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples" zig build run-examples
+    # ⚠ `zig build run-examples` USED TO BE HERE, running all 230 examples on
+    # every scoped push under a comment claiming "only the full lane pays it".
+    # It did not: this step is unconditional, so the scoped lane paid ~68 s of
+    # it per push and then `run_modules` ran the changed closure's examples
+    # AGAIN. Running them is not in question -- compiling an example cannot see
+    # what examples are for -- but the scoped lane runs the modules this change
+    # can reach, and that is where its example runs belong too. See
+    # `run_modules`, which now covers every group it tests.
 
     # `modules/http/sizeprobe/` proves requestPlain/requestStreamingPlain/
     # putFilePlain never pull in TLS (CONVENTIONS.md-adjacent doc on
@@ -1402,9 +1416,12 @@ cmd_all() {
         summary
         return
     fi
-    # Below this line the gate RUNS things. Examples first: compiling one is not
-    # what examples are for, and a tag is exactly where that must not be assumed.
-    ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples" zig build run-examples
+    # Below this line the gate RUNS things — examples included: `run_modules`
+    # runs every module's example in this lane's optimize mode, which is what a
+    # tag claims and what the aggregate `zig build run-examples` that used to
+    # stand here could not say (it carried no EXTRA_ZIG_ARGS, so it ran Debug
+    # binaries in a ReleaseSafe lane and compiled all 230 a second time to do
+    # it). `all_mods` is every module, so nothing lost coverage in the move.
     run_modules "$all_mods"
     graph_save
     summary
