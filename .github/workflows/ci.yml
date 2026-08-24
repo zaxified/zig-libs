@@ -210,8 +210,8 @@ concurrency:
 # permanently red lane stays permanently cold.
 #
 # ⚠ AND THE PR LANE NO LONGER USES setup-zig's CACHE EITHER — it manages
-# `.zig-cache` itself through `actions/cache`. Not a preference: bxp measured
-# the built-in one persisting ~137 MB of a ~1.1 GB build cache with the
+# `.zig-cache` itself through `actions/cache`. Not a preference: measured
+# directly — the built-in one persisting ~137 MB of a ~1.1 GB build cache with the
 # compiled `o/` outputs dropped, so it restored, reported a hit, and then
 # rebuilt everything. A cache that reads as warm and is cold is worse than no
 # cache, because nobody goes looking for the time.
@@ -256,8 +256,8 @@ jobs:
         with:
           version: 0.16.0
           # ⚠ setup-zig's OWN build cache is off on purpose, and not for the
-          # quota reason that keeps it off in the `full` job below. bxp measured
-          # it directly: it persisted ~137 MB of a ~1.1 GB build cache and
+          # quota reason that keeps it off in the `full` job below. Measured
+          # directly here: it persisted ~137 MB of a ~1.1 GB build cache and
           # dropped the compiled `o/` outputs — that is, everything the cache
           # exists for. It reads as warm and recompiles from scratch. The Zig
           # TOOLCHAIN download stays cached either way; that part works.
@@ -543,7 +543,7 @@ jobs:
         with:
           version: 0.16.0
           # setup-zig's own build cache stays off here for the same reason as
-          # in the scoped job: bxp measured it dropping the compiled `o/`
+          # in the scoped job: measured dropping the compiled `o/`
           # outputs. The toolchain download is still cached by it.
           use-cache: false
       - name: Cache Zig build artifacts
@@ -819,8 +819,12 @@ jobs:
   # timing.)
   consumer:
     name: consumer build
-    needs: [scoped, full, plan]
-    if: always()
+    # No `needs`: this job shares nothing with scoped/full/plan (its own
+    # checkout, its own toolchain, no matrix input) and the comment above says
+    # it "holds nobody up." A `needs` on them would make GitHub wait for the
+    # full matrix — up to a 90-minute lane — before starting ~37 s of work, the
+    # opposite of parallel. `gate` lists `consumer` in ITS needs, so nothing is
+    # lost by consumer starting immediately.
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
