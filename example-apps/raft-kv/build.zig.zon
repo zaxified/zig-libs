@@ -1,0 +1,26 @@
+.{
+    .name = .raft_kv,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x8f93784d7886c873,
+    .paths = .{ "build.zig", "build.zig.zon", "src", "init.sh", "smoke.sh", "README.md" },
+    .dependencies = .{
+        // Pinned to a dated release tag. A tag asserts one thing: every module
+        // cleared every lane at that commit. Bumped by `scripts/tag.sh` when a
+        // new tag is cut, so a copy taken from tag T is built against T.
+        .zig_libs = .{
+            .url = "git+https://github.com/zaxified/zig-libs#2026-08-24",
+            .hash = "zig_libs-0.0.0-WiQ0GqnfKAOK-CAOPplTu56aLd-H1cjoDF-7FTXU-Tor",
+        },
+        // To follow the development branch instead, or to pin one commit,
+        // replace the two lines above with one of these and run
+        // `zig fetch --save <url>` to fill in the matching hash:
+        //
+        //   .url = "git+https://github.com/zaxified/zig-libs#main",
+        //   .url = "git+https://github.com/zaxified/zig-libs#<40-char-commit-sha>",
+        //
+        // Both are content-pinned by `.hash` all the same, so neither floats:
+        // `#main` stops resolving the moment main moves. Only the tag is a
+        // stable point, and only the tag carries the all-lanes-green claim.
+    },
+}

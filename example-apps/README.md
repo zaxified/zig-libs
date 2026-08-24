@@ -18,6 +18,7 @@ nothing else.
 | [`mls-chat`](mls-chat/) | End-to-end encrypted group chat over RFC 9420 (MLS) — delivery service and client in one binary. | `mls`, `framing`, `lockfree` |
 | [`http-service`](http-service/) | A hardened task-tracking JSON API — API-key and HMAC-signed webhook clients, behind the composed middleware chain. | `http`, `router`, and 15 more |
 | [`timecapsule`](timecapsule/) | Encrypt a file openable only AFTER a chosen time (drand timelock) and only BY a chosen recipient (HQC post-quantum KEM) — two locks, both required. | `timelock_envelope`, `drand`, `hqc`, `http`, `datefmt` |
+| [`raft-kv`](raft-kv/) | Replicated KV store over the raft module's model-checked kernel — survives leader kill, catches up after restart, refuses writes without a majority. | `raft`, `kv`, `framing`, `lockfree` |
 
 ## How this differs from `modules/<name>/example/`
 
@@ -101,7 +102,15 @@ conformance is what is measured.
 
 Where the check would earn its cost is a protocol with no foreign
 implementation to test against — there the previous version is the only oracle
-there is. If such an app is added here, this is the section to revisit.
+there is. `raft-kv` is such a protocol (the peer wire is the `raft` module's
+own codec), and the section was revisited when it landed: the check is still
+not warranted, because the app makes no cross-version promise to break — a
+cluster runs ONE binary, and mixed-version clusters are outside what the demo
+claims. What the wire carries is instead anchored the other way: the consensus
+decisions behind every message are the module's model-checked kernel, and the
+kernel — not the framing — is where a wire misunderstanding would corrupt
+state. If an app arrives that promises rolling upgrades, this is the section
+to revisit again.
 
 ## Adding one
 

@@ -78,6 +78,24 @@ directory.
   with **425 Too Early**, not 404 — the app treats both as "still locked"
   (exit 3, distinct from an error's 1).
 
+- **New example app `raft-kv`:** a replicated key-value store — the first
+  deployment of the `raft` module's model-checked consensus kernel outside
+  `netsim`. The app supplies what the simulator abstracts away (real TCP,
+  real election timers, a real disk via `kv`'s fsync-per-put contract) and
+  makes no consensus decision of its own: every vote, truncation and commit
+  is a call into the kernel, and the peer wire is the module's own codec.
+  Arbitrary KV values ride alongside the kernel's fixed-width `u64` command
+  as hash-bound blobs (truncated SHA-256, refused at apply on mismatch). The
+  smoke test SIGKILLs the elected leader and asserts the survivors keep
+  serving, restarts the corpse and asserts it catches up from its own log,
+  and kills the majority and asserts writes REFUSE. Two same-day module
+  fixes came out of being the first outside caller: `raft`'s root now
+  re-exports `tagOf` and `max_entries_per_msg` (an external consumer could
+  not dispatch on the wire without them), and the first cross-thread `kv`
+  write found nothing wrong in `kv` but did find the classic
+  interface-captures-address-of-local bug in the app's own first draft of
+  its store wrapper, which is recorded in the app as a warning comment.
+
 - **Packaging fix:** `build.zig.zon`'s `.paths` did not list `LICENSE` or
   `NOTICE`, so neither was part of the package. `.paths` decides what a
   consumer actually receives; a file outside it is visible on GitHub and absent
