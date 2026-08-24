@@ -1234,7 +1234,7 @@ cmd_changed() {
     # declarations and its build carries `test_deps` a consumer never gets.
     # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
     # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
-    step "check-examples" zig build check-examples
+    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
     # ⚠ `zig build run-examples` USED TO BE HERE, running all 230 examples on
     # every scoped push under a comment claiming "only the full lane pays it".
     # It did not: this step is unconditional, so the scoped lane paid ~68 s of
@@ -1358,7 +1358,14 @@ cmd_all() {
     # declarations and its build carries `test_deps` a consumer never gets.
     # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
     # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
-    step "check-examples" zig build check-examples
+    # ⭐ WITH THE LANE'S FLAGS, because this is the step that COMPILES the
+    # examples and a lane compiles in its own mode or it has not compiled them.
+    # Without them a ReleaseSafe lane built all 230 in Debug here and the run
+    # phase below then built them AGAIN in ReleaseSafe — the same omission that
+    # made `run-examples` a second compile, one step over. It also matters most
+    # in the lane that does nothing else: the compile-only lane's whole
+    # deliverable is "the modules and the examples build in this mode".
+    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
     # ⚠ `run-examples` USED TO BE HERE, and being here made the compile-only
     # lane a liar. It announces "COMPILING every module and running NO tests"
     # and then executed 216 example binaries — which is also why CI skips that
