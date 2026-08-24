@@ -1,18 +1,54 @@
 #!/usr/bin/env bash
-# Build every example-apps/ project against THIS working tree.
+# Build every example-apps/ project — against this working tree, or through the
+# pin the way a person who downloads the directory does.
 #
-# The apps pin a dated tag in their own build.zig.zon, because that is what a
-# person who downloads one needs. `--fork` overrides that pin without touching
-# the file, so the same directory serves the customer and serves us: this is
-# the only check in the repository that compiles the published API through the
-# real package machinery, the way a consumer reaches it.
+# THE RULE, in one place, because three files used to state it three ways:
 #
-#   scripts/check-apps.sh            # every app
+#   An app's source is written against THIS TREE. Its manifest pins the last
+#   dated tag, and that pin exists for the downloader, not for us: a tag is the
+#   only ref carrying the all-lanes-green claim, so it is the only thing worth
+#   handing a stranger. `scripts/tag.sh` rewrites the pin when a tag is cut, and
+#   commits that rewrite INSIDE the tag, so a copy taken from tag T is built
+#   against T.
+#
+# Two modes, and they answer different questions:
+#
+#   (default)  `zig build --fork=../..` — substitute this working tree for the
+#              pinned dependency. Answers: did this commit break a published API
+#              that a real consumer reaches through the package manager? Cheap,
+#              no network, runs on every CI run.
+#
+#   --pinned   build from the manifest as written: fetch by URL and hash, and
+#              compile the exported package. Answers: does the artifact the
+#              customer actually downloads build? This is the only check that
+#              goes through `.paths`, so it is the only one that can notice the
+#              package omitting a file the apps need (`check-package` covers
+#              LICENSE and NOTICE by name and nothing else).
+#
+#              FAIL-CLOSED: refuses to run unless every pinned tag resolves to
+#              HEAD. That is true on a tag ref and nowhere else. Off a tag it
+#              would silently become a two-version skew check — a comparison we
+#              deliberately do not make, because for a standardised protocol the
+#              live interop tests against a foreign implementation dominate it,
+#              and for anything else our own previous version is a weak oracle.
+#
+#   scripts/check-apps.sh            # every app, against the tree
 #   scripts/check-apps.sh ssh-demo   # just one
+#   scripts/check-apps.sh --pinned   # every app, through its pin (tag refs only)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+
+PINNED=0
+ARGS=()
+for a in "$@"; do
+    case "$a" in
+        --pinned) PINNED=1 ;;
+        -*) echo "check-apps: unknown option '$a'" >&2; exit 2 ;;
+        *) ARGS+=("$a") ;;
+    esac
+done
 
 mapfile -t DECLARED < <(zig build app-list 2>/dev/null)
 if [ ${#DECLARED[@]} -eq 0 ]; then
@@ -35,6 +71,20 @@ for d in example-apps/*/; do
 done
 [ $fail -eq 0 ] || exit 1
 
+# The collection's own README carries the catalogue of apps, and it is the first
+# page anyone reads. It is hand-written, so it drifts in the direction that
+# matters: an app nobody listed is an app nobody finds. `http-service` was
+# missing from it for its whole first day, and every other check here was green.
+for d in example-apps/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    grep -q "]($n/)" example-apps/README.md || {
+        echo "check-apps: example-apps/README.md's table does not link example-apps/$n/ — an app nobody lists is an app nobody finds" >&2
+        fail=1
+    }
+done
+[ $fail -eq 0 ] || exit 1
+
 # The app README tells a newcomer how to download that one directory, so it
 # spells the tag out in a URL -- a second place the same fact lives. Keep the
 # two from drifting: every dated tag the README names must be the tag its own
@@ -53,20 +103,66 @@ for d in example-apps/*/; do
 done
 [ $fail -eq 0 ] || exit 1
 
-WANT=("$@")
+WANT=("${ARGS[@]}")
 [ ${#WANT[@]} -eq 0 ] && WANT=("${DECLARED[@]}")
+
+# --pinned only says something where the pin and the commit under test are the
+# same content. Prove that here rather than trusting the caller's ref: a guard
+# over our own build must be fail-closed, or the first thing it does when the
+# assumption breaks is pass.
+if [ "$PINNED" = 1 ]; then
+    head_sha="$(git rev-parse HEAD)"
+    for n in "${WANT[@]}"; do
+        z="example-apps/$n/build.zig.zon"
+        pin="$(sed -n 's|.*zig-libs#\([0-9][0-9-]*\)".*|\1|p' "$z" | head -1)"
+        if [ -z "$pin" ]; then
+            echo "check-apps: --pinned: example-apps/$n does not pin a dated tag — nothing to verify against" >&2
+            exit 2
+        fi
+        pin_sha="$(git rev-parse -q --verify "refs/tags/$pin^{commit}" 2>/dev/null || true)"
+        if [ -z "$pin_sha" ]; then
+            echo "check-apps: --pinned: tag '$pin' (pinned by $n) does not exist here — fetch tags, or you are not on a tag ref" >&2
+            exit 2
+        fi
+        if [ "$pin_sha" != "$head_sha" ]; then
+            echo "check-apps: --pinned: $n pins '$pin' = $pin_sha, but HEAD is $head_sha." >&2
+            echo "            This mode is for a TAG REF, where the pin and the commit under test" >&2
+            echo "            are the same content and the build therefore says something about" >&2
+            echo "            THIS commit's package export. Anywhere else it compares two" >&2
+            echo "            versions, which is a check this repository deliberately does not" >&2
+            echo "            make. Refusing rather than reporting on the wrong question." >&2
+            exit 2
+        fi
+    done
+fi
 
 for n in "${WANT[@]}"; do
     [ -d "example-apps/$n" ] || { echo "check-apps: no such app '$n'" >&2; exit 2; }
-    echo "check-apps: building $n against the working tree"
-    ( cd "example-apps/$n" && zig build --fork=../.. ) || {
-        echo "check-apps: $n FAILED to build against this commit." >&2
-        echo "            This build used --fork, i.e. THIS working tree, not the tag the app" >&2
-        echo "            pins — so what broke is a published API this commit changed, and a" >&2
-        echo "            consumer would meet it one release later." >&2
-        echo "            (The app's source is written against the last tag and is bumped to" >&2
-        echo "            the new one by scripts/tag.sh, so the pin is never what fails here.)" >&2
-        exit 1
-    }
+    if [ "$PINNED" = 1 ]; then
+        echo "check-apps: building $n through its pin (fetch by URL + hash)"
+        ( cd "example-apps/$n" && zig build ) || {
+            echo "check-apps: $n FAILED to build through its pin." >&2
+            echo "            The pin resolves to this very commit, so the source is not what" >&2
+            echo "            broke — the package export is. Suspect build.zig.zon's .paths" >&2
+            echo "            omitting something the apps import, or the pinned hash no longer" >&2
+            echo "            matching the tag's tree. This is the path a downloader takes, so" >&2
+            echo "            red here means a stranger cannot build what we published." >&2
+            exit 1
+        }
+    else
+        echo "check-apps: building $n against the working tree"
+        ( cd "example-apps/$n" && zig build --fork=../.. ) || {
+            echo "check-apps: $n FAILED to build against this commit." >&2
+            echo "            This build used --fork, i.e. THIS working tree, not the tag the app" >&2
+            echo "            pins — and the app's source is written against the tree, so the pin" >&2
+            echo "            is not what failed. What broke is a published API this commit" >&2
+            echo "            changed, and a consumer would meet it one release later." >&2
+            exit 1
+        }
+    fi
 done
-echo "check-apps: ${#WANT[@]} app(s) built against the working tree"
+if [ "$PINNED" = 1 ]; then
+    echo "check-apps: ${#WANT[@]} app(s) built through their pins"
+else
+    echo "check-apps: ${#WANT[@]} app(s) built against the working tree"
+fi

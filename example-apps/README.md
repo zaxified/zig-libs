@@ -15,6 +15,7 @@ nothing else.
 | App | What it is | Modules it uses |
 |---|---|---|
 | [`ssh-demo`](ssh-demo/) | An SSH-2.0 client and server in one binary, with real `known_hosts` and `authorized_keys` handling. | `ssh` |
+| [`http-service`](http-service/) | A hardened task-tracking JSON API — API-key and HMAC-signed webhook clients, behind the composed middleware chain. | `http`, `router`, and 15 more |
 
 ## How this differs from `modules/<name>/example/`
 
@@ -35,24 +36,49 @@ module's example obligation (`CONVENTIONS.md` §7.2).
 
 ## What we get from the same directory
 
-Both are arranged from outside the app, so its manifest stays the customer's:
+**The rule, once:** an app's source is written against **this tree**. Its
+manifest pins the last dated tag, and that pin is for the downloader, not for
+us — a tag is the only ref carrying the all-lanes-green claim, so it is the only
+thing worth handing a stranger. `scripts/tag.sh` rewrites the pin when a tag is
+cut and commits the rewrite *inside* the tag, so a copy taken from tag T builds
+against T.
 
-1. `scripts/check-apps.sh` builds each app with `zig build --fork=../..`,
-   which overrides the pinned dependency with this working tree. An app builds
-   against its tag but not against the tree exactly when this collection has
-   broken a published API — the signal a consumer would otherwise get one
-   release later.
-2. Two builds of the *same source* at two versions can be run against each
-   other: a server from the previous tag against a client from the commit under
-   test. That is a wire-compatibility check no in-repo test can be, because
-   both sides of an in-repo test are always the same version.
+Both checks are arranged from outside the app, so its manifest stays the
+customer's:
 
-**The second one is not switched on yet.** It needs two tags that both carry
-`example-apps/`, and only one exists so far, so today an app is written against
-the API in this tree and `zig build --fork=../..` is the check that runs. From
-the release after next, the source has to compile against both the previous tag
-and the commit under test — otherwise the comparison measures the app instead
-of the library — and that constraint lands then, not now.
+1. **Every run**, `scripts/check-apps.sh` builds each app with `zig build
+   --fork=../..`, which substitutes this working tree for the pinned dependency.
+   Red here means this commit broke a published API — the signal a consumer
+   would otherwise get one release later. Blocking.
+2. **On a tag ref**, `scripts/check-apps.sh --pinned` builds each app from its
+   manifest as written: fetch by URL and hash, compile the exported package.
+   On a tag the pin and the commit under test are the same content, so this is
+   not a comparison of two versions — it is the only check that goes through
+   `.paths`, and therefore the only one that can notice the package omitting a
+   file the apps import. `check-package` covers `LICENSE` and `NOTICE` by name
+   and nothing else, and the package having shipped without either is why that
+   check exists. `--pinned` refuses to run where the pin does not resolve to
+   `HEAD`, rather than quietly answering a different question.
+
+### The check that is deliberately absent: our new version against our old one
+
+The same source compiled against two tags could be run against itself — a
+server from the previous tag against a client from the commit under test — and
+that is a wire-compatibility check no in-repo test can be. We do not do it, and
+the reason is worth writing down so it is not proposed again as an oversight.
+
+For `ssh`, the only app today with both ends in one binary, it is dominated. The
+module carries **20 live interop tests against real OpenSSH** in both
+directions, across curve25519 and DH group14/16, ed25519 and rsa-sha2-256/512,
+chacha20-poly1305 and AES-GCM, including `mlkem768x25519-sha256` — and the CI
+runner is pinned to an image chosen for that OpenSSH version. A foreign
+implementation fails independently of us; our own previous version shares every
+misreading of the RFC we have ever had. Nor does SSH promise anything across
+*our* versions: it promises conformance, and conformance is what is measured.
+
+Where the check would earn its cost is a protocol with no foreign
+implementation to test against — there the previous version is the only oracle
+there is. If such an app is added here, this is the section to revisit.
 
 ## Adding one
 

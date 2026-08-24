@@ -794,19 +794,30 @@ jobs:
   # reads job RESULTS, and "ran less than it should have" is not visible in a
   # result. Which is worth remembering the next time something here needs
   # asserting — the answer may again be in the driver rather than in this file.
-  # ⚠ NON-BLOCKING ON PURPOSE, until this lane has been debugged in anger.
-  # `gate` does not `need` it and does not read its result, so a red run here
-  # cannot fail a commit. Promote it by adding `consumer` to `gate`'s `needs`
-  # and asserting its result there — and not before it has been green across a
-  # few real tags, because its whole point is a code path (the package manager)
-  # that no other lane exercises.
+  # ⭐ BLOCKING, and its own job rather than a step inside a `full` lane.
+  #
+  # Blocking because a lane whose red light cannot fail a commit is a lane whose
+  # verdict nobody has to read. It was non-blocking while the package-manager
+  # path was new; it is the only check that compiles the published API the way a
+  # stranger reaches it, which is exactly the reason to let it speak.
+  #
+  # Its own job, because folding it into `modules ReleaseSafe amd64` would be a
+  # THIRD compile of the same modules inside that lane. Zig's unit of caching is
+  # the whole binary, so a module already compiles twice per lane — once into the
+  # test binary, once into its example — and an app built through the package
+  # manager shares a cache with neither. `ReleaseFast` cleared the 90-minute cap
+  # by 23 seconds; this would not fit, and it does not need to. Here it runs on
+  # its own runner, in parallel, holding nobody up. Order of magnitude, measured
+  # on the development host: the biggest app (17 modules, ReleaseSafe) builds in
+  # ~4 s with a fresh project cache, and both apps through their pins — fetch
+  # included — in ~12 s. ⚠ Both had a warm GLOBAL cache (~/.cache/zig); a runner
+  # has neither, so treat these as a floor, not as the lane's cost.
   consumer:
-    name: consumer build (non-blocking)
+    name: consumer build
     needs: [scoped, full, plan]
     if: always()
     runs-on: ubuntu-26.04
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
@@ -814,18 +825,42 @@ jobs:
         with:
           version: 0.16.0
       # Builds every example-apps/ project against THIS commit, through the
-      # package machinery rather than an in-repo addImport. An app builds
-      # against its pinned tag but not against this tree exactly when this
-      # commit broke a published API.
+      # package machinery rather than an in-repo addImport. An app's source is
+      # written against the tree, so the pin is never what fails here: red means
+      # this commit broke a published API, and a consumer would meet it one
+      # release later.
       - name: example-apps against this commit
         run: bash scripts/check-apps.sh
+      # ⭐ THE DOWNLOADER'S PATH, and it exists only on a tag ref.
+      #
+      # The step above substitutes the working tree for the pinned dependency,
+      # so it never goes through `.paths` and never verifies a hash. This one
+      # builds the manifest as written — fetch by URL and hash, compile the
+      # exported package — which is what a person who downloads one directory
+      # gets. `check-package` covers LICENSE and NOTICE by name and nothing
+      # else, and the package having shipped without either is why it exists; a
+      # module directory dropped from `.paths` would still be invisible.
+      #
+      # Only on a tag, because only there do the pin and the commit under test
+      # name the same content. Off a tag this would compare two versions — a
+      # check this repository deliberately does not make (see
+      # example-apps/README.md, "The check that is deliberately absent").
+      # `--pinned` proves that condition itself and refuses otherwise, so this
+      # `if` and the script agree or the job goes red rather than vacuous.
+      - name: example-apps through their pins (tag refs only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: bash scripts/check-apps.sh --pinned
 
   gate:
     name: gate
     if: always()
     # `plan` is here only for its `selected` output — the gate reads no result
     # from it. A failed `plan` is still caught, because `full` is then skipped.
-    needs: [scoped, full, plan]
+    #
+    # `consumer` IS read, and unlike the two shapes it must have run on every
+    # ref: it is not part of the either/or, so `skipped` is a failure here just
+    # as `failure` is.
+    needs: [scoped, full, plan, consumer]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
@@ -838,8 +873,9 @@ jobs:
           # would demand `scoped` on a run where `scoped` is correctly idle.
           IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
           SELECTED: ${{ needs.plan.outputs.selected }}
+          CONSUMER: ${{ needs.consumer.result }}
         run: |
-          echo "scoped=$SCOPED  full=$FULL  tag=$IS_TAG  dispatch=$IS_DISPATCH"
+          echo "scoped=$SCOPED  full=$FULL  consumer=$CONSUMER  tag=$IS_TAG  dispatch=$IS_DISPATCH"
           if [ "$IS_TAG" = true ] || [ "$IS_DISPATCH" = true ]; then
             ran_name=full;   ran=$FULL;   idle_name=scoped; idle=$SCOPED
           else
@@ -857,8 +893,16 @@ jobs:
             echo "::error::$idle_name is '$idle' — it should not have run on this ref at all"
             rc=1
           fi
+          # `consumer` is outside the either/or: it runs on every ref, so
+          # anything but success — including `skipped`, which is what a job that
+          # never started reports — leaves the published API unbuilt by the one
+          # check that reaches it through the package manager.
+          if [ "$CONSUMER" != success ]; then
+            echo "::error::consumer is '$CONSUMER', not success — example-apps did not build against this commit"
+            rc=1
+          fi
           if [ "$rc" -eq 0 ]; then
-            echo "gate: $ran_name passed, $idle_name correctly did not run"
+            echo "gate: $ran_name passed, $idle_name correctly did not run, consumer passed"
           fi
           # ⚠ AND A GREEN DISPATCH IS NOT WHAT A GREEN TAG IS. It may have run a
           # single lane, over a branch that is not main. Said here because this

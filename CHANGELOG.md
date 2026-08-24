@@ -30,14 +30,19 @@ directory.
   binary — the primary purpose, and the manifests are written for it alone.
   First one is `ssh-demo`, moved out of `modules/ssh/example/` where 2339 lines
   of client-and-server had been squeezed into the single file that slot allows.
-  Two further uses are arranged from OUTSIDE the app so its manifest stays the
-  customer's: `scripts/check-apps.sh` builds each with `zig build --fork=../..`,
-  overriding the pin with the working tree — the only check here that reaches
-  the published API through the real package machinery — and two builds of the
-  same source at two versions can be run against each other, which is a
-  wire-compatibility check no in-repo test can be, since both sides of one are
-  always the same version. That second use is why an app is written against the
-  TAGGED API and never against unreleased work. `scripts/tag.sh` rewrites the
+  Two checks are arranged from OUTSIDE the app so its manifest stays the
+  customer's, and both are blocking: `scripts/check-apps.sh` builds each with
+  `zig build --fork=../..`, overriding the pin with the working tree, and on a
+  tag ref `--pinned` builds each from its manifest as written — fetch by URL and
+  hash, compile the exported package, which is the artifact a downloader gets
+  and the only one that goes through `.paths`. An app's source is written
+  against the TREE; the pin exists for the downloader, because a tag is the only
+  ref carrying the all-lanes-green claim. A third use was considered and
+  dropped: running two builds of the same source at two versions against each
+  other. For `ssh`, the only app with both ends of a protocol in one binary, 20
+  live interop tests against real OpenSSH dominate it — a foreign implementation
+  fails independently of us, our own previous version shares every misreading of
+  the RFC we have. `scripts/tag.sh` rewrites the
   pins when a tag is cut, which works only because `example-apps/` is outside
   `.paths`: editing an app does not change the package hash, so the hash the
   bump writes stays correct after the commit that writes it (verified by

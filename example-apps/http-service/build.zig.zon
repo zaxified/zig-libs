@@ -8,11 +8,6 @@
         // Pinned to a dated release tag. A tag asserts one thing: every module
         // cleared every lane at that commit. Bumped by `scripts/tag.sh` when a
         // new tag is cut, so a copy taken from tag T is built against T.
-        //
-        // NOTE: this app was written against APIs added after 2026-08-19 (see
-        // README "Written against this working tree" for the list), so it will
-        // not build against this pinned tag until the next tag is cut — the
-        // pin still points at the last release, as every app's manifest does.
         .zig_libs = .{
             .url = "git+https://github.com/zaxified/zig-libs#2026-08-24",
             .hash = "zig_libs-0.0.0-WiQ0GqnfKAOK-CAOPplTu56aLd-H1cjoDF-7FTXU-Tor",

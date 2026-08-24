@@ -23,25 +23,19 @@ cd zig-libs && git sparse-checkout set example-apps/http-service
 cd example-apps/http-service
 ```
 
-## Written against this working tree, not the pinned tag — read this first
+## Which version of zig-libs this is written against
 
-Every other app in this directory is written against the last release tag's
-published API, on purpose: it is what proves the tag's surface is enough to
-build something real. This one is not — it was written freely against
-whatever the current working tree's 13 composable middleware modules offer,
-without checking each shape against `2026-08-24` first. `zig build
---fork=../..` (building against the collection's current commit) is the
-build that is *guaranteed* to pass, and does.
+The tree, like every app here — see `example-apps/README.md` for the rule and
+why the pin exists anyway. This app was written freely against whatever the
+working tree's 13 composable middleware modules offer, without checking each
+shape against a tag first, and `zig build --fork=../..` is the build that is
+guaranteed to pass on every commit.
 
-Measured, not assumed: `init.sh` — the customer path, fetching the
-**pinned** `2026-08-24` tag — also builds cleanly today. Every middleware
-API this app ended up using was already present, unchanged, at that tag; it
-was never actually necessary to reach past it. That is not a promise for
-next time — this app is still not re-checked against the tag on every
-change the way the other apps are, so a future edit here could silently
-start depending on something newer. Treat the "against this working tree"
-framing as the operative one; the tag build passing right now is a nice
-extra, not the contract.
+Measured, not assumed: `init.sh` — the customer path, fetching the **pinned**
+tag — also builds cleanly. Every middleware API this app uses was already
+present, unchanged, at that tag. That is not a standing promise between tags;
+it is checked on the tag ref, where the pin and the commit are the same
+content, by `scripts/check-apps.sh --pinned`.
 
 ## Build and run
 
