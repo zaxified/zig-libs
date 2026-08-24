@@ -9,15 +9,15 @@ Take this directory and nothing else — it is a self-contained project, and
 the rest of the collection arrives as a pinned dependency, not as a checkout:
 
 ```sh
-curl -L https://github.com/zaxified/zig-libs/archive/refs/tags/2026-08-19.tar.gz \
-  | tar -xz --strip-components=2 'zig-libs-2026-08-19/example-apps/http-service'
+curl -L https://github.com/zaxified/zig-libs/archive/refs/tags/2026-08-24.tar.gz \
+  | tar -xz --strip-components=2 'zig-libs-2026-08-24/example-apps/http-service'
 cd http-service
 ```
 
 With git instead, if you would rather have history:
 
 ```sh
-git clone --depth 1 --filter=blob:none --sparse -b 2026-08-19 \
+git clone --depth 1 --filter=blob:none --sparse -b 2026-08-24 \
   https://github.com/zaxified/zig-libs.git
 cd zig-libs && git sparse-checkout set example-apps/http-service
 cd example-apps/http-service
@@ -29,12 +29,12 @@ Every other app in this directory is written against the last release tag's
 published API, on purpose: it is what proves the tag's surface is enough to
 build something real. This one is not — it was written freely against
 whatever the current working tree's 13 composable middleware modules offer,
-without checking each shape against `2026-08-19` first. `zig build
+without checking each shape against `2026-08-24` first. `zig build
 --fork=../..` (building against the collection's current commit) is the
 build that is *guaranteed* to pass, and does.
 
 Measured, not assumed: `init.sh` — the customer path, fetching the
-**pinned** `2026-08-19` tag — also builds cleanly today. Every middleware
+**pinned** `2026-08-24` tag — also builds cleanly today. Every middleware
 API this app ended up using was already present, unchanged, at that tag; it
 was never actually necessary to reach past it. That is not a promise for
 next time — this app is still not re-checked against the tag on every

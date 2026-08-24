@@ -8,15 +8,15 @@ Take this directory and nothing else — it is a self-contained project, and the
 rest of the collection arrives as a pinned dependency, not as a checkout:
 
 ```sh
-curl -L https://github.com/zaxified/zig-libs/archive/refs/tags/2026-08-19.tar.gz \
-  | tar -xz --strip-components=2 'zig-libs-2026-08-19/example-apps/ssh-demo'
+curl -L https://github.com/zaxified/zig-libs/archive/refs/tags/2026-08-24.tar.gz \
+  | tar -xz --strip-components=2 'zig-libs-2026-08-24/example-apps/ssh-demo'
 cd ssh-demo
 ```
 
 With git instead, if you would rather have history:
 
 ```sh
-git clone --depth 1 --filter=blob:none --sparse -b 2026-08-19 \
+git clone --depth 1 --filter=blob:none --sparse -b 2026-08-24 \
   https://github.com/zaxified/zig-libs.git
 cd zig-libs && git sparse-checkout set example-apps/ssh-demo
 cd example-apps/ssh-demo

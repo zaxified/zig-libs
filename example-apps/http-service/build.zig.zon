@@ -14,8 +14,8 @@
         // not build against this pinned tag until the next tag is cut — the
         // pin still points at the last release, as every app's manifest does.
         .zig_libs = .{
-            .url = "git+https://github.com/zaxified/zig-libs#2026-08-19",
-            .hash = "zig_libs-0.0.0-WiQ0GiHC8gLLy_JZG4Vl-Z2CWT4F8pJILf7CsHL0DVcM",
+            .url = "git+https://github.com/zaxified/zig-libs#2026-08-24",
+            .hash = "zig_libs-0.0.0-WiQ0GqnfKAOK-CAOPplTu56aLd-H1cjoDF-7FTXU-Tor",
         },
         // To follow the development branch instead, or to pin one commit,
         // replace the two lines above with one of these and run
