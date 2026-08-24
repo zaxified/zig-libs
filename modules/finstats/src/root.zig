@@ -33,8 +33,10 @@ pub const meta = .{
 
 pub const Error = error{ NoSuchColumn, OutOfMemory };
 
-/// `xirr` / `xirrPrecise` / `xirrNode` only. `XirrNoRoot` means NPV does not
-/// change sign anywhere across the `[-0.99, 10]` bracket, so the series has no
+/// `xirr` / `xirrPrecise` / `xirrNode` only. `XirrNoRoot` means NPV has no
+/// single crossing across the `[-0.99, 10]` bracket — it never changes sign, or
+/// it is CONSTANT there (a one-row window discounts nothing, so every rate is a
+/// root and none is the answer) — so the series has no
 /// internal rate of return inside it. Before 2026-08-23 those functions ran the
 /// bisection anyway and returned whichever bound it walked to — a bracket bound
 /// is indistinguishable from a real answer at the call site, so a windowed
@@ -248,9 +250,31 @@ fn bisect(items: []const Cashflow, base: i64, npv_tol: f64, rate_tol: ?f64) f64 
 /// bisecting finds a root and the loop below just walks to a bound — which is
 /// what used to be returned as the answer. NaN compares false both ways and so
 /// reports "no root", which is the honest verdict for it too.
+///
+/// ⭐ CONSTANT NPV IS NOT A ROOT, AND THAT INCLUDES THE CONSTANT ZERO. When
+/// every cashflow lands on the same date — a window narrow enough to hold one
+/// row, which is the realistic path — every discount exponent is 0 and NPV is
+/// the constant Σcf at every rate. Under `.value_includes_flow` that constant
+/// is exactly 0 (seed −value[0], terminal +value[0]), so `nv_lo == 0` read as
+/// "a bound IS the root": true, and useless. Every rate is a root, so no rate
+/// is the answer, and bisection walked its 200 halvings to `hi` and returned
+/// 9.99999999968015 — a confident +1000 %, indistinguishable at the call site
+/// from a real result. Reported from a consumer against a real database with a
+/// one-day range, 2026-08-24.
+///
+/// The predicate is stated as "NPV is constant", not as a row count, because
+/// the row count is a proxy for it and misses the shape from the other side:
+/// unseeded, the same one row gives the constant +1000, which is a genuine
+/// no-root that the sign test below already rejected. Equality at the two ends
+/// also costs nothing when NPV merely happens to return to the same value —
+/// that case has no sign change either, so it was already `false`.
+///
+/// This gates `xirrPrecise` too: its Newton phase would otherwise start from a
+/// derivative that is identically 0 here.
 fn bracketHasRoot(items: []const Cashflow, base: i64, lo: f64, hi: f64) bool {
     const nv_lo = npv(items, base, lo);
     const nv_hi = npv(items, base, hi);
+    if (nv_lo == nv_hi) return false; // constant across the bracket: no unique rate
     if (nv_lo == 0 or nv_hi == 0) return true; // a bound IS the root
     return (nv_lo < 0) != (nv_hi < 0);
 }
@@ -1540,6 +1564,68 @@ test "xirr: a mid-life window needs `opening`; without it there is no root, and 
         .opening = .none,
     }));
     try testing.expectError(error.XirrNoRoot, xirrPreciseNode(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .none,
+    }));
+}
+
+test "xirr: a one-row window has NO unique rate — every rate is a root, so none of them is the answer" {
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "flow", .type = .float },
+        .{ .name = "v", .type = .float },
+    };
+    // One row, which is what a window narrow enough to hold a single
+    // observation collapses to. Reported from a consumer against a real
+    // database (a one-day date range), where it came back as +999.9999 % and
+    // was indistinguishable at the call site from a real answer.
+    const rows = [_][]const Value{
+        &.{ .{ .text = "2026-08-24" }, .{ .float = 0 }, .{ .float = 1000 } },
+    };
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+
+    // ⭐ WHY THE SIGN-CHANGE CHECK CANNOT SEE THIS. Every cashflow lands on the
+    // same date, so every discount exponent is 0 and NPV is the CONSTANT Σcf at
+    // every rate in the bracket. Under `.value_includes_flow` the seed is
+    // −value[0] and the terminal is +value[0], so that constant is exactly 0 —
+    // and a bound that IS zero used to read as "a root exists", which is true
+    // and useless: every rate is a root, so no rate is the answer. Bisection
+    // then walked its 200 halvings to `hi`.
+    const seeded = XirrSpec{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .value_includes_flow,
+    };
+    try testing.expectError(error.XirrNoRoot, xirr(f.a(), d, seeded));
+    try testing.expectError(error.XirrNoRoot, xirrPrecise(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .value_includes_flow,
+    }));
+    try testing.expectError(error.XirrNoRoot, xirrNode(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .value_includes_flow,
+    }));
+    try testing.expectError(error.XirrNoRoot, xirrPreciseNode(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .value_includes_flow,
+    }));
+
+    // The other half of the same shape, and the reason the fix is stated as
+    // "NPV is constant" rather than as a row count: unseeded, the one cashflow
+    // is the terminal +1000, so NPV is the constant 1000 — no root at all, and
+    // the sign-change check already rejected that one on its own.
+    try testing.expectError(error.XirrNoRoot, xirr(f.a(), d, .{
         .date_col = "d",
         .flow_col = "flow",
         .value_col = "v",

@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-24** — **`xirr` / `xirrPrecise` returned `10.0` for a one-row window. Fixed:
+  constant NPV across the bracket is now `error.XirrNoRoot`.** The sign-change check added
+  on 2026-08-23 could not see this one. When every cashflow lands on the same date — which
+  is what a window narrow enough to hold a single observation collapses to — every discount
+  exponent is 0, so NPV is the *constant* Σcf at every rate. Under
+  `opening = .value_includes_flow` that constant is exactly 0 (seed −value[0], terminal
+  +value[0]), and `nv_lo == 0` read as "a bound IS the root": true, and useless. Every rate
+  is a root, so none of them is the answer, and bisection walked its 200 halvings to `hi`
+  and handed back **9.99999999968015** — a confident +1000 %, indistinguishable at the call
+  site from a real result. Reported by a consumer that hit it against a real database over a
+  one-day date range; reproduced here before the fix.
+  `bracketHasRoot` now rejects `npv(lo) == npv(hi)` first. The predicate is "NPV is
+  constant", not "one row", because the row count is only a proxy: unseeded, the same single
+  row gives the constant +1000, a genuine no-root the sign test already rejected. The check
+  gates `xirrPrecise` as well, whose Newton phase would otherwise start from a derivative
+  that is identically 0. New test *"xirr: a one-row window has NO unique rate — every rate
+  is a root, so none of them is the answer"* covers all four entry points.
+  **No effect on any series with two or more distinct dates.**
+
 - **2026-08-23** — Three follow-ups to the two entries below, none of which change a number.
   (1) **The measured `rate_tol = null` cost table in `XirrSpec.rate_tol` is now reproducible.**
   It published seven cells and named no construction, and an independent attempt using this
