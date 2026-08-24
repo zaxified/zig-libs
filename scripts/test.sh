@@ -1345,9 +1345,14 @@ cmd_all() {
     # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
     # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
     step "check-examples" zig build check-examples
-    # See cmd_all's comment on this one: compiling an example is not what
-    # examples are for, and a tag is exactly where that must not be assumed.
-    ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples" zig build run-examples
+    # ⚠ `run-examples` USED TO BE HERE, and being here made the compile-only
+    # lane a liar. It announces "COMPILING every module and running NO tests"
+    # and then executed 216 example binaries — which is also why CI skips that
+    # lane's peer install (`if: matrix.cmd != 'build'` in ci.yml): a lane that
+    # runs nothing needs no peers. On 2026-08-24 the strict-Debug lane of the
+    # full matrix died on `error.PythonPeerFailed`, having reached a Python
+    # peer it was configured never to need. It now sits below the build-only
+    # return, where the things that RUN belong.
     # See cmd_changed's comment on this same step for what it checks.
     step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
     # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
@@ -1397,6 +1402,9 @@ cmd_all() {
         summary
         return
     fi
+    # Below this line the gate RUNS things. Examples first: compiling one is not
+    # what examples are for, and a tag is exactly where that must not be assumed.
+    ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples" zig build run-examples
     run_modules "$all_mods"
     graph_save
     summary

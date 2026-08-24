@@ -406,6 +406,24 @@ inline fn ciosIter(tp: [*]u64, vp: [*]const u64, mp: [*]const u64, rem: usize, g
 /// register, modified ones tied to discarded outputs (see `ciosIter`'s note on
 /// the self-hosted backend).
 pub inline fn mulRow(tp: [*]u64, vp: [*]const u64, rem: usize, grp: usize, x: u64) u64 {
+    if (comptime supported) {
+        return mulRowAmd64(tp, vp, rem, grp, x);
+    } else {
+        // Unreachable by construction, exactly as in `montMul`/`montSqr` — but
+        // this one needed the wrapper for a reason those two did not have. It
+        // is `pub` because the KAT harness in this module builds a deliberately
+        // broken square from the same primitive, and `pub` is what crosses a
+        // file boundary in Zig. `check-pubfn-reach` instantiates every `pub fn`
+        // DIRECTLY, on whatever target is being built, so the x86 asm below was
+        // analysed on aarch64 and the aarch64 `Clobbers` struct has no `.r8`:
+        // the ReleaseSafe arm64 lane of 2026-08-24 went red on it. Its callers
+        // were all guarded; the guard belongs on the function, because the one
+        // caller that skipped it was not a caller at all.
+        unreachable;
+    }
+}
+
+inline fn mulRowAmd64(tp: [*]u64, vp: [*]const u64, rem: usize, grp: usize, x: u64) u64 {
     var carry: u64 = undefined;
     var d0: usize = undefined;
     var d1: usize = undefined;
