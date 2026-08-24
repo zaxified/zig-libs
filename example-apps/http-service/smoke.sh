@@ -34,8 +34,13 @@ cleanup() {
     rmdir "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
+# A timeout must run cleanup, not just die: SIGKILL on $$ cannot be trapped
+# and would orphan the child processes (still bound to the port) and $WORK.
+# The watchdog sends SIGTERM instead; this handler prints and exits, so the
+# EXIT trap above fires and kills the tracked PIDs.
+trap 'echo "smoke: TIMED OUT" >&2; exit 124' TERM
 
-( sleep 60; echo "smoke: TIMED OUT" >&2; kill -9 $$ 2>/dev/null ) &
+( sleep 60; kill -TERM $$ 2>/dev/null ) &
 PIDS+=($!)
 
 fail() {
@@ -110,7 +115,10 @@ code=$(status -X POST -H "X-Signature-256: sha256=$sig" \
 #    was the first attempt and it proved nothing: a mangled body is also
 #    malformed JSON, so the handler answers 400 whether the signature was
 #    checked or not — the test would have passed with verification disabled.
-bad_sig="$(printf '%s' "$sig" | sed 's/^./0/; s/^0/1/')"
+# Flip the first hex digit to a DIFFERENT value deterministically. The old
+# `sed 's/^./0/; s/^0/1/'` was a no-op whenever $sig already started with '1'
+# (~1/16 of runs), submitting a VALID signature and failing the gate spuriously.
+if [ "${sig:0:1}" = "a" ]; then bad_sig="b${sig:1}"; else bad_sig="a${sig:1}"; fi
 code=$(status -X POST -H "X-Signature-256: sha256=$bad_sig" \
     -H 'Content-Type: application/json' -d "$body" "$BASE/webhooks/tasks")
 case "$code" in
@@ -144,7 +152,11 @@ created=$(echo "$scrape" | sed -n 's/^tasks_created_total //p')
 # posts complete a task, they do not create one.
 [ "$created" = 2 ] || fail "tasks_created_total is '$created', this script created 2 (idempotent replay must not double-count)"
 scrape2=$(curl -s "$BASE/metrics")
-echo "$scrape2" | grep -q '^http_requests_total{method="get"' && :
+# The GET /api/tasks/:id from case 4 is BELOW the metrics middleware, so it
+# must be counted; /healthz and the scrape itself are above it and must not be.
+# (Was `... && :`, which under `set -e` can never fail — a vacuous check.)
+echo "$scrape2" | grep -q '^http_requests_total{method="get"' \
+    || fail "the counted GET /api/tasks/:id produced no get series — metrics middleware not seeing GETs?"
 delta=$(echo "$scrape2" | sed -n 's/^tasks_created_total //p')
 [ "$delta" = "$created" ] || fail "scraping /metrics changed a business counter"
 

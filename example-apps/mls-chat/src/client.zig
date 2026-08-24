@@ -421,6 +421,14 @@ fn commitAdd(self: *Client, name: []const u8, key_package_msg: []const u8) !void
     // message cannot be protected under the old epoch's ratchet.
     _ = try self.app.?.rekeyIfStale(g);
 
+    // This Commit advanced the epoch, so any proposal still pending was made
+    // against the previous one and is now invalid (a by-reference proposal
+    // does not survive an epoch change — the same reason maybeCommitPending
+    // and removeMember clear here too). Dropping them keeps the invariant the
+    // client documents; without this a stale /leave lingered and later failed
+    // its own commit silently.
+    self.clearPending();
+
     try self.sendFrame(.{ .kind = .handshake, .group = self.opts.group, .msg = created.commit });
     const w = created.welcome orelse return error.NoWelcomeForAddedMember;
     try self.sendFrame(.{ .kind = .welcome, .group = self.opts.group, .msg = w });
@@ -429,28 +437,44 @@ fn commitAdd(self: *Client, name: []const u8, key_package_msg: []const u8) !void
 }
 
 /// Somebody has to turn a floating proposal into a Commit, and the members
-/// cannot ask each other who. The rule is therefore derivable from state every
-/// member already agrees on: **the lowest occupied leaf that is not the
-/// proposer commits.** Deterministic, needs no round trip, and degrades
-/// safely — if two members ever did commit at once, the second Commit loses on
-/// `error.WrongEpoch` at every receiver and its author simply retries nothing.
+/// cannot ask each other who. The rule is therefore derived from state every
+/// member agrees on, and it must not depend on the ORDER proposals arrived —
+/// which is where the first version went wrong. It committed `pending[0]` and
+/// excluded only `pending[0]`'s removal target from the ballot; but a proposer
+/// self-caches its own proposal before it hits the wire while everyone else
+/// sees whatever the relay delivered first, so `[0]` differed across members,
+/// and two members leaving at once could each elect a different committer and
+/// livelock — none ever agreeing it was itself the one to commit.
+///
+/// Fixed on two axes, both order-independent:
+///  1. **Which proposal:** the lexicographically smallest message bytes. Every
+///     member holds the same pending SET once the relay has fanned the
+///     proposals out, so the min is the same choice everywhere.
+///  2. **Who commits:** the lowest occupied leaf that is NOT the target of ANY
+///     pending Remove. A member cannot commit its own Remove, and it is also
+///     the one member that never receives that proposal (the relay does not
+///     echo a frame to its sender), so leaving any removal target electable
+///     would deadlock silently. Excluding all of them, not just the chosen
+///     proposal's, keeps the ballot identical on every member.
+///
+/// Only that one proposal is committed this epoch; any others are dropped by
+/// `clearPending` (an epoch change invalidates a by-reference proposal anyway)
+/// and would have to be re-proposed — acceptable for a demo, and it converges.
 ///
 /// Caller holds `state_lock`.
 fn maybeCommitPending(self: *Client, g: *mls.Group(S)) !void {
     if (self.pending.items.len == 0) return;
 
-    // The member being removed must be excluded from the ballot, or a leaver
-    // that happens to sit at the lowest leaf elects itself and nobody commits:
-    // it cannot commit its own Remove, and it is the only member that never
-    // sees this proposal (the relay does not echo a frame to its sender), so
-    // the deadlock would be silent on every side.
-    const target = removeTarget(self.gpa, self.pending.items[0]);
+    var chosen: usize = 0;
+    for (self.pending.items, 0..) |p, i| {
+        if (std.mem.lessThan(u8, p, self.pending.items[chosen])) chosen = i;
+    }
 
     var lowest: ?u32 = null;
     var leaf: u32 = 0;
     while (leaf < g.treeSize()) : (leaf += 1) {
         if (g.ratchet_tree.leafNode(leaf) == null) continue; // blank
-        if (target != null and leaf == target.?) continue;
+        if (leafIsRemovalTarget(self, leaf)) continue;
         if (lowest == null) lowest = leaf;
     }
     if (lowest != g.my_leaf_index) return; // not this member's turn
@@ -458,7 +482,7 @@ fn maybeCommitPending(self: *Client, g: *mls.Group(S)) !void {
     const created = g.createCommit(self.gpa, .{
         .io = self.io,
         .signature_key_pair = self.sig,
-        .proposals = &.{.{ .by_reference = self.pending.items[0] }},
+        .proposals = &.{.{ .by_reference = self.pending.items[chosen] }},
     }) catch |err| {
         std.debug.print("mls-chat: could not commit the pending proposal: {t}\n", .{err});
         return;
@@ -488,6 +512,19 @@ fn memberCount(g: *const mls.Group(S)) usize {
         if (g.ratchet_tree.leafNode(leaf) != null) n += 1;
     }
     return n;
+}
+
+/// Is `leaf` the target of any currently-pending Remove proposal? Used to keep
+/// every removal target off the committer ballot (see `maybeCommitPending`).
+///
+/// Caller holds `state_lock`.
+fn leafIsRemovalTarget(self: *Client, leaf: u32) bool {
+    for (self.pending.items) |p| {
+        if (removeTarget(self.gpa, p)) |t| {
+            if (t == leaf) return true;
+        }
+    }
+    return false;
 }
 
 /// Which leaf a Remove proposal names, read WITHOUT verifying anything.

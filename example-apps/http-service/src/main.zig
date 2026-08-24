@@ -51,7 +51,7 @@
 //!   `/api/*`      → `aaa-gate` (API-key auth) + `idempotency`
 //!   `/webhooks/*` → `webhooksig` (HMAC verification)
 //!
-//! **Left out of the 13, and why:**
+//! **Left out of the 14, and why:**
 //!   - `sessions` (+ its `csrf` sibling) — this is a machine-to-machine JSON
 //!     API with no browser-rendered login page; there is no form to protect
 //!     and no session cookie to issue. A customer adding a browser admin
@@ -253,7 +253,12 @@ fn createTask(ctx: *router.Ctx) anyerror!void {
         return jsonError(ctx, 400, "title must be 1..200 bytes");
 
     const owned_title = try app.gpa.dupe(u8, title);
-    errdefer app.gpa.free(owned_title);
+    // NB: deliberately NO `errdefer free(owned_title)`. Ownership transfers to
+    // the task list on a successful append; after that point freeing it would
+    // double-free (deinit frees every list title) and dangle every reader. So
+    // the two fallible steps BEFORE the transfer free it explicitly, and
+    // nothing after the transfer frees it — a later respond() failure then
+    // leaves the task legitimately stored rather than corrupting the store.
 
     var aw: std.Io.Writer.Allocating = .init(app.gpa);
     defer aw.deinit();
@@ -262,15 +267,17 @@ fn createTask(ctx: *router.Ctx) anyerror!void {
     const id = app.next_id;
     app.next_id += 1;
     const task: Task = .{ .id = id, .title = owned_title, .done = false, .created_ns = wallNowNs() };
-    app.tasks.append(app.gpa, task) catch |err| {
+    var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+    // Render BEFORE the append transfers ownership, and under the lock so the
+    // bytes cannot depend on the title surviving a concurrent DELETE. On
+    // failure we still solely own owned_title, so we free it.
+    writeTaskJson(&jw, &task) catch |err| {
+        app.gpa.free(owned_title);
         app.lock.unlock();
         return err;
     };
-    var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-    // Rendered while still holding the lock: the response bytes must not
-    // depend on `task.title` surviving past `unlock` (a concurrent DELETE
-    // could free it the instant another thread gets the lock).
-    writeTaskJson(&jw, &task) catch |err| {
+    app.tasks.append(app.gpa, task) catch |err| {
+        app.gpa.free(owned_title);
         app.lock.unlock();
         return err;
     };
@@ -283,26 +290,43 @@ fn createTask(ctx: *router.Ctx) anyerror!void {
 
 fn listTasks(ctx: *router.Ctx) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx.state.?));
+    // Render into a private buffer UNDER the lock, then write to the socket
+    // AFTER releasing it. App.lock is a spinlock; holding it across a blocking
+    // write to a slow client makes every other handler busy-spin a core. The
+    // JSON array outgrows http.Server's 4 KiB response buffer at a few dozen
+    // tasks, so the write genuinely blocks — this is not a theoretical window.
+    var aw: std.Io.Writer.Allocating = .init(app.gpa);
+    defer aw.deinit();
+    {
+        appLock(app);
+        defer app.lock.unlock();
+        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        try jw.beginArray();
+        for (app.tasks.items) |*t| try writeTaskJson(&jw, t);
+        try jw.endArray();
+    }
     ctx.res.setStatus(200);
     try ctx.res.setHeader("Content-Type", "application/json");
-    var jw: std.json.Stringify = .{ .writer = ctx.res.writer(), .options = .{} };
-    appLock(app);
-    defer app.lock.unlock();
-    try jw.beginArray();
-    for (app.tasks.items) |*t| try writeTaskJson(&jw, t);
-    try jw.endArray();
+    try ctx.res.writer().writeAll(aw.written());
 }
 
 fn getTask(ctx: *router.Ctx) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx.state.?));
     const id = parseId(ctx) orelse return jsonError(ctx, 400, "bad task id");
-    appLock(app);
-    defer app.lock.unlock();
-    const idx = findTaskIndex(app, id) orelse return jsonError(ctx, 404, "no such task");
+    var aw: std.Io.Writer.Allocating = .init(app.gpa);
+    defer aw.deinit();
+    {
+        appLock(app);
+        defer app.lock.unlock();
+        const idx = findTaskIndex(app, id) orelse return jsonError(ctx, 404, "no such task");
+        // Render under the lock (a concurrent DELETE could free the title);
+        // write to the socket after unlocking, same reason as listTasks.
+        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        try writeTaskJson(&jw, &app.tasks.items[idx]);
+    }
     ctx.res.setStatus(200);
     try ctx.res.setHeader("Content-Type", "application/json");
-    var jw: std.json.Stringify = .{ .writer = ctx.res.writer(), .options = .{} };
-    try writeTaskJson(&jw, &app.tasks.items[idx]);
+    try ctx.res.writer().writeAll(aw.written());
 }
 
 const UpdateBody = struct { title: ?[]const u8 = null, done: ?bool = null };

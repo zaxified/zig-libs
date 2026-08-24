@@ -26,8 +26,13 @@ cleanup() {
     rmdir "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
+# A timeout must run cleanup, not just die: SIGKILL on $$ cannot be trapped
+# and would orphan the child processes (still bound to the port) and $WORK.
+# The watchdog sends SIGTERM instead; this handler prints and exits, so the
+# EXIT trap above fires and kills the tracked PIDs.
+trap 'echo "smoke: TIMED OUT" >&2; exit 124' TERM
 
-( sleep 60; echo "smoke: TIMED OUT" >&2; kill -9 $$ 2>/dev/null ) &
+( sleep 60; kill -TERM $$ 2>/dev/null ) &
 PIDS+=($!)
 
 fail() {

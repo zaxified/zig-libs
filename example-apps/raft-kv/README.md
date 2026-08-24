@@ -112,8 +112,18 @@ service.
 - **Static membership.** The `--peers` list is fixed at start; §6 membership
   changes are design-only in the module and not wired here.
 - **No snapshots/compaction.** The log replays from index 1 on restart.
-- **No RPC deadlines.** One-shot request/response on loopback; a peer that
-  accepts and never answers would wedge that one replication thread.
+- **No RPC deadlines.** One-shot request/response on loopback. A peer that
+  accepts a connection and then never answers blocks the thread that made the
+  call — and because replication threads are *joined* at shutdown, such a peer
+  present at SIGTERM time would keep the whole process from exiting, not just
+  stall one thread. On loopback with cooperating peers this never arises; a
+  production build would put a deadline on every socket op.
+- **One coarse lock, held across the fsync.** All node state is guarded by a
+  single spinlock, and `kv`'s durable `put` (an fsync) runs *under* it, so
+  writes are fully serialized and a slow disk can delay heartbeats. That is the
+  simplest thing that is correct, not the fastest thing that works: a real
+  system would persist off the critical path and replicate concurrently. Fine
+  for a three-node loopback demo; not a template for production throughput.
 
 ## Modules used
 
@@ -122,4 +132,4 @@ service.
 | `raft` | the model-checked consensus kernel + the RPC wire codec |
 | `kv` | crash-consistent storage for term/vote/log (fsync per write) |
 | `framing` | length-prefixed frames over TCP |
-| `lockfree` | the `SpinLock` guarding all Raft state |
+| `lockfree` | the `SpinLock` guarding all Raft state (see the note above) |

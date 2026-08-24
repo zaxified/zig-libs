@@ -846,6 +846,7 @@ const AuthorizedKeys = struct {
         no_matching_line,
         revoked,
         weak_rsa_hash,
+        restriction_too_long,
     };
 
     fn hook(self: *AuthorizedKeys) ssh.userauth.AuthorizedKeyCheck {
@@ -891,6 +892,7 @@ const AuthorizedKeys = struct {
             .no_matching_line => "no line of authorized_keys carries that key",
             .revoked => "the key is on a @revoked line",
             .weak_rsa_hash => "rsa-sha2-256 refused by --strict-rsa; offer rsa-sha2-512",
+            .restriction_too_long => "the line's options/forced-command exceed this server's 512-byte buffer; refused rather than enforced truncated",
         };
     }
 
@@ -965,11 +967,19 @@ const AuthorizedKeys = struct {
                 return self.refuse(.revoked, user, blob_type);
             }
 
-            self.options_len = @min(entry.options.len, self.options_buf.len);
-            @memcpy(self.options_buf[0..self.options_len], entry.options[0..self.options_len]);
+            // A restriction that does not FIT must refuse the key, never be
+            // silently truncated: a cut `command="…"` or option string is a
+            // DIFFERENT, likely weaker restriction than the admin wrote, and
+            // enforcing the wrong restriction is worse than rejecting the key.
+            if (entry.options.len > self.options_buf.len)
+                return self.refuse(.restriction_too_long, user, blob_type);
+            self.options_len = entry.options.len;
+            @memcpy(self.options_buf[0..self.options_len], entry.options);
             if (authorizedKeyOption(entry.options, "command")) |forced| {
-                self.forced_len = @min(forced.len, self.forced_buf.len);
-                @memcpy(self.forced_buf[0..self.forced_len], forced[0..self.forced_len]);
+                if (forced.len > self.forced_buf.len)
+                    return self.refuse(.restriction_too_long, user, blob_type);
+                self.forced_len = forced.len;
+                @memcpy(self.forced_buf[0..self.forced_len], forced);
             }
             if (self.verbose) std.debug.print(
                 "debug1: {s}:{d} authorizes this {s} key for {s}\n",
@@ -1291,14 +1301,33 @@ const Commands = struct {
             // `CommandHandler` hands over the client's stdin as one finished
             // slice, so there is nothing to stream: a temporary file is an
             // honest fd for it, and cannot deadlock the way a pipe we also
-            // have to drain would. ⚠ It is created with this process's umask
-            // in a shared `/tmp`; a server carrying anything secret on stdin
-            // wants a private mode, or `memfd_create`, or an `O_TMPFILE`.
+            // have to drain would.
+            //
+            // ⚠ The path is PREDICTABLE (`pid`-`runs`), so the create is
+            // EXCLUSIVE: on a shared host a local attacker who reads our pid
+            // could pre-plant a symlink here, and a following (non-exclusive)
+            // create would then overwrite whatever it points at with the
+            // client's stdin — an arbitrary-file-write. `exclusive = true`
+            // makes the create fail instead of following the link. Confidence
+            // is still the caller's problem (umask, and a secret on stdin
+            // wants `memfd_create`/`O_TMPFILE`), but integrity is covered.
             const p = std.fmt.bufPrint(&stdin_path_buf, "/tmp/ssh-demo-stdin-{d}-{d}", .{
                 std.os.linux.getpid(), self.runs,
             }) catch unreachable;
-            try writeWholeFile(self.io, p, stdin);
+            var f = std.Io.Dir.cwd().createFile(self.io, p, .{ .truncate = true, .exclusive = true }) catch |err| {
+                std.debug.print("ssh-demo: cannot create stdin temp {s}: {t}\n", .{ p, err });
+                return err;
+            };
+            // We own the file now — arm the cleanup BEFORE the write, so a
+            // failed/partial write still deletes it rather than leaking it.
             stdin_path = p;
+            {
+                defer f.close(self.io);
+                var wbuf: [4096]u8 = undefined;
+                var fw = f.writer(self.io, &wbuf);
+                try fw.interface.writeAll(stdin);
+                try fw.interface.flush();
+            }
             stdin_file = try std.Io.Dir.cwd().openFile(self.io, p, .{});
         }
 
@@ -1371,15 +1400,6 @@ const Commands = struct {
         };
     }
 };
-
-fn writeWholeFile(io: std.Io, path: []const u8, bytes: []const u8) !void {
-    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(io, &buf);
-    try fw.interface.writeAll(bytes);
-    try fw.interface.flush();
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // subsystem — a small honest one, and NOT SFTP

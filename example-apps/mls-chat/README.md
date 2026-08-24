@@ -99,15 +99,25 @@ with its leaf index precisely because two members may publish the same one.
 - **`/leave` is a proposal, not an act**, because §12.4 forbids a committer
   from removing itself: the leaver publishes a Remove for its own leaf and
   stays in the group until a remaining member commits it. Which member does
-  that has to be decided without a round trip, so the rule is derived from
-  state everyone already agrees on — **the lowest occupied leaf that is not
-  the one being removed commits.** Excluding the leaver matters: it is the one
-  member that never sees its own proposal (the relay does not echo to the
-  sender), so a leaver sitting at leaf 0 would elect itself and nothing would
-  ever happen.
+  that has to be decided without a round trip, and — the part that is easy to
+  get wrong — the decision must not depend on the order proposals arrived.
+  The committer is **the lowest occupied leaf that is not the target of any
+  pending Remove**, and when more than one proposal is outstanding the one
+  committed is chosen by a fixed canonical order, so every member reaches the
+  same answer. Excluding every removal target matters: a member never receives
+  its own proposal (the relay does not echo to the sender), so a leaver left on
+  the ballot would elect itself and nothing would happen. When several members
+  propose at once, one proposal is committed per epoch and the rest are
+  re-proposed as needed.
 - **One group per client**, named by `--group`, and no history: a member added
   in epoch 5 cannot read epoch 4's messages. That is MLS working, not a
   limitation of the app.
+- **One coarse lock over group state, held across the send.** A client's two
+  threads share a single spinlock, and a Commit is built and its handshake sent
+  while it is held. On loopback with small frames that is fine; a client facing
+  a slow relay would want the send off the lock. It is the simple correct
+  thing, not the scalable one — the same trade the `raft-kv` demo makes and
+  documents.
 - **No transport security below MLS.** The frames between client and relay are
   plain TCP. MLS protects the content; nothing here protects the metadata the
   relay sees anyway.

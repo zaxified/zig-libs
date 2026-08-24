@@ -123,6 +123,17 @@ fn keygen(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) 
     const sk_path = try std.fmt.allocPrint(gpa, "{s}.sk", .{stem});
     defer gpa.free(sk_path);
 
+    // Never clobber an existing keypair. Overwriting a `.sk` is irreversible
+    // and orphans every capsule already sealed to the matching `.pk` — for a
+    // tool whose whole job is guarding that key, a silent truncate is the
+    // worst possible default. Refuse if either file exists (checked before
+    // writing either, so a half-written pair is impossible), and let the user
+    // pick another `--out` or delete the old pair deliberately.
+    if (fileExists(io, pk_path) or fileExists(io, sk_path)) {
+        std.debug.print("timecapsule: {s}.pk / {s}.sk already exist — refusing to overwrite a keypair; use --out or remove them first\n", .{ stem, stem });
+        return failure_exit;
+    }
+
     try writeWholeFile(io, pk_path, &kp.ek, false);
     try writeWholeFile(io, sk_path, &kp.dk, true);
 
@@ -192,7 +203,10 @@ fn seal(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
     };
     defer gpa.free(plaintext);
 
-    const rnd = Env.SealRandomness.generate(io);
+    // `rnd` is half the raw material of the derived content key; zero it after
+    // sealing, the same hygiene keygen/open apply to every other secret here.
+    var rnd = Env.SealRandomness.generate(io);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&rnd));
     const wire = Env.seal(gpa, plaintext, ek, p_pub, round, rnd) catch |err| {
         std.debug.print("timecapsule: seal failed: {t}\n", .{err});
         return failure_exit;
@@ -277,56 +291,72 @@ fn open(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
 
     // Fetch (or load) the round's signature. A 425/404 is the time lock
     // holding; with --wait, so is a --round-file that does not exist yet.
+    // Acquire the round's signature, polling under --wait. "Not ready yet"
+    // has two shapes while polling a --round-file: the file is absent
+    // (FileNotFound), or it is present but mid-write, which surfaces LATER as
+    // a parse error on a truncated document. Both are retryable under --wait;
+    // treating the parse error as fatal (it was, before) turned a non-atomic
+    // writer racing the poll into a permanent exit 1, and `--round-file` is
+    // exactly the pattern smoke.sh feeds.
     var announced = false;
-    const round_json = while (true) {
-        const doc = beacon.roundDoc(gpa, io, round_file, base, cap.round) catch |err| {
-            const pending = err == error.RoundNotPublished or
-                (wait and round_file != null and err == error.FileNotFound);
-            if (!pending) {
-                std.debug.print("timecapsule: fetching round {d} failed: {t}\n", .{ cap.round, err });
+    const round = while (true) {
+        not_ready: {
+            const doc = beacon.roundDoc(gpa, io, round_file, base, cap.round) catch |err| {
+                const retryable = err == error.RoundNotPublished or
+                    (wait and round_file != null and err == error.FileNotFound);
+                if (!retryable) {
+                    std.debug.print("timecapsule: fetching round {d} failed: {t}\n", .{ cap.round, err });
+                    return failure_exit;
+                }
+                break :not_ready;
+            };
+            defer gpa.free(doc);
+            const parsed = drand.parseRound(gpa, doc) catch |err| {
+                // Retryable only while WAITING on a file that may still be
+                // half-written; a fetched-and-broken document, or a broken
+                // file without --wait, is a real error.
+                if (!(wait and round_file != null)) {
+                    std.debug.print("timecapsule: round document does not parse: {t}\n", .{err});
+                    return failure_exit;
+                }
+                break :not_ready;
+            };
+            if (parsed.round != cap.round) {
+                std.debug.print("timecapsule: signature is for round {d}, capsule unlocks at round {d}\n", .{ parsed.round, cap.round });
                 return failure_exit;
             }
-            const unlock_at = beacon.publishTime(&info, cap.round);
-            const remaining = @max(unlock_at - beacon.wallNow(), 0);
-            if (!wait) {
-                var when_buf: [40]u8 = undefined;
-                std.debug.print("timecapsule: still locked — round {d} publishes {s} ({d}s from now)\n", .{
-                    cap.round,
-                    beacon.formatUtc(&when_buf, unlock_at),
-                    remaining,
-                });
-                return locked_exit;
-            }
-            if (!announced) {
-                var when_buf: [40]u8 = undefined;
-                std.debug.print("timecapsule: waiting — round {d} publishes {s} ({d}s from now)\n", .{
-                    cap.round,
-                    beacon.formatUtc(&when_buf, unlock_at),
-                    remaining,
-                });
-                announced = true;
-            }
-            // One long sleep to just short of the publish time, then poll on
-            // the beacon's own cadence. Chunked so a Ctrl+C lands promptly.
-            const step_s: u64 = if (remaining > 5)
-                @min(@as(u64, @intCast(remaining - 2)), 60)
-            else
-                @max(info.period_seconds, 2);
-            io.sleep(.fromMilliseconds(@intCast(step_s * 1000)), .awake) catch return failure_exit;
-            continue;
-        };
-        break doc;
-    };
-    defer gpa.free(round_json);
+            break parsed;
+        }
 
-    const round = drand.parseRound(gpa, round_json) catch |err| {
-        std.debug.print("timecapsule: round document does not parse: {t}\n", .{err});
-        return failure_exit;
+        // Reaching here means "not published / not ready yet".
+        const unlock_at = beacon.publishTime(&info, cap.round);
+        const remaining = @max(unlock_at - beacon.wallNow(), 0);
+        if (!wait) {
+            var when_buf: [40]u8 = undefined;
+            std.debug.print("timecapsule: still locked — round {d} publishes {s} ({d}s from now)\n", .{
+                cap.round,
+                beacon.formatUtc(&when_buf, unlock_at),
+                remaining,
+            });
+            return locked_exit;
+        }
+        if (!announced) {
+            var when_buf: [40]u8 = undefined;
+            std.debug.print("timecapsule: waiting — round {d} publishes {s} ({d}s from now)\n", .{
+                cap.round,
+                beacon.formatUtc(&when_buf, unlock_at),
+                remaining,
+            });
+            announced = true;
+        }
+        // One long sleep to just short of the publish time, then poll on the
+        // beacon's own cadence. Chunked so a Ctrl+C lands promptly.
+        const step_s: u64 = if (remaining > 5)
+            @min(@as(u64, @intCast(remaining - 2)), 60)
+        else
+            @max(info.period_seconds, 2);
+        io.sleep(.fromMilliseconds(@intCast(step_s * 1000)), .awake) catch return failure_exit;
     };
-    if (round.round != cap.round) {
-        std.debug.print("timecapsule: signature is for round {d}, capsule unlocks at round {d}\n", .{ round.round, cap.round });
-        return failure_exit;
-    }
     // BLS-verify the signature against the chain public key BEFORE using it
     // as a decryption key: a fabricated signature must fail here, loudly,
     // not as an opaque envelope error.
@@ -414,6 +444,17 @@ fn readCapsule(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?Capsule {
         gpa.free(bytes);
         return null;
     };
+    // drand rounds are 1-based; round 0 is not a point on any chain, so a
+    // capsule claiming it could never have been sealed legitimately and can
+    // never be opened. Reject it here rather than downstream — the beacon
+    // arithmetic is saturating and would not crash, but "round 0" is a
+    // malformed capsule, and saying so is clearer than computing a fictional
+    // unlock time for it.
+    if (parsed.round == 0) {
+        std.debug.print("timecapsule: {s}: capsule names round 0, which no drand chain has\n", .{path});
+        gpa.free(bytes);
+        return null;
+    }
     var cap: Capsule = .{ .bytes = bytes, .chain_hash = undefined, .round = parsed.round };
     @memcpy(&cap.chain_hash, bytes[5..][0..32]);
     return cap;
@@ -466,6 +507,12 @@ fn parseWhen(s: []const u8, info: *const drand.ChainInfo) ?u64 {
     }
     std.debug.print("timecapsule: --at must be +<n>[smhd], @<unix>, or round:<n> — got '{s}'\n", .{s});
     return null;
+}
+
+fn fileExists(io: std.Io, path: []const u8) bool {
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    f.close(io);
+    return true;
 }
 
 fn writeWholeFile(io: std.Io, path: []const u8, bytes: []const u8, secret: bool) !void {

@@ -15,18 +15,24 @@ BIN="$PWD/zig-out/bin/timecapsule"
 [ -x "$BIN" ] || { echo "smoke: $BIN is not built — run ./init.sh first" >&2; exit 2; }
 
 WORK="$(mktemp -d)"
+WAITER=""  # the `open --wait` background case, when running
 cleanup() {
+    [ -n "${WATCHDOG:-}" ] && kill "$WATCHDOG" 2>/dev/null || true
+    [ -n "$WAITER" ] && kill "$WAITER" 2>/dev/null || true
     rm -f "$WORK"/* 2>/dev/null || true
     rmdir "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
+# A timeout must run cleanup, not just die: SIGKILL on $$ cannot be trapped and
+# would orphan the `open --wait` child and $WORK. The watchdog sends SIGTERM;
+# this handler exits so the EXIT trap fires.
+trap 'echo "smoke: TIMED OUT" >&2; exit 124' TERM
 
 # A watchdog: the app is offline here (every beacon document comes from a
 # file), so anything long-running is a hang, not a download. 60s is ~20x.
-( sleep 60; echo "smoke: TIMED OUT" >&2; kill -9 $$ 2>/dev/null ) &
+( sleep 60; kill -TERM $$ 2>/dev/null ) &
 WATCHDOG=$!
 disown "$WATCHDOG"
-trap 'kill "$WATCHDOG" 2>/dev/null || true; cleanup' EXIT
 
 fail() { echo "smoke: FAILED — $1" >&2; exit 1; }
 

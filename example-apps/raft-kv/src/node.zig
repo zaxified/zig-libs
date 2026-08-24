@@ -75,7 +75,11 @@ const Node = struct {
     // ────────────────────────────────────────────────────────────────────────
 
     stop: std.atomic.Value(bool) = .init(false),
-    live_conns: std.atomic.Value(usize) = .init(0),
+    /// Every DETACHED thread that touches `*Node` — accepted connections and
+    /// vote RPCs — is counted here so shutdown can wait for all of them before
+    /// `deinit` frees the state they hold. Missing this on vote threads was a
+    /// real use-after-free: they were detached and untracked.
+    live_threads: std.atomic.Value(usize) = .init(0),
     listen_addr: std.Io.net.IpAddress,
 
     fn init(self: *Node, gpa: std.mem.Allocator, io: std.Io, opts: Options) !void {
@@ -190,19 +194,28 @@ const Node = struct {
             // In-flight connections are all request/response with bounded
             // waits, so shutdown joins them implicitly: the stop watcher's
             // self-connect below is the LAST accepted connection.
-            _ = self.live_conns.rmw(.Add, 1, .acq_rel);
+            _ = self.live_threads.rmw(.Add, 1, .acq_rel);
             const t = std.Thread.spawn(.{}, connectionThread, .{ self, stream }) catch {
                 var s = stream;
                 s.close(self.io);
-                _ = self.live_conns.rmw(.Sub, 1, .acq_rel);
+                _ = self.live_threads.rmw(.Sub, 1, .acq_rel);
                 continue;
             };
             t.detach();
         }
-        // Let request/response stragglers finish before deinit tears state
-        // down under them (their waits are bounded by commit_wait_ms).
-        const deadline = nowMs() + commit_wait_ms + 500;
-        while (self.live_conns.load(.acquire) != 0 and nowMs() < deadline)
+        // Wait UNCONDITIONALLY for every detached thread (connections AND vote
+        // RPCs) to release `*Node` before returning — `serve` runs `deinit`
+        // the moment we return, and a straggler still inside `self.lock`/
+        // `self.log` would then touch freed state. The earlier soft deadline
+        // here would elapse and let `deinit` proceed under a live thread; that
+        // was the use-after-free. Every counted thread finishes on its own
+        // (request/response is bounded by commit_wait_ms; a vote/replication
+        // RPC returns when its peer answers or the connection drops), so this
+        // terminates in every case the demo produces. The one thing that could
+        // stall it — a peer that accepts and then never answers — already
+        // stalls the replication-thread joins above, so this widens no window
+        // that was not already open, and it trades a definite UAF for it.
+        while (self.live_threads.load(.acquire) != 0)
             self.io.sleep(.fromMilliseconds(10), .awake) catch break;
         std.debug.print("raft-kv[{d}]: stopped cleanly\n", .{self.id});
     }
@@ -237,8 +250,13 @@ const Node = struct {
         self.term += 1;
         self.vote = self.id;
         self.role = .candidate;
-        try self.store.saveMeta(self.term, self.vote);
+        // Reset the deadline BEFORE the fallible persist. If saveMeta fails
+        // (a broken disk), the `try` returns and tickerLoop only logs it — but
+        // with the deadline already advanced, the next tick backs off instead
+        // of re-firing 20 ms later and hammering the disk while inflating the
+        // term every cycle.
         self.resetElectionDeadline();
+        try self.store.saveMeta(self.term, self.vote);
         std.debug.print("raft-kv[{d}]: term={d} standing for election\n", .{ self.id, self.term });
 
         const li = self.log.info();
@@ -253,7 +271,9 @@ const Node = struct {
         for (0..self.n) |i| {
             if (i == self.id) continue;
             _ = tally.refs.rmw(.Add, 1, .acq_rel);
+            _ = self.live_threads.rmw(.Add, 1, .acq_rel);
             const t = std.Thread.spawn(.{}, voteThread, .{ self, @as(u32, @intCast(i)), req, tally }) catch {
+                _ = self.live_threads.rmw(.Sub, 1, .acq_rel);
                 _ = tally.refs.rmw(.Sub, 1, .acq_rel);
                 continue;
             };
@@ -272,6 +292,7 @@ const Node = struct {
     };
 
     fn voteThread(self: *Node, peer: u32, req: raft.RequestVoteReq, tally: *Tally) void {
+        defer _ = self.live_threads.rmw(.Sub, 1, .acq_rel);
         defer tally.release(self.gpa);
         var buf: [raft.RequestVoteReq.wire_len + 1]u8 = undefined;
         buf[0] = @intFromEnum(wire.Kind.rpc);
@@ -465,7 +486,7 @@ const Node = struct {
         var stream = stream_in;
         defer {
             stream.close(self.io);
-            _ = self.live_conns.rmw(.Sub, 1, .acq_rel);
+            _ = self.live_threads.rmw(.Sub, 1, .acq_rel);
         }
         const frame_buf = self.gpa.alloc(u8, wire.limits.max_frame) catch return;
         defer self.gpa.free(frame_buf);
