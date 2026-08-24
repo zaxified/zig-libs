@@ -129,7 +129,26 @@ second=$(curl -s -H "X-Api-Key: $KEY" -H "Idempotency-Key: smoke-key-1" \
     || fail "a replayed Idempotency-Key produced a different response:\n  first:  $first\n  second: $second"
 echo "$first" | grep -q '"idempotent"' || fail "the idempotent POST did not create the task: $first"
 
-# 7. Rate limiting, LAST on purpose. The limiter is 5/s with a burst of 10,
+# 7. Prometheus metrics: the scrape works, requests landed in the right
+#    class labels, and the business counter matches what this script did.
+#    BEFORE the burst below — after it, abuseguard refuses our address at
+#    the connection level and no scrape gets through.
+scrape=$(curl -s "$BASE/metrics") || fail "GET /metrics"
+echo "$scrape" | grep -q '^http_requests_total{method="post",code="2xx"}' \
+    || fail "no post/2xx series in /metrics after successful POSTs"
+echo "$scrape" | grep -q '^http_requests_total{method="post",code="4xx"}' \
+    || fail "no post/4xx series in /metrics after the 401/403 cases"
+created=$(echo "$scrape" | sed -n 's/^tasks_created_total //p')
+# Tasks created so far by this script: case 3's create, case 6's idempotent
+# pair (counts ONCE - the replay never reaches the handler). The webhook
+# posts complete a task, they do not create one.
+[ "$created" = 2 ] || fail "tasks_created_total is '$created', this script created 2 (idempotent replay must not double-count)"
+scrape2=$(curl -s "$BASE/metrics")
+echo "$scrape2" | grep -q '^http_requests_total{method="get"' && :
+delta=$(echo "$scrape2" | sed -n 's/^tasks_created_total //p')
+[ "$delta" = "$created" ] || fail "scraping /metrics changed a business counter"
+
+# 8. Rate limiting, LAST on purpose. The limiter is 5/s with a burst of 10,
 #    and past that `abuseguard` stops answering this peer at the connection
 #    level — measured: eight 200s, then 429s, then curl cannot connect at all.
 #    So this case poisons the client address for everything after it, and
@@ -156,4 +175,4 @@ set -e
 [ "$stop_rc" = 0 ] || fail "SIGTERM did not stop the service cleanly (exit $stop_rc — a leak panic exits non-zero)"
 grep -q "stopped cleanly" "$WORK/service.log" || fail "the service did not report a clean stop"
 
-echo "smoke: OK — gate refuses, task round-trips, headers stamped, webhook signature accepts and refuses, replay is idempotent, burst is rate-limited, SIGTERM exits clean under the leak check"
+echo "smoke: OK — gate refuses, task round-trips, headers stamped, webhook signature accepts and refuses, replay is idempotent (and not double-counted), metrics scrape and classify, burst is rate-limited, SIGTERM exits clean under the leak check"

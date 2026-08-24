@@ -1367,7 +1367,7 @@ const example_apps = [_]struct {
         "ratelimit",  "requestid", "health",      "throttle",
         "abuseguard", "aaa-gate",  "idempotency", "tracecontext",
         "webhooksig", "openapi",   "ramcache",    "accesslog",
-        "netaddr",
+        "metrics",    "netaddr",
     } },
 };
 

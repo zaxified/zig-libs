@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "openapi", .module = zig_libs.module("openapi") },
                 .{ .name = "ramcache", .module = zig_libs.module("ramcache") },
                 .{ .name = "accesslog", .module = zig_libs.module("accesslog") },
+                .{ .name = "metrics", .module = zig_libs.module("metrics") },
                 .{ .name = "netaddr", .module = zig_libs.module("netaddr") },
             },
         }),

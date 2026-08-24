@@ -31,12 +31,20 @@
 //!      orchestrator probe cannot present a credential.
 //!   7. `openapi`       — public API documentation belongs next to health:
 //!      no client should need a key just to read the spec.
-//!   8. `abuseguard`    — "register FIRST" relative to `ratelimit` (module's
+//!   8. `metrics`       — two pieces, in the module's own order: the
+//!      `/metrics` endpoint FIRST (a Prometheus scrape is an orchestrator
+//!      probe like `/healthz` — it cannot present a credential, must not
+//!      burn rate-limit, and must not count as traffic), then the request
+//!      middleware, which sits ABOVE the three shedding layers below so a
+//!      short-circuited 429/503 is still measured. Consequence of the
+//!      placement, on purpose: `/healthz`, the OpenAPI doc and the scrape
+//!      itself do not pollute the request metrics.
+//!   9. `abuseguard`    — "register FIRST" relative to `ratelimit` (module's
 //!      own usage example) so its auto-strike sees the 429s below it, plus
 //!      the 401s from aaa-gate and the 400/409/422/413s from idempotency
 //!      once those groups are nested inside this chain.
-//!   9. `ratelimit`     — per-client token bucket, cheap and specific.
-//!  10. `throttle`      — the last-resort global concurrency shed; it
+//!  10. `ratelimit`     — per-client token bucket, cheap and specific.
+//!  11. `throttle`      — the last-resort global concurrency shed; it
 //!      protects the server even when every per-client check passed.
 //!
 //! Then two route groups, each adding only the middleware ITS clients need:
@@ -84,6 +92,7 @@ const webhooksig = @import("webhooksig");
 const openapi = @import("openapi");
 const ramcache = @import("ramcache");
 const accesslog = @import("accesslog");
+const metrics = @import("metrics");
 const netaddr = @import("netaddr");
 
 const Allocator = std.mem.Allocator;
@@ -132,6 +141,10 @@ const App = struct {
     /// Not owned here — the idempotency Store outlives the App the same way
     /// it outlives the Router (both live on `runServer`'s stack).
     idem_store: *idempotency.Store,
+    /// Business metric, beside the middleware's request signals: how many
+    /// tasks this process has created. Registered in `runServer`; null only
+    /// until the registry exists.
+    tasks_created: ?*metrics.Counter = null,
 
     fn deinit(a: *App) void {
         for (a.tasks.items) |t| a.gpa.free(t.title);
@@ -263,6 +276,7 @@ fn createTask(ctx: *router.Ctx) anyerror!void {
     };
     app.lock.unlock();
 
+    if (app.tasks_created) |c| c.inc();
     if (aaa_gate.identityOf(ctx)) |id_| id_.audit_detail = "created a task";
     try app.idem_store.respond(ctx, 201, "application/json", aw.written());
 }
@@ -627,6 +641,18 @@ fn runServer(
     };
     defer docs.deinit();
 
+    var reg = metrics.Registry.init(gpa);
+    defer reg.deinit();
+    var rm = metrics.RequestMetrics.init(&reg, .{}) catch |err| {
+        std.debug.print("http-service: RequestMetrics.init: {t}\n", .{err});
+        return 1;
+    };
+    var ep = metrics.Endpoint{ .registry = &reg }; // GET /metrics
+    app.tasks_created = reg.counter("tasks_created_total", "Tasks created over the API.", &.{}) catch |err| {
+        std.debug.print("http-service: counter: {t}\n", .{err});
+        return 1;
+    };
+
     var guard = abuseguard.Guard.init(gpa, .{
         .max_conns_per_ip = 50,
         .ban_threshold = 8,
@@ -682,6 +708,8 @@ fn runServer(
     try r.use(cors_mw.middleware());
     try r.use(h.middleware());
     try r.use(docs.middleware());
+    try r.use(ep.middleware()); // scrape short-circuits here: never limited, never counted
+    try r.use(rm.middleware()); // measures everything below, incl. 429/503 sheds
     try r.use(guard.middleware());
     try r.use(limiter.middleware());
     try r.use(th.middleware());

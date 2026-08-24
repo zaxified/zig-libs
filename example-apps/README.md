@@ -16,7 +16,7 @@ nothing else.
 |---|---|---|
 | [`ssh-demo`](ssh-demo/) | An SSH-2.0 client and server in one binary, with real `known_hosts` and `authorized_keys` handling. | `ssh` |
 | [`mls-chat`](mls-chat/) | End-to-end encrypted group chat over RFC 9420 (MLS) — delivery service and client in one binary. | `mls`, `framing`, `lockfree` |
-| [`http-service`](http-service/) | A hardened task-tracking JSON API — API-key and HMAC-signed webhook clients, behind the composed middleware chain. | `http`, `router`, and 15 more |
+| [`http-service`](http-service/) | A hardened task-tracking JSON API — API-key and HMAC-signed webhook clients, behind the composed middleware chain. | `http`, `router`, and 16 more |
 | [`timecapsule`](timecapsule/) | Encrypt a file openable only AFTER a chosen time (drand timelock) and only BY a chosen recipient (HQC post-quantum KEM) — two locks, both required. | `timelock_envelope`, `drand`, `hqc`, `http`, `datefmt` |
 | [`raft-kv`](raft-kv/) | Replicated KV store over the raft module's model-checked kernel — survives leader kill, catches up after restart, refuses writes without a majority. | `raft`, `kv`, `framing`, `lockfree` |
 

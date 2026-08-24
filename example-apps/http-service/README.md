@@ -27,7 +27,7 @@ cd example-apps/http-service
 
 The tree, like every app here — see `example-apps/README.md` for the rule and
 why the pin exists anyway. This app was written freely against whatever the
-working tree's 13 composable middleware modules offer, without checking each
+working tree's 14 composable middleware modules offer, without checking each
 shape against a tag first, and `zig build --fork=../..` is the build that is
 guaranteed to pass on every commit.
 
@@ -85,12 +85,22 @@ Global (`router.use`, applies to every request), outermost first:
    orchestrator probe cannot present a credential.
 7. **`openapi`** — public docs belong next to health; no client should need
    a key just to read the spec.
-8. **`abuseguard`** — "register FIRST" relative to `ratelimit` (the module's
+8. **`metrics`** — two pieces, in the module's own order: the `/metrics`
+   endpoint first (a Prometheus scrape is an orchestrator probe like
+   `/healthz` — no credential, no rate-limit, and not counted as traffic),
+   then the request middleware, ABOVE the three shedding layers below so a
+   short-circuited 429/503 still lands in `http_requests_total`. Deliberate
+   consequence: `/healthz`, the OpenAPI doc and the scrape itself do not
+   pollute the request metrics. The app also registers one business
+   counter, `tasks_created_total` — and the smoke test uses it to prove an
+   idempotent replay does NOT double-count, which is two modules
+   cross-checking each other.
+9. **`abuseguard`** — "register FIRST" relative to `ratelimit` (the module's
    own usage example), so its auto-strike sees the 429s below it, plus the
    401s from `aaa-gate` and the 400/409/422/413s from `idempotency` once
    those groups nest inside this chain.
-9. **`ratelimit`** — per-client token bucket (5 req/s, burst 10).
-10. **`throttle`** — the last-resort global concurrency shed (32 in flight);
+10. **`ratelimit`** — per-client token bucket (5 req/s, burst 10).
+11. **`throttle`** — the last-resort global concurrency shed (32 in flight);
     protects the server even when every per-client check passed.
 
 Per-group (only the clients that need it pay for it):
@@ -106,7 +116,7 @@ request is read. That is separate from `guard.middleware()`'s
 response-status auto-strike above; the module ships both and this app uses
 both, on purpose.
 
-## Left out of the 13
+## Left out of the 14
 
 - **`sessions`** (and its `csrf` sibling) — this is a machine-to-machine
   JSON API with no browser-rendered login page: there is no form to protect
