@@ -1360,6 +1360,7 @@ const example_apps = [_]struct {
 }{
     .{ .name = "ssh-demo", .modules = &.{"ssh"} },
     .{ .name = "mls-chat", .modules = &.{ "mls", "framing", "lockfree" } },
+    .{ .name = "timecapsule", .modules = &.{ "timelock_envelope", "drand", "hqc", "http", "datefmt" } },
     .{ .name = "http-service", .modules = &.{
         "http",       "router",    "cors",        "security-headers",
         "ratelimit",  "requestid", "health",      "throttle",

@@ -65,6 +65,19 @@ directory.
   learned to stop on SIGTERM, because its `DebugAllocator` leak check only
   executes on a clean exit and nothing had ever given it one.
 
+- **New example app `timecapsule`:** encrypt a file openable only AFTER a
+  chosen wall-clock time (drand/quicknet timelock via `tlock`) and only BY a
+  chosen recipient (`hqc` post-quantum KEM), composed through
+  `timelock_envelope`'s two-lock AND — plus `drand` for BLS verification of
+  the beacon signature, `http` as the TLS client the transport-agnostic
+  `drand` module leaves to its caller, and `datefmt` for the unlock-time
+  display. The smoke test runs fully offline against the genuine quicknet
+  round-1000 documents (the same bytes the module KATs pin), so the
+  refuse-paths include a real BLS pairing rejection with no network in CI.
+  Measured while wiring the live path: api.drand.sh answers a future round
+  with **425 Too Early**, not 404 — the app treats both as "still locked"
+  (exit 3, distinct from an error's 1).
+
 - **Packaging fix:** `build.zig.zon`'s `.paths` did not list `LICENSE` or
   `NOTICE`, so neither was part of the package. `.paths` decides what a
   consumer actually receives; a file outside it is visible on GitHub and absent
