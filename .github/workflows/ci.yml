@@ -809,12 +809,14 @@ jobs:
   # by 23 seconds; this would not fit, and it does not need to. Here it runs on
   # its own runner, in parallel, holding nobody up.
   #
-  # Cost, measured on the development host: three apps built and their smoke
-  # tests run in BOTH ReleaseSafe and ReleaseFast is ~36 s wall. ⚠ That is with
-  # the ReleaseSafe builds already cached and a warm global cache; a runner has
-  # neither, so it is a floor, not the lane's cost. (An earlier version of this
-  # comment quoted ~4 s — measured before the apps were fixed to stop building
-  # in Debug, which is what that number was really timing.)
+  # Cost, measured on the development host: five apps built and their smoke
+  # tests run in BOTH ReleaseSafe and ReleaseFast is ~37 s wall — the smokes
+  # dominate now, not the builds (raft-kv's no-majority case alone holds a 4 s
+  # client budget per mode). ⚠ That is with builds already cached and a warm
+  # global cache; a runner has neither, so it is a floor, not the lane's cost.
+  # (An earlier version of this comment quoted ~4 s — measured before the apps
+  # were fixed to stop building in Debug, which is what that number was really
+  # timing.)
   consumer:
     name: consumer build
     needs: [scoped, full, plan]
