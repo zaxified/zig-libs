@@ -6,6 +6,24 @@
 # EVERY LANE AT THIS COMMIT. That is a checkable claim, so this script checks it
 # instead of asking you to remember.
 #
+# ⚠ ONE PIPELINE, AND THIS SCRIPT IS ITS SECOND STEP (owner, 2026-08-24):
+#
+#   the owner asks for a tag -> this script cuts it, it is pushed
+#                            -> pushing a tag runs the FULL matrix on the tag ref
+#                            -> green: a Release is cut from this tag's message
+#                            -> red:   no Release, and the tag is WITHDRAWN
+#
+# So THESE THREE LANES ARE A PRE-CHECK, NOT THE AUTHORITY. They are amd64-only:
+# the arm64 lane that found x86 inline asm in `montint` on 2026-08-24 is not
+# among them, and neither is any lane this host cannot run. What the tag asserts
+# is what the MATRIX ran. Tag `2026-08-18` was cut on three green local lanes,
+# pushed, and deleted when the matrix went red on ReleaseFast amd64 -- that is
+# the pipeline working.
+#
+# The Release is not cut from here: this script and CI both hold no
+# `contents: write`, on purpose. It is cut by hand from the tag's own message
+# once the matrix is green.
+#
 # WHY NOT SEMVER. Zig resolves dependencies by URL + hash; nothing reads a
 # version string, so a semver tag on a 225-module collection is pure signalling
 # with no mechanism behind it — and the signal would be false, since one number

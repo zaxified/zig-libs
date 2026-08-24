@@ -160,7 +160,8 @@ itself when the change is one that warrants it (`build.zig`, the harness). Reach
 
 Releases are dated git tags (`YYYY-MM-DD`), **not** semantic versions, and there are no
 per-module versions; a tag asserts exactly one thing, that every module cleared every lane at
-that commit (see the bar below — two lanes run the tests, the third only compiles). `scripts/tag.sh` cuts one. `v0.1.0` remains as history and is not a version
+that commit. `scripts/tag.sh` cuts one, on the owner's word and over a green full matrix,
+and every tag gets a GitHub Release. `v0.1.0` remains as history and is not a version
 anything after it follows; dated releases exist, so pin the newest one that suits you
 (`git tag`, or the tags page) rather than a bare commit. Detail
 lives in `modules/<name>/CHANGELOG.md` with breaking changes flagged `BREAKING`;

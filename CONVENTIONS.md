@@ -583,15 +583,37 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
 
 ## 8. Versioning, releases & spin-offs
 
-- **Dated tags, not semver.** A release = a git tag `YYYY-MM-DD` on `main`, cut by
-  `scripts/tag.sh`, which refuses unless all three CI lanes — `ReleaseSafe`, `ReleaseFast`,
-  `-Dstrict-debug` — are green at that commit. The tag
-  asserts exactly that and nothing more: *every module passed every lane here*. There are no
-  per-module version numbers and no collection-wide semantic version.
-  **Why three and not four.** The default (Debug) lane was dropped because `heavy_optimize`
-  in `build.zig` substitutes `ReleaseSafe` for Debug on the heavy modules, which makes every
-  (module, mode) pair of the default lane a subset of the other two. It cost gate time and
-  proved nothing the remaining lanes do not already cover.
+- **Dated tags, not semver. ONE pipeline, and it starts with the owner** (owner,
+  2026-08-24). A release = a git tag `YYYY-MM-DD` on `main`, and there is exactly one route
+  to it:
+
+      the owner asks for a tag  ->  tag.sh cuts it and it is pushed
+                                ->  pushing a tag runs the FULL CI matrix on the tag ref
+                                ->  green: a Release is cut from the tag's own message
+                                ->  red:   no Release, and the tag is WITHDRAWN
+
+  These are not separate rules to satisfy in some order. The tag is what triggers the
+  matrix; the matrix is the verdict on the tag; the Release is what a green verdict
+  produces. Nothing here is offered — a tag is cut when it is asked for, and never because
+  a run happened to be green.
+
+  The red branch is not theoretical. Tag `2026-08-18` was cut on three green local lanes and
+  pushed; the matrix then failed on ReleaseFast amd64 and the tag was deleted rather than
+  argued with. That is the pipeline working, not a mishap — which is why `tag.sh`'s three
+  local lanes are a PRE-CHECK and not the authority. They are amd64-only, so the arm64 lane
+  that found x86 inline asm in `montint` on 2026-08-24 is not among them. What the tag
+  asserts is what the matrix ran.
+
+  Running the matrix over `main` by hand BEFORE asking for the tag (`workflow_dispatch`,
+  lane `all`) is prudence, not policy: it costs one run and turns a withdrawal into a
+  non-event. It is also what warms the cache the tag run then hits — see `ci.yml`.
+  The tag asserts exactly that and nothing more: *every module passed every lane here*.
+  There are no per-module version numbers and no collection-wide semantic version.
+  **Why the Debug lane compiles and does not test.** `heavy_optimize` in `build.zig`
+  substitutes `ReleaseSafe` for Debug on the heavy modules, which makes every (module, mode)
+  pair of a Debug test lane a subset of the release lanes'. It cost gate time and proved
+  nothing they do not already cover, so that lane compiles every module and every example
+  and runs neither.
   **Why not semver.** Zig resolves dependencies by URL + hash — no resolver reads a version
   string — so a semver tag carries no mechanism, only signal, and on a 225-module collection
   the signal would be false: one number cannot describe modules ranging from externally
@@ -601,16 +623,22 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   per-module changelog below does not supplement a collection version — it replaces it.
   Same-day re-tags get `.1`, `.2`, … so names stay sortable and never collide. `v0.1.0`
   remains as history; nothing after it is a semantic version.
-- **A tag is not a GitHub Release, and that is deliberate.** They are separate objects: a
-  tag is git, a Release is a GitHub record someone creates explicitly. Nothing here creates
-  one — `tag.sh` pushes a tag, and CI holds `contents: read` precisely so the gate cannot
-  publish anything. So `v0.1.0` has a Release and no dated tag does, which looks like an
-  omission and is not: **Releases are cut BY HAND over selected tags** (owner's decision,
-  2026-08-15). A dated tag says "every module passed every lane at this commit" and is cut
-  whenever that becomes true, several times a day when the day goes badly; a Release is an
-  announcement, and announcing every green matrix would make the announcement worthless.
-  Automating it would also mean handing the gate `contents: write`, which trades the whole
-  point of least privilege for a convenience nobody asked for.
+- **A green matrix on a tag means a Release** — the last step of the pipeline above, not a
+  second rule (owner, 2026-08-24). This REVERSES the 2026-08-15 rule that Releases were cut
+  by hand over *selected* tags, and it reverses it because that rule's premise is gone: it
+  existed to stop announcements becoming worthless back when a dated tag was cut whenever
+  the matrix went green, several times a day when the day went badly. Tags are asked for
+  now, so every one of them is already something the owner decided to publish — and a tag
+  with no Release is a snapshot nobody can reach from the repository's front page.
+  **Still not automated.** CI holds `contents: read` precisely so the gate cannot publish
+  anything; automating this would mean handing it `contents: write`, which trades the whole
+  point of least privilege for a convenience nobody asked for. The Release is cut by hand
+  after the matrix is green, from the tag's own message.
+  **`v0.1.0` keeps its Release and stays as history** — it is not a dated tag and nothing
+  after it is a semantic version. Do not rename it to a date: the commit under it was
+  measured by a gate that had 77 modules, no arm64 lane and no example runs, so a dated
+  name would assert something that was never checked there. That is the shape that got tag
+  `2026-08-18` deleted.
 - **CHANGELOG per module.** **Every module in `module_list` has a
   `modules/<name>/CHANGELOG.md`** — not only the ones with a code change to record. A module
   whose only history is being created still gets its dated `New module:` entry, so per-module
