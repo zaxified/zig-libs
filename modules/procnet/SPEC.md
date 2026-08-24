@@ -87,41 +87,62 @@ open and close between two reads, and `ss` prefers netlink and can legitimately 
 files do not — so the strong claim is the controlled-socket one and the whole-machine figure is a
 snapshot, not an invariant.
 
-### Unverified limit: the hex address decode on a big-endian target
+### The hex address decode on a big-endian target — measured, and what is left
 
-`meta.targets` declares `.linux32`, which this repository's build defines as
-**MIPS** (`mips-linux-musl`, soft-float) — the collection's one **big-endian**
-lane, chosen precisely because endianness is the defect class every other lane
-cannot catch. The address decoders have never been *run* there, and this
-section exists so that is written down rather than implied.
+Two different questions hide behind "does this work on big-endian", and they
+have different answers. This section separates them because the first has now
+been measured and the second cannot be settled from here.
 
-What the code assumes. `leHexWord` (`src/sockets.zig`) and its twin
-`leHexToV4` (`src/routes.zig`) parse each 8-hex-char group with
-`parseInt(u32, s, 16)` and then emit the parsed integer's **low** byte as the
-**first** address octet — i.e. they assume the kernel printed the `__be32` as
-a little-endian host word. That assumption is the one those functions' own doc
-comments state, and it is the one every fixture under `src/testdata/` was
-captured under: those captures come from little-endian hosts, so they confirm
-the decode on little-endian and say nothing at all about big-endian.
+**Question 1 — does OUR code behave differently when compiled big-endian? No.
+Measured 2026-08-24, not reasoned about.** The same fixed `/proc/net/tcp` table
+was fed through `parseTcp` in two builds and the decoded addresses compared:
 
-Why the gate does not settle it. `check-portable` **compiles** every module
-for `.linux32`; it never executes anything there. A byte-order assumption is
-invisible to a compiler — the code is well-typed either way — so a green
-`portable-procnet-linux32` row is a statement about types, not about decoded
-addresses. There is no big-endian host and no big-endian capture in this
-repository, so nothing here can decide the question in either direction.
+    zig build-exe -target mips-linux-musl ...   # ELF 32-bit MSB, MIPS32
+    qemu-mips ./probe                           # reports: native endian: big
+
+Both builds printed byte-identical results (`0100007F` -> `127.0.0.1`,
+`7F000001` -> `1.0.0.127`), and the module's whole suite was then run the same
+way — `zig test -target mips-linux-musl --test-cmd qemu-mips --test-cmd-bin` —
+with **51/51 passing**.
+
+The reason matters more than the measurement. `leHexWord` (`src/sockets.zig`)
+and `leHexToV4` (`src/routes.zig`) parse a hex STRING into an integer VALUE
+with `parseInt(u32, s, 16)`, then take octets out of it with `& 0xff` and
+`>> 8`. Shifts and masks are defined on the value, not on its representation in
+memory, so no byte-order reinterpretation ever happens and the CPU's endianness
+cannot reach the result. An earlier version of this section framed the risk as
+"the decoders have never been RUN on `.linux32`" and read a green
+`portable-procnet-linux32` row as weak evidence. Running them there proves
+nothing either: there was nothing endian-dependent to run.
+
+**Question 2 — what does a big-endian KERNEL print into the file? Unverified,
+and it is a property of the kernel, not of this module.** The decode is correct
+exactly when the kernel emits the `__be32` as a little-endian host word, which
+is what every fixture under `src/testdata/` shows — and all of those captures
+come from little-endian hosts, so they confirm that case and say nothing about
+the other.
+
+What the field says, with its evidence quality stated rather than borrowed:
+secondary sources describe the file as "little-endian regardless of
+architecture", which would make this decode correct everywhere, and the one
+primary report found — Bitcoin's issue #31812, networking tests failing under
+emulated s390x — says the same. But that report *infers* the byte order from
+which tests failed: it quotes no file contents, no other participant confirms
+it, and no fix accompanies it. The kernel's own `proc_net_tcp` documentation
+does not mention endianness at all. That is not enough to write "fine on
+big-endian" into a SPEC, so it is not written.
 
 **Neither "broken on big-endian" nor "fine on big-endian" is claimed.** What
-would settle it, precisely: capture `/proc/net/tcp` **and** `/proc/net/tcp6`
-on a big-endian Linux host (MIPS, s390x, or a big-endian qemu-system guest)
-together with the ground-truth addresses of the sockets in them — e.g. `ss
--tuln` output taken on that same host at the same moment — then replay those
-captures through `parseTcp` as a fixture and compare the decoded `netaddr.Ip`
-values against that ground truth. One such pair of files, checked in beside
-the existing little-endian fixtures, converts this section from an unverified
-limit into either a passing test or a bug report. Until then `.linux32` in
-`meta.targets` should be read as "compiles there", not "decodes correctly
-there".
+would settle it, precisely: capture `/proc/net/tcp` **and** `/proc/net/tcp6` on
+a big-endian Linux host (s390x, or a big-endian `qemu-system` guest — note that
+`qemu-mips` user-mode emulation can NOT do this, because the `/proc` it exposes
+is the host kernel's) together with ground truth for the sockets in them, `ss
+-tuln` taken on that host at that moment, then replay the capture through
+`parseTcp` as a fixture and compare against that ground truth. One such pair of
+files, checked in beside the existing fixtures, turns this into either a passing
+test or a bug report. Until then `.linux32` in `meta.targets` means "compiles
+there, and decodes identically there"; the open question is the file's content,
+not this code.
 
 ## Backlog / deferred
 Per the module README's "DEFER" list: `/proc/net/unix` (the AF_UNIX table, `ss -x` — a different row
