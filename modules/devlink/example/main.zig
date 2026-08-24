@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: MIT
 
 //! What a SmartNIC inventory tool does with `devlink` when it wants to stay
-//! off the live kernel path: build a `DEVLINK_CMD_GET` dump request byte for
-//! byte, and decode a `DEVLINK_CMD_NEW` reply captured from a real
-//! `netdevsim` device into the module's own `Device` type.
+//! off the live kernel path: build a complete `DEVLINK_CMD_GET` dump request
+//! with `devlink.buildDevices`, and decode a `DEVLINK_CMD_NEW` reply captured
+//! from a real `netdevsim` device into the module's own `Device` type.
 //!
 //! `devlink.Devlink` (the client in the module's own usage example) always
 //! owns a live `AF_NETLINK` socket — there is no way to get a `Devlink` value
 //! without `Devlink.open()` making that syscall. This file stays on the wire
-//! seam instead, using the framing devlink re-exports (`devlink.codec` is
+//! seam instead: request **encoding** is a public step, so the bytes
+//! `Devlink.devices()` would send can be produced with no socket at all, and
+//! the reply side uses the framing devlink re-exports (`devlink.codec` is
 //! `netlink.codec`, `devlink.genl` is the `genetlink` module) plus the
 //! module's own pure decoders (`devlink.dev.parseDevice`). Built against the
 //! PUBLISHED module (`@import("devlink")`) only.
@@ -43,21 +45,15 @@ pub fn main() !void {
     // produce a realistic frame.
     const devlink_family_id: u16 = 25;
 
-    var req: std.ArrayList(u8) = .empty;
-    defer req.deinit(gpa);
-    const hdr_off = try devlink.codec.appendHeader(
-        gpa,
-        &req,
-        devlink_family_id,
-        devlink.codec.NLM_F_REQUEST | devlink.codec.NLM_F_DUMP,
-        1, // seq
-        0, // pid — kernel fills this in
-    );
-    try devlink.genl.appendHeader(gpa, &req, devlink.uapi.CMD.GET, 1);
-    devlink.codec.finishHeader(&req, hdr_off);
+    // One call for the whole message: netlink header, genlmsghdr, the flags
+    // (`NLM_F_DUMP` is the builder's business, not the sender's) and any
+    // attributes. The sequence number is the caller's — a live client passes
+    // its socket's next one.
+    const req = try devlink.buildDevices(gpa, devlink_family_id, 1);
+    defer gpa.free(req);
 
     std.debug.print("dump request: {d} wire bytes for family \"{s}\"\n", .{
-        req.items.len,
+        req.len,
         devlink.family_name,
     });
 

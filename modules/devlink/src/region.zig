@@ -52,6 +52,8 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
+const request = @import("request.zig");
+const genl = @import("genetlink");
 
 pub const ParseError = codec.Error || error{OutOfMemory};
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
@@ -338,6 +340,82 @@ pub fn appendRead(
     }
     try uapi.appendAttrU64(gpa, list, uapi.ATTR.REGION_CHUNK_ADDR, req.address);
     try uapi.appendAttrU64(gpa, list, uapi.ATTR.REGION_CHUNK_LEN, req.length);
+}
+
+// ── complete requests ──────────────────────────────────────────────────────
+
+/// Build a `DEVLINK_CMD_REGION_GET` **dump** — every region on the system,
+/// which is what `Devlink.regions` sends. The `filter` that method takes is
+/// applied to the replies, not to this message.
+pub fn buildRegions(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+) request.Error![]u8 {
+    return request.buildSimple(gpa, family_id, seq, uapi.CMD.REGION_GET, true, null);
+}
+
+/// Build a `DEVLINK_CMD_REGION_GET` for one named region — what
+/// `Devlink.region` sends.
+pub fn buildRegion(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    region_name: []const u8,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.REGION_GET, false);
+    errdefer b.deinit();
+    try appendGet(gpa, &b.list, h, region_name);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_REGION_NEW` — what `Devlink.newSnapshot` sends. Needs
+/// **CAP_NET_ADMIN**.
+pub fn buildNewSnapshot(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    region_name: []const u8,
+    snapshot_id: ?u32,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.REGION_NEW, false);
+    errdefer b.deinit();
+    try appendNewSnapshot(gpa, &b.list, h, region_name, snapshot_id);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_REGION_DEL` — what `Devlink.delSnapshot` sends.
+pub fn buildDelSnapshot(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    region_name: []const u8,
+    snapshot_id: u32,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.REGION_DEL, false);
+    errdefer b.deinit();
+    try appendDelSnapshot(gpa, &b.list, h, region_name, snapshot_id);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_REGION_READ` — what `Devlink.readRegion` sends. This
+/// one **is** a dump: the reply is chunked across as many messages as the
+/// kernel needs, and `Assembler` puts them back together. Needs
+/// **CAP_NET_ADMIN**.
+pub fn buildReadRegion(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    req: ReadRequest,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.REGION_READ, true);
+    errdefer b.deinit();
+    try appendRead(gpa, &b.list, h, req);
+    return b.finish();
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -642,4 +720,120 @@ fn fuzzRegion(_: void, smith: *std.testing.Smith) !void {
     var a = Assembler.init(testing.allocator, 0, 256) catch return;
     defer a.deinit(testing.allocator);
     a.feed(buf[0..len]) catch {};
+}
+
+fn attrPresent(attr_bytes: []const u8, want: u16) codec.Error!bool {
+    var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    while (try it.next()) |a| {
+        if (a.type == want) return true;
+    }
+    return false;
+}
+
+test "buildNewSnapshot leaves the id out when the kernel is to pick one" {
+    const gpa = testing.allocator;
+    const h: handle.Handle = .pci("0000:65:00.0");
+
+    const with = try buildNewSnapshot(gpa, 0x19, 6, h, "cr-space", 5);
+    defer gpa.free(with);
+    var it: codec.MessageIterator = .{ .buf = with };
+    var m = (try it.next()).?;
+    try testing.expectEqual(@as(u16, codec.NLM_F_REQUEST | codec.NLM_F_ACK), m.flags);
+    var p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.REGION_NEW, p.cmd);
+    try testing.expectEqualSlices(u32, &.{5}, (try parseRegion(p.attrs)).snapshots());
+
+    const without = try buildNewSnapshot(gpa, 0x19, 6, h, "cr-space", null);
+    defer gpa.free(without);
+    it = .{ .buf = without };
+    m = (try it.next()).?;
+    p = try genl.splitPayload(m.payload);
+    // The optional attribute is ABSENT, not zero: snapshot 0 is a real id.
+    try testing.expect(!(try attrPresent(p.attrs, uapi.ATTR.REGION_SNAPSHOT_ID)));
+    try testing.expectEqual(@as(usize, 0), (try parseRegion(p.attrs)).snapshots().len);
+    try testing.expectEqualStrings("cr-space", (try parseRegion(p.attrs)).name());
+    try testing.expectEqual(with.len - 8, without.len);
+}
+
+test "buildReadRegion is the one read sent as a dump" {
+    const gpa = testing.allocator;
+    const h: handle.Handle = .pci("0000:65:00.0");
+
+    const snap = try buildReadRegion(gpa, 0x19, 8, h, .{
+        .region = "cr-space",
+        .snapshot_id = 5,
+        .address = 0x1000,
+        .length = 32,
+    });
+    defer gpa.free(snap);
+    var it: codec.MessageIterator = .{ .buf = snap };
+    var m = (try it.next()).?;
+    try testing.expectEqual(
+        @as(u16, codec.NLM_F_REQUEST | codec.NLM_F_ACK | codec.NLM_F_DUMP),
+        m.flags,
+    );
+    try testing.expectEqual(@as(u32, 8), m.seq);
+    var p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.REGION_READ, p.cmd);
+    try testing.expectEqual(uapi.family_version, m.payload[1]);
+    var addr: ?u64 = null;
+    var len: ?u64 = null;
+    var attrs: codec.AttrIterator = .{ .buf = p.attrs };
+    while (try attrs.next()) |a| switch (a.type) {
+        uapi.ATTR.REGION_CHUNK_ADDR => addr = try uapi.asU64(a),
+        uapi.ATTR.REGION_CHUNK_LEN => len = try uapi.asU64(a),
+        else => {},
+    };
+    try testing.expectEqual(@as(?u64, 0x1000), addr);
+    try testing.expectEqual(@as(?u64, 32), len);
+    try testing.expect(try attrPresent(p.attrs, uapi.ATTR.REGION_SNAPSHOT_ID));
+    // A snapshot read is not a direct read.
+    try testing.expect(!(try attrPresent(p.attrs, uapi.ATTR.REGION_DIRECT)));
+
+    const direct = try buildReadRegion(gpa, 0x19, 8, h, .{ .region = "cr-space", .length = 32 });
+    defer gpa.free(direct);
+    it = .{ .buf = direct };
+    m = (try it.next()).?;
+    p = try genl.splitPayload(m.payload);
+    try testing.expect(!(try attrPresent(p.attrs, uapi.ATTR.REGION_SNAPSHOT_ID)));
+    try testing.expect(try attrPresent(p.attrs, uapi.ATTR.REGION_DIRECT));
+}
+
+test "buildRegions dumps, buildRegion and buildDelSnapshot name one region" {
+    const gpa = testing.allocator;
+    const h: handle.Handle = .pci("0000:65:00.0");
+
+    const dump = try buildRegions(gpa, 0x19, 1);
+    defer gpa.free(dump);
+    var it: codec.MessageIterator = .{ .buf = dump };
+    var m = (try it.next()).?;
+    try testing.expect(m.flags & codec.NLM_F_DUMP != 0);
+    var p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.REGION_GET, p.cmd);
+    try testing.expectEqual(@as(usize, 0), p.attrs.len);
+
+    const one = try buildRegion(gpa, 0x19, 1, h, "fw-health");
+    defer gpa.free(one);
+    it = .{ .buf = one };
+    m = (try it.next()).?;
+    try testing.expect(m.flags & codec.NLM_F_DUMP == 0);
+    p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.REGION_GET, p.cmd);
+    try testing.expectEqualStrings("fw-health", (try parseRegion(p.attrs)).name());
+    try testing.expect(!(try attrPresent(p.attrs, uapi.ATTR.REGION_SNAPSHOT_ID)));
+
+    const del = try buildDelSnapshot(gpa, 0x19, 1, h, "fw-health", 3);
+    defer gpa.free(del);
+    it = .{ .buf = del };
+    m = (try it.next()).?;
+    p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.REGION_DEL, p.cmd);
+    // A delete always names the snapshot: there is no "delete them all".
+    try testing.expectEqualSlices(u32, &.{3}, (try parseRegion(p.attrs)).snapshots());
+
+    try testing.expectError(error.InvalidRequest, buildRegion(gpa, 0x19, 1, h, ""));
+    try testing.expectError(error.InvalidRequest, buildReadRegion(gpa, 0x19, 1, h, .{
+        .region = "cr-space",
+        .length = 0,
+    }));
 }

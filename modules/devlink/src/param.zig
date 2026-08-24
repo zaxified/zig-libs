@@ -45,6 +45,8 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
+const request = @import("request.zig");
+const genl = @import("genetlink");
 
 pub const ParseError = codec.Error || error{OutOfMemory};
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
@@ -351,6 +353,51 @@ pub fn appendSet(
     }
 }
 
+// ── complete requests ──────────────────────────────────────────────────────
+
+/// Build a `DEVLINK_CMD_PARAM_GET` **dump** — every parameter of every
+/// instance, which is what `Devlink.params` sends. The `filter` that method
+/// takes is applied to the replies, not to this message.
+pub fn buildParams(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+) request.Error![]u8 {
+    return request.buildSimple(gpa, family_id, seq, uapi.CMD.PARAM_GET, true, null);
+}
+
+/// Build a `DEVLINK_CMD_PARAM_GET` for one named parameter — what
+/// `Devlink.param` sends.
+pub fn buildParam(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    param_name: []const u8,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PARAM_GET, false);
+    errdefer b.deinit();
+    try appendGetByName(gpa, &b.list, h, param_name);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_PARAM_SET` — what `Devlink.setParam` sends. Needs
+/// **CAP_NET_ADMIN** on the socket that sends it.
+pub fn buildSetParam(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    param_name: []const u8,
+    cmode: uapi.ParamCmode,
+    value: Value,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PARAM_SET, false);
+    errdefer b.deinit();
+    try appendSet(gpa, &b.list, h, param_name, cmode, value);
+    return b.finish();
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -360,7 +407,7 @@ const ValueSpec = struct { cmode: uapi.ParamCmode, data: ?[]const u8 };
 
 /// Build a `DEVLINK_ATTR_PARAM` nest with raw `PARAM_VALUE_DATA` payloads, so
 /// a test can feed a width the type does not declare.
-fn buildParam(
+fn buildParamNest(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     param_name: []const u8,
@@ -390,7 +437,7 @@ test "parse dispatches the value width on PARAM_TYPE, even when it comes last" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     try handle.append(gpa, &list, .pci("0000:65:00.0"));
-    try buildParam(gpa, &list, "max_macs", @intFromEnum(uapi.ParamType.u32_), true, &.{
+    try buildParamNest(gpa, &list, "max_macs", @intFromEnum(uapi.ParamType.u32_), true, &.{
         .{ .cmode = .driverinit, .data = &.{ 0x80, 0x00, 0x00, 0x00 } },
     });
 
@@ -421,7 +468,7 @@ test "parse handles every declared type" {
         if (native_endian != .little and (c.t == .u16_ or c.t == .u32_ or c.t == .u64_)) continue;
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(gpa);
-        try buildParam(gpa, &list, "p", @intFromEnum(c.t), false, &.{
+        try buildParamNest(gpa, &list, "p", @intFromEnum(c.t), false, &.{
             .{ .cmode = .runtime, .data = c.data },
         });
         var p = try parse(gpa, list.items);
@@ -432,7 +479,7 @@ test "parse handles every declared type" {
     // Strings are their own case: the payload keeps its NUL on the wire.
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try buildParam(gpa, &list, "p", @intFromEnum(uapi.ParamType.string), false, &.{
+    try buildParamNest(gpa, &list, "p", @intFromEnum(uapi.ParamType.string), false, &.{
         .{ .cmode = .permanent, .data = "flash\x00" },
     });
     var p = try parse(gpa, list.items);
@@ -445,7 +492,7 @@ test "a declared width the data does not match is a malformed reply" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     // Declared u32, sent 8 bytes wide.
-    try buildParam(gpa, &list, "p", @intFromEnum(uapi.ParamType.u32_), false, &.{
+    try buildParamNest(gpa, &list, "p", @intFromEnum(uapi.ParamType.u32_), false, &.{
         .{ .cmode = .runtime, .data = &.{ 0, 0, 0, 0, 0, 0, 0, 0 } },
     });
     try testing.expectError(error.BadLength, parse(gpa, list.items));
@@ -455,7 +502,7 @@ test "an unknown PARAM_TYPE keeps the raw bytes instead of dropping the value" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try buildParam(gpa, &list, "future", 200, false, &.{
+    try buildParamNest(gpa, &list, "future", 200, false, &.{
         .{ .cmode = .runtime, .data = &.{ 0xde, 0xad } },
     });
     var p = try parse(gpa, list.items);
@@ -468,7 +515,7 @@ test "a cmode with no data is 'supported but unset', not absent" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try buildParam(gpa, &list, "enable_roce", @intFromEnum(uapi.ParamType.flag), true, &.{
+    try buildParamNest(gpa, &list, "enable_roce", @intFromEnum(uapi.ParamType.flag), true, &.{
         .{ .cmode = .runtime, .data = &.{} },
         .{ .cmode = .permanent, .data = null },
     });
@@ -485,7 +532,7 @@ test "reloadWouldChange compares runtime against driverinit" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
-    try buildParam(gpa, &list, "enable_roce", @intFromEnum(uapi.ParamType.u8_), true, &.{
+    try buildParamNest(gpa, &list, "enable_roce", @intFromEnum(uapi.ParamType.u8_), true, &.{
         .{ .cmode = .runtime, .data = &.{1} },
         .{ .cmode = .driverinit, .data = &.{0} },
     });
@@ -494,7 +541,7 @@ test "reloadWouldChange compares runtime against driverinit" {
     try testing.expect(p.reloadWouldChange());
 
     list.clearRetainingCapacity();
-    try buildParam(gpa, &list, "enable_roce", @intFromEnum(uapi.ParamType.u8_), true, &.{
+    try buildParamNest(gpa, &list, "enable_roce", @intFromEnum(uapi.ParamType.u8_), true, &.{
         .{ .cmode = .runtime, .data = &.{1} },
         .{ .cmode = .driverinit, .data = &.{1} },
     });
@@ -504,7 +551,7 @@ test "reloadWouldChange compares runtime against driverinit" {
 
     // A parameter with only one cmode cannot be changed by a reload.
     list.clearRetainingCapacity();
-    try buildParam(gpa, &list, "x", @intFromEnum(uapi.ParamType.u8_), false, &.{
+    try buildParamNest(gpa, &list, "x", @intFromEnum(uapi.ParamType.u8_), false, &.{
         .{ .cmode = .runtime, .data = &.{1} },
     });
     var r = try parse(gpa, list.items);
@@ -518,7 +565,7 @@ test "a values list longer than max_values is refused, not allocated" {
     defer list.deinit(gpa);
     var specs: [max_values + 1]ValueSpec = undefined;
     for (&specs) |*s| s.* = .{ .cmode = .runtime, .data = &.{1} };
-    try buildParam(gpa, &list, "p", @intFromEnum(uapi.ParamType.u8_), false, &specs);
+    try buildParamNest(gpa, &list, "p", @intFromEnum(uapi.ParamType.u8_), false, &specs);
     try testing.expectError(error.BadLength, parse(gpa, list.items));
 }
 
@@ -644,4 +691,124 @@ fn fuzzParam(_: void, smith: *std.testing.Smith) !void {
         _ = v.reloadWouldChange();
         v.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "buildSetParam frames a whole PARAM_SET, headers and all" {
+    const gpa = testing.allocator;
+    const msg = try buildSetParam(
+        gpa,
+        0x19,
+        77,
+        .pci("0000:65:00.0"),
+        "max_macs",
+        .driverinit,
+        .{ .uint32 = 128 },
+    );
+    defer gpa.free(msg);
+
+    var it: codec.MessageIterator = .{ .buf = msg };
+    const m = (try it.next()).?;
+    try testing.expect((try it.next()) == null);
+    // Header: the family id the caller passed, REQUEST|ACK, its sequence
+    // number, and a pid the kernel is to fill in.
+    try testing.expectEqual(@as(u16, 0x19), m.type);
+    try testing.expectEqual(@as(u16, codec.NLM_F_REQUEST | codec.NLM_F_ACK), m.flags);
+    try testing.expectEqual(@as(u32, 77), m.seq);
+    try testing.expectEqual(@as(u32, 0), m.pid);
+    try testing.expectEqual(@as(u32, @intCast(msg.len)), std.mem.readInt(u32, msg[0..4], .little));
+    // genlmsghdr: the command and the family version.
+    const p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.PARAM_SET, p.cmd);
+    try testing.expectEqual(uapi.family_version, m.payload[1]);
+
+    // Every attribute this command must carry, by type and value.
+    var attrs: codec.AttrIterator = .{ .buf = p.attrs };
+    var seen_name = false;
+    var seen_type = false;
+    var seen_cmode = false;
+    var seen_data = false;
+    while (try attrs.next()) |a| switch (a.type) {
+        uapi.ATTR.PARAM_NAME => {
+            try testing.expectEqualStrings("max_macs", a.asString());
+            seen_name = true;
+        },
+        uapi.ATTR.PARAM_TYPE => {
+            try testing.expectEqual(@intFromEnum(uapi.ParamType.u32_), try a.asU8());
+            seen_type = true;
+        },
+        uapi.ATTR.PARAM_VALUE_CMODE => {
+            try testing.expectEqual(@intFromEnum(uapi.ParamCmode.driverinit), try a.asU8());
+            seen_cmode = true;
+        },
+        uapi.ATTR.PARAM_VALUE_DATA => {
+            try testing.expectEqual(@as(u32, 128), try a.asU32());
+            seen_data = true;
+        },
+        else => {},
+    };
+    try testing.expect(seen_name and seen_type and seen_cmode and seen_data);
+    const h = try handle.parse(p.attrs);
+    try testing.expectEqualStrings("0000:65:00.0", h.dev());
+}
+
+test "buildSetParam omits PARAM_VALUE_DATA for a flag that is off" {
+    const gpa = testing.allocator;
+    const h: handle.Handle = .pci("0000:65:00.0");
+
+    const on = try buildSetParam(gpa, 0x19, 1, h, "enable_roce", .runtime, .{ .flag = true });
+    defer gpa.free(on);
+    const off = try buildSetParam(gpa, 0x19, 1, h, "enable_roce", .runtime, .{ .flag = false });
+    defer gpa.free(off);
+
+    try testing.expect(hasAttr(on[20..], uapi.ATTR.PARAM_VALUE_DATA));
+    // "off" IS the absence of the attribute — the kernel's flag policy.
+    try testing.expect(!(try hasAttrChecked(off[20..], uapi.ATTR.PARAM_VALUE_DATA)));
+    try testing.expectEqual(on.len - 4, off.len);
+}
+
+fn hasAttr(attr_bytes: []const u8, want: u16) bool {
+    return hasAttrChecked(attr_bytes, want) catch false;
+}
+
+fn hasAttrChecked(attr_bytes: []const u8, want: u16) codec.Error!bool {
+    var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    while (try it.next()) |a| {
+        if (a.type == want) return true;
+    }
+    return false;
+}
+
+test "buildParam / buildParams / buildSetParam: commands, flags, rejections" {
+    const gpa = testing.allocator;
+    const h: handle.Handle = .pci("0000:65:00.0");
+
+    const dump = try buildParams(gpa, 0x19, 2);
+    defer gpa.free(dump);
+    var it: codec.MessageIterator = .{ .buf = dump };
+    var m = (try it.next()).?;
+    try testing.expect(m.flags & codec.NLM_F_DUMP != 0);
+    try testing.expectEqual(uapi.CMD.PARAM_GET, (try genl.splitPayload(m.payload)).cmd);
+
+    const one = try buildParam(gpa, 0x19, 2, h, "max_macs");
+    defer gpa.free(one);
+    it = .{ .buf = one };
+    m = (try it.next()).?;
+    try testing.expect(m.flags & codec.NLM_F_DUMP == 0);
+    const p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.PARAM_GET, p.cmd);
+    try testing.expect(hasAttr(p.attrs, uapi.ATTR.PARAM_NAME));
+    // A GET names the parameter; it never carries a value or a type.
+    try testing.expect(!hasAttr(p.attrs, uapi.ATTR.PARAM_VALUE_DATA));
+    try testing.expect(!hasAttr(p.attrs, uapi.ATTR.PARAM_TYPE));
+
+    try testing.expectError(error.InvalidRequest, buildParam(gpa, 0x19, 1, h, ""));
+    try testing.expectError(error.InvalidRequest, buildSetParam(
+        gpa,
+        0x19,
+        1,
+        h,
+        "a\x00b",
+        .runtime,
+        .{ .uint8 = 1 },
+    ));
 }

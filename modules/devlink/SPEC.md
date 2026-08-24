@@ -133,6 +133,26 @@ attributes in the request. `ports`/`params`/`regions`/`healthReporters`
 therefore take an *optional* handle and filter after decoding — which is what
 the `devlink` binary does. The single-object forms are real `doit` requests.
 
+### 2.7 Request encoding is public, and there is one encoder per command
+
+Each command's request is built by a public `buildX` (`buildDevices`,
+`buildSetPortType`, `buildReadRegion`, …) that returns a whole netlink message
+rather than a handful of attributes: headers, flags and attributes, for a
+family id and sequence number the caller supplies because those are facts a
+socket owns. That matches the sibling `nl80211` (`buildGetInterface`) and
+`nftables` (`buildDumpRequest`) bindings, and it is why a caller can produce
+the bytes a command would send and put them on a socket of its own — or slice
+off the headers (`msg[20..]`) and hand the attributes to `Devlink.raw`.
+
+The constraint that matters is what it is **not**: a second copy of the header
+assembly sitting next to the client's own. `client.zig` contains no
+`appendHeader`/`finishHeader` of its own — every command method calls its
+`buildX` and sends the bytes it returns, `request.zig` is the one place the two
+headers are written, and a test over `client.zig`'s own source keeps it that
+way. The flags are preserved exactly as the client sent them before, including
+this module's choice to ask for an `NLM_F_ACK` on `RESOURCE_DUMP`/`RESOURCE_SET`
+where the `devlink` binary does not (§4.1).
+
 ## 3. Threat model
 
 The kernel is the only peer, but the *messages* are treated as untrusted:

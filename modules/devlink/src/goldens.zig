@@ -491,6 +491,148 @@ test "golden: devlink dev eswitch set, pinning the u16/u8/u8 widths" {
     try testing.expectEqual(@as(?uapi.EncapMode, .basic), e.encap_mode);
 }
 
+// ── the public builders reproduce the captures ─────────────────────────────
+//
+// Everything above builds the captured requests out of the per-attribute
+// appenders plus a local `beginRequest`. The `buildX` functions are the public
+// entry point that returns one COMPLETE message, and `client.zig` sends
+// exactly what they return — so pinning them against the same captures pins
+// what the client puts on the wire, headers, flags and all.
+
+test "builder golden: the five bare dumps" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+
+    const devices = try dev.buildDevices(gpa, fam, seq_dumps);
+    defer gpa.free(devices);
+    try testing.expectEqualSlices(u8, &req_dev_show, devices);
+
+    const ports = try port.buildPorts(gpa, fam, seq_dumps);
+    defer gpa.free(ports);
+    try testing.expectEqualSlices(u8, &req_port_show, ports);
+
+    const params = try param.buildParams(gpa, fam, seq_dumps);
+    defer gpa.free(params);
+    try testing.expectEqualSlices(u8, &req_param_show, params);
+
+    const regions = try region.buildRegions(gpa, fam, seq_dumps);
+    defer gpa.free(regions);
+    try testing.expectEqualSlices(u8, &req_region_show, regions);
+
+    const reporters = try health.buildHealthReporters(gpa, fam, seq_dumps);
+    defer gpa.free(reporters);
+    try testing.expectEqualSlices(u8, &req_health_show, reporters);
+}
+
+test "builder golden: the handle-bearing reads" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+
+    const info = try dev.buildInfo(gpa, fam, seq_reads, cap_handle);
+    defer gpa.free(info);
+    try testing.expectEqualSlices(u8, &req_dev_info_h, info);
+
+    const esw = try eswitch.buildEswitch(gpa, fam, seq_reads, cap_handle);
+    defer gpa.free(esw);
+    try testing.expectEqualSlices(u8, &req_eswitch_show_h, esw);
+
+    const one_port = try port.buildPort(gpa, fam, seq_reads, cap_port);
+    defer gpa.free(one_port);
+    try testing.expectEqualSlices(u8, &req_port_show_h, one_port);
+
+    const one_param = try param.buildParam(gpa, fam, seq_reads, cap_handle, "test_param");
+    defer gpa.free(one_param);
+    try testing.expectEqualSlices(u8, &req_param_show_h, one_param);
+
+    const one_region = try region.buildRegion(gpa, fam, seq_reads, cap_handle, "cr-space");
+    defer gpa.free(one_region);
+    try testing.expectEqualSlices(u8, &req_region_show_h, one_region);
+
+    const reporter = try health.buildHealthReporter(gpa, fam, seq_reads, cap_handle, "fw");
+    defer gpa.free(reporter);
+    try testing.expectEqualSlices(u8, &req_health_show_h, reporter);
+}
+
+test "builder golden: port set / split / unsplit" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+
+    const set = try port.buildSetPortType(gpa, fam, seq_writes, cap_port, .eth);
+    defer gpa.free(set);
+    try testing.expectEqualSlices(u8, &req_port_set, set);
+
+    const split = try port.buildSplitPort(gpa, fam, seq_writes, cap_port, 2);
+    defer gpa.free(split);
+    try testing.expectEqualSlices(u8, &req_port_split, split);
+
+    const unsplit = try port.buildUnsplitPort(gpa, fam, seq_writes, cap_port);
+    defer gpa.free(unsplit);
+    try testing.expectEqualSlices(u8, &req_port_unsplit, unsplit);
+}
+
+test "builder golden: region new / del / read" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+
+    const new = try region.buildNewSnapshot(gpa, fam, seq_writes, cap_handle, "cr-space", 5);
+    defer gpa.free(new);
+    try testing.expectEqualSlices(u8, &req_region_new, new);
+
+    const del = try region.buildDelSnapshot(gpa, fam, seq_writes, cap_handle, "cr-space", 5);
+    defer gpa.free(del);
+    try testing.expectEqualSlices(u8, &req_region_del, del);
+
+    // The one read sent as a dump: the builder sets NLM_F_DUMP itself, because
+    // the flag is part of the message rather than of the sending.
+    const read = try region.buildReadRegion(gpa, fam, seq_writes, cap_handle, .{
+        .region = "cr-space",
+        .snapshot_id = 5,
+        .address = 0,
+        .length = 16,
+    });
+    defer gpa.free(read);
+    try testing.expectEqualSlices(u8, &req_region_read, read);
+    try testing.expect(std.mem.readInt(u16, read[6..8], .little) & codec.NLM_F_DUMP != 0);
+}
+
+test "builder golden: eswitch set, with the u16/u8/u8 widths" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try eswitch.buildSetEswitch(gpa, fam, seq_writes, cap_handle, .{
+        .mode = .switchdev,
+        .inline_mode = .network,
+        .encap_mode = .basic,
+    });
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_eswitch_set, msg);
+}
+
+test "builder golden: health recover, minus iproute2's duplicated attributes" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try health.buildRecoverHealthReporter(gpa, fam, seq_writes, cap_handle, "fw");
+    defer gpa.free(msg);
+    // Quirk (2) in this file's header: the capture repeats the handle and the
+    // reporter name. This module emits them once, so the message is the same
+    // 36 bytes shorter and identical up to that point.
+    try testing.expectEqual(@as(usize, 56), msg.len);
+    try testing.expectEqualSlices(u8, req_health_recover[16..56], msg[16..]);
+    try testing.expectEqual(@as(u32, 56), std.mem.readInt(u32, msg[0..4], .little));
+    try testing.expectEqual(seq_writes, std.mem.readInt(u32, msg[8..12], .little));
+}
+
+test "builder golden: RESOURCE_DUMP keeps this module's ACK, not iproute2's" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try resource.buildResources(gpa, fam, 0x6a61c35c, cap_handle);
+    defer gpa.free(msg);
+    // Same genlmsghdr and same handle as the capture; the capture's extra
+    // trailing RESOURCE_SIZE and its missing ACK are the two differences, and
+    // both are deliberate — see the capture test above.
+    try testing.expectEqualSlices(u8, req_resource_dump[16 .. req_resource_dump.len - 12], msg[16..]);
+    try testing.expectEqual(@as(u16, REQ | ACK), std.mem.readInt(u16, msg[6..8], .little));
+}
+
 // ── captured replies (real kernel bytes) ───────────────────────────────────
 
 /// The kernel's `CTRL_CMD_NEWFAMILY` answer to `CTRL_CMD_GETFAMILY("devlink")`,

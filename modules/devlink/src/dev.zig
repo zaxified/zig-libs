@@ -43,6 +43,8 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
+const request = @import("request.zig");
+const genl = @import("genetlink");
 
 pub const ParseError = codec.Error || error{ OutOfMemory, TooManyVersions };
 
@@ -221,6 +223,38 @@ pub fn parseInfo(gpa: std.mem.Allocator, attr_bytes: []const u8) ParseError!Info
     return info;
 }
 
+// ── request builders ───────────────────────────────────────────────────────
+//
+// A complete, ready-to-send message rather than a handful of attributes: the
+// caller supplies the two runtime facts a socket owns — the family id nlctrl
+// assigned this boot and the sequence number — and gets bytes back. The client
+// in `client.zig` calls exactly these, so there is one encoder per command.
+
+/// Build a `DEVLINK_CMD_GET` **dump** — every registered devlink instance,
+/// which is what `Devlink.devices` sends.
+///
+/// The dump carries no handle: devlink's dump handlers walk every instance and
+/// ignore one, so `devices`/`ports`/`params`/… filter client-side instead —
+/// see the note at the top of `client.zig`.
+pub fn buildDevices(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+) request.Error![]u8 {
+    return request.buildSimple(gpa, family_id, seq, uapi.CMD.GET, true, null);
+}
+
+/// Build a `DEVLINK_CMD_INFO_GET` for one instance — what `Devlink.info`
+/// sends.
+pub fn buildInfo(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+) request.Error![]u8 {
+    return request.buildSimple(gpa, family_id, seq, uapi.CMD.INFO_GET, false, h);
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -377,4 +411,44 @@ fn fuzzDev(_: void, smith: *std.testing.Smith) !void {
         _ = v.hasPendingUpdate();
         v.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "buildDevices is a bare dump; buildInfo is a handle-bearing doit" {
+    const gpa = testing.allocator;
+
+    const dump = try buildDevices(gpa, 0x19, 9);
+    defer gpa.free(dump);
+    var it: codec.MessageIterator = .{ .buf = dump };
+    var m = (try it.next()).?;
+    try testing.expect((try it.next()) == null); // one message, not two
+    try testing.expectEqual(@as(u16, 0x19), m.type);
+    try testing.expectEqual(
+        @as(u16, codec.NLM_F_REQUEST | codec.NLM_F_ACK | codec.NLM_F_DUMP),
+        m.flags,
+    );
+    try testing.expectEqual(@as(u32, 9), m.seq);
+    try testing.expectEqual(@as(u32, 0), m.pid);
+    var p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.GET, p.cmd);
+    try testing.expectEqual(uapi.family_version, m.payload[1]);
+    // A dump does not filter, so it carries no handle at all.
+    try testing.expectEqual(@as(usize, 0), p.attrs.len);
+
+    const one = try buildInfo(gpa, 0x19, 10, .pci("0000:65:00.0"));
+    defer gpa.free(one);
+    it = .{ .buf = one };
+    m = (try it.next()).?;
+    try testing.expectEqual(@as(u16, codec.NLM_F_REQUEST | codec.NLM_F_ACK), m.flags);
+    try testing.expect(m.flags & codec.NLM_F_DUMP == 0);
+    try testing.expectEqual(@as(u32, 10), m.seq);
+    p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.INFO_GET, p.cmd);
+    const h = try handle.parse(p.attrs);
+    try testing.expectEqualStrings("pci", h.bus());
+    try testing.expectEqualStrings("0000:65:00.0", h.dev());
+}
+
+test "buildInfo refuses a handle the kernel would reject" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidRequest, buildInfo(gpa, 0x19, 1, .{ .bus = "pci", .dev = "" }));
 }

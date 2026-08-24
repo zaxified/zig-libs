@@ -140,6 +140,8 @@ pub const health = @import("health.zig");
 pub const eswitch = @import("eswitch.zig");
 /// The socket client and the `config` notification socket.
 pub const client = @import("client.zig");
+/// Request framing — the one place a devlink message's headers are assembled.
+pub const request = @import("request.zig");
 
 /// The generic-netlink transport this family rides on, re-exported so a caller
 /// does not need a second import to drive the raw escape hatch.
@@ -191,6 +193,42 @@ pub const family_name = uapi.family_name;
 
 /// Free a slice of parameters and everything they own.
 pub const freeParams = param.freeAll;
+
+// ── offline request builders ───────────────────────────────────────────────
+//
+// One per request-performing `Devlink` method, returning a **complete**
+// netlink message (headers, flags and attributes) for the caller to send,
+// hand to `Devlink.raw`, or keep. `family_id` and `seq` are the two runtime
+// facts a socket owns: a live client passes `dl.family_id` and its own
+// sequence number, and those same methods call exactly these functions, so
+// there is one encoder per command rather than two that can drift.
+
+pub const buildDevices = dev.buildDevices;
+pub const buildInfo = dev.buildInfo;
+pub const buildPorts = port.buildPorts;
+pub const buildPort = port.buildPort;
+pub const buildSetPortType = port.buildSetPortType;
+pub const buildSplitPort = port.buildSplitPort;
+pub const buildUnsplitPort = port.buildUnsplitPort;
+pub const buildParams = param.buildParams;
+pub const buildParam = param.buildParam;
+pub const buildSetParam = param.buildSetParam;
+pub const buildResources = resource.buildResources;
+pub const buildSetResourceSize = resource.buildSetResourceSize;
+pub const buildRegions = region.buildRegions;
+pub const buildRegion = region.buildRegion;
+pub const buildNewSnapshot = region.buildNewSnapshot;
+pub const buildDelSnapshot = region.buildDelSnapshot;
+pub const buildReadRegion = region.buildReadRegion;
+pub const buildHealthReporters = health.buildHealthReporters;
+pub const buildHealthReporter = health.buildHealthReporter;
+pub const buildRecoverHealthReporter = health.buildRecoverHealthReporter;
+pub const buildEswitch = eswitch.buildEswitch;
+pub const buildSetEswitch = eswitch.buildSetEswitch;
+
+/// What a `buildX` can fail with: allocation, or an argument this module knows
+/// the kernel would reject.
+pub const BuildError = request.Error;
 
 // ── live tests (real kernel; skip cleanly, never fail) ─────────────────────
 //
@@ -462,6 +500,47 @@ test "live: the raw escape hatch reaches a command the typed API does not model"
     if (replies.len == 0) return skip("no devlink rate objects on this machine (empty RATE_GET dump)");
 }
 
+test "live: the kernel echoes back exactly the bytes a builder produced" {
+    var dl = try openOrSkip();
+    defer dl.close();
+    const gpa = testing.allocator;
+
+    // The strongest oracle available for "these bytes are a real devlink
+    // request": hand them to the kernel and read what it says it received.
+    // `NLMSG_ERROR` carries the rejected request back, and this socket does
+    // not set `NETLINK_CAP_ACK`, so the echo is the whole message rather than
+    // its header. The handle is the x86 host bridge — a PCI address that never
+    // has a devlink instance — and `INFO_GET` is a read, so nothing here can
+    // change any device's state even under privilege.
+    const seq = dl.sock.nextSeq();
+    const built = try buildInfo(gpa, dl.family_id, seq, .pci("0000:00:00.0"));
+    defer gpa.free(built);
+
+    dl.sock.send(built) catch return skip("sending a request on the devlink socket");
+    try dl.sock.setRecvTimeout(1000);
+    defer dl.sock.setRecvTimeout(0) catch {};
+    const dgram = dl.sock.recvDatagramStrict() catch
+        return skip("no reply to an INFO_GET for a device that does not exist");
+
+    var it: codec.MessageIterator = .{ .buf = dgram };
+    while (try it.next()) |m| {
+        if (m.seq != seq or m.type != codec.NLMSG_ERROR) continue;
+        // ENODEV (or EPERM/EOPNOTSUPP on a kernel that answers differently) —
+        // never success, since the handle names nothing.
+        try testing.expect((try m.errorCode()) != 0);
+        const echoed = m.payload[4..];
+        if (m.flags & codec.NLM_F_CAPPED != 0) {
+            // A kernel that caps the ACK returns the header only; then that is
+            // all there is to compare.
+            try testing.expectEqualSlices(u8, built[0..16], echoed[0..16]);
+        } else {
+            try testing.expectEqualSlices(u8, built, echoed);
+        }
+        return;
+    }
+    return skip("the devlink socket answered something other than an error");
+}
+
 test "live: the shared transport seam is reachable on a devlink socket" {
     var dl = try openOrSkip();
     defer dl.close();
@@ -496,5 +575,6 @@ test {
     _ = health;
     _ = eswitch;
     _ = client;
+    _ = request;
     _ = @import("goldens.zig");
 }

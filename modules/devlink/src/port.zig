@@ -45,6 +45,8 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
+const request = @import("request.zig");
+const genl = @import("genetlink");
 
 pub const Error = error{ OutOfMemory, InvalidRequest };
 
@@ -171,6 +173,78 @@ pub fn appendUnsplit(
     p: handle.PortHandle,
 ) Error!void {
     try handle.appendPort(gpa, list, p);
+}
+
+// ── complete requests ──────────────────────────────────────────────────────
+//
+// The appenders above produce attributes; these produce a whole message the
+// caller can hand to a socket. `client.zig` calls exactly these, so each
+// command has one encoder rather than one here and a twin there.
+
+/// Build a `DEVLINK_CMD_PORT_GET` **dump** — every port on the system, which
+/// is what `Devlink.ports` sends. The `filter` that method takes is applied to
+/// the *replies*, not to this message; see `client.zig`'s header.
+pub fn buildPorts(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+) request.Error![]u8 {
+    return request.buildSimple(gpa, family_id, seq, uapi.CMD.PORT_GET, true, null);
+}
+
+/// Build a `DEVLINK_CMD_PORT_GET` for one port — what `Devlink.port` sends.
+pub fn buildPort(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    p: handle.PortHandle,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_GET, false);
+    errdefer b.deinit();
+    try handle.appendPort(gpa, &b.list, p);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_PORT_SET` — what `Devlink.setPortType` sends. Needs
+/// **CAP_NET_ADMIN** on the socket that sends it.
+pub fn buildSetPortType(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    p: handle.PortHandle,
+    t: uapi.PortType,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_SET, false);
+    errdefer b.deinit();
+    try appendSetType(gpa, &b.list, p, t);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_PORT_SPLIT` — what `Devlink.splitPort` sends.
+pub fn buildSplitPort(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    p: handle.PortHandle,
+    count: u32,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_SPLIT, false);
+    errdefer b.deinit();
+    try appendSplit(gpa, &b.list, p, count);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_PORT_UNSPLIT` — what `Devlink.unsplitPort` sends.
+pub fn buildUnsplitPort(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    p: handle.PortHandle,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.PORT_UNSPLIT, false);
+    errdefer b.deinit();
+    try appendUnsplit(gpa, &b.list, p);
+    return b.finish();
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -327,4 +401,73 @@ fn fuzzPort(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const len = smith.valueRangeAtMost(u16, 0, buf.len);
     if (parse(buf[0..len])) |p| std.mem.doNotOptimizeAway(&p) else |_| {}
+}
+
+test "buildPorts dumps; buildPort names one port" {
+    const gpa = testing.allocator;
+
+    const dump = try buildPorts(gpa, 0x19, 3);
+    defer gpa.free(dump);
+    var it: codec.MessageIterator = .{ .buf = dump };
+    var m = (try it.next()).?;
+    try testing.expect(m.flags & codec.NLM_F_DUMP != 0);
+    var p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.PORT_GET, p.cmd);
+    try testing.expectEqual(@as(usize, 0), p.attrs.len);
+
+    const one = try buildPort(gpa, 0x19, 3, .{ .handle = .pci("0000:65:00.0"), .index = 7 });
+    defer gpa.free(one);
+    it = .{ .buf = one };
+    m = (try it.next()).?;
+    try testing.expect(m.flags & codec.NLM_F_DUMP == 0);
+    p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.PORT_GET, p.cmd);
+    const decoded = try parse(p.attrs);
+    try testing.expectEqual(@as(?u32, 7), decoded.index);
+    try testing.expectEqualStrings("0000:65:00.0", decoded.handle.dev());
+    // A GET names the port and says nothing about its type.
+    try testing.expectEqual(@as(?uapi.PortType, null), decoded.type);
+}
+
+test "the port write builders carry the command and the argument" {
+    const gpa = testing.allocator;
+    const ph: handle.PortHandle = .{ .handle = .pci("0000:65:00.0"), .index = 2 };
+
+    const set = try buildSetPortType(gpa, 0x19, 4, ph, .ib);
+    defer gpa.free(set);
+    var it: codec.MessageIterator = .{ .buf = set };
+    var m = (try it.next()).?;
+    var p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.PORT_SET, p.cmd);
+    try testing.expectEqual(@as(?uapi.PortType, .ib), (try parse(p.attrs)).type);
+
+    const split = try buildSplitPort(gpa, 0x19, 4, ph, 4);
+    defer gpa.free(split);
+    it = .{ .buf = split };
+    m = (try it.next()).?;
+    p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.PORT_SPLIT, p.cmd);
+    try testing.expectEqual(@as(?u32, 4), (try parse(p.attrs)).split_count);
+
+    // UNSPLIT takes the port handle and nothing else: no count, ever.
+    const unsplit = try buildUnsplitPort(gpa, 0x19, 4, ph);
+    defer gpa.free(unsplit);
+    it = .{ .buf = unsplit };
+    m = (try it.next()).?;
+    p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.PORT_UNSPLIT, p.cmd);
+    const u = try parse(p.attrs);
+    try testing.expectEqual(@as(?u32, 2), u.index);
+    try testing.expectEqual(@as(?u32, null), u.split_count);
+}
+
+test "the port builders refuse what the appenders refuse" {
+    const gpa = testing.allocator;
+    const ph: handle.PortHandle = .{ .handle = .pci("0000:65:00.0"), .index = 2 };
+    try testing.expectError(error.InvalidRequest, buildSetPortType(gpa, 0x19, 1, ph, .notset));
+    try testing.expectError(error.InvalidRequest, buildSplitPort(gpa, 0x19, 1, ph, 1));
+    try testing.expectError(error.InvalidRequest, buildPort(gpa, 0x19, 1, .{
+        .handle = .{ .bus = "", .dev = "d" },
+        .index = 1,
+    }));
 }

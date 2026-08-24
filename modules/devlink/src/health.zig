@@ -32,6 +32,8 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
+const request = @import("request.zig");
+const genl = @import("genetlink");
 
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
 
@@ -171,6 +173,50 @@ pub fn appendPortGet(
 ) BuildError!void {
     try handle.appendPort(gpa, list, p);
     try appendReporterName(gpa, list, reporter);
+}
+
+// ── complete requests ──────────────────────────────────────────────────────
+
+/// Build a `DEVLINK_CMD_HEALTH_REPORTER_GET` **dump** — every reporter on the
+/// system, which is what `Devlink.healthReporters` sends. The `filter` that
+/// method takes is applied to the replies, not to this message.
+pub fn buildHealthReporters(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+) request.Error![]u8 {
+    return request.buildSimple(gpa, family_id, seq, uapi.CMD.HEALTH_REPORTER_GET, true, null);
+}
+
+/// Build a `DEVLINK_CMD_HEALTH_REPORTER_GET` for one named reporter — what
+/// `Devlink.healthReporter` sends.
+pub fn buildHealthReporter(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    reporter: []const u8,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.HEALTH_REPORTER_GET, false);
+    errdefer b.deinit();
+    try appendGet(gpa, &b.list, h, reporter);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_HEALTH_REPORTER_RECOVER` — what
+/// `Devlink.recoverHealthReporter` sends. Needs **CAP_NET_ADMIN**, and
+/// typically resets the device: this is not a health check.
+pub fn buildRecoverHealthReporter(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    reporter: []const u8,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.HEALTH_REPORTER_RECOVER, false);
+    errdefer b.deinit();
+    try appendRecover(gpa, &b.list, h, reporter);
+    return b.finish();
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -342,4 +388,53 @@ fn fuzzHealth(_: void, smith: *std.testing.Smith) !void {
         _ = r.unrecoveredCount();
         _ = r.hasDump();
     } else |_| {}
+}
+
+test "the health builders: dump vs one reporter, GET vs RECOVER" {
+    const gpa = testing.allocator;
+    const h: handle.Handle = .pci("0000:65:00.0");
+
+    const dump = try buildHealthReporters(gpa, 0x19, 11);
+    defer gpa.free(dump);
+    var it: codec.MessageIterator = .{ .buf = dump };
+    var m = (try it.next()).?;
+    try testing.expect(m.flags & codec.NLM_F_DUMP != 0);
+    var p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.HEALTH_REPORTER_GET, p.cmd);
+    try testing.expectEqual(@as(usize, 0), p.attrs.len);
+
+    const one = try buildHealthReporter(gpa, 0x19, 11, h, "fw_fatal");
+    defer gpa.free(one);
+    it = .{ .buf = one };
+    m = (try it.next()).?;
+    try testing.expectEqual(@as(u16, codec.NLM_F_REQUEST | codec.NLM_F_ACK), m.flags);
+    try testing.expectEqual(@as(u32, 11), m.seq);
+    p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.HEALTH_REPORTER_GET, p.cmd);
+    try testing.expectEqual(uapi.family_version, m.payload[1]);
+
+    // Same attributes, different command — the difference between asking how a
+    // reporter is and resetting the device.
+    const recover = try buildRecoverHealthReporter(gpa, 0x19, 11, h, "fw_fatal");
+    defer gpa.free(recover);
+    it = .{ .buf = recover };
+    m = (try it.next()).?;
+    p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.HEALTH_REPORTER_RECOVER, p.cmd);
+    try testing.expectEqual(one.len, recover.len);
+    try testing.expectEqualSlices(u8, one[20..], recover[20..]);
+    // The reporter name is the top-level attribute, not a nest, on the way out.
+    var attrs: codec.AttrIterator = .{ .buf = p.attrs };
+    var named = false;
+    while (try attrs.next()) |a| {
+        if (a.type == uapi.ATTR.HEALTH_REPORTER_NAME) {
+            try testing.expectEqualStrings("fw_fatal", a.asString());
+            named = true;
+        }
+        try testing.expect(a.type != uapi.ATTR.HEALTH_REPORTER);
+    }
+    try testing.expect(named);
+
+    try testing.expectError(error.InvalidRequest, buildHealthReporter(gpa, 0x19, 1, h, ""));
+    try testing.expectError(error.InvalidRequest, buildRecoverHealthReporter(gpa, 0x19, 1, h, "a\x00b"));
 }

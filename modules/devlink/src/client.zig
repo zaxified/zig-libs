@@ -54,6 +54,7 @@ const resource_mod = @import("resource.zig");
 const region_mod = @import("region.zig");
 const health_mod = @import("health.zig");
 const eswitch_mod = @import("eswitch.zig");
+const request = @import("request.zig");
 
 /// `NETLINK_ADD_MEMBERSHIP` / `NETLINK_DROP_MEMBERSHIP` (linux/netlink.h).
 pub const NETLINK_ADD_MEMBERSHIP: u32 = 1;
@@ -176,7 +177,8 @@ pub const Devlink = struct {
     /// without a SmartNIC or switch ASIC. Free with `gpa.free`.
     pub fn devices(cl: *Devlink) RequestError![]dev_mod.Device {
         const gpa = cl.allocator();
-        const seq = try cl.sendSimple(uapi.CMD.GET, null, true);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(dev_mod.buildDevices(gpa, cl.family_id, seq));
 
         var out: std.ArrayList(dev_mod.Device) = .empty;
         errdefer out.deinit(gpa);
@@ -194,7 +196,9 @@ pub const Devlink = struct {
     /// `Info.deinit`.
     pub fn info(cl: *Devlink, h: handle_mod.Handle) RequestError!dev_mod.Info {
         const gpa = cl.allocator();
-        var reply = try cl.simpleGet(uapi.CMD.INFO_GET, h);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(dev_mod.buildInfo(gpa, cl.family_id, seq, h));
+        var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
         var out = dev_mod.parseInfo(gpa, reply.attrs) catch |e| return mapParse(e);
         errdefer out.deinit(gpa);
@@ -210,7 +214,8 @@ pub const Devlink = struct {
     pub fn ports(cl: *Devlink, filter: ?handle_mod.Handle) RequestError![]port_mod.Port {
         const gpa = cl.allocator();
         if (filter) |h| try validate(h);
-        const seq = try cl.sendSimple(uapi.CMD.PORT_GET, null, true);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(port_mod.buildPorts(gpa, cl.family_id, seq));
 
         var out: std.ArrayList(port_mod.Port) = .empty;
         errdefer out.deinit(gpa);
@@ -229,13 +234,8 @@ pub const Devlink = struct {
     /// `DEVLINK_CMD_PORT_GET` for one port. Unprivileged.
     pub fn port(cl: *Devlink, p: handle_mod.PortHandle) RequestError!port_mod.Port {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.CMD.PORT_GET, false);
-        handle_mod.appendPort(gpa, &msg, p) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(port_mod.buildPort(gpa, cl.family_id, seq, p));
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
@@ -250,45 +250,21 @@ pub const Devlink = struct {
         p: handle_mod.PortHandle,
         t: uapi.PortType,
     ) RequestError!void {
-        return cl.actPort(uapi.CMD.PORT_SET, p, struct {
-            fn f(gpa: std.mem.Allocator, msg: *std.ArrayList(u8), ph: handle_mod.PortHandle, arg: u32) port_mod.Error!void {
-                return port_mod.appendSetType(gpa, msg, ph, @enumFromInt(@as(u16, @intCast(arg))));
-            }
-        }.f, @intFromEnum(t));
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, port_mod.buildSetPortType(cl.allocator(), cl.family_id, seq, p, t));
     }
 
     /// `DEVLINK_CMD_PORT_SPLIT` — split a port into `count` lanes. Needs
     /// **CAP_NET_ADMIN**, and only works on a port with `splittable` set.
     pub fn splitPort(cl: *Devlink, p: handle_mod.PortHandle, count: u32) RequestError!void {
-        return cl.actPort(uapi.CMD.PORT_SPLIT, p, port_mod.appendSplit, count);
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, port_mod.buildSplitPort(cl.allocator(), cl.family_id, seq, p, count));
     }
 
     /// `DEVLINK_CMD_PORT_UNSPLIT` — undo a split. Needs **CAP_NET_ADMIN**.
     pub fn unsplitPort(cl: *Devlink, p: handle_mod.PortHandle) RequestError!void {
-        return cl.actPort(uapi.CMD.PORT_UNSPLIT, p, struct {
-            fn f(gpa: std.mem.Allocator, msg: *std.ArrayList(u8), ph: handle_mod.PortHandle, _: u32) port_mod.Error!void {
-                return port_mod.appendUnsplit(gpa, msg, ph);
-            }
-        }.f, 0);
-    }
-
-    fn actPort(
-        cl: *Devlink,
-        cmd: u8,
-        p: handle_mod.PortHandle,
-        comptime build: fn (std.mem.Allocator, *std.ArrayList(u8), handle_mod.PortHandle, u32) port_mod.Error!void,
-        arg: u32,
-    ) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, cmd, false);
-        build(gpa, &msg, p, arg) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, port_mod.buildUnsplitPort(cl.allocator(), cl.family_id, seq, p));
     }
 
     // ── parameters ─────────────────────────────────────────────────────────
@@ -298,7 +274,8 @@ pub const Devlink = struct {
     pub fn params(cl: *Devlink, filter: ?handle_mod.Handle) RequestError![]param_mod.Param {
         const gpa = cl.allocator();
         if (filter) |h| try validate(h);
-        const seq = try cl.sendSimple(uapi.CMD.PARAM_GET, null, true);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(param_mod.buildParams(gpa, cl.family_id, seq));
 
         var out: std.ArrayList(param_mod.Param) = .empty;
         errdefer {
@@ -328,13 +305,8 @@ pub const Devlink = struct {
         name: []const u8,
     ) RequestError!param_mod.Param {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.PARAM_GET, false);
-        param_mod.appendGetByName(gpa, &msg, h, name) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(param_mod.buildParam(gpa, cl.family_id, seq, h, name));
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
@@ -358,16 +330,16 @@ pub const Devlink = struct {
         cmode: uapi.ParamCmode,
         value: param_mod.Value,
     ) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.PARAM_SET, false);
-        param_mod.appendSet(gpa, &msg, h, name, cmode, value) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, param_mod.buildSetParam(
+            cl.allocator(),
+            cl.family_id,
+            seq,
+            h,
+            name,
+            cmode,
+            value,
+        ));
     }
 
     // ── resources ──────────────────────────────────────────────────────────
@@ -379,7 +351,9 @@ pub const Devlink = struct {
     /// arrives in one message.
     pub fn resources(cl: *Devlink, h: handle_mod.Handle) RequestError!resource_mod.Resources {
         const gpa = cl.allocator();
-        var reply = try cl.simpleGet(uapi.CMD.RESOURCE_DUMP, h);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(resource_mod.buildResources(gpa, cl.family_id, seq, h));
+        var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
         var out = resource_mod.parse(gpa, reply.attrs) catch |e| return mapParse(e);
         errdefer out.deinit(gpa);
@@ -395,16 +369,15 @@ pub const Devlink = struct {
         resource_id: u64,
         size: u64,
     ) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.RESOURCE_SET, false);
-        resource_mod.appendSet(gpa, &msg, h, resource_id, size) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, resource_mod.buildSetResourceSize(
+            cl.allocator(),
+            cl.family_id,
+            seq,
+            h,
+            resource_id,
+            size,
+        ));
     }
 
     // ── regions ────────────────────────────────────────────────────────────
@@ -414,7 +387,8 @@ pub const Devlink = struct {
     pub fn regions(cl: *Devlink, filter: ?handle_mod.Handle) RequestError![]region_mod.Region {
         const gpa = cl.allocator();
         if (filter) |h| try validate(h);
-        const seq = try cl.sendSimple(uapi.CMD.REGION_GET, null, true);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(region_mod.buildRegions(gpa, cl.family_id, seq));
 
         var out: std.ArrayList(region_mod.Region) = .empty;
         errdefer out.deinit(gpa);
@@ -437,13 +411,8 @@ pub const Devlink = struct {
         name: []const u8,
     ) RequestError!region_mod.Region {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.REGION_GET, false);
-        region_mod.appendGet(gpa, &msg, h, name) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(region_mod.buildRegion(gpa, cl.family_id, seq, h, name));
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
@@ -463,13 +432,8 @@ pub const Devlink = struct {
         snapshot_id: ?u32,
     ) RequestError!u32 {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.REGION_NEW, false);
-        region_mod.appendNewSnapshot(gpa, &msg, h, name, snapshot_id) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(region_mod.buildNewSnapshot(gpa, cl.family_id, seq, h, name, snapshot_id));
 
         var reply = (try cl.collect(seq)) orelse
             // No reply message: the kernel acknowledged without echoing the
@@ -488,16 +452,15 @@ pub const Devlink = struct {
         name: []const u8,
         snapshot_id: u32,
     ) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.REGION_DEL, false);
-        region_mod.appendDelSnapshot(gpa, &msg, h, name, snapshot_id) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, region_mod.buildDelSnapshot(
+            cl.allocator(),
+            cl.family_id,
+            seq,
+            h,
+            name,
+            snapshot_id,
+        ));
     }
 
     /// `DEVLINK_CMD_REGION_READ` — read a window of a region or one of its
@@ -513,12 +476,9 @@ pub const Devlink = struct {
         const gpa = cl.allocator();
         if (req.length > std.math.maxInt(usize)) return error.InvalidRequest;
 
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.REGION_READ, true);
-        region_mod.appendRead(gpa, &msg, h, req) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
+        const seq = cl.startRequest();
+        const msg = region_mod.buildReadRegion(gpa, cl.family_id, seq, h, req) catch |e| return mapBuild(e);
+        defer gpa.free(msg);
 
         var assembler = region_mod.Assembler.init(gpa, req.address, @intCast(req.length)) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -526,7 +486,7 @@ pub const Devlink = struct {
         };
         errdefer assembler.deinit(gpa);
 
-        try cl.send(msg.items);
+        try cl.send(msg);
         var walk: Walk = .{ .cl = cl, .seq = seq };
         while (try walk.next()) |m| {
             assembler.feed(m.attrs) catch return error.MalformedReply;
@@ -544,7 +504,8 @@ pub const Devlink = struct {
     ) RequestError![]health_mod.Reporter {
         const gpa = cl.allocator();
         if (filter) |h| try validate(h);
-        const seq = try cl.sendSimple(uapi.CMD.HEALTH_REPORTER_GET, null, true);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(health_mod.buildHealthReporters(gpa, cl.family_id, seq));
 
         var out: std.ArrayList(health_mod.Reporter) = .empty;
         errdefer out.deinit(gpa);
@@ -568,13 +529,8 @@ pub const Devlink = struct {
         name: []const u8,
     ) RequestError!health_mod.Reporter {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.HEALTH_REPORTER_GET, false);
-        health_mod.appendGet(gpa, &msg, h, name) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(health_mod.buildHealthReporter(gpa, cl.family_id, seq, h, name));
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
@@ -592,16 +548,14 @@ pub const Devlink = struct {
         h: handle_mod.Handle,
         name: []const u8,
     ) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.HEALTH_REPORTER_RECOVER, false);
-        health_mod.appendRecover(gpa, &msg, h, name) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, health_mod.buildRecoverHealthReporter(
+            cl.allocator(),
+            cl.family_id,
+            seq,
+            h,
+            name,
+        ));
     }
 
     // ── eswitch ────────────────────────────────────────────────────────────
@@ -611,7 +565,9 @@ pub const Devlink = struct {
     /// ordinary user.
     pub fn eswitch(cl: *Devlink, h: handle_mod.Handle) RequestError!eswitch_mod.Eswitch {
         const gpa = cl.allocator();
-        var reply = try cl.simpleGet(uapi.CMD.ESWITCH_GET, h);
+        const seq = cl.startRequest();
+        try cl.sendBuilt(eswitch_mod.buildEswitch(gpa, cl.family_id, seq, h));
+        var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
         const out = eswitch_mod.parse(reply.attrs) catch return error.MalformedReply;
         try checkHandleEcho(h, out.handle);
@@ -625,16 +581,8 @@ pub const Devlink = struct {
         h: handle_mod.Handle,
         set: eswitch_mod.Set,
     ) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, uapi.CMD.ESWITCH_SET, false);
-        eswitch_mod.appendSet(gpa, &msg, h, set) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const seq = cl.startRequest();
+        return cl.sendAndAck(seq, eswitch_mod.buildSetEswitch(cl.allocator(), cl.family_id, seq, h, set));
     }
 
     // ── multicast groups ───────────────────────────────────────────────────
@@ -678,17 +626,14 @@ pub const Devlink = struct {
     /// yields an empty list. Free with `freeRawReplies`.
     pub fn raw(cl: *Devlink, req: RawRequest) RequestError![]Reply {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
+        const seq = cl.startRequest();
         var flags = codec.NLM_F_REQUEST | req.extra_flags;
         if (!req.no_ack) flags |= codec.NLM_F_ACK;
         if (req.dump) flags |= codec.NLM_F_DUMP;
-        const off = try codec.appendHeader(gpa, &msg, cl.family_id, flags, seq, 0);
-        try genl.appendHeader(gpa, &msg, req.cmd, req.version);
-        try msg.appendSlice(gpa, req.attrs);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
+        var b = try request.beginFlags(gpa, cl.family_id, seq, req.cmd, flags, req.version);
+        errdefer b.deinit();
+        try b.list.appendSlice(gpa, req.attrs);
+        try cl.sendBuilt(b.finish());
 
         var out: std.ArrayList(Reply) = .empty;
         errdefer {
@@ -706,45 +651,27 @@ pub const Devlink = struct {
 
     // ── plumbing ───────────────────────────────────────────────────────────
 
-    fn begin(
-        cl: *Devlink,
-        msg: *std.ArrayList(u8),
-        seq: u32,
-        cmd: u8,
-        dump: bool,
-    ) RequestError!usize {
-        const gpa = cl.allocator();
+    /// Open a request: take the next sequence number and drop the previous
+    /// extended-ACK message, which is only valid until the next request.
+    fn startRequest(cl: *Devlink) u32 {
         cl.sock.ext_ack_len = 0;
-        var flags = codec.NLM_F_REQUEST | codec.NLM_F_ACK;
-        if (dump) flags |= codec.NLM_F_DUMP;
-        const off = try codec.appendHeader(gpa, msg, cl.family_id, flags, seq, 0);
-        try genl.appendHeader(gpa, msg, cmd, uapi.family_version);
-        return off;
+        return cl.sock.nextSeq();
     }
 
-    /// Build and send a command whose only attributes are an optional handle.
-    fn sendSimple(
-        cl: *Devlink,
-        cmd: u8,
-        h: ?handle_mod.Handle,
-        dump: bool,
-    ) RequestError!u32 {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const off = try cl.begin(&msg, seq, cmd, dump);
-        if (h) |x| handle_mod.append(gpa, &msg, x) catch |e| return mapBuild(e);
-        codec.finishHeader(&msg, off);
-        try cl.send(msg.items);
-        return seq;
+    /// Send a message one of the topic files' `buildX` functions produced, and
+    /// free it. Every command method goes through here, which is what keeps
+    /// the client and the public builders on **one** encoder per command
+    /// rather than two that can drift.
+    fn sendBuilt(cl: *Devlink, built: request.Error![]u8) RequestError!void {
+        return sendBuiltOver(cl, built);
     }
 
-    /// A `doit` GET whose only attributes are the handle, returning its one
-    /// reply message.
-    fn simpleGet(cl: *Devlink, cmd: u8, h: handle_mod.Handle) RequestError!Reply {
-        const seq = try cl.sendSimple(cmd, h, false);
-        return (try cl.collect(seq)) orelse error.MalformedReply;
+    /// `sendBuilt` for a command answered by a bare ACK: send, then read to
+    /// the end of the reply stream and discard whatever came with it.
+    fn sendAndAck(cl: *Devlink, seq: u32, built: request.Error![]u8) RequestError!void {
+        try cl.sendBuilt(built);
+        var reply = try cl.collect(seq);
+        if (reply) |*r| r.deinit(cl.allocator());
     }
 
     /// Read to the end of a request's replies, keeping the first family
@@ -846,6 +773,20 @@ fn mapResolve(e: genl.McastGroupError) SubscribeError {
         error.SystemResources => error.SystemResources,
         error.Unexpected => error.Unexpected,
     };
+}
+
+/// The body of `Devlink.sendBuilt`, factored out so a recording stand-in can
+/// drive it in tests without a real socket — the same technique `walkStep`
+/// below uses for the receive side. `cl` need only look like `*Devlink` for
+/// what this does: `cl.allocator()` and `cl.send(bytes)`.
+///
+/// It passes the builder's bytes to the transport **unchanged**: the client
+/// adds nothing to, and takes nothing from, what the public `buildX` returned.
+fn sendBuiltOver(cl: anytype, built: request.Error![]u8) RequestError!void {
+    const gpa = cl.allocator();
+    const msg = built catch |e| return mapBuild(e);
+    defer gpa.free(msg);
+    return cl.send(msg);
 }
 
 /// One family reply message. `attrs` borrows the socket's receive buffer and is
@@ -1261,4 +1202,107 @@ test "Walk.next errors out instead of looping forever on a never-DONE reply" {
     var msgs: u32 = 0;
     try testing.expectError(error.TooManyMessages, walkStep(&cl, seq, &it, &finished, &msgs));
     try testing.expectEqual(max_walk_messages, msgs);
+}
+
+// ── the client's encoder is the public builder ─────────────────────────────
+// The whole point of the `buildX` functions is that they are not a second copy
+// of the request assembly. Two properties hold that together, and both are
+// checked here:
+//
+//   1. Every command method's only encoding step is a call to the topic file's
+//      public `buildX` — the client contains no header assembly of its own any
+//      more. Asserted structurally below, over this file's own source.
+//   2. The send seam hands the transport the builder's bytes **unchanged**.
+//      Asserted by driving `sendBuiltOver` with a recording stand-in, the same
+//      technique `walkStep` uses for the receive side.
+//
+// What is deliberately NOT claimed: that a live `Devlink.setPortType` was
+// observed putting those bytes on a socket. `send` addresses the kernel
+// (`sockaddr_nl.pid = 0`), so there is no peer a test can hold the other end
+// of, and the kernel's own echo of a rejected request is the only mirror
+// available — see the live test in `root.zig`, which uses it.
+
+const RecordingClient = struct {
+    gpa: std.mem.Allocator,
+    sent: std.ArrayList(u8) = .empty,
+
+    fn allocator(rc: *RecordingClient) std.mem.Allocator {
+        return rc.gpa;
+    }
+
+    fn send(rc: *RecordingClient, msg: []const u8) RequestError!void {
+        try rc.sent.appendSlice(rc.gpa, msg);
+    }
+};
+
+test "the send seam passes the builder's bytes through untouched" {
+    const gpa = testing.allocator;
+    const fam: u16 = 0x19;
+    const seq: u32 = 42;
+
+    {
+        var rc: RecordingClient = .{ .gpa = gpa };
+        defer rc.sent.deinit(gpa);
+        // What `setPortType` hands to `sendBuilt`, verbatim.
+        try sendBuiltOver(&rc, port_mod.buildSetPortType(
+            gpa,
+            fam,
+            seq,
+            .{ .handle = .pci("0000:00:00.0"), .index = 1 },
+            .eth,
+        ));
+        const want = try port_mod.buildSetPortType(
+            gpa,
+            fam,
+            seq,
+            .{ .handle = .pci("0000:00:00.0"), .index = 1 },
+            .eth,
+        );
+        defer gpa.free(want);
+        try testing.expectEqualSlices(u8, want, rc.sent.items);
+    }
+    {
+        var rc: RecordingClient = .{ .gpa = gpa };
+        defer rc.sent.deinit(gpa);
+        // …and a dump, whose NLM_F_DUMP is the builder's doing, not the
+        // sender's.
+        try sendBuiltOver(&rc, region_mod.buildRegions(gpa, fam, seq));
+        const want = try region_mod.buildRegions(gpa, fam, seq);
+        defer gpa.free(want);
+        try testing.expectEqualSlices(u8, want, rc.sent.items);
+        try testing.expect(std.mem.readInt(u16, rc.sent.items[6..8], .little) & codec.NLM_F_DUMP != 0);
+    }
+}
+
+test "a builder's rejection reaches the caller and nothing is sent" {
+    const gpa = testing.allocator;
+    var rc: RecordingClient = .{ .gpa = gpa };
+    defer rc.sent.deinit(gpa);
+    // `.notset` is a port type the kernel reports but does not accept.
+    try testing.expectError(error.InvalidRequest, sendBuiltOver(&rc, port_mod.buildSetPortType(
+        gpa,
+        0x19,
+        1,
+        .{ .handle = .pci("0000:00:00.0"), .index = 1 },
+        .notset,
+    )));
+    try testing.expectEqual(@as(usize, 0), rc.sent.items.len);
+}
+
+test "the client assembles no request headers of its own" {
+    // The defect this whole arrangement exists to prevent: a `buildX` next to
+    // a client method that still spells out `appendHeader` + `appendHeader` +
+    // `finishHeader` itself, the two drifting apart with nothing holding them
+    // in step. The command methods above must therefore contain no header
+    // assembly at all — `request.zig` is the only place that does it, and the
+    // public builders are the only way the client reaches it.
+    const src = @embedFile("client.zig");
+    // Everything from the test section down is scaffolding that builds fake
+    // *replies*; the invariant is about the request path above it.
+    const marker = "// \u{2500}\u{2500} tests \u{2500}";
+    const code = src[0 .. std.mem.indexOf(u8, src, marker) orelse src.len];
+    try testing.expect(std.mem.indexOf(u8, code, "appendHeader") == null);
+    try testing.expect(std.mem.indexOf(u8, code, "finishHeader") == null);
+    // And every command method reaches the wire through the one seam.
+    try testing.expect(std.mem.indexOf(u8, code, "sendBuiltOver") != null);
 }

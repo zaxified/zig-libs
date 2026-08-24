@@ -27,6 +27,8 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
+const request = @import("request.zig");
+const genl = @import("genetlink");
 
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
 
@@ -92,6 +94,39 @@ pub fn appendGet(
     h: handle.Handle,
 ) handle.Error!void {
     try handle.append(gpa, list, h);
+}
+
+// ── complete requests ──────────────────────────────────────────────────────
+
+/// Build a `DEVLINK_CMD_ESWITCH_GET` — what `Devlink.eswitch` sends. The
+/// kernel marks this read `GENL_ADMIN_PERM`, so an unprivileged sender gets
+/// `EPERM` rather than an answer.
+pub fn buildEswitch(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.ESWITCH_GET, false);
+    errdefer b.deinit();
+    try appendGet(gpa, &b.list, h);
+    return b.finish();
+}
+
+/// Build a `DEVLINK_CMD_ESWITCH_SET` — what `Devlink.setEswitch` sends. Needs
+/// **CAP_NET_ADMIN**, and changing the mode tears down and re-creates the
+/// device's VF netdevs.
+pub fn buildSetEswitch(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    set: Set,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.ESWITCH_SET, false);
+    errdefer b.deinit();
+    try appendSet(gpa, &b.list, h, set);
+    return b.finish();
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -190,4 +225,45 @@ test "appendSet round-trips through parse" {
     try testing.expectEqual(@as(?uapi.EswitchMode, .legacy), e.mode);
     try testing.expectEqual(@as(?uapi.InlineMode, .transport), e.inline_mode);
     try testing.expectEqual(@as(?uapi.EncapMode, .basic), e.encap_mode);
+}
+
+test "buildEswitch asks; buildSetEswitch sends only what was asked for" {
+    const gpa = testing.allocator;
+    const h: handle.Handle = .pci("0000:65:00.0");
+
+    const get = try buildEswitch(gpa, 0x19, 13, h);
+    defer gpa.free(get);
+    var it: codec.MessageIterator = .{ .buf = get };
+    var m = (try it.next()).?;
+    try testing.expect((try it.next()) == null);
+    try testing.expectEqual(@as(u16, 0x19), m.type);
+    try testing.expectEqual(@as(u16, codec.NLM_F_REQUEST | codec.NLM_F_ACK), m.flags);
+    try testing.expectEqual(@as(u32, 13), m.seq);
+    try testing.expectEqual(@as(u32, 0), m.pid);
+    var p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.ESWITCH_GET, p.cmd);
+    try testing.expectEqual(uapi.family_version, m.payload[1]);
+    // A GET carries the handle and no mode of any kind.
+    const asked = try parse(p.attrs);
+    try testing.expectEqualStrings("0000:65:00.0", asked.handle.dev());
+    try testing.expectEqual(@as(?uapi.EswitchMode, null), asked.mode);
+    try testing.expectEqual(@as(?uapi.InlineMode, null), asked.inline_mode);
+    try testing.expectEqual(@as(?uapi.EncapMode, null), asked.encap_mode);
+
+    const set = try buildSetEswitch(gpa, 0x19, 14, h, .{ .mode = .switchdev });
+    defer gpa.free(set);
+    it = .{ .buf = set };
+    m = (try it.next()).?;
+    p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.ESWITCH_SET, p.cmd);
+    const sent = try parse(p.attrs);
+    try testing.expectEqual(@as(?uapi.EswitchMode, .switchdev), sent.mode);
+    // The two the caller left null are absent, not defaulted to `none`.
+    try testing.expectEqual(@as(?uapi.InlineMode, null), sent.inline_mode);
+    try testing.expectEqual(@as(?uapi.EncapMode, null), sent.encap_mode);
+
+    // An empty change is refused here rather than sent for the kernel to
+    // answer EINVAL to.
+    try testing.expectError(error.InvalidRequest, buildSetEswitch(gpa, 0x19, 1, h, .{}));
+    try testing.expectError(error.InvalidRequest, buildEswitch(gpa, 0x19, 1, .{ .bus = "pci", .dev = "" }));
 }

@@ -138,9 +138,35 @@ defer devlink.Devlink.freeRawReplies(gpa, replies);
 ```
 
 Sub-namespaces, all `pub`: `uapi` (every constant and enum), `handle`, `dev`,
-`port`, `param`, `resource`, `region`, `health`, `eswitch`, `client`, plus
-`genl` and `codec` for driving `raw`. Every encoder and decoder is a pure
-function over byte slices, so the wire format is testable without a socket.
+`port`, `param`, `resource`, `region`, `health`, `eswitch`, `client`,
+`request`, plus `genl` and `codec` for driving `raw`. Every encoder and decoder
+is a pure function over byte slices, so the wire format is testable without a
+socket.
+
+## Encoding a request is a public step
+
+Every command above has a `buildX` that returns the **complete** netlink
+message — nlmsghdr, genlmsghdr, flags and attributes — instead of only the
+attributes. The two things a message needs that a socket owns are parameters:
+the family id (whatever nlctrl assigned this boot) and the sequence number.
+
+```zig
+const msg = try devlink.buildSetPortType(gpa, dl.family_id, seq, port_handle, .eth);
+defer gpa.free(msg);
+// Send it over a socket of your own, keep the bytes, or hand the attribute
+// half — everything past the 20-byte nlmsghdr+genlmsghdr, `msg[20..]` — to
+// `Devlink.raw`, which frames the headers itself.
+```
+
+There is one per request-performing `Devlink` method — `buildDevices`,
+`buildInfo`, `buildPorts`, `buildPort`, `buildSetPortType`, `buildSplitPort`,
+`buildUnsplitPort`, `buildParams`, `buildParam`, `buildSetParam`,
+`buildResources`, `buildSetResourceSize`, `buildRegions`, `buildRegion`,
+`buildNewSnapshot`, `buildDelSnapshot`, `buildReadRegion`,
+`buildHealthReporters`, `buildHealthReporter`, `buildRecoverHealthReporter`,
+`buildEswitch`, `buildSetEswitch` — and **the client methods call exactly
+these**, so what a builder returns is what the client sends. `NLM_F_DUMP` is
+part of the message and is therefore the builder's business, not the sender's.
 
 ## The handle is two strings, not an ifindex
 

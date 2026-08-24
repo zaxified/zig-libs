@@ -42,6 +42,8 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
+const request = @import("request.zig");
+const genl = @import("genetlink");
 
 /// How deep a `RESOURCE_LIST` chain may nest before the stream is rejected.
 /// Real hardware uses 2.
@@ -230,6 +232,39 @@ pub fn appendSet(
     try handle.append(gpa, list, h);
     try uapi.appendAttrU64(gpa, list, uapi.ATTR.RESOURCE_ID, resource_id);
     try uapi.appendAttrU64(gpa, list, uapi.ATTR.RESOURCE_SIZE, size);
+}
+
+// ── complete requests ──────────────────────────────────────────────────────
+
+/// Build a `DEVLINK_CMD_RESOURCE_DUMP` — what `Devlink.resources` sends.
+///
+/// Despite the name this is a `doit`, not a netlink dump: the whole tree comes
+/// back in one message, so the message carries no `NLM_F_DUMP`. Note also that
+/// this module asks for an ACK where the real `devlink` binary does not — see
+/// the capture pinned in `goldens.zig`.
+pub fn buildResources(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+) request.Error![]u8 {
+    return request.buildSimple(gpa, family_id, seq, uapi.CMD.RESOURCE_DUMP, false, h);
+}
+
+/// Build a `DEVLINK_CMD_RESOURCE_SET` — what `Devlink.setResourceSize` sends.
+/// Needs **CAP_NET_ADMIN**, and takes effect at the next `devlink dev reload`.
+pub fn buildSetResourceSize(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    h: handle.Handle,
+    resource_id: u64,
+    size: u64,
+) request.Error![]u8 {
+    var b = try request.begin(gpa, family_id, seq, uapi.CMD.RESOURCE_SET, false);
+    errdefer b.deinit();
+    try appendSet(gpa, &b.list, h, resource_id, size);
+    return b.finish();
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -459,4 +494,63 @@ fn fuzzResource(_: void, smith: *std.testing.Smith) !void {
         _ = v.find("x");
         v.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "buildSetResourceSize frames a whole RESOURCE_SET, headers and all" {
+    const gpa = testing.allocator;
+    const msg = try buildSetResourceSize(gpa, 0x19, 12, .pci("0000:65:00.0"), 2, 98304);
+    defer gpa.free(msg);
+
+    var it: codec.MessageIterator = .{ .buf = msg };
+    const m = (try it.next()).?;
+    try testing.expect((try it.next()) == null);
+    try testing.expectEqual(@as(u16, 0x19), m.type);
+    // This module asks for an ACK where the `devlink` binary does not — the
+    // capture in goldens.zig pins iproute2's ACK-less form separately.
+    try testing.expectEqual(@as(u16, codec.NLM_F_REQUEST | codec.NLM_F_ACK), m.flags);
+    try testing.expect(m.flags & codec.NLM_F_DUMP == 0);
+    try testing.expectEqual(@as(u32, 12), m.seq);
+    try testing.expectEqual(@as(u32, 0), m.pid);
+    const p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.RESOURCE_SET, p.cmd);
+    try testing.expectEqual(uapi.family_version, m.payload[1]);
+
+    var id: ?u64 = null;
+    var size: ?u64 = null;
+    var attrs: codec.AttrIterator = .{ .buf = p.attrs };
+    while (try attrs.next()) |a| switch (a.type) {
+        uapi.ATTR.RESOURCE_ID => id = try uapi.asU64(a),
+        uapi.ATTR.RESOURCE_SIZE => size = try uapi.asU64(a),
+        else => {},
+    };
+    try testing.expectEqual(@as(?u64, 2), id);
+    try testing.expectEqual(@as(?u64, 98304), size);
+    const h = try handle.parse(p.attrs);
+    try testing.expectEqualStrings("0000:65:00.0", h.dev());
+}
+
+test "buildResources sends the handle and nothing else" {
+    const gpa = testing.allocator;
+    const msg = try buildResources(gpa, 0x19, 5, .pci("0000:65:00.0"));
+    defer gpa.free(msg);
+    var it: codec.MessageIterator = .{ .buf = msg };
+    const m = (try it.next()).?;
+    // Despite the name, RESOURCE_DUMP is a `doit`: no NLM_F_DUMP.
+    try testing.expect(m.flags & codec.NLM_F_DUMP == 0);
+    const p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.CMD.RESOURCE_DUMP, p.cmd);
+    var attrs: codec.AttrIterator = .{ .buf = p.attrs };
+    var n: usize = 0;
+    while (try attrs.next()) |a| : (n += 1) {
+        try testing.expect(a.type == uapi.ATTR.BUS_NAME or a.type == uapi.ATTR.DEV_NAME);
+    }
+    // Exactly the two handle attributes: no stray RESOURCE_SIZE, which is
+    // what iproute2's own capture carries.
+    try testing.expectEqual(@as(usize, 2), n);
+
+    try testing.expectError(error.InvalidRequest, buildResources(gpa, 0x19, 1, .{ .bus = "pci", .dev = "" }));
+    try testing.expectError(error.InvalidRequest, buildSetResourceSize(gpa, 0x19, 1, .{
+        .bus = "",
+        .dev = "d",
+    }, 1, 2));
 }
