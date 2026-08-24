@@ -52,7 +52,8 @@ BASE="http://127.0.0.1:$PORT"
 
 "$BIN" --port "$PORT" --api-key "$KEY" --webhook-secret "$SECRET" \
     > "$WORK/service.log" 2>&1 &
-PIDS+=($!)
+SERVICE_PID=$!
+PIDS+=("$SERVICE_PID")
 
 # Wait on the service's own banner rather than on a fixed sleep, and rather
 # than by opening a socket — a probe connection is a request as far as the
@@ -117,4 +118,42 @@ case "$code" in
     *) fail "a webhook with a corrupted signature over a VALID body answered $code" ;;
 esac
 
-echo "smoke: OK — gate refuses, task round-trips, headers stamped, webhook signature both accepts and refuses"
+# 6. Idempotency: the same `Idempotency-Key` twice must replay the first
+#    response, not create a second task. The README advertises this and
+#    nothing asserted it until now.
+first=$(curl -s -H "X-Api-Key: $KEY" -H "Idempotency-Key: smoke-key-1" \
+    -H 'Content-Type: application/json' -d '{"title":"idempotent"}' "$BASE/api/tasks")
+second=$(curl -s -H "X-Api-Key: $KEY" -H "Idempotency-Key: smoke-key-1" \
+    -H 'Content-Type: application/json' -d '{"title":"idempotent"}' "$BASE/api/tasks")
+[ "$first" = "$second" ] \
+    || fail "a replayed Idempotency-Key produced a different response:\n  first:  $first\n  second: $second"
+echo "$first" | grep -q '"idempotent"' || fail "the idempotent POST did not create the task: $first"
+
+# 7. Rate limiting, LAST on purpose. The limiter is 5/s with a burst of 10,
+#    and past that `abuseguard` stops answering this peer at the connection
+#    level — measured: eight 200s, then 429s, then curl cannot connect at all.
+#    So this case poisons the client address for everything after it, and
+#    everything after it is nothing.
+saw_429=0
+codes=""
+for _ in $(seq 1 30); do
+    c=$(curl -s -m 2 -o /dev/null -w '%{http_code}' -H "X-Api-Key: $KEY" "$BASE/api/tasks" || echo 000)
+    codes="$codes $c"
+    [ "$c" = 429 ] && saw_429=1
+done
+[ "$saw_429" = 1 ] || fail "30 rapid requests never drew a 429 from a 5/s limiter — codes were:$codes"
+
+# 8. And it has to STOP cleanly. This is not tidiness: `main` runs under a
+#    `DebugAllocator` that panics on leak, and that check only ever executes on
+#    a clean exit. A harness that kills the service instead makes the leak
+#    detector unreachable — a guard that cannot fire, which reads exactly like
+#    a guard that passed.
+kill -TERM "$SERVICE_PID"
+set +e
+wait "$SERVICE_PID"
+stop_rc=$?
+set -e
+[ "$stop_rc" = 0 ] || fail "SIGTERM did not stop the service cleanly (exit $stop_rc — a leak panic exits non-zero)"
+grep -q "stopped cleanly" "$WORK/service.log" || fail "the service did not report a clean stop"
+
+echo "smoke: OK — gate refuses, task round-trips, headers stamped, webhook signature accepts and refuses, replay is idempotent, burst is rate-limited, SIGTERM exits clean under the leak check"

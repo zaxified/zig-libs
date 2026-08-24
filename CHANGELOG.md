@@ -51,6 +51,20 @@ directory.
   more strictly than `modules/<m>/example/` does, since it goes through the
   package manager rather than an in-repo `addImport`.
 
+- **`example-apps/` are built in the mode they claim, and are RUN by the gate.**
+  Two separate fixes, the second found by the first. Each app's `build.zig` said
+  "ReleaseSafe by default … `-Doptimize=ReleaseFast` if you have measured that
+  you need it" and delivered neither: `standardOptimizeOption` with a
+  `preferred_optimize_mode` registers `-Drelease=[bool]` and **not**
+  `-Doptimize`, and with no flag it returns `.Debug`. So every build of every
+  app — including the gate's — was a Debug build, and the documented flag was
+  rejected as an invalid option. The apps now declare `-Doptimize` themselves
+  and default to `ReleaseSafe`. On top of that, `scripts/check-apps.sh --run`
+  now runs each app's `smoke.sh` in `ReleaseSafe` **and** `ReleaseFast`, which
+  is where a `std.debug.assert` guard is compiled out. `http-service` also
+  learned to stop on SIGTERM, because its `DebugAllocator` leak check only
+  executes on a clean exit and nothing had ever given it one.
+
 - **Packaging fix:** `build.zig.zon`'s `.paths` did not list `LICENSE` or
   `NOTICE`, so neither was part of the package. `.paths` decides what a
   consumer actually receives; a file outside it is visible on GitHub and absent

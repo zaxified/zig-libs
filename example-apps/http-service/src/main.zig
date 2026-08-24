@@ -476,6 +476,45 @@ const usage_text =
     \\
 ;
 
+// ── graceful shutdown ────────────────────────────────────────────────────────
+//
+// A service that can only be killed is a service whose teardown never runs, and
+// this one's teardown is load-bearing: `main` frees the task store, the
+// idempotency cache and every middleware, under a `DebugAllocator` that panics
+// on leak. Killed with SIGKILL — which is what a test harness reaches for when
+// there is nothing else — that check can never fire, so it says nothing.
+//
+// SIGTERM and SIGINT therefore stop the accept loop instead. The handler only
+// stores a flag (the one thing that is unambiguously safe to do in a signal
+// handler); a watcher thread does the actual `shutdown()`, which goes through
+// `std.Io` and must not run in handler context. 100 ms of latency on Ctrl-C is
+// invisible and buys not having to write a self-pipe.
+var stop_requested: std.atomic.Value(bool) = .init(false);
+var serve_finished: std.atomic.Value(bool) = .init(false);
+
+fn onStopSignal(_: std.posix.SIG) callconv(.c) void {
+    stop_requested.store(true, .release);
+}
+
+fn shutdownWatcher(server: *http.Server, io: std.Io) void {
+    while (!stop_requested.load(.acquire)) {
+        if (serve_finished.load(.acquire)) return; // the loop ended on its own
+        io.sleep(.fromMilliseconds(100), .awake) catch return;
+    }
+    std.debug.print("http-service: signal received, draining\n", .{});
+    server.shutdown();
+}
+
+fn installStopHandlers() void {
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onStopSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.TERM, &act, null);
+    std.posix.sigaction(.INT, &act, null);
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -733,10 +772,23 @@ fn runServer(
     const bound = server.boundAddress();
     printBanner(listen_addr, bound.getPort(), api_key, webhook_secret);
 
+    installStopHandlers();
+    const watcher = std.Thread.spawn(.{}, shutdownWatcher, .{ &server, io }) catch |err| {
+        std.debug.print("http-service: cannot start the shutdown watcher: {t}\n", .{err});
+        return 1;
+    };
+    defer {
+        // Whichever way `serve` ended, release the watcher so this process can
+        // actually exit — and so the leak check at the top of `main` runs.
+        serve_finished.store(true, .release);
+        watcher.join();
+    }
+
     server.serve() catch |err| {
         std.debug.print("http-service: accept loop ended: {t}\n", .{err});
         return 1;
     };
+    std.debug.print("http-service: stopped cleanly\n", .{});
     return 0;
 }
 

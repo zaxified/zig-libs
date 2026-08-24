@@ -807,11 +807,14 @@ jobs:
   # test binary, once into its example — and an app built through the package
   # manager shares a cache with neither. `ReleaseFast` cleared the 90-minute cap
   # by 23 seconds; this would not fit, and it does not need to. Here it runs on
-  # its own runner, in parallel, holding nobody up. Order of magnitude, measured
-  # on the development host: the biggest app (17 modules, ReleaseSafe) builds in
-  # ~4 s with a fresh project cache, and both apps through their pins — fetch
-  # included — in ~12 s. ⚠ Both had a warm GLOBAL cache (~/.cache/zig); a runner
-  # has neither, so treat these as a floor, not as the lane's cost.
+  # its own runner, in parallel, holding nobody up.
+  #
+  # Cost, measured on the development host: three apps built and their smoke
+  # tests run in BOTH ReleaseSafe and ReleaseFast is ~36 s wall. ⚠ That is with
+  # the ReleaseSafe builds already cached and a warm global cache; a runner has
+  # neither, so it is a floor, not the lane's cost. (An earlier version of this
+  # comment quoted ~4 s — measured before the apps were fixed to stop building
+  # in Debug, which is what that number was really timing.)
   consumer:
     name: consumer build
     needs: [scoped, full, plan]
@@ -835,6 +838,12 @@ jobs:
       # resolve, which is the smaller half. The gate over `modules/<m>/example/`
       # was compile-only too, and the day it started running them one pass found
       # 22 that did not work.
+      #
+      # ⭐ And it runs each app TWICE, ReleaseSafe then ReleaseFast, because
+      # `std.debug.assert` is compiled out of the latter: a fail-open guard is
+      # invisible in every safe-mode run and only lets the bad thing through in
+      # the mode a consumer is most likely to build. This repository has shipped
+      # exactly that defect.
       - name: example-apps built and run against this commit
         run: bash scripts/check-apps.sh --run
       # ⭐ THE DOWNLOADER'S PATH, and it exists only on a tag ref.

@@ -58,6 +58,14 @@ customer's:
    did not work. Blocking, and an app without an executable `smoke.sh` is
    rejected — an app whose only proof is that it compiles is the state this
    directory used to be in.
+
+   **Each app is built and run twice: `ReleaseSafe` and `ReleaseFast`.** The
+   difference between them is a defect class this collection has already
+   shipped — `std.debug.assert` is compiled out of `ReleaseFast`, so a
+   fail-open guard is invisible in every safe-mode run and only lets the bad
+   thing through in the mode a consumer is most likely to build. The module
+   lanes have always tested three optimize modes; until this landed the apps
+   tested one, and it was not even the one they claimed (see the CHANGELOG).
 2. **On a tag ref**, `scripts/check-apps.sh --pinned` builds each app from its
    manifest as written: fetch by URL and hash, compile the exported package.
    On a tag the pin and the commit under test are the same content, so this is

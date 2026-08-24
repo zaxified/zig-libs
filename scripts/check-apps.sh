@@ -200,13 +200,36 @@ fi
 # Not combined with `--pinned`, which is about the package export rather than
 # about behaviour — the binaries are the same content on a tag ref, so running
 # them twice would buy nothing.
+#
+# ⭐ TWICE, in ReleaseSafe and then in ReleaseFast, because the difference
+# between them is a defect class this repository has already shipped: a
+# `std.debug.assert` is COMPILED OUT of ReleaseFast, so a fail-open guard is
+# invisible in every safe-mode run and only lets the bad thing through in the
+# mode a consumer is most likely to build. That is not hypothetical here — a
+# public `reset` guarded that way put two headers on the wire. The module lanes
+# test three optimize modes; until now the apps tested one.
 if [ "$RUN" = 1 ]; then
     for n in "${WANT[@]}"; do
-        echo "check-apps: running example-apps/$n/smoke.sh"
-        if ! ( cd "example-apps/$n" && ./smoke.sh ); then
-            echo "check-apps: $n's smoke test FAILED — the app builds but does not work." >&2
-            exit 1
-        fi
+        for mode in ReleaseSafe ReleaseFast; do
+            # ReleaseSafe is what the app's own build.zig prefers, so the first
+            # pass reuses the binary the build stage already produced.
+            if [ "$mode" != ReleaseSafe ]; then
+                echo "check-apps: rebuilding $n as $mode"
+                ( cd "example-apps/$n" && zig build --fork=../.. "-Doptimize=$mode" ) || {
+                    echo "check-apps: $n FAILED to build as $mode." >&2
+                    exit 1
+                }
+            fi
+            echo "check-apps: running example-apps/$n/smoke.sh ($mode)"
+            if ! ( cd "example-apps/$n" && ./smoke.sh ); then
+                echo "check-apps: $n's smoke test FAILED in $mode — the app builds but does not work." >&2
+                exit 1
+            fi
+        done
+        # Leave the tree as it was found: the last build above is ReleaseFast,
+        # and a developer who runs this then runs the binary by hand should get
+        # the mode the app's own build.zig chooses.
+        ( cd "example-apps/$n" && zig build --fork=../.. >/dev/null ) || true
     done
-    echo "check-apps: ${#WANT[@]} app(s) ran their smoke tests"
+    echo "check-apps: ${#WANT[@]} app(s) ran their smoke tests in ReleaseSafe and ReleaseFast"
 fi
