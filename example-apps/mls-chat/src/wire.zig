@@ -12,9 +12,9 @@
 //!
 //! **What the relay may look at**, and the reason this envelope exists in this
 //! shape: the kind, the member name on a `publish`/`fetch`, and the group id.
-//! Nothing else. The `msg` field of a `handshake`, `welcome` or `app` frame is
-//! copied to the other subscribers byte for byte and is never decoded — the
-//! relay holds no key that could decode it.
+//! Nothing else. The `msg` field of a `handshake`, `proposal`, `welcome` or
+//! `app` frame is copied to the other subscribers byte for byte and is never
+//! decoded — the relay holds no key that could decode it.
 
 const std = @import("std");
 const framing = @import("framing");
@@ -38,15 +38,21 @@ pub const Kind = enum(u8) {
     handshake = 5,
     /// either direction: an `MLSMessage(Welcome)`.
     welcome = 6,
-    /// either direction: `PrivateMessage` wire bytes (see appmsg.zig for why
-    /// this one is not an `MLSMessage`).
+    /// either direction: `MLSMessage(PrivateMessage)` — an application
+    /// message.
     app = 7,
     /// relay → client: human-readable status text. Never protocol-bearing.
     note = 8,
+    /// either direction: an `MLSMessage(PublicMessage)` carrying a Proposal
+    /// that no Commit covers yet. Separate from `handshake` because the
+    /// receiver does a different thing with it — caches it — and a frame kind
+    /// that means "one of two things, look inside to see which" is how a
+    /// relay ends up parsing MLS.
+    proposal = 9,
 
     fn from(byte: u8) ?Kind {
         return switch (byte) {
-            1...8 => @enumFromInt(byte),
+            1...9 => @enumFromInt(byte),
             else => null,
         };
     }

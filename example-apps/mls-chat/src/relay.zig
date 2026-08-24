@@ -257,11 +257,11 @@ fn handleFrame(relay: *Relay, conn: *Conn, frame: wire.Frame) !void {
                 frame.group,
             });
         },
-        // The three that carry MLS bytes take the same path on purpose: the
+        // The four that carry MLS bytes take the same path on purpose: the
         // relay's rule for all of them is "copy to the others", and giving
         // each its own branch would invite a future edit to treat one of them
         // as something it may look inside.
-        .handshake, .welcome, .app => {
+        .handshake, .proposal, .welcome, .app => {
             if (frame.group.len == 0) return error.MalformedFrame;
             relay.fanOut(conn, frame);
         },

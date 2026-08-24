@@ -582,6 +582,33 @@ pub const RatchetTree = struct {
         return (self.nodes.len + 1) / 2;
     }
 
+    /// The `LeafNode` at a LEAF index, or `null` when that leaf is blank or
+    /// beyond the tree.
+    ///
+    /// Appendix C's array layout puts leaf `i` at node index `2 * i`, and
+    /// until this existed every caller outside the module did that doubling
+    /// itself and unwrapped the `Node` union by hand — `example-apps/mls-chat`
+    /// needed it twice, once to find a sender's signature key and once to
+    /// print who a leaf is. A tree that exposes `nodes` and `nLeaves()` and
+    /// nothing between them makes its own index convention the consumer's
+    /// problem, which is how an off-by-one in someone else's code becomes a
+    /// signature verified against the wrong member.
+    ///
+    /// `null` rather than an error: a blank leaf is an ordinary state (every
+    /// Remove leaves one behind), not a failure.
+    pub fn leafNode(self: RatchetTree, leaf_index: u32) ?LeafNode {
+        const node_index: usize = @as(usize, leaf_index) * 2;
+        if (node_index >= self.nodes.len) return null;
+        const node = self.nodes[node_index] orelse return null;
+        return switch (node) {
+            .leaf => |l| l,
+            // Unreachable for a well-formed tree — an even node index is
+            // always a leaf slot — but this type is built from wire data, so
+            // "cannot happen" is answered rather than asserted.
+            .parent => null,
+        };
+    }
+
     pub fn deinit(self: *RatchetTree) void {
         for (self.nodes) |maybe_node| if (maybe_node) |n| n.deinit(self.allocator);
         self.allocator.free(self.nodes);
@@ -848,6 +875,53 @@ test "§7.2: LeafNode.sign round-trips through verifySignature, and the group bi
 // covers it — the passive-client sessions never happen to add a leaf to
 // the LEFT of an existing unmerged one, so a plain append passes all of
 // them. Without this test the ordering could be lost silently.
+test "leafNode: leaf index is doubled, a blank leaf is null, past the end is null" {
+    // Three leaf slots (node width 5), leaf 1 blank — the shape a Remove
+    // leaves behind. Built by hand rather than decoded, so the test says what
+    // the layout is instead of inheriting it from the decoder it is checking.
+    const leaf0: LeafNode = .{
+        .encryption_key = &[_]u8{0x00} ** 32,
+        .signature_key = &[_]u8{0x10} ** 32,
+        .credential = .{ .basic = "zero" },
+        .capabilities = .{ .versions = &.{1}, .cipher_suites = &.{1}, .extensions = &.{}, .proposals = &.{}, .credentials = &.{1} },
+        .leaf_node_source = .key_package,
+        .lifetime = .{ .not_before = 0, .not_after = 1 },
+        .extensions = &.{},
+        .signature = &.{},
+    };
+    var leaf2 = leaf0;
+    leaf2.credential = .{ .basic = "two" };
+
+    const parent: ParentNode = .{
+        .encryption_key = &[_]u8{0x20} ** 32,
+        .parent_hash = &.{},
+        .unmerged_leaves = &.{},
+    };
+
+    var nodes = [_]?Node{
+        .{ .leaf = leaf0 }, // node 0 = leaf 0
+        .{ .parent = parent }, // node 1 = a parent, NOT a leaf
+        null, // node 2 = leaf 1, blank
+        .{ .parent = parent }, // node 3
+        .{ .leaf = leaf2 }, // node 4 = leaf 2
+    };
+    const t: RatchetTree = .{ .allocator = std.testing.allocator, .nodes = &nodes };
+
+    try std.testing.expectEqual(@as(usize, 3), t.nLeaves());
+
+    // The doubling is the point: leaf 2 lives at node 4. An implementation
+    // that forgot it would hand back node 2 — which here is `null`, and in a
+    // full tree would be somebody else's leaf.
+    const got2 = t.leafNode(2) orelse return error.TestExpectedLeaf;
+    try std.testing.expectEqualStrings("two", got2.credential.basic);
+    const got0 = t.leafNode(0) orelse return error.TestExpectedLeaf;
+    try std.testing.expectEqualStrings("zero", got0.credential.basic);
+
+    try std.testing.expect(t.leafNode(1) == null); // blank
+    try std.testing.expect(t.leafNode(3) == null); // past the end
+    try std.testing.expect(t.leafNode(std.math.maxInt(u32)) == null); // no overflow
+}
+
 test "§7.1: withAppendedUnmerged inserts in order, not at the end" {
     const gpa = std.testing.allocator;
     const node: ParentNode = .{

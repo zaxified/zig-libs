@@ -332,6 +332,7 @@ pub const MLSMessage = framing.MLSMessage;
 pub const protectPublic = framing.protectPublic;
 pub const unprotectPublic = framing.unprotectPublic;
 pub const protectPrivate = framing.protectPrivate;
+pub const wrapPrivateMessage = framing.wrapPrivateMessage;
 pub const decryptSenderData = framing.decryptSenderData;
 pub const decryptContent = framing.decryptContent;
 pub const parsePrivateContent = framing.parsePrivateContent;

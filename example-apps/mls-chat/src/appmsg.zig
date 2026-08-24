@@ -138,10 +138,11 @@ pub const AppMessages = struct {
         return true;
     }
 
-    /// §6.3's encode path for one line of chat. Returns `PrivateMessage`
-    /// wire bytes, which is what `protectPrivate` produces — NOT an
-    /// `MLSMessage`. The two are not interchangeable and this app's envelope
-    /// carries the distinction in its own frame kind rather than re-wrapping.
+    /// §6.3's encode path for one line of chat. Returns `MLSMessage` wire
+    /// bytes — `protectPrivate` produces a bare `PrivateMessage`, and
+    /// `mls.wrapPrivateMessage` puts it in the same envelope a Commit and a
+    /// Welcome arrive in, so every MLS payload on this app's wire is one kind
+    /// of thing.
     pub fn protect(
         self: *AppMessages,
         gpa: std.mem.Allocator,
@@ -183,13 +184,15 @@ pub const AppMessages = struct {
             // next to the AEAD and signature this message already carries.
             .padding_len = 64,
         });
-        errdefer gpa.free(bytes);
+        defer gpa.free(bytes);
+        const wrapped = try mls.wrapPrivateMessage(gpa, bytes);
+        errdefer gpa.free(wrapped);
 
         // Only advance once the message actually exists: a failed protect
         // must not burn a generation, or the sender's ratchet runs ahead of
         // what every receiver's window expects.
         try self.send.advance();
-        return bytes;
+        return wrapped;
     }
 
     /// §6.3's decode path, in the order the RFC requires: sender data first
@@ -201,13 +204,17 @@ pub const AppMessages = struct {
         self: *AppMessages,
         gpa: std.mem.Allocator,
         group: *const mls.Group(S),
-        private_message_bytes: []const u8,
+        mls_message_bytes: []const u8,
     ) !Opened {
-        // `PrivateMessage.decode` takes no allocator and owns nothing: the
-        // whole message is slices into `private_message_bytes`, which the
-        // caller keeps alive for this call.
-        var r = mls.codec.Reader.init(private_message_bytes);
-        const pm = try mls.PrivateMessage.decode(&r);
+        // Every MLS payload on this wire is an `MLSMessage`; anything else in
+        // the envelope is a sender this app does not speak to.
+        var r = mls.codec.Reader.init(mls_message_bytes);
+        const decoded = try mls.MLSMessage.decode(gpa, &r);
+        defer decoded.deinit(gpa);
+        const pm = switch (decoded) {
+            .private_message => |p| p,
+            else => return Error.NotAnApplicationMessage,
+        };
 
         // Checked before any key is derived: a message from another epoch
         // must not touch this epoch's ratchets at all.
@@ -251,22 +258,14 @@ pub const AppMessages = struct {
     }
 };
 
-/// The sender's signature key, read out of the group's public ratchet tree.
+/// The sender's signature key, read out of the group's public ratchet tree —
+/// so "who sent this" is a fact about the tree, not a claim in the message.
 ///
-/// ⚠ This reaches into `RatchetTree.nodes` and does the leaf-index-to-node-
-/// index doubling itself, because the tree exposes `nodes` and `nLeaves()`
-/// and no accessor between them. It is the one place in this app that
-/// handles the library's data structure rather than calling a function on
-/// it — noted here rather than hidden, since it is exactly the kind of thing
-/// a first outside consumer is supposed to surface.
+/// This used to index `RatchetTree.nodes[2 * leaf]` and unwrap the union by
+/// hand, because the tree exposed `nodes` and `nLeaves()` and nothing in
+/// between. Writing it twice here is what produced `RatchetTree.leafNode`.
 fn leafSignatureKey(group: *const mls.Group(S), leaf_index: u32) !S.Sig.PublicKey {
-    const node_index: usize = @as(usize, leaf_index) * 2;
-    if (node_index >= group.ratchet_tree.nodes.len) return Error.UnknownSender;
-    const node = group.ratchet_tree.nodes[node_index] orelse return Error.UnknownSender;
-    const leaf = switch (node) {
-        .leaf => |l| l,
-        .parent => return Error.UnknownSender,
-    };
+    const leaf = group.ratchet_tree.leafNode(leaf_index) orelse return Error.UnknownSender;
     if (leaf.signature_key.len != S.Sig.PublicKey.encoded_length) return Error.UnknownSender;
     var raw: [S.Sig.PublicKey.encoded_length]u8 = undefined;
     @memcpy(&raw, leaf.signature_key);
@@ -278,13 +277,7 @@ fn leafSignatureKey(group: *const mls.Group(S), leaf_index: u32) !S.Sig.PublicKe
 /// is opaque bytes by RFC 9420 §5.3 — this app publishes a UTF-8 nickname
 /// there and treats it as untrusted display text, never as an identity.
 pub fn leafName(group: *const mls.Group(S), leaf_index: u32) ?[]const u8 {
-    const node_index: usize = @as(usize, leaf_index) * 2;
-    if (node_index >= group.ratchet_tree.nodes.len) return null;
-    const node = group.ratchet_tree.nodes[node_index] orelse return null;
-    const leaf = switch (node) {
-        .leaf => |l| l,
-        .parent => return null,
-    };
+    const leaf = group.ratchet_tree.leafNode(leaf_index) orelse return null;
     return switch (leaf.credential) {
         .basic => |identity| identity,
         else => null,

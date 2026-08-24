@@ -1043,6 +1043,29 @@ pub fn protectPrivate(comptime S: type, allocator: std.mem.Allocator, params: Pr
 /// whose cipher suite is carried in the message itself rather than in a
 /// `GroupContext`, because its recipient is by definition not yet a member
 /// and has no group state to look it up in.
+/// Wrap `PrivateMessage` wire bytes in the `MLSMessage` envelope.
+///
+/// `protectPrivate` returns a bare `PrivateMessage`, while `Group.createCommit`
+/// returns `MLSMessage(PublicMessage)` and `createKeyPackage` is published as
+/// `MLSMessage(KeyPackage)`. Both are correct — §6.1's `PrivateMessage` is a
+/// type in its own right and §17.2's `MLSMessage` is the wire envelope around
+/// it — but an application carrying handshake and application messages over
+/// one transport meets the asymmetry immediately: three things come out of
+/// this module and one of them is framed differently from the other two.
+/// `example-apps/mls-chat` worked around it by giving its own envelope a
+/// separate frame kind, which is a workaround for something that belongs here.
+///
+/// Implemented by decoding and re-encoding rather than by prepending the four
+/// header bytes, so this cannot drift from `MLSMessage.encode` if the envelope
+/// ever gains a field. Returns freshly allocated bytes (caller frees).
+pub fn wrapPrivateMessage(allocator: std.mem.Allocator, private_message_bytes: []const u8) ![]u8 {
+    var r = codec.Reader.init(private_message_bytes);
+    const pm = try PrivateMessage.decode(&r);
+    if (!r.atEnd()) return error.Malformed;
+    const msg: MLSMessage = .{ .private_message = pm };
+    return msg.encodeAlloc(allocator);
+}
+
 pub const MLSMessage = union(enum) {
     public_message: PublicMessage,
     private_message: PrivateMessage,
@@ -1306,6 +1329,70 @@ test "protectPrivate/unprotect: application data round-trips through both AEADs"
     try testing.expectEqualStrings("hello, group", ac.content.body.application);
     try testing.expectEqualStrings("aad", ac.content.authenticated_data);
     try verifyFramedContent(TestSuite, testing.allocator, kp.public_key, ac, gc);
+}
+
+test "wrapPrivateMessage: a bare PrivateMessage becomes a decodable MLSMessage" {
+    const gc = try testGroupContext(testing.allocator);
+    defer testing.allocator.free(gc);
+    var seed: [32]u8 = @splat(9);
+    const kp = try TestSuite.Sig.KeyPair.generateDeterministic(seed);
+    seed = @splat(0);
+
+    const encryption_secret: [TestSuite.Nh]u8 = @splat(0x33);
+    const sender_data_secret: [TestSuite.Nh]u8 = @splat(0x44);
+    const base = try secrettree.ratchetBaseSecret(TestSuite, encryption_secret, 2, 0, .application);
+    var ratchet = secrettree.Ratchet(TestSuite).init(base);
+    const kn = try ratchet.current();
+
+    const bare = try protectPrivate(TestSuite, testing.allocator, .{
+        .signature_key_pair = kp,
+        .group_context = gc,
+        .content = .{
+            .group_id = "group",
+            .epoch = 7,
+            .sender = .{ .member = 0 },
+            .authenticated_data = &.{},
+            .body = .{ .application = "wrapped" },
+        },
+        .key_nonce = kn,
+        .generation = 0,
+        .reuse_guard = .{ 9, 9, 9, 9 },
+        .sender_data_secret = sender_data_secret,
+    });
+    defer testing.allocator.free(bare);
+
+    const wrapped = try wrapPrivateMessage(testing.allocator, bare);
+    defer testing.allocator.free(wrapped);
+
+    // The envelope is version + wire format ahead of the same body. Pinning
+    // the size difference as well as the decode means a wrapper that silently
+    // re-encoded the body differently would be caught, not just one that
+    // failed to parse.
+    try testing.expectEqual(bare.len + 4, wrapped.len);
+
+    var r = codec.Reader.init(wrapped);
+    const msg = try MLSMessage.decode(testing.allocator, &r);
+    defer msg.deinit(testing.allocator);
+    try testing.expect(r.atEnd());
+    try testing.expectEqual(WireFormat.mls_private_message, msg.wireFormat());
+
+    // Same message, not merely a well-formed one: the ciphertext that came
+    // out of `protectPrivate` is the ciphertext inside the envelope.
+    const inner = msg.private_message;
+    const original = blk: {
+        var r2 = codec.Reader.init(bare);
+        break :blk try PrivateMessage.decode(&r2);
+    };
+    try testing.expectEqualSlices(u8, original.ciphertext, inner.ciphertext);
+    try testing.expectEqualSlices(u8, original.encrypted_sender_data, inner.encrypted_sender_data);
+    try testing.expectEqual(@as(u64, 7), inner.epoch);
+
+    // Trailing bytes are a malformed message, not something to wrap anyway.
+    const with_tail = try testing.allocator.alloc(u8, bare.len + 1);
+    defer testing.allocator.free(with_tail);
+    @memcpy(with_tail[0..bare.len], bare);
+    with_tail[bare.len] = 0;
+    try testing.expectError(error.Malformed, wrapPrivateMessage(testing.allocator, with_tail));
 }
 
 test "decryptContent: the reuse guard is load-bearing — a wrong guard fails the AEAD" {

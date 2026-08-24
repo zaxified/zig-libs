@@ -41,7 +41,8 @@ Then three terminals, all on loopback:
 
 In alice's terminal, `/invite bob`. Both terminals print the new epoch and the
 member count; anything you type after that is an encrypted application message
-to the group. `/who` lists the leaves, `/quit` leaves.
+to the group. `/who` lists the leaves, `/remove <name>` commits a Remove,
+`/leave` proposes your own, and `/quit` merely disconnects.
 
 `init.sh` needs Zig 0.16.0 on `PATH` and installs nothing for you.
 
@@ -93,9 +94,17 @@ with its leaf index precisely because two members may publish the same one.
   9420 §6 permits either framing; this app takes the one the library supports.
   The cost is real: the delivery service sees *that* membership changed, though
   not the content of anything.
-- **Add only.** `/invite` builds a Commit with one Add proposal. Remove, Update
-  and external joins are all in the module's API and none of them are wired up
-  here — the demo is about the shape of a client, not about covering §12.
+- **No Update proposals and no external joins.** Both are in the module's API;
+  neither is wired up here. Add, Remove and a member's own departure are.
+- **`/leave` is a proposal, not an act**, because §12.4 forbids a committer
+  from removing itself: the leaver publishes a Remove for its own leaf and
+  stays in the group until a remaining member commits it. Which member does
+  that has to be decided without a round trip, so the rule is derived from
+  state everyone already agrees on — **the lowest occupied leaf that is not
+  the one being removed commits.** Excluding the leaver matters: it is the one
+  member that never sees its own proposal (the relay does not echo to the
+  sender), so a leaver sitting at leaf 0 would elect itself and nothing would
+  ever happen.
 - **One group per client**, named by `--group`, and no history: a member added
   in epoch 5 cannot read epoch 4's messages. That is MLS working, not a
   limitation of the app.

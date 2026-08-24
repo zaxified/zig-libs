@@ -61,10 +61,40 @@ pub const Client = struct {
     /// instead of typing into a dead socket.
     stopped: bool = false,
 
+    /// §12.1: proposals seen in the CURRENT epoch, kept because a Commit may
+    /// name them by reference and both `createCommit` and `processCommit`
+    /// then need the original message. Owned copies, cleared whenever the
+    /// epoch changes — a proposal from a past epoch is not a proposal.
+    pending: std.ArrayList([]u8) = .empty,
+
+    /// Set once this member has been removed from the group, so the keyboard
+    /// stops offering to send into a group it is not in.
+    removed: bool = false,
+
     /// Set before this end shuts the socket down on purpose. Without it the
     /// reader thread reports our own `/quit` as "the relay closed the
     /// connection", which is a lie about whose decision it was.
     leaving: bool = false,
+
+    /// Drop every cached proposal. Called on every epoch change: §12.1 scopes
+    /// a proposal to the epoch it was made in.
+    fn clearPending(self: *Client) void {
+        for (self.pending.items) |p| self.gpa.free(p);
+        self.pending.clearRetainingCapacity();
+    }
+
+    /// The leaf that published this nickname, or null. Names are display text
+    /// from a `basic` credential, so a duplicate is possible: the FIRST match
+    /// wins and the caller is expected to have shown `/who` first.
+    fn leafNamed(self: *Client, name: []const u8) ?u32 {
+        const g = if (self.group) |*g| g else return null;
+        var leaf: u32 = 0;
+        while (leaf < g.treeSize()) : (leaf += 1) {
+            const who = appmsg.leafName(g, leaf) orelse continue;
+            if (std.mem.eql(u8, who, name)) return leaf;
+        }
+        return null;
+    }
 
     pub fn sendFrame(self: *Client, frame: wire.Frame) !void {
         self.write_lock.lock();
@@ -148,6 +178,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Client {
 }
 
 pub fn deinit(self: *Client) void {
+    self.clearPending();
+    self.pending.deinit(self.gpa);
     self.gpa.free(self.published);
     if (self.app) |*a| a.deinit();
     if (self.group) |*g| g.deinit();
@@ -187,7 +219,7 @@ pub fn run(self: *Client) !void {
         std.debug.print("mls-chat: created '{s}' — epoch {d}, {d} member(s)\n", .{
             self.opts.group,
             g.epoch,
-            g.treeSize(),
+            memberCount(&g),
         });
     } else {
         std.debug.print("mls-chat: waiting for a Welcome into '{s}' — ask a member to /invite {s}\n", .{
@@ -288,19 +320,51 @@ fn handleInbound(self: *Client, frame: wire.Frame) !void {
             std.debug.print("mls-chat: joined '{s}' — epoch {d}, {d} member(s)\n", .{
                 self.opts.group,
                 g.epoch,
-                g.treeSize(),
+                memberCount(&g),
             });
+        },
+
+        .proposal => {
+            self.state_lock.lock();
+            defer self.state_lock.unlock();
+            if (self.removed) return;
+            const g = if (self.group) |*g| g else return;
+            // Cache first, commit second: every member needs the bytes to
+            // resolve the reference in whichever Commit lands, including the
+            // members that are not the one committing.
+            const copy = try gpa.dupe(u8, frame.msg);
+            errdefer gpa.free(copy);
+            try self.pending.append(gpa, copy);
+            try maybeCommitPending(self, g);
         },
 
         .handshake => {
             self.state_lock.lock();
             defer self.state_lock.unlock();
+            if (self.removed) return;
             const g = if (self.group) |*g| g else return; // not a member yet
-            try g.processCommit(.{ .commit_msg = frame.msg });
+            g.processCommit(.{
+                .commit_msg = frame.msg,
+                .proposal_msgs = self.pending.items,
+            }) catch |err| switch (err) {
+                // The module says this outright, so do not infer it. A member
+                // removed by a Commit cannot follow that Commit — it is not in
+                // the new epoch's tree and there is nothing to derive. The
+                // first version of this code looked for a blanked leaf
+                // instead and never fired, because `processCommit` refuses
+                // before it mutates anything.
+                error.RemovedFromGroup => {
+                    self.removed = true;
+                    std.debug.print("mls-chat: you were removed from '{s}' — /quit\n", .{self.opts.group});
+                    return;
+                },
+                else => return err,
+            };
+            self.clearPending();
             const rekeyed = try self.app.?.rekeyIfStale(g);
             std.debug.print("mls-chat: epoch {d}, {d} member(s){s}\n", .{
                 g.epoch,
-                g.treeSize(),
+                memberCount(g),
                 if (rekeyed) " — application keys re-derived" else "",
             });
         },
@@ -308,6 +372,10 @@ fn handleInbound(self: *Client, frame: wire.Frame) !void {
         .app => {
             self.state_lock.lock();
             defer self.state_lock.unlock();
+            // Once removed, this member holds no key for the epochs that
+            // follow. Reporting each of those as a dropped frame would be
+            // noise about the one thing it already knows.
+            if (self.removed) return;
             const g = if (self.group) |*g| g else return;
             const opened = try self.app.?.open(gpa, g, frame.msg);
             defer gpa.free(opened.text);
@@ -357,14 +425,177 @@ fn commitAdd(self: *Client, name: []const u8, key_package_msg: []const u8) !void
     const w = created.welcome orelse return error.NoWelcomeForAddedMember;
     try self.sendFrame(.{ .kind = .welcome, .group = self.opts.group, .msg = w });
 
-    std.debug.print("mls-chat: added '{s}' — epoch {d}, {d} member(s)\n", .{ name, g.epoch, g.treeSize() });
+    std.debug.print("mls-chat: added '{s}' — epoch {d}, {d} member(s)\n", .{ name, g.epoch, memberCount(g) });
+}
+
+/// Somebody has to turn a floating proposal into a Commit, and the members
+/// cannot ask each other who. The rule is therefore derivable from state every
+/// member already agrees on: **the lowest occupied leaf that is not the
+/// proposer commits.** Deterministic, needs no round trip, and degrades
+/// safely — if two members ever did commit at once, the second Commit loses on
+/// `error.WrongEpoch` at every receiver and its author simply retries nothing.
+///
+/// Caller holds `state_lock`.
+fn maybeCommitPending(self: *Client, g: *mls.Group(S)) !void {
+    if (self.pending.items.len == 0) return;
+
+    // The member being removed must be excluded from the ballot, or a leaver
+    // that happens to sit at the lowest leaf elects itself and nobody commits:
+    // it cannot commit its own Remove, and it is the only member that never
+    // sees this proposal (the relay does not echo a frame to its sender), so
+    // the deadlock would be silent on every side.
+    const target = removeTarget(self.gpa, self.pending.items[0]);
+
+    var lowest: ?u32 = null;
+    var leaf: u32 = 0;
+    while (leaf < g.treeSize()) : (leaf += 1) {
+        if (g.ratchet_tree.leafNode(leaf) == null) continue; // blank
+        if (target != null and leaf == target.?) continue;
+        if (lowest == null) lowest = leaf;
+    }
+    if (lowest != g.my_leaf_index) return; // not this member's turn
+
+    const created = g.createCommit(self.gpa, .{
+        .io = self.io,
+        .signature_key_pair = self.sig,
+        .proposals = &.{.{ .by_reference = self.pending.items[0] }},
+    }) catch |err| {
+        std.debug.print("mls-chat: could not commit the pending proposal: {t}\n", .{err});
+        return;
+    };
+    defer created.deinit(self.gpa);
+
+    self.clearPending();
+    _ = try self.app.?.rekeyIfStale(g);
+    try self.sendFrame(.{ .kind = .handshake, .group = self.opts.group, .msg = created.commit });
+    std.debug.print("mls-chat: committed a pending proposal — epoch {d}, {d} member(s)\n", .{
+        g.epoch,
+        memberCount(g),
+    });
+}
+
+/// How many members the group actually has.
+///
+/// ⚠ NOT `treeSize()`, which is the tree's width in leaf slots — §12.4.3.3
+/// pads a ratchet tree out to `2^(d+1) - 1` nodes, so three members report
+/// four leaves, and every Remove leaves a blank behind on top of that. The
+/// first version of this app printed `treeSize()` as "member(s)" and
+/// cheerfully announced four members in a group of three.
+fn memberCount(g: *const mls.Group(S)) usize {
+    var n: usize = 0;
+    var leaf: u32 = 0;
+    while (leaf < g.treeSize()) : (leaf += 1) {
+        if (g.ratchet_tree.leafNode(leaf) != null) n += 1;
+    }
+    return n;
+}
+
+/// Which leaf a Remove proposal names, read WITHOUT verifying anything.
+///
+/// This decides who commits, not whether the proposal is legitimate:
+/// `createCommit` re-authenticates it (§12.2 makes that the committer's job),
+/// so a forged or corrupted proposal cannot buy anything here beyond electing
+/// the wrong router — which shows up as a Commit that fails, not as one that
+/// succeeds wrongly.
+fn removeTarget(gpa: std.mem.Allocator, mls_message_bytes: []const u8) ?u32 {
+    var r = mls.codec.Reader.init(mls_message_bytes);
+    const msg = mls.MLSMessage.decode(gpa, &r) catch return null;
+    defer msg.deinit(gpa);
+    const pm = switch (msg) {
+        .public_message => |p| p,
+        else => return null,
+    };
+    const proposal = switch (pm.content.body) {
+        .proposal => |p| p,
+        else => return null,
+    };
+    return switch (proposal) {
+        .remove => |leaf| leaf,
+        else => null,
+    };
+}
+
+/// `/remove <name>` — one Commit carrying one Remove, by value.
+///
+/// §12.4 forbids a committer from removing itself in its own Commit, and the
+/// module would refuse it; the app refuses it earlier and points at `/leave`,
+/// because "you cannot do that here, do this instead" is more use than an
+/// error name.
+fn removeMember(self: *Client, name: []const u8) !void {
+    self.state_lock.lock();
+    defer self.state_lock.unlock();
+    const g = if (self.group) |*g| g else {
+        std.debug.print("mls-chat: not in the group yet\n", .{});
+        return;
+    };
+    const leaf = self.leafNamed(name) orelse {
+        std.debug.print("mls-chat: no member named '{s}' in this group\n", .{name});
+        return;
+    };
+    if (leaf == g.my_leaf_index) {
+        std.debug.print("mls-chat: a committer cannot remove itself — use /leave\n", .{});
+        return;
+    }
+
+    const created = g.createCommit(self.gpa, .{
+        .io = self.io,
+        .signature_key_pair = self.sig,
+        .proposals = &.{.{ .by_value = .{ .remove = leaf } }},
+    }) catch |err| {
+        std.debug.print("mls-chat: could not remove '{s}': {t}\n", .{ name, err });
+        return;
+    };
+    defer created.deinit(self.gpa);
+
+    self.clearPending();
+    _ = try self.app.?.rekeyIfStale(g);
+    try self.sendFrame(.{ .kind = .handshake, .group = self.opts.group, .msg = created.commit });
+    std.debug.print("mls-chat: removed '{s}' (leaf {d}) — epoch {d}, {d} member(s)\n", .{
+        name,
+        leaf,
+        g.epoch,
+        memberCount(g),
+    });
+}
+
+/// `/leave` — propose this member's own Remove and let somebody else commit it.
+///
+/// This is the shape RFC 9420 forces: a member cannot commit its own removal,
+/// so leaving is a proposal plus a wait. The group does not change until a
+/// remaining member commits it, and this client is still in the group — still
+/// able to send — until that Commit arrives.
+fn proposeLeave(self: *Client) !void {
+    self.state_lock.lock();
+    defer self.state_lock.unlock();
+    const g = if (self.group) |*g| g else {
+        std.debug.print("mls-chat: not in the group yet\n", .{});
+        return;
+    };
+    const bytes = g.createProposal(self.gpa, .{
+        .signature_key_pair = self.sig,
+        .proposal = .{ .remove = g.my_leaf_index },
+    }) catch |err| {
+        std.debug.print("mls-chat: could not propose leaving: {t}\n", .{err});
+        return;
+    };
+    errdefer self.gpa.free(bytes);
+    try self.sendFrame(.{ .kind = .proposal, .group = self.opts.group, .msg = bytes });
+
+    // Cache it here too. The relay does not echo a frame back to its sender,
+    // so without this the proposer is the ONE member that cannot resolve the
+    // reference in the Commit that covers it — and it learns of its own
+    // removal as `ProposalNotFound` instead of `RemovedFromGroup`.
+    try self.pending.append(self.gpa, bytes);
+    std.debug.print("mls-chat: proposed your own Remove — waiting for a member to commit it\n", .{});
 }
 
 const help =
     \\Commands:
     \\  /invite <name>   add the member who published under <name>
+    \\  /remove <name>   commit a Remove for that member
+    \\  /leave           propose your own Remove; another member commits it
     \\  /who             list the group's leaves
-    \\  /quit            leave
+    \\  /quit            disconnect (does NOT remove you from the group)
     \\Anything else is sent to the group as an application message.
     \\
 ;
@@ -418,6 +649,15 @@ fn keyboardLoop(self: *Client) !void {
             }
             continue;
         }
+        if (std.mem.startsWith(u8, text, "/remove ")) {
+            const who = std.mem.trim(u8, text["/remove ".len..], " \t");
+            try removeMember(self, who);
+            continue;
+        }
+        if (std.mem.eql(u8, text, "/leave")) {
+            try proposeLeave(self);
+            continue;
+        }
         if (std.mem.startsWith(u8, text, "/invite ")) {
             const who = std.mem.trim(u8, text["/invite ".len..], " \t");
             if (who.len == 0) {
@@ -437,6 +677,10 @@ fn keyboardLoop(self: *Client) !void {
         const protected = blk: {
             self.state_lock.lock();
             defer self.state_lock.unlock();
+            if (self.removed) {
+                std.debug.print("mls-chat: you were removed from this group — nothing to send to\n", .{});
+                continue;
+            }
             const g = if (self.group) |*g| g else {
                 std.debug.print("mls-chat: not in the group yet — nothing to send to\n", .{});
                 continue;
