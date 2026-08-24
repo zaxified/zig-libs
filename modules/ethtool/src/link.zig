@@ -22,6 +22,11 @@ const bitset = @import("bitset.zig");
 
 pub const Error = codec.Error || error{OutOfMemory};
 
+/// What the `build*` encoders below can fail with: `header.Error` for the
+/// request header (an impossible device name is caught locally), plus whatever
+/// the attribute appenders raise.
+pub const BuildError = Error || header.Error;
+
 // ── LINKINFO ───────────────────────────────────────────────────────────────
 
 /// `ETHTOOL_MSG_LINKINFO_GET` reply. Everything is optional: a driver that does
@@ -67,6 +72,47 @@ pub fn appendLinkInfoSet(
 ) std.mem.Allocator.Error!void {
     if (set.port) |p| try codec.appendAttrU8(gpa, list, uapi.LINKINFO.PORT, @intFromEnum(p));
     if (set.tp_mdix_ctrl) |m| try codec.appendAttrU8(gpa, list, uapi.LINKINFO.TP_MDIX_CTRL, @intFromEnum(m));
+}
+
+/// Encode a complete `ETHTOOL_MSG_LINKINFO_GET` request. The result is the
+/// whole datagram — `nlmsghdr`, `genlmsghdr`, header nest — owned by the
+/// caller, who frees it with `gpa`. `Ethtool.linkInfo` sends exactly this.
+pub fn buildLinkInfo(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.LINKINFO_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.LINKINFO.HEADER, .{ .target = target });
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// Encode a complete `ETHTOOL_MSG_LINKINFO_SET` request. `Ethtool.setLinkInfo`
+/// sends exactly this.
+pub fn buildSetLinkInfo(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    set: LinkInfoSet,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.LINKINFO_SET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.LINKINFO.HEADER, .{ .target = target });
+    try appendLinkInfoSet(gpa, &msg, set);
+    return header.finishRequest(gpa, &msg, h);
 }
 
 // ── LINKMODES ──────────────────────────────────────────────────────────────
@@ -179,6 +225,52 @@ pub fn appendLinkModesSet(
         try bitset.appendIndexedValues(gpa, list, uapi.LINKMODES.OURS, set.advertise);
 }
 
+/// Encode a complete `ETHTOOL_MSG_LINKMODES_GET` request. `form` picks the
+/// bitset encoding the reply will use, and it does so through the request
+/// header's `FLAGS` word — which is why it is part of the message rather than
+/// of the sending. `Ethtool.linkModes` sends exactly this.
+pub fn buildLinkModes(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    form: header.BitsetForm,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.LINKMODES_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.LINKMODES.HEADER, .{
+        .target = target,
+        .compact_bitsets = form.compactFlag(),
+    });
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// Encode a complete `ETHTOOL_MSG_LINKMODES_SET` request.
+/// `Ethtool.setLinkModes` sends exactly this.
+pub fn buildSetLinkModes(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    set: LinkModesSet,
+) BuildError![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.LINKMODES_SET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.LINKMODES.HEADER, .{ .target = target });
+    try appendLinkModesSet(gpa, &msg, set);
+    return header.finishRequest(gpa, &msg, h);
+}
+
 // ── LINKSTATE ──────────────────────────────────────────────────────────────
 
 /// `ETHTOOL_MSG_LINKSTATE_GET` reply.
@@ -214,6 +306,25 @@ pub fn parseLinkState(attr_bytes: []const u8) codec.Error!LinkState {
         else => {},
     };
     return out;
+}
+
+/// Encode a complete `ETHTOOL_MSG_LINKSTATE_GET` request. `Ethtool.linkState`
+/// sends exactly this.
+pub fn buildLinkState(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.LINKSTATE_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.LINKSTATE.HEADER, .{ .target = target });
+    return header.finishRequest(gpa, &msg, h);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────

@@ -86,7 +86,7 @@ pub const RequestError = error{
     /// family message — a kernel bug or a socket fed by something other than
     /// the kernel would otherwise spin the caller forever. See `Walk.next`.
     TooManyMessages,
-    /// **W2 audit finding, campaign C-10 (`ethtool` F3)**: a `simpleGet`
+    /// **W2 audit finding, campaign C-10 (`ethtool` F3)**: an `exchangeGet`
     /// reply's echoed header names a different device than the one that was
     /// asked about. Correlation used to rest solely on `Walk`'s `(portid,
     /// seq)` match; this catches a kernel (or anything else that can answer
@@ -121,14 +121,11 @@ pub fn errnoToError(code: i32) RequestError {
 /// Which bitset encoding to ask the kernel for. Verbose costs bytes and gives
 /// names; compact is cheap and gives bare bit numbers whose meaning has to come
 /// from a `stringSet` lookup. See `bitset.zig`.
-pub const BitsetForm = enum {
-    verbose,
-    compact,
-
-    fn compactFlag(f: BitsetForm) bool {
-        return f == .compact;
-    }
-};
+///
+/// It is declared in `header.zig`, next to the request-header flag it sets, so
+/// that the offline `build*` encoders can take it without importing the client;
+/// this alias is the name it has always had.
+pub const BitsetForm = header.BitsetForm;
 
 /// Find the id of the multicast group named `want` in the attribute bytes of a
 /// `CTRL_CMD_NEWFAMILY` reply. Pure — golden-tested offline against a captured
@@ -229,24 +226,19 @@ pub const Ethtool = struct {
     /// `ETHTOOL_MSG_LINKINFO_GET` — port, PHY address, MDI-X, transceiver.
     /// Unprivileged.
     pub fn linkInfo(cl: *Ethtool, target: header.Target) RequestError!link.LinkInfo {
-        var reply = try cl.simpleGet(uapi.MSG.LINKINFO_GET, uapi.LINKINFO.HEADER, .{ .target = target });
+        const seq = cl.sock.nextSeq();
+        const msg = link.buildLinkInfo(cl.allocator(), cl.family_id, seq, target) catch |e| return mapParse(e);
+        var reply = try cl.exchangeGet(msg, seq, uapi.LINKINFO.HEADER, target);
         defer reply.deinit(cl.allocator());
         return link.parseLinkInfo(reply.attrs) catch error.MalformedReply;
     }
 
     /// `ETHTOOL_MSG_LINKINFO_SET`. Needs **CAP_NET_ADMIN**.
     pub fn setLinkInfo(cl: *Ethtool, target: header.Target, set: link.LinkInfoSet) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.LINKINFO_SET, false);
-        try cl.appendHeaderNest(&msg, uapi.LINKINFO.HEADER, .{ .target = target });
-        try link.appendLinkInfoSet(gpa, &msg, set);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const msg = link.buildSetLinkInfo(cl.allocator(), cl.family_id, seq, target, set) catch |e|
+            return mapParse(e);
+        try cl.exchangeAck(msg, seq);
     }
 
     /// `ETHTOOL_MSG_LINKMODES_GET` — autoneg, speed, duplex and the
@@ -260,33 +252,29 @@ pub const Ethtool = struct {
         target: header.Target,
         form: BitsetForm,
     ) RequestError!link.LinkModes {
-        var reply = try cl.simpleGet(uapi.MSG.LINKMODES_GET, uapi.LINKMODES.HEADER, .{
-            .target = target,
-            .compact_bitsets = form.compactFlag(),
-        });
+        const seq = cl.sock.nextSeq();
+        const msg = link.buildLinkModes(cl.allocator(), cl.family_id, seq, target, form) catch |e|
+            return mapParse(e);
+        var reply = try cl.exchangeGet(msg, seq, uapi.LINKMODES.HEADER, target);
         defer reply.deinit(cl.allocator());
         return link.parseLinkModes(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
     }
 
     /// `ETHTOOL_MSG_LINKMODES_SET`. Needs **CAP_NET_ADMIN**.
     pub fn setLinkModes(cl: *Ethtool, target: header.Target, set: link.LinkModesSet) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.LINKMODES_SET, false);
-        try cl.appendHeaderNest(&msg, uapi.LINKMODES.HEADER, .{ .target = target });
-        link.appendLinkModesSet(gpa, &msg, set) catch |e| return mapParse(e);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const msg = link.buildSetLinkModes(cl.allocator(), cl.family_id, seq, target, set) catch |e|
+            return mapParse(e);
+        try cl.exchangeAck(msg, seq);
     }
 
     /// `ETHTOOL_MSG_LINKSTATE_GET` — carrier, SQI, and why the link is down.
     /// Unprivileged.
     pub fn linkState(cl: *Ethtool, target: header.Target) RequestError!link.LinkState {
-        var reply = try cl.simpleGet(uapi.MSG.LINKSTATE_GET, uapi.LINKSTATE.HEADER, .{ .target = target });
+        const seq = cl.sock.nextSeq();
+        const msg = link.buildLinkState(cl.allocator(), cl.family_id, seq, target) catch |e|
+            return mapParse(e);
+        var reply = try cl.exchangeGet(msg, seq, uapi.LINKSTATE.HEADER, target);
         defer reply.deinit(cl.allocator());
         return link.parseLinkState(reply.attrs) catch error.MalformedReply;
     }
@@ -295,95 +283,76 @@ pub const Ethtool = struct {
 
     /// `ETHTOOL_MSG_RINGS_GET`. Unprivileged.
     pub fn rings(cl: *Ethtool, target: header.Target) RequestError!params.Rings {
-        var reply = try cl.simpleGet(uapi.MSG.RINGS_GET, uapi.RINGS.HEADER, .{ .target = target });
+        const seq = cl.sock.nextSeq();
+        const msg = params.buildRings(cl.allocator(), cl.family_id, seq, target) catch |e|
+            return mapParse(e);
+        var reply = try cl.exchangeGet(msg, seq, uapi.RINGS.HEADER, target);
         defer reply.deinit(cl.allocator());
         return params.parseRings(reply.attrs) catch error.MalformedReply;
     }
 
     /// `ETHTOOL_MSG_RINGS_SET`. Needs **CAP_NET_ADMIN**.
     pub fn setRings(cl: *Ethtool, target: header.Target, set: params.RingsSet) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.RINGS_SET, false);
-        try cl.appendHeaderNest(&msg, uapi.RINGS.HEADER, .{ .target = target });
-        try params.appendRingsSet(gpa, &msg, set);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const msg = params.buildSetRings(cl.allocator(), cl.family_id, seq, target, set) catch |e|
+            return mapParse(e);
+        try cl.exchangeAck(msg, seq);
     }
 
     /// `ETHTOOL_MSG_CHANNELS_GET`. Unprivileged.
     pub fn channels(cl: *Ethtool, target: header.Target) RequestError!params.Channels {
-        var reply = try cl.simpleGet(uapi.MSG.CHANNELS_GET, uapi.CHANNELS.HEADER, .{ .target = target });
+        const seq = cl.sock.nextSeq();
+        const msg = params.buildChannels(cl.allocator(), cl.family_id, seq, target) catch |e|
+            return mapParse(e);
+        var reply = try cl.exchangeGet(msg, seq, uapi.CHANNELS.HEADER, target);
         defer reply.deinit(cl.allocator());
         return params.parseChannels(reply.attrs) catch error.MalformedReply;
     }
 
     /// `ETHTOOL_MSG_CHANNELS_SET`. Needs **CAP_NET_ADMIN**.
     pub fn setChannels(cl: *Ethtool, target: header.Target, set: params.ChannelsSet) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.CHANNELS_SET, false);
-        try cl.appendHeaderNest(&msg, uapi.CHANNELS.HEADER, .{ .target = target });
-        try params.appendChannelsSet(gpa, &msg, set);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const msg = params.buildSetChannels(cl.allocator(), cl.family_id, seq, target, set) catch |e|
+            return mapParse(e);
+        try cl.exchangeAck(msg, seq);
     }
 
     /// `ETHTOOL_MSG_COALESCE_GET`. Unprivileged.
     pub fn coalesce(cl: *Ethtool, target: header.Target) RequestError!params.Coalesce {
-        var reply = try cl.simpleGet(uapi.MSG.COALESCE_GET, uapi.COALESCE.HEADER, .{ .target = target });
+        const seq = cl.sock.nextSeq();
+        const msg = params.buildCoalesce(cl.allocator(), cl.family_id, seq, target) catch |e|
+            return mapParse(e);
+        var reply = try cl.exchangeGet(msg, seq, uapi.COALESCE.HEADER, target);
         defer reply.deinit(cl.allocator());
         return params.parseCoalesce(reply.attrs) catch error.MalformedReply;
     }
 
     /// `ETHTOOL_MSG_COALESCE_SET`. Needs **CAP_NET_ADMIN**.
     pub fn setCoalesce(cl: *Ethtool, target: header.Target, set: params.CoalesceSet) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.COALESCE_SET, false);
-        try cl.appendHeaderNest(&msg, uapi.COALESCE.HEADER, .{ .target = target });
-        try params.appendCoalesceSet(gpa, &msg, set);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const msg = params.buildSetCoalesce(cl.allocator(), cl.family_id, seq, target, set) catch |e|
+            return mapParse(e);
+        try cl.exchangeAck(msg, seq);
     }
 
     /// `ETHTOOL_MSG_PAUSE_GET`. Unprivileged. `want_stats` sets
     /// `ETHTOOL_FLAG_STATS`, which is the only way the optional pause-frame
     /// counters come back.
     pub fn pauseParams(cl: *Ethtool, target: header.Target, want_stats: bool) RequestError!params.Pause {
-        var reply = try cl.simpleGet(uapi.MSG.PAUSE_GET, uapi.PAUSE.HEADER, .{
-            .target = target,
-            .stats = want_stats,
-        });
+        const seq = cl.sock.nextSeq();
+        const msg = params.buildPauseParams(cl.allocator(), cl.family_id, seq, target, want_stats) catch |e|
+            return mapParse(e);
+        var reply = try cl.exchangeGet(msg, seq, uapi.PAUSE.HEADER, target);
         defer reply.deinit(cl.allocator());
         return params.parsePause(reply.attrs) catch error.MalformedReply;
     }
 
     /// `ETHTOOL_MSG_PAUSE_SET`. Needs **CAP_NET_ADMIN**.
     pub fn setPause(cl: *Ethtool, target: header.Target, set: params.PauseSet) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.PAUSE_SET, false);
-        try cl.appendHeaderNest(&msg, uapi.PAUSE.HEADER, .{ .target = target });
-        try params.appendPauseSet(gpa, &msg, set);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const msg = params.buildSetPause(cl.allocator(), cl.family_id, seq, target, set) catch |e|
+            return mapParse(e);
+        try cl.exchangeAck(msg, seq);
     }
 
     // ── features ───────────────────────────────────────────────────────────
@@ -394,10 +363,10 @@ pub const Ethtool = struct {
         target: header.Target,
         form: BitsetForm,
     ) RequestError!features_mod.Features {
-        var reply = try cl.simpleGet(uapi.MSG.FEATURES_GET, uapi.FEATURES.HEADER, .{
-            .target = target,
-            .compact_bitsets = form.compactFlag(),
-        });
+        const seq = cl.sock.nextSeq();
+        const msg = features_mod.buildFeatures(cl.allocator(), cl.family_id, seq, target, form) catch |e|
+            return mapParse(e);
+        var reply = try cl.exchangeGet(msg, seq, uapi.FEATURES.HEADER, target);
         defer reply.deinit(cl.allocator());
         return features_mod.parse(cl.allocator(), reply.attrs) catch |e| return mapParse(e);
     }
@@ -412,7 +381,15 @@ pub const Ethtool = struct {
         target: header.Target,
         entries: []const bitset.NamedValue,
     ) RequestError!features_mod.SetResult {
-        return cl.setFeaturesImpl(target, entries, null);
+        const seq = cl.sock.nextSeq();
+        const msg = features_mod.buildSetFeaturesByName(
+            cl.allocator(),
+            cl.family_id,
+            seq,
+            target,
+            entries,
+        ) catch |e| return mapParse(e);
+        return cl.featuresSetResult(msg, seq);
     }
 
     /// Same, keyed by bit index rather than name.
@@ -421,26 +398,23 @@ pub const Ethtool = struct {
         target: header.Target,
         entries: []const bitset.IndexedValue,
     ) RequestError!features_mod.SetResult {
-        return cl.setFeaturesImpl(target, null, entries);
+        const seq = cl.sock.nextSeq();
+        const msg = features_mod.buildSetFeaturesByIndex(
+            cl.allocator(),
+            cl.family_id,
+            seq,
+            target,
+            entries,
+        ) catch |e| return mapParse(e);
+        return cl.featuresSetResult(msg, seq);
     }
 
-    fn setFeaturesImpl(
-        cl: *Ethtool,
-        target: header.Target,
-        by_name: ?[]const bitset.NamedValue,
-        by_index: ?[]const bitset.IndexedValue,
-    ) RequestError!features_mod.SetResult {
+    /// Send an already-encoded `FEATURES_SET` and decode its reply. A bare ACK
+    /// (which is what `ETHTOOL_FLAG_OMIT_REPLY` would buy) yields an empty
+    /// result rather than an error.
+    fn featuresSetResult(cl: *Ethtool, msg: []u8, seq: u32) RequestError!features_mod.SetResult {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.FEATURES_SET, false);
-        try cl.appendHeaderNest(&msg, uapi.FEATURES.HEADER, .{ .target = target });
-        if (by_name) |e| features_mod.appendSetByName(gpa, &msg, e) catch |err| return mapParse(err);
-        if (by_index) |e| features_mod.appendSetByIndex(gpa, &msg, e) catch |err| return mapParse(err);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
-
+        try cl.sendBuilt(msg);
         var reply = (try cl.collect(seq)) orelse return .{};
         defer reply.deinit(gpa);
         return features_mod.parseSetResult(gpa, reply.attrs) catch |e| return mapParse(e);
@@ -459,15 +433,10 @@ pub const Ethtool = struct {
         groups: []const []const u8,
     ) RequestError!stats_mod.Stats {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.STATS_GET, false);
-        try cl.appendHeaderNest(&msg, uapi.STATS.HEADER, .{ .target = target });
-        if (groups.len != 0)
-            stats_mod.appendGroupSelector(gpa, &msg, groups) catch |e| return mapParse(e);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
+        const msg = stats_mod.buildStats(gpa, cl.family_id, seq, target, groups) catch |e|
+            return mapParse(e);
+        try cl.sendBuilt(msg);
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
@@ -486,18 +455,10 @@ pub const Ethtool = struct {
         ids: []const uapi.StringSetId,
     ) RequestError!stats_mod.StringSets {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.STRSET_GET, false);
-        if (target) |t| {
-            try cl.appendHeaderNest(&msg, uapi.STRSET.HEADER, .{ .target = t });
-        } else {
-            header.appendGlobal(gpa, &msg, uapi.STRSET.HEADER, 0) catch |e| return mapHeader(e);
-        }
-        try stats_mod.appendStringSetSelector(gpa, &msg, ids);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
+        const msg = stats_mod.buildStringSet(gpa, cl.family_id, seq, target, ids) catch |e|
+            return mapParse(e);
+        try cl.sendBuilt(msg);
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
@@ -509,7 +470,10 @@ pub const Ethtool = struct {
     /// `ETHTOOL_MSG_MODULE_GET` — the transceiver's power-mode policy.
     /// `error.NotSupported` on any device without a pluggable module.
     pub fn moduleInfo(cl: *Ethtool, target: header.Target) RequestError!moduleinfo.ModuleInfo {
-        var reply = try cl.simpleGet(uapi.MSG.MODULE_GET, uapi.MODULE.HEADER, .{ .target = target });
+        const seq = cl.sock.nextSeq();
+        const msg = moduleinfo.buildModuleInfo(cl.allocator(), cl.family_id, seq, target) catch |e|
+            return mapParse(e);
+        var reply = try cl.exchangeGet(msg, seq, uapi.MODULE.HEADER, target);
         defer reply.deinit(cl.allocator());
         return moduleinfo.parse(reply.attrs) catch error.MalformedReply;
     }
@@ -520,17 +484,15 @@ pub const Ethtool = struct {
         target: header.Target,
         policy: uapi.ModulePowerModePolicy,
     ) RequestError!void {
-        const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.MODULE_SET, false);
-        try cl.appendHeaderNest(&msg, uapi.MODULE.HEADER, .{ .target = target });
-        try moduleinfo.appendSet(gpa, &msg, policy);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
-        var reply = try cl.collect(seq);
-        if (reply) |*r| r.deinit(gpa);
+        const msg = moduleinfo.buildSetModulePowerPolicy(
+            cl.allocator(),
+            cl.family_id,
+            seq,
+            target,
+            policy,
+        ) catch |e| return mapParse(e);
+        try cl.exchangeAck(msg, seq);
     }
 
     /// `ETHTOOL_MSG_MODULE_EEPROM_GET` — up to 128 raw bytes of the module's
@@ -542,17 +504,12 @@ pub const Ethtool = struct {
         req: moduleinfo.EepromRequest,
     ) RequestError!moduleinfo.Eeprom {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, uapi.MSG.MODULE_EEPROM_GET, false);
-        try cl.appendHeaderNest(&msg, uapi.MODULE_EEPROM.HEADER, .{ .target = target });
-        moduleinfo.appendEepromRequest(gpa, &msg, req) catch |e| switch (e) {
+        const msg = moduleinfo.buildModuleEeprom(gpa, cl.family_id, seq, target, req) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidRequest => return error.InvalidRequest,
         };
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
+        try cl.sendBuilt(msg);
 
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         defer reply.deinit(gpa);
@@ -598,15 +555,17 @@ pub const Ethtool = struct {
     pub fn raw(cl: *Ethtool, req: RawRequest) RequestError![]Reply {
         const gpa = cl.allocator();
         var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
+        errdefer msg.deinit(gpa);
         const seq = cl.sock.nextSeq();
-        var flags = codec.NLM_F_REQUEST | codec.NLM_F_ACK | req.extra_flags;
-        if (req.dump) flags |= codec.NLM_F_DUMP;
-        const h = try codec.appendHeader(gpa, &msg, cl.family_id, flags, seq, 0);
-        try genl.appendHeader(gpa, &msg, req.cmd, req.version);
+        const h = try header.beginRequest(gpa, &msg, .{
+            .family_id = cl.family_id,
+            .cmd = req.cmd,
+            .seq = seq,
+            .extra_flags = req.extra_flags | (if (req.dump) codec.NLM_F_DUMP else 0),
+            .version = req.version,
+        });
         try msg.appendSlice(gpa, req.attrs);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
+        try cl.sendBuilt(try header.finishRequest(gpa, &msg, h));
 
         var out: std.ArrayList(Reply) = .empty;
         errdefer {
@@ -624,56 +583,46 @@ pub const Ethtool = struct {
 
     // ── plumbing ───────────────────────────────────────────────────────────
 
-    fn begin(
-        cl: *Ethtool,
-        msg: *std.ArrayList(u8),
-        seq: u32,
-        cmd: u8,
-        dump: bool,
-    ) RequestError!usize {
-        const gpa = cl.allocator();
+    /// Take ownership of an encoder's bytes, drop the previous request's
+    /// extended ACK, and put them on the wire. **This is the only place a
+    /// request reaches the socket**: the message itself always comes from the
+    /// matching `build*` encoder in the topic files, never from a second copy
+    /// of the header assembly here.
+    fn sendBuilt(cl: *Ethtool, msg: []u8) RequestError!void {
+        defer cl.allocator().free(msg);
         cl.sock.ext_ack_len = 0;
-        var flags = codec.NLM_F_REQUEST | codec.NLM_F_ACK;
-        if (dump) flags |= codec.NLM_F_DUMP;
-        const h = try codec.appendHeader(gpa, msg, cl.family_id, flags, seq, 0);
-        try genl.appendHeader(gpa, msg, cmd, uapi.family_version);
-        return h;
+        try cl.send(msg);
     }
 
-    fn appendHeaderNest(
+    /// Send an already-encoded device GET and return its one reply message,
+    /// after checking the reply's own echoed header names the device that was
+    /// asked about (see `checkDeviceEcho` / `UnexpectedDevice` — campaign C-10,
+    /// `ethtool` F3). Reply/request correlation used to rest solely on `Walk`'s
+    /// `(portid, seq)` match.
+    fn exchangeGet(
         cl: *Ethtool,
-        msg: *std.ArrayList(u8),
-        attr_type: u16,
-        opts: header.Options,
-    ) RequestError!void {
-        header.append(cl.allocator(), msg, attr_type, opts) catch |e| return mapHeader(e);
-    }
-
-    /// Build + send a device GET with no extra attributes and return its one
-    /// reply message, after checking the reply's own echoed header names the
-    /// device that was asked about (see `checkDeviceEcho` / `UnexpectedDevice`
-    /// — campaign C-10, `ethtool` F3). Reply/request correlation used to rest
-    /// solely on `Walk`'s `(portid, seq)` match.
-    fn simpleGet(
-        cl: *Ethtool,
-        cmd: u8,
+        msg: []u8,
+        seq: u32,
         hdr_attr: u16,
-        opts: header.Options,
+        target: header.Target,
     ) RequestError!Reply {
         const gpa = cl.allocator();
-        var msg: std.ArrayList(u8) = .empty;
-        defer msg.deinit(gpa);
-        const seq = cl.sock.nextSeq();
-        const h = try cl.begin(&msg, seq, cmd, false);
-        try cl.appendHeaderNest(&msg, hdr_attr, opts);
-        codec.finishHeader(&msg, h);
-        try cl.send(msg.items);
+        try cl.sendBuilt(msg);
         var reply = (try cl.collect(seq)) orelse return error.MalformedReply;
         errdefer reply.deinit(gpa);
         const got = (header.find(reply.attrs, hdr_attr) catch return error.MalformedReply) orelse
             return error.MalformedReply;
-        try checkDeviceEcho(opts.target, got);
+        try checkDeviceEcho(target, got);
         return reply;
+    }
+
+    /// Send an already-encoded SET and read to the end of its replies,
+    /// discarding the `*_SET_REPLY` body. For the SETs whose reply carries no
+    /// information this module models.
+    fn exchangeAck(cl: *Ethtool, msg: []u8, seq: u32) RequestError!void {
+        try cl.sendBuilt(msg);
+        var reply = try cl.collect(seq);
+        if (reply) |*r| r.deinit(cl.allocator());
     }
 
     /// Read to the end of a request's replies, keeping the first family
@@ -728,14 +677,7 @@ fn mapParse(e: anyerror) RequestError {
     };
 }
 
-fn mapHeader(e: header.Error) RequestError {
-    return switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.InvalidRequest => error.InvalidRequest,
-    };
-}
-
-/// `simpleGet`'s C-10 binding check: the reply's echoed header must name the
+/// `exchangeGet`'s C-10 binding check: the reply's echoed header must name the
 /// exact device the request asked about, by whichever identifier the request
 /// used. The header doc (`header.zig`) says a reply always carries both
 /// `DEV_INDEX` and `DEV_NAME`; a reply missing the one the caller asked with
@@ -1003,6 +945,43 @@ pub fn parseNotification(
 
 const testing = std.testing;
 
+// ── one encoder per operation ──────────────────────────────────────────────
+// Every command method above hands its arguments to the matching `build*`
+// encoder in a topic file and sends what comes back; the frame those encoders
+// share is spelled once, in `header.beginRequest`/`finishRequest`. That is a
+// property of this file's *text*, and nothing in a type or a value can pin it —
+// a re-inlined `codec.appendHeader` + `genl.appendHeader` + `finishHeader`
+// sequence here would compile, pass every byte test (the encoders would still
+// be correct), and silently diverge from what the socket sends. So it is
+// asserted against the source itself.
+//
+// Scoped to the code above the test banner: the mock-transport helpers below
+// build netlink messages on purpose.
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, i, needle)) |at| : (i = at + needle.len) n += 1;
+    return n;
+}
+
+test "the client holds no second copy of the request frame" {
+    const src = @embedFile("client.zig");
+    const banner = "\n// ── tests ──";
+    const code = src[0 .. std.mem.indexOf(u8, src, banner) orelse return error.TestBannerMoved];
+
+    // The three calls that spell an ethtool request frame. `header.beginRequest`
+    // and `header.finishRequest` are the only place they belong.
+    try testing.expectEqual(@as(usize, 0), countOccurrences(code, "codec.appendHeader("));
+    try testing.expectEqual(@as(usize, 0), countOccurrences(code, "genl.appendHeader("));
+    try testing.expectEqual(@as(usize, 0), countOccurrences(code, "codec.finishHeader("));
+
+    // …and every request reaches the socket through the single funnel that
+    // frees the encoder's bytes.
+    try testing.expectEqual(@as(usize, 1), countOccurrences(code, "cl.send("));
+    try testing.expectEqual(@as(usize, 1), countOccurrences(code, "fn sendBuilt("));
+}
+
 test "errnoToError maps the errnos ethtool actually returns" {
     try testing.expectEqual(error.AccessDenied, errnoToError(-@as(i32, @intFromEnum(linux.E.PERM))));
     try testing.expectEqual(error.NoSuchDevice, errnoToError(-@as(i32, @intFromEnum(linux.E.NODEV))));
@@ -1084,12 +1063,12 @@ test "BitsetForm maps onto the header flag" {
     try testing.expect(!BitsetForm.verbose.compactFlag());
 }
 
-// ── C-10 regression: simpleGet must bind the reply to the request's device ─
-// W2-nn (`ethtool` F3): `simpleGet` handed `reply.attrs` straight to the typed
+// ── C-10 regression: a GET must bind the reply to the request's device ────
+// W2-nn (`ethtool` F3): the GET path handed `reply.attrs` straight to the typed
 // parser with no check that the echoed header named the device that was
 // asked about — correlation rested solely on `Walk`'s `(portid, seq)` match.
 // `checkDeviceEcho` is the fix, and it is pure (no socket needed), so it is
-// tested directly rather than through a mocked `simpleGet` round trip.
+// tested directly rather than through a mocked round trip.
 
 fn deviceNamed(index: ?u32, name: []const u8) header.Device {
     var d: header.Device = .{ .index = index };

@@ -22,9 +22,74 @@
 const std = @import("std");
 const netlink = @import("netlink");
 const codec = netlink.codec;
+const genl = @import("genetlink");
 const uapi = @import("uapi.zig");
 
 pub const Error = error{ OutOfMemory, InvalidRequest };
+
+/// Which bitset encoding to ask the kernel for. Verbose costs bytes and gives
+/// names; compact is cheap and gives bare bit numbers whose meaning has to come
+/// from a `stringSet` lookup. See `bitset.zig`.
+///
+/// It lives here because the only thing it decides is one bit of the request
+/// header's `FLAGS` word; `client.BitsetForm` is an alias of it.
+pub const BitsetForm = enum {
+    verbose,
+    compact,
+
+    pub fn compactFlag(f: BitsetForm) bool {
+        return f == .compact;
+    }
+};
+
+// ── the message frame ──────────────────────────────────────────────────────
+//
+// Every ethtool request is an `nlmsghdr` + a `genlmsghdr` + attributes. That
+// frame is spelled **once**, here: the per-operation `buildX` encoders in
+// `link.zig`, `params.zig`, `features.zig`, `stats.zig` and `moduleinfo.zig`
+// all open with `beginRequest` and close with `finishRequest`, and the client
+// in `client.zig` sends what those encoders return rather than assembling a
+// second copy of its own.
+
+/// The runtime facts a request frame needs. `family_id` and `seq` belong to the
+/// socket, which is why an offline encoder takes them from its caller.
+pub const RequestFrame = struct {
+    /// The `ethtool` family id nlctrl assigned on this boot — never a constant.
+    family_id: u16,
+    /// `ETHTOOL_MSG_*` (`uapi.MSG`).
+    cmd: u8,
+    /// `nlmsg_seq`. The kernel echoes it; a client matches replies on it.
+    seq: u32,
+    /// `NLM_F_*` bits beyond the `REQUEST | ACK` every ethtool request carries.
+    /// `codec.NLM_F_DUMP` here is what turns a request with an empty header
+    /// nest into a walk of every device.
+    extra_flags: u16 = 0,
+    /// `genlmsghdr.version`; the family has only ever used 1.
+    version: u8 = uapi.family_version,
+};
+
+/// Open a request message: `nlmsghdr` then `genlmsghdr`. Returns the offset
+/// `finishRequest` needs to back-patch `nlmsg_len`.
+pub fn beginRequest(
+    gpa: std.mem.Allocator,
+    msg: *std.ArrayList(u8),
+    frame: RequestFrame,
+) std.mem.Allocator.Error!usize {
+    const flags = codec.NLM_F_REQUEST | codec.NLM_F_ACK | frame.extra_flags;
+    const h = try codec.appendHeader(gpa, msg, frame.family_id, flags, frame.seq, 0);
+    try genl.appendHeader(gpa, msg, frame.cmd, frame.version);
+    return h;
+}
+
+/// Back-patch `nlmsg_len` and hand the finished message to the caller.
+pub fn finishRequest(
+    gpa: std.mem.Allocator,
+    msg: *std.ArrayList(u8),
+    h: usize,
+) std.mem.Allocator.Error![]u8 {
+    codec.finishHeader(msg, h);
+    return msg.toOwnedSlice(gpa);
+}
 
 /// How a request names the device. `ethtool` itself sends the name; an ifindex
 /// is stabler against renames and is what a reply always carries.
@@ -169,6 +234,64 @@ pub fn find(attr_bytes: []const u8, attr_type: u16) codec.Error!?Device {
 
 const testing = std.testing;
 const native_endian = @import("builtin").cpu.arch.endian();
+
+test "beginRequest/finishRequest frame: REQUEST|ACK, the family id, the seq and the genlmsghdr" {
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try beginRequest(gpa, &msg, .{ .family_id = 23, .cmd = uapi.MSG.RINGS_GET, .seq = 9 });
+    try append(gpa, &msg, uapi.RINGS.HEADER, .{ .target = .byIndex(2) });
+    const out = try finishRequest(gpa, &msg, h);
+    defer gpa.free(out);
+
+    var it: codec.MessageIterator = .{ .buf = out };
+    const m = (try it.next()).?;
+    try testing.expectEqual(@as(u16, 23), m.type);
+    try testing.expectEqual(codec.NLM_F_REQUEST | codec.NLM_F_ACK, m.flags);
+    try testing.expectEqual(@as(u32, 9), m.seq);
+    // `nlmsg_pid` is left at 0 for the kernel to fill in.
+    try testing.expectEqual(@as(u32, 0), m.pid);
+    // …and `finishHeader` really back-patched the length: the iterator found
+    // exactly one message covering the whole buffer.
+    try testing.expect((try it.next()) == null);
+
+    const p = try genl.splitPayload(m.payload);
+    try testing.expectEqual(uapi.MSG.RINGS_GET, p.cmd);
+    const d = (try find(p.attrs, uapi.RINGS.HEADER)).?;
+    try testing.expectEqual(@as(?u32, 2), d.index);
+}
+
+test "beginRequest: NLM_F_DUMP is part of the message, not of the sending" {
+    const gpa = testing.allocator;
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try beginRequest(gpa, &msg, .{
+        .family_id = 23,
+        .cmd = uapi.MSG.RINGS_GET,
+        .seq = 1,
+        .extra_flags = codec.NLM_F_DUMP,
+    });
+    // A dump is the empty-header-nest form: every device, no target.
+    try appendGlobal(gpa, &msg, uapi.RINGS.HEADER, 0);
+    const out = try finishRequest(gpa, &msg, h);
+    defer gpa.free(out);
+
+    var it: codec.MessageIterator = .{ .buf = out };
+    const m = (try it.next()).?;
+    try testing.expectEqual(
+        codec.NLM_F_REQUEST | codec.NLM_F_ACK | codec.NLM_F_DUMP,
+        m.flags,
+    );
+    // …and without `extra_flags` the very same call leaves it clear.
+    var plain: std.ArrayList(u8) = .empty;
+    errdefer plain.deinit(gpa);
+    const h2 = try beginRequest(gpa, &plain, .{ .family_id = 23, .cmd = uapi.MSG.RINGS_GET, .seq = 1 });
+    try appendGlobal(gpa, &plain, uapi.RINGS.HEADER, 0);
+    const out2 = try finishRequest(gpa, &plain, h2);
+    defer gpa.free(out2);
+    var it2: codec.MessageIterator = .{ .buf = out2 };
+    try testing.expectEqual(@as(u16, 0), (try it2.next()).?.flags & codec.NLM_F_DUMP);
+}
 
 test "header by name, no flags — the shape ethtool sends for a plain GET" {
     if (native_endian != .little) return error.SkipZigTest;

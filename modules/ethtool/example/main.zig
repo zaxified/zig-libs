@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: MIT
 
 //! What a link-monitoring consumer does with `ethtool` when it cannot open a
-//! socket: build a `LINKSTATE_GET` request byte for byte, and decode a
+//! socket: encode a complete `LINKSTATE_GET` request, and decode a
 //! `LINKSTATE_GET_REPLY` captured from a real NIC into `ethtool.LinkState`.
 //!
 //! `ethtool.Ethtool` (the client shown in the module's own usage example)
 //! always owns a live `AF_NETLINK` socket — there is no way to get one
 //! without `Ethtool.open()` making that syscall. This file stays on the wire
-//! seam instead, using the framing ethtool re-exports (`ethtool.codec` is
-//! `netlink.codec`, `ethtool.genl` is the `genetlink` module) plus the
-//! module's own pure encoder/decoder (`ethtool.header.append`,
-//! `ethtool.link.parseLinkState`). Built against the PUBLISHED module
-//! (`@import("ethtool")`) only.
+//! seam instead, using the module's public request encoder
+//! (`ethtool.buildLinkState`, the same one `Ethtool.linkState` sends) and its
+//! pure decoders (`ethtool.link.parseLinkState`), plus the framing ethtool
+//! re-exports for the reply walk (`ethtool.codec` is `netlink.codec`,
+//! `ethtool.genl` is the `genetlink` module). Built against the PUBLISHED
+//! module (`@import("ethtool")`) only.
 
 const std = @import("std");
 const ethtool = @import("ethtool");
@@ -39,24 +40,13 @@ pub fn main() !void {
     // produce a realistic frame.
     const ethtool_family_id: u16 = 23;
 
-    var req: std.ArrayList(u8) = .empty;
-    defer req.deinit(gpa);
-    const hdr_off = try ethtool.codec.appendHeader(
-        gpa,
-        &req,
-        ethtool_family_id,
-        ethtool.codec.NLM_F_REQUEST,
-        7, // seq
-        0, // pid — kernel fills this in
-    );
-    try ethtool.genl.appendHeader(gpa, &req, ethtool.uapi.MSG.LINKSTATE_GET, 1);
-    try ethtool.header.append(gpa, &req, ethtool.uapi.LINKSTATE.HEADER, .{
-        .target = .byName("enp0s31f6"),
-    });
-    ethtool.codec.finishHeader(&req, hdr_off);
+    // One call returns the whole datagram — nlmsghdr, genlmsghdr and the
+    // header nest that names the device — ready for a `sendto`.
+    const req = try ethtool.buildLinkState(gpa, ethtool_family_id, 7, .byName("enp0s31f6"));
+    defer gpa.free(req);
 
     std.debug.print("linkstate request: {d} wire bytes for family \"{s}\"\n", .{
-        req.items.len,
+        req.len,
         ethtool.family_name,
     });
 

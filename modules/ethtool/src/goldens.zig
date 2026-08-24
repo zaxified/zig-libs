@@ -145,14 +145,38 @@ fn beginRequest(
     return h;
 }
 
-/// Split a captured reply into its genlmsghdr command byte and attribute
-/// bytes, asserting the message type is the ethtool family.
+/// Split a captured message into its genlmsghdr command byte and attribute
+/// bytes, asserting the message type is the ethtool family. Works on a request
+/// as well as a reply — both are ethtool-family generic-netlink messages.
 fn replyAttrs(captured: []const u8) !struct { cmd: u8, attrs: []const u8 } {
     var it: codec.MessageIterator = .{ .buf = captured };
     const m = (try it.next()).?;
     try testing.expectEqual(fam, m.type);
     const p = try genl.splitPayload(m.payload);
     return .{ .cmd = p.cmd, .attrs = p.attrs };
+}
+
+/// The payload of the first attribute of type `want`, or null when there is
+/// none. For asserting an optional attribute is genuinely ABSENT, not merely
+/// different.
+fn findAttr(attr_bytes: []const u8, want: u16) codec.Error!?[]const u8 {
+    var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    while (try it.next()) |a| {
+        if (a.type == want) return a.data;
+    }
+    return null;
+}
+
+/// The `ETHTOOL_A_HEADER_FLAGS` word inside the header nest of type `hdr_attr`,
+/// or null when the nest carries none — which is what a zero flag word encodes
+/// (`header.append` omits the attribute entirely).
+fn findFlags(attr_bytes: []const u8, hdr_attr: u16) codec.Error!?u32 {
+    const nest = (try findAttr(attr_bytes, hdr_attr)) orelse return null;
+    var it: codec.AttrIterator = .{ .buf = nest };
+    while (try it.next()) |a| {
+        if (a.type == uapi.HEADER.FLAGS) return try a.asU32();
+    }
+    return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -926,70 +950,59 @@ const notification_features_ntf = hex("a4000000170000009500000000000000" ++
 // Request goldens
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Every test below drives the module's own public request encoder — the same
+// `build*` function `client.zig` calls before it sends — so what is compared
+// against the capture is literally what an `Ethtool` puts on the wire. The one
+// exception is `FEATURES_SET`, called out where it appears.
+
 test "golden request: LINKMODES_GET, verbose bitsets (ethtool enp0s31f6)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.LINKMODES_GET, 2);
-    try header.append(gpa, &msg, uapi.LINKMODES.HEADER, .{ .target = .byName("enp0s31f6") });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_linkmodes_get_verbose, msg.items);
+    const msg = try link.buildLinkModes(gpa, fam, 2, .byName("enp0s31f6"), .verbose);
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_linkmodes_get_verbose, msg);
 }
 
 test "golden request: LINKINFO_GET (ethtool enp0s31f6)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.LINKINFO_GET, 3);
-    try header.append(gpa, &msg, uapi.LINKINFO.HEADER, .{ .target = .byName("enp0s31f6") });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_linkinfo_get, msg.items);
+    const msg = try link.buildLinkInfo(gpa, fam, 3, .byName("enp0s31f6"));
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_linkinfo_get, msg);
 }
 
 test "golden request: LINKSTATE_GET (ethtool enp0s31f6)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.LINKSTATE_GET, 7);
-    try header.append(gpa, &msg, uapi.LINKSTATE.HEADER, .{ .target = .byName("enp0s31f6") });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_linkstate_get, msg.items);
+    const msg = try link.buildLinkState(gpa, fam, 7, .byName("enp0s31f6"));
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_linkstate_get, msg);
 }
 
 test "golden request: RINGS_GET (ethtool -g enp0s31f6)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.RINGS_GET, 2);
-    try header.append(gpa, &msg, uapi.RINGS.HEADER, .{ .target = .byName("enp0s31f6") });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_rings_get, msg.items);
+    const msg = try params.buildRings(gpa, fam, 2, .byName("enp0s31f6"));
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_rings_get, msg);
 }
 
 test "golden request: COALESCE_GET (ethtool -c enp0s31f6)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.COALESCE_GET, 2);
-    try header.append(gpa, &msg, uapi.COALESCE.HEADER, .{ .target = .byName("enp0s31f6") });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_coalesce_get, msg.items);
+    const msg = try params.buildCoalesce(gpa, fam, 2, .byName("enp0s31f6"));
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_coalesce_get, msg);
 }
 
 test "golden request: PAUSE_GET (ethtool -a enp0s31f6)" {
+    // `want_stats = false`: `ethtool -a` does not ask for the optional
+    // pause-frame counters, so the header nest carries no flag word at all.
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.PAUSE_GET, 2);
-    try header.append(gpa, &msg, uapi.PAUSE.HEADER, .{ .target = .byName("enp0s31f6") });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_pause_get, msg.items);
+    const msg = try params.buildPauseParams(gpa, fam, 2, .byName("enp0s31f6"), false);
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_pause_get, msg);
 }
 
 test "golden request: LINKMODES_GET with ETHTOOL_FLAG_COMPACT_BITSETS" {
@@ -998,15 +1011,9 @@ test "golden request: LINKMODES_GET with ETHTOOL_FLAG_COMPACT_BITSETS" {
     // the single bit that decides which of the two bitset encodings comes back.
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.LINKMODES_GET, 1);
-    try header.append(gpa, &msg, uapi.LINKMODES.HEADER, .{
-        .target = .byName("enp0s31f6"),
-        .compact_bitsets = true,
-    });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_linkmodes_get_compact, msg.items);
+    const msg = try link.buildLinkModes(gpa, fam, 1, .byName("enp0s31f6"), .compact);
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_linkmodes_get_compact, msg);
     // …and it really is only the flag that differs.
     try testing.expectEqual(req_linkmodes_get_verbose.len + 8, req_linkmodes_get_compact.len);
 }
@@ -1014,42 +1021,29 @@ test "golden request: LINKMODES_GET with ETHTOOL_FLAG_COMPACT_BITSETS" {
 test "golden request: CHANNELS_GET (ethtool -l enp0s31f6)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.CHANNELS_GET, 2);
-    try header.append(gpa, &msg, uapi.CHANNELS.HEADER, .{ .target = .byName("enp0s31f6") });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_channels_get, msg.items);
+    const msg = try params.buildChannels(gpa, fam, 2, .byName("enp0s31f6"));
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_channels_get, msg);
 }
 
 test "golden request: FEATURES_GET (ethtool -k enp0s31f6)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.FEATURES_GET, 2);
-    try header.append(gpa, &msg, uapi.FEATURES.HEADER, .{
-        .target = .byName("enp0s31f6"),
-        .compact_bitsets = true,
-    });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_features_get_compact, msg.items);
+    const msg = try features.buildFeatures(gpa, fam, 2, .byName("enp0s31f6"), .compact);
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_features_get_compact, msg);
 }
 
 test "golden request: STRSET_GET of ETH_SS_FEATURES (ethtool -k enp0s31f6)" {
     // The companion request of the one above: compact bitsets carry no names,
     // so `ethtool` fetches the kernel's feature-name table separately — and
     // does it with an **empty header nest**, because the table is not a
-    // property of any device.
+    // property of any device. A null target is what asks for that.
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.STRSET_GET, 1);
-    try header.appendGlobal(gpa, &msg, uapi.STRSET.HEADER, 0);
-    try stats.appendStringSetSelector(gpa, &msg, &.{.features});
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_strset_features, msg.items);
+    const msg = try stats.buildStringSet(gpa, fam, 1, null, &.{.features});
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_strset_features, msg);
 }
 
 test "golden request: STATS_GET with a verbose name-keyed group bitset" {
@@ -1060,13 +1054,9 @@ test "golden request: STATS_GET with a verbose name-keyed group bitset" {
     // rather than 1.
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.STATS_GET, 2);
-    try header.append(gpa, &msg, uapi.STATS.HEADER, .{ .target = .byName("enp0s31f6") });
-    try stats.appendGroupSelector(gpa, &msg, &.{ "eth-mac", "eth-ctrl", "rmon" });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_stats_get_groups, msg.items);
+    const msg = try stats.buildStats(gpa, fam, 2, .byName("enp0s31f6"), &.{ "eth-mac", "eth-ctrl", "rmon" });
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_stats_get_groups, msg);
 }
 
 test "golden request: STRSET_GET of ETH_SS_STATS_STD" {
@@ -1074,13 +1064,9 @@ test "golden request: STRSET_GET of ETH_SS_STATS_STD" {
     // *names* come from string set 16.
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.STRSET_GET, 1);
-    try header.appendGlobal(gpa, &msg, uapi.STRSET.HEADER, 0);
-    try stats.appendStringSetSelector(gpa, &msg, &.{.stats_std});
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_strset_stats_std, msg.items);
+    const msg = try stats.buildStringSet(gpa, fam, 1, null, &.{.stats_std});
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_strset_stats_std, msg);
 }
 
 test "golden request: RINGS_SET (ethtool -G enp0s31f6 rx 512)" {
@@ -1088,41 +1074,29 @@ test "golden request: RINGS_SET (ethtool -G enp0s31f6 rx 512)" {
     // *after* `ethtool` has put the request on the wire, so the bytes are real.
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.RINGS_SET, 2);
-    try header.append(gpa, &msg, uapi.RINGS.HEADER, .{ .target = .byName("enp0s31f6") });
-    try params.appendRingsSet(gpa, &msg, .{ .rx = 512 });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_rings_set, msg.items);
+    const msg = try params.buildSetRings(gpa, fam, 2, .byName("enp0s31f6"), .{ .rx = 512 });
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_rings_set, msg);
 }
 
 test "golden request: PAUSE_SET (ethtool -A enp0s31f6 autoneg off)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.PAUSE_SET, 2);
-    try header.append(gpa, &msg, uapi.PAUSE.HEADER, .{ .target = .byName("enp0s31f6") });
-    try params.appendPauseSet(gpa, &msg, .{ .autoneg = false });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_pause_set, msg.items);
+    const msg = try params.buildSetPause(gpa, fam, 2, .byName("enp0s31f6"), .{ .autoneg = false });
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_pause_set, msg);
 }
 
 test "golden request: LINKMODES_SET (ethtool -s enp0s31f6 speed 100 duplex full autoneg on)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.LINKMODES_SET, 2);
-    try header.append(gpa, &msg, uapi.LINKMODES.HEADER, .{ .target = .byName("enp0s31f6") });
-    try link.appendLinkModesSet(gpa, &msg, .{
+    const msg = try link.buildSetLinkModes(gpa, fam, 2, .byName("enp0s31f6"), .{
         .speed_mbps = 100,
         .duplex = .full,
         .autoneg = true,
     });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_linkmodes_set, msg.items);
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_linkmodes_set, msg);
 }
 
 test "golden request: FEATURES_SET (ethtool -K enp0s31f6 tso off)" {
@@ -1131,6 +1105,11 @@ test "golden request: FEATURES_SET (ethtool -K enp0s31f6 tso off)" {
     // **no** `NOMASK` — so the kernel changes exactly these five bits and
     // leaves everything else alone. That is the masked verbose form, and it is
     // why `bitset.appendNamedValues` does not emit `NOMASK`.
+    //
+    // The one request golden NOT built through this module's own encoder:
+    // `ethtool -K` sets ETHTOOL_FLAG_COMPACT_BITSETS in the request header and
+    // `features.buildSetFeaturesByName` does not. The next test pins that
+    // difference so it stays the only one.
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
     var msg: std.ArrayList(u8) = .empty;
@@ -1151,52 +1130,77 @@ test "golden request: FEATURES_SET (ethtool -K enp0s31f6 tso off)" {
     try testing.expectEqualSlices(u8, &req_features_set, msg.items);
 }
 
+test "FEATURES_SET: this module's request differs from `ethtool -K`'s by the header flag only" {
+    // Not a defect being fixed here, a difference being pinned: the request
+    // header `Ethtool.setFeaturesByName` sends carries no FLAGS attribute,
+    // where `ethtool -K` asks for compact bitsets in the SET *reply*. Both are
+    // valid requests; this module reads the verbose reply form. Everything
+    // after the header nest — the WANTED bitset with all five BIT{NAME} nests —
+    // must be byte-identical to the capture.
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try features.buildSetFeaturesByName(gpa, fam, 3, .byName("enp0s31f6"), &.{
+        .{ .name = "tx-tcp-segmentation", .on = false },
+        .{ .name = "tx-tcp-ecn-segmentation", .on = false },
+        .{ .name = "tx-tcp-mangleid-segmentation", .on = false },
+        .{ .name = "tx-tcp6-segmentation", .on = false },
+        .{ .name = "tx-tcp-accecn-segmentation", .on = false },
+    });
+    defer gpa.free(msg);
+
+    const ours = try replyAttrs(msg);
+    const theirs = try replyAttrs(&req_features_set);
+    try testing.expectEqual(uapi.MSG.FEATURES_SET, ours.cmd);
+    try testing.expectEqual(theirs.cmd, ours.cmd);
+
+    // The device is the same and named the same way; only the flag word differs.
+    const our_hdr = (try header.find(ours.attrs, uapi.FEATURES.HEADER)).?;
+    const their_hdr = (try header.find(theirs.attrs, uapi.FEATURES.HEADER)).?;
+    try testing.expectEqualStrings(their_hdr.name(), our_hdr.name());
+    try testing.expectEqual(@as(?u32, null), try findFlags(ours.attrs, uapi.FEATURES.HEADER));
+    try testing.expectEqual(
+        @as(?u32, uapi.FLAG.COMPACT_BITSETS),
+        try findFlags(theirs.attrs, uapi.FEATURES.HEADER),
+    );
+
+    // …and the bitset that carries the actual request is identical.
+    try testing.expectEqualSlices(
+        u8,
+        (try findAttr(theirs.attrs, uapi.FEATURES.WANTED)).?,
+        (try findAttr(ours.attrs, uapi.FEATURES.WANTED)).?,
+    );
+}
+
 test "golden request: CHANNELS_SET (ethtool -L veth0 combined 1)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.CHANNELS_SET, 2);
-    try header.append(gpa, &msg, uapi.CHANNELS.HEADER, .{ .target = .byName("veth0") });
-    try params.appendChannelsSet(gpa, &msg, .{ .combined_count = 1 });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_channels_set, msg.items);
+    const msg = try params.buildSetChannels(gpa, fam, 2, .byName("veth0"), .{ .combined_count = 1 });
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_channels_set, msg);
 }
 
 test "golden request: COALESCE_SET (ethtool -C veth0 adaptive-rx on)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.COALESCE_SET, 2);
-    try header.append(gpa, &msg, uapi.COALESCE.HEADER, .{ .target = .byName("veth0") });
-    try params.appendCoalesceSet(gpa, &msg, .{ .use_adaptive_rx = true });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_coalesce_set, msg.items);
+    const msg = try params.buildSetCoalesce(gpa, fam, 2, .byName("veth0"), .{ .use_adaptive_rx = true });
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_coalesce_set, msg);
 }
 
 test "golden request: LINKINFO_SET (ethtool -s veth0 port tp)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.LINKINFO_SET, 2);
-    try header.append(gpa, &msg, uapi.LINKINFO.HEADER, .{ .target = .byName("veth0") });
-    try link.appendLinkInfoSet(gpa, &msg, .{ .port = .tp });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_linkinfo_set, msg.items);
+    const msg = try link.buildSetLinkInfo(gpa, fam, 2, .byName("veth0"), .{ .port = .tp });
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_linkinfo_set, msg);
 }
 
 test "golden request: MODULE_SET (ethtool --set-module veth0 power-mode-policy high)" {
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.MODULE_SET, 2);
-    try header.append(gpa, &msg, uapi.MODULE.HEADER, .{ .target = .byName("veth0") });
-    try moduleinfo.appendSet(gpa, &msg, .high);
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_module_set, msg.items);
+    const msg = try moduleinfo.buildSetModulePowerPolicy(gpa, fam, 2, .byName("veth0"), .high);
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_module_set, msg);
 }
 
 test "golden request: MODULE_EEPROM_GET (ethtool -m enp0s31f6)" {
@@ -1204,13 +1208,160 @@ test "golden request: MODULE_EEPROM_GET (ethtool -m enp0s31f6)" {
     // of 1 here is `ethtool`'s, not a default of this module's.
     try skipUnlessLittleEndian();
     const gpa = testing.allocator;
-    var msg: std.ArrayList(u8) = .empty;
-    defer msg.deinit(gpa);
-    const h = try beginRequest(gpa, &msg, uapi.MSG.MODULE_EEPROM_GET, 2);
-    try header.append(gpa, &msg, uapi.MODULE_EEPROM.HEADER, .{ .target = .byName("enp0s31f6") });
-    try moduleinfo.appendEepromRequest(gpa, &msg, .{ .length = 1, .offset = 0 });
-    codec.finishHeader(&msg, h);
-    try testing.expectEqualSlices(u8, &req_module_eeprom_get, msg.items);
+    const msg = try moduleinfo.buildModuleEeprom(gpa, fam, 2, .byName("enp0s31f6"), .{
+        .length = 1,
+        .offset = 0,
+    });
+    defer gpa.free(msg);
+    try testing.expectEqualSlices(u8, &req_module_eeprom_get, msg);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Request encoders with no capture to compare against
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `ethtool` never sends these shapes — it always keys a SET bitset by name,
+// never asks for a *device's* string sets, and the machine the captures came
+// from has no pluggable transceiver — so there is no byte-exact oracle. They
+// are decoded back with this module's own primitives instead, and every
+// assertion includes the attributes that must be ABSENT: an optional flag or
+// selector silently appearing is exactly the drift a length check would miss.
+
+fn countAttrs(attr_bytes: []const u8) !usize {
+    var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    var n: usize = 0;
+    while (try it.next()) |_| n += 1;
+    return n;
+}
+
+test "encoder: FEATURES_GET with verbose bitsets carries no header flag word" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try features.buildFeatures(gpa, fam, 11, .byName("enp0s31f6"), .verbose);
+    defer gpa.free(msg);
+
+    const r = try replyAttrs(msg);
+    try testing.expectEqual(uapi.MSG.FEATURES_GET, r.cmd);
+    try testing.expectEqualStrings("enp0s31f6", (try header.find(r.attrs, uapi.FEATURES.HEADER)).?.name());
+    // The whole difference between .verbose and .compact: this attribute.
+    try testing.expectEqual(@as(?u32, null), try findFlags(r.attrs, uapi.FEATURES.HEADER));
+    try testing.expectEqual(@as(usize, 1), try countAttrs(r.attrs));
+}
+
+test "encoder: FEATURES_SET keyed by bit index" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try features.buildSetFeaturesByIndex(gpa, fam, 12, .byIndex(2), &.{
+        .{ .index = 3, .on = true },
+        .{ .index = 7, .on = false },
+    });
+    defer gpa.free(msg);
+
+    const r = try replyAttrs(msg);
+    try testing.expectEqual(uapi.MSG.FEATURES_SET, r.cmd);
+    try testing.expectEqual(@as(?u32, 2), (try header.find(r.attrs, uapi.FEATURES.HEADER)).?.index);
+    try testing.expectEqual(@as(?u32, null), try findFlags(r.attrs, uapi.FEATURES.HEADER));
+
+    var bs = try bitset.parse(gpa, (try findAttr(r.attrs, uapi.FEATURES.WANTED)).?);
+    defer bs.deinit(gpa);
+    // Masked verbose form: no NOMASK, no compact words, one entry per bit.
+    try testing.expect(!bs.nomask);
+    try testing.expect(bs.value_words == null);
+    const bits = bs.bits.?;
+    try testing.expectEqual(@as(usize, 2), bits.len);
+    try testing.expectEqual(@as(?u32, 3), bits[0].index);
+    try testing.expect(bits[0].value);
+    try testing.expect(bits[0].name == null); // keyed by index, not by name
+    try testing.expectEqual(@as(?u32, 7), bits[1].index);
+    try testing.expect(!bits[1].value);
+    // …and nothing else rode along.
+    try testing.expectEqual(@as(usize, 2), try countAttrs(r.attrs));
+}
+
+test "encoder: MODULE_GET is the header nest and nothing else" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try moduleinfo.buildModuleInfo(gpa, fam, 13, .byName("enp0s31f6"));
+    defer gpa.free(msg);
+
+    const r = try replyAttrs(msg);
+    try testing.expectEqual(uapi.MSG.MODULE_GET, r.cmd);
+    try testing.expectEqualStrings("enp0s31f6", (try header.find(r.attrs, uapi.MODULE.HEADER)).?.name());
+    try testing.expectEqual(@as(?u32, null), try findFlags(r.attrs, uapi.MODULE.HEADER));
+    try testing.expectEqual(@as(usize, 1), try countAttrs(r.attrs));
+    // A MODULE_GET must not be mistaken for a MODULE_SET: no policy attribute.
+    try testing.expectEqual(@as(?[]const u8, null), try findAttr(r.attrs, uapi.MODULE.POWER_MODE_POLICY));
+}
+
+test "encoder: PAUSE_GET with want_stats sets ETHTOOL_FLAG_STATS" {
+    // The `false` case is pinned byte-exactly against `ethtool -a` above; this
+    // is the bit that turns the optional pause-frame counters on.
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try params.buildPauseParams(gpa, fam, 14, .byName("enp0s31f6"), true);
+    defer gpa.free(msg);
+
+    const r = try replyAttrs(msg);
+    try testing.expectEqual(uapi.MSG.PAUSE_GET, r.cmd);
+    try testing.expectEqual(@as(?u32, uapi.FLAG.STATS), try findFlags(r.attrs, uapi.PAUSE.HEADER));
+}
+
+test "encoder: STRSET_GET for one device uses a real header nest, not the empty one" {
+    // The captured `ethtool` requests all fetch *global* string sets, so this
+    // branch of `buildStringSet` has no capture: with a target, the nest names
+    // the device instead of being empty.
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try stats.buildStringSet(gpa, fam, 15, .byName("enp0s31f6"), &.{.stats_std});
+    defer gpa.free(msg);
+
+    const r = try replyAttrs(msg);
+    try testing.expectEqual(uapi.MSG.STRSET_GET, r.cmd);
+    try testing.expectEqualStrings("enp0s31f6", (try header.find(r.attrs, uapi.STRSET.HEADER)).?.name());
+    try testing.expect((try findAttr(r.attrs, uapi.STRSET.STRINGSETS)) != null);
+    try testing.expectEqual(@as(usize, 2), try countAttrs(r.attrs));
+
+    // The global form really does differ: an empty nest, no device.
+    const global = try stats.buildStringSet(gpa, fam, 15, null, &.{.stats_std});
+    defer gpa.free(global);
+    const g = try replyAttrs(global);
+    const gd = (try header.find(g.attrs, uapi.STRSET.HEADER)).?;
+    try testing.expectEqual(@as(usize, 0), gd.name().len);
+    try testing.expectEqual(@as(?u32, null), gd.index);
+}
+
+test "encoder: STATS_GET with no groups omits the selector entirely" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try stats.buildStats(gpa, fam, 16, .byIndex(2), &.{});
+    defer gpa.free(msg);
+
+    const r = try replyAttrs(msg);
+    try testing.expectEqual(uapi.MSG.STATS_GET, r.cmd);
+    // An *empty* GROUPS bitset would mean "no groups"; omitting it is what
+    // asks for the driver's default set, so absence is the assertion.
+    try testing.expectEqual(@as(?[]const u8, null), try findAttr(r.attrs, uapi.STATS.GROUPS));
+    try testing.expectEqual(@as(usize, 1), try countAttrs(r.attrs));
+}
+
+test "encoder: a SET with nothing set carries the header nest and no value attributes" {
+    try skipUnlessLittleEndian();
+    const gpa = testing.allocator;
+    const msg = try params.buildSetRings(gpa, fam, 17, .byIndex(2), .{});
+    defer gpa.free(msg);
+
+    const r = try replyAttrs(msg);
+    try testing.expectEqual(uapi.MSG.RINGS_SET, r.cmd);
+    try testing.expectEqual(@as(usize, 1), try countAttrs(r.attrs));
+    try testing.expectEqual(@as(?[]const u8, null), try findAttr(r.attrs, uapi.RINGS.RX));
+    try testing.expectEqual(@as(?[]const u8, null), try findAttr(r.attrs, uapi.RINGS.TX));
+
+    // …and one field set really does add exactly one attribute.
+    const one = try params.buildSetRings(gpa, fam, 17, .byIndex(2), .{ .rx = 512 });
+    defer gpa.free(one);
+    const r1 = try replyAttrs(one);
+    try testing.expectEqual(@as(usize, 2), try countAttrs(r1.attrs));
+    try testing.expectEqual(@as(u32, 512), std.mem.readInt(u32, (try findAttr(r1.attrs, uapi.RINGS.RX)).?[0..4], .little));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

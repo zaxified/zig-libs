@@ -111,6 +111,47 @@ pub fn appendRingsSet(
     if (set.hds_thresh) |v| try codec.appendAttrU32(gpa, list, uapi.RINGS.HDS_THRESH, v);
 }
 
+/// Encode a complete `ETHTOOL_MSG_RINGS_GET` request — `nlmsghdr`,
+/// `genlmsghdr` and header nest, owned by the caller and freed with `gpa`.
+/// `Ethtool.rings` sends exactly this.
+pub fn buildRings(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.RINGS_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.RINGS.HEADER, .{ .target = target });
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// Encode a complete `ETHTOOL_MSG_RINGS_SET` request. `Ethtool.setRings` sends
+/// exactly this.
+pub fn buildSetRings(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    set: RingsSet,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.RINGS_SET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.RINGS.HEADER, .{ .target = target });
+    try appendRingsSet(gpa, &msg, set);
+    return header.finishRequest(gpa, &msg, h);
+}
+
 // ── CHANNELS ───────────────────────────────────────────────────────────────
 
 /// `ETHTOOL_MSG_CHANNELS_GET` reply.
@@ -165,6 +206,46 @@ pub fn appendChannelsSet(
     if (set.tx_count) |v| try codec.appendAttrU32(gpa, list, uapi.CHANNELS.TX_COUNT, v);
     if (set.other_count) |v| try codec.appendAttrU32(gpa, list, uapi.CHANNELS.OTHER_COUNT, v);
     if (set.combined_count) |v| try codec.appendAttrU32(gpa, list, uapi.CHANNELS.COMBINED_COUNT, v);
+}
+
+/// Encode a complete `ETHTOOL_MSG_CHANNELS_GET` request. `Ethtool.channels`
+/// sends exactly this.
+pub fn buildChannels(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.CHANNELS_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.CHANNELS.HEADER, .{ .target = target });
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// Encode a complete `ETHTOOL_MSG_CHANNELS_SET` request. `Ethtool.setChannels`
+/// sends exactly this.
+pub fn buildSetChannels(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    set: ChannelsSet,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.CHANNELS_SET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.CHANNELS.HEADER, .{ .target = target });
+    try appendChannelsSet(gpa, &msg, set);
+    return header.finishRequest(gpa, &msg, h);
 }
 
 // ── COALESCE ───────────────────────────────────────────────────────────────
@@ -282,6 +363,46 @@ pub fn appendCoalesceSet(
         try codec.appendAttrU8(gpa, list, uapi.COALESCE.USE_CQE_MODE_TX, @intFromBool(v));
 }
 
+/// Encode a complete `ETHTOOL_MSG_COALESCE_GET` request. `Ethtool.coalesce`
+/// sends exactly this.
+pub fn buildCoalesce(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.COALESCE_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.COALESCE.HEADER, .{ .target = target });
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// Encode a complete `ETHTOOL_MSG_COALESCE_SET` request. `Ethtool.setCoalesce`
+/// sends exactly this.
+pub fn buildSetCoalesce(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    set: CoalesceSet,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.COALESCE_SET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.COALESCE.HEADER, .{ .target = target });
+    try appendCoalesceSet(gpa, &msg, set);
+    return header.finishRequest(gpa, &msg, h);
+}
+
 // ── PAUSE ──────────────────────────────────────────────────────────────────
 
 /// The optional `ETHTOOL_A_PAUSE_STATS` nest — only present when the request
@@ -347,6 +468,52 @@ pub fn appendPauseSet(
     if (set.autoneg) |v| try codec.appendAttrU8(gpa, list, uapi.PAUSE.AUTONEG, @intFromBool(v));
     if (set.rx) |v| try codec.appendAttrU8(gpa, list, uapi.PAUSE.RX, @intFromBool(v));
     if (set.tx) |v| try codec.appendAttrU8(gpa, list, uapi.PAUSE.TX, @intFromBool(v));
+}
+
+/// Encode a complete `ETHTOOL_MSG_PAUSE_GET` request. `want_stats` sets
+/// `ETHTOOL_FLAG_STATS` in the request header, which is the only way the
+/// optional pause-frame counters come back. `Ethtool.pauseParams` sends
+/// exactly this.
+pub fn buildPauseParams(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    want_stats: bool,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.PAUSE_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.PAUSE.HEADER, .{
+        .target = target,
+        .stats = want_stats,
+    });
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// Encode a complete `ETHTOOL_MSG_PAUSE_SET` request. `Ethtool.setPause` sends
+/// exactly this.
+pub fn buildSetPause(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    set: PauseSet,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.PAUSE_SET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.PAUSE.HEADER, .{ .target = target });
+    try appendPauseSet(gpa, &msg, set);
+    return header.finishRequest(gpa, &msg, h);
 }
 
 /// Statistics counters in this family are u64 and the kernel pads them to an

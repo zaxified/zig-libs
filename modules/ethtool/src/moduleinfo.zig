@@ -59,6 +59,47 @@ pub fn appendSet(
     try codec.appendAttrU8(gpa, list, uapi.MODULE.POWER_MODE_POLICY, @intFromEnum(policy));
 }
 
+/// Encode a complete `ETHTOOL_MSG_MODULE_GET` request — `nlmsghdr`,
+/// `genlmsghdr` and header nest, owned by the caller and freed with `gpa`.
+/// `Ethtool.moduleInfo` sends exactly this.
+pub fn buildModuleInfo(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.MODULE_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.MODULE.HEADER, .{ .target = target });
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// Encode a complete `ETHTOOL_MSG_MODULE_SET` request.
+/// `Ethtool.setModulePowerPolicy` sends exactly this.
+pub fn buildSetModulePowerPolicy(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    policy: uapi.ModulePowerModePolicy,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.MODULE_SET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.MODULE.HEADER, .{ .target = target });
+    try appendSet(gpa, &msg, policy);
+    return header.finishRequest(gpa, &msg, h);
+}
+
 /// Which window of the module's EEPROM to read.
 pub const EepromRequest = struct {
     /// Byte offset within the page.
@@ -89,6 +130,28 @@ pub fn appendEepromRequest(
     try codec.appendAttrU8(gpa, list, uapi.MODULE_EEPROM.PAGE, req.page);
     try codec.appendAttrU8(gpa, list, uapi.MODULE_EEPROM.BANK, req.bank);
     try codec.appendAttrU8(gpa, list, uapi.MODULE_EEPROM.I2C_ADDRESS, req.i2c_address);
+}
+
+/// Encode a complete `ETHTOOL_MSG_MODULE_EEPROM_GET` request. A window the
+/// kernel's policy would refuse is rejected here as `error.InvalidRequest`
+/// instead of being encoded. `Ethtool.moduleEeprom` sends exactly this.
+pub fn buildModuleEeprom(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    req: EepromRequest,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.MODULE_EEPROM_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.MODULE_EEPROM.HEADER, .{ .target = target });
+    try appendEepromRequest(gpa, &msg, req);
+    return header.finishRequest(gpa, &msg, h);
 }
 
 /// `ETHTOOL_MSG_MODULE_EEPROM_GET` reply — raw bytes, undecoded on purpose.

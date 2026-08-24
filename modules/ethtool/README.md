@@ -111,6 +111,28 @@ Sub-namespaces, all `pub`: `uapi` (every constant and enum), `bitset`,
 `genl` and `codec` for driving `raw`. Every encoder and decoder is a pure
 function over byte slices, so the wire format is testable without a socket.
 
+### Request encoding is a public step
+
+Every method above is a message plus a socket, and the message half is public
+on its own. `ethtool.buildRings(gpa, family_id, seq, dev)` — and one `buildX`
+per method, named after it — returns the **complete datagram**: the `nlmsghdr`
+with its flags, the `genlmsghdr` with the command, and the attributes,
+allocator-owned, ready to hand to a `sendto`. `family_id` and `seq` are
+parameters because they are the socket's to know: the family id is whatever
+nlctrl assigned this boot, and the sequence number is the client's counter.
+
+```zig
+const req = try ethtool.buildRings(gpa, et.family_id, et.sock.nextSeq(), dev);
+defer gpa.free(req);
+// …hand `req` to your own transport, or inspect it.
+```
+
+These are the same encoders the client uses: `Ethtool.rings` calls
+`buildRings` and sends what it returns, so there is one encoder per operation
+and no second copy to drift. The sibling `nl80211`
+(`iface.buildGetInterface`) and `nftables` bindings expose their request
+encoders the same way.
+
 ## Bitsets — read this before touching one
 
 Half of this family's interesting attributes are *bitsets*, and the same

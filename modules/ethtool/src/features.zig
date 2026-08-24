@@ -146,6 +146,87 @@ pub fn appendSetByIndex(
     try bitset.appendIndexedValues(gpa, list, uapi.FEATURES.WANTED, entries);
 }
 
+/// What the `build*` encoders below can fail with.
+pub const BuildError = Error || header.Error;
+
+/// Encode a complete `ETHTOOL_MSG_FEATURES_GET` request — `nlmsghdr`,
+/// `genlmsghdr` and header nest, owned by the caller and freed with `gpa`.
+/// `form` picks the reply's bitset encoding through the header's `FLAGS` word.
+/// `Ethtool.features` sends exactly this.
+pub fn buildFeatures(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    form: header.BitsetForm,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.FEATURES_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.FEATURES.HEADER, .{
+        .target = target,
+        .compact_bitsets = form.compactFlag(),
+    });
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// Encode a complete `ETHTOOL_MSG_FEATURES_SET` request keyed by feature name.
+/// `Ethtool.setFeaturesByName` sends exactly this.
+///
+/// Note the header nest carries **no flags**: unlike the `-K` command of the
+/// `ethtool` binary this module was captured from, it does not ask for compact
+/// bitsets, so the `FEATURES_SET_REPLY` comes back in the verbose form.
+pub fn buildSetFeaturesByName(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    entries: []const bitset.NamedValue,
+) BuildError![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try beginFeaturesSet(gpa, &msg, family_id, seq, target);
+    try appendSetByName(gpa, &msg, entries);
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// Same, keyed by bit index. `Ethtool.setFeaturesByIndex` sends exactly this.
+pub fn buildSetFeaturesByIndex(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    entries: []const bitset.IndexedValue,
+) BuildError![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try beginFeaturesSet(gpa, &msg, family_id, seq, target);
+    try appendSetByIndex(gpa, &msg, entries);
+    return header.finishRequest(gpa, &msg, h);
+}
+
+/// The frame and header nest the two `FEATURES_SET` encoders share; only the
+/// bitset that follows differs between them.
+fn beginFeaturesSet(
+    gpa: std.mem.Allocator,
+    msg: *std.ArrayList(u8),
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+) header.Error!usize {
+    const h = try header.beginRequest(gpa, msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.FEATURES_SET,
+        .seq = seq,
+    });
+    try header.append(gpa, msg, uapi.FEATURES.HEADER, .{ .target = target });
+    return h;
+}
+
 /// The decoded `FEATURES_SET_REPLY`. Both bitsets are *diffs* whose mask half
 /// carries the meaning — see the file header. Owns its allocations.
 pub const SetResult = struct {

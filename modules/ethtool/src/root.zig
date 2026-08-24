@@ -159,6 +159,38 @@ pub const StringSets = stats.StringSets;
 pub const ModuleInfo = moduleinfo.ModuleInfo;
 pub const Eeprom = moduleinfo.Eeprom;
 
+// ── offline request encoders ───────────────────────────────────────────────
+//
+// One per request-performing `Ethtool` method, and the same encoder that
+// method itself uses: each returns a complete, ready-to-send netlink datagram
+// (`nlmsghdr` + `genlmsghdr` + attributes) for a caller that owns the socket
+// and therefore knows the two runtime facts a message needs — the family id
+// nlctrl assigned this boot, and the sequence number. Flat aliases of the
+// `build*` functions in the topic modules; free the result with the same
+// allocator.
+
+pub const buildLinkInfo = link.buildLinkInfo;
+pub const buildSetLinkInfo = link.buildSetLinkInfo;
+pub const buildLinkModes = link.buildLinkModes;
+pub const buildSetLinkModes = link.buildSetLinkModes;
+pub const buildLinkState = link.buildLinkState;
+pub const buildRings = params.buildRings;
+pub const buildSetRings = params.buildSetRings;
+pub const buildChannels = params.buildChannels;
+pub const buildSetChannels = params.buildSetChannels;
+pub const buildCoalesce = params.buildCoalesce;
+pub const buildSetCoalesce = params.buildSetCoalesce;
+pub const buildPauseParams = params.buildPauseParams;
+pub const buildSetPause = params.buildSetPause;
+pub const buildFeatures = features.buildFeatures;
+pub const buildSetFeaturesByName = features.buildSetFeaturesByName;
+pub const buildSetFeaturesByIndex = features.buildSetFeaturesByIndex;
+pub const buildStats = stats.buildStats;
+pub const buildStringSet = stats.buildStringSet;
+pub const buildModuleInfo = moduleinfo.buildModuleInfo;
+pub const buildSetModulePowerPolicy = moduleinfo.buildSetModulePowerPolicy;
+pub const buildModuleEeprom = moduleinfo.buildModuleEeprom;
+
 pub const Port = uapi.Port;
 pub const Duplex = uapi.Duplex;
 pub const MdiX = uapi.MdiX;
@@ -268,6 +300,63 @@ test "live: LINKSTATE_GET on a real interface (unprivileged)" {
         // ext_state only means anything on a link that is down.
         if (up) try testing.expect(st.ext_state == null);
     }
+}
+
+test "live: the offline encoder's bytes are a request this kernel answers" {
+    // The other half of the "one encoder per operation" property. `client.zig`
+    // asserts against its own source that it holds no second copy of the
+    // request frame; this asserts the *first* copy is real — the bytes
+    // `buildLinkState` returns are put on the client's own socket, unmodified,
+    // and the kernel answers them with the same device the typed method got.
+    //
+    // (What the typed method actually writes to the fd is not observable from
+    // a test: `Socket.send` always addresses the kernel, so there is no way to
+    // loop a request back and read it.)
+    var et = try openOrSkip();
+    defer et.close();
+    var buf: [uapi.ifnamesize]u8 = undefined;
+    const dev = try targetOrSkip(&buf);
+    const gpa = testing.allocator;
+
+    const via_method = et.linkState(dev) catch |e| switch (e) {
+        error.NotSupported, error.NoSuchDevice, error.InvalidRequest => return skip("LINKSTATE_GET on this device"),
+        error.AccessDenied => return skip("LINKSTATE_GET (needs privilege here)"),
+        else => return e,
+    };
+
+    const seq = et.sock.nextSeq();
+    const msg = try buildLinkState(gpa, et.family_id, seq, dev);
+    defer gpa.free(msg);
+    try et.sock.send(msg);
+
+    var via_bytes: ?LinkState = null;
+    // Generous, finite: the answer is one family message plus an ACK.
+    var datagrams: u8 = 0;
+    outer: while (datagrams < 8) : (datagrams += 1) {
+        const dgram = try et.sock.recvDatagram();
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (try it.next()) |m| {
+            if (m.pid != et.sock.portid or m.seq != seq) continue;
+            switch (m.type) {
+                codec.NLMSG_ERROR => {
+                    if ((try m.errorCode()) != 0) return skip("the kernel refused the encoded LINKSTATE_GET");
+                    break :outer;
+                },
+                codec.NLMSG_DONE => break :outer,
+                else => {
+                    if (m.type != et.family_id) continue;
+                    const p = try genl.splitPayload(m.payload);
+                    via_bytes = try link.parseLinkState(p.attrs);
+                },
+            }
+        }
+    }
+
+    // Device identity is the stable half — carrier state may flap between the
+    // two round trips, the interface it is about may not.
+    try testing.expect(via_bytes != null);
+    try testing.expectEqualStrings(via_method.device.name(), via_bytes.?.device.name());
+    try testing.expectEqual(via_method.device.index, via_bytes.?.device.index);
 }
 
 test "live: LINKMODES_GET decodes in BOTH bitset encodings, and they agree" {

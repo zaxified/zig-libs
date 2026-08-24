@@ -53,6 +53,16 @@ sequence the capture used). `nlmsg_pid` needs no special handling — `ethtool`,
 like this module, writes 0 and lets the kernel fill it in. Everything else,
 including attribute order and padding, is a plain byte compare.
 
+Each of those tests drives this module's own public request encoder (§2.1a) —
+the same `buildX` the client method calls — so the capture is compared against
+what an `Ethtool` actually puts on the wire, not against a re-spelling of it
+in the test. `FEATURES_SET` is the exception, for the reason §2.1a gives.
+Encoder shapes `ethtool` never sends (a SET keyed by bit index, a *device's*
+string sets, `PAUSE_GET` with `ETHTOOL_FLAG_STATS`, `MODULE_GET`) have no
+capture to compare against and are decoded back with this module's own
+primitives instead, asserting the optional attributes that must be **absent**
+as well as those present.
+
 One encoder was reordered to keep that compare plain: `appendLinkModesSet`
 emits speed → duplex → autoneg, which is the order `ethtool -s` uses. Netlink
 attaches no meaning to attribute order; matching the reference tool turns a
@@ -201,6 +211,29 @@ here). `genetlink` deliberately stops before multicast-group resolution, so
 the `CTRL_ATTR_MCAST_GROUPS` walk lives here as a pure function
 (`client.findMcastGroupId`) — the same extension point `nl80211` documents. If
 a third family needs it, that is the code to promote.
+
+### 2.1a One encoder per operation, and it is public
+
+Building a request and performing it are separate steps, and only the second
+needs a socket. Each request-performing `Ethtool` method has a matching
+`buildX` function in the topic module next to the attribute appenders it uses
+(`link.buildLinkModes`, `params.buildSetRings`, `stats.buildStringSet`, …),
+re-exported flat from the root. It takes the family id and sequence number —
+the two runtime facts the socket owns — and returns the complete datagram, so
+a caller with its own transport gets exactly the bytes this module would send.
+
+The *invariant* is the point: the client method **calls** that encoder and
+sends what it returns. There is no second spelling of any operation's message,
+and the `nlmsghdr`+`genlmsghdr` frame they share is written once, in
+`header.beginRequest`/`header.finishRequest`. `client.zig` carries a test that
+asserts against its own source text that the frame has not been re-inlined
+there — a re-inlined copy would compile and would pass every byte test, since
+the encoders would still be correct, so no value-level assertion can catch it.
+
+One request shape differs from what the `ethtool` binary sends, deliberately
+and unchanged here: `FEATURES_SET` goes out with no header flags, where
+`ethtool -K` sets `ETHTOOL_FLAG_COMPACT_BITSETS`. Both are valid; this module
+reads the verbose `FEATURES_SET_REPLY`. `goldens.zig` pins the difference.
 
 ### 2.2 Bitsets: three rules, all learned from bytes
 

@@ -201,6 +201,32 @@ pub fn appendGroupSelector(
     try bitset.appendNameList(gpa, list, uapi.STATS.GROUPS, names);
 }
 
+/// What the `build*` encoders can fail with.
+pub const BuildError = Error || header.Error;
+
+/// Encode a complete `ETHTOOL_MSG_STATS_GET` request — `nlmsghdr`,
+/// `genlmsghdr`, header nest and group selector, owned by the caller and freed
+/// with `gpa`. An empty `groups` omits the selector entirely, which is what
+/// asks for the driver's default set. `Ethtool.stats` sends exactly this.
+pub fn buildStats(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: header.Target,
+    groups: []const []const u8,
+) BuildError![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.STATS_GET,
+        .seq = seq,
+    });
+    try header.append(gpa, &msg, uapi.STATS.HEADER, .{ .target = target });
+    if (groups.len != 0) try appendGroupSelector(gpa, &msg, groups);
+    return header.finishRequest(gpa, &msg, h);
+}
+
 /// The standard group names, in `ETHTOOL_A_STATS_GROUPS` bit order. Asserted
 /// against a captured `ETH_SS_STATS_STD` reply in `goldens.zig`, so this table
 /// cannot drift from the kernel silently.
@@ -356,6 +382,33 @@ pub fn appendStringSetSelector(
         codec.nestEnd(list, one);
     }
     codec.nestEnd(list, sets);
+}
+
+/// Encode a complete `ETHTOOL_MSG_STRSET_GET` request. A null `target` sends
+/// the **empty** header nest the device-independent sets are asked for with —
+/// not an omitted header, which the kernel's policy rejects. `Ethtool.stringSet`
+/// sends exactly this.
+pub fn buildStringSet(
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    seq: u32,
+    target: ?header.Target,
+    ids: []const uapi.StringSetId,
+) header.Error![]u8 {
+    var msg: std.ArrayList(u8) = .empty;
+    errdefer msg.deinit(gpa);
+    const h = try header.beginRequest(gpa, &msg, .{
+        .family_id = family_id,
+        .cmd = uapi.MSG.STRSET_GET,
+        .seq = seq,
+    });
+    if (target) |t| {
+        try header.append(gpa, &msg, uapi.STRSET.HEADER, .{ .target = t });
+    } else {
+        try header.appendGlobal(gpa, &msg, uapi.STRSET.HEADER, 0);
+    }
+    try appendStringSetSelector(gpa, &msg, ids);
+    return header.finishRequest(gpa, &msg, h);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
