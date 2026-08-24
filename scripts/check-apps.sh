@@ -34,17 +34,25 @@
 #
 #   scripts/check-apps.sh            # every app, against the tree
 #   scripts/check-apps.sh ssh-demo   # just one
+#   scripts/check-apps.sh --run      # build, then RUN each app's smoke.sh
 #   scripts/check-apps.sh --pinned   # every app, through its pin (tag refs only)
+#
+# ⭐ `--run` is the difference between "it compiles" and "it works". The gate
+# over `modules/<m>/example/` used to only compile too, and the day it started
+# running them, one pass found 22 that did not work. These are whole programs
+# with sockets and key files, so the same gap is wider here, not narrower.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 PINNED=0
+RUN=0
 ARGS=()
 for a in "$@"; do
     case "$a" in
         --pinned) PINNED=1 ;;
+        --run) RUN=1 ;;
         -*) echo "check-apps: unknown option '$a'" >&2; exit 2 ;;
         *) ARGS+=("$a") ;;
     esac
@@ -82,6 +90,23 @@ for d in example-apps/*/; do
         echo "check-apps: example-apps/README.md's table does not link example-apps/$n/ — an app nobody lists is an app nobody finds" >&2
         fail=1
     }
+done
+[ $fail -eq 0 ] || exit 1
+
+# Every app ships a `smoke.sh` that runs it. Required unconditionally, not just
+# under `--run`: an app whose only proof is that it compiles is exactly the
+# state this directory was in before, and a missing script would otherwise be
+# discovered as "nothing ran" — which reads identical to "everything passed".
+for d in example-apps/*/; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    if [ ! -f "$d/smoke.sh" ]; then
+        echo "check-apps: example-apps/$n has no smoke.sh — an app that is only compiled is not an app that works" >&2
+        fail=1
+    elif [ ! -x "$d/smoke.sh" ]; then
+        echo "check-apps: example-apps/$n/smoke.sh is not executable" >&2
+        fail=1
+    fi
 done
 [ $fail -eq 0 ] || exit 1
 
@@ -165,4 +190,23 @@ if [ "$PINNED" = 1 ]; then
     echo "check-apps: ${#WANT[@]} app(s) built through their pins"
 else
     echo "check-apps: ${#WANT[@]} app(s) built against the working tree"
+fi
+
+# ── running them ──────────────────────────────────────────────────────────
+#
+# Deliberately AFTER every build: a red smoke test on app one should not hide
+# a compile error in app three, and the builds are the cheaper half.
+#
+# Not combined with `--pinned`, which is about the package export rather than
+# about behaviour — the binaries are the same content on a tag ref, so running
+# them twice would buy nothing.
+if [ "$RUN" = 1 ]; then
+    for n in "${WANT[@]}"; do
+        echo "check-apps: running example-apps/$n/smoke.sh"
+        if ! ( cd "example-apps/$n" && ./smoke.sh ); then
+            echo "check-apps: $n's smoke test FAILED — the app builds but does not work." >&2
+            exit 1
+        fi
+    done
+    echo "check-apps: ${#WANT[@]} app(s) ran their smoke tests"
 fi

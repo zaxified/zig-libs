@@ -829,8 +829,14 @@ jobs:
       # written against the tree, so the pin is never what fails here: red means
       # this commit broke a published API, and a consumer would meet it one
       # release later.
-      - name: example-apps against this commit
-        run: bash scripts/check-apps.sh
+      #
+      # ⭐ `--run` then RUNS each app: sockets, key files, HTTP requests, a
+      # three-process MLS session. Compiling an app proves that its imports
+      # resolve, which is the smaller half. The gate over `modules/<m>/example/`
+      # was compile-only too, and the day it started running them one pass found
+      # 22 that did not work.
+      - name: example-apps built and run against this commit
+        run: bash scripts/check-apps.sh --run
       # ⭐ THE DOWNLOADER'S PATH, and it exists only on a tag ref.
       #
       # The step above substitutes the working tree for the pinned dependency,

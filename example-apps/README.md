@@ -47,10 +47,17 @@ against T.
 Both checks are arranged from outside the app, so its manifest stays the
 customer's:
 
-1. **Every run**, `scripts/check-apps.sh` builds each app with `zig build
-   --fork=../..`, which substitutes this working tree for the pinned dependency.
-   Red here means this commit broke a published API — the signal a consumer
-   would otherwise get one release later. Blocking.
+1. **Every run**, `scripts/check-apps.sh --run` builds each app with `zig build
+   --fork=../..`, which substitutes this working tree for the pinned dependency,
+   and then **runs** it: each app ships a `smoke.sh` that starts the program and
+   asserts on what it does. Red on the build means this commit broke a published
+   API — the signal a consumer would otherwise get one release later. Red on the
+   smoke test means the app compiles and does not work, which is the failure a
+   compile-only gate cannot see: the gate over `modules/<name>/example/` was
+   compile-only too, and one pass after it started running them found 22 that
+   did not work. Blocking, and an app without an executable `smoke.sh` is
+   rejected — an app whose only proof is that it compiles is the state this
+   directory used to be in.
 2. **On a tag ref**, `scripts/check-apps.sh --pinned` builds each app from its
    manifest as written: fetch by URL and hash, compile the exported package.
    On a tag the pin and the commit under test are the same content, so this is
@@ -99,3 +106,13 @@ there is. If such an app is added here, this is the section to revisit.
 4. Open the README with the download command for that one directory, naming the
    same tag. `scripts/tag.sh` rewrites it with the pin and `check-apps.sh` fails
    if the two ever disagree.
+5. Write `smoke.sh`: start the app and assert on what it does, exit 0 or 1.
+   Required — `check-apps.sh` refuses an app without one. Wait on the program's
+   own output rather than on a fixed `sleep`, pick an ephemeral port per run,
+   give the script a watchdog, and print every process's log on failure. Each
+   of those is a lesson from writing the three that exist: a `sleep` is either
+   flaky or slow, a fixed port collides with the previous run's `TIME_WAIT`, and
+   a readiness probe that opens a socket IS a client — it consumed the single
+   connection `ssh-demo --once` had to give.
+6. Add a row to the table at the top of this file. `check-apps.sh` fails on an
+   app the catalogue does not list.
