@@ -607,6 +607,18 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   Running the matrix over `main` by hand BEFORE asking for the tag (`workflow_dispatch`,
   lane `all`) is prudence, not policy: it costs one run and turns a withdrawal into a
   non-event. It is also what warms the cache the tag run then hits — see `ci.yml`.
+
+  **The tag message carries the BIG CHANGES since the previous tag** (owner, 2026-08-24),
+  and the Release repeats them at the top, because that is the one question a reader of a
+  dated tag actually has: *what moved since the last one?* Not a commit-by-commit list —
+  the per-module `CHANGELOG.md` files are that — but the handful of things worth naming:
+  new modules, a campaign that touched everything, a defect class closed, an API that
+  moved. ⚠ **Any number in it is a claim and gets counted, not estimated.** The
+  `2026-08-24` message said "5 commits over 2026-08-19" when the range held **143**: it
+  counted the commits made on the day of the tag instead of `git rev-list --count
+  <prev>..<new>`. A tag message cannot be edited afterwards without deleting and re-cutting
+  the tag, so that one is corrected in its Release notes and stands as the reason this
+  sentence exists.
   The tag asserts exactly that and nothing more: *every module passed every lane here*.
   There are no per-module version numbers and no collection-wide semantic version.
   **Why the Debug lane compiles and does not test.** `heavy_optimize` in `build.zig`

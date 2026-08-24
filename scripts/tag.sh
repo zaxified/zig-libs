@@ -240,11 +240,30 @@ if [ "${dry_run:-0}" != 1 ]; then
     head_sha="$(git rev-parse HEAD)"
 fi
 
+# ⚠ THE DEFAULT MESSAGE IS A FLOOR, NOT A TEMPLATE TO SHIP AS-IS. CONVENTIONS
+# §8: a tag message carries the BIG CHANGES since the previous tag, because
+# that is the question a reader of a dated tag has. This script cannot write
+# those -- it can count, and counting is the half that goes wrong: the
+# `2026-08-24` message claimed "5 commits over 2026-08-19" where the range held
+# 143, having counted the day's commits instead of the range. So the count
+# below is computed, and the prose is left to whoever cuts the tag.
+prev_tag="$(git tag -l '20*' --sort=-v:refname | grep -v "^$tag\$" | head -1)"
+if [ -n "$prev_tag" ]; then
+    n_commits="$(git rev-list --count "$prev_tag..HEAD")"
+    range_line="Cut at $head_sha, $n_commits commits over $prev_tag."
+else
+    range_line="Cut at $head_sha."
+fi
+
 git tag -a "$tag" -m "$tag
 
-Every module passed every release lane at $head_sha: ReleaseSafe and
+$range_line Every module passed every release lane: ReleaseSafe and
 ReleaseFast, and compiled in strict Debug. That is the whole claim — this
 is a dated snapshot of the collection, not a semantic version. Per-module
-changes are in each module's CHANGELOG; see CONVENTIONS §8."
+changes are in each module's CHANGELOG; see CONVENTIONS §8.
+
+WHAT CHANGED SINCE $prev_tag: <<< fill this in before pushing -- CONVENTIONS §8.
+New modules, campaigns that touched everything, defect classes closed, APIs that
+moved. Any number here is a claim: count it, do not estimate it. >>>"
 
 echo "tag.sh: created '$tag'. Not pushed — that is the owner's call."
