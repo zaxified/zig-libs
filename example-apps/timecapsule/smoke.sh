@@ -107,4 +107,19 @@ if "$BIN" open --key alice.sk --in future.tc --out x "${OFFLINE[@]}" --round-fil
     fail "a past round's signature opened a future capsule"
 fi
 
+# ── 5. --wait blocks while the source has nothing, opens when it appears ────
+# The signature "publishes" by the round file appearing 2 s in — the same
+# poll loop that watches the beacon watches the file, so this is the wait
+# path minus the network, which CI does not get.
+rm -f pending.json waited.out
+( "$BIN" open --key alice.sk --in msg.tc --out waited.out "${OFFLINE[@]}" --round-file pending.json --wait \
+      > wait.log 2>&1; echo "$?" > wait.rc ) &
+WAITER=$!
+sleep 2
+cp round1000.json pending.json
+wait "$WAITER"
+[ "$(cat wait.rc)" = 0 ] || fail "open --wait exited $(cat wait.rc) (log: $(cat wait.log))"
+grep -q "waiting — round 1000" wait.log || fail "open --wait never announced it was waiting — did it wait at all?"
+cmp -s msg.txt waited.out || fail "--wait plaintext differs"
+
 echo "smoke: OK"

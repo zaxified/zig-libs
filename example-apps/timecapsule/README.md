@@ -48,7 +48,10 @@ echo "the eagle lands at midnight" > msg.txt
 Run `open` before the two minutes are up and it prints when the capsule
 unlocks and exits with status **3** (distinct from an error's 1, so a cron
 job can tell "not yet" from "never"). Run it after, and the plaintext is
-back. `info --in msg.tc` shows the round and the unlock time without
+back. Or skip the cron entirely: `open --wait` sleeps until the round's
+publish time and then polls the source — the beacon, or `--round-file` —
+until the signature appears, which turns the whole dead-man switch into one
+blocking command. `info --in msg.tc` shows the round and the unlock time without
 touching a key. `--at` also takes `@<unix>` and `round:<n>`.
 
 `init.sh` needs Zig 0.16.0 on `PATH` and installs nothing for you.

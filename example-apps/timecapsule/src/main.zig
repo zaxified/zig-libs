@@ -46,6 +46,10 @@ const usage =
     \\                       fetching it — offline use, or a pinned trust root
     \\  --round-file <file>  (open) read the /public/<round> document from a
     \\                       file instead of fetching it
+    \\  --wait               (open) instead of exiting 3 while locked, sleep
+    \\                       until the round's publish time and keep polling
+    \\                       the source (the beacon, or --round-file) until
+    \\                       the signature appears — then open
     \\
     \\Exit status: 0 done · 1 error · 3 capsule still locked (round not
     \\published yet; `open`/`info` print when it will be).
@@ -223,9 +227,12 @@ fn open(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
     var out_path: ?[]const u8 = null;
     var chain_info_path: ?[]const u8 = null;
     var round_file: ?[]const u8 = null;
+    var wait = false;
     var base: []const u8 = beacon.default_base_url;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--key")) {
+        if (std.mem.eql(u8, arg, "--wait")) {
+            wait = true;
+        } else if (std.mem.eql(u8, arg, "--key")) {
             key_path = try nextValue(args, "--key");
         } else if (std.mem.eql(u8, arg, "--in")) {
             in_path = try nextValue(args, "--in");
@@ -268,22 +275,47 @@ fn open(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
         return failure_exit;
     }
 
-    // Fetch (or load) the round's signature. A 404 is the time lock holding.
-    const round_json = beacon.roundDoc(gpa, io, round_file, base, cap.round) catch |err| switch (err) {
-        error.RoundNotPublished => {
+    // Fetch (or load) the round's signature. A 425/404 is the time lock
+    // holding; with --wait, so is a --round-file that does not exist yet.
+    var announced = false;
+    const round_json = while (true) {
+        const doc = beacon.roundDoc(gpa, io, round_file, base, cap.round) catch |err| {
+            const pending = err == error.RoundNotPublished or
+                (wait and round_file != null and err == error.FileNotFound);
+            if (!pending) {
+                std.debug.print("timecapsule: fetching round {d} failed: {t}\n", .{ cap.round, err });
+                return failure_exit;
+            }
             const unlock_at = beacon.publishTime(&info, cap.round);
-            var when_buf: [40]u8 = undefined;
-            std.debug.print("timecapsule: still locked — round {d} publishes {s} ({d}s from now)\n", .{
-                cap.round,
-                beacon.formatUtc(&when_buf, unlock_at),
-                @max(unlock_at - beacon.wallNow(), 0),
-            });
-            return locked_exit;
-        },
-        else => {
-            std.debug.print("timecapsule: fetching round {d} failed: {t}\n", .{ cap.round, err });
-            return failure_exit;
-        },
+            const remaining = @max(unlock_at - beacon.wallNow(), 0);
+            if (!wait) {
+                var when_buf: [40]u8 = undefined;
+                std.debug.print("timecapsule: still locked — round {d} publishes {s} ({d}s from now)\n", .{
+                    cap.round,
+                    beacon.formatUtc(&when_buf, unlock_at),
+                    remaining,
+                });
+                return locked_exit;
+            }
+            if (!announced) {
+                var when_buf: [40]u8 = undefined;
+                std.debug.print("timecapsule: waiting — round {d} publishes {s} ({d}s from now)\n", .{
+                    cap.round,
+                    beacon.formatUtc(&when_buf, unlock_at),
+                    remaining,
+                });
+                announced = true;
+            }
+            // One long sleep to just short of the publish time, then poll on
+            // the beacon's own cadence. Chunked so a Ctrl+C lands promptly.
+            const step_s: u64 = if (remaining > 5)
+                @min(@as(u64, @intCast(remaining - 2)), 60)
+            else
+                @max(info.period_seconds, 2);
+            io.sleep(.fromMilliseconds(@intCast(step_s * 1000)), .awake) catch return failure_exit;
+            continue;
+        };
+        break doc;
     };
     defer gpa.free(round_json);
 
