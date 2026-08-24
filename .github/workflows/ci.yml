@@ -53,10 +53,14 @@ on:
         default: all
         options:
           - all
-          - ReleaseSafe amd64
-          - ReleaseFast amd64
-          - strict Debug amd64 (compile only)
-          - ReleaseSafe arm64
+          - checks
+          - modules ReleaseSafe amd64
+          - modules ReleaseFast amd64
+          - modules ReleaseSafe arm64
+          - compile-only strict Debug amd64
+          - examples ReleaseSafe amd64
+          - examples ReleaseFast amd64
+          - examples ReleaseSafe arm64
 
 # Least privilege. The gate reads the repository and nothing else — it opens no
 # issue, pushes no tag, publishes no package — so saying so here means a
@@ -353,6 +357,19 @@ jobs:
       matrix: ${{ steps.lanes.outputs.matrix }}
       selected: ${{ steps.lanes.outputs.selected }}
     steps:
+      # ⭐ LANE 0. The sub-second checks run HERE, before the matrix exists,
+      # because every other job in this workflow waits on this one's output —
+      # so a stray `zig fmt` costs a minute instead of eight runners spending
+      # an hour each on work nobody will read. Twelve steps, 4.9 s measured on
+      # 2026-08-24; the expensive checks are their own lane, off the critical
+      # path. That is the whole trade: 4.9 s serial to save eight runner-hours
+      # on the days it fires.
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: The sub-second gates, before anything expensive starts
+        run: bash scripts/test.sh checks-fast
       - name: Choose the lanes
         id: lanes
         env:
@@ -361,41 +378,114 @@ jobs:
           WANT: ${{ inputs.lane || 'all' }}
         run: |
           set -euo pipefail
+          # ⭐ EIGHT LANES, AND THE SPLIT IS NOT A PREFERENCE. Until 2026-08-24
+          # four lanes each ran the WHOLE gate, and the ReleaseFast one cleared
+          # its 90-minute cap by 23 SECONDS (5245.8 s of gate under a 5400 s
+          # ceiling). The cap is not going up, so the work came apart — and it
+          # comes apart cleanly, because the halves share no compilation: a
+          # module is compiled once for its test binary and once for its
+          # example, and Zig's unit of caching is the whole compilation.
+          # Measured: examples cold 2.07 s, examples after the tests 1.80 s;
+          # tests cold 23.24 s, tests after the examples 23.44 s. Splitting
+          # duplicates nothing; it spreads the same work over idle runners.
+          #
+          # Measured content of one lane (ReleaseSafe amd64, run 32704842728):
+          #   once-only checks     76 s   -> `checks`
+          #   check-pubfn-reach    83 s   -> stays per-arch, inside `modules`
+          #   examples           1442 s   -> `examples`
+          #   modules + tests    2144 s   -> `modules`
+          #
+          # ⚠ `check-pubfn-reach` is NOT in the `checks` lane. It instantiates
+          # every `pub fn` for the target being BUILT, which is exactly how the
+          # arm64 lane found x86 inline asm in `montint` on 2026-08-24. Run it
+          # once and that class goes unseen on three lanes out of four.
           lanes=()
-          lanes+=('{"name":"ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"all","cachekey":"relsafe","cache":true,"runner":"ubuntu-26.04"}')
-          lanes+=('{"name":"ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"all","cachekey":"relfast","cache":true,"runner":"ubuntu-26.04"}')
-          # ⚠ `build`, NOT `all` — this lane COMPILES every module in real Debug
-          # and runs no test, and that is the whole claim it can support. Nobody
-          # consumes this collection in Debug: it ships source, and the mode is
-          # the integrator's decision. What is worth asking of Debug is that the
-          # code compiles there, which is a live question, because an integrator
-          # developing against these modules does build them in Debug -- heavy
-          # ones included, and this is the only lane that ever compiles those in
-          # real Debug at all.
+          # Everything mode- and arch-independent, once for the whole matrix:
+          # the tables, the catalog, `check-portable` (which cross-compiles from
+          # wherever it runs), the ctgrind harnesses, the sizeprobe.
+          lanes+=('{"name":"checks","args":"","cmd":"checks","cachekey":"checks","cache":false,"runner":"ubuntu-26.04","peers":false,"tc":false,"timeout":15,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"modules","cachekey":"mod-relsafe","cache":true,"runner":"ubuntu-26.04","peers":true,"tc":true,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"modules","cachekey":"mod-relfast","cache":true,"runner":"ubuntu-26.04","peers":true,"tc":true,"timeout":90,"skip_live":""}')
+          # ONE arm64 pair, not three. What a second architecture buys is
+          # portability coverage -- alignment and endianness assumptions,
+          # atomics, and the asm-vs-fallback dispatch -- and none of that varies
+          # by optimize mode, so the other modes would mostly recompile the same
+          # surface. ReleaseSafe is the mode chosen because it is the one that
+          # has already caught a real defect here. The day this lane fails
+          # something the amd64 ReleaseSafe lane passes, add the others rather
+          # than arguing about it.
+          #
+          # ⚠ ITS cachekey CARRIES NO ARCHITECTURE. The arch is in the key
+          # template already (see the cache step), and carrying it here as well
+          # is what made this entry's key an extension of the amd64 lane's
+          # restore prefix — which is how an amd64 job came to restore an
+          # aarch64 object tree.
+          #
+          # ⚠ `skip_live` exists for exactly one peer. open62541 publishes no
+          # arm64 image, so `opcua`'s container runs EMULATED here: 565.8 s
+          # against 56.9 s on amd64 on 2026-08-24, for a suite that skips 7 of
+          # its own tests on that host anyway. "Our client interoperates with
+          # open62541" is not an architecture-dependent claim, and amd64 makes
+          # it in a minute. The skip prints a line every time it happens.
+          lanes+=('{"name":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"modules","cachekey":"mod-relsafe","cache":true,"runner":"ubuntu-26.04-arm","peers":true,"tc":true,"timeout":90,"skip_live":"opcua"}')
+          # ⚠ `build`, NOT `modules` — this lane COMPILES every module and every
+          # example in real Debug and RUNS NOTHING, and that is the whole claim
+          # it can support. Nobody consumes this collection in Debug: it ships
+          # source, and the mode is the integrator's decision. What is worth
+          # asking of Debug is that the code compiles there, which is a live
+          # question, because an integrator developing against these modules
+          # does build them in Debug -- heavy ones included, and this is the only
+          # lane that ever compiles those in real Debug at all.
           #
           # Running the tests here proved nothing measurable. Debug and
           # ReleaseSafe arm the same safety checks; Debug merely does not
           # optimise, which makes it weaker at exposing UB, and the one
           # documented cross-mode catch went the other way. Tests that run only
-          # in Debug: zero. Tests that SKIP in Debug: fifteen, so this lane gave
-          # 48/63 where its siblings gave 63/63. See `cmd_build` in
-          # scripts/test.sh for the measurement.
-          lanes+=('{"name":"strict Debug amd64 (compile only)","args":"-Dstrict-debug","cmd":"build","cachekey":"strictdebug","cache":false,"runner":"ubuntu-26.04"}')
-          # ONE arm64 lane, not three. What a second architecture buys is
-          # portability coverage -- alignment and endianness assumptions,
-          # atomics, and the asm-vs-fallback dispatch above -- and none of that
-          # varies by optimize mode, so the other two would mostly recompile the
-          # same surface. ReleaseSafe is the mode chosen because it is the one
-          # that has already caught a real defect here. The day this lane fails
-          # something the amd64 ReleaseSafe lane passes, add the other two rather
-          # than arguing about it.
+          # in Debug: zero. Tests that SKIP in Debug: fifteen. See `cmd_build`
+          # in scripts/test.sh.
+          lanes+=('{"name":"compile-only strict Debug amd64","args":"-Dstrict-debug","cmd":"build","cachekey":"strictdebug","cache":false,"runner":"ubuntu-26.04","peers":false,"tc":false,"timeout":30,"skip_live":""}')
+          # BOTH release modes run the examples, and that is deliberate: the two
+          # catch different classes and both are documented here. ReleaseFast is
+          # where `qrscan`'s uninitialised perspective terms showed (Debug and
+          # ReleaseSafe fill `undefined` with 0xaa, which read as a float is
+          # near enough to zero to pass every downstream check) and where a
+          # `std.debug.assert` guard compiles out and puts two headers on the
+          # wire. ReleaseSafe is where a use-after-scope in http's response path
+          # showed while both other modes passed it by luck. An example is a
+          # real consumer binary, so it is where those classes surface.
           #
-          # ⚠ ITS cachekey IS `relsafe`, NOT `relsafe-arm64`. The architecture is
-          # in the key template already (see the cache step), and carrying it
-          # here as well is what made this entry's key an extension of the amd64
-          # lane's restore prefix — which is how an amd64 job came to restore an
-          # aarch64 object tree.
-          lanes+=('{"name":"ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"all","cachekey":"relsafe","cache":true,"runner":"ubuntu-26.04-arm"}')
+          # arm64 runs them too: aarch64 has a weaker memory model than x86, and
+          # a store-store reordering bug in `workerpool`/`jobqueue`/`lockfree`
+          # can only appear by RUNNING there. No such defect is on record here
+          # yet; the lane costs a runner, not wall-clock.
+          #
+          # ⭐ CACHED, LIKE EVERY OTHER LANE, and the number that settles it was
+          # measured the same day this file was split. An EXACT key hit (2834 MB
+          # restored) took `build (all modules)` from 1944.2 s to 326.9 s and
+          # the whole lane from 3768.9 s to 964.0 s. Warm is worth four fifths
+          # of a lane, so no lane gives it up voluntarily.
+          #
+          # ⚠ WHAT DECIDES WHETHER IT HITS is not the mode, it is the REF. The
+          # full matrix runs on tags and dispatch; GitHub scopes cache entries
+          # by ref and lets any ref read the DEFAULT branch's. So a tag run hits
+          # exactly when a run over `main` has already written that key -- which
+          # is why the 2026-08-24 tag was warm (the dispatch an hour earlier
+          # wrote it, and the pin commit changed nothing `hashFiles` looks at)
+          # while the dispatch itself was stone cold on three lanes out of four.
+          # Populate over `main` before tagging, or expect the cold numbers.
+          #
+          # ⚠ AND A STALE HIT IS NOT A WARM ONE. On the same day a restore-key
+          # fallback onto a six-day-old entry left `build (all modules)` at
+          # 2598 s -- slower than the cold lane beside it.
+          #
+          # ⚠ THE QUOTA IS 10 GB PER REPO, LRU. Eight lanes at 1-3 GB do not all
+          # fit, so entries evict each other and a lane going cold is normal
+          # rather than a defect. That is survivable only because the lanes are
+          # split: a cold `modules` lane is ~50 minutes against a 90-minute cap,
+          # where the unsplit lane cleared it by 23 seconds.
+          lanes+=('{"name":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe","cache":true,"runner":"ubuntu-26.04","peers":true,"tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"examples","cachekey":"ex-relfast","cache":true,"runner":"ubuntu-26.04","peers":true,"tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe","cache":true,"runner":"ubuntu-26.04-arm","peers":true,"tc":false,"timeout":60,"skip_live":""}')
 
           sel=$(printf '%s\n' "${lanes[@]}" | jq -s -c --arg want "$WANT" \
             '[ .[] | select($want == "all" or .name == $want) ]')
@@ -422,7 +512,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    name: full — ${{ matrix.name }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     # ⭐ A CEILING WE CHOOSE, instead of the one GitHub imposes. Twice — on
     # 2026-08-14 and again on 2026-08-15 — a single wedged test held every lane
@@ -435,7 +525,13 @@ jobs:
     # thought of as doing so. A job timeout says "something here never
     # finished"; the per-test deadline says WHICH test. The first is a
     # backstop, the second is a diagnosis.
-    timeout-minutes: 90
+    #
+    # ⭐ PER LANE SINCE 2026-08-24, because the lanes are no longer the same
+    # size. 90 stays for the `modules` lanes -- the ReleaseFast one measured
+    # 5245.8 s while it still carried the examples, and 90 is not going up.
+    # A `checks` lane that has not finished in 15 minutes is stuck, and saying
+    # so in 15 rather than 90 is a large part of why it was split out.
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - uses: actions/checkout@v7
       # ⚠ THE ONE ACTION STILL ON NODE 20, and not for want of bumping: v2.2.1
@@ -552,7 +648,12 @@ jobs:
         # open62541 container, two Python servers — and that lane runs no test
         # at all. Measured on 2026-08-15: 26 s of a 271 s lane spent installing
         # things nothing would touch.
-        if: matrix.cmd != 'build'
+        # ⚠ KEYED ON WHETHER THE LANE RUNS ANYTHING, not on which lane it is.
+        # The compile-only lane died on error.PythonPeerFailed on 2026-08-24
+        # under the old spelling of this condition, because it was running
+        # examples it had declared it would not run. `peers` says what the lane
+        # needs; the lane table says whether it runs anything at all.
+        if: matrix.peers
         # ⚠ SHARED WITH THE `scoped` JOB, deliberately. This was inline here
         # until 2026-08-15, which is precisely why the lane that gates every
         # push had none of it. Two copies of an install list drift; one script
@@ -564,6 +665,9 @@ jobs:
           # Names this lane's block on the run's summary page, where the four
           # digests land side by side instead of in four downloadable logs.
           ZIGLIBS_LANE: ${{ matrix.name }}
+          # Empty for every lane but one; the lane table says which peer and
+          # why. `run_modules` prints a line whenever it honours this.
+          ZIGLIBS_SKIP_LIVE: ${{ matrix.skip_live }}
         run: |
           # The imap peer is found at its default path; the opcua one is named
           # by an environment variable, so point it at the venv built above.
@@ -602,7 +706,9 @@ jobs:
         # skipping exactly as they always had. A step that exists to close a
         # coverage gap and cannot say whether it closed it is the same fail-open
         # shape it was written to fix.
-        if: matrix.cmd != 'build'
+        # Only where module TESTS run. The examples and checks lanes have no
+        # business paying for a root netns they never enter.
+        if: matrix.tc
         run: |
           sudo unshare -n "$(command -v zig)" build test-tc ${{ matrix.args }} \
             --summary all \

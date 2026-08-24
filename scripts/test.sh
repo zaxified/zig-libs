@@ -433,6 +433,24 @@ EXTRA_ZIG_ARGS=()
 # the hang findable; the test still has to be fixed.
 TEST_TIMEOUT="${TEST_TIMEOUT:-3m}"
 
+# RUN the examples of the given modules, ONCE, in this lane's optimize mode.
+# `check-examples` only compiles them, and compiling cannot see the class an
+# example exists to catch -- a dangling slice, a leak, a wrong-tag union read;
+# one sweep on 2026-08-23 found all three plus twelve examples that had never
+# run at all.
+run_examples_for() {
+    local -a run_targets=()
+    local m
+    for m in $1; do
+        [[ -f "modules/$m/example/main.zig" ]] && run_targets+=("run-example-$m")
+    done
+    [[ ${#run_targets[@]} -eq 0 ]] && return 0
+    ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples (${#run_targets[@]} modules)" \
+        zig build "${run_targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
+}
+
+ZL_RUN_EXAMPLES=1
+
 run_modules() {
     local mods="$1"
     [[ -z "${mods// /}" ]] && return 0
@@ -489,6 +507,21 @@ run_modules() {
     if [[ ${#live[@]} -gt 0 ]]; then
         local m
         for m in "${live[@]}"; do
+            # ⚠ ONE LANE IS ALLOWED TO OPT OUT OF ONE PEER, and it is named in
+            # the lane table rather than decided here. The case it exists for:
+            # open62541 publishes no arm64 image, so `opcua`'s container runs
+            # EMULATED on the arm64 lane — 565.8 s there against 56.9 s on
+            # amd64 on 2026-08-24, for a suite that skips 7 of its tests on
+            # that host anyway. "Our client interoperates with open62541" is
+            # not an architecture-dependent claim and amd64 makes it in a
+            # minute. Skipping is LOUD: the line below is the only place that
+            # says a live peer did not run, so it says it every time.
+            case " ${ZIGLIBS_SKIP_LIVE:-} " in
+                *" $m "*)
+                    echo "  live interop: $m SKIPPED on this lane (ZIGLIBS_SKIP_LIVE) — its peer runs elsewhere"
+                    continue
+                    ;;
+            esac
             step "live interop: $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
         done
     fi
@@ -512,13 +545,12 @@ run_modules() {
     # in one `zig build` too. The live modules' SERIAL rule is about their
     # tests, which hold a timed conversation with a real peer -- not about their
     # examples, which ran alongside everything else here before and still do.
-    local -a run_targets=()
-    for m in $mods; do
-        [[ -f "modules/$m/example/main.zig" ]] && run_targets+=("run-example-$m")
-    done
-    if [[ ${#run_targets[@]} -gt 0 ]]; then
-        ZL_STEP_STDERR_IS_OUTPUT=1 step "run-examples (${#run_targets[@]} modules)" zig build "${run_targets[@]}" "${EXTRA_ZIG_ARGS[@]}"
-    fi
+    # ⚠ NOT IN THE `modules` LANE. CI runs modules and examples as separate
+    # jobs (see ci.yml's lane table), because the two share no compilation:
+    # a module is compiled once for its test binary and once for its example,
+    # and Zig's unit of caching is the whole compilation. `changed` and `all`
+    # leave this on, since a developer wants one command.
+    (( ZL_RUN_EXAMPLES )) && run_examples_for "$mods"
 
     local log="$_ZL_KEEP_OUT"
     _ZL_KEEP_OUT=""
@@ -1295,40 +1327,42 @@ cmd_changed() {
 # ⚠ This is not a shortcut to make a slow lane fit. It is narrowing a lane to
 # the claim it can actually support. If a Debug-only test ever exists, this
 # stops being the right shape and the count above is how you would notice.
-cmd_build() {
-    GATE_BUILD_ONLY=1
-    cmd_all "$@"
+# ── the gate's phases, so CI can run them as separate jobs ────────────────
+#
+# ⭐ WHY THIS IS SPLIT AT ALL. The four lanes of the full matrix each ran the
+# whole gate, and on 2026-08-24 the ReleaseFast lane passed its 90-minute cap
+# by 23 SECONDS (5245.8 s of gate inside a 5400 s ceiling). The cap is not
+# going up, so the work has to come apart — and it comes apart cleanly, because
+# the halves share nothing: a module is compiled once for its test binary and
+# once for its example, and Zig's unit of caching is the whole compilation, so
+# there is no artifact for one to hand the other. Measured: examples cold
+# 2.07 s, examples after the tests 1.80 s; tests cold 23.24 s, tests after the
+# examples 23.44 s.
+#
+#   checks-fast   the sub-second ones, ~4 s. CI runs these BEFORE the lanes so
+#                 a stray `zig fmt` cannot burn eight runners for an hour.
+#   checks        the mode- and arch-independent rest, ~1-2 min, one job.
+#   modules       per-arch `check-pubfn-reach`, compile every module, test it.
+#   examples      compile every example in the lane's mode, run it.
+#
+# `all` still runs every phase in one process: that is what a local pre-commit
+# gate should be, and nothing about the split belongs in a developer's hands.
+
+# The first of the fast checks is `fmt`, and it stays spelled out at each call
+# site: `af6a148` is why the fmt step is first and why the hook exists -- six
+# files had drifted out of fmt, the gate stops on the first failure, and so NO
+# module was being tested locally at all. The hook stops that landing in a
+# commit -- but only while the hook itself works, which is what this checks.
+phase_checks_fast() {
+    step "fmt check" zig fmt --check build.zig build.zig.zon modules
+    phase_checks_fast_tail
 }
 
-GATE_BUILD_ONLY=0
-
-cmd_all() {
-    # Drop empty arguments rather than passing them on: main dispatches with
-    # "${rest[@]:-}", which expands an EMPTY array to one empty string, and
-    # `zig build ""` fails with `no step named ''`. Filtering here keeps this
-    # correct no matter how the caller quotes.
-    EXTRA_ZIG_ARGS=()
-    local a
-    for a in "$@"; do [[ -n "$a" ]] && EXTRA_ZIG_ARGS+=("$a"); done
-    # ⚠ The capability report answers "which TESTS will silently cover less on
-    # this host", so it has nothing to say about a run that executes none. In
-    # build-only mode it listed six gaps against a lane that could not have used
-    # any of them — noise shaped exactly like a coverage warning, which is the
-    # one thing that report must never be.
-    (( GATE_BUILD_ONLY )) || capability_check
-    graph_load
-    local all_mods="${G_NAMES[*]}"
-    local n=${#G_NAMES[@]}
-    if (( GATE_BUILD_ONLY )); then
-        echo "build: COMPILING every module ($n total) and running NO tests — see cmd_build for why"
-    else
-        echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — the pre-commit/CI gate"
-    fi
-    step "fmt check" zig fmt --check build.zig build.zig.zon modules
-    # `af6a148` is why the fmt step is first and why the hook exists: six files
-    # had drifted out of fmt, the gate stops on the first failure, and so NO
-    # module was being tested locally at all. The hook stops that landing in a
-    # commit -- but only while the hook itself works, which is what this checks.
+# Everything in here was measured at 0.0-1.3 s on 2026-08-24, twelve steps for
+# about four seconds in total. That is the whole reason they are a group: they
+# are cheap enough to run before anything expensive starts, which is what makes
+# them a fail-fast gate rather than one more thing to wait for.
+phase_checks_fast_tail() {
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
     step "tag.sh self-test" ./scripts/test-tag.sh
     step "check-ci-cache-keys" ./scripts/check-ci-cache-keys.sh
@@ -1337,13 +1371,133 @@ cmd_all() {
     step "check-catalog" zig build check-catalog
     step "check-uapi" zig build check-uapi
     step "check-changelog" zig build check-changelog
+    step "check-portable-table" zig build check-portable-table
+    step "check-libs-table" zig build check-libs-table
+    step "check-catalog-table" zig build check-catalog-table
+}
+
+# The rest of the checks: 76 s on amd64, 104 s on arm64, and NOT arch-dependent
+# in what they assert -- `check-portable` cross-compiles every `platform = .any`
+# module for 32-bit and wasm32 targets from wherever it runs, and the ctgrind
+# harnesses and the sizeprobe are compile-only. So one job runs them once for
+# the whole matrix.
+#
+# ⚠ `check-pubfn-reach` is deliberately NOT here. It instantiates every `pub fn`
+# for the target being built, which is exactly how the arm64 lane found x86
+# inline asm in `montint` on 2026-08-24 -- run it once and that class goes
+# unseen on three of four lanes. It lives in `modules`, per arch.
+phase_checks() {
     step "check-testonly" zig build check-testonly
     step "check-fuzz" zig build check-fuzz
     step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
-    step "check-portable-table" zig build check-portable-table
-    step "check-libs-table" zig build check-libs-table
-    step "check-catalog-table" zig build check-catalog-table
+    step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
+    step "check-ctgrind" zig build check-ctgrind
+}
+
+cmd_checks_fast() {
+    echo "checks-fast: the sub-second gates, before anything expensive starts"
+    phase_checks_fast
+    summary
+}
+
+cmd_checks() {
+    echo "checks: the mode- and arch-independent gates, once for the whole matrix"
+    phase_checks
+    summary
+}
+
+# The `modules` lane: every module compiled and tested in ONE optimize mode.
+# Examples are a separate lane; see the phase comment above for why that costs
+# nothing.
+cmd_modules() {
+    set_extra_args "$@"
+    capability_check
+    graph_load
+    local all_mods="${G_NAMES[*]}"
+    echo "modules: compiling and testing every module (${#G_NAMES[@]} total) — examples run in their own lane"
+    step "check-pubfn-reach" zig build check-pubfn-reach
+    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}"
+    ZL_RUN_EXAMPLES=0 run_modules "$all_mods"
+    graph_save
+    summary
+}
+
+# The `examples` lane: every example compiled in THIS lane's mode and run.
+# ⚠ It calls `capability_check` for a reason the modules lane does not share:
+# the blocker probe there is about an EXAMPLE's external judge (the websocket
+# example's Python peer), and this is the lane that would die without it.
+cmd_examples() {
+    set_extra_args "$@"
+    capability_check
+    graph_load
+    local all_mods="${G_NAMES[*]}"
+    echo "examples: compiling and running every module's example (${#G_NAMES[@]} modules)"
+    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
+    run_examples_for "$all_mods"
+    summary
+}
+
+# `main` dispatches with "${rest[@]:-}", which expands an EMPTY array to one
+# empty string, and `zig build ""` fails with `no step named ''`. Filtering
+# here keeps every caller correct no matter how it quotes.
+set_extra_args() {
+    EXTRA_ZIG_ARGS=()
+    local a
+    for a in "$@"; do [[ -n "$a" ]] && EXTRA_ZIG_ARGS+=("$a"); done
+    # ⚠ NOT DECORATION. The loop's last statement is an `&&` list, so with only
+    # empty arguments the loop -- and therefore this function -- returns 1, and
+    # under `set -e` the caller dies on the spot: `test.sh examples` printed the
+    # memory warning and exited 1 with nothing else to show. Inline in cmd_all
+    # this could not happen, because statements followed it.
+    return 0
+}
+
+# The compile-only lane. It runs NOTHING: no test, no example, no check that
+# belongs to another job. Its whole deliverable is "every module and every
+# example compiles in this mode", which is why CI skips its peer install --
+# and why `run-examples` sitting above the old build-only return was a defect
+# rather than a nicety: on 2026-08-24 this lane died on error.PythonPeerFailed,
+# having reached a Python peer it was configured never to have.
+cmd_build() {
+    GATE_BUILD_ONLY=1
+    set_extra_args "$@"
+    graph_load
+    local n=${#G_NAMES[@]}
+    echo "build: COMPILING every module ($n total) and every example, running NOTHING"
+    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}"
+    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
+    # This lane runs no test, so there is no `--summary all` to digest and
+    # nothing would land on the run's page. A lane that contributes NOTHING
+    # there reads as one that failed to report, not as one with nothing to
+    # report, and on 2026-08-15 three of four lanes had a block and this one
+    # did not. One line, saying what it did and what that is worth.
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        printf '### %s\n\n```\n  %-16s %d modules + %d examples compiled, 0 tests run (see cmd_build)\n```\n\n' \
+            "${ZIGLIBS_LANE:-gate}" "compile only:" "$n" "$n" >> "$GITHUB_STEP_SUMMARY"
+    fi
+    # ⚠ The graph snapshot is NOT saved here. It is what `changed` uses to
+    # decide it may run a narrow set, and a run that executed no test has no
+    # business telling the next one that anything was covered.
+    summary
+}
+
+GATE_BUILD_ONLY=0
+
+cmd_all() {
+    set_extra_args "$@"
+    capability_check
+    graph_load
+    local all_mods="${G_NAMES[*]}"
+    local n=${#G_NAMES[@]}
+    echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — the pre-commit/CI gate"
+    step "fmt check" zig fmt --check build.zig build.zig.zon modules
+    # `af6a148` is why the fmt step is first and why the hook exists: six files
+    # had drifted out of fmt, the gate stops on the first failure, and so NO
+    # module was being tested locally at all. The hook stops that landing in a
+    # commit -- but only while the hook itself works, which is what this checks.
+    phase_checks_fast_tail
+    phase_checks
     # The class no other gate can see: Zig analyses a function body only when
     # something references it, so a `pub fn` no test reaches can be outright
     # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626
@@ -1374,20 +1528,10 @@ cmd_all() {
     # full matrix died on `error.PythonPeerFailed`, having reached a Python
     # peer it was configured never to need. It now sits below the build-only
     # return, where the things that RUN belong.
-    # See cmd_changed's comment on this same step for what it checks.
-    step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
-    # The ctgrind harnesses (`modules/*/src/ctgrind_harness.zig`) are standalone
-    # programs nothing else builds: they are not tests, and `scripts/ctgrind.sh`
-    # -- which needs valgrind -- is deliberately NOT in this gate. Left alone
-    # they would rot into unbuildable recipes the first time a module's API
-    # moved, and the SPEC.md tables they back would silently become claims
-    # nobody can re-take. This compiles them (semantic analysis only; the build
-    # system emits no binary because nothing asks for one) and runs no valgrind:
-    # ~0.1s warm. It is spelled out here rather than left to `zig build test`'s
-    # dependency on it, because this driver never runs `zig build test` -- it
-    # runs `test-<module>` per module, so anything hung off the aggregate step
-    # alone would never execute in the gate.
-    step "check-ctgrind" zig build check-ctgrind
+    # ⚠ `check-http-sizeprobe` and `check-ctgrind` were here; they are in
+    # `phase_checks` now, which this function called above. They assert nothing
+    # that depends on the optimize mode or the host arch, so the matrix runs
+    # them once rather than four times.
 
     # ⭐ COMPILE EVERYTHING FIRST, then run. `zig build`'s default step depends
     # on every module's test Compile (see build.zig), so this is the whole
@@ -1407,22 +1551,6 @@ cmd_all() {
     # `changed` deliberately does NOT do this: the default step builds the whole
     # collection, and a scoped lane exists precisely to avoid that.
     step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}"
-    if (( GATE_BUILD_ONLY )); then
-        # This lane runs no test, so there is no `--summary all` to digest and
-        # nothing lands on the run's page. A lane that contributes NOTHING there
-        # reads as one that failed to report, not as one with nothing to report,
-        # and on 2026-08-15 three of four lanes had a block and this one did not.
-        # One line, saying what it did and what that is worth.
-        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-            printf '### %s\n\n```\n  %-16s %d modules compiled, 0 tests run (see cmd_build)\n```\n\n' \
-                "${ZIGLIBS_LANE:-gate}" "compile only:" "$n" >> "$GITHUB_STEP_SUMMARY"
-        fi
-        # ⚠ The graph snapshot is NOT saved here. It is what `changed` uses to
-        # decide it may run a narrow set, and a run that executed no test has no
-        # business telling the next one that anything was covered.
-        summary
-        return
-    fi
     # Below this line the gate RUNS things — examples included: `run_modules`
     # runs every module's example in this lane's optimize mode, which is what a
     # tag claims and what the aggregate `zig build run-examples` that used to
@@ -1561,6 +1689,15 @@ printed — the driver runs nothing privileged or networked for you.
 Which do I run? While working: `changed` (fast, scoped). Before committing:
 `all` (the full, authoritative gate). Closing a real-root gap that `changed`/
 `all` can only skip and print a fix command for: `vm`.
+
+`checks-fast`, `checks`, `modules` and `examples` are the four phases `all`
+runs in one process, split so CI can put them in separate jobs — one lane per
+(phase, optimize mode, arch). They are not a menu for people: running them by
+hand in sequence is `all` with more typing and no graph snapshot in between.
+The split exists because the halves share no compilation (a module is compiled
+once for its test binary and once for its example, and Zig caches whole
+compilations) and because the ReleaseFast lane cleared its 90-minute cap by 23
+seconds on 2026-08-24.
 EOF
 }
 
@@ -1572,6 +1709,10 @@ main() {
         changed) cmd_changed "${rest[@]:-}" ;;
         all) cmd_all "${rest[@]:-}" ;;
         build) cmd_build "${rest[@]:-}" ;;
+        checks-fast) cmd_checks_fast ;;
+        checks) cmd_checks ;;
+        modules) cmd_modules "${rest[@]:-}" ;;
+        examples) cmd_examples "${rest[@]:-}" ;;
         time) cmd_time "${rest[@]:-}" ;;
         vm) cmd_vm "${rest[@]:-}" ;;
         -h|--help|help) usage ;;
