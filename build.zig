@@ -1359,6 +1359,7 @@ const example_apps = [_]struct {
     modules: []const []const u8,
 }{
     .{ .name = "ssh-demo", .modules = &.{"ssh"} },
+    .{ .name = "mls-chat", .modules = &.{ "mls", "framing", "lockfree" } },
     .{ .name = "http-service", .modules = &.{
         "http",       "router",    "cors",        "security-headers",
         "ratelimit",  "requestid", "health",      "throttle",

@@ -15,6 +15,7 @@ nothing else.
 | App | What it is | Modules it uses |
 |---|---|---|
 | [`ssh-demo`](ssh-demo/) | An SSH-2.0 client and server in one binary, with real `known_hosts` and `authorized_keys` handling. | `ssh` |
+| [`mls-chat`](mls-chat/) | End-to-end encrypted group chat over RFC 9420 (MLS) — delivery service and client in one binary. | `mls`, `framing`, `lockfree` |
 | [`http-service`](http-service/) | A hardened task-tracking JSON API — API-key and HMAC-signed webhook clients, behind the composed middleware chain. | `http`, `router`, and 15 more |
 
 ## How this differs from `modules/<name>/example/`
@@ -67,14 +68,20 @@ server from the previous tag against a client from the commit under test — and
 that is a wire-compatibility check no in-repo test can be. We do not do it, and
 the reason is worth writing down so it is not proposed again as an oversight.
 
-For `ssh`, the only app today with both ends in one binary, it is dominated. The
-module carries **20 live interop tests against real OpenSSH** in both
-directions, across curve25519 and DH group14/16, ed25519 and rsa-sha2-256/512,
-chacha20-poly1305 and AES-GCM, including `mlkem768x25519-sha256` — and the CI
-runner is pinned to an image chosen for that OpenSSH version. A foreign
-implementation fails independently of us; our own previous version shares every
-misreading of the RFC we have ever had. Nor does SSH promise anything across
-*our* versions: it promises conformance, and conformance is what is measured.
+For both protocols represented here it is dominated, for the same reason by two
+different routes. `ssh` carries **20 live interop tests against real OpenSSH**
+in both directions — curve25519 and DH group14/16, ed25519 and
+rsa-sha2-256/512, chacha20-poly1305 and AES-GCM, `mlkem768x25519-sha256` — and
+the CI runner is pinned to an image chosen for that OpenSSH version. `mls` has
+no live peer, but it is pinned byte-exact to the official mlswg interop
+vectors, including whole recorded sessions replayed Commit by Commit with the
+epoch authenticator compared at every step — recordings produced by other
+implementations, which is the same independence in a different form.
+
+A foreign implementation fails independently of us; our own previous version
+shares every misreading of the RFC we have ever had. Nor does either protocol
+promise anything across *our* versions: they promise conformance, and
+conformance is what is measured.
 
 Where the check would earn its cost is a protocol with no foreign
 implementation to test against — there the previous version is the only oracle

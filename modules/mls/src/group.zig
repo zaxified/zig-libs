@@ -41,12 +41,11 @@
 //!
 //! **What this object deliberately does NOT own.**
 //!
-//!   * **Creating** Commits or proposals. This is the receiving half only.
-//!     A committer additionally needs to generate an `UpdatePath` (the
-//!     sender half of §7.5, which `treekem.zig` does not implement either),
-//!     and to produce a `Welcome` for the members it adds. `fromWelcome`
-//!     plus `processCommit` is a complete passive client and a complete
-//!     *follower*; it is not a complete *client*.
+//! ⚠ Creating Commits and proposals used to be on this list, and is not any
+//! more: Part 8 added `createProposal`, `createCommit` and the `UpdatePath`
+//! generation under them, so this object is a complete client and not only a
+//! follower. The list below is what is still true.
+//!
 //!   * **Application messages and the secret tree.** `secrettree.zig` owns
 //!     §9's ratchets, but this object does not drive them: a Commit changes
 //!     `encryption_secret`, and re-keying the secret tree per epoch is a
