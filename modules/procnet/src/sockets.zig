@@ -7,8 +7,16 @@
 //! `.close` (unconnected/bound) or `.established` (connect()-ed).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const netaddr = @import("netaddr");
 const procnet = @import("root.zig");
+
+/// The byte order of the machine running this code. The default producer
+/// byte order for every `parseX` entry point here, because the overwhelming
+/// case — and *every* live read — is a file written by this machine's own
+/// kernel. See `hexWord` for why the producer's byte order is a parameter of
+/// the decode at all.
+const native_endian = builtin.cpu.arch.endian();
 
 /// Which `/proc/net/*` table a row came from.
 pub const Proto = enum { tcp, udp };
@@ -83,36 +91,57 @@ pub const SocketEntry = struct {
     rx_queue: u32,
 };
 
-/// Decode one 8-hex-char little-endian `u32` group the same way
-/// `/proc/net/route` does (kernel prints host-order hex of the network-order
-/// word, so the low byte of the parsed int is the first address byte of
-/// that word). Shared by v4 (one group) and v6 (four groups) decoding.
-fn leHexWord(s: []const u8) ?[4]u8 {
+/// Decode one 8-hex-char address group into its four octets in transmission
+/// order. Shared by v4 (one group) and v6 (four groups) decoding.
+///
+/// ⚠ THE PRODUCING KERNEL'S BYTE ORDER IS PART OF THE ENCODING. The kernel
+/// prints each group with `%08X` of a `u32` variable that *holds a `__be32`*
+/// — it never converts, so what the hex spells is the MEMORY IMAGE of that
+/// word read as a host-order integer. The address octets are therefore
+/// recovered by writing the parsed value back out in the byte order of the
+/// kernel that wrote the file:
+///   * little-endian producer: `0100007F` -> 7F 00 00 01 -> 127.0.0.1
+///   * big-endian producer:    `7F000001` -> 7F 00 00 01 -> 127.0.0.1
+/// Both of those are the same socket; the file differs, not the address.
+///
+/// Measured, not inferred (2026-08-24): a big-endian MIPS kernel (OpenWrt
+/// 25.12.4 `malta/be` under `qemu-system-mips`) with a socket bound to a
+/// known `127.0.0.1:12345` printed `7F000001:3039` — see
+/// `testdata/tcp-mips-be.txt` and SPEC.md. This function used to take the
+/// parsed integer's LOW byte as the first octet unconditionally, which
+/// decoded that capture as `1.0.0.127`.
+///
+/// Note the port half of an `addr:port` column needs no such treatment: the
+/// kernel prints it via `ntohs()`, as a number, so `3039` is 12345 on either
+/// producer — confirmed by the same capture.
+///
+/// This code is itself endian-INDEPENDENT: `parseInt` and `writeInt` are
+/// defined on values and on an explicitly requested order, so the CPU running
+/// the decode never enters into it. `producer` is about the machine that
+/// wrote the text.
+fn hexWord(s: []const u8, producer: std.builtin.Endian) ?[4]u8 {
     if (s.len != 8) return null;
     const v = std.fmt.parseInt(u32, s, 16) catch return null;
-    return .{
-        @truncate(v & 0xff),
-        @truncate((v >> 8) & 0xff),
-        @truncate((v >> 16) & 0xff),
-        @truncate((v >> 24) & 0xff),
-    };
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, producer);
+    return b;
 }
 
 /// Decode a `/proc/net/{tcp,udp}` address hex string — the same encoding in
 /// both the `local_address` and `rem_address` columns: 8 hex chars for IPv4,
-/// 32 for IPv6 (four little-endian `u32` words, concatenated in address
-/// order — verified against real `tcp6`/`udp6` snapshots). Null on any other
-/// length or malformed hex.
-fn parseSocketAddr(s: []const u8) ?netaddr.Ip {
+/// 32 for IPv6 (four `u32` words in the producer's byte order, concatenated
+/// in address order — verified against real `tcp6`/`udp6` snapshots). Null on
+/// any other length or malformed hex. See `hexWord` for `producer`.
+fn parseSocketAddr(s: []const u8, producer: std.builtin.Endian) ?netaddr.Ip {
     if (s.len == 8) {
-        const b = leHexWord(s) orelse return null;
+        const b = hexWord(s, producer) orelse return null;
         return .{ .v4 = b };
     }
     if (s.len == 32) {
         var b: [16]u8 = undefined;
         var g: usize = 0;
         while (g < 4) : (g += 1) {
-            const word = leHexWord(s[g * 8 .. g * 8 + 8]) orelse return null;
+            const word = hexWord(s[g * 8 .. g * 8 + 8], producer) orelse return null;
             @memcpy(b[g * 4 .. g * 4 + 4], &word);
         }
         return .{ .v6 = b };
@@ -124,10 +153,12 @@ fn parseSocketAddr(s: []const u8) ?netaddr.Ip {
 const HostPort = struct { ip: netaddr.Ip, port: u16 };
 
 /// Split and decode one `addr:port` column. Null if it has no `:`, an
-/// address of the wrong width, or non-hex in either half.
-fn parseHostPort(s: []const u8) ?HostPort {
+/// address of the wrong width, or non-hex in either half. `producer` applies
+/// to the address half only — the port is a plain number in both byte orders
+/// (see `hexWord`).
+fn parseHostPort(s: []const u8, producer: std.builtin.Endian) ?HostPort {
     const colon = std.mem.indexOfScalar(u8, s, ':') orelse return null;
-    const ip = parseSocketAddr(s[0..colon]) orelse return null;
+    const ip = parseSocketAddr(s[0..colon], producer) orelse return null;
     const port = std.fmt.parseInt(u16, s[colon + 1 ..], 16) catch return null;
     return .{ .ip = ip, .port = port };
 }
@@ -154,7 +185,15 @@ fn parseQueues(s: []const u8) ?struct { tx: u32, rx: u32 } {
 /// true. Columns past `inode` (`ref`, the `sk` pointer, and the TCP
 /// diagnostics `rto`/`ato`/`snd_cwnd`/`ssthresh`) are not required, so a
 /// kernel that grows or shrinks that tail does not empty the table.
-fn parseTable(gpa: std.mem.Allocator, text: []const u8, proto: Proto) std.mem.Allocator.Error![]SocketEntry {
+///
+/// `producer` is the byte order of the kernel that WROTE `text` — see
+/// `hexWord`; every caller of a live `/proc` read passes `native_endian`.
+fn parseTable(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    proto: Proto,
+    producer: std.builtin.Endian,
+) std.mem.Allocator.Error![]SocketEntry {
     var out: std.ArrayList(SocketEntry) = .empty;
     errdefer out.deinit(gpa);
 
@@ -174,8 +213,8 @@ fn parseTable(gpa: std.mem.Allocator, text: []const u8, proto: Proto) std.mem.Al
         _ = f.next() orelse continue; // timeout
         const inode_s = f.next() orelse continue;
 
-        const local = parseHostPort(local_s) orelse continue;
-        const remote = parseHostPort(remote_s) orelse continue;
+        const local = parseHostPort(local_s, producer) orelse continue;
+        const remote = parseHostPort(remote_s, producer) orelse continue;
         const state_raw = std.fmt.parseInt(u8, state_s, 16) catch continue;
         const queues = parseQueues(queues_s) orelse continue;
         const uid = std.fmt.parseInt(u32, uid_s, 10) catch continue;
@@ -198,14 +237,43 @@ fn parseTable(gpa: std.mem.Allocator, text: []const u8, proto: Proto) std.mem.Al
 }
 
 /// Parse a `/proc/net/tcp` or `/proc/net/tcp6` blob (auto-detects v4 vs v6
-/// per row by address hex length; a caller may even pass both concatenated).
+/// per row by address hex length; a caller may even pass both concatenated),
+/// **taken from a kernel of this machine's byte order** — which is every live
+/// read, and every snapshot that has not crossed architectures. For a capture
+/// from a foreign kernel use `parseTcpWithEndian`; `hexWord` explains why the
+/// producer's byte order changes the decode.
 pub fn parseTcp(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]SocketEntry {
-    return parseTable(gpa, text, .tcp);
+    return parseTable(gpa, text, .tcp, native_endian);
+}
+
+/// `parseTcp` for a capture whose producing kernel's byte order is stated
+/// rather than assumed — a `/proc/net/tcp` file copied off a big-endian
+/// machine (s390x, a BE MIPS/PowerPC router) and parsed elsewhere, or a
+/// little-endian capture replayed by a test on a big-endian target.
+///
+/// `producer` is the byte order of the KERNEL THAT WROTE `text`, never of the
+/// machine doing the parsing: `parseTcpWithEndian(gpa, text, .big)` decodes
+/// `7F000001` to 127.0.0.1 whatever CPU it runs on.
+pub fn parseTcpWithEndian(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    producer: std.builtin.Endian,
+) std.mem.Allocator.Error![]SocketEntry {
+    return parseTable(gpa, text, .tcp, producer);
 }
 
 /// Parse a `/proc/net/udp` or `/proc/net/udp6` blob. See `parseTcp`.
 pub fn parseUdp(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]SocketEntry {
-    return parseTable(gpa, text, .udp);
+    return parseTable(gpa, text, .udp, native_endian);
+}
+
+/// `parseUdp` for a foreign capture. See `parseTcpWithEndian`.
+pub fn parseUdpWithEndian(
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    producer: std.builtin.Endian,
+) std.mem.Allocator.Error![]SocketEntry {
+    return parseTable(gpa, text, .udp, producer);
 }
 
 /// How much of each `/proc/net/*` socket table `readSockets` will read.
@@ -235,7 +303,10 @@ pub fn readSockets(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![
     }) |spec| {
         const text = procnet.readVirtualFile(gpa, io, spec.path, socket_table_read_limit) orelse continue;
         defer gpa.free(text);
-        const rows = try parseTable(gpa, text, spec.proto);
+        // A live read's producer is by definition the running kernel, so the
+        // native order is not merely the default here — it is the only right
+        // answer.
+        const rows = try parseTable(gpa, text, spec.proto, native_endian);
         defer gpa.free(rows);
         try out.appendSlice(gpa, rows);
     }
@@ -245,13 +316,35 @@ pub fn readSockets(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+// ⚠ EVERY FIXTURE BELOW IS A LITTLE-ENDIAN CAPTURE, and the tests that assert
+// decoded ADDRESSES say so with `parseTcpWithEndian(..., .little)` rather than
+// leaning on `parseTcp`'s native default. That is not ceremony: the default
+// means "written by a kernel of this machine's byte order", so on a big-endian
+// target `parseTcp(tcp_fixture)` correctly decodes these little-endian bytes
+// to different (and here meaningless) addresses. Pinning the fixture's own
+// producer keeps these tests true on every target, and leaves the native
+// default pinned by its own dedicated test below, where a target-dependent
+// expectation is the point.
 const tcp_fixture = @embedFile("testdata/tcp.txt");
 const tcp6_fixture = @embedFile("testdata/tcp6.txt");
 const udp_fixture = @embedFile("testdata/udp.txt");
 const udp6_fixture = @embedFile("testdata/udp6.txt");
 
+/// A `/proc/net/tcp` captured from a BIG-endian kernel — the file that makes
+/// the producer's byte order a measured fact rather than an inference. See
+/// SPEC.md "The hex address decode on a big-endian target" for the full
+/// provenance; in short: OpenWrt 25.12.4, target `malta/be`, booted from
+/// `openwrt-25.12.4-malta-be-vmlinux-initramfs.elf` (sha256 checked against
+/// the release's `sha256sums`) under `qemu-system-mips -M malta`, `uname -m` =
+/// `mips`, `/proc/cpuinfo` "system type: MIPS Malta"; the single row is
+/// `dropbear -R -p 127.0.0.1:12345` after `ip link set lo up`, captured
+/// 2026-08-24. The ground truth needs no foreign tool: the address and port
+/// were CHOSEN when the socket was bound.
+const tcp_be_fixture = @embedFile("testdata/tcp-mips-be.txt");
+
 test "parseTcp: real /proc/net/tcp fixture (v4)" {
-    const entries = try parseTcp(testing.allocator, tcp_fixture);
+    const entries = try parseTcpWithEndian(testing.allocator, tcp_fixture, .little);
     defer testing.allocator.free(entries);
     try testing.expectEqual(@as(usize, 5), entries.len);
 
@@ -275,7 +368,7 @@ test "parseTcp: rem_address, uid and inode columns are captured, not stepped ove
     // Concrete expected values taken from the fixture text by hand, not
     // recomputed from the parser, so a decode that changes shows up as a
     // failure rather than agreeing with itself.
-    const entries = try parseTcp(testing.allocator, tcp_fixture);
+    const entries = try parseTcpWithEndian(testing.allocator, tcp_fixture, .little);
     defer testing.allocator.free(entries);
 
     // Row 0 — a listener: "00000000:0000" peer, root-owned, inode 5194665.
@@ -345,7 +438,7 @@ test "parseTcp: a real orphaned socket keeps the kernel's inode 0" {
 }
 
 test "parseTcp: real /proc/net/tcp6 fixture (v6)" {
-    const entries = try parseTcp(testing.allocator, tcp6_fixture);
+    const entries = try parseTcpWithEndian(testing.allocator, tcp6_fixture, .little);
     defer testing.allocator.free(entries);
     try testing.expectEqual(@as(usize, 4), entries.len);
 
@@ -373,7 +466,7 @@ test "parseTcp: real /proc/net/tcp6 fixture (v6)" {
 }
 
 test "parseUdp: real /proc/net/udp fixture" {
-    const entries = try parseUdp(testing.allocator, udp_fixture);
+    const entries = try parseUdpWithEndian(testing.allocator, udp_fixture, .little);
     defer testing.allocator.free(entries);
     try testing.expectEqual(@as(usize, 4), entries.len);
 
@@ -394,10 +487,110 @@ test "parseUdp: real /proc/net/udp fixture" {
 }
 
 test "parseUdp: real /proc/net/udp6 fixture" {
-    const entries = try parseUdp(testing.allocator, udp6_fixture);
+    const entries = try parseUdpWithEndian(testing.allocator, udp6_fixture, .little);
     defer testing.allocator.free(entries);
     try testing.expectEqual(@as(usize, 3), entries.len);
     try testing.expect(entries[0].local == .v6);
+}
+
+// ── the producing kernel's byte order ───────────────────────────────────────
+
+test "parseTcp: big-endian kernel capture decodes to the socket that was bound" {
+    // The capture that turned this from an inference into a measurement. A
+    // big-endian MIPS kernel printed `7F000001:3039` for a socket the capture
+    // script had itself bound to 127.0.0.1:12345 — so the expected value here
+    // is GROUND TRUTH CHOSEN BEFORE THE FILE EXISTED, not a re-reading of the
+    // parser's own output, and no foreign tool has to be trusted for it.
+    //
+    // The same socket on a little-endian kernel prints `0100007F:3039`. Note
+    // the port half is identical in both: it is printed as a number.
+    const entries = try parseTcpWithEndian(testing.allocator, tcp_be_fixture, .big);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(netaddr.Ip{ .v4 = .{ 127, 0, 0, 1 } }, entries[0].local);
+    try testing.expectEqual(@as(u16, 12345), entries[0].local_port);
+    try testing.expectEqual(SockState.listen, entries[0].state);
+    // …and the all-zero peer of a listener, which is byte-order-blind.
+    try testing.expectEqual(netaddr.Ip{ .v4 = .{ 0, 0, 0, 0 } }, entries[0].remote);
+    try testing.expectEqual(@as(u16, 0), entries[0].remote_port);
+}
+
+test "parseTcp: producer byte order is honoured in BOTH directions, on any CPU" {
+    // The control for the test above: `producer` must actually steer the
+    // decode rather than being accepted and ignored. Reading the big-endian
+    // capture AS little-endian reproduces exactly the defect this module
+    // shipped with — 1.0.0.127 — and reading a little-endian row as
+    // big-endian mirrors it. Neither expectation depends on the CPU running
+    // the test, so both hold natively and under qemu-mips.
+    const be_as_le = try parseTcpWithEndian(testing.allocator, tcp_be_fixture, .little);
+    defer testing.allocator.free(be_as_le);
+    try testing.expectEqual(@as(usize, 1), be_as_le.len);
+    try testing.expectEqual(netaddr.Ip{ .v4 = .{ 1, 0, 0, 127 } }, be_as_le[0].local);
+
+    // "0100007F" is the little-endian rendering of 127.0.0.1; misread as
+    // big-endian it is 1.0.0.127 — the same wrongness, the other way round.
+    const le_row = "hdr\n   0: 0100007F:3039 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 466 1 0000000000000000 100 0 0 10 5\n";
+    const le_as_be = try parseTcpWithEndian(testing.allocator, le_row, .big);
+    defer testing.allocator.free(le_as_be);
+    try testing.expectEqual(@as(usize, 1), le_as_be.len);
+    try testing.expectEqual(netaddr.Ip{ .v4 = .{ 1, 0, 0, 127 } }, le_as_be[0].local);
+    try testing.expectEqual(@as(u16, 12345), le_as_be[0].local_port); // port unaffected
+
+    const le_as_le = try parseTcpWithEndian(testing.allocator, le_row, .little);
+    defer testing.allocator.free(le_as_le);
+    try testing.expectEqual(netaddr.Ip{ .v4 = .{ 127, 0, 0, 1 } }, le_as_le[0].local);
+}
+
+test "parseTcp: the endian-less entry point means NATIVE, and the decode shows it" {
+    // ⭐ THE TARGET-DEPENDENT TEST. `parseTcp` promises "this text came from a
+    // kernel of this machine's byte order", which is what makes every live
+    // read correct without a caller deciding anything. That promise is only
+    // testable by an expectation that DIFFERS per target — a decode pinned to
+    // little-endian here would pass on amd64 and fail under
+    // `zig test -target mips-linux-musl --test-cmd qemu-mips`, and a decode
+    // that ignored the producer entirely would fail one of the two.
+    //
+    // Run it both ways; that pair of runs is the whole point of this test.
+    const row = "hdr\n   0: 0100007F:3039 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 466 1 0000000000000000 100 0 0 10 5\n";
+    const want: netaddr.Ip = switch (native_endian) {
+        .little => .{ .v4 = .{ 127, 0, 0, 1 } }, // this machine wrote it LE
+        .big => .{ .v4 = .{ 1, 0, 0, 127 } }, // a BE kernel writing THIS text meant 1.0.0.127
+    };
+    const entries = try parseTcp(testing.allocator, row);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(want, entries[0].local);
+
+    // And the default is the explicit variant at `native_endian`, not a
+    // second implementation that could drift from it.
+    const explicit = try parseTcpWithEndian(testing.allocator, row, native_endian);
+    defer testing.allocator.free(explicit);
+    try testing.expectEqualSlices(SocketEntry, entries, explicit);
+
+    // `parseUdp` shares the table decoder, so it inherits the same default —
+    // asserted rather than assumed, since it is a separate entry point.
+    const u_native = try parseUdp(testing.allocator, row);
+    defer testing.allocator.free(u_native);
+    try testing.expectEqual(want, u_native[0].local);
+}
+
+test "parseTcp: v6 words each follow the producer's byte order" {
+    // No big-endian `tcp6` capture exists (the BE guest had IPv6 out of the
+    // image), so this is DERIVED from the measured v4 rule rather than
+    // captured: a v6 column is four of the same `__be32`-as-host-word groups
+    // concatenated in address order, so each group decodes exactly as the v4
+    // one does. Stated that way so nobody reads it as a second measurement.
+    //
+    // ::1 as a big-endian kernel would print it — the low word is 00000001,
+    // where a little-endian kernel writes 01000000 (as `testdata/tcp6.txt`
+    // really does).
+    const be6 = "hdr\n   0: 00000000000000000000000000000001:0016 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 466 1 0000000000000000 100 0 0 10 5\n";
+    const entries = try parseTcpWithEndian(testing.allocator, be6, .big);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    var want: [16]u8 = @splat(0);
+    want[15] = 1;
+    try testing.expectEqual(netaddr.Ip{ .v6 = want }, entries[0].local);
+    try testing.expectEqual(@as(u16, 22), entries[0].local_port);
 }
 
 test "parseTcp: empty table (header only)" {
@@ -425,7 +618,7 @@ test "parseTcp: malformed rows are skipped, not fatal" {
 // point is the same hostile-input surface as any wire parser (a bind-
 // mounted/faked `/proc`, a snapshot read from a file). Allocates, so this
 // runs under `std.testing.allocator` with the result freed on every path.
-const socket_corpus = [_][]const u8{ tcp_fixture, tcp6_fixture, udp_fixture, udp6_fixture };
+const socket_corpus = [_][]const u8{ tcp_fixture, tcp6_fixture, udp_fixture, udp6_fixture, tcp_be_fixture };
 
 test "fuzz: parseTcp/parseUdp never panic, OOB or leak, arbitrary or mutated-real bytes" {
     try std.testing.fuzz({}, fuzzParseSocketsNeverLeaks, .{ .corpus = &socket_corpus });

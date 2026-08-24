@@ -25,10 +25,12 @@ whole result slice frees with one `gpa.free(slice)`, no arena required (same sha
 `netlink` module's typed results); `copyClamped` truncates rather than fails when copying into
 these buffers as a defensive belt-and-braces measure (inputs are already kernel-bounded, so this
 is not the expected path). Addresses are returned as typed `netaddr.Ip`/`Prefix`, not allocated
-dotted-string IPs — IPv6 socket addresses (`tcp6`/`udp6`) decode as four little-endian 32-bit words
-concatenated in address order (verified against real kernel captures under
-`src/testdata/`). Malformed rows are skipped, not fatal — one corrupt line never sinks the whole
-table. A read past `limit` truncates to the bounded prefix rather than failing (the last partial row
+dotted-string IPs — IPv6 socket addresses (`tcp6`/`udp6`) decode as four 32-bit words concatenated
+in address order (verified against real kernel captures under `src/testdata/`), each word in the
+byte order of the KERNEL THAT WROTE the file, which is what the hex columns actually encode (see
+"The hex address decode on a big-endian target" below; `parseX` means "this machine's order" and
+`parseXWithEndian` states a foreign capture's). Malformed rows are skipped, not fatal — one corrupt
+line never sinks the whole table. A read past `limit` truncates to the bounded prefix rather than failing (the last partial row
 is then skipped as malformed like any other), so an oversized table yields a short listing, never an
 empty one. `SocketEntry` returns every row with its `state` (not pre-filtered to
 LISTEN/bound) — filtering is now the caller's job — and carries the full row the kernel prints: local
@@ -47,7 +49,7 @@ behaves identically, verified live. `SockState` reuses the
 kernel's `net/tcp_states.h` values for UDP too (`.close` = unconnected/bound, `.established` =
 connect()-ed — UDP has no separate state space). Concurrency: reentrant, no shared state — each
 call is independent, callers may run them from any thread. Original work of the zig-libs authors
-(MIT): typed parsers for `/proc/net/route` (`routesOutcome`/`leHexToV4`), `/proc/net/{tcp,udp}`
+(MIT): typed parsers for `/proc/net/route` (`routesOutcome`/`hexToV4`), `/proc/net/{tcp,udp}`
 (`socketsOutcome`), `/proc/net/nf_conntrack` (`conntrackOutcome`/`kvField`), `/proc/<pid>/stat`
 (`parseProcStat`), plus the snapshot/thermal-zone/meminfo helpers; `arp.zig` is clean-room from
 `proc(5)`; IPv6 socket-table support extends IPv4-only reads to full dual-stack coverage. Written
@@ -67,14 +69,22 @@ allocation — the caller gets a truncated/capped view instead. Out of scope: wr
 `/proc` read permissions.
 
 ## Verification
-51 tests across `arp.zig`/`routes.zig`/`sockets.zig`/`conntrack.zig`/`process.zig` (dark-aggregated
+57 tests across `arp.zig`/`routes.zig`/`sockets.zig`/`conntrack.zig`/`process.zig` (dark-aggregated
 from `root.zig`), golden-text fixtures under `src/testdata/` for each table (including real
-`tcp6`/`udp6` kernel captures verifying the little-endian-hex IPv6 decode), malformed-row-skipped
--not-fatal cases, the `readVirtualFile` streaming-vs-`stat`-size-0 behavior and its
+`tcp6`/`udp6` kernel captures verifying the four-word hex IPv6 decode, and a real BIG-ENDIAN
+`/proc/net/tcp` capture, `tcp-mips-be.txt`, whose ground truth is the address the capture script
+itself bound), malformed-row-skipped-not-fatal cases, the `readVirtualFile` streaming-vs-`stat`-size-0 behavior and its
 truncate-don't-vanish limit, per-column tests for every field decoded out of a socket row, and gated
 live smoke tests against the real `/proc` (including one that opens its own listener and asserts the
 process join attributes it to this pid under the fd this process holds). Run: `zig build
-test-procnet`.
+test-procnet`. The suite is also run on a BIG-ENDIAN CPU — `zig test -OReleaseSafe -target
+mips-linux-musl --test-cmd qemu-mips --test-cmd-bin --dep netaddr -Mroot=modules/procnet/src/root.zig
+-Mnetaddr=modules/netaddr/src/root.zig`, 57/57 — which is load-bearing rather than decorative: the
+tests pinning what the *endian-less* `parseTcp`/`parseRoutes` decode expect a DIFFERENT answer per
+target, so a decode that quietly hard-coded little-endian would pass natively and fail there.
+Verified by mutation, both directions: restoring the old unconditional low-byte-first decode turns
+the big-endian-capture tests red in both lanes, and hard-coding the endian-less entry points to
+`.little` passes natively and fails only under qemu-mips.
 
 Beyond the suite, `example/main.zig` was diffed against real `ss` from iproute2 6.19.0 on a live
 host. Five deliberately-created listening sockets (v4/v6, TCP/UDP, wildcard and loopback) compared
@@ -90,8 +100,8 @@ snapshot, not an invariant.
 ### The hex address decode on a big-endian target — measured, and what is left
 
 Two different questions hide behind "does this work on big-endian", and they
-have different answers. This section separates them because the first has now
-been measured and the second cannot be settled from here.
+have different answers. Both have now been measured; the second turned out the
+opposite way from what the secondary sources said, and it was a real bug.
 
 **Question 1 — does OUR code behave differently when compiled big-endian? No.
 Measured 2026-08-24, not reasoned about.** The same fixed `/proc/net/tcp` table
@@ -105,44 +115,81 @@ Both builds printed byte-identical results (`0100007F` -> `127.0.0.1`,
 way — `zig test -target mips-linux-musl --test-cmd qemu-mips --test-cmd-bin` —
 with **51/51 passing**.
 
-The reason matters more than the measurement. `leHexWord` (`src/sockets.zig`)
-and `leHexToV4` (`src/routes.zig`) parse a hex STRING into an integer VALUE
-with `parseInt(u32, s, 16)`, then take octets out of it with `& 0xff` and
-`>> 8`. Shifts and masks are defined on the value, not on its representation in
-memory, so no byte-order reinterpretation ever happens and the CPU's endianness
-cannot reach the result. An earlier version of this section framed the risk as
-"the decoders have never been RUN on `.linux32`" and read a green
-`portable-procnet-linux32` row as weak evidence. Running them there proves
-nothing either: there was nothing endian-dependent to run.
+The reason matters more than the measurement. `hexWord` (`src/sockets.zig`) and
+`hexToV4` (`src/routes.zig`) parse a hex STRING into an integer VALUE with
+`parseInt(u32, s, 16)` and then lay that value out in an explicitly requested
+byte order with `writeInt`. Neither step consults the CPU's representation, so
+no byte-order reinterpretation ever happens and the machine running the decode
+cannot reach the result. (Before the fix below, the octets came out with
+`& 0xff` and `>> 8` instead — different code, same property.) An earlier
+version of this section framed the risk as "the decoders have never been RUN on
+`.linux32`" and read a green `portable-procnet-linux32` row as weak evidence.
+Running them there proves nothing either: there was nothing endian-dependent to
+run — which is exactly why a green cross-target suite was not evidence about
+Question 2, and why the bug below survived one.
 
-**Question 2 — what does a big-endian KERNEL print into the file? Unverified,
-and it is a property of the kernel, not of this module.** The decode is correct
-exactly when the kernel emits the `__be32` as a little-endian host word, which
-is what every fixture under `src/testdata/` shows — and all of those captures
-come from little-endian hosts, so they confirm that case and say nothing about
-the other.
+**Question 2 — what does a big-endian KERNEL print into the file? Its own byte
+order. MEASURED 2026-08-24, and the answer was the opposite of what the
+secondary sources said.** A big-endian MIPS kernel was booted, a socket bound
+to an address chosen in advance, and `/proc/net/tcp` read back:
 
-What the field says, with its evidence quality stated rather than borrowed:
-secondary sources describe the file as "little-endian regardless of
-architecture", which would make this decode correct everywhere, and the one
-primary report found — Bitcoin's issue #31812, networking tests failing under
-emulated s390x — says the same. But that report *infers* the byte order from
-which tests failed: it quotes no file contents, no other participant confirms
-it, and no fix accompanies it. The kernel's own `proc_net_tcp` documentation
-does not mention endianness at all. That is not enough to write "fine on
-big-endian" into a SPEC, so it is not written.
+    OpenWrt 25.12.4, target malta/be, from
+      openwrt-25.12.4-malta-be-vmlinux-initramfs.elf
+      (sha256 verified against the release's sha256sums)
+    booted under qemu-system-mips -M malta
+    uname -m = mips; /proc/cpuinfo "system type: MIPS Malta"
+    ip link set lo up; dropbear -R -p 127.0.0.1:12345
+    captured 2026-08-24 -> src/testdata/tcp-mips-be.txt
 
-**Neither "broken on big-endian" nor "fine on big-endian" is claimed.** What
-would settle it, precisely: capture `/proc/net/tcp` **and** `/proc/net/tcp6` on
-a big-endian Linux host (s390x, or a big-endian `qemu-system` guest — note that
-`qemu-mips` user-mode emulation can NOT do this, because the `/proc` it exposes
-is the host kernel's) together with ground truth for the sockets in them, `ss
--tuln` taken on that host at that moment, then replay the capture through
-`parseTcp` as a fixture and compare against that ground truth. One such pair of
-files, checked in beside the existing fixtures, turns this into either a passing
-test or a bug report. Until then `.linux32` in `meta.targets` means "compiles
-there, and decodes identically there"; the open question is the file's content,
-not this code.
+       0: 7F000001:3039 00000000:0000 0A ...
+
+`7F000001` is 127.0.0.1 in NATURAL order; a little-endian kernel writes
+`0100007F` for the same socket (as every other fixture here does). The ground
+truth needs no foreign tool and no `ss`: the address and port were CHOSEN when
+the socket was bound. The port half, `3039` = 12345, is identical on both
+producers — the kernel prints it as a number.
+
+So the eight hex characters are the native-byte-order memory image of a `u32`
+holding the `__be32`, and the address octets are that value written back out
+**in the producing kernel's byte order**. The secondary sources describing the
+file as "little-endian regardless of architecture" are wrong, and so was the
+one primary report that agreed with them (Bitcoin issue #31812, which *inferred*
+the byte order from which tests failed under emulated s390x and quoted no file
+contents). The kernel's own `proc_net_tcp` documentation does not mention
+endianness at all.
+
+**What the module does about it.** Both decoders took the parsed integer's LOW
+byte as the first octet unconditionally, so they decoded that capture as
+`1.0.0.127` — confirmed by an outside consumer built against the published
+module, which printed `local=1.0.0.127:22` for a `7F000001` row. The producing
+byte order is now an explicit parameter of the decode:
+
+* `parseTcp`/`parseUdp`/`parseRoutes` keep their signatures and mean "written
+  by a kernel of THIS machine's byte order". That is correct for every live
+  read by construction — `readSockets`/`readRoutes` read the running kernel's
+  own files — and for any capture that has not crossed architectures.
+* `parseTcpWithEndian`/`parseUdpWithEndian`/`parseRoutesWithEndian` take the
+  producer's byte order for a foreign capture, and are what the little-endian
+  fixtures here are now parsed with, so they keep decoding correctly when the
+  suite runs on a big-endian target.
+
+⚠ A wrong-endian read of `/proc/net/route` does not merely mis-decode: the
+`Mask` column goes through the same path, so a big-endian `FFFFFF00` (/24) read
+low-byte-first becomes 0.255.255.255, which is not a contiguous CIDR mask and
+the row is DROPPED. A big-endian router would have lost routes silently.
+
+**On qemu.** `qemu-mips` user-mode emulation cannot answer Question 2 at all —
+the `/proc` it exposes is the HOST kernel's, so a big-endian process there reads
+little-endian files. That is why a full-system `qemu-system-mips` guest was
+needed for the capture. User-mode qemu remains the right tool for Question 1,
+and the whole suite is run under it (`zig test -OReleaseSafe -target
+mips-linux-musl --test-cmd qemu-mips --test-cmd-bin`) precisely so the
+native-order tests get evaluated on a big-endian CPU as well as this one.
+
+Still open, and small: no big-endian `tcp6` capture (the BE guest image had no
+IPv6), so the v6 case is covered by a test DERIVED from the measured v4 rule —
+a v6 column is four of the same `__be32`-as-host-word groups — and labelled as
+derived rather than measured.
 
 ## Backlog / deferred
 Per the module README's "DEFER" list: `/proc/net/unix` (the AF_UNIX table, `ss -x` — a different row

@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-24** — **Address hex columns are decoded in the PRODUCING KERNEL's byte order; they
+  were always read low-byte-first.** `/proc/net/{tcp,udp,tcp6,udp6,route}` print each address word
+  with `%08X` of a `u32` variable holding a `__be32` — the kernel never converts, so the eight hex
+  characters are that word's memory image and their order follows the kernel that wrote them. Both
+  decoders (`sockets.hexWord`, ex-`leHexWord`; `routes.hexToV4`, ex-`leHexToV4`) took the parsed
+  integer's LOW byte as the first octet unconditionally, which is right only for a little-endian
+  producer. **Measured, not inferred:** a big-endian MIPS kernel (OpenWrt 25.12.4 `malta/be` under
+  `qemu-system-mips`) with a socket bound to a chosen `127.0.0.1:12345` printed `7F000001:3039`,
+  which the old decode read as **1.0.0.127** — reproduced by an outside consumer built against the
+  published module (`local=1.0.0.127:22`). The capture is checked in as
+  `src/testdata/tcp-mips-be.txt`; its ground truth is the address the capture script itself bound,
+  so no foreign tool has to be trusted. ⚠ On `/proc/net/route` the damage was worse than a wrong
+  address: the `Mask` column takes the same path, so a big-endian `FFFFFF00` (/24) became
+  0.255.255.255 — not a contiguous CIDR mask — and the row was DROPPED. A big-endian router lost
+  routes silently. ⚠ The secondary sources saying "little-endian regardless of architecture" (and
+  the one primary report agreeing, Bitcoin #31812, which infers byte order from which tests failed
+  and quotes no file contents) are wrong; SPEC.md now records the measurement instead of them.
+  **Additive, not breaking:** `parseTcp`/`parseUdp`/`parseRoutes` keep their signatures and now
+  mean "written by a kernel of this machine's byte order" — always true for `readSockets`/
+  `readRoutes`, which read the running kernel, and for any capture that has not crossed
+  architectures. New `parseTcpWithEndian`/`parseUdpWithEndian`/`parseRoutesWithEndian` take the
+  producer's byte order for a foreign capture (the argument is the *writer's* order, never the
+  parsing machine's). ⚠ A green cross-target run was NOT evidence here and had been read as some:
+  the decoders are endian-independent as code (arithmetic on a parsed value), so the whole suite
+  passed under `qemu-mips` while carrying this bug — the fixtures were all little-endian captures
+  AND the decode ignored the machine. The tests now pin what the endian-less entry points decode
+  with a per-target expectation, so hard-coding little-endian passes natively and fails under
+  qemu-mips; the suite is run both ways.
 - **2026-08-23** — **`readVirtualFile`'s `limit` now truncates instead of returning nothing.**
   It was `allocRemaining(...) catch null`, and `allocRemaining` returns `error.StreamTooLong`
   the moment the limit is reached — so an oversized table returned NULL and every row in it

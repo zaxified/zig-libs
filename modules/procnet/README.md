@@ -7,14 +7,14 @@ returning typed values (`netaddr.Ip`/`Prefix`, not allocated dotted-string
 IPs).
 
 Provenance: original work of the zig-libs authors (MIT) — typed parsers for
-`/proc/net/route` (`routesOutcome`/`leHexToV4`), `/proc/net/{tcp,udp}`
+`/proc/net/route` (`routesOutcome`/`hexToV4`), `/proc/net/{tcp,udp}`
 (`socketsOutcome`), `/proc/net/nf_conntrack` (`conntrackOutcome`/`kvField`),
 and `/proc/<pid>/stat` (`parseProcStat`), plus the `snapshot`/thermal-zone/
 meminfo helpers. `arp.zig` (`/proc/net/arp`) is clean-room from `proc(5)`.
-IPv6 socket-table support (`tcp6`/`udp6`) and the little-endian-hex→
-`netaddr.Ip` decode for 16-byte addresses are verified against real kernel
-snapshots (see the test fixtures under `src/testdata/`), extending IPv4-only
-reads to full dual-stack coverage.
+IPv6 socket-table support (`tcp6`/`udp6`) and the hex→`netaddr.Ip` address
+decode are verified against real kernel snapshots (see the test fixtures
+under `src/testdata/`, which now include a big-endian kernel's capture),
+extending IPv4-only reads to full dual-stack coverage.
 
 - **Model after:** gopsutil (Go) / procps-ng.
 - **Platform:** linux (raw `/proc`+`/sys` reads). **Role:** util.
@@ -114,9 +114,27 @@ routes, `-N` neighbours and `-s` snapshot.
 - `SockState` reuses the kernel's `net/tcp_states.h` values for UDP too:
   `.close` (0x07) means "unconnected/bound", `.established` (0x01) means
   "connect()-ed" — there is no separate UDP state space.
-- IPv6 socket addresses decode as four little-endian 32-bit words
-  concatenated in address order (verified against real `tcp6`/`udp6`
-  captures in `src/testdata/`).
+- IPv6 socket addresses decode as four 32-bit words concatenated in address
+  order (verified against real `tcp6`/`udp6` captures in `src/testdata/`),
+  each word in the producing kernel's byte order — see the next point.
+- **The hex address columns are in the byte order of the KERNEL THAT WROTE
+  the file**, because the kernel prints a `u32` holding a `__be32` without
+  converting it: the same loopback socket is `0100007F` on a little-endian
+  kernel and `7F000001` on a big-endian one. Measured on a big-endian MIPS
+  kernel, not inferred (`src/testdata/tcp-mips-be.txt`; SPEC.md has the
+  provenance). `parseTcp`/`parseUdp`/`parseRoutes` assume a producer of this
+  machine's byte order — always true for `readSockets`/`readRoutes`, and for
+  any capture that has not crossed architectures. For a foreign capture say
+  so explicitly:
+
+  ```zig
+  // A /proc/net/tcp copied off a big-endian box (s390x, a BE MIPS router).
+  const rows = try procnet.parseTcpWithEndian(gpa, text, .big);
+  defer gpa.free(rows);
+  ```
+
+  with `parseUdpWithEndian`/`parseRoutesWithEndian` alongside it. The
+  argument is the *producer's* byte order, never the parsing machine's.
 
 ## DEFER (beyond this module's current scope)
 

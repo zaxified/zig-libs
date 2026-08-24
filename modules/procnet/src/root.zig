@@ -102,6 +102,11 @@ pub const readArp = arp.readArp;
 pub const RouteEntry = routes.RouteEntry;
 pub const parseRoutes = routes.parseRoutes;
 pub const readRoutes = routes.readRoutes;
+// For a capture taken off a kernel whose byte order differs from this
+// machine's — the hex address columns are that kernel's memory image, so the
+// producer's byte order is part of the encoding. `parseRoutes` means "this
+// machine's order", which is every live read. See `routes.hexToV4`.
+pub const parseRoutesWithEndian = routes.parseRoutesWithEndian;
 
 pub const Proto = sockets.Proto;
 pub const SockState = sockets.SockState;
@@ -109,6 +114,10 @@ pub const SocketEntry = sockets.SocketEntry;
 pub const parseTcp = sockets.parseTcp;
 pub const parseUdp = sockets.parseUdp;
 pub const readSockets = sockets.readSockets;
+// As `parseRoutesWithEndian` above: for a socket table captured on a foreign
+// kernel. See `sockets.hexWord` for the measurement behind it.
+pub const parseTcpWithEndian = sockets.parseTcpWithEndian;
+pub const parseUdpWithEndian = sockets.parseUdpWithEndian;
 
 pub const ConntrackFlow = conntrack.ConntrackFlow;
 pub const ConntrackResult = conntrack.ConntrackResult;
