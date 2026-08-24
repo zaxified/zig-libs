@@ -715,6 +715,13 @@ capability_check() {
     _CAP_CHECKED=1
 
     local -a gaps=()
+    # Two lists, because two different things go wrong. A GAP costs coverage:
+    # the test that needed the peer skips and the lane still goes green, which
+    # is why every gap prints what it costs. A BLOCKER fails the lane outright —
+    # examples do not skip, they run their external judge or return an error —
+    # so printing it under "gap(s) reducing coverage" would be a lie about a
+    # lane that is going to be red either way.
+    local -a blockers=()
 
     # The userns knob differs by distro. `sysctl -w` only lasts until reboot,
     # so what we print is the persistent drop-in form plus a reload — one line,
@@ -927,6 +934,44 @@ capability_check() {
     # build.zig, i.e. arbitrary code, as root.
     local zig_abs; zig_abs="$(command -v zig 2>/dev/null || echo zig)"
     gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root")
+
+    # ⭐ THE EXAMPLES' OWN PEERS, and they are a different class from everything
+    # above. `run-examples` RUNS each example (it only compiled them until
+    # 2026-08-23), and an example whose external judge is missing returns an
+    # error — `modules/websocket/example/main.zig` returns
+    # `error.PythonPeerFailed`. That is deliberate: the judge is the point of
+    # the file, and skipping it would leave an example that proves nothing.
+    #
+    # ⚠ WHICH MEANS THE REPORT ABOVE COULD NOT SEE IT. Its whole table probes
+    # the peers of TESTS, and on 2026-08-24 it printed "1 gap" — real root for
+    # tc — on a runner with no `websockets` at all, then spent eight minutes
+    # reaching step 460 of 461 to say `ModuleNotFoundError` inside a traceback.
+    # The host it was written on happened to have the package, so no local run
+    # could have found this; only a host that did not.
+    #
+    # Everything else the examples spawn is stdlib (`sys`, `re`, `socket`) or a
+    # coreutil, so this table has one row today. It is a table because the next
+    # example with a third-party judge should cost one line, not a rediscovery.
+    local peer
+    for peer in \
+        "websockets|websockets==15.0.1|the websocket example, and with it \`zig build run-examples\` and the whole gate"
+    do
+        local imp="${peer%%|*}" rest3="${peer#*|}"
+        local spec="${rest3%%|*}" what_breaks="${rest3#*|}"
+        python3 -c "import $imp" >/dev/null 2>&1 \
+            || blockers+=("python lacks $imp|$what_breaks|pip install '$spec'")
+    done
+
+    if (( ${#blockers[@]} )); then
+        echo "environment: ${#blockers[@]} MISSING PEER(S) THAT FAIL THE RUN — not a coverage gap:"
+        local b
+        for b in "${blockers[@]}"; do
+            local b_what="${b%%|*}"; local b_rest="${b#*|}"
+            local b_breaks="${b_rest%%|*}"; local b_fix="${b_rest#*|}"
+            printf '  %s\n      breaks: %s\n      fix:    %s\n' "$b_what" "$b_breaks" "$b_fix"
+        done
+        echo
+    fi
 
     [[ ${#gaps[@]} -eq 0 ]] && return 0
 

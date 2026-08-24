@@ -2,12 +2,16 @@
 # Close the environment gaps `scripts/test.sh` reports, on a hosted runner.
 #
 # Everything installed here exists to let a LIVE test reach a real peer: a
-# wolfSSL DTLS responder, an open62541 container, and five Python packages that
+# wolfSSL DTLS responder, an open62541 container, and the Python packages that
 # are INDEPENDENT implementations of what the module under test implements.
 # Those are the highest-value tests in this collection, because they are the
 # only ones that can fail for a reason our own encoder does not share — and
 # they are also the ones that vanish quietly, since a missing peer is a skip
 # and a skip is a pass.
+#
+# ⚠ WITH ONE EXCEPTION, AND IT IS THE LOUD KIND: `websockets` backs an EXAMPLE,
+# not a test, and an example that cannot reach its judge FAILS. See the comment
+# on the pip line below.
 #
 # ⭐ ONE SCRIPT, BOTH JOBS, and that is the point of it existing at all. Until
 # 2026-08-15 this lived inline in the `full` job only, so the `scoped` job —
@@ -24,6 +28,11 @@
 # every one of these ships for aarch64. What must never happen is a gap closing
 # silently, and that report is what prevents it — read it, do not assume this
 # script worked.
+#
+# ⚠ That reasoning holds only for a package whose absence is a SKIP. When
+# `websockets` fails to install, the lane goes red at `run-examples` — the `||
+# true` buys nothing there, and the capability report naming it is the only
+# thing that turns a traceback 400 steps into a build into an answer.
 set -u
 
 # Quiet, but not silent: `apt-get -qq` still lets dpkg print a twenty-four line
@@ -100,15 +109,27 @@ echo "::group::python oracles"
 # exactly what a golden-vs-live test exists to catch. A gate must go red for our
 # reasons, so this is pinned and bumped deliberately.
 #
-# The other three were found missing by the arm64 lane of tag 2026-08-15, which
+# The next three were found missing by the arm64 lane of tag 2026-08-15, which
 # skipped 22 reference-interop tests while the capability report said "1 gap".
 # The report had no probe for them; it has one now, and they are installed here
 # so the probe has nothing to report.
+#
+# ⭐ `websockets` IS NOT LIKE THE OTHERS, AND THAT IS WHY IT IS PINNED. Every
+# package above backs a TEST, which skips when its import fails; this one backs
+# an EXAMPLE, and `modules/websocket/example/main.zig` returns
+# `error.PythonPeerFailed` rather than skipping — the whole point of that file
+# is that an external judge actually runs. So a missing `websockets` is not
+# reduced coverage, it is a red lane, which is exactly what the first push after
+# `run-examples` learned to RUN the examples produced: 459/461 steps green and
+# the gate red on `ModuleNotFoundError: No module named 'websockets'`, on a
+# runner where nothing had ever installed it. The version is the one that
+# example's own header claims to have been judged by; keep the two in step.
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
-    "jinja2==3.1.6" sympy brotli protobuf >/dev/null 2>&1 || true
+    "jinja2==3.1.6" sympy brotli protobuf "websockets==15.0.1" >/dev/null 2>&1 || true
 python3 - <<'PY' || true
 for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
-                   ("brotli", "brotli"), ("google.protobuf", "protobuf")):
+                   ("brotli", "brotli"), ("google.protobuf", "protobuf"),
+                   ("websockets", "websockets")):
     try:
         m = __import__(mod)
         print(f"{label}: {getattr(m, '__version__', 'present')}")
