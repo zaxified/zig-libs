@@ -27,6 +27,7 @@ const usage =
     \\  raft-kv get  --cluster <a:p,a:p,a:p> <key>
     \\  raft-kv del  --cluster <a:p,a:p,a:p> <key>
     \\  raft-kv dump --node <a:p>
+    \\  raft-kv status --cluster <a:p,a:p,a:p>
     \\
     \\Options:
     \\  --id <n>          this node's index into --peers (0-based)
@@ -79,6 +80,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (std.mem.eql(u8, mode, "get")) return client(gpa, io, &args, .c_get, false);
     if (std.mem.eql(u8, mode, "del")) return client(gpa, io, &args, .c_del, false);
     if (std.mem.eql(u8, mode, "dump")) return dump(gpa, io, &args);
+    if (std.mem.eql(u8, mode, "status")) return status(gpa, io, &args);
 
     std.debug.print("raft-kv: unknown command '{s}'\n{s}", .{ mode, usage });
     return failure_exit;
@@ -229,7 +231,12 @@ fn dump(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
     };
     const term = std.mem.readInt(u64, resp[2..10], .little);
     const count = std.mem.readInt(u32, resp[10..14], .little);
-    try printOut(io, "role={s} term={d} keys={d}\n", .{ role, term, count });
+    // One writer for all lines — see status() for why per-line writers
+    // overwrite each other when stdout is a regular file.
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    const out = &stdout.interface;
+    try out.print("role={s} term={d} keys={d}\n", .{ role, term, count });
     var off: usize = 14;
     var i: u32 = 0;
     while (i < count) : (i += 1) {
@@ -242,10 +249,65 @@ fn dump(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
         const vlen = std.mem.readInt(u32, resp[off..][0..4], .little);
         off += 4;
         if (resp.len < off + vlen) break;
-        try printOut(io, "{s}={s}\n", .{ k, resp[off..][0..vlen] });
+        try out.print("{s}={s}\n", .{ k, resp[off..][0..vlen] });
         off += vlen;
     }
+    try out.flush();
     return 0;
+}
+
+/// One line per node: who is up, who leads, which term, how many keys —
+/// the three `dump` calls you would otherwise type while watching a
+/// failover, as one command. Exit 0 if any node answered.
+fn status(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u8 {
+    var cluster_arg: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--cluster")) {
+            cluster_arg = try nextValue(args, "--cluster");
+        } else return unknown(arg);
+    }
+    const cluster = try splitList(gpa, cluster_arg orelse return missing("--cluster"));
+    defer gpa.free(cluster);
+
+    const frame = try wire.encodeClient(gpa, .c_dump, "", "");
+    defer gpa.free(frame);
+
+    const resp_buf = try gpa.alloc(u8, wire.limits.max_frame);
+    defer gpa.free(resp_buf);
+    // ONE writer for the whole table. A fresh `File.stdout().writer` per
+    // line writes POSITIONALLY from its own offset 0 — to a terminal or a
+    // pipe that reads as appending, but redirected to a regular file every
+    // line lands on top of the previous one. Measured: `status > out` kept
+    // only the last line.
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    const out = &stdout.interface;
+    var up: usize = 0;
+    for (cluster, 0..) |addr, i| {
+        const resp = exchangeAddr(gpa, io, addr, frame, resp_buf) catch |err| {
+            try out.print("node {d}  {s}  DOWN ({t})\n", .{ i, addr, err });
+            continue;
+        };
+        if (resp.len < 14 or resp[0] != @intFromEnum(wire.Resp.dump)) {
+            try out.print("node {d}  {s}  malformed reply\n", .{ i, addr });
+            continue;
+        }
+        up += 1;
+        const role: []const u8 = switch (resp[1]) {
+            'l' => "leader",
+            'c' => "candidate",
+            else => "follower",
+        };
+        try out.print("node {d}  {s}  {s}  term={d}  keys={d}\n", .{
+            i,
+            addr,
+            role,
+            std.mem.readInt(u64, resp[2..10], .little),
+            std.mem.readInt(u32, resp[10..14], .little),
+        });
+    }
+    try out.flush();
+    return if (up == 0) failure_exit else 0;
 }
 
 fn exchangeAddr(gpa: std.mem.Allocator, io: std.Io, addr_text: []const u8, frame: []const u8, resp_buf: []u8) ![]u8 {

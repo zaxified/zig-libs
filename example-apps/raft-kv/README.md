@@ -48,7 +48,19 @@ and from a fourth:
 ./zig-out/bin/raft-kv put --cluster $P city Brno   # follows redirects to the leader
 ./zig-out/bin/raft-kv get --cluster $P city        # Brno
 ./zig-out/bin/raft-kv dump --node 127.0.0.1:7802   # one node's applied state + role
+./zig-out/bin/raft-kv status --cluster $P          # the whole cluster, one line per node
 ```
+
+`status` is the view to keep open while you break things:
+
+```
+node 0  127.0.0.1:7801  follower  term=2  keys=3
+node 1  127.0.0.1:7802  DOWN (ConnectionRefused)
+node 2  127.0.0.1:7803  leader  term=2  keys=3
+```
+
+(A follower can trail the leader's key count for a heartbeat — commit index
+travels with the next AppendEntries, and `status` shows you exactly that.)
 
 Now `kill -9` the process that logged `LEADER` and run the `put` again: it
 retries through the election and lands on the new leader. Restart the killed

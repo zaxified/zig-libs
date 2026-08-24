@@ -57,6 +57,12 @@ for i in 0 1 2; do start_node "$i"; done
 "$BIN" put "${CL[@]}" city Brno >/dev/null 2>&1 || fail "first put (no leader elected?)"
 [ "$("$BIN" get "${CL[@]}" city 2>/dev/null)" = "Brno" ] || fail "get after put"
 
+# ── 1b. status: one command sees the whole cluster, with exactly one leader ─
+"$BIN" status "${CL[@]}" > "$WORK/status.out" 2>/dev/null || fail "status against a healthy cluster"
+[ "$(wc -l < "$WORK/status.out")" = 3 ] || fail "status did not print one line per node:\n$(cat "$WORK/status.out")"
+leaders=$(grep -c "  leader  " "$WORK/status.out" || true)
+[ "$leaders" = 1 ] || fail "status shows $leaders leaders, Election Safety says exactly 1:\n$(cat "$WORK/status.out")"
+
 # ── 2. kill the leader with SIGKILL; the survivors elect and keep serving ───
 leader=""
 for i in 0 1 2; do
@@ -108,4 +114,4 @@ done
 kill -0 "$term_pid" 2>/dev/null && fail "node did not exit on SIGTERM"
 grep -q "stopped cleanly" "$WORK/n$leader.log" || fail "no clean-shutdown line (leak check unreachable)"
 
-echo "smoke: OK — elected, replicated, failed over, caught up, refused without majority, stopped cleanly"
+echo "smoke: OK — elected (status sees exactly one leader), replicated, failed over, caught up, refused without majority, stopped cleanly"
