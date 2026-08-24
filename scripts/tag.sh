@@ -197,7 +197,11 @@ fi
 bump_app_pins() {
     local newtag="$1" export_dir pkg_hash z
     [ -d example-apps ] || return 0
-    export_dir="$(mktemp -d)"
+    # Off tmpfs: this extracts a full ~54 MB repo archive, and /tmp is RAM here
+    # (the house rule that closed a prior OOM). test.sh redirects TMPDIR for its
+    # own children but does not run this; `.zig-cache` is the repo's scratch.
+    mkdir -p .zig-cache
+    export_dir="$(mktemp -d "$PWD/.zig-cache/tag-export.XXXXXX")"
     git archive HEAD | tar -x -C "$export_dir"
     if ! pkg_hash="$(zig fetch "$export_dir" 2>/dev/null)"; then
         echo "tag.sh: could not compute the package hash — example-apps pins NOT bumped" >&2
@@ -207,13 +211,19 @@ bump_app_pins() {
     rm -rf "$export_dir"
     for z in example-apps/*/build.zig.zon; do
         [ -f "$z" ] || continue
-        oldtag="$(sed -n 's|.*zig-libs#\([0-9][0-9-]*\)".*|\1|p' "$z" | head -1)"
+        oldtag="$(sed -n 's|.*zig-libs#\([0-9][-0-9.]*\)".*|\1|p' "$z" | head -1)"
         sed -i "0,/zig-libs#/{s|\(zig-libs#\)[^\"]*|\1$newtag|}" "$z"
         sed -i "0,/\.hash = /{s|\(\.hash = \"\)[^\"]*|\1$pkg_hash|}" "$z"
         # The README's download URL names the same tag; check-apps.sh fails if
         # the two disagree, so they move together or not at all.
+        #
+        # ⚠ SCOPED to the tag's three real forms (`tags/…`, `zig-libs-…`,
+        # `-b …`). A whole-file `s|$oldtag|$newtag|g` also rewrote prose that
+        # merely shared the date — timecapsule's README says "publishes
+        # 2026-08-24 19:35:15 UTC" as an example — silently corrupting it on
+        # every tag cut.
         if [ -n "$oldtag" ] && [ -f "$(dirname "$z")/README.md" ]; then
-            sed -i "s|$oldtag|$newtag|g" "$(dirname "$z")/README.md"
+            sed -i -E "s#(tags/|zig-libs-|-b )$oldtag#\\1$newtag#g" "$(dirname "$z")/README.md"
         fi
     done
     if ! git diff --quiet -- example-apps; then

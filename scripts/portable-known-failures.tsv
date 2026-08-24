@@ -15,7 +15,7 @@
 # build portable-<module>-<target>` compiler error -- never invented, never a
 # generic restatement that could be pasted onto any row. Local toolchain
 # install paths are stripped down to the `std/...`-relative path (no
-# `/home/<user>/` in this file, ever — CLAUDE.md).
+# absolute home-directory paths in this file, ever — it is a public repo).
 #
 # THIS LIST IS A BASELINE, NOT A SUPPRESSION. `check-portable`
 # (`PortableBaselineStep` in build.zig) fails the build in BOTH directions:
@@ -87,15 +87,20 @@
 # cleanly" account, not a live import -- kept, but weaker evidence than the
 # rest of this file and flagged here as such). All pass.
 #
-# Result: 38 (module, target) pairs declared, 34 pass, 4 real failures below
-# -- this is the honest shape of a non-empty baseline, not a regression.
+# Result: all declared (module, target) pairs pass EXCEPT the one row below.
+# The three own-bug failures this file once listed -- blobstore, filestore
+# (64-bit atomic RMW at the mips32 baseline) and traceroute (u64->usize narrow)
+# -- have since been FIXED and are no longer failing rows; only wireguard's
+# deliberate guard remains. A non-empty baseline, not a regression. (The
+# earlier "34 pass, 4 failures" wording outlived those fixes; the data section
+# below is the enforced source of truth, the prose only its explanation.)
 #
 # ── Root-cause groups (2026-08-18, mips-linux-musl mips32/soft_float) ──
 #
-#   64-bit atomic RMW unsupported at the mips32 baseline ISA (own bug):
-#     blobstore, filestore -- same class independently confirmed on `ramcache`
-#     below, which does not declare `.linux32` and so has no row of its own.
-#   usize-narrow (u64 -> usize), own bug:
+#   [FIXED] 64-bit atomic RMW unsupported at the mips32 baseline ISA (own bug):
+#     blobstore, filestore -- same class was independently confirmed on
+#     `ramcache`, which declares no `.linux32` row of its own. Fixed since.
+#   [FIXED] usize-narrow (u64 -> usize), own bug:
 #     traceroute
 #   deliberate big-endian guard (module says so itself, not a surprise):
 #     wireguard -- `handshake.zig`'s `comptime` block already `@compileError`s

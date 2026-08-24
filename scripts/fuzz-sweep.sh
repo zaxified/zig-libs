@@ -128,6 +128,12 @@ mapfile -t ALL_MODS < <(grep -rl 'testing\.fuzz(' modules/*/src/*.zig 2>/dev/nul
     sed 's|modules/||; s|/src/.*||' | sort -u)
 if [[ "$1" == "all" ]]; then
     MODS=("${ALL_MODS[@]}")
+    # Same guard the named branch has: a discovery that finds no fuzz harness
+    # must FAIL, not sweep zero modules and print "SWEEP DONE" over nothing.
+    # (ctgrind.sh and dark-tests.sh both guard their all-branch; this one did
+    # not.) It is dormant today — many call sites exist — but a refactor that
+    # renamed `testing.fuzz(` would silently empty the sweep.
+    (( ${#MODS[@]} )) || { echo "no module has a testing.fuzz( harness — nothing to sweep"; exit 2; }
 else
     MODS=()
     for want in "$@"; do
@@ -150,7 +156,10 @@ total=${#MODS[@]}
 # run's own files, which are new. $BASE/latest is a convenience pointer for the
 # common case ("where did my sweep go"), and $BASE/runs.tsv is an append-only
 # index so a run whose pointer was overtaken is still findable.
-BASE="${FUZZ_OUT:-${TMPDIR:-/tmp}/zig-libs-fuzz}"
+# Default OFF tmpfs: fuzz corpora and instrumented builds are big, and /tmp is
+# RAM here (a 4.5 GB cache parked there OOM-killed the editor once). `.zig-cache`
+# is the repo's own scratch. `FUZZ_OUT` still overrides for a deliberate choice.
+BASE="${FUZZ_OUT:-.zig-cache/zig-libs-fuzz}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 OUT="$BASE/run-$RUN_ID"
 mkdir -p "$OUT"

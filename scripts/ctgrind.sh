@@ -201,7 +201,10 @@ if ! command -v valgrind >/dev/null 2>&1; then
     exit 2
 fi
 
-WORKDIR="$(mktemp -d)"
+# Off tmpfs: this is the install prefix for every (mode, -fvalgrind) build combo,
+# which is large, and /tmp is RAM here. `.zig-cache` is the repo's scratch.
+mkdir -p .zig-cache
+WORKDIR="$(mktemp -d "$PWD/.zig-cache/ctgrind.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 # ── build ──────────────────────────────────────────────────────────────────

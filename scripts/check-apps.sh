@@ -118,13 +118,19 @@ for d in example-apps/*/; do
     [ -d "$d" ] || continue
     n="$(basename "$d")"
     [ -f "$d/README.md" ] || { echo "check-apps: example-apps/$n has no README.md -- the download instructions are the point of the directory" >&2; fail=1; continue; }
-    pin="$(sed -n 's|.*zig-libs#\([0-9][0-9-]*\)".*|\1|p' "$d/build.zig.zon" | head -1)"
+    pin="$(sed -n 's|.*zig-libs#\([0-9][-0-9.]*\)".*|\1|p' "$d/build.zig.zon" | head -1)"
     [ -n "$pin" ] || continue   # pinned to a commit or a branch, not a tag
+    # Match the tag only where the README uses it AS a tag — after `tags/`,
+    # `zig-libs-`, or `-b `. A bare `grep` for any date also caught prose like
+    # "publishes 2026-08-24 19:35:15 UTC", which is an illustrative timestamp,
+    # not a pin, and would have gone red the first time the pin advanced past
+    # that date. The `(\.[0-9]+)?` also lets it read a same-day `.N` tag, which
+    # the old pattern truncated.
     while read -r found; do
         [ "$found" = "$pin" ] && continue
         echo "check-apps: example-apps/$n/README.md names tag '$found' but build.zig.zon pins '$pin'" >&2
         fail=1
-    done < <(grep -oE '20[0-9]{2}-[0-9]{2}-[0-9]{2}' "$d/README.md" | sort -u)
+    done < <(grep -oE '(tags/|zig-libs-|-b )20[0-9]{2}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?' "$d/README.md" | sed -E 's#^(tags/|zig-libs-|-b )##' | sort -u)
 done
 [ $fail -eq 0 ] || exit 1
 
@@ -139,7 +145,7 @@ if [ "$PINNED" = 1 ]; then
     head_sha="$(git rev-parse HEAD)"
     for n in "${WANT[@]}"; do
         z="example-apps/$n/build.zig.zon"
-        pin="$(sed -n 's|.*zig-libs#\([0-9][0-9-]*\)".*|\1|p' "$z" | head -1)"
+        pin="$(sed -n 's|.*zig-libs#\([0-9][-0-9.]*\)".*|\1|p' "$z" | head -1)"
         if [ -z "$pin" ]; then
             echo "check-apps: --pinned: example-apps/$n does not pin a dated tag — nothing to verify against" >&2
             exit 2
@@ -228,8 +234,11 @@ if [ "$RUN" = 1 ]; then
         done
         # Leave the tree as it was found: the last build above is ReleaseFast,
         # and a developer who runs this then runs the binary by hand should get
-        # the mode the app's own build.zig chooses.
-        ( cd "example-apps/$n" && zig build --fork=../.. >/dev/null ) || true
+        # the mode the app's own build.zig chooses. Non-fatal (the gate has
+        # already passed), but SAY SO if it fails rather than silently leaving
+        # the tree in ReleaseFast.
+        ( cd "example-apps/$n" && zig build --fork=../.. >/dev/null ) \
+            || echo "check-apps: warning: could not restore example-apps/$n to its default build mode (tree left in ReleaseFast)" >&2
     done
     echo "check-apps: ${#WANT[@]} app(s) ran their smoke tests in ReleaseSafe and ReleaseFast"
 fi

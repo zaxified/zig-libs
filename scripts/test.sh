@@ -1064,7 +1064,7 @@ cmd_changed() {
                 # Might have changed the graph — ask the graph, do not assume.
                 trigger_graph=1
                 ;;
-            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/hooks/*)
+            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed.
@@ -1074,7 +1074,11 @@ cmd_changed() {
                 # each was the same hole: `dark-tests.sh` decides which tests
                 # count as dark, `ci-environment.sh` decides which live peers
                 # exist on a runner, and `test-tag.sh` plus `hooks/*` are run as
-                # gate steps in their own right. Editing any of them changes
+                # gate steps in their own right. `check-http-sizeprobe.sh` was
+                # added a day later (2026-08-18) and missed the same fix: it too
+                # is a gate step (see the `check-http-sizeprobe` calls below),
+                # so an edit weakening its TLS-symbol assertion would otherwise
+                # seed nothing and self-certify. Editing any of them changes
                 # what a green run means while leaving the narrowing untouched.
                 #
                 # Everything else under scripts/ is a tool the gate never calls
@@ -1523,7 +1527,7 @@ cmd_all() {
     # ⚠ `run-examples` USED TO BE HERE, and being here made the compile-only
     # lane a liar. It announces "COMPILING every module and running NO tests"
     # and then executed 216 example binaries — which is also why CI skips that
-    # lane's peer install (`if: matrix.cmd != 'build'` in ci.yml): a lane that
+    # lane's peer install (`if: matrix.peers` in ci.yml): a lane that
     # runs nothing needs no peers. On 2026-08-24 the strict-Debug lane of the
     # full matrix died on `error.PythonPeerFailed`, having reached a Python
     # peer it was configured never to need. It now sits below the build-only
