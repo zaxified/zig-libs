@@ -603,6 +603,14 @@ const Session = struct {
     fn run(s: *Session) void {
         s.fireConnState(.new);
         defer s.fireConnState(.closed);
+        // Declared before the worker-drain defer so it runs AFTER it (LIFO):
+        // by then nothing can still be staging, and a response staged by the
+        // last round must not die with the session.
+        defer {
+            s.lock();
+            s.flushWire() catch {};
+            s.unlock();
+        }
         // Threaded: no worker may still be holding a `*Job`, the `wire` or
         // the socket writer when `deinit` frees them. `gone` first, so a
         // worker parked in `waitForPeer` stops waiting for a connection task
@@ -744,6 +752,35 @@ const Session = struct {
         }
     };
 
+    /// How much may sit staged in `wire` before `stageWire` writes it out.
+    /// A whole round of small responses fits, which is the point; the cap
+    /// exists so a large one cannot grow the staging buffer without bound.
+    const wire_flush_threshold = 8 * 1024;
+
+    /// Hot-path counterpart to `flushWire`: stage the frames and let them
+    /// leave together.
+    ///
+    /// A multiplexed protocol whose responses each take their own socket
+    /// write throws away most of what multiplexing is for. Measured against
+    /// `hyper` on the same box, one 112-byte answer per stream: it wrote 0.16
+    /// times per request where this server wrote 2.04 -- a 13-byte HEADERS
+    /// frame and a 26-byte DATA frame, each its own `sendmsg`, per response,
+    /// with nothing coalesced across the eight streams in flight. Two
+    /// microseconds of kernel transition to move thirteen bytes.
+    ///
+    /// **Who flushes, and why it differs by mode.** Without a dispatcher the
+    /// task that stages a response is the task that will next reach `pump`,
+    /// and `pump` flushes before it blocks, so staging is safe and the whole
+    /// ready round leaves in one write. With one, a worker may finish a
+    /// response while the connection task is *already* blocked in that read;
+    /// nothing would then push the bytes out until the peer sent something
+    /// unprompted, which for a peer waiting on this very response is never.
+    /// So a worker flushes immediately and only the single-task path
+    /// accumulates.
+    fn stageWire(s: *Session) Writer.Error!void {
+        if (s.threaded or s.wire.items.len >= wire_flush_threshold) return s.flushWire();
+    }
+
     /// Flush staged wire bytes through the (timeout-guarded) socket writer.
     fn flushWire(s: *Session) Writer.Error!void {
         if (s.wire.items.len == 0) return;
@@ -762,6 +799,14 @@ const Session = struct {
     /// with `mu` released — that is what keeps PING/SETTINGS/WINDOW_UPDATE
     /// flowing while handlers run.
     fn pump(s: *Session) error{Closed}!void {
+        // Anything `stageWire` left staged goes out BEFORE the blocking read.
+        // This is the half that makes staging safe: the peer never waits on
+        // bytes that are sitting in `wire` while we wait on the peer.
+        {
+            s.lock();
+            defer s.unlock();
+            s.flushWire() catch return error.Closed;
+        }
         _ = s.in.peekGreedy(1) catch return error.Closed; // EOF/timeout/reset
         s.lock();
         defer s.unlock();
@@ -1674,7 +1719,7 @@ const Framer = struct {
                 else => return f.die(.keep), // stream reset by the peer meanwhile
             };
         f.headers_sent = true;
-        f.s.flushWire() catch return f.die(.close);
+        f.s.stageWire() catch return f.die(.close);
     }
 
     /// Put `body` on the wire as DATA under §5.2 flow control: send what the
@@ -1732,7 +1777,7 @@ const Framer = struct {
                         error.WindowExhausted => break :blk .wait,
                         else => break :blk .dead_keep, // stream reset: abandon
                     };
-                s.flushWire() catch break :blk .dead_close;
+                s.stageWire() catch break :blk .dead_close;
                 break :blk .sent;
             };
             switch (step) {
@@ -1751,7 +1796,7 @@ const Framer = struct {
             s.lock();
             defer s.unlock();
             s.conn.sendData(&s.wire, f.id, "", true) catch return f.die(.keep);
-            s.flushWire() catch return f.die(.close);
+            s.stageWire() catch return f.die(.close);
         }
     }
 
@@ -1802,7 +1847,7 @@ const Framer = struct {
                     error.OutOfMemory => return .close,
                     else => return .keep, // stream reset by the peer meanwhile
                 };
-            f.s.flushWire() catch return .close;
+            f.s.stageWire() catch return .close;
         }
         return .keep;
     }

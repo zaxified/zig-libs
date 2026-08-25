@@ -5,6 +5,41 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-25** — **h2 responses no longer take a socket write each.** A
+  multiplexed protocol whose every response pays its own kernel transition
+  throws away most of what multiplexing is for, and this server was paying two:
+  `sendHead` flushed the HEADERS frame and `emit` flushed the DATA frame, so a
+  112-byte answer left as a 13-byte `sendmsg` followed by a 26-byte one.
+  Measured against `hyper` on the same machine and the same load, it wrote 0.16
+  times per request where this wrote **2.04**.
+
+  Frames now stage in `wire` and `stageWire` writes only past
+  `wire_flush_threshold` (8 KiB), with `pump` flushing everything staged
+  **before** its blocking read — which is the half that makes staging safe: the
+  peer never waits on bytes sitting in `wire` while we wait on the peer. `run`
+  flushes once more on the way out, after the worker drain, so a response
+  staged in the last round cannot die with the session.
+
+  **Who flushes differs by mode, deliberately.** Without a dispatcher the task
+  that stages is the task that next reaches `pump`, so staging is safe. With
+  one, a worker can finish a response while the connection task is already
+  blocked in that read, and nothing would push the bytes out until the peer
+  spoke unprompted — which, for a peer waiting on this very response, is never.
+  So `stageWire` flushes immediately when threaded and only accumulates on the
+  single-task path.
+
+  Measured after: **1.02 writes per request** (from 2.04, reads unchanged at
+  0.16), h2c throughput **+66%** at one stream per connection and **+87%** at
+  eight, and p99 at eight streams from **25.1 ms to 2.3 ms**. Against `hyper`
+  in the same run the gap narrowed from 3.9x to 2.26x.
+
+  **Not yet done, and visible in the same trace:** responses still do not
+  coalesce with *each other*. Every write is exactly 39 bytes — one whole
+  response — even where a single read delivered several requests, so the ready
+  loop appears to serve one stream per pump round rather than draining what
+  arrived together. `hyper` writes about one time per seven requests. That is
+  the rest of the gap and it is a scheduling question, not a flushing one.
+
 - **2026-08-25** — `h2.Connection.sendHeaders` no longer allocates the HPACK
   block for every response. It built the block in a fresh `ArrayList` and freed
   it again on each call; the buffer now lives on the `Connection` beside
