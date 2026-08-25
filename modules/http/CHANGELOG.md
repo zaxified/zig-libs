@@ -33,12 +33,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   eight, and p99 at eight streams from **25.1 ms to 2.3 ms**. Against `hyper`
   in the same run the gap narrowed from 3.9x to 2.26x.
 
-  **Not yet done, and visible in the same trace:** responses still do not
-  coalesce with *each other*. Every write is exactly 39 bytes — one whole
-  response — even where a single read delivered several requests, so the ready
-  loop appears to serve one stream per pump round rather than draining what
-  arrived together. `hyper` writes about one time per seven requests. That is
-  the rest of the gap and it is a scheduling question, not a flushing one.
+  **Then the rest of it, found by counting rather than reading.** Responses
+  still refused to coalesce with each other, and the ready loop was not to
+  blame — instrumented, it drained 4.9 streams per pump round exactly as
+  intended, and `serveJob` flushed zero times. The socket writes were all
+  coming from `removeJob`, which flushed **unconditionally** after handing
+  back a retired stream's uncredited window octets. Retiring a job is the last
+  thing that happens to every response, and a GET owes nothing and stages
+  nothing there — so the flush had no WINDOW_UPDATE to deliver and simply
+  pushed out whatever response was staged, one per stream. It was 400 of 416
+  socket writes on a 400-request run. Now the credit return is guarded on
+  there being credit, and uses `stageWire` when there is; `grantJob` likewise.
+
+  End to end on one core, h2c, eight streams per connection: writes per request
+  **2.04 → 0.30** (a single 312-byte `sendmsg` carrying eight responses where
+  there were sixteen), throughput **47,899 → 197,301 req/s**, p99 **25.1 ms →
+  1.0 ms**. Against `hyper` measured in the same run it went from **3.9x
+  behind to 6% ahead** (185,370). One stream per connection is unchanged at
+  about 17% behind, which is the per-request cost rather than batching: with
+  one response per round there is nothing to coalesce.
 
 - **2026-08-25** — `h2.Connection.sendHeaders` no longer allocates the HPACK
   block for every response. It built the block in a fresh `ArrayList` and freed

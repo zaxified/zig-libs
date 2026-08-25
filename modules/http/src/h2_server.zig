@@ -985,7 +985,7 @@ const Session = struct {
         const stream_open = !job.complete and !job.rst;
         s.grant(0, take);
         if (stream_open) s.grant(id, take);
-        s.flushWire() catch {};
+        s.stageWire() catch {};
     }
 
     /// Stage WINDOW_UPDATE(s) worth `n` octets for `id` (0 = connection).
@@ -1058,8 +1058,19 @@ const Session = struct {
             // Everything received and never credited back is being thrown
             // away now; the connection window is owed it (§6.9.1). The
             // stream window is moot — the stream is gone.
-            s.grant(0, job.owed);
-            s.flushWire() catch {};
+            //
+            // The guard is load-bearing, not tidiness. This flushed
+            // unconditionally, and retiring a job is the last thing that
+            // happens to every response — so a GET, which owes nothing and
+            // stages nothing here, still had its response written out on its
+            // own. It was 400 of the 416 socket writes on a 400-request run,
+            // i.e. the entire reason responses never coalesced with each
+            // other. With nothing owed there is nothing to say, and what IS
+            // owed can travel with the rest: `pump` flushes before it blocks.
+            if (job.owed != 0) {
+                s.grant(0, job.owed);
+                s.stageWire() catch {};
+            }
             job.deinit(s.gpa);
         }
     }
