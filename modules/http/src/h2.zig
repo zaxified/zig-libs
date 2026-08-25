@@ -784,6 +784,20 @@ pub const Connection = struct {
     highest_remote_stream_id: u31 = 0,
     recv_buf: std.ArrayList(u8) = .empty,
     recv_pos: usize = 0,
+    /// Scratch for the HPACK block `sendHeaders` builds, reused across
+    /// responses. Every response used to allocate this list from empty and
+    /// free it again, which on a small response is a measurable share of the
+    /// whole cost: profiling a server answering a fixed 112-byte body put
+    /// allocator traffic at roughly a fifth of the per-request instructions,
+    /// against an h1 response path that allocates nothing at all.
+    ///
+    /// Its capacity settles at the largest header block this connection has
+    /// sent, which `max_header_block` already bounds, so nothing new is
+    /// unbounded. Owned exactly like `recv_buf`: freed in `deinit`, and safe
+    /// for the same reason the encoder's dynamic table is — `sendHeaders`
+    /// already mutates `hpack_enc` on every call, so it has always required
+    /// exclusive access to the connection.
+    hpack_block: std.ArrayList(u8) = .empty,
     /// Server side: the client preface magic is still expected.
     preface_pending: bool,
     /// The first frame from the peer must be SETTINGS (§3.4).
@@ -878,6 +892,7 @@ pub const Connection = struct {
         c.hpack_dec.deinit();
         c.streams.deinit(c.gpa);
         c.recv_buf.deinit(c.gpa);
+        c.hpack_block.deinit(c.gpa);
         if (c.assembling) |*a| a.buf.deinit(c.gpa);
         c.* = undefined;
     }
@@ -946,9 +961,9 @@ pub const Connection = struct {
             .open, .half_closed_remote => {},
             else => return error.StreamNotWritable,
         }
-        var block: std.ArrayList(u8) = .empty;
-        defer block.deinit(c.gpa);
-        try c.hpack_enc.encodeBlock(fields, &block);
+        const block = &c.hpack_block;
+        block.clearRetainingCapacity();
+        try c.hpack_enc.encodeBlock(fields, block);
 
         const max_frag: usize = c.remote_settings.max_frame_size;
         var off: usize = 0;
