@@ -192,3 +192,73 @@ test "GATED differential: group.mulCtWindowed == portable CT ladder" {
         try std.testing.expect(want.equivalent(got));
     }
 }
+
+test "basePoint.mul takes the comb redirect, and the redirect changes no answer" {
+    // Two separate claims, and it is worth being precise about which is which
+    // because the first attempt at this test checked only the second and
+    // reported success while the redirect was deleted.
+    //
+    // The redirect exists because `std.crypto.sign.ecdsa.Ecdsa.sign` computes
+    // its `R` as `Curve.basePoint.mul(k, .big)`. Before it, the fixed-base
+    // comb -- this module's headline optimisation, ~4x the variable-base path
+    // -- had NO call site on the signing path, so every signature took the
+    // slow road.
+    //
+    // 1. The mechanism. Both branches of `mul` return identical points by
+    //    construction, so no assertion on a result can distinguish them: what
+    //    can break is the predicate that chooses, and that is what is asserted
+    //    here. The `mul` body is three lines above it.
+    try std.testing.expect(group.P256.isBasePointRepr(group.P256.basePoint));
+    try std.testing.expect(!group.P256.isBasePointRepr(group.P256.basePoint.dbl()));
+    try std.testing.expect(!group.P256.isBasePointRepr(group.P256.identityElement));
+    // A point equal to G but in another projective representation is allowed
+    // to miss the redirect -- it must not be *claimed*, because the comb table
+    // belongs to this exact representation.
+    const g_scaled = blk: {
+        const two = try group.P256.Fe.fromInt(2);
+        break :blk group.P256{
+            .x = group.P256.basePoint.x.mul(two).mul(two),
+            .y = group.P256.basePoint.y.mul(two).mul(two).mul(two),
+            .z = group.P256.basePoint.z.mul(two),
+        };
+    };
+    try std.testing.expect(!group.P256.isBasePointRepr(g_scaled));
+
+    // 2. The consequence: taking the redirect must not change what comes back,
+    //    against the comb (so the two agree) and against std (so both are
+    //    right). A shared mistake between this module's two paths cannot pass
+    //    the std leg.
+    var prng = std.Random.DefaultPrng.init(0x9E37_79B9_7F4A_7C15);
+    const rand = prng.random();
+
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        var s: [32]u8 = undefined;
+        rand.bytes(&s);
+        s[0] &= 0x7f; // stay inside the group order for both implementations
+
+        const via_mul = group.P256.basePoint.mul(s, .big) catch continue;
+        const via_comb = try group.P256.combMulBase(s, .big);
+        const via_std = try std.crypto.ecc.P256.basePoint.mul(s, .big);
+
+        const a = via_mul.affineCoordinates();
+        const b = via_comb.affineCoordinates();
+        const c = via_std.affineCoordinates();
+
+        try std.testing.expectEqualSlices(u8, &b.x.toBytes(.big), &a.x.toBytes(.big));
+        try std.testing.expectEqualSlices(u8, &b.y.toBytes(.big), &a.y.toBytes(.big));
+        try std.testing.expectEqualSlices(u8, &c.x.toBytes(.big), &a.x.toBytes(.big));
+        try std.testing.expectEqualSlices(u8, &c.y.toBytes(.big), &a.y.toBytes(.big));
+    }
+
+    // And a point that is not G must still be multiplied the ordinary way:
+    // the comb table is G's alone, so answering with it here would be wrong
+    // rather than merely fast.
+    const other = try group.P256.basePoint.dbl().mul([_]u8{3} ** 32, .big);
+    const other_ref = try std.crypto.ecc.P256.basePoint.dbl().mul([_]u8{3} ** 32, .big);
+    try std.testing.expectEqualSlices(
+        u8,
+        &other_ref.affineCoordinates().x.toBytes(.big),
+        &other.affineCoordinates().x.toBytes(.big),
+    );
+}

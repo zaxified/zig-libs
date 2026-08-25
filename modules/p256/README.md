@@ -24,6 +24,34 @@ has P-256 — it is a *performance-specialized reimplementation* justified by th
 measured gap plus the collection's thesis that native Zig should be usable
 INSTEAD of linking a C crypto library. See `SPEC.md §Dedup`.
 
+## Measured on the signing path (2026-08-25, i7-7920HQ, ReleaseFast)
+
+ECDSA P-256 **sign**, the operation a TLS server runs once per full handshake
+and a JWT issuer runs once per token:
+
+| | µs / sign | vs OpenSSL |
+|---|---|---|
+| `std.crypto.sign.ecdsa.EcdsaP256Sha256` | 394 | 16.0× |
+| `p256.EcdsaP256Sha256`, **before** the comb was reachable | 252 | 10.2× |
+| `p256.EcdsaP256Sha256`, today | **102** | 4.2× |
+| OpenSSL 3.5.5 `nistz256` (`openssl speed ecdsap256`) | 24.6 | 1.0× |
+
+⚠ **The step from 252 to 102 was not new code — it was connecting code that was
+already here.** `std.crypto.sign.ecdsa.Ecdsa.sign` computes `R` as
+`Curve.basePoint.mul(k, .big)`, and this module exports `EcdsaP256Sha256` as
+`Ecdsa(P256, Sha256)`. `P256.mul` is the *variable-base* multiply, so the
+fixed-base comb — built for signing, documented as the signing hot path, and
+differentialled against the ladder — **had no call site on the signing path at
+all**. `combMulBase` was reached only from `xmldsig`, which calls it by name.
+`P256.mul` now recognises the base point and redirects (235 µs → 56 µs on that
+multiply alone).
+
+The remaining 4.2× against nistz256 is not the field core, which is on
+(`field_asm_active`); it is the rest of the sign path — the scalar inversion
+and the RFC 6979 nonce — plus whatever nistz256's own comb does better. The
+stated 2–3× target is therefore **not met yet**, and this table is what to
+measure against rather than the target.
+
 ## Status: cores IMPLEMENTED (both gates on) + vartime wNAF verify
 
 The **portable path is real, constant-time, and byte-exact against
