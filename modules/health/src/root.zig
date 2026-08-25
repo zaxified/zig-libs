@@ -99,7 +99,33 @@ pub const Health = struct {
     pub fn middleware(h: *const Health) router.Middleware {
         return .{ .state = @constCast(h), .run = middlewareRun };
     }
+
+    /// Which probe this request is, if any.
+    ///
+    /// For a server that routes itself. `middleware` is the answer when there
+    /// is a `router` to hang it on; a server without one -- a single-purpose
+    /// API daemon, say -- would otherwise have to build a `router.Ctx` it has
+    /// no other use for, or reimplement the contract this module exists to
+    /// state. `metrics.Registry.respond` is the same shape.
+    pub fn probeFor(h: *const Health, method: http.Method, path: []const u8) ?Probe {
+        if (!isProbeMethod(method)) return null;
+        if (std.mem.eql(u8, path, h.live_path)) return .live;
+        if (std.mem.eql(u8, path, h.ready_path)) return .ready;
+        return null;
+    }
+
+    /// Answer one probe. Byte for byte what `middleware` writes -- both go
+    /// through the same two functions, so the two entry points cannot drift.
+    pub fn respond(h: *const Health, probe: Probe, res: *http.Server.ResponseWriter) anyerror!void {
+        return switch (probe) {
+            .live => respondLive(res),
+            .ready => respondReady(h, res),
+        };
+    }
 };
+
+/// Which of the two probes a request is.
+pub const Probe = enum { live, ready };
 
 fn isProbeMethod(m: http.Method) bool {
     return m == .get or m == .head;
@@ -169,6 +195,85 @@ fn respondReady(h: *const Health, res: *http.Server.ResponseWriter) anyerror!voi
     }
     try res.writeAll(detail_buf[0..detail_len]);
     if (truncated) try res.writeAll("not ready: ...\n");
+}
+
+test "probeFor recognises exactly the two probe paths, and only probe methods" {
+    const h: Health = .{ .live_path = "/healthz", .ready_path = "/readyz" };
+
+    try testing.expectEqual(Probe.live, h.probeFor(.get, "/healthz").?);
+    try testing.expectEqual(Probe.ready, h.probeFor(.get, "/readyz").?);
+    try testing.expectEqual(Probe.live, h.probeFor(.head, "/healthz").?);
+
+    // Anything else belongs to whatever the server serves.
+    try testing.expect(h.probeFor(.get, "/healthz/") == null);
+    try testing.expect(h.probeFor(.get, "/health") == null);
+    try testing.expect(h.probeFor(.get, "/") == null);
+    // A probe path under a method that is not a probe is not a probe. Without
+    // this, a POST to /readyz would be answered by the health module in a
+    // server that routes itself, which is not what the middleware does.
+    try testing.expect(h.probeFor(.post, "/readyz") == null);
+    try testing.expect(h.probeFor(.delete, "/healthz") == null);
+}
+
+var direct_health: ?*const Health = null;
+var direct_probe: Probe = .live;
+
+fn directHandler(_: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror!void {
+    return direct_health.?.respond(direct_probe, res);
+}
+
+fn runWireDirect(bytes: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [512]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = directHandler,
+        .server_name = null,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "respond writes what the middleware writes" {
+    // The claim that matters about the direct API: it is not a second
+    // implementation. Both entry points go through the same two functions,
+    // and this pins that they agree -- a copy that drifted would make the
+    // probe contract depend on how the server happened to be wired.
+    var checks = [_]Check{.{ .name = "database", .checkFn = flagCheck }};
+    var h = Health{ .checks = &checks };
+    ready_flag = false;
+    defer ready_flag = true;
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(h.middleware());
+    try r.get("/", hApp);
+
+    var a_buf: [1024]u8 = undefined;
+    var b_buf: [1024]u8 = undefined;
+    const through = runWire(&r, wire("/readyz"), &a_buf);
+
+    direct_health = &h;
+    direct_probe = .ready;
+    const direct = runWireDirect(wire("/readyz"), &b_buf);
+
+    try testing.expect(std.mem.startsWith(u8, through, "HTTP/1.1 503"));
+    try testing.expectEqualStrings(bodyOf(through), bodyOf(direct));
+    try testing.expectEqualStrings("not ready: database\n", bodyOf(direct));
+
+    // And the liveness half, which has no state to get wrong and would
+    // therefore be the easy one to leave unchecked.
+    direct_probe = .live;
+    const live_direct = runWireDirect(wire("/healthz"), &b_buf);
+    const live_through = runWire(&r, wire("/healthz"), &a_buf);
+    try testing.expectEqualStrings(bodyOf(live_through), bodyOf(live_direct));
 }
 
 // ── tests (offline — through http.Server.serveStream) ───────────────────────
