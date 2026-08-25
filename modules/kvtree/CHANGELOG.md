@@ -10,10 +10,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   freelist itself — a simplification taken to dodge the chicken-and-egg of a freelist
   write describing the page it is being written to. It was not orthogonal to anything:
   every commit rewrites the chain, so every commit permanently added `pagesNeeded()`
-  entries to the list, which lengthened the chain, which added more entries. Measured
-  downstream on a modest append workload: **over a gigabyte an hour**, and a 13 GB file
-  before anyone noticed. Exactly one page leaked per commit even on a workload whose
-  data set never grew.
+  entries to the list, which lengthened the chain, which added more entries.
+
+  **Net file growth per commit equalled `pagesNeeded()` — the current chain length —
+  exactly**, which is both the mechanism and the amplification: the leak per commit is
+  the chain length, and the chain lengthens because of the leak. It is why the same
+  defect shows as one page per commit here (a short list that fits a single chain page)
+  and as two downstream (a longer list needing two).
+
+  **The cost is per COMMIT and independent of what the commit carries**, so it scales
+  with commit rate, not with data rate. Measured downstream on a tsdb-shaped append
+  workload — 23 series, 17-byte keys, 8-byte values, every key new — a commit of three
+  points and a commit of sixteen both cost exactly 8 KiB. Straight-line fits over
+  60-second windows on that store: **327 KB/s at one commit per value**, 16.4 KB/s at
+  one commit per source-resolve, 8.1 KB/s with the retention sweep rate-limited, and
+  3.3 KB/s after widening the sampling interval. A 13 GB store accumulated over an
+  afternoon of intermittent runs.
+
+  **What it looks like from outside**, for anyone recognising their own case: a store
+  growing megabytes per minute while holding kilobytes of data, and a batch-your-writes
+  change paying off enormously for reasons that have nothing to do with I/O. That last
+  one is the trap — downstream, batching cut the rate twentyfold and read as a win
+  rather than as a symptom, which is part of why the real defect survived another pass.
 
   The chicken-and-egg dissolves by ORDERING, not by giving up reuse: take the storage
   pages out of the list first, then encode what remains, so nothing describes itself.
