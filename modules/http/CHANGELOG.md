@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-25** — `h2.Connection.sendHeaders` no longer allocates the HPACK
+  block for every response. It built the block in a fresh `ArrayList` and freed
+  it again on each call; the buffer now lives on the `Connection` beside
+  `recv_buf` and is cleared rather than freed. Capacity settles at the largest
+  header block the connection has sent, which `max_header_block` already
+  bounds, so nothing new is unbounded, and it is safe for the same reason the
+  encoder's dynamic table is: `sendHeaders` already mutates `hpack_enc` on
+  every call, so it has always required exclusive access to the connection.
+
+  **Measured, and smaller than it looks:** on a server answering a fixed
+  112-byte body, allocator work fell by 239 instructions per request but the
+  total fell by only 66 — about **0.26%** — because most of what the h2 path
+  allocates is not this list. Throughput moved +2.1% against a run-to-run
+  spread of ±12%, i.e. not measurably at all. Kept because removing a
+  per-response allocation from a hot path is right on its own terms, not
+  because it bought speed.
+
+  For anyone tempted to chase the rest: with 400 requests profiled under
+  callgrind, allocation is about 12% of the h2 path's instructions and the
+  serialise-and-reparse round trip (the handler writes an HTTP/1.1 response
+  and `Framer.feed` parses it back with `h1.HeaderIterator` to re-emit it as
+  HPACK) is about another 12%. HPACK encoding of the response is ~12% more.
+  h2 costing roughly 2.3x h1 in this server is spread across framing, HPACK in
+  both directions, per-stream state and flow control — it is not one hotspot,
+  and no contained change will close it.
+
 - **2026-08-23** — **`Client.Options.user_agent` now reaches HTTP/2 too; it was
   silently dropped there.** Every one of the option's call sites flowed into the
   HTTP/1 head writer and nowhere else, so the same `Client` with the same
