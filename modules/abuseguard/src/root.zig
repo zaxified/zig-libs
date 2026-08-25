@@ -155,6 +155,11 @@ pub const Options = struct {
     /// approximation of fail2ban's `findtime` — strikes older than
     /// `ban_threshold * strike_decay_ms` can never accumulate to an
     /// offense). 0 = strikes never decay.
+    ///
+    /// Drains in **whole** strikes, so `ban_threshold` means the same number
+    /// of unit strikes whatever this is set to. Draining a fraction of a
+    /// strike per nanosecond would make N strikes arriving together sum to
+    /// marginally under N, and `ban_threshold = N` would silently mean N+1.
     strike_decay_ms: u64 = 2 * std.time.ms_per_min,
     /// The offense count at which an auto-greylisting escalates to a
     /// permanent ban (fail2ban recidive shape): 2 = first offense
@@ -356,8 +361,18 @@ pub const Guard = struct {
         lockSpin(&g.lock);
         defer g.lock.unlock();
         const e = g.getOrCreate(ip.as16(), now_ns) orelse return;
-        e.strikes = g.decayedStrikes(e, now_ns) + @as(f64, @floatFromInt(weight));
-        e.strikes_updated_ns = now_ns;
+        const drained = g.drainedSince(e, now_ns);
+        e.strikes = @max(0, e.strikes - @as(f64, @floatFromInt(drained))) +
+            @as(f64, @floatFromInt(weight));
+        // Advance by what actually drained, not to `now`: discarding the
+        // remainder would mean a client striking just inside the interval
+        // never drains at all. When nothing is left to drain there is no
+        // remainder worth keeping, and letting the mark lag would build up a
+        // huge drain for the next strike.
+        e.strikes_updated_ns = if (e.strikes == 0 or g.options.strike_decay_ms == 0)
+            now_ns
+        else
+            e.strikes_updated_ns +| (drained *| (g.options.strike_decay_ms *| std.time.ns_per_ms));
         if (e.strikes < @as(f64, @floatFromInt(g.options.ban_threshold))) return;
         // Offense: reset the balance, escalate.
         e.strikes = 0;
@@ -521,11 +536,26 @@ pub const Guard = struct {
 
     /// The strike balance after lazy decay: one strike drains per
     /// `strike_decay_ms`, floored at 0.
+    ///
+    /// Whole strikes, not a fraction of one. `strike_decay_ms` is documented
+    /// as "one strike drains per this interval", and draining continuously
+    /// meant something else: three unit strikes arriving together summed to
+    /// 2.99997, so `ban_threshold = 3` needed a fourth strike. That held for
+    /// **any** non-zero decay, so the default configuration could never reach
+    /// its own threshold in the number of strikes it names — and every
+    /// threshold test in this file set `strike_decay_ms = 0` "to keep the
+    /// arithmetic exact", which is precisely the region where it was wrong.
     fn decayedStrikes(g: *const Guard, e: *const Entry, now_ns: u64) f64 {
         if (g.options.strike_decay_ms == 0) return e.strikes;
-        const decay_ns: f64 = @floatFromInt(g.options.strike_decay_ms *| std.time.ns_per_ms);
-        const elapsed_ns: f64 = @floatFromInt(now_ns -| e.strikes_updated_ns);
-        return @max(0, e.strikes - elapsed_ns / decay_ns);
+        return @max(0, e.strikes - @as(f64, @floatFromInt(g.drainedSince(e, now_ns))));
+    }
+
+    /// Whole strikes that have drained since this entry's strikes were last
+    /// accounted for.
+    fn drainedSince(g: *const Guard, e: *const Entry, now_ns: u64) u64 {
+        if (g.options.strike_decay_ms == 0) return 0;
+        const decay_ns = g.options.strike_decay_ms *| std.time.ns_per_ms;
+        return (now_ns -| e.strikes_updated_ns) / decay_ns;
     }
 
     fn removeEntry(g: *Guard, e: *Entry) void {
@@ -780,6 +810,60 @@ test "record: strike decay drains one strike per strike_decay_ms" {
     tc.advanceMs(1000); // balance 2 → 1
     g.record(ip, 2); // 1 + 2 = 3 → offense
     try testing.expect(g.isGreylisted(ip));
+}
+
+test "record: ban_threshold means that many strikes, decay on or off" {
+    // The bug this pins: with a continuous drain, three unit strikes arriving
+    // in the same microsecond summed to 2.99997, so a `ban_threshold` of 3
+    // was not reached until the fourth. It held for any non-zero decay, which
+    // is every default configuration -- and no test saw it, because every
+    // other threshold test in this file disables decay "to keep the
+    // arithmetic exact".
+    //
+    // Deliberately uses the *real* clock rather than the fake one. The fake
+    // clock only moves when a test moves it, in whole milliseconds, so it
+    // cannot produce the sub-interval elapsed time that caused this. A test
+    // that cannot reach the state under test is not a test.
+    for ([_]u64{ 0, 1000, 2 * std.time.ms_per_min }) |decay_ms| {
+        var g = Guard.init(testing.allocator, .{
+            .ban_threshold = 3,
+            .ban_after_offenses = 0,
+            .strike_decay_ms = decay_ms,
+        });
+        defer g.deinit();
+        const ip = mkIp("192.0.2.77");
+
+        g.record(ip, 1);
+        g.record(ip, 1);
+        try testing.expect(!g.isGreylisted(ip));
+        g.record(ip, 1);
+        try testing.expect(g.isGreylisted(ip));
+    }
+}
+
+test "record: a drip just inside the decay interval still drains" {
+    // The other half of the same change. Advancing the drain mark to `now`
+    // rather than by what actually drained would discard the remainder, and a
+    // client striking every `decay_ms - 1` would then never drain a thing.
+    // Here it does: 5 strikes at 900ms apart against a 1000ms drain leave a
+    // balance below the threshold rather than five.
+    var tc: TestClock = .{};
+    var g = Guard.init(testing.allocator, .{
+        .ban_threshold = 5,
+        .ban_after_offenses = 0,
+        .strike_decay_ms = 1000,
+        .clock = tc.clock(),
+    });
+    defer g.deinit();
+    const ip = mkIp("192.0.2.78");
+
+    for (0..5) |_| {
+        g.record(ip, 1);
+        tc.advanceMs(900);
+    }
+    // 5 strikes, 4 whole seconds of elapsed time between the first and last:
+    // four of them drained, so the balance never reached 5.
+    try testing.expect(!g.isGreylisted(ip));
 }
 
 test "per-IP isolation: strikes, greylists and counters never leak across IPs" {
