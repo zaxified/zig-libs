@@ -108,12 +108,22 @@ pub const Pager = struct {
 // page header is `count(u16) + next(PageId u32)`, followed by up to
 // `capacity` fixed 12-byte entries. A commit that frees more pages than one
 // page holds simply chains another — there is no cap on how many pages may be
-// parked, only on how many fit per chain page. Chain-storage pages themselves
-// are allocated via `Pager.growOne` only (never `popReusable`): that sidesteps
-// the classic chicken-and-egg problem of a freelist write needing to itself
-// describe the very page it is about to be written to, at the cost of never
-// reusing a freed page for freelist storage (a documented simplification,
-// orthogonal to the reuse-safety invariant `reclaimGate` enforces).
+// parked, only on how many fit per chain page. The chain is followed by its
+// `next` pointers, so its pages need not be contiguous.
+//
+// Chain-storage pages are RECYCLED like any other (`reserveChain`). They used
+// to come from `Pager.growOne` only, to sidestep the chicken-and-egg of a
+// freelist write having to describe the very page it is about to be written
+// to. That simplification was not orthogonal to anything: it made the store
+// grow for ever. Each commit rewrites the chain, so each commit permanently
+// added `pagesNeeded()` entries to the list, which lengthened the chain, which
+// added more entries — self-amplifying, and measured at over a gigabyte an
+// hour on a modest append workload before it was found.
+//
+// The chicken-and-egg dissolves by ORDERING rather than by giving up reuse:
+// take the storage pages OUT of the list first, then encode what remains. A
+// popped page is no longer an entry, so nothing describes itself. What the
+// ordering must also respect is the crash-safety half — see `reserveChain`.
 
 pub const Freelist = struct {
     ids: std.ArrayList(PageId) = .empty,
@@ -158,6 +168,64 @@ pub const Freelist = struct {
         return null;
     }
 
+    /// Entries the chain will hold if `extra` more are pushed, rounded up to
+    /// whole pages.
+    fn pagesFor(entries: usize) usize {
+        if (entries == 0) return 0;
+        return (entries + capacity - 1) / capacity;
+    }
+
+    /// Choose the storage pages for this commit's chain, recycling wherever the
+    /// reclaim gate allows and growing only when it does not.
+    ///
+    /// **Call this BEFORE pushing this commit's own freed pages**, and that
+    /// ordering is the crash-safety half of the argument, not a convenience: at
+    /// this moment every entry in `self` was freed by an EARLIER txn, so by the
+    /// copy-on-write invariant none of them is reachable from the still-durable
+    /// base meta. Reserve after pushing and a commit could write its chain onto
+    /// a page its own base tree still needs — invisible until a crash between
+    /// the two fsyncs, at which point recovery adopts a base whose tree has a
+    /// hole in it. `reclaimGate` cannot catch that; it only knows about readers.
+    ///
+    /// `extra` is how many entries the caller is about to push. The count is a
+    /// fixed point — taking a page from the list shortens the list, which can
+    /// shorten the chain — so a page is recycled only when doing so leaves the
+    /// arithmetic consistent, and grown otherwise. Both loops terminate because
+    /// the reserved count strictly rises while the needed count never does.
+    pub fn reserveChain(
+        self: *Freelist,
+        gpa: Allocator,
+        pager: *Pager,
+        extra: usize,
+        oldest_reader_txn: u64,
+    ) Allocator.Error![]PageId {
+        var out: std.ArrayList(PageId) = .empty;
+        errdefer out.deinit(gpa);
+        while (true) {
+            const need = pagesFor(self.ids.items.len + extra);
+            if (need <= out.items.len) {
+                // Exactly, never more: a surplus page would be one this call had
+                // taken out of the list and then never written anywhere — a leak
+                // of the same kind as the one this function exists to fix.
+                std.debug.assert(need == out.items.len);
+                break;
+            }
+            // Recycling is self-defeating when removing this entry would drop the
+            // requirement below what we would then hold (the single-entry case:
+            // one page parked, one page needed to say so). Grow there instead —
+            // as when there is nothing parked to recycle at all, which is every
+            // commit on a young store.
+            const worth_popping = self.ids.items.len > 0 and
+                pagesFor(self.ids.items.len - 1 + extra) >= out.items.len + 1;
+            const id = if (worth_popping)
+                self.popReusable(oldest_reader_txn) orelse pager.growOne()
+            else
+                pager.growOne();
+            try out.append(gpa, id);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
     /// Chain pages needed to persist the current entry count (0 if empty).
     pub fn pagesNeeded(self: *const Freelist) usize {
         const n = self.ids.items.len;
@@ -177,29 +245,38 @@ pub const Freelist = struct {
         }
     }
 
-    /// Write the whole list as a chain of fresh pages and return the chain
-    /// head (0 if empty). Storage pages come only from `pager.growOne` (see
-    /// the container doc comment) — this never touches `popReusable`, so it
-    /// can safely be called after this commit's own freed pages have already
-    /// been pushed into `self`.
-    pub fn writeChain(self: *const Freelist, pager: *Pager) StorageError!PageId {
+    /// Write the whole list as a chain onto `pages` and return the chain head
+    /// (0 if the list is empty). `pages` comes from `reserveChain` and may be
+    /// any set of page ids, contiguous or not — the chain is linked by its
+    /// `next` field, and every reader (`readFreelistChain`, and recovery's
+    /// `candidateValid`) follows that rather than assuming adjacency.
+    pub fn writeChainOn(self: *const Freelist, pager: *Pager, pages: []const PageId) StorageError!PageId {
         const n = self.ids.items.len;
+        std.debug.assert(pages.len == self.pagesNeeded());
         if (n == 0) return 0;
-        const npages = self.pagesNeeded();
-        const first_id: PageId = @intCast(pager.high_water);
-        pager.high_water += npages; // reserve npages consecutive fresh ids
 
         var buf: [page_size]u8 = undefined;
         var start: usize = 0;
-        var i: usize = 0;
-        while (i < npages) : (i += 1) {
+        for (pages, 0..) |id, i| {
             const take = @min(capacity, n - start);
-            const next: PageId = if (i + 1 < npages) first_id + @as(PageId, @intCast(i + 1)) else 0;
+            const next: PageId = if (i + 1 < pages.len) pages[i + 1] else 0;
             encodeChunk(self.ids.items[start .. start + take], self.free_txns.items[start .. start + take], next, &buf);
-            try pager.writePage(first_id + @as(PageId, @intCast(i)), &buf);
+            try pager.writePage(id, &buf);
             start += take;
         }
-        return first_id;
+        return pages[0];
+    }
+
+    /// `writeChainOn` onto freshly grown pages — no recycling. Kept for tests
+    /// and for any caller with no reclaim context; `core.commit` uses
+    /// `reserveChain` + `writeChainOn`, which is what stops the file growing.
+    pub fn writeChain(self: *const Freelist, gpa: Allocator, pager: *Pager) (StorageError || Allocator.Error)!PageId {
+        const npages = self.pagesNeeded();
+        if (npages == 0) return 0;
+        const pages = try gpa.alloc(PageId, npages);
+        defer gpa.free(pages);
+        for (pages) |*id| id.* = pager.growOne();
+        return self.writeChainOn(pager, pages);
     }
 };
 
@@ -300,7 +377,7 @@ test "freelist writeChain/readFreelistChain round-trip (well below capacity)" {
     try fl.push(testing.allocator, 4, 5);
     try testing.expectEqual(@as(usize, 1), fl.pagesNeeded());
 
-    const head = try fl.writeChain(&p);
+    const head = try fl.writeChain(testing.allocator, &p);
     try testing.expect(head != 0);
 
     var back = try readFreelistChain(testing.allocator, &p, head);
@@ -317,7 +394,7 @@ test "freelist chain: empty list writes/reads as head 0, no pages" {
 
     var fl = Freelist{};
     defer fl.deinit(testing.allocator);
-    try testing.expectEqual(@as(PageId, 0), try fl.writeChain(&p));
+    try testing.expectEqual(@as(PageId, 0), try fl.writeChain(testing.allocator, &p));
 
     var back = try readFreelistChain(testing.allocator, &p, 0);
     defer back.deinit(testing.allocator);
@@ -337,7 +414,7 @@ test "freelist chain: exactly at one page's capacity stays a single page" {
         try fl.push(testing.allocator, i + 100, 1);
     try testing.expectEqual(@as(usize, 1), fl.pagesNeeded());
 
-    const head = try fl.writeChain(&p);
+    const head = try fl.writeChain(testing.allocator, &p);
     var back = try readFreelistChain(testing.allocator, &p, head);
     defer back.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), back.pages.items.len);
@@ -357,7 +434,7 @@ test "freelist chain: ONE OVER capacity forces a second chain page (the overflow
         try fl.push(testing.allocator, i + 100, 1);
     try testing.expectEqual(@as(usize, 2), fl.pagesNeeded());
 
-    const head = try fl.writeChain(&p);
+    const head = try fl.writeChain(testing.allocator, &p);
     var back = try readFreelistChain(testing.allocator, &p, head);
     defer back.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), back.pages.items.len);
@@ -396,7 +473,7 @@ test "freelist chain: freeing MORE pages than one page holds survives a simulate
         try fl.push(testing.allocator, i + 1000, 42); // all freed by txn 42
     try testing.expectEqual(@as(usize, 3), fl.pagesNeeded());
 
-    const head = try fl.writeChain(&p);
+    const head = try fl.writeChain(testing.allocator, &p);
     const high_water_after_write = p.high_water;
 
     // Simulate reopen: a fresh Pager over the SAME store/handle, as `recover`
@@ -415,4 +492,94 @@ test "freelist chain: freeing MORE pages than one page holds survives a simulate
     while (back.fl.popReusable(42)) |_| reused += 1;
     try testing.expectEqual(total, reused);
     try testing.expectEqual(@as(usize, 0), back.fl.len());
+}
+
+test "reserveChain recycles a parked page instead of growing, and takes exactly what the chain needs" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+
+    var fl = Freelist{};
+    defer fl.deinit(testing.allocator);
+    // Two pages parked by an EARLIER txn (1), so both pass the gate below.
+    try fl.push(testing.allocator, 30, 1);
+    try fl.push(testing.allocator, 31, 1);
+    const high_water_before = p.high_water;
+
+    // One entry about to be pushed → three entries total → one chain page,
+    // and it must come from the freelist rather than from the end of the file.
+    const pages = try fl.reserveChain(testing.allocator, &p, 1, 5);
+    defer testing.allocator.free(pages);
+    try testing.expectEqual(@as(usize, 1), pages.len);
+    try testing.expectEqual(high_water_before, p.high_water); // nothing grown
+    try testing.expectEqual(@as(usize, 1), fl.len()); // the page it took is gone
+    try fl.push(testing.allocator, 99, 6);
+    try testing.expectEqual(@as(usize, 1), fl.pagesNeeded()); // sized exactly
+
+    const head = try fl.writeChainOn(&p, pages);
+    try testing.expectEqual(pages[0], head);
+    var back = try readFreelistChain(testing.allocator, &p, head);
+    defer back.deinit(testing.allocator);
+    try testing.expectEqualSlices(PageId, fl.ids.items, back.fl.ids.items);
+}
+
+test "reserveChain grows when the list is empty or when recycling would undercut the count" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+
+    { // nothing parked: the only source is the end of the file
+        var fl = Freelist{};
+        defer fl.deinit(testing.allocator);
+        const before = p.high_water;
+        const pages = try fl.reserveChain(testing.allocator, &p, 3, 5);
+        defer testing.allocator.free(pages);
+        try testing.expectEqual(@as(usize, 1), pages.len);
+        try testing.expectEqual(before + 1, p.high_water);
+    }
+    { // ONE entry parked and nothing else: taking it would leave nothing to
+        // describe, so the page needed to describe it must be grown. Recycling
+        // here would oscillate — the case that makes the count a fixed point
+        // rather than a division.
+        var fl = Freelist{};
+        defer fl.deinit(testing.allocator);
+        try fl.push(testing.allocator, 42, 1);
+        const before = p.high_water;
+        const pages = try fl.reserveChain(testing.allocator, &p, 0, 5);
+        defer testing.allocator.free(pages);
+        try testing.expectEqual(@as(usize, 1), pages.len);
+        try testing.expectEqual(before + 1, p.high_water); // grown, not recycled
+        try testing.expectEqual(@as(usize, 1), fl.len()); // entry still parked
+        try testing.expectEqual(fl.pagesNeeded(), pages.len);
+    }
+    { // an empty list needs no chain at all
+        var fl = Freelist{};
+        defer fl.deinit(testing.allocator);
+        const before = p.high_water;
+        const pages = try fl.reserveChain(testing.allocator, &p, 0, 5);
+        defer testing.allocator.free(pages);
+        try testing.expectEqual(@as(usize, 0), pages.len);
+        try testing.expectEqual(before, p.high_water);
+    }
+}
+
+test "reserveChain spans several chain pages, recycling every one of them" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var p = try testPager(&sim);
+
+    var fl = Freelist{};
+    defer fl.deinit(testing.allocator);
+    const parked = Freelist.capacity * 3;
+    var i: PageId = 0;
+    while (i < parked) : (i += 1) try fl.push(testing.allocator, i + 1000, 1);
+    const before = p.high_water;
+
+    const pages = try fl.reserveChain(testing.allocator, &p, 0, 5);
+    defer testing.allocator.free(pages);
+    try testing.expectEqual(before, p.high_water); // all recycled, none grown
+    try testing.expectEqual(fl.pagesNeeded(), pages.len);
+    // Every reserved page came out of the list, so none of them is also listed
+    // as free in the chain it is about to store.
+    for (pages) |id| for (fl.ids.items) |listed| try testing.expect(listed != id);
 }

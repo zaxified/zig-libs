@@ -672,3 +672,54 @@ test "smoke: module re-exports resolve; gate is readable regardless of value" {
     _ = Change;
     try testing.expectEqual(@as(usize, 4096), page_size);
 }
+
+test "steady state: overwriting a fixed key set stops growing the file (the freelist chain recycles)" {
+    // THE REGRESSION GATE for the unbounded-growth defect. Chain-storage pages
+    // used to come only from `Pager.growOne`, so every commit permanently added
+    // `pagesNeeded()` entries to the freelist, which lengthened the chain, which
+    // added more entries — self-amplifying. It went unnoticed because every
+    // other test either commits a handful of times or checks correctness rather
+    // than footprint; the cost only shows up as a store that never stops
+    // growing under a steady write load. Measured downstream before the fix: a
+    // modest append workload grew the file by over a gigabyte an hour.
+    //
+    // The workload overwrites a FIXED key set, so the tree's own size is
+    // constant and any growth is pure bookkeeping leak.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true; // COW page store: meta slots + page reuse
+    var db = try Db.open(testing.allocator, sim.storage(), "steady.kvt", .{});
+    defer db.close();
+
+    var key_buf: [16]u8 = undefined;
+    const val = "v" ** 64;
+    const keys = 16;
+
+    // Warm up: the tree reaches its shape, and the freelist reaches the state
+    // where a commit's frees can satisfy the next commit's allocations.
+    var i: usize = 0;
+    while (i < keys * 8) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i % keys});
+        try db.put(key, val);
+    }
+    const warm = db.meta_rec.high_water;
+
+    // Then a long run of the same thing. A leak of even ONE page per commit
+    // would show as +200 here; the old code leaked at least that.
+    while (i < keys * 8 + 200) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i % keys});
+        try db.put(key, val);
+    }
+    try testing.expectEqual(warm, db.meta_rec.high_water);
+
+    // …and the data is still right, so this is a steady state and not a store
+    // that quietly stopped writing.
+    var k: usize = 0;
+    while (k < keys) : (k += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{k});
+        const got = try db.get(testing.allocator, key);
+        defer if (got) |g| testing.allocator.free(g);
+        try testing.expect(got != null);
+        try testing.expectEqualStrings(val, got.?);
+    }
+}

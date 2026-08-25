@@ -27,9 +27,12 @@ that see a consistent snapshot without blocking the writer.
 > than a page, merge-less deletes (empty leaves persist until overwritten).
 > The on-disk freelist is a page CHAIN (not a single bounded page) — freeing
 > more pages than one page holds chains another, so nothing is silently
-> leaked; chain-storage pages are drawn only from fresh growth, never the
-> reuse pool. See `SPEC.md` for the A-vs-B design decision and the
-> verification argument.
+> leaked. Chain-storage pages are recycled from the freelist like tree pages;
+> the commit reserves them *before* parking its own freed pages, which is what
+> makes that safe (see `SPEC.md`). They were grown-only until 2026-08-25, and
+> since every commit rewrites the chain, that made the file grow without bound
+> — a page per commit even when the data set did not change. See `SPEC.md` for
+> the A-vs-B design decision and the verification argument.
 
 Provenance: clean-room. Design references only — LMDB (OpenLDAP Public
 License) and BoltDB (MIT) for the copy-on-write B-tree with double-buffered

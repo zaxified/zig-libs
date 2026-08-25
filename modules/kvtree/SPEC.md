@@ -74,7 +74,14 @@ Single 4 KiB page unit (`format.zig`):
 - **page 2…** — tree nodes and freelist pages, handed out by the `Pager`. The
   freelist is a page CHAIN — each freelist page carries a `next` pointer
   (0 = end) alongside its entries, so a commit that frees more pages than one
-  page holds simply chains another instead of losing ids.
+  page holds simply chains another instead of losing ids. The chain is followed
+  by those pointers, so its pages need not be adjacent, and they are RECYCLED
+  from the freelist like tree pages are. The order matters and is the commit's
+  to enforce: the chain's storage is reserved *before* this commit's own freed
+  pages are parked, so it can only ever be handed pages an earlier txn freed —
+  which copy-on-write guarantees the still-durable base meta does not reference.
+  Reserving after would let a commit overwrite a page its own base tree needs,
+  a hole that only a crash between the two fsyncs would reveal.
 
 A **node** is a slotted page: an 8-byte header (kind, count, and — for a branch
 — the leftmost child), a `count`-entry directory of 2-byte cell offsets kept in

@@ -101,7 +101,8 @@ pub const RecoverError = error{
 ///      rebuilt into a FRESH page (freelist-reused only past `reclaimGate`, or
 ///      grown); the base tree is never written to. Split separators thread up
 ///      recursively, growing a new root when the old one splits.
-///   2. Write the new freelist page (also COW — the old one is dead now).
+///   2. Write the new freelist chain (also COW — the old pages are dead now,
+///      and the new ones are recycled from pages earlier txns freed).
 ///   3. `fsync` #1 — every page the new meta will reference is on stable
 ///      media BEFORE any meta write. A crash up to here leaves both meta
 ///      slots exactly as they were: the new pages are unreachable garbage.
@@ -118,6 +119,11 @@ pub const RecoverError = error{
 /// been made, so an in-flight commit can never recycle a page its own base
 /// tree still references (the previous durable meta must stay intact until
 /// step 5; `reclaimGate` alone cannot see this case, it only knows readers).
+/// "Every allocation" includes the freelist chain's own storage, which is why
+/// `reserveChain` runs before the push loop and not after: the chain recycles
+/// like everything else, and it is that ordering — not a ban on reuse — that
+/// keeps it safe. Banning it was the original design and it made the file grow
+/// without bound, since every commit rewrites the chain.
 pub fn commit(
     gpa: Allocator,
     pager: *Pager,
@@ -174,19 +180,26 @@ pub fn commit(
     for (base_chain.pages.items) |pid|
         ctx.freed.append(arena, pid) catch return error.OutOfMemory;
 
-    // Record every page this commit made dead. No capacity cap: unlike a
-    // plain tree-node/freelist-storage allocation, `Freelist.writeChain`
-    // below draws its own storage pages from `pager.growOne` only — never
-    // `popReusable` — so it can never recycle a page the still-durable
-    // `base` meta still references before this commit's final fsync, and it
-    // is therefore always safe to do this push before writing the chain (see
-    // `Freelist`'s container doc comment). A batch of frees larger than one
-    // page's worth chains a second (third, ...) page instead of losing ids.
+    // Reserve the chain's OWN storage before parking anything this commit
+    // freed, and the order is load-bearing: right now every entry in `fl` was
+    // freed by an earlier txn, so copy-on-write guarantees none of them is
+    // reachable from the still-durable `base` meta and any of them may be
+    // written to. The pages `ctx.freed` is about to add are the opposite —
+    // `base`'s tree is made of them, and it must stay intact until fsync #2.
+    // Reserving first is what lets the chain recycle at all; reserving after
+    // would hand it exactly the pages it must not touch.
+    const chain_pages = fl.reserveChain(arena, pager, ctx.freed.items.len, oldest_reader_txn) catch
+        return error.OutOfMemory;
+
+    // Record every page this commit made dead. No capacity cap: a batch of
+    // frees larger than one page's worth chains a second (third, ...) page
+    // instead of losing ids, and `reserveChain` above already sized the chain
+    // for exactly these entries.
     for (ctx.freed.items) |pid|
         fl.push(arena, pid, new_txn) catch return error.OutOfMemory;
 
     var buf: [page_size]u8 = undefined;
-    const new_free_root = fl.writeChain(pager) catch return error.CommitFailed;
+    const new_free_root = fl.writeChainOn(pager, chain_pages) catch return error.CommitFailed;
 
     // fsync #1: all referenced pages durable before any meta write.
     pager.sync() catch return error.CommitFailed;
