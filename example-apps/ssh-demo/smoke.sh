@@ -26,13 +26,20 @@ cleanup() {
     rmdir "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
-# A timeout must run cleanup, not just die: SIGKILL on $$ cannot be trapped
-# and would orphan the child processes (still bound to the port) and $WORK.
-# The watchdog sends SIGTERM instead; this handler prints and exits, so the
-# EXIT trap above fires and kills the tracked PIDs.
-trap 'echo "smoke: TIMED OUT" >&2; exit 124' TERM
 
-( sleep 60; kill -TERM $$ 2>/dev/null ) &
+( sleep 60
+  echo "smoke: TIMED OUT" >&2
+  # ⚠ CLEANUP IS THE WATCHDOG'S JOB ON THIS PATH, because the script provably
+  # cannot do it. SIGKILL cannot be trapped, and a SIGTERM trap is DEFERRED
+  # until the foreground command returns — which, in the hang a watchdog exists
+  # for, is never. Measured: watchdog fired at t=2 s, the TERM trap ran at
+  # t=30 s, only once the blocking command ended by itself. So kill the
+  # script's other children here, run cleanup here, and SIGKILL the script
+  # last. (`kill -9 -$$` is not an option: a smoke test shares check-apps.sh's
+  # process group, so that would kill the gate too.)
+  for p in $(pgrep -P $$ 2>/dev/null); do [ "$p" = "$BASHPID" ] || kill -9 "$p" 2>/dev/null; done
+  cleanup
+  kill -9 $$ 2>/dev/null ) &
 PIDS+=($!)
 
 fail() {

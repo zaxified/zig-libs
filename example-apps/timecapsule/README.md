@@ -40,6 +40,8 @@ Then:
 
 ```sh
 ./zig-out/bin/timecapsule keygen --out alice        # alice.pk (share) + alice.sk (keep)
+# keygen refuses if alice.pk/alice.sk already exist — overwriting a secret key
+# orphans every capsule sealed to it, so it is never done silently.
 echo "the eagle lands at midnight" > msg.txt
 ./zig-out/bin/timecapsule seal --to alice.pk --at +2m --in msg.txt --out msg.tc
 ./zig-out/bin/timecapsule open --key alice.sk --in msg.tc --out msg.out

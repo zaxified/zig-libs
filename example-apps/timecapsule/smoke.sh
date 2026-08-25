@@ -23,14 +23,22 @@ cleanup() {
     rmdir "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
-# A timeout must run cleanup, not just die: SIGKILL on $$ cannot be trapped and
-# would orphan the `open --wait` child and $WORK. The watchdog sends SIGTERM;
-# this handler exits so the EXIT trap fires.
-trap 'echo "smoke: TIMED OUT" >&2; exit 124' TERM
 
 # A watchdog: the app is offline here (every beacon document comes from a
 # file), so anything long-running is a hang, not a download. 60s is ~20x.
-( sleep 60; kill -TERM $$ 2>/dev/null ) &
+( sleep 60
+  echo "smoke: TIMED OUT" >&2
+  # ⚠ CLEANUP IS THE WATCHDOG'S JOB ON THIS PATH, because the script provably
+  # cannot do it. SIGKILL cannot be trapped, and a SIGTERM trap is DEFERRED
+  # until the foreground command returns — which, in the hang a watchdog exists
+  # for, is never. Measured: watchdog fired at t=2 s, the TERM trap ran at
+  # t=30 s, only once the blocking command ended by itself. So kill the
+  # script's other children here, run cleanup here, and SIGKILL the script
+  # last. (`kill -9 -$$` is not an option: a smoke test shares check-apps.sh's
+  # process group, so that would kill the gate too.)
+  for p in $(pgrep -P $$ 2>/dev/null); do [ "$p" = "$BASHPID" ] || kill -9 "$p" 2>/dev/null; done
+  cleanup
+  kill -9 $$ 2>/dev/null ) &
 WATCHDOG=$!
 disown "$WATCHDOG"
 
@@ -127,5 +135,26 @@ wait "$WAITER"
 [ "$(cat wait.rc)" = 0 ] || fail "open --wait exited $(cat wait.rc) (log: $(cat wait.log))"
 grep -q "waiting — round 1000" wait.log || fail "open --wait never announced it was waiting — did it wait at all?"
 cmp -s msg.txt waited.out || fail "--wait plaintext differs"
+
+# ── 6. a HOSTILE capsule must not crash the process ────────────────────────
+# The envelope's round field is 8 attacker-written bytes that no signature
+# covers on this path (`info` never reaches the AEAD tag). Patch a real capsule
+# to claim round 2^64-1 and to claim round 0. Both must produce a typed refusal
+# or a "still locked" verdict — never a panic. This case exists because the
+# first fix for it (saturating arithmetic) only MOVED the abort into the date
+# formatter, and nothing here would have noticed.
+# Offset 44 = capsule header (37) + the envelope's round_off (7).
+for hostile in ffffffffffffffff 0000000000000000; do
+    cp msg.tc hostile.tc
+    printf "$(echo "$hostile" | sed 's/../\\x&/g')" | dd of=hostile.tc bs=1 seek=44 conv=notrunc 2>/dev/null
+    set +e
+    "$BIN" info --in hostile.tc "${OFFLINE[@]}" > hostile.out 2>&1
+    rc=$?
+    set -e
+    case "$rc" in
+        1|3) ;;
+        *) fail "a capsule claiming round 0x$hostile made \`info\` exit $rc (134 = panic); output: $(cat hostile.out)" ;;
+    esac
+done
 
 echo "smoke: OK"

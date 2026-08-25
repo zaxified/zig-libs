@@ -108,8 +108,22 @@ pub fn wallNow() i64 {
 
 /// `1997-08-29 02:14:00 UTC` — `datefmt`'s civil-calendar core does the
 /// date math; rendering stays here so the buffer is the caller's.
+///
+/// ⚠ TOTAL BY CONSTRUCTION. `unix` reaches here from `publishTime`, whose input
+/// round comes straight off a capsule an attacker writes, so it can be the
+/// saturated `i64` maximum. The civil conversion then yields a year no `u32`
+/// cast survives, and this aborted the process. Making `publishTime` saturating
+/// was not enough on its own — it only MOVED the panic here, which is the
+/// lesson worth keeping: a clamp is not a fix until every consumer of the
+/// clamped value is total too. Outside the printable calendar, say so instead.
+const min_printable_unix: i64 = -62135596800; // 0001-01-01T00:00:00Z
+const max_printable_unix: i64 = 253402300799; // 9999-12-31T23:59:59Z
+
 pub fn formatUtc(buf: []u8, unix: i64) []const u8 {
+    if (unix < min_printable_unix) return "before year 1 (malformed capsule)";
+    if (unix > max_printable_unix) return "after year 9999 (malformed capsule)";
     const p = datefmt.unixToParts(unix);
+    // Now in 1..9999 by the guard above, so the cast cannot trap.
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{
         @as(u32, @intCast(p.year)), p.month, p.day, p.hour, p.minute, p.second,
     }) catch unreachable;

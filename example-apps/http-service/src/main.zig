@@ -315,15 +315,21 @@ fn getTask(ctx: *router.Ctx) anyerror!void {
     const id = parseId(ctx) orelse return jsonError(ctx, 400, "bad task id");
     var aw: std.Io.Writer.Allocating = .init(app.gpa);
     defer aw.deinit();
-    {
-        appLock(app);
-        defer app.lock.unlock();
-        const idx = findTaskIndex(app, id) orelse return jsonError(ctx, 404, "no such task");
-        // Render under the lock (a concurrent DELETE could free the title);
-        // write to the socket after unlocking, same reason as listTasks.
-        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        try writeTaskJson(&jw, &app.tasks.items[idx]);
-    }
+    // Render under the lock (a concurrent DELETE could free the title); every
+    // response byte — including the 404 — is written after unlocking, which is
+    // what the other handlers do and what makes the rule easy to keep.
+    appLock(app);
+    const idx = findTaskIndex(app, id) orelse {
+        app.lock.unlock();
+        return jsonError(ctx, 404, "no such task");
+    };
+    var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+    writeTaskJson(&jw, &app.tasks.items[idx]) catch |err| {
+        app.lock.unlock();
+        return err;
+    };
+    app.lock.unlock();
+
     ctx.res.setStatus(200);
     try ctx.res.setHeader("Content-Type", "application/json");
     try ctx.res.writer().writeAll(aw.written());

@@ -1314,6 +1314,13 @@ const Commands = struct {
             const p = std.fmt.bufPrint(&stdin_path_buf, "/tmp/ssh-demo-stdin-{d}-{d}", .{
                 std.os.linux.getpid(), self.runs,
             }) catch unreachable;
+            // Clear a stale file first. A previous incarnation holding this pid
+            // may have been SIGKILLed before its deferred delete ran, and an
+            // exclusive create would then fail on that path forever. Unlinking
+            // does not weaken the guard above: it removes the LINK, never its
+            // target, and a symlink re-planted between the two calls still
+            // meets `exclusive` and is refused.
+            std.Io.Dir.cwd().deleteFile(self.io, p) catch {};
             var f = std.Io.Dir.cwd().createFile(self.io, p, .{ .truncate = true, .exclusive = true }) catch |err| {
                 std.debug.print("ssh-demo: cannot create stdin temp {s}: {t}\n", .{ p, err });
                 return err;
