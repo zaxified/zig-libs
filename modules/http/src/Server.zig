@@ -1313,10 +1313,24 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
         const cap = opts.max_requests_per_conn;
         const force_close = cap != 0 and req_index + 1 >= cap;
 
-        // Borrowed for this request and given back after it, when the caller
-        // supplied somewhere to borrow from. The lend/return pair brackets
-        // exactly one request, which is what makes a parked connection cost
-        // nothing: see `BuffersProvider`.
+        // ⭐⭐⭐ Wait for the next request BEFORE borrowing anything.
+        //
+        // The wait is the whole point. A keep-alive connection spends most of
+        // its life here, and if the borrow window covers the wait then a
+        // borrowed set is held exactly as long as a per-connection one and
+        // the mechanism buys nothing -- it costs, because now there is an
+        // allocator in the path too. The first version of this did that: the
+        // acquire sat above `serveOne`, whose first act is this same wait,
+        // and a pool measured under 1024 connections at one request a second
+        // grew to 896 slabs with an idle list that was empty every time it
+        // was asked. Per-connection memory went UP by 4 KiB.
+        //
+        // Any failure here -- client hung up between requests, idle timeout
+        // -- is a quiet close, as it was when `serveOne` owned this line.
+        _ = in.peekByte() catch break;
+
+        // Borrowed for this request and given back after it. The pair now
+        // brackets exactly the time a request is being served.
         var lent: ?StreamBuffers = null;
         const use = if (opts.buffers_provider) |p| blk: {
             lent = p.acquire(p.ctx);
@@ -1342,9 +1356,8 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
 const ConnDisposition = enum { keep_alive, close };
 
 fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32, force_close: bool) ConnDisposition {
-    // Wait for the next request (keep-alive idle); any failure here — client
-    // hung up between requests, idle timeout — is a quiet close.
-    _ = in.peekByte() catch return .close;
+    // The wait for this request already happened in `serveLoop`, above the
+    // point where working memory is borrowed. See the comment there.
 
     var date_buf: [http_date_len]u8 = undefined;
     const date: ?[]const u8 = if (opts.now) |n| formatHttpDate(n.epochSeconds(n.ctx), &date_buf) else null;
@@ -5307,4 +5320,21 @@ test "PooledBuffers: successive requests reuse one slab" {
     try testing.expectEqual(@as(usize, 1), pool.allocCount());
     try testing.expectEqual(@as(usize, 2), pool.reuseCount());
     try testing.expectEqual(@as(usize, 1), pool.idleCount());
+}
+
+test "buffers_provider: nothing is borrowed while the connection waits" {
+    // ⭐ The regression this pins is the one that made the whole mechanism
+    // pointless: if the borrow window covers the wait for the next request,
+    // a set is held for as long as a per-connection one would be. The wire
+    // here ends after two requests with no `Connection: close`, so the loop
+    // takes a third turn and finds end-of-stream. Borrowing before the wait
+    // costs a third acquire; borrowing after it does not.
+    var cp: CountingProvider = .{};
+    var out_buf: [4096]u8 = undefined;
+    const got = runWithProvider(cp.provider(), "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "hello"));
+    try testing.expectEqual(@as(usize, 2), cp.acquires);
+    try testing.expectEqual(@as(usize, 2), cp.releases);
 }
