@@ -197,6 +197,15 @@ pub const PooledBuffers = struct {
 
     /// What to construct the pool with. A pool whose slabs are a different
     /// size cannot serve this layout.
+    ///
+    /// ⚠ Deliberately NOT in the slab: the serving loop's own per-request
+    /// state (the response writer, the path-normalization buffer). It was
+    /// tried -- measured at 200-connection saturation, in-flight borrows
+    /// approach the connection count (responses park on full sockets), so a
+    /// bigger slab is paid per CONNECTION exactly when memory is scarcest:
+    /// +14 KiB of slab cost +18 KiB/conn of RSS. A caller who parks its
+    /// keep-alive wait outside `serveStep` gets those frame pages back for
+    /// free between requests; a slab carries them forever.
     pub fn slabSize(l: PooledBuffers) usize {
         return l.head_len + l.request_body_len + l.response_body_len + l.chunk_len + l.trailers_len;
     }
@@ -1308,10 +1317,6 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
     var req_index: u32 = 0;
     while (true) {
         if (tr) |t| t.armRequest();
-        // Per-connection request cap: when this request reaches the limit
-        // its response is forced to `Connection: close` and the loop ends.
-        const cap = opts.max_requests_per_conn;
-        const force_close = cap != 0 and req_index + 1 >= cap;
 
         // ⭐⭐⭐ Wait for the next request BEFORE borrowing anything.
         //
@@ -1329,31 +1334,68 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
         // -- is a quiet close, as it was when `serveOne` owned this line.
         _ = in.peekByte() catch break;
 
-        // Borrowed for this request and given back after it. The pair now
-        // brackets exactly the time a request is being served.
-        var lent: ?StreamBuffers = null;
-        const use = if (opts.buffers_provider) |p| blk: {
-            lent = p.acquire(p.ctx);
-            break :blk lent orelse {
-                // Nothing to lend: this is backpressure, and it is answered
-                // rather than dropped. A connection closed without a word
-                // looks like a crash from the other end.
-                _ = respondError(opts, out, null, 503);
-                break;
-            };
-        } else bufs;
-        defer if (opts.buffers_provider) |p| {
-            if (lent) |l| p.release(p.ctx, l);
-        };
-
-        if (serveOne(opts, in, out, use, req_index, force_close) == .close) break;
+        if (serveStep(opts, in, out, bufs, req_index) == .close) break;
         req_index += 1;
         fireConnState(&opts, .idle);
     }
     fireConnState(&opts, .closed);
 }
 
-const ConnDisposition = enum { keep_alive, close };
+/// Serve exactly one request that is already known to be arriving -- the
+/// borrow-serve-release slice of `serveLoop`, without the wait and without
+/// the loop.
+///
+/// This exists for callers whose *frame layout* is the resource: the serving
+/// loop's frame is tens of kilobytes (the per-request state below lives in
+/// it), and a caller that parks INSIDE `serveStream`'s wait keeps that whole
+/// frame on its stack for as long as the connection idles. A
+/// fiber-per-connection engine that instead does the wait itself, in its own
+/// small frame, and calls this only when bytes are there, holds the big
+/// frame only while a request is actually in flight:
+///
+/// ```zig
+/// var req_index: u32 = 0;
+/// while (true) {
+///     _ = reader.peekByte() catch break;       // park HERE, shallow
+///     if (http.Server.serveStep(opts, reader, writer, bufs, req_index) == .close) break;
+///     req_index += 1;
+/// }
+/// ```
+///
+/// Semantics match one turn of `serveStream`'s loop exactly, including the
+/// `buffers_provider` borrow bracketing the request and the
+/// `max_requests_per_conn` cap (derived from `req_index`, which the caller
+/// increments per served request). What the caller owns instead: the wait
+/// for the first byte, and the connection-lifecycle `ConnState` hooks other
+/// than `.active` (`.new`/`.idle`/`.closed` fire only in `serveStream`,
+/// which owns the connection's life).
+pub fn serveStep(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32) ConnDisposition {
+    // Per-connection request cap: when this request reaches the limit its
+    // response is forced to `Connection: close` and the connection ends.
+    const cap = opts.max_requests_per_conn;
+    const force_close = cap != 0 and req_index + 1 >= cap;
+
+    // Borrowed for this request and given back after it. The pair brackets
+    // exactly the time a request is being served.
+    var lent: ?StreamBuffers = null;
+    const use = if (opts.buffers_provider) |p| blk: {
+        lent = p.acquire(p.ctx);
+        break :blk lent orelse {
+            // Nothing to lend: this is backpressure, and it is answered
+            // rather than dropped. A connection closed without a word
+            // looks like a crash from the other end.
+            _ = respondError(opts, out, null, 503);
+            return .close;
+        };
+    } else bufs;
+    defer if (opts.buffers_provider) |p| {
+        if (lent) |l| p.release(p.ctx, l);
+    };
+
+    return serveOne(opts, in, out, use, req_index, force_close);
+}
+
+pub const ConnDisposition = enum { keep_alive, close };
 
 fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32, force_close: bool) ConnDisposition {
     // The wait for this request already happened in `serveLoop`, above the
@@ -5320,6 +5362,47 @@ test "PooledBuffers: successive requests reuse one slab" {
     try testing.expectEqual(@as(usize, 1), pool.allocCount());
     try testing.expectEqual(@as(usize, 2), pool.reuseCount());
     try testing.expectEqual(@as(usize, 1), pool.idleCount());
+}
+
+test "serveStep: one turn of the loop, wait owned by the caller" {
+    // The contract a fiber-per-connection engine relies on: the caller does
+    // the wait in ITS frame, `serveStep` serves exactly one request that is
+    // already arriving, and the request cap still binds through `req_index`.
+    var in: Reader = .fixed("GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    const bufs: StreamBuffers = .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    };
+    const opts: StreamOptions = .{ .handler = testHandler, .server_name = "test", .now = null };
+
+    var served: u32 = 0;
+    while (true) {
+        _ = in.peekByte() catch break;
+        if (serveStep(opts, &in, &out, bufs, served) == .close) break;
+        served += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), served);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.buffered(), "hello"));
+
+    // And the cap: with max_requests_per_conn = 1, the first step already
+    // answers `Connection: close`.
+    var in2: Reader = .fixed("GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    var out2_buf: [4096]u8 = undefined;
+    var out2: Writer = .fixed(&out2_buf);
+    var capped = opts;
+    capped.max_requests_per_conn = 1;
+    try testing.expectEqual(ConnDisposition.close, serveStep(capped, &in2, &out2, bufs, 0));
+    try testing.expect(std.mem.indexOf(u8, out2.buffered(), "connection: close") != null or
+        std.mem.indexOf(u8, out2.buffered(), "Connection: close") != null);
 }
 
 test "buffers_provider: nothing is borrowed while the connection waits" {
