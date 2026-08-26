@@ -111,7 +111,7 @@ fn normalize(s0: u256, carry: u1) [4]u64 {
 /// folds provably reach `< 2^257` (a value with at most one excess bit), after
 /// which `normalize` finishes. Eleven folds are used for margin; the assert
 /// pins the bound. Fixed trip count ⇒ constant-time.
-fn reduceWide(wide: u512) [4]u64 {
+fn reduceWideFold(wide: u512) [4]u64 {
     const M: u512 = m_fold;
     const mask: u512 = (@as(u512, 1) << 256) - 1;
     var x = wide;
@@ -120,6 +120,85 @@ fn reduceWide(wide: u512) [4]u64 {
     }
     std.debug.assert((x >> 257) == 0); // ≤ one excess bit remains after the folds
     return normalize(@truncate(x & mask), @truncate(x >> 256));
+}
+
+/// Eight 32-bit words into a 256-bit value, most significant first — the order
+/// the NIST reduction tables below are written in, so that each `s_i` reads
+/// like its row in the reference rather than backwards.
+inline fn words(a7: u32, a6: u32, a5: u32, a4: u32, a3: u32, a2: u32, a1: u32, a0: u32) u256 {
+    return (@as(u256, a7) << 224) | (@as(u256, a6) << 192) |
+        (@as(u256, a5) << 160) | (@as(u256, a4) << 128) |
+        (@as(u256, a3) << 96) | (@as(u256, a2) << 64) |
+        (@as(u256, a1) << 32) | @as(u256, a0);
+}
+
+/// The NIST/Solinas word-shuffle reduction, in portable Zig.
+///
+/// ⭐⭐⭐ **This exists because the fold above is linear in a fold count of
+/// eleven, and that was measured, not guessed.** Dropping two of the eleven
+/// folds moved the portable multiply from 2.40x `std`'s to 2.00x — exactly the
+/// 2/11 the change removed — so the whole cost was the reduction and almost
+/// none of it was the 512-bit product. Eleven passes of 512-bit arithmetic is
+/// what made this module's *portable* path 2.4x slower than `std`'s portable
+/// path, on a machine where the amd64 assembly hid it. On aarch64 there is no
+/// assembly to hide behind, which is what made it worth fixing.
+///
+/// The algorithm is the one `fast_core.zig`'s assembly already implements
+/// (HMV "Guide to ECC" Alg. 2.29): over the sixteen 32-bit product words,
+///
+///     r ≡ s1 + 2·s2 + 2·s3 + s4 + s5 − s6 − s7 − s8 − s9   (mod p)
+///
+/// where each `s_i` is a fixed permutation. One pass, no loop.
+///
+/// Constant-time: straight-line arithmetic over fixed-width integers, a fixed
+/// number of operations, no branch and no secret-dependent index. The final
+/// canonicalisation is `normalize`, which was already written for this and is
+/// masked rather than branched.
+fn reduceWideShuffle(wide: u512) [4]u64 {
+    var c: [16]u32 = undefined;
+    inline for (0..16) |i| c[i] = @truncate(wide >> (32 * i));
+
+    const s1 = words(c[7], c[6], c[5], c[4], c[3], c[2], c[1], c[0]);
+    const s2 = words(c[15], c[14], c[13], c[12], c[11], 0, 0, 0);
+    const s3 = words(0, c[15], c[14], c[13], c[12], 0, 0, 0);
+    const s4 = words(c[15], c[14], 0, 0, 0, c[10], c[9], c[8]);
+    const s5 = words(c[8], c[13], c[15], c[14], c[13], c[11], c[10], c[9]);
+    const s6 = words(c[10], c[8], 0, 0, 0, c[13], c[12], c[11]);
+    const s7 = words(c[11], c[9], 0, 0, c[15], c[14], c[13], c[12]);
+    const s8 = words(c[12], 0, c[10], c[9], c[8], c[15], c[14], c[13]);
+    const s9 = words(c[13], 0, c[11], c[10], c[9], 0, c[15], c[14]);
+
+    // Signed, because s6..s9 are subtracted and any of them can exceed the
+    // running total. The sum lies in (−4·2^256, +7·2^256).
+    const acc: i512 = @as(i512, s1) +
+        2 * @as(i512, s2) + 2 * @as(i512, s3) +
+        @as(i512, s4) + @as(i512, s5) -
+        @as(i512, s6) - @as(i512, s7) - @as(i512, s8) - @as(i512, s9);
+
+    // Shift into non-negative territory by a multiple of p, which changes
+    // nothing mod p. Five is the smallest that works: the most negative
+    // accumulator is > −4·2^256, and 5p > 4·2^256 because p > 2^256 − 2^224.
+    const biased = acc + 5 * @as(i512, field_order);
+    std.debug.assert(biased >= 0);
+    // `@bitCast`, not `@intCast`: two's complement reinterpretation of a value
+    // already proven non-negative, with no check to branch on.
+    const v: u512 = @bitCast(biased);
+
+    // v < 12·2^256, so the top is a handful of bits. Fold them with the one
+    // identity this whole file rests on, 2^256 ≡ M (mod p).
+    const top: u512 = v >> 256;
+    const folded: u512 = (v & ((@as(u512, 1) << 256) - 1)) + top * @as(u512, m_fold);
+    // top ≤ 11 and M < 2^224, so top·M < 2^228: the sum can carry into bit 256
+    // but no further, which is exactly the shape `normalize` takes.
+    std.debug.assert((folded >> 257) == 0);
+    return normalize(@truncate(folded), @truncate(folded >> 256));
+}
+
+/// The portable reduction. `reduceWideFold` stays as the oracle it always was
+/// — it is what the differential in `oracle_test.zig` pins the asm core to,
+/// and it is now what pins this one too.
+fn reduceWide(wide: u512) [4]u64 {
+    return reduceWideShuffle(wide);
 }
 
 /// `z = a·b mod p`, portable Solinas path (the oracle the asm core mirrors).
@@ -429,5 +508,52 @@ test "reduction edge patterns match std (fold-boundary + max-limb)" {
             try std.testing.expectEqualSlices(u8, &sa.mul(sb).toBytes(.big), &a.mul(b).toBytes(.big));
         }
         try std.testing.expectEqualSlices(u8, &sa.sq().toBytes(.big), &a.sq().toBytes(.big));
+    }
+}
+
+test "the word-shuffle reduction agrees with the fold, bit for bit" {
+    // The fold is the oracle: slow, obviously correct, and already the thing
+    // the asm core is pinned to. Anything the shuffle gets wrong shows up here
+    // as a mismatch rather than as a wrong signature months later.
+    var prng: std.Random.DefaultPrng = .init(0x5EED_5AFE_F1E1_D000);
+    const rand = prng.random();
+
+    // The edges first, because a random 512-bit value never lands on one: a
+    // zero product, the largest possible product, and values that sit exactly
+    // on the 2^256 boundary the fold is about.
+    const p: u512 = field_order;
+    for ([_]u512{
+        0,
+        1,
+        std.math.maxInt(u512),
+        (@as(u512, 1) << 256),
+        (@as(u512, 1) << 256) - 1,
+        p,
+        p - 1,
+        p + 1,
+        @as(u512, @truncate(@as(u1024, p) * @as(u1024, p))),
+        (@as(u512, 1) << 511),
+    }) |wide| {
+        try std.testing.expectEqual(reduceWideFold(wide), reduceWideShuffle(wide));
+    }
+
+    // Then products of real field elements, which is the only input shape the
+    // callers can actually produce, and then unrestricted 512-bit values,
+    // which is what a bug in a length or a shift would produce.
+    // 20_000 in the ordinary gate, 200_000 with P256_SHUFFLE_SWEEP=1.
+    const draws: usize = if (std.testing.environ.getPosix("P256_SHUFFLE_SWEEP") != null) 200_000 else 20_000;
+    for (0..draws) |_| {
+        var a: u256 = undefined;
+        var b: u256 = undefined;
+        rand.bytes(std.mem.asBytes(&a));
+        rand.bytes(std.mem.asBytes(&b));
+        a %= field_order;
+        b %= field_order;
+        const prod = @as(u512, a) * @as(u512, b);
+        try std.testing.expectEqual(reduceWideFold(prod), reduceWideShuffle(prod));
+
+        var wide: u512 = undefined;
+        rand.bytes(std.mem.asBytes(&wide));
+        try std.testing.expectEqual(reduceWideFold(wide), reduceWideShuffle(wide));
     }
 }
