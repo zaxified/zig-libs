@@ -88,6 +88,7 @@ const h1 = @import("h1.zig");
 const h2 = @import("h2.zig");
 const h2s = @import("h2_server.zig");
 const gzip = @import("gzip.zig");
+const bufpool = @import("bufpool.zig");
 const flate = std.compress.flate;
 const net = std.Io.net;
 const Reader = std.Io.Reader;
@@ -139,6 +140,108 @@ pub const ConnState = enum { new, active, idle, closed };
 /// when driven socket-free (`serveStream` without `StreamOptions.peer`).
 pub const ConnStateFn = *const fn (?*anyopaque, peer: ?net.IpAddress, state: ConnState) void;
 
+/// Where a connection's per-request working memory comes from, when the
+/// caller would rather **lend** it than own it.
+///
+/// ## Why this exists
+///
+/// `StreamBuffers` is otherwise the caller's for the whole connection, and
+/// for a server holding many connections open that is most of what it costs.
+/// Measured on this repo's own bench box, a TLS connection parked between
+/// requests held 28 KiB of buffer containing nothing, of which 16 KiB was the
+/// codec's `head`, `response_body` and `chunk` — memory that is scratch by
+/// construction, rewritten before it is read, and dead every moment the
+/// connection is waiting.
+///
+/// A provider makes that memory belong to a **request** instead of a
+/// connection, so the steady-state cost is `set_size * in-flight requests`
+/// rather than `set_size * open connections`. `bufpool.BufferPool` is the
+/// obvious backing and `PooledBuffers` wires the two together in three lines.
+///
+/// ⭐ **Release has to be cheap.** The naive version of this idea hands the
+/// pages back to the kernel at each request boundary; measured, that is a
+/// syscall per request and it cost **57% of throughput** (79,099 req/s
+/// against 34,216). A pool release is a push onto a list, and the kernel only
+/// hears about it when the pool overflows. That difference is the whole
+/// design.
+///
+/// `acquire` returning null is **backpressure**, not an error: the connection
+/// is answered 503 and closed. A server that would rather queue should block
+/// inside `acquire` instead.
+/// A `BuffersProvider` backed by `bufpool.BufferPool`: one slab per in-flight
+/// request, carved into the buffers the codec asks for.
+///
+/// The three lines a caller writes:
+///
+/// ```zig
+/// var pool: http.bufpool.BufferPool = .init(gpa, layout.slabSize(), 64);
+/// var layout: http.Server.PooledBuffers = .{ .pool = &pool, .head_len = 8192, ... };
+/// opts.buffers_provider = layout.provider();
+/// ```
+///
+/// The pool's `max_idle_slabs` is the memory ceiling this buys: a server
+/// holding ten thousand connections that are mostly waiting keeps
+/// `slab_size * max_idle_slabs`, not `slab_size * 10,000`.
+///
+/// Sub-buffers are carved in a fixed order from one slab, so a released slab
+/// is recovered from the head buffer's pointer. Handing `release` anything
+/// this did not produce is a bug in the caller and is asserted in safe
+/// builds.
+pub const PooledBuffers = struct {
+    pool: *bufpool.BufferPool,
+    head_len: usize,
+    request_body_len: usize,
+    response_body_len: usize,
+    chunk_len: usize,
+    trailers_len: usize = 0,
+
+    /// What to construct the pool with. A pool whose slabs are a different
+    /// size cannot serve this layout.
+    pub fn slabSize(l: PooledBuffers) usize {
+        return l.head_len + l.request_body_len + l.response_body_len + l.chunk_len + l.trailers_len;
+    }
+
+    pub fn provider(self: *PooledBuffers) BuffersProvider {
+        return .{ .ctx = self, .acquire = acquireFn, .release = releaseFn };
+    }
+
+    fn acquireFn(ctx: ?*anyopaque) ?StreamBuffers {
+        const self: *PooledBuffers = @ptrCast(@alignCast(ctx.?));
+        const slab = self.pool.acquire() catch return null;
+        var at: usize = 0;
+        const head = slab[at..][0..self.head_len];
+        at += self.head_len;
+        const request_body = slab[at..][0..self.request_body_len];
+        at += self.request_body_len;
+        const response_body = slab[at..][0..self.response_body_len];
+        at += self.response_body_len;
+        const chunk = slab[at..][0..self.chunk_len];
+        at += self.chunk_len;
+        const trailers = slab[at..][0..self.trailers_len];
+        return .{
+            .head = head,
+            .request_body = request_body,
+            .response_body = response_body,
+            .chunk = chunk,
+            .trailers = trailers,
+        };
+    }
+
+    fn releaseFn(ctx: ?*anyopaque, b: StreamBuffers) void {
+        const self: *PooledBuffers = @ptrCast(@alignCast(ctx.?));
+        const slab = b.head.ptr[0..self.slabSize()];
+        self.pool.release(slab);
+    }
+};
+
+pub const BuffersProvider = struct {
+    ctx: ?*anyopaque = null,
+    /// Called before each request on the connection.
+    acquire: *const fn (?*anyopaque) ?StreamBuffers,
+    /// Called after each request, with exactly what `acquire` returned.
+    release: *const fn (?*anyopaque, StreamBuffers) void,
+};
+
 /// Gzip response-compression config — see `Options.compression` and
 /// `gzip.zig` (min_size 1 KiB / level 6 / text+JSON+XML+JS defaults).
 pub const Compression = gzip.Compression;
@@ -178,6 +281,15 @@ pub const Options = struct {
     on_connect: ?OnConnectFn = null,
     /// Opaque pointer passed to `on_connect`.
     on_connect_ctx: ?*anyopaque = null,
+    /// Lend a connection its working memory one request at a time instead of
+    /// taking the caller's for the whole connection. Null keeps the buffers
+    /// the serving loop allocates per connection, which is what every caller
+    /// did before this existed.
+    ///
+    /// ⚠ **HTTP/1.1 only.** The h2 codec's working memory is per stream
+    /// rather than per request and lending it is a different change; an h2
+    /// connection ignores this. See `BuffersProvider`.
+    buffers_provider: ?BuffersProvider = null,
     /// Optional Go-ConnState-style lifecycle observer (metrics/debugging);
     /// runs on the connection's task. See `ConnState`.
     on_conn_state: ?ConnStateFn = null,
@@ -777,6 +889,10 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .gzip_scratch = gz,
                 .on_conn_state = o.on_conn_state,
                 .on_conn_state_ctx = o.on_conn_state_ctx,
+                // Deliberately not forwarded: the h2 codec's working memory
+                // has a different shape (per-stream, not per-request) and
+                // lending it is a separate change. `Options.buffers_provider`
+                // is documented as h1-only for that reason.
                 .limits = o.h2_limits,
                 .stream_request = o.h2_stream_request,
                 .dispatcher = o.h2_dispatcher,
@@ -795,6 +911,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .max_body_bytes = o.max_body_bytes,
         .on_conn_state = o.on_conn_state,
         .on_conn_state_ctx = o.on_conn_state_ctx,
+        .buffers_provider = o.buffers_provider,
         .compression = o.compression,
         .max_decompressed_request_bytes = o.max_decompressed_request_bytes,
         .max_requests_per_conn = o.max_requests_per_conn,
@@ -1103,6 +1220,11 @@ pub const StreamOptions = struct {
     /// the whole stream counts as one connection.
     on_conn_state: ?ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
+    /// Lend this connection its working memory one request at a time instead
+    /// of taking the caller's for the whole connection. Null keeps the
+    /// buffers passed to `serveStream`, which is what every caller did before
+    /// this existed. See `BuffersProvider`.
+    buffers_provider: ?BuffersProvider = null,
     /// Negotiated gzip response compression (see `Options.compression`);
     /// active only when `StreamBuffers.gzip` is also provided. null = off.
     compression: ?Compression = null,
@@ -1190,7 +1312,27 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
         // its response is forced to `Connection: close` and the loop ends.
         const cap = opts.max_requests_per_conn;
         const force_close = cap != 0 and req_index + 1 >= cap;
-        if (serveOne(opts, in, out, bufs, req_index, force_close) == .close) break;
+
+        // Borrowed for this request and given back after it, when the caller
+        // supplied somewhere to borrow from. The lend/return pair brackets
+        // exactly one request, which is what makes a parked connection cost
+        // nothing: see `BuffersProvider`.
+        var lent: ?StreamBuffers = null;
+        const use = if (opts.buffers_provider) |p| blk: {
+            lent = p.acquire(p.ctx);
+            break :blk lent orelse {
+                // Nothing to lend: this is backpressure, and it is answered
+                // rather than dropped. A connection closed without a word
+                // looks like a crash from the other end.
+                _ = respondError(opts, out, null, 503);
+                break;
+            };
+        } else bufs;
+        defer if (opts.buffers_provider) |p| {
+            if (lent) |l| p.release(p.ctx, l);
+        };
+
+        if (serveOne(opts, in, out, use, req_index, force_close) == .close) break;
         req_index += 1;
         fireConnState(&opts, .idle);
     }
@@ -5058,4 +5200,111 @@ test "cancel: a canceled socket write is recovered from the writer's err field" 
     try testing.expectError(error.WriteFailed, fut.cancel(io));
     try testing.expect(tw.canceled);
     try testing.expect(!tw.timed_out);
+}
+
+// ── buffers_provider ────────────────────────────────────────────────────────
+
+/// A provider that counts, so a test can say *when* the codec borrows rather
+/// than only that it works.
+const CountingProvider = struct {
+    acquires: usize = 0,
+    releases: usize = 0,
+    fail_at: usize = 0, // acquire number that returns null; 0 = never
+    head: [1024]u8 = undefined,
+    request_body: [256]u8 = undefined,
+    response_body: [64]u8 = undefined,
+    chunk: [128]u8 = undefined,
+
+    fn provider(self: *CountingProvider) BuffersProvider {
+        return .{ .ctx = self, .acquire = acq, .release = rel };
+    }
+    fn acq(ctx: ?*anyopaque) ?StreamBuffers {
+        const self: *CountingProvider = @ptrCast(@alignCast(ctx.?));
+        self.acquires += 1;
+        if (self.fail_at != 0 and self.acquires == self.fail_at) return null;
+        return .{
+            .head = &self.head,
+            .request_body = &self.request_body,
+            .response_body = &self.response_body,
+            .chunk = &self.chunk,
+        };
+    }
+    fn rel(ctx: ?*anyopaque, _: StreamBuffers) void {
+        const self: *CountingProvider = @ptrCast(@alignCast(ctx.?));
+        self.releases += 1;
+    }
+};
+
+fn runWithProvider(p: BuffersProvider, wire: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(wire);
+    var out: Writer = .fixed(out_buf);
+    // Deliberately unusable: a provider that is consulted leaves these
+    // untouched, so a zero-length fallback proves the borrow happened rather
+    // than merely permitting it.
+    var none: [0]u8 = undefined;
+    serveStream(.{
+        .handler = testHandler,
+        .server_name = "test",
+        .now = null,
+        .buffers_provider = p,
+    }, &in, &out, .{
+        .head = &none,
+        .request_body = &none,
+        .response_body = &none,
+        .chunk = &none,
+    });
+    return out.buffered();
+}
+
+test "buffers_provider: borrowed once per request and given back each time" {
+    var cp: CountingProvider = .{};
+    var out_buf: [4096]u8 = undefined;
+    const got = runWithProvider(cp.provider(), "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+
+    // Two requests answered from buffers the caller never owned: the fallback
+    // passed to `serveStream` is zero length and could not have served either.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "hello"));
+    try testing.expectEqual(@as(usize, 2), cp.acquires);
+    // Balanced -- a leak here is a pool that drains under load, which is the
+    // failure this whole mechanism would otherwise introduce.
+    try testing.expectEqual(cp.acquires, cp.releases);
+}
+
+test "buffers_provider: nothing to lend is 503 and a closed connection, not a dropped one" {
+    var cp: CountingProvider = .{ .fail_at = 2 };
+    var out_buf: [4096]u8 = undefined;
+    const got = runWithProvider(cp.provider(), "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "hello"));
+    try testing.expect(std.mem.indexOf(u8, got, "503") != null);
+    // The one that was lent came back; the one that was refused was never
+    // handed out, so it must not be released either.
+    try testing.expectEqual(@as(usize, 1), cp.releases);
+}
+
+test "PooledBuffers: successive requests reuse one slab" {
+    var layout: PooledBuffers = .{
+        .pool = undefined,
+        .head_len = 1024,
+        .request_body_len = 256,
+        .response_body_len = 64,
+        .chunk_len = 128,
+    };
+    var pool: bufpool.BufferPool = .init(testing.allocator, layout.slabSize(), 4);
+    defer pool.deinit();
+    layout.pool = &pool;
+
+    var out_buf: [4096]u8 = undefined;
+    const got = runWithProvider(layout.provider(), "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, got, "hello"));
+    // ⭐ The point of the exercise: three requests, ONE slab. Without the
+    // return half of the contract this would be three.
+    try testing.expectEqual(@as(usize, 1), pool.allocCount());
+    try testing.expectEqual(@as(usize, 2), pool.reuseCount());
+    try testing.expectEqual(@as(usize, 1), pool.idleCount());
 }
