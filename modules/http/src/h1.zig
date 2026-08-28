@@ -26,22 +26,84 @@ pub const ReadHeadError = error{
     HeadTooLarge,
 };
 
+/// One line as `takeLineInto` produced it.
+const Line = struct {
+    /// The line with its original `\r\n`, as far as it fit the destination.
+    bytes: []u8,
+    /// The line was longer than the destination; the excess was consumed off
+    /// the wire and dropped, so the reader is still positioned on the next
+    /// line either way.
+    overflow: bool,
+    /// The line is the empty one — nothing but its terminator. Reported
+    /// separately from `bytes` because a caller may pass no destination at
+    /// all and still need to recognise the end of a header section.
+    blank: bool,
+};
+
+/// Read one `\n`-terminated line into `dest`, scanning what has arrived and
+/// consuming it as it goes.
+///
+/// ⭐ The contiguity this asks of `r` is **one byte**, not one line. That is
+/// the whole difference from `Reader.takeDelimiterInclusive`, which needs the
+/// line whole in the reader's buffer and reports `StreamTooLong` when it
+/// cannot have it. A reader whose buffer is a frame or a record — one that
+/// hands out whatever arrived and cannot join two of them — therefore serves
+/// this, and the line length stops being bounded by the reader's buffer and
+/// starts being bounded by `dest`, which is the caller's to size.
+///
+/// The copy is not new work: every caller here was already copying the line
+/// out of the reader's buffer into a buffer of its own.
+fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
+    var len: usize = 0;
+    var overflow = false;
+    var blank = true;
+    while (true) {
+        const avail = r.peekGreedy(1) catch |err| switch (err) {
+            error.ReadFailed => return error.ReadFailed,
+            error.EndOfStream => return error.EndOfStream,
+        };
+        const nl = std.mem.indexOfScalar(u8, avail, '\n');
+        const take = if (nl) |i| i + 1 else avail.len;
+        // Only worth scanning while it could still be blank, which is only
+        // ever the terminator line and the first byte settles it.
+        if (blank) for (avail[0..take]) |b| {
+            if (b != '\r' and b != '\n') {
+                blank = false;
+                break;
+            }
+        };
+        const n = @min(take, dest.len - len);
+        @memcpy(dest[len..][0..n], avail[0..n]);
+        len += n;
+        if (n < take) overflow = true;
+        r.toss(take);
+        if (nl != null) return .{ .bytes = dest[0..len], .overflow = overflow, .blank = blank };
+    }
+}
+
 /// Read one HTTP/1.x message head (status/request line + header lines) off
 /// `r` into `buf`, consuming the terminating blank line. Returns the raw head
 /// block — lines with their original `\r\n` endings, blank terminator
-/// excluded. Line length is additionally bounded by `r`'s buffer capacity.
+/// excluded.
+///
+/// A line is bounded by `buf` and by nothing else: this reads incrementally,
+/// so `r` is never asked for more contiguous bytes than it has. That is what
+/// lets a server run h1 over a reader that hands out one TLS record or one
+/// frame at a time.
 pub fn readHead(r: *Reader, buf: []u8) ReadHeadError![]const u8 {
     var len: usize = 0;
     while (true) {
-        const line = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        const line = takeLineInto(r, buf[len..]) catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
             error.EndOfStream => return error.ConnectionClosed,
-            error.StreamTooLong => return error.HeadTooLarge,
         };
-        if (trimLineEnd(line).len == 0) return buf[0..len];
-        if (buf.len - len < line.len) return error.HeadTooLarge;
-        @memcpy(buf[len..][0..line.len], line);
-        len += line.len;
+        // Before `overflow`, not after: the terminator is two bytes that are
+        // never kept, so a head whose lines fill `buf` exactly still ends
+        // successfully -- which is what the previous implementation did, and
+        // the difference would otherwise be an off-by-two in the head limit.
+        if (line.blank) return buf[0..len];
+        if (line.overflow) return error.HeadTooLarge;
+        len += line.bytes.len;
     }
 }
 
@@ -414,6 +476,11 @@ pub const ChunkedReader = struct {
     /// The trailer section did not fit `trailer_buf`; excess lines were
     /// dropped (still consumed off the wire).
     trailers_overflow: bool = false,
+    /// Scratch for the chunk-header line, which is the only line this decoder
+    /// has to read the bytes of. Sized past the longest one that can be
+    /// meaningful: a chunk size is at most 16 hex digits, so everything the
+    /// parse depends on is in the first 17 bytes.
+    line_buf: [32]u8 = undefined,
 
     pub const FailReason = enum { malformed_chunk, truncated_body };
 
@@ -470,7 +537,15 @@ pub const ChunkedReader = struct {
             switch (c.state) {
                 .done => return error.EndOfStream,
                 .chunk_header => {
-                    const line = trimLineEnd(try c.takeLine());
+                    // ⭐ Truncation at `line_buf` cannot change the verdict.
+                    // A chunk size is at most 16 hex digits, so a ';' that
+                    // ends a valid size sits at index 16 or less -- well
+                    // inside the buffer. A line long enough to be cut here
+                    // therefore either carries its ';' in the kept prefix,
+                    // and parses to the same size, or carries none, and is
+                    // rejected for a size text over 16 digits. Both are what
+                    // the whole line would have produced.
+                    const line = trimLineEnd((try c.takeLineRaw(&c.line_buf)).bytes);
                     // "<hex-size>[;extensions]"
                     const size_text = if (std.mem.indexOfScalar(u8, line, ';')) |i| line[0..i] else line;
                     if (size_text.len == 0 or size_text.len > 16) return c.fail(.malformed_chunk);
@@ -491,32 +566,37 @@ pub const ChunkedReader = struct {
                     if (n != 0) return n;
                 },
                 .body_crlf => {
-                    if (trimLineEnd(try c.takeLine()).len != 0) return c.fail(.malformed_chunk);
+                    // Nothing is wanted of this line but that it be empty, so
+                    // it is read into no buffer at all.
+                    if (!(try c.takeLineRaw(c.line_buf[0..0])).blank) return c.fail(.malformed_chunk);
                     c.state = .chunk_header;
                 },
                 .trailers => {
                     // Consume trailer fields up to the blank line; capture
                     // them (with their CRLF, so the block parses like a head)
-                    // when a buffer was provided, else just discard.
-                    const line = try c.takeLine();
-                    if (trimLineEnd(line).len == 0) {
+                    // when a buffer was provided, else just discard. Read
+                    // straight into the capture buffer rather than into a
+                    // line buffer and out again -- which also means a trailer
+                    // line is bounded by the space left in it and not by the
+                    // reader's buffer.
+                    const line = try c.takeLineRaw(c.trailer_buf[c.trailer_len..]);
+                    if (line.blank) {
                         c.state = .done;
                     } else if (c.trailer_buf.len != 0) {
-                        if (c.trailer_len + line.len <= c.trailer_buf.len) {
-                            @memcpy(c.trailer_buf[c.trailer_len..][0..line.len], line);
-                            c.trailer_len += line.len;
-                        } else c.trailers_overflow = true;
+                        // Excess lines are dropped whole, as before: the
+                        // partial bytes are simply not committed.
+                        if (line.overflow) c.trailers_overflow = true else c.trailer_len += line.bytes.len;
                     }
                 },
             }
         }
     }
 
-    fn takeLine(c: *ChunkedReader) Reader.StreamError![]const u8 {
-        return c.in.takeDelimiterInclusive('\n') catch |err| switch (err) {
+    /// One line into `dest`, with this decoder's failure vocabulary.
+    fn takeLineRaw(c: *ChunkedReader, dest: []u8) Reader.StreamError!Line {
+        return takeLineInto(c.in, dest) catch |err| switch (err) {
             error.ReadFailed => error.ReadFailed,
             error.EndOfStream => c.fail(.truncated_body),
-            error.StreamTooLong => c.fail(.malformed_chunk),
         };
     }
 
@@ -674,6 +754,145 @@ const Trickle = struct {
         return 1;
     }
 };
+
+/// A reader that hands out its input a record at a time and **cannot join two
+/// of them** — the shape of a TLS record reader or a frame reader, where the
+/// buffer is not storage the reader owns but an alias onto whatever arrived.
+///
+/// This is the reader the incremental line reading exists for, and it is
+/// written to refuse rather than to be slow: a caller asking for more
+/// contiguous bytes than the current record holds gets `ReadFailed`, exactly
+/// as the real one does.
+const RecordSource = struct {
+    data: []const u8,
+    chunk: usize,
+    pos: usize = 0,
+    reader: Reader,
+
+    fn init(data: []const u8, chunk: usize) RecordSource {
+        return .{
+            .data = data,
+            .chunk = chunk,
+            .reader = .{
+                .vtable = &.{ .stream = streamFn, .readVec = readVec, .rebase = rebase },
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn pull(s: *RecordSource, r: *Reader) Reader.Error!void {
+        if (s.pos == s.data.len) return error.EndOfStream;
+        const n = @min(s.chunk, s.data.len - s.pos);
+        r.buffer = @constCast(s.data[s.pos..][0..n]);
+        r.seek = 0;
+        r.end = n;
+        s.pos += n;
+    }
+
+    fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
+        const s: *RecordSource = @alignCast(@fieldParentPtr("reader", r));
+        if (r.seek != r.end) return error.ReadFailed; // asked to span two records
+        _ = data;
+        try s.pull(r);
+        return 0;
+    }
+
+    fn rebase(r: *Reader, capacity: usize) Reader.RebaseError!void {
+        _ = capacity;
+        if (r.seek == r.end) {
+            r.buffer = r.buffer[0..0];
+            r.seek = 0;
+            r.end = 0;
+            return;
+        }
+        return error.ReadFailed; // asked to span two records
+    }
+
+    fn streamFn(r: *Reader, w: *Writer, limit: Limit) Reader.StreamError!usize {
+        const s: *RecordSource = @alignCast(@fieldParentPtr("reader", r));
+        if (r.seek == r.end) try s.pull(r);
+        const available = r.buffer[r.seek..r.end];
+        const n = limit.minInt(available.len);
+        if (n == 0) return 0;
+        try w.writeAll(available[0..n]);
+        r.seek += n;
+        return n;
+    }
+};
+
+const split_request =
+    "GET /suggest?q=abcde HTTP/1.1\r\n" ++
+    "Host: api.example.com\r\n" ++
+    "User-Agent: something-long-enough-to-straddle\r\n" ++
+    "Accept: */*\r\n" ++
+    "\r\nBODY";
+
+test "readHead reads a head no record of which holds a whole line" {
+    // Three bytes a record: every line of the request above spans several,
+    // and the blank terminator can land split across two.
+    var src: RecordSource = .init(split_request, 3);
+    var buf: [256]u8 = undefined;
+    const head = try readHead(&src.reader, &buf);
+    try testing.expectEqualStrings(split_request[0 .. split_request.len - "\r\nBODY".len], head);
+    // The body is still there, and still readable a record at a time.
+    var out: [4]u8 = undefined;
+    var w: Writer = .fixed(&out);
+    var got: usize = 0;
+    while (got < 4) got += try src.reader.stream(&w, .limited(4 - got));
+    try testing.expectEqualStrings("BODY", &out);
+}
+
+test "the reader this is for really cannot serve takeDelimiterInclusive" {
+    // Without this the test above proves nothing about the mechanism: a
+    // reader that quietly joined records would pass it too. `readHead` used
+    // to be exactly this call.
+    //
+    // ⚠ And note *which* error, because it is the whole reason this was worth
+    // changing rather than documenting. `peekDelimiterInclusive` gives up as
+    // soon as `buffer.len - content_len == 0`, which for a buffer that *is*
+    // the record is immediately -- so the answer is `StreamTooLong`, which
+    // `readHead` mapped to `HeadTooLarge`. A valid request would have been
+    // refused for being too large: a wrong answer, not a slow one.
+    var src: RecordSource = .init(split_request, 3);
+    try testing.expectError(error.StreamTooLong, src.reader.takeDelimiterInclusive('\n'));
+}
+
+test "a head line longer than the buffer is still HeadTooLarge across records" {
+    var src: RecordSource = .init(split_request, 3);
+    var small: [40]u8 = undefined; // the first line alone is longer
+    try testing.expectError(error.HeadTooLarge, readHead(&src.reader, &small));
+}
+
+test "a head whose lines exactly fill the buffer still ends" {
+    // The blank terminator is two bytes that are never kept, so it must not
+    // be charged against `buf`. Pins the `blank`-before-`overflow` order in
+    // `readHead`; reverse them and this is HeadTooLarge.
+    const lines = "GET / HTTP/1.1\r\nA: 1\r\n";
+    var r: Reader = .fixed(lines ++ "\r\n");
+    var exact: [lines.len]u8 = undefined;
+    try testing.expectEqualStrings(lines, try readHead(&r, &exact));
+}
+
+test "a chunked body arrives over records that split every framing line" {
+    const wire = "4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-T: v\r\n\r\n";
+    var src: RecordSource = .init(wire, 3);
+    var body: [64]u8 = undefined;
+    var tbuf: [64]u8 = undefined;
+    var cr: ChunkedReader = .initCapturingTrailers(&src.reader, &body, &tbuf);
+    var out: [64]u8 = undefined;
+    var w: Writer = .fixed(&out);
+    var n: usize = 0;
+    while (cr.reader.stream(&w, .limited(64 - n))) |k| {
+        n += k;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+    try testing.expectEqualStrings("Wikipedia", out[0..n]);
+    try testing.expectEqualStrings("X-T: v\r\n", cr.trailers());
+}
 
 test "readHead consumes the blank line and preserves raw lines" {
     var r: Reader = .fixed("HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\n\r\nBODY");
