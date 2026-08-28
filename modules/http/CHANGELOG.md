@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-28** — **An h2 connection no longer grows by a stream table entry
+  per request served.** `Connection.streams` kept every stream ever created,
+  because presence in the table was how a *closed* stream was told apart from
+  an *idle* one (§5.1). On a long-lived connection that is an entry per
+  request, held until the peer hangs up: measured at ~48 B of requested memory
+  per request and, with the map's doubling and the pages behind it, **106 KiB
+  of resident memory per connection at a thousand connections serving ~600
+  requests each**.
+
+  Closed streams are now retired from the table, and closed-vs-idle is derived
+  from `next_local_stream_id` and `highest_remote_stream_id` — both already
+  maintained for §5.1.1, so nothing new is tracked. `stream()` answers for a
+  retired id from the same arithmetic, reporting `.closed` with zero windows
+  because nothing can be spent on a closed stream.
+
+  End to end, on a server holding 1000 saturated TLS h2 connections: **176.8 →
+  70.8 KiB per connection**, and per-connection memory is now **flat in the
+  number of requests** (208 requests per connection: 69.8 KiB; 825: 69.7 —
+  it was 150.3 and 180.6 before).
+
+  **One wire-visible change:** HEADERS on a stream closed by END_STREAM is now
+  a connection `PROTOCOL_ERROR` rather than a stream `STREAM_CLOSED`. Without
+  the table entry, a stream closed by END_STREAM cannot be told from one
+  implicitly closed by §5.1.1, and §5.1.1 answers the latter with exactly that
+  error. It is the stricter of the two, §5.1 asks for a connection error in
+  both cases, and no legal flow reaches it — trailers arrive *before*
+  END_STREAM, not after. RST_STREAM on a retired stream stays legal and
+  ignored (§5.1 grace) but now burns the unproductive-frame budget, so a flood
+  of them still meets a ceiling.
+
 - **2026-08-25** — **h2 responses no longer take a socket write each.** A
   multiplexed protocol whose every response pays its own kernel transition
   throws away most of what multiplexing is for, and this server was paying two:

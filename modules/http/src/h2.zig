@@ -899,8 +899,50 @@ pub const Connection = struct {
 
     /// Look up a stream (introspection; e.g. for asserting states in tests
     /// and for the server layer's scheduling decisions).
+    ///
+    /// A closed stream is answered from `everExisted` rather than from the
+    /// table — `retire` drops the entry as soon as the stream closes, so the
+    /// table holds live streams only. The windows of a closed stream are
+    /// reported as zero because nothing can be spent on one.
     pub fn stream(c: *const Connection, id: u31) ?Stream {
-        return c.streams.get(id);
+        if (c.streams.get(id)) |s| return s;
+        if (!c.everExisted(id)) return null;
+        return .{ .id = id, .state = .closed, .send_window = 0, .recv_window = 0 };
+    }
+
+    /// Whether an id that is ABSENT from `streams` was once open (closed) or
+    /// was never created (idle). §5.1 needs the two told apart on every
+    /// receive path, and this is what lets the table forget closed streams.
+    ///
+    /// ⚠ **This replaces a table entry with arithmetic, and that is the whole
+    /// point.** The table used to keep every stream ever created so the two
+    /// cases could be distinguished by presence, which made per-connection
+    /// memory grow without bound: measured at ~48 B per request served,
+    /// never released, on a connection that lives as long as the peer keeps
+    /// it. The two watermarks below were already maintained for §5.1.1, so
+    /// nothing new is tracked — the entry was simply redundant.
+    fn everExisted(c: *const Connection, id: u31) bool {
+        if (id == 0) return false;
+        // Odd ids are client-initiated (§5.1.1), so "ours" depends on role.
+        const is_local = (id % 2 == 1) == (c.role == .client);
+        return if (is_local)
+            id < c.next_local_stream_id
+        else
+            id <= c.highest_remote_stream_id;
+    }
+
+    /// Forget a stream that has reached `.closed`. Call only once every
+    /// `*Stream` taken for the current frame has been finished with — the
+    /// map rehashes and the pointer dies here.
+    fn retire(c: *Connection, id: u31) void {
+        _ = c.streams.remove(id);
+    }
+
+    /// Retire `id` if the table says it is closed. The lookup is what makes
+    /// this safe to call unconditionally at the tail of a frame handler.
+    fn retireIfClosed(c: *Connection, id: u31) void {
+        const st = c.streams.getPtr(id) orelse return;
+        if (st.state == .closed) c.retire(id);
     }
 
     // ── send side ───────────────────────────────────────────────────────────
@@ -956,7 +998,11 @@ pub const Connection = struct {
         fields: []const hpack.Field,
         end_stream: bool,
     ) SendError!void {
-        const st = c.streams.getPtr(stream_id) orelse return error.InvalidStream;
+        const st = c.streams.getPtr(stream_id) orelse
+            return if (c.everExisted(stream_id))
+                error.StreamNotWritable // closed and retired
+            else
+                error.InvalidStream;
         switch (st.state) {
             .open, .half_closed_remote => {},
             else => return error.StreamNotWritable,
@@ -984,7 +1030,10 @@ pub const Connection = struct {
             }
             if (last) break;
         }
-        if (end_stream) sendEndStream(st);
+        if (end_stream) {
+            sendEndStream(st);
+            c.retireIfClosed(stream_id);
+        }
     }
 
     /// Send DATA, split across frames per the peer's SETTINGS_MAX_FRAME_SIZE
@@ -998,7 +1047,11 @@ pub const Connection = struct {
         data: []const u8,
         end_stream: bool,
     ) SendError!void {
-        const st = c.streams.getPtr(stream_id) orelse return error.InvalidStream;
+        const st = c.streams.getPtr(stream_id) orelse
+            return if (c.everExisted(stream_id))
+                error.StreamNotWritable // closed and retired
+            else
+                error.InvalidStream;
         switch (st.state) {
             .open, .half_closed_remote => {},
             else => return error.StreamNotWritable,
@@ -1022,7 +1075,10 @@ pub const Connection = struct {
         // WINDOW_UPDATE is replenishing something real (see the
         // `.window_update` dispatch arm's flood accounting).
         c.data_sent_since_window_update = true;
-        if (end_stream) sendEndStream(st);
+        if (end_stream) {
+            sendEndStream(st);
+            c.retireIfClosed(stream_id);
+        }
     }
 
     /// Grant the peer `increment` more octets (§6.9); stream_id 0 = the
@@ -1037,11 +1093,15 @@ pub const Connection = struct {
         if (stream_id == 0) {
             c.conn_recv_window += increment;
             std.debug.assert(c.conn_recv_window <= max_window_size);
-        } else {
-            const st = c.streams.getPtr(stream_id) orelse return error.InvalidStream;
+        } else if (c.streams.getPtr(stream_id)) |st| {
             st.recv_window += increment;
             std.debug.assert(st.recv_window <= max_window_size);
+        } else if (!c.everExisted(stream_id)) {
+            return error.InvalidStream;
         }
+        // A retired (closed) stream keeps no accounting to update — credit
+        // on it can never be spent — but the frame still goes out, which is
+        // exactly what happened when closed streams stayed in the table.
         try encodeWindowUpdate(c.gpa, out, stream_id, increment);
     }
 
@@ -1057,8 +1117,12 @@ pub const Connection = struct {
         stream_id: u31,
         code: ErrorCode,
     ) SendError!void {
-        const st = c.streams.getPtr(stream_id) orelse return error.InvalidStream;
-        st.state = .closed;
+        if (c.streams.getPtr(stream_id)) |st| {
+            st.state = .closed;
+            c.retire(stream_id);
+        } else if (!c.everExisted(stream_id)) {
+            return error.InvalidStream;
+        }
         try encodeRstStream(c.gpa, out, stream_id, code);
     }
 
@@ -1085,7 +1149,10 @@ pub const Connection = struct {
     pub fn recoverStreamError(c: *Connection) ?Violation {
         const v = c.violation orelse return null;
         if (v.scope != .stream) return null;
-        if (c.streams.getPtr(v.stream_id)) |st| st.state = .closed;
+        if (c.streams.getPtr(v.stream_id)) |st| {
+            st.state = .closed;
+            c.retire(v.stream_id);
+        }
         // CVE-2023-44487: a stream we must reset counts against the same
         // budget as peer resets — a peer forcing us to reset stream after
         // stream is doing the rapid-reset dance in reverse. The next
@@ -1192,8 +1259,19 @@ pub const Connection = struct {
 
         switch (frame) {
             .data => |d| {
-                const st = c.streams.getPtr(d.stream_id) orelse
-                    return c.fail(.connection, d.stream_id, error.ProtocolError); // idle (§6.1)
+                const st = c.streams.getPtr(d.stream_id) orelse {
+                    if (!c.everExisted(d.stream_id))
+                        return c.fail(.connection, d.stream_id, error.ProtocolError); // idle (§6.1)
+                    // Closed and retired. §6.9: DATA counts against the
+                    // CONNECTION window whatever the stream's state, so the
+                    // charge happens before the stream error — otherwise a
+                    // peer could drain our window for free by racing the
+                    // close.
+                    if (h.length > c.conn_recv_window)
+                        return c.fail(.connection, 0, error.FlowControlError);
+                    c.conn_recv_window -= h.length;
+                    return c.fail(.stream, d.stream_id, error.StreamClosed);
+                };
                 // Flow control charges the whole payload incl. padding (§6.1).
                 if (h.length > c.conn_recv_window)
                     return c.fail(.connection, 0, error.FlowControlError);
@@ -1217,6 +1295,8 @@ pub const Connection = struct {
                     .data = d.data,
                     .end_stream = d.end_stream,
                 } });
+                // `st` dies here.
+                if (d.end_stream) c.retireIfClosed(d.stream_id);
             },
             .headers => |hd| {
                 if (c.streams.getPtr(hd.stream_id)) |st| {
@@ -1229,6 +1309,19 @@ pub const Connection = struct {
                     // best) are not new work — a trailer flood on one
                     // stream burns the unproductive budget.
                     try c.noteUnproductive();
+                } else if (c.everExisted(hd.stream_id)) {
+                    // Closed — either retired after END_STREAM, or implicitly
+                    // closed by §5.1.1 when a higher id was opened. The two
+                    // cannot be told apart without the table entry this
+                    // change exists to drop, and §5.1.1 already answers the
+                    // second with a connection PROTOCOL_ERROR, so both get
+                    // it. ⚠ That is the ONE wire-visible change here: HEADERS
+                    // on a stream closed by END_STREAM used to be a stream
+                    // error (STREAM_CLOSED). §5.1 asks for a connection error
+                    // in that case too, so this is stricter, not looser — and
+                    // no legal flow reaches it, since trailers arrive BEFORE
+                    // END_STREAM, not after.
+                    return c.fail(.connection, hd.stream_id, error.ProtocolError);
                 } else {
                     // New peer-initiated stream: §5.1.1 — clients initiate
                     // odd ids toward a server, monotonically, never reused;
@@ -1271,16 +1364,23 @@ pub const Connection = struct {
                 } });
             },
             .rst_stream => |r| {
-                const st = c.streams.getPtr(r.stream_id) orelse
-                    return c.fail(.connection, r.stream_id, error.ProtocolError); // idle (§6.4)
                 // CVE-2023-44487 rapid reset: a reset of a stream that had
-                // not completed (both sides closed) is cancelled work.
-                const was_done = st.state == .closed;
-                st.state = .closed;
-                if (!was_done) {
+                // not completed (both sides closed) is cancelled work. A
+                // retired stream IS a completed one, so it is not.
+                if (c.streams.getPtr(r.stream_id)) |st| {
+                    st.state = .closed;
+                    c.retire(r.stream_id);
                     c.reset_streams += 1;
                     if (c.reset_streams > c.max_reset_streams)
                         return c.fail(.connection, r.stream_id, error.EnhanceYourCalm);
+                } else if (!c.everExisted(r.stream_id)) {
+                    return c.fail(.connection, r.stream_id, error.ProtocolError); // idle (§6.4)
+                } else {
+                    // Closed and retired: legal and ignorable (§5.1 grace),
+                    // and it must stay bounded — resetting a stream that is
+                    // already gone is not work, so it burns the unproductive
+                    // budget instead of the rapid-reset one.
+                    try c.noteUnproductive();
                 }
                 try events.append(c.gpa, .{ .stream_reset = .{
                     .stream_id = r.stream_id,
@@ -1383,9 +1483,9 @@ pub const Connection = struct {
                             return c.fail(.stream, wu.stream_id, error.FlowControlError);
                         replenishes_spent_credit = c.data_sent_since_window_update;
                     } // closed: ignore (§5.1 short-lived-frame grace) — and never productive
-                } else {
+                } else if (!c.everExisted(wu.stream_id)) {
                     return c.fail(.connection, wu.stream_id, error.ProtocolError); // idle
-                }
+                } // closed and retired: same grace, same lack of progress
                 if (replenishes_spent_credit) {
                     c.data_sent_since_window_update = false;
                     c.unproductive_frames = 0;
@@ -1489,6 +1589,7 @@ pub const Connection = struct {
             .headers = list,
             .end_stream = end_stream,
         } });
+        if (end_stream) c.retireIfClosed(stream_id);
     }
 
     fn finishPushPromise(
@@ -2497,6 +2598,51 @@ fn testServerWith(options: Connection.Options) !Connection {
     defer freeEvents(&events);
     try conn.recv(handshake.items, &out, &events);
     return conn;
+}
+
+test "connection: the stream table does not grow with the requests served" {
+    // ⭐ The oracle for a bounded connection. The table used to keep every
+    // stream ever created — an entry per request, held for the life of the
+    // connection — which on a server is memory the peer decides the size of.
+    // A count that tracks the request number is the regression; a count that
+    // stays at zero is the fix.
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+
+    var id: u31 = 1;
+    for (0..500) |_| {
+        // Request: HEADERS + END_STREAM (":method: GET", static index 2).
+        bytes.clearRetainingCapacity();
+        try encodeHeaders(gpa, &bytes, id, &.{0x82}, .{ .end_stream = true, .end_headers = true });
+        try conn.recv(bytes.items, &out, &events);
+        for (events.items) |*ev| ev.deinit(gpa);
+        events.clearRetainingCapacity();
+        // The stream is only half closed until we answer, so it is still live.
+        try testing.expectEqual(@as(u32, 1), conn.streams.count());
+        try testing.expectEqual(StreamState.half_closed_remote, conn.stream(id).?.state);
+
+        // Response: HEADERS + END_STREAM closes it from our side too.
+        try conn.sendHeaders(&out, id, &.{.{ .name = ":status", .value = "200" }}, true);
+        try testing.expectEqual(@as(u32, 0), conn.streams.count());
+        // ...and it still reads as closed, not as never-having-existed.
+        try testing.expectEqual(StreamState.closed, conn.stream(id).?.state);
+        id += 2;
+    }
+    // An id above the watermark is idle, which is a different answer.
+    try testing.expectEqual(@as(?Stream, null), conn.stream(id + 2));
+    try testing.expectEqual(@as(u32, 0), conn.streams.count());
+    // Capacity settles on the CONCURRENT live streams (one, here), not on the
+    // 500 served — the table never sized itself to the request count. Asserted
+    // as a bound rather than a number so it survives a hash-map growth policy.
+    try testing.expect(conn.streams.capacity() < 32);
 }
 
 test "connection: rapid reset (CVE-2023-44487) → ENHANCE_YOUR_CALM" {

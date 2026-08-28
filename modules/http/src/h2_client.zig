@@ -1353,6 +1353,18 @@ const Peer = struct {
         }
         return false;
     }
+
+    /// Total STREAM-level credit the client granted on `sid`. Summed from the
+    /// frames rather than read off the peer's stream table, because a closed
+    /// stream is retired from that table — see `h2.Connection.everExisted`.
+    fn streamCreditGranted(p: *const Peer, sid: u31) i64 {
+        var total: i64 = 0;
+        for (p.srv.events.items) |ev| {
+            if (ev == .window_update and ev.window_update.stream_id == sid)
+                total += ev.window_update.increment;
+        }
+        return total;
+    }
 };
 
 fn trailerValue(list: hpack.HeaderList, name: []const u8) ?[]const u8 {
@@ -1709,12 +1721,13 @@ test "h2 client: cancel resets the stream and returns the unread octets' credit 
     // so the peer's connection window is whole again.
     const w: i64 = h2.default_initial_window_size;
     try testing.expectEqual(w, peer.srv.conn.conn_send_window);
-    // Not on the stream window — that stream is dead; only what the caller
-    // actually read was ever granted there.
-    try testing.expectEqual(
-        w - @as(i64, chunk.len) + @as(i64, rbuf.len),
-        peer.srv.conn.stream(sid).?.send_window,
-    );
+    // Not on the stream window: only what the caller actually READ was ever
+    // granted there — the 3 KiB it walked away from were credited back on
+    // the connection above and nowhere else. Summed from the frames rather
+    // than read off the peer's stream table, because a closed stream is
+    // retired from that table (`h2.Connection.everExisted`).
+    try testing.expectEqual(@as(i64, rbuf.len), peer.streamCreditGranted(sid));
+    try testing.expectEqual(h2.StreamState.closed, peer.srv.conn.stream(sid).?.state);
 }
 
 test "h2 client: DATA for a stream we no longer hold is credited immediately (offline)" {
