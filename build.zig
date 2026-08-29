@@ -95,7 +95,7 @@ const module_list = [_]Module{
     // wire a real `workerpool.WorkerPool` into that seam because the five
     // concurrency invariants can only be exercised by real threads.
     // `zig build check-testonly` proves the published module never needs it.
-    .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{"netaddr"}, .test_deps = &.{ "testkit", "workerpool" } },
+    .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{ "netaddr", "datefmt" }, .test_deps = &.{ "testkit", "workerpool" } },
     .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"} },
