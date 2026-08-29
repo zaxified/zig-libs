@@ -1400,6 +1400,50 @@ pub fn serveStep(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuf
 
 pub const ConnDisposition = enum { keep_alive, close };
 
+/// How much stack one in-flight request costs, measured rather than reasoned
+/// about.
+///
+/// ⭐⭐⭐ WHY THIS EXISTS. Measured against a live server (256 TLS connections
+/// at saturation, io_uring, ReleaseFast): 36 KiB of every connection's stack
+/// was resident, and every resident page of it lay between the codec's entry
+/// and the handler's frame. Nothing else on that stack mattered -- the two
+/// 16 KiB TLS record buffers a connection also holds had ZERO resident pages,
+/// and nothing was left dead below the frame. On a server that gives every
+/// connection its own stack, this frame IS the per-connection memory, and it
+/// had no test.
+///
+/// ⚠ Two things make it unmeasurable if either is missed:
+///
+///   * ReleaseFast merges every inlined callee into ONE allocation taken in
+///     the entry prologue, so two probes INSIDE the codec are ~200 B apart
+///     however large that allocation is. The probe has to straddle a real
+///     call boundary -- the caller's frame against the handler's.
+///   * A `var` function pointer nothing ever stores to is proved constant and
+///     inlined through, which collapses that boundary again. The harness loads
+///     it through a `volatile` pointer, the way a server reaching the codec
+///     through a vtable does by construction.
+const frame_probe = struct {
+    var caller: usize = 0;
+    var measured: usize = 0;
+
+    noinline fn here() usize {
+        var x: usize = undefined;
+        return @intFromPtr(&x);
+    }
+
+    fn markCaller() void {
+        caller = here();
+        measured = 0;
+    }
+
+    /// Called from the serving frame, just before the handler runs: the
+    /// deepest point the codec reaches on its own.
+    noinline fn record() void {
+        if (caller == 0 or measured != 0) return;
+        measured = caller -% here();
+    }
+};
+
 fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32, force_close: bool) ConnDisposition {
     // The wait for this request already happened in `serveLoop`, above the
     // point where working memory is borrowed. See the comment there.
@@ -1541,6 +1585,8 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .accept_gzip = compression_on and gzip.acceptsGzip(head.header("accept-encoding")),
     });
 
+    // Compiled out entirely outside the test build; see `frame_probe`.
+    if (builtin.is_test) frame_probe.record();
     opts.handler(&req, &rw) catch {
         // Nothing on the wire yet → a clean 500; otherwise the response
         // framing is broken and the connection must die.
@@ -3273,7 +3319,7 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
     defer if (gunzip) |p| testing.allocator.destroy(p);
     if (tweaks.max_decompressed_request_bytes != 0)
         gunzip = testing.allocator.create(GunzipScratch) catch @panic("OOM");
-    serveStream(.{
+    serveIndirect(.{
         .handler = testHandler,
         .context = ctx,
         .server_name = tweaks.server_name,
@@ -3298,7 +3344,21 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
     return out.buffered();
 }
 
+/// A real call boundary, for `frame_probe`. See its doc comment for why a
+/// direct call cannot measure the frame and why this pointer is loaded
+/// through `volatile`.
+var serve_indirect: *const fn (StreamOptions, *Reader, *Writer, StreamBuffers) void = &serveStream;
+
+fn serveIndirect(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers) void {
+    // ⚠ A plain global pointer is not enough: nothing ever stores to it, so
+    // LLVM proves it constant and inlines through it anyway -- the probe then
+    // reads 208 B whatever the frame holds. A volatile load cannot be folded.
+    const p: *volatile *const fn (StreamOptions, *Reader, *Writer, StreamBuffers) void = &serve_indirect;
+    p.*(opts, in, out, bufs);
+}
+
 fn runStream(ctx: ?*anyopaque, wire: []const u8, out_buf: []u8) []const u8 {
+    frame_probe.markCaller();
     return runStreamWith(.{}, ctx, wire, out_buf);
 }
 
@@ -5597,4 +5657,37 @@ test "formatHttpDate: the calendar, and the year that used to panic" {
     // Negative seconds are floored to the epoch rather than wrapping into a
     // plausible-looking wrong date.
     try testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", formatHttpDate(-1, &buf));
+}
+
+/// ⛔ The per-connection memory of any server that gives a connection its own
+/// stack -- a thread, a fiber, a coroutine -- is this number, and it is paid
+/// once per IN-FLIGHT REQUEST. It grows silently: a local added to the serving
+/// path costs every connection on the box, and no other test in this file
+/// would move.
+///
+/// The ceiling is deliberately loose. It is here to catch a frame that
+/// DOUBLES, not to police a hundred bytes, and a change that needs more room
+/// should raise it in the same commit that spends it -- with the number it
+/// measured. Measured 2026-08-29: 18,640 B at ReleaseFast.
+const codec_frame_budget = 24 * 1024;
+
+test "the serving frame stays inside its budget" {
+    var out_buf: [4096]u8 = undefined;
+    _ = runStream(null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(frame_probe.measured != 0);
+
+    // ⚠ Debug allocates a slot per temporary and reaches ~35 KiB where
+    // ReleaseFast reaches 16.5; asserting one number against both would either
+    // pass everything or fail honestly-built code. The optimized modes are the
+    // ones a server ships, and they are the ones held to the budget.
+    const optimized = builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSafe or
+        builtin.mode == .ReleaseSmall;
+    if (!optimized) return;
+    if (frame_probe.measured > codec_frame_budget) {
+        std.debug.print(
+            "the serving frame is {d} B, over the {d} B budget -- see `frame_probe`\n",
+            .{ frame_probe.measured, codec_frame_budget },
+        );
+        return error.ServingFrameTooLarge;
+    }
 }
