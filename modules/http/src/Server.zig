@@ -1509,8 +1509,25 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         if (std.mem.indexOfScalar(u8, path, 0) != null or
             std.ascii.indexOfIgnoreCase(path, "%00") != null)
             return respondError(opts, out, date, 400);
-        @memcpy(norm_buf[0..path.len], path);
-        path = norm_buf[0..http.removeDotSegments(norm_buf[0..path.len])];
+        // ⭐⭐ The copy exists so that normalization -- which rewrites in
+        // place -- cannot touch the raw target. Where there is nothing to
+        // normalize there is nothing to protect: every branch of
+        // `removeDotSegments` that moves a byte needs a "/." to fire, and a
+        // path without one comes back byte for byte at the same length. So
+        // the copy is skipped, and `path` keeps pointing into the head buffer
+        // it already pointed into.
+        //
+        // ⭐ Not a micro-optimization. `norm_buf` is 8 KiB of the serving
+        // frame, and on a server that gives every connection its own stack
+        // that frame IS the per-connection memory (see `frame_probe`): the
+        // `@memcpy` makes its pages resident for every connection on the box,
+        // and a static-asset path like `/app.js` -- a dot, but not a dot
+        // SEGMENT -- was paying it. `/foo/./bar` and `/foo/../bar` still take
+        // the copy, which is the only case that ever needed it.
+        if (std.mem.indexOf(u8, path, "/.") != null) {
+            @memcpy(norm_buf[0..path.len], path);
+            path = norm_buf[0..http.removeDotSegments(norm_buf[0..path.len])];
+        }
     }
 
     // Persistence: HTTP/1.1 defaults to keep-alive unless the client asked
@@ -4178,6 +4195,12 @@ test "serveStream: request path normalized + traversal-clamped before routing" {
     try testing.expect(std.mem.endsWith(u8, q, "\r\n\r\nhello"));
     // Already-normal routes are byte-for-byte unaffected (404 path).
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET /nope HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 404 Not Found\r\n"));
+    // ⭐ A dot that is not a dot SEGMENT does not make a path need
+    // normalizing, and one that is still does even when the other is present.
+    // This pins the predicate that decides whether the 8 KiB copy happens at
+    // all: "/." appears in the second target and not the first.
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET /app.js HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 404 Not Found\r\n"));
+    try testing.expect(std.mem.endsWith(u8, runStream(null, "GET /app.js/../hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf), "\r\n\r\nhello"));
 }
 
 test "serveStream: NUL / encoded-NUL in the path → 400" {
