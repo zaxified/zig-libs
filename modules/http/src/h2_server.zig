@@ -1298,7 +1298,7 @@ const Session = struct {
         // ── run the handler against the stock ResponseWriter ────────────
         var date_buf: [Server.http_date_len]u8 = undefined;
         const date: ?[]const u8 = if (s.opts.now) |n|
-            Server.formatHttpDate(n.epochSeconds(n.ctx), &date_buf)
+            Server.httpDateInto(n, &date_buf)
         else
             null;
         const body_buf = arena.alloc(u8, s.opts.response_buffer_size) catch return .close;

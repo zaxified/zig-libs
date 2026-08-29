@@ -1402,7 +1402,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // point where working memory is borrowed. See the comment there.
 
     var date_buf: [http_date_len]u8 = undefined;
-    const date: ?[]const u8 = if (opts.now) |n| formatHttpDate(n.epochSeconds(n.ctx), &date_buf) else null;
+    const date: ?[]const u8 = if (opts.now) |n| httpDateInto(n, &date_buf) else null;
 
     const block = h1.readHead(in, bufs.head) catch |err| switch (err) {
         error.HeadTooLarge => return respondError(opts, out, date, 431),
@@ -2983,6 +2983,44 @@ pub fn reasonPhrase(status: u16) []const u8 {
 
 /// Length of an IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT").
 pub const http_date_len = 29;
+
+/// The last stamp this thread formatted, and the second it is for.
+///
+/// A server answering the rate this codec is built for serves thousands of
+/// responses inside one second, and every one of them carries the same 29
+/// bytes. Formatting them separately is the single most expensive thing about
+/// the `Date` header: measured in a consumer over TLS/h2, turning `Date` on
+/// cost **+6,433 instructions per request**, of which the clock read was ~900
+/// and the rest was almost entirely this call. nginx, ntex and hyper all keep
+/// a stamp per second for the same reason.
+///
+/// Per thread rather than per process: it is written on every tick of the
+/// clock, and a shared one would be a contended write on the response path to
+/// save 29 bytes.
+threadlocal var date_cache: [http_date_len]u8 = undefined;
+threadlocal var date_cache_second: i64 = std.math.minInt(i64);
+
+/// `formatHttpDate` for a caller that asks once per response, reusing the
+/// stamp while the second lasts. The result is written into `buf` and is the
+/// caller's, with exactly the lifetime `formatHttpDate` gave it.
+///
+/// ⭐ **The copy into `buf` is what makes this safe, and it is not a
+/// leftover.** Returning `&date_cache` directly would hand out a pointer to
+/// storage that the next tick rewrites, and a caller that yields between
+/// taking the stamp and writing it — which a fibre-per-connection server does
+/// whenever the response head does not fit the socket buffer — could then emit
+/// a head half in one second and half in the next. Copying 29 bytes costs a
+/// couple of instructions against the thousands this saves, and it cannot be
+/// interrupted: nothing between here and the return can yield.
+pub fn httpDateInto(now: StreamOptions.Now, buf: *[http_date_len]u8) []const u8 {
+    const second = now.epochSeconds(now.ctx);
+    if (second != date_cache_second) {
+        _ = formatHttpDate(second, &date_cache);
+        date_cache_second = second;
+    }
+    buf.* = date_cache;
+    return buf;
+}
 
 /// Format epoch seconds as an RFC 9110 IMF-fixdate for Date headers.
 pub fn formatHttpDate(epoch_seconds: i64, buf: *[http_date_len]u8) []const u8 {
@@ -5420,4 +5458,78 @@ test "buffers_provider: nothing is borrowed while the connection waits" {
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "hello"));
     try testing.expectEqual(@as(usize, 2), cp.acquires);
     try testing.expectEqual(@as(usize, 2), cp.releases);
+}
+
+// ── the Date stamp is formatted once a second, not once a response ──────────
+
+/// A clock the test drives, counting how often it was asked.
+const CountingClock = struct {
+    second: i64 = 1_756_468_938, // 2026-08-29T13:22:18Z
+    reads: usize = 0,
+
+    fn epochSeconds(ctx: ?*anyopaque) i64 {
+        const self: *CountingClock = @ptrCast(@alignCast(ctx.?));
+        self.reads += 1;
+        return self.second;
+    }
+
+    fn now(self: *CountingClock) StreamOptions.Now {
+        return .{ .ctx = self, .epochSeconds = CountingClock.epochSeconds };
+    }
+};
+
+test "the stamp is reformatted only when the second changes" {
+    // The whole point of the cache. A server answering thousands of responses
+    // per second formats the same 29 bytes for all of them, and in a consumer
+    // measurement that formatting was most of what the `Date` header cost.
+    var clock: CountingClock = .{};
+    date_cache_second = std.math.minInt(i64); // this thread may have served already
+
+    var buf: [http_date_len]u8 = undefined;
+    var expected: [http_date_len]u8 = undefined;
+    const want = formatHttpDate(clock.second, &expected);
+
+    try testing.expectEqualStrings(want, httpDateInto(clock.now(), &buf));
+
+    // ⭐ Asserted by poisoning the cache rather than by counting calls: a
+    // version that reformatted every time returns the right answer too, so a
+    // test that only compares stamps passes with the cache deleted. Overwrite
+    // what the first call stored, ask again inside the same second, and the
+    // poison has to come back -- which it can only do if nothing reformatted.
+    @memset(&date_cache, 'X');
+    try testing.expectEqualStrings("X" ** http_date_len, httpDateInto(clock.now(), &buf));
+
+    // The clock is still read every time -- what is saved is the formatting,
+    // and a cache that stopped reading the clock could not notice the second
+    // turning over.
+    try testing.expectEqual(@as(usize, 2), clock.reads);
+
+    // And the turnover itself: a new second reformats, poison and all.
+    clock.second += 1;
+    var next: [http_date_len]u8 = undefined;
+    const got = httpDateInto(clock.now(), &buf);
+    try testing.expectEqualStrings(formatHttpDate(clock.second, &next), got);
+}
+
+test "the stamp lands in the caller's buffer, not in the cache" {
+    // ⭐ The safety property, and the reason this returns into a buffer rather
+    // than handing back `&date_cache`: a caller may yield between taking the
+    // stamp and writing it out, and the next tick of the clock must not edit a
+    // head that is half on the wire.
+    var clock: CountingClock = .{};
+    date_cache_second = std.math.minInt(i64);
+
+    var buf: [http_date_len]u8 = undefined;
+    const got = httpDateInto(clock.now(), &buf);
+    try testing.expectEqual(@as([*]const u8, &buf), got.ptr);
+
+    // Prove it by doing exactly what a second connection on this thread would:
+    // move the clock on, take another stamp, and check the first one did not
+    // change under it.
+    var held: [http_date_len]u8 = undefined;
+    @memcpy(&held, got);
+    clock.second += 60;
+    var other: [http_date_len]u8 = undefined;
+    _ = httpDateInto(clock.now(), &other);
+    try testing.expectEqualStrings(&held, got);
 }
