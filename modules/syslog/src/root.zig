@@ -39,7 +39,9 @@ pub const meta = .{
     .role = .client,
     .concurrency = .reentrant,
     .model_after = "RFC 5424 (+ RFC 6587 framing); design after joelreymont/pz",
-    .deps = .{},
+    // `datefmt` for the RFC 3339 timestamp's calendar: std has one and it walks
+    // a year at a time from 1970 (`message.decompose`).
+    .deps = .{"datefmt"},
 };
 
 const message = @import("message.zig");

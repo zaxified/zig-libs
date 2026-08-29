@@ -8,6 +8,7 @@
 //! testable with no clock; `syslog.nowTimestamp()` (root) is the live helper.
 
 const std = @import("std");
+const datefmt = @import("datefmt");
 
 // ── PRI: facility + severity ────────────────────────────────────────────────
 
@@ -107,19 +108,24 @@ pub fn decompose(ts: Timestamp) DecomposeError!CalendarTime {
     if (total_secs < 0 or total_secs > max_epoch_secs) return error.TimestampOutOfRange;
     const milli: u16 = @intCast(@mod(adjusted, 1000));
 
-    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(total_secs) };
-    const day = es.getEpochDay();
-    const yd = day.calculateYearDay();
-    const md = yd.calculateMonthDay();
-    const ds = es.getDaySeconds();
+    // `datefmt`'s branchless civil-from-days, not `std.time.epoch`. std's
+    // `calculateYearDay` walks **one loop iteration per year since 1970** --
+    // 56 of them in 2026, and one more every New Year -- and its
+    // `calculateMonthDay` then walks the months. This runs once per message,
+    // so it is the record rate that pays for it. Measured in `http`, which had
+    // the identical four lines: **3,043 instructions per call down to 141**.
+    //
+    // The range check above is what makes this safe: `DateParts.year` is an
+    // `i32`, and seconds past year 9999 would overflow it.
+    const p = datefmt.unixToParts(total_secs);
 
     return .{
-        .year = yd.year,
-        .month = md.month.numeric(),
-        .day = @as(u8, md.day_index) + 1,
-        .hour = ds.getHoursIntoDay(),
-        .minute = ds.getMinutesIntoHour(),
-        .second = ds.getSecondsIntoMinute(),
+        .year = @intCast(p.year),
+        .month = @intCast(p.month),
+        .day = @intCast(p.day),
+        .hour = @intCast(p.hour),
+        .minute = @intCast(p.minute),
+        .second = @intCast(p.second),
         .milli = milli,
         .offset_minutes = ts.offset_minutes,
     };
@@ -469,4 +475,28 @@ test "bufPrint reports NoSpaceLeft when the buffer is too small" {
     const msg = Message{ .facility = .user, .severity = .notice, .msg = "x" ** 100 };
     var tiny: [16]u8 = undefined;
     try t.expectError(error.NoSpaceLeft, bufPrint(&msg, &tiny));
+}
+
+test "the calendar: leap days, year boundaries and both ends of the range" {
+    // `decompose` is where the RFC 3339 timestamp's date comes from, and until
+    // 2026-08-29 it walked `std.time.epoch`'s year-at-a-time loop. The two
+    // implementations agree on ordinary dates and differ where a calendar is
+    // easy to get wrong, so those are what is pinned here rather than the
+    // 2026-07-09 instant the formatter tests already use.
+    const cases = [_]struct { ms: i64, want: []const u8 }{
+        .{ .ms = 0, .want = "1970-01-01T00:00:00.000Z" },
+        .{ .ms = 1709164800_000, .want = "2024-02-29T00:00:00.000Z" }, // leap day
+        .{ .ms = 1709251199_999, .want = "2024-02-29T23:59:59.999Z" }, // its last ms
+        .{ .ms = 1709251200_000, .want = "2024-03-01T00:00:00.000Z" }, // the day after
+        .{ .ms = 1735689599_999, .want = "2024-12-31T23:59:59.999Z" }, // year boundary
+        .{ .ms = 1735689600_000, .want = "2025-01-01T00:00:00.000Z" },
+        .{ .ms = 4107542400_000, .want = "2100-03-01T00:00:00.000Z" }, // 2100 is NOT a leap year
+        .{ .ms = 253402300799_000, .want = "9999-12-31T23:59:59.000Z" }, // the last instant accepted
+    };
+    for (cases) |c| {
+        var buf: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeRfc3339(&w, .{ .unix_ms = c.ms });
+        try std.testing.expectEqualStrings(c.want, w.buffered());
+    }
 }

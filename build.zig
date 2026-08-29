@@ -252,7 +252,7 @@ const module_list = [_]Module{
     .{ .name = "llmclient", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "rawsock", .libs = &.{"net"}, .deps = &.{"netaddr"} },
     .{ .name = "encoding", .libs = &.{"format"} },
-    .{ .name = "syslog", .libs = &.{"net"} },
+    .{ .name = "syslog", .libs = &.{"net"}, .deps = &.{"datefmt"} },
     .{ .name = "sntp", .libs = &.{"net"} },
     .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"} },
     .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .live = true },
