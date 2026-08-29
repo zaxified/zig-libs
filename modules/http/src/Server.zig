@@ -823,9 +823,29 @@ const trailer_scratch_len = 1024;
 /// on keep-alive (Go's maxPostHandlerReadBytes).
 const max_unread_body_drain = 256 * 1024;
 /// Scratch bound for request-path normalization (a private copy so the raw
-/// `Request.target` is preserved). Covers the default `max_request_line_bytes`
-/// (8 KiB) — a longer origin-form path answers 414 rather than routing raw.
-const max_normalized_path = 8 * 1024;
+/// `Request.target` is preserved): the longest request PATH this server will
+/// normalize, and so the longest it will serve -- above it the answer is 414
+/// rather than routing raw. The query string is not counted; `path` is the
+/// target up to the '?'.
+///
+/// ⚠ This is NOT `max_request_line_bytes`, which still defaults to 8 KiB: a
+/// request line may carry that much, and a query string may use all of it,
+/// but the path half of it stops here.
+///
+/// ⭐⭐ 8 KiB until 2026-08-29, and the number is not free: this buffer sits on
+/// the serving frame, and that frame is the per-connection memory of any server
+/// that gives a connection its own stack (see `frame_probe`). Measured against
+/// a live server -- 256 TLS connections at saturation, io_uring, ReleaseFast --
+/// dropping it to 2 KiB took anonymous memory from 41.4-42.5 KiB per connection
+/// to 38.1 and the serving frame from 18,640 B to 12,496. Dropping it further,
+/// to 512 B, bought nothing measurable (37.7 KiB): residency is counted in
+/// pages and the rest of the frame is already dense.
+///
+/// ⚠ And it has to be the DECLARED size that shrinks. Not writing to the
+/// buffer does nothing at all -- the frame is one contiguous allocation whose
+/// every page carries something live -- which is why the dot-segment skip
+/// above this saves work but not a byte of memory.
+const max_normalized_path = 2 * 1024;
 
 fn connMain(s: *Server, stream: net.Stream) void {
     defer stream.close(s.io);
@@ -4203,6 +4223,51 @@ test "serveStream: request path normalized + traversal-clamped before routing" {
     try testing.expect(std.mem.endsWith(u8, runStream(null, "GET /app.js/../hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf), "\r\n\r\nhello"));
 }
 
+test "serveStream: a path past max_normalized_path is 414, one under it serves" {
+    // The limit is the buffer the path is normalized in, and that buffer is
+    // per-connection memory on any server that gives a connection its own
+    // stack -- so the number is worth pinning rather than left to whoever next
+    // reads the constant. `max_request_line_bytes` is a different and larger
+    // limit; this one is the path half alone.
+    //
+    // Its own buffers, not `runStream`'s: that harness lends a 1 KiB head
+    // buffer, so a 2 KiB path is refused as 431 before the path limit is ever
+    // reached -- which is a true answer to a different question.
+    const Case = struct {
+        fn run(path_len: usize, out_buf: []u8) []const u8 {
+            var wire: [max_normalized_path + 512]u8 = undefined;
+            var w: Writer = .fixed(&wire);
+            w.writeAll("GET /") catch unreachable;
+            w.splatByteAll('a', path_len - 1) catch unreachable;
+            w.writeAll(" HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n") catch unreachable;
+
+            var in: Reader = .fixed(w.buffered());
+            var out: Writer = .fixed(out_buf);
+            var head_buf: [max_normalized_path + 512]u8 = undefined;
+            var request_body_buf: [256]u8 = undefined;
+            var response_body_buf: [64]u8 = undefined;
+            var chunk_buf: [128]u8 = undefined;
+            serveStream(.{
+                .handler = testHandler,
+                .server_name = "test",
+                .now = .{ .epochSeconds = fixedEpoch },
+                .max_request_line_bytes = null,
+            }, &in, &out, .{
+                .head = &head_buf,
+                .request_body = &request_body_buf,
+                .response_body = &response_body_buf,
+                .chunk = &chunk_buf,
+            });
+            return out.buffered();
+        }
+    };
+    var out_buf: [4096]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, Case.run(max_normalized_path + 1, &out_buf), "HTTP/1.1 414 "));
+    // One inside the limit routes normally -- a 404 here, because the test
+    // handler serves /hello and the point is that it ROUTED at all.
+    try testing.expect(std.mem.startsWith(u8, Case.run(max_normalized_path, &out_buf), "HTTP/1.1 404 "));
+}
+
 test "serveStream: NUL / encoded-NUL in the path → 400" {
     var out_buf: [4096]u8 = undefined;
     // Percent-encoded NUL: the parser passes it, normalization rejects it.
@@ -5691,8 +5756,9 @@ test "formatHttpDate: the calendar, and the year that used to panic" {
 /// The ceiling is deliberately loose. It is here to catch a frame that
 /// DOUBLES, not to police a hundred bytes, and a change that needs more room
 /// should raise it in the same commit that spends it -- with the number it
-/// measured. Measured 2026-08-29: 18,640 B at ReleaseFast.
-const codec_frame_budget = 24 * 1024;
+/// measured. Measured 2026-08-30: 12,496 B at ReleaseFast, down from 18,640
+/// when `max_normalized_path` was 8 KiB.
+const codec_frame_budget = 16 * 1024;
 
 test "the serving frame stays inside its budget" {
     var out_buf: [4096]u8 = undefined;
