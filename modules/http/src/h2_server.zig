@@ -752,9 +752,10 @@ const Session = struct {
         }
     };
 
-    /// How much may sit staged in `wire` before `stageWire` writes it out.
-    /// A whole round of small responses fits, which is the point; the cap
-    /// exists so a large one cannot grow the staging buffer without bound.
+    /// How much may sit staged in `wire` before `stageWire` spills it into
+    /// the socket writer's buffer. A whole round of small responses fits,
+    /// which is the point; the cap exists so a large one cannot grow the
+    /// staging buffer without bound.
     const wire_flush_threshold = 8 * 1024;
 
     /// Hot-path counterpart to `flushWire`: stage the frames and let them
@@ -778,15 +779,34 @@ const Session = struct {
     /// So a worker flushes immediately and only the single-task path
     /// accumulates.
     fn stageWire(s: *Session) Writer.Error!void {
-        if (s.threaded or s.wire.items.len >= wire_flush_threshold) return s.flushWire();
+        if (s.threaded) return s.flushWire();
+        if (s.wire.items.len >= wire_flush_threshold) return s.spillWire();
+    }
+
+    /// Move staged wire bytes into the socket writer's own buffering without
+    /// forcing them onto the wire. Bounding `wire` needs only the move --
+    /// `out` is a buffered writer (over TLS, one that builds whole records in
+    /// the connection's ciphertext buffer), and bytes that are waiting for
+    /// more company belong in it, not on the network. Flushing the socket
+    /// here as well is what `stageWire` used to do, and it put a response
+    /// larger than the threshold on the wire one threshold-sized piece per
+    /// send -- each send a full pass through the TCP stack -- while the
+    /// single-task pump was going to flush before blocking anyway.
+    fn spillWire(s: *Session) Writer.Error!void {
+        if (s.wire.items.len == 0) return;
+        try s.out.writeAll(s.wire.items);
+        s.wire.clearRetainingCapacity();
     }
 
     /// Flush staged wire bytes through the (timeout-guarded) socket writer.
+    /// `out` is flushed even with nothing staged: `stageWire` spills without
+    /// flushing, so bytes can sit in `out`'s buffer while `wire` is empty --
+    /// and every caller of this function is about to block on (or hand the
+    /// connection back to) a peer who may be waiting on exactly those bytes.
+    /// On an empty buffer the flush is a no-op, not a syscall.
     fn flushWire(s: *Session) Writer.Error!void {
-        if (s.wire.items.len == 0) return;
-        try s.out.writeAll(s.wire.items);
+        try s.spillWire();
         try s.out.flush();
-        s.wire.clearRetainingCapacity();
     }
 
     /// Block for at least one byte, feed everything buffered to the h2
