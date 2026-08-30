@@ -330,7 +330,10 @@ fn huffmanEncodedLen(s: []const u8) usize {
 }
 
 /// Huffman-encode `s`, padding the final partial octet with EOS-prefix ones.
-fn huffmanEncode(gpa: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
+/// `out` must have `huffmanEncodedLen(s)` octets of unused capacity: the
+/// length is known before the first octet is written, so the encoder
+/// reserves once rather than checking on every octet.
+fn huffmanEncodeAssumeCapacity(out: *std.ArrayList(u8), s: []const u8) void {
     var acc: u64 = 0;
     var nbits: u6 = 0;
     for (s) |b| {
@@ -339,14 +342,19 @@ fn huffmanEncode(gpa: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocat
         nbits += hc.len;
         while (nbits >= 8) {
             nbits -= 8;
-            try out.append(gpa, @truncate(acc >> nbits));
+            out.appendAssumeCapacity(@truncate(acc >> nbits));
         }
     }
     if (nbits > 0) {
         const byte: u8 = @truncate((acc << @intCast(8 - @as(u4, @intCast(nbits)))) |
             (@as(u64, 0xff) >> nbits));
-        try out.append(gpa, byte);
+        out.appendAssumeCapacity(byte);
     }
+}
+
+fn huffmanEncode(gpa: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
+    try out.ensureUnusedCapacity(gpa, huffmanEncodedLen(s));
+    huffmanEncodeAssumeCapacity(out, s);
 }
 
 /// Huffman-decode `input` into a fresh allocation, enforcing the §5.2
@@ -389,6 +397,28 @@ fn huffmanDecodeAlloc(gpa: Allocator, input: []const u8, limit: usize) DecodeErr
 // ── Appendix A static table ─────────────────────────────────────────────────
 
 const StaticEntry = struct { name: []const u8, value: []const u8 };
+
+/// Name -> the RFC index of the first static entry carrying it, and how
+/// many consecutive entries do (Appendix A lists the entries that share a
+/// name together: `:status` is 8..14, `:method` 2..3). An encoder lookup is
+/// then one map probe and at most seven value compares, where it used to
+/// walk all 61 entries twice per field -- measured at 850 instructions per
+/// field even when every field was an indexed hit.
+const StaticNameRun = struct { first: u8, count: u8 };
+const static_names = blk: {
+    var kvs: [static_table.len]struct { []const u8, StaticNameRun } = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < static_table.len) {
+        const name = static_table[i].name;
+        var j = i;
+        while (j < static_table.len and std.mem.eql(u8, static_table[j].name, name)) j += 1;
+        kvs[n] = .{ name, .{ .first = @intCast(i + 1), .count = @intCast(j - i) } };
+        n += 1;
+        i = j;
+    }
+    break :blk std.StaticStringMap(StaticNameRun).initComptime(kvs[0..n]);
+};
 
 /// RFC 7541 Appendix A: the 61 static entries. The array is 0-based;
 /// RFC index `i` lives at `static_table[i - 1]`.
@@ -841,7 +871,8 @@ pub const Encoder = struct {
             const hlen = huffmanEncodedLen(s);
             if (hlen <= s.len) {
                 try appendInt(e.gpa, out, 0x80, 7, hlen);
-                try huffmanEncode(e.gpa, out, s);
+                try out.ensureUnusedCapacity(e.gpa, hlen);
+                huffmanEncodeAssumeCapacity(out, s);
                 return;
             }
         }
@@ -851,9 +882,11 @@ pub const Encoder = struct {
 
     /// Combined index of an exact (name, value) match; static entries win.
     fn findExact(e: *const Encoder, f: Field) ?u64 {
-        for (static_table, 1..) |s, i| {
-            if (std.mem.eql(u8, s.name, f.name) and std.mem.eql(u8, s.value, f.value))
-                return i;
+        if (static_names.get(f.name)) |run| {
+            var i: usize = run.first;
+            while (i < run.first + run.count) : (i += 1) {
+                if (std.mem.eql(u8, static_table[i - 1].value, f.value)) return i;
+            }
         }
         const n = e.table.count();
         var i: usize = 1;
@@ -867,9 +900,7 @@ pub const Encoder = struct {
 
     /// Combined index of a name-only match; static entries win.
     fn findName(e: *const Encoder, name: []const u8) ?u64 {
-        for (static_table, 1..) |s, i| {
-            if (std.mem.eql(u8, s.name, name)) return i;
-        }
+        if (static_names.get(name)) |run| return run.first;
         const n = e.table.count();
         var i: usize = 1;
         while (i <= n) : (i += 1) {
@@ -949,6 +980,21 @@ fn expectDecodeError(expected: anyerror, block: []const u8) !void {
     var dec: Decoder = .init(testing.allocator, .{});
     defer dec.deinit();
     try testing.expectError(expected, dec.decodeBlock(block));
+}
+
+test "static name runs cover the static table exactly" {
+    var covered: usize = 0;
+    for (static_table, 1..) |s, i| {
+        const run = static_names.get(s.name).?;
+        try testing.expect(run.first <= i and i < run.first + run.count);
+        try testing.expectEqualStrings(s.name, static_table[run.first - 1].name);
+        try testing.expectEqualStrings(s.name, static_table[run.first + run.count - 2].name);
+        if (i == run.first) covered += run.count;
+    }
+    try testing.expectEqual(static_table.len, covered);
+    try testing.expectEqual(@as(u8, 8), static_names.get(":status").?.first);
+    try testing.expectEqual(@as(u8, 7), static_names.get(":status").?.count);
+    try testing.expect(static_names.get("x-not-static") == null);
 }
 
 test "integer: RFC 7541 C.1 examples" {
