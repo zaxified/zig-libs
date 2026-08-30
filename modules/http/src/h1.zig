@@ -146,9 +146,36 @@ fn parseHeaderLine(line: []const u8) HeadParseError!HeaderEntry {
     if (line[0] == ' ' or line[0] == '\t') return error.MalformedHead; // obs-fold
     const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHead;
     const name = line[0..colon];
-    if (name.len == 0 or std.mem.indexOfAny(u8, name, " \t") != null)
-        return error.MalformedHead;
-    return .{ .name = name, .value = std.mem.trim(u8, line[colon + 1 ..], " \t") };
+    // field-name = token (RFC 9110 §5.1): a name that is not a token is not
+    // a header, and a server that stores it under whatever bytes it got has
+    // let "Bad[Name", "Transfer\x00Encoding" and every non-ASCII spelling
+    // through as headers nobody will ever match.
+    if (name.len == 0) return error.MalformedHead;
+    for (name) |c| if (!isTchar(c)) return error.MalformedHead;
+    const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+    // field-value = *(field-vchar / SP / HTAB), field-vchar = VCHAR / obs-text
+    // (§5.5): a control byte -- NUL, a bare CR, anything below 0x20 but
+    // HTAB, or DEL -- cannot appear in a value, and is the classic vehicle
+    // for header injection. Bytes >= 0x80 are obs-text and stay legal.
+    for (value) |c| if ((c < 0x20 and c != '\t') or c == 0x7f) return error.MalformedHead;
+    return .{ .name = name, .value = value };
+}
+
+/// `Host = uri-host [ ":" port ]` (RFC 9112 §3.2): the characters a reg-name,
+/// an IP-literal or a port can be made of, and nothing else. What it turns
+/// away: an empty value on an origin-form request, a path ("h/x"), userinfo
+/// ("u@h"), a second host after a comma, whitespace. Each of those is either
+/// a smuggling vector against a front proxy that reads Host differently, or
+/// a request no client sends. A server MUST answer such a request 400
+/// (§3.2, last paragraph).
+pub fn isValidHost(v: []const u8) bool {
+    if (v.len == 0) return false;
+    for (v) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9' => {},
+        '-', '.', '_', '~', '%', ':', '[', ']', '!', '$', '&', '\'', '(', ')', '*', '+', ';', '=' => {},
+        else => return false,
+    };
+    return true;
 }
 
 /// Lenient wire-order iterator over a raw header block (lines that fail to
@@ -376,7 +403,11 @@ pub const RequestHead = struct {
         if (method.len == 0) return error.MalformedHead;
         for (method) |c| if (!isTchar(c)) return error.MalformedHead;
         if (target.len == 0) return error.MalformedHead;
-        for (target) |c| if (c <= ' ' or c == 0x7f) return error.MalformedHead;
+        // A request-target is a URI reference, and a URI is ASCII (RFC 3986
+        // §2): a raw byte >= 0x80 in it is a client that did not
+        // percent-encode, and routing on it would route on the bytes of
+        // whichever encoding it happened to use.
+        for (target) |c| if (c <= ' ' or c >= 0x7f) return error.MalformedHead;
         if (version.len != 8 or !std.mem.startsWith(u8, version, "HTTP/"))
             return error.MalformedHead;
         if (version[5] != '1' or version[6] != '.') return error.UnsupportedVersion;
@@ -415,6 +446,7 @@ pub const RequestHead = struct {
                 if (tokenListContains(entry.value, "keep-alive")) head.connection_keep_alive = true;
             } else if (std.ascii.eqlIgnoreCase(entry.name, "host")) {
                 if (head.host != null) return error.MalformedHead; // request smuggling
+                if (!isValidHost(entry.value)) return error.MalformedHead;
                 head.host = entry.value;
             } else if (std.ascii.eqlIgnoreCase(entry.name, "expect")) {
                 if (std.ascii.eqlIgnoreCase(entry.value, "100-continue")) head.expect_continue = true;
@@ -1037,6 +1069,16 @@ test "RequestHead.parse: malformed heads never panic" {
         "GET / HTTP/1.1\r\nNoColonHere\r\n",
         "GET / HTTP/1.1\r\n: empty-name\r\n",
         "GET / HTTP/1.1\r\nBad Name: x\r\n",
+        "GET / HTTP/1.1\r\nBad[Name: x\r\n", // name is not a token
+        "GET / HTTP/1.1\r\nB\xc3\xa4d: x\r\n", // non-ASCII name
+        "GET / HTTP/1.1\r\nX: va\x00lue\r\n", // NUL in a value
+        "GET / HTTP/1.1\r\nX: va\rlue\r\n", // bare CR in a value
+        "GET / HTTP/1.1\r\nX: va\x7flue\r\n", // DEL in a value
+        "GET /caf\xc3\xa9 HTTP/1.1\r\n", // non-ASCII target
+        "GET / HTTP/1.1\r\nHost: a/b\r\n", // Host with a path
+        "GET / HTTP/1.1\r\nHost: u@h\r\n", // Host with userinfo
+        "GET / HTTP/1.1\r\nHost: a, b\r\n", // two hosts in one field
+        "GET / HTTP/1.1\r\nHost:\r\n", // empty Host on an origin-form request
         "GET / HTTP/1.1\r\nA: 1\r\n folded\r\n",
         "GET / HTTP/1.1\r\nContent-Length: 12x\r\n",
         "GET / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n",

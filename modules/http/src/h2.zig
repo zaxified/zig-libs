@@ -717,6 +717,12 @@ pub const Stream = struct {
     send_window: i64,
     /// What they may still send us (we control via WINDOW_UPDATE).
     recv_window: i64,
+    /// The peer has sent a HEADERS on this stream. For a server that means
+    /// the request head is in, and the only HEADERS still legal from the
+    /// client is the trailer section, which carries END_STREAM (§8.1).
+    /// A client cannot use the same rule: an informational 1xx response is
+    /// a HEADERS without END_STREAM followed by the final one.
+    peer_headers_seen: bool = false,
 };
 
 /// Which endpoint of the connection this is (decides stream-id parity,
@@ -1247,7 +1253,11 @@ pub const Connection = struct {
             // increment on a stream: stream error); everything else is a
             // connection error.
             const scope: @FieldType(Violation, "scope") = switch (h.frame_type) {
-                .priority => .stream,
+                // §6.3: a bad PRIORITY length is a stream error -- but a
+                // PRIORITY on stream 0 is a connection error, and answering
+                // it with RST_STREAM(0) is itself a protocol violation the
+                // peer will tear the connection down over.
+                .priority => if (h.stream_id == 0) .connection else .stream,
                 .window_update => if (h.stream_id != 0 and err == error.ProtocolError)
                     .stream
                 else
@@ -1305,6 +1315,12 @@ pub const Connection = struct {
                         .reserved_remote => st.state = .half_closed_local,
                         else => return c.fail(.stream, hd.stream_id, error.StreamClosed),
                     }
+                    // On a server a second client HEADERS can only be the
+                    // trailer section, and trailers end the stream: without
+                    // END_STREAM it is malformed (§8.1) -- a stream error.
+                    if (c.role == .server and st.peer_headers_seen and !hd.end_stream)
+                        return c.fail(.stream, hd.stream_id, error.ProtocolError);
+                    st.peer_headers_seen = true;
                     // Repeat HEADERS on an existing stream (trailers at
                     // best) are not new work — a trailer flood on one
                     // stream burns the unproductive budget.
@@ -1338,12 +1354,18 @@ pub const Connection = struct {
                         .state = .open,
                         .send_window = c.remote_settings.initial_window_size,
                         .recv_window = c.local_settings.initial_window_size,
+                        .peer_headers_seen = true,
                     });
                 }
-                if (hd.priority) |p| try events.append(c.gpa, .{ .priority = .{
-                    .stream_id = hd.stream_id,
-                    .priority = p,
-                } });
+                if (hd.priority) |p| {
+                    // §5.3.1: a stream cannot depend on itself.
+                    if (p.dependency == hd.stream_id)
+                        return c.fail(.stream, hd.stream_id, error.ProtocolError);
+                    try events.append(c.gpa, .{ .priority = .{
+                        .stream_id = hd.stream_id,
+                        .priority = p,
+                    } });
+                }
                 if (hd.end_headers) {
                     try c.finishHeaderBlock(hd.stream_id, hd.fragment, hd.end_stream, events);
                 } else {
@@ -1358,6 +1380,9 @@ pub const Connection = struct {
                 // Legal in any state, including idle (§6.3 / RFC 7540 §5.1)
                 // — but advisory only, so it burns the unproductive budget.
                 try c.noteUnproductive();
+                // §5.3.1: a stream cannot depend on itself.
+                if (p.priority.dependency == p.stream_id)
+                    return c.fail(.stream, p.stream_id, error.ProtocolError);
                 try events.append(c.gpa, .{ .priority = .{
                     .stream_id = p.stream_id,
                     .priority = p.priority,

@@ -1504,15 +1504,37 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         return respondError(opts, out, date, 400);
     const method = methodFromToken(head.method) orelse return respondError(opts, out, date, 501);
 
-    // Origin-form ("/path?query") and asterisk-form only — absolute-form is
-    // a proxy concern and never appears behind a reverse proxy.
-    if (head.target[0] != '/' and !std.mem.eql(u8, head.target, "*"))
-        return respondError(opts, out, date, 400);
-    var path: []const u8 = head.target;
-    var query: []const u8 = "";
-    if (std.mem.indexOfScalar(u8, head.target, '?')) |i| {
-        path = head.target[0..i];
-        query = head.target[i + 1 ..];
+    // The request-target, reduced to what routing needs. Origin-form
+    // ("/path?query") is what every client sends to an origin; asterisk-form
+    // ("*") belongs to OPTIONS alone (RFC 9112 §3.2.4); absolute-form
+    // ("http://host/path") is what a client sends to a proxy -- and a server
+    // MUST accept it anyway (§3.2.2), using the authority in the target and
+    // ignoring Host (§3.3). It used to be refused here as "a proxy concern";
+    // a MUST is not a concern to weigh.
+    var target: []const u8 = head.target;
+    var query_of_empty_path: []const u8 = "";
+    if (target[0] != '/' and !std.mem.eql(u8, target, "*")) {
+        const scheme_end = std.mem.indexOf(u8, target, "://") orelse return respondError(opts, out, date, 400);
+        const scheme = target[0..scheme_end];
+        if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https"))
+            return respondError(opts, out, date, 400);
+        const rest = target[scheme_end + 3 ..];
+        // The authority ends at the first '/' or '?'; a target with neither
+        // ("http://host") names an empty path, which is "/" (§3.2.2).
+        const end = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
+        if (end == 0 or !h1.isValidHost(rest[0..end])) return respondError(opts, out, date, 400);
+        target = if (end == rest.len) "/" else if (rest[end] == '?') "/" else rest[end..];
+        if (end != rest.len and rest[end] == '?') {
+            // "http://host?q": an empty path with a query.
+            query_of_empty_path = rest[end + 1 ..];
+        }
+    }
+    if (std.mem.eql(u8, target, "*") and method != .options) return respondError(opts, out, date, 400);
+    var path: []const u8 = target;
+    var query: []const u8 = query_of_empty_path;
+    if (std.mem.indexOfScalar(u8, target, '?')) |i| {
+        path = target[0..i];
+        query = target[i + 1 ..];
     }
 
     // Path normalization + traversal protection (RFC 3986 §5.2.4): collapse
@@ -1576,7 +1598,10 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         return respondError(opts, out, date, 415);
 
     const has_body = head.chunked or (head.content_length orelse 0) != 0;
-    if (head.expect_continue and has_body) {
+    // RFC 9110 §10.1.1: an HTTP/1.0 client never sent the expectation on
+    // purpose -- 1.0 has no 1xx -- and a 100 it does not understand is read
+    // as the response.
+    if (head.expect_continue and has_body and !head.http1_0) {
         out.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return .close;
         out.flush() catch return .close;
     }
@@ -3597,8 +3622,16 @@ test "serveStream: protocol rejections (505, 501, 400s, 431)" {
     // request-smuggling primitive (RFC 9112 §6.1) — reject, don't frame.
     try testing.expect(std.mem.startsWith(u8, runStream(null, "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
     try testing.expect(std.mem.startsWith(u8, runStream(null, "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked, chunked\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
-    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET http://x/ HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), // absolute-form
-        "HTTP/1.1 400 Bad Request\r\n"));
+    // Absolute-form is accepted, and its authority wins over Host (RFC 9112
+    // §3.2.2, §3.3); a scheme this server does not speak, or no authority,
+    // is still 400.
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET http://x/hello HTTP/1.1\r\nHost: other\r\n\r\n", &out_buf), "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET ftp://x/hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET http:///hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
+    // "*" is for OPTIONS alone (§3.2.4).
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET * HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
+    // A 1.0 client gets no 100 Continue (RFC 9110 §10.1.1).
+    try testing.expect(std.mem.indexOf(u8, runStream(null, "POST /echo HTTP/1.0\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", &out_buf), "100 Continue") == null);
     const long_head = "GET / HTTP/1.1\r\nHost: t\r\nX-Big: " ++ ("a" ** 2000) ++ "\r\n\r\n";
     try testing.expect(std.mem.startsWith(u8, runStream(null, long_head, &out_buf), "HTTP/1.1 431 Request Header Fields Too Large\r\n"));
 }

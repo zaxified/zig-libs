@@ -1211,24 +1211,29 @@ const Session = struct {
             }
         }
         if (method_tok == null) malformed = true;
-        if (malformed) return s.respondError(id, 400);
+        // §8.1.1: a malformed request is a STREAM ERROR of type
+        // PROTOCOL_ERROR -- RST_STREAM, not a 400. This used to answer 400
+        // with a body, which a client reads as a response to a request it
+        // never fully made; every h2 conformance suite (h2spec 8.1.2.x)
+        // expects the reset, and so does every peer.
+        if (malformed) return s.protocolError(id);
         const method = Server.methodFromToken(method_tok.?) orelse
             return s.respondError(id, 501);
         // §8.3.1: GET-family requests need :scheme and a non-empty :path.
         if (scheme == null or path_full == null or path_full.?.len == 0)
-            return s.respondError(id, 400);
+            return s.protocolError(id);
         // §8.1.1: a content-length must match the actual DATA total. On the
         // streaming surface the total is not known yet — nothing has been
         // received — so `StreamBody` enforces the same rule as it reads,
         // which is also how the h1 `ContentLengthReader` does it.
         if (content_length) |n| {
-            if (!streaming and n != buffered_body.len) return s.respondError(id, 400);
+            if (!streaming and n != buffered_body.len) return s.protocolError(id);
         }
 
-        // Origin-form / asterisk-form only, same rule as the h1 loop.
+        // `:path` is origin-form or "*" (§8.3.1); anything else is malformed.
         const target = path_full.?;
         if (target[0] != '/' and !std.mem.eql(u8, target, "*"))
-            return s.respondError(id, 400);
+            return s.protocolError(id);
         var path: []const u8 = target;
         var query: []const u8 = "";
         if (std.mem.indexOfScalar(u8, target, '?')) |i| {
@@ -1397,6 +1402,19 @@ const Session = struct {
     /// **Invariant 1** (the other HPACK encode site besides `Framer
     /// .sendHead`): the whole response — encode, stage, flush — is one
     /// critical section. Callers must NOT hold `mu`.
+    /// RST_STREAM(PROTOCOL_ERROR): the answer to a malformed request
+    /// (§8.1.1). No response head goes out first -- the RFC permits one, but
+    /// a peer that sees HEADERS on a stream it is about to have reset has to
+    /// guess which of the two is the answer, and the conformance suites
+    /// read the first frame.
+    fn protocolError(s: *Session, id: u31) Disposition {
+        s.lock();
+        defer s.unlock();
+        s.conn.sendRstStream(&s.wire, id, .protocol_error) catch return .keep;
+        s.flushWire() catch return .close;
+        return .keep;
+    }
+
     fn respondError(s: *Session, id: u31, status: u16) Disposition {
         s.lock();
         defer s.unlock();
@@ -2574,26 +2592,26 @@ test "h2c serve: handler error → 500; 404 and HEAD framing (offline)" {
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
 
-test "h2c serve: malformed requests → 400/501, connection survives (offline)" {
+test "h2c serve: malformed requests → RST_STREAM(PROTOCOL_ERROR)/501, connection survives (offline)" {
     const gpa = testing.allocator;
     var peer: TestPeer = .init(gpa, .{});
     defer peer.deinit();
 
     try peer.conn.sendPreface(&peer.wire);
-    // No :path (§8.3.1) → 400.
+    // No :path (§8.3.1) → malformed → RST_STREAM(PROTOCOL_ERROR) (§8.1.1).
     const sid_nopath = try peer.conn.startStream(&peer.wire, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "http" },
         .{ .name = ":authority", .value = "t" },
     }, true);
-    // Connection-specific header (§8.2.2) → 400.
+    // Connection-specific header (§8.2.2) → malformed → reset.
     const sid_connhdr = try peer.conn.startStream(&peer.wire, &.{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":scheme", .value = "http" },
         .{ .name = ":path", .value = "/hello" },
         .{ .name = "connection", .value = "keep-alive" },
     }, true);
-    // content-length disagreeing with the DATA total (§8.1.1) → 400.
+    // content-length disagreeing with the DATA total (§8.1.1) → reset.
     const sid_badlen = try peer.conn.startStream(&peer.wire, &.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":scheme", .value = "http" },
@@ -2609,10 +2627,12 @@ test "h2c serve: malformed requests → 400/501, connection survives (offline)" 
     var out_buf: [8192]u8 = undefined;
     try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
 
-    try testing.expectEqual(@as(u16, 400), peer.resp(sid_nopath).status);
-    try testing.expectEqualStrings("Bad Request\n", peer.resp(sid_nopath).body.items);
-    try testing.expectEqual(@as(u16, 400), peer.resp(sid_connhdr).status);
-    try testing.expectEqual(@as(u16, 400), peer.resp(sid_badlen).status);
+    // A malformed request gets no response head at all -- the peer would
+    // have to guess whether the HEADERS or the RST_STREAM is the answer.
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_nopath).rst);
+    try testing.expectEqual(@as(u16, 0), peer.resp(sid_nopath).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_connhdr).rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_badlen).rst);
     try testing.expectEqual(@as(u16, 501), peer.resp(sid_brew).status);
     try testing.expectEqual(@as(u16, 200), peer.resp(sid_ok).status);
     try testing.expectEqualStrings("hello", peer.resp(sid_ok).body.items);
@@ -3173,8 +3193,9 @@ test "h2 streaming request: opting one route in leaves every other route buffere
     defer peer.deinit();
 
     try peer.conn.sendPreface(&peer.wire);
-    // `/echo` is not a `/stream-*` route: it must still see the 400 that only
-    // a fully collected body can produce (§8.1.1).
+    // `/echo` is not a `/stream-*` route: it must still get the
+    // RST_STREAM(PROTOCOL_ERROR) that only a fully collected body can
+    // produce (§8.1.1) -- the content-length check needs the whole body.
     const sid_bad = try peer.conn.startStream(&peer.wire, &.{
         .{ .name = ":method", .value = "POST" },
         .{ .name = ":scheme", .value = "http" },
@@ -3191,7 +3212,7 @@ test "h2 streaming request: opting one route in leaves every other route buffere
     var out_buf: [8192]u8 = undefined;
     try runOffline(&peer, streamOpts(), &out_buf);
 
-    try testing.expectEqual(@as(u16, 400), peer.resp(sid_bad).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_bad).rst);
     try testing.expectEqual(@as(u16, 200), peer.resp(sid_ok).status);
     try testing.expectEqualStrings("buffered still", peer.resp(sid_ok).body.items);
     // A buffered body is still credited on ARRIVAL: 8 octets of stream
@@ -3202,7 +3223,7 @@ test "h2 streaming request: opting one route in leaves every other route buffere
     // and deadlock every upload above the initial window.
     try testing.expectEqual(@as(u64, 8), peer.streamCredit(sid_ok));
     // Every octet either stream got is back on the connection window: 14
-    // here plus the 4 the malformed stream sent before its 400.
+    // here plus the 4 the malformed stream sent before its reset.
     try testing.expectEqual(@as(u64, 18), peer.wu_conn);
 }
 

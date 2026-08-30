@@ -1622,12 +1622,17 @@ test "middleware: malformed Authorization never panics, always 401" {
         "Authorization: B\r\n", // shorter than the scheme
         "Authorization: \r\n", // empty value
         "Authorization: Bearer\ts3cr3t\r\n", // tab separator (not SP)
-        "Authorization: =?!@ \x01 garbage\r\n", // junk bytes
+        "Authorization: =?!@ garbage\r\n", // junk, but printable
     }) |h| {
         const got = runWire(&gr.r, wire("GET", "/t", h), &buf);
         try expectStatus(got, "401");
         try expectHeaderLine(got, "WWW-Authenticate: Bearer");
     }
+    // A control byte in the value is not a malformed credential, it is a
+    // malformed HEADER (RFC 9110 §5.5): the codec answers 400 and the gate
+    // never sees the request. Still no panic, still not a 200.
+    const ctl = runWire(&gr.r, wire("GET", "/t", "Authorization: =?!@ \x01 garbage\r\n"), &buf);
+    try expectStatus(ctl, "400");
 
     // Surrounding whitespace around a well-formed credential is fine.
     try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization:   Bearer s3cr3t  \r\n"), &buf), "200");
