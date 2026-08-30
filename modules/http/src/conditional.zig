@@ -104,6 +104,43 @@ pub const Outcome = enum {
     precondition_failed,
 };
 
+/// The four precondition fields, gathered in one pass over the header block.
+///
+/// `evaluate` used to look each up with `req.header(...)`, which is a scan
+/// of every header per lookup — four scans on every request, almost always
+/// over preconditions that are not there. A server that runs `evaluate`
+/// unconditionally (the natural way to arm a caching layer) pays those scans
+/// on its hottest path; measured on such a server, they were most of the
+/// layer's cost. One pass gathers all four, and the byte test on `name[0]`
+/// dismisses the ordinary header without a case-insensitive compare.
+///
+/// First value wins for each field, matching `Request.header`.
+const Preconditions = struct {
+    if_match: ?[]const u8 = null,
+    if_none_match: ?[]const u8 = null,
+    if_modified_since: ?[]const u8 = null,
+    if_unmodified_since: ?[]const u8 = null,
+
+    fn gather(req: *const Server.Request) Preconditions {
+        var p: Preconditions = .{};
+        var it = req.iterateHeaders();
+        while (it.next()) |h| {
+            if (h.name.len < "if-match".len) continue;
+            if (h.name[0] != 'i' and h.name[0] != 'I') continue;
+            if (p.if_match == null and std.ascii.eqlIgnoreCase(h.name, "if-match")) {
+                p.if_match = h.value;
+            } else if (p.if_none_match == null and std.ascii.eqlIgnoreCase(h.name, "if-none-match")) {
+                p.if_none_match = h.value;
+            } else if (p.if_modified_since == null and std.ascii.eqlIgnoreCase(h.name, "if-modified-since")) {
+                p.if_modified_since = h.value;
+            } else if (p.if_unmodified_since == null and std.ascii.eqlIgnoreCase(h.name, "if-unmodified-since")) {
+                p.if_unmodified_since = h.value;
+            }
+        }
+        return p;
+    }
+};
+
 /// Evaluate the request's preconditions against `v` in the RFC 9110 §13.2.2
 /// order. Pure: reads only request headers, allocates nothing.
 ///
@@ -117,16 +154,17 @@ pub const Outcome = enum {
 ///  5. otherwise             → proceed.
 pub fn evaluate(method: http.Method, req: *const Server.Request, v: Validators) Outcome {
     const is_get_head = method == .get or method == .head;
+    const p: Preconditions = .gather(req);
 
     // Step 1 — If-Match (strong comparison; `*` matches because a validator
     // ⇒ the representation exists). A match falls through WITHOUT running
     // If-Unmodified-Since (§13.1.2/§13.2.2: If-Match takes precedence).
-    if (req.header("if-match")) |list| {
+    if (p.if_match) |list| {
         if (!listMatches(list, v.etag, false)) return .precondition_failed;
     }
     // Step 2 — If-Unmodified-Since (only when If-Match is absent). An
     // unparseable date is ignored (RFC 9110 §13.1.4).
-    else if (req.header("if-unmodified-since")) |raw| {
+    else if (p.if_unmodified_since) |raw| {
         if (parseHttpDate(raw)) |since| {
             if (v.last_modified) |lm| {
                 if (lm > since) return .precondition_failed;
@@ -137,14 +175,14 @@ pub fn evaluate(method: http.Method, req: *const Server.Request, v: Validators) 
     // Step 3 — If-None-Match (weak comparison; `*` matches because the
     // representation exists). Present-but-no-match proceeds and SUPPRESSES
     // If-Modified-Since (§13.2.2).
-    if (req.header("if-none-match")) |list| {
+    if (p.if_none_match) |list| {
         if (listMatches(list, v.etag, true))
             return if (is_get_head) .not_modified else .precondition_failed;
     }
     // Step 4 — If-Modified-Since (GET/HEAD only, only when If-None-Match is
     // absent). An unparseable date is ignored.
     else if (is_get_head) {
-        if (req.header("if-modified-since")) |raw| {
+        if (p.if_modified_since) |raw| {
             if (parseHttpDate(raw)) |since| {
                 if (v.last_modified) |lm| {
                     if (lm <= since) return .not_modified;
