@@ -66,11 +66,20 @@ pub const default_max_header_list_size: usize = 64 * 1024;
 /// A decoded header block. Owns every `name`/`value` slice.
 pub const HeaderList = struct {
     fields: []Field,
+    /// Every name and value of `fields`, in one allocation, when the list
+    /// came out of `Decoder.decodeBlock`: a block decodes into two
+    /// allocations rather than two per field. Empty for a list built by
+    /// hand, whose strings are then owned one by one.
+    storage: []u8 = &.{},
 
     pub fn deinit(hl: *HeaderList, gpa: Allocator) void {
-        for (hl.fields) |f| {
-            gpa.free(f.name);
-            gpa.free(f.value);
+        if (hl.storage.len > 0) {
+            gpa.free(hl.storage);
+        } else {
+            for (hl.fields) |f| {
+                gpa.free(f.name);
+                gpa.free(f.value);
+            }
         }
         gpa.free(hl.fields);
         hl.* = undefined;
@@ -363,6 +372,14 @@ fn huffmanEncode(gpa: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocat
 fn huffmanDecodeAlloc(gpa: Allocator, input: []const u8, limit: usize) DecodeError![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
+    _ = try huffmanDecodeAppend(gpa, &out, input, limit);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Huffman-decode `input` onto the end of `out`, under the same rules;
+/// returns how many octets were appended.
+fn huffmanDecodeAppend(gpa: Allocator, out: *std.ArrayList(u8), input: []const u8, limit: usize) DecodeError!usize {
+    const start = out.items.len;
     var node: u16 = 0;
     var depth: u8 = 0; // bits consumed since the last symbol boundary
     var all_ones = true;
@@ -377,7 +394,7 @@ fn huffmanDecodeAlloc(gpa: Allocator, input: []const u8, limit: usize) DecodeErr
                 const sym: u16 = @intCast(huff_tree[child].sym);
                 // §5.2: an explicitly encoded EOS is a decoding error.
                 if (sym == eos_symbol) return error.HuffmanError;
-                if (out.items.len >= limit) return error.HeaderListTooLarge;
+                if (out.items.len - start >= limit) return error.HeaderListTooLarge;
                 try out.append(gpa, @intCast(sym));
                 node = 0;
                 depth = 0;
@@ -391,7 +408,7 @@ fn huffmanDecodeAlloc(gpa: Allocator, input: []const u8, limit: usize) DecodeErr
     }
     // §5.2: padding must be a prefix of EOS (all ones), at most 7 bits.
     if (node != 0 and (depth > 7 or !all_ones)) return error.HuffmanError;
-    return out.toOwnedSlice(gpa);
+    return out.items.len - start;
 }
 
 // ── Appendix A static table ─────────────────────────────────────────────────
@@ -613,16 +630,26 @@ pub const Decoder = struct {
     /// table may have been partially updated; per RFC 7541 §2.2 / RFC 7540
     /// §4.3 a decoding error is a connection error, so the decoder must not
     /// be reused afterwards.
+    /// A field while its block is being decoded: offsets into the block's
+    /// string storage, which may still move as it grows. The slices are cut
+    /// once the storage is final.
+    const Span = struct {
+        name_off: usize,
+        name_len: usize,
+        value_off: usize,
+        value_len: usize,
+        sensitive: bool,
+    };
+
     pub fn decodeBlock(d: *Decoder, block: []const u8) DecodeError!HeaderList {
         var c: Cursor = .{ .buf = block };
-        var fields: std.ArrayList(Field) = .empty;
-        errdefer {
-            for (fields.items) |f| {
-                d.gpa.free(f.name);
-                d.gpa.free(f.value);
-            }
-            fields.deinit(d.gpa);
-        }
+        // Every name and value of the block lands in `storage`, indexed
+        // fields copied from the tables and literals decoded straight into
+        // it -- two allocations per block instead of two per field.
+        var storage: std.ArrayList(u8) = .empty;
+        errdefer storage.deinit(d.gpa);
+        var spans: std.ArrayList(Span) = .empty;
+        defer spans.deinit(d.gpa);
 
         var list_size: usize = 0;
         var seen_field = false;
@@ -632,15 +659,19 @@ pub const Decoder = struct {
                 // §6.1 indexed header field.
                 const index = try readInt(&c, first, 7);
                 const e = d.table.lookup(index) orelse return error.InvalidHpack;
-                try d.appendField(&fields, &list_size, e.name, e.value, false);
+                try d.appendField(&storage, &spans, &list_size, e.name, e.value, false);
                 seen_field = true;
             } else if (first & 0x40 != 0) {
-                // §6.2.1 literal with incremental indexing.
-                const name, const value = try d.readNameValue(&c, first, 6, &list_size);
-                defer d.gpa.free(name);
-                defer d.gpa.free(value);
-                try d.table.add(d.gpa, name, value);
-                try d.appendField(&fields, &list_size, name, value, false);
+                // §6.2.1 literal with incremental indexing. The table takes
+                // its copy from `storage`, after the field is in it: a name
+                // looked up in the dynamic table is a slice the table's own
+                // eviction could free.
+                const span = try d.readNameValue(&c, first, 6, &storage, &spans, &list_size, false);
+                try d.table.add(
+                    d.gpa,
+                    storage.items[span.name_off..][0..span.name_len],
+                    storage.items[span.value_off..][0..span.value_len],
+                );
                 seen_field = true;
             } else if (first & 0x20 != 0) {
                 // §6.3 dynamic table size update — only before any field.
@@ -651,15 +682,20 @@ pub const Decoder = struct {
             } else {
                 // §6.2.2 without indexing (0000) / §6.2.3 never indexed (0001).
                 const sensitive = first & 0x10 != 0;
-                const name, const value = try d.readNameValue(&c, first, 4, &list_size);
-                defer d.gpa.free(name);
-                defer d.gpa.free(value);
-                try d.appendField(&fields, &list_size, name, value, sensitive);
+                _ = try d.readNameValue(&c, first, 4, &storage, &spans, &list_size, sensitive);
                 seen_field = true;
             }
         }
 
-        return .{ .fields = try fields.toOwnedSlice(d.gpa) };
+        const buf = try storage.toOwnedSlice(d.gpa);
+        errdefer d.gpa.free(buf);
+        const fields = try d.gpa.alloc(Field, spans.items.len);
+        for (spans.items, fields) |sp, *f| f.* = .{
+            .name = buf[sp.name_off..][0..sp.name_len],
+            .value = buf[sp.value_off..][0..sp.value_len],
+            .sensitive = sp.sensitive,
+        };
+        return .{ .fields = fields, .storage = buf };
     }
 
     // Introspection (used by tests; handy for debugging/GOAWAY diagnostics).
@@ -684,26 +720,41 @@ pub const Decoder = struct {
     /// Read the (name, value) of a literal representation whose name is
     /// either an index in the `prefix_bits` prefix or a literal string.
     /// Both returned slices are gpa-owned.
+    /// Decode a literal's name and value onto `storage` and record the
+    /// field; returns its span.
     fn readNameValue(
         d: *Decoder,
         c: *Cursor,
         first: u8,
         prefix_bits: u4,
-        list_size: *const usize,
-    ) DecodeError!struct { []u8, []u8 } {
+        storage: *std.ArrayList(u8),
+        spans: *std.ArrayList(Span),
+        list_size: *usize,
+        sensitive: bool,
+    ) DecodeError!Span {
         const name_index = try readInt(c, first, prefix_bits);
-        const name = if (name_index != 0) blk: {
+        const name_off = storage.items.len;
+        const name_len = if (name_index != 0) blk: {
             const e = d.table.lookup(name_index) orelse return error.InvalidHpack;
-            break :blk try d.gpa.dupe(u8, e.name);
-        } else try d.readString(c, list_size.*);
-        errdefer d.gpa.free(name);
-        const value = try d.readString(c, list_size.*);
-        return .{ name, value };
+            try storage.appendSlice(d.gpa, e.name);
+            break :blk e.name.len;
+        } else try d.readString(c, storage, list_size.*);
+        const value_off = storage.items.len;
+        const value_len = try d.readString(c, storage, list_size.*);
+        try d.accountField(list_size, name_len, value_len);
+        const span: Span = .{
+            .name_off = name_off,
+            .name_len = name_len,
+            .value_off = value_off,
+            .value_len = value_len,
+            .sensitive = sensitive,
+        };
+        try spans.append(d.gpa, span);
+        return span;
     }
 
-    /// Read one §5.2 string literal into a gpa-owned slice, bounding the
-    /// decoded length by the remaining header-list budget.
-    fn readString(d: *Decoder, c: *Cursor, used: usize) DecodeError![]u8 {
+    /// Decode one §5.2 string literal onto `storage`; returns its length.
+    fn readString(d: *Decoder, c: *Cursor, storage: *std.ArrayList(u8), used: usize) DecodeError!usize {
         const budget = d.max_header_list_size -| used;
         const first = try c.take();
         const huffman = first & 0x80 != 0;
@@ -712,28 +763,42 @@ pub const Decoder = struct {
         const raw = try c.takeSlice(@intCast(len));
         if (!huffman) {
             if (raw.len > budget) return error.HeaderListTooLarge;
-            return d.gpa.dupe(u8, raw);
+            try storage.appendSlice(d.gpa, raw);
+            return raw.len;
         }
-        return huffmanDecodeAlloc(d.gpa, raw, budget);
+        return huffmanDecodeAppend(d.gpa, storage, raw, budget);
     }
 
-    /// Charge the field against the list budget, dupe and append it.
+    /// §4.1 accounting of a field against SETTINGS_MAX_HEADER_LIST_SIZE.
+    fn accountField(d: *Decoder, list_size: *usize, name_len: usize, value_len: usize) DecodeError!void {
+        const fsize = name_len + value_len + entry_overhead;
+        if (fsize > d.max_header_list_size - list_size.*) return error.HeaderListTooLarge;
+        list_size.* += fsize;
+    }
+
+    /// Record a field whose name and value already exist (an indexed hit).
     fn appendField(
         d: *Decoder,
-        fields: *std.ArrayList(Field),
+        storage: *std.ArrayList(u8),
+        spans: *std.ArrayList(Span),
         list_size: *usize,
         name: []const u8,
         value: []const u8,
         sensitive: bool,
     ) DecodeError!void {
-        const fsize = DynamicTable.entrySize(name, value);
-        if (fsize > d.max_header_list_size - list_size.*) return error.HeaderListTooLarge;
-        list_size.* += fsize;
-        const n = try d.gpa.dupe(u8, name);
-        errdefer d.gpa.free(n);
-        const v = try d.gpa.dupe(u8, value);
-        errdefer d.gpa.free(v);
-        try fields.append(d.gpa, .{ .name = n, .value = v, .sensitive = sensitive });
+        try d.accountField(list_size, name.len, value.len);
+        try storage.ensureUnusedCapacity(d.gpa, name.len + value.len);
+        const name_off = storage.items.len;
+        storage.appendSliceAssumeCapacity(name);
+        const value_off = storage.items.len;
+        storage.appendSliceAssumeCapacity(value);
+        try spans.append(d.gpa, .{
+            .name_off = name_off,
+            .name_len = name.len,
+            .value_off = value_off,
+            .value_len = value.len,
+            .sensitive = sensitive,
+        });
     }
 };
 
