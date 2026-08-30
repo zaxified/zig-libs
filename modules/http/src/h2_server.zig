@@ -1330,11 +1330,9 @@ const Session = struct {
         // requests, content negotiation, the trailer surface) therefore
         // works on h2 unchanged, because none of it knows the difference.
         var framer: Framer = .init(s, id, arena, .{
-            .gpa = s.gpa,
             .hold_cap = @max(s.opts.response_buffer_size, 1),
             .buffer = arena.alloc(u8, 256) catch return .close,
         });
-        defer framer.deinit();
         var rw: Server.ResponseWriter = .init(&framer.interface, body_buf, &chunk_buf, .{
             .head_request = method == .head,
             .date = date,
@@ -1486,10 +1484,13 @@ const Framer = struct {
     s: *Session,
     id: u31,
     /// Request-scoped; holds the HPACK field names/values until they are
-    /// encoded, and the framer's own interface buffer.
+    /// encoded, the framer's own interface buffer, and every list below --
+    /// nothing in a framer outlives its request, so nothing needs an
+    /// allocator that does.
     arena: Allocator,
-    gpa: Allocator,
     hold_cap: usize,
+    /// Backs the `:status` field's value until `sendHead` encodes it.
+    status_buf: [5]u8 = undefined,
 
     /// Staged response head, until CRLFCRLF.
     head: std.ArrayList(u8) = .empty,
@@ -1520,27 +1521,19 @@ const Framer = struct {
     disp: Disposition = .keep,
     interface: Writer,
 
-    const InitOptions = struct { gpa: Allocator, hold_cap: usize, buffer: []u8 };
+    const InitOptions = struct { hold_cap: usize, buffer: []u8 };
 
     fn init(s: *Session, id: u31, arena: Allocator, opts: InitOptions) Framer {
         return .{
             .s = s,
             .id = id,
             .arena = arena,
-            .gpa = opts.gpa,
             .hold_cap = opts.hold_cap,
             .interface = .{
                 .vtable = &.{ .drain = drainFn, .flush = flushFn },
                 .buffer = opts.buffer,
             },
         };
-    }
-
-    fn deinit(f: *Framer) void {
-        f.head.deinit(f.gpa);
-        f.held.deinit(f.gpa);
-        f.line.deinit(f.gpa);
-        f.trailers.deinit(f.gpa);
     }
 
     fn drainFn(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
@@ -1602,7 +1595,7 @@ const Framer = struct {
     /// into h2 fields and return whatever followed it.
     fn feedHead(f: *Framer, bytes: []const u8) Writer.Error![]const u8 {
         const start = f.head.items.len;
-        f.head.appendSlice(f.gpa, bytes) catch return f.die(.close);
+        f.head.appendSlice(f.arena, bytes) catch return f.die(.close);
         if (f.head.items.len > max_staged_head) return f.die(.close);
         // The terminator can straddle two writes: rescan the last 3 octets.
         const from = start -| 3;
@@ -1611,7 +1604,7 @@ const Framer = struct {
         const res = h1.ResponseHead.parse(f.head.items[0 .. idx + 2]) catch
             return f.die(.close);
         f.chunked = res.chunked;
-        const status_str = std.fmt.allocPrint(f.arena, "{d}", .{res.status}) catch
+        const status_str = std.fmt.bufPrint(&f.status_buf, "{d}", .{res.status}) catch
             return f.die(.close);
         f.fields.append(f.arena, .{ .name = ":status", .value = status_str }) catch
             return f.die(.close);
@@ -1620,12 +1613,15 @@ const Framer = struct {
             // §8.2.2: connection-specific headers never cross into h2
             // (framing is the frame layer's job now).
             if (isConnectionSpecific(hd.name)) continue;
-            // §8.2.1: lowercase on the wire. Copied out of `head`, which is
-            // an ArrayList that must be allowed to keep growing.
-            const name = std.ascii.allocLowerString(f.arena, hd.name) catch
-                return f.die(.close);
-            const value = f.arena.dupe(u8, hd.value) catch return f.die(.close);
-            f.fields.append(f.arena, .{ .name = name, .value = value }) catch
+            // §8.2.1: lowercase on the wire -- lowered IN PLACE. `head` is
+            // this framer's own buffer, and the CRLFCRLF this parse just
+            // found is where it stops growing forever (`head_done` guards
+            // every further append), so the parsed slices are stable and
+            // nothing downstream wants the original case. These used to be
+            // two arena copies per field, per response. Values are left
+            // alone: a Date value has uppercase octets that matter.
+            for (@constCast(hd.name)) |*c| c.* = std.ascii.toLower(c.*);
+            f.fields.append(f.arena, .{ .name = hd.name, .value = hd.value }) catch
                 return f.die(.close);
         }
         f.head_done = true;
@@ -1675,7 +1671,7 @@ const Framer = struct {
                         u8,
                         std.mem.trim(u8, line[colon + 1 ..], " \t"),
                     ) catch return f.die(.close);
-                    f.trailers.append(f.gpa, .{ .name = name, .value = value }) catch
+                    f.trailers.append(f.arena, .{ .name = name, .value = value }) catch
                         return f.die(.close);
                 }
                 return rest;
@@ -1701,7 +1697,7 @@ const Framer = struct {
     }
 
     fn appendLine(f: *Framer, bytes: []const u8) Writer.Error!void {
-        f.line.appendSlice(f.gpa, bytes) catch return f.die(.close);
+        f.line.appendSlice(f.arena, bytes) catch return f.die(.close);
         if (f.line.items.len > max_staged_line) return f.die(.close);
     }
 
@@ -1711,7 +1707,7 @@ const Framer = struct {
         if (bytes.len == 0) return;
         if (!f.headers_sent) try f.sendHead(false); // a body exists: no END_STREAM
         if (f.held.items.len + bytes.len <= f.hold_cap) {
-            f.held.appendSlice(f.gpa, bytes) catch return f.die(.close);
+            f.held.appendSlice(f.arena, bytes) catch return f.die(.close);
             return;
         }
         if (f.held.items.len != 0) {
@@ -1721,9 +1717,9 @@ const Framer = struct {
         if (bytes.len > f.hold_cap) {
             const n = bytes.len - f.hold_cap;
             try f.emit(bytes[0..n], false);
-            f.held.appendSlice(f.gpa, bytes[n..]) catch return f.die(.close);
+            f.held.appendSlice(f.arena, bytes[n..]) catch return f.die(.close);
         } else {
-            f.held.appendSlice(f.gpa, bytes) catch return f.die(.close);
+            f.held.appendSlice(f.arena, bytes) catch return f.die(.close);
         }
     }
 
