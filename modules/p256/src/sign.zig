@@ -269,6 +269,14 @@ pub fn ecdsaVerify(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8) boo
     var h: [32]u8 = undefined;
     Sha256.hash(msg, &h, .{});
     const e = reduceToScalar(h);
+    // std's verifier rejects `e == 0` and this one did not. With `e ≡ 0
+    // (mod n)` the verification equation collapses to `R = u2·Q`, which
+    // anyone can satisfy without a private key: pick `t`, set `R = t·Q`,
+    // `r = x(R) mod n`, `s = r·t⁻¹`. Unreachable here — `e` is SHA-256 of the
+    // message, so triggering it needs a preimage of 0 or of n — but this
+    // module is anchored on being behaviourally identical to std, and a
+    // divergence in a rejection rule is exactly what such an anchor is for.
+    if (e.isZero()) return false;
 
     const sinv = s.invert();
     const u1v = e.mul(sinv);

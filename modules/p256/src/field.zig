@@ -194,9 +194,21 @@ fn reduceWideShuffle(wide: u512) [4]u64 {
     return normalize(@truncate(folded), @truncate(folded >> 256));
 }
 
-/// The portable reduction. `reduceWideFold` stays as the oracle it always was
-/// — it is what the differential in `oracle_test.zig` pins the asm core to,
-/// and it is now what pins this one too.
+/// The portable reduction.
+///
+/// ⚠ **Where the independent oracle actually lives, since this is easy to get
+/// wrong and the consequence is silent.** `oracle_test.zig`'s gated
+/// differential pins the asm core against `mulPortable`/`sqPortable`, which
+/// come through here — so both sides of that comparison now run the SAME
+/// word-shuffle algorithm with the same `s_i` tables. It proves the assembly
+/// implements the shuffle; it can no longer catch a shared misreading of the
+/// shuffle itself.
+///
+/// The one comparison that still provides algorithmic independence is
+/// `reduceWideFold` vs `reduceWideShuffle` in this file's own test
+/// ("the word-shuffle reduction agrees with the fold, bit for bit"), which is
+/// also the expensive one. **Do not trim it believing `oracle_test` covers the
+/// fold — it does not reach `reduceWideFold` at all.**
 fn reduceWide(wide: u512) [4]u64 {
     return reduceWideShuffle(wide);
 }
@@ -283,8 +295,23 @@ pub const Fe = struct {
     }
 
     /// Constant-time conditional move: `fe = a` iff `c == 1`.
+    ///
+    /// ⭐ The barrier is not optional here — this is the ONE operation in the
+    /// file whose condition bit is a secret (a scalar bit, in a ladder). `c`
+    /// is a `u1`, so without laundering it LLVM keeps the `c ∈ {0,1}` range
+    /// fact and lowers the masked select exactly as the note above this file's
+    /// `blackBox` predicts: `test dl,1 / je` on x86-64 and `tbz w2,#0` on
+    /// aarch64 in both release modes, and in ReleaseSmall a `cmove` on the
+    /// LOAD ADDRESS — a secret-dependent branch, and then a secret-dependent
+    /// memory access, once per scalar bit.
+    ///
+    /// `normalize` and `sub` already launder their bits. `group.zig`'s
+    /// windowed and comb cores had hit this and worked around it with a local
+    /// laundered blend, leaving the shared primitive — the one the "proven
+    /// constant-time double-and-add" fallback and every external caller of
+    /// `p256.Fe` uses — still branching.
     pub fn cMov(fe: *Fe, a: Fe, c: u1) void {
-        const mask: u64 = @as(u64, 0) -% @as(u64, c);
+        const mask: u64 = @as(u64, 0) -% blackBox(@as(u64, c));
         for (&fe.limbs, a.limbs) |*w, aw| {
             w.* = (aw & mask) | (w.* & ~mask);
         }

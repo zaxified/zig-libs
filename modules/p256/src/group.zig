@@ -590,7 +590,21 @@ const wnaf_len: usize = 257;
 fn computeWnaf(s: u256, out: *[wnaf_len]i8) usize {
     const two_w: u64 = 1 << wnaf_w; // 32
     const half: u64 = 1 << (wnaf_w - 1); // 16
-    var d = s;
+    // ⭐ WIDER THAN THE SCALAR, and that is the whole point. A negative digit
+    // is subtracted by ADDING `two_w - mod` to the accumulator, which for a
+    // scalar near the top of the range carries past 2^256. In a `u256` that
+    // wrapped: `s = 2^256 - 1` has `mod = 31`, so `d += 1` became 0, the loop
+    // stopped after ONE digit, and the recoding encoded `-1` instead of
+    // `s` — `mulPublic` then returned `-P` where the constant-time ladder and
+    // std both return `(2^256 - 1)·P`. Silent wrong answer, no panic (the
+    // digit array was never overrun), for the eight scalars `2^256 - k`,
+    // k ∈ {1,3,…,15}. Three doc sites and SPEC.md claim byte-exactness with
+    // std, and the random differential could not find it: the trigger set has
+    // probability 2^-253.
+    //
+    // Non-wrapping operators below, so that a future width mistake is a loud
+    // overflow in safe builds rather than another silent recoding.
+    var d: u264 = s;
     var i: usize = 0;
     while (d != 0) : (i += 1) {
         var digit: i8 = 0;
@@ -598,10 +612,10 @@ fn computeWnaf(s: u256, out: *[wnaf_len]i8) usize {
             const mod: u64 = @as(u64, @truncate(d)) & (two_w - 1); // d mod 2^w (odd)
             if (mod >= half) {
                 digit = @intCast(@as(i64, @intCast(mod)) - @as(i64, @intCast(two_w)));
-                d +%= two_w - mod; // d -= digit (digit < 0)
+                d += two_w - mod; // d -= digit (digit < 0)
             } else {
                 digit = @intCast(mod);
-                d -%= mod;
+                d -= mod;
             }
         }
         out[i] = digit;
@@ -741,6 +755,43 @@ test "base point + identity + curve constant B match std" {
     try eqAffine(P256.basePoint, Std.basePoint);
     try std.testing.expectError(error.IdentityElement, P256.identityElement.rejectIdentity());
     try std.testing.expectEqualSlices(u8, &Std.B.toBytes(.big), &P256.B.toBytes(.big));
+}
+
+test "wNAF: the top of the scalar range recodes without wrapping" {
+    // ⭐ The eight scalars the random differential below can never draw
+    // (probability 2^-253) and that the redirect test masks away outright
+    // (`s[0] &= 0x7f`). A negative wNAF digit is applied by ADDING to the
+    // accumulator, so `s = 2^256 - k` for odd k <= 15 carried past 2^256; in
+    // a u256 that wrapped to zero, ending the recoding after one digit and
+    // encoding -k instead of s. `mulPublic` then answered `-k·P` while the
+    // constant-time ladder — and std — answered `s·P`.
+    //
+    // Checked against BOTH oracles: the module's own CT ladder (so the two
+    // paths of this module agree) and std (so neither is wrong in the same
+    // way).
+    var s1b: [32]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x2A6F_1E55_C0DE);
+    prng.random().bytes(&s1b);
+    const p = try P256.combMulBase(s1b, .big);
+    const sp = try Std.basePoint.mul(s1b, .big);
+
+    var k: u9 = 1;
+    while (k <= 31) : (k += 2) {
+        const s: u256 = @as(u256, 0) -% @as(u256, k); // 2^256 - k
+        var sb: [32]u8 = undefined;
+        std.mem.writeInt(u256, &sb, s, .big);
+
+        // The scalar is above the group order, so only the raw point-level
+        // multiplies accept it — which is exactly the surface `mulPublic` and
+        // `mulDoubleBasePublic` document as std-equivalent.
+        const got = try p.mulPublic(sb, .big);
+        const want_ct = try p.mul(sb, .big);
+        const want_std = try sp.mul(sb, .big);
+        // Both of this module's paths against std: they therefore also agree
+        // with each other, and a shared mistake cannot hide in the pair.
+        try eqAffine(got, want_std);
+        try eqAffine(want_ct, want_std);
+    }
 }
 
 test "differential vs std: dbl/add/scalarmul/combMulBase on random scalars" {

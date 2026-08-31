@@ -22,10 +22,17 @@
 //!
 //! ## The reduction — signed word-shuffle, NOT the wide-M fold
 //!
-//! The portable oracle (`field.reduceWide`) folds `2^256 ≡ M` eleven times with
+//! ⚠ Stale until corrected: the portable path took the eleven-fold `2^256 ≡ M`
+//! route when this was written, and the word-shuffle below was the "instead".
+//! `field.reduceWide` now runs the **same** word-shuffle, so this core and the
+//! portable path are no longer algorithmically independent — the fold survives
+//! only as `field.reduceWideFold`, exercised by one differential test in that
+//! file. See `field.reduceWide`'s doc for what that means for assurance.
+//!
+//! The fold (`field.reduceWideFold`) folds `2^256 ≡ M` eleven times with
 //! a wide `M = 2^224 − 2^192 − 2^96 + 1` multiply — correct but slow, and a poor
 //! shape for asm (each fold shrinks the excess only ~32 bits). This core uses
-//! the classic **NIST/Solinas word-shuffle** instead (HMV "Guide to ECC"
+//! the classic **NIST/Solinas word-shuffle** (HMV "Guide to ECC"
 //! Alg. 2.29, the reduction OpenSSL's 32-bit P-256 and many others use): over
 //! the sixteen 32-bit product words c0..c15,
 //!
