@@ -186,7 +186,9 @@ if (cors.isPreflight(req)) return cors.applyPreflightStatic(policy, req, res); /
 try cors.applyActualStatic(policy, res); // before anything else touches the head
 ```
 
-No gates, no `Vary`, no allocation; validation is compile errors. See SPEC.md "Static CORS" for
+No gates and no allocation; validation is compile errors. The only `Vary` is on a reflecting
+preflight (`allow_headers = null`), which does vary by the request; a pinned `allow_headers`
+emits none. See SPEC.md "Static CORS" for
 why this is its own posture and not a comptime twin of the gated `Options`.
 
 ## Header timing vs. `ResponseWriter.reset()`

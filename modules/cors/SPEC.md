@@ -27,8 +27,10 @@ Attribution/provenance: see /NOTICE.
 The second named posture, for the same adoption reason as the wildcard one below: a public
 read-only API whose grant is a **build-time constant** — one `Access-Control-Allow-Origin` value
 (`*` or one fixed origin) stamped on every response and every preflight, regardless of `Origin`.
-No gates run and no `Vary` is emitted (the response never varies by request); the policy compiles
-to `setHeaderStatic` slot writes. Surface: `StaticOptions` + `applyActualStatic` /
+No gates run, and the policy compiles to `setHeaderStatic` slot writes. `Vary` is emitted only on
+the one path that genuinely varies: a preflight with `allow_headers = null` echoes the request's
+`Access-Control-Request-Headers`, so it carries `Vary: Access-Control-Request-Headers`. Pin
+`allow_headers` and the posture is constant end to end and emits no `Vary` at all. Surface: `StaticOptions` + `applyActualStatic` /
 `applyPreflightStatic` / `isPreflight` — no `Cors`, no `init`, no allocator. `allow_credentials`
 is structurally absent: a constant grant with credentials is the combination `Cors.init` rejects,
 so the knob does not exist. First consumer: qap (its `Config.cors` is this type).

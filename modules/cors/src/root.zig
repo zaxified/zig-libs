@@ -218,6 +218,34 @@ pub const Cors = struct {
     pub fn init(gpa: Allocator, options: Options) InitError!Cors {
         if (options.allowed_origins == .any and options.allow_credentials)
             return error.CredentialsWithWildcardOrigin;
+        // `.any` is only the first spelling of "wildcard". A LIST entry can
+        // be one too, and the tag check above cannot see it:
+        //
+        //   - `"null"` is the origin serialization of every *opaque* origin,
+        //     which any attacker page can mint at will with
+        //     `<iframe sandbox="allow-scripts">`. Granting it with
+        //     credentials hands every site on the internet credentialed read
+        //     access — the precise outcome this check exists to prevent, and
+        //     it is a plausible-looking entry for an app that also runs from
+        //     a sandboxed frame or `file://`.
+        //   - `"*"` in a list is emitted verbatim by the exact-byte matcher,
+        //     producing the literal `Access-Control-Allow-Origin: *` that the
+        //     Fetch spec forbids alongside credentials.
+        //
+        // Rejected rather than downgraded, for the same reason as `.any`:
+        // the documented way to opt into reflect-with-credentials is a
+        // `.predicate`, which is explicit and greppable. Without credentials
+        // both entries stay legal — `ACAO: null` is then just a public grant,
+        // and the exact-byte-compare behaviour is deliberate.
+        if (options.allow_credentials) {
+            switch (options.allowed_origins) {
+                .list => |l| for (l) |o| {
+                    if (std.mem.eql(u8, o, "null") or std.mem.eql(u8, o, "*"))
+                        return error.CredentialsWithWildcardOrigin;
+                },
+                else => {},
+            }
+        }
         if (options.allow_unconditional_wildcard and options.allowed_origins != .any)
             return error.UnconditionalWildcardRequiresAnyOrigin;
         if (std.debug.runtime_safety) {
@@ -322,8 +350,21 @@ pub const Cors = struct {
             switch (c.options.allowed_headers) {
                 // Echo the request's own slice — it outlives the response
                 // head (written before the handler scope ends).
+                // A reflected value is the one header whose SIZE is chosen by
+                // the client, and the response's header-copy store is much
+                // smaller than the head the parser will accept — so a long
+                // enough `Access-Control-Request-Headers` cannot be echoed
+                // back. Propagating that error turned this module's promised
+                // 204 into a 500 straight out of `serveStream`'s handler-error
+                // path: an unauthenticated remote could pick the status code.
+                // Omitting the header instead IS the documented failure mode
+                // (a failed preflight is a 204 without the CORS headers) and
+                // the browser reads it as the "no" it is.
                 .reflect => if (acrh) |h| {
-                    if (h.len != 0) try res.setHeader("Access-Control-Allow-Headers", h);
+                    if (h.len != 0) res.setHeader("Access-Control-Allow-Headers", h) catch |e| switch (e) {
+                        error.HeaderBytesExhausted, error.TooManyHeaders => {},
+                        else => return e,
+                    };
                 },
                 .list => if (c.allow_headers_value.len != 0)
                     try res.setHeader("Access-Control-Allow-Headers", c.allow_headers_value),
@@ -425,13 +466,25 @@ pub const Cors = struct {
         return false;
     }
 
-    /// `.list` mode: every header named in the preflight's
-    /// `Access-Control-Request-Headers` (comma-separated, OWS-tolerant)
-    /// must be on the configured list (case-insensitive). Pure — `acrh` is
-    /// the raw header value. Asserts `.list` mode (`.reflect` has no list
-    /// to check and the emit paths never call this in it).
+    /// Every header named in the preflight's `Access-Control-Request-Headers`
+    /// (comma-separated, OWS-tolerant) must be allowed by the policy. Pure —
+    /// `acrh` is the raw header value.
+    ///
+    /// In `.reflect` mode the answer is `true` for any input: reflection
+    /// grants whatever was asked for, so there is no list to fail against.
+    /// This used to read `.list` unconditionally and merely *document* that
+    /// it "asserts `.list` mode" — but nothing asserted it, and the only
+    /// thing standing between a `.reflect` policy and 16 undefined bytes
+    /// read as a `ptr`/`len` pair was Zig's inactive-field safety check,
+    /// which ReleaseFast removes. That was reachable from the default
+    /// configuration (`allowed_headers` defaults to `.reflect`) through an
+    /// API the README advertises with no precondition, so the mode is now
+    /// answered instead of assumed.
     pub fn requestedHeadersAllowed(c: *const Cors, acrh: []const u8) bool {
-        const list = c.options.allowed_headers.list;
+        const list = switch (c.options.allowed_headers) {
+            .reflect => return true,
+            .list => |l| l,
+        };
         var it = std.mem.splitScalar(u8, acrh, ',');
         while (it.next()) |raw| {
             const name = std.mem.trim(u8, raw, " \t");
@@ -531,8 +584,29 @@ pub fn applyPreflightStatic(comptime o: StaticOptions, req: *const http.Server.R
     try res.setHeaderStatic("Access-Control-Allow-Methods", o.allow_methods);
     if (comptime o.allow_headers) |h| {
         try res.setHeaderStatic("Access-Control-Allow-Headers", h);
-    } else if (req.header("Access-Control-Request-Headers")) |h| {
-        if (h.len != 0) try res.setHeader("Access-Control-Allow-Headers", h);
+    } else {
+        // Reflection is the one runtime path in this posture, and it makes
+        // the response depend on a request header — so this response, alone
+        // among the static ones, has to say so. Without it a shared cache
+        // stores one client's `Access-Control-Allow-Headers` and replays it
+        // to the next, whose requested set is different; `max_age_s` defaults
+        // to a day, so the wrong answer sticks. The gated middleware already
+        // names this header in `preflight_vary` for exactly this reason.
+        //
+        // It stays comptime-conditional: a policy that pins `allow_headers`
+        // is genuinely constant and keeps the posture's no-`Vary` promise.
+        try res.setHeaderStatic("Vary", "Access-Control-Request-Headers");
+        if (req.header("Access-Control-Request-Headers")) |h| {
+            // Same reasoning as the gated `.reflect` branch: the client picks
+            // this value's length, the header-copy store is smaller than the
+            // head the parser accepts, and a `try` here would answer 500 to a
+            // request this posture documents as "always a grant". Dropping
+            // the echoed header leaves the 204 intact.
+            if (h.len != 0) res.setHeader("Access-Control-Allow-Headers", h) catch |e| switch (e) {
+                error.HeaderBytesExhausted, error.TooManyHeaders => {},
+                else => return e,
+            };
+        }
     }
     if (comptime o.max_age_s != 0) try res.setHeaderStatic(
         "Access-Control-Max-Age",
@@ -1752,6 +1826,49 @@ fn fuzzGates(_: void, smith: *std.testing.Smith) !void {
     _ = listed.allowOriginValue(bytes);
     _ = listed.methodTokenAllowed(bytes);
     _ = listed.requestedHeadersAllowed(bytes);
+
+    // The other side of every union the gates read. Driving only the `.list`
+    // policy above left this test asserting "never panic" over a config space
+    // it could not enter: `requestedHeadersAllowed` used to read `.list`
+    // unconditionally, so a `.reflect` policy — the DEFAULT — was precisely
+    // the input that broke the claim, and precisely the one not generated.
+    const reflecting: Cors = .{
+        .gpa = testing.failing_allocator,
+        .options = .{
+            .allowed_origins = .any,
+            .allowed_headers = .reflect,
+        },
+        .allow_methods_value = "",
+        .allow_headers_value = "",
+        .expose_headers_value = "",
+    };
+    _ = reflecting.allowOriginValue(bytes);
+    _ = reflecting.methodTokenAllowed(bytes);
+    _ = reflecting.requestedHeadersAllowed(bytes);
+
+    const none_policy: Cors = .{
+        .gpa = testing.failing_allocator,
+        .options = .{ .allowed_origins = .none, .allowed_headers = .reflect },
+        .allow_methods_value = "",
+        .allow_headers_value = "",
+        .expose_headers_value = "",
+    };
+    _ = none_policy.allowOriginValue(bytes);
+}
+
+test "the pure gates are total: .reflect answers instead of reading a dead union field" {
+    // Regression for a ReleaseFast wild read. In safe modes the old code
+    // panicked with "access of union field 'list' while field 'reflect' is
+    // active"; with the safety check compiled out it walked an undefined
+    // ptr/len pair. Reachable straight from the README's router-free usage,
+    // because `allowed_headers` defaults to `.reflect`.
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+    });
+    defer c.deinit();
+    try testing.expect(c.requestedHeadersAllowed("authorization"));
+    try testing.expect(c.requestedHeadersAllowed(""));
+    try testing.expect(c.requestedHeadersAllowed("x-anything, whatever"));
 }
 test "fuzz: allowOriginValue/methodTokenAllowed/requestedHeadersAllowed never panic" {
     try testing.fuzz({}, fuzzGates, .{});
@@ -1769,6 +1886,40 @@ fn staticHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) an
     try applyActualStatic(o, res);
     try res.writeAll("ok");
     try res.end();
+}
+
+// The same posture with `allow_headers` PINNED — nothing about the response
+// then depends on the request, which is the configuration the posture's
+// no-`Vary` promise is actually about.
+fn staticPinnedHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror!void {
+    const o: StaticOptions = .{
+        .allow_origin = "https://app.example",
+        .allow_headers = "Content-Type",
+        .max_age_s = 600,
+    };
+    if (isPreflight(req)) return applyPreflightStatic(o, req, res);
+    try applyActualStatic(o, res);
+    try res.writeAll("ok");
+    try res.end();
+}
+
+fn runWirePinned(bytes: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [512]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = staticPinnedHandler,
+        .server_name = null,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
 }
 
 fn runWireStatic(bytes: []const u8, out_buf: []u8) []const u8 {
@@ -1814,7 +1965,10 @@ test "static posture: preflight is always a full 204 grant; ACRH reflected" {
     try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, HEAD");
     try expectHeaderLine(got, "Access-Control-Allow-Headers: authorization");
     try expectHeaderLine(got, "Access-Control-Max-Age: 600");
-    try expectNoHeader(got, "Vary");
+    // Reflecting ACRH makes THIS response vary by a request header, so the
+    // posture's blanket "no Vary" does not extend to it — a shared cache would
+    // otherwise replay one client's allowed-header set to the next.
+    try expectHeaderLine(got, "Vary: Access-Control-Request-Headers");
     try testing.expect(std.mem.indexOf(u8, got, "ok") == null);
 }
 
@@ -1823,4 +1977,116 @@ test "static posture: a bare OPTIONS is not a preflight and routes normally" {
     const got = runWireStatic(wire("OPTIONS", "/t", ""), &buf);
     try expectStatus(got, "200"); // the handler's own answer, grant included
     try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+}
+
+test "static posture: a PINNED allow_headers keeps the no-Vary promise" {
+    // The complement of the reflecting case: with the header list fixed at
+    // compile time nothing in the response depends on the request, so the
+    // posture emits no `Vary` at all -- and the ACRH the client asked for is
+    // ignored rather than echoed.
+    var buf: [2048]u8 = undefined;
+    const got = runWirePinned(wire("OPTIONS", "/t", "Origin: https://whoever.example\r\nAccess-Control-Request-Method: GET\r\n" ++
+        "Access-Control-Request-Headers: authorization\r\n"), &buf);
+    try expectStatus(got, "204");
+    try expectHeaderLine(got, "Access-Control-Allow-Headers: Content-Type");
+    try expectNoHeader(got, "Vary");
+}
+
+test "init rejects a credentialed wildcard spelled as a LIST entry, not just as .any" {
+    // `Origin: null` is what every opaque origin serializes to, and any page
+    // can mint one with <iframe sandbox="allow-scripts">. Paired with
+    // credentials it is the same grant-the-internet footgun as `*`, but it
+    // reaches `init` through `.list`, where the tag check cannot see it.
+    try testing.expectError(error.CredentialsWithWildcardOrigin, Cors.init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{ "https://app.example", "null" } },
+        .allow_credentials = true,
+    }));
+    try testing.expectError(error.CredentialsWithWildcardOrigin, Cors.init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"*"} },
+        .allow_credentials = true,
+    }));
+
+    // Without credentials both stay legal: a public `ACAO: null` grants no
+    // credentialed access, and exact-byte matching of "null" is deliberate.
+    var ok: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{ "https://app.example", "null" } },
+    });
+    ok.deinit();
+
+    // And the documented escape hatch still works — an explicit, greppable
+    // opt-in is exactly what the posture asks for.
+    var pred: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .predicate = .{ .allow = allowAnyOrigin } },
+        .allow_credentials = true,
+    });
+    pred.deinit();
+}
+
+fn allowAnyOrigin(_: ?*anyopaque, _: []const u8) bool {
+    return true;
+}
+
+/// A server whose head buffer is larger than the response's header-copy
+/// store — the configuration in which a client-chosen reflected value can be
+/// parsed on the way in but not echoed on the way out.
+fn runWireBigHead(handler: http.Server.Handler, ctx: ?*anyopaque, bytes: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [16384]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [512]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = handler,
+        .context = ctx,
+        .server_name = null,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+fn hugeAcrhRequest(buf: []u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll("OPTIONS /t HTTP/1.1\r\nHost: t\r\nOrigin: https://app.example\r\n") catch unreachable;
+    w.writeAll("Access-Control-Request-Method: GET\r\nAccess-Control-Request-Headers: ") catch unreachable;
+    var i: usize = 0;
+    while (i < 2100) : (i += 1) w.writeAll("a,") catch unreachable;
+    w.writeAll("b\r\nConnection: close\r\n\r\n") catch unreachable;
+    return w.buffered();
+}
+
+test "an un-echoable reflected ACRH stays a 204, it does not become a 500" {
+    // Regression: the reflected value's length is the client's choice, and the
+    // header-copy store is smaller than the head the parser accepts, so
+    // `setHeader` can fail on a perfectly well-formed request. A bare `try`
+    // let that error out of the handler, and serveStream answers 500 -- an
+    // unauthenticated remote picking the status code, on the path both the
+    // module doc and SPEC call "always a 204".
+    var req: [5200]u8 = undefined;
+    const bytes = hugeAcrhRequest(&req);
+    var buf: [8192]u8 = undefined;
+
+    { // static posture
+        const got = runWireBigHead(staticHandler, null, bytes, &buf);
+        try expectStatus(got, "204");
+        try expectNoHeader(got, "Access-Control-Allow-Headers");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    }
+    { // gated middleware, .reflect (the default)
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = .{ .list = &.{"https://app.example"} },
+        });
+        defer c.deinit();
+        var flag: Flag = .{};
+        var r = try testRouter(&c, &flag);
+        defer r.deinit();
+        const got = runWireBigHead(r.handler(), &r, bytes, &buf);
+        try expectStatus(got, "204");
+        try expectNoHeader(got, "Access-Control-Allow-Headers");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    }
 }
