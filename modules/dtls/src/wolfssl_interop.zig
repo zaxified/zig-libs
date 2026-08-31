@@ -34,6 +34,7 @@ const cert_kat = @import("certauth_kat_vectors.zig");
 
 const x25519_group: u16 = @intFromEnum(messages.NamedGroup.x25519);
 const secp256r1_group: u16 = @intFromEnum(messages.NamedGroup.secp256r1);
+const x25519_mlkem768_group: u16 = @intFromEnum(messages.NamedGroup.x25519_ml_kem768);
 
 /// Test fixtures — duplicated verbatim in `testdata/wolfssl_peer.c`. Test
 /// material only; nothing here is a default for anything.
@@ -627,6 +628,41 @@ test "LIVE wolfSSL peer: a HelloRetryRequest carrying BOTH a cookie and a group 
     });
 }
 
+// ── the X25519MLKEM768 post-quantum hybrid, live ─────────────────────────
+//
+// The construction has no byte-exact published vector, and self-interop is
+// structurally unable to catch the two ways it goes wrong quietly (swapped
+// halves, or a hash combiner where TLS wants bare concatenation — std's own
+// `MlKem768X25519` is X-Wing, SAME share sizes, different secret). wolfSSL
+// deriving the same traffic keys and echoing our application data is the
+// proof: its ML-KEM encapsulation to our key, its X25519 share against
+// ours, its key schedule over the 64-byte concatenation — all foreign code.
+//
+// Two shapes, because the hybrid is reachable two ways:
+//
+//   1. offered directly (`Config.key_share_group = .x25519_ml_kem768`) —
+//      the 1216-byte client share goes out in ClientHello1 and the
+//      handshake completes with no retry;
+//   2. reached via HelloRetryRequest — a DEFAULT client (x25519 share)
+//      meets a hybrid-only server, which names 0x11EC in a retry; the
+//      client must then produce the 1216-byte share in ClientHello2.
+
+test "LIVE wolfSSL peer: our client OFFERS X25519MLKEM768 and completes a PQ-hybrid certificate handshake against wolfSSL" {
+    try certClientAgainstWolfssl(.{
+        .peer_mode = "server-cert-mlkem",
+        .offer_group = x25519_mlkem768_group,
+        .expect_group = x25519_mlkem768_group,
+    });
+}
+
+test "LIVE wolfSSL peer: a hybrid-only wolfSSL server retries our classical offer UP to X25519MLKEM768 and the handshake completes on it" {
+    try certClientAgainstWolfssl(.{
+        .peer_mode = "server-cert-mlkem",
+        .expect_hello_retry_request = true,
+        .expect_group = x25519_mlkem768_group,
+    });
+}
+
 // ── mutual authentication, live ──────────────────────────────────────────
 //
 // Until this test, every Certificate + CertificateVerify our CLIENT had ever
@@ -648,6 +684,9 @@ const CertCase = struct {
     peer_mode: []const u8,
     /// Non-zero forces wolfSSL to fragment its Certificate flight.
     mtu: u16 = 0,
+    /// The group our fresh ClientHello offers its share in
+    /// (`Config.key_share_group`).
+    offer_group: u16 = x25519_group,
     /// Asserted after the handshake — see the block comment above.
     expect_hello_retry_request: bool = false,
     /// The group the handshake finally ran on.
@@ -711,19 +750,22 @@ fn certClientAgainstWolfssl(case: CertCase) !void {
             .chain = &.{&cert_kat.client_cert_der},
             .private_key = clientEcdsaKeyPair(),
         } else null,
+        .key_share_group = @enumFromInt(case.offer_group),
     });
     defer conn.deinit();
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x3d} ** 32);
     const rnd = seededForTest(&csprng);
 
-    var out: [1500]u8 = undefined;
-    var rx: [1500]u8 = undefined;
+    var out: [2048]u8 = undefined;
+    var rx: [2048]u8 = undefined;
 
     const client_hello = try conn.startHandshake(rnd, 0, &out);
-    // Every fresh ClientHello offers x25519 — which is what makes the
-    // secp256r1 cases a genuine group CHANGE rather than a lucky first pick.
-    try testing.expectEqual(x25519_group, conn.ecdhe_group);
+    // The fresh ClientHello offers exactly the configured group — which is
+    // what makes the retry cases a genuine group CHANGE rather than a lucky
+    // first pick (secp256r1 and, for a default x25519 offer against a
+    // hybrid-only server, x25519_ml_kem768).
+    try testing.expectEqual(case.offer_group, conn.ecdhe_group);
     try sock.send(io, &server_addr, client_hello);
 
     var steps: usize = 0;
@@ -812,10 +854,22 @@ fn certClientAgainstWolfssl(case: CertCase) !void {
 // check out, then round-trips application data under the keys our server
 // derived.
 //
-// wolfSSL's client is restricted to x25519, matching what our server's
-// `clientHelloShare` prefers — this test is about the certificate direction,
-// not about group negotiation, which the HelloRetryRequest tests above cover.
+// wolfSSL's client is restricted to x25519 in the baseline case, matching
+// what a classical client offers — group negotiation is the HelloRetryRequest
+// tests' job above. The `client-cert-mlkem` case restricts it to
+// X25519MLKEM768 instead: wolfSSL offers the 1216-byte hybrid share and OUR
+// server must encapsulate to it and answer in the 1120-byte ciphertext form —
+// the server half of the hybrid, checked by foreign code (nothing in this
+// repo can check it against anything but itself).
 test "LIVE wolfSSL peer: a real wolfSSL certificate CLIENT verifies the chain OUR server presents" {
+    try certServerAgainstWolfsslClient("client-cert", x25519_group);
+}
+
+test "LIVE wolfSSL peer: a wolfSSL client offering X25519MLKEM768 completes the PQ hybrid against OUR server's encapsulation path" {
+    try certServerAgainstWolfsslClient("client-cert-mlkem", x25519_mlkem768_group);
+}
+
+fn certServerAgainstWolfsslClient(peer_mode: []const u8, expect_group: u16) !void {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -834,7 +888,7 @@ test "LIVE wolfSSL peer: a real wolfSSL certificate CLIENT verifies the chain OU
     const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{sock.address.getPort()});
 
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "./wolfssl_peer", "client-cert", port_str },
+        .argv = &.{ "./wolfssl_peer", peer_mode, port_str },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
         .stdout = .ignore,
@@ -856,8 +910,11 @@ test "LIVE wolfSSL peer: a real wolfSSL certificate CLIENT verifies the chain OU
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x4e} ** 32);
     const rnd = seededForTest(&csprng);
 
-    var out: [1500]u8 = undefined;
-    var rx: [1500]u8 = undefined;
+    // A hybrid ServerHello makes our flight 2 outgrow an MTU-sized buffer
+    // (~1.2 KB ServerHello + certificate + CertificateVerify + Finished in
+    // ONE `out`), hence flight-sized rather than 1500.
+    var out: [4096]u8 = undefined;
+    var rx: [2048]u8 = undefined;
     var peer_addr: net.IpAddress = undefined;
 
     var steps: usize = 0;
@@ -871,6 +928,10 @@ test "LIVE wolfSSL peer: a real wolfSSL certificate CLIENT verifies the chain OU
         };
         if (result.out.len > 0) try sock.send(io, &peer_addr, result.out);
     }
+
+    // The group the session actually ran on — for the mlkem case, the proof
+    // that wolfSSL's hybrid share was USED, not renegotiated down.
+    try testing.expectEqual(expect_group, conn.ecdhe_group);
 
     var plain: [1500]u8 = undefined;
     var skipped: usize = 0;

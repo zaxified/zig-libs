@@ -202,9 +202,12 @@ unaffected — proven by the untouched existing suite). Summary:
 - **`messages.zig`:** `key_share` (RFC 8446 §4.2.8, ClientHello list +
   ServerHello single-entry forms), `supported_groups` (§4.2.7),
   `signature_algorithms` (§4.2.3) encode/decode, plus the `NamedGroup` enum.
-  Both **X25519** (`0x001d`) and **secp256r1** (`0x0017`) are wired end to
-  end; a fresh ClientHello offers an X25519 share and secp256r1 is used when
-  a server names it in a HelloRetryRequest (RFC 8446 §4.1.4). `key_share`
+  **X25519** (`0x001d`), **secp256r1** (`0x0017`) and the PQ hybrid
+  **X25519MLKEM768** (`0x11ec`, added 2026-08-31 — see the threat-model
+  section) are wired end to end; a fresh ClientHello offers a share in
+  `Config.key_share_group` (default X25519) and any other advertised group
+  is used when a server names it in a HelloRetryRequest (RFC 8446 §4.1.4).
+  `key_share`
   has a THIRD wire form for that message — a bare two-byte `selected_group`
   (`encode`/`decodeKeyShareHelloRetryRequest`), not interchangeable with the
   ServerHello form.
@@ -277,36 +280,40 @@ follow-up.
   migration beyond the connection-ID field already framed in `record.zig`.
   (X.509/certificate auth was in this list originally — see "Certificate
   mode" above for what landed and what of it is still genuinely deferred.)
-- **No post-quantum key exchange, and that is a real exposure, not a shrug.**
-  Both `.cert_dhe` groups are classical (X25519, secp256r1), so a `.cert_dhe`
-  session is recorded-now-decrypted-later once a cryptographically relevant
-  quantum computer exists. What makes this worth writing down rather than
-  leaving implicit: the sibling path a consumer might assume is equivalent is
-  NOT. `std.crypto.tls.Client` — which this collection's `http` client uses —
-  offers `x25519_ml_kem768` and gets the hybrid whenever the peer supports it,
-  and `ssh` in this collection offers `mlkem768x25519-sha256` first. A
-  consumer who reaches for `dtls` instead therefore drops from a hybrid to a
-  purely classical exchange **silently**, on the reasonable assumption that
-  one TLS-family module in a collection behaves like the others.
-  - Closing it is not blocked on a primitive: Zig 0.16 ships
-    `std.crypto.kem.ml_kem.MLKem768` and, ready-made,
-    `std.crypto.kem.hybrid.MlKem768X25519`. Measured on this repo's audit
-    host (2026-08-22, ReleaseFast), std's ML-KEM-768 costs **less** than its
-    own X25519: keygen 52 vs 54 µs, encaps 29 µs, decaps 43 µs — and beats
-    OpenSSL 3.5.5's own ML-KEM-768 (65/40/60 µs) on the same machine. Cost is
-    not the reason this is missing; nobody has wired the `key_share` group.
-  - What it needs: the `X25519MLKEM768` named group (0x11ec) as a third
-    `key_share` option, its 1216-byte client share / 1120-byte server share,
-    and the concatenated secret into the SAME key schedule the two classical
-    groups already feed. Note the trap `ssh` documents: identical wire sizes
-    do NOT imply an identical construction — TLS concatenates
-    `ss_ML-KEM ‖ ss_X25519` per draft-ietf-tls-ecdhe-mlkem, while `ssh` hashes
-    `SHA256(ss_M ‖ ss_X)`. Reusing the wrong combiner would interoperate with
-    nothing.
-  - Scope note: nothing in DTLS 1.3 negotiates a PQ hybrid by DEFAULT in the
-    field either (as of 2026-08: wolfSSL and mbedTLS have it opt-in, WebRTC's
-    hybrid DTLS-SRTP keying is still in design), so this is a gap against the
-    *opt-in* tier, not against a shipping default.
+- **Post-quantum key exchange: CLOSED (2026-08-31).** `X25519MLKEM768`
+  (0x11ec, draft-ietf-tls-ecdhe-mlkem) is wired end to end in both roles:
+  the 1216-byte client share (`ML-KEM-768 encapsulation key ‖ X25519 public`
+  — ML-KEM FIRST, the draft's famous naming inconsistency), the 1120-byte
+  server share (`ciphertext ‖ X25519 public`), and the 64-byte
+  `ss_MLKEM ‖ ss_X25519` concatenation into the SAME key schedule the two
+  classical groups feed. Server side is unconditional; client side offers
+  the hybrid when `Config.key_share_group = .x25519_ml_kem768` (default
+  stays `.x25519`, matching the field's opt-in tier — wolfSSL/mbedTLS —
+  because a hybrid offer costs a HelloRetryRequest round trip against every
+  classical-only DTLS server; the always-advertised `supported_groups` entry
+  still lets a preference-honoring server retry a classical offer UP to it).
+  Live-proven against wolfSSL 5.9.1 in three shapes: offered directly,
+  reached via HRR upgrade, and a wolfSSL client's share answered by our
+  server's encapsulation path.
+  - Cost was never the blocker, measured on this repo's audit host
+    (2026-08-22, ReleaseFast): std's ML-KEM-768 costs **less** than its own
+    X25519 — keygen 52 vs 54 µs, encaps 29 µs, decaps 43 µs — and beats
+    OpenSSL 3.5.5's own ML-KEM-768 (65/40/60 µs) on the same machine.
+  - ⚠ The combiner trap `ssh` documents turned out to have a SECOND instance,
+    in std itself: `std.crypto.kem.hybrid.MlKem768X25519` (which an earlier
+    revision of this note recommended as "ready-made") has exactly these
+    share sizes but is **X-Wing** — a SHA3-256 combiner over
+    `secrets ‖ ciphertext ‖ key ‖ label` — while TLS wants the bare
+    concatenation, and `ssh` hashes `SHA256(ss_M ‖ ss_X)`. Three
+    constructions, identical wire sizes, zero interop between them; this
+    module transcribes the draft's own construction over
+    `std.crypto.kem.ml_kem.MLKem768` directly.
+  - Two wolfSSL field lessons, encoded in the interop harness: a PQ share is
+    only generated after `wolfSSL_UseKeyShare` (`set_groups` alone yields an
+    EMPTY client_shares list), and the `WOLFSSL_DTLS_CH_FRAG` build (auto-on
+    when ML-KEM + DTLS 1.3 are both enabled) empties the key share whenever
+    ClientHello1 would exceed the MTU rather than fragment it — both look
+    like "peer didn't offer the group" from the other side.
 - Once `keyschedule.pskBinder` is implemented, it MUST be checked (server
   side) before trusting the offered PSK identity — a missing check is the
   single highest-impact bug this module could ship with.

@@ -5,6 +5,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-31** — Post-quantum hybrid key exchange: `.cert_dhe` now speaks
+  **X25519MLKEM768** (`0x11ec`, draft-ietf-tls-ecdhe-mlkem) alongside
+  X25519 and secp256r1 — the last TLS-family path in this collection with
+  no PQ option. The server side is unconditional (a client's 1216-byte
+  hybrid share gets the 1120-byte ciphertext-form answer and the 64-byte
+  `ss_MLKEM ‖ ss_X25519` concatenation feeds the unmodified key schedule);
+  the client offers it via the new `Config.key_share_group` field (default
+  `.x25519` — unchanged wire behavior — because a hybrid offer costs one
+  HelloRetryRequest round trip against every classical-only DTLS server;
+  the group is always ADVERTISED, so a preference-honoring server can also
+  retry a classical offer up to it). Deliberately NOT built on
+  `std.crypto.kem.hybrid.MlKem768X25519`: that type has the same share
+  sizes but is X-Wing (SHA3 combiner), a third same-sized,
+  non-interoperable construction next to TLS's concatenation and `ssh`'s
+  `SHA256(ss_M ‖ ss_X)`. Live-anchored against wolfSSL 5.9.1 in three
+  shapes (offered directly; upgraded to via HRR; a wolfSSL client's share
+  answered by our server), which surfaced two wolfSSL field behaviors now
+  encoded in the harness: PQ shares appear only after
+  `wolfSSL_UseKeyShare`, and `WOLFSSL_DTLS_CH_FRAG` silently EMPTIES the
+  key share when ClientHello1 would exceed the MTU.
+  **BREAKING (API):** `ConfigError` gains `error.UnsupportedKeyShareGroup`
+  (a `key_share_group` outside `advertised_groups`) — an exhaustive
+  `switch` over the set stops compiling until it handles it. Sizing
+  changes that follow from 1.2-KB shares: `max_flight_bytes` 4096 → 5632,
+  the retransmission cache (`last_flight`) 1500 → `max_flight_bytes`
+  (a cert-mode server flight could already exceed 1500 and then failed
+  the handshake AFTER the flight went out), and the ClientHello accept
+  bound is 2048 (a foreign hybrid hello — wolfSSL's — exceeded 1536 live).
+
 - **2026-08-23** — `Connection.suite`'s field initialiser is no longer
   `.aes_128_ccm_8_sha256`. It now shares `Config.cipher_suites`' default
   through a single `default_cipher_suites` constant, so the pre-negotiation

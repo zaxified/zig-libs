@@ -3,7 +3,8 @@
 DTLS 1.3 (RFC 9147). Two key-exchange modes (`Config.key_exchange`): `.psk`
 (default, pre-shared-key, no (EC)DHE) with an additive X.509
 Certificate/CertificateVerify/CertificateRequest authentication layer on top,
-and `.cert_dhe` (PSK-less, ephemeral-X25519, the standard TLS-1.3-style
+and `.cert_dhe` (PSK-less ephemeral key exchange — X25519, secp256r1, or the
+post-quantum hybrid X25519MLKEM768 — the standard TLS-1.3-style
 certificate handshake). Secure-UDP transport, intended primarily for the
 `coap` module's IoT/SCADA fleet-management use case (CoAP-over-DTLS is
 RFC 7925's constrained-device profile).
@@ -28,8 +29,11 @@ Implemented and validated:
   (ClientHello with a real PSK binder → ServerHello → EncryptedExtensions +
   Finished → client Finished → application keys installed), plus the
   additive certificate-mode messages and the `.cert_dhe` ephemeral-(EC)DHE
-  mode — X25519 (validated against RFC 8448 §3's external ECDHE vector) and
-  secp256r1 (against a Python-`cryptography`/OpenSSL vector). Proven by an
+  mode — X25519 (validated against RFC 8448 §3's external ECDHE vector),
+  secp256r1 (against a Python-`cryptography`/OpenSSL vector), and the
+  X25519MLKEM768 PQ hybrid (both halves pinned against their primitives,
+  and the whole thing against wolfSSL — see the post-quantum section).
+  Proven by an
   in-memory client↔server interop suite: both validated suites reach
   `.connected` with byte-identical derived keys, a real `send`/`recv`
   round trip, caller-clocked retransmission on a dropped ClientHello, and
@@ -76,7 +80,10 @@ compiled at test time; the tests skip loudly when `cc` or wolfSSL is missing
   `VERIFY_PEER | FAIL_IF_NO_PEER_CERT` and our anchor as its only CA
   verifying OUR client certificate;
 - **our server's chain, verified by a third party** — a real wolfSSL
-  certificate client checking what we present.
+  certificate client checking what we present;
+- **the X25519MLKEM768 hybrid, three shapes** — our client offering it, our
+  client retried UP to it from a classical offer, and a wolfSSL client's
+  hybrid share answered by our server (see the post-quantum section).
 
 That test found four defects that self-interop is structurally incapable of
 finding, because both sides of a self-interop suite make the same mistake
@@ -235,7 +242,8 @@ supplying a seeded generator is no longer something that can happen by reflex:
 the weak path is a variant the caller has to name.
 
 This is not a style note. In `.cert_dhe` mode those two calls draw the
-**x25519 / secp256r1 ephemeral private key**. Under a seeded PRNG a passive
+**ephemeral private key** (the x25519 / secp256r1 scalar; for the hybrid
+also the ML-KEM-768 keygen and encapsulation seeds). Under a seeded PRNG a passive
 eavesdropper who learns the seed derives that key, recomputes the (EC)DHE
 shared secret and decrypts every recorded session from that peer,
 **retroactively** — including traffic captured long before the seed leaked.
@@ -265,19 +273,35 @@ The `dtls.keyschedule` and `dtls.aead` modules are the KAT-validated crypto
 core; `dtls.record`/`handshake`/`flight`/`messages` are the pure framing
 layer — all usable standalone.
 
-## Post-quantum: not here, and the sibling paths differ
+## Post-quantum: the X25519MLKEM768 hybrid, wired in both roles
 
-Both `.cert_dhe` groups are classical (X25519, secp256r1). A consumer who
-picks `dtls` over the collection's other TLS-family paths drops to a purely
-classical exchange **silently** — `std.crypto.tls.Client` (what the `http`
-client uses) offers `x25519_ml_kem768`, and [`ssh`](../ssh) offers
-`mlkem768x25519-sha256` first. Nothing in DTLS 1.3 negotiates a hybrid by
-default in the field either, so this is a gap against the opt-in tier rather
-than against a shipping default — but it is a gap, and it is not blocked on a
-primitive: `std.crypto.kem.hybrid.MlKem768X25519` is ready-made and measures
-faster than std's own X25519. `SPEC.md`'s threat-model section has the
-measurements and the exact wiring (group `0x11ec`, share sizes, and the
-combiner trap that makes `ssh`'s construction non-reusable here).
+`.cert_dhe` speaks three groups: X25519, secp256r1, and the post-quantum
+hybrid `X25519MLKEM768` (`0x11ec`, draft-ietf-tls-ecdhe-mlkem — the group
+TLS deployments ship). The **server** side needs no configuration: a client
+that offers the 1216-byte hybrid share gets the 1120-byte ciphertext-form
+answer and a 64-byte `ss_MLKEM ‖ ss_X25519` secret into the same key
+schedule, unconditionally. The **client** offers its fresh share in
+`Config.key_share_group` — default `.x25519` (matching the DTLS field, where
+every stack ships the hybrid opt-in; the collection's TLS/SSH siblings
+default to the hybrid because it costs no round trip THERE, while a DTLS
+client offering it against a classical-only server pays one
+HelloRetryRequest). Set `.x25519_ml_kem768` to offer it first; either way
+every group is always advertised in `supported_groups`, so a
+preference-honoring server can retry a classical offer up to the hybrid on
+its own — that path is live-tested too.
+
+All four hybrid shapes are proven against wolfSSL, not just against this
+module's own mirror image: our client offering the hybrid, our client
+upgraded to it by a HelloRetryRequest, and a wolfSSL client's hybrid share
+answered by our server's encapsulation path. The construction is the draft's
+bare concatenation — deliberately NOT `std.crypto.kem.hybrid.MlKem768X25519`,
+which has the SAME share sizes but is X-Wing (a SHA3 combiner), and not
+`ssh`'s `SHA256(ss_M ‖ ss_X)` either; identical wire sizes, three mutually
+non-interoperable secrets. Two field lessons live in the wolfSSL harness:
+wolfSSL only generates a PQ share after `wolfSSL_UseKeyShare`, and its
+`WOLFSSL_DTLS_CH_FRAG` build silently EMPTIES the key share when
+ClientHello1 would exceed the MTU — an interop failure that looks like a
+missing extension until you know to look.
 
 ## Verify
 

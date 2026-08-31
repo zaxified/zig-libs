@@ -59,21 +59,35 @@ pub const ExtensionType = enum(u16) {
     _,
 };
 
-/// RFC 8446 §4.2.7 `NamedGroup` code points for the (EC)DHE groups this
-/// module's cert-only-DHE handshake mode can offer/select. BOTH are wired
-/// end-to-end in `Connection.zig` (see its `ecdheGenerate`/`ecdheSharedSecret`):
+/// RFC 8446 §4.2.7 `NamedGroup` code points for the key-exchange groups this
+/// module's cert-only-DHE handshake mode can offer/select. ALL THREE are wired
+/// end-to-end in `Connection.zig` (see its `ecdheGenerate`/`ecdheSharedSecret`/
+/// `ecdheServerExchange`):
 ///   * `x25519` — `KeyShareEntry.key_exchange` is the raw 32-byte X25519
 ///     public key (RFC 8446 §4.2.8.1 / RFC 7748); shared secret = the 32-byte
 ///     scalarmult output;
 ///   * `secp256r1` — `key_exchange` is the 65-byte UNCOMPRESSED SEC1 point
 ///     `0x04 || X || Y` (RFC 8446 §4.2.8.2); shared secret = the 32-byte X
 ///     coordinate of the shared point ONLY, not the point encoding.
+///   * `x25519_ml_kem768` — the post-quantum hybrid (draft-ietf-tls-ecdhe-mlkem,
+///     the group TLS deployments ship as `X25519MLKEM768`). ASYMMETRIC, unlike
+///     the two curves: the client's `key_exchange` is the 1216-byte
+///     `ML-KEM-768 encapsulation key ‖ X25519 public` (ML-KEM FIRST, despite
+///     the name), the server's is the 1120-byte `ML-KEM ciphertext ‖ X25519
+///     public`, and the shared secret is the 64-byte `ss_MLKEM ‖ ss_X25519`
+///     CONCATENATION fed to the key schedule as-is — NOT a hash combiner.
+///     Two constructions with these exact share sizes exist and interoperate
+///     with nothing but themselves: `ssh`'s `mlkem768x25519-sha256` hashes
+///     `SHA256(ss_M ‖ ss_X)`, and std's `crypto.kem.hybrid.MlKem768X25519`
+///     is X-Wing (SHA3-256 over secrets ‖ ciphertext ‖ key ‖ label). Identical
+///     wire sizes do not imply an identical construction.
 /// An earlier version of this module advertised `secp256r1` in
 /// `supported_groups` while being unable to compute a share for it — which
 /// is exactly what makes a server answer with a HelloRetryRequest naming it.
 pub const NamedGroup = enum(u16) {
     secp256r1 = 0x0017,
     x25519 = 0x001d,
+    x25519_ml_kem768 = 0x11ec,
     _,
 };
 

@@ -30,6 +30,15 @@
 //   ./wolfssl_peer server-cert-p256-hrr <port>
 //                                     # ...both at once: cookie + group
 //                                     # change in one HelloRetryRequest.
+//   ./wolfssl_peer server-cert-mlkem <port>
+//                                     # ...restricted to X25519MLKEM768
+//                                     # (0x11EC), the PQ hybrid: a client
+//                                     # offering the 1216-byte hybrid share
+//                                     # completes directly; one offering
+//                                     # x25519 gets a HelloRetryRequest
+//                                     # naming the hybrid. Needs a wolfSSL
+//                                     # built with ML-KEM (Debian's 5.9.1
+//                                     # is); otherwise exits before READY.
 //   ./wolfssl_peer server-cert-mutual <port>
 //                                     # ...and REQUIRES a client certificate,
 //                                     # verified against ./anchor-cert.der.
@@ -40,6 +49,10 @@
 //                                     # the chain OUR server presents against
 //                                     # ./anchor-cert.der, then sends +
 //                                     # expects an echo.
+//   ./wolfssl_peer client-cert-mlkem <port>
+//                                     # ...offering the X25519MLKEM768 hybrid
+//                                     # share, so OUR server's encapsulation
+//                                     # path is exercised by foreign code.
 //
 // Deliberate configuration, each item chosen to match what this module
 // implements — a mismatch here would make the test prove nothing:
@@ -327,14 +340,20 @@ static int run_cert_server(int port, struct cert_server_opts o) {
 // our Certificate + CertificateVerify actually check out; wolfSSL's default
 // (no domain-name check unless asked) is left alone, since the fixture leaf
 // carries a CN, not a SAN matching a loopback address.
-static int run_cert_client(int port) {
+//
+// `group` — the single NamedGroup this client offers its key_share in.
+// WOLFSSL_ECC_X25519 is the classical baseline; WOLFSSL_X25519MLKEM768
+// makes wolfSSL offer the 1216-byte PQ-hybrid share, so OUR server's
+// encapsulation path (ciphertext-form answer, concatenated shared secret)
+// is proven by a third party's key schedule agreeing with ours.
+static int run_cert_client(int port, int group) {
     WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfDTLSv1_3_client_method());
     if (!ctx) { fprintf(stderr, "CTX_new failed\n"); return 1; }
     if (wolfSSL_CTX_set_cipher_list(ctx, kSuite) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "set_cipher_list failed\n");
         return 1;
     }
-    int groups[] = {WOLFSSL_ECC_X25519};
+    int groups[] = {group};
     if (wolfSSL_CTX_set_groups(ctx, groups, 1) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "set_groups failed\n");
         return 1;
@@ -354,6 +373,26 @@ static int run_cert_client(int port) {
 
     WOLFSSL *ssl = wolfSSL_new(ctx);
     wolfSSL_set_fd(ssl, fd);
+    // Two knobs, both needed before the hybrid share actually appears in
+    // ClientHello1 (found live — with either missing, wolfSSL sends an
+    // EMPTY client_shares list and bets on a group-naming HRR, which our
+    // server deliberately never sends; see `clientHelloShare`'s documented
+    // limit):
+    //   * `UseKeyShare` — `set_groups` alone only fills `supported_groups`;
+    //     wolfSSL does not GENERATE a PQ-hybrid share unless told to.
+    //   * a raised MTU — wolfSSL builds ML-KEM with `WOLFSSL_DTLS_CH_FRAG`,
+    //     whose client half EMPTIES the key share whenever ClientHello1
+    //     would exceed the MTU rather than fragment it (an initial-flight
+    //     amplification precaution). The 1216-byte share puts the hello
+    //     over the default; on loopback a 4 KB datagram is fine.
+    if (wolfSSL_UseKeyShare(ssl, (word16)group) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "UseKeyShare failed\n");
+        return 1;
+    }
+    if (wolfSSL_dtls_set_mtu(ssl, 4096) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "dtls_set_mtu failed\n");
+        return 1;
+    }
     int rc = wolfSSL_connect(ssl);
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
@@ -453,8 +492,9 @@ int main(int argc, char **argv) {
     if (argc != 3 && argc != 4) {
         fprintf(stderr,
                 "usage: %s server|server-hrr|server-cert|server-cert-hrr|"
-                "server-cert-p256|server-cert-p256-hrr|server-cert-mutual|"
-                "client|client-cert <port> [mtu]\n",
+                "server-cert-p256|server-cert-p256-hrr|server-cert-mlkem|"
+                "server-cert-mutual|client|client-cert|client-cert-mlkem "
+                "<port> [mtu]\n",
                 argv[0]);
         return 2;
     }
@@ -484,11 +524,29 @@ int main(int argc, char **argv) {
         cert.group = WOLFSSL_ECC_SECP256R1;
         cert.hrr_cookie = 1;
         rc = run_cert_server(port, cert);
+    } else if (strcmp(argv[1], "server-cert-mlkem") == 0) {
+        // The X25519MLKEM768 PQ hybrid (0x11EC), guarded because wolfSSL
+        // builds it opt-in — Debian's 5.9.1 has it. A build without it
+        // exits before READY, which the Zig harness reports as a loud skip.
+#ifdef WOLFSSL_HAVE_MLKEM
+        cert.group = WOLFSSL_X25519MLKEM768;
+        rc = run_cert_server(port, cert);
+#else
+        fprintf(stderr, "no ML-KEM in this wolfSSL build\n");
+        rc = 2;
+#endif
     } else if (strcmp(argv[1], "server-cert-mutual") == 0) {
         cert.verify_peer = 1;
         rc = run_cert_server(port, cert);
     } else if (strcmp(argv[1], "client-cert") == 0) {
-        rc = run_cert_client(port);
+        rc = run_cert_client(port, WOLFSSL_ECC_X25519);
+    } else if (strcmp(argv[1], "client-cert-mlkem") == 0) {
+#ifdef WOLFSSL_HAVE_MLKEM
+        rc = run_cert_client(port, WOLFSSL_X25519MLKEM768);
+#else
+        fprintf(stderr, "no ML-KEM in this wolfSSL build\n");
+        rc = 2;
+#endif
     } else {
         rc = run_client(port);
     }
