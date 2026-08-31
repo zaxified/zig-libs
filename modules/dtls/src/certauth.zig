@@ -21,6 +21,14 @@
 //! the anchor's public key (real RSA-PKCS1v1.5/ECDSA/Ed25519 signature
 //! math, per the leaf's declared `signatureAlgorithm`).
 //!
+//! **Peer IDENTITY is checked only when the caller asks for it**
+//! (`verifyLeafAgainstAnchor`'s `expected_name`, reached from
+//! `Connection.Config.expected_peer_name`). Issuance and identity are two
+//! different questions and only the first is answered by a chain check: an
+//! anchor that issues a fleet of certificates vouches for every one of them,
+//! so without a name the check accepts any fleet member as any other. See
+//! that parameter's doc comment.
+//!
 //! **What this is NOT — deliberately out of scope, not silently skipped:**
 //! full RFC 5280 §6 certification-path building (multi-hop chains beyond
 //! leaf+one anchor, name constraints, policy extensions, `basicConstraints
@@ -65,7 +73,7 @@ pub const Error = error{
     /// algorithm (malformed SEC1 point, malformed RSA DER, wrong-length
     /// Ed25519 key, ...).
     InvalidPublicKey,
-} || Certificate.Parsed.VerifyError;
+} || Certificate.Parsed.VerifyError || Certificate.Parsed.VerifyHostNameError;
 
 /// Parses `cert_der`'s `SubjectPublicKeyInfo` into a `certverify.PublicKey`
 /// — the key `certverify.verify` needs to check a `CertificateVerify`
@@ -114,7 +122,25 @@ pub fn parseLeafPublicKey(cert_der: []const u8) Error!certverify.PublicKey {
 /// exactly what is and is not validated): `leaf_der` must be issued
 /// (real signature check) by `anchor_der`'s key, and `now_sec` must fall
 /// inside `leaf_der`'s validity period.
-pub fn verifyLeafAgainstAnchor(leaf_der: []const u8, anchor_der: []const u8, now_sec: i64) Error!void {
+///
+/// ⭐ `expected_name`, when non-null, additionally binds the certificate to
+/// an IDENTITY — the leaf's `subjectAltName` dNSNames, or its `commonName`
+/// when the certificate carries no SAN at all (RFC 6125 / std's
+/// `verifyHostName`, wildcards included).
+///
+/// **Passing null is only safe when the anchor issues exactly one identity.**
+/// Chain verification answers "was this issued by the anchor", never "is this
+/// the peer I meant to reach": under a fleet CA every device certificate is
+/// anchor-issued, so with null any holder of any such certificate
+/// authenticates as any other — device impersonation, and on a client, a
+/// server-impersonation MITM. That is the whole reason this parameter is not
+/// optional-by-omission but an explicit `?[]const u8` the caller must decide.
+pub fn verifyLeafAgainstAnchor(
+    leaf_der: []const u8,
+    anchor_der: []const u8,
+    now_sec: i64,
+    expected_name: ?[]const u8,
+) Error!void {
     // Unlike `parseLeafPublicKey`, this needs fields `spkiOf` deliberately does
     // not decode — issuer, validity, signature — so std's parser is still the
     // one doing the work. It is fed through `x509.safe.safeCertificate`, which
@@ -128,6 +154,7 @@ pub fn verifyLeafAgainstAnchor(leaf_der: []const u8, anchor_der: []const u8, now
     const leaf_parsed = leaf.parse() catch return error.MalformedCertificate;
     const anchor_parsed = anchor.parse() catch return error.MalformedCertificate;
     try leaf_parsed.verify(anchor_parsed, now_sec);
+    if (expected_name) |name| try leaf_parsed.verifyHostName(name);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -195,32 +222,49 @@ test "parseLeafPublicKey: adversarial DER returns a typed error instead of panic
 }
 
 test "verifyLeafAgainstAnchor: real signature check accepts a genuinely anchor-signed leaf" {
-    try verifyLeafAgainstAnchor(&kat.server_cert_der, &kat.anchor_cert_der, kat.valid_now_sec);
-    try verifyLeafAgainstAnchor(&kat.client_cert_der, &kat.anchor_cert_der, kat.valid_now_sec);
+    try verifyLeafAgainstAnchor(&kat.server_cert_der, &kat.anchor_cert_der, kat.valid_now_sec, null);
+    try verifyLeafAgainstAnchor(&kat.client_cert_der, &kat.anchor_cert_der, kat.valid_now_sec, null);
+}
+
+test "verifyLeafAgainstAnchor: expected_name binds the chain to an identity" {
+    // ⭐ The reason this parameter exists. Both certificates below are issued
+    // by the SAME anchor and both pass every chain check there is — issuer,
+    // validity, signature. Only the name tells them apart, so without one the
+    // client certificate authenticates perfectly well AS THE SERVER, which is
+    // what a fleet CA hands every device holding a certificate.
+    try verifyLeafAgainstAnchor(&kat.server_cert_der, &kat.anchor_cert_der, kat.valid_now_sec, "dtls-test-server");
+    try testing.expectError(error.CertificateHostMismatch, verifyLeafAgainstAnchor(
+        &kat.client_cert_der,
+        &kat.anchor_cert_der,
+        kat.valid_now_sec,
+        "dtls-test-server",
+    ));
+    // The impersonation the null case allows, spelled out: same call, no name.
+    try verifyLeafAgainstAnchor(&kat.client_cert_der, &kat.anchor_cert_der, kat.valid_now_sec, null);
 }
 
 test "verifyLeafAgainstAnchor: rejects a leaf signed by a DIFFERENT anchor (same subject name as the real leaf)" {
     // evil_server_cert_der has the SAME CN as server_cert_der but was signed
     // by evil_anchor_cert_der's key, not anchor_cert_der's -- proving the
     // check is a real signature/issuer verification, not a name compare.
-    try testing.expectError(error.CertificateIssuerMismatch, verifyLeafAgainstAnchor(&kat.evil_server_cert_der, &kat.anchor_cert_der, kat.valid_now_sec));
+    try testing.expectError(error.CertificateIssuerMismatch, verifyLeafAgainstAnchor(&kat.evil_server_cert_der, &kat.anchor_cert_der, kat.valid_now_sec, null));
 }
 
 test "verifyLeafAgainstAnchor: rejects the real leaf against the WRONG anchor" {
-    try testing.expectError(error.CertificateIssuerMismatch, verifyLeafAgainstAnchor(&kat.server_cert_der, &kat.evil_anchor_cert_der, kat.valid_now_sec));
+    try testing.expectError(error.CertificateIssuerMismatch, verifyLeafAgainstAnchor(&kat.server_cert_der, &kat.evil_anchor_cert_der, kat.valid_now_sec, null));
 }
 
 test "verifyLeafAgainstAnchor: rejects a time outside the certificate's validity window" {
     const long_before: i64 = 1; // 1970 -- before notBefore (2026)
-    try testing.expectError(error.CertificateNotYetValid, verifyLeafAgainstAnchor(&kat.server_cert_der, &kat.anchor_cert_der, long_before));
+    try testing.expectError(error.CertificateNotYetValid, verifyLeafAgainstAnchor(&kat.server_cert_der, &kat.anchor_cert_der, long_before, null));
     const long_after: i64 = 4102444800; // 2100 -- after notAfter (2036)
-    try testing.expectError(error.CertificateExpired, verifyLeafAgainstAnchor(&kat.server_cert_der, &kat.anchor_cert_der, long_after));
+    try testing.expectError(error.CertificateExpired, verifyLeafAgainstAnchor(&kat.server_cert_der, &kat.anchor_cert_der, long_after, null));
 }
 
 test "verifyLeafAgainstAnchor: a tampered leaf signature is rejected" {
     var tampered = kat.server_cert_der;
     tampered[tampered.len - 1] ^= 0x01; // flip the last byte of the ECDSA signature
-    try testing.expectError(error.CertificateSignatureInvalid, verifyLeafAgainstAnchor(&tampered, &kat.anchor_cert_der, kat.valid_now_sec));
+    try testing.expectError(error.CertificateSignatureInvalid, verifyLeafAgainstAnchor(&tampered, &kat.anchor_cert_der, kat.valid_now_sec, null));
 }
 
 // ── fuzz: parseLeafPublicKey off the wire, never panics ─────────────────────

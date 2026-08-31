@@ -25,15 +25,21 @@
 //!     Config that sets nothing but the mode can no longer complete an
 //!     unauthenticated handshake in the mode named for authentication.
 //!
-//!     ⚠ **Both groups are classical — there is no post-quantum hybrid here.**
-//!     A `.cert_dhe` session is recorded-now-decrypted-later. Do not assume
-//!     parity with the other TLS-family paths a consumer might reach for:
-//!     `std.crypto.tls.Client` offers `x25519_ml_kem768` and `ssh` offers
-//!     `mlkem768x25519-sha256` first, so choosing `dtls` silently drops to a
-//!     classical exchange. The primitive is not the obstacle (`std.crypto.kem
-//!     .hybrid.MlKem768X25519` is ready-made and measures faster than std's
-//!     own X25519); nobody has wired the group. SPEC.md's threat-model
-//!     section carries the numbers and what wiring it would take.
+//!     ⭐ **Post-quantum hybrid IS available and is opt-in, not the default:**
+//!     `Config.key_share_group = .x25519_ml_kem768` runs the
+//!     draft-ietf-tls-ecdhe-mlkem X25519MLKEM768 exchange in both roles
+//!     (validated against a live wolfSSL peer). The default stays `.x25519`
+//!     to keep the hello small, so a caller that sets nothing gets a
+//!     CLASSICAL exchange and a recorded-now-decrypted-later session — the
+//!     other TLS-family paths a consumer might compare against
+//!     (`std.crypto.tls.Client`'s `x25519_ml_kem768`, `ssh`'s
+//!     `mlkem768x25519-sha256`) put the hybrid FIRST, so choosing `dtls`
+//!     without naming the group is a downgrade relative to them. Name it.
+//!
+//!     ⚠ Do NOT substitute `std.crypto.kem.hybrid.MlKem768X25519` for the
+//!     transcription in `Connection.zig`: it has the same share sizes but is
+//!     X-Wing, whose shared secret is derived differently — same bytes on the
+//!     wire, a different secret, and no interop.
 //!   - `.cert_dhe_insecure_unauthenticated`: the same (EC)DHE exchange with
 //!     peer authentication switched off — encryption to an unknown party,
 //!     indistinguishable from encryption to an active MITM. Spelled out in

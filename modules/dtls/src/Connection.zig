@@ -273,6 +273,12 @@ pub const PeerVerify = union(enum) {
     /// and the actual signature). Multi-hop path building through an
     /// intermediate is NOT performed — see the "certificate mode: deferred"
     /// notes below.
+    ///
+    /// ⚠ This answers "did the anchor issue this certificate" and nothing
+    /// else. Binding the certificate to an identity is `Config
+    /// .expected_peer_name`, which is null by default — under a fleet CA,
+    /// leaving it null lets any anchor-issued certificate authenticate as any
+    /// other peer. Set it unless the anchor issues exactly one identity.
     trust_anchor: []const u8,
     /// Caller-supplied hook: given the peer's raw leaf certificate DER,
     /// return successfully to accept the chain or any error to reject it.
@@ -328,6 +334,20 @@ pub const Config = struct {
     /// consulted when the peer actually presents a non-empty chain and its
     /// CertificateVerify signature has already checked out.
     peer_verify: PeerVerify = .none,
+    /// ⭐ The identity the peer's certificate must carry, checked against its
+    /// `subjectAltName` dNSNames (or `commonName` when it has no SAN) —
+    /// `PeerVerify.trust_anchor` only. Null skips the check.
+    ///
+    /// **Null is only safe when the anchor issues exactly one identity.** A
+    /// chain check answers "did the anchor issue this", never "is this the
+    /// peer I meant to reach", and those come apart the moment one CA serves
+    /// a fleet: every device certificate is anchor-issued, so with null any
+    /// device authenticates as any other, and a client accepts any fleet
+    /// member as its server. Set this to the name you dialed.
+    ///
+    /// `PeerVerify.verify_fn` callers own the whole decision, identity
+    /// included, and this field is not consulted for them.
+    expected_peer_name: ?[]const u8 = null,
     /// Server only: send a CertificateRequest (RFC 8446 §4.3.2), asking the
     /// client to also authenticate with a certificate.
     request_client_cert: bool = false,
@@ -1789,8 +1809,28 @@ pub const Connection = struct {
             },
             // A real protocol/crypto failure ends this flight: drop the
             // accumulation so the next datagram is not parsed as a
-            // continuation of a flight that already failed.
+            // continuation of a flight that already failed — and ROLL BACK,
+            // exactly as the incomplete case does.
+            //
+            // ⭐ The rollback is the security-relevant half. Epoch-0 records
+            // are unauthenticated, so anyone able to spoof the peer's address
+            // can get a forged ClientHello/ServerHello parsed; without the
+            // restore, everything the parse mutated before it failed stayed
+            // behind. `peer_message_seq` is the sharpest case: a forged
+            // ServerHello that reassembles and is only then rejected (40 zero
+            // bytes decode fine and die at `VersionNotNegotiated`) leaves it
+            // advanced past 0, after which the GENUINE ServerHello — and every
+            // retransmission of it — is dismissed by `messageSeqOlderThan` as
+            // an old duplicate. One spoofed datagram, handshake dead forever,
+            // with the retransmission machinery unable to recover. The
+            // transcript, negotiated suite and handshake keys are poisoned the
+            // same way by a hello that gets further before failing.
+            //
+            // RFC 9147 §4.5.2: an invalid record is discarded, "thus
+            // preserving the association" — which means the association must
+            // still be the one that existed before the record arrived.
             else => {
+                self.* = saved;
                 self.rx_flight_len = 0;
                 return err;
             },
@@ -1953,19 +1993,29 @@ pub const Connection = struct {
         var end = body_len;
         while (end > 0 and out[end - 1] == 0) end -= 1;
         if (end == 0) return error.Malformed;
+        // RFC 9147 §4.5.1 anti-replay window. Two orderings matter here.
+        //
+        // AFTER the AEAD tag has verified (it has, by this point): gating on
+        // an unauthenticated sequence number would let an attacker poison the
+        // window with forged records.
+        //
+        // ⭐ BEFORE the content-type dispatch below: the window is defined
+        // over every received record, not over application data alone. With
+        // the dispatch first, an `ack` or post-handshake record left the
+        // function before its sequence number was ever marked seen — so a
+        // passive observer could capture the server's post-handshake ACK and
+        // re-inject it indefinitely, raising a fresh `ReceivedAck` each time
+        // instead of `ReplayedRecord`, and driving any caller that counts or
+        // acts on those events.
+        if (!replayCheckAndUpdate(&self.recv_seen_any, &self.recv_max_seq, &self.recv_window, full_seq))
+            return error.ReplayedRecord;
+
         const ctype = out[end - 1];
         if (ctype != content_type_application_data) return switch (ctype) {
             content_type_ack => error.ReceivedAck,
             content_type_handshake => error.ReceivedPostHandshakeMessage,
             else => error.Malformed,
         };
-
-        // RFC 9147 §4.5.1 anti-replay window. This MUST run only after the
-        // AEAD tag above has already verified (it has, by this point) —
-        // gating on an unauthenticated sequence number would let an
-        // attacker poison the window with forged records.
-        if (!replayCheckAndUpdate(&self.recv_seen_any, &self.recv_max_seq, &self.recv_window, full_seq))
-            return error.ReplayedRecord;
 
         return out[0 .. end - 1];
     }
@@ -2470,7 +2520,19 @@ pub const Connection = struct {
 
             if (hdr.length > msg_buf.len) return error.BufferTooShort;
             if (!reasm_live) {
-                reasm = handshake.Reassembler.init(msg_buf[0..hdr.length], received_buf[0..hdr.length]);
+                // ⭐ The FULL buffers, not `[0..hdr.length]`. Sizing the
+                // reassembler from the first fragment's declared length hands
+                // its capacity check a number the peer chose: `feed`'s
+                // `hdr.length > self.buf.len` then means "bigger than whatever
+                // the first fragment claimed", so a spoofed epoch-0 fragment
+                // declaring `length = 1` and carrying no bytes shrinks the
+                // slot to one byte, and the genuine message behind it in the
+                // same accumulation is refused for being too large. Handing
+                // over the real capacity lets `total_len` do the sizing, which
+                // is what `feed` is written to expect — a disagreeing header
+                // over an empty slot re-latches instead of failing.
+                const cap = @min(msg_buf.len, received_buf.len);
+                reasm = handshake.Reassembler.init(msg_buf[0..cap], received_buf[0..cap]);
                 reasm_live = true;
             }
 
@@ -2660,7 +2722,12 @@ pub const Connection = struct {
         certverify.verify(scheme, pubkey, signer_side, transcript_hash, signature) catch return error.CertVerifyFailed;
         switch (self.config.peer_verify) {
             .none => {},
-            .trust_anchor => |anchor_der| certauth.verifyLeafAgainstAnchor(leaf_der, anchor_der, self.config.now_sec) catch return error.CertificateRejected,
+            .trust_anchor => |anchor_der| certauth.verifyLeafAgainstAnchor(
+                leaf_der,
+                anchor_der,
+                self.config.now_sec,
+                self.config.expected_peer_name,
+            ) catch return error.CertificateRejected,
             .verify_fn => |f| f(leaf_der) catch return error.CertificateRejected,
         }
     }
@@ -3924,7 +3991,12 @@ fn decodeSingleFragmentMessage(
     const frag_body = fragment_bytes[handshake.header_len..][0..hdr.fragment_length];
     if (hdr.length > msg_buf.len) return error.BufferTooShort;
 
-    var reasm = handshake.Reassembler.init(msg_buf[0..hdr.length], received_buf[0..hdr.length]);
+    // The real capacity, same reasoning as `takeHandshakeMessage` — not
+    // `[0..hdr.length]`, which would hand the reassembler a size the message
+    // itself declared. `@min` because the two buffers are independent
+    // parameters and `Reassembler` requires them equal.
+    const cap = @min(msg_buf.len, received_buf.len);
+    var reasm = handshake.Reassembler.init(msg_buf[0..cap], received_buf[0..cap]);
     const complete = (reasm.feed(hdr, frag_body) catch return error.Malformed) orelse
         return error.FlightIncomplete;
     return .{ .msg_type = hdr.msg_type, .body = complete, .message_seq = hdr.message_seq };
@@ -4705,6 +4777,84 @@ test "reassembly: a fragment of a LATER message while one is in progress is reje
         error.InterleavedFragments,
         server.handleFlight(handBuiltPlaintextRecord(1, next_msg, &rec_buf_b), rnd, 0, &buf2),
     );
+}
+
+test "spoofed epoch-0 datagram cannot wedge the handshake (state rolls back on rejection)" {
+    // ⭐⭐ Epoch 0 is unauthenticated, so anyone who can spoof the peer's
+    // address gets a hello PARSED. It will be rejected — but a rejection that
+    // leaves state behind is itself the attack: `peer_message_seq` advanced
+    // past the message means the GENUINE ServerHello, and every
+    // retransmission of it, is thereafter dismissed as an old duplicate.
+    // One datagram, handshake dead forever. RFC 9147 §4.5.2 requires the
+    // association to survive an invalid record intact.
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_c = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    const cfg_s = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7e} ** 32);
+    const rnd = seededForTest(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    var client = try Connection.clientInit(cfg_c);
+    var server = try Connection.serverInit(cfg_s);
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+
+    // A ServerHello body of 40 zero bytes: it decodes (empty session id, one
+    // suite, empty extensions) and dies at the missing `supported_versions`,
+    // which is exactly "parsed far enough to mutate, then rejected".
+    const seq_before = client.peer_message_seq;
+    var frag_buf: [128]u8 = undefined;
+    var rec_buf: [256]u8 = undefined;
+    const forged = handBuiltHandshakeFragment(2, 40, 0, 0, &([_]u8{0} ** 40), &frag_buf);
+    try testing.expectError(
+        error.VersionNotNegotiated,
+        client.handleFlight(handBuiltPlaintextRecord(0, forged, &rec_buf), rnd, 0, &buf1),
+    );
+    try testing.expectEqual(seq_before, client.peer_message_seq);
+
+    // The real handshake now proceeds as if the forgery had never arrived.
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+    const flight3 = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    const flight4 = try server.handleFlight(flight3.out, rnd, 0, &buf2);
+    try testing.expect(flight4.done);
+}
+
+test "a spoofed short-length fragment cannot shrink the reassembly slot" {
+    // ⭐ The reassembler must be given the REAL capacity, not the length the
+    // first fragment declared: otherwise one spoofed fragment claiming
+    // `length = 1` and carrying nothing shrinks the slot, and the genuine
+    // message that follows it in the same accumulation is refused for being
+    // "too large" for a buffer the attacker sized.
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    const cfg_c = Config{ .role = .client, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
+    const cfg_s = Config{ .role = .server, .psk_identity = psk_identity, .psk = psk, .cipher_suites = &.{.aes_128_gcm_sha256} };
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x7f} ** 32);
+    const rnd = seededForTest(&csprng);
+    var buf1: [1500]u8 = undefined;
+    var buf2: [1500]u8 = undefined;
+
+    var client = try Connection.clientInit(cfg_c);
+    var server = try Connection.serverInit(cfg_s);
+    const ch = try client.startHandshake(rnd, 0, &buf1);
+    const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+
+    // Poison first: a zero-byte fragment of "message 0, total length 1".
+    // Incomplete, so it is buffered and the flight accumulates behind it.
+    var frag_buf: [64]u8 = undefined;
+    var rec_buf: [128]u8 = undefined;
+    const poison = handBuiltHandshakeFragment(2, 1, 0, 0, "", &frag_buf);
+    const poison_dg = handBuiltPlaintextRecord(0, poison, &rec_buf);
+    try testing.expect((try client.handleFlight(poison_dg, rnd, 0, &buf1)).need_more_data);
+
+    // The genuine flight 2, re-parsed behind the poison record, must still
+    // reassemble and complete the handshake.
+    const flight3 = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    const flight4 = try server.handleFlight(flight3.out, rnd, 0, &buf2);
+    try testing.expect(flight4.done);
 }
 
 test "reassembly: buffered bytes are capped — a peer that never completes a message gets FlightTooLarge" {
@@ -5997,6 +6147,87 @@ test "cert-mode: peer chain signed by an UNTRUSTED anchor is rejected" {
     const ch = try client.startHandshake(rnd, 0, &buf1);
     const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
     try testing.expectError(error.CertificateRejected, client.handleFlight(flight2.out, rnd, 0, &buf1));
+}
+
+test "cert-mode: expected_peer_name stops one anchor-issued peer impersonating another" {
+    // ⭐ The gap `expected_peer_name` closes, driven end-to-end through a real
+    // handshake. The "server" here presents the CLIENT's certificate: issued
+    // by the anchor the client trusts, validity fine, and its
+    // CertificateVerify signature genuinely made with the matching private
+    // key — every check the chain layer has to offer passes. It is simply not
+    // the peer the client dialed, and under a fleet CA that is the ordinary
+    // case, not an exotic one.
+    const psk_identity = "device-042";
+    const psk = "a-shared-pre-shared-key";
+    var cfg_client = Config{
+        .role = .client,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .peer_verify = .{ .trust_anchor = &cert_kat.anchor_cert_der },
+        .now_sec = cert_kat.valid_now_sec,
+    };
+    const cfg_server = Config{
+        .role = .server,
+        .psk_identity = psk_identity,
+        .psk = psk,
+        .cipher_suites = &.{.aes_128_gcm_sha256},
+        .cert = .{
+            .chain = &.{&cert_kat.client_cert_der},
+            .private_key = clientEcdsaKeyPair(),
+        },
+    };
+
+    // Without a name: the impersonation succeeds, which is exactly why the
+    // field's doc calls null unsafe under a shared anchor.
+    {
+        var client = try Connection.clientInit(cfg_client);
+        var server = try Connection.serverInit(cfg_server);
+        var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+        const rnd = seededForTest(&csprng);
+        var buf1: [2048]u8 = undefined;
+        var buf2: [2048]u8 = undefined;
+        const ch = try client.startHandshake(rnd, 0, &buf1);
+        const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+        _ = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    }
+
+    // With the name the client actually dialed: rejected.
+    {
+        cfg_client.expected_peer_name = "dtls-test-server";
+        var client = try Connection.clientInit(cfg_client);
+        var server = try Connection.serverInit(cfg_server);
+        var csprng = std.Random.DefaultCsprng.init([_]u8{0x71} ** 32);
+        const rnd = seededForTest(&csprng);
+        var buf1: [2048]u8 = undefined;
+        var buf2: [2048]u8 = undefined;
+        const ch = try client.startHandshake(rnd, 0, &buf1);
+        const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+        try testing.expectError(error.CertificateRejected, client.handleFlight(flight2.out, rnd, 0, &buf1));
+    }
+
+    // And the genuine server, under the same name, still completes.
+    {
+        cfg_client.expected_peer_name = "dtls-test-server";
+        var client = try Connection.clientInit(cfg_client);
+        var server = try Connection.serverInit(.{
+            .role = .server,
+            .psk_identity = psk_identity,
+            .psk = psk,
+            .cipher_suites = &.{.aes_128_gcm_sha256},
+            .cert = .{
+                .chain = &.{&cert_kat.server_cert_der},
+                .private_key = serverEcdsaKeyPair(),
+            },
+        });
+        var csprng = std.Random.DefaultCsprng.init([_]u8{0x72} ** 32);
+        const rnd = seededForTest(&csprng);
+        var buf1: [2048]u8 = undefined;
+        var buf2: [2048]u8 = undefined;
+        const ch = try client.startHandshake(rnd, 0, &buf1);
+        const flight2 = try server.handleFlight(ch, rnd, 0, &buf2);
+        _ = try client.handleFlight(flight2.out, rnd, 0, &buf1);
+    }
 }
 
 test "cert-mode: require_peer_cert rejects a server that presents no certificate at all" {

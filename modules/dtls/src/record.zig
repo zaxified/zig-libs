@@ -105,9 +105,20 @@ pub fn encodeUnified(hdr: UnifiedHeader, out: []u8) RecordError![]u8 {
 
 pub const DecodedUnified = struct {
     hdr: UnifiedHeader,
-    /// Bytes of `buf` consumed by the header (start of the remaining
-    /// ciphertext, if `hdr.length` is `null` — otherwise the ciphertext is
-    /// exactly `hdr.length` bytes starting here).
+    /// Bytes of `buf` consumed by the header — where the ciphertext starts.
+    ///
+    /// ⚠ `hdr.length`, when present, is the peer's DECLARED body length and
+    /// is NOT reconciled against `buf` here: this decodes a header and is
+    /// called on header-only buffers (see this file's round-trip tests), so
+    /// it cannot require the body. **A caller slicing
+    /// `buf[consumed..][0..hdr.length]` must first check
+    /// `buf.len >= consumed + hdr.length`** — unchecked, the 4-byte datagram
+    /// `25 2A FF FF` yields `consumed = 4, length = 65535` and the slice runs
+    /// 64 KiB past the receive buffer, which in ReleaseFast is not a bounds
+    /// panic but heap fed to the AEAD, whose pass/fail is then an oracle on
+    /// it. Every caller in this module does check (`Connection.zig`'s
+    /// `recv`/`unprotectRecord`, `recordLen`); this note is here so the next
+    /// one does too.
     consumed: usize,
 };
 

@@ -356,6 +356,19 @@ pub fn decodeOfferedPsks(
         n_binders += 1;
     }
 
+    // ⭐ RFC 8446 §4.2.11 makes the two lists parallel — "each entry in the
+    // binders list is computed ... in the same order as the identities list"
+    // — and that correspondence is the ONLY thing that makes "select
+    // identity k, verify binder k" meaningful. Returning two independently
+    // sized slices without it invites indexing one by the other's index: a
+    // ClientHello offering 8 identities and 1 binder would then have a server
+    // that matched identity 7 read an uninitialized element of the caller's
+    // binder array and hand it to a constant-time compare. This module's own
+    // consumer only ever uses index 0, so nothing is reachable today — which
+    // is exactly why the shape has to be refused here, at the one place that
+    // sees both counts, rather than trusted to stay that way.
+    if (n_ids != n_binders) return error.Malformed;
+
     return .{
         .identities = identities_out[0..n_ids],
         .binders = binders_out[0..n_binders],

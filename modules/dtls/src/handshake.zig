@@ -158,6 +158,17 @@ pub const Reassembler = struct {
     total_len: ?u24 = null,
     message_seq: ?u16 = null,
     msg_type: u8 = 0,
+    /// How many distinct bytes of `buf` have arrived for the message in
+    /// progress. Maintained by `feed`, which counts only false→true
+    /// transitions, so a re-delivered fragment does not inflate it.
+    ///
+    /// Two jobs, both of which used to be done by walking `received`:
+    /// completion is `received_bytes == total` instead of an O(total) scan
+    /// per FRAGMENT (quadratic in fragment count — a peer fragmenting a
+    /// message one byte at a time made every datagram cost a full-buffer
+    /// walk), and "nothing is committed yet" is what lets a disagreeing
+    /// header re-latch instead of poisoning the slot (see `feed`).
+    received_bytes: usize = 0,
 
     pub fn init(buf: []u8, received: []bool) Reassembler {
         std.debug.assert(buf.len == received.len);
@@ -168,6 +179,7 @@ pub const Reassembler = struct {
     pub fn reset(self: *Reassembler) void {
         self.total_len = null;
         self.message_seq = null;
+        self.received_bytes = 0;
         @memset(self.received, false);
     }
 
@@ -187,40 +199,71 @@ pub const Reassembler = struct {
         if (fragment_body.len != hdr.fragment_length) return error.FragmentOutOfRange;
 
         if (self.message_seq == null or self.message_seq.? != hdr.message_seq) {
+            // ⭐ Validated BEFORE the latch, not after. This check used to sit
+            // below the assignments, so an unacceptable length STUCK: the slot
+            // kept it and only a different `message_seq` ever cleared it.
+            if (hdr.length > self.buf.len) return error.BufferTooSmall;
             self.reset();
             self.message_seq = hdr.message_seq;
             self.total_len = hdr.length;
             self.msg_type = hdr.msg_type;
-        } else if (self.total_len.? != hdr.length) {
-            return error.InconsistentLength;
-        } else if (self.msg_type != hdr.msg_type) {
-            return error.InconsistentMessageType;
+        } else if (self.total_len.? != hdr.length or self.msg_type != hdr.msg_type) {
+            // ⭐ Disagreement with a slot that holds NO bytes yet re-latches
+            // instead of failing forever.
+            //
+            // The attack this closes: one spoofed epoch-0 fragment — a
+            // ClientHello/ServerHello fragment is not yet protected, and
+            // `message_seq` is a small counter — carrying a bogus header and
+            // ZERO bytes. It latched the header, committed nothing, and every
+            // genuine fragment of the real message afterwards, INCLUDING
+            // every retransmission of it, was answered `InconsistentLength`.
+            // One datagram wedged the message permanently, defeating the
+            // retransmission machinery that exists to survive exactly that.
+            //
+            // With nothing committed there is no reason to believe the
+            // earlier header over this one. Once a single byte IS in, a
+            // contradicting header is a genuine conflict and still fails.
+            if (self.received_bytes != 0) {
+                return if (self.total_len.? != hdr.length)
+                    error.InconsistentLength
+                else
+                    error.InconsistentMessageType;
+            }
+            if (hdr.length > self.buf.len) return error.BufferTooSmall;
+            self.total_len = hdr.length;
+            self.msg_type = hdr.msg_type;
         }
 
         const total: usize = self.total_len.?;
-        if (total > self.buf.len) return error.BufferTooSmall;
 
         const end = @as(usize, hdr.fragment_offset) + @as(usize, hdr.fragment_length);
         if (end > total) return error.FragmentOutOfRange;
 
         // Overlap check BEFORE any write, so a rejected fragment leaves the
         // in-progress message exactly as it was — a partial copy followed by
-        // an error would be the "last writer wins" hole this rejects.
+        // an error would be the "last writer wins" hole this rejects. The
+        // same pass counts the bytes this fragment actually adds (false→true
+        // only), which is what keeps `received_bytes` honest under the
+        // re-delivery this loop exists to tolerate.
+        var new_bytes: usize = 0;
         for (self.received[hdr.fragment_offset..][0..fragment_body.len], fragment_body, 0..) |already, b, i| {
-            if (already and self.buf[@as(usize, hdr.fragment_offset) + i] != b)
-                return error.OverlappingFragment;
+            if (already) {
+                if (self.buf[@as(usize, hdr.fragment_offset) + i] != b)
+                    return error.OverlappingFragment;
+            } else new_bytes += 1;
         }
 
         if (fragment_body.len > 0) {
             @memcpy(self.buf[hdr.fragment_offset..][0..fragment_body.len], fragment_body);
             @memset(self.received[hdr.fragment_offset..][0..fragment_body.len], true);
+            self.received_bytes += new_bytes;
         }
 
         if (total == 0) return self.buf[0..0];
 
-        for (self.received[0..total]) |r| {
-            if (!r) return null;
-        }
+        // O(1): the scan this replaced ran over the whole message on every
+        // fragment (see `received_bytes`).
+        if (self.received_bytes != total) return null;
         return self.buf[0..total];
     }
 };
@@ -347,6 +390,62 @@ test "reassembler: inconsistent length is a typed error" {
 
     const hdr_b = HandshakeHeader{ .msg_type = 1, .length = 12, .message_seq = 0, .fragment_offset = 4, .fragment_length = 4 };
     try testing.expectError(error.InconsistentLength, reasm.feed(hdr_b, "BBBB"));
+}
+
+test "reassembler: a spoofed header cannot wedge a message_seq" {
+    // ⭐ The DoS this shape closes. An off-path attacker who can spoof one
+    // epoch-0 datagram (ClientHello/ServerHello fragments are not yet
+    // protected, and `message_seq` is a small counter) sends a fragment that
+    // declares a huge length and carries nothing. The genuine message — and
+    // every RETRANSMISSION of it, which is how DTLS survives a hostile
+    // network — must still reassemble; before the fix each one answered
+    // `InconsistentLength` forever, because the bogus length had been latched
+    // and only a NEW message_seq ever cleared it.
+    var buf: [16]u8 = undefined;
+    var received: [16]bool = undefined;
+    var reasm = Reassembler.init(&buf, &received);
+
+    // Over-long: refused without touching the slot, so the slot is still
+    // free for the real message below (before the fix it was latched first
+    // and the rejection came after).
+    const poison_big = HandshakeHeader{ .msg_type = 1, .length = 0xFFFFFF, .message_seq = 0, .fragment_offset = 0, .fragment_length = 0 };
+    try testing.expectError(error.BufferTooSmall, reasm.feed(poison_big, ""));
+    try testing.expectEqual(@as(?u16, null), reasm.message_seq);
+
+    // Plausible but wrong, and committing no bytes: it may latch, but it must
+    // not outrank the real message.
+    const poison_fit = HandshakeHeader{ .msg_type = 9, .length = 12, .message_seq = 0, .fragment_offset = 0, .fragment_length = 0 };
+    try testing.expectEqual(@as(?[]const u8, null), try reasm.feed(poison_fit, ""));
+
+    const real_a = HandshakeHeader{ .msg_type = 1, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 4 };
+    const real_b = HandshakeHeader{ .msg_type = 1, .length = 8, .message_seq = 0, .fragment_offset = 4, .fragment_length = 4 };
+    try testing.expectEqual(@as(?[]const u8, null), try reasm.feed(real_a, "AAAA"));
+    try testing.expectEqualStrings("AAAABBBB", (try reasm.feed(real_b, "BBBB")).?);
+
+    // And once real bytes ARE in, a contradicting header is still a conflict.
+    var reasm2 = Reassembler.init(&buf, &received);
+    _ = try reasm2.feed(real_a, "AAAA");
+    try testing.expectError(error.InconsistentLength, reasm2.feed(poison_fit, ""));
+}
+
+test "reassembler: re-delivered fragments do not inflate the byte count" {
+    // `received_bytes` drives completion now, so double-counting a
+    // retransmitted fragment would report a message complete while holding
+    // holes — the buffer would be handed on with uninitialized bytes in it.
+    var buf: [8]u8 = undefined;
+    var received: [8]bool = undefined;
+    var reasm = Reassembler.init(&buf, &received);
+
+    const first = HandshakeHeader{ .msg_type = 1, .length = 8, .message_seq = 0, .fragment_offset = 0, .fragment_length = 4 };
+    try testing.expectEqual(@as(?[]const u8, null), try reasm.feed(first, "AAAA"));
+    try testing.expectEqual(@as(?[]const u8, null), try reasm.feed(first, "AAAA"));
+    try testing.expectEqual(@as(?[]const u8, null), try reasm.feed(first, "AAAA"));
+    try testing.expectEqual(@as(usize, 4), reasm.received_bytes);
+
+    // Partially overlapping re-delivery counts only what is new.
+    const overlap = HandshakeHeader{ .msg_type = 1, .length = 8, .message_seq = 0, .fragment_offset = 2, .fragment_length = 4 };
+    try testing.expectEqual(@as(?[]const u8, null), try reasm.feed(overlap, "AABB"));
+    try testing.expectEqual(@as(usize, 6), reasm.received_bytes);
 }
 
 test "reassembler: fragment out of range is a typed error" {
