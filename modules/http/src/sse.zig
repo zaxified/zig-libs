@@ -67,6 +67,71 @@ pub const StartError = Server.ResponseWriter.SetHeaderError;
 /// Errors from sending an event: a bad field or a transport write failure.
 pub const SendError = FieldError || Writer.Error;
 
+/// Format one event into `w` — the wire bytes only, no flush. Field order:
+/// `event`, `id`, `retry`, then `data` line(s), then the terminating blank
+/// line. This is the transport-agnostic half of `EventStream.send`: an h2
+/// server pushing events on a detached stream formats into its own buffer
+/// with this and frames the bytes itself.
+pub fn writeEvent(w: *Writer, ev: Event) SendError!void {
+    // Validate the single-line fields before writing anything, so a bad
+    // event never leaves a half-written frame on the wire.
+    if (ev.event) |name| {
+        if (std.mem.indexOfAny(u8, name, "\r\n") != null) return error.InvalidField;
+    }
+    if (ev.id) |id| {
+        if (std.mem.indexOfAny(u8, id, "\r\n\x00") != null) return error.InvalidField;
+    }
+
+    if (ev.event) |name| {
+        try w.writeAll("event: ");
+        try w.writeAll(name);
+        try w.writeByte('\n');
+    }
+    if (ev.id) |id| {
+        try w.writeAll("id: ");
+        try w.writeAll(id);
+        try w.writeByte('\n');
+    }
+    if (ev.retry) |ms| try w.print("retry: {d}\n", .{ms});
+
+    // Data lines (WHATWG §9.2.6): cut at each '\n' or '\r' (a '\r'
+    // followed by '\n' counts as one break) and emit one data: line per
+    // segment — including a trailing empty segment when the data ends
+    // with a newline, and exactly one "data:\n" for empty data.
+    var rest = ev.data;
+    while (true) {
+        if (std.mem.indexOfAny(u8, rest, "\r\n")) |i| {
+            try writeDataLine(w, rest[0..i]);
+            var next = i + 1;
+            if (rest[i] == '\r' and next < rest.len and rest[next] == '\n') next += 1;
+            rest = rest[next..];
+        } else {
+            try writeDataLine(w, rest);
+            break;
+        }
+    }
+
+    try w.writeByte('\n'); // blank line dispatches the event
+}
+
+fn writeDataLine(w: *Writer, line: []const u8) Writer.Error!void {
+    if (line.len == 0) return w.writeAll("data:\n");
+    try w.writeAll("data: ");
+    try w.writeAll(line);
+    try w.writeByte('\n');
+}
+
+/// Format an SSE comment line (`: text\n\n`) into `w` — a heartbeat that
+/// keeps the connection and intermediaries alive without dispatching a
+/// client event. `text` must not contain CR or LF. No flush; the
+/// transport-agnostic half of `EventStream.comment`.
+pub fn writeComment(w: *Writer, text: []const u8) SendError!void {
+    if (std.mem.indexOfAny(u8, text, "\r\n") != null) return error.InvalidField;
+    try w.writeAll(": ");
+    try w.writeAll(text);
+    try w.writeAll("\n\n");
+}
+
 /// A live `text/event-stream` response. Create with `start`; the underlying
 /// `ResponseWriter` must outlive it (it is borrowed).
 pub const EventStream = struct {
@@ -86,57 +151,10 @@ pub const EventStream = struct {
         return .{ .rw = rw };
     }
 
-    /// Format one event and flush it to the socket. Field order: `event`,
-    /// `id`, `retry`, then `data` line(s), then the terminating blank line.
+    /// Format one event and flush it to the socket.
     pub fn send(es: *EventStream, ev: Event) SendError!void {
-        // Validate the single-line fields before writing anything, so a bad
-        // event never leaves a half-written frame on the wire.
-        if (ev.event) |name| {
-            if (std.mem.indexOfAny(u8, name, "\r\n") != null) return error.InvalidField;
-        }
-        if (ev.id) |id| {
-            if (std.mem.indexOfAny(u8, id, "\r\n\x00") != null) return error.InvalidField;
-        }
-
-        const w = es.rw.writer();
-        if (ev.event) |name| {
-            try w.writeAll("event: ");
-            try w.writeAll(name);
-            try w.writeByte('\n');
-        }
-        if (ev.id) |id| {
-            try w.writeAll("id: ");
-            try w.writeAll(id);
-            try w.writeByte('\n');
-        }
-        if (ev.retry) |ms| try w.print("retry: {d}\n", .{ms});
-
-        // Data lines (WHATWG §9.2.6): cut at each '\n' or '\r' (a '\r'
-        // followed by '\n' counts as one break) and emit one data: line per
-        // segment — including a trailing empty segment when the data ends
-        // with a newline, and exactly one "data:\n" for empty data.
-        var rest = ev.data;
-        while (true) {
-            if (std.mem.indexOfAny(u8, rest, "\r\n")) |i| {
-                try writeDataLine(w, rest[0..i]);
-                var next = i + 1;
-                if (rest[i] == '\r' and next < rest.len and rest[next] == '\n') next += 1;
-                rest = rest[next..];
-            } else {
-                try writeDataLine(w, rest);
-                break;
-            }
-        }
-
-        try w.writeByte('\n'); // blank line dispatches the event
+        try writeEvent(es.rw.writer(), ev);
         try es.rw.flush();
-    }
-
-    fn writeDataLine(w: *Writer, line: []const u8) Writer.Error!void {
-        if (line.len == 0) return w.writeAll("data:\n");
-        try w.writeAll("data: ");
-        try w.writeAll(line);
-        try w.writeByte('\n');
     }
 
     /// Convenience: a default-type ("message") event carrying `payload`.
@@ -144,15 +162,9 @@ pub const EventStream = struct {
         return es.send(.{ .data = payload });
     }
 
-    /// Write an SSE comment line (`: text\n\n`) and flush — a heartbeat that
-    /// keeps the connection and intermediaries alive without dispatching a
-    /// client event. `text` must not contain CR or LF.
+    /// Write an SSE comment line and flush — see `writeComment`.
     pub fn comment(es: *EventStream, text: []const u8) SendError!void {
-        if (std.mem.indexOfAny(u8, text, "\r\n") != null) return error.InvalidField;
-        const w = es.rw.writer();
-        try w.writeAll(": ");
-        try w.writeAll(text);
-        try w.writeAll("\n\n");
+        try writeComment(es.rw.writer(), text);
         try es.rw.flush();
     }
 };

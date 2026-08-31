@@ -245,6 +245,113 @@ pub const Options = struct {
     /// sequential behavior, byte-for-byte — the locking below is compiled
     /// in but never taken. See the module doc's "Concurrent handlers".
     dispatcher: ?Dispatcher = null,
+    /// Detached-stream idle hook (single-task mode only; see
+    /// `ResponseWriter.detach` and `Detached`). Called by the serve loop
+    /// right before it would block reading the connection, whenever at least
+    /// one detached stream is live (or a detached stream's reset is waiting
+    /// to be reported). The embedder owns the wait: push bytes through the
+    /// `Detached` handle, `Detached.flush`, and return `.proceed` once the
+    /// socket is (or may be) readable — the loop then does its blocking
+    /// read exactly as always. Return `.close` to end the connection with a
+    /// graceful GOAWAY. Without a hook, detached streams still work but new
+    /// bytes for them can only be pushed from inside other streams'
+    /// handlers, which is almost never what a detaching embedder wants.
+    on_detached_idle: ?*const fn (?*anyopaque, Detached) IdleVerdict = null,
+    /// Passed to `on_detached_idle`. Separate from `context`, which belongs
+    /// to the handler.
+    on_detached_idle_ctx: ?*anyopaque = null,
+};
+
+/// What `Options.on_detached_idle` tells the serve loop to do next.
+pub const IdleVerdict = enum { proceed, close };
+
+/// The embedder's handle over one connection's detached streams, valid only
+/// inside `Options.on_detached_idle` (single-task mode: nothing else runs on
+/// the connection while the hook does).
+///
+/// The push model is deliberately all-or-nothing and never queues: an event
+/// that does not fit the stream's send window right now answers
+/// `error.WouldBlock` and stages nothing, so backpressure lives with the
+/// embedder's own event source rather than growing a buffer here. Credit
+/// arrives as WINDOW_UPDATE frames — which is bytes on the socket, which is
+/// exactly the "return `.proceed` and let the loop read" case.
+pub const Detached = struct {
+    s: *Session,
+
+    pub const PushError = error{ WouldBlock, StreamGone, Overloaded };
+
+    /// Live detached stream count.
+    pub fn count(d: Detached) usize {
+        return d.s.detached.items.len;
+    }
+
+    /// One stream the peer reset since the last call, or null. Drain this
+    /// each hook invocation: a reset detached stream is already gone from
+    /// `count` and can take no more pushes.
+    pub fn takeClosed(d: Detached) ?u31 {
+        return d.s.detached_closed.pop();
+    }
+
+    /// How many DATA octets `push` could send on `id` right now: the
+    /// smaller of the connection and stream send windows, zero when the
+    /// stream is gone.
+    pub fn writable(d: Detached, id: u31) usize {
+        const st = d.s.conn.stream(id) orelse return 0;
+        switch (st.state) {
+            .open, .half_closed_remote => {},
+            else => return 0,
+        }
+        const win = @min(d.s.conn.conn_send_window, st.send_window);
+        return if (win > 0) @intCast(win) else 0;
+    }
+
+    /// Stage `bytes` as DATA on detached stream `id` — all of it or none of
+    /// it (`error.WouldBlock`). Staged, not flushed: call `flush` once the
+    /// round of pushes is done. `error.StreamGone` means the stream is dead;
+    /// call `close(id)` to retire it.
+    pub fn push(d: Detached, id: u31, bytes: []const u8) PushError!void {
+        const s = d.s;
+        if (d.writable(id) < bytes.len) {
+            if (s.conn.stream(id) == null) return error.StreamGone;
+            return error.WouldBlock;
+        }
+        s.conn.sendData(&s.wire, id, bytes, false) catch |err| switch (err) {
+            error.OutOfMemory => return error.Overloaded,
+            error.WindowExhausted => return error.WouldBlock,
+            else => return error.StreamGone,
+        };
+        s.stageWire() catch return error.Overloaded;
+    }
+
+    /// End detached stream `id` gracefully (an empty DATA frame carrying
+    /// END_STREAM) and forget it. Safe on a stream that is already dead —
+    /// the frame is simply not sent — so this is also the cleanup call
+    /// after `error.StreamGone`.
+    pub fn close(d: Detached, id: u31) void {
+        const s = d.s;
+        blk: {
+            const st = s.conn.stream(id) orelse break :blk;
+            switch (st.state) {
+                .open, .half_closed_remote => {},
+                else => break :blk,
+            }
+            s.conn.sendData(&s.wire, id, "", true) catch break :blk;
+            s.stageWire() catch {};
+        }
+        for (s.detached.items, 0..) |sid, i| {
+            if (sid == id) {
+                _ = s.detached.swapRemove(i);
+                break;
+            }
+        }
+    }
+
+    /// Put everything staged on the wire. Call before parking on the
+    /// socket: the peer never learns of bytes sitting in the staging
+    /// buffer.
+    pub fn flush(d: Detached) error{Closed}!void {
+        d.s.flushWire() catch return error.Closed;
+    }
 };
 
 /// One unit of handler work, shaped exactly like `workerpool.Job` so a
@@ -520,6 +627,13 @@ const Session = struct {
     jobs: std.AutoArrayHashMapUnmanaged(u31, Job) = .empty,
     req_index: u32 = 0,
     peer_goaway: bool = false,
+    /// Streams a handler detached (`ResponseWriter.detach`): response open,
+    /// request state already freed, DATA pushed through `Detached` between
+    /// pumps. Single-task mode only; the dispatcher path never fills it.
+    detached: std.ArrayList(u31) = .empty,
+    /// Detached streams the peer has reset, waiting for the embedder to
+    /// collect them (`Detached.takeClosed`).
+    detached_closed: std.ArrayList(u31) = .empty,
 
     // ── concurrency (all four are inert without `Options.dispatcher`) ────
 
@@ -593,6 +707,8 @@ const Session = struct {
         s.jobs.deinit(s.gpa);
         s.events.deinit(s.gpa); // always drained by processEvents
         s.wire.deinit(s.gpa);
+        s.detached.deinit(s.gpa);
+        s.detached_closed.deinit(s.gpa);
         s.conn.deinit();
     }
 
@@ -655,9 +771,29 @@ const Session = struct {
                 s.flushWire() catch {};
             }
             // Graceful shutdown: the peer said GOAWAY and nothing is left.
-            const drained = s.peer_goaway and s.jobs.count() == 0;
+            // A GOAWAY forbids NEW streams; a live detached stream is an
+            // existing one and keeps the connection open (§6.8).
+            const drained = s.peer_goaway and s.jobs.count() == 0 and
+                s.detached.items.len == 0;
             s.unlock();
             if (over_total or drained) return;
+            // The embedder's turn, before the loop blocks on the peer: with
+            // detached streams live (or their resets unreported) the next
+            // bytes may have to ORIGINATE here rather than answer anything.
+            if (!s.threaded and
+                s.detached.items.len + s.detached_closed.items.len != 0)
+            {
+                if (s.opts.on_detached_idle) |hook| {
+                    switch (hook(s.opts.on_detached_idle_ctx, .{ .s = s })) {
+                        .proceed => {},
+                        .close => {
+                            s.conn.sendGoaway(&s.wire, .no_error, "") catch {};
+                            s.flushWire() catch {};
+                            return;
+                        },
+                    }
+                }
+            }
             s.pump() catch return;
         }
     }
@@ -861,7 +997,10 @@ const Session = struct {
         for (s.events.items) |*ev| switch (ev.*) {
             .headers => |*hd| s.onHeaders(hd),
             .data => |d| s.onData(d),
-            .stream_reset => |r| s.dropJob(r.stream_id),
+            .stream_reset => |r| {
+                s.dropJob(r.stream_id);
+                s.detachedReset(r.stream_id);
+            },
             .goaway => s.peer_goaway = true,
             // SETTINGS/PING are acknowledged by the layer; WINDOW_UPDATE
             // already raised the send windows; PRIORITY is advisory.
@@ -1061,6 +1200,46 @@ const Session = struct {
             }
         }
         s.removeJob(id);
+    }
+
+    /// A peer reset landed on a detached stream: retire it and queue the id
+    /// for the embedder (`Detached.takeClosed`). No-op for everything else.
+    fn detachedReset(s: *Session, id: u31) void {
+        for (s.detached.items, 0..) |sid, i| {
+            if (sid != id) continue;
+            _ = s.detached.swapRemove(i);
+            // Report best-effort: if the append fails the embedder still
+            // finds out at its next push (`error.StreamGone`).
+            s.detached_closed.append(s.gpa, id) catch {};
+            return;
+        }
+    }
+
+    /// Take stream `id` out of the request lifecycle with its response left
+    /// open — the second half of `ResponseWriter.detach`. Returns false when
+    /// the stream cannot be detached (request not fully arrived, response
+    /// head never flushed, stream already dead), in which case the caller
+    /// finishes the response normally.
+    fn detachJob(s: *Session, f: *Framer, rw: *Server.ResponseWriter, id: u31) bool {
+        // Only a fully-arrived request can leave its stream open: h2 has no
+        // half-close of the peer's sending direction short of RST_STREAM,
+        // which would kill the response with it.
+        {
+            const job = s.jobs.getPtr(id) orelse return false;
+            if (!job.complete or job.rst) return false;
+        }
+        // Everything the handler wrote — head included — must reach the
+        // wire now: nothing may stay held for an END_STREAM that is not
+        // coming, and the framer's memory dies with `serveJob`'s frame.
+        rw.flush() catch return false;
+        if (f.dead) return false;
+        // A response that never produced a byte never produced a head
+        // either; there is nothing on the wire to keep open.
+        if (!f.headers_sent) return false;
+        s.detached.append(s.gpa, id) catch return false;
+        if (s.jobs.getPtr(id)) |job| job.dispatched = false;
+        s.removeJob(id);
+        return true;
     }
 
     /// **Invariant 4, enforced rather than assumed.** `serveJob` keeps
@@ -1318,6 +1497,7 @@ const Session = struct {
             .context = s.opts.context,
             .peer = s.opts.peer,
             .conn_request_index = req_index,
+            .stream_id = id,
         };
 
         // ── run the handler against the stock ResponseWriter ────────────
@@ -1352,6 +1532,14 @@ const Session = struct {
         s.opts.handler(&req, &rw) catch {
             failed = true;
         };
+        // A detach intercepts BEFORE `rw.end`, which would terminate the
+        // response the handler is asking to keep open. Single-task mode
+        // only: on the dispatcher path the connection task cannot push for
+        // a worker's stream, so the flag is ignored and the response ends
+        // normally — as `ResponseWriter.detach` documents.
+        if (!failed and rw.detached and !s.threaded) {
+            if (s.detachJob(&framer, &rw, id)) return .keep;
+        }
         if (!failed) rw.end() catch {
             failed = true; // e.g. body ≠ declared Content-Length
         };
@@ -3288,6 +3476,197 @@ fn bindOrSkip(server: *Server) !void {
         std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
         return error.SkipZigTest;
     };
+}
+
+test "detach: the handler returns, the hook pushes and ends the stream cleanly" {
+    const gpa = testing.allocator;
+    const T = struct {
+        var sid_g: ?u32 = null;
+        var hook_calls: u32 = 0;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            sid_g = req.stream_id;
+            rw.setStatus(200);
+            try rw.setHeader("Content-Type", "text/event-stream");
+            try rw.writer().writeAll("retry: 1000\n\n");
+            try rw.flush();
+            rw.detach();
+        }
+
+        fn idle(_: ?*anyopaque, d: Detached) IdleVerdict {
+            hook_calls += 1;
+            const id: u31 = @intCast(sid_g.?);
+            d.push(id, "data: 1\n\n") catch unreachable;
+            d.push(id, "data: 2\n\n") catch unreachable;
+            d.close(id);
+            d.flush() catch {};
+            return .proceed;
+        }
+    };
+    T.sid_g = null;
+    T.hook_calls = 0;
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/sse"), true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = T.handler,
+        .on_detached_idle = T.idle,
+    }, &out_buf);
+
+    // The handler's flush reached the wire before it returned; the hook's
+    // pushes followed on the SAME stream, and `close` ended it with a clean
+    // END_STREAM rather than a reset.
+    try testing.expectEqual(@as(?u32, sid), T.sid_g);
+    try testing.expectEqual(@as(u32, 1), T.hook_calls);
+    const r = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), r.status);
+    try testing.expectEqualStrings("text/event-stream", r.header("content-type").?);
+    try testing.expectEqualStrings("retry: 1000\n\ndata: 1\n\ndata: 2\n\n", r.body.items);
+    try testing.expect(r.end);
+    try testing.expect(r.data_end_stream);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), r.rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "detach: an exhausted stream window answers WouldBlock, never queues" {
+    const gpa = testing.allocator;
+    const T = struct {
+        var sid_g: ?u32 = null;
+        var would_block: bool = false;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            sid_g = req.stream_id;
+            rw.setStatus(200);
+            // Exactly the client's whole 13-octet stream window, so the
+            // hook finds it at zero.
+            try rw.writer().writeAll("retry: 1000\n\n");
+            try rw.flush();
+            rw.detach();
+        }
+
+        fn idle(_: ?*anyopaque, d: Detached) IdleVerdict {
+            const id: u31 = @intCast(sid_g.?);
+            // The hook cannot return an error, so the window observation is
+            // folded into the flag the test asserts on.
+            if (d.writable(id) != 0) return .close;
+            d.push(id, "data: x\n\n") catch |err| {
+                would_block = err == error.WouldBlock;
+            };
+            // END_STREAM on an empty DATA frame needs no window credit.
+            d.close(id);
+            d.flush() catch {};
+            return .proceed;
+        }
+    };
+    T.sid_g = null;
+    T.would_block = false;
+
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = 13 });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/sse"), true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = T.handler,
+        .on_detached_idle = T.idle,
+    }, &out_buf);
+
+    try testing.expect(T.would_block);
+    const r = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), r.status);
+    try testing.expectEqualStrings("retry: 1000\n\n", r.body.items);
+    try testing.expect(r.end); // the close still landed
+}
+
+test "detach integration: a peer reset is reported through takeClosed" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const T = struct {
+        var sid_g: ?u32 = null;
+        var closed_seen: ?u31 = null;
+
+        fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+            sid_g = req.stream_id;
+            rw.setStatus(200);
+            try rw.writer().writeAll("retry: 1000\n\n");
+            try rw.flush();
+            rw.detach();
+        }
+
+        fn idle(_: ?*anyopaque, d: Detached) IdleVerdict {
+            if (d.takeClosed()) |id| {
+                closed_seen = id;
+                return .close; // nothing left to serve: end the connection
+            }
+            // Nothing to push: hand the loop back to the socket and wait
+            // for the peer (this test: for its RST_STREAM).
+            return .proceed;
+        }
+
+        fn serveConn(server: *std.Io.net.Server, sio: std.Io) void {
+            const stream = server.accept(sio) catch return;
+            defer stream.close(sio);
+            var rbuf: [8192]u8 = undefined;
+            var wbuf: [8192]u8 = undefined;
+            var sr = stream.reader(sio, &rbuf);
+            var sw = stream.writer(sio, &wbuf);
+            serveStream(testing.allocator, &sr.interface, &sw.interface, null, .{
+                .handler = handler,
+                .on_detached_idle = idle,
+            });
+        }
+    };
+    T.sid_g = null;
+    T.closed_seen = null;
+
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+    var listener = addr.listen(io, .{ .mode = .stream, .reuse_address = true }) catch |err| {
+        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const thread = try std.Thread.spawn(.{}, T.serveConn, .{ &listener, io });
+    defer thread.join();
+
+    const stream = listener.socket.address.connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/sse"), true);
+    try peer.sendWire(&sw.interface);
+
+    // Wait for the detached response's first bytes, so the reset lands on a
+    // stream the server has already detached.
+    while (peer.resps.getPtr(sid) == null or peer.resp(sid).body.items.len == 0) {
+        try peer.pumpSocket(&sr.interface);
+    }
+    try peer.conn.sendRstStream(&peer.wire, sid, .cancel);
+    try peer.sendWire(&sw.interface);
+
+    // The server notices the reset, reports it to the hook, and the hook's
+    // `.close` verdict ends the connection with a graceful GOAWAY.
+    while (peer.goaway == null) {
+        peer.pumpSocket(&sr.interface) catch break; // EOF after GOAWAY is fine
+    }
+    try testing.expectEqual(@as(?h2.ErrorCode, .no_error), peer.goaway);
+    try testing.expectEqual(@as(?u31, @intCast(sid)), T.closed_seen);
 }
 
 test "h2c integration: the same handler serves HTTP/1.1 and HTTP/2 over loopback" {

@@ -1750,6 +1750,10 @@ pub const Request = struct {
     peer: ?net.IpAddress = null,
     /// 0-based request ordinal on this connection — see `connRequestIndex`.
     conn_request_index: u32 = 0,
+    /// HTTP/2 only: the request's stream id, so a handler that detaches its
+    /// response (`ResponseWriter.detach`) can name the stream to
+    /// `h2_server.Detached.push` later. Null on HTTP/1.1.
+    stream_id: ?u32 = null,
 
     /// The socket peer address (the direct client — meaningful as a client
     /// identity only when no trusted proxy sits in front; `ratelimit` /
@@ -2130,6 +2134,8 @@ pub const ResponseWriter = struct {
     sent_head: bool = false,
     ended: bool = false,
     failed: bool = false,
+    /// See `detach`. Only the single-task h2 serve loop reads it.
+    detached: bool = false,
     body: BodySink = .buffering,
     interface: Writer,
 
@@ -2592,6 +2598,17 @@ pub const ResponseWriter = struct {
     /// True once the response head is on the wire.
     pub fn headSent(rw: *const ResponseWriter) bool {
         return rw.sent_head;
+    }
+
+    /// HTTP/2 only: hand the stream back to the connection with the response
+    /// left OPEN — no END_STREAM — so the embedder can keep pushing bytes on
+    /// it after the handler returns (`h2_server.Detached`). The single-task
+    /// h2 serve loop honors it for a request that has fully arrived; every
+    /// other serving path (HTTP/1.1, the h2 dispatcher path) ignores the
+    /// flag and finishes the response normally, because there the handler's
+    /// return IS the end of the response's lifetime.
+    pub fn detach(rw: *ResponseWriter) void {
+        rw.detached = true;
     }
 
     /// Whether the connection must close after this response (explicit
