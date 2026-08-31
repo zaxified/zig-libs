@@ -260,6 +260,39 @@ pub fn branchViewSafe(page: *const [page_size]u8) ?Branch {
     return Branch.init(page);
 }
 
+/// The leaf dual of `branchViewSafe`, and required for the same reason: a leaf
+/// page reached from a stale/torn/corrupt meta candidate is untrusted bytes.
+///
+/// Recovery used to accept a leaf on its KIND BYTE ALONE, on the strength of
+/// the sentence above ("their pages come from a validated committed tree") —
+/// but nothing validated leaves, so the premise was false and the tree walk's
+/// documented promise to trust nothing held for branches only. A leaf whose
+/// `count` field is `0xFFFF` was adopted by `recover` and then sent
+/// `binarySearch` off the end of the caller's 4 KiB page buffer on the first
+/// probe; `valAt`'s length is a **u32**, so a cell could also name a 4 GiB
+/// value inside a 4 KiB page. Node pages carry no CRC (only meta pages do), so
+/// a single corrupted length byte on media is enough — squarely inside this
+/// module's stated "I/O faults" threat model.
+///
+/// A leaf cell is `(key_len: u16, val_len: u32, key, val)`, so the check is
+/// `branchViewSafe`'s plus the value bytes. Lengths are widened to `usize`
+/// before they are added, so the bound cannot be defeated by wrapping.
+pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
+    if (page[0] != @intFromEnum(NodeKind.leaf)) return null;
+    const count: usize = nodeCount(page);
+    const dir_end = hdr_len + count * slot_len;
+    if (dir_end > page_size) return null;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const o = slotOffset(page, i);
+        if (o < dir_end or o + 6 > page_size) return null;
+        const klen = std.mem.readInt(u16, page[o .. o + 2][0..2], .little);
+        const vlen = std.mem.readInt(u32, page[o + 2 .. o + 6][0..4], .little);
+        if (o + 6 + @as(usize, klen) + @as(usize, vlen) > page_size) return null;
+    }
+    return Leaf.init(page);
+}
+
 /// Generic ascending binary search over a leaf's/branch's key directory.
 fn binarySearch(comptime V: type, view: V, key: []const u8) Search {
     var lo: usize = 0;

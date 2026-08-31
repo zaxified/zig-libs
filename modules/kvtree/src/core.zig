@@ -45,9 +45,29 @@ pub const Change = union(enum) {
 };
 
 pub const CommitError = error{
-    /// A storage side effect (write / fsync / …) failed mid-commit. A correct
-    /// `commit` guarantees this leaves the LAST committed meta intact and
-    /// adoptable — the new state atomically did-not-happen.
+    /// A storage side effect (write / fsync / …) failed mid-commit. The store
+    /// is left with a committed version that `recover` will adopt — never a
+    /// torn tree. Which version, though, depends on where the failure landed,
+    /// and the difference matters to the caller:
+    ///
+    ///   - Failure at or before fsync #1, or a partial meta write: the new
+    ///     state did not happen. The last committed meta is still the newest
+    ///     valid one, and the new pages are unreachable garbage.
+    ///   - Failure at fsync #2, *after* the meta page itself reached the file:
+    ///     the new meta is durable, CRC-valid and carries the higher `txn_id`,
+    ///     so the next `recover` adopts it — this is exactly the
+    ///     "unacknowledged but durable" commit that `recover` documents as a
+    ///     legal recovery target. It is unacknowledged, not undone.
+    ///
+    /// So this error means "the outcome is INDETERMINATE", not "nothing
+    /// happened" — the two cases are indistinguishable from here (a failing
+    /// fsync does not say whether the page it was flushing had already been
+    /// written back). The caller MUST NOT retry on the same `Db`: its
+    /// in-memory `meta_rec` still names the old base, so a retry would build
+    /// on a version the file may no longer consider newest, and hand out page
+    /// ids the durable newer meta already references. Close and reopen, let
+    /// `recover` establish which version actually survived, and redo the work
+    /// from there.
     CommitFailed,
     EntryTooLarge,
     OutOfMemory,
@@ -458,7 +478,14 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
             else => return error.Storage,
         };
         switch (buf[0]) {
-            @intFromEnum(format.NodeKind.leaf) => {}, // nothing below a leaf
+            // Nothing below a leaf — but the leaf's OWN geometry still has to
+            // be checked here. Accepting it on the kind byte alone (what this
+            // walk used to do) let a corrupt `count`/`val_len` through to the
+            // read path, which indexes the page with no bounds check of its
+            // own. See `format.leafViewSafe`.
+            @intFromEnum(format.NodeKind.leaf) => {
+                if (format.leafViewSafe(&buf) == null) return false;
+            },
             @intFromEnum(format.NodeKind.branch) => {
                 const br = format.branchViewSafe(&buf) orelse return false;
                 if (!pageIdOk(br.leftmost(), m.high_water)) return false;
@@ -600,6 +627,114 @@ fn fuzzRecover(_: void, smith: *std.testing.Smith) !void {
     while (id < num_pages) : (id += 1) {
         var page: [page_size]u8 = undefined;
         @memcpy(&page, raw[id * page_size .. (id + 1) * page_size]);
+        // A meta slot of purely random bytes is REJECTED by `Meta.decode`:
+        // it gates on magic, format_version, page_size and a CRC32, four
+        // independent 32-bit equalities, so random bytes get past it with
+        // probability ~2^-128 (measured: 0 hits in 200,000 draws). Left that
+        // way, this fuzzer would only ever exercise the structural reject
+        // path, and `candidateValid` — the tree walk and the freelist-chain
+        // walk, i.e. the deeper half of what the header above says is under
+        // test — would be unreachable. So re-stamp each meta slot as a
+        // STRUCTURALLY valid record whose SEMANTIC fields stay fuzzed: the
+        // walk then runs against hostile root / free_root / free_count /
+        // high_water. One slot in four is left random to keep covering the
+        // reject path and the "both slots invalid" branch.
+        //
+        // The sense of the test matters: an un-fuzzed run (plain
+        // `zig build test-kvtree`, no `--fuzz`) drives the body ONCE with an
+        // all-zero smith, so the zero draw must be the one that stamps a
+        // valid meta. Written as `!= 0` it would do the opposite and the
+        // gate would exercise nothing but the reject path again. The reject
+        // path is separately and deterministically covered by `format.zig`'s
+        // "meta rejects foreign / wrong-version pages" and CRC tests.
+        if (id < 2 and smith.valueRangeAtMost(u8, 0, 3) != 3) {
+            const m: Meta = .{
+                .txn_id = smith.value(u64),
+                // Mostly in range, so the walk actually descends; sometimes
+                // just past the end, so the bounds rejection is covered too.
+                .root = smith.valueRangeAtMost(u32, 0, num_pages + 1),
+                .free_root = smith.valueRangeAtMost(u32, 0, num_pages + 1),
+                // Small often enough that `total == free_count` can actually
+                // hold and a candidate can be ADOPTED — a fuzzer that only
+                // ever reaches "reject" never exercises the accept path.
+                .free_count = if (smith.valueRangeAtMost(u8, 0, 1) == 0)
+                    smith.valueRangeAtMost(u64, 0, num_pages * 2)
+                else
+                    smith.value(u64),
+                .high_water = smith.valueRangeAtMost(u64, 0, num_pages + 1),
+            };
+            m.encode(&page);
+        } else if (id >= format.first_data_page) {
+            // Same argument one level down. `candidateValid` only descends
+            // into a page whose first byte is a leaf/branch kind, and only
+            // walks a freelist page it was pointed at; with purely random
+            // bytes that happens ~2/256 of the time, so the branch descent
+            // and the chain walk stay all but uncovered (measured on the
+            // random version: 188 of 200,000 runs reached the freelist walk,
+            // every one of them via the trivial root-is-a-leaf case, and no
+            // run ever descended through a branch). Stamp a plausible SHAPE
+            // and keep the contents fuzzed.
+            switch (smith.valueRangeAtMost(u8, 0, 3)) {
+                0 => {}, // leave fully random — hostile/garbage page
+                1 => page[0] = @intFromEnum(format.NodeKind.leaf),
+                2 => {
+                    // A branch whose geometry passes `branchViewSafe` so the
+                    // walk descends, but whose child ids are fuzzed.
+                    const count = smith.valueRangeAtMost(u16, 0, 4);
+                    page[0] = @intFromEnum(format.NodeKind.branch);
+                    std.mem.writeInt(u16, page[2..4], count, .little);
+                    std.mem.writeInt(
+                        u32,
+                        page[4..8],
+                        smith.valueRangeAtMost(u32, 0, num_pages + 1),
+                        .little,
+                    );
+                    var k: u16 = 0;
+                    while (k < count) : (k += 1) {
+                        const off: u16 = @intCast(page_size - (@as(usize, k) + 1) * 16);
+                        std.mem.writeInt(u16, page[8 + k * 2 ..][0..2], off, .little);
+                        std.mem.writeInt(u16, page[off..][0..2], 4, .little); // sep_len
+                        std.mem.writeInt(
+                            u32,
+                            page[off + 2 ..][0..4],
+                            smith.valueRangeAtMost(u32, 0, num_pages + 1),
+                            .little,
+                        );
+                    }
+                },
+                else => {
+                    // A freelist chain page: a count that is sometimes over
+                    // capacity (rejection), a `next` that can point back into
+                    // the chain (cycle guard) and fuzzed entry ids.
+                    // Usually a handful of entries, so the chain's running
+                    // total can plausibly equal the meta's `free_count` and
+                    // the ACCEPT path is reachable at all; sometimes at or
+                    // over `capacity`, which is the rejection this page's
+                    // count field exists to trigger.
+                    const n = if (smith.valueRangeAtMost(u8, 0, 3) != 3)
+                        smith.valueRangeAtMost(u16, 0, 8)
+                    else
+                        smith.valueRangeAtMost(u16, 0, Freelist.capacity + 1);
+                    std.mem.writeInt(u16, page[0..2], n, .little);
+                    std.mem.writeInt(
+                        u32,
+                        page[2..6],
+                        smith.valueRangeAtMost(u32, 0, num_pages + 1),
+                        .little,
+                    );
+                    var k: usize = 0;
+                    while (k < @min(n, Freelist.capacity)) : (k += 1) {
+                        const off = Freelist.hdr_bytes + k * Freelist.entry_bytes;
+                        std.mem.writeInt(
+                            u32,
+                            page[off..][0..4],
+                            smith.valueRangeAtMost(u32, 0, num_pages + 1),
+                            .little,
+                        );
+                    }
+                },
+            }
+        }
         try p.writePage(id, &page);
     }
     p.high_water = num_pages;

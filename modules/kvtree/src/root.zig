@@ -208,10 +208,29 @@ pub const Db = struct {
     }
 
     /// A cursor over the newest committed version (ordered iteration / scan).
-    /// Consistent for the cursor's lifetime only in the single-writer model;
-    /// for a stable view across concurrent commits, take a `snapshot`.
+    /// It PINS that version against the reclaim gate for its whole lifetime,
+    /// exactly as `snapshot` does, and releases the pin in `Cursor.deinit`.
+    ///
+    /// The pin is not a convenience — it is required for memory safety. A
+    /// cursor keeps a *copy* of each page on its descent path but only the
+    /// page IDS of the subtrees it has not reached yet, and re-reads them
+    /// lazily in `next`. Without a pin, `oldestReader` reports "no reader",
+    /// so a commit two versions on recycles the very pages the cursor is
+    /// still going to follow: the scan then walks into whatever replaced
+    /// them. This was reachable in the *single-writer* model — the commits
+    /// need only be the cursor holder's own, between two `next` calls — and
+    /// it was not a stale-but-consistent read: a page recycled as a freelist
+    /// chain page has an entry count where a node's kind byte belongs.
+    ///
+    /// Note the cost this makes explicit: a long-lived cursor holds back page
+    /// reclamation for as long as it is open, so close it promptly.
     pub fn cursor(self: *Db) Allocator.Error!Cursor {
-        return Cursor.init(self.gpa, &self.pager, self.meta_rec.root);
+        const pinned = self.meta_rec.txn_id;
+        try self.open_snapshots.append(self.gpa, pinned);
+        errdefer self.releaseSnapshot(pinned);
+        var c = try Cursor.init(self.gpa, &self.pager, self.meta_rec.root);
+        c.pin = .{ .db = self, .txn_id = pinned };
+        return c;
     }
 
     // ── transactions ─────────────────────────────────────────────────────────
@@ -334,8 +353,11 @@ pub const Txn = struct {
 
     /// Commit atomically (via `core.commit`). CONSUMES the transaction on
     /// BOTH outcomes: after a failed commit the txn is already torn down —
-    /// do not call `rollback` on it (the store itself is left on the last
-    /// committed version either way; that is `core.commit`'s guarantee).
+    /// do not call `rollback` on it. The store is always left on *some*
+    /// committed version, never a torn one; but on `error.CommitFailed` it is
+    /// indeterminate WHICH — this transaction may still be durable and get
+    /// adopted by the next `recover`. Do not retry on this `Db`; close and
+    /// reopen. See `CommitError.CommitFailed` for the full argument.
     pub fn commit(self: *Txn) CommitError!void {
         defer {
             self.arena.deinit();
@@ -422,6 +444,11 @@ pub const Cursor = struct {
     pager: *Pager,
     root: PageId,
     stack: std.ArrayList(Frame),
+    /// Set when the cursor owns its reclaim-gate pin — i.e. it came straight
+    /// from `Db.cursor`. A cursor over a `Snapshot` leaves this null, because
+    /// the snapshot already holds the pin and releasing it twice would drop
+    /// another reader's protection.
+    pin: ?struct { db: *Db, txn_id: u64 } = null,
 
     const Frame = struct {
         page: [page_size]u8,
@@ -436,6 +463,7 @@ pub const Cursor = struct {
     }
 
     pub fn deinit(self: *Cursor) void {
+        if (self.pin) |p| p.db.releaseSnapshot(p.txn_id);
         self.stack.deinit(self.gpa);
         self.* = undefined;
     }
@@ -722,4 +750,149 @@ test "steady state: overwriting a fixed key set stops growing the file (the free
         try testing.expect(got != null);
         try testing.expectEqualStrings(val, got.?);
     }
+}
+
+test "recovery rejects a leaf page with corrupt geometry instead of adopting it" {
+    // Regression: `candidateValid` used to accept a leaf on its KIND BYTE
+    // alone. A leaf claiming 65535 entries was then adopted, and the very
+    // first `get` sent `binarySearch` to slot 32767 — offset 65544 in a 4 KiB
+    // page buffer. Node pages carry no CRC, so one corrupt length byte on
+    // media is enough to get here; the store must reject, never crash.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+
+    const h = try sim.storage().open("corrupt.kvt", .create_truncate);
+    var p = Pager.init(sim.storage(), h, 0);
+    var page: [page_size]u8 = undefined;
+
+    @memset(&page, 0);
+    page[0] = @intFromEnum(format.NodeKind.leaf);
+    std.mem.writeInt(u16, page[2..4], 0xFFFF, .little); // impossible count
+    try p.writePage(2, &page);
+
+    @memset(&page, 0); // slot B: not a meta at all
+    try p.writePage(1, &page);
+
+    // A structurally perfect meta — right magic, version, geometry and CRC —
+    // pointing at that leaf. Only the leaf's own geometry can reject this.
+    const m: format.Meta = .{
+        .txn_id = 1,
+        .root = 2,
+        .free_root = 0,
+        .free_count = 0,
+        .high_water = 3,
+    };
+    m.encode(&page);
+    try p.writePage(0, &page);
+    try p.sync();
+
+    try testing.expectError(
+        error.Corrupt,
+        Db.open(testing.allocator, sim.storage(), "corrupt.kvt", .{}),
+    );
+}
+
+test "leafViewSafe accepts a real leaf, rejects an oversized value length" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var lb = format.LeafBuilder.init(arena_state.allocator());
+    try lb.put("apple", "1");
+    try lb.put("banana", "2");
+    var page: [page_size]u8 = undefined;
+    lb.encode(&page);
+    try testing.expect(format.leafViewSafe(&page) != null);
+
+    // val_len is a u32: a cell may name far more bytes than the page holds.
+    const o = std.mem.readInt(u16, page[8..10], .little);
+    std.mem.writeInt(u32, page[o + 2 ..][0..4], 0xFFFF_FFFF, .little);
+    try testing.expect(format.leafViewSafe(&page) == null);
+}
+
+test "a live Db.cursor keeps its pages: commits during a scan cannot recycle them" {
+    // Regression: `Db.cursor` used to pin nothing. A cursor holds a COPY of
+    // each page on its descent path but only the page IDS of the subtrees it
+    // has not reached, re-reading them lazily -- so with `oldestReader`
+    // reporting "no reader", a commit two versions on recycled the pages the
+    // scan was still going to follow. Before the pin this exact test aborted
+    // with "invalid enum value": a page had been recycled as a freelist chain
+    // page, whose byte 0 is an entry count, not a node kind.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "pin.kvt", .{});
+    defer db.close();
+
+    var key_buf: [16]u8 = undefined;
+    const val = "v" ** 64;
+    const keys = 120; // enough entries at this value size for a multi-level tree
+
+    var i: usize = 0;
+    while (i < keys) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i});
+        try db.put(key, val);
+    }
+
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.first();
+
+    var last: [16]u8 = undefined;
+    var last_len: usize = 0;
+    var seen: usize = 0;
+    while (try cur.next()) |e| {
+        if (last_len != 0) try testing.expect(std.mem.lessThan(u8, last[0..last_len], e.key));
+        @memcpy(last[0..e.key.len], e.key);
+        last_len = e.key.len;
+        seen += 1;
+        // Partway through the scan, rewrite EVERY key several times over. Each
+        // pass COWs the whole tree and frees the previous version's pages --
+        // which is precisely the set this cursor has not visited yet.
+        if (seen == 5) {
+            var j: usize = 0;
+            while (j < keys * 3) : (j += 1) {
+                const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{j % keys});
+                try db.put(key, val);
+            }
+        }
+    }
+    try testing.expectEqual(keys, seen);
+}
+
+test "a cursor over a Snapshot does not double-release the snapshot's pin" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "pin2.kvt", .{});
+    defer db.close();
+    try db.put("a", "1");
+
+    var snap = try db.snapshot();
+    defer snap.release();
+    try testing.expectEqual(@as(usize, 1), db.open_snapshots.items.len);
+    {
+        var cur = try snap.cursor();
+        defer cur.deinit();
+        try cur.first();
+        // The snapshot owns the pin; the cursor must not register a second one
+        // and must not release the snapshot's on deinit.
+        try testing.expectEqual(@as(usize, 1), db.open_snapshots.items.len);
+    }
+    try testing.expectEqual(@as(usize, 1), db.open_snapshots.items.len);
+}
+
+test "Db.cursor releases its pin on deinit, so reclamation resumes" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "pin3.kvt", .{});
+    defer db.close();
+    try db.put("a", "1");
+
+    try testing.expectEqual(@as(usize, 0), db.open_snapshots.items.len);
+    {
+        var cur = try db.cursor();
+        defer cur.deinit();
+        try testing.expectEqual(@as(usize, 1), db.open_snapshots.items.len);
+    }
+    try testing.expectEqual(@as(usize, 0), db.open_snapshots.items.len);
 }
