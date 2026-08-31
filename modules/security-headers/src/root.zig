@@ -318,6 +318,48 @@ pub const SecurityHeaders = struct {
         if (o.server) |v| try res.setHeader("Server", v);
     }
 
+    /// `apply` for a configuration known at compile time: the same header
+    /// set in the same order, but emitted through
+    /// `ResponseWriter.setHeaderStatic`, so the whole ceremony is paid when
+    /// the binary is built — validation and the managed-name checks become
+    /// compile errors, the HSTS value is rendered into rodata, and every
+    /// name/value pair is stored as the static slices themselves. Nothing
+    /// is formatted or copied per request and none of the response's
+    /// header-byte budget is spent, which is why the error set shrinks:
+    /// `error.HeaderBytesExhausted` cannot happen here (only the header
+    /// *slot* budget remains). No `init`, no `SecurityHeaders` value, no
+    /// `InitError` — pass the `Options` directly.
+    ///
+    /// Semantics are otherwise `apply`'s: values set here are defaults in
+    /// effect, a later `setHeader` with the same name wins. Like `apply`,
+    /// call it before anything else touches the response so short-circuit
+    /// replies carry the headers too.
+    pub fn applyStatic(comptime options: Options, res: *http.Server.ResponseWriter) error{ HeadersSent, TooManyHeaders }!void {
+        if (comptime options.hsts) |h| try res.setHeaderStatic("Strict-Transport-Security", comptime hstsStaticValue(h));
+        if (comptime options.content_security_policy) |v| try res.setHeaderStatic("Content-Security-Policy", v);
+        if (comptime options.content_security_policy_report_only) |v| try res.setHeaderStatic("Content-Security-Policy-Report-Only", v);
+        if (comptime options.x_content_type_options) try res.setHeaderStatic("X-Content-Type-Options", "nosniff");
+        if (comptime options.x_frame_options) |v| try res.setHeaderStatic("X-Frame-Options", v);
+        if (comptime options.referrer_policy) |v| try res.setHeaderStatic("Referrer-Policy", v);
+        if (comptime options.permissions_policy) |v| try res.setHeaderStatic("Permissions-Policy", v);
+        if (comptime options.cross_origin_opener_policy) |v| try res.setHeaderStatic("Cross-Origin-Opener-Policy", v);
+        if (comptime options.cross_origin_resource_policy) |v| try res.setHeaderStatic("Cross-Origin-Resource-Policy", v);
+        if (comptime options.cross_origin_embedder_policy) |v| try res.setHeaderStatic("Cross-Origin-Embedder-Policy", v);
+        if (comptime options.server) |v| try res.setHeaderStatic("Server", v);
+    }
+
+    /// The exact bytes `init` would format into `hsts_buf` for `h`, built
+    /// at compile time instead — the two renderings are kept in lockstep by
+    /// the "applyStatic: default set is byte-for-byte apply's" test.
+    fn hstsStaticValue(comptime h: Hsts) []const u8 {
+        comptime {
+            var v: []const u8 = std.fmt.comptimePrint("max-age={d}", .{h.max_age_s});
+            if (h.include_subdomains) v = v ++ "; includeSubDomains";
+            if (h.preload) v = v ++ "; preload";
+            return v;
+        }
+    }
+
     /// The `router.Middleware` (`state` = this immutable SecurityHeaders —
     /// per-instance, no globals; never mutated by `run`). Sets the headers,
     /// then runs the rest of the chain. Register it first (outermost,
@@ -719,6 +761,65 @@ test "apply: usable directly on a bare ResponseWriter (no router)" {
     const got = out.buffered();
     try expectHeaderLine(got, "Strict-Transport-Security: max-age=31536000; includeSubDomains");
     try expectHeaderLine(got, "Cross-Origin-Opener-Policy: same-origin");
+}
+
+test "applyStatic: default set is byte-for-byte apply's" {
+    // The drift guard for the comptime twin: the same Options through both
+    // paths must produce the identical head, HSTS rendering included.
+    var runtime_buf: [1024]u8 = undefined;
+    var static_buf: [1024]u8 = undefined;
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+
+    var out_r: Writer = .fixed(&runtime_buf);
+    var rw_r: http.Server.ResponseWriter = .init(&out_r, &body_buf, &chunk_buf, .{});
+    const sh: SecurityHeaders = try .init(.{});
+    try sh.apply(&rw_r);
+    try rw_r.end();
+
+    var out_s: Writer = .fixed(&static_buf);
+    var rw_s: http.Server.ResponseWriter = .init(&out_s, &body_buf, &chunk_buf, .{});
+    try SecurityHeaders.applyStatic(.{}, &rw_s);
+    try rw_s.end();
+
+    try testing.expectEqualStrings(out_r.buffered(), out_s.buffered());
+}
+
+test "applyStatic: full options render comptime, spend no header bytes" {
+    var out_buf: [2048]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    try SecurityHeaders.applyStatic(.{
+        .hsts = .{ .max_age_s = 63_072_000, .preload = true },
+        .content_security_policy = csp_api,
+        .server = "webserver",
+    }, &rw);
+    // Static pairs are rodata slices: the copy store must be untouched.
+    try testing.expectEqual(@as(usize, 0), rw.header_buf_len);
+    try rw.end();
+    const got = out.buffered();
+    try expectHeaderLine(got, "Strict-Transport-Security: max-age=63072000; includeSubDomains; preload");
+    try expectHeaderLine(got, "Content-Security-Policy: " ++ csp_api);
+    try expectHeaderLine(got, "X-Content-Type-Options: nosniff");
+    try expectHeaderLine(got, "Server: webserver");
+}
+
+test "applyStatic: handler's later setHeader still wins" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    try SecurityHeaders.applyStatic(.{}, &rw);
+    try rw.setHeader("X-Frame-Options", "SAMEORIGIN");
+    try rw.end();
+    const got = out.buffered();
+    try expectHeaderLine(got, "X-Frame-Options: SAMEORIGIN");
+    try testing.expect(std.mem.indexOf(u8, got, "DENY") == null);
 }
 
 // ── tests (in-process integration — http.Server + http.Client) ──────────────

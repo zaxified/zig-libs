@@ -78,6 +78,23 @@ the chain runs, so short-circuit responses from inner middleware (ratelimit
 too. `apply()` is also public for setting the same header set directly on
 any `http.Server.ResponseWriter` without the router.
 
+### Without the router, at compile time
+
+When the whole configuration is known at build time, skip `init` entirely:
+
+```zig
+try security_headers.SecurityHeaders.applyStatic(.{
+    .hsts = .{ .max_age_s = 63_072_000, .preload = true },
+    .content_security_policy = security_headers.csp_api,
+}, res);
+```
+
+`applyStatic` emits the same set in the same order through
+`ResponseWriter.setHeaderStatic`: validation becomes compile errors, the
+HSTS value is rendered into rodata, and no per-request formatting, copying
+or header-byte budget is involved — the per-request cost is the slot writes
+alone. Same precedence: a handler's later `setHeader` still wins.
+
 ## Precedence (middleware sets, handler wins)
 
 The middleware sets the configured headers **before** calling `next`, so the
