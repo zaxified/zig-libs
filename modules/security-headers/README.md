@@ -45,13 +45,16 @@ names are plain strings; the hyphen imports fine, same as the community's
 | `Cross-Origin-Resource-Policy` | `same-origin` | `cross_origin_resource_policy` |
 | `Cross-Origin-Embedder-Policy` | *(off — opt-in, breaks embeds)* | `cross_origin_embedder_policy` |
 | `Server` | *(off — replacement value)* | `server` |
+| *(anything else, verbatim)* | *(off)* | `extra` |
 
 Defaults match helmet.js v7 except: `X-Frame-Options` is `DENY` (spec
 mandate; helmet uses SAMEORIGIN) and CSP is **off by default** (helmet ships
 a default policy; there is no universally-safe one — see below). helmet's
 legacy extras (`X-DNS-Prefetch-Control`, `X-Download-Options`,
 `X-Permitted-Cross-Domain-Policies`, `X-XSS-Protection: 0`,
-`Origin-Agent-Cluster`) are consciously out of scope.
+`Origin-Agent-Cluster`) consciously get no knob of their own — a consumer
+that wants one names it in `extra` (emitted last, verbatim, same
+handler-wins semantics).
 
 ## Usage
 

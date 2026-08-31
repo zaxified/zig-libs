@@ -53,6 +53,9 @@
 //!   `http.Server`'s automatic `Server:` header for these responses. To
 //!   drop the header entirely, configure the server itself with
 //!   `.server_name = null` (a header, once set, can only be replaced).
+//! - `extra` — additional static headers emitted verbatim after the set
+//!   above: the escape hatch for the curation's long tail (`X-Robots-Tag`,
+//!   `X-Permitted-Cross-Domain-Policies`, ...) without a knob each.
 //!
 //! Stateless and reentrant: the middleware `state` is a pointer to the
 //! immutable `SecurityHeaders` (precomputed config) — no clock, no
@@ -164,6 +167,14 @@ pub const Options = struct {
     /// leave the server's own behavior. Removal is not possible from
     /// middleware — configure `http.Server` with `.server_name = null`.
     server: ?[]const u8 = null,
+    /// Additional static headers, emitted verbatim after everything above —
+    /// the escape hatch for the curation's long tail (`X-Robots-Tag`,
+    /// `X-Permitted-Cross-Domain-Policies`, `X-DNS-Prefetch-Control`, ...)
+    /// without a dedicated knob each. Same default-in-effect semantics: a
+    /// handler's later `setHeader` wins. Names must be ordinary headers —
+    /// the managed ones (`Content-Length`, `Connection`, ...) do not belong
+    /// in a static default set; `applyStatic` rejects them at compile time.
+    extra: []const http.Header = &.{},
 };
 
 /// Deny-everything CSP for a pure JSON/binary API (no HTML is ever
@@ -249,6 +260,7 @@ pub const SecurityHeaders = struct {
             if (options.cross_origin_resource_policy) |v| assertValueClean(v);
             if (options.cross_origin_embedder_policy) |v| assertValueClean(v);
             if (options.server) |v| assertValueClean(v);
+            for (options.extra) |h| assertValueClean(h.value);
         }
         var sh: SecurityHeaders = .{ .options = options };
         if (options.hsts) |h| {
@@ -282,6 +294,7 @@ pub const SecurityHeaders = struct {
         if (o.cross_origin_resource_policy) |v| total += "Cross-Origin-Resource-Policy".len + v.len;
         if (o.cross_origin_embedder_policy) |v| total += "Cross-Origin-Embedder-Policy".len + v.len;
         if (o.server) |v| total += "Server".len + v.len;
+        for (o.extra) |h| total += h.name.len + h.value.len;
         return total;
     }
 
@@ -316,6 +329,7 @@ pub const SecurityHeaders = struct {
         if (o.cross_origin_resource_policy) |v| try res.setHeader("Cross-Origin-Resource-Policy", v);
         if (o.cross_origin_embedder_policy) |v| try res.setHeader("Cross-Origin-Embedder-Policy", v);
         if (o.server) |v| try res.setHeader("Server", v);
+        for (o.extra) |h| try res.setHeader(h.name, h.value);
     }
 
     /// `apply` for a configuration known at compile time: the same header
@@ -346,6 +360,7 @@ pub const SecurityHeaders = struct {
         if (comptime options.cross_origin_resource_policy) |v| try res.setHeaderStatic("Cross-Origin-Resource-Policy", v);
         if (comptime options.cross_origin_embedder_policy) |v| try res.setHeaderStatic("Cross-Origin-Embedder-Policy", v);
         if (comptime options.server) |v| try res.setHeaderStatic("Server", v);
+        inline for (comptime options.extra) |h| try res.setHeaderStatic(h.name, h.value);
     }
 
     /// The exact bytes `init` would format into `hsts_buf` for `h`, built
@@ -796,6 +811,7 @@ test "applyStatic: full options render comptime, spend no header bytes" {
         .hsts = .{ .max_age_s = 63_072_000, .preload = true },
         .content_security_policy = csp_api,
         .server = "webserver",
+        .extra = &.{.{ .name = "X-Robots-Tag", .value = "noindex" }},
     }, &rw);
     // Static pairs are rodata slices: the copy store must be untouched.
     try testing.expectEqual(@as(usize, 0), rw.header_buf_len);
@@ -805,6 +821,7 @@ test "applyStatic: full options render comptime, spend no header bytes" {
     try expectHeaderLine(got, "Content-Security-Policy: " ++ csp_api);
     try expectHeaderLine(got, "X-Content-Type-Options: nosniff");
     try expectHeaderLine(got, "Server: webserver");
+    try expectHeaderLine(got, "X-Robots-Tag: noindex");
 }
 
 test "applyStatic: handler's later setHeader still wins" {
@@ -977,4 +994,26 @@ test "external anchor: OWASP's own Cross-Origin-Embedder-Policy example matches 
 
     var buf: [2048]u8 = undefined;
     try expectHeaderLine(runWire(&r, wire("/t"), &buf), owasp_example_line);
+}
+
+test "extra: emitted by the runtime path and counted against the budget" {
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    const sh: SecurityHeaders = try .init(.{
+        .extra = &.{.{ .name = "X-Robots-Tag", .value = "noindex" }},
+    });
+    try sh.apply(&rw);
+    try rw.end();
+    try expectHeaderLine(out.buffered(), "X-Robots-Tag: noindex");
+
+    // An extra pair big enough to blow the whole header-byte budget on its
+    // own must be caught at init, exactly like an oversized CSP.
+    const huge = "v" ** (http_header_budget_bytes + 1);
+    try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(.{
+        .extra = &.{.{ .name = "X-Big", .value = huge }},
+    }));
 }
