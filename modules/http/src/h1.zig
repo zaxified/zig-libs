@@ -257,7 +257,7 @@ pub fn blockIterator(block: []const u8) HeaderIterator {
 /// `0`. A fronting CDN/LB that forwards those raw bytes and disagrees
 /// with our lenient parse is a request-smuggling desync risk, so any
 /// non-digit byte (or an empty value) is rejected.
-fn parseContentLengthStrict(value: []const u8) HeadParseError!u64 {
+pub fn parseContentLengthStrict(value: []const u8) HeadParseError!u64 {
     if (value.len == 0) return error.MalformedHead;
     var n: u64 = 0;
     for (value) |c| {

@@ -1381,10 +1381,14 @@ const Session = struct {
                 if (std.ascii.eqlIgnoreCase(f.name, "te") and
                     !std.mem.eql(u8, f.value, "trailers")) malformed = true;
                 if (std.ascii.eqlIgnoreCase(f.name, "content-length")) {
-                    content_length = std.fmt.parseInt(u64, f.value, 10) catch blk: {
-                        malformed = true;
-                        break :blk null;
-                    };
+                    // Strict 1*DIGIT, matching the h1 parser: `parseInt`
+                    // would accept `+5` and `1_0`, and §8.1.1 makes a
+                    // duplicate with a different value malformed too.
+                    if (h1.parseContentLengthStrict(f.value)) |n| {
+                        if (content_length) |prev| {
+                            if (prev != n) malformed = true;
+                        } else content_length = n;
+                    } else |_| malformed = true;
                 }
                 if (malformed) break;
             }

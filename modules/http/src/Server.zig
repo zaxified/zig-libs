@@ -1485,7 +1485,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
             return respondError(opts, out, date, 414);
     }
 
-    const head = h1.RequestHead.parse(block) catch |err| return respondError(opts, out, date, switch (err) {
+    var head = h1.RequestHead.parse(block) catch |err| return respondError(opts, out, date, switch (err) {
         error.UnsupportedVersion => 505,
         error.MalformedHead => 400,
     });
@@ -1523,6 +1523,18 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         // ("http://host") names an empty path, which is "/" (§3.2.2).
         const end = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
         if (end == 0 or !h1.isValidHost(rest[0..end])) return respondError(opts, out, date, 400);
+        // §3.3: the target's authority is authoritative and Host is ignored.
+        // Ignoring alone would still leave `Request.header("host")` reading
+        // the raw (overridden) Host value — a host-confusion seam when a
+        // handler routes on it while a front proxy routed on the authority —
+        // so a Host that disagrees with the authority is rejected outright,
+        // and `head.host` is pointed at the authority for the rest.
+        const authority = rest[0..end];
+        if (head.host) |sent| {
+            if (!std.ascii.eqlIgnoreCase(sent, authority))
+                return respondError(opts, out, date, 400);
+        }
+        head.host = authority;
         target = if (end == rest.len) "/" else if (rest[end] == '?') "/" else rest[end..];
         if (end != rest.len and rest[end] == '?') {
             // "http://host?q": an empty path with a query.
@@ -3688,8 +3700,12 @@ test "serveStream: protocol rejections (505, 501, 400s, 431)" {
     try testing.expect(std.mem.startsWith(u8, runStream(null, "POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked, chunked\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
     // Absolute-form is accepted, and its authority wins over Host (RFC 9112
     // §3.2.2, §3.3); a scheme this server does not speak, or no authority,
-    // is still 400.
-    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET http://x/hello HTTP/1.1\r\nHost: other\r\n\r\n", &out_buf), "HTTP/1.1 200 OK\r\n"));
+    // is still 400. A Host that DISAGREES with the authority is a client
+    // protocol violation (§3.2.2: the two MUST be identical) and a
+    // host-confusion vector — rejected, so a handler reading `header("host")`
+    // can never see a value the routing layer ignored.
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET http://x/hello HTTP/1.1\r\nHost: x\r\n\r\n", &out_buf), "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.startsWith(u8, runStream(null, "GET http://x/hello HTTP/1.1\r\nHost: other\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET ftp://x/hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET http:///hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
     // "*" is for OPTIONS alone (§3.2.4).
