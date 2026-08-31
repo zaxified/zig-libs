@@ -60,11 +60,17 @@
 //! - A ban/greylist affects **new admissions only**; connections already
 //!   admitted keep running until they close (the guard has no handle to
 //!   kill them — pair with the server's read/write timeouts).
-//! - Known server edge: if `http.Server` drops an *admitted* connection
-//!   before serving begins (its per-connection buffer allocation failed —
-//!   OOM only), `.closed` never fires and that IP's slot leaks by one. Call
-//!   `reconcile(ip, live)` with the true live count to drop the phantom
-//!   slot; the guard's own memory stays bounded regardless.
+//! - Former server edge, now CLOSED in `http`: a connection admitted by
+//!   `on_connect` but dropped before serving began reported no lifecycle
+//!   state at all, so `.closed` never fired and that IP's slot leaked by
+//!   one — permanently. This was documented here as an OOM-only edge, and
+//!   it was not: with h2c enabled, a peer that simply sent nothing took the
+//!   same exit, making the leak client-triggered at one idle socket apiece
+//!   — the traffic shape this module exists to bound. `http.Server` now
+//!   reports `.new`/`.closed` for a connection dropped before serving, so
+//!   the pairing holds on every path. `reconcile(ip, live)` remains
+//!   available to drop a phantom slot; the guard's own memory was always
+//!   bounded regardless.
 
 const std = @import("std");
 const http = @import("http");

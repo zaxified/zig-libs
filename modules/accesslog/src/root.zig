@@ -1264,14 +1264,14 @@ const fuzz_field_max = 32;
 /// `fuzzCase` writes that encoding and the "corpus really reaches the fields"
 /// test below pins the decode, so a change to this order goes red instead of
 /// silently degenerating the corpus back to nothing.
-fn fuzzEntry(smith: *std.testing.Smith, pool: *[8 * fuzz_field_max]u8) Entry {
+fn fuzzEntry(smith: *std.testing.Smith, pool: *[10 * fuzz_field_max]u8) Entry {
     var flags: [1]u8 = undefined;
     smith.bytes(&flags);
 
-    var fields: [8][]const u8 = undefined;
+    var fields: [10][]const u8 = undefined;
     // `inline` so each field gets its own call site: `Smith` keys the real
     // fuzzer's state on the caller's return address, and a runtime loop would
-    // hand all eight fields the same draw.
+    // hand all ten fields the same draw.
     inline for (&fields, 0..) |*f, i| {
         var len_byte: [1]u8 = undefined;
         smith.bytes(&len_byte);
@@ -1303,13 +1303,20 @@ fn fuzzEntry(smith: *std.testing.Smith, pool: *[8 * fuzz_field_max]u8) Entry {
         .user_agent = if (present & 0x04 != 0) fields[5] else null,
         .referer = if (present & 0x08 != 0) fields[6] else null,
         .request_id = if (present & 0x10 != 0) fields[7] else null,
+        // Always present: the flag byte's eight bits are already spoken for,
+        // and unconditional presence is the stronger choice anyway -- these
+        // two were added to `Entry` without being added here, so the fuzzers
+        // and the anti-degeneracy guard below have never seen them carry a
+        // single byte.
+        .trace_id = fields[8],
+        .span_id = fields[9],
     };
 }
 
 /// Encode one corpus input in `fuzzEntry`'s draw order. Field slots, in order:
 /// `time_formatted`, `remote_addr`, `method`, `target`, `protocol`,
-/// `user_agent`, `referer`, `request_id`.
-fn fuzzCase(comptime flags: u8, comptime fields: [8][]const u8) []const u8 {
+/// `user_agent`, `referer`, `request_id`, `trace_id`, `span_id`.
+fn fuzzCase(comptime flags: u8, comptime fields: [10][]const u8) []const u8 {
     comptime {
         var out: []const u8 = &[_]u8{flags};
         for (fields) |f| {
@@ -1331,24 +1338,24 @@ const all_fields: u8 = 0xFF;
 const fuzz_corpus = [_][]const u8{
     // Lone surrogates, truncated leads, bare continuations — one per slot, so
     // no single slot carries the whole burden.
-    fuzzCase(all_fields, .{ "\xff", "\x80", "GET", "/\xed\xa0\x80", "HTTP/1.1", "curl\xc3", "\xe2\x82", "\xf0\x9f\x98" }),
+    fuzzCase(all_fields, .{ "\xff", "\x80", "GET", "/\xed\xa0\x80", "HTTP/1.1", "curl\xc3", "\xe2\x82", "\xf0\x9f\x98", "\xed\xa0", "\xc2" }),
     // Overlongs and out-of-range leads, with two realistic fields alongside so
     // the record is not uniformly hostile.
-    fuzzCase(all_fields, .{ "22/Jul/2026:10:00:00 +0000", "192.0.2.1:54321", "\xc0\xaf", "\xe0\x80\xaf", "\xf4\x90\x80\x80", "a\xffb", "\x80\x80\x80", "\xf5\xf6\xf7" }),
+    fuzzCase(all_fields, .{ "22/Jul/2026:10:00:00 +0000", "192.0.2.1:54321", "\xc0\xaf", "\xe0\x80\xaf", "\xf4\x90\x80\x80", "a\xffb", "\x80\x80\x80", "\xf5\xf6\xf7", "\xf5", "\x80\xbf" }),
     // Ill-formed bytes AND the injection payload in the same record: the two
     // defences have to hold at once, not one at a time.
-    fuzzCase(all_fields, .{ "\"\r\n", "\\\xff", "\x00\x1f\x7f", "\xff\"\r\n{\"a\":1}", "\xf0", "\xed\xbf\xbf", "\xc2", "\xe2\x82\xac" }),
+    fuzzCase(all_fields, .{ "\"\r\n", "\\\xff", "\x00\x1f\x7f", "\xff\"\r\n{\"a\":1}", "\xf0", "\xed\xbf\xbf", "\xc2", "\xe2\x82\xac", "\"\r\n\xff", "\xe0\x80" }),
     // Every field at the pool maximum, all ill-formed: the widest expansion the
     // output buffer has to absorb (3 bytes of U+FFFD per input byte).
-    fuzzCase(all_fields, .{ "\xff" ** 32, "\x80" ** 32, "\xed\xa0\x80" ** 10, "\xc0" ** 32, "\xf5" ** 32, "\xfe" ** 32, "\xe2\x82" ** 16, "\xf0\x9f\x98" ** 10 }),
+    fuzzCase(all_fields, .{ "\xff" ** 32, "\x80" ** 32, "\xed\xa0\x80" ** 10, "\xc0" ** 32, "\xf5" ** 32, "\xfe" ** 32, "\xe2\x82" ** 16, "\xf0\x9f\x98" ** 10, "\xc0" ** 32, "\xed\xa0\x80" ** 10 }),
     // Well-formed control: all-valid UTF-8 across the whole of Table 3-7, so a
     // sweep cannot pass by sanitizing everything into U+FFFD.
-    fuzzCase(all_fields, .{ "22/Jul/2026:10:00:00 +0000", "[2001:db8::1]:443", "GET", "/\u{00e9}\u{20ac}\u{1f600}", "HTTP/1.1", "curl/8.0 \u{fffd}", "https://example.org/", "req-1" }),
+    fuzzCase(all_fields, .{ "22/Jul/2026:10:00:00 +0000", "[2001:db8::1]:443", "GET", "/\u{00e9}\u{20ac}\u{1f600}", "HTTP/1.1", "curl/8.0 \u{fffd}", "https://example.org/", "req-1", "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7" }),
     // No optionals at all: the `null` rendering path, with the three required
     // string fields still ill-formed.
-    fuzzCase(0x00, .{ "", "", "\xff", "\xed\xa0\x80", "\xe2\x82", "", "", "" }),
+    fuzzCase(0x00, .{ "", "", "\xff", "\xed\xa0\x80", "\xe2\x82", "", "", "", "", "" }),
     // Everything empty — the degenerate record, which must still be one line.
-    fuzzCase(0x00, .{ "", "", "", "", "", "", "", "" }),
+    fuzzCase(0x00, .{ "", "", "", "", "", "", "", "", "", "" }),
 };
 
 /// `out` must end with exactly one `\n` and contain no other one: whatever the
@@ -1364,7 +1371,7 @@ test "fuzz corpus: the written inputs really reach the fields that matter" {
     // entry into padding and all three sweeps below keep passing — on an empty
     // record. Degenerate input is exactly where a fixed and a broken escaper
     // agree, so the corpus being non-degenerate is itself an assertion.
-    var pool: [8 * fuzz_field_max]u8 = undefined;
+    var pool: [10 * fuzz_field_max]u8 = undefined;
 
     // The first entry decodes to precisely what `fuzzCase` was handed.
     var smith: std.testing.Smith = .{ .in = fuzz_corpus[0] };
@@ -1388,14 +1395,15 @@ test "fuzz corpus: the written inputs really reach the fields that matter" {
 
     // Across the corpus, every JSON-visible slot carries ill-formed UTF-8 at
     // least once, and at least one record is entirely well-formed.
-    var ill_formed: [7]bool = @splat(false);
+    var ill_formed: [9]bool = @splat(false);
     var any_all_valid = false;
     for (fuzz_corpus) |input| {
         var s: std.testing.Smith = .{ .in = input };
         const e = fuzzEntry(&s, &pool);
-        const slots = [7]?[]const u8{
+        const slots = [9]?[]const u8{
             e.method,     e.target,  e.protocol,   e.remote_addr,
-            e.user_agent, e.referer, e.request_id,
+            e.user_agent, e.referer, e.request_id, e.trace_id,
+            e.span_id,
         };
         var all_valid = true;
         for (slots, 0..) |slot, i| if (slot) |v| {
@@ -1420,7 +1428,7 @@ test "fuzz: JSON Lines always parses, whatever bytes the fields carry" {
 }
 
 fn fuzzJsonLines(_: void, smith: *std.testing.Smith) !void {
-    var pool: [8 * fuzz_field_max]u8 = undefined;
+    var pool: [10 * fuzz_field_max]u8 = undefined;
     const entry = fuzzEntry(smith, &pool);
 
     var buf: [4096]u8 = undefined;
@@ -1481,7 +1489,7 @@ test "fuzz: logfmt stays one line with no raw control byte" {
 }
 
 fn fuzzLogfmt(_: void, smith: *std.testing.Smith) !void {
-    var pool: [8 * fuzz_field_max]u8 = undefined;
+    var pool: [10 * fuzz_field_max]u8 = undefined;
     const entry = fuzzEntry(smith, &pool);
 
     var buf: [4096]u8 = undefined;
@@ -1497,7 +1505,7 @@ test "fuzz: Combined stays one line with no raw control byte" {
 }
 
 fn fuzzCombined(_: void, smith: *std.testing.Smith) !void {
-    var pool: [8 * fuzz_field_max]u8 = undefined;
+    var pool: [10 * fuzz_field_max]u8 = undefined;
     const entry = fuzzEntry(smith, &pool);
 
     var buf: [4096]u8 = undefined;

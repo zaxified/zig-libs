@@ -70,6 +70,24 @@ fn checkHeaderBudgetExceeded(gpa: std.mem.Allocator) !void {
             "SecurityHeaders.init with an 8192-byte CSP: HeaderBudgetExceeded (expected)\n",
             .{},
         ),
+        error.InvalidExtraHeaderName => return error.UnexpectedError,
+    }
+
+    // The other config-time rejection, for the same reason: a header name
+    // that is not an RFC 9110 token would make `setHeader` fail on every
+    // single request, and that request-time failure is an automatic 500
+    // carrying none of these headers. Caught here instead, in every build
+    // mode.
+    if (security_headers.SecurityHeaders.init(.{
+        .extra = &.{.{ .name = "X Robots Tag", .value = "noindex" }},
+    })) |_| {
+        return error.UnexpectedAccept;
+    } else |err| switch (err) {
+        error.InvalidExtraHeaderName => std.debug.print(
+            "SecurityHeaders.init with a spaced extra header name: InvalidExtraHeaderName (expected)\n",
+            .{},
+        ),
+        error.HeaderBudgetExceeded => return error.UnexpectedError,
     }
 }
 

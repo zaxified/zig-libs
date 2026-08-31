@@ -72,8 +72,19 @@
 //! - **Denied-request throttle** (per-key).
 //!   Repeated 401s from one client are coalesced to ~1 audit entry per
 //!   `throttle_window_ms` (default 5 s), folding the suppressed count
-//!   into the next admitted entry (`AuditEntry.suppressed`) — an
-//!   unauthenticated flood cannot flood the audit sink. Keys follow the
+//!   into the next admitted entry (`AuditEntry.suppressed`).
+//!   ⚠ **That bounds a flood only as far as the KEY is trustworthy.**
+//!   Behind a proxy that rewrites `X-Forwarded-For` the rightmost hop is
+//!   genuine and the coalescing holds. On a directly reachable server the
+//!   whole header is the client's to write, so an attacker who varies it
+//!   per request lands a fresh key every time, misses the map, and reaches
+//!   the synchronous `on_audit` hook on every single denial — and the
+//!   churn evicts other clients' pending `suppressed` counts. Set
+//!   `Options.throttle_key` (or front the server with a proxy) if the
+//!   sink must be bounded against that. SPEC.md states this; the summary
+//!   here used to claim the opposite ("an unauthenticated flood cannot
+//!   flood the audit sink").
+//!   Keys follow the
 //!   same client-IP trust rule as `ratelimit`: rightmost element of the
 //!   last `X-Forwarded-For` header (the one hop a client cannot forge
 //!   when a trusted proxy fronts the server), else `X-Real-IP`, else the
@@ -799,8 +810,21 @@ const Throttle = struct {
             if (e.suppressed != 0 or now_ns -| e.last_ns < window_ns) break;
             t.removeEntry(gpa, e);
         }
-        if (t.map.count() >= max_keys)
-            t.removeEntry(gpa, @alignCast(@fieldParentPtr("node", t.lru.last.?)));
+        // The tail is unwrapped, not asserted. `Options.throttle_max_keys`
+        // documents "must be ≥ 1" and `init` checks it with
+        // `std.debug.assert` — which ReleaseFast compiles out, along with
+        // the `.?` unwrap's own null check. A `throttle_max_keys` of 0 then
+        // made `0 >= 0` true against an empty store, and the unwrap of a
+        // null tail fed `@fieldParentPtr` a garbage pointer that
+        // `removeEntry` proceeded to `map.remove` and `gpa.destroy`: heap
+        // corruption in the release build from a config the safe build
+        // rejects loudly. A guard that only exists under `runtime_safety`
+        // is not a guard, so the cap enforcement now simply does nothing
+        // when there is no tail to evict.
+        if (t.map.count() >= max_keys) {
+            if (t.lru.last) |tail|
+                t.removeEntry(gpa, @alignCast(@fieldParentPtr("node", tail)));
+        }
 
         t.insert(gpa, key, now_ns) catch {}; // OOM → fail open (documented)
         return 0;

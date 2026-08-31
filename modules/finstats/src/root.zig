@@ -668,18 +668,47 @@ pub const MonteCarloSpec = struct {
 /// Monte-Carlo net-worth projection → Dataset {month, p10, p50, p90}. Monthly
 /// step v = max(0, v·(1 + muM + sigM·Z) + monthly), Z ~ N(0,1) Box-Muller.
 pub fn monteCarlo(a: std.mem.Allocator, spec: MonteCarloSpec) Error!Dataset {
-    const months: usize = @intFromFloat(@round(spec.years * 12));
+    // `years` was the one integer-shaped knob left unclamped, and it is a
+    // caller-supplied float. `@intFromFloat` on a negative value panics in
+    // Debug/ReleaseSafe -- which SPEC's threat model rules out ("never a
+    // panic") -- and in ReleaseFast produced a colossal `months` whose
+    // allocation failed, reporting a validation mistake to the caller as
+    // `error.OutOfMemory`. NaN was quieter still: Zig's range check is
+    // `v > max or v < min`, both false for NaN, so it passed in EVERY mode
+    // and became an absurd month count. `(end - start) / 365.25` with the
+    // dates picked in the wrong order is all it takes.
+    //
+    // Clamped rather than rejected, matching what `paths` and `bins`
+    // already do in this module. `!(x >= 1)` is deliberate: it sends NaN to
+    // the zero arm, which `x < 1` would not.
+    const months_f = @round(spec.years * 12);
+    const months_cap = @as(f64, @floatFromInt(std.math.maxInt(u32)));
+    const months: usize = if (!(months_f >= 1))
+        0
+    else if (months_f >= months_cap)
+        std.math.maxInt(u32) // absurd but finite: let the allocator say no
+    else
+        @intFromFloat(months_f);
     const mu_m = std.math.pow(f64, 1 + spec.mu_ann, 1.0 / 12.0) - 1;
     const sig_m = spec.vol_ann / @sqrt(12.0);
     const n = @max(spec.paths, 1);
 
     // cols[t] = the n path values at month t (t = 0..months)
     const cols_v = try a.alloc([]f64, months + 1);
-    for (cols_v) |*c| c.* = try a.alloc(f64, n);
-    // Scratch: `months + 1` path buffers, the largest allocation in the module.
+    // Scratch: `months + 1` path buffers, the largest allocation in the
+    // module -- so the one most likely to fail partway. `made` is what makes
+    // this cleanup correct on the error path: the defer used to be registered
+    // AFTER the loop, so a failure at iteration k returned with `cols_v` and
+    // k inner slices leaked, and the "scratch allocations are released" test
+    // only ever walks the success path.
+    var made: usize = 0;
     defer {
-        for (cols_v) |c| a.free(c);
+        for (cols_v[0..made]) |c| a.free(c);
         a.free(cols_v);
+    }
+    for (cols_v) |*c| {
+        c.* = try a.alloc(f64, n);
+        made += 1;
     }
     var prng = std.Random.DefaultPrng.init(spec.seed);
     const rnd = prng.random();
@@ -2450,4 +2479,67 @@ test "FFN reference validation: risk_metrics against external ffn library (8-day
     const cvar_95_ffn = 0.02;
     const cvar_95_zig = rm.cell(0, "cvar95").?.float;
     try testing.expectApproxEqAbs(cvar_95_ffn, cvar_95_zig, 0.005);
+}
+
+fn freeDataset(al: std.mem.Allocator, ds: Dataset) void {
+    for (ds.rows) |r| al.free(r);
+    al.free(ds.rows);
+    al.free(ds.columns);
+}
+
+test "monteCarlo clamps a nonsense years instead of panicking or faking an OOM" {
+    // SPEC's threat model promises "never a panic" and that allocation
+    // failure is what `error.OutOfMemory` means. An unclamped `@intFromFloat`
+    // broke both: negative years panicked in safe builds and, unchecked in
+    // ReleaseFast, asked for an impossible allocation; NaN slipped through
+    // every mode because Zig's range check is false on both sides for NaN.
+    const base: MonteCarloSpec = .{
+        .start = 1000,
+        .mu_ann = 0.07,
+        .vol_ann = 0.15,
+        .monthly = 100,
+        .years = -1,
+        .paths = 8,
+    };
+    for ([_]f64{ -1, -0.5, 0, std.math.nan(f64), -std.math.inf(f64) }) |y| {
+        var spec = base;
+        spec.years = y;
+        const d = try monteCarlo(testing.allocator, spec);
+        defer freeDataset(testing.allocator, d);
+        // A projection over no time is the month-0 row alone.
+        try testing.expectEqual(@as(usize, 1), d.rows.len);
+    }
+
+    // A sane horizon is untouched by the clamp.
+    const ok = try monteCarlo(testing.allocator, .{
+        .start = 1000,
+        .mu_ann = 0.07,
+        .vol_ann = 0.15,
+        .monthly = 100,
+        .years = 2,
+        .paths = 8,
+    });
+    defer freeDataset(testing.allocator, ok);
+    try testing.expectEqual(@as(usize, 25), ok.rows.len); // months 0..24
+}
+
+test "monteCarlo frees the path buffers it did allocate when one fails" {
+    // The defer used to be registered after the allocation loop, so a
+    // failure partway leaked every buffer made before it.
+    const base: MonteCarloSpec = .{
+        .start = 1000,
+        .mu_ann = 0.07,
+        .vol_ann = 0.15,
+        .monthly = 100,
+        .years = 3,
+        .paths = 16,
+    };
+    // Fail at a later allocation index so several inner buffers already exist.
+    var i: usize = 1;
+    while (i < 12) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        try testing.expectError(error.OutOfMemory, monteCarlo(failing.allocator(), base));
+        // FailingAllocator's own deinit-time accounting is what catches a leak.
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }

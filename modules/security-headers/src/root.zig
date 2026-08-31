@@ -240,7 +240,37 @@ pub const SecurityHeaders = struct {
         /// split it, or grow `http`'s `header_copy_bytes` if the policy is
         /// genuinely required to be that large.
         HeaderBudgetExceeded,
+        /// An `Options.extra` entry's NAME is not an RFC 9110 field-name
+        /// token, so `http.Server`'s `setHeader` would reject it with
+        /// `error.InvalidHeader` on every request — the same "fails every
+        /// request, deterministically" shape `HeaderBudgetExceeded` exists
+        /// to catch at configuration time, and for the same reason: that
+        /// request-time failure becomes an automatic 500 carrying none of
+        /// this module's headers.
+        ///
+        /// `init` used to validate `extra` VALUES (and only under
+        /// `runtime_safety`) while never looking at the names, even though
+        /// names go onto the wire just as verbatim. There is no injection
+        /// risk either way — `http` re-validates names and values at
+        /// `setHeader` time in every build mode — so this is about failing
+        /// loudly at config time instead of silently at request time. The
+        /// comptime sibling `applyStatic` already rejects the same input
+        /// with a `@compileError`.
+        InvalidExtraHeaderName,
     };
+
+    /// RFC 9110 §5.1 field-name token. `http`'s own validator is private to
+    /// that module, so the rule is restated here rather than widening its
+    /// public surface for one call.
+    fn validFieldName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        for (name) |c| switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9' => {},
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+            else => return false,
+        };
+        return true;
+    }
 
     /// Precompute the header set. `SecurityHeaders.init(.{})` = the secure
     /// defaults. Caller-supplied strings are borrowed (must outlive the
@@ -261,6 +291,9 @@ pub const SecurityHeaders = struct {
             if (options.cross_origin_embedder_policy) |v| assertValueClean(v);
             if (options.server) |v| assertValueClean(v);
             for (options.extra) |h| assertValueClean(h.value);
+        }
+        for (options.extra) |h| {
+            if (!validFieldName(h.name)) return error.InvalidExtraHeaderName;
         }
         var sh: SecurityHeaders = .{ .options = options };
         if (options.hsts) |h| {
@@ -1016,4 +1049,26 @@ test "extra: emitted by the runtime path and counted against the budget" {
     try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(.{
         .extra = &.{.{ .name = "X-Big", .value = huge }},
     }));
+}
+
+test "init rejects an extra header whose NAME is not a field token" {
+    // The value list was validated (Debug-only) while the name -- equally
+    // verbatim on the wire -- was never looked at, so a bad name slipped
+    // through config time and made `setHeader` fail on every request: an
+    // automatic 500 carrying none of this module's headers. That is exactly
+    // the failure shape `InitError` exists to move to config time.
+    try testing.expectError(error.InvalidExtraHeaderName, SecurityHeaders.init(.{
+        .extra = &.{.{ .name = "X Robots Tag", .value = "noindex" }}, // space
+    }));
+    try testing.expectError(error.InvalidExtraHeaderName, SecurityHeaders.init(.{
+        .extra = &.{.{ .name = "", .value = "v" }},
+    }));
+    try testing.expectError(error.InvalidExtraHeaderName, SecurityHeaders.init(.{
+        .extra = &.{.{ .name = "X-Bad:Name", .value = "v" }},
+    }));
+
+    // A legitimate token still configures cleanly.
+    _ = try SecurityHeaders.init(.{
+        .extra = &.{.{ .name = "X-Robots-Tag", .value = "noindex" }},
+    });
 }

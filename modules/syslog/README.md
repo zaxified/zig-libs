@@ -11,7 +11,9 @@
   emitter split of `joelreymont/pz` `src/core/syslog.zig` (MIT).
 - **Platform:** any (pure codec core; the optional `UdpEmitter`/`TcpEmitter`
   use `std.Io.net`, `nowTimestamp` uses posix `clock_gettime`).
-  **Role:** both (codec + client). **Concurrency:** reentrant (no shared
+  **Role:** client (the canonical value is `meta.role` in src/root.zig, which
+  explains why this is deliberately not `both`: `both` reads as "also a syslog
+  server" and would sit on the wrong side of a client/server survey). **Concurrency:** reentrant (no shared
   state). **Allocation:** none — fixed buffers throughout.
 
 Provenance: clean-room from RFC 5424 (syslog protocol), RFC 6587 (TCP octet

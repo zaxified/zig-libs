@@ -21,6 +21,8 @@ Structured HTTP access-log formatter: one `Entry` record per request, emitted to
 | `user_agent` | `?[]const u8` | `User-Agent` header value. |
 | `referer` | `?[]const u8` | `Referer` header value. |
 | `request_id` | `?[]const u8` | Correlation / request id. |
+| `trace_id` | `?[]const u8` | Distributed-trace id (W3C `traceparent`'s trace-id). |
+| `span_id` | `?[]const u8` | Distributed-trace span id. |
 
 Only `timestamp_ns`, `method`, `target`, `status` are required; `protocol` defaults to
 `"HTTP/1.1"`; everything else is `?` and null when unknown.
@@ -43,7 +45,7 @@ malformed either, and it costs nothing extra to support.
 
 One JSON object per line, LF-terminated, **fixed key order** (`ts`, `remote_addr`, `method`,
 `target`, `protocol`, `status`, `request_bytes`, `response_bytes`, `latency_ns`, `user_agent`,
-`referer`, `request_id`), every key always present — an absent optional renders as JSON `null`
+`referer`, `request_id`, `trace_id`, `span_id`), every key always present — an absent optional renders as JSON `null`
 rather than being omitted, so the record has a stable schema for log-pipeline consumers.
 
 **Every emitted line is valid JSON, for any input bytes whatsoever** — see "Encoding contract"

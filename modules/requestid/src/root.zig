@@ -157,7 +157,17 @@ pub fn generateInto(buf: *[generated_len]u8) []const u8 {
     counter +%= 1;
     const ns = monoNs();
     // The address of a thread-local distinguishes threads (each has its own
-    // TLS block), so two threads never collide even within one ns tick.
+    // TLS block). It does NOT make a collision impossible, which this
+    // comment used to claim: TLS blocks are laid out at a fixed stride, so
+    // bits 4..19 of their addresses form an arithmetic progression with a
+    // short period — measured at 128 distinct nonces across 300 live
+    // threads on x86-64 Linux. `monoNs` is not a tiebreak either (two
+    // threads read the same nanosecond in ~2.6% of concurrent samples), and
+    // `counter` starts at 1 on every thread, so under
+    // one-thread-per-connection the first request of two connections can
+    // match on all three. Duplicate ids merge two traces; that is the cost,
+    // and it is a correlation-quality cost only — the module already
+    // disclaims security use, and nothing here is a uniqueness guarantee.
     const nonce: u16 = @truncate(@intFromPtr(&counter) >> 4);
     const printed = std.fmt.bufPrint(buf, "{x:0>16}{x:0>4}{x:0>12}", .{
         ns, nonce, counter & 0xffffffffffff,

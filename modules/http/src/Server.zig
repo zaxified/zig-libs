@@ -851,6 +851,32 @@ fn connMain(s: *Server, stream: net.Stream) void {
     defer stream.close(s.io);
     defer _ = s.active_conns.fetchSub(1, .monotonic); // paired with serve()
 
+    // `on_connect` already admitted this connection up in the accept loop,
+    // but `.new`/`.closed` are fired by the serving functions below — so
+    // every exit that happens BEFORE one of them runs reports nothing at
+    // all. A consumer that counts admissions and decrements on `.closed`
+    // (which is exactly what `abuseguard`'s per-IP and global connection
+    // caps do) then leaks that slot permanently.
+    //
+    // That was not merely the OOM edge it was documented as. With h2c
+    // enabled, `detectH2Preface` below turns a stalled or reset peer into
+    // `error.ReadFailed` and drops the connection — client-triggered, one
+    // idle socket per leaked slot, which is precisely the traffic shape
+    // such a consumer exists to defend against.
+    //
+    // Both states are reported, not just `.closed`: the pair is what an
+    // observer is promised, and a bare `.closed` for a connection it never
+    // saw open is its own inconsistency. `serveStream` and the h2 session
+    // keep firing their own pair — they are public entry points in their
+    // own right — so this runs only when neither of them was reached.
+    var served = false;
+    defer if (!served) {
+        if (s.options.on_conn_state) |hook| {
+            hook(s.options.on_conn_state_ctx, stream.socket.address, .new);
+            hook(s.options.on_conn_state_ctx, stream.socket.address, .closed);
+        }
+    };
+
     const o = &s.options;
     const total = o.read_buffer_size + o.write_buffer_size + o.max_header_bytes +
         o.response_buffer_size + body_scratch_len + chunk_scratch_len + trailer_scratch_len;
@@ -908,6 +934,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
     if (o.enable_h2c) {
         const is_h2 = detectH2Preface(&tr.reader) catch return; // stalled/reset: drop
         if (is_h2) {
+            served = true;
             h2s.serve(s.gpa, .{
                 .handler = o.handler,
                 .context = o.context,
@@ -933,6 +960,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         }
     }
 
+    served = true;
     serveLoop(.{
         .handler = o.handler,
         .context = o.context,
@@ -5925,4 +5953,67 @@ test "the serving frame stays inside its budget" {
         );
         return error.ServingFrameTooLarge;
     }
+}
+
+/// Counts the lifecycle states an admitted connection reports.
+const ConnStateTally = struct {
+    new: std.atomic.Value(u32) = .init(0),
+    closed: std.atomic.Value(u32) = .init(0),
+
+    fn hook(ctx: ?*anyopaque, _: ?net.IpAddress, state: ConnState) void {
+        const t: *ConnStateTally = @ptrCast(@alignCast(ctx.?));
+        switch (state) {
+            .new => _ = t.new.fetchAdd(1, .monotonic),
+            .closed => _ = t.closed.fetchAdd(1, .monotonic),
+            else => {},
+        }
+    }
+};
+
+test "integration: a connection dropped before serving still reports .new/.closed" {
+    // Regression for a connection-slot leak. `on_connect` admits up in the
+    // accept loop, but `.new`/`.closed` are fired by the serving functions --
+    // so an exit before one of them ran reported nothing, and a consumer that
+    // decrements on `.closed` (abuseguard's per-IP and global caps) leaked the
+    // slot forever. With h2c on, `detectH2Preface` turns a peer that sends
+    // nothing into exactly that exit: client-triggered, one idle socket per
+    // leaked slot.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tally: ConnStateTally = .{};
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .enable_h2c = true, // the path that made this client-triggered
+        .on_conn_state = ConnStateTally.hook,
+        .on_conn_state_ctx = &tally,
+    });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    { // connect and close without sending a byte: the preface peek fails
+        const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+            std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        stream.close(io);
+    }
+
+    // Wait for the server task to finish with that connection.
+    var spins: usize = 0;
+    while (server.activeConnections() != 0 and spins < 2000) : (spins += 1)
+        try sleepMs(io, 1);
+
+    try testing.expectEqual(@as(usize, 0), server.activeConnections());
+    // The whole life is reported, and reported in balance -- an admission
+    // counter that pairs these two must come back to zero.
+    try testing.expectEqual(@as(u32, 1), tally.new.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), tally.closed.load(.monotonic));
 }
