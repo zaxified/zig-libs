@@ -376,9 +376,122 @@ fn huffmanDecodeAlloc(gpa: Allocator, input: []const u8, limit: usize) DecodeErr
     return out.toOwnedSlice(gpa);
 }
 
+// ── table-driven decode: 4 bits per step ────────────────────────────────────
+//
+// The shortest Appendix B code is 5 bits, so a 4-bit step can complete at
+// most one symbol (checked at comptime while the table is built). One step
+// is then a single load: `huff_dtable[state][nibble]` says which symbol (if
+// any) completed, whether the step ran into the explicit-EOS error, and
+// which tree node the walk stands on at the nibble boundary — the state for
+// the next step. Both tables are derived from the same `huff_tree` the
+// bit-walk reference uses, so they cannot drift from the RFC data (and a
+// differential fuzz harness at the bottom of this file holds the two
+// decoders equal on arbitrary bytes).
+
+const HuffStep = struct { next: u16, sym: i16 };
+/// `next` value marking a step that completed the EOS symbol — a decoding
+/// error per §5.2 (also used to poison the rows of leaf-node states, which
+/// a correct walk can never stand on at a boundary).
+const huff_step_fail = std.math.maxInt(u16);
+
+const huff_dtable: [513][16]HuffStep = blk: {
+    @setEvalBranchQuota(2_000_000);
+    var table: [513][16]HuffStep = undefined;
+    for (0..513) |state| {
+        for (0..16) |nibble| {
+            table[state][nibble] = .{ .next = huff_step_fail, .sym = -1 };
+            if (huff_tree[state].sym >= 0 and state != 0) continue; // leaf: poisoned row
+            var node: u16 = @intCast(state);
+            var sym: i16 = -1;
+            var ok = true;
+            var bit_i: u3 = 4;
+            while (bit_i > 0) {
+                bit_i -= 1;
+                const bit: u1 = @intCast((nibble >> bit_i) & 1);
+                const child = huff_tree[node].next[bit];
+                if (child == 0) @compileError("huffman table incomplete"); // complete code: never
+                if (huff_tree[child].sym >= 0) {
+                    if (huff_tree[child].sym == eos_symbol) {
+                        ok = false; // explicit EOS: the whole step is an error
+                        break;
+                    }
+                    if (sym >= 0) @compileError("two symbols in one nibble: shortest code < 5 bits?");
+                    sym = huff_tree[child].sym;
+                    node = 0;
+                } else {
+                    node = child;
+                }
+            }
+            if (ok) table[state][nibble] = .{ .next = node, .sym = sym };
+        }
+    }
+    break :blk table;
+};
+
+/// Per-node walk position: how many bits deep the node is, and whether the
+/// path to it is all ones (an EOS prefix) — exactly the two facts the §5.2
+/// padding rule needs about the final state.
+const HuffMeta = struct { depth: u8, all_ones: bool };
+const huff_meta: [513]HuffMeta = blk: {
+    @setEvalBranchQuota(200_000);
+    var meta: [513]HuffMeta = @splat(.{ .depth = 0, .all_ones = true });
+    // BFS from the root: every node's path facts derive from its parent's.
+    var queue: [513]u16 = undefined;
+    queue[0] = 0;
+    var head: usize = 0;
+    var tail: usize = 1;
+    while (head < tail) {
+        const node = queue[head];
+        head += 1;
+        for (huff_tree[node].next, 0..) |child, bit| {
+            if (child == 0) continue;
+            meta[child] = .{
+                .depth = meta[node].depth + 1,
+                .all_ones = meta[node].all_ones and bit == 1,
+            };
+            if (huff_tree[child].sym < 0) {
+                queue[tail] = child;
+                tail += 1;
+            }
+        }
+    }
+    break :blk meta;
+};
+
 /// Huffman-decode `input` onto the end of `out`, under the same rules;
 /// returns how many octets were appended.
 fn huffmanDecodeAppend(gpa: Allocator, out: *std.ArrayList(u8), input: []const u8, limit: usize) DecodeError!usize {
+    const start = out.items.len;
+    // Decoded output can't exceed 8/5 of the input (shortest code, 5 bits);
+    // reserving it up front makes the per-symbol append branch-free. The
+    // reservation is capped by the limit the caller enforces anyway.
+    try out.ensureUnusedCapacity(gpa, @min(limit +| 1, (input.len * 8) / 5 + 1));
+    var node: u16 = 0;
+    for (input) |byte| {
+        const hi = huff_dtable[node][byte >> 4];
+        if (hi.next == huff_step_fail) return error.HuffmanError;
+        if (hi.sym >= 0) {
+            if (out.items.len - start >= limit) return error.HeaderListTooLarge;
+            out.appendAssumeCapacity(@intCast(hi.sym));
+        }
+        const lo = huff_dtable[hi.next][byte & 0xf];
+        if (lo.next == huff_step_fail) return error.HuffmanError;
+        if (lo.sym >= 0) {
+            if (out.items.len - start >= limit) return error.HeaderListTooLarge;
+            out.appendAssumeCapacity(@intCast(lo.sym));
+        }
+        node = lo.next;
+    }
+    // §5.2: padding must be a prefix of EOS (all ones), at most 7 bits.
+    if (node != 0 and (huff_meta[node].depth > 7 or !huff_meta[node].all_ones)) return error.HuffmanError;
+    return out.items.len - start;
+}
+
+/// The original bit-walk decoder, kept as the differential-testing
+/// reference for `huff_dtable` (see the fuzz harness at the bottom): both
+/// derive from `huff_tree`, but this one applies the §5.2 rules bit by bit,
+/// the way the RFC states them.
+fn huffmanDecodeBitwalk(gpa: Allocator, out: *std.ArrayList(u8), input: []const u8, limit: usize) DecodeError!usize {
     const start = out.items.len;
     var node: u16 = 0;
     var depth: u8 = 0; // bits consumed since the last symbol boundary
@@ -1607,4 +1720,67 @@ fn fuzzDecodeBlock(_: void, smith: *std.testing.Smith) !void {
     defer dec.deinit();
     var hl = dec.decodeBlock(buf[0..len]) catch return;
     hl.deinit(testing.allocator);
+}
+
+// ── differential: the table-driven Huffman decoder vs the bit-walk ─────────
+//
+// `huff_dtable`/`huff_meta` and `huffmanDecodeBitwalk` derive from the same
+// tree, but the table bakes the §5.2 rules in at comptime — this holds the
+// two equal (same bytes out, or the same error) on arbitrary input, which
+// is the guard that lets the fast path be trusted with hostile bytes.
+
+fn expectHuffmanDecodersAgree(input: []const u8) !void {
+    var fast: std.ArrayList(u8) = .empty;
+    defer fast.deinit(testing.allocator);
+    var ref: std.ArrayList(u8) = .empty;
+    defer ref.deinit(testing.allocator);
+    const fast_res = huffmanDecodeAppend(testing.allocator, &fast, input, 4096);
+    const ref_res = huffmanDecodeBitwalk(testing.allocator, &ref, input, 4096);
+    if (ref_res) |_| {
+        _ = try fast_res;
+        try testing.expectEqualSlices(u8, ref.items, fast.items);
+    } else |ref_err| {
+        try testing.expectError(ref_err, fast_res);
+    }
+}
+
+test "huffman: table decoder matches the bit-walk on round-trips and edges" {
+    // Round-trips through the module's own encoder.
+    const samples = [_][]const u8{
+        "www.example.com",
+        "no-cache",
+        "custom-key",
+        "custom-value",
+        "Mon, 21 Oct 2013 20:13:21 GMT",
+        "https://www.example.com",
+        "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1",
+        "\x00\x01\xfe\xff binary-ish \x7f",
+        "",
+    };
+    inline for (samples) |s| {
+        var enc_buf: std.ArrayList(u8) = .empty;
+        defer enc_buf.deinit(testing.allocator);
+        try huffmanEncode(testing.allocator, &enc_buf, s);
+        try expectHuffmanDecodersAgree(enc_buf.items);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        _ = try huffmanDecodeAppend(testing.allocator, &out, enc_buf.items, 4096);
+        try testing.expectEqualSlices(u8, s, out.items);
+    }
+    // Edges the padding rule cares about.
+    try expectHuffmanDecodersAgree(&.{0xff}); // 8 bits of EOS prefix: too much padding
+    try expectHuffmanDecodersAgree(&.{ 0xff, 0xff, 0xff, 0xff }); // into the EOS code itself
+    try expectHuffmanDecodersAgree(&.{0x00}); // '0' + 3 pad bits of zeros: bad padding
+    try expectHuffmanDecodersAgree(&.{0x07}); // '0' + 3 one-bits: valid
+}
+
+test "fuzz: huffman table decoder always agrees with the bit-walk" {
+    try testing.fuzz({}, fuzzHuffmanDifferential, .{});
+}
+
+fn fuzzHuffmanDifferential(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    try expectHuffmanDecodersAgree(buf[0..len]);
 }
