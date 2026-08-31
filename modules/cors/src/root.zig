@@ -280,9 +280,14 @@ pub const Cors = struct {
     /// Preflight: answer 204 (no body) and stop — the router never sees it.
     /// CORS headers only when origin + requested method + requested headers
     /// all pass; `Vary` always (rs/cors semantics).
-    fn handlePreflight(c: *const Cors, ctx: *router.Ctx) anyerror!void {
-        const req = ctx.req;
-        const res = ctx.res;
+    ///
+    /// **Public on purpose** (`applyActual`'s twin): a server that is not
+    /// routing through the middleware — its own dispatch, no `router` at
+    /// all — intercepts `OPTIONS` + `Access-Control-Request-Method` itself
+    /// and hands the pair here; this writes the complete preflight response
+    /// head (status included). The caller ends the response and must not
+    /// run a handler afterwards — a preflight is answered, never routed.
+    pub fn applyPreflight(c: *const Cors, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
         res.setStatus(204);
         try res.setHeader("Vary", preflight_vary);
 
@@ -301,10 +306,11 @@ pub const Cors = struct {
         emit: {
             const origin = req.header("Origin") orelse break :emit;
             const acao = c.allowOriginValue(origin) orelse break :emit;
-            // Present: the `allow_unconditional_wildcard` early-return above
-            // is the only way to reach this block with ACRM possibly absent,
-            // and it already returned.
-            const req_method = req.header("Access-Control-Request-Method").?;
+            // The middleware only routes true preflights (ACRM present)
+            // here, but a direct `applyPreflight` caller might not honor
+            // that contract — an absent ACRM is then a failed preflight
+            // (headerless 204), never a crash.
+            const req_method = req.header("Access-Control-Request-Method") orelse break :emit;
             if (!c.methodTokenAllowed(req_method)) break :emit;
             const acrh = req.header("Access-Control-Request-Headers");
             if (c.options.allowed_headers == .list) {
@@ -385,12 +391,17 @@ pub const Cors = struct {
             try res.setHeader("Access-Control-Expose-Headers", c.expose_headers_value);
     }
 
-    // ── the gates ───────────────────────────────────────────────────────
+    // ── the gates — pure, string-level, public ─────────────────────────
+    //
+    // The decision half of both request shapes, decoupled from any request
+    // or response type: a consumer with its own HTTP plumbing runs the same
+    // policy over the raw header values and emits whatever it emits.
 
     /// The `Access-Control-Allow-Origin` value for this request, or null
     /// when the origin is not allowed: `*` for `.any`, else the specific
     /// origin echoed back. Exact byte compare for `.list` (see module doc).
-    fn allowOriginValue(c: *const Cors, origin: []const u8) ?[]const u8 {
+    /// Pure — `origin` is the raw `Origin` header value.
+    pub fn allowOriginValue(c: *const Cors, origin: []const u8) ?[]const u8 {
         return switch (c.options.allowed_origins) {
             .none => null,
             .any => "*", // .any + credentials is rejected at init
@@ -403,8 +414,10 @@ pub const Cors = struct {
 
     /// Case-insensitive method-token check against `allowed_methods`.
     /// OPTIONS is always allowed (rs/cors: the preflight vehicle itself is
-    /// never the thing being permitted).
-    fn methodTokenAllowed(c: *const Cors, token: []const u8) bool {
+    /// never the thing being permitted). Pure — `token` is a raw method
+    /// token (an actual request's method, or a preflight's
+    /// `Access-Control-Request-Method` value).
+    pub fn methodTokenAllowed(c: *const Cors, token: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(token, "OPTIONS")) return true;
         for (c.options.allowed_methods) |m| {
             if (std.ascii.eqlIgnoreCase(token, m.token())) return true;
@@ -414,8 +427,10 @@ pub const Cors = struct {
 
     /// `.list` mode: every header named in the preflight's
     /// `Access-Control-Request-Headers` (comma-separated, OWS-tolerant)
-    /// must be on the configured list (case-insensitive).
-    fn requestedHeadersAllowed(c: *const Cors, acrh: []const u8) bool {
+    /// must be on the configured list (case-insensitive). Pure — `acrh` is
+    /// the raw header value. Asserts `.list` mode (`.reflect` has no list
+    /// to check and the emit paths never call this in it).
+    pub fn requestedHeadersAllowed(c: *const Cors, acrh: []const u8) bool {
         const list = c.options.allowed_headers.list;
         var it = std.mem.splitScalar(u8, acrh, ',');
         while (it.next()) |raw| {
@@ -438,7 +453,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // interceptable, ACRM or not (see the module doc + SPEC.md).
     if (ctx.req.method == .options and
         (ctx.req.header("Access-Control-Request-Method") != null or c.options.allow_unconditional_wildcard))
-        return c.handlePreflight(ctx); // short-circuit: next is never called
+        return c.applyPreflight(ctx.req, ctx.res); // short-circuit: next is never called
     try c.applyActual(ctx.req, ctx.res);
     return next.run(ctx);
 }
@@ -1511,4 +1526,139 @@ test "interop (flask_cors oracle): null/opaque Origin — exact byte compare, no
         try expectStatus(got, "200");
         try expectHeaderLine(got, "Access-Control-Allow-Origin: null");
     }
+}
+
+// ── tests (router-free — the policy on a bare handler) ──────────────────────
+
+/// What a server with its own dispatch does: intercept true preflights into
+/// `applyPreflight`, run `applyActual` before everything else. No `router`
+/// anywhere in this handler.
+fn bareHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror!void {
+    const c: *const Cors = @ptrCast(@alignCast(req.context.?));
+    if (req.method == .options and req.header("Access-Control-Request-Method") != null)
+        return c.applyPreflight(req, res); // answered, never routed
+    try c.applyActual(req, res);
+    try res.writeAll("ok");
+    try res.end();
+}
+
+fn runWireBare(c: *const Cors, bytes: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [512]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = bareHandler,
+        .context = @constCast(c),
+        .server_name = null,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "router-free: applyPreflight + applyActual carry the whole policy" {
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .max_age_s = 600,
+    });
+    defer c.deinit();
+    var buf: [2048]u8 = undefined;
+
+    { // passing preflight: full grant, 204, no body ("ok" never written)
+        const got = runWireBare(&c, wire("OPTIONS", "/t", "Origin: https://app.example\r\nAccess-Control-Request-Method: POST\r\n"), &buf);
+        try expectStatus(got, "204");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, HEAD, POST");
+        try expectHeaderLine(got, "Access-Control-Max-Age: 600");
+        try expectHeaderLine(got, "Vary: " ++ preflight_vary);
+        try testing.expect(std.mem.indexOf(u8, got, "ok") == null);
+    }
+    { // failing preflight (foreign origin): headerless 204, Vary still on
+        const got = runWireBare(&c, wire("OPTIONS", "/t", "Origin: https://evil.example\r\nAccess-Control-Request-Method: POST\r\n"), &buf);
+        try expectStatus(got, "204");
+        try expectNoCorsHeaders(got);
+        try expectHeaderLine(got, "Vary: " ++ preflight_vary);
+    }
+    { // actual request through the same handler
+        const got = runWireBare(&c, wire("GET", "/t", "Origin: https://app.example\r\n"), &buf);
+        try expectStatus(got, "200");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    }
+}
+
+test "applyPreflight: a direct caller breaking the ACRM contract gets a failed preflight, not a crash" {
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+    });
+    defer c.deinit();
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+
+    // A Request with an allowed Origin but no Access-Control-Request-Method
+    // — the middleware never sends this here; a direct caller might.
+    var in: Reader = .fixed(wire("OPTIONS", "/t", "Origin: https://app.example\r\n"));
+    var head_buf: [1024]u8 = undefined;
+    var req_body_buf: [64]u8 = undefined;
+    var resp_body_buf: [256]u8 = undefined;
+    var chunk2_buf: [64]u8 = undefined;
+    var out2_buf: [512]u8 = undefined;
+    var out2: Writer = .fixed(&out2_buf);
+    const Probe = struct {
+        var cors_ptr: *const Cors = undefined;
+        var rw_ptr: *http.Server.ResponseWriter = undefined;
+        fn h(rq: *http.Server.Request, _: *http.Server.ResponseWriter) anyerror!void {
+            // Drive applyPreflight against the OUTER writer so the emitted
+            // head can be inspected without this stream's own framing.
+            try cors_ptr.applyPreflight(rq, rw_ptr);
+        }
+    };
+    Probe.cors_ptr = &c;
+    Probe.rw_ptr = &rw;
+    http.Server.serveStream(.{ .handler = Probe.h, .server_name = null }, &in, &out2, .{
+        .head = &head_buf,
+        .request_body = &req_body_buf,
+        .response_body = &resp_body_buf,
+        .chunk = &chunk2_buf,
+    });
+    try rw.end();
+    const got = out.buffered();
+    try expectStatus(got, "204");
+    try expectNoCorsHeaders(got);
+    try expectHeaderLine(got, "Vary: " ++ preflight_vary);
+}
+
+// ── fuzz: the pure gates never panic on hostile header bytes ────────────────
+
+fn fuzzGates(_: void, smith: *std.testing.Smith) !void {
+    var buf: [96]u8 = undefined;
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const bytes = buf[0..len];
+
+    // Policies live on the stack — the gates allocate nothing.
+    const listed: Cors = .{
+        .gpa = testing.failing_allocator,
+        .options = .{
+            .allowed_origins = .{ .list = &.{ "https://app.example", "null" } },
+            .allowed_headers = .{ .list = &.{ "Content-Type", "Authorization" } },
+        },
+        .allow_methods_value = "",
+        .allow_headers_value = "",
+        .expose_headers_value = "",
+    };
+    _ = listed.allowOriginValue(bytes);
+    _ = listed.methodTokenAllowed(bytes);
+    _ = listed.requestedHeadersAllowed(bytes);
+}
+test "fuzz: allowOriginValue/methodTokenAllowed/requestedHeadersAllowed never panic" {
+    try testing.fuzz({}, fuzzGates, .{});
 }

@@ -155,6 +155,26 @@ that sets `Vary` on a CORS route must include `Origin` in its own list**
 `OPTIONS` routes) and `Access-Control-Allow-Private-Network` are out of
 scope for now.
 
+## Without the router
+
+The middleware is a thin dispatcher over two public halves — a server with
+its own dispatch (no `router` anywhere) consumes the same policy directly:
+
+```zig
+fn handler(req: *http.Server.Request, res: *http.Server.ResponseWriter) !void {
+    if (req.method == .options and req.header("Access-Control-Request-Method") != null)
+        return my_cors.applyPreflight(req, res); // full 204 head; answered, never routed
+    try my_cors.applyActual(req, res); // before anything else touches the head
+    // ... your own dispatch ...
+}
+```
+
+For plumbing that does not even share `http`'s request type, the decision
+half is public as three pure string-level gates over raw header values:
+`allowOriginValue(origin)` (returns the `Access-Control-Allow-Origin` value
+to emit, or null), `methodTokenAllowed(token)` and
+`requestedHeadersAllowed(acrh)`.
+
 ## Header timing vs. `ResponseWriter.reset()`
 
 `cors` sets its actual-request headers **before** `next.run` — i.e. before
