@@ -255,6 +255,10 @@ pub fn Window(comptime S: type, comptime capacity: usize) type {
         held: [capacity]?Entry = @splat(null),
         next_slot: usize = 0,
         max_forward_jump: u32 = default_max_forward_jump,
+        /// The final generation (`maxInt(u32)`) has been served. There is no
+        /// generation after it to advance into, so the ratchet cannot mark it
+        /// consumed the way it marks every other one — this flag does.
+        final_spent: bool = false,
 
         pub fn init(base_secret: [S.Nh]u8) Self {
             return .{ .ratchet = Ratchet(S).init(base_secret) };
@@ -284,6 +288,19 @@ pub fn Window(comptime S: type, comptime capacity: usize) type {
                 return error.GenerationConsumed;
             }
 
+            // ⭐ The one generation the ratchet cannot consume by advancing
+            // past it. Without this, `get(maxInt(u32))` returned the SAME
+            // key/nonce every time it was called: `advance` answers
+            // `RatchetExhausted`, the arm below swallows it, and the
+            // generation never moves — so the module's own guarantee ("a key
+            // is erased the moment it is returned ... replay of a captured
+            // message fails with `error.GenerationConsumed`") failed exactly
+            // at the end of the epoch, where an attacker who has already
+            // driven the ratchet there can replay one captured message
+            // without limit.
+            if (self.final_spent and generation == self.ratchet.generation)
+                return error.GenerationConsumed;
+
             if (generation - self.ratchet.generation > self.max_forward_jump) {
                 return error.GenerationTooFarAhead;
             }
@@ -298,8 +315,14 @@ pub fn Window(comptime S: type, comptime capacity: usize) type {
             // unrepeatable: it is neither the current generation any more
             // nor retained.
             self.ratchet.advance() catch |err| switch (err) {
-                // The last generation of the epoch is still usable once.
-                error.RatchetExhausted => {},
+                // The last generation of the epoch is usable exactly ONCE.
+                // There is nothing to advance into, so the flag is what makes
+                // "once" true; the secret is wiped here for the same reason
+                // `advance` wipes the one it steps off.
+                error.RatchetExhausted => {
+                    self.final_spent = true;
+                    self.ratchet.wipe();
+                },
                 else => return err,
             };
             return kn;
@@ -480,6 +503,27 @@ test "Window: eviction past capacity, and a huge forward jump is refused not com
     _ = try w2.get(4);
 
     w.wipe();
+    try testing.expectEqualSlices(u8, &[_]u8{0} ** TestSuite.Nh, &w.ratchet.secret);
+}
+
+test "Window: the FINAL generation is consumed too — a replay of it is refused" {
+    // ⭐ The end of the epoch is where "consumed" used to stop meaning
+    // anything: `get` consumes a generation by advancing past it, and there
+    // is nothing past `maxInt(u32)`, so the swallowed `RatchetExhausted` left
+    // the ratchet parked and every later call returned the SAME key/nonce.
+    // An attacker who has driven a sender's ratchet to the end could then
+    // replay one captured message without limit, against a module whose doc
+    // promises the opposite.
+    const base = [_]u8{0x62} ** TestSuite.Nh;
+    var w = Window(TestSuite, 2).init(base);
+    // Park the ratchet on the last generation without paying 2^32 KDF calls.
+    w.ratchet.generation = std.math.maxInt(u32);
+
+    const first = try w.get(std.math.maxInt(u32));
+    try testing.expectError(error.GenerationConsumed, w.get(std.math.maxInt(u32)));
+    try testing.expectError(error.GenerationConsumed, w.get(std.math.maxInt(u32)));
+    // The served key is still a real one, and the spent secret is gone.
+    try testing.expect(!std.mem.allEqual(u8, &first.key, 0));
     try testing.expectEqualSlices(u8, &[_]u8{0} ** TestSuite.Nh, &w.ratchet.secret);
 }
 

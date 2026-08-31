@@ -235,8 +235,17 @@ fn resolutionInto(
         try list.append(allocator, index);
         switch (node) {
             .parent => |p| for (p.unmerged_leaves) |li| {
-                if (isExcludedLeaf(excluded, 2 * @as(usize, li))) continue;
-                try list.append(allocator, 2 * @as(usize, li));
+                const n = 2 * @as(usize, li);
+                // ⭐ Defence in depth. `tree.RatchetTree.validateUnmergedLeaves`
+                // rejects an out-of-range entry when the tree is decoded, which
+                // is where a hostile tree enters — but this loop is what turns
+                // the entry into an ARRAY SUBSCRIPT that callers then use to
+                // read `nodes`, so it does not get to assume its input was
+                // vetted. A tree assembled in memory rather than decoded (a
+                // committer's own staging, a future caller) reaches here too.
+                if (n >= t.nodes.len) return error.Malformed;
+                if (isExcludedLeaf(excluded, n)) continue;
+                try list.append(allocator, n);
             },
             .leaf => {},
         }

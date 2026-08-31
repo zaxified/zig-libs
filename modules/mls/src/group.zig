@@ -710,6 +710,12 @@ pub fn Group(comptime S: type) type {
 
             // ── §12.4.3.3's tree + §12.4.3.1's integrity block.
             var rt = try verifiedTreeFromGroupInfo(gpa, arena, group_info, params.ratchet_tree);
+            // §7.3's whole-tree uniqueness. The other tree-ingest paths reach
+            // it through `checkKeyUniqueness` after their epoch transition;
+            // this one has no epoch transition to hang it on, and skipping it
+            // here left the single largest untrusted input in the module
+            // unchecked for it — see `checkTreeKeyUniqueness`.
+            if (params.policy.check_key_uniqueness) try checkTreeKeyUniqueness(&rt);
 
             // ── §8: the epoch, entered at joiner_secret.
             const gc_bytes = group_info.raw.?.group_context;
@@ -1140,6 +1146,19 @@ pub fn Group(comptime S: type) type {
             self.epoch += 1;
             self.tree_hash = new_tree_hash;
             self.confirmed_transcript_hash = hashes.confirmed;
+            // ⭐ The LENGTH travels with the hash. `commitInner` maintains
+            // this (its own adopt block does the same) and every entry point
+            // sets it, but this block did not — so a group whose
+            // `confirmed_len` was 0 (epoch 0's zero-length hash, §8.2, which
+            // `create` sets and which a `GroupInfo` may legitimately carry)
+            // kept reporting a zero-length confirmed hash forever after its
+            // first processed Commit. `groupContext()` slices with it, so
+            // from then on this member encodes an empty `opaque<V>` where its
+            // peers encode a digest: every later signature and membership tag
+            // it checks or produces is computed over different bytes than the
+            // rest of the group uses. Silent, permanent, single-member
+            // desync.
+            self.confirmed_len = hashes.confirmed.len;
             self.interim_transcript_hash = hashes.interim;
             self.extensions = new_extensions;
             self.secrets = secrets;
@@ -2351,6 +2370,24 @@ pub fn Group(comptime S: type) type {
             errdefer added.deinit(gpa);
             for (resolved) |rp| switch (rp.proposal) {
                 .add => |kp| {
+                    // ⭐ §12.1.1 makes an Add invalid if its KeyPackage is
+                    // invalid per §10.1, and §12.2 opens with "A group member
+                    // creating a Commit AND a group member processing a
+                    // Commit MUST verify..." — both directions, the same
+                    // checks. `commitInner` ran these three; this, the side
+                    // that reads a STRANGER's bytes, ran only the inner leaf's
+                    // signature.
+                    //
+                    // The KeyPackage signature is the only thing binding
+                    // `init_key`, `version` and `cipher_suite` to the leaf.
+                    // Without it a malicious committer lifts a victim's
+                    // genuine published LeafNode, wraps it in a KeyPackage
+                    // carrying an attacker-chosen `init_key`, and every
+                    // receiver seats a "member" whose KeyPackage its claimed
+                    // owner never signed — while any conforming peer rejects
+                    // the same Commit, splitting the group.
+                    if (kp.cipher_suite != S.id or kp.version != .mls10) return error.KeyPackageMismatch;
+                    try kp.verifySignature(S, gpa);
                     try verifyLeafSignature(S, gpa, kp.leaf_node, .key_package, null, null);
                     try self.checkLeafSelfConsistent(kp.leaf_node);
                     const owned = try dupLeafNode(arena, kp.leaf_node);
@@ -2821,7 +2858,24 @@ pub fn Group(comptime S: type) type {
         /// not of any one leaf, and no earlier point can see it.
         fn checkKeyUniqueness(self: *const Self) !void {
             if (!self.policy.check_key_uniqueness) return;
-            const nodes = self.ratchet_tree.nodes;
+            return checkTreeKeyUniqueness(&self.ratchet_tree);
+        }
+
+        /// The same rules over a tree that is not yet installed in a group —
+        /// which is the shape `fromWelcome` needs, since the tree it is
+        /// validating arrives before there is a `Self` to hang it on.
+        ///
+        /// ⭐ Splitting this out is the fix, not a tidy-up: joining from a
+        /// `Welcome` is the ONE moment an entire tree arrives from an
+        /// untrusted party in a single step, and it was the only tree-ingest
+        /// path that never ran this check. §7.3's uniqueness is not
+        /// expressible per leaf, so nothing else caught it: a hostile
+        /// committer could seat one member's genuine, correctly-signed
+        /// `key_package`-sourced LeafNode at two indices — §7.2 binds neither
+        /// `group_id` nor `leaf_index` for that source, so both copies verify
+        /// — and the joiner would report two members with one identity.
+        fn checkTreeKeyUniqueness(t: *const tree.RatchetTree) !void {
+            const nodes = t.nodes;
             for (nodes, 0..) |maybe_a, i| {
                 const a = maybe_a orelse continue;
                 const a_enc = switch (a) {

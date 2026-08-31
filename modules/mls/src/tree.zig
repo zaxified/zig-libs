@@ -637,7 +637,47 @@ pub const RatchetTree = struct {
         }
         const target = paddedWidth(list.items.len);
         while (list.items.len < target) try list.append(allocator, null);
-        return .{ .allocator = allocator, .nodes = try list.toOwnedSlice(allocator) };
+        var t: RatchetTree = .{ .allocator = allocator, .nodes = try list.toOwnedSlice(allocator) };
+        errdefer t.deinit();
+        try t.validateUnmergedLeaves();
+        return t;
+    }
+
+    /// ⭐ RFC 9420 §7.1: every entry of a `ParentNode.unmerged_leaves` is a
+    /// LEAF INDEX in this tree. The wire type is a bare `u32` and
+    /// `ParentNode.decode` cannot check it — a node does not know the tree it
+    /// will land in — so the check belongs here, at the first moment the tree
+    /// exists, and it must run before anything walks the nodes.
+    ///
+    /// **This is a memory-safety boundary, not a tidiness check.**
+    /// `treekem.resolution` turns each entry into the node index `2 * li`
+    /// (§4.1.1's doubling) and callers subscript `nodes` with the result:
+    /// `validateParentHashes` reads `parentHashField(t, d_idx)` for every
+    /// entry of a resolution. An unchecked entry is therefore an attacker-
+    /// chosen array subscript, reachable from a `Welcome` before any
+    /// credential or leaf signature has been looked at — a remote panic in
+    /// safe builds, and in ReleaseFast a wild read whose result decides
+    /// whether the tree is accepted.
+    pub fn validateUnmergedLeaves(self: RatchetTree) !void {
+        const n_leaves = self.nLeaves();
+        for (self.nodes) |maybe| {
+            const node = maybe orelse continue;
+            const p = switch (node) {
+                .parent => |pn| pn,
+                .leaf => continue,
+            };
+            var prev: ?u32 = null;
+            for (p.unmerged_leaves) |li| {
+                if (li >= n_leaves) return error.Malformed;
+                // §7.1 also fixes the order ("sorted in increasing order"),
+                // and it is load-bearing rather than cosmetic: the §7.9.2
+                // link criterion compares this list as a SET against a
+                // resolution, so duplicates would let one leaf stand in for
+                // several and change which trees are judged valid.
+                if (prev) |q| if (li <= q) return error.Malformed;
+                prev = li;
+            }
+        }
     }
 
     /// The mirror of `decode`: trims trailing blanks (RFC 9420 §12.4.3.3:
@@ -810,6 +850,15 @@ pub const RatchetTree = struct {
             const right_subtree = self.nodes[2 * left_idx + 2 ..];
             if (hasNonBlankLeaf(right_subtree)) break;
             for (right_subtree) |m| if (m) |n| n.deinit(self.allocator);
+            // ⭐ The current ROOT (index `2*left_idx+1`) is dropped by the
+            // realloc too — it sits between the left subtree and
+            // `right_subtree`, so the loop above steps over it. On the FIRST
+            // iteration it is already blank, because the removed leaf's
+            // direct path ends at the root; on a LATER one the node being
+            // dropped need never have been on that path, and its
+            // `unmerged_leaves` allocation went with the realloc. `blank`
+            // is null-safe, so covering both costs nothing.
+            self.blank(2 * left_idx + 1);
             self.nodes = try self.allocator.realloc(self.nodes, 2 * left_idx + 1);
             n_leaves = self.nLeaves();
         }
@@ -945,6 +994,69 @@ test "§7.1: withAppendedUnmerged inserts in order, not at the end" {
     const right = try node.withAppendedUnmerged(gpa, 9);
     defer gpa.free(right.unmerged_leaves);
     try std.testing.expectEqualSlices(u32, &.{ 2, 5, 9 }, right.unmerged_leaves);
+}
+
+test "§7.1: a peer-supplied unmerged leaf index outside the tree is refused at decode" {
+    // ⭐⭐ The array subscript a hostile `Welcome` used to control. Every
+    // entry here is doubled into a NODE index by `treekem.resolution`, and
+    // `validateParentHashes` — which runs on a stranger's tree before any
+    // credential or signature is examined — reads `nodes[that index]`. An
+    // out-of-range entry was a remote panic in safe builds and, in
+    // ReleaseFast, a wild read whose result decided whether the tree was
+    // accepted.
+    const gpa = std.testing.allocator;
+
+    // A 2-leaf tree: node 0 = leaf, node 1 = parent, node 2 = leaf. The
+    // parent claims leaf 0x7FFFFFFF, i.e. node index 0xFFFFFFFE.
+    var buf: [512]u8 = undefined;
+    var w = codec.Writer.init(&buf);
+    var body: [512]u8 = undefined;
+    var bw = codec.Writer.init(&body);
+    try bw.writePresence(false); // node 0: blank leaf
+    try bw.writePresence(true); // node 1: the hostile parent
+    try bw.writeU8(@intFromEnum(NodeType.parent));
+    try bw.writeVector(&.{}); // encryption_key
+    try bw.writeVector(&.{}); // parent_hash
+    try wire.encodeU32Vec(&bw, &[_]u32{0x7FFF_FFFF}); // unmerged_leaves
+    try bw.writePresence(false); // node 2: blank leaf
+    try w.writeVector(bw.finish());
+
+    var r = codec.Reader.init(w.finish());
+    try std.testing.expectError(error.Malformed, RatchetTree.decode(gpa, &r));
+
+    // §7.1's ordering is enforced with it: an unsorted or duplicated list
+    // would let one leaf stand in for several in the §7.9.2 set comparison.
+    var body2: [512]u8 = undefined;
+    var bw2 = codec.Writer.init(&body2);
+    try bw2.writePresence(false);
+    try bw2.writePresence(true);
+    try bw2.writeU8(@intFromEnum(NodeType.parent));
+    try bw2.writeVector(&.{});
+    try bw2.writeVector(&.{});
+    try wire.encodeU32Vec(&bw2, &[_]u32{ 1, 1 }); // in range, but duplicated
+    try bw2.writePresence(false);
+    var buf2: [512]u8 = undefined;
+    var w2 = codec.Writer.init(&buf2);
+    try w2.writeVector(bw2.finish());
+    var r2 = codec.Reader.init(w2.finish());
+    try std.testing.expectError(error.Malformed, RatchetTree.decode(gpa, &r2));
+
+    // A well-formed tree with an in-range, ascending list still decodes.
+    var body3: [512]u8 = undefined;
+    var bw3 = codec.Writer.init(&body3);
+    try bw3.writePresence(false);
+    try bw3.writePresence(true);
+    try bw3.writeU8(@intFromEnum(NodeType.parent));
+    try bw3.writeVector(&.{});
+    try bw3.writeVector(&.{});
+    try wire.encodeU32Vec(&bw3, &[_]u32{1});
+    try bw3.writePresence(false);
+    var buf3: [512]u8 = undefined;
+    var w3 = codec.Writer.init(&buf3);
+    try w3.writeVector(bw3.finish());
+    var r3 = codec.Reader.init(w3.finish());
+    var ok = try RatchetTree.decode(gpa, &r3);
+    ok.deinit();
 }
 
 // ── fuzz: the untrusted-wire tree decoders never panic/OOB ────────────────
