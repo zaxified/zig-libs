@@ -1668,6 +1668,15 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         rw.setHeader("Content-Type", "text/plain") catch return .close;
         rw.writeAll("Internal Server Error\n") catch return .close;
     };
+    // A detached response stays OPEN: no `end`, no chunked terminator, no
+    // keep-alive — the loop stops (`.close`) and the embedder that knows
+    // about the detach keeps writing the body (an SSE pump, say) before it
+    // closes the socket. An embedder that does not know simply closes, which
+    // is the h1 behavior `ResponseWriter.detach` documents.
+    if (rw.detached) {
+        rw.flush() catch return .close;
+        return .close;
+    }
     rw.end() catch {
         // Framing failed. When nothing hit the wire yet (e.g. the body did
         // not match a declared Content-Length), a 500 still fits; either
@@ -2600,13 +2609,19 @@ pub const ResponseWriter = struct {
         return rw.sent_head;
     }
 
-    /// HTTP/2 only: hand the stream back to the connection with the response
-    /// left OPEN — no END_STREAM — so the embedder can keep pushing bytes on
-    /// it after the handler returns (`h2_server.Detached`). The single-task
-    /// h2 serve loop honors it for a request that has fully arrived; every
-    /// other serving path (HTTP/1.1, the h2 dispatcher path) ignores the
-    /// flag and finishes the response normally, because there the handler's
-    /// return IS the end of the response's lifetime.
+    /// Hand the response back to the embedder with its framing left OPEN —
+    /// the handler returns, and the response is not ended.
+    ///
+    /// On h2 (single task): the stream stays open past the handler and the
+    /// embedder pushes DATA on it through `h2_server.Detached` (no
+    /// END_STREAM until it closes the stream). On h1: the serve loop stops
+    /// without writing the chunked terminator and reports `.close`; an
+    /// embedder that detached on purpose keeps writing body bytes — framed
+    /// as the response was (chunked, unless the handler declared otherwise)
+    /// — and then closes the socket, while one that did not simply closes,
+    /// so a stray detach degrades to a truncated-looking close rather than
+    /// a corrupted next response. The h2 dispatcher path ignores the flag
+    /// and finishes normally.
     pub fn detach(rw: *ResponseWriter) void {
         rw.detached = true;
     }
