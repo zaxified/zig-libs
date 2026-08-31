@@ -139,25 +139,43 @@ fn stripCrlf(raw: []const u8) HeadParseError![]const u8 {
     return raw[0 .. raw.len - 1];
 }
 
+// Byte-class tables for the head parser's hot loops: a 256-entry table
+// turns each RFC character-class test into one load and one branch. The
+// switch-form predicate (`isTchar`) stays the readable definition and the
+// table is derived from it at comptime, so the two cannot drift.
+const tchar_table: [256]bool = blk: {
+    var t: [256]bool = @splat(false);
+    for (0..256) |c| t[c] = isTchar(c);
+    break :blk t;
+};
+// field-value = *(field-vchar / SP / HTAB), field-vchar = VCHAR / obs-text
+// (RFC 9110 §5.5): a control byte -- NUL, a bare CR, anything below 0x20
+// but HTAB, or DEL -- cannot appear in a value, and is the classic vehicle
+// for header injection. Bytes >= 0x80 are obs-text and stay legal.
+const value_char_table: [256]bool = blk: {
+    var t: [256]bool = @splat(false);
+    for (0..256) |c| t[c] = !((c < 0x20 and c != '\t') or c == 0x7f);
+    break :blk t;
+};
+
 /// Strict header-line split (no obs-fold, no whitespace around the name);
 /// the value is trimmed of optional whitespace. `line` must be non-empty and
 /// already stripped of its line ending.
 fn parseHeaderLine(line: []const u8) HeadParseError!HeaderEntry {
-    if (line[0] == ' ' or line[0] == '\t') return error.MalformedHead; // obs-fold
-    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHead;
-    const name = line[0..colon];
     // field-name = token (RFC 9110 §5.1): a name that is not a token is not
     // a header, and a server that stores it under whatever bytes it got has
     // let "Bad[Name", "Transfer\x00Encoding" and every non-ASCII spelling
-    // through as headers nobody will ever match.
-    if (name.len == 0) return error.MalformedHead;
-    for (name) |c| if (!isTchar(c)) return error.MalformedHead;
-    const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-    // field-value = *(field-vchar / SP / HTAB), field-vchar = VCHAR / obs-text
-    // (§5.5): a control byte -- NUL, a bare CR, anything below 0x20 but
-    // HTAB, or DEL -- cannot appear in a value, and is the classic vehicle
-    // for header injection. Bytes >= 0x80 are obs-text and stay legal.
-    for (value) |c| if ((c < 0x20 and c != '\t') or c == 0x7f) return error.MalformedHead;
+    // through as headers nobody will ever match. One table-driven pass both
+    // finds the colon and validates the name: the scan stops at the first
+    // non-tchar, which must BE the colon — and that subsumes the old
+    // explicit checks (obs-fold: ' '/'\t' is not a tchar, so a folded line
+    // stops at 0; empty name: ':' first stops at 0 too).
+    var i: usize = 0;
+    while (i < line.len and tchar_table[line[i]]) i += 1;
+    if (i == 0 or i >= line.len or line[i] != ':') return error.MalformedHead;
+    const name = line[0..i];
+    const value = std.mem.trim(u8, line[i + 1 ..], " \t");
+    for (value) |c| if (!value_char_table[c]) return error.MalformedHead;
     return .{ .name = name, .value = value };
 }
 
@@ -202,9 +220,19 @@ fn iterateHeaderBlock(block: []const u8) HeaderIterator {
 }
 
 fn findHeader(block: []const u8, name: []const u8) ?[]const u8 {
-    var it = iterateHeaderBlock(block);
-    while (it.next()) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
+    // The block was already validated by parse (names are tokens, so no
+    // name contains ':'), which licenses a cheap shape probe per line: the
+    // header can match only if the byte AT `name.len` is the colon. Almost
+    // every non-matching line fails that one-byte test, so the per-line
+    // cost of a lookup is a split and a load -- the full case-insensitive
+    // compare and the value trim run only on a length-matching candidate.
+    // (A shorter real name puts its ':' or the SP after it inside the
+    // compared window, where `name` -- a token -- can never match it.)
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    while (lines.next()) |raw| {
+        if (raw.len <= name.len or raw[name.len] != ':') continue;
+        if (!std.ascii.eqlIgnoreCase(raw[0..name.len], name)) continue;
+        return std.mem.trim(u8, trimLineEnd(raw)[name.len + 1 ..], " \t");
     }
     return null;
 }
@@ -427,29 +455,39 @@ pub const RequestHead = struct {
             if (line.len == 0) continue; // tolerate a stray blank CRLF line
             const entry = try parseHeaderLine(line);
 
-            if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
-                head.has_content_length = true;
-                try latchContentLength(&head.content_length, entry.value);
-            } else if (std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding")) {
-                head.has_transfer_encoding = true;
-                // RFC 9112 §6.1: when `chunked` is present it MUST be the
-                // final transfer-coding; this server supports no other
-                // coding, so the only accepted value is the single token
-                // "chunked". Merely *containing* chunked (e.g.
-                // "chunked, gzip", or the "chunked, chunked" double-chunk
-                // vector) is a TE.TE request-smuggling primitive — leaving
-                // `chunked` false here routes it through the
-                // `has_transfer_encoding and !chunked` → 400 gate below.
-                if (std.ascii.eqlIgnoreCase(entry.value, "chunked")) head.chunked = true;
-            } else if (std.ascii.eqlIgnoreCase(entry.name, "connection")) {
-                if (tokenListContains(entry.value, "close")) head.connection_close = true;
-                if (tokenListContains(entry.value, "keep-alive")) head.connection_keep_alive = true;
-            } else if (std.ascii.eqlIgnoreCase(entry.name, "host")) {
-                if (head.host != null) return error.MalformedHead; // request smuggling
-                if (!isValidHost(entry.value)) return error.MalformedHead;
-                head.host = entry.value;
-            } else if (std.ascii.eqlIgnoreCase(entry.name, "expect")) {
-                if (std.ascii.eqlIgnoreCase(entry.value, "100-continue")) head.expect_continue = true;
+            // Length first: every framing-relevant name has a distinct
+            // length, so the typical uninteresting header pays one integer
+            // compare here instead of five case-insensitive scans.
+            switch (entry.name.len) {
+                "content-length".len => if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
+                    head.has_content_length = true;
+                    try latchContentLength(&head.content_length, entry.value);
+                },
+                "transfer-encoding".len => if (std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding")) {
+                    head.has_transfer_encoding = true;
+                    // RFC 9112 §6.1: when `chunked` is present it MUST be the
+                    // final transfer-coding; this server supports no other
+                    // coding, so the only accepted value is the single token
+                    // "chunked". Merely *containing* chunked (e.g.
+                    // "chunked, gzip", or the "chunked, chunked" double-chunk
+                    // vector) is a TE.TE request-smuggling primitive — leaving
+                    // `chunked` false here routes it through the
+                    // `has_transfer_encoding and !chunked` → 400 gate below.
+                    if (std.ascii.eqlIgnoreCase(entry.value, "chunked")) head.chunked = true;
+                },
+                "connection".len => if (std.ascii.eqlIgnoreCase(entry.name, "connection")) {
+                    if (tokenListContains(entry.value, "close")) head.connection_close = true;
+                    if (tokenListContains(entry.value, "keep-alive")) head.connection_keep_alive = true;
+                },
+                "host".len => if (std.ascii.eqlIgnoreCase(entry.name, "host")) {
+                    if (head.host != null) return error.MalformedHead; // request smuggling
+                    if (!isValidHost(entry.value)) return error.MalformedHead;
+                    head.host = entry.value;
+                },
+                "expect".len => if (std.ascii.eqlIgnoreCase(entry.name, "expect")) {
+                    if (std.ascii.eqlIgnoreCase(entry.value, "100-continue")) head.expect_continue = true;
+                },
+                else => {},
             }
         }
 
