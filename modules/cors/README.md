@@ -175,6 +175,20 @@ half is public as three pure string-level gates over raw header values:
 to emit, or null), `methodTokenAllowed(token)` and
 `requestedHeadersAllowed(acrh)`.
 
+## Static CORS (comptime, constant grant)
+
+When the whole policy is a build-time constant — a public read-only API granting one origin (or
+`*`) to everybody — skip `Cors` entirely:
+
+```zig
+const policy: cors.StaticOptions = .{ .allow_origin = "*", .expose_headers = "ETag" };
+if (cors.isPreflight(req)) return cors.applyPreflightStatic(policy, req, res); // full 204 grant
+try cors.applyActualStatic(policy, res); // before anything else touches the head
+```
+
+No gates, no `Vary`, no allocation; validation is compile errors. See SPEC.md "Static CORS" for
+why this is its own posture and not a comptime twin of the gated `Options`.
+
 ## Header timing vs. `ResponseWriter.reset()`
 
 `cors` sets its actual-request headers **before** `next.run` — i.e. before

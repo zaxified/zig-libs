@@ -458,6 +458,100 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     return next.run(ctx);
 }
 
+// ── static CORS (deliberate deviation, comptime) ────────────────────────────
+//
+// The second named posture beside `allow_unconditional_wildcard`, for the
+// same adoption reason (SPEC.md): a public read-only API whose grant is a
+// BUILD-TIME CONSTANT — one origin value (`*` or one fixed origin) stamped
+// on every response and every preflight, regardless of `Origin`. No gates
+// run, so there is nothing to precompute, nothing to allocate and no `Vary`
+// to emit (the response never varies by request); the whole policy compiles
+// to `setHeaderStatic` slot writes. Spelled as its own option set rather
+// than a comptime twin of `Options` because the semantics genuinely differ:
+// gated CORS decides per request, static CORS decided when the binary was
+// built. A deployment that needs different answers for different origins
+// needs the gated `Cors`, not a flag here.
+//
+// `allow_credentials` is structurally absent on purpose: a constant grant
+// with credentials would hand every website credentialed access — the exact
+// combination `Cors.init` rejects — so the knob does not exist to misuse.
+
+/// The static-grant policy. Every field is comptime data; validation
+/// happens at compile time inside the apply functions.
+pub const StaticOptions = struct {
+    /// The `Access-Control-Allow-Origin` value: `"*"`, or one fixed origin
+    /// such as `"https://app.example"`. Sent on every actual response and
+    /// every preflight answer, regardless of the request's `Origin`.
+    allow_origin: []const u8 = "*",
+    /// Preflight `Access-Control-Allow-Methods`, verbatim. The default is
+    /// the read-only pair — the shape this posture exists for; a server
+    /// that takes writes names them explicitly ("GET, HEAD, POST").
+    allow_methods: []const u8 = "GET, HEAD",
+    /// Preflight `Access-Control-Allow-Headers`. Null reflects the
+    /// request's `Access-Control-Request-Headers` verbatim (the `.reflect`
+    /// stance of the gated middleware; header names are not sensitive and
+    /// the codec refuses CR/LF, so a hostile value fails the preflight
+    /// instead of splitting the response).
+    allow_headers: ?[]const u8 = null,
+    /// Preflight `Access-Control-Max-Age`, seconds. 0 omits the header.
+    /// A day by default, because the grant is static — it cannot change
+    /// without a new binary.
+    max_age_s: u32 = 86_400,
+    /// `Access-Control-Expose-Headers` on actual responses; null omits.
+    expose_headers: ?[]const u8 = null,
+};
+
+/// True for a real preflight: `OPTIONS` carrying
+/// `Access-Control-Request-Method`. The interception test a router-free
+/// consumer runs before choosing `applyPreflightStatic` over
+/// `applyActualStatic`.
+pub fn isPreflight(req: *const http.Server.Request) bool {
+    return req.method == .options and req.header("Access-Control-Request-Method") != null;
+}
+
+/// The actual-response half of the static posture: the constant grant (and
+/// the optional expose list), paid at compile time. Call it before anything
+/// else touches the response head, on every response the server chooses to
+/// give.
+pub fn applyActualStatic(comptime o: StaticOptions, res: *http.Server.ResponseWriter) error{ HeadersSent, TooManyHeaders }!void {
+    comptime validateStatic(o);
+    try res.setHeaderStatic("Access-Control-Allow-Origin", o.allow_origin);
+    if (comptime o.expose_headers) |v| try res.setHeaderStatic("Access-Control-Expose-Headers", v);
+}
+
+/// The preflight half of the static posture: writes the complete 204 head —
+/// always a grant, no gates. The caller intercepts (`isPreflight`), ends
+/// the response afterwards, and never routes it. The one runtime path is
+/// header reflection (`allow_headers = null`), which echoes the request's
+/// own slice through the validating `setHeader`.
+pub fn applyPreflightStatic(comptime o: StaticOptions, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
+    comptime validateStatic(o);
+    res.setStatus(204);
+    try res.setHeaderStatic("Access-Control-Allow-Origin", o.allow_origin);
+    try res.setHeaderStatic("Access-Control-Allow-Methods", o.allow_methods);
+    if (comptime o.allow_headers) |h| {
+        try res.setHeaderStatic("Access-Control-Allow-Headers", h);
+    } else if (req.header("Access-Control-Request-Headers")) |h| {
+        if (h.len != 0) try res.setHeader("Access-Control-Allow-Headers", h);
+    }
+    if (comptime o.max_age_s != 0) try res.setHeaderStatic(
+        "Access-Control-Max-Age",
+        std.fmt.comptimePrint("{d}", .{o.max_age_s}),
+    );
+}
+
+fn validateStatic(comptime o: StaticOptions) void {
+    // Value bytes and header-name rules are enforced by setHeaderStatic's
+    // own compile errors; what it cannot know is that an empty grant or
+    // method list is never what a CORS policy means.
+    if (o.allow_origin.len == 0) @compileError(
+        "cors.StaticOptions.allow_origin must be \"*\" or one origin — an empty value grants nothing and confuses caches.",
+    );
+    if (o.allow_methods.len == 0) @compileError(
+        "cors.StaticOptions.allow_methods must name at least one method token.",
+    );
+}
+
 /// Join method tokens with ", " into one owned slice.
 fn joinMethods(gpa: Allocator, methods: []const http.Method) Allocator.Error![]const u8 {
     var total: usize = 0;
@@ -1661,4 +1755,72 @@ fn fuzzGates(_: void, smith: *std.testing.Smith) !void {
 }
 test "fuzz: allowOriginValue/methodTokenAllowed/requestedHeadersAllowed never panic" {
     try testing.fuzz({}, fuzzGates, .{});
+}
+
+// ── tests (static posture) ──────────────────────────────────────────────────
+
+fn staticHandler(req: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror!void {
+    const o: StaticOptions = .{
+        .allow_origin = "https://app.example",
+        .expose_headers = "ETag",
+        .max_age_s = 600,
+    };
+    if (isPreflight(req)) return applyPreflightStatic(o, req, res);
+    try applyActualStatic(o, res);
+    try res.writeAll("ok");
+    try res.end();
+}
+
+fn runWireStatic(bytes: []const u8, out_buf: []u8) []const u8 {
+    var in: Reader = .fixed(bytes);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [512]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = staticHandler,
+        .server_name = null,
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "static posture: constant grant on every response, Origin or not, no Vary" {
+    var buf: [2048]u8 = undefined;
+    { // no Origin at all — the grant is stamped anyway (the posture's point)
+        const got = runWireStatic(wire("GET", "/t", ""), &buf);
+        try expectStatus(got, "200");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        try expectHeaderLine(got, "Access-Control-Expose-Headers: ETag");
+        try expectNoHeader(got, "Vary");
+    }
+    { // a foreign Origin changes nothing — no gate exists
+        const got = runWireStatic(wire("GET", "/t", "Origin: https://evil.example\r\n"), &buf);
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    }
+}
+
+test "static posture: preflight is always a full 204 grant; ACRH reflected" {
+    var buf: [2048]u8 = undefined;
+    const got = runWireStatic(wire("OPTIONS", "/t", "Origin: https://whoever.example\r\nAccess-Control-Request-Method: GET\r\n" ++
+        "Access-Control-Request-Headers: authorization\r\n"), &buf);
+    try expectStatus(got, "204");
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, HEAD");
+    try expectHeaderLine(got, "Access-Control-Allow-Headers: authorization");
+    try expectHeaderLine(got, "Access-Control-Max-Age: 600");
+    try expectNoHeader(got, "Vary");
+    try testing.expect(std.mem.indexOf(u8, got, "ok") == null);
+}
+
+test "static posture: a bare OPTIONS is not a preflight and routes normally" {
+    var buf: [2048]u8 = undefined;
+    const got = runWireStatic(wire("OPTIONS", "/t", ""), &buf);
+    try expectStatus(got, "200"); // the handler's own answer, grant included
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
 }

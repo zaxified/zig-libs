@@ -22,6 +22,17 @@ Attribution/provenance: see /NOTICE.
   `allow_credentials = true` with `error.CredentialsWithWildcardOrigin` rather than silently
   downgrading; a `.predicate` returning true is the explicit, greppable opt-in.
 
+## Static CORS (deliberate deviation, comptime)
+
+The second named posture, for the same adoption reason as the wildcard one below: a public
+read-only API whose grant is a **build-time constant** — one `Access-Control-Allow-Origin` value
+(`*` or one fixed origin) stamped on every response and every preflight, regardless of `Origin`.
+No gates run and no `Vary` is emitted (the response never varies by request); the policy compiles
+to `setHeaderStatic` slot writes. Surface: `StaticOptions` + `applyActualStatic` /
+`applyPreflightStatic` / `isPreflight` — no `Cors`, no `init`, no allocator. `allow_credentials`
+is structurally absent: a constant grant with credentials is the combination `Cors.init` rejects,
+so the knob does not exist. First consumer: qap (its `Config.cors` is this type).
+
 ## Unconditional wildcard CORS (deliberate deviation, opt-in)
 
 Spec-correct CORS — the default, unchanged — never touches a response the browser isn't asking a
