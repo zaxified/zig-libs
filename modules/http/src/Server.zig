@@ -2303,6 +2303,38 @@ pub const ResponseWriter = struct {
         return rw.putHeader(name, value);
     }
 
+    /// `setHeader` for a comptime-known name/value pair, with the ceremony
+    /// paid at compile time instead of per request: validation and the
+    /// managed-name checks become `@compileError`s, and the pair is stored as
+    /// the rodata slices themselves — static strings outlive every response,
+    /// so nothing is copied into `header_buf` and none of its budget is
+    /// spent. Replace-by-name semantics are identical to `setHeader`; what a
+    /// static call cannot do is set a managed header (`Content-Length`,
+    /// `Transfer-Encoding`, `Trailer`, `Connection`), whose side effects are
+    /// the point of setting them — those keep going through `setHeader`.
+    pub fn setHeaderStatic(rw: *ResponseWriter, comptime name: []const u8, comptime value: []const u8) error{ HeadersSent, TooManyHeaders }!void {
+        comptime {
+            if (!validHeaderName(name))
+                @compileError("setHeaderStatic: header name is not an RFC 9110 token: \"" ++ name ++ "\"");
+            if (!validHeaderValue(value))
+                @compileError("setHeaderStatic: header value contains CR/LF/NUL: \"" ++ name ++ "\"");
+            for ([_][]const u8{ "content-length", "transfer-encoding", "trailer", "connection" }) |managed| {
+                if (std.ascii.eqlIgnoreCase(name, managed))
+                    @compileError("setHeaderStatic: \"" ++ name ++ "\" is a managed header — use setHeader");
+            }
+        }
+        if (rw.sent_head) return error.HeadersSent;
+        for (rw.headers[0..rw.headers_len]) |*hd| {
+            if (std.ascii.eqlIgnoreCase(hd.name, name)) {
+                hd.* = .{ .name = name, .value = value };
+                return;
+            }
+        }
+        if (rw.headers_len == max_response_headers) return error.TooManyHeaders;
+        rw.headers[rw.headers_len] = .{ .name = name, .value = value };
+        rw.headers_len += 1;
+    }
+
     /// Raw header-table insert (replace by name, else append) — the single
     /// place the table grows, bypassing the managed-header interception in
     /// `setHeader` (which is how `declareTrailer` maintains its `Trailer`
@@ -3757,6 +3789,39 @@ test "ResponseWriter: header validation and managed headers" {
         "Content-Length: 0\r\n" ++
         "\r\n", out.buffered());
     try testing.expectError(error.HeadersSent, rw.setHeader("X-Late", "1"));
+}
+
+test "ResponseWriter: setHeaderStatic — replace both ways, no header_buf spend" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try rw.setHeaderStatic("X-Static", "one");
+    try testing.expectEqual(@as(usize, 0), rw.header_buf_len); // rodata slice, nothing copied
+    try rw.setHeader("x-static", "two"); // dynamic replaces static
+    try rw.setHeaderStatic("X-Static", "three"); // static replaces dynamic
+    try rw.setHeaderStatic("Cache-Control", "no-store");
+    try rw.end();
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "X-Static: three\r\n" ++
+        "Cache-Control: no-store\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", out.buffered());
+    try testing.expectError(error.HeadersSent, rw.setHeaderStatic("X-Late", "1"));
+}
+
+test "ResponseWriter: setHeaderStatic hits the same table limit as setHeader" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    inline for (0..max_response_headers) |i| {
+        try rw.setHeaderStatic(std.fmt.comptimePrint("X-N{d}", .{i}), "v");
+    }
+    try testing.expectError(error.TooManyHeaders, rw.setHeaderStatic("X-Over", "v"));
+    try rw.setHeaderStatic("X-N7", "replaced"); // replace still works at the limit
 }
 
 /// The handler half of the dead-frame test below: build a header name, a
