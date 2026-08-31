@@ -127,6 +127,14 @@ pub const Entry = struct {
     referer: ?[]const u8 = null,
     /// Correlation / request id (e.g. from the `requestid` module), if any.
     request_id: ?[]const u8 = null,
+    /// W3C Trace Context trace-id (32 lowercase hex chars, e.g. the
+    /// `tracecontext` module's validated slice of an incoming traceparent),
+    /// if any. JSON/logfmt only; Combined is a fixed format and carries
+    /// neither this nor `request_id`.
+    trace_id: ?[]const u8 = null,
+    /// The span that made this request — traceparent's parent-id (16
+    /// lowercase hex chars), if any. Same formats as `trace_id`.
+    span_id: ?[]const u8 = null,
 };
 
 /// Selects which `write*` function `write` dispatches to. Each format is
@@ -187,6 +195,10 @@ pub fn writeJsonLines(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void 
     try writeJsonOptString(w, entry.referer);
     try w.writeAll(",\"request_id\":");
     try writeJsonOptString(w, entry.request_id);
+    try w.writeAll(",\"trace_id\":");
+    try writeJsonOptString(w, entry.trace_id);
+    try w.writeAll(",\"span_id\":");
+    try writeJsonOptString(w, entry.span_id);
     try w.writeAll("}\n");
 }
 
@@ -384,6 +396,14 @@ pub fn writeLogfmt(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll(" request_id=");
         try writeLogfmtValue(w, v);
     }
+    if (entry.trace_id) |v| {
+        try w.writeAll(" trace_id=");
+        try writeLogfmtValue(w, v);
+    }
+    if (entry.span_id) |v| {
+        try w.writeAll(" span_id=");
+        try writeLogfmtValue(w, v);
+    }
     try w.writeByte('\n');
 }
 
@@ -507,6 +527,11 @@ pub const FromRequestOptions = struct {
     request_bytes: ?u64 = null,
     /// Correlation / request id, e.g. from the `requestid` module.
     request_id: ?[]const u8 = null,
+    /// W3C trace-id (32 hex), e.g. a `tracecontext`-validated slice of the
+    /// incoming traceparent. See `Entry.trace_id`.
+    trace_id: ?[]const u8 = null,
+    /// The requesting span's id (16 hex). See `Entry.span_id`.
+    span_id: ?[]const u8 = null,
 };
 
 /// Build an `Entry` from a served request + its response writer, pulling
@@ -540,6 +565,8 @@ pub fn entryFromRequest(
         .user_agent = req.header("User-Agent"),
         .referer = req.header("Referer"),
         .request_id = opts.request_id,
+        .trace_id = opts.trace_id,
+        .span_id = opts.span_id,
     };
     if (req.peerAddress()) |p| {
         var w: std.Io.Writer = .fixed(addr_buf);
@@ -582,6 +609,8 @@ fn sampleEntry() Entry {
         .user_agent = "curl/8.0",
         .referer = "https://example.org/",
         .request_id = "req-abc-123",
+        .trace_id = "0af7651916cd43dd8448eb211c80319c",
+        .span_id = "b7ad6b7169203331",
     };
 }
 
@@ -594,7 +623,9 @@ test "writeJsonLines: byte-exact golden for a representative entry" {
             "\"method\":\"GET\",\"target\":\"/status?x=1\",\"protocol\":\"HTTP/1.1\"," ++
             "\"status\":200,\"request_bytes\":0,\"response_bytes\":512," ++
             "\"latency_ns\":1500000,\"user_agent\":\"curl/8.0\"," ++
-            "\"referer\":\"https://example.org/\",\"request_id\":\"req-abc-123\"}\n",
+            "\"referer\":\"https://example.org/\",\"request_id\":\"req-abc-123\"," ++
+            "\"trace_id\":\"0af7651916cd43dd8448eb211c80319c\"," ++
+            "\"span_id\":\"b7ad6b7169203331\"}\n",
         w.buffered(),
     );
 }
@@ -607,7 +638,8 @@ test "writeLogfmt: byte-exact golden for a representative entry" {
         "ts=1734000000000000000 remote_addr=192.0.2.1:54321 method=GET " ++
             "target=\"/status?x=1\" protocol=HTTP/1.1 status=200 request_bytes=0 " ++
             "response_bytes=512 latency_ns=1500000 user_agent=curl/8.0 " ++
-            "referer=https://example.org/ request_id=req-abc-123\n",
+            "referer=https://example.org/ request_id=req-abc-123 " ++
+            "trace_id=0af7651916cd43dd8448eb211c80319c span_id=b7ad6b7169203331\n",
         w.buffered(),
     );
 }
@@ -675,7 +707,7 @@ test "missing optional fields: JSON emits null, logfmt omits the key, combined u
         "{\"ts\":1,\"remote_addr\":null,\"method\":\"GET\",\"target\":\"/\"," ++
             "\"protocol\":\"HTTP/1.1\",\"status\":204,\"request_bytes\":null," ++
             "\"response_bytes\":null,\"latency_ns\":null,\"user_agent\":null," ++
-            "\"referer\":null,\"request_id\":null}\n",
+            "\"referer\":null,\"request_id\":null,\"trace_id\":null,\"span_id\":null}\n",
         jw.buffered(),
     );
 
@@ -760,7 +792,7 @@ test "logfmt: injection payload is quoted+escaped, one record, no fake pair, no 
 }
 
 test "logfmt: benign field is unquoted verbatim (positive control)" {
-    var buf: [256]u8 = undefined;
+    var buf: [320]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var entry = sampleEntry();
     entry.user_agent = "curl/8.0";
@@ -1621,6 +1653,8 @@ test "JSON: every emitted line parses and every field is valid UTF-8, for the sa
         entry.referer = v;
         entry.request_id = v;
         entry.protocol = v;
+        entry.trace_id = v;
+        entry.span_id = v;
         try writeJsonLines(entry, &w);
         const out = w.buffered();
         try expectOneLine(out);
@@ -1632,7 +1666,7 @@ test "JSON: every emitted line parses and every field is valid UTF-8, for the sa
             .{},
         );
         defer parsed.deinit();
-        for ([_][]const u8{ "method", "target", "protocol", "remote_addr", "user_agent", "referer", "request_id" }) |k| {
+        for ([_][]const u8{ "method", "target", "protocol", "remote_addr", "user_agent", "referer", "request_id", "trace_id", "span_id" }) |k| {
             try testing.expect(std.unicode.utf8ValidateSlice(parsed.value.object.get(k).?.string));
         }
     }

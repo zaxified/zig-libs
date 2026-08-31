@@ -117,7 +117,13 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 }
 
 /// An incoming ID is adopted only when it is non-empty, within
-/// `max_adopt_len`, and every byte is a token-safe character:
+/// `max_adopt_len`, and every byte is a token-safe character.
+///
+/// `pub`, with `generateInto`, for servers that pass request state
+/// explicitly instead of running the middleware — an engine whose
+/// connections are fibers that migrate between threads cannot use
+/// `current()`'s thread-local, but the adopt-or-generate policy is the
+/// same. Continued:
 /// `[A-Za-z0-9._-]`, the same charset nginx's own `$request_id` (hex) and
 /// most upstream correlation-id conventions produce. This is narrower than
 /// "printable ASCII, no space": the wider set still let a crafted
@@ -127,7 +133,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 /// `current()` into an unescaped JSON/logfmt sink could still get a malformed
 /// record from an adopted ID (wave-2 audit `requestid` F1). Otherwise a fresh
 /// ID is generated.
-fn isAdoptable(v: []const u8) bool {
+pub fn isAdoptable(v: []const u8) bool {
     if (v.len == 0 or v.len > max_adopt_len) return false;
     for (v) |c| {
         switch (c) {
@@ -141,7 +147,13 @@ fn isAdoptable(v: []const u8) bool {
 /// Write a unique 32-hex-char ID into `buf` and return it. Composition:
 /// 16 hex of monotonic ns · 4 hex of a per-thread nonce · 12 hex of a
 /// per-thread counter — unique without any OS-entropy call (see module doc).
-fn generateInto(buf: *[generated_len]u8) []const u8 {
+///
+/// `pub` for explicit-state servers (see `isAdoptable`); safe from a fiber,
+/// unlike `current()`: the thread-locals here are the generator's own
+/// counter and nonce, consumed within this call — nothing request-scoped
+/// survives it, so a task that later resumes on another thread keeps only
+/// the caller-owned `buf`.
+pub fn generateInto(buf: *[generated_len]u8) []const u8 {
     counter +%= 1;
     const ns = monoNs();
     // The address of a thread-local distinguishes threads (each has its own
