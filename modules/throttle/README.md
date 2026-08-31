@@ -63,6 +63,20 @@ Observability: `inFlight()`, `waiting()`, `maxInFlight()`, `maxWaiters()` —
 utilization is `inFlight() / maxInFlight()` (for the future `metrics`
 module).
 
+## Without the router
+
+The middleware is a convenience wrapper; the whole mechanism is two public,
+allocation-free, atomic calls on `Throttle` — usable from any server loop,
+router or not:
+
+```zig
+if (!t.tryAcquire()) return sheddedReply(res); // your own 503 + Retry-After
+defer t.release();
+// ... handle the request ...
+```
+
+Nothing in `Throttle` touches a request or response type.
+
 ## Bounded wait (backpressure)
 
 Default `max_wait_ms = 0` sheds immediately (pure load shedding). With

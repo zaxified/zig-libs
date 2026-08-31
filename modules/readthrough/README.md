@@ -56,6 +56,13 @@ See `SPEC.md` for the concurrency model + rationale, the single-flight
 mechanism, the exact invalidate-during-load / TTL=0 / loader-panic edge
 semantics, and the deliberately-deferred list (including stale-while-revalidate).
 
+## Without the router (and without HTTP)
+
+Nothing in this module knows about requests, responses or `router` — `get`
+takes a key and a loader, `ifCached(key)` is the zero-allocation cache-hit
+probe. It composes with any call site that has a key and a way to fetch,
+HTTP handler or not.
+
 ## Ownership / return contract
 
 Because this cache is thread-safe, `get` returns an **owned copy** of the value

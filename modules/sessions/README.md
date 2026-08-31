@@ -37,6 +37,16 @@ the cookie with `Max-Age=-1`). After a privilege change (login), call
 `Manager.regenerate` — a new id is minted, the data carried over, the old id
 killed in the store (session-fixation defense).
 
+## Without the router
+
+The middleware only moves strings between the cookie header and the core;
+the core itself is public and request-type-free. `Manager.create(&session)`
+mints an id, `Manager.lookup(sid, &session)` loads by the raw cookie value,
+`Manager.persist(&session)` writes back; `Csrf.token(session_id, &buf)` and
+`Csrf.verify(session_id, presented)` are pure HMAC over strings. A server
+with its own dispatch (or a non-HTTP protocol with a session concept) runs
+the same session machinery without `router`.
+
 ## Cookie hardening (OWASP Session Management Cheat Sheet)
 
 Session cookies are always `HttpOnly` and `Secure` with `SameSite=Lax` by

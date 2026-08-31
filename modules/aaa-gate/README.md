@@ -100,6 +100,16 @@ fn rebootHandler(ctx: *router.Ctx) !void {
 The `Gate` must outlive the `Router`, at a stable address (the
 middleware's `state` points at it).
 
+## Without the router
+
+The middleware is a wrapper around the decision core, which is public and
+request-type-free: `verify(presented)` / `verifyApiKey(presented)` take the
+presented credential — the bearer token (already extracted from the
+`Authorization` scheme) or the API key — as an optional string and return a
+`Verdict`. A server with its own dispatch extracts the credential from its
+request and consumes the same policy, constant-time compares included,
+without `router` anywhere; only the extraction is the caller's.
+
 ## Semantics
 
 - **Auth check.** Requests in the protected scope need
