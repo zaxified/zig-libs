@@ -104,13 +104,20 @@ fn appendInt(
         try out.append(gpa, flags | @as(u8, @intCast(value)));
         return;
     }
-    try out.append(gpa, flags | @as(u8, @intCast(max_prefix)));
+    // Build the continuation bytes locally and land them in one append:
+    // a u64 is at most the prefix octet plus ten 7-bit groups.
+    var tmp: [11]u8 = undefined;
+    tmp[0] = flags | @as(u8, @intCast(max_prefix));
+    var n: usize = 1;
     var v = value - max_prefix;
     while (v >= 0x80) {
-        try out.append(gpa, @as(u8, @intCast(v & 0x7f)) | 0x80);
+        tmp[n] = @as(u8, @intCast(v & 0x7f)) | 0x80;
+        n += 1;
         v >>= 7;
     }
-    try out.append(gpa, @intCast(v));
+    tmp[n] = @intCast(v);
+    n += 1;
+    try out.appendSlice(gpa, tmp[0..n]);
 }
 
 /// Bounded input cursor for decoding.
@@ -629,17 +636,27 @@ const DynamicTable = struct {
     /// Current maximum (§4.2); insertions evict down to this.
     max_size: usize,
 
-    const TableEntry = struct { name: []u8, value: []u8 };
+    /// `name ++ value` in a single allocation, split at `name_len` — one
+    /// alloc and one free per entry instead of two, and the compare the
+    /// encoder's search runs walks adjacent bytes.
+    const TableEntry = struct {
+        buf: []u8,
+        name_len: usize,
+
+        fn name(e: TableEntry) []const u8 {
+            return e.buf[0..e.name_len];
+        }
+        fn value(e: TableEntry) []const u8 {
+            return e.buf[e.name_len..];
+        }
+    };
 
     fn entrySize(name: []const u8, value: []const u8) usize {
         return name.len + value.len + entry_overhead;
     }
 
     fn deinit(t: *DynamicTable, gpa: Allocator) void {
-        for (t.entries.items) |e| {
-            gpa.free(e.name);
-            gpa.free(e.value);
-        }
+        for (t.entries.items) |e| gpa.free(e.buf);
         t.entries.deinit(gpa);
         t.* = undefined;
     }
@@ -656,9 +673,8 @@ const DynamicTable = struct {
 
     fn evictOldest(t: *DynamicTable, gpa: Allocator) void {
         const e = t.entries.orderedRemove(0);
-        t.size -= entrySize(e.name, e.value);
-        gpa.free(e.name);
-        gpa.free(e.value);
+        t.size -= e.buf.len + entry_overhead;
+        gpa.free(e.buf);
     }
 
     /// §4.3: lower the maximum and evict until the table fits.
@@ -677,11 +693,11 @@ const DynamicTable = struct {
             return;
         }
         while (t.size + esize > t.max_size) t.evictOldest(gpa);
-        const n = try gpa.dupe(u8, name);
-        errdefer gpa.free(n);
-        const v = try gpa.dupe(u8, value);
-        errdefer gpa.free(v);
-        try t.entries.append(gpa, .{ .name = n, .value = v });
+        const buf = try gpa.alloc(u8, name.len + value.len);
+        errdefer gpa.free(buf);
+        @memcpy(buf[0..name.len], name);
+        @memcpy(buf[name.len..], value);
+        try t.entries.append(gpa, .{ .buf = buf, .name_len = name.len });
         t.size += esize;
     }
 
@@ -690,7 +706,7 @@ const DynamicTable = struct {
         if (index == 0) return null;
         if (index <= static_table.len) return static_table[@intCast(index - 1)];
         const e = t.get(@intCast(index - static_table.len)) orelse return null;
-        return .{ .name = e.name, .value = e.value };
+        return .{ .name = e.name(), .value = e.value() };
     }
 };
 
@@ -827,7 +843,7 @@ pub const Decoder = struct {
     /// the next `decodeBlock`/`setMaxTableSize` call.
     pub fn dynamicTableEntry(d: *const Decoder, i: usize) ?Field {
         const e = d.table.get(i) orelse return null;
-        return .{ .name = e.name, .value = e.value };
+        return .{ .name = e.name(), .value = e.value() };
     }
 
     /// Read the (name, value) of a literal representation whose name is
@@ -1006,22 +1022,24 @@ pub const Encoder = struct {
     /// the next `encodeBlock`/`setMaxTableSize` call.
     pub fn dynamicTableEntry(e: *const Encoder, i: usize) ?Field {
         const entry = e.table.get(i) orelse return null;
-        return .{ .name = entry.name, .value = entry.value };
+        return .{ .name = entry.name(), .value = entry.value() };
     }
 
     fn encodeField(e: *Encoder, f: Field, out: *std.ArrayList(u8)) Allocator.Error!void {
         if (f.sensitive) {
-            // §6.2.3 literal never indexed.
-            try e.encodeLiteral(f, 0x10, 4, out);
+            // Â§6.2.3 literal never indexed. The name may still travel by
+            // index (only the value is the secret).
+            try e.encodeLiteral(f, 0x10, 4, e.findField(f).name, out);
             return;
         }
-        if (e.findExact(f)) |index| {
-            // §6.1 indexed.
+        const m = e.findField(f);
+        if (m.exact) |index| {
+            // Â§6.1 indexed.
             try appendInt(e.gpa, out, 0x80, 7, index);
             return;
         }
-        // §6.2.1 literal with incremental indexing.
-        try e.encodeLiteral(f, 0x40, 6, out);
+        // Â§6.2.1 literal with incremental indexing.
+        try e.encodeLiteral(f, 0x40, 6, m.name, out);
         try e.table.add(e.gpa, f.name, f.value);
     }
 
@@ -1032,9 +1050,10 @@ pub const Encoder = struct {
         f: Field,
         flags: u8,
         prefix_bits: u4,
+        name_index: ?u64,
         out: *std.ArrayList(u8),
     ) Allocator.Error!void {
-        if (e.findName(f.name)) |index| {
+        if (name_index) |index| {
             try appendInt(e.gpa, out, flags, prefix_bits, index);
         } else {
             try appendInt(e.gpa, out, flags, prefix_bits, 0);
@@ -1059,32 +1078,36 @@ pub const Encoder = struct {
     }
 
     /// Combined index of an exact (name, value) match; static entries win.
-    fn findExact(e: *const Encoder, f: Field) ?u64 {
+    /// One walk answering both questions `encodeField` asks: the combined
+    /// index of an exact name+value match, and of the first name-only match
+    /// (static entries win, as before). The old shape ran `findExact` and,
+    /// on the common miss, walked the whole table AGAIN for the name.
+    const Match = struct { exact: ?u64 = null, name: ?u64 = null };
+
+    fn findField(e: *const Encoder, f: Field) Match {
+        var m: Match = .{};
         if (static_names.get(f.name)) |run| {
+            m.name = run.first;
             var i: usize = run.first;
             while (i < run.first + run.count) : (i += 1) {
-                if (std.mem.eql(u8, static_table[i - 1].value, f.value)) return i;
+                if (std.mem.eql(u8, static_table[i - 1].value, f.value)) {
+                    m.exact = i;
+                    return m;
+                }
             }
         }
         const n = e.table.count();
         var i: usize = 1;
         while (i <= n) : (i += 1) {
             const entry = e.table.get(i).?;
-            if (std.mem.eql(u8, entry.name, f.name) and std.mem.eql(u8, entry.value, f.value))
-                return static_table.len + i;
+            if (!std.mem.eql(u8, entry.name(), f.name)) continue;
+            if (m.name == null) m.name = static_table.len + i;
+            if (std.mem.eql(u8, entry.value(), f.value)) {
+                m.exact = static_table.len + i;
+                return m;
+            }
         }
-        return null;
-    }
-
-    /// Combined index of a name-only match; static entries win.
-    fn findName(e: *const Encoder, name: []const u8) ?u64 {
-        if (static_names.get(name)) |run| return run.first;
-        const n = e.table.count();
-        var i: usize = 1;
-        while (i <= n) : (i += 1) {
-            if (std.mem.eql(u8, e.table.get(i).?.name, name)) return static_table.len + i;
-        }
-        return null;
+        return m;
     }
 };
 
