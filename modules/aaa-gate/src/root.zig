@@ -835,12 +835,19 @@ fn isMutating(m: http.Method) bool {
 }
 
 /// The bearer token of the request, or null when the Authorization header
-/// is absent, uses another scheme, or is malformed (never panics — any
-/// header byte sequence maps to a token or to null). Scheme match is
-/// case-insensitive per RFC 9110; surrounding whitespace is tolerated.
+/// is absent — the request-typed wrapper over `bearerTokenOf`.
 fn bearerToken(req: *const http.Server.Request) ?[]const u8 {
-    const auth = req.header("authorization") orelse return null;
-    const value = std.mem.trim(u8, auth, " \t");
+    return bearerTokenOf(req.header("authorization") orelse return null);
+}
+
+/// The bearer token in a raw `Authorization` header value, or null when it
+/// uses another scheme or is malformed (never panics — any byte sequence
+/// maps to a token or to null). Pure and string-level on purpose: the
+/// extraction half of the middleware, public for a server with its own
+/// request type (the decision half is `verify`). Scheme match is
+/// case-insensitive per RFC 9110; surrounding whitespace is tolerated.
+pub fn bearerTokenOf(authorization: []const u8) ?[]const u8 {
+    const value = std.mem.trim(u8, authorization, " \t");
     if (value.len < "Bearer ".len) return null;
     if (!std.ascii.eqlIgnoreCase(value[0..6], "Bearer")) return null;
     if (value[6] != ' ') return null;
@@ -872,8 +879,11 @@ fn apiKeyPresented(g: *const Gate, req: *const http.Server.Request) ?[]const u8 
 /// First value of query parameter `name` in a raw query string
 /// (`key=val&key2=val2`), or null. The name compare is a plain byte
 /// compare (the parameter name is not a secret); the value is returned
-/// verbatim.
-fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
+/// **verbatim — no percent-decoding** (prefer the header for keys with
+/// reserved characters). Public as the string-level piece of API-key
+/// extraction for callers with their own request type; pair it with
+/// `verifyApiKey`.
+pub fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
@@ -882,27 +892,37 @@ fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The throttle's client key per the trust rule shared with `ratelimit`
-/// (see the module doc): rightmost element of the **last**
-/// `X-Forwarded-For` header, else `X-Real-IP`, else the socket peer IP
-/// (formatted into `buf`, port excluded; IPv4-mapped IPv6 unified with
-/// plain IPv4), else `fallback_key`.
+/// The throttle's client key — the request-typed wrapper over
+/// `clientKeyFrom`: finds the **last** `X-Forwarded-For` header and the
+/// `X-Real-IP` value, then applies the shared trust rule.
 fn clientKey(req: *const http.Server.Request, buf: *[client_key_len_max]u8) []const u8 {
     var xff: ?[]const u8 = null;
     var it = req.iterateHeaders();
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) xff = h.value;
     }
-    if (xff) |v| {
+    return clientKeyFrom(xff, req.header("x-real-ip"), req.peerAddress(), buf);
+}
+
+/// The client key per the trust rule shared with `ratelimit` (see the
+/// module doc), over raw values: the rightmost element of `last_xff` (pass
+/// the value of the **last** `X-Forwarded-For` header — picking it is the
+/// caller's, it is the request-type-dependent half), else `x_real_ip`, else
+/// the socket peer IP (formatted into `buf`, port excluded; IPv4-mapped
+/// IPv6 unified with plain IPv4), else `fallback_key`. Header-derived keys
+/// are clamped to `client_key_len_max`. Public for callers with their own
+/// request type; never panics on any byte sequence.
+pub fn clientKeyFrom(last_xff: ?[]const u8, x_real_ip: ?[]const u8, peer: ?std.Io.net.IpAddress, buf: *[client_key_len_max]u8) []const u8 {
+    if (last_xff) |v| {
         const start = if (std.mem.lastIndexOfScalar(u8, v, ',')) |i| i + 1 else 0;
         const ip = std.mem.trim(u8, v[start..], " \t");
         if (ip.len != 0) return clampKey(ip, buf);
     }
-    if (req.header("x-real-ip")) |v| {
+    if (x_real_ip) |v| {
         const ip = std.mem.trim(u8, v, " \t");
         if (ip.len != 0) return clampKey(ip, buf);
     }
-    if (req.peerAddress()) |peer| return formatPeerIp(peer, buf);
+    if (peer) |p| return formatPeerIp(p, buf);
     return fallback_key;
 }
 
@@ -2377,4 +2397,42 @@ fn fuzzQueryValue(_: void, smith: *std.testing.Smith) !void {
 }
 test "fuzz queryValue never panics" {
     try testing.fuzz({}, fuzzQueryValue, .{});
+}
+
+// ── tests (string-level extractors — no request type) ───────────────────────
+
+test "bearerTokenOf: RFC 9110 shapes map to a token or to null, never panic" {
+    try testing.expectEqualStrings("abc123", bearerTokenOf("Bearer abc123").?);
+    try testing.expectEqualStrings("abc123", bearerTokenOf("  bearer   abc123  ").?);
+    try testing.expect(bearerTokenOf("Basic abc123") == null);
+    try testing.expect(bearerTokenOf("Bearer") == null);
+    try testing.expect(bearerTokenOf("Bearer    ") == null);
+    try testing.expect(bearerTokenOf("Bearerabc") == null);
+    try testing.expect(bearerTokenOf("") == null);
+}
+
+test "queryValue: first match, verbatim value, no percent-decoding" {
+    try testing.expectEqualStrings("v1", queryValue("k=v1&k=v2", "k").?);
+    try testing.expectEqualStrings("a%20b", queryValue("x=1&key=a%20b", "key").?);
+    try testing.expect(queryValue("x=1", "key") == null);
+    try testing.expect(queryValue("", "key") == null);
+    try testing.expect(queryValue("key", "key") == null); // no '=': skipped
+}
+
+test "clientKeyFrom: XFF rightmost, then X-Real-IP, then peer, then fallback; clamped" {
+    var buf: [client_key_len_max]u8 = undefined;
+    try testing.expectEqualStrings(
+        "203.0.113.7",
+        clientKeyFrom("10.0.0.1, 203.0.113.7", null, null, &buf),
+    );
+    try testing.expectEqualStrings("198.51.100.2", clientKeyFrom(null, " 198.51.100.2 ", null, &buf));
+    // Empty XFF tail falls through to X-Real-IP.
+    try testing.expectEqualStrings("198.51.100.2", clientKeyFrom("a, ", "198.51.100.2", null, &buf));
+    try testing.expectEqualStrings(fallback_key, clientKeyFrom(null, null, null, &buf));
+    // A forged, unbounded header value is clamped to the key cap.
+    const huge = "x" ** 300;
+    try testing.expectEqual(client_key_len_max, clientKeyFrom(huge, null, null, &buf).len);
+    // The peer path unifies IPv4-mapped IPv6 with plain IPv4.
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 9 }, .port = 4433 } };
+    try testing.expectEqualStrings("192.0.2.9", clientKeyFrom(null, null, peer, &buf));
 }

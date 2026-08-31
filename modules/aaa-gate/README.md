@@ -108,7 +108,12 @@ presented credential — the bearer token (already extracted from the
 `Authorization` scheme) or the API key — as an optional string and return a
 `Verdict`. A server with its own dispatch extracts the credential from its
 request and consumes the same policy, constant-time compares included,
-without `router` anywhere; only the extraction is the caller's.
+without `router` anywhere. The extraction cores are public too, string-level:
+`bearerTokenOf(authorization)` (RFC 9110 scheme parse), `queryValue(query,
+name)` (verbatim, no percent-decoding) for API keys, and
+`clientKeyFrom(last_xff, x_real_ip, peer, &buf)` (the shared
+XFF-rightmost → X-Real-IP → peer trust rule, clamped). Only reading the raw
+header values out of your request type remains yours.
 
 ## Semantics
 
