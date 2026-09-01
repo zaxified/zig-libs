@@ -68,8 +68,18 @@
 //! pymodbus decoded the replies, summed and packed what it understood in its
 //! own number domain, and wrote the result back with FC 0x10 and FC 0x05. Those
 //! request bytes are therefore a function of what the device said, computed by
-//! a third party — and the test below recomputes the expected values from the
-//! fixture rather than restating them, so the two have to agree.
+//! a third party — and the tests below recompute the DERIVED marks (the sums,
+//! the differences, the bitmaps, the checksums) from the fixture rather than
+//! restating them, so the two have to agree.
+//!
+//! ⚠ Not every assertion, and the difference matters when reading this file as
+//! evidence. The magics, the operation and failure counts, the pass bits and
+//! the status/error codes are literals; for the status codes the
+//! discrimination lives in the frozen response bytes anyway, so those are
+//! redundant rather than weak. **One literal is genuinely an echo** and is
+//! marked where it appears — the S7 negotiated PDU length (`db2[8]`) is a
+//! number the master itself proposed, against a device ceiling that happens to
+//! equal it, so `@min` is the identity and that mark grades nothing.
 //!
 //! Concretely: a device whose register encoder was byte-swapped would have made
 //! pymodbus read 28416, 56832, … instead of 111, 222, …, so the sum in exchange
@@ -892,7 +902,15 @@ test "anchor: replay a real python-snap7 3.1.0 client's recorded session offline
     // pass either check alone.
     try testing.expectEqual(@as(u32, 0x0A), slot(&db2, 6));
     try testing.expectEqual(@as(u32, 0x05), slot(&db2, 7));
-    try testing.expectEqual(@as(u32, 480), slot(&db2, 8)); // the PDU it negotiated
+    // ⚠ NOT a negotiation result, despite the name. The recorded request
+    // proposes pdu_length = 0x01E0 = 480 and the device's own ceiling is also
+    // 480, so `@min` is the identity and this is a verbatim echo of the
+    // master's own number — measured 2026-09-01: replacing the device's
+    // `@min(asked, ceiling)` with `asked` left the whole suite green. A
+    // responder with no PDU ceiling at all passes this mark. Making it grade
+    // something needs the live fixture re-recorded with the device's ceiling
+    // BELOW the master's proposal, which is a VM-lane change, not a literal.
+    try testing.expectEqual(@as(u32, 480), slot(&db2, 8)); // echo, see above
     try testing.expectEqual(@as(u32, 1), slot(&db2, 9)); // the pass mark
 }
 

@@ -2628,14 +2628,29 @@ test "anchor: Wireshark reads the OPC UA adapter's ACKF handshake reply" {
     //     Chunk Type: F              [opcua.transport.chunk == "F"]
     //     Message Size: 28           [opcua.transport.size == 28]
     //     Version: 0                 [opcua.transport.ver == 0]
-    //     ReceiveBufferSize: 65536   [opcua.transport.rbs == 65536]
-    //     SendBufferSize: 65536      [opcua.transport.sbs == 65536]
-    //     MaxMessageSize: 1048576    [opcua.transport.mms == 1048576]
+    //     ReceiveBufferSize: 32768   [opcua.transport.rbs == 32768]
+    //     SendBufferSize: 16384      [opcua.transport.sbs == 16384]
+    //     MaxMessageSize: 4194304    [opcua.transport.mms == 4194304]
     //     MaxChunkCount: 256         [opcua.transport.mcc == 256]
     //
     // The negotiated limits are what a real client uses to size its own
     // buffers, so a third party reading them back in the right order and
     // endianness is the part of the UA-TCP handshake worth anchoring.
+    //
+    // ⚠ The Hello's four limits are deliberately ASYMMETRIC and deliberately
+    // straddle the server's own ceilings. The first version proposed
+    // 65536/65536/1 MiB/0 against a 65536/65536/4 MiB/256 server, so the ACK
+    // came back with `rbs == sbs` and an `mms` that was just the client's own
+    // number echoed -- and neither the receive/send CROSS-SWAP (what the
+    // server sends is bounded by what the client can receive, and vice versa)
+    // nor the ceiling itself was a distinction the frozen reading could
+    // express. Measured 2026-09-01: with `modules/opcua/src/server.zig`'s
+    // cross-swap dropped, and again with `.max_message_size =
+    // client_max_message`, the whole suite stayed GREEN on the old fixture.
+    // Those four fields are that module's documented denial-of-service bounds,
+    // not tuning knobs. A positive control -- forcing `max_chunk_count` to 7 --
+    // did fail this test on the old fixture, so the vector was alive; it just
+    // could not say the thing its own comment claimed it said.
     const gpa = testing.allocator;
     var fx: OpcuaFixture = undefined;
     try fx.init(gpa, "opc.tcp://127.0.0.1:4840");
@@ -2655,10 +2670,10 @@ test "anchor: Wireshark reads the OPC UA adapter's ACKF handshake reply" {
     @memcpy(hel[0..4], "HELF");
     std.mem.writeInt(u32, hel[4..8], hel.len, .little);
     std.mem.writeInt(u32, hel[8..12], 0, .little);
-    std.mem.writeInt(u32, hel[12..16], 65536, .little);
-    std.mem.writeInt(u32, hel[16..20], 65536, .little);
-    std.mem.writeInt(u32, hel[20..24], 1 << 20, .little);
-    std.mem.writeInt(u32, hel[24..28], 0, .little);
+    std.mem.writeInt(u32, hel[12..16], 16384, .little); // client receive; below the server's 65536
+    std.mem.writeInt(u32, hel[16..20], 32768, .little); // client send; also below, and DIFFERENT
+    std.mem.writeInt(u32, hel[20..24], 8 << 20, .little); // above the server's 4 MiB ceiling
+    std.mem.writeInt(u32, hel[24..28], 1024, .little); // above the server's 256 ceiling
     std.mem.writeInt(u32, hel[28..32], url.len, .little);
     @memcpy(hel[32..], url);
 
@@ -2667,7 +2682,7 @@ test "anchor: Wireshark reads the OPC UA adapter's ACKF handshake reply" {
     try testing.expectEqual(@as(usize, 1), f.outbound().len);
     try testing.expectEqualSlices(u8, &.{
         0x41, 0x43, 0x4B, 0x46, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x00, 0x80, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
         0x00, 0x01, 0x00, 0x00,
     }, f.frameBytes(f.outbound()[0]));
 }

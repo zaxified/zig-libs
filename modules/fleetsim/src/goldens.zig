@@ -220,7 +220,7 @@ test "anchor: Wireshark reads the S7comm adapter's TPKT/COTP Connect Confirm" {
     //   ISO 8073/X.224 COTP
     //     Length: 17                        [cotp.li == 17]
     //     PDU Type: CC Connect Confirm (0x0d)  [cotp.type == 0x0d]
-    //     Destination reference: 0x0001     [cotp.destref == 0x0001]
+    //     Destination reference: 0x0004     [cotp.destref == 0x0004]
     //     Source reference: 0x0001          [cotp.srcref == 0x0001]
     //     0000 .... = Class: 0              [cotp.class == 0]
     //     Parameter code: tpdu-size (0xc0), TPDU size: 1024   [cotp.tpdu_size == 1024]
@@ -236,13 +236,21 @@ test "anchor: Wireshark reads the S7comm adapter's TPKT/COTP Connect Confirm" {
     const n = plc.node();
 
     var out: [512]u8 = undefined;
+    // ⚠ The CR's source reference is deliberately 0x0004, not 0x0001. The
+    // adapter answers `.dst_ref = cr.src_ref, .src_ref = 1`, so with both
+    // equal the CC's destref/srcref PLACEMENT was not a distinction this
+    // vector could express -- swapping the two assignments emitted a
+    // byte-identical frame and the whole suite stayed green (measured
+    // 2026-09-01). Still not discriminated, and worth knowing: the CC's TPKT
+    // length and COTP li are both equal to the CR's, so an implementation
+    // that echoed the request's lengths is indistinguishable here too.
     const cr = [_]u8{
-        0x03, 0x00, 0x00, 0x16, 0x11, 0xE0, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x03, 0x00, 0x00, 0x16, 0x11, 0xE0, 0x00, 0x00, 0x00, 0x04, 0x00,
         0xC1, 0x02, 0x01, 0x00, 0xC2, 0x02, 0x01, 0x02, 0xC0, 0x01, 0x0A,
     };
     const cc = (try n.deliver(&cr, &out, 0)).?;
     try testing.expectEqualSlices(u8, &.{
-        0x03, 0x00, 0x00, 0x16, 0x11, 0xD0, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x03, 0x00, 0x00, 0x16, 0x11, 0xD0, 0x00, 0x04, 0x00, 0x01, 0x00,
         0xC0, 0x01, 0x0A, 0xC1, 0x02, 0x01, 0x00, 0xC2, 0x02, 0x01, 0x02,
     }, cc);
 }
@@ -254,7 +262,7 @@ test "anchor: Wireshark reads the EtherNet/IP adapter's RegisterSession reply" {
     //     Length: 4                            [enip.length == 4]
     //     Session Handle: 0xa5a50001           [enip.session == 0xa5a50001]
     //     Status: Success (0x00000000)         [enip.status == 0x00000000]
-    //     Sender Context: 0000000000000000     [enip.context]
+    //     Sender Context: 7a6967666c656574     [enip.context]
     //     Options: 0x00000000                  [enip.options == 0x00000000]
     //     Command Specific Data
     //       Protocol Version: 1                [enip.rs.version == 1]
@@ -272,11 +280,17 @@ test "anchor: Wireshark reads the EtherNet/IP adapter's RegisterSession reply" {
     var req: [28]u8 = @splat(0);
     std.mem.writeInt(u16, req[0..2], @intFromEnum(enip.Command.register_session), .little);
     std.mem.writeInt(u16, req[2..4], 4, .little);
+    // Non-zero on purpose: the encapsulation header's sender context is echoed
+    // verbatim, and an all-zero one cannot tell an echo from a device that
+    // drops it. Measured 2026-09-01 -- with the echo removed in
+    // `modules/enip/src/adapter.zig`, the zero-context fixture stayed GREEN
+    // and only the pycomm3 corpus (whose context is `_pycomm_`) caught it.
+    @memcpy(req[12..20], "zigfleet");
     std.mem.writeInt(u16, req[24..26], 1, .little); // protocol version
     const reply = (try n.deliver(&req, &out, 0)).?;
     try testing.expectEqualSlices(u8, &.{
         0x65, 0x00, 0x04, 0x00, 0x01, 0x00, 0xA5, 0xA5, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x7A, 0x69, 0x67, 0x66, 0x6C, 0x65, 0x65, 0x74, 0x00, 0x00, 0x00, 0x00,
         0x01, 0x00, 0x00, 0x00,
     }, reply);
 }

@@ -19,7 +19,12 @@ const modbus = @import("modbus");
 
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
+    // Running the published surface under a leak-checking allocator is the
+    // only leak check this module has OUTSIDE its own test suite (the suite
+    // itself runs on `std.testing.allocator`). Discarding the verdict throws
+    // that away: measured 2026-09-01, a deliberate 64-byte leak printed
+    // `error(DebugAllocator): memory address 0x… leaked` and still exited 0.
+    defer if (gpa_state.deinit() == .leak) @panic("leak");
     const gpa = gpa_state.allocator();
 
     // A holding-register bank the simulated device reports from. Nothing

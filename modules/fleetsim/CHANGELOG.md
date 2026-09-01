@@ -5,6 +5,61 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-01** — Security audit.
+  **One silent TCP connection wedged the whole `serveTcpMulti` loop.** `fds` is built from the
+  peers active BEFORE the accept pass; the read loop walked the peers active AFTER it with a
+  running cursor into `fds`. A peer accepted during that pass is active but has no entry, so
+  from it onward every peer read someone else's `revents` — or, for the last one, an entry never
+  written that round, which on the first round is the allocator's `0xaaaa` fill, whose bit 3 is
+  `POLL.ERR`. The gate then opened and the loop entered a BLOCKING read on a peer that had sent
+  nothing. Measured: `run_ms = 700`, actual **3120 ms** — released by the peer's disconnect, not
+  by its own deadline, so a peer that connects, stays silent and never hangs up starves every
+  other master on the single thread they share. Each peer now carries its own poll-set index;
+  a peer with none has not been polled and is not treated as ready. `git blame` puts the cursor
+  at `a2c2e79c` (2026-07-23), before both prior audits.
+  **A canceled `serveTcpMulti` leaked one descriptor per connected master.** Peers were closed
+  only on the normal exit path, and the cancellation campaign added early returns that skip it.
+  Allocations were always fine — every `gpa.free` is a `defer` — so no allocator could see it.
+  **A canceled `accept` was reported as `NoPeer`, and `serveTcp` turns that into success.**
+  `AcceptError` ends in `Io.Cancelable`; `catch return error.NoPeer` threw it away, and with a
+  session already connected the caller got a normal `Report` for a cancel it requested.
+  `Threaded.checkCancel` reports `.canceling` once, so no later round recovered it either. Both
+  accept sites now surface it. ⚠ `f5b05324`'s claim that "a full sweep found no further arm of
+  this shape" was wrong: these two are the arms.
+  **A `run_ms` above 2^31 ms panicked.** `poll(2)`'s timeout is signed and negative means
+  forever, so the bare `@intCast` from these `u32` options crashed in Debug/ReleaseSafe and
+  became an infinite wait in ReleaseFast — from an ordinary "run for a month" value. Saturates
+  now.
+  **Two concurrent `test-fleetsim` runs produced a false RED.** Three hardcoded ports meant the
+  winner of the bind accepted the loser's clients too: `expected 2, found 1` / `found 3` /
+  `found 4`, on an assertion that looks entirely real. It fired accidentally on three separate
+  occasions during this audit, and `scripts/test.sh` runs modules in parallel. Ports are now
+  derived from the pid, strided by four — a stride of one still failed, because processes
+  spawned together get consecutive pids.
+  **Anchors that recorded a property without discriminating it** (the F7 shape, three more
+  occurrences, each re-anchored against a fresh Wireshark 4.6.4 reading rather than
+  re-commented): the OPC UA ACKF vector proposed limits equal to the server's own, so
+  `rbs == sbs` and `mms` was the client's own number echoed — dropping the receive/send
+  cross-swap, and separately never applying the server's own ceiling, both left the suite green,
+  and those four fields are `opcua`'s documented denial-of-service bounds. The S7comm Connect
+  Confirm carried `destref == srcref`, so swapping the two assignments emitted a byte-identical
+  frame. The EtherNet/IP RegisterSession used an all-zero sender context, so the echo was
+  indistinguishable from dropping it. All three now go red under exactly those mutations.
+  **A broken server was reported as an unavailable port.** The two round-trip tests skipped on
+  `BindFailed, error.NoPeer` — but `NoPeer` is a SERVER verdict when the client threads did
+  connect. Inverting `readable`'s readiness predicate, i.e. breaking the central readiness
+  decision, made the test print "cannot bind" and count green. `NoPeer` is now a failure.
+  **`FLEETSIM_EXPECT_TCP=1`**, the sibling of `FLEETSIM_EXPECT_LIVE` for this module's loopback
+  tests: every test in `tcp.zig` gives up with `SkipZigTest` if a socket call fails, and a skip
+  reports PASS, so the whole real-socket surface — the four cancellation guards included — could
+  vanish into a green run. Set it where loopback is expected to work.
+  **The example discarded its own leak verdict** (`defer _ = gpa_state.deinit()`), and it is the
+  only leak check outside the test suite: a deliberate leak printed the DebugAllocator's warning
+  and still exited 0.
+  Recorded rather than fixed: the S7 negotiated-PDU mark is an echo of a number the master
+  proposed (needs the live fixture re-recorded), and `master_goldens.zig`'s header overstated how
+  many marks are recomputed from the fixture — both now say so where they appear.
+
 - **2026-08-22** — `tcp.Error` gained a `Canceled` variant, and both raw-`poll(2)` waits in
   `tcp.zig` — `readable` (behind `serveTcp`'s accept budget and `serveTcpOn`'s idle-read
   wait) and `serveTcpMulti`'s many-descriptor readiness loop — now recover a `std.Io`

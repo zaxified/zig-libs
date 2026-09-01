@@ -752,4 +752,11 @@ and the multi-connection binding. What is still open:
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** 7 protocols live vs real masters: pymodbus/pycomm3/bacpypes3/opendnp3/c104/snap7/asyncua
+**What the tests actually contain.** Six real third-party master sessions frozen and replayed
+byte-for-byte offline in every default run — pymodbus 3.14.0, pycomm3 1.2.16, python-snap7 3.1.0,
+bacpypes3 0.0.106, c104 2.2.1, opendnp3 3.1.2, request bytes composed by the master and verdict
+marks it computed in its own number domain — plus eight Wireshark 4.6.4 readings of this module's
+own frames. ⚠ The seven LIVE tests against those masters (asyncua 2.0.1 is the seventh, and the
+one deliberately not frozen) are gated on `FLEETSIM_*_LISTEN` and **skip** unless the VM lane is
+running; `FLEETSIM_EXPECT_LIVE=1` turns a skip into a failure, and `FLEETSIM_EXPECT_TCP=1` does
+the same for the loopback-socket tests in `tcp.zig`.
