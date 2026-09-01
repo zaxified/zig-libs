@@ -5998,18 +5998,65 @@ test "integration: a connection dropped before serving still reports .new/.close
     defer thread.join();
     defer server.shutdown();
 
-    { // connect and close without sending a byte: the preface peek fails
+    { // Connect, let the server accept, then RESET without sending a byte.
+        //
+        // ⚠ A graceful close does NOT reach the path this test exists for, and
+        // the first version of this test used one. `detectH2Preface` maps
+        // `error.EndOfStream` to `return false` deliberately ("the h1 path
+        // answers"), so a FIN proceeds into `serveStream`, which fires its own
+        // `.new`/`.closed` pair — and the test then passed whether or not the
+        // fallback in `connMain` existed at all. Only `error.ReadFailed` takes
+        // the early return, and that needs a peer that RESETS. `SO_LINGER`
+        // with a zero timeout is what turns `close()` into an RST.
         const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
             std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
             return error.SkipZigTest;
         };
+        const Linger = extern struct { onoff: i32, timeout: i32 };
+        const l: Linger = .{ .onoff = 1, .timeout = 0 };
+        std.posix.setsockopt(
+            stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.LINGER,
+            std.mem.asBytes(&l),
+        ) catch |err| {
+            stream.close(io);
+            std.debug.print("SO_LINGER unavailable ({s}), skipping\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        // Wait for the RISE before resetting. An RST that arrives while the
+        // connection is still in the accept queue can take it out of the queue
+        // instead, so `connMain` would never run and the reset would prove
+        // nothing. `active_conns` is incremented by `serve()` at accept time,
+        // ahead of `connMain`, so this is the point at which the peek is what
+        // the reset will land on.
+        try waitForActive(&server, io, 1);
         stream.close(io);
     }
 
-    // Wait for the server task to finish with that connection.
+    // Wait for the connection's whole life to be REPORTED, not for the server
+    // to look idle. `activeConnections()` is the wrong predicate here: it reads
+    // 0 both BEFORE the accept and after the close, so the wait is satisfied by
+    // the initial state and returns immediately. That is exactly how this test
+    // passed in Debug and failed in ReleaseSafe and ReleaseFast on CI, on both
+    // amd64 and arm64 -- there the test thread wins the race to the first check
+    // and reads the tally before the accept loop has touched it.
+    //
+    // `waitForActive` above gets this right by waiting for the RISE (1) before
+    // the fall (0). A connection that may already be gone has no rise anyone
+    // can be sure of observing, so wait on the tally instead: `.closed` is
+    // written once, and only after the serving function is finished with the
+    // socket, so it cannot be satisfied early.
+    //
+    // Both loops fail LOUDLY on timeout. The version being replaced fell
+    // through into the assertions after its bound, so a server that genuinely
+    // never reported would have been indistinguishable from this race.
     var spins: usize = 0;
-    while (server.activeConnections() != 0 and spins < 2000) : (spins += 1)
+    while (tally.closed.load(.monotonic) == 0) : (spins += 1) {
+        if (spins > 2000) return error.TestTimeout;
         try sleepMs(io, 1);
+    }
+    try waitForActive(&server, io, 0);
 
     try testing.expectEqual(@as(usize, 0), server.activeConnections());
     // The whole life is reported, and reported in balance -- an admission
