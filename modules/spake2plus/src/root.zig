@@ -81,8 +81,11 @@
 //! (one of the seven cores) requires `received_confirm_p` as an input
 //! parameter, so it cannot be called yet at that point in a genuinely
 //! blind two-party run. `verifierConfirm` is `verifierFinish`'s `Z`/`V`/
-//! `TT`/key-schedule computation with the `confirmP` check (and the
-//! `K_shared` return) removed — it exists so the real message order
+//! `TT`/key-schedule computation with the `confirmP` check removed and
+//! with everything except `confirmV` kept INSIDE the call — a returned
+//! `K_main` or `TT` is one public `deriveKeys`/`kdf` call away from
+//! `K_shared`, so withholding merely the `k_shared` field would not have
+//! withheld the key — it exists so the real message order
 //! (`proverStart` -> `verifierStart` -> `verifierConfirm` ->
 //! `proverFinish` -> `verifierFinish`) is drivable through public API
 //! alone, with neither party ever needing foreknowledge of the other's
@@ -781,29 +784,40 @@ pub const VerifierConfirmError = error{
 };
 
 /// One result of the Verifier's confirmation-EMISSION half — deliberately
-/// NOT the same struct as `VerifierFinishResult`: there is no `k_shared`
-/// field here (see `verifierConfirm`'s doc comment for why that omission
-/// is load-bearing, not an oversight).
+/// NOT the same struct as `VerifierFinishResult`.
+///
+/// **The single field IS the contract.** RFC 9383 §3.3 requires that
+/// neither party consider the protocol complete before validating the
+/// peer's confirmation, and this step runs before the Verifier has seen
+/// `confirmP` at all — so everything this call computes on the way to
+/// `confirmV` (`Z`, `V`, `TT`, `K_main`, both confirmation keys) stays
+/// inside it. `K_main` and `TT` are each a ONE-CALL pre-image of
+/// `K_shared` through this module's own public `deriveKeys`/`kdf`, so a
+/// struct that returned them for "KAT visibility" would have handed back
+/// the very key the gate exists to withhold, in a struct whose
+/// documentation promised the opposite. `Z`/`V` are two calls away by the
+/// same route (`computeTranscript` then `deriveKeys`, from arguments the
+/// caller already holds), so they are withheld too.
+///
+/// `TT` is allocated and freed inside `verifierConfirm`; unlike
+/// `ProverFinishResult`/`VerifierFinishResult` there is nothing here for
+/// the caller to free. The byte-exact KAT coverage those fields carried is
+/// unaffected: `verifierFinish` recomputes `Z`/`V`/`TT`/the key schedule
+/// from the same inputs and returns them after the confirmation check, and
+/// `kat_test.zig` pins them there. A wrong `Z` or `V` here still fails
+/// loudly — it lands in `confirmV`, which is pinned byte-exact against RFC
+/// 9383 Appendix C.
+///
+/// ⚠ This is a gate against a *caller's mistake*, not against a hostile
+/// Verifier: the Verifier holds `w0`, `L`, `y` and both shares, so it can
+/// always recompute the key schedule from scratch if it sets out to. What
+/// the type now guarantees is that it cannot do so by accident, from a
+/// field it was handed.
 pub const VerifierConfirmResult = struct {
     /// `confirmV = MAC(K_confirmV, shareP)` (RFC 9383 §3.4) — transmit
     /// this to the Prover. This is the value RFC 9383 Appendix A.5's
     /// Verifier flow sends BEFORE it has seen the Prover's `confirmP`.
     confirm_v: [hash_length]u8,
-    /// `Z = h*y*(X - w0*M)` (RFC 9383 §3.3), UNCOMPRESSED SEC1. Exposed
-    /// for the same byte-exact-KAT reason `VerifierFinishResult.z` is.
-    z: [share_length]u8,
-    /// `V = h*y*L` (RFC 9383 §3.3), UNCOMPRESSED SEC1 — see
-    /// `VerifierFinishResult.v`'s doc comment for the commutativity this
-    /// relies on.
-    v: [share_length]u8,
-    /// The assembled transcript `TT` this call fed to `deriveKeys`.
-    /// ALLOCATOR-OWNED — the caller MUST free this with the same
-    /// `allocator` passed to `verifierConfirm` (mirrors
-    /// `VerifierFinishResult.tt`).
-    tt: []u8,
-    k_main: [hash_length]u8,
-    k_confirm_p: [hash_length]u8,
-    k_confirm_v: [hash_length]u8,
 };
 
 /// RFC 9383 §3.3 / Appendix A.2 `VerifierFinish`'s `Z`/`V` half PLUS
@@ -839,12 +853,17 @@ pub const VerifierConfirmResult = struct {
 /// inputs (everything `verifierFinish` needs EXCEPT `received_confirm_p`,
 /// because this step runs before that value exists), but it stops right
 /// after emitting `confirmV` — it does NOT check anything received from
-/// the Prover, and it deliberately does NOT return `K_shared` (see
-/// `VerifierConfirmResult`'s doc comment): RFC 9383 §3.3 is explicit that
-/// neither party may consider the protocol complete before validating
-/// the peer's confirmation, and `K_shared` is only ever safe to hand back
-/// from `verifierFinish`, once `received_confirm_p` has actually been
-/// checked. A caller drives the real, blind two-party protocol as:
+/// the Prover, and it returns `confirmV` and NOTHING ELSE (see
+/// `VerifierConfirmResult`'s doc comment, where the emptiness of that
+/// struct is argued in full): RFC 9383 §3.3 is explicit that neither
+/// party may consider the protocol complete before validating the peer's
+/// confirmation, and `K_shared` is only ever safe to hand back from
+/// `verifierFinish`, once `received_confirm_p` has actually been checked.
+/// Withholding the `k_shared` FIELD is not enough to make that true — a
+/// returned `K_main` or `TT` is one public `deriveKeys`/`kdf` call away
+/// from the same key — which is why this call keeps its whole key
+/// schedule and frees its own transcript.
+/// A caller drives the real, blind two-party protocol as:
 /// `proverStart` -> `verifierStart` -> `verifierConfirm` (send
 /// `confirm_v`) -> `proverFinish` (validates `confirm_v`, sends
 /// `confirm_p`) -> `verifierFinish` (validates `confirm_p`, both sides
@@ -860,11 +879,12 @@ pub const VerifierConfirmResult = struct {
 /// constant-time `mul` — identical constant-time discipline to
 /// `verifierFinish`.
 ///
-/// Byte-exact target: RFC 9383 Appendix C's official vector's `Z`, `V`,
-/// `TT`, `K_main`, `K_confirmP`, `K_confirmV`, and `confirmV` (same
-/// values `verifierFinish`'s KAT test already pins — `kat_test.zig`
-/// exercises this function directly too, ahead of `confirmP` ever being
-/// computed).
+/// Byte-exact target: RFC 9383 Appendix C's official vector's `confirmV`
+/// (`kat_test.zig` exercises this function directly, ahead of `confirmP`
+/// ever being computed). `confirmV` is `MAC(K_confirmV, shareP)` over a
+/// key schedule fed by `Z`/`V`/`TT`, so pinning it pins all of them —
+/// and `verifierFinish`'s own KAT pins those intermediates individually,
+/// on the same inputs, where returning them is safe.
 pub fn verifierConfirm(
     allocator: std.mem.Allocator,
     context: []const u8,
@@ -899,20 +919,15 @@ pub fn verifierConfirm(
     const z = z_point.toUncompressedSec1();
     const v = v_point.toUncompressedSec1();
 
+    // Freed here, not returned: see `VerifierConfirmResult`'s doc comment —
+    // `TT` is a one-call pre-image of `K_shared`, which this step must not
+    // hand back.
     const tt = try computeTranscript(allocator, context, id_prover, id_verifier, share_p, share_v, z, v, w0);
-    errdefer allocator.free(tt);
+    defer allocator.free(tt);
 
     const keys = deriveKeys(tt);
 
-    return .{
-        .confirm_v = mac(&keys.k_confirm_v, &share_p),
-        .z = z,
-        .v = v,
-        .tt = tt,
-        .k_main = keys.k_main,
-        .k_confirm_p = keys.k_confirm_p,
-        .k_confirm_v = keys.k_confirm_v,
-    };
+    return .{ .confirm_v = mac(&keys.k_confirm_v, &share_p) };
 }
 
 /// RFC 9383 §3.3 / Appendix A.2 `VerifierFinish`'s `Z`/`V` half (the
@@ -1045,22 +1060,114 @@ test "mPoint/nPoint parse the RFC 9383 §4 P-256 constants and land on-curve, no
 
 // ── fuzz: the share-decode boundary never panics/OOB on arbitrary bytes ───
 //
-// `proverFinish`/`verifierFinish` both feed a peer-supplied share
-// (`share_v`/`share_p`, arbitrary wire bytes in a live protocol) straight
-// into `P256.fromSec1` before any group-membership check runs — this is
-// the module's actual untrusted-wire decode boundary (RFC 9383 §6's
-// "MUST abort... upon receiving any value V such that..." starts with
-// "does this even parse as a point").
+// `proverFinish`/`verifierFinish`/`verifierConfirm` all feed a
+// peer-supplied share (`share_v`/`share_p`, arbitrary wire bytes in a live
+// protocol) straight into `P256.fromSec1` before any group-membership
+// check runs — this is the module's actual untrusted-wire decode boundary
+// (RFC 9383 §6's "MUST abort... upon receiving any value V such that..."
+// starts with "does this even parse as a point").
+//
+// ⚠ An earlier version of this harness drew a random length in [0, 96] and
+// called `P256.fromSec1` directly. Measured over 20,000,000 draws, that
+// reached a parsing point 0.008% of the time, **and not once in the
+// 65-byte UNCOMPRESSED form — the only encoding this module ever receives**
+// (both entry points take `[share_length]u8`). It was fuzzing the
+// compressed-point path, which no caller can reach, and a random (x, y)
+// satisfies the curve equation with probability ~2^-256 so the
+// uncompressed path was unreachable by construction, not by luck.
+//
+// So: fix the buffer at `share_length`, and derive half the draws from a
+// REAL encoding the smith then perturbs, which puts valid,
+// one-byte-off-valid, and wildly-invalid shares all in range. The share is
+// driven through the public entry point rather than `fromSec1` alone, so
+// the identity/canonical guards behind the parse are on the fuzzed path
+// too. Costs stay bounded: a share that does not parse returns before any
+// scalar multiplication happens.
 
 fn fuzzShareDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [96]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const point = P256.fromSec1(buf[0..len]) catch return;
-    point.rejectIdentity() catch {};
+    var share: [share_length]u8 = undefined;
+    if (smith.value(bool)) {
+        // Perturb a genuine uncompressed encoding: reachable valid input,
+        // and every near-miss around it.
+        share = mPoint().toUncompressedSec1();
+        var i: usize = 0;
+        const flips = smith.valueRangeAtMost(u8, 0, 4);
+        while (i < flips) : (i += 1) {
+            const at = smith.valueRangeAtMost(u8, 0, share_length - 1);
+            share[at] ^= smith.value(u8);
+        }
+    } else {
+        smith.bytes(&share);
+    }
+
+    // The bare decode boundary.
+    if (P256.fromSec1(&share)) |point| {
+        point.rejectIdentity() catch {};
+    } else |_| {}
+
+    // And the real entry point behind it: parse, RFC 9383 §6 group check,
+    // then the secret-touching arithmetic and the transcript allocation.
+    const w = [_]u8{0x2a} ** scalar_length;
+    if (proverFinish(
+        std.testing.allocator,
+        "fuzz",
+        "p",
+        "v",
+        w,
+        w,
+        w,
+        share,
+        share,
+        [_]u8{0} ** hash_length,
+    )) |ok| {
+        std.testing.allocator.free(ok.tt);
+    } else |_| {}
 }
-test "fuzz P256.fromSec1 (share-decode boundary) never panics" {
+test "fuzz the share-decode boundary and the entry point behind it" {
     try std.testing.fuzz({}, fuzzShareDecode, .{});
+}
+
+// The module doc comment and SPEC.md both state that EVERY scalar
+// multiplication here touches secret material and must therefore go
+// through `P256`'s constant-time `mul`, never the variable-time
+// `mulPublic`/`mulDoubleBasePublic`. Nothing enforced it: swapping
+// `computeL`'s multiply — the one that touches `w1`, whose secrecy is the
+// entire point of the "+" in SPAKE2+ — for `mulPublic` left all 29 tests
+// green in Debug AND ReleaseFast (measured, audit 2026-09-01).
+//
+// ⚠ What this test pins is the CALL SITE, which is exactly what the claim
+// says: it cannot measure timing. Whether `p256`'s `mul` is itself free of
+// secret-dependent branches is `p256`'s to prove, and `p256` has no
+// `ctgrind_harness.zig` — so neither module is in the `ct` set that covers
+// the sibling `k256`/`montint`. That gap is recorded, not closed here. Do
+// not read a green run of this test as a constant-time measurement.
+//
+// The needles are assembled from fragments so this test cannot match its
+// own source text.
+test "CT discipline: no secret multiply may use a variable-time routine" {
+    const src = @embedFile("root.zig");
+    const vartime = [_][]const u8{
+        "." ++ "mulPublic(",
+        "." ++ "mulDoubleBasePublic(",
+    };
+    for (vartime) |needle| {
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, src, at, needle)) |hit| {
+            // A mention inside a doc/line comment is the claim itself; a
+            // call is code. Find the start of the hit's line and reject it
+            // only when that line is not a comment.
+            const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..hit], '\n')) |nl| nl + 1 else 0;
+            const line = std.mem.trimStart(u8, src[line_start..hit], " ");
+            if (!std.mem.startsWith(u8, line, "//")) {
+                std.debug.print(
+                    "\nvariable-time multiply on a secret scalar at byte {d}: {s}\n",
+                    .{ hit, src[line_start..@min(src.len, hit + 40)] },
+                );
+                return error.VariableTimeMultiplyOnSecretScalar;
+            }
+            at = hit + needle.len;
+        }
+    }
 }
 
 test "hash/mac wrappers agree with std's own primitives directly (sanity, not a KAT)" {

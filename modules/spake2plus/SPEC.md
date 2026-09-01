@@ -34,7 +34,9 @@ below.
   this augmentation. `root.zig`'s `meta.model_after` and its own test
   ("names RFC 9383 / SPAKE2+ (not RFC 9382 / plain SPAKE2)") both pin
   this distinction so it cannot silently drift.
-- **The group**: `std.crypto.ecc.P256`, a PRIME-order Weierstrass curve
+- **The group**: this repository's `p256` module (byte-exact to
+  `std.crypto.ecc.P256`, which is what this module was written against
+  and was moved off on 2026-07-19), a PRIME-order Weierstrass curve
   — cofactor `h = 1` always for this ciphersuite (`cofactor_h` in
   `root.zig`), so every `h*x*(...)`/`h*y*(...)` term in RFC 9383's `Z`/
   `V` equations collapses to a no-op multiplication-by-one. This is a
@@ -105,18 +107,25 @@ one-way function of it" step at all — SPAKE2's Verifier-equivalent party
 holds the literal secret, so a database compromise there IS a stolen
 password. SPAKE2+'s `L` is the whole reason that is not true here.
 
-## `w0`/`w1` derivation (RFC 9383 §3.2) — the one function with no KAT oracle
+## `w0`/`w1` derivation (RFC 9383 §3.2) — the one function Appendix C cannot reach
 
 `computeW0W1` implements §3.2's RECOMMENDED PBKDF-output-splitting
 method (`w0s || w1s = pbkdf_output`, each half `>= 320` bits, reduced
 mod `p` via `Scalar.fromBytes48`'s wide reduction). RFC 9383 Appendix
 C's own test vector explicitly SKIPS this step ("the choice of PBKDF is
 omitted, and values for w0 and w1 are provided directly") — so unlike
-every other function in this module, `computeW0W1` has no official
-byte-exact target. Its contract is still pinned unambiguously (via
-`group_order`/`Scalar.fromBytes48`'s well-defined semantics, restated in
-its own doc comment), just without a KAT to check it against; see
-`kat_test.zig`'s coverage note.
+every other function in this module, `computeW0W1` has no *official*
+byte-exact target.
+
+It is not unanchored, though. `src/bssl_w0w1_vectors.zig` carries frozen
+outputs of BoringSSL's `bssl::spake2plus::Register` performing the
+identical §3.2 construction, and `src/bssl_w0w1_test.zig` pins
+`computeW0W1` (and `computeL`) against them byte for byte — three
+registration vectors plus chosen modular-reduction boundary halves
+(`0`, `1`, `n-1`, `n`, `n+1`, `2^256-1`, `2^320-1`), which a scrypt
+output never lands near and which the §3.2 wide reduction is precisely
+what gets wrong. That is a genuine cross-implementation oracle, not a
+self-consistency check; it closed audit finding F1.
 
 ## Threat model / limits
 
@@ -127,6 +136,41 @@ its own doc comment), just without a KAT to check it against; see
   takes `x`/`y` as explicit CALLER-supplied parameters (mirrors
   `bip340.sign`'s `aux_rand` precedent) rather than generating them
   internally — sourcing them correctly is the caller's responsibility.
+
+  **"A CSPRNG" is not specific enough in this repository, and the
+  difference is the whole security of the PAKE.** `std.Io.random` is a
+  CSPRNG *by its own documentation* and carries a silent-degrade clause
+  (`std.Io.Threaded` seeds from a zeroed buffer plus an ASLR pointer,
+  `getpid()` and a clock when entropy is unavailable). `x`/`y` are
+  secret-bearing draws, so CONVENTIONS.md §2.2 applies: use
+  `try io.randomSecure(&buf)`, or [`entropy.fill(io, &buf)`](../entropy)
+  where there is no error channel — the same rule, and for the same
+  reason, that `bip340`'s `a_2..a_u` draws follow.
+
+  What a degraded draw costs here: `shareV = y*P + w0*N` is public. An
+  eavesdropper who can predict `y` recovers `w0*N = shareV - y*P`, and
+  then each candidate password costs ONE scalar multiplication to test,
+  **offline, with no further interaction** — the augmented PAKE collapses
+  to the offline dictionary attack it exists to prevent. The Prover side
+  is symmetric in `x` and `w0*M`. Reduce the draw to a wide 48-byte
+  buffer with `Scalar.fromBytes48` (the pattern `computeW0W1` already
+  uses) rather than rejection-sampling by hand.
+- **Rate-limit failed runs**: a PAKE's security argument is that an
+  active attacker gets exactly ONE password guess per protocol run, and
+  that argument holds only if the Verifier bounds how many runs an
+  attacker may start. This module has no state and cannot count for you:
+  every `error.ConfirmationMismatch` from `verifierFinish` is one
+  consumed guess against `(idProver, idVerifier)` and the caller must
+  record it, throttle, and lock out. ⚠ **RFC 9383 does not say this** —
+  its §6 covers the CSPRNG and subgroup-confinement requirements and is
+  silent on failed-attempt limiting (checked against the RFC text, not
+  assumed), so an implementer who treats §6 as a complete checklist ships
+  an unthrottled Verifier. The obligation comes from what a PAKE is, not
+  from the document.
+  Abort the session on the error; never retry the same run, and never
+  report *why* it failed to the peer. For the Matter/Thread commissioning
+  passcodes this ciphersuite targets the search space is 10^8 or smaller,
+  so an unthrottled Verifier is brute-forceable online.
 - **Group-membership checks are mandatory, not optional**: RFC 9383 §6
   requires aborting on any received public value `V` such that `V*h ==
   I` (the identity). For P-256's prime-order group (`h = 1`), this
@@ -187,9 +231,9 @@ allocator-owned variable-length output, constant-time MAC/confirmation
 comparison):
 
 1. **`computeW0W1`** — split an 80-byte PBKDF output into two 40-byte
-   halves, wide-reduce each mod `p` via `Scalar.fromBytes48`. No KAT
-   oracle (see above) — correctness rests on `group_order`/
-   `Scalar.fromBytes48`'s own well-defined semantics.
+   halves, wide-reduce each mod `p` via `Scalar.fromBytes48`. Outside
+   Appendix C's reach (see above), so it is anchored instead against
+   BoringSSL's `Register`, boundary halves included.
 2. **`computeL`** — `L = w1*P` (constant-time base-point multiply,
    uncompressed-SEC1-encode).
 3. **`proverStart`** — `X = x*P + w0*M` (two constant-time multiplies +
@@ -211,7 +255,10 @@ comparison):
 
 Byte-exact oracle for six of the seven: RFC 9383 Appendix C's OFFICIAL
 P-256/SHA-256 test vector (`kat_vectors.zig`), exercised by
-`kat_test.zig`. `computeTranscript` and `mac` pass against this same
+`kat_test.zig`. The seventh, `computeW0W1`, is anchored against
+BoringSSL (`bssl_w0w1_vectors.zig` / `bssl_w0w1_test.zig`), which also
+gives `computeL` a second, independent oracle.
+`computeTranscript` and `mac` pass against this same
 vector too — the transcript/MAC plumbing the six cores feed into is
 correct independent of them. The property-test layer (a genuinely blind
 end-to-end Prover<->Verifier run agreeing on `K_shared`, tamper rejection
@@ -243,14 +290,32 @@ which by construction cannot depend on `confirmP`.
 `Z = h*y*(X - w0*M)` / `V = h*y*L` / transcript / key-schedule
 computation `verifierFinish` performs, stopping right after
 `confirmV = MAC(K_confirmV, shareP)` — no `received_confirm_p` parameter,
-because this step runs before that value exists, and NO `K_shared` in
-its return type (`VerifierConfirmResult` has no `k_shared` field at
-all — not merely an unused one). RFC 9383 §3.3 is explicit that neither
+because this step runs before that value exists, and `VerifierConfirmResult`
+carries `confirm_v` and NOTHING ELSE. RFC 9383 §3.3 is explicit that neither
 party may consider the protocol complete before validating the peer's
 confirmation; a function that handed back `K_shared` before that
 validation would reintroduce the exact class of defect this addition
 fixes, only worse (a silently-unauthenticated key instead of a stuck
-protocol). `proverFinish` needed no equivalent split: `proverStart`
+protocol).
+
+⚠ **Omitting the `k_shared` FIELD is not what makes that true, and the
+first version of this function got it wrong.** It also returned `tt` and
+`k_main` "for KAT visibility", and each of those is a one-call pre-image of
+`K_shared` through this module's own public `deriveKeys`/`kdf` — measured
+2026-09-01: both `deriveKeys(vc.tt).k_shared` and
+`kdf(32, "", &vc.k_main, "SharedKey")` equal the real `K_shared`, at the
+moment the Verifier has never seen a `confirmP`. `Z`/`V` were two calls
+away by the same route. All of them now stay inside the call, which frees
+its own transcript; the byte-exact KAT coverage they carried is unchanged,
+because `verifierFinish` recomputes and returns the same values on the same
+inputs, after the confirmation check, where returning them is safe.
+
+Scope this honestly: it is a gate against a caller's **mistake**, not
+against a hostile Verifier. The Verifier holds `w0`, `L`, `y` and both
+shares, so it can always recompute the key schedule from scratch if it
+sets out to. What the type now guarantees is that it cannot do so by
+accident, from a field it was handed while the docs told it that was
+impossible. `proverFinish` needed no equivalent split: `proverStart`
 already gives the Prover a way to emit its first message (`shareP`) with
 no peer input, and by the time the Prover next acts it already holds
 BOTH `shareV` and the Verifier's `confirmV` — the RFC's own pseudocode
@@ -284,4 +349,4 @@ returns it caller-owned in `VerifierConfirmResult.tt`.
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** RFC 9383 Appendix C official P-256/SHA-256 vector, kat_vectors.zig
+**What the tests actually contain.** RFC 9383 Appendix C official P-256/SHA-256 vector, kat_vectors.zig; plus goldens captured from BoringSSL's `bssl::spake2plus::Register` (registration + modular-reduction boundary halves), bssl_w0w1_vectors.zig

@@ -15,10 +15,9 @@ first table row). RFC 9383 is a public IETF specification — not a
 copyrightable work (merger doctrine; see CONVENTIONS.md §5) — so no
 third-party-source NOTICE entry is strictly required for the spec citation
 alone. No reference implementation's source was ported or consulted as a
-design reference for this scaffolding pass; it worked from the RFC 9383
-specification text
+design reference; it worked from the RFC 9383 specification text
 (`https://www.rfc-editor.org/rfc/rfc9383.txt`, fetched 2026-07-12) and the
-public API of `std.crypto.ecc.P256` / `std.crypto.hash.sha2.Sha256` /
+public API of the P-256 group / `std.crypto.hash.sha2.Sha256` /
 `std.crypto.auth.hmac.sha2.HmacSha256` / `std.crypto.kdf.hkdf.HkdfSha256`
 only.
 
@@ -69,12 +68,25 @@ independent confirmation that both the compressed constants AND the
 `TT` vector were transcribed correctly (a transcription error in either
 one would have broken this cross-check).
 
-`std.crypto.ecc.P256` (field arithmetic, scalar arithmetic, point group
-law, `basePoint`, `mul`/`mulDoubleBasePublic`, `fromSec1`/
-`toUncompressedSec1`/`toCompressedSec1`), `std.crypto.hash.sha2.Sha256`,
-`std.crypto.auth.hmac.sha2.HmacSha256`, and `std.crypto.kdf.hkdf.
-HkdfSha256` are used via their public APIs (MIT, part of Zig itself); no
-new curve, hash, MAC, or KDF primitive is implemented here.
+The P-256 group (field arithmetic, scalar arithmetic, point group law,
+`basePoint`, `mul`, `fromSec1`/`toUncompressedSec1`/`toCompressedSec1`)
+comes from this repository's own `p256` module, which is itself clean-room
+(see `modules/p256/README.md`) and byte-exact to `std.crypto.ecc.P256`;
+this module was written against `std.crypto.ecc.P256` and moved onto
+`p256` on 2026-07-19 with no source change beyond the import. The
+`std.crypto.hash.sha2.Sha256`, `std.crypto.auth.hmac.sha2.HmacSha256`, and
+`std.crypto.kdf.hkdf.HkdfSha256` primitives are used via their public APIs
+(MIT, part of Zig itself); no new curve, hash, MAC, or KDF primitive is
+implemented here.
+
+BoringSSL (Apache-2.0, The BoringSSL Authors), commit
+`922245af6eda11b3f101ab5f542093eb5e7d1a74`, was **built and run once**
+outside this repository to capture the frozen `computeW0W1`/`computeL`
+cross-implementation vectors in `src/bssl_w0w1_vectors.zig`. Nothing from
+it is copied or translated into this repository — only the outputs of
+running it were recorded, so no Apache-2.0 condition attaches here and the
+root `NOTICE` is unaffected. The full capture procedure (driver source,
+build command, date) is documented at the head of that file.
 
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
@@ -90,13 +102,14 @@ this pass; this module does not itself implement, and has no dependency
 on, any Matter- or Thread-specific framing, only the underlying RFC 9383
 SPAKE2+ primitive.
 
-**Status: scaffold.** Wire constants/encoders (`m_compressed_sec1`/
+**Status: complete.** Wire constants/encoders (`m_compressed_sec1`/
 `n_compressed_sec1`, `mPoint`/`nPoint`, `computeTranscript`, the `hash`/
-`mac`/`kdf` primitive wrappers) are implemented and tested for real. The
-seven crypto cores (`computeW0W1`, `computeL`, `proverStart`,
-`verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`) are
-`@panic("TODO(fable): ...")` stubs with their final signatures fixed and
-their exact construction fully specified in `root.zig`'s doc comments and
-`SPEC.md`; `kat_vectors.zig` / `kat_test.zig` are ready to validate a
-crypto-core implementation byte-exactly the moment one lands. See
-`SPEC.md`'s "TODO(fable)" section.
+`mac`/`kdf` primitive wrappers) and all seven crypto cores (`computeW0W1`,
+`computeL`, `proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`,
+`verifierFinish`) are implemented, plus `verifierConfirm`, the eighth
+function that lets a genuinely blind Verifier emit `confirmV` before it has
+received `confirmP`. No `@panic`/TODO stub remains. `kat_vectors.zig` /
+`kat_test.zig` validate them byte-exactly against RFC 9383 Appendix C, and
+`bssl_w0w1_vectors.zig` / `bssl_w0w1_test.zig` anchor `computeW0W1` and
+`computeL` against BoringSSL, the one construction Appendix C cannot reach.
+See `SPEC.md` for the per-function specification.

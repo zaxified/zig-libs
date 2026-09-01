@@ -114,7 +114,6 @@ fn runSession(
     // Round 2a: the Verifier goes first — it transmits confirmV with NO
     // Prover confirmation in existence yet (RFC 9383 Appendix A.5).
     const verifier_confirm = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, w0, l, y, share_p, share_v);
-    defer gpa.free(verifier_confirm.tt);
 
     // Round 2b: the Prover validates confirmV (received above) and only
     // then computes+transmits its own confirmP, receiving K_shared.
@@ -197,7 +196,6 @@ pub fn main() !void {
     const share_p3 = try spake.proverStart(scalars3.w0, wrong_password.w0); // prover's WRONG w0
     const share_v3 = try spake.verifierStart(scalars3.w1, w0); // verifier's CORRECT w0
     const verifier_confirm3 = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, w0, l, scalars3.w1, share_p3, share_v3);
-    defer gpa.free(verifier_confirm3.tt);
     if (spake.proverFinish(
         gpa,
         context,
@@ -221,7 +219,6 @@ pub fn main() !void {
     const share_p4 = try spake.proverStart(scalars4.w0, w0);
     const share_v4 = try spake.verifierStart(scalars4.w1, w0);
     const verifier_confirm4 = try spake.verifierConfirm(gpa, context, id_prover, id_verifier, w0, l, scalars4.w1, share_p4, share_v4);
-    defer gpa.free(verifier_confirm4.tt);
     var prover_result4 = try spake.proverFinish(
         gpa,
         context,

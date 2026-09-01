@@ -5,6 +5,39 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-01** — Security audit. `verifierConfirm`'s documented gate did not hold:
+  `VerifierConfirmResult` withheld the `k_shared` FIELD while returning `tt` and `k_main`,
+  and each of those is a one-call pre-image of `K_shared` through this module's own public
+  `deriveKeys`/`kdf` — measured, at the moment the Verifier has never seen a `confirmP`,
+  which is exactly the "silently-unauthenticated key" SPEC.md named as the worse defect.
+  The struct now carries `confirm_v` and nothing else and frees its own transcript; the
+  byte-exact coverage the removed fields carried is unchanged, since `verifierFinish`
+  recomputes and returns the same values after the confirmation check. Scoped honestly in
+  the docs: this stops a caller's accident, not a hostile Verifier, which holds every input
+  needed to recompute the schedule anyway.
+  Guards that held nothing, now pinned: `verifierConfirm`'s two RFC 9383 §6
+  group-membership checks (added as a third wire-facing entry point in `7386e724` and never
+  added to the §6 test set — both could be deleted with the suite green in Debug and
+  ReleaseFast), and all twelve `rejectNonCanonical` call sites (the group operation reduces
+  mod `n` silently, so `basePoint.mul(n+1) == basePoint.mul(1)` — without the guard a
+  non-canonical encoding aliases onto a canonical one). Added the mismatched-password run
+  the suite never had, and a source-text gate on the constant-time claim, after
+  `computeL`'s multiply over the secret `w1` was swapped for the variable-time `mulPublic`
+  with all 29 tests green. ⚠ That gate pins the CALL SITE, not timing: `p256` has no
+  `ctgrind_harness.zig`, so neither module is in the `ct` set covering `k256`/`montint`.
+  `fuzzShareDecode` rebuilt: it drew a random length in [0, 96] and reached a parsing point
+  0.008% of the time, **never once in the 65-byte uncompressed form that is the only
+  encoding this module accepts** (0 of 20,000,000 draws) — it was fuzzing the compressed
+  path no caller can reach. Now fixed at `share_length`, half the draws perturbing a real
+  encoding, driven through the public entry point: 10.0% reach the parse, all uncompressed.
+  Docs: `NOTICE` still declared the module a scaffold of `@panic` stubs and carried no
+  BoringSSL provenance entry; SPEC.md called `computeW0W1` unanchored in four places and
+  omitted the BoringSSL goldens from its anchor evidence; both named `std.crypto.ecc.P256`
+  as the group. SPEC.md gained the two obligations it was missing for a PAKE — the
+  fail-closed entropy source `x`/`y` must come from (CONVENTIONS.md §2.2; a predictable `y`
+  makes `w0*N = shareV - y*P` recoverable and collapses this to an OFFLINE dictionary
+  attack) and failed-attempt rate limiting, which RFC 9383 §6 does not require and an
+  implementer reading it as a checklist will therefore omit.
 - **2026-08-23** — False-anchor fix: the documented "Protocol flow" (README.md) could not
   actually run. `proverFinish` requires the Verifier's `confirmV` as an input and
   `verifierFinish` requires the Prover's `confirmP` as an input, so two genuinely blind

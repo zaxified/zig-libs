@@ -25,7 +25,9 @@ hinges on.
 |---|---|
 | `root.zig` | `M`/`N` ciphersuite constants + `mPoint`/`nPoint`, `computeTranscript`, `hash`/`mac`/`kdf` wrappers, the 7 crypto cores (`computeW0W1`, `computeL`, `proverStart`, `verifierStart`, `deriveKeys`, `proverFinish`, `verifierFinish`), and `verifierConfirm` (the Verifier's confirmV-emission half, split out of `verifierFinish` so a blind two-party run is drivable) — all REAL |
 | `kat_vectors.zig` | RFC 9383 Appendix C's 1 official P-256/SHA-256 test vector, byte-exact |
-| `kat_test.zig` | "REAL TODAY" tests (`computeTranscript`/`mac`, pass now) + byte-exact KAT assertions + a genuinely-blind end-to-end Prover<->Verifier run (no foreknowledge of either confirmation value) + tamper-rejection tests |
+| `kat_test.zig` | Byte-exact KAT assertions against that vector + a genuinely-blind end-to-end Prover<->Verifier run (no foreknowledge of either confirmation value) + mismatched-password, tamper-rejection, RFC 9383 §6 group-membership and non-canonical-scalar tests |
+| `bssl_w0w1_vectors.zig` | Frozen goldens captured from BoringSSL's `bssl::spake2plus::Register` — registration vectors plus modular-reduction boundary halves. The oracle for `computeW0W1`, which RFC 9383 Appendix C cannot reach |
+| `bssl_w0w1_test.zig` | Pins `computeW0W1` and `computeL` against those goldens byte for byte. Runs offline, with no skip path |
 
 ## Import
 
@@ -59,9 +61,9 @@ const verifier_confirm = try spake2plus.verifierConfirm(
     allocator, context, id_prover, id_verifier,
     w0w1.w0, l, y, share_p, share_v,
 );
-defer allocator.free(verifier_confirm.tt);
 // verifier_confirm.confirm_v -> Verifier -> Prover: confirmV
-// (no k_shared here by design — see verifierConfirm's doc comment)
+// This result carries confirm_v and NOTHING else -- no transcript to free,
+// and nothing that reconstructs K_shared (see verifierConfirm's doc comment)
 
 // Round 2b: the Prover validates the confirmV it just received, and only
 // on success computes its own confirmP and the shared secret.
@@ -91,9 +93,15 @@ drives a transport itself; see `SPEC.md`'s threat-model section for the
 CSPRNG and constant-time-comparison requirements this places on
 callers/the crypto-core implementation. `K_shared` is returned ONLY by
 `proverFinish`/`verifierFinish`, and only after each has independently,
-constant-time-validated the peer's confirmation — `verifierConfirm`
-cannot hand back `K_shared` at all (RFC 9383 §3.3: neither party may
-consider the protocol complete before that validation).
+constant-time-validated the peer's confirmation (RFC 9383 §3.3: neither
+party may consider the protocol complete before that validation).
+`verifierConfirm`, which runs before the Verifier has seen any `confirmP`,
+returns `confirmV` and nothing else — not the transcript and not `K_main`,
+each of which is one public `deriveKeys`/`kdf` call away from `K_shared`.
+That is a gate against a caller's *mistake*, not against a hostile
+Verifier: a Verifier holds `w0`, `L`, `y` and both shares, so it can always
+recompute the key schedule if it sets out to. What the type guarantees is
+that it cannot do so by accident, from a field it was handed.
 
 ## Import graph
 
