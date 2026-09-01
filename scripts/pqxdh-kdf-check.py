@@ -24,6 +24,7 @@ wrong order, a missing prefix, the wrong salt length, or `info` fed to
 Usage:
     scripts/pqxdh-kdf-check.py            # print the pinned vectors as Zig
     scripts/pqxdh-kdf-check.py --check    # re-derive and diff against the pin
+                                          # (exit 1 on any mismatch)
 
 The output is pinned in `modules/signal/src/interop_vectors.zig`; the test in
 `pqxdh.zig` compares this module's `deriveSharedSecret` against it.
@@ -31,7 +32,9 @@ The output is pinned in `modules/signal/src/interop_vectors.zig`; the test in
 
 import hashlib
 import hmac
+import re
 import sys
+from pathlib import Path
 
 INFO = b"zig-libs/signal/pqxdh/v1_CURVE25519_SHA-256_ML-KEM-1024"
 F = b"\xff" * 32
@@ -63,7 +66,46 @@ CASES = [
 ]
 
 
+PIN = "modules/signal/src/interop_vectors.zig"
+
+
+def check() -> int:
+    """Re-derive every case and diff it against what is pinned in Zig.
+
+    This mode was documented long before it existed: `main` ignored `argv`
+    entirely, so `--check` printed the vectors and exited 0 whether or not the
+    pin still matched. A verification tool that cannot fail verifies nothing —
+    and this one is the only thing standing behind the PQXDH composition,
+    because the Zig tests compare against the pin, not against this file.
+    """
+    root = Path(__file__).resolve().parent.parent
+    text = (root / PIN).read_text()
+    failures = 0
+    for name, dh1, dh2, dh3, dh4, ss in CASES:
+        want = sk(dh1, dh2, dh3, dh4, ss).hex()
+        m = re.search(rf'pub const {re.escape(name)} = "([0-9a-f]+)";', text)
+        if m is None:
+            print(f"MISSING  {name}: not pinned in {PIN}")
+            failures += 1
+        elif m.group(1) != want:
+            print(f"MISMATCH {name}\n  pinned:  {m.group(1)}\n  derived: {want}")
+            failures += 1
+        else:
+            print(f"ok       {name}")
+    if failures:
+        print(f"\n{failures} of {len(CASES)} vectors disagree with {PIN}")
+        return 1
+    print(f"\nall {len(CASES)} vectors match {PIN}")
+    return 0
+
+
 def main() -> int:
+    args = sys.argv[1:]
+    if args == ["--check"]:
+        return check()
+    if args:
+        print(__doc__)
+        return 2
     for name, dh1, dh2, dh3, dh4, ss in CASES:
         print(f'pub const {name} = "{sk(dh1, dh2, dh3, dh4, ss).hex()}";')
     return 0

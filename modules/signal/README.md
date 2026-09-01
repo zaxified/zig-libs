@@ -21,7 +21,7 @@ end-to-end-encrypted session:
   (signal.org/docs/specifications/doubleratchet), seeded with X3DH's `SK`
   as its initial root key and `AD` as its per-message associated data.
 
-**Status: Part 1 + Part 2 COMPLETE.** X3DH's DH+HKDF agreement, both wire
+**Status: Parts 1-3 COMPLETE.** X3DH's DH+HKDF agreement, both wire
 codecs (`PreKeyBundle`, `InitialMessage`), and XEdDSA (`xeddsa.sign`/
 `xeddsa.verify`, including `xeddsa.edwardsFromMontgomery` — the
 Montgomery->Edwards sign-0 point recovery std does not provide) are real
@@ -44,10 +44,12 @@ the spec-pure `xeddsa.verify`. See [SPEC.md](SPEC.md).
 
 | File | Contents |
 |---|---|
-| `src/root.zig` | `meta`, flat re-exports of the X3DH + Double Ratchet surface, dark-tests aggregator |
+| `src/root.zig` | `meta`, flat re-exports of the X3DH + PQXDH + Double Ratchet surface, dark-tests aggregator |
 | `src/x3dh.zig` | Key types (`IdentityKey`/`SignedPreKey`/`OneTimePreKey`/`EphemeralKey`), `PreKeyBundle`/`InitialMessage` codecs, the four-DH + HKDF agreement (`initiateUnverified`/`respond`), fail-closed `initiate`, `generateSignedPreKey` |
 | `src/xeddsa.zig` | XEdDSA `sign`/`verify` (spec variant) + `libsignal.sign`/`verify` (deployed-libsignal variant) + `edwardsFromMontgomery` (the sign-0 Montgomery->Edwards recovery both variants share), sign-0-convention + libsignal-variant self-consistency tests |
 | `src/ratchet.zig` | Double Ratchet `State` (`initAlice`/`initBob`/`encrypt`/`decrypt`), `Header`/`Message` + header codec, `KDF_RK`/`KDF_CK`, DH + symmetric-key ratchets, `max_skip`-bounded skipped-key store, transactional decrypt; full-session / out-of-order / MAX_SKIP / tamper tests |
+| `src/pqxdh.zig` | PQXDH (Part 3): `KemPreKey`, `PreKeyBundle`/`InitialMessage`, the four-DH + ML-KEM-1024 + HKDF agreement (`initiateUnverified`/`respond`), fail-closed `initiate`, `generateKemPreKey`; **no wire codec** — a caller transmitting a PQXDH bundle writes their own |
+| `src/interop_vectors.zig` | The Double Ratchet's `KDF_CK`/`KDF_RK` vectors captured from libsignal, and PQXDH's KDF-chain vectors from `scripts/pqxdh-kdf-check.py` — see each block's doc comment for which is which and what class of anchor it is |
 | `src/kat_test.zig` | X3DH agreement + codec tests; XEdDSA round-trip/tamper/fail-closed tests; the libsignal known-answer vector as an external anchor exercised against BOTH variants (`xeddsa.libsignal.verify` byte-exact accept + 64-tamper rejection, `xeddsa.verify` reject); std-Ed25519 cross-check; `initiate`/`respond` end-to-end |
 
 ## Import
@@ -188,10 +190,13 @@ bridge. Passing the full value does not compile, which is the intent.
 **What anchors this.** Less than the rest of this module, and the
 difference is stated rather than smoothed over: Signal publishes no
 byte-exact PQXDH vectors (checked 2026-08-22 — neither the spec page nor
-libsignal). XEdDSA carries libsignal's own vector and ML-KEM-1024 is
-anchored by std's FIPS 203 vectors, but the composition is checked against
-an independent implementation of the same arithmetic
-(`scripts/pqxdh-kdf-check.py`). A round trip cannot catch a misplaced KEM
+libsignal). XEdDSA carries libsignal's own vector, and the
+composition is checked against an independent implementation of the same
+arithmetic (`scripts/pqxdh-kdf-check.py --check`). **ML-KEM-1024 itself is
+unanchored** — std's three `NIST KAT test` blocks all cover `d00.Kyber*`,
+the round-3 variant this module explicitly does not implement, while
+`nist.MLKem1024` gets only a self round trip. This paragraph used to claim
+those KATs as the KEM's anchor; they belong to the other algorithm. A round trip cannot catch a misplaced KEM
 secret — Alice and Bob would agree on the wrong answer together — so the
 wrong answer is pinned as a value the code must never produce.
 

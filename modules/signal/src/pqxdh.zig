@@ -29,15 +29,26 @@
 //! **2. There are no published PQXDH test vectors.** Neither the spec page nor
 //! libsignal publishes byte-exact known-answer data for the composed
 //! agreement — checked 2026-08-22. So the anchoring here is layered rather
-//! than end-to-end: `xeddsa` carries libsignal's own published vector,
-//! ML-KEM-1024 is anchored by `std`'s FIPS 203 vectors, and the composition
-//! itself is checked against an independent HKDF implementation
-//! (`../scripts/pqxdh_kdf_check.py`, whose output is pinned in
+//! than end-to-end: `xeddsa` carries libsignal's own published vector, and the
+//! composition itself is checked against an independent HKDF implementation
+//! (`scripts/pqxdh-kdf-check.py`, whose output is pinned in
 //! `interop_vectors.zig`). What is NOT claimed is byte-compatibility with
 //! Signal's servers: like `x3dh.zig`, this file uses its own `info` string,
 //! which the spec explicitly leaves application-specific.
+//!
+//! ⚠ **The KEM itself is the weakest link in that chain, and this file used to
+//! overstate it.** It claimed ML-KEM-1024 was "anchored by `std`'s FIPS 203
+//! vectors". It is not: `std.crypto.kem.ml_kem`'s three `NIST KAT test`
+//! blocks are all `d00.Kyber512/768/1024` — the round-3 namespace this file
+//! spends a paragraph explaining is *not* what it implements. `nist.MLKem1024`
+//! has only `"Test happy flow"`, a `generateDeterministic → encapsDeterministic
+//! → decaps` self round trip, which is the self-consistency class this module
+//! declines to call an anchor anywhere else. Closing it means bringing in NIST
+//! ACVP vectors for ML-KEM, the way `slhdsa` did; until then the KEM is
+//! unanchored and this comment says so.
 
 const std = @import("std");
+const entropy = @import("entropy");
 const x3dh = @import("x3dh.zig");
 const xeddsa = @import("xeddsa.zig");
 const X25519 = std.crypto.dh.X25519;
@@ -155,6 +166,14 @@ pub const InitialMessage = struct {
     /// Opaque, caller-supplied — this file carries it and never interprets
     /// it, exactly as `x3dh.InitialMessage.ciphertext` does.
     ciphertext: []const u8,
+
+    /// Frees `ciphertext`, which `initiate` allocated. The same shape as
+    /// `x3dh.InitialMessage.deinit`; `InitiateOutput`'s doc comment named this
+    /// method before it existed, so a caller following the documentation did
+    /// not compile.
+    pub fn deinit(m: InitialMessage, allocator: std.mem.Allocator) void {
+        allocator.free(m.ciphertext);
+    }
 };
 
 fn dh(secret_key: [key_length]u8, public_key: [key_length]u8) AgreementError![key_length]u8 {
@@ -175,7 +194,11 @@ fn deriveSharedSecret(
     dh4: ?[key_length]u8,
     ss: [kem_shared_length]u8,
 ) [shared_secret_length]u8 {
+    // The buffer holds `F || DH1..DH4 || SS` — every secret of the handshake,
+    // including the one whose leak deletes the post-quantum property. It costs
+    // one instruction to not leave it on the stack.
     var km_buf: [f_constant.len + key_length * 4 + kem_shared_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &km_buf);
     var len: usize = 0;
     km_buf[len..][0..f_constant.len].* = f_constant;
     len += f_constant.len;
@@ -254,7 +277,13 @@ pub fn initiateUnverified(
 
     const kem_pk = Kem.PublicKey.fromBytes(&bob_bundle.kem_prekey) catch
         return error.InvalidKemPreKey;
-    const enc = kem_pk.encaps(io);
+    // `encaps(io)` would draw the encapsulation message from `io.random`. That
+    // message IS the post-quantum secret — `SS` is its hash — so it goes
+    // through the fail-closed source, same as every other secret here.
+    var enc_seed: [Kem.encaps_seed_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &enc_seed);
+    entropy.fill(io, &enc_seed);
+    const enc = kem_pk.encapsDeterministic(&enc_seed);
 
     const shared_secret = deriveSharedSecret(dh1, dh2, dh3, dh4, enc.shared_secret);
     const ad = associatedData(alice_ik.public_key, bob_bundle.identity_key, bob_bundle.kem_prekey);
@@ -291,11 +320,18 @@ pub fn initiate(
 }
 
 pub const RespondError = AgreementError || error{
-    /// `alice_initial.kem_ciphertext` did not decapsulate under `bob_kem`.
-    /// ML-KEM's implicit rejection means this is NOT a decryption failure in
-    /// the usual sense — a well-formed ciphertext always yields *some* shared
-    /// secret — so this fires only on a malformed ciphertext, and a
-    /// substituted one shows up as a mismatched `SK` instead.
+    /// **Currently unreachable, and a caller must not read it as validation.**
+    /// FIPS 203's implicit rejection means decapsulation has no failure mode:
+    /// `std`'s `decaps` returns unconditionally on both its branches, `cmov`ing
+    /// to `J(z‖c)` when the re-encryption disagrees, so its inferred error set
+    /// is empty and the `catch` below is dead. Every 1568-byte string
+    /// decapsulates to *some* secret.
+    ///
+    /// The arm is kept rather than deleted so a future `std` that does gain an
+    /// error has somewhere to land. What detects a substituted ciphertext is
+    /// not this error but the mismatched `SK`, which surfaces as an AEAD
+    /// failure in whatever the caller encrypts under it — `respond` succeeding
+    /// says nothing about the ciphertext being genuine.
     KemDecapsulationFailed,
 };
 
@@ -333,6 +369,35 @@ pub fn respond(
     return .{ .shared_secret = shared_secret, .associated_data = ad };
 }
 
+/// A fresh ML-KEM keypair drawn from this module's fail-closed entropy source.
+///
+/// Body-identical to `Kem.KeyPair.generate`, with the one substitution
+/// `x3dh.generateKeyPair` already makes for X25519: the seed comes from
+/// `entropy.fill` (→ `io.randomSecure`, which panics rather than degrade)
+/// instead of `io.random`, whose contract permits a silent degrade
+/// (CONVENTIONS.md §2.2). The stakes are higher here than for a curve key,
+/// not lower: this seed becomes a LONG-LIVED, signed prekey — a last-resort
+/// one is reused until Bob rotates it — and it carries the entire
+/// post-quantum property. A weak draw leaves every Diffie-Hellman strong and
+/// silently reduces `SK` to classical X3DH material, which is precisely the
+/// failure this file exists to prevent, with nothing to report it.
+///
+/// The retry loop is std's, kept for std's reason: `generateDeterministic`
+/// rejects some seeds and the answer is another draw, not a failure.
+fn generateKemKeyPair(io: std.Io) Kem.KeyPair {
+    var seed: [Kem.seed_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    while (true) {
+        return Kem.KeyPair.generateDeterministic(blk: {
+            entropy.fill(io, &seed);
+            break :blk seed;
+        }) catch {
+            @branchHint(.unlikely);
+            continue;
+        };
+    }
+}
+
 /// Generate a fresh KEM prekey and sign its public half under Bob's identity
 /// key. `z` is XEdDSA's signing randomness, passed in for the same reason
 /// `x3dh.generateSignedPreKey` takes it: it makes published vectors
@@ -345,7 +410,7 @@ pub fn generateKemPreKey(
     z: xeddsa.RandomData,
     io: std.Io,
 ) KemPreKey {
-    const kp = Kem.KeyPair.generate(io);
+    const kp = generateKemKeyPair(io);
     const pk_bytes = kp.public_key.toBytes();
     return .{
         .key_pair = kp,
@@ -537,4 +602,75 @@ test "a substituted KEM prekey yields a DIFFERENT SK, which is how the swap is c
 
     const wrong = try respond(bob_ik, spk, null, other_kem, out.message);
     try testing.expect(!std.mem.eql(u8, &out.agreement.shared_secret, &wrong.shared_secret));
+}
+
+// ── the entropy seam (audit 2026-09-01) ──────────────────────────────────────
+//
+// `CONVENTIONS.md` §2.2: anything that becomes a key or ephemeral key material
+// is drawn with `entropy.fill`/`io.randomSecure`, never `io.random`, whose
+// contract permits a silent degrade. `x3dh.generateKeyPair` was moved to the
+// fail-closed source on 2026-08-13 for exactly this reason; the two ML-KEM
+// draws added with PQXDH reached `io.random` through std's convenience
+// wrappers (`Kem.KeyPair.generate` / `PublicKey.encaps`) and inherited nothing
+// of that decision. A weak draw there leaves every Diffie-Hellman strong and
+// silently reduces `SK` to classical X3DH material — the exact failure this
+// file exists to prevent, with nothing to report it.
+
+/// An `Io` whose `random` has degraded to a constant, with `randomSecure` left
+/// intact. Same shape as `sealedbox`'s KAT harness: copy the vtable, replace
+/// one slot.
+fn degradedRandom(_: ?*anyopaque, buffer: []u8) void {
+    @memset(buffer, 0);
+}
+
+fn degradedIo(io: std.Io, vt: *std.Io.VTable) std.Io {
+    vt.* = io.vtable.*;
+    vt.random = degradedRandom;
+    return .{ .userdata = io.userdata, .vtable = vt };
+}
+
+test "a degraded io.random cannot reach any PQXDH secret" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    var vt: std.Io.VTable = undefined;
+    const io = degradedIo(threaded.io(), &vt);
+
+    // CONTROL. Under the same degraded `io`, the module's existing curve-key
+    // source still produces distinct keys — so a collision below is a
+    // statement about this file, not about a broken harness.
+    const c1 = x3dh.generateKeyPair(io);
+    const c2 = x3dh.generateKeyPair(io);
+    try testing.expect(!std.mem.eql(u8, &c1.public_key, &c2.public_key));
+
+    const bob_ik = x3dh.generateKeyPair(io);
+    const alice_ik = x3dh.generateKeyPair(io);
+    const z: xeddsa.RandomData = @splat(0x77);
+    const spk = x3dh.generateSignedPreKey(bob_ik, 7, z, io);
+
+    // 1. Bob's ML-KEM prekey is long-lived and, when `last_resort`, reused
+    //    until he rotates it. Two draws must not collide.
+    const k1 = generateKemPreKey(bob_ik, 1, true, z, io);
+    const k2 = generateKemPreKey(bob_ik, 2, true, z, io);
+    try testing.expect(!std.mem.eql(u8, &k1.key_pair.public_key.toBytes(), &k2.key_pair.public_key.toBytes()));
+
+    // 2. The encapsulation message determines `SS`. Two handshakes against the
+    //    same bundle must not produce the same ciphertext — if they do, `SS`
+    //    is derivable from Bob's PUBLIC prekey alone.
+    const bundle: PreKeyBundle = .{
+        .identity_key = bob_ik.public_key,
+        .signed_prekey = spk.key_pair.public_key,
+        .signed_prekey_id = spk.id,
+        .signed_prekey_signature = spk.signature,
+        .one_time_prekey = null,
+        .one_time_prekey_id = 0,
+        .kem_prekey = k1.key_pair.public_key.toBytes(),
+        .kem_prekey_id = k1.id,
+        .kem_prekey_signature = k1.signature,
+    };
+    const a = try initiate(testing.allocator, alice_ik, bundle, "hi", io);
+    defer testing.allocator.free(a.message.ciphertext);
+    const b = try initiate(testing.allocator, alice_ik, bundle, "hi", io);
+    defer testing.allocator.free(b.message.ciphertext);
+    try testing.expect(!std.mem.eql(u8, &a.message.kem_ciphertext, &b.message.kem_ciphertext));
+    try testing.expect(!std.mem.eql(u8, &a.agreement.shared_secret, &b.agreement.shared_secret));
 }

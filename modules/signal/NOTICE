@@ -152,6 +152,20 @@ out-of-order handling, and a transactional fail-closed `decrypt`) are
 implemented and tested — all green in Debug and ReleaseFast. Together
 they form a usable Signal-style end-to-end-encrypted session, either
 self-consistent (spec variant) or wire-compatible with real Signal
-(`libsignal` variant). Header encryption (Double Ratchet spec §4), PQXDH
-seeding, and a stability-committed session-persistence format remain out
-of scope — see `README.md`/`SPEC.md`.
+(`libsignal` variant). PQXDH (`src/pqxdh.zig`) implements the
+post-quantum-augmented handshake Signal has defaulted to since 2023, over
+ML-KEM-1024 rather than the round-3 Kyber the spec text names. Header
+encryption (Double Ratchet spec §4), a PQXDH wire codec, and a
+stability-committed session-persistence format remain out of scope — see
+`README.md`/`SPEC.md`.
+
+PQXDH's key-derivation vectors (`src/interop_vectors.zig`, `pqxdh_kdf`) are
+a different and WEAKER provenance class than everything else in this file,
+and are listed here so a distributor is not misled by their neighbours.
+They are not libsignal's and not the protocol authors': Signal publishes no
+byte-exact PQXDH vectors (checked 2026-08-22). They are the output of
+`scripts/pqxdh-kdf-check.py`, written in this repository from Python's
+`hmac`/`hashlib` alone — a second implementation of the same arithmetic, no
+third-party code, no licence obligation of any kind. It catches a term in
+the wrong order, a missing prefix, the wrong salt length; it cannot catch a
+misreading of the spec shared by both implementations.

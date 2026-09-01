@@ -88,7 +88,11 @@ pub fn main() !void {
 
     // ── Bob, back online: reconstruct the same secret and read it ─────────
     const bob_agreement = try signal.pqRespond(bob_ik, bob_spk, .{ .key_pair = bob_opk_kp, .id = 7 }, bob_kem, opened.message);
-    if (!std.mem.eql(u8, &bob_agreement.shared_secret, &opened.agreement.shared_secret))
+    // `timing_safe.eql`, not `std.mem.eql` — both operands are local here, so
+    // there is no oracle to leak to, but this file is the reference wiring a
+    // consumer copies, and comparing secret material in variable time is not
+    // what it should be teaching.
+    if (!std.crypto.timing_safe.eql([32]u8, bob_agreement.shared_secret, opened.agreement.shared_secret))
         @panic("PQXDH disagreed across the two sides");
 
     var bob_state = signal.initBob(

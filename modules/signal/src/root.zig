@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! signal — the Signal Protocol's core cryptographic building blocks,
-//! built entirely on `std.crypto`. A two-part arc, now BOTH complete —
+//! built entirely on `std.crypto`. A three-part arc, all complete —
 //! together a usable Signal-style end-to-end-encrypted session:
 //!
 //!   - **Part 1: X3DH** (`x3dh.zig`) — Extended Triple Diffie-Hellman, the
@@ -60,7 +60,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Signal Protocol — X3DH key agreement, XEdDSA signing, and the Double Ratchet: E2EE sessions with forward secrecy and post-compromise security.",
+    .doc = "Signal Protocol — X3DH and PQXDH key agreement, XEdDSA signing, and the Double Ratchet: E2EE sessions with forward secrecy, post-compromise security and a post-quantum initial handshake.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -98,8 +98,14 @@ pub const generateSignedPreKey = x3dh.generateSignedPreKey;
 
 // Flat re-exports of the PQXDH surface (Part 3). Deliberately prefixed rather
 // than shadowing the X3DH names: the two protocols have DIFFERENT bundles,
-// messages and associated data, and a caller who mixed them would get a
-// bundle that silently fails to decode rather than a compile error.
+// messages and associated data, so keeping both sets visible makes every
+// cross-feed a compile error on distinct types.
+//
+// Note what is NOT here: PQXDH ships no wire codec. X3DH's `PreKeyBundle` and
+// `InitialMessage` have `toBytes`/`fromBytes`; their PQXDH counterparts do
+// not, so a caller who needs to transmit a PQXDH bundle writes the encoding
+// themselves — including the `has_opk` discipline x3dh's codec already gets
+// right, for a message carrying two 1568-byte fields.
 pub const PqPreKeyBundle = pqxdh.PreKeyBundle;
 pub const PqInitialMessage = pqxdh.InitialMessage;
 pub const PqAgreement = pqxdh.Agreement;

@@ -335,6 +335,7 @@ fn dh(secret_key: [key_length]u8, public_key: [key_length]u8) AgreementError![ke
 /// (one HKDF call site, not two independently-written ones).
 fn deriveSharedSecret(dh1: [key_length]u8, dh2: [key_length]u8, dh3: [key_length]u8, dh4: ?[key_length]u8) [shared_secret_length]u8 {
     var km_buf: [f_constant.len + key_length * 4]u8 = undefined;
+    defer std.crypto.secureZero(u8, &km_buf); // holds every DH output
     var len: usize = 0;
     km_buf[len..][0..f_constant.len].* = f_constant;
     len += f_constant.len;
