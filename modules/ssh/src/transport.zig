@@ -52,7 +52,41 @@ pub const TransportError = std.Io.Reader.Error || std.Io.Writer.Error ||
     MacVerificationFailed,
     PacketTooLarge,
     StringTooLarge,
+    /// This direction has sent or received `max_packets_per_direction`
+    /// packets. Rekeying (RFC 4253 §9) is not implemented, so the connection
+    /// cannot be continued safely and is refused rather than wrapped. See
+    /// `max_packets_per_direction`.
+    SequenceNumberExhausted,
 };
+
+/// Hard ceiling on packets per direction, per connection.
+///
+/// `chacha20-poly1305@openssh.com` — this module's FIRST-preference cipher —
+/// derives its ChaCha20 nonce from nothing but the 32-bit SSH sequence
+/// number (`seqNonce`), and RFC 4253 §6.4 says that number wraps. At wrap the
+/// nonce repeats under the same `key_main`, so the Poly1305 one-time key
+/// repeats: two packets authenticated under one one-time key give up that
+/// key, and the ChaCha20 keystream at counter 1 repeats as well. That is
+/// key recovery and forgery, not merely replay.
+///
+/// The real fix is rekeying, which this module does not implement — SPEC
+/// says so and calls a very long-lived or high-volume connection "out of
+/// policy". A documented policy with no runtime guard is a fail-open guard,
+/// which is what this constant closes: the connection is refused at the
+/// ceiling instead of quietly crossing into nonce reuse.
+///
+/// 2^31 is OpenSSH's own rekey threshold for this cipher, i.e. half the
+/// distance to the wrap — the same margin, applied as a stop rather than a
+/// renegotiation. It also covers the two AES modes, whose nonces are safe at
+/// this scale (GCM has a 64-bit invocation counter, CTR a continuous 128-bit
+/// block counter) but whose sequence numbers still feed the HMAC.
+pub const max_packets_per_direction: u32 = 1 << 31;
+
+/// Advance one direction's sequence number, refusing to wrap.
+fn bumpSequence(seq: *u32) TransportError!void {
+    if (seq.* >= max_packets_per_direction) return error.SequenceNumberExhausted;
+    seq.* += 1;
+}
 
 /// Our identification `softwareversion` (RFC 4253 §4.2).
 pub const software_version = "zig_ssh_0.1";
@@ -231,6 +265,13 @@ pub const ServerSigAlgs = struct {
 /// EXT_INFO (§2.5 requires ignoring extensions we do not recognize, and there
 /// is no minimum count), not an error.
 pub fn parseExtInfo(payload: []const u8) TransportError!?ServerSigAlgs {
+    // `pub`, so an outside caller may hand this a raw buffer. In-module
+    // callers reach it only through a `msgType(pkt)` switch, and `msgType`
+    // returns 0 for an empty payload, so the arm is unreachable with
+    // `payload.len == 0` — but `payload[1..]` on an empty slice is a panic in
+    // safe modes and, in ReleaseFast, a length computed as `0 - 1`: an
+    // enormous slice handed to a Cursor that then trusts `b.len`.
+    if (payload.len == 0) return error.ProtocolError;
     var c = messages.Cursor{ .b = payload[1..] };
     const count = try c.uint32();
     // No separate bound on `count` is needed: every iteration reads two
@@ -431,13 +472,22 @@ pub fn exchangeVersions(
     var attempts: usize = 0;
     while (attempts < 64) : (attempts += 1) {
         var len: usize = 0;
+        // RFC 4253 §4.2 caps this line at 255 characters including CR LF.
+        // The over-long bytes used to be discarded but still CONSUMED, one
+        // `takeByte` at a time, with no budget — so an unauthenticated peer
+        // that opens a socket and streams anything other than `\n` holds the
+        // connection (and its task) open indefinitely, before KEXINIT, before
+        // any cipher, before any credential. Truncating without stopping is
+        // fail-open: the truncated string still goes into the exchange hash
+        // as V_C/V_S, so the handshake would fail anyway — the read just
+        // never got there. A per-read deadline does not cover it either, since
+        // one byte per period defeats that; only refusing the line does.
         while (true) {
             const b = try r.takeByte();
             if (b == '\n') break;
-            if (len < line.len) {
-                line[len] = b;
-                len += 1;
-            }
+            if (len == line.len) return error.VersionExchangeFailed;
+            line[len] = b;
+            len += 1;
         }
         var l: []const u8 = line[0..len];
         if (l.len > 0 and l[l.len - 1] == '\r') l = l[0 .. l.len - 1];
@@ -551,7 +601,7 @@ pub fn readPacket(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
             if (pkt_len > buf.len) return error.PacketTooLarge;
             try r.readSliceAll(buf[0..pkt_len]);
             const padlen = buf[0];
-            if (@as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
+            if (padlen < 4 or @as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
             const payload_len = pkt_len - 1 - padlen;
             return .{
                 .packet_length = pkt_len,
@@ -581,10 +631,10 @@ pub fn readPacket(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
             if (!std.crypto.timing_safe.eql([16]u8, expect, tag)) return error.MacVerificationFailed;
             ChaCha.xor(buf[4 .. 4 + pkt_len], buf[4 .. 4 + pkt_len], 1, st.key_main, nonce);
             const padlen = buf[4];
-            if (@as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
+            if (padlen < 4 or @as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
             const payload_len = pkt_len - 1 - padlen;
             @memcpy(buf[4 + pkt_len .. 4 + pkt_len + 16], &tag);
-            st.sequence_number +%= 1;
+            try bumpSequence(&st.sequence_number);
             return .{
                 .packet_length = pkt_len,
                 .padding_length = padlen,
@@ -618,9 +668,9 @@ pub fn readPacket(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
             hm.final(&mac);
             if (!std.crypto.timing_safe.eql([32]u8, mac, mac_recv)) return error.MacVerificationFailed;
             st.enc_iv = counter;
-            st.sequence_number +%= 1;
+            try bumpSequence(&st.sequence_number);
             const padlen = buf[4];
-            if (@as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
+            if (padlen < 4 or @as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
             const payload_len = pkt_len - 1 - padlen;
             @memcpy(buf[total_pt .. total_pt + 32], &mac_recv);
             return .{
@@ -661,9 +711,9 @@ pub fn readPacket(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
                     return error.MacVerificationFailed,
             }
             st.invocation_counter +%= 1;
-            st.sequence_number +%= 1;
+            try bumpSequence(&st.sequence_number);
             const padlen = buf[4];
-            if (@as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
+            if (padlen < 4 or @as(usize, padlen) + 1 > pkt_len) return error.ProtocolError;
             const payload_len = pkt_len - 1 - padlen;
             @memcpy(buf[4 + pkt_len .. 4 + pkt_len + 16], &tag);
             return .{
@@ -719,7 +769,7 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
             @memcpy(buf[4 + pkt_len .. 4 + pkt_len + 16], &tag);
             try w.writeAll(buf[0..total]);
             try w.flush();
-            st.sequence_number +%= 1;
+            try bumpSequence(&st.sequence_number);
         },
         .aes256_ctr_hmac_sha256 => |*st| {
             const block: usize = 16;
@@ -744,7 +794,7 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
             @memcpy(buf[total_pt .. total_pt + 32], &mac);
             try w.writeAll(buf[0 .. total_pt + 32]);
             try w.flush();
-            st.sequence_number +%= 1;
+            try bumpSequence(&st.sequence_number);
         },
         .aes_gcm => |*st| {
             // RFC 5647 + OpenSSH AES-GCM framing (see the `readPacket` branch).
@@ -773,7 +823,7 @@ pub fn writePacket(w: *std.Io.Writer, cipher: *CipherState, payload: []const u8)
             try w.writeAll(buf[0..total]);
             try w.flush();
             st.invocation_counter +%= 1;
-            st.sequence_number +%= 1;
+            try bumpSequence(&st.sequence_number);
         },
     }
 }
@@ -3368,4 +3418,100 @@ test "live interop against OpenSSH sshd — aes256-gcm@openssh.com" {
 
 test "live interop against OpenSSH sshd — aes128-gcm@openssh.com" {
     try liveInterop("curve25519-sha256", "aes128-gcm@openssh.com");
+}
+
+test "the packet ceiling stops chacha20-poly1305 before its nonce can repeat" {
+    // `seqNonce` builds the ChaCha20 nonce from the 32-bit sequence number
+    // and nothing else, and RFC 4253 §6.4 says that number wraps. Rekeying is
+    // not implemented, so a wrap reuses the nonce under the same `key_main`:
+    // the Poly1305 one-time key repeats, which surrenders that key and the
+    // keystream. The connection must refuse to get there.
+    const t = std.testing;
+
+    // The ceiling is enforced when the counter is ADVANCED, i.e. after the
+    // packet at the ceiling has been processed. That is the right place: the
+    // nonce for `max_packets_per_direction` is still unique -- reuse only
+    // begins at the wrap to 0, which this refusal makes unreachable.
+    var seq: u32 = max_packets_per_direction - 1;
+    try bumpSequence(&seq);
+    try t.expectEqual(max_packets_per_direction, seq);
+    try t.expectError(error.SequenceNumberExhausted, bumpSequence(&seq));
+    try t.expectEqual(max_packets_per_direction, seq); // refused, not wrapped
+
+    // …and the ceiling really is below the wrap, which is the whole point.
+    try t.expect(max_packets_per_direction < std.math.maxInt(u32));
+
+    // The real write path reaches it: one packet at the ceiling goes out, the
+    // next is refused rather than reusing a nonce.
+    var out: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    var wc: CipherState = .{ .chacha20_poly1305 = .{
+        .key_main = @splat(7),
+        .key_header = @splat(9),
+        .sequence_number = max_packets_per_direction - 1,
+    } };
+    try writePacket(&w, &wc, "still fine");
+    try t.expectEqual(max_packets_per_direction, wc.chacha20_poly1305.sequence_number);
+    try t.expectError(error.SequenceNumberExhausted, writePacket(&w, &wc, "one too many"));
+    try t.expectEqual(max_packets_per_direction, wc.chacha20_poly1305.sequence_number);
+}
+
+test "exchangeVersions refuses an over-long identification line instead of reading forever" {
+    // RFC 4253 §4.2 caps the line at 255 characters. The over-long bytes were
+    // discarded but still consumed with no budget, so an unauthenticated peer
+    // could hold the connection open pre-KEXINIT by streaming anything that
+    // is not a newline.
+    const t = std.testing;
+    var flood: [4096]u8 = undefined;
+    @memset(&flood, 'A'); // no '\n' anywhere
+    var r: std.Io.Reader = .fixed(&flood);
+    var out: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try t.expectError(
+        error.VersionExchangeFailed,
+        exchangeVersions(t.allocator, &r, &w, .{ .softwareversion = software_version }),
+    );
+}
+
+test "parseExtInfo rejects an empty payload rather than slicing past it" {
+    // It is `pub`: an outside caller can hand it a raw buffer, and
+    // `payload[1..]` on an empty slice is a wild slice in ReleaseFast.
+    try std.testing.expectError(error.ProtocolError, parseExtInfo(&[_]u8{}));
+}
+
+test "readPacket enforces RFC 4253 §6's four-byte padding minimum" {
+    // "There MUST be at least four bytes of padding." Only the two AES
+    // branches carried any shape check (block multiple / minimum length);
+    // `.none` and chacha20-poly1305 accepted any padding that merely fitted,
+    // so a peer could frame degenerate 5-byte packets during the plaintext
+    // KEX phase. Harmless for memory safety -- an empty payload yields
+    // message type 0, which matches no arm -- but an unenforced MUST.
+    const t = std.testing;
+    var rbuf: [512]u8 = undefined;
+
+    { // packet_length = 1, padding_length = 0: no payload, no padding
+        const wire = [_]u8{ 0, 0, 0, 1, 0 };
+        var r: std.Io.Reader = .fixed(&wire);
+        var rc: CipherState = .none;
+        try t.expectError(error.ProtocolError, readPacket(&r, &rc, &rbuf));
+    }
+    { // three bytes of padding is still one short of the MUST
+        var wire = [_]u8{0} ** 12;
+        std.mem.writeInt(u32, wire[0..4], 8, .big);
+        wire[4] = 3; // padding_length
+        var r: std.Io.Reader = .fixed(&wire);
+        var rc: CipherState = .none;
+        try t.expectError(error.ProtocolError, readPacket(&r, &rc, &rbuf));
+    }
+    { // what this module itself writes still round-trips
+        var out: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        var wc: CipherState = .none;
+        try writePacket(&w, &wc, "payload");
+        var r: std.Io.Reader = .fixed(w.buffered());
+        var rc: CipherState = .none;
+        const pkt = try readPacket(&r, &rc, &rbuf);
+        try t.expectEqualStrings("payload", pkt.payload);
+        try t.expect(pkt.padding_length >= 4);
+    }
 }

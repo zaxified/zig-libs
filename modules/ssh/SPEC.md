@@ -21,7 +21,14 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   userauth, channels — decodes with the same bounds-checked cursor: `string`/`byte`/`boolean`/
   `uint32`, each checked against the buffer it was built from. An attacker-controlled `uint32`
   length can therefore only ever produce `error.ProtocolError`; it can never index out of bounds,
-  panic, or size an allocation. (`transport.zig`'s `SliceReader` and `server.zig`'s `WireCursor`
+  panic, or size an allocation — **above the KEX layer**. `KexInit.decode` is the
+  exception and the one an auditor meets first: it predates the cursor and reads its ten
+  name-lists through `readListOwned` → `messages.readString`, where a peer's `uint32` DOES
+  size a `gpa.alloc` and the error is `StringTooLarge`/`EndOfStream`. That allocation is
+  capped at `max_wire_string_len` (1 MiB), only one is live at a time, and an over-announced
+  length fails `readSliceAll` and is freed by the `errdefer` — so it is bounded, not
+  unbounded. Stated because an invariant an auditor is invited to rely on should not have a
+  silent exception in the first message of every connection. (`transport.zig`'s `SliceReader` and `server.zig`'s `WireCursor`
   are now aliases of it, not copies.)
 - **Wire-format codec (`messages.zig`):** `writeString`/`readString` (RFC 4251 §5 length-prefixed
   byte string), `writeMpint`/`readMpint` (§5 mpint, including the high-bit-set-implies-leading-
