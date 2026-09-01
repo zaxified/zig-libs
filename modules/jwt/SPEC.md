@@ -36,6 +36,23 @@ This is the security core; the defenses are the point:
 - **Algorithm confusion (RFC 8725):** `alg` is never trusted from the token to pick a key *class* —
   `none` is rejected; an HMAC `alg` can never verify against an asymmetric key (no RS/ES→HS
   downgrade); the expected algorithm/key type is fixed by the verifier, not the attacker.
+  The same binding covers the post-quantum family: `.ml_dsa_44`/`.ml_dsa_65`/`.ml_dsa_87` are
+  three distinct `Key` variants over three distinct Zig types, so crossing the parameter sets is
+  a compile error inside `verify` rather than a runtime path, and an ML-DSA `alg` offered a
+  classical key (or the reverse) is `AlgKeyMismatch`.
+- **ML-DSA / RFC 9964 (`kty:"AKP"`):** the parameter set is read from the JWK's REQUIRED `alg`
+  and **never inferred from the length of `pub`**, even though the three lengths are distinct —
+  inferring it would accept a key whose `alg` names one set and whose bytes are another. `pub` is
+  length-checked against the named set before it is decoded. Verification is pure ML-DSA with an
+  EMPTY FIPS-204 context and a raw (unframed) signature, as RFC 9964 §2 requires; HashML-DSA has
+  no `Alg` name here, so it is `UnsupportedAlg` rather than silently treated as pure.
+- **A published private key is refused (RFC 7517 §4, RFC 9964 §3 — both MUST NOT):** a JWKS
+  fetched over the network whose key carries `d` (RSA/EC/OKP) or `priv` (AKP) is skipped with
+  reason `priv_from_network`, alongside the existing `oct_from_network`. The module never reads
+  the private half — but a published one means the issuer's signing key is readable by anyone
+  who can GET the document, so every token it "verifies" is forgeable, and continuing to trust it
+  would authenticate forgeries as genuine. A locally-configured set may still carry private
+  material; that is a legitimate place to hold it.
 - **Critical header parameters (RFC 7515 §4.1.11 / RFC 8725 §3.3):** a token whose header carries
   `crit` is **rejected in `parse`**, so every entry point (offline verify, JWKS, `Provider`,
   `ResourceServer`, `Guard`, the RP's `acceptIdToken*`) inherits the rejection and no path can
@@ -163,3 +180,11 @@ canonical source is `pub const meta` in src/root.zig.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** RFC 7515 A.1-A.3/8037 A.4 full JWS compact-token vectors + PKCE 7636 App B
++ **RFC 9964 Appendix A.1** — all three published (AKP JWK, ML-DSA JWS) pairs, verbatim, in
+`src/rfc9964_vectors.zig`. That last one is the module's strongest external anchor and was
+missing from this list until 2026-09-01: the vectors landed in `e5d6d947` and this section had
+been written in `4f75fc51` a week earlier. It matters more than a line-count omission, because
+the RFC's private seed is 32 zero bytes and the module can regenerate all three public keys
+itself — so internal evidence alone cannot tell a genuine RFC vector from a self-generated one.
+The audit that added this line fetched the RFC and compared character by character (and
+recomputed each `kid` as the RFC 7638 thumbprint over `{alg, kty, pub}`); all three match.

@@ -118,7 +118,8 @@ that. Never authorize from a `ParsedToken` alone.
   usable key — the module never guesses among keys.
 
 Delivery plan (**all seven done**): P1 parse + claims · P2 signature verify
-(HS/ES/EdDSA) · P3 RSA (RS256/384/512) · P4 JWKS key sets · P5 OIDC
+(HS/ES/EdDSA, and ML-DSA-44/65/87 per RFC 9964) · P3 RSA (RS256/384/512) ·
+P4 JWKS key sets (incl. `kty:"AKP"`) · P5 OIDC
 discovery + JWKS fetch + caching `Provider` · P6 `ResourceServer` `router`
 middleware + framework-agnostic `Guard` · P7 OAuth2/OIDC relying-party flow
 (PKCE, state/nonce, authorization-request + token-exchange builders,
@@ -135,11 +136,11 @@ ID-token acceptance).
 | `Audience` | `none` \| `single` \| `many` — the parsed `aud` (string OR array), with `contains()` |
 | `AudiencePolicy` / `IssuerPolicy` | mandatory-choice unions for `Options`: `.{ .required = "…" }` (must match) \| `.any` (conscious opt-out). No default — see "Mandatory audience/issuer" |
 | `validateClaims(claims, Options) ValidateError!void` | RFC 7519 §4.1 checks; pure, allocation-free |
-| `Alg` | RFC 7518 names (`HS256`…`EdDSA`, `none`, `unknown`) — the verify dispatch |
-| `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ed25519` (std public keys) \| `.rsa` (`RsaPublicKey`); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents) |
+| `Alg` | RFC 7518 names (`HS256`…`EdDSA`) plus RFC 9964's `ML-DSA-44`/`ML-DSA-65`/`ML-DSA-87`, `none`, `unknown` — the verify dispatch |
+| `Key` | tagged union: `.hmac` (secret bytes) \| `.ecdsa_p256` \| `.ecdsa_p384` \| `.ed25519` (std public keys) \| `.rsa` (`RsaPublicKey`) \| `.ml_dsa_44` / `.ml_dsa_65` / `.ml_dsa_87` (FIPS-204 public keys); constructors `ecdsaP256FromCoords(x, y)` / `ecdsaP384FromCoords(x, y)` / `ed25519FromBytes(x)` / `rsaFromModExp(n, e)` / `mlDsa44FromBytes(pub)` / `mlDsa65FromBytes(pub)` / `mlDsa87FromBytes(pub)` take exactly a JWK's decoded parameters (`KeyError.InvalidKey` on bad points/moduli/exponents/encodings). The tag binds the key TYPE to the token's `alg`, which is what closes algorithm confusion — including across the three ML-DSA parameter sets, where the tags are distinct types |
 | `verify(&parsed, key) VerifyError!void` | recompute/check the signature over `signing_input`; RFC 8725 defenses baked in |
 | `parseAndVerify(gpa, token, key, Options) !ParsedToken` | the one-call API: parse → verify → validateClaims; frees on any failure |
-| `parseJwks(gpa, json) JwksError!JwkSet` | parse an RFC 7517 `{"keys":[…]}` document; per-JWK problems skip that key (recorded in `skipped`), only a non-JWKS document errors |
+| `parseJwks(gpa, json) JwksError!JwkSet` | parse an RFC 7517 `{"keys":[…]}` document — `kty` `RSA`/`EC`/`OKP`/`oct` and RFC 9964's `AKP` (ML-DSA, whose REQUIRED `alg` carries the parameter set and is never inferred from the key length); per-JWK problems skip that key (recorded in `skipped`), only a non-JWKS document errors |
 | `JwkSet` | `keys: []const Jwk` (converted, usable) + `skipped: []const SkippedJwk` (index + `JwkSkipReason`) + `deinit()`; one arena owns everything |
 | `Jwk` | `key: Key` + selection metadata: `kid`, `use` (`sig`/`enc`/`other`), `alg` (pinned `Alg`) |
 | `JwkSet.keyForKid(kid) ?ResolvedKey` | first sig-usable key with that `kid` (no alg context) |

@@ -13,6 +13,13 @@
 //! writing `.any`, the module's explicit, greppable opt-out — exactly the
 //! conscious choice the module forces on every caller.
 //!
+//! The second half does the same for a **post-quantum** token (ML-DSA-65,
+//! RFC 9964) delivered through a JWKS with a `kty:"AKP"` key — the surface
+//! this module gained most recently, and the one a caller is most likely to
+//! wire up wrong. It is here because nothing else crosses the published
+//! boundary for that path: the module's own ML-DSA tests all live inside the
+//! test root.
+//!
 //! Built against the PUBLISHED module (`@import("jwt")`) only — no
 //! `test_deps`, no access to the module's own test vectors or helpers.
 
@@ -92,4 +99,71 @@ pub fn main() !void {
         },
         else => return err,
     };
+
+    try postQuantum(gpa);
+}
+
+/// The RFC 9964 path, end to end over the published surface: mint an ML-DSA-65
+/// token, publish the public half as a `kty:"AKP"` JWK, and verify by `kid`.
+///
+/// A deterministic seed keeps the example reproducible; a real issuer draws
+/// its key from a CSPRNG and never lets the private half near the JWKS —
+/// which `parseJwksSource(.network)` now enforces, refusing any published key
+/// that carries `d` or `priv`.
+fn postQuantum(gpa: std.mem.Allocator) !void {
+    const kp = try jwt.MlDsa65.KeyPair.generateDeterministic([_]u8{0x5a} ** 32);
+
+    // The issuer's side: sign `header.payload` with the raw FIPS-204
+    // signature, no framing and an empty context — what RFC 9964 §2 fixes.
+    const signing_input =
+        "eyJhbGciOiJNTC1EU0EtNjUiLCJraWQiOiJwcTEifQ" ++
+        "." ++
+        "eyJpc3MiOiJodHRwczovL29wLmV4YW1wbGUiLCJhdWQiOiJhcGk6Ly9zdmMiLCJleHAiOjIwMDAwMDAwMDB9";
+    const sig = try kp.sign(signing_input, null);
+    const sig_bytes = sig.toBytes();
+
+    var token_buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&token_buf);
+    try w.writeAll(signing_input ++ ".");
+    var sig_b64: [6000]u8 = undefined;
+    try w.writeAll(sig_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&sig_b64, &sig_bytes).len]);
+    const pq_token = w.buffered();
+
+    // The resource server's side: the issuer's published JWKS.
+    var pub_b64: [4000]u8 = undefined;
+    const pk_bytes = kp.public_key.toBytes();
+    const pub_s = pub_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&pub_b64, &pk_bytes).len];
+
+    var jwks_doc: std.ArrayList(u8) = .empty;
+    defer jwks_doc.deinit(gpa);
+    try jwks_doc.appendSlice(gpa, "{\"keys\":[{\"kty\":\"AKP\",\"kid\":\"pq1\",\"use\":\"sig\",\"alg\":\"ML-DSA-65\",\"pub\":\"");
+    try jwks_doc.appendSlice(gpa, pub_s);
+    try jwks_doc.appendSlice(gpa, "\"}]}");
+
+    var jwks = try jwt.parseJwksSource(gpa, jwks_doc.items, .network);
+    defer jwks.deinit();
+
+    var pq = try jwt.parseVerifyJwks(gpa, pq_token, jwks, .{
+        .now_s = 1_700_000_000,
+        .issuer = .{ .required = "https://op.example" },
+        .audience = .{ .required = "api://svc" },
+    });
+    defer pq.deinit();
+    std.debug.print("accepted: ML-DSA-65 token by kid, iss={s}\n", .{pq.claims.iss.?});
+
+    // The same JWKS with the issuer's private seed left in it. Published, that
+    // seed lets anyone mint tokens for this issuer, so the key is refused and
+    // the reason says which — a misconfiguration that must not verify quietly.
+    var leaky: std.ArrayList(u8) = .empty;
+    defer leaky.deinit(gpa);
+    try leaky.appendSlice(gpa, "{\"keys\":[{\"kty\":\"AKP\",\"kid\":\"pq1\",\"alg\":\"ML-DSA-65\",\"priv\":\"AAAA\",\"pub\":\"");
+    try leaky.appendSlice(gpa, pub_s);
+    try leaky.appendSlice(gpa, "\"}]}");
+
+    var leaked = try jwt.parseJwksSource(gpa, leaky.items, .network);
+    defer leaked.deinit();
+    std.debug.print("rejected: published private key, {d} usable key(s), reason={s}\n", .{
+        leaked.keys.len,
+        @tagName(leaked.skipped[0].reason),
+    });
 }

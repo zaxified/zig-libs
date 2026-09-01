@@ -189,7 +189,7 @@ const router = @import("router");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA, alg-confusion-safe), JWKS-by-kid, OIDC discovery, plus a router Bearer middleware",
+    .doc = "JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA and post-quantum ML-DSA per RFC 9964, alg-confusion-safe), JWKS-by-kid incl. kty:AKP, OIDC discovery, plus a router Bearer middleware",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -1026,6 +1026,14 @@ pub const JwkSkipReason = enum {
     /// mint HS* tokens with it (RFC 8725 §3.5 / §2.1 algorithm confusion).
     /// Symmetric keys are accepted ONLY from a locally-configured `parseJwks`.
     oct_from_network,
+    /// A key carrying its PRIVATE component — `d` for RSA/EC/OKP, `priv` for
+    /// AKP — appeared in a JWKS fetched over the network. Its signing half is
+    /// published, so anyone who can read the document can mint tokens for
+    /// this issuer, and verifying against it would authenticate forgeries as
+    /// genuine. Refused for the same reason `oct_from_network` is, and, like
+    /// it, accepted from a locally-configured set where holding a private key
+    /// is legitimate.
+    priv_from_network,
 };
 
 /// Where a JWKS came from — decides whether `kty:"oct"` symmetric keys are
@@ -1234,6 +1242,9 @@ const JwkFailure = error{
     InvalidKeyMaterial,
     InvalidMember,
     OctFromNetwork,
+    /// A key published its private component (`d`, or AKP's `priv`) in a
+    /// network-fetched JWKS — see `JwkSkipReason.priv_from_network`.
+    PrivFromNetwork,
 };
 
 fn skipReason(err: JwkFailure) JwkSkipReason {
@@ -1249,6 +1260,7 @@ fn skipReason(err: JwkFailure) JwkSkipReason {
         error.InvalidKeyMaterial => .invalid_key,
         error.InvalidMember => .invalid_member,
         error.OctFromNetwork => .oct_from_network,
+        error.PrivFromNetwork => .priv_from_network,
     };
 }
 
@@ -1264,6 +1276,20 @@ fn jwkFromValue(
 
     const key: Key = blk: {
         const kty = (try jwkString(obj, "kty")) orelse return error.MissingKty;
+        // A published JWKS carries PUBLIC keys. A private component in one
+        // means the issuer's signing half is readable by anyone who can GET
+        // the document, so every token that key "verifies" is forgeable —
+        // continuing to trust it authenticates forgeries as genuine. RFC 7517
+        // §4 and RFC 9964 §3 both say MUST NOT for exactly this reason.
+        //
+        // Checked for every `kty`, not just the one that prompted it: `d` is
+        // the private component of RSA, EC and OKP alike (RFC 7518 §6.2.2.1 /
+        // §6.3.2.1, RFC 8037 §2), `priv` is AKP's (RFC 9964 §3), and `oct` is
+        // already refused wholesale below. Only on the network path — a
+        // locally-configured set is a legitimate place to hold a private key,
+        // and this module simply never reads the private half either way.
+        if (source == .network and (obj.get("d") != null or obj.get("priv") != null))
+            return error.PrivFromNetwork;
         if (std.mem.eql(u8, kty, "RSA")) {
             // RFC 7518 §6.3.1: n, e as base64url big-endian integers.
             const n = try jwkMaterial(arena, obj, "n");
@@ -1306,8 +1332,11 @@ fn jwkFromValue(
             // even though the three lengths are distinct: inferring it would
             // accept a key whose `alg` says one set and whose bytes are
             // another, which is the algorithm-confusion shape RFC 8725 exists
-            // to close. `priv` (a 32-byte seed) has no business in a
-            // verification key and is simply never read.
+            // to close.
+            //
+            // `priv` (a 32-byte seed) has no business in a verification key
+            // and is never read; a published one is refused at the top of
+            // this function, together with every other kty's private half.
             const alg = (try jwkString(obj, "alg")) orelse return error.MissingAlg;
             const pub_bytes = try jwkMaterial(arena, obj, "pub");
             const set = Alg.fromString(alg);
@@ -4257,6 +4286,75 @@ test "parseJwks: an AKP key whose pub length contradicts its alg is skipped" {
     try testing.expectEqual(JwkSkipReason.invalid_key, set.skipped[0].reason);
 }
 
+test "parseJwks: the pub-length guard holds for ML-DSA-44 and -87 too, not just -65" {
+    // The three arms are textually identical, so a regression would most
+    // plausibly hit all three — but only the -65 arm was pinned, and deleting
+    // the other two left the suite green. Each arm gets a key of the WRONG
+    // parameter set presented under its own `alg`.
+    const kp65 = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x44} ** 32);
+    const kp87 = try MlDsa87.KeyPair.generateDeterministic([_]u8{0x45} ** 32);
+    const pk65 = kp65.public_key.toBytes(); // 1952
+    const pk87 = kp87.public_key.toBytes(); // 2592
+
+    // ML-DSA-44 (1312) offered a 1952-byte key; ML-DSA-87 (2592) offered 1952.
+    inline for (.{ .{ "ML-DSA-44", &pk65 }, .{ "ML-DSA-87", &pk65 }, .{ "ML-DSA-44", &pk87 } }) |case| {
+        var pub_b64: [4000]u8 = undefined;
+        const pub_s = pub_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&pub_b64, case[1]).len];
+
+        var doc: std.ArrayList(u8) = .empty;
+        defer doc.deinit(testing.allocator);
+        try doc.appendSlice(testing.allocator, "{\"keys\":[{\"kty\":\"AKP\",\"alg\":\"" ++ case[0] ++ "\",\"pub\":\"");
+        try doc.appendSlice(testing.allocator, pub_s);
+        try doc.appendSlice(testing.allocator, "\"}]}");
+
+        var set = try parseJwks(testing.allocator, doc.items);
+        defer set.deinit();
+        try testing.expectEqual(@as(usize, 0), set.keys.len);
+        try testing.expectEqual(@as(usize, 1), set.skipped.len);
+        try testing.expectEqual(JwkSkipReason.invalid_key, set.skipped[0].reason);
+    }
+}
+
+test "SECURITY: a network JWKS that publishes a private key is refused, every kty" {
+    // A published JWKS carries public keys. A private component in one means
+    // the signing half is readable by anyone who can GET the document, so a
+    // token that key "verifies" is forgeable — trusting it would authenticate
+    // forgeries as genuine. RFC 7517 §4 and RFC 9964 §3 both say MUST NOT.
+    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x46} ** 32);
+    const pk_bytes = kp.public_key.toBytes();
+    var pub_b64: [4000]u8 = undefined;
+    const pub_s = pub_b64[0..std.base64.url_safe_no_pad.Encoder.encode(&pub_b64, &pk_bytes).len];
+
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(testing.allocator);
+    try doc.appendSlice(testing.allocator, "{\"keys\":[{\"kty\":\"AKP\",\"kid\":\"pq1\",\"alg\":\"ML-DSA-65\",\"priv\":\"AAAA\",\"pub\":\"");
+    try doc.appendSlice(testing.allocator, pub_s);
+    try doc.appendSlice(testing.allocator, "\"}]}");
+
+    // Locally configured: a private key is a legitimate thing to hold, and the
+    // module never reads it — the key stays usable for verification.
+    var local = try parseJwksSource(testing.allocator, doc.items, .local);
+    defer local.deinit();
+    try testing.expectEqual(@as(usize, 1), local.keys.len);
+
+    // Fetched over the network: refused, and the reason says why.
+    var net = try parseJwksSource(testing.allocator, doc.items, .network);
+    defer net.deinit();
+    try testing.expectEqual(@as(usize, 0), net.keys.len);
+    try testing.expectEqual(@as(usize, 1), net.skipped.len);
+    try testing.expectEqual(JwkSkipReason.priv_from_network, net.skipped[0].reason);
+
+    // `d` is the same story for RSA/EC/OKP — the check is not AKP-only.
+    const rsa_doc =
+        \\{"keys":[{"kty":"RSA","kid":"r1","n":"AQAB","e":"AQAB","d":"AQAB"}]}
+    ;
+    var rsa_net = try parseJwksSource(testing.allocator, rsa_doc, .network);
+    defer rsa_net.deinit();
+    try testing.expectEqual(@as(usize, 0), rsa_net.keys.len);
+    try testing.expectEqual(@as(usize, 1), rsa_net.skipped.len);
+    try testing.expectEqual(JwkSkipReason.priv_from_network, rsa_net.skipped[0].reason);
+}
+
 test "verify: alg none is always rejected, key or no key (RFC 8725 §2.1)" {
     const unsecured = "eyJhbGciOiJub25lIn0.eyJpc3MiOiJqb2UifQ.";
     var parsed = try parse(testing.allocator, unsecured);
@@ -4326,6 +4424,45 @@ test "verify: unknown and not-yet-supported algs → UnsupportedAlg" {
         defer parsed.deinit();
         try testing.expectError(error.UnsupportedAlg, verify(&parsed, .{ .hmac = "secret" }));
     }
+}
+
+test "verify: ML-DSA wrong-length signatures are BadSignature, never an OOB read" {
+    // The explicit length check in `verifyMlDsa` sits in front of a
+    // slice-to-array coercion of 2420/3309/4627 bytes. Deleting it left the
+    // whole suite green until this test existed: ML-DSA was the only family
+    // without the wrong-length case its siblings have had all along (see
+    // "verify: wrong-length or garbage signatures never panic" for ES/EdDSA
+    // and the RSA one below). In Debug a regression is a remote panic; in
+    // ReleaseFast, which this suite also builds, there is no bounds check and
+    // it becomes a silent read of adjacent heap fed into `Signature.fromBytes`.
+    const kp = try MlDsa65.KeyPair.generateDeterministic([_]u8{0x31} ** 32);
+    const key = try Key.mlDsa65FromBytes(kp.public_key.toBytes());
+
+    var buf: [8192]u8 = undefined;
+    // Empty, tiny, one short, one long, and the sizes of the OTHER two
+    // parameter sets — the last two are the ones a real mix-up produces.
+    inline for (.{ 0, 1, 64, 2420, 3308, 3310, 4627 }) |bad_len| {
+        const si = signingInputInto(&buf,
+            \\{"alg":"ML-DSA-65"}
+        ,
+            \\{"exp":1000}
+        );
+        const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** bad_len));
+        var parsed = try parse(testing.allocator, token);
+        defer parsed.deinit();
+        try testing.expectError(error.BadSignature, verify(&parsed, key));
+    }
+
+    // Right length, arbitrary bytes: rejected by verification, not a panic.
+    const si = signingInputInto(&buf,
+        \\{"alg":"ML-DSA-65"}
+    ,
+        \\{"exp":1000}
+    );
+    const token = finishToken(&buf, si.len, &([_]u8{0xAB} ** 3309));
+    var parsed = try parse(testing.allocator, token);
+    defer parsed.deinit();
+    try testing.expectError(error.BadSignature, verify(&parsed, key));
 }
 
 test "verify: wrong-length or garbage signatures never panic" {
@@ -5263,12 +5400,24 @@ fn fuzzParseJwks(_: void, smith: *std.testing.Smith) !void {
     // Individual malformed JWKs are skipped (never a set-wide error), and
     // per parseJwks's own doc comment "Arbitrary bytes never panic" — this
     // is the fuzz harness proving that claim for both `.local` and
-    // `.network` trust sources (the latter has an extra oct-key rejection
-    // branch `.local` never takes).
-    var local = parseJwksSource(testing.allocator, buf[0..len], .local) catch return;
-    local.deinit();
-    var network = parseJwksSource(testing.allocator, buf[0..len], .network) catch return;
-    network.deinit();
+    // `.network` trust sources (the latter has extra rejection branches
+    // `.local` never takes: `oct_from_network` and `priv_from_network`).
+    //
+    // NB: `catch return` here would be a skip-as-pass, and was one. Nearly
+    // every random byte string is a parse error, so an early return abandons
+    // the iteration — and the `.network` call below, the whole reason the
+    // comment above names two trust sources, never ran. This module's
+    // `fuzzParseTokenResponse` already carries the same warning; the sibling
+    // `fuzzParse` gets away with `catch return` only because nothing follows
+    // it there.
+    if (parseJwksSource(testing.allocator, buf[0..len], .local)) |ok| {
+        var local = ok;
+        local.deinit();
+    } else |_| {}
+    if (parseJwksSource(testing.allocator, buf[0..len], .network)) |ok| {
+        var network = ok;
+        network.deinit();
+    } else |_| {}
 }
 
 test "parseVerifyJwks: end-to-end against a multi-key set" {

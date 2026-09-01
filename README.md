@@ -310,7 +310,7 @@ way to recognise it.
 | [`http`](modules/http/README.md) | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt |
 | [`idempotency`](modules/idempotency/README.md) | Idempotency-Key dedup of unsafe retries — middleware + ramcache-backed store replaying a cached response without re-running the handler | any | router, http, ramcache |
 | [`jwe`](modules/jwe/README.md) | JSON Web Encryption (RFC 7516/7518) compact serialization — RSA-OAEP/AxxxKW/ECDH-ES key management + AES-GCM/CBC-HMAC content encryption; A192* unsupported (no AES-192 in std) | any | rsa, p256, aescbc, aeskw |
-| [`jwt`](modules/jwt/README.md) | JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA, alg-confusion-safe), JWKS-by-kid, OIDC discovery, plus a router Bearer middleware | any | http, router, p256 |
+| [`jwt`](modules/jwt/README.md) | JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA and post-quantum ML-DSA per RFC 9964, alg-confusion-safe), JWKS-by-kid incl. kty:AKP, OIDC discovery, plus a router Bearer middleware | any | http, router, p256 |
 | [`llmclient`](modules/llmclient/README.md) | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |
 | [`metrics`](modules/metrics/README.md) | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware + access-log writer (combined/JSON) | posix | router, http |
 | [`openapi`](modules/openapi/README.md) | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | any | router, http |
