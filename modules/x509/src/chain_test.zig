@@ -685,3 +685,174 @@ test "SLH-DSA: mixing the two hash families at the same size is an algorithm mis
         chain_mod.verifySlhDsaLink(slh.leaf_sha2, slh.root_shake, now_valid_mldsa),
     );
 }
+
+// ── regression: zero-length BIT STRINGs reach parseShape before anything is
+//    verified (audit 2026-09-01) ─────────────────────────────────────────────
+//
+// `parseShape` leans on `std.crypto.Certificate.parseBitString`, which reads
+// the unused-bits octet without checking the BIT STRING has one and returns
+// `start + 1` regardless. Both call sites take attacker-controlled elements,
+// and `verifyChain` reaches the first of them on the peer's leaf certificate
+// before a single signature is checked — so the shapes below used to abort the
+// process (Debug/ReleaseSafe) or produce a slice of length 2^32-1 (ReleaseFast).
+
+const oid_sha256rsa_tlv = [_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00 };
+const validity_tlv = [_]u8{ 0x30, 0x1e, 0x17, 0x0d } ++ "250101000000Z".* ++
+    [_]u8{ 0x17, 0x0d } ++ "350101000000Z".*;
+const rsa_algid_tlv = [_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 };
+
+/// A structurally complete certificate whose `subjectPublicKeyInfo` BIT STRING
+/// and `signatureValue` are supplied by the caller, so a test can make either
+/// one degenerate while every enclosing element stays well-formed.
+fn craftCert(comptime pub_key_bits: []const u8, comptime signature_bits: []const u8) []const u8 {
+    const spki_body = rsa_algid_tlv ++ pub_key_bits[0..pub_key_bits.len].*;
+    const spki = [_]u8{ 0x30, spki_body.len } ++ spki_body;
+    const tbs_body = [_]u8{ 0xa0, 0x03, 0x02, 0x01, 0x02 } ++ // version v3
+        [_]u8{ 0x02, 0x01, 0x01 } ++ // serialNumber
+        oid_sha256rsa_tlv ++ // signature
+        [_]u8{ 0x30, 0x00 } ++ // issuer
+        validity_tlv ++
+        [_]u8{ 0x30, 0x00 } ++ // subject
+        spki;
+    const tbs = [_]u8{ 0x30, tbs_body.len } ++ tbs_body;
+    const body = tbs ++ oid_sha256rsa_tlv ++ signature_bits[0..signature_bits.len].*;
+    return &([_]u8{ 0x30, body.len } ++ body);
+}
+
+test "regression: a zero-length signatureValue BIT STRING is a typed error, not a panic" {
+    const cert = comptime craftCert(&[_]u8{ 0x03, 0x02, 0x00, 0x00 }, &[_]u8{ 0x03, 0x00 });
+    const chain = [_]chain_mod.CertDer{cert};
+    const anchors = [_]chain_mod.CertDer{cert};
+    try testing.expectError(
+        error.CertificateHasInvalidBitString,
+        chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid }),
+    );
+}
+
+test "regression: a zero-length subjectPublicKey BIT STRING is a typed error, not a panic" {
+    const cert = comptime craftCert(&[_]u8{ 0x03, 0x00 }, &[_]u8{ 0x03, 0x02, 0x00, 0x00 });
+    const chain = [_]chain_mod.CertDer{cert};
+    const anchors = [_]chain_mod.CertDer{cert};
+    try testing.expectError(
+        error.CertificateHasInvalidBitString,
+        chain_mod.verifyChain(testing.allocator, &chain, &anchors, .{ .now_sec = now_valid }),
+    );
+}
+
+test "PQ single-link helpers chain the issuer's name, like their std counterpart" {
+    // `verifyMlDsaLink`/`verifySlhDsaLink` are public and documented as the
+    // way to check one link without building a path. The std function they
+    // stand in for, `Parsed.verify`, rejects an issuer whose subject DN is not
+    // the subject's issuer DN (RFC 5280 §6.1.3 (a)(4)); these used to verify
+    // the signature and return success regardless, so the parity the doc
+    // comment advertises was not there.
+    //
+    // The mutation is same-length, so the DER stays well-formed and the
+    // issuer's key is untouched — only its subject DN changes.
+    var forged: [mldsa.inter44.len]u8 = mldsa.inter44.*;
+    const needle = "Test Inter ML-DSA-44";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, &forged, needle));
+    forged[std.mem.indexOf(u8, &forged, needle).?] = 'X';
+    try testing.expectError(
+        error.CertificateIssuerMismatch,
+        chain_mod.verifyMlDsaLink(mldsa.leaf44, &forged, now_valid_mldsa),
+    );
+    // Unmutated, the same link still verifies — so the test is pinning the
+    // name check, not a broken fixture.
+    try chain_mod.verifyMlDsaLink(mldsa.leaf44, mldsa.inter44, now_valid_mldsa);
+
+    var forged_slh: [slh.inter_sha2.len]u8 = slh.inter_sha2.*;
+    const needle_slh = "Test Inter SLH-DSA";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, &forged_slh, needle_slh));
+    forged_slh[std.mem.indexOf(u8, &forged_slh, needle_slh).?] = 'X';
+    try testing.expectError(
+        error.CertificateIssuerMismatch,
+        chain_mod.verifySlhDsaLink(slh.leaf_sha2, &forged_slh, now_valid_mldsa),
+    );
+    try chain_mod.verifySlhDsaLink(slh.leaf_sha2, slh.inter_sha2, now_valid_mldsa);
+}
+
+// ── the two length checks each PQ path makes before coercing a slice to an
+//    array, and the SLH-DSA validity window (audit 2026-09-01) ──────────────
+//
+// SPEC claimed each of the ML-DSA path's four checks was pinned by a test that
+// goes red when the check alone is removed. Two were not: deleting either
+// length check left the whole suite green. They matter more than bookkeeping —
+// they stand in front of `key_bytes[0..encoded_length].*` and
+// `signature[0..encoded_length].*`, which in ReleaseFast would otherwise read
+// up to 4627 bytes past the certificate buffer and feed them to verification.
+
+/// Rewrite every occurrence of one algorithm OID's content bytes with
+/// another's. The two are always the same length (they differ in the final
+/// arc), so the DER stays byte-for-byte well-formed and only the algorithm
+/// *names* change — which is exactly the confusion these checks exist to
+/// catch. Blanket replacement is safe here because neither `verifyMlDsaLink`
+/// nor `verifySlhDsaLink` reads the issuer's own signatureAlgorithm or the
+/// subject's own SubjectPublicKeyInfo.
+fn renameAlgorithm(gpa: std.mem.Allocator, cert: []const u8, from: []const u8, to: []const u8) ![]u8 {
+    std.debug.assert(from.len == to.len);
+    const out = try gpa.dupe(u8, cert);
+    errdefer gpa.free(out);
+    var replaced: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, from)) |at| {
+        @memcpy(out[at..][0..to.len], to);
+        i = at + to.len;
+        replaced += 1;
+    }
+    // A rename that matched nothing would make the test vacuous.
+    try testing.expect(replaced > 0);
+    return out;
+}
+
+const oid_mldsa44 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11 };
+const oid_mldsa65 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12 };
+const oid_slh_sha2_128s = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x14 };
+const oid_slh_sha2_128f = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x15 };
+
+test "ML-DSA: a public key whose length is not the parameter set's is rejected by length" {
+    // Both halves of a real ML-DSA-65 link, renamed to claim ML-DSA-44. The
+    // parameter sets now agree with each other, and the names still chain, so
+    // the 1952-byte key reaching a slot that fixes 1312 is the only thing left
+    // to catch.
+    const gpa = testing.allocator;
+    const subject = try renameAlgorithm(gpa, mldsa.leaf65, &oid_mldsa65, &oid_mldsa44);
+    defer gpa.free(subject);
+    const issuer = try renameAlgorithm(gpa, mldsa.inter65, &oid_mldsa65, &oid_mldsa44);
+    defer gpa.free(issuer);
+    try testing.expectError(
+        error.CertificatePublicKeyInvalid,
+        chain_mod.verifyMlDsaLink(subject, issuer, now_valid_mldsa),
+    );
+}
+
+test "SLH-DSA: a signature whose length is not the parameter set's is rejected by length" {
+    // SHA2-128s and SHA2-128f share a 32-byte public key and differ only in
+    // signature size (7856 vs 17088), so renaming a self-signed 128s
+    // certificate to 128f passes the parameter-set comparison, passes the
+    // name chaining (it is self-signed) and passes the key-length check —
+    // leaving the signature-length check alone on the line. Without it the
+    // short signature reaches `slhdsa.verify`, which returns a bare `false`
+    // that reads as a forgery rather than a size mismatch.
+    const gpa = testing.allocator;
+    const renamed = try renameAlgorithm(gpa, slh.selfsigned[0], &oid_slh_sha2_128s, &oid_slh_sha2_128f);
+    defer gpa.free(renamed);
+    try testing.expectError(
+        error.CertificateSignatureInvalidLength,
+        chain_mod.verifySlhDsaLink(renamed, renamed, now_valid_mldsa),
+    );
+}
+
+test "SLH-DSA: expiry and not-yet-valid are checked on the SLH-DSA path too" {
+    // The ML-DSA path had this test; the SLH-DSA path did not, while SPEC
+    // described the two as "the same shape" — a parity of assurance the suite
+    // did not deliver.
+    try testing.expectError(
+        error.CertificateNotYetValid,
+        chain_mod.verifySlhDsaLink(slh.leaf_sha2, slh.inter_sha2, now_before),
+    );
+    try testing.expectError(
+        error.CertificateExpired,
+        chain_mod.verifySlhDsaLink(slh.leaf_sha2, slh.inter_sha2, now_after),
+    );
+}

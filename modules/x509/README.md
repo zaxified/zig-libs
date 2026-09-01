@@ -137,12 +137,18 @@ unchecked DER reader **panics in Debug and reads out of bounds / segfaults in
 ReleaseFast** on a malformed, attacker-supplied certificate (verified on Zig
 0.16.0). `safe.validate` / `safe.validateCertificate` are a recursive-descent
 DER well-formedness validator (its own bounds-checked decoder — it does not
-trust std's reader) returning a typed `safe.Error`. `safe.safeCertificate(der,
-scratch)` validates, then returns a zero-padded `std.crypto.Certificate` that
-is safe to `parse` in every optimisation mode — the padding is required
-because well-formedness alone does not make std's parse total (`SPEC.md`
-gives the proof). This is the shared helper the `iec62351` and `opcua`
-modules route through instead of each carrying its own copy.
+trust std's reader) returning a typed `safe.Error`. **They do not on their own
+make an input safe to `parse`** — a tiling proof says nothing about the inside
+of a primitive element, and std descends into an element's content by field
+position rather than by the constructed bit.
+
+`safe.safeCertificate(der, scratch)` is the function that carries the
+safe-to-`parse` claim: it validates, then requires a constructed element at
+every position std descends into, then hands back a zero-padded
+`std.crypto.Certificate`. All three layers are load-bearing and `SPEC.md`
+says why — the padding alone bounds only std's boundary probes, not a hostile
+length. This is the shared helper the `iec62351` and `opcua` modules route
+through instead of each carrying its own copy.
 
 ```zig
 var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;

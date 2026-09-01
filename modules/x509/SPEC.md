@@ -84,13 +84,17 @@ ReleaseFast; `30 82` (truncated length) segfaults in ReleaseFast.
   `safe.Error` for a length that overruns its container, a truncated tag or
   length, a length-of-length that itself overruns, an indefinite-length
   encoding (BER, illegal in DER), a high-tag-number identifier, a
-  length-of-length beyond four octets, or nesting past `safe.max_depth` (32).
+  length-of-length beyond four octets, nesting past `safe.max_depth` (32), or
+  a BIT STRING with no content octets at all (X.690 §8.6.2.3 — see below).
   `validateCertificate` additionally requires a single outer `SEQUENCE`
-  filling the buffer.
-- `safe.safeCertificate(der, scratch)` — validate, copy into caller scratch,
-  zero-pad by `safe.parse_slack` (64), and return a `std.crypto.Certificate`
-  safe to `parse`. `safe.max_certificate_len` (8192) bounds the input so a
-  caller can size `[max_certificate_len + parse_slack]u8` on the stack.
+  filling the buffer. **Neither carries the safe-to-`parse` claim on its own;
+  `safeCertificate` does.**
+- `safe.safeCertificate(der, scratch)` — validate, require a constructed
+  element at every position std descends into (`requireStdDescentPoints`),
+  copy into caller scratch, zero-pad by `safe.parse_slack` (64), and return a
+  `std.crypto.Certificate` safe to `parse`. `safe.max_certificate_len` (8192)
+  bounds the input so a caller can size `[max_certificate_len + parse_slack]u8`
+  on the stack.
 - `safe.spkiOf(certificate_der)` (lifted as `x509.spkiOf`) — the certificate's
   `SubjectPublicKeyInfo`, extracted without `std.crypto.Certificate.parse` at
   all. See the section below.
@@ -146,19 +150,57 @@ values, explicit shapes with too-few TBS fields / a non-SEQUENCE SPKI / a
 non-zero unused-bit count, and a `std.testing.fuzz` walk feeding arbitrary
 bytes into `spkiOf` and on into `rsa.PublicKey.fromDer` / `fromSec1`.
 
-**Why the zero-padded copy is kept, not dropped.** Well-formedness is
-necessary but **not sufficient** to make `std.crypto.Certificate.parse`
-total, so the scratch-copy convenience is required rather than optional. The
-well-formed input `30 02 30 00` passes `validateCertificate`, yet std, having
-consumed the empty inner element as the tbsCertificate, then parses the next
-field at the buffer boundary and indexes off the end (the Debug panic /
-ReleaseFast OOB read above). The `parse_slack` zero bytes behind a validated
-copy turn every such boundary probe into an empty `00 00` TLV read out of the
-padding; because every loop std runs is bounded by an element end the
-validator already proved in-bounds, a bounded number of probes cannot walk
-through 64 zero bytes. With the guard, `30 02 30 00` yields a clean
-`error.CertificateFieldHasWrongDataType` in **both** Debug and ReleaseFast
-(verified). `safe.zig`'s tests take the union of the three former guards'
+**Why well-formedness is not enough — corrected 2026-09-01.** This section
+used to argue that a validated, zero-padded copy made `parse` total, on the
+grounds that "every loop std runs is bounded by an element end the validator
+already proved in-bounds, so a bounded number of probes cannot walk through 64
+zero bytes". **That argument is unsound and the guard it justified did not
+hold.** It reasons only about std probing for an OPTIONAL sibling at a
+boundary. The real hazard is different in kind:
+
+`walk` descends into **constructed** elements. `Certificate.parse` descends
+into an element's content by **field position**, whatever the constructed bit
+says. Park a primitive element at one of those positions and its interior is a
+region no validator ever examined — and std will read a TLV length out of it.
+`30 07 04 05 30 83 01 00 00` is nine bytes: a `SEQUENCE` holding a primitive
+`OCTET STRING` whose content declares 65536 bytes. It passes
+`validateCertificate`; std then takes the OCTET STRING's content as the
+tbsCertificate and indexes at offset 65545 — Debug abort, ReleaseFast segfault,
+straight through the guard. Padding cannot help: an attacker-chosen 32-bit
+length is not a boundary probe, and no fixed amount of slack bounds it.
+
+Shaped a little differently the same trick is worse than a crash. Wrap a real
+SubjectPublicKeyInfo in a primitive `OCTET STRING` and give it a BIT STRING
+declaring 256 content octets with one present: `parse` returns **successfully**
+with a `pub_key_slice` ending far outside the buffer, which the caller then
+hands to a signature verifier as key material.
+
+`requireStdDescentPoints` is the fix: require a constructed element at every
+position std descends into, so every element `parse` sees is one the tiling
+walk already bounded, and so is every slice in the returned `Parsed`. It is
+run by `safeCertificate`, not by `validateCertificate` — `spkiOf` never calls
+std's parser and has no use for it.
+
+A third shape needs no primitive at all: an **empty BIT STRING**. std's
+`parseBitString` reads the unused-bits octet without checking one exists and
+returns `start + 1` regardless, so `03 00` yields a slice whose start is one
+past its end — and here the padding actively *hid* the bug, satisfying the
+unguarded read so that the corruption surfaced downstream (a 4 GB
+`Parsed.signature()` in ReleaseFast) instead of aborting loudly. X.690 §8.6.2.3
+requires that octet to be present, so `walk` now rejects the encoding outright.
+The same missing precondition was live in `chain.zig`'s `parseShape`, which
+does not use this guard at all; it has its own `parseBitStringSafe` now.
+
+The zero-padded copy is still kept, for what it actually does: `30 02 30 00`
+used to be caught by the padding and is now refused by
+`requireStdDescentPoints` before std runs, but the boundary-probe case the
+padding covers is real and cheap to keep.
+
+⚠ `requireStdDescentPoints` mirrors `std.crypto.Certificate.parse` as of Zig
+0.16, which is a coupling. The alternative is to stop offering a guarded
+`parse` at all and route every consumer through a defensive field walk of our
+own, the way `spkiOf` already does. That is the larger change and it is not
+made here. `safe.zig`'s tests take the union of the three former guards'
 coverage — every-prefix and every-single-byte-mutation sweeps of a real
 fixture certificate, a `std.testing.fuzz` walk, explicit hostile shapes, and
 a regression test pinned to the reproduced std hazard.
@@ -197,9 +239,17 @@ against both a real generated fixture (CA vs. leaf, via
   surfacing as a key-length error), rejects a public key or signature whose
   length is not the one that parameter set fixes, and verifies pure ML-DSA
   with an empty context string per RFC 9881 §4. Each of those four is checked
-  by a test that goes red when the check alone is removed.
+  by a test that goes red when the check alone is removed. Two of those four
+  (the key-length and signature-length comparisons) were **not** pinned until
+  the 2026-09-01 audit added the tests; the claim is now true for the pair of
+  them the fixture corpus can express — the ML-DSA signature-length check is
+  reachable only through DER surgery, because an ML-DSA key length uniquely
+  determines its parameter set, so the SLH-DSA pair carries that shape instead
+  (SHA2-128s and SHA2-128f share a key length and differ only in signature
+  size).
 - The SLH-DSA path (`verifySlhDsaLink`) is the same shape over twelve
-  parameter sets. The parameter-set check matters MORE there than for ML-DSA,
+  parameter sets — including the validity window, which for a while the code
+  checked and no test pinned, while this sentence implied otherwise. The parameter-set check matters MORE there than for ML-DSA,
   not less: `s` and `f` differ only in signature size and share a public-key
   length, and the two hash families at the same category share BOTH lengths —
   so for SHA2-128s against SHAKE-128s the set comparison is the only thing
@@ -219,11 +269,15 @@ against both a real generated fixture (CA vs. leaf, via
 
 Remaining, NOT addressed by this module (see "Explicitly out of scope"
 above and README.md): CRL/OCSP revocation, certificate-policy processing,
-and name-constraint bypass via `GeneralName` types this module doesn't match
-against (`rfc822Name`, `uniformResourceIdentifier`, etc. — parsed but not
-enforced) or via Unicode/punycode confusables in `dNSName`/IPv4-mapped IPv6
-in `iPAddress` (this module does exact-bytes/CIDR matching only, no
-normalization).
+and name-constraint bypass via Unicode/punycode confusables in `dNSName` or
+IPv4-mapped IPv6 in `iPAddress` (this module does exact-bytes/CIDR matching
+only, no normalization).
+
+`GeneralName` types this module has no matching rule for (`rfc822Name`,
+`uniformResourceIdentifier`, …) are **not** a bypass: both sides fail closed,
+so the exposure is a false reject. Stated here because this section used to
+claim the opposite and an auditor would go looking for a hole that is not
+there.
 
 ## Status
 
@@ -247,9 +301,10 @@ guard" above (`zig build test-x509`, green in Debug and ReleaseFast).
 Not implemented, and not silently skipped (see "Explicitly out of scope"
 above): CRL/OCSP revocation checking, certificate-policy processing
 (§6.1.5), and name-constraint matching for `GeneralName` types other than
-`dNSName`/`directoryName`/`iPAddress` (a constraint on `rfc822Name`,
-`uniformResourceIdentifier`, etc. is parsed but never matched against —
-fail-open for that specific name type only).
+`dNSName`/`directoryName`/`iPAddress`. A constraint on `rfc822Name`,
+`uniformResourceIdentifier`, etc. is parsed but never matched against, and
+both the excluded and the permitted side then reject — fail-**closed** for
+that name type, i.e. a false reject, never a bypass.
 
 ## Anchoring
 

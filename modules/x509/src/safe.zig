@@ -28,7 +28,7 @@
 //! `tlsprofile.structurallySafe`, `opcua`'s `security.safeCertificate`); this
 //! file is the single reconciled implementation they all now route through.
 //!
-//! ## The fix, in two layers
+//! ## The fix, in three layers
 //!
 //! 1. **`validate` / `validateCertificate`** — a recursive-descent DER
 //!    well-formedness validator that walks the whole TLV structure *without
@@ -36,31 +36,39 @@
 //!    returns a typed error for any length that overruns its container, any
 //!    truncated tag or length, any indefinite-length encoding (BER, illegal in
 //!    DER), any high-tag-number identifier, a length-of-length beyond four
-//!    octets (more than the `u32` std computes ends in), and nesting past a
-//!    bounded depth. Every accepted element provably sits wholly inside the
-//!    buffer.
+//!    octets (more than the `u32` std computes ends in), nesting past a bounded
+//!    depth, and a BIT STRING with no content octets at all (X.690 §8.6.2.3
+//!    requires the unused-bits octet to be there, and std's `parseBitString`
+//!    reads it without checking). Every accepted element provably sits wholly
+//!    inside the buffer.
 //!
-//! 2. **`safeCertificate`** — well-formedness is *necessary but not sufficient*
-//!    to make `std.crypto.Certificate.parse` total. A well-formed but
-//!    minimally-shaped input such as `30 02 30 00` (`SEQUENCE { SEQUENCE {} }`)
-//!    passes `validateCertificate`, yet std, having consumed the empty inner
-//!    element as the tbsCertificate, then parses the *next* field at the buffer
-//!    boundary and indexes past the end (Debug panic / ReleaseFast OOB read —
-//!    both reproduced). The remedy is a fixed amount of zero padding behind a
-//!    validated copy: std's boundary probes then read `00 00` empty TLVs out of
-//!    the padding instead of off the end, and every loop std runs is bounded by
-//!    an element end this validator already proved in-bounds, so a bounded
-//!    number of such probes cannot walk through `parse_slack` zero bytes.
-//!    `safeCertificate` validates, copies into caller-supplied scratch, zero-
-//!    pads, and hands back a `std.crypto.Certificate` that is safe to `parse`.
-//!    With it, the same `30 02 30 00` yields a clean
-//!    `error.CertificateFieldHasWrongDataType` in **both** Debug and
-//!    ReleaseFast (verified).
+//! 2. **`requireStdDescentPoints`** — and that proof is *still not enough*,
+//!    because it covers only the elements the walk descended into, and the walk
+//!    descends into constructed elements. `std.crypto.Certificate.parse`
+//!    descends by FIELD POSITION instead, whatever the constructed bit says.
+//!    Nine bytes are enough to exploit the difference:
+//!    `30 07 04 05 30 83 01 00 00` is a `SEQUENCE` holding a *primitive*
+//!    `OCTET STRING`, and std takes that OCTET STRING's content as the
+//!    tbsCertificate, reads a 65536-byte length out of an interior no
+//!    validator ever examined, and indexes at offset 65545. So the second
+//!    layer requires a constructed element at every position std descends into
+//!    — which is what makes layer 1's proof carry over to std's walk.
 //!
-//! So the scratch-copy convenience is **kept, because it is required**: the
-//! well-formedness check alone does not neutralise the std hazard, only the
-//! validated-plus-padded buffer does. See `SPEC.md` for the full argument and
-//! the out-of-band panic reproduction.
+//! 3. **`parse_slack`** — a fixed amount of zero padding behind the validated
+//!    copy. This is the smallest of the three and handles only what its name
+//!    says: std probing for an OPTIONAL sibling at a boundary reads an empty
+//!    `00 00` TLV out of the padding instead of off the end. It is *not* a
+//!    defence against a hostile length, which is an attacker-chosen 32-bit
+//!    number no bounded amount of padding can absorb — layer 2 is.
+//!
+//! `safeCertificate` runs all three and hands back a `std.crypto.Certificate`
+//! safe to `parse`. `validateCertificate` on its own runs only layer 1 and
+//! must not be read as carrying the safe-to-parse claim.
+//!
+//! ⚠ Layer 2 mirrors `std.crypto.Certificate.parse`. That coupling is
+//! deliberate — the only alternative is to stop offering a guarded `parse` at
+//! all and route every consumer through a defensive field walk of our own, the
+//! way `spkiOf` already does. See `SPEC.md`.
 //!
 //! Provenance: clean-room from X.690 (DER encoding rules) and the observed
 //! behaviour of `std.crypto.Certificate` (MIT, part of Zig std). No third-party
@@ -85,6 +93,13 @@ pub const max_certificate_len: usize = 8192;
 /// of the buffer. Two bytes (`00 00`, an empty element) satisfy one probe;
 /// std makes at most a handful in a row and every loop it runs is bounded by a
 /// validated element end, so this is comfortably more than enough.
+///
+/// It bounds *probes* and nothing else. A hostile element length is an
+/// attacker-chosen 32-bit number, which no fixed padding can absorb — that is
+/// `requireStdDescentPoints`' job, not this constant's. Padding alone is also
+/// the reason an empty BIT STRING used to be dangerous rather than loud: the
+/// padding satisfied `parseBitString`'s unguarded read, and the corruption
+/// moved downstream into a slice whose start was one past its end.
 pub const parse_slack: usize = 64;
 
 /// Every way `validate` / `validateCertificate` can reject an input. All are
@@ -109,6 +124,16 @@ pub const Error = error{
     /// `validateCertificate` only: the outer element is not a single
     /// `SEQUENCE` that exactly fills the buffer.
     NotCertificate,
+    /// A BIT STRING with no content octets at all. X.690 §8.6.2.3 requires the
+    /// initial (unused-bits) octet to be present even for an empty bitstring,
+    /// so zero content octets is invalid encoding — and std's `parseBitString`
+    /// reads that octet unconditionally and returns `start + 1` regardless, so
+    /// accepting it yields a slice whose start is one past its end.
+    EmptyBitString,
+    /// `safeCertificate` only: a position `std.crypto.Certificate.parse`
+    /// descends into holds a PRIMITIVE element, whose interior this validator
+    /// never examined. See `requireStdDescentPoints`.
+    PrimitiveWhereStdDescends,
 };
 
 const Header = struct {
@@ -163,6 +188,16 @@ fn walk(bytes: []const u8, start: usize, end: usize, depth: u8) Error!void {
     var i = start;
     while (i < end) {
         const h = try decodeHeader(bytes, i, end);
+        // X.690 §8.6.2.3: a BIT STRING always carries its initial unused-bits
+        // octet, so zero content octets is malformed. It has to be rejected
+        // here rather than left to std: `parseBitString` reads that octet
+        // without checking it exists and returns `start + 1` unconditionally,
+        // so an empty BIT STRING yields a slice whose start is one past its
+        // end — a panic in safe modes, a `len` of 2^32-1 in ReleaseFast. The
+        // type check std makes reads only the tag NUMBER, so any class with
+        // tag number 3 reaches it, not just the universal `0x03`.
+        if (!h.constructed and bytes[i] & 0x1f == 0x03 and h.content_end == h.content_start)
+            return error.EmptyBitString;
         if (h.constructed) try walk(bytes, h.content_start, h.content_end, depth - 1);
         i = h.content_end;
     }
@@ -179,9 +214,14 @@ pub fn validate(bytes: []const u8) Error!void {
 
 /// `validate`, additionally requiring the input to be a single `SEQUENCE` that
 /// exactly fills the buffer — i.e. shaped like `Certificate ::= SEQUENCE`.
-/// This does not prove the input *is* a valid certificate (that is std's job,
-/// via `safeCertificate`); it proves it is safe to hand to std's parser once
-/// padded.
+///
+/// This does **not** on its own make the input safe to hand to
+/// `std.crypto.Certificate.parse`, and must not be read as doing so: a tiling
+/// proof says nothing about the interior of a PRIMITIVE element, and std
+/// descends into an element's content by FIELD POSITION rather than by the
+/// constructed bit. Use `safeCertificate`, which adds
+/// `requireStdDescentPoints` on top of this and is the only function here that
+/// carries the safe-to-parse claim.
 pub fn validateCertificate(bytes: []const u8) Error!void {
     if (bytes.len == 0) return error.Empty;
     const outer = try decodeHeader(bytes, 0, bytes.len);
@@ -189,6 +229,128 @@ pub fn validateCertificate(bytes: []const u8) Error!void {
     if (bytes[0] != 0x30) return error.NotCertificate;
     if (outer.content_end != bytes.len) return error.NotCertificate;
     return walk(bytes, outer.content_start, outer.content_end, max_depth);
+}
+
+/// `decodeHeader`, additionally requiring the element to be constructed —
+/// the precondition every position in `requireStdDescentPoints` shares.
+fn constructedAt(bytes: []const u8, pos: usize, limit: usize) Error!Header {
+    const h = try decodeHeader(bytes, pos, limit);
+    if (!h.constructed) return error.PrimitiveWhereStdDescends;
+    return h;
+}
+
+/// Require a constructed element at every position `std.crypto.Certificate.parse`
+/// descends into an element's CONTENT.
+///
+/// **Why `walk` alone is not enough, and why the padding does not help.**
+/// `walk` descends into constructed elements only — the right rule for DER,
+/// the wrong one for std. `parse` walks into an element's content at a fixed
+/// set of FIELD POSITIONS and does so whether or not the constructed bit is
+/// set. Put a primitive element at one of them and std reads a TLV out of an
+/// interior this validator never examined, then computes `start + declared_length`
+/// with no clamp. Nine bytes suffice: `30 07 04 05 30 83 01 00 00` is a
+/// `SEQUENCE` holding a primitive `OCTET STRING` whose content declares a
+/// 65536-byte length, and std indexes at offset 65545. `parse_slack` cannot
+/// absorb that — it is not a boundary probe but an attacker-chosen 32-bit
+/// length. Shaped differently, the same trick makes `parse` return a `Parsed`
+/// whose `pub_key_slice` ends far outside the buffer, which the caller then
+/// hands to a signature verifier as key material.
+///
+/// **Why this closes it.** If every descent lands on a constructed element,
+/// it lands in a region `walk` tiled; every element `parse` then sees is one
+/// this validator already proved in-bounds, and so is every slice in the
+/// returned `Parsed`. Conforming certificates are unaffected — every position
+/// below is a SEQUENCE or SET in RFC 5280 §4.1.
+///
+/// ⚠ This mirrors `std.crypto.Certificate.parse` as of Zig 0.16. It is a
+/// coupling, and a deliberate one: the alternative is to stop promising that
+/// `safeCertificate`'s result is safe to `parse`. If std's walk gains a
+/// descent point, this must gain it too — the regression tests below pin the
+/// shapes, not the coupling.
+fn requireStdDescentPoints(bytes: []const u8, certificate: Header) Error!void {
+    const b = bytes;
+    const tbs = try constructedAt(b, certificate.content_start, certificate.content_end);
+    const lim = tbs.content_end;
+
+    // TBSCertificate ::= SEQUENCE { version [0] EXPLICIT DEFAULT v1,
+    //   serialNumber, signature, issuer, validity, subject,
+    //   subjectPublicKeyInfo, ... }
+    var pos = tbs.content_start;
+    const first = try decodeHeader(b, pos, lim);
+    // std reads the version only to decide v1 vs v2/v3; `parseVersion` returns
+    // v1 for anything that is not the `[0]` tag, and requires exactly three
+    // content octets when it is.
+    const tagged_version = b[pos] == 0xa0;
+    var version_is_v1 = true;
+    if (tagged_version) {
+        version_is_v1 = first.content_end - first.content_start != 3 or
+            std.mem.eql(u8, b[first.content_start..first.content_end], "\x02\x01\x00");
+        pos = first.content_end; // -> serialNumber
+    }
+    // serialNumber -> signature -> issuer. std descends into none of the
+    // three: it compares `issuer` as raw bytes and never walks its RDNs.
+    var f = try decodeHeader(b, pos, lim);
+    for (0..2) |_| {
+        pos = f.content_end;
+        f = try decodeHeader(b, pos, lim);
+    }
+    pos = f.content_end;
+
+    // validity — std parses notBefore/notAfter from inside it.
+    const validity = try constructedAt(b, pos, lim);
+    // subject — std walks its RDNSequence looking for commonName.
+    const subject = try constructedAt(b, validity.content_end, lim);
+    // subjectPublicKeyInfo, and the AlgorithmIdentifier std descends into.
+    const spki = try constructedAt(b, subject.content_end, lim);
+    _ = try constructedAt(b, spki.content_start, spki.content_end);
+
+    // RDNSequence ::= SEQUENCE OF RelativeDistinguishedName ::= SET OF
+    // AttributeTypeAndValue ::= SEQUENCE { type, value }. std descends two
+    // levels; the type/value pair inside are read as siblings, not descended.
+    var name_i = subject.content_start;
+    while (name_i < subject.content_end) {
+        const rdn = try constructedAt(b, name_i, subject.content_end);
+        var rdn_i = rdn.content_start;
+        while (rdn_i < rdn.content_end) {
+            const atav = try constructedAt(b, rdn_i, rdn.content_end);
+            rdn_i = atav.content_end;
+        }
+        name_i = rdn.content_end;
+    }
+
+    // signatureAlgorithm — std descends to read its OID.
+    _ = try constructedAt(b, tbs.content_end, certificate.content_end);
+
+    // Extensions. std reaches them only for a non-v1 certificate that has a
+    // field after subjectPublicKeyInfo, and descends only when that field's
+    // tag NUMBER is 3 (it compares against `.bitstring`, which is the tag
+    // number alone — so the context-specific `[3]` matches).
+    if (version_is_v1) return;
+    if (spki.content_end >= tbs.content_end) return;
+    if (b[spki.content_end] & 0x1f != 0x03) return;
+    const outer_extensions = try constructedAt(b, spki.content_end, tbs.content_end);
+    const extensions = try constructedAt(b, outer_extensions.content_start, outer_extensions.content_end);
+
+    var ext_i = extensions.content_start;
+    while (ext_i < extensions.content_end) {
+        const extension = try constructedAt(b, ext_i, extensions.content_end);
+        ext_i = extension.content_end;
+
+        // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE,
+        //   extnValue OCTET STRING }. RFC 5280 §4.1: extnValue holds the DER
+        // encoding of the extension's own value, so it must tile — and it has
+        // to, because `Parsed.verifyHostName` parses TLVs straight out of the
+        // subjectAltName extension's content, one more descent into a
+        // primitive's interior.
+        const oid = try decodeHeader(b, extension.content_start, extension.content_end);
+        if (oid.content_end >= extension.content_end) continue;
+        const after_oid = try decodeHeader(b, oid.content_end, extension.content_end);
+        const value = if (b[oid.content_end] & 0x1f != 0x01) after_oid else v: {
+            if (after_oid.content_end >= extension.content_end) continue;
+            break :v try decodeHeader(b, after_oid.content_end, extension.content_end);
+        };
+        try walk(b, value.content_start, value.content_end, max_depth);
+    }
 }
 
 pub const SafeCertificateError = Error || error{
@@ -216,6 +378,11 @@ pub fn safeCertificate(certificate_der: []const u8, scratch: []u8) SafeCertifica
     if (certificate_der.len > max_certificate_len) return error.TooLarge;
     if (scratch.len < certificate_der.len + parse_slack) return error.ScratchTooSmall;
     try validateCertificate(certificate_der);
+    // Well-formedness is not enough on its own: std descends into an element's
+    // content at fixed FIELD POSITIONS regardless of the constructed bit, so a
+    // primitive parked at one of them hides an interior `validateCertificate`
+    // never examined. See `requireStdDescentPoints`.
+    try requireStdDescentPoints(certificate_der, try decodeHeader(certificate_der, 0, certificate_der.len));
     @memcpy(scratch[0..certificate_der.len], certificate_der);
     @memset(scratch[certificate_der.len..][0..parse_slack], 0);
     return .{ .buffer = scratch[0 .. certificate_der.len + parse_slack], .index = 0 };
@@ -510,14 +677,68 @@ test "regression: the std hazard is neutralised (verified panic out of band)" {
     // would abort the test binary. See SPEC.md.) Routed through the guard it is
     // a clean typed error in every optimisation mode.
     const hostile: []const u8 = &.{ 0x30, 0x02, 0x30, 0x00 };
-    // The input is well-formed and certificate-shaped: the guard does not
-    // reject it structurally...
+    // Well-formed and certificate-shaped, so the tiling check accepts it...
     try validateCertificate(hostile);
-    // ...but the validated, padded copy makes std's parse total: it now
-    // reaches a clean typed error instead of walking off the end.
+    // ...and it is `safeCertificate` that refuses: the tbsCertificate has no
+    // room for the fields std will walk. This used to be caught one layer
+    // later, by the padding turning std's off-the-end read into an empty TLV;
+    // it is now caught before std runs at all, which is the stronger property
+    // and the one `requireStdDescentPoints` exists to give.
     var scratch: [max_certificate_len + parse_slack]u8 = undefined;
-    const cert = try safeCertificate(hostile, &scratch);
-    try testing.expectError(error.CertificateFieldHasWrongDataType, cert.parse());
+    try testing.expectError(error.Truncated, safeCertificate(hostile, &scratch));
+}
+
+test "regression: a primitive element where std descends is refused (audit 2026-09-01)" {
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+
+    // Nine bytes: `SEQUENCE { OCTET STRING (primitive) { 30 83 01 00 00 } }`.
+    // The tiling check accepts it — the OCTET STRING sits wholly inside the
+    // buffer — but std takes its content as the tbsCertificate and reads a
+    // 65536-byte length out of an interior nothing validated, then indexes at
+    // offset 65545. `parse_slack` cannot absorb an attacker-chosen 32-bit
+    // length, which is why the guard has to refuse the shape instead.
+    const primitive_tbs: []const u8 = &.{ 0x30, 0x07, 0x04, 0x05, 0x30, 0x83, 0x01, 0x00, 0x00 };
+    try validateCertificate(primitive_tbs);
+    try testing.expectError(error.PrimitiveWhereStdDescends, safeCertificate(primitive_tbs, &scratch));
+
+    // The same trick one level deeper, and far more dangerous: a real
+    // SubjectPublicKeyInfo wrapped in a primitive OCTET STRING, holding a BIT
+    // STRING that declares 256 content octets with one present. Before the
+    // fix this certificate PARSED SUCCESSFULLY and handed the caller a
+    // `pub_key_slice` ending 172 bytes past the buffer — key material read
+    // from whatever followed the scratch copy.
+    const ec_algid = [_]u8{ 0x30, 0x13 } ++
+        [_]u8{ 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 } ++ // ecPublicKey
+        [_]u8{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }; // prime256v1
+    const algid_sha256rsa = [_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00 };
+    const validity_der = [_]u8{ 0x30, 0x1e, 0x17, 0x0d } ++ "250101000000Z".* ++
+        [_]u8{ 0x17, 0x0d } ++ "350101000000Z".*;
+    const spki_wrapped = [_]u8{ 0x04, 0x1a } ++ ec_algid ++ [_]u8{ 0x03, 0x82, 0x01, 0x00, 0x00 };
+    const tbs_content = [_]u8{ 0xa0, 0x03, 0x02, 0x01, 0x02 } ++ // version v3
+        [_]u8{ 0x02, 0x01, 0x01 } ++ // serialNumber
+        algid_sha256rsa ++ // signature
+        [_]u8{ 0x30, 0x00 } ++ // issuer
+        validity_der ++
+        [_]u8{ 0x30, 0x00 } ++ // subject
+        spki_wrapped;
+    const tbs = [_]u8{ 0x30, tbs_content.len } ++ tbs_content;
+    const body = tbs ++ algid_sha256rsa ++ [_]u8{ 0x03, 0x02, 0x00, 0x00 };
+    const forged_spki = [_]u8{ 0x30, body.len } ++ body;
+
+    try validateCertificate(&forged_spki);
+    try testing.expectError(error.PrimitiveWhereStdDescends, safeCertificate(&forged_spki, &scratch));
+
+    // And the third shape, which no descent rule catches because every
+    // container here IS constructed: an empty signatureValue. std's
+    // `parseBitString` reads the unused-bits octet without checking one
+    // exists and returns `start + 1` regardless, so the resulting
+    // `signature_slice` has its start one past its end — a panic in safe
+    // modes, a 4 GB slice in ReleaseFast. X.690 §8.6.2.3 makes zero content
+    // octets invalid encoding, so `walk` rejects it outright.
+    const empty_sig_body = tbs ++ algid_sha256rsa ++ [_]u8{ 0x03, 0x00 };
+    const empty_sig = [_]u8{ 0x30, empty_sig_body.len } ++ empty_sig_body;
+    try testing.expectError(error.EmptyBitString, validateCertificate(&empty_sig));
+    try testing.expectError(error.EmptyBitString, safeCertificate(&empty_sig, &scratch));
 }
 
 // ── spkiOf ──────────────────────────────────────────────────────────────────

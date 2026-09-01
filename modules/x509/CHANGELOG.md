@@ -5,6 +5,76 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-01** — **Security audit: the DER guard did not guard, in three
+  separate ways.** `safe.zig` advertised `safeCertificate` as returning a
+  certificate "safe to hand to `std.crypto.Certificate.parse` without any risk
+  of panic, out-of-bounds read, or segfault regardless of optimisation mode".
+  It was not, and the argument in `SPEC.md` that said so was unsound.
+
+  `walk` descends into **constructed** elements; `Certificate.parse` descends
+  into an element's content by **field position**, whatever the constructed
+  bit says. Nine bytes exploit the difference: `30 07 04 05 30 83 01 00 00` is
+  a `SEQUENCE` holding a primitive `OCTET STRING` whose content declares 65536
+  bytes. It passed the guard, and std then indexed at offset 65545 — abort in
+  Debug, segfault in ReleaseFast. Reshaped, the same trick made `parse` return
+  **successfully** with a `pub_key_slice` ending 172 bytes past the buffer,
+  which the caller hands to a signature verifier as key material. `parse_slack`
+  cannot help: an attacker-chosen 32-bit length is not a boundary probe.
+  `requireStdDescentPoints` now requires a constructed element at every
+  position std descends into, which is what carries the tiling proof over to
+  std's walk. It runs in `safeCertificate`; `validateCertificate` keeps the
+  narrower well-formedness contract and its doc no longer claims otherwise.
+
+  Third shape, needing no primitive at all: an **empty BIT STRING**. std's
+  `parseBitString` reads the unused-bits octet without checking one exists and
+  returns `start + 1` regardless, so `03 00` yields a slice whose start is one
+  past its end. Here the padding made things *worse* — it satisfied the
+  unguarded read, so instead of aborting loudly the corruption surfaced
+  downstream as a 4 GB `Parsed.signature()` in ReleaseFast. X.690 §8.6.2.3
+  requires that octet, so `walk` rejects the encoding.
+
+  Reachable from `iec62351`'s TLS profile, `opcua`'s `SenderCertificate`
+  handling, `webauthn`'s `x5c[0]` and `dtls`'s anchor check — all peer bytes.
+
+- **2026-09-01** — **`chain.zig` had the same BIT STRING defect and does not
+  use the guard at all.** `parseShape` calls std's `parseBitString` on the
+  SubjectPublicKeyInfo and signatureValue elements, both attacker-controlled.
+  `verifyChain` reaches the first of them via `buildPath` on the peer's leaf
+  certificate **before any signature is checked**, and `verifyMlDsaLink` /
+  `verifySlhDsaLink` / `verifyPssLink` each call `parseShape` as their first
+  statement. Now routed through a local `parseBitStringSafe`; two regression
+  tests drive a crafted certificate through the public `verifyChain` and abort
+  the test binary when the guard is removed.
+
+- **2026-09-01** — **The public single-link PQ helpers now chain the issuer's
+  name.** `verifyMlDsaLink` and `verifySlhDsaLink` checked the parameter set,
+  both lengths, the validity window and the signature, but not RFC 5280
+  §6.1.3 (a)(4) — so an issuer whose subject DN is not the subject's issuer DN
+  was accepted. `verifyChain` was never affected (path building only offers
+  candidates whose subject matches), but the doc comment invites direct use and
+  their std counterpart `Parsed.verify` makes the check. Ordered after the
+  parameter-set comparison so an algorithm mismatch is still reported as one.
+
+- **2026-09-01** — **Three checks the SPEC said were pinned by tests, and were
+  not.** SPEC claimed each of the ML-DSA path's four checks went red when
+  removed; the key-length and signature-length comparisons did not, and the
+  SLH-DSA validity window had no test while SPEC called the two paths "the
+  same shape". They guard slice-to-array coercions, so in ReleaseFast their
+  absence is an out-of-bounds read of up to 4627 bytes fed into verification.
+  Tests added by renaming a real certificate's algorithm OIDs rather than by
+  DER surgery — SHA2-128s and SHA2-128f share a key length and differ only in
+  signature size, which is what makes the signature-length check expressible.
+
+- **2026-09-01** — **Docs: the name-constraint gap fails CLOSED, not open.**
+  `chain.zig`, `root.zig` and `SPEC.md` all described an unmatchable
+  `GeneralName` type (`rfc822Name`, `uniformResourceIdentifier`) as a
+  fail-*open* bypass. Since the `constraintTypeSupported` change both the
+  excluded and the permitted side reject. The real exposure is the opposite
+  one and was undocumented: a CA carrying an rfc822Name constraint turns away
+  every subordinate certificate with an rfc822Name SAN, including one inside
+  the permitted subtree.
+
+
 - **2026-08-22** — **SLH-DSA (RFC 9882) certificates verify — all twelve FIPS
   205 parameter sets.** `x509.verifySlhDsaLink` joins the ML-DSA path added
   the same day; the module gained a `slhdsa` dependency, since std has no

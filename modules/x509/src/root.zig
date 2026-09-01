@@ -122,8 +122,8 @@
 //! `rfc822Name`/`uniformResourceIdentifier`/other `GeneralName` types are
 //! recognized by `checkNameConstraints` but have no matching rule
 //! implemented (only `dNSName`, `directoryName`, `iPAddress` per RFC 5280
-//! §4.2.1.10) — a constraint of one of those types is parsed but never
-//! matched, which is a fail-*open* gap for that specific name type;
+//! §4.2.1.10), so a constraint of one of those types fails **closed** on both
+//! the excluded and the permitted side — a false reject rather than a bypass;
 //! flagged here and in `SPEC.md`.
 //!
 //! Provenance: clean-room from RFC 5280 (X.509 v3 / PKIX Certificate and CRL

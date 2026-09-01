@@ -32,9 +32,15 @@
 //! rely on policy OIDs). A consumer needing either must add it explicitly.
 //! `rfc822Name`/`uniformResourceIdentifier`/other `GeneralName` types are
 //! recognized by `checkNameConstraints` but have no matching rule implemented
-//! (only `dNSName`, `directoryName`, `iPAddress` per RFC 5280 §4.2.1.10) — a
-//! constraint of one of those types is parsed but never matched, which is a
-//! fail-*open* gap for that specific name type; flagged here and in SPEC.md.
+//! (only `dNSName`, `directoryName`, `iPAddress` per RFC 5280 §4.2.1.10). A
+//! constraint of one of those types therefore fails **closed**, on both sides:
+//! an excluded subtree of an unmatchable type rejects any certificate bearing
+//! a name of that type (this module cannot prove the name lies outside it),
+//! and a permitted subtree rejects by the same per-type default-deny. The
+//! consequence is a false REJECT, not a bypass — a CA carrying an rfc822Name
+//! constraint turns away every subordinate certificate with an rfc822Name SAN,
+//! including one squarely inside the permitted subtree. Flagged here and in
+//! SPEC.md.
 
 const std = @import("std");
 const Certificate = std.crypto.Certificate;
@@ -506,6 +512,17 @@ pub fn verifyMlDsaLink(
         else => return error.CertificateSignatureAlgorithmMismatch,
     }
 
+    // RFC 5280 §6.1.3 (a)(4): the issuer's subject DN must be the subject's
+    // issuer DN. `verifyChain` already guarantees it — `findIssuerAndVerify`
+    // only offers candidates whose subject matches — but these two functions
+    // are public and documented as the way to check a single link without
+    // building a path, and their std counterpart (`Parsed.verify`) makes the
+    // check. Without it they are not the parity that doc comment claims.
+    // Ordered after the parameter-set comparison so an algorithm mismatch is
+    // still reported as one rather than being masked by a name mismatch.
+    if (!std.mem.eql(u8, subject_shape.issuer, issuer_shape.subject))
+        return error.CertificateIssuerMismatch;
+
     const key_bytes = issuer_der[issuer_shape.pub_key_slice.start..issuer_shape.pub_key_slice.end];
 
     switch (set) {
@@ -561,6 +578,17 @@ pub fn verifySlhDsaLink(
         .slh_dsa => |issuer_set| if (issuer_set != set) return error.CertificateSignatureAlgorithmMismatch,
         else => return error.CertificateSignatureAlgorithmMismatch,
     }
+
+    // RFC 5280 §6.1.3 (a)(4): the issuer's subject DN must be the subject's
+    // issuer DN. `verifyChain` already guarantees it — `findIssuerAndVerify`
+    // only offers candidates whose subject matches — but these two functions
+    // are public and documented as the way to check a single link without
+    // building a path, and their std counterpart (`Parsed.verify`) makes the
+    // check. Without it they are not the parity that doc comment claims.
+    // Ordered after the parameter-set comparison so an algorithm mismatch is
+    // still reported as one rather than being masked by a name mismatch.
+    if (!std.mem.eql(u8, subject_shape.issuer, issuer_shape.subject))
+        return error.CertificateIssuerMismatch;
 
     const key_bytes = issuer_der[issuer_shape.pub_key_slice.start..issuer_shape.pub_key_slice.end];
 
@@ -631,6 +659,25 @@ const Shape = struct {
     pub_key_slice: der.Element.Slice,
 };
 
+/// `std.crypto.Certificate.parseBitString` with the precondition it is missing.
+///
+/// std reads the BIT STRING's unused-bits octet as `cert.buffer[elem.slice.start]`
+/// without first checking the element has any content, and returns
+/// `.{ .start = start + 1, .end = end }` regardless. On a zero-length BIT
+/// STRING that is either an index past the buffer (when the element ends the
+/// buffer) or a returned slice whose start is one past its end — and the
+/// caller then slices with it, which panics in safe modes and yields a `len`
+/// of 2^32-1 in ReleaseFast. Same bug class as the two zero-length-BOOLEAN
+/// reads `extensions.zig` guards against; the guard has to live here because
+/// the unchecked primitive is std's.
+///
+/// X.690 §8.6.2.3 requires the initial octet to be present even for an empty
+/// bitstring, so zero content octets is malformed encoding, not an edge case.
+fn parseBitStringSafe(cert: Certificate, elem: der.Element) Certificate.ParseError!der.Element.Slice {
+    if (elem.slice.start >= elem.slice.end) return error.CertificateHasInvalidBitString;
+    return Certificate.parseBitString(cert, elem);
+}
+
 fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
     const bytes = cert.buffer;
     const certificate = try extensions.parseElement(bytes, cert.index);
@@ -671,7 +718,7 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
         },
     };
     const pub_key_elem = try extensions.parseElement(bytes, pub_key_alg_seq.slice.end);
-    const pub_key_slice = try Certificate.parseBitString(cert, pub_key_elem);
+    const pub_key_slice = try parseBitStringSafe(cert, pub_key_elem);
 
     const sig_algo = try extensions.parseElement(bytes, tbs_certificate.slice.end);
     const algo_oid_elem = try extensions.parseElement(bytes, sig_algo.slice.start);
@@ -681,7 +728,7 @@ fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
         break :params bytes[algo_oid_elem.slice.end..params_elem.slice.end];
     } else null;
     const sig_elem = try extensions.parseElement(bytes, sig_algo.slice.end);
-    const signature_slice = try Certificate.parseBitString(cert, sig_elem);
+    const signature_slice = try parseBitStringSafe(cert, sig_elem);
 
     return .{
         .issuer = bytes[issuer.slice.start..issuer.slice.end],
@@ -1231,10 +1278,18 @@ pub fn verifyPssLink(subject_der: CertDer, issuer_pub_key: rsa.PublicKey, now_se
 // `parameters` field — attacker-controlled DER) entirely through
 // `extensions.parseElement`, the same bounds-safe wrapper `extensions.zig`
 // fuzzes directly; no call to `std.crypto.Certificate.parse` sits in front
-// of it. `parseShape` (the other raw-DER walk in this file, used by
-// `verifyPssLink`) is private and not independently reachable without a
-// live `rsa.PublicKey`/hash comparison, so it is exercised only indirectly
-// through the higher-level chain tests in `chain_test.zig`, not fuzzed here.
+// of it.
+//
+// `parseShape` (the other raw-DER walk in this file) is private, but it is
+// NOT hard to reach: `verifyMlDsaLink`, `verifySlhDsaLink` and `verifyPssLink`
+// are all public and all call it as their first statement, before any key
+// material is looked at, and `verifyChain` runs it over every entry of the
+// peer-supplied chain before a single signature is checked. An earlier version
+// of this comment claimed it was "not independently reachable without a live
+// `rsa.PublicKey`/hash comparison" and used that to justify leaving it
+// unfuzzed — the post-quantum additions made the claim false, and the two
+// zero-length BIT STRING regressions in `chain_test.zig` are what it missed.
+// It is still exercised mainly through the higher-level chain tests.
 const testing = std.testing;
 
 test "fuzz: parsePssParams never panics on arbitrary bytes" {
