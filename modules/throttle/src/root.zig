@@ -190,7 +190,16 @@ pub const Throttle = struct {
     pub fn acquire(t: *Throttle) bool {
         if (t.tryAcquire()) return true;
         if (t.options.max_wait_ms == 0) return false;
-        const io = t.options.io.?; // asserted at init
+        // `init` asserts this, and `std.debug.assert` is compiled out in
+        // ReleaseFast — where `.?` on a null optional is illegal behaviour,
+        // not a panic. Shedding instead is this module's own release-mode
+        // shape for a violated precondition (`release` saturates at 0 rather
+        // than wrapping), and it is the safe direction: a caller who asked
+        // for a bounded wait without an `Io` gets exactly the behaviour of
+        // `max_wait_ms = 0`. The README's new "Without the router" section
+        // invites direct construction by callers who never read the module
+        // doc, which is what turned this from theory into a live edge.
+        const io = t.options.io orelse return false;
 
         // Join the (bounded) waiter set. The increment must precede the
         // generation snapshot below: `release` only bumps/wakes when it
@@ -1080,4 +1089,15 @@ test "integration: N slots occupied → 503 + Retry-After; a freed slot serves a
     }
     try testing.expectEqual(200, s1.load(.seq_cst)); // both blocked requests completed fine
     try testing.expectEqual(200, s2.load(.seq_cst));
+}
+
+test "acquire sheds instead of unwrapping a null io when the precondition is violated" {
+    // `init`'s `io != null` check is a Debug-only assert, so ReleaseFast
+    // reached `.?` on a null optional -- illegal behaviour rather than a
+    // panic. Shedding matches what `release` already does for its own
+    // violated precondition.
+    var t: Throttle = .{ .options = .{ .max_in_flight = 1, .max_wait_ms = 50, .io = null } };
+    try testing.expect(t.acquire()); // the free slot still goes through tryAcquire
+    try testing.expect(!t.acquire()); // full + no io → shed, not a wild read
+    t.release();
 }

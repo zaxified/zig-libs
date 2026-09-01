@@ -572,6 +572,26 @@ pub const RaftServer = struct {
         }
         if (ns.role != .leader or resp.term != ns.current_term) return;
         if (resp.success) {
+            // `match_index` is an unconstrained wire `u64` — `decode` bounds
+            // the term and nothing else — and the line below is an
+            // unconditional `+ 1` on it. That is the exact shape `max_term`
+            // exists to rule out for `current_term` (see types.zig): a panic
+            // under Debug/ReleaseSafe, and under ReleaseFast a wrap to 0
+            // whose `prev_index = next - 1` underflows straight into
+            // `log.get(0).?`, which is `null` by contract.
+            //
+            // Rejected, not clamped. Clamping to `lastIndex()` would be the
+            // worse bug: it would record that this follower has matched the
+            // WHOLE log, and `leaderCommitIndex` counts exactly those
+            // match_index values for its majority — so one forged response
+            // could commit entries no majority ever replicated. A crash is
+            // an availability problem; that would be a safety violation.
+            // An honest follower can never match more than the leader holds,
+            // so a larger value is corruption or hostility either way.
+            if (resp.match_index > ns.log.lastIndex()) {
+                self.malformed_dropped += 1;
+                return;
+            }
             ns.match_index[from] = resp.match_index;
             ns.next_index[from] = resp.match_index + 1;
             ns.match_index[node] = ns.log.lastIndex();
@@ -1436,4 +1456,43 @@ test "real: the model-checked cluster never drops a message of its own making" {
         defer gr.trace.deinit();
         try testing.expectEqual(@as(u64, 0), srv.malformed_dropped);
     }
+}
+
+test "a leader rejects an AppendEntriesResp claiming more log than it has" {
+    // `match_index` is an unconstrained wire u64 and `decode` bounds only the
+    // term, so `next_index = match_index + 1` was an unconditional increment
+    // on peer-controlled input -- the shape `max_term` exists to rule out for
+    // `current_term`. Rejected rather than clamped: clamping would record the
+    // follower as having matched the WHOLE log, and `leaderCommitIndex`
+    // counts exactly those values for its majority, so a forged response
+    // could commit entries no majority ever replicated.
+    const gpa = testing.allocator;
+    var srv = try RaftServer.init(gpa, CLUSTER_N, DEFAULT_CFG);
+    defer srv.deinit(gpa);
+
+    var log: netsim.Log = .{};
+    defer log.deinit(gpa);
+    var sim = netsim.Sim.init(gpa, 0, srv.protocol(), &log, UNTIL, 10_000);
+    defer sim.deinit();
+    try scenario(&sim);
+
+    // Put node 0 in the one state that reaches the arithmetic.
+    const ns = &srv.nodes[0];
+    ns.role = .leader;
+    ns.current_term = 1;
+
+    var payload = [_]u8{0} ** 18;
+    payload[0] = @intFromEnum(types.RpcTag.append_entries_resp);
+    std.mem.writeInt(u64, payload[1..9], 1, .little); // term == leader's
+    payload[9] = 1; // success
+    std.mem.writeInt(u64, payload[10..18], std.math.maxInt(u64), .little);
+
+    const before = srv.malformed_dropped;
+    const p = srv.protocol();
+    try p.onMessageFn(p.ctx, &sim, 0, 1, &payload);
+
+    // Dropped and counted, and nothing about the peer's replication state moved.
+    try testing.expectEqual(before + 1, srv.malformed_dropped);
+    try testing.expectEqual(@as(LogIndex, 0), ns.match_index[1]);
+    try testing.expect(ns.commit_index == 0);
 }

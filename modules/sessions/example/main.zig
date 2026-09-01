@@ -48,7 +48,7 @@ pub fn main() !void {
     var fake_clock: FakeClock = .{};
     var store: sessions.RamcacheStore = .{ .cache = &cache, .clock = fake_clock.clock() };
 
-    var m = sessions.Manager.init(gpa, store.store(), .{
+    var m = try sessions.Manager.init(gpa, store.store(), .{
         .io = io,
         .clock = fake_clock.clock(),
         .idle_timeout_ns = 500 * std.time.ns_per_s,

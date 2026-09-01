@@ -100,8 +100,9 @@ pub const csrf_token_hex_len = csrf.token_hex_len;
 pub const max_id_bytes = 64;
 
 /// Hard floor on `Options.id_bytes` (128 bits of CSPRNG entropy).
-/// `Manager.init` rejects anything below this — a caller-configured
-/// `id_bytes` of, say, 1 (8 bits) would make the session id brute-forceable.
+/// `Manager.init` rejects anything below this (a real error return, in every
+/// build mode) — a caller-configured `id_bytes` of, say, 1 (8 bits) would
+/// make the session id brute-forceable.
 pub const min_id_bytes = 16;
 
 /// Largest application payload one session may carry (kept inline in the
@@ -445,12 +446,29 @@ pub const Manager = struct {
     secure: bool,
 
     /// Build a manager. `gpa` is used only for the short-lived decode copies
-    /// `Store.get` hands back (the store owns its own storage). Asserts
-    /// `min_id_bytes <= id_bytes <= max_id_bytes` — an `id_bytes` below the
-    /// floor would make session ids brute-forceable.
-    pub fn init(gpa: Allocator, store: Store, options: Options) Manager {
-        std.debug.assert(options.id_bytes >= min_id_bytes and options.id_bytes <= max_id_bytes);
-        std.debug.assert(options.cookie_name.len != 0);
+    /// `Store.get` hands back (the store owns its own storage).
+    ///
+    /// Rejects `id_bytes` outside `[min_id_bytes, max_id_bytes]` and an empty
+    /// `cookie_name`. This used to be two `std.debug.assert`s while the docs
+    /// said "rejects anything below this" — and `std.debug.assert` is
+    /// compiled out in ReleaseFast, which is a mode this module's own suite
+    /// runs in. Both halves of the range mattered: below the floor the
+    /// release build silently minted brute-forceable session ids (the very
+    /// thing the floor exists to prevent), and above the ceiling `newId`
+    /// wrote `id_bytes` random bytes into its `[max_id_bytes]u8` stack array
+    /// and `id_bytes * 2` hex digits into a fixed `id_buf`, then handed the
+    /// out-of-bounds slice to the store and the `Set-Cookie` header.
+    pub const InitError = error{
+        /// `id_bytes` is below `min_id_bytes` (brute-forceable ids) or above
+        /// `max_id_bytes` (overflows the id buffers).
+        InvalidIdBytes,
+        EmptyCookieName,
+    };
+
+    pub fn init(gpa: Allocator, store: Store, options: Options) InitError!Manager {
+        if (options.id_bytes < min_id_bytes or options.id_bytes > max_id_bytes)
+            return error.InvalidIdBytes;
+        if (options.cookie_name.len == 0) return error.EmptyCookieName;
         return .{
             .store = store,
             .gpa = gpa,
@@ -755,8 +773,8 @@ const Env = struct {
     fn deinit(e: *Env) void {
         e.cache.deinit();
     }
-    fn manager(e: *Env, opts: struct { idle: i64 = 0, absolute: i64 = 0 }) Manager {
-        return Manager.init(testing.allocator, e.store.store(), .{
+    fn manager(e: *Env, opts: struct { idle: i64 = 0, absolute: i64 = 0 }) !Manager {
+        return try Manager.init(testing.allocator, e.store.store(), .{
             .io = testing.io, // real CSPRNG-backed test Io
             .clock = e.clk.clock(),
             .idle_timeout_ns = opts.idle,
@@ -779,7 +797,7 @@ test "create → seed → lookup round-trips id and data" {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
 
     var s: Session = .{};
     m.create(&s);
@@ -801,7 +819,7 @@ test "forged / unknown session id → absent" {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
 
     var loaded: Session = .{};
     try testing.expectEqual(Manager.LoadResult.absent, m.lookup("deadbeefdeadbeefdeadbeefdeadbeef", &loaded));
@@ -811,7 +829,7 @@ test "expired session (idle window) → expired + evicted" {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 500, .absolute = 100_000 });
+    var m = try env.manager(.{ .idle = 500, .absolute = 100_000 });
 
     var s: Session = .{};
     m.create(&s);
@@ -837,7 +855,7 @@ test "expired session (absolute cap) → expired even when recently active" {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 1_000_000, .absolute = 5_000 });
+    var m = try env.manager(.{ .idle = 1_000_000, .absolute = 5_000 });
 
     var s: Session = .{};
     m.create(&s); // created + last_seen = 1000
@@ -855,7 +873,7 @@ test "regenerate: new id, data carried, old id dead (fixation defense)" {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
 
     var s: Session = .{};
     m.create(&s);
@@ -882,7 +900,7 @@ test "cross-request race: a stale save cannot resurrect a session destroyed by a
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
 
     var s: Session = .{};
     m.create(&s);
@@ -917,7 +935,7 @@ test "cross-request race: a stale save cannot resurrect a session rotated by a c
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
 
     var s: Session = .{};
     m.create(&s);
@@ -958,7 +976,7 @@ test "single-owner save succeeds and bumps the generation; a second concurrent s
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
 
     var s: Session = .{};
     m.create(&s);
@@ -995,20 +1013,20 @@ test "min_id_bytes floor: default and at-floor id_bytes are accepted" {
     env.wire();
     defer env.deinit();
     // Default (32 bytes) — fine.
-    _ = Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io });
+    _ = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io });
     // Exactly at the floor — fine.
-    _ = Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = min_id_bytes });
+    _ = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = min_id_bytes });
     // Exactly at the ceiling — fine.
-    _ = Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = max_id_bytes });
+    _ = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = max_id_bytes });
 }
 
 test "insecure escape hatch drops Secure; default keeps it" {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    const secure = Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io });
+    const secure = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io });
     try testing.expect(secure.secure);
-    const insecure = Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .allow_insecure_cookie = true });
+    const insecure = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .allow_insecure_cookie = true });
     try testing.expect(!insecure.secure);
 }
 
@@ -1064,7 +1082,7 @@ test "Manager.save: the session id in the Set-Cookie survives writeCookie's dead
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
 
     var out_buf: [1024]u8 = undefined;
     var out: Writer = .fixed(&out_buf);
@@ -1164,7 +1182,7 @@ test "middleware: fresh request gets a hardened Set-Cookie; round-trips" {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
     var app = App{ .manager = &m };
 
     var r = router.Router.init(testing.allocator);
@@ -1201,7 +1219,7 @@ test "middleware: revoke expires the cookie and evicts the session" {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
     var app = App{ .manager = &m };
 
     var r = router.Router.init(testing.allocator);
@@ -1242,7 +1260,7 @@ test "middleware: the trailing end-of-request save does not resurrect a session 
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
     var app = App{ .manager = &m };
 
     var r = router.Router.init(testing.allocator);
@@ -1282,7 +1300,7 @@ test "middleware: regenerate mid-request — old id dead, only the new id resolv
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
     var app = App{ .manager = &m };
 
     var r = router.Router.init(testing.allocator);
@@ -1325,7 +1343,7 @@ test "middleware: small response buffer forces an early flush — no cookie-buff
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
     var app = App{ .manager = &m, .action = .write_big };
 
     var r = router.Router.init(testing.allocator);
@@ -1349,7 +1367,7 @@ fn fuzzSessionRecordDecode(_: void, smith: *std.testing.Smith) !void {
     var env = Env.init();
     env.wire();
     defer env.deinit();
-    var m = env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
 
     var record: [record_header_len + max_session_bytes]u8 = undefined;
     smith.bytes(&record);
@@ -1384,4 +1402,38 @@ fn fuzzCookieParse(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: cookie header parse (as used by Manager.load) never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzCookieParse, .{});
+}
+
+test "Manager.init rejects an out-of-range id_bytes in every build mode" {
+    // The floor and the ceiling were both `std.debug.assert`, which
+    // ReleaseFast compiles out -- and this module's suite runs that mode.
+    // Below the floor the release build silently minted brute-forceable
+    // session ids; above the ceiling `newId` wrote `id_bytes` bytes into a
+    // `[max_id_bytes]u8` stack array and `id_bytes * 2` hex digits into a
+    // fixed `id_buf`, then handed that out-of-bounds slice to the store and
+    // the Set-Cookie header.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+
+    try testing.expectError(error.InvalidIdBytes, Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .id_bytes = min_id_bytes - 1,
+    }));
+    try testing.expectError(error.InvalidIdBytes, Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .id_bytes = max_id_bytes + 1,
+    }));
+    try testing.expectError(error.InvalidIdBytes, Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .id_bytes = 1, // the doc's own example of a brute-forceable value
+    }));
+    try testing.expectError(error.EmptyCookieName, Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .cookie_name = "",
+    }));
+
+    // Both ends of the accepted range still construct.
+    _ = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = min_id_bytes });
+    _ = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .id_bytes = max_id_bytes });
 }
