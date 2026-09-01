@@ -69,13 +69,24 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   COSE label regardless of whether it's encoded as `uint` (non-negative labels like `kty`=1) or
   `negint` (negative labels like `crv`=-1) — COSE labels are RFC 9052/9053 registered small
   integers on both sides of zero.
-- **EC2** (RFC 9053 §7.1: kty=2, params crv=-1/x=-2/y=-3) and **OKP** (§7.2: kty=1, crv=-1/x=-2,
-  no `y`) are the only key types modeled; `parseKey` returns `error.UnsupportedKty` for anything
-  else (RSA, symmetric). Field `x`/`y` are opaque big-endian byte slices — not curve-validated
+- **EC2** (RFC 9053 §7.1: kty=2, params crv=-1/x=-2/y=-3), **OKP** (§7.2: kty=1, crv=-1/x=-2,
+  no `y`) and **AKP** (RFC 9964 §3: kty=7, `pub`=-1, `priv`=-2, ML-DSA at alg -48/-49/-50) are the
+  key types modeled; `parseKey` returns `error.UnsupportedKty` for anything else (RSA, symmetric).
+- ⚠ **COSE parameter labels are scoped to the key type, and the same number means different
+  things.** Label -1 is `crv` for EC2/OKP but `pub` for AKP; -2 is `x` for EC2/OKP but `priv` for
+  AKP. `parseKey` must therefore read every keyed parameter INSIDE its `kty` branch, never before
+  the switch — reading `crv` first would reject every AKP key with a type error on a 1312-byte
+  "curve identifier", and, worse in the other direction, a label read outside its own scope is how
+  a parser ends up handing one key type's bytes to another's consumer.
+- **AKP's parameter set comes from `alg`, which RFC 9964 §3 makes REQUIRED, and is never inferred
+  from `pub.len`.** Inferring would accept a key whose `alg` claims one ML-DSA parameter set while
+  its bytes are another — the same rule `jwt`'s JOSE half of RFC 9964 follows. Field `x`/`y` are opaque big-endian byte slices — not curve-validated
   here, matching `ctap2pin`'s `PublicKey{x,y}` design (the consuming curve module, e.g. `p256`'s
   `Fe.fromBytes`/`fromAffineCoordinates`, does that validation).
-- **`d` (private key, label -4) is never referenced anywhere in this module** — a deliberate scope
-  boundary, not an oversight: this is a verifier/public-key-consumer layer.
+- **No private-key label is referenced anywhere in this module** — a deliberate scope boundary,
+  not an oversight: this is a verifier/public-key-consumer layer. That is `d` at label **-4** for
+  EC2/OKP and `priv` at label **-2** for AKP; naming only -4 would understate the posture, because
+  the AKP private component sits at a label that means `x` under a different `kty`.
 - **`COSE_Sign1`** (`parseSign1`/`encodeSign1`): the bare 4-element array `[protected, unprotected,
   payload, signature]` (RFC 9052 §4.2); `parseSign1` also accepts the same array wrapped in tag 18
   without checking the tag number (a caller that cares can inspect `value.tag.number` first).
@@ -106,15 +117,16 @@ shortest-form) row also re-encodes byte-exact; every "roundtrip: false" (indefin
 checked to decode to the identical logical value as encoding+re-decoding it through this module.
 Two canonical-encoding positive controls assert the *exact* byte sequence of both the default
 (insertion-order) and `canonical = true` (bytewise-sorted) encodings of the same non-trivial map.
-Nine hostile-input cases (truncated multi-byte header, declared array/byte-string length exceeding
+Thirteen hostile-input cases (truncated multi-byte header, declared array/byte-string length exceeding
 available input, a 200-deep nesting bomb against the default 64-deep cap — plus a sanity check that
 ordinary shallow nesting still succeeds, trailing garbage, reserved additional-info, bare `break`,
 wrong-major-type indefinite chunk, invalid UTF-8, empty input) each assert the specific typed
 `DecodeError`, plus an arbitrary-bytes `std.testing.fuzz` test asserting decode never panics.
 `cose.zig` adds its own KATs: EC2/OKP `COSE_Key` round-trip (including a byte-identical re-encode
-check) using the ctap2pin-style field layout, missing-field/unsupported-kty error cases, and
-`COSE_Sign1` round-trip (including a detached-payload and a tag-18-wrapped variant) plus a
-`Sig_structure`-shape check. Verified green in Debug and ReleaseFast; `zig fmt --check modules/cbor`
+check) using the ctap2pin-style field layout, missing-field/unsupported-kty error cases,
+`COSE_Sign1` round-trip (including a detached-payload and a tag-18-wrapped variant), a
+`Sig_structure`-shape check, and the RFC 9964 AKP key type against the RFC's own published
+examples. Verified green in Debug and ReleaseFast; `zig fmt --check modules/cbor`
 clean. Run: `zig build test-cbor`.
 
 **COSE layer external anchor (`cose_kat_test.zig` / `cose_kat_vectors.zig`, added 2026-07-28):**
@@ -162,4 +174,8 @@ in src/root.zig.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** RFC 8949 App. A + RFC 9052 C.2.1 byte-exact vectors, kat_vectors.zig
+**What the tests actually contain.** RFC 8949 App. A (cross-checked against the community
+`cbor/test-vectors` `appendix_a.json`) + RFC 9052 C.2.1 and two `cose-wg/Examples` `sign1-tests`
+vectors including their published `Sig_structure` intermediates + RFC 9964 Appendix A.2's three
+published ML-DSA `COSE_Key`/signature examples — byte-exact, kat_vectors.zig and
+cose_kat_vectors.zig

@@ -177,6 +177,18 @@ pub const DecodeOptions = struct {
     /// maliciously deeply-nested input. RFC 8949 sets no limit; 64 comfortably
     /// covers every real CBOR/COSE structure in this collection (a COSE_Sign1
     /// carrying a COSE_Key is 3–4 levels deep) while bounding stack use.
+    ///
+    /// ⚠ **Raising this converts the guard into the thing it guards against.**
+    /// `decodeValue` is recursive, so the cap is what keeps a depth bomb off
+    /// the stack; past a few thousand levels the recursion overflows it and
+    /// the process dies with SIGSEGV, which no `DecodeError` can report.
+    /// Measured on the audited host (8 MiB stack, audit 2026-09-01) with
+    /// nested `0x81` arrays and `max_depth` raised to match: **Debug 4096 OK /
+    /// 8192 SIGSEGV, ReleaseFast 16384 OK / 32768 SIGSEGV.** The default
+    /// leaves a 64–256× margin. A consumer that "generously" sets this to
+    /// 10 000 has replaced a typed `DepthLimitExceeded` with a crash, on
+    /// input an attacker chooses. Raise it only against a stack you have
+    /// measured, and never past low thousands.
     max_depth: u32 = 64,
 };
 
@@ -503,6 +515,15 @@ pub const EncodeOptions = struct {
 /// Encode `value` to freshly `allocator`-owned bytes.
 pub fn encode(allocator: Allocator, value: Value, options: EncodeOptions) EncodeError![]u8 {
     var list: std.ArrayList(u8) = .empty;
+    // Without this, a failure anywhere inside `encodeInto` -- or in
+    // `toOwnedSlice`'s own final resize -- returns `OutOfMemory` and abandons
+    // every byte already produced. Third instance of this class in this
+    // module: `decode`'s partial tree (audit 2026-08-06) and `encodeMap`'s
+    // canonical scratch (`14ef4331`) were the first two, and this was the one
+    // entry point left. Measured before the fix with
+    // `std.testing.checkAllAllocationFailures`: 129 bytes allocated, 0 freed,
+    // on both the plain and the canonical path.
+    errdefer list.deinit(allocator);
     try encodeInto(&list, allocator, value, options);
     return try list.toOwnedSlice(allocator);
 }

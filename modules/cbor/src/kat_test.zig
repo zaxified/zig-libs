@@ -443,3 +443,144 @@ test "a decoded tree can be freed through the public API, with no arena" {
     try testing.expectEqualStrings("txt", v.map[1].value.tag.value.text);
     cbor.freeValue(testing.allocator, v);
 }
+
+// ── audit 2026-09-01: guards that were correct but held by nothing ─────────
+
+test "boundary: peekByte at end of input is Truncated, never a one-past-end read" {
+    // `readBytes`' bound got its boundary test when F1 was closed in 2026-08;
+    // `peekByte`'s did not. Relaxing `pos >= len` to `pos > len` survived the
+    // whole suite in Debug AND ReleaseFast, and in ReleaseFast that relaxation
+    // is a SILENT one-past-end read whose value then steers decoding — the
+    // major type of whatever byte follows the buffer decides what gets parsed.
+    //
+    // Every input below leaves the cursor exactly at the end with `peekByte`
+    // as the next operation: the four indefinite-length openers with nothing
+    // after them, and three with one complete chunk/element and no `0xff`.
+    const at_end = [_][]const u8{
+        &[_]u8{0x5f}, // indefinite byte string, then EOF
+        &[_]u8{0x7f}, // indefinite text string, then EOF
+        &[_]u8{0x9f}, // indefinite array, then EOF
+        &[_]u8{0xbf}, // indefinite map, then EOF
+        &[_]u8{ 0x9f, 0x01 }, // one element, no break
+        &[_]u8{ 0xbf, 0x01, 0x02 }, // one pair, no break
+        &[_]u8{ 0x5f, 0x41, 0xaa }, // one chunk, no break
+    };
+    for (at_end) |input| {
+        try testing.expectError(error.Truncated, cbor.decode(testing.allocator, input, .{}));
+    }
+}
+
+test "reserved additional-info 28/29/30 in major type 7 is Malformed" {
+    for ([_]u8{ 0xfc, 0xfd, 0xfe }) |b| {
+        try testing.expectError(error.Malformed, cbor.decode(testing.allocator, &[_]u8{b}, .{}));
+    }
+}
+
+test "an indefinite string chunk may not itself be indefinite (RFC 8949 §3.2.3)" {
+    const nested = [_][]const u8{
+        &[_]u8{ 0x5f, 0x5f, 0xff, 0xff },
+        &[_]u8{ 0x7f, 0x7f, 0xff, 0xff },
+        &[_]u8{ 0x5f, 0x41, 0xaa, 0x5f, 0xff, 0xff },
+    };
+    for (nested) |input| {
+        try testing.expectError(error.Malformed, cbor.decode(testing.allocator, input, .{}));
+    }
+}
+
+test "toI64 rejects exactly at the signed boundary, in both directions" {
+    // `toI64` is the accessor the COSE layer resolves every label and
+    // algorithm identifier through, so its range check is load-bearing well
+    // outside this module. Both loosening mutations survived the suite.
+    const max: u64 = std.math.maxInt(i64);
+    try testing.expectEqual(@as(?i64, std.math.maxInt(i64)), (Value{ .uint = max }).toI64());
+    try testing.expectEqual(@as(?i64, null), (Value{ .uint = max + 1 }).toI64());
+
+    // negint stores the magnitude n for the value -1-n, so the most negative
+    // representable value has magnitude maxInt(i64).
+    try testing.expectEqual(@as(?i64, std.math.minInt(i64)), (Value{ .negint = max }).toI64());
+    try testing.expectEqual(@as(?i64, null), (Value{ .negint = max + 1 }).toI64());
+}
+
+test "writeHead emits the shortest form at every width boundary" {
+    // No Appendix A vector carries a value of exactly 255 or 65535, so the
+    // 1-byte/2-byte and 2-byte/4-byte boundaries were unpinned — and a
+    // regression there silently produces non-preferred serialisation, which
+    // matters precisely because deterministic output is what this module is
+    // used for when something is about to be signed.
+    const cases = [_]struct { v: u64, want: []const u8 }{
+        .{ .v = 23, .want = &[_]u8{0x17} },
+        .{ .v = 24, .want = &[_]u8{ 0x18, 0x18 } },
+        .{ .v = 255, .want = &[_]u8{ 0x18, 0xff } },
+        .{ .v = 256, .want = &[_]u8{ 0x19, 0x01, 0x00 } },
+        .{ .v = 65535, .want = &[_]u8{ 0x19, 0xff, 0xff } },
+        .{ .v = 65536, .want = &[_]u8{ 0x1a, 0x00, 0x01, 0x00, 0x00 } },
+        .{ .v = 4294967295, .want = &[_]u8{ 0x1a, 0xff, 0xff, 0xff, 0xff } },
+        .{ .v = 4294967296, .want = &[_]u8{ 0x1b, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 } },
+        .{ .v = std.math.maxInt(u64), .want = &[_]u8{ 0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } },
+    };
+    for (cases) |c| {
+        const out = try cbor.encode(testing.allocator, .{ .uint = c.v }, .{});
+        defer testing.allocator.free(out);
+        try testing.expectEqualSlices(u8, c.want, out);
+    }
+}
+
+// ── the leak class, driven by ALLOCATOR failure rather than wire failure ───
+//
+// The decode leak (audit 2026-08-06) was closed with `errdefer`s, and the
+// hostile-input tests exercise them — but only along paths where a MALFORMED
+// INPUT triggers the error. An allocation that fails partway through a
+// well-formed input takes different paths, and three of them were held by
+// nothing: `readArray`'s per-item `errdefer freeValue`, `readMap`'s per-key
+// one, and `readMap`'s outer errdefer. `readArray`'s outer equivalent IS
+// killed by the shipped suite; `readMap`'s is not, because no test had a map
+// whose earlier entry owns an allocation and whose later entry fails.
+
+fn decodeOne(a: std.mem.Allocator, input: []const u8) !void {
+    const v = cbor.decode(a, input, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return, // a wire error is the expected outcome for some inputs
+    };
+    cbor.freeValue(a, v);
+}
+
+test "decode frees everything it built when an ALLOCATION fails, not just when the input is bad" {
+    const inputs = [_][]const u8{
+        // well-formed and owning: the interesting shapes for OOM injection
+        &[_]u8{ 0x82, 0x63, 0x61, 0x62, 0x63, 0x63, 0x64, 0x65, 0x66 }, // ["abc","def"]
+        &[_]u8{ 0xa2, 0x63, 0x61, 0x62, 0x63, 0x01, 0x63, 0x64, 0x65, 0x66, 0x02 }, // {"abc":1,"def":2}
+        &[_]u8{ 0xa1, 0x63, 0x61, 0x62, 0x63, 0x82, 0x63, 0x64, 0x65, 0x66, 0x01 }, // {"abc":["def",1]}
+        &[_]u8{ 0x82, 0x81, 0x63, 0x61, 0x62, 0x63, 0x63, 0x64, 0x65, 0x66 }, // [["abc"],"def"]
+        &[_]u8{ 0xc1, 0x63, 0x61, 0x62, 0x63 }, // tag(1, "abc")
+        &[_]u8{ 0x5f, 0x41, 0xaa, 0x41, 0xbb, 0xff }, // indefinite bstr, 2 chunks
+        &[_]u8{ 0x9f, 0x63, 0x61, 0x62, 0x63, 0xff }, // indefinite array
+        // truncated after an entry that already owns memory
+        &[_]u8{ 0xa2, 0x63, 0x61, 0x62, 0x63, 0x01, 0x63, 0x64, 0x65 },
+        &[_]u8{ 0x82, 0x63, 0x61, 0x62, 0x63 },
+    };
+    for (inputs) |input| {
+        try testing.checkAllAllocationFailures(testing.allocator, decodeOne, .{input});
+    }
+}
+
+fn encodeRoundTrip(a: std.mem.Allocator, canonical: bool) !void {
+    const inner = [_]Value{ .{ .uint = 1 }, .{ .uint = 2 }, .{ .uint = 3 } };
+    const entries = [_]MapEntry{
+        .{ .key = .{ .text = "alpha" }, .value = .{ .bytes = "0123456789" } },
+        .{ .key = .{ .text = "beta" }, .value = .{ .array = &inner } },
+        .{ .key = .{ .text = "gamma" }, .value = .{ .f64 = 1.5 } },
+    };
+    const out = try cbor.encode(a, .{ .map = &entries }, .{ .canonical = canonical });
+    a.free(out);
+}
+
+test "encode frees its partial output when an allocation fails" {
+    // Found by this audit: `encode` had no `errdefer` on its output buffer, so
+    // any failure inside `encodeInto` -- or in `toOwnedSlice`'s own final
+    // resize -- abandoned every byte already produced. 129 bytes allocated, 0
+    // freed. This also pins `14ef4331`'s canonical-scratch fix, which until
+    // now was caught only by the example's leak-checking allocator, so a
+    // reintroduced leak looked green under a plain `zig build test-cbor`.
+    try testing.checkAllAllocationFailures(testing.allocator, encodeRoundTrip, .{false});
+    try testing.checkAllAllocationFailures(testing.allocator, encodeRoundTrip, .{true});
+}

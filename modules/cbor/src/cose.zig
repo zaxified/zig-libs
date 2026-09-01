@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! cose — minimal RFC 9052 (CBOR Object Signing and Encryption) layer over
-//! the sibling `cbor` codec: parse a `COSE_Key` (EC2 + OKP) into a typed
+//! the sibling `cbor` codec: parse a `COSE_Key` (EC2, OKP or AKP) into a typed
 //! struct, parse/build `COSE_Sign1`, and build the `Sig_structure` bytes a
 //! signer/verifier feeds to its signature algorithm. This is exactly the
 //! slice WebAuthn/FIDO2 needs to pull an authenticator's public key out of
@@ -11,11 +11,14 @@
 //! itself.
 //!
 //! **Deliberately out of scope** (see README "Deferred"): private-key
-//! material (`d`, COSE label -4) is never parsed or emitted — this is a
-//! verifier/public-key-consumer layer, not a key-storage format; COSE_Mac0/
-//! COSE_Encrypt0/full COSE_Sign (multi-signer) are not implemented; RSA and
-//! symmetric COSE key types are not modeled (`parseKey` returns
-//! `error.UnsupportedKty` for anything but EC2/OKP).
+//! material is never parsed or emitted — `d` at COSE label -4 for EC2/OKP
+//! and `priv` at label -2 for AKP, which is the SAME NUMBER that means `x`
+//! under a different `kty`. This is a verifier/public-key-consumer layer,
+//! not a key-storage format; COSE_Mac0/COSE_Encrypt0/full COSE_Sign
+//! (multi-signer) are not implemented; RSA and symmetric COSE key types are
+//! not modeled (`parseKey` returns `error.UnsupportedKty` for anything but
+//! EC2, OKP and AKP). There is no `encodeAkpKey` — this module parses AKP
+//! keys, it does not emit them.
 //!
 //! Provenance: RFC 9052 (COSE, STD); clean-room from the spec, no
 //! third-party COSE implementation consulted (CONVENTIONS.md §5 merger
@@ -98,7 +101,26 @@ pub const KeyError = error{
     /// §3). A first-wins or last-wins reader disagrees with any
     /// spec-conformant peer about which copy is authoritative — a
     /// parser-differential in front of the key material itself.
+    ///
+    /// The check is generic over the label's CBOR type, not just integers:
+    /// `tstr` labels are legal COSE and an integer above `maxInt(i64)` has no
+    /// signed form, and both used to slip past.
     DuplicateLabel,
+    /// The map carries more than `max_map_entries` entries. The uniqueness
+    /// check above is quadratic and its input comes off the wire, so the
+    /// count is bounded rather than paid — see `max_map_entries` for the
+    /// measurement that made this a refusal instead of a comment.
+    TooManyEntries,
+    /// An AKP key's `pub` is not the length its own REQUIRED `alg` fixes
+    /// (RFC 9964 §3 / FIPS 204 Table 2: 1312 / 1952 / 2592 bytes for
+    /// ML-DSA-44 / -65 / -87).
+    WrongKeyLength,
+    /// `kty` and `alg` name different families: an ML-DSA `alg` on a key that
+    /// is not AKP, or a signature `alg` this module knows to be EC2/OKP-only
+    /// on an AKP key. Only pairs where BOTH sides are registered here are
+    /// judged — an `alg` outside `alg_*` still round-trips under any `kty`,
+    /// the way the algorithm-identifier constants' doc comment promises.
+    AlgKtyMismatch,
 };
 
 /// An EC2 (double-coordinate elliptic curve) public key (RFC 9053 §7.1) —
@@ -162,31 +184,88 @@ fn mapGet(entries: []const MapEntry, label: i64) ?Value {
     return null;
 }
 
-/// True if two entries' int-valued keys are the same label. Non-int keys
-/// (this module never emits or expects a `tstr` label) never collide.
+/// True if two entries' keys are the same COSE label.
+///
+/// Integer labels compare numerically across the `uint`/`negint`
+/// representations. RFC 9052 §3's uniqueness requirement is about *labels*,
+/// not integer labels: a `tstr` label is legal COSE, and an integer larger
+/// than `maxInt(i64)` has no `toI64`. An earlier version returned `false` for
+/// every one of those, so a duplicated text label — or a duplicated `2^63`
+/// — passed the uniqueness check and reached the caller in
+/// `Sign1.unprotected`, where a first-wins consumer resolves it. Those cases
+/// now compare structurally.
 fn labelKeyEql(a: Value, b: Value) bool {
-    const ai = switch (a) {
-        .uint, .negint => a.toI64() orelse return false,
-        else => return false,
+    if (a.toI64()) |ai| {
+        const bi = b.toI64() orelse return false;
+        return ai == bi;
+    }
+    // Not i64-representable on the left; only an identical shape can collide.
+    return switch (a) {
+        .uint => |x| switch (b) {
+            .uint => |y| x == y,
+            else => false,
+        },
+        .negint => |x| switch (b) {
+            .negint => |y| x == y,
+            else => false,
+        },
+        .text => |x| switch (b) {
+            .text => |y| std.mem.eql(u8, x, y),
+            else => false,
+        },
+        .bytes => |x| switch (b) {
+            .bytes => |y| std.mem.eql(u8, x, y),
+            else => false,
+        },
+        else => false,
     };
-    const bi = switch (b) {
-        .uint, .negint => b.toI64() orelse return false,
-        else => return false,
-    };
-    return ai == bi;
 }
+
+/// The largest map this layer will scan for duplicate labels, and therefore
+/// the largest `COSE_Key` or header bucket it accepts at all.
+///
+/// ⚠ This bound is load-bearing, not tidiness. `checkLabels` compares
+/// every pair, which is quadratic, and the map it scans comes off the wire:
+/// `webauthn` hands `parseCredentialKey` the unbounded tail of a
+/// client-supplied `authData`. Measured in ReleaseFast on the audited host,
+/// one call, with no duplicate present so the scan runs to completion:
+///
+/// ```text
+///   labels     input        decode       parseKey
+///     4000     24005B         263us        22052us
+///    16000     96005B        1040us       369726us
+///   128000    768005B        8090us     26375567us
+/// ```
+///
+/// Decode is linear; the scan quadrupled its cost for every doubling — 768 KB
+/// of input bought **26 seconds** of one core. A cap is the fix that keeps
+/// this function allocation-free (`parseKey`/`parseSign1` allocate nothing,
+/// which callers rely on), and it costs nothing real: RFC 9052 header buckets
+/// and `COSE_Key` maps carry single-digit label counts, so 256 is roughly
+/// thirty times the largest legitimate map and still bounds the scan at
+/// 32,640 comparisons.
+pub const max_map_entries: usize = 256;
+
+/// The two ways a header-bucket map can be rejected before any field is read.
+/// Deliberately its own narrow set: it is a subset of both `KeyError` and
+/// `Sign1Error`, so `checkLabels` can guard either entry point without
+/// widening the error either one advertises.
+pub const LabelError = error{ DuplicateLabel, TooManyEntries };
 
 /// RFC 9052 §3 forbids a repeated label in a header-bucket map. Detect it
 /// generically over every entry — not just the labels this module happens
 /// to read — because a producer and a lenient first/last-wins consumer can
 /// disagree about which of two copies is authoritative.
-fn hasDuplicateLabel(entries: []const MapEntry) bool {
+///
+/// Returns `error.TooManyEntries` above `max_map_entries` rather than paying
+/// the quadratic scan; see that constant for the measurement.
+fn checkLabels(entries: []const MapEntry) LabelError!void {
+    if (entries.len > max_map_entries) return error.TooManyEntries;
     for (entries, 0..) |e, i| {
         for (entries[i + 1 ..]) |o| {
-            if (labelKeyEql(e.key, o.key)) return true;
+            if (labelKeyEql(e.key, o.key)) return error.DuplicateLabel;
         }
     }
-    return false;
 }
 
 fn intField(entries: []const MapEntry, label: i64) KeyError!?i64 {
@@ -216,9 +295,21 @@ pub fn parseKey(value: Value) KeyError!Key {
         .map => |m| m,
         else => return error.NotAMap,
     };
-    if (hasDuplicateLabel(entries)) return error.DuplicateLabel;
+    try checkLabels(entries);
     const kty = try requiredIntField(entries, label_kty);
     const alg = try intField(entries, label_alg);
+
+    // A key may not claim another family's algorithm. `jwt`, on the JOSE half
+    // of the same RFC 9964, ends its AKP branch with exactly this rule; the
+    // two halves of one RFC in one repository should not disagree about it.
+    // Only pairs where both sides are registered above are judged, so an
+    // unlisted `alg` is unaffected.
+    if (alg) |a| {
+        const ml_dsa = akpPublicKeyLen(a) != null;
+        const ec_or_okp = a == alg_es256 or a == alg_es384 or a == alg_es512 or a == alg_eddsa;
+        if (kty == kty_akp and ec_or_okp) return error.AlgKtyMismatch;
+        if (kty != kty_akp and ml_dsa) return error.AlgKtyMismatch;
+    }
 
     // `kty` decides what the negative labels MEAN, so nothing below -1 may be
     // read before this switch: -1 is `crv` for EC2/OKP and `pub` for AKP.
@@ -234,11 +325,48 @@ pub fn parseKey(value: Value) KeyError!Key {
             .crv = try requiredIntField(entries, label_crv),
             .x = try bstrField(entries, label_x),
         } },
-        kty_akp => .{ .akp = .{
-            .alg = alg orelse return error.MissingField,
-            .pub_bytes = try bstrField(entries, label_pub),
-        } },
+        kty_akp => blk: {
+            const key_alg = alg orelse return error.MissingField;
+            const pub_bytes = try bstrField(entries, label_pub);
+            // `alg` fixes the parameter set AND therefore the length. Not
+            // inferring the set from the length is correct and deliberate --
+            // but it is not the same as not CHECKING the length, and only the
+            // check closes the seam. Without it this function hands the caller
+            // an `alg` and an unconstrained slice, and the natural consumer
+            // expression is the one this module's own KAT writes:
+            // `pub_bytes[0..Scheme.PublicKey.encoded_length].*`. Measured on a
+            // key declaring ML-DSA-87 with ML-DSA-44's 1312 bytes, that is
+            // `index out of bounds: index 2592, len 1312` in Debug and a
+            // 1280-byte out-of-bounds READ in ReleaseFast, straight into a
+            // signature verifier. The sibling `jwt`, on the JOSE half of this
+            // same RFC, has checked it since it landed.
+            if (akpPublicKeyLen(key_alg)) |want| {
+                if (pub_bytes.len != want) return error.WrongKeyLength;
+            }
+            break :blk .{ .akp = .{ .alg = key_alg, .pub_bytes = pub_bytes } };
+        },
         else => error.UnsupportedKty,
+    };
+}
+
+/// The `pub` length RFC 9964 §3 fixes for an AKP `alg`, or `null` when the
+/// algorithm is not one this module knows a length for (an unlisted `alg`
+/// still round-trips, as it does for EC2/OKP — see the algorithm-identifier
+/// constants above, which are "a selection", not a closed set).
+///
+/// Exported so a consumer that accepts an unlisted `alg` can apply the same
+/// rule itself instead of re-deriving FIPS 204 Table 2 from memory.
+/// The lengths are taken from `std.crypto.sign.mldsa`'s own FIPS 204 types
+/// rather than transcribed as literals: a number copied out of Table 2 by
+/// hand is a number that can be copied wrong, and `encoded_length` is a
+/// comptime constant, so naming it costs nothing at runtime.
+pub fn akpPublicKeyLen(alg: i64) ?usize {
+    const mldsa = std.crypto.sign.mldsa;
+    return switch (alg) {
+        alg_ml_dsa_44 => mldsa.MLDSA44.PublicKey.encoded_length,
+        alg_ml_dsa_65 => mldsa.MLDSA65.PublicKey.encoded_length,
+        alg_ml_dsa_87 => mldsa.MLDSA87.PublicKey.encoded_length,
+        else => null,
     };
 }
 
@@ -275,6 +403,9 @@ pub const Sign1Error = error{
     WrongType,
     /// The unprotected header map has a repeated label — see `KeyError.DuplicateLabel`.
     DuplicateLabel,
+    /// The unprotected header map is larger than `max_map_entries` — see that
+    /// constant, and `KeyError.TooManyEntries`.
+    TooManyEntries,
 };
 
 /// A parsed/to-be-built `COSE_Sign1` structure (RFC 9052 §4.2): the 4-tuple
@@ -317,7 +448,7 @@ pub fn parseSign1(value: Value) Sign1Error!Sign1 {
         .map => |m| m,
         else => return error.WrongType,
     };
-    if (hasDuplicateLabel(unprotected)) return error.DuplicateLabel;
+    try checkLabels(unprotected);
     const payload: ?[]const u8 = switch (arr[2]) {
         .bytes => |b| b,
         .null_value => null,
@@ -597,4 +728,211 @@ test "COSE_Sign1: each of the 4 fields rejects the wrong CBOR type -> WrongType"
             .{ .uint = 0 }, // should be bytes
         },
     }));
+}
+
+// ── audit 2026-09-01: guards that were correct but held by nothing ─────────
+
+test "AKP: pub length must match the length its own alg fixes" {
+    var a = std.testing.allocator;
+
+    const sets = [_]struct { alg: i64, len: usize }{
+        .{ .alg = alg_ml_dsa_44, .len = akpPublicKeyLen(alg_ml_dsa_44).? },
+        .{ .alg = alg_ml_dsa_65, .len = akpPublicKeyLen(alg_ml_dsa_65).? },
+        .{ .alg = alg_ml_dsa_87, .len = akpPublicKeyLen(alg_ml_dsa_87).? },
+    };
+
+    for (sets) |s| {
+        const right = try a.alloc(u8, s.len);
+        defer a.free(right);
+        @memset(right, 0xAB);
+
+        // The correct length parses.
+        const ok_entries = [_]MapEntry{
+            .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_akp) } },
+            .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(s.alg) },
+            .{ .key = Value.fromI64(label_pub), .value = .{ .bytes = right } },
+        };
+        const k = try parseKey(.{ .map = &ok_entries });
+        try testing.expectEqual(s.alg, k.akp.alg);
+        try testing.expectEqual(s.len, k.akp.pub_bytes.len);
+
+        // Every other parameter set's length, plus the boundaries and empty,
+        // must be refused under THIS alg -- the cross-set mix-up is the shape
+        // a real confusion produces.
+        for (sets) |other| {
+            if (other.len == s.len) continue;
+            const wrong = try a.alloc(u8, other.len);
+            defer a.free(wrong);
+            @memset(wrong, 0xAB);
+            const bad = [_]MapEntry{
+                .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_akp) } },
+                .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(s.alg) },
+                .{ .key = Value.fromI64(label_pub), .value = .{ .bytes = wrong } },
+            };
+            try testing.expectError(error.WrongKeyLength, parseKey(.{ .map = &bad }));
+        }
+
+        for ([_]usize{ 0, 1, s.len - 1, s.len + 1 }) |n| {
+            const wrong = try a.alloc(u8, n);
+            defer a.free(wrong);
+            @memset(wrong, 0xAB);
+            const bad = [_]MapEntry{
+                .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_akp) } },
+                .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(s.alg) },
+                .{ .key = Value.fromI64(label_pub), .value = .{ .bytes = wrong } },
+            };
+            try testing.expectError(error.WrongKeyLength, parseKey(.{ .map = &bad }));
+        }
+    }
+
+    // An alg this module knows no length for still round-trips, the way an
+    // unlisted EC2 `alg` does -- the constants are a selection, not a set.
+    try testing.expectEqual(@as(?usize, null), akpPublicKeyLen(-999));
+    const unlisted = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_akp) } },
+        .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(-999) },
+        .{ .key = Value.fromI64(label_pub), .value = .{ .bytes = "short" } },
+    };
+    const k = try parseKey(.{ .map = &unlisted });
+    try testing.expectEqual(@as(i64, -999), k.akp.alg);
+}
+
+test "AKP: pub missing or wrong-typed is refused" {
+    const no_pub = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_akp) } },
+        .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(alg_ml_dsa_44) },
+    };
+    try testing.expectError(error.MissingField, parseKey(.{ .map = &no_pub }));
+
+    const text_pub = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_akp) } },
+        .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(alg_ml_dsa_44) },
+        .{ .key = Value.fromI64(label_pub), .value = .{ .text = "not bytes" } },
+    };
+    try testing.expectError(error.WrongType, parseKey(.{ .map = &text_pub }));
+}
+
+test "duplicate labels are caught at any distance, not just adjacent ones" {
+    // The duplicated pair sits at index 0 and index 4: an adjacent-pair scan
+    // would miss it entirely.
+    const entries = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_ec2) } },
+        .{ .key = .{ .uint = 100 }, .value = .{ .uint = 1 } },
+        .{ .key = .{ .uint = 101 }, .value = .{ .uint = 1 } },
+        .{ .key = .{ .uint = 102 }, .value = .{ .uint = 1 } },
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_okp) } },
+    };
+    try testing.expectError(error.DuplicateLabel, parseKey(.{ .map = &entries }));
+}
+
+test "duplicate labels that are not i64 integers are caught too" {
+    // RFC 9052 §3 says "labels", not "integer labels". A tstr label is legal
+    // COSE, and an integer above maxInt(i64) has no signed form -- both used
+    // to return false from the comparison and slip through.
+    const dup_text = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_ec2) } },
+        .{ .key = .{ .text = "vendor" }, .value = .{ .uint = 1 } },
+        .{ .key = .{ .text = "vendor" }, .value = .{ .uint = 2 } },
+    };
+    try testing.expectError(error.DuplicateLabel, parseKey(.{ .map = &dup_text }));
+
+    const huge: u64 = @as(u64, 1) << 63; // > maxInt(i64), so toI64 is null
+    const dup_huge = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_ec2) } },
+        .{ .key = .{ .uint = huge }, .value = .{ .uint = 1 } },
+        .{ .key = .{ .uint = huge }, .value = .{ .uint = 2 } },
+    };
+    try testing.expectError(error.DuplicateLabel, parseKey(.{ .map = &dup_huge }));
+
+    const dup_bytes = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_ec2) } },
+        .{ .key = .{ .bytes = "L" }, .value = .{ .uint = 1 } },
+        .{ .key = .{ .bytes = "L" }, .value = .{ .uint = 2 } },
+    };
+    try testing.expectError(error.DuplicateLabel, parseKey(.{ .map = &dup_bytes }));
+
+    // Different labels of the same shape must still be accepted -- a check
+    // that rejects everything is not a check.
+    const distinct = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_okp) } },
+        .{ .key = Value.fromI64(label_crv), .value = Value.fromI64(crv_ed25519) },
+        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = "k" } },
+        .{ .key = .{ .text = "a" }, .value = .{ .uint = 1 } },
+        .{ .key = .{ .text = "b" }, .value = .{ .uint = 2 } },
+    };
+    _ = try parseKey(.{ .map = &distinct });
+}
+
+test "an oversized map is refused before the quadratic scan is paid" {
+    var a = std.testing.allocator;
+
+    const entries = try a.alloc(MapEntry, max_map_entries + 1);
+    defer a.free(entries);
+    for (entries, 0..) |*e, i| {
+        e.* = .{ .key = .{ .uint = @intCast(1000 + i) }, .value = .{ .uint = 1 } };
+    }
+    try testing.expectError(error.TooManyEntries, parseKey(.{ .map = entries }));
+    try testing.expectError(error.TooManyEntries, parseSign1(.{ .array = &[_]Value{
+        .{ .bytes = "" },
+        .{ .map = entries },
+        .{ .bytes = "p" },
+        .{ .bytes = "s" },
+    } }));
+
+    // Exactly at the cap is still accepted: the bound must not be off by one
+    // against a legitimate (if implausible) map.
+    const at_cap = entries[0..max_map_entries];
+    at_cap[0] = .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_akp) } };
+    try testing.expectError(error.MissingField, parseKey(.{ .map = at_cap }));
+}
+
+test "COSE_Sign1: an array longer than 4 elements is not a COSE_Sign1" {
+    try testing.expectError(error.NotSign1, parseSign1(.{ .array = &[_]Value{
+        .{ .bytes = "" },
+        .{ .map = &[_]MapEntry{} },
+        .{ .bytes = "payload" },
+        .{ .bytes = "sig" },
+        .{ .uint = 5 },
+    } }));
+}
+
+test "a key may not claim another family's algorithm" {
+    // An EC2 key declaring ML-DSA, and an AKP key declaring ES256, are the
+    // two directions of the same confusion. A consumer that dispatches on
+    // `alg` rather than on the union tag is the one this protects.
+    const ec2_claiming_mldsa = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_ec2) } },
+        .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(alg_ml_dsa_44) },
+        .{ .key = Value.fromI64(label_crv), .value = Value.fromI64(crv_p256) },
+        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+        .{ .key = Value.fromI64(label_y), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+    };
+    try testing.expectError(error.AlgKtyMismatch, parseKey(.{ .map = &ec2_claiming_mldsa }));
+
+    const okp_claiming_mldsa = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_okp) } },
+        .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(alg_ml_dsa_87) },
+        .{ .key = Value.fromI64(label_crv), .value = Value.fromI64(crv_ed25519) },
+        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+    };
+    try testing.expectError(error.AlgKtyMismatch, parseKey(.{ .map = &okp_claiming_mldsa }));
+
+    const akp_claiming_es256 = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_akp) } },
+        .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(alg_es256) },
+        .{ .key = Value.fromI64(label_pub), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+    };
+    try testing.expectError(error.AlgKtyMismatch, parseKey(.{ .map = &akp_claiming_es256 }));
+
+    // An `alg` this module does not register is judged by neither side and
+    // still round-trips under any `kty` -- the constants are a selection.
+    const ec2_unlisted_alg = [_]MapEntry{
+        .{ .key = .{ .uint = @intCast(label_kty) }, .value = .{ .uint = @intCast(kty_ec2) } },
+        .{ .key = .{ .uint = @intCast(label_alg) }, .value = Value.fromI64(-777) },
+        .{ .key = Value.fromI64(label_crv), .value = Value.fromI64(crv_p256) },
+        .{ .key = Value.fromI64(label_x), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+        .{ .key = Value.fromI64(label_y), .value = .{ .bytes = &[_]u8{0} ** 32 } },
+    };
+    const k = try parseKey(.{ .map = &ec2_unlisted_alg });
+    try testing.expectEqual(@as(?i64, -777), k.ec2.alg);
 }

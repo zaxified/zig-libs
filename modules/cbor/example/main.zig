@@ -4,8 +4,13 @@
 //! of the RFC 8949 Appendix A test vectors verbatim (the spec's own
 //! known-answer table — the external judge for this module), re-encode them
 //! and check the "preferred serialization" round-trip is byte-exact, build
-//! and canonical-encode a small map, and reject truncated/trailing-garbage
-//! input by name.
+//! and canonical-encode a small map, reject truncated/trailing-garbage
+//! input by name, and then drive the COSE layer itself: parse RFC 9052
+//! Appendix C.2.1's published `COSE_Sign1`, confirm `protected` comes back as
+//! the original serialized bytes (the property that closes the
+//! re-encode-what-was-signed forgery seam), rebuild its `Sig_structure` and
+//! compare against the bytes `cose-wg/Examples` publishes for that vector,
+//! and refuse an unmodelled `kty` by name.
 //!
 //! This is an example in the gate sense — it is built by
 //! `zig build check-examples` against the PUBLISHED module (`deps` only, no
@@ -118,5 +123,61 @@ pub fn main() !void {
     } else |err| switch (err) {
         error.TrailingGarbage => std.debug.print("byte-string + trailing byte: TrailingGarbage (expected)\n", .{}),
         else => return err,
+    }
+
+    // The COSE layer, which is the half a WebAuthn-adjacent consumer actually
+    // reaches for. RFC 9052 Appendix C.2.1's own `COSE_Sign1` worked example,
+    // tag-18 wrapped, verbatim.
+    {
+        const wire = [_]u8{
+            0xd2, 0x84, 0x43, 0xa1, 0x01, 0x26, 0xa1, 0x04, 0x42, 0x31, 0x31, 0x54,
+            0x54, 0x68, 0x69, 0x73, 0x20, 0x69, 0x73, 0x20, 0x74, 0x68, 0x65, 0x20,
+            0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 0x74, 0x2e, 0x58, 0x40, 0x8e, 0xb3,
+            0x3e, 0x4c, 0xa3, 0x1d, 0x1c, 0x46, 0x5a, 0xb0, 0x5a, 0xac, 0x34, 0xcc,
+            0x6b, 0x23, 0xd5, 0x8f, 0xef, 0x5c, 0x08, 0x31, 0x06, 0xc4, 0xd2, 0x5a,
+            0x91, 0xae, 0xf0, 0xb0, 0x11, 0x7e, 0x2a, 0xf9, 0xa2, 0x91, 0xaa, 0x32,
+            0xe1, 0x4a, 0xb8, 0x34, 0xdc, 0x56, 0xed, 0x2a, 0x22, 0x34, 0x44, 0x54,
+            0x7e, 0x01, 0xf1, 0x1d, 0x3b, 0x09, 0x16, 0xe5, 0xa4, 0xc3, 0x45, 0xca,
+            0xcb, 0x36,
+        };
+        const v = try cbor.decode(gpa, &wire, .{});
+        defer cbor.freeValue(gpa, v);
+
+        const s1 = try cbor.cose.parseSign1(v);
+        std.debug.assert(std.mem.eql(u8, s1.payload.?, "This is the content."));
+
+        // The property this layer exists to protect: `protected` is handed back
+        // as the ORIGINAL serialized bytes, so what gets verified is what was
+        // signed. Re-encoding `{1: -7}` here instead would be the classic
+        // COSE forgery seam.
+        std.debug.assert(std.mem.eql(u8, s1.protected, &[_]u8{ 0xa1, 0x01, 0x26 }));
+
+        // `Sig_structure` — the exact bytes a signature covers. Compared against
+        // the value published in `cose-wg/Examples` sign1-tests/sign-fail-01.json
+        // as `intermediates.ToBeSign_hex`, which is this same vector.
+        const tbs = try cbor.cose.sigStructure(gpa, s1.protected, "", s1.payload.?);
+        defer gpa.free(tbs);
+        const published_tbs = [_]u8{
+            0x84, 0x6a, 0x53, 0x69, 0x67, 0x6e, 0x61, 0x74, 0x75, 0x72, 0x65, 0x31,
+            0x43, 0xa1, 0x01, 0x26, 0x40, 0x54, 0x54, 0x68, 0x69, 0x73, 0x20, 0x69,
+            0x73, 0x20, 0x74, 0x68, 0x65, 0x20, 0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e,
+            0x74, 0x2e,
+        };
+        std.debug.assert(std.mem.eql(u8, tbs, &published_tbs));
+        std.debug.print("COSE_Sign1 (RFC 9052 C.2.1): protected kept verbatim, Sig_structure matches the published bytes\n", .{});
+    }
+
+    // A COSE_Key whose `kty` this module does not model must be refused by
+    // name, not guessed at.
+    {
+        const entries = [_]cbor.MapEntry{
+            .{ .key = .{ .uint = 1 }, .value = .{ .uint = 4 } }, // kty = 4 (symmetric)
+        };
+        if (cbor.cose.parseKey(.{ .map = &entries })) |_| {
+            unreachable;
+        } else |err| switch (err) {
+            error.UnsupportedKty => std.debug.print("COSE_Key kty=4 (symmetric): UnsupportedKty (expected)\n", .{}),
+            else => return err,
+        }
     }
 }

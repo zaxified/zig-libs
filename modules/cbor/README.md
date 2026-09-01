@@ -29,7 +29,9 @@ NOTICE entry needed.
    *encoded* keys (RFC 8949 §4.2.1 core-deterministic encoding) — together this produces
    core-deterministic output.
 3. **COSE (`cose.zig`).** `cose.parseKey`/`cose.encodeEc2Key`/`cose.encodeOkpKey` for `COSE_Key`
-   (EC2/OKP public keys — the shape `ctap2pin`'s inline `PublicKey{x,y}` generalizes), and
+   (EC2/OKP public keys — the shape `ctap2pin`'s inline `PublicKey{x,y}` generalizes — plus AKP,
+   RFC 9964's post-quantum key type, whose ML-DSA parameter set comes from the REQUIRED `alg` and
+   is never inferred from the key length), and
    `cose.parseSign1`/`cose.encodeSign1`/`cose.sigStructure` for `COSE_Sign1` (RFC 9052 §4.2/§4.4).
    Everything routes through the `cbor.Value`/`decode`/`encode` above — no CBOR is hand-rolled a
    second time inside COSE. The actual signature algorithm (ECDSA/EdDSA/...) is out of scope —
