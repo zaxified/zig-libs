@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-01** (audit) — **The reader no longer honors a `size` field on an entry
+  type that carries no content**, which was a content-smuggling desync. POSIX is
+  explicit ("No data logical records are stored for types 1, 2, or 5"), and GNU tar
+  1.35 ignores the field for `'1'`, `'2'`, `'3'`, `'4'`, `'5'` and `'6'` alike.
+  Honoring it let a crafted archive hide entries: a link entry claiming one block of
+  content, followed by a valid header, made this `Reader` report 2 entries where
+  `tar tf` on the same bytes reports 3 — so a scanner or policy gate built on it
+  never saw a file a real extractor still creates. The typeflag set was established
+  against GNU tar rather than assumed; `'7'` (contiguous) genuinely does carry
+  content and is deliberately excluded, with a positive-control test to keep the fix
+  from degenerating into "ignore every size field". `Entry.size` now reports the
+  content actually present.
+- **2026-09-01** (audit) — **`Writer` refuses a numeric header field that does not
+  fit instead of silently truncating it** (new `WriteError.FieldOutOfRange`). The
+  8-byte octal fields hold 21 bits, so uid/gid `2097152` was being written as
+  `"0000000"` — root — and `mode`/`mtime` truncated the same way. GNU tar 1.35
+  refuses the identical value ("value 2097152 out of uid_t range 0..2097151") rather
+  than writing it. Reachable wherever high ids exist: userns/`subuid` mappings,
+  idmap ranges, `overflowuid`. `packDir` stays best-effort as documented — it skips
+  such an entry rather than failing the archive — but now counts it in the new
+  `PackStats.skipped`, so a short archive is distinguishable from a complete one;
+  `packTarGz`, which is handed an explicit entry list, propagates the error instead.
+
 - **2026-08-18** — New `packDirToPath(io, gpa, roots, out_path)`: the create-file /
   wrap-writer / call-`packDir` / flush dance every caller was repeating verbatim,
   collapsed into one call with the same `PackStats` return. `packDir` itself is

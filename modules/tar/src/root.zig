@@ -257,10 +257,30 @@ pub const Reader = struct {
                 '1' => .hardlink,
                 else => .other,
             };
-            // Content is streamed via read(); next() skips leftovers. Some
-            // producers put a size on dirs — honor it so we stay in sync.
-            self.remaining = h.size;
-            self.pad = content_pad;
+            // Whether this entry is followed by content blocks at all. POSIX
+            // (pax, "ustar Interchange Format") is explicit: "No data logical
+            // records are stored for types 1, 2, or 5", and a link's size
+            // "shall be specified as zero". Device and FIFO entries ('3', '4',
+            // '6') carry none either.
+            //
+            // This is not merely a conformance nicety: honoring a size field
+            // on such an entry desynchronises the reader from the archive.
+            // A header planted in the blocks the liar claims as its content
+            // is then consumed as data and never reported, while a real
+            // extractor still creates that file — so a scanner or policy gate
+            // built on this Reader sees fewer entries than `tar -xf` writes.
+            //
+            // The set was established against GNU tar 1.35 rather than
+            // assumed: the same 5-block archive lists 3 entries under
+            // `tar tf` for each of '1','2','3','4','5','6', and 2 entries for
+            // '7'. Contiguous files ('7') DO carry content, which is why they
+            // are deliberately absent here and stay on the `else` arm.
+            const carries_content = switch (h.typeflag) {
+                '1', '2', '3', '4', '5', '6' => false,
+                else => true,
+            };
+            self.remaining = if (carries_content) h.size else 0;
+            self.pad = if (carries_content) content_pad else 0;
 
             return .{
                 .path = std.mem.sliceTo(self.path_buf, 0),
@@ -269,7 +289,9 @@ pub const Reader = struct {
                 .uid = h.uid,
                 .gid = h.gid,
                 .mtime = h.mtime,
-                .size = h.size,
+                // Reported as the content actually present, not as the header
+                // claims — matching what GNU tar reports for these types.
+                .size = if (carries_content) h.size else 0,
                 .link_target = std.mem.sliceTo(self.link_buf, 0),
                 .typeflag = h.typeflag,
             };
@@ -410,7 +432,28 @@ pub const WriteError = error{
     /// `writeHeader`/`writeEntry` got a `.other` entry — the writer only
     /// emits files, dirs, symlinks and hard links.
     UnsupportedKind,
+    /// A numeric header field does not fit its ustar octal field: `mode`,
+    /// `uid` or `gid` above `0o7777777` (7 digits, 21 bits), or `mtime`
+    /// outside `0..0o77777777777` (11 digits, 33 bits).
+    ///
+    /// Refused rather than truncated. The octal fields discard high bits
+    /// silently, and for an id that is not a cosmetic loss: uid `0o10000000`
+    /// (2 097 152) truncates to `0`, so a file owned by an unprivileged
+    /// high-range account — a userns/`subuid` mapping, an idmap range, the
+    /// `overflowuid` — would be stored as owned by **root** and extracted
+    /// that way under `--same-owner`. GNU tar 1.35 refuses the identical
+    /// value ("value 2097152 out of uid_t range 0..2097151", exit 2) instead
+    /// of writing it, and this writer matches it.
+    ///
+    /// `size` is deliberately not in this set: it has the GNU/star base-256
+    /// escape (`writeSizeField`) and needs no ceiling.
+    FieldOutOfRange,
 } || std.Io.Writer.Error;
+
+/// Largest value an 8-byte ustar octal field can carry (7 digits + NUL).
+const max_octal_8 = 0o7777777;
+/// Largest value a 12-byte ustar octal field can carry (11 digits + NUL).
+const max_octal_12 = 0o77777777777;
 
 /// ustar/GNU tar emitter. `writeEntry` for in-memory content; or
 /// `writeHeader` + stream `size` bytes to `dst` + `writePadding(size)` for
@@ -453,6 +496,13 @@ pub const Writer = struct {
             .hardlink => '1',
             .other => return error.UnsupportedKind,
         };
+        // Every octal field is checked before a single byte is emitted, so a
+        // refused entry never leaves a half-written header (or a 'L'/'K'
+        // record with no header behind it) in the stream.
+        if (e.mode > max_octal_8) return error.FieldOutOfRange;
+        if (e.uid > max_octal_8) return error.FieldOutOfRange;
+        if (e.gid > max_octal_8) return error.FieldOutOfRange;
+        if (e.mtime < 0 or e.mtime > max_octal_12) return error.FieldOutOfRange;
         if (e.path.len > 100) try writeGnuLong(w, &block, 'L', e.path);
         const has_link = e.kind == .symlink or e.kind == .hardlink;
         if (has_link and e.link_target.len > 100) try writeGnuLong(w, &block, 'K', e.link_target);
@@ -569,7 +619,10 @@ pub const ContentEntry = struct {
     content: []const u8 = "",
 };
 
-pub const PackError = error{UnsupportedKind} || Allocator.Error || std.Io.Writer.Error;
+// `FieldOutOfRange` is propagated here rather than skipped: unlike `packDir`,
+// which walks a filesystem best-effort, `packTarGz` is handed an explicit list
+// of entries, so dropping one silently would lose data the caller asked for.
+pub const PackError = error{ UnsupportedKind, FieldOutOfRange } || Allocator.Error || std.Io.Writer.Error;
 
 /// Pack `entries` as a gzip-compressed tar stream onto `dst`, streaming
 /// through `std.compress.flate` (one window-sized allocation, no whole-
@@ -593,6 +646,13 @@ pub const PackStats = struct {
     symlinks: usize = 0,
     /// Sum of file content sizes (uncompressed).
     bytes: u64 = 0,
+    /// Entries left out of the archive because a numeric attribute would not
+    /// fit its ustar field (`WriteError.FieldOutOfRange`) — in practice a
+    /// uid/gid at or above 2 097 152. `packDir` is documented best-effort, so
+    /// one such file must not fail the archive; but skipping it silently
+    /// would make a short archive indistinguishable from a complete one, so
+    /// it is counted here. A nonzero value means the archive is incomplete.
+    skipped: usize = 0,
 };
 
 pub const PackDirError = error{ PathTooLong, NoEntries } ||
@@ -661,7 +721,7 @@ fn emitPath(io: std.Io, tw: Writer, fs_path: []const u8, tar_name: []const u8, s
 
     if (ifmt == linux.S.IFDIR) {
         tw.writeHeader(.{ .path = tar_name, .kind = .dir, .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e|
-            return stripUnsupported(e);
+            return skipOrFail(e, stats);
         stats.dirs += 1;
         var dir = std.Io.Dir.cwd().openDir(io, fs_path, .{ .iterate = true }) catch return;
         defer dir.close(io);
@@ -678,11 +738,11 @@ fn emitPath(io: std.Io, tw: Writer, fs_path: []const u8, tar_name: []const u8, s
         const n = linux.readlink(pz, &lbuf, lbuf.len);
         if (linux.errno(n) != .SUCCESS) return;
         tw.writeHeader(.{ .path = tar_name, .kind = .symlink, .link_target = lbuf[0..n], .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e|
-            return stripUnsupported(e);
+            return skipOrFail(e, stats);
         stats.symlinks += 1;
     } else if (ifmt == linux.S.IFREG) {
         tw.writeHeader(.{ .path = tar_name, .kind = .file, .size = stx.size, .mode = perm, .uid = stx.uid, .gid = stx.gid, .mtime = mtime }) catch |e|
-            return stripUnsupported(e);
+            return skipOrFail(e, stats);
         var f = std.Io.Dir.cwd().openFile(io, fs_path, .{}) catch {
             // Header already written with the declared size — keep the
             // archive well-formed by emitting that many zero bytes.
@@ -700,13 +760,20 @@ fn emitPath(io: std.Io, tw: Writer, fs_path: []const u8, tar_name: []const u8, s
     // other types (fifo/dev/socket) intentionally skipped
 }
 
-/// `Writer.writeHeader` can only fail with `UnsupportedKind` for `.other`
-/// entries, which `emitPath` never constructs — narrow the error set.
-fn stripUnsupported(e: WriteError) std.Io.Writer.Error {
-    return switch (e) {
+/// Narrow `writeHeader`'s error set for the best-effort packer.
+///
+/// `UnsupportedKind` is unreachable — `emitPath` never constructs a `.other`
+/// entry. `FieldOutOfRange` is reachable (a uid/gid at or above 2 097 152 on
+/// the filesystem being walked) and is deliberately NOT propagated: `packDir`
+/// documents that "one bad file never fails the archive". It is counted in
+/// `PackStats.skipped` instead, so a caller can still tell a complete archive
+/// from a short one — the failure mode a silent skip would create.
+fn skipOrFail(e: WriteError, stats: *PackStats) std.Io.Writer.Error!void {
+    switch (e) {
         error.UnsupportedKind => unreachable,
-        else => |w| w,
-    };
+        error.FieldOutOfRange => stats.skipped += 1,
+        else => |w| return w,
+    }
 }
 
 // ── tests: field primitives ──────────────────────────────────────────────────
@@ -1237,6 +1304,101 @@ test "writer rejects .other entries" {
     var dst: std.Io.Writer = .fixed(&buf);
     const tw = Writer.init(&dst);
     try testing.expectError(error.UnsupportedKind, tw.writeEntry(.{ .path = "x", .kind = .other }, ""));
+}
+
+test "reader: a link/dir/dev entry claiming content cannot swallow the header behind it" {
+    // The archive an attacker writes: an entry of a type that carries no data
+    // but whose size field claims one block, followed by a complete,
+    // checksum-valid header, followed by an ordinary entry. If the reader
+    // honors the size, it eats the middle header as "content" and never
+    // reports it — while `tar -xf` creates that file. Verified against GNU
+    // tar 1.35, which lists all three members for every typeflag below.
+    //
+    // '7' (contiguous) is deliberately absent: it DOES carry content, and GNU
+    // tar honors its size field. It is covered by the positive control below.
+    for ([_]u8{ '1', '2', '3', '4', '5', '6' }) |typeflag| {
+        var buf: [5 * block_size]u8 = undefined;
+        var dst: std.Io.Writer = .fixed(&buf);
+
+        var block: [block_size]u8 = undefined;
+        emitHeader(&block, "link", "target", 0o644, 0, 0, block_size, 0, typeflag);
+        try dst.writeAll(&block);
+        emitHeader(&block, "smuggled.sh", "", 0o755, 0, 0, 0, 0, '0');
+        try dst.writeAll(&block);
+        emitHeader(&block, "safe.txt", "", 0o644, 0, 0, 0, 0, '0');
+        try dst.writeAll(&block);
+        try dst.splatByteAll(0, 2 * block_size);
+
+        var src: std.Io.Reader = .fixed(dst.buffered());
+        var tr = Reader.init(testing.allocator, &src);
+        defer tr.deinit();
+
+        const first = (try tr.next()).?;
+        try testing.expectEqualStrings("link", first.path);
+        // Reported as the content actually present, not as the header claims.
+        try testing.expectEqual(@as(u64, 0), first.size);
+
+        const second = (try tr.next()).?;
+        try testing.expectEqualStrings("smuggled.sh", second.path);
+
+        const third = (try tr.next()).?;
+        try testing.expectEqualStrings("safe.txt", third.path);
+
+        try testing.expectEqual(@as(?Entry, null), try tr.next());
+    }
+}
+
+test "reader: a contiguous ('7') entry still carries content, so the set above is not too wide" {
+    // Positive control for the test above: the same archive shape with the one
+    // typeflag that genuinely has data must behave the OTHER way, or the fix
+    // would just be "ignore every size field".
+    var buf: [5 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "contig.bin", "", 0o644, 0, 0, block_size, 0, '7');
+    try dst.writeAll(&block);
+    emitHeader(&block, "not-an-entry", "", 0o755, 0, 0, 0, 0, '0');
+    try dst.writeAll(&block);
+    emitHeader(&block, "safe.txt", "", 0o644, 0, 0, 0, 0, '0');
+    try dst.writeAll(&block);
+    try dst.splatByteAll(0, 2 * block_size);
+
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+
+    const first = (try tr.next()).?;
+    try testing.expectEqualStrings("contig.bin", first.path);
+    try testing.expectEqual(@as(u64, block_size), first.size);
+
+    // The middle block is this entry's content, so the next entry is the last.
+    const second = (try tr.next()).?;
+    try testing.expectEqualStrings("safe.txt", second.path);
+    try testing.expectEqual(@as(?Entry, null), try tr.next());
+}
+
+test "writer refuses a numeric field that does not fit, instead of truncating it" {
+    var buf: [4 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    const tw = Writer.init(&dst);
+
+    // 0o7777777 = 2097151 is the largest uid ustar can hold; GNU tar 1.35
+    // accepts exactly this and refuses 2097152 ("value 2097152 out of uid_t
+    // range 0..2097151"). Without the guard 2097152 is written as "0000000",
+    // i.e. root.
+    try tw.writeEntry(.{ .path = "ok", .uid = max_octal_8, .gid = max_octal_8, .mode = max_octal_8 }, "");
+    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x", .uid = max_octal_8 + 1 }, ""));
+    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x", .gid = max_octal_8 + 1 }, ""));
+    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x", .mode = max_octal_8 + 1 }, ""));
+    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x", .mtime = max_octal_12 + 1 }, ""));
+    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x", .mtime = -1 }, ""));
+
+    // The refusal happens before any byte is emitted, so a rejected entry
+    // leaves no partial header (and no orphan 'L' record) in the stream.
+    const after_ok = dst.buffered().len;
+    try testing.expectError(error.FieldOutOfRange, tw.writeEntry(.{ .path = "x" ** 60, .uid = max_octal_8 + 1 }, ""));
+    try testing.expectEqual(after_ok, dst.buffered().len);
 }
 
 // ── tests: Linux filesystem packer ──────────────────────────────────────────
