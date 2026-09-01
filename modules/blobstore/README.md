@@ -89,16 +89,24 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
 
 ## Design notes
 
-- **Crash safety.** Every write lands in a hidden `.part` temp, is `fsync`'d,
-  and is made visible by a single `rename(2)`. A crash mid-write leaves only a
-  temp (garbage, never referenced); a live blob is never torn or partial.
+- **Crash safety.** Every write lands in a hidden temp and is made visible by a
+  single `rename(2)`, so a crash mid-write leaves only a temp (garbage, never
+  referenced) and a live blob is never torn or partial. **`fsync` is narrower
+  than the rename discipline and this bullet used to conflate them:** only
+  `put` fsyncs its temp before committing. `putNamed` and the raw `commit`
+  path rename an unsynced temp, so a power loss can leave a correctly-shaped
+  store missing the last named write — atomic, not durable. `put` is the
+  durable one.
 - **Dedup.** `put` hashes while streaming (single pass, bounded memory) and
   `casCommit` skips the rename if the content already exists — one copy on disk
   regardless of how many times it is put.
 - **Path safety.** `ns`/`key` must be single safe segments (`segmentSafe`:
   `[A-Za-z0-9._-]`, no leading dot, no `.`/`..`), checked on *every* public
-  entry point, so a request can never traverse out of `base`. CAS hex keys are
-  generated internally and always safe.
+  entry point, so a request can never traverse out of `base`. This used to
+  carve out "CAS hex keys are generated internally and always safe" — but five
+  public functions take `hex` from the caller, and `casDelete("../victim")`
+  wrote outside the store. Every CAS path now goes through `requireCasHex`, and
+  `scratchCreate` validates its name too.
 - **Verification.** `verify` re-reads the stored bytes to EOF (via
   `hashdigest.sha256File`, which does not trust `stat().size`) and compares the
   hash to the address — catching silent bit-rot or tampering.
@@ -165,4 +173,3 @@ const keys = try store.listNamed(arena, "hostA");              // [][]const u8
   processes committing the *same* content no longer race the refcount bump
   itself (the earlier benign rename-only TOCTOU note still applies to the
   rename call in isolation).
-```

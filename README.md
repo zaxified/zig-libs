@@ -439,7 +439,7 @@ way to recognise it.
 
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
-| [`blobstore`](modules/blobstore/README.md) | Content-addressed blob store (git-object/restic style), plus name-addressed and small named-record layers; crash-safe. | posix | hashdigest |
+| [`blobstore`](modules/blobstore/README.md) | Content-addressed blob store (git-object/restic style) with refcounted GC, configurable fan-out and a cross-process ingest lock, plus name-addressed and small named-record layers; crash-safe. | posix | hashdigest |
 | [`dataset`](modules/dataset/README.md) | Canonical in-memory columnar-typed table — the normalization seam between data sources and consumers. | any | — |
 | [`decimal`](modules/decimal/README.md) | Exact i128 fixed-point decimal for money math, float-free, with IEEE/GDA rounding modes and rescale. | any | — |
 | [`filestore`](modules/filestore/README.md) | DB-less durable keyed document store — one atomically-written file per record, plus a typed-JSON convenience layer. | posix | — |

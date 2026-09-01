@@ -24,8 +24,12 @@
 //!
 //! **Path safety.** `ns` and `key` are single path segments validated by
 //! `segmentSafe` ([A-Za-z0-9._-], no leading dot, no `.`/`..`), so a request
-//! can never escape `base`. CAS hex keys are generated internally and always
-//! safe.
+//! can never escape `base` — including the five public functions that take a
+//! raw `hex`, which reach disk through `requireCasHex`, and `scratchCreate`,
+//! which runs `segmentSafe` on its name. This paragraph used to exempt CAS hex
+//! keys as "generated internally and always safe"; they are not, and
+//! `casDelete("../victim")` wrote a sidecar outside the store until
+//! 2026-09-01.
 //!
 //! **Reference counting + GC.** `put`/`casCommit` increment a per-blob
 //! refcount sidecar (even on a dedup hit); `delete`/`casDelete` only
@@ -63,7 +67,7 @@ const hashdigest = @import("hashdigest");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Content-addressed blob store (git-object/restic style), plus name-addressed and small named-record layers; crash-safe.",
+    .doc = "Content-addressed blob store (git-object/restic style) with refcounted GC, configurable fan-out and a cross-process ingest lock, plus name-addressed and small named-record layers; crash-safe.",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -91,7 +95,24 @@ pub const Error = error{
     /// half-bookkept blob. Callers who never delete (the intended use of
     /// `refcount = false`) never hit this.
     RefcountDisabled,
+    /// The ingest lock file was replaced underneath the locker repeatedly —
+    /// see `lockIngest`. Something is churning `<base>/tmp`, and proceeding
+    /// would mean entering the critical section holding a lock on an inode
+    /// nobody else can see.
+    IngestLockUnstable,
 };
+
+/// The ingest lock's file name inside `<base>/tmp`. Named rather than
+/// spelled twice, because `scratchCreate` has to refuse it: handing a caller
+/// a writable handle on the lock file (and `discardTemp` unlinks whatever
+/// path it is given) is one way to replace it under a live holder.
+const ingest_lock_name = ".ingest.lock";
+
+/// How many times `lockIngest` re-opens after finding the file it locked is
+/// no longer the file the path names. Small on purpose: one replacement is a
+/// race worth retrying through, a stream of them is a broken environment and
+/// should surface as an error rather than a spin.
+const lock_inode_retries: u8 = 8;
 
 /// Store construction options. Default matches the on-disk layout every
 /// store has always used, so opening a store written before this option
@@ -143,6 +164,17 @@ pub const Options = struct {
     /// `Store.hasOrphanedRcSidecars` is an opt-in check for exactly this
     /// situation — see its doc comment for why it is opt-in rather than
     /// automatic at `init`/`gc` time.
+    ///
+    /// The paragraph above discusses `true` → `false` and calls the direction
+    /// fail-safe. **The reverse — a store used with `false` and later reopened
+    /// with `true` — is the one that used to lose blobs**, and was documented
+    /// nowhere. Its blobs carry no sidecars, and until 2026-09-01
+    /// `casCommit`'s dedup branch read a missing sidecar as zero references
+    /// instead of the one implicit reference `casDelete` and `gc` both assume:
+    /// a second referrer's `put` wrote `1` for two live references, and the
+    /// first `delete` made the blob collectible under the second. Both
+    /// directions are safe now; the asymmetry is recorded because the option's
+    /// docs invited exactly this migration.
     refcount: bool = true,
 };
 
@@ -230,7 +262,32 @@ pub const Store = struct {
     /// The fan-out directory for `hex` (no trailing filename), e.g.
     /// `<base>/cas/<hh>` at the default `fanout = 1`, `<base>/cas/<hh>/<hh>`
     /// at `fanout = 2`.
+    /// Every CAS path is built from `hex`, so this is the one place that has
+    /// to be sure of it. It is not decoration: `casPath` interpolates `hex`
+    /// verbatim and the fan-out loop below slices it two characters at a
+    /// time, so an unvalidated `hex` of `"../victim"` yields a path that
+    /// climbs out of `cas/` — and `casDelete` would then WRITE a `.rc`
+    /// sidecar there. The five public entry points that take a raw `hex`
+    /// (`casPath`, `casHas`, `casOpen`, `casCommit`, `casDelete`) all reach
+    /// disk through here, which is why the check lives at the bottom rather
+    /// than being repeated at each of them.
+    ///
+    /// It doubles as the fan-out loop's missing length precondition: a
+    /// 64-character hex always has `2 * fanout` characters to slice for any
+    /// `fanout <= 32`, so `hex[2 * i .. 2 * i + 2]` cannot run off the end.
+    /// Without it a short `hex` panicked in Debug and, in ReleaseFast where
+    /// the bounds check is gone, read adjacent stack bytes into a directory
+    /// name.
+    fn requireCasHex(hex: []const u8) Error!void {
+        if (hex.len != hashdigest.hex_len) return error.InvalidName;
+        for (hex) |c| {
+            const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+            if (!ok) return error.InvalidName;
+        }
+    }
+
     fn casDir(self: Store, buf: []u8, hex: []const u8) ![]const u8 {
+        try requireCasHex(hex);
         var n = (try std.fmt.bufPrint(buf, "{s}/cas", .{self.base})).len;
         var i: u8 = 0;
         while (i < self.fanout) : (i += 1) {
@@ -289,16 +346,38 @@ pub const Store = struct {
         return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch default_if_missing;
     }
 
-    /// Overwrite a refcount sidecar with `count`. Not itself crash-atomic
-    /// (no temp+rename) — a torn write just falls back to
-    /// `default_if_missing` on the next `casRefRead`, which is the safe
-    /// direction for bookkeeping metadata (never worse than "untracked").
+    /// Overwrite a refcount sidecar with `count`, crash-atomically: the bytes
+    /// land in a hidden sibling temp and become visible with one `rename(2)`,
+    /// the same discipline every other write in this module uses.
+    ///
+    /// It used to be a bare `writeFile`, on the argument that a torn write
+    /// "just falls back to `default_if_missing`, which is the safe direction
+    /// (never worse than untracked)". That argument only holds for `gc`'s
+    /// reader, which treats an unreadable sidecar as still-referenced. The
+    /// INCREMENT path reads the same file with a default of one implicit
+    /// reference — so a torn sidecar on a blob with five referrers came back
+    /// as one, the next commit wrote two, and three references were gone.
+    /// Untracked is not a neutral state; it means something different to
+    /// every reader. Making the file untearable removes the question.
+    ///
+    /// The temp name is deterministic and every caller holds the ingest lock,
+    /// so a crash leaves at most one stale temp per blob and the next write
+    /// reuses that exact name — debris cannot accumulate. The leading dot
+    /// keeps `gcWalk`'s hidden-file skip from ever mistaking it for a blob.
     fn casRefWrite(self: Store, hex: []const u8, count: u64) !void {
         var pbuf: [800]u8 = undefined;
         const path = try self.casRefPath(&pbuf, hex);
+        var tbuf: [800]u8 = undefined;
+        const dir = try self.casDir(&tbuf, hex);
+        const tmp = try std.fmt.bufPrint(tbuf[dir.len..], "/.{s}.rc.tmp", .{hex});
+        const tmp_path = tbuf[0 .. dir.len + tmp.len];
+
         var vbuf: [24]u8 = undefined;
         const s = try std.fmt.bufPrint(&vbuf, "{d}", .{count});
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = s });
+        const cwd = std.Io.Dir.cwd();
+        try cwd.writeFile(self.io, .{ .sub_path = tmp_path, .data = s });
+        errdefer cwd.deleteFile(self.io, tmp_path) catch {};
+        try cwd.rename(tmp_path, cwd, path, self.io);
     }
 
     /// True if the content blob already exists (the dedup-hit check).
@@ -343,12 +422,27 @@ pub const Store = struct {
     /// existed (see `Options.refcount`'s doc comment for why that is
     /// contract-compatible with `gc`).
     pub fn casCommit(self: Store, hex: []const u8, tmp: []const u8) !bool {
+        try requireCasHex(hex);
         const lockf = try self.lockIngest();
         defer self.unlockIngest(lockf);
 
         if (self.casHas(hex)) {
             self.discardTemp(tmp);
-            if (self.refcount) try self.casRefWrite(hex, self.casRefRead(hex, 0) + 1);
+            // `1`, not `0`, and the difference is a blob-losing bug. This is
+            // the DEDUP branch: the content is already on disk, so somebody
+            // already holds a reference to it. A missing sidecar means that
+            // reference is untracked, which `casDelete` and `gc` both read as
+            // exactly one implicit reference — reading it as zero here wrote
+            // `1` for what are really two referrers, and the first `delete`
+            // then took the count to zero and let `gc` unlink the blob under
+            // the second. Reachable with no crash at all: any blob written
+            // before refcounting existed, or any store reopened after a
+            // `refcount = false` phase.
+            //
+            // Saturating, because the sidecar is a file anyone can corrupt: a
+            // value of `maxInt(u64)` plus one wrapped to zero in ReleaseFast,
+            // which is the collectible state.
+            if (self.refcount) try self.casRefWrite(hex, self.casRefRead(hex, 1) +| 1);
             return false;
         }
         try self.ensureCasDir(hex);
@@ -356,7 +450,10 @@ pub const Store = struct {
         const path = try self.casPath(&pbuf, hex);
         const cwd = std.Io.Dir.cwd();
         try cwd.rename(tmp, cwd, path, self.io);
-        if (self.refcount) try self.casRefWrite(hex, self.casRefRead(hex, 0) + 1);
+        // `0` is right HERE and only here: the blob did not exist a moment
+        // ago, so there is no prior referrer to preserve. Contrast the dedup
+        // branch above.
+        if (self.refcount) try self.casRefWrite(hex, self.casRefRead(hex, 0) +| 1);
         return true;
     }
 
@@ -378,6 +475,7 @@ pub const Store = struct {
     /// deletes should never reach this; one that does is told so loudly
     /// instead of getting a half-bookkept blob.
     pub fn casDelete(self: Store, hex: []const u8) !bool {
+        try requireCasHex(hex);
         if (!self.refcount) return error.RefcountDisabled;
         const lockf = try self.lockIngest();
         defer self.unlockIngest(lockf);
@@ -615,6 +713,16 @@ pub const Store = struct {
     /// Create a uniquely-named scratch file under `<base>/tmp/`. Returns a
     /// `Scratch` (open file + its path); clean up with `discardTemp` when done.
     pub fn scratchCreate(self: Store, uniq: []const u8, path_buf: []u8) !Scratch {
+        // `uniq` is interpolated straight into the path, so it needs the same
+        // check every other segment-taking entry point runs — the docs said
+        // it already did. `"../../x"` escaped the store entirely.
+        if (!segmentSafe(uniq)) return error.InvalidName;
+        // The ingest lock lives in this directory and is identified by path;
+        // handing a caller a `Scratch` over it (and `discardTemp`, its
+        // documented cleanup, unlinks whatever path it is given) is how the
+        // lock file gets replaced underneath a live holder. `lockIngest`
+        // re-checks the inode too — this refuses the in-module route outright.
+        if (std.mem.eql(u8, uniq, ingest_lock_name)) return error.InvalidName;
         try self.ensureTmpTopDir();
         const path = try std.fmt.bufPrint(path_buf, "{s}/tmp/{s}", .{ self.base, uniq });
         const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
@@ -650,8 +758,40 @@ pub const Store = struct {
     fn lockIngest(self: Store) !std.Io.File {
         try self.ensureTmpTopDir();
         var buf: [768]u8 = undefined;
-        const path = try std.fmt.bufPrint(&buf, "{s}/tmp/.ingest.lock", .{self.base});
-        return std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false, .lock = .exclusive });
+        const path = try std.fmt.bufPrint(&buf, "{s}/tmp/{s}", .{ self.base, ingest_lock_name });
+        const cwd = std.Io.Dir.cwd();
+
+        // An advisory lock is held on an INODE; the mutual exclusion it buys
+        // is only as good as everyone agreeing which inode that is. Unlink
+        // this path while a holder has it locked — an external `tmp/` cleaner,
+        // a backup restore, an admin tidying scratch — and the next locker
+        // creates a NEW inode, locks that, and walks straight into the
+        // critical section beside the first. Measured: the second process
+        // acquired "the" lock in 0 ms against a 1500 ms control.
+        //
+        // So after locking, check the descriptor still refers to what the
+        // path names. If it does not, the file was replaced between open and
+        // lock; drop it and try again. Bounded, because a caller looping on
+        // unlink would otherwise spin here forever — and an error is the
+        // right answer for a store whose lock file is being churned.
+        var attempt: u8 = 0;
+        while (attempt < lock_inode_retries) : (attempt += 1) {
+            const f = try cwd.createFile(self.io, path, .{ .truncate = false, .lock = .exclusive });
+            const held = f.stat(self.io) catch {
+                f.unlock(self.io);
+                f.close(self.io);
+                continue;
+            };
+            const named = cwd.statFile(self.io, path, .{}) catch {
+                f.unlock(self.io);
+                f.close(self.io);
+                continue;
+            };
+            if (held.inode == named.inode) return f;
+            f.unlock(self.io);
+            f.close(self.io);
+        }
+        return error.IngestLockUnstable;
     }
 
     fn unlockIngest(self: Store, f: std.Io.File) void {
@@ -1557,4 +1697,209 @@ test "scratchCreate: returns a Scratch, not a Temp — write, read back via .pat
     // `discardTemp` cleans up a `Scratch` too — it only ever unlinks a path.
     store.discardTemp(s.path);
     try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, s.path, .{}));
+}
+
+// ── audit 2026-09-01: the guards nothing was holding ────────────────────────
+
+test "SECURITY: a sidecar-less blob keeps every reference when a second referrer puts it" {
+    // The whole store agreed a blob with no `.rc` sidecar carries one implicit
+    // reference — `casDelete` read it that way, `gc` read it that way, and
+    // three doc comments said so. `casCommit`'s dedup branch read it as ZERO.
+    // So the second referrer's `put` wrote `1` for two live references, the
+    // first referrer's `delete` took it to `0`, and `gc` unlinked the blob
+    // under the second. No crash required: this is any blob written before
+    // refcounting existed, or any store reopened after a `refcount = false`
+    // phase.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const gpa = std.testing.allocator;
+
+    // Phase 1: a store that writes no sidecars — exactly a pre-refcount store.
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const legacy = try Store.initOptions(std.testing.io, base, .{ .refcount = false });
+    const d = try legacy.putBytes("content two manifests both reference");
+    try t.expect(legacy.has(d));
+
+    // Phase 2: reopened WITH refcounting, as the option's docs invite. A
+    // second referrer puts the same content (a dedup hit).
+    const store = try Store.init(std.testing.io, base);
+    _ = try store.putBytes("content two manifests both reference");
+
+    // The first referrer drops its reference. One of two must survive.
+    try t.expect(try store.delete(d));
+
+    var stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed);
+    try t.expect(store.has(d));
+
+    // And the second referrer dropping its own reference DOES make it
+    // collectible — the fix must not simply make blobs immortal.
+    try t.expect(try store.delete(d));
+    stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 1), stats.blobs_removed);
+    try t.expect(!store.has(d));
+}
+
+test "SECURITY: a saturated refcount never wraps back to collectible" {
+    // The sidecar is a plain file. At `maxInt(u64)`, `+ 1` wrapped to zero in
+    // ReleaseFast — where the overflow check is gone — and the next `gc`
+    // reclaimed a blob whose count had just been at its maximum.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+
+    const d = try store.putBytes("a blob whose bookkeeping was tampered with");
+    try store.casRefWrite(&d.hex, std.math.maxInt(u64));
+    _ = try store.putBytes("a blob whose bookkeeping was tampered with");
+
+    try t.expectEqual(std.math.maxInt(u64), store.casRefRead(&d.hex, 0));
+    const stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed);
+    try t.expect(store.has(d));
+}
+
+test "SECURITY: gc never collects a blob with no sidecar (the always-referenced rule)" {
+    // Stated in the module doc, in `gc`'s doc and in `Options.refcount`'s doc
+    // — and pinned by nothing. Flipping `orelse continue` to `orelse 0` in
+    // `gcWalk` turned the store's flagship fail-safe fully fail-open with the
+    // suite still green in both optimisation modes.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+
+    const d = try store.putBytes("a blob whose sidecar does not exist");
+    // Remove the sidecar, leaving the blob: the pre-refcount on-disk shape.
+    var pbuf: [800]u8 = undefined;
+    const rc_path = try store.casRefPath(&pbuf, &d.hex);
+    try std.Io.Dir.cwd().deleteFile(store.io, rc_path);
+
+    const stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed);
+    try t.expect(store.has(d));
+}
+
+test "refcount floor: deleting past zero stays at zero, never wraps" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+
+    const d = try store.putBytes("deleted more times than it was put");
+    try t.expect(try store.delete(d)); // 1 -> 0
+    try t.expect(try store.delete(d)); // 0 -> 0, must not wrap to maxInt
+    try t.expectEqual(@as(u64, 0), store.casRefRead(&d.hex, 7));
+
+    // A wrapped count would read as maxInt and make the blob immortal.
+    const stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 1), stats.blobs_removed);
+}
+
+test "refcount: a delete on a sidecar-less blob consumes its one implicit reference" {
+    // The other half of the implicit-reference rule, and equally unpinned:
+    // `casDelete`'s default of 1 is what lets a legacy blob ever be reclaimed.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+
+    const d = try store.putBytes("legacy blob, single owner");
+    var pbuf: [800]u8 = undefined;
+    const rc_path = try store.casRefPath(&pbuf, &d.hex);
+    try std.Io.Dir.cwd().deleteFile(store.io, rc_path);
+
+    try t.expect(try store.delete(d)); // implicit 1 -> 0
+    try t.expectEqual(@as(u64, 0), store.casRefRead(&d.hex, 9));
+    const stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 1), stats.blobs_removed);
+}
+
+test "SECURITY: every raw-hex CAS entry point rejects a hex that is not one" {
+    // `casPath`/`casHas`/`casOpen`/`casCommit`/`casDelete` are public and take
+    // `hex` verbatim; the docs claimed "CAS hex keys are generated internally
+    // and always safe". `casDelete("../victim")` wrote `victim.rc` OUTSIDE the
+    // store. The fan-out slicing is what turns a leading `..` into a real
+    // directory climb.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+
+    var pbuf: [800]u8 = undefined;
+    for ([_][]const u8{ "../victim", "..", "", "abc", "/etc/passwd", "AB" ** 32 }) |bad| {
+        try t.expectError(error.InvalidName, store.casPath(&pbuf, bad));
+        try t.expect(!store.casHas(bad));
+        try t.expectError(error.InvalidName, store.casDelete(bad));
+        try t.expectError(error.InvalidName, store.casOpen(bad));
+    }
+    // A short hex used to index off the end of the slice: a Debug panic, and
+    // in ReleaseFast adjacent stack bytes read into a directory name.
+    try t.expectError(error.InvalidName, store.casPath(&pbuf, "ab"));
+}
+
+test "SECURITY: scratchCreate validates its name, and refuses the ingest lock's" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+
+    var pbuf: [800]u8 = undefined;
+    // Traversal: this wrote a file two levels above the store root.
+    try t.expectError(error.InvalidName, store.scratchCreate("../../escaped", &pbuf));
+    try t.expectError(error.InvalidName, store.scratchCreate("a/b", &pbuf));
+    try t.expectError(error.InvalidName, store.scratchCreate("", &pbuf));
+    // The ingest lock is identified by path. Handing a caller a writable
+    // handle on it — and `discardTemp` unlinks whatever path it is given — is
+    // how the lock file gets replaced under a live holder.
+    try t.expectError(error.InvalidName, store.scratchCreate(ingest_lock_name, &pbuf));
+    // An ordinary name still works.
+    var ok = try store.scratchCreate("work-1", &pbuf);
+    ok.file.close(store.io);
+    store.discardTemp(ok.path);
+}
+
+test "Options.fanout bounds are enforced, not merely documented" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+
+    try t.expectError(error.InvalidFanout, Store.initOptions(std.testing.io, base, .{ .fanout = 0 }));
+    // 33 levels would slice `hex[64..66]` out of a 64-character digest.
+    try t.expectError(error.InvalidFanout, Store.initOptions(std.testing.io, base, .{ .fanout = 33 }));
+    _ = try Store.initOptions(std.testing.io, base, .{ .fanout = 32 });
+}
+
+test "casRefWrite leaves no temp behind, and a stale one is never taken for a blob" {
+    // The sidecar write is now temp+rename. Two properties follow: a
+    // successful write leaves nothing extra on disk, and a temp left by a
+    // crash is invisible to `gc` (the leading dot puts it under the
+    // hidden-file skip) rather than being swept as if it were a blob.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+
+    const d = try store.putBytes("a blob with a refcount");
+    var dbuf: [800]u8 = undefined;
+    const dir_path = try store.casDir(&dbuf, &d.hex);
+    var tbuf: [900]u8 = undefined;
+    const stale = try std.fmt.bufPrint(&tbuf, "{s}/.{s}.rc.tmp", .{ dir_path, d.hex });
+
+    // Nothing left over from the write that just happened.
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(store.io, stale, .{}));
+
+    // Simulate a crash between write and rename, then check gc's verdict.
+    try std.Io.Dir.cwd().writeFile(store.io, .{ .sub_path = stale, .data = "999" });
+    const stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed);
+    try t.expect(store.has(d));
+    try t.expectEqual(@as(u64, 1), store.casRefRead(&d.hex, 0));
 }

@@ -11,8 +11,11 @@ named records. Usage: see ./README.md. Attribution/provenance: see this module's
   (scratch + in-flight ingest temps + the `tmp/.ingest.lock` cross-process lock file). Each of these
   four subdirectories is created lazily, on that layer's first write, not at `Store.init` time — a
   store that never uses a layer (e.g. never calls `putNamed`) never creates its directory.
-- **Crash safety:** every write lands in a hidden `.part` temp, is fsync'd, made visible by a single
-  `rename(2)`. A crash mid-write leaves only an orphaned temp; a live blob is never torn or partial.
+- **Crash safety:** every write lands in a hidden temp and is made visible by a single `rename(2)`,
+  including the `.rc` refcount sidecars since 2026-09-01 — a crash mid-write leaves only an orphaned
+  temp; a live blob or sidecar is never torn or partial. **`fsync` is not part of that invariant and
+  this line used to claim it was:** the module contains one `sync` call, in `put`. `putNamed` and the
+  raw `commit` path rename an unsynced temp, so they are atomic but not durable across power loss.
 - **Dedup:** `put` hashes while streaming (single pass, bounded memory); `casCommit` skips the
   rename if the content already exists — one copy on disk regardless of put count — but still bumps
   that blob's refcount, since a dedup hit is a real reference.
@@ -84,7 +87,15 @@ named records. Usage: see ./README.md. Attribution/provenance: see this module's
   the pre-commit phase the lock doesn't cover.
 - **Path safety:** `ns`/`key` must be single safe segments (`segmentSafe`: `[A-Za-z0-9._-]`, no
   leading dot, no `.`/`..`), checked on every public entry point — a request can never traverse out
-  of `base`. CAS hex keys are generated internally and always safe.
+  of `base`. **The sentence that used to follow — "CAS hex keys are generated internally and always
+  safe" — was false, and the escape clause it granted was the bug.** `casPath`, `casHas`, `casOpen`,
+  `casCommit` and `casDelete` are all public and take `hex` verbatim from the caller; with the
+  fan-out slicing added in `3ac5fee9`, a leading `..` became a real directory climb, and
+  `casDelete("../victim")` WROTE a `.rc` sidecar outside the store. Since 2026-09-01 every CAS path
+  is built through `requireCasHex` (exactly 64 lowercase-hex characters), which also supplies the
+  length precondition the fan-out loop never had — a short `hex` used to panic in Debug and, in
+  ReleaseFast, read adjacent stack bytes into a directory name. `scratchCreate` was the other
+  unguarded entry point and now runs `segmentSafe` like its siblings.
 - **Verification primitive:** `verify` re-reads stored bytes to EOF (via `hashdigest.sha256File`,
   which does not trust `stat().size`) and compares to the address, catching silent bit-rot/tampering.
 - Reentrant — shared state (refcounts, gc) is coordinated via the advisory ingest flock, not
@@ -130,7 +141,7 @@ reopened with `refcount = false`, `hasOrphanedRcSidecars` finding the stale side
 confirming it is truthfully untouched (`blobs_removed == 0`).
 
 ## Backlog / deferred
-None outstanding from the original three-item backlog (garbage collection, reference counting,
+None outstanding from the original four-item backlog (garbage collection, reference counting,
 configurable fan-out depth, cross-process ingest locking/isolation) — all implemented, see
 "Design & invariants" above. Possible future work, not currently planned: `gc` does not sweep
 `raw/`/`named/` temp debris (only `cas/.ingest-*.part`, since those are the only ones this module's

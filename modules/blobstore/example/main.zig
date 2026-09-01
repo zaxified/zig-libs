@@ -42,8 +42,15 @@ pub fn main() !void {
 
     var accepted: usize = 0;
     for (manifest) |e| {
-        // 1. `ns`/`key` must be single, safe path segments -- the same check
-        //    every `Store` entry point runs before touching disk.
+        // 1. `ns`/`key` must be single, safe path segments. Every `Store`
+        //    entry point that takes a segment runs this same check before
+        //    touching disk -- and as of 2026-09-01 that really is every one
+        //    of them: `scratchCreate` used to interpolate its name unchecked,
+        //    and the five raw-hex CAS functions took `hex` verbatim, so
+        //    `casDelete("../victim")` wrote a sidecar outside the store.
+        //    Checking here anyway is still the right shape for a caller: it
+        //    rejects the entry by name instead of discovering it at the
+        //    filesystem.
         if (!blobstore.segmentSafe(e.ns) or !blobstore.segmentSafe(e.key)) {
             std.debug.print("reject {s}/{s}: unsafe path segment\n", .{ e.ns, e.key });
             continue;
