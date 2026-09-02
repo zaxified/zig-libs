@@ -31,7 +31,13 @@ pub fn main() !void {
 
     // First record is the header row.
     const header_line = it.next() orelse return error.EmptyFile;
-    var header_buf: [8][]const u8 = undefined;
+    // Sized generously on purpose: `splitFields` now REFUSES a record with
+    // more fields than the buffer holds rather than silently dropping the
+    // surplus, and a header and its rows split with the same too-small buffer
+    // were both truncated to the same width — so the ragged-row check below
+    // reported a match on data that had already lost columns
+    // (W2 re-audit 2026-09-02, `csvstream` F2/F3).
+    var header_buf: [64][]const u8 = undefined;
     const header_fields = try csvstream.splitFields(header_line.bytes, &header_buf, ',', '"', gpa);
     var header = try csvstream.Header.init(gpa, header_fields);
     defer header.deinit();
@@ -39,7 +45,7 @@ pub fn main() !void {
 
     // Remaining records are data rows.
     while (it.next()) |record| {
-        var field_buf: [8][]const u8 = undefined;
+        var field_buf: [64][]const u8 = undefined;
         const fields = try csvstream.splitFields(record.bytes, &field_buf, ',', '"', gpa);
         try header.validateArity(fields);
 

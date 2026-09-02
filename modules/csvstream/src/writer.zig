@@ -76,6 +76,19 @@ pub fn writeField(w: *std.Io.Writer, field: []const u8, opts: WriteOptions) std.
 /// Writes one full record: `fields` joined by `opts.delimiter`, each quoted
 /// per `writeField`, terminated by `opts.line_terminator`.
 pub fn writeRecord(w: *std.Io.Writer, fields: []const []const u8, opts: WriteOptions) std.Io.Writer.Error!void {
+    // A single empty field is the one record whose unquoted form is
+    // indistinguishable from an empty line — and `LineIterator` skips empty
+    // lines, so a legitimate one-column row with an empty value was written
+    // and then silently vanished on read-back. Python's `csv.writer` quotes
+    // exactly this case for exactly this reason, and it was the ONLY
+    // divergence from it across 6001 random rows. The module's own test
+    // asserted the loss as correct (W2 re-audit 2026-09-02, `csvstream` F4).
+    if (fields.len == 1 and fields[0].len == 0 and opts.quote != 0) {
+        try w.writeByte(opts.quote);
+        try w.writeByte(opts.quote);
+        try w.writeAll(opts.line_terminator.bytes());
+        return;
+    }
     for (fields, 0..) |field, i| {
         if (i != 0) try w.writeByte(opts.delimiter);
         try writeField(w, field, opts);
@@ -126,9 +139,23 @@ test "writeRecord: field starting and ending with quote chars, all doubled" {
     try expectRecord(&.{"\"\""}, .{}, "\"\"\"\"\"\"\r\n"); // `""` -> `""""""`
 }
 
-test "writeRecord: empty field and empty record" {
-    try expectRecord(&.{""}, .{}, "\r\n");
+test "writeRecord: a one-empty-field record survives its own round trip" {
+    // These two used to produce identical bytes, and the reader dropped them
+    // both — so `writeRecord(&.{""})` was write-only. This test asserted the
+    // loss as correct, which is why it survived (F4).
+    try expectRecord(&.{""}, .{}, "\"\"\r\n");
     try expectRecord(&.{}, .{}, "\r\n");
+
+    // …and the round trip, which is the property that actually matters.
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRecord(&w, &.{"alice"}, .{});
+    try writeRecord(&w, &.{""}, .{});
+    try writeRecord(&w, &.{"bob"}, .{});
+    var it = line.LineIterator.init(w.buffered(), '"', 0);
+    var n: usize = 0;
+    while (it.next()) |_| n += 1;
+    try t.expectEqual(@as(usize, 3), n);
 }
 
 test "writeRecord: custom delimiter and quote char" {

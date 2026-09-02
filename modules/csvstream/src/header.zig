@@ -30,6 +30,11 @@ pub const Header = struct {
 
         var index = std.StringHashMap(usize).init(alloc);
         errdefer index.deinit();
+        // `@intCast` is not a guard: `Header.init` is public and takes an
+        // arbitrary slice, so in ReleaseFast a length past 2^32 truncated
+        // silently and `putAssumeCapacity` below then overran the map
+        // (W2 re-audit 2026-09-02, `csvstream` F9).
+        if (fields.len > std.math.maxInt(u32)) return error.TooManyColumns;
         try index.ensureTotalCapacity(@intCast(fields.len));
 
         for (fields, 0..) |f, i| {

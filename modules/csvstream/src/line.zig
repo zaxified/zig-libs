@@ -23,6 +23,12 @@ const std = @import("std");
 pub fn splitFields(line: []const u8, buf: [][]const u8, delimiter: u8, quote: u8, alloc: std.mem.Allocator) ![][]const u8 {
     var count: usize = 0;
     var pos: usize = 0;
+    // Fields that needed unescaping are alloc-owned. On an error partway
+    // through, the caller never receives the slice, so without this they were
+    // simply unreachable (W2 re-audit 2026-09-02, `csvstream` F7).
+    var owned: [64]usize = undefined;
+    var owned_n: usize = 0;
+    errdefer for (owned[0..owned_n]) |i| alloc.free(buf[i]);
     // Loop condition: pos <= line.len (one past end) lets the outer while
     // reach the `if (pos == line.len) break` sentinel for the trailing-field
     // case, avoiding a separate post-loop append.
@@ -41,8 +47,21 @@ pub fn splitFields(line: []const u8, buf: [][]const u8, delimiter: u8, quote: u8
                     if (pos + 1 < line.len and line[pos + 1] == quote) {
                         has_escaped_quote = true;
                         pos += 2; // Skip escaped quote (e.g. "")
+                    } else if (pos + 1 == line.len or line[pos + 1] == delimiter) {
+                        break; // Closing quote: end of record, or a delimiter next.
                     } else {
-                        break; // Closing quote
+                        // ⚠ A lone quote with something OTHER than a delimiter
+                        // after it is a literal quote — Go `encoding/csv`'s
+                        // `LazyQuotes` rule, which this module's docs name as
+                        // its model. It used to close the field here, so a
+                        // field boundary was emitted at a position where the
+                        // input contains no delimiter: `"a"b` became two
+                        // fields, `"a,b"c,d` became three. File content then
+                        // chose a row's column count, `Header.get` read the
+                        // wrong column, and `unbalanced_quote` stayed false
+                        // because the quotes really were balanced
+                        // (W2 re-audit 2026-09-02, `csvstream` F1).
+                        pos += 1;
                     }
                 } else {
                     pos += 1;
@@ -56,6 +75,10 @@ pub fn splitFields(line: []const u8, buf: [][]const u8, delimiter: u8, quote: u8
             // allocation in the common case).
             if (has_escaped_quote) {
                 buf[count] = try unescapeQuotes(raw, quote, alloc);
+                if (owned_n < owned.len) {
+                    owned[owned_n] = count;
+                    owned_n += 1;
+                }
             } else {
                 buf[count] = raw;
             }
@@ -68,7 +91,48 @@ pub fn splitFields(line: []const u8, buf: [][]const u8, delimiter: u8, quote: u8
         }
         count += 1;
     }
+    // The surplus used to be dropped in silence — and because a header and its
+    // rows are usually split with the same buffer, both were truncated to the
+    // same width, so `validateArity` reported a match and `Header.len()`
+    // returned the truncated column count as if it were the true one. The
+    // signature always had an error channel; nothing used it
+    // (W2 re-audit 2026-09-02, `csvstream` F2).
+    if (count == buf.len and pos < line.len) return error.FieldBufferTooSmall;
     return buf[0..count];
+}
+
+/// How many fields `splitFields` would produce for `line` — the true count,
+/// independent of any buffer. Exists because `splitFields`'s "buf must be
+/// large enough" was a precondition a caller had no way to evaluate: learning
+/// the count meant re-implementing the quote-aware scan.
+pub fn countFields(line: []const u8, delimiter: u8, quote: u8) usize {
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (pos <= line.len) {
+        if (pos == line.len) break;
+        if (quote != 0 and line[pos] == quote) {
+            pos += 1;
+            while (pos < line.len) {
+                const b = line[pos];
+                if (b == quote) {
+                    if (pos + 1 < line.len and line[pos + 1] == quote) {
+                        pos += 2;
+                    } else if (pos + 1 == line.len or line[pos + 1] == delimiter) {
+                        break;
+                    } else {
+                        pos += 1;
+                    }
+                } else pos += 1;
+            }
+            if (pos < line.len) pos += 1;
+            if (pos < line.len and line[pos] == delimiter) pos += 1;
+        } else {
+            while (pos < line.len and line[pos] != delimiter) : (pos += 1) {}
+            if (pos < line.len) pos += 1;
+        }
+        n += 1;
+    }
+    return n;
 }
 
 /// One record produced by `LineIterator.next()`: the record bytes (a slice into
@@ -176,6 +240,10 @@ pub fn stripBom(bytes: []const u8) []const u8 {
 /// The returned slice is allocated with `alloc`.
 fn unescapeQuotes(s: []const u8, quote: u8, alloc: std.mem.Allocator) ![]u8 {
     var out = std.array_list.Managed(u8).init(alloc);
+    // `toOwnedSlice` can allocate too, so a failure anywhere after the
+    // reserve leaked the whole list — the same missing-errdefer shape as its
+    // caller (W2 re-audit 2026-09-02, `csvstream` F7).
+    errdefer out.deinit();
     try out.ensureTotalCapacity(s.len);
     var i: usize = 0;
     while (i < s.len) {
@@ -493,4 +561,79 @@ fn fuzzSplitFields(_: void, smith: *std.testing.Smith) !void {
 
     var fields_buf: [64][]const u8 = undefined;
     _ = splitFields(line_buf[0..len], &fields_buf, delimiter, quote, arena.allocator()) catch return;
+}
+
+test "a field ends only at a delimiter or at end of record" {
+    const gpa = std.testing.allocator;
+    // Junk after a closing quote used to end the field there, emitting a
+    // boundary at a position where the input contains no delimiter. Expected
+    // values below are Go `encoding/csv` with `LazyQuotes=true`, which is the
+    // model this module's own docs name (W2 re-audit 2026-09-02, F1).
+    const cases = [_]struct { in: []const u8, want: []const []const u8 }{
+        .{ .in = "\"a\"b", .want = &.{"a\"b"} },
+        .{ .in = "\"\"a", .want = &.{"\"a"} },
+        .{ .in = "\"a\"b\"c", .want = &.{"a\"b\"c"} },
+        .{ .in = "\"a\" ,b", .want = &.{"a\" ,b"} },
+        .{ .in = "\"a,b\"c,d", .want = &.{"a,b\"c,d"} },
+        // …and the ordinary shapes still behave.
+        .{ .in = "\"a\",b", .want = &.{ "a", "b" } },
+        .{ .in = "\"a,b\",c", .want = &.{ "a,b", "c" } },
+        .{ .in = "a,b", .want = &.{ "a", "b" } },
+        .{ .in = "\"a\"\"b\"", .want = &.{"a\"b"} },
+    };
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var buf: [8][]const u8 = undefined;
+        const got = try splitFields(c.in, &buf, ',', '"', arena.allocator());
+        // The count first: an inflated field count is the shape that shifts
+        // every later column.
+        try std.testing.expectEqual(c.want.len, got.len);
+        try std.testing.expectEqual(c.want.len, countFields(c.in, ',', '"'));
+        try std.testing.expectEqualStrings(c.want[0], got[0]);
+    }
+}
+
+test "a record with more fields than the buffer holds is an error, not a short row" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const wide = "c1,c2,c3,c4,c5,c6,c7,c8,c9,c10";
+    try std.testing.expectEqual(@as(usize, 10), countFields(wide, ',', '"'));
+
+    var small: [4][]const u8 = undefined;
+    try std.testing.expectError(error.FieldBufferTooSmall, splitFields(wide, &small, ',', '"', a));
+
+    // Exactly the right size is fine — the bound is pinned at the value, not
+    // near it.
+    var exact: [10][]const u8 = undefined;
+    const got = try splitFields(wide, &exact, ',', '"', a);
+    try std.testing.expectEqual(@as(usize, 10), got.len);
+
+    // The composed case this made possible: header and row split with the
+    // same too-small buffer were truncated to the same width, so the module's
+    // own ragged-row guard reported a match and `Header.get` returned another
+    // column's bytes (F3).
+    var hbuf: [3][]const u8 = undefined;
+    try std.testing.expectError(
+        error.FieldBufferTooSmall,
+        splitFields("user,note,role,extra", &hbuf, ',', '"', a),
+    );
+}
+
+test "a failed split frees the fields it had already allocated" {
+    // Only escaped-quote fields allocate, so this needs two of them and a
+    // failure on the second. Without the errdefer the first one's bytes are
+    // unreachable: the caller never receives the slice
+    // (W2 re-audit 2026-09-02, `csvstream` F7).
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    const a = failing.allocator();
+    var buf: [4][]const u8 = undefined;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        splitFields("\"a\"\"a\",\"b\"\"b\"", &buf, ',', '"', a),
+    );
+    try std.testing.expectEqual(failing.allocations, failing.deallocations);
 }

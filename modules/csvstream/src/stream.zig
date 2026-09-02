@@ -65,6 +65,23 @@ pub const ChunkReader = struct {
     max_record_len: usize,
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, chunk_size: usize) !ChunkReader {
+        return initMax(io, alloc, file, chunk_size, 0);
+    }
+
+    /// `max_record_len` of 0 means "the resolved chunk size" — the bound the
+    /// README and SPEC always claimed ("peak is the chunk size, not the file
+    /// size"). It used to be `@max(resolved_chunk, default_chunk_size)`, a
+    /// **10 MiB floor the caller could not lower**: asking for 1 KiB chunks
+    /// still permitted a 1 MiB allocation with no error, and
+    /// `StreamReader.Options` exposed no knob at all
+    /// (W2 re-audit 2026-09-02, `csvstream` F5).
+    pub fn initMax(
+        io: std.Io,
+        alloc: std.mem.Allocator,
+        file: std.Io.File,
+        chunk_size: usize,
+        max_record_len: usize,
+    ) !ChunkReader {
         const stat = try file.stat(io);
         const resolved_chunk = if (chunk_size == 0) default_chunk_size else chunk_size;
         return .{
@@ -77,7 +94,7 @@ pub const ChunkReader = struct {
             .bytes_read = 0,
             .eof = false,
             .chunk_start_in_file = 0,
-            .max_record_len = @max(resolved_chunk, default_chunk_size),
+            .max_record_len = if (max_record_len == 0) resolved_chunk else max_record_len,
         };
     }
 
@@ -116,22 +133,24 @@ pub const ChunkReader = struct {
                 self.last_emit_len = self.buffer.items.len;
                 return self.buffer.items;
             }
-            // Right-size the next read: never reserve more than what the file
-            // still has to offer, so a tiny file caps the buffer at its size.
-            const remaining: u64 = if (self.bytes_read >= self.total_size)
-                0
+            // Right-size the next read from the size seen at `init` — but
+            // only as a HINT. Deciding EOF from it made two silent failures:
+            // any readable file whose `stat.size` is 0 (every `/proc` file)
+            // yielded zero records and was indistinguishable from an empty
+            // one, and bytes appended after `init` were dropped with the last
+            // partial record emitted as if it were complete. EOF now comes
+            // from a read returning 0, which is the only thing that means it
+            // (W2 re-audit 2026-09-02, `csvstream` F6).
+            const hint: u64 = if (self.bytes_read >= self.total_size)
+                self.chunk_size
             else
                 self.total_size - self.bytes_read;
-            if (remaining == 0) {
-                self.eof = true;
-                continue;
-            }
             // Bound memory on a newline-free input: if we have already buffered a
             // whole record's worth (max_record_len) with no boundary and there is
             // still more file to read, the record is pathological — fail closed
             // instead of growing the buffer to the entire file size.
             if (self.buffer.items.len >= self.max_record_len) return error.RecordTooLong;
-            const want_cap: usize = @intCast(@min(@as(u64, self.chunk_size), remaining));
+            const want_cap: usize = @intCast(@min(@as(u64, self.chunk_size), hint));
             try self.buffer.ensureUnusedCapacity(want_cap);
             const dest = self.buffer.unusedCapacitySlice();
             const want = @min(dest.len, want_cap);
@@ -178,11 +197,15 @@ pub const StreamReader = struct {
         delimiter: u8 = ',',
         /// Target chunk size in bytes (0 = `default_chunk_size`).
         chunk_size: usize = default_chunk_size,
+        /// Longest single record this reader will buffer before returning
+        /// `error.RecordTooLong`. 0 = the resolved chunk size, which is what
+        /// "peak memory is the chunk size" means.
+        max_record_len: usize = 0,
     };
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, opts: Options) !StreamReader {
         return .{
-            .chunks = try ChunkReader.init(io, alloc, file, opts.chunk_size),
+            .chunks = try ChunkReader.initMax(io, alloc, file, opts.chunk_size, opts.max_record_len),
             .quote = opts.quote,
             .delimiter = opts.delimiter,
             .lines = LineIterator.init("", opts.quote, 0),
@@ -505,4 +528,58 @@ test "StreamReader.nextFields: default delimiter still splits on comma (non-brea
     try t.expectEqualStrings("a", fields[0]);
     try t.expectEqualStrings("b", fields[1]);
     try t.expectEqualStrings("c", fields[2]);
+}
+
+test "a readable file whose stat says 0 bytes still yields its records" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Every `/proc` file reports `stat.size == 0` and is perfectly readable.
+    // EOF used to be decided from that cached size, so this returned zero
+    // records — indistinguishable from a genuinely empty file, which the
+    // suite does test (W2 re-audit 2026-09-02, `csvstream` F6).
+    const f = std.Io.Dir.cwd().openFile(io, "/proc/self/status", .{}) catch
+        return error.SkipZigTest;
+    defer f.close(io);
+    const st = try f.stat(io);
+    if (st.size != 0) return error.SkipZigTest; // not the shape we mean to pin
+
+    var sr = try StreamReader.init(io, gpa, f, .{ .chunk_size = 4096 });
+    defer sr.deinit();
+    var n: usize = 0;
+    while (try sr.next()) |_| n += 1;
+    try std.testing.expect(n > 0);
+}
+
+test "max_record_len is the caller's, and defaults to the chunk size" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // One record with no newline, longer than a small chunk.
+    const big = try gpa.alloc(u8, 8192);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "wide.csv", .data = big });
+    const f = try tmp.dir.openFile(io, "wide.csv", .{});
+    defer f.close(io);
+
+    // A caller asking for 1 KiB chunks used to get a 10 MiB ceiling it could
+    // not lower, and `Options` had no knob at all (F5).
+    var sr = try StreamReader.init(io, gpa, f, .{ .chunk_size = 1024 });
+    defer sr.deinit();
+    try std.testing.expectEqual(@as(usize, 1024), sr.chunks.max_record_len);
+    try std.testing.expectError(error.RecordTooLong, sr.next());
+
+    const f2 = try tmp.dir.openFile(io, "wide.csv", .{});
+    defer f2.close(io);
+    var sr2 = try StreamReader.init(io, gpa, f2, .{ .chunk_size = 1024, .max_record_len = 16384 });
+    defer sr2.deinit();
+    try std.testing.expectEqual(@as(usize, 16384), sr2.chunks.max_record_len);
+    try std.testing.expect((try sr2.next()) != null);
 }

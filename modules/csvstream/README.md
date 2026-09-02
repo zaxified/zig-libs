@@ -4,7 +4,7 @@ Streaming RFC 4180 CSV reader that **preserves byte offsets**. Every record
 comes out with the absolute file offset of its first byte, so a consumer can
 seek straight back to the exact source span (drill-down, `--trace`-style source
 locators, error reporting). Streams arbitrarily large files in **bounded
-memory** — peak is the chunk size, not the file size.
+memory** — peak is `max_record_len` (which defaults to the chunk size), not the file size.
 
 - **Model after:** RFC 4180 + byte-offset-preserving streaming.
 - **Platform:** any. **Role:** codec. **Concurrency:** reentrant (no shared
@@ -87,7 +87,11 @@ disables quoting, mirroring the reader's convention), and `line_terminator`
 Note: a writer-emitted field with an embedded `\n`/`\r` is valid RFC 4180, but
 this module's own reader cannot re-parse it back into one record (see
 "Quoting semantics" above) — that's a permanent, documented asymmetry, not a
-bug.
+bug. ⚠ It was described here as *the* asymmetry; a second one was not
+documented at all and was pinned as correct by the writer's own test — a
+single empty field was written unquoted, i.e. as an empty line, which the
+reader then skips. That one **was** a bug and is fixed: `writeRecord(&.{""})`
+emits `""`, the way `csv.writer` does and for the same reason.
 
 ## Header-row handling (opt-in)
 
