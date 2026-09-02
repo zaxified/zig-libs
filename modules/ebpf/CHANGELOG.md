@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — Security audit: `findMember`/`findPath` are now bounded by the
+  WORK they do, not only by how deep they recurse (new
+  `TypeError.TypeSearchTooWide`, `max_member_visits`). `max_resolve_depth`
+  bounded the stack; nothing bounded the breadth, and the search descends once
+  per anonymous composite member — so a chain of 30 structs each holding two
+  anonymous members of the level below is a 2^30-node tree, walked in full
+  whenever the name is absent, which is the ordinary "this kernel does not have
+  that field" answer CO-RE depends on. A blob under 4 KB was enough: with the
+  bound removed again the new regression test does not finish in 45 seconds.
+  No cycle is involved — the depth bound always caught those.
+
 - **2026-09-02** — Security audit: **an attacker-supplied object file could reach a
   `@memcpy` of 2^64-8 bytes**. `splitProgramSection` bounded a symbol's `st_value`
   against the section but never its `st_size`, and wrote the range check as

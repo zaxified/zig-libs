@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — Security audit: a plaintext `UserNameIdentityToken` is now
+  refused unless the client named a `UserTokenPolicy` this server advertises
+  **and** that policy is `#None`. The refusal used to be nested inside
+  `if (parsed.policy_id) |pid|` and `if (userTokenPolicy(cfg, pid)) |policy|`,
+  both of which fall through when absent — so a token carrying no PolicyId, or
+  naming an unadvertised one, had its cleartext password accepted against an
+  endpoint whose only username policy demands encryption. The module's own test
+  for this passed the one PolicyId that reaches the guard, so it proved the
+  branch works without proving the branch is reached.
+- **2026-09-02** — Security audit: `SamplingInterval` is clamped at both ends
+  (new `Config.max_sampling_interval_ms`). It had a floor and no ceiling, unlike
+  `reviseInterval` and `reviseKeepAlive` beside it, so a client-supplied
+  `Double` of 1e300 came back verbatim and was then added to a millisecond clock
+  as an `i64`: a remote panic in Debug and ReleaseSafe, and in ReleaseFast an
+  `i64` poison value that made `now_ms < next_sample_ms` never true — the item
+  sampled on EVERY tick while the server reported
+  `RevisedSamplingInterval = 1e300`. Asking for the slowest interval got you the
+  fastest, the exact inverse of what `min_sampling_interval_ms` enforces. Both
+  `CreateMonitoredItems` and `ModifyMonitoredItems` route through the clamp.
+
 - **2026-09-02** — Security audit: **a `SecurityPolicy#None` channel was accepted by
   a server that advertises no `#None` endpoint.** `endpointOffers` — documented as
   "The gate every `OpenSecureChannel` passes through", with `Config.endpoints`

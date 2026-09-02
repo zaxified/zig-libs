@@ -220,6 +220,16 @@ pub const Config = struct {
     /// publishing-interval band a subscription may be granted (milliseconds)
     /// — the rate limiter that keeps a client from asking this server to spin.
     min_sampling_interval_ms: f64 = 50,
+    /// Slowest sampling interval a monitored item may be granted. This is not
+    /// politeness: `SamplingInterval` is a client-supplied `Double` and the
+    /// revised value is added to a millisecond clock as an `i64`. Without a
+    /// ceiling, a request of 1e300 reached `@intFromFloat` — a remote panic in
+    /// Debug and ReleaseSafe, and in ReleaseFast an `i64` poison value that
+    /// made `now_ms < next_sample_ms` never true, so the item sampled on EVERY
+    /// tick while the server reported `RevisedSamplingInterval = 1e300`.
+    /// Asking for the slowest possible interval got you the fastest, which is
+    /// the exact inverse of what `min_sampling_interval_ms` exists to enforce.
+    max_sampling_interval_ms: f64 = 3_600_000,
     min_publishing_interval_ms: f64 = 50,
     max_publishing_interval_ms: f64 = 3_600_000,
     max_notifications_per_publish: u32 = 1024,
@@ -2104,15 +2114,29 @@ pub const Connection = struct {
             const user = parsed.user_name orelse return status.bad_identity_token_invalid;
             var password = parsed.password orelse &.{};
             if (algo.len == 0) {
-                // Plaintext. Refuse it if the policy the client named
-                // demands encryption — the whole point of that policy.
-                if (parsed.policy_id) |pid| {
-                    if (userTokenPolicy(cfg, pid)) |policy| {
-                        const policy_uri = policy.security_policy_uri orelse services.security_policy_none_uri;
-                        if (!std.mem.eql(u8, policy_uri, services.security_policy_none_uri)) {
-                            return status.bad_identity_token_invalid;
-                        }
-                    }
+                // Plaintext, and acceptable only when the client named a
+                // UserTokenPolicy this server actually advertises AND that
+                // policy is `#None`.
+                //
+                // Written fail-CLOSED. The previous form nested the refusal
+                // inside `if (parsed.policy_id) |pid|` and
+                // `if (userTokenPolicy(cfg, pid)) |policy|`, and both fall
+                // through when absent — so a token carrying no PolicyId at
+                // all, or naming one this server does not advertise, skipped
+                // the check and had its cleartext password accepted. That is
+                // exactly backwards for an endpoint whose only username policy
+                // demands encryption, the configuration whose entire purpose
+                // is that the password never travels in the clear.
+                //
+                // The module's own test for this pinned only the reachable
+                // case: it passes `encrypted_user_name_policy_id`, the one
+                // value that gets past both `if`s. It proved the branch
+                // works, not that the branch is reached.
+                const pid = parsed.policy_id orelse return status.bad_identity_token_invalid;
+                const policy = userTokenPolicy(cfg, pid) orelse return status.bad_identity_token_invalid;
+                const policy_uri = policy.security_policy_uri orelse services.security_policy_none_uri;
+                if (!std.mem.eql(u8, policy_uri, services.security_policy_none_uri)) {
+                    return status.bad_identity_token_invalid;
                 }
             } else if (std.mem.eql(u8, algo, security.encryption_algorithm_rsa_oaep)) {
                 const sec = cfg.security orelse return status.bad_identity_token_invalid;
@@ -2897,9 +2921,13 @@ pub const Connection = struct {
 
     fn reviseSampling(cfg: Config, sub: *const Subscription, requested: f64) f64 {
         // -1 = "the publishing interval", 0 = "as fast as you can".
+        // Clamped at BOTH ends, like `reviseInterval` and `reviseKeepAlive`
+        // beside it. This was the one reviser with a floor and no ceiling, and
+        // both callers — `CreateMonitoredItems` and `ModifyMonitoredItems` —
+        // come through here, so the bound is a rule rather than two guards.
         if (!(requested >= 0)) return sub.publishing_interval_ms; // covers -1 and NaN
         if (requested == 0) return @max(cfg.min_sampling_interval_ms, sub.publishing_interval_ms);
-        return @max(requested, cfg.min_sampling_interval_ms);
+        return std.math.clamp(requested, cfg.min_sampling_interval_ms, cfg.max_sampling_interval_ms);
     }
 
     fn handleModifyMonitoredItems(c: *Connection, ctx: *Ctx, d: *encoding.Decoder) HandlerError!void {
@@ -4592,6 +4620,43 @@ fn createSubscription(rig: *TestRig, interval_ms: f64, keep_alive: u32) !service
     );
 }
 
+/// Like `rigCreateMonitoredItem`, but with a caller-chosen `SamplingInterval`
+/// so a hostile value can be driven down the real wire path.
+fn rigCreateMonitoredItemSampling(rig: *TestRig, subscription_id: u32, node_id: encoding.NodeId, client_handle: u32, sampling: f64) !services.CreateMonitoredItemsResponse {
+    const items = [_]services.MonitoredItemCreateRequest{.{
+        .item_to_monitor = .{
+            .node_id = node_id,
+            .attribute_id = services.attribute_id.value,
+            .index_range = null,
+            .data_encoding = .{ .namespace_index = 0, .name = null },
+        },
+        .monitoring_mode = .reporting,
+        .requested_parameters = .{
+            .client_handle = client_handle,
+            .sampling_interval = sampling,
+            .filter = services.no_filter,
+            .queue_size = 10,
+            .discard_oldest = true,
+        },
+    }};
+    return rig.call(
+        .message,
+        services.type_id.create_monitored_items_request,
+        services.CreateMonitoredItemsRequest,
+        .{
+            .request_header = rig.header(rig.authToken()),
+            .subscription_id = subscription_id,
+            .timestamps_to_return = .both,
+            .items_to_create = &items,
+        },
+        services.encodeCreateMonitoredItemsRequest,
+        services.CreateMonitoredItemsResponse,
+        services.type_id.create_monitored_items_response,
+        services.decodeCreateMonitoredItemsResponse,
+        services.result_fns.create_monitored_items,
+    );
+}
+
 fn rigCreateMonitoredItem(rig: *TestRig, subscription_id: u32, node_id: encoding.NodeId, client_handle: u32) !services.CreateMonitoredItemsResponse {
     const items = [_]services.MonitoredItemCreateRequest{.{
         .item_to_monitor = .{
@@ -4826,6 +4891,34 @@ test "subscription: Publish without a subscription is BadNoSubscription; the que
     _ = try parkPublish(&rig, &.{});
     try testing.expectError(error.ServiceFault, publish(&rig, &.{}));
     try testing.expectEqual(status.bad_too_many_publish_requests, rig.channel.last_service_result);
+}
+
+test "subscription: an absurd SamplingInterval is clamped, not turned into the fastest one" {
+    // Regression for a HIGH. `SamplingInterval` is a client-supplied `Double`
+    // and `reviseSampling` had a floor and no ceiling, so 1e300 came back
+    // verbatim and was then added to a millisecond clock as an `i64`:
+    // `@intFromFloat` panicked in Debug and ReleaseSafe, and in ReleaseFast
+    // produced an i64 poison value that made `now_ms < next_sample_ms` never
+    // true — so the item sampled on EVERY tick while the server reported
+    // `RevisedSamplingInterval = 1e300`. Asking for the slowest possible
+    // interval got you the fastest, which is the exact inverse of what
+    // `min_sampling_interval_ms` exists to enforce.
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+
+    const sub = try createSubscription(&rig, 100, 3);
+    defer services.freeCreateSubscriptionResponse(rig.gpa, sub);
+
+    for ([_]f64{ 1.0e300, std.math.floatMax(f64) }) |hostile| {
+        const created = try rigCreateMonitoredItemSampling(&rig, sub.subscription_id, rig.answer_id, 7, hostile);
+        defer services.freeCreateMonitoredItemsResponse(rig.gpa, created);
+        const revised = created.results.?[0].revised_sampling_interval;
+        // Bounded, and bounded by the configured ceiling rather than by luck.
+        try testing.expect(revised <= TestRig.defaultConfig().max_sampling_interval_ms);
+        try testing.expect(revised >= TestRig.defaultConfig().min_sampling_interval_ms);
+    }
 }
 
 test "subscription: SetPublishingMode/SetMonitoringMode/ModifyMonitoredItems/DeleteMonitoredItems" {
@@ -6592,6 +6685,40 @@ test "secure: encrypted UserNameIdentityToken over a SecurityPolicy#None channel
         var e = encoding.Encoder.init(&out.writer);
         try services.encodeUserNameIdentityToken(&e, .{
             .policy_id = encrypted_user_name_policy_id,
+            .user_name = test_users[0].user_name,
+            .password = test_users[0].password,
+            .encryption_algorithm = null,
+        });
+        try testing.expectError(error.ServiceFault, rig.activateSession(.{
+            .type_id = services.type_id.user_name_identity_token,
+            .encoding = .byte_string,
+            .body = out.writer.buffered(),
+        }));
+        try testing.expectEqual(status.bad_identity_token_invalid, rig.channel.last_service_result);
+    }
+
+    // (e) The same downgrade, but with the PolicyId ABSENT and then UNKNOWN.
+    //     Case (d) above passes `encrypted_user_name_policy_id` — the one
+    //     value that reaches the guard — so it proved the branch works
+    //     without proving the branch is reached. It was not: the refusal used
+    //     to be nested inside `if (parsed.policy_id) |pid|` and
+    //     `if (userTokenPolicy(cfg, pid)) |policy|`, both of which fall
+    //     through when absent, so either of these two tokens had its
+    //     cleartext password accepted against a server whose only username
+    //     policy demands encryption.
+    for ([_]?[]const u8{ null, "urn:zig-libs:no-such-policy" }) |pid| {
+        var rig: TestRig = undefined;
+        try rig.init(gpa, secureTestConfig(endpoints, pki));
+        defer rig.deinit();
+        try rig.handshake();
+        try rig.openChannel();
+        try rig.createSession();
+
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        var e = encoding.Encoder.init(&out.writer);
+        try services.encodeUserNameIdentityToken(&e, .{
+            .policy_id = pid,
             .user_name = test_users[0].user_name,
             .password = test_users[0].password,
             .encryption_algorithm = null,

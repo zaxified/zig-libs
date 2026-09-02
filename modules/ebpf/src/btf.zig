@@ -108,6 +108,23 @@ pub const max_vlen: u32 = 0xffff;
 /// legitimate C type comes anywhere near it.
 pub const max_resolve_depth: u32 = 32;
 
+/// Total members one `findMember`/`findPath` search may examine.
+///
+/// `max_resolve_depth` bounds how DEEP the search goes; this bounds how MUCH
+/// it does. `findMemberDepth` recurses once per anonymous composite member, so
+/// an acyclic chain of 32 types each holding a few anonymous members of the
+/// next is an exponential tree — and the whole tree is walked whenever the
+/// name is absent, which is the ordinary "this kernel does not have that
+/// field" answer CO-RE relies on. Measured before this bound, on a
+/// deliberately-shaped blob: 1032 bytes of BTF cost 19 seconds of one core,
+/// and ~3.5 KB did not finish in 30. A cycle was always caught by the depth
+/// bound; breadth was not bounded at all.
+///
+/// 100k visits is far above any real kernel type (`struct task_struct` is a
+/// few hundred members and one or two anonymous levels) and is reached in
+/// milliseconds.
+pub const max_member_visits: u32 = 100_000;
+
 /// Ceiling on a blob this module will read off disk. `/sys/kernel/btf/vmlinux`
 /// is ~7 MiB on a distro kernel; 256 MiB is "something is wrong", not a
 /// legitimate BTF.
@@ -182,6 +199,13 @@ pub const TypeError = error{
     /// The type has no computable size (`FWD`, `FUNC_PROTO`, a `VAR`,
     /// an array whose element count overflows).
     NoSize,
+    /// A `findMember` search visited more members than `max_member_visits`
+    /// allows. `max_resolve_depth` bounds the STACK, not the WORK: the search
+    /// recurses once per anonymous composite member, so an acyclic chain of
+    /// `max_resolve_depth` types each holding several anonymous members of the
+    /// next is an exponential tree whenever the name is absent. A cycle was
+    /// always caught by the depth bound; breadth was not.
+    TypeSearchTooWide,
 };
 
 pub const KernelLoadError = error{
@@ -663,10 +687,11 @@ pub const Btf = struct {
     /// reachable at all — several of its members are unnamed unions). The
     /// returned `bit_offset` is accumulated across those hops.
     pub fn findMember(self: *const Btf, id: u32, name: []const u8) TypeError!?Field {
-        return self.findMemberDepth(id, name, 0, 0);
+        var budget: u32 = max_member_visits;
+        return self.findMemberDepth(id, name, 0, 0, &budget);
     }
 
-    fn findMemberDepth(self: *const Btf, id: u32, name: []const u8, base_bits: u64, depth: u32) TypeError!?Field {
+    fn findMemberDepth(self: *const Btf, id: u32, name: []const u8, base_bits: u64, depth: u32, budget: *u32) TypeError!?Field {
         if (depth > max_resolve_depth) return error.TypeChainTooDeep;
         const cid = try self.skipModifiers(id);
         const t = try self.byId(cid);
@@ -674,6 +699,10 @@ pub const Btf = struct {
 
         var i: u16 = 0;
         while (i < t.vlen) : (i += 1) {
+            // The work bound. Charged per member examined, not per level, so
+            // it bounds the whole search tree rather than one path down it.
+            if (budget.* == 0) return error.TypeSearchTooWide;
+            budget.* -= 1;
             const m = try self.member(t, i);
             const mname = self.str(m.name_off) orelse "";
             if (mname.len != 0) {
@@ -692,7 +721,7 @@ pub const Btf = struct {
             const inner_id = self.skipModifiers(m.type_id) catch continue;
             const inner = self.byId(inner_id) catch continue;
             if (!inner.isComposite()) continue;
-            if (try self.findMemberDepth(inner_id, name, base_bits + m.bit_offset, depth + 1)) |f| return f;
+            if (try self.findMemberDepth(inner_id, name, base_bits + m.bit_offset, depth + 1, budget)) |f| return f;
         }
         return null;
     }
@@ -707,11 +736,14 @@ pub const Btf = struct {
         var cur = id;
         var bits: u64 = 0;
         var last: Field = undefined;
+        // One budget for the whole path, not one per segment: a path of N
+        // segments must not buy N times the work.
+        var budget: u32 = max_member_visits;
         for (path) |seg| {
             // A non-composite intermediate (typically a PTR) ends the walk.
             const cur_resolved = self.skipModifiers(cur) catch return null;
             if (!(self.byId(cur_resolved) catch return null).isComposite()) return null;
-            const f = (try self.findMemberDepth(cur, seg, 0, 0)) orelse return null;
+            const f = (try self.findMemberDepth(cur, seg, 0, 0, &budget)) orelse return null;
             last = .{
                 .bit_offset = bits + f.bit_offset,
                 .type_id = f.type_id,
@@ -2199,6 +2231,52 @@ test "loadModule rejects a name that could escape /sys/kernel/btf" {
     try testing.expectError(error.InvalidModuleName, loadModule(gpa, "a/b", &dummy));
     try testing.expectError(error.InvalidModuleName, loadModule(gpa, "..", &dummy));
     try testing.expectError(error.InvalidModuleName, loadModule(gpa, "x" ** 200, &dummy));
+}
+
+test "findMember: the search is bounded by WORK, not only by depth" {
+    // Regression for a HIGH. `max_resolve_depth` bounds how deep the search
+    // recurses; nothing bounded how much it did. `findMemberDepth` descends
+    // once per anonymous composite member, so a chain of 30 structs each
+    // holding TWO anonymous members of the level below is a 2^30-node tree —
+    // and the whole tree is walked whenever the name is absent, which is the
+    // ordinary "this kernel does not have that field" answer CO-RE relies on.
+    //
+    // The blob below is about a kilobyte. Measured before the fix, this shape
+    // cost 19 s of one core at 28 levels and did not finish in 30 s at ~3.5 KB.
+    // No cycle is involved: the depth bound always caught those. Breadth was
+    // the unbounded dimension.
+    const gpa = testing.allocator;
+    var b = Builder.init(gpa);
+    defer b.deinit();
+    const int_id = try b.addInt("int", 4, 32, 0b001);
+    var cur = try b.addComposite(.@"struct", "leaf", 4, &.{
+        .{ .name = "x", .type_id = int_id, .bit_offset = 0 },
+    });
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        cur = try b.addComposite(.@"struct", "", 8, &.{
+            .{ .name = "", .type_id = cur, .bit_offset = 0 },
+            .{ .name = "", .type_id = cur, .bit_offset = 32 },
+        });
+    }
+    const blob = try b.finish();
+    defer gpa.free(blob);
+    try testing.expect(blob.len < 4096); // the point: tiny input, huge search
+
+    var t = try parse(gpa, blob, .{});
+    defer t.deinit();
+    try testing.expectError(error.TypeSearchTooWide, t.findMember(cur, "zig_libs_absent"));
+
+    // Positive control: a search that fits the budget still WORKS, so the
+    // bound refuses the pathological case rather than everything.
+    const flat = try b.addComposite(.@"struct", "flat", 4, &.{
+        .{ .name = "found_me", .type_id = int_id, .bit_offset = 0 },
+    });
+    const blob2 = try b.finish();
+    defer gpa.free(blob2);
+    var t2 = try parse(gpa, blob2, .{});
+    defer t2.deinit();
+    try testing.expect((try t2.findMember(flat, "found_me")) != null);
 }
 
 test "LIVE: BPF_BTF_LOAD accepts a blob this module built" {
