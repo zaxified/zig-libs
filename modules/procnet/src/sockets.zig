@@ -121,6 +121,13 @@ pub const SocketEntry = struct {
 /// wrote the text.
 fn hexWord(s: []const u8, producer: std.builtin.Endian) ?[4]u8 {
     if (s.len != 8) return null;
+    // Length is not a charset: `std.fmt.parseInt` accepts a leading `+` and
+    // `_` digit separators, so `"+100007F"` and `"0100_07F"` are eight
+    // characters and decode to addresses the text does not spell. No kernel
+    // writes either, but the `*WithEndian` entry points exist precisely for
+    // text that did not come from this kernel
+    // (W2 re-audit 2026-09-02, `procnet` F11).
+    for (s) |c| if (!std.ascii.isHex(c)) return null;
     const v = std.fmt.parseInt(u32, s, 16) catch return null;
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, v, producer);
@@ -286,13 +293,35 @@ pub fn parseUdpWithEndian(
 /// `readVirtualFile` + `parseTcp`/`parseUdp` split already allows.
 pub const socket_table_read_limit = 512 * 1024;
 
+/// A socket listing plus whether any of the four tables was cut short.
+///
+/// `readSockets` used to return a bare `[]SocketEntry`, which has no channel
+/// for "this table was truncated" — so a host with ~3 500 sockets in one
+/// table got a silently short answer, and for this module's headline use
+/// ("which sockets are listening, and who owns them") a silently short answer
+/// is a wrong one. Both siblings in this module already reported it
+/// (`ConntrackResult.total`, `SocketOwnerIndex.truncated`), so this was an
+/// inconsistency inside the module, not a house style
+/// (W2 re-audit 2026-09-02, `procnet` F8).
+pub const SocketTable = struct {
+    entries: []SocketEntry,
+    /// At least one of the four `/proc/net` tables hit
+    /// `socket_table_read_limit`; `entries` is missing that table's tail.
+    truncated: bool,
+
+    pub fn deinit(t: SocketTable, gpa: std.mem.Allocator) void {
+        gpa.free(t.entries);
+    }
+};
+
 /// Read + parse all four live tables (`tcp`, `tcp6`, `udp`, `udp6`) into one
 /// combined slice. A missing/unreadable table (IPv6 disabled, module not
 /// loaded) contributes nothing rather than failing the whole read. Caller
-/// owns the returned slice (`gpa.free`).
-pub fn readSockets(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]SocketEntry {
+/// owns the returned slice (`result.deinit(gpa)`).
+pub fn readSockets(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!SocketTable {
     var out: std.ArrayList(SocketEntry) = .empty;
     errdefer out.deinit(gpa);
+    var truncated = false;
 
     const Spec = struct { path: []const u8, proto: Proto };
     for ([_]Spec{
@@ -301,8 +330,10 @@ pub fn readSockets(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![
         .{ .path = "/proc/net/udp", .proto = .udp },
         .{ .path = "/proc/net/udp6", .proto = .udp },
     }) |spec| {
-        const text = procnet.readVirtualFile(gpa, io, spec.path, socket_table_read_limit) orelse continue;
+        const read = procnet.readVirtualFileReporting(gpa, io, spec.path, socket_table_read_limit) orelse continue;
+        const text = read.bytes;
         defer gpa.free(text);
+        if (read.truncated) truncated = true;
         // A live read's producer is by definition the running kernel, so the
         // native order is not merely the default here — it is the only right
         // answer.
@@ -310,7 +341,7 @@ pub fn readSockets(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![
         defer gpa.free(rows);
         try out.appendSlice(gpa, rows);
     }
-    return out.toOwnedSlice(gpa);
+    return .{ .entries = try out.toOwnedSlice(gpa), .truncated = truncated };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -676,4 +707,16 @@ fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []cons
     }
     const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
     return buf[0..out_len];
+}
+
+test "hexWord accepts eight HEX DIGITS, not eight characters" {
+    // `std.fmt.parseInt` takes a leading `+` and `_` separators, so a length
+    // check alone let two spellings through that decode to an address the
+    // text does not contain — and the `*WithEndian` entry points exist for
+    // text this kernel did not write (W2 re-audit 2026-09-02, `procnet` F11).
+    try testing.expect(hexWord("0100007F", .little) != null);
+    try testing.expect(hexWord("+100007F", .little) == null);
+    try testing.expect(hexWord("0100_07F", .little) == null);
+    try testing.expect(hexWord("0100007", .little) == null); // 7 digits
+    try testing.expect(hexWord("0100007FF", .little) == null); // 9
 }

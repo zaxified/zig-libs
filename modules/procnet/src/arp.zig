@@ -73,7 +73,7 @@ pub fn parseArp(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Erro
         const flags = std.fmt.parseInt(u16, flags_s, 0) catch continue;
 
         var e: ArpEntry = .{ .ip = ip, .mac = mac, .hw_type = hw_type, .flags = flags };
-        e.device_len = procnet.copyClamped(&e.device_buf, dev_s);
+        e.device_len = @intCast(procnet.copyClamped(&e.device_buf, dev_s));
         try out.append(gpa, e);
     }
     return out.toOwnedSlice(gpa);

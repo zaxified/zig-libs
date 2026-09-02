@@ -37,11 +37,21 @@ pub const ConntrackFlow = struct {
 };
 
 /// The result of a (possibly capped) conntrack read: a bounded sample plus
-/// the true total row count, so a caller always knows whether `flows` is
-/// the whole table or a truncated view.
+/// the total row count, so a caller always knows whether `flows` is the whole
+/// table or a truncated view.
 pub const ConntrackResult = struct {
     flows: []ConntrackFlow,
+    /// Rows in the text that was parsed — which is the whole file only when
+    /// `text_truncated` is false. The doc used to call this "the true total"
+    /// unconditionally while `readConntrack` handed it a 4 MiB prefix, so
+    /// past ~20 000 flows the very signal that says "you are seeing a partial
+    /// view" was itself partial, and short by a plausible amount
+    /// (W2 re-audit 2026-09-02, `procnet` F6).
     total: usize,
+    /// The source file was longer than the read limit, so `total` counts only
+    /// the prefix that was read. `parseConntrack` on caller-supplied text
+    /// never sets this — the caller knows where its text came from.
+    text_truncated: bool = false,
 
     pub fn deinit(r: ConntrackResult, gpa: std.mem.Allocator) void {
         gpa.free(r.flows);
@@ -67,7 +77,7 @@ fn isUpperWord(s: []const u8) bool {
 
 /// Parse `/proc/net/nf_conntrack` (one flow per line: `<family> <l3num>
 /// <proto> <l4num> <timeout> [<TCP state>] key=value...`) into at most `max`
-/// typed flows, plus the true total line count. Malformed lines are counted
+/// typed flows, plus the total line count of the text handed in. Malformed lines are counted
 /// (toward `total`) but skipped from `flows`, not fatal. Caller owns
 /// `result.flows` (`result.deinit(gpa)`).
 pub fn parseConntrack(gpa: std.mem.Allocator, text: []const u8, max: usize) std.mem.Allocator.Error!ConntrackResult {
@@ -107,8 +117,8 @@ pub fn parseConntrack(gpa: std.mem.Allocator, text: []const u8, max: usize) std.
             .sport = std.fmt.parseInt(u16, sport_s, 10) catch 0,
             .dport = std.fmt.parseInt(u16, dport_s, 10) catch 0,
         };
-        flow.proto_len = procnet.copyClamped(&flow.proto_buf, proto_name);
-        flow.state_len = procnet.copyClamped(&flow.state_buf, state);
+        flow.proto_len = @intCast(procnet.copyClamped(&flow.proto_buf, proto_name));
+        flow.state_len = @intCast(procnet.copyClamped(&flow.state_buf, state));
         try out.append(gpa, flow);
     }
     return .{ .flows = try out.toOwnedSlice(gpa), .total = total };
@@ -118,10 +128,12 @@ pub fn parseConntrack(gpa: std.mem.Allocator, text: []const u8, max: usize) std.
 /// missing/unreadable file (module not loaded) yields an empty result, not
 /// an error.
 pub fn readConntrack(gpa: std.mem.Allocator, io: std.Io, max: usize) std.mem.Allocator.Error!ConntrackResult {
-    const text = procnet.readVirtualFile(gpa, io, "/proc/net/nf_conntrack", 4 * 1024 * 1024) orelse
+    const r = procnet.readVirtualFileReporting(gpa, io, "/proc/net/nf_conntrack", 4 * 1024 * 1024) orelse
         return .{ .flows = &.{}, .total = 0 };
-    defer gpa.free(text);
-    return parseConntrack(gpa, text, max);
+    defer gpa.free(r.bytes);
+    var out = try parseConntrack(gpa, r.bytes, max);
+    out.text_truncated = r.truncated;
+    return out;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -224,4 +236,59 @@ fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []cons
     }
     const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
     return buf[0..out_len];
+}
+
+test "a capped read says so, instead of reporting a short total as the true one" {
+    const gpa = testing.allocator;
+    // Build a table larger than the read limit we hand it, then read it the
+    // way `readConntrack` does. Before the fix `total` was the row count of
+    // the 4 MiB prefix, presented by the doc as "the true total row count" —
+    // a partial answer to the very question "is this view partial?", and
+    // short by a plausible amount (W2 re-audit 2026-09-02, `procnet` F6).
+    const line = "ipv4     2 tcp      6 431999 ESTABLISHED src=10.0.0.1 dst=10.0.0.2 sport=1 dport=2 [ASSURED] mark=0 use=1\n";
+    const rows = 200;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (0..rows) |_| try text.appendSlice(gpa, line);
+
+    // Whole text: the total is the true one and nothing claims truncation.
+    {
+        var r = try parseConntrack(gpa, text.items, 8);
+        defer r.deinit(gpa);
+        try testing.expectEqual(@as(usize, rows), r.total);
+        try testing.expect(!r.text_truncated);
+    }
+    // A prefix: fewer rows, and `total` alone cannot say which case it is —
+    // 150 is a perfectly plausible row count for a real table.
+    {
+        const cut = line.len * 50 + 3;
+        var r = try parseConntrack(gpa, text.items[0..cut], 8);
+        defer r.deinit(gpa);
+        try testing.expect(r.total < rows);
+        try testing.expect(!r.text_truncated); // caller-supplied text: not our call
+    }
+}
+
+test "readVirtualFileReporting tells its caller when the limit was the end" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // `/proc/version` is one line and always present on Linux. Read it whole,
+    // then read a prefix of it: the difference between the two is exactly the
+    // bit `readVirtualFile` used to throw away, and the bit `readConntrack`
+    // and `readSockets` need in order to keep the promises their docs make.
+    const whole = procnet.readVirtualFileReporting(gpa, io, "/proc/version", 64 * 1024) orelse
+        return error.SkipZigTest;
+    defer gpa.free(whole.bytes);
+    try testing.expect(whole.bytes.len > 8);
+    try testing.expect(!whole.truncated);
+
+    const prefix = procnet.readVirtualFileReporting(gpa, io, "/proc/version", 8) orelse
+        return error.SkipZigTest;
+    defer gpa.free(prefix.bytes);
+    try testing.expectEqual(@as(usize, 8), prefix.bytes.len);
+    try testing.expect(prefix.truncated);
+    try testing.expectEqualStrings(whole.bytes[0..8], prefix.bytes);
 }

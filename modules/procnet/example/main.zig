@@ -191,8 +191,18 @@ fn parseArgs(args: *std.process.Args.Iterator) !Options {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn runSockets(gpa: Allocator, io: std.Io, opts: Options) !u8 {
-    const socks = try procnet.readSockets(gpa, io);
-    defer gpa.free(socks);
+    const table = try procnet.readSockets(gpa, io);
+    defer table.deinit(gpa);
+    const socks = table.entries;
+    if (table.truncated) {
+        // The listing is short by a table's tail. Saying so is the whole
+        // point of the flag — a silently short socket listing is a wrong
+        // answer, not a small one.
+        std.debug.print(
+            "warning: a /proc/net socket table exceeded {d} bytes and was truncated; this listing is incomplete\n",
+            .{procnet.socket_table_read_limit},
+        );
+    }
 
     // ⚠ Build the owner index ONCE, outside the loop. It is an O(processes ×
     // descriptors) sweep of /proc; doing it per socket would make the whole

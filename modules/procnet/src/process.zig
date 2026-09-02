@@ -73,7 +73,7 @@ pub fn parseProcStat(line: []const u8) ?ProcessEntry {
         // this parser's "malformed input degrades gracefully" contract.
         .rss_kb = (std.fmt.parseInt(u64, rss_s, 10) catch 0) *| 4, // 4 KB pages
     };
-    e.name_len = procnet.copyClamped(&e.name_buf, name);
+    e.name_len = @intCast(procnet.copyClamped(&e.name_buf, name));
     return e;
 }
 
@@ -138,6 +138,16 @@ pub const SocketOwnerOptions = struct {
     /// with a million open descriptors is a real (if rare) thing, and it
     /// must not be able to stall a listing on its own.
     max_fds_per_process: usize = 8192,
+    /// Stop once this many owner records have been collected.
+    ///
+    /// The two caps above bound the WALK; nothing bounded the RESULT, and the
+    /// result is their product: 4096 × 8192 × 88 bytes = 2.95 GB. `dup(2)`
+    /// makes that reachable without opening a single extra socket — measured,
+    /// sixteen processes holding one socket each and 8000 dups apiece
+    /// produced 129 322 owner records and 11.4 MB with `truncated = false`,
+    /// because neither walk cap had fired. Roughly 712 KB of allocation per
+    /// real socket (W2 re-audit 2026-09-02, `procnet` F7).
+    max_owners: usize = 1 << 20,
 };
 
 /// The result of one `/proc/<pid>/fd` sweep: every socket-holding descriptor
@@ -166,8 +176,9 @@ pub const SocketOwnerIndex = struct {
     /// error, and distinct from `denied` because it says nothing about
     /// privilege.
     vanished: u32,
-    /// True if `max_processes` or some `max_fds_per_process` cut the sweep
-    /// short, so a caller never mistakes a capped view for a complete one.
+    /// True if `max_processes`, some `max_fds_per_process`, or `max_owners`
+    /// cut the sweep short, so a caller never mistakes a capped view for a
+    /// complete one.
     truncated: bool,
 
     pub fn deinit(idx: SocketOwnerIndex, gpa: std.mem.Allocator) void {
@@ -283,7 +294,15 @@ pub fn indexSocketOwners(
                 error.AccessDenied, error.PermissionDenied => denied += 1,
                 // The pid exited between the listing and this open.
                 error.FileNotFound => vanished += 1,
-                else => vanished += 1,
+                // Anything else (ENFILE, EMFILE, ENOMEM, ELOOP) is neither a
+                // privilege refusal nor a race, and folding it into
+                // `vanished` made a resource exhaustion read as "/proc moved
+                // under us". Counted as a refusal-to-see instead, and the
+                // sweep is marked partial (W2 re-audit 2026-09-02).
+                else => {
+                    denied += 1;
+                    truncated = true;
+                },
             }
             continue;
         };
@@ -305,6 +324,10 @@ pub fn indexSocketOwners(
                 truncated = true;
                 break;
             }
+            if (out.items.len >= opts.max_owners) {
+                truncated = true;
+                break;
+            }
             fd_count += 1;
             const fd = std.fmt.parseInt(u32, fd_entry.name, 10) catch continue;
 
@@ -318,7 +341,7 @@ pub fn indexSocketOwners(
                 if (std.fmt.bufPrint(&sp_buf, "/proc/{d}/stat", .{pid}) catch null) |sp| {
                     if (procnet.readVirtualFile(gpa, io, sp, 4096)) |text| {
                         defer gpa.free(text);
-                        if (parseProcStat(text)) |pe| name_len = procnet.copyClamped(&name_buf, pe.name());
+                        if (parseProcStat(text)) |pe| name_len = @intCast(procnet.copyClamped(&name_buf, pe.name()));
                     }
                 }
             }
@@ -330,6 +353,10 @@ pub fn indexSocketOwners(
                 .name_buf = name_buf,
                 .name_len = name_len,
             });
+        }
+        if (out.items.len >= opts.max_owners) {
+            truncated = true;
+            break;
         }
     }
 
@@ -568,7 +595,11 @@ test "fuzz: parseProcStat never panics, arbitrary or mutated-real bytes" {
 
 fn fuzzParseProcStatNeverPanics(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    const line = mutateSample(smith, proc_stat_corpus[0], &buf);
+    // Was `proc_stat_corpus[0]`, so the two paren-heavy samples this harness
+    // exists for — `((sd-pam))` and `my weird) name` — were never mutation
+    // seeds. `sockets.zig` draws its seed; this did not
+    // (W2 re-audit 2026-09-02, `procnet` F10).
+    const line = mutateSample(smith, proc_stat_corpus[smith.index(proc_stat_corpus.len)], &buf);
     _ = parseProcStat(line);
 }
 

@@ -114,6 +114,8 @@ pub const SocketEntry = sockets.SocketEntry;
 pub const parseTcp = sockets.parseTcp;
 pub const parseUdp = sockets.parseUdp;
 pub const readSockets = sockets.readSockets;
+pub const SocketTable = sockets.SocketTable;
+pub const socket_table_read_limit = sockets.socket_table_read_limit;
 // As `parseRoutesWithEndian` above: for a socket table captured on a foreign
 // kernel. See `sockets.hexWord` for the measurement behind it.
 pub const parseTcpWithEndian = sockets.parseTcpWithEndian;
@@ -164,25 +166,51 @@ pub const indexSocketOwners = process.indexSocketOwners;
 /// implemented here: "an adversarially huge `/proc` table ... cannot force
 /// unbounded allocation — the caller gets a truncated/capped view instead".
 pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
+    const r = readVirtualFileReporting(gpa, io, path, limit) orelse return null;
+    return r.bytes;
+}
+
+/// A bounded read plus the one bit the caller usually needs and
+/// `readVirtualFile` throws away: whether `limit` was actually hit.
+///
+/// Truncation here is documented and deliberate, but a caller that goes on to
+/// promise its own reader a *complete* answer — "the true total row count",
+/// "all four live tables" — cannot keep that promise without knowing. Two of
+/// this module's own readers promised exactly that and could not tell
+/// (W2 re-audit 2026-09-02, `procnet` F6/F8).
+pub const VirtualFile = struct {
+    bytes: []u8,
+    /// The file was at least `limit` bytes and `bytes` is a prefix of it.
+    truncated: bool,
+};
+
+pub fn readVirtualFileReporting(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    limit: usize,
+) ?VirtualFile {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);
     var buf: [4096]u8 = undefined;
     var fr = std.Io.File.Reader.initStreaming(file, io, &buf);
 
+    var truncated = false;
     var list: std.ArrayList(u8) = .empty;
     fr.interface.appendRemaining(gpa, &list, .limited(limit)) catch |err| switch (err) {
         // Everything read so far is already in `list` (documented contract
         // of `appendRemaining`), and it is the bounded prefix we asked for.
-        error.StreamTooLong => {},
+        error.StreamTooLong => truncated = true,
         else => {
             list.deinit(gpa);
             return null;
         },
     };
-    return list.toOwnedSlice(gpa) catch {
+    const bytes = list.toOwnedSlice(gpa) catch {
         list.deinit(gpa);
         return null;
     };
+    return .{ .bytes = bytes, .truncated = truncated };
 }
 
 /// Copy as much of `s` as fits into `buf`, truncating rather than failing —
@@ -190,10 +218,15 @@ pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, lim
 /// into a buffer already sized to the kernel's own limit, so truncation is a
 /// defensive belt-and-braces measure, not the expected path. Returns the
 /// copied length.
-pub fn copyClamped(buf: []u8, s: []const u8) u8 {
+pub fn copyClamped(buf: []u8, s: []const u8) usize {
+    // `u8` was the return type, with an `@intCast` — which is not a guard: a
+    // `buf` longer than 255 was a panic in Debug/ReleaseSafe and lost the
+    // length entirely in ReleaseFast. Nothing in this module passes such a
+    // buffer, but the signature is public and states no bound
+    // (W2 re-audit 2026-09-02, `procnet` F9).
     const n = @min(s.len, buf.len);
     @memcpy(buf[0..n], s[0..n]);
-    return @intCast(n);
+    return n;
 }
 
 /// The first whitespace-separated token of `text` parsed as a float, or 0.
@@ -201,6 +234,23 @@ fn firstFloat(text: []const u8) f64 {
     var it = std.mem.tokenizeAny(u8, text, " \t\n");
     const tok = it.next() orelse return 0;
     return std.fmt.parseFloat(f64, tok) catch 0;
+}
+
+/// `@intFromFloat` is NOT a guard: it is a panic in Debug and ReleaseSafe and
+/// illegal behaviour in ReleaseFast for anything not representable. The
+/// `catch 0` above is spent on the *parse*, and `parseFloat` succeeds on
+/// `nan`, `inf`, `-1.0` and `1e30` — so a `/proc/uptime` that is not the
+/// kernel's own (lxcfs bind-mounts exactly this file into every LXC
+/// container, and the module's own fuzz harnesses declare a faked `/proc` in
+/// scope) aborted `snapshot()` on the shipping lane, or fabricated an uptime
+/// of 584 billion years in ReleaseFast.
+///
+/// The previous audit fixed this shape once, in `process.zig`, as the case
+/// rather than as the rule (W2 re-audit 2026-09-02, `procnet` F5).
+fn secondsFromFloat(f: f64) u64 {
+    if (!std.math.isFinite(f) or f < 0) return 0;
+    if (f >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) return std.math.maxInt(u64);
+    return @intFromFloat(f);
 }
 
 /// The kB value following `key` (e.g. "MemTotal:") in `/proc/meminfo`, or 0.
@@ -269,7 +319,7 @@ pub fn snapshot(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!Snap
     const uptime_s: u64 = blk: {
         const t = readVirtualFile(gpa, io, "/proc/uptime", 256) orelse break :blk 0;
         defer gpa.free(t);
-        break :blk @intFromFloat(firstFloat(t));
+        break :blk secondsFromFloat(firstFloat(t));
     };
 
     var load = [3]f64{ 0, 0, 0 };
@@ -344,13 +394,13 @@ fn readThermalZones(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!
         const milli = std.fmt.parseInt(i64, std.mem.trim(u8, temp_text, " \t\r\n"), 10) catch continue;
 
         var z: ThermalZone = .{ .temp_c = @as(f64, @floatFromInt(milli)) / 1000.0 };
-        z.zone_len = copyClamped(&z.zone_buf, entry.name);
+        z.zone_len = @intCast(copyClamped(&z.zone_buf, entry.name));
 
         var kpb: [80]u8 = undefined;
         if (std.fmt.bufPrint(&kpb, "/sys/class/thermal/{s}/type", .{entry.name}) catch null) |kind_path| {
             if (readVirtualFile(gpa, io, kind_path, 64)) |kind_text| {
                 defer gpa.free(kind_text);
-                z.kind_len = copyClamped(&z.kind_buf, std.mem.trim(u8, kind_text, " \t\r\n"));
+                z.kind_len = @intCast(copyClamped(&z.kind_buf, std.mem.trim(u8, kind_text, " \t\r\n")));
             }
         }
 
@@ -641,8 +691,8 @@ test "smoke: readSockets/readArp/readRoutes/readConntrack are wired to the right
         }
         fn wrapSockets(gpa: std.mem.Allocator, io_: std.Io) anyerror![]Key {
             const socks = try readSockets(gpa, io_);
-            defer gpa.free(socks);
-            return keys(gpa, socks);
+            defer socks.deinit(gpa);
+            return keys(gpa, socks.entries);
         }
 
         fn directArp(gpa: std.mem.Allocator, io_: std.Io) anyerror![]ArpEntry {
@@ -685,4 +735,36 @@ test "smoke: readSockets/readArp/readRoutes/readConntrack are wired to the right
     try expectWiredTo(ArpEntry, P.directArp, P.wrapArp, io, "readArp");
     try expectWiredTo(RouteEntry, P.directRoutes, P.wrapRoutes, io, "readRoutes");
     try expectWiredTo(ConntrackFlow, P.directConntrack, P.wrapConntrack, io, "readConntrack");
+}
+
+test "a /proc/uptime that is not the kernel's own cannot abort snapshot()" {
+    // `@intFromFloat` is not a guard, and `firstFloat`'s `catch 0` covers the
+    // parse, not the conversion: `parseFloat` succeeds on every value below.
+    // In Debug and ReleaseSafe each was a `panic: integer part of floating
+    // point value out of bounds`; in ReleaseFast, a fabricated uptime of
+    // ~584 billion years that no caller could tell from a reading. lxcfs
+    // bind-mounts exactly this file into every LXC container, and this
+    // module's own fuzz harnesses declare a faked `/proc` in scope
+    // (W2 re-audit 2026-09-02, `procnet` F5).
+    try testing.expectEqual(@as(u64, 0), secondsFromFloat(firstFloat("inf 1.0")));
+    try testing.expectEqual(@as(u64, 0), secondsFromFloat(firstFloat("-inf 1.0")));
+    try testing.expectEqual(@as(u64, 0), secondsFromFloat(firstFloat("nan 1.0")));
+    try testing.expectEqual(@as(u64, 0), secondsFromFloat(firstFloat("-1.0 1.0")));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), secondsFromFloat(firstFloat("1e30 1.0")));
+    // …and the real thing still reads.
+    try testing.expectEqual(@as(u64, 1265851), secondsFromFloat(firstFloat("1265851.19 9999.00")));
+    try testing.expectEqual(@as(u64, 0), secondsFromFloat(firstFloat("not-a-number")));
+}
+
+test "copyClamped's return type does not bound the buffer it accepts" {
+    // Public API with no stated bound on `buf`, and a `u8` return: a buffer
+    // longer than 255 was a panic in Debug and a lost length in ReleaseFast.
+    // No in-module caller can reach it, which is exactly why the signature
+    // had to be the fix (W2 re-audit 2026-09-02, `procnet` F9).
+    var big: [512]u8 = undefined;
+    const src = "x" ** 300;
+    try testing.expectEqual(@as(usize, 300), copyClamped(&big, src));
+    var small: [4]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), copyClamped(&small, src));
+    try testing.expectEqual(@as(usize, 0), copyClamped(&small, ""));
 }

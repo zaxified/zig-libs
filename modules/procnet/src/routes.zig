@@ -56,6 +56,13 @@ pub const RouteEntry = struct {
 /// rejects — so the row disappears entirely rather than decoding oddly.
 fn hexToV4(s: []const u8, producer: std.builtin.Endian) ?netaddr.Ip {
     if (s.len != 8) return null;
+    // Length is not a charset: `std.fmt.parseInt` accepts a leading `+` and
+    // `_` digit separators, so `"+100007F"` and `"0100_07F"` are eight
+    // characters and decode to addresses the text does not spell. No kernel
+    // writes either, but the `*WithEndian` entry points exist precisely for
+    // text that did not come from this kernel
+    // (W2 re-audit 2026-09-02, `procnet` F11).
+    for (s) |c| if (!std.ascii.isHex(c)) return null;
     const v = std.fmt.parseInt(u32, s, 16) catch return null;
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, v, producer);
@@ -135,7 +142,7 @@ pub fn parseRoutesWithEndian(
             .flags = flags,
             .metric = std.fmt.parseInt(u32, metric_s, 10) catch 0,
         };
-        e.iface_len = procnet.copyClamped(&e.iface_buf, iface_s);
+        e.iface_len = @intCast(procnet.copyClamped(&e.iface_buf, iface_s));
         try out.append(gpa, e);
     }
     return out.toOwnedSlice(gpa);

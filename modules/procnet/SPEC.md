@@ -57,16 +57,32 @@ clean-room against the documented Linux `/proc` file format (`proc(5)`) and the 
 `/proc` ABI.
 
 ## Threat model / out of scope
-Not security-sensitive in the traditional sense — the untrusted input is the kernel's own
-`/proc`/`/sys` text, not attacker-controlled network bytes, and every parser treats a malformed
-line as skip-and-continue rather than a hard failure or panic. Linux-only platform ceiling is
-accepted scope (raw `/proc`+`/sys` reads, no portable fallback), grouped with the repo's other
-Linux-only members (icmp/rawsock/netlink/wireguard/l2disco). Reads are bounded: `readVirtualFile`
-takes an explicit `limit` and `listProcesses`/`readConntrack` take an explicit cap, so an
-adversarially huge `/proc` table (e.g. a conntrack-flood scenario) cannot force unbounded
-allocation — the caller gets a truncated/capped view instead. Out of scope: writing to any
-`/proc`/`/sys` file (read-only by design); anything requiring elevated privileges beyond normal
-`/proc` read permissions.
+**The `/proc` text this module parses is not always the kernel's own.** An earlier revision of
+this section said it was — "not security-sensitive in the traditional sense … not
+attacker-controlled" — while five of this module's own fuzz harnesses said the opposite in their
+doc comments ("a bind-mounted/faked `/proc`, a snapshot read from a file"). That contradiction is
+what left an unchecked `@intFromFloat` on `/proc/uptime` in `snapshot()` until the 2026-09-02
+re-audit: lxcfs bind-mounts `/proc/{uptime,meminfo,loadavg,stat}` into every LXC container as a
+matter of course, and `unshare --map-root-user --mount` is available to any local user on a
+default kernel. Treat every decode entry point as a hostile-input surface, the same as a wire
+parser. Every parser treats a malformed line as skip-and-continue rather than a hard failure or
+panic, and no conversion from file content may be an `@intCast`/`@intFromFloat`/`.?`.
+
+Linux-only platform ceiling is accepted scope (raw `/proc`+`/sys` reads, no portable fallback),
+grouped with the repo's other Linux-only members (icmp/rawsock/netlink/wireguard/l2disco).
+
+Reads are bounded, and a bounded read **says so**: `readVirtualFileReporting` returns whether the
+limit was hit, `readSockets` returns `SocketTable.truncated`, `readConntrack` returns
+`ConntrackResult.text_truncated`, `indexSocketOwners` returns `truncated`, and
+`listProcesses`/`readConntrack` take an explicit cap. So an adversarially huge `/proc` table (a
+conntrack flood, a process holding 8 000 descriptors) cannot force unbounded allocation and
+cannot silently shorten an answer either. ⚠ `indexSocketOwners`' caps bound the *walk*; its
+`max_owners` bounds the *result*, and it exists because the first two did not — `dup(2)` yields a
+full owner record per descriptor without opening a socket, so sixteen processes with one socket
+each produced 129 322 records with both walk caps unfired.
+
+Out of scope: writing to any `/proc`/`/sys` file (read-only by design); anything requiring
+elevated privileges beyond normal `/proc` read permissions.
 
 ## Verification
 57 tests across `arp.zig`/`routes.zig`/`sockets.zig`/`conntrack.zig`/`process.zig` (dark-aggregated
