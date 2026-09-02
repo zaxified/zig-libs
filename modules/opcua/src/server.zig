@@ -1724,6 +1724,23 @@ pub const Connection = struct {
                 try sendFault(ctx, status.bad_security_mode_rejected);
                 return;
             }
+            // The same gate the secured branch applies below, and for the same
+            // reason. It was missing here, which meant a server configured with
+            // only Basic256Sha256 Sign/SignAndEncrypt endpoints — a deployment
+            // that deliberately advertises no `#None` — still accepted a
+            // `#None` channel, and from there an anonymous session and
+            // cleartext Read/Write/Call: `CreateSession` and `ActivateSession`
+            // both gate their certificate and signature checks on
+            // `sec_mode != .none`, so both were skipped.
+            //
+            // Three documents promised otherwise — `Config.endpoints` ("**This
+            // list is the authority**"), `endpointOffers` ("The gate every
+            // `OpenSecureChannel` passes through") and SPEC's "only advertised
+            // modes are usable" row — and the gate simply was not on this path.
+            if (!endpointOffers(ctx.srv.config, services.security_policy_none_uri, .none)) {
+                try sendFault(ctx, status.bad_security_policy_rejected);
+                return;
+            }
         } else {
             // A secured OPN whose *request* is unacceptable gets a
             // transport-level `ERR`, not a ServiceFault: the client is
@@ -5696,6 +5713,41 @@ test "hostile: a chunk header whose size disagrees with the bytes that follow" {
 }
 
 // ── SecurityPolicy#Basic256Sha256, server side ──────────────────────────────
+
+test "secure: a #None channel is refused when no endpoint advertises #None" {
+    // Regression for a CRITICAL security-policy downgrade. `endpointOffers` is
+    // documented as "The gate every `OpenSecureChannel` passes through", and
+    // `Config.endpoints` as "**This list is the authority**" — but the gate sat
+    // only on the SECURED branch of `handleOpenSecureChannel`. A server built
+    // the documented way for a secured deployment, advertising Basic256Sha256
+    // at Sign and SignAndEncrypt and no `#None` endpoint at all, still accepted
+    // a `#None` SecureChannel; and because `CreateSession` and
+    // `ActivateSession` gate their certificate and `ClientSignature` checks on
+    // `sec_mode != .none`, both were then skipped. The result was an anonymous
+    // peer reading and writing in the clear against a server configured to
+    // permit neither.
+    //
+    // `secureTestEndpoints` puts the None endpoint in slot 0, so slicing it off
+    // is exactly the deployment in question.
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
+    const pki = try TestPki.init(gpa, &prng, .{});
+    defer pki.deinit(gpa);
+    var endpoint_buf: [3]services.EndpointDescription = undefined;
+    const all = secureTestEndpoints(&endpoint_buf, pki.server.certificate_der);
+    const secure_only = all[1..];
+    // The premise, asserted rather than assumed: nothing left offers #None.
+    for (secure_only) |ep| {
+        try testing.expect(!std.mem.eql(u8, ep.security_policy_uri.?, services.security_policy_none_uri));
+    }
+
+    var rig: TestRig = undefined;
+    try rig.init(gpa, secureTestConfig(secure_only, pki));
+    defer rig.deinit();
+    // `connect()` is the plain #None path a discovering client uses. It must
+    // not get past the channel now.
+    try testing.expectError(error.ServiceFault, rig.connect());
+}
 
 test "secure: GetEndpoints advertises None + Sign + SignAndEncrypt with certificates and levels" {
     const gpa = testing.allocator;

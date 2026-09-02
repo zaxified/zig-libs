@@ -1038,7 +1038,23 @@ fn splitProgramSection(obj: *Object, a: std.mem.Allocator, sec_idx: usize, out: 
             size = if (k + 1 < ranges.items.len) ranges.items[k + 1].off - r.off else data.len - r.off;
         }
         if (size % 8 != 0) return error.UnalignedInstructionSection;
-        if (r.off + size > data.len) return error.MalformedElf;
+        // `size` is the symbol's raw `st_size`, a u64 straight off the wire
+        // that nothing has bounded — `st_value` is checked against `data.len`
+        // above, `st_size` never was. Written as `r.off + size > data.len` the
+        // sum wraps: `st_value = 8` with `st_size = 0xFFFF_FFFF_FFFF_FFF8`
+        // (a multiple of 8, so the alignment check above passes) sums to 0 and
+        // the range check accepts. What follows is an allocation whose own
+        // size arithmetic wraps too, and then a `@memcpy` of 2^64-8 bytes.
+        //
+        // Measured on a crafted object built from `core_reloc.bpf.o`:
+        // Debug and ReleaseSafe panic with `integer overflow` HERE; ReleaseFast
+        // has no overflow check at all and reaches the `@memcpy`, which is an
+        // out-of-bounds WRITE, not a read (SIGSEGV). `open()` is the module's
+        // documented untrusted-input entry point and needs no privilege.
+        //
+        // Phrased by subtraction so neither term can overflow — the same
+        // discipline `elfsym.entryOffset` already uses.
+        if (size > data.len or r.off > data.len - size) return error.MalformedElf;
         if (size == 0) continue;
 
         const insns = a.alloc(Insn, @intCast(size / 8)) catch return error.OutOfMemory;
@@ -2290,6 +2306,56 @@ test "hostile: an unaligned instruction section" {
     std.mem.writeInt(u64, img[at..][0..8], 0x11, .little);
 
     try testing.expectError(error.UnalignedInstructionSection, open(gpa, img, .{}));
+}
+
+test "hostile: a symbol whose st_size overflows the program-range bound" {
+    // Regression for a CRITICAL. `size` is the symbol's raw `st_size`, a u64
+    // straight off the wire. `st_value` was bounded against `data.len`;
+    // `st_size` never was, and the bound was written `r.off + size > data.len`,
+    // which wraps. `st_value = 8` with `st_size = 0xFFFF_FFFF_FFFF_FFF8` — a
+    // multiple of 8, so the alignment check above it passes — sums to 0 and was
+    // accepted. What followed was an allocation whose own size arithmetic
+    // wrapped and then a `@memcpy` of 2^64-8 bytes.
+    //
+    // Measured before the fix, on exactly this input: `integer overflow` panic
+    // in Debug and ReleaseSafe, and in ReleaseFast — which has no overflow
+    // check at all — an out-of-bounds WRITE, SIGSEGV. `open()` is the
+    // documented untrusted-input entry point and needs no privilege.
+    const gpa = testing.allocator;
+    const img = try gpa.dupe(u8, fx_xdp_pass);
+    defer gpa.free(img);
+
+    const shoff = std.mem.readInt(u64, img[40..48], .little);
+    const shent = std.mem.readInt(u16, img[58..60], .little);
+    const shnum = std.mem.readInt(u16, img[60..62], .little);
+    var sym_off: u64 = 0;
+    var sym_size: u64 = 0;
+    var sym_ent: u64 = 0;
+    var i: u16 = 0;
+    while (i < shnum) : (i += 1) {
+        const at: usize = @intCast(shoff + @as(u64, i) * shent);
+        if (std.mem.readInt(u32, img[at + 4 ..][0..4], .little) != 2) continue; // SHT_SYMTAB
+        sym_off = std.mem.readInt(u64, img[at + 24 ..][0..8], .little);
+        sym_size = std.mem.readInt(u64, img[at + 32 ..][0..8], .little);
+        sym_ent = std.mem.readInt(u64, img[at + 56 ..][0..8], .little);
+        break;
+    }
+    try testing.expect(sym_ent != 0);
+
+    var patched: usize = 0;
+    var j: u64 = 0;
+    while (j < sym_size / sym_ent) : (j += 1) {
+        const so: usize = @intCast(sym_off + j * sym_ent);
+        if (img[so + 4] & 0xf != 2) continue; // STT_FUNC
+        std.mem.writeInt(u64, img[so + 8 ..][0..8], 8, .little);
+        std.mem.writeInt(u64, img[so + 16 ..][0..8], 0xFFFF_FFFF_FFFF_FFF8, .little);
+        patched += 1;
+    }
+    // Without this the test could pass by never having patched anything —
+    // a green assertion reached by the wrong route.
+    try testing.expect(patched != 0);
+
+    try testing.expectError(error.MalformedElf, open(gpa, img, .{}));
 }
 
 test "hostile: a .maps VAR whose type is not a struct" {

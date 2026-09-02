@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — Security audit: **a `SecurityPolicy#None` channel was accepted by
+  a server that advertises no `#None` endpoint.** `endpointOffers` — documented as
+  "The gate every `OpenSecureChannel` passes through", with `Config.endpoints`
+  documented as "**This list is the authority**" and SPEC promising "only
+  advertised modes are usable" — was only reached on the secured branch of
+  `handleOpenSecureChannel`; the `#None` branch returned before it. A deployment
+  built the documented way for security, offering Basic256Sha256 at Sign and
+  SignAndEncrypt and nothing else, therefore still accepted a cleartext channel;
+  and since `CreateSession` and `ActivateSession` both gate their certificate and
+  `ClientSignature` checks on `sec_mode != .none`, both were then skipped, giving
+  an anonymous peer Read/Write/Call in the clear. The gate now applies to both
+  branches.
+
 - **2026-08-15** — Test-only (no change to the module): the driver rejected a reconnect it
   should have accepted, under load. In one iteration of `Driver.serve` the order was *read
   data → accept → tear down a finished connection*, so when a client's last bytes

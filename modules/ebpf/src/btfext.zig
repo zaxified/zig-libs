@@ -195,6 +195,15 @@ pub const CoreError = error{
     TargetTypeNotFound,
     /// A bitfield whose bits do not fit in any load of <= 8 bytes.
     BitfieldTooWide,
+    /// An array index times an element size overflowed the accumulated bit
+    /// offset. Both factors come off the wire and neither is otherwise
+    /// bounded: the index is parsed from a CO-RE access string in the BTF
+    /// string section (`parseAccessIndices` bounds how MANY components there
+    /// are, not how large each is), and the size is `sizeOf`, which for a
+    /// struct returns the raw `size` word. Refused rather than wrapped: in
+    /// ReleaseFast a wrapped `bit_offset` is not a crash but a wrong offset
+    /// patched into a loaded BPF instruction, which is the worse outcome.
+    FieldOffsetOverflow,
     /// One of the relocation kinds this module deliberately does not compute
     /// (see this file's header).
     UnsupportedReloKind,
@@ -450,6 +459,17 @@ pub fn parseAccessIndices(access: []const u8, out: *[max_spec_len]u32) CoreError
 /// the local bit offset and recording each member's **name** — the names are
 /// what the target lookup uses, because a member's *index* is exactly the
 /// thing CO-RE exists to stop depending on.
+/// `bit_offset += index * size * 8`, with every step checked.
+///
+/// Four sites needed this — two walking the local BTF and two the target — so
+/// it is one rule rather than four guards, and a fifth caller cannot get it
+/// wrong by omission.
+fn addIndexedBitOffset(bit_offset: *u64, index: u32, size: u64) error{FieldOffsetOverflow}!void {
+    const bits = std.math.mul(u64, size, 8) catch return error.FieldOffsetOverflow;
+    const delta = std.math.mul(u64, @as(u64, index), bits) catch return error.FieldOffsetOverflow;
+    bit_offset.* = std.math.add(u64, bit_offset.*, delta) catch return error.FieldOffsetOverflow;
+}
+
 pub fn parseFieldSpec(local: *const Btf, root_type_id: u32, access: []const u8) CoreError!FieldSpec {
     var idx: [max_spec_len]u32 = undefined;
     const n = try parseAccessIndices(access, &idx);
@@ -467,7 +487,7 @@ pub fn parseFieldSpec(local: *const Btf, root_type_id: u32, access: []const u8) 
     var cur = try local.skipModifiers(root_type_id);
     if (idx[0] != 0) {
         const sz = try local.sizeOf(cur);
-        spec.bit_offset += @as(u64, idx[0]) * sz * 8;
+        try addIndexedBitOffset(&spec.bit_offset, idx[0], sz);
     }
     spec.steps[0] = .{ .index = idx[0], .name = null };
     spec.len = 1;
@@ -490,7 +510,7 @@ pub fn parseFieldSpec(local: *const Btf, root_type_id: u32, access: []const u8) 
             .array => {
                 const a = try local.arrayInfo(t);
                 const esz = try local.sizeOf(a.elem_type);
-                spec.bit_offset += @as(u64, idx[i]) * esz * 8;
+                try addIndexedBitOffset(&spec.bit_offset, idx[i], esz);
                 spec.bitfield_size = 0;
                 spec.steps[spec.len] = .{ .index = idx[i], .name = null };
                 spec.len += 1;
@@ -542,7 +562,7 @@ pub fn matchFieldSpec(
     const steps = spec.slice();
     if (steps[0].index != 0) {
         const sz = try target.sizeOf(cur);
-        out.bit_offset += @as(u64, steps[0].index) * sz * 8;
+        try addIndexedBitOffset(&out.bit_offset, steps[0].index, sz);
     }
     out.steps[0] = .{ .index = steps[0].index, .name = null };
     out.len = 1;
@@ -567,7 +587,7 @@ pub fn matchFieldSpec(
                 .array => {
                     const a = try target.arrayInfo(t);
                     const esz = try target.sizeOf(a.elem_type);
-                    out.bit_offset += @as(u64, st.index) * esz * 8;
+                    try addIndexedBitOffset(&out.bit_offset, st.index, esz);
                     out.bitfield_size = 0;
                     out.steps[out.len] = .{ .index = st.index, .name = null };
                     out.len += 1;
@@ -1459,6 +1479,33 @@ test "CO-RE: relocate a real clang object against /sys/kernel/btf/vmlinux" {
         defer fake.deinit();
         const lspec = try parseFieldSpec(&fake, 2, "0:0");
         try testing.expectEqual(@as(?FieldSpec, null), try matchFieldSpec(&fake, lspec, &kernel));
+    }
+
+    // An array index times an element size that overflows the accumulated bit
+    // offset is REFUSED, not wrapped. Both factors are attacker-chosen: the
+    // index comes from the CO-RE access string (`parseAccessIndices` bounds how
+    // MANY components there are, not how large each is) and the size is the
+    // struct's raw wire `size` word.
+    //
+    // Measured before the fix on exactly this input: `integer overflow` panic
+    // in Debug and ReleaseSafe, and in ReleaseFast a silently wrapped
+    // `bit_offset` that flows on into `fieldGeometry` and `patchCoreInsn` --
+    // a wrong offset written into a loaded BPF program, which is worse than
+    // the crash. Four sites shared the defect; they now share one checked
+    // helper, so this test pins the rule rather than one of its cases.
+    {
+        var b = btf.Builder.init(gpa);
+        defer b.deinit();
+        const i32_id = try b.addInt("int", 4, 32, 0b001);
+        _ = try b.addComposite(.@"struct", "big", 0xFFFF_FFFF, &.{
+            .{ .name = "x", .type_id = i32_id, .bit_offset = 0 },
+        });
+        const blob = try b.finish();
+        defer gpa.free(blob);
+        var fake = try btf.parse(gpa, blob, .{});
+        defer fake.deinit();
+        // 4294967295 * 0xFFFFFFFF * 8 is ~1.5e20, far past u64.
+        try testing.expectError(error.FieldOffsetOverflow, parseFieldSpec(&fake, 2, "4294967295"));
     }
 
     // A root type name that does not exist anywhere.
