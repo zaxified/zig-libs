@@ -11,7 +11,12 @@
 //!
 //! Notifications are different, and this module refuses to hide that.
 //! **`EventSocket` has exactly one blocking call — `waitForNotification`** —
-//! and it does exactly one `recvmsg` when its buffer is drained. There is no
+//! and it does one `recvmsg` per DRAINED buffer. ⚠ Not necessarily one per
+//! call: a datagram carrying only non-devlink messages is skipped and the
+//! next one is fetched, so a call can block more than once (audit
+//! 2026-09-02, correcting "exactly one `recvmsg`"). The seam discipline is
+//! unchanged — a caller who wants a bounded wait polls `fd()` — but the
+//! sentence used to promise something the loop does not. There is no
 //! timer thread, no deadline and no event loop here: a caller that wants a
 //! bounded wait polls `fd()` itself and only calls `waitForNotification` once
 //! the fd is readable. That is the same seam discipline the sibling `ethtool`
@@ -441,6 +446,14 @@ pub const Devlink = struct {
             return snapshot_id orelse error.MalformedReply;
         defer reply.deinit(gpa);
         const r = region_mod.parseRegion(reply.attrs) catch return error.MalformedReply;
+        // ⛔ The one single-object method that took the reply's word for it.
+        // Seven siblings call `checkHandleEcho`; this one called neither that
+        // nor a region-name compare, so a reply naming a DIFFERENT device and
+        // a different region handed back its snapshot id — and that id then
+        // selects what `readRegion` reads (audit 2026-09-02; residue of the
+        // 2026-08 F4 fix, which this method was left out of).
+        try checkHandleEcho(h, r.handle);
+        if (!std.mem.eql(u8, r.name(), name)) return error.UnexpectedHandle;
         if (r.snapshot_count == 0) return snapshot_id orelse error.MalformedReply;
         return r.snapshot_ids[0];
     }
@@ -842,6 +855,12 @@ fn walkStep(
             it.* = .{ .buf = dgram };
             continue;
         };
+        // The ceiling is documented in MESSAGES, and this is where a message
+        // is one: counting only datagrams made "65536 netlink messages" mean
+        // "65536 datagrams of up to 16 MiB each" — bounded, but not by the
+        // quantity the doc names (audit 2026-09-02).
+        msgs.* += 1;
+        if (msgs.* > max_walk_messages) return error.TooManyMessages;
         if (m.pid != cl.sock.portid or m.seq != seq) continue;
         switch (m.type) {
             codec.NLMSG_DONE => {
@@ -984,9 +1003,11 @@ pub const EventSocket = struct {
     }
 
     /// **The one blocking call.** Returns the next devlink notification,
-    /// performing a single `recvmsg` only when the previously received datagram
-    /// has been drained. Messages that are not devlink-family messages are
-    /// skipped. Free the result with `deinit`.
+    /// performing a `recvmsg` only when the previously received datagram has
+    /// been drained. Messages that are not devlink-family messages are
+    /// skipped — and a datagram consisting only of those costs another
+    /// blocking receive, so this is one `recvmsg` per drained buffer rather
+    /// than one per call. Free the result with `deinit`.
     pub fn waitForNotification(ev: *EventSocket, gpa: std.mem.Allocator) RequestError!Notification {
         while (true) {
             const maybe = ev.it.next() catch return error.MalformedReply;
@@ -1305,4 +1326,47 @@ test "the client assembles no request headers of its own" {
     try testing.expect(std.mem.indexOf(u8, code, "finishHeader") == null);
     // And every command method reaches the wire through the one seam.
     try testing.expect(std.mem.indexOf(u8, code, "sendBuiltOver") != null);
+}
+
+test "newSnapshot's reply correlation: a snapshot id is only taken from the region that was asked for" {
+    // ⛔ `newSnapshot` was the one single-object method that took the reply's
+    // word for it: seven siblings call `checkHandleEcho`, it called neither
+    // that nor a name compare, so a `REGION_NEW` reply naming a different
+    // device and a different region handed its snapshot id straight back —
+    // and that id then selects what `readRegion` reads (audit 2026-09-02).
+    //
+    // The correlation is checked here at the level the client applies it,
+    // against a parsed reply built from real attribute bytes.
+    const gpa = testing.allocator;
+    const want: handle_mod.Handle = .pci("0000:65:00.0");
+
+    var attrs: std.ArrayList(u8) = .empty;
+    defer attrs.deinit(gpa);
+    try codec.appendAttrString(gpa, &attrs, uapi.ATTR.BUS_NAME, "pci");
+    try codec.appendAttrString(gpa, &attrs, uapi.ATTR.DEV_NAME, "0000:03:00.0"); // a DIFFERENT device
+    try codec.appendAttrString(gpa, &attrs, uapi.ATTR.REGION_NAME, "fw-health");
+
+    const other = try region_mod.parseRegion(attrs.items);
+    try testing.expectError(error.UnexpectedHandle, checkHandleEcho(want, other.handle));
+
+    // Right device, wrong region: the name compare is the second half, and it
+    // is the half `checkHandleEcho` cannot do.
+    var attrs2: std.ArrayList(u8) = .empty;
+    defer attrs2.deinit(gpa);
+    try codec.appendAttrString(gpa, &attrs2, uapi.ATTR.BUS_NAME, "pci");
+    try codec.appendAttrString(gpa, &attrs2, uapi.ATTR.DEV_NAME, "0000:65:00.0");
+    try codec.appendAttrString(gpa, &attrs2, uapi.ATTR.REGION_NAME, "fw-health");
+    const wrong_region = try region_mod.parseRegion(attrs2.items);
+    try checkHandleEcho(want, wrong_region.handle); // the handle DOES echo
+    try testing.expect(!std.mem.eql(u8, wrong_region.name(), "cr-space"));
+
+    // And the reply that matches on both passes both checks.
+    var attrs3: std.ArrayList(u8) = .empty;
+    defer attrs3.deinit(gpa);
+    try codec.appendAttrString(gpa, &attrs3, uapi.ATTR.BUS_NAME, "pci");
+    try codec.appendAttrString(gpa, &attrs3, uapi.ATTR.DEV_NAME, "0000:65:00.0");
+    try codec.appendAttrString(gpa, &attrs3, uapi.ATTR.REGION_NAME, "cr-space");
+    const right = try region_mod.parseRegion(attrs3.items);
+    try checkHandleEcho(want, right.handle);
+    try testing.expect(std.mem.eql(u8, right.name(), "cr-space"));
 }

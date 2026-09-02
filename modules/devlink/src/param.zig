@@ -812,3 +812,48 @@ test "buildParam / buildParams / buildSetParam: commands, flags, rejections" {
         .{ .uint8 = 1 },
     ));
 }
+
+test "an oversized PARAM_VALUE_DATA is refused, on the binary branch and on the unknown one" {
+    // ⛔ These two `value_max` checks are the only thing between a wire
+    // attribute and a 128-byte fixed buffer, and until 2026-09-02 NOTHING
+    // tested them: widening either bound to `value_max + 8` (or + 1000) left
+    // the whole suite green in both modes. With the guard removed, a
+    // 200-byte `PARAM_VALUE_DATA` panics in Debug (`index out of bounds:
+    // index 200, len 128`) and in **ReleaseFast is accepted silently** — the
+    // `@memcpy` runs 72 bytes past `Bytes.buf` and clobbers the `len` field
+    // with the payload's own bytes.
+    const gpa = testing.allocator;
+    // EXACTLY one past the bound, not "comfortably over" it: a test that
+    // sends 200 bytes still passes when the bound is widened to
+    // `value_max + 8`, so it pins the existence of a check and not its VALUE
+    // -- `feedback_mutate_the_constant`.
+    const big = [_]u8{0xAB} ** (uapi.value_max + 1);
+
+    inline for ([_]uapi.ParamType{ .binary, @enumFromInt(200) }) |t| {
+        var msg: std.ArrayList(u8) = .empty;
+        defer msg.deinit(gpa);
+        try codec.appendAttrU8(gpa, &msg, uapi.ATTR.PARAM_TYPE, @intFromEnum(t));
+        try codec.appendAttr(gpa, &msg, uapi.ATTR.PARAM_VALUE_DATA, &big);
+        const attrs = msg.items;
+
+        var it: codec.AttrIterator = .{ .buf = attrs };
+        var ty: ?uapi.ParamType = null;
+        var got: ?codec.Error!Value = null;
+        while (try it.next()) |a| {
+            if (a.type == uapi.ATTR.PARAM_TYPE) ty = @enumFromInt(try a.asU8());
+            if (a.type == uapi.ATTR.PARAM_VALUE_DATA) got = decodeData(ty.?, a);
+        }
+        try testing.expectError(error.BadLength, got.?);
+    }
+
+    // And the largest value that DOES fit is still accepted, so the bound is
+    // pinned from both sides.
+    var ok_msg: std.ArrayList(u8) = .empty;
+    defer ok_msg.deinit(gpa);
+    const small = [_]u8{0xCD} ** uapi.value_max;
+    try codec.appendAttr(gpa, &ok_msg, uapi.ATTR.PARAM_VALUE_DATA, &small);
+    var ok_it: codec.AttrIterator = .{ .buf = ok_msg.items };
+    const a = (try ok_it.next()).?;
+    const v = try decodeData(.binary, a);
+    try testing.expectEqual(@as(u8, uapi.value_max), v.binary.len);
+}

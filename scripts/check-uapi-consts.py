@@ -82,6 +82,8 @@ MODULES = {
             "/usr/include/linux/ethtool.h",
         ],
         "prefixes": ["ETHTOOL_A_", "ETHTOOL_"],
+        # ⚠ MOSTLY THE SAME BLIND SPOT devlink had: enum namespaces the kernel snake_cases differently. Resolving them needs a `namespace_aliases` map read out of the header, module by module — recorded as follow-up work by the 2026-09-02 devlink audit, not guessed at here.
+        "unresolved_budget": 120,
     },
     "nl80211": {
         "zig_files": ["modules/nl80211/src/uapi.zig"],
@@ -90,11 +92,28 @@ MODULES = {
             "/usr/include/linux/genetlink.h",
         ],
         "prefixes": ["NL80211_", "GENL_"],
+        # same shape as ethtool above; see the devlink entry for the fix pattern.
+        "unresolved_budget": 25,
     },
     "devlink": {
         "zig_files": ["modules/devlink/src/uapi.zig"],
         "headers": ["/usr/include/linux/devlink.h"],
         "prefixes": ["DEVLINK_"],
+        # Where the kernel's namespace is not this repo's namespace. Each one
+        # was read out of `/usr/include/linux/devlink.h`, not guessed:
+        # `InlineMode.none` is `DEVLINK_ESWITCH_INLINE_MODE_NONE`, and the
+        # parameter types live under the kernel's newer `VAR_ATTR_TYPE`
+        # spelling.
+        "namespace_aliases": {
+            "InlineMode": "ESWITCH_INLINE_MODE",
+            "EncapMode": "ESWITCH_ENCAP_MODE",
+            "HealthState": "HEALTH_REPORTER_STATE",
+            "ParamType": "VAR_ATTR_TYPE",
+        },
+        # Repo-local sizing constants (`bus_name_max`, `ifnamesize`, …) that
+        # have no kernel spelling. Every enum member resolves; if this number
+        # grows, something stopped being checked.
+        "unresolved_budget": 7,
     },
     "conntrack": {
         "zig_files": ["modules/conntrack/src/wire.zig"],
@@ -105,6 +124,8 @@ MODULES = {
             "/usr/include/linux/netfilter/nfnetlink.h",
         ],
         "prefixes": [""],
+        # repo-local sizing constants and a few names this host's headers do not carry.
+        "unresolved_budget": 23,
     },
     "netlink": {
         # `bridge.zig`'s ~100 hand-transcribed AF_BRIDGE constants (audit
@@ -119,6 +140,8 @@ MODULES = {
             "/usr/include/linux/rtnetlink.h",
         ],
         "prefixes": [""],
+        # repo-local constants.
+        "unresolved_budget": 3,
     },
 }
 
@@ -288,9 +311,37 @@ def header_constants(path):
 # ── driver ───────────────────────────────────────────────────────────────
 
 
-def candidate_names(dotted, prefixes):
-    base = dotted.upper().replace(".", "_")
-    return [p + base for p in prefixes]
+def _camel_to_snake_upper(seg):
+    """`PortType` -> `PORT_TYPE`, `Cmd` -> `CMD`, `ATTR` -> `ATTR`.
+
+    The kernel snake_cases what this repo spells in CamelCase, and until
+    2026-09-02 this function only produced the concatenated form -- so
+    `PortType.eth` asked the header for `DEVLINK_PORTTYPE_ETH` while the
+    kernel spells it `DEVLINK_PORT_TYPE_ETH`, and EVERY member of eight
+    devlink enums (plus 87 in ethtool and 18 in nl80211) fell into the
+    unresolved bucket that nothing printed and nothing failed. Twenty of
+    devlink's could be given a wrong value with the whole suite green.
+    """
+    out = []
+    for i, ch in enumerate(seg):
+        if ch.isupper() and i > 0 and (seg[i - 1].islower() or seg[i - 1].isdigit()):
+            out.append("_")
+        out.append(ch)
+    return "".join(out).upper()
+
+
+def candidate_names(dotted, prefixes, aliases=None):
+    segs = dotted.split(".")
+    if aliases and len(segs) > 1 and segs[0] in aliases:
+        segs = [aliases[segs[0]]] + segs[1:]
+    # `u8_`/`type_` are Zig keyword escapes; the kernel has no trailing '_'.
+    tail_variants = {segs[-1], segs[-1].rstrip("_")}
+    bases = set()
+    for tail in tail_variants:
+        head = segs[:-1]
+        bases.add("_".join(head + [tail]).upper())
+        bases.add("_".join([_camel_to_snake_upper(h) for h in head] + [tail.upper()]))
+    return [p + b for p in prefixes for b in sorted(bases)]
 
 
 def check_module(name, cfg, verbose):
@@ -310,14 +361,21 @@ def check_module(name, cfg, verbose):
 
     matched = mismatched = unresolved = 0
     mismatches = []
+    unresolved_names = []
     for dotted, ours in sorted(zig.items()):
+        # `_` is Zig's non-exhaustive-enum marker, not a constant anybody could
+        # look up. Counting it as "unresolved" put noise in the one number that
+        # is supposed to mean "something here is unchecked".
+        if dotted.endswith("._"):
+            continue
         found = None
-        for cand in candidate_names(dotted, cfg["prefixes"]):
+        for cand in candidate_names(dotted, cfg["prefixes"], cfg.get("namespace_aliases")):
             if cand in kernel:
                 found = (cand, kernel[cand])
                 break
         if found is None:
             unresolved += 1
+            unresolved_names.append(dotted)
             continue
         cand, theirs = found
         if theirs == ours:
@@ -335,7 +393,26 @@ def check_module(name, cfg, verbose):
     )
     for dotted, ours, cand, theirs in mismatches:
         print(f"  MISMATCH {name}: {dotted} = {ours} in this repo, but kernel {cand} = {theirs}")
-    return ("skip" if len(zig) == 0 else "ok"), matched, mismatched, unresolved
+
+    # ⛔ UNRESOLVED IS NOT "FINE". A constant nothing could look up is a
+    # constant nothing checked, and until 2026-09-02 the count was printed as a
+    # bare number with the names hidden even under `--verbose` -- so devlink
+    # read "154 matched, 0 MISMATCH" while eight of its enums, including the
+    # ones that drive `setPortType`, `setParam` (device NVRAM) and
+    # `setEswitch`, were not being checked at all. The names are printed now,
+    # and a module may not exceed the budget its entry records.
+    budget = cfg.get("unresolved_budget")
+    over = budget is not None and unresolved > budget
+    if unresolved and (verbose or over):
+        for dotted in unresolved_names:
+            print(f"  UNRESOLVED {name}: {dotted} (no candidate kernel name)")
+    if over:
+        print(
+            f"  BUDGET {name}: {unresolved} unresolved, budget {budget}. Either the kernel "
+            f"spells these differently again (teach `candidate_names`) or they are genuinely "
+            f"not kernel constants (raise the budget, and say why)."
+        )
+    return ("skip" if len(zig) == 0 else ("fail" if over else "ok")), matched, mismatched, unresolved
 
 
 def main():
@@ -351,11 +428,16 @@ def main():
         return 2
 
     total_mismatch = 0
+    over_budget = 0
     for n in names:
-        _, _, mismatched, _ = check_module(n, MODULES[n], args.verbose)
+        status, _, mismatched, _ = check_module(n, MODULES[n], args.verbose)
         total_mismatch += mismatched
+        # An over-budget module is a FAILURE, not a note. The whole point of
+        # the budget is that "unresolved" stopped being a number nobody reads.
+        if status == "fail":
+            over_budget += 1
 
-    return 1 if total_mismatch else 0
+    return 1 if (total_mismatch or over_budget) else 0
 
 
 if __name__ == "__main__":

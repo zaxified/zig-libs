@@ -528,8 +528,12 @@ test "live: the kernel echoes back exactly the bytes a builder produced" {
         // ENODEV (or EPERM/EOPNOTSUPP on a kernel that answers differently) —
         // never success, since the handle names nothing.
         try testing.expect((try m.errorCode()) != 0);
+        // The kernel's echo, bounded before it is sliced: a short capped ACK
+        // would otherwise panic this test in Debug (audit 2026-09-02).
+        try testing.expect(m.payload.len >= 4);
         const echoed = m.payload[4..];
         if (m.flags & codec.NLM_F_CAPPED != 0) {
+            try testing.expect(echoed.len >= 16);
             // A kernel that caps the ACK returns the header only; then that is
             // all there is to compare.
             try testing.expectEqualSlices(u8, built[0..16], echoed[0..16]);
