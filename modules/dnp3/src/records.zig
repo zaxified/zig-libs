@@ -109,13 +109,50 @@ pub const Value = union(enum) {
     analog_int: i32,
     analog_float: f64,
 
+    /// The value as an integer, for callers that want one number whatever the
+    /// point's shape.
+    ///
+    /// ⚠ `@intFromFloat` is UNDEFINED for a NaN, an infinity, or a magnitude
+    /// past `i64` — and this is a public entry point on a type built out of
+    /// wire bytes (`decode` produces `.analog_float` straight from four or
+    /// eight peer-supplied bytes, and `f32`/`f64` have encodings for all
+    /// three). `lossyCast` saturates instead, and maps NaN to 0: a wrong
+    /// number is not good, but it is a number, and the alternative here was
+    /// illegal behaviour in a release build. Audit 2026-09-02.
     pub fn asInt(self: Value) i64 {
         return switch (self) {
             .binary => |b| @intFromBool(b),
             .double_bit => |d| @intFromEnum(d),
             .counter => |c| c,
             .analog_int => |v| v,
-            .analog_float => |f| @intFromFloat(f),
+            .analog_float => |f| std.math.lossyCast(i64, f),
+        };
+    }
+
+    /// An analog value as an integer for the integer wire forms, or
+    /// `error.ValueOutOfRange` when it does not survive the conversion.
+    ///
+    /// ⭐ The layout decides the WIRE form; the value is just a number. Until
+    /// 2026-09-02 the `.i16`/`.i32` encoders read `value.analog_int`
+    /// unconditionally, so a float-shaped value there was an inactive-union
+    /// read: a panic in Debug, and in ReleaseFast the float's low bytes
+    /// reinterpreted as an integer — a SCADA reading of `12.3` reaching the
+    /// master as `-1717986918`. Nothing bounded the shapes to each other,
+    /// because the shape came from the point's CONFIGURED variation and the
+    /// layout came from the master's REQUESTED one.
+    fn analogAsInt(value: Value) error{ValueOutOfRange}!i64 {
+        return switch (value) {
+            .analog_int => |v| v,
+            .analog_float => |f| blk: {
+                if (!std.math.isFinite(f)) return error.ValueOutOfRange;
+                const r = @round(f);
+                if (r > @as(f64, std.math.maxInt(i32)) or r < @as(f64, std.math.minInt(i32)))
+                    return error.ValueOutOfRange;
+                break :blk @intFromFloat(r);
+            },
+            // A caller that hands a binary or a counter to an analog layout
+            // has a bug the encoder should not paper over.
+            else => error.ValueOutOfRange,
         };
     }
 };
@@ -365,13 +402,14 @@ pub fn encode(layout: Layout, flags: Flags, value: Value, time_ms: u48, time_rel
             pos += 4;
         },
         .i16 => {
-            const v = value.analog_int;
+            const v = try Value.analogAsInt(value);
             if (v > 32767 or v < -32768) return error.ValueOutOfRange;
             std.mem.writeInt(i16, out[pos..][0..2], @intCast(v), .little);
             pos += 2;
         },
         .i32 => {
-            std.mem.writeInt(i32, out[pos..][0..4], value.analog_int, .little);
+            const v = try Value.analogAsInt(value);
+            std.mem.writeInt(i32, out[pos..][0..4], @intCast(v), .little);
             pos += 4;
         },
         .f32 => {

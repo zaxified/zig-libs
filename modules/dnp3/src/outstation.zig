@@ -214,8 +214,8 @@ pub const Database = struct {
             .binary_output_status => .{ .binary = self.binary_outputs[index].value },
             .counter => .{ .counter = self.counters[index].value },
             .frozen_counter => .{ .counter = self.frozen_counters[index].value },
-            .analog_input => analogValue(self.analog_inputs[index].value, self.analog_inputs[index].static_variation),
-            .analog_output_status => analogValue(self.analog_outputs[index].value, self.analog_outputs[index].static_variation),
+            .analog_input => analogValue(self.analog_inputs[index].value),
+            .analog_output_status => analogValue(self.analog_outputs[index].value),
         };
     }
 
@@ -256,13 +256,25 @@ pub const Database = struct {
     }
 };
 
-/// Picks the `records.Value` shape that matches a float-valued point's
-/// declared variation: the integer variations must carry an integer.
-fn analogValue(value: f64, variation: u8) records.Value {
-    return switch (variation) {
-        5, 6 => .{ .analog_float = value },
-        else => .{ .analog_int = std.math.lossyCast(i32, value) },
-    };
+/// An analog point's stored value, as a `records.Value`.
+///
+/// ⭐ It does NOT pick a shape from the point's declared variation any more,
+/// and that is the fix rather than the omission it looks like. The layout that
+/// finally encodes the value comes from the MASTER'S REQUESTED variation
+/// (`emitStatics`), not from the point's configured one, so any shape chosen
+/// here was a guess about a number the requester had not sent yet. Two
+/// defects came out of that guess (audit 2026-09-02): the two variations could
+/// disagree, giving `records.encode` a float where it read `.analog_int` --
+/// a panic in Debug, a reinterpreted low half in ReleaseFast; and the float
+/// variation numbers hard-coded here are group 30's, while g40's are 3 and 4
+/// and g32/g42's are 5..8, so a g40v3 point declared as a float was rounded
+/// to an integer before the encoder ever saw it (`3.25` arriving as `3`).
+///
+/// The database stores every analog as `f64`, which holds every `i32`
+/// exactly, so carrying the float loses nothing; `records.encode` converts to
+/// whatever wire form the layout names and refuses what will not fit.
+fn analogValue(value: f64) records.Value {
+    return .{ .analog_float = value };
 }
 
 // ── event buffer ────────────────────────────────────────────────────────────
@@ -712,14 +724,8 @@ pub const Outstation = struct {
             .binary_output_status => .{ .binary = self.db.binary_outputs[index].value },
             .counter => .{ .counter = self.db.counters[index].value },
             .frozen_counter => .{ .counter = self.db.frozen_counters[index].value },
-            .analog_input => analogValue(
-                self.db.analog_inputs[index].value,
-                self.db.analog_inputs[index].event_variation,
-            ),
-            .analog_output_status => analogValue(
-                self.db.analog_outputs[index].value,
-                self.db.analog_outputs[index].event_variation,
-            ),
+            .analog_input => analogValue(self.db.analog_inputs[index].value),
+            .analog_output_status => analogValue(self.db.analog_outputs[index].value),
         };
     }
 
@@ -1211,16 +1217,45 @@ pub const Outstation = struct {
                 if (next_var != var_used) break;
             }
 
-            const emitted = self.emitRun(kind, var_used, layout, first, run, out, pos);
-            if (emitted == 0) return false;
-            item_pos.* += emitted;
-            if (emitted < run) return false;
+            const r = self.emitRun(kind, var_used, layout, first, run, out, pos);
+            item_pos.* += r.emitted;
+            if (r.unencodable) {
+                // The point at the cursor cannot be carried by the variation
+                // the master asked for -- a counter past 0xFFFF read as
+                // `g20v2`, an analog outside i16 read as `g30v2`. Stepping
+                // over it is what the sibling `layoutOf` miss above already
+                // does; the difference is that this one is a property of the
+                // VALUE, so retrying can only loop. The master is told the
+                // response is not everything it asked for.
+                item_pos.* += 1;
+                self.pending_extra_iin.parameter_error = true;
+                continue;
+            }
+            if (r.emitted == 0) return false;
+            if (r.emitted < run) return false;
         }
         return true;
     }
 
-    /// Writes one object header plus as many of `run` points as fit,
-    /// returning how many points it managed.
+    /// What one `emitRun` managed, and why it stopped.
+    ///
+    /// ⛔ The `why` is load-bearing, and its absence was a CRITICAL: `emitRun`
+    /// used to return a bare count, and a zero meant either "no room in this
+    /// fragment" (retry in the next one — the cursor must NOT move) or "the
+    /// point at the cursor cannot be encoded in the requested variation"
+    /// (step over it — the cursor MUST move). The caller assumed the first,
+    /// so a counter above 0xFFFF read as `g20v2` -- a legal request, a legal
+    /// value -- left `item_pos` where it was and the outstation emitted
+    /// identical empty non-FIN fragments for ever. Measured before the fix:
+    /// 50 000 frames and 1.1 MB out of one 20-byte request, still going.
+    const RunResult = struct {
+        emitted: u32,
+        /// The point AFTER `emitted` is unencodable in this variation: not a
+        /// space problem, and no amount of retrying will change it.
+        unencodable: bool = false,
+    };
+
+    /// Writes one object header plus as many of `run` points as fit.
     fn emitRun(
         self: *Outstation,
         kind: PointKind,
@@ -1230,10 +1265,10 @@ pub const Outstation = struct {
         run: u32,
         out: []u8,
         pos: *usize,
-    ) u32 {
+    ) RunResult {
         const wide = first + run - 1 > 0xFF;
         const header_len: usize = if (wide) 7 else 5;
-        if (pos.* + header_len + 1 > out.len) return 0;
+        if (pos.* + header_len + 1 > out.len) return .{ .emitted = 0 };
 
         // How many points fit after the header?
         const space = out.len - pos.* - header_len;
@@ -1241,12 +1276,12 @@ pub const Outstation = struct {
         if (layout.isPacked()) {
             const per = if (layout.value == .packed_bit) @as(usize, 8) else 4;
             fit = @intCast(@min(@as(usize, run), space * per));
-            if (fit == 0) return 0;
+            if (fit == 0) return .{ .emitted = 0 };
             // Recompute the byte count for the points that fit.
         } else {
             const each = layout.wireLen().?;
             fit = @intCast(@min(@as(usize, run), space / each));
-            if (fit == 0) return 0;
+            if (fit == 0) return .{ .emitted = 0 };
         }
 
         const last = first + fit - 1;
@@ -1259,7 +1294,7 @@ pub const Outstation = struct {
             },
             .range = .{ .start_stop = .{ .start = first, .stop = last } },
         };
-        const hdr = objects.encodeObjectHeader(header, out[pos.*..]) catch return 0;
+        const hdr = objects.encodeObjectHeader(header, out[pos.*..]) catch return .{ .emitted = 0 };
         pos.* += hdr.len;
 
         if (layout.isPacked()) {
@@ -1287,11 +1322,11 @@ pub const Outstation = struct {
                     0,
                     0,
                     out[pos.*..],
-                ) catch return @intCast(i);
+                ) catch return .{ .emitted = @intCast(i), .unencodable = true };
                 pos.* += bytes.len;
             }
         }
-        return fit;
+        return .{ .emitted = fit };
     }
 
     /// Emits buffered events (oldest first, skipping the first `skip` of the
@@ -1669,7 +1704,12 @@ pub const Outstation = struct {
             if (index >= self.db.analog_outputs.len) return .not_supported;
             const point = &self.db.analog_outputs[index];
             if (!point.supports_commands) return .not_supported;
-            if (value < point.min or value > point.max) return .out_of_range;
+            // NOT `value < min or value > max`: both comparisons are FALSE
+            // for a NaN, so `00 00 C0 7F` in a g41v3 setpoint walked through
+            // a declared [-100, 100] and was written to the point and handed
+            // to the caller's hook and its actuator (audit 2026-09-02). Phrased
+            // as the positive property, a NaN fails it like anything else.
+            if (!(value >= point.min and value <= point.max)) return .out_of_range;
 
             if (self.hook) |h| {
                 const verdict = h.ask(kind, .{ .analog = .{ .index = index, .value = value } });
@@ -4032,6 +4072,15 @@ const hostile_objects = [_][2]u8{
     .{ 41, 4 }, .{ 1, 2 },  .{ 2, 2 },  .{ 10, 2 },
     .{ 20, 1 }, .{ 30, 1 }, .{ 50, 1 }, .{ 60, 1 },
     .{ 60, 2 }, .{ 80, 1 }, .{ 99, 7 },
+    // ⭐ The NARROW read variations, added 2026-09-02. Every read variation in
+    // the pool above is one that can carry any value the database holds, so
+    // the whole "the master asked for a variation this value does not fit"
+    // path -- which produced a CRITICAL non-terminating response series --
+    // was unreachable by construction, not merely unlucky. A pool of hostile
+    // objects that only names the wide variations cannot draw the request
+    // that breaks the narrow ones.
+    .{ 20, 2 },
+    .{ 30, 2 }, .{ 30, 4 }, .{ 30, 5 },
 };
 
 const hostile_range_codes = [_]u8{ 0, 1, 2, 6, 7, 8, 9, 3 };
@@ -4147,8 +4196,22 @@ fn checkDrawnFragment(station: *Outstation, fragment: []const u8, now_ms: u64, o
         try testing.expect(decoded.header.function == .response or
             decoded.header.function == .unsolicited_response);
     }
+    // ⛔ BOUNDED, and the bound is an assertion rather than a `break`. This
+    // loop used to be `while (station.cursor != null)` with no cap: fed the
+    // fragment that wedged the response cursor it ran for ever, so the
+    // harness whose job was to find that defect HUNG instead of failing it
+    // (measured: `timeout 60` → exit 124, no output). A fuzz target that can
+    // hang is a fuzz target that reports nothing.
+    //
+    // The cap is generous -- no legitimate response to a single request needs
+    // anything like this many fragments against a fixture database of a few
+    // points -- so exceeding it is a finding, not a tuning problem.
+    const max_fragments = 64;
+    var fragments: usize = 0;
     while (station.cursor != null) {
         _ = station.next(now_ms, out) catch break;
+        fragments += 1;
+        if (fragments > max_fragments) return error.ResponseSeriesDidNotTerminate;
     }
 }
 
@@ -4161,6 +4224,15 @@ test "fuzz: structured request fragments reach the command path and never panic"
     });
     var out: [2048]u8 = undefined;
     var buf: [200]u8 = undefined;
+
+    // ⭐ At least one point whose VALUE no narrow variation can carry. Without
+    // this the pool's `{20,2}`/`{30,2}` draws all encode cleanly and the
+    // harness still cannot reach the "requested variation cannot carry this
+    // value" path -- the one that produced a non-terminating response series.
+    // Two things have to line up for a fuzz target to see a class: an input
+    // that asks for it, and a STATE that makes it happen.
+    fix.counters[2].value = 0x1_0000; // one past g20v2
+    fix.analogs[3].value = 40_000; // outside i16, so g30v2/g30v4 refuse it
 
     var d = Xorshift{ .state = 0x9E37_79B9 };
     var shapes = DrawnShapes{};
@@ -4372,4 +4444,169 @@ test "fuzz: random link frames through a Session never panic" {
 test "meta: the module reports both roles" {
     const root = @import("root.zig");
     try testing.expectEqual(.both, root.meta.role);
+}
+
+// ── audit 2026-09-02 (drift campaign) ───────────────────────────────────────
+
+test "a value the requested variation cannot carry ends the response instead of looping for ever" {
+    // ⛔ CRITICAL regression. One legal 20-byte request -- READ g20v2, the
+    // 16-bit counter variation, against a counter holding more than 0xFFFF --
+    // used to drive an unbounded series of identical empty non-FIN fragments:
+    // `emitRun` returned 0 because the FIRST point failed to encode, the
+    // caller read that as "no room, retry", and `item_pos` never moved.
+    // Measured before the fix: 50 000 frames, 1.1 MB, still going.
+    var counters = [_]Counter{
+        .{ .value = 0x1_0000, .class = null }, // one past what g20v2 can carry
+        .{ .value = 7, .class = null },
+    };
+    var storage: [4]Event = undefined;
+    var station = Outstation.init(.{}, .{ .counters = &counters }, EventBuffer.init(&storage));
+    var out: [256]u8 = undefined;
+    var req: [32]u8 = undefined;
+    const read = try buildRead(&req, 0, &.{.{
+        .group = 20,
+        .variation = 2,
+        .qualifier = .{ .prefix_code = .none, .range_code = .all_values },
+        .range = .{ .all_values = {} },
+    }});
+
+    var reply = (try station.handle(read, 10, &out)).?;
+    var fragments: usize = 1;
+    while (reply.more) {
+        // A cap, not a deadline: without the fix this loop never ends, and a
+        // test that hangs reports nothing. Ten is far more than the two
+        // points here can legitimately need.
+        try testing.expect(fragments < 10);
+        reply = (try station.next(10, &out)).?;
+        fragments += 1;
+    }
+    try testing.expect(fragments <= 2);
+    // The point that could not be carried is not silently missing: the master
+    // is told the response is not everything it asked for.
+    try testing.expect((try responseIin(reply.fragment)).parameter_error);
+    // And the point that CAN be carried was still served.
+    var headers: [4]objects.ObjectHeader = undefined;
+    try testing.expect((try objectHeaders(reply.fragment, &headers)) >= 1);
+}
+
+test "an analog is encoded in the variation the master asked for, not the one it was configured with" {
+    // ⛔ HIGH regression. The layout came from the WIRE variation while the
+    // value's union shape came from the point's CONFIGURED one, so a float
+    // point read as g30v1 reached `records.encode`'s `.i32` arm holding
+    // `.analog_float`: an inactive-union read -- a panic in Debug, and in
+    // ReleaseFast the f64's low four bytes reinterpreted, so a reading of
+    // 12.3 reached the master as -1717986918.
+    var analogs = [_]AnalogInput{
+        .{ .value = 12.3, .class = null, .static_variation = 5 }, // f32 by config
+    };
+    var storage: [4]Event = undefined;
+    var station = Outstation.init(.{}, .{ .analog_inputs = &analogs }, EventBuffer.init(&storage));
+    var out: [256]u8 = undefined;
+    var req: [32]u8 = undefined;
+    const read = try buildRead(&req, 0, &.{.{
+        .group = 30,
+        .variation = 1, // 32-bit integer, on purpose
+        .qualifier = .{ .prefix_code = .none, .range_code = .all_values },
+        .range = .{ .all_values = {} },
+    }});
+    const reply = (try station.handle(read, 10, &out)).?;
+    const body = (try application.decodeResponseHeader(reply.fragment)).rest;
+    const hdr = try objects.decodeObjectHeader(body);
+    const rec = try records.decode(records.layoutOf(30, 1).?, .analog_input, body[hdr.consumed..]);
+    try testing.expectEqual(@as(i32, 12), @as(i32, @intCast(rec.value.asInt())));
+}
+
+test "an analog output status declared with its own group's float variation keeps its fraction" {
+    // MEDIUM regression: the shape picker hard-coded GROUP 30's float
+    // variation numbers (5, 6) and was applied to g40 as well, whose float
+    // variations are 3 and 4 -- so a g40v3 point was rounded to an integer
+    // before the encoder ever saw it, and 3.25 arrived as 3.
+    var aouts = [_]AnalogOutputStatus{
+        .{ .value = 3.25, .class = null, .static_variation = 3, .min = -100, .max = 100 },
+    };
+    var storage: [4]Event = undefined;
+    var station = Outstation.init(.{}, .{ .analog_outputs = &aouts }, EventBuffer.init(&storage));
+    var out: [256]u8 = undefined;
+    var req: [32]u8 = undefined;
+    const read = try buildRead(&req, 0, &.{.{
+        .group = 40,
+        .variation = 3, // single-precision float
+        .qualifier = .{ .prefix_code = .none, .range_code = .all_values },
+        .range = .{ .all_values = {} },
+    }});
+    const reply = (try station.handle(read, 10, &out)).?;
+    const body = (try application.decodeResponseHeader(reply.fragment)).rest;
+    const hdr = try objects.decodeObjectHeader(body);
+    const rec = try records.decode(records.layoutOf(40, 3).?, .analog_output_status, body[hdr.consumed..]);
+    try testing.expectEqual(@as(f64, 3.25), rec.value.analog_float);
+}
+
+test "a NaN setpoint is out of range, not a value that walks through the limits" {
+    // ⛔ HIGH regression. The guard read `value < min or value > max`, and
+    // BOTH comparisons are false for a NaN -- so a g41v3 carrying
+    // `00 00 C0 7F` returned `.success`, was written to the point, and was
+    // handed to the caller's hook and its actuator, past a declared
+    // [-100, 100]. (+inf and -inf were always rejected; only NaN slipped.)
+    var fix = Fixture{};
+    var station = fix.station(.{});
+    var out: [256]u8 = undefined;
+    var req: [64]u8 = undefined;
+
+    const build = struct {
+        fn v3(buf: []u8, seq: u4, index: u8, bits: u32) ![]u8 {
+            var pos = (try application.encodeRequestHeader(
+                .{ .control = .{ .fir = true, .fin = true, .seq = seq }, .function = .direct_operate },
+                buf,
+            )).len;
+            pos += (try objects.encodeObjectHeader(.{
+                .group = 41,
+                .variation = 3,
+                .qualifier = .{ .prefix_code = .index_1b, .range_code = .count_1b },
+                .range = .{ .count = 1 },
+            }, buf[pos..])).len;
+            buf[pos] = index;
+            pos += 1;
+            // The bit pattern, not a Zig float literal: this is what arrives.
+            pos += (try (objects.g41.V3{ .value = @bitCast(bits) }).encode(buf[pos..])).len;
+            return buf[0..pos];
+        }
+    };
+
+    const before = fix.aouts[0].value;
+    const nan_req = try build.v3(&req, 0, 0, 0x7FC0_0000); // quiet NaN
+    const reply = (try station.handle(nan_req, 100, &out)).?;
+    try testing.expectEqual(CommandStatus.out_of_range, try commandStatus(reply.fragment));
+    try testing.expectEqual(before, fix.aouts[0].value); // never written
+    try testing.expect(!std.math.isNan(fix.aouts[0].value));
+
+    // The ordinary in-range setpoint still works, so the guard did not become
+    // a refusal of everything.
+    const ok = try build.v3(&req, 1, 0, @bitCast(@as(f32, 12.5)));
+    const reply2 = (try station.handle(ok, 200, &out)).?;
+    try testing.expectEqual(CommandStatus.success, try commandStatus(reply2.fragment));
+    try testing.expectEqual(@as(f64, 12.5), fix.aouts[0].value);
+}
+
+test "a read of a point kind the database does not have is OBJECT_UNKNOWN, not an empty-range walk" {
+    // The guard is `if (n == 0) return error.UnknownObject` in
+    // `parseReadHeader`, and until 2026-09-02 NOTHING pinned it: disabling it
+    // left the whole suite green, because every test configures the kind it
+    // reads. It is load-bearing -- with it disabled, `all_values` computes
+    // `stop = n - 1` on an unsigned zero: `integer overflow` in Debug, and in
+    // ReleaseFast a walk over ~2^32 points.
+    var binaries = [_]BinaryInput{.{ .value = true }};
+    var storage: [2]Event = undefined;
+    // Frozen counters: deliberately absent from this database.
+    var station = Outstation.init(.{}, .{ .binary_inputs = &binaries }, EventBuffer.init(&storage));
+    var out: [256]u8 = undefined;
+    var req: [32]u8 = undefined;
+    const read = try buildRead(&req, 0, &.{.{
+        .group = 21, // frozen counters
+        .variation = 1,
+        .qualifier = .{ .prefix_code = .none, .range_code = .all_values },
+        .range = .{ .all_values = {} },
+    }});
+    const reply = (try station.handle(read, 10, &out)).?;
+    try testing.expect((try responseIin(reply.fragment)).object_unknown);
+    try testing.expect(!reply.more);
 }

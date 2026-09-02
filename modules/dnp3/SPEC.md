@@ -123,7 +123,18 @@ fragment that is not FIR+FIN, an object header whose range is inverted or empty,
 that runs past the database, a count that overruns the fragment, a start/stop range spanning the
 whole 32-bit space, a prefix-less command header naming a point index past the 16-bit index space,
 a variation the module does not implement, an unassigned function code, and a zero-length fragment
-all resolve to a response with the right IIN bits rather than an error or a crash. Wire-driven
+all resolve to a response with the right IIN bits rather than an error or a crash.
+
+⚠ **And a WELL-FORMED request is part of that surface too, which this paragraph used to leave
+unsaid** (audit 2026-09-02). Three of that audit's findings needed nothing malformed at all: a
+`READ g20v2` -- a spec-defined 16-bit counter variation -- against a counter holding more than
+`0xFFFF` drove an unbounded series of identical empty fragments, because the value the master asked
+for could not be carried in the variation it asked for and the response cursor treated that as "no
+room, retry"; a `READ g30v1` against a point CONFIGURED as a float reached an inactive union field;
+and a `DIRECT_OPERATE` carrying a NaN setpoint walked through a declared `[min, max]` because
+`value < min or value > max` is false for a NaN. The threat model is not "malformed bytes": it is
+every request a master can legally send, against every state the caller's database can legally
+hold. Wire-driven
 object-instance counts always go through `objects.Range.objectCount()` / `objectSpanBytes()`, whose
 arithmetic is widened to `u64`; a raw `stop - start + 1` on a wire value is a defect, and an index
 that does not fit the 16-bit point space is refused, never truncated onto a different point.

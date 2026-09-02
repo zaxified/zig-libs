@@ -5,6 +5,45 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — **Audit (drift campaign): 1 CRITICAL, 2 HIGH, 2 MEDIUM, 1 LOW fixed.** All in
+  the read/command path, and none of them needed a malformed request.
+  **CRITICAL — a legal request drove a response series that never ended.** `emitRun` returned a
+  bare count, and a zero meant either "no room in this fragment" (retry; the cursor must not move)
+  or "this point cannot be encoded in the requested variation" (step over it; the cursor must
+  move). `emitStatics` assumed the first, so a `READ g20v2` against a counter above `0xFFFF` --
+  or `g30v2`/`g30v4` against an analog outside `i16`, or a class-0 poll of any point whose
+  declared variation is narrower than its value -- left `item_pos` unchanged and emitted identical
+  empty non-FIN fragments for ever (measured: 50 000 frames, 1.1 MB, still going, from one 20-byte
+  link frame). `emitRun` now reports WHY it stopped; the caller steps over an unencodable point and
+  sets `parameter_error` so the master learns the response is not everything it asked for.
+  **HIGH — the value's shape came from the point's configured variation, the layout from the
+  master's requested one.** Nothing bound the two together, so a float-configured analog read as
+  `g30v1` reached `records.encode`'s `.i32` arm holding `.analog_float`: a panic in Debug, and in
+  ReleaseFast the f64's low four bytes reinterpreted -- a reading of `12.3` arriving at the master
+  as `-1717986918`. The encoder now converts between the analog shapes (`Value.analogAsInt`,
+  refusing NaN/inf/out-of-range) and `analogValue` no longer guesses a shape at all.
+  **HIGH — a NaN setpoint defeated the analog-output limits.** `value < min or value > max` is
+  false for a NaN, so a `g41v3` carrying `00 00 C0 7F` returned `.success`, was stored, and was
+  handed to the caller's hook and its actuator past a declared `[-100, 100]`. Phrased as the
+  positive property now.
+  **MEDIUM — the shape picker hard-coded group 30's float variation numbers** (5, 6) and was
+  applied to g40 (3, 4) and g32/g42 (5..8) as well, so a g40v3 point was rounded to an integer
+  before the encoder saw it: `3.25` arrived as `3`. Gone with the guess.
+  **MEDIUM — the fuzz harness could not report any of this.** `checkDrawnFragment` drained with an
+  unbounded `while (station.cursor != null)`: fed the wedging fragment it HUNG rather than failed
+  (`timeout 60` → exit 124). It is bounded now, and exceeding the bound is an error rather than a
+  `break`. Two further blind spots closed with it: the hostile-object pool named only variations
+  wide enough to carry any value (`{20,2}`, `{30,2}`, `{30,4}`, `{30,5}` added), and the fixture
+  held no value that a narrow variation refuses -- an input that asks for the class is not enough
+  if no STATE makes it happen.
+  **LOW — `parseReadHeader`'s empty-database guard had no test behind it.** Disabling
+  `if (n == 0) return error.UnknownObject` left the whole suite green, while a `READ g21` against
+  a database with no frozen counters computes `stop = n - 1` on an unsigned zero: `integer
+  overflow` in Debug, a ~2^32-point walk in ReleaseFast. Pinned.
+  Every fix carries a regression test that goes red when the fix is reverted; `Value.asInt`'s
+  unguarded `@intFromFloat` (a public entry point reachable from decoded wire bytes) saturates
+  instead of being undefined. Ledger: `~/CML/20260931-zig-libs-audit/dnp3.md`.
+
 - **2026-08-18** — Portability fix (`check-portable`), and a latent 32-bit correctness
   bug it uncovered: `Cursor.item_pos` and the class-0 static-scan's `scan_stride`
   constant (`1 << 32`) were typed `usize`. The `1 << 32` literal doesn't fit `usize` on a
