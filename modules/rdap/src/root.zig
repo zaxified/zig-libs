@@ -887,8 +887,14 @@ pub const Fetcher = struct {
 pub const Client = struct {
     fetcher: Fetcher,
     gpa: std.mem.Allocator,
+    /// Where this client may dial. See `DestinationPolicy` — both terms
+    /// default to deny, and they apply to the primary query as well as the
+    /// related hop. The primary URL is not automatically trustworthy: the
+    /// documented way to obtain one is `Bootstrap.lookupDomain`, which returns
+    /// service URLs parsed straight out of an untrusted registry file.
+    destinations: DestinationPolicy = .{},
 
-    pub const QueryError = FetchError || ParseError || UrlError ||
+    pub const QueryError = FetchError || ParseError || UrlError || DestinationError ||
         error{
             /// HTTP 404 — the queried object does not exist (RFC 7480 §5.3).
             NotFound,
@@ -940,15 +946,16 @@ pub const Client = struct {
             .rdap_error => null,
         };
         const related = related_opt orelse return parsed;
-        if (!isHttpUrl(related)) return parsed;
-        const related_url = http.Url.parse(related) catch return parsed;
-        if (isSpecialUseHost(related_url.host)) return parsed; // SSRF guard
+        // Same gate as the primary — including the https requirement, so a
+        // `related` href cannot walk the exchange off TLS. A refused hop falls
+        // back to the document we already have, as a failed one always did.
         const followed = c.fetchAndParse(related, body_buf, null) catch return parsed;
         parsed.deinit();
         return followed;
     }
 
     fn fetchAndParse(c: *Client, url: []const u8, body_buf: []u8, status_out: ?*u16) QueryError!Parsed {
+        try checkDestination(url, c.destinations);
         const res = try c.fetcher.fetch(url, body_buf);
         if (res.status == 404) return error.NotFound;
         const failure = res.status < 200 or res.status >= 300;
@@ -991,11 +998,52 @@ fn isHttpUrl(s: []const u8) bool {
 /// here — it is left to the caller's `Fetcher`/`http.Client`'s own resolver;
 /// this check catches the literal-IP and `localhost` cases the audit found
 /// directly exploitable.
-fn isSpecialUseHost(host: []const u8) bool {
+fn isSpecialUseHost(raw_host: []const u8) bool {
+    // A trailing root dot is the ABSOLUTE spelling of the same name: every
+    // resolver treats `localhost.` as `localhost` (verified on this host —
+    // `getent hosts localhost.` answers `::1`). Comparing the unnormalised
+    // string missed it, `netaddr.parseIp` rejected it, and the function
+    // returned false — so the one hostname this guard exists to deny was
+    // reachable in one hop by writing it with a dot on the end.
+    const host = std.mem.trimEnd(u8, raw_host, ".");
+    if (host.len == 0) return true; // "." / "" is not a destination
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
     if (std.ascii.endsWithIgnoreCase(host, ".localhost")) return true;
     const ip = netaddr.parseIp(host) orelse return false;
     return isSpecialUseIp(ip);
+}
+
+/// What this module will dial. Applied to **every** URL it fetches — the
+/// primary query, the `rel:"related"` hop, and each redirect `Location` —
+/// because the address that matters is the one finally connected to, and a
+/// check on the first of those bounds nothing.
+///
+/// Both defaults are deny. RDAP is an https protocol (every IANA bootstrap
+/// entry is https) and its trust rests entirely on TLS to the server, so a
+/// plaintext destination is a downgrade whoever named it. Point a client at a
+/// loopback or plaintext server on purpose by relaxing these.
+pub const DestinationPolicy = struct {
+    /// Refuse special-use / non-routable address space (see `isSpecialUseHost`).
+    deny_special_use: bool = true,
+    /// Refuse `http://`; only `https://` may be dialed.
+    require_https: bool = true,
+};
+
+pub const DestinationError = error{
+    /// The URL is not http(s), or is not parseable as one.
+    BadDestination,
+    /// The destination is refused by the active `DestinationPolicy`.
+    BlockedDestination,
+};
+
+/// The single gate every dial in this module passes through.
+pub fn checkDestination(url: []const u8, policy: DestinationPolicy) DestinationError!void {
+    if (!isHttpUrl(url)) return error.BadDestination;
+    if (policy.require_https and !std.ascii.startsWithIgnoreCase(url, "https://")) {
+        return error.BlockedDestination;
+    }
+    const parsed = http.Url.parse(url) catch return error.BadDestination;
+    if (policy.deny_special_use and isSpecialUseHost(parsed.host)) return error.BlockedDestination;
 }
 
 /// The policy: which address space this module refuses to follow a related
@@ -1035,6 +1083,17 @@ fn isDocumentationIp(ip: netaddr.Ip) bool {
 /// the http client follows HTTP redirects itself, RFC 7480 §5.2).
 pub const HttpFetcher = struct {
     client: *http.Client,
+    /// Applied to every redirect `Location` before it is dialed. Keep it the
+    /// same as the `Client`'s: this fetcher is where the destinations that
+    /// `Client` never sees are chosen.
+    destinations: DestinationPolicy = .{},
+    /// How many `Location` hops to follow. `http.Client` would follow up to
+    /// ten of them **itself**, accepting an absolute cross-origin `Location`
+    /// verbatim — so the module's destination check applied to the address it
+    /// asked for and never to the one it reached, and any server able to send
+    /// one response could bounce the client anywhere. Following them here is
+    /// what puts each hop through `checkDestination`.
+    max_redirects: u8 = 5,
 
     pub fn fetcher(f: *HttpFetcher) Fetcher {
         return .{ .ctx = f, .fetchFn = fetchFn };
@@ -1042,9 +1101,49 @@ pub const HttpFetcher = struct {
 
     fn fetchFn(ctx: *anyopaque, url: []const u8, body_buf: []u8) FetchError!Fetcher.Result {
         const f: *HttpFetcher = @ptrCast(@alignCast(ctx));
-        var res = f.client.request(.get, url, .{
-            .headers = &.{accept_header},
-        }) catch |err| return mapFetchError(err);
+        var url_buf: [max_url_len]u8 = undefined;
+        var current = url;
+        var hops: u8 = 0;
+        while (true) {
+            var res = f.client.request(.get, current, .{
+                .headers = &.{accept_header},
+                .follow_redirects = false,
+            }) catch |err| return mapFetchError(err);
+            if (!isRedirectStatus(res.status)) return readBody(&res, body_buf);
+            const location = res.header("location") orelse return readBody(&res, body_buf);
+            if (hops >= f.max_redirects) {
+                res.deinit();
+                return error.FetchFailed;
+            }
+            const base = http.Url.parse(current) catch {
+                res.deinit();
+                return error.FetchFailed;
+            };
+            // Resolve into a buffer that is NOT the response's, then drop the
+            // response: `location` points into `res`.
+            var next_buf: [max_url_len]u8 = undefined;
+            const resolved = http.resolveLocation(base, location, &next_buf) catch {
+                res.deinit();
+                return error.FetchFailed;
+            };
+            const len = resolved.len;
+            @memcpy(url_buf[0..len], resolved);
+            res.deinit();
+            const next = url_buf[0..len];
+            checkDestination(next, f.destinations) catch return error.FetchFailed;
+            current = next;
+            hops += 1;
+        }
+    }
+
+    fn isRedirectStatus(status: u16) bool {
+        return switch (status) {
+            301, 302, 303, 307, 308 => true,
+            else => false,
+        };
+    }
+
+    fn readBody(res: *http.Client.Response, body_buf: []u8) FetchError!Fetcher.Result {
         defer res.deinit();
 
         const n = res.reader().readSliceShort(body_buf) catch |err| switch (err) {
@@ -1899,6 +1998,160 @@ test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes
     try testing.expect(!isSpecialUseHost("2001:db9::1"));
 }
 
+test "isSpecialUseHost: the ABSOLUTE spelling is the same name (re-audit F1)" {
+    // `localhost.` is `localhost` to every resolver on earth — verified on
+    // this host: `getent hosts localhost.` answers `::1`. The guard compared
+    // the raw string and `netaddr.parseIp` rejected the dotted form, so this
+    // returned false and the hop was dialed.
+    for ([_][]const u8{
+        "localhost.",       "LOCALHOST.",     "LocalHost.", "localhost..",
+        "x.localhost.",     "a.b.localhost.", "127.0.0.1.", "10.0.0.1.",
+        "169.254.169.254.", "0.0.0.0.",       ".",          "",
+    }) |h| {
+        if (!isSpecialUseHost(h)) {
+            std.debug.print("host not classified special-use: '{s}'\n", .{h});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Unchanged: a public name is still not special-use, and a name that
+    // merely CONTAINS one is not either.
+    for ([_][]const u8{
+        "rdap.verisign.com",        "rdap.verisign.com.",
+        "localhost.evil.example",   "notlocalhost",
+        "203.0.113.9.evil.example",
+    }) |h| {
+        if (isSpecialUseHost(h)) {
+            std.debug.print("public host classified special-use: '{s}'\n", .{h});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "checkDestination: the policy is scheme AND address, and both default to deny (re-audit F1/F3)" {
+    const strict: DestinationPolicy = .{};
+    // Plaintext is a downgrade whoever named it: this module's trust rests
+    // entirely on TLS to the RDAP server.
+    try testing.expectError(error.BlockedDestination, checkDestination("http://rdap.verisign.com/x", strict));
+    try testing.expectError(error.BlockedDestination, checkDestination("https://localhost./x", strict));
+    try testing.expectError(error.BlockedDestination, checkDestination("https://127.0.0.1./x", strict));
+    try testing.expectError(error.BlockedDestination, checkDestination("https://169.254.169.254/x", strict));
+    try testing.expectError(error.BadDestination, checkDestination("file:///etc/passwd", strict));
+    try testing.expectError(error.BadDestination, checkDestination("ftp://rdap.example/x", strict));
+    try checkDestination("https://rdap.verisign.com/com/v1/domain/example.com", strict);
+
+    // A caller that really does point at a local server says so.
+    const lax: DestinationPolicy = .{ .deny_special_use = false, .require_https = false };
+    try checkDestination("http://127.0.0.1:8080/rdap/domain/x", lax);
+    // ...and relaxing one term does not relax the other.
+    try testing.expectError(error.BlockedDestination, checkDestination(
+        "http://127.0.0.1:8080/x",
+        .{ .deny_special_use = true, .require_https = false },
+    ));
+    try testing.expectError(error.BlockedDestination, checkDestination(
+        "http://rdap.verisign.com/x",
+        .{ .deny_special_use = false, .require_https = true },
+    ));
+}
+
+test "client: a related link cannot walk the exchange off TLS (re-audit F3)" {
+    // The 2026-07-19 audit's F1 named the scheme downgrade in the same
+    // sentence as the address SSRF; the fix that closed it added the address
+    // guard only, so this half stayed open and was recorded nowhere.
+    const downgrade_json =
+        \\{
+        \\  "objectClassName": "domain",
+        \\  "handle": "REGISTRY",
+        \\  "links": [
+        \\    {"rel": "related", "type": "application/rdap+json",
+        \\     "href": "http://rdap.registrar.example/domain/example.com"}
+        \\  ]
+        \\}
+    ;
+    var stub: StubFetcher = .{
+        .entries = &.{
+            .{ .url = "https://rdap.verisign.com/com/v1/domain/example.com", .body = downgrade_json },
+            // Reachable only if the downgrade is followed. It must not be.
+            .{ .url = "http://rdap.registrar.example/domain/example.com", .body = domain_json },
+        },
+    };
+    var client: Client = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    var buf: [8192]u8 = undefined;
+    var parsed = try client.query(
+        "https://rdap.verisign.com/com/v1",
+        .domain,
+        "example.com",
+        .{ .follow_related = true },
+        &buf,
+        null,
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), stub.call_count); // never dialed
+    try testing.expectEqualStrings("REGISTRY", parsed.document.object.handle.?);
+}
+
+test "client: a related link at the ABSOLUTE loopback name is refused (re-audit F1)" {
+    const dotted_json =
+        \\{
+        \\  "objectClassName": "domain",
+        \\  "handle": "REGISTRY",
+        \\  "links": [
+        \\    {"rel": "related", "type": "application/rdap+json",
+        \\     "href": "https://localhost.:6379/rdap/domain/example.com"}
+        \\  ]
+        \\}
+    ;
+    var stub: StubFetcher = .{
+        .entries = &.{
+            .{ .url = "https://rdap.verisign.com/com/v1/domain/example.com", .body = dotted_json },
+            .{ .url = "https://localhost.:6379/rdap/domain/example.com", .body = domain_json },
+        },
+    };
+    var client: Client = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    var buf: [8192]u8 = undefined;
+    var parsed = try client.query(
+        "https://rdap.verisign.com/com/v1",
+        .domain,
+        "example.com",
+        .{ .follow_related = true },
+        &buf,
+        null,
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), stub.call_count);
+    try testing.expectEqualStrings("REGISTRY", parsed.document.object.handle.?);
+}
+
+test "client: the PRIMARY url is gated too — a bootstrap entry is untrusted input (re-audit F4)" {
+    // `Bootstrap.lookupDomain` returns service URLs parsed out of a registry
+    // file this module does not author, and `example/main.zig` feeds `urls[0]`
+    // straight to `query`. That path had no destination check at all: a
+    // bootstrap naming `http://169.254.169.254/` sent every query there.
+    var stub: StubFetcher = .{ .entries = &.{
+        .{ .url = "http://169.254.169.254/domain/example.com", .body = domain_json },
+        .{ .url = "https://localhost./domain/example.com", .body = domain_json },
+    } };
+    var client: Client = .{ .fetcher = stub.fetcher(), .gpa = testing.allocator };
+    var buf: [8192]u8 = undefined;
+    try testing.expectError(error.BlockedDestination, client.query(
+        "http://169.254.169.254",
+        .domain,
+        "example.com",
+        .{},
+        &buf,
+        null,
+    ));
+    try testing.expectError(error.BlockedDestination, client.query(
+        "https://localhost.",
+        .domain,
+        "example.com",
+        .{},
+        &buf,
+        null,
+    ));
+    // Refused BEFORE the fetcher was touched, not after.
+    try testing.expectEqual(@as(usize, 0), stub.call_count);
+}
+
 test "client: related link at a loopback host is refused, falls back to the first document" {
     const ssrf_related_json =
         \\{
@@ -2038,6 +2291,109 @@ test "HttpFetcher.fetchFn: a canceled body read surfaces error.Canceled, not err
     try testing.expectError(error.Canceled, fut.cancel(io));
 }
 
+/// A listener that answers up to `max_serve` requests with the same canned
+/// bytes, counting how many it actually served. Closing the listener from the
+/// main thread is what releases it when it is parked in `accept`.
+const CannedPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    response: []const u8,
+    hits: std.atomic.Value(u32) = .init(0),
+    stop: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *CannedPeer) void {
+        while (true) {
+            const s = p.listener.accept(p.io) catch return;
+            defer s.close(p.io);
+            // Closing the listener does NOT wake a peer parked in `accept`
+            // under `std.Io.Threaded`, so the test wakes it with one throwaway
+            // connection after setting this. (Learned the hard way: the first
+            // shape of this test hung the whole suite.)
+            if (p.stop.load(.acquire) != 0) return;
+            _ = p.hits.fetchAdd(1, .monotonic);
+            var rbuf: [1024]u8 = undefined;
+            var sr = s.reader(p.io, &rbuf);
+            _ = sr.interface.takeDelimiterExclusive('\n') catch {};
+            var wbuf: [512]u8 = undefined;
+            var sw = s.writer(p.io, &wbuf);
+            sw.interface.writeAll(p.response) catch {};
+            sw.interface.flush() catch {};
+        }
+    }
+};
+
+test "HttpFetcher: every redirect Location is gated, and the chain is bounded (re-audit F2)" {
+    // `http.Client` follows up to ten `Location` hops ITSELF, accepting an
+    // absolute cross-origin one verbatim — so this module's destination check
+    // applied to the address it ASKED for and never to the one it REACHED.
+    // Any server able to send one response could bounce the client anywhere,
+    // which made the whole SSRF deny-list decorative. Following the hops here
+    // is what puts each one through `checkDestination`.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = addr.listen(io, .{}) catch return error.SkipZigTest;
+    var open = true;
+    defer if (open) server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    // The server points every request straight back at itself: a redirect
+    // graph with no exit, which is exactly what a bound has to survive.
+    var loc_buf: [160]u8 = undefined;
+    const response = try std.fmt.bufPrint(
+        &loc_buf,
+        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/next\r\nContent-Length: 0\r\n\r\n",
+        .{port},
+    );
+    var peer: CannedPeer = .{ .io = io, .listener = &server, .response = response };
+    const pt = try std.Thread.spawn(.{}, CannedPeer.run, .{&peer});
+
+    var http_client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer http_client.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/rdap/domain/x", .{port});
+    var body_buf: [512]u8 = undefined;
+
+    // (a) The policy a caller uses to reach a plaintext loopback server on
+    // purpose still denies special-use ADDRESSES — and the Location names
+    // one, so the hop is refused after exactly one request.
+    var gated: HttpFetcher = .{
+        .client = &http_client,
+        .destinations = .{ .require_https = false, .deny_special_use = true },
+    };
+    const gated_result = gated.fetcher().fetch(url, &body_buf);
+    const after_gated = peer.hits.load(.monotonic);
+
+    // (b) With the address term relaxed the hops ARE followed — and stop at
+    // `max_redirects`, rather than running as long as the server likes.
+    var bounded: HttpFetcher = .{
+        .client = &http_client,
+        .destinations = .{ .require_https = false, .deny_special_use = false },
+        .max_redirects = 2,
+    };
+    const bounded_result = bounded.fetcher().fetch(url, &body_buf);
+    const after_bounded = peer.hits.load(.monotonic);
+
+    // Release the peer, then tear the listener down.
+    peer.stop.store(1, .release);
+    if (server.socket.address.connect(io, .{ .mode = .stream })) |wake| {
+        var w = wake;
+        w.close(io);
+    } else |_| {}
+    pt.join();
+    server.deinit(io);
+    open = false;
+
+    try testing.expectError(error.FetchFailed, gated_result);
+    try testing.expectEqual(@as(u32, 1), after_gated);
+    try testing.expectError(error.FetchFailed, bounded_result);
+    // The first request plus `max_redirects` follow-ups, and not one more.
+    try testing.expectEqual(@as(u32, 1 + 2), after_bounded - after_gated);
+}
+
 // ── fuzz: RDAP response + IANA bootstrap JSON parse, never panics ──────────
 //
 // `parseResponse` runs on the HTTP response body from whatever RDAP server
@@ -2050,13 +2406,93 @@ test "fuzz: parseResponse never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzParseResponse, .{});
 }
 
+/// The tolerant mapper — `mapObject`/`mapEntities`/`extractVcard`/
+/// `mapRedacted` — is the actual untrusted-input surface, and 512 uniform
+/// random bytes never form JSON, so before this the harness reached
+/// `std.json` and stopped there. Worse, `catch return` turned every outcome
+/// into a pass. Three things fix the aim: an assertion that the mapper really
+/// ran (independent of the fuzzer, so it fails the moment the harness drifts
+/// off target again), an error switch instead of `catch return`, and a second
+/// pass that puts the fuzzer's bytes INSIDE a well-formed RDAP document.
+fn assertMapperReached() !void {
+    var parsed = try parseResponse(testing.allocator, domain_json);
+    defer parsed.deinit();
+    const o = parsed.document.object;
+    try testing.expectEqualStrings("2336799_DOMAIN_COM-VRSN", o.handle.?);
+    try testing.expectEqual(@as(usize, 1), o.entities.len); // mapEntities
+    try testing.expectEqualStrings("Example Registrar Inc.", o.entities[0].full_name.?); // extractVcard
+    try testing.expect(o.events.len >= 3);
+    try testing.expect(o.links.len >= 2);
+}
+
+fn tolerate(result: ParseError!Parsed) !void {
+    var parsed = result catch |err| switch (err) {
+        // The declared set, and nothing else. Anything outside it is a
+        // failure, which `catch return` could never report.
+        error.InvalidJson, error.InvalidRdap, error.OutOfMemory => return,
+    };
+    parsed.deinit();
+}
+
+/// Wrap the fuzzer's bytes in a real RDAP skeleton at a fuzzer-chosen member,
+/// as a fuzzer-chosen JSON shape. This is what actually drives the mapper's
+/// type switches: a member that is a string where an array is expected, an
+/// array of the wrong element type, a deeply nested value, an absent member.
+fn buildFuzzedResponse(w: *std.Io.Writer, smith: *std.testing.Smith, payload: []const u8) !void {
+    const members = [_][]const u8{
+        "handle",      "ldhName",   "status",    "events",  "entities",
+        "nameservers", "links",     "notices",   "remarks", "vcardArray",
+        "redacted",    "publicIds", "secureDNS",
+    };
+    const member = members[smith.index(members.len)];
+    try w.writeAll("{\"objectClassName\":\"domain\",\"handle\":\"H\",\"");
+    try w.writeAll(member);
+    try w.writeAll("\":");
+    switch (smith.index(6)) {
+        0 => try std.json.Stringify.encodeJsonString(payload, .{}, w),
+        1 => try w.print("{d}", .{payload.len}),
+        2 => {
+            try w.writeAll("[");
+            try std.json.Stringify.encodeJsonString(payload, .{}, w);
+            try w.writeAll("]");
+        },
+        3 => {
+            try w.writeAll("[{\"");
+            try w.writeAll(member);
+            try w.writeAll("\":");
+            try std.json.Stringify.encodeJsonString(payload, .{}, w);
+            try w.writeAll("}]");
+        },
+        4 => try w.writeAll("null"),
+        else => {
+            // Nesting, bounded by the fuzzer's own byte budget.
+            const depth = smith.valueRangeAtMost(u8, 0, 32);
+            var i: u8 = 0;
+            while (i < depth) : (i += 1) try w.writeAll("[");
+            try std.json.Stringify.encodeJsonString(payload, .{}, w);
+            i = 0;
+            while (i < depth) : (i += 1) try w.writeAll("]");
+        },
+    }
+    try w.writeAll("}");
+}
+
 fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
+    try assertMapperReached();
+
     var buf: [512]u8 = undefined;
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const payload = buf[0..len];
 
-    var parsed = parseResponse(testing.allocator, buf[0..len]) catch return;
-    parsed.deinit();
+    // (a) the raw bytes, as before: they must never panic.
+    try tolerate(parseResponse(testing.allocator, payload));
+
+    // (b) the same bytes inside a document the mapper will actually walk.
+    var doc: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer doc.deinit();
+    buildFuzzedResponse(&doc.writer, smith, payload) catch return;
+    try tolerate(parseResponse(testing.allocator, doc.written()));
 }
 
 test "fuzz: parseBootstrap never panics on arbitrary bytes" {
@@ -2067,9 +2503,48 @@ fn fuzzParseBootstrap(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const payload = buf[0..len];
 
-    var bootstrap = parseBootstrap(testing.allocator, buf[0..len]) catch return;
-    bootstrap.deinit();
+    // Aim canary: the bootstrap mapper must be reachable, and this says so
+    // without depending on the fuzzer (see `assertMapperReached`).
+    {
+        const canary =
+            \\{
+            \\  "version": "1.0",
+            \\  "services": [
+            \\    [["com", "net"], ["https://rdap.verisign.com/com/v1/"]],
+            \\    [["org"], ["https://rdap.publicinterestregistry.org/rdap/"]]
+            \\  ]
+            \\}
+        ;
+        var bs = try parseBootstrap(testing.allocator, canary);
+        defer bs.deinit();
+        try testing.expectEqual(@as(usize, 2), bs.services.len);
+        try testing.expect(bs.lookupDomain("example.com") != null);
+    }
+
+    if (parseBootstrap(testing.allocator, payload)) |bs| {
+        var b = bs;
+        b.deinit();
+    } else |err| switch (err) {
+        error.InvalidJson, error.InvalidRdap, error.OutOfMemory => {},
+    }
+
+    // The fuzzer's bytes as a service entry, so the shape the mapper walks is
+    // a bootstrap file and not a random blob.
+    var doc: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer doc.deinit();
+    doc.writer.writeAll("{\"version\":\"1.0\",\"services\":[[[") catch return;
+    std.json.Stringify.encodeJsonString(payload, .{}, &doc.writer) catch return;
+    doc.writer.writeAll("],[") catch return;
+    std.json.Stringify.encodeJsonString(payload, .{}, &doc.writer) catch return;
+    doc.writer.writeAll("]]]}") catch return;
+    if (parseBootstrap(testing.allocator, doc.written())) |bs| {
+        var b = bs;
+        b.deinit();
+    } else |err| switch (err) {
+        error.InvalidJson, error.InvalidRdap, error.OutOfMemory => {},
+    }
 }
 
 test {

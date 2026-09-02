@@ -43,19 +43,32 @@ Trust rests on **TLS to the RDAP server** (via the `http` client / `Fetcher`); t
 TLS itself and validates no server identity beyond what the fetcher enforces. The parser is the
 attack surface, and its guarantee is that **hostile/oversized/wrong-typed JSON from an untrusted
 server never panics** — arena-owned, tolerant parsing with a caller-bounded body buffer. The
-`related`-link follow is capped at **one hop** so a server cannot chain the client through an
-unbounded redirect graph, and the target host is checked with `isSpecialUseHost` before that hop is
-fetched — a `related` `href` naming loopback/RFC 1918/link-local/unique-local/unspecified/multicast
-space or `localhost` is refused (falls back to the first document) rather than fetched, since RDAP's
-whole point is cross-registry redirection and a hostile/compromised registry controls that URL
-(SSRF hardening; a hostname other than `localhost` is not classified here and relies on the
-`Fetcher`'s own resolver). RDAP data is registrant-supplied and unauthenticated beyond the transport
+`related`-link follow is capped at **one hop**, and **every** URL this module dials goes through the
+same `checkDestination` gate: the primary query, the `related` hop, and each redirect `Location`.
+That third one is why the gate moved: `http.Client` follows up to ten `Location` hops itself and
+accepts an absolute cross-origin one verbatim, so a check on the address we *asked for* bounded
+nothing — one response from any server bounced the client anywhere, and the "one hop" cap above was
+true only of RDAP hops. `HttpFetcher` now follows redirects itself (`follow_redirects = false` on
+the client, `max_redirects` here) so each hop is checked before it is dialed.
+
+`DestinationPolicy` has two terms and both default to **deny**: `deny_special_use` refuses
+loopback/RFC 1918/link-local/unique-local/unspecified/multicast/documentation space and the
+`localhost` name — including its ABSOLUTE spelling `localhost.`, which every resolver treats
+identically and which the string compare used to miss (`getent hosts localhost.` answers `::1` on
+the machine this was found on) — and `require_https` refuses plaintext, because the sentence above
+says trust rests on TLS to the RDAP server and a `related` href naming `http://` walks the whole
+exchange off it. A refused `related` hop falls back to the first document; a refused primary is
+`error.BlockedDestination`. The primary is gated because it is not automatically the caller's own
+choice: the documented way to obtain one is `Bootstrap.lookupDomain`, which returns service URLs
+parsed straight out of an untrusted registry file. A hostname other than `localhost` is still not
+classified here and relies on the `Fetcher`'s own resolver. RDAP data is registrant-supplied and unauthenticated beyond the transport
 — callers must not treat fields as verified. Out of scope: RDAP search queries, RDAP-over-HTTP
 conformance/authentication extensions, and JSON schema validation beyond the tolerant model.
 
 ## Verification
 
-33 offline tests (no test touches the network): `buildPath` KATs for all query types +
+39 offline tests (no test reaches the public network; three bind a **loopback** socket — the
+cancellation test and the redirect-gate test): `buildPath` KATs for all query types +
 percent-encoding, Accept-header check, base-join with/without trailing slash; response KATs for
 domain / ip-network / autnum shapes (RFC 9083 §5.3–5.5) and the typed error object (RFC 7480 §5.3),
 nested entities (RFC 9083 §5.1) including the `max_entity_depth` tolerant-drop boundary,
@@ -91,6 +104,6 @@ names a loopback/RFC 1918 host — never dialed). Run: `zig build test-rdap`.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/goldens.zig carries a real rdap.publicinterestregistry.org response for iana.org captured live 2026-08-01 (GDPR-redacted handle, nested entities, publicIds, nameserver glue addresses) plus the real IANA bootstrap file; the remaining client fixtures in root.zig are hand-authored.
+**What the tests actually contain.** src/goldens.zig carries a real rdap.publicinterestregistry.org response for iana.org captured live 2026-08-01 (GDPR-redacted handle, nested entities, publicIds, nameserver glue addresses) — **and nothing else**: it holds exactly one constant. An earlier revision of this line also claimed "plus the real IANA bootstrap file", which was never true; `goldens.zig`'s own doc comment says the bootstrap file was deliberately checked rather than captured. The remaining client fixtures in root.zig are hand-authored.
 
 **How it got there.** The anchoring work landed in two passes. DONE ea2d000: captured the real registry response, which surfaced the GDPR-redacted handle and nested-entities shapes as gaps (asserted then as documented limitations). DONE 2026-08-22 (competitive survey against `icann-rdap`/`openrdap`): closed those gaps — `Entity.entities`, `Object.redacted`/`public_ids`/`rdap_conformance`, nameserver handle/status/glue addresses — and re-anchored the same golden fixture's assertions against the new, not the old, behavior.

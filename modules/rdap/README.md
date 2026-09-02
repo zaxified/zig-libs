@@ -75,13 +75,23 @@ var doc = client.query("https://rdap.verisign.com/com/v1", .domain,
 };
 defer doc.deinit();
 
-// Optional real fetcher over our http.Client (the only network-touching code)
-var hf: rdap.HttpFetcher = .{ .client = &http_client };
+// Optional real fetcher over our http.Client (the only network-touching code).
+// Give it the SAME destination policy as the client: it is where the redirect
+// hops the client never sees get chosen.
+var hf: rdap.HttpFetcher = .{ .client = &http_client, .destinations = client.destinations };
 client.fetcher = hf.fetcher();
+
+// Where this client may dial. Both terms default to DENY and apply to every
+// URL — the primary query, the `related` hop, and each redirect `Location`.
+// A bootstrap-supplied base_url is untrusted input, so the primary is gated too.
+client.destinations = .{ .deny_special_use = true, .require_https = true };
+// Talking to a local RDAP server on purpose is opt-in:
+// client.destinations = .{ .deny_special_use = false, .require_https = false };
 ```
 
 HTTP 404 maps to `error.NotFound`; a non-2xx status with an RDAP error body
 returns the typed `rdap_error` document; non-2xx without one is
 `error.HttpStatus`, and `Client.query`'s `status_out` out-parameter carries
 the real HTTP status in that case (e.g. telling a 429 rate limit apart from a
-500 server error). No test touches the network.
+500 server error). No test reaches the public network; three bind a loopback
+socket (cancellation, and the redirect-gate test).
