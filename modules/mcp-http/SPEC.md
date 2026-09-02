@@ -61,6 +61,23 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   the replay buffer is bounded (old events drop). No cross-process session sharing (single-server).
   The session **peer handle** derived from them scopes response correlation only — it inherits the
   session id's trust level and is not an authentication of the answering party.
+
+  ⚠ *Unguessable* was a claim before it was true. Until 2026-09-02 an id was
+  `monoNs() ^ (@intFromPtr(store) *% K)` in its high half and a plain incrementing counter in its
+  low half, under a comment reading "hard to guess". It was not: bracketing a victim's
+  `initialize` with two of your own pins the counter exactly and cancels the process-constant `K`,
+  leaving the clock delta between two closely-spaced calls — **≈2^20 candidates**, each testable
+  as one `GET`. That was demonstrated end to end: read another session's pending
+  `sampling/createMessage` and answer it with forged content, which is exactly the cross-client
+  delivery the peer-scoping property above forbids. Ids are now 128 bits from `getrandom(2)`.
+  Note what auth in front does **not** buy you here: an authenticated tenant B guessing tenant A's
+  id is still tenant A.
+- **A full session table heals.** `max_sessions` bounds memory, but until 2026-09-02 nothing but
+  an explicit `DELETE` ever freed a session, so `max_sessions` abandoned `initialize`s locked
+  every later client out permanently — the cap turned an exhaustion into an outage that outlived
+  the attacker's connection. `create` may now reclaim the least-recently-touched session **once it
+  has been idle past `max_idle_ns`** (30 min). Deliberately not a plain LRU: evicting a live
+  session to admit a new one would turn a flood into a cross-client denial, which is worse.
 - **Out of scope:** TLS (the server's/a proxy's), rate limiting (`ratelimit`), and the older
   HTTP+SSE dual-endpoint transport (only Streamable HTTP is implemented).
 

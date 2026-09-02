@@ -141,6 +141,25 @@ fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
 }
 
+/// 128 bits from the kernel CSPRNG. Same shape as `ssh`/`bulletproofs` use —
+/// `getrandom(2)` directly, retrying on `EINTR`, panicking rather than
+/// returning weak bytes, because a session id that is merely *probably*
+/// random is exactly the defect this replaced.
+fn fillRandom(buf: []u8) void {
+    if (@import("builtin").os.tag != .linux)
+        @compileError("fillRandom: only the Linux getrandom(2) entropy path is wired up");
+    var off: usize = 0;
+    while (off < buf.len) {
+        const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) {
+            if (signed == -@as(isize, @intFromEnum(std.os.linux.E.INTR))) continue;
+            @panic("getrandom failed");
+        }
+        off += @intCast(signed);
+    }
+}
+
 fn monoNs() u64 {
     switch (@import("builtin").os.tag) {
         .windows => {
@@ -190,6 +209,10 @@ pub const Sessions = struct {
     /// so an unauthenticated peer spamming `initialize` cannot grow the
     /// registry (and its per-session replay buffers) without bound.
     max_sessions: usize = 10_000,
+    /// How long a session may go untouched before a full table may reclaim it.
+    /// Only consulted when `create` would otherwise refuse, so an idle session
+    /// on a quiet server is never taken away from a client that comes back.
+    max_idle_ns: u64 = 30 * std.time.ns_per_min,
 
     const Session = struct {
         id: []const u8, // gpa-owned, stable for the session's life
@@ -201,6 +224,11 @@ pub const Sessions = struct {
         events: std.ArrayList(StoredEvent) = .empty,
         next_event_id: u64 = 1,
         closing: bool = false,
+        /// Monotonic nanoseconds at the last request that named this session.
+        /// Without it a full table was a permanent lockout: nothing but an
+        /// explicit `DELETE` ever freed a session
+        /// (W2 re-audit 2026-09-02, `mcp-http` F2).
+        last_seen_ns: u64,
     };
     const StoredEvent = struct { id: u64, data: []const u8 }; // data gpa-owned
 
@@ -236,23 +264,80 @@ pub const Sessions = struct {
     fn create(self: *Sessions) error{ OutOfMemory, TooManySessions }!Created {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        if (self.map.count() >= self.max_sessions) return error.TooManySessions;
+        if (self.map.count() >= self.max_sessions) {
+            // A full table used to be permanent: nothing but an explicit
+            // DELETE ever freed a session, so `max_sessions` abandoned
+            // `initialize`s locked every later client out forever. The cap
+            // bounded memory and the quantity it bounded never fell on its own
+            // (W2 re-audit 2026-09-02, `mcp-http` F2).
+            if (!self.evictIdle()) return error.TooManySessions;
+        }
         self.seq += 1;
-        // Unique (seq, under lock) and hard to guess (monotonic clock + the
-        // store address mixed in) — NOT a CSPRNG token, so it is a routing key,
-        // not an auth secret; gate the endpoint with aaa-gate/jwt for auth.
-        const mixed = monoNs() ^ (@as(u64, @intCast(@intFromPtr(self))) *% 0x9E3779B97F4A7C15);
+        // ⚠ 128 bits from the CSPRNG, and it has to be: possession of this id
+        // is the ENTIRE gate on GET/POST/DELETE for a session, so the module's
+        // advertised peer-scoping property ("a response POSTed on session B
+        // can never resolve a request issued to session A") holds only if a
+        // peer cannot guess another peer's id.
+        //
+        // It used to be `monoNs() ^ (@intFromPtr(self) *% K)` in the high half
+        // and a plain incrementing `seq` in the low half, with a comment
+        // calling that "hard to guess". It was not. The low half is exact —
+        // bracket the victim's `initialize` with two of your own and its seq
+        // is yours+1. The high half's `K` is constant for the process, so
+        // XORing two of your own ids cancels it completely and leaves only the
+        // clock delta between two closely-spaced calls: measured, **2^20
+        // candidates**, each testable over the wire as one `GET`. Reproduced
+        // end to end — read another session's pending `sampling/createMessage`
+        // and answer it with forged content
+        // (W2 re-audit 2026-09-02, `mcp-http` F1).
+        var raw: [16]u8 = undefined;
+        fillRandom(&raw);
         var idbuf: [32]u8 = undefined;
-        const id_txt = std.fmt.bufPrint(&idbuf, "{x:0>16}{x:0>16}", .{ mixed, self.seq }) catch unreachable;
+        const id_txt = std.fmt.bufPrint(&idbuf, "{x}", .{&raw}) catch unreachable;
+        // A collision would silently merge two peers, which is the very thing
+        // the id exists to prevent. At 128 bits it never happens; refusing is
+        // still the only honest answer if it does.
+        if (self.map.contains(id_txt)) return error.TooManySessions;
         const id = try self.gpa.dupe(u8, id_txt);
         errdefer self.gpa.free(id);
         const s = try self.gpa.create(Session);
         errdefer self.gpa.destroy(s);
         // seq is allocated under the lock and never reused, so it is a unique
         // peer handle for this session's lifetime.
-        s.* = .{ .id = id, .tag = self.seq };
+        s.* = .{ .id = id, .tag = self.seq, .last_seen_ns = monoNs() };
         try self.map.put(self.gpa, id, s);
         return .{ .id = id, .tag = s.tag };
+    }
+
+    /// Drop the least-recently-touched session **if** it has been idle longer
+    /// than `max_idle_ns`. Caller holds the lock. Returns whether it freed one.
+    ///
+    /// Deliberately not a plain LRU eviction: taking a live session away from
+    /// a client to make room for a new one would turn a flood into a
+    /// cross-client denial instead of an outage, which is worse. An abandoned
+    /// flood self-heals; a busy server still refuses.
+    fn evictIdle(self: *Sessions) bool {
+        const now = monoNs();
+        var oldest_key: ?[]const u8 = null;
+        var oldest_seen: u64 = std.math.maxInt(u64);
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            const seen = e.value_ptr.*.last_seen_ns;
+            if (seen < oldest_seen) {
+                oldest_seen = seen;
+                oldest_key = e.key_ptr.*;
+            }
+        }
+        const key = oldest_key orelse return false;
+        if (now -| oldest_seen < self.max_idle_ns) return false;
+        const kv = self.map.fetchRemove(key) orelse return false;
+        self.freeSession(kv.value);
+        return true;
+    }
+
+    /// Record that a request named this session. Caller holds the lock.
+    fn touch(self: *Sessions, id: []const u8) void {
+        if (self.map.get(id)) |s| s.last_seen_ns = monoNs();
     }
 
     fn exists(self: *Sessions, id: []const u8) bool {
@@ -266,6 +351,7 @@ pub const Sessions = struct {
         lockSpin(&self.lock);
         defer self.lock.unlock();
         const s = self.map.get(id) orelse return null;
+        s.last_seen_ns = monoNs();
         return s.tag;
     }
 
@@ -565,13 +651,21 @@ fn handleGet(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     var batch: std.ArrayList(Sessions.StoredEvent) = .empty;
     // Snapshot under the store lock (copies into the arena) so writing to the
     // socket below holds no lock and races no concurrent DELETE.
-    _ = (try sessions.drainAfter(sid, after, arena_state.allocator(), &batch)) orelse return notFound(ctx);
+    // `drainAfter`'s bool is the session's `closing` flag. It used to be
+    // discarded, and nothing else read the flag either — so the public
+    // `Sessions.close` was inert: after it the session still accepted `push`,
+    // still `exists`, and was never torn down. Honour it here, which is what
+    // its doc always said ("its next GET drains what is queued and ends")
+    // (W2 re-audit 2026-09-02, `mcp-http` F3).
+    const closing = (try sessions.drainAfter(sid, after, arena_state.allocator(), &batch)) orelse
+        return notFound(ctx);
 
     var es = try http.sse.EventStream.start(ctx.res);
     if (batch.items.len == 0) {
         // Nothing queued: a heartbeat keeps the response well-formed; the
         // client's EventSource reconnects (with Last-Event-ID) for later events.
         try es.comment("keep-alive");
+        if (closing) _ = sessions.destroy(sid);
         return;
     }
     for (batch.items) |e| {
@@ -579,6 +673,9 @@ fn handleGet(t: *const Transport, ctx: *router.Ctx) anyerror!void {
         const idstr = std.fmt.bufPrint(&idbuf, "{d}", .{e.id}) catch unreachable;
         try es.send(.{ .id = idstr, .data = e.data });
     }
+    // Everything queued has now been written, so the session has nothing left
+    // to deliver and can go.
+    if (closing) _ = sessions.destroy(sid);
 }
 
 /// `DELETE /mcp`: tear down the session named by `Mcp-Session-Id`.
@@ -2100,4 +2197,113 @@ fn writeJsonString(smith: *std.testing.Smith, w: *std.Io.Writer) void {
         }
     }
     w.writeByte('"') catch {};
+}
+
+test "a session id carries no counter and no clock" {
+    const gpa = testing.allocator;
+    var s = Sessions.init(gpa);
+    defer s.deinit();
+
+    // The id used to be `monoNs() ^ (@intFromPtr(store) *% K)` in the high 64
+    // bits and a plain incrementing `seq` in the low 64. Possession of an id
+    // is the entire gate on GET/POST/DELETE for a session, so the module's
+    // advertised peer-scoping property rested on it being unguessable — and
+    // two of an attacker's own ids, taken either side of the victim's, cancel
+    // the constant `K` and pin the counter exactly, leaving ~2^20 candidates
+    // (W2 re-audit 2026-09-02, `mcp-http` F1).
+    const n = 8;
+    var ids: [n][]const u8 = undefined;
+    for (&ids) |*slot| {
+        const c = try s.create();
+        slot.* = c.id;
+    }
+
+    for (ids, 0..) |id, i| {
+        try testing.expectEqual(@as(usize, 32), id.len);
+        for (id) |ch| try testing.expect(std.ascii.isHex(ch));
+        // No two ids share a half: a counter in either half would make the
+        // low halves consecutive, and a process-constant mixed with a clock
+        // would make the high halves differ only in their bottom bits.
+        for (ids, 0..) |other, j| {
+            if (i == j) continue;
+            try testing.expect(!std.mem.eql(u8, id[0..16], other[0..16]));
+            try testing.expect(!std.mem.eql(u8, id[16..32], other[16..32]));
+        }
+    }
+
+    // The sharpest single check: the low half of consecutive ids differed by
+    // exactly 1 before the fix.
+    const a = try std.fmt.parseInt(u64, ids[0][16..32], 16);
+    const b = try std.fmt.parseInt(u64, ids[1][16..32], 16);
+    try testing.expect(b -% a != 1);
+
+    // And the population is spread, not clustered: half the bits set, give or
+    // take. A clock-derived high half fails this by a mile.
+    var ones: usize = 0;
+    for (ids) |id| {
+        const hi = try std.fmt.parseInt(u64, id[0..16], 16);
+        const lo = try std.fmt.parseInt(u64, id[16..32], 16);
+        ones += @popCount(hi) + @popCount(lo);
+    }
+    try testing.expect(ones > n * 128 / 4);
+    try testing.expect(ones < n * 128 * 3 / 4);
+}
+
+test "a table filled by an abandoned flood heals; a busy one still refuses" {
+    const gpa = testing.allocator;
+    var s = Sessions.init(gpa);
+    defer s.deinit();
+    s.max_sessions = 3;
+
+    for (0..3) |_| _ = try s.create();
+    // Busy table: every session was just touched, so the cap holds — evicting
+    // a live session to make room would turn a flood into a cross-client
+    // denial, which is worse than an outage.
+    try testing.expectError(error.TooManySessions, s.create());
+
+    // The same table, abandoned. Nothing but an explicit DELETE used to free a
+    // session, so `max_sessions` unclaimed `initialize`s locked every later
+    // client out permanently (W2 re-audit 2026-09-02, `mcp-http` F2).
+    s.max_idle_ns = 0;
+    const fresh = try s.create();
+    try testing.expect(s.exists(fresh.id));
+    try testing.expectEqual(@as(usize, 3), s.map.count());
+}
+
+test "close() actually ends the session it marks" {
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var rbuf: [1024]u8 = undefined;
+    var out: [8192]u8 = undefined;
+    const created = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
+    const sid_h = headerValue(created, "Mcp-Session-Id").?;
+    var sidbuf: [64]u8 = undefined;
+    @memcpy(sidbuf[0..sid_h.len], sid_h);
+    const sid = sidbuf[0..sid_h.len];
+
+    try testing.expect(try sessions.push(sid, "a"));
+    sessions.close(sid);
+
+    // ⚠ Driven THROUGH THE WIRE on purpose. `closing` was written and never
+    // read — `handleGet` discarded `drainAfter`'s bool — so the public `close`
+    // was inert (F3). A test that asserts `drainAfter` returns the flag passes
+    // either way: it pins the flag, not the wiring. Only the second GET can
+    // tell whether anything acted on it.
+    var out2: [8192]u8 = undefined;
+    const drained = runWire(&r, getWithSession(&rbuf, sid, null), &out2);
+    try testing.expect(std.mem.startsWith(u8, drained, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, drained, "data: a") != null);
+
+    var out3: [8192]u8 = undefined;
+    const after = runWire(&r, getWithSession(&rbuf, sid, null), &out3);
+    try testing.expect(std.mem.startsWith(u8, after, "HTTP/1.1 404"));
+    try testing.expect(!sessions.exists(sid));
 }
