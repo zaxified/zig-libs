@@ -98,6 +98,26 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/test-lib.sh"
 cd "$REPO_ROOT"
 
+# ⚠ A LANE MAY DELIBERATELY NOT RUN A MODULE, and that is not a dark test.
+# `ZIGLIBS_SKIP_LIVE` names the modules whose live-peer suite this lane does
+# not run — today exactly one, `opcua`, on arm64, because open62541 publishes
+# no aarch64 image (see the lane table in .github/workflows/ci.yml). Those
+# modules produce no `run test … (N total)` line, which is indistinguishable
+# from "the suite silently did not run" unless this check is told.
+#
+# ⭐ Told, not inferred: the exemption applies ONLY to modules the lane named
+# in its own configuration, the same list `test.sh` uses to print the
+# "SKIPPED on this lane" line. A module that vanishes for any other reason is
+# still a violation, which is the whole point of this script.
+#
+# And it is reported, never silent — the summary counts it and names it. A
+# check that cannot say what it did not check is the shape this repo has been
+# bitten by before.
+declare -A lane_skips=()
+for _m in ${ZIGLIBS_SKIP_LIVE:-}; do
+    [[ -n "$_m" ]] && lane_skips["$_m"]=1
+done
+
 # Modules that own `.zig` sources under `src/` which their own compilation
 # deliberately does not analyse. One row per module:
 #
@@ -221,6 +241,7 @@ fi
 
 bad=0
 multi=0
+lane_skipped=0
 for m in "${mods[@]}"; do
     [[ -z "$m" ]] && continue
     disk=$(find "modules/$m/src" -type f -name '*.zig' -exec grep -hc '^test ' {} + 2>/dev/null |
@@ -231,6 +252,11 @@ for m in "${mods[@]}"; do
     exempt=$(exempt_for "$m")
 
     if [[ "$ran" == "-" ]]; then
+        if [[ -n "${lane_skips[$m]:-}" ]]; then
+            echo "NOT HERE   $m — $disk test block(s) on disk, not run on this lane by its own configuration (ZIGLIBS_SKIP_LIVE). Its suite is checked on the lanes that do run it; this lane cannot, and says so rather than counting it as covered."
+            lane_skipped=$((lane_skipped + 1))
+            continue
+        fi
         echo "NO RESULT  $m — $disk test block(s) on disk, but the build summary has no \`run test … (N total)\` line for step test-$m. Either the step was never requested, or its suite did not run."
         bad=$((bad + 1))
         continue
@@ -248,5 +274,5 @@ for m in "${mods[@]}"; do
 done
 
 echo
-echo "dark-tests: checked ${#mods[@]} module(s), $bad violation(s)$( [[ $multi -gt 0 ]] && echo ", $multi with more than one run-test line (summed)")"
+echo "dark-tests: checked $(( ${#mods[@]} - lane_skipped )) of ${#mods[@]} module(s), $bad violation(s)$( [[ $lane_skipped -gt 0 ]] && echo ", $lane_skipped not run on this lane")$( [[ $multi -gt 0 ]] && echo ", $multi with more than one run-test line (summed)")"
 [[ $bad -eq 0 ]] || exit 1
