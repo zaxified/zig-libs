@@ -114,7 +114,11 @@ pub const TcpTransport = struct {
     /// then as `0` from `readFn` — "nothing available this round" — and the
     /// caller would keep polling a connection it had already abandoned.
     fn waitReadable(self: *TcpTransport) TransportError!bool {
-        const ms = self.read_timeout_ms orelse return true;
+        return self.waitReadableMs(self.read_timeout_ms);
+    }
+
+    fn waitReadableMs(self: *TcpTransport, budget_ms: ?u32) TransportError!bool {
+        const ms = budget_ms orelse return true;
         var fds = [_]std.posix.pollfd{.{
             .fd = self.stream.socket.handle,
             .events = std.posix.POLL.IN,
@@ -129,6 +133,45 @@ pub const TcpTransport = struct {
         if (n != 0) return true;
         try self.checkCanceled();
         return false;
+    }
+
+    /// Read exactly `dest.len` octets, waiting no longer than the read
+    /// timeout for **each** further octet. `eof_err` is what a clean close
+    /// means at this point in the frame.
+    fn readAllBounded(
+        self: *TcpTransport,
+        r: *std.Io.Reader,
+        dest: []u8,
+        budget_ms: ?u32,
+        eof_err: TransportError,
+    ) TransportError!void {
+        var got: usize = 0;
+        // `readVec` may legitimately return 0 without meaning end of stream,
+        // so a run of them must not become a spin even though `poll` gates
+        // each turn.
+        var empty_reads: u8 = 0;
+        while (got < dest.len) {
+            if (r.bufferedLen() == 0 and !try self.waitReadableMs(budget_ms)) {
+                // Mid-frame silence is not a graceful idle.
+                return error.ReadFailed;
+            }
+            // `readVec`, not `readSliceShort`: the latter is short only at end
+            // of stream — it loops until the buffer is full, so it blocks
+            // exactly like `readSliceAll` and reintroduces the defect this
+            // function exists to remove. `readVec` returns whatever one read
+            // produced, which is what lets the budget be re-checked between
+            // octets.
+            var data: [1][]u8 = .{dest[got..]};
+            const n = r.readVec(&data) catch |e| switch (e) {
+                error.EndOfStream => return eof_err,
+                error.ReadFailed => return self.readFailure(),
+            };
+            if (n == 0) {
+                empty_reads += 1;
+                if (empty_reads > 16) return error.ReadFailed;
+            } else empty_reads = 0;
+            got += n;
+        }
     }
 
     /// `Io.checkCancel` acknowledges the request, so it reports a pending
@@ -172,20 +215,26 @@ pub const TcpTransport = struct {
         const r = &self.reader.?.interface;
         // Anything already buffered by a previous read counts as readable.
         if (r.bufferedLen() == 0 and !try self.waitReadable()) return 0;
-        r.readSliceAll(buf[0..2]) catch |e| switch (e) {
-            error.EndOfStream => return error.EndOfStream,
-            error.ReadFailed => return self.readFailure(),
-        };
+
+        // ⚠ The budget has to be carried through the WHOLE frame. It used to
+        // be one `poll` up front, and `poll` returns as soon as a single octet
+        // is readable — so both `readSliceAll`s below blocked in the kernel
+        // with no deadline at all. A peer that sends one byte (or a complete,
+        // legal `68 FD` header promising 253 more) and then stops parked the
+        // read forever, and with it every t1/t2/t3 timer, because `poll` calls
+        // `transport.read` synchronously and `conn.tick` never runs again.
+        // Cost to the attacker: one connection and one octet. Measured: still
+        // parked at 10x the configured timeout
+        // (W2 re-audit 2026-09-02, `iec104` F1).
+        const deadline_ms = self.read_timeout_ms;
+        try self.readAllBounded(r, buf[0..2], deadline_ms, error.EndOfStream);
         if (buf[0] != apci.start_byte) return error.ReadFailed;
         const n: usize = buf[1];
         if (n < apci.min_length or n > apci.max_length) return error.ReadFailed;
         // Past the header there is no graceful idle: a timeout here means the
         // peer stopped mid-frame and the connection is unusable, so even a
         // clean close counts as a failure. A cancel is still a cancel.
-        r.readSliceAll(buf[2..][0..n]) catch |e| switch (e) {
-            error.EndOfStream => return error.ReadFailed,
-            error.ReadFailed => return self.readFailure(),
-        };
+        try self.readAllBounded(r, buf[2..][0..n], deadline_ms, error.ReadFailed);
         return 2 + n;
     }
 
@@ -496,4 +545,61 @@ test "a cancel during the read timeout's poll is not reported as an idle round" 
     var fut = try io.concurrent(readOnce, .{ &fixture.tt, &buf });
     try io.sleep(.fromMilliseconds(100), .awake);
     try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+test "a peer that stops MID-FRAME hits the read timeout, not an unbounded park" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    try fixture.tt.setReadTimeout(200);
+    // A COMPLETE, LEGAL APCI header promising 253 more octets — then silence.
+    // The old code polled once, saw these two bytes, and then blocked in
+    // `readSliceAll` with no deadline at all: still parked at 10x the
+    // timeout, with every t1/t2/t3 timer frozen behind it
+    // (W2 re-audit 2026-09-02, `iec104` F1).
+    _ = std.os.linux.write(fixture.peer.socket.handle, &[_]u8{ 0x68, 0xFD }, 2);
+
+    var buf: [apci.max_apdu_len]u8 = undefined;
+    const t0 = monoMs();
+    const r = readOnce(&fixture.tt, &buf);
+    const elapsed = monoMs() -| t0;
+
+    try testing.expectError(error.ReadFailed, r);
+    // Generous ceiling: the point is that it returns at all, on the budget's
+    // order of magnitude rather than never.
+    if (elapsed > 2000) {
+        std.debug.print("\nmid-frame read returned after {d} ms for a 200 ms timeout\n", .{elapsed});
+        return error.ReadTimeoutNotEnforcedMidFrame;
+    }
+}
+
+test "a peer that sends one octet and stops also hits the read timeout" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    try fixture.tt.setReadTimeout(200);
+    _ = std.os.linux.write(fixture.peer.socket.handle, &[_]u8{0x68}, 1);
+
+    var buf: [apci.max_apdu_len]u8 = undefined;
+    const t0 = monoMs();
+    const r = readOnce(&fixture.tt, &buf);
+    const elapsed = monoMs() -| t0;
+    try testing.expectError(error.ReadFailed, r);
+    if (elapsed > 2000) return error.ReadTimeoutNotEnforcedMidFrame;
+}
+
+fn monoMs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }

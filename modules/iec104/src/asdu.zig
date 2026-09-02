@@ -637,6 +637,19 @@ pub fn decode(bytes: []const u8, params: Params) Error!Asdu {
     const expected = if (header.vsq.sq) isz + n * esz else n * (isz + esz);
     if (body.len != expected) return error.ObjectCountMismatch;
 
+    // With SQ = 1 the addresses are SYNTHESISED (`base + i`), not read off the
+    // wire, and nothing bounded them: a base at the ceiling produced addresses
+    // the module's own encoder then refuses with `AddressOutOfRange`, so one
+    // legal 17-octet APDU took the whole connection down through every
+    // confirmation path. Refuse it here, before any handler acts on it — a
+    // frame the decoder accepts must be one the encoder can echo
+    // (W2 re-audit 2026-09-02, `iec104` F3).
+    if (header.vsq.sq and n > 0) {
+        const base = readAddress(body[0..isz]);
+        const last = @as(u64, base) + @as(u64, n) - 1;
+        if (last > params.maxIoa()) return error.AddressOutOfRange;
+    }
+
     return .{ .header = header, .params = params, .shape = shape, .body = body };
 }
 
@@ -1328,4 +1341,26 @@ fn fuzzAsdu(_: void, smith: *std.testing.Smith) !void {
         seen += 1;
         try testing.expect(seen <= std.math.maxInt(u7));
     }
+}
+
+test "SQ=1 cannot synthesise an address past the configured ceiling" {
+    // With SQ = 1 the addresses are SYNTHESISED (`base + i`), not read off the
+    // wire, and nothing bounded them: a base at the ceiling produced addresses
+    // this module's own encoder then refuses with `AddressOutOfRange`, on the
+    // reply path of essentially every request type — so one legal 11-octet
+    // ASDU took the whole connection down. A frame the decoder accepts must
+    // be one the encoder can echo (W2 re-audit 2026-09-02, `iec104` F3).
+    var frame: [11]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&frame, "648206002f00ffffff1414");
+    try testing.expectError(error.AddressOutOfRange, decode(&frame, default_params));
+
+    // The largest base that still fits its two elements is accepted, so the
+    // bound is pinned at the value and not near it.
+    var ok_frame: [11]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&ok_frame, "648206002f00feffff1414");
+    const a = try decode(&ok_frame, default_params);
+    var it = a.objects();
+    var last: u32 = 0;
+    while (try it.next()) |obj| last = obj.ioa;
+    try testing.expectEqual(default_params.maxIoa(), last);
 }

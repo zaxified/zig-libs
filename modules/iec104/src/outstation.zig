@@ -120,6 +120,17 @@ pub const Outstation = struct {
 
     pub fn init(opts: Options, points: []Point) Error!Outstation {
         try opts.params.validate();
+        // §7.2.4 reserves the all-ones common address for broadcast. A station
+        // configured AS it silently disabled the entire broadcast guard —
+        // `isBroadcast` ends in `and self.opts.common_address != bc`, which is
+        // false for every frame — re-opening "stop broadcasting actuation" in
+        // full: the exact octets the §7.2.4 regression test proves are dropped
+        // operated the point. The behaviour was even pinned as intended by a
+        // test whose fixture uses `C_IC_NA_1` only, so it could not see that
+        // the command case went with it
+        // (W2 re-audit 2026-09-02, `iec104` F4).
+        if (opts.common_address == opts.params.broadcastCa()) return error.AddressOutOfRange;
+        if (opts.common_address > opts.params.maxCa()) return error.AddressOutOfRange;
         return .{ .opts = opts, .points = points };
     }
 
@@ -338,11 +349,22 @@ pub const Outstation = struct {
             try self.echoDecoded(a, .activation_con, true, sink);
             return;
         }
+        // ⚠ ORDER. The confirmation is built and reserved BEFORE the output
+        // fires. It used to be the other way round: `p.element = o.element`
+        // committed the actuation and `echoDecoded` could then fail on a full
+        // reply sink — so the breaker had moved, the master was told nothing,
+        // and the error tore the connection down, so it was never told later
+        // either. The HMI keeps showing the pre-command state while the field
+        // device has moved, which is the SCADA-specific hazard
+        // (W2 re-audit 2026-09-02, `iec104` F2).
+        try self.echoDecoded(a, .activation_con, false, sink);
         p.element = o.element;
         p.time = o.time;
-        try self.echoDecoded(a, .activation_con, false, sink);
         if (self.opts.command_termination) {
-            try self.echoDecoded(a, .activation_termination, false, sink);
+            // A termination that will not fit is not worth undoing the
+            // actuation for — the confirmation the master waits on is already
+            // out — but it must not fail the connection either.
+            self.echoDecoded(a, .activation_termination, false, sink) catch {};
         }
     }
 
@@ -548,7 +570,17 @@ pub const Server = struct {
         try self.drain(now);
 
         if (try self.framer.next()) |apdu| return try self.dispatch(apdu, now);
-        const n = try self.transport.read(&self.rx_chunk);
+        // Cap the read at what the framer can still take. `Transport` is a
+        // generic byte stream, so a partial frame plus a full chunk exceeds a
+        // `frame_buf` sized at the documented minimum (`max_apdu_len`) and
+        // `feed` returns `BufferTooSmall` — whose own doc comment says that
+        // "can only happen if the caller supplied a smaller one". `TcpTransport`
+        // happens to deliver exactly one whole APDU per read and so hides it;
+        // `LoopTransport` and any caller-supplied adapter do not
+        // (W2 re-audit 2026-09-02, `iec104` F5).
+        const room = self.framer.capacity() - self.framer.pending();
+        if (room < apci.min_length) return error.ReadFailed;
+        const n = try self.transport.read(self.rx_chunk[0..@min(self.rx_chunk.len, room)]);
         if (n == 0) return .none;
         try self.framer.feed(self.rx_chunk[0..n]);
         if (try self.framer.next()) |apdu| return try self.dispatch(apdu, now);
@@ -597,6 +629,23 @@ pub const Server = struct {
         fn sendFn(ctx: *anyopaque, bytes: []const u8) SinkError!void {
             const self: *QueueSink = @ptrCast(@alignCast(ctx));
             const s = self.server;
+            // Compact first: `drain` only resets the cursors when it runs to
+            // the END, so a partial drain (the send window filled) left
+            // `queue_read` mid-buffer and every already-sent octet was dead
+            // space for the rest of the episode. The queue's effective
+            // capacity was therefore "bytes queued since the last COMPLETE
+            // drain", which no caller can size for — and `Server.init`'s
+            // sizing guidance ("roughly N * element size") is wrong by an
+            // unbounded factor for a master that pipelines interrogations,
+            // which it is entitled to do. The outcome was `error.SinkFull`
+            // out of `poll`, i.e. a dropped connection rather than
+            // backpressure (W2 re-audit 2026-09-02, `iec104` F6).
+            if (s.queue_used + 2 + bytes.len > s.queue.len and s.queue_read > 0) {
+                const live = s.queue_used - s.queue_read;
+                std.mem.copyForwards(u8, s.queue[0..live], s.queue[s.queue_read..s.queue_used]);
+                s.queue_used = live;
+                s.queue_read = 0;
+            }
             if (s.queue_used + 2 + bytes.len > s.queue.len) return error.SinkFull;
             s.queue[s.queue_used] = @truncate(bytes.len);
             s.queue[s.queue_used + 1] = @truncate(bytes.len >> 8);
@@ -1040,19 +1089,43 @@ test "outstation: a global-CA request is answered with this station's own addres
     }
 }
 
-test "outstation: a station whose own CA is 0xFFFF still answers as itself" {
-    // Degenerate but reachable configuration: `replyCa` must not substitute an
-    // address it would have echoed anyway, and the broadcast guard must not
-    // start dropping this station's own traffic.
+test "a station cannot be configured as the reserved broadcast address" {
+    // ⚠ This test used to be "a station whose own CA is 0xFFFF still answers as
+    // itself", and it PINNED THE HOLE. `isBroadcast` ends in
+    // `and self.opts.common_address != bc`, so configuring the station as the
+    // reserved all-ones address makes it false for every frame — the entire
+    // §7.2.4 guard disappears, and the exact octets the regression test below
+    // proves are dropped will operate the point. The old test's fixture used
+    // `C_IC_NA_1` only, so it could not see that the command case went with
+    // it (W2 re-audit 2026-09-02, `iec104` F4).
     var points = demoPoints();
-    var o = try Outstation.init(.{ .common_address = 0xFFFF }, &points);
+    try testing.expectError(
+        error.AddressOutOfRange,
+        Outstation.init(.{ .common_address = 0xFFFF }, &points),
+    );
+    // …and an address that does not fit the configured CA width is refused
+    // too, rather than making the station permanently unaddressable.
+    try testing.expectError(
+        error.AddressOutOfRange,
+        Outstation.init(.{
+            .common_address = 300,
+            .params = .{ .ca_size = 1, .ioa_size = 3, .cot_size = 2 },
+        }, &points),
+    );
+    // A normal address still initialises.
+    _ = try Outstation.init(.{ .common_address = 47 }, &points);
+}
+
+test "a broadcast control command never operates the point, even at the CA ceiling" {
+    // The command half of §7.2.4, which the removed test's interrogation-only
+    // fixture could not reach.
+    var points = [_]Point{
+        .{ .ioa = 301, .type_id = .c_sc_na_1, .element = .{ .sco = .{} }, .command_mode = .direct },
+    };
+    var o = try Outstation.init(.{ .common_address = 47 }, &points);
     var s = CollectSink{};
-    try o.handle(&hex("64010600ffff00000014"), s.sink());
-    try testing.expectEqual(@as(usize, 4), s.count);
-    var addrs: [8]u16 = undefined;
-    for (try replyCommonAddresses(&s, &addrs)) |ca| {
-        try testing.expectEqual(@as(u16, 0xFFFF), ca);
-    }
+    try o.handle(&hex("2d010600ffff2d010001"), s.sink());
+    try testing.expect(!points[0].element.sco.on);
 }
 
 test "outstation: an unknown common address is still echoed back, byte for byte" {

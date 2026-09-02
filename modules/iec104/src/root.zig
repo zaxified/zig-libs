@@ -570,3 +570,34 @@ test "live: a third-party controlling station drives our outstation" {
         try testing.expect(points[4].element.sco.on);
     }
 }
+
+test "a frame split across TCP segments survives a frame_buf at the documented minimum" {
+    // `Transport` is a generic byte stream, and `TcpTransport` only hides this
+    // by happening to deliver exactly one whole APDU per read. With the
+    // framer holding a partial frame, `pending + chunk` used to exceed a
+    // buffer sized at `max_apdu_len` and `feed` returned `BufferTooSmall` —
+    // an error whose own doc said it could not happen
+    // (W2 re-audit 2026-09-02, `iec104` F5).
+    var loop = transport.LoopTransport{};
+    var frame_buf: [apci.max_apdu_len]u8 = undefined; // the documented minimum
+    var c = try Client.init(loop.transport(), &frame_buf, .{});
+    c.beginConnect(0);
+    c.onConnected(0);
+    try c.startDataTransfer(0);
+    const startdt_con = [_]u8{ 0x68, 0x04, 0x0b, 0x00, 0x00, 0x00 };
+    loop.deliver(&startdt_con); // STARTDT con
+    _ = try c.poll(0);
+
+    var f2: [apci.max_apdu_len]u8 = undefined;
+    const full = try apci.encode(
+        .{ .i = .{ .send_seq = 0, .recv_seq = 0 } },
+        &[_]u8{0} ** apci.max_asdu_len,
+        &f2,
+    );
+    loop.deliver(full[0..200]);
+    _ = try c.poll(0);
+    loop.deliver(full[200..]);
+    loop.deliver(full); // a second frame coalesced behind the tail
+    // The point is that this returns rather than erroring out of the framer.
+    _ = try c.poll(0);
+}

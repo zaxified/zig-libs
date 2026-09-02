@@ -161,6 +161,13 @@ pub fn decode(bytes: []const u8) DecodeError!Apdu {
     if (c1 & 0x01 == 0) {
         // I-format: both sequence numbers present, ASDU follows.
         if (c3 & 0x01 != 0) return error.ReservedBitsSet;
+        // §5.1 gives the I-format an ASDU by definition. An empty one used to
+        // be accepted here and rejected downstream as `ShortAsdu` — but only
+        // after `state.onFrame` had counted it and advanced `recv_seq`, and
+        // the cost is the connection. The other two formats already reject a
+        // body they do not expect; this makes the third symmetric
+        // (W2 re-audit 2026-09-02, `iec104` F7).
+        if (body.len == 0) return error.ReservedBitsSet;
         const ns: Seq = @intCast((@as(u16, c1) | (@as(u16, c2) << 8)) >> 1);
         const nr: Seq = @intCast((@as(u16, c3) | (@as(u16, c4) << 8)) >> 1);
         return .{
@@ -252,9 +259,16 @@ pub fn encodeS(recv_seq: Seq) [apci_len]u8 {
 // ── stream framer ───────────────────────────────────────────────────────────
 
 pub const FramerError = DecodeError || error{
-    /// A frame arrived that is longer than the framer's buffer. Since the
-    /// buffer is sized for `max_apdu_len` this can only happen if the caller
-    /// supplied a smaller one.
+    /// A frame arrived that is longer than the framer's buffer, or a partial
+    /// frame plus the bytes just fed exceed it.
+    ///
+    /// ⚠ This used to read "since the buffer is sized for `max_apdu_len` this
+    /// can only happen if the caller supplied a smaller one". Not so: with a
+    /// buffer at exactly `max_apdu_len` — the documented minimum — an ordinary
+    /// TCP segmentation (200 octets of a 255-octet frame, then the rest with a
+    /// second frame coalesced behind it) overflows it. `Client.poll` and
+    /// `Server.poll` now cap each read at `capacity() - pending()`
+    /// (W2 re-audit 2026-09-02, `iec104` F5).
     BufferTooSmall,
 };
 
@@ -277,6 +291,13 @@ pub const Framer = struct {
     /// Bytes still buffered but not yet consumed.
     pub fn pending(self: *const Framer) usize {
         return self.len - self.pos;
+    }
+
+    /// Total octets this framer's buffer can hold. A caller reading into it
+    /// must cap its read at `capacity() - pending()`, or a partial frame plus
+    /// a full chunk overflows a buffer sized at the documented minimum (F5).
+    pub fn capacity(self: *const Framer) usize {
+        return self.buf.len;
     }
 
     /// Appends freshly-read stream bytes. Compacts first, so a caller may feed
@@ -491,4 +512,20 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
             if (got == null) break;
         }
     }
+}
+
+test "an I-format APDU with no ASDU is refused by the framer, not by the state machine" {
+    // §5.1 gives the I-format an ASDU by definition. An empty one was accepted
+    // here and rejected downstream — but only after `state.onFrame` had
+    // counted it and advanced `recv_seq`, and the cost is the connection. The
+    // other two formats already reject a body they do not expect
+    // (W2 re-audit 2026-09-02, `iec104` F7).
+    const empty_i = [_]u8{ 0x68, 0x04, 0x00, 0x00, 0x00, 0x00 };
+    try std.testing.expectError(error.ReservedBitsSet, decode(&empty_i));
+
+    // One octet of ASDU is still refused later (it is a short ASDU), but the
+    // frame itself decodes — the bound is on "no body", not on "small body".
+    const one_octet = [_]u8{ 0x68, 0x05, 0x00, 0x00, 0x00, 0x00, 0x2d };
+    const f = try decode(&one_octet);
+    try std.testing.expectEqual(@as(usize, 1), f.asdu.len);
 }

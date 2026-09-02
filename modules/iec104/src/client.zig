@@ -256,7 +256,17 @@ pub const Client = struct {
         if (try self.framer.next()) |apdu| return try self.dispatch(apdu, now);
 
         // 3. Otherwise take one read from the stream.
-        const n = try self.transport.read(&self.rx_chunk);
+        // Cap the read at what the framer can still take. `Transport` is a
+        // generic byte stream, so a partial frame plus a full chunk exceeds a
+        // `frame_buf` sized at the documented minimum (`max_apdu_len`) and
+        // `feed` returns `BufferTooSmall` — whose own doc comment says that
+        // "can only happen if the caller supplied a smaller one". `TcpTransport`
+        // happens to deliver exactly one whole APDU per read and so hides it;
+        // `LoopTransport` and any caller-supplied adapter do not
+        // (W2 re-audit 2026-09-02, `iec104` F5).
+        const room = self.framer.capacity() - self.framer.pending();
+        if (room < apci.min_length) return error.ReadFailed;
+        const n = try self.transport.read(self.rx_chunk[0..@min(self.rx_chunk.len, room)]);
         if (n == 0) return .none;
         try self.framer.feed(self.rx_chunk[0..n]);
         if (try self.framer.next()) |apdu| return try self.dispatch(apdu, now);
