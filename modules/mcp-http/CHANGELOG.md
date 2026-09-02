@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — Follow-on from the `mcp` drift re-audit: `mcp.Server` now keeps handshake state
+  **per peer**, and a peer handle is this transport's session tag — so the server has to be told
+  when a session ends or its peer table only grows, and past `Server.max_peers` it starts refusing
+  new handshakes outright. Session teardown now writes back: `destroy` and `evictIdle` report the
+  freed session's tag (`bool` → `?u64`, `Created` gains `evicted`), and every teardown path —
+  `DELETE`, a `close()`d session's final `GET`, and eviction under `max_sessions` — calls
+  `Server.forgetPeer` under the transport lock.
+
+
 - **2026-09-02** — Drift re-audit (W2, window `0575340..HEAD`). Three findings, all fixed:
 
   - **HIGH, broken isolation:** session ids were **guessable**, and possession of an id is the

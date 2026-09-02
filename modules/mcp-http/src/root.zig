@@ -258,19 +258,26 @@ pub const Sessions = struct {
     /// back up by id: that second lookup was a failure mode with no honest
     /// answer (the session exists — it was just made), and it used to be
     /// swallowed with `orelse 0`, i.e. dropped into the shared peer-0 bucket.
-    pub const Created = struct { id: []const u8, tag: u64 };
+    pub const Created = struct {
+        id: []const u8,
+        tag: u64,
+        /// The peer handle of a session evicted to make room, if any. The
+        /// caller must `mcp.Server.forgetPeer` it.
+        evicted: ?u64 = null,
+    };
 
     /// Create a session; returns its id and peer handle (see `Created`).
     fn create(self: *Sessions) error{ OutOfMemory, TooManySessions }!Created {
         lockSpin(&self.lock);
         defer self.lock.unlock();
+        var evicted: ?u64 = null;
         if (self.map.count() >= self.max_sessions) {
             // A full table used to be permanent: nothing but an explicit
             // DELETE ever freed a session, so `max_sessions` abandoned
             // `initialize`s locked every later client out forever. The cap
             // bounded memory and the quantity it bounded never fell on its own
             // (W2 re-audit 2026-09-02, `mcp-http` F2).
-            if (!self.evictIdle()) return error.TooManySessions;
+            evicted = self.evictIdle() orelse return error.TooManySessions;
         }
         self.seq += 1;
         // ⚠ 128 bits from the CSPRNG, and it has to be: possession of this id
@@ -306,17 +313,20 @@ pub const Sessions = struct {
         // peer handle for this session's lifetime.
         s.* = .{ .id = id, .tag = self.seq, .last_seen_ns = monoNs() };
         try self.map.put(self.gpa, id, s);
-        return .{ .id = id, .tag = s.tag };
+        return .{ .id = id, .tag = s.tag, .evicted = evicted };
     }
 
     /// Drop the least-recently-touched session **if** it has been idle longer
-    /// than `max_idle_ns`. Caller holds the lock. Returns whether it freed one.
+    /// than `max_idle_ns`. Caller holds the lock. Returns the freed session's
+    /// peer handle, so the caller can hand it to `mcp.Server.forgetPeer` — the
+    /// server keeps per-peer handshake state and has no other way to learn
+    /// that a session is gone.
     ///
     /// Deliberately not a plain LRU eviction: taking a live session away from
     /// a client to make room for a new one would turn a flood into a
     /// cross-client denial instead of an outage, which is worse. An abandoned
     /// flood self-heals; a busy server still refuses.
-    fn evictIdle(self: *Sessions) bool {
+    fn evictIdle(self: *Sessions) ?u64 {
         const now = monoNs();
         var oldest_key: ?[]const u8 = null;
         var oldest_seen: u64 = std.math.maxInt(u64);
@@ -328,11 +338,12 @@ pub const Sessions = struct {
                 oldest_key = e.key_ptr.*;
             }
         }
-        const key = oldest_key orelse return false;
-        if (now -| oldest_seen < self.max_idle_ns) return false;
-        const kv = self.map.fetchRemove(key) orelse return false;
+        const key = oldest_key orelse return null;
+        if (now -| oldest_seen < self.max_idle_ns) return null;
+        const kv = self.map.fetchRemove(key) orelse return null;
+        const tag = kv.value.tag;
         self.freeSession(kv.value);
-        return true;
+        return tag;
     }
 
     /// Record that a request named this session. Caller holds the lock.
@@ -355,13 +366,15 @@ pub const Sessions = struct {
         return s.tag;
     }
 
-    /// Tear a session down (on `DELETE`). Returns whether it existed.
-    fn destroy(self: *Sessions, id: []const u8) bool {
+    /// Tear a session down (on `DELETE`). Returns its peer handle when it
+    /// existed, so the caller can `mcp.Server.forgetPeer` it (see `evictIdle`).
+    fn destroy(self: *Sessions, id: []const u8) ?u64 {
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        const kv = self.map.fetchRemove(id) orelse return false;
+        const kv = self.map.fetchRemove(id) orelse return null;
+        const tag = kv.value.tag;
         self.freeSession(kv.value);
-        return true;
+        return tag;
     }
 
     /// Enqueue a server→client message for a session's `GET` stream (deliver on
@@ -665,7 +678,7 @@ fn handleGet(t: *const Transport, ctx: *router.Ctx) anyerror!void {
         // Nothing queued: a heartbeat keeps the response well-formed; the
         // client's EventSource reconnects (with Last-Event-ID) for later events.
         try es.comment("keep-alive");
-        if (closing) _ = sessions.destroy(sid);
+        if (closing) forgetSession(t, sessions, sid);
         return;
     }
     for (batch.items) |e| {
@@ -675,17 +688,28 @@ fn handleGet(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     }
     // Everything queued has now been written, so the session has nothing left
     // to deliver and can go.
-    if (closing) _ = sessions.destroy(sid);
+    if (closing) forgetSession(t, sessions, sid);
+}
+
+/// Destroy a session AND drop the server-side handshake state that belongs to
+/// it. `mcp.Server` scopes capabilities, the negotiated revision and the
+/// pending budget per peer (`mcp.PeerState`); nothing else tells it a peer has
+/// gone, so a transport that tore sessions down without this would walk into
+/// `Server.max_peers` and start refusing new handshakes outright.
+fn forgetSession(t: *const Transport, sessions: *Sessions, sid: []const u8) void {
+    const tag = sessions.destroy(sid) orelse return;
+    t.lock.acquire();
+    defer t.lock.release();
+    t.server.forgetPeer(tag);
 }
 
 /// `DELETE /mcp`: tear down the session named by `Mcp-Session-Id`.
 fn handleDelete(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     const sid = ctx.req.header("mcp-session-id") orelse return notFound(ctx);
-    if (t.sessions.?.destroy(sid)) {
-        ctx.res.setStatus(204);
-    } else {
-        return notFound(ctx);
-    }
+    const sessions = t.sessions.?;
+    if (sessions.tagOf(sid) == null) return notFound(ctx);
+    forgetSession(t, sessions, sid);
+    ctx.res.setStatus(204);
 }
 
 fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
@@ -723,6 +747,14 @@ fn handlePost(t: *const Transport, ctx: *router.Ctx) anyerror!void {
                     return;
                 },
             };
+            // A session evicted to make room takes its server-side handshake
+            // state with it (see `forgetSession`); otherwise the peer entry
+            // outlives every session that ever used the slot.
+            if (created.evicted) |gone| {
+                t.lock.acquire();
+                t.server.forgetPeer(gone);
+                t.lock.release();
+            }
             try ctx.res.setHeader("Mcp-Session-Id", created.id);
             sid = created.id;
             // The tag comes back from `create` itself: there is no second
@@ -1328,6 +1360,52 @@ test "sessions: initialize assigns Mcp-Session-Id; missing/unknown → 404; DELE
     try testing.expect(std.mem.startsWith(u8, del, "HTTP/1.1 204"));
     const gone = runWire(&r, postWithSession(&rbuf, sid, list_body), &out);
     try testing.expect(std.mem.startsWith(u8, gone, "HTTP/1.1 404"));
+}
+
+test "sessions: tearing a session down also drops its server-side handshake state" {
+    // `mcp.Server` scopes capabilities/revision/pending budget per peer, and a
+    // peer handle is this transport's session tag. Nothing tells the server a
+    // session ended, so without this the peer table only ever grows — and past
+    // `Server.max_peers` the server starts refusing new handshakes outright.
+    const gpa = testing.allocator;
+    var server = try buildServer(gpa);
+    defer server.deinit();
+    server.max_peers = 2;
+    var sessions = Sessions.init(gpa);
+    defer sessions.deinit();
+    var transport = Transport{ .gpa = gpa, .server = &server, .sessions = &sessions };
+
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try r.use(transport.middleware());
+
+    var rbuf: [1024]u8 = undefined;
+    var out: [4096]u8 = undefined;
+
+    // Two sessions fill the server's peer table exactly.
+    var ids: [2][64]u8 = undefined;
+    var lens: [2]usize = undefined;
+    for (0..2) |i| {
+        const res = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
+        try testing.expect(std.mem.startsWith(u8, res, "HTTP/1.1 200"));
+        const h = headerValue(res, "Mcp-Session-Id") orelse return error.NoSession;
+        @memcpy(ids[i][0..h.len], h);
+        lens[i] = h.len;
+    }
+    try testing.expectEqual(@as(usize, 2), server.peers.items.len);
+
+    // DELETE the first one: the server must forget that peer, not just the
+    // session store.
+    const del = runWire(&r, deleteWithSession(&rbuf, ids[0][0..lens[0]]), &out);
+    try testing.expect(std.mem.startsWith(u8, del, "HTTP/1.1 204"));
+    try testing.expectEqual(@as(usize, 1), server.peers.items.len);
+
+    // ...so a third client can still hand shake. Without the write-back the
+    // table would be full and this `initialize` would come back an error.
+    const third = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
+    try testing.expect(std.mem.startsWith(u8, third, "HTTP/1.1 200"));
+    try testing.expect(std.mem.indexOf(u8, third, "\"error\"") == null);
+    try testing.expectEqual(@as(usize, 2), server.peers.items.len);
 }
 
 test "sessions: GET streams pushed events as SSE; Last-Event-ID replays only newer" {

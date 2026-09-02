@@ -1097,6 +1097,32 @@ const Pending = struct {
     ctx: ?*anyopaque,
 };
 
+/// One peer's handshake state.
+///
+/// `initialize` is a **per-connection** act: the capabilities a client
+/// declares, the revision it settled on and its lifecycle flag all belong to
+/// the peer that sent them. Holding them as three fields on the `Server` made
+/// them global, and a `Server` is deliberately shared — `mcp-http` serves
+/// every session from one (`Transport.server`). So any party that could POST
+/// could open a session, declare `elicitation`/`sampling`, and thereby lift
+/// the gate for **every other session**: `elicitation/create` — the phishing
+/// primitive this module documents at length — was then written to a client
+/// that had declared nothing, in a revision it never negotiated. The same
+/// handle in reverse: a session declaring `capabilities:{}` revoked everyone
+/// else's. Peer scoping already existed for response *correlation*; the gate
+/// is the other half of it.
+pub const PeerState = struct {
+    peer: u64,
+    /// Set when this peer sends `notifications/initialized`.
+    initialized: bool = false,
+    /// What this peer advertised on its last `initialize`. All-false until
+    /// one arrives, so the gate is closed before a handshake.
+    capabilities: ClientCapabilities = .{},
+    /// The revision this peer's `initialize` settled on. Defaults to our
+    /// latest so a pre-handshake encoder picks the newest shape.
+    negotiated_version: []const u8 = protocol_version,
+};
+
 /// Whether a negotiated protocol revision knows elicitation *modes*. The
 /// 2025-06-18 revision has no `mode` field at all (and no URL mode), so a
 /// form-mode request to such a client omits it — which 2025-11-25 explicitly
@@ -1121,11 +1147,20 @@ const HostPort = struct {
 /// prefix-matching: in `http://localhost:8080@evil.example/steal` the host is
 /// `evil.example`, and `localhost:8080` is merely a username — a
 /// prefix/first-delimiter check reads that as loopback and lets an arbitrary
-/// plaintext-http host through. The authority itself ends at the first `/`,
-/// `?` or `#`, so an `@` in the *path* (`http://evil.example/@localhost`)
-/// cannot pull the host apart either.
+/// plaintext-http host through.
+///
+/// The authority ends at the first `/`, `?`, `#` **or `\`**, so an `@` in the
+/// *path* (`http://evil.example/@localhost`) cannot pull the host apart
+/// either. The backslash is not RFC 3986 — it is the WHATWG URL Standard's
+/// rule for *special* schemes, and it is in this set because the party that
+/// finally opens the URL is the MCP **client**: a browser or a JS runtime,
+/// every one of which parses by WHATWG. Under RFC 3986 alone the authority of
+/// `http://evil.example\@localhost/` is `evil.example\@localhost`, whose last
+/// `@` makes the host `localhost` — loopback, allowed — while the client that
+/// opens it navigates to `http://evil.example/@localhost/`. Agreeing with the
+/// parser that acts on the answer matters more here than agreeing with the RFC.
 fn splitAuthority(after_scheme: []const u8) ?HostPort {
-    const end = std.mem.indexOfAny(u8, after_scheme, "/?#") orelse after_scheme.len;
+    const end = std.mem.indexOfAny(u8, after_scheme, "/?#\\") orelse after_scheme.len;
     var authority = after_scheme[0..end];
     if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
 
@@ -1375,7 +1410,7 @@ pub const ToolCall = struct {
     /// feature that depends on sampling or elicitation, rather than issuing a
     /// request and handling the refusal.
     pub fn clientCapabilities(self: *const ToolCall) ClientCapabilities {
-        return self.server.client_capabilities;
+        return self.server.clientCapabilities(self.peer);
     }
 
     /// Append raw bytes to the result. OOM is swallowed (a truncated tool
@@ -1609,23 +1644,25 @@ pub const Server = struct {
     resources: std.ArrayList(Resource) = .empty,
     resource_templates: std.ArrayList(ResourceTemplate) = .empty,
     prompts: std.ArrayList(Prompt) = .empty,
-    /// Set when the client sends `notifications/initialized`.
-    client_initialized: bool = false,
-    /// What the client advertised on the last `initialize` — the gate on every
-    /// server→client request. All-false until an `initialize` arrives.
-    client_capabilities: ClientCapabilities = .{},
-    /// The revision `initialize` settled on (see `negotiateVersion`). Defaults
-    /// to our latest so a pre-handshake encoder picks the newest shape.
-    negotiated_version: []const u8 = protocol_version,
+    /// Per-peer handshake state, one entry per peer that has handshaken.
+    /// See `PeerState` for why this is not three fields on the `Server`.
+    peers: std.ArrayList(PeerState) = .empty,
+    /// Cap on remembered peers. A transport that multiplexes sessions must
+    /// call `forgetPeer` when one ends; this bounds the damage when it does
+    /// not, and past it an `initialize` from an unknown peer is refused
+    /// rather than served.
+    max_peers: usize = 4096,
     /// Outbound (server→client) requests awaiting the client's response.
     pending: std.ArrayList(Pending) = .empty,
     /// Next server→client request id. Monotonic and **never reused**: an id is
     /// burnt when it is allocated, even if the send then fails, so a late
     /// answer can never be matched to a different request.
     next_request_id: u64 = 1,
-    /// Cap on unanswered server→client requests. A client that simply never
-    /// answers must not grow this without bound; past the cap `send*` returns
-    /// `error.TooManyPending`.
+    /// Cap on unanswered server→client requests **per peer**. A client that
+    /// simply never answers must not grow this without bound; past the cap
+    /// `send*` returns `error.TooManyPending`. Counted per peer so one
+    /// session cannot exhaust the budget of every other session sharing this
+    /// `Server`.
     max_pending: usize = 256,
 
     pub fn init(gpa: std.mem.Allocator, info: Info) Server {
@@ -1637,7 +1674,73 @@ pub const Server = struct {
         self.resources.deinit(self.gpa);
         self.resource_templates.deinit(self.gpa);
         self.prompts.deinit(self.gpa);
+        self.peers.deinit(self.gpa);
         self.pending.deinit(self.gpa);
+    }
+
+    /// This peer's handshake state, or the pre-handshake default (all-false
+    /// capabilities, our latest revision) when it has not handshaken. Never
+    /// another peer's.
+    pub fn peerState(self: *const Server, peer: u64) PeerState {
+        for (self.peers.items) |p| {
+            if (p.peer == peer) return p;
+        }
+        return .{ .peer = peer };
+    }
+
+    /// What `peer` advertised at `initialize` — the gate on every
+    /// server→client request to it.
+    pub fn clientCapabilities(self: *const Server, peer: u64) ClientCapabilities {
+        return self.peerState(peer).capabilities;
+    }
+
+    /// Whether `peer` has sent `notifications/initialized`.
+    pub fn clientInitialized(self: *const Server, peer: u64) bool {
+        return self.peerState(peer).initialized;
+    }
+
+    /// The revision `peer`'s `initialize` settled on (see `negotiateVersion`).
+    pub fn negotiatedVersion(self: *const Server, peer: u64) []const u8 {
+        return self.peerState(peer).negotiated_version;
+    }
+
+    /// Forget everything about `peer`: its handshake state and every pending
+    /// server→client request issued to it. A multiplexing transport calls
+    /// this when a session ends, so a `Server` that outlives many sessions
+    /// does not accumulate them. Dropped pending entries are *not* handed to
+    /// their `on_response` handler — the peer is gone, there is no answer.
+    pub fn forgetPeer(self: *Server, peer: u64) void {
+        var i: usize = self.pending.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.pending.items[i].peer == peer) _ = self.pending.orderedRemove(i);
+        }
+        for (self.peers.items, 0..) |p, j| {
+            if (p.peer == peer) {
+                _ = self.peers.orderedRemove(j);
+                return;
+            }
+        }
+    }
+
+    /// This peer's mutable slot, created on demand. The returned pointer is
+    /// invalidated by the next `peerSlot`, so write through it immediately.
+    fn peerSlot(self: *Server, peer: u64) error{ OutOfMemory, TooManyPeers }!*PeerState {
+        for (self.peers.items) |*p| {
+            if (p.peer == peer) return p;
+        }
+        if (self.peers.items.len >= self.max_peers) return error.TooManyPeers;
+        try self.peers.append(self.gpa, .{ .peer = peer });
+        return &self.peers.items[self.peers.items.len - 1];
+    }
+
+    /// Unanswered server→client requests issued to `peer`.
+    fn pendingFor(self: *const Server, peer: u64) usize {
+        var n: usize = 0;
+        for (self.pending.items) |p| {
+            if (p.peer == peer) n += 1;
+        }
+        return n;
     }
 
     /// Register a tool. All slices in `tool` (name, description, schemas) must
@@ -1716,7 +1819,8 @@ pub const Server = struct {
         req: SamplingRequest,
         opts: RequestOptions,
     ) SendError!u64 {
-        if (!self.client_capabilities.sampling) return error.SamplingNotSupported;
+        const peer_state = self.peerState(opts.peer);
+        if (!peer_state.capabilities.sampling) return error.SamplingNotSupported;
         if (req.messages.len == 0) return error.NoMessages;
         if (req.max_tokens == 0) return error.InvalidMaxTokens;
         if (req.model_preferences) |mp| {
@@ -1725,7 +1829,7 @@ pub const Server = struct {
                 if (!(p >= 0.0) or !(p <= 1.0)) return error.InvalidPriority; // NaN too
             }
         }
-        if (self.pending.items.len >= self.max_pending) return error.TooManyPending;
+        if (self.pendingFor(opts.peer) >= self.max_pending) return error.TooManyPending;
 
         const id = self.allocRequestId();
         try self.pending.append(self.gpa, .{
@@ -1762,7 +1866,8 @@ pub const Server = struct {
         req: ElicitationRequest,
         opts: RequestOptions,
     ) SendError!u64 {
-        if (!self.client_capabilities.elicitation) return error.ElicitationNotSupported;
+        const peer_state = self.peerState(opts.peer);
+        if (!peer_state.capabilities.elicitation) return error.ElicitationNotSupported;
 
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -1770,18 +1875,18 @@ pub const Server = struct {
 
         switch (req) {
             .form => |f| {
-                if (!self.client_capabilities.elicitation_form) return error.ElicitationFormNotSupported;
+                if (!peer_state.capabilities.elicitation_form) return error.ElicitationFormNotSupported;
                 if (f.message.len == 0) return error.EmptyMessage;
                 try validateElicitationSchema(arena, f.requested_schema);
             },
             .url => |u| {
-                if (!self.client_capabilities.elicitation_url) return error.ElicitationUrlNotSupported;
+                if (!peer_state.capabilities.elicitation_url) return error.ElicitationUrlNotSupported;
                 if (u.message.len == 0) return error.EmptyMessage;
                 if (u.elicitation_id.len == 0) return error.MissingElicitationId;
                 if (!isSafeElicitationUrl(u.url)) return error.InvalidUrl;
             },
         }
-        if (self.pending.items.len >= self.max_pending) return error.TooManyPending;
+        if (self.pendingFor(opts.peer) >= self.max_pending) return error.TooManyPending;
 
         const id = self.allocRequestId();
         try self.pending.append(self.gpa, .{
@@ -1800,7 +1905,7 @@ pub const Server = struct {
             &aw.writer,
             id,
             req,
-            versionHasElicitationModes(self.negotiated_version),
+            versionHasElicitationModes(peer_state.negotiated_version),
         ) catch |err| switch (err) {
             error.SchemaNotJson => return error.SchemaNotJson, // unreachable: validated above
             else => return error.OutOfMemory,
@@ -2069,7 +2174,23 @@ pub const Server = struct {
         // fails when a tag has no `spec_anchor_index` entry.
         const dm = std.meta.stringToEnum(DispatchMethod, method);
         if (dm == .@"notifications/initialized") {
-            self.client_initialized = true;
+            // A notification by definition — carrying an `id` makes it a
+            // *request*, and "a request gets exactly one response" is a
+            // stated invariant of this module. Answering it here (rather than
+            // taking the notification path and returning silently) is what
+            // keeps that true; a client that sends this shape would otherwise
+            // wait forever for a reply that is never written. The flag is not
+            // set for a message we are rejecting.
+            if (id != null) {
+                return sendError(arena, out, id, error_code.invalid_request, "notifications/initialized is a notification and takes no id");
+            }
+            const slot = self.peerSlot(peer) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // Past `max_peers` there is nowhere to record it, and a
+                // notification has no response to carry the refusal.
+                error.TooManyPeers => return,
+            };
+            slot.initialized = true;
             return;
         }
         // Notification for a request-only method (or for one we do not know at
@@ -2080,7 +2201,7 @@ pub const Server = struct {
         switch (m) {
             // Handled above, before the id check — a notification by definition.
             .@"notifications/initialized" => unreachable,
-            .initialize => try self.handleInitialize(arena, out, id, obj.get("params")),
+            .initialize => try self.handleInitialize(arena, out, id, obj.get("params"), peer),
             .@"tools/list" => {
                 const list = self.buildToolsList(arena) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -2100,7 +2221,7 @@ pub const Server = struct {
         }
     }
 
-    fn handleInitialize(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value) Error!void {
+    fn handleInitialize(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, peer: u64) Error!void {
         // Extract the client's requested protocolVersion (if any) and echo it
         // back when supported; otherwise answer with our latest.
         var requested: ?[]const u8 = null;
@@ -2116,9 +2237,15 @@ pub const Server = struct {
         const version = negotiateVersion(requested);
         // Record what the CLIENT can do: this is the gate on every server→client
         // request (see `ClientCapabilities`). A re-`initialize` replaces it
-        // wholesale — capabilities never accumulate across handshakes.
-        self.negotiated_version = version;
-        self.client_capabilities = ClientCapabilities.parse(caps);
+        // wholesale — capabilities never accumulate across handshakes — and it
+        // is recorded against THIS peer, never against the `Server` (see
+        // `PeerState`): one session's handshake must not move another's gate.
+        const slot = self.peerSlot(peer) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TooManyPeers => return sendError(arena, out, id, error_code.internal_error, "too many peers"),
+        };
+        slot.negotiated_version = version;
+        slot.capabilities = ClientCapabilities.parse(caps);
 
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
@@ -2539,17 +2666,17 @@ fn sendResultRaw(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Va
 /// `isError:false`.
 fn sendToolResult(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, text: []const u8, allow_structured: bool, is_error: bool) Error!void {
     var aw: std.Io.Writer.Allocating = .init(arena);
-    buildToolResultLine(&aw.writer, id, text, allow_structured, is_error) catch return error.OutOfMemory;
+    buildToolResultLine(arena, &aw.writer, id, text, allow_structured, is_error) catch return error.OutOfMemory;
     try flushLine(out, aw.written());
 }
 
-fn buildToolResultLine(w: *std.Io.Writer, id: ?std.json.Value, text: []const u8, allow_structured: bool, is_error: bool) std.Io.Writer.Error!void {
+fn buildToolResultLine(gpa: std.mem.Allocator, w: *std.Io.Writer, id: ?std.json.Value, text: []const u8, allow_structured: bool, is_error: bool) std.Io.Writer.Error!void {
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try writeId(w, id);
     try w.writeAll(",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
     try std.json.Stringify.encodeJsonString(text, .{}, w);
     try w.writeAll("}]");
-    if (allow_structured and isSingleJsonObject(text)) {
+    if (allow_structured and isSingleJsonObject(gpa, text)) {
         try w.writeAll(",\"structuredContent\":");
         try writeStrippingNewlines(w, text);
     }
@@ -2607,48 +2734,29 @@ fn isWs(c: u8) bool {
 
 /// True when `text` is exactly one top-level JSON object (`{ … }`) followed
 /// by nothing but whitespace — the only shape MCP `structuredContent`
-/// accepts. Brace-matches with string/escape awareness so NDJSON (many `{…}`
-/// lines) and bare arrays are correctly rejected, not concatenated into
-/// invalid JSON by the later newline-strip.
-fn isSingleJsonObject(text: []const u8) bool {
+/// accepts — **and the whole of it is valid JSON**.
+///
+/// The second half is why this delegates to `std.json` instead of matching
+/// brackets by hand. A depth counter cannot distinguish the bracket *kinds*,
+/// so `{]`, `{"a":1]` and `{[}]` all counted as one balanced top-level object
+/// and were spliced verbatim into `structuredContent`, emitting a response
+/// line no client can parse — reachable from any pass-through tool, because
+/// `allow_structured` defaults to true and the text is the tool's output.
+/// Nor can a counter see a raw control character inside a string: that is
+/// invalid JSON which the later newline-strip silently *repaired* into valid
+/// JSON carrying a different value than the text block beside it.
+///
+/// Validating here is what makes the strip safe: in a document `std.json`
+/// accepts, a `\n`/`\r` can only be insignificant whitespace between tokens
+/// (RFC 8259 §7 forbids unescaped %x00-1F inside a string), so removing it
+/// cannot change the value.
+fn isSingleJsonObject(gpa: std.mem.Allocator, text: []const u8) bool {
     var i: usize = 0;
     while (i < text.len and isWs(text[i])) : (i += 1) {}
     if (i >= text.len or text[i] != '{') return false;
-
-    var depth: usize = 0;
-    var in_str = false;
-    var escaped = false;
-    while (i < text.len) : (i += 1) {
-        const c = text[i];
-        if (in_str) {
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        switch (c) {
-            '"' => in_str = true,
-            '{', '[' => depth += 1,
-            '}', ']' => {
-                if (depth == 0) return false; // unbalanced
-                depth -= 1;
-                if (depth == 0) {
-                    // top-level value closed: the remainder must be whitespace.
-                    i += 1;
-                    while (i < text.len) : (i += 1) {
-                        if (!isWs(text[i])) return false;
-                    }
-                    return true;
-                }
-            },
-            else => {},
-        }
-    }
-    return false; // unterminated
+    // `validate` accepts exactly one top-level value plus trailing
+    // whitespace, so NDJSON and any trailing garbage are refused here too.
+    return std.json.validate(gpa, text) catch false;
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
@@ -3014,11 +3122,11 @@ test "negotiateVersion unit" {
 test "notifications/initialized: no response, flag set" {
     var s = testServer(null);
     defer s.deinit();
-    try testing.expect(!s.client_initialized);
+    try testing.expect(!s.clientInitialized(0));
     // This line is already the spec's own (basic/lifecycle.mdx) verbatim, byte
     // for byte -- a full spec-literal anchor, no adaptation needed.
     try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", "");
-    try testing.expect(s.client_initialized);
+    try testing.expect(s.clientInitialized(0));
 }
 
 test "tools/list: golden JSON from the registered catalog" {
@@ -3214,15 +3322,103 @@ test "addTool: duplicate name rejected" {
 }
 
 test "isSingleJsonObject unit" {
-    try testing.expect(isSingleJsonObject("{}"));
-    try testing.expect(isSingleJsonObject("  {\"a\":1}  \n"));
-    try testing.expect(isSingleJsonObject("{\"s\":\"}{\",\"e\":\"\\\"}\"}")); // braces inside strings
-    try testing.expect(!isSingleJsonObject("")); // empty
-    try testing.expect(!isSingleJsonObject("[1,2]")); // array
-    try testing.expect(!isSingleJsonObject("\"str\"")); // string
-    try testing.expect(!isSingleJsonObject("{\"a\":1}\n{\"b\":2}")); // NDJSON
-    try testing.expect(!isSingleJsonObject("{\"a\":1")); // unterminated
-    try testing.expect(!isSingleJsonObject("}{")); // unbalanced
+    try testing.expect(isSingleJsonObject(testing.allocator, "{}"));
+    try testing.expect(isSingleJsonObject(testing.allocator, "  {\"a\":1}  \n"));
+    try testing.expect(isSingleJsonObject(testing.allocator, "{\"s\":\"}{\",\"e\":\"\\\"}\"}")); // braces inside strings
+    try testing.expect(!isSingleJsonObject(testing.allocator, "")); // empty
+    try testing.expect(!isSingleJsonObject(testing.allocator, "[1,2]")); // array
+    try testing.expect(!isSingleJsonObject(testing.allocator, "\"str\"")); // string
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{\"a\":1}\n{\"b\":2}")); // NDJSON
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{\"a\":1")); // unterminated
+    try testing.expect(!isSingleJsonObject(testing.allocator, "}{")); // unbalanced
+    // Re-audit F10: the bracket KINDS have to agree, not merely the count. A
+    // single depth counter shared by `{}` and `[]` returned true for all of
+    // these, and the caller then spliced them verbatim.
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{]"));
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{\"a\":1]"));
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{[}]"));
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{\"a\":[1,2}"));
+    try testing.expect(!isSingleJsonObject(testing.allocator, "[}"));
+    // Re-audit F13: valid-looking, but a raw control character inside a
+    // string is not valid JSON (RFC 8259 §7) — and it is exactly the shape
+    // the newline-strip silently rewrote into a different value.
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{\"a\":\"x\ny\"}"));
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{\"a\":\"x\ry\"}"));
+    // Whitespace newlines between tokens stay fine: they carry no value.
+    try testing.expect(isSingleJsonObject(testing.allocator, "{\n\"a\":\n1\n}"));
+    // Other things a brace count cannot see.
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{\"a\":}"));
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{\"a\" 1}"));
+    try testing.expect(!isSingleJsonObject(testing.allocator, "{\"a\":01}"));
+}
+
+fn echoTextTool(_: ?*anyopaque, call: *ToolCall) bool {
+    call.write(call.strArg("text") orelse "");
+    return false;
+}
+
+test "tools/call: structuredContent is spliced only when the text is genuinely valid JSON (re-audit F10/F13)" {
+    // Reachable from ONE ordinary request against any pass-through tool:
+    // `allow_structured` defaults to true and the text is the tool's output,
+    // so a remote peer chose these bytes. Two properties are pinned here —
+    // the emitted line always parses, and when `structuredContent` IS present
+    // it carries the same value as the text block beside it.
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{
+        .name = "echo",
+        .description = "echoes its argument verbatim",
+        .input_schema = "{\"type\":\"object\"}",
+        .handler = &echoTextTool,
+    });
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    const cases = [_]struct { text: []const u8, structured: bool }{
+        .{ .text = "{]", .structured = false },
+        .{ .text = "{\"a\":1]", .structured = false },
+        .{ .text = "{[}]", .structured = false },
+        .{ .text = "{\"a\":[1,2}", .structured = false },
+        .{ .text = "{\"a\":\"x\ny\"}", .structured = false }, // raw LF inside a string
+        .{ .text = "{\"a\":1}\n{\"b\":2}", .structured = false }, // NDJSON
+        .{ .text = "not json at all", .structured = false },
+        .{ .text = "{\"ok\":true}", .structured = true },
+        .{ .text = "{\n  \"a\": [1, 2],\n  \"b\": {\"c\": null}\n}", .structured = true },
+    };
+    for (cases) |c| {
+        aw.clearRetainingCapacity();
+        var req: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer req.deinit();
+        try req.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":",
+        );
+        try std.json.Stringify.encodeJsonString(c.text, .{}, &req.writer);
+        try req.writer.writeAll("}}}");
+        try s.handleMessage(req.written(), &aw.writer);
+
+        const line = std.mem.trimEnd(u8, aw.written(), "\n");
+        // Whatever we emit, the client must be able to parse it.
+        var parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{}) catch |err| {
+            std.debug.print("emitted an unparseable line for {s}: {s}\n", .{ c.text, line });
+            return err;
+        };
+        defer parsed.deinit();
+        const result = parsed.value.object.get("result").?.object;
+        const structured = result.get("structuredContent");
+        try testing.expectEqual(c.structured, structured != null);
+        if (structured) |sv| {
+            // One state, two readers: the spliced copy must agree with the
+            // text block. (The strip only removes insignificant whitespace,
+            // which re-serializing normalises away on both sides.)
+            const from_text = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.text, .{});
+            defer from_text.deinit();
+            const a = try std.json.Stringify.valueAlloc(testing.allocator, from_text.value, .{});
+            defer testing.allocator.free(a);
+            const b = try std.json.Stringify.valueAlloc(testing.allocator, sv, .{});
+            defer testing.allocator.free(b);
+            try testing.expectEqualStrings(a, b);
+        }
+    }
 }
 
 test "integration: full round-trip over an in-memory pipe (serve)" {
@@ -3260,7 +3456,7 @@ test "integration: full round-trip over an in-memory pipe (serve)" {
     try testing.expectEqualStrings(expected, aw.written());
 
     // The session reached the app: handshake flag + ctx-threaded state.
-    try testing.expect(s.client_initialized);
+    try testing.expect(s.clientInitialized(0));
     try testing.expectEqual(@as(u32, 1), app.calls);
     try testing.expectEqualStrings("round-trip", app.last_text[0..app.last_text_len]);
 }
@@ -3791,30 +3987,30 @@ test "initialize: client capabilities are captured (and replaced on re-handshake
     var s = testServer(null);
     defer s.deinit();
     // Nothing declared before a handshake: everything fails closed.
-    try testing.expect(!s.client_capabilities.sampling);
-    try testing.expect(!s.client_capabilities.elicitation);
+    try testing.expect(!s.clientCapabilities(0).sampling);
+    try testing.expect(!s.clientCapabilities(0).elicitation);
 
     try feed(&s,
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"sampling":{"tools":{}},"elicitation":{"form":{},"url":{}},"roots":{"listChanged":true}}}}
     );
-    try testing.expect(s.client_capabilities.sampling);
-    try testing.expect(s.client_capabilities.sampling_tools);
-    try testing.expect(!s.client_capabilities.sampling_context);
-    try testing.expect(s.client_capabilities.elicitation);
-    try testing.expect(s.client_capabilities.elicitation_form);
-    try testing.expect(s.client_capabilities.elicitation_url);
-    try testing.expect(s.client_capabilities.roots);
-    try testing.expect(s.client_capabilities.roots_list_changed);
-    try testing.expectEqualStrings("2025-11-25", s.negotiated_version);
+    try testing.expect(s.clientCapabilities(0).sampling);
+    try testing.expect(s.clientCapabilities(0).sampling_tools);
+    try testing.expect(!s.clientCapabilities(0).sampling_context);
+    try testing.expect(s.clientCapabilities(0).elicitation);
+    try testing.expect(s.clientCapabilities(0).elicitation_form);
+    try testing.expect(s.clientCapabilities(0).elicitation_url);
+    try testing.expect(s.clientCapabilities(0).roots);
+    try testing.expect(s.clientCapabilities(0).roots_list_changed);
+    try testing.expectEqualStrings("2025-11-25", s.negotiatedVersion(0));
 
     // A second initialize replaces the set outright — capabilities must never
     // accumulate across handshakes (otherwise a client could never drop one).
     try feed(&s,
         \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}
     );
-    try testing.expect(!s.client_capabilities.sampling);
-    try testing.expect(!s.client_capabilities.elicitation);
-    try testing.expectEqualStrings("2025-06-18", s.negotiated_version);
+    try testing.expect(!s.clientCapabilities(0).sampling);
+    try testing.expect(!s.clientCapabilities(0).elicitation);
+    try testing.expectEqualStrings("2025-06-18", s.negotiatedVersion(0));
 }
 
 test "ClientCapabilities.parse: the spec's declaration shapes" {
@@ -3942,6 +4138,22 @@ fn serverWithCaps(caps_json: []const u8) !Server {
     defer testing.allocator.free(msg);
     try s.handleMessage(msg, &sink.writer);
     return s;
+}
+
+/// Run an `initialize` handshake **as `peer`**, so a test that issues a
+/// server→client request to that peer passes the (per-peer) capability gate.
+/// `serverWithCaps` handshakes peer 0 only, which is what a stdio transport
+/// has and what a multiplexing one does not.
+fn handshakePeer(s: *Server, peer: u64, caps_json: []const u8) !void {
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    const msg = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{s}}}}}",
+        .{caps_json},
+    );
+    defer testing.allocator.free(msg);
+    try s.handleMessageFrom(msg, &sink.writer, peer);
 }
 
 test "sampling: refused unless the client declared the capability" {
@@ -4567,6 +4779,18 @@ test "elicitation: userinfo cannot smuggle a host past the http loopback allowan
         // '@' in the PATH must not be read as a userinfo delimiter.
         "http://evil.example/@localhost",
         "http://evil.example/?x=@127.0.0.1",
+        // Re-audit F12: a BACKSLASH also ends the authority — not per RFC
+        // 3986, but per the WHATWG URL Standard, which is what the party that
+        // finally opens this URL (a browser, a JS-SDK client) uses. Reading
+        // these the RFC way puts the last '@' inside the authority and makes
+        // the host `localhost`; the client navigates to `evil.example` over
+        // plaintext http. Confirmed against WHATWG: `new URL(...).host` is
+        // `evil.example` for every one of them.
+        "http://evil.example\\@localhost/steal",
+        "http://evil.example\\@127.0.0.1/steal",
+        "http://evil.example\\@[::1]/steal",
+        "http://evil.example\\@localhost:80/steal",
+        "http://evil.example\\localhost/steal",
     };
     for (smuggled) |u| {
         testing.expectError(error.InvalidUrl, s.sendElicitationRequest(&aw.writer, .{ .url = .{
@@ -4592,6 +4816,10 @@ test "elicitation: userinfo cannot smuggle a host past the http loopback allowan
         "http://user@localhost:7717/connect",
         "http://localhost",
         "http://localhost?x=1",
+        // The same rule in the other direction: WHATWG reads this host as
+        // `localhost` (the rest is path), so refusing it was the mirror-image
+        // error — a genuinely loopback URL turned away.
+        "http://localhost\\@evil.example/connect",
     }) |u| {
         _ = s.sendElicitationRequest(&aw.writer, .{ .url = .{
             .message = "go here",
@@ -4602,6 +4830,215 @@ test "elicitation: userinfo cannot smuggle a host past the http loopback allowan
             return err;
         };
     }
+}
+
+test "capability gate: one peer's initialize does not move another peer's gate (re-audit F11)" {
+    // Re-audit 2026-09-02 F11: capabilities, the negotiated revision and the
+    // lifecycle flag were three fields on the `Server`, and a `Server` is
+    // shared across sessions by `mcp-http`. So any party that could POST
+    // could open a session, declare `elicitation`, and thereby lift the gate
+    // for EVERY other session — `elicitation/create` was then written to a
+    // client that had declared nothing. The reverse handle worked too: a
+    // session declaring `capabilities:{}` revoked everyone else's.
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    const url_req: ElicitationRequest = .{ .url = .{
+        .message = "Sign in to continue",
+        .url = "https://corp.example/login",
+        .elicitation_id = "e-1",
+    } };
+
+    // Peer 1 is an ordinary client that declared nothing.
+    try handshakePeer(&s, 1, "{}");
+    try testing.expectError(
+        error.ElicitationNotSupported,
+        s.sendElicitationRequest(&aw.writer, url_req, .{ .peer = 1 }),
+    );
+
+    // Peer 2 — the hostile session — declares everything, at an older
+    // revision (whose wire shape omits `mode`).
+    try handshakePeer(&s, 2, "{\"elicitation\":{\"form\":{},\"url\":{}},\"sampling\":{}}");
+
+    // Peer 1's gate has NOT moved.
+    try testing.expectError(
+        error.ElicitationNotSupported,
+        s.sendElicitationRequest(&aw.writer, url_req, .{ .peer = 1 }),
+    );
+    try testing.expectError(
+        error.SamplingNotSupported,
+        s.sendSamplingRequest(&aw.writer, .{
+            .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+            .max_tokens = 10,
+        }, .{ .peer = 1 }),
+    );
+    try testing.expectEqualStrings("", aw.written());
+    // Peer 2's own request still works — the gate moved for exactly one peer.
+    _ = try s.sendElicitationRequest(&aw.writer, url_req, .{ .peer = 2 });
+    try testing.expect(aw.written().len > 0);
+
+    // The revocation direction: peer 3 declaring nothing must not close
+    // peer 2, and a re-handshake by peer 2 must not open peer 3.
+    try handshakePeer(&s, 3, "{}");
+    aw.clearRetainingCapacity();
+    _ = try s.sendElicitationRequest(&aw.writer, url_req, .{ .peer = 2 });
+    try testing.expectError(
+        error.ElicitationNotSupported,
+        s.sendElicitationRequest(&aw.writer, url_req, .{ .peer = 3 }),
+    );
+
+    // The negotiated revision is per-peer too: peer 4 settles on the older
+    // one, and that must not reshape peer 2's wire line.
+    try handshakePeer(&s, 4, "{\"elicitation\":{\"form\":{},\"url\":{}}}");
+    {
+        var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer sink.deinit();
+        const msg =
+            \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"elicitation":{"form":{},"url":{}}}}}
+        ;
+        try s.handleMessageFrom(msg, &sink.writer, 4);
+    }
+    try testing.expectEqualStrings("2025-06-18", s.negotiatedVersion(4));
+    try testing.expectEqualStrings("2025-11-25", s.negotiatedVersion(2));
+    // `mode` is what the two revisions disagree about, and only the FORM
+    // shape can express the difference (a url request must always carry it).
+    const form_req: ElicitationRequest = .{ .form = .{
+        .message = "Your name?",
+        .requested_schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}",
+    } };
+    aw.clearRetainingCapacity();
+    _ = try s.sendElicitationRequest(&aw.writer, form_req, .{ .peer = 2 });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"mode\":\"form\"") != null);
+    aw.clearRetainingCapacity();
+    _ = try s.sendElicitationRequest(&aw.writer, form_req, .{ .peer = 4 });
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"mode\"") == null);
+
+    // And the lifecycle flag.
+    try testing.expect(!s.clientInitialized(1));
+    {
+        var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer sink.deinit();
+        try s.handleMessageFrom("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", &sink.writer, 2);
+    }
+    try testing.expect(s.clientInitialized(2));
+    try testing.expect(!s.clientInitialized(1));
+}
+
+test "capability gate: the pending budget is per peer (re-audit F11)" {
+    // One shared budget meant a session that simply never answered could
+    // starve every other session's ability to send at all.
+    var s = try serverWithCaps("{\"sampling\":{}}");
+    defer s.deinit();
+    try handshakePeer(&s, 1, "{\"sampling\":{}}");
+    try handshakePeer(&s, 2, "{\"sampling\":{}}");
+    s.max_pending = 2;
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    const req: SamplingRequest = .{
+        .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+        .max_tokens = 10,
+    };
+    _ = try s.sendSamplingRequest(&aw.writer, req, .{ .peer = 1 });
+    _ = try s.sendSamplingRequest(&aw.writer, req, .{ .peer = 1 });
+    try testing.expectError(error.TooManyPending, s.sendSamplingRequest(&aw.writer, req, .{ .peer = 1 }));
+    // Peer 2 is unaffected by peer 1 filling its own budget.
+    _ = try s.sendSamplingRequest(&aw.writer, req, .{ .peer = 2 });
+    _ = try s.sendSamplingRequest(&aw.writer, req, .{ .peer = 2 });
+    try testing.expectError(error.TooManyPending, s.sendSamplingRequest(&aw.writer, req, .{ .peer = 2 }));
+    try testing.expectEqual(@as(usize, 4), s.pendingCount());
+}
+
+test "forgetPeer drops the session's handshake state and its pending requests" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try handshakePeer(&s, 1, "{\"sampling\":{}}");
+    try handshakePeer(&s, 2, "{\"sampling\":{}}");
+    const req: SamplingRequest = .{
+        .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+        .max_tokens = 10,
+    };
+    _ = try s.sendSamplingRequest(&aw.writer, req, .{ .peer = 1 });
+    _ = try s.sendSamplingRequest(&aw.writer, req, .{ .peer = 2 });
+    _ = try s.sendSamplingRequest(&aw.writer, req, .{ .peer = 1 });
+    try testing.expectEqual(@as(usize, 3), s.pendingCount());
+
+    s.forgetPeer(1);
+    // Both of peer 1's entries went, peer 2's stayed.
+    try testing.expectEqual(@as(usize, 1), s.pendingCount());
+    try testing.expect(!s.clientCapabilities(1).sampling);
+    try testing.expect(s.clientCapabilities(2).sampling);
+    // A forgotten peer is back to the pre-handshake default, gate closed.
+    try testing.expectError(
+        error.SamplingNotSupported,
+        s.sendSamplingRequest(&aw.writer, req, .{ .peer = 1 }),
+    );
+    // Forgetting an unknown peer is a no-op, not a crash.
+    s.forgetPeer(999);
+    try testing.expectEqual(@as(usize, 1), s.pendingCount());
+}
+
+test "max_peers bounds the state a transport that never forgets can accumulate" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.max_peers = 3;
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    for ([_]u64{ 1, 2, 3 }) |p| try handshakePeer(&s, p, "{\"sampling\":{}}");
+    try testing.expectEqual(@as(usize, 3), s.peers.items.len);
+
+    // A fourth peer's handshake is refused rather than served — and refused
+    // as a JSON-RPC error, so the client learns of it.
+    aw.clearRetainingCapacity();
+    try s.handleMessageFrom(
+        \\{"jsonrpc":"2.0","id":9,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"sampling":{}}}}
+    , &aw.writer, 4);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"error\"") != null);
+    try testing.expectEqual(@as(usize, 3), s.peers.items.len);
+    try testing.expect(!s.clientCapabilities(4).sampling);
+
+    // Freeing one slot lets the next session in.
+    s.forgetPeer(2);
+    try handshakePeer(&s, 4, "{\"sampling\":{}}");
+    try testing.expect(s.clientCapabilities(4).sampling);
+}
+
+test "notifications/initialized carrying an id is answered, not silently absorbed (re-audit F14)" {
+    // "A request (has `id`) gets exactly one response" is a stated invariant
+    // (README, SPEC, the dispatch doc). This arm sat in front of the id check,
+    // so the shape mutated server state and wrote nothing back — a strict
+    // client waits forever for a reply that never comes.
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try s.handleMessage("{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"notifications/initialized\"}", &aw.writer);
+    try testing.expect(aw.written().len > 0);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        std.mem.trimEnd(u8, aw.written(), "\n"),
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 42), parsed.value.object.get("id").?.integer);
+    try testing.expectEqual(
+        @as(i64, error_code.invalid_request),
+        parsed.value.object.get("error").?.object.get("code").?.integer,
+    );
+    // A message we are rejecting must not have moved the lifecycle flag.
+    try testing.expect(!s.clientInitialized(0));
+
+    // The notification form still works and still gets no response.
+    aw.clearRetainingCapacity();
+    try s.handleMessage("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}", &aw.writer);
+    try testing.expectEqualStrings("", aw.written());
+    try testing.expect(s.clientInitialized(0));
 }
 
 // ── correlation: the inbound response path ─────────────────────────────────
@@ -4765,6 +5202,7 @@ test "correlation: a response for an unknown/foreign id is dropped, never answer
 test "correlation: a response from another peer cannot claim the request" {
     var s = try serverWithCaps("{\"sampling\":{}}");
     defer s.deinit();
+    try handshakePeer(&s, 7, "{\"sampling\":{}}");
     var col = Collector{};
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
@@ -4991,6 +5429,7 @@ test "tools/call: a tool cannot elicit from a client that never declared it" {
 test "tools/call: a request issued from a call inherits the caller's peer" {
     var s = try serverWithCaps("{\"elicitation\":{}}");
     defer s.deinit();
+    try handshakePeer(&s, 42, "{\"elicitation\":{}}");
     var seen = false;
     try s.addTool(.{
         .name = "ask",
@@ -5198,15 +5637,15 @@ test "initialize: decodes the spec's own request verbatim (lifecycle.mdx)" {
     try feed(&s,
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true},"sampling":{},"elicitation":{"form":{},"url":{}},"tasks":{"requests":{"elicitation":{"create":{}},"sampling":{"createMessage":{}}}}},"clientInfo":{"name":"ExampleClient","title":"Example Client Display Name","version":"1.0.0","description":"An example MCP client application","icons":[{"src":"https://example.com/icon.png","mimeType":"image/png","sizes":["48x48"]}],"websiteUrl":"https://example.com"}}}
     );
-    try testing.expectEqualStrings("2025-11-25", s.negotiated_version);
-    try testing.expect(s.client_capabilities.roots);
-    try testing.expect(s.client_capabilities.roots_list_changed);
-    try testing.expect(s.client_capabilities.sampling);
-    try testing.expect(!s.client_capabilities.sampling_tools);
-    try testing.expect(!s.client_capabilities.sampling_context);
-    try testing.expect(s.client_capabilities.elicitation);
-    try testing.expect(s.client_capabilities.elicitation_form);
-    try testing.expect(s.client_capabilities.elicitation_url);
+    try testing.expectEqualStrings("2025-11-25", s.negotiatedVersion(0));
+    try testing.expect(s.clientCapabilities(0).roots);
+    try testing.expect(s.clientCapabilities(0).roots_list_changed);
+    try testing.expect(s.clientCapabilities(0).sampling);
+    try testing.expect(!s.clientCapabilities(0).sampling_tools);
+    try testing.expect(!s.clientCapabilities(0).sampling_context);
+    try testing.expect(s.clientCapabilities(0).elicitation);
+    try testing.expect(s.clientCapabilities(0).elicitation_form);
+    try testing.expect(s.clientCapabilities(0).elicitation_url);
     // The response itself cannot be byte-identical to the spec's (see
     // spec_anchor_index) -- this server's capability shape is fixed and
     // narrower (no `logging`, no `tasks`, listChanged always false).
@@ -5731,6 +6170,11 @@ test "fuzz: an arbitrary client RESPONSE never panics and always reaches the par
 fn fuzzClientResponse(_: void, smith: *std.testing.Smith) !void {
     var s = try serverWithCaps("{\"sampling\":{},\"elicitation\":{\"form\":{},\"url\":{}}}");
     defer s.deinit();
+    // Every peer this harness arms a request for must have handshaken:
+    // the capability gate is per-peer, and `smith.index(3)` picks 0..2.
+    for ([_]u64{ 1, 2, 7 }) |p| {
+        try handshakePeer(&s, p, "{\"sampling\":{},\"elicitation\":{\"form\":{},\"url\":{}}}");
+    }
     var probe: ResponseFuzzProbe = .{};
     var line: std.Io.Writer.Allocating = .init(testing.allocator);
     defer line.deinit();

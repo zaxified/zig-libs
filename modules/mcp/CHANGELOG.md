@@ -5,6 +5,50 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — Drift re-audit (window `15486ba..HEAD`, +1219 lines). Five findings, all fixed:
+
+  - **HIGH, cross-session capability grant:** `client_capabilities`, `negotiated_version` and
+    `client_initialized` were three fields on the `Server`, and a `Server` is deliberately shared —
+    `mcp-http` serves every session from one. So `initialize` from *any* peer replaced the gate for
+    *all* of them: a party that could POST opened a session, declared `elicitation`, and
+    `elicitation/create` — the phishing primitive this module documents at length — was then
+    written to a client that had declared nothing, in a revision it never negotiated. The reverse
+    handle worked too: a session declaring `capabilities:{}` revoked every other session's
+    sampling/elicitation, and the single `max_pending` budget let one session starve the rest.
+    Peer scoping already existed for response *correlation*; it now covers the handshake as well.
+    **BREAKING (minor):** the three fields are gone, replaced by `PeerState` and the accessors
+    `clientCapabilities(peer)` / `clientInitialized(peer)` / `negotiatedVersion(peer)`;
+    `max_pending` is counted per peer. New: `forgetPeer(peer)`, which a multiplexing transport
+    calls when a session ends, and `max_peers` (default 4096), which bounds what accumulates if it
+    does not.
+
+  - **HIGH, unparseable responses:** `structuredContent` was gated on a brace *count* that shared
+    one counter between `{}` and `[]`, so `{]`, `{"a":1]` and `{[}]` all read as "exactly one
+    top-level JSON object" and were spliced into the response verbatim. `allow_structured` defaults
+    to true and the spliced text is the tool's output, so **one ordinary `tools/call` against any
+    pass-through tool made the server emit a line the client cannot parse**. The check is now a
+    real `std.json` validation.
+
+  - **MEDIUM, one state and two readers:** the same count could not see a raw control character
+    inside a string — invalid JSON, which the newline-strip then *repaired* into valid JSON holding
+    a different value than the text block beside it. A tool output of `{"a":"x<LF>y"}` produced
+    `text` = `x\ny` and `structuredContent.a` = `xy`, the divergence chosen by the caller. Closed
+    by the same validation: the strip now only ever removes insignificant whitespace.
+
+  - **MEDIUM, host confusion in the elicitation URL guard:** the authority ended at the first of
+    `/?#`, per RFC 3986. The WHATWG URL Standard — which is what every browser and JS-SDK client
+    uses, i.e. the party that actually *opens* the URL — also ends it at `\`. So in
+    `http://evil.example\@localhost/` this module read the host as `localhost` (loopback, http
+    allowed) while the client navigates to `http://evil.example/` in plaintext. The delimiter set
+    now includes `\`, which also fixes the mirror-image error (a genuinely loopback
+    `http://localhost\@evil.example/` was refused).
+
+  - **LOW, a request with no response:** `notifications/initialized` was handled *before* the id
+    check, so the shape carrying an `id` mutated server state and got nothing written back —
+    against this module's own stated invariant that a request gets exactly one response. It is now
+    answered `-32600`, and a message being rejected no longer sets the flag.
+
+
 - **2026-08-22** — Two transport-boundary fixes:
   - `readLine` now discards an unterminated final line — the stream ends, or a
     cancelable read is canceled, mid-line — instead of handing the fragment

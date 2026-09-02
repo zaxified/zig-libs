@@ -21,7 +21,9 @@ MCP spec 2025-11-25.
   requested revision when supported — `2025-11-25`, `2025-06-18` — else
   answers with the latest) + server capabilities (`tools`, `listChanged:
   false`) + `serverInfo` + optional `instructions`.
-- `notifications/initialized` — accepted; sets `server.client_initialized`.
+- `notifications/initialized` — accepted; sets that peer's initialized flag
+  (`server.clientInitialized(peer)`). Sent *with* an `id` it is a malformed
+  request, not a notification, and is answered `-32600`.
 - `tools/list` — built from the registered catalog (`name`, `description`,
   `inputSchema`, optional `outputSchema`).
 - `tools/call` — dispatch by name; result = text content block +
@@ -46,8 +48,9 @@ MCP spec 2025-11-25.
   server offers any", so an empty catalog must not claim one. (Resource
   `subscribe` is not implemented — `subscribe:false` is advertised whenever
   `resources` itself is.) It also **records what the client
-  advertised** in `server.client_capabilities` — the gate on the two
-  server→client requests below.
+  advertised** in `server.clientCapabilities(peer)` — the gate on the two
+  server→client requests below. Recorded **per peer**: `initialize` is a
+  per-connection act, so one session's handshake never moves another's gate.
 - **Sampling / elicitation (server→client requests):**
   `sendSamplingRequest` (`sampling/createMessage`) and
   `sendElicitationRequest` (`elicitation/create`), plus `cancelRequest`
@@ -172,14 +175,20 @@ The answer still arrives later, so a tool that *needs* it must be two calls:
 ask on the first, act on the second. There is no third option that this
 transport can express.
 
-- **Capability-gated.** Both refuse (`error.SamplingNotSupported` /
+- **Capability-gated, per peer.** Both refuse (`error.SamplingNotSupported` /
   `error.ElicitationNotSupported`, and per-mode `Elicitation{Form,Url}NotSupported`)
-  unless the client declared it at `initialize` — the spec's MUST NOT, enforced
+  unless **that peer** declared it at `initialize` — the spec's MUST NOT, enforced
   rather than documented. Check `call.clientCapabilities()` first to avoid
-  offering a feature the client can't serve.
+  offering a feature the client can't serve. The gate used to be one set of
+  fields on the `Server`, which a multiplexing transport shares: any session
+  that could POST lifted it for every other session, and one declaring
+  `capabilities:{}` revoked everyone's.
 - **Ids are never reused**, even when a send fails. Unanswered requests are
-  capped (`max_pending`, default 256); `cancelRequest` drops one and tells the
-  client.
+  capped **per peer** (`max_pending`, default 256), so one session cannot
+  exhaust the budget of the rest; `cancelRequest` drops one and tells the
+  client. A transport that multiplexes sessions calls `forgetPeer` when one
+  ends — `Server.max_peers` (default 4096) bounds what it accumulates if it
+  does not.
 - **Peer scoping.** `RequestOptions.peer` + `handleMessageFrom` keep a response
   from resolving another connection's request — as long as the transport gives
   each connection its own handle. `mcp-http` wires each *session's* handle

@@ -141,8 +141,8 @@ wire-identical to any `EventSource`. See `oracle_vectors.zig`'s doc comment for 
 recap and provenance. `mcp` run as a black-box test oracle needs no root `NOTICE` entry (§0); no
 `mcp_dart`, the official SDK, or any other MCP-transport source was ported or copied.
 
-**30 tests total**, of which 5 are the oracle replays above and 3 came from the 2026-08-11
-peer-scoping pass. (Earlier revisions of this line said "26 (18 + 8)" — a hand-kept split that had
+**35 tests total**, of which 5 are the oracle replays above, 3 came from the 2026-08-11
+peer-scoping pass and 1 from the 2026-09-02 `mcp` per-peer-state follow-on. (Earlier revisions of this line said "26 (18 + 8)" — a hand-kept split that had
 already drifted from the tree; the total is now the counted one, and `scripts/dark-tests.sh`
 asserts every declared test actually runs.) Run: `zig build test-mcp-http`.
 

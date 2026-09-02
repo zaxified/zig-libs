@@ -45,8 +45,12 @@ the zig-libs authors (MIT).
   arguments validated by the server (-32602) before the handler runs. Every handler receives the
   opaque `ctx` given at registration — **server = transport, app = primitives** is the split this
   module enforces. `tools/call` results carry a text content block plus `structuredContent` only
-  when the tool allows it and its output is structurally a single top-level JSON object (a
-  brace-matcher rejects NDJSON/arrays); `isError:true` marks a tool failure.
+  when the tool allows it and its output **validates as** a single top-level JSON object (NDJSON,
+  arrays and anything malformed are rejected); `isError:true` marks a tool failure. The check is
+  `std.json`'s, not a brace count: a count cannot tell `{` from `[`, so `{]` read as one balanced
+  object and was spliced verbatim into a response no client could parse, and it cannot see a raw
+  control character inside a string, so the newline-strip silently rewrote such a value into one
+  that disagreed with the text block beside it (re-audit F10/F13).
 - **Never-panic error policy.** Malformed input becomes the proper JSON-RPC error (-32700/-32600/
   -32601/-32602/-32603, plus MCP's -32002 for an unresolvable `resources/read` uri), never a panic
   or a Zig error; only OOM and transport write-failure surface as `error` from `handleMessage`. A
@@ -71,12 +75,16 @@ the zig-libs authors (MIT).
   inbound response (`id` + `result`/`error`, no `method`), matches the pending table and invokes the
   registered `ResponseHandler`, writing **nothing** — JSON-RPC forbids answering a response, and
   answering with the same id would loop. Consequence a consumer must design around: a tool that
-  needs the answer is two calls (ask, then act). Pending entries are capped (`max_pending`);
+  needs the answer is two calls (ask, then act). Pending entries are capped per peer (`max_pending`);
   `cancelRequest` drops one and emits `notifications/cancelled`. **This fixed a live bug**: before
   this, a client's response hit the "Missing method" branch and got a -32600 *reply*.
-- **Capabilities are stored, not just parsed.** `initialize` records `client_capabilities` (and
-  `negotiated_version`), replacing any prior set wholesale, and all-false before a handshake — so a
-  server fails closed. A capability is granted only by **the JSON shape the spec defines** (each
+- **Capabilities are stored per peer, not just parsed.** `initialize` records that peer's
+  capabilities (and negotiated revision) in its `PeerState`, replacing any prior set wholesale, and
+  all-false before a handshake — so a server fails closed. **Per peer** because `initialize` is a
+  per-connection act and a `Server` is shared: as three fields on the `Server` they were global, so
+  any session that could POST could declare `elicitation` and lift the gate for every other session
+  — `elicitation/create` written to a client that had declared nothing, in a revision it never
+  negotiated — while one declaring `capabilities:{}` revoked everyone else's (re-audit F11). A capability is granted only by **the JSON shape the spec defines** (each
   capability an object; `roots.listChanged` a bool), never by "something is present": a malformed
   declaration such as `{"elicitation":true}` or `{"elicitation":"url"}` grants nothing at all. (The
   latter used to grant *form* mode and deny url — the inverse of the declaration, and the
@@ -87,7 +95,10 @@ the zig-libs authors (MIT).
   is parsed on a per-message arena, so echoing it back would dangle in `negotiated_version`.
 - **Peer scoping.** `handleMessageFrom(msg, out, peer)` correlates a response only to a pending
   request issued to the *same* peer; `handleMessage` is `peer = 0`. Not a wildcard in either
-  direction. The check compares two handles and nothing else, so **it is exactly as good as the
+  direction. Scoping covers the **handshake state and the pending budget** as well as correlation
+  (`PeerState`, `max_pending` counted per peer, `forgetPeer` when a session ends, `max_peers`
+  bounding a transport that forgets to). Until 2026-09-02 it covered correlation alone, and this
+  bullet's "peer scoping" heading was read — including by this file — as if it covered the gate. The check compares two handles and nothing else, so **it is exactly as good as the
   transport's peer assignment** — it cannot separate two clients a transport has given the same
   handle. A multiplexing transport must therefore supply a per-client handle: `mcp-http` does when
   a `Sessions` registry is configured, and when one is not (its stateless mode, where every POST
@@ -114,7 +125,8 @@ callers, rate-limit, or sandbox tool handlers — a registered tool runs with th
 privileges, so exposing it (especially over HTTP) is the caller's trust decision. It hardens the
 framing/parse surface (malformed JSON, wrong types, batch arrays, stray notifications, an invalid
 registered schema literal → -32603 not a crash; a bounded per-message arena; the `structuredContent`
-structural re-check so a text/error blob never emits invalid structure). Out of scope: MCP
+structural re-check — a real JSON validation — so a text/error blob never emits invalid
+structure). Out of scope: MCP
 client/host roles, roots, subscriptions and list-change notifications, pagination, and
 the HTTP/SSE session transport (the sibling `mcp-http` module). Also out of scope within the
 sampling/elicitation surface: sampling-with-tools (`tools`/`toolChoice` and the tool-use/tool-result
@@ -135,9 +147,14 @@ is pinned). **Its limits are real**: it matches names only — not the free-text
 and not what the value is later used for — so it stops the accident, not the adversary. The
 structural mitigation is `.url` mode, whose URL is scheme-checked (https, or http for loopback only)
 so `javascript:`/`data:`/`file:` payloads never reach a client that is about to open them. The
-loopback allowance compares the **parsed authority's host** — userinfo stripped at the last `@`,
-IPv6 literals kept bracketed, port digits only — so neither `http://localhost:8080@evil.example/`
-nor `http://localhost.evil.example/` is loopback (the first was accepted before re-audit F3). Every
+loopback allowance compares the **parsed authority's host** — authority ended at the first of
+`/?#\`, userinfo stripped at the last `@`, IPv6 literals kept bracketed, port digits only — so
+neither `http://localhost:8080@evil.example/` nor `http://localhost.evil.example/` is loopback (the
+first was accepted before re-audit F3). The backslash is in that delimiter set because the party
+that opens the URL is the **client** — a browser or JS runtime, all of which parse by the WHATWG URL
+Standard, where `\` ends the authority. Reading `http://evil.example\@localhost/` the RFC 3986 way
+makes its host `localhost`; the client that opens it goes to `evil.example` over plaintext
+(re-audit F12). Agreeing with the parser that acts on the answer beats agreeing with the RFC. Every
 other URL-safety rule in the spec (no credentials in the URL, no pre-authenticated links, verifying
 that the user who opens it is the user it was minted for) is the application's, not this module's.
 
