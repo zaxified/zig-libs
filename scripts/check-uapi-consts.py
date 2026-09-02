@@ -126,10 +126,29 @@ MODULES = {
         "headers": [
             "/usr/include/linux/nl80211.h",
             "/usr/include/linux/genetlink.h",
+            "/usr/include/linux/if.h",
         ],
-        "prefixes": ["NL80211_", "GENL_"],
-        # same shape as ethtool above; see the devlink entry for the fix pattern.
-        "unresolved_budget": 25,
+        # `""` reaches the `CTRL_ATTR_*`/`CTRL_ATTR_MCAST_GRP_*` families in
+        # genetlink.h, which carry no `NL80211`/`GENL` prefix.
+        "prefixes": ["NL80211_", "GENL_", ""],
+        # Read out of `/usr/include/linux/nl80211.h`, not guessed: the
+        # regulatory-rule attributes live in the kernel's flat `NL80211_ATTR_`
+        # namespace, and the two regulatory enums have their own spellings.
+        "namespace_aliases": {
+            "REG_RULE_ATTR": "ATTR",
+            "DfsRegion": "DFS",
+            "RegType": "REGDOM_TYPE",
+        },
+        "member_aliases": {
+            "ifnamsiz": "IFNAMSIZ",
+        },
+        # Repo-local constants with no kernel spelling on this host:
+        # `family_version` (the genl family version this module speaks, not an
+        # ABI macro), `pmk_len` and `max_ssid_len` (802.11 spec constants —
+        # `IEEE80211_MAX_SSID_LEN` and `WLAN_PMK_LEN` live in the kernel tree's
+        # `ieee80211.h`, which is not exported to `/usr/include/linux`).
+        # If this number grows, something stopped being checked.
+        "unresolved_budget": 3,
     },
     "devlink": {
         "zig_files": ["modules/devlink/src/uapi.zig"],
@@ -158,10 +177,36 @@ MODULES = {
             "/usr/include/linux/netfilter/nf_conntrack_common.h",
             "/usr/include/linux/netfilter/nf_conntrack_tcp.h",
             "/usr/include/linux/netfilter/nfnetlink.h",
+            "/usr/include/linux/in.h",
+            "/usr/include/linux/in6.h",
+            # glibc, not the kernel: `AF_*`/`PF_*` are not in `linux/socket.h`.
+            # A host without this exact path loses two constants to the
+            # unresolved bucket, which fails the budget — the right way round.
+            "/usr/include/x86_64-linux-gnu/bits/socket.h",
         ],
         "prefixes": [""],
-        # repo-local sizing constants and a few names this host's headers do not carry.
-        "unresolved_budget": 23,
+        # ⚠ The comment that used to sit here said these were "repo-local sizing
+        # constants and a few names this host's headers do not carry". 22 of the
+        # 23 had a kernel spelling all along — the third module in a row whose
+        # unresolved bucket was written off rather than read (2026-09-02).
+        "namespace_aliases": {
+            "TcpState": "TCP_CONNTRACK",
+            "IPPROTO": "IPPROTO",
+            "Family": "PF",
+        },
+        "member_aliases": {
+            # The kernel puts the width before the field, this repo after it.
+            "CTA_COUNTERS.PACKETS32": "CTA_COUNTERS32_PACKETS",
+            "CTA_COUNTERS.BYTES32": "CTA_COUNTERS32_BYTES",
+            # The socket families are `PF_INET`/`PF_INET6`, not `PF_IPV4`.
+            "Family.ipv4": "PF_INET",
+            "Family.ipv6": "PF_INET6",
+        },
+        # `nfgenmsg_len` is a repo-local sizing constant, and
+        # `TcpState.syn_sent2` is a `#define` whose right-hand side is another
+        # identifier (`TCP_CONNTRACK_LISTEN`), which the header parser does not
+        # chase. If this number grows, something stopped being checked.
+        "unresolved_budget": 2,
     },
     "netlink": {
         # `bridge.zig`'s ~100 hand-transcribed AF_BRIDGE constants (audit
