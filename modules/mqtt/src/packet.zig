@@ -1158,3 +1158,52 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         off += d.consumed;
     }
 }
+
+/// Aim canary for `fuzzDecode`, and the reason it needs one: the harness above
+/// advertises that it "advances over a stream the way a real reader loop
+/// would", but 256 uniform random bytes are malformed at packet one with
+/// overwhelming probability, so the multi-packet path was reached essentially
+/// never. This drives the same loop over a stream of REAL back-to-back packets
+/// and asserts it walked all of them — so if the walk stops working, or stops
+/// being reached, a named test says so rather than the fuzzer silently
+/// covering one byte.
+fn walkStream(bytes: []const u8) !usize {
+    var off: usize = 0;
+    var count: usize = 0;
+    while (off < bytes.len) {
+        const decoded = try decode(bytes[off..]);
+        const d = decoded orelse break;
+        off += d.consumed;
+        count += 1;
+    }
+    return count;
+}
+
+test "fuzzDecode's stream walk is reachable and correct on real back-to-back packets" {
+    var buf: [512]u8 = undefined;
+    var n: usize = 0;
+    n += (try encodePingreq(buf[n..])).len;
+    n += (try encodePublish(buf[n..], .{
+        .topic = "a/b",
+        .payload = "hi",
+        .qos = .at_most_once,
+    })).len;
+    n += (try encodeSubscribe(buf[n..], 7, &.{.{ .filter = "a/#", .qos = .at_least_once }})).len;
+    n += (try encodePingresp(buf[n..])).len;
+
+    try testing.expectEqual(@as(usize, 4), try walkStream(buf[0..n]));
+
+    // A truncated tail stops the walk cleanly rather than looping or erroring
+    // — the `need more data` outcome the real reader loop depends on.
+    try testing.expectEqual(@as(usize, 3), try walkStream(buf[0 .. n - 1]));
+
+    // And the fuzz harness's own body over the same bytes reaches every one.
+    var off: usize = 0;
+    var walked: usize = 0;
+    while (off < n) {
+        const d = ((try decode(buf[off..n])) orelse break);
+        off += d.consumed;
+        walked += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), walked);
+}

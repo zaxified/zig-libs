@@ -26,7 +26,13 @@ allow-all). PUBLISH fan-out at min(publisher QoS, granted QoS), one copy per con
 granted QoS among overlapping filters; QoS 0 fire-and-forget, QoS 1 inbound→immediate PUBACK,
 outbound→packet-id allocated in the *subscriber's* id space tracked pending until PUBACK; retained
 store (empty payload clears, delivered right after SUBACK). The global spinlock guards only short
-registry mutations and the fan-out *snapshot* — never a socket write; each connection has its own
+registry mutations and the fan-out *snapshot* — never a socket write. ⚠ That was **false for
+SUBSCRIBE** until 2026-09-03: the retained walk ran once per filter in the packet, duplicates
+included, snapshotting the whole store each time under the lock. Measured on a quarter-full default
+store: 261 bytes in, 67 MB and 131 074 PUBLISH packets out, 3 s of one core with the lock held —
+and `Broker.mutex` is a pure spinlock with no yield, so every other handler thread burns a core
+waiting. The walk is now de-duplicated per packet and bounded by `max_retained_deliveries` /
+`max_retained_bytes`; each connection has its own
 `tx_lock`, and fan-out readers reference-count targets so a mid-fan-out disconnect never writes to
 freed memory; a per-subscriber delivery failure is contained to that subscriber. Same caller-driven
 socket-free seam as the client, reversed; `TcpServer` is an optional `std.Io.net` accept loop
@@ -119,7 +125,11 @@ encoder reproduction plus real-broker decode); and this module's own `Broker`, l
 `paho` (QoS 0/1 fan-out with the RETAIN bit correctly cleared on a live delivery — a case no prior
 offline test asserted — retain-before-subscribe, and the documented QoS-2-tears-the-connection-down
 behavior against a genuine client). A real, reported (not "fixed") finding: `amqtt` does not perform
-the spec 3.3.5 QoS-downgrade-on-delivery that this module's own `Broker` does. See the file's doc
+the spec 3.3.5 QoS-downgrade-on-delivery that this module's own `Broker` does. ⚠ The captures
+**cannot** anchor our own downgrade: every publish in them has publisher QoS equal to granted QoS,
+so §3.3.5 is never exercised and mutating `minQos` away leaves all eight golden tests green. Only
+the in-tree test catches it. Genuine anchor, no discrimination on that property — see the file's
+doc comment. See the file's doc
 comment for capture provenance and attribution (root `NOTICE` §0 — black-box oracle, no source
 consulted).
 

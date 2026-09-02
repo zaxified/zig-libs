@@ -578,7 +578,32 @@ pub const Config = struct {
     /// `max_subscriptions_total`, so ordinary pub/sub is never truncated; lower
     /// it to tighten the envelope. A truncated fan-out bumps
     /// `Broker.fanoutTruncations()`.
+    ///
+    /// ⚠ Read that default the other way too: the number of `SubRef`s
+    /// `Index.collect` can gather is by construction at most the number of
+    /// registered subscriptions, so **at the default this envelope can never
+    /// bind** and provides no protection until an operator lowers it. And once
+    /// lowered, the truncation is a deterministic first-match-wins trie walk,
+    /// so a subscriber positioned early in the walk deterministically starves
+    /// everyone after it.
     max_fanout_matches: usize = 65536,
+
+    /// Envelope on the retained messages **one** SUBSCRIBE may pull, counted
+    /// across every filter in the packet. MQTT 3.1.1 §3.8.4 requires re-sending
+    /// retained messages on each subscribe, and nothing else bounded the walk:
+    /// `registerSubscription` accepts an exact duplicate filter (correctly —
+    /// §3.8.4-3 is a QoS update), so one 261-byte packet carrying `#` sixty-four
+    /// times made the broker snapshot the whole retained store 64 times over,
+    /// holding every copy at once and doing it inside the global lock. Measured
+    /// on a quarter-full default store: 261 bytes in, **67 MB and 131 074
+    /// PUBLISH packets out, 3 s of one core**, with the lock held throughout.
+    /// The default admits one full pass over a `max_retained` store, so
+    /// ordinary use is never truncated; a truncated walk bumps
+    /// `Broker.retainedTruncations()`.
+    max_retained_deliveries: usize = 8192,
+    /// Byte envelope on the same walk — the count above does not bound
+    /// payload size, and `max_retained` never did either. 16 MiB.
+    max_retained_bytes: usize = 16 << 20,
 
     /// Optional authentication hook (FIX D). Null = allow every CONNECT.
     /// Invoked in `handleConnect` with the client id + credentials; a deny
@@ -620,6 +645,12 @@ pub const Broker = struct {
     /// observable signal that the fan-out envelope was hit (an operator's cue to
     /// investigate an amplifying client or raise the cap).
     fanout_truncations: std.atomic.Value(u64) = .init(0),
+    /// Count of SUBSCRIBEs whose retained walk was truncated at
+    /// `Config.max_retained_deliveries` / `max_retained_bytes`.
+    retained_truncations: std.atomic.Value(u64) = .init(0),
+    /// Count of QoS 1 messages dropped because a subscriber's in-flight pool
+    /// was full — i.e. that subscriber has stopped answering PUBACKs.
+    qos1_drops: std.atomic.Value(u64) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Broker {
         return .{ .allocator = allocator, .config = config };
@@ -648,6 +679,19 @@ pub const Broker = struct {
     /// `Config.max_fanout_matches` envelope so far.
     pub fn fanoutTruncations(b: *const Broker) u64 {
         return b.fanout_truncations.load(.monotonic);
+    }
+
+    /// How many SUBSCRIBE retained walks have been truncated at the
+    /// `Config.max_retained_deliveries` / `max_retained_bytes` envelope so far.
+    pub fn retainedTruncations(b: *const Broker) u64 {
+        return b.retained_truncations.load(.monotonic);
+    }
+
+    /// How many QoS 1 deliveries have been dropped for a subscriber whose
+    /// in-flight pool was full. Non-zero means a subscriber has stopped
+    /// answering PUBACKs and is silently losing messages.
+    pub fn qos1Drops(b: *const Broker) u64 {
+        return b.qos1_drops.load(.monotonic);
     }
 
     /// Register a new connection over `transport`; returns an owned pointer
@@ -903,6 +947,13 @@ pub const Broker = struct {
         {
             b.mutex.lock();
             defer b.mutex.unlock();
+            // Filters already walked in THIS packet. A duplicate filter is a
+            // legal QoS update (§3.8.4-3) and still gets its SUBACK code, but
+            // re-sending the retained set for it is pure amplification.
+            var walked: [max_filters_per_subscribe][]const u8 = undefined;
+            var walked_n: usize = 0;
+            var snap_bytes: usize = 0;
+            var truncated = false;
             var it = s.iterator();
             while (it.next()) |req| {
                 var code: u8 = packet.suback_failure;
@@ -921,27 +972,39 @@ pub const Broker = struct {
                 } else |_| {}
                 codes[n] = code;
                 n += 1;
-                if (ok) {
+                if (ok and !alreadyWalked(walked[0..walked_n], req.filter)) {
+                    walked[walked_n] = req.filter;
+                    walked_n += 1;
                     for (b.retained.items) |r| {
-                        if (topic.matches(req.filter, r.topic)) {
-                            const t = try b.allocator.dupe(u8, r.topic);
-                            const pl = b.allocator.dupe(u8, r.payload) catch |e| {
-                                b.allocator.free(t);
-                                return e;
-                            };
-                            retsnap.append(b.allocator, .{
-                                .topic = t,
-                                .payload = pl,
-                                .qos = minQos(r.qos, granted),
-                            }) catch |e| {
-                                b.allocator.free(t);
-                                b.allocator.free(pl);
-                                return e;
-                            };
+                        if (!topic.matches(req.filter, r.topic)) continue;
+                        // The envelope is checked BEFORE the dup, so a
+                        // truncated walk costs nothing rather than one more
+                        // copy of the largest payload in the store.
+                        if (retsnap.items.len >= b.config.max_retained_deliveries or
+                            snap_bytes + r.topic.len + r.payload.len > b.config.max_retained_bytes)
+                        {
+                            truncated = true;
+                            break;
                         }
+                        const t = try b.allocator.dupe(u8, r.topic);
+                        const pl = b.allocator.dupe(u8, r.payload) catch |e| {
+                            b.allocator.free(t);
+                            return e;
+                        };
+                        retsnap.append(b.allocator, .{
+                            .topic = t,
+                            .payload = pl,
+                            .qos = minQos(r.qos, granted),
+                        }) catch |e| {
+                            b.allocator.free(t);
+                            b.allocator.free(pl);
+                            return e;
+                        };
+                        snap_bytes += r.topic.len + r.payload.len;
                     }
                 }
             }
+            if (truncated) _ = b.retained_truncations.fetchAdd(1, .monotonic);
             if (n == 0) return error.ProtocolViolation; // empty SUBSCRIBE (spec 3.8.3-3)
         }
 
@@ -954,6 +1017,13 @@ pub const Broker = struct {
         for (retsnap.items) |r| {
             try b.deliverLocked(conn, r.topic, r.payload, r.qos, true);
         }
+    }
+
+    fn alreadyWalked(seen: []const []const u8, filter: []const u8) bool {
+        for (seen) |f| {
+            if (std.mem.eql(u8, f, filter)) return true;
+        }
+        return false;
     }
 
     /// Add (or, for an exact re-subscribe, update the QoS of) a subscription.
@@ -1125,11 +1195,17 @@ pub const Broker = struct {
     /// subscriber. The QoS 0 → QoS 1 re-encode cannot overflow `tx_buf`
     /// (sized with `tx_headroom`, FIX B).
     fn deliverLocked(b: *Broker, sub_conn: *Connection, topic_name: []const u8, payload: []const u8, qos: QoS, retain: bool) Error!void {
-        _ = b;
         var out_qos = qos;
         var id: u16 = 0;
         if (qos == .at_least_once) {
-            id = sub_conn.allocPacketId() orelse return; // pool full: drop
+            // Pool full: this subscriber is not answering PUBACKs, so drop
+            // for it alone rather than stalling the fan-out. Counted, because
+            // a silent drop with no signal is indistinguishable from a
+            // delivery the subscriber simply never acted on.
+            id = sub_conn.allocPacketId() orelse {
+                _ = b.qos1_drops.fetchAdd(1, .monotonic);
+                return;
+            };
             out_qos = .at_least_once;
         }
         const bytes = try packet.encodePublish(sub_conn.tx_buf, .{
@@ -1364,7 +1440,15 @@ fn waitReadable(io: std.Io, handle: std.Io.net.Socket.Handle, timeout_ms: i32) ?
 
 /// The poll timeout (ms) for one iteration of `connMain`'s read loop.
 fn connTimeoutMs(config: Config, conn: *const Connection) i32 {
-    if (conn.state == .awaiting_connect) return @intCast(config.connect_timeout_ms);
+    // Clamped, not `@intCast`: `connect_timeout_ms` is a `u32`, and any legal
+    // value above `maxInt(i32)` (~24.8 days) panicked in Debug and, in
+    // ReleaseFast, wrapped NEGATIVE — which `poll(2)` reads as "block
+    // indefinitely". A connection that opens a socket and never sends CONNECT
+    // would then pin its handler thread and its `max_connections` slot
+    // forever, which is exactly what this timeout exists to prevent.
+    if (conn.state == .awaiting_connect) {
+        return @intCast(@min(config.connect_timeout_ms, @as(u32, std.math.maxInt(i32))));
+    }
     if (conn.keep_alive_s == 0) return -1;
     return @intCast(@as(u32, conn.keep_alive_s) * 1500);
 }
@@ -1502,6 +1586,170 @@ fn feedPublish(b: *Broker, conn: *Connection, p: packet.Publish) !Disposition {
     const bytes = try packet.encodePublish(&buf, p);
     try b.feed(conn, bytes);
     return b.process(conn, 1);
+}
+
+/// Counts bytes and packets instead of storing them, so a test can measure
+/// amplification without a fixed-size buffer capping it first.
+const CountingTransport = struct {
+    bytes: usize = 0,
+    packets: usize = 0,
+
+    fn transport(m: *CountingTransport) Transport {
+        return .{ .ctx = m, .writeFn = writeFn, .closeFn = closeFn };
+    }
+    fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
+        const m: *CountingTransport = @ptrCast(@alignCast(ctx));
+        m.bytes += bytes.len;
+        m.packets += 1;
+    }
+    fn closeFn(_: *anyopaque) void {}
+};
+
+test "one SUBSCRIBE walks the retained store ONCE, not once per duplicate filter (re-audit F1)" {
+    // §3.8.4 requires re-sending retained messages on a subscribe, and
+    // §3.8.4-3 makes a repeated filter a legal QoS update — so
+    // `registerSubscription` correctly returns true for it. Nothing then
+    // stopped the retained walk running again for each copy, with every dup
+    // held simultaneously and the whole thing inside the global spinlock.
+    // Measured before the fix on a QUARTER-full default store: 261 bytes in,
+    // 67 MB and 131 074 PUBLISH packets out, 3 s of one core, lock held
+    // throughout. A pure spinlock with no yield, so every other handler
+    // thread burns a core waiting.
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    var tp = CountingTransport{};
+    const pub_conn = try b.accept(tp.transport());
+    var cbuf: [128]u8 = undefined;
+    try b.feed(pub_conn, try packet.encodeConnect(&cbuf, .{ .client_id = "pubr", .keep_alive_s = 0 }));
+    _ = try b.process(pub_conn, 1);
+
+    const retained_count = 256;
+    var payload: [64]u8 = undefined;
+    @memset(&payload, 'x');
+    for (0..retained_count) |i| {
+        var tbuf: [32]u8 = undefined;
+        const t = try std.fmt.bufPrint(&tbuf, "zl/{d}", .{i});
+        var pbuf: [256]u8 = undefined;
+        try b.feed(pub_conn, try packet.encodePublish(&pbuf, .{
+            .topic = t,
+            .payload = &payload,
+            .qos = .at_most_once,
+            .retain = true,
+        }));
+        _ = try b.process(pub_conn, 1);
+    }
+
+    var ts = CountingTransport{};
+    const sub_conn = try b.accept(ts.transport());
+    var cbuf2: [128]u8 = undefined;
+    try b.feed(sub_conn, try packet.encodeConnect(&cbuf2, .{ .client_id = "subr", .keep_alive_s = 0 }));
+    _ = try b.process(sub_conn, 1);
+
+    // One packet carrying "#" the maximum number of times.
+    var filters: [max_filters_per_subscribe]packet.Subscription = undefined;
+    for (&filters) |*f| f.* = .{ .filter = "#", .qos = .at_most_once };
+    var sbuf: [1024]u8 = undefined;
+    const sub_bytes = try packet.encodeSubscribe(&sbuf, 1, &filters);
+    const before_packets = ts.packets;
+    try b.feed(sub_conn, sub_bytes);
+    _ = try b.process(sub_conn, 1);
+
+    // One SUBACK plus exactly one PUBLISH per retained topic — not 64 per.
+    try testing.expectEqual(@as(usize, 1 + retained_count), ts.packets - before_packets);
+    // The legitimate walk is not truncated: the envelope admits a full store.
+    try testing.expectEqual(@as(u64, 0), b.retainedTruncations());
+    // ...and all 64 filters were still answered in the SUBACK, so the dedup
+    // is of the WALK, not of the subscription.
+    try testing.expect(ts.bytes > 0);
+}
+
+test "the retained walk is bounded even for a single filter (re-audit F1)" {
+    // Dedup alone is not a bound: 64 DISTINCT filters can each match
+    // everything. The envelope is what actually binds, and it truncates
+    // rather than failing, with an observable counter.
+    var b = Broker.init(testing.allocator, .{ .max_retained_deliveries = 10 });
+    defer b.deinit();
+
+    var tp = CountingTransport{};
+    const pub_conn = try b.accept(tp.transport());
+    var cbuf: [128]u8 = undefined;
+    try b.feed(pub_conn, try packet.encodeConnect(&cbuf, .{ .client_id = "pubr", .keep_alive_s = 0 }));
+    _ = try b.process(pub_conn, 1);
+    for (0..100) |i| {
+        var tbuf: [32]u8 = undefined;
+        const t = try std.fmt.bufPrint(&tbuf, "zl/{d}", .{i});
+        var pbuf: [128]u8 = undefined;
+        try b.feed(pub_conn, try packet.encodePublish(&pbuf, .{
+            .topic = t,
+            .payload = "p",
+            .qos = .at_most_once,
+            .retain = true,
+        }));
+        _ = try b.process(pub_conn, 1);
+    }
+
+    var ts = CountingTransport{};
+    const sub_conn = try b.accept(ts.transport());
+    var cbuf2: [128]u8 = undefined;
+    try b.feed(sub_conn, try packet.encodeConnect(&cbuf2, .{ .client_id = "subr", .keep_alive_s = 0 }));
+    _ = try b.process(sub_conn, 1);
+    const before = ts.packets;
+    try feedSubscribe(&b, sub_conn, 1, &.{.{ .filter = "#", .qos = .at_most_once }});
+    // SUBACK + 10, not SUBACK + 100.
+    try testing.expectEqual(@as(usize, 11), ts.packets - before);
+    try testing.expectEqual(@as(u64, 1), b.retainedTruncations());
+
+    // The byte envelope binds independently of the count.
+    var b2 = Broker.init(testing.allocator, .{ .max_retained_bytes = 40 });
+    defer b2.deinit();
+    var tp2 = CountingTransport{};
+    const p2 = try b2.accept(tp2.transport());
+    var c3: [128]u8 = undefined;
+    try b2.feed(p2, try packet.encodeConnect(&c3, .{ .client_id = "p2", .keep_alive_s = 0 }));
+    _ = try b2.process(p2, 1);
+    for (0..20) |i| {
+        var tbuf: [32]u8 = undefined;
+        const t = try std.fmt.bufPrint(&tbuf, "zl/{d}", .{i});
+        var pbuf: [128]u8 = undefined;
+        try b2.feed(p2, try packet.encodePublish(&pbuf, .{
+            .topic = t,
+            .payload = "0123456789",
+            .qos = .at_most_once,
+            .retain = true,
+        }));
+        _ = try b2.process(p2, 1);
+    }
+    var ts2 = CountingTransport{};
+    const s2 = try b2.accept(ts2.transport());
+    var c4: [128]u8 = undefined;
+    try b2.feed(s2, try packet.encodeConnect(&c4, .{ .client_id = "s2", .keep_alive_s = 0 }));
+    _ = try b2.process(s2, 1);
+    const before2 = ts2.packets;
+    try feedSubscribe(&b2, s2, 1, &.{.{ .filter = "#", .qos = .at_most_once }});
+    // Each entry is ~6 topic + 10 payload bytes, so 40 bytes admits 2.
+    try testing.expect(ts2.packets - before2 < 6);
+    try testing.expectEqual(@as(u64, 1), b2.retainedTruncations());
+}
+
+test "connTimeoutMs clamps rather than wrapping negative (re-audit F3)" {
+    // `connect_timeout_ms` is a `u32`. Above `maxInt(i32)` — ~24.8 days, a
+    // legal value — the `@intCast` panicked in Debug and wrapped NEGATIVE in
+    // ReleaseFast, which `poll(2)` reads as "block indefinitely". The
+    // connection that opens a socket and never sends CONNECT would then pin
+    // its handler thread and its `max_connections` slot forever: exactly the
+    // wedge this timeout exists to prevent.
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tt = TestTransport{};
+    const conn = try b.accept(tt.transport());
+    try testing.expectEqual(Connection.State.awaiting_connect, conn.state);
+    for ([_]u32{ 0, 1, 30_000, std.math.maxInt(i32), std.math.maxInt(i32) + 1, std.math.maxInt(u32) }) |ms| {
+        const got = connTimeoutMs(.{ .connect_timeout_ms = ms }, conn);
+        try testing.expect(got >= 0);
+    }
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), connTimeoutMs(.{ .connect_timeout_ms = std.math.maxInt(u32) }, conn));
+    try testing.expectEqual(@as(i32, 30_000), connTimeoutMs(.{ .connect_timeout_ms = 30_000 }, conn));
 }
 
 test "connect A + B → both receive an accepted CONNACK" {

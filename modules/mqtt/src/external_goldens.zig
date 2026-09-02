@@ -74,9 +74,18 @@
 //! `zig_client_vs_amqtt.pub_q0_echo` below (flags encode QoS 1, though our
 //! client published at QoS 0 and `amqtt` granted QoS 1 — `min(0,1)` should
 //! be 0). This module's own `Broker` does NOT share that defect — its
-//! `fanout` computes `minQos(pub_pkt.qos, target.qos)` and the sibling
-//! `paho_vs_zig_broker` capture below shows byte-exact correct downgrade
-//! behavior against a real client. The golden below freezes what `amqtt`
+//! `fanout` computes `minQos(pub_pkt.qos, target.qos)`. ⚠ An earlier revision
+//! of this sentence credited the sibling `paho_vs_zig_broker` capture with
+//! showing that downgrade "byte-exact against a real client". **It cannot.**
+//! Its two subscriptions are `zl/pb0`@QoS0 and `zl/pb1`@QoS1 and its two
+//! publishes are QoS 0 to `zl/pb0` and QoS 1 to `zl/pb1` — `min(0,0)` and
+//! `min(1,1)`, so publisher QoS never differs from granted QoS and §3.3.5 is
+//! never exercised. Mutating `minQos(pub_pkt.qos, t.qos)` to `t.qos` leaves
+//! every golden here GREEN; only the in-tree `subscribe sport/# …` test goes
+//! red. The capture is genuine and its RETAIN-clearing teeth are real — it is
+//! the only thing in the module that catches that bit — but a corpus
+//! collected to record what a real client sent cannot express an input the
+//! module refuses, and this is that gap. The golden below freezes what `amqtt`
 //! actually sent (a factual record of real wire bytes), not an endorsement
 //! that the behavior is spec-conformant — see the inline comment at its use.
 //!
