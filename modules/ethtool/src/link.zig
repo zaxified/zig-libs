@@ -25,7 +25,7 @@ pub const Error = codec.Error || error{OutOfMemory};
 /// What the `build*` encoders below can fail with: `header.Error` for the
 /// request header (an impossible device name is caught locally), plus whatever
 /// the attribute appenders raise.
-pub const BuildError = Error || header.Error;
+pub const BuildError = bitset.BuildError || header.Error;
 
 // ── LINKINFO ───────────────────────────────────────────────────────────────
 
@@ -211,7 +211,7 @@ pub fn appendLinkModesSet(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     set: LinkModesSet,
-) bitset.Error!void {
+) bitset.BuildError!void {
     // Attribute order carries no meaning to the kernel, but this one matches
     // what `ethtool -s <dev> speed … duplex … autoneg …` emits, so the golden
     // comparison is a plain byte compare instead of a set comparison.

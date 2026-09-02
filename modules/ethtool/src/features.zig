@@ -132,7 +132,7 @@ pub fn appendSetByName(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     entries: []const bitset.NamedValue,
-) Error!void {
+) bitset.BuildError!void {
     try bitset.appendNamedValues(gpa, list, uapi.FEATURES.WANTED, entries);
 }
 
@@ -142,12 +142,12 @@ pub fn appendSetByIndex(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     entries: []const bitset.IndexedValue,
-) Error!void {
+) bitset.BuildError!void {
     try bitset.appendIndexedValues(gpa, list, uapi.FEATURES.WANTED, entries);
 }
 
 /// What the `build*` encoders below can fail with.
-pub const BuildError = Error || header.Error;
+pub const BuildError = bitset.BuildError || header.Error;
 
 /// Encode a complete `ETHTOOL_MSG_FEATURES_GET` request — `nlmsghdr`,
 /// `genlmsghdr` and header nest, owned by the caller and freed with `gpa`.
@@ -279,9 +279,15 @@ pub const SetResult = struct {
     /// Same as `honouredAt`, by name. Only answerable when the reply used
     /// verbose bitsets — `ethtool` itself asks for compact ones here, so a
     /// caller that wants names must not set `compact_bitsets` on the SET.
-    pub fn honouredByName(r: SetResult, name: []const u8) bool {
+    ///
+    /// `null` means *unanswerable*, not *honoured*: a compact reply carries no
+    /// names, so the question cannot be put to it. Returning `bool` here made
+    /// a reply that had refused everything report every feature as honoured —
+    /// fail-open, and the opposite of what its sibling `isSetByName` (also
+    /// `?bool`) does with the same reply (W2 re-audit 2026-09-02, `ethtool` F4).
+    pub fn honouredByName(r: SetResult, name: []const u8) ?bool {
         const b = r.unhonoured orelse return true;
-        const bits = b.bits orelse return true;
+        const bits = b.bits orelse return null;
         for (bits) |bit| {
             if (bit.name) |n| {
                 if (std.mem.eql(u8, n, name)) return false;
@@ -422,8 +428,8 @@ test "SET reply: a verbose reply answers by name" {
     });
     var r = try parseSetResult(gpa, list.items);
     defer r.deinit(gpa);
-    try testing.expect(!r.honouredByName("tx-tcp-segmentation"));
-    try testing.expect(r.honouredByName("rx-gro")); // never mentioned
+    try testing.expect(r.honouredByName("tx-tcp-segmentation") == false);
+    try testing.expect(r.honouredByName("rx-gro") == true); // never mentioned
 }
 
 test "SET request encodes the -K shape: named bits, no NOMASK" {
@@ -460,4 +466,24 @@ test "a truncated feature reply is a typed error" {
     const gpa = testing.allocator;
     try testing.expectError(error.Truncated, parse(gpa, &.{ 0x40, 0x00, 0x02, 0x00, 1 }));
     try testing.expectError(error.Truncated, parseSetResult(gpa, &.{ 0x40, 0x00, 0x03, 0x00, 1 }));
+}
+
+test "a compact SET reply cannot answer honouredByName, and says so" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    // A compact `FEATURES_SET_REPLY` that refused bit 2 outright: WANTED says
+    // "one bit was not honoured", ACTIVE says "nothing changed". Reachable
+    // through the public `parseSetResult` + `raw()` path, which is the
+    // documented escape hatch — `setFeaturesBy*` never asks for compact.
+    try bitset.appendCompact(gpa, &list, uapi.FEATURES.WANTED, 32, &.{0}, &.{0b0100});
+    try bitset.appendCompact(gpa, &list, uapi.FEATURES.ACTIVE, 32, &.{0}, &.{0});
+    var r = try parseSetResult(gpa, list.items);
+    defer r.deinit(gpa);
+
+    try testing.expectEqual(@as(u32, 1), r.unhonouredCount());
+    try testing.expect(!r.fullyHonoured());
+    // The reply carries no names, so the question is unanswerable — not
+    // "honoured". This used to return `true` for every name.
+    try testing.expectEqual(@as(?bool, null), r.honouredByName("tso"));
 }

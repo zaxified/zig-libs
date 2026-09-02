@@ -79,11 +79,47 @@ MODULES = {
         "zig_files": ["modules/ethtool/src/uapi.zig"],
         "headers": [
             "/usr/include/linux/ethtool_netlink_generated.h",
+            "/usr/include/linux/ethtool_netlink.h",
             "/usr/include/linux/ethtool.h",
+            "/usr/include/linux/if.h",
         ],
-        "prefixes": ["ETHTOOL_A_", "ETHTOOL_"],
-        # ⚠ MOSTLY THE SAME BLIND SPOT devlink had: enum namespaces the kernel snake_cases differently. Resolving them needs a `namespace_aliases` map read out of the header, module by module — recorded as follow-up work by the 2026-09-02 devlink audit, not guessed at here.
-        "unresolved_budget": 120,
+        # `""` matters: the bare `PORT_*`, `DUPLEX_*`, `XCVR_*`, `ETH_SS_*` and
+        # `AUTONEG_*` families carry no `ETHTOOL` prefix at all.
+        "prefixes": ["ETHTOOL_A_", "ETHTOOL_", ""],
+        # Suffixes are scoped to a namespace on purpose. `ETHTOOL_MSG_X_GET`
+        # and `ETHTOOL_MSG_X_GET_REPLY` are BOTH real constants one apart, so
+        # an unscoped bare-name attempt resolves every reply id against the
+        # request id and reports 50 MISMATCHes that are not there. `_NTF`
+        # names carry their own suffix, hence the `""` fallback inside REPLY.
+        "suffixes": {"REPLY": ["_REPLY", ""], "LINK_MODE": ["_BIT"]},
+        # Where this repo's namespace is not the kernel's. `REPLY` -> `MSG`
+        # covers the 50 reply/notification ids (`ETHTOOL_MSG_<X>_REPLY`, and
+        # the `_NTF` names which already end in their own suffix).
+        "namespace_aliases": {
+            "REPLY": "MSG",
+            "StringSetId": "ETH_SS",
+            "StatsGroup": "STATS",
+            "StatsSrc": "MAC_STATS_SRC",
+            "Port": "PORT",
+            "Duplex": "DUPLEX",
+            "Transceiver": "XCVR",
+            "MasterSlaveCfg": "MASTER_SLAVE_CFG",
+            "MasterSlaveState": "MASTER_SLAVE_STATE",
+            "family_version": "GENL_VERSION",
+        },
+        # The handful whose kernel name is not derivable by any rule.
+        "member_aliases": {
+            "StringSetId.self_test": "ETH_SS_TEST",
+            "MdiX.mdi": "ETH_TP_MDI",
+            "MdiX.mdi_x": "ETH_TP_MDI_X",
+            "MdiX.auto": "ETH_TP_MDI_AUTO",
+            "MdiX.invalid": "ETH_TP_MDI_INVALID",
+            "ifnamesize": "IFNAMSIZ",
+        },
+        # `I2C_ADDRESS_LOW`/`_HIGH` are SFF-8472 addresses this repo names
+        # itself; the kernel has no macro for them. If this number grows,
+        # something stopped being checked.
+        "unresolved_budget": 2,
     },
     "nl80211": {
         "zig_files": ["modules/nl80211/src/uapi.zig"],
@@ -330,9 +366,14 @@ def _camel_to_snake_upper(seg):
     return "".join(out).upper()
 
 
-def candidate_names(dotted, prefixes, aliases=None):
+def candidate_names(dotted, prefixes, aliases=None, suffixes=None, members=None):
+    if members and dotted in members:
+        return [members[dotted]]
     segs = dotted.split(".")
-    if aliases and len(segs) > 1 and segs[0] in aliases:
+    sfxs = [""]
+    if suffixes:
+        sfxs = suffixes.get(segs[0], suffixes.get("*", [""]))
+    if aliases and segs[0] in aliases:
         segs = [aliases[segs[0]]] + segs[1:]
     # `u8_`/`type_` are Zig keyword escapes; the kernel has no trailing '_'.
     tail_variants = {segs[-1], segs[-1].rstrip("_")}
@@ -341,7 +382,16 @@ def candidate_names(dotted, prefixes, aliases=None):
         head = segs[:-1]
         bases.add("_".join(head + [tail]).upper())
         bases.add("_".join([_camel_to_snake_upper(h) for h in head] + [tail.upper()]))
-    return [p + b for p in prefixes for b in sorted(bases)]
+        # Case-PRESERVING variant: the kernel spells its link-mode bits
+        # `ETHTOOL_LINK_MODE_10baseT_Half_BIT`, mixed case and all, so an
+        # upper-cased candidate can never match one.
+        bases.add("_".join(head + [tail]))
+    return [
+        p + b + sfx
+        for p in prefixes
+        for b in sorted(bases)
+        for sfx in sfxs
+    ]
 
 
 def check_module(name, cfg, verbose):
@@ -369,7 +419,13 @@ def check_module(name, cfg, verbose):
         if dotted.endswith("._"):
             continue
         found = None
-        for cand in candidate_names(dotted, cfg["prefixes"], cfg.get("namespace_aliases")):
+        for cand in candidate_names(
+            dotted,
+            cfg["prefixes"],
+            cfg.get("namespace_aliases"),
+            cfg.get("suffixes"),
+            cfg.get("member_aliases"),
+        ):
             if cand in kernel:
                 found = (cand, kernel[cand])
                 break

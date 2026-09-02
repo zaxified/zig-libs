@@ -69,6 +69,15 @@ const uapi = @import("uapi.zig");
 
 pub const Error = codec.Error || error{OutOfMemory};
 
+/// The **encode**-side error set. Deliberately disjoint from `Error`: an
+/// encoder cannot meet a truncated or badly-framed message, it can only be
+/// handed arguments the wire format cannot express. Reporting those as
+/// `codec.Error.BadLength` — which is what these functions used to do — made
+/// `client.zig` classify a caller-argument fault as `MalformedReply`, i.e. as
+/// the *peer's* fault, for a request that was never sent. Same shape as
+/// `header.Error` (W2 re-audit 2026-09-02, `ethtool` F3).
+pub const BuildError = error{ OutOfMemory, InvalidRequest };
+
 /// Refuse to allocate for an absurd `SIZE`. The biggest real bitset in this
 /// family is the link-mode set (126 bits as of Linux 7.0); 64 Ki bits is four
 /// orders of magnitude of headroom and still bounds a hostile/corrupt reply.
@@ -346,7 +355,7 @@ pub fn appendCompact(
     size: u32,
     value: []const u32,
     mask: ?[]const u32,
-) (Error || error{InvalidRequest})!void {
+) BuildError!void {
     if (size > max_bits) return error.InvalidRequest;
     const want = (size + 31) / 32;
     if (value.len != want) return error.InvalidRequest;
@@ -359,7 +368,7 @@ pub fn appendCompact(
     try codec.appendAttrU32(gpa, list, uapi.BITSET.SIZE, size);
     try appendWords(gpa, list, uapi.BITSET.VALUE, value);
     if (mask) |m| try appendWords(gpa, list, uapi.BITSET.MASK, m);
-    codec.nestEnd(list, nest) catch return error.BadLength;
+    codec.nestEnd(list, nest) catch return error.InvalidRequest;
 }
 
 /// Append a **verbose, name-keyed list** bitset: `NOMASK` + one `BIT { NAME }`
@@ -370,20 +379,20 @@ pub fn appendNameList(
     list: *std.ArrayList(u8),
     attr_type: u16,
     names: []const []const u8,
-) Error!void {
+) BuildError!void {
     const nest = try codec.nestBegin(gpa, list, attr_type | codec.NLA_F_NESTED);
     try appendFlag(gpa, list, uapi.BITSET.NOMASK);
     const bits = try codec.nestBegin(gpa, list, uapi.BITSET.BITS | codec.NLA_F_NESTED);
     for (names) |n| {
         const bit = try codec.nestBegin(gpa, list, uapi.BITSET_BITS.BIT | codec.NLA_F_NESTED);
         codec.appendAttrString(gpa, list, uapi.BITSET_BIT.NAME, n) catch |e| switch (e) {
-            error.AttrTooLong => return error.BadLength,
+            error.AttrTooLong => return error.InvalidRequest,
             error.OutOfMemory => return error.OutOfMemory,
         };
-        codec.nestEnd(list, bit) catch return error.BadLength;
+        codec.nestEnd(list, bit) catch return error.InvalidRequest;
     }
-    codec.nestEnd(list, bits) catch return error.BadLength;
-    codec.nestEnd(list, nest) catch return error.BadLength;
+    codec.nestEnd(list, bits) catch return error.InvalidRequest;
+    codec.nestEnd(list, nest) catch return error.InvalidRequest;
 }
 
 /// One entry of a name-keyed *masked* bitset request: "set this named bit to
@@ -399,20 +408,20 @@ pub fn appendNamedValues(
     list: *std.ArrayList(u8),
     attr_type: u16,
     entries: []const NamedValue,
-) Error!void {
+) BuildError!void {
     const nest = try codec.nestBegin(gpa, list, attr_type | codec.NLA_F_NESTED);
     const bits = try codec.nestBegin(gpa, list, uapi.BITSET.BITS | codec.NLA_F_NESTED);
     for (entries) |e| {
         const bit = try codec.nestBegin(gpa, list, uapi.BITSET_BITS.BIT | codec.NLA_F_NESTED);
         codec.appendAttrString(gpa, list, uapi.BITSET_BIT.NAME, e.name) catch |err| switch (err) {
-            error.AttrTooLong => return error.BadLength,
+            error.AttrTooLong => return error.InvalidRequest,
             error.OutOfMemory => return error.OutOfMemory,
         };
         if (e.on) try appendFlag(gpa, list, uapi.BITSET_BIT.VALUE);
-        codec.nestEnd(list, bit) catch return error.BadLength;
+        codec.nestEnd(list, bit) catch return error.InvalidRequest;
     }
-    codec.nestEnd(list, bits) catch return error.BadLength;
-    codec.nestEnd(list, nest) catch return error.BadLength;
+    codec.nestEnd(list, bits) catch return error.InvalidRequest;
+    codec.nestEnd(list, nest) catch return error.InvalidRequest;
 }
 
 /// One entry of an index-keyed masked bitset request.
@@ -427,21 +436,21 @@ pub fn appendIndexedValues(
     list: *std.ArrayList(u8),
     attr_type: u16,
     entries: []const IndexedValue,
-) Error!void {
+) BuildError!void {
     const nest = try codec.nestBegin(gpa, list, attr_type | codec.NLA_F_NESTED);
     const bits = try codec.nestBegin(gpa, list, uapi.BITSET.BITS | codec.NLA_F_NESTED);
     for (entries) |e| {
-        if (e.index >= max_bits) return error.BadLength;
+        if (e.index >= max_bits) return error.InvalidRequest;
         const bit = try codec.nestBegin(gpa, list, uapi.BITSET_BITS.BIT | codec.NLA_F_NESTED);
         try codec.appendAttrU32(gpa, list, uapi.BITSET_BIT.INDEX, e.index);
         if (e.on) try appendFlag(gpa, list, uapi.BITSET_BIT.VALUE);
-        codec.nestEnd(list, bit) catch return error.BadLength;
+        codec.nestEnd(list, bit) catch return error.InvalidRequest;
     }
-    codec.nestEnd(list, bits) catch return error.BadLength;
-    codec.nestEnd(list, nest) catch return error.BadLength;
+    codec.nestEnd(list, bits) catch return error.InvalidRequest;
+    codec.nestEnd(list, nest) catch return error.InvalidRequest;
 }
 
-fn appendFlag(gpa: std.mem.Allocator, list: *std.ArrayList(u8), attr_type: u16) Error!void {
+fn appendFlag(gpa: std.mem.Allocator, list: *std.ArrayList(u8), attr_type: u16) BuildError!void {
     codec.appendAttr(gpa, list, attr_type, &.{}) catch |e| switch (e) {
         error.AttrTooLong => unreachable, // 4 bytes total
         error.OutOfMemory => return error.OutOfMemory,
@@ -453,9 +462,9 @@ fn appendWords(
     list: *std.ArrayList(u8),
     attr_type: u16,
     words: []const u32,
-) Error!void {
+) BuildError!void {
     const total = codec.attr_header_len + words.len * 4;
-    if (total > std.math.maxInt(u16)) return error.BadLength;
+    if (total > std.math.maxInt(u16)) return error.InvalidRequest;
     var hdr: [codec.attr_header_len]u8 = undefined;
     std.mem.writeInt(u16, hdr[0..2], @intCast(total), native_endian);
     std.mem.writeInt(u16, hdr[2..4], attr_type, native_endian);
@@ -712,4 +721,76 @@ fn fuzzBitset(_: void, smith: *std.testing.Smith) !void {
     _ = bs.nameOf(probe);
     _ = bs.byName("x");
     _ = bs.isSetByName("x");
+}
+
+// A nest whose payload does not fit the 16-bit `nla_len` used to be closed
+// silently: `codec.nestEnd` truncated the length and returned `void`, so the
+// encoders reported success and put a header on the wire covering a fraction
+// of its own payload. `nestEnd` was given `error{AttrTooLong}` repo-wide on
+// 2026-09-02 and every call site here maps it — but nothing in this module
+// drove a nest past the limit, so deleting the whole guard left the suite
+// green (W2 re-audit 2026-09-02, `ethtool` F1). These tests are the guard:
+// one per verbose encoder, each just over 65535 bytes of nest.
+test "a verbose bitset larger than a nest can express is refused, not truncated" {
+    const gpa = testing.allocator;
+
+    // ~20 bytes per entry (BIT nest + 8-byte NAME + VALUE flag): 6000 entries
+    // is ~120 KB, comfortably past `maxInt(u16)`.
+    const names = try gpa.alloc(NamedValue, 6000);
+    defer gpa.free(names);
+    for (names) |*n| n.* = .{ .name = "aaaaaaaa", .on = true };
+    {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try testing.expectError(
+            error.InvalidRequest,
+            appendNamedValues(gpa, &list, uapi.FEATURES.WANTED, names),
+        );
+    }
+
+    const plain = try gpa.alloc([]const u8, 6000);
+    defer gpa.free(plain);
+    for (plain) |*n| n.* = "aaaaaaaa";
+    {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try testing.expectError(
+            error.InvalidRequest,
+            appendNameList(gpa, &list, uapi.STATS.GROUPS, plain),
+        );
+    }
+
+    const idx = try gpa.alloc(IndexedValue, 6000);
+    defer gpa.free(idx);
+    for (idx, 0..) |*e, i| e.* = .{ .index = @intCast(i), .on = true };
+    {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try testing.expectError(
+            error.InvalidRequest,
+            appendIndexedValues(gpa, &list, uapi.LINKMODES.OURS, idx),
+        );
+    }
+}
+
+test "the compact bitset ceiling is pinned at the value, not near it" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    // Both calls carry a correctly sized `value`, so the only thing that can
+    // refuse the second one is the ceiling itself. Sizing both from `max_bits`
+    // instead made the over-limit call fail the `value.len != want` check, and
+    // widening `max_bits` by 8 then left this test green — it pinned the
+    // existence of a check, not its value.
+    const words_at = try gpa.alloc(u32, (max_bits + 31) / 32);
+    defer gpa.free(words_at);
+    @memset(words_at, 0);
+    const words_over = try gpa.alloc(u32, (max_bits + 1 + 31) / 32);
+    defer gpa.free(words_over);
+    @memset(words_over, 0);
+    try appendCompact(gpa, &list, uapi.FEATURES.WANTED, max_bits, words_at, null);
+    try testing.expectError(
+        error.InvalidRequest,
+        appendCompact(gpa, &list, uapi.FEATURES.WANTED, max_bits + 1, words_over, null),
+    );
 }

@@ -892,7 +892,7 @@ const reply_features_set_honoured = hex("74000000170000000300000000000000" ++
 
 /// FEATURES_SET_REPLY, **verbose** — the reply shape this module's own
 /// `setFeaturesByName` actually gets (it never sets `compact_bitsets`; see
-/// `client.zig`'s `setFeaturesImpl`), unlike the two compact goldens above
+/// `features.zig`'s `buildSetFeaturesByName`/`ByIndex`), unlike the two compact goldens above
 /// and below, which are what the real `ethtool` CLI asks for and is all
 /// that had ever been captured. Captured live inside `unshare -rn` against
 /// a fresh veth pair (wave-2 F1): `ethtool -K veth0 tso off`, then a
@@ -1827,11 +1827,11 @@ test "golden reply: a verbose FEATURES_SET_REPLY -- the shape setFeaturesByName 
         "tx-tcp6-segmentation",
         "tx-tcp-accecn-segmentation",
     }) |name| {
-        try testing.expect(res.honouredByName(name));
+        try testing.expect(res.honouredByName(name) == true);
     }
     // A name that was never touched is (vacuously) "honoured" too --
     // `honouredByName` only reports refusal, and this one was never asked.
-    try testing.expect(res.honouredByName("rx-checksumming"));
+    try testing.expect(res.honouredByName("rx-checksumming") == true);
 }
 
 test "golden reply: a FEATURES_SET the kernel refused four fifths of" {

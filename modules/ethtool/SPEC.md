@@ -114,7 +114,7 @@ their weight:
   diff semantics (§2.3). Both are **compact** — the format the real `ethtool`
   CLI asks for (it always sets `compact_bitsets`, per `bitset.zig`'s file
   header). This module's own `setFeaturesByName`/`setFeaturesByIndex` never
-  set that flag (`client.zig`'s `setFeaturesImpl`), so the reply shape the
+  set that flag (`features.zig`'s `buildSetFeaturesByName`/`ByIndex`), so the reply shape the
   shipped code path actually receives was, until wave-2 F1, unanchored —
   the two committed goldens exercised a request shape our own API doesn't
   send. Closed by a **third** `FEATURES_SET_REPLY` golden,
@@ -123,7 +123,7 @@ their weight:
   `ethtool -K veth0 tso on` sends, header's `compact_bitsets` omitted) — the
   first byte-exact evidence for what the kernel actually replies with on the
   path this module's own by-name API drives. (Considered and rejected: just
-  making `setFeaturesImpl` set `compact_bitsets` to match the two existing
+  making those encoders set `compact_bitsets` to match the two existing
   goldens instead — that would silently break `SetResult.honouredByName`,
   which only has names to report when the reply is verbose, for every
   caller of `setFeaturesByName`.)

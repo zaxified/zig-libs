@@ -170,10 +170,15 @@ pub fn parseEeprom(gpa: std.mem.Allocator, attr_bytes: []const u8) (codec.Error 
     var out: Eeprom = .{};
     errdefer out.deinit(gpa);
     var it: codec.AttrIterator = .{ .buf = attr_bytes };
+    // Presence, not length: a first `DATA` of length 0 leaves `out.data.len`
+    // at 0, so keying the duplicate check on the length let a second `DATA`
+    // through and silently win (W2 re-audit 2026-09-02, `ethtool` F5).
+    var seen_data = false;
     while (try it.next()) |a| switch (a.type) {
         uapi.MODULE_EEPROM.HEADER => out.device = try header.parse(a.data),
         uapi.MODULE_EEPROM.DATA => {
-            if (out.data.len != 0) return error.BadLength;
+            if (seen_data) return error.BadLength;
+            seen_data = true;
             if (a.data.len > max_eeprom_read) return error.BadLength;
             out.data = try gpa.dupe(u8, a.data);
         },
@@ -246,4 +251,13 @@ test "malformed module replies are typed errors" {
     const gpa = testing.allocator;
     try testing.expectError(error.BadLength, parse(&.{ 0x08, 0x00, 0x02, 0x00, 1, 0, 0, 0 }));
     try testing.expectError(error.Truncated, parseEeprom(gpa, &.{ 0x40, 0x00, 0x07, 0x00, 1 }));
+}
+
+test "a zero-length DATA still counts as DATA, so a second one is refused" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try codec.appendAttr(gpa, &list, uapi.MODULE_EEPROM.DATA, &.{});
+    try codec.appendAttr(gpa, &list, uapi.MODULE_EEPROM.DATA, &.{ 1, 2, 3, 4 });
+    try testing.expectError(error.BadLength, parseEeprom(gpa, list.items));
 }

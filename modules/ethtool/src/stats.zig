@@ -197,12 +197,12 @@ pub fn appendGroupSelector(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     names: []const []const u8,
-) bitset.Error!void {
+) bitset.BuildError!void {
     try bitset.appendNameList(gpa, list, uapi.STATS.GROUPS, names);
 }
 
 /// What the `build*` encoders can fail with.
-pub const BuildError = Error || header.Error;
+pub const BuildError = bitset.BuildError || header.Error;
 
 /// Encode a complete `ETHTOOL_MSG_STATS_GET` request — `nlmsghdr`,
 /// `genlmsghdr`, header nest and group selector, owned by the caller and freed
