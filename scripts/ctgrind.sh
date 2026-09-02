@@ -101,7 +101,7 @@ if [[ ${#ALL_MODULES[@]} -eq 0 ]]; then
 fi
 
 declare -A TARGETS=(
-    [chachapoly]="poly1305"
+    [chachapoly]="poly1305 aead"
     [ct25519]="ct25519 std"
     [decaf448]="scalarmul"
     [ecvrf]="prove"
@@ -121,6 +121,18 @@ declare -A MODES=(
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
     [chachapoly/poly1305]='poly1305[.]zig'
+    # The AEAD's own claim: the tag comparison and the cipher/MAC glue in
+    # `root.zig`. Added 2026-09-02 -- the module was listed with the poly1305
+    # target alone, so `SPEC.md`'s constant-time sentence about the tag
+    # compare had no measurement behind it at all.
+    # ⚠ The pattern names std's files too, and that is deliberate: this module
+    # DELEGATES short AEAD calls to `std.crypto.aead.chacha_poly`, so std's
+    # constant-time property is this module's property for every message at or
+    # below `aead_delegate_max`. Attributing those contexts to std and calling
+    # them someone else's problem would be the same evasion as widening a
+    # pattern to make a count go away. The expected non-zero is named in
+    # ctgrind-expected.tsv.
+    [chachapoly/aead]='root[.]zig|chacha20[.]zig|poly1305[.]zig'
     [ct25519/ct25519]='root[.]zig'
     [ct25519/std]='edwards25519[.]zig|ristretto255[.]zig|curve25519[.]zig'
     [decaf448/scalarmul]='element[.]zig|ed448[.]zig|field[.]zig|scalar[.]zig'
@@ -150,6 +162,7 @@ declare -A PATTERN=(
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 declare -A LABEL=(
     [chachapoly/poly1305]='poly1305.zig'
+    [chachapoly/aead]='aead: root+std'
     [ct25519/ct25519]='ct25519/root.zig'
     [ct25519/std]='std 25519'
     [decaf448/scalarmul]='decaf448+ed448'

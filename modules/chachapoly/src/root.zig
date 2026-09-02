@@ -194,6 +194,56 @@ inline fn note(w: *Witness, p: Path) void {
     if (builtin.is_test) w.* = p;
 }
 
+/// Test-only: force every call past the delegation thresholds, so a vector
+/// that is short enough to be handed to std can be run through THIS module's
+/// engine as well.
+///
+/// ⛔ It exists because of what the 2026-09-02 audit measured: **three of the
+/// four RFC 8439 vectors in this file execute std's code, not ours.** §2.3.2
+/// (64 B) and §2.8.2 (114 + 12 = 126 B) are inside `delegate_max_bytes` /
+/// `aead_delegate_max`, and §2.5.2 (34 B) is below the MAC's wide threshold —
+/// so the AEAD had NO external vector running its own path, and the
+/// length-sweep differential against std, which is a real oracle above the
+/// thresholds, is vacuous below them: oracle and implementation are the same
+/// code. The prior audit's `A1 external-anchor: PASS` predates the thresholds
+/// (`d1635787`) and was never re-checked.
+///
+/// Like the witness above, this is `void` outside a test build and reaches no
+/// object file that ships.
+const ForceWide = if (builtin.is_test) bool else void;
+pub var force_wide: ForceWide = if (builtin.is_test) false else {};
+
+/// The effective delegation threshold: `n`, or 0 while a test is forcing this
+/// module's own engine.
+inline fn delegateLimit(comptime n: usize) usize {
+    if (builtin.is_test) return if (force_wide) 0 else n;
+    return n;
+}
+
+/// True when a ChaCha20 call of `len` bytes starting at block `counter` would
+/// run past the 32-bit block counter.
+///
+/// ⛔ RFC 8439 §2.3: the counter must not wrap. A wrap restarts the keystream
+/// and reuses it — a two-time pad, silently. This used to be
+/// `std.debug.assert`, which is **absent in the mode this module's own SPEC
+/// tells you to ship** ("ship `ReleaseFast` if constant time matters"), and
+/// the audit of 2026-09-02 reproduced the consequence: `stream(128 B,
+/// counter = 0xFFFF_FFFF)` in ReleaseFast returns bytes 64..128 that are
+/// byte-identical to `keystream(counter = 0)`. With a comptime counter the
+/// violated `unreachable` became UB and the test SEGV'd instead.
+///
+/// It is a `@panic` and not an error return because the signature is `void`
+/// on both public entry points and the condition is a caller bug, not a
+/// runtime state: the caller must re-key or advance the nonce. A crash is
+/// availability; a silent two-time pad is confidentiality, and the campaign's
+/// own rule is that the second is worse. The predicate is `pub` so the
+/// arithmetic can be pinned by tests without provoking the panic.
+pub fn counterWouldWrap(len: usize, counter: u32) bool {
+    return @as(u64, (len + 63) / 64) + counter > (@as(u64, 1) << 32);
+}
+
+const counter_wrap_message = "chachapoly: the ChaCha20 block counter would wrap — keystream reuse (two-time pad). Re-key or advance the nonce.";
+
 const native_endian = @import("builtin").cpu.arch.endian();
 
 const sigma = [4]u32{ 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 }; // "expand 32-byte k"
@@ -336,12 +386,8 @@ pub const ChaCha20 = struct {
     /// 64-byte block before writing it, as std's block-buffered `xor` does.
     pub fn xor(out: []u8, in: []const u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
         std.debug.assert(out.len == in.len);
-        // RFC 8439 §2.3: the 32-bit block counter must not wrap. A wrap restarts
-        // the keystream and reuses it (two-time-pad), silently destroying
-        // confidentiality. Reject in safe builds — matches the assert in
-        // std.crypto.stream.chacha; a caller streaming past the counter space
-        // must re-key or advance the nonce.
-        std.debug.assert(@as(u64, (in.len + 63) / 64) + counter <= (@as(u64, 1) << 32));
+        // In EVERY build — see `counterWouldWrap`.
+        if (counterWouldWrap(in.len, counter)) @panic(counter_wrap_message);
         // Short whole call -> std, before anything else happens. See
         // `delegate_max_bytes`. This is a strict SUBSET of the tail branch at
         // the bottom (if it fires, the group loop cannot run and `rem` would
@@ -353,7 +399,7 @@ pub const ChaCha20 = struct {
         //
         // Branch on the message LENGTH, which is public (it is on the wire
         // before a byte is decrypted). Never on key or plaintext.
-        if (in.len <= delegate_max_bytes) {
+        if (in.len <= delegateLimit(delegate_max_bytes)) {
             note(&chacha_path, .std_delegated);
             return StdChaCha.xor(out, in, counter, key, nonce);
         }
@@ -383,7 +429,7 @@ pub const ChaCha20 = struct {
         // which is the point. One comparison covers both "short message" and
         // "short tail after the wide groups".
         const rem = in.len - i;
-        if (rem > delegate_max_bytes) {
+        if (rem > delegateLimit(delegate_max_bytes)) {
             // A wide group costs about the same as ONE scalar block — same
             // instruction count, `wide` times the width — so generating all
             // `wide` blocks and discarding the unused suffix beats any
@@ -407,10 +453,10 @@ pub const ChaCha20 = struct {
 
     /// Write the raw ChaCha20 keystream (starting at block `counter`) into `out`.
     pub fn stream(out: []u8, counter: u32, key: [key_length]u8, nonce: [nonce_length]u8) void {
-        // See `xor`: the 32-bit block counter must not wrap (keystream reuse).
-        std.debug.assert(@as(u64, (out.len + 63) / 64) + counter <= (@as(u64, 1) << 32));
+        // See `counterWouldWrap`: in every build, not just the safe ones.
+        if (counterWouldWrap(out.len, counter)) @panic(counter_wrap_message);
         // Short whole call -> std; see the matching note in `xor`.
-        if (out.len <= delegate_max_bytes) {
+        if (out.len <= delegateLimit(delegate_max_bytes)) {
             note(&chacha_path, .std_delegated);
             return StdChaCha.stream(out, counter, key, nonce);
         }
@@ -429,7 +475,7 @@ pub const ChaCha20 = struct {
         // one wide group with the unused blocks discarded above the threshold,
         // std below it. Branch on the output length only, which is public.
         const rem = out.len - i;
-        if (rem > delegate_max_bytes) {
+        if (rem > delegateLimit(delegate_max_bytes)) {
             var ks: [64 * wide]u8 = undefined;
             keystream(wide, &ks, k, ctr, n);
             @memcpy(out[i..], ks[0..rem]);
@@ -501,7 +547,7 @@ pub const ChaCha20Poly1305 = struct {
         // before any of it is authenticated. Nothing secret may ever be added
         // to this condition — a branch on key or plaintext would be a timing
         // oracle, a branch on a length is not.
-        if (m.len + ad.len <= aead_delegate_max) {
+        if (m.len + ad.len <= delegateLimit(aead_delegate_max)) {
             note(&aead_path, .std_delegated);
             return StdAead.encrypt(c, tag, m, ad, npub, k);
         }
@@ -531,7 +577,7 @@ pub const ChaCha20Poly1305 = struct {
 
         // Short total -> std's AEAD. Same public-length branch as `encrypt`;
         // see `aead_delegate_max`.
-        if (c.len + ad.len <= aead_delegate_max) {
+        if (c.len + ad.len <= delegateLimit(aead_delegate_max)) {
             note(&aead_path, .std_delegated);
             StdAead.decrypt(m, c, tag, ad, npub, k) catch |e| {
                 // The one place the delegation is NOT a straight hand-off.
@@ -614,6 +660,16 @@ test "RFC 8439 §2.3.2 ChaCha20 block/keystream" {
     var out: [64]u8 = undefined;
     ChaCha20.stream(&out, 1, key, nonce);
     try testing.expectEqualSlices(u8, &expected, &out);
+
+    // ⛔ 64 bytes is `delegate_max_bytes`, so the call above ran std's block
+    // function. Again through ours, or this vector anchors the oracle rather
+    // than the module (audit 2026-09-02).
+    force_wide = true;
+    defer force_wide = false;
+    var mine: [64]u8 = undefined;
+    ChaCha20.stream(&mine, 1, key, nonce);
+    try testing.expectEqual(Path.wide, chacha_path);
+    try testing.expectEqualSlices(u8, &expected, &mine);
 }
 
 // RFC 8439 §2.4.2 — ChaCha20 encryption ("sunscreen"), counter = 1.
@@ -691,6 +747,30 @@ test "RFC 8439 §2.8.2 AEAD encrypt + tag" {
     var back: [114]u8 = undefined;
     try ChaCha20Poly1305.decrypt(&back, &c, tag, &ad, nonce, key);
     try testing.expectEqualSlices(u8, m, &back);
+
+    // ⛔ AND AGAIN THROUGH THIS MODULE'S OWN ENGINE. 114 + 12 = 126 bytes is
+    // inside `aead_delegate_max`, so everything above ran std's code: the
+    // module's AEAD had no external vector exercising a single line of its own
+    // (measured 2026-09-02 — `aead_path` reads `std_delegated` here). An
+    // anchor that tests the oracle is not an anchor.
+    force_wide = true;
+    defer force_wide = false;
+    var c2: [114]u8 = undefined;
+    var tag2: [16]u8 = undefined;
+    ChaCha20Poly1305.encrypt(&c2, &tag2, m, &ad, nonce, key);
+    try testing.expectEqual(Path.wide, aead_path);
+    try testing.expectEqualSlices(u8, &expected_c, &c2);
+    try testing.expectEqualSlices(u8, &expected_tag, &tag2);
+
+    var back2: [114]u8 = undefined;
+    try ChaCha20Poly1305.decrypt(&back2, &c2, tag2, &ad, nonce, key);
+    try testing.expectEqual(Path.wide, aead_path);
+    try testing.expectEqualSlices(u8, m, &back2);
+
+    // The tag is still rejected when it is wrong, on this path too.
+    var bad = tag2;
+    bad[0] ^= 1;
+    try testing.expectError(error.AuthenticationFailed, ChaCha20Poly1305.decrypt(&back2, &c2, bad, &ad, nonce, key));
 }
 
 // ── tests: differential vs std (the oracle), across block-boundary edges ──────
@@ -1311,4 +1391,57 @@ fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
 
     var m: [128]u8 = undefined;
     ChaCha20Poly1305.decrypt(m[0..len], c[0..len], tag, ad[0..ad_len], nonce, key) catch {};
+}
+
+test "the 32-bit counter anti-wrap rule is arithmetic anyone can check, in every build" {
+    // ⛔ The rule used to be a `std.debug.assert`, i.e. absent in ReleaseFast —
+    // the mode this module's own SPEC tells you to ship. Reproduced there
+    // (audit 2026-09-02): `stream(128 B, counter = 0xFFFF_FFFF)` returned
+    // bytes 64..128 byte-identical to `keystream(counter = 0)`, a silent
+    // two-time pad; with a comptime counter the violated `unreachable` became
+    // UB and the run SEGV'd. It is a `@panic` now, in every build.
+    //
+    // The panic itself cannot be caught from a test, so the PREDICATE is
+    // public and pinned here: get the arithmetic wrong and the guard fires in
+    // the wrong place, which is the only way it can go quietly wrong.
+    try testing.expect(!counterWouldWrap(0, 0));
+    try testing.expect(!counterWouldWrap(64, 0));
+    try testing.expect(!counterWouldWrap(64, std.math.maxInt(u32) - 1)); // last legal block
+    try testing.expect(!counterWouldWrap(1, std.math.maxInt(u32))); // the final block itself
+    try testing.expect(!counterWouldWrap(64, std.math.maxInt(u32))); // exactly consumes it
+
+    try testing.expect(counterWouldWrap(65, std.math.maxInt(u32))); // one byte past
+    try testing.expect(counterWouldWrap(128, std.math.maxInt(u32))); // the reproduced case
+    try testing.expect(counterWouldWrap(129, std.math.maxInt(u32) - 1));
+    try testing.expect(!counterWouldWrap(128, std.math.maxInt(u32) - 1));
+
+    // A boundary that exactly consumes the counter space still runs.
+    var out: [64]u8 = undefined;
+    ChaCha20.stream(&out, std.math.maxInt(u32), [_]u8{7} ** 32, [_]u8{9} ** 12);
+    var std_out: [64]u8 = undefined;
+    StdChaCha.stream(&std_out, std.math.maxInt(u32), [_]u8{7} ** 32, [_]u8{9} ** 12);
+    try testing.expectEqualSlices(u8, &std_out, &out);
+}
+
+test "the counter-space boundary runs through THIS module's engine, not std's" {
+    // The test named for the F1 counter fix was vacuous: its 64-byte `stream`
+    // call is inside `delegate_max_bytes`, so it compared `StdChaCha` with
+    // `StdChaCha` and touched none of this module's counter arithmetic
+    // (audit 2026-09-02, read off the path witness).
+    const key = [_]u8{0x42} ** 32;
+    const nonce = [_]u8{0x24} ** 12;
+
+    force_wide = true;
+    defer force_wide = false;
+
+    for ([_]u32{ std.math.maxInt(u32), std.math.maxInt(u32) - 1, std.math.maxInt(u32) - 3 }) |ctr| {
+        const room: usize = (@as(u64, std.math.maxInt(u32)) - ctr + 1) * 64;
+        const len: usize = @intCast(@min(room, @as(u64, 256)));
+        var mine: [256]u8 = undefined;
+        var theirs: [256]u8 = undefined;
+        ChaCha20.stream(mine[0..len], ctr, key, nonce);
+        try testing.expectEqual(Path.wide, chacha_path);
+        StdChaCha.stream(theirs[0..len], ctr, key, nonce);
+        try testing.expectEqualSlices(u8, theirs[0..len], mine[0..len]);
+    }
 }

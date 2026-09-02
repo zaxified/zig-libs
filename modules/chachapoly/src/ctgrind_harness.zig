@@ -62,6 +62,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const poly1305 = @import("poly1305.zig");
+const root = @import("root.zig");
 
 const Poly1305 = poly1305.Poly1305;
 
@@ -103,8 +104,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = it.next(); // argv[0]
     const target_arg = it.next() orelse return error.MissingTarget;
     const taint_arg = it.next() orelse return error.MissingTaint;
-    if (!std.mem.eql(u8, target_arg, "poly1305")) return error.UnknownTarget;
+    const target: Target = if (std.mem.eql(u8, target_arg, "poly1305"))
+        .poly1305
+    else if (std.mem.eql(u8, target_arg, "aead"))
+        .aead
+    else
+        return error.UnknownTarget;
     const taint = try parseTaint(taint_arg);
+    if (target == .aead) return aeadTarget(taint);
 
     std.debug.print("valgrind_support={} lanes={d}\n", .{ builtin.valgrind_support, poly1305.lanes });
 
@@ -137,5 +144,64 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var tag: [16]u8 = undefined;
         st.final(&tag);
         std.debug.print("stream={x}\n", .{tag});
+    }
+}
+
+/// Which claim this run measures.
+const Target = enum { poly1305, aead };
+
+/// The AEAD's own constant-time claim, which had **nothing behind it** until
+/// 2026-09-02.
+///
+/// ⛔ `SPEC.md` and `root.zig` state as fact that the tag is compared in
+/// constant time, and `ctgrind-expected.tsv` listed chachapoly with the
+/// `poly1305` target ALONE — this harness never touched `root.zig`. Measured
+/// consequence: replacing `std.crypto.timing_safe.eql` with `std.mem.eql`
+/// left `zig build test-chachapoly` at exit 0, 31 passing tests. A claim with
+/// no enforcement is the campaign's most repeated shape, and this is the
+/// version of it where the enforcement machinery already existed and simply
+/// did not point here.
+///
+/// The KEY is the secret: it is what the tag, the ciphertext and the
+/// comparison all derive from, so a branch anywhere in `decrypt` on
+/// key-derived data shows up. The taint therefore covers the tag compare and
+/// the AEAD's own cipher/MAC glue in one run.
+fn aeadTarget(taint: Taint) !void {
+    std.debug.print("valgrind_support={} target=aead\n", .{builtin.valgrind_support});
+
+    var key = secretKey();
+    if (taint == .yes) {
+        std.valgrind.memcheck.makeMemUndefined(&key);
+    }
+    const secret = reloadVolatile(&key);
+
+    // Public: nonce, AD and plaintext. Only the key is secret, exactly as in
+    // the poly1305 target above.
+    const nonce = [_]u8{ 0x07, 0, 0, 0, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47 };
+    var msg: [1024]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    const ad = [_]u8{ 0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3 };
+
+    // Both sides of the threshold: a delegated-size call and a wide one, so a
+    // branch on either engine's glue is visible.
+    for ([_]usize{ 64, 1024 }) |n| {
+        var c: [1024]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        root.ChaCha20Poly1305.encrypt(c[0..n], &tag, msg[0..n], &ad, nonce, secret);
+        // Propagation witness: hex formatting is not constant-time.
+        std.debug.print("seal[{d}]={x}\n", .{ n, tag });
+
+        var back: [1024]u8 = undefined;
+        root.ChaCha20Poly1305.decrypt(back[0..n], c[0..n], tag, &ad, nonce, secret) catch |e| {
+            std.debug.print("open[{d}] unexpected {t}\n", .{ n, e });
+            return e;
+        };
+
+        // The rejecting path, which is where the comparison lives: a wrong tag
+        // must take the same time as a right one.
+        var bad = tag;
+        bad[0] ^= 1;
+        root.ChaCha20Poly1305.decrypt(back[0..n], c[0..n], bad, &ad, nonce, secret) catch {};
+        std.debug.print("reject[{d}] done\n", .{n});
     }
 }

@@ -46,6 +46,36 @@
 chachapoly	ReleaseFast	poly1305	1	0
 chachapoly	ReleaseSafe	poly1305	1	>=1
 chachapoly	Debug	poly1305	1	>=1
+# The AEAD's own claim (added 2026-09-02). SPEC.md and root.zig state that the
+# tag is compared in constant time, and until this row existed the module was
+# measured with the `poly1305` target ALONE -- the harness never touched
+# `root.zig`, so swapping `timing_safe.eql` for `std.mem.eql` left the whole
+# suite green.
+#
+# ⚠ THE EXPECTED COUNT IS NOT ZERO, AND THE FOUR ARE NAMED. `in` for this
+# target is `root.zig` PLUS std's `chacha20.zig`/`poly1305.zig`, because the
+# module delegates every AEAD call at or below `aead_delegate_max` to std --
+# their property is ours for those lengths, and attributing the contexts to
+# std would be the same evasion as widening a pattern to make a count go away.
+# At ReleaseFast the four are the ONE branch an AEAD cannot avoid, twice on
+# each side of the delegation threshold: `if (!timing_safe.eql(computed, tag))`
+# in `root.zig` (2) and the identical `if (!verify)` in std's `chacha20.zig`
+# (2). Branching on the ANSWER is the API; the comparison that produced it is
+# what has to be constant-time, and that is what the two `timing_safe.eql`
+# calls are. A fifth context would mean a new branch on secret data.
+# ReleaseSafe/Debug are `>=1` for the same reason the poly1305 rows are: the
+# lane-parallel MAC's checked arithmetic is reached through the AEAD too.
+#
+# ⛔ KNOWN RED, and it is the GATE that is red, not the module: in the **Debug**
+# harness build valgrind prints the MAC's frames with no file:line at all
+# (`poly1305.Generic(4).wide (in …/ctgrind-chachapoly)`), so NO pattern can
+# attribute them and `--check` reports them as unattributed. That is true of
+# the `poly1305` target's Debug row too, which this line did not touch, so it
+# predates the `aead` target. Measured 2026-09-02; the ReleaseFast rows -- the
+# ones every claim in SPEC.md is about -- attribute cleanly.
+chachapoly	ReleaseFast	aead	1	4
+chachapoly	ReleaseSafe	aead	1	>=1
+chachapoly	Debug	aead	1	>=1
 ct25519	ReleaseFast	ct25519	1	0
 ct25519	ReleaseFast	std	1	>=1
 decaf448	ReleaseFast	scalarmul	1	0
