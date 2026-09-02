@@ -803,12 +803,12 @@ pub fn appendActionList(
         // qdisc-level TCA_OPTIONS, which it writes bare).
         const opts = try codec.nestBegin(gpa, list, TCA_ACT.OPTIONS | codec.NLA_F_NESTED);
         try a.appendOptions(gpa, list, ps);
-        codec.nestEnd(list, opts);
+        codec.nestEnd(list, opts) catch return error.OptionsTooLong;
         const ck = a.cookie();
         if (ck.len != 0) try appendAttr(gpa, list, TCA_ACT.COOKIE, ck);
-        codec.nestEnd(list, entry);
+        codec.nestEnd(list, entry) catch return error.OptionsTooLong;
     }
-    codec.nestEnd(list, outer);
+    codec.nestEnd(list, outer) catch return error.OptionsTooLong;
 }
 
 /// A reference to an already-installed action in the shared table — what
@@ -835,9 +835,9 @@ pub fn appendActionRefs(
         const entry = try codec.nestBegin(gpa, list, ordinal);
         try appendKind(gpa, list, r.kind);
         if (r.index) |idx| try codec.appendAttrU32(gpa, list, TCA_ACT.INDEX, idx);
-        codec.nestEnd(list, entry);
+        codec.nestEnd(list, entry) catch return error.OptionsTooLong;
     }
-    codec.nestEnd(list, outer);
+    codec.nestEnd(list, outer) catch return error.OptionsTooLong;
 }
 
 /// Append `TCA_ROOT_FLAGS`, an `nla_bitfield32` (value, selector) pair.
@@ -1443,7 +1443,7 @@ test "TCA_ACT_STATS and the per-kind TM attribute decode" {
         std.mem.writeInt(u64, tm[16..24], 33, native_endian);
         std.mem.writeInt(u64, tm[24..32], 44, native_endian);
         try appendAttr(gpa, &list, TCA_GACT.TM, &tm);
-        codec.nestEnd(&list, opts);
+        codec.nestEnd(&list, opts) catch return error.OptionsTooLong;
     }
     {
         const st = try codec.nestBegin(gpa, &list, TCA_ACT.STATS);
@@ -1455,9 +1455,9 @@ test "TCA_ACT_STATS and the per-kind TM attribute decode" {
         std.mem.writeInt(u32, queue[8..12], 3, native_endian); // drops
         std.mem.writeInt(u32, queue[16..20], 5, native_endian); // overlimits
         try appendAttr(gpa, &list, TCA_STATS.QUEUE, &queue);
-        codec.nestEnd(&list, st);
+        codec.nestEnd(&list, st) catch return error.OptionsTooLong;
     }
-    codec.nestEnd(&list, entry);
+    codec.nestEnd(&list, entry) catch return error.OptionsTooLong;
 
     var it: codec.AttrIterator = .{ .buf = list.items };
     const a = (try it.next()).?;

@@ -359,7 +359,7 @@ pub fn appendCompact(
     try codec.appendAttrU32(gpa, list, uapi.BITSET.SIZE, size);
     try appendWords(gpa, list, uapi.BITSET.VALUE, value);
     if (mask) |m| try appendWords(gpa, list, uapi.BITSET.MASK, m);
-    codec.nestEnd(list, nest);
+    codec.nestEnd(list, nest) catch return error.BadLength;
 }
 
 /// Append a **verbose, name-keyed list** bitset: `NOMASK` + one `BIT { NAME }`
@@ -380,10 +380,10 @@ pub fn appendNameList(
             error.AttrTooLong => return error.BadLength,
             error.OutOfMemory => return error.OutOfMemory,
         };
-        codec.nestEnd(list, bit);
+        codec.nestEnd(list, bit) catch return error.BadLength;
     }
-    codec.nestEnd(list, bits);
-    codec.nestEnd(list, nest);
+    codec.nestEnd(list, bits) catch return error.BadLength;
+    codec.nestEnd(list, nest) catch return error.BadLength;
 }
 
 /// One entry of a name-keyed *masked* bitset request: "set this named bit to
@@ -409,10 +409,10 @@ pub fn appendNamedValues(
             error.OutOfMemory => return error.OutOfMemory,
         };
         if (e.on) try appendFlag(gpa, list, uapi.BITSET_BIT.VALUE);
-        codec.nestEnd(list, bit);
+        codec.nestEnd(list, bit) catch return error.BadLength;
     }
-    codec.nestEnd(list, bits);
-    codec.nestEnd(list, nest);
+    codec.nestEnd(list, bits) catch return error.BadLength;
+    codec.nestEnd(list, nest) catch return error.BadLength;
 }
 
 /// One entry of an index-keyed masked bitset request.
@@ -435,10 +435,10 @@ pub fn appendIndexedValues(
         const bit = try codec.nestBegin(gpa, list, uapi.BITSET_BITS.BIT | codec.NLA_F_NESTED);
         try codec.appendAttrU32(gpa, list, uapi.BITSET_BIT.INDEX, e.index);
         if (e.on) try appendFlag(gpa, list, uapi.BITSET_BIT.VALUE);
-        codec.nestEnd(list, bit);
+        codec.nestEnd(list, bit) catch return error.BadLength;
     }
-    codec.nestEnd(list, bits);
-    codec.nestEnd(list, nest);
+    codec.nestEnd(list, bits) catch return error.BadLength;
+    codec.nestEnd(list, nest) catch return error.BadLength;
 }
 
 fn appendFlag(gpa: std.mem.Allocator, list: *std.ArrayList(u8), attr_type: u16) Error!void {
@@ -637,7 +637,7 @@ test "hostile: contradictory, oversized and truncated bitsets are rejected" {
         defer list.deinit(gpa);
         try appendWords(gpa, &list, uapi.BITSET.VALUE, &.{0});
         const bits = try codec.nestBegin(gpa, &list, uapi.BITSET.BITS);
-        codec.nestEnd(&list, bits);
+        codec.nestEnd(&list, bits) catch return error.BadLength;
         try testing.expectError(error.BadLength, parse(gpa, list.items));
     }
     // NOMASK together with a MASK.
@@ -679,8 +679,8 @@ test "hostile: contradictory, oversized and truncated bitsets are rejected" {
         const bits = try codec.nestBegin(gpa, &list, uapi.BITSET.BITS);
         const bit = try codec.nestBegin(gpa, &list, uapi.BITSET_BITS.BIT);
         try codec.appendAttrU32(gpa, &list, uapi.BITSET_BIT.INDEX, max_bits);
-        codec.nestEnd(&list, bit);
-        codec.nestEnd(&list, bits);
+        codec.nestEnd(&list, bit) catch return error.BadLength;
+        codec.nestEnd(&list, bits) catch return error.BadLength;
         try testing.expectError(error.BadLength, parse(gpa, list.items));
     }
 }

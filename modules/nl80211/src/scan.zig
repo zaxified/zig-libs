@@ -102,7 +102,7 @@ pub fn buildTriggerScan(
                 error.OutOfMemory => return error.OutOfMemory,
             };
         }
-        codec.nestEnd(&list, nest);
+        codec.nestEnd(&list, nest) catch return error.InvalidRequest;
     }
     if (opts.freqs_mhz.len != 0) {
         const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.SCAN_FREQUENCIES);
@@ -110,7 +110,7 @@ pub fn buildTriggerScan(
             if (i > std.math.maxInt(u16)) return error.InvalidRequest;
             try codec.appendAttrU32(gpa, &list, @intCast(i), f);
         }
-        codec.nestEnd(&list, nest);
+        codec.nestEnd(&list, nest) catch return error.InvalidRequest;
     }
     if (opts.ie_bytes.len != 0) {
         codec.appendAttr(gpa, &list, uapi.ATTR.IE, opts.ie_bytes) catch |e| switch (e) {
@@ -362,7 +362,7 @@ test "parseBss: a hand-built nest round-trips through the decoder" {
     defer msg.deinit(gpa);
     const off = try codec.nestBegin(gpa, &msg, uapi.ATTR.BSS);
     try msg.appendSlice(gpa, nest.items);
-    codec.nestEnd(&msg, off);
+    codec.nestEnd(&msg, off) catch return error.InvalidRequest;
 
     var b = (try parseBss(gpa, msg.items)).?;
     defer b.deinit(gpa);

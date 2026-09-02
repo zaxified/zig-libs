@@ -239,6 +239,8 @@ pub const bridge_vlan_info_len = 4;
 /// `BuildError`, so `netlink`'s existing error sets are untouched.
 pub const BuildError = root.BuildError || error{
     /// A VID outside 1..4094, which the kernel would reject anyway.
+    /// A nested attribute grew past 65535 bytes (`codec.nestEnd`).
+    AttrTooLong,
     InvalidVlanId,
     /// `vid_end` below `vid`, or a `pvid` request spanning a range (the
     /// kernel allows exactly one PVID per port, so a range cannot be one).
@@ -601,9 +603,9 @@ pub fn buildBridgeAddRequest(
             std.mem.writeInt(u16, &raw, v, .big);
             try attrChecked(gpa, &list, IFLA_BR.VLAN_PROTOCOL, &raw);
         }
-        codec.nestEnd(&list, data);
+        try codec.nestEnd(&list, data);
     }
-    codec.nestEnd(&list, linkinfo);
+    try codec.nestEnd(&list, linkinfo);
 
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
@@ -746,7 +748,7 @@ pub fn buildVlanRequest(
         try appendVlanInfo(gpa, &list, base | BRIDGE_VLAN_INFO.RANGE_BEGIN, spec.vid);
         try appendVlanInfo(gpa, &list, base | BRIDGE_VLAN_INFO.RANGE_END, end);
     }
-    codec.nestEnd(&list, af_spec);
+    try codec.nestEnd(&list, af_spec);
 
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
@@ -853,7 +855,7 @@ pub fn buildBrportRequest(
     if (change.state) |v| try codec.appendAttrU8(gpa, &list, IFLA_BRPORT.STATE, v);
     if (change.neigh_suppress) |v| try attrBool(gpa, &list, IFLA_BRPORT.NEIGH_SUPPRESS, v);
     if (change.isolated) |v| try attrBool(gpa, &list, IFLA_BRPORT.ISOLATED, v);
-    codec.nestEnd(&list, protinfo);
+    try codec.nestEnd(&list, protinfo);
 
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);

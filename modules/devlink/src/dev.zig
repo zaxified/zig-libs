@@ -269,7 +269,7 @@ fn appendVersion(
     const nest = try codec.nestBegin(gpa, list, attr);
     try codec.appendAttrString(gpa, list, uapi.ATTR.INFO_VERSION_NAME, n);
     try codec.appendAttrString(gpa, list, uapi.ATTR.INFO_VERSION_VALUE, v);
-    codec.nestEnd(list, nest);
+    try codec.nestEnd(list, nest);
 }
 
 test "parseDevice reads the handle and the optional flags" {
@@ -279,7 +279,7 @@ test "parseDevice reads the handle and the optional flags" {
     try handle.append(gpa, &list, .pci("0000:65:00.0"));
     try codec.appendAttrU8(gpa, &list, uapi.ATTR.RELOAD_FAILED, 0);
     const stats = try codec.nestBegin(gpa, &list, uapi.ATTR.DEV_STATS);
-    codec.nestEnd(&list, stats);
+    try codec.nestEnd(&list, stats);
 
     const d = try parseDevice(list.items);
     try testing.expect(d.handle.isComplete());
@@ -349,7 +349,7 @@ test "parseInfo: an unnamed version nest is a malformed reply" {
     defer list.deinit(gpa);
     const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.INFO_VERSION_RUNNING);
     try codec.appendAttrString(gpa, &list, uapi.ATTR.INFO_VERSION_VALUE, "1.0");
-    codec.nestEnd(&list, nest);
+    try codec.nestEnd(&list, nest);
     try testing.expectError(error.BadLength, parseInfo(gpa, list.items));
 }
 

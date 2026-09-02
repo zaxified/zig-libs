@@ -931,10 +931,10 @@ test "constructed: a PARAM_GET reply with all three cmodes carrying a u32" {
         const one = try codec.nestBegin(gpa, &attrs, uapi.ATTR.PARAM_VALUE);
         if (x.v) |v| try codec.appendAttrU32(gpa, &attrs, uapi.ATTR.PARAM_VALUE_DATA, v);
         try codec.appendAttrU8(gpa, &attrs, uapi.ATTR.PARAM_VALUE_CMODE, @intFromEnum(x.cmode));
-        codec.nestEnd(&attrs, one);
+        try codec.nestEnd(&attrs, one);
     }
-    codec.nestEnd(&attrs, vl);
-    codec.nestEnd(&attrs, nest);
+    try codec.nestEnd(&attrs, vl);
+    try codec.nestEnd(&attrs, nest);
 
     var dgram: std.ArrayList(u8) = .empty;
     defer dgram.deinit(gpa);
@@ -981,11 +981,11 @@ test "constructed: a mlxsw-shaped recursive RESOURCE_DUMP reply" {
         try uapi.appendAttrU64(gpa, &attrs, uapi.ATTR.RESOURCE_ID, k.id);
         try uapi.appendAttrU64(gpa, &attrs, uapi.ATTR.RESOURCE_SIZE, k.size);
         try uapi.appendAttrU64(gpa, &attrs, uapi.ATTR.RESOURCE_OCC, 0);
-        codec.nestEnd(&attrs, one);
+        try codec.nestEnd(&attrs, one);
     }
-    codec.nestEnd(&attrs, sub);
-    codec.nestEnd(&attrs, kvd);
-    codec.nestEnd(&attrs, top);
+    try codec.nestEnd(&attrs, sub);
+    try codec.nestEnd(&attrs, kvd);
+    try codec.nestEnd(&attrs, top);
 
     var dgram: std.ArrayList(u8) = .empty;
     defer dgram.deinit(gpa);
@@ -1018,9 +1018,9 @@ test "constructed: a REGION_GET reply with two snapshots" {
     for ([_]u32{ 1, 5 }) |id| {
         const one = try codec.nestBegin(gpa, &attrs, uapi.ATTR.REGION_SNAPSHOT);
         try codec.appendAttrU32(gpa, &attrs, uapi.ATTR.REGION_SNAPSHOT_ID, id);
-        codec.nestEnd(&attrs, one);
+        try codec.nestEnd(&attrs, one);
     }
-    codec.nestEnd(&attrs, snaps);
+    try codec.nestEnd(&attrs, snaps);
 
     var dgram: std.ArrayList(u8) = .empty;
     defer dgram.deinit(gpa);
@@ -1061,8 +1061,8 @@ test "constructed: a chunked REGION_READ dump reassembles into 48 bytes" {
         var payload: [16]u8 = @splat(piece.fill);
         try codec.appendAttr(gpa, &attrs, uapi.ATTR.REGION_CHUNK_DATA, payload[0..piece.len]);
         try uapi.appendAttrU64(gpa, &attrs, uapi.ATTR.REGION_CHUNK_ADDR, piece.addr);
-        codec.nestEnd(&attrs, one);
-        codec.nestEnd(&attrs, chunks);
+        try codec.nestEnd(&attrs, one);
+        try codec.nestEnd(&attrs, chunks);
         try wrapMessage(gpa, &dgram, uapi.CMD.REGION_READ, 1, codec.NLM_F_MULTI, attrs.items);
     }
     try dgram.appendSlice(gpa, &reply_empty_dump_done);
@@ -1098,7 +1098,7 @@ test "constructed: a HEALTH_REPORTER_GET dump with a tripped reporter" {
         try uapi.appendAttrU64(gpa, &attrs, uapi.ATTR.HEALTH_REPORTER_RECOVER_COUNT, s.rec);
         try uapi.appendAttrU64(gpa, &attrs, uapi.ATTR.HEALTH_REPORTER_GRACEFUL_PERIOD, 60000);
         try codec.appendAttrU8(gpa, &attrs, uapi.ATTR.HEALTH_REPORTER_AUTO_RECOVER, 1);
-        codec.nestEnd(&attrs, nest);
+        try codec.nestEnd(&attrs, nest);
         try wrapMessage(gpa, &dgram, uapi.CMD.HEALTH_REPORTER_GET, 1, codec.NLM_F_MULTI, attrs.items);
     }
     try dgram.appendSlice(gpa, &reply_empty_dump_done);
@@ -1139,7 +1139,7 @@ test "constructed: an INFO_GET reply with a pending firmware update" {
         const nest = try codec.nestBegin(gpa, &attrs, x.attr);
         try codec.appendAttrString(gpa, &attrs, uapi.ATTR.INFO_VERSION_NAME, x.n);
         try codec.appendAttrString(gpa, &attrs, uapi.ATTR.INFO_VERSION_VALUE, x.v);
-        codec.nestEnd(&attrs, nest);
+        try codec.nestEnd(&attrs, nest);
     }
 
     var dgram: std.ArrayList(u8) = .empty;

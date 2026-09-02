@@ -374,14 +374,18 @@ pub fn appendStringSetSelector(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     ids: []const uapi.StringSetId,
-) std.mem.Allocator.Error!void {
+    // `InvalidRequest` because `ids` is caller-supplied and unbounded: past
+    // ~8000 string-set ids the nest exceeds what an `nlattr` length can
+    // express. Refusing beats the silent truncation that was here until
+    // 2026-09-02 (see `codec.nestEnd`).
+) error{ OutOfMemory, InvalidRequest }!void {
     const sets = try codec.nestBegin(gpa, list, uapi.STRSET.STRINGSETS | codec.NLA_F_NESTED);
     for (ids) |id| {
         const one = try codec.nestBegin(gpa, list, uapi.STRINGSETS.STRINGSET | codec.NLA_F_NESTED);
         try codec.appendAttrU32(gpa, list, uapi.STRINGSET.ID, @intFromEnum(id));
-        codec.nestEnd(list, one);
+        codec.nestEnd(list, one) catch return error.InvalidRequest;
     }
-    codec.nestEnd(list, sets);
+    codec.nestEnd(list, sets) catch return error.InvalidRequest;
 }
 
 /// Encode a complete `ETHTOOL_MSG_STRSET_GET` request. A null `target` sends
@@ -442,9 +446,9 @@ test "STATS: a group's counters are keyed by attribute type, not by a value attr
     }) |s| {
         const one = try codec.nestBegin(gpa, &list, uapi.STATS_GRP.STAT);
         try appendU64(gpa, &list, s.id, s.v);
-        codec.nestEnd(&list, one);
+        codec.nestEnd(&list, one) catch return error.InvalidRequest;
     }
-    codec.nestEnd(&list, grp);
+    codec.nestEnd(&list, grp) catch return error.InvalidRequest;
 
     var st = try parse(gpa, list.items);
     defer st.deinit(gpa);
@@ -473,15 +477,15 @@ test "STATS: rmon histograms decode into rx/tx buckets" {
         try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.HIST_BKT_LOW, b.low);
         try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.HIST_BKT_HI, b.hi);
         try appendU64(gpa, &list, uapi.STATS_GRP.HIST_VAL, b.value);
-        codec.nestEnd(&list, one);
+        codec.nestEnd(&list, one) catch return error.InvalidRequest;
     }
     {
         const one = try codec.nestBegin(gpa, &list, uapi.STATS_GRP.HIST_TX);
         try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.HIST_BKT_LOW, 64);
         try appendU64(gpa, &list, uapi.STATS_GRP.HIST_VAL, 7);
-        codec.nestEnd(&list, one);
+        codec.nestEnd(&list, one) catch return error.InvalidRequest;
     }
-    codec.nestEnd(&list, grp);
+    codec.nestEnd(&list, grp) catch return error.InvalidRequest;
 
     var st = try parse(gpa, list.items);
     defer st.deinit(gpa);
@@ -501,7 +505,7 @@ test "STATS: an empty group is a normal reply, not an error" {
     const grp = try codec.nestBegin(gpa, &list, uapi.STATS.GRP);
     try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.eth_ctrl));
     try codec.appendAttrU32(gpa, &list, uapi.STATS_GRP.SS_ID, 19);
-    codec.nestEnd(&list, grp);
+    codec.nestEnd(&list, grp) catch return error.InvalidRequest;
 
     var st = try parse(gpa, list.items);
     defer st.deinit(gpa);
@@ -517,8 +521,8 @@ test "STATS: a counter that is not 8 bytes is a malformed reply" {
     const grp = try codec.nestBegin(gpa, &list, uapi.STATS.GRP);
     const one = try codec.nestBegin(gpa, &list, uapi.STATS_GRP.STAT);
     try codec.appendAttrU32(gpa, &list, 0, 5);
-    codec.nestEnd(&list, one);
-    codec.nestEnd(&list, grp);
+    codec.nestEnd(&list, one) catch return error.InvalidRequest;
+    codec.nestEnd(&list, grp) catch return error.InvalidRequest;
     try testing.expectError(error.BadLength, parse(gpa, list.items));
 }
 
@@ -541,11 +545,11 @@ test "STRSET: strings decode with their kernel indices" {
         const str = try codec.nestBegin(gpa, &list, uapi.STRINGS.STRING);
         try codec.appendAttrU32(gpa, &list, uapi.STRING.INDEX, @intCast(i));
         try codec.appendAttrString(gpa, &list, uapi.STRING.VALUE, s);
-        codec.nestEnd(&list, str);
+        codec.nestEnd(&list, str) catch return error.InvalidRequest;
     }
-    codec.nestEnd(&list, strings);
-    codec.nestEnd(&list, one);
-    codec.nestEnd(&list, sets);
+    codec.nestEnd(&list, strings) catch return error.InvalidRequest;
+    codec.nestEnd(&list, one) catch return error.InvalidRequest;
+    codec.nestEnd(&list, sets) catch return error.InvalidRequest;
 
     var ss = try parseStringSets(gpa, list.items);
     defer ss.deinit(gpa);
@@ -567,10 +571,10 @@ test "STRSET: a string without an index or a value is refused, never mis-aligned
     const strings = try codec.nestBegin(gpa, &list, uapi.STRINGSET.STRINGS);
     const str = try codec.nestBegin(gpa, &list, uapi.STRINGS.STRING);
     try codec.appendAttrString(gpa, &list, uapi.STRING.VALUE, "no-index");
-    codec.nestEnd(&list, str);
-    codec.nestEnd(&list, strings);
-    codec.nestEnd(&list, one);
-    codec.nestEnd(&list, sets);
+    codec.nestEnd(&list, str) catch return error.InvalidRequest;
+    codec.nestEnd(&list, strings) catch return error.InvalidRequest;
+    codec.nestEnd(&list, one) catch return error.InvalidRequest;
+    codec.nestEnd(&list, sets) catch return error.InvalidRequest;
     try testing.expectError(error.BadLength, parseStringSets(gpa, list.items));
 }
 
@@ -581,8 +585,8 @@ test "STRSET: an absurd COUNT does not become an allocation" {
     const sets = try codec.nestBegin(gpa, &list, uapi.STRSET.STRINGSETS);
     const one = try codec.nestBegin(gpa, &list, uapi.STRINGSETS.STRINGSET);
     try codec.appendAttrU32(gpa, &list, uapi.STRINGSET.COUNT, 0xffff_ffff);
-    codec.nestEnd(&list, one);
-    codec.nestEnd(&list, sets);
+    codec.nestEnd(&list, one) catch return error.InvalidRequest;
+    codec.nestEnd(&list, sets) catch return error.InvalidRequest;
     try testing.expectError(error.BadLength, parseStringSets(gpa, list.items));
 }
 

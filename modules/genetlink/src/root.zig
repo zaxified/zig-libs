@@ -515,9 +515,9 @@ fn buildMcastGroupsAttrs(
         const inner = try codec.nestBegin(gpa, list, @intCast(idx));
         try codec.appendAttrU32(gpa, list, CTRL_ATTR_MCAST_GRP_ID, g.id);
         try codec.appendAttrString(gpa, list, CTRL_ATTR_MCAST_GRP_NAME, g.name);
-        codec.nestEnd(list, inner);
+        try codec.nestEnd(list, inner);
     }
-    codec.nestEnd(list, outer);
+    try codec.nestEnd(list, outer);
 }
 
 // ── fuzz: genlmsghdr split + nlctrl attribute walk, never panic ────────────
@@ -572,9 +572,9 @@ fn fuzzFindMcastGroupId(_: void, smith: *std.testing.Smith) !void {
             smith.bytes(&name_buf);
             const name_len: usize = smith.valueRangeAtMost(u8, 0, name_buf.len);
             codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_NAME, name_buf[0..name_len]) catch return;
-            codec.nestEnd(&list, inner);
+            try codec.nestEnd(&list, inner);
         }
-        codec.nestEnd(&list, outer);
+        try codec.nestEnd(&list, outer);
         if (list.items.len > buf.len) return;
         @memcpy(buf[0..list.items.len], list.items);
         break :blk list.items.len;
@@ -630,8 +630,8 @@ test "findMcastGroupId rejects a matching group with no id" {
     const outer = try codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS);
     const inner = try codec.nestBegin(testing.allocator, &list, 1);
     try codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_NAME, "scan");
-    codec.nestEnd(&list, inner);
-    codec.nestEnd(&list, outer);
+    try codec.nestEnd(&list, inner);
+    try codec.nestEnd(&list, outer);
 
     try testing.expectError(error.BadLength, findMcastGroupId(list.items, "scan"));
 }

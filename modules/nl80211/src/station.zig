@@ -246,7 +246,7 @@ const testing = std.testing;
 fn wrapNest(gpa: std.mem.Allocator, list: *std.ArrayList(u8), t: u16, inner: []const u8) !void {
     const off = try codec.nestBegin(gpa, list, t);
     try list.appendSlice(gpa, inner);
-    codec.nestEnd(list, off);
+    codec.nestEnd(list, off) catch return error.InvalidRequest;
 }
 
 test "parseRateInfo: VHT-MCS 2, NSS 1, 80 MHz, short GI (the captured shape)" {

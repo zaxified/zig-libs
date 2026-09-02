@@ -416,6 +416,13 @@ pub const BuildError = std.mem.Allocator.Error || RegError || error{
     UnsupportedHook,
     /// A comparison value whose width does not match what the load produces.
     ValueWidthMismatch,
+    /// An interface name at or past `IFNAMSIZ` (16 bytes including the NUL).
+    /// `nft(8)` refuses the same name — "String exceeds maximum length of 16".
+    InterfaceNameTooLong,
+    /// An IPv4 prefix length above 32.
+    InvalidPrefixLength,
+    /// A `limit` rate that overflows once scaled by its unit.
+    RateOutOfRange,
 };
 
 // ── encoding ────────────────────────────────────────────────────────────────
@@ -433,10 +440,10 @@ fn appendData(
             const voff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_DATA.VERDICT);
             try nl.appendAttrBe32(gpa, list, NFTA_VERDICT.CODE, @bitCast(v.code));
             if (v.chain) |c| try nl.appendAttrString(gpa, list, NFTA_VERDICT.CHAIN, c);
-            nl.nestEnd(list, voff);
+            try nl.nestEnd(list, voff);
         },
     }
-    nl.nestEnd(list, off);
+    try nl.nestEnd(list, off);
 }
 
 /// Append one expression as an `NFTA_LIST_ELEM` nest.
@@ -508,7 +515,14 @@ pub fn appendExpr(
             try appendData(gpa, list, NFTA_IMMEDIATE.DATA, i.data);
         },
         .limit => |l| {
-            try nl.appendAttrBe64(gpa, list, NFTA_LIMIT.RATE, l.rate * l.unit.scale());
+            // ⚠ `rate * scale` wrapped: `(1 << 44) + 1` bytes/s scaled to
+            // mbytes came out as 1 MiB/s -- a limit far TIGHTER than asked
+            // for, which is a rule that silently drops traffic the caller
+            // meant to admit (Debug panicked; ReleaseFast encoded the wrapped
+            // value with no error). Audit 2026-09-02.
+            const scaled = std.math.mul(u64, l.rate, l.unit.scale()) catch
+                return error.RateOutOfRange;
+            try nl.appendAttrBe64(gpa, list, NFTA_LIMIT.RATE, scaled);
             try nl.appendAttrBe64(gpa, list, NFTA_LIMIT.UNIT, l.per.seconds());
             try nl.appendAttrBe32(gpa, list, NFTA_LIMIT.BURST, l.burst);
             try nl.appendAttrBe32(gpa, list, NFTA_LIMIT.TYPE, l.unit.limitType());
@@ -544,8 +558,8 @@ pub fn appendExpr(
         },
         .raw => |r| try list.appendSlice(gpa, r.data),
     }
-    nl.nestEnd(list, data);
-    nl.nestEnd(list, elem);
+    try nl.nestEnd(list, data);
+    try nl.nestEnd(list, elem);
 }
 
 // ── decoding ────────────────────────────────────────────────────────────────
@@ -619,7 +633,16 @@ pub fn ipv4Bytes(a: u8, b: u8, c: u8, d: u8) [4]u8 {
 }
 
 /// The 4-byte network mask of an IPv4 prefix length, in wire order.
-pub fn ipv4MaskBytes(prefix_len: u6) [4]u8 {
+///
+/// ⚠ `prefix_len` is a `u6` because no integer type spells 0..32, so the
+/// out-of-range half has to be REFUSED rather than typed away. It used to be
+/// computed anyway: `/33` shifted by `32 - 33` — a panic in Debug, and in
+/// ReleaseFast a shift by 63 that produced `80000000`, the mask of a `/1`,
+/// silently widening a rule from one host to half the internet. `ipPrefix`
+/// has always guarded this; the public helper beside it did not (audit
+/// 2026-09-02).
+pub fn ipv4MaskBytes(prefix_len: u6) error{InvalidPrefixLength}![4]u8 {
+    if (prefix_len > 32) return error.InvalidPrefixLength;
     var out: [4]u8 = undefined;
     const bits: u32 = if (prefix_len == 0)
         0
@@ -640,10 +663,18 @@ pub fn regU32(v: u32) [4]u8 {
 
 /// An interface name padded to `IFNAMSIZ` — the width `meta iifname`/`oifname`
 /// loads and therefore the width its `cmp` must carry.
-pub fn ifnameBytes(name: []const u8) [16]u8 {
+///
+/// ⚠ A name that does not fit is an ERROR, not something to trim. It used to
+/// be trimmed (`@min(name.len, 16)`), which built a rule comparing against the
+/// first 16 bytes of the name — and since no Linux interface can be named
+/// those 16 bytes, a `drop` built that way never fired. Fail-open, from a
+/// silent success. `nft(8)` refuses the same input: "String exceeds maximum
+/// length of 16" (measured: 15 accepted, 16 and 17 refused — the 16th byte is
+/// the NUL). Audit 2026-09-02.
+pub fn ifnameBytes(name: []const u8) error{InterfaceNameTooLong}![16]u8 {
     var out: [16]u8 = @splat(0);
-    const n = @min(name.len, out.len);
-    @memcpy(out[0..n], name[0..n]);
+    if (name.len >= out.len) return error.InterfaceNameTooLong;
+    @memcpy(out[0..name.len], name);
     return out;
 }
 
@@ -764,7 +795,7 @@ pub const Program = struct {
 
     /// `iifname "name"` / `oifname "name"` — the `IFNAMSIZ`-padded form.
     pub fn ifnameCmp(p: *Program, key: MetaKey, op: Op, name: []const u8) *Program {
-        const padded = ifnameBytes(name);
+        const padded = ifnameBytes(name) catch |e| return p.fail(e);
         return p.metaCmp(key, op, &padded);
     }
 
@@ -797,6 +828,11 @@ pub const Program = struct {
         set_id: ?u32,
         invert: bool,
     ) *Program {
+        // The same bound its two siblings got when the 2026-08-11 audit's F3
+        // was fixed -- `payloadCmp` and `payloadMaskedCmp` were bounded, this
+        // one was left out of the fix set, and a `len` past a register's width
+        // went to the kernel to be refused there (audit 2026-09-02).
+        if (len > max_value_len) return p.fail(error.ValueWidthMismatch);
         p.regs.reset();
         const reg = p.regs.alloc() catch |e| return p.fail(e);
         const s = p.dupe(set) orelse return p;
@@ -875,7 +911,7 @@ pub const Program = struct {
             if (n == 0) return p; // /0 matches everything
             return p.payloadCmp(.nh, offset, n, .eq, addr[0..n]);
         }
-        const mask = ipv4MaskBytes(prefix_len);
+        const mask = ipv4MaskBytes(prefix_len) catch |e| return p.fail(e);
         var masked: [4]u8 = undefined;
         for (&masked, addr, mask) |*m, a, k| m.* = a & k;
         return p.payloadMaskedCmp(.nh, offset, 4, &mask, .eq, &masked);
@@ -1089,10 +1125,30 @@ test "bitwise rejects a mask/xor that disagrees with len" {
 }
 
 test "ipv4 prefix masks" {
-    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &ipv4MaskBytes(0));
-    try testing.expectEqualSlices(u8, &.{ 0xff, 0, 0, 0 }, &ipv4MaskBytes(8));
-    try testing.expectEqualSlices(u8, &.{ 0xff, 0xf0, 0, 0 }, &ipv4MaskBytes(12));
-    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, &ipv4MaskBytes(32));
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &(try ipv4MaskBytes(0)));
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0, 0, 0 }, &(try ipv4MaskBytes(8)));
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xf0, 0, 0 }, &(try ipv4MaskBytes(12)));
+    try testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, &(try ipv4MaskBytes(32)));
+    // ⚠ Above 32 it used to compute a mask anyway: `/33` gave `80000000` in
+    // ReleaseFast -- a `/1`, half the internet, where the caller asked for a
+    // single host's worth of a typo (audit 2026-09-02).
+    try testing.expectError(error.InvalidPrefixLength, ipv4MaskBytes(33));
+    try testing.expectError(error.InvalidPrefixLength, ipv4MaskBytes(63));
+}
+
+test "an interface name that cannot fit IFNAMSIZ is refused, not trimmed into a rule that never matches" {
+    // `nft(8)` refuses the same name ("String exceeds maximum length of 16");
+    // this used to trim it to 16 bytes and build a `drop` against a name no
+    // interface can have -- a fail-open rule that looks installed.
+    try testing.expectError(error.InterfaceNameTooLong, ifnameBytes("abcdefghijklmnopqrstuvwxyz"));
+    try testing.expectError(error.InterfaceNameTooLong, ifnameBytes("abcdefghijklmnop")); // exactly 16: the NUL has nowhere to go
+    const ok = try ifnameBytes("abcdefghijklmno"); // 15
+    try testing.expectEqual(@as(u8, 0), ok[15]);
+
+    var p = Program.init(testing.allocator, .inet);
+    defer p.deinit();
+    _ = p.ifnameCmp(.iifname, .eq, "abcdefghijklmnopqrstuvwxyz").drop();
+    try testing.expectError(error.InterfaceNameTooLong, p.finish());
 }
 
 test "ipv4Bytes packs its four octets in argument order, unmodified" {
@@ -1205,4 +1261,36 @@ fn fuzzExprWalk(_: void, smith: *std.testing.Smith) !void {
             _ = a.asString();
         }
     }
+}
+
+test "a payload set lookup is bounded like its two cmp siblings" {
+    // The 2026-08-11 fix bounded `payloadCmp` and `payloadMaskedCmp` at
+    // `max_value_len` and left `payloadLookup` out of the fix set — the shape
+    // `feedback_take_the_finding_not_the_fix_set` is about. Nothing between
+    // the caller and the kernel checked it.
+    var p = Program.init(testing.allocator, .inet);
+    defer p.deinit();
+    _ = p.payloadLookup(.nh, 0, 4096, "badhosts", null, false).drop();
+    try testing.expectError(error.ValueWidthMismatch, p.finish());
+
+    var ok = Program.init(testing.allocator, .inet);
+    defer ok.deinit();
+    _ = ok.payloadLookup(.nh, 12, 4, "badhosts", null, false).drop();
+    _ = try ok.finish();
+}
+
+test "a limit rate that overflows its unit scaling is refused, not wrapped into a tighter one" {
+    // `rate * unit.scale()` wrapped: (1 << 44) + 1 mbytes/s encoded as
+    // 1 MiB/s. A limit tighter than the caller asked for drops traffic they
+    // meant to admit, and it did it with no error at all in ReleaseFast.
+    var p = Program.init(testing.allocator, .inet);
+    defer p.deinit();
+    _ = p.limit(.{ .rate = (1 << 44) + 1, .unit = .mbytes, .per = .second, .burst = 5 }).drop();
+    const exprs = try p.finish();
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try testing.expectError(
+        error.RateOutOfRange,
+        appendExpr(testing.allocator, &list, exprs[0]),
+    );
 }

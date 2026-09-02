@@ -907,6 +907,10 @@ pub const BuildError = error{
     /// A `LinkChange` that would change nothing (empty `ifi_change`, no
     /// attributes) — rejected rather than sent as a silent no-op.
     NothingToChange,
+    /// A nested attribute grew past what an `nlattr` length can express
+    /// (65535 bytes), so the request cannot be sent as one message. Raised by
+    /// `codec.nestEnd`; see its doc comment for why refusing beats truncating.
+    AttrTooLong,
 };
 
 /// Family implied by an address length (4 → INET, 16 → INET6).
@@ -1123,7 +1127,7 @@ fn buildLinkAddRequest(
     if (spec.mac) |m| try appendAttrChecked(gpa, &list, ifla_address, m);
     const nest = try codec.nestBegin(gpa, &list, ifla_linkinfo);
     try appendAttrStringChecked(gpa, &list, IFLA_INFO.KIND, spec.kind);
-    codec.nestEnd(&list, nest);
+    try codec.nestEnd(&list, nest);
 
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);

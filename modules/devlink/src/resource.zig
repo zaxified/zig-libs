@@ -288,15 +288,15 @@ fn appendResource(gpa: std.mem.Allocator, list: *std.ArrayList(u8), s: Spec) !vo
     if (s.children.len != 0) {
         const sub = try codec.nestBegin(gpa, list, uapi.ATTR.RESOURCE_LIST);
         for (s.children) |c| try appendResource(gpa, list, c);
-        codec.nestEnd(list, sub);
+        try codec.nestEnd(list, sub);
     }
-    codec.nestEnd(list, nest);
+    try codec.nestEnd(list, nest);
 }
 
 fn appendTree(gpa: std.mem.Allocator, list: *std.ArrayList(u8), roots: []const Spec) !void {
     const top = try codec.nestBegin(gpa, list, uapi.ATTR.RESOURCE_LIST);
     for (roots) |r| try appendResource(gpa, list, r);
-    codec.nestEnd(list, top);
+    try codec.nestEnd(list, top);
 }
 
 /// A nest chain `depth` levels deep, each level holding one resource.
@@ -309,7 +309,7 @@ fn buildDeep(gpa: std.mem.Allocator, list: *std.ArrayList(u8), depth: usize) !vo
         try opens.append(gpa, try codec.nestBegin(gpa, list, uapi.ATTR.RESOURCE));
         try codec.appendAttrString(gpa, list, uapi.ATTR.RESOURCE_NAME, "r");
     }
-    while (opens.items.len != 0) codec.nestEnd(list, opens.pop().?);
+    while (opens.items.len != 0) try codec.nestEnd(list, opens.pop().?);
 }
 
 test "parse decodes the two-level tree a switch ASIC reports" {
@@ -369,8 +369,8 @@ test "parse reports a pending RESOURCE_SET" {
     try uapi.appendAttrU64(gpa, &list, uapi.ATTR.RESOURCE_SIZE_NEW, 65536);
     try codec.appendAttrU8(gpa, &list, uapi.ATTR.RESOURCE_SIZE_VALID, 1);
     try uapi.appendAttrU64(gpa, &list, uapi.ATTR.RESOURCE_OCC, 17);
-    codec.nestEnd(&list, one);
-    codec.nestEnd(&list, top);
+    try codec.nestEnd(&list, one);
+    try codec.nestEnd(&list, top);
 
     var rs = try parse(gpa, list.items);
     defer rs.deinit(gpa);
@@ -385,8 +385,8 @@ test "parse reports a pending RESOURCE_SET" {
     const t2 = try codec.nestBegin(gpa, &list2, uapi.ATTR.RESOURCE_LIST);
     const o2 = try codec.nestBegin(gpa, &list2, uapi.ATTR.RESOURCE);
     try uapi.appendAttrU64(gpa, &list2, uapi.ATTR.RESOURCE_SIZE_NEW, 1);
-    codec.nestEnd(&list2, o2);
-    codec.nestEnd(&list2, t2);
+    try codec.nestEnd(&list2, o2);
+    try codec.nestEnd(&list2, t2);
     var rs2 = try parse(gpa, list2.items);
     defer rs2.deinit(gpa);
     try testing.expect(!rs2.roots[0].hasPendingSize());
@@ -423,9 +423,9 @@ test "the node budget bounds a wide tree as well as a deep one" {
     var i: usize = 0;
     while (i < max_nodes + 1) : (i += 1) {
         const one = try codec.nestBegin(gpa, &list, uapi.ATTR.RESOURCE);
-        codec.nestEnd(&list, one);
+        try codec.nestEnd(&list, one);
     }
-    codec.nestEnd(&list, top);
+    try codec.nestEnd(&list, top);
     try testing.expectError(error.TooManyResources, parse(gpa, list.items));
 }
 
@@ -440,8 +440,8 @@ test "truncated and wrong-width resource attributes are typed errors" {
     const top = try codec.nestBegin(gpa, &list, uapi.ATTR.RESOURCE_LIST);
     const one = try codec.nestBegin(gpa, &list, uapi.ATTR.RESOURCE);
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.RESOURCE_SIZE, 1);
-    codec.nestEnd(&list, one);
-    codec.nestEnd(&list, top);
+    try codec.nestEnd(&list, one);
+    try codec.nestEnd(&list, top);
     try testing.expectError(error.BadLength, parse(gpa, list.items));
 
     // A truncated inner TLV inside an otherwise valid nest.

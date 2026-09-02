@@ -577,7 +577,7 @@ pub fn appendTuple(
             .v4 => |b| try codec.appendAttr(gpa, list, CTA_IP.V4_DST, &b),
             .v6 => |b| try codec.appendAttr(gpa, list, CTA_IP.V6_DST, &b),
         }
-        codec.nestEnd(list, ip_off);
+        try codec.nestEnd(list, ip_off);
     }
     {
         const proto = t.proto.?;
@@ -592,10 +592,10 @@ pub fn appendTuple(
             try codec.appendAttrU8(gpa, list, if (icmpv6) CTA_PROTO.ICMPV6_TYPE else CTA_PROTO.ICMP_TYPE, ty);
         if (t.icmp_id) |id|
             try codec.appendAttrBe16(gpa, list, if (icmpv6) CTA_PROTO.ICMPV6_ID else CTA_PROTO.ICMP_ID, id);
-        codec.nestEnd(list, p_off);
+        try codec.nestEnd(list, p_off);
     }
     if (t.zone) |z| try codec.appendAttrBe16(gpa, list, CTA_TUPLE.ZONE, z);
-    codec.nestEnd(list, tuple_off);
+    try codec.nestEnd(list, tuple_off);
 }
 
 /// The complete `IPCTNL_MSG_CT_GET` + `NLM_F_DUMP` request — 20 fixed bytes,
@@ -768,8 +768,8 @@ pub fn buildNewRequest(
             CTA_PROTOINFO_TCP.FLAGS_REPLY,
             &[_]u8{ f.flags, f.mask },
         );
-        codec.nestEnd(&list, tcp_off);
-        codec.nestEnd(&list, pi_off);
+        try codec.nestEnd(&list, tcp_off);
+        try codec.nestEnd(&list, pi_off);
     }
     if (spec.zone) |z| try codec.appendAttrBe16(gpa, &list, CTA.ZONE, z);
     codec.finishHeader(&list, hdr);
@@ -1246,7 +1246,7 @@ test "F5: decodeTuple rejects a mixed-family tuple that appendTuple already refu
     const ip_off = try codec.nestBegin(gpa, &nest, codec.NLA_F_NESTED | CTA_TUPLE.IP);
     try codec.appendAttr(gpa, &nest, CTA_IP.V4_SRC, &.{ 1, 2, 3, 4 });
     try codec.appendAttr(gpa, &nest, CTA_IP.V6_DST, &(@as([16]u8, @splat(0))));
-    codec.nestEnd(&nest, ip_off);
+    try codec.nestEnd(&nest, ip_off);
 
     try testing.expectError(error.AddressFamilyMismatch, decodeTuple(nest.items));
 
@@ -1258,8 +1258,8 @@ test "F5: decodeTuple rejects a mixed-family tuple that appendTuple already refu
     const ip_off2 = try codec.nestBegin(gpa, &flow_list, codec.NLA_F_NESTED | CTA_TUPLE.IP);
     try codec.appendAttr(gpa, &flow_list, CTA_IP.V4_SRC, &.{ 1, 2, 3, 4 });
     try codec.appendAttr(gpa, &flow_list, CTA_IP.V6_DST, &(@as([16]u8, @splat(0))));
-    codec.nestEnd(&flow_list, ip_off2);
-    codec.nestEnd(&flow_list, t_off);
+    try codec.nestEnd(&flow_list, ip_off2);
+    try codec.nestEnd(&flow_list, t_off);
     try testing.expectError(error.AddressFamilyMismatch, decodeFlow(flow_list.items));
 }
 
@@ -1281,8 +1281,8 @@ test "decoder rejects wrong-sized scalars, not unknown attributes" {
         const t_off = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.TUPLE_ORIG);
         const ip_off = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA_TUPLE.IP);
         try codec.appendAttr(gpa, &list, CTA_IP.V4_SRC, &.{ 1, 2, 3, 4, 5 });
-        codec.nestEnd(&list, ip_off);
-        codec.nestEnd(&list, t_off);
+        try codec.nestEnd(&list, ip_off);
+        try codec.nestEnd(&list, t_off);
         try testing.expectError(error.BadLength, decodeFlow(list.items));
     }
     // An attribute type no kernel has ever emitted is simply skipped.
@@ -1332,7 +1332,7 @@ test "decoder survives misaligned and adversarially nested attribute streams" {
     for (&offs) |*o| o.* = try codec.nestBegin(gpa, &list, codec.NLA_F_NESTED | CTA.TUPLE_ORIG);
     try codec.appendAttrBe32(gpa, &list, CTA.MARK, 1);
     var i: usize = offs.len;
-    while (i > 0) : (i -= 1) codec.nestEnd(&list, offs[i - 1]);
+    while (i > 0) : (i -= 1) try codec.nestEnd(&list, offs[i - 1]);
     _ = decodeFlow(list.items) catch {}; // must not crash or hang
 
     // Odd-length payloads at every position of a 3-attribute stream.

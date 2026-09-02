@@ -243,7 +243,7 @@ fn buildReporterReply(gpa: std.mem.Allocator, list: *std.ArrayList(u8), s: Repor
     try uapi.appendAttrU64(gpa, list, uapi.ATTR.HEALTH_REPORTER_GRACEFUL_PERIOD, 60000);
     try codec.appendAttrU8(gpa, list, uapi.ATTR.HEALTH_REPORTER_AUTO_RECOVER, s.auto_recover);
     try codec.appendAttrU8(gpa, list, uapi.ATTR.HEALTH_REPORTER_AUTO_DUMP, 1);
-    codec.nestEnd(list, nest);
+    try codec.nestEnd(list, nest);
 }
 
 test "parse decodes a healthy reporter with no faults" {
@@ -299,7 +299,7 @@ test "a reporter with no counters answers null rather than zero" {
     defer list.deinit(gpa);
     const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.HEALTH_REPORTER);
     try codec.appendAttrString(gpa, &list, uapi.ATTR.HEALTH_REPORTER_NAME, "rx");
-    codec.nestEnd(&list, nest);
+    try codec.nestEnd(&list, nest);
     const r = try parse(list.items);
     try testing.expectEqual(@as(?u64, null), r.unrecoveredCount());
     try testing.expectEqual(@as(?bool, null), r.isHealthy());
@@ -313,7 +313,7 @@ test "a port reporter keeps its port index" {
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.PORT_INDEX, 2);
     const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.HEALTH_REPORTER);
     try codec.appendAttrString(gpa, &list, uapi.ATTR.HEALTH_REPORTER_NAME, "rx");
-    codec.nestEnd(&list, nest);
+    try codec.nestEnd(&list, nest);
     const r = try parse(list.items);
     try testing.expectEqual(@as(?u32, 2), r.port_index);
     try testing.expectEqualStrings("rx", r.name());
@@ -325,7 +325,7 @@ test "a nanosecond-only dump timestamp still counts as a dump" {
     defer list.deinit(gpa);
     const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.HEALTH_REPORTER);
     try uapi.appendAttrU64(gpa, &list, uapi.ATTR.HEALTH_REPORTER_DUMP_TS_NS, 42);
-    codec.nestEnd(&list, nest);
+    try codec.nestEnd(&list, nest);
     try testing.expect((try parse(list.items)).hasDump());
 }
 
@@ -338,14 +338,14 @@ test "hostile reporter input is a typed error" {
     defer list.deinit(gpa);
     const nest = try codec.nestBegin(gpa, &list, uapi.ATTR.HEALTH_REPORTER);
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.HEALTH_REPORTER_ERR_COUNT, 1);
-    codec.nestEnd(&list, nest);
+    try codec.nestEnd(&list, nest);
     try testing.expectError(error.BadLength, parse(list.items));
 
     // An over-long reporter name.
     list.clearRetainingCapacity();
     const n2 = try codec.nestBegin(gpa, &list, uapi.ATTR.HEALTH_REPORTER);
     try codec.appendAttrString(gpa, &list, uapi.ATTR.HEALTH_REPORTER_NAME, "r" ** (uapi.name_max + 1));
-    codec.nestEnd(&list, n2);
+    try codec.nestEnd(&list, n2);
     try testing.expectError(error.BadLength, parse(list.items));
 }
 

@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — **BREAKING: `codec.nestEnd` returns `error{AttrTooLong}!void`** (audit,
+  drift campaign). It used to return `void` and close a nest with a bare
+  `@intCast(list.items.len - off)` into the `nlattr`'s `u16` length — so a nest grown past
+  65535 bytes was **silently truncated to its low sixteen bits** in ReleaseFast (a panic in
+  Debug), the caller sent a message whose nest header covered a fraction of its payload, the
+  kernel installed that fraction, and the send reported SUCCESS. Measured through `nftables`:
+  6000 set elements asked for, batch committed, **1904 landed**, `lastFailure()` null. Its two
+  siblings `appendAttr`/`appendAttrString` have always returned `AttrTooLong` for exactly this
+  condition; the asymmetry was the defect, and a `void` return is what made it unreportable.
+  Callers now `try` it (mechanical: 178 call sites across nine modules; `netlink`'s own
+  `BuildError` and `bridge.BuildError` gained `AttrTooLong`, and `ethtool`/`nl80211`/`tc` map it
+  onto their existing "request too large" errors the way they already map `appendAttr`'s).
+  Splitting an over-large nest across several messages — what `nft(8)` does — is a caller's
+  decision, so this layer refuses instead of guessing.
+
 - **2026-08-18** — `Socket.neighborFlush(NeighborFlushFilter)`: the dump-then-delete loop
   behind `ip neigh flush`, which iproute2 has no single message for. Default state mask
   `NEIGHBOR_FLUSH_DEFAULT_STATE` (pinned by a unit test) reproduces iproute2's

@@ -552,7 +552,7 @@ pub const PeerConfig = struct {
     }
 };
 
-pub const BuildError = error{ OutOfMemory, InvalidConfig };
+pub const BuildError = error{ OutOfMemory, InvalidConfig, AttrTooLong };
 
 /// Soft per-message ceiling used by `setDevice` — the same order of
 /// magnitude as the `wg` tool's socket buffer.
@@ -610,8 +610,8 @@ pub fn buildSetRequests(
             var cur_peer_nest = peer_nest;
             for (p.allowed_ips) |ip| {
                 if (b.wouldOverflow(allowedIpSpace(ip))) {
-                    nestEnd(&b.list, ips_nest);
-                    nestEnd(&b.list, cur_peer_nest);
+                    try nestEnd(&b.list, ips_nest);
+                    try nestEnd(&b.list, cur_peer_nest);
                     try b.startContinuation();
                     cur_peer_nest = try b.beginPeer(p, true);
                     ips_nest = try nestBegin(gpa, &b.list, WGPEER_A.ALLOWEDIPS);
@@ -619,14 +619,14 @@ pub fn buildSetRequests(
                 try appendAllowedIp(gpa, &b.list, ip);
                 b.units += 1;
             }
-            nestEnd(&b.list, ips_nest);
-            nestEnd(&b.list, cur_peer_nest);
+            try nestEnd(&b.list, ips_nest);
+            try nestEnd(&b.list, cur_peer_nest);
         } else {
-            nestEnd(&b.list, peer_nest);
+            try nestEnd(&b.list, peer_nest);
         }
         b.units += 1;
     }
-    b.endMessage();
+    try b.endMessage();
 
     return .{ .buf = try b.list.toOwnedSlice(gpa), .msg_count = b.msg_count };
 }
@@ -687,14 +687,14 @@ const SetBuilder = struct {
             b.peers_nest = try nestBegin(b.gpa, &b.list, WGDEVICE_A.PEERS);
     }
 
-    fn endMessage(b: *SetBuilder) void {
-        if (b.peers_nest) |off| nestEnd(&b.list, off);
+    fn endMessage(b: *SetBuilder) error{AttrTooLong}!void {
+        if (b.peers_nest) |off| try nestEnd(&b.list, off);
         b.peers_nest = null;
         codec.finishHeader(&b.list, b.hdr_off);
     }
 
     fn startContinuation(b: *SetBuilder) BuildError!void {
-        b.endMessage();
+        try b.endMessage();
         try b.beginMessage(false);
     }
 
@@ -759,10 +759,18 @@ fn nestBegin(
     return off;
 }
 
-fn nestEnd(list: *std.ArrayList(u8), off: usize) void {
+/// Close a nest, refusing one that an `nlattr` length cannot express.
+///
+/// ⛔ This was a second, local copy of `codec.nestEnd` carrying the same
+/// CRITICAL defect (audit 2026-09-02): a bare `@intCast` of the nest size into
+/// a `u16`, which in ReleaseFast writes the low sixteen bits and reports
+/// nothing. The builder here does bound its messages (`wouldOverflow` /
+/// `startContinuation`), so no shipped path is known to reach it — but "no
+/// caller reaches it today" is not a guard, and the duplicate meant a fix to
+/// the shared one would not have reached this file. It delegates now.
+fn nestEnd(list: *std.ArrayList(u8), off: usize) error{AttrTooLong}!void {
     // Inner attributes are self-aligned, so the total needs no padding.
-    const total: u16 = @intCast(list.items.len - off);
-    std.mem.writeInt(u16, list.items[off..][0..2], total, native_endian);
+    return codec.nestEnd(list, off);
 }
 
 fn attrRaw(
@@ -828,12 +836,12 @@ fn appendAllowedIp(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     ip: AllowedIp,
-) error{OutOfMemory}!void {
+) error{ OutOfMemory, AttrTooLong }!void {
     const off = try nestBegin(gpa, list, 0);
     try attrU16(gpa, list, WGALLOWEDIP_A.FAMILY, ip.family);
     try attrRaw(gpa, list, WGALLOWEDIP_A.IPADDR, ip.bytes());
     try attrU8(gpa, list, WGALLOWEDIP_A.CIDR_MASK, ip.cidr);
-    nestEnd(list, off);
+    try nestEnd(list, off);
 }
 
 // ── client ──────────────────────────────────────────────────────────────────
@@ -1336,9 +1344,9 @@ test "get parse: multipart device with peer continuation across messages" {
         try codec.appendAttrU32(gpa, &msg1, WGPEER_A.PROTOCOL_VERSION, 1);
         const ips = try nestBegin(gpa, &msg1, WGPEER_A.ALLOWEDIPS);
         try appendAllowedIp(gpa, &msg1, AllowedIp.v4(.{ 10, 0, 0, 0 }, 24));
-        nestEnd(&msg1, ips);
-        nestEnd(&msg1, entry);
-        nestEnd(&msg1, peers);
+        try nestEnd(&msg1, ips);
+        try nestEnd(&msg1, entry);
+        try nestEnd(&msg1, peers);
     }
 
     // Message 2: peer A continuation (public key + one more ip) + peer B
@@ -1352,13 +1360,13 @@ test "get parse: multipart device with peer continuation across messages" {
         try attrRaw(gpa, &msg2, WGPEER_A.PUBLIC_KEY, &peer_a);
         const ips = try nestBegin(gpa, &msg2, WGPEER_A.ALLOWEDIPS);
         try appendAllowedIp(gpa, &msg2, AllowedIp.v6([_]u8{0xfd} ++ [_]u8{0} ** 15, 64));
-        nestEnd(&msg2, ips);
-        nestEnd(&msg2, entry);
+        try nestEnd(&msg2, ips);
+        try nestEnd(&msg2, entry);
         entry = try nestBegin(gpa, &msg2, 0);
         try attrRaw(gpa, &msg2, WGPEER_A.PUBLIC_KEY, &peer_b);
         try attrRaw(gpa, &msg2, WGPEER_A.PRESHARED_KEY, &(@as(Key, @splat(0))));
-        nestEnd(&msg2, entry);
-        nestEnd(&msg2, peers);
+        try nestEnd(&msg2, entry);
+        try nestEnd(&msg2, peers);
     }
 
     var parser: DeviceParser = .init(gpa);
@@ -1444,10 +1452,10 @@ test "get parse: malformed replies yield typed errors, never a panic" {
         try attrU16(gpa, &list, WGALLOWEDIP_A.FAMILY, AF.INET);
         try attrRaw(gpa, &list, WGALLOWEDIP_A.IPADDR, &([_]u8{0} ** 16)); // 16B for AF_INET
         try attrU8(gpa, &list, WGALLOWEDIP_A.CIDR_MASK, 24);
-        nestEnd(&list, ip_entry);
-        nestEnd(&list, ips);
-        nestEnd(&list, entry);
-        nestEnd(&list, peers);
+        try nestEnd(&list, ip_entry);
+        try nestEnd(&list, ips);
+        try nestEnd(&list, entry);
+        try nestEnd(&list, peers);
         var parser: DeviceParser = .init(gpa);
         defer parser.deinit();
         try testing.expectError(error.BadLength, parser.feed(list.items));

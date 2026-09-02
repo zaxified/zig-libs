@@ -834,9 +834,9 @@ test "findMcastGroupId on a hand-built nlctrl reply" {
         const one = try codec.nestBegin(gpa, &attrs, @intCast(i));
         try codec.appendAttrU32(gpa, &attrs, uapi.CTRL_ATTR_MCAST_GRP.ID, g.id);
         try codec.appendAttrString(gpa, &attrs, uapi.CTRL_ATTR_MCAST_GRP.NAME, g.n);
-        codec.nestEnd(&attrs, one);
+        codec.nestEnd(&attrs, one) catch return error.InvalidRequest;
     }
-    codec.nestEnd(&attrs, groups);
+    codec.nestEnd(&attrs, groups) catch return error.InvalidRequest;
 
     try testing.expectEqual(@as(?u32, 23), try findMcastGroupId(attrs.items, "scan"));
     try testing.expectEqual(@as(?u32, 22), try findMcastGroupId(attrs.items, "config"));
@@ -854,8 +854,8 @@ test "findMcastGroupId: a group entry with a name but no id is a bad reply" {
     const groups = try codec.nestBegin(gpa, &attrs, uapi.CTRL_ATTR.MCAST_GROUPS);
     const one = try codec.nestBegin(gpa, &attrs, 1);
     try codec.appendAttrString(gpa, &attrs, uapi.CTRL_ATTR_MCAST_GRP.NAME, "scan");
-    codec.nestEnd(&attrs, one);
-    codec.nestEnd(&attrs, groups);
+    codec.nestEnd(&attrs, one) catch return error.InvalidRequest;
+    codec.nestEnd(&attrs, groups) catch return error.InvalidRequest;
     try testing.expectError(error.BadLength, findMcastGroupId(attrs.items, "scan"));
 }
 

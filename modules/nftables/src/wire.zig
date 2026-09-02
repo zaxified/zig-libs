@@ -376,7 +376,7 @@ fn appendChainBody(
             @bitCast(spec.prio orelse 0),
         );
         if (spec.dev) |d| try nl.appendAttrString(gpa, list, NFTA_HOOK.DEV, d);
-        nl.nestEnd(list, off);
+        try nl.nestEnd(list, off);
     }
     if (spec.userdata) |u| try nl.appendAttr(gpa, list, NFTA_CHAIN.USERDATA, u);
 }
@@ -393,7 +393,7 @@ fn appendRuleBody(
     if (spec.exprs.len > 0) {
         const off = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_RULE.EXPRESSIONS);
         for (spec.exprs) |e| try expr.appendExpr(gpa, list, e);
-        nl.nestEnd(list, off);
+        try nl.nestEnd(list, off);
     }
     if (spec.userdata) |u| try nl.appendAttr(gpa, list, NFTA_RULE.USERDATA, u);
 }
@@ -416,7 +416,7 @@ fn appendSetBody(
     if (spec.size) |s| {
         const off = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET.DESC);
         try nl.appendAttrBe32(gpa, list, NFTA_SET_DESC.SIZE, s);
-        nl.nestEnd(list, off);
+        try nl.nestEnd(list, off);
     }
     if (spec.timeout_ms) |t| try nl.appendAttrBe64(gpa, list, NFTA_SET.TIMEOUT, t);
     if (spec.userdata) |u| try nl.appendAttr(gpa, list, NFTA_SET.USERDATA, u);
@@ -444,22 +444,22 @@ fn appendSetElems(
         {
             const koff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET_ELEM.KEY);
             try nl.appendAttr(gpa, list, expr.NFTA_DATA.VALUE, el.key);
-            nl.nestEnd(list, koff);
+            try nl.nestEnd(list, koff);
         }
         if (el.key_end) |ke| {
             const koff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET_ELEM.KEY_END);
             try nl.appendAttr(gpa, list, expr.NFTA_DATA.VALUE, ke);
-            nl.nestEnd(list, koff);
+            try nl.nestEnd(list, koff);
         }
         if (el.data) |d| {
             const doff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | NFTA_SET_ELEM.DATA);
             try nl.appendAttr(gpa, list, expr.NFTA_DATA.VALUE, d);
-            nl.nestEnd(list, doff);
+            try nl.nestEnd(list, doff);
         }
         if (el.timeout_ms) |t| try nl.appendAttrBe64(gpa, list, NFTA_SET_ELEM.TIMEOUT, t);
-        nl.nestEnd(list, eoff);
+        try nl.nestEnd(list, eoff);
     }
-    nl.nestEnd(list, off);
+    try nl.nestEnd(list, off);
 }
 
 // ── the batch ───────────────────────────────────────────────────────────────
@@ -1308,4 +1308,35 @@ fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
             try testing.expect(steps <= sr.elements.len / 4 + 1);
         }
     }
+}
+
+test "a set-element list too big for one message is refused, not silently truncated" {
+    // ⛔ CRITICAL regression (audit 2026-09-02). The ELEMENTS nest's length is
+    // an `nlattr` u16, and `codec.nestEnd` used to write the low sixteen bits
+    // of whatever the nest had grown to. There is nothing hostile in the
+    // input here -- an ordinary blocklist of a few thousand addresses -- and
+    // the outcome was the worst shape available for a module that writes
+    // firewall policy: the batch COMMITTED, the kernel installed the fraction
+    // the wrapped length described, and `commit()` reported success with
+    // `lastFailure()` null. Measured before the fix: 6000 elements asked for,
+    // 1904 landed (96000 mod 65536 = 30464 bytes = exactly 1904 elements).
+    //
+    // Refusing is this layer's honest answer: splitting the list across
+    // several NEWSETELEM messages, which is what `nft(8)` does, is the
+    // caller's decision to make. Recorded as a follow-up in the ledger.
+    const gpa = testing.allocator;
+    var b = try Batch.init(gpa, 1, .{});
+    defer b.deinit();
+
+    var elems: [6000]SetElem = undefined;
+    var keys: [6000][4]u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        std.mem.writeInt(u32, k, @intCast(0x0A00_0000 + i), .big);
+        elems[i] = .{ .key = k };
+    }
+    try testing.expectError(error.AttrTooLong, b.addSetElems(.inet, "filter", "blocked", null, &elems));
+
+    // A list that does fit still works, so the bound did not become a refusal
+    // of everything.
+    try b.addSetElems(.inet, "filter", "blocked", null, elems[0..1000]);
 }

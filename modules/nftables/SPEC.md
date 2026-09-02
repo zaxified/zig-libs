@@ -278,11 +278,13 @@ Run: `zig build test-nftables` (and `--release=fast`), `unshare -rn zig build te
   through `payloadMaskedCmp` with a caller-supplied 16-byte mask.
 - **Event monitoring.** `NFNLGRP_NFTABLES` multicast (`nft monitor`) is not wired up; the socket
   binds no groups. `conntrack`'s event seam is the shape to copy.
-- **Unanchored header offsets.** `Program.tcpSport` (transport offset 0) and `Program.ipDaddr`
-  (network offset 16, the exact-address form) appear in neither a byte golden nor the netns
-  consistency ruleset — mutating either offset leaves `zig build test-nftables` green in **both**
-  lanes (verified 2026-08-10). The values are right, but nothing would catch a future edit that
-  broke them. Every other `Program` match helper is pinned by a golden or by the consistency test.
+- ~~**Unanchored header offsets.**~~ **CLOSED — `g_rule_tcp_sport` and `g_rule_ip_daddr` landed
+  since.** The bullet said mutating `Program.tcpSport`'s or `Program.ipDaddr`'s offset left
+  `zig build test-nftables` green in both lanes (verified 2026-08-10); re-verified 2026-09-02 and
+  it is no longer true — `.th, 0, 2` → `.th, 6, 2` now exits 1 on
+  `goldens.test.golden: rule — tcp sport 22 counter accept`. Left visible rather than deleted
+  because a backlog entry that outlives its defect costs a future auditor the check it describes:
+  they read "nothing pins this", and skip a check that now works.
 - **Non-x86 goldens.** The captures are little-endian; every golden test skips on a big-endian
   host (netlink's host-endian header fields would differ). The wire layer itself is
   endian-explicit and would need a big-endian capture to be pinned.

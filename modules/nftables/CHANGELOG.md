@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — **Audit (drift campaign): 1 CRITICAL (in `netlink`, reached from here), 2
+  MEDIUM, 2 LOW, 2 doc.** The CRITICAL is `codec.nestEnd`'s silent nest-length truncation — see
+  `netlink`'s entry; from here it meant `addSetElems` with ~4096 elements, or `addRule` with
+  ~3277 expressions, **committed a partially-installed ruleset and reported success**. Refused
+  now (`error.AttrTooLong`), with a regression test at 6000 elements.
+  **MEDIUM — `ifnameCmp` trimmed an over-long interface name** into a `cmp` against its first 16
+  bytes: since no Linux interface can be named that, a `drop` built this way never fired.
+  `nft(8)` refuses the same input ("String exceeds maximum length of 16"); so does
+  `ifnameBytes` now (`InterfaceNameTooLong`).
+  **MEDIUM — `ipv4MaskBytes` accepted prefix lengths 33..63** and returned a mask anyway: `/33`
+  came out as `80000000` in ReleaseFast, the mask of a `/1`. `InvalidPrefixLength` now;
+  `ipPrefix` had always guarded it, the public helper beside it had not.
+  **LOW — `payloadLookup` was missing the `max_value_len` bound** its two `cmp` siblings got when
+  2026-08-11's F3 was fixed: the fix set was incomplete.
+  **LOW — a `limit` rate wrapped when scaled by its unit**, producing a limit far TIGHTER than
+  asked for (1 MiB/s for `(1 << 44) + 1` mbytes/s) with no error in ReleaseFast.
+  **Docs:** `NF_NAT_RANGE_MAP_IPS`'s comment described behaviour this module does not have, and
+  SPEC's "unanchored header offsets" backlog bullet had outlived its defect — a stale bullet
+  makes a future auditor skip a check that now works. Every fix carries a test that goes red when
+  the fix is reverted. Ledger: `~/CML/20260931-zig-libs-audit/nftables.md`.
+
 - **2026-08-18** — **BEHAVIOURAL, not breaking:** two API gaps closed after a
   consumer adopted the native read path and hit both. (1) `Socket.listTables`/
   `listChains`/`listSets`/`listRules`, and `wire.buildDumpRequest`/`buildRuleDumpRequest`,

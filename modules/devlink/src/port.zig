@@ -301,7 +301,7 @@ test "parse decodes a pci_vf representor with no netdev at all" {
     try codec.appendAttrU32(gpa, &list, uapi.ATTR.PORT_CONTROLLER_NUMBER, 0);
     try codec.appendAttrU8(gpa, &list, uapi.ATTR.PORT_EXTERNAL, 0);
     const fn_nest = try codec.nestBegin(gpa, &list, uapi.ATTR.PORT_FUNCTION);
-    codec.nestEnd(&list, fn_nest);
+    try codec.nestEnd(&list, fn_nest);
 
     const p = try parse(list.items);
     try testing.expectEqual(@as(?uapi.PortFlavour, .pci_vf), p.flavour);

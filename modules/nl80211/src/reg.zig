@@ -239,7 +239,7 @@ test "parse: rules decode with kHz→MHz conversion and DFS flags" {
     try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.FREQ_RANGE_MAX_BW, 80_000);
     try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.POWER_RULE_MAX_EIRP, 2000);
     try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.DFS_CAC_TIME, 60_000);
-    codec.nestEnd(&rules, one);
+    codec.nestEnd(&rules, one) catch return error.InvalidRequest;
 
     var msg: std.ArrayList(u8) = .empty;
     defer msg.deinit(gpa);
@@ -247,7 +247,7 @@ test "parse: rules decode with kHz→MHz conversion and DFS flags" {
     try codec.appendAttrU8(gpa, &msg, uapi.ATTR.DFS_REGION, 2); // ETSI
     const nest = try codec.nestBegin(gpa, &msg, uapi.ATTR.REG_RULES);
     try msg.appendSlice(gpa, rules.items);
-    codec.nestEnd(&msg, nest);
+    codec.nestEnd(&msg, nest) catch return error.InvalidRequest;
 
     var d = try parse(gpa, msg.items);
     defer d.deinit(gpa);
@@ -304,8 +304,8 @@ test "parse: malformed regulatory replies error out without leaking rules" {
     const a = try codec.nestBegin(gpa, &msg2, uapi.ATTR.REG_RULES);
     const inner = try codec.nestBegin(gpa, &msg2, 1);
     try codec.appendAttrU32(gpa, &msg2, uapi.REG_RULE_ATTR.FREQ_RANGE_START, 1);
-    codec.nestEnd(&msg2, inner);
-    codec.nestEnd(&msg2, a);
+    codec.nestEnd(&msg2, inner) catch return error.InvalidRequest;
+    codec.nestEnd(&msg2, a) catch return error.InvalidRequest;
     const dup_start = msg2.items.len;
     try msg2.appendSlice(gpa, msg2.items[0..dup_start]);
     try testing.expectError(error.BadLength, parse(gpa, msg2.items));
@@ -315,7 +315,7 @@ test "parse: malformed regulatory replies error out without leaking rules" {
     defer msg3.deinit(gpa);
     const b = try codec.nestBegin(gpa, &msg3, uapi.ATTR.REG_RULES);
     try msg3.appendSlice(gpa, &.{ 0x40, 0x00, 0x01, 0x00, 0xff });
-    codec.nestEnd(&msg3, b);
+    codec.nestEnd(&msg3, b) catch return error.InvalidRequest;
     try testing.expectError(error.Truncated, parse(gpa, msg3.items));
 }
 

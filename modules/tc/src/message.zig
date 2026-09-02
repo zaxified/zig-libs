@@ -164,7 +164,7 @@ pub fn buildQdiscSet(
     if (spec.carriesOptions()) {
         const nest = try codec.nestBegin(gpa, &list, qdisc.TCA.OPTIONS);
         try spec.appendOptions(gpa, &list, ps);
-        codec.nestEnd(&list, nest);
+        codec.nestEnd(&list, nest) catch return error.OptionsTooLong;
     }
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
@@ -209,7 +209,7 @@ pub fn buildClassSet(
     try appendKind(gpa, &list, spec.kind());
     const nest = try codec.nestBegin(gpa, &list, qdisc.TCA.OPTIONS);
     try spec.appendOptions(gpa, &list, ps);
-    codec.nestEnd(&list, nest);
+    codec.nestEnd(&list, nest) catch return error.OptionsTooLong;
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }
@@ -270,7 +270,7 @@ pub fn buildFilterSetWith(
     try appendKind(gpa, &list, spec.kind());
     const nest = try codec.nestBegin(gpa, &list, qdisc.TCA.OPTIONS);
     try spec.appendOptionsWith(gpa, &list, ps);
-    codec.nestEnd(&list, nest);
+    codec.nestEnd(&list, nest) catch return error.OptionsTooLong;
     codec.finishHeader(&list, hdr);
     return list.toOwnedSlice(gpa);
 }

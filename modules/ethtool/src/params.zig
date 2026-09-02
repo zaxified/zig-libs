@@ -603,7 +603,7 @@ test "PAUSE decodes the optional statistics nest" {
     var raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &raw, 42, native_endian);
     try codec.appendAttr(gpa, &list, uapi.PAUSE_STAT.TX_FRAMES, &raw);
-    codec.nestEnd(&list, nest);
+    codec.nestEnd(&list, nest) catch return error.InvalidRequest;
 
     const p = try parsePause(list.items);
     try testing.expectEqual(@as(?bool, true), p.autoneg);

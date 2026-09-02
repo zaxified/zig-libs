@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — **BREAKING: `BuildError` gains `AttrTooLong`.** This module carried its own
+  local copy of `nestEnd` with the same defect the shared one had (a bare `@intCast` of the nest
+  size into a `u16` — silent truncation in ReleaseFast). No shipped path is known to reach it,
+  because the builder bounds its messages with `wouldOverflow`/`startContinuation` — but "no
+  caller reaches it today" is not a guard, and the duplicate meant the fix to
+  `netlink.codec.nestEnd` would not have reached this file. It delegates to the shared one now
+  and propagates its error. Audit 2026-09-02 (drift campaign).
+
 - **2026-08-18** — Portability: `linux32` (`mips-linux-musl`, `mips32,soft_float`)
   compile fix in `transport.zig`'s `ReplayWindow(bits)`, no behavior change.
   Three sites indexed the circular `bitmap` with a bare `(n >> 6) & (blocks -

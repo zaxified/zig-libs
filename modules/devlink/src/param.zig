@@ -423,13 +423,13 @@ fn buildParamNest(
         const v = try codec.nestBegin(gpa, list, uapi.ATTR.PARAM_VALUE);
         if (s.data) |d| try codec.appendAttr(gpa, list, uapi.ATTR.PARAM_VALUE_DATA, d);
         try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_VALUE_CMODE, @intFromEnum(s.cmode));
-        codec.nestEnd(list, v);
+        try codec.nestEnd(list, v);
     }
-    codec.nestEnd(list, vl);
+    try codec.nestEnd(list, vl);
     // Deliberately last: the decoder must not depend on PARAM_TYPE coming
     // before the values it describes.
     if (t) |x| try codec.appendAttrU8(gpa, list, uapi.ATTR.PARAM_TYPE, x);
-    codec.nestEnd(list, nest);
+    try codec.nestEnd(list, nest);
 }
 
 test "parse dispatches the value width on PARAM_TYPE, even when it comes last" {
@@ -645,9 +645,9 @@ test "appendSet round-trips through the decoder for every integer width" {
                 try codec.appendAttr(gpa, &reply, uapi.ATTR.PARAM_VALUE_DATA, a.data);
         }
         try codec.appendAttrU8(gpa, &reply, uapi.ATTR.PARAM_VALUE_CMODE, @intFromEnum(uapi.ParamCmode.runtime));
-        codec.nestEnd(&reply, one);
-        codec.nestEnd(&reply, vl);
-        codec.nestEnd(&reply, nest);
+        try codec.nestEnd(&reply, one);
+        try codec.nestEnd(&reply, vl);
+        try codec.nestEnd(&reply, nest);
 
         var p = try parse(gpa, reply.items);
         defer p.deinit(gpa);

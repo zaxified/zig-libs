@@ -406,7 +406,13 @@ pub const NatFlag = enum {
 
 /// `NF_NAT_RANGE_PROTO_SPECIFIED` — set whenever a port register is present.
 pub const NF_NAT_RANGE_PROTO_SPECIFIED: u32 = 1 << 1;
-/// `NF_NAT_RANGE_MAP_IPS` — set whenever an address register is present.
+/// `NF_NAT_RANGE_MAP_IPS` — declared for completeness; **this module never
+/// sets it**, and neither does `nft(8)` (checked against the `dnat` golden).
+/// The kernel sets it itself when an address register is present. The doc
+/// comment here used to say "set whenever an address register is present",
+/// which described behaviour no code in this module has: harmless, since the
+/// flag ends up on the rule either way, but a reader could not tell that from
+/// the sentence. Audit 2026-09-02.
 pub const NF_NAT_RANGE_MAP_IPS: u32 = 1 << 0;
 
 /// Reject statement variants.

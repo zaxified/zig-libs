@@ -439,9 +439,9 @@ fn buildRegionReply(
     for (ids) |id| {
         const one = try codec.nestBegin(gpa, list, uapi.ATTR.REGION_SNAPSHOT);
         try codec.appendAttrU32(gpa, list, uapi.ATTR.REGION_SNAPSHOT_ID, id);
-        codec.nestEnd(list, one);
+        try codec.nestEnd(list, one);
     }
-    codec.nestEnd(list, snaps);
+    try codec.nestEnd(list, snaps);
 }
 
 /// Build one `REGION_READ` reply message carrying the given chunks.
@@ -457,9 +457,9 @@ fn buildChunks(
         const one = try codec.nestBegin(gpa, list, uapi.ATTR.REGION_CHUNK);
         try codec.appendAttr(gpa, list, uapi.ATTR.REGION_CHUNK_DATA, c.data);
         try uapi.appendAttrU64(gpa, list, uapi.ATTR.REGION_CHUNK_ADDR, c.addr);
-        codec.nestEnd(list, one);
+        try codec.nestEnd(list, one);
     }
-    codec.nestEnd(list, top);
+    try codec.nestEnd(list, top);
 }
 
 test "parseRegion reads the size, the snapshot budget and the snapshot ids" {
@@ -613,8 +613,8 @@ test "Assembler refuses a chunk missing its address or its data" {
     const top = try codec.nestBegin(gpa, &m, uapi.ATTR.REGION_CHUNKS);
     const one = try codec.nestBegin(gpa, &m, uapi.ATTR.REGION_CHUNK);
     try codec.appendAttr(gpa, &m, uapi.ATTR.REGION_CHUNK_DATA, &.{ 1, 2 });
-    codec.nestEnd(&m, one);
-    codec.nestEnd(&m, top);
+    try codec.nestEnd(&m, one);
+    try codec.nestEnd(&m, top);
     try testing.expectError(error.BadLength, a.feed(m.items));
 }
 

@@ -471,7 +471,29 @@ pub fn nestBegin(
 /// Close the nested attribute opened at `off`, patching its length to cover
 /// everything appended since — including each inner attribute's alignment
 /// padding, exactly like the kernel's `nla_nest_end`.
-pub fn nestEnd(list: *std.ArrayList(u8), off: usize) void {
+///
+/// ⛔ **It can fail, and that is the whole point of the error return.** An
+/// `nlattr` length is a `u16`; a nest that has grown past 65535 bytes cannot
+/// be expressed, and until 2026-09-02 this function said so by silently
+/// truncating it — `@intCast` with nothing in front of it. In Debug that is a
+/// panic; in ReleaseFast it is undefined, and what it did in practice was
+/// write the low 16 bits and carry on. The caller then sent a message whose
+/// nest header covered a fraction of the payload, the kernel installed that
+/// fraction, and the `send` reported SUCCESS: measured through `nftables`,
+/// 6000 set elements asked for, batch committed, **1904 landed**, no error
+/// anywhere (96000 mod 65536 = 30464 bytes = exactly 1904 elements). For a
+/// module that writes firewall policy, a partially-installed ruleset reported
+/// as installed is the worst failure shape available.
+///
+/// Its two siblings, `appendAttr` and `appendAttrString`, have always returned
+/// `error.AttrTooLong` for the same condition; this one could not, because it
+/// returned `void`. That asymmetry WAS the defect. Splitting an over-large
+/// nest across several messages — which is what `nft(8)` does — is a caller's
+/// decision, not something this layer can take: refuse, and let the caller
+/// split.
+pub fn nestEnd(list: *std.ArrayList(u8), off: usize) error{AttrTooLong}!void {
+    // By subtraction: `off` is inside the list, so neither term can wrap.
+    if (list.items.len - off > std.math.maxInt(u16)) return error.AttrTooLong;
     const total: u16 = @intCast(list.items.len - off);
     std.mem.writeInt(u16, list.items[off..][0..2], total, native_endian);
 }
@@ -764,6 +786,41 @@ test "NLMSG_ERROR payload yields the errno (and ACK)" {
     try testing.expectError(error.Truncated, cut.errorCode());
 }
 
+test "a nest that cannot fit an nlattr length is refused, not truncated" {
+    // ⛔ CRITICAL regression (audit 2026-09-02). `nestEnd` used to `@intCast`
+    // the nest size into a `u16` with nothing in front of it: a panic in
+    // Debug, and in ReleaseFast the low sixteen bits written and no error at
+    // all. The caller then sent a message whose nest header covered a
+    // fraction of its payload, the kernel installed that fraction, and the
+    // send reported success -- measured through `nftables`: 6000 set elements
+    // asked for, batch committed, 1904 landed.
+    const gpa = std.testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+
+    const off = try nestBegin(gpa, &list, 1);
+    // 700 * 100 bytes = 70 000, comfortably past 65535.
+    var i: usize = 0;
+    while (i < 700) : (i += 1) try appendAttr(gpa, &list, 2, &[_]u8{0xAA} ** 96);
+    try std.testing.expectError(error.AttrTooLong, nestEnd(&list, off));
+    // And the header is left as `nestBegin` wrote it -- no half-truth on the
+    // wire even if a caller ignores the error.
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, list.items[off..][0..2], native_endian));
+
+    // The boundary itself: exactly 65535 bytes is expressible, one more is not.
+    var edge: std.ArrayList(u8) = .empty;
+    defer edge.deinit(gpa);
+    const e_off = try nestBegin(gpa, &edge, 1);
+    try edge.appendNTimes(gpa, 0, std.math.maxInt(u16) - attr_header_len);
+    try nestEnd(&edge, e_off);
+    try std.testing.expectEqual(
+        @as(u16, std.math.maxInt(u16)),
+        std.mem.readInt(u16, edge.items[e_off..][0..2], native_endian),
+    );
+    try edge.append(gpa, 0);
+    try std.testing.expectError(error.AttrTooLong, nestEnd(&edge, e_off));
+}
+
 test "nestBegin/nestEnd length covers inner padding (nla_nest_end)" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
@@ -772,7 +829,7 @@ test "nestBegin/nestEnd length covers inner padding (nla_nest_end)" {
     // `ip link add name X type dummy` puts on the wire (see SPEC.md).
     const off = try nestBegin(gpa, &list, 18);
     try appendAttrString(gpa, &list, 1, "dummy"); // len 10, padded to 12
-    nestEnd(&list, off);
+    try nestEnd(&list, off);
     try testing.expectEqual(@as(usize, 16), list.items.len);
     var it: AttrIterator = .{ .buf = list.items };
     const nest = (try it.next()).?;

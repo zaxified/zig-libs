@@ -75,8 +75,8 @@ pub fn main() !void {
         std.mem.writeInt(u16, sockaddr[2..4], 51820, .big);
         sockaddr[4..8].* = .{ 203, 0, 113, 5 };
         try codec.appendAttr(gpa, &msg, wireguard.WGPEER_A.ENDPOINT, &sockaddr);
-        codec.nestEnd(&msg, entry);
-        codec.nestEnd(&msg, peers);
+        try codec.nestEnd(&msg, entry);
+        try codec.nestEnd(&msg, peers);
     }
 
     var parser: wireguard.DeviceParser = .init(gpa);

@@ -468,7 +468,7 @@ test "split dump: one radio spread over several messages is merged into one" {
         const off = try openNest(gpa, &m, uapi.ATTR.SUPPORTED_IFTYPES);
         try codec.appendAttr(gpa, &m, @intFromEnum(uapi.Iftype.station), &.{});
         try codec.appendAttr(gpa, &m, @intFromEnum(uapi.Iftype.ap), &.{});
-        codec.nestEnd(&m, off);
+        codec.nestEnd(&m, off) catch return error.InvalidRequest;
         try p.feed(m.items);
     }
     // Messages 3 and 4: one channel each, same band — the split-dump shape.
@@ -482,10 +482,10 @@ test "split dump: one radio spread over several messages is merged into one" {
         const entry = try openNest(gpa, &m, ch.idx);
         try codec.appendAttrU32(gpa, &m, uapi.FREQUENCY_ATTR.FREQ, ch.mhz);
         try codec.appendAttrU32(gpa, &m, uapi.FREQUENCY_ATTR.MAX_TX_POWER, 2000);
-        codec.nestEnd(&m, entry);
-        codec.nestEnd(&m, freqs);
-        codec.nestEnd(&m, band0);
-        codec.nestEnd(&m, bands);
+        codec.nestEnd(&m, entry) catch return error.InvalidRequest;
+        codec.nestEnd(&m, freqs) catch return error.InvalidRequest;
+        codec.nestEnd(&m, band0) catch return error.InvalidRequest;
+        codec.nestEnd(&m, bands) catch return error.InvalidRequest;
         try p.feed(m.items);
     }
 
@@ -558,10 +558,10 @@ test "the same channel index arriving twice updates, never duplicates" {
         const entry = try openNest(gpa, &m, 0);
         try codec.appendAttrU32(gpa, &m, uapi.FREQUENCY_ATTR.FREQ, 5500);
         if (second) try codec.appendAttr(gpa, &m, uapi.FREQUENCY_ATTR.RADAR, &.{});
-        codec.nestEnd(&m, entry);
-        codec.nestEnd(&m, freqs);
-        codec.nestEnd(&m, band0);
-        codec.nestEnd(&m, bands);
+        codec.nestEnd(&m, entry) catch return error.InvalidRequest;
+        codec.nestEnd(&m, freqs) catch return error.InvalidRequest;
+        codec.nestEnd(&m, band0) catch return error.InvalidRequest;
+        codec.nestEnd(&m, bands) catch return error.InvalidRequest;
         try p.feed(m.items);
     }
     const list = try p.finish();

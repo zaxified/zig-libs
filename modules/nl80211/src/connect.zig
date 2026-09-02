@@ -189,9 +189,9 @@ pub fn buildConnect(
             try codec.appendAttrU32(gpa, &list, uapi.KEY.CIPHER, try k.cipher());
             try appendRaw(gpa, &list, uapi.KEY.DATA, k.data);
             if (k.default) try appendRaw(gpa, &list, uapi.KEY.DEFAULT, &.{});
-            codec.nestEnd(&list, one);
+            codec.nestEnd(&list, one) catch return error.InvalidRequest;
         }
-        codec.nestEnd(&list, keys);
+        codec.nestEnd(&list, keys) catch return error.InvalidRequest;
     }
 
     if (opts.wpa_versions) |v|

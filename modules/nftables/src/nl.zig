@@ -150,7 +150,7 @@ test "nested attribute round-trip carries NLA_F_NESTED" {
     const off = try nestBegin(testing.allocator, &list, NLA_F_NESTED | 4);
     try appendAttrBe32(testing.allocator, &list, 1, 1);
     try appendAttrBe32(testing.allocator, &list, 2, 0);
-    nestEnd(&list, off);
+    try nestEnd(&list, off);
     try testing.expectEqual(@as(usize, 20), list.items.len);
 
     var it: AttrIterator = .{ .buf = list.items };

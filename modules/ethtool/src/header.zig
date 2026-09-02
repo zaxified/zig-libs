@@ -152,7 +152,7 @@ pub fn append(
     }
     const flags = opts.flagBits();
     if (flags != 0) try codec.appendAttrU32(gpa, list, uapi.HEADER.FLAGS, flags);
-    codec.nestEnd(list, nest);
+    codec.nestEnd(list, nest) catch return error.InvalidRequest;
 }
 
 /// Append a header nest that names **no device**. Not every ethtool request is
@@ -169,7 +169,7 @@ pub fn appendGlobal(
 ) Error!void {
     const nest = try codec.nestBegin(gpa, list, attr_type | codec.NLA_F_NESTED);
     if (flags != 0) try codec.appendAttrU32(gpa, list, uapi.HEADER.FLAGS, flags);
-    codec.nestEnd(list, nest);
+    codec.nestEnd(list, nest) catch return error.InvalidRequest;
 }
 
 /// The device a reply/notification header identifies. The name is copied into
