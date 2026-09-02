@@ -42,12 +42,20 @@ const Expect = vectors_mod.Expect;
 /// json5-tests was built to assert hard failure on non-identifier unquoted
 /// keys. Both are correct for what they're each testing.
 ///
-/// `objects/illegal-unquoted-key-number.txt` ("10twenty: ...") is NOT in
-/// this list even though it looks like the same shape: empirically it
-/// already rejects correctly (the leading digits "10" break object
-/// structure before recovery ever gets a chance), so it needs no carve-out.
+/// `objects/illegal-unquoted-key-number.txt` ("10twenty: ...") used to be
+/// absent from this list, with the reasoning "empirically it already rejects
+/// correctly — the leading digits break object structure before recovery ever
+/// gets a chance". ⚠ It rejected BY THE WRONG ROUTE. What broke the object
+/// structure was the F7 defect: a byte that cannot start a key was copied
+/// into the output with `key_pos` still set, landing ahead of the
+/// `"$err_…":` that followed and producing something that was not JSON at
+/// all. The corpus read that as a correct rejection. With the byte routed
+/// into recovery like every other unspellable key, this case now behaves
+/// exactly like its sibling above — which is the module's deliberate
+/// behaviour, not a new divergence (W2 re-audit 2026-09-02, `json5` F7).
 const known_disagreements = [_][]const u8{
     "objects/illegal-unquoted-key-symbol.txt",
+    "objects/illegal-unquoted-key-number.txt",
 };
 
 fn isKnownDisagreement(path: []const u8) bool {
@@ -136,9 +144,58 @@ test "json5-tests corpus: in-scope fixtures match the upstream extension convent
         checked += 1;
     }
 
-    try testing.expectEqual(@as(usize, 1), skipped_disagreement);
+    try testing.expectEqual(@as(usize, 2), skipped_disagreement);
     try testing.expectEqual(@as(usize, 37), skipped_out_of_scope);
     try testing.expectEqual(vectors_mod.vectors.len, checked + skipped_out_of_scope + skipped_disagreement);
     try testing.expectEqual(@as(usize, 0), resolved_disagreements);
     try testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "json5-tests corpus: the two entry points agree on the document" {
+    const alloc = testing.allocator;
+    // The corpus drove `preprocess` only, so the entry point `root.zig` calls
+    // "the most intricate state machine in the module" had ZERO corpus
+    // coverage (W2 re-audit 2026-09-02, `json5` F2).
+    //
+    // The property asserted is a DIFFERENTIAL, not the README's old absolute
+    // "the output is always valid JSON" — that claim is not achievable and
+    // never was: empty input cannot become valid JSON, and a JSON5 construct
+    // this module defers (`.5`, `5.`, `0x`, an escaped line continuation) is
+    // passed through verbatim for `std.json` to reject, which is the intended
+    // division of labour. What IS achievable, and what a caller relies on, is
+    // that turning diagnostics on does not change whether the document
+    // parses. Eight must-parse plain-JSON numbers failed exactly this before
+    // the exponent fix.
+    var disagreements: usize = 0;
+    for (vectors_mod.vectors) |v| {
+        const plain = try json5.preprocess(alloc, v.content);
+        defer alloc.free(plain);
+        const r = try json5.preprocessAnnotated(alloc, v.content);
+        defer alloc.free(r.out);
+
+        const plain_ok = parsesAsJson(alloc, plain) catch |e| return e;
+        const ann_ok = parsesAsJson(alloc, r.out) catch |e| return e;
+        if (plain_ok != ann_ok) {
+            disagreements += 1;
+            std.debug.print(
+                "\n{s}: preprocess parses={}, preprocessAnnotated parses={}\n  in : {s}\n  out: {s}\n",
+                .{ v.path, plain_ok, ann_ok, v.content, r.out },
+            );
+        }
+    }
+    if (disagreements != 0) {
+        std.debug.print("\n{d} of {d} fixtures disagree between the two entry points\n", .{ disagreements, vectors_mod.vectors.len });
+        return error.EntryPointsDisagree;
+    }
+}
+
+fn parsesAsJson(alloc: std.mem.Allocator, text: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{
+        .duplicate_field_behavior = .use_last,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return false;
+    };
+    parsed.deinit();
+    return true;
 }

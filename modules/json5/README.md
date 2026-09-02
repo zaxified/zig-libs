@@ -24,7 +24,8 @@ defer alloc.free(out);
 
 const r = try json5.preprocessAnnotated(alloc, src);
 defer alloc.free(r.out);
-// r.out is always valid JSON; r.next_id is the next unused $err_<N> id
+// r.out parses exactly when preprocess's output does — diagnostics never
+// change the verdict (SPEC § Threat model); r.next_id is the next unused id
 ```
 
 - **Role:** codec. **Platform:** any.

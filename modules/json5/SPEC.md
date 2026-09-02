@@ -24,10 +24,25 @@ the zig-libs authors (MIT).
 
 Not a security boundary; it is a lenient text preprocessor over untrusted/hand-edited config or
 editor input. It guarantees `preprocess`'s output is either valid transformed JSON or an error
-(never a panic on malformed input), and `preprocessAnnotated`'s output is *always* valid JSON (the
-recovered-error markers keep the document parseable even when the source was broken). It does not
-implement the full JSON5 grammar (see Backlog for the specific gaps) and does not validate
-semantic correctness of the resulting document — only `std.json` syntax validity.
+(never a panic on malformed input).
+
+⚠ `preprocessAnnotated`'s output was documented here as *always* valid JSON. **It is not, and no
+implementation could make it so**: empty input cannot become a valid document, and every JSON5
+construct this module defers (`.5`, `5.`, `0x1f`, `Infinity`, an escaped line continuation) is
+passed through verbatim for `std.json` to reject, which is the intended division of labour. The
+claim also hid real defects — 63 of the 112 vendored corpus fixtures failed it, including eight
+must-parse plain-JSON numbers whose exponent was being split apart, and the fuzz target added to
+guard it asserted only "does not panic", which is `preprocess`'s contract, not this one's
+(W2 re-audit 2026-09-02).
+
+The guarantee that **is** true, and the one a caller actually relies on, is a differential:
+**turning diagnostics on does not change whether the document parses.** `preprocess` and
+`preprocessAnnotated` agree on every one of the 112 corpus fixtures and on fuzzer-drawn input;
+recovery never turns a parseable document into an unparseable one, and never the reverse. What
+the recovered-error markers add is *where* the problem was, not a stronger validity promise.
+
+It does not implement the full JSON5 grammar (see Backlog for the specific gaps) and does not
+validate semantic correctness of the resulting document — only `std.json` syntax validity.
 
 ## Verification
 

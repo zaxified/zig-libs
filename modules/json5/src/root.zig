@@ -22,6 +22,9 @@ pub const meta = .{
 
 /// Preprocess JSON5 source and return a new slice owned by alloc.
 pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
+    const prefix = try diagnosticPrefix(alloc, input, "$err_trace_");
+    defer alloc.free(prefix);
+    var lines: LineCounter = .{};
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     // nest tracks the current container context ("{" or "[") per depth level.
@@ -119,7 +122,13 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                     // is a must-reject case the old silent-swallow accepted.
                     try out.appendSlice(alloc, input[comment_start..input.len]);
                     i = input.len;
+                    continue;
                 }
+                // See the annotated entry point: a comment separates tokens.
+                // `[1/*c*/2]` became `[12]`, turning a must-reject input into
+                // a valid document with a fabricated value
+                // (W2 re-audit 2026-09-02, `json5` F6).
+                try out.append(alloc, ' ');
                 continue;
             }
         }
@@ -190,19 +199,28 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                         // and emit a synthetic $err_trace_N entry so the GUI can surface the
                         // problem without crashing the JSON parser. The key+value pair is
                         // consumed entirely so parsing continues from the next comma or '}'.
-                        var colon = j;
-                        while (colon < input.len and input[colon] != ':') : (colon += 1) {}
-                        const err_line = lineOf(input, key_start);
+                        // Was `while (input[colon] != ':') colon += 1` — unbounded
+                        // to EOF. Two consequences: a tail with no `:` scanned the
+                        // whole remaining input for every malformed key (a second
+                        // O(n²) on top of the one in `lineOf`), and a `:` further
+                        // on absorbed everything up to it, commas and later keys
+                        // included — `{a b: "x'y", c: 2}` swallowed `c` and lost
+                        // the closing brace. The annotated entry point already had
+                        // the bounded, string-aware scan; this one never got it
+                        // (W2 re-audit 2026-09-02, `json5` F4).
+                        const colon = findKeyColon(input, j);
+                        const err_line = lines.at(input, key_start);
                         err_counter += 1;
-                        const head = try std.fmt.allocPrint(alloc, "\"$err_trace_{d}\": ", .{err_counter});
+                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, err_counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
-                        if (colon >= input.len) {
-                            // Malformed: unquoted key with no ':' before end-of-input
+                        if (colon >= input.len or input[colon] != ':') {
+                            // Malformed: unquoted key with no ':' before the end
+                            // of this entry — end of input, or the next `,`/`}`/`]`
                             // (e.g. "{a b"). Consume to the next delimiter so we never
                             // slice past the buffer; mirrors preprocessAnnotated's has_colon guard.
                             const skip_end = skipValue(input, j);
-                            const after = std.mem.trim(u8, input[key_start..skip_end], " \t\r\n");
+                            const after = trimForMessage(input[key_start..skip_end]);
                             const msg = try std.fmt.allocPrint(alloc, "{s} --> missing colon after key at line {d}", .{
                                 after, err_line,
                             });
@@ -210,13 +228,15 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                             try appendJsonStr(&out, alloc, msg);
                             i = skip_end;
                         } else {
-                            const raw_key = std.mem.trim(u8, input[key_start..colon], " \t\r\n");
+                            const raw_key = trimForMessage(input[key_start..colon]);
                             var vs = colon + 1;
                             while (vs < input.len and (input[vs] == ' ' or input[vs] == '\t')) : (vs += 1) {}
                             const val_end = skipValue(input, vs);
-                            const raw_val_full = std.mem.trim(u8, input[vs..val_end], " \t\r\n");
-                            // Truncate to 30 chars so the error message stays compact in the GUI.
-                            const raw_val = if (raw_val_full.len > 30) raw_val_full[0..30] else raw_val_full;
+                            // The value was already capped; the KEY and the
+                            // no-colon tail were not, so a 200 KB key made a
+                            // 200 KB "compact" message (F10). All three now go
+                            // through `trimForMessage`.
+                            const raw_val = trimForMessage(input[vs..val_end]);
                             const msg = try std.fmt.allocPrint(alloc, "{s}: '{s}' --> malformed key at line {d}", .{
                                 raw_key, raw_val, err_line,
                             });
@@ -227,6 +247,29 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                         key_pos = false;
                     }
                 } else {
+                    // See the annotated entry point: a byte that cannot start
+                    // a key, copied out with `key_pos` still true, lands ahead
+                    // of the `"$err_trace_…":` that follows it and breaks the
+                    // document (W2 re-audit 2026-09-02, `json5` F7).
+                    if (key_pos and c != '}' and c != ']' and !isWs(c)) {
+                        const bad_start = i;
+                        const colon = findKeyColon(input, i);
+                        const has_colon = colon < input.len and input[colon] == ':';
+                        const line = lines.at(input, bad_start);
+                        const skip_from = if (has_colon) colon + 1 else bad_start;
+                        const val_end = skipValue(input, skip_from);
+                        const raw = trimForMessage(input[bad_start..val_end]);
+                        err_counter += 1;
+                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, err_counter });
+                        defer alloc.free(head);
+                        try out.appendSlice(alloc, head);
+                        const msg = try std.fmt.allocPrint(alloc, "'{s}' --> key is not an identifier this module accepts, at line {d}", .{ raw, line });
+                        defer alloc.free(msg);
+                        try appendJsonStr(&out, alloc, msg);
+                        i = val_end;
+                        key_pos = false;
+                        continue;
+                    }
                     try out.append(alloc, c);
                     i += 1;
                 }
@@ -280,13 +323,146 @@ fn removeTrailingComma(out: *std.ArrayList(u8)) void {
 }
 
 /// Return the 1-based line number of position `pos` in `input`.
+/// One numeric literal, starting at `start`, as the end index just past it.
+/// Deliberately permissive — hex (`0x1f`), a leading or trailing dot, and an
+/// exponent with a sign are all JSON5, and anything this accepts that JSON
+/// does not is handed to `std.json` to reject. What matters is that the whole
+/// literal is consumed as ONE token, so no part of it is later mistaken for
+/// something else.
+fn scanNumber(input: []const u8, start: usize) usize {
+    var i = start;
+    if (i < input.len and (input[i] == '+' or input[i] == '-')) i += 1;
+    if (i + 1 < input.len and input[i] == '0' and (input[i + 1] == 'x' or input[i + 1] == 'X')) {
+        i += 2;
+        while (i < input.len and std.ascii.isHex(input[i])) : (i += 1) {}
+        return i;
+    }
+    while (i < input.len and (std.ascii.isDigit(input[i]) or input[i] == '.')) : (i += 1) {}
+    if (i < input.len and (input[i] == 'e' or input[i] == 'E')) {
+        var j = i + 1;
+        if (j < input.len and (input[j] == '+' or input[j] == '-')) j += 1;
+        // Only an exponent with at least one digit is part of the number; a
+        // bare `e` is a bare identifier and must stay one.
+        if (j < input.len and std.ascii.isDigit(input[j])) {
+            i = j;
+            while (i < input.len and std.ascii.isDigit(input[i])) : (i += 1) {}
+        }
+    }
+    // A lone sign or dot is not a number; leave it to the byte-copy path
+    // rather than consuming nothing and spinning.
+    return if (i == start) start + 1 else i;
+}
+
+/// The `:` that terminates a malformed key, starting the search at `from`.
+/// Stops at the next `,` / `}` / `]` rather than running to end of input, and
+/// steps over string literals (honouring `\\` escapes) so a colon or a comma
+/// inside one cannot be mistaken for structure. Returns an index at which
+/// `input[i] == ':'`, or an index that is not a colon when there is none.
+/// Trim a raw source fragment for use inside a diagnostic message, and cap
+/// it. The value was already capped at 30 characters "so the error message
+/// stays compact in the GUI"; the raw key and the no-colon tail were not, so a
+/// 200 KB key produced a 200 KB "compact" message
+/// (W2 re-audit 2026-09-02, `json5` F10).
+pub const message_fragment_max = 30;
+
+fn trimForMessage(raw: []const u8) []const u8 {
+    const t = std.mem.trim(u8, raw, " \t\r\n");
+    return if (t.len > message_fragment_max) t[0..message_fragment_max] else t;
+}
+
+/// A diagnostic key prefix that provably does not occur in `input`.
+///
+/// Diagnostics are injected as ordinary object keys with fixed, predictable
+/// names and a counter that starts at 1, and the input was never consulted.
+/// Under `.use_last` — JS `JSON.parse` semantics, and what this module's own
+/// corpus harness uses — a colliding key in the INPUT wins over the injected
+/// one, so `{x y: 1, "$err_trace_1": "all fine"}` reported "all fine" and hid
+/// the real error; under `std.json`'s default the same input turns any
+/// recovered error into `error.DuplicateField`. Either way the caller is
+/// misled (W2 re-audit 2026-09-02, `json5` F9).
+///
+/// The guarantee is by construction, not by hope: find the longest run of `_`
+/// that follows `base` anywhere in the input, and use one more.
+fn diagnosticPrefix(alloc: std.mem.Allocator, input: []const u8, comptime base: []const u8) ![]u8 {
+    var extra: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, input, at, base)) |found| : (at = found + 1) {
+        var k: usize = found + base.len;
+        while (k < input.len and input[k] == '_') : (k += 1) {}
+        // One more underscore than the longest run that already follows the
+        // base anywhere in the input. Absent from the input entirely, the
+        // base is used unchanged — the common case pays nothing.
+        const need = (k - (found + base.len)) + 1;
+        if (need > extra) extra = need;
+    }
+    const out = try alloc.alloc(u8, base.len + extra);
+    @memcpy(out[0..base.len], base);
+    @memset(out[base.len..], '_');
+    return out;
+}
+
+fn findKeyColon(input: []const u8, from: usize) usize {
+    var colon = from;
+    while (colon < input.len) : (colon += 1) {
+        const ch = input[colon];
+        if (ch == ':') break;
+        if (ch == ',' or ch == '}' or ch == ']') break;
+        if (ch == '"' or ch == '\'') {
+            const qc = ch;
+            colon += 1;
+            while (colon < input.len) : (colon += 1) {
+                if (input[colon] == '\\' and colon + 1 < input.len) {
+                    colon += 1;
+                    continue;
+                }
+                if (input[colon] == qc) break;
+            }
+        }
+    }
+    return colon;
+}
+
+/// Test-only: total bytes any line lookup has walked. The complexity claim in
+/// `LineCounter`'s doc is asserted against this rather than against a clock —
+/// a wall-clock ratio in the Debug lane is drowned by allocator noise, and a
+/// timing test that cannot tell the fixed code from the broken code is not a
+/// test (W2 re-audit 2026-09-02, `json5` F3).
+pub var line_scan_bytes: usize = 0;
+
 fn lineOf(input: []const u8, pos: usize) usize {
+    const end = @min(pos, input.len);
+    if (@import("builtin").is_test) line_scan_bytes += end;
     var line: usize = 1;
-    for (input[0..@min(pos, input.len)]) |ch| {
+    for (input[0..end]) |ch| {
         if (ch == '\n') line += 1;
     }
     return line;
 }
+
+/// A forward-only line counter for the recovery paths.
+///
+/// `lineOf` rescans from byte 0, and both entry points call it once per
+/// recovered error, so *n* errors cost O(n²): 1 MB of `{a b,a b,…}` took two
+/// minutes where a well-formed file of the same size took 11 ms. The call
+/// sites are monotonically increasing, so remembering where the last one
+/// stopped makes the whole walk linear; a backwards query (there are none
+/// today) still gets the right answer, just at the old price
+/// (W2 re-audit 2026-09-02, `json5` F3).
+const LineCounter = struct {
+    pos: usize = 0,
+    line: usize = 1,
+
+    fn at(self: *LineCounter, input: []const u8, pos: usize) usize {
+        const p = @min(pos, input.len);
+        if (p < self.pos) return lineOf(input, p);
+        if (@import("builtin").is_test) line_scan_bytes += p - self.pos;
+        for (input[self.pos..p]) |ch| {
+            if (ch == '\n') self.line += 1;
+        }
+        self.pos = p;
+        return self.line;
+    }
+};
 
 /// Skip one JSON5 value starting at `start`. Returns the index of the first
 /// delimiter character after the value (`,` `}` `]`) without consuming it.
@@ -299,17 +475,23 @@ fn lineOf(input: []const u8, pos: usize) usize {
 fn skipValue(input: []const u8, start: usize) usize {
     var i = start;
     var depth: i32 = 0;
-    var in_str = false;
+    // The quote that OPENED the current string, not merely "in a string".
+    // Treating `'` and `"` as interchangeable meant an apostrophe inside a
+    // double-quoted value closed it and the next `"` re-opened one, so the
+    // scan ran past every delimiter to EOF: `{a b: "don't", c: 2, d: 3}` lost
+    // the keys `c` and `d` into a diagnostic string. An apostrophe in English
+    // prose is the trigger (W2 re-audit 2026-09-02, `json5` F5).
+    var quote: ?u8 = null;
     while (i < input.len) : (i += 1) {
         const ch = input[i];
-        if (in_str) {
+        if (quote) |q| {
             if (ch == '\\') {
                 i += 1;
                 continue;
             }
-            if (ch == '"' or ch == '\'') in_str = false;
+            if (ch == q) quote = null;
         } else switch (ch) {
-            '"', '\'' => in_str = true,
+            '"', '\'' => quote = ch,
             '{', '[' => depth += 1,
             '}', ']' => {
                 if (depth == 0) return i;
@@ -412,11 +594,12 @@ fn flushValueErrs(
     alloc: std.mem.Allocator,
     errs: *std.ArrayList([]u8),
     counter: *u32,
+    prefix: []const u8,
 ) !void {
     for (errs.items) |msg| {
         try out.appendSlice(alloc, ", ");
         counter.* += 1;
-        const head = try std.fmt.allocPrint(alloc, "\"$err_{d}\": ", .{counter.*});
+        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, counter.* });
         defer alloc.free(head);
         try out.appendSlice(alloc, head);
         try appendJsonStr(out, alloc, msg);
@@ -444,6 +627,9 @@ fn isInObject(nest: []const u8) bool {
 /// site: gate any change here behind the existing recovery unit tests, not
 /// just the happy path.
 pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !AnnotatedResult {
+    const prefix = try diagnosticPrefix(alloc, input, "$err_");
+    defer alloc.free(prefix);
+    var lines: LineCounter = .{};
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     var nest: std.ArrayList(u8) = .empty;
@@ -478,12 +664,23 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
             while (i < input.len) {
                 const sc = input[i];
                 if (sc == '\n' or sc == '\r') {
+                    // Recovery needs somewhere to put its diagnostic, and a
+                    // `$err_<N>` can only be a sibling key inside an object.
+                    // Outside one this branch closed the string, dropped the
+                    // rest, and reported NOTHING: the must-reject fixture
+                    // `"foo\nbar"` became the document `"foo"`, valid and
+                    // silently truncated, while `preprocess` rejected it.
+                    // With nowhere to report, the honest move is not to
+                    // recover (W2 re-audit 2026-09-02, `json5` F2).
+                    if (!isInObject(nest.items)) {
+                        try out.append(alloc, sc);
+                        i += 1;
+                        continue;
+                    }
                     try out.append(alloc, '"');
                     closed = true;
-                    if (isInObject(nest.items)) {
-                        const msg = try std.fmt.allocPrint(alloc, "unterminated string at line {d}", .{lineOf(input, str_start)});
-                        try pending_value_errs.append(alloc, msg);
-                    }
+                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at line {d}", .{lines.at(input, str_start)});
+                    try pending_value_errs.append(alloc, msg);
                     i = skipValue(input, i);
                     break;
                 }
@@ -500,7 +697,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
             if (!closed) {
                 try out.append(alloc, '"');
                 if (isInObject(nest.items)) {
-                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lineOf(input, str_start)});
+                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
                     try pending_value_errs.append(alloc, msg);
                 }
             }
@@ -520,7 +717,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                     try out.append(alloc, '"');
                     closed = true;
                     if (isInObject(nest.items)) {
-                        const msg = try std.fmt.allocPrint(alloc, "unterminated string at line {d}", .{lineOf(input, str_start)});
+                        const msg = try std.fmt.allocPrint(alloc, "unterminated string at line {d}", .{lines.at(input, str_start)});
                         try pending_value_errs.append(alloc, msg);
                     }
                     i = skipValue(input, i);
@@ -549,7 +746,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
             if (!closed) {
                 try out.append(alloc, '"');
                 if (isInObject(nest.items)) {
-                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lineOf(input, str_start)});
+                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
                     try pending_value_errs.append(alloc, msg);
                 }
             }
@@ -566,14 +763,38 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                 continue;
             }
             if (input[i + 1] == '*') {
+                const comment_start = i;
+                var closed = false;
                 i += 2;
                 while (i + 1 < input.len) {
                     if (input[i] == '*' and input[i + 1] == '/') {
                         i += 2;
+                        closed = true;
                         break;
                     }
                     i += 1;
                 }
+                if (!closed) {
+                    // `preprocess` got this fix from the corpus; this entry
+                    // point never did, and it had a second bug on top: the
+                    // inner loop exits at `input.len - 1`, so the comment's
+                    // LAST BYTE was reprocessed as ordinary input —
+                    // `{a: 1 /*cZ` came out as `{"a": 1 "Z", "$err_1": …}`,
+                    // and `[1,2/* junk]` had the `]` inside the comment close
+                    // the array and parse clean. Copy the unterminated
+                    // comment through so `std.json` rejects it, the way the
+                    // must-reject fixture expects
+                    // (W2 re-audit 2026-09-02, `json5` F8).
+                    try out.appendSlice(alloc, input[comment_start..input.len]);
+                    i = input.len;
+                    continue;
+                }
+                // A comment is a token SEPARATOR, not nothing: deleting its
+                // bytes made the tokens on either side adjacent, so
+                // `[1/*c*/2]` became `[12]` — a must-reject input turned into
+                // a valid document with a fabricated value, which is worse
+                // than a rejection (W2 re-audit 2026-09-02, `json5` F6).
+                try out.append(alloc, ' ');
                 continue;
             }
         }
@@ -587,7 +808,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                 i += 1;
             },
             '}' => {
-                try flushValueErrs(&out, alloc, &pending_value_errs, &counter);
+                try flushValueErrs(&out, alloc, &pending_value_errs, &counter, prefix);
                 _ = nest.pop();
                 key_pos = false;
                 removeTrailingComma(&out);
@@ -614,7 +835,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                 i += 1;
             },
             ',' => {
-                try flushValueErrs(&out, alloc, &pending_value_errs, &counter);
+                try flushValueErrs(&out, alloc, &pending_value_errs, &counter, prefix);
                 key_pos = nest.items.len > 0 and nest.items[nest.items.len - 1] == '{';
                 try out.append(alloc, c);
                 i += 1;
@@ -637,30 +858,11 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                         try out.append(alloc, '"');
                         key_pos = false;
                     } else {
-                        // Scan for ':' but stop at the next ',' / '}' / ']' so
-                        // we don't absorb a later key's colon. Skip over string
-                        // literals so their bytes don't interfere.
-                        var colon = j;
-                        while (colon < input.len) : (colon += 1) {
-                            const ch = input[colon];
-                            if (ch == ':') break;
-                            if (ch == ',' or ch == '}' or ch == ']') break;
-                            if (ch == '"' or ch == '\'') {
-                                const qc = ch;
-                                colon += 1;
-                                while (colon < input.len) : (colon += 1) {
-                                    if (input[colon] == '\\' and colon + 1 < input.len) {
-                                        colon += 1;
-                                        continue;
-                                    }
-                                    if (input[colon] == qc) break;
-                                }
-                            }
-                        }
+                        const colon = findKeyColon(input, j);
                         const has_colon = colon < input.len and input[colon] == ':';
-                        const err_line = lineOf(input, key_start);
+                        const err_line = lines.at(input, key_start);
                         counter += 1;
-                        const head = try std.fmt.allocPrint(alloc, "\"$err_{d}\": ", .{counter});
+                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
                         if (!has_colon) {
@@ -668,7 +870,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                             // don't lose subsequent keys in this object.
                             const skip_end = skipValue(input, j);
                             const after_full = std.mem.trim(u8, input[j..skip_end], " \t\r\n");
-                            const after = if (after_full.len > 30) after_full[0..30] else after_full;
+                            const after = trimForMessage(after_full);
                             const msg = try std.fmt.allocPrint(alloc, "{s} {s} --> missing colon after key at line {d}", .{
                                 input[key_start..i], after, err_line,
                             });
@@ -676,12 +878,11 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                             try appendJsonStr(&out, alloc, msg);
                             i = skip_end;
                         } else {
-                            const raw_key = std.mem.trim(u8, input[key_start..colon], " \t\r\n");
+                            const raw_key = trimForMessage(input[key_start..colon]);
                             var vs = colon + 1;
                             while (vs < input.len and (input[vs] == ' ' or input[vs] == '\t')) : (vs += 1) {}
                             const val_end = skipValue(input, vs);
-                            const raw_val_full = std.mem.trim(u8, input[vs..val_end], " \t\r\n");
-                            const raw_val = if (raw_val_full.len > 30) raw_val_full[0..30] else raw_val_full;
+                            const raw_val = trimForMessage(input[vs..val_end]);
                             const ws_kind = whitespaceKind(input[i..colon]);
                             const msg = try std.fmt.allocPrint(alloc, "{s}: '{s}' --> malformed key ({s} in key) at line {d}", .{
                                 raw_key, raw_val, ws_kind, err_line,
@@ -692,6 +893,20 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                         }
                         key_pos = false;
                     }
+                } else if (!key_pos and (std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.')) {
+                    // A NUMERIC LITERAL is one token. Without this branch the
+                    // scanner copied the digits through byte by byte and then
+                    // met the `e` of an exponent in value position, where the
+                    // bare-identifier branch below claimed it: `{"a": 1e10}`
+                    // — plain RFC 8259 JSON, not even a JSON5 extension —
+                    // came out as `{"a": 1"e10", "$err_1": …}`, which is not
+                    // valid JSON at all. Eight must-parse fixtures already
+                    // vendored in this repo exercise it, and none of them ran
+                    // against this entry point
+                    // (W2 re-audit 2026-09-02, `json5` F1).
+                    const num_start = i;
+                    i = scanNumber(input, i);
+                    try out.appendSlice(alloc, input[num_start..i]);
                 } else if (!key_pos and std.ascii.isAlphabetic(c)) {
                     // Bare identifier in value position. Two cases:
                     //   (a) Followed by ':' inside an object → the comma between the
@@ -719,13 +934,13 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                     if (looks_like_key) {
                         // Case (a): flush any pending errors first so they are
                         // associated with the previous value, then inject the separator.
-                        try flushValueErrs(&out, alloc, &pending_value_errs, &counter);
+                        try flushValueErrs(&out, alloc, &pending_value_errs, &counter, prefix);
                         if (needsLeadingComma(out.items)) try out.appendSlice(alloc, ", ");
-                        const err_line = lineOf(input, start);
+                        const err_line = lines.at(input, start);
                         const msg = try std.fmt.allocPrint(alloc, "missing comma before '{s}' at line {d}", .{ ident, err_line });
                         defer alloc.free(msg);
                         counter += 1;
-                        const head = try std.fmt.allocPrint(alloc, "\"$err_{d}\": ", .{counter});
+                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
                         try appendJsonStr(&out, alloc, msg);
@@ -739,7 +954,18 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                         i = jp;
                         if (std.mem.eql(u8, ident, "true") or
                             std.mem.eql(u8, ident, "false") or
-                            std.mem.eql(u8, ident, "null"))
+                            std.mem.eql(u8, ident, "null") or
+                            // `Infinity`/`NaN` are JSON5 NUMBERS this module
+                            // defers (README Deferred #3). Wrapping them in
+                            // quotes did not defer them — it fabricated the
+                            // string "Infinity" where a number belonged, and
+                            // made a document parse that `preprocess` (and
+                            // the deferred contract) rejects. Pass them
+                            // through for `std.json` to refuse, like every
+                            // other deferred construct
+                            // (W2 re-audit 2026-09-02, `json5` F2).
+                            std.mem.eql(u8, ident, "Infinity") or
+                            std.mem.eql(u8, ident, "NaN"))
                         {
                             try out.appendSlice(alloc, ident);
                         } else {
@@ -749,7 +975,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                             try out.appendSlice(alloc, ident);
                             try out.append(alloc, '"');
                             if (isInObject(nest.items)) {
-                                const err_line = lineOf(input, start);
+                                const err_line = lines.at(input, start);
                                 const msg = try std.fmt.allocPrint(alloc, "'{s}' --> invalid literal in value position at line {d}", .{
                                     ident, err_line,
                                 });
@@ -758,6 +984,33 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                         }
                     }
                 } else {
+                    // A byte this module cannot start a key with, in key
+                    // position. Copying it out here — with `key_pos` still
+                    // true — put it in the document AHEAD of the `"$err_…":`
+                    // the recovery path was about to emit, so `{été: 1}` came
+                    // out as `{é"$err_1": …}`: not JSON, and the siblings
+                    // after it were lost too. Route it into recovery instead,
+                    // which is what every other unspellable key does
+                    // (W2 re-audit 2026-09-02, `json5` F7).
+                    if (key_pos and c != '}' and c != ']' and !isWs(c)) {
+                        const bad_start = i;
+                        const colon = findKeyColon(input, i);
+                        const has_colon = colon < input.len and input[colon] == ':';
+                        const line = lines.at(input, bad_start);
+                        const skip_from = if (has_colon) colon + 1 else bad_start;
+                        const val_end = skipValue(input, skip_from);
+                        const raw = trimForMessage(input[bad_start..val_end]);
+                        counter += 1;
+                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, counter });
+                        defer alloc.free(head);
+                        try out.appendSlice(alloc, head);
+                        const msg = try std.fmt.allocPrint(alloc, "'{s}' --> key is not an identifier this module accepts, at line {d}", .{ raw, line });
+                        defer alloc.free(msg);
+                        try appendJsonStr(&out, alloc, msg);
+                        i = val_end;
+                        key_pos = false;
+                        continue;
+                    }
                     try out.append(alloc, c);
                     i += 1;
                 }
@@ -773,7 +1026,7 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
     // structure); array contexts drop their queued errs silently, mirroring
     // the in-stream `]` handler.
     if (isInObject(nest.items)) {
-        try flushValueErrs(&out, alloc, &pending_value_errs, &counter);
+        try flushValueErrs(&out, alloc, &pending_value_errs, &counter, prefix);
     } else {
         dropValueErrs(alloc, &pending_value_errs);
     }
@@ -798,9 +1051,33 @@ test "single-line comment" {
 
 test "multi-line comment" {
     const alloc = std.testing.allocator;
+    // A comment leaves a SPACE behind, not nothing: two tokens separated only
+    // by a comment must not become adjacent (`[1/*c*/2]` -> `[12]`).
     const out = try preprocess(alloc, "{/* hi */\"a\":1}");
     defer alloc.free(out);
-    try std.testing.expectEqualStrings("{\"a\":1}", out);
+    try std.testing.expectEqualStrings("{ \"a\":1}", out);
+}
+
+test "a block comment separates tokens instead of joining them" {
+    const alloc = std.testing.allocator;
+    // `[1/*c*/2]` used to come out `[12]` — a must-reject input turned into a
+    // valid document with a value that is in neither the input nor the spec,
+    // which is strictly worse than a rejection
+    // (W2 re-audit 2026-09-02, `json5` F6).
+    inline for (.{ "[1/*c*/2]", "{a:1/*c*/2}", "{a:1,b:2/*x*/3}" }) |src| {
+        inline for (.{ true, false }) |annotated| {
+            const out = if (annotated) blk: {
+                const r = try preprocessAnnotated(alloc, src);
+                break :blk r.out;
+            } else try preprocess(alloc, src);
+            defer alloc.free(out);
+            if (std.json.parseFromSlice(std.json.Value, alloc, out, .{})) |p| {
+                p.deinit();
+                std.debug.print("\n{s} -> {s} parsed, but the input is not JSON5\n", .{ src, out });
+                return error.CommentJoinedTwoTokens;
+            } else |_| {}
+        }
+    }
 }
 
 test "unquoted key" {
@@ -1118,8 +1395,43 @@ fn fuzzPreprocessAnnotated(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const r = preprocessAnnotated(alloc, buf[0..len]) catch return;
-    alloc.free(r.out);
+    const input = buf[0..len];
+    const r = preprocessAnnotated(alloc, input) catch return;
+    defer alloc.free(r.out);
+
+    // The ORACLE, which this target did not have: "does not panic" is
+    // `preprocess`'s contract, not this one's. What a caller relies on here
+    // is that turning diagnostics on does not change whether the document
+    // parses — the two entry points must agree. Asserting "the output is
+    // always valid JSON" instead would be asserting something untrue and
+    // untrueable: empty input, and every JSON5 construct this module defers,
+    // are passed through for `std.json` to reject on purpose
+    // (W2 re-audit 2026-09-02, `json5` F2).
+    const plain = preprocess(alloc, input) catch return;
+    defer alloc.free(plain);
+    const ann_ok = jsonParses(alloc, r.out);
+    const plain_ok = jsonParses(alloc, plain);
+    if (ann_ok != plain_ok) {
+        std.debug.print(
+            "\nentry points disagree on {f}\n  preprocess ({}): {f}\n  annotated  ({}): {f}\n",
+            .{
+                std.ascii.hexEscape(input, .lower),
+                plain_ok,
+                std.ascii.hexEscape(plain, .lower),
+                ann_ok,
+                std.ascii.hexEscape(r.out, .lower),
+            },
+        );
+        return error.EntryPointsDisagree;
+    }
+}
+
+fn jsonParses(alloc: std.mem.Allocator, text: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{
+        .duplicate_field_behavior = .use_last,
+    }) catch return false;
+    parsed.deinit();
+    return true;
 }
 
 // ── external anchor: json5/json5-tests corpus ───────────────────────────────
@@ -1127,4 +1439,153 @@ fn fuzzPreprocessAnnotated(_: void, smith: *std.testing.Smith) !void {
 test {
     _ = @import("json5_tests_vectors.zig");
     _ = @import("json5_tests_test.zig");
+}
+
+test "annotated: an exponent is part of the number, not a bare identifier" {
+    const gpa = std.testing.allocator;
+    // `1e10` is plain RFC 8259 JSON, not even a JSON5 extension. The
+    // bare-identifier branch fired on the `e` because it is alphabetic and
+    // the scanner had no idea it was inside a numeric literal, so the number
+    // was split, quoted, and a bogus diagnostic queued — and the result was
+    // not valid JSON at all (W2 re-audit 2026-09-02, `json5` F1).
+    const cases = [_][]const u8{
+        "{\"a\": 1e10}",
+        "{a: 1.5e-3}",
+        "{a: 2E7}",
+        "[1e10]",
+        "{a: 1.2e3, b: 2e-23}",
+        "[0e0, -0E+0, 1e+2]",
+    };
+    for (cases) |src| {
+        const r = try preprocessAnnotated(gpa, src);
+        defer gpa.free(r.out);
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, r.out, .{
+            .duplicate_field_behavior = .use_last,
+        }) catch |e| {
+            std.debug.print("\nannotated({s}) -> {s} : {s}\n", .{ src, r.out, @errorName(e) });
+            return error.AnnotatedEmittedInvalidJson;
+        };
+        parsed.deinit();
+        if (std.mem.indexOf(u8, r.out, "$err") != null) {
+            std.debug.print("\nannotated({s}) -> {s}\n", .{ src, r.out });
+            return error.DiagnosedAValidNumber;
+        }
+    }
+}
+
+test "a malformed file costs work proportional to its size, not to its square" {
+    const gpa = std.testing.allocator;
+    // `lineOf` rescanned from byte 0 for every recovered error, and
+    // `preprocess`'s colon scan ran to EOF for every malformed key: 1 MB of
+    // `{a b,a b,…}` took 123 s through `preprocess` and 61 s through
+    // `preprocessAnnotated`, against 11 ms for a well-formed file of the same
+    // size — a 10 700x ratio on input a GUI accepts from a user
+    // (W2 re-audit 2026-09-02, `json5` F3/F4).
+    //
+    // Asserted on WORK, not on a clock: `line_scan_bytes` counts every byte
+    // any line lookup walks, so "linear" is a statement about this input and
+    // not about this machine. A wall-clock ratio in the Debug lane could not
+    // tell the fixed code from the broken code at any size a test may spend —
+    // measured, 64 KB of this input gave 5x for 4x the input either way.
+    const n = 2000;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.append(gpa, '{');
+    for (0..n) |_| try src.appendSlice(gpa, "a b,");
+    try src.append(gpa, '}');
+
+    inline for (.{ true, false }) |annotated| {
+        line_scan_bytes = 0;
+        const out = if (annotated) blk: {
+            const r = try preprocessAnnotated(gpa, src.items);
+            break :blk r.out;
+        } else try preprocess(gpa, src.items);
+        gpa.free(out);
+        // One forward pass over the input, and nothing more. Quadratic would
+        // be about n/2 * len ~= 8 million bytes here; the cap is 2x the input.
+        if (line_scan_bytes > src.items.len * 2) {
+            std.debug.print(
+                "\n{s}: {d} bytes of input, {d} bytes walked counting lines\n",
+                .{ if (annotated) "preprocessAnnotated" else "preprocess", src.items.len, line_scan_bytes },
+            );
+            return error.QuadraticInInputSize;
+        }
+    }
+}
+
+test "a key this module cannot spell does not corrupt the document around it" {
+    const gpa = std.testing.allocator;
+    // JSON5 unquoted keys are ECMAScript IdentifierName — Unicode letters,
+    // `$`, `_`, `\uXXXX`. This module accepts ASCII alphanumerics, `_` and
+    // `$` only, which is a documented limitation; what is not acceptable is
+    // what happened next. A non-identifier byte in key position fell through
+    // to the plain byte-copy path with `key_pos` still true, so it landed in
+    // the output BEFORE the recovery machinery emitted its `"$err_…":` — and
+    // `{été: 1, b: 2}` came out as `{é"$err_1": "…", "b": 2}`, which is not
+    // JSON at all, so the sibling `b` was lost along with it
+    // (W2 re-audit 2026-09-02, `json5` F7).
+    const cases = [_][]const u8{
+        "{\u{e9}t\u{e9}: 1, b: 2}",
+        "{a /*c*/: 1, b: 2}",
+        "{a\n: 1, b: 2}",
+        "{\u{4e2d}\u{6587}: 1}",
+    };
+    for (cases) |src| {
+        inline for (.{ true, false }) |annotated| {
+            const out = if (annotated) blk: {
+                const r = try preprocessAnnotated(gpa, src);
+                break :blk r.out;
+            } else try preprocess(gpa, src);
+            defer gpa.free(out);
+            const parsed = std.json.parseFromSlice(std.json.Value, gpa, out, .{
+                .duplicate_field_behavior = .use_last,
+            }) catch |e| {
+                std.debug.print("\n{s}({s}) -> {s} : {s}\n", .{
+                    if (annotated) "annotated" else "preprocess", src, out, @errorName(e),
+                });
+                return error.EmittedInvalidJson;
+            };
+            parsed.deinit();
+        }
+    }
+}
+
+test "a diagnostic key cannot be shadowed by one the input chose" {
+    const gpa = std.testing.allocator;
+    // The `$err` namespace was not reserved against the input: a colliding
+    // key with a predictable name and a counter starting at 1 was enough to
+    // hide the real diagnostic under `.use_last` (JS `JSON.parse` semantics,
+    // and what this module's own corpus harness uses), or to turn any
+    // recovered error into `error.DuplicateField` under `std.json`'s default
+    // (W2 re-audit 2026-09-02, `json5` F9).
+    {
+        const src = "{x y: 1, \"$err_trace_1\": \"all fine\"}";
+        const out = try preprocess(gpa, src);
+        defer gpa.free(out);
+        // The default duplicate behaviour is the sharper oracle: a collision
+        // is a hard parse failure there, so this parsing at all is the claim.
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("$err_trace_1") != null);
+        try std.testing.expectEqualStrings("all fine", parsed.value.object.get("$err_trace_1").?.string);
+        // …and the real diagnostic is still there, under a name the input
+        // could not have chosen.
+        var found_real = false;
+        var it = parsed.value.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.startsWith(u8, e.key_ptr.*, "$err_trace_") and
+                !std.mem.eql(u8, e.key_ptr.*, "$err_trace_1")) found_real = true;
+        }
+        try std.testing.expect(found_real);
+    }
+    {
+        // Escalation is by construction, not by hope: an input that already
+        // uses the escaped name gets one more underscore again.
+        const src = "{x y: 1, \"$err_1\": \"a\", \"$err__1\": \"b\", \"$err___1\": \"c\"}";
+        const r = try preprocessAnnotated(gpa, src);
+        defer gpa.free(r.out);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, r.out, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("$err____1") != null);
+    }
 }
