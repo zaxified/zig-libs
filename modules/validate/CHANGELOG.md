@@ -5,6 +5,40 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — **Audit (drift campaign): 4 MEDIUM, 3 LOW.** No memory-safety defect and no
+  mode difference anywhere; every finding is about a rule that did not do what it says.
+  **MEDIUM, BEHAVIOURAL — `kind = .any` no longer voids every constraint.** `.any` is the
+  DEFAULT `kind`, and it used to skip the whole constraint switch — so one omitted
+  `.kind = .string` turned a rule carrying `required`, `format`, `min_len`, `max_len`, `one_of`
+  and `pattern` into a silent no-op (`ok() == true` on input violating all six), with no comptime
+  or runtime signal. It now means "any TYPE is acceptable": whatever type arrives is held to the
+  constraints the rule states. A rule with no constraints is unaffected, which is what `.any` was
+  for. **A validator that fails open by default is worse than no validator.**
+  **MEDIUM — new `min_bytes`/`max_bytes`, and the derived `[N]u8` rule uses them.** When lengths
+  became code points, `rulesFor(struct { fixed: [16]u8 })` kept emitting `min_len = max_len = 16`
+  — 16 CHARACTERS against a decoder that fills 16 BYTES. `"éééééééé"` (16 bytes, 8 code points)
+  decodes perfectly and was REJECTED; a 16-code-point/17-byte string passed the rule and then
+  failed inside `parseFromValue` as an unpathed root `invalid`. `rulesFor` is `pub`, so the
+  false-yes is reachable without the decode.
+  **MEDIUM — `max_errors` now bounds the WORK, not just the list.** The cap was checked inside
+  `append`, after `appendf` had already formatted the message, and `indexPath` allocated a path
+  for every array element regardless of outcome. Measured: a 996 KiB body of 340 000 nodes — all
+  of it inside the DEFAULT `Limits` — built 339 000 messages nobody could read and held an
+  **18 802 KiB** report arena for the 1000 errors it kept. Pinned by a counting allocator with a
+  4 MiB ceiling; the old code overshoots it by 4.7×.
+  **MEDIUM — three of the four `Limits` defaults SPEC names as the security control had nothing
+  pinning them.** Raising `max_array_elements` 10 000→1e8, `max_object_members` 1 000→1e8 or
+  `max_total_nodes` 1e6→1e11 each left the suite fully green; the one test that claimed to cover
+  this exercised `max_depth` alone. The defaults worked — nothing would have noticed them
+  stopping.
+  **LOW — docs:** `README` and `Rule`'s struct doc still said string lengths are BYTES, which is
+  what made the `[N]u8` defect easy to miss; the README's RFC list now names the one place
+  `date`/`time`/`date_time` are laxer than RFC 3339 (the optional offset).
+  **LOW — `isEmail`'s documented 254-byte ceiling** and **the offset-optional date-time profile**
+  are pinned. Removing the email cap left the suite green while 255–318-byte addresses became
+  acceptable; the date-time choice had no corpus case at all in either direction.
+  Ledger: `~/CML/20260931-zig-libs-audit/validate.md`.
+
 - **2026-07-28** — Security audit: the module's untrusted-input surface gained fuzz
   harnesses — `fuzzValidateJson` and `fuzzValidateFormat` (the latter across all 12
   formats) — which it had none of, unlike the sibling wire parsers. Tests only.

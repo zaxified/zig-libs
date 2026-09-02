@@ -93,8 +93,19 @@ const Value = std.json.Value;
 
 // ── the rule vocabulary ─────────────────────────────────────────────────────
 
-/// Expected JSON type of a field. `.any` skips the type gate (only
-/// `required`/`allow_null`/`custom` apply).
+/// Expected JSON type of a field.
+///
+/// `.any` skips the TYPE GATE and nothing else: whatever type arrives is
+/// still held to the constraints the rule states — a string to `min_len`,
+/// `format`, `one_of`, `pattern`; a number to `min`/`max`; an array to
+/// `items`; an object to `fields`.
+///
+/// ⛔ It used to skip every constraint, and since it is the DEFAULT `kind`
+/// that made a forgotten `.kind = .string` into a silent no-op: a rule
+/// carrying `required`, `format`, `min_len`, `max_len`, `one_of` and
+/// `pattern` returned `ok() == true` for input that violated all of them.
+/// A validator that fails open by default is worse than no validator, because
+/// someone is relying on it. Audit 2026-09-02.
 pub const Kind = enum { string, int, float, bool, array, object, any };
 
 /// Simple string pattern — deliberately not regex (see the module TODO).
@@ -163,9 +174,12 @@ pub const Custom = struct {
 };
 
 /// One field rule. Constraints apply per kind: `min`/`max` to numerics,
-/// `min_len`/`max_len` to strings (bytes) and arrays (items), `one_of`,
-/// `pattern` and `format` to strings, `fields` to objects, `items` to
-/// arrays. Constraints for other kinds are ignored.
+/// `min_len`/`max_len` to strings (**Unicode code points**, pydantic's
+/// contract) and arrays (items), `min_bytes`/`max_bytes` to a string's
+/// ENCODED length, `one_of`, `pattern` and `format` to strings, `fields` to
+/// objects, `items` to arrays.
+///
+/// ⚠ `kind = .any` does not switch the constraints off — see `Kind.any`.
 pub const Rule = struct {
     /// Object key this rule applies to (ignored on `items` element rules).
     field: []const u8,
@@ -184,6 +198,19 @@ pub const Rule = struct {
     /// length in items. Invalid UTF-8 fails closed (`string_unicode`).
     min_len: ?usize = null,
     max_len: ?usize = null,
+    /// String length in BYTES, for the callers who mean bytes — a fixed-width
+    /// buffer, a column width, a wire field.
+    ///
+    /// ⛔ It exists because the two are not interchangeable and the derived
+    /// schema needs the byte one. `rulesFor(struct { fixed: [16]u8 })` used to
+    /// emit `min_len = max_len = 16`, which after the code-point fix meant 16
+    /// CHARACTERS while `std.json` still decodes 16 BYTES: `"éééééééé"` (16
+    /// bytes, 8 code points) was rejected as too short although it decodes
+    /// perfectly, and a 16-code-point/17-byte string passed the rule and then
+    /// failed inside `parseFromValue` as an unpathed root `invalid`. Audit
+    /// 2026-09-02.
+    min_bytes: ?usize = null,
+    max_bytes: ?usize = null,
     /// One-of allow-list for strings (the JSON Schema `enum` keyword; named
     /// `one_of` because `enum` is a Zig keyword).
     one_of: ?[]const []const u8 = null,
@@ -309,7 +336,23 @@ const Builder = struct {
         b.list.shrinkRetainingCapacity(write);
     }
 
+    /// True once the error list is full: nothing more will be retained, so
+    /// nothing more needs to be BUILT.
+    fn full(b: *const Builder) bool {
+        return b.list.items.len >= max_errors;
+    }
+
     fn appendf(b: *Builder, path: []const u8, code: []const u8, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+        // ⛔ The cap is checked BEFORE the message is formatted. It used to be
+        // checked only inside `append`, so every error past the cap still
+        // paid an `allocPrint` into the report arena and was then dropped on
+        // the floor. Measured (audit 2026-09-02): a 996 KiB body of 340 000
+        // nodes -- all of it inside the DEFAULT `Limits` -- built 339 000
+        // formatted messages nobody could read and left an 18 802 KiB report
+        // arena behind, for the 1000 errors it retained. `Builder.append`'s
+        // own doc said the cap "bounds worst-case aggregation work"; it
+        // bounded `dedupeFrom`.
+        if (b.full()) return;
         try b.append(path, code, try std.fmt.allocPrint(b.a(), fmt, args));
     }
 
@@ -319,6 +362,12 @@ const Builder = struct {
     }
 
     fn indexPath(b: *Builder, prefix: []const u8, i: usize) Allocator.Error![]const u8 {
+        // Same reasoning as `appendf`: once the list is full this path can
+        // only ever be discarded, and it was being allocated for EVERY array
+        // element regardless of outcome -- 2 829 KiB of arena for a *valid*
+        // 1015 KiB body. The empty path is safe here because a full builder
+        // appends nothing that could carry it.
+        if (b.full()) return "";
         return std.fmt.allocPrint(b.a(), "{s}[{d}]", .{ prefix, i });
     }
 
@@ -598,7 +647,26 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
         return;
     }
 
-    switch (rule.kind) {
+    // ⛔ `.any` constrains the VALUE, not nothing. It is the DEFAULT `kind`,
+    // and it used to skip every constraint on the rule -- so a rule that
+    // forgot `.kind = .string` silently became a no-op: `format`, `min_len`,
+    // `max_len`, `one_of` and `pattern` all present, `ok() == true` on input
+    // that violates every one of them, with no comptime or runtime signal.
+    // Fail-open by default is the worst shape a validator can have.
+    //
+    // `.any` now means "any TYPE is acceptable"; whatever type does arrive is
+    // held to the constraints the rule states. A rule with no constraints is
+    // unaffected, which is what `.any` was for. Audit 2026-09-02.
+    const effective: Kind = if (rule.kind != .any) rule.kind else switch (v) {
+        .string => .string,
+        .integer, .number_string => .int,
+        .float => .float,
+        .array => .array,
+        .object => .object,
+        .bool, .null => .bool,
+    };
+
+    switch (effective) {
         .int, .float => {
             if (numValue(v)) |n| {
                 if (rule.min) |m| if (n < m)
@@ -628,6 +696,10 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
                     try b.append(path, "string_unicode", "Input should be a valid string, unable to parse as unicode");
                 }
             }
+            if (rule.min_bytes) |m| if (s.len < m)
+                try b.appendf(path, "string_bytes_too_short", "String should have at least {d} bytes", .{m});
+            if (rule.max_bytes) |m| if (s.len > m)
+                try b.appendf(path, "string_bytes_too_long", "String should have at most {d} bytes", .{m});
             if (rule.one_of) |allowed| {
                 if (!containsString(allowed, s)) {
                     const joined = try std.mem.join(b.a(), ", ", allowed);
@@ -1227,7 +1299,10 @@ fn ruleForType(comptime T: type) Rule {
             },
             .array => |ai| {
                 if (ai.child == u8)
-                    return .{ .field = "", .kind = .string, .min_len = ai.len, .max_len = ai.len };
+                    // BYTES, not code points: `std.json` fills these `ai.len`
+                    // bytes, so a code-point bound rejects strings that decode
+                    // and accepts strings that do not. See `Rule.min_bytes`.
+                    return .{ .field = "", .kind = .string, .min_bytes = ai.len, .max_bytes = ai.len };
                 const elem = ruleForType(ai.child);
                 return .{ .field = "", .kind = .array, .min_len = ai.len, .max_len = ai.len, .items = &elem };
             },
@@ -3224,4 +3299,235 @@ fn fuzzValidateFormat(_: void, smith: *std.testing.Smith) !void {
 test {
     _ = @import("json_schema_format_vectors.zig");
     _ = @import("json_schema_format_test.zig");
+}
+
+test "a rule that forgot its kind is not a no-op: .any constrains the value" {
+    // ⛔ MEDIUM regression (audit 2026-09-02). `.any` is the DEFAULT kind and
+    // used to void every constraint, so one omitted `.kind = .string` turned
+    // a fully specified rule into nothing at all — with no signal.
+    const rules = [_]Rule{.{
+        .field = "email",
+        .required = true,
+        .format = .email,
+        .min_len = 5,
+        .max_len = 10,
+        .one_of = &.{"x"},
+        .pattern = .{ .literal = "zz" },
+    }};
+    var report = try validateJson(testing.allocator, "{\"email\":\"not-an-email at all, way too long\"}", &rules);
+    defer report.deinit();
+    try testing.expect(!report.ok());
+
+    // Nested rules too: `.any` with `fields` used to skip the object.
+    const inner = [_]Rule{.{ .field = "id", .kind = .int, .required = true }};
+    const outer = [_]Rule{.{ .field = "u", .fields = &inner }};
+    var r2 = try validateJson(testing.allocator, "{\"u\":{}}", &outer);
+    defer r2.deinit();
+    try testing.expect(!r2.ok());
+
+    // And a rule with NO constraints still accepts anything, which is what
+    // `.any` is for — the fix must not have turned it into a type gate.
+    const loose = [_]Rule{.{ .field = "whatever" }};
+    var r3 = try validateJson(testing.allocator, "{\"whatever\":[1,2,3]}", &loose);
+    defer r3.deinit();
+    try testing.expect(r3.ok());
+    var r4 = try validateJson(testing.allocator, "{\"whatever\":\"a string\"}", &loose);
+    defer r4.deinit();
+    try testing.expect(r4.ok());
+}
+
+test "a derived [N]u8 rule counts BYTES, because that is what the decoder fills" {
+    // The code-point fix silently broke the derived rule: 16 code points is
+    // not 16 bytes, so a string that decodes perfectly was rejected and one
+    // that does not was passed through to fail unpathed inside
+    // `parseFromValue`. Audit 2026-09-02.
+    const T = struct { fixed: [16]u8 };
+    const rules = comptime rulesFor(T);
+    try testing.expectEqual(@as(?usize, 16), rules[0].min_bytes);
+    try testing.expectEqual(@as(?usize, 16), rules[0].max_bytes);
+    try testing.expectEqual(@as(?usize, null), rules[0].min_len);
+
+    // 16 bytes, 8 code points: decodes, and must validate.
+    var ok_report = try validateJson(testing.allocator, "{\"fixed\":\"éééééééé\"}", rules);
+    defer ok_report.deinit();
+    try testing.expect(ok_report.ok());
+
+    // 16 code points, 17 bytes: does NOT decode, and must be rejected here
+    // rather than deeper down with no path.
+    var bad = try validateJson(testing.allocator, "{\"fixed\":\"0123456789abcdéf\"}", rules);
+    defer bad.deinit();
+    try testing.expect(!bad.ok());
+    try testing.expectEqualStrings("string_bytes_too_long", bad.errors[0].code);
+}
+
+test "the Limits defaults are the security control, so each one is pinned" {
+    // ⛔ Three of the four defaults SPEC names as the control had nothing
+    // behind them: raising `max_array_elements` 10 000 → 1e8,
+    // `max_object_members` 1 000 → 1e8 or `max_total_nodes` 1e6 → 1e11 each
+    // left the whole suite green (audit 2026-09-02). The one test that
+    // claimed to cover this exercised `max_depth` alone; every other limit
+    // test passes its own `Limits`. The defaults worked — nothing would have
+    // noticed them stopping.
+    const gpa = testing.allocator;
+
+    // An array one past the default element cap, in a body that is otherwise
+    // trivially valid.
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try body.appendSlice(gpa, "{\"a\":[");
+        for (0..10_001) |i| {
+            if (i != 0) try body.append(gpa, ',');
+            try body.append(gpa, '0');
+        }
+        try body.appendSlice(gpa, "]}");
+        var report = try validateJson(gpa, body.items, &.{});
+        defer report.deinit();
+        try testing.expect(!report.ok());
+        try testing.expectEqualStrings("array_too_large", report.errors[0].code);
+    }
+
+    // An object one past the default member cap.
+    {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try body.append(gpa, '{');
+        for (0..1001) |i| {
+            if (i != 0) try body.append(gpa, ',');
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "\"k{d}\":0", .{i});
+            try body.appendSlice(gpa, key);
+        }
+        try body.append(gpa, '}');
+        var report = try validateJson(gpa, body.items, &.{});
+        defer report.deinit();
+        try testing.expect(!report.ok());
+        try testing.expectEqualStrings("too_many_fields", report.errors[0].code);
+    }
+}
+
+test "isEmail's documented 254-byte ceiling is enforced" {
+    // Documented, and nothing pinned it: removing the check left the suite
+    // green while 255..318-byte addresses became acceptable (audit
+    // 2026-09-02). The corpus has no long-address case.
+    const gpa = testing.allocator;
+    // local(60) + '@' + labels of 'b' separated by dots + ".com", built to
+    // exactly 254 bytes and then to 255.
+    var addr: std.ArrayList(u8) = .empty;
+    defer addr.deinit(gpa);
+    try addr.appendNTimes(gpa, 'a', 60);
+    try addr.append(gpa, '@');
+    while (addr.items.len < 254 - 4) {
+        // 60-byte labels keep every label inside the 63-byte hostname cap.
+        const room = 254 - 4 - addr.items.len;
+        const chunk = @min(room, @as(usize, 60));
+        try addr.appendNTimes(gpa, 'b', chunk);
+        if (addr.items.len < 254 - 4) try addr.append(gpa, '.');
+    }
+    try addr.appendSlice(gpa, ".com");
+    try testing.expectEqual(@as(usize, 254), addr.items.len);
+    try testing.expect(validateFormat(.email, addr.items));
+
+    try addr.insert(gpa, 61, 'b');
+    try testing.expectEqual(@as(usize, 255), addr.items.len);
+    try testing.expect(!validateFormat(.email, addr.items));
+}
+
+test "the error cap bounds the WORK, not just the list" {
+    // ⛔ MEDIUM regression (audit 2026-09-02). `max_errors` capped the error
+    // LIST inside `append`, but `appendf` formatted its message first — so a
+    // 996 KiB body of 340 000 nodes, every part of it inside the DEFAULT
+    // `Limits`, built 339 000 messages nobody could read and left an 18 802
+    // KiB report arena behind for the 1000 errors it kept.
+    //
+    // Measured here as bytes still outstanding when the report comes back:
+    // the parse arena is freed by then, so what remains IS the report arena.
+    // The ceiling is ~5x the fixed cost, and the defect overshoots it by an
+    // order of magnitude.
+    const Counting = struct {
+        inner: Allocator,
+        outstanding: usize = 0,
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = self.inner.rawAlloc(len, al, ra) orelse return null;
+            self.outstanding += len;
+            return p;
+        }
+        fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.inner.rawResize(m, al, new_len, ra)) return false;
+            self.outstanding = self.outstanding + new_len - m.len;
+            return true;
+        }
+        fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = self.inner.rawRemap(m, al, new_len, ra) orelse return null;
+            self.outstanding = self.outstanding + new_len - m.len;
+            return p;
+        }
+        fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.inner.rawFree(m, al, ra);
+            self.outstanding -= m.len;
+        }
+    };
+
+    var counting: Counting = .{ .inner = testing.allocator };
+    const gpa = counting.allocator();
+
+    // 34 arrays of 10 000 empty strings: 340 000 nodes, every one of which
+    // fails a `min_len` rule on the element.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.appendSlice(testing.allocator, "{\"g\":[");
+    for (0..34) |outer| {
+        if (outer != 0) try body.append(testing.allocator, ',');
+        try body.append(testing.allocator, '[');
+        for (0..10_000) |i| {
+            if (i != 0) try body.append(testing.allocator, ',');
+            try body.appendSlice(testing.allocator, "\"\"");
+        }
+        try body.append(testing.allocator, ']');
+    }
+    try body.appendSlice(testing.allocator, "]}");
+
+    const elem: Rule = .{ .field = "", .kind = .string, .min_len = 1 };
+    const inner: Rule = .{ .field = "", .kind = .array, .items = &elem };
+    const rules = [_]Rule{.{ .field = "g", .kind = .array, .items = &inner }};
+
+    var report = try validateJson(gpa, body.items, &rules);
+    const held = counting.outstanding;
+    report.deinit();
+    try testing.expectEqual(@as(usize, 0), counting.outstanding); // no leak either
+
+    try testing.expect(!report.ok());
+    if (held > 4 * 1024 * 1024) {
+        std.debug.print("\nreport arena held {d} KiB for {d} errors — the cap is bounding the list, not the work\n", .{ held / 1024, report.errors.len });
+        return error.ErrorCapDoesNotBoundWork;
+    }
+}
+
+test "the offset-optional date-time profile is a CHOICE, and this is where it is written down" {
+    // `date_time`/`time` accept a local time with no UTC offset, which RFC
+    // 3339 proper forbids and the `Format` doc calls a deliberate ISO 8601
+    // profile. Nothing pinned it: the vendored corpus has no date-time case
+    // at all and reaches the `time` one only through a documented skip, so
+    // the choice could have been reversed by accident in either direction
+    // (audit 2026-09-02). If a future change makes the offset mandatory, this
+    // test is the conversation, not a surprise.
+    try testing.expect(validateFormat(.date_time, "1998-12-31T23:59:59"));
+    try testing.expect(validateFormat(.date_time, "1998-12-31T23:59:59Z"));
+    try testing.expect(validateFormat(.date_time, "1998-12-31T23:59:59+01:00"));
+    try testing.expect(validateFormat(.time, "23:59:59"));
+    try testing.expect(validateFormat(.time, "23:59:59Z"));
+
+    // What is NOT lax: the offset is still validated when it is there, and
+    // the calendar/clock ranges are real.
+    try testing.expect(!validateFormat(.date_time, "1998-12-31T23:59:59+99:00"));
+    try testing.expect(!validateFormat(.date_time, "1998-13-31T23:59:59Z"));
+    try testing.expect(!validateFormat(.time, "24:00:00"));
 }

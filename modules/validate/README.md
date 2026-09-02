@@ -12,7 +12,9 @@ keyword semantics: `1.0` is an integer, inclusive `minimum`/`maximum`,
 additional properties allowed, `enum`, `properties`/`items` nesting) and
 go-playground/validator (MIT — struct-tag-style ergonomics, mirrored here as
 comptime reflection; behavior only). The string `format` vocabulary follows
-RFC 5321/3986/1123/3339/6901. No source copied. The reproduced JSON-Schema
+RFC 5321/3986/1123/3339/6901 (`date`/`time`/`date_time` follow an ISO 8601
+profile that is slightly laxer than RFC 3339 in one named place: the UTC offset
+is optional — see `Format`). No source copied. The reproduced JSON-Schema
 conformance fixtures are a separate matter and are answered in
 [`NOTICE`](NOTICE) beside this file.
 
@@ -104,7 +106,8 @@ body answers **413**. `Query` + `Body`/`TypedBody` stack on one route — the
 | `kind` | type gate | `string_type` `int_type` `float_type` `bool_type` `array_type` `object_type` |
 | `allow_null` | any | (accepts explicit JSON `null`) |
 | `min` / `max` (inclusive, f64) | int, float | `greater_than_equal` / `less_than_equal` |
-| `min_len` / `max_len` | string (bytes) | `string_too_short` / `string_too_long` |
+| `min_len` / `max_len` | string (**code points**) | `string_too_short` / `string_too_long` |
+| `min_bytes` / `max_bytes` | string (**encoded bytes**) | `string_bytes_too_short` / `string_bytes_too_long` |
 | `min_len` / `max_len` | array (items) | `too_short` / `too_long` |
 | `one_of` | string | `enum` |
 | `pattern` (literal/prefix/suffix/charset) | string | `string_pattern_mismatch` |
