@@ -178,12 +178,30 @@ pub const TargetResult = struct {
     samples: []Result,
     stats: latency.Stats,
 
+    /// Repetitions that never ran to a verdict because the caller cancelled
+    /// its own `std.Io` task. Excluded from `stats` entirely — they are not
+    /// evidence about the host, and counting them as loss is exactly the
+    /// "dead host" report the `.canceled` status was added to remove
+    /// (W2 re-audit 2026-09-02, `probe` F2).
+    pub fn canceledCount(self: TargetResult) usize {
+        var n: usize = 0;
+        for (self.samples) |s| {
+            if (s.kind == .canceled) n += 1;
+        }
+        return n;
+    }
+
     /// True if at least one repetition connected.
+    ///
+    /// `false` does **not** mean "host down" on its own: check
+    /// `canceledCount()` first. A run every repetition of which was cancelled
+    /// has no verdict at all, and says so — `stats.sent == 0`.
     pub fn reachable(self: TargetResult) bool {
         return self.stats.received > 0;
     }
 
-    /// Packet-loss percentage over the repetitions (non-`up` = loss).
+    /// Packet-loss percentage over the repetitions that produced a verdict
+    /// (non-`up` = loss). Cancelled repetitions are not in the denominator.
     pub fn lossPct(self: TargetResult) f64 {
         return self.stats.lossPct();
     }
@@ -227,10 +245,18 @@ pub const Options = struct {
     connector: Connector,
     /// Per-attempt connect timeout budget, milliseconds. Passed to the
     /// connector as nanoseconds.
+    ///
+    /// **0 means NO budget** — block until the OS gives up, which on Linux is
+    /// `tcp_syn_retries` and about two minutes. It does not mean "do not
+    /// wait". The convention lived only in two private doc comments while
+    /// this, the public knob, said nothing
+    /// (W2 re-audit 2026-09-02, `probe` F3).
     timeout_ms: u32 = 1000,
     /// Repetitions per target (clamped to `[1, max_repetitions]`).
     count: u16 = 1,
     /// Upper bound on connects in flight at once during `probeMany`.
+    /// Effectively `max(1, min(max_concurrent, targets, 256))` — 0 does not
+    /// mean "no probes", it means one at a time (F7).
     max_concurrent: u32 = 16,
     /// Reject a `probeMany` list longer than this.
     max_targets: usize = 65_536,
@@ -311,7 +337,18 @@ fn probeInto(r: *TargetResult, opts: Options) void {
     for (r.samples) |*s| s.* = probeTcp(r.target, opts);
     var acc = latency.Accumulator.init();
     for (r.samples) |s| {
-        if (s.kind == .up) acc.addSample(s.rtt_ns orelse 0) else acc.addLoss();
+        // A cancellation is the caller's own doing and is evidence about
+        // nothing. `Status.canceled` was added so the *sample* stopped saying
+        // "dead"; the aggregate went on saying it — `received = 0`,
+        // `reachable() = false`, `lossPct() = 100` — which is what a consumer
+        // actually reads (F2).
+        if (s.kind == .canceled) continue;
+        // An `.up` with no round-trip is a broken `Connector`, not a 0 ns
+        // connect: `Connector` is a public seam and `rtt_ns orelse 0` folded
+        // the two together into a fabricated latency floor (F5).
+        if (s.kind == .up) {
+            if (s.rtt_ns) |rtt| acc.addSample(rtt) else acc.addLoss();
+        } else acc.addLoss();
     }
     r.stats = acc.snapshot();
 }
@@ -620,26 +657,49 @@ pub const PosixConnector = struct {
         const start = monoNs();
 
         // An IP literal never reaches a resolver, in either mode.
-        const ip: netaddr.Ip = netaddr.parseIp(target.host) orelse switch (self.resolve) {
+        var addrs: [max_addresses]netaddr.Ip = undefined;
+        var n: usize = 1;
+        if (netaddr.parseIp(target.host)) |literal| {
+            addrs[0] = literal;
+        } else switch (self.resolve) {
             .literal_only => return .{ .status = .@"error" },
-            .system => blk: {
+            .system => {
                 const io = self.io orelse return .{ .status = .@"error" };
-                break :blk resolveFirst(io, target.host, target.port) orelse
-                    return .{ .status = .@"error" };
+                n = resolveAll(io, target.host, target.port, &addrs);
+                if (n == 0) return .{ .status = .@"error" };
             },
-        };
+        }
 
-        // Charge resolution against the budget: the connect gets the REMAINDER,
-        // and a lookup that already blew the budget never connects at all.
-        const spent = monoNs() -| start;
-        const remaining: u64 = if (timeout_ns == 0)
-            0 // 0 == "no budget", same convention as `overBudget`
-        else if (spent >= timeout_ns)
-            return .{ .status = .timeout, .rtt_ns = spent }
-        else
-            timeout_ns - spent;
+        // Every resolved address gets a turn against what is left of the
+        // budget, and a definitive negative is only reported once they have
+        // all been tried (F1). `.refused` outranks `.@"error"` as the answer
+        // to keep: it is the one the caller is told is definitive.
+        var best: Verdict = .{ .status = .@"error" };
+        var ran_out = false;
+        for (addrs[0..n]) |ip| {
+            // Charge resolution and earlier attempts against the budget: each
+            // connect gets the REMAINDER, and once it is gone nothing more is
+            // attempted.
+            const spent_now = monoNs() -| start;
+            const remaining: u64 = if (timeout_ns == 0)
+                0 // 0 == "no budget", same convention as `overBudget`
+            else if (spent_now >= timeout_ns) {
+                ran_out = true;
+                break;
+            } else timeout_ns - spent_now;
 
-        const v = connectBounded(ip, target.port, remaining);
+            const attempt = connectBounded(ip, target.port, remaining);
+            if (attempt.status == .up) {
+                best = attempt;
+                break;
+            }
+            if (attempt.status == .timeout) ran_out = true;
+            if (best.status != .refused) best = attempt;
+        }
+        if (best.status != .up and ran_out and best.status != .refused)
+            best = .{ .status = .timeout, .errno = best.errno };
+
+        const v = best;
         const rtt = monoNs() -| start;
         return switch (v.status) {
             // `overBudget` still guards the success path: a connect that
@@ -756,21 +816,43 @@ pub const PosixConnector = struct {
         return .{ .status = classifyErrno(so_error), .errno = so_error };
     }
 
-    /// First address `std.Io.net`'s resolver returns for `host`, or null.
-    /// std has already applied its own ordering; this takes the head of it.
-    fn resolveFirst(io: std.Io, host: []const u8, port: u16) ?netaddr.Ip {
-        const host_name = net.HostName.init(host) catch return null;
+    /// How many resolved addresses one `.system` probe will try. std's
+    /// resolver has already ordered them; this bounds the work, not the
+    /// choice.
+    pub const max_addresses = 8;
+
+    /// Every address `std.Io.net`'s resolver returns for `host`, in std's own
+    /// order, up to `max_addresses`. Returns how many were written.
+    ///
+    /// This used to be `resolveFirst`, taking the head of the list and
+    /// stopping — while `LiveConnector` (via `net.HostName.connect`) races
+    /// *every* resolved address. Same target, opposite verdicts: on a
+    /// dual-stack host whose service listens only on the second address,
+    /// `PosixConnector` reported `.refused` — documented as "a definitive,
+    /// fast negative" — where `LiveConnector` reported `.up`. Worse, with the
+    /// first address black-holed it burned the whole budget and reported
+    /// `.timeout`. `.system` is the default and `PosixConnector` is the
+    /// recommended connector, so that is a false "service down" on the health
+    /// checker this module exists for (W2 re-audit 2026-09-02, `probe` F1).
+    fn resolveAll(io: std.Io, host: []const u8, port: u16, out: *[max_addresses]netaddr.Ip) usize {
+        const host_name = net.HostName.init(host) catch return 0;
         // `lookup` is documented not to block with capacity >= 16.
         var buf: [32]net.HostName.LookupResult = undefined;
         var queue: std.Io.Queue(net.HostName.LookupResult) = .init(&buf);
-        host_name.lookup(io, &queue, .{ .port = port }) catch return null;
+        host_name.lookup(io, &queue, .{ .port = port }) catch return 0;
+        var n: usize = 0;
         while (queue.getOne(io)) |res| switch (res) {
-            .address => |addr| return switch (addr) {
-                .ip4 => |a| .{ .v4 = a.bytes },
-                .ip6 => |a| .{ .v6 = a.bytes },
+            .address => |addr| {
+                out[n] = switch (addr) {
+                    .ip4 => |a| .{ .v4 = a.bytes },
+                    .ip6 => |a| .{ .v6 = a.bytes },
+                };
+                n += 1;
+                if (n == max_addresses) return n;
             },
             .canonical_name => continue,
-        } else |_| return null;
+        } else |_| return n;
+        return n;
     }
 };
 
@@ -1529,8 +1611,13 @@ test "live: a listening loopback port is up, with a measured rtt" {
 /// value is uninteresting; the DIFFERENCE across a batch is the oracle.
 fn lowestFreeFd() !i32 {
     const rc = tl.dup(0);
+    // `dup` returns `usize`, so on failure `rc` is `@bitCast(-EMFILE)` — a
+    // huge positive number. `@intCast` to `i32` therefore panics before the
+    // `fd < 0` guard can ever be true, and the guard was dead code. This is
+    // the descriptor-leak oracle, i.e. exactly the test that runs when
+    // descriptors are scarce (W2 re-audit 2026-09-02, `probe` F6).
+    if (tl.errno(rc) != .SUCCESS) return error.DupFailed;
     const fd: i32 = @intCast(rc);
-    if (fd < 0) return error.DupFailed;
     _ = tl.close(fd);
     return fd;
 }
@@ -1633,13 +1720,50 @@ test "live: system resolution does resolve a name, without leaving the host" {
     // special case, so no packet leaves the machine and the test stays
     // hermetic — while still exercising the real `HostName.lookup` path that
     // `.system` uses.
-    const ip = PosixConnector.resolveFirst(threaded.io(), "localhost", 0) orelse
-        return error.LocalhostDidNotResolve;
-    const loopback = switch (ip) {
-        .v4 => |q| q[0] == 127,
-        .v6 => |b| std.mem.eql(u8, &b, &([_]u8{0} ** 15 ++ [_]u8{1})),
-    };
-    try testing.expect(loopback);
+    var addrs: [PosixConnector.max_addresses]netaddr.Ip = undefined;
+    const n = PosixConnector.resolveAll(threaded.io(), "localhost", 0, &addrs);
+    if (n == 0) return error.LocalhostDidNotResolve;
+    for (addrs[0..n]) |ip| {
+        const loopback = switch (ip) {
+            .v4 => |q| q[0] == 127,
+            .v6 => |b| std.mem.eql(u8, &b, &([_]u8{0} ** 15 ++ [_]u8{1})),
+        };
+        try testing.expect(loopback);
+    }
+
+    // ⚠ `localhost` resolves to BOTH 127.0.0.1 and ::1 on a normal host, and
+    // taking only the head of that list is what made `PosixConnector` report
+    // a service listening on the second address as `.refused` — a definitive
+    // negative — where `LiveConnector` reported `.up`
+    // (W2 re-audit 2026-09-02, `probe` F1).
+    if (n < 2) std.debug.print(
+        "\nnote: localhost resolved to {d} address(es) here, so the multi-address path is untested on this host\n",
+        .{n},
+    );
+}
+
+test "system resolution tries every address, not just the first" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var addrs: [PosixConnector.max_addresses]netaddr.Ip = undefined;
+    const n = PosixConnector.resolveAll(io, "localhost", 0, &addrs);
+    if (n < 2) return error.SkipZigTest; // single-stack host: nothing to prove
+
+    // A listener on the SECOND resolved address only. Before the fix this was
+    // reported `.refused` (or `.timeout`, burning the whole budget) because
+    // only the head of the list was ever tried.
+    const second = addrs[1];
+    const is_v6 = second == .v6;
+    const ln = listenLoopback(is_v6, 16) catch return error.SkipZigTest;
+    defer _ = std.os.linux.close(ln.fd);
+
+    var buf: [40]u8 = undefined;
+    const t = try Target.parse(try std.fmt.bufPrint(&buf, "localhost:{d}", .{ln.port}));
+    var pc: PosixConnector = .{ .resolve = .system, .io = io };
+    const out = pc.connector().connect(t, 3 * std.time.ns_per_s);
+    try testing.expectEqual(Status.up, out.status);
 }
 
 test "live: a fan-out over black-holed targets finishes on the budget" {
@@ -1807,4 +1931,62 @@ test "live: canceling a blocked connect surfaces .canceled, not .error" {
     // The underlying Zig error name survives too, same contract as every
     // other `LiveConnector` classification.
     try testing.expectEqualStrings("Canceled", out.err_name.?);
+}
+
+test "a cancelled run is not a dead host, and an .up with no rtt is not a 0 ns connect" {
+    const gpa = testing.allocator;
+    {
+        // `Status.canceled` was added because "a caller that cancelled its own
+        // `std.Io` task saw the targets it never finished probing reported as
+        // dead hosts". The sample said `canceled`; the aggregate — which is
+        // what a consumer reads — still said received=0, reachable=false,
+        // loss=100% (W2 re-audit 2026-09-02, `probe` F2).
+        var scripts = [_]FakeConnector.Script{
+            .{ .host = "svc", .outcomes = &.{.{ .status = .canceled, .err_name = "Canceled" }} },
+        };
+        var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+        const r = try probeTarget(gpa, .{ .host = "svc", .port = 443 }, .{
+            .connector = fake.connector(),
+            .count = 4,
+        });
+        defer r.deinit(gpa);
+        try testing.expectEqual(@as(usize, 4), r.canceledCount());
+        try testing.expectEqual(@as(u64, 0), r.stats.sent);
+        try testing.expectEqual(@as(u64, 0), r.stats.received);
+        try testing.expect(!r.reachable());
+        // The key line: no verdict was reached, so no loss is claimed either.
+        try testing.expectEqual(@as(f64, 0), r.lossPct());
+    }
+    {
+        // `Connector` is a public seam (the shipped example implements one),
+        // and `Result`'s doc reads as a guarantee that `rtt_ns` is non-null
+        // for `.up`. It was not enforced: `rtt_ns orelse 0` turned a broken
+        // connector into a fabricated 0 ns latency floor (F5).
+        var scripts = [_]FakeConnector.Script{
+            .{ .host = "svc", .outcomes = &.{.{ .status = .up }} },
+        };
+        var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+        const r = try probeTarget(gpa, .{ .host = "svc", .port = 1 }, .{
+            .connector = fake.connector(),
+            .count = 3,
+        });
+        defer r.deinit(gpa);
+        try testing.expectEqual(@as(u64, 3), r.stats.sent);
+        try testing.expectEqual(@as(u64, 0), r.stats.received);
+        try testing.expectEqual(@as(u64, 0), r.stats.min_ns);
+        try testing.expect(!r.reachable());
+    }
+}
+
+test "a non-up outcome may carry neither errno nor err_name" {
+    // SPEC said "exactly one of the two is ever set", which invites
+    // `r.errno.?` — a panic in Debug, illegal behaviour in ReleaseFast. Six
+    // live `.error` exits carry neither (F4). Pinned so the doc cannot drift
+    // back to the absolute.
+    var pc: PosixConnector = .{ .resolve = .literal_only };
+    const name = try Target.parse("no-such-host.invalid:80");
+    const o = pc.connector().connect(name, 200 * std.time.ns_per_ms);
+    try testing.expectEqual(Status.@"error", o.status);
+    try testing.expect(o.errno == null);
+    try testing.expect(o.err_name == null);
 }

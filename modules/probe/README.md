@@ -49,10 +49,12 @@ An optional app-level check hook runs after the handshake. `Target.parse`
 accepts `host:port` and `[v6]:port`.
 
 `Result`'s classification into `Status` (`up`/`refused`/`timeout`/`canceled`/`error`)
-stays the whole decision surface, but a non-`up` result also carries the connector's
+stays the whole decision surface, but a non-`up` result *may also* carry the connector's
 underlying error: `errno` (the raw `SO_ERROR`/`connect()` code) from `PosixConnector`,
-`err_name` (a `@errorName` string) from `LiveConnector` — never both, and both null
-for `.up`. Useful when the classification alone is not enough, e.g. logging
+`err_name` (a `@errorName` string) from `LiveConnector` — never both, both null
+for `.up`, and **both null on the several `.error` exits that have no error to name**
+(SPEC lists them). Treat them as optional; `r.errno.?` on a non-`up` result will
+eventually panic. Useful when the classification alone is not enough, e.g. logging
 `EHOSTUNREACH` vs `ENETUNREACH` even though both are `.error`. `canceled` is
 `LiveConnector`-only: it means the caller's own `std.Io` task was canceled
 (`Future.cancel`) while this attempt was in flight, not that anything about the

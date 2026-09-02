@@ -81,9 +81,14 @@ API, so the choice was between doing that (shape A, taken) versus not doing it a
 which one actually happened. `errno: ?i32` and `err_name: ?[]const u8` carry it: `PosixConnector`
 sets `errno` to the raw `SO_ERROR`/`connect()` code (`classifyErrno`'s input, preserved rather than
 discarded after use); `LiveConnector` sets `err_name` to `@errorName` of the `std.Io.net` error,
-since that connector has no numeric errno to report. Exactly one of the two is ever set — never
-both, since exactly one connector produced any given outcome — and both are null for `.up` and for
-an `app_check`-downgraded `.error` (nothing at the OS/transport level failed there). `@errorName`
+since that connector has no numeric errno to report. **At most** one of the two is ever set — never
+both, since exactly one connector produced any given outcome — and both are null for `.up`, for
+an `app_check`-downgraded `.error` (nothing at the OS/transport level failed there), **and for
+the handful of `.error` exits that have no error to name**: a name given to `.literal_only`, a
+`.system` probe with no `io`, a lookup that returned nothing, `socket()` itself failing,
+`POLLNVAL`, and `LiveConnector`'s own parse/`HostName.init` refusals. ⚠ This paragraph used to say
+*exactly* one, which invites `r.errno.?` on a non-`up` result — a panic in Debug and illegal
+behaviour in ReleaseFast (W2 re-audit 2026-09-02, `probe` F4). `@errorName`
 returns a static, program-lifetime string, so `err_name` needs no allocation or ownership story, the
 same as every other string this module hands back.
 
