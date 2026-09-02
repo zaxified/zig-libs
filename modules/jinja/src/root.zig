@@ -127,6 +127,18 @@ pub const Options = struct {
     lstrip_blocks: bool = false,
     keep_trailing_newline: bool = false,
     max_output_bytes: usize = 64 << 20,
+    /// Total bytes one render may take from its scratch arena.
+    ///
+    /// The depth caps below bound DEPTH; the per-operation caps in `value.zig`
+    /// (`max_alloc`, `max_items`) bound ONE operation. Neither bounds a
+    /// render's total work, and the arena is not reclaimed until the render
+    /// ends, so both compose into an unbounded one: `{% macro m(n) %}…{{ m(n-1) }}{{ m(n-1) }}…`
+    /// at depth 22 — a third of `max_call_depth` — took 3.8 GB and emitted
+    /// **zero bytes**, so `max_output_bytes` never saw one, and
+    /// `{{ ('a' * 30000)|replace('', 'b' * 30000) }}` multiplied two 64 MiB
+    /// caps together from a 53-byte template
+    /// (W2 re-audit 2026-09-02, `jinja` F-B1/F-B2).
+    max_render_bytes: usize = 256 << 20,
     /// Combined nesting bound for `{% extends %}`/`{% include %}`/
     /// `{% import %}`. An inheritance *cycle* is caught by name before this
     /// ever fires; this bounds everything a name check cannot see.
@@ -328,7 +340,11 @@ pub const Template = struct {
         const d = diag orelse &scratch;
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
-        try render_mod.render(arena.allocator(), self.parsed, context, .{
+        var budget: RenderBudget = .{
+            .parent = arena.allocator(),
+            .remaining = self.env.options.max_render_bytes,
+        };
+        render_mod.render(budget.allocator(), self.parsed, context, .{
             .autoescape = self.env.options.autoescape,
             .undefined_policy = self.env.options.undefined_policy,
             .max_output_bytes = self.env.options.max_output_bytes,
@@ -341,7 +357,67 @@ pub const Template = struct {
             .test_fn = Environment.testLookup,
             .loader = self.env.loader,
             .compile = Environment.compileInto,
-        }, out, d);
+        }, out, d) catch |e| {
+            // An exhausted budget arrives as `OutOfMemory` because that is the
+            // only thing an allocator may report. Reporting it as `OutOfMemory`
+            // to the caller would be the same misclassification a real OOM is
+            // not: the machine has memory, this render asked for too much.
+            if (e == error.OutOfMemory and budget.exhausted) {
+                d.set(0, "render exceeded max_render_bytes ({d})", .{self.env.options.max_render_bytes});
+                return error.RenderBudgetExceeded;
+            }
+            return e;
+        };
+    }
+};
+
+/// Charges a render's scratch arena against `Options.max_render_bytes`. Only
+/// `alloc`/`remap` grow the total; the arena never really frees, so neither
+/// does this.
+const RenderBudget = struct {
+    parent: std.mem.Allocator,
+    remaining: usize,
+    exhausted: bool = false,
+
+    fn allocator(self: *RenderBudget) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn take(self: *RenderBudget, n: usize) bool {
+        if (n > self.remaining) {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= n;
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *RenderBudget = @ptrCast(@alignCast(ctx));
+        if (!self.take(len)) return null;
+        return self.parent.rawAlloc(len, a, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *RenderBudget = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.take(new_len - memory.len)) return false;
+        return self.parent.rawResize(memory, a, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *RenderBudget = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.take(new_len - memory.len)) return null;
+        return self.parent.rawRemap(memory, a, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *RenderBudget = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(memory, a, ra);
     }
 };
 

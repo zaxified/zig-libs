@@ -543,3 +543,231 @@ test "`**` from context data cannot spin the renderer" {
         return error.PowUnbounded;
     }
 }
+
+test "the one integer pair `//`, `%` and `divisibleby` cannot represent is an error, not a trap" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    // Reachable from context data alone: `@divTrunc`/`@rem`/`@mod` trap on
+    // `minInt(i64) / -1`, which is a panic in Debug and a **SIGFPE** in
+    // ReleaseFast — neither is catchable by a caller.
+    const ctx = try jinja.valueFrom(arena.allocator(), .{
+        .a = @as(i64, std.math.minInt(i64)),
+        .b = @as(i64, -1),
+    });
+    try testing.expectError(error.OutOfRange, renderWith(gpa, .{}, "{{ a // b }}", ctx));
+
+    // `%` and `divisibleby` have answers Python agrees with, so they render.
+    {
+        const out = try renderWith(gpa, .{}, "{{ a % b }}", ctx);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("0", out);
+    }
+    {
+        const out = try renderWith(gpa, .{}, "{{ a is divisibleby(b) }}", ctx);
+        defer gpa.free(out);
+        try testing.expectEqualStrings("True", out);
+    }
+    // The same pair reached from the template's own text, no context at all.
+    try testing.expectError(
+        error.OutOfRange,
+        renderWith(gpa, .{}, "{{ (-9223372036854775807 - 1) // -1 }}", .{ .none = {} }),
+    );
+}
+
+test "`xmlattr` refuses a key that could close the attribute" {
+    const gpa = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Autoescape on, no `|safe` anywhere: the injection is the dict KEY, and
+    // `escapeTo`'s `& < > " '` set does not touch a space or an `=`.
+    inline for (.{
+        "a onmouseover=alert(1) b",
+        "a/b",
+        "a>b",
+        "a=b",
+        "a\tb",
+        "a\nb",
+    }) |bad| {
+        const attrs: []const jinja.Pair = try a.dupe(jinja.Pair, &.{.{
+            .key = .{ .string = .{ .bytes = bad } },
+            .value = .{ .string = .{ .bytes = "1" } },
+        }});
+        const ctx: jinja.Value = .{ .map = .{ .pairs = try a.dupe(jinja.Pair, &.{.{
+            .key = .{ .string = .{ .bytes = "d" } },
+            .value = .{ .map = .{ .pairs = attrs } },
+        }}) } };
+        try testing.expectError(
+            error.BadArgument,
+            renderWith(gpa, .{ .autoescape = true }, "<img{{ d|xmlattr }}>", ctx),
+        );
+    }
+}
+
+test "a value deeper than the value-depth cap is refused, not a stack overflow" {
+    const gpa = testing.allocator;
+
+    // A 103-byte template builds the value; `max_nesting_depth` bounds the
+    // SOURCE tree and says nothing about this. Measured before the fix:
+    // 60 000 levels rendered, 70 000 was a SIGSEGV in ReleaseFast (Debug
+    // aborted at 40 000), and `{{ ns.v|length }}` on the same value answered
+    // `1` in 17 ms — only printing it died.
+    const src =
+        \\{% set ns = namespace(v=[]) %}{% for i in range(2000) %}{% set ns.v = [ns.v] %}{% endfor %}{{ ns.v }}
+    ;
+    try testing.expectError(error.OutOfRange, renderWith(gpa, .{}, src, .{ .none = {} }));
+
+    // …and through `|tojson`, which walks the same value with its own recursion.
+    const as_json =
+        \\{% set ns = namespace(v=[]) %}{% for i in range(2000) %}{% set ns.v = [ns.v] %}{% endfor %}{{ ns.v|tojson }}
+    ;
+    try testing.expectError(error.OutOfRange, renderWith(gpa, .{}, as_json, .{ .none = {} }));
+
+    // Just inside the cap still renders, so the bound is a bound and not a ban.
+    const shallow =
+        \\{% set ns = namespace(v=[]) %}{% for i in range(200) %}{% set ns.v = [ns.v] %}{% endfor %}{{ ns.v|length }}
+    ;
+    const out = try renderWith(gpa, .{}, shallow, .{ .none = {} });
+    defer gpa.free(out);
+    try testing.expectEqualStrings("1", out);
+
+    // The same depth reached the other way: pure context data through the
+    // public `valueFromJson`, no template trick at all.
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 2000;
+    const json = try a.alloc(u8, n * 2);
+    @memset(json[0..n], '[');
+    @memset(json[n..], ']');
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    try testing.expectError(error.OutOfRange, jinja.valueFromJson(a, parsed.value));
+}
+
+test "truncate keeps a spaceless prefix instead of emptying it" {
+    const gpa = testing.allocator;
+    // `rsplit(" ", 1)[0]` on a string with no space returns the whole string.
+    // URLs, hostnames, interface names and base64 are exactly what a config
+    // template truncates, and they were all silently reduced to the ellipsis.
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "{{ 'https://example.com/averylongpath'|truncate(20) }}", .want = "https://example.c..." },
+        .{ .src = "{{ 'abcdefghijklmnop'|truncate(10) }}", .want = "abcdefg..." },
+        .{ .src = "{{ 'abcdefghij'|truncate(9, false, '..', 0) }}", .want = "abcdefg.." },
+        .{ .src = "{{ 'aaaaaaaaaaaaaaaaaa'|truncate(12, false, '') }}", .want = "aaaaaaaaaaaa" },
+        // The vector the corpus already had still answers the same.
+        .{ .src = "{{ 'the quick brown fox jumps'|truncate(15) }}", .want = "the quick..." },
+    };
+    for (cases) |c| {
+        const out = try renderWith(gpa, .{}, c.src, .{ .none = {} });
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "an undefined numeric argument is refused, not quietly defaulted" {
+    const gpa = testing.allocator;
+    // The reference raises for every one of these under BOTH `Undefined` and
+    // `StrictUndefined`; this module answered with the argument's default,
+    // which is the silent-wrong-value failure its policy exists to prevent.
+    inline for (.{
+        "{{ x|int }}",
+        "{{ x|float }}",
+        "{{ 'a'|center(x) }}",
+        "{{ 'abc'|truncate(x) }}",
+        "{{ 'abc'|replace('a','b',x) }}",
+        "{{ [1,2]|batch(x)|list }}",
+        "{{ [1,2,3]|slice(x)|list }}",
+        "{{ 'a'|indent(x) }}",
+        "{{ 1.5|round(x) }}",
+    }) |src| {
+        try testing.expectError(
+            error.UndefinedValue,
+            renderWith(gpa, .{}, src, .{ .none = {} }),
+        );
+    }
+}
+
+test "`|int` with base 0 reads the literal's own prefix" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "{{ '0b101'|int(0, 0) }}", .want = "5" },
+        .{ .src = "{{ '0o17'|int(0, 0) }}", .want = "15" },
+        .{ .src = "{{ '0x1f'|int(0, 0) }}", .want = "31" },
+        // The explicit bases keep working — the manual prefix strip is what
+        // base 0 must not go through, not what base 16 must lose.
+        .{ .src = "{{ '0x1f'|int(0, 16) }}", .want = "31" },
+        .{ .src = "{{ '17'|int(0, 8) }}", .want = "15" },
+    };
+    for (cases) |c| {
+        const out = try renderWith(gpa, .{}, c.src, .{ .none = {} });
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "a render's total work is bounded, not just its depth and its steps" {
+    const gpa = testing.allocator;
+    // 8 MiB so the test is fast; the point is that a bound exists at all.
+    const opts: jinja.Options = .{ .max_render_bytes = 8 << 20 };
+
+    // (a) Exponential macro fan-out. Depth 22 is a THIRD of `max_call_depth`,
+    // so neither depth cap fires, and the output is zero bytes throughout, so
+    // `max_output_bytes` never sees one. Measured before the fix: 3.8 GB.
+    const fanout =
+        \\{% macro m(n) %}{% if n %}{{ m(n-1) }}{{ m(n-1) }}{% endif %}{% endmacro %}{{ m(22) }}
+    ;
+    try testing.expectError(error.RenderBudgetExceeded, renderWith(gpa, opts, fanout, .{ .none = {} }));
+
+    // (b) Two per-operation caps multiplied by one expression: `replace` with
+    // an empty `old` inserts `new` at every codepoint gap, so the cost is
+    // `len(s) × len(new)` and both operands are separately under `max_alloc`.
+    const amplify = "{{ (('a' * 30000)|replace('', 'b' * 30000))|length }}";
+    try testing.expectError(error.RenderBudgetExceeded, renderWith(gpa, opts, amplify, .{ .none = {} }));
+
+    // (c) The same shape through a loop, where each step is individually legal.
+    const looped = "{% for i in range(16) %}{{ ('x' * 67108000)|length }}{% endfor %}";
+    try testing.expectError(error.RenderBudgetExceeded, renderWith(gpa, opts, looped, .{ .none = {} }));
+
+    // A budget is a bound, not a ban: ordinary work still renders.
+    const ok_src =
+        \\{% macro m(n) %}{% if n %}{{ m(n-1) }}{{ m(n-1) }}{% endif %}x{% endmacro %}{{ m(8) }}
+    ;
+    const out = try renderWith(gpa, opts, ok_src, .{ .none = {} });
+    defer gpa.free(out);
+    try testing.expectEqual(@as(usize, 511), out.len);
+}
+
+test "wordcount, striptags and urlencode answer what the reference answers" {
+    const gpa = testing.allocator;
+    // Every expectation below was read off live Jinja2 3.1.6 on this host,
+    // not from memory. SPEC.md claims everything not in a corpus case matches
+    // the reference; these four did not (W2 re-audit, F-D2).
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        // `\w+` runs, not whitespace-separated tokens.
+        .{ .src = "{{ 'a-b-c'|wordcount }}", .want = "3" },
+        .{ .src = "{{ 'foo.bar'|wordcount }}", .want = "2" },
+        .{ .src = "{{ '<b>x</b>'|wordcount }}", .want = "3" },
+        .{ .src = "{{ 'a_b'|wordcount }}", .want = "1" },
+        .{ .src = "{{ ''|wordcount }}", .want = "0" },
+        // The corpus vector still answers the same.
+        .{ .src = "{{ 'a b  c\nd'|wordcount }}", .want = "4" },
+        // An unterminated `<` is text, not the start of a tag that eats the rest.
+        .{ .src = "{{ 'a<b'|striptags }}", .want = "a<b" },
+        .{ .src = "{{ 'a<b>c'|striptags }}", .want = "ac" },
+        // A mapping is query-string encoded: a space is `+`, not `%20`.
+        .{ .src = "{{ {'k': 'a b'}|urlencode }}", .want = "k=a+b" },
+        .{ .src = "{{ {'a b': 'c'}|urlencode }}", .want = "a+b=c" },
+        .{ .src = "{{ {'k': 'a/b'}|urlencode }}", .want = "k=a%2Fb" },
+        // …and an iterable of pairs is accepted, not repr'd.
+        .{ .src = "{{ [('a', 'b c')]|urlencode }}", .want = "a=b+c" },
+        // A bare string keeps the plain form, `/` safe and `%20` for a space.
+        .{ .src = "{{ 'a b'|urlencode }}", .want = "a%20b" },
+    };
+    for (cases) |c| {
+        const out = try renderWith(gpa, .{}, c.src, .{ .none = {} });
+        defer gpa.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}

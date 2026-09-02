@@ -239,6 +239,11 @@ fn fromSlice(arena: std.mem.Allocator, s: anytype) Error!Value {
 /// `StringArrayHashMap`). JSON has no undefined and no markup, so every string
 /// arrives unsafe, which is the correct default for untrusted data.
 pub fn fromJson(arena: std.mem.Allocator, v: std.json.Value) Error!Value {
+    return fromJsonDepth(arena, v, 0);
+}
+
+fn fromJsonDepth(arena: std.mem.Allocator, v: std.json.Value, depth: usize) Error!Value {
+    if (depth > max_value_depth) return error.OutOfRange;
     return switch (v) {
         .null => .none,
         .bool => |b| .{ .boolean = b },
@@ -248,7 +253,7 @@ pub fn fromJson(arena: std.mem.Allocator, v: std.json.Value) Error!Value {
         .string => |s| Value.str(s),
         .array => |a| blk: {
             const items = try arena.alloc(Value, a.items.len);
-            for (a.items, 0..) |e, i| items[i] = try fromJson(arena, e);
+            for (a.items, 0..) |e, i| items[i] = try fromJsonDepth(arena, e, depth + 1);
             break :blk .{ .list = items };
         },
         .object => |o| blk: {
@@ -256,7 +261,7 @@ pub fn fromJson(arena: std.mem.Allocator, v: std.json.Value) Error!Value {
             var it = o.iterator();
             var i: usize = 0;
             while (it.next()) |e| : (i += 1) {
-                pairs[i] = .{ .key = Value.str(e.key_ptr.*), .value = try fromJson(arena, e.value_ptr.*) };
+                pairs[i] = .{ .key = Value.str(e.key_ptr.*), .value = try fromJsonDepth(arena, e.value_ptr.*, depth + 1) };
             }
             break :blk .{ .map = .{ .pairs = pairs } };
         },
@@ -295,6 +300,20 @@ fn w(writer: *std.Io.Writer, bytes: []const u8) Error!void {
 /// renders as the empty string (the lenient policy; the strict policy never
 /// gets here).
 pub fn strTo(writer: *std.Io.Writer, v: Value) Error!void {
+    return strToDepth(writer, v, 0);
+}
+
+/// `max_nesting_depth` bounds the **source** tree, and so bounds the parser
+/// and the evaluator. It does not bound the depth of a `Value`, which a
+/// template can build at render time (`{% set ns.v = [ns.v] %}` in a loop) or
+/// a caller can hand in as context (`fromJson` over nested JSON). These three
+/// walkers recursed over that depth with nothing stopping them: 70 000 levels
+/// was a **SIGSEGV** in ReleaseFast, from a 103-byte template
+/// (W2 re-audit 2026-09-02, `jinja` F-A3).
+pub const max_value_depth: usize = 256;
+
+fn strToDepth(writer: *std.Io.Writer, v: Value, depth: usize) Error!void {
+    if (depth > max_value_depth) return error.OutOfRange;
     switch (v) {
         .undef => {},
         .none => try w(writer, "None"),
@@ -302,7 +321,7 @@ pub fn strTo(writer: *std.Io.Writer, v: Value) Error!void {
         .integer => |i| writer.print("{d}", .{i}) catch return error.OutOfMemory,
         .float => |f| try floatTo(writer, f),
         .string => |s| try w(writer, s.bytes),
-        else => try reprTo(writer, v),
+        else => try reprToDepth(writer, v, depth),
     }
 }
 
@@ -316,13 +335,18 @@ pub fn strAlloc(arena: std.mem.Allocator, v: Value) Error![]const u8 {
 /// `repr(v)` — the form used for elements *inside* a container, which is why
 /// `{{ ['a'] }}` renders `['a']` and not `[a]`.
 pub fn reprTo(writer: *std.Io.Writer, v: Value) Error!void {
+    return reprToDepth(writer, v, 0);
+}
+
+fn reprToDepth(writer: *std.Io.Writer, v: Value, depth: usize) Error!void {
+    if (depth > max_value_depth) return error.OutOfRange;
     switch (v) {
         .string => |s| try reprStrTo(writer, s.bytes),
         .list => |items| {
             try w(writer, "[");
             for (items, 0..) |e, i| {
                 if (i != 0) try w(writer, ", ");
-                try reprTo(writer, e);
+                try reprToDepth(writer, e, depth + 1);
             }
             try w(writer, "]");
         },
@@ -330,31 +354,32 @@ pub fn reprTo(writer: *std.Io.Writer, v: Value) Error!void {
             try w(writer, "(");
             for (items, 0..) |e, i| {
                 if (i != 0) try w(writer, ", ");
-                try reprTo(writer, e);
+                try reprToDepth(writer, e, depth + 1);
             }
             // Python disambiguates a 1-tuple from a parenthesised value.
             if (items.len == 1) try w(writer, ",");
             try w(writer, ")");
         },
-        .map => |m| try reprPairs(writer, m.pairs),
-        .namespace => |ns| try reprPairs(writer, ns.pairs.items),
+        .map => |m| try reprPairs(writer, m.pairs, depth + 1),
+        .namespace => |ns| try reprPairs(writer, ns.pairs.items, depth + 1),
         .loop => try w(writer, "<loop>"),
         .macro => |m| {
             try w(writer, "<Macro '");
             try w(writer, m.name);
             try w(writer, "'>");
         },
-        else => try strTo(writer, v),
+        else => try strToDepth(writer, v, depth),
     }
 }
 
-fn reprPairs(writer: *std.Io.Writer, pairs: []const Pair) Error!void {
+fn reprPairs(writer: *std.Io.Writer, pairs: []const Pair, depth: usize) Error!void {
+    if (depth > max_value_depth) return error.OutOfRange;
     try w(writer, "{");
     for (pairs, 0..) |p, i| {
         if (i != 0) try w(writer, ", ");
-        try reprTo(writer, p.key);
+        try reprToDepth(writer, p.key, depth + 1);
         try w(writer, ": ");
-        try reprTo(writer, p.value);
+        try reprToDepth(writer, p.value, depth + 1);
     }
     try w(writer, "}");
 }
@@ -529,8 +554,8 @@ pub fn binary(arena: std.mem.Allocator, op: BinOp, a: Value, b: Value) Error!Val
             .add => intOf(std.math.add(i64, x, y)),
             .sub => intOf(std.math.sub(i64, x, y)),
             .mul => intOf(std.math.mul(i64, x, y)),
-            .floordiv => if (y == 0) error.DivisionByZero else .{ .integer = pyFloorDiv(x, y) },
-            .mod => if (y == 0) error.DivisionByZero else .{ .integer = pyMod(x, y) },
+            .floordiv => if (y == 0) error.DivisionByZero else pyFloorDiv(x, y),
+            .mod => if (y == 0) error.DivisionByZero else pyMod(x, y),
             .pow => intPow(x, y),
             .div, .concat => unreachable,
         };
@@ -559,15 +584,25 @@ fn intOf(r: anytype) Error!Value {
 /// Python's `//` and `%`: the quotient floors and the remainder takes the sign
 /// of the DIVISOR, so `-7 // 2 == -4` and `7 % -2 == -1`. Zig's `@mod`/`@divFloor`
 /// are only defined for a positive divisor, so this is spelled out.
-fn pyFloorDiv(x: i64, y: i64) i64 {
+///
+/// Both return an error union rather than an `i64`: `minInt(i64) // -1` and
+/// `minInt(i64) % -1` are not representable, and `@divTrunc`/`@rem` TRAP on
+/// them — a SIGFPE in ReleaseFast, reachable from ordinary context data
+/// (`{{ a // b }}` with `a = -9223372036854775808, b = -1`). Their siblings
+/// `.add`/`.sub`/`.mul` went through `std.math` and reported `OutOfRange`
+/// from the start; these two were the ones left with a non-failing signature
+/// (W2 re-audit 2026-09-02, `jinja` F-A2).
+fn pyFloorDiv(x: i64, y: i64) Error!Value {
+    if (x == std.math.minInt(i64) and y == -1) return error.OutOfRange;
     const q = @divTrunc(x, y);
     const r = @rem(x, y);
-    return if (r != 0 and ((r < 0) != (y < 0))) q - 1 else q;
+    return .{ .integer = if (r != 0 and ((r < 0) != (y < 0))) q - 1 else q };
 }
 
-fn pyMod(x: i64, y: i64) i64 {
+fn pyMod(x: i64, y: i64) Error!Value {
+    if (x == std.math.minInt(i64) and y == -1) return .{ .integer = 0 };
     const r = @rem(x, y);
-    return if (r != 0 and ((r < 0) != (y < 0))) r + y else r;
+    return .{ .integer = if (r != 0 and ((r < 0) != (y < 0))) r + y else r };
 }
 
 fn pyFmod(x: f64, y: f64) f64 {

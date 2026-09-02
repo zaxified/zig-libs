@@ -239,6 +239,11 @@ or a documented, tested behaviour.
 | D15 | Calling a name that is not a macro and not one of the three built-in globals is `error.NotCallable`; the reference would call any callable in the context | **runtime error** |
 | D16 | `super.super()` (reaching two levels up in one expression) is not implemented; `{{ super() }}` inside a block that itself overrides is the supported form | **runtime error** |
 | D17 | A template name a loader *refuses* (an escape attempt) is `error.LoaderFailed` even under `ignore missing` — only genuine absence is ignorable | deliberate, stricter |
+| D18 | `wordcount` counts runs of `\w`, as the reference does, but its notion of a word character is ASCII alphanumerics, `_`, and every byte >= 0x80. Letters agree (`ěščř` is one word in both); non-ASCII *punctuation* does not (`a—b` is 2 there, 1 here) — the same residue as D4 | silent, ASCII-identical |
+| D19 | `striptags` knows 7 HTML entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, `&apos;`, `&nbsp;` is **not** among them); the reference unescapes the full HTML5 set, so `&nbsp;x` stays literal here | silent, under-unescaped |
+| D20 | An undefined value passed as a *numeric argument* to a filter (`center(x)`, `batch(x)`, `int`, `float`, …) is `error.UndefinedValue` under both policies, matching the reference. An explicit `None` in the same position takes the argument's default here, where the reference raises `TypeError` for several of them (`center`, `truncate`, `slice`, `indent`) and accepts it for others (`batch`, `replace`) | runtime, laxer on `None` |
+| D21 | A filter or test named by a *string argument* to `map`/`select`/`reject`/`selectattr`/`rejectattr` is resolved at render time, as in the reference — unlike a directly named filter, which is resolved at compile time | runtime error |
+| D22 | `~` and `\|length` on an undefined value are `error.UndefinedValue` under `.lenient` too, where the reference's `Undefined` renders `''` and answers `0` | runtime, stricter |
 
 Why `attr` was dropped rather than implemented (D6): the reference's `attr`
 filter is `getattr` *without* the `getitem` fallback, so applied to a mapping —
@@ -345,6 +350,24 @@ answered in closed form for the bases (`0`, `1`, `-1`) whose loop would
 otherwise run `exponent` times producing no output for `max_output_bytes` to
 see.
 
+Those bound ONE operation each, and they do not compose. `max_render_bytes`
+(256 MiB) is the render-wide bound, and it exists because the per-operation
+ones were claimed here to be the answer and are not: two 64 MiB caps multiply
+in a single expression (`{{ ('a' * 30000)|replace('', 'b' * 30000) }}` asked
+for 1.4 GB from a 53-byte template, and at the caps for 4.5 × 10^15 bytes), a
+`range()` of 4 Mi iterations multiplies one of them again, and none of it is
+visible to `max_output_bytes` because the whole string is built in the arena
+before a byte is emitted. Exceeding it is `error.RenderBudgetExceeded`, kept
+distinct from `OutOfMemory` — the machine has memory, this render asked for
+more than it is allowed.
+
+A render's arena is not reclaimed until the render ends, so building a string
+by accumulation costs O(n²) *memory* where the reference's refcounting costs
+O(n): `{% set ns.s = ns.s ~ 'x' %}` over 80 000 iterations exhausts a 4 GB
+process here and holds 24 MB there. That is a real divergence in cost, not in
+output, and `max_render_bytes` turns it into a named refusal rather than an
+OOM — but the shape is the caller's to avoid.
+
 Recursion in the parser and in the evaluator follows the source's nesting depth,
 and that is bounded explicitly by `max_nesting_depth` (256), not implicitly by
 anything about the source. An earlier revision of this section claimed the
@@ -355,6 +378,15 @@ One `Options` field now bounds all three, at compile time, as `error.TooDeep`
 with a diagnostic — and because it bounds the *tree*, it bounds `Renderer.eval`,
 `renderNodes` and the macro-body walker too. Siblings do not accumulate, so
 template size is not limited; only depth is.
+
+It bounds the **syntax** tree, and nothing else. The depth of a `Value` is a
+separate quantity: a template can build one at render time
+(`{% set ns.v = [ns.v] %}` in a loop) and a caller can hand one in as context
+(`valueFromJson` over nested JSON). The three walkers over a value —
+`strTo`/`reprTo`, `tojson`'s `jsonWrite`, and `fromJson` itself — recursed over
+that depth with nothing stopping them, and 70 000 levels from a 103-byte
+template was a SIGSEGV in ReleaseFast. `value.max_value_depth` (256) bounds all
+three as `error.OutOfRange`.
 
 Escaping is a policy the caller sets, not a guess: with `autoescape = false` the
 module never escapes anything, and with it on the safe bit is the only way to

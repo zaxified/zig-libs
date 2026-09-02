@@ -165,13 +165,16 @@ fn fromYaml(arena: std.mem.Allocator, v: yaml.Value) !jinja.Value {
 | `max_template_depth` | 32 | Combined `{% extends %}`/`{% include %}`/`{% import %}` nesting bound. |
 | `max_call_depth` | 64 | Macro, `{% call %}` and `loop()` recursion bound. |
 | `max_templates` | 256 | Distinct templates one render may load. |
-| `max_nesting_depth` | 256 | How deep one template's syntax may nest — brackets, `not`/unary chains, `else` arms, each link of a `1+1+1`/`x\|f\|g`/`a.b.c` chain, each nested block body, each `{% elif %}`. Refused at compile time as `error.TooDeep`, which also bounds the recursive evaluator. |
+| `max_nesting_depth` | 256 | How deep one template's syntax may nest — brackets, `not`/unary chains, `else` arms, each link of a `1+1+1`/`x\|f\|g`/`a.b.c` chain, each nested block body, each `{% elif %}`. Refused at compile time as `error.TooDeep`, which also bounds the recursive evaluator. Bounds the **syntax** tree only; `value.max_value_depth` (256) bounds how deep a *value* may be walked. |
+| `max_render_bytes` | 256 MiB | Total scratch one render may take. The depth caps bound depth and the `value.zig` caps bound one operation; neither bounds total work, and a macro fan-out well inside `max_call_depth` took 3.8 GB while emitting nothing. `error.RenderBudgetExceeded`. |
 
 **The `.strict` default inverts the reference implementation's.** That is
 deliberate and is the module's one behavioural divergence in the default path:
 for configuration output, an empty string where an IP address belonged is worse
 than a failed render. Pass `.undefined_policy = .lenient` to get the reference's
-behaviour exactly. `x is defined`, `x is undefined` and `x|default(…)` keep
+behaviour on attribute access and arithmetic; a few operations still refuse an
+undefined value under both policies (`~`, `|length`), which SPEC's divergence
+table names. `x is defined`, `x is undefined` and `x|default(…)` keep
 working under both policies.
 
 Autoescaping is off unless you ask for it, and there is no guessing from a file
@@ -286,9 +289,13 @@ interface {{ i }}
 
 ## Filters
 
-All 46 resolve at **compile time**. A template naming a filter that is not here
-fails `env.compile`, with a diagnostic — it can never surface halfway through a
-render in production.
+All 46 resolve at **compile time** when the template names one directly: a
+template naming a filter that is not here fails `env.compile`, with a
+diagnostic. The exception is a filter or test named by a *string argument* to
+`map`, `select`, `reject`, `selectattr` or `rejectattr` — `{{ xs|map('nope') }}`
+is resolved during the render, as it is in the reference, and surfaces as
+`error.BadArgument`. The earlier wording here said resolution "can never
+surface halfway through a render", which was a false absolute.
 
 | | | | |
 |---|---|---|---|

@@ -235,7 +235,6 @@ const escape_sites = [_][]const u8{
     "{{ e.split('q')|list|join('') }}",
     "{{ e|tojson }}",
     "{{ e|urlencode }}",
-    "{{ e|xmlattr if false else e|string }}",
     "{% for c in e %}{{ c }}{% endfor %}",
     "{% filter upper %}{{ e }}{% endfilter %}",
 };
@@ -287,6 +286,103 @@ fn fuzzAutoescapeInvariant(_: void, smith: *std.testing.Smith) !void {
         );
         return error.AutoescapeBypass;
     }
+}
+
+/// The attribute-context invariant, which `fuzzAutoescapeInvariant` above
+/// structurally cannot express.
+///
+/// Three things kept the `xmlattr` class out of reach of that harness, and the
+/// audit's CRITICAL sat in the gap: the site was written
+/// `{{ e|xmlattr if false else e|string }}`, so the filter was never
+/// evaluated; the fixture put fuzzer bytes only in a `[]const u8`, never in a
+/// map KEY, which is the attacker-controlled half of `xmlattr`; and the oracle
+/// was `indexOfAny(out, "<>")`, while an attribute-context injection —
+/// `a onmouseover=alert(1) b` — contains neither character
+/// (W2 re-audit 2026-09-02, `jinja` F-D3).
+///
+/// The property here is the one an attribute context actually needs: whatever
+/// `xmlattr` emits must re-parse as a sequence of ` name="value"` with no
+/// whitespace, `=`, `/` or `>` anywhere in a name.
+fn fuzzXmlattrInvariant(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
+
+    var kbuf: [128]u8 = undefined;
+    const kn = smith.indexWithHash(kbuf.len, 0);
+    smith.bytes(kbuf[0..kn]);
+    var vbuf: [128]u8 = undefined;
+    const vn = smith.indexWithHash(vbuf.len, 1);
+    smith.bytes(vbuf[0..vn]);
+
+    var env = try jinja.Environment.init(gpa, .{ .autoescape = true, .undefined_policy = .lenient });
+    defer env.deinit();
+    var tmpl = try env.compile("<img{{ d|xmlattr }}>", null);
+    defer tmpl.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const attrs: []const jinja.Pair = try a.dupe(jinja.Pair, &.{.{
+        .key = .{ .string = .{ .bytes = kbuf[0..kn] } },
+        .value = .{ .string = .{ .bytes = vbuf[0..vn] } },
+    }});
+    const ctx: jinja.Value = .{ .map = .{ .pairs = try a.dupe(jinja.Pair, &.{.{
+        .key = .{ .string = .{ .bytes = "d" } },
+        .value = .{ .map = .{ .pairs = attrs } },
+    }}) } };
+
+    // A refusal is the correct answer for a key that cannot be spelled; only a
+    // rendered result makes a claim that can be wrong.
+    const out = tmpl.render(gpa, ctx, null) catch return;
+    defer gpa.free(out);
+
+    if (!attrsWellFormed(out)) {
+        std.debug.print(
+            "\nattribute injection: key={f} value={f} rendered '{f}'\n",
+            .{
+                std.ascii.hexEscape(kbuf[0..kn], .lower),
+                std.ascii.hexEscape(vbuf[0..vn], .lower),
+                std.ascii.hexEscape(out, .lower),
+            },
+        );
+        return error.AttributeInjection;
+    }
+}
+
+/// `<img( name="value")*>` — a name may not hold whitespace, `=`, `/` or `>`,
+/// and a value may not hold a bare `"`.
+fn attrsWellFormed(out: []const u8) bool {
+    if (!std.mem.startsWith(u8, out, "<img")) return false;
+    if (!std.mem.endsWith(u8, out, ">")) return false;
+    var rest = out["<img".len .. out.len - 1];
+    while (rest.len != 0) {
+        if (rest[0] != ' ') return false;
+        rest = rest[1..];
+        const eq = std.mem.indexOfScalar(u8, rest, '=') orelse return false;
+        for (rest[0..eq]) |c| switch (c) {
+            ' ', '\t', '\n', '\r', 0x0b, 0x0c, '/', '>', '"' => return false,
+            else => {},
+        };
+        rest = rest[eq + 1 ..];
+        if (rest.len == 0 or rest[0] != '"') return false;
+        rest = rest[1..];
+        const close = std.mem.indexOfScalar(u8, rest, '"') orelse return false;
+        rest = rest[close + 1 ..];
+    }
+    return true;
+}
+
+test "fuzz: arbitrary context data never breaks out of an attribute name" {
+    try std.testing.fuzz({}, fuzzXmlattrInvariant, .{});
+}
+
+test "the attribute oracle rejects the injection the audit found" {
+    // The oracle is the whole value of the target above, so it gets a test of
+    // its own: a harness whose judgement is wrong certifies nothing.
+    try std.testing.expect(attrsWellFormed("<img a=\"1\" b=\"x y\">"));
+    try std.testing.expect(attrsWellFormed("<img>"));
+    try std.testing.expect(!attrsWellFormed("<img a onmouseover=alert(1) b=\"1\">"));
+    try std.testing.expect(!attrsWellFormed("<img a/b=\"1\">"));
+    try std.testing.expect(!attrsWellFormed("<img a=1>"));
 }
 
 test "F12: the template draw buffer now reaches well past the old 1024-byte cap" {

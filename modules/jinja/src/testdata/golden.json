@@ -841,6 +841,18 @@
    "out": "[]",
    "status": "ok"
   },
+  "int_base_zero_binary": {
+   "out": "5",
+   "status": "ok"
+  },
+  "int_base_zero_hex": {
+   "out": "31",
+   "status": "ok"
+  },
+  "int_base_zero_octal": {
+   "out": "15",
+   "status": "ok"
+  },
   "list_concat_repeat": {
    "out": "[1, 2, 3]|[0, 0, 0]",
    "status": "ok"
@@ -1200,6 +1212,10 @@
    "out": "-----|ababab",
    "status": "ok"
   },
+  "striptags_unterminated_lt_is_text": {
+   "out": "a<b",
+   "status": "ok"
+  },
   "subscript_int": {
    "out": "10|30",
    "status": "ok"
@@ -1280,6 +1296,18 @@
    "out": "2.0|3.5|-3.5",
    "status": "ok"
   },
+  "truncate_no_space_empty_end": {
+   "out": "aaaaaaaaaaaa",
+   "status": "ok"
+  },
+  "truncate_no_space_keeps_prefix": {
+   "out": "https://example.c...",
+   "status": "ok"
+  },
+  "truncate_no_space_short": {
+   "out": "abcdefg...",
+   "status": "ok"
+  },
   "unary_minus_binds_after_pow": {
    "out": "4",
    "status": "ok"
@@ -1314,12 +1342,40 @@
    "out": "[]",
    "status": "ok"
   },
+  "urlencode_map_key_space_is_plus": {
+   "out": "a+b=c",
+   "status": "ok"
+  },
+  "urlencode_map_slash_is_encoded": {
+   "out": "k=a%2Fb",
+   "status": "ok"
+  },
+  "urlencode_map_space_is_plus": {
+   "out": "k=a+b",
+   "status": "ok"
+  },
+  "urlencode_string_keeps_percent20": {
+   "out": "a%20b",
+   "status": "ok"
+  },
   "whitespace_only_template": {
    "out": "   \n   ",
    "status": "ok"
   },
   "with_scope": {
    "out": "1[gone]",
+   "status": "ok"
+  },
+  "wordcount_dotted": {
+   "out": "2",
+   "status": "ok"
+  },
+  "wordcount_punctuation_splits": {
+   "out": "3",
+   "status": "ok"
+  },
+  "wordcount_underscore_is_one_word": {
+   "out": "1",
    "status": "ok"
   },
   "ws_both_options": {

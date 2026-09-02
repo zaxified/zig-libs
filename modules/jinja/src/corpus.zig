@@ -275,6 +275,27 @@ pub const cases = [_]Case{
     .{ .name = "escape_tojson_is_safe", .template = "{{ d|tojson }}", .context = "{\"d\": {\"k\": \"<v>\"}}", .autoescape = true },
     .{ .name = "escape_xmlattr", .template = "<a{{ d|xmlattr }}>", .context = "{\"d\": {\"href\": \"a&b\", \"n\": null}}", .autoescape = true },
 
+    // ── W2 re-audit 2026-09-02 ──────────────────────────────────────────────
+    //
+    // Every one of these was a divergence the module carried silently, found
+    // by reading the reference's own source rather than the module's tests.
+    // They live in the corpus, not in a hand-written expectation, so the live
+    // Jinja2 run is what judges them.
+    .{ .name = "truncate_no_space_keeps_prefix", .template = "{{ 'https://example.com/averylongpath'|truncate(20) }}" },
+    .{ .name = "truncate_no_space_short", .template = "{{ 'abcdefghijklmnop'|truncate(10) }}" },
+    .{ .name = "truncate_no_space_empty_end", .template = "{{ 'aaaaaaaaaaaaaaaaaa'|truncate(12, false, '') }}" },
+    .{ .name = "int_base_zero_binary", .template = "{{ '0b101'|int(0, 0) }}" },
+    .{ .name = "int_base_zero_octal", .template = "{{ '0o17'|int(0, 0) }}" },
+    .{ .name = "int_base_zero_hex", .template = "{{ '0x1f'|int(0, 0) }}" },
+    .{ .name = "wordcount_punctuation_splits", .template = "{{ 'a-b-c'|wordcount }}" },
+    .{ .name = "wordcount_dotted", .template = "{{ 'foo.bar'|wordcount }}" },
+    .{ .name = "wordcount_underscore_is_one_word", .template = "{{ 'a_b'|wordcount }}" },
+    .{ .name = "striptags_unterminated_lt_is_text", .template = "{{ 'a<b'|striptags }}" },
+    .{ .name = "urlencode_map_space_is_plus", .template = "{{ d|urlencode }}", .context = "{\"d\": {\"k\": \"a b\"}}" },
+    .{ .name = "urlencode_map_key_space_is_plus", .template = "{{ d|urlencode }}", .context = "{\"d\": {\"a b\": \"c\"}}" },
+    .{ .name = "urlencode_map_slash_is_encoded", .template = "{{ d|urlencode }}", .context = "{\"d\": {\"k\": \"a/b\"}}" },
+    .{ .name = "urlencode_string_keeps_percent20", .template = "{{ 'a b'|urlencode }}" },
+
     // ── autoescape × argument-taking filters (audit F1/F8, W2-18) ───────────
     //
     // The hole the audit named: the autoescape section above crossed `safe`

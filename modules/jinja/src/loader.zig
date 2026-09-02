@@ -182,6 +182,18 @@ pub const DirLoader = struct {
                 // `LoaderFailed` here rather than reading as "absent" and
                 // letting `ignore missing` swallow them (wave-2 audit
                 // `jinja` F13).
+                //
+                // But `ENOTDIR` is ALSO what an ordinary regular file in the
+                // middle of the path gives, and that is genuine absence, not
+                // an escape attempt: `{% include 'regular/x' ignore missing %}`
+                // failed the render where it should have been ignored. Ask
+                // what the component actually is before deciding
+                // (W2 re-audit 2026-09-02, `jinja` F-E2).
+                error.NotDir => {
+                    const st = dir.statFile(self.io, pending, .{ .follow_symlinks = false }) catch
+                        return error.LoaderFailed;
+                    return if (st.kind == .sym_link) error.LoaderFailed else null;
+                },
                 else => return error.LoaderFailed,
             };
             if (opened) dir.close(self.io);

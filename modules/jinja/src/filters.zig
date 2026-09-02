@@ -75,12 +75,22 @@ pub fn intFromFloatChecked(f: f64) Error!i64 {
     return @intFromFloat(t);
 }
 
+/// `.undef` is NOT `.none`. Folding the two together made an undefined
+/// numeric argument silently become the default under EVERY policy, including
+/// the module's default `.strict` one: `{{ 'a'|center(x) }}` padded to 80
+/// columns, `{{ [1,2]|batch(x) }}` batched by 1, `{{ x|int }}` answered 0.
+/// The reference raises `UndefinedError`/`TypeError` for all of them, under
+/// `Undefined` and `StrictUndefined` alike (verified against live Jinja2
+/// 3.1.6) — and a silent `0` where a VLAN id or an MTU belonged is exactly
+/// the failure mode this module's undefined policy exists to prevent
+/// (W2 re-audit 2026-09-02, `jinja` F-C2).
 fn intArg(v: Value, dflt: i64) Error!i64 {
     return switch (v) {
         .integer => |i| i,
         .boolean => |b| @intFromBool(b),
         .float => |f| intFromFloatChecked(f),
-        .none, .undef => dflt,
+        .undef => error.UndefinedValue,
+        .none => dflt,
         else => error.BadArgument,
     };
 }
@@ -475,21 +485,35 @@ fn fTruncate(ctx: *Ctx, input: Value, args: Args) Error!Value {
     const keep = length - end_raw.len;
     var cut = s[0..keep];
     if (!killwords) {
-        if (std.mem.lastIndexOfScalar(u8, cut, ' ')) |sp| {
-            cut = cut[0..sp];
-        } else {
-            cut = cut[0..0];
-        }
+        // `do_truncate` is `s[:length-len(end)].rsplit(" ", 1)[0]`, and
+        // `rsplit` on a string with no space returns `[whole]` — so the whole
+        // prefix is kept, not dropped. Emptying it silently truncated every
+        // spaceless string to nothing: a URL, a hostname, an interface name,
+        // base64 (W2 re-audit 2026-09-02, `jinja` F-C1).
+        if (std.mem.lastIndexOfScalar(u8, cut, ' ')) |sp| cut = cut[0..sp];
     }
     return .{ .string = .{ .bytes = try std.mem.concat(ctx.arena, u8, &.{ cut, end }), .safe = markup } };
 }
 
+/// `do_wordcount` is `len(_word_re.findall(soft_str(s)))` with
+/// `_word_re = re.compile(r"\w+")` — RUNS OF WORD CHARACTERS, not
+/// whitespace-separated tokens. Splitting on whitespace answered `1` for
+/// `a-b-c` where the reference answers `3`, and `1` for `<b>x</b>` where it
+/// answers `3` (W2 re-audit 2026-09-02, `jinja` F-D2).
+///
+/// Bytes >= 0x80 count as word characters, which is right for letters
+/// (`ěščř` is one word in both) and wrong for non-ASCII punctuation — the
+/// same ASCII-only residue `|upper` already carries (SPEC divergence D4).
 fn fWordcount(ctx: *Ctx, input: Value, args: Args) Error!Value {
     _ = args;
     const s = try ctx.toStr(input);
     var n: i64 = 0;
-    var it = std.mem.tokenizeAny(u8, s, " \t\r\n\x0b\x0c");
-    while (it.next()) |_| n += 1;
+    var in_word = false;
+    for (s) |c| {
+        const word = std.ascii.isAlphanumeric(c) or c == '_' or c >= 0x80;
+        if (word and !in_word) n += 1;
+        in_word = word;
+    }
     return .{ .integer = n };
 }
 
@@ -500,9 +524,14 @@ fn fStriptags(ctx: *Ctx, input: Value, args: Args) Error!Value {
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == '<') {
-            const close = std.mem.indexOfScalarPos(u8, s, i, '>') orelse break;
-            i = close + 1;
-            continue;
+            // An UNTERMINATED `<` is not a tag. `break` here dropped the whole
+            // rest of the string — `'a<b'|striptags` answered `a` where the
+            // reference answers `a<b`, silent data loss on ordinary text
+            // (W2 re-audit 2026-09-02, `jinja` F-D2).
+            if (std.mem.indexOfScalarPos(u8, s, i, '>')) |close| {
+                i = close + 1;
+                continue;
+            }
         }
         try stripped.append(ctx.arena, s[i]);
         i += 1;
@@ -587,10 +616,34 @@ fn fUrlencode(ctx: *Ctx, input: Value, args: Args) Error!Value {
             var out: std.ArrayList(u8) = .empty;
             for (pairs, 0..) |p, i| {
                 if (i != 0) try out.append(ctx.arena, '&');
-                try quoteInto(ctx, &out, try ctx.toStr(p.key), "");
+                try quoteIntoQs(ctx, &out, try ctx.toStr(p.key), "", true);
                 try out.append(ctx.arena, '=');
-                try quoteInto(ctx, &out, try ctx.toStr(p.value), "");
+                try quoteIntoQs(ctx, &out, try ctx.toStr(p.value), "", true);
             }
+            return Value.str(out.items);
+        },
+        // `do_urlencode` accepts an ITERABLE OF PAIRS as well as a mapping —
+        // `[('a', 'b c')]` is `a=b+c` there. This module rendered the Python
+        // repr of the list and percent-encoded that
+        // (W2 re-audit 2026-09-02, `jinja` F-D2).
+        .list, .tuple => |items| {
+            if (items.len != 0 and allPairs(items)) {
+                var out: std.ArrayList(u8) = .empty;
+                for (items, 0..) |it, i| {
+                    const kv = switch (it) {
+                        .list, .tuple => |p| p,
+                        else => unreachable,
+                    };
+                    if (i != 0) try out.append(ctx.arena, '&');
+                    try quoteIntoQs(ctx, &out, try ctx.toStr(kv[0]), "", true);
+                    try out.append(ctx.arena, '=');
+                    try quoteIntoQs(ctx, &out, try ctx.toStr(kv[1]), "", true);
+                }
+                return Value.str(out.items);
+            }
+            const s = try ctx.toStr(input);
+            var out: std.ArrayList(u8) = .empty;
+            try quoteInto(ctx, &out, s, "/");
             return Value.str(out.items);
         },
         else => {
@@ -602,8 +655,27 @@ fn fUrlencode(ctx: *Ctx, input: Value, args: Args) Error!Value {
     }
 }
 
+fn allPairs(items: []const Value) bool {
+    for (items) |it| switch (it) {
+        .list, .tuple => |p| if (p.len != 2) return false,
+        else => return false,
+    };
+    return true;
+}
+
 fn quoteInto(ctx: *Ctx, out: *std.ArrayList(u8), s: []const u8, extra_safe: []const u8) Error!void {
+    return quoteIntoQs(ctx, out, s, extra_safe, false);
+}
+
+/// `for_qs` is `url_quote(..., for_qs=True)`: inside a query string a space is
+/// `+`, not `%20`. `do_urlencode` uses the query-string form for a mapping and
+/// the plain form for a bare string (W2 re-audit 2026-09-02, `jinja` F-D2).
+fn quoteIntoQs(ctx: *Ctx, out: *std.ArrayList(u8), s: []const u8, extra_safe: []const u8, for_qs: bool) Error!void {
     for (s) |c| {
+        if (for_qs and c == ' ') {
+            try out.append(ctx.arena, '+');
+            continue;
+        }
         const unreserved = std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-' or c == '~' or
             std.mem.indexOfScalar(u8, extra_safe, c) != null;
         if (unreserved) {
@@ -614,6 +686,18 @@ fn quoteInto(ctx: *Ctx, out: *std.ArrayList(u8), s: []const u8, extra_safe: []co
             try out.appendSlice(ctx.arena, hex);
         }
     }
+}
+
+/// `do_xmlattr`'s `re.compile(r"[\s/>=]", re.ASCII)`: ASCII whitespace, `/`,
+/// `>` and `=` cannot appear in an attribute name.
+fn invalidAttrKey(key: []const u8) bool {
+    for (key) |c| switch (c) {
+        ' ', '\t', '\n', '\r', 0x0b, 0x0c, '/', '>', '=' => return true,
+        else => {},
+    };
+    // An empty key is NOT refused: `do_xmlattr({'': '1'})` renders ` ="1"`,
+    // verified against live Jinja2 3.1.6.
+    return false;
 }
 
 fn fXmlattr(ctx: *Ctx, input: Value, args: Args) Error!Value {
@@ -629,8 +713,19 @@ fn fXmlattr(ctx: *Ctx, input: Value, args: Args) Error!Value {
         if (p.value == .none or p.value == .undef) continue;
         if (!first or autospace) try out.append(ctx.arena, ' ');
         first = false;
+        const key = try ctx.toStr(p.key);
+        // `escapeTo` is markupsafe's set — `& < > " '` — and a dict key is
+        // attacker-controlled context data. Space, tab, newline, `/` and `=`
+        // pass through it untouched, so a key could close this attribute and
+        // open a live event handler: `{{ d|xmlattr }}` with the key
+        // `a onmouseover=alert(1) b` rendered `<img a onmouseover=alert(1) b="1">`
+        // out of an autoescaped template with no `|safe` anywhere. The
+        // reference refuses the key outright (`ValueError`), which is what
+        // CVE-2024-22195 added; this module never got that half
+        // (W2 re-audit 2026-09-02, `jinja` F-A1).
+        if (invalidAttrKey(key)) return error.BadArgument;
         var aw: std.Io.Writer.Allocating = .init(ctx.arena);
-        try value.escapeTo(&aw.writer, try ctx.toStr(p.key));
+        try value.escapeTo(&aw.writer, key);
         try out.appendSlice(ctx.arena, aw.written());
         try out.appendSlice(ctx.arena, "=\"");
         var vw: std.Io.Writer.Allocating = .init(ctx.arena);
@@ -673,10 +768,19 @@ fn fInt(ctx: *Ctx, input: Value, args: Args) Error!Value {
         // returning `default` instead would be a wrong answer rather than a
         // refusal.
         .float => |f| if (std.math.isNan(f) or std.math.isInf(f)) dflt else .{ .integer = try intFromFloatChecked(f) },
+        // See `intArg`: `{{ x|int }}` on an undefined `x` answered 0 under the
+        // strict policy. The reference raises (F-C2).
+        .undef => error.UndefinedValue,
         .string => |s| blk: {
             const t = std.mem.trim(u8, s.bytes, " \t\r\n");
             if (base) |b| {
-                const stripped = if (b != 10 and t.len > 2 and t[0] == '0' and !std.ascii.isDigit(t[1])) t[2..] else t;
+                // Base 0 means "read the prefix": `std.fmt.parseInt` does that
+                // itself, and the hand-rolled strip below removed the prefix
+                // FIRST, so base 0 saw a bare digit string — `'0b101'|int(0,0)`
+                // answered 101 where the reference answers 5, and `'0x1f'`
+                // answered the default (W2 re-audit 2026-09-02, `jinja` F-D1).
+                const strip = b != 0 and b != 10 and t.len > 2 and t[0] == '0' and !std.ascii.isDigit(t[1]);
+                const stripped = if (strip) t[2..] else t;
                 if (std.fmt.parseInt(i64, stripped, b)) |v| break :blk .{ .integer = v } else |_| {}
             }
             if (base == null or base.? == 10) {
@@ -695,6 +799,7 @@ fn fFloat(ctx: *Ctx, input: Value, args: Args) Error!Value {
         .float => input,
         .integer => |i| .{ .float = @floatFromInt(i) },
         .boolean => |b| .{ .float = if (b) 1.0 else 0.0 },
+        .undef => error.UndefinedValue,
         .string => |s| blk: {
             const t = std.mem.trim(u8, s.bytes, " \t\r\n");
             if (std.fmt.parseFloat(f64, t)) |f| break :blk .{ .float = f } else |_| {}
@@ -1293,6 +1398,10 @@ fn fTojson(ctx: *Ctx, input: Value, args: Args) Error!Value {
 }
 
 fn jsonWrite(ctx: *Ctx, w: *std.Io.Writer, v: Value, indent: ?usize, depth: usize) Error!void {
+    // `depth` was carried for indentation only and checked against nothing:
+    // 200 000 levels of nested list from context data was a SIGSEGV in
+    // ReleaseFast (W2 re-audit 2026-09-02, `jinja` F-A3).
+    if (depth > value.max_value_depth) return error.OutOfRange;
     switch (v) {
         .undef => return error.UndefinedValue,
         .none => w.writeAll("null") catch return error.OutOfMemory,
@@ -1537,6 +1646,9 @@ fn tDivisibleby(ctx: *Ctx, input: Value, args: Args) Error!bool {
     const by = args.get(0, "num") orelse return error.BadArgument;
     if (input != .integer or by != .integer) return error.TypeMismatch;
     if (by.integer == 0) return error.DivisionByZero;
+    // `@mod(minInt(i64), -1)` traps — SIGFPE in ReleaseFast. Everything is
+    // divisible by -1 (W2 re-audit 2026-09-02, `jinja` F-A2).
+    if (by.integer == -1) return true;
     return @mod(input.integer, by.integer) == 0;
 }
 fn tUpperTest(ctx: *Ctx, input: Value, args: Args) Error!bool {

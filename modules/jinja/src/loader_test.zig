@@ -383,3 +383,29 @@ test "a template included in a loop is loaded and compiled once" {
     defer gpa.free(out);
     try testing.expectEqualStrings("<0><1><2><3><4>", out);
 }
+
+test "a regular file in the middle of a path is absence, a symlinked one is a refusal" {
+    var tree = try Tree.init(testing.io);
+    defer tree.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dl: jinja.DirLoader = .{ .io = tree.io, .root = tree.root };
+    const l = dl.loader();
+
+    // `root/ok.j2` is a regular file, so `ok.j2/x` is `ENOTDIR` — the same
+    // errno a refused symlinked directory gives. Conflating them made
+    // `{% include 'ok.j2/x' ignore missing %}` fail the render instead of
+    // being ignored, which contradicts D17's own wording: only genuine
+    // absence is ignorable (W2 re-audit, F-E2).
+    try testing.expect((try l.load(l.ctx, a, "ok.j2/x")) == null);
+    try testing.expect((try l.load(l.ctx, a, "absentdir/x")) == null);
+
+    // …and the symlinked directory component is still refused, not reported
+    // absent. That is the half the F13 fix was about, and it must not regress.
+    if (tree.symlinks) {
+        try testing.expectError(error.LoaderFailed, l.load(l.ctx, a, "up/SECRET"));
+    }
+}

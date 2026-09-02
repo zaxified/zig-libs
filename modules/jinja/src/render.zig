@@ -22,6 +22,10 @@ const Node = ast.Node;
 pub const Error = value.Error || error{
     /// The output exceeded `Options.max_output_bytes`.
     OutputTooLarge,
+    /// The render's total scratch allocation exceeded
+    /// `Options.max_render_bytes`. Distinct from `OutOfMemory`: the machine
+    /// has memory, this render asked for more than it is allowed.
+    RenderBudgetExceeded,
     /// Called something that is not callable, or a method a value does not have.
     NotCallable,
     /// A filter/test named at compile time vanished from the registry.
