@@ -5,6 +5,38 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — **Audit (drift campaign): 1 HIGH, 4 LOW fixed.**
+  **HIGH — `msgFlags.privFlag` did not select the ScopedPduData branch; the msgData TLV *tag*
+  did.** RFC 3412 §7.2 step 5 makes the flag the selector, and the previous audit's fix checked
+  only the flag PAIR (`priv and !auth`), so both mismatch directions were open. privFlag set with
+  a plaintext `SEQUENCE` was taken as authPriv **data** — an adversary holding only the auth key
+  could read and inject at authPriv, a privacy downgrade that looked like a normal reply. privFlag
+  clear with an OCTET STRING was taken as `.encrypted`, so **unauthenticated** bytes reached
+  `priv.decryptScopedPdu` under the real localized key with an attacker-chosen IV (boots, time and
+  salt all come from the unauthenticated USM params). The second one was measured as a live
+  oracle: 20 000 random ciphertexts produced 8 distinct typed-error classes, identical in Debug
+  and ReleaseFast. SPEC.md already said in as many words that an unauthenticated "encrypted"
+  message must not be decrypted even as an oracle; nothing implemented it. Both directions are
+  `error.SecurityLevelMismatch` now.
+  **LOW — `msgAuthoritativeEngineBoots`/`Time` were not range-checked** against RFC 3414 §2.2's
+  `INTEGER (0..2147483647)`, and the anti-replay escape hatch ("boots at the ceiling ⇒ always out
+  of window") was written `== max_boots`, so a spoofed `0xFFFFFFFF` stepped over it: one
+  unauthenticated discovery Report seeded the client's clock and every genuine reply after it was
+  `NotInTimeWindow`, permanently. Range enforced at `parse`, and the ceiling comparison widened to
+  `>=` as a second lock. ⚠ A round-trip test asserted the out-of-range value survives `parse` —
+  it was pinning the defect, and is corrected.
+  **LOW — `usm.verify`/`usm.sign` accepted a zero-length localized key**, so a digest signed with
+  `""` verified against `""`: the pair failed open together, while the privacy layer beside them
+  has always returned `KeyTooShort`. `sign` is fallible now.
+  **LOW — `computeDigestInto`'s out-buffer guard was `std.debug.assert`.** Measured in ReleaseFast
+  with a 4-byte buffer for a 12-byte digest: it returned 12 bytes and wrote 8 of them past the
+  slice, no error. It is a `pub` entry point; the check is real now (`BufferTooSmall`).
+  **LOW — the catalog cell outlived the code**: `meta.doc` (the rendered source of truth) still
+  said "privacy crypto in progress" while RFC 7860 SHA-224/256/384/512 and DES-CBC + AES-128-CFB
+  ship, KAT- and net-snmp-anchored.
+  Every fix carries a regression test that goes red when the fix is reverted. Ledger:
+  `~/CML/20260931-zig-libs-audit/snmp.md`.
+
 - **2026-08-23** — **Behavioural:** `TransportError` gains `Canceled`, and
   `UdpTransport.exchangeFn` recovers it from `Socket.send`/`.receiveTimeout`
   instead of folding every failure into `TransportFailed`. A canceled

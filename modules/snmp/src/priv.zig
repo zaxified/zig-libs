@@ -605,7 +605,7 @@ fn expectPrivRoundTrip(proto: PrivProtocol) !void {
     const sp = try usm.parse(m.security_parameters);
     try testing.expectEqualSlices(u8, &salt, sp.priv_params);
     const off = usm.authOffset(msg, sp) orelse return error.TestUnexpectedResult;
-    usm.sign(.hmac_sha1, key, msg, off);
+    try usm.sign(.hmac_sha1, key, msg, off);
     try usm.verify(.hmac_sha1, key, msg, sp);
     const enc_bytes = m.data.encrypted;
 

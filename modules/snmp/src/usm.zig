@@ -63,10 +63,20 @@ pub fn parse(bytes: []const u8) DecodeError!UsmSecurityParameters {
 
     var d = ber.Decoder.init(seq);
     const engine_id = try d.expect(ber.tag.octet_string);
+    // RFC 3414 §2.2 types both of these `INTEGER (0..2147483647)` -- the same
+    // range this file's own doc comment quotes -- and the range is not
+    // decoration: the anti-replay window's escape hatch is "boots at
+    // 2147483647 means always out of window", and a value ABOVE it walks past
+    // the `== max_boots` comparison that implements the escape. A spoofed
+    // discovery Report carrying `boots = 0xFFFFFFFF` then seeds the client's
+    // clock and every genuine reply after it is `NotInTimeWindow` -- a
+    // permanent denial from one unauthenticated datagram. Audit 2026-09-02.
     const eb = try ber.parseInteger(try d.expect(ber.tag.integer));
     const engine_boots = std.math.cast(u32, eb) orelse return error.IntegerTooLarge;
+    if (engine_boots > std.math.maxInt(i32)) return error.InvalidValue;
     const et = try ber.parseInteger(try d.expect(ber.tag.integer));
     const engine_time = std.math.cast(u32, et) orelse return error.IntegerTooLarge;
+    if (engine_time > std.math.maxInt(i32)) return error.InvalidValue;
     const user_name = try d.expect(ber.tag.octet_string);
     const auth_params = try d.expect(ber.tag.octet_string);
     const priv_params = try d.expect(ber.tag.octet_string);
@@ -191,6 +201,9 @@ pub const AuthError = error{
     /// `msgAuthenticationParameters` was not the protocol's `digestLen()`, or
     /// does not lie within `message` (so its offset can't be located).
     BadAuthParams,
+    /// The localized key was shorter than `proto.keyLen()` — including the
+    /// empty key, which used to verify against a digest computed with it.
+    KeyTooShort,
 };
 
 /// Errors from the password->key derivation (RFC 3414 §2.6 / Appendix A.2).
@@ -291,9 +304,13 @@ pub fn computeDigestInto(
     message: []const u8,
     auth_offset: usize,
     out: []u8,
-) []u8 {
+) error{BufferTooSmall}![]u8 {
     const n = proto.digestLen();
-    std.debug.assert(out.len >= n);
+    // NOT `std.debug.assert`: this is `pub`, and an assert is a guard only in
+    // a build that keeps them. Measured in ReleaseFast with a 4-byte `out`
+    // for a 12-byte digest: it returned 12 bytes and wrote 8 of them past the
+    // slice, no error. Audit 2026-09-02.
+    if (out.len < n) return error.BufferTooSmall;
     switch (proto) {
         .hmac_md5 => digestT(hmac.Hmac(hash.Md5), localized_key, message, auth_offset, n, out),
         .hmac_sha1 => digestT(hmac.Hmac(hash.Sha1), localized_key, message, auth_offset, n, out),
@@ -318,7 +335,7 @@ pub fn computeDigest(
     out: *[digest_len]u8,
 ) void {
     std.debug.assert(proto.digestLen() == digest_len);
-    _ = computeDigestInto(proto, localized_key, message, auth_offset, out);
+    _ = computeDigestInto(proto, localized_key, message, auth_offset, out) catch unreachable; // `out` is `max_digest_len` by construction here
 }
 
 fn digestT(
@@ -397,9 +414,19 @@ pub fn verify(
     message: []const u8,
     params: UsmSecurityParameters,
 ) AuthError!void {
+    // A localized key shorter than the protocol's own key length is not a key.
+    // Both this and `sign` used to accept ANY slice, including an empty one:
+    // a digest signed with `""` verified with `""` and was accepted. The
+    // privacy layer beside this one has always returned `KeyTooShort` for the
+    // same condition (`priv.zig`). Wire-reachable only at noAuthNoPriv, where
+    // `authKey()` is empty and an off-path attacker can set authFlag, compute
+    // the HMAC themselves and reach the `authenticated`-only branches -- but a
+    // public crypto entry point that fails OPEN on a missing key is the shape,
+    // whatever today's reachability. Audit 2026-09-02.
+    if (localized_key.len < proto.keyLen()) return error.KeyTooShort;
     const off = authOffsetFor(proto, message, params) orelse return error.BadAuthParams;
     var expected_buf: [max_digest_len]u8 = undefined;
-    const expected = computeDigestInto(proto, localized_key, message, off, &expected_buf);
+    const expected = computeDigestInto(proto, localized_key, message, off, &expected_buf) catch unreachable; // `expected_buf` is `max_digest_len`
     // CONSTANT-TIME compare (never std.mem.eql on a MAC). timing_safe.eql wants
     // a fixed-size array type, so dispatch on the protocol's truncation length.
     const got = params.auth_params;
@@ -424,9 +451,12 @@ pub fn sign(
     localized_key: []const u8,
     message: []u8,
     auth_offset: usize,
-) void {
+) error{KeyTooShort}!void {
+    // See `verify`: an empty "key" produced a digest that verified against
+    // itself, so the pair failed open together.
+    if (localized_key.len < proto.keyLen()) return error.KeyTooShort;
     var buf: [max_digest_len]u8 = undefined;
-    const d = computeDigestInto(proto, localized_key, message, auth_offset, &buf);
+    const d = computeDigestInto(proto, localized_key, message, auth_offset, &buf) catch unreachable; // `buf` is `max_digest_len`
     @memcpy(message[auth_offset..][0..d.len], d);
 }
 
@@ -475,11 +505,18 @@ test "encode/parse round-trip: noAuthNoPriv empties" {
     try testing.expectEqual(@as(u32, 0), back.engine_time);
 }
 
-test "encode/parse round-trip: boots/time near u32 max" {
+test "encode/parse round-trip: boots/time at the top of their RFC range" {
+    // ⚠ This used to round-trip `maxInt(u32)`, which RFC 3414 §2.2 does not
+    // permit: both fields are `INTEGER (0..2147483647)`. The range is
+    // load-bearing -- the anti-replay window's escape hatch is "boots at
+    // 2147483647 ⇒ always out of window", and a larger value walks past the
+    // `== max_boots` comparison that implements it. A test that asserted the
+    // out-of-range value survives the round trip was pinning the defect.
+    // Audit 2026-09-02.
     try expectRoundTrip(.{
         .engine_id = "\x80\x00\x1f\x88\x04",
-        .engine_boots = std.math.maxInt(u32),
-        .engine_time = std.math.maxInt(u32) - 1,
+        .engine_boots = std.math.maxInt(i32),
+        .engine_time = std.math.maxInt(i32) - 1,
         .user_name = "u",
         .auth_params = "",
         .priv_params = "",
@@ -695,7 +732,7 @@ fn expectSignVerifyRoundTrip(proto: AuthProtocol) !void {
     const off = authOffsetFor(proto, msg, params) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, zeros[0..dlen], params.auth_params);
 
-    sign(proto, key, msg, off);
+    try sign(proto, key, msg, off);
     try verify(proto, key, msg, params);
 
     // The written digest must be non-zero (a zero HMAC would be astronomical).
@@ -826,7 +863,7 @@ test "computeDigestInto: truncation length is the protocol's, and is a real pref
     @memset(msg[8..][0..24], 0); // sha256's 24-byte auth region, already zero
 
     var out: [max_digest_len]u8 = undefined;
-    const d = computeDigestInto(.hmac_sha256, &key, &msg, 8, &out);
+    const d = try computeDigestInto(.hmac_sha256, &key, &msg, 8, &out);
     try testing.expectEqual(@as(usize, 24), d.len);
 
     var full: [hmac.Hmac(hash.sha2.Sha256).mac_length]u8 = undefined;
@@ -906,7 +943,7 @@ test "authOffsetFor: a pointer landing INSIDE the message but not on the field i
     // Not over-tight: the genuine params still resolve, and still verify.
     var key_buf: [max_key_len]u8 = undefined;
     const key = try passwordToKey(proto, "maplesyrup", &rfc3414_engine_id, &key_buf);
-    sign(proto, key, msg, off);
+    try sign(proto, key, msg, off);
     try verify(proto, key, msg, params);
 }
 
@@ -960,4 +997,54 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&buf);
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     _ = parse(buf[0..len]) catch return;
+}
+
+test "engineBoots/engineTime outside INTEGER (0..2147483647) are refused on the wire" {
+    // ⛔ The range is not decoration: the anti-replay window's escape hatch is
+    // "boots at 2147483647 ⇒ always out of window", so a value ABOVE the
+    // ceiling used to step over it. One spoofed, UNAUTHENTICATED discovery
+    // Report carrying `boots = 0xFFFFFFFF` then seeded the client's clock and
+    // every genuine reply after it was `NotInTimeWindow` -- a permanent denial
+    // from one datagram. Audit 2026-09-02.
+    var buf: [128]u8 = undefined;
+    const over = try encode(&buf, .{
+        .engine_id = "\x80\x00\x1f\x88\x04",
+        .engine_boots = std.math.maxInt(u32),
+        .engine_time = 1,
+        .user_name = "u",
+        .auth_params = "",
+        .priv_params = "",
+    });
+    try testing.expectError(error.InvalidValue, parse(over));
+
+    var buf2: [128]u8 = undefined;
+    const over_time = try encode(&buf2, .{
+        .engine_id = "\x80\x00\x1f\x88\x04",
+        .engine_boots = 1,
+        .engine_time = std.math.maxInt(u32),
+        .user_name = "u",
+        .auth_params = "",
+        .priv_params = "",
+    });
+    try testing.expectError(error.InvalidValue, parse(over_time));
+}
+
+test "an empty localized key is not a key: sign and verify both refuse it" {
+    // ⛔ They used to accept any slice, so a digest signed with `""` verified
+    // against `""` and the pair failed OPEN together — while the privacy
+    // layer beside them has always returned `KeyTooShort` for the same thing.
+    // Audit 2026-09-02.
+    var msg = [_]u8{0} ** 64;
+    try testing.expectError(error.KeyTooShort, sign(.hmac_sha1, "", &msg, 8));
+    try testing.expectError(error.KeyTooShort, sign(.hmac_sha1, "too short", &msg, 8));
+
+    // A real key still signs, and its digest still verifies — the guard did
+    // not become a refusal of everything.
+    const key = [_]u8{0xAB} ** 20;
+    try sign(.hmac_sha1, &key, &msg, 8);
+    var short: [4]u8 = undefined;
+    try testing.expectError(
+        error.BufferTooSmall,
+        computeDigestInto(.hmac_sha1, &key, &msg, 8, &short),
+    );
 }

@@ -92,7 +92,7 @@ pub fn checkTimeWindow(
 ) TimeError!void {
     switch (role) {
         .authoritative => {
-            if (state.engine_boots == max_boots) return error.NotInTimeWindow;
+            if (state.engine_boots >= max_boots) return error.NotInTimeWindow;
             if (msg_boots != state.engine_boots) return error.NotInTimeWindow;
             const diff = if (msg_time > state.engine_time)
                 msg_time - state.engine_time
@@ -102,7 +102,12 @@ pub fn checkTimeWindow(
         },
         .non_authoritative => {
             _ = latch(state, msg_boots, msg_time);
-            if (state.engine_boots == max_boots) return error.NotInTimeWindow;
+            // `>=`, not `==`: RFC 3414 §2.2 caps boots at `max_boots`, but the
+            // escape hatch this implements ("boots at the ceiling ⇒ always out
+            // of window") must not be walked past by a value ABOVE it. The
+            // range is enforced in `usm.parse` now; this is the second lock,
+            // and it costs nothing. Audit 2026-09-02.
+            if (state.engine_boots >= max_boots) return error.NotInTimeWindow;
             if (msg_boots < state.engine_boots) return error.NotInTimeWindow;
             if (msg_boots == state.engine_boots) {
                 // msg_time more than 150 s behind the newest time we've seen.
@@ -195,4 +200,30 @@ test "non-authoritative: no underflow when times are small" {
     // latest_received=10; floor = 10-150 = -140; any small msg_time >= -140 is OK.
     try checkTimeWindow(.non_authoritative, &st, 1, 0);
     try checkTimeWindow(.non_authoritative, &st, 1, 5);
+}
+
+test "a boots value above the RFC ceiling cannot walk past the always-out-of-window rule" {
+    // The escape hatch is "boots at `max_boots` ⇒ always out of window". It
+    // was written `== max_boots`, so a spoofed value ABOVE the ceiling stepped
+    // over it. `usm.parse` now refuses such a value on the wire; this is the
+    // second lock, and it is the one that would still hold if a caller built
+    // the state some other way. Audit 2026-09-02.
+    var state: EngineTimeState = .{
+        .engine_boots = std.math.maxInt(u32),
+        .engine_time = 10,
+        .latest_received_engine_time = 10,
+    };
+    try std.testing.expectError(
+        error.NotInTimeWindow,
+        checkTimeWindow(.non_authoritative, &state, std.math.maxInt(u32), 10),
+    );
+    var auth_state: EngineTimeState = .{
+        .engine_boots = std.math.maxInt(u32),
+        .engine_time = 0,
+        .latest_received_engine_time = 0,
+    };
+    try std.testing.expectError(
+        error.NotInTimeWindow,
+        checkTimeWindow(.authoritative, &auth_state, std.math.maxInt(u32), 0),
+    );
 }

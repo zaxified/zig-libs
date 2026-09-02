@@ -431,7 +431,7 @@ fn expectDigestInterop(proto: usm.AuthProtocol, golden: []const u8, want_user: [
     // (2) we regenerate it bit-for-bit.
     const off = usm.authOffsetFor(proto, dg, sp).?;
     @memset(dg[off..][0..proto.digestLen()], 0);
-    usm.sign(proto, key, dg, off);
+    try usm.sign(proto, key, dg, off);
     try testing.expectEqualSlices(u8, golden, dg);
 
     // (3) a single flipped bit anywhere outside the digest breaks it.

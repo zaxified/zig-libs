@@ -106,6 +106,13 @@ pub const DecodeError = message.DecodeError || error{
     /// implement. Only USM (RFC 3411 model 3) is implemented, and a message
     /// naming another model must not be handed to USM anyway.
     UnsupportedSecurityModel,
+    /// RFC 3412 §7.2 step 5: the ScopedPduData branch and `msgFlags.privFlag`
+    /// disagree — a plaintext ScopedPDU under privFlag (a privacy downgrade
+    /// that would otherwise be read as authPriv data), or an encryptedPDU
+    /// without it (unauthenticated bytes on their way to the privacy key).
+    /// The flag SELECTS the branch; neither half may be inferred from the
+    /// other. See `decode`.
+    SecurityLevelMismatch,
 };
 
 /// Decode an SNMPv3 message envelope. A non-v3 `msgVersion` is `error.NotV3`.
@@ -143,9 +150,33 @@ pub fn decode(bytes: []const u8) DecodeError!V3Message {
     const data_tlv = try m.any();
     if (!m.done()) return error.TrailingData;
 
+    // ⛔ RFC 3412 §7.2 step 5: `msgFlags.privFlag` SELECTS the ScopedPduData
+    // branch. It is not a hint to be reconciled later, and it is not enough to
+    // check the flag pair (`priv and !auth`, above) -- the two halves must
+    // agree in BOTH directions, or the branch is chosen by whichever the
+    // attacker sends:
+    //
+    //   * privFlag set + a plaintext SEQUENCE was taken as authPriv DATA, so
+    //     an adversary holding only the AUTH key could read and inject at
+    //     authPriv -- a privacy downgrade that looked like a normal reply.
+    //   * privFlag clear + an OCTET STRING was taken as `.encrypted`, so the
+    //     client handed UNAUTHENTICATED bytes to `priv.decryptScopedPdu`
+    //     under the real localized key, with boots/time/salt (the whole
+    //     AES-CFB IV) also attacker-chosen. Measured as a live oracle: 20 000
+    //     random ciphertexts produced 8 distinct typed-error classes,
+    //     identical in Debug and ReleaseFast. SPEC.md said in as many words
+    //     that this must not happen; nothing implemented it.
+    //
+    // Audit 2026-09-02.
     const data: ScopedData = switch (data_tlv.tag) {
-        ber.tag.sequence => .{ .plaintext = try decodeScopedPdu(data_tlv.content) },
-        ber.tag.octet_string => .{ .encrypted = data_tlv.content },
+        ber.tag.sequence => blk: {
+            if (header.flags.priv) return error.SecurityLevelMismatch;
+            break :blk .{ .plaintext = try decodeScopedPdu(data_tlv.content) };
+        },
+        ber.tag.octet_string => blk: {
+            if (!header.flags.priv) return error.SecurityLevelMismatch;
+            break :blk .{ .encrypted = data_tlv.content };
+        },
         else => return error.UnexpectedTag,
     };
     return .{ .header = header, .security_parameters = security_parameters, .data = data };
@@ -489,20 +520,31 @@ test "RFC 3412 §7.2 step 5: privFlag without authFlag is discarded before anyth
     try testing.expectError(error.InvalidSecurityFlags, decode(dg));
 
     // Non-vacuity, and the exact bit that matters: the same datagram with
-    // authFlag ALSO set decodes. So the rejection is the illegal
-    // combination, not the privFlag and not this message shape.
+    // authFlag ALSO set — and an encryptedPDU, which is what privFlag now
+    // means — decodes. So the rejection is the illegal combination, not the
+    // privFlag and not this message shape.
+    //
+    // ⚠ This arm used to send a PLAINTEXT ScopedPDU with both flags set and
+    // assert that it decoded. That shape is the privacy downgrade the
+    // 2026-09-02 audit found: the flag said authPriv, the data was in the
+    // clear, and `decode` handed it up as authPriv DATA.
     var buf2: [256]u8 = undefined;
-    var both = params;
-    both.flags = .{ .priv = true, .auth = true };
-    const dg2 = try encode(&buf2, both);
+    const dg2 = try encodeEncrypted(&buf2, .{
+        .msg_id = 7,
+        .flags = .{ .priv = true, .auth = true },
+        .security_parameters = "usm-blob",
+        .encrypted_pdu = "\x01\x02\x03\x04",
+    });
     const m = try decode(dg2);
     try testing.expect(m.header.flags.priv and m.header.flags.auth);
+    try testing.expect(m.data == .encrypted);
 
-    // And the three legal combinations of the two bits all still decode.
+    // And the two combinations that go with a PLAINTEXT ScopedPDU still
+    // decode. authPriv is not among them any more -- with privFlag set the
+    // msgData must be an encryptedPDU, which the arm above covers.
     for ([_]MsgFlags{
         .{},
         .{ .auth = true },
-        .{ .auth = true, .priv = true },
     }) |f| {
         errdefer std.debug.print("flags byte 0x{x:0>2}\n", .{f.toByte()});
         var b: [256]u8 = undefined;
@@ -510,6 +552,55 @@ test "RFC 3412 §7.2 step 5: privFlag without authFlag is discarded before anyth
         p.flags = f;
         _ = try decode(try encode(&b, p));
     }
+}
+
+test "RFC 3412 §7.2 step 5: privFlag SELECTS the ScopedPduData branch, both ways" {
+    // ⛔ HIGH regression (audit 2026-09-02). The branch used to be chosen by
+    // the msgData TLV tag alone, so both mismatches were accepted:
+    //
+    //   * privFlag set + a plaintext SEQUENCE was taken as authPriv DATA --
+    //     an adversary holding only the AUTH key could read and inject at
+    //     authPriv (a privacy downgrade that looks like a normal reply).
+    //   * privFlag clear + an OCTET STRING was taken as `.encrypted`, so
+    //     UNAUTHENTICATED bytes reached `priv.decryptScopedPdu` under the
+    //     real localized key with an attacker-chosen IV. Measured as a live
+    //     oracle: 20 000 random ciphertexts, 8 distinct typed-error classes,
+    //     identical in Debug and ReleaseFast.
+    const vbs = try sampleTrapVarbinds();
+    const base: EncodeParams = .{
+        .msg_id = 11,
+        .security_parameters = "usm-blob",
+        .context_engine_id = "\x80\x00\x1f\x88\x80",
+        .pdu = .{ .type = .trap_v2, .request_id = 1, .varbinds = &vbs },
+    };
+
+    // A plaintext ScopedPDU carrying authPriv flags: the downgrade.
+    var buf: [256]u8 = undefined;
+    var downgrade = base;
+    downgrade.flags = .{ .auth = true, .priv = true };
+    try testing.expectError(error.SecurityLevelMismatch, decode(try encode(&buf, downgrade)));
+
+    // An encryptedPDU with privFlag clear: the decryption oracle. Both bits
+    // clear, so the older `priv and !auth` check cannot see it.
+    var buf2: [256]u8 = undefined;
+    const oracle = try encodeEncrypted(&buf2, .{
+        .msg_id = 11,
+        .flags = .{},
+        .security_parameters = "usm-blob",
+        .encrypted_pdu = "\xde\xad\xbe\xef",
+    });
+    try testing.expectError(error.SecurityLevelMismatch, decode(oracle));
+
+    // Same thing with authFlag set but privFlag still clear -- authenticated
+    // is not the same as authorised to be decrypted.
+    var buf3: [256]u8 = undefined;
+    const auth_only = try encodeEncrypted(&buf3, .{
+        .msg_id = 11,
+        .flags = .{ .auth = true },
+        .security_parameters = "usm-blob",
+        .encrypted_pdu = "\xde\xad\xbe\xef",
+    });
+    try testing.expectError(error.SecurityLevelMismatch, decode(auth_only));
 }
 
 test "RFC 3411: a message naming a security model other than USM is refused" {

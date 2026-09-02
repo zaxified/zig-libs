@@ -612,7 +612,7 @@ pub const V3Client = struct {
             const sent_params = try usm.parse(sent.security_parameters);
             const off = usm.authOffsetFor(c.user.auth_protocol, out, sent_params) orelse
                 return error.BadAuthParams;
-            usm.sign(c.user.auth_protocol, c.engine.authKey(), out, off);
+            try usm.sign(c.user.auth_protocol, c.engine.authKey(), out, off);
         }
         return .{ .wire = out, .msg_id = msg_id, .request_id = rid };
     }
@@ -1047,7 +1047,7 @@ pub const FakeAgent = struct {
             const off = usm.authOffsetFor(a.user.auth_protocol, mut, sp2) orelse return error.BadAuthParams;
             var kb: [usm.max_key_len]u8 = undefined;
             const key = try a.authKey(&kb);
-            usm.sign(a.user.auth_protocol, key, mut, off);
+            try usm.sign(a.user.auth_protocol, key, mut, off);
         }
         return mut;
     }
