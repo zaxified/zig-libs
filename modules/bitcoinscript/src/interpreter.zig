@@ -345,12 +345,68 @@ fn undecodableStop(script: []const u8, i: usize) usize {
     return pos;
 }
 
-fn allExecuting(cond_stack: []const bool) bool {
-    for (cond_stack) |v| {
-        if (!v) return false;
+/// The IF/NOTIF/ELSE/ENDIF nesting state, with an **O(1)** "are we executing?"
+/// — Bitcoin Core's `ConditionStack`.
+///
+/// ⛔ It used to be a `std.ArrayList(bool)` scanned end to end on EVERY
+/// instruction (`allExecuting`), which is O(depth) per opcode and therefore
+/// quadratic in a script's own length. BIP342 removes both
+/// `MAX_OPS_PER_SCRIPT` and `MAX_SCRIPT_SIZE` for a tapscript leaf, so the
+/// depth is whatever the spender wrote: measured in ReleaseFast on a leaf of
+/// `OP_1 OP_IF` repeated — 100 KB 0.91 s, 200 KB 3.68 s, 400 KB 14.5 s,
+/// 800 KB 57.2 s, **1.6 MB 237 s of one core**, a clean ×4 per doubling.
+/// Core validates the same leaf in linear time, because `all_true()` is one
+/// comparison. The work is spent before any verdict, and the attacker writes
+/// the leaf they are spending.
+///
+/// The trick is Core's: remember only how deep we are and where the FIRST
+/// false lies. `no_false` is `m_first_false_pos == NO_FALSE` in Core.
+/// Audit 2026-09-02; the shape was not in the drift window — it is as old as
+/// the file, and the previous audit's B1 ("no accidental quadratic in the
+/// dispatch itself") did not reach it.
+const ConditionStack = struct {
+    const no_false = std.math.maxInt(usize);
+
+    size: usize = 0,
+    /// Depth of the first `false` entry, or `no_false` when every entry is
+    /// true (which includes the empty stack).
+    first_false: usize = no_false,
+
+    fn empty(c: ConditionStack) bool {
+        return c.size == 0;
     }
-    return true;
-}
+
+    fn allTrue(c: ConditionStack) bool {
+        return c.first_false == no_false;
+    }
+
+    fn push(c: *ConditionStack, value: bool) void {
+        if (c.first_false == no_false and !value) c.first_false = c.size;
+        c.size += 1;
+    }
+
+    /// Pops the top entry. The caller must have checked `!empty()`.
+    fn pop(c: *ConditionStack) void {
+        c.size -= 1;
+        if (c.first_false == c.size) c.first_false = no_false;
+    }
+
+    /// Flips the top entry (OP_ELSE). The caller must have checked `!empty()`.
+    fn toggleTop(c: *ConditionStack) void {
+        const top = c.size - 1;
+        if (c.first_false == no_false) {
+            // Everything above and including the top was true: the top
+            // becomes the first false.
+            c.first_false = top;
+        } else if (c.first_false == top) {
+            // The top was the only false at or below it: it becomes true.
+            c.first_false = no_false;
+        } else {
+            // A false lies deeper; flipping the top changes nothing about
+            // where the first one is.
+        }
+    }
+};
 
 const State = struct {
     allocator: Allocator,
@@ -949,7 +1005,7 @@ fn evalCore(
     if (!is_tapscript and script.len > limits.max_script_size) return error.ScriptSize;
 
     var altstack: Stack = .empty;
-    var cond_stack: std.ArrayList(bool) = .empty;
+    var cond_stack: ConditionStack = .{};
 
     var state: State = .{
         .allocator = allocator,
@@ -997,7 +1053,7 @@ fn evalCore(
         if (sig_version == .base and flags.const_scriptcode and
             instr.opcode == @intFromEnum(Opcode.OP_CODESEPARATOR)) return error.OpCodeseparator;
 
-        const exec = allExecuting(cond_stack.items);
+        const exec = cond_stack.allTrue();
 
         if (instr.data) |data| {
             if (data.len > limits.max_script_element_size) return error.PushSize;
@@ -1032,14 +1088,13 @@ fn evalCore(
                 stack.shrinkRetainingCapacity(stack.items.len - 1);
             }
             const is_notif = instr.opcode == @intFromEnum(Opcode.OP_NOTIF);
-            try cond_stack.append(allocator, value != is_notif);
+            cond_stack.push(value != is_notif);
         } else if (instr.opcode == @intFromEnum(Opcode.OP_ELSE)) {
-            if (cond_stack.items.len == 0) return error.UnbalancedConditional;
-            const last = cond_stack.items.len - 1;
-            cond_stack.items[last] = !cond_stack.items[last];
+            if (cond_stack.empty()) return error.UnbalancedConditional;
+            cond_stack.toggleTop();
         } else if (instr.opcode == @intFromEnum(Opcode.OP_ENDIF)) {
-            if (cond_stack.items.len == 0) return error.UnbalancedConditional;
-            _ = cond_stack.pop();
+            if (cond_stack.empty()) return error.UnbalancedConditional;
+            cond_stack.pop();
         } else if (exec) {
             try execOpcode(&state, instr.opcode, instr.next);
         }
@@ -1047,7 +1102,7 @@ fn evalCore(
         if (stack.items.len + altstack.items.len > limits.max_stack_size) return error.StackSize;
     }
 
-    if (cond_stack.items.len != 0) return error.UnbalancedConditional;
+    if (!cond_stack.empty()) return error.UnbalancedConditional;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -1322,4 +1377,92 @@ test "OP_CHECKLOCKTIMEVERIFY: locktime <= tx.locktime passes, > fails (BIP65 bou
             eval(arena.allocator(), &stack, &script, ctxWithLocktime(6), .base, flags),
         );
     }
+}
+
+test "ConditionStack agrees with the naive scan it replaced, over a random op sequence" {
+    // The O(1) form is only worth having if it answers the same question. A
+    // differential against the exact code that was here before -- a `bool`
+    // list scanned end to end -- over a pseudo-random walk of the four
+    // operations, checked after EVERY step.
+    var naive: std.ArrayList(bool) = .empty;
+    defer naive.deinit(testing.allocator);
+    var fast: ConditionStack = .{};
+
+    var seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    var i: usize = 0;
+    while (i < 20_000) : (i += 1) {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const roll = (seed >> 33) % 10;
+        if (roll < 5 or naive.items.len == 0) {
+            const v = (seed >> 17) & 1 == 0;
+            try naive.append(testing.allocator, v);
+            fast.push(v);
+        } else if (roll < 8) {
+            const last = naive.items.len - 1;
+            naive.items[last] = !naive.items[last];
+            fast.toggleTop();
+        } else {
+            _ = naive.pop();
+            fast.pop();
+        }
+
+        var all = true;
+        for (naive.items) |v| {
+            if (!v) {
+                all = false;
+                break;
+            }
+        }
+        try testing.expectEqual(all, fast.allTrue());
+        try testing.expectEqual(naive.items.len == 0, fast.empty());
+    }
+}
+
+test "a deeply nested tapscript leaf is linear, not quadratic, in its own length" {
+    // ⛔ HIGH regression (audit 2026-09-02). `allExecuting` scanned the whole
+    // condition stack on EVERY instruction, and BIP342 removes both
+    // MAX_OPS_PER_SCRIPT and MAX_SCRIPT_SIZE for a leaf -- so the depth is
+    // whatever the spender wrote. Measured before the fix, ReleaseFast,
+    // `OP_1 OP_IF` repeated: 100 KB 0.91 s, 200 KB 3.68 s, 400 KB 14.5 s,
+    // 800 KB 57.2 s, 1.6 MB 237 s of one core, a clean x4 per doubling. Core
+    // is linear here because `ConditionStack::all_true()` is one comparison.
+    //
+    // The assertion is a wall-clock CEILING with three orders of magnitude of
+    // headroom, not a benchmark: 200 000 nesting levels took ~34 s in Debug
+    // on the old code and is milliseconds on the new one. A ceiling that
+    // loose does not care what else the machine is doing; it only fails if
+    // the quadratic comes back.
+    const levels = 200_000;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(testing.allocator);
+    try script.ensureTotalCapacity(testing.allocator, levels * 2 + levels);
+    var i: usize = 0;
+    while (i < levels) : (i += 1) {
+        script.appendAssumeCapacity(@intFromEnum(Opcode.OP_1));
+        script.appendAssumeCapacity(@intFromEnum(Opcode.OP_IF));
+    }
+    i = 0;
+    while (i < levels) : (i += 1) script.appendAssumeCapacity(@intFromEnum(Opcode.OP_ENDIF));
+
+    var exec_data: ExecData = .{
+        .tapleaf_hash = [_]u8{0} ** 32,
+        .validation_weight = std.math.maxInt(i64),
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stack: Stack = .empty;
+
+    const started = monotonicMs();
+    try evalTapscript(arena.allocator(), &stack, script.items, dummyCtx(), ScriptFlags.none, &exec_data);
+    const elapsed_ms = monotonicMs() - started;
+    if (elapsed_ms > 5_000) {
+        std.debug.print("\ncondition-stack walk took {d} ms for {d} levels — the quadratic is back\n", .{ elapsed_ms, levels });
+        return error.ConditionStackNotLinear;
+    }
+}
+
+fn monotonicMs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
