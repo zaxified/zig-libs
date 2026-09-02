@@ -127,7 +127,10 @@ The policy now:
   is therefore always reported to the caller, which owns the policy response
   (alarm, ACL, pin with `learnStatic`). `moveCount` / `isQuarantined` expose the
   same state for inspection.
-- **Moves are counted** per entry over a sliding window. The move that reaches
+- **Moves are counted** per entry over a **fixed (tumbling)** window, not a
+  sliding one: `move_window_start` is set once when a window opens and is not
+  advanced while moves accumulate inside it. Earlier revisions of this line said
+  "sliding", which it never was. The move that reaches
   `Options.max_mac_moves` (default 5) within `Options.mac_move_window` (default
   180 — RFC 7432 §15's stated N/M defaults) is **refused**, and the MAC is
   **quarantined**.
@@ -182,8 +185,30 @@ spraying novel source MACs to exhaust memory. Bounds, all hard:
   (they flood) until ageing frees room — an availability degradation, not a
   memory or cross-tenant compromise.
 - **Per-tenant, not global** — the cap is per I-SID, so a flood in one tenant can
-  never evict or starve another tenant's entries (tenant isolation extends to the
-  DoS bound).
+  never evict or starve another tenant's **entries** (tenant isolation extends to
+  the DoS bound). ⚠ That is a claim about entries and **not about the forwarding
+  thread**, which the accepted production shape gives one of, owning every I-SID.
+  Until 2026-09-03 a full tenant made every frame carrying a novel source MAC pay
+  a complete O(table) reclamation scan that reclaimed nothing and still returned
+  `FdbFull` — 77.6 us per rejected frame against 21 ns for a normal one at the
+  shipped 8192-entry default, so 6.6 Mbit/s of 64-byte frames saturated one core,
+  and the CPU burned rejecting tenant A's flood was CPU not spent forwarding
+  tenant B's traffic. The kernel bridge does the equivalent as an O(1) counter
+  test with reclamation on a periodic workqueue; this had moved the sweep onto
+  the attacker-controlled path. Now at most one sweep per tick.
+- **The quarantine's cost is the operator's to weigh.** A quarantined MAC floods
+  to every member PE until its window lapses, and the flood *is* the safe answer —
+  but it is attacker-triggerable on demand and indefinitely: 5 spoofed frames per
+  `mac_move_window` keep a chosen station's entire unicast conversation replicated
+  to all N members, and the victim cannot heal it (its own frames are refused
+  while quarantined). That is N-fold amplification on the core **and** exposure of
+  the victim's frames to every remote site in the I-SID, where the hijack it
+  replaced exposed them to one. Sound as a trade; not free, and previously
+  described here as if it were.
+- **No port state.** There is no STP / blocking / learning-only concept: every
+  frame handed to `learn` is learned and every `forward` decides. In the L2VPN
+  framing (membership is control-plane, `Ingress` is access-vs-core) that is
+  coherent, but the kernel bridge has it and this omission was not written down.
 - **`max_isids`** bounds the number of distinct tenants that may hold state, and
   **`max_pes_per_isid`** bounds membership per tenant (and thus the maximum flood
   fan-out / replication-buffer size). A new I-SID beyond the cap →

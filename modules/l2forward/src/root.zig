@@ -175,6 +175,12 @@ pub fn isMulticast(mac: Mac) bool {
 /// True iff a frame to `dst` must be treated as BUM purely from the destination
 /// address itself (broadcast or multicast). An *unknown-unicast* is also BUM but
 /// only relative to a given FDB, so it is decided inside `forward`, not here.
+/// The all-zero address: not a group address, but not a valid source either
+/// (IEEE 802-2014 §9.2, and `is_valid_ether_addr` refuses it).
+pub fn isZeroMac(mac: Mac) bool {
+    return std.mem.allEqual(u8, &mac, 0);
+}
+
 pub fn isBumAddress(dst: Mac) bool {
     return isMulticast(dst); // broadcast ⊂ multicast (I/G bit set)
 }
@@ -195,7 +201,10 @@ pub const Options = struct {
     max_macs_per_isid: usize = 8192,
     /// A dynamic FDB entry older than this (in `Time` units) is expired: treated
     /// as a miss by `forward`/`lookup` and reclaimed by `tick`. Static entries
-    /// ignore it. `0` means every dynamic entry is immediately stale.
+    /// ignore it. ⚠ `0` does **not** mean "immediately stale", as this line
+    /// used to say: expiry is `age > aging_ticks`, so at `now == learned_at`
+    /// the entry is still fresh. `0` means an entry expires one tick after it
+    /// was learned.
     aging_ticks: Time = 300,
     /// MAC-mobility limit (EVPN RFC 7432 §15.1 duplicate-MAC detection): the
     /// number of moves of the *same* MAC inside `mac_move_window` that trips
@@ -203,7 +212,7 @@ pub const Options = struct {
     /// the MAC is quarantined (see `LearnOutcome.duplicate_detected`). `0`
     /// disables move acceptance entirely — the first move quarantines.
     max_mac_moves: u8 = 5,
-    /// The sliding window (in `Time` units) `max_mac_moves` is counted over, and
+    /// The window (in `Time` units) `max_mac_moves` is counted over, and
     /// also how long a quarantine holds. RFC 7432 §15.1 (verified against the
     /// RFC text, 2026-08-07): "a PE that detects a MAC mobility event via local
     /// learning starts an M-second timer (with a default value of M = 180), and
@@ -270,6 +279,12 @@ pub const AddIsidError = error{
 /// `TooManyIsids`. A received frame can never create a tenant, so it can never
 /// consume the I-SID budget either — it is refused with `UnknownIsid` first.
 pub const LearnError = error{
+    /// The frame's SOURCE address is a group (I/G set, incl. broadcast) or
+    /// all-zero address. IEEE 802.1D's learning process refuses it and the
+    /// Linux bridge drops the frame outright; such an entry could never be
+    /// reached by `forward` anyway, so learning it only spends the tenant's
+    /// FDB cap. The caller should drop the frame.
+    InvalidSourceMac,
     /// No such tenant. `learn` is the data-plane entry point and the tenant slot
     /// is control-plane state (`addIsid` / `addMember` / `learnStatic` create
     /// it), so a frame carrying an I-SID the control plane never configured is
@@ -363,6 +378,19 @@ const Fdb = std.AutoHashMapUnmanaged(Mac, FdbEntry);
 const IsidEntry = struct {
     members: PeSet = .empty,
     fdb: Fdb = .empty,
+    /// The tick at which `pruneIsid` last ran on a full table and reclaimed
+    /// **nothing**. Expiry is a function of `now` and `learned_at` alone, and
+    /// `learned_at` only moves forward, so a second sweep within the same tick
+    /// cannot find anything the first did not — the repeat is pure cost.
+    ///
+    /// That cost was the attacker's: a full tenant made every frame carrying a
+    /// novel source MAC pay a complete O(table) scan that reclaimed nothing and
+    /// still returned `FdbFull`, which is exactly the path a source-MAC flood
+    /// drives. Measured at the shipped 8192-entry default: **77.6 us per
+    /// rejected frame against 21 ns for a normal one**, so 6.6 Mbit/s of
+    /// 64-byte frames saturated one core — and with `.single_owner` that is
+    /// the one thread forwarding for every other tenant on the PE.
+    last_futile_prune: ?Time = null,
 
     fn deinit(self: *IsidEntry, alloc: Allocator) void {
         self.members.deinit(alloc);
@@ -373,6 +401,11 @@ const IsidEntry = struct {
 /// The per-PE E-LAN forwarding table. `single_owner`: one thread/loop owns an
 /// instance; it holds no internal lock. Create with `init`, free with `deinit`.
 pub const Table = struct {
+    /// Diagnostic: how many times `pruneIsid` has swept a tenant's FDB. The
+    /// sweep is O(table), so this is the quantity a source-MAC flood used to
+    /// drive once per frame — a test asserts on it rather than on a wall-clock
+    /// ratio, which reads much the same with and without the fix.
+    prune_sweeps: u64 = 0,
     alloc: Allocator,
     options: Options,
     isids: std.AutoHashMapUnmanaged(Isid, IsidEntry) = .empty,
@@ -478,6 +511,18 @@ pub const Table = struct {
     /// The returned `LearnOutcome` is the caller's only notification of a MAC
     /// hijack; ignoring it (`_ = try …`) is choosing to run without one.
     pub fn learn(self: *Table, isid: Isid, src_mac: Mac, src_pe: PeId, now: Time) LearnError!LearnOutcome {
+        // IEEE 802.1D's learning process, and the Linux bridge
+        // (`is_valid_ether_addr` in `br_handle_frame`), both refuse a frame
+        // whose SOURCE is a group or all-zero address — the kernel drops it
+        // outright, verified here: of four broadcast-destination frames with
+        // sources 02:.., 01:.., ff:.. and 00:.., exactly one was forwarded and
+        // none was learned. Such an entry is structurally unreachable by
+        // `forward` (a group destination is classified BUM *before* the
+        // lookup), so it is pure dead weight against `max_macs_per_isid` — a
+        // free route to the full-table state — and it is what would let a
+        // learned broadcast address collapse the tenant's broadcast domain if
+        // the BUM-before-lookup ordering ever changed.
+        if (isBumAddress(src_mac) or isZeroMac(src_mac)) return error.InvalidSourceMac;
         // Data-plane frames do not provision tenants: no getOrCreateIsid here.
         const ie = self.isids.getPtr(isid) orelse return error.UnknownIsid;
         if (ie.fdb.getPtr(src_mac)) |e| {
@@ -565,6 +610,12 @@ pub const Table = struct {
 
     /// Moves of `mac` counted in the current mobility window (0 if unknown).
     /// The caller's hijack signal alongside `LearnOutcome.moved`.
+    ///
+    /// ⚠ It is **latched, not live**: `moves` is reset only by the next move
+    /// that starts a new window, so once a window lapses this keeps returning
+    /// the lapsed window's count indefinitely. A caller polling it as a
+    /// current-rate signal reads a value that never decays. `LearnOutcome` is
+    /// the edge-triggered signal; this is the level.
     pub fn moveCount(self: *const Table, isid: Isid, mac: Mac) u8 {
         const ie = self.isids.getPtr(isid) orelse return 0;
         const e = ie.fdb.getPtr(mac) orelse return 0;
@@ -593,7 +644,21 @@ pub const Table = struct {
         // unicast or BUM — would multiply the frame, not deliver it.
         if (ingress == .core) return .local_only;
         if (!isBumAddress(dst_mac)) {
-            if (self.lookup(isid, dst_mac, now)) |pe| return .{ .unicast = pe };
+            if (self.lookup(isid, dst_mac, now)) |pe| {
+                // The learned PE must still be a member of this I-SID. `src_pe`
+                // reaches `learn` from `l2encap`'s `ingress_pe` — a plain
+                // unauthenticated header field this module already refuses to
+                // trust in `replicationSet` — so one spoofed frame could
+                // otherwise point a victim's entire unicast flow at a PE
+                // outside the tenant for a full `aging_ticks`, and if that id
+                // named a real PE the customer's frame left the I-SID's member
+                // set entirely. Membership is control-plane, so `learn` stays
+                // permissive (an entry may be learned before membership
+                // converges); the binding happens here, at the decision. A
+                // non-member answer is treated as unknown-unicast, which
+                // floods — and flooding still reaches the real station.
+                if (self.isMember(isid, pe)) return .{ .unicast = pe };
+            }
             // fall through: unknown unicast is BUM relative to this FDB
         }
         return .{ .flood = try self.replicationSet(isid, ingress, out) };
@@ -691,7 +756,13 @@ pub const Table = struct {
     /// reject with `FdbFull`.
     fn insertNewMac(self: *Table, ie: *IsidEntry, mac: Mac, entry: FdbEntry, now: Time) error{ FdbFull, OutOfMemory }!void {
         if (ie.fdb.count() >= self.options.max_macs_per_isid) {
-            self.pruneIsid(ie, now);
+            // See `IsidEntry.last_futile_prune`: at most one sweep per tick,
+            // so the reject path costs O(1) rather than O(table) per frame.
+            if (ie.last_futile_prune == null or ie.last_futile_prune.? != now) {
+                const before = ie.fdb.count();
+                self.pruneIsid(ie, now);
+                ie.last_futile_prune = if (ie.fdb.count() == before) now else null;
+            }
             if (ie.fdb.count() >= self.options.max_macs_per_isid) return error.FdbFull;
         }
         try ie.fdb.put(self.alloc, mac, entry);
@@ -702,6 +773,7 @@ pub const Table = struct {
     /// removal); on scratch-allocation failure it reclaims what it gathered and
     /// leaves the rest for a later tick (see `tick`'s contract).
     fn pruneIsid(self: *Table, ie: *IsidEntry, now: Time) void {
+        self.prune_sweeps += 1;
         var victims: std.ArrayList(Mac) = .empty;
         defer victims.deinit(self.alloc);
         var it = ie.fdb.iterator();
@@ -907,11 +979,175 @@ test "BUM classification drives flood: broadcast, multicast, unknown-unicast flo
     try testing.expect((try t.forward(1, macOf(0x66), .access, 0, &buf)) == .flood);
 }
 
+test "a rejected learn on a full tenant sweeps at most once per tick (re-audit F-A)" {
+    // The attacker's own path was the expensive one: on a full tenant with
+    // nothing expired, EVERY frame carrying a novel source MAC paid a complete
+    // O(table) `pruneIsid` scan that reclaimed nothing and still returned
+    // `FdbFull` — which is exactly the path a source-MAC flood drives.
+    // Measured at the shipped 8192-entry default: 77.6 us per rejected frame
+    // against 21 ns for a normal one, so 6.6 Mbit/s of 64-byte frames
+    // saturated one core. With `.single_owner` that is the one thread
+    // forwarding for every other tenant on the PE, so SPEC's "a flood in one
+    // tenant can never starve another tenant" was true of entries and false of
+    // the forwarding thread.
+    //
+    // Asserted on the sweep COUNT rather than on elapsed time: a wall-clock
+    // ratio in the Debug lane reads much the same with and without the fix,
+    // and the count is the quantity that actually changed.
+    var t = Table.init(testing.allocator, .{ .max_macs_per_isid = 64, .aging_ticks = 1_000_000 });
+    defer t.deinit();
+    try t.addIsid(1);
+    var i: u8 = 0;
+    while (i < 64) : (i += 1) _ = try t.learn(1, macOf(i), 2, 0);
+    try testing.expectEqual(@as(usize, 64), t.fdbCount(1));
+
+    // 400 rejected frames within one tick: one sweep, not four hundred.
+    const before = t.prune_sweeps;
+    var j: usize = 0;
+    while (j < 400) : (j += 1) {
+        // 0x06 prefix so these cannot collide with `macOf`'s 0x02 space.
+        const mac: Mac = .{ 0x06, 0, 0, 0, @intCast(j >> 8), @intCast(j & 0xFF) };
+        try testing.expectError(error.FdbFull, t.learn(1, mac, 2, 5));
+    }
+    try testing.expectEqual(@as(u64, 1), t.prune_sweeps - before);
+
+    // The tick moving on earns exactly one more sweep, because that is when
+    // something could newly have expired.
+    const mac2: Mac = .{ 0x06, 0, 0, 0, 0xFF, 0xFF };
+    try testing.expectError(error.FdbFull, t.learn(1, mac2, 2, 6));
+    try testing.expectEqual(@as(u64, 2), t.prune_sweeps - before);
+    try testing.expectError(error.FdbFull, t.learn(1, mac2, 2, 6));
+    try testing.expectEqual(@as(u64, 2), t.prune_sweeps - before);
+
+    // ...and reclamation still works: once entries expire, the next rejected
+    // frame's sweep frees them and the learn succeeds.
+    var t3 = Table.init(testing.allocator, .{ .max_macs_per_isid = 2, .aging_ticks = 10 });
+    defer t3.deinit();
+    try t3.addIsid(1);
+    _ = try t3.learn(1, macOf(1), 2, 0);
+    _ = try t3.learn(1, macOf(2), 2, 0);
+    try testing.expectError(error.FdbFull, t3.learn(1, macOf(3), 2, 5)); // nothing expired yet
+    _ = try t3.learn(1, macOf(3), 2, 100); // both expired: reclaimed, room made
+    try testing.expectEqual(@as(usize, 1), t3.fdbCount(1));
+}
+
+test "a group or all-zero SOURCE address is never learned (re-audit F-D)" {
+    // IEEE 802.1D's learning process refuses it, and the Linux bridge drops
+    // the frame outright — verified live in a netns: of four
+    // broadcast-destination frames with sources 02:.., 01:.., ff:.. and 00:..,
+    // exactly one was forwarded and none was learned. Here all five were
+    // learned, and every one is structurally unreachable by `forward` (a group
+    // destination is classified BUM before the lookup), so they were pure dead
+    // weight against the tenant's cap — a free route to `FdbFull`.
+    var t = Table.init(testing.allocator, .{ .max_macs_per_isid = 8 });
+    defer t.deinit();
+    try t.addIsid(1);
+    for ([_]Mac{
+        .{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }, // broadcast
+        .{ 0x01, 0x00, 0x5e, 0x00, 0x00, 0x01 }, // IPv4 multicast
+        .{ 0x33, 0x33, 0x00, 0x00, 0x00, 0x01 }, // IPv6 multicast
+        .{ 0x01, 0x80, 0xc2, 0x00, 0x00, 0x00 }, // 802.1D reserved / BPDU
+        .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, // all-zero
+    }) |bad| {
+        try testing.expectError(error.InvalidSourceMac, t.learn(1, bad, 2, 0));
+    }
+    try testing.expectEqual(@as(usize, 0), t.fdbCount(1));
+    // An ordinary unicast source still learns, so this is a shape check and
+    // not a blanket refusal.
+    _ = try t.learn(1, macOf(1), 2, 0);
+    try testing.expectEqual(@as(usize, 1), t.fdbCount(1));
+}
+
+test "a destination is BUM by SHAPE, before any table lookup (re-audit F-E)" {
+    // `SPEC.md` states this ordering as load-bearing, and nothing in the suite
+    // would have noticed its removal: consulting the FDB for a group
+    // destination stayed 28/28 green. It was invisible because no test ever
+    // put a group address into the FDB — which is F-D. `learnStatic` is the
+    // control-plane route that still can, so it is what pins the ordering.
+    var t = testTable();
+    defer t.deinit();
+    try t.addIsid(1);
+    try t.addMember(1, 1);
+    try t.addMember(1, 3);
+    var buf: [16]PeId = undefined;
+
+    const bcast: Mac = broadcast;
+    const v6mcast: Mac = .{ 0x33, 0x33, 0x00, 0x00, 0x00, 0x01 };
+    try t.learnStatic(1, bcast, 3, 0);
+    try t.learnStatic(1, v6mcast, 3, 0);
+    // Both are in the FDB and would resolve...
+    try testing.expect(t.lookup(1, bcast, 0) != null);
+    try testing.expect(t.lookup(1, v6mcast, 0) != null);
+    // ...and `forward` must still flood them to the whole member set. Reading
+    // the table here would collapse the tenant's broadcast domain into a
+    // unicast to one PE: no other site would see ARP or ND again.
+    try testing.expect((try t.forward(1, bcast, .access, 0, &buf)) == .flood);
+    try testing.expectEqualSlices(PeId, &.{ 1, 3 }, (try t.forward(1, bcast, .access, 0, &buf)).flood);
+    try testing.expect((try t.forward(1, v6mcast, .access, 0, &buf)) == .flood);
+}
+
+test "a unicast decision names a MEMBER of the I-SID (re-audit F-B)" {
+    // `src_pe` reaches `learn` from `l2encap`'s unauthenticated `ingress_pe`
+    // header field — which this module already refuses to trust in
+    // `replicationSet`. One spoofed frame could point a victim's whole unicast
+    // flow at a PE outside the tenant for a full `aging_ticks`, and if the id
+    // named a real PE the customer's frame left the member set entirely. The
+    // outcome was a bare `.moved`, indistinguishable from real mobility.
+    var t = testTable();
+    defer t.deinit();
+    try t.addIsid(1);
+    try t.addMember(1, 2);
+    try t.addMember(1, 3);
+    var buf: [16]PeId = undefined;
+
+    _ = try t.learn(1, macOf(0x77), 2, 0);
+    try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(1, macOf(0x77), .access, 1, &buf));
+
+    // A spoofed ingress PE outside the tenant. Learning still succeeds —
+    // membership is control-plane and may converge later — but the decision
+    // does not hand the frame to a non-member.
+    _ = try t.learn(1, macOf(0x77), 60000, 2);
+    try testing.expect(!t.isMember(1, 60000));
+    const d = try t.forward(1, macOf(0x77), .access, 3, &buf);
+    try testing.expect(d == .flood);
+    try testing.expectEqualSlices(PeId, &.{ 2, 3 }, d.flood);
+
+    // Once the control plane really does admit that PE, the same entry
+    // resolves — so this is a membership binding, not a blanket refusal.
+    try t.addMember(1, 60000);
+    try testing.expectEqual(Decision{ .unicast = 60000 }, try t.forward(1, macOf(0x77), .access, 4, &buf));
+}
+
+test "the move-window boundary is inclusive (re-audit F-G)" {
+    // `inMoveWindow`'s `<=` could be changed to `<` with 28/28 green, unlike
+    // the quarantine and ageing boundaries, which are both pinned.
+    var t = Table.init(testing.allocator, .{ .mac_move_window = 10, .max_mac_moves = 3 });
+    defer t.deinit();
+    try t.addIsid(1);
+    try t.addMember(1, 2);
+    try t.addMember(1, 3);
+    _ = try t.learn(1, macOf(1), 2, 0);
+    // First move opens the window at t=1.
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, macOf(1), 3, 1));
+    try testing.expectEqual(@as(u8, 1), t.moveCount(1, macOf(1)));
+    // EXACTLY at the window edge (1 + 10) the move is still counted in it.
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, macOf(1), 2, 11));
+    try testing.expectEqual(@as(u8, 2), t.moveCount(1, macOf(1)));
+    // One tick past it, the window restarts and the count resets to 1.
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, macOf(1), 3, 22));
+    try testing.expectEqual(@as(u8, 1), t.moveCount(1, macOf(1)));
+}
+
 test "MAC move: relearn behind a new PE updates the decision (last-writer-wins)" {
     var t = testTable();
     defer t.deinit();
     var buf: [16]PeId = undefined;
     try t.addIsid(3); // the tenant is control-plane state; the data plane fills it
+    // Both PEs must be members: a unicast decision names a member, or the
+    // frame floods (see `forward`). Learning stays permissive; the decision
+    // is where membership binds.
+    try t.addMember(3, 2);
+    try t.addMember(3, 7);
     _ = try t.learn(3, macOf(0x77), 2, 0);
     try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(3, macOf(0x77), .access, 5, &buf));
     _ = try t.learn(3, macOf(0x77), 7, 10); // same MAC, now seen from PE 7
@@ -1038,6 +1274,7 @@ test "ageing: fresh → unicast; past aging_ticks the entry is gone → flood; r
     var t = testTable();
     defer t.deinit();
     try t.addMember(4, 8);
+    try t.addMember(4, 2);
     _ = try t.learn(4, macOf(0x88), 2, 1000); // learned at t=1000, aging=100
 
     var buf: [16]PeId = undefined;
@@ -1058,6 +1295,7 @@ test "static entry is never aged and not overwritten by dynamic learn" {
     var t = testTable();
     defer t.deinit();
     try t.learnStatic(5, macOf(0x99), 2, 0);
+    try t.addMember(5, 2);
     var buf: [16]PeId = undefined;
     // Never expires, even far past any aging window.
     try testing.expectEqual(Decision{ .unicast = 2 }, try t.forward(5, macOf(0x99), .access, std.math.maxInt(Time), &buf));
@@ -1095,6 +1333,7 @@ test "isExpired clock-skew clamp: now before learned_at is treated as age 0 (fre
     // Learn "in the future" relative to a later query with a smaller `now`
     // (e.g. a clock adjustment). age must clamp to 0, never underflow.
     try t.addIsid(7);
+    try t.addMember(7, 2);
     _ = try t.learn(7, macOf(0xBB), 2, 1_000);
     var buf: [16]PeId = undefined;
     const d = try t.forward(7, macOf(0xBB), .access, 10, &buf); // now(10) < learned_at(1000)
