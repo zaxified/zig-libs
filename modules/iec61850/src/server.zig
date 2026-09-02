@@ -156,6 +156,11 @@ pub const Server = struct {
     reasm_buf: [max_report_len]u8 = undefined,
     /// Octets held by a partially reassembled inbound COTP sequence.
     reasm_len: usize = 0,
+    /// The peer whose partial sequence `reasm_buf` currently holds. These are
+    /// **wire bytes**, not a negotiated parameter two peers can happen to
+    /// agree on, so sharing them across associations is not the benign
+    /// limitation the other shared fields are — see the `.dt` arm.
+    reasm_peer: u32 = 0,
     /// The presentation context the association settled on, remembered so an
     /// **unsolicited** PDU can be wrapped without a request to copy it from.
     mms_context: u16 = presentation.context_mms,
@@ -212,6 +217,8 @@ pub const Server = struct {
         switch (try cotp.decode(pkt.payload)) {
             .cr => |cr| {
                 self.transport_up = true;
+                // A new transport connection cannot inherit a partial frame.
+                self.reasm_len = 0;
                 // The COTP TPDU size is the *other* negotiated ceiling, and it
                 // is the binding one: this module never splits a PDU across
                 // several DT TPDUs, so nothing it sends may exceed it. A peer
@@ -234,12 +241,33 @@ pub const Server = struct {
             .dr => {
                 self.associated = false;
                 self.transport_up = false;
+                self.reasm_len = 0;
                 return null;
             },
             .dt => |dt| {
+                // A held fragment belongs to the peer that sent it. `peer` is
+                // what a select, a setting-group edit and an RCB reservation
+                // are owned BY, so completing one peer's parked request under
+                // another peer's id substitutes the ownership check outright:
+                // a peer holding nothing operated switchgear another operator
+                // had selected, and the positive response went to that other
+                // operator. The buffer is single-tenant — one buffer cannot
+                // hold two conversations — so a fragment from a different peer
+                // evicts the parked one rather than joining it.
+                if (self.reasm_len != 0 and self.reasm_peer != self.peer) self.reasm_len = 0;
+                self.reasm_peer = self.peer;
                 var r = cotp.Reassembler.init(&self.reasm_buf);
                 r.len = self.reasm_len;
-                const spdu = (try r.push(dt)) orelse {
+                // A failed reassembly must not leave its length behind:
+                // `Reassembler.push` zeroes its own copy, but the write-back
+                // below is skipped on the error path, so the abandoned
+                // fragment's octets were prepended to every later request and
+                // the connection never recovered.
+                const pushed = r.push(dt) catch |err| {
+                    self.reasm_len = 0;
+                    return err;
+                };
+                const spdu = pushed orelse {
                     self.reasm_len = r.len;
                     return null;
                 };
@@ -256,6 +284,7 @@ pub const Server = struct {
             .connect => return try self.handleConnect(spdu, out),
             .abort, .finish, .disconnect => {
                 self.associated = false;
+                self.reasm_len = 0;
                 return null;
             },
             .give_tokens_or_data => {
@@ -1016,6 +1045,9 @@ pub const Server = struct {
         for (self.model.report_controls) |*cb| cb.associationLostBy(peer, self.now_ms);
         if (self.model.setting_groups) |sg| sg.associationLost(peer);
         for (self.model.controls) |*p| p.release(peer);
+        // The dropped connection's half-sent frame goes with it, or the next
+        // peer to reach the `.dt` arm inherits its octets.
+        if (self.reasm_peer == peer) self.reasm_len = 0;
         self.associated = false;
     }
 
@@ -1752,6 +1784,113 @@ test "all four control models drive a breaker end to end" {
     try testing.expectEqual(@as(u64, 0), srv.control_rejections);
     try testing.expectEqual(@as(usize, 0), paired.failures);
     c.disconnect();
+}
+
+test "a parked COTP fragment cannot be completed under another peer's association (re-audit F-A)" {
+    // The 2026-08-31 F6 fix added inbound reassembly as per-`Server` state,
+    // and `Server.peer` is what a select, a setting-group edit and an RCB
+    // reservation are owned BY. So peer A parked a complete operate as a
+    // non-terminal fragment, peer B sent any terminal DT of its own — a legal
+    // EMPTY one is enough — and A's request was executed with `peer` == B.
+    // Reproduced before the fix: the breaker closed, `operates` went 1 -> 2,
+    // and the positive Operate response was returned to B.
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+
+    var val: [8]u8 = undefined;
+    var vw = ber.Writer.init(&val);
+    try onCommand(&vw);
+    const cmd = control.Command{
+        .ctl_val = vw.done(),
+        .ctl_num = 1,
+        .origin = .{ .or_cat = .station_control, .or_ident = "zig-libs" },
+        .t = mmsdata.UtcTime.fromMillis(1_700_000_000_000, 10),
+    };
+
+    // B holds a legitimate select on the sbo-with-normal-security point.
+    srv.peer = 0xBBBB;
+    try testing.expect(try c.selectObject("TESTLD/GGIO1.SPCSO2"));
+
+    // A operating directly is refused. This is the ownership check working,
+    // and it is the check the steal substitutes.
+    srv.peer = 0xAAAA;
+    try testing.expectError(error.AccessFailed, c.operateObject("TESTLD/GGIO1.SPCSO2", cmd));
+    try testing.expect(!try fx.stVal(1));
+    const operates_before = srv.operates;
+
+    // A parks that same operate as a non-terminal fragment.
+    const frame = paired.last_write[0..paired.last_write_len];
+    const dt_in = try cotp.decode((try tpkt.decode(frame)).payload);
+    var frag_buf: [4096]u8 = undefined;
+    var tp_buf: [4096]u8 = undefined;
+    const frag = try cotp.encodeData(dt_in.dt.payload, false, &frag_buf);
+    try testing.expect((try srv.handle(try tpkt.encode(frag, &tp_buf), &paired.out)) == null);
+    try testing.expect(srv.reasm_len != 0); // it really is parked
+
+    // B sends an empty terminal DT. A's octets must NOT be joined to it.
+    srv.peer = 0xBBBB;
+    var empty_buf: [64]u8 = undefined;
+    var empty_tp: [64]u8 = undefined;
+    const empty = try cotp.encodeData(&[_]u8{}, true, &empty_buf);
+    _ = srv.handle(try tpkt.encode(empty, &empty_tp), &paired.out) catch {};
+
+    try testing.expect(!try fx.stVal(1)); // the breaker did not close
+    try testing.expectEqual(operates_before, srv.operates);
+    // B's own DT evicted A's fragment rather than inheriting it.
+    try testing.expectEqual(@as(u32, 0xBBBB), srv.reasm_peer);
+
+    // ...and the same peer's own two-fragment request still works, so the
+    // eviction did not simply disable reassembly.
+    srv.peer = 0xAAAA;
+    const half = dt_in.dt.payload.len / 2;
+    var a1: [4096]u8 = undefined;
+    var a2: [4096]u8 = undefined;
+    var t1: [4096]u8 = undefined;
+    var t2: [4096]u8 = undefined;
+    _ = try srv.handle(try tpkt.encode(try cotp.encodeData(dt_in.dt.payload[0..half], false, &a1), &t1), &paired.out);
+    const done = try srv.handle(try tpkt.encode(try cotp.encodeData(dt_in.dt.payload[half..], true, &a2), &t2), &paired.out);
+    try testing.expect(done != null); // reassembled and answered, for A
+}
+
+test "a failed reassembly does not wedge the connection (re-audit F-C)" {
+    // `Reassembler.push` zeroes its own `len` on overflow, but the write-back
+    // to `Server.reasm_len` sat after the `try`, so the abandoned fragment's
+    // octets stayed and were prepended to every later request. The association
+    // never recovered, and nothing reset it on CR, DR, ABORT or FINISH either.
+    var fx: ControlFixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    const reads_before = srv.reads;
+
+    var big: [5000]u8 = undefined;
+    @memset(&big, 0);
+    var f1: [8192]u8 = undefined;
+    var t1: [8192]u8 = undefined;
+    _ = try srv.handle(try tpkt.encode(try cotp.encodeData(&big, false, &f1), &t1), &paired.out);
+    try testing.expectEqual(@as(usize, 5000), srv.reasm_len);
+
+    var big2: [4000]u8 = undefined;
+    @memset(&big2, 0);
+    var f2: [8192]u8 = undefined;
+    var t2: [8192]u8 = undefined;
+    try testing.expectError(
+        error.ReassemblyOverflow,
+        srv.handle(try tpkt.encode(try cotp.encodeData(&big2, false, &f2), &t2), &paired.out),
+    );
+    try testing.expectEqual(@as(usize, 0), srv.reasm_len);
+
+    // The association still works: a genuine request is served.
+    _ = try c.readObject("TESTLD/GGIO1.SPCSO1.stVal", .ST);
+    try testing.expect(srv.reads > reads_before);
 }
 
 test "an operate without a select is refused with Object-not-selected, and says so" {

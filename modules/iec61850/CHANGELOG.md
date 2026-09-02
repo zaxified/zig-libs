@@ -5,6 +5,50 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — Drift re-audit (window `d163578..HEAD`, +1140/-73 over 14 files). Four findings,
+  all fixed and mutation-checked.
+
+  - **CRITICAL, cross-association request injection.** The 2026-08-31 F6 fix added inbound COTP
+    reassembly as **per-`Server`** state, and a `Server` is what the module's own live loop
+    multiplexes several associations onto, setting `Server.peer` per frame. So a peer could send a
+    complete, valid MMS request in a `DT` with `eot` **clear**, leaving it parked in the shared
+    buffer, and the next peer to send any terminal `DT` — a legal empty one is enough — caused that
+    parked request to be decoded and served with `peer` set to *its* association id. `peer` is the
+    only thing arbitrating a select, a setting-group edit and an RCB reservation, so this
+    substituted the ownership check outright. Reproduced: peer A's direct operate is refused
+    (`AccessFailed`, `stVal=false`), A parks the same operate, B sends an empty `DT` — the breaker
+    closes, `operates` goes 1→2, and the positive Operate response is returned to **B**. Identical
+    in Debug and ReleaseFast. Fixed by making the buffer single-tenant (`reasm_peer`), and by
+    dropping it on `CR`, `DR`, `ABORT`/`FINISH` and `releaseAssociationOf`.
+
+  - **HIGH, one octet parks the read forever with a timeout configured.** `setReadTimeout`
+    documents "Bounds how long a read blocks", but the poll guarded only the *entry* to the read:
+    once one octet was available, `readSliceAll` blocked in the kernel waiting for the other three
+    header octets, with no deadline. Measured 20x past a configured 100 ms bound. The module's own
+    multi-peer server loop reads its links serially, so one octet from one unauthenticated
+    connection — no association, no authentication — stopped every other association, emitted no
+    reports and drained no notifications. `readAllBounded` (the shape proved in the sibling
+    `iec104`) now bounds the whole frame; `readVec` rather than `readSliceShort`, because the
+    latter is short only at end of stream and reintroduces the block.
+
+  - **MEDIUM, a failed reassembly wedged the connection permanently.** `Reassembler.push` zeroes
+    its own `len` on overflow, but the write-back to `Server.reasm_len` sat after the `try`, so the
+    abandoned fragment's octets stayed and were prepended to every later request — for the server
+    and, in the identical shape, for the client. Nothing reset it on `CR`, `DR`, `ABORT` or
+    `FINISH` either.
+
+  - **MEDIUM (test gap), the oversized-TPKT guard had no test.** `if (total > buf.len)` stops
+    `readSliceAll(buf[header_len..total])` running to a wire-chosen `total` of up to 65535 past the
+    caller's buffer — a trap in Debug, an out-of-bounds write from network data in ReleaseFast. It
+    could be deleted with 398/409 green. It was the only one of eight mutations that survived.
+
+  Doc: SPEC's "The multi-association `Server`" entry enumerated the shared state as the context
+  table and PDU size and is now accurate about reassembly and `associated`; the `.single_owner`
+  concurrency line contradicts the multiplexing pattern the module documents and ships, which is
+  recorded rather than resolved because resolving it means deciding whether `Server` gets an
+  association table.
+
+
 - **2026-08-22** — `TcpTransport` now surfaces `error.Canceled` (a new
   `TransportError` variant) instead of `error.ReadFailed`/`error.WriteFailed`
   when a blocked read or write is interrupted by `std.Io`'s `Future.cancel`.

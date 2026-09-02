@@ -294,7 +294,11 @@ shape and say so.
 - **`stNum` never wraps to 0**, which is reserved.
 
 Concurrency: `.single_owner` — one `Client`/`Server` owns one association's buffers and invoke ids;
-one `Publisher`/`Subscriber` owns one control block's counters. Nothing is shared or global, and the
+one `Publisher`/`Subscriber` owns one control block's counters. ⚠ **This contradicts the
+multi-association pattern the module also documents and ships** (`server.zig`'s `peer` doc, the live
+two-client run recorded below). The module cannot be both, and the shared-state limitation above
+rests on the first reading while the example code rests on the second. Recorded rather than
+resolved: resolving it means deciding whether `Server` gets an association table. Nothing is shared or global, and the
 clock and any threading are the caller's.
 
 Error policy: every decode entry point returns a typed error on malformed input. Nothing panics,
@@ -705,9 +709,25 @@ were parsed, emitted and re-parsed:
   octets, which is this module's own choice: "nobody" and "0.0.0.0" are different answers.
 - **The multi-association `Server`.** `Server.peer` is the seam a front end sets per frame, and the
   live two-client test drives it that way — but one `Server` object still holds **one**
-  presentation-context table and one negotiated PDU size for all of them. That works in the live
-  run only because both peers propose identical context ids. A production front end gives each
-  association its own view; this is a simulator.
+  presentation-context table, one negotiated PDU size, and one `associated` flag for all of them.
+  That works in the live run only because both peers propose identical context ids. A production
+  front end gives each association its own view; this is a simulator.
+
+  ⚠ **This entry used to end there, and it was understating the case.** The 2026-08-31 F6 fix added
+  inbound COTP reassembly as `Server` state too — and reassembly holds **wire bytes**, not a
+  negotiated parameter two peers can happen to agree on. A peer could park a complete request as a
+  non-terminal `DT` and have the *next* peer's terminal `DT` — an empty one is enough — execute it
+  with `Server.peer` set to that second peer. Since `peer` is the only thing arbitrating a select,
+  a setting-group edit and an RCB reservation, that substituted the ownership check outright:
+  reproduced with a peer holding nothing operating a breaker another operator had selected, the
+  positive Operate response going to the innocent operator. Fixed by making the buffer
+  single-tenant (`reasm_peer`): a fragment from a different peer evicts the parked one rather than
+  joining it, and it is dropped on `CR`, `DR`, `ABORT`/`FINISH` and `releaseAssociationOf`.
+
+  ⛔ **Still open, and it is an owner decision.** `associated` is a single boolean, so once *any*
+  peer has associated, a fresh connection can send a bare `DT` with no `CR`, no CONNECT SPDU and no
+  AARQ and reach `handleMms`. Closing that needs a per-association table, not a field — which is
+  the same change that would resolve the contradiction below.
 - **The `ResvTms` readings.** That a BRCB reservation with `ResvTms > 0` outlives the association by
   that many seconds, that `-1` holds it until released, and that the SGCB's `ResvTms` is an
   *inactivity* timeout are all readings of IEC 61850-7-2 that no peer confirmed: no reference client

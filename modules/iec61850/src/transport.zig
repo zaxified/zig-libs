@@ -141,6 +141,12 @@ pub const TcpTransport = struct {
     /// Bounds how long a read blocks. Implemented with `poll(2)` rather than
     /// `SO_RCVTIMEO`, because an `EAGAIN` surfacing out of `std.Io` is treated
     /// there as a programmer error.
+    ///
+    /// The bound covers the **whole frame**, not its first octet. It used to
+    /// gate only the entry to the read, so a peer that sent one octet and
+    /// stopped parked the caller in `readSliceAll` indefinitely — 20x past a
+    /// configured 100 ms bound, measured — and the module's own serial
+    /// multi-peer loop then served nobody at all.
     pub fn setReadTimeout(self: *TcpTransport, milliseconds: u32) void {
         self.read_timeout_ms = milliseconds;
     }
@@ -152,7 +158,11 @@ pub const TcpTransport = struct {
     /// then as `0` from `readFn` — "nothing available this round" — and the
     /// caller would keep polling a connection it had already abandoned.
     fn waitReadable(self: *TcpTransport) TransportError!bool {
-        const ms = self.read_timeout_ms orelse return true;
+        return self.waitReadableMs(self.read_timeout_ms);
+    }
+
+    fn waitReadableMs(self: *TcpTransport, budget_ms: ?u32) TransportError!bool {
+        const ms = budget_ms orelse return true;
         var fds = [_]std.posix.pollfd{.{
             .fd = self.stream.socket.handle,
             .events = std.posix.POLL.IN,
@@ -203,25 +213,70 @@ pub const TcpTransport = struct {
         if (self.writer == null) self.writer = self.stream.writer(self.io, &self.wbuf);
     }
 
+    /// Read exactly `dest.len` octets, waiting no longer than the read timeout
+    /// for **each** further octet. `eof_err` is what a clean close means at
+    /// this point in the frame.
+    ///
+    /// This exists because `readSliceAll` is unbounded: it blocks in the kernel
+    /// until the buffer is full. The poll in front of it only guarded the
+    /// *entry* to the read, so one octet was enough to make `waitReadable`
+    /// return true and park the caller forever on the remaining three header
+    /// octets — 20x past a configured 100 ms bound, measured. The module's own
+    /// multi-peer server loop reads its links serially, so that one octet from
+    /// one unauthenticated connection stopped every other association.
+    fn readAllBounded(
+        self: *TcpTransport,
+        r: *std.Io.Reader,
+        dest: []u8,
+        budget_ms: ?u32,
+        eof_err: TransportError,
+    ) TransportError!void {
+        var got: usize = 0;
+        // `readVec` may legitimately return 0 without meaning end of stream,
+        // so a run of them must not become a spin even though `poll` gates
+        // each turn.
+        var empty_reads: u8 = 0;
+        while (got < dest.len) {
+            if (r.bufferedLen() == 0 and !try self.waitReadableMs(budget_ms)) {
+                // Mid-frame silence is not a graceful idle.
+                return error.ReadFailed;
+            }
+            // `readVec`, not `readSliceShort`: the latter is short only at end
+            // of stream — it loops until the buffer is full, so it blocks
+            // exactly like `readSliceAll` and reintroduces the defect this
+            // function exists to remove. `readVec` returns whatever one read
+            // produced, which is what lets the budget be re-checked.
+            var data: [1][]u8 = .{dest[got..]};
+            const n = r.readVec(&data) catch |e| switch (e) {
+                error.EndOfStream => return eof_err,
+                error.ReadFailed => return self.readFailure(),
+            };
+            if (n == 0) {
+                empty_reads += 1;
+                if (empty_reads > 16) return error.ReadFailed;
+            } else empty_reads = 0;
+            got += n;
+        }
+    }
+
     fn readFn(ctx: *anyopaque, buf: []u8) TransportError!usize {
         const self: *TcpTransport = @ptrCast(@alignCast(ctx));
         self.ensure();
         if (buf.len < tpkt.header_len) return error.ReadFailed;
         const r = &self.reader.?.interface;
+        // Entry: nothing at all yet is a graceful idle round.
         if (r.bufferedLen() == 0 and !try self.waitReadable()) return 0;
-        r.readSliceAll(buf[0..tpkt.header_len]) catch |e| switch (e) {
-            error.EndOfStream => return error.EndOfStream,
-            error.ReadFailed => return self.readFailure(),
-        };
+        // Past the first octet it is not: the peer has started a frame, so a
+        // stall is a stall and the deadline has to bound the WHOLE frame.
+        try self.readAllBounded(r, buf[0..tpkt.header_len], self.read_timeout_ms, error.EndOfStream);
         const total = tpkt.peekLength(buf[0..tpkt.header_len]) catch return error.ReadFailed;
+        // Load-bearing: without it the slice below runs to a wire-chosen
+        // `total` of up to 65535 past the end of the caller's buffer.
         if (total > buf.len) return error.ReadFailed;
         // Past the header there is no graceful idle: a stall here means the
         // peer stopped mid-packet and the connection is unusable, so even a
         // clean close counts as a failure. A cancel is still a cancel.
-        r.readSliceAll(buf[tpkt.header_len..total]) catch |e| switch (e) {
-            error.EndOfStream => return error.ReadFailed,
-            error.ReadFailed => return self.readFailure(),
-        };
+        try self.readAllBounded(r, buf[tpkt.header_len..total], self.read_timeout_ms, error.ReadFailed);
         return total;
     }
 
@@ -641,4 +696,70 @@ test "a cancel during the read timeout's poll is not reported as an idle round" 
     var fut = try io.concurrent(readOnce, .{ &fixture.tt, &buf });
     try io.sleep(.fromMilliseconds(100), .awake);
     try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+test "one octet does not park the read past its timeout (re-audit F-B)" {
+    // `setReadTimeout` documents "Bounds how long a read blocks". The poll
+    // only guarded the ENTRY to the read: once one octet was available,
+    // `waitReadable` returned true and `readSliceAll(buf[0..4])` blocked in
+    // the kernel with no deadline, waiting for the other three header octets.
+    // Measured 20x past a configured 100 ms bound. The module's own multi-peer
+    // server loop reads its links serially, so one unauthenticated connection
+    // sending one octet stopped every other association — a total, one-packet
+    // denial of service on a protection-and-control front end.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    fixture.tt.setReadTimeout(100);
+    // One octet — a legal TPKT version byte — then silence, socket kept open.
+    const one = [_]u8{tpkt.version};
+    _ = std.posix.system.write(fixture.peer.socket.handle, &one, 1);
+
+    var buf: [4096]u8 = undefined;
+    var fut = try io.concurrent(readOnce, .{ &fixture.tt, &buf });
+    // Far past the bound. If the read is still parked, `cancel` wins the race
+    // and answers `Canceled`; if it respected the bound it has already
+    // returned `error.ReadFailed` (mid-frame silence is not a graceful idle),
+    // and `cancel` hands that result back instead.
+    try io.sleep(.fromMilliseconds(1200), .awake);
+    const result = fut.cancel(io);
+    try testing.expectError(error.ReadFailed, result);
+}
+
+test "a TPKT larger than the caller's buffer is refused, not sliced past the end (re-audit F-D)" {
+    // `total` comes off the wire and reaches 65535. Without this guard
+    // `buf[header_len..total]` runs past the caller's buffer: a trap in Debug,
+    // an out-of-bounds write from network data in ReleaseFast. The guard was
+    // load-bearing and entirely unpinned — deleting it left the suite green.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    // A well-formed TPKT header announcing 600 octets, into a 128-byte buffer.
+    const header = [_]u8{ tpkt.version, 0, 0x02, 0x58 };
+    _ = std.posix.system.write(fixture.peer.socket.handle, &header, header.len);
+
+    var small: [128]u8 = undefined;
+    fixture.tt.setReadTimeout(200);
+    try testing.expectError(error.ReadFailed, fixture.tt.transport().read(&small));
+
+    // A frame that DOES fit is still accepted, so the guard is a bound and
+    // not a blanket refusal.
+    var body: [8]u8 = undefined;
+    @memset(&body, 0);
+    const ok_frame = [_]u8{ tpkt.version, 0, 0, 12 } ++ body;
+    _ = std.posix.system.write(fixture.peer.socket.handle, &ok_frame, ok_frame.len);
+    var big: [4096]u8 = undefined;
+    try testing.expectEqual(@as(usize, 12), try fixture.tt.transport().read(&big));
 }
