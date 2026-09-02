@@ -79,8 +79,13 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no allocation
     // No globals. Bare `SecretKey` mutation is caller-owned and NOT safe to
-    // share across threads (`sign` reads then writes `idx`); `SigningKey` is
-    // the hardened handle that IS safe to share — see its doc comment.
+    // share across threads. That used to be an index-reuse hazard only
+    // ("`sign` reads then writes `idx`"); since the BDS rewrite it is also
+    // MEMORY-unsafety: `sign` mutates `bds.stackoffset`/`stacklevels`, two
+    // racing signers drive `stackoffset` to 0 while `stackusage > 0`, and
+    // `stackoffset - 1` underflows a `u32` — an integer-overflow panic in
+    // Debug and a **SIGSEGV in ReleaseFast**, the shipping mode. `SigningKey`
+    // is the hardened handle that IS safe to share — see its doc comment.
     .concurrency = .reentrant,
     .model_after = "RFC 8391 (XMSS); XMSS/xmss-reference as KAT oracle",
     .deps = .{}, // std only (SHA-256)
@@ -389,7 +394,11 @@ pub fn genLeaf(sk_seed: *const [n]u8, pub_seed: *const [n]u8, leaf_idx: u32) [n]
 /// public key (use the RFC-assigned value for standard heights; anything in
 /// 0xDDDDDDDD..0xFFFFFFFF is free for private/test use).
 pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
-    std.debug.assert(tree_height >= 1 and tree_height <= 30);
+    // 2, not 1: at h == 1 the BDS `keep` array is `[h >> 1] == [0]` and
+    // `bdsRound`'s `keep[(tau - 1) >> 1]` is a compile error the moment `sign`
+    // is instantiated — so h == 1 type-checked and then failed on use. The
+    // documented range is now the effective one.
+    std.debug.assert(tree_height >= 2 and tree_height <= 30);
     return struct {
         const Self = @This();
 
@@ -426,6 +435,22 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
             /// once the key is retired. `root`/`pub_seed`/`idx` are public
             /// values and are deliberately left alone — a zeroed `idx` would
             /// look like a fresh key, which is the opposite of safe here.
+            ///
+            /// ⚠ **It does not reach the last signature's WOTS+ one-time
+            /// private key.** `sign` materialises all `wots_len` chain start
+            /// values, and `chain` takes its input **by value**, so copies live
+            /// in callee frames this function cannot address. Measured after
+            /// `zeroize()` by scanning a fresh 512 KiB stack frame: 0 of 67
+            /// recoverable in Debug, **55 of 67 in ReleaseFast** (no `sk_seed`
+            /// copies either way). Possession of leaf *k*'s WOTS+ private key
+            /// permits forging an arbitrary message at index *k* under the
+            /// published public key, so an already-spent index is not harmless.
+            /// Closing it needs a stack scrub at frame recycling, which is the
+            /// same unsolved problem `std.crypto` has with its own AES/hash key
+            /// schedules — a `secureZero` in this layer would not reach those
+            /// either. Reachable only with a memory-disclosure primitive (core
+            /// dump, swap, an out-of-bounds read elsewhere), which is why it is
+            /// stated rather than mitigated here.
             pub fn zeroize(sk: *SecretKey) void {
                 std.crypto.secureZero(u8, &sk.sk_seed);
                 std.crypto.secureZero(u8, &sk.sk_prf);
@@ -551,6 +576,10 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
             }
         };
 
+        /// `BdsState.covered_idx` value meaning "this state authenticates no
+        /// leaf yet". Not a valid index: `max_signatures` is at most 2^30.
+        pub const not_synced: u32 = std.math.maxInt(u32);
+
         pub const KeyPair = struct {
             sk: SecretKey,
             pk: PublicKey,
@@ -596,7 +625,21 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
             treehash: [h]TreehashInst = @splat(.{}),
             /// Leaf index that `auth` currently authenticates. Kept equal to
             /// `SecretKey.idx`; a mismatch triggers a resync in `sign`.
-            covered_idx: u32 = 0,
+            ///
+            /// The default is the **not-synchronised sentinel**, not 0. A
+            /// `SecretKey` built as a literal — which is exactly what a caller
+            /// restoring a key does, and what SPEC.md described the private
+            /// key as being — gets `.bds = .{}`, and with a 0 default that
+            /// read as "already synchronised for leaf 0". So a key restored at
+            /// index 0, the single most likely restore point, skipped the
+            /// resync, signed with an all-zero auth path, returned success,
+            /// and **consumed the leaf** for a signature that does not verify.
+            /// It never recovered either: `covered_idx` then tracks `idx` in
+            /// lockstep, so the mismatch is never seen again. Every other
+            /// index self-heals, which is what made it hard to notice.
+            /// `maxInt(u32)` cannot be a valid leaf (`h <= 30`), so the
+            /// unsynchronised state is now unrepresentable as "in sync".
+            covered_idx: u32 = not_synced,
         };
 
         /// Initialize the BDS state for leaf 0 and return the tree root. This
@@ -779,7 +822,13 @@ pub fn XmssSha2(comptime tree_height: u5, comptime wire_oid: u32) type {
         /// treeHash (§4.1.6, Algorithm 9): root of the height-`t` subtree
         /// whose leftmost leaf is `s` (s must be 2^t-aligned). O(2^t) WOTS+
         /// key generations; fixed stack, no allocation.
-        pub fn treeHash(sk_seed: *const [n]u8, pub_seed: *const [n]u8, s: u32, t: u5) [n]u8 {
+        /// Not `pub`: its `t <= h` bound is an assert, and the stack it
+        /// indexes is `[h + 1]`, so a caller passing `t > h` overflowed a
+        /// fixed array — `unreachable` in Debug, and in ReleaseFast an
+        /// out-of-bounds write that corrupted the loop state and never
+        /// returned (killed at 600 s). No internal caller can reach that, and
+        /// nothing outside the module needs the function.
+        fn treeHash(sk_seed: *const [n]u8, pub_seed: *const [n]u8, s: u32, t: u5) [n]u8 {
             std.debug.assert(t <= h);
             std.debug.assert(s % (@as(u32, 1) << t) == 0);
             var stack: [h + 1][n]u8 = undefined;
@@ -1143,6 +1192,50 @@ test "SigningKey: concurrent signing on one shared handle never repeats a leaf" 
         };
     }
     try std.testing.expectEqual(@as(u32, TestX.max_signatures), handle.index());
+}
+
+test "a key restored at index 0 resyncs instead of signing an all-zero auth path (re-audit F1)" {
+    // `BdsState` has all-default fields, so `SecretKey{ …, .bds = .{} }`
+    // compiles — and that is exactly what a caller restoring a key writes,
+    // because SPEC.md described the private key as "4 seeds + a 4-byte index".
+    // With `covered_idx` defaulting to 0, a key restored AT INDEX 0 — a brand
+    // new key persisted before its first signature, the single most likely
+    // restore point — matched `idx`, skipped the resync, emitted the all-zero
+    // auth path, returned success and CONSUMED the leaf. It never recovered:
+    // `covered_idx` then tracks `idx` in lockstep, so all eight following
+    // signatures failed too. Every other index self-healed, which is what made
+    // it invisible: `kat_test.zig`'s jump test uses 1/5/11/15/32, never 0.
+    const X = XmssSha2(4, 0xDDDDDDD0);
+    const kp = X.keyGen(@splat(7), @splat(8), @splat(9));
+    var sig: [X.signature_length]u8 = undefined;
+
+    for ([_]u32{ 0, 1, 5 }) |start| {
+        var restored: X.SecretKey = .{
+            .idx = start,
+            .sk_seed = kp.sk.sk_seed,
+            .sk_prf = kp.sk.sk_prf,
+            .pub_seed = kp.sk.pub_seed,
+            .root = kp.sk.root,
+            .bds = .{},
+        };
+        try X.sign(&restored, &sig, "firmware v1");
+        try std.testing.expect(X.verify(kp.pk, "firmware v1", &sig));
+        try std.testing.expectEqual(start + 1, restored.idx);
+        // ...and it stays correct for the rest of the key's life.
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            try X.sign(&restored, &sig, "next");
+            try std.testing.expect(X.verify(kp.pk, "next", &sig));
+        }
+    }
+
+    // The sentinel is not a valid leaf, so "unsynchronised" can never be read
+    // as "synchronised for leaf N".
+    try std.testing.expect(X.not_synced >= X.max_signatures);
+    const fresh: X.BdsState = .{};
+    try std.testing.expectEqual(X.not_synced, fresh.covered_idx);
+    // A key straight out of keyGen IS synchronised, for leaf 0.
+    try std.testing.expectEqual(@as(u32, 0), kp.sk.bds.covered_idx);
 }
 
 test "SecretKey.zeroize wipes the seeds and leaves the public state alone" {

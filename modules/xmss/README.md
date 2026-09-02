@@ -60,9 +60,14 @@ reference at every leaf for two heights, plus a dedicated resync test).
 - **Consumer:** SCADA firmware signing (IEC 62443-style code-signing
   chains standardize on SP 800-208 stateful HBS).
 
-Provenance: clean-room from RFC 8391, a public IRTF specification. The XMSS
-reference implementation was exercised only as a **black-box KAT oracle** —
-built, run, and its output diffed against ours; no source was read or ported,
-which per the root [`NOTICE`](../../NOTICE) §0 is neither a port nor a design
-reference. Detail in this module's own [`NOTICE`](NOTICE); it carries no
+Provenance: clean-room from RFC 8391, a public IRTF specification, **with one
+stated exception**: `src/root.zig` and SPEC.md both say the BDS auth-path
+traversal is *ported* from the reference `xmss_core_fast.c` (parameter k = 0).
+Until 2026-09-03 this paragraph and the module `NOTICE` said instead that "no
+source was read or ported" — two files in one directory making opposite claims
+about the same ~200 lines. Corrected to the code's own statement. xmss-reference
+is **CC0** (public domain), so the port carries no licence condition either way;
+what was wrong was the record, not the act. Everything outside the BDS traversal
+is clean-room from the RFC, and the reference was otherwise exercised only as a
+**black-box KAT oracle** — built, run, and its output diffed against ours. Detail in this module's own [`NOTICE`](NOTICE); it carries no
 condition beyond zig-libs' MIT license.

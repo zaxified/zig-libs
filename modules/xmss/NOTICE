@@ -25,7 +25,13 @@ known-answer vectors embedded in src/kat_vectors.zig (primitive outputs,
 WOTS+ keys/signatures, XMSS public keys and signatures at h = 2, h = 4 and
 h = 10 — h = 2 added to byte-anchor a full sequential stateful-index walk
 of all-but-the-last one-time key, see kat_vectors.zig for why the tree's
-final leaf is excluded). No source code from xmss-reference was ported into the module;
+final leaf is excluded). The **BDS auth-path traversal** (`bdsInit`/`bdsRound`/`bdsTreehashUpdate` in
+src/root.zig) is ported from xmss-reference's `xmss_core_fast.c` with parameter
+k = 0, as that file's own comments and SPEC.md state; xmss-reference is CC0
+(public domain dedication), which carries no attribution or licence condition,
+so this is a record of fact rather than an obligation. Until 2026-09-03 this
+NOTICE said no source was ported, which contradicted the module's own source
+comments. No OTHER source code from xmss-reference was ported into the module;
 two implementation-defined conventions were intentionally matched for
 interoperability and are documented in SPEC.md: (a) the NIST SP 800-208
 PRF_keygen WOTS+ secret-key derivation (toByte(4, 32) domain prefix),

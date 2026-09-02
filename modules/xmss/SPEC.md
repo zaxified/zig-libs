@@ -32,8 +32,17 @@ len_1 = 64, len_2 = 3, len = 67):
   xmss-reference scheme — chain i start value =
   `SHA-256(toByte(4, 32) || SK_SEED || SEED || ADRS)` with ADRS = the OTS
   address with chainAddress = i, hashAddress = 0, keyAndMask = 0. The
-  private key is therefore 4 seeds + a 4-byte index; one-time keys are
-  derived on demand and never stored.
+  private key's **secret material** is therefore 4 seeds + a 4-byte index;
+  one-time keys are derived on demand and never stored. ⚠ That is not the same
+  as `SecretKey`'s **layout**, and an earlier revision of this line said
+  "the private key is therefore 4 seeds + a 4-byte index" without the
+  distinction — which is the direct cause of the 2026-09-03 F1 finding, because
+  a caller who restores exactly those fields leaves `bds` default-constructed.
+  Since the BDS rewrite `SecretKey` also carries the traversal state: measured
+  `@sizeOf` is **676 B at h=4, 1424 B at h=10, 2176 B at h=16, 2676 B at h=20**
+  (of which `BdsState` is 544 / 1292 / 2044 / 2544 B) against the 132-byte RFC
+  private key. There is deliberately **no serialisation API**; a caller that
+  invents one must persist the whole struct, or accept the O(target·h) resync.
 
 **Not implemented:** XMSS^MT (§4.2 multi-tree — different OID space and
 hypertree signing); the SHA-512 and SHAKE suites (§5 OPTIONAL; RFC only
@@ -71,8 +80,13 @@ emits the current leaf's precomputed auth path and advances the state to
 the next leaf in ~O(h) hashing (about verify cost) instead of rebuilding
 the whole path in O(2^h). The BDS state tracks `covered_idx` in lockstep
 with `sk.idx`; a caller that jumps `idx` out of band (index partitioning,
-a restored key) triggers an automatic O(2^h) resync so the emitted
-signature is still byte-exact. `keyGen` remains O(2^h) (it now also seeds
+a restored key) triggers an automatic resync so the emitted signature is
+still byte-exact. That resync is **O(target·h) leaf generations, not O(2^h)** —
+`root.zig` says so correctly and this line understated it by a factor of h.
+Measured at h=10 in ReleaseFast: keyGen 1696 ms, an in-sequence sign 2.55 ms,
+and a sign after jumping to leaf 1023 **8335 ms — 4.9x the cost of generating
+the key**. Extrapolated to h=20 that is hours, silently, on the very workflow
+this section recommends (index partitioning). `keyGen` remains O(2^h) (it now also seeds
 the initial BDS state) — only per-signature auth-path cost is reduced.
 
 ## Statefulness — the key hazard
@@ -163,8 +177,24 @@ the auto-resync still reproduces the from-scratch auth path byte-exactly.
   (secret) and `pub_seed` (public but MUST be high-entropy, §4.1.3) —
   bring a CSPRNG (std 0.16 removed `std.crypto.random`). Everything is
   deterministic, which is what makes the KATs byte-exact.
-- **No allocation, no I/O:** all buffers are fixed-size (largest:
-  the 67×32 B WOTS+ arrays and the h+1-slot treeHash stack).
+- **No allocation, no I/O:** all buffers are fixed-size (largest: `BdsState`
+  itself, 2544 B at h=20 — bigger than the 67x32 B WOTS+ arrays this line used
+  to name as the largest).
+- **`zeroize` does not reach the last signature's WOTS+ one-time private key.**
+  `chain` takes its input by value, so copies live in callee frames the
+  function cannot address. Measured after `zeroize()` by scanning a fresh
+  512 KiB frame: 0 of 67 recoverable in Debug, **55 of 67 in ReleaseFast**.
+  Possession of leaf *k*'s WOTS+ private key permits forging an arbitrary
+  message at index *k*, so a spent index is not harmless. Closing it needs a
+  stack scrub at frame recycling — the same unsolved problem `std.crypto` has
+  with its own key schedules. Reachable only with a memory-disclosure
+  primitive, so it is stated rather than mitigated.
+- **Bare `SecretKey` is not thread-safe, and since the BDS rewrite the hazard
+  is memory-unsafety, not just index reuse.** Two racing `sign` calls drive
+  `bds.stackoffset` to 0 while `stackusage > 0`; `stackoffset - 1` underflows a
+  `u32`. Debug: integer-overflow panic. **ReleaseFast: SIGSEGV.** Use
+  `SigningKey`, whose interlock covers the whole exhaustion-check → persist →
+  sign → advance section.
 - **OID discipline:** `PublicKey.fromBytes` rejects foreign OIDs; the
   reduced-height test instantiations use private-range OIDs
   (0xDDDDDDDD–0xFFFFFFFF are never IANA-assigned).
