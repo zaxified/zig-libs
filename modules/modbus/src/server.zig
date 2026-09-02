@@ -278,7 +278,15 @@ pub const Server = struct {
                 var pdu_buf: [mb.max_pdu_len]u8 = undefined;
                 const was_listening = self.listen_only;
                 const reply_pdu = try self.handlePdu(frame.pdu, &pdu_buf);
-                if (!was_listening and self.listen_only) {
+                if (was_listening or self.listen_only) {
+                    // §6.8: a device in Listen Only Mode transmits NOTHING --
+                    // "If the port is currently in Listen Only Mode, no
+                    // response is returned" -- and the request that puts it
+                    // there is not answered either. `was_listening` is the
+                    // half that was missing: a restart-comms request received
+                    // while already muted was processed AND answered, and a
+                    // malformed one put an exception frame on a bus the device
+                    // is supposed to be silent on (audit 2026-09-02).
                     self.counters.slave_no_response +%= 1;
                     return null;
                 }
@@ -305,9 +313,12 @@ pub const Server = struct {
                 var pdu_buf: [mb.max_pdu_len]u8 = undefined;
                 const was_listening = self.listen_only;
                 const reply_pdu = try self.handlePdu(frame.pdu, &pdu_buf);
-                if (!was_listening and self.listen_only) {
+                if (was_listening or self.listen_only) {
                     // §6.8 sub 0x0004: the request that puts the device into
-                    // listen-only mode is itself not answered.
+                    // listen-only mode is itself not answered -- and (the half
+                    // that was missing until 2026-09-02) a device ALREADY in
+                    // the mode answers nothing at all, not even the exception
+                    // a malformed restart request would otherwise produce.
                     self.counters.slave_no_response +%= 1;
                     return null;
                 }
@@ -375,6 +386,19 @@ pub const Server = struct {
         };
 
         if (result) |code| return self.exception(out, fc_byte, code);
+        // ⛔ The last line of defence, and it is not redundant with the read
+        // limits above it. Every reply is written straight into `out`, and
+        // the only thing keeping `2 + 2*quantity` inside 253 bytes is
+        // `limits.max_read_registers` / `max_rw_read_registers`: two
+        // constants, in another file, with no assertion tying them to the
+        // buffer they bound. Raising `max_rw_read_registers` from 125 to 250
+        // alone was measured to panic in Debug (`index 254, len 253`) and, in
+        // ReleaseFast, to write 402 bytes into a 253-byte stack buffer with
+        // no panic at all -- the prior audit record's claim that "the failure
+        // mode really is a safety panic rather than silent corruption" holds
+        // only in Debug. This turns the coupling into a check that exists in
+        // every build. Audit 2026-09-02.
+        if (self.reply_len > out.len) return self.exception(out, fc_byte, .server_device_failure);
         return out[0..self.reply_len];
     }
 
@@ -625,6 +649,17 @@ pub const Server = struct {
             // one either, but the ADU layer needs a reply PDU to discard, so
             // build the echo and let `handleAdu` swallow it.
             .force_listen_only_mode => {
+                // ⛔ **BEHAVIOURAL, and deliberately narrower than the spec's
+                // silence.** V1.1b3 marks the whole of FC 08 as serial-line
+                // only, and over TCP this sub-function is a one-frame,
+                // unauthenticated, permanent denial of service: twelve bytes
+                // mute the server for EVERY master on EVERY connection until
+                // someone sends a restart (measured 2026-09-02 — five
+                // subsequent reads, all silent). A serial bus has one master
+                // and physical access; a TCP listener has neither. The rest
+                // of FC 08 stays available on both framings: echo and the
+                // counters have no lasting effect.
+                if (self.config.framing != .rtu) return .illegal_function;
                 if (data.len != 2 or std.mem.readInt(u16, data[0..2], .big) != 0) return .illegal_data_value;
                 self.listen_only = true;
                 @memcpy(out[3..5], data[0..2]);
@@ -1299,11 +1334,17 @@ test "FC 08 sub 0x0004: listen-only mode swallows everything until a restart" {
     const read2 = try mb.rtu.encodeAdu(&adu_buf, 5, &.{ 0x03, 0x00, 0x64, 0x00, 0x01 });
     try testing.expectEqual(@as(?[]u8, null), try server.handleAdu(read2, &out));
 
-    // ...except the restart sub-function.
+    // ...and the restart sub-function is PROCESSED but still not answered.
+    //
+    // ⚠ This arm used to assert a reply. V1.1b3 §6.8 sub 01 is explicit --
+    // "If the port is currently in Listen Only Mode, no response is returned"
+    // -- and the old behaviour put a frame on a bus the device is supposed to
+    // be silent on, including an exception frame for a MALFORMED restart
+    // request, which is the arm below. Audit 2026-09-02.
     var restart_buf: [mb.rtu.max_adu_len]u8 = undefined;
     const restart = try mb.rtu.encodeAdu(&restart_buf, 5, &.{ 0x08, 0x00, 0x01, 0x00, 0x00 });
-    try testing.expect((try server.handleAdu(restart, &out)) != null);
-    try testing.expect(!server.listen_only);
+    try testing.expectEqual(@as(?[]u8, null), try server.handleAdu(restart, &out));
+    try testing.expect(!server.listen_only); // it took effect all the same
 
     const read3 = try mb.rtu.encodeAdu(&adu_buf, 5, &.{ 0x03, 0x00, 0x64, 0x00, 0x01 });
     try testing.expect((try server.handleAdu(read3, &out)) != null);
@@ -1535,4 +1576,106 @@ fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
             .rtu => _ = try mb.rtu.decodeAdu(adu),
         }
     }
+}
+
+test "a device in listen-only mode answers nothing at all, not even an exception" {
+    // ⛔ MEDIUM regression (audit 2026-09-02). Only the frame that ENTERED
+    // the mode was suppressed, so any PDU matching `isRestartDiagnostic`
+    // received while already muted was answered — and a malformed one
+    // produced an EXCEPTION frame on a bus the device is supposed to be
+    // silent on (measured: `05 88 03 47 C0`), while staying muted.
+    var fix = Fixture{};
+    var server = fix.server(.rtu);
+    var buf: [mb.rtu.max_adu_len]u8 = undefined;
+    var out: [mb.rtu.max_adu_len]u8 = undefined;
+
+    const listen = try mb.rtu.encodeAdu(&buf, 5, &.{ 0x08, 0x00, 0x04, 0x00, 0x00 });
+    try testing.expectEqual(@as(?[]u8, null), try server.handleAdu(listen, &out));
+    try testing.expect(server.listen_only);
+
+    // A MALFORMED restart request: `isRestartDiagnostic` matches on the
+    // sub-function, so this reaches the handler and used to come back as an
+    // exception frame.
+    var bad_buf: [mb.rtu.max_adu_len]u8 = undefined;
+    const bad_restart = try mb.rtu.encodeAdu(&bad_buf, 5, &.{ 0x08, 0x00, 0x01, 0x12, 0x34 });
+    try testing.expectEqual(@as(?[]u8, null), try server.handleAdu(bad_restart, &out));
+    try testing.expect(server.listen_only); // and it did not leave the mode
+
+}
+
+test "over TCP, one unauthenticated frame cannot mute the server for everyone" {
+    // FC 08 is serial-line-only in the spec, and over TCP `force listen only
+    // mode` was an unauthenticated, permanent, all-connections denial of
+    // service costing twelve bytes (audit 2026-09-02). It is `illegal
+    // function` over TCP now; the rest of FC 08 is untouched.
+    var fix = Fixture{};
+    var server = fix.server(.tcp);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    try expectException(
+        try server.handlePdu(&.{ 0x08, 0x00, 0x04, 0x00, 0x00 }, &out),
+        0x08,
+        .illegal_function,
+    );
+    try testing.expect(!server.listen_only);
+
+    // Still answering, which is the point.
+    var adu: [mb.tcp.max_adu_len]u8 = undefined;
+    var adu_out: [mb.tcp.max_adu_len]u8 = undefined;
+    const read = try mb.tcp.encodeAdu(&adu, 7, 5, &.{ 0x03, 0x00, 0x64, 0x00, 0x01 });
+    try testing.expect((try server.handleAdu(read, &adu_out)) != null);
+
+    // Echo (sub 0) still works over TCP -- the narrowing is one sub-function.
+    try testing.expect((try server.handlePdu(&.{ 0x08, 0x00, 0x00, 0xAB, 0xCD }, &out)).len == 5);
+}
+
+test "FC 0x10: an address window miss is an exception, and writes nothing" {
+    // ⛔ One of four guards between a peer PDU and the process image that had
+    // NO test at all (audit 2026-09-02): disabling it left the suite green
+    // (77/77). It is load-bearing — without it, this frame panics in Debug
+    // ("attempt to use null value") and in ReleaseFast writes 0xDEAD into the
+    // WRONG register and answers the master with a positive reply.
+    var fix = Fixture{};
+    var server = fix.server(.rtu);
+    var out: [mb.max_pdu_len]u8 = undefined;
+    // Register 1000, window is 100..115.
+    const reply = try server.handlePdu(&.{ 0x10, 0x03, 0xE8, 0x00, 0x01, 0x02, 0xDE, 0xAD }, &out);
+    try expectException(reply, 0x10, .illegal_data_address);
+    for (fix.holdings) |v| try testing.expectEqual(@as(u16, 0), v);
+}
+
+test "FC 0x17: byte count and both address windows are checked, and nothing is written" {
+    // The other three untested guards. Each one disabled separately left the
+    // suite green; each one is the difference between an exception and a
+    // silent out-of-bounds read or write in ReleaseFast.
+    var fix = Fixture{};
+    var server = fix.server(.rtu);
+    var out: [mb.max_pdu_len]u8 = undefined;
+
+    // byte_count says 2, the body carries none: `body.len != 9 + byte_count`.
+    // Without the guard: Debug panics `index out of bounds: index 2, len 0`;
+    // ReleaseFast replies success and stores bytes read PAST the request
+    // frame into a holding register, readable back over the wire.
+    try expectException(
+        try server.handlePdu(&.{ 0x17, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02 }, &out),
+        0x17,
+        .illegal_data_value,
+    );
+
+    // Read address outside the window (write address inside).
+    try expectException(
+        try server.handlePdu(&.{ 0x17, 0x03, 0xE8, 0x00, 0x01, 0x00, 0x64, 0x00, 0x01, 0x02, 0x11, 0x22 }, &out),
+        0x17,
+        .illegal_data_address,
+    );
+
+    // Write address outside the window (read address inside).
+    try expectException(
+        try server.handlePdu(&.{ 0x17, 0x00, 0x64, 0x00, 0x01, 0x03, 0xE8, 0x00, 0x01, 0x02, 0x11, 0x22 }, &out),
+        0x17,
+        .illegal_data_address,
+    );
+
+    // §6.17 performs the write before the read, so a rejected frame must
+    // leave the image alone — check it did.
+    for (fix.holdings) |v| try testing.expectEqual(@as(u16, 0), v);
 }
