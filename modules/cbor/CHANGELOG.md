@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — `cose.checkLabels` is now `pub`. RFC 9052 §3's label-uniqueness MUST (and the
+  `max_map_entries` cap) applied only to the key types `parseKey` handles, so a caller that parses
+  a COSE map itself silently lost both: `webauthn`'s RFC 8230 RSA arm returns before `parseKey`
+  and was accepting duplicate labels first-wins. No behaviour change here; the rule is now
+  reachable by the caller that needs it.
+
+
 - **2026-09-01** — Security audit (extended scope, `cbor` + the `cose` sub-layer).
   **Remote CPU DoS, fixed:** `cose`'s duplicate-label check compares every pair of entries,
   and its input comes off the wire — `webauthn` hands `parseCredentialKey` the unbounded tail

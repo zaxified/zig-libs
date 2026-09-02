@@ -73,10 +73,18 @@ const result = try webauthn.verifyRegistration(
     },
 );
 // result.attestation_type      -> .none / .basic / .self_attestation
-// result.credential_id         -> store this
-// result.credential_public_key -> store this (webauthn.CoseKey) -- feed back
-//                                  into verifyAssertion for future logins
-// result.aaguid, result.sign_count, result.rp_id_hash, result.flags
+// result.aaguid, result.sign_count, result.rp_id_hash, result.flags -> plain values
+
+// ⚠ result.credential_id / .credential_public_key / .format / .leaf_cert_der
+// BORROW from `allocator`. `cbor.decode` dupes every byte string into it, so
+// they do not even alias `attestation_object`. To persist them -- and the
+// credential id and public key are exactly what an RP must persist -- take an
+// owning copy first, or they become pointers into recycled heap and every
+// later login verifies against whatever the next request wrote there.
+const stored = try result.dupe(gpa);   // gpa, NOT the request arena
+defer stored.deinit(gpa);              // when the credential is deleted
+// stored.credential_id, stored.credential_public_key -> feed back into
+// verifyAssertion for future logins.
 ```
 
 `type == "webauthn.create"`, the challenge, the origin, `rpIdHash` and the

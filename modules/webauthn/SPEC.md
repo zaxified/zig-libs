@@ -18,13 +18,23 @@ there is deliberately no root `/NOTICE` entry to point at.
   comment. `webauthn` is the first consumer that needs RS256, so `parseCredentialKey` extends
   `cbor.cose.parseKey`: EC2/OKP still go through `cbor.cose.parseKey` unchanged; `kty==3` is
   parsed locally (`n`=label -1, `e`=label -2, same label *numbers* RFC 9053 reuses for EC2's
-  `crv`/`x` — not a collision, RFC 8152's own design).
+  `crv`/`x` — not a collision, RFC 8152's own design). The local arm returns **before**
+  `cbor.cose.parseKey`, which is where RFC 9052 §3's label-uniqueness MUST and the
+  `max_map_entries` cap live — so until 2026-09-02 an RSA credential key with two `-1` labels was
+  accepted first-wins here while a `cbor2`/`python-fido2` peer reads it last-wins, a
+  credential-identity split. `parseCredentialKey` now calls `cbor.cose.checkLabels` itself, above
+  the `kty` read so a duplicated `kty` is caught too, and `parseAttestationObject` does the same
+  one layer up.
 - **Algorithm binding, not algorithm negotiation.** `verifySignature` ties `alg` tightly to the
   key's own `crv`/`kty`: an ES256 `alg` against anything but a P-256 EC2 key, or an RS256 `alg`
   against anything but an RSA key, is `error.UnsupportedAlgorithm` — never coerced, never
   "closest match". This is the algorithm-confusion defense (the same class of bug JWT's `alg:
   none`/HS-vs-RS confusion made infamous); see `assertion_test.zig`'s
-  "wrong key algorithm family" reject-tooth.
+  "wrong key algorithm family" reject-tooth — which swaps the **key**, and so pinned the
+  `crv`/`kty` half only. The `alg` half is a cross-check (the verification algorithm is derived
+  from the key's own `crv`/`kty`, or the certificate's SPKI, never from the client's `alg`), and
+  it could be deleted in all four places with the suite green until `attestation_test.zig`'s
+  "the attStmt alg must agree with the certificate's own key" was added.
 - **Certificate PARSING, not chain validation, for `packed`/`fido-u2f` x5c.** `verifyLeafCertSignature`
   uses `std.crypto.Certificate.parse` (the same primitive the sibling `x509` module's chain
   validator builds on) to pull the leaf certificate's own public key and verify `attStmt.sig`
@@ -34,7 +44,14 @@ there is deliberately no root `/NOTICE` entry to point at.
   out-of-bounds read under ReleaseFast), and `x509/src/safe.zig` is this collection's single
   reconciled guard for exactly that hazard. It does
   **not** build or validate a trust chain to a root, check `basicConstraints`/
-  `keyUsage`, or check certificate validity dates — WebAuthn attestation trust decisions (is this
+  `keyUsage`, check certificate validity dates, **or check §8.2.1's
+  `id-fido-gen-ce-aaguid` extension (OID 1.3.6.1.4.1.45724.1.1.4) against `authData.aaguid`**.
+  That last one was not disclosed here until 2026-09-02 and is the one that binds the certificate
+  to the claim: an RP that *does* chain `leaf_cert_der` to an MDS-derived store and then reads
+  `result.aaguid` to decide which authenticator MODEL this is can be spoofed by anyone holding an
+  attestation key that chains to a root in that store (batch keys are shared across whole product
+  lines, and several have leaked). No §16 vector carries the extension, so the corpus could not
+  anchor the check even if it existed. Model-based policy, not authentication, is what breaks — WebAuthn attestation trust decisions (is this
   authenticator model acceptable?) are a metadata-service (FIDO MDS) / RP-policy concern layered
   above signature verification, and are explicitly out of scope here (see "Threat model" below).
 - **`authenticatorData`'s CBOR credential public key has no length prefix (WebAuthn §6.5.2) —
@@ -57,7 +74,15 @@ This is a security-critical verifier of fully attacker-controlled wire bytes (an
 attestation response is produced by whatever ran in the browser/authenticator, which an attacker
 fully controls up to the cryptographic binding). Every check below is proven load-bearing by a
 dedicated adversarial test (`assertion_test.zig` / `attestation_test.zig` "reject:" tests) that
-tampers exactly one input and asserts the *specific* typed error, not merely "some error":
+tampers exactly one input and asserts the *specific* typed error, not merely "some error".
+
+⚠ That sentence was **false for three of them** until 2026-09-02, and the reason is worth keeping:
+the §16 corpus is structurally blind in places. Every registration vector has UP set and ED clear,
+none carries an illegal BE/BS pair, and `fuzzRegistrationBinding` only ever feeds real vectors —
+so `verifyRegistration`'s User-Present check, both arms of the extension-data rejection, and the
+`alg` half of the algorithm binding could each be deleted with the suite green. A corpus that
+cannot express the input a check refuses does not pin that check, however genuine the corpus is.
+The synthetic inputs that close them are in `attestation_test.zig`'s re-audit block.
 
 - **Both ceremonies are bound, and the binding lives in one place each.** `verifyAssertion` (§7.2)
   and `verifyRegistration` (§7.1) each run the full clientData + `rpIdHash` + User-Present check
@@ -178,7 +203,13 @@ tampered signature byte, tampered `clientDataHash`, wrong `rpId`, User Present f
 Verified required-but-clear, wrong challenge, wrong origin, wrong `type` (registration clientData
 replayed as an assertion, and §16.2's real assertion clientData replayed as a registration),
 a valid §16.2/§16.7 registration response replayed into a ceremony whose issued challenge was a
-different vector's, `require_attestation` against `fmt == "none"`,
+different vector's, `require_attestation` against `fmt == "none"` **and against `self`**
+(which proves nothing about the authenticator and leaves no certificate to chain),
+registration User Present cleared, extension data set in both `authData` branches,
+BE=0 with BS=1, `credentialIdLength` past 1023, duplicate COSE labels in a credential key and
+duplicate keys in the attestation object, a `fido-u2f` `x5c` with two elements, an empty `x5c`,
+an `attStmt.alg` that disagrees with the certificate's own key, an attestation certificate below
+the RSA modulus floor,
 cross-algorithm key swap (EdDSA key against an ES256 assertion), cross-credential key swap (right
 algorithm, wrong actual key), non-empty `attStmt` on `fmt=="none"`, and an unrecognized `fmt`
 string. Run: `zig build test-webauthn`.

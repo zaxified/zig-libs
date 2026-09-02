@@ -940,3 +940,456 @@ test "the registration fuzz harness reaches an accepted registration (reachabili
         try fuzzRegistrationBinding({}, &smith);
     }
 }
+
+// ── drift re-audit 2026-09-02 ───────────────────────────────────────────────
+//
+// Seven of these pin checks that ALREADY existed and that a mutation could
+// delete with the suite green — the corpus is structurally blind to them
+// (every §16 registration vector has UP=1 and ED=0, none carries an illegal
+// BE/BS pair, none has more than one `x5c` element). The rest pin new rules.
+
+/// A copy of `raw` with its flags byte (offset 32) replaced.
+fn withFlags(a: std.mem.Allocator, raw: []const u8, flags: u8) ![]u8 {
+    const out = try a.dupe(u8, raw);
+    out[32] = flags;
+    return out;
+}
+
+test "registration: User Present cleared is refused (re-audit F5 — the check had no teeth)" {
+    // SPEC said "every check below is proven load-bearing by a dedicated
+    // adversarial test" and named User Present. That was true of the
+    // ASSERTION check only: every §16 registration vector has UP set, and
+    // `fuzzRegistrationBinding` only ever feeds real vectors, so its
+    // `expect(result.flags.user_present)` oracle held unconditionally. The
+    // registration check could be deleted with 55/55 green.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.none_es256;
+    const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
+    // UP is bit 0; keep AT (bit 6) so the object still parses that far.
+    const cleared = try withFlags(a, auth_data, auth_data[32] & ~@as(u8, 0x01));
+    const obj = try buildAttestationObject(a, .{
+        .fmt = "none",
+        .alg = cbor.cose.alg_es256,
+        .x5c = null,
+        .sig = &.{},
+        .auth_data = cleared,
+    });
+    try testing.expectError(error.UserNotPresent, webauthn.verifyRegistration(
+        a,
+        obj,
+        &v.registration_client_data_json,
+        .{
+            .rp_id = "example.org",
+            .expected_challenge = &v.registration_challenge,
+            .expected_origin = "https://example.org",
+        },
+    ));
+}
+
+test "authData: BE=0 with BS=1 is refused (re-audit F6 — §6.1 / §7.1 step 11)" {
+    // An authenticator state the spec forbids, passed straight through
+    // before: an RP with a passkey-portability policy read an incoherent
+    // pair out of `result.flags` that this verifier had accepted.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.none_es256;
+    const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
+    // BE is bit 3 (0x08), BS is bit 4 (0x10): clear BE, set BS.
+    const bad = try withFlags(a, auth_data, (auth_data[32] & ~@as(u8, 0x08)) | 0x10);
+    try testing.expectError(
+        error.BackupStateInconsistent,
+        webauthn.parseAuthenticatorData(a, bad),
+    );
+    // Every legal combination still parses.
+    for ([_]u8{ 0x00, 0x08, 0x18 }) |be_bs| {
+        const ok = try withFlags(a, auth_data, (auth_data[32] & ~@as(u8, 0x18)) | be_bs);
+        _ = try webauthn.parseAuthenticatorData(a, ok);
+    }
+}
+
+test "authData: the extension-data rejection has teeth in both branches (re-audit F8)" {
+    // `error.ExtensionsNotSupported` is documented as "a structural, typed
+    // rejection, not a silent misparse" and as "proven by the adversarial
+    // test suite". Every §16 vector has ED=0, and no synthetic ED-set input
+    // existed anywhere, so both branches could be deleted with 55/55 green.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.none_es256;
+    const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
+    // ED is bit 7 (0x80). With AT set (the attested-credential branch)...
+    const with_at = try withFlags(a, auth_data, auth_data[32] | 0x80);
+    try testing.expectError(
+        error.ExtensionsNotSupported,
+        webauthn.parseAuthenticatorData(a, with_at),
+    );
+    // ...and with AT clear (the other branch), on a bare 37-byte authData.
+    const bare = try a.dupe(u8, auth_data[0..37]);
+    bare[32] = (bare[32] & ~@as(u8, 0x40)) | 0x80;
+    try testing.expectError(
+        error.ExtensionsNotSupported,
+        webauthn.parseAuthenticatorData(a, bare),
+    );
+}
+
+test "authData: credentialIdLength is capped at 1023 (re-audit F13 — §6.5.2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.none_es256;
+    const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
+    const oversized = try a.alloc(u8, 55 + 2000);
+    @memcpy(oversized[0..55], auth_data[0..55]);
+    @memset(oversized[55..], 0);
+    std.mem.writeInt(u16, oversized[53..55], 2000, .big);
+    try testing.expectError(
+        error.CredentialIdTooLong,
+        webauthn.parseAuthenticatorData(a, oversized),
+    );
+    // The boundary itself, from both sides.
+    const at_cap = try a.alloc(u8, 55 + webauthn.max_credential_id_len + 8);
+    @memcpy(at_cap[0..55], auth_data[0..55]);
+    @memset(at_cap[55..], 0);
+    std.mem.writeInt(u16, at_cap[53..55], webauthn.max_credential_id_len, .big);
+    // Refused for a reason that is NOT the length cap (the trailing bytes are
+    // not a COSE key) — which is exactly what proves the cap let it through.
+    try testing.expect(webauthn.parseAuthenticatorData(a, at_cap) != error.CredentialIdTooLong);
+    std.mem.writeInt(u16, at_cap[53..55], webauthn.max_credential_id_len + 1, .big);
+    try testing.expectError(
+        error.CredentialIdTooLong,
+        webauthn.parseAuthenticatorData(a, at_cap),
+    );
+}
+
+test "credential key: duplicate COSE labels are refused (re-audit F2)" {
+    // The RSA arm returned before `cbor.cose.parseKey`, so RFC 9052 §3's
+    // uniqueness MUST — and the `max_map_entries` cap `cbor` added for this
+    // exact caller — silently did not apply to it. A modulus this verifier
+    // reads first-wins and a `python-fido2` peer reads last-wins is a
+    // credential-identity split.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const n1 = [_]u8{0xC1} ** 256;
+    const n2 = [_]u8{0xD2} ** 256;
+    const e = [_]u8{ 0x01, 0x00, 0x01 };
+    const rsa_dup = [_]cbor.MapEntry{
+        .{ .key = .{ .uint = 1 }, .value = .{ .uint = 3 } }, // kty: RSA
+        .{ .key = .{ .negint = 0 }, .value = .{ .bytes = &n1 } }, // -1: n
+        .{ .key = .{ .negint = 0 }, .value = .{ .bytes = &n2 } }, // -1: n AGAIN
+        .{ .key = .{ .negint = 1 }, .value = .{ .bytes = &e } }, // -2: e
+    };
+    try testing.expectError(
+        error.DuplicateLabel,
+        webauthn.parseCredentialKey(.{ .map = &rsa_dup }),
+    );
+
+    // A duplicated `kty` — which decides WHICH arm runs — is caught too.
+    const kty_dup = [_]cbor.MapEntry{
+        .{ .key = .{ .uint = 1 }, .value = .{ .uint = 3 } },
+        .{ .key = .{ .uint = 1 }, .value = .{ .uint = 2 } },
+        .{ .key = .{ .negint = 0 }, .value = .{ .bytes = &n1 } },
+        .{ .key = .{ .negint = 1 }, .value = .{ .bytes = &e } },
+    };
+    try testing.expectError(
+        error.DuplicateLabel,
+        webauthn.parseCredentialKey(.{ .map = &kty_dup }),
+    );
+
+    // ...and the entry cap applies to the RSA arm now, not just EC2/OKP.
+    const many = try a.alloc(cbor.MapEntry, cbor.cose.max_map_entries + 2);
+    many[0] = .{ .key = .{ .uint = 1 }, .value = .{ .uint = 3 } };
+    for (many[1..], 0..) |*m, i| {
+        m.* = .{ .key = .{ .uint = @intCast(100 + i) }, .value = .{ .uint = 0 } };
+    }
+    try testing.expectError(
+        error.TooManyEntries,
+        webauthn.parseCredentialKey(.{ .map = many }),
+    );
+}
+
+test "attestationObject: duplicate top-level keys are refused (re-audit F12)" {
+    // `{fmt:"none", fmt:"tpm", authData:A, authData:B}` was accepted
+    // first-wins, so WHICH `authData` this verifier signs over was a
+    // parser-differential away from what another implementation reads.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.none_es256;
+    const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
+    const decoy = try a.alloc(u8, 40);
+    @memset(decoy, 0);
+    const entries = [_]cbor.MapEntry{
+        .{ .key = .{ .text = "fmt" }, .value = .{ .text = "none" } },
+        .{ .key = .{ .text = "fmt" }, .value = .{ .text = "tpm" } },
+        .{ .key = .{ .text = "attStmt" }, .value = .{ .map = &.{} } },
+        .{ .key = .{ .text = "authData" }, .value = .{ .bytes = auth_data } },
+        .{ .key = .{ .text = "authData" }, .value = .{ .bytes = decoy } },
+    };
+    const obj = try cbor.encode(a, .{ .map = &entries }, .{});
+    try testing.expectError(error.DuplicateLabel, webauthn.verifyRegistration(
+        a,
+        obj,
+        &v.registration_client_data_json,
+        .{
+            .rp_id = "example.org",
+            .expected_challenge = &v.registration_challenge,
+            .expected_origin = "https://example.org",
+        },
+    ));
+}
+
+test "require_attestation is not satisfied by SELF attestation (re-audit F3)" {
+    // A self-attested statement is signed by the credential's own key, so
+    // anything an attacker generates in a browser satisfies it — and it
+    // leaves `leaf_cert_der = null`, so the follow-up the option's own doc
+    // recommends is not even available.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_self_es256;
+    const opts: webauthn.RegistrationOptions = .{
+        .rp_id = "example.org",
+        .expected_challenge = &v.registration_challenge,
+        .expected_origin = "https://example.org",
+    };
+    // Without the flag it still verifies, and still reports what it is.
+    {
+        const r = try webauthn.verifyRegistration(a, &v.attestation_object, &v.registration_client_data_json, opts);
+        try testing.expectEqual(webauthn.AttestationType.self_attestation, r.attestation_type);
+        try testing.expect(r.leaf_cert_der == null);
+    }
+    var strict = opts;
+    strict.require_attestation = true;
+    try testing.expectError(error.AttestationNotProvided, webauthn.verifyRegistration(
+        a,
+        &v.attestation_object,
+        &v.registration_client_data_json,
+        strict,
+    ));
+    // ...and a real basic attestation still passes the same flag.
+    {
+        const b = vectors.packed_es256_full;
+        var basic_strict: webauthn.RegistrationOptions = .{
+            .rp_id = "example.org",
+            .expected_challenge = &b.registration_challenge,
+            .expected_origin = "https://example.org",
+            .require_attestation = true,
+        };
+        const r = try webauthn.verifyRegistration(a, &b.attestation_object, &b.registration_client_data_json, basic_strict);
+        try testing.expectEqual(webauthn.AttestationType.basic, r.attestation_type);
+        basic_strict.require_attestation = false;
+        _ = try webauthn.verifyRegistration(a, &b.attestation_object, &b.registration_client_data_json, basic_strict);
+    }
+}
+
+test "allowed_algorithms implements §7.1 step 14 (re-audit F7)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.none_es256;
+    var opts: webauthn.RegistrationOptions = .{
+        .rp_id = "example.org",
+        .expected_challenge = &v.registration_challenge,
+        .expected_origin = "https://example.org",
+    };
+    // Default: the step is skipped, as before.
+    _ = try webauthn.verifyRegistration(a, &v.attestation_object, &v.registration_client_data_json, opts);
+    // Offered: the credential's ES256 is in the list.
+    opts.allowed_algorithms = &.{ cbor.cose.alg_es256, cbor.cose.alg_eddsa };
+    _ = try webauthn.verifyRegistration(a, &v.attestation_object, &v.registration_client_data_json, opts);
+    // Not offered: refused.
+    opts.allowed_algorithms = &.{cbor.cose.alg_eddsa};
+    try testing.expectError(error.AlgorithmNotAllowed, webauthn.verifyRegistration(
+        a,
+        &v.attestation_object,
+        &v.registration_client_data_json,
+        opts,
+    ));
+    // An empty list offers nothing, and refuses everything.
+    opts.allowed_algorithms = &.{};
+    try testing.expectError(error.AlgorithmNotAllowed, webauthn.verifyRegistration(
+        a,
+        &v.attestation_object,
+        &v.registration_client_data_json,
+        opts,
+    ));
+}
+
+test "fido-u2f: x5c must hold exactly one element (re-audit F11 — §8.6 step 2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.fido_u2f_es256;
+    const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
+    const leaf = try realX5c(a, &v.attestation_object);
+
+    // Two elements: refused, where before the extra ones were ignored.
+    const arr = try a.alloc(cbor.Value, 2);
+    arr[0] = .{ .bytes = leaf };
+    arr[1] = .{ .bytes = &[_]u8{ 0xde, 0xad } };
+    const att = [_]cbor.MapEntry{
+        .{ .key = .{ .text = "sig" }, .value = .{ .bytes = &[_]u8{0} ** 8 } },
+        .{ .key = .{ .text = "x5c" }, .value = .{ .array = arr } },
+    };
+    const entries = [_]cbor.MapEntry{
+        .{ .key = .{ .text = "fmt" }, .value = .{ .text = "fido-u2f" } },
+        .{ .key = .{ .text = "attStmt" }, .value = .{ .map = &att } },
+        .{ .key = .{ .text = "authData" }, .value = .{ .bytes = auth_data } },
+    };
+    const obj = try cbor.encode(a, .{ .map = &entries }, .{});
+    try testing.expectError(error.InvalidAttestationStatement, webauthn.verifyAttestation(
+        a,
+        obj,
+        clientDataHash(&v.registration_client_data_json),
+    ));
+    // The real one-element vector still verifies.
+    _ = try webauthn.verifyAttestation(a, &v.attestation_object, clientDataHash(&v.registration_client_data_json));
+}
+
+test "x5c: an EMPTY array is refused rather than indexed (re-audit F10)" {
+    // A memory-safety guard with no test: without it `arr[0]` on `x5c: []`
+    // is an out-of-bounds index — a Debug panic, and in ReleaseFast a read of
+    // whatever follows, on fully client-supplied bytes.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_es256_full;
+    const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
+    for ([_][]const u8{ "packed", "fido-u2f" }) |fmt| {
+        const att = [_]cbor.MapEntry{
+            .{ .key = .{ .text = "alg" }, .value = .{ .negint = 6 } }, // -7 = ES256
+            .{ .key = .{ .text = "sig" }, .value = .{ .bytes = &[_]u8{0} ** 8 } },
+            .{ .key = .{ .text = "x5c" }, .value = .{ .array = &.{} } },
+        };
+        const entries = [_]cbor.MapEntry{
+            .{ .key = .{ .text = "fmt" }, .value = .{ .text = fmt } },
+            .{ .key = .{ .text = "attStmt" }, .value = .{ .map = &att } },
+            .{ .key = .{ .text = "authData" }, .value = .{ .bytes = auth_data } },
+        };
+        const obj = try cbor.encode(a, .{ .map = &entries }, .{});
+        try testing.expectError(error.MissingField, webauthn.verifyAttestation(
+            a,
+            obj,
+            clientDataHash(&v.registration_client_data_json),
+        ));
+    }
+}
+
+test "AttestationResult.dupe survives the verification arena being recycled (re-audit F1)" {
+    // The README told an RP to persist `credential_public_key` and
+    // `credential_id`. Both are arena-owned — `cbor.decode` dupes every byte
+    // string into the allocator, so they do not even alias the caller's
+    // `attestation_object_raw`. With the per-request arena the README itself
+    // showed, a stored key became pointers into recycled heap and every later
+    // login verified against whatever the next request wrote there.
+    const v = vectors.none_es256;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const stored = blk: {
+        const a = arena.allocator();
+        const r = try webauthn.verifyRegistration(a, &v.attestation_object, &v.registration_client_data_json, .{
+            .rp_id = "example.org",
+            .expected_challenge = &v.registration_challenge,
+            .expected_origin = "https://example.org",
+        });
+        break :blk try r.dupe(testing.allocator);
+    };
+    defer stored.deinit(testing.allocator);
+
+    // Recycle the arena the way the next request would, and scribble on it.
+    _ = arena.reset(.retain_capacity);
+    const scratch = try arena.allocator().alloc(u8, 8192);
+    @memset(scratch, 0xAA);
+
+    // The stored copy is still the credential that registered — and is what
+    // the next login verifies against.
+    try testing.expectEqualSlices(u8, &v.credential_id, stored.credential_id);
+    try testing.expectEqualStrings("none", stored.format);
+    const x = stored.credential_public_key.ec2.x;
+    try testing.expect(x[0] != 0xAA);
+    var verify_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer verify_arena.deinit();
+    _ = try webauthn.verifyAssertion(
+        verify_arena.allocator(),
+        &v.authenticator_data,
+        &v.assertion_client_data_json,
+        &v.signature,
+        stored.credential_public_key,
+        .{
+            .rp_id = "example.org",
+            .expected_challenge = &v.assertion_challenge,
+            .expected_origin = "https://example.org",
+        },
+    );
+}
+
+test "packed x5c: the attStmt alg must agree with the certificate's own key (re-audit F9)" {
+    // SPEC names this "the algorithm-confusion defense … the same class of
+    // bug JWT's `alg: none` made infamous", and cites a test that swaps the
+    // KEY — which pins the `crv`/`kty` half only. The `alg` cross-check
+    // itself could be deleted in all four places with the suite green.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_es256_full;
+    const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
+    const leaf = try realX5c(a, &v.attestation_object);
+
+    // A genuine ES256 attestation certificate, declared as RS256 and as
+    // EdDSA. The EC arm must refuse on the declared algorithm alone.
+    for ([_]i64{ webauthn.alg_rs256, cbor.cose.alg_eddsa }) |wrong| {
+        const obj = try buildAttestationObject(a, .{
+            .fmt = "packed",
+            .alg = wrong,
+            .x5c = leaf,
+            .sig = &[_]u8{0} ** 8,
+            .auth_data = auth_data,
+        });
+        try testing.expectError(error.UnsupportedAlgorithm, webauthn.verifyAttestation(
+            a,
+            obj,
+            clientDataHash(&v.registration_client_data_json),
+        ));
+    }
+    // The truthful declaration still reaches signature verification (and
+    // fails there on the bogus signature, not on the algorithm).
+    const honest = try buildAttestationObject(a, .{
+        .fmt = "packed",
+        .alg = cbor.cose.alg_es256,
+        .x5c = leaf,
+        .sig = &[_]u8{0} ** 8,
+        .auth_data = auth_data,
+    });
+    const err = webauthn.verifyAttestation(a, honest, clientDataHash(&v.registration_client_data_json));
+    try testing.expect(err != error.UnsupportedAlgorithm);
+}
+
+test "packed x5c: an attestation certificate below the RSA modulus floor is refused (re-audit F14)" {
+    // The 2026-08-06 audit's F7 put a 2048-bit floor on the CREDENTIAL key
+    // and not on the attestation certificate's. Nothing recorded that
+    // asymmetry as a decision, and the corpus has no undersized attestation
+    // key to notice it — so this vector is synthetic (see vectors.zig).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = vectors.packed_es256_full;
+    const auth_data = try extractAuthDataRaw(a, &v.attestation_object);
+    const obj = try buildAttestationObject(a, .{
+        .fmt = "packed",
+        .alg = webauthn.alg_rs256,
+        .x5c = &vectors.weak_rsa_attestation_cert_der,
+        .sig = &[_]u8{0} ** 128,
+        .auth_data = auth_data,
+    });
+    try testing.expectError(error.InvalidKey, webauthn.verifyAttestation(
+        a,
+        obj,
+        clientDataHash(&v.registration_client_data_json),
+    ));
+}

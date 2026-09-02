@@ -92,7 +92,7 @@ pub const meta = .{
 // RFC 8812 §2 COSE algorithm identifier for RS256 (RSASSA-PKCS1-v1_5 w/
 // SHA-256) — not in `cbor.cose` (that module only lists algs its own
 // EC2/OKP key types use); webauthn is the first consumer that needs RSA.
-const alg_rs256: i64 = -257;
+pub const alg_rs256: i64 = -257;
 
 /// Minimum RS256 **credential** key modulus size this module accepts (W2
 /// `webauthn` F7). `rsa.PublicKey.fromBytes` alone only enforces its own
@@ -132,6 +132,48 @@ pub const CoseKey = union(enum) {
             .rsa => |k| k.alg,
         };
     }
+
+    /// An owning copy. The coordinates a parsed key carries are borrowed from
+    /// the allocator the CBOR was decoded into (`cbor.decode` dupes each byte
+    /// string into it), so a key an RP intends to STORE — which is every
+    /// credential key — has to be copied out before that allocator is reset.
+    /// Free with `freeOwned`.
+    pub fn dupe(self: CoseKey, gpa: Allocator) Allocator.Error!CoseKey {
+        switch (self) {
+            .ec2 => |k| {
+                const x = try gpa.dupe(u8, k.x);
+                errdefer gpa.free(x);
+                const y = try gpa.dupe(u8, k.y);
+                return .{ .ec2 = .{ .alg = k.alg, .crv = k.crv, .x = x, .y = y } };
+            },
+            .okp => |k| {
+                const x = try gpa.dupe(u8, k.x);
+                return .{ .okp = .{ .alg = k.alg, .crv = k.crv, .x = x } };
+            },
+            .rsa => |k| {
+                const n = try gpa.dupe(u8, k.n);
+                errdefer gpa.free(n);
+                const e = try gpa.dupe(u8, k.e);
+                return .{ .rsa = .{ .alg = k.alg, .n = n, .e = e } };
+            },
+        }
+    }
+
+    /// Free a copy made by `dupe`. Never call it on a key returned straight
+    /// from parsing — that one borrows.
+    pub fn freeOwned(self: CoseKey, gpa: Allocator) void {
+        switch (self) {
+            .ec2 => |k| {
+                gpa.free(k.x);
+                gpa.free(k.y);
+            },
+            .okp => |k| gpa.free(k.x),
+            .rsa => |k| {
+                gpa.free(k.n);
+                gpa.free(k.e);
+            },
+        }
+    }
 };
 
 pub const KeyError = cbor.cose.KeyError;
@@ -169,6 +211,14 @@ pub fn parseCredentialKey(value: cbor.Value) KeyError!CoseKey {
         .map => |m| m,
         else => return error.NotAMap,
     };
+    // RFC 9052 §3: labels MUST be unique. `cbor.cose.parseKey` enforces this
+    // for the key types it handles — and the RSA arm below returns before
+    // ever reaching it, so this key type silently lost the rule. Hoisted
+    // above the `kty` read so a duplicated `kty` is caught too. It also
+    // reinstates `max_map_entries` for this arm, the cap `cbor` added
+    // specifically because `webauthn` hands this function the unbounded tail
+    // of client-supplied `authData`.
+    try cbor.cose.checkLabels(entries);
     const kty_v = cborMapGetInt(entries, cbor.cose.label_kty) orelse return error.MissingField;
     const kty = kty_v.toI64() orelse return error.WrongType;
     if (kty == 3) { // RFC 8230 kty "RSA"
@@ -242,7 +292,18 @@ pub fn parseClientData(allocator: Allocator, client_data_json: []const u8) Clien
 
 // ── authenticatorData (WebAuthn §6.1) ───────────────────────────────────────
 
-pub const AuthDataError = error{ Truncated, ExtensionsNotSupported, OutOfMemory } || cbor.DecodeError || KeyError;
+/// §6.5.2 / CTAP2 cap on `credentialIdLength`.
+pub const max_credential_id_len: u16 = 1023;
+
+pub const AuthDataError = error{
+    Truncated,
+    ExtensionsNotSupported,
+    /// `credentialIdLength` exceeds `max_credential_id_len` (§6.5.2).
+    CredentialIdTooLong,
+    /// BE=0 with BS=1 — an authenticator state §6.1 forbids.
+    BackupStateInconsistent,
+    OutOfMemory,
+} || cbor.DecodeError || KeyError;
 
 pub const AttestedCredentialData = struct {
     aaguid: [16]u8,
@@ -290,6 +351,10 @@ pub fn parseAuthenticatorData(allocator: Allocator, raw: []const u8) AuthDataErr
         var aaguid: [16]u8 = undefined;
         @memcpy(&aaguid, raw[37..53]);
         const cred_id_len = std.mem.readInt(u16, raw[53..55], .big);
+        // §6.5.2 / CTAP2: a credential ID is at most 1023 bytes. The only
+        // length field in `authData` the spec caps, and the one this module
+        // did not.
+        if (cred_id_len > max_credential_id_len) return error.CredentialIdTooLong;
         const cred_id_start: usize = 55;
         const cred_id_end = cred_id_start + cred_id_len;
         if (raw.len < cred_id_end) return error.Truncated;
@@ -304,6 +369,13 @@ pub fn parseAuthenticatorData(allocator: Allocator, raw: []const u8) AuthDataErr
     } else if (flags.extension_data) {
         return error.ExtensionsNotSupported;
     }
+
+    // WebAuthn L3 §6.1: BE=0 means the credential cannot be backed up, so
+    // BS=1 alongside it is a contradiction the authenticator must not emit —
+    // §7.1 step 11 / §7.2 step 17 make rejecting it normative. Checked here,
+    // once, so both ceremonies get it. Reported-but-not-acted-on was framed
+    // as a policy choice; it was a skipped step.
+    if (!flags.backup_eligible and flags.backup_state) return error.BackupStateInconsistent;
 
     return .{ .rp_id_hash = rp_id_hash, .flags = flags, .sign_count = sign_count, .attested_credential_data = attested };
 }
@@ -436,6 +508,20 @@ pub const AttestationError = AttestationObjectError || AuthDataError || Signatur
 
 pub const AttestationType = enum { none, basic, self_attestation };
 
+/// The outcome of a registration ceremony.
+///
+/// ⚠ **Lifetime.** `format`, `credential_id`, `leaf_cert_der` and every byte
+/// slice inside `credential_public_key` are **borrowed from the allocator you
+/// passed in** — `cbor.decode` dupes each byte string into it, so they do not
+/// even alias your `attestation_object_raw`. Reset or free that allocator and
+/// they dangle. This matters because the two fields an RP must *persist* are
+/// exactly `credential_id` and `credential_public_key`: with a per-request
+/// arena (the natural fit for the rest of the call, and what the README used
+/// to show) a stored key becomes pointers into recycled heap, and the next
+/// login verifies against whatever the following request wrote there — silent
+/// in ReleaseFast. `dupe` returns an owning copy for storage; `deinit` frees
+/// one. Only `aaguid`, `sign_count`, `rp_id_hash`, `flags` and
+/// `attestation_type` are plain values that outlive the allocator.
 pub const AttestationResult = struct {
     attestation_type: AttestationType,
     format: []const u8,
@@ -466,6 +552,36 @@ pub const AttestationResult = struct {
     /// as long as that input (and, for the allocating decode path, the arena)
     /// is still alive.
     leaf_cert_der: ?[]const u8 = null,
+
+    /// An owning copy, safe to keep after the verification allocator is gone.
+    /// Free it with `deinit(gpa)`. This is what an RP stores.
+    pub fn dupe(self: AttestationResult, gpa: Allocator) Allocator.Error!AttestationResult {
+        var out = self;
+        var done: usize = 0;
+        errdefer {
+            // Unwind exactly what was allocated, in order.
+            if (done > 0) gpa.free(out.format);
+            if (done > 1) gpa.free(out.credential_id);
+            if (done > 2) out.credential_public_key.freeOwned(gpa);
+        }
+        out.format = try gpa.dupe(u8, self.format);
+        done = 1;
+        out.credential_id = try gpa.dupe(u8, self.credential_id);
+        done = 2;
+        out.credential_public_key = try self.credential_public_key.dupe(gpa);
+        done = 3;
+        if (self.leaf_cert_der) |der| out.leaf_cert_der = try gpa.dupe(u8, der);
+        return out;
+    }
+
+    /// Free a copy made by `dupe`. Never call this on the value
+    /// `verifyRegistration` returned directly — that one borrows.
+    pub fn deinit(self: AttestationResult, gpa: Allocator) void {
+        gpa.free(self.format);
+        gpa.free(self.credential_id);
+        self.credential_public_key.freeOwned(gpa);
+        if (self.leaf_cert_der) |der| gpa.free(der);
+    }
 };
 
 const AttestationObject = struct {
@@ -481,6 +597,10 @@ fn parseAttestationObject(allocator: Allocator, raw: []const u8) (AttestationObj
         .map => |m| m,
         else => return error.NotAMap,
     };
+    // Same rule one layer up: `{fmt:"none", fmt:"tpm", authData:A, authData:B}`
+    // was accepted first-wins, so which `authData` this verifier signed over
+    // was a parser-differential away from what another implementation reads.
+    try cbor.cose.checkLabels(entries);
     const fmt_v = cborMapGetStr(entries, "fmt") orelse return error.MissingField;
     const fmt = switch (fmt_v) {
         .text => |t| t,
@@ -543,19 +663,30 @@ fn verifyLeafCertSignature(leaf_der: []const u8, alg: i64, msg: []const u8, sig:
             if (alg != alg_rs256) return error.UnsupportedAlgorithm;
             const components = std.crypto.Certificate.rsa.PublicKey.parseDer(parsed.pubKey()) catch return error.InvalidCertificate;
             const pk = rsa.PublicKey.fromBytes(components.modulus, components.exponent) catch return error.InvalidKey;
+            // The same floor the CREDENTIAL key gets (audit W2 F7). The
+            // asymmetry — enforced on one RSA key in this module and not the
+            // other — was not a decision anyone recorded.
+            if (pk.n.bits() < rs256_min_modulus_bits) return error.InvalidKey;
             rsa.verifyPkcs1v15(pk, std.crypto.hash.sha2.Sha256, msg, sig) catch return error.BadSignature;
         },
         .rsassa_pss => return error.UnsupportedAlgorithm,
     }
 }
 
-fn firstX5cDer(att_stmt: []const cbor.MapEntry) AttestationError!?[]const u8 {
+/// `attStmt.x5c[0]`. `require_single` implements §8.6 step 2 for `fido-u2f`
+/// ("Check that x5c has exactly one element"); `packed` (§8.2) legitimately
+/// carries the attestation certificate followed by its chain, so it passes
+/// false. The empty-array guard is a memory-safety guard, not a policy one:
+/// without it `arr[0]` on `x5c: []` is an out-of-bounds index — a Debug panic
+/// and, in ReleaseFast, a read of whatever follows.
+fn firstX5cDer(att_stmt: []const cbor.MapEntry, require_single: bool) AttestationError!?[]const u8 {
     const x5c_v = cborMapGetStr(att_stmt, "x5c") orelse return null;
     const arr = switch (x5c_v) {
         .array => |a| a,
         else => return error.WrongType,
     };
     if (arr.len == 0) return error.MissingField;
+    if (require_single and arr.len != 1) return error.InvalidAttestationStatement;
     return switch (arr[0]) {
         .bytes => |b| b,
         else => error.WrongType,
@@ -585,7 +716,7 @@ fn verifyPacked(att_stmt: []const cbor.MapEntry, msg: []const u8, credential_key
         else => return error.WrongType,
     };
 
-    if (try firstX5cDer(att_stmt)) |leaf_der| {
+    if (try firstX5cDer(att_stmt, false)) |leaf_der| {
         try verifyLeafCertSignature(leaf_der, alg, msg, sig);
         return .{ .attestation_type = .basic, .leaf_cert_der = leaf_der };
     }
@@ -609,7 +740,7 @@ fn verifyFidoU2f(
         .bytes => |b| b,
         else => return error.WrongType,
     };
-    const leaf_der = (try firstX5cDer(att_stmt)) orelse return error.MissingField;
+    const leaf_der = (try firstX5cDer(att_stmt, true)) orelse return error.MissingField;
 
     const att = auth_data.attested_credential_data orelse return error.MissingAttestedCredentialData;
     const ec2 = switch (att.credential_public_key) {
@@ -712,6 +843,9 @@ pub const RegistrationError = AttestationError || ClientDataError || error{
     UserNotPresent,
     UserNotVerified,
     AttestationNotProvided,
+    /// The credential's COSE algorithm is not in
+    /// `RegistrationOptions.allowed_algorithms` (§7.1 step 14).
+    AlgorithmNotAllowed,
 };
 
 pub const RegistrationOptions = struct {
@@ -739,7 +873,18 @@ pub const RegistrationOptions = struct {
     /// depends on the authenticator's identity — and then also chain the
     /// leaf certificate, because `basic` here still only means "the
     /// statement is internally consistent" (see SPEC.md "Deferred").
+    ///
+    /// Satisfied by `.basic` **only**. `.self_attestation` is signed by the
+    /// credential's own key and carries no certificate, so it proves nothing
+    /// about the authenticator and leaves nothing to chain.
     require_attestation: bool = false,
+    /// §7.1 step 14: the COSE algorithms this RP offered in
+    /// `pubKeyCredParams`. `null` (the default) skips the step, which is what
+    /// this module did unconditionally before — every algorithm it supports
+    /// is an acceptable one, so the practical impact is small, but a caller
+    /// that offered only ES256 had no way to insist on it. Example:
+    /// `.allowed_algorithms = &.{ cbor.cose.alg_es256 }`.
+    allowed_algorithms: ?[]const i64 = null,
 };
 
 /// Verify a WebAuthn **registration ceremony** (§7.1) end to end: the
@@ -783,7 +928,25 @@ pub fn verifyRegistration(
     var client_data_hash: [32]u8 = undefined;
     Sha256.hash(client_data_json, &client_data_hash, .{});
     const statement = try verifyStatement(allocator, obj, att, client_data_hash);
-    if (options.require_attestation and statement.attestation_type == .none) return error.AttestationNotProvided;
+    // `.self_attestation` is signed by the credential's own key, so anything
+    // an attacker generates in a browser satisfies it — it proves nothing
+    // about the authenticator, and it carries no `leaf_cert_der`, so the
+    // follow-up this option's own doc recommends ("then also chain the leaf
+    // certificate") is not even available. A caller who only checks that
+    // `require_attestation` passed had gained exactly nothing over `none`.
+    if (options.require_attestation and statement.attestation_type != .basic) {
+        return error.AttestationNotProvided;
+    }
+    // §7.1 step 14: the credential's algorithm must be one the RP offered in
+    // `pubKeyCredParams`. Unenforceable before — there was no way to express
+    // the list — so an authenticator could register under any algorithm this
+    // module supports regardless of what was asked for.
+    if (options.allowed_algorithms) |allowed| {
+        const alg = att.credential_public_key.alg() orelse return error.AlgorithmNotAllowed;
+        for (allowed) |a| {
+            if (a == alg) break;
+        } else return error.AlgorithmNotAllowed;
+    }
 
     return attestationResult(obj, att, statement);
 }

@@ -259,7 +259,15 @@ pub const LabelError = error{ DuplicateLabel, TooManyEntries };
 ///
 /// Returns `error.TooManyEntries` above `max_map_entries` rather than paying
 /// the quadratic scan; see that constant for the measurement.
-fn checkLabels(entries: []const MapEntry) LabelError!void {
+///
+/// Public because a caller that parses a COSE map itself — `webauthn` reads
+/// the RFC 8230 RSA key type this module does not — needs the same rule.
+/// `parseKey` calls it for the types it handles, and a caller that returns
+/// before reaching `parseKey` silently drops it: `webauthn`'s RSA arm did,
+/// accepting a key whose modulus this verifier read first-wins where a
+/// `cbor2`/`python-fido2` peer reads last-wins. That is a credential-identity
+/// split, which is why RFC 9052 §3 makes rejection a MUST.
+pub fn checkLabels(entries: []const MapEntry) LabelError!void {
     if (entries.len > max_map_entries) return error.TooManyEntries;
     for (entries, 0..) |e, i| {
         for (entries[i + 1 ..]) |o| {
