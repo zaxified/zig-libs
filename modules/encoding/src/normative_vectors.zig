@@ -25,7 +25,40 @@ const std = @import("std");
 pub const ParseResult = struct {
     table: [128]u21,
     count: usize,
+    /// The `# Identifier: <sha256>` the WHATWG file states about itself, when
+    /// it carries one. Upstream computes it over the JSON serialisation of
+    /// the codepoint list, so it is reproducible from the parsed table alone
+    /// — see `identifierMatches`. Null for files that have no such line
+    /// (the Unicode.org `8859-*.TXT` tables).
+    identifier: ?[64]u8 = null,
 };
+
+/// Whether the file's own advertised `Identifier` matches the table that was
+/// parsed out of it. Upstream's hash is
+/// `sha256(json.dumps(codepoints))` with Python's `", "` separators, e.g.
+/// `[8364, 129, 8218, ...]`, and `null` in place of an "undefined" hole.
+///
+/// This turns the vendored files from "we copied them once" into "this is
+/// still upstream's data". Without it a hand-edited table entry paired with a
+/// matching change in `root.zig` passes every test — inherent, an oracle
+/// cannot catch a co-edited oracle — while leaving the file contradicting the
+/// hash printed inside it.
+pub fn identifierMatches(r: ParseResult) bool {
+    const want = r.identifier orelse return true; // nothing claimed, nothing to check
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [16]u8 = undefined;
+    h.update("[");
+    for (r.table, 0..) |cp, i| {
+        if (i != 0) h.update(", ");
+        h.update(std.fmt.bufPrint(&buf, "{d}", .{cp}) catch unreachable);
+    }
+    h.update("]");
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    var hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex, "{x}", .{&digest}) catch unreachable;
+    return std.mem.eql(u8, &hex, &want);
+}
 
 /// Parse a WHATWG `index-*.txt` table. Lines are `<index>\t0x<CP>\t<comment>`;
 /// comment-only (`#`) and blank lines are skipped. `<index>` is 0..127 and
@@ -35,10 +68,20 @@ pub fn parseWhatwgIndex(text: []const u8) !ParseResult {
     var have: [128]bool = [_]bool{false} ** 128;
     var count: usize = 0;
 
+    var identifier: ?[64]u8 = null;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
+        if (line.len == 0 or line[0] == '#') {
+            // The file states a hash of its own contents; keep it so the
+            // caller can check the table against it.
+            const marker = "# Identifier: ";
+            if (std.mem.startsWith(u8, line, marker)) {
+                const hex = std.mem.trim(u8, line[marker.len..], " \t");
+                if (hex.len == 64) identifier = hex[0..64].*;
+            }
+            continue;
+        }
 
         var fields = std.mem.splitScalar(u8, line, '\t');
         const idx_field = fields.next() orelse return error.MalformedLine;
@@ -59,7 +102,7 @@ pub fn parseWhatwgIndex(text: []const u8) !ParseResult {
     for (have) |h| {
         if (!h) return error.MissingIndex;
     }
-    return .{ .table = table, .count = count };
+    return .{ .table = table, .count = count, .identifier = identifier };
 }
 
 /// Parse a Unicode.org `8859-*.TXT` table. Lines are

@@ -56,24 +56,28 @@ fn checkPage(enc: Encoding, table: [128]u21) !void {
 test "windows-1252: exhaustive decode+encode vs WHATWG index-windows-1252.txt" {
     const r = try vec.parseWhatwgIndex(whatwg_1252);
     try testing.expectEqual(@as(usize, 128), r.count);
+    try testing.expect(vec.identifierMatches(r));
     try checkPage(.windows_1252, r.table);
 }
 
 test "windows-1250: exhaustive decode+encode vs WHATWG index-windows-1250.txt" {
     const r = try vec.parseWhatwgIndex(whatwg_1250);
     try testing.expectEqual(@as(usize, 128), r.count);
+    try testing.expect(vec.identifierMatches(r));
     try checkPage(.windows_1250, r.table);
 }
 
 test "iso-8859-2: exhaustive decode+encode vs WHATWG index-iso-8859-2.txt" {
     const r = try vec.parseWhatwgIndex(whatwg_iso2);
     try testing.expectEqual(@as(usize, 128), r.count);
+    try testing.expect(vec.identifierMatches(r));
     try checkPage(.iso_8859_2, r.table);
 }
 
 test "iso-8859-15: exhaustive decode+encode vs WHATWG index-iso-8859-15.txt" {
     const r = try vec.parseWhatwgIndex(whatwg_iso15);
     try testing.expectEqual(@as(usize, 128), r.count);
+    try testing.expect(vec.identifierMatches(r));
     try checkPage(.iso_8859_15, r.table);
 }
 
@@ -85,6 +89,7 @@ test "iso-8859-1: exhaustive decode+encode vs Unicode.org 8859-1.TXT" {
     // normative source here, not WHATWG.
     const r = try vec.parseUnicodeOrgTable(unicode_iso1);
     try testing.expectEqual(@as(usize, 128), r.count);
+    try testing.expect(vec.identifierMatches(r));
     try checkPage(.iso_8859_1, r.table);
 }
 
@@ -107,4 +112,23 @@ test "normative tables: all five pages define every one of the 128 high bytes (n
     }
     const r1 = try vec.parseUnicodeOrgTable(unicode_iso1);
     try testing.expectEqual(@as(usize, 128), r1.count);
+}
+
+test "vendored WHATWG files still match the hash printed inside them (re-audit F4)" {
+    // Each `index-*.txt` states `# Identifier: <sha256>` about its own
+    // contents. Nothing read it, so the anchor said "we vendored this once"
+    // rather than "this is still upstream's data" — a hand-edited entry
+    // paired with a matching `root.zig` override passes every other test
+    // here (inherent: an oracle cannot catch a co-edited oracle) while
+    // silently contradicting the hash sitting in the file.
+    for ([_][]const u8{ whatwg_1252, whatwg_1250, whatwg_iso2, whatwg_iso15 }) |text| {
+        const r = try vec.parseWhatwgIndex(text);
+        try testing.expect(r.identifier != null); // the line must be there at all
+        try testing.expect(vec.identifierMatches(r));
+    }
+    // The Unicode.org table carries no such line; absence must not be a pass
+    // dressed as a check — `identifier` is null and `identifierMatches`
+    // returns true only because there is nothing claimed.
+    const u = try vec.parseUnicodeOrgTable(unicode_iso1);
+    try testing.expect(u.identifier == null);
 }

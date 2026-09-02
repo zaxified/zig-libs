@@ -31,8 +31,11 @@ CJK, UTF-16) is intentionally **out of scope**, not planned — see below.
 | `iso_8859_15`   | `iso-8859-15`  | `iso8859-15`, `latin-9`, `latin9`    |
 
 Each page's low half (0x00–0x7F) is ASCII and maps to itself, so structural
-bytes (delimiters, quotes, CR, LF) survive transcoding and raw byte offsets
-stay valid. The high half (0x80–0xFF) is built from an identity base (Latin-1 /
+bytes (delimiters, quotes, CR, LF) survive transcoding. ⚠ *Delimiters*, not
+*positions*: decode expands up to 3x (4 MiB of `0x80` as windows-1250 is
+12 MiB), so an earlier "raw byte offsets stay valid" here was false as
+written — what holds is that a framer running on the RAW bytes still finds
+its delimiters. The high half (0x80–0xFF) is built from an identity base (Latin-1 /
 C1) plus per-page override tables.
 
 ## API
@@ -48,11 +51,22 @@ fn decodeToUtf8(alloc, bytes: []const u8, enc: Encoding) ![]u8;   // caller owns
 fn encodeFromUtf8(alloc, utf8: []const u8, enc: Encoding) ![]u8;  // caller owns result
 ```
 
-**Data-lenient — never traps.** On decode, an unmappable codepoint falls back
-to the verbatim source byte. On encode, a codepoint with no representation in
-the target page becomes `'?'`, and invalid/truncated UTF-8 passes through
-verbatim byte-for-byte. Neither direction ever errors on content (only on
-allocation failure).
+**Data-lenient — never traps.** `decodeToUtf8` returns **valid UTF-8
+unconditionally**: from a legacy page structurally (all 128 high bytes map),
+and from `.utf8` because malformed input is replaced with U+FFFD, WHATWG's own
+decoder error mode. On encode, a codepoint with no representation in the target
+page becomes `'?'`, and invalid/truncated UTF-8 passes through verbatim
+byte-for-byte, resynchronising **one byte at a time** so a delimiter right
+after bad input is never swallowed. Neither direction ever errors on content
+(only on allocation failure).
+
+⚠ **One deliberate departure from WHATWG**, worth knowing before relying on
+either behaviour: WHATWG maps the labels `iso-8859-1` / `latin1` to the
+**windows-1252** encoding, because that is what the web contains. Here they
+select `iso_8859_1`, the true ISO/IEC 8859-1 page. `\x93quoted\x94` is
+`“quoted”` in a browser and a pair of C1 controls here. Pass `.windows_1252`
+explicitly for web-sourced data. Every other label in the WHATWG table for
+these five pages is accepted, and leading/trailing whitespace is stripped.
 
 ## Out of scope (not planned)
 

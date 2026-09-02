@@ -12,7 +12,9 @@ Excel export is realistically saved in (`windows_1250`, `windows_1252`, `iso_885
 `iso_8859_15`, plus `utf8` pass-through). `Encoding.parse` is case-insensitive with common aliases
 (`cp1250`, `latin-1`, etc.); `decodeToUtf8`/`encodeFromUtf8` take an allocator and return an owned
 buffer. Each page's low half (0x00–0x7F) is ASCII and maps to itself, so structural bytes
-(delimiters, quotes, CR, LF) survive transcoding and raw byte offsets stay valid; the high half
+(delimiters, quotes, CR, LF) survive transcoding (⚠ *delimiters*, not *positions* — see the module
+doc comment: decode expands up to 3x, so an earlier "raw byte offsets stay valid" here was false as
+written); the high half
 (0x80–0xFF) is built from an identity Latin-1/C1 base plus per-page override tables. This module
 runs only at the read edge (decode → UTF-8) and the write edge (encode ← UTF-8) — internal currency
 everywhere else is always UTF-8. Platform: any (pure logic, no OS calls). Role: codec. Concurrency:
@@ -24,10 +26,15 @@ aliases the "iso-8859-1" *label* to the windows-1252 *encoding* and does not pub
 index for the true ISO/IEC 8859-1 page) — see `modules/encoding/NOTICE`.
 
 ## Threat model / out of scope
-**Data-lenient — never traps.** On decode, an unmappable codepoint falls back to the verbatim
-source byte. On encode, a codepoint with no representation in the target page becomes `'?'`, and
-invalid/truncated UTF-8 passes through verbatim byte-for-byte. Neither direction ever errors on
-content (only on allocation failure) — so hostile/malformed input cannot crash or hang transcoding,
+**Data-lenient — never traps.** On decode from a legacy page every one of the 128 high bytes maps,
+so the unmappable-codepoint fallback is provably unreachable for all five (`normative_test.zig`
+proves it; a 2026-08-14 changelog line claiming "arbitrary bytes already reach every branch" was
+wrong about exactly this). On decode from `.utf8`, malformed input becomes U+FFFD — WHATWG's own
+decoder error mode — so `decodeToUtf8` returns valid UTF-8 unconditionally, which it did not until
+2026-09-02: `.utf8` was a verbatim dupe, and `.utf8` is the default. On encode, a codepoint with no
+representation in the target page becomes `'?'`, and invalid/truncated UTF-8 passes through
+verbatim byte-for-byte, resynchronising **one byte at a time** so a delimiter following bad input is
+never swallowed. Neither direction ever errors on content (only on allocation failure) — so hostile/malformed input cannot crash or hang transcoding,
 only silently degrade fidelity (which is the documented, deliberate contract, not a bug to fix).
 Out of scope, intentionally not planned: broader WHATWG Encoding Standard coverage — other
 single-byte pages (windows-1251/1253–1258, KOI8, ISO-8859-3..16), multi-byte/CJK (Shift-JIS, EUC-JP,

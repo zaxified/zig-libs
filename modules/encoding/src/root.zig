@@ -8,10 +8,15 @@
 //! and the write edge (encode ← UTF-8).
 //!
 //! Data-lenient: a byte / sequence that cannot be transcoded is emitted
-//! verbatim (decode) or replaced with '?' (encode) — never an error, never a
-//! crash. Every code page's low half (0x00–0x7F) is ASCII and maps to itself,
-//! so structural bytes (delimiters, quotes, CR, LF) survive transcoding and
-//! raw byte offsets stay valid.
+//! verbatim (encode) or replaced with U+FFFD (decode) — never an error, never
+//! a crash. Every code page's low half (0x00–0x7F) is ASCII and maps to
+//! itself, so structural bytes (delimiters, quotes, CR, LF) survive
+//! transcoding. ⚠ That is a claim about *delimiters*, not about *positions*:
+//! earlier revisions of this line said "and raw byte offsets stay valid",
+//! which is false as written for decode — 4 MiB of `0x80` decoded as
+//! windows-1250 is 12 MiB, exactly 3x, so every offset after the first high
+//! byte shifts. What holds is that a byte-oriented framer running on the RAW
+//! bytes still finds its delimiters, which is the useful half.
 
 const std = @import("std");
 
@@ -41,17 +46,37 @@ pub const Encoding = enum {
     iso_8859_2, // Latin-2 (Central European)
     iso_8859_15, // Latin-9 (Latin-1 + €, Š, Ž, Œ, Ÿ)
 
-    /// Parse a config string into an Encoding. Case-insensitive; accepts the
-    /// canonical names plus the common aliases. Returns null on no match so
-    /// the caller can emit a did-you-mean style warning.
-    pub fn parse(s: []const u8) ?Encoding {
+    /// Parse a config string into an Encoding. Case-insensitive, and leading
+    /// and trailing ASCII whitespace is stripped first (WHATWG "get an
+    /// encoding" step 1 — a label read off a CRLF-terminated ini or CSV
+    /// header line arrives with a `\r` on it, and used to return null).
+    /// Returns null on no match so the caller can emit a did-you-mean style
+    /// warning.
+    ///
+    /// The alias set is WHATWG's for these five pages, with **one deliberate
+    /// departure**: WHATWG maps the labels `iso-8859-1`, `iso8859-1`,
+    /// `latin1` and friends to the **windows-1252** encoding, because that is
+    /// what the web actually contains. This module has a distinct
+    /// `iso_8859_1` — the true ISO/IEC 8859-1 page, identity high half — and
+    /// those labels select it. The consequence is real and worth knowing
+    /// before you rely on either behaviour: `93 71 75 6f 74 65 64 94` decodes
+    /// here to a C1 control, `“quoted”` in a browser. Choose `.windows_1252`
+    /// explicitly for web-sourced data.
+    pub fn parse(raw: []const u8) ?Encoding {
+        const s = std.mem.trim(u8, raw, " \t\n\r\x0c");
         const eq = std.ascii.eqlIgnoreCase;
-        if (eq(s, "utf-8") or eq(s, "utf8")) return .utf8;
-        if (eq(s, "windows-1250") or eq(s, "windows1250") or eq(s, "cp1250") or eq(s, "win1250")) return .windows_1250;
-        if (eq(s, "windows-1252") or eq(s, "windows1252") or eq(s, "cp1252") or eq(s, "win1252")) return .windows_1252;
-        if (eq(s, "iso-8859-1") or eq(s, "iso8859-1") or eq(s, "latin-1") or eq(s, "latin1")) return .iso_8859_1;
-        if (eq(s, "iso-8859-2") or eq(s, "iso8859-2") or eq(s, "latin-2") or eq(s, "latin2")) return .iso_8859_2;
-        if (eq(s, "iso-8859-15") or eq(s, "iso8859-15") or eq(s, "latin-9") or eq(s, "latin9")) return .iso_8859_15;
+        if (eq(s, "utf-8") or eq(s, "utf8") or eq(s, "unicode-1-1-utf-8") or eq(s, "unicode11utf8") or eq(s, "unicode20utf8") or eq(s, "x-unicode20utf8")) return .utf8;
+        if (eq(s, "windows-1250") or eq(s, "windows1250") or eq(s, "cp1250") or eq(s, "win1250") or eq(s, "x-cp1250")) return .windows_1250;
+        if (eq(s, "windows-1252") or eq(s, "windows1252") or eq(s, "cp1252") or eq(s, "win1252") or eq(s, "x-cp1252") or
+            eq(s, "ansi_x3.4-1968") or eq(s, "ascii") or eq(s, "us-ascii") or eq(s, "cp819") or eq(s, "ibm819")) return .windows_1252;
+        if (eq(s, "iso-8859-1") or eq(s, "iso8859-1") or eq(s, "iso88591") or eq(s, "iso_8859-1") or
+            eq(s, "iso_8859-1:1987") or eq(s, "iso-ir-100") or eq(s, "latin-1") or eq(s, "latin1") or
+            eq(s, "l1") or eq(s, "csisolatin1")) return .iso_8859_1;
+        if (eq(s, "iso-8859-2") or eq(s, "iso8859-2") or eq(s, "iso88592") or eq(s, "iso_8859-2") or
+            eq(s, "iso_8859-2:1987") or eq(s, "iso-ir-101") or eq(s, "latin-2") or eq(s, "latin2") or
+            eq(s, "l2") or eq(s, "csisolatin2")) return .iso_8859_2;
+        if (eq(s, "iso-8859-15") or eq(s, "iso8859-15") or eq(s, "iso885915") or eq(s, "iso_8859-15") or
+            eq(s, "iso-ir-203") or eq(s, "latin-9") or eq(s, "latin9") or eq(s, "l9") or eq(s, "csisolatin9")) return .iso_8859_15;
         return null;
     }
 
@@ -68,11 +93,64 @@ pub const Encoding = enum {
     }
 };
 
-/// Decode legacy `bytes` in `enc` into a freshly allocated UTF-8 string.
-/// For `.utf8` this is a verbatim dupe. ASCII bytes (< 0x80) always pass
-/// through unchanged. Caller owns the returned slice.
+/// Copy `bytes`, replacing every malformed UTF-8 sequence with U+FFFD
+/// (REPLACEMENT CHARACTER) — the WHATWG Encoding Standard's decoder error
+/// mode. Resynchronisation is byte-at-a-time on a malformed sequence, the
+/// same rule `encodeFromUtf8` uses, so a structural ASCII byte following bad
+/// input is never swallowed.
+fn sanitizeUtf8(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    // Overwhelmingly the input is already valid; pay one scan to find out.
+    if (std.unicode.utf8ValidateSlice(bytes)) return alloc.dupe(u8, bytes);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, bytes.len);
+
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
+            try out.appendSlice(alloc, replacement_char);
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > bytes.len) {
+            try out.appendSlice(alloc, replacement_char);
+            i += 1;
+            continue;
+        }
+        _ = std.unicode.utf8Decode(bytes[i .. i + seq_len]) catch {
+            try out.appendSlice(alloc, replacement_char);
+            i += 1;
+            continue;
+        };
+        try out.appendSlice(alloc, bytes[i .. i + seq_len]);
+        i += seq_len;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// U+FFFD in UTF-8.
+pub const replacement_char = "\u{FFFD}";
+
+/// Decode `bytes` in `enc` into a freshly allocated **valid UTF-8** string.
+/// ASCII bytes (< 0x80) always pass through unchanged. Caller owns the
+/// returned slice.
+///
+/// For the five legacy pages the guarantee is structural: every one of the
+/// 128 high bytes maps to a codepoint (pinned by `normative_test.zig`), so
+/// the output cannot be anything but valid UTF-8. For `.utf8` it used to be
+/// a verbatim dupe — and `.utf8` is the enum's first member, the one
+/// `Encoding.parse` yields for an absent or unknown declaration, and the one
+/// the README calls the default. So a function named `decodeToUtf8` handed
+/// hostile bytes straight through on its most-taken path: a lone `0xFF`, a
+/// truncated `e2 82`, a surrogate `ed a0 80` and an overlong `c0 af` all came
+/// out unchanged, and a downstream `Utf8View` or JSON emitter met them
+/// believing otherwise. Malformed input is now replaced with U+FFFD, which is
+/// what the WHATWG Encoding Standard's own decode algorithm does — the
+/// standard this module names as its model — so the guarantee is
+/// unconditional. Well-formed UTF-8 is unchanged.
 pub fn decodeToUtf8(alloc: std.mem.Allocator, bytes: []const u8, enc: Encoding) ![]u8 {
-    if (enc == .utf8) return alloc.dupe(u8, bytes);
+    if (enc == .utf8) return sanitizeUtf8(alloc, bytes);
     const table = highTable(enc);
 
     var out: std.ArrayList(u8) = .empty;
@@ -351,6 +429,105 @@ test "decode/encode: empty string" {
 
 test "encode: invalid UTF-8 passes through verbatim" {
     try expectEncode(.iso_8859_1, "ab\xffcd", "ab\xffcd");
+}
+
+test "encode: a malformed CONTINUATION resyncs by ONE byte, so the next ASCII byte survives (re-audit F1)" {
+    // The whole point of this codec's error handling: structural bytes —
+    // delimiters, quotes, CR, LF — survive transcoding, which is what lets a
+    // CSV/log framer keep working across it. Byte-at-a-time resynchronisation
+    // on a malformed sequence is what delivers that, and only two of the
+    // three `catch` arms had a test. Skipping `seq_len` instead of 1 here
+    // silently eats the bytes that follow a bad lead — `e2 22 2c` losing the
+    // `"` and the `,` is field-boundary desync, the same shape as the
+    // csvstream finding — and the suite stayed green.
+    try expectEncode(.windows_1250, "\xe2\x22\x2c", "\xe2\x22\x2c");
+    try expectEncode(.iso_8859_1, "\xe2\x22\x2c", "\xe2\x22\x2c");
+    try expectEncode(.iso_8859_1, "\xf0\x3c\x73\x3e", "\xf0\x3c\x73\x3e");
+    // A 3-byte lead followed by ONE valid continuation and then a delimiter:
+    // the delimiter is two bytes past the lead, so `seq_len` would swallow it.
+    try expectEncode(.iso_8859_1, "a\xe2\x82,b", "a\xe2\x82,b");
+    // The other two arms, kept beside it so the three read as one set.
+    try expectEncode(.iso_8859_1, "ab\xffcd", "ab\xffcd"); // invalid lead
+    try expectEncode(.iso_8859_1, "ab\xe2", "ab\xe2"); // truncated at end
+}
+
+test "decode: `.utf8` produces valid UTF-8, not the bytes it was handed (re-audit F2)" {
+    // `.utf8` is the enum's first member, what `Encoding.parse` yields for an
+    // absent or unknown declaration, and what the README calls the default —
+    // and on that path `decodeToUtf8` was a verbatim dupe, so hostile bytes
+    // passed straight through a function whose name is a promise. A
+    // downstream `Utf8View` or JSON emitter then met them believing
+    // otherwise.
+    const cases = [_][]const u8{
+        "\xff", // lone continuation-less byte
+        "\xe2\x82", // truncated 3-byte sequence
+        "\xed\xa0\x80", // surrogate
+        "\xc0\xaf", // overlong
+        "a,\xff,b", // ...and the delimiters around it still survive
+    };
+    for (cases) |c| {
+        const got = try decodeToUtf8(testing.allocator, c, .utf8);
+        defer testing.allocator.free(got);
+        try testing.expect(std.unicode.utf8ValidateSlice(got));
+        try testing.expect(std.mem.indexOf(u8, got, replacement_char) != null);
+    }
+    // Valid input is untouched, byte for byte.
+    for ([_][]const u8{ "", "plain ascii", "p\u{159}\u{ed}li\u{161} \u{17e}lu\u{165}ou\u{10d}k\u{fd}", "\u{1F600}" }) |c| {
+        const got = try decodeToUtf8(testing.allocator, c, .utf8);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c, got);
+    }
+    // The commas either side of a bad byte are still commas.
+    const framed = try decodeToUtf8(testing.allocator, "a,\xff,b", .utf8);
+    defer testing.allocator.free(framed);
+    try testing.expectEqualStrings("a," ++ replacement_char ++ ",b", framed);
+    // And every legacy page's decode was, and remains, unconditionally valid.
+    inline for (.{ .windows_1250, .windows_1252, .iso_8859_1, .iso_8859_2, .iso_8859_15 }) |enc| {
+        var all: [256]u8 = undefined;
+        for (&all, 0..) |*b, i| b.* = @intCast(i);
+        const got = try decodeToUtf8(testing.allocator, &all, enc);
+        defer testing.allocator.free(got);
+        try testing.expect(std.unicode.utf8ValidateSlice(got));
+    }
+}
+
+test "parse: WHATWG labels and whitespace (re-audit F3)" {
+    // 23 of the 35 WHATWG labels selecting these five pages were rejected
+    // outright, so a caller fell back to its default on labels that really
+    // occur in the wild; and a label read off a CRLF line kept its `\r`.
+    for ([_][]const u8{ "iso88592", "iso_8859-2", "l2", "csisolatin2", "iso-ir-101" }) |l| {
+        try testing.expectEqual(Encoding.iso_8859_2, Encoding.parse(l).?);
+    }
+    for ([_][]const u8{ "iso885915", "l9", "iso_8859-15", "csisolatin9" }) |l| {
+        try testing.expectEqual(Encoding.iso_8859_15, Encoding.parse(l).?);
+    }
+    for ([_][]const u8{ "x-cp1250", "cp1250" }) |l| {
+        try testing.expectEqual(Encoding.windows_1250, Encoding.parse(l).?);
+    }
+    for ([_][]const u8{ "x-cp1252", "ascii", "us-ascii", "ansi_x3.4-1968" }) |l| {
+        try testing.expectEqual(Encoding.windows_1252, Encoding.parse(l).?);
+    }
+    for ([_][]const u8{ "l1", "csisolatin1", "iso88591", "iso_8859-1:1987" }) |l| {
+        try testing.expectEqual(Encoding.iso_8859_1, Encoding.parse(l).?);
+    }
+    // Whitespace, including the CR a CRLF header line leaves behind.
+    for ([_][]const u8{ "cp1250\r", " cp1250", "cp1250 ", "\t cp1250 \r\n" }) |l| {
+        try testing.expectEqual(Encoding.windows_1250, Encoding.parse(l).?);
+    }
+    // Still null for a genuine non-match, so a caller can still warn.
+    try testing.expect(Encoding.parse("shift_jis") == null);
+    try testing.expect(Encoding.parse("") == null);
+    // The documented departure from WHATWG, pinned so it cannot drift
+    // silently in either direction: these labels select the TRUE ISO-8859-1
+    // page here, windows-1252 in a browser.
+    try testing.expectEqual(Encoding.iso_8859_1, Encoding.parse("latin1").?);
+    const bytes = "\x93quoted\x94";
+    const here = try decodeToUtf8(testing.allocator, bytes, Encoding.parse("iso-8859-1").?);
+    defer testing.allocator.free(here);
+    const web = try decodeToUtf8(testing.allocator, bytes, .windows_1252);
+    defer testing.allocator.free(web);
+    try testing.expect(!std.mem.eql(u8, here, web));
+    try testing.expectEqualStrings("\u{201C}quoted\u{201D}", web);
 }
 
 test "canonicalName: round-trips through parse for every Encoding (audit F2)" {
