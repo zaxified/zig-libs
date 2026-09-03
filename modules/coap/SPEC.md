@@ -34,9 +34,10 @@ parameters. Within C6, **combined Block1+Block2 in a single exchange** (RFC 7959
 renegotiation mid-transfer** are deliberately deferred (the assembler tolerates only a constant
 block size, and rejects a mid-transfer SZX change with a typed error rather than mis-assembling).
 
-Two further items were flagged in pre-public review as attacker-triggerable **on an unauthenticated,
-connectionless UDP transport** and are now **addressed (admission hook + DTLS seam)** rather than
-merely documented:
+Four items are attacker-triggerable **on an unauthenticated, connectionless UDP transport**. The
+first two are **bounded (admission hook + DTLS seam)**; the last two are **NOT bounded here**, and
+saying so is the point — the 2026-09-03 drift audit found this section enumerating two items and
+calling them addressed, which reads as though the UDP surface had been enumerated. It had not:
 
 1. **Message-ID dedup window** (§4.5, `reliability.Dedup`) — caller-storage-bounded; an attacker who
    can inject packets can flood it with distinct message IDs to evict a legitimate exchange's entry
@@ -60,7 +61,28 @@ merely documented:
    address is not a mitigation, since that address is trivially spoofed. See `observe.zig`'s module
    and `Registry` doc comments for the full API and its `tryRegister` tests.
 
-Both remain properties of *unauthenticated* CoAP, not bugs in this codec/state-tracking layer: the
+3. **Response amplification** (RFC 7252 §11.3) — **not bounded by this module, and it cannot be.**
+   `block.split` and `server.piggyback` make a large answer to a small question easy, and the UDP
+   source address is chosen by whoever sends the datagram. Nothing here rate-limits, requires a
+   round trip before a large response, or compares response size to request size. A deployment on
+   an untrusted network gets that from the DTLS seam (a handshake the spoofer cannot complete), not
+   from this layer.
+4. **Observe notification volume** (RFC 7641 §7) — **not bounded by this module.** §7 is a MUST:
+   "Without client authentication, a server therefore MUST strictly limit the number of
+   notifications that it sends between receiving acknowledgements that confirm the actual interest
+   of the client in the data; i.e., any notifications sent in non-confirmable messages MUST be
+   interspersed with confirmable messages." `Registry`'s two admission controls — `admit_fn` and
+   `max_per_source` — both bound the same quantity, **how many rows of the table one source
+   occupies**. Neither bounds what a registration costs, which is the stream of notifications that
+   follows it, unbounded in time. `Registry.Entry` carries no unacknowledged-notification counter
+   and no last-acknowledged timestamp, so a caller cannot implement the MUST on top of this API
+   either; it would have to keep that state itself. ⛔ **Recorded and not fixed** in the 2026-09-03
+   audit: the fix is a per-entry unacked budget plus a CON-interspersal point in the push path, and
+   it changes `Entry` and the caller's loop together. Note also §7's closing sentence — "an attacker
+   may still spoof the acknowledgements if the confirmable messages are sufficiently predictable" —
+   which is why `client.Client.init` now documents its token seed as a CSPRNG requirement.
+
+Items 1–2 remain properties of *unauthenticated* CoAP, not bugs in this codec/state-tracking layer: the
 hook and cap bound what an *admitted* or *uncapped* misbehaving source can do, but the real fix for
 an untrusted network is DTLS (peer authentication) terminated by the caller, feeding a real
 `source_id` and `admit_fn` policy into `Registry.tryRegister`.
@@ -77,11 +99,21 @@ round-trip, since it never leaves this module's own encoder/decoder pair). This 
 `aiocoap.resource.Site` server — a plain GET, a full real 3-block Block2 GET reassembly, a real
 Block1 PUT with a genuine chained Block1+Size1 option delta, a real Observe registration followed by
 two genuinely live-pushed notifications (driving this module's own `Registry`/`Sequence` with the
-real sequence numbers), and a real multi-byte (2-byte) Block value from a 17-block transfer. A real,
+real sequence numbers), and a real multi-byte (2-byte) Block value from a 17-block transfer.
+⚠ **"Two independent real endpoints" means two endpoints of ONE implementation** — `aiocoap-client`
+and `aiocoap.resource.Site`, one version, one codec. A misreading of RFC 7252 *inside* aiocoap is
+invisible to this anchor in exactly the way a self-round-trip would be; what the anchor rules out is
+a defect private to *this* module, which is what the byte-order example above is. ⚠ And every
+capture is a well-formed loopback CON/ACK exchange with TKL 2: **no golden exercises a refusal
+path**, so every `ParseError`, `Block.DecodeError` and `FormatError` branch is anchored by
+hand-authored tests alone. A real,
 reported (non-bug) finding: `aiocoap-client` elides `Uri-Host` for a destination-matching IP literal
 (RFC 7252 §6.4 SHOULD); this module's `options.optionsFromUri` never elides it. See the file's doc
-comment for the full capture recipe and attribution (root `NOTICE` §0 — black-box oracle, no source
-consulted).
+comment for what was captured and the attribution (root `NOTICE` §0 — black-box oracle, no source
+consulted). ⚠ That doc comment is a NARRATIVE, not a recipe: it names no command, no server
+resource definitions and no ports, and `aiocoap` is not installed on the audit host — so the bytes
+are frozen and cannot currently be re-taken by following what is written. Recorded, not fixed
+(2026-09-03); closing it means committing the capture client + server script.
 
 `zig build test-coap` — 65 offline tests. Codec (7): golden-byte CON GET round-trip, extended
 option nibbles at the 13/269 boundaries, payload-marker edge cases, full parse/serialize error

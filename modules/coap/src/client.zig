@@ -83,8 +83,17 @@ pub const RequestOptions = struct {
     content_format: ?u16 = null,
     /// `Accept` (option 17) — the response format the client prefers.
     accept: ?u16 = null,
-    /// Token length to use (0..8). A shorter token is a smaller datagram; 4 is
-    /// a common default that still makes cross-request collisions unlikely.
+    /// Token length to use (0..8); anything above 8 is `error.BadTokenLength`,
+    /// never a silent truncation. A shorter token is a smaller datagram.
+    ///
+    /// ⚠ The token is not only a correlation handle. On an unsecured transport
+    /// it is the anti-spoofing device: RFC 7252 §5.3.1 says a client "should
+    /// use a nontrivial, randomized token", with at least 32 bits of randomness
+    /// for an Internet-connected client, and §11.4 names it as *the* defence —
+    /// "an attacker cannot inject a response message that a client will accept,
+    /// since it has to guess both the Message ID and the Token". `Client`'s
+    /// token comes from its `next_token` counter, so **the randomness has to be
+    /// in the seed**: see `Client.init`.
     token_len: u8 = 4,
 };
 
@@ -101,6 +110,18 @@ pub const Client = struct {
     next_mid: u16,
     next_token: u64,
 
+    /// ⚠ **`seed_token` must come from a CSPRNG on any unsecured transport.**
+    /// Both counters advance by one per request, so the token carries exactly as
+    /// much unpredictability as its seed and no more. RFC 7252 §11.4's entire
+    /// argument — that an off-path attacker "has to guess both the Message ID
+    /// and the Token" — is void against a client seeded with a constant: given
+    /// one observed (or simply assumed) starting point, every later exchange's
+    /// pair is arithmetic. RFC 7641 §7 makes the same point from the other end,
+    /// noting an attacker can spoof acknowledgements "if the confirmable
+    /// messages are sufficiently predictable".
+    ///
+    /// `seed_mid` matters less (a wrong guess yields `.unrelated`), but there is
+    /// no reason not to randomise it too.
     pub fn init(seed_mid: u16, seed_token: u64) Client {
         return .{ .next_mid = seed_mid, .next_token = seed_token };
     }
@@ -141,7 +162,12 @@ pub const Client = struct {
             .message_id = self.next_mid,
             .confirmable = options.confirmable,
         };
-        ex.token_len = @min(options.token_len, coap.max_token_len);
+        // Reject rather than clamp. Silently shrinking a token the caller asked
+        // for is the wrong direction on the one field that carries this
+        // client's anti-spoofing entropy, and the clamp also hid an out-of-range
+        // value that would otherwise slice `token_buf` out of bounds.
+        if (options.token_len > coap.max_token_len) return error.BadTokenLength;
+        ex.token_len = options.token_len;
         writeToken(ex.token_buf[0..ex.token_len], self.next_token);
         self.next_mid +%= 1;
         self.next_token +%= 1;
@@ -303,6 +329,64 @@ test "Exchange.match: piggybacked / separate / empty-ack / reset / unrelated" {
         .message_id = 999,
         .token = "zzzz",
     }));
+}
+
+test "TEETH: the correlation checks that stop a spoofed reply, in their own right" {
+    // The existing match test's two "unrelated" cases are a WRONG-MID ACK and a
+    // WRONG-TOKEN CON. Neither reaches the piggybacked token check or the Reset
+    // message-id check: deleting either one used to leave the whole suite green,
+    // which is a bad property for the two lines that stand between a spoofed
+    // datagram and a mis-correlated exchange.
+    var c = Client.init(5, 0x99);
+    var opts: [8]coap.Option = undefined;
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const req = try c.buildRequest(.get, "coap://h/x", .{}, &opts, &scratch, &out);
+    const ex = req.exchange;
+
+    // An ACK with OUR message id but somebody else's token is NOT our response.
+    // Without the token check this reads as `.piggybacked` — an injected body.
+    try testing.expectEqual(Match.unrelated, ex.match(.{
+        .type = .ack,
+        .code = .content,
+        .message_id = 5,
+        .token = "zzzz",
+    }));
+    // A Reset for a message id that is not ours must not kill this exchange.
+    try testing.expectEqual(Match.unrelated, ex.match(.{
+        .type = .reset,
+        .code = .empty,
+        .message_id = 6,
+    }));
+    // Sanity, so the two above are not passing because `match` broke outright.
+    try testing.expectEqual(Match.piggybacked, ex.match(.{
+        .type = .ack,
+        .code = .content,
+        .message_id = 5,
+        .token = ex.token(),
+    }));
+    try testing.expectEqual(Match.reset, ex.match(.{
+        .type = .reset,
+        .code = .empty,
+        .message_id = 5,
+    }));
+}
+
+test "TEETH: an out-of-range token_len is refused, not silently truncated" {
+    // It used to be `@min(token_len, 8)`. Nothing passed more than 8, so the
+    // clamp was unexercised — and it was the only thing standing between a
+    // caller's `token_len = 16` and `token_buf[0..16]` over an 8-byte array.
+    var c = Client.init(1, 1);
+    var opts: [8]coap.Option = undefined;
+    var scratch: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+
+    try testing.expectError(error.BadTokenLength, c.buildRequest(.get, "coap://h/x", .{ .token_len = 9 }, &opts, &scratch, &out));
+    try testing.expectError(error.BadTokenLength, c.buildRequest(.get, "coap://h/x", .{ .token_len = 255 }, &opts, &scratch, &out));
+
+    // The boundary itself is legal, and the token really is that long.
+    const ok = try c.buildRequest(.get, "coap://h/x", .{ .token_len = 8 }, &opts, &scratch, &out);
+    try testing.expectEqual(@as(usize, 8), ok.exchange.token().len);
 }
 
 test "non-confirmable request is typed NON" {

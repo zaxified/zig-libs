@@ -13,7 +13,7 @@
 //! - **`Registry`** — the server's subscription table over caller storage
 //!   (`[]Entry`), structurally like `reliability.Dedup`: a bounded array keyed by
 //!   `(token, resource)` with FIFO eviction when full. `notify` applies the RFC
-//!   7641 §4.4 freshness test so an out-of-order/replayed notification is
+//!   7641 §3.4 freshness test so an out-of-order/replayed notification is
 //!   rejected.
 //! - **`Sequence`** — the monotonic 24-bit generator for the notification
 //!   sequence numbers, plus `isNewer`, the RFC 1982-style "lollipop" comparison.
@@ -79,14 +79,42 @@ pub const Sequence = struct {
     }
 };
 
-/// RFC 7641 §4.4 freshness ("lollipop" / RFC 1982 serial-number arithmetic):
-/// is a notification with sequence `new` newer than the last-seen `old`? True
-/// when `new` is ahead within half the 24-bit space (directly, or across the
-/// wrap). A stale or reordered notification is therefore rejected.
+/// The **first two** of RFC 7641 §3.4's three freshness conditions: RFC 1982
+/// serial-number arithmetic over the 24-bit space — is `new` ahead of `old`
+/// within half the space (directly, or across the wrap)?
+///
+/// ⚠ This is deliberately NOT the whole test, and on its own it is not safe on
+/// an unauthenticated transport. §3.4 reads
+///
+/// > (V1 < V2 and V2 - V1 < 2^23) or (V1 > V2 and V1 - V2 > 2^23) or
+/// > (T2 > T1 + 128 seconds)
+///
+/// and the third condition is the recovery path — "after 128 seconds have
+/// elapsed without any notification, a client does not need to check the
+/// sequence numbers". Without it the comparison can WEDGE: one notification
+/// carrying `2^23 - 1` is "newer" than every value in `[0, 2^23)`, so a single
+/// spoofed datagram makes every genuine notification that follows read as
+/// stale, permanently. Use `isNewerAt`, or `Registry.notify`, which does.
 pub fn isNewer(old: u24, new: u24) bool {
     const half: u24 = 1 << 23;
     return (old < new and new - old < half) or (old > new and old - new > half);
 }
+
+/// RFC 7641 §3.4's freshness test, complete: `isNewer`, **or** more than
+/// `reordering_window_ms` of client-local time has passed since the freshest
+/// notification so far, in which case the sequence numbers are not consulted at
+/// all. `old_ms` and `now_ms` are the caller's own clock (any monotonic
+/// millisecond source); a caller that has no clock and passes a constant gets
+/// the two-condition behaviour and the wedge that comes with it.
+pub fn isNewerAt(old: u24, old_ms: u64, new: u24, now_ms: u64) bool {
+    if (isNewer(old, new)) return true;
+    return now_ms -| old_ms > reordering_window_ms;
+}
+
+/// RFC 7641 §3.4's 128 seconds: the age past which an incoming notification is
+/// fresh regardless of its sequence number. The RFC picks it as "a nice round
+/// number greater than MAX_LATENCY" (RFC 7252 §4.8.2).
+pub const reordering_window_ms: u64 = 128_000;
 
 /// Encode an Observe sequence as its option value: a 0..3-byte minimal
 /// big-endian uint (0 → empty), like the CoAP uint format (RFC 7641 §2 uses the
@@ -98,11 +126,30 @@ pub fn encodeValue(seq: u24, buf: *[3]u8) []const u8 {
     return buf[start..];
 }
 
+pub const DecodeError = error{
+    /// The option value was longer than RFC 7641 §2's three bytes.
+    OptionValueTooLong,
+};
+
 /// Decode an Observe option value (0..3 bytes) back to a sequence number.
-pub fn decodeValue(bytes: []const u8) u24 {
-    const tail = if (bytes.len > 3) bytes[bytes.len - 3 ..] else bytes;
+///
+/// An over-long value is REJECTED, not folded. It used to take the last three
+/// bytes, which is worse than truncating: the attacker keeps the bytes that
+/// decide the outcome and chooses it with padding — `{0,0,0,1}` decoded as
+/// `deregister` and `{1,0,0,0}` as `register`, from the same four bytes in the
+/// other order, while a conformant peer rejects both. `coap.parse` puts no
+/// length limit on an option value, so this is straight off the wire. The
+/// sibling decoders agree: `block.Block.decode` returns `error.TooLong` and
+/// `options.contentFormat`/`accept` return `FormatError.OptionValueTooLong` —
+/// the latter added in this same drift window, with the reason written into
+/// its source ("rejecting is safer than silently `@truncate`-ing an
+/// attacker-supplied over-long value to a plausible-looking identifier"). That
+/// argument was applied to the two options it was found on rather than to the
+/// rule; this is the third.
+pub fn decodeValue(bytes: []const u8) DecodeError!u24 {
+    if (bytes.len > 3) return error.OptionValueTooLong;
     var v: u32 = 0;
-    for (tail) |b| v = (v << 8) | b;
+    for (bytes) |b| v = (v << 8) | b;
     return @truncate(v);
 }
 
@@ -147,6 +194,10 @@ pub const Registry = struct {
         resource: u64 = 0,
         /// The sequence number stamped on the last notification for this entry.
         last_seq: u24 = 0,
+        /// Client-local time (ms) at which `last_seq` was accepted — T1 in RFC
+        /// 7641 §3.4. Stamped by `register`/`tryRegister` and advanced by
+        /// `notify`; it is what makes §3.4's third condition expressible at all.
+        last_ms: u64 = 0,
         /// The caller-supplied peer identity that registered this entry (`0`
         /// when registered via the plain `register` primitive, which does not
         /// take one). Used only by `tryRegister`'s per-source cap.
@@ -161,7 +212,7 @@ pub const Registry = struct {
     pub const Update = enum {
         /// Fresh — newer than the last seen; `last_seq` advanced.
         accepted,
-        /// Stale or out-of-order — rejected (RFC 7641 §4.4); `last_seq` unchanged.
+        /// Stale or out-of-order — rejected (RFC 7641 §3.4); `last_seq` unchanged.
         stale,
     };
 
@@ -186,8 +237,8 @@ pub const Registry = struct {
     /// (or trusts its transport, e.g. a private link). On an untrusted
     /// transport, prefer `tryRegister`, which checks that policy first — see
     /// the module doc comment.
-    pub fn register(self: *Registry, tok: []const u8, resource: u64, seq: u24) *Entry {
-        return self.registerRaw(0, tok, resource, seq);
+    pub fn register(self: *Registry, tok: []const u8, resource: u64, seq: u24, now_ms: u64) *Entry {
+        return self.registerRaw(0, tok, resource, seq, now_ms);
     }
 
     /// Admission-checked registration: the entry point to use on an untrusted
@@ -205,7 +256,7 @@ pub const Registry = struct {
     /// Otherwise behaves like `register` (including FIFO eviction of some
     /// *other* source's oldest entry if the table is full — the cap bounds one
     /// source's share, it does not reserve table space).
-    pub fn tryRegister(self: *Registry, source_id: u64, tok: []const u8, resource: u64, seq: u24) ?*Entry {
+    pub fn tryRegister(self: *Registry, source_id: u64, tok: []const u8, resource: u64, seq: u24, now_ms: u64) ?*Entry {
         if (self.admit_fn) |admit| {
             if (!admit(self.admit_ctx, source_id, tok, resource)) return null;
         }
@@ -216,12 +267,13 @@ pub const Registry = struct {
             }
             if (live >= self.max_per_source) return null;
         }
-        return self.registerRaw(source_id, tok, resource, seq);
+        return self.registerRaw(source_id, tok, resource, seq, now_ms);
     }
 
-    fn registerRaw(self: *Registry, source_id: u64, tok: []const u8, resource: u64, seq: u24) *Entry {
+    fn registerRaw(self: *Registry, source_id: u64, tok: []const u8, resource: u64, seq: u24, now_ms: u64) *Entry {
         if (self.find(tok, resource)) |e| {
             e.last_seq = seq;
+            e.last_ms = now_ms;
             return e;
         }
         const slot = if (self.len < self.entries.len) blk: {
@@ -238,6 +290,7 @@ pub const Registry = struct {
         @memcpy(slot.token_buf[0..slot.token_len], tok[0..slot.token_len]);
         slot.resource = resource;
         slot.last_seq = seq;
+        slot.last_ms = now_ms;
         slot.source_id = source_id;
         return slot;
     }
@@ -245,10 +298,11 @@ pub const Registry = struct {
     /// A notification carrying `seq` arrived for `(tok, resource)`. Returns null
     /// when there is no such subscription, else whether it is fresh (`accepted`,
     /// `last_seq` advanced) or stale/out-of-order (`stale`, rejected).
-    pub fn notify(self: *Registry, tok: []const u8, resource: u64, seq: u24) ?Update {
+    pub fn notify(self: *Registry, tok: []const u8, resource: u64, seq: u24, now_ms: u64) ?Update {
         const e = self.find(tok, resource) orelse return null;
-        if (isNewer(e.last_seq, seq)) {
+        if (isNewerAt(e.last_seq, e.last_ms, seq, now_ms)) {
             e.last_seq = seq;
+            e.last_ms = now_ms;
             return .accepted;
         }
         return .stale;
@@ -277,6 +331,13 @@ pub const Registry = struct {
 
 const testing = std.testing;
 
+/// A fixed client-local "now" for the tests that do not care about time. It is
+/// deliberately NOT zero: `notify`'s §3.4 third condition compares against the
+/// entry's `last_ms`, and starting the clock at 0 would make every first
+/// notification older than the 128 s window and so trivially fresh — the tests
+/// would then pass without the sequence comparison running at all.
+const t0: u64 = 1_000_000;
+
 /// Serialize `note`, parse it back (a real in-memory round-trip), assert its
 /// payload, and return the Observe sequence it carried.
 fn roundTripNotificationSeq(note: coap.Message, expect_payload: []const u8) !u24 {
@@ -287,7 +348,7 @@ fn roundTripNotificationSeq(note: coap.Message, expect_payload: []const u8) !u24
     try testing.expectEqualStrings(expect_payload, parsed.payload);
     var seq: ?u24 = null;
     for (parsed.options) |o| {
-        if (o.number == coap.options.number.observe) seq = decodeValue(o.value);
+        if (o.number == coap.options.number.observe) seq = try decodeValue(o.value);
     }
     return seq orelse error.MissingObserveOption;
 }
@@ -321,7 +382,7 @@ test "encodeValue/decodeValue round-trip (minimal, no leading zeros)" {
     for ([_]u24{ 0, 1, 255, 256, 65535, 65536, max_sequence }) |v| {
         const enc = encodeValue(v, &buf);
         if (enc.len > 0) try testing.expect(enc[0] != 0);
-        try testing.expectEqual(v, decodeValue(enc));
+        try testing.expectEqual(v, try decodeValue(enc));
     }
 }
 
@@ -330,19 +391,19 @@ test "Registry: register, freshness-checked notify, cancel" {
     var reg = Registry.init(&storage);
 
     const tok = "\x01\x02\x03\x04";
-    _ = reg.register(tok, 42, 0); // initial notification seq 0
+    _ = reg.register(tok, 42, 0, t0); // initial notification seq 0
     try testing.expectEqual(@as(usize, 1), reg.count());
 
     // In-order notifications are accepted and advance last_seq.
-    try testing.expectEqual(Registry.Update.accepted, reg.notify(tok, 42, 1).?);
-    try testing.expectEqual(Registry.Update.accepted, reg.notify(tok, 42, 2).?);
+    try testing.expectEqual(Registry.Update.accepted, reg.notify(tok, 42, 1, t0).?);
+    try testing.expectEqual(Registry.Update.accepted, reg.notify(tok, 42, 2, t0).?);
     // A replayed/out-of-order seq is rejected.
-    try testing.expectEqual(Registry.Update.stale, reg.notify(tok, 42, 1).?);
-    try testing.expectEqual(Registry.Update.stale, reg.notify(tok, 42, 2).?);
+    try testing.expectEqual(Registry.Update.stale, reg.notify(tok, 42, 1, t0).?);
+    try testing.expectEqual(Registry.Update.stale, reg.notify(tok, 42, 2, t0).?);
 
     // Unknown (token, resource) → null.
-    try testing.expectEqual(@as(?Registry.Update, null), reg.notify(tok, 99, 3));
-    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("zzzz", 42, 3));
+    try testing.expectEqual(@as(?Registry.Update, null), reg.notify(tok, 99, 3, t0));
+    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("zzzz", 42, 3, t0));
 
     // Cancel removes exactly the one entry.
     try testing.expect(reg.cancel(tok, 42));
@@ -350,23 +411,103 @@ test "Registry: register, freshness-checked notify, cancel" {
     try testing.expect(!reg.cancel(tok, 42)); // already gone
 }
 
+test "TEETH: one forged notification cannot blind a subscription for good (RFC 7641 §3.4)" {
+    // §3.4's freshness test has THREE conditions; only the first two are about
+    // sequence numbers. Without the third, a single spoofed datagram carrying
+    // 2^23 - 1 — "newer" than every value in [0, 2^23) and so needing no
+    // knowledge of the current sequence at all — makes every genuine
+    // notification that follows read as stale, permanently. On plain UDP the
+    // attacker needs only the token and the resource, and `find` keys on those
+    // two alone; it never sees a source address.
+    var storage: [2]Registry.Entry = undefined;
+    var reg = Registry.init(&storage);
+    const tok = "\x01\x02";
+
+    _ = reg.register(tok, 42, 0, t0);
+    try testing.expectEqual(Registry.Update.accepted, reg.notify(tok, 42, 1, t0).?);
+
+    // The forged notification is accepted — it IS "newer" in serial arithmetic,
+    // and nothing here can tell it from a legitimate jump.
+    const forged: u24 = (1 << 23) - 1;
+    try testing.expectEqual(Registry.Update.accepted, reg.notify(tok, 42, forged, t0).?);
+
+    // Within the reordering window the genuine stream now reads as stale. That
+    // is correct behaviour for a reorder and is exactly the wedge for a spoof.
+    var seq: u24 = 2;
+    while (seq < 200) : (seq += 1) {
+        try testing.expectEqual(Registry.Update.stale, reg.notify(tok, 42, seq, t0 + 1000).?);
+    }
+
+    // The recovery: past 128 s with nothing accepted, the sequence numbers are
+    // not consulted at all and the subscription un-wedges. This is the arm the
+    // module used to be structurally unable to express — `Entry` had no
+    // timestamp, so no caller could have implemented it either.
+    // 128 s is the RFC's number, not ours, so it is written here as a LITERAL.
+    // Expressed as `t0 + reordering_window_ms + 1` this test scales with the
+    // constant it is supposed to pin and stays green however far the window is
+    // moved — checked, and it did (widening it to ~4 years left the suite green).
+    const later = t0 + 128_001;
+    try testing.expectEqual(Registry.Update.accepted, reg.notify(tok, 42, 2, later).?);
+    // …and normal service resumes from there.
+    try testing.expectEqual(Registry.Update.accepted, reg.notify(tok, 42, 3, later).?);
+    try testing.expectEqual(Registry.Update.stale, reg.notify(tok, 42, 2, later).?);
+}
+
+test "TEETH: the reordering window is a boundary, not a door left open" {
+    // Anything at or below 128 s must still go through the sequence comparison —
+    // otherwise the recovery path would swallow the reorder rejection whole.
+    var storage: [1]Registry.Entry = undefined;
+    var reg = Registry.init(&storage);
+    _ = reg.register("t", 1, 100, t0);
+
+    try testing.expectEqual(Registry.Update.stale, reg.notify("t", 1, 50, t0).?);
+    // Literals again, for the same reason: RFC 7641 §3.4 says 128 seconds.
+    try testing.expectEqual(Registry.Update.stale, reg.notify("t", 1, 50, t0 + 128_000).?);
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("t", 1, 50, t0 + 128_001).?);
+    // And the constant itself is the RFC's value, so a future edit to it is a
+    // spec change and must be argued as one.
+    try testing.expectEqual(@as(u64, 128_000), reordering_window_ms);
+
+    // `isNewerAt` agrees with `isNewer` whenever the clock has not moved, so the
+    // new condition is strictly additive.
+    try testing.expect(isNewerAt(100, t0, 101, t0) == isNewer(100, 101));
+    try testing.expect(isNewerAt(100, t0, 50, t0) == isNewer(100, 50));
+}
+
+test "TEETH: an over-long Observe option value is refused, not folded to a chosen outcome" {
+    // Taking the last three bytes let the attacker pick register-vs-deregister
+    // by choosing the padding: the same four bytes in two orders decoded to the
+    // two opposite requests, while a conformant peer rejects both. `coap.parse`
+    // puts no length limit on an option value, so these arrive straight off the
+    // wire.
+    try testing.expectError(error.OptionValueTooLong, decodeValue(&[_]u8{ 0, 0, 0, 1 }));
+    try testing.expectError(error.OptionValueTooLong, decodeValue(&[_]u8{ 1, 0, 0, 0 }));
+    try testing.expectError(error.OptionValueTooLong, decodeValue(&[_]u8{ 9, 9, 9, 9, 9, 0, 0, 0 }));
+
+    // The legal lengths are untouched, including the empty value (= 0 = register).
+    try testing.expectEqual(@as(u24, 0), try decodeValue(&[_]u8{}));
+    try testing.expectEqual(@as(u24, 1), try decodeValue(&[_]u8{1}));
+    try testing.expectEqual(@as(u24, 0x0102), try decodeValue(&[_]u8{ 1, 2 }));
+    try testing.expectEqual(@as(u24, 0x010203), try decodeValue(&[_]u8{ 1, 2, 3 }));
+}
+
 test "Registry: FIFO eviction when full, re-register refreshes" {
     var storage: [2]Registry.Entry = undefined;
     var reg = Registry.init(&storage);
 
-    _ = reg.register("a", 1, 0);
-    _ = reg.register("b", 2, 0);
-    _ = reg.register("c", 3, 0); // full → evicts the oldest ("a",1)
+    _ = reg.register("a", 1, 0, t0);
+    _ = reg.register("b", 2, 0, t0);
+    _ = reg.register("c", 3, 0, t0); // full → evicts the oldest ("a",1)
     try testing.expectEqual(@as(usize, 2), reg.count());
-    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("a", 1, 5)); // evicted
-    try testing.expectEqual(Registry.Update.accepted, reg.notify("b", 2, 5).?);
-    try testing.expectEqual(Registry.Update.accepted, reg.notify("c", 3, 5).?);
+    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("a", 1, 5, t0)); // evicted
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("b", 2, 5, t0).?);
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("c", 3, 5, t0).?);
 
     // Re-registering an existing key updates in place (no growth).
-    _ = reg.register("b", 2, 10);
+    _ = reg.register("b", 2, 10, t0);
     try testing.expectEqual(@as(usize, 2), reg.count());
-    try testing.expectEqual(Registry.Update.stale, reg.notify("b", 2, 9).?); // 9 < 10
-    try testing.expectEqual(Registry.Update.accepted, reg.notify("b", 2, 11).?);
+    try testing.expectEqual(Registry.Update.stale, reg.notify("b", 2, 9, t0).?); // 9 < 10
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("b", 2, 11, t0).?);
 }
 
 fn denyAll(_: ?*anyopaque, _: u64, _: []const u8, _: u64) bool {
@@ -381,9 +522,9 @@ test "Registry.tryRegister: default (no hook, no cap) matches register" {
     var storage: [2]Registry.Entry = undefined;
     var reg = Registry.init(&storage);
 
-    try testing.expect(reg.tryRegister(1, "a", 1, 0) != null);
+    try testing.expect(reg.tryRegister(1, "a", 1, 0, t0) != null);
     try testing.expectEqual(@as(usize, 1), reg.count());
-    try testing.expectEqual(Registry.Update.accepted, reg.notify("a", 1, 1).?);
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("a", 1, 1, t0).?);
 }
 
 test "Registry.tryRegister: rejected admission does not register and does not evict" {
@@ -391,15 +532,15 @@ test "Registry.tryRegister: rejected admission does not register and does not ev
     var reg = Registry.init(&storage);
 
     // A legitimate subscription is already in place.
-    _ = reg.register("a", 1, 0);
+    _ = reg.register("a", 1, 0, t0);
     try testing.expectEqual(@as(usize, 1), reg.count());
 
     reg.admit_fn = denyAll;
-    try testing.expectEqual(@as(?*Registry.Entry, null), reg.tryRegister(2, "b", 2, 0));
+    try testing.expectEqual(@as(?*Registry.Entry, null), reg.tryRegister(2, "b", 2, 0, t0));
     // Rejected: nothing new registered, and the existing entry survives untouched.
     try testing.expectEqual(@as(usize, 1), reg.count());
-    try testing.expectEqual(Registry.Update.accepted, reg.notify("a", 1, 1).?);
-    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("b", 2, 0));
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("a", 1, 1, t0).?);
+    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("b", 2, 0, t0));
 }
 
 test "Registry.tryRegister: admitted source registers normally, even when the table is full" {
@@ -408,15 +549,15 @@ test "Registry.tryRegister: admitted source registers normally, even when the ta
     reg.admit_fn = admitSourceOne;
 
     // source_id 2 is not admitted.
-    try testing.expectEqual(@as(?*Registry.Entry, null), reg.tryRegister(2, "x", 1, 0));
+    try testing.expectEqual(@as(?*Registry.Entry, null), reg.tryRegister(2, "x", 1, 0, t0));
     try testing.expectEqual(@as(usize, 0), reg.count());
 
     // source_id 1 is admitted and registers (and may still FIFO-evict another
     // *admitted* source's entry once the table is full — the hook gates
     // whether an entry is added at all, not the table's eviction policy).
-    try testing.expect(reg.tryRegister(1, "y", 2, 0) != null);
+    try testing.expect(reg.tryRegister(1, "y", 2, 0, t0) != null);
     try testing.expectEqual(@as(usize, 1), reg.count());
-    try testing.expectEqual(Registry.Update.accepted, reg.notify("y", 2, 1).?);
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("y", 2, 1, t0).?);
 }
 
 test "Registry.tryRegister: per-source cap bounds one source's share without evicting" {
@@ -424,25 +565,25 @@ test "Registry.tryRegister: per-source cap bounds one source's share without evi
     var reg = Registry.init(&storage);
     reg.max_per_source = 2;
 
-    try testing.expect(reg.tryRegister(1, "a", 1, 0) != null);
-    try testing.expect(reg.tryRegister(1, "b", 2, 0) != null);
+    try testing.expect(reg.tryRegister(1, "a", 1, 0, t0) != null);
+    try testing.expect(reg.tryRegister(1, "b", 2, 0, t0) != null);
     try testing.expectEqual(@as(usize, 2), reg.count());
 
     // A third distinct subscription from the same source hits the cap and is
     // rejected — the two existing entries for source 1 are untouched.
-    try testing.expectEqual(@as(?*Registry.Entry, null), reg.tryRegister(1, "c", 3, 0));
+    try testing.expectEqual(@as(?*Registry.Entry, null), reg.tryRegister(1, "c", 3, 0, t0));
     try testing.expectEqual(@as(usize, 2), reg.count());
-    try testing.expectEqual(Registry.Update.accepted, reg.notify("a", 1, 1).?);
-    try testing.expectEqual(Registry.Update.accepted, reg.notify("b", 2, 1).?);
-    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("c", 3, 0));
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("a", 1, 1, t0).?);
+    try testing.expectEqual(Registry.Update.accepted, reg.notify("b", 2, 1, t0).?);
+    try testing.expectEqual(@as(?Registry.Update, null), reg.notify("c", 3, 0, t0));
 
     // A refresh of an already-held subscription is not new share and is not
     // capped.
-    try testing.expect(reg.tryRegister(1, "a", 1, 5) != null);
+    try testing.expect(reg.tryRegister(1, "a", 1, 5, t0) != null);
     try testing.expectEqual(@as(usize, 2), reg.count());
 
     // A different, uncapped source can still register freely.
-    try testing.expect(reg.tryRegister(2, "d", 4, 0) != null);
+    try testing.expect(reg.tryRegister(2, "d", 4, 0, t0) != null);
     try testing.expectEqual(@as(usize, 3), reg.count());
 }
 
@@ -480,12 +621,12 @@ test "C7 end-to-end: observe register → notifications → freshness → cancel
     const sget = try coap.parse(gwire[0..glen], &sopts);
     var registering = false;
     for (sget.options) |o| {
-        if (o.number == num.observe) registering = decodeValue(o.value) == request.register;
+        if (o.number == num.observe) registering = (try decodeValue(o.value)) == request.register;
     }
     try testing.expect(registering);
 
     const s0 = seq.next(); // 0
-    _ = reg.register(sget.token, resource, s0);
+    _ = reg.register(sget.token, resource, s0, t0);
     try testing.expectEqual(@as(usize, 1), reg.count());
     {
         var nbuf: [3]u8 = undefined;
@@ -493,7 +634,7 @@ test "C7 end-to-end: observe register → notifications → freshness → cancel
             .{ .number = num.observe, .value = encodeValue(s0, &nbuf) },
         }, "v0", false);
         const cs = try roundTripNotificationSeq(note, "v0");
-        _ = view.register(sget.token, resource, cs); // client records the initial seq
+        _ = view.register(sget.token, resource, cs, t0); // client records the initial seq
     }
 
     // 3. two resource changes → two notifications with increasing seq, accepted.
@@ -504,11 +645,11 @@ test "C7 end-to-end: observe register → notifications → freshness → cancel
             .{ .number = num.observe, .value = encodeValue(s, &nbuf) },
         }, p, false);
         const cs = try roundTripNotificationSeq(note, p);
-        try testing.expectEqual(Registry.Update.accepted, view.notify(token, resource, cs).?);
+        try testing.expectEqual(Registry.Update.accepted, view.notify(token, resource, cs, t0).?);
     }
 
     // 4. an out-of-order (stale) notification is rejected by the client.
-    try testing.expectEqual(Registry.Update.stale, view.notify(token, resource, 1).?);
+    try testing.expectEqual(Registry.Update.stale, view.notify(token, resource, 1, t0).?);
 
     // 5. cancellation (an Observe:1 deregister GET, or a RST) removes the entry.
     try testing.expect(reg.cancel(sget.token, resource));
@@ -524,14 +665,14 @@ test "C7 reliability glue: a dead CON notification cancels the subscription" {
     const resource: u64 = 7;
 
     // A CON notification whose Retransmit exhausts (.timed_out) → cancel.
-    _ = reg.register(token, resource, 0);
+    _ = reg.register(token, resource, 0, t0);
     var rt = reliability.Retransmit.init(.{ .max_retransmit = 0 }, 0, 0);
     try testing.expectEqual(reliability.Retransmit.Action.timed_out, rt.poll(2000));
     if (rt.isDone()) _ = reg.cancel(token, resource);
     try testing.expectEqual(@as(usize, 0), reg.count());
 
     // A CON notification answered with a Reset (.reset) → cancel.
-    _ = reg.register(token, resource, 0);
+    _ = reg.register(token, resource, 0, t0);
     var rt2 = reliability.Retransmit.init(.{}, 0, 0);
     rt2.onReset();
     if (rt2.isDone()) _ = reg.cancel(token, resource);

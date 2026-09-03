@@ -569,7 +569,7 @@ test "external: aiocoap Observe register + two REAL live-pushed notifications" {
     try testing.expectEqual(coap.Code.get, reg.code);
     var registering = false;
     for (reg.options) |o| {
-        if (o.number == options.number.observe) registering = observe.decodeValue(o.value) == observe.request.register;
+        if (o.number == options.number.observe) registering = (try observe.decodeValue(o.value)) == observe.request.register;
     }
     try testing.expect(registering);
 
@@ -579,7 +579,7 @@ test "external: aiocoap Observe register + two REAL live-pushed notifications" {
     try testing.expectEqualSlices(u8, reg.token, ack.token);
     var initial_seq: ?u24 = null;
     for (ack.options) |o| {
-        if (o.number == options.number.observe) initial_seq = observe.decodeValue(o.value);
+        if (o.number == options.number.observe) initial_seq = try observe.decodeValue(o.value);
     }
     try testing.expectEqual(@as(u24, 0), initial_seq.?);
     try testing.expectEqualStrings("0", ack.payload);
@@ -588,7 +588,7 @@ test "external: aiocoap Observe register + two REAL live-pushed notifications" {
     // numbers a live server actually pushed -- not hand-picked values.
     var storage: [2]observe.Registry.Entry = undefined;
     var reg_table = observe.Registry.init(&storage);
-    _ = reg_table.register(reg.token, 1, initial_seq.?);
+    _ = reg_table.register(reg.token, 1, initial_seq.?, 1_000_000);
 
     const notifies = [_][]const u8{ bytes.observe_notify1, bytes.observe_notify2 };
     const acks = [_][]const u8{ bytes.observe_notify1_ack, bytes.observe_notify2_ack };
@@ -601,9 +601,9 @@ test "external: aiocoap Observe register + two REAL live-pushed notifications" {
         try testing.expectEqualStrings(want_payload, note.payload);
         var seq: ?u24 = null;
         for (note.options) |o| {
-            if (o.number == options.number.observe) seq = observe.decodeValue(o.value);
+            if (o.number == options.number.observe) seq = try observe.decodeValue(o.value);
         }
-        try testing.expectEqual(Registry_Update.accepted, reg_table.notify(reg.token, 1, seq.?).?);
+        try testing.expectEqual(Registry_Update.accepted, reg_table.notify(reg.token, 1, seq.?, 1_000_000).?);
 
         // The client's real empty-ACK echoes the notification's message id.
         var aopts: [1]coap.Option = undefined;
@@ -620,10 +620,15 @@ test "external: aiocoap Observe register + two REAL live-pushed notifications" {
         var nopts: [4]coap.Option = undefined;
         const note = try coap.parse(bytes.observe_notify1, &nopts);
         for (note.options) |o| {
-            if (o.number == options.number.observe) first_seq = observe.decodeValue(o.value);
+            if (o.number == options.number.observe) first_seq = try observe.decodeValue(o.value);
         }
     }
-    try testing.expectEqual(Registry_Update.stale, reg_table.notify(reg.token, 1, first_seq).?);
+    // Same client-local instant as the two notifications above, deliberately:
+    // RFC 7641 §3.4's third condition makes ANY notification fresh once 128 s
+    // have passed since the freshest one, so advancing this clock would turn the
+    // replay into a legitimate re-delivery and disarm the assertion below
+    // without changing a line of it.
+    try testing.expectEqual(Registry_Update.stale, reg_table.notify(reg.token, 1, first_seq, 1_000_000).?);
 }
 
 const Registry_Update = observe.Registry.Update;

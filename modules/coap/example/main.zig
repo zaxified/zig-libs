@@ -14,7 +14,23 @@ const std = @import("std");
 const coap = @import("coap");
 
 pub fn main() !void {
-    var client = coap.client.Client.init(0x1000, 0x40);
+    // The token seed is CSPRNG-drawn, and on an unsecured transport it must be.
+    // Both of `Client`'s counters advance by one per request, so the token
+    // carries exactly the unpredictability of this seed — and RFC 7252 §11.4's
+    // whole defence against an off-path attacker injecting a response is that it
+    // "has to guess both the Message ID and the Token". Seeded with a constant,
+    // every later exchange's pair is arithmetic. This example used to hard-code
+    // both seeds, which is the wrong thing for a reader to copy.
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var seed: [10]u8 = undefined;
+    try io.randomSecure(&seed);
+    var client = coap.client.Client.init(
+        std.mem.readInt(u16, seed[0..2], .big),
+        std.mem.readInt(u64, seed[2..10], .big),
+    );
     var opts_buf: [16]coap.Option = undefined;
     var scratch: [128]u8 = undefined;
     var out: [256]u8 = undefined;

@@ -39,6 +39,11 @@ pub const Params = struct {
     ack_timeout_ms: u32 = 2000,
     /// ACK_RANDOM_FACTOR as permille (1500 = 1.5). The initial timeout is
     /// chosen uniformly in `[ack_timeout, ack_timeout × factor]`.
+    ///
+    /// RFC 7252 §4.8 requires this to be greater than 1. Nothing here can
+    /// enforce that — `Params` is a plain struct — so `Retransmit.init` clamps
+    /// anything below `1000` UP to `1000`, which means "no jitter". Without the
+    /// clamp the `factor - 1000` underflows and the process dies.
     ack_random_factor_permille: u32 = 1500,
     /// MAX_RETRANSMIT — retransmissions before giving up (4 ⇒ 5 sends total).
     max_retransmit: u8 = 4,
@@ -95,11 +100,24 @@ pub const Retransmit = struct {
     /// production (so peers don't sync retransmits), a fixed one in tests.
     pub fn init(params: Params, now_ms: u64, jitter_permille: u32) Retransmit {
         const base: u64 = params.ack_timeout_ms;
-        const span_ms: u64 = base * (params.ack_random_factor_permille - 1000) / 1000;
+        // RFC 7252 §4.8 requires ACK_RANDOM_FACTOR > 1, and nothing validates
+        // `Params` — it is a plain public struct a deployment fills in by hand.
+        // The obvious spellings of "no jitter" (0, or 1 meaning 1.0) are both
+        // below 1000, and `factor - 1000` on a `u32` then underflows to ~4.29e9,
+        // which the `@intCast` below turns into a panic in Debug and UB in
+        // ReleaseFast. Clamping is the right answer rather than rejecting: the
+        // clamped value IS "no jitter", which is what such a caller meant, and
+        // it keeps `init` infallible for the many callers that pass the spec
+        // defaults. See CHANGELOG 2026-09-03.
+        const factor: u64 = @max(params.ack_random_factor_permille, 1000);
+        const span_ms: u64 = base * (factor - 1000) / 1000;
         const initial: u64 = base + span_ms * @min(jitter_permille, 1000) / 1000;
         return .{
             .params = params,
-            .timeout_ms = @intCast(initial),
+            // Saturating, for the same reason `poll` doubles saturatingly: an
+            // `ack_timeout_ms` near `maxInt(u32)` with a large factor overflows
+            // the window type, and a wrapped window is worse than a long one.
+            .timeout_ms = std.math.lossyCast(u32, initial),
             .deadline_ms = now_ms + initial,
         };
     }
@@ -116,7 +134,14 @@ pub const Retransmit = struct {
             return .timed_out;
         }
         self.retransmits += 1;
-        self.timeout_ms *= 2;
+        // Saturating. `max_retransmit` is a `u8`, so a deployment on a lossy
+        // link may legitimately set it to ~30; with the 2000 ms base the window
+        // leaves `u32` at retransmit #22. A wrapping `*=` does not merely
+        // mis-time the next send — it eventually reaches ZERO, and a zero-length
+        // window makes `poll` return `.retransmit` on every call, i.e. a
+        // self-inflicted packet storm at the moment the network is worst. RFC
+        // 7252 §4.2's backoff is monotone by design; saturating keeps it so.
+        self.timeout_ms *|= 2;
         self.deadline_ms = now_ms + self.timeout_ms;
         return .retransmit;
     }
@@ -299,6 +324,48 @@ test "Retransmit: custom max_retransmit gives exactly that many retransmits" {
     try testing.expectEqual(Retransmit.Action.waiting, rt.poll(13999));
     try testing.expectEqual(Retransmit.Action.timed_out, rt.poll(14000));
     try testing.expect(rt.isDone());
+}
+
+test "Retransmit: the backoff is MONOTONE to the end of a long schedule, never wrapping" {
+    // `max_retransmit` is a u8 and documented as tunable; a lossy link raising
+    // it to ~30 is ordinary. With the 2000 ms base the window leaves u32 at
+    // retransmit #22, and a wrapping double reaches ZERO by #28 — after which
+    // `poll` answers `.retransmit` on every call, a packet storm. The default
+    // schedule (4) is three orders of magnitude short of the boundary, so
+    // nothing in the suite used to go anywhere near it.
+    var rt = Retransmit.init(.{ .max_retransmit = 40 }, 0, 0);
+    var now: u64 = 0;
+    var prev: u32 = rt.timeout_ms;
+    try testing.expectEqual(@as(u32, 2000), prev);
+    var n: usize = 0;
+    while (n < 40) : (n += 1) {
+        now = rt.deadline_ms;
+        try testing.expectEqual(Retransmit.Action.retransmit, rt.poll(now));
+        // The window never shrinks, and in particular never falls back under
+        // the base — the shape a wrap produces.
+        try testing.expect(rt.timeout_ms >= prev);
+        try testing.expect(rt.timeout_ms >= 2000);
+        prev = rt.timeout_ms;
+    }
+    // Saturated rather than wrapped: 2000 · 2^40 is far past u32.
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), rt.timeout_ms);
+    try testing.expectEqual(Retransmit.Action.timed_out, rt.poll(rt.deadline_ms));
+}
+
+test "Retransmit.init: an ACK_RANDOM_FACTOR below 1 is clamped, not an underflow" {
+    // RFC 7252 §4.8 requires ACK_RANDOM_FACTOR > 1 and nothing validates
+    // `Params`. Both obvious spellings of "no jitter" are below 1000 and used
+    // to underflow `factor - 1000` on a u32 — a panic in Debug, UB in
+    // ReleaseFast (observed as both a SIGSEGV and a runaway, which is what UB
+    // looks like). The clamped result is exactly "no jitter": the base timeout.
+    for ([_]u32{ 0, 1, 999, 1000 }) |bad| {
+        const rt = Retransmit.init(.{ .ack_random_factor_permille = bad }, 0, 1000);
+        try testing.expectEqual(@as(u32, 2000), rt.timeout_ms);
+        try testing.expectEqual(@as(u64, 2000), rt.deadline_ms);
+    }
+    // A legal factor still jitters, so the clamp did not flatten the feature.
+    const ok = Retransmit.init(.{ .ack_random_factor_permille = 1500 }, 0, 1000);
+    try testing.expectEqual(@as(u32, 3000), ok.timeout_ms);
 }
 
 test "Dedup: fresh, duplicate, and expiry from first sight" {

@@ -305,6 +305,24 @@ test "Assembler: in-order 0..N assembly still works" {
     try testing.expectEqualStrings("0123456789abcdefghijklmnopqrstuvwxyz", asm_.payload());
 }
 
+test "TEETH: re-accepting an earlier block never SHRINKS the assembled coverage" {
+    // `if (end > self.len) self.len = end;` — the guard is the monotonicity that
+    // keeps a retransmitted or short duplicate block from truncating what is
+    // already assembled. Reduced to a bare `self.len = end;` the whole suite
+    // stayed green, because no test ever re-sent a block.
+    var buf: [64]u8 = undefined;
+    var asm_ = Assembler.init(&buf);
+    try asm_.accept(.{ .num = 0, .more = true, .szx = 0 }, "0123456789ABCDEF");
+    try asm_.accept(.{ .num = 1, .more = false, .szx = 0 }, "GHIJ");
+    try testing.expectEqualStrings("0123456789ABCDEFGHIJ", asm_.payload());
+
+    // A duplicate of block 0 — same offset, fewer bytes than are already
+    // assembled beyond it. Coverage must not go backwards.
+    try asm_.accept(.{ .num = 0, .more = true, .szx = 0 }, "0123456789ABCDEF");
+    try testing.expectEqualStrings("0123456789ABCDEFGHIJ", asm_.payload());
+    try testing.expectEqual(@as(usize, 20), asm_.payload().len);
+}
+
 test "Assembler: a gap between blocks is rejected" {
     var store: [4096]u8 = undefined;
     var asm_ = Assembler.init(&store);

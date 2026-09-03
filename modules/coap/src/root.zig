@@ -499,6 +499,29 @@ test "payload: marker parses, serialize re-emits it, lone 0xFF errors" {
     try testing.expectError(error.EmptyPayload, parse(&lone_marker, &opts));
 }
 
+test "TEETH: the accumulated option number cannot escape u16" {
+    // `number` accumulates deltas in a wide integer and is then `@intCast` to
+    // u16 — silent truncation in ReleaseFast if the guard above it goes. Nothing
+    // in the suite drove the accumulator past 65535, so the guard SPEC.md lists
+    // under "typed errors, never panics" was never once exercised. Ten bytes are
+    // enough: two chained nibble-14 delta extensions of 65024+269 each, which
+    // lands on 130586.
+    const wire = [_]u8{
+        0x40, 0x01, 0x00, 0x01, // ver 1, CON, TKL 0, GET, mid 1
+        0xE0, 0xFE, 0x00, // delta nibble 14, ext 0xFE00 → +65293
+        0xE0, 0xFE, 0x00, // again → 130586, past u16
+    };
+    var opts: [8]Option = undefined;
+    try testing.expectError(error.BadOption, parse(&wire, &opts));
+
+    // One extension alone stays inside u16 and parses, so the rejection above is
+    // the ACCUMULATOR crossing the boundary and not the extension form itself.
+    var opts2: [8]Option = undefined;
+    const ok = try parse(wire[0..7], &opts2);
+    try testing.expectEqual(@as(usize, 1), ok.options.len);
+    try testing.expectEqual(@as(u16, 65293), ok.options[0].number);
+}
+
 test "parse errors" {
     var opts: [1]Option = undefined;
     // 3-byte buffer.
