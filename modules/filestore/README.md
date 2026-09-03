@@ -76,9 +76,14 @@ defer kl.unlock();
 - **Crash safety.** Every write lands in a hidden `.<key>-<n>.part` temp
   (`n` = a process-local atomic counter, so two writers in the same process
   never collide on the same temp path) and is made visible by a single
-  `rename(2)`. A crash mid-write leaves only an orphaned temp — never listed
+  `rename(2)`, with an `fsync` of the temp before it and of the directory
+  after. A crash mid-write leaves only an orphaned temp — never listed
   (hidden files are skipped), never read (its name is not a valid key), never
-  a torn live record.
+  a torn live record — and a `putBytes` that returned is on stable media.
+  Both `fsync`s matter and neither is implied by `rename`: without the first
+  the directory entry can point at blocks that were never written, without
+  the second the rename itself can be lost. Two `fsync`s per write is the
+  price; verify with `strace -e trace=rename,fsync` on the example.
 - **Path safety.** `kind` and `key` must each be a safe single segment
   (`segmentSafe`: `[A-Za-z0-9._-]`, no leading dot, no `.`/`..`), checked on
   *every* public entry point, so a request can never traverse out of `base`.

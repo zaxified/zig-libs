@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — Drift re-audit. **Writes are now `fsync`ed: the temp before
+  the rename, the directory after it.** The module described itself as a
+  "DB-less **durable** keyed document store" with "crash safety by
+  construction" and issued **no `fsync` at all** — measured on its own example
+  with `strace`: 5 renames, 0 fsyncs. Temp-then-rename without those two syncs
+  buys tear avoidance and nothing else: a reader never sees a half-written
+  record, but after a power loss a `putBytes` that RETURNED can be missing
+  entirely (the rename was never durable) or present over blocks that were
+  never written. The word `fsync` appeared nowhere in the module, its SPEC or
+  its README. The sibling `blobstore` — same shape, same store-a-file-then-
+  rename — has fsynced its temp since its own audit ("durability: fsync before
+  it becomes visible"); this module never followed. Re-measured after the fix:
+  5 renames, **10 fsyncs**. ⚠ The directory `fsync` needs the directory
+  re-opened with `.iterate = true`: std's default handle is `O_PATH`, which
+  cannot be fsynced at all. That workaround is `kv`'s `FsStorage.vSyncDir`,
+  reused rather than re-derived, and the existing suite pins it — dropping
+  `.iterate` turns `zig build test-filestore` red.
 - **2026-08-18** — New `Store.ttl: bool = true` option: set it `false` on a store that
   never calls `putWithTTL` to skip the `.expiry` sidecar probe on every `getBytes`
   (was unconditional — an extra syscall per get, doubling the cost of a

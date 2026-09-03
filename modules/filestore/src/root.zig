@@ -12,6 +12,11 @@
 //! never collide on the same temp path) and is made visible by a single
 //! `rename(2)` — atomic on POSIX. A crash mid-write leaves only an orphaned
 //! temp (never listed, never read); a live record is never torn or partial.
+//! The temp is `fsync`ed BEFORE the rename and the directory `fsync`ed
+//! after it, so a `putBytes` that returned survives a power loss — without
+//! those two, temp-then-rename buys tear avoidance only, and this module
+//! issued neither until 2026-09-03 while calling itself durable (measured
+//! on its own example with `strace`: 5 renames, 0 fsyncs; now 5 and 10).
 //!
 //! **Path safety.** `kind` and `key` are each validated by `segmentSafe`
 //! (`[A-Za-z0-9._-]`, no leading dot, no `.`/`..`, no `/`), checked on every
@@ -214,7 +219,33 @@ pub const Store = struct {
         var tbuf: [896]u8 = undefined;
         const tmp = try std.fmt.bufPrint(&tbuf, "{s}/.{s}-{s}.part", .{ dir, name, uniq });
         const cwd = std.Io.Dir.cwd();
-        try cwd.writeFile(self.io, .{ .sub_path = tmp, .data = bytes });
+
+        // `writeFile` + `rename` alone is NOT crash safety, only tear
+        // avoidance: it stops a reader seeing a half-written record, and
+        // that is all it stops. Without an `fsync` of the temp before the
+        // rename, a crash can leave the directory entry pointing at blocks
+        // that were never written; without an `fsync` of the DIRECTORY
+        // after it, the rename itself is not durable, so a `putBytes` that
+        // RETURNED can be missing entirely after a power loss. This module
+        // called itself a "durable" store and issued no `fsync` at all --
+        // measured on its own example with `strace`: 5 renames, 0 fsyncs --
+        // while the sibling `blobstore`, same shape, has fsynced its temp
+        // since its own audit ("durability: fsync before it becomes
+        // visible"). Both syncs are here now; the directory one is the half
+        // `blobstore` is still missing.
+        {
+            const f = try cwd.createFile(self.io, tmp, .{ .truncate = true });
+            errdefer {
+                f.close(self.io);
+                cwd.deleteFile(self.io, tmp) catch {};
+            }
+            var wbuf: [64 * 1024]u8 = undefined;
+            var fw = f.writer(self.io, &wbuf);
+            try fw.interface.writeAll(bytes);
+            try fw.interface.flush();
+            try f.sync(self.io);
+            f.close(self.io);
+        }
 
         var pbuf: [896]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, name });
@@ -222,6 +253,20 @@ pub const Store = struct {
             cwd.deleteFile(self.io, tmp) catch {};
             return e;
         };
+        try self.syncDir(dir);
+    }
+
+    /// `fsync` a directory, so a `rename` into it is durable.
+    ///
+    /// The directory must be re-opened with `.iterate = true`: std's default
+    /// for a plain directory handle is `O_PATH`, which cannot be fsynced at
+    /// all (`EBADF`). Same reasoning, and same workaround, as `kv`'s
+    /// `FsStorage.vSyncDir` -- taken from there rather than re-derived.
+    fn syncDir(self: Store, dir: []const u8) !void {
+        var d = try std.Io.Dir.cwd().openDir(self.io, dir, .{ .iterate = true });
+        defer d.close(self.io);
+        const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
+        try as_file.sync(self.io);
     }
 
     /// Write (overwrite) `bytes` as `<base>/<kind>/<key>`, atomically (temp +

@@ -8,8 +8,15 @@ thin typed-JSON convenience layer (`put`/`get`/`listTyped`) over the same raw-by
 (`putBytes`/`getBytes`/`list`/`delete`) — no forced file extension, no separate directory tree for
 the typed API. Crash safety: every write lands in a hidden `.<key>-<n>.part` temp (`n` a
 process-local atomic counter, so two writers in the same process never collide) and is made visible
-by a single `rename(2)` — a crash mid-write leaves only an orphaned temp, never listed (hidden files
-skipped), never read (its name is not a valid key), never a torn live record. Path safety: `kind`
+by a single `rename(2)`, with an `fsync` of the temp before the rename and of the directory after —
+a crash mid-write leaves only an orphaned temp, never listed (hidden files skipped), never read (its
+name is not a valid key), never a torn live record, and a `putBytes` that returned is on stable
+media. ⚠ Until 2026-09-03 there were **no fsyncs at all** (measured on the example with `strace`:
+5 renames, 0 fsyncs), so "crash safety" covered concurrent readers and not crashes, while the
+module's own one-line description said "durable". The sibling `blobstore` had fsynced its temp
+since its own audit and this module never followed; `blobstore` is still missing the directory
+half. Re-take the reading with `strace -e trace=rename,renameat,fsync` on `run-example-filestore`:
+5 renames, 10 fsyncs. Path safety: `kind`
 and `key` must each pass `segmentSafe` (`[A-Za-z0-9._-]`, no leading dot, no `.`/`..`) on every
 public entry point, so a request can never traverse out of `base`. `listTyped` tolerance:
 unparseable files are skipped rather than failing the whole listing, but the `skipped` count is
