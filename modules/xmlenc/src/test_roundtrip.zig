@@ -14,6 +14,7 @@ const std = @import("std");
 const xml = @import("xml");
 const rsa = @import("rsa");
 const xmlenc = @import("root.zig");
+const testing = std.testing;
 
 const aes = std.crypto.core.aes;
 const Sha1 = std.crypto.hash.Sha1;
@@ -372,6 +373,295 @@ test "round-trip: RSAES-PKCS1-v1_5 gated by allow_weak_rsa15" {
 }
 
 // ── teeth (with positive controls above) ────────────────────────────────────
+
+/// Peak LIVE bytes, not a cumulative total. A cumulative counter cannot tell
+/// "one copy of the input at a time" from "three at once", which is exactly the
+/// distinction a work bound is about.
+const PeakAllocator = struct {
+    child: std.mem.Allocator,
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn alloc(ctx: *anyopaque, n: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(n, a, ra) orelse return null;
+        self.live += n;
+        self.peak = @max(self.peak, self.live);
+        return p;
+    }
+    fn resize(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(buf, a, n, ra)) return false;
+        self.live = self.live - buf.len + n;
+        self.peak = @max(self.peak, self.live);
+        return true;
+    }
+    fn remap(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(buf, a, n, ra) orelse return null;
+        self.live = self.live - buf.len + n;
+        self.peak = @max(self.peak, self.live);
+        return p;
+    }
+    fn free(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(buf, a, ra);
+        self.live -= buf.len;
+    }
+    fn allocator(self: *PeakAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+};
+
+fn hugeCipherValueDoc(alloc: std.mem.Allocator, chars: usize, on_key: bool) ![]u8 {
+    const junk = try alloc.alloc(u8, chars);
+    defer alloc.free(junk);
+    @memset(junk, 'A');
+    const small = "QUFB";
+    return buildEncryptedData(
+        alloc,
+        "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
+        "http://www.w3.org/2001/04/xmlenc#rsa-1_5",
+        if (on_key) junk else small,
+        if (on_key) small else junk,
+    );
+}
+
+test "TEETH (F2): the CipherValue caps bound the WORK, not just the decoded size" {
+    // The caps were real and enforced and bounded the wrong quantity. The route
+    // used to be `textContent(alloc)` — one full copy of the attacker's text —
+    // then an ArrayList grown byte by byte — a second — and only THEN the size
+    // check. Measured before the fix: the EncryptedKey's 1024-byte ceiling
+    // admitted 191,005,769 bytes of peak live allocation and 474 ms from one
+    // 64 MB unauthenticated document, 186,000x the stated bound, all of it
+    // before the private key is touched. `saml`'s EncryptedAssertion path
+    // reaches here pre-authentication.
+    var kp = try makeKey();
+    defer kp.secret_key.deinit();
+
+    const chars = 1 << 21; // 2 MiB of base64, ~2048x the key cap
+    for ([_]bool{ true, false }) |on_key| {
+        const doc_src = try hugeCipherValueDoc(testing.allocator, chars, on_key);
+        defer testing.allocator.free(doc_src);
+
+        var tracker = PeakAllocator{ .child = testing.allocator };
+        const a = tracker.allocator();
+        var doc = try xml.parse(a, doc_src, .{});
+        defer doc.deinit();
+
+        // Measure only what decryptData ADDS on top of the parsed document —
+        // those bytes are the caller's own input and are already resident.
+        const after_parse = tracker.live;
+        tracker.peak = tracker.live;
+        // A small content cap so BOTH arms are over their bound; the point is
+        // that a cap is a bound on work, whatever its value. (At the 4 MiB
+        // default a 2 MiB content CipherValue is legitimately under the cap and
+        // is supposed to be decoded.)
+        const r = xmlenc.decryptData(a, doc.root, kp.secret_key, .{
+            .allow_weak_rsa15 = true,
+            .max_ciphertext_len = 4096,
+        });
+        if (r) |p| a.free(p) else |_| {}
+        const added = tracker.peak - after_parse;
+
+        // Generous: the key path now adds a handful of bytes and the content
+        // path refuses before allocating. Anything approaching the input size
+        // means the source is being copied before it is bounded again.
+        if (added > chars / 8) {
+            std.debug.print(
+                "{s} CipherValue: {d} base64 chars added {d} peak live bytes — the cap is not bounding the work\n",
+                .{ if (on_key) "KEY" else "CONTENT", chars, added },
+            );
+            return error.CapDoesNotBoundTheWork;
+        }
+    }
+}
+
+test "TEETH (F5): a second CipherData or CipherValue is refused, as xmlsec1 refuses it" {
+    // Measured against the C reference: `xmlsec1 --decrypt` fails on a document
+    // with two CipherData or two CipherValue children, while a first-match
+    // search here decrypted the first one happily. Two implementations reading
+    // the same document and disagreeing about whether it is valid at all is
+    // signature wrapping's shape one layer down.
+    var kp = try makeKey();
+    defer kp.secret_key.deinit();
+
+    const dup_cipher_data = try std.fmt.allocPrint(testing.allocator,
+        \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}">
+        \\  <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+        \\  <ds:KeyInfo><xenc:EncryptedKey>
+        \\    <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/>
+        \\    <xenc:CipherData><xenc:CipherValue>QUFB</xenc:CipherValue></xenc:CipherData>
+        \\  </xenc:EncryptedKey></ds:KeyInfo>
+        \\  <xenc:CipherData><xenc:CipherValue>QUFB</xenc:CipherValue></xenc:CipherData>
+        \\  <xenc:CipherData><xenc:CipherValue>QkJC</xenc:CipherValue></xenc:CipherData>
+        \\</xenc:EncryptedData>
+    , .{ xenc_ns, ds_ns });
+    defer testing.allocator.free(dup_cipher_data);
+
+    const dup_cipher_value = try std.fmt.allocPrint(testing.allocator,
+        \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}">
+        \\  <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+        \\  <ds:KeyInfo><xenc:EncryptedKey>
+        \\    <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/>
+        \\    <xenc:CipherData><xenc:CipherValue>QUFB</xenc:CipherValue></xenc:CipherData>
+        \\  </xenc:EncryptedKey></ds:KeyInfo>
+        \\  <xenc:CipherData>
+        \\    <xenc:CipherValue>QUFB</xenc:CipherValue>
+        \\    <xenc:CipherValue>QkJC</xenc:CipherValue>
+        \\  </xenc:CipherData>
+        \\</xenc:EncryptedData>
+    , .{ xenc_ns, ds_ns });
+    defer testing.allocator.free(dup_cipher_value);
+
+    for ([_][]const u8{ dup_cipher_data, dup_cipher_value }) |src| {
+        var doc = try xml.parse(testing.allocator, src, .{});
+        defer doc.deinit();
+        try testing.expectError(
+            error.MalformedStructure,
+            xmlenc.decryptData(testing.allocator, doc.root, kp.secret_key, .{ .allow_weak_rsa15 = true }),
+        );
+    }
+}
+
+test "TEETH (F1): the structural refusals nothing used to reach" {
+    // Nine `return error.…` guards in this module could each be deleted with
+    // the whole suite green, four of them memory-safety bounds on lengths the
+    // peer chooses. The reason is the one the prior audit already wrote down
+    // about this file: a corpus of VALID documents cannot exercise a refusal.
+    // These are the shapes, one per guard.
+    var kp = try makeKey();
+    defer kp.secret_key.deinit();
+    const opts: xmlenc.Options = .{ .allow_weak_rsa15 = true };
+
+    const Case = struct { name: []const u8, src: []const u8, want: anyerror, kek_len: usize = 32 };
+    const cases = [_]Case{
+        .{
+            .name = "the root element is not EncryptedData",
+            .want = error.MalformedStructure,
+            .src =
+            \\<xenc:NotEncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"/>
+            ,
+        },
+        .{
+            .name = "AES-KW blob under 24 bytes (the usize-underflow bound)",
+            .want = error.DecryptionError,
+            .src =
+            \\<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+            \\<ds:KeyInfo><xenc:EncryptedKey>
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes256"/>
+            \\<xenc:CipherData><xenc:CipherValue>QQ==</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedKey></ds:KeyInfo>
+            \\<xenc:CipherData><xenc:CipherValue>QUFBQUFBQUFBQUFBQUFBQQ==</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedData>
+            ,
+        },
+        .{
+            .name = "GCM content shorter than IV+tag",
+            .want = error.DecryptionError,
+            .src =
+            \\<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes256-gcm"/>
+            \\<ds:KeyInfo><xenc:EncryptedKey>
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/>
+            \\<xenc:CipherData><xenc:CipherValue>QUFB</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedKey></ds:KeyInfo>
+            \\<xenc:CipherData><xenc:CipherValue>QUFB</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedData>
+            ,
+        },
+        .{
+            .name = "CBC content that is not a whole number of blocks",
+            .want = error.DecryptionError,
+            .src =
+            \\<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+            \\<ds:KeyInfo><xenc:EncryptedKey>
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/>
+            \\<xenc:CipherData><xenc:CipherValue>QUFB</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedKey></ds:KeyInfo>
+            \\<xenc:CipherData><xenc:CipherValue>QUFBQUFBQUFBQUFBQUFBQUFBQQ==</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedData>
+            ,
+        },
+        .{
+            .name = "an unrecognised OAEP DigestMethod is refused, not defaulted",
+            .want = error.UnsupportedAlgorithm,
+            .src =
+            \\<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+            \\<ds:KeyInfo><xenc:EncryptedKey>
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep">
+            \\<ds:DigestMethod Algorithm="http://example.invalid/not-a-digest"/>
+            \\</xenc:EncryptionMethod>
+            \\<xenc:CipherData><xenc:CipherValue>QUFB</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedKey></ds:KeyInfo>
+            \\<xenc:CipherData><xenc:CipherValue>QUFB</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedData>
+            ,
+        },
+        .{
+            .name = "a KEK of the wrong length for the declared kw algorithm",
+            .want = error.UnsupportedAlgorithm,
+            .kek_len = 16,
+            .src =
+            \\<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
+            \\<ds:KeyInfo><xenc:EncryptedKey>
+            \\<xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes256"/>
+            \\<xenc:CipherData><xenc:CipherValue>QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ==</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedKey></ds:KeyInfo>
+            \\<xenc:CipherData><xenc:CipherValue>QUFB</xenc:CipherValue></xenc:CipherData>
+            \\</xenc:EncryptedData>
+            ,
+        },
+    };
+
+    for (cases) |c| {
+        var doc = try xml.parse(testing.allocator, c.src, .{});
+        defer doc.deinit();
+        // Two of the cases are about AES-KW and need a KEK present: one with
+        // the right length (so the blob's own length is the only thing that can
+        // reject it) and one with the wrong one.
+        const kek = [_]u8{0} ** 32;
+        var o = opts;
+        o.kek = kek[0..c.kek_len];
+        const r = xmlenc.decryptData(testing.allocator, doc.root, kp.secret_key, o);
+        testing.expectError(c.want, r) catch |e| {
+            std.debug.print("xmlenc did not refuse: {s}\n", .{c.name});
+            if (r) |p| testing.allocator.free(p) else |_| {}
+            return e;
+        };
+    }
+}
+
+test "TEETH (F1): the content EncryptionMethod really does bind the recovered key length" {
+    // `cek.len != content.key_len` used to be a separate check one frame up in
+    // `decryptData`; it is now folded into the unwrap's validity mask, which is
+    // where the anti-oracle work needed it. Either way nothing exercised it: a
+    // valid-only corpus never presents an AES-128 key under an AES-256 content
+    // algorithm.
+    var kp = try makeKey();
+    defer kp.secret_key.deinit();
+
+    const cek16 = [_]u8{0xAB} ** 16;
+    const wrapped = try oaepWrapCek(testing.allocator, Sha1, kp.public_key, &cek16);
+    defer testing.allocator.free(wrapped);
+
+    // A 16-byte CEK offered to AES-256-GCM. Whatever the content bytes are, the
+    // answer must be the generic error and never a decryption with a short key.
+    const content = [_]u8{0} ** 64;
+    try testing.expectError(error.DecryptionError, roundTrip(
+        testing.allocator,
+        "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+        "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
+        wrapped,
+        &content,
+        kp.secret_key,
+        .{},
+    ));
+}
 
 test "teeth: GCM tag tampering -> DecryptionError" {
     const a = std.testing.allocator;
@@ -902,4 +1192,51 @@ test "Z1: the CBC plaintext scratch is wiped before it goes back to the allocato
     // so this test does not itself hand the plaintext back unwiped.
     std.crypto.secureZero(u8, out);
     sa.free(out);
+}
+
+test "Z1: decryptDataToDocument wipes the plaintext IT frees, not just the ones decryptData does" {
+    // Same reasoning and the same ReleaseFast gate as the test above.
+    //
+    // `decryptDataToDocument` allocates the recovered assertion, parses it, and
+    // FREES it itself — it never hands it to the caller, so wiping it is this
+    // function's job, not the caller's. The repo-wide zeroization pass that put
+    // the wipes inside `decryptData` (and wrote the paragraph on its doc comment
+    // saying "every buffer *this* module frees on the way there ... is wiped
+    // here") walked past this sibling three lines below it. Measured before the
+    // fix: 1 of 12 released blocks still held the whole assertion.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    const kp = try makeKey();
+    const cek = [_]u8{0x3B} ** 32;
+    const wrapped = try oaepWrapCek(a, Sha1, kp.public_key, &cek);
+    defer a.free(wrapped);
+    const content = try cbcEncrypt(a, aes.Aes256, cek, plaintext_assertion);
+    defer a.free(content);
+    const cek_b64 = try b64(a, wrapped);
+    defer a.free(cek_b64);
+    const content_b64 = try b64(a, content);
+    defer a.free(content_b64);
+    const doc_src = try buildEncryptedData(a, xenc_ns ++ "aes256-cbc", xenc_ns ++ "rsa-oaep-mgf1p", cek_b64, content_b64);
+    defer a.free(doc_src);
+
+    var outer = try xml.parse(a, doc_src, .{});
+    defer outer.deinit();
+
+    var scan = FreeScanner{ .child = a, .needle = "the recovered assertion body" };
+    const sa = scan.allocator();
+    var inner = try xmlenc.decryptDataToDocument(sa, outer.root, kp.secret_key, .{});
+    // Snapshot BEFORE `inner.deinit()`. The returned document legitimately
+    // holds the assertion — it is the caller's to destroy (§2.1 Z2) — so
+    // letting the scanner see its arena go back would make this test fail for
+    // a reason it is not about.
+    const frees_seen = scan.frees_seen;
+    const leaked = scan.leaked_plaintext;
+    inner.deinit();
+
+    try std.testing.expect(frees_seen > 0);
+    if (leaked) {
+        std.debug.print("decryptDataToDocument released a block still holding the recovered assertion\n", .{});
+        return error.PlaintextSurvivedFree;
+    }
 }

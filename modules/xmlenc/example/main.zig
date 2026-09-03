@@ -123,7 +123,13 @@ pub fn main() !void {
         var doc = try xml.parse(gpa, encrypted_gcm, .{});
         defer doc.deinit();
         const out = try xmlenc.decryptData(gpa, doc.root, sk, .{});
-        defer gpa.free(out);
+        // CONVENTIONS §2.1 Z2: `decryptData`'s doc comment says the returned
+        // plaintext is the caller's to destroy, and this example is a caller —
+        // the pattern an integrator copies. It used to free it bare.
+        defer {
+            std.crypto.secureZero(u8, out);
+            gpa.free(out);
+        }
         std.debug.print("decrypted {d} bytes: {s}\n", .{ out.len, out });
         if (!std.mem.eql(u8, out, expected_plaintext)) return error.UnexpectedPlaintext;
     }

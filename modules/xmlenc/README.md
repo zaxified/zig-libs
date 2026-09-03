@@ -18,7 +18,8 @@ specifications. No third-party XML-Enc implementation was consulted, so no
 ## Supported algorithms
 
 - **Key transport:** `rsa-oaep-mgf1p` (SHA-1), xenc11 `rsa-oaep` (SHA-1/SHA-256,
-  MGF matching the digest), and — gated behind `allow_weak_rsa15` —
+  DigestMethod and MGF resolved INDEPENDENTLY, MGF defaulting to MGF1-SHA1
+  when the element is absent whatever the digest is), and — gated behind `allow_weak_rsa15` —
   `rsa-1_5`. Optional `kw-aes128`/`kw-aes256` symmetric key wrap (RFC 3394) when
   a KEK is supplied.
 - **Content:** `aes128-cbc`, `aes256-cbc`, `aes128-gcm`, `aes256-gcm`. AES-192
@@ -53,7 +54,11 @@ returns an owned `xml.Document`.
 ## Security
 
 Decrypts attacker-influenced ciphertext. All cryptographic failures collapse to
-a single generic `error.DecryptionError` (no padding/oracle signal); `rsa-1_5`
+a single generic `error.DecryptionError`, and a failed key unwrap still
+decrypts the content with a decoy CEK so the two outcomes cost the same work —
+collapsing the error VALUE is not the same as collapsing the WORK, and only the
+first of those used to be true (see SPEC.md §Constant-time posture for the arm
+that is still open); `rsa-1_5`
 and AES-CBC carry the documented Bleichenbacher / padding-oracle caveats; the
 safe composition is **decrypt → signature-verify**. The recovered CEK is
 zeroized after use. Never panics. Full detail in `SPEC.md`.

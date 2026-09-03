@@ -712,7 +712,9 @@ fn processEncryptedAssertion(
         // Everything else (DecryptionError, UnsupportedAlgorithm,
         // MalformedStructure, WeakRsa15NotAllowed, CipherReferenceUnsupported,
         // KekNotProvided, CiphertextTooLarge) collapses to one generic error —
-        // no oracle signal, mirroring xmlenc's own posture.
+        // and `xmlenc` does the same work either way (it decrypts the content
+        // with a decoy CEK when the key unwrap fails), so the collapse is of the
+        // work as well as the value. See `xmlenc`'s `Unwrapped`.
         else => return error.AssertionDecryptionFailed,
     };
     // CONVENTIONS §2.1 Z1: the recovered `<saml:Assertion>` — the subject's

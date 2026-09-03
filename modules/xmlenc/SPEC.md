@@ -29,7 +29,7 @@ Also out of scope, and actively rejected:
 | URI | Meaning | Gate |
 |-----|---------|------|
 | `…2001/04/xmlenc#rsa-oaep-mgf1p` | RSAES-OAEP, MGF1-SHA1, label-hash SHA-1 | default |
-| `…2009/xmlenc11#rsa-oaep` | RSAES-OAEP, DigestMethod ∈ {SHA-1, SHA-256}, MGF matches digest | default |
+| `…2009/xmlenc11#rsa-oaep` | RSAES-OAEP, DigestMethod ∈ {SHA-1, SHA-256} and MGF ∈ {MGF1-SHA-1, MGF1-SHA-256} resolved **independently** — MGF defaults to MGF1-SHA1 when absent, whatever the digest is (RFC 8017 treats them as separate parameters, and real xenc11 configs pair SHA-256 with MGF1-SHA-1) | default |
 | `…2001/04/xmlenc#rsa-1_5` | RSAES-PKCS#1 v1.5 | **gated** by `allow_weak_rsa15` |
 | `…2001/04/xmlenc#kw-aes128` | RFC 3394 AES-128 key wrap | needs `Options.kek` (16 B) |
 | `…2001/04/xmlenc#kw-aes256` | RFC 3394 AES-256 key wrap | needs `Options.kek` (32 B) |
@@ -112,7 +112,34 @@ for A192*). The CEK length must match the content algorithm's key size, else
 
 ## Constant-time posture
 
-Scoped to `rsaPkcs1v15Unwrap`, the one place in this module that makes a
+⚠ **Scope corrected 2026-09-03: it is `decryptData`, not one callee.** This
+section used to scope itself to `rsaPkcs1v15Unwrap` and name its residual risk
+as compiler-dependent branch lowering *inside* that function. The dominant leak
+was one frame up and had nothing to do with lowering: a failed key unwrap
+returned before the content was touched at all, so a whole AES pass over an
+attacker-sized ciphertext ran on exactly one side of the conformance decision.
+Measured in ReleaseFast over a 3 MiB CBC content ciphertext, interleaved
+A/B/C: min-of-8 queries with a fixed threshold classified conforming vs
+non-conforming **194/200 = 97.0%**, with `error.DecryptionError` fully collapsed
+throughout — orders of magnitude louder than anything the mask arithmetic below
+was written to suppress, and with a strength the attacker picks, since it comes
+from the content size, which is their input.
+
+**The fix, and its limit.** A failed unwrap now returns a **decoy CEK** of the
+content algorithm's key length (`Unwrapped` in `root.zig`) and the content is
+decrypted either way; the answer is the validity mask, not what the content
+decryption happened to do. The decoy is derived from secret material — the raw
+RSA block for PKCS#1 v1.5, the KEK for AES-KW — because a predictable decoy
+would let the peer craft content that authenticates under it and read the bit
+back out of the success/failure answer. The content key-length check moved into
+the unwrap's mask for the same reason. ⛔ **OAEP still returns early.** The decoy
+needs secret material and the only secret on that path lives inside
+`rsa.decryptOaepH`, which reports failure as an error; closing it means either a
+second modular exponentiation (a louder difference than the one being closed) or
+a change to the `rsa` module's surface. Recorded, not fixed.
+
+What follows is the older, narrower analysis, which remains accurate about
+`rsaPkcs1v15Unwrap`'s own arithmetic — the one place in this module that makes a
 secret-dependent decision of its own. (GCM tag comparison is std's; AES-KW
 integrity uses `std.crypto.timing_safe.eql`; OAEP is delegated to
 `rsa.decryptOaepH`; algorithm-URI comparisons are over public strings.)

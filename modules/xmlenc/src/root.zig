@@ -123,8 +123,17 @@ pub const Error = error{
     /// The CEK could not be unwrapped, or the content did not decrypt/
     /// authenticate. Deliberately GENERIC: every cryptographic failure mode
     /// (wrong key, bad RSA/CBC padding, GCM tag mismatch, RSADP range) maps
-    /// here so no padding/oracle signal leaks (Bleichenbacher / Manger /
-    /// padding-oracle).
+    /// here (Bleichenbacher / Manger / padding-oracle).
+    ///
+    /// ⚠ Collapsing the error VALUE is only half of it, and for a long time it
+    /// was the only half here. A failed key unwrap used to return before the
+    /// content was touched, so a whole AES pass over an attacker-sized
+    /// ciphertext happened on exactly one side of the conformance decision —
+    /// measured at 97% classifier accuracy (min-of-8 queries) over a 3 MiB CBC
+    /// content ciphertext, with this value fully collapsed throughout. The
+    /// content is now decrypted with a decoy CEK on failure so both outcomes do
+    /// the same work; see `Unwrapped`, and SPEC.md for the OAEP arm that is
+    /// still open.
     DecryptionError,
     /// `rsa-1_5` key transport was used but `Options.allow_weak_rsa15` is false.
     WeakRsa15NotAllowed,
@@ -184,15 +193,29 @@ pub fn decryptData(
     // already written into the buffer — no current unwrap path copies before
     // it succeeds, but that is an accident of two callees, not a guarantee.
     defer std.crypto.secureZero(u8, cek_buf[0..]);
-    const cek = try unwrapCek(alloc, enc_key, sk, options, &cek_buf);
-    if (cek.len != content.key_len) return error.DecryptionError;
+    const un = try unwrapCek(alloc, enc_key, sk, options, &cek_buf, content.key_len);
 
-    // 4. Decrypt the content with the CEK.
-
-    return switch (content.mode) {
-        .gcm => try aesGcmDecrypt(alloc, cek, cipher),
-        .cbc => try aesCbcDecrypt(alloc, cek, cipher),
+    // 4. Decrypt the content with the CEK — INCLUDING when the unwrap failed,
+    //    in which case `un.cek` is a decoy of the right length and this pass is
+    //    what makes the two outcomes cost the same. See `Unwrapped`. The result
+    //    is thrown away below; only the work is wanted.
+    const plain = switch (content.mode) {
+        .gcm => aesGcmDecrypt(alloc, un.cek, cipher),
+        .cbc => aesCbcDecrypt(alloc, un.cek, cipher),
     };
+    if (!un.ok) {
+        // A decoy cannot authenticate a GCM tag and all but never satisfies CBC
+        // padding, so this is nearly always already an error — but "nearly" is
+        // not a guarantee, and handing back garbage as plaintext would be a
+        // worse bug than the one being fixed. The answer is decided by the
+        // mask, not by what the content decryption happened to do.
+        if (plain) |p| {
+            std.crypto.secureZero(u8, p);
+            alloc.free(p);
+        } else |_| {}
+        return error.DecryptionError;
+    }
+    return try plain;
 }
 
 /// Convenience for the SAML path: take a `<saml:EncryptedAssertion>` wrapper,
@@ -220,7 +243,17 @@ pub fn decryptDataToDocument(
     options: Options,
 ) (Error || xml.ParseError)!xml.Document {
     const plain = try decryptData(alloc, encrypted_data, sk, options);
-    defer alloc.free(plain);
+    // CONVENTIONS §2.1 Z1: this function ALLOCATES and FREES the plaintext
+    // itself and never hands it out, so wiping it is not the caller's job —
+    // it is this function's. `decryptData`'s doc comment three lines up says
+    // exactly that about its own return value, and the repo-wide zeroization
+    // pass that added the wipes inside `decryptData` walked past this sibling.
+    // Measured before the fix with a free-scanning allocator in ReleaseFast:
+    // 1 of 12 released blocks still held the whole recovered SAML assertion.
+    defer {
+        std.crypto.secureZero(u8, plain);
+        alloc.free(plain);
+    }
     return xml.parse(alloc, plain, .{ .id_attr_names = &.{"ID"} });
 }
 
@@ -247,32 +280,96 @@ const OaepHash = enum { sha1, sha256 };
 /// Unwrap the content-encryption key from an `<xenc:EncryptedKey>`. Returns a
 /// subslice of `out` holding the CEK. Never trusts any KeyInfo inside the
 /// EncryptedKey — the private key / KEK come from the caller.
+/// The largest EncryptedKey ciphertext accepted, in decoded bytes. An RSA block
+/// is at most `rsa.max_modulus_len` (512 for RSA-4096) and an AES-KW blob is
+/// 40; 1024 is generous for both and is the ceiling on the base64 source too.
+const max_wrapped_key_len: usize = 1024;
+
+/// The outcome of a key unwrap.
+///
+/// `ok = false` means the unwrap failed **cryptographically** — a non-conforming
+/// PKCS#1 block, a failed AES-KW integrity check, or a recovered key of the
+/// wrong length for the content algorithm. `cek` is then a DECOY of exactly the
+/// requested length, so the caller decrypts the content anyway and reports the
+/// same `error.DecryptionError` afterwards, having done the same work.
+///
+/// This is the RFC 8017 §7.2.2 / TLS countermeasure, and it is here because the
+/// alternative is a Bleichenbacher oracle at *caller* scope: returning early on
+/// a bad block skips an entire AES pass over an attacker-sized ciphertext, which
+/// is orders of magnitude louder than anything `rsaPkcs1v15Unwrap`'s mask
+/// arithmetic was written to suppress. Collapsing the error VALUE is not the
+/// same as collapsing the WORK.
+///
+/// The decoy must be unpredictable to the peer, or they could craft a content
+/// ciphertext that verifies under a decoy they computed themselves and read the
+/// bit back out of the success/failure answer. Each path derives it from secret
+/// material it already holds — the raw RSA block for PKCS#1 v1.5, the KEK for
+/// AES-KW.
+///
+/// ⛔ Structural failures (a missing element, an unsupported algorithm URI, a
+/// refused `rsa-1_5`) still return early. Those decisions are made on PUBLIC
+/// data — the document's shape and the caller's `Options` — so an early return
+/// discloses nothing the peer did not already choose.
+const Unwrapped = struct {
+    cek: []const u8,
+    ok: bool,
+};
+
+/// Derive a decoy CEK of `want` bytes from secret material the peer cannot
+/// compute. Domain-separated so a decoy can never collide with any other use of
+/// the same secret.
+fn decoyCek(secret: []const u8, want: usize, out: *[64]u8) []const u8 {
+    var h = Sha256.init(.{});
+    h.update("zig-libs/xmlenc decoy CEK v1");
+    h.update(secret);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &digest);
+    h.final(&digest);
+    const n = @min(want, digest.len);
+    @memcpy(out[0..n], digest[0..n]);
+    // A content algorithm wanting more than one digest is not reachable today
+    // (AES-256 is 32 bytes), but zero-filling beats returning a short slice.
+    if (want > n) @memset(out[n..want], 0);
+    return out[0..want];
+}
+
 fn unwrapCek(
     alloc: std.mem.Allocator,
     enc_key: *const xml.Element,
     sk: rsa.SecretKey,
     options: Options,
     out: *[64]u8,
-) Error![]const u8 {
+    want: usize,
+) Error!Unwrapped {
     const method = childEl(enc_key, xenc_ns, "EncryptionMethod") orelse return error.MalformedStructure;
     const alg = method.attr("", "Algorithm") orelse return error.MalformedStructure;
 
-    const wrapped = try readCipherValue(alloc, enc_key, 1024); // an RSA block / KW blob is small
+    // An RSA block or a KW blob is small, and this bound now bounds the WORK
+    // as well as the output — see `decodeBase64FromElement`. It used to bound
+    // only the decoded size, which let a 1024-byte ceiling admit 191 MB.
+    const wrapped = try readCipherValue(alloc, enc_key, max_wrapped_key_len);
     defer alloc.free(wrapped);
 
     if (eq(alg, alg_rsa_oaep_mgf1p)) {
-        return try rsaOaepUnwrap(sk, .{ .digest = .sha1, .mgf = .sha1 }, enc_key, wrapped, out);
+        // ⛔ OAEP still returns early on a decode failure — see SPEC.md
+        // §"Constant-time posture". The decoy needs secret material, and the
+        // only secret this path holds is inside `rsa.decryptOaepH`, which
+        // reports failure as an error and keeps its intermediate block; giving
+        // OAEP the same treatment means either a second modular exponentiation
+        // (a louder difference than the one being closed) or a change to the
+        // `rsa` module's surface. Recorded, not fixed.
+        return .{ .cek = try rsaOaepUnwrap(sk, .{ .digest = .sha1, .mgf = .sha1 }, enc_key, wrapped, out), .ok = true };
     } else if (eq(alg, alg_rsa_oaep)) {
         const h = try oaepHashFromMethod(method);
-        return try rsaOaepUnwrap(sk, h, enc_key, wrapped, out);
+        return .{ .cek = try rsaOaepUnwrap(sk, h, enc_key, wrapped, out), .ok = true };
     } else if (eq(alg, alg_rsa_15)) {
         if (!options.allow_weak_rsa15) return error.WeakRsa15NotAllowed;
-        return try rsaPkcs1v15Unwrap(sk, wrapped, out);
+        return try rsaPkcs1v15Unwrap(sk, wrapped, out, want);
     } else if (eq(alg, alg_kw_aes128) or eq(alg, alg_kw_aes256)) {
         const kek = options.kek orelse return error.KekNotProvided;
-        const want: usize = if (eq(alg, alg_kw_aes128)) 16 else 32;
-        if (kek.len != want) return error.UnsupportedAlgorithm;
-        return try aesKwUnwrap(kek, wrapped, out);
+        const kek_want: usize = if (eq(alg, alg_kw_aes128)) 16 else 32;
+        if (kek.len != kek_want) return error.UnsupportedAlgorithm;
+        return try aesKwUnwrap(kek, wrapped, out, want);
     }
     return error.UnsupportedAlgorithm;
 }
@@ -365,7 +462,11 @@ fn rsaOaepUnwrap(
 /// `em.len`, the loop bounds and `wrapped.len` are all functions of the public
 /// modulus length. (std does not let us hide the RSADP range check, which is on
 /// the public ciphertext anyway.)
-fn rsaPkcs1v15Unwrap(sk: rsa.SecretKey, wrapped: []const u8, out: *[64]u8) Error![]const u8 {
+fn rsaPkcs1v15Unwrap(sk: rsa.SecretKey, wrapped: []const u8, out: *[64]u8, want: usize) Error!Unwrapped {
+    // `want` is the content algorithm's key length, decided by a public
+    // algorithm URI, so refusing an impossible one here leaks nothing — and the
+    // decoy is written into `out`, which this bounds.
+    if (want == 0 or want > out.len) return error.DecryptionError;
     var em_buf: [rsa.max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &em_buf);
     const em = try rsaRawPrivate(sk, wrapped, &em_buf);
@@ -396,6 +497,12 @@ fn rsaPkcs1v15Unwrap(sk: rsa.SecretKey, wrapped: []const u8, out: *[64]u8) Error
     const msg_len = em.len - sep_idx - 1;
     good &= ~ctEqMaskUsize(msg_len, 0); // a zero-length message is not a CEK
     good &= ctGeMaskUsize(out.len, msg_len); // and it must fit the CEK buffer
+    // The content algorithm's key length is folded in HERE rather than checked
+    // by the caller. A conforming block carrying a differently-sized key is one
+    // of the three arms a Bleichenbacher search separates, and checking it one
+    // frame up put it back on the fast path — measured at 97% classifier
+    // accuracy over a 3 MiB content ciphertext.
+    good &= ctEqMaskUsize(msg_len, want);
 
     // Fixed-shape message extraction. Rather than reading `em` at the
     // secret-derived offset `sep_idx + 1` (a data-dependent memory access), try
@@ -415,8 +522,14 @@ fn rsaPkcs1v15Unwrap(sk: rsa.SecretKey, wrapped: []const u8, out: *[64]u8) Error
     const pub_mask: u8 = @truncate(good);
     for (out, &msg_buf) |*o, v| o.* = v & pub_mask;
 
-    if (good == 0) return error.DecryptionError;
-    return out[0..msg_len];
+    if (good == 0) {
+        // Not an error: a decoy of the right length, so the caller decrypts the
+        // content either way. `em` is c^d mod n — the peer cannot compute it,
+        // which is what stops them crafting content that verifies under a decoy
+        // they predicted. See `Unwrapped`.
+        return .{ .cek = decoyCek(em, want, out), .ok = false };
+    }
+    return .{ .cek = out[0..want], .ok = true };
 }
 
 /// Raw RSADP over the module's CRT primitive. `rsadpCrt` needs a comptime
@@ -437,16 +550,34 @@ fn rsaRawPrivate(sk: rsa.SecretKey, wrapped: []const u8, out: *[rsa.max_modulus_
     return error.DecryptionError; // non-standard modulus size
 }
 
-fn aesKwUnwrap(kek: []const u8, wrapped: []const u8, out: *[64]u8) Error![]const u8 {
+fn aesKwUnwrap(kek: []const u8, wrapped: []const u8, out: *[64]u8, want: usize) Error!Unwrapped {
     // RFC 3394 unwrap (delegated to the shared `aeskw` module): recovered
     // length = wrapped.len - 8. Any failure (bad length, unsupported KEK
     // length, integrity-check mismatch) collapses to the generic
     // `DecryptionError` — see the module doc comment on error posture.
-    if (wrapped.len < 24) return error.DecryptionError; // bound the out-slice below
+    // Both length checks are on PUBLIC data (the ciphertext's own length), so
+    // returning early here discloses nothing the peer did not choose. ⚠ Without
+    // the first one, `wrapped.len - 8` wraps around on a `usize` for any blob
+    // under 8 bytes and `out[0..plain_len]` slices a 64-byte array to ~2^64.
+    if (wrapped.len < 24) return error.DecryptionError;
     const plain_len = wrapped.len - 8;
     if (plain_len > out.len) return error.DecryptionError;
-    _ = aeskw.unwrap(kek, wrapped, out[0..plain_len]) catch return error.DecryptionError;
-    return out[0..plain_len];
+    if (aeskw.unwrap(kek, wrapped, out[0..plain_len])) |_| {
+        // The integrity check passed. A key of the wrong length for the content
+        // algorithm is still a failure, but it takes the same route as any
+        // other so the work stays identical.
+        if (plain_len == want) return .{ .cek = out[0..want], .ok = true };
+    } else |_| {}
+    // The KEK is secret and the peer cannot compute it, so a decoy keyed on it
+    // is unpredictable — see `Unwrapped`. Bound to the wrapped bytes as well, so
+    // two different blobs do not decoy to the same key.
+    var secret: [64 + 1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &secret);
+    const n = @min(kek.len, 64);
+    @memcpy(secret[0..n], kek[0..n]);
+    const m = @min(wrapped.len, secret.len - n);
+    @memcpy(secret[n..][0..m], wrapped[0..m]);
+    return .{ .cek = decoyCek(secret[0 .. n + m], want, out), .ok = false };
 }
 
 // ── content decryption ──────────────────────────────────────────────────────
@@ -526,14 +657,110 @@ fn childEl(parent: *const xml.Element, uri: []const u8, local: []const u8) ?*con
 
 /// Read the base64 CipherData/CipherValue under `parent` and return the decoded
 /// bytes (owned by `alloc`). Rejects a CipherReference (external URI).
+///
+/// **Exactly one** `CipherData`, and exactly one `CipherValue` inside it. The
+/// xenc schema says so (`CipherData` is `minOccurs=1 maxOccurs=1`, its body a
+/// choice of one `CipherValue` or one `CipherReference`) and `xmlsec1` enforces
+/// it — measured: `xmlsec1 --decrypt` refuses a document with two `CipherData`
+/// or two `CipherValue` children, while a first-match search here happily
+/// decrypted the first one. That is signature wrapping's shape one layer down:
+/// two implementations looking at the same document disagreeing about whether
+/// it is even valid, and — if a third resolves duplicates last-match — about
+/// which ciphertext IS the message.
 fn readCipherValue(alloc: std.mem.Allocator, parent: *const xml.Element, max_len: usize) Error![]u8 {
-    const cipher_data = childEl(parent, xenc_ns, "CipherData") orelse return error.MalformedStructure;
+    const cipher_data = try onlyChild(parent, xenc_ns, "CipherData");
     if (childEl(cipher_data, xenc_ns, "CipherReference") != null) return error.CipherReferenceUnsupported;
-    const cipher_value = childEl(cipher_data, xenc_ns, "CipherValue") orelse return error.MalformedStructure;
+    const cipher_value = try onlyChild(cipher_data, xenc_ns, "CipherValue");
 
-    const raw = cipher_value.textContent(alloc) catch return error.OutOfMemory;
-    defer alloc.free(raw);
-    return decodeBase64Alloc(alloc, raw, max_len);
+    return decodeBase64FromElement(alloc, cipher_value, max_len);
+}
+
+/// `childEl`, but a second match is `error.MalformedStructure` rather than
+/// silently the first one. See `readCipherValue`.
+fn onlyChild(parent: *const xml.Element, uri: []const u8, local: []const u8) Error!*const xml.Element {
+    var found: ?*const xml.Element = null;
+    for (parent.children) |c| switch (c.content) {
+        .element => |e| if (isEl(e, uri, local)) {
+            if (found != null) return error.MalformedStructure;
+            found = e;
+        },
+        else => {},
+    };
+    return found orelse error.MalformedStructure;
+}
+
+/// Whitespace-strip and base64-decode an element's text content, bounding the
+/// SOURCE before any of it is copied.
+///
+/// The previous route was `textContent(alloc)` — one full copy of the attacker's
+/// text — then an `ArrayList` grown byte by byte — a second — and only then
+/// `if (n > max_len) return error.CiphertextTooLarge`. So `max_len` bounded the
+/// OUTPUT while the work was unbounded: the EncryptedKey's hard-coded 1024-byte
+/// ceiling, justified in its own comment as "an RSA block / KW blob is small",
+/// admitted **191 MB of peak live allocation and 474 ms** from one
+/// unauthenticated document — 186,000x the stated bound, all of it spent before
+/// the private key is touched, and `saml`'s `EncryptedAssertion` path reaches
+/// here pre-authentication. A real, enforced cap that bounds the wrong quantity.
+///
+/// Now: walk the text nodes without copying, refuse as soon as the significant
+/// (non-whitespace) character count cannot possibly decode within `max_len`, and
+/// only then allocate — once, at the exact size. The document's own bytes are
+/// already resident (the caller parsed it), so the walk adds nothing.
+fn decodeBase64FromElement(alloc: std.mem.Allocator, el: *const xml.Element, max_len: usize) Error![]u8 {
+    // base64 spends 4 characters per 3 bytes; +4 covers the padding group.
+    const max_chars = (std.math.divCeil(usize, max_len, 3) catch return error.CiphertextTooLarge) * 4 + 4;
+
+    var n_sig: usize = 0;
+    try countSignificant(el, max_chars, &n_sig);
+
+    const compact = try alloc.alloc(u8, n_sig);
+    defer alloc.free(compact);
+    var w: usize = 0;
+    gatherSignificant(el, compact, &w);
+    std.debug.assert(w == n_sig);
+
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(compact) catch return error.MalformedStructure;
+    if (n > max_len) return error.CiphertextTooLarge;
+    const out = try alloc.alloc(u8, n);
+    errdefer alloc.free(out);
+    dec.decode(out, compact) catch return error.MalformedStructure;
+    return out;
+}
+
+fn isB64Space(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
+fn countSignificant(el: *const xml.Element, cap: usize, n: *usize) Error!void {
+    for (el.children) |c| switch (c.content) {
+        .text, .cdata => |t| {
+            for (t) |ch| {
+                if (isB64Space(ch)) continue;
+                n.* += 1;
+                if (n.* > cap) return error.CiphertextTooLarge;
+            }
+        },
+        // `textContent` descends into child elements and `xmlsec1` accepts a
+        // nested element inside CipherValue too, so the traversal matches both
+        // — this is a bound on the work, not a change of shape.
+        .element => |e| try countSignificant(e, cap, n),
+        .comment, .pi => {},
+    };
+}
+
+fn gatherSignificant(el: *const xml.Element, out: []u8, w: *usize) void {
+    for (el.children) |c| switch (c.content) {
+        .text, .cdata => |t| {
+            for (t) |ch| {
+                if (isB64Space(ch)) continue;
+                out[w.*] = ch;
+                w.* += 1;
+            }
+        },
+        .element => |e| gatherSignificant(e, out, w),
+        .comment, .pi => {},
+    };
 }
 
 /// Decode a base64 element's text into `out` (small, fixed buffers only — for
@@ -546,23 +773,6 @@ fn readBase64Text(el: *const xml.Element, out: []u8) Error![]const u8 {
         break :blk el.textContent(fbs.allocator()) catch return error.MalformedStructure;
     };
     return decodeBase64Fixed(raw, out);
-}
-
-/// Strip ASCII whitespace and standard-base64-decode into a fresh allocation.
-fn decodeBase64Alloc(alloc: std.mem.Allocator, text: []const u8, max_len: usize) Error![]u8 {
-    var compact: std.ArrayList(u8) = .empty;
-    defer compact.deinit(alloc);
-    for (text) |c| {
-        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
-        try compact.append(alloc, c);
-    }
-    const dec = std.base64.standard.Decoder;
-    const n = dec.calcSizeForSlice(compact.items) catch return error.MalformedStructure;
-    if (n > max_len) return error.CiphertextTooLarge;
-    const out = try alloc.alloc(u8, n);
-    errdefer alloc.free(out);
-    dec.decode(out, compact.items) catch return error.MalformedStructure;
-    return out;
 }
 
 /// Whitespace-strip + base64-decode into a fixed buffer (for the tiny OAEP
@@ -663,8 +873,9 @@ test "RFC 3394 §4.1 AES key unwrap (byte-exact)" {
         0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5,
     };
     var out: [64]u8 = undefined;
-    const rec = try aesKwUnwrap(&kek, &ciphertext, &out);
-    try testing.expectEqualSlices(u8, &key_data, rec);
+    const un = try aesKwUnwrap(&kek, &ciphertext, &out, key_data.len);
+    try testing.expect(un.ok);
+    try testing.expectEqualSlices(u8, &key_data, un.cek);
 }
 
 // ── RFC 8017 §7.2.2 unpadding teeth ─────────────────────────────────────────
@@ -711,10 +922,16 @@ fn buildEm(comptime k: usize, b0: u8, b1: u8, ps_len: usize, msg_len: usize, ter
     return em;
 }
 
-/// Hand `em` to the production unpadding by raw-encrypting it under `pk`.
-fn unpadEm(comptime k: usize, em: [k]u8, kp: rsa.KeyPair, out: *[64]u8) Error![]const u8 {
+/// Hand `em` to the production unpadding by raw-encrypting it under `pk`, and
+/// turn its masked result back into the accept/reject answer these tests are
+/// about. `want` is the content algorithm's key length, which the unpadding
+/// folds into its validity mask — each case below passes its OWN message
+/// length, so the only thing that can reject a case is the check it names.
+fn unpadEm(comptime k: usize, em: [k]u8, kp: rsa.KeyPair, out: *[64]u8, want: usize) Error![]const u8 {
     const ct = rsa.rsaep(k, em, kp.public_key) catch return error.DecryptionError;
-    return rsaPkcs1v15Unwrap(kp.secret_key, &ct, out);
+    const un = try rsaPkcs1v15Unwrap(kp.secret_key, &ct, out, want);
+    if (!un.ok) return error.DecryptionError;
+    return un.cek;
 }
 
 test "TEETH: PKCS#1 v1.5 unpadding accepts a valid EM and the PS=8 boundary" {
@@ -725,7 +942,7 @@ test "TEETH: PKCS#1 v1.5 unpadding accepts a valid EM and the PS=8 boundary" {
 
     // Ordinary CEK-sized message: EM = 00 02 PS(29) 00 M(32).
     const good = buildEm(k, 0x00, 0x02, 29, 32, true);
-    const rec = try unpadEm(k, good, kp, &out);
+    const rec = try unpadEm(k, good, kp, &out, 32);
     try testing.expectEqualSlices(u8, good[k - 32 ..], rec);
 
     // PS of exactly 8 octets is the RFC 8017 §7.2.2 minimum — must be ACCEPTED.
@@ -733,7 +950,7 @@ test "TEETH: PKCS#1 v1.5 unpadding accepts a valid EM and the PS=8 boundary" {
     // in the rejection table below. Without both, `sep_idx >= 10` can be moved
     // in either direction unnoticed.)
     const ps8 = buildEm(k, 0x00, 0x02, 8, 53, true);
-    const rec8 = try unpadEm(k, ps8, kp, &out);
+    const rec8 = try unpadEm(k, ps8, kp, &out, 53);
     try testing.expectEqualSlices(u8, ps8[k - 53 ..], rec8);
 }
 
@@ -746,30 +963,33 @@ test "TEETH: PKCS#1 v1.5 unpadding rejects every malformed EM (RFC 8017 §7.2.2)
     const Case = struct {
         name: []const u8,
         em: [k]u8,
+        /// The message length this case's EM claims — passed as `want` so the
+        /// key-length fold can never be the reason a case is rejected.
+        want: usize,
     };
     const cases = [_]Case{
         // EM[0] must be 0x00.
-        .{ .name = "leading octet 0x01", .em = buildEm(k, 0x01, 0x02, 29, 32, true) },
+        .{ .name = "leading octet 0x01", .em = buildEm(k, 0x01, 0x02, 29, 32, true), .want = 32 },
         // EM[1] must be 0x02. 0x01 is block type 1 (the *signature* padding
         // type) — accepting it is the classic v1.5 confusion, and dropping this
         // single check is what previously survived the whole suite.
-        .{ .name = "block type 1 (signature padding)", .em = buildEm(k, 0x00, 0x01, 29, 32, true) },
-        .{ .name = "block type 0", .em = buildEm(k, 0x00, 0x00, 29, 32, true) },
-        .{ .name = "block type 3", .em = buildEm(k, 0x00, 0x03, 29, 32, true) },
+        .{ .name = "block type 1 (signature padding)", .em = buildEm(k, 0x00, 0x01, 29, 32, true), .want = 32 },
+        .{ .name = "block type 0", .em = buildEm(k, 0x00, 0x00, 29, 32, true), .want = 32 },
+        .{ .name = "block type 3", .em = buildEm(k, 0x00, 0x03, 29, 32, true), .want = 32 },
         // PS must be at least 8 octets. 7 is one below the bound; everything
         // else about this block is valid, so the PS minimum is the only check
         // that can reject it.
-        .{ .name = "PS of 7 octets (one below the minimum)", .em = buildEm(k, 0x00, 0x02, 7, 54, true) },
-        .{ .name = "PS of 1 octet", .em = buildEm(k, 0x00, 0x02, 1, 60, true) },
-        .{ .name = "PS of 0 octets (0x00 immediately after the prefix)", .em = buildEm(k, 0x00, 0x02, 0, 61, true) },
+        .{ .name = "PS of 7 octets (one below the minimum)", .em = buildEm(k, 0x00, 0x02, 7, 54, true), .want = 54 },
+        .{ .name = "PS of 1 octet", .em = buildEm(k, 0x00, 0x02, 1, 60, true), .want = 60 },
+        .{ .name = "PS of 0 octets (0x00 immediately after the prefix)", .em = buildEm(k, 0x00, 0x02, 0, 61, true), .want = 61 },
         // A 0x00 terminator must exist.
-        .{ .name = "no 0x00 terminator anywhere", .em = buildEm(k, 0x00, 0x02, 0, 0, false) },
+        .{ .name = "no 0x00 terminator anywhere", .em = buildEm(k, 0x00, 0x02, 0, 0, false), .want = 0 },
         // A zero-length message (terminator is the final octet) is not a CEK.
-        .{ .name = "zero-length message", .em = buildEm(k, 0x00, 0x02, k - 3, 0, true) },
+        .{ .name = "zero-length message", .em = buildEm(k, 0x00, 0x02, k - 3, 0, true), .want = 0 },
     };
 
     for (cases) |c| {
-        const r = unpadEm(k, c.em, kp, &out);
+        const r = unpadEm(k, c.em, kp, &out, c.want);
         testing.expectError(error.DecryptionError, r) catch |e| {
             std.debug.print("v1.5 unpadding ACCEPTED a malformed EM: {s}\n", .{c.name});
             return e;
@@ -785,12 +1005,17 @@ test "TEETH: PKCS#1 v1.5 unpadding rejects a message longer than the CEK buffer"
     defer kp.secret_key.deinit();
     var out: [64]u8 = undefined;
 
+    // No content algorithm asks for a 117-byte key, so `want` is refused before
+    // any secret-dependent work — a public bound on a public value.
     const long = buildEm(k, 0x00, 0x02, 8, 117, true);
-    try testing.expectError(error.DecryptionError, unpadEm(k, long, kp, &out));
+    try testing.expectError(error.DecryptionError, unpadEm(k, long, kp, &out, 117));
+    // And with a realistic `want`, the same over-long message is rejected by the
+    // mask rather than by that bound.
+    try testing.expectError(error.DecryptionError, unpadEm(k, long, kp, &out, 32));
 
     // Control on the same key: a 32-byte CEK with a full-length PS decodes.
     const ok = buildEm(k, 0x00, 0x02, 93, 32, true);
-    const rec = try unpadEm(k, ok, kp, &out);
+    const rec = try unpadEm(k, ok, kp, &out, 32);
     try testing.expectEqualSlices(u8, ok[k - 32 ..], rec);
 }
 
@@ -827,7 +1052,7 @@ test "TEETH (F3): the v1.5 message copy has a fixed length, not msg_len" {
     // writes all 64.
     var out: [64]u8 = @splat(0xAA);
     const em = buildEm(k, 0x00, 0x02, 45, 16, true);
-    const rec = try unpadEm(k, em, kp, &out);
+    const rec = try unpadEm(k, em, kp, &out, 16);
     try testing.expectEqualSlices(u8, em[k - 16 ..], rec);
     for (out[16..], 16..) |b, idx| {
         if (b != 0) {
@@ -840,7 +1065,7 @@ test "TEETH (F3): the v1.5 message copy has a fixed length, not msg_len" {
     }
 }
 
-test "TEETH (F3): a rejected v1.5 block still writes the CEK buffer, and writes zero" {
+test "TEETH (F3): a rejected v1.5 block still WRITES the CEK buffer, and never with plaintext" {
     const k = 64;
     var kp = try v15TestKey(512);
     defer kp.secret_key.deinit();
@@ -849,18 +1074,115 @@ test "TEETH (F3): a rejected v1.5 block still writes the CEK buffer, and writes 
     // other part of the block is well formed, so a `msg_len`-sized copy placed
     // before the validity branch would deposit 54 bytes of recovered plaintext
     // here and an early `return error` would deposit none. Both are visible.
+    //
+    // Since the anti-oracle work landed, a rejected block leaves a DECOY in the
+    // first `want` bytes rather than zeros — that is the whole point, the caller
+    // decrypts the content with it. So the property asserted here is the one
+    // that actually matters and always did: whatever is in the buffer, it is not
+    // the recovered message, and nothing past the decoy is left over.
+    const want = 54;
     var out: [64]u8 = @splat(0xAA);
-    const bad = buildEm(k, 0x00, 0x02, 7, 54, true);
-    try testing.expectError(error.DecryptionError, unpadEm(k, bad, kp, &out));
-    for (out, 0..) |b, idx| {
-        if (b != 0) {
-            std.debug.print(
-                "rejected v1.5 block left out[{d}] = 0x{X:0>2} (0xAA = write skipped, else = plaintext residue)\n",
-                .{ idx, b },
-            );
-            return error.RejectPathSkipsTheCopy;
+    const bad = buildEm(k, 0x00, 0x02, 7, want, true);
+    try testing.expectError(error.DecryptionError, unpadEm(k, bad, kp, &out, want));
+
+    const recovered = bad[k - want ..];
+    if (std.mem.eql(u8, out[0..want], recovered)) {
+        std.debug.print("rejected v1.5 block published the recovered plaintext\n", .{});
+        return error.RejectedBlockLeakedPlaintext;
+    }
+    // The write happened at all — an early `return error` would have left the
+    // caller's 0xAA fill in place.
+    var untouched = true;
+    for (out) |b| {
+        if (b != 0xAA) {
+            untouched = false;
+            break;
         }
     }
+    if (untouched) {
+        std.debug.print("rejected v1.5 block skipped the CEK-buffer write entirely\n", .{});
+        return error.RejectedBlockSkippedWrite;
+    }
+    // And nothing beyond the decoy: no tail of the recovered message survives.
+    for (out[want..], want..) |b, idx| {
+        if (b != 0) {
+            std.debug.print("rejected v1.5 block left out[{d}] = 0x{X:0>2} past the decoy\n", .{ idx, b });
+            return error.RejectedBlockLeftResidue;
+        }
+    }
+}
+
+test "TEETH (F3): a failed key unwrap still decrypts the content, so both outcomes cost the same" {
+    // The oracle this closes is at CALLER scope, not inside the unpadding: a
+    // non-conforming block used to return before `decryptData` touched the
+    // content at all, so a whole AES pass over an attacker-sized ciphertext
+    // happened on exactly one side of the decision. Measured at 97% classifier
+    // accuracy (min-of-8 queries) over a 3 MiB CBC content ciphertext, with the
+    // error VALUE fully collapsed the whole time.
+    //
+    // Asserted here as the mechanism rather than as a timing ratio, because a
+    // wall-clock assertion is exactly the kind that reads the same with and
+    // without the fix. `Unwrapped.ok` false with a `want`-length decoy IS the
+    // fix; a decoy of the wrong length would put the caller back on the fast
+    // path.
+    const k = 64;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+    var out: [64]u8 = @splat(0xAA);
+
+    for ([_]usize{ 16, 32 }) |want| {
+        // Block type 1 — the classic v1.5 confusion, and non-conforming.
+        const bad = buildEm(k, 0x00, 0x01, 29, 32, true);
+        const ct = try rsa.rsaep(k, bad, kp.public_key);
+        const un = try rsaPkcs1v15Unwrap(kp.secret_key, &ct, &out, want);
+        try testing.expect(!un.ok);
+        // The decoy is exactly the content algorithm's key length, so the
+        // caller's AES pass runs on it.
+        try testing.expectEqual(want, un.cek.len);
+
+        // A CONFORMING block whose message is the wrong length for the content
+        // algorithm is the third arm of the same oracle, and it takes the same
+        // route rather than being checked one frame up.
+        const other: usize = if (want == 32) 16 else 32;
+        const wrong_len = buildEm(k, 0x00, 0x02, k - 3 - other, other, true);
+        const ct2 = try rsa.rsaep(k, wrong_len, kp.public_key);
+        const un2 = try rsaPkcs1v15Unwrap(kp.secret_key, &ct2, &out, want);
+        try testing.expect(!un2.ok);
+        try testing.expectEqual(want, un2.cek.len);
+
+        // Control: the right length, conforming, still succeeds.
+        const good = buildEm(k, 0x00, 0x02, 29, 32, true);
+        const ct3 = try rsa.rsaep(k, good, kp.public_key);
+        const un3 = try rsaPkcs1v15Unwrap(kp.secret_key, &ct3, &out, 32);
+        try testing.expect(un3.ok);
+        try testing.expectEqualSlices(u8, good[k - 32 ..], un3.cek);
+    }
+}
+
+test "TEETH (F3): the decoy is unpredictable and input-bound, not a constant" {
+    // If the decoy were public — a constant, or a function of the ciphertext
+    // alone — the peer could craft a content ciphertext that authenticates
+    // under the decoy they computed themselves, and read the unwrap result back
+    // out of the success/failure answer. It is derived from the raw RSA block,
+    // which needs the private key.
+    const k = 64;
+    var kp = try v15TestKey(512);
+    defer kp.secret_key.deinit();
+    var out_a: [64]u8 = undefined;
+    var out_b: [64]u8 = undefined;
+
+    const bad_a = buildEm(k, 0x00, 0x01, 29, 32, true);
+    var bad_b = bad_a;
+    bad_b[40] ^= 0x01; // one bit of the rejected block
+
+    const un_a = try rsaPkcs1v15Unwrap(kp.secret_key, &(try rsa.rsaep(k, bad_a, kp.public_key)), &out_a, 32);
+    const un_b = try rsaPkcs1v15Unwrap(kp.secret_key, &(try rsa.rsaep(k, bad_b, kp.public_key)), &out_b, 32);
+    try testing.expect(!un_a.ok and !un_b.ok);
+
+    var zero: [32]u8 = @splat(0);
+    try testing.expect(!std.mem.eql(u8, un_a.cek, &zero));
+    // Two different rejected blocks must not decoy to the same key.
+    try testing.expect(!std.mem.eql(u8, un_a.cek, un_b.cek));
 }
 
 test "constant-time mask helpers (exhaustive over u8, table over usize)" {
