@@ -651,7 +651,10 @@ fn fuzzParseStream(_: void, smith: *std.testing.Smith) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    const n_records = smith.valueRangeAtMost(u8, 0, 12);
+    // Lower bound 1, not 0: on the single smoke run `valueRangeAtMost` falls
+    // back to its LOWER bound, and zero records is an empty stream — the one
+    // input that exercises nothing. See `message.zig`'s note.
+    const n_records = smith.valueRangeAtMost(u8, 1, 12);
     var i: u8 = 0;
     while (i < n_records) : (i += 1) {
         // Bias the type/length BigSize prefixes toward small single-byte

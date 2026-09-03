@@ -146,14 +146,33 @@ pub const Writer = struct {
         try self.list.appendSlice(allocator, b);
     }
 
-    pub fn putBytesU16(self: *Writer, allocator: Allocator, b: []const u8) Allocator.Error!void {
-        std.debug.assert(b.len <= std.math.maxInt(u16));
+    /// Write `b` prefixed by its `u16` big-endian length.
+    ///
+    /// ⚠ The bound was a `std.debug.assert` followed by an unchecked
+    /// `@intCast`, which in ReleaseFast is no bound at all: the prefix became
+    /// `b.len mod 65536` while the whole of `b` was still appended, so the
+    /// bytes past the field landed where the peer parses whatever comes next
+    /// (for `reply_channel_range`, the trailing `tlv_stream`). And the length
+    /// that overflows is not ours to choose — `encoded_short_ids` is 8 bytes
+    /// per channel over a **block range the remote peer asked for**, so 8,192
+    /// channels is already one byte past the field. Measured, same source and
+    /// input: Debug and ReleaseSafe abort (rc=134); ReleaseFast is undefined
+    /// and did NOT present the same way twice (an `OutOfMemory` here, a frame
+    /// with `declared len=1` and 65,536 bytes past the field elsewhere).
+    pub fn putBytesU16(self: *Writer, allocator: Allocator, b: []const u8) WriteError!void {
+        if (b.len > std.math.maxInt(u16)) return error.FieldTooLong;
         try self.putU16be(allocator, @intCast(b.len));
         try self.putBytes(allocator, b);
     }
 };
 
 // ── 2-byte message-type frame ───────────────────────────────────────────
+
+/// A value handed to the encoder does not fit the wire field that must carry
+/// it. Separate from `Allocator.Error` because it is a caller/peer-input
+/// problem, not a host one — and it is an ERROR rather than an assert because
+/// asserts are compiled out of the ReleaseFast lane this collection ships.
+pub const WriteError = Allocator.Error || error{FieldTooLong};
 
 pub const FrameError = ReadError || error{WrongType};
 
@@ -329,7 +348,15 @@ fn fuzzFrameAndExtension(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [512]u8 = undefined;
     smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ Written as `valueRangeAtMost(u16, 0, buf.len)` this drew ZERO on the
+    // one input an ordinary `zig build test-*` run gets: outside `--fuzz` an
+    // empty corpus is exactly one input, and `Smith.valueRangeAtMost` falls
+    // back to the range's LOWER bound once the input is exhausted. So the
+    // harness's single smoke run fed an EMPTY buffer to the decoder, which
+    // bails at the first length check — while `check-fuzz` counted the module
+    // covered. Subtracting instead makes the exhausted-input fallback the FULL
+    // buffer, which is the interesting end of the range.
+    const len: usize = buf.len - smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
     const bytes = buf[0..len];
 
     // Bias `want` toward the type actually encoded at the front of `bytes`
@@ -343,4 +370,52 @@ fn fuzzFrameAndExtension(_: void, smith: *std.testing.Smith) !void {
     var r = openFrame(bytes, want) catch return;
     var ext = decodeExtension(allocator, r.rest(), &.{ 0, 1, 3, 254 }) catch return;
     defer ext.deinit(allocator);
+}
+
+test "TEETH: a field too long for its u16 prefix is REFUSED, not truncated" {
+    // The bound here was a `std.debug.assert` plus an unchecked `@intCast`.
+    // In ReleaseFast that is no bound: the prefix became `len mod 65536` while
+    // the whole payload was still appended, so the excess landed where the peer
+    // parses the next field. And the overflowing length is chosen by the REMOTE
+    // PEER — `reply_channel_range` carries 8 bytes per channel over a block
+    // range the peer asked for, so 8,192 channels is already one past the field.
+    //
+    // Measured before the fix, same source and input, three modes: Debug and
+    // ReleaseSafe abort (rc=134); ReleaseFast is undefined and did not present
+    // the same way twice.
+    const a = std.testing.allocator;
+    const too_long = try a.alloc(u8, std.math.maxInt(u16) + 1);
+    defer a.free(too_long);
+    @memset(too_long, 0xAB);
+
+    var w: Writer = .{};
+    defer w.deinit(a);
+    try std.testing.expectError(error.FieldTooLong, w.putBytesU16(a, too_long));
+    // Nothing was written, so a refused field cannot leave a half-frame behind.
+    try std.testing.expectEqual(@as(usize, 0), w.list.items.len);
+
+    // The largest length that DOES fit still writes, so the bound is not off by
+    // one in the other direction.
+    var w2: Writer = .{};
+    defer w2.deinit(a);
+    try w2.putBytesU16(a, too_long[0..std.math.maxInt(u16)]);
+    try std.testing.expectEqual(@as(usize, 2 + std.math.maxInt(u16)), w2.list.items.len);
+    try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), std.mem.readInt(u16, w2.list.items[0..2], .big));
+}
+
+test "TEETH: the fuzz harness's smoke run feeds a FULL buffer, not an empty one" {
+    // Outside `--fuzz`, `std.testing.fuzz` with an empty corpus runs exactly
+    // one input, and `Smith.valueRangeAtMost` falls back to the range's LOWER
+    // bound on exhausted input. Written `valueRangeAtMost(u16, 0, buf.len)`
+    // that made the one input an EMPTY buffer, which every decoder rejects at
+    // its first length check — so an ordinary `zig build test-lnwire` exercised
+    // nothing, while `check-fuzz` reported the module covered.
+    //
+    // This reads the same expression the harness uses, through a `Smith` in
+    // exactly that exhausted state.
+    var empty: [0]u8 = .{};
+    var smith: std.testing.Smith = .{ .in = &empty };
+    const buf_len: usize = 512;
+    const len: usize = buf_len - smith.valueRangeAtMost(u16, 0, @intCast(buf_len));
+    try std.testing.expectEqual(buf_len, len);
 }

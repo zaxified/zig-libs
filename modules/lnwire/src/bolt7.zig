@@ -107,7 +107,7 @@ pub fn decodeChannelAnnouncement(bytes: []const u8) message.FrameError!ChannelAn
     return m;
 }
 
-pub fn serializeChannelAnnouncement(allocator: Allocator, msg: ChannelAnnouncement) Allocator.Error![]u8 {
+pub fn serializeChannelAnnouncement(allocator: Allocator, msg: ChannelAnnouncement) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, CHANNEL_ANNOUNCEMENT_TYPE);
@@ -172,7 +172,7 @@ pub fn decodeNodeAnnouncement(bytes: []const u8) message.FrameError!NodeAnnounce
     return m;
 }
 
-pub fn serializeNodeAnnouncement(allocator: Allocator, msg: NodeAnnouncement) Allocator.Error![]u8 {
+pub fn serializeNodeAnnouncement(allocator: Allocator, msg: NodeAnnouncement) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, NODE_ANNOUNCEMENT_TYPE);
@@ -283,18 +283,50 @@ pub fn channelUpdateDigest(payload: []const u8) message.ReadError![32]u8 {
 /// (a verification context, a key cache, …) -- `null` if unneeded.
 pub const EcdsaVerifyFn = *const fn (ctx: ?*anyopaque, digest: [32]u8, signature: Signature, pubkey: Point) bool;
 
-/// Verifies all four `channel_announcement` signatures (BOLT#7: two node
-/// signatures over `node_id_1`/`node_id_2`, two bitcoin signatures over
-/// `bitcoin_key_1`/`bitcoin_key_2`, all four over the same digest) against
-/// `payload` (the decoded message's own wire bytes, type-prefix excluded --
-/// what `channelAnnouncementDigest` takes). Short-circuits on the first
-/// failing signature; never claims "verified" on a partial check.
+/// `true` iff `node_id_1` sorts strictly before `node_id_2` as compressed
+/// keys, which BOLT#7 requires of every `channel_announcement`.
+///
+/// Sender side, `07-routing-gossip.md`: "MUST set `node_id_1` and `node_id_2`
+/// to the public keys of the two nodes operating the channel, such that
+/// `node_id_1` is the lexicographically-lesser of the two compressed keys
+/// sorted in ascending lexicographic order."
+pub fn nodeIdsOrdered(msg: ChannelAnnouncement) bool {
+    return std.mem.order(u8, &msg.node_id_1, &msg.node_id_2) == .lt;
+}
+
+/// Verifies a `channel_announcement` as a receiver must: all four signatures
+/// (BOLT#7: two node signatures over `node_id_1`/`node_id_2`, two bitcoin
+/// signatures over `bitcoin_key_1`/`bitcoin_key_2`, all four over the same
+/// digest) against `payload` (the decoded message's own wire bytes,
+/// type-prefix excluded -- what `channelAnnouncementDigest` takes), **and**
+/// the node-id ordering. Short-circuits on the first failure; never claims
+/// "verified" on a partial check.
+///
+/// ⚠ The ordering check used to be absent, unnamed and undeferred, in the one
+/// function this module advertises as its acceptance seam. BOLT#7's receiver
+/// clause, verbatim and in this order:
+///
+///   "The receiving node:
+///      - MUST verify the integrity AND authenticity of the message by
+///        verifying the signatures.
+///      - if `node_id_1` is not lexicographically less than `node_id_2`:
+///        - SHOULD send a `warning`.
+///        - MAY close the connection.
+///        - **MUST ignore the message.**"
+///
+/// The two sit in the same list, one bullet apart. Only the first was here —
+/// and unlike the P2WSH and chain checks further down that clause, this one
+/// needs no secp256k1, no chain access and no funding lookup: it is a
+/// comparison of two byte arrays already in hand. `warning`/close are the
+/// caller's (this module holds no connection); "MUST ignore" is what a
+/// verifier returning `false` means.
 pub fn verifyChannelAnnouncement(
     payload: []const u8,
     msg: ChannelAnnouncement,
     verify_fn: EcdsaVerifyFn,
     ctx: ?*anyopaque,
 ) message.ReadError!bool {
+    if (!nodeIdsOrdered(msg)) return false;
     const digest = try channelAnnouncementDigest(payload);
     return verify_fn(ctx, digest, msg.node_signature_1, msg.node_id_1) and
         verify_fn(ctx, digest, msg.node_signature_2, msg.node_id_2) and
@@ -354,7 +386,7 @@ pub fn decodeQueryShortChannelIds(allocator: Allocator, bytes: []const u8) (Deco
     return .{ .chain_hash = chain_hash, .encoded_short_ids = encoded_short_ids, .extension = extension };
 }
 
-pub fn serializeQueryShortChannelIds(allocator: Allocator, msg: QueryShortChannelIds) Allocator.Error![]u8 {
+pub fn serializeQueryShortChannelIds(allocator: Allocator, msg: QueryShortChannelIds) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, QUERY_SHORT_CHANNEL_IDS_TYPE);
@@ -458,7 +490,7 @@ pub fn decodeReplyChannelRange(allocator: Allocator, bytes: []const u8) (DecodeE
     };
 }
 
-pub fn serializeReplyChannelRange(allocator: Allocator, msg: ReplyChannelRange) Allocator.Error![]u8 {
+pub fn serializeReplyChannelRange(allocator: Allocator, msg: ReplyChannelRange) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, REPLY_CHANNEL_RANGE_TYPE);
@@ -1362,8 +1394,52 @@ fn fuzzDecodeQueryShortChannelIds(_: void, smith: *std.testing.Smith) !void {
         const near: u16 = @intCast(buf.len - 36 + smith.valueRangeAtMost(u8, 0, 4));
         std.mem.writeInt(u16, buf[34..36], near, .big);
     }
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ Written as `valueRangeAtMost(u16, 0, buf.len)` this drew ZERO on the
+    // one input an ordinary `zig build test-*` run gets: outside `--fuzz` an
+    // empty corpus is exactly one input, and `Smith.valueRangeAtMost` falls
+    // back to the range's LOWER bound once the input is exhausted. So the
+    // harness's single smoke run fed an EMPTY buffer to the decoder, which
+    // bails at the first length check — while `check-fuzz` counted the module
+    // covered. Subtracting instead makes the exhausted-input fallback the FULL
+    // buffer, which is the interesting end of the range.
+    const len: usize = buf.len - smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
 
     var m = decodeQueryShortChannelIds(allocator, buf[0..len]) catch return;
     defer m.deinit(allocator);
+}
+
+test "TEETH: a channel_announcement with unordered node ids is refused (BOLT#7 MUST ignore)" {
+    // BOLT#7's receiver clause puts "MUST verify the signatures" and
+    // "if node_id_1 is not lexicographically less than node_id_2 ... MUST
+    // ignore the message" one bullet apart. Only the first was implemented,
+    // in the function this module advertises as its acceptance seam, and the
+    // word "lexicograph" appeared nowhere in the module.
+    const S = struct {
+        fn always(_: ?*anyopaque, _: [32]u8, _: Signature, _: Point) bool {
+            return true;
+        }
+    };
+    // A payload long enough for the digest to be taken over.
+    var payload: [CHANNEL_ANNOUNCEMENT_SIG_BYTES + 8]u8 = @splat(0x00);
+
+    var msg: ChannelAnnouncement = std.mem.zeroes(ChannelAnnouncement);
+    msg.node_id_1 = @splat(0x02);
+    msg.node_id_2 = @splat(0x03);
+    // Ordered: with a signature oracle that accepts everything, this passes —
+    // so the refusal below is about the ordering and nothing else.
+    try std.testing.expect(nodeIdsOrdered(msg));
+    try std.testing.expect(try verifyChannelAnnouncement(&payload, msg, S.always, null));
+
+    // Swapped: every signature still "verifies", and it must still be refused.
+    const swapped_1 = msg.node_id_2;
+    msg.node_id_2 = msg.node_id_1;
+    msg.node_id_1 = swapped_1;
+    try std.testing.expect(!nodeIdsOrdered(msg));
+    try std.testing.expect(!(try verifyChannelAnnouncement(&payload, msg, S.always, null)));
+
+    // Equal is not "less than" either — the spec says lexicographically LESS.
+    msg.node_id_1 = @splat(0x07);
+    msg.node_id_2 = @splat(0x07);
+    try std.testing.expect(!nodeIdsOrdered(msg));
+    try std.testing.expect(!(try verifyChannelAnnouncement(&payload, msg, S.always, null)));
 }

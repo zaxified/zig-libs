@@ -58,17 +58,31 @@ pub fn main() !void {
 
     // The settling peer must be able to check the revealed preimage
     // actually hashes to the HTLC's committed payment_hash.
+    // ⚠ This used to PRINT the result — `"preimage validates: {}"` — so a
+    // broken serializer made it print `false` and exit 0. Demonstrated: a
+    // one-line mutation of `serializeUpdateFulfillHtlc` turned the suite red on
+    // two tests while `run-example-lnwire` printed `false` and exited 0. The
+    // one file whose purpose is to be an EXECUTED outside-caller check reported
+    // its failure as a line of text.
     var check: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&decoded_fulfill.payment_preimage, &check, .{});
-    std.debug.print("preimage validates against payment_hash: {}\n", .{std.mem.eql(u8, &check, &decoded_add.payment_hash)});
+    if (!std.mem.eql(u8, &check, &decoded_add.payment_hash)) {
+        return error.PreimageDoesNotMatchPaymentHash;
+    }
+    std.debug.print("preimage validates against payment_hash\n", .{});
 
     // A frame with the wrong leading type must be rejected by name, not
     // silently misparsed — a peer sending `ping` where `update_add_htlc`
     // was expected is a routine wire event, not a crash.
     const ping_wire = try lnwire.serializePing(gpa, .{ .num_pong_bytes = 0, .ignored = &.{} });
     defer gpa.free(ping_wire);
-    _ = lnwire.decodeUpdateAddHtlc(gpa, ping_wire) catch |err| switch (err) {
+    // Success is the error case: `_ = f(x) catch |err| switch (err)` asserts
+    // NOTHING when `f` succeeds, so a decoder that accepted a `ping` as an
+    // `update_add_htlc` would have left this example green.
+    if (lnwire.decodeUpdateAddHtlc(gpa, ping_wire)) |_| {
+        return error.MistypedFrameAccepted;
+    } else |err| switch (err) {
         error.WrongType => std.debug.print("mistyped frame correctly rejected: WrongType\n", .{}),
         else => return err,
-    };
+    }
 }

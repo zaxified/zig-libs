@@ -433,25 +433,42 @@ Three things compound it, and none of them is a bug in isolation:
   covered, exempt") reads as coverage.
 - `scripts/test.sh` runs `check-fuzz` and never `fuzz-sweep.sh`.
 - `.github/workflows/ci.yml` contains no fuzz step at all.
-- ⚠ **This file used to claim `zig build --fuzz` "does not compile on this
-  toolchain", failing inside std's own `test_runner` "identically for every
-  module tried". That is not reproducible.** On Zig 0.16.0, both of these
-  build and run:
+- ⚠ **`zig build --fuzz` compiles in the Release modes and NOT in Debug.**
+  Measured on Zig 0.16.0, same module, one variable:
 
   ```
-  $ zig build test --release=safe -Dtest-filter="fuzz: PDU/TLV decode" --fuzz=50000
-  $ echo $?
+  $ zig build test-lnwire                --fuzz=20 ; echo $?    # Debug
+  1
+  $ zig build test-lnwire --release=safe --fuzz=20 ; echo $?
   0
-  $ zig build test -Dtest-filter="fuzz: PDU/TLV decode" --fuzz=1000     # Debug
-  (still fuzzing at the 110 s mark — `=N` does not bound the run; killed)
+  $ zig build test-lnwire --release=fast --fuzz=20 ; echo $?
+  0
   ```
 
-  Coverage-guided mode therefore IS available, and is the only way to answer
-  "does this harness reach anything", which `fuzz-sweep.sh` cannot: it reports
-  `clean` whether the harness explored the decoder or bounced off the first
-  byte. Whether the old claim was true on an earlier toolchain is unknown; it
-  was recorded without a pasted failure, which is why it survived. **Paste the
-  failure or do not record the impossibility.**
+  The Debug failure is inside std's own runner and has nothing to do with the
+  module:
+
+  ```
+  lib/compiler/test_runner.zig:566:55: error: expected type
+      '*const debug.StackTrace', found '*builtin.StackTrace'
+  ```
+
+  So **coverage-guided fuzzing IS available — add `--release=safe`.** That
+  matters, because it is the only way to answer "does this harness reach
+  anything", which `fuzz-sweep.sh` cannot: it reports `clean` whether the
+  harness explored the decoder or bounced off the first byte. Five harnesses
+  found in three batches of the 2026-09 audit reached nothing at all.
+
+  ⚠⚠ **The history of this bullet is itself the lesson.** It first said
+  `--fuzz` "does not compile on this toolchain … identically for every module
+  tried", with no pasted failure. On 2026-09-03 that was overturned as "not
+  reproducible" — on the strength of one `--release=safe` run that worked and
+  one Debug run that was *killed at 110 s and assumed to be fuzzing*. It was
+  not; a Debug `--fuzz` build fails, and the 110 s was spent compiling. **The
+  correction repeated the original error in the opposite direction: a claim
+  about a failure, recorded without observing the failure.** The original note
+  was right about the mode it must have been written in, and wrong only in
+  saying "every module". Paste the failure, name the mode, or record neither.
 - ⛔ `fuzz-sweep.sh` is still the routine sweep, and it is still manual.
 
 **What to do about it.** Two routes, and the choice is about how the shapes are

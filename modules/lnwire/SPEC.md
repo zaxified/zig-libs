@@ -202,8 +202,15 @@ module regardless of what they encode, so no vector needed skipping for an unimp
 `channel_update.htlc_maximum_msat` is unconditional in BOLT#7's current spec text (the
 `option_channel_htlc_max` feature that used to gate it is now mandatory), matching every vector.
 
-This closes the "round-trip only" gap previously recorded here for these three messages; the whole
-BOLT#2 channel-management set remains round-trip-only (needs a live daemon peer, the anchor record in `SPEC.md`).
+This closes the "round-trip only" gap previously recorded here for these three messages.
+
+⚠ The sentence that used to follow — "the whole BOLT#2 channel-management set remains
+round-trip-only (needs a live daemon peer, the anchor record in `SPEC.md`)" — **was false when it
+was written, and this same file said so eighteen lines below**: the Anchoring section records
+"all 13 implemented messages, every upstream parameter combination, byte-exact both directions.
+No regtest daemon was needed." It also cited `SPEC.md` as its own source, which is the signature
+of the mechanical `ANCHOR-TASKS.tsv` substitution that produced it. One document, both claims, and
+the stale half is the one a reader hits first.
 
 Run: `zig build test-lnwire` (Debug and `-Doptimize=ReleaseFast`).
 

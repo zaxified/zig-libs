@@ -36,7 +36,7 @@ pub fn decodeInit(allocator: Allocator, bytes: []const u8) (DecodeError || Alloc
     return .{ .globalfeatures = globalfeatures, .features = features, .extension = extension };
 }
 
-pub fn serializeInit(allocator: Allocator, msg: Init) Allocator.Error![]u8 {
+pub fn serializeInit(allocator: Allocator, msg: Init) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, INIT_TYPE);
@@ -73,7 +73,7 @@ pub fn decodeErrorLike(bytes: []const u8, msg_type: u16) message.FrameError!Erro
     return .{ .channel_id = channel_id, .data = data };
 }
 
-pub fn serializeErrorLike(allocator: Allocator, msg: ErrorMsg, msg_type: u16) Allocator.Error![]u8 {
+pub fn serializeErrorLike(allocator: Allocator, msg: ErrorMsg, msg_type: u16) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, msg_type);
@@ -85,13 +85,13 @@ pub fn serializeErrorLike(allocator: Allocator, msg: ErrorMsg, msg_type: u16) Al
 pub fn decodeError(bytes: []const u8) message.FrameError!ErrorMsg {
     return decodeErrorLike(bytes, ERROR_TYPE);
 }
-pub fn serializeError(allocator: Allocator, msg: ErrorMsg) Allocator.Error![]u8 {
+pub fn serializeError(allocator: Allocator, msg: ErrorMsg) message.WriteError![]u8 {
     return serializeErrorLike(allocator, msg, ERROR_TYPE);
 }
 pub fn decodeWarning(bytes: []const u8) message.FrameError!ErrorMsg {
     return decodeErrorLike(bytes, WARNING_TYPE);
 }
-pub fn serializeWarning(allocator: Allocator, msg: ErrorMsg) Allocator.Error![]u8 {
+pub fn serializeWarning(allocator: Allocator, msg: ErrorMsg) message.WriteError![]u8 {
     return serializeErrorLike(allocator, msg, WARNING_TYPE);
 }
 
@@ -115,7 +115,7 @@ pub fn decodePing(bytes: []const u8) message.FrameError!Ping {
     return .{ .num_pong_bytes = num_pong_bytes, .ignored = ignored };
 }
 
-pub fn serializePing(allocator: Allocator, msg: Ping) Allocator.Error![]u8 {
+pub fn serializePing(allocator: Allocator, msg: Ping) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, PING_TYPE);
@@ -137,7 +137,7 @@ pub fn decodePong(bytes: []const u8) message.FrameError!Pong {
     return .{ .ignored = ignored };
 }
 
-pub fn serializePong(allocator: Allocator, msg: Pong) Allocator.Error![]u8 {
+pub fn serializePong(allocator: Allocator, msg: Pong) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, PONG_TYPE);

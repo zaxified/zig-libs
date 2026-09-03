@@ -404,7 +404,7 @@ pub fn decodeUpdateFailHtlc(allocator: Allocator, bytes: []const u8) (DecodeErro
     return .{ .channel_id = channel_id, .id = id, .reason = reason, .extension = extension };
 }
 
-pub fn serializeUpdateFailHtlc(allocator: Allocator, msg: UpdateFailHtlc) Allocator.Error![]u8 {
+pub fn serializeUpdateFailHtlc(allocator: Allocator, msg: UpdateFailHtlc) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, UPDATE_FAIL_HTLC_TYPE);
@@ -446,8 +446,11 @@ pub fn decodeCommitmentSigned(allocator: Allocator, bytes: []const u8) (DecodeEr
     return .{ .channel_id = channel_id, .signature = signature, .htlc_signatures = htlc_signatures, .extension = extension };
 }
 
-pub fn serializeCommitmentSigned(allocator: Allocator, msg: CommitmentSigned) Allocator.Error![]u8 {
-    std.debug.assert(msg.htlc_signatures.len <= std.math.maxInt(u16));
+pub fn serializeCommitmentSigned(allocator: Allocator, msg: CommitmentSigned) message.WriteError![]u8 {
+    // Same shape as `putBytesU16`'s: a `std.debug.assert` is not a bound in
+    // ReleaseFast, and the count here is the number of HTLCs on the channel —
+    // not a constant this side picks.
+    if (msg.htlc_signatures.len > std.math.maxInt(u16)) return error.FieldTooLong;
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, COMMITMENT_SIGNED_TYPE);
@@ -543,7 +546,7 @@ pub fn decodeShutdown(bytes: []const u8) message.FrameError!Shutdown {
     return .{ .channel_id = channel_id, .scriptpubkey = scriptpubkey };
 }
 
-pub fn serializeShutdown(allocator: Allocator, msg: Shutdown) Allocator.Error![]u8 {
+pub fn serializeShutdown(allocator: Allocator, msg: Shutdown) message.WriteError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try message.putFrameType(&w, allocator, SHUTDOWN_TYPE);
