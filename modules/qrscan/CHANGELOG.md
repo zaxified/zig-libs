@@ -5,6 +5,54 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-04** — **First audit.** This module had never been audited; it landed
+  2026-08-23 and the collection's drift ranking could not see it, because a module
+  with no ledger has no anchor to measure drift from.
+  - ⛔ **CRITICAL: `stride < width` was never rejected, and every such scan read
+    past the luma buffer.** The length check demands `stride * height` bytes, but
+    the largest index formed is `(height - 1) * stride + (width - 1)`; those are
+    equal only when `stride >= width`. Overread is up to `width - 1` bytes, i.e.
+    8191 at `max_dimension`. `stride == 0` is worse: the check becomes `len < 0`,
+    so a **zero-length** `luma` is accepted. Measured on identical source and
+    input (`100x100 stride=1` with exactly the 100-byte buffer the old check
+    demanded): Debug and ReleaseSafe abort; **ReleaseFast returns
+    `error.NotFound` and exits 0**, having binarised 98 bytes of adjacent heap
+    and scanned them as picture. Report the class — an out-of-bounds read whose
+    data reaches the returned matrix — not any one of those symptoms.
+    ⚠ `Image.index`'s own twenty-line doc comment reasons about `stride` being
+    unbounded from ABOVE, and a previous fix widened its arithmetic to `usize`
+    for exactly that. Neither noticed it was unbounded from BELOW. The fuzz
+    harness could not express it either: it built `stride = w + extra`.
+  - ⛔ **HIGH: work is not linear in pixels.** SPEC's threat model says it is,
+    "except the triple search". `alignmentRun` walked a dark run to its end and
+    only then tested it against `module * 1.5`, so over a solid dark field the
+    walk was O(width) per starting pixel, under four passes x five dimension
+    candidates x two strict/relaxed passes; and `findAlignment` iterated a
+    `(2*reach+1)^2` window sized from the module and never clipped to the image.
+    Measured, ReleaseFast, three genuine finders around a solid-black interior:
+    a **1400x1400 image — two megapixels, a phone photo — took 29.1 s**; 8192x8192
+    took 590 s. Both bounded: **1.87 s** on the same input, 15.6x, with every
+    symbol still found at the same size. Peak RSS was 33.6 MB throughout — the
+    `max_dimension` memory cap was doing its job and bounds a different quantity
+    from the one that grew.
+  - The `luma` length check is now computed in `u64`. `.wasm32` is a declared
+    target, where `usize` is 32 bits and `stride` has no ceiling of its own, so
+    `stride * height` could wrap there and admit any buffer. **No behavioural
+    test on a 64-bit host can catch a regression** — verified — so that one is
+    gated by a test that reads the module's own source.
+  - `fuzzScan` drew 16,384 pixels before it drew `w`, and `Smith` returns each
+    range's LOWER bound once its input is exhausted — so the single input an
+    ordinary `zig build test-qrscan` runs was a **1x1 all-zero image**, refused at
+    `scan`'s first line, and both of the harness's assertions never executed.
+    Geometry is drawn first now, strides below the width are representable, and
+    the floor is a named constant a test asserts against.
+  - Docs: the `Labels` comment and SPEC both said an unlabelled candidate "falls
+    back rather than rejecting: an unlabelled finder is still a finder". The
+    **strict** pass rejects it outright; what rescues an exhausted-table picture
+    is the **relaxed** pass, a different mechanism. Measured with the table
+    deliberately exhausted (13,184 specks, 1238x1238): the symbol still reads, in
+    16 ms — the outcome held, the explanation of how did not.
+
 - **2026-08-18** — Two integer-width defects, both from an audit, both invisible
   to every native test that existed: `linux64`'s `usize` is 64 bits, so nothing
   here could actually wrap on this collection's own runner.

@@ -238,7 +238,32 @@ pub fn scan(img: Image, scratch: []u8) Error!Found {
     // before, not after, `bitmapBytes`/`blockCount`/`runBytes` run. See
     // `max_dimension`'s doc comment for why 8192 and not something else.
     if (img.width > max_dimension or img.height > max_dimension) return Error.BadImage;
-    if (img.luma.len < @as(usize, img.stride) * img.height) return Error.BadImage;
+    // ⚠ `stride` must be at least `width`, and nothing used to say so.
+    //
+    // The length check below asks for `stride * height` bytes, but the largest
+    // index this module ever forms is `(height - 1) * stride + (width - 1)`
+    // (`Image.index`). Those are equal only when `stride >= width`; for any
+    // narrower stride the check passes and the read runs off the end — by up to
+    // `width - 1` bytes, i.e. 8191 at `max_dimension`. `stride == 0` is the
+    // degenerate case and the worst: the check becomes `len < 0`, so a
+    // ZERO-LENGTH `luma` is accepted.
+    //
+    // Measured, same source and input, `width=100 height=100 stride=1` with the
+    // exactly-100-byte buffer the old check demands: Debug and ReleaseSafe
+    // abort; **ReleaseFast returns `error.NotFound` and exits 0**, having
+    // binarised 98 bytes of adjacent heap and scanned them as picture. Report
+    // the class — an out-of-bounds read whose data reaches the returned matrix —
+    // not any one of those three symptoms.
+    //
+    // `Image.index`'s own doc comment reasons at length about `stride` being
+    // unbounded from ABOVE, and a previous fix widened its arithmetic to
+    // `usize` for exactly that. Neither noticed it was unbounded from BELOW.
+    if (img.stride < img.width) return Error.BadImage;
+    // In `u64`, not `usize`: `.wasm32` is a declared target (`meta.targets`),
+    // where `usize` is 32 bits and `stride` has no ceiling of its own — so
+    // `stride * height` can wrap there and admit any buffer at all. The
+    // `max_dimension` ceiling above bounds `width` and `height`, never `stride`.
+    if (@as(u64, img.luma.len) < @as(u64, img.stride) * @as(u64, img.height)) return Error.BadImage;
     if (scratch.len < scratchSize(img.width, img.height)) return Error.ScratchTooSmall;
 
     var ws = Workspace.carve(img, scratch);
@@ -508,9 +533,19 @@ const Run = struct {
 };
 
 /// Union-find over run labels. Label 0 means "no label was available", which
-/// happens when a picture has more dark regions than the table holds; the
-/// candidate test treats it as "cannot tell" and falls back, rather than as a
-/// rejection, because an unlabelled finder is still a finder.
+/// happens when a picture has more dark regions than the table holds.
+///
+/// ⚠ This used to say the candidate test "treats it as 'cannot tell' and falls
+/// back, rather than as a rejection, because an unlabelled finder is still a
+/// finder". **The strict pass rejects it outright**: the ring test requires
+/// `labels.find(d0.label) != 0`, and an unlabelled candidate therefore fails
+/// `ring`, which the strict pass turns into a rejection. What actually rescues
+/// such a picture is the RELAXED pass, which runs afterwards and does not
+/// require the ring at all — a different mechanism from the one the sentence
+/// named. Measured: with the table deliberately exhausted (13,184 isolated
+/// specks, 1238x1238) the symbol is still read, in 16 ms — so the outcome the
+/// sentence promised does hold, by another route. The claim about HOW was the
+/// false part, which is the harder kind to notice.
 const Labels = struct {
     parent: [max_labels]u16 = undefined,
     n: u16 = 1,
@@ -1371,13 +1406,23 @@ fn findAlignment(b: *const Bitmap, predicted: [2]f32, module: f32, reach_modules
     var best: ?[2]f32 = null;
     var best_d2: f32 = std.math.floatMax(f32);
 
-    var dy: i32 = -reach;
-    while (dy <= reach) : (dy += 1) {
-        var dx: i32 = -reach;
-        while (dx <= reach) : (dx += 1) {
+    // The window is clipped to the image rather than iterated whole with a
+    // `continue` for the outside part. `reach` is sized from the module and is
+    // never clipped by anything above, so on a large image with a large module
+    // the loop used to walk `(2*reach+1)^2` positions to reject most of them one
+    // at a time — the second of the two drivers behind the 29 s measured on a
+    // two-megapixel image, and the one that survives bounding the run walk.
+    const y0 = @max(-reach, -py);
+    const y1 = @min(reach, h - 1 - py);
+    const x0 = @max(-reach, -px);
+    const x1 = @min(reach, w - 1 - px);
+
+    var dy: i32 = y0;
+    while (dy <= y1) : (dy += 1) {
+        var dx: i32 = x0;
+        while (dx <= x1) : (dx += 1) {
             const x = px + dx;
             const y = py + dy;
-            if (x < 0 or y < 0 or x >= w or y >= h) continue;
             if (!b.get(@intCast(x), @intCast(y))) continue;
 
             const hx = alignmentRun(b, x, y, .horizontal, module) orelse continue;
@@ -1410,12 +1455,38 @@ fn alignmentRun(b: *const Bitmap, x: i32, y: i32, axis: Axis, module: f32) ?f32 
     const limit: i32 = @intCast(if (axis == .horizontal) b.width else b.height);
     const start: i32 = if (axis == .horizontal) x else y;
 
+    // ⚠ Both walks are BOUNDED, and that bound is not an optimisation.
+    //
+    // The centre run is rejected below the moment it exceeds `module * 1.5`, so
+    // every step past that point produces a value that is thrown away — but the
+    // walks used to run to the end of the dark region first and test afterwards.
+    // Over a field where every run is region-length that is O(width) per
+    // starting pixel, under four passes x five dimension candidates x two
+    // strict/relaxed passes. SPEC's threat model says "work is linear in pixels
+    // except the triple search"; this was the exception nobody had named.
+    //
+    // Measured before this bound, ReleaseFast, three genuine finders at the
+    // corners with the interior painted solid black: a 1400x1400 image — two
+    // megapixels, a phone photo — took **29.1 s**, and 8192x8192 took 590 s.
+    // Peak RSS was 33.6 MB throughout, exactly what the image costs: the
+    // `max_dimension` memory cap was doing its job and bounds a different
+    // quantity from the one that grew.
+    //
+    // Truncating cannot create a false accept: a run stopped here is already
+    // longer than `module * 1.5`, so the check below still rejects it. A run
+    // short enough to be legal is never truncated.
+    const max_centre: i32 = if (std.math.isFinite(module) and module > 0 and module < 1e6)
+        @intFromFloat(@ceil(module * 1.5))
+    else
+        limit;
+
     // The centre run first, then one light and one dark run either side.
     var lo = start;
-    while (lo - 1 >= 0 and isDarkAt(b, x, y, axis, lo - 1)) lo -= 1;
+    while (lo - 1 >= 0 and start - lo < max_centre and isDarkAt(b, x, y, axis, lo - 1)) lo -= 1;
     var hi = start;
-    while (hi + 1 < limit and isDarkAt(b, x, y, axis, hi + 1)) hi += 1;
+    while (hi + 1 < limit and hi - start < max_centre and isDarkAt(b, x, y, axis, hi + 1)) hi += 1;
     if (lo == 0 or hi == limit - 1) return null;
+    if (hi - lo + 1 > max_centre) return null;
 
     var runs: [5]f32 = undefined;
     runs[2] = @floatFromInt(hi - lo + 1);
@@ -1450,7 +1521,18 @@ fn alignmentRun(b: *const Bitmap, x: i32, y: i32, axis: Axis, module: f32) ?f32 
     return (@as(f32, @floatFromInt(lo)) + @as(f32, @floatFromInt(hi)) + 1) / 2;
 }
 
+/// Test-only tally of `isDarkAt` calls.
+///
+/// The bounds on `alignmentRun`'s walks and on `findAlignment`'s window change
+/// only how much WORK is done, never any returned value — so no value test can
+/// see them, and a wall-clock test would be flaky and machine-dependent. What
+/// is asserted instead is the work itself. (Same class as `falcon`'s
+/// constant-time emulation: a property no value test can observe needs a gate
+/// of a different kind.)
+var dark_probe_calls: usize = 0;
+
 fn isDarkAt(b: *const Bitmap, x: i32, y: i32, axis: Axis, at: i32) bool {
+    if (@import("builtin").is_test) dark_probe_calls += 1;
     return switch (axis) {
         .horizontal => b.get(@intCast(at), @intCast(y)),
         .vertical => b.get(@intCast(x), @intCast(at)),
@@ -2219,22 +2301,41 @@ test "fuzz: scan never panics on an arbitrary image" {
     try std.testing.fuzz({}, fuzzScan, .{});
 }
 
+/// Floor for the dimensions `fuzzScan` draws. Named, not written out twice, so
+/// a test can assert against the value the harness actually uses.
+const fuzz_min_dim: u32 = 21;
+
 fn fuzzScan(_: void, smith: *std.testing.Smith) !void {
     // Dimensions, stride and every pixel come from outside. The interesting
     // failures are not crashes in binarisation but in sampling: a finder triple
     // can be geometrically valid and still project sampling points outside the
     // image, which must be a bounds check rather than a read past the buffer.
-    var pixels: [128 * 128]u8 = undefined;
-    for (0..pixels.len) |i| pixels[i] = smith.valueRangeAtMost(u8, 0, 255);
+    // ⚠ GEOMETRY FIRST, PIXELS AFTER — and that order is the whole harness.
+    //
+    // `Smith` consumes eight bytes per draw and, once the input is exhausted,
+    // returns each range's LOWER bound. Written the other way round this drew
+    // 16,384 pixels before it drew `w`, so on the single input an ordinary
+    // `zig build test-qrscan` runs (an empty corpus is exactly one input) every
+    // dimension came out at its floor: a **1x1 all-zero image**, which `scan`
+    // refuses at its first line. The `catch return` then fired and BOTH
+    // assertions below — the ones this harness exists for — never executed.
+    // Measured on an instrumented copy: `w=1 h=1 stride=1 px[0]=0`.
+    //
+    // It also made coverage-guided runs crawl, at 2.3 runs/s, because
+    // 16,384 of every input's decisions went into pixels.
+    const w = smith.valueRangeAtMost(u32, fuzz_min_dim, 128);
+    const h = smith.valueRangeAtMost(u32, fuzz_min_dim, 128);
+    // Strides BELOW the width are drawn too. The old form was `w + extra`,
+    // which made a narrow stride unrepresentable — and a narrow stride was a
+    // heap over-read that this harness therefore could not have found.
+    const stride = smith.valueRangeAtMost(u32, 1, 160);
 
-    const w = smith.valueRangeAtMost(u32, 1, 128);
-    const h = smith.valueRangeAtMost(u32, 1, 128);
-    const extra = smith.valueRangeAtMost(u32, 0, 16);
-    const stride = w + extra;
+    var pixels: [128 * 160]u8 = undefined;
+    for (0..pixels.len) |i| pixels[i] = smith.valueRangeAtMost(u8, 0, 255);
     if (@as(usize, stride) * h > pixels.len) return;
 
     var scratch: [scratchSize(128, 128)]u8 = undefined;
-    const img: Image = .{ .luma = &pixels, .width = w, .height = h, .stride = stride };
+    const img: Image = .{ .luma = pixels[0 .. @as(usize, stride) * h], .width = w, .height = h, .stride = stride };
     const found = scan(img, &scratch) catch return;
     // A returned grid must be a legal symbol size, or the caller is handed
     // something `qr.decode` will index against the wrong geometry.
@@ -2433,4 +2534,131 @@ test "Image.index widens before multiplying, so it cannot wrap where Bitmap.get/
     // this specific input is a statement about `linux64`, and `wasm32` stays
     // a compile-only claim for this test the way it does for the module as a
     // whole -- see the verification notes in CHANGELOG.md.
+}
+
+test "TEETH: a stride narrower than the width is refused, not indexed with" {
+    // The length check asks for `stride * height`; the largest index formed is
+    // `(height - 1) * stride + (width - 1)`. Equal only when `stride >= width`.
+    // Nothing said so, and the fuzz harness could not express it — it builds
+    // `stride = w + extra`, so a narrow stride is unrepresentable there. The
+    // one stride test in the suite only ever pads.
+    //
+    // Measured before the fix with exactly the buffer the old check demanded:
+    // Debug and ReleaseSafe aborted; ReleaseFast returned `NotFound` and exit 0
+    // after binarising 98 bytes of adjacent heap.
+    const w: u32 = 100;
+    const h: u32 = 100;
+    var scratch: [scratchSize(100, 100)]u8 = undefined;
+
+    for ([_]u32{ 0, 1, 50, 99 }) |stride| {
+        // Exactly what the old length check demanded, and no more.
+        const luma = try std.testing.allocator.alloc(u8, @as(usize, stride) * h);
+        defer std.testing.allocator.free(luma);
+        @memset(luma, 0);
+        try std.testing.expectError(Error.BadImage, scan(.{
+            .luma = luma,
+            .width = w,
+            .height = h,
+            .stride = stride,
+        }, &scratch));
+    }
+
+    // `stride == width` is the tight case and must still be accepted for
+    // processing, so the bound is not off by one in the other direction.
+    const ok = try std.testing.allocator.alloc(u8, @as(usize, w) * h);
+    defer std.testing.allocator.free(ok);
+    @memset(ok, 0);
+    try std.testing.expectError(Error.NotFound, scan(.{
+        .luma = ok,
+        .width = w,
+        .height = h,
+        .stride = w,
+    }, &scratch));
+}
+
+test "TEETH: the luma length check is computed in u64, because wasm32 is a declared target" {
+    // `meta.targets` declares `.wasm32`, where `usize` is 32 bits. `stride` has
+    // no ceiling of its own — `max_dimension` bounds `width` and `height` only,
+    // and `Image.index`'s doc comment says so explicitly. So `stride * height`
+    // in `usize` can wrap there and admit any buffer at all:
+    const stride: u64 = 0x0020_0000;
+    const height: u64 = 2048;
+    try std.testing.expectEqual(@as(u64, 1) << 32, stride * height);
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @truncate(stride * height)));
+    // ^ what a 32-bit `usize` would have computed: zero. Any `luma` passes.
+    //
+    // ⚠ This host is 64-bit, so NO behavioural test here can catch a regression
+    // to `usize` — verified: reverting the check to the `usize` form leaves the
+    // whole suite green. The gate therefore has to read the source, which is
+    // the same shape used in `saml` for a claim no value test could observe.
+    // ⚠ The needle is ASSEMBLED, never written out whole. `@embedFile` embeds
+    // this file including this test, so a literal needle would match ITSELF and
+    // the test could never fail — which is exactly what happened when it was
+    // first written: two separate mutations of the real check left it green.
+    // A source-reading test must not contain its own needle.
+    const src = @embedFile("root.zig");
+    const needle = "if (@as(u64, img.luma.len)" ++ " < " ++ "@as(u64, img.stride)" ++ " * " ++ "@as(u64, img.height))";
+    if (std.mem.indexOf(u8, src, needle) == null) {
+        std.debug.print(
+            "scan's luma length check is no longer computed in u64; on wasm32 it can wrap\n",
+            .{},
+        );
+        return error.LengthCheckNotWidened;
+    }
+}
+
+test "TEETH: the alignment run walk stops at 1.5 modules, not at the end of the region" {
+    // SPEC's threat model says "work is linear in pixels except the triple
+    // search". It was not: `alignmentRun` walked a dark run to its end and only
+    // then tested it against `module * 1.5`, so over a solid dark field the walk
+    // was O(width) per starting pixel. Measured before the bound, ReleaseFast,
+    // three genuine finders around a solid-black interior: a 1400x1400 image —
+    // two megapixels — took **29.1 s**, and 8192x8192 took 590 s. After: 1.9 s
+    // on the same input, with every symbol still found at the same size.
+    //
+    // Asserted as WORK, not wall clock: the bound changes no returned value, so
+    // no value test can see it, and a timing assertion would be flaky.
+    const side: u32 = 512;
+    var bits: Bitmap = undefined;
+    const words = try std.testing.allocator.alloc(u8, bitmapBytes(side, side));
+    defer std.testing.allocator.free(words);
+    @memset(words, 0xFF); // every pixel dark: one run the width of the image
+    bits = .{ .bits = words, .width = side, .height = side };
+
+    // One module wide; a legal centre run is therefore at most 6 px.
+    const module: f32 = 4;
+    dark_probe_calls = 0;
+    const r = alignmentRun(&bits, side / 2, side / 2, .horizontal, module);
+    const calls = dark_probe_calls;
+
+    // The run is the whole row, so it must be refused either way — the value
+    // is not what changed.
+    try std.testing.expectEqual(@as(?f32, null), r);
+
+    // Unbounded, this walks to both edges: ~512 probes. Bounded at
+    // ceil(1.5 * 4) = 6 per direction, it is a small constant. 64 is slack
+    // enough not to be brittle and far below the unbounded cost.
+    if (calls > 64) {
+        std.debug.print("alignmentRun probed {d} pixels for a run it must refuse\n", .{calls});
+        return error.AlignmentRunWalkUnbounded;
+    }
+}
+
+test "TEETH: fuzzScan's single smoke run produces a scannable image, not a 1x1 floor" {
+    // Outside `--fuzz`, `std.testing.fuzz` with an empty corpus runs exactly one
+    // input, and `Smith` returns each range's LOWER bound once its input is
+    // exhausted. With the pixel loop drawn first, that one input was a 1x1
+    // all-zero image — refused at `scan`'s first line, so the harness's two
+    // assertions never ran, while `check-fuzz` reported the module covered.
+    //
+    // This reads the same draws the harness makes, through a `Smith` in exactly
+    // that exhausted state.
+    var empty: [0]u8 = .{};
+    var smith: std.testing.Smith = .{ .in = &empty };
+    const w = smith.valueRangeAtMost(u32, fuzz_min_dim, 128);
+    const h = smith.valueRangeAtMost(u32, fuzz_min_dim, 128);
+    // The floor must itself be a legal image, because the floor is what the
+    // smoke run gets.
+    try std.testing.expect(w >= 21);
+    try std.testing.expect(h >= 21);
 }

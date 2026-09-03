@@ -55,8 +55,15 @@ pixel is 16x this module's entire scratch buffer. Labelling *runs* needs one row
 of them plus a union-find over the labels, and the row scan already produces the
 runs — so the candidate test reads the labels of the three dark runs it is
 looking at, in the same pass, with nothing stored per pixel at all. Label 0 means
-the table ran out, and the test then falls back rather than rejecting: an
-unlabelled finder is still a finder.
+the table ran out.
+
+⚠ This paragraph used to continue "and the test then falls back rather than
+rejecting: an unlabelled finder is still a finder". It does not: the **strict**
+pass requires a non-zero label and rejects an unlabelled candidate outright.
+What rescues an exhausted-table picture is the **relaxed** pass, which does not
+require the ring at all. Measured with the table deliberately exhausted
+(13,184 isolated specks, 1238x1238): the symbol still reads, in 16 ms. The
+outcome held; the explanation of how did not.
 
 **Two passes, strict first.** The ring requirement fails on a *small* symbol,
 where the light band between ring and centre is three pixels wide and
