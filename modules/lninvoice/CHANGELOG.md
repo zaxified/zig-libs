@@ -5,6 +5,74 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — Drift re-audit (last audited `d163578`, ~771 lines since). ⭐ **Nothing
+  in the shipped code was broken** — every guard mutated is correct today. What was wrong is
+  that a large share of them had no test that would notice if they stopped being, so this
+  entry is mostly teeth. Both of the previous audit's ⚠ items are genuinely closed and were
+  re-verified rather than read: the `n` amount multiplier now has a discriminating external
+  anchor (bitcoinjs/bolt11 fixtures with real `n` rows and a re-takeable recipe, one of them
+  re-derived from scratch in Python down to the recovered node key), and `bolt12.zig` is
+  fuzzed — a corpus replay shows 39 of 134 saved inputs reaching `parseTlvStream`, 12 of
+  them with two or more TLV records, so the harness's own reachability claim is true.
+  - **The `n`-present ECDSA verification had no test.** `error.InvalidSignature` appeared in
+    no test body anywhere; deleting the `ecdsaVerify` call left all 79 tests green. Without
+    it `decode` returns `verification = .declared_node_id` carrying whatever pubkey the
+    invoice CLAIMED, and a wallet trusting `verified_pubkey` pays a node id an attacker wrote
+    down. Now driven by a forged invoice whose `n` names one key while a different key signs
+    — everything else about it well formed, so ECDSA is the only thing that can reject it.
+  - **`encode` could emit an expiry `decode` refuses.** `quintetsToUint` capped at 12 digits
+    (60 bits) on the strength of a comment about what BOLT#11 fields "are"; its neighbour
+    `uintToQuintets` writes up to 13, and `EncodeParams.expiry_seconds` /
+    `min_final_cltv_expiry` are plain `u64` with no bound anywhere. At exactly 2^60 this
+    module produced a well-formed, correctly signed invoice that this module then rejected.
+    A precondition stated as a fact, with the disproof one function away. `quintetsToUint`
+    now takes the whole `u64` range and refuses only a genuine overflow
+    (`error.IntegerTooLarge`), so the round trip closes at `maxInt(u64)`.
+  - **The BOLT#12 signature-type exclusion could be widened DOWNWARDS unnoticed.** The test
+    written for exactly this pinned 240, 999, 1000 and 1001 — the upper edge and the range —
+    but nothing below 240, so `t >= 200` was green. A TLV excluded from the Merkle tree is a
+    field the signature does not commit to, so widening the exclusion downwards lets any
+    type-200..239 record be added or rewritten while the BIP-340 signature still verifies.
+    Now pinned at 239.
+  - **Fixed-width BOLT#12 fields, and both sites of the same rule.** Eight `!= N` length
+    checks could each be weakened to `< N` — accept an over-long value and take its first N
+    bytes — with the suite green, because the whole vendored corpus is well formed and a
+    genuine external corpus cannot exercise a refusal it never triggers. ⚠ Worth keeping:
+    `offer_issuer_id` is checked in **two** decoders and a mutation applied to one of them
+    reads green, so both are now driven.
+  - **`verify()` failed closed only by inspection.** Replacing `orelse return
+    error.MissingSignature` with `orelse return true` — an UNSIGNED invoice_request
+    verifying — was green. The cryptographic refusal is anchored by the payer-proof KAT; the
+    two structural refusals in front of it were not.
+  - **`bech32_raw.decode`'s `DataTooShort` bound** — the first thing an untrusted invoice
+    string touches, and what keeps `full.len - 6` from wrapping — was reached by no test at
+    all: replacing its body with `unreachable` was green, and so was weakening it to `< 1`.
+- **2026-09-03** — Docs. The file doc's "every decode path is fail-closed … a signature that
+  fails to verify/recover is a typed error" is true and reads as more than it is: on the
+  `.recovered` path `decode` **authenticates nothing**, because recovery is a function, not
+  a check. Measured by tampering every quintet of the spec donation invoice's signed payload
+  with the signature and checksum recomputed: of 5859 single-symbol variants **5430 (92%)
+  decoded successfully**, every one returning a different payee key with no error. Correct
+  and unavoidable for a recovery-only invoice — and it means the security step belongs to
+  the caller, which the module doc and README now say. README's usage snippet also called
+  `std.time.timestamp()`, removed in Zig 0.16, so the module's front door did not compile;
+  the compiled `example/` never touched that line, which is why no gate caught it.
+- **2026-08-08** — ⏪ *Backfilled 2026-09-03; these entries were missing.* **Behavioural:**
+  the BOLT#11 `9` field became a real bit vector (`5454b4e2`) — `Invoice.features` for the
+  spec's own donation vector changed from `{0x82}` to `{0x41,0x00}` and `encode` now omits an
+  all-zero `9`, so every downstream reader of that field sees different bytes. And
+  `bech32_raw.stripContinuation`'s neighbour test for a BOLT#12 `+` was tightened from "not
+  `+`, not whitespace" to "a member of the 32-symbol bech32 charset" (`03cc7f90`).
+  ⛔ **That tightening is unresolved and is recorded here rather than reverted:** `o`, `b`,
+  `i` and the separator `1` are not charset members and all occur in the BOLT#12 prefixes
+  themselves, so three `+` placements a QR/tweet splitter can legitimately produce in an
+  `lno1…` offer are now refused where they previously decoded. The vendored
+  `format-string-test.json` passes under BOTH readings — all five of its invalid `+` rows are
+  start-of-string, end-of-string or doubled-`+` — so **no external oracle backs either
+  reading**, and the commit swapped one unanchored interpretation for another. The direction
+  is fail-closed, so this is an interop question, not a security one; settling it needs a
+  reference implementation's behaviour, which is out of licence scope here.
+
 - **2026-08-21** — No behaviour change: recorded why the 65-byte signature `assert` in
   `decode` is an invariant rather than a bounds check (the `data.len < 7 + 104` rejection
   above it makes the slice exactly 104 quintets), so a future fail-open sweep does not

@@ -1601,6 +1601,20 @@ test "BOLT#12 Merkle: signature-type exclusion range [240,1000] is a range, not 
     defer allocator.free(data_bytes);
     const r_data = try merkleRoot(allocator, data_bytes);
 
+    // type=239, len=2, value=0xbeef — one BELOW the excluded range, so it MUST
+    // be walked as an ordinary leaf and change the root. Without this arm the
+    // range can be widened DOWNWARDS unnoticed: `t >= 200` left all 79 tests
+    // green. That matters because a TLV excluded from the tree is a field the
+    // BOLT#12 signature does not commit to — widen the exclusion and any
+    // type-200..239 record can be added or rewritten while the BIP-340
+    // signature still verifies.
+    var with_239: std.ArrayList(u8) = .empty;
+    defer with_239.deinit(allocator);
+    try with_239.appendSlice(allocator, data_bytes);
+    try with_239.appendSlice(allocator, &.{ 0xef, 0x02, 0xbe, 0xef });
+    const r_239 = try merkleRoot(allocator, with_239.items);
+    try testing.expect(!std.mem.eql(u8, &r_data, &r_239));
+
     // type=999 (BigSize 0xfd03e7), len=2, value=0xdead — top of the excluded
     // range; must still be ignored, same as type=240.
     var with_999: std.ArrayList(u8) = .empty;
@@ -1627,6 +1641,129 @@ test "BOLT#12 Merkle: signature-type exclusion range [240,1000] is a range, not 
     try with_1001.appendSlice(allocator, &.{ 0xfd, 0x03, 0xe9, 0x02, 0xbe, 0xef });
     const r_1001 = try merkleRoot(allocator, with_1001.items);
     try testing.expect(!std.mem.eql(u8, &r_data, &r_1001));
+}
+
+/// Build an `lnr1…` invoice_request string from a raw TLV byte stream, using
+/// this module's own bech32 encoder so the framing is correct by construction
+/// and the TLV contents are the only thing under test.
+fn ireqStringFromTlv(allocator: Allocator, tlv: []const u8) ![]u8 {
+    const quintets = try bitpack.bytesToQuintets(allocator, tlv);
+    defer allocator.free(quintets);
+    return bech32raw.encodeNoChecksum(allocator, "lnr", quintets);
+}
+
+test "TEETH: a fixed-width BOLT#12 field is refused when over-long, never truncated" {
+    // Every one of these was `!= N` in the shipped code and could be weakened
+    // to `< N` — i.e. accept an over-long value and take its first N bytes —
+    // with the entire suite green. The reason is the corpus: all 53 vendored
+    // offer rows and every signature/payer-proof vector are WELL-FORMED, so no
+    // vector ever presents an over-long fixed-width field. A genuine external
+    // corpus that cannot discriminate the refusal it is standing next to.
+    //
+    // A truncating decoder here is the classic split view: this module reads
+    // the first 33 bytes of an issuer id, the signer signed 40.
+    const allocator = testing.allocator;
+
+    const Case = struct { ty: u8, width: usize, want: anyerror };
+    // Single-byte BigSize covers every type below 253, which all four are.
+    const cases = [_]Case{
+        .{ .ty = 22, .width = 33, .want = error.BadIssuerIdLength }, // offer_issuer_id
+        .{ .ty = 80, .width = 32, .want = error.BadChainLength }, // invreq_chain
+        .{ .ty = 88, .width = 33, .want = error.BadPayerIdLength }, // invreq_payer_id
+        .{ .ty = 240, .width = 64, .want = error.BadSignatureLength }, // signature
+    };
+
+    // The offer decoder carries its OWN copy of the issuer-id length check, and
+    // a mutation applied only to the invoice_request one reads green here — two
+    // sites, one rule, so both need driving.
+    for ([_]usize{ 32, 34 }) |bad_len| {
+        var tlv: std.ArrayList(u8) = .empty;
+        defer tlv.deinit(allocator);
+        try tlv.append(allocator, 22); // offer_issuer_id
+        try tlv.append(allocator, @intCast(bad_len));
+        try tlv.appendNTimes(allocator, 0xAB, bad_len);
+        const quintets = try bitpack.bytesToQuintets(allocator, tlv.items);
+        defer allocator.free(quintets);
+        const str = try bech32raw.encodeNoChecksum(allocator, "lno", quintets);
+        defer allocator.free(str);
+        const r = decodeOffer(allocator, str);
+        testing.expectError(error.BadIssuerIdLength, r) catch |e| {
+            std.debug.print("decodeOffer accepted a {d}-byte issuer id\n", .{bad_len});
+            if (r) |o| {
+                var m = o;
+                m.deinit(allocator);
+            } else |_| {}
+            return e;
+        };
+    }
+
+    for (cases) |c| {
+        // One record of the right type carrying width+1 bytes: over-long by
+        // exactly one, so nothing but the length check can reject it.
+        var tlv: std.ArrayList(u8) = .empty;
+        defer tlv.deinit(allocator);
+        try tlv.append(allocator, c.ty);
+        try tlv.append(allocator, @intCast(c.width + 1));
+        try tlv.appendNTimes(allocator, 0xAB, c.width + 1);
+
+        const str = try ireqStringFromTlv(allocator, tlv.items);
+        defer allocator.free(str);
+        const r = decodeInvoiceRequest(allocator, str);
+        testing.expectError(c.want, r) catch |e| {
+            std.debug.print("over-long BOLT#12 type {d} was not refused\n", .{c.ty});
+            if (r) |ir| allocator.free(ir.raw) else |_| {}
+            return e;
+        };
+
+        // Under-long by one as well — the other half of `!=`.
+        var short: std.ArrayList(u8) = .empty;
+        defer short.deinit(allocator);
+        try short.append(allocator, c.ty);
+        try short.append(allocator, @intCast(c.width - 1));
+        try short.appendNTimes(allocator, 0xAB, c.width - 1);
+        const str2 = try ireqStringFromTlv(allocator, short.items);
+        defer allocator.free(str2);
+        const r2 = decodeInvoiceRequest(allocator, str2);
+        testing.expectError(c.want, r2) catch |e| {
+            std.debug.print("under-long BOLT#12 type {d} was not refused\n", .{c.ty});
+            if (r2) |ir| allocator.free(ir.raw) else |_| {}
+            return e;
+        };
+    }
+}
+
+test "TEETH: verify() fails CLOSED on a missing signature or payer id, it does not return true" {
+    // Both `verify` methods are documented "Fails closed if either field is
+    // absent", and `orelse return error.MissingSignature` could be replaced by
+    // `orelse return true` — an UNSIGNED invoice_request verifying — with all
+    // 79 tests green. The cryptographic refusal is anchored (the payer-proof
+    // KAT flips a signature bit); the two structural refusals in front of it
+    // were not.
+    const allocator = testing.allocator;
+
+    // A well-formed invoice_request carrying a payer id but no signature.
+    var no_sig: std.ArrayList(u8) = .empty;
+    defer no_sig.deinit(allocator);
+    try no_sig.append(allocator, 88); // invreq_payer_id
+    try no_sig.append(allocator, 33);
+    try no_sig.appendNTimes(allocator, 0x02, 33);
+    const s1 = try ireqStringFromTlv(allocator, no_sig.items);
+    defer allocator.free(s1);
+    var ir1 = try decodeInvoiceRequest(allocator, s1);
+    defer allocator.free(ir1.raw);
+    try testing.expectError(error.MissingSignature, ir1.verify(allocator));
+
+    // …and one carrying a signature but no payer id.
+    var no_payer: std.ArrayList(u8) = .empty;
+    defer no_payer.deinit(allocator);
+    try no_payer.append(allocator, 240); // signature
+    try no_payer.append(allocator, 64);
+    try no_payer.appendNTimes(allocator, 0x03, 64);
+    const s2 = try ireqStringFromTlv(allocator, no_payer.items);
+    defer allocator.free(s2);
+    var ir2 = try decodeInvoiceRequest(allocator, s2);
+    defer allocator.free(ir2.raw);
+    try testing.expectError(error.MissingPayerId, ir2.verify(allocator));
 }
 
 test "BOLT#12 Merkle: hostile inputs fail closed" {

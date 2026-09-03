@@ -227,15 +227,32 @@ pub fn quintetsToFeatureBytes(allocator: Allocator, quintets: []const u5) Alloca
     return out;
 }
 
-pub const IntError = error{TooManyQuintets};
+pub const IntError = error{
+    /// More base-32 digits than a `u64` can hold, whatever their values.
+    TooManyQuintets,
+    /// Exactly 13 digits (65 bits of room) whose leading digit puts the value
+    /// past `maxInt(u64)`.
+    IntegerTooLarge,
+};
 
 /// Reads `quintets` as a plain big-endian base-32 integer (BOLT#11
-/// `timestamp`/`x`/`c`: "35 bits, big-endian" etc — no byte alignment). Caps
-/// at 12 quintets (60 bits, comfortably covering every real BOLT#11 use —
-/// `timestamp` is fixed at 7, `x`/`c` are seconds/block-deltas) so the
-/// accumulator can never silently truncate a hostile oversized field.
+/// `timestamp`/`x`/`c`: "35 bits, big-endian" etc — no byte alignment).
+///
+/// Accepts the whole `u64` range, which needs **13** digits, and refuses only a
+/// genuine overflow. It used to cap at 12 on the strength of a comment — "60
+/// bits, comfortably covering every real BOLT#11 use; `timestamp` is fixed at 7,
+/// `x`/`c` are seconds/block-deltas". That was a precondition stated as a fact,
+/// and its own neighbour disproved it: `uintToQuintets` takes a `[13]u5` buffer
+/// and `EncodeParams.expiry_seconds` / `min_final_cltv_expiry` are plain `u64`
+/// with no bound anywhere, so **this module encoded well-formed, correctly
+/// signed invoices that this module then refused to decode** — measured at
+/// exactly 2^60. Two adjacent functions in one file meant two different ranges
+/// by "a u64 expiry".
 pub fn quintetsToUint(quintets: []const u5) IntError!u64 {
-    if (quintets.len > 12) return error.TooManyQuintets;
+    if (quintets.len > 13) return error.TooManyQuintets;
+    // 13 digits carry 65 bits. The leading one is what can push past u64:
+    // v = q[0]·2^60 + (a value < 2^60), so it fits iff q[0] <= 0x0F.
+    if (quintets.len == 13 and quintets[0] > 0x0F) return error.IntegerTooLarge;
     var v: u64 = 0;
     for (quintets) |q| v = (v << 5) | q;
     return v;

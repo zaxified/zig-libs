@@ -312,6 +312,24 @@ test "encode then decode round-trips, no length cap" {
     try testing.expectEqualSlices(u5, &data_buf, dec.data);
 }
 
+test "TEETH: a data part too short to hold a checksum is refused, not underflowed" {
+    // `split.data.len < 6` is the first thing an untrusted invoice string
+    // touches, and it is what keeps `full.len - 6` below from wrapping around
+    // on a `usize`. No test reached it: `error.DataTooShort` appeared in no
+    // test body in the module, replacing the body with `unreachable` kept the
+    // suite green, and so did weakening the bound to `< 1`.
+    const allocator = testing.allocator;
+    // 0..5 data characters — every length below the checksum's own width.
+    const cases = [_][]const u8{ "lnbc1", "lnbc1q", "lnbc1qq", "lnbc1qqq", "lnbc1qqqq", "lnbc1qqqqq" };
+    for (cases) |c| {
+        try testing.expectError(error.DataTooShort, decode(allocator, c));
+    }
+    // Six characters is the boundary and is long enough to reach the checksum,
+    // which then rejects it for its own reason — so the bound above is exactly
+    // where it claims to be, not one either side.
+    try testing.expectError(error.InvalidChecksum, decode(allocator, "lnbc1qqqqqq"));
+}
+
 test "decode: mixed case rejected" {
     const allocator = testing.allocator;
     try testing.expectError(error.MixedCase, decode(allocator, "Lnbc1qqqqqqqq"));

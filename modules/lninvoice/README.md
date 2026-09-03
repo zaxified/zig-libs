@@ -73,7 +73,13 @@ const fields = [_]lninvoice.TaggedFieldOut{
 const str = try lninvoice.encode(allocator, .{
     .network = .mainnet,
     .amount_msat = 250_000_000,
-    .timestamp = @intCast(std.time.timestamp()),
+    // `std.time.timestamp()` was removed in Zig 0.16 — this snippet used to
+    // call it, so the README's own example did not compile.
+    .timestamp = blk: {
+        var ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+        break :blk @intCast(ts.sec);
+    },
     .fields = &fields,
 }, .{ .private_key = my_privkey });
 defer allocator.free(str);
@@ -97,3 +103,10 @@ amount/expiry/description vectors, route-hint decode, high-S handling, RFC 6979 
 the spec's exact signature bytes) plus hostile/negative controls (bad checksum, unrecoverable
 signature, sub-millisatoshi precision, missing required fields, high-S with a declared node ID)
 — see `SPEC.md` for the full list and what each one checks.
+
+⚠ **`verification` is not a verdict on the payee.** `.declared_node_id` means the invoice named
+a node id (`n`) and the signature was checked against it. `.recovered` means no `n` was present
+and the key was *recovered* from the signature — which almost always succeeds, just with a
+different key when anything signed was tampered with: 92% of single-symbol tamperings of the
+spec's donation invoice decode fine and return a stranger's key. Compare `verified_pubkey`
+against a node id you already trust; `decode` cannot do that for you.

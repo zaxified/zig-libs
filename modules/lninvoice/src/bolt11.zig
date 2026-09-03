@@ -16,6 +16,18 @@
 //! (standard ECDSA verify) and low-S is required (BOLT#11 "MUST fail the
 //! payment" on high-S with `n` present — recovery-only invoices accept
 //! either, per spec).
+//!
+//! ⚠ **On the `.recovered` path `decode` AUTHENTICATES NOTHING, and cannot.**
+//! "Fail-closed" above is about structure and about recovery *failing*; key
+//! recovery mostly succeeds. Measured by tampering every quintet of the spec
+//! donation invoice's signed payload, signature and checksum recomputed so the
+//! string stays well formed: of 5859 single-symbol variants, **5430 (92%)
+//! decoded successfully**, every one of them returning a payee key different
+//! from the real one, with `verification = .recovered` and no error. That is
+//! correct and unavoidable for a recovery-only BOLT#11 invoice — recovery is a
+//! function, not a check — but it means the security step is the CALLER's:
+//! compare `verified_pubkey` against a node id you already trust. Only
+//! `.declared_node_id` carries an actual verification.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -908,6 +920,170 @@ test "encode -> decode round-trip: fields survive re-parsing, node ID recovered 
     try testing.expectEqualSlices(u8, &pub_compressed, &inv.verified_pubkey);
 }
 
+test "TEETH: an 'n' field naming a node that did NOT sign is refused" {
+    // The module's own security core on the `declared_node_id` path, and
+    // `error.InvalidSignature` appeared in no test body anywhere: deleting the
+    // `ecdsaVerify` call outright left all 79 tests green. Without it, `decode`
+    // returns `verification = .declared_node_id` with whatever pubkey the
+    // invoice CLAIMED, and a wallet trusting `verified_pubkey` routes payment
+    // to a node id an attacker merely wrote down.
+    const allocator = testing.allocator;
+
+    var signer_key: [32]u8 = undefined;
+    @memset(&signer_key, 0x11);
+    const signer_pub = (try k256.Secp256k1.combMulBase(signer_key, .big)).toCompressedSec1();
+
+    // A different key, whose public key the invoice will name in its `n` field.
+    var impostor_key: [32]u8 = undefined;
+    @memset(&impostor_key, 0x22);
+    const impostor_pub = (try k256.Secp256k1.combMulBase(impostor_key, .big)).toCompressedSec1();
+    try testing.expect(!std.mem.eql(u8, &signer_pub, &impostor_pub));
+
+    const payment_hash: [32]u8 = hexToBytes(32, "0001020304050607080900010203040506070809000102030405060708090102");
+    const payment_secret: [32]u8 = hexToBytes(32, "1111111111111111111111111111111111111111111111111111111111111111");
+
+    // Honest control first: `n` naming the key that actually signs.
+    {
+        const fields = [_]TaggedFieldOut{
+            .{ .payment_hash = payment_hash },
+            .{ .payment_secret = payment_secret },
+            .{ .description = "honest n-invoice" },
+            .{ .node_id = signer_pub },
+        };
+        const str = try encode(allocator, .{
+            .network = .testnet,
+            .amount_msat = 1000,
+            .timestamp = 1_700_000_000,
+            .fields = &fields,
+        }, .{ .private_key = signer_key });
+        defer allocator.free(str);
+        var inv = try decode(allocator, str);
+        defer inv.deinit(allocator);
+        try testing.expectEqual(VerificationSource.declared_node_id, inv.verification);
+        try testing.expectEqualSlices(u8, &signer_pub, &inv.verified_pubkey);
+    }
+
+    // The forgery: identical shape, but `n` names the impostor while the
+    // signature is still the signer's. Everything else about the invoice is
+    // well formed — bech32 checksum, field lengths, low-S — so the ECDSA
+    // verification is the ONLY check that can reject it.
+    {
+        const fields = [_]TaggedFieldOut{
+            .{ .payment_hash = payment_hash },
+            .{ .payment_secret = payment_secret },
+            .{ .description = "honest n-invoice" },
+            .{ .node_id = impostor_pub },
+        };
+        const str = try encode(allocator, .{
+            .network = .testnet,
+            .amount_msat = 1000,
+            .timestamp = 1_700_000_000,
+            .fields = &fields,
+        }, .{ .private_key = signer_key });
+        defer allocator.free(str);
+        try testing.expectError(error.InvalidSignature, decode(allocator, str));
+    }
+}
+
+test "TEETH: the network prefix is not guessed — an unknown one is refused, not defaulted to mainnet" {
+    // `UnknownPrefix` and `UnknownNetwork` were both deletable with the suite
+    // green, and the second is a fund-loss shape: silently reading a testnet or
+    // regtest invoice as mainnet.
+    const allocator = testing.allocator;
+    const mainnet = "lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdeessp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygs9q5sqqqqqqqqqqqqqqqqsgq2a25dxl5hrntdtn6zvydt7d66hyzsyhqs4wdynavys42xgl6sgx9c4g7me86a27t07mdtfry458rtjr0v92cnmswpsjscgt2vcse3sgpz3uapa";
+
+    // The genuine vector decodes as mainnet — the control.
+    {
+        var inv = try decode(allocator, mainnet);
+        defer inv.deinit(allocator);
+        try testing.expectEqual(Network.mainnet, inv.network);
+    }
+    // Re-spelling the HRP of a real invoice breaks its bech32 checksum, which
+    // fails first — so the prefix and network tables are driven with freshly
+    // ENCODED invoices instead, where the checksum is correct by construction
+    // and the HRP is the only thing wrong.
+    var privkey: [32]u8 = undefined;
+    @memset(&privkey, 0x44);
+    const payment_hash: [32]u8 = hexToBytes(32, "0001020304050607080900010203040506070809000102030405060708090102");
+    const payment_secret: [32]u8 = hexToBytes(32, "1111111111111111111111111111111111111111111111111111111111111111");
+    const fields = [_]TaggedFieldOut{
+        .{ .payment_hash = payment_hash },
+        .{ .payment_secret = payment_secret },
+        .{ .description = "prefix test" },
+    };
+    const testnet_str = try encode(allocator, .{
+        .network = .testnet,
+        .amount_msat = 1000,
+        .timestamp = 1_700_000_000,
+        .fields = &fields,
+    }, .{ .private_key = privkey });
+    defer allocator.free(testnet_str);
+
+    // Control: it decodes, and as TESTNET — not as mainnet.
+    {
+        var inv = try decode(allocator, testnet_str);
+        defer inv.deinit(allocator);
+        try testing.expectEqual(Network.testnet, inv.network);
+        try testing.expect(inv.network != .mainnet);
+    }
+
+    // Now re-checksum the same data part under two broken HRPs. `bech32_raw`
+    // is this module's own encoder, so both strings are structurally valid
+    // bech32 and the ONLY thing wrong is the human-readable part.
+    const sep = std.mem.lastIndexOfScalar(u8, testnet_str, '1').?;
+    const data_part = testnet_str[sep + 1 .. testnet_str.len - 6];
+    for ([_]struct { hrp: []const u8, want: anyerror }{
+        .{ .hrp = "xxtb1000n", .want = error.UnknownPrefix },
+        .{ .hrp = "lnzz1000n", .want = error.UnknownNetwork },
+    }) |c| {
+        var quintets: std.ArrayList(u5) = .empty;
+        defer quintets.deinit(allocator);
+        for (data_part) |ch| {
+            const idx = std.mem.indexOfScalar(u8, bech32raw.charset, ch).?;
+            try quintets.append(allocator, @intCast(idx));
+        }
+        const s2 = try bech32raw.encode(allocator, c.hrp, quintets.items);
+        defer allocator.free(s2);
+        try testing.expectError(c.want, decode(allocator, s2));
+    }
+}
+
+test "TEETH: a u64 expiry survives the round trip — encode cannot emit what decode refuses" {
+    // `quintetsToUint` capped at 12 quintets (60 bits) on the strength of a
+    // comment about what BOLT#11 fields "are", while `uintToQuintets` writes up
+    // to 13 and `EncodeParams.expiry_seconds` is a plain u64 with no bound. At
+    // exactly 2^60 this module produced a well-formed, correctly signed invoice
+    // that this module then refused to decode.
+    const allocator = testing.allocator;
+    var privkey: [32]u8 = undefined;
+    @memset(&privkey, 0x33);
+
+    const payment_hash: [32]u8 = hexToBytes(32, "0001020304050607080900010203040506070809000102030405060708090102");
+    const payment_secret: [32]u8 = hexToBytes(32, "1111111111111111111111111111111111111111111111111111111111111111");
+
+    for ([_]u64{ (1 << 60) - 1, 1 << 60, std.math.maxInt(u64) }) |expiry| {
+        const fields = [_]TaggedFieldOut{
+            .{ .payment_hash = payment_hash },
+            .{ .payment_secret = payment_secret },
+            .{ .description = "expiry round trip" },
+            .{ .expiry_seconds = expiry },
+        };
+        const str = try encode(allocator, .{
+            .network = .testnet,
+            .amount_msat = 1000,
+            .timestamp = 1_700_000_000,
+            .fields = &fields,
+        }, .{ .private_key = privkey });
+        defer allocator.free(str);
+        var inv = decode(allocator, str) catch |e| {
+            std.debug.print("encode emitted an expiry of {d} that decode refuses: {s}\n", .{ expiry, @errorName(e) });
+            return e;
+        };
+        defer inv.deinit(allocator);
+        try testing.expectEqual(expiry, inv.expiry_seconds);
+    }
+}
+
 test "RFC6979 byte-exact re-derivation: signing the donation vector's own hash with its own privkey reproduces its exact r/s" {
     // The strongest possible encoder check: BOLT#11's own donation-invoice
     // hash (SHA256(hrp || data-without-signature), independently confirmed
@@ -975,7 +1151,7 @@ test "BOLT#11 KAT: donation invoice ENCODE byte-exact against the spec's own lnb
 // into a wallet. Plain random bytes would die almost immediately on
 // `bech32_raw.decode`'s checksum check (a 1-in-2^30 chance of passing by
 // luck), testing nothing past it -- so this harness builds a
-// checksum-VALID bech32 string via `bech32_raw.encode` itself (real HRP
+// checksum-VALID bech32 string via `bech32raw.encode` itself (real HRP
 // grammar: "ln" + a real network prefix + an optional amount+multiplier;
 // real data-part length, biased toward >= 7+104 quintets so the
 // tagged-field loop at the heart of this file actually runs) and lets
