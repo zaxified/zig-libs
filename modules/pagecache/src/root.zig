@@ -139,26 +139,18 @@ pub const PageCache = struct {
     ref_hits: u64 = 0,
     ref_misses: u64 = 0,
     gpa: std.mem.Allocator,
-    /// Per-handle set of page indices this `PageCache` has ever put into
-    /// `cache` since that handle was last opened. Lets `vClose` forget only
-    /// the closing handle's pages via `ramcache.Cache.remove` (F5) instead of
-    /// `cache.clear()`-ing every other open file's hot pages too. A page
-    /// index stays listed even after `cache` itself evicts it under capacity
-    /// pressure — `remove` on an absent key is a defined no-op (see its doc
-    /// comment), so the set is an over-approximation of residency, never an
-    /// under-approximation, which is the direction that matters for
-    /// correctness. It costs 8 bytes of metadata per distinct page ever
-    /// touched by an open handle (vs. the 4 KiB the page itself would cost),
-    /// freed in full on `vClose`.
-    handle_pages: std.AutoHashMapUnmanaged(Storage.Handle, std.AutoHashMapUnmanaged(u64, void)) = .empty,
-
     /// Key layout for a cached page: the backend handle (so two files opened
     /// through the same cache never alias) followed by the page index.
     const key_len = 4 + 8;
 
     pub fn init(gpa: std.mem.Allocator, inner: Storage, options: Options) PageCache {
-        std.debug.assert(options.page_size > 0);
-        std.debug.assert(options.max_pages > 0);
+        // A named refusal, not `std.debug.assert`: `max_pages` has no default,
+        // so a caller computing it (`cache_bytes / page_size` with
+        // `cache_bytes < page_size`) gets 0, and in ReleaseFast the assert is
+        // `unreachable` -- measured as a SIGSEGV inside `init` itself, before
+        // it even returns. `page_size == 0` is the same shape one modulo away.
+        if (options.page_size == 0) std.debug.panic("pagecache: page_size must be > 0", .{});
+        if (options.max_pages == 0) std.debug.panic("pagecache: max_pages must be > 0", .{});
         return .{
             .inner = inner,
             .cache = ramcache.Cache.init(gpa, .{
@@ -172,9 +164,6 @@ pub const PageCache = struct {
 
     pub fn deinit(self: *PageCache) void {
         self.cache.deinit();
-        var it = self.handle_pages.valueIterator();
-        while (it.next()) |pages| pages.deinit(self.gpa);
-        self.handle_pages.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -242,7 +231,6 @@ pub const PageCache = struct {
             return null;
         }
         self.ref_misses += 1;
-        self.trackPage(h, page_index);
         const borrow = self.cache.commit(fill);
         return .{ .bytes = borrow.bytes, .borrow = borrow };
     }
@@ -271,16 +259,14 @@ pub const PageCache = struct {
         return k;
     }
 
-    /// Record that `page_index` was just inserted into `cache` under `h`, so
-    /// `vClose` can find it later. Best-effort: on allocation failure the
-    /// page simply stays untracked (it was already cached best-effort by
-    /// `ramcache.put`, which is itself a silent no-op on OOM) — it will
-    /// outlive this handle's close and only leave via `cache`'s own eviction
-    /// or a whole-cache `clear()`, same as every page did before this fix.
-    fn trackPage(self: *PageCache, h: Storage.Handle, page_index: u64) void {
-        const gop = self.handle_pages.getOrPut(self.gpa, h) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        gop.value_ptr.put(self.gpa, page_index, {}) catch {};
+    /// The key prefix every page of `h` shares: `pageKey`'s handle field.
+    /// `vClose` invalidates by this prefix over the RESIDENT set, which is
+    /// bounded by `max_pages`; there is no side table of touched pages to
+    /// keep, to grow, or to fail to allocate.
+    fn handlePrefix(handle: Storage.Handle) [4]u8 {
+        var k: [4]u8 = undefined;
+        std.mem.writeInt(u32, &k, handle, .little);
+        return k;
     }
 
     // ── Storage vtable ───────────────────────────────────────────────────────
@@ -340,7 +326,6 @@ pub const PageCache = struct {
         // page is not fully on media — never cache a partial page).
         if (n == self.page_size) {
             self.cache.put(&key, buf, 0, 0, 0);
-            self.trackPage(h, off / self.page_size);
         }
         return n;
     }
@@ -348,9 +333,26 @@ pub const PageCache = struct {
     fn vWriteAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
         const self = cast(ctx);
         // WRITE-THROUGH: the durable write happens first and must succeed
-        // before we touch the cache. On inner failure we return the error with
-        // the cache unchanged (it still holds the last correct copy).
-        try self.inner.writeAll(h, bytes, off);
+        // before we touch the cache.
+        //
+        // On inner failure the cache must not simply be left alone. "The last
+        // correct copy" assumes the write was all-or-nothing, and the real
+        // `FsStorage` shape is a looping `pwrite` whose second chunk can fail
+        // after the first landed. The resident page is then OLDER than media,
+        // and the cache MASKS the torn page from every subsequent reader in
+        // the process while a raw reader sees it -- breaking the transparency
+        // invariant in the direction that hides damage. After a failed write
+        // the media state is unknown, so the only answer we can honestly give
+        // is "absent": drop it and let the next read go to media.
+        self.inner.writeAll(h, bytes, off) catch |err| {
+            if (self.isFullPage(off, bytes.len)) {
+                const failed_key = pageKey(h, off / self.page_size);
+                _ = self.cache.remove(&failed_key);
+            } else {
+                self.cache.clear();
+            }
+            return err;
+        };
 
         if (self.isFullPage(off, bytes.len)) {
             const page_index = off / self.page_size;
@@ -358,7 +360,6 @@ pub const PageCache = struct {
             // Replace-in-place if resident (put over an existing key always
             // succeeds and never mis-admits), else offer it to the cache.
             self.cache.put(&key, bytes, 0, 0, 0);
-            self.trackPage(h, page_index);
         } else {
             // A sub-page or unaligned write could partially overlap resident
             // pages we cannot selectively invalidate; drop everything to stay
@@ -374,7 +375,11 @@ pub const PageCache = struct {
     fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
         const self = cast(ctx);
         try self.inner.truncate(h, len);
-        // Truncation can drop pages we hold; without per-key removal, clear.
+        // Truncation can drop pages we hold. This clears every open file's
+        // pages, not only this handle's -- `removeMatching(handlePrefix(h))`
+        // would narrow it, but kvtree does not truncate in normal operation,
+        // so the coarse form is left until a caller needs otherwise (SPEC
+        // backlog).
         self.cache.clear();
     }
 
@@ -382,20 +387,21 @@ pub const PageCache = struct {
         const self = cast(ctx);
         self.inner.close(h);
         // The handle number may be recycled by the backend for a different
-        // file; forget ONLY this handle's pages (F5) — other files sharing
-        // the cache keep their hot pages resident. `remove` on an already-
-        // evicted page index is a defined no-op, so an over-approximating
-        // tracked set (see `handle_pages`'s doc comment) costs a few extra
-        // no-op lookups here, never a missed invalidation.
-        if (self.handle_pages.fetchRemove(h)) |removed| {
-            var pages = removed.value;
-            var it = pages.keyIterator();
-            while (it.next()) |page_index| {
-                const key = pageKey(h, page_index.*);
-                _ = self.cache.remove(&key);
-            }
-            pages.deinit(self.gpa);
-        }
+        // file, and the key space is `(handle, page_index)` — so every page of
+        // this handle must go, while other files sharing the cache keep their
+        // hot pages resident. Sweeping the RESIDENT set by key prefix is
+        // exact, allocation-free and bounded by `max_pages`.
+        //
+        // The previous form kept a per-handle set of every page index the
+        // handle had ever touched. Two defects, both structural: the set grew
+        // with the STORE (measured at ~12 B live / ~18 B peak per distinct
+        // page, so a 4-page budget over 200 000 pages held 2.4 MB — 145x the
+        // cache's own ceiling, and the one quantity this module exists to
+        // decouple RAM from), and it was populated best-effort, so a page
+        // whose tracking allocation failed survived the close and was served
+        // to a DIFFERENT file through the recycled handle number.
+        const prefix = handlePrefix(h);
+        _ = self.cache.removeMatching(&prefix);
     }
 
     fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
@@ -1137,6 +1143,201 @@ test "F3: kvtree's read descent really takes the borrow seam, and still reads id
     // every one of them back.
     try testing.expect(pc.stats().ref_hits > ref_hits_before);
     try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+}
+
+/// A `Storage` that forwards everything to an inner one but can make
+/// `writeAll` fail -- optionally after landing part of the bytes, which is the
+/// real `FsStorage` shape (a looping `pwrite` whose second chunk can hit
+/// `ENOSPC` after the first landed).
+///
+/// The suite had no such backend, so **no test ever made an inner write fail**
+/// and `vWriteAll`'s entire error path -- the module's central safety claim --
+/// was unexercised. Two guards were deletable with the suite green because of
+/// it.
+const FaultStorage = struct {
+    inner: Storage,
+    /// Fail the write whose 0-based index is this one; `null` never fails.
+    fail_write_index: ?usize = null,
+    /// On the failing write, first land `torn_prefix` bytes on media.
+    torn_prefix: usize = 0,
+    writes: usize = 0,
+
+    fn cast(ctx: *anyopaque) *FaultStorage {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
+        return cast(ctx).inner.open(path, mode);
+    }
+    fn vSize(ctx: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
+        return cast(ctx).inner.size(h);
+    }
+    fn vPread(ctx: *anyopaque, h: Storage.Handle, buf: []u8, off: u64) Storage.Error!usize {
+        return cast(ctx).inner.pread(h, buf, off);
+    }
+    fn vWriteAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
+        const self = cast(ctx);
+        const idx = self.writes;
+        self.writes += 1;
+        if (self.fail_write_index) |fi| {
+            if (idx == fi) {
+                if (self.torn_prefix > 0) try self.inner.writeAll(h, bytes[0..self.torn_prefix], off);
+                return error.NoSpaceLeft;
+            }
+        }
+        return self.inner.writeAll(h, bytes, off);
+    }
+    fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        return cast(ctx).inner.sync(h);
+    }
+    fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
+        return cast(ctx).inner.truncate(h, len);
+    }
+    fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
+        cast(ctx).inner.close(h);
+    }
+    fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) Storage.Error!void {
+        return cast(ctx).inner.rename(old_path, new_path);
+    }
+    fn vDelete(ctx: *anyopaque, path: []const u8) Storage.Error!void {
+        return cast(ctx).inner.delete(path);
+    }
+    fn vSyncDir(ctx: *anyopaque) Storage.Error!void {
+        return cast(ctx).inner.syncDir();
+    }
+    fn vTryLock(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        return cast(ctx).inner.tryLockExclusive(h);
+    }
+    const vtable = Storage.VTable{
+        .open = vOpen,
+        .size = vSize,
+        .pread = vPread,
+        .writeAll = vWriteAll,
+        .sync = vSync,
+        .truncate = vTruncate,
+        .close = vClose,
+        .rename = vRename,
+        .delete = vDelete,
+        .syncDir = vSyncDir,
+        .tryLockExclusive = vTryLock,
+    };
+    fn storage(self: *FaultStorage) Storage {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
+test "a write that FAILS never leaves the cache holding bytes media does not have" {
+    // The write-through ordering guard (`inner.writeAll` before any cache
+    // mutation) is the module's central claim, and inverting it left the suite
+    // green: nothing ever made an inner write fail. With a backend that can,
+    // the inverted order serves bytes that never reached media.
+    const gpa = testing.allocator;
+    const page = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(page);
+    const page2 = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(page2);
+    @memset(page, 0x11);
+    @memset(page2, 0x22);
+
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var fault = FaultStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, fault.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    const h = try st.open("f", .create_truncate);
+    try st.writeAll(h, page, 0); // write 0: lands
+    fault.fail_write_index = fault.writes; // the NEXT write fails outright
+    try testing.expectError(error.NoSpaceLeft, st.writeAll(h, page2, 0));
+
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    try testing.expectEqualSlices(u8, page, &buf); // media truth, not 0x22
+
+    // And the same for a TORN write, where part of the bytes did land: the
+    // resident copy would then be OLDER than media, so the cache would hide
+    // the damage from every reader in the process while a raw reader saw it.
+    fault.fail_write_index = fault.writes;
+    fault.torn_prefix = 128;
+    try testing.expectError(error.NoSpaceLeft, st.writeAll(h, page2, 0));
+
+    _ = try st.pread(h, &buf, 0);
+    var raw: [default_page_size]u8 = undefined;
+    _ = try sim.storage().pread(h, &raw, 0);
+    try testing.expectEqualSlices(u8, &raw, &buf); // cached == media, torn or not
+    try testing.expectEqual(@as(u8, 0x22), buf[0]); // and it really is torn
+    try testing.expectEqual(@as(u8, 0x11), buf[default_page_size - 1]);
+}
+
+test "a page that is not fully present is never cached, however many times it is read" {
+    // `vPread`'s `n == page_size` gate: mutating it to `if (true)` left the
+    // suite green in both modes. What it actually prevents is a short read
+    // being stored as a whole page -- the next reader then gets `page_size`
+    // back with the PREVIOUS CALLER'S BUFFER as the tail, which in kvtree's
+    // `lookup` is `var page: [page_size]u8 = undefined`, i.e. uninitialised
+    // stack presented as a valid tree page. Reachable after a crash leaves a
+    // torn last page.
+    const gpa = testing.allocator;
+    const full = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(full);
+    @memset(full, 0x01);
+
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    const h = try st.open("short", .create_truncate);
+    try st.writeAll(h, full, 0); // page 0: whole
+    try st.writeAll(h, full[0..100], default_page_size); // page 1: 100 bytes only
+
+    var buf1: [default_page_size]u8 = undefined;
+    @memset(&buf1, 0xDD);
+    const n1 = try st.pread(h, &buf1, default_page_size);
+    try testing.expectEqual(@as(usize, 100), n1);
+
+    var buf2: [default_page_size]u8 = undefined;
+    @memset(&buf2, 0xDD);
+    const n2 = try st.pread(h, &buf2, default_page_size);
+    // The second read must report the same truth as the first. Cached, it
+    // reports a full page and hands back `0xDD` from byte 100 on.
+    try testing.expectEqual(@as(usize, 100), n2);
+    try testing.expectEqual(@as(u8, 0xDD), buf2[100]);
+}
+
+test "closing a handle forgets ALL of its resident pages, so a recycled handle cannot serve another file's bytes" {
+    // `vClose` invalidated only the pages a best-effort side table had
+    // recorded. An untracked page outlived the close, and the backend recycles
+    // handle numbers, so a `pread` of an unrelated (even empty) file returned
+    // another file's content as a HIT -- cross-file disclosure, not staleness.
+    // The sweep is over the resident set by key prefix now, so there is no
+    // side table to fail: every resident page of the handle goes.
+    const gpa = testing.allocator;
+    const page = try gpa.alloc(u8, default_page_size);
+    defer gpa.free(page);
+    @memset(page, 0xAB);
+
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+
+    const ha = try st.open("secret", .create_truncate);
+    try st.writeAll(ha, page, 0);
+    try testing.expectEqual(@as(usize, 1), pc.stats().resident_pages);
+    st.close(ha);
+    try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+
+    // A different, EMPTY file. If it lands on the recycled handle number, a
+    // surviving page would be served for it.
+    const hb = try st.open("public", .create_truncate);
+    var buf: [default_page_size]u8 = undefined;
+    @memset(&buf, 0);
+    const n = try st.pread(hb, &buf, 0);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expectEqual(@as(u8, 0), buf[0]);
 }
 
 test "F5: vClose forgets only the closing handle's pages, not every open file's (per-handle invalidation via ramcache.remove)" {

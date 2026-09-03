@@ -32,8 +32,21 @@ defer db.close();
 
 // ...use db exactly as if it were opened over fs.storage() directly...
 
-const s = pc.stats(); // { hits, misses, resident_pages, resident_bytes, evictions }
+const s = pc.stats(); // { hits, misses, resident_pages, resident_bytes,
+                       //   evictions, borrowed_pages, ref_hits, ref_misses }
 ```
+
+**Precondition: at most one open handle per path per `PageCache`.** The cache
+key is `(handle, page_index)`, which stops two files aliasing each other and
+makes two handles on the SAME file two independent key spaces — a write
+through one would be invisible to the other. kvtree's exclusive lock refuses a
+second opener on a path, so its own usage cannot reach this; a caller driving
+`pc.storage()` directly can.
+
+`preadRef`/`releasePage` are the zero-copy borrow seam: a borrowed page is not
+an eviction candidate while the borrow is outstanding, so `resident_pages` can
+exceed `max_pages` by the number of live borrows (`borrowed_pages`). kvtree's
+read descent takes this path automatically when the store can lend.
 
 Works over `SimStorage` too (set `sim.allow_overwrite = true`, since kvtree
 overwrites its meta pages in place).

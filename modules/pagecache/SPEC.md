@@ -57,27 +57,52 @@ Including the handle means two files opened through the same cache never alias.
 `ramcache` is configured with `max_entries = max_pages` and `max_bytes =
 max_pages * page_size`. `ramcache` enforces the cap on every `put` (evicting
 before returning), so **`resident_pages <= max_pages` holds at every observable
-moment**. Only page-aligned, exactly-`page_size` accesses are cached (kvtree
+moment** — except across an outstanding borrow, which is deliberately not an
+eviction candidate and is counted by `Stats.borrowed_pages` (see the borrow
+seam below). Only page-aligned, exactly-`page_size` accesses are cached (kvtree
 always issues those); any other-shaped access bypasses the cache entirely.
 
-### ramcache seam friction (and why it's fine)
+### Invalidation
 
-`ramcache` exposes no **single-key removal** (only `clear()`). This matters
-only for *invalidation* — a case that cannot produce a stale hit under
-write-through, because:
+`ramcache` now exposes `remove(key)` and `removeMatching(prefix)`, so
+invalidation is as narrow as its scope:
 
-- A resident page is **updated in place** by `put` on write-through (an
-  existing key is replaced, never mis-admitted), so it never goes stale.
-- A page leaves the cache only by **eviction** (fully removed) → the next read
-  is a miss served from the inner Storage.
+- **`close`** removes exactly the closing handle's pages, by key prefix over
+  the resident set. The backend recycles handle numbers and the key space is
+  `(handle, page_index)`, so leaving any of them behind would serve one file's
+  bytes for another's.
+- **`create_truncate` open, `truncate`, `rename`, `delete`, non-page-aligned
+  writes, and a failed write** still take a whole-cache `clear()` (a failed
+  full-page write removes just that page). All are rare or never issued by
+  kvtree, which opens `open_or_create`, never truncates in normal operation,
+  never renames or deletes, and only ever writes full pages.
 
-The residual cases where bytes could be dropped underneath us —
-`create_truncate` open, `truncate`, `close` (handle-number recycling),
-`rename`/`delete`, and non-page-aligned writes — are handled by a whole-cache
-`clear()`. All are **rare or never issued by kvtree** (kvtree opens
-`open_or_create`, never truncates in normal operation, never renames/deletes,
-and only ever writes full pages), so the coarse invalidation costs nothing in
-practice while keeping correctness unconditional.
+⚠ **What made `close` narrow before 2026-09-03 was a side table** of every
+page index each handle had ever touched. It was populated best-effort, so a
+page whose tracking allocation failed survived the close and was served for
+the next file on the recycled handle number; and it grew with the **store**,
+not with the cache — measured at ~12 B live and ~18 B peak per distinct page
+touched, so a 4-page (16 KiB) budget over 200 000 pages held 2.4 MB of
+metadata, 145× the cache's own ceiling. The budget assertions held throughout:
+the cap was real and bounded the wrong quantity. Sweeping the resident set is
+bounded by `max_pages` by construction and cannot fail to allocate.
+
+⚠ **A resident page is *not* stale-proof merely because `put` replaces in
+place.** That was the old argument here, and `ramcache.put` cannot report
+failure: when its value dupe failed it left the OLD value in the map, so the
+write-through refresh — which runs *after* the durable write has landed — left
+the cache serving pre-write bytes as a hit, indefinitely. `ramcache` now drops
+the key instead: absent is a miss, stale is corruption.
+
+### One handle per path
+
+The cache key is `(handle, page_index)`, which prevents aliasing **between**
+files and makes the cache incoherent **within** one file if two handles are
+open on it at once: a write through one is invisible to the other. kvtree's
+exclusive lock refuses a second opener on the same path, so its own usage
+cannot reach this, but `pc.storage()` is a public `Storage` and a caller
+opening the same path twice through one `PageCache` can. **Precondition: at
+most one open handle per path per `PageCache`.**
 
 ## Write policy: **write-through only** (durability preserved)
 
@@ -224,9 +249,11 @@ nanoseconds; against a real `read(2)` both are noise.
 
 ## Backlog / non-goals
 
-- **Per-key invalidation.** If `ramcache` gains a `remove(key)`, the
-  coarse-grained `clear()` on truncate/close/rename/delete could be narrowed to
-  the affected pages. Not needed for kvtree's access pattern.
+- **Narrowing the remaining `clear()`s.** `close` is narrow (by key prefix);
+  `truncate` still clears every open file's pages although only the truncated
+  handle's are affected — `removeMatching` would narrow it the same way. Not
+  needed for kvtree's access pattern, which does not truncate in normal
+  operation.
 - **Write-back / dirty buffering.** Deliberately excluded — incompatible with
   kvtree's ordered-commit durability model.
 - **Prefetch / read-ahead.** A sequential-scan read-ahead could reduce misses

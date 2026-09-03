@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — **`put` over a resident key no longer leaves the OLD value
+  behind when its value dupe fails.** `put` cannot report failure, and
+  `pagecache`'s write-through refresh calls it *after* the durable write has
+  landed — so the cache went on serving pre-write bytes as a hit,
+  indefinitely, over correct media. The `max_bytes` branch three lines up
+  already reasons this out by name ("keeping the old bytes would serve
+  pre-write data indefinitely") and calls `dropKey`; the allocator path did
+  not. Absent is a miss, stale is corruption.
+- **2026-09-03** — New: `removeMatching(prefix)`, removing every resident entry
+  whose key starts with `prefix` and returning the count. For callers whose
+  invalidation scope is a key prefix rather than one key or the whole cache —
+  `pagecache` forgetting one file handle's pages on close, where the
+  alternatives were a full `clear()` or a side table that grew with the store
+  instead of the cache. Allocation-free and therefore infallible.
 - **2026-08-11** — Security audit: fifteen findings fixed, one documented as accepted
   (not defects) — part of the collection-wide audit. Modeled on Caffeine (Java,
   conceptual) (design reference, not a test anchor).

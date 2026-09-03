@@ -527,8 +527,19 @@ pub const Cache = struct {
                 self.doomEntry(key, .replaced);
                 break :replace;
             }
-            // replace value in place, keep the stored key
-            const vdup = self.alloc.dupe(u8, value) catch return;
+            // replace value in place, keep the stored key.
+            //
+            // A `catch return` here would leave the OLD value in the map and
+            // report nothing -- exactly the stale-hit class the `max_bytes`
+            // branch above refuses by name, arrived at through the allocator
+            // instead. `pagecache`'s write-through refresh calls this after
+            // the durable write has already landed, so the resident copy
+            // would then be pre-write bytes served as a hit, forever. Absent
+            // is a miss; stale is corruption. Drop the key instead.
+            const vdup = self.alloc.dupe(u8, value) catch {
+                _ = self.dropKey(key);
+                return;
+            };
             self.fireOnEvict(e.node, key, e.value, e.dirty, .replaced);
             self.bytes -= e.value.len;
             self.alloc.free(e.value);
@@ -669,6 +680,42 @@ pub const Cache = struct {
     /// handed to the borrower and freed by the last `release` instead of here.
     pub fn remove(self: *Cache, key: []const u8) bool {
         return self.dropKey(key);
+    }
+
+    /// Remove every resident entry whose key starts with `prefix`; returns how
+    /// many were removed. Each removal is exactly `remove`, so a borrowed
+    /// entry still becomes unfindable immediately and its bytes still outlive
+    /// the call with the borrower.
+    ///
+    /// This exists for callers whose invalidation scope is a *key prefix*
+    /// rather than one key or the whole cache -- `pagecache` forgetting one
+    /// file handle's pages on close, where the alternatives were a full
+    /// `clear()` (discarding every other open file's hot pages) or a side
+    /// table of every page index the handle ever touched. That side table grew
+    /// with the STORE, which is the one quantity a bounded page cache exists
+    /// to decouple RAM from; this walks the resident set instead, which is
+    /// bounded by `max_pages` by construction.
+    ///
+    /// Allocation-free, and therefore infallible: it re-scans from the start
+    /// after each removal rather than buffering the matches, since removing
+    /// invalidates the map iterator. That is quadratic in the number of
+    /// matches within a set already bounded by the cache's own capacity, on a
+    /// path that runs once per file close.
+    pub fn removeMatching(self: *Cache, prefix: []const u8) usize {
+        var removed: usize = 0;
+        outer: while (true) {
+            var it = self.map.keyIterator();
+            while (it.next()) |k| {
+                if (k.len < prefix.len) continue;
+                if (!std.mem.eql(u8, k.*[0..prefix.len], prefix)) continue;
+                // `dropKey` frees this very slice; nothing reads it after.
+                _ = self.dropKey(k.*);
+                removed += 1;
+                continue :outer;
+            }
+            break;
+        }
+        return removed;
     }
 
     // ── borrow seam: zero-copy reads out of cache storage ───────────────────
@@ -2028,6 +2075,60 @@ test "borrow: discarding a reservation the caller also pinned still removes it" 
     c.release(also);
     try testing.expectEqual(@as(usize, 0), c.stats.pinned);
     try testing.expectEqualStrings("B", c.get("bystander", 0, 0).?);
+}
+
+test "a replace whose value dupe fails drops the key rather than serving pre-write bytes" {
+    // `put` over a resident key is the write-through refresh `pagecache` does
+    // AFTER the durable write has landed, and it cannot report failure. When
+    // the value dupe failed, the old value stayed in the map: the next read
+    // was a HIT on pre-write bytes, indefinitely -- a silently stale cache
+    // over correct media. `max_bytes` refusal three branches up already
+    // reasons this out and calls `dropKey`; the allocator path did not.
+    var hits: usize = 0;
+    var failures: usize = 0;
+    for (0..4) |n| {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var c = Cache.init(fa.allocator(), .{ .max_bytes = 1 << 20, .max_entries = 16 });
+        defer c.deinit();
+        c.put("page", "OLDOLDOLD", 0, 0, 0);
+        c.put("bystander", "B", 0, 0, 0);
+        fa.fail_index = fa.alloc_index + n;
+
+        c.put("page", "NEWNEWNEW", 0, 0, 0);
+        if (c.get("page", 0, 0)) |v| {
+            // Present: it must be the value we just wrote, never the old one.
+            try testing.expectEqualStrings("NEWNEWNEW", v);
+            hits += 1;
+        } else {
+            // Absent is the correct degradation: a miss re-reads media.
+            failures += 1;
+        }
+    }
+    // Both outcomes have to occur, or the sweep proves nothing: all-hits would
+    // mean no rung ever failed, all-misses that the write never lands.
+    try testing.expect(hits > 0);
+    try testing.expect(failures > 0);
+}
+
+test "removeMatching removes exactly the prefix, and nothing else" {
+    var c = Cache.init(testing.allocator, .{ .max_bytes = 1 << 20, .max_entries = 64 });
+    defer c.deinit();
+    // Two "handles" sharing the cache, plus a key that merely shares a byte.
+    c.put("\x01\x00page0", "a", 0, 0, 0);
+    c.put("\x01\x00page1", "b", 0, 0, 0);
+    c.put("\x01\x00page2", "c", 0, 0, 0);
+    c.put("\x02\x00page0", "d", 0, 0, 0);
+    c.put("\x01", "short", 0, 0, 0); // shorter than the prefix: not a match
+
+    try testing.expectEqual(@as(usize, 3), c.removeMatching("\x01\x00"));
+    try testing.expect(c.get("\x01\x00page0", 0, 0) == null);
+    try testing.expect(c.get("\x01\x00page1", 0, 0) == null);
+    try testing.expect(c.get("\x01\x00page2", 0, 0) == null);
+    try testing.expectEqualStrings("d", c.get("\x02\x00page0", 0, 0).?);
+    try testing.expectEqualStrings("short", c.get("\x01", 0, 0).?);
+    // Idempotent, and an empty prefix is the whole cache.
+    try testing.expectEqual(@as(usize, 0), c.removeMatching("\x01\x00"));
+    try testing.expectEqual(@as(usize, 2), c.removeMatching(""));
 }
 
 test "borrow: a reserve that fails leaves the caller's existing entry alone" {
