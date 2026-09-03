@@ -20,7 +20,7 @@
 # compared module-for-module: any disagreement is a real defect, not a
 # difference in mode/version/mask selection heuristics.
 #
-# Deliberately covers what the module's 29 self-consistency tests
+# Deliberately covers what the module's self-consistency tests
 # structurally cannot: our own round trip is blind to the module-placement
 # (zigzag `Walk`) order and to the transcribed error-correction block
 # structure table, because a decode that undoes the SAME wrong order or the

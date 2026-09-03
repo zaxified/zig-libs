@@ -5,6 +5,46 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-04** — **First audit.** Never audited before; landed 2026-08-23 and was
+  invisible to the drift ranking, which cannot see a module with no anchor.
+  **The codec itself is correct** — 2880 encoder vectors across all 40 versions x
+  4 levels x 3 modes byte-identical to segno, 960 segno-produced grids decoded
+  back to segno's own input, 25,765 exhaustive single-module flips with 0 wrong
+  answers, and ReleaseFast storms (200k arbitrary grids, 20k crafted RS-valid
+  symbols, 3.4M direct `rsDecode`) with no panic and no OOB. Every finding is
+  about tests and docs.
+  - **The decoder gained the external anchor SPEC.md said it lacked.** That file
+    named the gap in its own words — "Extending the oracle to decoding (e.g.
+    segno's matrices fed to this module's decoder) is future work". It is done:
+    `src/testdata/decode_vectors.bin`, 160 grids from **segno** (BSD-3,
+    independently authored) spanning every version 1-40 at every level, which
+    this module must read back to segno's own input. Not a round trip — nothing
+    in it was encoded here. Generator: `scripts/gen-qr-decode-vectors.py`,
+    which emits all 960; all 960 passed when this landed.
+  - ⛔ **Six of seven decoder refusal guards deleted cleanly with the whole suite
+    green.** Only the format-info BCH radius was pinned. Four now have tests,
+    each seen red under exactly that one-line deletion: the unimplemented-mode
+    reject (without it an **ECI or Kanji segment is silently reinterpreted as
+    byte data** — a different string returned, not a refusal), structured-append
+    `index > total`, numeric `v > 999`, alphanumeric `v >= 45*45`. The last two
+    are silent-corruption guards: without them a malformed symbol decodes to
+    some other string.
+    ⚠ The first version of the mode test passed under its own mutation for the
+    wrong reason — reinterpreted as byte mode, the next octet read as a count of
+    65 that did not fit, so it still errored, by a route unrelated to the guard.
+    The payload behind the indicator is a well-formed byte segment now.
+  - Docs: a test comment said "Mode indicator 0b0011 is ECI"; **0b0011 is
+    structured append**, this file's own `sequence_mode`, and ECI is 0b0111. Its
+    vector returns `BadData` from a truncated SA header, not from the branch the
+    comment named — and that branch had no test, which is how it survived to a
+    first audit. `SPEC.md` justified its fuzz harnesses with "random noise rarely
+    reaches Berlekamp-Massey"; measured, **81% of random grids do reach it**, and
+    what they essentially never reach is `parseSegments`, at 0%. A doc comment
+    claimed a check "against an independent encoder for every version from 2 to
+    40" while the committed oracle covers 10 — the claim is true (re-verified
+    across all 40) but nothing in the repo re-ran it. `reference.py` said 29
+    self-consistency tests where there are 31.
+
 - **2026-08-18** — `SPEC.md` claimed an external verification that did not exist: "672
   matrices... byte-identical", "320 matrices... byte-identical", "84 symbols" read back
   by an independent decoder, "12 sequences and 30 symbols" and "120 symbols"

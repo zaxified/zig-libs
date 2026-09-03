@@ -389,6 +389,14 @@ fn sideFor(version: u6) u16 {
 /// too — one rounds down, the other up. Checked against an independent encoder
 /// for every version from 2 to 40; 32 is the only one that disagrees, so it is
 /// an outlier in the standard's table rather than a rule this code is missing.
+///
+/// ⚠ That check was real but was never committed: `golden_matrices.zig` covers
+/// **10** versions, not 40, so nothing in the repo re-ran it. Re-verified
+/// 2026-09-04 against segno across all 40 versions, and the claim holds — but
+/// the lesson is that "checked against an independent encoder" in a comment is
+/// a past event, not a standing property, unless the check is in the tree.
+/// `testdata/decode_vectors.bin` now covers all 40 versions on the decode side;
+/// the encode side above still rests on 10.
 pub fn alignmentCentres(version: u6, out: *[7]u16) []const u16 {
     if (version == 1) return out[0..0];
     if (version == 32) {
@@ -1674,9 +1682,19 @@ test "decode reports BadData when the corrected codewords are not a well-formed 
     // module-level corruption that reliably reaches this path (any single
     // flipped module is either undone by error correction or pushes the
     // block past capability into `Uncorrectable` instead — see the
-    // "damage beyond capability" test above). Mode indicator 0b0011 is ECI,
-    // which this module does not implement and rejects as malformed data
-    // rather than silently mishandling.
+    // "damage beyond capability" test above).
+    //
+    // ⚠ This comment used to say "Mode indicator 0b0011 is ECI, which this
+    // module does not implement and rejects as malformed data". **0b0011 is
+    // structured append** — this file's own `sequence_mode` — and ECI is
+    // 0b0111. The vector below does return `BadData`, but from a TRUNCATED
+    // structured-append header (the four bits are followed by nothing), not
+    // from the unimplemented-mode branch the comment named. The branch the
+    // comment pointed at had no test at all; it has one now, in
+    // "TEETH: an unimplemented segment mode is REFUSED, not read as bytes".
+    // A test whose comment names a different code path from the one it
+    // reaches is worse than no comment: it is why that branch survived to a
+    // first audit unguarded.
     const data = [_]u8{0b0011_0000};
     try t.expectError(DecodeError.BadData, parseSegments(&data, 1, &out, &seq));
 }
@@ -1887,4 +1905,212 @@ fn fuzzSequence(_: void, smith: *std.testing.Smith) !void {
         n += part.data.len;
     }
     try std.testing.expectEqualSlices(u8, text, joined[0..n]);
+}
+
+// ── TEETH: the decoder's refusal guards, none of which had a test ───────────
+//
+// A first audit (2026-09-04) deleted seven refusal guards in `parseSegments`
+// and `rsDecode` one at a time. **Six of the seven left all 33 tests green** —
+// only the format-info BCH radius was pinned. Two of the six are
+// silent-corruption guards, not crash guards: without them a malformed symbol
+// decodes to a *different string* rather than being refused, which is the
+// failure mode a decoder must never have.
+//
+// These drive `parseSegments` directly, because building a full symbol for each
+// case would test the encoder as much as the guard.
+
+/// Bit-appender for hand-built segment streams, MSB first — the order
+/// `BitReader` reads.
+const TestBits = struct {
+    buf: [64]u8 = @splat(0),
+    n: usize = 0,
+
+    fn put(self: *TestBits, value: u32, bits: u5) void {
+        var i: u5 = bits;
+        while (i > 0) {
+            i -= 1;
+            const bit: u1 = @intCast((value >> i) & 1);
+            if (bit == 1) self.buf[self.n >> 3] |= @as(u8, 0x80) >> @intCast(self.n & 7);
+            self.n += 1;
+        }
+    }
+    fn bytes(self: *const TestBits) []const u8 {
+        return self.buf[0 .. (self.n + 7) / 8];
+    }
+};
+
+test "TEETH: an unimplemented segment mode is REFUSED, not read as bytes" {
+    // Mutating `else => return DecodeError.BadData` to `else => .byte` left the
+    // whole suite green: an ECI (0b0111) or Kanji (0b1000) segment would have
+    // been silently reinterpreted as byte data, i.e. decoded to a different
+    // string, with nothing to say so.
+    var out: [128]u8 = undefined;
+    var seq: ?Sequence = null;
+
+    // ⚠ The payload behind the bad indicator is a WELL-FORMED byte segment.
+    // A first version of this test put arbitrary bytes there, and it passed
+    // under the mutation for the wrong reason: reinterpreted as byte mode, the
+    // next octet read as a count of 65, which did not fit the buffer, so it
+    // still errored — by a route that has nothing to do with the guard. With a
+    // count of 2 and two bytes behind it, the mutated decoder succeeds and
+    // returns "hi", so only the guard itself can produce the refusal.
+    for ([_]u32{ 0b0111, 0b1000, 0b0101, 0b1001, 0b1111 }) |raw_mode| {
+        var b: TestBits = .{};
+        b.put(raw_mode, 4);
+        b.put(2, 8); // a count a byte-mode reader would accept
+        b.put('h', 8);
+        b.put('i', 8);
+        try std.testing.expectError(
+            DecodeError.BadData,
+            parseSegments(b.bytes(), 1, &out, &seq),
+        );
+    }
+
+    // Control: a byte segment on the same path still decodes, so the refusal is
+    // about the mode and not about the fixture being unreadable.
+    var ok: TestBits = .{};
+    ok.put(0b0100, 4); // byte mode
+    ok.put(2, 8); // count, 8 bits at version 1
+    ok.put('h', 8);
+    ok.put('i', 8);
+    const got = try parseSegments(ok.bytes(), 1, &out, &seq);
+    try std.testing.expectEqualStrings("hi", got);
+}
+
+test "TEETH: a structured-append index past its total is REFUSED" {
+    // `if (index > total) return BadData` deleted cleanly. A symbol claiming
+    // "part 9 of 3" would have been accepted and handed to the caller to
+    // reassemble.
+    var out: [128]u8 = undefined;
+    var seq: ?Sequence = null;
+    var b: TestBits = .{};
+    b.put(sequence_mode, 4);
+    b.put(9, 4); // index
+    b.put(3, 4); // total
+    b.put(0xAB, 8); // parity
+    b.put(0b0100, 4); // a byte segment after it
+    b.put(1, 8);
+    b.put('x', 8);
+    try std.testing.expectError(DecodeError.BadData, parseSegments(b.bytes(), 1, &out, &seq));
+
+    // Control: index == total is legal (part 3 of 3) and must be accepted.
+    var ok: TestBits = .{};
+    ok.put(sequence_mode, 4);
+    ok.put(2, 4); // index 2, i.e. the third part, 0-based
+    ok.put(2, 4);
+    ok.put(0xAB, 8);
+    ok.put(0b0100, 4);
+    ok.put(1, 8);
+    ok.put('x', 8);
+    const got = try parseSegments(ok.bytes(), 1, &out, &seq);
+    try std.testing.expectEqualStrings("x", got);
+    try std.testing.expect(seq != null);
+}
+
+test "TEETH: out-of-range numeric and alphanumeric groups are REFUSED, not folded" {
+    // Both range checks deleted cleanly. These are the silent-corruption pair:
+    // a 10-bit numeric group above 999, or an 11-bit alphanumeric pair above
+    // 44*45+44, is not a legal encoding, and without the check it decodes to
+    // *some other string* rather than being refused.
+    var out: [128]u8 = undefined;
+    var seq: ?Sequence = null;
+
+    // Numeric: one group of three digits, value 1000 (the smallest illegal).
+    var num: TestBits = .{};
+    num.put(0b0001, 4); // numeric mode
+    num.put(3, 10); // count = 3 digits, 10 bits at version 1
+    num.put(1000, 10);
+    try std.testing.expectError(DecodeError.BadData, parseSegments(num.bytes(), 1, &out, &seq));
+
+    // Alphanumeric: one pair, value 45*45 (the smallest illegal).
+    var alnum: TestBits = .{};
+    alnum.put(0b0010, 4); // alphanumeric mode
+    alnum.put(2, 9); // count = 2 chars, 9 bits at version 1
+    alnum.put(45 * 45, 11);
+    try std.testing.expectError(DecodeError.BadData, parseSegments(alnum.bytes(), 1, &out, &seq));
+
+    // Controls: the largest LEGAL value in each encoding still decodes.
+    var num_ok: TestBits = .{};
+    num_ok.put(0b0001, 4);
+    num_ok.put(3, 10);
+    num_ok.put(999, 10);
+    try std.testing.expectEqualStrings("999", try parseSegments(num_ok.bytes(), 1, &out, &seq));
+
+    var alnum_ok: TestBits = .{};
+    alnum_ok.put(0b0010, 4);
+    alnum_ok.put(2, 9);
+    alnum_ok.put(44 * 45 + 44, 11); // ":" ":" — the last pair in the table
+    _ = try parseSegments(alnum_ok.bytes(), 1, &out, &seq);
+}
+
+test "EXTERNAL ORACLE: 160 segno-produced grids decode back to segno's own input" {
+    // ⚠ Until 2026-09-04 the DECODER had no external anchor at all. SPEC.md
+    // named the gap in its own words: "It does not anchor decoding, error
+    // correction, structured append, or the renderers ... Extending the oracle
+    // to decoding (e.g. segno's matrices fed to this module's decoder) is
+    // future work, not something this pass claims to have done." The committed
+    // golden set anchors the ENCODER, and only 10 of 40 versions — so a shared
+    // misreading of the standard on the decode side would have gone unseen.
+    //
+    // These grids were produced by segno (BSD-3, independently authored) and
+    // this module must read segno's own bytes back out of them. It is not a
+    // round trip: nothing here was encoded by this module.
+    //
+    // 160 vectors: every version (1-40) at every level (L/M/Q/H), with the mode
+    // cycling so all three appear across the version range. The generator
+    // (`scripts/gen-qr-decode-vectors.py`) emits all 960; all 960 passed when
+    // this landed, and 308 KB is what is worth committing.
+    const blob = @embedFile("testdata/decode_vectors.bin");
+    var off: usize = 0;
+    const count = std.mem.readInt(u32, blob[0..4], .little);
+    off = 4;
+    try std.testing.expect(count == 160);
+
+    var seen_versions = [_]bool{false} ** 41;
+    var seen_ecc = [_]bool{false} ** 4;
+    var decoded: usize = 0;
+
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const version = blob[off];
+        const ecc_raw = blob[off + 1];
+        off += 4; // version, ecc, mode, mask
+        const size = std.mem.readInt(u16, blob[off..][0..2], .little);
+        const clen = std.mem.readInt(u16, blob[off + 2 ..][0..2], .little);
+        off += 4;
+        const content = blob[off..][0..clen];
+        off += clen;
+        const bit_bytes = (@as(usize, size) * size + 7) / 8;
+        const bits = blob[off..][0..bit_bytes];
+        off += bit_bytes;
+
+        var m: Matrix = .{ .size = size };
+        var idx: usize = 0;
+        while (idx < @as(usize, size) * size) : (idx += 1) {
+            // Row-major, MSB first, continuous across rows — the generator's
+            // documented layout.
+            const dark = (bits[idx >> 3] >> @intCast(7 - (idx & 7))) & 1 != 0;
+            m.setDark(@intCast(idx % size), @intCast(idx / size), dark);
+        }
+
+        var out: [4096]u8 = undefined;
+        const got = decode(&m, &out) catch |err| {
+            std.debug.print(
+                "vector {d} (version {d}, ecc {d}, size {d}) failed to decode: {any}\n",
+                .{ i, version, ecc_raw, size, err },
+            );
+            return err;
+        };
+        try std.testing.expectEqualStrings(content, got);
+        seen_versions[version] = true;
+        seen_ecc[ecc_raw] = true;
+        decoded += 1;
+    }
+
+    // The corpus must actually span what it claims to span, or a shrunken
+    // regenerated file would quietly narrow the anchor.
+    try std.testing.expectEqual(@as(usize, 160), decoded);
+    for (1..41) |v| try std.testing.expect(seen_versions[v]);
+    for (0..4) |e| try std.testing.expect(seen_ecc[e]);
+    try std.testing.expectEqual(blob.len, off);
 }

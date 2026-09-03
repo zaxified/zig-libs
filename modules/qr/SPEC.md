@@ -102,8 +102,17 @@ is refused before anything is indexed; the format information must land within
 the BCH code's 3-bit correction radius or it is refused; and a Reed-Solomon
 correction whose syndromes do not clear afterwards is reported rather than
 returned. Two fuzz harnesses cover the surface — one over arbitrary grids, one
-over valid symbols with modules flipped, since random noise rarely reaches
-Berlekamp-Massey but real damage does. The damage harness also asserts the
+over valid symbols with modules flipped.
+
+⚠ The reason given here used to be "since random noise rarely reaches
+Berlekamp-Massey but real damage does". **Measured, it is the wrong way round:
+81% of arbitrary grids DO reach Berlekamp-Massey** (a random grid's format bits
+are within BCH correction distance often enough, and the RS syndromes are then
+non-zero by construction). What random noise essentially never reaches is
+`parseSegments`, at **0%** — because a corrected block almost never spells a
+legal segment header. Both harnesses are still worth having; the sentence
+justified them by a fact that is not true, which is a worse footing than
+justifying them by the measured one. The damage harness also asserts the
 message when decoding succeeds, so "returns confident nonsense" is a fuzz failure
 and not merely a missing panic.
 
@@ -217,13 +226,26 @@ one-line corrected `write_padding_bits` at generation time, documented in
 full there, so the captured vectors reflect segno's real encoding logic and
 not this one bug in it.
 
-**What the external oracle does not yet cover.** It anchors the encoder's
-placement and block-structure/interleave logic. It does not anchor decoding,
-error correction, structured append, or the renderers — those remain
-self-consistency only, same as before this section was corrected. Extending
-the oracle to decoding (e.g. segno's matrices fed to this module's decoder,
-or this module's matrices fed to an independent decoder) is future work, not
-something this pass claims to have done.
+**What the external oracle covers, updated 2026-09-04.** It anchors the
+encoder's placement and block-structure/interleave logic — over **10** versions,
+not the 40 a doc comment in `root.zig` claimed had been checked.
+
+**The decoder is now anchored too.** This paragraph used to end "Extending the
+oracle to decoding (e.g. segno's matrices fed to this module's decoder …) is
+future work, not something this pass claims to have done." That work is done:
+`testdata/decode_vectors.bin` holds 160 grids produced by **segno**, spanning
+every version 1–40 at every level, which this module's decoder must read back to
+segno's own input. It is not a round trip — nothing in it was encoded here. The
+generator (`scripts/gen-qr-decode-vectors.py`) emits all 960; all 960 passed
+when this landed.
+
+Still self-consistency only: error correction beyond what those vectors
+exercise, structured append, the renderers, and mask selection — `pickMask` is
+anchored by nothing, because every golden vector FORCES a mask. A three-way vote
+over 1914 tuples put this module against qrcodegen at 81.9% agreement and
+against segno at 66.9%, with those two agreeing with each other only 64.2% — so
+this module is not the outlier, and mask choice is a quality decision the
+standard leaves open rather than a correctness one.
 
 Neither `render.zig`'s renderers nor structured append gained an external
 oracle in this pass; both are still checked by parsing rendered output back
