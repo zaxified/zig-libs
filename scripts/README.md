@@ -16,7 +16,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | `tag.sh` | Cuts a dated release tag, and re-runs every lane before it does. A tag asserts that every module passed every lane at that commit. |
 | `hooks/` | The commit-time formatting hook and its own self-test. A hook that always exits 0 looks exactly like "nothing was ever unformatted". |
 | `capped` | Memory-capped process wrapper. ⛔ Run fuzzing through it and nothing else — an uncapped sweep has taken this host down. |
-| `fuzz-sweep.sh` | Repo-wide fuzz run over the harnesses `zig build check-fuzz` requires. |
+| `fuzz-sweep.sh` | Repo-wide fuzz run over the harnesses `zig build check-fuzz` requires. ⛔ **This is the ONLY thing in the repo that actually fuzzes** — see below. |
 | `ctgrind.sh`, `ctgrind-expected.tsv` | Constant-time verification and the per-module expectations it is judged against. Needs valgrind, so it is deliberately NOT in the gate. |
 | `dark-tests.sh` | Finds modules that DECLARE tests the test binary never ran — the failure that reads as a pass. |
 | `check-http-sizeprobe.sh` | Probes the `http` module's size-limit behaviour from outside, as a consumer would. Runs on every gate — it was in the driver but missing from this table until an audit compared the two. |
@@ -396,3 +396,65 @@ It is a triage aid, not a gate. Extraction is regex-based, so a full-repo run
 reports roughly half its claims as MISMATCH — mostly ordinary prose sitting
 near a standards token, not wrong citations. Read the `file:line` before
 believing one. UNFETCHABLE is never a pass: those claims are simply unchecked.
+
+## ⛔ Fuzzing does not happen in the standing gate, and the numbers say how much
+
+Measured 2026-09-03, during the `xmlenc` drift re-audit, which found its length
+bounds deletable with the suite green and traced it here.
+
+`std.testing.fuzz(ctx, f, opts)` behaves differently depending on how the test
+binary was built. Outside `--fuzz` mode — which is every ordinary `zig build
+test-<m>`, every `scripts/test.sh` run and every CI job — Zig's test runner
+(`lib/compiler/test_runner.zig`) runs the harness on `opts.corpus` and then on
+**one** empty-string smoke input:
+
+```zig
+// When the unit test executable is not built in fuzz mode, only run the
+// provided corpus.
+for (options.corpus) |input| { … }
+// In case there is no provided corpus, also use an empty string as a smoke test.
+var smith: testing.Smith = .{ .in = "" };
+```
+
+So a harness declared as `std.testing.fuzz({}, f, .{})` — an EMPTY corpus —
+executes **exactly one input** in the lane that runs. It is a compile check, not
+coverage, and its test name asserts a property nothing checked.
+
+**203 of the repo's 226 harnesses are declared that way.** The 23 that are not
+pass a `.corpus`, and those entries do get replayed as ordinary regression inputs
+on every run — which is what a corpus is for and why it is worth adding.
+
+Three things compound it, and none of them is a bug in isolation:
+
+- `zig build check-fuzz` verifies a module **has** a harness. It cannot know
+  whether the harness ever explores anything, and its message ("obligated,
+  covered, exempt") reads as coverage.
+- `scripts/test.sh` runs `check-fuzz` and never `fuzz-sweep.sh`.
+- `.github/workflows/ci.yml` contains no fuzz step at all.
+- ⛔ And `zig build --fuzz` **does not compile on this toolchain** — it fails
+  inside std's own `test_runner`, identically for every module tried — so
+  `fuzz-sweep.sh` is the only route, and it is manual.
+
+**What to do about it.** Two routes, and the choice is about how the shapes are
+reached, not about effort:
+
+1. **An ordinary deterministic test** for each refusal, written by hand. Best
+   when the shape is easy to state directly — a blob one byte under a length
+   floor, a ciphertext that is not a whole number of blocks. This is what
+   `xmlenc` got on 2026-09-03, and it is strictly clearer than a corpus, because
+   the test says which guard it is about and fails with that guard's name.
+2. **A committed `.corpus`** on the harness. Best when the interesting input is
+   awkward to reach any other way, or when you already have crash inputs from a
+   sweep and want them replayed forever. The runner loop above is what replays
+   them, on every build, with no `--fuzz` anywhere.
+
+⚠ Steering a corpus entry needs `std.testing.Smith`'s consumption model, which is
+fully deterministic and worth knowing before you try: `bytes(out)` copies a
+prefix of the input and ZERO-FILLS the remainder, while `valueRangeAtMost` reads
+**8 little-endian bytes** and falls back to the range's LOWER BOUND both when
+fewer than 8 remain and when the value read is out of range. So a short or
+careless corpus entry silently selects the first branch of every switch — which
+looks like coverage and is not.
+
+Reserve `fuzz-sweep.sh` (through `scripts/capped` — an uncapped sweep has taken
+this host down) for actual search.
