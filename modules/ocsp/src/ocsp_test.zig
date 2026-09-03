@@ -1233,6 +1233,11 @@ const VerifyFuzzCtx = struct {
     response: []const u8,
     issuer: []const u8,
     subject: []const u8,
+    /// Half-open range of `response` occupied by the embedded certificates.
+    /// Damage inside it is excluded from the "must not verify" assertion — see
+    /// `fuzzVerify`'s note.
+    certs_start: usize,
+    certs_end: usize,
 };
 
 test "fuzz: verify's certificate and delegate parsers on damaged input" {
@@ -1283,10 +1288,14 @@ test "fuzz: verify's certificate and delegate parsers on damaged input" {
     try testing.expect(control.status == .good);
     try testing.expect(control.delegated);
 
+    const certs_slice = (try ocsp.parseResponse(resp_der)).basic.?.certs orelse
+        return error.FixtureHasNoCerts;
     const ctx = VerifyFuzzCtx{
         .response = resp_der,
         .issuer = fx.issuer_der,
         .subject = fx.subject_der,
+        .certs_start = @intFromPtr(certs_slice.ptr) - @intFromPtr(resp_der.ptr),
+        .certs_end = (@intFromPtr(certs_slice.ptr) - @intFromPtr(resp_der.ptr)) + certs_slice.len,
     };
     try testing.fuzz(&ctx, fuzzVerify, .{ .corpus = verify_seeds });
 }
@@ -1336,7 +1345,15 @@ fn fuzzVerify(ctx: *const VerifyFuzzCtx, smith: *std.testing.Smith) !void {
         },
     }
 
-    const opts: ocsp.VerifyOptions = if (mode == 0) defaultOpts() else .{
+    // ⚠ The clock is PINNED for the response-damage mode, and that is the whole
+    // difference between this harness testing what it says and testing nothing.
+    // With `now_unix` randomized here too, the freshness check rejected almost
+    // every damaged response before reaching the `DamagedResponseAccepted`
+    // assertion below — so the assertion was dead, and the harness reported "no
+    // crashes" for as long as it existed. Pinning it made the assertion fire in
+    // 287 coverage-guided runs, on a real defect. The other modes keep the
+    // random clock, which is what exercises the freshness logic itself.
+    const opts: ocsp.VerifyOptions = if (mode == 0 or mode == 1) defaultOpts() else .{
         .now_unix = smith.value(i32),
         .max_age_seconds = smith.value(u16),
         .expected_nonce = null,
@@ -1354,10 +1371,35 @@ fn fuzzVerify(ctx: *const VerifyFuzzCtx, smith: *std.testing.Smith) !void {
         if (verdict.status != .good) return error.UndamagedFixtureNotGood;
         if (!verdict.delegated) return error.UndamagedFixtureNotDelegated;
     }
-    // Every octet of this response is either inside the signed
-    // `tbsResponseData`, inside the signature over it, or in the wrapper that
-    // names the two — so a response altered anywhere must not verify.
-    if (response_damaged) return error.DamagedResponseAccepted;
+    // Every octet of this response OUTSIDE the certificates it embeds is either
+    // inside the signed `tbsResponseData`, inside the signature over it, or in
+    // the wrapper that names the two — so altering any of them must stop it
+    // verifying.
+    //
+    // ⚠ The exclusion is real and measured, not a hedge. A single-bit sweep
+    // over the whole response found 14 offsets that still verified `good`; ten
+    // were this module's (container lengths never checked for closure, the
+    // signatureAlgorithm's NULL parameters, the signature BIT STRING's
+    // unused-bits octet) and are fixed. The remaining ones are the NULL
+    // parameters inside the DELEGATE CERTIFICATE, parsed by
+    // `x509`/`std.crypto.Certificate` — a real malleability, in another
+    // module's code, recorded rather than hidden. Asserting over the whole
+    // response would make this harness permanently red for someone else's
+    // defect; asserting over nothing is what it did before. This asserts over
+    // exactly what this module is answerable for, and
+    // `TEETH: no byte of a response OUTSIDE its embedded certificates ...`
+    // pins the same boundary deterministically.
+    if (response_damaged and !damageOnlyInside(ctx, resp)) return error.DamagedResponseAccepted;
+}
+
+/// True iff every octet where `damaged` differs from the pristine response
+/// lies inside the embedded-certificate range.
+fn damageOnlyInside(ctx: *const VerifyFuzzCtx, damaged: []const u8) bool {
+    for (damaged, ctx.response, 0..) |a, b, i| {
+        if (a == b) continue;
+        if (i < ctx.certs_start or i >= ctx.certs_end) return false;
+    }
+    return true;
 }
 
 /// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
@@ -1404,4 +1446,101 @@ fn spkiOf(cert: []const u8) ![]const u8 {
     const spki_start = subject.slice.end;
     const spki = try elem(cert, spki_start);
     return cert[spki_start..spki.slice.end];
+}
+
+test "TEETH: no byte of a response OUTSIDE its embedded certificates can be altered undetected" {
+    // `verify`'s own fuzz harness asserts "a response altered anywhere must not
+    // verify". That assertion was DEAD: the damage mode also randomized
+    // `now_unix`, so the freshness check rejected almost every damaged input
+    // before the assertion could be reached. Pinning the clock — one change —
+    // made it fire in 287 coverage-guided runs.
+    //
+    // And it fires because it is TRUE. A single bit flipped at each offset in
+    // turn, over a whole 848-byte response: **14 offsets still verified
+    // `good`.** Every one of them sits outside `tbsResponseData`, so the
+    // signature cannot object; only the parser can, and it did not:
+    //
+    //   9,10 13,14 28 32 374,378  container LENGTH octets, never checked for
+    //                             exact closure ([0] EXPLICIT, ResponseBytes,
+    //                             the response OCTET STRING, BasicOCSPResponse,
+    //                             the certs wrapper)
+    //   238,239                   the `05 00` NULL parameters of the response's
+    //                             own signatureAlgorithm, never read
+    //   243                       the signature BIT STRING's unused-bits octet,
+    //                             which DER requires to be zero, never read
+    //   714,715                   the same NULL parameters inside the embedded
+    //                             DELEGATE CERTIFICATE
+    //
+    // The first three classes are this module's and are fixed. The last is not:
+    // certificate bodies are parsed by `x509`/`std.crypto.Certificate`, and the
+    // fix belongs there. This test therefore pins the exact boundary — nothing
+    // outside the certificate blob is malleable — so a regression in what was
+    // fixed goes red, and closing the `x509` half will also go red and can then
+    // tighten this to zero.
+    const gpa = testing.allocator;
+    var fx = try makeRsaFixture(gpa);
+    defer fx.deinit(gpa);
+    const issuer = try extractBits(fx.issuer_der);
+    const subject = try extractBits(fx.subject_der);
+
+    var prng = std.Random.DefaultPrng.init(0xf0e1d2c3);
+    const dkp = try rsa.generate(prng.random(), 1024, 65537);
+    const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
+        .common_name = "fuzz delegated responder",
+        .serial = 9,
+        .not_before = "200101000000Z",
+        .not_after = "400101000000Z",
+        .is_ca = false,
+    });
+    defer gpa.free(delegate_self);
+    const dbits = try extractBits(delegate_self);
+    const delegate_cert = try buildDelegateCert(gpa, fx.kp.secret_key, issuer.subject_name, try spkiOf(delegate_self), dbits.subject_name, .ocsp_signing);
+    defer gpa.free(delegate_cert);
+    const resp_der = try buildResponse(gpa, .{
+        .issuer = issuer,
+        .subject_serial = subject.serial,
+        .responder_by_name = dbits.subject_name,
+        .certs = delegate_cert,
+        .sign_rsa = dkp.secret_key,
+    });
+    defer gpa.free(resp_der);
+
+    // Where the embedded certificates start, taken from the parse rather than
+    // hardcoded, so the boundary follows the fixture.
+    const parsed_ok = try ocsp.parseResponse(resp_der);
+    const certs = parsed_ok.basic.?.certs orelse return error.FixtureHasNoCerts;
+    const certs_start = @intFromPtr(certs.ptr) - @intFromPtr(resp_der.ptr);
+    const certs_end = certs_start + certs.len;
+
+    // Positive control first: the undamaged fixture verifies, so a run of zero
+    // survivors below cannot be "nothing verifies any more".
+    try testing.expect((try ocsp.verify(parsed_ok, fx.issuer_der, fx.subject_der, defaultOpts())).status == .good);
+
+    const buf = try gpa.dupe(u8, resp_der);
+    defer gpa.free(buf);
+    var outside_survivors: usize = 0;
+    // ⚠ ALL EIGHT bit positions, not just bit 0. The first version of this
+    // sweep flipped `^= 0x01` and reported the response clean once ten offsets
+    // were fixed; the module's own fuzz harness then immediately found more,
+    // because it flips arbitrary bits. A probe weaker than the harness it is
+    // meant to explain will agree with you.
+    for (0..resp_der.len) |off| {
+        for (0..8) |bit| {
+            @memcpy(buf, resp_der);
+            buf[off] ^= (@as(u8, 1) << @intCast(bit));
+            const parsed = ocsp.parseResponse(buf) catch continue;
+            const verdict = ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()) catch continue;
+            if (verdict.status != .good) continue;
+            if (off >= certs_start and off < certs_end) continue; // the x509 half
+            outside_survivors += 1;
+            if (outside_survivors <= 20) {
+                std.debug.print("malleable at offset {d} bit {d}: byte {x:0>2}  ctx {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{
+                    off,                                       bit,                                    resp_der[off],
+                    resp_der[if (off >= 2) off - 2 else 0],    resp_der[if (off >= 1) off - 1 else 0], resp_der[@min(off + 1, resp_der.len - 1)],
+                    resp_der[@min(off + 2, resp_der.len - 1)],
+                });
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), outside_survivors);
 }

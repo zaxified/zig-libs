@@ -133,7 +133,43 @@ const oid_ecdsa_sha256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 }
 const Malformed = error{Malformed};
 
 fn el(bytes: []const u8, index: u32) Malformed!Element {
-    return ext.parseElement(bytes, index) catch error.Malformed;
+    const e = ext.parseElement(bytes, index) catch return error.Malformed;
+    try wantMinimalLength(bytes, index, e);
+    return e;
+}
+
+/// DER (X.690 §10.1) admits exactly one length encoding per length: the short
+/// form for 0..127, and otherwise the long form with the fewest possible
+/// octets. BER's other spellings — a long form where the short form fits, a
+/// leading zero, the indefinite form — are not DER and must not be accepted.
+///
+/// ⚠ Checked here, in the one place every element is parsed, rather than at
+/// call sites: the sweep that found this class found it at ONE offset (the
+/// two-octet `05 00` NULL parameters, whose length octet flipped to the
+/// indefinite form and still verified `good`), and a call-site fix would have
+/// closed exactly that offset while leaving every other element spellable two
+/// ways. A verifier's decision must not depend on which of several encodings
+/// of the same value it was handed.
+fn wantMinimalLength(bytes: []const u8, start: u32, e: Element) Malformed!void {
+    if (start + 1 >= bytes.len) return error.Malformed;
+    const first = bytes[start + 1];
+    const header_len = e.slice.start - start;
+    const content_len = e.slice.end - e.slice.start;
+
+    if (content_len <= 127) {
+        // Short form, and it must BE the short form. `0x80` is the indefinite
+        // form, which `parseElement` accepts and which also yields a two-octet
+        // header and empty content — so comparing header lengths alone lets it
+        // through. This is the octet the sweep caught: `05 00` became `05 80`
+        // and the response still verified `good`.
+        if (first != content_len) return error.Malformed;
+        return;
+    }
+    var n: u32 = 0;
+    var v = content_len;
+    while (v != 0) : (v >>= 8) n += 1;
+    if (first != 0x80 | @as(u8, @intCast(n))) return error.Malformed;
+    if (header_len != 2 + n) return error.Malformed;
 }
 
 /// Raw identifier octet — for context-specific/unnamed tags where the `Tag`
@@ -141,6 +177,56 @@ fn el(bytes: []const u8, index: u32) Malformed!Element {
 /// `@bitCast` idiom x509's own extension walk uses.
 fn rawTag(e: Element) u8 {
     return @as(u8, @bitCast(e.identifier));
+}
+
+/// The element's FULL identifier octet must equal `want` — class bits,
+/// constructed bit and tag number, not just the tag number.
+///
+/// ⚠ `e.identifier.tag` is the low five bits alone, so `!= .sequence` accepts a
+/// SEQUENCE encoded as PRIMITIVE (`0x10`), as APPLICATION class (`0x70`) or as
+/// PRIVATE class (`0xb0`). Measured: sweeping all eight bit positions of every
+/// octet of a response, **bits 5, 6 and 7 of every identifier octet outside the
+/// signed region flipped freely and the response still verified `good`**. DER
+/// gives each type exactly one encoding; a verifier that accepts three is not
+/// deciding on the bytes it was given.
+fn wantTag(e: Element, want: u8) Malformed!void {
+    if (rawTag(e) != want) return error.Malformed;
+}
+
+const TAG_SEQUENCE: u8 = 0x30;
+const TAG_OCTETSTRING: u8 = 0x04;
+const TAG_OID: u8 = 0x06;
+const TAG_BITSTRING: u8 = 0x03;
+const TAG_INTEGER: u8 = 0x02;
+const TAG_NULL: u8 = 0x05;
+
+/// The child ending at `child_end` must be the LAST thing inside a container
+/// whose content ends at `container_end` — i.e. the container closes exactly.
+///
+/// ⚠ Nothing checked this, and it is why a single-byte edit to a container's
+/// LENGTH octet left a response still verifying `good`. Measured before the
+/// fix, one bit flipped per offset over a whole response: **14 of 848 edits
+/// survived**, and eight of them were exactly this — the two-octet lengths of
+/// the `[0] EXPLICIT`, the `ResponseBytes` SEQUENCE, the `response` OCTET
+/// STRING, the `BasicOCSPResponse` SEQUENCE and the `certs` wrapper. All of
+/// those octets sit OUTSIDE `tbsResponseData`, so the signature cannot object:
+/// only the parser can, and it did not. The response was not byte-unique,
+/// which is not the property a verifier's own fuzz harness asserted it had.
+fn closes(child_end: u32, container_end: u32) Malformed!void {
+    if (child_end != container_end) return error.Malformed;
+}
+
+/// An `AlgorithmIdentifier`'s `parameters` must be absent or the ASN.1 NULL
+/// `05 00` (RFC 4055 §2.1 for the RSA OIDs this module accepts). Unchecked,
+/// the two NULL octets were free-floating: flipping either left the response
+/// verifying `good`, twice over (the response's own signatureAlgorithm and the
+/// delegate certificate's).
+fn checkAlgParams(bytes: []const u8, alg_seq: Element, oid: Element) Malformed!void {
+    if (oid.slice.end == alg_seq.slice.end) return; // absent — allowed
+    const params = try el(bytes, oid.slice.end);
+    try closes(params.slice.end, alg_seq.slice.end);
+    try wantTag(params, TAG_NULL);
+    if (params.slice.end != params.slice.start) return error.Malformed; // NULL is empty
 }
 
 fn contentOf(bytes: []const u8, e: Element) []const u8 {
@@ -216,10 +302,10 @@ fn classifyPubKey(oid: []const u8) PubKeyAlgo {
 
 fn parseCert(bytes: []const u8) Malformed!CertView {
     const cert = try el(bytes, 0);
-    if (cert.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(cert, TAG_SEQUENCE);
     const tbs_start = cert.slice.start;
     const tbs = try el(bytes, tbs_start);
-    if (tbs.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(tbs, TAG_SEQUENCE);
 
     // version [0] EXPLICIT optional, then serialNumber INTEGER.
     var pos = tbs.slice.start;
@@ -229,15 +315,15 @@ fn parseCert(bytes: []const u8) Malformed!CertView {
         first = try el(bytes, pos);
     }
     const serial = first;
-    if (serial.identifier.tag != .integer) return error.Malformed;
+    try wantTag(serial, TAG_INTEGER);
 
     const sig_alg_seq = try el(bytes, serial.slice.end);
     const issuer_start = sig_alg_seq.slice.end;
     const issuer = try el(bytes, issuer_start);
-    if (issuer.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(issuer, TAG_SEQUENCE);
 
     const validity = try el(bytes, issuer.slice.end);
-    if (validity.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(validity, TAG_SEQUENCE);
     const nb_start = validity.slice.start;
     const nb = try el(bytes, nb_start);
     const na_start = nb.slice.end;
@@ -247,18 +333,18 @@ fn parseCert(bytes: []const u8) Malformed!CertView {
 
     const subject_start = validity.slice.end;
     const subject = try el(bytes, subject_start);
-    if (subject.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(subject, TAG_SEQUENCE);
 
     const spki_start = subject.slice.end;
     const spki = try el(bytes, spki_start);
-    if (spki.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(spki, TAG_SEQUENCE);
     const alg_seq = try el(bytes, spki.slice.start);
-    if (alg_seq.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(alg_seq, TAG_SEQUENCE);
     const alg_oid = try el(bytes, alg_seq.slice.start);
-    if (alg_oid.identifier.tag != .object_identifier) return error.Malformed;
+    try wantTag(alg_oid, TAG_OID);
     const pub_algo = classifyPubKey(contentOf(bytes, alg_oid));
     const spk = try el(bytes, alg_seq.slice.end);
-    if (spk.identifier.tag != .bitstring) return error.Malformed;
+    try wantTag(spk, TAG_BITSTRING);
     const spk_content = contentOf(bytes, spk);
     if (spk_content.len < 1) return error.Malformed; // at least the unused-bits octet
     // subjectPublicKey value = BIT STRING content minus the leading unused-bits
@@ -268,13 +354,19 @@ fn parseCert(bytes: []const u8) Malformed!CertView {
 
     // Outer signatureAlgorithm + signatureValue (siblings of tbsCertificate).
     const outer_alg = try el(bytes, tbs.slice.end);
-    if (outer_alg.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(outer_alg, TAG_SEQUENCE);
     const outer_oid = try el(bytes, outer_alg.slice.start);
-    if (outer_oid.identifier.tag != .object_identifier) return error.Malformed;
+    try wantTag(outer_oid, TAG_OID);
     const sig_val = try el(bytes, outer_alg.slice.end);
-    if (sig_val.identifier.tag != .bitstring) return error.Malformed;
+    try wantTag(sig_val, TAG_BITSTRING);
     const sig_content = contentOf(bytes, sig_val);
     if (sig_content.len < 1) return error.Malformed;
+    // X.690 §8.6.2.3 / DER: the initial octet counts the unused bits in the
+    // final octet, and a signature is a whole number of octets, so it must be
+    // zero. It was never read: flipping it left the response verifying `good`,
+    // twice over. The octet is outside `tbsResponseData`, so the signature
+    // cannot object to it either.
+    if (sig_content[0] != 0) return error.Malformed;
 
     return .{
         .tbs = tlvOf(bytes, tbs_start, tbs),
@@ -482,7 +574,7 @@ pub const ParseError = error{Malformed};
 /// panics on malformed input, rejects trailing garbage past the outer SEQUENCE.
 pub fn parseResponse(bytes: []const u8) ParseError!Response {
     const outer = try el(bytes, 0);
-    if (outer.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(outer, TAG_SEQUENCE);
     if (outer.slice.end != bytes.len) return error.Malformed; // no trailing garbage
 
     const status_elem = try el(bytes, outer.slice.start);
@@ -498,11 +590,14 @@ pub fn parseResponse(bytes: []const u8) ParseError!Response {
     const rb_ctx = try el(bytes, status_elem.slice.end);
     if (rawTag(rb_ctx) != 0xa0) return error.Malformed;
     const rb = try el(bytes, rb_ctx.slice.start); // ResponseBytes SEQUENCE
-    if (rb.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(rb, TAG_SEQUENCE);
+    try closes(rb.slice.end, rb_ctx.slice.end); // [0] EXPLICIT holds exactly one
+    try closes(rb_ctx.slice.end, outer.slice.end);
     const resp_type = try el(bytes, rb.slice.start);
-    if (resp_type.identifier.tag != .object_identifier) return error.Malformed;
+    try wantTag(resp_type, TAG_OID);
     const resp_octet = try el(bytes, resp_type.slice.end);
-    if (resp_octet.identifier.tag != .octetstring) return error.Malformed;
+    try wantTag(resp_octet, TAG_OCTETSTRING);
+    try closes(resp_octet.slice.end, rb.slice.end);
 
     if (!std.mem.eql(u8, contentOf(bytes, resp_type), &oid_ocsp_basic)) {
         // Successful but a response type we do not decode (fail closed at verify).
@@ -516,21 +611,29 @@ pub fn parseResponse(bytes: []const u8) ParseError!Response {
 fn parseBasic(bytes: []const u8, resp_octet: Element) Malformed!Basic {
     // resp_octet content = BasicOCSPResponse SEQUENCE.
     const bor = try el(bytes, resp_octet.slice.start);
-    if (bor.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(bor, TAG_SEQUENCE);
+    try closes(bor.slice.end, resp_octet.slice.end);
 
     const tbs_start = bor.slice.start;
     const tbs = try el(bytes, tbs_start); // ResponseData
-    if (tbs.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(tbs, TAG_SEQUENCE);
 
     const sig_alg = try el(bytes, tbs.slice.end); // signatureAlgorithm
-    if (sig_alg.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(sig_alg, TAG_SEQUENCE);
     const sig_alg_oid = try el(bytes, sig_alg.slice.start);
-    if (sig_alg_oid.identifier.tag != .object_identifier) return error.Malformed;
+    try wantTag(sig_alg_oid, TAG_OID);
+    try checkAlgParams(bytes, sig_alg, sig_alg_oid);
 
     const sig_val = try el(bytes, sig_alg.slice.end); // signature BIT STRING
-    if (sig_val.identifier.tag != .bitstring) return error.Malformed;
+    try wantTag(sig_val, TAG_BITSTRING);
     const sig_content = contentOf(bytes, sig_val);
     if (sig_content.len < 1) return error.Malformed;
+    // X.690 §8.6.2.3 / DER: the initial octet counts the unused bits in the
+    // final octet, and a signature is a whole number of octets, so it must be
+    // zero. It was never read: flipping it left the response verifying `good`,
+    // twice over. The octet is outside `tbsResponseData`, so the signature
+    // cannot object to it either.
+    if (sig_content[0] != 0) return error.Malformed;
 
     // certs [0] EXPLICIT SEQUENCE OF Certificate, optional.
     var certs: ?[]const u8 = null;
@@ -538,7 +641,9 @@ fn parseBasic(bytes: []const u8, resp_octet: Element) Malformed!Basic {
         const certs_ctx = try el(bytes, sig_val.slice.end);
         if (rawTag(certs_ctx) == 0xa0) {
             const certs_seq = try el(bytes, certs_ctx.slice.start);
-            if (certs_seq.identifier.tag != .sequence) return error.Malformed;
+            try wantTag(certs_seq, TAG_SEQUENCE);
+            try closes(certs_seq.slice.end, certs_ctx.slice.end);
+            try closes(certs_ctx.slice.end, bor.slice.end);
             certs = contentOf(bytes, certs_seq);
         }
     }
@@ -554,7 +659,7 @@ fn parseBasic(bytes: []const u8, resp_octet: Element) Malformed!Basic {
         0xa1 => .{ .by_name = tlvOf(bytes, e.slice.start, try el(bytes, e.slice.start)) },
         0xa2 => blk: {
             const kh = try el(bytes, e.slice.start);
-            if (kh.identifier.tag != .octetstring) return error.Malformed;
+            try wantTag(kh, TAG_OCTETSTRING);
             break :blk .{ .by_key = contentOf(bytes, kh) };
         },
         else => return error.Malformed,
@@ -564,7 +669,7 @@ fn parseBasic(bytes: []const u8, resp_octet: Element) Malformed!Basic {
     const produced_at = try parseGeneralizedTime(contentOf(bytes, produced));
 
     const responses_seq = try el(bytes, produced.slice.end);
-    if (responses_seq.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(responses_seq, TAG_SEQUENCE);
 
     // responseExtensions [1] EXPLICIT, optional — scan for the nonce.
     var nonce: ?[]const u8 = null;
@@ -572,7 +677,7 @@ fn parseBasic(bytes: []const u8, resp_octet: Element) Malformed!Basic {
         const re_ctx = try el(bytes, responses_seq.slice.end);
         if (rawTag(re_ctx) == 0xa1) {
             const re_seq = try el(bytes, re_ctx.slice.start);
-            if (re_seq.identifier.tag != .sequence) return error.Malformed;
+            try wantTag(re_seq, TAG_SEQUENCE);
             nonce = try findNonce(bytes, re_seq);
         }
     }
@@ -596,17 +701,17 @@ fn findNonce(bytes: []const u8, exts_seq: Element) Malformed!?[]const u8 {
     var pos = exts_seq.slice.start;
     while (pos < exts_seq.slice.end) {
         const extn = try el(bytes, pos);
-        if (extn.identifier.tag != .sequence) return error.Malformed;
+        try wantTag(extn, TAG_SEQUENCE);
         pos = extn.slice.end;
         const oid_elem = try el(bytes, extn.slice.start);
-        if (oid_elem.identifier.tag != .object_identifier) return error.Malformed;
+        try wantTag(oid_elem, TAG_OID);
         var after = try el(bytes, oid_elem.slice.end);
         if (after.identifier.tag == .boolean) after = try el(bytes, after.slice.end); // skip critical
-        if (after.identifier.tag != .octetstring) return error.Malformed;
+        try wantTag(after, TAG_OCTETSTRING);
         if (std.mem.eql(u8, contentOf(bytes, oid_elem), &oid_ocsp_nonce)) {
             // extnValue OCTET STRING wraps the DER of Nonce (itself an OCTET STRING).
             const inner = try el(bytes, after.slice.start);
-            if (inner.identifier.tag != .octetstring) return error.Malformed;
+            try wantTag(inner, TAG_OCTETSTRING);
             return contentOf(bytes, inner);
         }
     }
@@ -812,7 +917,7 @@ fn resolveDelegate(basic: Basic, issuer: CertView, now_unix: i64) VerifyError!Ce
 
     while (pos < end) {
         const cert_elem = el(bytes, pos) catch return error.Malformed;
-        if (cert_elem.identifier.tag != .sequence) return error.Malformed;
+        try wantTag(cert_elem, TAG_SEQUENCE);
         const cert_der = bytes[pos..cert_elem.slice.end];
         pos = cert_elem.slice.end;
 
@@ -945,11 +1050,11 @@ fn findMatchingSingle(basic: Basic, issuer: CertView, subject_serial: []const u8
 
     while (pos < end) {
         const single = el(bytes, pos) catch return error.Malformed;
-        if (single.identifier.tag != .sequence) return error.Malformed;
+        try wantTag(single, TAG_SEQUENCE);
         pos = single.slice.end;
 
         const cert_id = el(bytes, single.slice.start) catch return error.Malformed;
-        if (cert_id.identifier.tag != .sequence) return error.Malformed;
+        try wantTag(cert_id, TAG_SEQUENCE);
 
         if (!(certIdBinds(&digests, bytes, cert_id, issuer, subject_serial) catch return error.Malformed))
             continue;
@@ -964,17 +1069,17 @@ fn findMatchingSingle(basic: Basic, issuer: CertView, subject_serial: []const u8
 /// them (via `digests`) at most once per algorithm for the whole walk.
 fn certIdBinds(digests: *DigestCache, bytes: []const u8, cert_id: Element, issuer: CertView, subject_serial: []const u8) Malformed!bool {
     const alg_seq = try el(bytes, cert_id.slice.start);
-    if (alg_seq.identifier.tag != .sequence) return error.Malformed;
+    try wantTag(alg_seq, TAG_SEQUENCE);
     const alg_oid = try el(bytes, alg_seq.slice.start);
-    if (alg_oid.identifier.tag != .object_identifier) return error.Malformed;
+    try wantTag(alg_oid, TAG_OID);
     const algo = hashAlgoFromOid(contentOf(bytes, alg_oid)) orelse return false;
 
     const name_hash = try el(bytes, alg_seq.slice.end);
-    if (name_hash.identifier.tag != .octetstring) return error.Malformed;
+    try wantTag(name_hash, TAG_OCTETSTRING);
     const key_hash = try el(bytes, name_hash.slice.end);
-    if (key_hash.identifier.tag != .octetstring) return error.Malformed;
+    try wantTag(key_hash, TAG_OCTETSTRING);
     const serial = try el(bytes, key_hash.slice.end);
-    if (serial.identifier.tag != .integer) return error.Malformed;
+    try wantTag(serial, TAG_INTEGER);
 
     const want = digests.get(algo, issuer);
 

@@ -191,10 +191,15 @@ oracle" reasoning, CONVENTIONS.md §5 / root NOTICE §0). No root NOTICE change
 accompanies this addition.
 
 A mutation teeth-check confirmed the goldens are load-bearing: dropping the
-SHA-1 arm of `hashAlgoFromOid` turns exactly the three real-response tests
-red (`CertIdMismatch`) while all nineteen constructed-fixture tests above
-stay green, because none of them ever hashes a response `CertID` with SHA-1
-— precisely the blind spot real data and only real data catches here.
+SHA-1 arm of `hashAlgoFromOid` turns the real-response tests red
+(`CertIdMismatch`) while the constructed-fixture tests stay green, because
+none of them ever hashes a response `CertID` with SHA-1 — precisely the blind
+spot real data and only real data catches here.
+⚠ The counts that used to be in that sentence ("exactly the three … all
+nineteen") were stale: re-measured, **5** go red (two as
+`TestUnexpectedError`) and there are **25** constructed tests. The claim
+survives; the numbers did not. A count in prose is a measurement with no
+gate under it, and it ages every time a test is added.
 
 ## Deferred (out of scope, not silently skipped)
 
@@ -223,6 +228,7 @@ test-ocsp` — green in Debug and ReleaseFast.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** request CertID cross-checked by independent extractBits (REDERIVED); responses self-signed fixtures
+**What the tests actually contain.** request CertID cross-checked by independent extractBits (REDERIVED); responses anchored on real captures AND on OpenSSL-signed fixtures.
+⚠ This line used to end "responses self-signed fixtures", two lines above the sentence recording that real DigiCert and GoDaddy responses had landed. It was a generated block that went stale against the paragraph directly below it, and it understated the module's own anchoring — the example's two responses are OpenSSL-signed and re-verify with `openssl ocsp` → `Response verify OK`.
 
 **How it got there.** The anchoring work landed. DONE 6c2d6d9: real DigiCert + GoDaddy responses captured; delegated responder now exercised
