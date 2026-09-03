@@ -181,7 +181,52 @@ const digest_placeholder_slo = "__SLO_DIGEST_PLACEHOLDER__";
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// A decompression-bomb cap for the HTTP-Redirect (DEFLATE) binding.
-pub const max_redirect_inflated = 1 << 20;
+///
+/// ⚠ This bounds the inflated OCTETS, and the quantity that grows is the parse
+/// tree the very next call builds — those are only loosely related, and the
+/// relation is superlinear. Measured in ReleaseFast on `<a/>`-dense,
+/// perfectly well-formed XML: 1 MiB of source parses into **163,139,946 bytes**
+/// of peak live allocation (155.6x; 64 KiB gives 96.7x, 256 KiB 122.7x). At the
+/// old value of `1 << 20` a **1,496-byte** `SAMLRequest` query field — one
+/// unauthenticated GET, no session, no credentials — reached ~163 MB, all of it
+/// before any signature exists to check, since the redirect binding carries no
+/// `<ds:Signature>` in the document at all.
+///
+/// Two bounds now compose instead of one bounding the wrong thing: this one is
+/// 64 KiB, which is ample for a real `LogoutRequest` (a few hundred bytes) and
+/// generous for a redirect-bound `AuthnRequest`, and `max_untrusted_elements`
+/// below bounds the tree directly.
+pub const max_redirect_inflated = 64 << 10;
+
+/// Element budget for any document that arrives from an unauthenticated peer.
+///
+/// `xml.Options.max_depth` bounds nesting and says nothing about breadth, which
+/// is the cheap shape — see `max_redirect_inflated` for the measurement. A real
+/// SAML `Response` with a handful of attributes is on the order of a hundred
+/// elements; 8192 leaves an order of magnitude of headroom and caps the parse
+/// at roughly a megabyte instead of at whatever the source allows.
+pub const max_untrusted_elements = 8192;
+
+/// `xml.Options` for a SAML protocol document from an untrusted peer: this
+/// module's ID rule plus the element budget.
+///
+/// Every parse of attacker-supplied bytes goes through this or
+/// `untrustedMetadataXmlOptions`, so the budget cannot be forgotten at one call
+/// site — and that sentence is asserted by a test rather than merely written,
+/// because a first draft of it was already false: three sites inlined the same
+/// options instead of calling the helper, which carries the property but not the
+/// guarantee the sentence claims.
+fn untrustedXmlOptions() xml.Options {
+    return .{ .id_attr_names = &.{"ID"}, .max_elements = max_untrusted_elements };
+}
+
+/// As `untrustedXmlOptions`, for IdP METADATA. Metadata is not a SAML protocol
+/// message and carries no signed `#id` reference this module resolves, so it
+/// deliberately keeps `xml`'s default `id_attr_names` — the one reason it cannot
+/// share the helper above.
+fn untrustedMetadataXmlOptions() xml.Options {
+    return .{ .max_elements = max_untrusted_elements };
+}
 
 // ── configuration ────────────────────────────────────────────────────────────
 
@@ -358,6 +403,20 @@ pub const AuthnResult = struct {
     arena: std.heap.ArenaAllocator,
 
     /// The authenticated subject identifier (`<NameID>` text).
+    ///
+    /// ⚠ **CONVENTIONS §2.1 Z2 — the caller's to destroy.** On the
+    /// `<EncryptedID>` / `<EncryptedAssertion>` paths this is recovered
+    /// plaintext: a subject identity the IdP encrypted precisely so it would not
+    /// travel in the clear. `deinit` tears the arena down without wiping it,
+    /// which in ReleaseFast means the bytes go back to the allocator intact —
+    /// exactly the mode where the transient wipes this module already does are
+    /// load-bearing. `std.crypto.secureZero` it (and `attributes`) before
+    /// `deinit` if the identity is sensitive in your deployment.
+    ///
+    /// The sentence was missing until 2026-09-03: the zeroization pass wiped the
+    /// three transient decrypted buffers (Z1) and did not discharge the Z2
+    /// obligation on the longest-lived copy of the same secret. `xmlenc`, one
+    /// layer down, carries it.
     name_id: []const u8,
     /// `<NameID Format>` if present.
     name_id_format: ?[]const u8,
@@ -368,6 +427,10 @@ pub const AuthnResult = struct {
     /// `<AuthnContextClassRef>` text if present.
     authn_context_class_ref: ?[]const u8,
     /// Attributes in document order.
+    ///
+    /// ⚠ **CONVENTIONS §2.1 Z2 — the caller's to destroy**, for the same reason
+    /// as `name_id`: an `<EncryptedAttribute>` value arrives here as recovered
+    /// plaintext.
     attributes: []const Attribute,
 
     /// The assertion's `<Conditions NotOnOrAfter>` as Unix seconds, if present —
@@ -551,9 +614,7 @@ pub fn consumeResponse(alloc: std.mem.Allocator, saml_response_field: []const u8
 
 /// Consume an already-base64-decoded `<samlp:Response>` XML document.
 pub fn consumeResponseXml(alloc: std.mem.Allocator, xml_bytes: []const u8, config: Config) ConsumeError!AuthnResult {
-    var doc = xml.parse(alloc, xml_bytes, .{
-        .id_attr_names = &.{"ID"},
-    }) catch |e| switch (e) {
+    var doc = xml.parse(alloc, xml_bytes, untrustedXmlOptions()) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
     };
@@ -684,7 +745,22 @@ fn sigOpts(config: Config) xmldsig.Options {
 /// LogoutRequest/LogoutResponse, and ArtifactResponse verifiers — each with
 /// their own, differently-shaped `Config` — build it identically.
 fn sigOptsFor(key: xmldsig.VerifyKey, allow_weak_sha1: bool, id_attr: []const u8) xmldsig.Options {
-    return .{ .key = key, .allow_weak_sha1 = allow_weak_sha1, .id_attr = id_attr };
+    return .{
+        .key = key,
+        .allow_weak_sha1 = allow_weak_sha1,
+        .id_attr = id_attr,
+        // `signedTargetMatches` refuses anything but exactly one reference, so
+        // references 2..8 were guaranteed-discarded work. `xmldsig` gained this
+        // knob in the same window that this module started reaching it from an
+        // unauthenticated POST, and its own doc names `saml` as the reason —
+        // the neighbour shipped the bound and this side did not collect it.
+        // `xmldsig` refuses reference N+1 BEFORE canonicalizing it, so setting
+        // it to 1 removes the waste rather than merely capping it. Measured on
+        // the same ~800 KB document: eight `URI=""` references cost 244 ms and
+        // 114,805,252 peak live bytes against 78 ms and 80,104,334 for one —
+        // 3.1x the pre-authentication CPU for an identical verdict.
+        .max_references = 1,
+    };
 }
 
 /// The eIDAS encrypt profile. `enc` is the `<saml:EncryptedAssertion>` (a direct
@@ -728,9 +804,7 @@ fn processEncryptedAssertion(
     // Parse the recovered octets with the SAME id-attribute options `saml` uses
     // for the Response, so the XSW pointer-pin (which resolves the signature's
     // #id Reference through the SAML `ID` index) is sound inside the inner doc.
-    var inner = xml.parse(alloc, plaintext, .{
-        .id_attr_names = &.{"ID"},
-    }) catch |e| switch (e) {
+    var inner = xml.parse(alloc, plaintext, untrustedXmlOptions()) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
     };
@@ -871,7 +945,7 @@ fn decryptWrappedElement(
         std.crypto.secureZero(u8, plaintext);
         alloc.free(plaintext);
     }
-    const doc = xml.parse(alloc, plaintext, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+    const doc = xml.parse(alloc, plaintext, untrustedXmlOptions()) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return fail_err,
     };
@@ -1720,7 +1794,7 @@ pub const MetadataError = error{
 /// SSO endpoints and signing certificates so the caller can build a `Config`.
 /// Certificates are returned as raw DER only — never parsed here.
 pub fn parseIdpMetadata(alloc: std.mem.Allocator, metadata_xml: []const u8) MetadataError!IdpMetadata {
-    var doc = xml.parse(alloc, metadata_xml, .{}) catch |e| switch (e) {
+    var doc = xml.parse(alloc, metadata_xml, untrustedMetadataXmlOptions()) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedMetadata,
     };
@@ -2404,7 +2478,7 @@ pub fn consumeLogoutRequestXml(
     source: SignatureSource,
     config: LogoutRequestConfig,
 ) LogoutRequestError!LogoutRequestResult {
-    var doc = xml.parse(alloc, xml_bytes, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+    var doc = xml.parse(alloc, xml_bytes, untrustedXmlOptions()) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedRequest,
     };
@@ -2583,7 +2657,7 @@ pub fn consumeLogoutResponseXml(
     source: SignatureSource,
     config: LogoutResponseConfig,
 ) LogoutResponseError!LogoutResponseResult {
-    var doc = xml.parse(alloc, xml_bytes, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+    var doc = xml.parse(alloc, xml_bytes, untrustedXmlOptions()) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
     };
@@ -2854,7 +2928,7 @@ pub const ArtifactResponseResult = struct {
 /// optional-signature downgrade) — verifying it authenticates every byte
 /// inside via the enveloped transform, including the enclosed message.
 pub fn consumeArtifactResponseSoap(alloc: std.mem.Allocator, soap_xml: []const u8, config: ArtifactResponseConfig) ArtifactResponseError!ArtifactResponseResult {
-    var doc = xml.parse(alloc, soap_xml, .{ .id_attr_names = &.{"ID"} }) catch |e| switch (e) {
+    var doc = xml.parse(alloc, soap_xml, untrustedXmlOptions()) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedSoap,
     };
@@ -3257,4 +3331,105 @@ test "saml requirement: parseXsdDateTime must require the colon in a numeric tim
     // mandatory. `+0200` (no colon) must be rejected, not silently accepted
     // as if it meant `+02:00`.
     try std.testing.expectError(error.InvalidDateTime, datefmt.parseXsdDateTime("2024-01-01T00:00:00+0200"));
+}
+
+test "TEETH: an unauthenticated document is bounded by its ELEMENT count, not only its bytes" {
+    // `max_redirect_inflated` was a real, hard-enforced cap — and it bounded the
+    // inflated OCTETS while the quantity that grows is the parse tree the very
+    // next call builds. The relation is superlinear: measured in ReleaseFast on
+    // `<a/>`-dense, perfectly well-formed XML, 64 KiB of source parses into
+    // 6,339,414 bytes of peak live allocation (96.7x), 256 KiB into 32,177,512
+    // (122.7x) and 1 MiB into 163,139,946 (155.6x). At the old 1 MiB ceiling a
+    // 1,496-byte `SAMLRequest` query field — one unauthenticated GET, no
+    // session, no credentials — reached ~163 MB, all of it before any signature
+    // exists to check, since the redirect binding carries no `<ds:Signature>`
+    // inside the document at all. With both bounds in place the same shape is
+    // refused at 2,812,884 peak live bytes.
+    const gpa = testing.allocator;
+    const head = "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" ID=\"_r\" Version=\"2.0\"><pad>";
+    var bomb: std.ArrayList(u8) = .empty;
+    defer bomb.deinit(gpa);
+    try bomb.appendSlice(gpa, head);
+    for (0..max_untrusted_elements) |_| try bomb.appendSlice(gpa, "<a/>");
+    try bomb.appendSlice(gpa, "</pad></samlp:Response>");
+
+    // It is well-formed XML — `xml.parse` with no budget accepts it, so the
+    // refusal below is the budget and not a syntax error.
+    {
+        var ok = try xml.parse(gpa, bomb.items, .{});
+        defer ok.deinit();
+        try testing.expectEqual(@as(usize, 1), ok.root.children.len);
+    }
+
+    // Through the module's own untrusted-input options it is refused.
+    try testing.expectError(error.TooManyElements, xml.parse(gpa, bomb.items, untrustedXmlOptions()));
+
+    // And the same document under the budget is accepted, so the bound is where
+    // it claims to be rather than refusing everything.
+    var under: std.ArrayList(u8) = .empty;
+    defer under.deinit(gpa);
+    try under.appendSlice(gpa, head);
+    for (0..max_untrusted_elements - 3) |_| try under.appendSlice(gpa, "<a/>");
+    try under.appendSlice(gpa, "</pad></samlp:Response>");
+    var fits = try xml.parse(gpa, under.items, untrustedXmlOptions());
+    defer fits.deinit();
+
+    // The octet cap is the second half and still real: 64 KiB, which a genuine
+    // LogoutRequest is orders of magnitude under.
+    try testing.expectEqual(@as(usize, 64 << 10), max_redirect_inflated);
+}
+
+test "TEETH: the signature options really do refuse a second reference" {
+    // `signedTargetMatches` requires exactly one `<ds:Reference>`, so
+    // `sigOptsFor` asking `xmldsig` for at most one is not a nicety — it is what
+    // stops seven guaranteed-discarded canonicalizations happening first, on an
+    // unauthenticated POST. Asserted on the options themselves, because the
+    // cost is paid inside the sibling and a wall-clock assertion here would read
+    // the same with and without the fix (that mistake was made twice in this
+    // campaign).
+    const opts = sigOptsFor(.{ .rsa = undefined }, false, "ID");
+    try testing.expectEqual(@as(usize, 1), opts.max_references);
+    // And the module's own rule it exists to match.
+    try testing.expectEqual(@as([]const u8, "ID"), opts.id_attr);
+}
+
+test "TEETH: every untrusted parse in this file goes through an options helper" {
+    // The helpers' doc claims the element budget "cannot be forgotten at one
+    // call site". That is a STRUCTURAL claim, and a first draft of it was
+    // already false — three sites inlined equivalent options instead of calling
+    // a helper, which carries the property but not the guarantee. A sentence
+    // like that has to be checked or removed, so it is checked: this reads the
+    // module's own source and requires every parse taking the caller's
+    // allocator — the shape used only for peer-supplied bytes; the module's own
+    // assembled documents are named below — to pass one of the two helpers.
+    //
+    // The needle is assembled from pieces so this comment and this line do not
+    // match themselves.
+    const src = @embedFile("root.zig");
+    const needle = "xml." ++ "parse(alloc, ";
+    // The two call sites that parse THIS MODULE'S OWN freshly-assembled output
+    // in `signProtocolMessage`, which is not attacker-supplied.
+    const self_authored = [_][]const u8{ "xml.parse(alloc, assembled, ", "xml.parse(alloc, with_digest, " };
+
+    var i: usize = 0;
+    var checked: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
+        i = at + needle.len;
+        const tail = src[at..@min(src.len, at + 96)];
+        var skip = false;
+        for (self_authored) |own| {
+            if (std.mem.startsWith(u8, tail, own)) skip = true;
+        }
+        if (skip) continue;
+        checked += 1;
+        const ok = std.mem.indexOf(u8, tail, "untrustedXmlOptions()") != null or
+            std.mem.indexOf(u8, tail, "untrustedMetadataXmlOptions()") != null;
+        if (!ok) {
+            std.debug.print("an untrusted xml.parse does not use an options helper:\n  {s}\n", .{tail});
+            return error.UntrustedParseWithoutBudget;
+        }
+    }
+    // The positive control: if the needle ever stops matching, the loop above
+    // passes vacuously and this catches it.
+    try testing.expect(checked >= 6);
 }

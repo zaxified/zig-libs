@@ -358,6 +358,28 @@ pub const Options = struct {
     /// Maximum element nesting depth (root = depth 1). Guards against stack /
     /// resource exhaustion from adversarial nesting.
     max_depth: usize = 256,
+    /// Maximum number of ELEMENTS in the document.
+    ///
+    /// ⚠ `max_depth` bounds nesting and bounds nothing about breadth. A flat
+    /// document is the cheap shape: `<a/>` repeated is 4 source bytes per
+    /// element and builds an `Element` plus its children/attribute slices.
+    /// Measured in ReleaseFast, peak LIVE bytes of `parse` alone:
+    ///
+    /// | source | peak live | ratio |
+    /// |---:|---:|---:|
+    /// | 64 KiB | 6,339,414 B | 96.7x |
+    /// | 256 KiB | 32,177,512 B | 122.7x |
+    /// | 1 MiB | 163,139,946 B | **155.6x** |
+    ///
+    /// — and superlinear, so a caller who bounds the SOURCE has not bounded the
+    /// TREE. `saml`'s HTTP-Redirect binding capped the inflated octets at 1 MiB
+    /// and reached 163 MB from ~1.5 KB of query string, pre-authentication.
+    ///
+    /// 1,048,576 is generous for every document this repo parses (a SAML
+    /// response is hundreds of elements) while keeping the worst case around
+    /// 160 MB rather than unbounded. A caller facing untrusted input should set
+    /// it far lower.
+    max_elements: usize = 1 << 20,
     /// Maximum number of attributes on a single element.
     max_attributes: usize = 4096,
     /// Maximum length in bytes of any single Name (element/attr/PI target).
@@ -387,6 +409,8 @@ pub const ParseError = error{
     UnsupportedEncoding,
     UnsupportedVersion,
     MaxDepthExceeded,
+    /// More elements than `Options.max_elements`.
+    TooManyElements,
     MalformedComment,
     MalformedPI,
     MalformedCData,
@@ -511,6 +535,8 @@ const Parser = struct {
     ids: std.StringHashMapUnmanaged(*Element),
     stack: std.ArrayList(Open) = .empty,
     stats: ?*Stats = null,
+    /// Elements seen so far — the breadth counterpart to `stack.items.len`.
+    n_elements: usize = 0,
 
     fn countCompares(self: *Parser, n: usize) void {
         if (self.stats) |s| s.dup_compares += n;
@@ -921,6 +947,10 @@ const Parser = struct {
 
         // depth guard (root = depth 1)
         if (self.stack.items.len + 1 > self.opts.max_depth) return error.MaxDepthExceeded;
+        // breadth guard — see `Options.max_elements`. `max_depth` bounds one
+        // and says nothing about the other.
+        self.n_elements += 1;
+        if (self.n_elements > self.opts.max_elements) return error.TooManyElements;
 
         // Parse raw attributes (including xmlns:* declarations).
         var raw: std.ArrayList(RawAttr) = .empty;
@@ -2073,4 +2103,37 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 // See xmlconf_test.zig / xmlconf_vectors.zig / NOTICE.
 test {
     _ = @import("xmlconf_test.zig");
+}
+
+test "TEETH: max_elements bounds BREADTH, which max_depth does not" {
+    // `max_depth` was the only structural bound, and a flat document is the
+    // cheap shape: `<a/>` is four source bytes per element and builds an
+    // `Element` plus its slices. Measured in ReleaseFast, peak LIVE bytes of
+    // `parse` alone: 64 KiB of source → 6.3 MB (96.7x), 256 KiB → 32.2 MB
+    // (122.7x), 1 MiB → 163.1 MB (155.6x) — superlinear, so a caller who bounds
+    // the SOURCE has not bounded the TREE. `saml`'s redirect binding capped the
+    // inflated octets at 1 MiB and reached 163 MB from ~1.5 KB of query string,
+    // before authenticating anything.
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "<r>");
+    for (0..64) |_| try buf.appendSlice(gpa, "<a/>");
+    try buf.appendSlice(gpa, "</r>");
+
+    // 65 elements: the root plus 64 children.
+    try testing.expectError(error.TooManyElements, parse(gpa, buf.items, .{ .max_elements = 64 }));
+
+    // The boundary itself is accepted — the bound is where it claims to be, not
+    // one either side.
+    var doc = try parse(gpa, buf.items, .{ .max_elements = 65 });
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 64), doc.root.children.len);
+
+    // ⚠ And the depth bound cannot stand in for it: this document is 2 deep, so
+    // any `max_depth` at all admits every one of those 64 elements. Without
+    // this arm the test above could be passing on the wrong guard.
+    try testing.expectError(error.TooManyElements, parse(gpa, buf.items, .{ .max_depth = 2, .max_elements = 64 }));
+    var deep_ok = try parse(gpa, buf.items, .{ .max_depth = 2, .max_elements = 65 });
+    defer deep_ok.deinit();
 }
