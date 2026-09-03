@@ -9,7 +9,9 @@ shell-outs, no `wpa_supplicant` linkage, no libc.
 - **Model after:** the kernel UAPI (`linux/nl80211.h`) and the IEEE 802.11
   information-element formats. `iw` was used **only as a black-box capture
   oracle** under `strace` — its requests are the byte-exact goldens this module
-  is asserted against — no `iw` or `wpa_supplicant` source was read or ported.
+  is asserted against — no `iw`, `wpa_supplicant` or `hostapd` source was read or
+  ported. Both `iw` and (since 2026-08-08) `wpa_supplicant` 2.11 + `hostapd` are used
+  as black-box capture oracles; see `SPEC.md` §1.1/§1.2.
 - **Platform:** linux (raw `std.os.linux` AF_NETLINK syscalls — a conscious
   ceiling). **Role:** client. **Concurrency:** reentrant (no globals; one
   `Nl80211` / `EventSocket` per thread/loop).
@@ -29,7 +31,9 @@ copyrightable interface code) and the IEEE 802.11 information-element formats,
 relying on the same Linux-syscall-note exception as
 `netlink`/`genetlink`/`wireguard`/`tc`. `iw` (GPL-2.0) was run ONLY as a
 black-box test oracle under `strace`, its request bytes diffed against this
-module's — no `iw` or `wpa_supplicant` source consulted, studied or ported.
+module's — no `iw`, `wpa_supplicant` or `hostapd` source consulted, studied or
+ported. Two black-box oracles are used, not one: `iw` 6.17 for the request goldens and
+`wpa_supplicant` 2.11 against a real `hostapd` AP for the WPA2-PSK `CONNECT` golden.
 
 ## Scope
 

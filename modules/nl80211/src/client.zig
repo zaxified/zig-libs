@@ -60,6 +60,12 @@ pub const NETLINK_DROP_MEMBERSHIP: u32 = 2;
 
 pub const RequestError = error{
     OutOfMemory,
+    /// The kernel set `NLM_F_DUMP_INTR`: its tables changed while the dump was
+    /// being walked, so the reply may have skipped or duplicated objects. The
+    /// dump is refused rather than returned as if it were consistent. Retry the
+    /// request; `netlink.Socket` retries such a dump up to `max_dump_attempts`
+    /// times internally, and a caller of this module can do the same.
+    DumpInterrupted,
     SendFailed,
     RecvFailed,
     /// A reply failed wire-format validation (bounds/length checks).
@@ -541,22 +547,48 @@ pub const Nl80211 = struct {
     }
 };
 
-/// Ceiling on how many netlink messages one `Dump`/`awaitAck` scan may
+/// Ceiling on how many netlink DATAGRAMS one `Dump`/`awaitAck` scan may
 /// consume before giving up. See the sibling `ethtool`/`devlink` clients'
-/// identical constant for the full rationale: the kernel is the only
-/// verified sender on this socket, so this is a robustness ceiling against a
-/// malfunctioning driver, not an attacker-facing bound.
+/// identical constant for the full rationale: the kernel is the only verified
+/// sender on this socket (`netlink.Socket.recvDatagramStrict` drops any
+/// datagram whose source pid is non-zero), so this is a robustness ceiling
+/// against a malfunctioning driver, not an attacker-facing bound.
+///
+/// ⚠ **It bounds datagrams, not the memory the collectors retain**, and those
+/// are only loosely related. Every `NEW_SCAN_RESULTS` message has its IE blob
+/// duplicated into a `Bss` appended to a list; the same is true of `wiphys`,
+/// `stations`, `interfaces`, `regDomains` and `raw`. Measured against the real
+/// `dumpStep` with a mock socket returning one ordinary 18,752-byte datagram
+/// (8 BSSes × 2304 bytes of IEs — nothing hostile): the budget fired exactly on
+/// schedule, at 65,536 datagrams — after **1,285,750,080 bytes (1226 MiB)** of
+/// peak live allocation and 524,288 retained BSSes. netlink's receive buffer
+/// grows to 16 MiB, so the derived memory bound is ~1 TiB.
+///
+/// `max_dump_bytes` below is the bound on the quantity that actually grows. A
+/// malfunctioning driver is precisely the case this ceiling exists for, and on
+/// a small box the OOM arrives long before 65,536 datagrams do.
 const max_dump_messages: u32 = 65536;
+
+/// Ceiling on the total netlink payload one `Dump` may consume. This is the
+/// bound on what a runaway dump actually costs: bytes, not datagram count.
+///
+/// 64 MiB is generous for every dump this module issues — a `wiphys` split dump
+/// is ~75 messages of a few KiB each, and a scan on a busy band is a few hundred
+/// KiB — while being small enough that the process survives hitting it.
+const max_dump_bytes: usize = 64 << 20;
 
 /// The body of `Nl80211.awaitAck`, factored out the same way `dumpStep` is —
 /// `cl` need only look like `*Nl80211` for `cl.sock.recvDatagram()` /
 /// `cl.sock.portid`.
 fn awaitAckStep(cl: anytype, seq: u32) RequestError!void {
     var msgs: u32 = 0;
+    var bytes: usize = 0;
     while (true) {
         if (msgs >= max_dump_messages) return error.TooManyMessages;
         const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
         msgs += 1;
+        bytes +|= dgram.len;
+        if (bytes > max_dump_bytes) return error.TooManyMessages;
         var it: codec.MessageIterator = .{ .buf = dgram };
         while (it.next() catch return error.MalformedReply) |m| {
             if (m.pid != cl.sock.portid or m.seq != seq) continue;
@@ -593,9 +625,10 @@ const Dump = struct {
     it: codec.MessageIterator = .{ .buf = &.{} },
     finished: bool = false,
     msgs: u32 = 0,
+    bytes: usize = 0,
 
     fn next(w: *Dump) RequestError!?DumpMessage {
-        return dumpStep(w.cl, w.seq, &w.it, &w.finished, &w.msgs);
+        return dumpStep(w.cl, w.seq, &w.it, &w.finished, &w.msgs, &w.bytes);
     }
 };
 
@@ -610,6 +643,7 @@ fn dumpStep(
     it: *codec.MessageIterator,
     finished: *bool,
     msgs: *u32,
+    bytes: *usize,
 ) RequestError!?DumpMessage {
     while (true) {
         if (finished.*) return null;
@@ -618,10 +652,35 @@ fn dumpStep(
             if (msgs.* >= max_dump_messages) return error.TooManyMessages;
             const dgram = cl.sock.recvDatagram() catch |e| return recvErr(e);
             msgs.* += 1;
+            bytes.* +|= dgram.len;
+            // The bound on the quantity that grows — see `max_dump_bytes`.
+            if (bytes.* > max_dump_bytes) return error.TooManyMessages;
             it.* = .{ .buf = dgram };
             continue;
         };
         if (m.pid != cl.sock.portid or m.seq != seq) continue;
+        // NLM_F_DUMP_INTR: the kernel's tables changed while it was walking
+        // them, so this dump may have skipped or duplicated objects. Refuse it
+        // rather than hand the caller a list that looks complete.
+        //
+        // ⚠ This loop was factored out of `Dump.next` in this drift window with
+        // a doc comment naming the sibling `conntrack`'s `dumpOver` as "the same
+        // technique" — and did not pick up the contract that goes with it. The
+        // shared triage `codec.classifyDumpMessage` returns `.restart` for
+        // exactly this case, `netlink.Socket` retries it up to
+        // `max_dump_attempts`, and `genetlink` drops a flagged reply. This
+        // module did neither: `scanResults` during ongoing scanning,
+        // `interfaces`/`stations` while an interface comes or goes, and the
+        // *split* `wiphys` dump (one radio spread over ~75 messages, reassembled
+        // by `wiphy.Parser`) are precisely the dumps a busy Wi-Fi host
+        // interrupts, and a partial radio was returned as a complete one with no
+        // error and no flag.
+        //
+        // Surfaced rather than retried, deliberately: a retry needs the request
+        // re-sent with a fresh sequence number, and this iterator does not own
+        // the send — each collector does. Fail-closed here, retry where the
+        // request is built.
+        if (m.flags & codec.NLM_F_DUMP_INTR != 0) return error.DumpInterrupted;
         switch (m.type) {
             codec.NLMSG_DONE => {
                 finished.* = true;
@@ -771,8 +830,19 @@ pub const EventSocket = struct {
                 ev.it = .{ .buf = dgram };
                 continue;
             };
-            // Events come from the kernel with seq 0 and pid 0; anything else
-            // on this socket is not an event.
+            // Only the kernel can put bytes on this socket:
+            // `netlink.Socket.recvDatagramStrict` re-reads the source
+            // `sockaddr_nl` and drops any datagram whose `nl_pid` is non-zero,
+            // and this module never sends on the event socket. So the message
+            // type is the only thing left to discriminate on.
+            //
+            // ⚠ This comment used to assert "events come from the kernel with
+            // seq 0 and pid 0; anything else on this socket is not an event" —
+            // a property of `m.pid`/`m.seq` that this function does not check.
+            // The safety is real but it lives in the sibling, and the comment
+            // was the only record of why the check is absent. Stating the
+            // actual reason means a reader who changes the transport knows what
+            // they are relying on.
             if (m.type != ev.family_id) continue;
             const p = genl.splitPayload(m.payload) catch return error.MalformedReply;
             return parseEvent(p.cmd, p.attrs) catch return error.MalformedReply;
@@ -931,6 +1001,19 @@ const MockNl80211 = struct {
 /// One message with `NLM_F_MULTI` set and a type that never matches
 /// `family_id`, so `Dump`'s `else` arm skips it and asks for another
 /// datagram — forever, absent a budget.
+/// A non-terminating datagram padded to roughly `want` bytes, so a test can
+/// choose which of the two dump budgets bites first.
+fn bigNonTerminatingDatagram(gpa: std.mem.Allocator, pid: u32, seq: u32, family_id: u16, want: usize) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    while (list.items.len < want) {
+        const hdr = try codec.appendHeader(gpa, &list, family_id +% 1, codec.NLM_F_MULTI, seq, pid);
+        try list.appendNTimes(gpa, 0, 1024);
+        codec.finishHeader(&list, hdr);
+    }
+    return list.toOwnedSlice(gpa);
+}
+
 fn nonTerminatingDatagram(gpa: std.mem.Allocator, pid: u32, seq: u32, family_id: u16) ![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
@@ -950,8 +1033,109 @@ test "Dump.next errors out instead of looping forever on a never-DONE reply" {
     var it: codec.MessageIterator = .{ .buf = &.{} };
     var finished = false;
     var msgs: u32 = 0;
-    try testing.expectError(error.TooManyMessages, dumpStep(&cl, seq, &it, &finished, &msgs));
+    var bytes: usize = 0;
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl, seq, &it, &finished, &msgs, &bytes));
     try testing.expectEqual(max_dump_messages, msgs);
+}
+
+/// A datagram carrying one nl80211-typed record with `NLM_F_DUMP_INTR` set —
+/// what the kernel sends when its tables changed while it was walking them.
+fn dumpIntrDatagram(gpa: std.mem.Allocator, pid: u32, seq: u32, family_id: u16, flags: u16) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, family_id, codec.NLM_F_MULTI | flags, seq, pid);
+    // A genetlink payload header: cmd, version, reserved.
+    try list.appendSlice(gpa, &.{ 34, 1, 0, 0 });
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+test "TEETH: a dump flagged NLM_F_DUMP_INTR is refused, not consumed as if consistent" {
+    // The kernel sets this when its tables changed mid-dump, so the reply may
+    // have skipped or duplicated objects. The shared triage
+    // `netlink.codec.classifyDumpMessage` returns `.restart` for it,
+    // `netlink.Socket` retries such a dump, and `genetlink` drops a flagged
+    // reply. `dumpStep` inspected only `m.type` and handed the record over.
+    const family_id: u16 = 41;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+
+    // Control FIRST: without the flag, the identical datagram yields a record.
+    // Without this arm the refusal below could be any parse failure at all.
+    {
+        const dgram = try dumpIntrDatagram(testing.allocator, pid, seq, family_id, 0);
+        defer testing.allocator.free(dgram);
+        var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
+        var it: codec.MessageIterator = .{ .buf = &.{} };
+        var finished = false;
+        var msgs: u32 = 0;
+        var bytes: usize = 0;
+        const rec = try dumpStep(&cl, seq, &it, &finished, &msgs, &bytes);
+        try testing.expect(rec != null);
+        try testing.expectEqual(@as(u8, 34), rec.?.cmd);
+    }
+
+    // The same bytes with NLM_F_DUMP_INTR set.
+    {
+        const dgram = try dumpIntrDatagram(testing.allocator, pid, seq, family_id, codec.NLM_F_DUMP_INTR);
+        defer testing.allocator.free(dgram);
+        var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
+        var it: codec.MessageIterator = .{ .buf = &.{} };
+        var finished = false;
+        var msgs: u32 = 0;
+        var bytes: usize = 0;
+        try testing.expectError(error.DumpInterrupted, dumpStep(&cl, seq, &it, &finished, &msgs, &bytes));
+
+        // And the sibling's shared triage agrees about the same bytes — this is
+        // the contract that was there to be collected.
+        var it2: codec.MessageIterator = .{ .buf = dgram };
+        const m = (try it2.next()).?;
+        try testing.expectEqual(netlink.codec.DumpStep.restart, codec.classifyDumpMessage(m, pid, seq));
+    }
+}
+
+test "TEETH: the dump budget bounds BYTES, not just datagram count" {
+    // `max_dump_messages` is real and fires exactly on schedule — after 65,536
+    // datagrams. Measured against this same `dumpStep` with a mock socket
+    // returning one ordinary 18,752-byte datagram (8 BSSes × 2304 bytes of IEs,
+    // nothing hostile): 1,285,750,080 bytes — 1226 MiB — of peak live
+    // allocation had been retained by the collector before it did. netlink's
+    // receive buffer grows to 16 MiB, so the derived memory bound was ~1 TiB.
+    // A cap that is real, enforced, and bounds the wrong quantity.
+    const family_id: u16 = 41;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    // 256 KiB per datagram: 64 MiB is 256 of them, far short of the 65,536
+    // datagram budget, so which bound bites is unambiguous.
+    const dgram = try bigNonTerminatingDatagram(testing.allocator, pid, seq, family_id, 256 << 10);
+    defer testing.allocator.free(dgram);
+
+    var cl: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = dgram }, .family_id = family_id };
+    var it: codec.MessageIterator = .{ .buf = &.{} };
+    var finished = false;
+    var msgs: u32 = 0;
+    var bytes: usize = 0;
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl, seq, &it, &finished, &msgs, &bytes));
+
+    // The BYTE budget is what stopped it, not the datagram count. Without this
+    // the assertion above would hold either way and say nothing about which
+    // bound bit — which is exactly the confusion being fixed.
+    try testing.expect(bytes > max_dump_bytes);
+    try testing.expect(msgs < max_dump_messages);
+    try testing.expect(msgs < 1000);
+
+    // Control: the same loop with a tiny datagram still ends on the datagram
+    // budget, so the byte bound did not replace it.
+    const small = try nonTerminatingDatagram(testing.allocator, pid, seq, family_id);
+    defer testing.allocator.free(small);
+    var cl2: MockNl80211 = .{ .sock = .{ .portid = pid, .datagram = small }, .family_id = family_id };
+    var it2: codec.MessageIterator = .{ .buf = &.{} };
+    var finished2 = false;
+    var msgs2: u32 = 0;
+    var bytes2: usize = 0;
+    try testing.expectError(error.TooManyMessages, dumpStep(&cl2, seq, &it2, &finished2, &msgs2, &bytes2));
+    try testing.expectEqual(max_dump_messages, msgs2);
+    try testing.expect(bytes2 <= max_dump_bytes);
 }
 
 test "awaitAck errors out instead of looping forever on a never-matching reply" {

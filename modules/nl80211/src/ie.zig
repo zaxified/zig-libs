@@ -113,6 +113,16 @@ pub const Iterator = struct {
 
 /// The body of the first element with `id`, or null. Stops at the first
 /// malformed element rather than erroring — see the file header.
+///
+/// ⚠ **The returned body is UNBOUNDED — up to 255 bytes, the range of the IE
+/// length octet — and the transmitter chooses it.** In particular `find(ies,
+/// EID.SSID)` can return 255 bytes where `nl80211.max_ssid_len` is 32, so a
+/// caller that sizes a buffer on that constant (as `iface.Interface.ssid_buf`
+/// does, and as the constant is re-exported from `root.zig` to encourage)
+/// overflows by up to 223 bytes. `summarize` refuses an over-length SSID and
+/// says so in `Summary.ssid_oversized`; this function is the generic
+/// element-lookup primitive and deliberately does not interpret any element, so
+/// the length is the caller's to check. Prefer `summarize` for the SSID.
 pub fn find(ies: []const u8, id: u8) ?[]const u8 {
     var it: Iterator = .{ .buf = ies };
     while (it.next() catch return null) |e| {
@@ -360,6 +370,18 @@ pub const Summary = struct {
     he: bool = false,
     /// The walk stopped early on a malformed element.
     truncated: bool = false,
+    /// An SSID element was seen at all (whatever its length). The FIRST one
+    /// decides, matching `find` and matching Wireshark; a later one is ignored.
+    ssid_seen: bool = false,
+    /// An SSID element was present but longer than `uapi.max_ssid_len`, so
+    /// `ssid` is empty for a reason that is NOT "the network is hidden".
+    ///
+    /// Without this a beacon carrying an over-length SSID was byte-identical in
+    /// the answer to a beacon carrying no SSID element at all — the cap that
+    /// stops the overflow was silent, and silence is what a caller reads as
+    /// "nothing to see". This file's own header states the principle: "It is
+    /// therefore the caller's answer that has to carry the doubt."
+    ssid_oversized: bool = false,
 
     /// Privacy verdict from the elements alone. `capability` comes from
     /// `NL80211_BSS_CAPABILITY` bit 4 (Privacy) and is what tells WEP apart
@@ -418,9 +440,27 @@ pub fn summarize(ies: []const u8) Summary {
             // An oversized element is skipped, not treated as a decode
             // failure, matching every other guard in this loop (e.g.
             // DS_PARAMS below) and this function's own "never fails" oracle.
-            EID.SSID => if (s.ssid.len == 0 and !s.hidden_ssid and e.body.len <= uapi.max_ssid_len) {
-                s.ssid = e.body;
-                s.hidden_ssid = e.body.len == 0 or std.mem.allEqual(u8, e.body, 0);
+            // FIRST element wins, valid or not. An over-length one is refused
+            // AND closes the field, so a SECOND SSID element cannot supply the
+            // answer in its place.
+            //
+            // ⚠ Accepting the later one was a real producer/consumer split, not
+            // a theoretical one. Measured against Wireshark's own 802.11
+            // dissector on a beacon carrying SSID(33 × 'A') then SSID(8,
+            // "homewifi"): `sharkd` names the FIRST element the SSID and raises
+            // a Malformed expert error, leaving the second undecoded as a
+            // duplicate. This module named the BSS "homewifi", silently — and
+            // so did not even agree with its own `find(ies, EID.SSID)`, which
+            // returns the first. A transmitter in range could make this module
+            // and every packet-capture tool disagree about a network's identity.
+            EID.SSID => if (!s.ssid_seen) {
+                s.ssid_seen = true;
+                if (e.body.len <= uapi.max_ssid_len) {
+                    s.ssid = e.body;
+                    s.hidden_ssid = e.body.len == 0 or std.mem.allEqual(u8, e.body, 0);
+                } else {
+                    s.ssid_oversized = true;
+                }
             },
             EID.SUPPORTED_RATES => if (s.supported_rates.len == 0) {
                 s.supported_rates = e.body;
@@ -716,6 +756,55 @@ test "summarize: an SSID element exactly at max_ssid_len is accepted, one byte m
     const over_cap = [_]u8{ 0, uapi.max_ssid_len + 1 } ++ [_]u8{'a'} ** (uapi.max_ssid_len + 1);
     const s_over_cap = summarize(&over_cap);
     try testing.expectEqual(@as(usize, 0), s_over_cap.ssid.len);
+    // …and the caller can tell that apart from "hidden" and from "no SSID
+    // element at all", which it could not while the skip was silent.
+    try testing.expect(s_over_cap.ssid_oversized);
+    try testing.expect(!s_over_cap.hidden_ssid);
+
+    // The three empty-`ssid` cases are now distinguishable, which is the point.
+    const none = [_]u8{ 3, 1, 6 }; // DS Params only, no SSID element
+    const s_none = summarize(&none);
+    try testing.expectEqual(@as(usize, 0), s_none.ssid.len);
+    try testing.expect(!s_none.ssid_oversized);
+    try testing.expect(!s_none.ssid_seen);
+
+    const hidden = [_]u8{ 0, 0 }; // present and empty
+    const s_hidden = summarize(&hidden);
+    try testing.expect(s_hidden.hidden_ssid);
+    try testing.expect(!s_hidden.ssid_oversized);
+    try testing.expect(s_hidden.ssid_seen);
+}
+
+test "TEETH: the FIRST SSID element decides, as Wireshark and `find` both do" {
+    // Measured against Wireshark's own 802.11 dissector (`sharkd`, DLT 105) on
+    // exactly these bytes: it names the FIRST element the SSID, raises a
+    // Malformed expert error for its 33-byte length, and leaves the second
+    // undecoded as a duplicate. This module used to skip the oversized first
+    // element silently and then accept the second, so it named the BSS
+    // "homewifi" — disagreeing with every capture tool AND with its own
+    // `find(ies, EID.SSID)`, which returns the first. A transmitter in range
+    // chooses both elements, so it chose which name this module reported.
+    const ies = [_]u8{ 0, uapi.max_ssid_len + 1 } ++ [_]u8{'A'} ** (uapi.max_ssid_len + 1) ++
+        [_]u8{ 0, 8, 'h', 'o', 'm', 'e', 'w', 'i', 'f', 'i' } ++
+        [_]u8{ 3, 1, 6 };
+    const s = summarize(&ies);
+    try testing.expectEqual(@as(usize, 0), s.ssid.len);
+    try testing.expect(s.ssid_oversized);
+    try testing.expect(!s.hidden_ssid);
+    // The rest of the walk is unaffected — the element is refused, not the beacon.
+    try testing.expectEqual(@as(?u8, 6), s.ds_channel);
+    try testing.expect(!s.truncated);
+
+    // `find` still reports the first element's body, uncapped and unchanged —
+    // and the two now agree about WHICH element is the SSID.
+    const f = find(&ies, EID.SSID).?;
+    try testing.expectEqual(@as(usize, uapi.max_ssid_len + 1), f.len);
+
+    // A well-formed first element still wins over a later one, which is the
+    // same rule seen from the other side.
+    const two_ok = [_]u8{ 0, 3, 'a', 'b', 'c' } ++ [_]u8{ 0, 8, 'h', 'o', 'm', 'e', 'w', 'i', 'f', 'i' };
+    const s2 = summarize(&two_ok);
+    try testing.expectEqualStrings("abc", s2.ssid);
 }
 
 test "summarize stops at a malformed element and reports what it had" {

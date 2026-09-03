@@ -71,9 +71,18 @@
 //! Provenance: clean-room from the kernel UAPI (`linux/nl80211.h`, GPL-2.0
 //! WITH Linux-syscall-note — the command/attribute constants and their layouts
 //! are the kernel's OS ABI, not copyrightable interface code) and the IEEE
-//! 802.11 information-element formats. `iw` was used only as a black-box
-//! capture oracle under `strace`; no `iw` or `wpa_supplicant` source was read
-//! or ported. See `NOTICE`.
+//! 802.11 information-element formats. `iw`, and since 2026-08-08 also
+//! `wpa_supplicant` 2.11 with `hostapd` (the VM lane that produced the WPA2-PSK
+//! `CONNECT` golden), were used **only** as black-box capture oracles under
+//! `strace`; no `iw`, `wpa_supplicant` or `hostapd` source was read or ported.
+//! See `NOTICE`, and `SPEC.md` §1.1/§1.2 for the per-golden capture commands.
+//!
+//! ⚠ This sentence named `iw` alone until 2026-09-03, while `goldens.zig` had
+//! carried 320 bytes of wpa_supplicant's own output since the VM lane landed —
+//! `SPEC.md` and `goldens.zig` said so and these two front-door documents did
+//! not. No licence obligation was breached (CONVENTIONS §5: running a
+//! third-party binary as a black-box oracle needs no entry), but a public
+//! repo's provenance statement has to be complete, not merely true.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -301,7 +310,20 @@ test "live: GET_SCAN dump of the kernel's BSS table (unprivileged)" {
             if (b.freq_mhz) |f| try testing.expect(f > 700 and f < 8000);
             // Whatever is on the air, the IE walk must not blow up.
             const s = b.elements();
-            try testing.expect(s.ssid.len <= max_ssid_len);
+            // ⚠ `s.ssid.len <= max_ssid_len` used to stand here. Once
+            // `summarize` began refusing an over-length element that became
+            // true by construction — a tautology, and the ONLY assertion in the
+            // repo that could have caught an over-length SSID on real air. The
+            // uncapped route is what still has something to say, so assert
+            // there, and record the refusal when it happens.
+            const raw_ssid = ie.find(b.ies, ie.EID.SSID);
+            const raw_len: usize = if (raw_ssid) |r| r.len else 0;
+            if (s.ssid_oversized) {
+                std.debug.print("live: a beacon in range carried an over-length SSID ({d} bytes)\n", .{raw_len});
+                try testing.expect(raw_len > max_ssid_len);
+            } else if (raw_ssid) |r| {
+                try testing.expectEqualSlices(u8, r, s.ssid);
+            }
             if (s.rsn) |r| try testing.expect(r.pairwise.len <= ie.max_suites);
         }
     }
