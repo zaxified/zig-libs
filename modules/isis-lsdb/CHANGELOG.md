@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — New: `srmIsSet(id, iface)`, the single-bit form of
+  `srmSet(id).?.isSet(iface)`. The set-building form costs one hash lookup per
+  circuit to read one bit, and `isis-flood.prune` asks the question once per
+  tracked `(lsp, iface)` pair on **every** poll — 15 ms per prune over 28 672
+  pairs at `interface_count = 32`. Two lookups now, whatever the circuit
+  count. `false` for an LSP that is not stored, matching `srmSet`'s `null`,
+  and pinned against `srmSet` for every circuit rather than assumed equal.
 - **2026-08-11** — Security audit: the link-state database's update process was missing
   several ISO 10589 receive-side defences against an unauthenticated peer — a single SNP
   could permanently wedge the database, and a peer could purge or sequence-lock this

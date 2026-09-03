@@ -22,7 +22,9 @@
 //! Identical to the siblings `isis-adj` and `isis-lsdb`: the scheduler never reads
 //! a clock. `poll` takes a caller-supplied monotonic `now`; the pacing/CSNP
 //! deadlines are derived from the `now` values it was last called with. Given the
-//! same `(lsdb state, now sequence, up set)` the effects are fully deterministic.
+//! same `(lsdb OPERATION SEQUENCE, now sequence, up set)` the effects are fully
+//! deterministic — over the sequence, not over lsdb state, because LSP transmit
+//! order is `srm_queue`'s insertion order. See `scheduler.zig`'s header.
 //!
 //! ## What clears SRM
 //! On P2P, sending an LSP does **not** clear its SRM flag — `isis-lsdb` clears SRM

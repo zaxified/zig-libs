@@ -101,11 +101,25 @@ Each poll therefore picks a **window** `[cursor, end]`:
 
 - `summarise` is asked for one entry more than can be advertised
   (`max_summary_entries + 1`). A short answer proves the window is complete.
-- If the window is over-full, `end` is **binary-searched** down (by LSP-ID,
-  `snp.midpoint`) to the largest value whose window fits. Narrowing rather than
-  truncating is what keeps the claim honest — `summarise` walks the LSDB in hash
-  order, so "the first 256" is not even a well-defined prefix of the range.
-- The window's entries are **sorted** ascending by LSP-ID and split into groups
+- If the window is over-full, `end` becomes the **last entry of the prefix we
+  can advertise** (`entries[max_summary_entries - 1].lsp_id`). This rests on
+  `isis-lsdb.summarise`'s contract: it returns the numerically smallest
+  in-range LSP-IDs, **ascending, truncating the tail**, so a return of `n`
+  entries provably enumerates all of `[cursor, entries[n-1].lsp_id]` and that
+  prefix is exactly what may be claimed. One `summarise` pass per window.
+  ⚠ Until 2026-09-03 this module **binary-searched** `end` down by LSP-ID
+  instead — ~64 extra full-database passes per window — because `summarise`
+  once filled its buffer in hash order, where "the first 256" had no
+  definition. `isis-lsdb` gave it the ordered contract and documented this
+  pagination protocol; this module was not updated and its own comments went
+  on citing hash order as the justification. Measured on a 4096-LSP series:
+  991 `summarise` calls and 1.77 s, against 16 calls and 28 ms for the same
+  16 windows — **62.7× the work**, at stock `complete_snp_interval` enough to
+  starve the scheduler outright at ~12 circuits. The ordering dependency is
+  now explicit: `emitCsnp` asserts the returned prefix is ascending, and
+  `modules/isis-lsdb`'s "srmIsSet answers exactly what srmSet does" and this
+  module's SIBLING CONTRACT test pin it.
+- The window's entries are already ascending; they are split into groups
   of `lsp_entries_per_pdu`. For group `k` (entries `[i, j)`):
   - `start = (k == 0) ? cursor : successor(last_id_of_group_{k-1})`
   - `end   = (k == last) ? window_end : last_id_of_group_k`
@@ -137,8 +151,23 @@ walks every #9 TLV.
 
 It is `now` when `truncated` (work remains this instant — poll again immediately)
 and `null` when nothing is pending (no Up interface). PSNP acks are emitted
-immediately and unpaced, so they contribute to the wakeup only via `truncated`.
+immediately and unpaced, so they contribute to the wakeup only via `truncated`
+— which is why `emitPsnp` reports `truncated` when more than
+`max_summary_entries` flags are pending on a circuit and its summary buffer
+caps the drain. It used not to, so the leftover acks and requests (reachable
+at stock settings: `request_capacity` defaults to `capacity / 4` = 1024, four
+times the buffer) were invisible to this computation and the caller slept a
+full `complete_snp_interval` on them.
 Saturating arithmetic (`+|`) guards the interval additions.
+
+**Adjacency edges.** Per-circuit scheduling state describes an *adjacency*,
+not a wire. When a circuit leaves the `up` set, its CSNP priming, resume
+cursor and pacing records are dropped, so the next adjacency is re-primed and
+re-synchronised from the bottom of the ID space. Without that, only the first
+adjacency ever seen on a circuit got its initial CSNP, and a flap mid-series
+left the cursor parked — the new neighbour's first CSNP then advertised a
+window starting in the middle of the space and the bottom of it went
+unadvertised for a full cadence.
 
 ## 7. Bounds / DoS
 
@@ -156,7 +185,15 @@ Saturating arithmetic (`+|`) guards the interval additions.
   resumes at `end + 1` (§5). The bound is on the *window*, never on the truth of
   the advertised range — a hostile neighbour that grows the area past the buffer
   cannot make us claim coverage we do not have. No per-hostile-input allocation
-  anywhere; the window search costs at most 64 `summarise` passes.
+  anywhere; each window costs exactly one `summarise` pass.
+- **Config is caller-supplied, and `init`'s asserts do not exist in
+  ReleaseFast.** `lsp_entries_per_pdu` is therefore **clamped** to
+  `[1, snp.max_entries_per_pdu]` where it is used, at both emitters. Zero
+  makes the chunker's group empty forever; anything above 15 makes every
+  `buildPsnp`/`buildCsnp` return `ValueTooLong`, which both emitters report as
+  `truncated` — "poll again immediately" on work that never gets smaller, i.e.
+  a zero-output livelock from a config typo. The 2026-08-23 fix clamped the
+  lower end only, which fixed the case and not the rule.
 
 ## 8. Deferred (with hooks)
 
@@ -171,6 +208,15 @@ Saturating arithmetic (`+|`) guards the interval additions.
   replace it.
 - **Multi-TLV PDU packing** — filling a PDU to the link MTU with several #9 TLVs
   (rather than one 15-entry TLV per PDU). Purely an efficiency change.
+- **`partialSNPInterval`** — ISO 10589 defines a third timer alongside
+  `minimumLSPTransmissionInterval` and `completeSNPInterval`, governing the
+  periodic transmission of Partial SNPs (RFC 9681 §3 quotes it, with "a
+  reasonable value is 2 s"). This module implements the other two and emits
+  PSNPs immediately and unpaced instead. That is a deliberate choice — §6
+  states it, and the CSNP → request-placeholder → PSNP reflection ratio is
+  ~1:1, so it is not an amplification surface — but it is a deviation from the
+  standard's timer set, recorded here rather than left implicit in §6's
+  wording.
 - **Mesh-groups (RFC 2973)** and **LSP purge-specific flooding** beyond what the
   SRM flag already encodes (a purge is just an LSP with SRM set by the LSDB).
 - **Socket I/O** — the scheduler returns effects; the caller owns the wire.

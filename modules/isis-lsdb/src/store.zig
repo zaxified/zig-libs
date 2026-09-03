@@ -773,6 +773,22 @@ pub const Lsdb = struct {
         return acc;
     }
 
+    /// Whether SRM is set for `id` on `iface` alone.
+    ///
+    /// `srmSet(id).?.isSet(iface)` answers the same question by building the
+    /// whole per-interface set first -- `interface_count` hash lookups to read
+    /// one bit. `isis-flood.prune` asks it once per tracked `(lsp, iface)` pair
+    /// on **every** poll, where that factor is the difference between a sweep
+    /// and a stall (measured there at 15 ms per prune over 28 672 pairs at
+    /// `interface_count = 32`). Two lookups, whatever the circuit count.
+    ///
+    /// `false` for an LSP that is not stored, matching `srmSet`'s `null`.
+    pub fn srmIsSet(self: *const Lsdb, id: LspId, iface: u8) bool {
+        if (iface >= self.cfg.interface_count) return false;
+        if (!self.map.contains(id)) return false;
+        return self.srm_queue[iface].contains(id);
+    }
+
     /// The SSN flag set for one LSP, or `null` if it is not stored.
     pub fn ssnSet(self: *const Lsdb, id: LspId) ?InterfaceSet {
         if (!self.map.contains(id)) return null;
@@ -1189,6 +1205,32 @@ test "insert of a new LSP stores it and sets the newer SRM/SSN matrix" {
     const ssn = db.ssnSet(id).?;
     try testing.expect(ssn.isSet(2));
     try testing.expectEqual(@as(usize, 1), ssn.count());
+}
+
+test "srmIsSet answers exactly what srmSet does, for every circuit and for an LSP we do not hold" {
+    // The cheap single-bit form exists because `isis-flood.prune` asks this
+    // question once per tracked pair on every poll. It must not become a
+    // subtly different question: `srmSet` returns `null` for an LSP we do not
+    // store, and a stale `srm_queue` entry for a removed LSP must not read as
+    // set here while `srmSet` says otherwise.
+    var db = Lsdb.init(testing.allocator, testCfg());
+    defer db.deinit();
+
+    var buf: [128]u8 = undefined;
+    _ = try db.insert(buildLsp(&buf, sys_other, 0, 1, 1000), 2, 0);
+    const id = idOf(sys_other, 0);
+
+    const srm = db.srmSet(id).?;
+    var i: u8 = 0;
+    while (i < db.cfg.interface_count) : (i += 1) {
+        try testing.expectEqual(srm.isSet(i), db.srmIsSet(id, i));
+    }
+    // Out of range, and an id we never stored: both `false`, matching
+    // `srmSet`'s `null`.
+    try testing.expect(!db.srmIsSet(id, db.cfg.interface_count));
+    const absent = idOf(sys_other, 99);
+    try testing.expect(db.srmSet(absent) == null);
+    try testing.expect(!db.srmIsSet(absent, 0));
 }
 
 test "duplicate (same) insert: SSN on arrival, no SRM" {

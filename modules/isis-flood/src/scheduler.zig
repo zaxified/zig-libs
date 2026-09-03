@@ -13,7 +13,14 @@
 //! depend on `isis-adj`), a caller-owned `out` slice for the effects and a
 //! caller-owned `scratch` byte buffer to serialise SNP PDUs into, and calls
 //! `poll`. It then physically sends the returned effects. Determinism: the same
-//! `(lsdb state, now sequence, up set)` yields the same effects.
+//! `(lsdb OPERATION SEQUENCE, now sequence, up set)` yields the same effects.
+//! Not the same lsdb *state*: LSP transmit order comes from `db.srmIterator`,
+//! which `isis-lsdb` defines as `srm_queue[iface]`'s insertion order — the
+//! order SRM was most recently set on that circuit, i.e. a function of
+//! history. Two stores with identical content built by different operation
+//! sequences flood the same LSPs in different orders (probed: the same six
+//! LSPs inserted forward vs reverse come out reversed). Content-determinism
+//! would need a sorted walk and is not what this provides.
 //!
 //! ## The retransmit / pacing model (P2P) — where SRM is *actually* cleared
 //! On a point-to-point circuit an LSP is flooded and then **retransmitted** every
@@ -159,6 +166,16 @@ pub const Scheduler = struct {
     /// the series reaches `max_lsp_id` the cadence timer is not re-armed.
     csnp_cursor: [max_interfaces]LspId = @splat(snp.min_lsp_id),
 
+    /// The `up` set the previous `poll` saw, so this one can spot the Down->Up
+    /// edge. Per-circuit scheduling state describes an ADJACENCY, and an
+    /// adjacency that went Down and came back is a different one: it has seen
+    /// none of our database. Without the edge, `csnp_primed` fired once per
+    /// circuit for the life of the process and a flap mid-series left
+    /// `csnp_cursor` parked, so the new neighbour's first CSNP started
+    /// somewhere in the middle of the ID space and the bottom of it went
+    /// unadvertised for a full `complete_snp_interval`.
+    prev_up: InterfaceSet = InterfaceSet.initEmpty(),
+
     pub fn init(alloc: std.mem.Allocator, cfg: Config) Scheduler {
         std.debug.assert(cfg.lsp_entries_per_pdu >= 1 and cfg.lsp_entries_per_pdu <= snp.max_entries_per_pdu);
         return .{ .alloc = alloc, .cfg = cfg };
@@ -182,9 +199,12 @@ pub const Scheduler = struct {
         self.victims.clearRetainingCapacity();
         var it = self.last_sent.iterator();
         while (it.next()) |e| {
-            const set = db.srmSet(e.key_ptr.id);
-            const still = set != null and set.?.isSet(e.key_ptr.iface);
-            if (!still) self.victims.append(self.alloc, e.key_ptr.*) catch break;
+            // `srmIsSet`, not `srmSet(...).?.isSet(...)`: the latter builds the
+            // whole per-interface set (one hash lookup per circuit) to read one
+            // bit, once per tracked pair, on every poll.
+            if (!db.srmIsSet(e.key_ptr.id, e.key_ptr.iface)) {
+                self.victims.append(self.alloc, e.key_ptr.*) catch break;
+            }
         }
         for (self.victims.items) |k| _ = self.last_sent.remove(k);
     }
@@ -198,6 +218,29 @@ pub const Scheduler = struct {
     /// one poll (a few hundred bytes per PDU). `out` bounds the effect count.
     pub fn poll(self: *Scheduler, now: Time, up: InterfaceSet, db: *Lsdb, out: []Effect, scratch: []u8) PollResult {
         self.prune(db);
+
+        // An interface that has gone Down loses every piece of state that
+        // described its adjacency: the CSNP priming and resume cursor (so the
+        // next adjacency is re-synchronised from the bottom of the ID space,
+        // not from wherever the last series happened to stop) and its pacing
+        // records (whose "we already sent this recently" refers to a peer that
+        // is no longer there). The Up edge is then handled by the existing
+        // first-sight priming below, which this restores rather than
+        // duplicates.
+        var i_down: u8 = 0;
+        while (i_down < max_interfaces) : (i_down += 1) {
+            if (!self.prev_up.isSet(i_down) or up.isSet(i_down)) continue;
+            self.csnp_primed[i_down] = false;
+            self.csnp_cursor[i_down] = snp.min_lsp_id;
+            self.csnp_next[i_down] = 0;
+            self.victims.clearRetainingCapacity();
+            var lit = self.last_sent.iterator();
+            while (lit.next()) |e| {
+                if (e.key_ptr.iface == i_down) self.victims.append(self.alloc, e.key_ptr.*) catch break;
+            }
+            for (self.victims.items) |k| _ = self.last_sent.remove(k);
+        }
+        self.prev_up = up;
 
         var n_eff: usize = 0;
         var scratch_used: usize = 0;
@@ -282,8 +325,10 @@ pub const Scheduler = struct {
     }
 
     /// Emit the PSNP PDUs for one circuit: drain the SSN-flagged LSPs, chunked,
-    /// clearing SSN as each PDU is produced. Returns `true` iff it ran out of
-    /// `out` room or `scratch` space (truncated).
+    /// clearing SSN as each PDU is produced. Returns `true` iff work remains
+    /// this instant: it ran out of `out` room or `scratch` space, **or** more
+    /// than `max_summary_entries` circuits' worth of flags were pending and
+    /// the summary buffer capped the drain.
     fn emitPsnp(
         self: *Scheduler,
         now: Time,
@@ -312,9 +357,22 @@ pub const Scheduler = struct {
         // unreachable dead code under `Lsdb`'s current invariants, not a live
         // stranded-flag bug — left as defensive fail-safety rather than
         // `unreachable`, since that invariant lives in a different module.
+        // Set when the summary buffer fills before the SSN queue is drained.
+        // Without it the leftover flags are invisible to the caller: this
+        // returns "not truncated", `poll` computes `next_wakeup` as if no acks
+        // were pending, and the caller sleeps up to `complete_snp_interval`
+        // with acks and requests outstanding -- while SPEC section 6 says PSNP
+        // acks are unpaced and contribute to the wakeup precisely via
+        // `truncated`. Reachable without a malformed packet: request
+        // placeholders are minted up to `request_capacity` (default
+        // `capacity / 4` = 1024 at stock settings), four times this buffer.
+        var capped = false;
         var qit = db.ssnIterator(iface);
         while (qit.next()) |item| {
-            if (m >= entries.len) break;
+            if (m >= entries.len) {
+                capped = true;
+                break;
+            }
             const v = db.get(item.lsp_id, now) orelse continue;
             entries[m] = .{
                 .remaining_lifetime = v.remaining_lifetime,
@@ -329,12 +387,16 @@ pub const Scheduler = struct {
         snp.sortEntries(entries[0..m]);
 
         // `Config.lsp_entries_per_pdu` is caller-supplied and `init`'s
-        // `std.debug.assert` is the only thing that keeps it `>= 1` — and
-        // that assert is compiled OUT in ReleaseFast. Without this clamp a
-        // caller-constructed `Config{ .lsp_entries_per_pdu = 0 }` makes `j ==
-        // i` forever (see `emitCsnp`'s sibling clamp for the sharper failure
-        // mode this exact gap causes there). See CHANGELOG.
-        const per = @max(@as(usize, 1), self.cfg.lsp_entries_per_pdu);
+        // `std.debug.assert` is the only thing that keeps it in
+        // `1..=max_entries_per_pdu` — and that assert is compiled OUT in
+        // ReleaseFast. The clamp covers BOTH ends, because the assert did:
+        // `0` makes `j == i` forever, and anything above
+        // `snp.max_entries_per_pdu` makes every `buildPsnp`/`buildCsnp`
+        // return `ValueTooLong`, which both emitters report as `truncated`,
+        // i.e. "poll again immediately" — a zero-output livelock that never
+        // gets smaller. Clamping only the lower end fixed the case and not
+        // the rule. See CHANGELOG.
+        const per = std.math.clamp(self.cfg.lsp_entries_per_pdu, 1, snp.max_entries_per_pdu);
         const src = self.sourceId();
         var i: usize = 0;
         while (i < m) {
@@ -350,7 +412,7 @@ pub const Scheduler = struct {
             for (entries[i..j]) |e| db.clearSsn(e.lsp_id, iface);
             i = j;
         }
-        return false;
+        return capped;
     }
 
     /// The outcome of one circuit's CSNP burst.
@@ -372,15 +434,32 @@ pub const Scheduler = struct {
     /// advertised range is a *claim* about coverage, and this function may only
     /// claim what it actually enumerated.
     ///
-    /// The summary buffer is finite (`max_summary_entries`) and `isis-lsdb`'s
-    /// `summarise` fills it in hash order, so "the first N of the range" is not
-    /// even a well-defined prefix. Therefore: ask for one more entry than we can
-    /// advertise, and if the window is over-full **narrow the window** (halve it
-    /// by LSP-ID) and re-count until what came back is provably the *whole*
-    /// content of `[start, end]`. That window is then advertised honestly, the
-    /// cursor moves to `end + 1`, and the rest of the database follows on the
-    /// next poll(s). The previous behaviour — emit the first 256 entries and
-    /// still stamp `max_lsp_id` on the last chunk — made every omitted LSP look
+    /// The summary buffer is finite (`max_summary_entries`), so a window may
+    /// hold more than we can enumerate. **`isis-lsdb.summarise` returns the
+    /// numerically smallest in-range LSP-IDs in ascending order, truncating the
+    /// TAIL** — so a return of `n` entries provably enumerates the whole of
+    /// `[start, out[n-1].lsp_id]`, and that is the range this advertises. Ask
+    /// for one slot more than we will advertise: a return of
+    /// `max_summary_entries + 1` proves the window is over-full and
+    /// `entries[max_summary_entries - 1].lsp_id` is the largest end we can
+    /// honestly claim; anything less proves `[start, max_lsp_id]` was
+    /// enumerated completely. The cursor then moves to `end + 1` and the rest
+    /// of the database follows on the next poll(s).
+    ///
+    /// ⚠ **This rests on the sibling's ordering contract**, and used not to.
+    /// When `summarise` filled the buffer in hash order, "the first N of the
+    /// range" had no definition, so this function binary-searched the 64-bit
+    /// LSP-ID space for the largest enumerable end — ~64 extra full-database
+    /// passes per window, i.e. per poll, quadratic in database size for a
+    /// paginated series. `isis-lsdb` gave `summarise` the ascending,
+    /// tail-truncating contract (and documented this exact pagination
+    /// protocol) and this module was never updated; its comment and SPEC still
+    /// asserted the old behaviour as the justification. The dependency is now
+    /// explicit and pinned by "SIBLING CONTRACT" below, so losing it upstream
+    /// turns this module red rather than silently over-claiming a range.
+    ///
+    /// The behaviour before either fix — emit the first 256 entries and still
+    /// stamp `max_lsp_id` on the last chunk — made every omitted LSP look
     /// absent to the peer, which re-flooded them on every cadence tick forever.
     fn emitCsnp(
         self: *Scheduler,
@@ -400,25 +479,20 @@ pub const Scheduler = struct {
         const start = self.csnp_cursor[iface];
         var end = snp.max_lsp_id;
         var m = db.summarise(&entries, start, end, now);
+        // `summarise`'s ascending order is what makes a prefix meaningful, and
+        // it is a contract of a DIFFERENT module. Check it here rather than
+        // trust it: the failure mode is an over-claimed CSNP range, which the
+        // peer answers by flooding back every LSP we did not list.
+        for (1..m) |k| std.debug.assert(std.mem.lessThan(u8, &entries[k - 1].lsp_id, &entries[k].lsp_id));
         if (m > max_summary_entries) {
-            // Over-full: we cannot enumerate this window, so we must not claim
-            // it. Binary-search the LARGEST end whose window we can enumerate
-            // (largest, not merely any, so a sparse ID space does not cost one
-            // poll per halving). `good` is complete by construction — a single
-            // LSP-ID holds at most one entry — and `bad` is over-full; each step
-            // strictly shrinks the gap, so this ends after at most 64 rounds.
-            var good = start;
-            var bad = end;
-            while (true) {
-                const mid = snp.midpoint(good, bad);
-                if (std.mem.eql(u8, &mid, &good)) break; // bad == good + 1
-                if (db.summarise(&entries, start, mid, now) > max_summary_entries) bad = mid else good = mid;
-            }
-            end = good;
-            m = db.summarise(&entries, start, end, now); // refill for the chosen window
+            // Over-full. The smallest `max_summary_entries` ids are exactly
+            // what came back first, so `[start, entries[255].lsp_id]` is
+            // enumerated completely and is the largest end we may claim. One
+            // pass, not sixty-five: no re-query is needed, because the entries
+            // for the narrowed window are already the prefix in hand.
+            m = max_summary_entries;
+            end = entries[m - 1].lsp_id;
         }
-
-        snp.sortEntries(entries[0..m]);
 
         // See the identical clamp + comment in `emitPsnp`. Here the gap is
         // sharper than a stalled loop: with `per == 0` and `m > 0`, `j ==
@@ -429,7 +503,7 @@ pub const Scheduler = struct {
         // are BOTH compiled out — it is an out-of-bounds read at an
         // address `usize.max` slots past `entries`, undefined behaviour on
         // a public function driven entirely by caller-supplied `Config`.
-        const per = @max(@as(usize, 1), self.cfg.lsp_entries_per_pdu);
+        const per = std.math.clamp(self.cfg.lsp_entries_per_pdu, 1, snp.max_entries_per_pdu);
         const src = self.sourceId();
         var i: usize = 0;
         var advertised_to: ?LspId = null;
@@ -876,13 +950,11 @@ test "determinism: identical (lsdb ops, now, up) yield identical effects, order 
     // F2: the previous version of this test compared only three per-kind
     // COUNTS (lsp/psnp/csnp) and next_wakeup between two runs, never the
     // Effect order or bytes. But LSP transmit order comes from
-    // `db.srmIterator`, a bare AutoHashMap iterator whose iteration order is
-    // a function of insertion history (probed separately: the same 12 LSP
-    // IDs inserted forward vs. reverse DO come out of `srmIterator` in a
-    // different order — see the module finding). The file's own
-    // determinism contract ("the same (lsdb state, now sequence, up set)
-    // yields the same effects") is about *content*-determinism, which is
-    // stronger than three counts can pin. This drives the same script
+    // `db.srmIterator`, whose order is `srm_queue[iface]`'s insertion order —
+    // a function of history (probed: the same LSP IDs inserted forward vs.
+    // reverse DO come out in a different order). The file header's contract
+    // is therefore stated over the OPERATION SEQUENCE, not over lsdb state;
+    // this test drives the same script
     // twice (identical insertion order both times, so this specific
     // scenario IS expected to be byte-identical) and asserts the full
     // ordered (iface, kind, bytes) sequence, not just counts.
@@ -1165,6 +1237,247 @@ test "fail-open guard: lsp_entries_per_pdu == 0 does not underflow emitCsnp / st
     try testing.expect(countKind(r0.effects, .psnp) >= 1); // the SSN entry was drained
     try testing.expect(!db.ssnSet(idOf(sys_other, 0)).?.isSet(arrival)); // actually acked, not spun on
     _ = sched.poll(1, oneUp(arrival), &db, &out, &scratch); // a second poll: still terminates
+}
+
+test "SIBLING CONTRACT: isis-lsdb.summarise returns an ASCENDING, tail-truncated prefix" {
+    // `emitCsnp` advertises `[cursor, entries[n-1].lsp_id]` after ONE
+    // `summarise` call. That is only honest because the sibling returns the
+    // numerically smallest in-range ids in ascending order, truncating the
+    // tail -- so the entries in hand provably enumerate that range completely.
+    // The property lives in another module and the failure mode here is an
+    // over-claimed CSNP range, which the peer answers by flooding back
+    // everything we did not list. Pin it where it is depended on, not only
+    // where it is declared: if `isis-lsdb` ever loses the ordering, this test
+    // is what says so.
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 1024 });
+    defer db.deinit();
+    var lbuf: [128]u8 = undefined;
+    const total = max_summary_entries + 30;
+    // Inserted in an order that is NOT ascending, so a pass-through of
+    // insertion order would show up here.
+    var n: u16 = @intCast(total);
+    while (n > 0) {
+        n -= 1;
+        _ = try db.insert(buildLspId(&lbuf, idNth(sys_other, n), 1, 1000), arrival, 0);
+    }
+
+    var entries: [max_summary_entries + 1]LspEntry = undefined;
+    const m = db.summarise(&entries, snp.min_lsp_id, snp.max_lsp_id, 0);
+    try testing.expectEqual(max_summary_entries + 1, m); // over-full, as set up
+    for (1..m) |k| {
+        try testing.expect(std.mem.lessThan(u8, &entries[k - 1].lsp_id, &entries[k].lsp_id));
+    }
+    // Tail truncation, not an arbitrary subset: what came back is the SMALLEST
+    // `m` ids, so re-asking for exactly the prefix range returns exactly the
+    // prefix -- which is the claim `emitCsnp` puts on the wire.
+    const prefix_end = entries[max_summary_entries - 1].lsp_id;
+    var again: [max_summary_entries + 1]LspEntry = undefined;
+    try testing.expectEqual(max_summary_entries, db.summarise(&again, snp.min_lsp_id, prefix_end, 0));
+    for (0..max_summary_entries) |k| {
+        try testing.expectEqual(entries[k].lsp_id, again[k].lsp_id);
+    }
+}
+
+test "a circuit that flaps is re-primed and re-synchronised from the bottom of the ID space" {
+    // `csnp_primed[i]` was set on first sight and never cleared, so only the
+    // FIRST adjacency ever seen on a circuit got its initial CSNP; every
+    // later one waited out `complete_snp_interval`. Worse, a flap in the
+    // middle of a paginated series left `csnp_cursor[i]` parked, so the new
+    // neighbour's first CSNP advertised a window starting somewhere in the
+    // middle of the ID space and the bottom of it went unadvertised -- to a
+    // peer that has seen none of our database.
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 1024 });
+    defer db.deinit();
+    var lbuf: [128]u8 = undefined;
+    // More than one summary window, so the first poll leaves a series in
+    // progress and the cursor parked away from `min_lsp_id`.
+    for (0..max_summary_entries + 10) |n| {
+        _ = try db.insert(buildLspId(&lbuf, idNth(sys_other, @intCast(n)), 1, 1000), arrival, 0);
+    }
+
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local });
+    defer sched.deinit();
+    var out: [128]Effect = undefined;
+    var scratch: [65536]u8 = undefined;
+
+    const r0 = sched.poll(0, oneUp(0), &db, &out, &scratch);
+    try testing.expect(countKind(r0.effects, .csnp) >= 1);
+    try testing.expect(r0.truncated); // series in progress
+    try testing.expect(!std.mem.eql(u8, &sched.csnp_cursor[0], &snp.min_lsp_id));
+
+    // The circuit goes Down mid-series...
+    _ = sched.poll(1, InterfaceSet.initEmpty(), &db, &out, &scratch);
+    try testing.expectEqual(snp.min_lsp_id, sched.csnp_cursor[0]);
+
+    // ...and comes back. A CSNP must fire at once, from the bottom.
+    const r2 = sched.poll(2, oneUp(0), &db, &out, &scratch);
+    try testing.expect(countKind(r2.effects, .csnp) >= 1);
+    var first_start: ?LspId = null;
+    for (r2.effects) |e| {
+        if (e.kind != .csnp) continue;
+        first_start = (try isis.Csnp.decode(e.bytes)).start_lsp_id;
+        break;
+    }
+    try testing.expectEqual(snp.min_lsp_id, first_start.?);
+}
+
+test "more than max_summary_entries pending SSN flags reports truncated, not a full sleep" {
+    // `emitPsnp`'s drain stops at the 256-entry summary buffer. It used to
+    // return `false` (not truncated) when it did, so `poll` computed
+    // `next_wakeup` as if nothing were pending and the caller slept up to
+    // `complete_snp_interval` with acks and requests outstanding -- against
+    // SPEC section 6, which says PSNP acks are unpaced and reach the wakeup
+    // exactly via `truncated`. No fixture exceeded 256, so nothing was red.
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 1024 });
+    defer db.deinit();
+    var lbuf: [128]u8 = undefined;
+    const over = max_summary_entries + 44;
+    for (0..over) |n| _ = try db.insert(buildLspId(&lbuf, idNth(sys_other, @intCast(n)), 1, 1000), arrival, 0);
+
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local });
+    defer sched.deinit();
+
+    // Driven directly rather than through `poll`, so the periodic CSNP's own
+    // truncation over the same 300-entry database cannot supply the `true`
+    // this test is looking for. `out`/`scratch` are sized well past what the
+    // 256 drained entries need (18 PSNPs at 15 entries each), so neither of
+    // the OTHER two truncation causes can fire either -- what is left is the
+    // buffer cap.
+    var out: [128]Effect = undefined;
+    var scratch: [65536]u8 = undefined;
+    var n_eff: usize = 0;
+    var scratch_used: usize = 0;
+    const truncated = sched.emitPsnp(0, arrival, &db, &out, &n_eff, &scratch, &scratch_used);
+    try testing.expect(n_eff < out.len); // out did not fill
+    try testing.expect(scratch_used < scratch.len); // scratch did not fill
+    try testing.expect(truncated);
+
+    // And the flags that did not fit are still set -- the work the caller is
+    // being told to come back for.
+    var still: usize = 0;
+    for (0..over) |n| {
+        if (db.ssnSet(idNth(sys_other, @intCast(n))).?.isSet(arrival)) still += 1;
+    }
+    try testing.expectEqual(@as(usize, over - max_summary_entries), still);
+
+    // Under the cap, the same call reports no truncation: the flag means
+    // "work remains", not "there were many entries".
+    var db2 = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 1024 });
+    defer db2.deinit();
+    for (0..max_summary_entries - 1) |n| _ = try db2.insert(buildLspId(&lbuf, idNth(sys_other, @intCast(n)), 1, 1000), arrival, 0);
+    n_eff = 0;
+    scratch_used = 0;
+    try testing.expect(!sched.emitPsnp(0, arrival, &db2, &out, &n_eff, &scratch, &scratch_used));
+}
+
+test "CSNP chunks tile a SPARSE id space with no gap — the successor rule, on ids that can tell the two candidates apart" {
+    // SPEC section 5's tiling rule is `chunk_start = successor(previous
+    // chunk's last id)`. Every other chunking fixture in this file and every
+    // Wireshark golden uses CONSECUTIVE LSP-IDs, and on consecutive ids
+    // `successor(entries[i-1].lsp_id)` and `entries[i].lsp_id` are the SAME
+    // VALUE — so the rule was replaceable by the wrong expression with all
+    // 30 tests and all 5 goldens green (measured). The corpus is genuine and
+    // byte-verified and simply cannot express the input the rule refuses;
+    // genuineness and discrimination are separate properties.
+    //
+    // Sparse ids separate them. The consequence of getting it wrong is not
+    // cosmetic: an uncovered gap between two advertised ranges means a peer
+    // holding an LSP we lack in that gap never floods it to us (ISO 10589
+    // section 7.3.15.2 reasons about the advertised RANGE, not the listed
+    // entries), i.e. permanent database desync.
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 16 });
+    defer db.deinit();
+    var lbuf: [128]u8 = undefined;
+    const sparse = [_]LspId{
+        .{ 0x11, 0, 0, 0, 0, 0x0B, 0, 0 },
+        .{ 0x22, 0, 0, 0, 0, 0x0B, 0, 0 },
+        .{ 0x33, 0, 0, 0, 0, 0x0B, 0, 0 },
+        .{ 0x44, 0, 0, 0, 0, 0x0B, 0, 0 },
+    };
+    for (sparse) |id| _ = try db.insert(buildLspId(&lbuf, id, 1, 1000), arrival, 0);
+
+    var sched = Scheduler.init(testing.allocator, .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 2 });
+    defer sched.deinit();
+
+    var out: [32]Effect = undefined;
+    var scratch: [4096]u8 = undefined;
+    const r = sched.poll(0, oneUp(0), &db, &out, &scratch);
+
+    var prev_end: ?LspId = null;
+    var seen: usize = 0;
+    for (r.effects) |e| {
+        if (e.kind != .csnp) continue;
+        const c = try isis.Csnp.decode(e.bytes);
+        if (prev_end) |pe| {
+            // Contiguity: this chunk starts exactly one past the last one.
+            // With the wrong expression this is `entries[i].lsp_id`, which
+            // on sparse ids leaves everything between `pe` and that id
+            // advertised by nobody.
+            try testing.expectEqual(snp.successor(pe), c.start_lsp_id);
+        } else {
+            try testing.expectEqual(snp.min_lsp_id, c.start_lsp_id);
+        }
+        prev_end = c.end_lsp_id;
+        seen += 1;
+    }
+    try testing.expect(seen >= 2); // more than one chunk, or the rule is untested
+    try testing.expectEqual(snp.max_lsp_id, prev_end.?); // and the series covers the top
+}
+
+test "fail-open guard: lsp_entries_per_pdu ABOVE snp.max_entries_per_pdu does not livelock" {
+    // The 2026-08-23 fix clamped the caller-supplied `lsp_entries_per_pdu`
+    // at its LOWER end only, while the assert it was replacing guarded
+    // both: `1..=snp.max_entries_per_pdu`. Above that ceiling every
+    // `buildPsnp`/`buildCsnp` returns `ValueTooLong` (the #9 TLV caps at 15
+    // entries), and both emitters map that to `truncated`, which the poll
+    // contract defines as "call again immediately". Nothing gets smaller on
+    // the retry, so the caller spins at `next_wakeup == now` emitting zero
+    // PDUs while the SSN flags stay set — for as long as the process runs.
+    // A stalled routing loop, from a config typo, with no assert in
+    // ReleaseFast to catch it.
+    var db = Lsdb.init(testing.allocator, .{ .local_system_id = sys_local, .interface_count = 2, .capacity = 64 });
+    defer db.deinit();
+    var lbuf: [128]u8 = undefined;
+    // More than the 15-entry ceiling, so a single PDU cannot hold them all
+    // and the chunker is what has to make progress.
+    for (0..20) |n| {
+        try arrivalDb(&db, buildLsp(&lbuf, sys_other, @intCast(n), 1, 1000), idOf(sys_other, @intCast(n)));
+    }
+
+    // Bypass `init` on purpose, exactly as the sibling tests above do: its
+    // assert is all a Debug build has and all a ReleaseFast build does not.
+    var sched: Scheduler = .{
+        .alloc = testing.allocator,
+        .cfg = .{ .local_system_id = sys_local, .lsp_entries_per_pdu = 100 },
+    };
+    defer sched.deinit();
+
+    var out: [64]Effect = undefined;
+    var scratch: [4096]u8 = undefined;
+    const r0 = sched.poll(0, oneUp(arrival), &db, &out, &scratch);
+    // Progress, on the first poll: PDUs out and flags actually cleared.
+    try testing.expect(countKind(r0.effects, .psnp) >= 1);
+    try testing.expect(!db.ssnSet(idOf(sys_other, 0)).?.isSet(arrival));
+
+    // ...and the whole backlog drains in a bounded number of polls rather
+    // than spinning forever. 20 entries at 15 per PDU is 2 PDUs' worth; ten
+    // polls is generous and still finite, which is the point.
+    var polls: usize = 0;
+    while (polls < 10) : (polls += 1) {
+        var any = false;
+        for (0..20) |n| {
+            if (db.ssnSet(idOf(sys_other, @intCast(n))).?.isSet(arrival)) any = true;
+        }
+        if (!any) break;
+        _ = sched.poll(@intCast(polls + 1), oneUp(arrival), &db, &out, &scratch);
+    }
+    try testing.expect(polls < 10);
+
+    // The periodic CSNP half of the same gap: an interface with no SSN
+    // pending reaches `emitCsnp`, which must also emit rather than report
+    // `truncated` forever.
+    const r1 = sched.poll(100, oneUp(0), &db, &out, &scratch);
+    try testing.expect(countKind(r1.effects, .csnp) >= 1);
 }
 
 test "fail-open guard: lsp_entries_per_pdu == 0 does not underflow emitCsnp's entries[j-1]" {
