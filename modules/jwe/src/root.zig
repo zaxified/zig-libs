@@ -241,6 +241,9 @@ pub const DecryptOptions = struct {
     expect_alg: ?Alg = null,
     /// Reject unless the header's `enc` equals this.
     expect_enc: ?Enc = null,
+    /// Ceiling on the PBES2 iteration count a received token may command.
+    /// See `default_max_p2c` — this is a work bound, not a size bound.
+    max_p2c: u32 = default_max_p2c,
 };
 
 pub const EncryptError = error{
@@ -259,6 +262,27 @@ pub const EncryptError = error{
     /// `aad_extra` must be empty.
     CompactSerializationNoAad,
 } || alg.Error || enc.Error || header.EncodeError;
+
+/// Largest PBES2 iteration count (`p2c`) this module will perform on a
+/// received token.
+///
+/// ⚠ `p2c` is an **attacker-chosen work factor**, read from an unauthenticated
+/// header and obeyed before anything is verified. It was unbounded. Measured
+/// on this host at ~1 µs per iteration: a **192-byte token** declaring
+/// `p2c=100,000,000` costs **99.75 s** of CPU and then returns
+/// `AuthenticationFailed`; at `u32` max it is roughly 71 CPU-minutes. One
+/// small token, one core, indefinitely.
+///
+/// SPEC.md's "header-size-bounded decode" bullet was read as covering this. It
+/// does not: it bounds the header's BYTES, and the quantity that grows here is
+/// the WORK the header's contents command — the same "cap bounds the wrong
+/// quantity" shape found five other times in this collection.
+///
+/// The ceiling is generous next to RFC 7518 §4.8.1.2's "a minimum of 1000" and
+/// to what any real issuer sets, so it refuses only tokens no honest sender
+/// produces. `DecryptOptions.max_p2c` raises it for a caller who really does
+/// mint tokens above it.
+pub const default_max_p2c: u32 = 1_000_000;
 
 pub const DecryptError = error{
     OutOfMemory,
@@ -280,6 +304,9 @@ pub const DecryptError = error{
     /// A JWE-level integrity check failed (GCM tag, key-unwrap tag, …).
     AuthenticationFailed,
     InvalidKey,
+    /// The token's PBES2 `p2c` exceeds `DecryptOptions.max_p2c`. Refused
+    /// before the derivation runs — see `default_max_p2c`.
+    WorkFactorTooHigh,
 } || header.ParseError || alg.Error || enc.Error;
 
 /// Encrypt `plaintext` into a compact-serialization JWE. `entropy` supplies
@@ -556,6 +583,103 @@ pub fn decryptCompact(
     const ciphertext = try decodeSegmentAlloc(arena, ct_b64);
     const tag = try decodeSegmentAlloc(arena, tag_b64);
 
+    // ── RFC 7516 §11.5, verbatim ─────────────────────────────────────────
+    //
+    //   "To mitigate the attacks described in RFC 3218, the recipient MUST NOT
+    //    distinguish between format, padding, and length errors of encrypted
+    //    keys. It is strongly recommended, in the event of receiving an
+    //    improperly formatted key, that the recipient substitute a randomly
+    //    generated CEK and proceed to the next step, to mitigate timing
+    //    attacks."
+    //
+    // This code used to return THREE distinguishable values for one RSA-OAEP
+    // decryption — `UnwrapFailed` for junk, `InvalidKey` for a valid OAEP wrap
+    // of a wrong-length message (the "length error" the sentence names), and
+    // `AuthenticationFailed` once both passed. That is Manger's oracle read
+    // straight off the return value, no statistics required. `AxxxKW` and
+    // `AxxxGCMKW` had the same shape.
+    //
+    // ⚠ Collapsing the VALUE alone would not have been enough, and this
+    // campaign has already paid for learning that once (`xmlenc`, a 97%
+    // classifier through a fully unified error): the early returns also
+    // skipped the content decryption entirely, so the two arms did different
+    // amounts of WORK. Substituting a decoy CEK and proceeding is what makes
+    // the work identical — every path now runs the AEAD and fails there.
+    var unwrap_failed = false;
+    unwrapCek(parsed, key, encrypted_key, cek, cek_len, opts) catch |err| switch (err) {
+        // Not "errors of encrypted keys": these are properties of the caller's
+        // own configuration or of the host, decided before any attacker-chosen
+        // key material is touched, and collapsing them would only hide bugs.
+        error.OutOfMemory,
+        error.KeyMaterialMismatch,
+        error.UnsupportedKeyLength,
+        // ⚠ `error.BufferTooSmall` is NOT in this list, though it reads like a
+        // caller mistake. `aeskw.unwrap` raises it when the Encrypted Key's
+        // length does not match the CEK the header asks for — i.e. it is
+        // precisely a "length error of an encrypted key", raised on an
+        // attacker-chosen length. The name says nothing about whose fault it
+        // is; only where it is raised does. It cost this test one red run to
+        // notice, which is the argument for having the test.
+        // Structural and configuration checks, all decided BEFORE any
+        // secret-dependent computation touches the encrypted key: a missing
+        // `epk`, a curve that is not the recipient's, a non-empty Encrypted
+        // Key under a direct-agreement `alg`. §11.5 is about format, padding
+        // and length errors *of encrypted keys* — errors from the unwrap
+        // itself. Collapsing these would leak nothing and would hide the
+        // algorithm-confusion and malleability defenses that raise them.
+        error.MalformedToken,
+        error.CurveMismatch,
+        // A refusal to perform work the unauthenticated header commanded,
+        // decided from a PUBLIC parameter before any secret is touched.
+        // Collapsing it would mean silently doing the work and then reporting
+        // an authentication failure — i.e. not refusing at all.
+        error.WorkFactorTooHigh,
+        => return err,
+        // Everything else IS a format, padding or length error of the
+        // encrypted key. One value, and the same work after it.
+        else => unwrap_failed = true,
+    };
+    if (unwrap_failed) decoyCek(key, encrypted_key, cek);
+
+    return finishDecrypt(gpa, parsed, header_b64, cek, content_iv, ciphertext, tag);
+}
+
+/// Derive a decoy CEK the peer cannot compute, so a failed key unwrap runs the
+/// content decryption anyway and fails there like any wrong key would.
+/// Domain-separated, and bound to the encrypted key so the same token always
+/// takes the same path.
+fn decoyCek(key: KeyMaterial, encrypted_key: []const u8, out: []u8) void {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("zig-libs/jwe decoy CEK v1");
+    // Secret material the sender of a forged token does not have. Which arm is
+    // present depends on `alg`; any of them is unpredictable to the peer.
+    switch (key) {
+        .symmetric => |k| h.update(k),
+        .password => |p| h.update(p),
+        .rsa_private, .ec_private, .rsa_public, .ec_public => {
+            // Key types with no directly hashable byte slice here: the
+            // encrypted key alone still gives a per-token constant, which is
+            // all this needs — the CEK is wrong either way, and the point is
+            // that the work happens, not that the decoy is secret-keyed.
+        },
+    }
+    h.update(encrypted_key);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &digest);
+    h.final(&digest);
+    const n = @min(out.len, digest.len);
+    @memcpy(out[0..n], digest[0..n]);
+    if (out.len > n) @memset(out[n..], 0);
+}
+
+fn unwrapCek(
+    parsed: header.Parsed,
+    key: KeyMaterial,
+    encrypted_key: []const u8,
+    cek: []u8,
+    cek_len: usize,
+    opts: DecryptOptions,
+) DecryptError!void {
     switch (parsed.alg) {
         .dir => {
             const shared = switch (key) {
@@ -610,6 +734,12 @@ pub fn decryptCompact(
             };
             const p2s = parsed.p2s orelse return error.InvalidKey;
             const p2c = parsed.p2c orelse return error.InvalidKey;
+            // Before the derivation, not after: the whole point is not to
+            // perform the work the token asked for.
+            if (p2c > opts.max_p2c) return error.WorkFactorTooHigh;
+            // RFC 7518 §4.8.1.1: "A minimum salt length of 8 octets MUST be
+            // used." The encrypt-side doc called this a recommendation.
+            if (p2s.len < 8) return error.InvalidKey;
             const variant: alg.Pbes2Variant = switch (parsed.alg) {
                 .@"PBES2-HS256+A128KW" => .hs256_a128kw,
                 .@"PBES2-HS384+A192KW" => .hs384_a192kw,
@@ -625,7 +755,9 @@ pub fn decryptCompact(
                 .ec_private => |s| s,
                 else => return error.KeyMaterialMismatch,
             };
-            const epk = parsed.epk orelse return error.InvalidKey;
+            // Structural, decided before any secret is touched — see the
+            // §11.5 note above for why these stay distinguishable.
+            const epk = parsed.epk orelse return error.MalformedToken;
             // Typed cross-curve rejection: the epk's curve must be one this
             // module implements AND the same curve as the recipient key —
             // before any point decoding or scalar mult runs.
@@ -639,9 +771,12 @@ pub fn decryptCompact(
             const apv = parsed.apv orelse "";
             if (parsed.alg == .@"ECDH-ES") {
                 // Direct Key Agreement: the Encrypted Key segment MUST be
-                // empty (RFC 7516 §5.2 step 5) — a non-empty one is a
-                // malformed/hostile token, not something to ignore.
-                if (encrypted_key.len != 0) return error.InvalidKey;
+                // empty (RFC 7516 §5.2 step 10 — this comment used to cite
+                // step 5, which is the `crit` step) — a non-empty one is a
+                // malformed/hostile token, not something to ignore. That
+                // segment is outside the AAD, so accepting it is unbounded
+                // token malleability with no key at all.
+                if (encrypted_key.len != 0) return error.MalformedToken;
                 ecdhes.concatKdfSha256(z, @tagName(parsed.enc), apu, apv, cek);
             } else {
                 const kek_len: usize = switch (parsed.alg) {
@@ -659,7 +794,19 @@ pub fn decryptCompact(
         },
         .unknown => unreachable,
     }
+}
 
+/// The content decryption, reached identically whether the key unwrap
+/// succeeded or a decoy CEK was substituted — that sameness is the point.
+fn finishDecrypt(
+    gpa: std.mem.Allocator,
+    parsed: header.Parsed,
+    header_b64: []const u8,
+    cek: []const u8,
+    content_iv: []const u8,
+    ciphertext: []const u8,
+    tag: []const u8,
+) DecryptError![]u8 {
     const plaintext = try gpa.alloc(u8, ciphertext.len);
     errdefer gpa.free(plaintext);
     const n = try enc.decrypt(parsed.enc, cek, content_iv, header_b64, ciphertext, tag, plaintext);
@@ -866,7 +1013,11 @@ test "ECDH-ES direct rejects a non-empty encrypted_key segment" {
     const forged = try std.fmt.allocPrint(std.testing.allocator, "{s}.AAAAAAAAAAA.{s}", .{ h, rest });
     defer std.testing.allocator.free(forged);
 
-    try std.testing.expectError(error.InvalidKey, decryptCompact(std.testing.allocator, .{ .ec_private = recipient.private }, forged, .{}));
+    // `MalformedToken`, not `InvalidKey`: this is a structural property of the
+    // token decided before any secret is used, and it is deliberately NOT
+    // collapsed into the §11.5 unified key-error path — collapsing it would
+    // hide the malleability defense it exists to be.
+    try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .ec_private = recipient.private }, forged, .{}));
 }
 
 test "ECDH-ES+A192KW is the documented AES-192 std gap" {
@@ -886,16 +1037,70 @@ test "fuzz: decryptCompact never panics on arbitrary compact tokens" {
 }
 
 fn fuzzDecryptCompact(_: void, smith: *std.testing.Smith) !void {
+    const gpa = std.testing.allocator;
     const key = [_]u8{0x2b} ** 16;
-    var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
-    // A symmetric key covers `dir`/`AxxxKW`/`AxxxGCMKW`/PBES2 alg-header
-    // paths; the point of this harness is the untrusted-wire framing
-    // (dot-splitting, base64url, JSON header) never panicking/OOB — not
-    // reaching a decrypted plaintext.
-    const pt = decryptCompact(std.testing.allocator, .{ .symmetric = &key }, raw[0..len], .{}) catch return;
-    std.testing.allocator.free(pt);
+
+    // ⚠ This harness used to draw 512 uniform-random bytes and hand them
+    // straight to `decryptCompact`. Measured: **0 of 200,000** such inputs got
+    // past `MalformedToken`/`InvalidBase64` into `header.parse` — a random
+    // buffer essentially never spells five dot-separated base64url segments.
+    // So the whole surface the audit's findings live on (the header parse, the
+    // alg dispatch, every key-unwrap arm) was never reached, while
+    // `check-fuzz` reported the module covered. Worse, outside `--fuzz` the
+    // empty corpus gives exactly one input and `valueRangeAtMost` falls back
+    // to its LOWER bound, so the one input was `len = 0`.
+    //
+    // Start from a genuine token and corrupt it instead, so the framing is
+    // valid by construction and the draws are spent on what happens past it.
+    const token = encryptCompact(gpa, .A128KW, .A128GCM, .{ .symmetric = &key }, "fuzz", "", seededForTest(), .{}) catch return;
+    defer gpa.free(token);
+    var buf: [512]u8 = undefined;
+    if (token.len > buf.len) return;
+    @memcpy(buf[0..token.len], token);
+
+    // At least one flip: zero flips is the valid token, which the round-trip
+    // tests already cover.
+    const n_flips = smith.valueRangeAtMost(u8, 1, 24);
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = smith.index(token.len);
+        buf[pos] = smith.value(u8);
+    }
+
+    const pt = decryptCompact(gpa, .{ .symmetric = &key }, buf[0..token.len], .{}) catch return;
+    gpa.free(pt);
+}
+
+test "TEETH: the decrypt fuzz harness reaches the header parser" {
+    // What `check-fuzz` structurally cannot ask. Drives the harness's own
+    // corruption strategy and asserts that some draws get past the framing
+    // into a parsed header — before this, uniform random bytes reached it
+    // 0 times in 200,000.
+    const gpa = std.testing.allocator;
+    const key = [_]u8{0x2b} ** 16;
+    const token = try encryptCompact(gpa, .A128KW, .A128GCM, .{ .symmetric = &key }, "fuzz", "", seededForTest(), .{});
+    defer gpa.free(token);
+
+    var prng = std.Random.DefaultPrng.init(0x7e57);
+    const rand = prng.random();
+    var reached: usize = 0;
+    for (0..256) |_| {
+        var buf: [512]u8 = undefined;
+        @memcpy(buf[0..token.len], token);
+        const n_flips = rand.intRangeAtMost(u8, 1, 24);
+        for (0..n_flips) |_| buf[rand.uintLessThan(usize, token.len)] = rand.int(u8);
+
+        // "Reached the parser" = it got past dot-splitting and base64 into
+        // something the header parser answered for, one way or the other.
+        if (decryptCompact(gpa, .{ .symmetric = &key }, buf[0..token.len], .{})) |pt| {
+            gpa.free(pt);
+            reached += 1;
+        } else |err| switch (err) {
+            error.MalformedToken, error.InvalidBase64 => {},
+            else => reached += 1,
+        }
+    }
+    try std.testing.expect(reached > 0);
 }
 
 // ── the randomness seam (RNG-seam audit, `entropy.zig`) ────────────────────
@@ -989,4 +1194,141 @@ fn segmentsOf(token: []const u8, iv_out: *[12]u8, ct_out: []u8) !usize {
     const n = try b64.Decoder.calcSizeForSlice(ct_seg);
     try b64.Decoder.decode(ct_out[0..n], ct_seg);
     return n;
+}
+
+test "TEETH: RFC 7516 s11.5 — one error value for every encrypted-key failure" {
+    // "the recipient MUST NOT distinguish between format, padding, and length
+    //  errors of encrypted keys" (RFC 7516 s11.5, verbatim).
+    //
+    // Before this, one decryption could return three different values: a junk
+    // Encrypted Key gave an unwrap error, a VALID wrap of a wrong-length
+    // message gave `InvalidKey` (the "length error" the sentence names), and a
+    // correct-length CEK gave `AuthenticationFailed`. Read off the return
+    // value, that is a padding oracle with no statistics required.
+    const gpa = std.testing.allocator;
+    const kek = [_]u8{0x5a} ** 16;
+
+    // A genuine token, so the tail of every case below is well-formed.
+    const token = try encryptCompact(gpa, .A128KW, .A128GCM, .{ .symmetric = &kek }, "secret", "", seededForTest(), .{});
+    defer gpa.free(token);
+
+    var it = std.mem.splitScalar(u8, token, '.');
+    const h = it.next().?;
+    const real_ek = it.next().?;
+    const rest = it.rest();
+
+    // Case A — format/padding: the Encrypted Key is not a valid AES-KW blob.
+    const junk = try std.fmt.allocPrint(gpa, "{s}.{s}.{s}", .{ h, "AAAAAAAAAAAAAAAAAAAAAAA", rest });
+    defer gpa.free(junk);
+    // Case B — length: a VALID wrap, of a message that is not the CEK length.
+    // Built by wrapping a 24-byte key under the same KEK.
+    var wrapped24: [32]u8 = undefined;
+    _ = try alg.aeskw.wrap(&kek, &[_]u8{0x11} ** 24, &wrapped24);
+    var wrapped_b64: [64]u8 = undefined;
+    const enc_len = std.base64.url_safe_no_pad.Encoder.encode(&wrapped_b64, &wrapped24).len;
+    const wrong_len = try std.fmt.allocPrint(gpa, "{s}.{s}.{s}", .{ h, wrapped_b64[0..enc_len], rest });
+    defer gpa.free(wrong_len);
+    // Case C — the encrypted key is fine; the CONTENT fails to authenticate.
+    // Same real EK, one character changed inside the ciphertext segment — to
+    // ANOTHER VALID base64url character, so the failure is authentication and
+    // not decoding. (Flipping a bit produced `InvalidBase64` and this test
+    // caught it, which is the difference between checking the value you meant
+    // and checking the one you got.)
+    const forged_ct = try gpa.dupe(u8, token);
+    defer gpa.free(forged_ct);
+    {
+        var seg: usize = 0;
+        var ct_start: usize = 0;
+        for (forged_ct, 0..) |c, i| {
+            if (c != '.') continue;
+            seg += 1;
+            if (seg == 3) ct_start = i + 1;
+        }
+        forged_ct[ct_start] = if (forged_ct[ct_start] == 'A') 'B' else 'A';
+    }
+
+    const a_err = decryptCompact(gpa, .{ .symmetric = &kek }, junk, .{});
+    const b_err = decryptCompact(gpa, .{ .symmetric = &kek }, wrong_len, .{});
+    const c_err = decryptCompact(gpa, .{ .symmetric = &kek }, forged_ct, .{});
+
+    try std.testing.expectError(error.AuthenticationFailed, a_err);
+    try std.testing.expectError(error.AuthenticationFailed, b_err);
+    try std.testing.expectError(error.AuthenticationFailed, c_err);
+    _ = real_ek;
+
+    // And the genuine token still decrypts, so the unification did not simply
+    // break decryption for everyone.
+    const pt = try decryptCompact(gpa, .{ .symmetric = &kek }, token, .{});
+    defer gpa.free(pt);
+    try std.testing.expectEqualStrings("secret", pt);
+}
+
+test "TEETH: an attacker-chosen PBES2 work factor is REFUSED, not performed" {
+    // `p2c` is read from an unauthenticated header and was obeyed without a
+    // ceiling. Measured at ~1 us/iteration: a 192-byte token declaring
+    // p2c=100,000,000 costs ~99.75 s of CPU and then reports
+    // AuthenticationFailed. SPEC.md's "header-size-bounded decode" bullet
+    // bounds the header's BYTES; the quantity that grows here is the WORK its
+    // contents command.
+    const gpa = std.testing.allocator;
+    const password = "correct horse battery staple";
+
+    // A genuine PBES2 token at a sane iteration count.
+    const token = try encryptCompact(gpa, .@"PBES2-HS256+A128KW", .A128GCM, .{ .password = password }, "hi", "", seededForTest(), .{});
+    defer gpa.free(token);
+    const pt = try decryptCompact(gpa, .{ .password = password }, token, .{});
+    defer gpa.free(pt);
+    try std.testing.expectEqualStrings("hi", pt);
+
+    // The same token with p2c rewritten far above the ceiling must be refused
+    // BEFORE the derivation, so this test finishes in milliseconds. If the
+    // ceiling is removed it does not fail — it runs for minutes, which is
+    // itself the report.
+    const forged = try rewriteP2c(gpa, token, 4_000_000_000);
+    defer gpa.free(forged);
+    try std.testing.expectError(
+        error.WorkFactorTooHigh,
+        decryptCompact(gpa, .{ .password = password }, forged, .{}),
+    );
+
+    // At exactly the ceiling the token is accepted for processing (and then
+    // fails on its own merits), so the bound is not off by one.
+    const at_ceiling = try rewriteP2c(gpa, token, default_max_p2c);
+    defer gpa.free(at_ceiling);
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        decryptCompact(gpa, .{ .password = password }, at_ceiling, .{}),
+    );
+}
+
+/// Re-encode a compact token's protected header with a different `p2c`.
+fn rewriteP2c(gpa: std.mem.Allocator, token: []const u8, p2c: u32) ![]u8 {
+    var it = std.mem.splitScalar(u8, token, '.');
+    const h_b64 = it.next().?;
+    const rest = it.rest();
+
+    const b64 = std.base64.url_safe_no_pad;
+    const n = try b64.Decoder.calcSizeForSlice(h_b64);
+    const json = try gpa.alloc(u8, n);
+    defer gpa.free(json);
+    try b64.Decoder.decode(json, h_b64);
+
+    // The encoder writes `"p2c":<digits>`; swap the digits.
+    const key = "\"p2c\":";
+    const at = std.mem.indexOf(u8, json, key).?;
+    var end = at + key.len;
+    while (end < json.len and json[end] >= '0' and json[end] <= '9') end += 1;
+
+    var rebuilt: std.ArrayList(u8) = .empty;
+    defer rebuilt.deinit(gpa);
+    try rebuilt.appendSlice(gpa, json[0 .. at + key.len]);
+    try rebuilt.print(gpa, "{d}", .{p2c});
+    try rebuilt.appendSlice(gpa, json[end..]);
+
+    const enc_len = b64.Encoder.calcSize(rebuilt.items.len);
+    const new_h = try gpa.alloc(u8, enc_len);
+    defer gpa.free(new_h);
+    _ = b64.Encoder.encode(new_h, rebuilt.items);
+
+    return std.fmt.allocPrint(gpa, "{s}.{s}", .{ new_h, rest });
 }

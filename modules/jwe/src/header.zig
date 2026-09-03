@@ -55,6 +55,13 @@ pub const ParseError = error{
     MissingAlg,
     /// `enc` is absent or not a string (REQUIRED, RFC 7516 §4.1.2).
     MissingEnc,
+    /// `crit` is present. RFC 7516 §5.2 step 5: a recipient MUST understand
+    /// and process every header parameter listed there, and MUST reject the
+    /// JWE otherwise. This module implements no extensions, so the only
+    /// conformant answer to any `crit` at all is refusal — it was previously
+    /// parsed past and ignored, which meant a sender's "you must understand
+    /// this or fail" was silently answered "understood".
+    UnsupportedCrit,
     /// `zip` is present — always rejected (see module doc comment).
     UnsupportedZip,
     /// A known member has the wrong JSON type, or a base64 member decodes
@@ -109,6 +116,12 @@ pub fn parse(arena: std.mem.Allocator, header_json: []const u8) ParseError!Parse
     const obj = val.object;
 
     if (obj.get("zip") != null) return error.UnsupportedZip;
+    // RFC 7516 §5.2 step 5. Rejected before its SHAPE is examined: a malformed
+    // `crit` (a string rather than an array, say) is no more understandable
+    // than a well-formed one naming an extension we do not implement, and a
+    // parser that inspects the shape first has already accepted the premise
+    // that some `crit` values are fine.
+    if (obj.get("crit") != null) return error.UnsupportedCrit;
 
     const alg_str = try requiredString(obj, "alg") orelse return error.MissingAlg;
     const enc_str = try requiredString(obj, "enc") orelse return error.MissingEnc;
@@ -412,10 +425,63 @@ test "fuzz: parse never panics on arbitrary header JSON bytes" {
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
-    var buf: [max_header_json_len]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    _ = parse(arena.allocator(), buf[0..len]) catch return;
+    const a = arena.allocator();
+
+    // ⚠ This drew uniform-random bytes, which are not JSON: every draw bounced
+    // off `InvalidJson` and the member-by-member decoding below it — the
+    // `optionalBase64`/`optionalUint`/`optionalEpk` paths where the parse
+    // errors actually live — was never entered. And outside `--fuzz` the empty
+    // corpus gives ONE input, with `valueRangeAtMost` falling back to its lower
+    // bound, so that one input was the empty string.
+    //
+    // Build a syntactically valid header and let the fuzzer choose its member
+    // VALUES instead, which is where hostile input goes in practice.
+    var json: std.ArrayList(u8) = .empty;
+    var raw: [64]u8 = undefined;
+    smith.bytes(&raw);
+    const n = smith.valueRangeAtMost(u8, 0, raw.len);
+    const blob = raw[0..n];
+
+    json.print(a, "{{\"alg\":\"{s}\",\"enc\":\"{s}\"", .{
+        if (smith.value(bool)) "A128KW" else "PBES2-HS256+A128KW",
+        "A128GCM",
+    }) catch return;
+    if (smith.value(bool)) json.print(a, ",\"p2c\":{d}", .{smith.value(u32)}) catch return;
+    if (smith.value(bool)) json.print(a, ",\"p2s\":\"{s}\"", .{std.fmt.bytesToHex(raw, .lower)[0 .. n * 2]}) catch return;
+    if (smith.value(bool)) json.print(a, ",\"kid\":\"{s}\"", .{std.fmt.bytesToHex(raw, .lower)[0 .. n * 2]}) catch return;
+    if (smith.value(bool)) json.appendSlice(a, ",\"epk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"AA\",\"y\":\"AA\"}") catch return;
+    json.append(a, '}') catch return;
+
+    _ = parse(a, json.items) catch return;
+    // The raw-bytes case still gets a share of the draws — it is what proves
+    // the parser survives non-JSON at all.
+    _ = parse(a, blob) catch return;
+}
+
+test "TEETH: any crit header is refused (RFC 7516 s5.2 step 5)" {
+    // `crit` means "reject this JWE unless you understand every parameter I
+    // list". It was parsed past and ignored, so six different shapes — including
+    // a spec-forbidden `crit:["alg"]` and a malformed `crit:"notanarray"` —
+    // were all accepted on genuine, correctly-tagged tokens. Silence is the
+    // one answer the parameter forbids.
+    // `parse` takes an arena and leaks into it by design.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+    for ([_][]const u8{
+        "{\"alg\":\"dir\",\"enc\":\"A128GCM\",\"crit\":[\"exp\"]}",
+        "{\"alg\":\"dir\",\"enc\":\"A128GCM\",\"crit\":[]}",
+        "{\"alg\":\"dir\",\"enc\":\"A128GCM\",\"crit\":[\"alg\"]}",
+        "{\"alg\":\"dir\",\"enc\":\"A128GCM\",\"crit\":\"notanarray\"}",
+        "{\"alg\":\"dir\",\"enc\":\"A128GCM\",\"crit\":null}",
+        "{\"alg\":\"dir\",\"enc\":\"A128GCM\",\"crit\":{\"a\":1}}",
+    }) |json| {
+        try std.testing.expectError(error.UnsupportedCrit, parse(gpa, json));
+    }
+    // The same header without `crit` still parses, so this is not rejecting
+    // everything.
+    const ok = try parse(gpa, "{\"alg\":\"dir\",\"enc\":\"A128GCM\"}");
+    try std.testing.expectEqual(Alg.dir, ok.alg);
 }

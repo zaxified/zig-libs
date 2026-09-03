@@ -74,8 +74,9 @@ const plaintext2 = try jwe.decryptCompact(gpa, .{ .rsa_private = sk }, token2, .
 defer gpa.free(plaintext2);
 ```
 
-`KeyMaterial` is a tagged union (`symmetric` / `rsa_public` / `rsa_private` /
-`password`) — its tag must match what the header's `alg` expects, or decrypt
+`KeyMaterial` is a tagged union of **six** arms (`symmetric` / `rsa_public` /
+`rsa_private` / `password` / `ec_public` / `ec_private` — the ECDH-ES pair was
+missing from this list, in the very sentence that states the defense) — its tag must match what the header's `alg` expects, or decrypt
 fails closed with `error.KeyMaterialMismatch` (the JWE analogue of `jwt`'s
 `AlgKeyMismatch` algorithm-confusion defense).
 

@@ -56,8 +56,10 @@ placement).
 ## Threat model
 
 - **Key-material confusion** (the JWE analogue of `jwt`'s RFC 8725
-  algorithm-confusion defense): `KeyMaterial` is a tagged union
-  (`symmetric`/`rsa_public`/`rsa_private`/`password`), and both
+  algorithm-confusion defense): `KeyMaterial` is a tagged union of six arms
+  (`symmetric`/`rsa_public`/`rsa_private`/`password`/`ec_public`/`ec_private`
+  — the two ECDH-ES arms were absent from this list, in the sentence that
+  states the defense), and both
   `encryptCompact` and `decryptCompact` check the header's `alg` against the
   *kind* of key material supplied before doing any crypto —
   `error.KeyMaterialMismatch` on any mismatch (an `RSA-OAEP` token can never
