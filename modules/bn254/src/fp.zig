@@ -278,8 +278,11 @@ fn montMul(a: Limbs, b: Limbs) Limbs {
 /// Portable constant-time DEDICATED Montgomery squaring `z = a²·R⁻¹ mod p`
 /// (SOS: separated square then Montgomery-reduce). Each off-diagonal
 /// `a[i]·a[j]` (`i<j`) product is computed ONCE and doubled — the ~½L²
-/// saving over `montMul(a, a)`. Its correctness oracle is `montMul(a, a)`
-/// (the differential test below). No secret-dependent branch/index.
+/// saving over `montMul(a, a)`. Its correctness oracle is `std.crypto.ff`'s
+/// `Modulus.sq` (the differential test below), not `montMul(a, a)` -- an
+/// external one, so a shared mistake in the two hand-written kernels cannot
+/// cancel out. No secret-dependent branch/index; measured, see `SPEC.md`
+/// "Constant time".
 fn montSqr(a: Limbs) Limbs {
     // A holds the full 2L-word square across all four phases.
     var A = [_]u64{0} ** (2 * L);
@@ -402,6 +405,16 @@ pub const Fp = struct {
     /// Builds a small `Fp` value from a native unsigned integer (e.g. the
     /// curve constant `b = 3`). Rejects values `>= p` (`error.Overflow`).
     pub fn fromInt(comptime T: type, v: T) FpError!Fp {
+        // `T` is the caller's choice, so neither of these is guaranteed by the
+        // call site. A bare `@intCast` on a negative value is illegal
+        // behaviour -- a caught panic in ReleaseSafe, a SIGSEGV in ReleaseFast
+        // -- while the declared error set promises a reported rejection.
+        const info = @typeInfo(T).int;
+        const max_bits: u16 = if (info.signedness == .signed) 257 else 256;
+        comptime if (info.bits > max_bits) {
+            @compileError("Fp.fromInt: T wider than 256 bits cannot be represented");
+        };
+        if (info.signedness == .signed and v < 0) return error.Overflow;
         const uv: u256 = @intCast(v);
         if (uv >= @as(u256, p_int)) return error.Overflow;
         const normal: Limbs = .{
@@ -508,7 +521,7 @@ pub const Fp = struct {
     /// Constant-time select: returns `a` if `cond`, else `b` (masked
     /// limb-wise merge on the Montgomery representation).
     pub fn ctSelect(cond: bool, a: Fp, b: Fp) Fp {
-        const mask: u64 = @as(u64, 0) -% @intFromBool(cond);
+        const mask: u64 = @as(u64, 0) -% blackBox(@as(u64, @intFromBool(cond)));
         var out: Limbs = undefined;
         inline for (0..L) |i| out[i] = (a.limbs[i] & mask) | (b.limbs[i] & ~mask);
         return .{ .limbs = out };
@@ -545,6 +558,59 @@ test "Fp.fromBytes rejects p itself (non-canonical) and accepts p-1" {
     var p_minus_1 = p_bytes;
     p_minus_1[31] -= 1;
     _ = try Fp.fromBytes(p_minus_1); // must not error
+}
+
+test "geP: the canonicality gate is exercised at EVERY limb, in both directions" {
+    // EIP-197 (Encoding): "An encoding value of `p` or larger is invalid." `geP`
+    // is the sole enforcement of that for every coordinate of every
+    // ecAdd/ecMul/ecPairing/Groth16 point. It was pinned only at `p` and
+    // `p - 1`, i.e. at the top limb, so a compiling FALSE-ACCEPT mutation
+    // (skipping limb 1 of the comparison) shipped with all 163 tests green --
+    // the 49 official Ethereum vectors included, because every one of them is
+    // a SUCCESS case and none can express a non-canonical coordinate.
+    //
+    // The oracle here is `p_int` itself, not `geP`: the expectation is
+    // computed from the u256 value, so this cannot agree with a broken
+    // comparator by construction.
+    inline for (0..L) |i| {
+        inline for ([_]i2{ 1, -1 }) |delta| {
+            comptime var v = p_limbs;
+            const wraps = comptime (delta == 1 and p_limbs[i] == std.math.maxInt(u64)) or
+                (delta == -1 and p_limbs[i] == 0);
+            if (!wraps) {
+                comptime {
+                    v[i] = if (delta == 1) p_limbs[i] + 1 else p_limbs[i] - 1;
+                }
+                const value: u256 = @as(u256, v[0]) | (@as(u256, v[1]) << 64) |
+                    (@as(u256, v[2]) << 128) | (@as(u256, v[3]) << 192);
+                const bytes = limbsToBe(v);
+                if (value >= @as(u256, p_int)) {
+                    try std.testing.expectError(error.NonCanonical, Fp.fromBytes(bytes));
+                } else {
+                    // Accepted, and round-trips exactly: a gate that accepts
+                    // but reduces would be the same defect wearing a mask.
+                    const fe = try Fp.fromBytes(bytes);
+                    try std.testing.expectEqualSlices(u8, &bytes, &fe.toBytes());
+                }
+            }
+        }
+    }
+}
+
+test "Fp.fromInt rejects a negative or oversize T by name rather than by illegal behaviour" {
+    // `T` is the CALLER's choice. The `std.crypto.ff` path this replaced
+    // returned `error.Overflow` for a negative value and rejected
+    // `@bitSizeOf(T) > 256` at compile time; the rewrite's bare `@intCast`
+    // dropped both, so `fromInt(i32, -1)` was a caught panic in ReleaseSafe
+    // and a SIGSEGV in ReleaseFast -- while the declared error set still
+    // promises a reported rejection.
+    try std.testing.expectError(error.Overflow, Fp.fromInt(i32, -1));
+    try std.testing.expectError(error.Overflow, Fp.fromInt(i64, std.math.minInt(i64)));
+    // A negative-typed but non-negative value is still a value.
+    const two = try Fp.fromInt(i32, 2);
+    try std.testing.expectEqual(try Fp.fromInt(u8, 2), two);
+    // And a wide unsigned T still rejects >= p rather than truncating.
+    try std.testing.expectError(error.Overflow, Fp.fromInt(u256, std.math.maxInt(u256)));
 }
 
 test "Fp.fromInt(3) matches the b=3 curve-constant byte pattern" {

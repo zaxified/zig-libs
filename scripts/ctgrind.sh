@@ -104,6 +104,7 @@ declare -A TARGETS=(
     [chachapoly]="poly1305 aead"
     [ct25519]="ct25519 std"
     [decaf448]="scalarmul"
+    [bn254]="field scalarmul"
     [ecvrf]="prove"
     [ed448]="full ladder"
     [k256]="field mul comb sign ecdsa"
@@ -113,6 +114,7 @@ declare -A MODES=(
     [chachapoly]="ReleaseFast ReleaseSafe Debug"
     [ct25519]="ReleaseFast"
     [decaf448]="ReleaseFast"
+    [bn254]="ReleaseFast"
     [ecvrf]="ReleaseFast"
     [ed448]="ReleaseFast"
     [k256]="ReleaseFast"
@@ -133,6 +135,13 @@ declare -A PATTERN=(
     # pattern to make a count go away. The expected non-zero is named in
     # ctgrind-expected.tsv.
     [chachapoly/aead]='root[.]zig|chacha20[.]zig|poly1305[.]zig'
+    # bn254's own hand-written Montgomery field (commit 1892c814 replaced the
+    # `std.crypto.ff` backend with it). `fp.zig` carries montMul/montSqr,
+    # condSubP, subLimbs, ctSelect and the `blackBox` barrier; `g1.zig` the
+    # ladder the tainted scalar drives. `scalar.zig` is listed for the
+    # scalarmul target because `Fr` IS the secret there.
+    [bn254/field]='fp[.]zig'
+    [bn254/scalarmul]='g1[.]zig|fp[.]zig|scalar[.]zig'
     [ct25519/ct25519]='root[.]zig'
     [ct25519/std]='edwards25519[.]zig|ristretto255[.]zig|curve25519[.]zig'
     [decaf448/scalarmul]='element[.]zig|ed448[.]zig|field[.]zig|scalar[.]zig'
@@ -161,6 +170,8 @@ declare -A PATTERN=(
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 declare -A LABEL=(
+    [bn254/field]='bn254 fp.zig'
+    [bn254/scalarmul]='bn254 g1+fp+scalar'
     [chachapoly/poly1305]='poly1305.zig'
     [chachapoly/aead]='aead: root+std'
     [ct25519/ct25519]='ct25519/root.zig'

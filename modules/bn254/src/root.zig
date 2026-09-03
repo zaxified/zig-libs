@@ -30,8 +30,10 @@
 //! `core/vm/testdata/precompiles/*.json` conformance vectors (49 vectors
 //! across all three precompiles, both the `ecPairing` true AND false
 //! paths). This module was built by careful, verified ADAPTATION of
-//! the sibling `bls12_381` module (same `std.crypto.ff`-backed `Fp`/`Fr`
-//! construction, same tower-arithmetic formula shapes from Devegili et
+//! the sibling `bls12_381` module (`std.crypto.ff`-backed `Fr`; `Fp` has
+//! since moved to this module's own hand-written CIOS/SOS Montgomery
+//! arithmetic, see `fp.zig`) — same tower-arithmetic formula shapes from
+//! Devegili et
 //! al. and Adj & Rodriguez-Henriquez, same Jacobian point-arithmetic
 //! formulas from `g1.zig`/`g2.zig`, same pairing STRUCTURE from
 //! `bls12_381/src/pairing.zig`) with BN254's own field/curve constants
@@ -99,8 +101,8 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no wire framing
     .concurrency = .reentrant, // every type is a plain value type, no shared state
-    .model_after = "BN254 / alt-bn128 (EIP-196/197) field tower; std.crypto.ff supplies the constant-time Montgomery modular arithmetic Fp/Fr are built on — same construction as the sibling bls12_381 module, adapted to BN254's modulus/non-residues",
-    .deps = .{}, // std only (std.crypto.ff)
+    .model_after = "BN254 / alt-bn128 (EIP-196/197) field tower; Fp is this module's own constant-time CIOS/SOS Montgomery arithmetic over four 64-bit limbs (std.crypto.ff still backs Fr), modelled on the sibling bls12_381 module and adapted to BN254's modulus/non-residues",
+    .deps = .{}, // std only (std.crypto.ff, for Fr)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────

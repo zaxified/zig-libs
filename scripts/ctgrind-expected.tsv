@@ -43,6 +43,8 @@
 # re-running the harness.
 #
 # module	mode	target	total_min	in_file
+bn254	ReleaseFast	field	1	1
+bn254	ReleaseFast	scalarmul	1	5
 chachapoly	ReleaseFast	poly1305	1	0
 chachapoly	ReleaseSafe	poly1305	1	>=1
 chachapoly	Debug	poly1305	1	>=1

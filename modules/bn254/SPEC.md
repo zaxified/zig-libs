@@ -23,11 +23,17 @@ accounting.
   `bn128_curve.curve_order` / `bn128_curve.G1` / `bn128_curve.G2`
   constants (these are PUBLISHED NUMBERS, not copyrightable expression
   — see the "NOTICE" section below for why no NOTICE entry is needed).
-- **`Fp`/`Fr` ride on `std.crypto.ff.Modulus`/`Fe`** (`fp.zig`/
-  `scalar.zig`), exactly as `bls12_381` does — this module supplies the
-  BN254-specific modulus values and field-arithmetic entry points on
-  top; it does NOT reimplement big-integer or Montgomery arithmetic
-  itself. Both `Fp` and `Fr` use a 256-bit (32-byte) container — a
+- **`Fr` rides on `std.crypto.ff.Modulus`/`Fe` (`scalar.zig`); `Fp` no
+  longer does.** ⚠ Corrected 2026-09-03: this section said both fields
+  did, and that the module "does NOT reimplement big-integer or
+  Montgomery arithmetic itself", for six weeks after commit `1892c814`
+  replaced `Fp`'s backend with ~450 lines of hand-written constant-time
+  Montgomery arithmetic — a CIOS multiply, a dedicated SOS square,
+  `negInvMod2_64` by Newton–Hensel, masked conditional add/subtract,
+  limb codecs and an inline-asm optimization barrier. `std.crypto.ff`
+  survives in `fp.zig` only as a comptime differential oracle in its
+  tests. This mattered beyond tidiness: a contributor following the
+  sentence would have produced byte-wrong `toBytes`. Both `Fp` and `Fr` use a 256-bit (32-byte) container — a
   BN254-specific quirk vs. `bls12_381` (whose `Fp`/`Fr` use DIFFERENT
   widths, 384 vs. 256 bits) because BN254's `p` and `r` are both
   exactly 254 bits.
@@ -98,9 +104,10 @@ accounting.
   planned arc; adding it back is a one-line change if a future
   compressed-encoding consumer ever appears, but it would currently be
   dead, untested code.
-- **Montgomery-storage / canonical-storage convention: `Fp` matches
-  `bls12_381` (canonical at rest, see `fp.zig`'s module doc comment);
-  `Fr` does NOT — it stores in Montgomery form.** `std.crypto.ff`'s
+- **Montgomery-storage convention: BOTH `Fp` and `Fr` store in
+  Montgomery form.** ⚠ Corrected 2026-09-03 — this said `Fp` was
+  "canonical at rest" and "deliberately left alone", which was written
+  three weeks after `1892c814` made `Fp` Montgomery-resident. `std.crypto.ff`'s
   `Modulus.mul` preserves its first operand's form, so two canonical
   operands cost **four** Montgomery multiplications per field multiply
   (and `sq` costs three, the 3:4 `square`:`mul` ratio that exposed
@@ -113,8 +120,8 @@ accounting.
   unchanged. The invariant (every `Fr` a constructor or operation
   yields is in Montgomery form) is load-bearing, because `ff.Fe.eql`
   ignores the form flag; `scalar.zig` asserts it directly in a test.
-  `Fp` is deliberately left alone here — it is a separate change with
-  the pairing KATs as its own acceptance surface.
+  `Fp` went the same way in `1892c814`, with the pairing KATs as its
+  acceptance surface, and took its own hand-written backend with it.
 - **`G1`'s cofactor is 1 — a load-bearing fact, not a simplification.**
   BN254's defining polynomial family gives `#E(Fp) = p + 1 - t = r`
   EXACTLY (`t = 6x^2+1`, confirmed `p + 1 - t == r` symbolically — see
@@ -154,8 +161,9 @@ accounting.
 ## Tier assessment — Fable NOT required for Parts 1-3
 
 This is a **careful, verified ADAPTATION**, not novel cryptographic
-design. Every algorithm (Montgomery field arithmetic via
-`std.crypto.ff`, Karatsuba/Devegili tower multiplication, the
+design. Every algorithm (CIOS/SOS Montgomery field arithmetic after
+Koç et al. in `fp.zig`, `std.crypto.ff` for `Fr`, Karatsuba/Devegili
+tower multiplication, the
 Adj–Rodriguez-Henriquez complex-method square root, Granger–Scott
 cyclotomic squaring, programmatic Frobenius-coefficient derivation) is
 the SAME formula shape already proven correct and battle-tested in the
@@ -854,6 +862,57 @@ documents for its own `e(G1,G2)` cross-check — see
 methodology, the ring-homomorphism validation, and what was/was not
 read from `py_ecc`'s source).
 
+## Constant time
+
+Measured, not asserted: `src/ctgrind_harness.zig` drives the secret paths
+under valgrind's memcheck with the secret TAINTED, and
+`scripts/ctgrind.sh bn254 --check` compares the per-file context counts
+against `scripts/ctgrind-expected.tsv`. Two targets, ReleaseFast (Debug and
+ReleaseSafe add overflow checks that branch on tainted values and bury the
+signal):
+
+| target | tainted input | in-file contexts |
+|---|---|---:|
+| `field` | an `Fp` value (limbs, after a clean parse) | 1 |
+| `scalarmul` | the `Fr` scalar of `G1.Jacobian.scalarMul` | 5 |
+
+⚠ **Until 2026-09-03 there was no such measurement at all.** Commit
+`1892c814` replaced `Fp`'s `std.crypto.ff` backend with a hand-written
+constant-time field — CIOS multiply, SOS square, masked conditional
+subtract, an inline-asm barrier — and `bn254` was not on the ctgrind module
+list, so none of it was ever measured. That is the same structural gap that
+let `p256`'s HIGH survive an audit. Two things the first run found:
+
+1. **`Fp.ctSelect`'s mask was not laundered through `blackBox`**, though
+   that barrier's own doc comment describes exactly this pattern ("select on
+   a 0/1 bit via `mask = 0 - bit`; without this barrier LLVM can recover
+   `bit ∈ {0,1}` and lower the masked select to a data-dependent branch — a
+   secret-dependent branch on the Groth16 prove path"), and `ctSelect` in
+   the `G1` ladder is where a SECRET bit is selected on. The barrier was
+   applied to the carry/borrow bits and not to the consequence it names.
+   Adding it removed one context from `scalarmul` (6 → 5), so it changes
+   real codegen rather than being decorative.
+2. **Three of the five remaining `scalarmul` contexts are `std.crypto.ff`,
+   reached through `Fr.toBytes`.** `scalarMul` converts the secret scalar to
+   bytes to walk its bits, and that conversion runs `Modulus.fromMontgomery`
+   → `shrink` → `eql`, all of which memcheck reports as branching on the
+   secret (`ff.zig:595`, `:490`, `:889`). The ladder above it is genuinely
+   branchless; the CONVERSION THAT FEEDS IT is not. **Recorded, not fixed:**
+   closing it means giving `Fr` the same hand-written Montgomery backend
+   `Fp` now has, which is a field rewrite with the Groth16/Poseidon KATs as
+   its acceptance surface — not a patch. Until then the module's
+   "constant-time double-and-add-ALWAYS, the only quantity leaked is
+   `s.len`" is true of the ladder and not of `scalarMul` as a whole.
+
+The other two contexts are `toAffine`'s `Z == 0` test and the `Fp.inv` it
+guards, on the RESULT point: taint propagates to an output that is public by
+construction, and memcheck cannot know it has been declassified. The single
+`field` context is `inv`'s documented `a == 0` check.
+
+Note that memcheck cannot distinguish a conditional jump from a `cmov`, so a
+context is a place to look, not a proven branch — which is why the fix above
+is justified by the count CHANGING, not by the count existing.
+
 ## Backlog
 
 - Part 3 (`G1`/`G2` group arithmetic — Jacobian/affine points,
@@ -879,10 +938,9 @@ read from `py_ecc`'s source).
   exact against a REAL snarkjs-produced Groth16/BN254 proof
   (darkforest-v0.3's "move" circuit). See "Part 6 — Groth16 verifier"
   below.
-- Persistent Montgomery storage / precomputed Frobenius-coefficient
-  tables (performance-only; same deferred-optimization shape as
-  `bls12_381`'s SPEC.md Backlog) — not needed until a later part's hot
-  path (Miller loop) makes it worth the complexity.
+- ~~Persistent Montgomery storage / precomputed Frobenius-coefficient
+  tables~~ — **both shipped** (`1892c814`/`a1d72299` and `8644b485`);
+  this entry outlived them.
 - `G2`'s fast endomorphism-based subgroup check (untwist-Frobenius-twist
   — same technique `bls12_381/src/g2.zig`'s Backlog defers) — the
   simple `[r]P == O` form implemented here is correct and is what a

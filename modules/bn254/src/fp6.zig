@@ -206,8 +206,9 @@ const p_minus_1_over_3_bytes: [32]u8 = fp.pExponentBytes(-1, 3);
 /// the whole pairing's cost (final exponentiation applies Frobenius a
 /// dozen-plus times). Still derived, never hand-transcribed: the
 /// "frobenius == pow(p)" definitional test and the byte-exact `γ_1` KAT
-/// below remain the anchors, and the field ops ride `std.crypto.ff`,
-/// which is comptime-evaluable.
+/// below remain the anchors, and the field ops stay comptime-evaluable
+/// (`fp.zig`'s inline-asm barrier is `@inComptime()`-guarded precisely so
+/// this derivation keeps working).
 const frobenius_gamma_1: Fp2 = blk: {
     @setEvalBranchQuota(50_000_000);
     break :blk nonresidue.pow(&p_minus_1_over_3_bytes);
