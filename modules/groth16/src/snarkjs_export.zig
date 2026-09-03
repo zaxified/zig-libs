@@ -68,15 +68,34 @@ fn isAllZero(bytes: []const u8) bool {
     return true;
 }
 
-/// Converts a big-endian byte array (any length) to a decimal string written
-/// into `buf` (`buf.len >= max_decimal_digits` required). Returns the
+pub const DecimalError = error{
+    /// `be` is longer than `max_field_bytes` — this converts field elements,
+    /// not arbitrary big integers.
+    ValueTooLarge,
+    /// `buf` is smaller than `max_decimal_digits`.
+    BufferTooSmall,
+};
+
+/// The widest input `decimalBytes` accepts: a BN254 field element.
+pub const max_field_bytes = 32;
+
+/// Converts a big-endian byte array of at most `max_field_bytes` to a decimal
+/// string written into `buf` (`buf.len >= max_decimal_digits`). Returns the
 /// written slice — no leading zeros, `"0"` for an all-zero input. Repeated
 /// schoolbook long division of the big-endian byte string by 10, collecting
 /// remainders least-significant-digit first, then reversed.
-pub fn decimalBytes(be: []const u8, buf: []u8) []const u8 {
-    std.debug.assert(buf.len >= max_decimal_digits);
-    var work_buf: [32]u8 = undefined;
-    std.debug.assert(be.len <= work_buf.len);
+///
+/// ⚠ The doc used to say "any length" while the body copied into a private
+/// 32-byte buffer behind `std.debug.assert` — compiled out in ReleaseFast, where
+/// a 48-byte input was a measured SIGSEGV. Both bounds are refusals now. This
+/// matters beyond the in-repo call graph: SPEC.md's **fuzz exemption** is argued
+/// from every byte-accepting `pub fn` here only ever seeing "field elements THIS
+/// module just computed", while the published contract invited any caller to
+/// pass anything.
+pub fn decimalBytes(be: []const u8, buf: []u8) DecimalError![]const u8 {
+    if (buf.len < max_decimal_digits) return error.BufferTooSmall;
+    var work_buf: [max_field_bytes]u8 = undefined;
+    if (be.len > work_buf.len) return error.ValueTooLarge;
     @memcpy(work_buf[0..be.len], be);
     const work = work_buf[0..be.len];
 
@@ -102,18 +121,18 @@ pub fn decimalBytes(be: []const u8, buf: []u8) []const u8 {
 }
 
 /// Decimal-string encoding of an `Fp` element (base field coordinate).
-pub fn fpDecimal(fp: Fp, buf: []u8) []const u8 {
-    return decimalBytes(&fp.toBytes(), buf);
+pub fn fpDecimal(fp: Fp, buf: []u8) DecimalError![]const u8 {
+    return try decimalBytes(&fp.toBytes(), buf);
 }
 
 /// Decimal-string encoding of an `Fr` element (scalar / public input).
-pub fn frDecimal(fr: Fr, buf: []u8) []const u8 {
-    return decimalBytes(&fr.toBytes(), buf);
+pub fn frDecimal(fr: Fr, buf: []u8) DecimalError![]const u8 {
+    return try decimalBytes(&fr.toBytes(), buf);
 }
 
 fn writeFpDecimal(w: *std.Io.Writer, fp: Fp) !void {
     var buf: [max_decimal_digits]u8 = undefined;
-    try w.writeAll(fpDecimal(fp, &buf));
+    try w.writeAll(try fpDecimal(fp, &buf));
 }
 
 /// Writes a `G1.Affine` point as snarkjs's `[x, y, "1"]` (or `["0","1","0"]`
@@ -205,7 +224,7 @@ pub fn publicJson(allocator: std.mem.Allocator, public_inputs: []const Fr) ![]u8
         if (i != 0) try w.writeAll(",");
         try w.writeAll("\"");
         var buf: [max_decimal_digits]u8 = undefined;
-        try w.writeAll(frDecimal(pi, &buf));
+        try w.writeAll(try frDecimal(pi, &buf));
         try w.writeAll("\"");
     }
     try w.writeAll("]");
@@ -218,14 +237,14 @@ pub fn publicJson(allocator: std.mem.Allocator, public_inputs: []const Fr) ![]u8
 test "decimalBytes: zero encodes as \"0\"" {
     var buf: [max_decimal_digits]u8 = undefined;
     const zero = [_]u8{0} ** 32;
-    try std.testing.expectEqualStrings("0", decimalBytes(&zero, &buf));
+    try std.testing.expectEqualStrings("0", try decimalBytes(&zero, &buf));
 }
 
 test "decimalBytes: one encodes as \"1\"" {
     var buf: [max_decimal_digits]u8 = undefined;
     var one = [_]u8{0} ** 32;
     one[31] = 1;
-    try std.testing.expectEqualStrings("1", decimalBytes(&one, &buf));
+    try std.testing.expectEqualStrings("1", try decimalBytes(&one, &buf));
 }
 
 test "decimalBytes: 256 encodes as \"256\" (multi-digit, byte boundary)" {
@@ -233,7 +252,7 @@ test "decimalBytes: 256 encodes as \"256\" (multi-digit, byte boundary)" {
     var v = [_]u8{0} ** 32;
     v[30] = 1;
     v[31] = 0;
-    try std.testing.expectEqualStrings("256", decimalBytes(&v, &buf));
+    try std.testing.expectEqualStrings("256", try decimalBytes(&v, &buf));
 }
 
 test "decimalBytes round-trips Fr.toBytes for a handful of small scalars" {
@@ -242,7 +261,7 @@ test "decimalBytes round-trips Fr.toBytes for a handful of small scalars" {
         const fr = field.frFromU64(n);
         try std.testing.expectEqualStrings(
             std.fmt.comptimePrint("{d}", .{n}),
-            frDecimal(fr, &buf),
+            try frDecimal(fr, &buf),
         );
     }
 }
@@ -270,4 +289,40 @@ test "publicJson renders a bare decimal-string array" {
     const json = try publicJson(allocator, &inputs);
     defer allocator.free(json);
     try std.testing.expectEqualStrings("[\"9\",\"16\",\"49\"]", json);
+}
+
+test "TEETH: decimalBytes refuses an over-long value and a too-small buffer" {
+    // Both bounds were `std.debug.assert`, and the doc said "any length".
+    // Measured in ReleaseFast before the fix: a 48-byte input SIGSEGV'd, because
+    // the assert vanished and `@memcpy` ran past a private 32-byte array.
+    var buf: [max_decimal_digits]u8 = undefined;
+    const too_long = [_]u8{0xAB} ** 48;
+    try std.testing.expectError(error.ValueTooLarge, decimalBytes(&too_long, &buf));
+
+    var small: [max_decimal_digits - 1]u8 = undefined;
+    const ok_value = [_]u8{1} ** 32;
+    try std.testing.expectError(error.BufferTooSmall, decimalBytes(&ok_value, &small));
+
+    // The boundary itself is legal in both directions — the refusals are where
+    // they claim to be, not one step either side.
+    const at_cap = [_]u8{0} ** 31 ++ [_]u8{7};
+    try std.testing.expectEqualStrings("7", try decimalBytes(&at_cap, &buf));
+}
+
+test "TEETH: the G2 point-at-infinity encoding is exercised" {
+    // `writeG2`'s infinity branch had NO test: replacing its literal with
+    // garbage left the whole suite green, while `writeG1` has both a generator
+    // and an infinity case. The frozen snarkjs KAT carries only finite points,
+    // so a valid-output corpus could not reach it — the same shape as everywhere
+    // else in this campaign.
+    const allocator = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var inf = G2.Affine.generator;
+    inf.infinity = true;
+    try writeG2(&aw.writer, inf);
+    // snarkjs writes the point at infinity in the same three-projective-
+    // coordinate shape as a finite point, with Z = 0 — asserted literally, so a
+    // mutation to any part of it is caught, not just "something was written".
+    try std.testing.expectEqualStrings("[[\"0\",\"0\"],[\"1\",\"0\"],[\"0\",\"0\"]]", aw.writer.buffered());
 }

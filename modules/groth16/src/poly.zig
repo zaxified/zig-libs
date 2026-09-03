@@ -80,7 +80,9 @@ pub fn mulSchoolbook(out: []Fr, a: []const Fr, b: []const Fr) void {
 /// contributes `c` to the quotient at degree `i−n` and folds `c` back into
 /// degree `i−n` of the running remainder. What remains in degrees `< n` is
 /// the true remainder.
-pub fn divByVanishing(quotient: []Fr, p: []const Fr, comptime n: usize) bool {
+pub const DivError = error{PolynomialTooLarge};
+
+pub fn divByVanishing(quotient: []Fr, p: []const Fr, comptime n: usize) DivError!bool {
     std.debug.assert(p.len >= n);
     std.debug.assert(quotient.len == p.len - n);
 
@@ -88,8 +90,15 @@ pub fn divByVanishing(quotient: []Fr, p: []const Fr, comptime n: usize) bool {
     // `p` high→low, accumulating folds into a scratch we derive on the fly.
     // To stay allocation-free we reduce in place over a local copy bounded
     // by p.len; for scaffold-scale circuits this stack buffer is ample.
+    // ⛔ NOT an assert. `std.debug.assert` is compiled out in ReleaseFast, and
+    // past it `@memcpy(rem[0..p.len], p)` writes straight past a fixed stack
+    // array: SIGSEGV, measured, with `p.len = 20480` at `max_degree = 16384`.
+    // The in-module route is real, not hypothetical — `prove(comptime n, …)`
+    // builds a `p` of length `2n − 1`, so any `n >= 8193` crosses the bound, and
+    // this constant's own doc comment invites exactly that ("bump if a larger
+    // circuit needs it") without saying the check evaporates.
+    if (p.len > max_degree) return error.PolynomialTooLarge;
     var rem: [max_degree]Fr = undefined;
-    std.debug.assert(p.len <= max_degree);
     @memcpy(rem[0..p.len], p);
 
     @memset(quotient, Fr.zero);
@@ -151,7 +160,7 @@ test "divByVanishing: (x^2-1) = (x-1)(x+1), exact for n=1 domain Z=x-1" {
     // p = -1 + 0x + 1x^2
     const p = [_]Fr{ Fr.one.neg(), Fr.zero, Fr.one };
     var q: [2]Fr = undefined;
-    const exact = divByVanishing(&q, &p, 1);
+    const exact = try divByVanishing(&q, &p, 1);
     try std.testing.expect(exact);
     // quotient should be (1 + x)
     try std.testing.expect(q[0].eql(Fr.one));
@@ -162,7 +171,7 @@ test "divByVanishing: non-multiple of Z reports inexact" {
     // p(x) = x^2 (not divisible by x^2 - 1 exactly: x^2 = 1·(x^2-1) + 1)
     const p = [_]Fr{ Fr.zero, Fr.zero, Fr.one };
     var q: [1]Fr = undefined;
-    const exact = divByVanishing(&q, &p, 2);
+    const exact = try divByVanishing(&q, &p, 2);
     try std.testing.expect(!exact); // remainder is 1
     try std.testing.expect(q[0].eql(Fr.one)); // quotient is 1
 }

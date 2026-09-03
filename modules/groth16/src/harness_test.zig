@@ -9,9 +9,10 @@
 //!      "prover" is REJECTED by `bn254.groth16Verify` (`prover.zig`). This
 //!      file adds the end-to-end wiring shape and the cross-stack consistency
 //!      check.
-//!   2. **Gated (Opus core):** `prove(setup(…)) → bn254.groth16Verify ==
-//!      true`, plus tamper cases → `false`. SKIP until
-//!      `gate.prover_core_implemented`.
+//!   2. **The core, implemented:** `prove(setup(…)) → bn254.groth16Verify ==
+//!      true`, plus tamper cases → `false`. (This used to read "SKIP until
+//!      `gate.prover_core_implemented`"; that flag has been `true` since the
+//!      core landed, and nothing here skips.)
 
 const std = @import("std");
 const bn254 = @import("bn254");
@@ -67,8 +68,8 @@ test "cross-stack consistency: QAP divisibility == R1CS satisfaction (the ungate
     const sys = r1cs.example.system(&cons);
     const good = r1cs.example.goodWitness();
     const bad = r1cs.example.badWitness();
-    try std.testing.expectEqual(sys.isSatisfied(&good), qap.checkDivisible(2, sys, &good));
-    try std.testing.expectEqual(sys.isSatisfied(&bad), qap.checkDivisible(2, sys, &bad));
+    try std.testing.expectEqual(sys.isSatisfied(&good), try qap.checkDivisible(2, sys, &good));
+    try std.testing.expectEqual(sys.isSatisfied(&bad), try qap.checkDivisible(2, sys, &bad));
 }
 
 // ── the non-trivial end-to-end circuit ──────────────────────────────────────
@@ -162,7 +163,7 @@ test "end-to-end anchor: prove -> bn254.groth16Verify ACCEPTS (4 constraints, 3 
     // vk shape: ic.len == num_public + 1.
     try std.testing.expectEqual(nt_num_public + 1, kp.vk.ic.len);
 
-    const proof = prover.prove(nt_domain, kp.pk, sys, nt_num_public, &w, .{
+    const proof = try prover.prove(nt_domain, kp.pk, sys, nt_num_public, &w, .{
         .r = field.frFromU64(123),
         .s = field.frFromU64(456),
     });
@@ -182,7 +183,7 @@ test "end-to-end tamper: flipped proof coordinate / wrong public input -> REJECT
     const kp = try prover.setup(nt_domain, alloc, sys, nt_num_public, ntToxicWaste());
     defer prover.freeKeyPair(alloc, kp);
 
-    const proof = prover.prove(nt_domain, kp.pk, sys, nt_num_public, &w, .{
+    const proof = try prover.prove(nt_domain, kp.pk, sys, nt_num_public, &w, .{
         .r = field.frFromU64(123),
         .s = field.frFromU64(456),
     });
@@ -226,10 +227,59 @@ test "end-to-end: a NON-satisfying witness produces a proof that is REJECTED" {
     w[6] = field.frFromU64(13);
     try std.testing.expect(!sys.isSatisfied(&w));
 
-    const proof = prover.prove(nt_domain, kp.pk, sys, nt_num_public, &w, .{
+    const proof = try prover.prove(nt_domain, kp.pk, sys, nt_num_public, &w, .{
         .r = field.frFromU64(123),
         .s = field.frFromU64(456),
     });
     const public = ntWitness()[1 .. nt_num_public + 1]; // honest public inputs
     try std.testing.expect(!(try bn254.groth16Verify(kp.vk, proof, public)));
+}
+
+test "TEETH: setup and prove REFUSE a circuit larger than the domain" {
+    // The refusal lives in three places because the truncation did: `setup`
+    // builds the CRS from the constraint walk, `prove` takes the `System`
+    // separately from the `ProvingKey` (so a caller can hand it a circuit that
+    // grew since the key was made), and `qap.checkDivisible` is the self-oracle
+    // that is supposed to agree with `r1cs.isSatisfied`. Only the last had a
+    // test after the fix; this is the other two.
+    const gpa = std.testing.allocator;
+    const T = r1cs.Term;
+    const sq = [_]T{.{ .index = 2, .coeff = Fr.one }};
+    const out = [_]T{.{ .index = 1, .coeff = Fr.one }};
+    const other = [_]T{.{ .index = 3, .coeff = Fr.one }};
+    const cons = [_]r1cs.Constraint{
+        .{ .a = &sq, .b = &sq, .c = &out },
+        .{ .a = &sq, .b = &sq, .c = &out },
+        .{ .a = &other, .b = &other, .c = &out },
+    };
+    const sys = r1cs.System{ .num_vars = 4, .constraints = &cons };
+    const tw = prover.ToxicWaste{
+        .tau = field.frFromU64(11),
+        .alpha = field.frFromU64(12),
+        .beta = field.frFromU64(13),
+        .gamma = field.frFromU64(14),
+        .delta = field.frFromU64(15),
+    };
+
+    // Three constraints, domain 2.
+    try std.testing.expectError(error.DomainTooSmall, prover.setup(2, gpa, sys, 1, tw));
+
+    // Control: the same circuit at a domain that fits sets up, and the key it
+    // produces is then used to show `prove`'s own refusal is not just `setup`'s
+    // repeated — `prove` is handed a domain smaller than the key's.
+    const kp = try prover.setup(4, gpa, sys, 1, tw);
+    defer prover.freeKeyPair(gpa, kp);
+
+    const w = [_]Fr{ Fr.one, field.frFromU64(25), field.frFromU64(5), field.frFromU64(5) };
+    const rand = prover.Randomizers{ .r = field.frFromU64(3), .s = field.frFromU64(4) };
+    // At the key's own domain it proves, and the proof verifies — so the
+    // refusal below cannot be a broken fixture.
+    const proof = try prover.prove(4, kp.pk, sys, 1, &w, rand);
+    try std.testing.expect(try bn254.groth16Verify(kp.vk, proof, w[1..2]));
+
+    // ⚠ `prove`'s OWN refusal, which `setup`'s does not cover: `prove` takes
+    // the `System` separately from the `ProvingKey`, so a caller can hand it a
+    // domain smaller than the circuit even when the key was made correctly.
+    // Without this arm, deleting `prove`'s check left the whole suite green.
+    try std.testing.expectError(error.DomainTooSmall, prover.prove(2, kp.pk, sys, 1, &w, rand));
 }

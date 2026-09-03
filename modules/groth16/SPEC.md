@@ -151,6 +151,37 @@ has no opinion on whether a proof corresponds to its circuit's intended
 semantics. That is a legitimate end state (no external vector exists for a
 custom circuit's intermediate polynomials), not remaining anchor debt.
 
+## 5b. Threat model
+
+⚠ **This section did not exist until 2026-09-03**, though the document's first
+line has promised a threat model since the file was written. Two things a
+Groth16 consumer has to be told, and neither was anywhere in SPEC or README.
+
+**1. Proofs are MALLEABLE. Never use proof bytes as a nullifier or replay key.**
+Given a valid `(πA, πB, πC)` and any nonzero scalar `k`, the pair
+`([k]πA, [k⁻¹]πB, πC)` verifies for the same statement. Measured on this
+module's own fixture with `k = 1234567`: the original verifies, the mauled proof
+differs byte-wise, and the mauled proof also verifies. This is a property of
+Groth16 itself, not a defect here — which is exactly why it belongs in a threat
+model rather than a bug list. A system that de-duplicates submissions by hashing
+the proof, or that treats "this proof was already spent" as a security check,
+is broken by construction.
+
+**2. `verify` does NOT validate the verifying key.** `groth16.verify` is a
+re-export of `bn254.groth16Verify`, which validates the untrusted PROOF — an
+`isOnCurve` check on `A` and `C`, and a real subgroup check (`[r]P == O`) on the
+G2 point `B`, so the classic Groth16 G2-subgroup bug is not present. The
+verifying key is trusted verbatim. `bn254` states that boundary; this module's
+re-export repeated none of it. A `vk` an attacker supplies is a `vk` an attacker
+can forge proofs against.
+
+**3. The evaluation domain is part of the statement.** `setup`, `prove` and
+`qap.checkDivisible` all refuse a constraint system larger than the domain
+(`error.DomainTooSmall`). Until 2026-09-03 that was a `std.debug.assert`, and in
+ReleaseFast the circuit was silently TRUNCATED to fit — the CRS then being built
+from the truncated circuit, so the dropped constraints were absent from the
+statement the verifier checks, with nothing at any layer reporting it.
+
 ## 6. Verification harness — teeth today
 
 Runs today, no gated code (see `fft.zig`/`msm.zig`/`qap.zig`/`prover.zig`
@@ -211,7 +242,16 @@ field elements THIS module just computed — a proof/verifying-key/public-
 input it produced internally — into decimal-ASCII text for a snarkjs-
 compatible JSON export. There is no decode step anywhere in this module:
 nothing here ever parses a proof, key, or witness that arrived from a
-peer. Overturn this exemption the moment `groth16` grows a `.zkey`/
+peer.
+
+⚠ **That argument is about the in-repo call graph, and the published contract
+was wider than the call graph.** `decimalBytes` is `pub`, its doc said it took
+"a big-endian byte array (any length)", and its two bounds were
+`std.debug.assert` — so a caller taking the contract at its word passed 48 bytes
+and got a SIGSEGV in ReleaseFast (measured). Both bounds are typed refusals now
+(`error.ValueTooLarge` / `error.BufferTooSmall`) and the doc says
+`max_field_bytes`. An exemption argued from "no in-repo caller does that" only
+holds while the published signature agrees. Overturn this exemption the moment `groth16` grows a `.zkey`/
 witness-file ingestion path (§7's deferred increment) — that would be a
 genuine foreign-bytes decode surface.
 

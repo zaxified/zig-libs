@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: MIT
 //! The Groth16 PROVER — `setup` (a test-only toy CRS/trusted setup) and
-//! `prove` (the 3-element proof assembly `πA ∈ G1, πB ∈ G2, πC ∈ G1`). This
-//! is the one part of the module the Phase-1 SCAFFOLD does NOT implement: both
-//! functions are gated behind `gate.prover_core_implemented` and `@panic`
-//! until the core lands. See `gate.zig` for why this is an **Opus** flag (the
-//! sibling `bn254` Groth16 verifier is a complete deterministic anchor), not a
-//! Fable one.
+//! `prove` (the 3-element proof assembly `πA ∈ G1, πB ∈ G2, πC ∈ G1`). Both
+//! are IMPLEMENTED; `gate.prover_core_implemented` is `true` and there is no
+//! `@panic` anywhere in this module. See `gate.zig` for why the core was an
+//! **Opus** flag (the sibling `bn254` Groth16 verifier is a complete
+//! deterministic anchor), not a Fable one.
 //!
-//! What IS real here: `brokenProof`, a deliberately-wrong "prover" output used
-//! as the harness's positive control — `bn254.groth16Verify` REJECTS it,
-//! proving the end-to-end anchor has teeth before `prove` exists.
+//! ⚠ This header said the opposite until 2026-09-03 — that both functions
+//! "`@panic` until the core lands", and that `brokenProof` was what was real
+//! "before `prove` exists". The commit that stopped 25 modules describing
+//! finished work as unimplemented fixed `root.zig`, `gate.zig`, README and
+//! SPEC, and missed this file and `harness_test.zig`.
+//!
+//! `brokenProof` is still here and still useful: a deliberately-wrong prover
+//! output used as the harness's positive control, so `bn254.groth16Verify`
+//! rejecting a proof means something.
 //!
 //! ## Proof/key types
 //!
@@ -112,7 +117,14 @@ pub const KeyPair = struct { pk: ProvingKey, vk: VerifyingKey };
 
 /// Errors `setup` can return: allocation failure, or a degenerate toxic-waste
 /// (`gamma` or `delta` zero, hence non-invertible).
-pub const SetupError = std.mem.Allocator.Error || error{DegenerateToxicWaste};
+pub const SetupError = std.mem.Allocator.Error || error{ DegenerateToxicWaste, DomainTooSmall };
+
+/// Errors `prove` can return.
+///
+/// `DomainTooSmall` is the same refusal `setup` makes, repeated here because
+/// `prove` takes the `System` separately from the `ProvingKey`: a caller can
+/// hand it a circuit that has grown since the key was generated.
+pub const ProveError = error{DomainTooSmall} || poly.DivError;
 
 /// Frees the heap-allocated key slices in a `KeyPair` returned by `setup`.
 pub fn freeKeyPair(allocator: std.mem.Allocator, kp: KeyPair) void {
@@ -191,7 +203,27 @@ pub fn setup(
     tw: ToxicWaste,
 ) SetupError!KeyPair {
     comptime std.debug.assert(gate.prover_core_implemented);
-    std.debug.assert(sys.constraints.len <= n);
+    // ⛔ NOT an assert. `std.debug.assert` is compiled out in ReleaseFast — the
+    // mode README.md and SPEC.md both tell you to run — and past it the whole
+    // pipeline SILENTLY TRUNCATES the circuit to the domain: `columnEvalAtTau`
+    // `break`s at `j >= n`, `prove` and `qap.checkDivisible` only fill
+    // `for (0..n) |j| if (j < sys.constraints.len)`. The CRS is then built from
+    // the truncated circuit, so the dropped constraints are not merely unproven
+    // — they are absent from the statement the verifier checks, and nothing at
+    // any layer reports it.
+    //
+    // Measured on a 3-constraint circuit at `n = 2` whose third constraint the
+    // witness violates: `r1cs.isSatisfied` correctly answers `false`, Debug
+    // panicked here, and ReleaseFast ran on into undefined behaviour (observed
+    // as SIGSEGV inside `checkDivisible` on this host; an earlier run on the
+    // same code reported the QAP oracle answering `true` and
+    // `bn254.groth16Verify` ACCEPTING the proof — which is what undefined means).
+    // `r1cs.zig`'s own module doc says `isSatisfied` here and the divisibility
+    // test there "must always agree"; above the domain size they could not.
+    //
+    // `n` is a plain comptime constant a caller picks once, so the ordinary way
+    // in is a circuit that grew past it.
+    if (sys.constraints.len > n) return error.DomainTooSmall;
     std.debug.assert(num_public + 1 <= sys.num_vars);
 
     // `tw` arrives by value (a local copy already, independent of the
@@ -291,8 +323,10 @@ pub fn prove(
     num_public: usize,
     witness: []const Fr,
     rand: Randomizers,
-) Proof {
+) ProveError!Proof {
     comptime std.debug.assert(gate.prover_core_implemented);
+    // See `setup` for why this is a refusal and not an assert.
+    if (sys.constraints.len > n) return error.DomainTooSmall;
     std.debug.assert(witness.len == sys.num_vars);
     std.debug.assert(pk.domain_size == n);
     std.debug.assert(pk.a_query.len == witness.len);
@@ -335,7 +369,11 @@ pub fn prove(
     defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
     // Exact for a satisfying witness (the boolean is the satisfaction oracle);
     // for a non-satisfying one the quotient is bogus and the proof won't verify.
-    _ = poly.divByVanishing(&h, &p, n);
+    // The quotient's exactness is not checked here — an unsatisfied witness
+    // yields a proof the verifier rejects, which is the design. The error IS
+    // propagated: a polynomial too large for the division scratch is a refusal,
+    // not a stack smash.
+    _ = try poly.divByVanishing(&h, &p, n);
 
     // ── proof assembly (MSM over the proving key) ──────────────────────────
     // πA = α·G1 + Σ wᵢ·uᵢ(τ)·G1 + r·δ·G1
@@ -431,7 +469,7 @@ test "setup+prove+verify smoke: knowledge of a square root (1 public input)" {
     const kp = try setup(2, alloc, sys, 1, tw);
     defer freeKeyPair(alloc, kp);
 
-    const proof = prove(2, kp.pk, sys, 1, &witness, .{
+    const proof = try prove(2, kp.pk, sys, 1, &witness, .{
         .r = field.frFromU64(3),
         .s = field.frFromU64(4),
     });

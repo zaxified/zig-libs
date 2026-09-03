@@ -15,13 +15,14 @@
 //! stops compiling. The module's own tests cannot notice either, because they
 //! live inside it.
 //!
-//! **What a consumer of this module alone cannot do: check its own output.**
-//! The verifier is `bn254.groth16Verify`, in the sibling module — so the one
-//! property that defines a correct proof is not reachable from
-//! `@import("groth16")`, even though `Proof` and `VerifyingKey` here ARE
-//! re-exports of that verifier's own types. This program therefore ends by
-//! serialising the proof for someone else to check; a service that wants to
-//! self-check before responding has to depend on `bn254` as well.
+//! ⚠ **This file used to say a consumer "cannot check its own output"** —
+//! that the verifier lived only in the sibling `bn254` and was unreachable from
+//! `@import("groth16")`. The very next commit added `groth16.verify` (a
+//! re-export of `bn254.groth16Verify`, whose own doc says "Found by writing
+//! `example/main.zig`"), and this file was never updated. It is reachable, and
+//! this program now uses it: the proof is verified here before being
+//! serialised, which is what a service wanting to self-check before responding
+//! would do.
 
 const std = @import("std");
 const groth16 = @import("groth16");
@@ -108,6 +109,11 @@ pub fn main() !void {
     } else |err| switch (err) {
         error.OutOfMemory => return err,
         error.DegenerateToxicWaste => std.debug.print("zero delta rejected by setup\n", .{}),
+        // A circuit with more constraints than the evaluation domain. Not
+        // reachable here (one constraint, domain 2) but nameable from outside,
+        // which is the point of this file: the arm exists because `setup`
+        // REFUSES that case rather than silently truncating the circuit.
+        error.DomainTooSmall => return err,
     }
 
     const keys = try groth16.setup(domain_size, gpa, sys, num_public, toxic);
@@ -127,10 +133,21 @@ pub fn main() !void {
     // `r` and `s` are the zero-knowledge randomizers: fresh per proof in a
     // deployment (two proofs of the same statement must not be equal), fixed
     // here so this program is reproducible.
-    const proof = groth16.prove(domain_size, keys.pk, sys, num_public, &witness, .{
+    const proof = try groth16.prove(domain_size, keys.pk, sys, num_public, &witness, .{
         .r = groth16.field.frFromU64(23),
         .s = groth16.field.frFromU64(29),
     });
+
+    // ── self-check before shipping ───────────────────────────────────────
+    // `groth16.verify` is a re-export of `bn254.groth16Verify`, so a consumer
+    // of this module alone CAN check its own output — which is what makes the
+    // header's old claim wrong. A proving service should do this: an inexact
+    // QAP quotient (a witness that does not satisfy the circuit) produces a
+    // well-formed proof that simply fails, and this is where that is caught.
+    if (!try groth16.verify(keys.vk, proof, witness[1 .. num_public + 1])) {
+        return error.OwnProofDoesNotVerify;
+    }
+    std.debug.print("proof verifies against our own verifying key\n", .{});
 
     // ── ship it ──────────────────────────────────────────────────────────
     // snarkjs' own three files. The verifying key goes out once, at deploy
@@ -148,6 +165,31 @@ pub fn main() !void {
 
     // The private wires never appear in any of the three: `public.json`
     // holds `n` alone, and the proof is three group elements.
-    if (std.mem.indexOf(u8, public_json, "13") != null) return error.PrivateWireLeaked;
+    //
+    // ⚠ This used to be `indexOf(public_json, "13") != null`, which cannot fail:
+    // `public.json` is `["91"]` and can never contain "13". Worse, it would
+    // have fired FALSELY on a public input of 130 or 913 — a substring search
+    // over a decimal rendering is the wrong shape for this question entirely.
+    // Asserted structurally now: the published inputs are EXACTLY the public
+    // prefix of the witness, so no private wire can be among them whatever the
+    // digits look like.
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(gpa);
+    try expected.appendSlice(gpa, "[\"91\"]");
+    if (!std.mem.eql(u8, public_json, expected.items)) {
+        std.debug.print("public.json is {s}, expected {s}\n", .{ public_json, expected.items });
+        return error.PublicInputsUnexpected;
+    }
+    // And the private factors, rendered the way this encoder renders them, are
+    // absent from all three files — checked as whole JSON string values, not as
+    // substrings.
+    for ([_][]const u8{ "\"7\"", "\"13\"" }) |secret| {
+        for ([_][]const u8{ public_json, proof_json, vk_json }) |doc| {
+            if (std.mem.indexOf(u8, doc, secret) != null) {
+                std.debug.print("a private wire {s} appears in a published file\n", .{secret});
+                return error.PrivateWireLeaked;
+            }
+        }
+    }
     std.debug.print("private factors absent from the published inputs\n", .{});
 }
