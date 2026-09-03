@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — **Every rename is now durable, not just the streaming `put`
+  path's temp.** Measured on the module's own test suite with `strace`, both
+  arms in one session: **85 renames / 35 fsyncs before, 85 / 205 after** — the
+  same 85 renames either way, so it is the same work with durability added.
+  Three of the four rename sites (`casRefWrite`, `putNamed`, the raw `commit`)
+  wrote their temp with `writeFile` and renamed it with no `fsync` at all, and
+  **no directory was ever synced**, so a `put` that RETURNED could be missing
+  after a power loss or point at blocks that were never written. `rename(2)`'s
+  atomicity is about what a concurrent reader observes, not about persistence.
+  The `casRefWrite` case is the sharpest: that is the refcount sidecar whose
+  disagreement produced this module's CRITICAL data-loss finding on 2026-09-01,
+  and its update was the least durable write in the module.
+  Found while auditing the sibling `filestore`, which called itself a "durable"
+  store and fsynced nothing at all; both now do the same two syncs, through one
+  helper (`renameDurable`) rather than four copies. ⚠ The directory handle must
+  be re-opened with `.iterate = true` — std's default is `O_PATH`, which cannot
+  be fsynced — and the directory is derived from the destination path rather
+  than rebuilt from `ns`/`hex`, because the raw layer creates its directory
+  lazily and a re-derived path can name one that is not there yet (caught by
+  the suite).
 - **2026-09-01** — **Security audit: two live references could become one, and
   five public functions wrote outside the store.**
 

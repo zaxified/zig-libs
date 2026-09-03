@@ -20,7 +20,11 @@
 //!
 //! **Crash safety.** Every write goes to a hidden `.part` temp and is made
 //! visible by a single `rename(2)` — atomic on POSIX. A crash mid-write leaves
-//! only a temp (swept as garbage); a live blob is never torn or partial.
+//! only a temp (swept as garbage); a live blob is never torn or partial. The
+//! temp is `fsync`ed before the rename and the containing directory after it
+//! (`renameDurable`), so a `put`/`commit` that RETURNED is on stable media —
+//! neither sync is implied by `rename(2)`, whose atomicity is about what a
+//! concurrent reader observes, not about persistence.
 //!
 //! **Path safety.** `ns` and `key` are single path segments validated by
 //! `segmentSafe` ([A-Za-z0-9._-], no leading dot, no `.`/`..`), so a request
@@ -377,7 +381,42 @@ pub const Store = struct {
         const cwd = std.Io.Dir.cwd();
         try cwd.writeFile(self.io, .{ .sub_path = tmp_path, .data = s });
         errdefer cwd.deleteFile(self.io, tmp_path) catch {};
-        try cwd.rename(tmp_path, cwd, path, self.io);
+        try self.renameDurable(tmp_path, path);
+    }
+
+    /// `rename(tmp -> path)`, made durable: the temp is `fsync`ed before it
+    /// becomes visible and the containing directory `fsync`ed after, so a
+    /// `put`/`commit` that RETURNED survives a power loss.
+    ///
+    /// Neither sync is implied by `rename(2)`, whose atomicity is about what a
+    /// concurrent READER can observe, not about persistence. Without the
+    /// first, the new directory entry can point at blocks that were never
+    /// written; without the second, the entry itself can be lost. This module
+    /// fsynced only the streaming `put` path's temp (see `casCommit`'s caller)
+    /// and never a directory -- the gap was found while auditing the sibling
+    /// `filestore`, which called itself "durable" and fsynced nothing at all;
+    /// both now do the same two syncs, and for the same reason.
+    ///
+    /// The directory must be re-opened with `.iterate = true`: std's default
+    /// handle for a plain directory is `O_PATH`, which cannot be fsynced at
+    /// all. Same workaround as `kv`'s `FsStorage.vSyncDir`.
+    fn renameDurable(self: Store, tmp: []const u8, path: []const u8) !void {
+        // The directory is derived from `path` itself rather than passed in:
+        // it must be the one the rename lands in, and a caller re-deriving it
+        // from `ns`/`hex` can disagree (the raw layer's directory is created
+        // lazily, so a hand-built path can name a directory that is not there).
+        const dir = std.fs.path.dirname(path) orelse ".";
+        const cwd = std.Io.Dir.cwd();
+        {
+            const f = try cwd.openFile(self.io, tmp, .{});
+            defer f.close(self.io);
+            try f.sync(self.io);
+        }
+        try cwd.rename(tmp, cwd, path, self.io);
+        var d = try cwd.openDir(self.io, dir, .{ .iterate = true });
+        defer d.close(self.io);
+        const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
+        try as_file.sync(self.io);
     }
 
     /// True if the content blob already exists (the dedup-hit check).
@@ -448,8 +487,7 @@ pub const Store = struct {
         try self.ensureCasDir(hex);
         var pbuf: [768]u8 = undefined;
         const path = try self.casPath(&pbuf, hex);
-        const cwd = std.Io.Dir.cwd();
-        try cwd.rename(tmp, cwd, path, self.io);
+        try self.renameDurable(tmp, path);
         // `0` is right HERE and only here: the blob did not exist a moment
         // ago, so there is no prior referrer to preserve. Contrast the dedup
         // branch above.
@@ -599,8 +637,7 @@ pub const Store = struct {
     pub fn commit(self: Store, ns: []const u8, key: []const u8, tmp: []const u8) !void {
         var buf: [768]u8 = undefined;
         const path = try self.blobPath(&buf, ns, key);
-        const cwd = std.Io.Dir.cwd();
-        try cwd.rename(tmp, cwd, path, self.io);
+        try self.renameDurable(tmp, path);
     }
 
     /// Best-effort removal of a temp file (on a failed upload).
@@ -671,7 +708,7 @@ pub const Store = struct {
         const cwd = std.Io.Dir.cwd();
         try cwd.writeFile(self.io, .{ .sub_path = tmp, .data = bytes });
         errdefer cwd.deleteFile(self.io, tmp) catch {};
-        try cwd.rename(tmp, cwd, path, self.io);
+        try self.renameDurable(tmp, path);
     }
 
     /// Read a named record (allocated in `arena`), or null if absent.
