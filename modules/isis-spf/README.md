@@ -23,9 +23,20 @@ This module owns **topology extraction, the two-way check, the system-id ↔
 NodeId interning, and next-hop/metric resolution**. It does **not** own the
 shortest-path algorithm: `spf-ect` owns Dijkstra *and* the symmetric,
 reversal-invariant ECT tie-break, so equal-cost path selection is loop-free and
-`path(A→B) == reverse(path(B→A))` by construction. This module builds the graph,
-calls `shortestPathTree`, and reads the resolved tree — it never picks among
-equal-cost paths itself.
+`path(A→B) == reverse(path(B→A))` **on a symmetric-metric fabric** (which
+802.1aq requires). This module builds the graph, calls `shortestPathTree`, and
+reads the resolved tree — it never picks among equal-cost paths itself.
+
+⚠ **That qualifier is load-bearing and this sentence used to omit it.** Since the
+engine became directed (one arc per admitted direction, at its own advertised
+metric) reversal invariance holds only when the metrics are symmetric, and
+`Options.reject_asymmetric` **defaults to `false`** — `compute` hard-codes it to
+`false`. The module's own frozen FRR anchor test asserts the counter-example in
+the green suite: from r1, r3 costs 15 via r5; from r3, r1 costs 30 via r4, so
+`reverse(path(r3→r1))` is not `path(r1→r3)`. **An 802.1aq/SPB caller must pass
+`.reject_asymmetric = true`** — congruent forward and reverse paths are what SPB's
+reverse-path check assumes, and nothing here refuses an asymmetric database
+unless asked.
 
 ## The pipeline
 
@@ -85,8 +96,15 @@ if (table.nextHop(dest)) |nh| { /* forward toward `nh` */ }
 if (table.lookup(dest)) |r| { /* r.next_hop, r.metric */ }
 ```
 
-`computeWith(gpa, db, local, now, .{ .require_two_way = false })` disables the
-two-way check — used only by the permanent positive control.
+The two-way check has **no public off switch**, deliberately. `Options` carries
+no `require_two_way` field — an earlier audit removed it precisely so no
+production caller can disable the ISO §7.2.8.2 guard by accident, and `root.zig`
+carries a permanent test asserting the field's absence. ⚠ This paragraph used to
+show `computeWith(gpa, db, local, now, .{ .require_two_way = false })` as the way
+to turn it off: a call that has not compiled since the field was removed, in the
+one document a caller reads first, advertising exactly the API shape that finding
+was raised to eliminate. The positive control uses a private test-only entry
+point instead.
 
 ## Test
 

@@ -18,6 +18,22 @@
 //!   so there is **no per-flow ECMP hashing** at the data plane. (The 16 ECT
 //!   algorithms spread paths across I-SIDs/B-VIDs, not within a flow.)
 //!
+//!   ⚠ **"Congruent" is a precondition on the CALLER, not something this module
+//!   or `isis-spf` enforces by default.** `isis-spf` became a directed engine on
+//!   2026-08-07 — one arc per admitted direction, at its own advertised metric —
+//!   so forward and reverse paths are congruent only on a symmetric-metric
+//!   fabric, which is what 802.1aq requires and what nothing checks unless asked:
+//!   `isis_spf.Options.reject_asymmetric` defaults to `false`, and the plain
+//!   `isis_spf.compute` hard-codes it to `false`. This module consumes a finished
+//!   `RouteTable` and never calls `compute`, so it cannot set that itself.
+//!
+//!   **A caller building an SPB FIB must obtain its `RouteTable` from
+//!   `isis_spf.computeWith(..., .{ .reject_asymmetric = true })`.** Fed an
+//!   asymmetric database instead, the forward and reverse B-MAC paths need not
+//!   be congruent, which is precisely what SPB's reverse-path forwarding check
+//!   assumes. Noted here 2026-09-03: this module's code did not change — the
+//!   guarantee underneath it did.
+//!
 //!   **Part B — the SPBM group multicast-DA.** A BUM frame for an I-SID uses a
 //!   group destination B-MAC derived from the source node's 20-bit **SPSourceID**
 //!   and the 24-bit **I-SID** — the very DA whose per-source distribution tree

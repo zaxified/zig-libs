@@ -201,6 +201,6 @@ across runs (a permanent test pins this).
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** 5-router topology run once through real isisd 10.3 in-VM, matches vertex-by-vertex modulo documented undirected-engine gap; rest stays SELF
+**What the tests actually contain.** 5-router topology run once through real isisd 10.3 in-VM, matching vertex-by-vertex on all five rows with NO remaining gap (the "modulo documented undirected-engine gap" this line used to carry was superseded by the directed rewrite and is corrected 2026-09-03); rest stays SELF
 
 **How it got there.** The anchoring work landed. DONE 2026-08-02: captured via scripts/vm/ (5 netns + veth p2p adjacencies, real IPv4 addressing was load-bearing for the P2P 3-way handshake). GPLv2 §0 restricts the program, not its output, so a routing table it computes for our topology is not a work based on FRR - licence clean, cited in the frozen test's own comment. Mutation teeth check (reverse-edge metric) confirmed the freeze catches a regression; reverted, md5sum-verified.

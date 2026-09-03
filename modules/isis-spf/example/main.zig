@@ -70,6 +70,24 @@ fn insertReach(
     _ = try db.insert(lb.finish(), null, 0);
 }
 
+/// The example's assertions, in EVERY optimize mode.
+///
+/// ⚠ These were `std.debug.assert`, which is compiled OUT in ReleaseFast — and
+/// `scripts/test.sh` does not merely build examples, it RUNS them in the lane's
+/// own optimize mode, one of which is ReleaseFast. Measured 2026-09-03 with the
+/// ISO §7.2.8.2 two-way check disabled in a scratch copy of the module (so the
+/// dangling neighbour E becomes reachable and `routes.len` is 5, not 4): the
+/// Debug run panicked as it should, and the ReleaseFast run printed
+/// "E unreachable" and exited 0. A green stamp on any behaviour whatsoever,
+/// with affirmatively misleading output in the lane log.
+///
+/// The whole point of the example gate is that the first outside caller finds
+/// what the suite cannot; an assertion that evaporates in the shipped mode finds
+/// nothing.
+fn must(ok: bool, comptime what: []const u8) void {
+    if (!ok) std.debug.panic("example check failed: {s}", .{what});
+}
+
 pub fn main() !void {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -90,11 +108,11 @@ pub fn main() !void {
         var table = try isis_spf.compute(gpa, &db, a, 0);
         defer table.deinit();
 
-        std.debug.assert(table.routes.len == 4); // A, B, C, D — never E
-        std.debug.assert(std.meta.eql(table.lookup(a).?, .{ .dest = a, .next_hop = a, .metric = 0 }));
-        std.debug.assert(std.meta.eql(table.lookup(b).?, .{ .dest = b, .next_hop = b, .metric = 10 }));
-        std.debug.assert(std.meta.eql(table.lookup(c).?, .{ .dest = c, .next_hop = c, .metric = 10 }));
-        std.debug.assert(table.lookup(e) == null); // dangling neighbour: never reachable
+        must(table.routes.len == 4, "table.routes.len == 4"); // A, B, C, D — never E
+        must(std.meta.eql(table.lookup(a).?, .{ .dest = a, .next_hop = a, .metric = 0 }), "std.meta.eql(table.lookup(a).?, .{ .dest = a, .next_hop = a, .metric = 0 })");
+        must(std.meta.eql(table.lookup(b).?, .{ .dest = b, .next_hop = b, .metric = 10 }), "std.meta.eql(table.lookup(b).?, .{ .dest = b, .next_hop = b, .metric = 10 })");
+        must(std.meta.eql(table.lookup(c).?, .{ .dest = c, .next_hop = c, .metric = 10 }), "std.meta.eql(table.lookup(c).?, .{ .dest = c, .next_hop = c, .metric = 10 })");
+        must(table.lookup(e) == null, "table.lookup(e) == null"); // dangling neighbour: never reachable
 
         // D is a genuine tie: cost is exact (20), the winning next hop is
         // NOT — either B or C is a legitimate answer. Assert what a tie
@@ -103,12 +121,12 @@ pub fn main() !void {
         // ECT tie-break is deterministic (recomputing gives the SAME winner,
         // not a coin flip per call).
         const d_route = table.lookup(d).?;
-        std.debug.assert(d_route.metric == 20);
-        std.debug.assert(std.mem.eql(u8, &d_route.next_hop, &b) or std.mem.eql(u8, &d_route.next_hop, &c));
+        must(d_route.metric == 20, "d_route.metric == 20");
+        must(std.mem.eql(u8, &d_route.next_hop, &b) or std.mem.eql(u8, &d_route.next_hop, &c), "std.mem.eql(u8, &d_route.next_hop, &b) or std.mem.eql(u8, &d_route.next_hop, &c)");
 
         var table2 = try isis_spf.compute(gpa, &db, a, 0);
         defer table2.deinit();
-        std.debug.assert(std.mem.eql(u8, &d_route.next_hop, &table2.lookup(d).?.next_hop)); // stable
+        must(std.mem.eql(u8, &d_route.next_hop, &table2.lookup(d).?.next_hop), "std.mem.eql(u8, &d_route.next_hop, &table2.lookup(d).?.next_hop)"); // stable
         std.debug.print("run 1 (tied diamond): A=0 B=10 C=10 D=20 (tie, stable), E unreachable\n", .{});
     }
 
@@ -136,13 +154,13 @@ pub fn main() !void {
         // B: no longer worth reaching directly (100) now that A-C-D-B (30)
         // is cheaper — the indirect path wins and B's next hop becomes C.
         const b_route = table.lookup(b).?;
-        std.debug.assert(b_route.metric == 30);
-        std.debug.assert(std.mem.eql(u8, &b_route.next_hop, &c));
+        must(b_route.metric == 30, "b_route.metric == 30");
+        must(std.mem.eql(u8, &b_route.next_hop, &c), "std.mem.eql(u8, &b_route.next_hop, &c)");
         // D: the tie is GONE — A-C-D (20) beats A-B-D (110) outright, so the
         // next hop is C alone, deterministically, not a stable-pick-of-two.
         const d_route = table.lookup(d).?;
-        std.debug.assert(d_route.metric == 20);
-        std.debug.assert(std.mem.eql(u8, &d_route.next_hop, &c));
+        must(d_route.metric == 20, "d_route.metric == 20");
+        must(std.mem.eql(u8, &d_route.next_hop, &c), "std.mem.eql(u8, &d_route.next_hop, &c)");
         std.debug.print("after A-B: 10->100: D routes via C only (tie gone); B itself rerouted to cost 30 via C-D-B\n", .{});
     }
 
@@ -166,8 +184,8 @@ pub fn main() !void {
         {
             var table = try isis_spf.compute(gpa, &xy_db, x, 0);
             defer table.deinit();
-            std.debug.assert(table.lookup(y).?.metric == 10); // X->Y uses X's own advertised metric
-            std.debug.assert(table.asymmetric_links == 1);
+            must(table.lookup(y).?.metric == 10, "table.lookup(y).?.metric == 10"); // X->Y uses X's own advertised metric
+            must(table.asymmetric_links == 1, "table.asymmetric_links == 1");
         }
         // Opt-in rejection: this is the failure path that allocates (the
         // topology-extraction pass already built the `directed` map before

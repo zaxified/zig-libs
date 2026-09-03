@@ -76,20 +76,39 @@ pub const Route = struct {
     metric: u64,
 };
 
-/// RFC 5305 §3: "A value of 'MaxLinkMetric' ... MUST NOT be advertised... A
-/// link with this metric MUST not be considered during the normal SPF
-/// computation." The mechanism a TE-only / MPLS-TE / LFA-staging link uses to
-/// stay advertised (so its existence is still visible to traffic engineering)
-/// while being excluded from ordinary shortest-path routing.
+/// RFC 5305 §3: "If a link is advertised with the maximum link metric
+/// (2^24 - 1), this link MUST NOT be considered during the normal SPF
+/// computation. This will allow advertisement of a link for purposes other than
+/// building the normal Shortest Path Tree." The mechanism a TE-only / MPLS-TE /
+/// LFA-staging link uses to stay advertised (so its existence is still visible
+/// to traffic engineering) while being excluded from ordinary shortest-path
+/// routing.
 ///
-/// RFC 5305 §3 also defines `MaxPathMetric` (0xFE000000), a ceiling on the
-/// SUMMED cost along a path, which this module does NOT enforce: at u24-per-
-/// hop metrics (max 0xFFFFFE once the value above is excluded), reaching that
-/// ceiling needs on the order of 254 concatenated near-max-metric hops — not
-/// a fixture that can be driven RED at a defensible size, and no path this
-/// module's own callers construct can plausibly reach it. Left as a known,
-/// intentionally deferred gap rather than shipped unproven (internal audit
-/// W2 `isis-spf` F2).
+/// ⚠ This comment used to quote the RFC as "A value of 'MaxLinkMetric' ... MUST
+/// NOT be advertised", which the RFC does not say — it never uses the token
+/// `MaxLinkMetric` at all — and which **inverts** the rule: the whole point is
+/// that the link STAYS advertised, as the sentence right above already said.
+/// `scripts/check-citations.py` had been reporting the MISMATCH. Corrected
+/// 2026-09-03.
+///
+/// RFC 5305 §3 also defines `MAX_PATH_METRIC` (0xFE000000), a ceiling on the
+/// SUMMED cost along a path, which this module does NOT enforce.
+///
+/// ⚠ The reason recorded here for that deferral was false in both halves and is
+/// restated. It claimed such a path is "not a fixture that can be driven RED at
+/// a defensible size" — a 300-router line reaches 5,016,386,986, past the
+/// ceiling by 754,974,122, in 22 ms (measured; the fixture is below). And the RFC's
+/// own rationale for the ceiling is that "MAX_PATH_METRIC plus a single link
+/// metric does not overflow ... 32 bits"; `Route.metric` here is a `u64`, so
+/// that rationale does not bite and nothing overflows.
+///
+/// What is actually left is a CONFORMANCE difference, not a safety one: above
+/// the ceiling an RFC-conformant peer treats all path costs as equal, while
+/// this module keeps ordering them by their true sums — so an equal-cost
+/// tie-break could be resolved differently at metrics above 2^32. Closing it
+/// properly means clamping during relaxation, which lives in the sibling
+/// `spf-ect`, not here; clamping only the REPORTED metric would hide the
+/// divergence rather than remove it, which is worse than leaving it stated.
 pub const max_link_metric: u32 = 0xFFFFFF;
 
 /// Tuning for `computeWith`. The defaults are the correct/safe behaviour.
@@ -274,6 +293,26 @@ fn computeInternal(
     while (view_it.next()) |ev| {
         // Request placeholders carry no bytes; skip them.
         if (ev.is_request or ev.bytes.len == 0) continue;
+        // ISO/IEC 10589 §7.3.17: an LSP whose Remaining Lifetime has reached
+        // zero is excluded from the Decision Process. `ev.remaining_lifetime`
+        // is already aged to `now` by `isis-lsdb`, which is the whole reason
+        // `now` is threaded down here — and until 2026-09-03 nothing read it.
+        //
+        // ⚠ The `bytes.len == 0` test above is NOT this check. `isis-lsdb`
+        // drops an expired LSP's bytes inside `Lsdb.tick`, which is
+        // caller-driven and wholly independent of `compute`: between two ticks,
+        // or in any caller whose `now` runs ahead of its last tick, the entry is
+        // still fully present. Measured on a two-router database inserted with
+        // a lifetime of 5 and computed at `now = 1000`: the LSDB reported
+        // `remaining_lifetime = 0` for both, with 40 bytes each, and SPF
+        // returned 2 routes over them.
+        //
+        // That matters because Remaining Lifetime is the ONLY mechanism IS-IS
+        // has for retiring an LSP whose originator can no longer speak — a purge
+        // needs the originator or a neighbour to send one. Without this line a
+        // one-shot injected LSP does not have to be maintained: it keeps
+        // attracting traffic for as long as its entry sits in the database.
+        if (ev.remaining_lifetime == 0 or ev.is_purge) continue;
         // A stored LSP is well-formed at the header/framing level, but decode
         // defensively anyway — a decode failure just skips this LSP.
         const lsp = isis.Lsp.decode(ev.bytes) catch continue;
@@ -534,6 +573,29 @@ fn insertReachLspRaw(
     });
     for (reach) |r| {
         try isis.tlvs.addExtendedIsReach(&b.tlvs, r.nbr7, r.metric, &.{});
+    }
+    _ = try db.insert(b.finish(), null, 0);
+}
+
+/// Like `insertReachLsp`, but with a caller-chosen Remaining Lifetime, so a
+/// fixture can age an LSP past its own expiry.
+fn insertReachLspLifetime(
+    db: *lsdb.Lsdb,
+    origin: SystemId,
+    seq: u32,
+    lifetime: u16,
+    reach: []const struct { nbr: SystemId, metric: u24 },
+) !void {
+    var buf: [512]u8 = undefined;
+    var b = try isis.pdu.LspBuilder.init(&buf, .{
+        .remaining_lifetime = lifetime,
+        .lsp_id = .{ origin[0], origin[1], origin[2], origin[3], origin[4], origin[5], 0, 0 },
+        .sequence_number = seq,
+        .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
+    });
+    for (reach) |r| {
+        const nbr7: [7]u8 = .{ r.nbr[0], r.nbr[1], r.nbr[2], r.nbr[3], r.nbr[4], r.nbr[5], 0 };
+        try isis.tlvs.addExtendedIsReach(&b.tlvs, nbr7, r.metric, &.{});
     }
     _ = try db.insert(b.finish(), null, 0);
 }
@@ -908,35 +970,40 @@ test "pseudonode neighbour filter (#2 old-style): a LAN must not cheapen a real 
 // neighbour-side finding above but injected from the *origin* end instead of
 // the *neighbour* end of an entry.
 //
-// The fixture above (and bab3b37's) is blind to THIS filter for a subtly
-// different reason than the bare-LAN trap documented there: `computeWith`
-// picks its canonical undirected weight from the advertisement running from
-// the lexicographically-LOWER system-id to the higher one (`lo_hi`, see the
-// comment at its use site). In that fixture the DIS (0x50/0x51) is the
-// numerically-HIGHER id, so the canonical weight is always the untouched
-// member→DIS advertisement; corruption injected into the DIS's own outgoing
-// entry (which is what the pseudonode LSP, parsed as an origin, would add)
-// never gets selected. Reversing which endpoint is numerically lower flips
-// that: here the DIS is deliberately the LOWER id, so its outgoing entry IS
-// the canonical weight, and the pseudonode LSP's fake zero-cost entry to the
-// same neighbour lands directly on top of the real, expensive P2P metric via
-// `addDirected`'s min-merge — this is the origin-side counterpart to the
-// undercutting bab3b37 proved on the neighbour side.
+// ⚠ The fixture below was rewritten on 2026-09-03. Its predecessor justified
+// itself by a mechanism the directed rewrite (`6634cbb7`) DELETED: it argued
+// that `computeWith` "picks its canonical undirected weight from the
+// advertisement running from the lexicographically-LOWER system-id to the
+// higher one (`lo_hi`)", and therefore that making the DIS the lower id put the
+// corrupted advertisement on the canonical side. There is no canonical
+// per-link weight any more — each direction is its own arc at its own metric —
+// so the fake arc the pseudonode LSP injects (`d→x`) simply was not on the
+// root's (x's) path to d, and the assertion held with the filter deleted.
+// Measured: the whole 28-test suite stayed GREEN with `lsp.lsp_id[6] != 0`
+// removed.
+//
+// What discriminates under the directed engine is putting the corrupted arc ON
+// the root's own path: a third router behind the DIS, so that x→z necessarily
+// traverses d→z, which is exactly the advertisement the pseudonode LSP forges.
 test "pseudonode ORIGIN filter: the pseudonode's own LSP must not itself supply a route" {
-    const d = sysId(0x10); // the LAN's DIS — a LOWER system-id than the member below
-    const x = sysId(0x50); // LAN member with a genuine, pricier P2P link to D
+    const x = sysId(0x50); // the root
+    const d = sysId(0x10); // the LAN's DIS
+    const z = sysId(0x60); // a router BEHIND the DIS — this is what makes it bite
 
     const pn_d: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0x01 }; // D's pseudonode id
     const d7: [7]u8 = .{ d[0], d[1], d[2], d[3], d[4], d[5], 0 };
     const x7: [7]u8 = .{ x[0], x[1], x[2], x[3], x[4], x[5], 0 };
+    const z7: [7]u8 = .{ z[0], z[1], z[2], z[3], z[4], z[5], 0 };
 
     var db = lsdb.Lsdb.init(testing.allocator, cfgFor(x));
     defer db.deinit();
 
-    // The pseudonode's own LSP (LSP-ID octet 6 = 0x01): lists X and D (itself)
-    // at cost 0, per ISO 10589. If the origin filter is disabled, this LSP is
-    // walked as if D originated it, injecting a fake D→X advertisement at the
-    // clamped-minimum cost of 1.
+    // The pseudonode's own LSP (LSP-ID octet 6 = 0x01): per ISO 10589 it lists
+    // every attached router at cost 0. With the origin filter disabled this LSP
+    // is walked as though D had originated it, injecting fake D→X and D→Z
+    // advertisements at the clamped-minimum cost of 1 — and D→Z lies on the
+    // root's path to Z, so the min-merge in `addDirected` overwrites the real,
+    // expensive metric.
     {
         var buf: [256]u8 = undefined;
         var lb = try isis.pdu.LspBuilder.init(&buf, .{
@@ -946,29 +1013,34 @@ test "pseudonode ORIGIN filter: the pseudonode's own LSP must not itself supply 
             .flags = .{ .partition_repair = false, .attached = 0, .overload = false, .is_type = 1 },
         });
         try isis.tlvs.addExtendedIsReach(&lb.tlvs, x7, 0, &.{});
-        try isis.tlvs.addExtendedIsReach(&lb.tlvs, d7, 0, &.{}); // self; addDirected ignores it anyway
+        try isis.tlvs.addExtendedIsReach(&lb.tlvs, z7, 0, &.{});
         _ = try db.insert(lb.finish(), null, 0);
     }
 
-    // D's own real LSP: the genuine, expensive P2P adjacency to X.
+    // The genuine, expensive P2P adjacencies: X—D 100 and D—Z 100, both ways.
     try insertReachLspRaw(&db, d, 1, &.{
         .{ .nbr7 = pn_d, .metric = 5 }, // dropped by the neighbour-side filter regardless
         .{ .nbr7 = x7, .metric = 100 },
+        .{ .nbr7 = z7, .metric = 100 },
     });
-    // X: reciprocal P2P to D, plus its own LAN entry to the pseudonode.
     try insertReachLspRaw(&db, x, 1, &.{
         .{ .nbr7 = pn_d, .metric = 5 },
+        .{ .nbr7 = d7, .metric = 100 },
+    });
+    try insertReachLspRaw(&db, z, 1, &.{
         .{ .nbr7 = d7, .metric = 100 },
     });
 
     var table = try compute(testing.allocator, &db, x, 0);
     defer table.deinit();
 
-    // Correct (origin filter present): the pseudonode LSP contributes nothing;
-    // D is reachable only via the real P2P link, at its real cost (100) — NOT
-    // the fake cost (1) the pseudonode LSP would otherwise inject.
-    try testing.expectEqual(@as(usize, 2), table.routes.len);
+    // Correct (origin filter present): the pseudonode LSP contributes nothing,
+    // so Z costs the two real hops. With the filter deleted this reads 101 —
+    // a silently WRONG metric, not a missing route, which is the shape that
+    // makes it worth a test at all.
+    try testing.expectEqual(@as(usize, 3), table.routes.len);
     try testing.expectEqual(Route{ .dest = d, .next_hop = d, .metric = 100 }, table.lookup(d).?);
+    try testing.expectEqual(Route{ .dest = z, .next_hop = d, .metric = 200 }, table.lookup(z).?);
 }
 
 test "robustness: a malformed reachability TLV is skipped; the valid rest still routes" {
@@ -1165,15 +1237,32 @@ test "addDirected: the same ordered pair advertised twice keeps the minimum metr
     var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
     defer db.deinit();
 
-    // A's LSP advertises B twice (e.g. duplicate/fragmented entries): 20 then 5.
-    // The directed a->b advertisement must keep the minimum (5), not the last
-    // or the first value seen.
+    // A's LSP advertises B twice (e.g. duplicate/fragmented entries).
+    //
+    // ⚠ Order matters, and this fixture used to carry only ONE of them: with
+    // `{20, 5}` alone, "keep the minimum" and "keep the LAST" give the same
+    // answer, so a keep-last mutation stayed green across the whole suite while
+    // the comment claimed the test excluded "the last or the first value seen".
+    // It excluded the first. Both orders are now driven, which is what makes
+    // the claim true.
     try insertReachLsp(&db, a, 1, &.{ .{ .nbr = b, .metric = 20 }, .{ .nbr = b, .metric = 5 } });
     try insertReachLsp(&db, b, 1, &.{.{ .nbr = a, .metric = 5 }});
 
     var table = try compute(testing.allocator, &db, a, 0);
     defer table.deinit();
     try testing.expectEqual(@as(u64, 5), table.lookup(b).?.metric);
+
+    // The reverse order: minimum FIRST, so keep-last would report 20.
+    const c = sysId(0xC);
+    const d = sysId(0xD);
+    var db2 = lsdb.Lsdb.init(testing.allocator, cfgFor(c));
+    defer db2.deinit();
+    try insertReachLsp(&db2, c, 1, &.{ .{ .nbr = d, .metric = 5 }, .{ .nbr = d, .metric = 20 } });
+    try insertReachLsp(&db2, d, 1, &.{.{ .nbr = c, .metric = 5 }});
+
+    var table2 = try compute(testing.allocator, &db2, c, 0);
+    defer table2.deinit();
+    try testing.expectEqual(@as(u64, 5), table2.lookup(d).?.metric);
 }
 
 test "two-way check with require_two_way=false: only the hi->lo advertisement exists (hi_lo fallback)" {
@@ -1182,9 +1271,12 @@ test "two-way check with require_two_way=false: only the hi->lo advertisement ex
     var db = lsdb.Lsdb.init(testing.allocator, cfgFor(a));
     defer db.deinit();
 
-    // Only B (the lexicographically-larger id) advertises A; A advertises
-    // nothing. This exercises the `hi_lo` fallback in the undirected-weight
-    // selection (the `lo_hi` advertisement is absent).
+    // Only B advertises A; A advertises nothing, so the b→a arc exists and the
+    // a→b arc does not. (This comment used to describe a `hi_lo` fallback in an
+    // "undirected-weight selection" — a mechanism the directed rewrite deleted.
+    // There is no canonical per-link weight any more: each direction is its own
+    // arc, and what this fixture exercises is a one-way arc surviving with the
+    // two-way check disabled.)
     try insertReachLsp(&db, a, 1, &.{});
     try insertReachLsp(&db, b, 1, &.{.{ .nbr = a, .metric = 15 }});
 
@@ -1612,4 +1704,97 @@ fn fuzzComputeOverLsdb(_: void, smith: *testing.Smith) anyerror!void {
 
 test "fuzz: SPF over an LSDB fed arbitrary bytes never panics" {
     try testing.fuzz({}, fuzzComputeOverLsdb, .{});
+}
+
+test "TEETH: an LSP whose Remaining Lifetime has aged to zero is excluded from SPF" {
+    // ISO/IEC 10589 §7.3.17. `now` was accepted, forwarded to `isis-lsdb` (whose
+    // `EntryView.remaining_lifetime` is aged to exactly that `now`), documented
+    // as ageing lifetimes — and then never read. The only filter was
+    // `bytes.len == 0`, which catches an entry `Lsdb.tick` has already reduced
+    // to a header, and `tick` is caller-driven and independent of `compute`.
+    //
+    // ⚠ `isis-sim`, the harness that drives this module, calls
+    // `isis_spf.compute(gpa, …, 0)` with `now` hardcoded to 0, so every
+    // simulated SPF runs at t=0 where nothing has aged. The harness structurally
+    // could not see this.
+    const gpa = testing.allocator;
+    const a = sysId(1);
+    const b = sysId(2);
+    var db = lsdb.Lsdb.init(gpa, cfgFor(a));
+    defer db.deinit();
+    try insertReachLspLifetime(&db, a, 1, 5, &.{.{ .nbr = b, .metric = 10 }});
+    try insertReachLspLifetime(&db, b, 1, 5, &.{.{ .nbr = a, .metric = 10 }});
+
+    // The premise, asserted rather than assumed: the database itself calls both
+    // entries dead at this `now`, and still holds their bytes. Without the
+    // second half the test would pass for the wrong reason.
+    {
+        var it = db.iterator(1000);
+        var seen: usize = 0;
+        while (it.next()) |ev| {
+            try testing.expectEqual(@as(u16, 0), ev.remaining_lifetime);
+            try testing.expect(ev.bytes.len > 0);
+            seen += 1;
+        }
+        try testing.expectEqual(@as(usize, 2), seen);
+    }
+
+    // Well inside the lifetime the topology routes normally — the control, so
+    // an empty table below cannot be a broken fixture.
+    {
+        var early = try compute(gpa, &db, a, 1);
+        defer early.deinit();
+        try testing.expectEqual(@as(usize, 2), early.routes.len);
+        try testing.expectEqual(@as(u64, 10), early.lookup(b).?.metric);
+    }
+
+    // Past it, nothing is routable — not even the local self route, because the
+    // local router's own LSP has expired too and `origins` is built from the
+    // same walk.
+    var table = try compute(gpa, &db, a, 1000);
+    defer table.deinit();
+    try testing.expectEqual(@as(usize, 0), table.routes.len);
+}
+
+test "RFC 5305 §3 MAX_PATH_METRIC: the ceiling is exceeded, and the gap is stated rather than assumed" {
+    // The deferral of the MAX_PATH_METRIC clamp used to be justified by "not a
+    // fixture that can be driven RED at a defensible size". This is that
+    // fixture: 300 routers, 22 ms. It asserts the CURRENT behaviour — the
+    // summed metric runs past 0xFE000000 unclamped — so the deferral is pinned
+    // by a measurement instead of by a claim, and whoever later clamps in
+    // `spf-ect` will meet this test and have to change it deliberately.
+    const gpa = testing.allocator;
+    const n: usize = 300;
+    var db = lsdb.Lsdb.init(gpa, .{ .local_system_id = sysId(0), .interface_count = 2, .capacity = 512 });
+    defer db.deinit();
+    var ids: [300]SystemId = undefined;
+    for (0..n) |i| {
+        ids[i] = .{ 0, 0, 0, 0, @intCast(i >> 8), @intCast(i & 0xff) };
+    }
+    const near_max: u24 = 0xFFFFFE; // one below max_link_metric, which is excluded outright
+    for (0..n) |i| {
+        if (i == 0) {
+            try insertReachLsp(&db, ids[i], 1, &.{.{ .nbr = ids[1], .metric = near_max }});
+        } else if (i + 1 == n) {
+            try insertReachLsp(&db, ids[i], 1, &.{.{ .nbr = ids[i - 1], .metric = near_max }});
+        } else {
+            try insertReachLsp(&db, ids[i], 1, &.{
+                .{ .nbr = ids[i - 1], .metric = near_max },
+                .{ .nbr = ids[i + 1], .metric = near_max },
+            });
+        }
+    }
+    var table = try compute(gpa, &db, ids[0], 0);
+    defer table.deinit();
+    try testing.expectEqual(@as(usize, n), table.routes.len);
+
+    const max_path_metric: u64 = 0xFE000000;
+    const far = table.lookup(ids[n - 1]).?;
+    // The exact sum, so a change in either the metric type or the accumulation
+    // shows up here rather than being absorbed by an inequality.
+    try testing.expectEqual(@as(u64, 299) * near_max, far.metric);
+    try testing.expect(far.metric > max_path_metric);
+    // And nothing overflowed: the RFC's own rationale for the ceiling is a
+    // 32-bit accumulator, and `Route.metric` is a u64.
+    try testing.expect(far.metric > std.math.maxInt(u32));
 }
