@@ -45,6 +45,28 @@ killed child's own descendants (e.g. a shell's `&`-backgrounded jobs) are reacha
 only covers descendants that stayed in the group the kernel assigns at fork; a descendant that
 calls `setsid`/`setpgid` itself escapes it, same as any POSIX process-group signal.
 
+**Signalling a pid we may no longer own (PID reuse).** The premise of this module — a sibling
+thread's `wait4(-1)` can reap our child — has a second edge nothing addressed until 2026-09-03.
+When somebody else reaps the child, the pid becomes FREE for the host's next `fork`, while
+`child.id` is still set (nothing nulls it until `waitTolerant` runs) and, on the `runTimeout`
+path, the killer thread is still armed and can fire up to the deadline. Both `deliver` and
+`deliverGroup` then signalled that pid regardless — and `deliverGroup`'s form is
+`kill(-pid, SIGKILL)`, i.e. an entire recycled process **group**. Reproduced: after an
+out-of-band reap, `child.id` is still set and both paths proceeded to signal the freed pid.
+
+Every signal now passes `stillOurChild(pid)` first — `waitid` with `WNOHANG | WNOWAIT`, which is
+non-destructive (it never consumes the status `waitTolerant` still needs), non-blocking for a
+running child or a zombie alike, and answers `ECHILD` exactly when the pid is no longer ours.
+
+⚠ **This narrows the window; it does not close it.** The pid can be reaped between that answer
+and the `kill`. Closing it properly means signalling through a `pidfd` opened at spawn
+(`pidfd_open` / `pidfd_send_signal`), which is immune to reuse by construction — deferred rather
+than done, because it costs a descriptor per child and needs a fallback for kernels without it,
+and because `std.process.spawn` gives no hook to open the pidfd atomically with the fork. Also
+Linux-only: on other POSIX targets `stillOurChild` answers "ours" unconditionally and the
+unguarded behaviour stands. Actual pid RECYCLING was not reproduced (it needs the pid counter
+forced to wrap); what is pinned by a test is the gate itself, in both directions.
+
 ## Verification
 
 Deterministic tests over real spawned processes (`git`, `sleep`, `cat`, `dd`, `/bin/sh`, and

@@ -306,9 +306,41 @@ fn deliver(child: *std.process.Child, kind: SigKind, raw: u8) void {
                 .kill => .KILL,
                 .raw => @enumFromInt(raw),
             };
+            if (!stillOurChild(id)) return; // see `stillOurChild`
             std.posix.kill(id, sig) catch {};
         },
     }
+}
+
+/// Is `pid` still one of OUR children — i.e. not yet reaped by anybody?
+///
+/// `waitid` with `WNOHANG | WNOWAIT` is a non-destructive question: it never
+/// consumes the exit status (so `waitTolerant` still gets it), it returns
+/// without blocking whether the child is running or a zombie, and it answers
+/// `ECHILD` exactly when the pid is no longer ours.
+///
+/// This exists because of the module's own premise. If a sibling thread's
+/// `wait4(-1)` reaps our child, the pid is FREE and the host's next `fork`
+/// can take it -- while `child.id` is still set (nothing nulls it until
+/// `waitTolerant` runs) and the timeout killer thread is still armed. The
+/// signal would then land on a stranger, and for `deliverGroup` it is
+/// `kill(-pid, SIGKILL)`: a whole recycled process GROUP. Reproduced: after
+/// an out-of-band reap, `child.id` is still set and both `deliver` and
+/// `deliverGroup` proceeded to signal the freed pid.
+///
+/// ⚠ **This NARROWS the window, it does not close it.** The pid can be
+/// reaped between this answer and the `kill` below. Closing it properly means
+/// signalling through a `pidfd` opened at spawn (`pidfd_open` /
+/// `pidfd_send_signal`), which is immune to reuse by construction --
+/// recorded in `SPEC.md` rather than done here, because it needs a
+/// descriptor per child and a fallback for kernels without it. Non-Linux
+/// keeps the unguarded behaviour, also recorded.
+fn stillOurChild(pid: std.posix.pid_t) bool {
+    if (builtin.os.tag != .linux) return true;
+    var info: std.os.linux.siginfo_t = undefined;
+    const L = std.os.linux;
+    const rc = L.waitid(.PID, pid, &info, L.W.NOHANG | L.W.NOWAIT | L.W.EXITED, null);
+    return std.posix.errno(rc) != .CHILD;
 }
 
 /// Like `deliver`, but signals the child's entire process GROUP
@@ -331,6 +363,7 @@ fn deliverGroup(child: *std.process.Child, kind: SigKind, raw: u8, grouped: bool
                 .kill => .KILL,
                 .raw => @enumFromInt(raw),
             };
+            if (!stillOurChild(id)) return; // see `stillOurChild`
             std.posix.kill(-id, sig) catch {};
         },
     }
@@ -1777,4 +1810,51 @@ test "runValidated: a bad program path is rejected independently of args" {
         "",
     );
     try testing.expectError(argsafe.Error.Rejected, result);
+}
+
+test "a pid reaped out-of-band is not signalled: stillOurChild is the gate" {
+    // The module's own premise is that a sibling thread's `wait4(-1)` can reap
+    // our child. When it does, the pid is FREE for the host's next `fork` --
+    // while `child.id` is still set (nothing nulls it until `waitTolerant`
+    // runs) and, on the timeout path, the killer thread is still armed. Both
+    // `deliver` and `deliverGroup` used to signal it regardless, and
+    // `deliverGroup`'s form is `kill(-pid, SIGKILL)`: a whole recycled process
+    // GROUP.
+    //
+    // Actual pid recycling is not reproducible here without forcing the pid
+    // counter to wrap, so what is pinned is the gate itself: it must answer
+    // "ours" for a live child and "not ours" the moment somebody else reaps.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    ensureChildReaping();
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", "sleep 5" },
+        .stdin = .close,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const pid = child.id.?;
+
+    // Running child: ours, and the query must not consume anything.
+    try testing.expect(stillOurChild(pid));
+    try testing.expect(stillOurChild(pid)); // WNOWAIT: repeatable
+
+    // Kill it for real and let a sibling-style reaper take the status.
+    deliver(&child, .kill, 0);
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const rc = std.posix.system.wait4(pid, &status, 0, null);
+        if (std.posix.errno(rc) == .INTR) continue;
+        break;
+    }
+
+    // Now the pid is not ours. `child.id` is still set -- that is the whole
+    // hazard -- so the gate is the only thing standing between the killer
+    // thread and a stranger's process group.
+    try testing.expect(child.id != null);
+    try testing.expect(!stillOurChild(pid));
 }
