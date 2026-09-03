@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — Drift re-audit. **`mtaAliceFinalize` reduced only the LOW
+  64 BYTES of the decrypted Paillier plaintext**, on the strength of a comment
+  reading "α' = a·b + β' < q² + q < 2^512, so only its low 64 bytes are
+  nonzero". That is true of an HONEST Bob, whose `β'` is a `Scalar`; it is not
+  a fact about the protocol. `verifyBobMta`'s range check on `β'` is
+  `t1 <= q⁷` — GG18 Appendix A.3's slack, ≈ 2^1792 — so a malicious Bob can
+  prove a `β'` of `2^512 - X`, and whenever `a·b >= X` the plaintext crosses
+  2^512, the high bytes were dropped, and the module's own invariant
+  **α + β ≡ a·b (mod q) silently broke while every proof check passed**.
+  Reproduced with `a·b = 1000`: at `X = 2000` the identity holds, at `X = 500`
+  it does not — so Bob picks the outcome, and the resulting abort is one
+  adaptively-chosen bit of `a·b`. `mtaAliceFinalizeChecked`'s doc named this
+  exact attack class ("the Alpha-Rays/TSSHOCK failure class … is rejected
+  here"). The reduction is now full-width (`zkproofs.scalarFromWide`, made
+  public for it), which removes the precondition rather than asserting it:
+  `q⁷ + q² < N` for any `N` meeting the module's key-size floor, so the
+  identity holds for every `β'` the proof can accept.
+- **2026-09-03** — **`s2`/`t2` are length-capped before they are used as
+  exponents.** Both verifiers feed them straight to `powPub`, and nothing
+  bounded them — the work is linear in a length the attacker picks. Measured
+  against an honest `s2` of 352 bytes, on a proof the verifier then rejects
+  anyway: 1 KiB → 44 ms, 64 KiB → 1.1 s, **1 MiB → 19 s**. One message, one
+  core, nineteen seconds. The honest bound is `96 + |Ñ| + 1` bytes
+  (`e·ρ + γ` with `e < q`, `ρ < q·Ñ`, `γ < q³·Ñ`), so the cap rejects nothing
+  an honest prover can produce — asserted from both sides, and the 1 MiB case
+  is now a test that runs in 0 ms.
 - **2026-07-29** — The GG18 Appendix-A Fiat-Shamir transcripts now bind the Paillier
   **generator** `Γ`, not only the modulus `N` (audit F3 — an unbound
   public value in the verification equation is a value a prover can

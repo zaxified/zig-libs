@@ -207,20 +207,31 @@ pub fn mtaAliceFinalize(c_b: paillier.Ciphertext, alice_sk: paillier.SecretKey) 
 
     // decrypt's Fe is backed by the FULL modulus width, so it must be
     // serialized into an `n`-wide buffer (Fe.toBytes rejects a buffer smaller
-    // than the modulus, even when the value itself is small). The plaintext
-    // α' = a·b + β' < q² + q < 2^512, so only its low 64 bytes are nonzero;
-    // reduce those mod q via the curve's constant-time wide reduction. The
-    // range precondition (N > q²+q, hence nByteLen > 64) guarantees the slice.
+    // than the modulus, even when the value itself is small).
+    //
+    // ⚠ This used to take only the LOW 64 BYTES, justified by "the plaintext
+    // α' = a·b + β' < q² + q < 2^512, so only its low 64 bytes are nonzero".
+    // That is true of an HONEST Bob, whose `β'` is a `Scalar` (< q). It is not
+    // a fact about the protocol: `zkproofs.verifyBobMta`'s range check is
+    // `t1 <= q⁷` (GG18 Appendix A.3's slack), so a malicious Bob may legally
+    // prove a `β'` up to ~2^1792. With `β' = 2^512 - X` and `a·b >= X` the
+    // plaintext crosses 2^512, the high bytes were silently dropped, and the
+    // module's whole invariant α + β ≡ a·b (mod q) broke -- while every proof
+    // check passed and `mtaAliceFinalizeChecked`'s doc promised that exact
+    // attack class ("the Alpha-Rays/TSSHOCK failure class ... is rejected
+    // here") was refused. Reproduced: `β' = 2^512 - 500`, `a·b = 1000`,
+    // proof ACCEPTED, identity broken; at `X = 2000` it holds, so Bob also
+    // chooses the outcome and reads one bit of `a·b` off the abort.
+    //
+    // Reducing the FULL width removes the precondition instead of asserting
+    // it: the identity now holds for every `β'` the proof can accept, since
+    // `q⁷ + q² < N` for any `N` meeting the module's key-size floor, so the
+    // Paillier plaintext cannot wrap either.
     const n_len = alice_sk.nByteLen();
-    std.debug.assert(n_len >= 64);
     var wide: [paillier.modulus_bytes]u8 = [_]u8{0} ** paillier.modulus_bytes;
     defer std.crypto.secureZero(u8, wide[0..n_len]);
     try alpha_fe.toBytes(wide[0..n_len], .big);
-
-    var buf: [64]u8 = undefined;
-    defer std.crypto.secureZero(u8, &buf);
-    @memcpy(&buf, wide[n_len - 64 .. n_len]);
-    return Scalar.fromBytes64(buf, .big); // reduce mod q
+    return zkproofs.scalarFromWide(wide[0..n_len]);
 }
 
 // ── Phase 2c: malicious-secure ("checked") MtA — REAL wiring + REAL proofs
@@ -364,10 +375,23 @@ pub const MtaCheckedError = MtaError || error{InvalidMtaProof};
 
 /// **Phase-2c Alice, finalize — fail-closed. REAL control flow + REAL
 /// predicate.** Verifies Bob's `zkproofs.MtaProof` against Alice's OWN
-/// view of `c_a` BEFORE ever decrypting `c_b` — a malicious Bob who fed
-/// an out-of-range `b`/`β'` (the Alpha-Rays/TSSHOCK failure class — see
-/// `zkproofs.zig`'s module doc comment / `SPEC.md`'s threat model) is
-/// rejected here, never reaching `mtaAliceFinalize`'s decryption.
+/// view of `c_a` BEFORE ever decrypting `c_b` — a malicious Bob whose `b`
+/// exceeds `q³`, or whose `β'` exceeds `q⁷`, is rejected here and never
+/// reaches `mtaAliceFinalize`'s decryption (the Alpha-Rays/TSSHOCK failure
+/// class — see `zkproofs.zig`'s module doc comment / `SPEC.md`'s threat
+/// model).
+///
+/// ⚠ **"Out of range" means out of the PROOF's range, which is wide.**
+/// GG18 Appendix A.3's slack puts the accepted `β'` at `q⁷ ≈ 2^1792`, not
+/// at `q`. This doc used to say an out-of-range `β'` was "rejected here"
+/// without that distinction, while `mtaAliceFinalize` reduced only the low
+/// 64 bytes of the plaintext on the strength of `β' < q`. A `β'` of
+/// `2^512 - X` is perfectly proof-legal, and for `a·b ≥ X` it silently
+/// broke the module's own invariant `α + β ≡ a·b (mod q)` with every check
+/// passing — and Bob chose `X`, so the resulting abort was one
+/// adaptively-selected bit of `a·b`. The reduction is full-width now, so
+/// the identity holds for every `β'` the proof can accept; the range check
+/// is what bounds the proof, not what makes the arithmetic sound.
 ///
 /// `verifier_aux` is ALICE's OWN `AuxParams` (she is the verifier here —
 /// see `zkproofs.zig`'s "verifier-vs-prover aux-param ownership" note).

@@ -610,7 +610,32 @@ fn gammaPowWide(pk: paillier.PublicKey, e_bytes: []const u8) ?paillier.Fe {
 /// constant-time `fromBytes48` wide reduction). Used for the MtAwc curve
 /// check's `s1 mod q` (public) and the prover's `alpha mod q` (its own
 /// fresh mask).
-fn scalarFromWide(bytes: []const u8) Scalar {
+/// Upper bound on an honest aux-side response exponent (`s2`/`t2` in both
+/// proofs), in BYTES.
+///
+/// Every such response has the shape `e·u + v` with `e < q` (32 bytes),
+/// `u < q·Ñ` and `v < q³·Ñ`, so the value is below `q²Ñ + q³Ñ < 2·q³·Ñ` and
+/// cannot need more than `96 + |Ñ| + 1` bytes. Nothing bounded them before,
+/// and both verifiers feed them straight to `powPub` as EXPONENTS: the work
+/// is linear in the attacker's chosen length, with no cap anywhere on the
+/// path. Measured on an honest `s2` of 352 bytes replaced by a random one:
+/// 1 KiB -> 44 ms, 64 KiB -> 1.1 s, **1 MiB -> 19 s**, all for a proof the
+/// verifier then rejects. One message, one core, nineteen seconds.
+///
+/// This is a work bound, not a soundness one -- the binding argument lives in
+/// the group mod `Ñ`, where the exponent wraps anyway -- so a length cap is
+/// the right shape: it rejects nothing an honest prover can produce.
+fn auxExponentTooLong(bytes: []const u8, nt: anytype) bool {
+    const nt_len = (nt.bits() + 7) / 8;
+    return bytes.len > 96 + nt_len + 1;
+}
+
+/// Reduce an arbitrarily wide big-endian integer mod `q`, by Horner over
+/// 16-byte limbs. `pub` because `mta.zig` needs exactly this: a Paillier
+/// plaintext is `nByteLen()` wide and only its low 64 bytes are small enough
+/// for `Scalar.fromBytes64` when the sender is HONEST -- which is a
+/// precondition, not a fact (see `mta.mtaAliceFinalize`).
+pub fn scalarFromWide(bytes: []const u8) Scalar {
     // 2^128 as a Scalar (bit 128 => byte 31 of a 48-byte BE buffer).
     var radix_buf = [_]u8{0} ** 48;
     radix_buf[31] = 1;
@@ -1217,6 +1242,9 @@ pub fn verifyAliceRange(
 
     // 1. THE range check: s1 <= q³.
     if (intCompare(proof.s1, &q3_bytes) == .gt) return false;
+    // ...and the work bound on the one field nothing bounded (see
+    // `auxExponentTooLong`): `s2` is an unbounded-length exponent.
+    if (auxExponentTooLong(proof.s2, nt)) return false;
 
     const e = rangeProofChallenge(verifier_aux, alice_pk, c_a, proof.z, proof.u, proof.w);
     const e_bytes = e.toBytes(.big);
@@ -1645,6 +1673,8 @@ fn verifyBobInner(
     // 1./2. THE range checks.
     if (intCompare(proof.s1, &q3_bytes) == .gt) return false;
     if (intCompare(proof.t1, &q7_bytes) == .gt) return false;
+    // The two response exponents nothing bounded (see `auxExponentTooLong`).
+    if (auxExponentTooLong(proof.s2, nt) or auxExponentTooLong(proof.t2, nt)) return false;
 
     const e = if (b_point) |bp|
         mtaProofWcChallenge(verifier_aux, alice_pk, c_a, c_b, proof.z, proof.z1, proof.t, proof.v, proof.w, bp, u1_point.?)
@@ -2649,4 +2679,94 @@ test "audit F3 (b): prove and verify entry points fail-close on a non-standard P
     };
     defer dummy_mta.deinit(allocator);
     try testing.expect(!verifyBobMta(dummy_mta, c_dummy_bad, c_dummy_bad, pk_bad, good_aux));
+}
+
+test "audit: a proof-legal beta' that crosses 2^512 keeps the MtA identity alpha + beta == a*b" {
+    // `mtaAliceFinalize` used to reduce only the LOW 64 BYTES of the Paillier
+    // plaintext, justified by "alpha' = a*b + beta' < q^2 + q < 2^512, so only
+    // its low 64 bytes are nonzero". That is true of an HONEST Bob, whose
+    // `beta'` is a `Scalar`. It is not a fact about the protocol: this
+    // verifier's range check on `beta'` is `t1 <= q^7` (GG18 Appendix A.3's
+    // slack), so a malicious Bob may legally prove a `beta'` up to ~2^1792.
+    //
+    // With `beta' = 2^512 - X` the plaintext crosses 2^512 exactly when
+    // `a*b >= X`, the high bytes were silently dropped, and the identity broke
+    // -- while every proof check passed and `mta.mtaAliceFinalizeChecked`'s
+    // doc promised that this exact attack class ("the Alpha-Rays/TSSHOCK
+    // failure class ... is rejected here") was refused. Bob also CHOOSES the
+    // outcome, so the abort is one adaptively-chosen bit of `a*b`.
+    //
+    // Both X values are proof-legal and must now behave identically. The pair
+    // is the point: X = 2000 held before the fix too, so a single case would
+    // not have distinguished a working reduction from a lucky one.
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const mta_mod = @import("mta.zig");
+    const allocator = testing.allocator;
+    const setup = try realAuxAndKey(0x4155444954_01);
+    const pk = setup.kp.public;
+    const sk = setup.kp.secret;
+    var prng = std.Random.DefaultPrng.init(0x4155444954);
+    const random = prng.random();
+
+    const a_val: u64 = 1000;
+    const a = scalarFromU64(a_val);
+    const r_a = testPaillierRandomness(pk, random);
+    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const x_ok = scalarFromU64(1).toBytes(.big); // Bob's b = 1
+
+    inline for (.{ 2000, 500 }) |X| {
+        const y_big = comptime comptimeIntBytes(65, (1 << 512) - X);
+        const r_b = testPaillierRandomness(pk, random);
+        const c_b = buildCb(pk, c_a, &x_ok, &y_big, r_b);
+        const out = try proveBobInner(allocator, &x_ok, &y_big, r_b, c_a, c_b, pk, setup.aux, null, random);
+        defer out.proof.deinit(allocator);
+
+        // The verifier accepts: every range bound and every equation holds.
+        try testing.expect(verifyBobMta(out.proof, c_a, c_b, pk, setup.aux));
+
+        // ...so the checked finalize runs, and its result must satisfy the
+        // module's whole invariant.
+        const alpha = try mta_mod.mtaAliceFinalizeChecked(c_a, c_b, out.proof, sk, pk, setup.aux);
+        const beta = scalarFromWide(&y_big).neg();
+        try testing.expectEqualSlices(u8, &a.toBytes(.big), &alpha.add(beta).toBytes(.big));
+    }
+}
+
+test "audit: an over-long s2 is refused before it is used as an exponent" {
+    // Both verifiers feed `s2`/`t2` straight to `powPub` as EXPONENTS, and
+    // nothing bounded their length. Measured before the cap, on a proof the
+    // verifier then REJECTS anyway: 1 KiB of s2 -> 44 ms, 64 KiB -> 1.1 s,
+    // 1 MiB -> 19 s. One message, one core, nineteen seconds. The honest
+    // bound is `96 + |N~| + 1` bytes (`e*rho + gamma` with `e < q`,
+    // `rho < q*N~`, `gamma < q^3*N~`), so the cap rejects nothing an honest
+    // prover can produce -- asserted here from both sides.
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const setup = try realAuxAndKey(0x4155444954_02);
+    const pk = setup.kp.public;
+    var prng = std.Random.DefaultPrng.init(0x41554449_5432);
+    const random = prng.random();
+
+    const a = scalarFromU64(7);
+    const r_a = testPaillierRandomness(pk, random);
+    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const proof = try proveAliceRange(allocator, a, r_a, pk, setup.aux, random);
+    defer proof.deinit(allocator);
+
+    // The honest proof still verifies, and its `s2` sits at the cap's own
+    // ceiling -- so a cap set one byte tighter would break honest provers.
+    try testing.expect(verifyAliceRange(proof, c_a, pk, setup.aux));
+    const nt_len = (setup.aux.n_tilde.bits() + 7) / 8;
+    try testing.expect(proof.s2.len <= 96 + nt_len + 1);
+    try testing.expect(!auxExponentTooLong(proof.s2, setup.aux.n_tilde));
+
+    // One byte past the bound is refused, and refused FAST: this runs the
+    // 1 MiB case that used to take 19 seconds.
+    inline for (.{ 96 + 256 + 2, 1024 * 1024 }) |big| {
+        const s2_big = try allocator.alloc(u8, big);
+        defer allocator.free(s2_big);
+        random.bytes(s2_big);
+        const evil: RangeProof = .{ .z = proof.z, .u = proof.u, .w = proof.w, .s = proof.s, .s1 = proof.s1, .s2 = s2_big };
+        try testing.expect(!verifyAliceRange(evil, c_a, pk, setup.aux));
+    }
 }
