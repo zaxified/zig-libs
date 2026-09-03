@@ -133,7 +133,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   under `std.testing.allocator` with the result freed on every path. No panic, hang,
   OOB read or leak found.
 - **2026-07-19** — Security audit: three findings fixed, one documented as accepted (not
-  defects) — part of the collection-wide audit. Verified against a live capture from
-  gopsutil (Go) / procps-ng.
+  defects) — part of the collection-wide audit. ⚠ **This entry used to end "Verified
+  against a live capture from gopsutil (Go) / procps-ng". There is no such capture** —
+  corrected 2026-09-03. Neither name appears anywhere in this module outside the three
+  places that state the design reference; what gopsutil and procps-ng are here is a
+  *model*, which is what `root.zig`'s `meta.model_after` says. The sentence was a
+  template rendering a C-reference-implementation field as a claim of a verified
+  capture, and the same template put the same false sentence in four other modules.
+  The module's captures are real and are its own: `src/testdata/` holds `/proc`
+  snapshots taken from running kernels, including the big-endian `tcp-mips-be.txt`
+  whose image, boot command and capture date SPEC.md §"The hex address decode on a
+  big-endian target" states in full, so it can be re-taken. Those anchor the parsers;
+  no foreign parser was ever run against them, and none needs to be — the ground truth
+  is the address the capture script BOUND, not another implementation's opinion.
 - **2026-07-09** — New module: Linux `/proc`+`/sys` parsers — ARP/routes/TCP+UDP
   sockets/conntrack/process stats/device health, typed.
