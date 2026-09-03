@@ -106,9 +106,14 @@ fn benchShardOverhead(
 
 test "bench (opt-in via PIR_BENCH)" {
     if (@import("builtin").target.os.tag == .windows or std.testing.environ.getPosix("PIR_BENCH") == null) return error.SkipZigTest;
+    // Print the mode the binary was actually BUILT in, not the flag the
+    // header suggests. A Debug run of this bench prints authoritative-looking
+    // ratios that mean nothing; the reading has to come from inside the
+    // binary (`builtin.mode`), because a `-Doptimize=` that did not apply
+    // looks exactly like one that did.
     std.debug.print(
-        "\n=== pir answerRange sharding overhead (F4) — single-threaded sum-of-shards vs whole-DB answer ===\n",
-        .{},
+        "\n=== pir answerRange sharding overhead (F4) — single-threaded sum-of-shards vs whole-DB answer [mode={s}] ===\n",
+        .{@tagName(@import("builtin").mode)},
     );
     // Small working sets throughout (thousands of small records, not
     // millions) — this host has OOM-killed the editor from an unbounded

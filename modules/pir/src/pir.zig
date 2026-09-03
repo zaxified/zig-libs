@@ -332,14 +332,28 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// record must have the same length (`RaggedRecords` otherwise —
         /// see `db.zig` for why that is a hard requirement and not a
         /// convenience), and `0 <= lo <= hi <= records.len`.
+        ///
+        /// **Raggedness is checked over `records[0]` and the shard's own
+        /// `[lo, hi)`, not over the whole slice.** `records[0].len` is the
+        /// reference length every answer's geometry is derived from, so it
+        /// is always read; beyond that a shard validates exactly what it
+        /// touches. Scanning all of `records` on every shard call would make
+        /// validation `O(T·records.len)` for `T` shards and quietly falsify
+        /// `answerRange`'s "additive in `T`, not multiplicative" cost model,
+        /// which is the one property sharding exists for. The consequence,
+        /// stated so it is a decision rather than an accident: a ragged
+        /// record OUTSIDE a shard's range does not fail that shard — it is
+        /// never read, and the shard's answer is correct. A full sharded run
+        /// covers `[0, count())`, so the union of the shards still rejects
+        /// it; `answerSlices` (the one-shard case) still rejects it outright.
         pub fn answerSlicesRange(party: u1, share: Share, records: []const []const u8, lo: usize, hi: usize, out: []Word) Error!void {
             if (records.len == 0) return error.EmptyDatabase;
             if (records.len > domain_size) return error.DomainTooSmall;
             const record_len = records[0].len;
             if (record_len == 0) return error.ZeroRecordLen;
-            for (records) |r| if (r.len != record_len) return error.RaggedRecords;
             if (out.len != answerWords(record_len)) return error.AnswerLengthMismatch;
             if (lo > hi or hi > records.len) return error.InvalidRange;
+            for (records[lo..hi]) |r| if (r.len != record_len) return error.RaggedRecords;
 
             @memset(out, 0);
             // Same tree-reuse range walk as `answerRange`, same reasons.
@@ -729,7 +743,13 @@ pub fn PirWith(comptime Prg: type, comptime domain_bits: usize, comptime word_by
         /// Detection only — abort, no recovery, no attribution; see
         /// `verify.zig`'s module doc for the exact security statement.
         pub fn Verified(comptime tag_slack_bytes: usize) type {
-            return @import("verify.zig").Verified(domain_bits, word_bytes, tag_slack_bytes);
+            // `Prg`, not `fss.prg.default`: this instantiation inherits the
+            // PRG its `PirWith` was given. Applying the default here would
+            // silently put both the value and the tag channel back on
+            // `Aes128Mmo` for a caller who chose `Sha256Prg` precisely to
+            // get off it -- a downgrade with no diagnostic, in the one
+            // direction the choice exists to prevent.
+            return @import("verify.zig").VerifiedWith(Prg, domain_bits, word_bytes, tag_slack_bytes);
         }
 
         // ── record ↔ word decomposition ───────────────────────────────────
@@ -834,6 +854,50 @@ test "SELF: PirWith actually threads the PRG through, not just compiles — cons
     var out: [record_len]u8 = undefined;
     try P.reconstruct(a0[0..n_words], a1[0..n_words], &out);
     try testing.expectEqualSlices(u8, database.record(index), &out);
+
+    // ...and through EVERY nested instantiation, not just `.Dpf`. Each of
+    // these re-enters a generic that could re-apply `fss.prg.default`
+    // instead of forwarding `Prg`, and such a downgrade is invisible: the
+    // wrong PRG still round-trips correctly, it is only the constant-time
+    // property that is gone. `.Verified(S)` did exactly that until this
+    // assertion existed.
+    const V = P.Verified(8);
+    try testing.expectEqual(fss.prg.Sha256Prg, V.Value.Dpf.Prg);
+    try testing.expectEqual(fss.prg.Sha256Prg, V.TagDpf.Prg);
+    const M = P.Multi(3);
+    try testing.expectEqual(fss.prg.Sha256Prg, M.Mpf.Dpf.Prg);
+}
+
+test "SELF: a shard validates raggedness over what it READS, and the whole slice is still covered by the union of shards" {
+    // The ragged scan used to run over all of `records` on every shard call,
+    // which is `O(T*records.len)` for `T` shards and falsifies the
+    // "additive in T, not multiplicative" cost model sharding exists for.
+    // It now covers `records[0]` (the reference length) plus `[lo, hi)`.
+    // These assertions are the semantics that follows, pinned deliberately.
+    const P = Pir(4, 4);
+    const good = "abcdefgh";
+    var records = [_][]const u8{ good, good, good, good, good, good };
+    records[4] = "short"; // ragged, and OUTSIDE the first shard
+
+    const seeds = detSeeds(4242);
+    const shares = try P.query(1, seeds[0], seeds[1]);
+    var out: [8]P.Word = undefined;
+    const n = P.answerWords(good.len);
+
+    // shard [0, 3) never reads records[4] -- it answers.
+    try P.answerSlicesRange(0, shares[0], &records, 0, 3, out[0..n]);
+    // shard [3, 6) does -- it rejects.
+    try testing.expectError(error.RaggedRecords, P.answerSlicesRange(0, shares[0], &records, 3, 6, out[0..n]));
+    // and the unsharded call, which is the shard [0, records.len), rejects.
+    try testing.expectError(error.RaggedRecords, P.answerSlices(0, shares[0], &records, out[0..n]));
+
+    // `records[0]` is the reference length whatever the shard, so a ragged
+    // FIRST record fails every shard, including one that does not contain
+    // index 0: each record in `[lo, hi)` is compared against `records[0]`,
+    // not against its neighbour.
+    var first_short = [_][]const u8{ "shrt", good, good, good };
+    const n_short = P.answerWords(4);
+    try testing.expectError(error.RaggedRecords, P.answerSlicesRange(0, shares[0], &first_short, 1, 4, out[0..n_short]));
 }
 
 test "SELF: retrieval returns the right record for EVERY index, across awkward sizes" {

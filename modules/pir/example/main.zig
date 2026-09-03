@@ -117,4 +117,30 @@ pub fn main() !void {
     // a protocol bug).
     if (!std.mem.eql(u8, kw_got[0.."carol".len], "carol")) return error.WrongRecord;
     if (!std.mem.eql(u8, kw_got[kw_key_len..], "member-2")) return error.WrongRecord;
+
+    // ── the constant-time PRG choice, exercised from OUTSIDE the module.
+    // SPEC.md "Constant-time PRG selection" tells a caller on a target
+    // without AES-NI/ARMv8-AES to instantiate with `fss.prg.Sha256Prg`
+    // rather than take the default's software-AES fallback, because the
+    // client's own key generation walks the domain tree keyed by the query
+    // index. That instruction is only true if the generic is reachable
+    // here: `PirWith`/`VerifiedWith` lived in `pir.zig`/`verify.zig` and
+    // were exercised only by tests INSIDE the module, which cannot see a
+    // missing re-export. This block is the compile gate for that -- it is
+    // the first outside caller.
+    const Pct = pir.PirWith(fss.prg.Sha256Prg, 3, 16);
+    const Vct = pir.VerifiedWith(fss.prg.Sha256Prg, 3, 16, 8);
+    const s0c: fss.prg.Seed = [_]u8{0x55} ** 16;
+    const s1c: fss.prg.Seed = [_]u8{0x66} ** 16;
+    const ct_shares = try Pct.query(want_index, s0c, s1c);
+    var c0: [1]Pct.Word = undefined;
+    var c1: [1]Pct.Word = undefined;
+    try Pct.answer(0, ct_shares[0], database, c0[0..n_words]);
+    try Pct.answer(1, ct_shares[1], database, c1[0..n_words]);
+    var ct_got: [record_len]u8 = undefined;
+    try Pct.reconstruct(c0[0..n_words], c1[0..n_words], &ct_got);
+    if (!std.mem.eql(u8, &ct_got, records[want_index])) return error.WrongRecord;
+    if (Vct.Value.Dpf.Prg != fss.prg.Sha256Prg) return error.WrongPrg;
+    if (Pct.Verified(8).TagDpf.Prg != fss.prg.Sha256Prg) return error.WrongPrg;
+    std.debug.print("Sha256Prg instantiation recovered: \"{s}\"\n", .{&ct_got});
 }

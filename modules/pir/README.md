@@ -78,7 +78,8 @@ try P.reconstruct(a0[0..n_words], a1[0..n_words], &record_out);
 falling back to non-constant-time software AES without AES-NI/ARMv8-AES —
 see `SPEC.md` §"Constant-time PRG selection"). On a target where that
 fallback matters, use `pir.PirWith(fss.prg.Sha256Prg, domain_bits,
-word_bytes)` instead (and `verify.VerifiedWith` for the verified layer).
+word_bytes)` instead (and `pir.VerifiedWith(...)` for the verified layer;
+`PirWith(...).Verified(S)` forwards the choice to both of its channels).
 
 ### Retrieving `k` records at once
 

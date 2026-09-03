@@ -322,6 +322,42 @@ The `Verified` layer gets the same one-line wrapper over its own `query`.
   deployment can build above this layer if collision-freedom is worth k× the
   work; it is not this module's default.
 
+## Range sharding (`answerRange` / `answerSlicesRange` / `accumulate`)
+
+A server answering over a large database may want to split the work across
+`T` workers. `answerRange(party, share, db, lo, hi, out)` answers over
+`[lo, hi)` only; `accumulate(dst, src)` sums two answer-shaped buffers by
+ring addition. `answer` is exactly the one-shard case `answerRange(…, 0,
+count(), …)` — not a separate code path — and the shards of a partition of
+`[0, count())` **add** to the whole-database answer, they do not concatenate.
+
+**Cost.** One shard costs its own leaf work plus two root-to-boundary
+descents (`O(domain_bits)` each) to position the walk, so `T` disjoint
+shards cost `O(count() + T·domain_bits)` — additive in `T`, not
+multiplicative. `src/bench.zig` measures the ratio (opt-in, `PIR_BENCH=1`);
+it prints the mode it was actually built in, because a Debug reading here
+would be meaningless. `answerSlicesRange` validates raggedness over
+`records[0]` and its own `[lo, hi)` rather than the whole slice, for the
+same reason — an `O(records.len)` scan per shard would make validation the
+multiplicative term the walk is not. See its doc comment for the semantics
+that follows.
+
+**What sharding reveals: nothing new.** `lo`/`hi` are the caller's own
+work-partitioning choice — public, fixed before the share is looked at,
+never derived from `share` or from the queried index. The access pattern
+within a shard is a function of `(lo, hi, database)` alone: records `lo..hi`
+in ascending order, unconditionally, no early exit, no branch on the
+evaluated share. Two different indices' shares over the identical `[lo, hi)`
+make the identical sequence of record accesses, and per-shard work is
+exactly `hi - lo` regardless of `i` — the same index-independence `answer`
+has over the whole database, restricted to a range. So a worker's assigned
+shard tells an observer only the partitioning the deployment itself chose.
+
+⚠ **What is tested is that every record in range influences the result**
+(the same test `answer` has, repeated for a shard), not the access sequence
+itself. Asserting the sequence would need a comptime seam on the record
+read; the property above is argued from the code, not pinned by a fixture.
+
 ## Threat model
 
 **The assumption.** Exactly one: the two servers do not pool their shares.
@@ -560,7 +596,7 @@ constant-time PRG built on `std.crypto.hash.sha2.Sha256` — via
 nothing threaded that choice through: `Pir`/`Verified` were hard-wired to
 `fss.Dpf`/`fss.Mpf`, i.e. to the default PRG, with no way for a caller on a
 soft-AES target to opt into `Sha256Prg` instead. `pir.PirWith(Prg, ...)` and
-`verify.VerifiedWith(Prg, ...)` now take the PRG as an explicit parameter,
+`pir.VerifiedWith(Prg, ...)` now take the PRG as an explicit parameter,
 mirroring `fss.DpfWith`/`fss.MpfWith` exactly; `Pir`/`Verified` remain
 `PirWith`/`VerifiedWith` applied to `fss.prg.default`, unchanged for every
 existing caller. A caller on a target without AES-NI/ARMv8-AES that cares

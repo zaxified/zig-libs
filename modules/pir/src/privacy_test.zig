@@ -222,7 +222,17 @@ fn maxGap(a: []const u32, b: []const u32) f64 {
 /// How the leak, if any, is injected into the serialized share. `.none` is the
 /// real thing; the others are deliberately broken shares that exist only to
 /// give the statistic teeth.
-const Leak = enum { none, whole_index_byte, one_index_bit };
+const Leak = enum {
+    none,
+    whole_index_byte,
+    one_index_bit,
+    /// CALIBRATION: the `one_index_bit` leak, but injected on only a
+    /// deterministic 30% / 10% of samples, so the expected per-bit frequency
+    /// gap is exactly that fraction. These are what pin `reject_gap` itself
+    /// -- see the CALIBRATION test.
+    index_bit_30pct,
+    index_bit_10pct,
+};
 
 fn sampleCounts(index: usize, stream: u64, leak: Leak, counts: *[share_bits]u32) !void {
     @memset(counts, 0);
@@ -238,6 +248,13 @@ fn sampleCounts(index: usize, stream: u64, leak: Leak, counts: *[share_bits]u32)
             // NEGATIVE CONTROL 2: ONE bit of the index in ONE bit of the
             // share — the subtlest leak this statistic is claimed to catch.
             .one_index_bit => buf[0] = (buf[0] & 0xFE) | @as(u8, @truncate(index & 1)),
+            // The same bit leak on a fixed fraction of samples. Not random:
+            // an exact `t % 10` schedule, so the expected gap is the rate to
+            // three decimals and the calibration below is reproducible.
+            .index_bit_30pct, .index_bit_10pct => {
+                const num: usize = if (leak == .index_bit_30pct) 3 else 1;
+                if (t % 10 < num) buf[0] = (buf[0] & 0xFE) | @as(u8, @truncate(index & 1));
+            },
         }
         accumulateBits(counts, &buf);
     }
@@ -287,6 +304,32 @@ test "STAT NEGATIVE CONTROL: the same statistic rejects a share that leaks the i
     try sampleCounts(0, 1001, .one_index_bit, &counts_a);
     try sampleCounts(1, 2002, .one_index_bit, &counts_b);
     try testing.expect(maxGap(&counts_a, &counts_b) >= reject_gap);
+}
+
+test "STAT CALIBRATION: `reject_gap` is pinned from BOTH sides -- a 30% leak is rejected, a 10% leak is not" {
+    // Without this test `reject_gap` is a free constant. The two negative
+    // controls above both produce a gap of EXACTLY 1.0 (the leaked bit is
+    // deterministic in the index), and the honest pairs sit near 0.096, so
+    // the threshold could be moved anywhere in (0.10, 1.0] -- from 6.4 sigma
+    // to "only a perfectly deterministic leak fails" -- with the whole suite
+    // green. Measured: raising it to 0.99 left 96/97 passing.
+    //
+    // A leak injected on a fixed fraction `p` of samples shifts the affected
+    // bit's frequency by exactly `p` between the two indices (0.5*(1-p) vs
+    // p + 0.5*(1-p)), so these two cases bracket the threshold: 0.30 must
+    // fire, 0.10 must not. Both are ~3 sigma clear of 0.20 at m = 512
+    // (sigma ~ 0.031), and the seeds are deterministic. Moving `reject_gap`
+    // out of (0.10, 0.30) now turns one of them red.
+    var counts_a: [share_bits]u32 = undefined;
+    var counts_b: [share_bits]u32 = undefined;
+
+    try sampleCounts(0, 1001, .index_bit_30pct, &counts_a);
+    try sampleCounts(1, 2002, .index_bit_30pct, &counts_b);
+    try testing.expect(maxGap(&counts_a, &counts_b) >= reject_gap);
+
+    try sampleCounts(0, 1001, .index_bit_10pct, &counts_a);
+    try sampleCounts(1, 2002, .index_bit_10pct, &counts_b);
+    try testing.expect(maxGap(&counts_a, &counts_b) < reject_gap);
 }
 
 // ── multi-index: what k points change, and what they do not ───────────────

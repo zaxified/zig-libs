@@ -5,6 +5,39 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — Drift re-audit. `PirWith`/`VerifiedWith` are now **exported
+  from `root.zig`**: they existed since 2026-08-07 and `SPEC.md`
+  "Constant-time PRG selection" and `README.md` both instruct a caller on a
+  soft-AES target to use them, but neither was reachable through
+  `@import("pir")` — the escape hatch for a named cache-timing channel on the
+  client's own key generation was unreachable by every consumer, and the
+  tests that exercised it live inside the module, where a missing re-export
+  is invisible. `example/main.zig` now instantiates both, so a compile gate
+  outside the module holds them. **`Pir(b, L).Verified(S)` silently dropped
+  the chosen PRG** and re-applied `fss.prg.default` to both channels; it now
+  forwards it, and the threading test covers `.Verified(S)` and `.Multi(k)`
+  as well as `.Dpf`. `privacy_test.zig` gained a calibration control that
+  pins `reject_gap` from both sides (a 30 % leak must be rejected, a 10 %
+  leak must not) — the two existing negative controls both produce a gap of
+  exactly 1.0, so the threshold could be moved anywhere in (0.10, 1.0] with
+  the suite green. `answerSlicesRange` no longer rescans the whole slice for
+  raggedness on every shard call. `src/bench.zig` prints its build mode.
+- **2026-09-02** — Range sharding and an explicit PRG parameter, added over
+  2026-08-31…09-02 and recorded here late — the entries below stopped at
+  2026-08-07 while the module gained ~900 lines:
+  - **BREAKING** — `answerBytesLen` and `tagBytesLen` changed from
+    `usize` to `Error!usize` (they now report the geometry overflow they
+    previously computed past).
+  - New: `PirWith(Prg, b, L)` / `VerifiedWith(Prg, b, L, S)`, taking the
+    `fss` PRG explicitly and mirroring `fss.DpfWith`/`fss.MpfWith`;
+    `Pir`/`Verified` are these applied to `fss.prg.default`, unchanged for
+    every existing caller.
+  - New: `answerRange` / `answerSlicesRange` / `accumulate` and
+    `error.InvalidRange` — server-side range sharding over `[lo, hi)`, with
+    the whole database as the degenerate one-shard case. See `SPEC.md`
+    "Range sharding".
+  - New: `Query.wipe` / `Secret.wipe`, and
+    `selective_failure_advantage_log2`.
 - **2026-08-07** — Security audit: seven findings fixed, one documented as accepted (not
   defects) — part of the collection-wide audit.
 - **2026-07-29** — Malicious-server detection (`Verified(...)`). The module's model was
@@ -26,8 +59,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   index recovers `m` — and **two servers holding the same wrong database
   are accepted**, since the MAC binds to the servers' common data rather
   than to a published digest. Both are asserted as `ATTACK NOT CAUGHT`
-  tests, not left implicit. Privacy is unchanged, and the abort verdict
-  is index-independent, so the check adds no selective-failure oracle.
+  tests, not left implicit. Privacy is unchanged. ⚠ **The sentence that
+  stood here — that the abort verdict is index-independent, so the check
+  adds no selective-failure oracle — was corrected on 2026-09-01**: it holds
+  at the recommended `S = 8`, but not uniformly down to the permitted floor
+  `S = 1`, where `tag_slack_bytes` is a privacy parameter and not only an
+  integrity one. `SPEC.md` "The exact security statement" carries the scoped
+  claim; this entry is left in place with the correction attached rather
+  than rewritten.
   `S = 0` is a `@compileError`: in the un-widened ring
   `m·2^(8L-1) = 2^(8L-1)` for every odd `m`, so a top-bit forgery would
   pass with probability 1. Under `Verified`, querying past the database

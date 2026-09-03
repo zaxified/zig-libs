@@ -102,6 +102,16 @@ const verify_mod = @import("verify.zig");
 /// `2^domain_bits` index domain. See `pir.zig`.
 pub const Pir = pir_mod.Pir;
 
+/// `Pir` with an explicitly chosen `fss` PRG. `Pir(b, L)` is exactly
+/// `PirWith(fss.prg.default, b, L)`; use this form on a target without
+/// AES-NI/ARMv8-AES, where the default PRG falls back to software (T-table)
+/// AES and the client's own key generation -- which walks the domain tree
+/// keyed by the query index -- stops being constant-time. See `SPEC.md`
+/// "Constant-time PRG selection", which names `fss.prg.Sha256Prg` as the
+/// escape hatch: this export is what makes that sentence reachable from
+/// outside the module.
+pub const PirWith = pir_mod.PirWith;
+
 /// `Verified(domain_bits, word_bytes, tag_slack_bytes)` — the same protocol
 /// with **detection of a lying server**: a MACed tag channel that makes the
 /// client abort (`error.AnswerRejected`) instead of silently reconstructing a
@@ -109,6 +119,11 @@ pub const Pir = pir_mod.Pir;
 /// only — no recovery, no attribution, and colluding servers still defeat it
 /// (as they already defeat privacy). See `verify.zig`.
 pub const Verified = verify_mod.Verified;
+
+/// `Verified` with an explicitly chosen `fss` PRG, threaded through both the
+/// value channel and the tag channel's DPF. The counterpart of `PirWith` for
+/// the verified layer, and reachable as `PirWith(Prg, b, L).Verified(S)`.
+pub const VerifiedWith = verify_mod.VerifiedWith;
 
 /// A borrowed, fixed-record-length view over a database. See `db.zig`.
 pub const Database = db_mod.Database;
