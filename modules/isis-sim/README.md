@@ -66,9 +66,13 @@ netsim node *n* maps deterministically to the 6-octet system-id of `n + 1`
 terminates**. Afterwards it inspects the context: the fabric is **quiescent** when
 no node has any SRM (flood) or SSN (ack) flag set on an *up* circuit — flooding
 has fully drained and a further poll would send nothing. Quiescence within the cap
-⇒ `.converged`; otherwise `.step_cap_exceeded`. A non-quiescing fabric (an endless
-re-flood) would blow the cap — the quiescence test asserts the steady state
-explicitly.
+⇒ `.converged`. Everything else is reported as one of three *distinct* outcomes,
+because they are three different diagnoses: `.safety_violated` (a per-event
+invariant tripped — see `violation`), `.event_cap_exceeded` (the event ceiling
+stopped the run: a runaway), and `.not_quiescent` (the simulated-time horizon
+elapsed with flooding still pending — mere under-convergence). A non-quiescing
+fabric (an endless re-flood) blows the ceiling — the quiescence test asserts the
+steady state explicitly.
 
 ## API sketch
 
@@ -88,8 +92,10 @@ defer fab.deinit();
 try fab.failLink(0, 1);
 
 switch (try fab.runToConvergence(100_000)) {
-    .converged => {},                 // quiesced steady state
-    .step_cap_exceeded => unreachable, // did not settle within the cap
+    .converged => {},                  // quiesced steady state
+    .safety_violated => unreachable,   // a per-event invariant tripped
+    .event_cap_exceeded => unreachable, // runaway: the event ceiling stopped it
+    .not_quiescent => unreachable,     // did not settle within the horizon
 }
 
 // Inspect the converged state.

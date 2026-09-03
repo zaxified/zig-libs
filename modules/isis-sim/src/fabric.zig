@@ -203,6 +203,17 @@ pub const Options = struct {
     /// repair mechanism — which is what actually recovers a database after
     /// loss.
     csnp_interval: Time = csnp_interval,
+    /// The hard event-count ceiling handed to `netsim.Case.max_events_cap`. A
+    /// ≤6-node fabric processes a few hundred events, so the default is three
+    /// orders of magnitude of headroom and bounds memory against a
+    /// non-terminating bug rather than against a slow run.
+    ///
+    /// It is an option, not a constant, so that `.event_cap_exceeded` is
+    /// reachable from a test at all: with the default no scenario here comes
+    /// near it, and `runToConvergence`'s documented precedence over
+    /// `.not_quiescent` — a runaway is a different diagnosis from mere
+    /// under-convergence — was consequently pinned by nothing.
+    max_events_cap: u64 = 200_000,
 };
 
 // ── the Fabric (the Protocol context) ────────────────────────────────────────
@@ -701,7 +712,7 @@ pub const Fabric = struct {
             .until = max_steps,
             // A ≤6-node lossless fabric processes a few hundred events; this hard
             // ceiling bounds memory even against a non-terminating bug.
-            .max_events_cap = 200_000,
+            .max_events_cap = self.opts.max_events_cap,
         };
 
         g_active_fabric = self;
@@ -982,6 +993,45 @@ test "quiescence: a converged fabric has no pending SRM/SSN and would send nothi
         try testing.expect(fab.quiescent(node));
     }
     try testing.expect(fab.allQuiescent());
+}
+
+test "TEETH: a run stopped by the event ceiling is a RUNAWAY, not mere non-quiescence" {
+    // `Outcome` documents `.event_cap_exceeded` and `.not_quiescent` as different
+    // diagnoses — "a runaway/non-terminating condition, NOT a mere
+    // under-convergence within the simulated-time horizon". Both conditions hold
+    // at once on any run the ceiling stops (a run cut short has obviously not
+    // drained), so the distinction is carried entirely by the order of the two
+    // checks in `runToConvergence`, and nothing pinned that order: with the
+    // default ceiling of 200_000 no scenario in this file comes within three
+    // orders of magnitude of it, so the branch was unreachable from the suite and
+    // swapping the two lines left 20/20 green.
+    //
+    // Lowering the ceiling is what makes the branch reachable. Eight events is
+    // fewer than a 4-node line spends on its opening flood, so the run is cut off
+    // mid-flight with SRM still set everywhere.
+    var edges: [3]Edge = undefined;
+    const topo = lineTopology(&edges);
+
+    var starved = try Fabric.initWithOptions(testing.allocator, topo, 3, .{ .max_events_cap = 8 });
+    defer starved.deinit();
+    try testing.expectEqual(Outcome.event_cap_exceeded, try starved.runToConvergence(step_cap));
+    // The premise: it is NOT quiescent either, so `.not_quiescent` would also be a
+    // true statement about this run. Precedence is the whole content of the check.
+    try testing.expect(!starved.allQuiescent());
+
+    // Control — the identical fabric under the default ceiling converges, so the
+    // outcome above is the ceiling talking and not a broken topology.
+    var free = try Fabric.init(testing.allocator, topo, 3);
+    defer free.deinit();
+    try testing.expectEqual(Outcome.converged, try free.runToConvergence(step_cap));
+
+    // And the horizon is the other axis: a fabric given no simulated time at all
+    // has processed far too few events to trip the ceiling, so it must come back
+    // as plain non-quiescence. This is the arm that goes green under a swap only
+    // if the ceiling is genuinely not the reason.
+    var rushed = try Fabric.init(testing.allocator, topo, 3);
+    defer rushed.deinit();
+    try testing.expectEqual(Outcome.not_quiescent, try rushed.runToConvergence(1));
 }
 
 test "determinism: identical fabric + fault schedule yields identical final LSDBs" {
