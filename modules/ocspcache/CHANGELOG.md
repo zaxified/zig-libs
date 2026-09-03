@@ -5,6 +5,47 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — Drift re-audit. **The responder no longer chooses where the
+  fetch goes.** `httpFetch` left `http.Client`'s `follow_redirects` at its
+  DEFAULT of `true` (up to 10 hops), and `isHttpUrl` screens the AIA URI once
+  and is never re-applied to a redirect target — so a `302` pointed the fetch
+  at any host the responder named, and a `307`/`308` replayed the OCSP request
+  BODY there. Reproduced against two loopback servers. This is worse than an
+  attacker-supplied-certificate problem: OCSP is fetched over cleartext
+  `http://` by deployment, so any on-path attacker could aim it, against the
+  module's DOCUMENTED use — a server stapling its own certificate. Now refused,
+  and a redirect arrives as a non-200 status that `refresh` rejects as
+  `ResponderHttpError`.
+- **2026-09-03** — **An expired entry no longer holds a cache slot forever.**
+  `invalidate` and `deinit` were the only removals, so entries past their
+  `next_update_unix` — already unservable, since `getStapled` reports them
+  absent — occupied `max_entries` permanently. No attacker: the cache key is
+  the certificate and every ACME renewal makes a new one, so `max_entries`
+  renewals into a long-lived server `refresh` starts answering `CacheFull` for
+  the certificate actually being served and stapling silently stops,
+  unrecoverable short of `deinit`. `refresh` now reclaims expired entries
+  before refusing; `evictExpired` is public for an operator with its own tick.
+- **2026-09-03** — **The response-size ceiling is enforced by this module**, not
+  only by the `Transport` it hands `max_response_bytes` to. Every mock in this
+  repo ignores that field, so a third-party transport doing the same silently
+  removed the documented bound — and unplumbing it at the one call site left
+  the whole suite green.
+- **2026-09-03** — Docs: README claimed a `revoked` status "leaves any existing
+  cache entry untouched", contradicting both the code and its own example
+  thirty lines later; and the 2026-08-06 entry below claimed a live capture
+  from nginx/Apache that does not exist. Both corrected in place rather than
+  rewritten away.
+- **2026-09-03** — ⛔ **Recorded, NOT fixed.** `httpFetch` sets no deadline on the response BODY
+  (`total_timeout_ms` explicitly does not cover it), so a responder that sends
+  a head and goes quiet parks the refresh indefinitely — needs a
+  `Config.fetch_timeout_ms` plumbed through `io.concurrent`/`Future.cancel`.
+  The `verdict.next_update_unix orelse …` fallback has zero coverage: every
+  fixture carries a `nextUpdate`, so a legal RFC 6960 shape is never
+  exercised, and the synthesized-expiry constant is unpinned. The two fuzz
+  harnesses reach almost nothing in the deterministic lane (`fuzzRefresh` gets
+  `status = 0` and never reaches `ocsp.parseResponse`).
+
+
 - **2026-08-22** — `FetchError`/`RefreshError` gain `error.Canceled`, and `httpFetch`
   (the production `Transport` behind `httpTransport`) no longer folds a canceled
   `http.Client` call into `error.TransportFailed`. Both of its `catch` sites named
@@ -22,6 +63,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   (`expected error.Canceled, found error.TransportFailed`) and to pass restored,
   without disturbing the other. `zig build test-ocspcache` — 34/34.
 - **2026-08-06** — Security audit: six findings fixed, one documented as accepted (not
-  defects) — part of the collection-wide audit. Verified against a live capture from
-  nginx `ngx_ssl_stapling` / Apache `mod_ssl` stapling cache.
+  defects) — part of the collection-wide audit. ⚠ **This entry used to end
+  "Verified against a live capture from nginx `ngx_ssl_stapling` / Apache
+  `mod_ssl` stapling cache". There is no such capture** — corrected 2026-09-03.
+  What nginx/Apache are to this module is a *design* reference, which is what
+  `root.zig`'s `meta.model_after` actually says ("nginx/Apache OCSP-stapling
+  soft-fail **posture**"); the sentence was a template that renders a
+  C-reference-implementation field as a claim of a verified capture. The
+  module's real external anchor is the committed GoDaddy OCSP capture in
+  `src/goldens.zig`, independently accepted by `openssl ocsp -respin`.
 - **2026-07-22** — New module: OCSP-stapling fetch + cache on top of `ocsp`.

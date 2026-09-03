@@ -258,6 +258,27 @@ fn httpFetch(context: *anyopaque, gpa: std.mem.Allocator, req: FetchRequest) Fet
     var response = client.request(method, req.url, .{
         .headers = if (req.method == .post) &post_content_type_header else &.{},
         .body = if (req.method == .post) req.body else null,
+        // Whoever answers the responder URL must not get to choose where this
+        // fetch actually goes. `http.Client` follows up to 10 redirects by
+        // DEFAULT, and `isHttpUrl` screens the AIA URI once and is never
+        // re-applied to a redirect target -- so a `302` pointed the fetch at
+        // any host the responder named, and a `307`/`308` replayed the OCSP
+        // request BODY there. Reproduced against two loopback servers: the
+        // internal one was reached and answered.
+        //
+        // Worse than it looks, because of how OCSP is deployed: the responder
+        // is reached over cleartext `http://` (that is the AIA URI real CAs
+        // publish), so this is not only an attacker-supplied-certificate
+        // problem -- any on-path attacker can inject the redirect against the
+        // module's DOCUMENTED use, a server stapling its own certificate.
+        //
+        // Refusing is fail-closed and costs nothing: a redirect now arrives as
+        // a non-200 status and `refresh` rejects it as `ResponderHttpError`.
+        // A responder that genuinely moved is a CA operations change, not
+        // something a validator should chase at fetch time. Same posture the
+        // sibling `rdap` reached in this campaign, which sets the flag false
+        // and re-screens each hop itself.
+        .follow_redirects = false,
     }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => return error.TransportFailed,
@@ -465,6 +486,30 @@ pub const Cache = struct {
         return try gpa.dupe(u8, entry.response_der);
     }
 
+    /// Drop every entry that is past its `next_update_unix` at `now_unix`,
+    /// returning how many went. Such an entry is already unservable —
+    /// `getStapled` reports it as absent — so this reclaims dead weight, never
+    /// a response a caller could still staple.
+    ///
+    /// Called by `refresh` before it refuses with `CacheFull`; public so an
+    /// operator with its own maintenance tick can reclaim earlier.
+    pub fn evictExpired(self: *Cache, now_unix: i64) usize {
+        var victims: std.ArrayList(CacheKey) = .empty;
+        defer victims.deinit(self.gpa);
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            if (now_unix > kv.value_ptr.next_update_unix) {
+                // On allocation failure, evict what was collected so far: a
+                // partial reclaim is correct, just less of it.
+                victims.append(self.gpa, kv.key_ptr.*) catch break;
+            }
+        }
+        for (victims.items) |k| {
+            if (self.entries.fetchRemove(k)) |old_entry| self.gpa.free(old_entry.value.response_der);
+        }
+        return victims.items.len;
+    }
+
     /// Drop any cached response for `subject_cert_der`, returning whether
     /// there was one. `refresh` calls this itself on a verified `revoked`;
     /// it is public so an operator that learns of a revocation out of band
@@ -522,6 +567,14 @@ pub const Cache = struct {
         };
         defer self.gpa.free(resp.body);
 
+        // The size bound is this module's claim, so this module checks it.
+        // `max_response_bytes` is passed to the `Transport` and enforced
+        // THERE; a third-party transport that ignores the field -- as every
+        // mock in this repo does -- silently removed the bound, and unplumbing
+        // it at the one call site left the suite green. One comparison makes
+        // the documented ceiling true whoever supplies the transport.
+        if (resp.body.len > self.config.max_response_bytes) return error.ResponseTooLarge;
+
         if (resp.status != 200) return error.ResponderHttpError;
 
         const parsed = ocsp.parseResponse(resp.body) catch return error.Malformed;
@@ -555,7 +608,18 @@ pub const Cache = struct {
         const key = keyOf(subject_cert_der);
 
         if (!self.entries.contains(key) and self.entries.count() >= self.config.max_entries) {
-            return error.CacheFull;
+            // Reclaim what is already unservable before refusing. An entry
+            // past its `next_update_unix` can never be returned again --
+            // `getStapled` reports it as absent by the identical test -- yet
+            // nothing dropped it, so it held a slot forever.
+            //
+            // No attacker needed, and the failure is silent: the cache key is
+            // the certificate, and every ACME renewal produces a new one. In a
+            // long-lived server, `max_entries` renewals later `refresh` starts
+            // answering `CacheFull` for the CURRENT certificate and stapling
+            // simply stops -- unrecoverable short of `deinit`.
+            _ = self.evictExpired(now_unix);
+            if (self.entries.count() >= self.config.max_entries) return error.CacheFull;
         }
 
         const owned = self.gpa.dupe(u8, resp.body) catch return error.OutOfMemory;
@@ -577,6 +641,65 @@ pub const Cache = struct {
 // ════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+
+test "an expired entry does not hold a cache slot forever" {
+    // Nothing in this module ever removed an entry past its `next_update_unix`
+    // -- `invalidate` and `deinit` were the only removals -- so unservable
+    // entries occupied `max_entries` permanently. No attacker is involved and
+    // the failure is silent: the cache key is the CERTIFICATE, and every ACME
+    // renewal produces a new one, so `max_entries` renewals into a long-lived
+    // server `refresh` starts answering `CacheFull` for the certificate the
+    // server is actually serving, and stapling just stops.
+    //
+    // What makes the reclaim safe is that these entries are already gone as
+    // far as any caller can tell: `getStapled` answers `null` for them by the
+    // identical `now_unix > next_update_unix` test. That equivalence is
+    // asserted here, not assumed -- if the two tests ever drift apart, this
+    // eviction would start dropping responses a caller could still staple.
+    // The transport is never reached: this test drives the cache directly.
+    const Never = struct {
+        fn fetch(_: *anyopaque, _: std.mem.Allocator, _: FetchRequest) FetchError!FetchResponse {
+            return error.TransportFailed;
+        }
+    };
+    var dummy: u8 = 0;
+    var cache = Cache.init(testing.allocator, .{ .context = &dummy, .fetchFn = Never.fetch }, .{ .max_entries = 2 });
+    defer cache.deinit();
+
+    const live_cert = "live-certificate-der";
+    const dead_cert = "dead-certificate-der";
+    const now: i64 = 1_800_000_000;
+
+    try cache.entries.put(testing.allocator, keyOf(live_cert), .{
+        .response_der = try testing.allocator.dupe(u8, "live"),
+        .this_update_unix = now - 100,
+        .next_update_unix = now + 100,
+    });
+    try cache.entries.put(testing.allocator, keyOf(dead_cert), .{
+        .response_der = try testing.allocator.dupe(u8, "dead"),
+        .this_update_unix = now - 1000,
+        .next_update_unix = now - 1,
+    });
+
+    // Full, and one of the two is already unservable.
+    try testing.expectEqual(@as(usize, 2), cache.entries.count());
+    try testing.expect(cache.entries.count() >= cache.config.max_entries);
+    try testing.expect((try cache.getStapled(testing.allocator, dead_cert, now)) == null);
+
+    try testing.expectEqual(@as(usize, 1), cache.evictExpired(now));
+
+    // Room again, and the live entry is untouched -- both halves matter: an
+    // eviction that also took the live one would "fix" the cap by breaking
+    // stapling for the certificate in use.
+    try testing.expectEqual(@as(usize, 1), cache.entries.count());
+    try testing.expect(cache.entries.count() < cache.config.max_entries);
+    const still = (try cache.getStapled(testing.allocator, live_cert, now)).?;
+    defer testing.allocator.free(still);
+    try testing.expectEqualStrings("live", still);
+
+    // Idempotent: nothing left to reclaim.
+    try testing.expectEqual(@as(usize, 0), cache.evictExpired(now));
+}
 
 test "parseAiaOcspUrl: single AccessDescription, id-ad-ocsp with a URI" {
     const url = "http://ocsp.example.org/";
@@ -731,6 +854,112 @@ const CancelTestPeer = struct {
 
 fn fetchOnce(transport: Transport, gpa: std.mem.Allocator, req: FetchRequest) FetchError!FetchResponse {
     return transport.fetch(gpa, req);
+}
+
+/// One-shot loopback peer for the redirect test. `redirect_to_port` non-null:
+/// answer `302` pointing at that port. Null: this is the "internal service"
+/// that must never be reached -- it counts only connections that actually send
+/// a request line, so the throwaway wake-up connection below is not miscounted.
+const RedirectTestPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    redirect_to_port: ?u16,
+    hits: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *RedirectTestPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        p.hits.store(1, .release);
+        // Answer without reading the request, exactly as `CancelTestPeer`
+        // does: the client is waiting on the head, and a peer that tries to
+        // read first can deadlock against a client that is not yet flushing.
+        var wbuf: [256]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        if (p.redirect_to_port) |port| {
+            var hbuf: [160]u8 = undefined;
+            const head = std.fmt.bufPrint(
+                &hbuf,
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/\r\nContent-Length: 0\r\n\r\n",
+                .{port},
+            ) catch return;
+            sw.interface.writeAll(head) catch {};
+        } else {
+            sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nSECRET") catch {};
+        }
+        sw.interface.flush() catch {};
+    }
+};
+
+test "httpFetch does NOT follow a responder's redirect (the responder does not choose the destination)" {
+    // `http.Client` follows up to 10 redirects by DEFAULT, and `isHttpUrl`
+    // screens the AIA URI once and is never re-applied to a redirect target --
+    // so whoever answered the responder URL chose where the fetch actually
+    // went. OCSP is fetched over cleartext `http://` by deployment (that is
+    // the AIA URI real CAs publish), so this was reachable by any on-path
+    // attacker against the module's DOCUMENTED use, a server stapling its own
+    // certificate; it did not need an attacker-supplied certificate at all.
+    //
+    // Two loopback peers: one redirects to the other, and the other must never
+    // be reached.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var internal = addr.listen(io, .{}) catch return error.SkipZigTest;
+    defer internal.deinit(io);
+    const internal_port = internal.socket.address.getPort();
+
+    var responder = addr.listen(io, .{}) catch return error.SkipZigTest;
+    defer responder.deinit(io);
+    const responder_port = responder.socket.address.getPort();
+
+    var internal_peer: RedirectTestPeer = .{ .io = io, .listener = &internal, .redirect_to_port = null };
+    var responder_peer: RedirectTestPeer = .{ .io = io, .listener = &responder, .redirect_to_port = internal_port };
+    const t_internal = try std.Thread.spawn(.{}, RedirectTestPeer.run, .{&internal_peer});
+    const t_responder = try std.Thread.spawn(.{}, RedirectTestPeer.run, .{&responder_peer});
+
+    var client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    const transport = httpTransport(&client);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{responder_port});
+    const resp = transport.fetch(testing.allocator, .{ .url = url, .max_response_bytes = 4096 }) catch |e| {
+        // Wake the peers before failing, or the joins below hang.
+        wakePort(io, internal_port);
+        wakePort(io, responder_port);
+        t_internal.join();
+        t_responder.join();
+        return e;
+    };
+    defer testing.allocator.free(resp.body);
+
+    // The internal peer is read BEFORE it is woken: the wake-up connection is
+    // an accept like any other, so counting it would mask the very thing under
+    // test. At this point the fetch has returned, so if the redirect had been
+    // chased the counter would already be set.
+    const internal_hits = internal_peer.hits.load(.acquire);
+
+    // Closing a listener does NOT wake a peer parked in `accept` under
+    // `std.Io.Threaded` -- a throwaway connection is what does.
+    wakePort(io, internal_port);
+    t_responder.join();
+    t_internal.join();
+
+    // The redirect is surfaced as a status, not chased...
+    try testing.expectEqual(@as(u16, 302), resp.status);
+    // ...and the host it named was never contacted.
+    try testing.expectEqual(@as(u32, 0), internal_hits);
+    try testing.expectEqual(@as(u32, 1), responder_peer.hits.load(.acquire));
+}
+
+/// Open and immediately close a loopback connection, purely to wake a peer
+/// parked in `accept`.
+fn wakePort(io: std.Io, port: u16) void {
+    const a = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return;
+    const s = a.connect(io, .{ .mode = .stream }) catch return;
+    s.close(io);
 }
 
 test "httpFetch: a canceled connect/head wait surfaces error.Canceled, not error.TransportFailed" {

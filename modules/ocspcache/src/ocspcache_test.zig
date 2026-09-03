@@ -453,6 +453,40 @@ test "Cache.refresh: fetches, verifies and caches a good response; getStapled se
     try testing.expectEqualSlices(u8, good_response, staple);
 }
 
+test "Cache.refresh: the size ceiling is the MODULE's, not the transport's" {
+    // `max_response_bytes` is handed to the `Transport` and enforced there.
+    // Every mock in this repo ignores the field -- which is exactly the point:
+    // a third-party transport that does the same silently removed the module's
+    // documented memory bound, and unplumbing it at the one call site left the
+    // whole suite green. `refresh` now checks the body it was handed.
+    const gpa = testing.allocator;
+
+    var mock: MockTransport = .{ .status = 200, .body = good_response };
+    defer mock.deinit(gpa);
+    var cache = ocspcache.Cache.init(gpa, mock.transport(), .{
+        .refresh_margin_seconds = margin,
+        .max_response_bytes = good_response.len - 1,
+    });
+    defer cache.deinit();
+
+    const now = this_update_unix + 100;
+    try testing.expectError(error.ResponseTooLarge, cache.refresh(subject_with_aia, issuer_der, now));
+    // Refused before parsing, and nothing cached.
+    try testing.expect((try cache.getStapled(gpa, subject_with_aia, now)) == null);
+
+    // One byte of headroom and the identical response is accepted, so the
+    // check is a ceiling and not a blanket refusal.
+    var cache_ok = ocspcache.Cache.init(gpa, mock.transport(), .{
+        .refresh_margin_seconds = margin,
+        .max_response_bytes = good_response.len,
+    });
+    defer cache_ok.deinit();
+    try cache_ok.refresh(subject_with_aia, issuer_der, now);
+    const staple = (try cache_ok.getStapled(gpa, subject_with_aia, now)).?;
+    defer gpa.free(staple);
+    try testing.expectEqualSlices(u8, good_response, staple);
+}
+
 test "Cache.needsRefresh/getStapled: refresh-margin proactive flip vs actual nextUpdate expiry" {
     const gpa = testing.allocator;
 

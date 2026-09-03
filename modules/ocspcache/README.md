@@ -14,9 +14,13 @@ URL from a certificate's Authority Information Access extension (RFC 5280
 through an injectable `Transport` (POST by default, RFC 6960 §4.2.1; or the
 GET form, Appendix A.1.1), and — only if `ocsp.verify` accepts the response
 **and** its status is `good` — caches the raw bytes; every other outcome
-(unreachable responder, `tryLater`, a bad signature, a `revoked`/`unknown`
-status) is a typed error that leaves any existing cache entry untouched (the
-soft-fail posture). `Cache.getStapled` serves the cached DER while it's
+(unreachable responder, `tryLater`, a bad signature, an `unknown` status) is a
+typed error that leaves any existing cache entry untouched — the soft-fail
+posture. ⚠ **`revoked` is the exception, and deliberately so:** it is an
+authenticated answer rather than an absence of one, so it EVICTS the cached
+entry and returns `error.CertRevoked`. (This paragraph said "revoked/unknown …
+untouched" until 2026-09-03, contradicting both the code and the example thirty
+lines below it, which already said the entry had been evicted.) `Cache.getStapled` serves the cached DER while it's
 genuinely still valid; `Cache.needsRefresh` tells a scheduler when to call
 `refresh` again, ahead of actual expiry. `zig build test-ocspcache` (Debug +
 ReleaseFast) covers AIA discovery (present/absent/malformed),
