@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — Handle `xmldsig.c14n`'s new `error.MaxDepthExceeded` at all
+  three `canonicalize` call sites (two on the signing path, one on the artifact
+  -response path). `c14n` gained a depth bound because its `writeElement`
+  recurses on the machine stack; nothing this module signs is near the limit,
+  so it folds into `SigningAssemblyFailed` on the signing side and
+  `MalformedSoap` for an inbound artifact response.
+
+
 - **2026-08-22** — Re-exported `VerifyKey`. It is the type of `Config.idp_key`, a field on
   this module's own public config, but `xmldsig` was imported privately here, so a consumer
   had to take a direct dependency on `xmldsig` just to name the value it hands to `saml`.

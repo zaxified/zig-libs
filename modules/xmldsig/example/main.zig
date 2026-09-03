@@ -6,6 +6,17 @@
 //! reference-digest level, and see a structurally-wrong input rejected by
 //! name rather than panicking.
 //!
+//! ⚠ **What this file deliberately does NOT show, and what a relying party
+//! must not omit: the coverage check.** `res.valid` says a signature
+//! verified; it does not say the signature covered the element the caller
+//! goes on to trust. Closing that gap is the caller's job — match the
+//! element's `ID` against a `Reference` whose `digest_valid` is true, the way
+//! `saml.signedTargetMatches` does, and treat a miss as signature wrapping
+//! (XSW). Everything below verifies a whole single-assertion document with
+//! one reference, which is the case where the check is trivially satisfied
+//! and therefore the case that teaches nothing about it. `README.md` step 4
+//! spells it out.
+//!
 //! External judge: `xmlsec1` (C, OpenSSL backend), a genuinely independent
 //! XML-Signature implementation. Both fixtures below are copied verbatim
 //! from `modules/xmldsig/src/test_external.zig`, which documents the exact

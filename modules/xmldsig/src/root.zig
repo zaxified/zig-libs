@@ -107,6 +107,20 @@ pub const Options = struct {
     /// Permit the legacy, cryptographically weak SHA-1 digest and RSA-SHA1
     /// signature algorithms. Off by default; enable only for legacy interop.
     allow_weak_sha1: bool = false,
+    /// Most `<ds:Reference>` elements one `<ds:Signature>` may carry.
+    ///
+    /// The reference loop runs BEFORE the `SignedInfo` signature is checked --
+    /// it has to, since the digests are what the signature covers -- so every
+    /// reference in an unauthenticated document is work an attacker chose. Each
+    /// one canonicalizes its target, and `URI=""` makes the target the whole
+    /// document, so `R` references cost `R` full canonical copies of the input.
+    /// Measured before this cap, in ReleaseFast: 286 KB of garbage-signed XML
+    /// with 2000 references reached **2.67 GB resident and 7.8 s of CPU**, an
+    /// amplification of 9323x, growing quadratically. `saml` reaches this
+    /// directly from an unauthenticated POST-binding `<Response>`.
+    ///
+    /// A real SAML assertion carries one reference; eight is already generous.
+    max_references: usize = 8,
     /// If set, `URI="#value"` references are resolved by matching this
     /// unqualified attribute's local name instead of the parser's ID heuristic
     /// (`getElementById`). SAML profiles that use a non-standard ID attribute
@@ -158,6 +172,16 @@ pub const VerifyError = error{
     /// The element is not a well-formed `ds:Signature` (missing SignedInfo,
     /// SignatureValue, Reference, DigestValue, required attributes, …).
     MalformedSignature,
+    /// More `<ds:Reference>` elements than `Options.max_references`. Refused
+    /// before any of them is canonicalized — see that field for the
+    /// pre-authentication amplification this bounds.
+    TooManyReferences,
+    /// Element nesting deeper than `c14n.Options.max_depth`. Canonicalization
+    /// recurses on the machine stack, so without this the only bound was the
+    /// `xml.Options.max_depth` the document was parsed with — a supported knob
+    /// whose own parser keeps its stack on the heap, so raising it was safe for
+    /// `xml` and a SIGSEGV here (measured: depth 36 000 in ReleaseFast).
+    MaxDepthExceeded,
     /// A named C14N / digest / signature / transform algorithm is not on the
     /// allow-list (or SHA-1 used without `allow_weak_sha1`).
     UnsupportedAlgorithm,
@@ -265,6 +289,55 @@ const WipingAllocator = struct {
     }
 };
 
+/// Test-only: a pass-through allocator that records peak LIVE bytes. Used to
+/// pin the per-reference arena reset -- a cumulative counter (std's
+/// `FailingAllocator.allocated_bytes`) cannot see the difference between
+/// "eight copies, one at a time" and "eight copies at once", which is exactly
+/// the property under test.
+const PeakAllocator = struct {
+    child: std.mem.Allocator,
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *PeakAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocFn,
+            .resize = resizeFn,
+            .remap = remapFn,
+            .free = freeFn,
+        } };
+    }
+    fn note(self: *PeakAllocator) void {
+        if (self.live > self.peak) self.peak = self.live;
+    }
+    fn allocFn(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, al, ra) orelse return null;
+        self.live += len;
+        self.note();
+        return p;
+    }
+    fn resizeFn(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(m, al, new_len, ra)) return false;
+        self.live = self.live - m.len + new_len;
+        self.note();
+        return true;
+    }
+    fn remapFn(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(m, al, new_len, ra) orelse return null;
+        self.live = self.live - m.len + new_len;
+        self.note();
+        return p;
+    }
+    fn freeFn(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        self.live -= m.len;
+        self.child.rawFree(m, al, ra);
+    }
+};
+
 // ── entry point ─────────────────────────────────────────────────────────────
 
 /// Verify the `ds:Signature` element `signature` within `doc`.
@@ -319,13 +392,31 @@ pub fn verify(
 
     var all_refs_valid = true;
     var saw_reference = false;
+
+    // A reference's canonical form is scratch: nothing survives the call but
+    // `RefResult`, whose `uri` points into the DOCUMENT and whose
+    // `digest_valid` is a bool. Giving each reference its own arena, reset
+    // after it, bounds the peak at ONE canonical copy instead of R of them --
+    // the `verify` arena is released only on return, so every reference's copy
+    // was held simultaneously. `.free_all` rather than `.retain_capacity`:
+    // the blocks must go back through `wiping` (CONVENTIONS §2.1 Z1), and a
+    // retained block is a decrypted assertion's canonical form left in memory.
+    var ref_arena_state = std.heap.ArenaAllocator.init(wiping.allocator());
+    defer ref_arena_state.deinit();
+    const ref_arena = ref_arena_state.allocator();
+
+    var n_refs: usize = 0;
     for (signed_info.children) |child| switch (child.content) {
         .element => |ref_el| {
             if (!isDs(ref_el, "Reference")) continue;
+            n_refs += 1;
+            // Counted and refused BEFORE the canonicalization it would pay for.
+            if (n_refs > options.max_references) return error.TooManyReferences;
             saw_reference = true;
-            const rr = try validateReference(arena, doc, signature, ref_el, options);
+            const rr = try validateReference(ref_arena, doc, signature, ref_el, options);
             if (!rr.digest_valid) all_refs_valid = false;
             try refs.append(alloc, rr);
+            _ = ref_arena_state.reset(.free_all);
         },
         else => {},
     };
@@ -334,6 +425,7 @@ pub fn verify(
     // ── Signature validation over canonicalized SignedInfo ───────────────────
     const si_c14n = c14n.canonicalize(arena, signed_info, .{ .mode = si_mode }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.MaxDepthExceeded => return error.MaxDepthExceeded,
     };
     const sig_bytes = try decodeBase64(arena, try textOf(arena, signature_value_el));
     const sig_ok = try verifySignature(sig_alg, options.key, si_c14n, sig_bytes);
@@ -409,6 +501,36 @@ fn validateReference(
     const dv_el = childByName(ref_el, "DigestValue") orelse return error.MalformedSignature;
     const expected_digest = try decodeBase64(arena, try textOf(arena, dv_el));
 
+    // `URI=""` is the whole DOCUMENT node-set, and this module canonicalizes
+    // from `doc.root` down -- so anything in the prolog or epilog is outside
+    // the digest while the caller is told the whole document was signed. A
+    // processing instruction there is always part of the canonical form (a
+    // comment only in the `WithComments` modes), so an attacker could inject
+    // e.g. `<?xml-stylesheet href="http://evil"?>` into a validly signed
+    // document and this still reported `valid`. Confirmed against xmlsec1 on
+    // the module's own committed fixture: xmlsec1 answers
+    // `FAILED / reason: REFERENCE` for the same bytes we accepted.
+    //
+    // ⚠ Refused rather than canonicalized. `xml.Document` does expose `prolog`
+    // and `epilog`, so covering them properly is possible and is the right
+    // end state -- it needs C14N's own prolog/epilog newline rules
+    // (RFC 3076 §2.5) and should be diffed against `xmllint --c14n`, which is
+    // how this module's other 180 C14N cases were checked. Until then,
+    // refusing is fail-closed and cannot forge: what it costs is a document
+    // that legitimately carries a prolog PI, which no fixture here does.
+    if (uri.len == 0) {
+        for (doc.prolog) |misc| switch (misc.content) {
+            .pi => return error.UriNotResolved,
+            .comment => if (mode.withComments()) return error.UriNotResolved,
+            else => {},
+        };
+        for (doc.epilog) |misc| switch (misc.content) {
+            .pi => return error.UriNotResolved,
+            .comment => if (mode.withComments()) return error.UriNotResolved,
+            else => {},
+        };
+    }
+
     // Canonicalize the (transformed) referenced subtree and digest it.
     const canon = c14n.canonicalize(arena, target, .{
         .mode = mode,
@@ -416,6 +538,7 @@ fn validateReference(
         .omit = omit,
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
+        error.MaxDepthExceeded => return error.MaxDepthExceeded,
     };
     const got_digest = try computeDigest(arena, dig_alg, canon);
 
@@ -1147,6 +1270,246 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     defer short_res.deinit(a);
     try testing.expect(!short_res.valid);
     try testing.expect(short_res.references[0].digest_valid); // structurally fine up to the signature
+}
+
+test "verify: a prolog PI is not silently outside a URI=\"\" signature" {
+    // `URI=""` is the whole DOCUMENT node-set. This module canonicalizes from
+    // `doc.root` down, so a processing instruction in the prolog or epilog was
+    // outside the digest while the caller was told the whole document was
+    // signed -- an attacker could inject `<?xml-stylesheet href="http://evil"?>`
+    // into a validly signed document and it still verified. xmlsec1 answers
+    // `FAILED / reason: REFERENCE` for the same bytes.
+    //
+    // Refused rather than covered (see `validateReference`): fail-closed, and
+    // the assertion is BOTH sides -- the untouched document must still verify,
+    // or "refuse everything" would pass the first half on its own.
+    const a = testing.allocator;
+    var sd = try buildSignedRsaDoc(a, false, false);
+    defer sd.deinit(a);
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+
+    {
+        var doc = try xml.parse(a, sd.xml, .{});
+        defer doc.deinit();
+        const sig = childByName(doc.root, "Signature").?;
+        var res = try verify(a, &doc, sig, .{ .key = .{ .rsa = pk } });
+        defer res.deinit(a);
+        try testing.expect(res.valid);
+    }
+
+    // The identical signature, with a PI prepended. Nothing the signature
+    // covers has changed -- which is exactly why this used to pass.
+    {
+        // Not `<?xml-stylesheet ...?>` at offset 0: the parser reads a leading
+        // `<?xml` as the XML declaration and refuses it as a malformed PI, so
+        // the test would pass for the wrong reason. Any other target is a
+        // genuine prolog PI and is exactly as injectable.
+        const injected = try std.fmt.allocPrint(a, "<?evil href=\"http://evil.example/x.xsl\"?>{s}", .{sd.xml});
+        defer a.free(injected);
+        var doc = try xml.parse(a, injected, .{});
+        defer doc.deinit();
+        const sig = childByName(doc.root, "Signature").?;
+        try testing.expectError(error.UriNotResolved, verify(a, &doc, sig, .{ .key = .{ .rsa = pk } }));
+    }
+}
+
+test "verify: the reference count is capped, and the cap is paid BEFORE the canonicalization it bounds" {
+    // The reference loop runs before the `SignedInfo` signature is checked --
+    // it has to, since the digests are what the signature covers -- so every
+    // reference in an unauthenticated document is work an attacker chose. Each
+    // canonicalizes its target, `URI=""` makes that the whole document, and the
+    // `verify` arena is released only on return, so R references held R full
+    // canonical copies at once. Measured in ReleaseFast before the fix: 286 KB
+    // of garbage-signed XML with 2000 references reached 2.67 GB resident and
+    // 7.8 s of CPU -- 9323x amplification, quadratic. `saml` reaches this from
+    // an unauthenticated POST-binding `<Response>`, so it is pre-auth there
+    // too.
+    //
+    // Everything below is garbage `DigestValue`/`SignatureValue`: the point is
+    // that the refusal happens without any of it mattering.
+    const a = testing.allocator;
+    const head =
+        "<Envelope xmlns=\"urn:demo\">" ++
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" ++
+        "<ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>";
+    const one_ref =
+        "<ds:Reference URI=\"\">" ++
+        "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+        "<ds:DigestValue>AAAA</ds:DigestValue>" ++
+        "</ds:Reference>";
+    const tail =
+        "</ds:SignedInfo>" ++
+        "<ds:SignatureValue>AAAA</ds:SignatureValue>" ++
+        "</ds:Signature>" ++
+        "</Envelope>";
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+
+    // One past the cap: refused by name.
+    {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(a);
+        try src.appendSlice(a, head);
+        for (0..9) |_| try src.appendSlice(a, one_ref);
+        try src.appendSlice(a, tail);
+        var doc = try xml.parse(a, src.items, .{});
+        defer doc.deinit();
+        const sig = childByName(doc.root, "Signature").?;
+        try testing.expectError(error.TooManyReferences, verify(a, &doc, sig, .{ .key = .{ .rsa = pk } }));
+    }
+
+    // Exactly at the cap: NOT refused for being too many. It fails later, on
+    // the garbage digests -- which is the whole point of asserting both sides:
+    // a cap that rejected everything would pass the first half alone.
+    {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(a);
+        try src.appendSlice(a, head);
+        for (0..8) |_| try src.appendSlice(a, one_ref);
+        try src.appendSlice(a, tail);
+        var doc = try xml.parse(a, src.items, .{});
+        defer doc.deinit();
+        const sig = childByName(doc.root, "Signature").?;
+        var res = try verify(a, &doc, sig, .{ .key = .{ .rsa = pk } });
+        defer res.deinit(a);
+        try testing.expect(!res.valid);
+        try testing.expectEqual(@as(usize, 8), res.references.len);
+    }
+}
+
+test "verify: one reference's canonical form does not outlive it" {
+    // The cap bounds how MANY references are processed; this bounds what each
+    // one costs. Before the per-reference arena, every reference's canonical
+    // copy was held until `verify` returned, so peak memory was R copies of the
+    // document rather than one. A counting allocator is the observable: the
+    // eight-reference document below must not cost eight documents' worth.
+    const a = testing.allocator;
+    var peak_alloc: PeakAllocator = .{ .child = a };
+    const head =
+        "<Envelope xmlns=\"urn:demo\">" ++
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" ++
+        "<ds:SignedInfo>" ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>";
+    const one_ref =
+        "<ds:Reference URI=\"\">" ++
+        "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+        "<ds:DigestValue>AAAA</ds:DigestValue>" ++
+        "</ds:Reference>";
+    const tail =
+        "</ds:SignedInfo>" ++
+        "<ds:SignatureValue>AAAA</ds:SignatureValue>" ++
+        "</ds:Signature>" ++
+        "</Envelope>";
+
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, head);
+    for (0..8) |_| try src.appendSlice(a, one_ref);
+    try src.appendSlice(a, tail);
+
+    var doc = try xml.parse(a, src.items, .{});
+    defer doc.deinit();
+    const sig = childByName(doc.root, "Signature").?;
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+
+    var res = try verify(peak_alloc.allocator(), &doc, sig, .{ .key = .{ .rsa = pk } });
+    defer res.deinit(peak_alloc.allocator());
+
+    // Peak LIVE bytes, not cumulative: a cumulative counter cannot tell
+    // "eight copies, one at a time" from "eight copies at once", which is
+    // exactly the property under test.
+    // Measured on this document, both arms in one run: **89 180 bytes without
+    // the per-reference reset, 12 602 with it** -- 59x the input versus 8.4x.
+    // The bound sits between them with room on both sides, so it fails if the
+    // reset is removed and does not fail on allocator block-sizing noise.
+    try testing.expect(peak_alloc.peak < 20 * src.items.len);
+}
+
+// Four guards this module advertises that no test pinned: each mutation below
+// left `test-xmldsig` and `test-saml` fully green, so every one of them could
+// have been deleted or inverted silently. The corpus is valid signatures, and
+// a valid-only corpus cannot exercise a refusal.
+const blind_guard_head =
+    "<Envelope xmlns=\"urn:demo\">" ++
+    "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">" ++
+    "<ds:SignedInfo>";
+const blind_guard_tail =
+    "</ds:SignedInfo>" ++
+    "<ds:SignatureValue>AAAA</ds:SignatureValue>" ++
+    "</ds:Signature>" ++
+    "</Envelope>";
+
+fn expectVerifyError(src: []const u8, want: anyerror) !void {
+    const a = testing.allocator;
+    var doc = try xml.parse(a, src, .{});
+    defer doc.deinit();
+    const sig = childByName(doc.root, "Signature").?;
+    const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
+    try testing.expectError(want, verify(a, &doc, sig, .{ .key = .{ .rsa = pk } }));
+}
+
+test "verify: RSA-SHA1 as the SIGNATURE method is refused, not just SHA-1 as the digest" {
+    // `allow_weak_sha1` gates both, but only the `DigestMethod` half had a
+    // test -- so the signature-method downgrade could be removed with the
+    // suite green, and an attacker who can produce a SHA-1 collision on
+    // SignedInfo is exactly who that gate is for.
+    try expectVerifyError(blind_guard_head ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#rsa-sha1\"/>" ++
+        "<ds:Reference URI=\"\">" ++
+        "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+        "<ds:DigestValue>AAAA</ds:DigestValue>" ++
+        "</ds:Reference>" ++ blind_guard_tail, error.UnsupportedAlgorithm);
+}
+
+test "verify: an external reference URI is refused, not resolved to the local document" {
+    // `resolveReference` refuses anything that is not `#id` or empty. Replacing
+    // that refusal with `return doc.root` made an `http://` reference silently
+    // canonicalize the LOCAL document -- so a signature over a remote resource
+    // would be reported as covering this one -- and no test noticed.
+    try expectVerifyError(blind_guard_head ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
+        "<ds:Reference URI=\"http://evil.example/other.xml\">" ++
+        "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+        "<ds:DigestValue>AAAA</ds:DigestValue>" ++
+        "</ds:Reference>" ++ blind_guard_tail, error.UriNotResolved);
+}
+
+test "verify: a signature with NO Reference is malformed, not vacuously valid" {
+    // Without this, a `<ds:Signature>` whose `SignedInfo` carries no
+    // `<ds:Reference>` at all reported `valid = true` on the strength of the
+    // SignedInfo signature alone -- a signature that covers nothing.
+    try expectVerifyError(blind_guard_head ++
+        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
+        blind_guard_tail, error.MalformedSignature);
+}
+
+test "verify: an unknown algorithm URI is refused by every allow-list, not defaulted" {
+    // Three allow-lists (`mapC14n`, `mapSig`, the digest map) all answered
+    // `UnsupportedAlgorithm`, and all three could be replaced by a silent
+    // default with the suite green -- only the TRANSFORM allow-list was
+    // pinned. A silent default is an algorithm-confusion primitive.
+    const good_c14n = "http://www.w3.org/2001/10/xml-exc-c14n#";
+    const good_sig = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+    const good_dig = "http://www.w3.org/2001/04/xmlenc#sha256";
+    const evil = "urn:evil:not-an-algorithm";
+    inline for (.{
+        .{ evil, good_sig, good_dig },
+        .{ good_c14n, evil, good_dig },
+        .{ good_c14n, good_sig, evil },
+    }) |algs| {
+        try expectVerifyError(blind_guard_head ++
+            "<ds:CanonicalizationMethod Algorithm=\"" ++ algs[0] ++ "\"/>" ++
+            "<ds:SignatureMethod Algorithm=\"" ++ algs[1] ++ "\"/>" ++
+            "<ds:Reference URI=\"\">" ++
+            "<ds:DigestMethod Algorithm=\"" ++ algs[2] ++ "\"/>" ++
+            "<ds:DigestValue>AAAA</ds:DigestValue>" ++
+            "</ds:Reference>" ++ blind_guard_tail, error.UnsupportedAlgorithm);
+    }
 }
 
 test "verify: unsupported transform (XPath) is rejected" {

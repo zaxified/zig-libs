@@ -59,9 +59,22 @@ pub const Options = struct {
     /// subtree (the enveloped-signature transform). `null` = canonicalize the
     /// entire subtree.
     omit: ?*const xml.Element = null,
+    /// Deepest element nesting this will descend.
+    ///
+    /// `writeElement` recurses once per level on the machine stack, so the only
+    /// thing that bounded it was the `xml.Options.max_depth` the DOCUMENT was
+    /// parsed with -- and that is an explicitly supported knob, while `xml`'s
+    /// own parser keeps its stack on the heap. Raising it is therefore safe for
+    /// `xml` and fatal here. Measured in ReleaseFast on an 8 MiB stack: depth
+    /// 32 000 canonicalizes, depth 36 000 is a SIGSEGV; in Debug the crash
+    /// arrives between 4 000 and 8 000. `SPEC.md`'s "no input path panics" was
+    /// false for any caller that raised the parser's limit.
+    ///
+    /// 256 matches `xml`'s own default, and is far past any real signature.
+    max_depth: usize = 256,
 };
 
-pub const Error = std.mem.Allocator.Error;
+pub const Error = std.mem.Allocator.Error || error{MaxDepthExceeded};
 
 /// Canonicalize the subtree rooted at `root` and return freshly-allocated
 /// UTF-8 bytes owned by the caller (`alloc`).
@@ -141,6 +154,8 @@ const Writer = struct {
     }
 
     fn writeElement(self: *Writer, el: *const xml.Element, depth: usize, is_apex: bool) Error!void {
+        // Bound the machine-stack recursion before descending, not after.
+        if (depth > self.options.max_depth) return error.MaxDepthExceeded;
         // 1. Decide which namespace declarations to emit at this element.
         var ns_out: std.ArrayList(NsOut) = .empty;
         defer ns_out.deinit(self.alloc);
@@ -448,6 +463,40 @@ fn findLocal(el: *xml.Element, local: []const u8) ?*xml.Element {
 
 // Exclusive C14N spec (§2.3, Example 1): the ancestor n0 namespace is NOT
 // visibly utilized by elem1, so it is pruned.  [W3C xml-exc-c14n]
+test "canonicalize: nesting past max_depth is a typed error, not a stack overflow" {
+    // `writeElement` recurses on the machine stack. The only bound was the
+    // `xml.Options.max_depth` the DOCUMENT was parsed with -- an explicitly
+    // supported knob, and `xml`'s own parser keeps its stack on the heap, so
+    // raising it is safe for `xml` and fatal here. Measured in ReleaseFast on
+    // an 8 MiB stack before this bound: depth 32 000 canonicalized, depth
+    // 36 000 was a SIGSEGV (exit 139); in Debug the crash arrived between
+    // 4 000 and 8 000.
+    //
+    // Both directions are asserted: a document at the limit must still
+    // canonicalize, or a bound of zero would pass the refusal half alone.
+    const a = std.testing.allocator;
+    const deep = 40;
+
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    for (0..deep) |_| try src.appendSlice(a, "<a>");
+    for (0..deep) |_| try src.appendSlice(a, "</a>");
+
+    var doc = try xml.parse(a, src.items, .{ .max_depth = deep + 8 });
+    defer doc.deinit();
+
+    // At the limit: fine.
+    const ok = try canonicalize(a, doc.root, .{ .mode = .exclusive, .max_depth = deep });
+    defer a.free(ok);
+    try std.testing.expect(ok.len > 0);
+
+    // One level short of it: refused by name rather than by crashing.
+    try std.testing.expectError(
+        error.MaxDepthExceeded,
+        canonicalize(a, doc.root, .{ .mode = .exclusive, .max_depth = deep - 2 }),
+    );
+}
+
 test "exc-c14n W3C example 1: visibly-utilized pruning" {
     const src =
         "<n0:pdu xmlns:n0=\"http://a.example\">\n" ++

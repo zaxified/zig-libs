@@ -64,8 +64,32 @@ var result = try xmldsig.verify(gpa, &doc, sig, .{
 defer result.deinit(gpa);
 
 if (!result.valid) return error.BadSignature;
+
+// 4. ⚠ THE STEP THIS SNIPPET USED TO OMIT. `result.valid` says a signature
+//    verified — it does NOT say it covered the element you are about to
+//    trust. That gap is signature wrapping (XSW), the defect class that broke
+//    SAML implementations for a decade: an attacker keeps the signed element
+//    intact somewhere the document still parses, and puts the element YOUR
+//    code reads somewhere else.
+//
+//    So bind the two together: the element you go on to use must be the one a
+//    reference names.
+const trusted_id = element_you_will_read.attr("", "ID") orelse return error.NoId;
+var covered = false;
+for (result.references) |ref| {
+    // `URI="#id"`; `URI=""` (whole document) needs its own decision.
+    if (ref.uri.len > 1 and ref.uri[0] == '#' and
+        std.mem.eql(u8, ref.uri[1..], trusted_id) and ref.digest_valid) covered = true;
+}
+if (!covered) return error.SignatureWrappingDetected;
+
 // result.references[i].digest_valid, result.x509_cert_der (pin it), …
 ```
+
+`saml` does exactly this in `signedTargetMatches`, and calls it "the module's
+ONLY defence" against wrapping — if you are using `xmldsig` directly, that
+defence is yours to write. Step 4 is not optional and `valid` is not a
+substitute for it.
 
 Direct canonicalization is available too:
 

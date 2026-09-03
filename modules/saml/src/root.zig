@@ -1880,7 +1880,15 @@ fn signProtocolMessage(
     };
     defer doc1.deinit();
     const sig1 = childEl(doc1.root, xmldsig.ds_ns, "Signature") orelse return error.SigningAssemblyFailed;
-    const ref_canon = try xmldsig.c14n.canonicalize(alloc, doc1.root, .{ .mode = .exclusive, .omit = sig1 });
+    // `c14n` gained a `MaxDepthExceeded` (its `writeElement` recurses on the
+    // machine stack; the only bound used to be the parser's `max_depth`, which
+    // is a supported knob). Nothing this module signs is anywhere near it, so
+    // it folds into the same "we could not assemble this" outcome as the other
+    // structural failures above.
+    const ref_canon = xmldsig.c14n.canonicalize(alloc, doc1.root, .{ .mode = .exclusive, .omit = sig1 }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MaxDepthExceeded => return error.SigningAssemblyFailed,
+    };
     defer alloc.free(ref_canon);
     var dgst: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(ref_canon, &dgst, .{});
@@ -1898,7 +1906,10 @@ fn signProtocolMessage(
     defer doc2.deinit();
     const sig2 = childEl(doc2.root, xmldsig.ds_ns, "Signature") orelse return error.SigningAssemblyFailed;
     const si2 = childEl(sig2, xmldsig.ds_ns, "SignedInfo") orelse return error.SigningAssemblyFailed;
-    const si_canon = try xmldsig.c14n.canonicalize(alloc, si2, .{ .mode = .exclusive });
+    const si_canon = xmldsig.c14n.canonicalize(alloc, si2, .{ .mode = .exclusive }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MaxDepthExceeded => return error.SigningAssemblyFailed,
+    };
     defer alloc.free(si_canon);
 
     var sig_buf: [rsa.max_modulus_len]u8 = undefined;
@@ -2876,7 +2887,14 @@ pub fn consumeArtifactResponseSoap(alloc: std.mem.Allocator, soap_xml: []const u
     if (!std.mem.eql(u8, code, status_success)) return error.StatusNotSuccess;
 
     const enclosed = findEnclosedMessage(root) orelse return error.NoEnclosedMessage;
-    const enclosed_xml = try xmldsig.c14n.canonicalize(alloc, enclosed, .{ .mode = .exclusive });
+    // Same new error as at the signing site: a document nested past `c14n`'s
+    // depth bound is one this module cannot serialize, which for an inbound
+    // artifact response is a malformed SOAP envelope as far as the caller is
+    // concerned.
+    const enclosed_xml = xmldsig.c14n.canonicalize(alloc, enclosed, .{ .mode = .exclusive }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MaxDepthExceeded => return error.MalformedSoap,
+    };
     return .{ .enclosed_message_xml = enclosed_xml };
 }
 
