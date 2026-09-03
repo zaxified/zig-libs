@@ -103,8 +103,21 @@ validator, so the KATs are not self-referential). Because a real RRSIG only
 verifies over byte-exact RFC 4034 §3.1.8.1 canonical data, a `.secure`
 verdict is itself the byte-exactness proof; the matching tampered
 (signature/digest byte flipped) cases return `.bogus`. Vectors:
-`src/oracle_vectors.zig`; KATs: `src/oracle_test.zig`; reproduction harness
-(zone + `extract.py`, using `dnspython`): `scratchpad/dnssec-oracle/`.
+`src/oracle_vectors.zig`; KATs: `src/oracle_test.zig`.
+
+⚠ **The reproduction harness was not in the repo.** Both this file and
+`README.md` credited `scratchpad/dnssec-oracle/` (zone + `extract.py`, using
+`dnspython`), and README called it "ephemeral" — accurately: a scratchpad does
+not survive a reboot, so the module's strongest anchor had no re-takeable
+recipe. Same shape as the drift-ranking script this campaign had to move out of
+a session scratchpad. `scripts/gen-dnssec-oracle.sh` now restores the
+provenance CHAIN: it builds a zone, signs it once per algorithm this module
+implements a verifier for (8, 13, 15) plus an NSEC3 pass, and has `ldns` —
+an independent implementation, not this repo — verify each result. What it
+deliberately does NOT do is reproduce the committed vectors byte for byte:
+those were signed with keys that no longer exist. The extraction step (wire
+rdata → the `Vec` literals) is the piece that was lost and is not
+reconstructed.
 Remaining: corpus-fuzz the parsers; external RFC 6605/8080 published test
 vectors as a second independent cross-check.
 
