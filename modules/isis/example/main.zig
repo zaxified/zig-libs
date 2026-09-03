@@ -64,11 +64,18 @@ pub fn main() !void {
     // Untrusted input: chopping bytes off the end leaves the PDU Length
     // field claiming more than the buffer actually holds — the decoder
     // must reject this by name, not panic or over-read.
+    // ⚠ Written as `_ = decode(x) catch |err| switch (err) {...}` this could
+    // not fail: if the decoder ACCEPTED the truncated PDU, the catch never
+    // ran, nothing was asserted, and `zig build run-example-isis` stayed
+    // green. The one file whose whole job is to be an executed outside-caller
+    // check had no check in it. Success is now the error case.
     const truncated = wire[0 .. wire.len - 3];
-    _ = isis.decode(truncated) catch |err| switch (err) {
+    if (isis.decode(truncated)) |_| {
+        return error.TruncatedPduWasAccepted;
+    } else |err| switch (err) {
         error.BadPduLength => {
             std.debug.print("truncated PDU correctly rejected: PDU Length exceeds buffer\n", .{});
         },
         else => return err,
-    };
+    }
 }

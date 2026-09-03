@@ -274,6 +274,38 @@ fn walkTlvs(bytes: []const u8, input: []const u8) void {
     }
 }
 
+/// The five PDU shapes `decode` models, with the fixed header length the
+/// Length Indicator must equal and the offset of the PDU-Length field.
+/// Kept beside the harness rather than in `pdu.zig` because it exists to make
+/// a fuzzer's random draw land on a decodable header, which is a testing
+/// concern and not part of the codec's contract.
+const modeled_shapes = [_]struct { type_byte: u8, fixed_len: u8, len_off: usize }{
+    .{ .type_byte = 15, .fixed_len = 27, .len_off = 17 }, // L1 LAN IIH
+    .{ .type_byte = 17, .fixed_len = 20, .len_off = 17 }, // P2P IIH
+    .{ .type_byte = 18, .fixed_len = 27, .len_off = 8 }, // L1 LSP
+    .{ .type_byte = 24, .fixed_len = 33, .len_off = 8 }, // L1 CSNP
+    .{ .type_byte = 26, .fixed_len = 17, .len_off = 8 }, // L1 PSNP
+};
+
+/// Rewrites the front of `buf` into a header that `decode` will accept, so the
+/// fuzzer spends its draws on the body and the TLV region instead of on the
+/// header's equality checks. Everything past the fixed header — including the
+/// TLVs — stays whatever the fuzzer drew.
+fn biasToModeledPdu(buf: []u8, len: usize, smith: *std.testing.Smith) void {
+    const s = modeled_shapes[smith.valueRangeAtMost(u8, 0, modeled_shapes.len - 1)];
+    if (len < s.fixed_len) return;
+    buf[0] = header.discriminator;
+    buf[1] = s.fixed_len; // Length Indicator — an equality, not a bound
+    buf[2] = header.version;
+    buf[3] = 6; // ID Length
+    buf[4] = s.type_byte; // top 3 bits clear, so no ReservedBitSet
+    buf[5] = header.version;
+    // PDU Length must land in [fixed_len, len]; a random u16 essentially never
+    // does, which is the single load-bearing field the old bias omitted.
+    const pdu_len: u16 = smith.valueRangeAtMost(u16, s.fixed_len, @intCast(len));
+    std.mem.writeInt(u16, buf[s.len_off..][0..2], pdu_len, .big);
+}
+
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [128]u8 = undefined;
     smith.bytes(&buf);
@@ -282,10 +314,19 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
 
     // Bias toward valid-looking headers so deeper paths are exercised, not just
     // the discriminator bail-out.
+    //
+    // ⚠ This block used to set bytes 0, 2 and 5 only, and it reached a decoded
+    // PDU body EXACTLY NEVER. Bytes 1 (Length Indicator), 3 (ID Length) and 4
+    // (PDU type + reserved bits) stayed random, so `checkCommon` refused every
+    // draw, and even past it the PDU-Length field is a random u16 that must
+    // land in `[fixed_len, len]`. Coverage feedback offers no gradient toward a
+    // 16-bit equality, so the search never crossed it: two million
+    // coverage-guided runs, zero bodies. Everything below `decode` — every
+    // fixed-offset body read, `tlvRegion`, and the whole `checksum.zig` surface
+    // added since — was unfuzzed while `check-fuzz` reported this module
+    // covered.
     if (len >= 8 and smith.value(bool)) {
-        buf[0] = header.discriminator;
-        buf[2] = header.version;
-        buf[5] = header.version;
+        biasToModeledPdu(&buf, len, smith);
     }
 
     // The raw TLV walk over the whole buffer must always be safe.
@@ -302,5 +343,52 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         .psnp => |x| x.tlv_bytes,
         .other => return,
     };
+    // The LSP checksum surface reads the SAME untrusted bytes, and
+    // `isis-lsdb` calls `checkLspChecksum` on them straight off the wire.
+    // It was never driven from here: 210 lines added on the untrusted path
+    // with no fuzz coverage at all.
+    if (p == .lsp) {
+        _ = pdu.computeLspChecksum(input) catch {};
+        _ = pdu.checkLspChecksum(input) catch {};
+    }
     walkTlvs(region, input);
+}
+
+test "TEETH: the fuzz bias actually reaches a decoded PDU body" {
+    // The harness's bias block is the only thing standing between the fuzzer
+    // and the body decoders, and for the whole life of this module it reached
+    // a body ZERO times — a fact no gate could report, because `check-fuzz`
+    // asks whether a harness EXISTS. This test asks the question `check-fuzz`
+    // cannot: it draws from the harness's own bias and asserts that at least
+    // one draw decodes into a modeled PDU.
+    //
+    // Deterministic: a fixed seed through `std.testing.Smith`, so this is a
+    // reachability assertion and not a flaky sampling test.
+    // ⚠ The draws here do NOT go through `Smith` the way `fuzzDecode` does,
+    // and that is deliberate: `Smith.bytes(out)` consumes the whole supplied
+    // input, so every later `valueRangeAtMost` falls back to its range's LOWER
+    // bound. Written the obvious way — one `Smith` per round, `bytes` then
+    // `valueRangeAtMost` — this test draws `len = 0` every single round, skips
+    // every iteration, and would report whatever the final `expect` says with
+    // nothing behind it. What is asserted instead is the thing that was
+    // broken: that `biasToModeledPdu` turns a random buffer into a header the
+    // dispatcher accepts.
+    var prng = std.Random.DefaultPrng.init(0x1515);
+    const rand = prng.random();
+    var seen: usize = 0;
+    var round: u8 = 0;
+    while (round < 64) : (round += 1) {
+        var buf: [128]u8 = undefined;
+        rand.bytes(&buf);
+        const len: usize = rand.intRangeAtMost(usize, 8, buf.len);
+        // Fresh, generously sized input for the bias's own two draws only.
+        var seed: [64]u8 = undefined;
+        rand.bytes(&seed);
+        var smith: std.testing.Smith = .{ .in = &seed };
+        biasToModeledPdu(&buf, len, &smith);
+        const p = decode(buf[0..len]) catch continue;
+        if (p != .other) seen += 1;
+    }
+    // Before the fix this was 0 for any number of rounds.
+    try std.testing.expect(seen > 0);
 }

@@ -62,10 +62,23 @@ fn accumulate(bytes: []const u8, skip: ?usize) struct { u32, u32 } {
 /// per B.3.1). Returns the pair as a big-endian `u16` — `X` is the high octet —
 /// i.e. exactly the value the LSP's Checksum field carries.
 ///
-/// Never returns `0x0000` (see the module doc); asserts the checksum field lies
-/// inside `bytes`.
-pub fn compute(bytes: []const u8, csum_off: usize) u16 {
-    std.debug.assert(csum_off + 1 < bytes.len);
+/// Never returns `0x0000` (see the module doc).
+///
+/// ⚠ The precondition — that both checksum octets lie inside `bytes` — used to
+/// be a `std.debug.assert`, which is **not a guard in ReleaseFast**: the
+/// `bytes.len - csum_off - 1` below then underflows a `usize` and `accumulate`
+/// reads off the end. Measured on this toolchain, same source, same input
+/// (`compute(len=8, off=7)`): Debug and ReleaseSafe panic, **ReleaseFast
+/// SIGSEGVs**. That is undefined behaviour, so the symptom is not stable — the
+/// class is "unchecked out-of-range read", not "it crashes". `verify` beside it
+/// is total; this is now an error too. `compute` is exported from a module whose
+/// SPEC advertises bounds-safe decoding of untrusted bytes, so the fact that no
+/// in-repo caller can currently reach it is not the guarantee.
+pub fn compute(bytes: []const u8, csum_off: usize) error{ChecksumFieldOutOfRange}!u16 {
+    // Written as a subtraction on the LENGTH, never `csum_off + 1`: the
+    // obvious form overflows on a `csum_off` near `maxInt(usize)` and panics
+    // inside the guard itself. (It did; the test below caught it.)
+    if (bytes.len < 2 or csum_off > bytes.len - 2) return error.ChecksumFieldOutOfRange;
     const c = accumulate(bytes, csum_off);
     const c0: i32 = @intCast(c[0]);
     const c1: i32 = @intCast(c[1]);
@@ -130,8 +143,25 @@ const ws_region = wireshark_lsp[12..];
 /// The Checksum field at PDU offset 24, i.e. offset 12 inside that region.
 const ws_csum_off = 12;
 
+test "TEETH: compute REFUSES a checksum field that does not fit in the buffer" {
+    // This precondition was a `std.debug.assert`, i.e. nothing at all in
+    // ReleaseFast: `bytes.len - csum_off - 1` underflows and `accumulate`
+    // walks off the end. Measured on the same source and input, Debug and
+    // ReleaseSafe panicked and ReleaseFast SIGSEGVed — undefined behaviour,
+    // so the class is the finding, not either symptom.
+    var buf: [8]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    // The two checksum octets are at `off` and `off + 1`, so `off == len - 1`
+    // is already one past the end — the off-by-one, not a wild offset.
+    try testing.expectError(error.ChecksumFieldOutOfRange, compute(&buf, buf.len - 1));
+    try testing.expectError(error.ChecksumFieldOutOfRange, compute(&buf, buf.len));
+    try testing.expectError(error.ChecksumFieldOutOfRange, compute(&buf, std.math.maxInt(usize)));
+    // The last offset that DOES fit still works, so the bound is not off by one
+    // in the other direction.
+    _ = try compute(&buf, buf.len - 2);
+}
+
 test "KAT (Wireshark-graded): compute reproduces 0xaee7 over the ISO §7.3.11 region" {
-    try testing.expectEqual(@as(u16, 0xaee7), compute(ws_region, ws_csum_off));
+    try testing.expectEqual(@as(u16, 0xaee7), try compute(ws_region, ws_csum_off));
 }
 
 test "KAT (Wireshark-graded): verify accepts the graded-Good bytes and rejects the graded-Bad ones" {
@@ -165,12 +195,12 @@ test "B.3 and B.4 agree: a computed checksum always verifies" {
             b.* = @truncate(seed >> 16);
         }
         const off = seed % (buf.len - 1);
-        const c = compute(&buf, off);
+        const c = try compute(&buf, off);
         buf[off] = @intCast(c >> 8);
         buf[off + 1] = @intCast(c & 0xFF);
         try testing.expect(verify(&buf));
         // Recomputing over the now-stamped buffer is idempotent.
-        try testing.expectEqual(c, compute(&buf, off));
+        try testing.expectEqual(c, try compute(&buf, off));
     }
 }
 
@@ -182,7 +212,7 @@ test "a computed checksum is never zero and has no zero octet (RFC 3719 §7)" {
             seed = seed *% 1103515245 +% 12345;
             b.* = @truncate(seed >> 16);
         }
-        const c = compute(&buf, 8);
+        const c = try compute(&buf, 8);
         try testing.expect(c != 0);
         try testing.expect(c >> 8 != 0);
         try testing.expect(c & 0xFF != 0);
@@ -190,7 +220,7 @@ test "a computed checksum is never zero and has no zero octet (RFC 3719 §7)" {
     // The all-zero buffer is the degenerate case the correction formula must
     // still not answer with 0x0000.
     @memset(&buf, 0);
-    try testing.expectEqual(@as(u16, 0xFFFF), compute(&buf, 8));
+    try testing.expectEqual(@as(u16, 0xFFFF), try compute(&buf, 8));
     buf[8] = 0xFF;
     buf[9] = 0xFF;
     try testing.expect(verify(&buf));
@@ -198,7 +228,7 @@ test "a computed checksum is never zero and has no zero octet (RFC 3719 §7)" {
 
 test "the offset is load-bearing: computing at the wrong offset does not verify" {
     var buf: [32]u8 = .{0x5A} ** 32;
-    const c = compute(&buf, 10);
+    const c = try compute(&buf, 10);
     buf[10] = @intCast(c >> 8);
     buf[11] = @intCast(c & 0xFF);
     try testing.expect(verify(&buf));

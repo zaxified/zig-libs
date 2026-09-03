@@ -45,6 +45,12 @@ pub const DecodeError = header.DecodeError || error{
     /// is defined to be exactly the fixed-header length for that PDU type, not
     /// merely a lower bound).
     LengthIndicatorMismatch,
+    /// The §7.3.11 region is too short to contain its own Checksum field.
+    /// Unreachable through `lspChecksumRegion` (which already refuses anything
+    /// shorter than the fixed header), and propagated rather than asserted
+    /// anyway: `checksum.compute`'s bound is ITS invariant, not this file's, and
+    /// a `catch unreachable` here would be the same absent guard one frame up.
+    ChecksumFieldOutOfRange,
 };
 
 pub const BuildError = tlv.BuildError;
@@ -329,7 +335,19 @@ pub const LspFields = struct {
     remaining_lifetime: u16,
     lsp_id: [8]u8,
     sequence_number: u32,
-    /// Checksum to stamp verbatim; 0 means "checksumming not in use" (ISO 10589).
+    /// Checksum to stamp verbatim.
+    ///
+    /// ⚠ The default `0` is the "**not computed**" marker, NOT a supported
+    /// "checksumming not in use" mode — which is what this line used to claim,
+    /// while `ChecksumStatus.not_present` fifty lines below said the opposite
+    /// and cited the rule correctly. RFC 3719 §7, quoting ISO 10589 §7.3.14.2
+    /// i): a zero checksum "shall be treated as if the Remaining Lifetime were
+    /// zero", and receivers "SHOULD treat all LSPs with a zero checksum and a
+    /// non-zero remaining lifetime as if they had a checksum error. Such
+    /// packets SHOULD be discarded." `isis-lsdb` does exactly that
+    /// (`store.zig`: `.bad, .not_present => return error.CorruptedLsp`), so an
+    /// LSP built from the default and closed with `finish()` is one this
+    /// repo's own update process must throw away. Use `finishStamped`.
     checksum: u16 = 0,
     flags: LspFlags,
     max_area_addresses: u8 = header.default_max_area_addresses,

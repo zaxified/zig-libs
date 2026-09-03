@@ -128,9 +128,15 @@ needs authenticated IS-IS must layer it above this codec.
 Offline only — pure codec, no live-interop surface in this environment.
 `zig build test-isis`:
 
-- **Goldens** (`goldens.zig`): a P2P IIH and an SPB-carrying L1 LSP, each
-  hand-assembled field-by-field per ISO 10589 / RFC 6329 (**no live capture was
-  available** — stated honestly) and pinned byte-for-byte. Three directions: the
+- **Goldens** (`goldens.zig`): **nine** goldens, pinned byte-for-byte.
+  ⚠ This bullet used to say "a P2P IIH and an SPB-carrying L1 LSP … **no live
+  capture was available** — stated honestly". That sentence was deleted from
+  `goldens.zig` as stale and left standing here, where it contradicts the
+  Anchoring section of this same file ("Wireshark sharkd validated 5 PDU
+  bodies + TLVs incl. L2 CSNP/PSNP"). One document, both claims. What is true:
+  the goldens are hand-assembled field-by-field per ISO 10589 / RFC 6329, and
+  five of the PDU bodies have since been graded by an INDEPENDENT dissector
+  (`sharkd`), which is a stronger anchor than the hand assembly alone. Three directions: the
   builders reproduce the golden bytes, the decoders recover every field, and
   `encode(decode(golden)) == golden`. The Length-Indicator/PDU-Length constants
   (20 / 27 / 37 / 60) are an independent cross-check on the hand assembly.
@@ -144,8 +150,23 @@ Offline only — pure codec, no live-interop surface in this environment.
   *would* over-read (`2 + declared_len > buf.len`) where the safe walk returns
   `TruncatedTlv` — so the test goes red the moment the guard is removed.
 - **Fuzz:** a `std.testing.fuzz` target driving arbitrary bytes through the
-  dispatch decoder + raw and sub-TLV walks, asserting never-panic, walk
-  termination, and value-within-input.
+  dispatch decoder + raw and sub-TLV walks and the typed sub-decoders,
+  asserting never-panic, walk termination, and value-within-input.
+  ⚠ Until 2026-09-03 this target reached a decoded PDU **body** exactly never:
+  its header bias set three bytes and left the Length Indicator, the ID Length,
+  the PDU-type octet and the whole PDU-Length field random, so `checkCommon`
+  refused every draw (measured: two million coverage-guided runs, zero bodies).
+  Every fixed-offset body read, `tlvRegion`, and the entire `checksum.zig`
+  surface were unfuzzed while `check-fuzz` reported the module covered — a
+  gate that asks whether a harness EXISTS cannot ask whether it reaches
+  anything. `root.zig` now biases a full modeled header and a consistent
+  PDU-Length field, drives the LSP checksum entry points, and carries a
+  non-fuzz test asserting the bias reaches a body (red without the
+  PDU-Length write).
+- **Checksum KAT:** `checksum.zig` is anchored on Wireshark's own Fletcher
+  implementation — the same octets graded `Good`/0xaee7 and `Bad`/0x1111 by
+  `sharkd`. This is the strongest external anchor the module has and was
+  missing from this section entirely.
 
 Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
 `zig build check-catalog` exit 0.
