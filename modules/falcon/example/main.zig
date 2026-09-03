@@ -32,6 +32,15 @@ pub fn main() !void {
     // so this program is reproducible; a build server MUST pass a
     // CSPRNG-backed `std.Random`, because the NTRU basis this draws IS the
     // private key.
+    //
+    // ⚠ AND THE SAME `rng` IS PASSED TO `signRandomized` BELOW, which is the
+    // sharper hazard of the two and used to go unmentioned here. Every run of
+    // this program emits a byte-identical 40-byte salt, because the salt is
+    // simply the next draw from this fixed seed. That is exactly the property
+    // `signDeterministic` was DELETED for in the previous audit — a signer
+    // that re-signs identical messages identically is what fault-differential
+    // and trace-averaging attacks want. A caller that copies the shape of this
+    // file and swaps only the keygen source has kept the whole defect.
     var prng = std.Random.DefaultPrng.init(0x8f2a_1c73_55d0_9e41);
     const rng = prng.random();
 
@@ -57,7 +66,13 @@ pub fn main() !void {
     var nonce: [falcon.nonce_length]u8 = undefined;
     var sig_buf: [falcon.max_sig_field_length]u8 = undefined;
     const sig_len = falcon.signRandomized(&pair.signing_key, manifest, rng, &nonce, &sig_buf) catch |err| switch (err) {
-        error.NoSpaceLeft => return err, // cannot happen with max_sig_field_length
+        // Cannot happen with `max_sig_field_length`, but nameable from out
+        // here, which is the point of this file.
+        error.NoSpaceLeft => return err,
+        // The rejection-sampling loop hit its ceiling. Before that ceiling
+        // existed this arm had nothing to name: an undersized buffer or a
+        // wiped key made `signWithRng` spin forever instead of returning.
+        error.TooManyRetries => return err,
     };
     const sig_field = sig_buf[0..sig_len];
     std.debug.print("signature: {d} bytes (+{d} nonce)\n", .{ sig_field.len, nonce.len });

@@ -71,11 +71,24 @@ below for the signer/keygen internals and the constant-time caveat). See
   grepped for every scalar AND AVX-encoded (`v`-prefixed) floating-point
   compute mnemonic (`{,v}{add,sub,mul,div,sqrt,round,ucomis,comis,cvtsi2s,
   cvts2si}{sd,ss,pd,ps}` and friends). Result: every hit is confined to
-  exactly two functions, `fpr.test."integer emulation matches native
-  IEEE-754 RNE bit-for-bit on random normal doubles"` and `fpr.test."integer
-  emulation: of/rint/floor/trunc agree with native conversions"` — the two
-  tests that INTENTIONALLY cross-check the integer emulation against real
-  hardware FP, exactly as documented below. No keygen or signing function
+  **test symbols** — the `fpr` tests that INTENTIONALLY
+  cross-check the integer emulation against real hardware FP, exactly as
+  documented below.
+
+  ⚠ This paragraph used to say "exactly two functions" and name them. Re-run,
+  its own grep reports **four**: those two plus `fft.test."fftRaw/ifftRaw
+  round-trip"` and a `testing.expectEqualInner` helper. The substantive claim
+  survived (all four are tests); the reproducible count did not, and it was
+  already wrong when it was written. A sentence describing a command someone
+  ran once is not a gate — it goes stale in silence and nothing reports it.
+  The check is therefore now EXECUTABLE: **`scripts/check-fp-freedom.sh`**,
+  run on every gate lane, which fails and names the offending symbol. Verified
+  red: with `fpr.div`'s body replaced by a native `/`, the whole suite and the
+  KATs stay green — the emulation is bit-identical to IEEE-754, so no value
+  test can ever see the difference — while the gate reports `vdivsd` in
+  `fft.polyLdlFft`, `fft.polyDivAutoadjFft` and `fft.polyInvnorm2Fft`.
+  `polyLdlFft` operates on the secret Gram matrix, which is what this module's
+  original HIGH was about. No keygen or signing function
   (`fpr.add`/`sign.Signer.signWithRng`/`ffsampling.sampleSignature`/
   `gaussian.samplerZ`/`ntru.solveNtru` and everything they inline) contains
   any such instruction. This corrects the previous, unsubstantiated phrasing

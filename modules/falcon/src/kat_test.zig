@@ -413,7 +413,18 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     const len = @min(real_sig.len, buf.len);
     @memcpy(buf[0..len], real_sig[0..len]);
 
-    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
+    // ⚠ The lower bound is 1, not 0, and that is load-bearing rather than
+    // cosmetic. Outside `--fuzz` mode `std.testing.fuzz` with an empty corpus
+    // runs EXACTLY ONE input, and on exhausted input `valueRangeAtMost` falls
+    // back to the range's LOWER bound. With a lower bound of 0 this harness
+    // therefore did precisely one thing on every ordinary `zig build test`:
+    // verify the pristine, valid NIST-KAT signature — zero bytes flipped, not
+    // one corrupted input ever reaching `compDecode`. Meanwhile `check-fuzz`
+    // counted the module as covered and the CHANGELOG recorded "no panic/OOB
+    // found". Zero flips is also the least interesting case even under a real
+    // fuzzer: an unmodified valid signature is what the KAT tests already
+    // assert.
+    const n_flips = smith.valueRangeAtMost(u8, 1, 6);
     var i: u8 = 0;
     while (i < n_flips) : (i += 1) {
         const pos = smith.index(len);
@@ -421,6 +432,18 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     }
 
     pk.verify(msg, nonce[0..falcon.nonce_length], buf[0..len]) catch return;
+}
+
+test "TEETH: the verify fuzz harness corrupts at least one byte on its smoke run" {
+    // The harness above is the module's only untrusted-input fuzz target, and
+    // outside `--fuzz` it gets exactly one draw. This test pins the property
+    // that made that one draw worthless: the flip count must never be able to
+    // come out zero. It reads the same expression the harness uses, through a
+    // `Smith` with NO input left — the exact state the single smoke run is in.
+    var empty: [0]u8 = .{};
+    var smith: std.testing.Smith = .{ .in = &empty };
+    const n_flips = smith.valueRangeAtMost(u8, 1, 6);
+    try std.testing.expect(n_flips >= 1);
 }
 
 test "fuzz: PublicKey.verify never panics on corrupted compressed signatures" {

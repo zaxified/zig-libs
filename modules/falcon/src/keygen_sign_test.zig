@@ -139,6 +139,52 @@ test "randomized keygen -> sign -> verify round trip, fresh key" {
     try kp.public_key.verify(message, &nonce, sig_buf[0..len]);
 }
 
+test "TEETH: an undersized sig_out is REFUSED, not spun on forever" {
+    // The rejection-sampling loop used to be `while (true)` and checked only
+    // `sig_out.len == 0`. Any other short buffer made `compEncode` fail,
+    // `catch continue` swallow it, and the next draw fail identically — the
+    // call never returned. Nothing in the suite passed a short buffer, so
+    // nothing saw it; the first audit even recorded the opposite as a PASS.
+    //
+    // This test cannot hang: if the ceiling is removed it does not fail, it
+    // never finishes, which is itself the report. Sizes bracket the boundary
+    // — 1 byte holds the header and nothing else; 600 is below every
+    // compressed Falcon-512 signature this key can produce.
+    var prng = std.Random.DefaultPrng.init(0x5170e);
+    const rng = prng.random();
+    const kp = try falcon.generateKeyPair(rng);
+    const message = "short buffer";
+    var nonce: [falcon.nonce_length]u8 = undefined;
+    var buf: [falcon.max_sig_field_length]u8 = undefined;
+
+    for ([_]usize{ 1, 64, 600 }) |n| {
+        try std.testing.expectError(
+            error.NoSpaceLeft,
+            falcon.signRandomized(&kp.signing_key, message, rng, &nonce, buf[0..n]),
+        );
+    }
+    // And the full-size buffer still signs, so the ceiling did not simply
+    // break signing for everyone.
+    const len = try falcon.signRandomized(&kp.signing_key, message, rng, &nonce, &buf);
+    try kp.public_key.verify(message, &nonce, buf[0..len]);
+}
+
+test "TEETH: signing with a zeroed key terminates instead of spinning" {
+    // `SigningKey.secureZero()` leaves the key structurally callable. Before
+    // the retry ceiling, signing with it spun forever inside the norm-bound
+    // rejection arm — a wiped key was an availability hazard, not an error.
+    var prng = std.Random.DefaultPrng.init(0x2e40ed);
+    const rng = prng.random();
+    var kp = try falcon.generateKeyPair(rng);
+    kp.signing_key.secureZero();
+
+    var nonce: [falcon.nonce_length]u8 = undefined;
+    var buf: [falcon.max_sig_field_length]u8 = undefined;
+    // Either wall is acceptable — the point is that it hits one of them.
+    const r = falcon.signRandomized(&kp.signing_key, "after wipe", rng, &nonce, &buf);
+    try std.testing.expect(std.meta.isError(r));
+}
+
 test "randomized keygen -> sign -> verify: a tampered message is rejected by PublicKey.verify directly" {
     // Every reject-path test elsewhere in this module's suite goes through
     // `openNistSignedMessage` against the ONE fixed NIST KAT public key —

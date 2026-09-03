@@ -324,6 +324,11 @@ harness_smoke() {
     # content, near-instant otherwise (Zig's own cache). See the script's
     # header for what it checks and why one target, not two.
     step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
+    # falcon's constant-time property is invisible to every value test (the
+    # integer emulation is bit-identical to hardware FP), and falcon is not on
+    # the ctgrind gate. This disassembly check is the only thing that fails when
+    # the emulation is bypassed. See the script header.
+    step "check-fp-freedom" ./scripts/check-fp-freedom.sh
     run_modules "$plain $netns"
     graph_save
     summary
@@ -1064,7 +1069,7 @@ cmd_changed() {
                 # Might have changed the graph — ask the graph, do not assume.
                 trigger_graph=1
                 ;;
-            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/hooks/*)
+            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/check-fp-freedom.sh|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed.
@@ -1291,6 +1296,11 @@ cmd_changed() {
     # check rather than a byte-count one. ~30s when Client.zig's content
     # actually changed, near-instant otherwise.
     step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
+    # falcon's constant-time property is invisible to every value test (the
+    # integer emulation is bit-identical to hardware FP), and falcon is not on
+    # the ctgrind gate. This disassembly check is the only thing that fails when
+    # the emulation is bypassed. See the script header.
+    step "check-fp-freedom" ./scripts/check-fp-freedom.sh
 
     if [[ -z "$closure" ]]; then
         graph_save
@@ -1396,6 +1406,11 @@ phase_checks() {
     step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
     step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
+    # falcon's constant-time property is invisible to every value test (the
+    # integer emulation is bit-identical to hardware FP), and falcon is not on
+    # the ctgrind gate. This disassembly check is the only thing that fails when
+    # the emulation is bypassed. See the script header.
+    step "check-fp-freedom" ./scripts/check-fp-freedom.sh
     step "check-ctgrind" zig build check-ctgrind
 }
 

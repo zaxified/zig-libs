@@ -69,9 +69,34 @@ pub fn Signer(comptime Ring: type) type {
         pub const sig_header: u8 = 0x20 + @as(u8, Ring.logn);
 
         pub const SignError = error{
-            /// `sig_out` too small to hold even the header byte.
+            /// `sig_out` cannot hold a signature. Returned up front when it
+            /// cannot hold even the header byte, and after `max_attempts`
+            /// draws every one of which `compEncode` refused for want of
+            /// room — i.e. the buffer is too small for this key's typical
+            /// compressed length, not merely unlucky.
             NoSpaceLeft,
+            /// `max_attempts` draws were rejected by the norm bound. An
+            /// honest sampler essentially never iterates more than once or
+            /// twice, so this means the tree or `sig_bound` is wrong (a
+            /// zeroed `SigningKey` reaches here), not that signing is hard.
+            TooManyRetries,
         };
+
+        /// Retry ceiling for the rejection-sampling loop.
+        ///
+        /// ⚠ This loop used to be `while (true)` with no ceiling at all, and
+        /// the only length check was `sig_out.len == 0`. Every other
+        /// undersized buffer made `compEncode` fail, `catch continue` swallow
+        /// it, and the next draw fail identically — **an unkillable
+        /// non-allocating spin**, not an error. The first audit recorded
+        /// "`sig_out` too small → `error.NoSpaceLeft`" as a PASS in the same
+        /// sentence that named the `catch continue` two lines above it; the
+        /// two halves contradict each other and neither half was executed.
+        ///
+        /// Falcon's own analysis puts the per-draw rejection probability at
+        /// well under 1/2, so 64 draws is astronomically slack for an honest
+        /// signer and still terminates.
+        pub const max_attempts: usize = 64;
 
         /// Sign `msg` under the ffSampling tree `tree`. Writes a fresh
         /// nonce into `nonce_out` and the compressed signature field
@@ -96,7 +121,11 @@ pub fn Signer(comptime Ring: type) type {
             sig_bound: u64,
         ) SignError!usize {
             if (sig_out.len == 0) return error.NoSpaceLeft;
-            while (true) {
+            // Which failure caused the last rejection, so an exhausted loop
+            // can name the cause instead of reporting a generic timeout.
+            var out_of_room = false;
+            var attempts: usize = 0;
+            while (attempts < max_attempts) : (attempts += 1) {
                 rng.bytes(nonce_out);
                 var c: Ring.Poly = undefined;
                 Codec.hashToPoint(nonce_out, msg, &c); // REUSED
@@ -108,12 +137,22 @@ pub fn Signer(comptime Ring: type) type {
                     norm += @as(u64, @intCast(@as(i32, a) * @as(i32, a)));
                     norm += @as(u64, @intCast(@as(i32, b) * @as(i32, b)));
                 }
-                if (norm > sig_bound) continue;
+                if (norm > sig_bound) {
+                    out_of_room = false;
+                    continue;
+                }
 
                 sig_out[0] = sig_header;
-                const len = Codec.compEncode(sig_out[1..], &samp.s2) catch continue; // REUSED
+                const len = Codec.compEncode(sig_out[1..], &samp.s2) catch { // REUSED
+                    out_of_room = true;
+                    continue;
+                };
                 return 1 + len;
             }
+            // The loop is bounded now; say which wall it hit. A buffer that
+            // is simply too short fails at `compEncode` every single time,
+            // which is a caller error and not a sampling accident.
+            return if (out_of_room) error.NoSpaceLeft else error.TooManyRetries;
         }
     };
 }

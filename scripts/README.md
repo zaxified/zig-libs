@@ -20,6 +20,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | `ctgrind.sh`, `ctgrind-expected.tsv` | Constant-time verification and the per-module expectations it is judged against. Needs valgrind, so it is deliberately NOT in the gate. |
 | `dark-tests.sh` | Finds modules that DECLARE tests the test binary never ran — the failure that reads as a pass. |
 | `check-http-sizeprobe.sh` | Probes the `http` module's size-limit behaviour from outside, as a consumer would. Runs on every gate — it was in the driver but missing from this table until an audit compared the two. |
+| `check-fp-freedom.sh` | Disassembles a ReleaseFast `falcon` and fails if a variable-latency FP instruction reached a non-test symbol. The `fpr` integer emulation is bit-identical to hardware FP, so **no value test can defend it** — the whole suite stays green with `fpr.div` replaced by `/`. Runs on every gate. |
 | `force-pubfn-reach.zig` | The second root `check-pubfn-reach` compiles over the module graph. Zig analyses a function body only when something references it, so a `pub fn` no test reaches is never type-checked at all; this file takes a reference to every one of them. |
 | `portable-known-failures.tsv` | The `(module, target)` pairs a module DECLARES in `meta.targets` but that do not currently compile, each with the real compiler error. A declared-but-broken target is a tracked debt, not a silently dropped claim. |
 | `check-apps.sh` | Builds every `example-apps/` project against THIS working tree, via `zig build --fork=../..`. The apps pin a released tag because that is what someone who downloads one needs; the fork overrides that pin without touching the file. It is the only check here that reaches the published API through the real package machinery, the way a consumer does. `--pinned` builds from the manifest as written instead — fetch by URL and hash, compile the exported package — which is the downloader's own path and the only thing that exercises `.paths`; it is fail-closed and refuses unless every pinned tag resolves to `HEAD`, i.e. on a tag ref and nowhere else. `--run` then executes each app's own `smoke.sh`, which starts the program and asserts on what it does — the difference between "it compiles" and "it works", and what CI runs. It does that **twice per app, in `ReleaseSafe` and in `ReleaseFast`**, because a `std.debug.assert` guard is compiled out of the latter and a fail-open one is therefore invisible in safe modes. Also refuses a directory nobody declared, a declaration whose directory is gone, an app the collection README does not list, and an app with no executable `smoke.sh`. |
@@ -27,6 +28,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | `ci-environment.sh` | Installs the live peers a hosted runner lacks — wolfSSL, the open62541 container, five Python oracles. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. |
 | `check-citations.py` | Verifies the RFC/standard citations in module docs point at something real. **Manual, not a gate:** measured on `dns`, it pairs an `RFC NNNN` mention with any nearby quoted string, so a quoted SPEC.md heading reports as a mismatch. Useful with triage, not as a red/green. |
 | `check-uapi-consts.py` | Diffs the kernel UAPI constants modules hardcode against the headers they came from. Driven by `zig build check-uapi`, which the gate runs; it SKIPS (never fails) on a host without python3 or kernel headers. Currently 689 matched / 0 mismatched across five modules, with 263 constants unresolved — it says so rather than counting them as passes. |
+| `gen-dnssec-oracle.sh` | Re-takes `modules/dnssec`'s independent-oracle anchor: builds a zone, signs it once per implemented algorithm with **ldns** (not this repo), and has `ldns-verify-zone` check each result. **Keep it.** The committed `oracle_vectors.zig` credited two different scratchpad paths, neither of which is in the repo — the module's strongest anchor had no re-takeable recipe at all. It deliberately does NOT reproduce the committed vectors byte for byte (those keys are gone and DNSSEC signatures are not deterministic); it re-establishes the property they attest. Needs `ldns`, so it is not a gate step. |
 | `dissect.py` | Drives Wireshark's headless dissector (`sharkd`) as an external oracle for wire-format modules. |
 | `pqxdh-kdf-check.py` | Second, independent implementation of PQXDH's key-derivation chain, written from `hmac`/`hashlib` alone. **Keep it.** Signal publishes no byte-exact PQXDH vectors, so this is the only thing standing between `signal`'s composition and a round trip that would agree with itself about a misplaced KEM secret. The values it emits are pinned in `modules/signal/src/interop_vectors.zig`, so the tests pass without it — which is exactly why it looks deletable. |
 | `gen-bitcoin-core-vectors.py`, `gen-bitcointx-single-bug.py`, `gen-p256-wycheproof.py`, `gen-ocsp-byname.sh` | Regenerate committed test vectors from their upstream sources (Bitcoin Core, BIP-341, Wycheproof, OCSP). **Keep them.** The vectors are frozen in the tree and the tests do not need these to run — which is exactly why they look deletable. Without them the vectors cannot be re-derived or extended, only trusted. |
@@ -431,9 +433,26 @@ Three things compound it, and none of them is a bug in isolation:
   covered, exempt") reads as coverage.
 - `scripts/test.sh` runs `check-fuzz` and never `fuzz-sweep.sh`.
 - `.github/workflows/ci.yml` contains no fuzz step at all.
-- ⛔ And `zig build --fuzz` **does not compile on this toolchain** — it fails
-  inside std's own `test_runner`, identically for every module tried — so
-  `fuzz-sweep.sh` is the only route, and it is manual.
+- ⚠ **This file used to claim `zig build --fuzz` "does not compile on this
+  toolchain", failing inside std's own `test_runner` "identically for every
+  module tried". That is not reproducible.** On Zig 0.16.0, both of these
+  build and run:
+
+  ```
+  $ zig build test --release=safe -Dtest-filter="fuzz: PDU/TLV decode" --fuzz=50000
+  $ echo $?
+  0
+  $ zig build test -Dtest-filter="fuzz: PDU/TLV decode" --fuzz=1000     # Debug
+  (still fuzzing at the 110 s mark — `=N` does not bound the run; killed)
+  ```
+
+  Coverage-guided mode therefore IS available, and is the only way to answer
+  "does this harness reach anything", which `fuzz-sweep.sh` cannot: it reports
+  `clean` whether the harness explored the decoder or bounced off the first
+  byte. Whether the old claim was true on an earlier toolchain is unknown; it
+  was recorded without a pasted failure, which is why it survived. **Paste the
+  failure or do not record the impossibility.**
+- ⛔ `fuzz-sweep.sh` is still the routine sweep, and it is still manual.
 
 **What to do about it.** Two routes, and the choice is about how the shapes are
 reached, not about effort:

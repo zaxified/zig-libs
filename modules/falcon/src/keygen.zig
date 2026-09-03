@@ -68,6 +68,15 @@ pub fn Keygen(comptime Ring: type) type {
             /// per-signature scratch in `ffsampling.sampleSignature` it is
             /// never wiped automatically — the caller decides when signing
             /// is done.
+            ///
+            /// ⚠ A wiped key stays STRUCTURALLY CALLABLE: nothing marks it
+            /// spent, so `signWithRng` will accept it and draw against an
+            /// all-zero basis, whose candidates never satisfy the norm bound.
+            /// Before the loop gained a ceiling that meant an unkillable spin;
+            /// it now surfaces as `error.TooManyRetries`, which is the wall
+            /// this hits and not a diagnosis. Treat signing after `secureZero`
+            /// as a caller bug — the recorded hazard used to be double-call
+            /// alone, and double-call is the harmless one.
             pub fn secureZero(sk: *SigningKey) void {
                 std.crypto.secureZero(i8, &sk.f);
                 std.crypto.secureZero(i8, &sk.g);
