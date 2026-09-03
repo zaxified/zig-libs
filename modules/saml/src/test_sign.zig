@@ -212,3 +212,55 @@ pub fn wrapInResponse(alloc: std.mem.Allocator, assertion_xml: []const u8) ![]u8
         "<samlp:Status><samlp:StatusCode Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/></samlp:Status>" ++
         "{s}</samlp:Response>", .{assertion_xml});
 }
+
+test "TEETH: a sender-vouches SubjectConfirmationData NotOnOrAfter is honoured" {
+    // SAMLCore §2.4.1.2 lists `NotBefore`/`NotOnOrAfter` on
+    // `<SubjectConfirmationData>` as "optional attributes that can apply to ANY
+    // method". The Bearer and HoK arms both read them; the sender-vouches arm
+    // returned without ever fetching the element. And `<Conditions>`' own two
+    // time attributes are enforced only IF PRESENT — so an assertion whose
+    // `<Conditions>` carries just an `<AudienceRestriction>`, as this one does,
+    // had NO expiry bound anywhere on that path. Measured before the fix:
+    // accepted 75 years after the `NotOnOrAfter` its own SIGNED
+    // `<SubjectConfirmationData>` declared. The IdP wrote a bound and it was
+    // discarded.
+    const alloc = std.testing.allocator;
+    const saml = @import("root.zig");
+    const fx = @import("fixtures.zig");
+
+    const after_issuer =
+        "<saml:Subject><saml:NameID>alice@example.org</saml:NameID>" ++
+        "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:sender-vouches\">" ++
+        "<saml:SubjectConfirmationData NotOnOrAfter=\"2024-06-01T12:05:00Z\"/>" ++
+        "</saml:SubjectConfirmation></saml:Subject>" ++
+        "<saml:Conditions>" ++
+        "<saml:AudienceRestriction><saml:Audience>https://sp.example.org/metadata</saml:Audience></saml:AudienceRestriction></saml:Conditions>";
+
+    var signed = try signAssertion(alloc, 0x5EED, fx.idp_entity_id, "_sv01", "2024-06-01T12:00:00Z", after_issuer);
+    defer signed.deinit(alloc);
+    const resp = try wrapInResponse(alloc, signed.xml);
+    defer alloc.free(resp);
+
+    const base: saml.Config = .{
+        .idp_entity_id = fx.idp_entity_id,
+        .idp_key = signed.key,
+        .sp_entity_id = fx.sp_entity_id,
+        .acs_url = fx.acs_url,
+        .now_unix = fx.t_valid,
+        .subject_confirmation = .sender_vouches,
+    };
+
+    // Inside the window it is accepted — so the refusal below is the clock and
+    // not a broken fixture.
+    {
+        var res = try saml.consumeResponseXml(alloc, resp, base);
+        defer res.deinit();
+        try std.testing.expectEqualStrings("alice@example.org", res.name_id);
+    }
+
+    // Long past it — 2099 — it is refused. `<Conditions>` here has no time
+    // attributes at all, so nothing but this check can reject it.
+    var late = base;
+    late.now_unix = 4070908800; // 2099-01-01
+    try std.testing.expectError(error.AssertionExpired, saml.consumeResponseXml(alloc, resp, late));
+}

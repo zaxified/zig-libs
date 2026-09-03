@@ -1145,11 +1145,23 @@ fn validateSubjectConfirmation(alloc: std.mem.Allocator, subject: *const xml.Ele
                 // Sender-vouches imposes NO key/recipient binding on the subject:
                 // the assertion's trust derives entirely from its already-verified
                 // signature (the attesting authority == the configured `idp_key`)
-                // plus the assertion `<Conditions>` (NotBefore/NotOnOrAfter/
-                // Audience), both enforced before this point. The Bearer
+                // plus the assertion `<Conditions>`. The Bearer
                 // Recipient/InResponseTo and the HoK key check are therefore NOT
                 // applied. The caller MUST ensure `idp_key` is the trusted
                 // attesting authority (see SPEC.md "Sender-vouches").
+                //
+                // ⚠ But the TIME BOUNDS are honoured, and were not until
+                // 2026-09-03. SAMLCore §2.4.1.2 lists `NotBefore`/`NotOnOrAfter`
+                // on `<SubjectConfirmationData>` as "optional attributes that
+                // can apply to ANY method"; the Bearer and HoK arms both read
+                // them and this one returned without ever fetching the element.
+                // `<Conditions>`' own two time attributes are enforced only IF
+                // PRESENT, so an assertion whose `<Conditions>` carries just an
+                // `<AudienceRestriction>` had NO expiry bound anywhere on this
+                // path — measured: accepted 75 years after the `NotOnOrAfter`
+                // its own signed `<SubjectConfirmationData>` declared. The IdP
+                // wrote a bound and it was discarded.
+                try validateConfirmationTimeBounds(sc, now, skew);
                 return; // a permitted sender-vouches confirmation
             }
             // Unknown / unsupported method: skip.
@@ -1157,6 +1169,22 @@ fn validateSubjectConfirmation(alloc: std.mem.Allocator, subject: *const xml.Ele
         else => {},
     };
     return best_err orelse error.SubjectConfirmationFailed;
+}
+
+/// The `<SubjectConfirmationData>` time bounds that SAMLCore §2.4.1.2 says
+/// "can apply to any method": `NotBefore` and `NotOnOrAfter`, each optional and
+/// each enforced when present. Absent element or absent attribute is not an
+/// error here — a method that REQUIRES them (Bearer does) checks that itself.
+fn validateConfirmationTimeBounds(sc: *const xml.Element, now: i64, skew: i64) ConsumeError!void {
+    const scd = childEl(sc, saml_ns, "SubjectConfirmationData") orelse return;
+    if (scd.attr("", "NotBefore")) |nb| {
+        const t = try datefmt.parseXsdDateTime(nb);
+        if (now + skew < t) return error.AssertionNotYetValid;
+    }
+    if (scd.attr("", "NotOnOrAfter")) |noa| {
+        const t = try datefmt.parseXsdDateTime(noa);
+        if (now - skew >= t) return error.AssertionExpired;
+    }
 }
 
 /// Validate a single Bearer `<SubjectConfirmationData>` (Web-SSO default):

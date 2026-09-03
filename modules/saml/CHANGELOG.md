@@ -53,6 +53,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     `untrustedMetadataXmlOptions` (metadata keeps `xml`'s default `id_attr_names`, the one
     reason it cannot share), and a test reads the module's own source and fails if any parse
     taking the caller's allocator bypasses them.
+- **2026-09-03** — **A sender-vouches `<SubjectConfirmationData>` was never read**, so a
+  signed `NotOnOrAfter` on it was discarded. SAMLCore §2.4.1.2 lists `NotBefore`/
+  `NotOnOrAfter` there as "optional attributes that can apply to ANY method"; the Bearer and
+  HoK arms both honour them and this arm returned without fetching the element. Since
+  `<Conditions>`' own two time attributes are enforced only IF PRESENT, an assertion whose
+  `<Conditions>` carries just an `<AudienceRestriction>` had **no expiry bound anywhere** on
+  that path — measured: accepted 75 years after the `NotOnOrAfter` its own signed
+  `<SubjectConfirmationData>` declared. Not injection (the assertion is signature-protected
+  and the policy is opt-in): a replay window with no upper bound, on the IdP's own attempt to
+  set one. Now enforced through a shared `validateConfirmationTimeBounds`, mutation-checked.
+- **2026-09-03** — ⛔ **Recorded, NOT fixed.** (a) An extension `<saml:Condition>` the SP does
+  not understand is silently IGNORED, where SAMLCore §2.5.1.1 says the assertion "is
+  considered to be Indeterminate" and "MUST be rejected", and SAMLProf §4.1.4.2 repeats it.
+  Fail-OPEN against a restriction the IdP deliberately attached (step-up, delegation limit,
+  eIDAS constraint). Measured: a genuinely signed assertion carrying
+  `<saml:Condition xsi:type="ext:StepUpRequiredType"/>` and `<saml:ProxyRestriction Count="0"/>`
+  is accepted. Refusing changes acceptance behaviour for existing deployments, so it is an
+  **owner decision**, not a drive-by fix. (b) Under `.either`, `validateSubjectConfirmation`
+  returns on the first fully-valid confirmation, so a leading sender-vouches one makes a
+  following Bearer confirmation's `Recipient`/`InResponseTo` checks unreachable — measured
+  with `Recipient=https://attacker.example/acs`. Same class of decision. (c) Ten live guards
+  still have no regression test (33-mutation sweep): the fail-closed audience rule, the
+  bearer `NotOnOrAfter`, the absent-`InResponseTo` rule, the ArtifactResponse XSW pin, the
+  Response-level `res.valid`, the two decrypted-root type checks, and both HoK data checks.
+  (d) `Version` is never read (SAMLCore §4.1.2 MUST); at-least-one `<AuthnStatement>`
+  (SAMLProf §4.1.4.2) is not required; `<AttributeStatement>`/`<AuthnStatement>` are read
+  first-match though the schema allows repeats — and `required_loa` gates on the first.
+  (e) `ArtifactResponseResult`'s doc claims extraction leaves an embedded inner signature
+  "unaffected"; true for exclusive C14N, false for inclusive, which is XML-DSig's default.
 - **2026-08-07** — ⏪ *Backfilled 2026-09-03; these entries were missing.* **BREAKING (additive):**
   closing the SAML issuer bypass added `IssuerMissing` to four exported error sets —
   `ConsumeError`, `LogoutRequestError`, `LogoutResponseError`, `ArtifactResponseError` — so
