@@ -91,14 +91,37 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Truncate an `f64` toward zero into `T`, or null if it does not fit.
+    ///
+    /// ⚠ `@intFromFloat` on an out-of-range or non-finite operand is
+    /// **undefined behaviour**: it panics in Debug and ReleaseSafe and yields
+    /// silent garbage in ReleaseFast, so it is not a conversion a caller can
+    /// hand untrusted numbers to. Two sites here did exactly that, and one of
+    /// them checked the WRONG VALUE — `isFinite(f)` guarding a cast of
+    /// `f * decimal_scale`, which is a different number by twelve orders of
+    /// magnitude. `1e30` is finite; `1e42` does not fit `i128`.
+    ///
+    /// The comparison is done in `f64` against the bound converted to `f64`,
+    /// and uses `<`/`>` on values that are exactly representable, so the
+    /// rounding at the edge cannot let an out-of-range value through.
+    pub fn floatToInt(comptime T: type, f: f64) ?T {
+        if (!std.math.isFinite(f)) return null;
+        const lo: f64 = @floatFromInt(std.math.minInt(T));
+        const hi: f64 = @floatFromInt(std.math.maxInt(T));
+        // `hi` rounds UP to the nearest representable f64 for wide T, so a
+        // value equal to it may still not fit; `>=` is the safe comparison.
+        if (f < lo or f >= hi) return null;
+        return @intFromFloat(f);
+    }
+
     /// Coerce a numeric cell to i64. `int` passes through; `float` truncates
-    /// toward zero; `decimal` truncates toward zero after dividing out the
-    /// scale (null if the whole-unit part doesn't fit i64). `null`/text/bool
-    /// → null.
+    /// toward zero (null if it does not fit i64, including NaN and infinity);
+    /// `decimal` truncates toward zero after dividing out the scale (null if
+    /// the whole-unit part doesn't fit i64). `null`/text/bool → null.
     pub fn asInt(self: Value) ?i64 {
         return switch (self) {
             .int => |i| i,
-            .float => |f| @intFromFloat(f),
+            .float => |f| floatToInt(i64, f),
             .decimal => |r| std.math.cast(i64, @divTrunc(r, decimal_scale)),
             else => null,
         };
@@ -187,8 +210,11 @@ pub const Value = union(enum) {
             .decimal => switch (self) {
                 .decimal => self,
                 .int => |i| .{ .decimal = @as(i128, i) * decimal_scale },
-                .float => |f| if (std.math.isFinite(f))
-                    .{ .decimal = @intFromFloat(f * @as(f64, @floatFromInt(decimal_scale))) }
+                // The scaled product is what is converted, so the scaled
+                // product is what must be in range — `isFinite(f)` alone let
+                // `1e30` through into a cast of `1e42`.
+                .float => |f| if (floatToInt(i128, f * @as(f64, @floatFromInt(decimal_scale)))) |d|
+                    .{ .decimal = d }
                 else
                     null,
                 else => null,

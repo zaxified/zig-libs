@@ -71,16 +71,57 @@ pub fn main() !void {
     // documented behavior contract, exercised as an effect since it is not
     // a failure the module raises.
     const empty = try jsonshape.shape(a, feed, .{ .path = "no_such_key", .columns = &cols });
-    std.debug.assert(empty.rowCount() == 0);
-    std.debug.assert(empty.columns.len == 2);
+    // ⚠ These were `std.debug.assert`, and the refusal below was `unreachable`.
+    // Both are compiled OUT in ReleaseFast, which is one of the two modes
+    // `scripts/check-apps.sh` runs examples in — so in the mode that matters
+    // this file asserted nothing at all. Returned errors instead.
+    if (empty.rowCount() != 0) return error.MissingPathYieldedRows;
+    if (empty.columns.len != 2) return error.DeclaredColumnsLost;
     std.debug.print("missing path: 0 rows, {d} declared columns preserved (not an error)\n", .{empty.columns.len});
 
-    // Malformed JSON is the one error this module raises, and it must be
-    // nameable from outside.
+    // Malformed JSON must be nameable from outside, and must actually be
+    // refused: `if (shape(...)) |_| unreachable` reports nothing in ReleaseFast
+    // if the parse were ever to succeed.
     if (jsonshape.shape(a, "{not valid json", .{})) |_| {
-        unreachable;
+        return error.MalformedJsonAccepted;
     } else |err| switch (err) {
         error.BadJson => std.debug.print("malformed JSON correctly rejected: BadJson\n", .{}),
         error.OutOfMemory => return err,
+        // A path this example never writes cannot match 65,536 nodes; the arm
+        // exists because the error is part of the published surface.
+        error.TooManyMatches => return err,
     }
+
+    // And the bound itself, from outside: an operator-fixed path against a
+    // document the caller does not control is refused rather than amplified.
+    // This is the check a service doing untrusted projections needs.
+    var hostile: std.ArrayList(u8) = .empty;
+    try buildBranching(a, &hostile, 12, 2);
+    if (jsonshape.shape(a, hostile.items, .{
+        .path = "..a..a",
+        .columns = &.{.{ .name = "v", .key = "", .type = .float }},
+    })) |_| {
+        return error.AmplifyingDocumentAccepted;
+    } else |err| switch (err) {
+        error.TooManyMatches => std.debug.print(
+            "hostile {d} B document refused: TooManyMatches\n",
+            .{hostile.items.len},
+        ),
+        else => return err,
+    }
+}
+
+/// `{"a":[ <b copies> ]}` nested `d` deep. Branching is what amplifies here;
+/// a chain of the same byte length does not.
+fn buildBranching(a: std.mem.Allocator, out: *std.ArrayList(u8), d: usize, b: usize) !void {
+    if (d == 0) {
+        try out.appendSlice(a, "1");
+        return;
+    }
+    try out.appendSlice(a, "{\"a\":[");
+    for (0..b) |i| {
+        if (i > 0) try out.append(a, ',');
+        try buildBranching(a, out, d - 1, b);
+    }
+    try out.appendSlice(a, "]}");
 }

@@ -47,7 +47,13 @@ pub const meta = .{
 
 // ── public API ──────────────────────────────────────────────────────────────
 
-pub const Error = error{ BadJson, OutOfMemory };
+pub const Error = error{
+    BadJson,
+    OutOfMemory,
+    /// The path matched more nodes than `ShapeSpec.max_matches` allows. A
+    /// refusal rather than a truncated result — see `MAX_MATCHES`.
+    TooManyMatches,
+};
 
 pub const JsonCol = struct {
     name: []const u8,
@@ -64,6 +70,12 @@ pub const ShapeSpec = struct {
     /// poc-compatible shorthand (only used when `columns` is empty).
     x: []const u8 = "",
     y: []const u8 = "",
+    /// Refuse a path that yields more than this many nodes — counted BOTH as
+    /// matched nodes and as the items those matches flatten into, because one
+    /// match that is a large array becomes that many rows while the match
+    /// counter still reads 1. See `MAX_MATCHES` for why this refuses rather
+    /// than truncating.
+    max_matches: usize = MAX_MATCHES,
 };
 
 /// Parse `bytes`, resolve `spec.path` to array item(s), project each item to a row.
@@ -82,7 +94,7 @@ pub const ShapeSpec = struct {
 ///     match becomes a single item itself.
 pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dataset {
     const root = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return Error.BadJson;
-    const items = try resolveItems(a, root, spec.path);
+    const items = try resolveItems(a, root, spec.path, spec.max_matches);
 
     if (spec.columns.len == 0) return shapeXY(a, items, spec);
 
@@ -157,10 +169,32 @@ fn descend(root: std.json.Value, path: []const u8) std.json.Value {
 // `*`, `?`, `..`, or a leading `$` routes through this richer engine instead.
 
 /// Bounds recursive-descent (`..name`) and general segment-eval recursion so
-/// a crafted path can't blow the stack on a deeply-nested document — a
-/// document-shaped DoS is the only real "unbounded recursion" risk here
-/// (filter predicates are single-level, no recursion of their own).
+/// a crafted path can't blow the stack on a deeply-nested document.
+///
+/// ⚠ **This bounds DEPTH, and depth is not the quantity that grows.** The
+/// README advertised it as the module's DoS control; it is not one on its own.
+/// `recursiveFind` visits every value at every level, so the number of MATCHES
+/// grows with the document's branching, not its depth, and each match is then
+/// flattened into rows. Measured on a **fixed, operator-written 6-byte path**
+/// (`..a..a`) where only the document is hostile:
+///
+///   doc     163,831 B  ->  393,220 rows,  peak RSS  65 MiB   (~417x)
+///   doc      40,951 B  ->   81,924 rows,  peak RSS  16 MiB
+///
+/// — superlinear, and nothing above stopped it. `MAX_MATCHES` below is the
+/// bound on the quantity that actually grows. Raising `MAX_PATH_DEPTH` alone
+/// is not a knob for that, and lowering it does not substitute for one.
 const MAX_PATH_DEPTH: u32 = 64;
+
+/// Ceiling on how many nodes a path may match before `shape` refuses.
+///
+/// This is the DoS control `MAX_PATH_DEPTH` was mistaken for. It is deliberately
+/// a **refusal, not a truncation**: silently returning the first N rows of a
+/// projection is a wrong answer that looks like a right one, and this module
+/// already had one silent-truncation bug (the depth cap quietly dropping deep
+/// matches while the README promised "every `name` anywhere"). A caller that
+/// legitimately wants more sets `ShapeSpec.max_matches`.
+pub const MAX_MATCHES: usize = 1 << 16;
 
 const CmpOp = enum { eq, ne, lt, le, gt, ge };
 
@@ -202,7 +236,7 @@ fn isLegacyPath(path: []const u8) bool {
 /// go through `descend` unchanged; anything else through the segment engine,
 /// flattening `.array` matches (their elements become items) and treating
 /// any other match as a single item itself.
-fn resolveItems(a: std.mem.Allocator, root: std.json.Value, path: []const u8) Error![]const std.json.Value {
+fn resolveItems(a: std.mem.Allocator, root: std.json.Value, path: []const u8, limit: usize) Error![]const std.json.Value {
     if (isLegacyPath(path)) {
         const node = descend(root, path);
         return switch (node) {
@@ -213,13 +247,24 @@ fn resolveItems(a: std.mem.Allocator, root: std.json.Value, path: []const u8) Er
 
     const segs = try parsePath(a, path);
     var matches: std.ArrayList(std.json.Value) = .empty;
-    try evalSegs(a, root, segs, &matches, 0);
+    try evalSegs(a, root, segs, &matches, 0, limit);
 
+    // ⚠ Bounding MATCHES is not bounding ITEMS, and items are what become
+    // rows. A single match that is a ten-million-element array flattens into
+    // ten million rows while the match counter reads 1 — the same
+    // "cap bounds the wrong quantity" shape this cap exists to close, one
+    // level down. Both are bounded, against the same limit.
     var items: std.ArrayList(std.json.Value) = .empty;
     for (matches.items) |m| {
         switch (m) {
-            .array => |arr| try items.appendSlice(a, arr.items),
-            else => try items.append(a, m),
+            .array => |arr| {
+                if (items.items.len + arr.items.len > limit) return Error.TooManyMatches;
+                try items.appendSlice(a, arr.items);
+            },
+            else => {
+                if (items.items.len >= limit) return Error.TooManyMatches;
+                try items.append(a, m);
+            },
         }
     }
     return try items.toOwnedSlice(a);
@@ -305,9 +350,12 @@ fn parsePath(a: std.mem.Allocator, path: []const u8) Error![]Seg {
     return try segs.toOwnedSlice(a);
 }
 
-fn evalSegs(a: std.mem.Allocator, node: std.json.Value, segs: []const Seg, out: *std.ArrayList(std.json.Value), depth: u32) Error!void {
+fn evalSegs(a: std.mem.Allocator, node: std.json.Value, segs: []const Seg, out: *std.ArrayList(std.json.Value), depth: u32, limit: usize) Error!void {
     if (depth > MAX_PATH_DEPTH) return;
     if (segs.len == 0) {
+        // Checked at the ONE place a match is recorded, so no caller can add a
+        // new recursion arm that bypasses it.
+        if (out.items.len >= limit) return Error.TooManyMatches;
         try out.append(a, node);
         return;
     }
@@ -316,22 +364,22 @@ fn evalSegs(a: std.mem.Allocator, node: std.json.Value, segs: []const Seg, out: 
     switch (seg) {
         .never => {},
         .key => |k| switch (node) {
-            .object => |o| if (o.get(k)) |v| try evalSegs(a, v, rest, out, depth + 1),
+            .object => |o| if (o.get(k)) |v| try evalSegs(a, v, rest, out, depth + 1, limit),
             else => {},
         },
         .index => |idx| switch (node) {
-            .array => |arr| if (idx < arr.items.len) try evalSegs(a, arr.items[idx], rest, out, depth + 1),
+            .array => |arr| if (idx < arr.items.len) try evalSegs(a, arr.items[idx], rest, out, depth + 1, limit),
             else => {},
         },
         .wildcard => switch (node) {
-            .array => |arr| for (arr.items) |it| try evalSegs(a, it, rest, out, depth + 1),
-            .object => |o| for (o.values()) |v| try evalSegs(a, v, rest, out, depth + 1),
+            .array => |arr| for (arr.items) |it| try evalSegs(a, it, rest, out, depth + 1, limit),
+            .object => |o| for (o.values()) |v| try evalSegs(a, v, rest, out, depth + 1, limit),
             else => {},
         },
-        .recursive => |name| try recursiveFind(a, node, name, rest, out, depth),
+        .recursive => |name| try recursiveFind(a, node, name, rest, out, depth, limit),
         .filter => |f| switch (node) {
             .array => |arr| for (arr.items) |it| {
-                if (matchFilter(it, f)) try evalSegs(a, it, rest, out, depth + 1);
+                if (matchFilter(it, f)) try evalSegs(a, it, rest, out, depth + 1, limit);
             },
             else => {},
         },
@@ -340,14 +388,14 @@ fn evalSegs(a: std.mem.Allocator, node: std.json.Value, segs: []const Seg, out: 
 
 /// Depth-first search for every object field named `name`, anywhere under
 /// `node` (any nesting) — the `..name` recursive-descent operator.
-fn recursiveFind(a: std.mem.Allocator, node: std.json.Value, name: []const u8, rest: []const Seg, out: *std.ArrayList(std.json.Value), depth: u32) Error!void {
+fn recursiveFind(a: std.mem.Allocator, node: std.json.Value, name: []const u8, rest: []const Seg, out: *std.ArrayList(std.json.Value), depth: u32, limit: usize) Error!void {
     if (depth > MAX_PATH_DEPTH) return;
     switch (node) {
         .object => |o| {
-            if (o.get(name)) |v| try evalSegs(a, v, rest, out, depth + 1);
-            for (o.values()) |v| try recursiveFind(a, v, name, rest, out, depth + 1);
+            if (o.get(name)) |v| try evalSegs(a, v, rest, out, depth + 1, limit);
+            for (o.values()) |v| try recursiveFind(a, v, name, rest, out, depth + 1, limit);
         },
-        .array => |arr| for (arr.items) |it| try recursiveFind(a, it, name, rest, out, depth + 1),
+        .array => |arr| for (arr.items) |it| try recursiveFind(a, it, name, rest, out, depth + 1, limit),
         else => {},
     }
 }
@@ -528,7 +576,12 @@ fn jsonToFloat(jv: std.json.Value) ?f64 {
 fn jsonToInt(jv: std.json.Value) ?i64 {
     return switch (jv) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        // ⚠ This was a bare `@intFromFloat(f)`. The number comes off the wire,
+        // so `1e300` into an `.int` column was undefined behaviour: SIGABRT in
+        // Debug and ReleaseSafe, silent `i64` minimum in ReleaseFast — against
+        // SPEC.md's "a shape mismatch never panics or propagates as an error".
+        // Out of range now degrades to `.null`, like every other mismatch here.
+        .float => |f| Value.floatToInt(i64, f),
         .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
         .string => |s| std.fmt.parseInt(i64, s, 10) catch null,
         else => null,
@@ -919,4 +972,193 @@ test "shape: the x column honours its declared .text type on every branch" {
         var buf: [8]u8 = undefined;
         try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d}", .{i}), got);
     }
+}
+
+// ── TEETH: the three guarantees that had no gate ────────────────────────────
+
+test "TEETH: an out-of-range JSON number degrades to null instead of panicking" {
+    // SPEC.md: "a shape mismatch never panics or propagates as an error."
+    // `jsonToInt` used a bare `@intFromFloat`, so a remote `1e300` into an
+    // `.int` column was undefined behaviour: SIGABRT in Debug and ReleaseSafe,
+    // silent i64-minimum in ReleaseFast. Three modes, three different answers,
+    // none of them the documented one.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_][]const u8{
+        "{\"r\":[{\"v\":1e300}]}",
+        "{\"r\":[{\"v\":-1e300}]}",
+        "{\"r\":[{\"v\":1e400}]}", // parses as +inf
+    }) |doc| {
+        const out_ds = try shape(a, doc, .{
+            .path = "r",
+            .columns = &.{.{ .name = "v", .key = "v", .type = .int }},
+        });
+        try testing.expectEqual(@as(usize, 1), out_ds.rows.len);
+        try testing.expect(out_ds.rows[0][0] == .null);
+    }
+    // A value that DOES fit still converts, so the guard is not simply
+    // rejecting everything.
+    const ok = try shape(a, "{\"r\":[{\"v\":42.9}]}", .{
+        .path = "r",
+        .columns = &.{.{ .name = "v", .key = "v", .type = .int }},
+    });
+    try testing.expectEqual(@as(i64, 42), ok.rows[0][0].int);
+}
+
+test "TEETH: an out-of-range JSON number degrades to null in a .decimal column too" {
+    // Distinct from the test above: `dataset`'s `Value.cast(.decimal)` guarded
+    // `isFinite(f)` while converting `f * 1e12`, so `1e30` — finite, and well
+    // inside f64 — reached `@intFromFloat` as `1e42`, which does not fit i128.
+    // The check was on a different number from the cast.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const out_ds = try shape(a, "{\"r\":[{\"v\":1e30}]}", .{
+        .path = "r",
+        .columns = &.{.{ .name = "v", .key = "v", .type = .decimal }},
+    });
+    try testing.expect(out_ds.rows[0][0] == .null);
+    const ok = try shape(a, "{\"r\":[{\"v\":1.5}]}", .{
+        .path = "r",
+        .columns = &.{.{ .name = "v", .key = "v", .type = .decimal }},
+    });
+    try testing.expect(ok.rows[0][0] == .decimal);
+}
+
+test "TEETH: MAX_PATH_DEPTH is load-bearing and is actually applied" {
+    // The depth cap is what stops a deeply nested document blowing the stack,
+    // and NOTHING tested it: raising the constant to 4,000,000 left the whole
+    // suite green while a 1.2 MB document segfaulted. A cap nothing exercises
+    // is indistinguishable from a comment.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Nest deeper than the cap, with the target key only at the bottom.
+    const depth = MAX_PATH_DEPTH + 10;
+    var doc: std.ArrayList(u8) = .empty;
+    for (0..depth) |_| try doc.appendSlice(a, "{\"n\":");
+    try doc.appendSlice(a, "{\"leaf\":[1,2]}");
+    for (0..depth) |_| try doc.append(a, '}');
+
+    // Reaching it needs more recursion than the cap allows, so the cap turns
+    // this into an empty result rather than unbounded descent.
+    const out_ds = try shape(a, doc.items, .{
+        .path = "..leaf",
+        .columns = &.{.{ .name = "v", .key = "", .type = .float }},
+    });
+    try testing.expectEqual(@as(usize, 0), out_ds.rows.len);
+
+    // Control: the SAME path against a shallow document does find it, so the 0
+    // above is the depth cap and not a broken fixture.
+    const shallow = try shape(a, "{\"n\":{\"leaf\":[1,2]}}", .{
+        .path = "..leaf",
+        .columns = &.{.{ .name = "v", .key = "", .type = .float }},
+    });
+    try testing.expectEqual(@as(usize, 2), shallow.rows.len);
+    try testing.expectEqual(@as(u32, 64), MAX_PATH_DEPTH);
+}
+
+test "TEETH: an out-of-range array index is refused, not read" {
+    // `.index` is the newest segment type and its bounds check had no test:
+    // deleting `if (idx < arr.items.len)` left all 21 tests green while giving
+    // an out-of-bounds read of a std.json.Value union.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const doc = "{\"a\":{\"b\":[[1],[2]]}}";
+
+    // One past the end, and far past it.
+    for ([_][]const u8{ "a.b[2]", "a.b[99999]" }) |path| {
+        const out_ds = try shape(a, doc, .{
+            .path = path,
+            .columns = &.{.{ .name = "v", .key = "", .type = .float }},
+        });
+        try testing.expectEqual(@as(usize, 0), out_ds.rows.len);
+    }
+    // Control: the last VALID index still resolves, so the guard is off by
+    // nothing in the other direction.
+    const ok = try shape(a, doc, .{
+        .path = "a.b[1]",
+        .columns = &.{.{ .name = "v", .key = "", .type = .float }},
+    });
+    try testing.expectEqual(@as(usize, 1), ok.rows.len);
+}
+
+test "TEETH: a fixed path on a hostile document is REFUSED, not amplified" {
+    // `MAX_PATH_DEPTH` was advertised as the DoS control. It bounds DEPTH, and
+    // depth is not what grows: `recursiveFind` visits every value at every
+    // level, so matches grow with the document's BRANCHING. Measured before
+    // this cap existed, with an operator-written 6-byte path where only the
+    // document is hostile: 163,831 B -> 393,220 rows, peak RSS 65 MiB (~417x).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `{"a":[<2 children>]}` nested 12 deep — ~41 KB, superlinear in matches.
+    var doc: std.ArrayList(u8) = .empty;
+    try buildBranching(a, &doc, 12, 2);
+
+    try testing.expectError(Error.TooManyMatches, shape(a, doc.items, .{
+        .path = "..a..a",
+        .columns = &.{.{ .name = "v", .key = "", .type = .float }},
+    }));
+
+    // Raising the caller's own ceiling lets it through, so this is a bound and
+    // not a broken path expression.
+    const out_ds = try shape(a, doc.items, .{
+        .path = "..a..a",
+        .columns = &.{.{ .name = "v", .key = "", .type = .float }},
+        .max_matches = 1 << 22,
+    });
+    try testing.expect(out_ds.rows.len > 65_536);
+}
+
+/// `{"a":[ <b copies> ]}` nested `d` deep — branching, which is the shape that
+/// amplifies. A chain of the same byte length does not.
+fn buildBranching(a: std.mem.Allocator, out: *std.ArrayList(u8), d: usize, b: usize) !void {
+    if (d == 0) {
+        try out.appendSlice(a, "1");
+        return;
+    }
+    try out.appendSlice(a, "{\"a\":[");
+    for (0..b) |i| {
+        if (i > 0) try out.append(a, ',');
+        try buildBranching(a, out, d - 1, b);
+    }
+    try out.appendSlice(a, "]}");
+}
+
+test "TEETH: a legacy dot-path really is routed to the legacy engine" {
+    // The existing back-compat test could not see the routing it was named
+    // for: forcing `isLegacyPath` to return false left it green, because both
+    // engines happen to agree on its fixture. They do NOT agree in general —
+    // a legacy path to a NON-array node yields no rows by design, while the
+    // JSONPath engine treats that match as a single item. Pinning the
+    // disagreement is what makes the routing observable.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = "{\"a\":{\"n\":1}}";
+    const cols = [_]JsonCol{.{ .name = "n", .key = "n", .type = .float }};
+
+    // Legacy: "a" is an object, not an array -> empty dataset.
+    const legacy = try shape(a, json, .{ .path = "a", .columns = &cols });
+    try testing.expectEqual(@as(usize, 0), legacy.rows.len);
+
+    // JSONPath (the leading `$` is what switches engines): the same node
+    // becomes one item.
+    const jsonpath = try shape(a, json, .{ .path = "$.a", .columns = &cols });
+    try testing.expectEqual(@as(usize, 1), jsonpath.rows.len);
+
+    // And the predicate itself, so a future refactor of the trigger set is
+    // caught at its source and not only through this behavioural difference.
+    try testing.expect(isLegacyPath("a.b"));
+    try testing.expect(!isLegacyPath("$.a"));
+    try testing.expect(!isLegacyPath("a.b[0]"));
+    try testing.expect(!isLegacyPath("a.*"));
+    try testing.expect(!isLegacyPath("..a"));
+    try testing.expect(!isLegacyPath("a[?(@.x == 1)]"));
 }

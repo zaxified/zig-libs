@@ -29,7 +29,10 @@ Given raw JSON bytes and a `ShapeSpec`:
    - **JSONPath subset** (anything else): object keys, array **indices**
      (`a.b[2]`), **wildcards** (`a.b[*]` over an array, `a.*` over an
      object's values), **recursive descent** (`..name`, finds every `name`
-     field anywhere under the current node), and **filter expressions**
+     field under the current node **down to a fixed depth of 64** — deeper
+     matches are silently absent, and the same budget is shared with the
+     path's own segments, so a path of 65+ segments finds nothing), and
+     **filter expressions**
      (`items[?(@.field == "x")]`, `items[?(@.n > 5)]` — one comparison,
      ops `== != < <= > >=`, literal a quoted string/number/`true`/`false`/
      `null`; no `&&`/`||`, no nesting). Any of these can match multiple
@@ -64,11 +67,25 @@ honoring the column's declared `ColumnType`, including JSON's
   special-casing it.
 - **Malformed JSON → `Error.BadJson`.** The only error this module raises;
   everything else (missing keys, type mismatches per cell, bad path/filter
-  syntax) degrades to `.null` cells or an empty dataset.
-- **Bounded recursion.** Recursive descent (`..name`) and general path
-  evaluation are capped at a fixed depth so a crafted path can't
-  stack-overflow on a deeply-nested document; filter predicates are
-  single-level (no recursion of their own).
+  syntax, and numbers outside the target column's range) degrades to `.null`
+  cells or an empty dataset. The errors it CAN raise are `BadJson`,
+  `OutOfMemory` and `TooManyMatches` — note that RFC-legal duplicate object
+  keys are rejected as `BadJson` by the underlying `std.json` parser.
+- **Bounded recursion, and separately a bounded result.** Recursive descent
+  (`..name`) and general path evaluation are capped at a fixed depth so a
+  crafted path can't stack-overflow on a deeply-nested document; filter
+  predicates are single-level (no recursion of their own).
+  ⚠ **The depth cap alone was NOT a DoS control, though this section used to
+  read as though it were.** Depth is not the quantity that grows: `..name`
+  visits every value at every level, so matches grow with the document's
+  *branching*. Measured with a fixed, operator-written 6-byte path where only
+  the document was hostile: **163,831 B → 393,220 rows, peak RSS 65 MiB
+  (~417x)**, superlinear. The bound on the quantity that actually grows is
+  `MAX_MATCHES` (65,536 by default, `ShapeSpec.max_matches` to change it),
+  which counts both matched nodes and the items they flatten into — a single
+  match that is a large array becomes that many rows while the match counter
+  reads 1. Exceeding it is `error.TooManyMatches`, a **refusal**: a truncated
+  projection is a wrong answer that looks like a right one.
 - **Arena-scoped strings.** Text cells parsed from JSON strings borrow the
   parse tree living in the caller's allocator (normally an arena) — free
   everything at once via that arena, same memory model as `dataset` itself.

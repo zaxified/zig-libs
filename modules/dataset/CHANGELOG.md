@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-03** — Two unguarded `@intFromFloat` conversions on public API, found
+  while auditing `jsonshape` (its `.int`/`.decimal` columns route here). New
+  `Value.floatToInt`, and both sites go through it.
+  - `Value.asInt` did `.float => @intFromFloat(f)` with no range check. Out of
+    range is undefined behaviour: it panics in Debug and ReleaseSafe and yields
+    silent garbage in ReleaseFast, so it was not a conversion untrusted numbers
+    could be handed to. Now returns `null`, which the doc already implied for
+    the `decimal` arm.
+  - `Value.cast(.decimal)` guarded the **wrong value**: `isFinite(f)` while the
+    conversion was of `f * decimal_scale`, a different number by twelve orders
+    of magnitude. `1e30` is finite; `1e42` does not fit `i128`. The bound is now
+    checked on the scaled product that is actually converted.
+
 - **2026-08-18** — Portability fix (`check-portable`): the `"serialize rejects a length
   that overflows the u32 wire field"` test crafted an oversized slice via
   `(@as(usize, 1) << 33)` to probe the `error.TooLarge` guard. On a 32-bit target
