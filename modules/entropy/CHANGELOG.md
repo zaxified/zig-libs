@@ -5,6 +5,44 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-04** — **First audit.** The module's central guarantee — abort
+  rather than silently degrade — **had no test**. Three mutations were green at
+  12/12: deleting the `@panic` arm, swapping it for `unreachable`, and
+  replacing the whole `catch` with `catch { io.random(buf); }`, which is
+  precisely the fall-back-to-the-degrading-source defect SPEC's opening section
+  says this module exists to prevent. A caller drawing a key would have
+  received plausible PRNG bytes with no way to tell.
+
+  The property is an *effect*, not a value, so no value test can see it. `fill`
+  now has one that forks, fails `getrandom(2)` inside the child with a
+  seccomp-BPF filter, and asserts the child is killed by **SIGABRT with
+  `unavailable_message` in its output**. All three mutations are red, in Debug
+  **and** ReleaseFast. Reading the message matters: `unreachable` also aborts
+  in Debug and ReleaseSafe and stops aborting only in ReleaseFast, so a test
+  accepting any SIGABRT would have caught that mutation in exactly the mode the
+  default gate does not run.
+
+  Three doc claims corrected, each measured rather than reasoned about:
+
+  * SPEC said an `Io` without `swapCancelProtection` "panics with 'reached
+    unreachable code' … what is lost is the diagnostic text on a path nothing
+    takes". Debug exits 13 and ReleaseSafe 134, but **ReleaseFast and
+    ReleaseSmall do not panic at all** — one binary took SIGSEGV, another fell
+    through into an unrelated branch and ran to completion. What is lost in the
+    build that ships is the abort, not the text.
+  * `fill`'s doc said a zero-length `buf` "still makes the call, so a caller
+    cannot accidentally treat 'no entropy needed' as 'entropy is fine here'".
+    Measured under the same seccomp filter: `fill(io, &.{})` **returns cleanly
+    on a machine with no entropy at all**. The test that appeared to prove
+    otherwise counted vtable invocations, which is a different quantity from
+    entropy accesses.
+  * `SecureSource`'s doc named twelve `std.Random.IoSource` call sites in `bfv`
+    and `tfhe` by line, and framed migrating them as an open decision. They
+    migrated: `std.Random.IoSource` now appears **nowhere in the collection as
+    code**, and both modules added the comptime guard this doc says the swap
+    requires. The line citations are removed rather than corrected — a claim
+    about what exists anywhere can be re-measured with one `rg`.
+
 - **2026-08-13** — **BEHAVIOURAL, and source-breaking on one symbol.** `fill` no
   longer aborts the host process on `error.Canceled`. The draw now runs with
   cancellation blocked — `io.swapCancelProtection(.blocked)` with a `defer`

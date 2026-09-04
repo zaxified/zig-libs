@@ -164,8 +164,16 @@ pub const unavailable_message =
 /// `io.random` is for, and paying a syscall — let alone a process abort — for
 /// them is wrong.
 ///
-/// A zero-length `buf` is legal and still makes the call (so a caller cannot
-/// accidentally treat "no entropy needed" as "entropy is fine here").
+/// ⚠ A zero-length `buf` is legal and **returns cleanly even on a machine with
+/// no entropy at all** — measured under a seccomp filter failing
+/// `getrandom(2)`, on the default `Threaded` backend. This used to claim the
+/// opposite ("still makes the call, so a caller cannot accidentally treat 'no
+/// entropy needed' as 'entropy is fine here'"); the backends short-circuit an
+/// empty buffer before any syscall (`Io/Uring.zig` returns outright, and
+/// `Threaded`'s draw loop completes without a live draw), so the promise was
+/// not this module's to make. The test that appeared to prove it counted
+/// vtable invocations, which is a different quantity from entropy accesses.
+/// First audit, 2026-09-04.
 ///
 /// Cancellation is blocked across the draw, so a cancel aimed at the calling
 /// task is observed after `fill` returns rather than aborting the process. That
@@ -193,25 +201,28 @@ pub fn fill(io: std.Io, buf: []u8) void {
 /// counterpart of `std.Random.IoSource`, which binds the degrading
 /// `io.random`.
 ///
-/// This exists for one concrete shape that is already all over this repo: a
-/// module whose public entry point takes `io: std.Io` but whose internals are
-/// written against `std.Random`, so the entry point adapts one to the other
-/// and immediately loses the distinction. Twelve such call sites exist today
-/// —
+/// This exists for one concrete shape: a module whose public entry point takes
+/// `io: std.Io` but whose internals are written against `std.Random`, so the
+/// entry point adapts one to the other and immediately loses the distinction.
 ///
 /// ```zig
-/// // modules/bfv/src/bfv.zig:674 (keyGen), :711, :1010
-/// // modules/tfhe/src/tfhe.zig:284, :312, :352, :400, :428, :481, :515, :542, :569
-/// var src: std.Random.IoSource = .{ .io = io };
+/// var src: std.Random.IoSource = .{ .io = io };   // binds the DEGRADING source
 /// return self.keyGenForTest(src.interface());
 /// ```
 ///
-/// — every one of them drawing a secret key or its noise, and both modules'
-/// own doc comments name failing closed via `randomSecure` as an open
-/// decision they have not been able to act on. Swapping `std.Random.IoSource`
-/// for this type is the whole change at each site. Whether those modules take
-/// it is their owners' call; the binding they would need is here rather than
-/// twelve copies of it there.
+/// ⚠ **This used to name twelve such call sites in `bfv` and `tfhe`, by line,
+/// and describe taking the swap as an open decision their owners had not been
+/// able to act on. They took it.** Measured at the first audit (2026-09-04):
+/// `std.Random.IoSource` appears **nowhere in this collection as code** — every
+/// remaining mention is a comment explaining why it is not used. Both modules
+/// draw through `SecureSource` now, and both added the second half this doc
+/// comment says the swap requires: a comptime guard asserting their production
+/// entry points take `std.Io` and not `std.Random`
+/// (`bfv/src/bfv.zig`'s and `tfhe/src/tfhe.zig`'s `lastParamType` checks).
+///
+/// The line numbers are gone rather than corrected: a citation by line drifts
+/// silently and this one had, while a claim about what exists anywhere in the
+/// collection can be re-measured with one `rg`.
 ///
 /// The `std.Random` vtable's `fillFn` returns `void`, so this inherits `fill`'s
 /// abort semantics by construction — there is no error channel to add.
@@ -365,6 +376,138 @@ const CountingIo = struct {
 // difference-across-calls, whole-buffer-coverage and not-all-zero all pass
 // under either implementation. This one does not: it observes which vtable
 // slot the call actually went to.
+// ── the abort, observed rather than asserted ────────────────────────────────
+//
+// ⚠ Until the first audit (2026-09-04) **nothing in this suite could tell a
+// module that aborts from one that silently degrades** — which is the single
+// property this module exists to provide. Three mutations were green at 12/12:
+// deleting the `@panic` arm outright, swapping the two arms, and — the one
+// that matters — replacing the whole `catch` with `catch { io.random(buf); }`,
+// i.e. exactly the fall-back-to-the-degrading-source defect SPEC's opening
+// section says this module was written to prevent. A caller drawing a key
+// would have got plausible bytes from a PRNG seed and no way to know.
+//
+// A value test cannot see this: the property is an *effect* (the process
+// dies), not a result. So the test below forks, makes `getrandom(2)` fail
+// inside the child with a seccomp filter, and asserts the child is killed by
+// SIGABRT rather than returning. Same shape as the repo's other
+// artefact-level gates, for the same reason — see
+// `scripts/check-fp-freedom.sh`.
+
+const sock_filter = extern struct { code: u16, jt: u8, jf: u8, k: u32 };
+const sock_fprog = extern struct { len: u16, filter: [*]const sock_filter };
+
+/// Install a seccomp-BPF filter failing `getrandom(2)` with `EPERM`. x86_64
+/// only — the audit arch and syscall number are both architecture-specific,
+/// and the test that uses it skips elsewhere rather than guessing.
+fn blockGetrandom() !void {
+    const AUDIT_ARCH_X86_64: u32 = 0xc000003e;
+    const NR_getrandom: u32 = 318;
+    const LD_W_ABS: u16 = 0x20;
+    const JMP_JEQ_K: u16 = 0x15;
+    const RET_K: u16 = 0x06;
+
+    if (std.os.linux.prctl(@intFromEnum(std.os.linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0) != 0)
+        return error.NoNewPrivs;
+
+    const filter = [_]sock_filter{
+        .{ .code = LD_W_ABS, .jt = 0, .jf = 0, .k = 4 }, // arch
+        .{ .code = JMP_JEQ_K, .jt = 0, .jf = 3, .k = AUDIT_ARCH_X86_64 },
+        .{ .code = LD_W_ABS, .jt = 0, .jf = 0, .k = 0 }, // syscall nr
+        .{ .code = JMP_JEQ_K, .jt = 0, .jf = 1, .k = NR_getrandom },
+        .{ .code = RET_K, .jt = 0, .jf = 0, .k = @as(u32, std.os.linux.SECCOMP.RET.ERRNO) | 1 },
+        .{ .code = RET_K, .jt = 0, .jf = 0, .k = std.os.linux.SECCOMP.RET.ALLOW },
+    };
+    const prog: sock_fprog = .{ .len = filter.len, .filter = &filter };
+    const rc = std.os.linux.prctl(
+        @intFromEnum(std.os.linux.PR.SET_SECCOMP),
+        std.os.linux.SECCOMP.MODE.FILTER,
+        @intFromPtr(&prog),
+        0,
+        0,
+    );
+    if (rc != 0) return error.SeccompUnavailable;
+}
+
+test "fill ABORTS when entropy is unavailable -- it does not return, and does not degrade" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64)
+        return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Warm the backend before forking: a child of a multi-threaded process
+    // has no thread pool, so anything lazily initialised must exist already.
+    var warm: [8]u8 = undefined;
+    io.random(&warm);
+
+    // The child's stderr is piped back, because WHICH abort happened matters:
+    // swapping `@panic(unavailable_message)` for `unreachable` still aborts in
+    // Debug and ReleaseSafe, and only stops aborting in ReleaseFast — so a
+    // test that accepts any SIGABRT catches that mutation in exactly the mode
+    // the default gate does not run. Reading the message makes the guard hold
+    // in every mode.
+    var fds: [2]i32 = undefined;
+    if (std.os.linux.pipe2(&fds, .{}) != 0) return error.SkipZigTest;
+
+    const rc = std.os.linux.fork();
+    const pid: isize = @bitCast(rc);
+    if (pid < 0) return error.SkipZigTest;
+    if (pid == 0) {
+        _ = std.os.linux.close(fds[0]);
+        _ = std.os.linux.dup3(fds[1], 2, 0);
+        var buf: [32]u8 = @splat(0xa5);
+        // 70: this environment forbids seccomp, so the test proves nothing.
+        blockGetrandom() catch std.os.linux.exit(70);
+        fill(io, &buf);
+        // 71: `fill` RETURNED with no entropy available. That is the defect.
+        std.os.linux.exit(71);
+    }
+    _ = std.os.linux.close(fds[1]);
+
+    var msg: [4096]u8 = undefined;
+    var msg_len: usize = 0;
+    while (msg_len < msg.len) {
+        const n = std.os.linux.read(fds[0], msg[msg_len..].ptr, msg.len - msg_len);
+        const got: isize = @bitCast(n);
+        if (got <= 0) break;
+        msg_len += @intCast(got);
+    }
+    _ = std.os.linux.close(fds[0]);
+
+    var status: u32 = 0;
+    _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
+    const sig = status & 0x7f;
+    const exit_code = (status >> 8) & 0xff;
+
+    if (sig == 0 and exit_code == 70) return error.SkipZigTest; // no seccomp here
+    if (sig == 0 and exit_code == 71) {
+        std.debug.print(
+            "\nfill() RETURNED with getrandom(2) failing: the abort is gone\n",
+            .{},
+        );
+        return error.TestUnexpectedResult;
+    }
+    // SIGABRT (6) is what `@panic` produces. Accept nothing else: an exit
+    // code would mean it returned, and a different signal would mean it died
+    // of something other than its own refusal.
+    try std.testing.expectEqual(@as(u32, 6), sig);
+
+    // And it must be THIS refusal. `unreachable` aborts too, with "reached
+    // unreachable code" -- which is a different promise to a reader and, in
+    // ReleaseFast, no promise at all.
+    const printed = msg[0..msg_len];
+    const needle = unavailable_message[0..@min(unavailable_message.len, 40)];
+    if (std.mem.indexOf(u8, printed, needle) == null) {
+        std.debug.print(
+            "\nfill() aborted, but not with `unavailable_message`. It printed:\n{s}\n",
+            .{printed},
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
 test "fill draws from randomSecure and never from random" {
     var probe: CountingIo = .{ .inner = testing.io };
     const io = probe.io();

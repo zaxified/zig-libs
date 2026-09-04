@@ -87,12 +87,22 @@ Two costs, neither hidden:
   The alternative on that same path is not "cancel promptly", it is "abort the
   process".
 - **`fill` now requires an `std.Io` that implements `swapCancelProtection`.**
-  `std.Io.failing` does not — every cancellation slot on it is `unreachable` —
-  so `fill(std.Io.failing, buf)` panics with "reached unreachable code" from
-  inside std instead of with `unavailable_message`. Verified by running it.
-  That `Io` simulates a machine with no `Io` operations at all, a draw on it was
-  already fatal, and no production consumer passes it; what is lost is the
-  diagnostic text on a path nothing takes. `Threaded`, `Evented`, `Uring` and
+  `std.Io.failing` does not — every cancellation slot on it is `unreachable`.
+
+  ⚠ **Corrected by the first audit (2026-09-04): "panics with 'reached
+  unreachable code'" is a Debug-only outcome, and the sentence that followed it
+  drew the wrong conclusion from it.** Measured on a 20-line isolate in all four
+  modes: Debug exits 13, ReleaseSafe exits 134 — and **ReleaseFast and
+  ReleaseSmall do not panic at all**: one binary took SIGSEGV (139), and in
+  another the call fell through into an unrelated branch and the program ran to
+  completion. `unreachable` is not a check in an optimized build; it is a
+  promise to the optimizer.
+
+  So what is lost in the build that ships is **not the diagnostic text on a
+  path nothing takes** — it is the abort itself. The mitigating facts still
+  hold (that `Io` simulates a machine with no `Io` operations at all, a draw on
+  it was already fatal, and no production consumer passes it), but they are the
+  reason the exposure is small, not a reason the sentence was right. `Threaded`, `Evented`, `Uring` and
   `Dispatch` all implement the slot.
 
 The removal of the second `@panic` arm also closed a real test gap. With two
