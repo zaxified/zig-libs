@@ -73,9 +73,12 @@
 //!  * `classify` / `mtuHintV4` / `mtuHintV6` — turn one received ICMP/ICMPv6
 //!    message into a `ProbeOutcome`, reading RFC 1191's next-hop-MTU hint
 //!    (v4: 2 bytes at ICMP header offset 6) / RFC 4443 §3.2's MTU field (v6:
-//!    4 bytes at offset 4) when a router supplies one. `searchWith` trusts a
-//!    valid hint the same way a real kernel PMTUD implementation does —
-//!    converging on it directly rather than re-probing that exact size.
+//!    4 bytes at offset 4) when a router supplies one. ⚠ `searchWith` uses a
+//!    valid hint to NARROW its ceiling, never as the answer: `Result.mtu` is
+//!    always a size this module probed and saw succeed. A kernel PMTUD
+//!    implementation does adopt the router's figure directly; this one does
+//!    not, because ICMP is unauthenticated and a forged hint otherwise names
+//!    the result outright (measured, first audit 2026-09-04).
 //!  * `probe` — the live path: opens an `icmp.Socket` (DGRAM if unprivileged
 //!    ping is permitted, RAW otherwise — CAP_NET_RAW), wires it into
 //!    `searchWith` via `Prober`.
@@ -325,17 +328,34 @@ fn applyOutcome(size: u16, outcome: ProbeOutcome, lo: *u16, hi: *u16, saw_frag_n
         .ok => lo.* = size,
         .frag_needed => |hint| {
             saw_frag_needed.* = true;
-            // RFC 1191/4443: the next-hop MTU a router reports is a size
-            // that DOES fit (not a size that failed) -- the same trust a
-            // real kernel PMTUD implementation places in it, without
-            // re-probing that exact size. So a valid hint raises `lo` to
-            // the hint itself and drops `hi` to one past it, converging
-            // immediately rather than merely narrowing.
+            // ⚠ A hint NARROWS the ceiling; it never becomes the answer.
+            //
+            // This used to read `lo.* = h16; hi.* = h16 + 1; return;` — the
+            // hint was adopted as the result **without ever being probed**,
+            // on the reasoning that a real kernel PMTUD implementation trusts
+            // the router's next-hop MTU the same way. A kernel may; this
+            // module's SPEC promised something else, and the two cannot both
+            // hold: "a malformed or hostile hint can only make the search
+            // slower, never wrong", and a falsely-large answer with
+            // `blackhole = false` is "the one direction the spoofed-hint case
+            // structurally cannot produce".
+            //
+            // Measured at the first audit (2026-09-04) against a prober whose
+            // true path MTU is 300, answering the first (ceiling) probe with a
+            // forged Fragmentation-Needed: **reported mtu = 1499,
+            // blackhole = false, in 2 probes** — any value the attacker names
+            // in `(floor, ceiling)`, and 1199 bytes too large. ICMP is
+            // unauthenticated, so that packet is available to anyone who can
+            // guess `ident`. It is also what RFC 1191 §3 and RFC 8201 §4
+            // forbid: a PMTU estimate may only ever DECREASE for a path.
+            //
+            // Setting only `hi` keeps the hint's whole benefit — the search
+            // still jumps straight past everything above it — while `lo`, and
+            // therefore `Result.mtu`, advances only on an `.ok` this module
+            // saw for itself. Cost: one extra probe.
             if (hint) |h| {
                 if (h > lo.* and h < size and h < std.math.maxInt(u16)) {
-                    const h16: u16 = @intCast(h);
-                    lo.* = h16;
-                    hi.* = h16 + 1;
+                    hi.* = @as(u16, @intCast(h)) + 1;
                     return;
                 }
             }
@@ -518,7 +538,7 @@ const LiveProber = struct {
         // original bug read past the end of this buffer and handed the
         // over-length slice to `sendTo`. `@panic` does not compile out in
         // any mode.
-        if (wire_size < self.ip_header_len or wire_size - self.ip_header_len > self.buf.len)
+        if (!probeFits(wire_size, self.ip_header_len, self.buf.len))
             @panic("pathmtu: LiveProber.attempt: wire_size exceeds probe buffer capacity");
 
         const payload_len = wire_size - self.ip_header_len;
@@ -551,6 +571,22 @@ const LiveProber = struct {
             const deadline: u64 = @as(u64, @intCast(icmp.monoNow())) + @as(u64, self.timeout_ms) * std.time.ns_per_ms;
             var recv_buf: [max_probe_mtu + 128]u8 = undefined;
             while (true) {
+                // ⚠ The deadline is checked at the TOP, before every receive.
+                // It used to sit only on the EAGAIN branch, so a packet that
+                // arrived `continue`d past it without ever consulting the
+                // clock — `timeout_ms` bounded how long this attempt sat
+                // IDLE, not how long it could run, and the quantity at risk
+                // is the second one. Measured at the first audit
+                // (2026-09-04) with a 1 ms budget: **8739 unrelated packets
+                // absorbed, one deadline check, 18 ms**. Anyone who can put
+                // ICMP on this host's loopback or guess `ident` gets that for
+                // free, and on the RAW lane the kernel delivers every ICMP
+                // packet on the host, so it needs no attacker at all on a
+                // busy machine. The tenth instance in this collection of a
+                // cap that bounds the wrong quantity.
+                const now: u64 = @intCast(icmp.monoNow());
+                if (now >= deadline) break;
+
                 if (self.sock.recvMsg(&recv_buf)) |info| {
                     if (classify(self.family, self.strip_ip_header, info.packet, self.sock.ident, seq)) |c| {
                         switch (c) {
@@ -560,8 +596,6 @@ const LiveProber = struct {
                     }
                     continue;
                 }
-                const now: u64 = @intCast(icmp.monoNow());
-                if (now >= deadline) break;
                 pollOnce(self.sock.fd, linux.POLL.IN, deadline - now);
             }
         }
@@ -610,6 +644,37 @@ fn pollOnce(fd: i32, events: i16, wait_ns: u64) void {
 /// Needed/Packet Too Big shrinks the search) from a black hole (the same
 /// boundary found only because nothing ever answered) -- see the module doc
 /// comment and `Result.blackhole`.
+/// The search ceiling, from the two sources that can set it.
+///
+/// ⚠ Extracted from `probe` so it can be tested **without a socket or any
+/// privilege**, which is the whole point: the 2026-08-18 CRITICAL was an
+/// over-large ceiling reaching `LiveProber`'s fixed `max_probe_mtu`-byte stack
+/// buffer, and the fix guarded BOTH routes but only ONE was regression-tested.
+/// `Options.ceiling_mtu` is refused above `max_probe_mtu` and has two tests
+/// named for the finding; `Options.iface` -> `SIOCGIFMTU` is CLAMPED here and
+/// had none. Measured at the first audit (2026-09-04): changing this clamp to
+/// 65535 left the suite green in Debug, ReleaseSafe **and** ReleaseFast, and
+/// `ifaceMtu("lo")` on an ordinary host is **65536** — so an entirely
+/// legitimate `probe(dest, .{ .iface = "lo" })` reproduced the original defect,
+/// as a bounds panic in the safe modes and a SIGSEGV in ReleaseFast.
+///
+/// A live test could not have held this: `probe` needs CAP_NET_RAW or a
+/// permissive `ping_group_range`, so on an ordinary host it SKIPS — and a skip
+/// is a pass.
+fn ceilingFor(explicit: ?u16, iface_mtu: ?u32) u16 {
+    const from_iface: ?u16 = if (iface_mtu) |m| @intCast(@min(m, max_probe_mtu)) else null;
+    return explicit orelse from_iface orelse default_ceiling_mtu;
+}
+
+/// Does a probe of `wire_size` fit the fixed probe buffer? Extracted for the
+/// same reason as `ceilingFor`: `attempt`'s `@panic` is defence in depth for
+/// the same invariant, it is unreachable while the clamp above holds, and
+/// deleting it was green in every mode.
+fn probeFits(wire_size: u16, ip_header_len: u16, buf_len: usize) bool {
+    if (wire_size < ip_header_len) return false;
+    return wire_size - ip_header_len <= buf_len;
+}
+
 pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
     const family = toSocketFamily(dest);
     const ip_header_len: u16 = switch (family) {
@@ -636,8 +701,7 @@ pub fn probe(dest: netaddr.Ip, opts: Options) ProbeError!Result {
     var iface_mtu: ?u32 = null;
     if (opts.iface) |name| iface_mtu = ifaceMtu(name) catch null;
 
-    const ceiling_from_iface: ?u16 = if (iface_mtu) |m| @intCast(@min(m, max_probe_mtu)) else null;
-    const ceiling: u16 = opts.ceiling_mtu orelse ceiling_from_iface orelse default_ceiling_mtu;
+    const ceiling: u16 = ceilingFor(opts.ceiling_mtu, iface_mtu);
     if (ceiling <= floor) return error.CeilingTooLow;
 
     var sock = icmp.Socket.open(family, .auto, .{ .dont_fragment = true }) catch |err| switch (err) {
@@ -714,6 +778,65 @@ const Ifreq = extern struct {
 const testing = std.testing;
 
 // -- mtuHintV4 / mtuHintV6 ----------------------------------------------------
+
+test "the interface-derived ceiling can never exceed the probe buffer" {
+    // TEETH for the SECOND route into `LiveProber`'s fixed 9000-byte stack
+    // buffer. The 2026-08-18 CRITICAL was fixed on both routes and
+    // regression-tested on one; measured at the first audit, changing this
+    // clamp to 65535 left the suite green in all three modes while
+    // `ifaceMtu("lo")` = 65536 on an ordinary host — a legitimate call
+    // reproducing the original defect, SIGSEGV in ReleaseFast.
+    try testing.expectEqual(max_probe_mtu, ceilingFor(null, 65536)); // loopback
+    try testing.expectEqual(max_probe_mtu, ceilingFor(null, 9001)); // one over
+    try testing.expectEqual(max_probe_mtu, ceilingFor(null, std.math.maxInt(u32)));
+    try testing.expectEqual(max_probe_mtu, ceilingFor(null, max_probe_mtu)); // exactly at it
+    // Below the cap the interface value is used as-is...
+    try testing.expectEqual(@as(u16, 1500), ceilingFor(null, 1500));
+    try testing.expectEqual(@as(u16, 68), ceilingFor(null, 68));
+    // ...an explicit ceiling wins over the interface...
+    try testing.expectEqual(@as(u16, 576), ceilingFor(576, 65536));
+    // ...and with neither source it is the documented default.
+    try testing.expectEqual(default_ceiling_mtu, ceilingFor(null, null));
+}
+
+test "probeFits: the buffer-capacity invariant `attempt` panics on, at both ends" {
+    // TEETH for the defence-in-depth `@panic`. It is unreachable while
+    // `ceilingFor` holds, so deleting it was green in every mode. The
+    // predicate is testable even though the branch it guards is not.
+    const buf_len: usize = max_probe_mtu;
+    try testing.expect(probeFits(1500, 20, buf_len));
+    try testing.expect(probeFits(max_probe_mtu, 0, buf_len)); // exactly full
+    try testing.expect(probeFits(max_probe_mtu + 20, 20, buf_len)); // header excluded
+    try testing.expect(!probeFits(max_probe_mtu + 21, 20, buf_len)); // one byte over
+    try testing.expect(!probeFits(65535, 20, buf_len)); // what an unclamped `lo` would ask for
+    // The other end: a wire size below the IP header underflows if unchecked.
+    try testing.expect(!probeFits(19, 20, buf_len));
+    try testing.expect(probeFits(20, 20, buf_len));
+    try testing.expect(!probeFits(0, 20, buf_len));
+}
+
+test "the probe buffer ships zeroed, not as stale stack" {
+    // The other half of the same 2026-08-18 CRITICAL: with `buf` left
+    // `undefined`, every probe put whatever was on the stack past the 8-byte
+    // echo header onto the wire, to a destination the caller merely named.
+    // Reverting `@splat(0)` to `undefined` was green in every mode.
+    // ⚠ This test is honest about its own limit: in ReleaseFast `undefined`
+    // may happen to be zero, so it is a guard in Debug and ReleaseSafe and a
+    // coincidence away from vacuous in ReleaseFast. The initializer is the
+    // artefact; there is no value test that can see the difference in the
+    // mode that ships.
+    const lp: LiveProber = .{
+        .sock = undefined,
+        .family = .v4,
+        .ip_header_len = 20,
+        .strip_ip_header = false,
+        .dest = .{ .v4 = .{ .port = 0, .addr = 0 } },
+        .retries = 0,
+        .timeout_ms = 1,
+        .seq = 0,
+    };
+    for (lp.buf) |b| try testing.expectEqual(@as(u8, 0), b);
+}
 
 test "mtuHintV4: reads the next-hop MTU field, treats zero as absent" {
     var bytes: [8]u8 = .{ 3, 4, 0, 0, 0, 0, 0x05, 0x14 }; // hint = 0x0514 = 1300
@@ -797,6 +920,26 @@ test "classify: ip-header stripping is exact at the IHL boundary" {
 
 // -- searchWith: pure binary search over a fake Prober ------------------------
 
+/// Can this host open an ordinary unprivileged UDP socket at all? Asked of
+/// the kernel directly so that a live test's skip condition never comes from
+/// the code that live test exists to check.
+fn udpSocketsWork() bool {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
+    const fd: isize = @bitCast(rc);
+    if (fd < 0) return false;
+    _ = linux.close(@intCast(fd));
+    return true;
+}
+
+/// Can this host open the ICMP socket `probe` needs — CAP_NET_RAW, or an
+/// unprivileged DGRAM ping socket permitted by `net.ipv4.ping_group_range`?
+/// Asked of `icmp.Socket` rather than inferred from `probe`'s error.
+fn icmpSocketsWork() bool {
+    var sock = icmp.Socket.open(.v4, .auto, .{ .dont_fragment = true }) catch return false;
+    sock.close();
+    return true;
+}
+
 const FakeProber = struct {
     /// Largest wire size that actually "fits" -- sizes <= this are `.ok`.
     real_mtu: u16,
@@ -816,6 +959,109 @@ const FakeProber = struct {
         return if (self.explicit_icmp) .{ .frag_needed = self.hint } else .no_reply;
     }
 };
+
+test "applyOutcome: every guard on the router-supplied hint, and the IPv6 floor" {
+    // TEETH for four mutations that were all green at the first audit
+    // (2026-09-04). RFC 8201 §4 is a MUST — "a node MUST NOT reduce its
+    // estimate of the Path MTU below the IPv6 minimum link MTU" — and RFC
+    // 8200 §5 sets that minimum at 1280. Two lines make this module honour
+    // it: the constant below, and `applyOutcome`'s `h > lo.*`.
+    try testing.expectEqual(@as(u16, 1280), min_mtu_v6); // M37: lowering this was green
+    try testing.expectEqual(@as(u16, 68), min_mtu_v4); // RFC 1191 §3's floor
+
+    var lo: u16 = undefined;
+    var hi: u16 = undefined;
+    var frag = false;
+    var timeout = false;
+
+    // M04 — a hint at or below the floor must not pull the estimate down.
+    // Without `h > lo.*` a single forged Packet-Too-Big carrying 68 drags an
+    // IPv6 path under the protocol minimum.
+    lo = min_mtu_v6;
+    hi = 1500;
+    applyOutcome(1500, .{ .frag_needed = 68 }, &lo, &hi, &frag, &timeout);
+    try testing.expectEqual(min_mtu_v6, lo); // floor held
+    try testing.expectEqual(@as(u16, 1500), hi); // fell back to "the probed size failed"
+
+    // M05 — a hint at or above the size that just failed is nonsense: the
+    // router is claiming a link carries more than the packet it just dropped.
+    lo = 1000;
+    hi = 1500;
+    applyOutcome(1200, .{ .frag_needed = 1200 }, &lo, &hi, &frag, &timeout);
+    try testing.expectEqual(@as(u16, 1200), hi);
+    lo = 1000;
+    hi = 1500;
+    applyOutcome(1200, .{ .frag_needed = 1400 }, &lo, &hi, &frag, &timeout);
+    try testing.expectEqual(@as(u16, 1200), hi);
+
+    // A hint outside u16 must not be truncated into a plausible one.
+    // ⚠ Honest note: `h < std.math.maxInt(u16)` in that condition is
+    // REDUNDANT, and this assertion cannot show otherwise. `size` is a `u16`,
+    // so `h < size` already implies `h < 65535` — measured: deleting the u16
+    // clause leaves this test green, and no test can make it red, because
+    // removing it changes no behaviour. Kept in the source as a statement of
+    // intent about a `?u32` field, not as a guard that does work.
+    lo = 1000;
+    hi = 1500;
+    applyOutcome(1400, .{ .frag_needed = std.math.maxInt(u32) }, &lo, &hi, &frag, &timeout);
+    try testing.expectEqual(@as(u16, 1400), hi);
+
+    // An honest hint narrows the ceiling to just past itself — and never
+    // moves `lo`, which is what keeps the reported MTU a size we probed.
+    lo = 68;
+    hi = 1500;
+    applyOutcome(1500, .{ .frag_needed = 1300 }, &lo, &hi, &frag, &timeout);
+    try testing.expectEqual(@as(u16, 68), lo);
+    try testing.expectEqual(@as(u16, 1301), hi);
+}
+
+/// A hostile path: the true MTU is small, but every oversized probe is
+/// answered with a Fragmentation-Needed carrying an attacker-chosen hint —
+/// exactly what an off-path spoofer who guesses `ident` can send, since ICMP
+/// carries no authentication.
+const ForgingProber = struct {
+    real_mtu: u16,
+    forged_hint: u32,
+    probes: usize = 0,
+
+    fn prober(self: *ForgingProber) Prober {
+        return .{ .ctx = self, .probeFn = probeFn };
+    }
+
+    fn probeFn(ctx: *anyopaque, wire_size: u16) ProbeOutcome {
+        const self: *ForgingProber = @ptrCast(@alignCast(ctx));
+        self.probes += 1;
+        if (wire_size <= self.real_mtu) return .ok;
+        return .{ .frag_needed = self.forged_hint };
+    }
+};
+
+test "a forged MTU hint cannot name the answer: the result is always a probed size" {
+    // TEETH for SPEC's threat model, which claimed a hostile hint "can only
+    // make the search slower, never wrong". Measured before the fix: against
+    // a true path MTU of 300 the attacker got **mtu = 1499, blackhole =
+    // false, in 2 probes** — any value it named in (floor, ceiling), 1199
+    // bytes too large, and with the flag saying the path is well behaved.
+    // The hint arm set `lo` to the hint and returned, so the reported size
+    // was never probed at all. It narrows `hi` now, and `lo` advances only on
+    // an `.ok` this module saw for itself.
+    const truth: u16 = 300;
+    for ([_]u32{ 400, 999, 1400, 1499, 65534 }) |forged| {
+        var fp: ForgingProber = .{ .real_mtu = truth, .forged_hint = forged };
+        const r = try searchWith(fp.prober(), min_mtu_v4, default_ceiling_mtu, null);
+        try testing.expectEqual(truth, r.mtu);
+    }
+
+    // An honest hint still converges, and still saves probes over a silent
+    // path — the point of trusting it at all.
+    var honest: ForgingProber = .{ .real_mtu = truth, .forged_hint = truth };
+    const good = try searchWith(honest.prober(), min_mtu_v4, default_ceiling_mtu, null);
+    try testing.expectEqual(truth, good.mtu);
+
+    var silent: FakeProber = .{ .real_mtu = truth, .explicit_icmp = false };
+    const slow = try searchWith(silent.prober(), min_mtu_v4, default_ceiling_mtu, null);
+    try testing.expectEqual(truth, slow.mtu);
+}
 
 test "searchWith: well-behaved path converges exactly, via the ICMP hint, blackhole = false" {
     var fp: FakeProber = .{ .real_mtu = 1300, .explicit_icmp = true, .hint = 1300 };
@@ -1061,12 +1307,26 @@ test "fuzz: classify never panics on arbitrary packets" {
 fn fuzzClassify(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
     smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const ident = smith.value(u16);
-    const seq = smith.value(u16);
-    _ = classify(.v4, false, buf[0..len], ident, seq);
-    _ = classify(.v4, true, buf[0..len], ident, seq);
-    _ = classify(.v6, false, buf[0..len], ident, seq);
+
+    // ⚠ Length, ident and seq are read OUT OF THE BYTES, never drawn from a
+    // range, and that is not a style choice. A `Smith` ranged draw consumes 8
+    // bytes, reads them as one little-endian `u64`, and returns the range's
+    // MINIMUM unless that `u64` already lies inside the range — no scaling,
+    // no modulo. `Smith.bytes` above has already consumed the whole input, so
+    // the `valueRangeAtMost`/`value` calls that used to stand here always
+    // returned 0. Instrumented at the first audit (2026-09-04): **1,000,000
+    // rounds produced 3,000,000 `classify` calls, every one of them with a
+    // zero-length packet, ident 0 and seq 0** — one input, and SPEC cited
+    // this test for "malformed/hostile ICMP bytes never panic".
+    const control = buf[0..6];
+    const body = buf[6..];
+    const len: usize = ((@as(usize, control[0]) << 8) | control[1]) % (body.len + 1);
+    const ident = std.mem.readInt(u16, control[2..4], .little);
+    const seq = std.mem.readInt(u16, control[4..6], .little);
+
+    _ = classify(.v4, false, body[0..len], ident, seq);
+    _ = classify(.v4, true, body[0..len], ident, seq);
+    _ = classify(.v6, false, body[0..len], ident, seq);
 }
 
 // -- live (gated where privilege is genuinely required) ----------------------
@@ -1077,24 +1337,32 @@ test "live: ifaceMtu(\"lo\") reads a real loopback MTU, unprivileged" {
 }
 
 test "live: query() against loopback, unprivileged (no CAP_NET_RAW needed)" {
+    // ⚠ The precondition is probed INDEPENDENTLY, never read off `query`.
+    // It used to skip on `query`'s own `SocketFailed`/`ConnectFailed`, and
+    // `query` is the code under test: making it always return `SocketFailed`
+    // turned this test into a SKIP with the whole suite green — a skip is a
+    // pass, so the module's only live oracle for `query` could be deleted for
+    // free. Measured at the first audit (2026-09-04), mutation S01. The same
+    // shape SPEC records having fixed elsewhere, and `diskusage` carried in
+    // its `detect()` skip.
+    if (!udpSocketsWork()) return error.SkipZigTest;
+
     const dest = netaddr.parseIp("127.0.0.1").?;
-    const r = query(dest, .{}) catch |err| switch (err) {
-        // Some sandboxes disallow even unprivileged UDP sockets entirely;
-        // that's an environment limit, not a claim this module doesn't
-        // hold, so it's an explicit skip rather than a silent pass.
-        error.SocketFailed, error.ConnectFailed => return error.SkipZigTest,
-        else => return err,
-    };
+    const r = try query(dest, .{});
     try testing.expectEqual(Source.cached, r.source);
     try testing.expect(r.mtu > 0);
 }
 
 test "live: probe() against loopback (skipped without CAP_NET_RAW / ping_group_range)" {
+    // ⚠ Same reason as the test above: this skipped on `probe`'s own
+    // `PermissionDenied`, so forcing `probe` to always return it made the
+    // test SKIP and the suite stay green (mutation S02 — it deletes every
+    // line of live-path coverage in the module). The capability is asked of
+    // the socket layer directly instead.
+    if (!icmpSocketsWork()) return error.SkipZigTest;
+
     const dest = netaddr.parseIp("127.0.0.1").?;
-    const r = probe(dest, .{ .timeout_ms = 500 }) catch |err| switch (err) {
-        error.PermissionDenied => return error.SkipZigTest,
-        else => return err,
-    };
+    const r = try probe(dest, .{ .timeout_ms = 500 });
     // Loopback MTU is far above the default 1500 ceiling, so this only
     // proves the live plumbing (real socket, real send/recv, real
     // searchWith wiring) works end-to-end -- it can never observe a real

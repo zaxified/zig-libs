@@ -97,8 +97,28 @@ leaves it zero, read as "no hint". v6: 4 bytes at offset 4 (`mtuHintV6`,
 RFC 4443 §3.2) — always meaningful for a conformant Packet Too Big message.
 A hint is trusted only when it lies strictly inside the current search
 interval (`applyOutcome`); an out-of-range or inconsistent value falls back
-to treating the probed size itself as the new bound, so a malformed or
-hostile hint can only make the search slower, never wrong.
+to treating the probed size itself as the new bound. **An accepted hint
+narrows the ceiling and nothing else** — `Result.mtu` is always a size this
+module probed and saw succeed.
+
+⚠ **That last sentence is the first audit's correction (2026-09-04), and the
+claim it replaces was false.** This used to say a hostile hint "can only make
+the search slower, never wrong", and elsewhere that a falsely-large MTU with
+`blackhole = false` is a shape the spoofed-hint case "structurally cannot
+produce". `applyOutcome`'s hint arm set `lo` to the hint and returned, so the
+reported size was **never probed**. Measured against a prober whose true path
+MTU is 300, answering the first (ceiling) probe with a forged
+Fragmentation-Needed: **reported `mtu = 1499`, `blackhole = false`, in 2
+probes** — any value the attacker names in `(floor, ceiling)`, 1199 bytes too
+large, flagged as a well-behaved path. ICMP is unauthenticated, so that packet
+costs an off-path spoofer one guess of `ident`.
+
+The safe-direction argument was made about the *ceiling* (`h < size`) and then
+read as an argument about the *true path MTU* — the bound was real, it just
+bounded a different quantity. Setting only `hi` keeps the hint's whole benefit
+(the search still skips everything above it) at a cost of one extra probe, and
+satisfies RFC 1191 §3 and RFC 8201 §4, which both say a PMTU estimate may only
+ever **decrease** for a path.
 
 ## Threat model / out of scope
 
@@ -109,10 +129,18 @@ spoofed off-path reply with the right ident/seq would be accepted as a real
 signal. Concretely for this module: a spoofed Fragmentation-Needed/Packet
 Too Big carrying a forged MTU hint is trusted the same way a genuine one is
 (see "The search invariant" above) — bounded above by whatever size the
-attacker's spoof responds to (a hint outside `(lo, size)` is discarded), so
-a forgery can steer the reported MTU down within that range, or clear
-`blackhole` by supplying `saw_frag_needed`, but cannot claim a size larger
-than what has already failed.
+attacker's spoof responds to (a hint outside `(lo, size)` is discarded).
+
+⚠ **Revised 2026-09-04.** This used to conclude that a forgery "can steer the
+reported MTU down within that range … but cannot claim a size larger than what
+has already failed", and that reading is what made the falsely-large case look
+impossible: the hint was bounded by the size that just failed, which says
+nothing about the *true* path MTU. Measured: a forged hint of 1499 against a
+true path MTU of **300** was reported as `mtu = 1499, blackhole = false` — the
+attacker's number, 1199 bytes too large, never probed. Since an accepted hint
+now only narrows `hi`, a forged Frag-Needed can make the search **slower**, and
+can still clear `blackhole` by supplying `saw_frag_needed`, but the reported
+MTU is always a size this module probed and saw succeed.
 
 **That is the weaker of the two directions, and an audit (2026-08-18) found
 this document only ever named that one.** The stronger direction: a
