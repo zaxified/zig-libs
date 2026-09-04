@@ -89,7 +89,7 @@ pub const Totals = struct {
         // See the `apparent_bytes` doc comment for why a directory's
         // st_size is excluded from this one sum and only this one.
         if (!s.isDir()) self.apparent_bytes +|= s.size;
-        self.entries += 1;
+        self.entries +|= 1;
     }
 };
 
@@ -257,6 +257,10 @@ pub fn scanAt(
     var walker = try dir.walkSelectively(gpa);
     defer walker.deinit();
 
+    // Frame paths exist only to be handed to a sink; with neither sink set,
+    // nothing can ever read them. See the note at the `dupe` below.
+    const track_paths = options.on_directory != null or options.on_error != null;
+
     var frames: std.ArrayList(Frame) = .empty;
     defer {
         for (frames.items) |f| gpa.free(f.path);
@@ -349,7 +353,55 @@ pub fn scanAt(
             continue;
         };
 
-        const owned = try gpa.dupe(u8, entry.path);
+        // ⚠ TOCTOU, and the reason this check exists. The decision to
+        // descend was made from the `lstat` above, which carries
+        // `AT_SYMLINK_NOFOLLOW`; `enter` then performs a SECOND, independent
+        // name resolution — `std.Io.Dir.SelectiveWalker.enter` calls
+        // `openDir(..., .{ .iterate = true })`, and `OpenOptions
+        // .follow_symlinks` defaults to TRUE, so that `openat` carries no
+        // `O_NOFOLLOW`. Rename a directory away and a symlink into its place
+        // between the two calls and the walk descends the symlink, out of the
+        // scan root. `one_file_system` does not help: the boundary was
+        // evaluated on the entry that no longer exists, not on the directory
+        // that was opened.
+        //
+        // Measured before this check, against an attacker looping
+        // `renameat2(RENAME_EXCHANGE)` over a directory and a symlink: the
+        // scan escaped its root on **1108 of 4000 runs** (27 %), reporting
+        // 17,297,408 bytes for a 512,000-byte tree — with `Report.errors`
+        // sitting at **0** throughout, so nothing told the caller the answer
+        // was about a different tree. SPEC's "Symlinks: never followed" was
+        // true of the `lstat` and false of the `openat` one line later.
+        //
+        // std gives `enter` no `OpenOptions` seam, so what was opened is
+        // re-identified instead — the answer GNU `fts` reaches in
+        // `fts_safe_changedir`. The directory fd is pinned, so `"."`
+        // resolves inside it and cannot be raced in turn.
+        const opened_dir = walker.stack.items[walker.stack.items.len - 1].iter.reader.dir;
+        if (!openedAsExpected(backend, opened_dir.handle, st.id())) {
+            walker.leave(io);
+            report.errors += 1;
+            if (options.on_error) |sink| sink.report(entry.path, error.DirectoryChanged);
+            if (options.on_directory) |sink| try sink.report(entry.path, depth, sub);
+            parent.totals.add(sub);
+            continue;
+        }
+
+        // ⚠ The copy is skipped when nothing can read it. `entry.path` is
+        // relative to the scan root, so its LENGTH grows with the frame's
+        // depth: `n` frames x O(n) bytes each is O(n^2) live bytes, held
+        // simultaneously. SPEC called the traversal "one frame plus one
+        // owned path copy per open directory", which bounds the COUNT of
+        // copies and says nothing about their size — the same
+        // bounds-the-wrong-quantity shape this collection keeps finding.
+        // Measured with no sinks at all, ReleaseFast, peak RSS: depth 5000
+        // 45 MB, 10000 144 MB, 20000 491 MB, 30000 **1021 MB** — 8.3x the
+        // 123 MB tree being measured, growing as depth^2. With the copy
+        // elided as below: 30000 -> 63 MB. A caller that only wants
+        // `Report.total`, which is what `scanPath(gpa, io, p, .{})` in
+        // `root.zig`'s own doc comment does, was paying a gigabyte for
+        // strings nothing would ever read.
+        const owned = if (track_paths) try gpa.dupe(u8, entry.path) else try gpa.alloc(u8, 0);
         errdefer gpa.free(owned);
         try frames.append(gpa, .{ .path = owned, .totals = sub });
     }
@@ -391,6 +443,17 @@ fn closeFrame(gpa: Allocator, frames: *std.ArrayList(Frame), sink: ?DirSink) Sin
     frames.items[frames.items.len - 1].totals.add(f.totals);
 }
 
+/// Is the directory now open at `handle` the one the descent decision was
+/// made on? A failure to stat it is a mismatch, never a pass: the point is
+/// to descend only into something whose identity was confirmed.
+///
+/// Extracted from `scanAt` so the comparison has a test — the branch that
+/// uses it is reachable only under a live race.
+fn openedAsExpected(backend: stat.Backend, handle: i32, expected: stat.Id) bool {
+    const opened_st = stat.lstatAt(backend, handle, ".") catch return false;
+    return std.meta.eql(opened_st.id(), expected);
+}
+
 /// Best-effort path for a failure the walker reported without one: the
 /// deepest directory still open, which is where `next` was reading. The
 /// empty string means the scan root.
@@ -416,6 +479,35 @@ fn classify(report: *Report, s: stat.FileStat) void {
 const testing = std.testing;
 const builtin = @import("builtin");
 const linux = std.os.linux;
+
+test "Totals: every accumulation saturates rather than wrapping" {
+    // TEETH for SPEC's "every total saturates rather than wraps (`+|=`)".
+    // That was true of `FileStat.allocatedBytes`, which has a maxInt test,
+    // and untested at every accumulation site here: turning the `+|=` in
+    // `Totals.add` and `Totals.addEntry` into `+%=` left the whole suite
+    // green. `entries` was a plain `+=` besides — a saturating claim with a
+    // silent exception in it.
+    const max = std.math.maxInt(u64);
+    var t: Totals = .{ .allocated_bytes = max, .apparent_bytes = max, .entries = max };
+    t.add(.{ .allocated_bytes = 4096, .apparent_bytes = 4096, .entries = 1 });
+    try testing.expectEqual(max, t.allocated_bytes);
+    try testing.expectEqual(max, t.apparent_bytes);
+    try testing.expectEqual(max, t.entries);
+
+    var u: Totals = .{ .allocated_bytes = max, .apparent_bytes = max, .entries = max };
+    u.addEntry(.{
+        .mode = linux.S.IFREG | 0o644,
+        .nlink = 1,
+        .size = max,
+        .blocks = max,
+        .dev_major = 0,
+        .dev_minor = 0,
+        .ino = 1,
+    });
+    try testing.expectEqual(max, u.allocated_bytes);
+    try testing.expectEqual(max, u.apparent_bytes);
+    try testing.expectEqual(max, u.entries);
+}
 
 /// The fixture every traversal test below is built on, mirroring the tree
 /// used to diff this module against real `du`:
@@ -517,9 +609,19 @@ test "hard links: a second link to the same (dev, ino) is counted once" {
 
 test "hard links: de-duplication keys on (dev, ino), not on inode alone" {
     // A directory is never de-duplicated even though many share a link
-    // count above one (every directory with subdirectories does). If the
-    // rule keyed on `nlink > 1` alone and forgot the "not a directory"
-    // half, `links/` — nlink 4 — would be dropped from its parent's total.
+    // count above one (every directory with subdirectories does).
+    //
+    // ⚠ This comment used to claim that without the `!st.isDir()` half of
+    // the guard, `links/` — nlink 4 — "would be dropped from its parent's
+    // total". Measured during the first audit: it is not. De-duplication
+    // only SKIPS on `found_existing`, and a walk that never follows a
+    // symlink reaches a directory exactly once, so dropping that half costs
+    // one hash insertion per multiply-linked directory and changes no
+    // number anywhere — the mutation leaves the whole suite green. The half
+    // is a COST guard, not a correctness one: it is why an ordinary tree
+    // never touches the hash map at all. Stating the real purpose, because
+    // a comment that names a consequence the code does not have puts the
+    // next reader off the trail.
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -883,6 +985,76 @@ test "allocation failure at any point leaks nothing and is reported" {
         // run took) or it reported out of memory. Never anything else.
         if (result) |_| {} else |err| try testing.expectEqual(error.OutOfMemory, err);
     }
+}
+
+test "allocation failure on a DEEP tree with a sink leaks nothing" {
+    // TEETH for `errdefer gpa.free(owned)` on the frame path copy. That
+    // errdefer only matters when `frames.append` fails AFTER the `dupe`
+    // succeeded, and `frames` is an `ArrayList` whose very first append
+    // already buys capacity — so over the 3-level `Fixture` the list never
+    // grows again, the failing branch is never taken, and deleting the
+    // errdefer left all 25 tests green while a 24-level tree reported
+    // "1 tests leaked memory". A sink is required as well, since the copy is
+    // skipped outright when neither sink is set.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var chain: [2 * 24]u8 = undefined;
+    var n: usize = 0;
+    while (n < chain.len) : (n += 2) {
+        chain[n] = 'd';
+        chain[n + 1] = '/';
+    }
+    try tmp.dir.createDirPath(io, chain[0 .. chain.len - 1]);
+
+    const opts: Options = .{ .on_directory = .{ .func = ignoreDirectory } };
+
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    _ = try scanAt(counting.allocator(), io, tmp.dir, ".", opts);
+    const total_allocations = counting.allocations;
+    try testing.expect(total_allocations > 0);
+
+    var i: usize = 0;
+    while (i < total_allocations) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        const result = scanAt(failing.allocator(), io, tmp.dir, ".", opts);
+        if (result) |_| {} else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+}
+
+fn ignoreDirectory(_: ?*anyopaque, _: []const u8, _: u32, _: Totals) SinkError!void {}
+
+test "the descent verifies WHICH directory it opened, not just that one opened" {
+    // TEETH for the identity re-check that closes the `enter` TOCTOU. The
+    // mismatch branch itself is only reachable under a live race, so the
+    // comparison it turns on is what gets pinned here: the same directory
+    // must compare equal to itself, and a different one must not.
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "one");
+    try tmp.dir.createDirPath(io, "two");
+
+    const backend = stat.detect();
+    var one = try tmp.dir.openDir(io, "one", .{ .iterate = true });
+    defer one.close(io);
+    var two = try tmp.dir.openDir(io, "two", .{ .iterate = true });
+    defer two.close(io);
+
+    const id_one = (try stat.lstatAt(backend, one.handle, ".")).id();
+    const id_two = (try stat.lstatAt(backend, two.handle, ".")).id();
+
+    try testing.expect(openedAsExpected(backend, one.handle, id_one));
+    try testing.expect(!openedAsExpected(backend, one.handle, id_two));
+    // A handle that cannot be stat'd is a mismatch, never a pass.
+    try testing.expect(!openedAsExpected(backend, -1, id_one));
 }
 
 // ── test helpers ────────────────────────────────────────────────────────────

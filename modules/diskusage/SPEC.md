@@ -182,6 +182,26 @@ them, because following them is not `du`'s question and a followed symlink to
 an ancestor makes the traversal non-terminating. The fixture carries a
 `loop.lnk -> ..` for exactly that reason.
 
+⚠ **Until the first audit (2026-09-04) this sentence was true of the `lstat`
+and false of the `openat` one line later.** The descent decision is made from
+`stat.lstatAt`, which carries `AT_SYMLINK_NOFOLLOW`; the descent itself was
+`std.Io.Dir.SelectiveWalker.enter`, which calls `openDir(..., .{ .iterate =
+true })` — and `OpenOptions.follow_symlinks` defaults to **true**, so that
+`openat` carried no `O_NOFOLLOW`. A directory renamed away and a symlink
+renamed into its place between the two calls steered the walk out of the scan
+root, and `one_file_system` did not help, because the boundary had been
+evaluated on the entry that no longer existed.
+
+Measured against an attacker looping `renameat2(RENAME_EXCHANGE)`: the scan
+escaped its root on **1108 of 4000 runs (27 %)**, reporting 17,297,408 bytes
+for a 512,000-byte tree, with `Report.errors` at **0** throughout. std offers
+`enter` no `OpenOptions` seam, so `scanAt` now re-identifies what was actually
+opened — `(dev, ino)` of the opened fd against the `lstat` the decision was
+made on, the same answer GNU `fts` reaches in `fts_safe_changedir` — and
+reports `error.DirectoryChanged` on a mismatch. Re-measured after the fix:
+**0 escapes in 4000 runs**, 1119 reported errors, and with no attacker
+present 0 errors and a byte-identical total.
+
 **One filesystem (`du -x`): excluded entirely, not merely not descended.**
 ⚠ **The two reference implementations disagree here.** Measured on a fixture
 built inside a user namespace (`unshare --user --map-root-user --mount`, no
@@ -225,9 +245,23 @@ Not applicable — no secret material is handled anywhere in this module.
   silent truncation to whatever precedes the NUL: a caller would be told
   about a shorter path than the one it actually gave. See the "Fuzzing"
   subsection below.
-- Traversal depth is bounded only by memory: one frame plus one owned path
-  copy per open directory.
-- Every total saturates rather than wraps (`+|=`), and a negative `st_size` or
+- Traversal depth is bounded only by memory: one frame per open directory,
+  plus one owned path copy per open directory **only when a sink can read
+  it** (`on_directory` or `on_error` set).
+  ⚠ That last clause is the first audit's correction. `entry.path` is
+  relative to the scan root, so its LENGTH grows with depth: `n` frames x
+  O(n) bytes each is O(n^2) live bytes held simultaneously, and the old
+  sentence bounded the COUNT of copies while saying nothing about their
+  size — the bounds-the-wrong-quantity shape again. Measured with no sinks
+  at all (ReleaseFast, peak RSS): depth 5000 45 MB, 10000 144 MB, 20000
+  491 MB, 30000 **1021 MB** — 8.3x the 123 MB tree being measured. With the
+  copy skipped when nothing can read it: 11 / 21 / 42 MB at 5000 / 10000 /
+  20000, i.e. linear.
+- Every total saturates rather than wraps (`+|=`) — held by tests at every
+  accumulation site since the first audit, which found the claim true only of
+  `FileStat.allocatedBytes`: turning both `Totals.add` and `Totals.addEntry`
+  to `+%=` had left the suite green, and `entries` was a plain `+=` besides.
+  A negative `st_size` or
   `st_blocks` from a corrupt or hostile filesystem is clamped to 0 rather than
   `@bitCast` into an astronomically large unsigned value that would dominate a
   subtree total.
@@ -312,10 +346,17 @@ numbers.
 
 Two of the eight did not behave as a plain red:
 
-- **Dropping `AT_SYMLINK_NOFOLLOW` does not fail a test; it hangs.** The
+- **Dropping `AT_SYMLINK_NOFOLLOW` fails two tests and THEN hangs.** ⚠ This
+  entry used to read "does not fail a test; it hangs", and that is the
+  sentence a reader would use to decide whether the guard is covered by an
+  ordinary red. Re-run at the first audit, dropping the flag from `statxAt`:
+  `stat.test."lstatPath: does not follow the final symlink"` FAILs, then
+  `stat.test."both backends agree, field for field"` FAILs (expected 16749,
+  found 41471), and only then does the first `scan.zig` test hang. The
   fixture carries `syms/loop.lnk -> ..`, so following the final symlink turns
   the traversal into an unbounded descent through the fixture root. Killed at
-  150 s. That is the strongest available statement of why there is no
+  240 s. A recorded mutation result needs its exact site and a re-run
+  command, or it ages into a claim nobody can check. That is the strongest available statement of why there is no
   follow-symlinks option: the failure mode is non-termination and unbounded
   memory growth, not a wrong number.
 - ⚠ **Disabling the one-filesystem check SURVIVED the first run**, and the
@@ -371,13 +412,25 @@ its own test: removed, red; restored, green.
 
 ## Open
 
-- Eight of the nine `fstatat` struct families have no live kernel here to
-  syscall against — the cross-compilation oracle verifies their layout, and
-  the `statx` cross-check verifies only x86_64's. Unlike `diskfree`'s
-  `statfs64` wrapper there is **no `EINVAL` safety net**: a layout error on
-  one of those architectures would be silent. The mitigation is that all nine
-  are pinned by a compiler that knows each ABI, and that the fallback only
-  runs at all on a kernel older than 4.11.
+- ~~Eight of the nine `fstatat` struct families have no live kernel here to
+  syscall against.~~ **CLOSED by the first audit (2026-09-04), by qemu-user.**
+  `qemu-arm`/`qemu-mips`/`qemu-i386`/`qemu-aarch64` and their siblings thunk
+  guest syscalls through their own independent transcription of each
+  architecture's `struct stat` — a foreign implementation of exactly what
+  this module hand-transcribed. **199 field-set comparisons across 17
+  architectures covering all nine families**, diffed against `stat(1)`.
+
+  The oracle was itself checked for the failure it exists to catch: with the
+  struct and its `comptime` assert mutated *together* (`blocks` at 4096
+  instead of 16 — compiles clean, suite green, which is the one class the
+  size pin structurally cannot see), the qemu comparison catches it. Five
+  mismatches out of 199 are one documented artifact, confirmed by raw buffer
+  dump to be qemu's rather than this module's: **qemu-i386 truncates `st_dev`
+  to the 16-bit `old_encode_dev` form**.
+
+  There is still **no `EINVAL` safety net** here, unlike `diskfree`'s
+  `statfs64` wrapper — `fstatat` has no size argument, so a layout error
+  stays silent. That is why this anchor matters more here than there.
 - `Generic32Stat64` is probe-verified through **hexagon** (and, redundantly,
   riscv32, which has no `fstatat` to use it with). It is also mapped to
   **arc, arceb, csky and or1k**, which this toolchain cannot target — those
@@ -388,9 +441,22 @@ its own test: removed, red; restored, green.
   this one has no `EINVAL` net.
 - `sparc`/`sparc64`, `m68k`, `xtensa`, `x32` and mips64 n32 have no fallback
   (`family = .none`) — see "Architectures that get no fallback". On those, a
-  pre-4.11 kernel yields `error.Unsupported`. Closing any of them needs either
-  a toolchain that can target it (m68k, xtensa) or a kernel syscall table to
-  settle the syscall→struct pairing (sparc).
+  pre-4.11 kernel yields `error.Unsupported`.
+
+  ⚠ **sparc64's pairing is now answered, and deliberately not acted on.** Two
+  independent measurements at the first audit agree that syscall 289
+  (`fstatat64`) fills the **`stat64`** shape, which is field-for-field
+  `X8664Stat`: the header oracle (`struct stat` 104 bytes with `blocks` at 80;
+  `struct stat64` 144 bytes with `blocks` at 64) and a raw-buffer dump under
+  qemu-sparc64 (`nlink` at +016, `mode` at +024, `size` at +048, `blocks` at
+  +064, big-endian). `SYS.fstatat64 = 289` exists in Zig 0.16's `Sparc64`
+  table. It stays `.none` anyway, because the only live oracle available
+  **truncates `st_dev`** (the same qemu artifact as i386), and `st_dev` is
+  half of the `(dev, ino)` identity that hard-link de-duplication and the
+  `-x` boundary both turn on: a wrong `dev` is silent and changes totals.
+  Mapping it on offsets alone would trade a loud `error.Unsupported` for a
+  quiet wrong number. 32-bit `sparc` is untouched by either measurement;
+  `m68k` fails to build (compiler_rt) and `xtensa` has no Zig backend.
 - The `-x` divergence between GNU and uutils on a cross-device *file* is
   recorded as measured behaviour of both; nothing here establishes which is
   the intended one. This module follows GNU.

@@ -5,6 +5,40 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-04** — **First audit.** The descent into a directory was an
+  `openat()` **without** `O_NOFOLLOW`: the decision to descend came from
+  `stat.lstatAt` (which carries `AT_SYMLINK_NOFOLLOW`), and the descent
+  itself from `std.Io.Dir.SelectiveWalker.enter`, whose `openDir` defaults to
+  `follow_symlinks = true`. Rename a directory away and a symlink into its
+  place between the two and the walk left the scan root — measured against a
+  `renameat2(RENAME_EXCHANGE)` attacker, **1108 of 4000 runs (27 %)**
+  escaped, reporting 17,297,408 bytes for a 512,000-byte tree with
+  `Report.errors` at 0 throughout. `scanAt` now re-identifies the directory
+  it actually opened, `(dev, ino)` against the `lstat` the decision was made
+  on, and reports `error.DirectoryChanged` on a mismatch: **0 escapes in 4000
+  runs**, and no false positives with no attacker present. Traversal memory
+  was quadratic in depth rather than linear, because each frame kept a copy
+  of a path whose length grows with depth — 1021 MB peak RSS at depth 30000,
+  8.3x the tree — and the copy is now made only when a sink can read it
+  (42 MB at depth 20000, down from 491 MB). The module's only live layout
+  oracle took its skip precondition from `detect()`, the very mechanism under
+  test, so mutating `detect()` turned that test into a SKIP with the suite
+  green; it probes `statx` directly now. Six mutation survivors gained teeth
+  — the `statx` mask refusal, the negative-field clamp, and saturation at
+  every accumulation site (`entries` was a plain `+=` under a SPEC line
+  promising `+|=`) — and the frame-path `errdefer`, unreachable from a
+  3-level fixture, is now covered by a 24-level one. Docs corrected: the
+  example's `--explain` said cross-device entries were "counted but not
+  entered" when they are excluded entirely; a test comment claimed the
+  hard-link guard's `!isDir()` half prevents a directory being dropped from
+  its parent's total, which it does not (it is a cost guard); and SPEC's
+  recorded mutation result for `AT_SYMLINK_NOFOLLOW` said no test fails,
+  when two do before the hang. All nine `fstatat` struct families now have a
+  live foreign oracle: 199 field-set comparisons across 17 architectures
+  under qemu-user, with its one artifact (i386 truncating `st_dev`)
+  identified by raw buffer dump. SPEC's open sparc64 question is answered
+  (syscall 289 fills the `stat64` shape) and deliberately not acted on.
+
 - **2026-08-23** — **`scanAt`'s NUL check was untested, and SPEC.md said the
   opposite.** No behaviour change; a correction to what was claimed about the
   coverage of the entry above. SPEC.md's "Fuzzing" paragraph said `scan.scanAt`

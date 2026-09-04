@@ -310,7 +310,14 @@ fn explain(io: std.Io, r: diskusage.Report, path: []const u8) !void {
         , .{ r.hard_links_skipped, r.hard_link_bytes_skipped });
     }
     if (r.other_filesystems_skipped > 0) {
-        try e.print("   {d} directory/ies on another filesystem were counted but not entered (-x).\n", .{r.other_filesystems_skipped});
+        // ⚠ "counted but not entered" was wrong twice over, and against
+        // decisions this module documents at length: a cross-device entry
+        // is EXCLUDED entirely (`Report.other_filesystems_skipped`'s own
+        // doc: "They contribute nothing to any total"), and the counter
+        // counts entries of any KIND, not just directories — following GNU
+        // rather than uutils on a cross-device file is the one place SPEC
+        // says the two oracles disagree.
+        try e.print("   {d} entr(y/ies) on another filesystem were excluded entirely (-x).\n", .{r.other_filesystems_skipped});
     }
     try e.print(
         \\   {d} entries: {d} dir, {d} regular, {d} symlink, {d} other; {d} error(s).

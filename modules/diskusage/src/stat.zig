@@ -226,8 +226,7 @@ fn statxAt(dirfd: i32, basename: [*:0]const u8) StatError!FileStat {
     // the default measure would silently read 0 for every file. SIZE and
     // INO are equally load-bearing. A filesystem that declines any of them
     // is reported, not papered over.
-    if (!raw.mask.BLOCKS or !raw.mask.SIZE or !raw.mask.INO or !raw.mask.NLINK or !raw.mask.TYPE)
-        return error.Unsupported;
+    if (!requiredMaskPresent(raw.mask)) return error.Unsupported;
 
     return .{
         .mode = raw.mode,
@@ -641,6 +640,16 @@ fn fstatatAt(dirfd: i32, basename: [*:0]const u8) StatError!FileStat {
 /// Widen a kernel counter to `u64`, treating a negative value as 0. Written
 /// generically because the same field is signed in some of the structs above
 /// and unsigned in others.
+/// Did `statx` actually answer every field this module cannot substitute
+/// for? Split out of `statxAt` so it can be tested without a filesystem that
+/// declines one — deleting the check left the whole suite green, and its
+/// consequence is not subtle: a filesystem answering without `STATX_BLOCKS`
+/// would contribute `blocks = 0`, i.e. "this file occupies nothing", to
+/// every total.
+fn requiredMaskPresent(mask: @FieldType(linux.Statx, "mask")) bool {
+    return mask.BLOCKS and mask.SIZE and mask.INO and mask.NLINK and mask.TYPE;
+}
+
 fn clampNonNegative(v: anytype) u64 {
     return if (v > 0) @intCast(v) else 0;
 }
@@ -776,7 +785,20 @@ test "both backends agree, field for field, on the same files" {
     // evidence at all about the other eight (see SPEC.md's Anchoring
     // section for what covers those).
     if (!fstatat_available) return error.SkipZigTest;
-    if (detect() != .statx) return error.SkipZigTest; // no statx here: nothing to compare against
+    // ⚠ The `statx` precondition is probed DIRECTLY here, never read off
+    // `detect()`. It used to be `if (detect() != .statx) return
+    // error.SkipZigTest`, and `detect()` is the module code that decides
+    // which backend a real scan uses — so mutating it to return `.fstatat`
+    // unconditionally turned this test, the module's ONLY live layout
+    // oracle, into a SKIP, and a skip is a pass: the whole suite stayed
+    // green with the oracle gone. The same skip fires on any host where
+    // `statx` is genuinely missing, which is precisely the hosts the
+    // `fstatat` backend exists for. SPEC.md records fixing this exact shape
+    // in the `one_file_system` test ("a precondition may never be read off
+    // the mechanism under test"); it was still here.
+    var statx_probe: linux.Statx = undefined;
+    const statx_rc = linux.statx(linux.AT.FDCWD, "/", linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &statx_probe);
+    if (linux.errno(statx_rc) == .NOSYS) return error.SkipZigTest;
 
     const paths = [_][]const u8{ "/", "/proc/self", "/proc/self/mounts", "/dev/null", "/etc" };
     var compared: usize = 0;
@@ -795,6 +817,37 @@ test "both backends agree, field for field, on the same files" {
     // Guard against the test passing because every path was skipped — the
     // vacuous-green shape a `continue` in a loop invites.
     try testing.expect(compared >= 3);
+}
+
+test "clampNonNegative: a negative kernel field becomes 0, not an astronomical unsigned" {
+    // TEETH for SPEC's "a negative st_size or st_blocks is clamped to 0
+    // rather than @bitCast into an astronomically large unsigned value that
+    // would dominate a subtree total". Nothing tested it — replacing the
+    // clamp with `@bitCast` left the suite green — and this is a pure
+    // function that needs no filesystem at all.
+    try testing.expectEqual(@as(u64, 0), clampNonNegative(@as(i64, -1)));
+    try testing.expectEqual(@as(u64, 0), clampNonNegative(@as(i64, std.math.minInt(i64))));
+    try testing.expectEqual(@as(u64, 0), clampNonNegative(@as(i64, 0)));
+    try testing.expectEqual(@as(u64, 4096), clampNonNegative(@as(i64, 4096)));
+    try testing.expectEqual(@as(u64, std.math.maxInt(i64)), clampNonNegative(@as(i64, std.math.maxInt(i64))));
+}
+
+test "statx mask: a missing required field is refused, never read as zero" {
+    // TEETH for the mask refusal. A filesystem that answers `statx` without
+    // STATX_BLOCKS would otherwise report every file as occupying nothing.
+    var full: @FieldType(linux.Statx, "mask") = std.mem.zeroes(@FieldType(linux.Statx, "mask"));
+    full.BLOCKS = true;
+    full.SIZE = true;
+    full.INO = true;
+    full.NLINK = true;
+    full.TYPE = true;
+    try testing.expect(requiredMaskPresent(full));
+
+    inline for (.{ "BLOCKS", "SIZE", "INO", "NLINK", "TYPE" }) |field| {
+        var one_missing = full;
+        @field(one_missing, field) = false;
+        try testing.expect(!requiredMaskPresent(one_missing));
+    }
 }
 
 test "FileStat.allocatedBytes: 512-byte units, saturating" {
