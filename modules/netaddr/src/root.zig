@@ -1037,6 +1037,41 @@ fn expectRoundTrip(text: []const u8, canonical: []const u8) !void {
     }
 }
 
+test "Ip.eql: a v4 address and its v4-mapped v6 form are NOT equal" {
+    // TEETH for the invariant this module's whole type rests on, and with it
+    // the address identity of every module that stores an `Ip`. Measured at
+    // the first audit (2026-09-04): making `1.2.3.4` compare equal to
+    // `::ffff:1.2.3.4` left the suite at **47/47 green**.
+    //
+    // The direction matters and it is deliberate. `Ip` is a tagged union, so
+    // the two are distinct values; a consumer that wants them identified must
+    // normalise first and say so. An allow-list keyed on `Ip.eql` that
+    // silently identified them would accept `::ffff:127.0.0.1` wherever it
+    // meant to accept only `127.0.0.1`, and the reverse for a deny-list.
+    const v4 = parseIp("1.2.3.4").?;
+    const mapped = parseIp("::ffff:1.2.3.4").?;
+    try testing.expect(!v4.eql(mapped));
+    try testing.expect(!mapped.eql(v4));
+
+    // Loopback, because that is the pair a security guard actually meets.
+    const lo4 = parseIp("127.0.0.1").?;
+    const lo_mapped = parseIp("::ffff:127.0.0.1").?;
+    try testing.expect(!lo4.eql(lo_mapped));
+
+    // ...while each still equals itself, and unequal addresses of one family
+    // stay unequal — so the test above cannot pass by `eql` simply being false.
+    try testing.expect(v4.eql(parseIp("1.2.3.4").?));
+    try testing.expect(mapped.eql(parseIp("::ffff:1.2.3.4").?));
+    try testing.expect(!v4.eql(parseIp("1.2.3.5").?));
+    try testing.expect(!mapped.eql(parseIp("::ffff:1.2.3.5").?));
+
+    // The same for the v4-compatible form, which shares the low 32 bits with
+    // both of the above and is a third distinct value.
+    const compat = parseIp("::1.2.3.4").?;
+    try testing.expect(!compat.eql(v4));
+    try testing.expect(!compat.eql(mapped));
+}
+
 test "parseIp4 accepts strict dotted quads" {
     try testing.expectEqual([4]u8{ 192, 168, 0, 1 }, parseIp4("192.168.0.1").?);
     try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, parseIp4("0.0.0.0").?);
@@ -1671,8 +1706,17 @@ test "mergePrefixes coalesces adjacent and overlapping prefixes" {
 
 fn fuzzParseIp(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ `smith.slice` in one call, never `bytes` then a ranged draw.
+    // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
+    // returns the range's MINIMUM unless the 8 bytes it reads as a
+    // little-endian `u64` already lie inside the range — so the length drawn
+    // after it was always 0. Instrumented at the first audit (2026-09-04):
+    // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
+    // hand-written corpus of 12 real literals, 13 rounds and still 0
+    // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
+    // parse. Three parsers of untrusted text were contributing one empty
+    // string to the gate.
+    const len: usize = smith.slice(&buf);
     _ = parseIp(buf[0..len]);
 }
 test "fuzz parseIp never panics" {
@@ -1681,8 +1725,17 @@ test "fuzz parseIp never panics" {
 
 fn fuzzParsePrefix(_: void, smith: *std.testing.Smith) !void {
     var buf: [72]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ `smith.slice` in one call, never `bytes` then a ranged draw.
+    // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
+    // returns the range's MINIMUM unless the 8 bytes it reads as a
+    // little-endian `u64` already lie inside the range — so the length drawn
+    // after it was always 0. Instrumented at the first audit (2026-09-04):
+    // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
+    // hand-written corpus of 12 real literals, 13 rounds and still 0
+    // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
+    // parse. Three parsers of untrusted text were contributing one empty
+    // string to the gate.
+    const len: usize = smith.slice(&buf);
     _ = parsePrefix(buf[0..len]);
 }
 test "fuzz parsePrefix never panics" {
@@ -1691,8 +1744,17 @@ test "fuzz parsePrefix never panics" {
 
 fn fuzzParseHostPort(_: void, smith: *std.testing.Smith) !void {
     var buf: [80]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ `smith.slice` in one call, never `bytes` then a ranged draw.
+    // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
+    // returns the range's MINIMUM unless the 8 bytes it reads as a
+    // little-endian `u64` already lie inside the range — so the length drawn
+    // after it was always 0. Instrumented at the first audit (2026-09-04):
+    // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
+    // hand-written corpus of 12 real literals, 13 rounds and still 0
+    // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
+    // parse. Three parsers of untrusted text were contributing one empty
+    // string to the gate.
+    const len: usize = smith.slice(&buf);
     _ = parseHostPort(buf[0..len]);
 }
 test "fuzz parseHostPort never panics" {

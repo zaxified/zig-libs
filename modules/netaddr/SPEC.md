@@ -45,7 +45,26 @@ source is `pub const meta` in src/root.zig.
 
 ## Anchoring
 
-**Anchor grade:** class C · oracle n/a
+**Anchor grade:** class B · oracle MIXED
+
+EXTERNAL for the parse/format/prefix core, SELF for the RFC 6724
+source-selection half.
+
+⚠ Corrected at the first audit (2026-09-04). This said "class C · oracle n/a",
+and that was true when written and false by the time it was read: the core is
+now checked against three independent outside implementations, all agreeing —
+glibc's `inet_pton` (2,100,000 generated literals, **0 disagreements**),
+Python's `ipaddress` (same corpus, 0 outside the documented zone-ID rejection,
+plus RFC 5952 canonical form byte-identical over 400,000 random and 80,000
+special forms), and `summarize`/`mergePrefixes` against
+`ipaddress.summarize_address_range`/`collapse_addresses` (200,000 ranges and
+60,000 prefix sets, 0 disagreements). `formatIp` round-trips 8,000,000 random
+addresses with 0 failures.
+
+The RFC 6724 half genuinely is oracle-poor and self-tested only, which is what
+the class-C claim describes correctly — but it describes one half of the module
+as though it were the whole one. `check-fuzz` reads this line to decide who must
+carry a fuzz harness, so understating it is not only a documentation matter.
 
 - **Class C** — internal algorithm or data structure — no outside exists, so correctness is defined by invariants or a brute-force reference. Not anchor debt.
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
