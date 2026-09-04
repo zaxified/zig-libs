@@ -50,7 +50,7 @@ source is `pub const meta` in src/root.zig.
 EXTERNAL for the parse/format/prefix core, SELF for the RFC 6724
 source-selection half.
 
-⚠ Corrected at the first audit (2026-09-04). This said "class C · oracle n/a",
+⚠ Corrected 2026-09-04. This said "class C · oracle n/a",
 and that was true when written and false by the time it was read: the core is
 now checked against three independent outside implementations, all agreeing —
 glibc's `inet_pton` (2,100,000 generated literals, **0 disagreements**),

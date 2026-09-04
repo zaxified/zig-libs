@@ -5,7 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-04** — **First audit.** `expectBytes` had become a printf: deleting
+- **2026-09-04** — **Second audit pass** (the first was 2026-08-06).
+  `expectBytes` had become a printf: deleting
   its `return error.TestExpectedEqual` left the suite at 22/22 green while five
   of five unequal pairs passed, because the wiring from `diff` to the returned
   error was held by nothing. Both of `expectHex`'s refusals were unheld too, and

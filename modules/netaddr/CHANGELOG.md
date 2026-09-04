@@ -5,7 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-04** — **First audit.** No defect in the parsing itself, which is
+- **2026-09-04** — **Second audit pass** (the first was 2026-07-19). No defect
+  in the parsing itself, which is
   anchored far better than its own SPEC admitted; the findings are in what the
   tests and the docs claim.
 

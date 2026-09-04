@@ -20,7 +20,7 @@ pub fn bytes(comptime n: usize, comptime s: *const [2 * n:0]u8) [n]u8 {
     // compile with `bad hex literal: deadbeef`, accusing a perfectly valid
     // literal and sending the reader hunting a typo that is not there.
     // Inside `comptime`, `hexToBytes` is comptime-known to succeed and the
-    // branch is never reached. Found by this module's first audit
+    // branch is never reached. Found by this module's 2026-09-04 audit pass
     // (2026-09-04).
     return comptime blk: {
         var out: [n]u8 = undefined;

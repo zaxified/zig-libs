@@ -105,7 +105,7 @@ pub const scratch_len = 4096;
 /// and `scripts/test-lib.sh` fails any step that writes to stderr while
 /// passing — so a self-test that let `expectHex` refuse would have failed the
 /// gate, and consequently **no test asserted the refusals**. Measured at the
-/// first audit (2026-09-04): both guards deleted cleanly with the suite green,
+/// 2026-09-04 audit pass: both guards deleted cleanly with the suite green,
 /// and swallowing the decode error made `expectHex("zz", &.{})` **pass** —
 /// a malformed golden compared as if it were an empty one.
 pub fn hexVerdict(expected_hex: []const u8, actual: []const u8) !void {
@@ -120,7 +120,7 @@ pub fn expectBytes(expected: []const u8, actual: []const u8) !void {
     if (diff(expected, actual) != null) report(expected, actual);
     // ⚠ The error comes from `verdict`, not from a `return` written here, so
     // the wiring between the decision and the failure is load-bearing.
-    // Measured at the first audit: deleting the bare
+    // Measured 2026-09-04: deleting the bare
     // `return error.TestExpectedEqual` that used to sit at the end of this
     // function left the suite at 22/22 green while five of five unequal pairs
     // passed — `expectBytes` had become a printf.

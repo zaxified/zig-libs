@@ -5,7 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-04** — **First audit.** The module's central guarantee — abort
+- **2026-09-04** — **Second audit pass** (the first was 2026-08-13, which
+  closed `SecureSource`'s missing output coverage and the swapped-message
+  arms). The module's central guarantee — abort
   rather than silently degrade — **had no test**. Three mutations were green at
   12/12: deleting the `@panic` arm, swapping it for `unreachable`, and
   replacing the whole `catch` with `catch { io.random(buf); }`, which is

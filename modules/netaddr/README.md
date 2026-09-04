@@ -15,7 +15,7 @@ IP address parse/format + **RFC 6724** destination/source address selection.
   a slice of prefixes and take an allocator to build it. The bound is
   `2·width − 2` prefixes for a single range (62 for IPv4, 254 for IPv6),
   which is the standard result for a range-to-prefix decomposition.
-  Corrected at the first audit, 2026-09-04 — it said "none, anywhere".
+  Corrected 2026-09-04 — it said "none, anywhere".
 
 Provenance: clean-room from RFC 6724 and RFC 5952; cross-checked against Go
 `net/addrselect` (BSD-3-Clause, The Go Authors) and the glibc `getaddrinfo`

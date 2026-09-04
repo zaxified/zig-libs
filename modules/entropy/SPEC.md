@@ -89,7 +89,7 @@ Two costs, neither hidden:
 - **`fill` now requires an `std.Io` that implements `swapCancelProtection`.**
   `std.Io.failing` does not — every cancellation slot on it is `unreachable`.
 
-  ⚠ **Corrected by the first audit (2026-09-04): "panics with 'reached
+  ⚠ **Corrected 2026-09-04: "panics with 'reached
   unreachable code'" is a Debug-only outcome, and the sentence that followed it
   drew the wrong conclusion from it.** Measured on a 20-line isolate in all four
   modes: Debug exits 13, ReleaseSafe exits 134 — and **ReleaseFast and

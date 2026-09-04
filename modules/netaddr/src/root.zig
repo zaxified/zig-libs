@@ -1040,7 +1040,7 @@ fn expectRoundTrip(text: []const u8, canonical: []const u8) !void {
 test "Ip.eql: a v4 address and its v4-mapped v6 form are NOT equal" {
     // TEETH for the invariant this module's whole type rests on, and with it
     // the address identity of every module that stores an `Ip`. Measured at
-    // the first audit (2026-09-04): making `1.2.3.4` compare equal to
+    // the 2026-09-04 audit pass: making `1.2.3.4` compare equal to
     // `::ffff:1.2.3.4` left the suite at **47/47 green**.
     //
     // The direction matters and it is deliberate. `Ip` is a tagged union, so
@@ -1710,7 +1710,7 @@ fn fuzzParseIp(_: void, smith: *std.testing.Smith) !void {
     // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
     // returns the range's MINIMUM unless the 8 bytes it reads as a
     // little-endian `u64` already lie inside the range — so the length drawn
-    // after it was always 0. Instrumented at the first audit (2026-09-04):
+    // after it was always 0. Instrumented on 2026-09-04:
     // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
     // hand-written corpus of 12 real literals, 13 rounds and still 0
     // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
@@ -1729,7 +1729,7 @@ fn fuzzParsePrefix(_: void, smith: *std.testing.Smith) !void {
     // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
     // returns the range's MINIMUM unless the 8 bytes it reads as a
     // little-endian `u64` already lie inside the range — so the length drawn
-    // after it was always 0. Instrumented at the first audit (2026-09-04):
+    // after it was always 0. Instrumented on 2026-09-04:
     // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
     // hand-written corpus of 12 real literals, 13 rounds and still 0
     // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
@@ -1748,7 +1748,7 @@ fn fuzzParseHostPort(_: void, smith: *std.testing.Smith) !void {
     // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
     // returns the range's MINIMUM unless the 8 bytes it reads as a
     // little-endian `u64` already lie inside the range — so the length drawn
-    // after it was always 0. Instrumented at the first audit (2026-09-04):
+    // after it was always 0. Instrumented on 2026-09-04:
     // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
     // hand-written corpus of 12 real literals, 13 rounds and still 0
     // non-empty. The same harness with `slice` gets 9 non-empty and 2 that

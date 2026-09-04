@@ -173,7 +173,7 @@ pub const unavailable_message =
 /// `Threaded`'s draw loop completes without a live draw), so the promise was
 /// not this module's to make. The test that appeared to prove it counted
 /// vtable invocations, which is a different quantity from entropy accesses.
-/// First audit, 2026-09-04.
+/// Measured 2026-09-04.
 ///
 /// Cancellation is blocked across the draw, so a cancel aimed at the calling
 /// task is observed after `fill` returns rather than aborting the process. That
@@ -212,7 +212,7 @@ pub fn fill(io: std.Io, buf: []u8) void {
 ///
 /// ⚠ **This used to name twelve such call sites in `bfv` and `tfhe`, by line,
 /// and describe taking the swap as an open decision their owners had not been
-/// able to act on. They took it.** Measured at the first audit (2026-09-04):
+/// able to act on. They took it.** Measured on 2026-09-04:
 /// `std.Random.IoSource` appears **nowhere in this collection as code** — every
 /// remaining mention is a comment explaining why it is not used. Both modules
 /// draw through `SecureSource` now, and both added the second half this doc
@@ -378,7 +378,7 @@ const CountingIo = struct {
 // slot the call actually went to.
 // ── the abort, observed rather than asserted ────────────────────────────────
 //
-// ⚠ Until the first audit (2026-09-04) **nothing in this suite could tell a
+// ⚠ Until 2026-09-04 **nothing in this suite could tell a
 // module that aborts from one that silently degrades** — which is the single
 // property this module exists to provide. Three mutations were green at 12/12:
 // deleting the `@panic` arm outright, swapping the two arms, and — the one
