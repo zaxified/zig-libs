@@ -166,7 +166,10 @@ section() {
 # Runs cmd, capturing stdout and stderr SEPARATELY. On success with empty
 # stderr, prints "  <label> .... OK   X.Xs". Any stderr is treated as a real
 # problem even when the command exits 0 — a module's tests are silent by
-# default (ZIG_LIBS_VERBOSE_SKIP=0), so stderr output here means something
+# default (ZIG_LIBS_VERBOSE_SKIP unset; ⚠ setting it to "0" ENABLES the
+# diagnostics, because the variable is read as set-and-non-empty, not parsed
+# as a boolean — `FOO= cmd` is the way to clear it, and this line used to say
+# "=0" and would have turned every step red), so stderr output here means something
 # unexpected printed (a stray debug print, a warning, a forgotten verbose
 # skip) — the run is downgraded to FAIL and both streams are replayed.
 # On a genuine nonzero exit, replays both streams and exits with that code.

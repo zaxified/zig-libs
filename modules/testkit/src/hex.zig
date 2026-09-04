@@ -13,9 +13,20 @@ const std = @import("std");
 /// parameter rather than inferred so a vector that is the wrong size is a
 /// COMPILE error at the vector, not a runtime surprise inside an assertion.
 pub fn bytes(comptime n: usize, comptime s: *const [2 * n:0]u8) [n]u8 {
-    var out: [n]u8 = undefined;
-    _ = std.fmt.hexToBytes(&out, s) catch @compileError("bad hex literal: " ++ s);
-    return out;
+    // ⚠ The decode is forced into a `comptime` block, and it matters where.
+    // Written as a plain body, the `catch @compileError(...)` branch gets
+    // semantically analysed whenever the call is NOT in a comptime context —
+    // so `const g = hex.bytes(4, "deadbeef");` in a test body failed to
+    // compile with `bad hex literal: deadbeef`, accusing a perfectly valid
+    // literal and sending the reader hunting a typo that is not there.
+    // Inside `comptime`, `hexToBytes` is comptime-known to succeed and the
+    // branch is never reached. Found by this module's first audit
+    // (2026-09-04).
+    return comptime blk: {
+        var out: [n]u8 = undefined;
+        _ = std.fmt.hexToBytes(&out, s) catch @compileError("bad hex literal: " ++ s);
+        break :blk out;
+    };
 }
 
 /// Decode into a caller-owned buffer, returning the used prefix.

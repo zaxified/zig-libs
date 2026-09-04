@@ -477,11 +477,10 @@ test "consistency: the native batch and the JSON builder describe the same rules
     const gpa = testing.allocator;
 
     var sock = root.Socket.open(gpa) catch |err| {
-        if (verboseSkip()) std.debug.print(
-            "\nJSON<->native consistency test SKIPPED: no NETLINK_NETFILTER socket ({s}).\n",
+        return testkit.skip(
+            "JSON<->native consistency test: no NETLINK_NETFILTER socket ({s}).",
             .{@errorName(err)},
         );
-        return;
     };
     defer sock.close();
     sock.setRecvTimeout(5000) catch {};
@@ -505,12 +504,11 @@ test "consistency: the native batch and the JSON builder describe the same rules
 
     sock.commit(&batch) catch |err| switch (err) {
         error.KernelRejected, error.AccessDenied, error.NotSupported, error.WouldBlock => {
-            if (verboseSkip()) std.debug.print(
-                "\nJSON<->native consistency test SKIPPED: the kernel refused the batch ({s}) — " ++
-                    "run it as `unshare -rn zig build test-nftables`.\n",
+            return testkit.skip(
+                "JSON<->native consistency test: the kernel refused the batch ({s}) — " ++
+                    "run it as `unshare -rn zig build test-nftables`.",
                 .{@errorName(err)},
             );
-            return;
         },
         else => return err,
     };
@@ -524,21 +522,19 @@ test "consistency: the native batch and the JSON builder describe the same rules
     // What the reference implementation makes of the bytes we sent.
     const run = runNft(gpa, &.{ "-j", "list", "ruleset" }) catch |err| switch (err) {
         error.SkipZigTest => {
-            if (verboseSkip()) std.debug.print(
-                "\nJSON<->native consistency test SKIPPED: no `nft` binary to decompile with.\n",
+            return testkit.skip(
+                "JSON<->native consistency test: no `nft` binary to decompile with.",
                 .{},
             );
-            return;
         },
         else => return err,
     };
     defer run.deinit(gpa);
     if (run.exit_code == null or run.exit_code.? != 0) {
-        if (verboseSkip()) std.debug.print(
-            "\nJSON<->native consistency test SKIPPED: `nft -j list ruleset` failed.\n",
+        return testkit.skip(
+            "JSON<->native consistency test: `nft -j list ruleset` failed.",
             .{},
         );
-        return;
     }
 
     var kernel = try std.json.parseFromSlice(std.json.Value, gpa, run.stdout, .{});

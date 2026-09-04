@@ -73,25 +73,69 @@ pub fn render(buf: []u8, s: []const u8, at: usize) []const u8 {
 /// capture tool printed, so it can be diffed against a fresh capture without
 /// decoding anything first.
 pub fn expectHex(expected_hex: []const u8, actual: []const u8) !void {
-    var buf: [4096]u8 = undefined;
-    if (expected_hex.len / 2 > buf.len) {
-        // Not a silent fallback to a weaker check -- say so and fail.
-        std.debug.print(
-            "golden is {d} bytes, larger than expectHex's {d}-byte scratch; " ++
-                "decode it yourself and use expectBytes\n",
-            .{ expected_hex.len / 2, buf.len },
-        );
-        return error.GoldenTooLarge;
-    }
-    const expected = hex.into(&buf, expected_hex) catch |e| {
-        std.debug.print("golden is not valid hex: {t}\n", .{e});
+    return hexVerdict(expected_hex, actual) catch |e| {
+        switch (e) {
+            // Not a silent fallback to a weaker check -- say so and fail.
+            error.GoldenTooLarge => std.debug.print(
+                "golden is {d} bytes, larger than expectHex's {d}-byte scratch; " ++
+                    "decode it yourself and use expectBytes\n",
+                .{ expected_hex.len / 2, scratch_len },
+            ),
+            error.TestExpectedEqual => {
+                var buf: [scratch_len]u8 = undefined;
+                // `hexVerdict` already decoded this successfully to reach a
+                // byte verdict; `catch return e` rather than `unreachable`
+                // because `unreachable` is not a guard in ReleaseFast.
+                const expected = hex.into(&buf, expected_hex) catch return e;
+                report(expected, actual);
+            },
+            else => std.debug.print("golden is not valid hex: {t}\n", .{e}),
+        }
         return e;
     };
-    return expectBytes(expected, actual);
+}
+
+/// Bytes of scratch `expectHex` decodes a golden into.
+pub const scratch_len = 4096;
+
+/// `expectHex`'s decision, without a word of diagnostics.
+///
+/// ⚠ The split is what makes the FAILING direction testable at all. Every
+/// refusal here used to live inside `expectHex` next to a `std.debug.print`,
+/// and `scripts/test-lib.sh` fails any step that writes to stderr while
+/// passing — so a self-test that let `expectHex` refuse would have failed the
+/// gate, and consequently **no test asserted the refusals**. Measured at the
+/// first audit (2026-09-04): both guards deleted cleanly with the suite green,
+/// and swallowing the decode error made `expectHex("zz", &.{})` **pass** —
+/// a malformed golden compared as if it were an empty one.
+pub fn hexVerdict(expected_hex: []const u8, actual: []const u8) !void {
+    var buf: [scratch_len]u8 = undefined;
+    if (expected_hex.len / 2 > buf.len) return error.GoldenTooLarge;
+    const expected = try hex.into(&buf, expected_hex);
+    return verdict(expected, actual);
 }
 
 /// Compare two byte slices, reporting the first difference by offset.
 pub fn expectBytes(expected: []const u8, actual: []const u8) !void {
+    if (diff(expected, actual) != null) report(expected, actual);
+    // ⚠ The error comes from `verdict`, not from a `return` written here, so
+    // the wiring between the decision and the failure is load-bearing.
+    // Measured at the first audit: deleting the bare
+    // `return error.TestExpectedEqual` that used to sit at the end of this
+    // function left the suite at 22/22 green while five of five unequal pairs
+    // passed — `expectBytes` had become a printf.
+    return verdict(expected, actual);
+}
+
+/// The decision, with no diagnostics: `diff` says unequal, this says so in the
+/// type system. Testable in the failing direction precisely because it is
+/// silent — see `hexVerdict`.
+pub fn verdict(expected: []const u8, actual: []const u8) error{TestExpectedEqual}!void {
+    if (diff(expected, actual) != null) return error.TestExpectedEqual;
+}
+
+/// Everything `expectBytes` prints when the comparison fails.
+fn report(expected: []const u8, actual: []const u8) void {
     const m = diff(expected, actual) orelse return;
 
     const at = switch (m) {
@@ -114,10 +158,45 @@ pub fn expectBytes(expected: []const u8, actual: []const u8) !void {
     std.debug.print("  offset {d}..\n", .{at -| window});
     std.debug.print("  expected: {s}\n", .{render(&eb, expected, at)});
     std.debug.print("  actual:   {s}\n", .{render(&ab, actual, at)});
-    return error.TestExpectedEqual;
 }
 
 const testing = std.testing;
+
+test "verdict fails on every kind of inequality, and says nothing while doing it" {
+    // TEETH for the wiring between `diff` and the returned error, and the
+    // reason it can exist at all: `verdict` is silent, so the failing
+    // direction can be asserted without writing to stderr — which
+    // `scripts/test-lib.sh` treats as a failure even for a passing step.
+    // Before this split, deleting the error return left the suite green.
+    try testing.expectError(error.TestExpectedEqual, verdict(&.{ 1, 2, 3 }, &.{ 1, 2, 4 }));
+    try testing.expectError(error.TestExpectedEqual, verdict(&.{ 1, 2, 3 }, &.{ 1, 2 }));
+    try testing.expectError(error.TestExpectedEqual, verdict(&.{ 1, 2 }, &.{ 1, 2, 3 }));
+    try testing.expectError(error.TestExpectedEqual, verdict(&.{}, &.{1}));
+    try testing.expectError(error.TestExpectedEqual, verdict(&.{1}, &.{}));
+    // ...and passes on every kind of equality, empties included.
+    try verdict(&.{ 1, 2, 3 }, &.{ 1, 2, 3 });
+    try verdict(&.{}, &.{});
+}
+
+test "hexVerdict refuses a malformed or oversized golden instead of comparing something weaker" {
+    // TEETH for both of `expectHex`'s refusals. Neither had a test, because
+    // both printed on the way out. Measured before the split: swallowing the
+    // decode error made `expectHex("zz", &.{})` PASS — a malformed golden
+    // compared as though it were an empty one, which is the worst possible
+    // reading of a typo in a vector.
+    try testing.expectError(error.InvalidCharacter, hexVerdict("zz", &.{}));
+    try testing.expectError(error.InvalidCharacter, hexVerdict("0g", &.{0}));
+    try testing.expectError(error.InvalidLength, hexVerdict("abc", &.{ 0xab, 0xc0 }));
+
+    // Oversized: one byte of golden past the scratch buffer.
+    const too_long = "ab" ** (scratch_len + 1);
+    try testing.expectError(error.GoldenTooLarge, hexVerdict(too_long, &.{}));
+
+    // And the honest cases still work.
+    try hexVerdict("deadbeef", &.{ 0xde, 0xad, 0xbe, 0xef });
+    try testing.expectError(error.TestExpectedEqual, hexVerdict("deadbeef", &.{ 0xde, 0xad, 0xbe, 0xee }));
+    try hexVerdict("", &.{});
+}
 
 test "diff returns null only when the slices are equal" {
     try testing.expectEqual(@as(?Mismatch, null), diff(&.{ 1, 2, 3 }, &.{ 1, 2, 3 }));

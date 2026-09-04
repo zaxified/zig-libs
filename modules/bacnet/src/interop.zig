@@ -405,11 +405,10 @@ test "live: our device side answers a real third-party client" {
     // *client*, not a device. Set BACNET_TEST_LISTEN=host:port and point a
     // third-party client (e.g. bacpypes3's `read-property` sample) at it.
     const spec = envVar("BACNET_TEST_LISTEN") orelse {
-        if (verboseSkip()) std.debug.print(
-            "SKIPPED: live device side (set BACNET_TEST_LISTEN=host:port and point a real client at it)\n",
+        return testkit.skip(
+            "live device side (set BACNET_TEST_LISTEN=host:port and point a real client at it)",
             .{},
         );
-        return;
     };
     const addr = bvll.BipAddress.parse(spec) orelse return error.BadListenSpec;
 

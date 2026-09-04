@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-04** — **The live device-side test reported PASS when
+  `BACNET_TEST_LISTEN` was unset**, announcing a skip and then returning
+  plainly, which `zig test` counts as a pass. Now `return testkit.skip(...)`.
+  Found by the first audit of `testkit`.
+
 - **2026-08-22** — `UdpTransport`'s send/receive paths were collapsing a
   `std.Io` cancellation (`error.Canceled`, carried directly in
   `Socket.SendError`/`ReceiveError`) into `error.SendFailed`/`RecvFailed`, so a

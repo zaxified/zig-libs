@@ -2317,8 +2317,11 @@ test "LIVE: tracepoint attach + detach against a real kernel" {
         prog_fd,
         .{ .link_preference = .legacy_only },
     ) catch |e| {
-        std.debug.print("\nLIVE ebpf tracepoint legacy-path attach failed ({s}).\n", .{@errorName(e)});
-        return;
+        // ⚠ Was a bare `return` after an UNGATED print: the assertions below
+        // never ran and the test reported PASS, while the print itself broke
+        // the "a passing test stays silent" rule the driver enforces. Fifteen
+        // lines above, the same test already does this correctly.
+        return testkit.skip("LIVE ebpf tracepoint legacy-path attach failed ({s}).", .{@errorName(e)});
     };
     defer legacy.detach();
     try testing.expectEqual(AttachPath.legacy, legacy.path);

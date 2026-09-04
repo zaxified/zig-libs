@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-04** — **Two live tests reported PASS where they meant SKIP**, and
+  printed unconditionally while doing it (breaking the "a passing test stays
+  silent" rule the driver enforces): the tracepoint legacy-path attach and
+  `LINK_GET_FD_BY_ID`, both bare `return;` with the assertions below them
+  un-run. Both are `return testkit.skip(...)` now. Latent on a host without
+  CAP_BPF, where an earlier guard already skips the whole test. Found by the
+  first audit of `testkit`.
+
 - **2026-09-02** — Security audit: `findMember`/`findPath` are now bounded by the
   WORK they do, not only by how deep they recurse (new
   `TypeError.TypeSearchTooWide`, `max_member_visits`). `max_resolve_depth`

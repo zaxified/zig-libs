@@ -715,9 +715,10 @@ test "LIVE: create, inspect, update and detach a real cgroup link" {
 
     // The link id round-trips through BPF_LINK_GET_FD_BY_ID.
     var byid = linkGetFdById(info.id) catch |e| {
-        std.debug.print("\nLIVE ebpf bpflink: LINK_GET_FD_BY_ID skipped ({s}).\n", .{@errorName(e)});
+        // ⚠ Said "skipped" and reported PASS — a bare `return` with the id
+        // round-trip and the detach-idempotency assertions below un-run.
         link.detach();
-        return;
+        return testkit.skip("LIVE ebpf bpflink: LINK_GET_FD_BY_ID ({s}).", .{@errorName(e)});
     };
     defer byid.detach();
     const info2 = try byid.info();

@@ -518,14 +518,22 @@ test "errno mapping covers what nf_tables actually answers" {
 
 const test_table = "zig_nftables_live";
 
-fn liveSocket(what: []const u8) ?Socket {
-    if (builtin.os.tag != .linux) return null;
+/// ⚠ Returns an error union, not an optional, and that is the whole point.
+/// It used to hand back `?Socket`, so every caller read
+/// `liveSocket(...) orelse return;` — a bare `return` that reports the test as
+/// **PASSED**, which is exactly the shape `testkit.skip`'s own doc comment says
+/// it was written to replace. Measured before the change: this file's live
+/// tests printed "SKIPPED" and the summary said "2/2 tests passed", so
+/// `scripts/test.sh`'s skip count — the line its header calls more important
+/// than the times — had nothing to count. With an error union the caller writes
+/// `try liveSocket(...)` and the skip cannot be swallowed.
+fn liveSocket(what: []const u8) !Socket {
+    if (builtin.os.tag != .linux) return testkit.skip("LIVE nftables {s} test: needs Linux", .{what});
     var sock = Socket.open(testing.allocator) catch |err| {
-        if (verboseSkip()) std.debug.print(
-            "\nLIVE nftables {s} test SKIPPED: cannot open a NETLINK_NETFILTER socket ({s}).\n",
+        return testkit.skip(
+            "LIVE nftables {s} test: cannot open a NETLINK_NETFILTER socket ({s}).",
             .{ what, @errorName(err) },
         );
-        return null;
     };
     // Never let a live test hang a CI run.
     sock.setRecvTimeout(5000) catch {};
@@ -558,7 +566,7 @@ fn dropTestTable(sock: *Socket) void {
 }
 
 test "live: native batch round-trip — create, list, delete" {
-    var sock = liveSocket("round-trip") orelse return;
+    var sock = try liveSocket("round-trip");
     defer sock.close();
     dropTestTable(&sock); // a previous crashed run must not fail this one
 
@@ -705,7 +713,7 @@ test "live: native batch round-trip — create, list, delete" {
 }
 
 test "live: a bad batch is rolled back atomically and names the failing command" {
-    var sock = liveSocket("atomicity") orelse return;
+    var sock = try liveSocket("atomicity");
     defer sock.close();
     dropTestTable(&sock);
 
@@ -783,7 +791,7 @@ test "live: an unspec-family dump returns objects from multiple families in one 
     // table in two *different* families and confirming a single
     // `listTables(null)` call surfaces both, each tagged with its own real
     // family byte.
-    var sock = liveSocket("unspec sweep") orelse return;
+    var sock = try liveSocket("unspec sweep");
     defer sock.close();
     dropTestTable(&sock);
     dropTable(&sock, .ip, test_table_ip);

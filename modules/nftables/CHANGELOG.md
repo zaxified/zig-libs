@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-04** — **Four consistency tests and three live socket tests
+  reported PASS where they meant SKIP.** `zig test` counts a bare `return;` as a
+  pass, so a host that cannot open a `NETLINK_NETFILTER` socket saw
+  `2/2 tests passed` while the run printed "SKIPPED". `liveSocket` now returns
+  an error union instead of `?Socket`, so `orelse return;` — which swallowed the
+  skip in a different function from the one that announced it — is `try`.
+  Measured: the module went from 94 passing to **90 pass, 4 skip**. Found by the
+  first audit of `testkit`; `scripts/check-skip-as-pass.py` now refuses the
+  shape.
+
 - **2026-09-02** — **Audit (drift campaign): 1 CRITICAL (in `netlink`, reached from here), 2
   MEDIUM, 2 LOW, 2 doc.** The CRITICAL is `codec.nestEnd`'s silent nest-length truncation — see
   `netlink`'s entry; from here it meant `addSetElems` with ~4096 elements, or `addRule` with
