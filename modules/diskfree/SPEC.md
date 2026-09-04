@@ -187,8 +187,14 @@ Not applicable — no secret material is handled anywhere in this module.
   = `rw,size=10` where the truth was `rw,size=1024k` — not a visibly broken
   row, a well-formed wrong one, 100x off. Dropping the tail after the last
   newline in `mounts.readVirtualFile` is what makes the promise true, and
-  `mountinfo` now calls that same reader instead of carrying a duplicate of
-  it (the duplicate is why the false claim stood in two places at once). This too matches `procnet`, and for the same reason it was
+  `mountinfo` calls that same reader instead of carrying a duplicate of it
+  (the duplicate is why the false claim stood in two places at once).
+  ⚠ The commit that first made this claim did **not** actually remove the
+  duplicate — the edit never reached the file — so `mountinfo` kept the old
+  reader for one commit while the SPEC said otherwise. Caught by a peer
+  session watching a stuck process, not by the gate: the truncation test used
+  only row-aligned limits, so it could not tell the two behaviours apart. It
+  now cuts mid-row as well. This too matches `procnet`, and for the same reason it was
   fixed there: as `allocRemaining(...) catch null` both readers returned
   `null` on an oversized table, which is the value `readMounts`/
   `readMountinfo` reserve for "`/proc` is not mounted" — a different fact,

@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-04** — **Correction to the entry below.** That entry claimed
+  `mountinfo` had stopped carrying its own duplicate of `readVirtualFile` and
+  now called the fixed one. **It did not: the edit never reached the file**,
+  so `mountinfo.readMountinfo` was still returning an over-limit read with its
+  partial final row attached, which is the exact defect the entry says was
+  fixed. The duplicate is gone now and the alias is in place. The truncation
+  test could not have caught it either way: every limit it used (250, 4096)
+  was a multiple of the 10-byte row length, so the cut always landed on a row
+  boundary and nothing was ever dropped. It now also cuts at 255 (mid-row,
+  expects 250) and at 5 (no whole row at all, expects 0), and removing the
+  drop turns it red.
+
 - **2026-09-04** — **First audit.** `mounts.unescapeOctal` did its octal
   arithmetic in `u8`, so an escape above `\377` overflowed: a checked panic
   in Debug and ReleaseSafe, and in ReleaseFast a silent wrap — `\400`

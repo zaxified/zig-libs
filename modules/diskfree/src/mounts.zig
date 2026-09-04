@@ -462,13 +462,35 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
     defer testing.allocator.free(whole);
     try testing.expectEqual(@as(usize, 1000), whole.len);
 
-    // Over it: a non-null, exactly-`limit`-byte prefix — NOT null, and not
-    // the whole file either.
+    // Over it: a non-null prefix — NOT null, and not the whole file either.
+    // 250 lands exactly on a row boundary (25 rows of 10), so nothing is
+    // dropped and the prefix is the full 250 bytes.
     const cut = readVirtualFile(testing.allocator, io, path, 250) orelse
         return error.ReadVirtualFileReturnedNullOnOversizedFile;
     defer testing.allocator.free(cut);
     try testing.expectEqual(@as(usize, 250), cut.len);
     try testing.expectEqualStrings(payload[0..250], cut);
+
+    // TEETH: a limit that lands INSIDE a row must drop that row, not hand
+    // back half of it. The boundary-aligned case above cannot tell the two
+    // behaviours apart — every limit it uses is a multiple of the row
+    // length — which is exactly how "the parser skips the cut row as
+    // malformed" survived as a doc claim: a cut inside the LAST column
+    // leaves every required field present, so the row is accepted carrying
+    // a prefix of that value. Measured on a real capture: `super_options` =
+    // `rw,size=10` where the truth was `rw,size=1024k`.
+    const mid = readVirtualFile(testing.allocator, io, path, 255) orelse
+        return error.ReadVirtualFileReturnedNullOnOversizedFile;
+    defer testing.allocator.free(mid);
+    try testing.expectEqual(@as(usize, 250), mid.len);
+    try testing.expectEqualStrings(payload[0..250], mid);
+
+    // And a limit that reaches no newline at all yields nothing rather than
+    // a fragment: there is no whole row in it to be right about.
+    const none = readVirtualFile(testing.allocator, io, path, 5) orelse
+        return error.ReadVirtualFileReturnedNullOnOversizedFile;
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
 }
 
 // `/proc/self/mounts` is kernel-emitted, but per `procnet`'s own threat-model
