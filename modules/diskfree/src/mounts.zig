@@ -54,11 +54,8 @@ pub fn unescapeOctal(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
     errdefer out.deinit(gpa);
     var i: usize = 0;
     while (i < raw.len) {
-        if (raw[i] == '\\' and i + 3 < raw.len and
-            isOctalDigit(raw[i + 1]) and isOctalDigit(raw[i + 2]) and isOctalDigit(raw[i + 3]))
-        {
-            const v = (raw[i + 1] - '0') * 64 + (raw[i + 2] - '0') * 8 + (raw[i + 3] - '0');
-            try out.append(gpa, v);
+        if (octalEscapeAt(raw, i)) |byte| {
+            try out.append(gpa, byte);
             i += 4;
         } else {
             try out.append(gpa, raw[i]);
@@ -66,6 +63,33 @@ pub fn unescapeOctal(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
         }
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// The byte a `\ooo` escape at `raw[i]` names, or `null` when there is no
+/// complete three-digit octal escape there.
+///
+/// ⚠ **Three octal digits span `\000`–`\777`, and only `\000`–`\377` fit in a
+/// byte.** The arithmetic used to be `(raw[i + 1] - '0') * 64 + …` with every
+/// operand a `u8`, so `\400` and up overflowed: a checked panic in Debug and
+/// ReleaseSafe, and in ReleaseFast a silent wrap — `\400` decoded to `0x00`,
+/// injecting a NUL into a returned `mount_point`, and `\777` to `0xff`. The
+/// leading digit was never compared against anything; `isOctalDigit` says a
+/// character is a digit, which is not the same fact as the three digits
+/// naming a byte. Found by this module's first audit (2026-09-04).
+///
+/// Out-of-range escapes are passed through literally, which is the rule the
+/// doc comment above already states for every other malformed escape.
+/// Truncating to `v & 0xff` would be inventing a byte the writer never wrote:
+/// no kernel emits `\400`, since `mangle_path` escapes exactly four
+/// characters, so there is no wire truth here to be faithful to — and a
+/// decoder that refuses to guess cannot be steered into emitting a NUL.
+fn octalEscapeAt(raw: []const u8, i: usize) ?u8 {
+    if (raw[i] != '\\' or i + 3 >= raw.len) return null;
+    if (!isOctalDigit(raw[i + 1]) or !isOctalDigit(raw[i + 2]) or !isOctalDigit(raw[i + 3])) return null;
+    const v = (@as(u16, raw[i + 1] - '0') << 6) |
+        (@as(u16, raw[i + 2] - '0') << 3) |
+        @as(u16, raw[i + 3] - '0');
+    return std.math.cast(u8, v);
 }
 
 fn isOctalDigit(c: u8) bool {
@@ -163,9 +187,19 @@ pub const mount_table_read_limit = 1024 * 1024;
 /// a (always-0) `stat` size.
 ///
 /// ⚠ `limit` TRUNCATES; it does not reject. A file longer than `limit` comes
-/// back as its first `limit` bytes, with the last line likely cut mid-row —
-/// which `parseMounts` then skips as malformed, so the caller gets a SHORT
-/// table rather than nothing.
+/// back as its first `limit` bytes **with the partial final line dropped**,
+/// so the caller gets a SHORT table rather than nothing.
+///
+/// ⚠ That last clause used to say the cut row was "skipped as malformed" by
+/// the parser, and it was not true: a cut only produces too-few-columns if
+/// it lands BEFORE the last required column. Once it lands anywhere inside
+/// the final column the row is complete and gets accepted carrying a PREFIX
+/// of that value — measured on a real 73-mount capture, a `mountinfo` row
+/// came back with `super_options` = `rw,size=10` where the truth was
+/// `rw,size=1024k`: not a visibly broken row, a well-formed wrong one, 100x
+/// off. Dropping the tail after the last newline here is what makes the
+/// promise true, and it is done once for both tables rather than trusted to
+/// each parser (first audit, 2026-09-04).
 ///
 /// That is a deliberate repair of the opposite behaviour, and of the same
 /// defect `procnet.readVirtualFile` carried (fixed there first): this was
@@ -177,7 +211,7 @@ pub const mount_table_read_limit = 1024 * 1024;
 /// on this defect: with the cap dropped to 300 bytes, `diskfree-demo`
 /// printed "-- 0 filesystem(s) shown." and exited 0 on a host with 63
 /// mounts. SPEC.md already promised the behaviour implemented here.
-fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
+pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
     var dir = std.Io.Dir.cwd();
     var file = dir.openFile(io, path, .{}) catch return null;
     defer file.close(io);
@@ -186,15 +220,22 @@ fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: 
     var fr = std.Io.File.Reader.initStreaming(file, io, &buf);
 
     var list: std.ArrayList(u8) = .empty;
+    var truncated = false;
     fr.interface.appendRemaining(gpa, &list, .limited(limit)) catch |err| switch (err) {
         // Everything read so far is already in `list` (documented contract
         // of `appendRemaining`), and it is the bounded prefix we asked for.
-        error.StreamTooLong => {},
+        error.StreamTooLong => truncated = true,
         else => {
             list.deinit(gpa);
             return null;
         },
     };
+    if (truncated) {
+        // Keep whole lines only. Without this the caller sees a truncated
+        // value as a complete one — see the second warning above.
+        const keep = if (std.mem.lastIndexOfScalar(u8, list.items, '\n')) |nl| nl + 1 else 0;
+        list.shrinkRetainingCapacity(keep);
+    }
     return list.toOwnedSlice(gpa) catch {
         list.deinit(gpa);
         return null;
@@ -240,6 +281,62 @@ test "parseMounts: octal-escaped mount point with a space decodes correctly" {
     try testing.expectEqualStrings("/mnt/tab\tin\tname", entries[1].mount_point);
     try testing.expectEqualStrings("/mnt/back\\slash", entries[2].mount_point);
     try testing.expectEqualStrings("/dev/disk/by-label/My\\Label", entries[2].device);
+}
+
+test "unescapeOctal: an escape above \\377 is passed through, never wrapped" {
+    // TEETH for `octalEscapeAt`'s range check. Three octal digits span
+    // \000-\777; only \000-\377 name a byte. The arithmetic used to be all
+    // `u8`, so \400 and up overflowed: a checked panic in Debug and
+    // ReleaseSafe, and in ReleaseFast a silent wrap — \400 became 0x00,
+    // injecting a NUL into a mount path, and \777 became 0xff. Delete
+    // `std.math.cast` (return `@truncate(v)`) and this test goes red in every
+    // optimize mode, which is the point: the Debug panic is not a guard.
+    const out = try unescapeOctal(testing.allocator, "/mnt/\\400\\777x");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("/mnt/\\400\\777x", out);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, out, 0));
+}
+
+test "unescapeOctal: \\377 is the largest escape that still decodes" {
+    // The boundary from the other side: one below the overflow must decode.
+    const out = try unescapeOctal(testing.allocator, "a\\377b");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a\xffb", out);
+}
+
+test "unescapeOctal: a two-digit escape at end of input is not read past" {
+    // TEETH for `i + 3 >= raw.len`. Loosen it to `i + 3 > raw.len` and this
+    // reads one byte past the slice — the guard is written against the upper
+    // bound, so nothing else in the suite notices.
+    const out = try unescapeOctal(testing.allocator, "x\\04");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("x\\04", out);
+}
+
+test "parseMounts: an over-range escape in a real row cannot inject a NUL" {
+    // The end-to-end shape of the same defect: `\400` reaching a caller's
+    // `mount_point` as 0x00 truncates the path for anyone who hands it to a
+    // C API, and the row still looks perfectly ordinary.
+    const entries = try parseMounts(testing.allocator, "/dev/sda1 /mnt/\\400bad ext4 rw 0 0\n");
+    defer freeAll(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("/mnt/\\400bad", entries[0].mount_point);
+}
+
+test "parseMounts: a three-column line is skipped, not accepted short" {
+    // TEETH for the four-column requirement. The existing malformed-line test
+    // uses a ONE-token line, which a mutation relaxing the requirement to
+    // three columns still rejects — so that mutation survived green. This
+    // pins the actual boundary.
+    const text =
+        "/dev/sda1 /mnt/ok ext4 rw 0 0\n" ++
+        "/dev/sdb1 /mnt/short ext4\n" ++
+        "/dev/sdc1 /mnt/ok2 ext4 rw 0 0\n";
+    const entries = try parseMounts(testing.allocator, text);
+    defer freeAll(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("/mnt/ok", entries[0].mount_point);
+    try testing.expectEqualStrings("/mnt/ok2", entries[1].mount_point);
 }
 
 test "unescapeOctal: plain text round-trips unchanged" {
@@ -381,37 +478,69 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
 // caller-supplied snapshot file. Allocates, so this runs under
 // `std.testing.allocator` with every result freed.
 const fuzz_fixture = @embedFile("testdata/mounts_sample.txt");
+const fuzz_fixture_escaped = @embedFile("testdata/mounts_escaped.txt");
+
+/// Size of the one blob every decision in `shapeInput` is derived from.
+const fuzz_input_len = 2048;
+
+/// **Both** samples, because a mutation strategy is only as good as what it
+/// mutates: the plain capture contains **zero backslashes**, so the escape
+/// decoder was unreachable from it by any small number of byte flips. The
+/// escaped fixture puts real `\ooo` sequences in front of the mutator, where
+/// flipping one digit reaches the out-of-range case.
+const fuzz_samples = [_][]const u8{ fuzz_fixture, fuzz_fixture_escaped };
 
 test "fuzz: parseMounts never panics, OOB or leaks, arbitrary or mutated-real bytes" {
-    try std.testing.fuzz({}, fuzzParseMountsNeverLeaks, .{ .corpus = &.{fuzz_fixture} });
+    try std.testing.fuzz({}, fuzzParseMountsNeverLeaks, .{ .corpus = &.{ fuzz_fixture, fuzz_fixture_escaped } });
 }
 
 fn fuzzParseMountsNeverLeaks(_: void, smith: *std.testing.Smith) !void {
-    var buf: [2048]u8 = undefined;
-    const text = mutateSample(smith, fuzz_fixture, &buf);
-    const entries = try parseMounts(testing.allocator, text);
+    var raw: [fuzz_input_len]u8 = undefined;
+    smith.bytes(&raw);
+    var buf: [fuzz_input_len]u8 = undefined;
+    const entries = try parseMounts(testing.allocator, shapeInput(&raw, &buf));
     freeAll(testing.allocator, entries);
 }
 
-/// One draw in five is pure arbitrary bytes; the rest starts from the real
-/// `/proc/self/mounts` capture and applies a handful of byte-level
-/// mutations — arbitrary bytes essentially never spell a well-formed
-/// `\ooo` octal escape, so mutating a known-good table exercises
-/// `unescapeOctal`'s bounds check far more often than a from-scratch random
-/// blob would. Shared shape with `procnet`'s `mutateSample`.
-fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
-    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
-        smith.bytes(buf);
-        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
-        return buf[0..len];
-    }
+/// Turns one blob of fuzzer/corpus bytes into a parser input: either the
+/// bytes themselves, or a real `/proc` capture with byte-driven mutations.
+///
+/// ⚠ **Every decision here is read out of the blob, never drawn from a
+/// range, and that is the whole point.** `Smith`'s ranged draws
+/// (`valueRangeAtMost`, `index`, `value`) consume 8 bytes, read them as one
+/// little-endian `u64`, and return the range's **minimum** unless that `u64`
+/// already lies inside the range — no scaling, no modulo. ASCII text never
+/// lands in a small range, so outside `zig build --fuzz` EVERY ranged draw
+/// returned its minimum: the previous version of this harness picked branch
+/// 0, drew length 0, and ran the parser on `""` — twice per gate run, and
+/// nothing else. That is how the `\400` overflow in `unescapeOctal` survived
+/// to this module's first audit (2026-09-04). `Smith.bytes` copies the input
+/// faithfully in both modes, so deriving from bytes is what makes a corpus
+/// entry mean anything outside the fuzzer.
+///
+/// Measured, not inferred: with `Smith{ .in = "/dev/sda1 /mnt/x ext4 …" }`,
+/// `valueRangeAtMost(u8, 0, 1)`, `valueRangeAtMost(u16, 0, 2048)`,
+/// `value(u8)` and `index(165)` all return **0**; with an input crafted as
+/// in-range little-endian `u64` words they return 1, 900, 200 and 77.
+fn shapeInput(raw: *const [fuzz_input_len]u8, buf: []u8) []const u8 {
+    const ctl = raw[0];
+    const want = (@as(usize, raw[1]) << 8) | raw[2];
+    const body = raw[3..];
+    // One shape in four: the blob itself, at a byte-derived length.
+    if (ctl & 3 == 0) return body[0 .. want % (body.len + 1)];
+
+    const sample = fuzz_samples[(ctl >> 2) % fuzz_samples.len];
     const len = @min(sample.len, buf.len);
+    if (len == 0) return buf[0..0];
     @memcpy(buf[0..len], sample[0..len]);
-    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
-    var i: u8 = 0;
-    while (i < n_mutations) : (i += 1) {
-        if (len == 0) break;
-        buf[smith.index(len)] = smith.value(u8);
+    // Up to 24 mutations, three bytes each: position high, position low,
+    // replacement byte. A run of three zeros ends the walk, so a corpus
+    // entry shorter than the blob mutates only as far as its own bytes
+    // reach — `Smith.bytes` zero-pads the tail.
+    var i: usize = 0;
+    while (i + 3 <= body.len and i < 3 * 24) : (i += 3) {
+        if (body[i] == 0 and body[i + 1] == 0 and body[i + 2] == 0) break;
+        buf[((@as(usize, body[i]) << 8) | body[i + 1]) % len] = body[i + 2];
     }
     return buf[0..len];
 }

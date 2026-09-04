@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-04** — **First audit.** `mounts.unescapeOctal` did its octal
+  arithmetic in `u8`, so an escape above `\377` overflowed: a checked panic
+  in Debug and ReleaseSafe, and in ReleaseFast a silent wrap — `\400`
+  decoded to `0x00`, injecting a NUL into a returned `mount_point`, and
+  `\777` to `0xff`. Out-of-range escapes are now passed through literally,
+  which is the rule the doc comment already stated for every other malformed
+  escape. Both fuzz harnesses derived their choices from `Smith` ranged
+  draws, which return the range's **minimum** unless the input bytes already
+  lie in range — so with an ASCII corpus the entire fuzz lane was
+  `parse*("")`; they are byte-driven now and trip the reinstated defect in
+  ~550 rounds where the old shape reached the escape decoder zero times in
+  1,000,000. `readVirtualFile` now drops the partial final line on
+  truncation instead of promising that the parsers skip it (they do not: a
+  cut inside the last column yields a well-formed **wrong** value, measured
+  as `size=10` where the truth was `size=1024k`), and `mountinfo` calls that
+  one reader rather than a duplicate of it. `statfs`'s architecture mapping
+  became a testable `familyFor` function, and field mapping, family
+  selection and saturating multiplication gained teeth — five mutations that
+  had left the suite green, `f_bavail` -> `f_bfree` among them, are now red.
+  `MountinfoEntry`'s doc no longer claims option strings cannot carry
+  escapes: an overlay whose `lowerdir` holds a space really does yield
+  `lowerdir=/…/low\040er`. SPEC's two open layout questions are closed by
+  qemu-user across eight architectures and by the real x86 compat layer
+  (`sz = 84` succeeds, 88/96/120/0/4096 all `EINVAL`).
+
 - **2026-08-23** — **`statfs.query` refuses a path with an embedded NUL
   (`StatfsError.InvalidPath`) instead of acting on half of it.** `query` is
   public API and handed its `path` bytes straight to `std.posix.toPosixPath`,

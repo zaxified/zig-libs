@@ -309,54 +309,73 @@ comptime {
 
 const Family = enum { native64, mips32, packed32, natural32 };
 
-const family: Family = switch (builtin.cpu.arch) {
-    .x86_64 => switch (builtin.abi) {
-        // x32 (ILP32 pointers over the x86_64 syscall ABI) is neither
-        // verified nor targeted by this collection — refuse rather than
-        // guess at a struct layout nobody has checked.
-        .gnux32, .muslx32 => @compileError("diskfree.statfs: x32 ABI statfs64 layout not verified — not a target of this collection"),
-        else => .native64,
-    },
-    .aarch64,
-    .aarch64_be,
-    .riscv64,
-    .loongarch64,
-    .powerpc64,
-    .powerpc64le,
-    .s390x,
-    .sparc64,
-    => .native64,
-    .mips64, .mips64el => switch (builtin.abi) {
-        // Mirrors std.os.linux.SYS's own dispatch: n32 shares MIPS's 32-bit
-        // ABI struct, everything else (n64) is native64.
-        .gnuabin32, .muslabin32 => .mips32,
-        else => .native64,
-    },
-    .mips, .mipsel => .mips32,
-    .arm, .armeb, .thumb, .thumbeb => .packed32,
-    // .x86 (i386): `.packed32` here is `compat_statfs64` (32-bit process
-    // under an x86_64 kernel's compat syscall layer), NOT a native i386
-    // kernel's own `statfs64` (which is unpacked — see NaturalGeneric32).
-    // Stated explicitly because the two are different kernel structs that
-    // happen to share this one's byte layout: this module assumes the
-    // compat case is the realistic `.x86` deployment (native 32-bit x86
-    // kernels are essentially extinct) — SPEC.md's "x86 compat-layer
-    // assumption" note has the full reasoning and the EINVAL safety net.
-    .x86 => .packed32,
-    .powerpc,
-    .powerpcle,
-    .m68k,
-    .sparc,
-    .xtensa,
-    .xtensaeb,
-    .riscv32,
-    .loongarch32,
-    .arc,
-    .arceb,
-    .csky,
-    .hexagon,
-    .or1k,
-    => .natural32,
+/// Which struct family a target uses — a function, not an inline `switch`,
+/// so a host of ANY architecture can test the mapping. `null` means no
+/// layout has been verified for that target.
+///
+/// ⚠ `.x86` is `.packed32` (84 B, `compat_statfs64`) deliberately, and this
+/// module's first audit settled the question SPEC.md left open rather than
+/// leaving it an assumption: a native i386 binary on an x86_64 host reaches
+/// the kernel's compat entry point, and `do_statfs64` accepted `sz = 84` and
+/// answered EINVAL for 88, 96, 120, 0 and 4096. A *native* i386 kernel would
+/// want the unpacked 88-byte `natural32`; native 32-bit x86 kernels are the
+/// case this module does not target. See SPEC.md, "x86 compat-layer
+/// assumption".
+fn familyFor(arch: std.Target.Cpu.Arch, abi: std.Target.Abi) ?Family {
+    return switch (arch) {
+        .x86_64 => switch (abi) {
+            // x32 (ILP32 pointers over the x86_64 syscall ABI) is neither
+            // verified nor targeted by this collection — refuse rather than
+            // guess at a struct layout nobody has checked.
+            .gnux32, .muslx32 => null,
+            else => .native64,
+        },
+        .aarch64,
+        .aarch64_be,
+        .riscv64,
+        .loongarch64,
+        .powerpc64,
+        .powerpc64le,
+        .s390x,
+        .sparc64,
+        => .native64,
+        .mips64, .mips64el => switch (abi) {
+            // Mirrors std.os.linux.SYS's own dispatch: n32 shares MIPS's 32-bit
+            // ABI struct, everything else (n64) is native64.
+            .gnuabin32, .muslabin32 => .mips32,
+            else => .native64,
+        },
+        .mips, .mipsel => .mips32,
+        .arm, .armeb, .thumb, .thumbeb => .packed32,
+        // .x86 (i386): `.packed32` here is `compat_statfs64` (32-bit process
+        // under an x86_64 kernel's compat syscall layer), NOT a native i386
+        // kernel's own `statfs64` (which is unpacked — see NaturalGeneric32).
+        // Stated explicitly because the two are different kernel structs that
+        // happen to share this one's byte layout: this module assumes the
+        // compat case is the realistic `.x86` deployment (native 32-bit x86
+        // kernels are essentially extinct) — SPEC.md's "x86 compat-layer
+        // assumption" note has the full reasoning and the EINVAL safety net.
+        .x86 => .packed32,
+        .powerpc,
+        .powerpcle,
+        .m68k,
+        .sparc,
+        .xtensa,
+        .xtensaeb,
+        .riscv32,
+        .loongarch32,
+        .arc,
+        .arceb,
+        .csky,
+        .hexagon,
+        .or1k,
+        => .natural32,
+        else => null,
+    };
+}
+
+const family: Family = familyFor(builtin.cpu.arch, builtin.abi) orelse switch (builtin.cpu.arch) {
+    .x86_64 => @compileError("diskfree.statfs: x32 ABI statfs64 layout not verified — not a target of this collection"),
     else => @compileError("diskfree.statfs: no statfs64 struct layout verified for this target architecture"),
 };
 
@@ -498,6 +517,79 @@ test "query: a path with an embedded NUL is refused, not silently answered about
     // ...and the guard must not have made a NUL-free path unanswerable.
     const u = try query("/");
     try testing.expect(u.blocks_total > 0);
+}
+
+test "toUsage: every field comes from the field it names, in all four families" {
+    // TEETH. The only live `statfs` test asserts relationships
+    // (`available <= free <= total`, `block_size > 0`, `name_max > 0`) and a
+    // field mix-up satisfies every one of them. Measured during this module's
+    // first audit: `.blocks_available = raw.bfree` — the exact `f_bfree` vs
+    // `f_bavail` confusion SPEC.md devotes a section to preventing, worth
+    // 25 GB of difference on the dev host — left the suite GREEN, as did
+    // reading `block_size` from `f_frsize` and `name_max` from `f_flags`.
+    // Distinct sentinels are what make a wrong mapping visible with no live
+    // filesystem in play, and they cover the three inactive families too.
+    inline for (.{ Native64, MipsStatfs64, PackedGeneric32, NaturalGeneric32 }) |T| {
+        var raw: T = std.mem.zeroes(T);
+        raw.type = 0x11;
+        raw.bsize = 0x22;
+        raw.blocks = 0x33;
+        raw.bfree = 0x44;
+        raw.bavail = 0x55;
+        raw.files = 0x66;
+        raw.ffree = 0x77;
+        raw.namelen = 0x88;
+        raw.frsize = 0x99;
+        raw.flags = 0xaa;
+        const u = toUsage(T, raw);
+        try testing.expectEqual(@as(u32, 0x11), u.fs_type_magic);
+        try testing.expectEqual(@as(i64, 0x22), u.block_size);
+        try testing.expectEqual(@as(u64, 0x33), u.blocks_total);
+        try testing.expectEqual(@as(u64, 0x44), u.blocks_free);
+        try testing.expectEqual(@as(u64, 0x55), u.blocks_available);
+        try testing.expectEqual(@as(u64, 0x66), u.inodes_total);
+        try testing.expectEqual(@as(u64, 0x77), u.inodes_free);
+        try testing.expectEqual(@as(i64, 0x88), u.name_max);
+        try testing.expectEqual(@as(i64, 0x99), u.fragment_size);
+    }
+}
+
+test "familyFor: the architecture-to-layout mapping, x86's compat choice included" {
+    // The mapping is a decision, and until this module's first audit nothing
+    // held it: flipping `.x86` to `.natural32` — the very question SPEC.md
+    // poses and does not close — cost nothing in the gate.
+    try testing.expectEqual(@as(?Family, .native64), familyFor(.x86_64, .gnu));
+    try testing.expectEqual(@as(?Family, null), familyFor(.x86_64, .gnux32));
+    try testing.expectEqual(@as(?Family, .packed32), familyFor(.x86, .gnu));
+    try testing.expectEqual(@as(?Family, .packed32), familyFor(.arm, .musleabi));
+    try testing.expectEqual(@as(?Family, .mips32), familyFor(.mipsel, .gnueabi));
+    try testing.expectEqual(@as(?Family, .mips32), familyFor(.mips64, .gnuabin32));
+    try testing.expectEqual(@as(?Family, .native64), familyFor(.mips64, .gnu));
+    try testing.expectEqual(@as(?Family, .natural32), familyFor(.powerpc, .gnu));
+    try testing.expectEqual(@as(?Family, .native64), familyFor(.aarch64, .gnu));
+    try testing.expectEqual(@as(?Family, null), familyFor(.wasm32, .none));
+}
+
+test "totalBytes: saturates on a block size the multiply can actually reach" {
+    // TEETH for `*|`. The test below this one names saturation but sets
+    // `block_size = -1`, which `blockSizeU64` clamps to 0 BEFORE the multiply
+    // — so the product is 0 whether the operator saturates or wraps, and
+    // `*|` -> `*%` survived it green. A test whose subject its own inputs
+    // cannot reach. These inputs reach it.
+    const u = Usage{
+        .block_size = 4096,
+        .fragment_size = 4096,
+        .blocks_total = std.math.maxInt(u64),
+        .blocks_free = std.math.maxInt(u64) / 2,
+        .blocks_available = std.math.maxInt(u64) / 4,
+        .inodes_total = 0,
+        .inodes_free = 0,
+        .fs_type_magic = 0,
+        .name_max = 255,
+    };
+    try testing.expectEqual(std.math.maxInt(u64), u.totalBytes());
+    try testing.expectEqual(std.math.maxInt(u64), u.freeBytes());
+    try testing.expectEqual(std.math.maxInt(u64), u.availableBytes());
 }
 
 test "totalBytes/freeBytes/availableBytes: saturate rather than wrap on a corrupt block_size" {

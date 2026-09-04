@@ -176,9 +176,19 @@ Not applicable — no secret material is handled anywhere in this module.
   `procnet`'s `readVirtualFile` discipline (its own doc comment explains why
   a streaming read is required at all: `/proc` files report size 0 from
   `stat`). ⚠ That cap **truncates**; it does not reject. A table past the
-  limit comes back as its bounded prefix, its last (cut) row skipped as
-  malformed like any other, so the caller gets a short listing — never an
-  empty one. This too matches `procnet`, and for the same reason it was
+  limit comes back as its bounded prefix **with the partial final line
+  dropped by the reader**, so the caller gets a short listing — never an
+  empty one. ⚠ Until this module's first audit (2026-09-04) this said the
+  cut row was "skipped as malformed like any other", and the parsers do not
+  do that: a cut only produces too-few-columns if it lands *before* the last
+  required column, and once it lands inside the final column the row is
+  complete and is accepted carrying a **prefix** of that value. Measured on
+  a real 73-mount capture: a `mountinfo` row came back with `super_options`
+  = `rw,size=10` where the truth was `rw,size=1024k` — not a visibly broken
+  row, a well-formed wrong one, 100x off. Dropping the tail after the last
+  newline in `mounts.readVirtualFile` is what makes the promise true, and
+  `mountinfo` now calls that same reader instead of carrying a duplicate of
+  it (the duplicate is why the false claim stood in two places at once). This too matches `procnet`, and for the same reason it was
   fixed there: as `allocRemaining(...) catch null` both readers returned
   `null` on an oversized table, which is the value `readMounts`/
   `readMountinfo` reserve for "`/proc` is not mounted" — a different fact,
@@ -261,18 +271,59 @@ Not applicable — no secret material is handled anywhere in this module.
   structure from them is consumer-side until something here needs it
   internally.
 
+## What the fuzz harnesses actually ran, before and after
+
+⚠ **A `Smith` ranged draw returns the range's minimum unless the input bytes
+already lie inside the range.** `valueRangeAtMost`, `index` and `value`
+consume 8 bytes, read them as one little-endian `u64`, and hand back
+`weights[0].min` whenever that `u64` falls outside the requested range — no
+scaling, no modulo. A corpus of ASCII text never lands in a small range, so
+outside `zig build --fuzz` **every** ranged draw in both harnesses returned
+its minimum: branch 0, length 0. The whole fuzz lane for this module was
+`parseMounts("")` and `parseMountinfo("")`, twice per gate run.
+
+Measured directly rather than inferred — with `Smith{ .in = "/dev/sda1 …" }`,
+`valueRangeAtMost(u8, 0, 1)`, `valueRangeAtMost(u16, 0, 2048)`, `value(u8)`
+and `index(165)` all return **0**, while an input crafted as in-range
+little-endian `u64` words returns 1, 900, 200 and 77. `Smith.bytes` is the
+exception: it copies the input faithfully in both modes.
+
+Two consequences were load-bearing here:
+
+- The `\400` overflow in `unescapeOctal` sat in a public entry point with a
+  fuzz harness pointed straight at it, and the harness never once reached the
+  escape decoder. Instrumented over **1,000,000 rounds of the old shape: zero
+  backslash bytes** ever reached it.
+- Its doc comment justified mutating a real capture on the grounds that this
+  "exercises `unescapeOctal`'s bounds check far more often than a from-scratch
+  random blob would" — and the capture it mutates contains **zero
+  backslashes**. The named mechanism was not there to begin with.
+
+Both harnesses now derive every decision from `Smith.bytes` and carry the
+escaped fixture as a second sample, so a corpus entry means something outside
+the fuzzer too. Re-measured against the defect deliberately reinstated: the
+new shape trips it in **~550 rounds**. The old `mutateSample` shape is shared
+with `procnet`'s, and this is a property of `Smith`, not of either module.
+
 ## Open
 
-- `NaturalGeneric32`/`PackedGeneric32`/`MipsStatfs64` are unverified by a
-  live syscall on their actual target architectures (no such kernel is
-  available in this collection's CI, x86_64 + arm64 only) — see the
-  Anchoring section's REDERIVED grade for what cross-compilation *did*
-  verify (real semantic analysis + target-independent `comptime` size
-  asserts across eleven architectures). The kernel's own `sz`-mismatch
-  `-EINVAL` check means a layout error would surface as a hard failure
-  rather than silent corruption on whichever architecture eventually
-  exercises this for real, but that is a safety net, not a substitute for
-  the missing live test.
+- ~~`NaturalGeneric32`/`PackedGeneric32`/`MipsStatfs64` are unverified by a
+  live syscall on their actual target architectures.~~ **CLOSED by the first
+  audit (2026-09-04), by qemu-user.** `qemu-arm`/`qemu-mips`/`qemu-i386`/
+  `qemu-aarch64` thunk guest syscalls through their own independent
+  transcription of each architecture's `struct statfs64` — a foreign
+  implementation of exactly what this module hand-transcribed. All four
+  families give the right numbers on **eight architectures**, both
+  endiannesses, checked field-by-field against `stat -f /` on the host;
+  MIPS's distinctive field order is externally confirmed.
+
+  ⚠ Two limits of that oracle, verified rather than assumed, because an
+  oracle's blind spot is the part that matters: qemu-user **does not
+  implement the kernel's `sz` check** (it accepted every size passed), and
+  it **cannot discriminate `packed32` from `natural32`** — the two have
+  identical field offsets and differ only in trailing padding. So ARM's
+  84-byte choice remains unanchored in the one way that would matter, and
+  the `EINVAL` net below is what stands behind it.
 - `mips64-linux-muslabin32` (mips n32 ABI) does not currently build at all —
   the failure is inside Zig 0.16.0's own `std.Io.Threaded`/`std.os.linux`
   support for that target (a `.llseek` syscall missing from the `MipsN32`
@@ -280,9 +331,13 @@ Not applicable — no secret material is handled anywhere in this module.
   investigated further here: out of scope for a `diskfree` fix, and o32
   (`.mips`/`.mipsel`) — the concrete target this module's requirements
   named — builds and analyzes cleanly.
-- `.x86`'s mapping to `PackedGeneric32` assumes a 32-bit process under an
-  x86_64 kernel's compat syscall layer, not a native i386 kernel — see the
-  "x86 compat-layer assumption" note above for the header text this rests
-  on and the `EINVAL` bound on being wrong. Not further verified here: no
-  i386 kernel, native or compat-hosting, is available in this collection's
-  CI to check the assumption against a live syscall either way.
+- ~~`.x86`'s mapping to `PackedGeneric32` assumes a 32-bit process under an
+  x86_64 kernel's compat syscall layer.~~ **CLOSED by the first audit
+  (2026-09-04), and the assumption is correct.** An x86_64 host *is* a
+  compat-hosting kernel, which the note above missed: a native i386 binary
+  run on one reaches the real compat entry point. Measured there —
+  `sz = 84` **succeeds**; `sz = 88`, `96`, `120`, `0` and `4096` all return
+  **EINVAL**. That settles both halves at once: `.x86 => .packed32` is
+  right, and `do_statfs64`'s size check is real rather than a hoped-for
+  safety net. The mapping is now held by a test (`familyFor`), which the
+  inline `switch` it replaced could not be.

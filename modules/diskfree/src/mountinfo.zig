@@ -27,8 +27,20 @@ const mounts = @import("mounts.zig");
 /// One `/proc/self/mountinfo` row. String fields are allocator-owned and
 /// already unescaped where the kernel escapes them (`root`, `mount_point`,
 /// `mount_source` — see `mounts.unescapeOctal`); `options`/`optional_fields`/
-/// `super_options` are comma/space-separated tag lists the kernel does not
-/// escape (no arbitrary path bytes can appear in them).
+/// `super_options` are handed back **raw, escapes and all**.
+///
+/// ⚠ This used to say those three "the kernel does not escape … (no
+/// arbitrary path bytes can appear in them)", and that is false: option
+/// values routinely carry paths. Measured on a live kernel — an overlay
+/// mount whose `lowerdir` contains a space yields
+/// `lowerdir=/…/low\040er` inside `super_options`. They are left raw
+/// because unescaping must happen AFTER the caller splits on `,`, never
+/// before: decode first and a `\040` becomes a real space that a
+/// whitespace-splitting caller then mis-splits. So the recipe is
+/// `splitScalar(u8, super_options, ',')` and then `mounts.unescapeOctal` on
+/// whatever value you keep. (A path containing a literal comma is
+/// unrepresentable in this format at all — the kernel escapes space, tab,
+/// newline and backslash, and nothing else.)
 pub const MountinfoEntry = struct {
     /// Unique ID for this mount (field 1) — not stable across
     /// unmount/remount, only within one `/proc/self/mountinfo` snapshot.
@@ -415,34 +427,69 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
 // (`mount_id`/`parent_id`/`major:minor`) is extra surface `mounts.zig`
 // doesn't have, and the "-" separator scan is its own bounds-sensitive loop.
 const fuzz_fixture = @embedFile("testdata/mountinfo_sample.txt");
+const fuzz_fixture_escaped = @embedFile("testdata/mountinfo_escaped.txt");
+
+/// Size of the one blob every decision in `shapeInput` is derived from.
+const fuzz_input_len = 2048;
+
+/// **Both** samples, because a mutation strategy is only as good as what it
+/// mutates: the plain capture contains **zero backslashes**, so the escape
+/// decoder was unreachable from it by any small number of byte flips. The
+/// escaped fixture puts real `\ooo` sequences in front of the mutator, where
+/// flipping one digit reaches the out-of-range case.
+const fuzz_samples = [_][]const u8{ fuzz_fixture, fuzz_fixture_escaped };
 
 test "fuzz: parseMountinfo never panics, OOB or leaks, arbitrary or mutated-real bytes" {
-    try std.testing.fuzz({}, fuzzParseMountinfoNeverLeaks, .{ .corpus = &.{fuzz_fixture} });
+    try std.testing.fuzz({}, fuzzParseMountinfoNeverLeaks, .{ .corpus = &.{ fuzz_fixture, fuzz_fixture_escaped } });
 }
 
 fn fuzzParseMountinfoNeverLeaks(_: void, smith: *std.testing.Smith) !void {
-    var buf: [2048]u8 = undefined;
-    const text = mutateSample(smith, fuzz_fixture, &buf);
-    const entries = try parseMountinfo(testing.allocator, text);
+    var raw: [fuzz_input_len]u8 = undefined;
+    smith.bytes(&raw);
+    var buf: [fuzz_input_len]u8 = undefined;
+    const entries = try parseMountinfo(testing.allocator, shapeInput(&raw, &buf));
     freeAll(testing.allocator, entries);
 }
 
-/// One draw in five is pure arbitrary bytes; the rest mutates the real
-/// `/proc/self/mountinfo` capture. Shared shape with `mounts.zig`'s
-/// `mutateSample` and `procnet`'s.
-fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
-    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
-        smith.bytes(buf);
-        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
-        return buf[0..len];
-    }
+/// Turns one blob of fuzzer/corpus bytes into a parser input: either the
+/// bytes themselves, or a real `/proc` capture with byte-driven mutations.
+///
+/// ⚠ **Every decision here is read out of the blob, never drawn from a
+/// range, and that is the whole point.** `Smith`'s ranged draws
+/// (`valueRangeAtMost`, `index`, `value`) consume 8 bytes, read them as one
+/// little-endian `u64`, and return the range's **minimum** unless that `u64`
+/// already lies inside the range — no scaling, no modulo. ASCII text never
+/// lands in a small range, so outside `zig build --fuzz` EVERY ranged draw
+/// returned its minimum: the previous version of this harness picked branch
+/// 0, drew length 0, and ran the parser on `""` — twice per gate run, and
+/// nothing else. That is how the `\400` overflow in `unescapeOctal` survived
+/// to this module's first audit (2026-09-04). `Smith.bytes` copies the input
+/// faithfully in both modes, so deriving from bytes is what makes a corpus
+/// entry mean anything outside the fuzzer.
+///
+/// Measured, not inferred: with `Smith{ .in = "/dev/sda1 /mnt/x ext4 …" }`,
+/// `valueRangeAtMost(u8, 0, 1)`, `valueRangeAtMost(u16, 0, 2048)`,
+/// `value(u8)` and `index(165)` all return **0**; with an input crafted as
+/// in-range little-endian `u64` words they return 1, 900, 200 and 77.
+fn shapeInput(raw: *const [fuzz_input_len]u8, buf: []u8) []const u8 {
+    const ctl = raw[0];
+    const want = (@as(usize, raw[1]) << 8) | raw[2];
+    const body = raw[3..];
+    // One shape in four: the blob itself, at a byte-derived length.
+    if (ctl & 3 == 0) return body[0 .. want % (body.len + 1)];
+
+    const sample = fuzz_samples[(ctl >> 2) % fuzz_samples.len];
     const len = @min(sample.len, buf.len);
+    if (len == 0) return buf[0..0];
     @memcpy(buf[0..len], sample[0..len]);
-    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
-    var i: u8 = 0;
-    while (i < n_mutations) : (i += 1) {
-        if (len == 0) break;
-        buf[smith.index(len)] = smith.value(u8);
+    // Up to 24 mutations, three bytes each: position high, position low,
+    // replacement byte. A run of three zeros ends the walk, so a corpus
+    // entry shorter than the blob mutates only as far as its own bytes
+    // reach — `Smith.bytes` zero-pads the tail.
+    var i: usize = 0;
+    while (i + 3 <= body.len and i < 3 * 24) : (i += 3) {
+        if (body[i] == 0 and body[i + 1] == 0 and body[i + 2] == 0) break;
+        buf[((@as(usize, body[i]) << 8) | body[i + 1]) % len] = body[i + 2];
     }
     return buf[0..len];
 }
