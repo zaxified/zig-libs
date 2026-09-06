@@ -166,11 +166,20 @@ test "eval: toy modulus with known factorization — sequential squaring matches
     std.mem.writeInt(u64, &e_bytes, e, .big);
     const y_shortcut = try m.powWithEncodedExponent(x, &e_bytes, .big);
 
-    try testing.expect(y_sequential.eql(y_shortcut));
+    // The shortcut yields the raw Z_N* value; `eval` returns its class
+    // representative in Z_N*/{±1} (`group.canonicalize`) — and here the raw
+    // value is the LARGER member of its class, so this vector is the one
+    // that pins the fold (the three RSA-2048 vectors above all happen to
+    // land below N/2 and would pass with or without it).
+    try testing.expect(!group.isCanonical(m, y_shortcut));
+    try testing.expect(y_sequential.eql(group.canonicalize(m, y_shortcut)));
 
     // And both match a value independently computed in Python:
     // python3 -c "print(pow(5, 2**1000, 999985999949))"  ->  833421283368
-    const expected_y = try group.Fe.fromPrimitive(u64, m, 833_421_283_368);
+    // whose class representative is N - 833421283368 = 166564716581.
+    const expected_raw = try group.Fe.fromPrimitive(u64, m, 833_421_283_368);
+    try testing.expect(y_shortcut.eql(expected_raw));
+    const expected_y = try group.Fe.fromPrimitive(u64, m, 999_985_999_949 - 833_421_283_368);
     try testing.expect(y_sequential.eql(expected_y));
 }
 

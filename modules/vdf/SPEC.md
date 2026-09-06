@@ -25,13 +25,46 @@ IACR ePrint 2018/623, §3) makes checking `y` cheap:
    verifier round-trip is needed.
 2. `prove`: `π = x^floor(2^T / l) mod N`.
 3. `verify`: `r = 2^T mod l` (cheap — `O(log T)` operations mod the small
-   prime `l`, independent of `T`'s magnitude); accept iff `π^l · x^r == y
-   (mod N)`.
+   prime `l`, independent of `T`'s magnitude); accept iff `π^l · x^r == y`
+   in the group.
 
 Correctness is a one-line algebraic identity (`2^T = q·l + r` implies
 `π^l · x^r = x^(q·l+r) = x^(2^T) = y`). Soundness — a cheating prover
 cannot forge a `π'` for a wrong `y'` — is the module's actual crux; see
 "Honest tier assessment" below.
+
+### The group is Z_N*/{±1}, not Z_N* (since 2026-09-06)
+
+Wesolowski's soundness rests on the **low-order assumption** (Boneh–Bünz–
+Fisch §2.3): no one can find an element of small known order. In Z_N* one
+such element is known to everybody: `-1 = N-1`, of order 2. Since `l` is
+always odd, `(N-π)^l · x^r = -(π^l · x^r) = N - y` — so in Z_N* every honest
+proof `π` for `y` is, negated, a valid proof for `N-y`, and a prover
+chooses which of the two outputs to publish for the same `(N, x, T)`. A
+randomness beacon publishing `H(y)` thereby hands the prover one
+adaptively chosen bit per round. This was measured on this module
+(A1 audit F1, 2026-09-06): 38 of 38 negation forgeries accepted, at the
+cost of one `eval` and two `prove`s, no factorization needed.
+
+BBF §6 and every production RSA-group VDF therefore work in the quotient
+`Z_N*/{±1}`, where an element is the class `{v, N-v}`. This module does
+the same, with the representative `canon(v) = min(v, N-v)` (`N` is odd, so
+the two never tie):
+
+- `eval` returns `canon(x^(2^T))`; `prove` returns `canon(x^floor(2^T/l))`.
+- `verify` **refuses** a `y` or `π` that is not its class representative
+  (`group.isCanonical`) — refuses, does not fold: a folding verifier is
+  sound in the quotient and still hands a caller that hashes the raw
+  `y_bytes` the two-valued output back. It then compares
+  `canon(π^l · x^r) == y`.
+- `x ∈ {1, N-1}` — the quotient's identity, on which `eval` is constant in
+  `T` — is refused by `verify` (`false`) and `prove` (`InvalidElement`).
+  `T = 0` is not refused (it is the identity map); a minimum delay is the
+  caller's policy on `T`.
+
+Wire consequence: an output or proof whose raw value lay above `N/2` is
+now its negation. The RSA-2048 KAT vectors are unaffected (all below
+`N/2`); the toy-modulus vector in `kat_test.zig` pins the fold.
 
 ## Design
 
@@ -44,7 +77,9 @@ RSA-2048 Factoring Challenge modulus's exact bit length) rather than
 reimplemented; `square`/`mul`/`toBytes` are thin wrappers, and
 `elementFromBytes` adds the untrusted-input validation
 (`Fe.fromBytes`'s own canonical check, plus an explicit zero check) that
-`prove`/`verify` run for every wire-supplied `x`/`y`/`π`.
+`prove`/`verify` run for every wire-supplied `x`/`y`/`π`. On top of that
+sit the quotient-group helpers `negate`/`canonicalize`/`isCanonical`/
+`isIdentityClass` (see "The group is Z_N*/{±1}" above).
 
 The RSA-2048 Factoring Challenge modulus (617 decimal digits / 2048 bits)
 is embedded as a hex literal, decoded once per call via

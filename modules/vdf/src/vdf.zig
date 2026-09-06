@@ -18,6 +18,11 @@ const group = @import("group.zig");
 /// steps, even with unbounded PARALLEL hardware. Wall-clock proportional
 /// to `T`; entirely mechanical (no cryptographic design judgment beyond
 /// "call `group.square` in a loop"), unlike `prove`/`verify` below.
+///
+/// The result is the class of `x^(2^T)` in Z_N*/{±1}, returned as its
+/// representative `min(y, N-y)` (`group.canonicalize`) — the form `verify`
+/// requires of `y`, and the reason a VDF output is ONE value: in Z_N*
+/// itself a proof for `y` proves `N-y` just as well (see `group.zig`).
 pub fn eval(m: group.Modulus, x: group.Fe, t: u64) group.Fe {
     // Montgomery-resident: convert `x` into the Montgomery domain ONCE, perform
     // the `T` sequential squarings there (each a single `montint` Montgomery
@@ -30,7 +35,7 @@ pub fn eval(m: group.Modulus, x: group.Fe, t: u64) group.Fe {
     var y = group.toMont(&mod, x);
     var i: u64 = 0;
     while (i < t) : (i += 1) y = group.montSquare(&mod, y);
-    return group.fromMont(m, &mod, y);
+    return group.canonicalize(m, group.fromMont(m, &mod, y));
 }
 
 // ── hashToPrime — the Fiat-Shamir challenge prime (REAL) ────────────────────
@@ -395,12 +400,20 @@ pub const ProveError = error{InvalidElement};
 /// `x_bytes`/`y_bytes` are validated via `group.elementFromBytes`
 /// before any arithmetic touches them — never skipped just because the
 /// values usually come from this module's own `eval` (an out-of-range or
-/// zero element yields `error.InvalidElement`, not garbage).
+/// zero element yields `error.InvalidElement`, not garbage). Two more
+/// shapes are `InvalidElement` for the quotient group's sake: an `x` in
+/// the identity class `{1, N-1}` (a degenerate input `verify` refuses —
+/// see `group.isIdentityClass`), and a `y` that is not the canonical
+/// representative of its class (`eval` never produces one; a proof over
+/// it would be for a `y` `verify` will not accept). The returned `π` is
+/// canonical too.
 pub fn prove(m: group.Modulus, x_bytes: []const u8, y_bytes: []const u8, t: u64) ProveError!Proof {
     // Validate both untrusted elements before any arithmetic touches them
     // (contract: never skipped just because they usually come from `eval`).
     const x = group.elementFromBytes(m, x_bytes) catch return error.InvalidElement;
     const y = group.elementFromBytes(m, y_bytes) catch return error.InvalidElement;
+    if (group.isIdentityClass(m, x)) return error.InvalidElement;
+    if (!group.isCanonical(m, y)) return error.InvalidElement;
 
     // Fiat-Shamir binding over the fixed-width canonical encodings — the
     // decoded elements are re-serialized through `group.toBytes` (rather
@@ -419,8 +432,11 @@ pub fn prove(m: group.Modulus, x_bytes: []const u8, y_bytes: []const u8, t: u64)
     const l_bytes = hashToPrime(&n_canon, &x_canon, &y_canon, t);
 
     // pi = x^floor(2^t / l) mod N, via the streaming quotient — the huge
-    // exponent `floor(2^t / l)` is never materialized (see the helper).
-    const pi = streamingQuotientPow(m, x, &l_bytes, t);
+    // exponent `floor(2^t / l)` is never materialized (see the helper) —
+    // then reduced to its class representative: `verify` compares in the
+    // quotient, so `π` and `N-π` prove the same thing, and the wire form
+    // carries the one of them a verifier will admit.
+    const pi = group.canonicalize(m, streamingQuotientPow(m, x, &l_bytes, t));
     var proof: Proof = .{ .pi = undefined };
     group.toBytes(pi, &proof.pi) catch unreachable; // buffer is exactly modulus_bytes
     return proof;
@@ -538,13 +554,18 @@ pub const VerifyError = error{InvalidElement};
 ///      (Fiat-Shamir — see `root.zig`).
 ///   3. `r = pow2Mod(PrimeModulus.fromBytes(l_bytes, .big), t)` — already
 ///      implemented and real, see `pow2Mod` above.
-///   4. Accept iff `π^l * x^r == y (mod N)`.
+///   4. Accept iff `π^l * x^r == y` **in Z_N*/{±1}** — i.e.
+///      `canonicalize(π^l * x^r mod N) == y`, with `y` and `π` required to
+///      be canonical representatives (step 1) and `x` not the identity
+///      class.
 ///
 /// **Why step 4 holds when `π` is honest:** writing `2^T = q*l + r` (the
 /// division `prove` performed; `q = floor(2^T/l)`, and `r = 2^T mod l` —
 /// the SAME `r` step 3 computes independently, without needing `q`):
 /// `π^l * x^r = (x^q)^l * x^r = x^(q*l + r) = x^(2^T) = y`. Completeness
-/// is therefore a one-line algebraic identity.
+/// is therefore a one-line algebraic identity — up to sign, which is what
+/// the quotient absorbs: `prove` ships `min(π, N-π)`, and `(N-π)^l = -π^l`
+/// for odd `l`, so the raw product is `±y` and its class is `y`'s.
 ///
 /// **Soundness — the module's actual crux, not boilerplate:** a CHEATING
 /// prover must NOT be able to produce a `π' != x^q` (or claim a wrong
@@ -552,15 +573,20 @@ pub const VerifyError = error{InvalidElement};
 /// being an UNPREDICTABLE-TO-THE-PROVER prime chosen ONLY AFTER `y` is
 /// fixed — exactly what the Fiat-Shamir `hashToPrime` binding buys, and
 /// exactly why `hashToPrime` must hash `y` (the prover's claim) and not
-/// just `(N, x, T)` (fixable in advance); (b) the group's order being
-/// hidden (see `root.zig`'s trusted-setup caveat) — the reduction breaks
-/// down entirely for a caller-supplied `N` whose factorization the
-/// prover/verifier (or anyone) knows. The full argument is Wesolowski §3
-/// Theorem 1, via the "low order assumption" formalized in
-/// Boneh-Bünz-Fisch §2.3 — implementing steps 1-4 above without
+/// just `(N, x, T)` (fixable in advance); (b) the group having no known
+/// element of low order — the "low order assumption" of Boneh-Bünz-Fisch
+/// §2.3, which needs BOTH the order of `N` to be hidden (see `root.zig`'s
+/// trusted-setup caveat; the reduction breaks down entirely for a
+/// caller-supplied `N` whose factorization anyone knows) AND the one
+/// low-order element everybody knows, `-1`, to be factored out. That
+/// second half is why this verifier works in Z_N*/{±1} (BBF §6): in Z_N*
+/// the same `π` negated is a valid proof of `N-y`, so a prover chooses
+/// which of two "outputs" to publish — 38 of 38 such forgeries were
+/// accepted before 2026-09-06. The full argument is Wesolowski §3
+/// Theorem 1 over the quotient; implementing steps 1-4 above without
 /// internalizing WHY step 2's binding must include `y` (not just `N, x,
-/// T`) is the single easiest way to ship a verifier that accepts forged
-/// proofs; see `SPEC.md`.
+/// T`), and why `-1` must be quotiented away, are the two easiest ways to
+/// ship a verifier that accepts forged proofs; see `SPEC.md`.
 pub fn verify(m: group.Modulus, x_bytes: []const u8, y_bytes: []const u8, proof: Proof, t: u64) VerifyError!bool {
     // Step 1: decode + validate every untrusted element. An out-of-range
     // value (`0`, `N`, `>= N`, wrong length) is a REJECTED proof — return
@@ -570,6 +596,14 @@ pub fn verify(m: group.Modulus, x_bytes: []const u8, y_bytes: []const u8, proof:
     const x = group.elementFromBytes(m, x_bytes) catch return false;
     const y = group.elementFromBytes(m, y_bytes) catch return false;
     const pi = group.elementFromBytes(m, &proof.pi) catch return false;
+    // The quotient group's own three rejections. `y`/`π` must be the
+    // representative of their class, not merely a member — folding `N-y`
+    // to `y` here would hand a caller that hashes `y_bytes` the two-valued
+    // output back (`group.isCanonical`). And `x ∈ {1, N-1}` is the
+    // identity: `eval` is constant in `T` on it, so a "proof of 10^18
+    // squarings" over it is free (`group.isIdentityClass`).
+    if (!group.isCanonical(m, y) or !group.isCanonical(m, pi)) return false;
+    if (group.isIdentityClass(m, x)) return false;
 
     // Step 2: recompute the challenge prime from the SAME fixed-width
     // canonical `(N, x, y, T)` binding `prove` hashed — including `y`,
@@ -599,7 +633,10 @@ pub fn verify(m: group.Modulus, x_bytes: []const u8, y_bytes: []const u8, proof:
     const mod = group.montModulus(m);
     const pi_l = group.montPowPublic(m, &mod, pi, &l_bytes);
     const x_r = group.montPowPublic(m, &mod, x, &r_bytes);
-    return group.mul(m, pi_l, x_r).eql(y);
+    // Compared in the quotient: the raw product is `±y` for an honest
+    // canonical `π` (see the doc comment), and its class representative is
+    // what `y` was required to be.
+    return group.canonicalize(m, group.mul(m, pi_l, x_r)).eql(y);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -663,14 +700,23 @@ test "Proof codec: rejects wrong-length input" {
 // the module's one boundary of this kind, so it gets a harness rather
 // than being skipped outright.
 test "fuzz: Proof.fromBytes never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzProofFromBytes, .{});
+    // Seeds at the one boundary the codec has (exactly `modulus_bytes`, one
+    // short, one long): without a corpus the harness sees a single empty
+    // input on the default lane — `check-fuzz-reach` measured that across
+    // the repository on 2026-09-06.
+    try testing.fuzz({}, fuzzProofFromBytes, .{ .corpus = &.{
+        &([_]u8{0xab} ** group.modulus_bytes),
+        &([_]u8{0xab} ** (group.modulus_bytes - 1)),
+        &([_]u8{0xab} ** (group.modulus_bytes + 1)),
+    } });
 }
 
 fn fuzzProofFromBytes(_: void, smith: *std.testing.Smith) !void {
     var buf: [group.modulus_bytes + 8]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
-    _ = Proof.fromBytes(buf[0..len]) catch return;
+    // `smith.slice`, not `bytes` + a ranged length: `bytes` consumes the
+    // whole seed, after which the length draw is always 0.
+    const n = smith.slice(&buf);
+    _ = Proof.fromBytes(buf[0..n]) catch return;
 }
 
 test "hashToPrime: deterministic given the same binding" {
@@ -728,6 +774,176 @@ test "prove core: streaming quotient matches naive big.int division (incl. q=0 a
         const naive = try naiveQuotientPowForTest(testing.allocator, m, x, &l_bytes, t);
         try testing.expect(streaming.eql(naive));
     }
+}
+
+// ── the quotient group Z_N*/{±1} (A1 F1, 2026-09-06) ────────────────────────
+
+/// `x` as a canonical fixed-width element, for the RSA-2048 tests below.
+fn smallElement(v: u8) [group.modulus_bytes]u8 {
+    var buf: [group.modulus_bytes]u8 = [_]u8{0} ** group.modulus_bytes;
+    buf[group.modulus_bytes - 1] = v;
+    return buf;
+}
+
+test "quotient group: eval and prove emit the class representative, and verify accepts a proof whose raw π lay above N/2" {
+    // Not merely "the honest proof verifies": for at least one of these
+    // inputs the raw `x^q` is the LARGER member of its class, so `prove`
+    // folded it and `verify`'s raw product is `N-y` — the case that only
+    // passes because the comparison happens in the quotient. Counted, so a
+    // future change to the inputs cannot make this vacuous.
+    const m = group.rsa2048ChallengeModulus();
+    var n_canon: [group.modulus_bytes]u8 = undefined;
+    try m.toBytes(&n_canon, .big);
+    const t: u64 = 1000;
+    var folded_pi: usize = 0;
+    var folded_y: usize = 0;
+    for ([_]u8{ 2, 3, 5, 7, 11, 13, 17, 19 }) |xv| {
+        const x_bytes = smallElement(xv);
+        const x = try group.elementFromBytes(m, &x_bytes);
+        const y = eval(m, x, t);
+        try testing.expect(group.isCanonical(m, y));
+        // The raw squaring chain, for comparison with what `eval` returned.
+        var raw = x;
+        var i: u64 = 0;
+        while (i < t) : (i += 1) raw = group.square(m, raw);
+        try testing.expect(group.canonicalize(m, raw).eql(y));
+        if (!raw.eql(y)) folded_y += 1;
+
+        var y_bytes: [group.modulus_bytes]u8 = undefined;
+        try group.toBytes(y, &y_bytes);
+        const proof = try prove(m, &x_bytes, &y_bytes, t);
+        const pi = try group.elementFromBytes(m, &proof.pi);
+        try testing.expect(group.isCanonical(m, pi));
+        const l_bytes = hashToPrime(&n_canon, &x_bytes, &y_bytes, t);
+        const raw_pi = streamingQuotientPow(m, x, &l_bytes, t);
+        try testing.expect(group.canonicalize(m, raw_pi).eql(pi));
+        if (!raw_pi.eql(pi)) folded_pi += 1;
+
+        try testing.expect(try verify(m, &x_bytes, &y_bytes, proof, t));
+    }
+    try testing.expect(folded_y > 0);
+    try testing.expect(folded_pi > 0);
+}
+
+test "quotient group: the negation forgery y' = N - y, π' = N - π is rejected, as is every other sign combination (A1 F1)" {
+    // `-1` has order 2 and `l` is odd, so in Z_N* `(N-π)^l · x^r = N - y`:
+    // a prover could publish EITHER `y` or `N-y` with a valid proof and pick
+    // the one whose hash suits it — 38 of 38 such forgeries were accepted
+    // before the verifier moved to Z_N*/{±1}. Now `N-y` is not a canonical
+    // representative and is refused at the door; and even if it were
+    // folded, the class it names is `y`'s, so a forger gains no second
+    // output.
+    const m = group.rsa2048ChallengeModulus();
+    for ([_]u64{ 1, 17, 1000 }) |t| {
+        for ([_]u8{ 5, 7 }) |xv| {
+            const x_bytes = smallElement(xv);
+            const x = try group.elementFromBytes(m, &x_bytes);
+            const y = eval(m, x, t);
+            var y_bytes: [group.modulus_bytes]u8 = undefined;
+            try group.toBytes(y, &y_bytes);
+            const proof = try prove(m, &x_bytes, &y_bytes, t);
+            try testing.expect(try verify(m, &x_bytes, &y_bytes, proof, t));
+
+            var neg_y_bytes: [group.modulus_bytes]u8 = undefined;
+            try group.toBytes(group.negate(m, y), &neg_y_bytes);
+            const pi = try group.elementFromBytes(m, &proof.pi);
+            var neg_proof: Proof = .{ .pi = undefined };
+            try group.toBytes(group.negate(m, pi), &neg_proof.pi);
+
+            // The forgery proper: (N-y, N-π).
+            try testing.expect(!(try verify(m, &x_bytes, &neg_y_bytes, neg_proof, t)));
+            // And the two half-negations.
+            try testing.expect(!(try verify(m, &x_bytes, &neg_y_bytes, proof, t)));
+            try testing.expect(!(try verify(m, &x_bytes, &y_bytes, neg_proof, t)));
+            // `prove` will not even start on the non-canonical `y`.
+            try testing.expectError(error.InvalidElement, prove(m, &x_bytes, &neg_y_bytes, t));
+        }
+    }
+}
+
+test "quotient group: the identity class x ∈ {1, N-1} is refused — no free proof of 10^18 squarings (A1 F2)" {
+    // `1^(2^T) = 1` and `(N-1)^(2^T) = 1` for every `T ≥ 1`: `eval` is
+    // constant in `T` on these, and the honest proof is `π = x^q ∈ {1, N-1}`
+    // — writable without a single squaring. Before 2026-09-06 `verify`
+    // accepted `x = 1, y = 1, π = 1, T = 10^18` in 6.3 ms.
+    const m = group.rsa2048ChallengeModulus();
+    const one_bytes = smallElement(1);
+    var n_minus_1_bytes: [group.modulus_bytes]u8 = undefined;
+    try group.toBytes(group.negate(m, m.one()), &n_minus_1_bytes);
+    const t: u64 = 1_000_000_000_000_000_000;
+    const proof_one: Proof = .{ .pi = one_bytes };
+
+    try testing.expect(!(try verify(m, &one_bytes, &one_bytes, proof_one, t)));
+    try testing.expect(!(try verify(m, &n_minus_1_bytes, &one_bytes, proof_one, t)));
+    try testing.expectError(error.InvalidElement, prove(m, &one_bytes, &one_bytes, t));
+    try testing.expectError(error.InvalidElement, prove(m, &n_minus_1_bytes, &one_bytes, t));
+    // The next element up is an ordinary input and still works.
+    const two_bytes = smallElement(2);
+    const y = eval(m, try group.elementFromBytes(m, &two_bytes), 10);
+    var y_bytes: [group.modulus_bytes]u8 = undefined;
+    try group.toBytes(y, &y_bytes);
+    const proof = try prove(m, &two_bytes, &y_bytes, 10);
+    try testing.expect(try verify(m, &two_bytes, &y_bytes, proof, 10));
+}
+
+test "quotient group: verify demands the canonical encoding of y and π rather than folding it" {
+    // A verifier that silently folded `N-y` to `y` would be sound in the
+    // quotient and yet hand a caller comparing/hashing the RAW `y_bytes`
+    // the two-valued output back. Pinned separately from the forgery test:
+    // this one goes red if someone "helpfully" replaces the rejection with
+    // a `canonicalize` on input.
+    const m = try group.Modulus.fromPrimitive(u64, 1_000_003 * 999_983);
+    const x = try group.Fe.fromPrimitive(u64, m, 12345);
+    var x_bytes: [group.modulus_bytes]u8 = undefined;
+    try group.toBytes(x, &x_bytes);
+    const t: u64 = 64;
+    const y = eval(m, x, t);
+    var y_bytes: [group.modulus_bytes]u8 = undefined;
+    try group.toBytes(y, &y_bytes);
+    const proof = try prove(m, &x_bytes, &y_bytes, t);
+    try testing.expect(try verify(m, &x_bytes, &y_bytes, proof, t));
+
+    // Same class, other member: rejected on both y and π individually,
+    // even though the pair (N-y, N-π) names exactly the honest classes.
+    var neg_y_bytes: [group.modulus_bytes]u8 = undefined;
+    try group.toBytes(group.negate(m, y), &neg_y_bytes);
+    var neg_proof: Proof = .{ .pi = undefined };
+    try group.toBytes(group.negate(m, try group.elementFromBytes(m, &proof.pi)), &neg_proof.pi);
+    try testing.expect(!(try verify(m, &x_bytes, &neg_y_bytes, neg_proof, t)));
+}
+
+// ── Miller-Rabin strength (A1 F3) ───────────────────────────────────────────
+
+test "isProbablePrime: strong pseudoprimes to base 2 are rejected — the witnesses are random, not the fixed base 2" {
+    // Every value here passes a Miller-Rabin round with witness 2 (they are
+    // the strong pseudoprimes base 2 below 10^5, OEIS A001262) and is
+    // composite. A test that hard-wired the witness to 2 — or that drew it
+    // from a PRNG seeded so that 2 is what comes out — would call each of
+    // them prime. `deterministicWitnessRandom` is used exactly as
+    // `hashToPrime` uses it, so this is the production witness stream.
+    const spsp2 = [_]u64{ 2047, 3277, 4033, 4681, 8321, 15841, 29341, 42799, 49141, 52633, 65281, 74665, 80581, 85489, 88357, 90751 };
+    for (spsp2) |n| {
+        const pm = try PrimeModulus.fromPrimitive(u64, n);
+        var n_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &n_bytes, n, .big);
+        var prng = deterministicWitnessRandom(&n_bytes);
+        try testing.expect(!isProbablePrime(pm, prng.random()));
+    }
+    // …and a prime of the same size still passes under the same stream.
+    const p = try PrimeModulus.fromPrimitive(u64, 65_537);
+    var p_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &p_bytes, 65_537, .big);
+    var prng = deterministicWitnessRandom(&p_bytes);
+    try testing.expect(isProbablePrime(p, prng.random()));
+}
+
+test "isProbablePrime: the round count is the repo-wide 64 (a tripwire, not a proof of strength)" {
+    // What this CAN see: a round count lowered by a refactor. What it
+    // CANNOT: whether 64 random witnesses are enough — that is the
+    // (1/4)^rounds bound of the algorithm, not a property a test can
+    // observe. A weakening from 64 to 32 rounds leaves every value test in
+    // this file green, which is why the constant is pinned by name.
+    try testing.expectEqual(@as(usize, 64), mr_rounds);
 }
 
 test "isProbablePrime: known small primes pass, known composites fail" {

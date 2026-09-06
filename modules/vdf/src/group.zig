@@ -6,7 +6,20 @@
 //! factorization is, to the best of public knowledge, unknown to anyone —
 //! see `root.zig`'s module doc comment for why that property is what makes
 //! a VDF's delay real, and why a caller-supplied `N` does not automatically
-//! get the same guarantee). No modular-exponentiation primitive is
+//! get the same guarantee).
+//!
+//! **The VDF's group is the quotient Z_N*/{±1}, not Z_N* itself** — see
+//! `canonicalize`. `-1 = N-1` has order 2 in Z_N*, and the Fiat-Shamir
+//! prime `l` is odd, so `(-π)^l · x^r = -(π^l · x^r)`: in Z_N* a proof for
+//! `y` is also a proof for `N-y`, and a prover picks which of the two
+//! "outputs" to publish (measured 2026-09-06: 38 of 38 such forgeries
+//! accepted). Boneh-Bünz-Fisch §6 and every production RSA-group VDF work
+//! in the quotient for exactly this reason: an element is its class
+//! `{v, N-v}`, represented by the smaller of the two. `eval`/`prove` emit
+//! that representative, `verify` demands it of `y` and `π` and compares in
+//! the quotient — one output per `(N, x, T)` again.
+//!
+//! No modular-exponentiation primitive is
 //! reimplemented here — every operation below is a thin, allocation-free
 //! wrapper over `std.crypto.ff.Modulus`/`.Fe`, the exact same constant-time
 //! finite-field type the `rsa` module's `Modulus`/`Fe` alias (see that
@@ -213,6 +226,45 @@ pub fn elementFromBytes(m: Modulus, bytes: []const u8) ElementError!Fe {
     return fe;
 }
 
+// ── the quotient group Z_N*/{±1} ────────────────────────────────────────────
+
+/// `N - v`: the other member of `v`'s class `{v, N-v}` in Z_N*/{±1}.
+pub fn negate(m: Modulus, v: Fe) Fe {
+    return m.sub(m.zero, v);
+}
+
+/// `min(v, N-v)` — the representative this module uses for the class of
+/// `v` in Z_N*/{±1}. `N` is odd, so `v` and `N-v` never tie; and `0` (which
+/// `elementFromBytes` already refuses) is the only value equal to its own
+/// negation. `eval`'s `y` and `prove`'s `π` are always in this form; a
+/// consumer that hashes or compares a VDF output byte for byte therefore
+/// sees ONE value per `(N, x, T)`, which is the property a randomness
+/// beacon or a leader election needs and which Z_N* alone does not give.
+pub fn canonicalize(m: Modulus, v: Fe) Fe {
+    const neg = negate(m, v);
+    return if (v.compare(neg) == .lt) v else neg;
+}
+
+/// Whether `v` is already the representative `canonicalize` would return
+/// (`v < N - v`). `verify` requires this of `y` and `π` rather than folding
+/// them silently: a verifier that accepted both encodings would hand a
+/// caller hashing the raw bytes exactly the two-valued output the quotient
+/// exists to remove.
+pub fn isCanonical(m: Modulus, v: Fe) bool {
+    return v.compare(negate(m, v)) == .lt;
+}
+
+/// Whether `v` is the identity of Z_N*/{±1}, i.e. `v ∈ {1, N-1}`. As a VDF
+/// input `x` that is a degenerate element: `x^(2^T) = 1` for every `T`, so
+/// `eval` is constant in `T` and a "proof of `T` sequential squarings" on it
+/// costs nothing — `prove`/`verify` refuse it. (`gcd(v, N) ≠ 1`, the other
+/// way to fall outside the unit group, is not checked: deciding it in
+/// general means factoring `N` — see `elementFromBytes`.)
+pub fn isIdentityClass(m: Modulus, v: Fe) bool {
+    const one = m.one();
+    return v.eql(one) or negate(m, v).eql(one);
+}
+
 // ── the RSA-2048 Factoring Challenge modulus ────────────────────────────────
 
 /// `N` from the RSA Factoring Challenge (RSA Laboratories, 1991-2007),
@@ -304,6 +356,28 @@ test "elementFromBytes: accepts an ordinary small element" {
     five[modulus_bytes - 1] = 5;
     const fe = try elementFromBytes(m, &five);
     try testing.expect(!fe.isZero());
+}
+
+test "canonicalize/isCanonical/negate: the class {v, N-v} has one representative, the smaller" {
+    const m = try Modulus.fromPrimitive(u64, 1_000_003 * 999_983); // N = 999985999949
+    const small = try Fe.fromPrimitive(u64, m, 12345);
+    const large = negate(m, small); // N - 12345
+    try testing.expect(try large.toPrimitive(u64) == 999_985_999_949 - 12345);
+    try testing.expect(isCanonical(m, small));
+    try testing.expect(!isCanonical(m, large));
+    try testing.expect(canonicalize(m, small).eql(small));
+    try testing.expect(canonicalize(m, large).eql(small));
+    // Right at the middle: (N-1)/2 is canonical, (N+1)/2 is its negation.
+    const mid_lo = try Fe.fromPrimitive(u64, m, (999_985_999_949 - 1) / 2);
+    const mid_hi = try Fe.fromPrimitive(u64, m, (999_985_999_949 + 1) / 2);
+    try testing.expect(isCanonical(m, mid_lo));
+    try testing.expect(!isCanonical(m, mid_hi));
+    try testing.expect(negate(m, mid_lo).eql(mid_hi));
+    // The identity class: 1 and N-1, and nothing else nearby.
+    try testing.expect(isIdentityClass(m, m.one()));
+    try testing.expect(isIdentityClass(m, negate(m, m.one())));
+    try testing.expect(!isIdentityClass(m, try Fe.fromPrimitive(u64, m, 2)));
+    try testing.expect(!isIdentityClass(m, negate(m, try Fe.fromPrimitive(u64, m, 2))));
 }
 
 test "toBytes: round trip through elementFromBytes" {

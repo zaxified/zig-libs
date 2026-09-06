@@ -26,11 +26,17 @@
 //! ## How the pieces fit together
 //!
 //! ```text
-//! eval(N, x, T)              -> y                       (REAL)
+//! eval(N, x, T)              -> y  = canon(x^(2^T))      (REAL)
 //! hashToPrime(N, x, y, T)    -> l  (a challenge prime)   (REAL)
-//! prove(N, x, y, T)          -> pi = x^floor(2^T / l)    (REAL, Fable core)
-//! verify(N, x, y, pi, T)     -> pi^l * x^r == y, r=2^T mod l  (REAL, Fable core)
+//! prove(N, x, y, T)          -> pi = canon(x^floor(2^T / l))   (REAL, Fable core)
+//! verify(N, x, y, pi, T)     -> canon(pi^l * x^r) == y, r=2^T mod l  (REAL, Fable core)
 //! ```
+//!
+//! `canon(v) = min(v, N-v)`: the group is the quotient **Z_N*/{±1}**, not
+//! Z_N* — `y` and `π` on the wire are always the smaller member of their
+//! class, `verify` refuses the other one, and `x ∈ {1, N-1}` (the
+//! quotient's identity) is refused as an input. See `group.canonicalize`
+//! for why a VDF over Z_N* itself has TWO valid outputs per `(N, x, T)`.
 //!
 //! `hashToPrime` is shared, unmodified, by both `prove` and `verify` — it
 //! is what makes this a NON-INTERACTIVE proof (Fiat-Shamir: the "random"

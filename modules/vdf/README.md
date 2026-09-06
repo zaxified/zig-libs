@@ -18,8 +18,9 @@ soundness check). See [SPEC.md](SPEC.md).
 ```zig
 const vdf = @import("vdf");
 
-// The group: Z_N* for the RSA-2048 Factoring Challenge modulus (factorization
-// unknown to everyone — see SPEC.md before using a different N).
+// The group: Z_N*/{±1} for the RSA-2048 Factoring Challenge modulus
+// (factorization unknown to everyone — see SPEC.md before using a different
+// N). Outputs and proofs are the smaller member of their class {v, N-v}.
 const m = vdf.group.rsa2048ChallengeModulus();
 
 // x as a canonical big-endian element.
@@ -42,8 +43,16 @@ const ok = try vdf.verify(m, &x_bytes, &y_bytes, proof, t);
 - `group.rsa2048ChallengeModulus()` — the RSA-2048 Factoring Challenge
   modulus (2048 bits), this module's zero-trusted-setup reference group.
 - `group.elementFromBytes(m, bytes)` — decode + validate an untrusted
-  big-endian group element (rejects `0`, `N`, and anything `>= N`).
-- `eval(m, x, t) Fe` — `y = x^(2^t) mod N`, `t` sequential squarings. REAL.
+  big-endian group element (rejects `0`, `N`, and anything `>= N`). An
+  input `x` must additionally not be `1` or `N-1` (the identity of
+  Z_N*/{±1}; `prove`/`verify` refuse it) — derive `x` by hashing to the
+  group, never take it raw from a peer.
+- `group.canonicalize(m, v)` / `isCanonical` / `negate` /
+  `isIdentityClass` — the quotient group Z_N*/{±1}: `canonicalize` is
+  `min(v, N-v)`, the form every `y` and `π` from this module is in and
+  the only form `verify` accepts for them.
+- `eval(m, x, t) Fe` — `y = canonicalize(x^(2^t) mod N)`, `t` sequential
+  squarings. REAL.
 - `hashToPrime(n_bytes, x_bytes, y_bytes, t) [32]u8` — the deterministic
   Fiat-Shamir challenge prime `l` both `prove` and `verify` derive from the
   same public binding. REAL (SHAKE256 candidate derivation + a
@@ -57,9 +66,12 @@ const ok = try vdf.verify(m, &x_bytes, &y_bytes, proof, t);
   one dividend bit per squaring). See `vdf.zig`'s doc comment for the exact
   algorithm.
 - `verify(m, x_bytes, y_bytes, proof, t) !bool` — **FABLE CORE.** Accepts
-  iff `π^l · x^r == y (mod N)` with `r = 2^t mod l`; the `hashToPrime`
-  binding includes `y` (soundness crux). Malformed/out-of-range inputs
-  return `false`, never UB. See `vdf.zig`'s doc comment for the relation.
+  iff `canonicalize(π^l · x^r) == y` with `r = 2^t mod l`, `y` and `π`
+  given in canonical form (a `y` of `N - y` is rejected, not folded — one
+  output per `(N, x, t)` is the point) and `x ∉ {1, N-1}`; the
+  `hashToPrime` binding includes `y` (soundness crux). Malformed/
+  out-of-range inputs return `false`, never UB. See `vdf.zig`'s doc
+  comment for the relation and [SPEC.md](SPEC.md) for why the quotient.
 
 ## Trusted-setup caveat — read before choosing a different `N`
 
