@@ -1,19 +1,44 @@
 #!/usr/bin/env bash
 # Close the environment gaps `scripts/test.sh` reports, on a hosted runner.
 #
-# Everything installed here exists to let a LIVE test reach a real peer: a
-# wolfSSL DTLS responder, an open62541 container, and the Python packages that
-# are INDEPENDENT implementations of what the module under test implements.
-# Those are the highest-value tests in this collection, because they are the
-# only ones that can fail for a reason our own encoder does not share — and
-# they are also the ones that vanish quietly, since a missing peer is a skip
-# and a skip is a pass.
+# Usage: scripts/ci-environment.sh [tests|interop|all]     (default: tests)
 #
-# ⚠ WITH ONE EXCEPTION, AND IT IS THE LOUD KIND: `websockets` backs an EXAMPLE,
-# not a test, and an example that cannot reach its judge FAILS. See the comment
-# on the pip line below.
+# ⭐ TWO ROLES SINCE 2026-09-06, AND THE SPLIT IS THE POINT OF THIS HEADER.
+# Until that day one list served every lane, and it was written when every one
+# of these peers was reached from inside a module's own test binary. Then six
+# modules were separated from their interop programs (`f3dbf38d`, `f42cc67a`):
+# `test-dtls` stopped compiling a wolfSSL peer with `cc`, and `test-grpc`,
+# `test-protobuf`, `test-brotli`, `test-jinja` and `test-poseidon` stopped
+# spawning `python3` — each now replays a committed transcript and passes on a
+# host with no compiler, no Python and no packages at all. The peers those six
+# need did not become useless; they moved to `zig build interop-<m>`, which is
+# what RE-TAKES the transcripts. So:
 #
-# ⭐ ONE SCRIPT, BOTH JOBS, and that is the point of it existing at all. Until
+#   tests    — what a lane that RUNS tests or examples needs. Every item here
+#              is reached by a test binary or an example: the two sysctls, the
+#              yaml conformance corpus, opcua's container and its asyncua venv,
+#              imap's pymap venv, and the `websockets` package the websocket
+#              EXAMPLE judges itself against.
+#   interop  — what `zig build interop-<m>` needs, and NOTHING here is reached
+#              by any test: a C compiler and wolfSSL headers (dtls), and
+#              jinja2 / sympy / brotli / protobuf / a grpcio venv (the five
+#              Python-driven ones).
+#   all      — both, for a machine that will do both.
+#
+# ⛔ THE `interop` HALF IS NOT DELETABLE, and that is the whole reason it is a
+# role rather than a removal. A transcript nobody can RE-TAKE is a frozen
+# anchor: it can never be extended, corrected, or re-derived, only trusted.
+# This repository has already lost one that way — `modules/dnssec`'s
+# independent-oracle vectors credited two scratchpad paths that are not in the
+# repo, and `scripts/gen-dnssec-oracle.sh` had to be written from scratch to
+# make the anchor re-takeable again. Six transcripts landed on 2026-09-06;
+# keeping the recipe installable is what stops all six going the same way.
+#
+# ⚠ WITH ONE EXCEPTION IN THE `tests` ROLE, AND IT IS THE LOUD KIND:
+# `websockets` backs an EXAMPLE, not a test, and an example that cannot reach
+# its judge FAILS. See the comment on the pip line below.
+#
+# ⭐ ONE SCRIPT, EVERY JOB, and that is the point of it existing at all. Until
 # 2026-08-15 this lived inline in the `full` job only, so the `scoped` job —
 # the one that gates every push — ran with all six gaps open. That mattered
 # more from the moment `test.sh changed` learned to escalate to the full gate
@@ -32,8 +57,21 @@
 # ⚠ That reasoning holds only for a package whose absence is a SKIP. When
 # `websockets` fails to install, the lane goes red at `run-examples` — the `||
 # true` buys nothing there, and the capability report naming it is the only
-# thing that turns a traceback 400 steps into a build into an answer.
+# thing that turns a traceback 400 steps into a build into an answer. It holds
+# differently for the `interop` role: there, a failed install means the lane
+# cannot re-take a transcript, and `zig build interop-<m>` says so by failing.
 set -u
+
+ROLE="${1:-tests}"
+case "$ROLE" in
+    tests | interop | all) ;;
+    *)
+        echo "ci-environment.sh: unknown role '$ROLE' (want tests, interop or all)" >&2
+        exit 1
+        ;;
+esac
+want() { [[ "$ROLE" == all || "$ROLE" == "$1" ]]; }
+echo "ci-environment: role=$ROLE"
 
 # Quiet, but not silent: `apt-get -qq` still lets dpkg print a twenty-four line
 # "(Reading database ... 5% ... 100%)" progress bar into a log that gets read by
@@ -41,6 +79,7 @@ set -u
 export DEBIAN_FRONTEND=noninteractive
 APT_QUIET=(-y -qq -o Dpkg::Use-Pty=0)
 
+if want tests; then
 echo "::group::userns"
 # Ubuntu restricts unprivileged user namespaces via AppArmor (24.04 and 26.04
 # alike), which is what makes `unshare -rn` fail on a stock runner. Without it
@@ -74,18 +113,6 @@ git clone -q -b data --depth 1 https://github.com/yaml/yaml-test-suite \
     && echo "yaml-test-suite: OK" || echo "yaml-test-suite: clone failed or already present"
 echo "::endgroup::"
 
-echo "::group::apt"
-sudo apt-get update "${APT_QUIET[@]}" >/dev/null 2>&1 || true
-# dtls's live DTLS 1.3 peer, for `zig build interop-dtls` ONLY. wolfSSL
-# specifically, because OpenSSL 3.5 and GnuTLS 3.8 have no DTLS 1.3 at all.
-# ⚠ `test-dtls` has NOT needed this since 2026-09-06 -- it replays a captured
-# transcript and passes 268/268 on a box with no compiler and no wolfSSL. This
-# install exists so a lane can RE-TAKE that transcript; a lane that only runs
-# tests does not need it.
-sudo apt-get install "${APT_QUIET[@]}" libwolfssl-dev >/dev/null 2>&1 \
-    && echo "wolfssl: OK" || echo "wolfssl: install failed"
-echo "::endgroup::"
-
 echo "::group::open62541 container"
 # opcua's container-backed live server interop.
 #
@@ -101,55 +128,34 @@ podman pull -q docker.io/open62541/open62541:latest >/dev/null 2>&1 \
     && echo "open62541: OK" || echo "open62541: pull failed"
 echo "::endgroup::"
 
-echo "::group::python oracles"
-# PEP 668 marks the system interpreter externally-managed and these tests spawn
-# a bare `python3`, so the ones without a venv of their own have to land there.
+echo "::group::example judge + live-test venvs"
+# ⭐ `websockets` IS NOT LIKE ANYTHING ELSE HERE, AND THAT IS WHY IT IS PINNED.
+# Every other package in this script backs a TEST or an interop program, which
+# skip or fail loudly when an import fails; this one backs an EXAMPLE, and
+# `modules/websocket/example/main.zig` returns `error.PythonPeerFailed` rather
+# than skipping — the whole point of that file is that an external judge
+# actually runs. So a missing `websockets` is not reduced coverage, it is a red
+# lane, which is exactly what the first push after `run-examples` learned to RUN
+# the examples produced: 459/461 steps green and the gate red on
+# `ModuleNotFoundError: No module named 'websockets'`, on a runner where nothing
+# had ever installed it. The version is the one that example's own header claims
+# to have been judged by; keep the two in step.
 #
-# jinja's oracle is a REAL Python Jinja2 and its VERSION is part of the claim,
-# not an implementation detail. The committed golden records `"jinja2": "3.1.6"`;
-# a runner shipping a different one turned two of 337 corpus cases red for
-# `replace` and `trim` with Markup arguments on 2026-08-15, and our output
-# matched the golden byte for byte in both — the ORACLE had moved, which is
-# exactly what a golden-vs-live test exists to catch. A gate must go red for our
-# reasons, so this is pinned and bumped deliberately.
-#
-# The next three were found missing by the arm64 lane of tag 2026-08-15, which
-# skipped 22 reference-interop tests while the capability report said "1 gap".
-# The report had no probe for them; it has one now, and they are installed here
-# so the probe has nothing to report.
-#
-# ⭐ `websockets` IS NOT LIKE THE OTHERS, AND THAT IS WHY IT IS PINNED. Every
-# package above backs a TEST, which skips when its import fails; this one backs
-# an EXAMPLE, and `modules/websocket/example/main.zig` returns
-# `error.PythonPeerFailed` rather than skipping — the whole point of that file
-# is that an external judge actually runs. So a missing `websockets` is not
-# reduced coverage, it is a red lane, which is exactly what the first push after
-# `run-examples` learned to RUN the examples produced: 459/461 steps green and
-# the gate red on `ModuleNotFoundError: No module named 'websockets'`, on a
-# runner where nothing had ever installed it. The version is the one that
-# example's own header claims to have been judged by; keep the two in step.
+# PEP 668 marks the system interpreter externally-managed, hence
+# --break-system-packages.
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
-    "jinja2==3.1.6" sympy brotli protobuf "websockets==15.0.1" >/dev/null 2>&1 || true
-python3 - <<'PY' || true
-for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
-                   ("brotli", "brotli"), ("google.protobuf", "protobuf"),
-                   ("websockets", "websockets")):
-    try:
-        m = __import__(mod)
-        print(f"{label}: {getattr(m, '__version__', 'present')}")
-    except ImportError:
-        print(f"{label}: MISSING")
-PY
+    "websockets==15.0.1" >/dev/null 2>&1 || true
+python3 -c 'import websockets; print("websockets:", websockets.__version__)' 2>/dev/null \
+    || echo "websockets: MISSING"
 
-# Four venvs, because each of these modules looks for one at a fixed path
-# before falling back to a bare `python3` (or, for opcua, is pointed at one by
+# Two venvs, because each of these modules looks for one at a fixed path before
+# falling back to a bare `python3` (or, for opcua, is pointed at one by
 # OPCUA_PYTHON). Keep the paths in step with the probes in test.sh.
-# ⚠ `grpc` takes protobuf TOO, and a venv does not see system site-packages.
-# The first run of this script installed protobuf system-wide and grpcio into
-# the venv, so the venv's interpreter — the one grpc's tests actually spawn —
-# had grpcio and no `google.protobuf`, and the oracle script died on an import.
-# List everything a venv's own scripts import; nothing outside it will help.
-for spec in "grpc:grpcio protobuf" "opcua:asyncua cryptography" "imap:pymap"; do
+#
+# ⚠ BOTH ARE REACHED BY A TEST, which is why they are in this role and grpc's
+# venv is not: `opcua`'s asyncua client and `imap`'s pymap server are still
+# spawned from inside those modules' own test binaries.
+for spec in "opcua:asyncua cryptography" "imap:pymap"; do
     name="${spec%%:*}"
     pkgs="${spec#*:}"
     python3 -m venv "$HOME/.cache/zig-libs-$name" >/dev/null 2>&1 || true
@@ -158,3 +164,57 @@ for spec in "grpc:grpcio protobuf" "opcua:asyncua cryptography" "imap:pymap"; do
         && echo "$name venv: OK" || echo "$name venv: install failed"
 done
 echo "::endgroup::"
+fi
+
+if want interop; then
+echo "::group::interop: C toolchain + wolfSSL"
+sudo apt-get update "${APT_QUIET[@]}" >/dev/null 2>&1 || true
+# dtls's live DTLS 1.3 peer, for `zig build interop-dtls` ONLY. wolfSSL
+# specifically, because OpenSSL 3.5 and GnuTLS 3.8 have no DTLS 1.3 at all.
+# ⚠ `test-dtls` has NOT needed this since 2026-09-06 -- it replays
+# `src/testdata/wolfssl_transcript.txt` and passes 268/268 on a box with no
+# compiler and no wolfSSL. This install exists so a lane can RE-TAKE that
+# transcript. `build-essential` for the same reason: `tools/interop.zig`
+# compiles the peer with `cc -lwolfssl`, and a hosted runner has cc already —
+# it is named here so a slimmer image does not silently lose the anchor.
+sudo apt-get install "${APT_QUIET[@]}" build-essential libwolfssl-dev >/dev/null 2>&1 \
+    && echo "cc + wolfssl: OK" || echo "cc + wolfssl: install failed"
+command -v cc >/dev/null 2>&1 && echo "cc: $(cc --version | head -1)" || echo "cc: MISSING"
+[[ -e /usr/include/wolfssl/ssl.h ]] && echo "wolfssl headers: OK" || echo "wolfssl headers: MISSING"
+echo "::endgroup::"
+
+echo "::group::interop: python oracles"
+# The four transcripts taken by a bare `python3`. PEP 668 marks the system
+# interpreter externally-managed and these programs spawn `python3` with no
+# venv of their own, so they have to land there.
+#
+# jinja's oracle is a REAL Python Jinja2 and its VERSION is part of the claim,
+# not an implementation detail. The committed golden records `"jinja2": "3.1.6"`;
+# a runner shipping a different one turned two of 337 corpus cases red for
+# `replace` and `trim` with Markup arguments on 2026-08-15, and our output
+# matched the golden byte for byte in both — the ORACLE had moved, which is
+# exactly what a golden-vs-live test exists to catch. A gate must go red for our
+# reasons, so this is pinned and bumped deliberately. `test.sh`'s capability
+# report compares the installed version against the golden's own header.
+sudo pip3 install --break-system-packages -q --root-user-action=ignore \
+    "jinja2==3.1.6" sympy brotli protobuf >/dev/null 2>&1 || true
+python3 - <<'PY' || true
+for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
+                   ("brotli", "brotli"), ("google.protobuf", "protobuf")):
+    try:
+        m = __import__(mod)
+        print(f"{label}: {getattr(m, '__version__', 'present')}")
+    except ImportError:
+        print(f"{label}: MISSING")
+PY
+
+# ⚠ `grpc` takes protobuf TOO, and a venv does not see system site-packages.
+# The first run of this script installed protobuf system-wide and grpcio into
+# the venv, so the venv's interpreter — the one interop-grpc actually spawns —
+# had grpcio and no `google.protobuf`, and the oracle script died on an import.
+# List everything a venv's own scripts import; nothing outside it will help.
+python3 -m venv "$HOME/.cache/zig-libs-grpc" >/dev/null 2>&1 || true
+"$HOME/.cache/zig-libs-grpc/bin/pip" -q install grpcio protobuf >/dev/null 2>&1 \
+    && echo "grpc venv: OK" || echo "grpc venv: install failed"
+echo "::endgroup::"
+fi

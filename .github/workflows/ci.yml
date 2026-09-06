@@ -61,6 +61,7 @@ on:
           - examples ReleaseSafe amd64
           - examples ReleaseFast amd64
           - examples ReleaseSafe arm64
+          - interop ReleaseSafe amd64
 
 # Least privilege. The gate reads the repository and nothing else — it opens no
 # issue, pushes no tag, publishes no package — so saying so here means a
@@ -291,7 +292,13 @@ jobs:
       # report green over every live test in the collection.
       - name: Close the environment gaps the gate reports
         continue-on-error: true
-        run: bash scripts/ci-environment.sh
+        # `tests`, not `all`: this job runs `test.sh changed`, which runs tests
+        # and examples and never `interop-*`. Since 2026-09-06 the wolfSSL and
+        # five-Python-oracle half of that script serves ONLY `zig build
+        # interop-<m>` -- the six migrated modules replay committed transcripts
+        # and pass on a host with no compiler and no Python -- so installing it
+        # here bought the lane that gates every push nothing at all.
+        run: bash scripts/ci-environment.sh tests
       # The base differs by event, and a base that does not resolve is NOT
       # allowed to read as "nothing changed" — `changed_files` fails and the
       # driver escalates to the full run rather than passing having tested
@@ -359,10 +366,10 @@ jobs:
     steps:
       # ⭐ LANE 0. The sub-second checks run HERE, before the matrix exists,
       # because every other job in this workflow waits on this one's output —
-      # so a stray `zig fmt` costs a minute instead of eight runners spending
+      # so a stray `zig fmt` costs a minute instead of nine runners spending
       # an hour each on work nobody will read. Twelve steps, 4.9 s measured on
       # 2026-08-24; the expensive checks are their own lane, off the critical
-      # path. That is the whole trade: 4.9 s serial to save eight runner-hours
+      # path. That is the whole trade: 4.9 s serial to save nine runner-hours
       # on the days it fires.
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
@@ -378,7 +385,9 @@ jobs:
           WANT: ${{ inputs.lane || 'all' }}
         run: |
           set -euo pipefail
-          # ⭐ EIGHT LANES, AND THE SPLIT IS NOT A PREFERENCE. Until 2026-08-24
+          # ⭐ NINE LANES, AND THE SPLIT IS NOT A PREFERENCE. Eight of them
+          # came from one split; the ninth (`interop`) is not part of it and is
+          # argued for at its own entry. Until 2026-08-24
           # four lanes each ran the WHOLE gate, and the ReleaseFast one cleared
           # its 90-minute cap by 23 SECONDS (5245.8 s of gate under a 5400 s
           # ceiling). The cap is not going up, so the work came apart — and it
@@ -403,9 +412,9 @@ jobs:
           # Everything mode- and arch-independent, once for the whole matrix:
           # the tables, the catalog, `check-portable` (which cross-compiles from
           # wherever it runs), the ctgrind harnesses, the sizeprobe.
-          lanes+=('{"name":"checks","args":"","cmd":"checks","cachekey":"checks","cache":false,"runner":"ubuntu-26.04","peers":false,"tc":false,"timeout":15,"skip_live":""}')
-          lanes+=('{"name":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"modules","cachekey":"mod-relsafe","cache":true,"runner":"ubuntu-26.04","peers":true,"tc":true,"timeout":90,"skip_live":""}')
-          lanes+=('{"name":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"modules","cachekey":"mod-relfast","cache":true,"runner":"ubuntu-26.04","peers":true,"tc":true,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"checks","args":"","cmd":"checks","cachekey":"checks","cache":false,"runner":"ubuntu-26.04","peers":"","tc":false,"timeout":15,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"modules","cachekey":"mod-relsafe","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"modules","cachekey":"mod-relfast","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
           # ONE arm64 pair, not three. What a second architecture buys is
           # portability coverage -- alignment and endianness assumptions,
           # atomics, and the asm-vs-fallback dispatch -- and none of that varies
@@ -427,7 +436,7 @@ jobs:
           # its own tests on that host anyway. "Our client interoperates with
           # open62541" is not an architecture-dependent claim, and amd64 makes
           # it in a minute. The skip prints a line every time it happens.
-          lanes+=('{"name":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"modules","cachekey":"mod-relsafe","cache":true,"runner":"ubuntu-26.04-arm","peers":true,"tc":true,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"modules","cachekey":"mod-relsafe","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":true,"timeout":90,"skip_live":"opcua"}')
           # ⚠ `build`, NOT `modules` — this lane COMPILES every module and every
           # example in real Debug and RUNS NOTHING, and that is the whole claim
           # it can support. Nobody consumes this collection in Debug: it ships
@@ -443,7 +452,7 @@ jobs:
           # documented cross-mode catch went the other way. Tests that run only
           # in Debug: zero. Tests that SKIP in Debug: fifteen. See `cmd_build`
           # in scripts/test.sh.
-          lanes+=('{"name":"compile-only strict Debug amd64","args":"-Dstrict-debug","cmd":"build","cachekey":"strictdebug","cache":false,"runner":"ubuntu-26.04","peers":false,"tc":false,"timeout":30,"skip_live":""}')
+          lanes+=('{"name":"compile-only strict Debug amd64","args":"-Dstrict-debug","cmd":"build","cachekey":"strictdebug","cache":false,"runner":"ubuntu-26.04","peers":"","tc":false,"timeout":30,"skip_live":""}')
           # BOTH release modes run the examples, and that is deliberate: the two
           # catch different classes and both are documented here. ReleaseFast is
           # where `qrscan`'s uninitialised perspective terms showed (Debug and
@@ -478,14 +487,58 @@ jobs:
           # fallback onto a six-day-old entry left `build (all modules)` at
           # 2598 s -- slower than the cold lane beside it.
           #
-          # ⚠ THE QUOTA IS 10 GB PER REPO, LRU. Eight lanes at 1-3 GB do not all
+          # ⚠ THE QUOTA IS 10 GB PER REPO, LRU. Six caching lanes at 1-3 GB do not all
           # fit, so entries evict each other and a lane going cold is normal
           # rather than a defect. That is survivable only because the lanes are
           # split: a cold `modules` lane is ~50 minutes against a 90-minute cap,
           # where the unsplit lane cleared it by 23 seconds.
-          lanes+=('{"name":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe","cache":true,"runner":"ubuntu-26.04","peers":true,"tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"examples","cachekey":"ex-relfast","cache":true,"runner":"ubuntu-26.04","peers":true,"tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe","cache":true,"runner":"ubuntu-26.04-arm","peers":true,"tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"examples","cachekey":"ex-relfast","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          # ⭐ THE ONE LANE THAT RE-TAKES THE ANCHORS, added 2026-09-06 —
+          # and until it existed, NOTHING anywhere ran `zig build interop-<m>`.
+          # The migration that day moved six interop programs out of the modules
+          # and turned their evidence into committed transcripts the modules
+          # replay hermetically. That is the right shape and it costs one thing:
+          # replay proves we still agree with what the peer said LAST time. It
+          # cannot find that something NEW we send provokes a different
+          # reaction, or that the peer moved. Only running the peer does — and
+          # for the days in between, the peers were being INSTALLED on lanes
+          # that no longer touched them while the six programs that needed them
+          # ran nowhere.
+          #
+          # ⚠ A transcript nobody can re-take is a frozen anchor. `dnssec` lost
+          # one exactly that way — its oracle vectors credited two scratchpad
+          # paths that are not in this repository — and `gen-dnssec-oracle.sh`
+          # had to be written from nothing to get it back. Six transcripts
+          # landed on 2026-09-06; this lane is what keeps them re-takeable.
+          #
+          # PRE-RELEASE, WHICH IS WHAT THIS MATRIX ALREADY IS. `plan` runs on
+          # tags and dispatch only, so a lane here is exactly the "pre-release
+          # check rather than a per-commit one" the migration asked for. Putting
+          # it on every push would restore the cost the migration removed: a
+          # container, a C compiler and four pip installs on the critical path.
+          #
+          # ⚠ IT VERIFIES, IT DOES NOT REWRITE. Each program compares against
+          # the committed transcript and reports mismatches; re-blessing is a
+          # flag a human passes. So this lane leaves a clean tree and goes RED
+          # on divergence, which is the only shape a gate can have.
+          #
+          # Measured 2026-09-06 on a loaded development box, warm: check-interop
+          # 0.2 s, then brotli 3.2 s, dtls 2.0 s, grpc 3.2 s, jinja 0.8 s,
+          # poseidon 14.4 s, protobuf 7.5 s — 35 s for all six. Cold is a
+          # compile of those six modules plus their programs, nowhere near a
+          # `modules` lane, hence 30 minutes rather than 90.
+          #
+          # ⚠ NO CACHE ENTRY OF ITS OWN, deliberately. The repo-wide quota is
+          # 10 GB LRU and six caching lanes at 1-3 GB already evict each other; a
+          # ninth key to save a compile this small would make the lanes that
+          # need it colder.
+          #
+          # ⚠ amd64 ONLY. Interop asks whether our bytes and a third party's
+          # agree, which is not an architecture-dependent claim — the same
+          # reasoning `skip_live` uses for opcua's emulated container.
+          lanes+=('{"name":"interop ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"interop","cachekey":"interop","cache":false,"runner":"ubuntu-26.04","peers":"interop","tc":false,"timeout":30,"skip_live":""}')
 
           sel=$(printf '%s\n' "${lanes[@]}" | jq -s -c --arg want "$WANT" \
             '[ .[] | select($want == "all" or .name == $want) ]')
@@ -643,27 +696,33 @@ jobs:
       # log is the measurement, it is per-lane and dated, and it costs nothing
       # to look at. Read it there.
       - name: Close the environment gaps the gate reports
-        # ⚠ NOT on the compile-only lane. Every one of these installs exists to
-        # let a LIVE test reach a real peer — a wolfSSL DTLS responder, an
-        # open62541 container, two Python servers — and that lane runs no test
-        # at all. Measured on 2026-08-15: 26 s of a 271 s lane spent installing
-        # things nothing would touch.
+        # ⚠ NOT on the compile-only lane, nor on `checks`. Every one of these
+        # installs exists to let something REACH a real peer, and those two
+        # lanes run nothing. Measured on 2026-08-15: 26 s of a 271 s lane spent
+        # installing things nothing would touch.
         # ⚠ KEYED ON WHETHER THE LANE RUNS ANYTHING, not on which lane it is.
         # The compile-only lane died on error.PythonPeerFailed on 2026-08-24
         # under the old spelling of this condition, because it was running
         # examples it had declared it would not run. `peers` says what the lane
         # needs; the lane table says whether it runs anything at all.
+        # ⭐ AND KEYED ON WHICH PEERS, not only on whether. Since 2026-09-06 the
+        # script takes a ROLE: `tests` is what a lane that runs tests or
+        # examples needs (the two sysctls, the yaml corpus, opcua's container
+        # and its asyncua venv, imap's pymap, the websocket example's judge);
+        # `interop` is the C-compiler/wolfSSL and four-Python-oracle set that
+        # ONLY `zig build interop-<m>` reaches. A lane declares what it will
+        # actually use, and an empty string still reads as false here.
         if: matrix.peers
         # ⚠ SHARED WITH THE `scoped` JOB, deliberately. This was inline here
         # until 2026-08-15, which is precisely why the lane that gates every
         # push had none of it. Two copies of an install list drift; one script
         # that both jobs run cannot.
         continue-on-error: true
-        run: bash scripts/ci-environment.sh
+        run: bash scripts/ci-environment.sh ${{ matrix.peers }}
       - name: Test (${{ matrix.name }})
         env:
-          # Names this lane's block on the run's summary page, where the four
-          # digests land side by side instead of in four downloadable logs.
+          # Names this lane's block on the run's summary page, where the lane
+          # digests land side by side instead of in separate downloadable logs.
           ZIGLIBS_LANE: ${{ matrix.name }}
           # Empty for every lane but one; the lane table says which peer and
           # why. `run_modules` prints a line whenever it honours this.

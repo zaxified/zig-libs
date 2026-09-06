@@ -280,3 +280,28 @@ matching. See SPEC.md.
   byte-identically; self-derived ones are labelled as such. Key derivation has
   a KAT whose expected bytes come from an independent implementation of
   P-SHA256.
+
+## Foreign toolchain
+
+**Foreign toolchain:** MIGRATION-OWED via `src/server_interop.zig` — that file
+carries a ~190-line Python `asyncua` driver as an inline `\\` literal and runs
+it with `python3 -c`, so `test-opcua` reaches for an interpreter the module has
+no business needing.
+
+This is the seventh instance of the shape six modules were separated from on
+2026-09-06 (`f3dbf38d`, `f42cc67a`), and it was missed for a mechanical reason:
+the other six kept their driver in a file that could be *moved*, while this one
+is a string constant inside a Zig source file, so no `git mv` made it visible.
+The rule is the same for it — an anchor against a foreign implementation is an
+EXTERNAL test and belongs in `tools/interop.zig`, with the exchange captured
+into a transcript the module's own tests replay hermetically.
+
+Nothing here approves that. `zig build check-module-purity` reads this line only
+so a known, named debt does not have to be paid for by switching the gate off,
+and the line **expires by itself**: the gate fails on a declaration whose file
+has stopped spawning, so the migration that fixes this deletes this section.
+
+Scope, so the debt is not read as larger than it is. The `podman`/open62541 half
+of that file spawns a container running a third-party *server* and is not what
+this line covers — a live peer is a different question from a foreign toolchain,
+and `live` in `build.zig`'s `module_list` is where it is answered.

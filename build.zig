@@ -106,7 +106,7 @@ const module_list = [_]Module{
     .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"} },
-    .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
+    .{ .name = "brotli", .libs = &.{"web"} },
     .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http" } },
     .{ .name = "ramcache", .libs = &.{ "storage", "net" } },
     .{ .name = "router", .libs = &.{"web"}, .deps = &.{"http"} },
@@ -240,8 +240,8 @@ const module_list = [_]Module{
     .{ .name = "yaml", .libs = &.{"format"} },
     .{ .name = "jinja", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "cbor", .libs = &.{"format"} },
-    .{ .name = "protobuf", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"} },
-    .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"} },
+    .{ .name = "protobuf", .libs = &.{ "format", "web" } },
+    .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf" } },
     .{ .name = "webauthn", .libs = &.{"crypto"}, .deps = &.{ "cbor", "rsa", "p256", "x509" } },
     .{ .name = "zipstream", .libs = &.{"format"} },
     .{ .name = "qr", .libs = &.{"format"} },
@@ -1179,6 +1179,25 @@ pub fn build(b: *std.Build) void {
         .makeFn = checkCopyleft,
     });
     check_copyleft.dependOn(check_copyleft_inner);
+
+    // Module-purity gate: `zig build check-module-purity`. The teeth on the
+    // owner's rule of 2026-09-06 -- a module is standalone Zig with no external
+    // dependency, and an anchor against a foreign implementation belongs in
+    // `modules/<m>/tools/`. Six modules were migrated that day; nothing stopped
+    // the seventh from being written the old way tomorrow. Deliberately NOT a
+    // section of `check-catalog` (change signal: source, not docs) and
+    // deliberately not derived from `moduleHasInterop` -- having a `tools/`
+    // program is no evidence that `src/` stopped spawning. See
+    // `checkModulePurity`.
+    const check_module_purity = b.step("check-module-purity", "Verify no module's own code runs a foreign toolchain");
+    const check_module_purity_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    check_module_purity_inner.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "check-module-purity",
+        .owner = b,
+        .makeFn = checkModulePurity,
+    });
+    check_module_purity.dependOn(check_module_purity_inner);
 
     // Fuzz-coverage gate: `zig build check-fuzz`. Deliberately a SEPARATE step
     // from `check-catalog` rather than a section of it -- see `checkFuzz` for
@@ -3431,6 +3450,493 @@ fn checkCopyleft(step: *std.Build.Step, options: std.Build.Step.MakeOptions) any
     }
 
     if (failed) return step.fail("copyleft is a defect, not a paperwork item — see errors above", .{});
+}
+
+// ---------------------------------------------------------------------------
+// `zig build check-module-purity` — a module is standalone Zig.
+// ---------------------------------------------------------------------------
+
+/// Programs whose presence in a module's argv means the module is driving a
+/// FOREIGN TOOLCHAIN: a compiler, an interpreter, or a build driver.
+///
+/// Matched against the BASENAME of a string literal, exactly, so `/usr/bin/cc`
+/// and `cc` are the same entry and `gcc-14` is not one (a version-suffixed
+/// spelling is worth adding the day it appears; guessing at suffixes now would
+/// widen the set without evidence).
+///
+/// `zig` is deliberately absent: it is this repository's OWN toolchain, and the
+/// rule this gate enforces is about FOREIGN dependencies. A module shelling out
+/// to `zig` would be strange, but it is not the thing the owner outlawed and
+/// pretending otherwise would make the set an opinion rather than a rule.
+///
+/// `podman`, `docker`, `nft`, `curl`, `sshd`, `wg` are absent for a different
+/// reason and it is not an oversight: they are PEERS, not toolchains. `nftables`
+/// spawns `nft` because talking to `nft` is what the module is for; `opcua`
+/// spawns `podman` to stand up a third-party server; `http` spawns `curl`.
+/// Whether a module's tests should reach a live peer at all is a real question
+/// and a different one — `live` in `module_list` is where it is answered — and
+/// folding it in here would make this gate red on ten modules for a reason its
+/// name does not describe.
+const foreign_toolchains = [_][]const u8{
+    "cc",     "gcc",   "g++",    "c++",    "clang",   "clang++", "cl",
+    "rustc",  "cargo", "go",     "gofmt",  "javac",   "java",    "dotnet",
+    "swiftc", "tsc",   "scalac", "python", "python2", "python3", "ruby",
+    "perl",   "php",   "lua",    "node",   "nodejs",  "bun",     "deno",
+    "npm",    "npx",   "yarn",   "pnpm",   "make",    "gmake",   "cmake",
+    "ninja",  "meson", "scons",  "gradle", "mvn",     "ant",     "bazel",
+    "buck",   "sbt",
+};
+
+/// Extensions that make a file FOREIGN SOURCE — something another toolchain
+/// compiles or interprets. Not `.zig` (ours), not `.o`/`.so` (already built,
+/// and `ebpf`'s `.bpf.o` fixtures are exactly that), not any data extension.
+const foreign_source_exts = [_][]const u8{
+    ".c",  ".h",  ".cc",   ".cpp", ".cxx", ".hpp",  ".hh",   ".m",   ".mm",
+    ".py", ".rb", ".pl",   ".php", ".lua", ".js",   ".mjs",  ".cjs", ".ts",
+    ".go", ".rs", ".java", ".cs",  ".sh",  ".bash", ".sage",
+};
+
+/// The spelling of "this file starts a child process". Text, not a parse: a
+/// mention inside a doc comment counts. That is the SAFE direction and it is
+/// deliberate — a spawn alone is never a failure here, it is only ever half of
+/// one, so over-detecting this half costs nothing and under-detecting it would
+/// be a hole. (`argsafe` and `procrun` document `std.process.Child` in prose
+/// and are matched by this; neither carries the other half, so both pass.)
+///
+/// `std.Thread.spawn` is NOT in this set and must never be: a thread is not a
+/// process, `opcua`'s interop file uses both, and a set that could not tell
+/// them apart would say "spawn" about every threaded test in the collection.
+const process_spawn_markers = [_][]const u8{
+    "std.process.spawn(",
+    "std.process.run(",
+    "std.process.Child",
+    "linux.execve(",
+    "posix.execve",
+    "posix.execv(",
+    "posix.execvp",
+};
+
+/// What one file under `modules/<m>/src/` does wrong, with the text that proves
+/// it. A gate that says "this file is impure" without quoting what it read is a
+/// gate people argue with -- `copyleftSelfDeclaration` returns its evidence for
+/// the same reason.
+const PurityFinding = struct {
+    kind: enum { toolchain, foreign_source },
+    evidence: []const u8,
+};
+
+/// Iterate the ordinary string literals of a Zig source file, contents only.
+///
+/// Three things are skipped, and the first two were added after a measurement
+/// rather than on principle. Planting a spawn into every module named in this
+/// gate's doc comment showed `grpc/src/root.zig` reporting the toolchain `"go"`
+/// — which is `/// try s.sendEnd(.{ .text = "go" });`, a payload in a DOC
+/// COMMENT. A gate whose diagnostic quotes an example in prose is a gate people
+/// stop reading, so:
+///
+///   - `//` to end of line. Zig has no block comments, so this is the whole
+///     class. Note this is the literal scan only: `process_spawn_markers` still
+///     matches inside comments on purpose, because a spawn alone is never a
+///     failure and over-detecting that half costs nothing.
+///   - `\\` multiline literals to end of line. Their content is DATA — opcua's
+///     inline Python driver is 190 lines of it — and reading a foreign
+///     language's own quotes as Zig string literals is meaningless.
+///   - `'"'` and `'\''` character literals, which parsers in this collection
+///     are full of and which would otherwise open a string that swallows source
+///     up to the next quote, hiding whatever followed.
+///
+/// Backslash escapes inside a literal are tracked, so `"a\"b"` is one literal.
+const StringLiteralIterator = struct {
+    src: []const u8,
+    i: usize = 0,
+
+    fn skipLine(self: *StringLiteralIterator) void {
+        self.i = std.mem.indexOfScalarPos(u8, self.src, self.i, '\n') orelse self.src.len;
+    }
+
+    fn next(self: *StringLiteralIterator) ?[]const u8 {
+        while (self.i < self.src.len) {
+            const c = self.src[self.i];
+            const has_next = self.i + 1 < self.src.len;
+            if (c == '/' and has_next and self.src[self.i + 1] == '/') {
+                self.skipLine();
+                continue;
+            }
+            if (c == '\\' and has_next and self.src[self.i + 1] == '\\') {
+                self.skipLine();
+                continue;
+            }
+            if (c == '\'') {
+                var j = self.i + 1;
+                if (j < self.src.len and self.src[j] == '\\') j += 1;
+                j += 1;
+                self.i = if (j < self.src.len and self.src[j] == '\'') j + 1 else self.i + 1;
+                continue;
+            }
+            if (c != '"') {
+                self.i += 1;
+                continue;
+            }
+            const start = self.i + 1;
+            var j = start;
+            while (j < self.src.len) : (j += 1) {
+                if (self.src[j] == '\\') {
+                    j += 1;
+                    continue;
+                }
+                if (self.src[j] == '"' or self.src[j] == '\n') break;
+            }
+            self.i = @min(j + 1, self.src.len);
+            return self.src[start..@min(j, self.src.len)];
+        }
+        return null;
+    }
+};
+
+/// THE WHOLE DESIGN IS IN WHAT THIS REFUSES TO MATCH ON, and it is the same
+/// move `copyleftSelfDeclaration` makes: it does not match on the NAME of a
+/// thing, it matches on the thing itself. Here the thing is a foreign toolchain
+/// BEING RUN, not a foreign-looking file sitting in the tree.
+///
+/// Three shapes in the tree today would each be flagged by the obvious
+/// implementation -- "fail any `.c`/`.js`/`.py` under `src/`" -- and every one
+/// of them is innocent. They were read before this function was written:
+///
+///   - `modules/json5/src/testdata/json5-tests/*.js` — six files whose entire
+///     content is `080` or `[\n ,null\n]`. They are FIXTURE INPUTS and the
+///     `.js` extension IS the expected verdict ("valid JavaScript, invalid
+///     JSON5"). `json5_tests_vectors.zig` `@embedFile`s all six and hands them
+///     to our own parser. Nothing executes them, and json5 spawns nothing.
+///   - `modules/ebpf/src/testdata/*.bpf.c` — the committed provenance of the
+///     seven `.bpf.o` fixtures the tests load. `clang -target bpf` is run by a
+///     HUMAN (the recipe is in `object.zig`'s comment), never by the module;
+///     committing the sources is what makes the binaries re-derivable, which is
+///     the same argument `gen-dnssec-oracle.sh` exists for. They are not even
+///     `@embedFile`d — only the `.o` files are — and ebpf spawns nothing.
+///   - `modules/qr/src/testdata/reference.py` — a segno driver a human runs to
+///     regenerate `golden_matrices.zig`. `golden_test.zig`'s own title ends
+///     "no python required". qr spawns nothing.
+///
+/// So the rule is: **a foreign source file under `src/` is DATA until something
+/// in the same file can run it.** Both findings are therefore conditioned on
+/// the file containing a process spawn, and neither can fire without one:
+///
+///   A. a spawn plus a string literal naming a foreign toolchain. This is the
+///      shape six modules carried until 2026-09-06 (`python3 reference.py`,
+///      `cc -lwolfssl`) and the one the owner's rule outlaws directly.
+///
+///   B. a spawn plus an `@embedFile` of foreign SOURCE. This exists to close
+///      A's one escape: A can only read a program name it can SEE, and
+///      `dtls`'s peer would have been invisible to it had the compiler come
+///      from `$CC` instead of the literal `"cc"`. A module that materialises
+///      foreign source at runtime AND holds something to run it with is the
+///      embed-then-compile shape whether or not the compiler's name is spelled
+///      out. `.js` is in `foreign_source_exts` precisely because json5 proves
+///      the condition does the work: json5 embeds six of them and passes,
+///      because it spawns nothing.
+///
+/// FILE-SCOPED, not module-scoped, and measured before choosing: fifteen files
+/// under `modules/*/src/` contain a spawn marker today, and across all fifteen
+/// exactly one toolchain literal exists (`opcua`'s `"python3"`). Module scope
+/// would have coupled `opcua/src/root.zig`'s podman helper to a defect in a
+/// different file, and would have made `procrun` answerable for any `.py`
+/// anyone ever drops under its `src/`.
+///
+/// WHAT THIS CANNOT SEE, said so a green run is not read as more than it is: a
+/// toolchain whose name is assembled at runtime from pieces (`"pyth" ++ "on3"`,
+/// or read from a config file) in a module that embeds no foreign source. Rule
+/// B covers the case that has an actual purpose behind it — running foreign
+/// source we ship — and nothing mechanical reaches obfuscation. `check-catalog`
+/// claim 5's human answer is the backstop, as it is for a stripped licence
+/// header.
+fn purityFinding(src: []const u8) ?PurityFinding {
+    // Prefilter: every marker below contains `process.` or `execv`, and 1046
+    // of the 1206 files under `modules/*/src/` contain neither, so they can be
+    // rejected without seven `indexOf` passes each. Measured on 39 MB of module
+    // source, against `check-copyleft`'s 1.1 s for 50 MB as the control:
+    // 3.0 s with the seven markers reached through a `process.`/`exec` filter,
+    // 1.4 s with this one.
+    //
+    // ⚠ THE NEEDLE LENGTH IS THE WHOLE DIFFERENCE, and it was not obvious. The
+    // filter first said `exec`; that single four-byte pass cost 2.7 s on its
+    // own, while the eight-byte `process.` pass over the same bytes cost 1.1 s.
+    // `indexOf` skips by a Horspool table, so a short needle of common letters
+    // walks nearly byte by byte -- and the build runner is compiled in Debug,
+    // where that is not optimised away. `execv` covers every exec marker here
+    // and costs what the long needle costs.
+    if (std.mem.indexOf(u8, src, "process.") == null and
+        std.mem.indexOf(u8, src, "execv") == null) return null;
+
+    var spawns = false;
+    for (process_spawn_markers) |marker| {
+        if (std.mem.indexOf(u8, src, marker) != null) {
+            spawns = true;
+            break;
+        }
+    }
+    if (!spawns) return null;
+
+    var it: StringLiteralIterator = .{ .src = src };
+    while (it.next()) |lit| {
+        const base = if (std.mem.lastIndexOfScalar(u8, lit, '/')) |s| lit[s + 1 ..] else lit;
+        if (containsName(&foreign_toolchains, base)) {
+            return .{ .kind = .toolchain, .evidence = lit };
+        }
+    }
+
+    const needle = "@embedFile(\"";
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, src, scan, needle)) |at| {
+        const rest = src[at + needle.len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse break;
+        const path = rest[0..end];
+        scan = at + needle.len + end;
+        for (foreign_source_exts) |ext| {
+            if (std.mem.endsWith(u8, path, ext)) {
+                return .{ .kind = .foreign_source, .evidence = path };
+            }
+        }
+    }
+    return null;
+}
+
+/// A module's stated foreign-toolchain debt, read from the one line that
+/// states it:
+///
+///     **Foreign toolchain:** MIGRATION-OWED via `src/server_interop.zig` — <argument>
+///
+/// ONE VALUE, AND IT IS NOT AN APPROVAL. There is deliberately no spelling of
+/// "this is fine". `**Copyleft:**` gives `NONE-SHIPPED` and `SHIPPED` because a
+/// module can legitimately have no relationship with a copyleft licence and
+/// needs a way to say so; here the clean state needs no line at all, so the
+/// only thing left to write down is the debt. Whoever adds the line is
+/// recording that the module is on the wrong side of the owner's rule and that
+/// the fix is `tools/interop.zig` — not buying an exemption, and not able to
+/// spell one.
+///
+/// THE LINE EXPIRES BY ITSELF. It names the file, and `checkModulePurity` fails
+/// when a declared file no longer violates. So the migration that fixes the
+/// module also deletes its declaration, and nobody has to remember: the same
+/// reason `check-portable`'s known-failure table carries the compiler error
+/// rather than just the pair.
+///
+/// THE SHAPE is the house style for a single stated fact — `**Fuzz exemption:**`
+/// and `**Copyleft:**` — one line in the module's own SPEC.md or README.md,
+/// argument in the prose after it, and no repository-level table to keep in
+/// sync. Two such tables were retired in August for being exactly that.
+const PurityDebt = struct {
+    /// Path relative to `modules/<m>/`, as written between the backticks.
+    file: []const u8,
+    argument: []const u8,
+    /// The document the line was read from, for diagnostics.
+    doc: []const u8,
+    /// Set when a scanned file matched `file`. A debt nothing matches is stale
+    /// and fails.
+    discharged: bool = false,
+};
+
+fn modulePurityDebt(b: *std.Build, io: std.Io, name: []const u8, failed: *bool) ?PurityDebt {
+    const needle = "**Foreign toolchain:** ";
+    var path = b.fmt("modules/{s}/SPEC.md", .{name});
+    var src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch "";
+    if (std.mem.indexOf(u8, src, needle) == null) {
+        path = b.fmt("modules/{s}/README.md", .{name});
+        src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch return null;
+    }
+
+    const at = std.mem.indexOf(u8, src, needle) orelse return null;
+    if (std.mem.indexOfPos(u8, src, at + needle.len, needle) != null) {
+        std.log.err("module '{s}': {s} states a foreign-toolchain debt twice", .{ name, path });
+        failed.* = true;
+        return null;
+    }
+
+    const rest = src[at + needle.len ..];
+    const line = std.mem.trim(u8, rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len], " \t\r");
+
+    const relation = "MIGRATION-OWED via ";
+    if (!std.mem.startsWith(u8, line, relation)) {
+        std.log.err(
+            "{s}: `{s}{s}` — the only form this line takes is `{s}MIGRATION-OWED via `<path>` — <argument>`. " ++
+                "There is no spelling that approves a foreign toolchain in a module: the fix is to move the " ++
+                "program to `modules/{s}/tools/interop.zig` and replay a committed transcript instead.",
+            .{ path, needle, line, needle, name },
+        );
+        failed.* = true;
+        return null;
+    }
+    const after = line[relation.len..];
+    const dash = " — ";
+    const cut = std.mem.indexOf(u8, after, dash) orelse {
+        std.log.err(
+            "{s}: `{s}{s}` states a debt with no argument — the line must read " ++
+                "`{s}MIGRATION-OWED via `<path>` — <argument>`, and a bare verdict is not a judgement",
+            .{ path, needle, line, needle },
+        );
+        failed.* = true;
+        return null;
+    };
+    const file = std.mem.trim(u8, after[0..cut], " \t`");
+    const argument = std.mem.trim(u8, after[cut + dash.len ..], " \t");
+    if (file.len == 0 or argument.len == 0) {
+        std.log.err(
+            "{s}: `{s}{s}` — the line must name the offending file and say why it is still there",
+            .{ path, needle, line },
+        );
+        failed.* = true;
+        return null;
+    }
+    return .{ .file = file, .argument = argument, .doc = path };
+}
+
+/// Walk `modules/<m>/src/` and hold every `.zig` file to `purityFinding`.
+///
+/// Only `.zig` is read: the finding is always about CODE running something, and
+/// the data files a module ships are precisely what this gate exists not to
+/// flag. `tools/` is not walked at all — an interop program may spawn anything,
+/// which is the entire point of it living there.
+fn scanSrcForPurity(
+    b: *std.Build,
+    io: std.Io,
+    module: []const u8,
+    dir_path: []const u8,
+    depth: u8,
+    debt: ?*PurityDebt,
+    failed: *bool,
+) void {
+    if (depth > 8) return;
+    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch |e| {
+        if (e == error.FileNotFound and depth == 0) return;
+        std.log.err("check-module-purity cannot open {s}: {s}", .{ dir_path, @errorName(e) });
+        failed.* = true;
+        return;
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch |e| {
+        std.log.err("check-module-purity cannot read {s}: {s}", .{ dir_path, @errorName(e) });
+        failed.* = true;
+        return;
+    }) |entry| {
+        const path = b.fmt("{s}/{s}", .{ dir_path, entry.name });
+        switch (entry.kind) {
+            .directory => {
+                if (containsName(&.{ "zig-out", ".zig-cache", "zig-pkg" }, entry.name)) continue;
+                scanSrcForPurity(b, io, module, path, depth + 1, debt, failed);
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+                // A file that cannot be READ fails rather than being skipped,
+                // for the reason `scanShippedForCopyleft` gives: "skip whatever
+                // you could not read" is how a gate acquires a hole.
+                const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(16 * 1024 * 1024)) catch |e| {
+                    std.log.err("check-module-purity cannot read {s}: {s}", .{ path, @errorName(e) });
+                    failed.* = true;
+                    continue;
+                };
+                const finding = purityFinding(src) orelse continue;
+
+                const rel = path["modules/".len + module.len + 1 ..];
+                if (debt) |d| {
+                    if (std.mem.eql(u8, d.file, rel)) {
+                        d.discharged = true;
+                        continue;
+                    }
+                }
+                switch (finding.kind) {
+                    .toolchain => std.log.err(
+                        "{s} spawns a child process and names the foreign toolchain \"{s}\". A module is " ++
+                            "standalone Zig with no external dependency (owner's rule, 2026-09-06): an anchor " ++
+                            "against a foreign implementation is an EXTERNAL test and belongs in " ++
+                            "modules/{s}/tools/interop.zig, which `zig build interop-{s}` runs and " ++
+                            "`zig build check-interop` compiles. What the module replays is the committed " ++
+                            "transcript that program takes, so `test-{s}` needs no toolchain at all.",
+                        .{ path, finding.evidence, module, module, module },
+                    ),
+                    .foreign_source => std.log.err(
+                        "{s} spawns a child process AND @embedFiles the foreign source \"{s}\" — that is the " ++
+                            "embed-then-compile shape `dtls` carried until 2026-09-06, and it is a violation " ++
+                            "whether or not the compiler's name is spelled out in this file. Move both the " ++
+                            "program and its foreign driver to modules/{s}/tools/ and replay a committed " ++
+                            "transcript. (Foreign source that nothing in its own file can RUN is data and is " ++
+                            "not flagged — see json5's .js fixtures and ebpf's .bpf.c provenance.)",
+                        .{ path, finding.evidence, module },
+                    ),
+                }
+                failed.* = true;
+            },
+            else => {},
+        }
+    }
+}
+
+/// `zig build check-module-purity` — no module's own code runs a foreign
+/// toolchain.
+///
+/// The owner's rule, 2026-09-06: zig-libs is a library of modules, every module
+/// is standalone Zig with no external dependency, and an anchor against a
+/// foreign implementation is an EXTERNAL test — it belongs in
+/// `modules/<m>/tools/`, not inside the module. Six modules were migrated that
+/// day (`f3dbf38d`, `f42cc67a`). This step is what stops the shape coming back.
+///
+/// The claim, and the interesting part is what it refuses to fire on: a file
+/// under `modules/<m>/src/` must not both start a child process and either name
+/// a foreign toolchain or carry `@embedFile`d foreign source. See
+/// `purityFinding` for why the condition is the SPAWN and not the file
+/// extension, and for the three innocent shapes in the tree today that a
+/// extension rule would have flagged.
+///
+/// VERIFIED BY PLANTING, since the tree is green apart from the one declared
+/// debt: a `std.process.run` of `{"cc", "-o", …}` added to a clean module's
+/// `src/` turns it red, an `@embedFile("testdata/peer.c")` next to a spawn
+/// turns it red, and removing each returns it to green — judged by exit code,
+/// not by reading the log. `json5`, `ebpf`, `qr` and the six migrated modules
+/// pass unmodified.
+///
+/// ONE MODULE IS NOT CLEAN TODAY, and the gate names it rather than being
+/// narrowed until it does not: `modules/opcua/src/server_interop.zig` carries a
+/// ~190-line Python driver as an inline `\\` literal and runs it with
+/// `python3 -c`. That is the same shape the migration removed from six modules
+/// — the seventh instance, missed because opcua's driver was never a separate
+/// file to move. It carries a `**Foreign toolchain:** MIGRATION-OWED` line
+/// (see `modulePurityDebt`), which expires by itself the moment the file stops
+/// spawning.
+///
+/// A SEPARATE STEP rather than a section of `check-catalog`, for the reason
+/// `check-copyleft` is: the change signal differs. This one reads every `.zig`
+/// under `modules/*/src/` and should run when SOURCE lands.
+fn checkModulePurity(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    var failed = false;
+
+    for (module_list) |m| {
+        var debt = modulePurityDebt(b, io, m.name, &failed);
+        scanSrcForPurity(
+            b,
+            io,
+            m.name,
+            b.fmt("modules/{s}/src", .{m.name}),
+            0,
+            if (debt) |*d| d else null,
+            &failed,
+        );
+        if (debt) |d| {
+            if (!d.discharged) {
+                std.log.err(
+                    "{s} declares `**Foreign toolchain:** MIGRATION-OWED via `{s}`, but modules/{s}/{s} " ++
+                        "does not spawn a foreign toolchain (or does not exist). If the migration landed, " ++
+                        "DELETE the line — a debt that outlives its cause is how a record stops being read.",
+                    .{ d.doc, d.file, m.name, d.file },
+                );
+                failed = true;
+            }
+        }
+    }
+
+    if (failed) return step.fail("a module is standalone Zig — see errors above", .{});
 }
 
 // ---------------------------------------------------------------------------

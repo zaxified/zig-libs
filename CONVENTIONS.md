@@ -861,6 +861,33 @@ that reaches it can notice.
   **Never in an audit directory, and never pasted into an audit document.** An audit finding
   cites the instrument by its path in this repository; it does not carry the instrument's
   body.
+- **An instrument that needs a FOREIGN TOOLCHAIN lives in `modules/<name>/tools/`, never in
+  `src/`** (owner's rule, 2026-09-06). A module is standalone Zig with no external dependency;
+  an anchor against a foreign implementation is a different thing — it needs a C compiler, a
+  Python, a container, a system library — and mixing the two put foreign source inside six
+  published modules and made `test-<name>` unrunnable without a toolchain it had no business
+  needing. It did not even fail honestly: each "skipped loudly" instead, and CI's peer install
+  is `continue-on-error`, so a failed install degraded to a silent skip. `grpc` was the sharpest
+  case, 13 of 15 reference tests passing on any host without Python by never running.
+  The split: `modules/<name>/tools/interop.zig` is a standalone PROGRAM that may spawn anything;
+  `zig build interop-<name>` runs it against the real peer and `zig build check-interop` compiles
+  it with no peer present, as a rot guard. What it produces is a transcript committed under
+  `src/testdata/`, and the module's own tests replay that hermetically — so the anchor's VALUE
+  runs in the lane that runs everywhere while the anchor's TAKING is a pre-release step
+  (`scripts/test.sh interop`). Existence is the declaration: a module either has the file or does
+  not, and a table of which ones do would be a second place to forget.
+  `zig build check-module-purity` is the teeth. It refuses a file under `modules/<name>/src/`
+  that starts a child process AND either names a foreign toolchain or `@embedFile`s foreign
+  SOURCE. The spawn is the condition, not the file extension — which is why `json5`'s `.js`
+  fixtures, `ebpf`'s `.bpf.c` provenance for its `.bpf.o` binaries, and `qr`'s `reference.py`
+  are all data and none of them trips it. A module that is still on the wrong side of this says
+  so in one line in its own SPEC/README, the same shape as `**Fuzz exemption:**`:
+
+      **Foreign toolchain:** MIGRATION-OWED via `<path>` — <argument>
+
+  There is deliberately no spelling that approves one, and the line expires by itself: the gate
+  fails on a declaration whose file has stopped spawning, so the migration that fixes the module
+  also deletes the line. `modules/opcua` is the only module carrying it today.
 - **An instrument that serves SEVERAL modules lives in `scripts/`** — or in a `tools/`
   directory beside it, if one is ever created for instruments that are not shell entry
   points. `scripts/` is already the documented home for repo-wide checks, and

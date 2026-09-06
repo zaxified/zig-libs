@@ -29,7 +29,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | `portable-known-failures.tsv` | The `(module, target)` pairs a module DECLARES in `meta.targets` but that do not currently compile, each with the real compiler error. A declared-but-broken target is a tracked debt, not a silently dropped claim. |
 | `check-apps.sh` | Builds every `example-apps/` project against THIS working tree, via `zig build --fork=../..`. The apps pin a released tag because that is what someone who downloads one needs; the fork overrides that pin without touching the file. It is the only check here that reaches the published API through the real package machinery, the way a consumer does. `--pinned` builds from the manifest as written instead — fetch by URL and hash, compile the exported package — which is the downloader's own path and the only thing that exercises `.paths`; it is fail-closed and refuses unless every pinned tag resolves to `HEAD`, i.e. on a tag ref and nowhere else. `--run` then executes each app's own `smoke.sh`, which starts the program and asserts on what it does — the difference between "it compiles" and "it works", and what CI runs. It does that **twice per app, in `ReleaseSafe` and in `ReleaseFast`**, because a `std.debug.assert` guard is compiled out of the latter and a fail-open one is therefore invisible in safe modes. Also refuses a directory nobody declared, a declaration whose directory is gone, an app the collection README does not list, and an app with no executable `smoke.sh`. |
 | `check-ci-cache-keys.sh` | Refuses a CI config where one lane's cache restore-key prefix can match another lane's entry. `restore-keys` matches by prefix, so distinct names are not enough — they must not be prefixes of each other. An amd64 lane restored an aarch64 tree this way and recompiled everything, green throughout. |
-| `ci-environment.sh` | Installs the live peers a hosted runner lacks — wolfSSL, the open62541 container, five Python oracles. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. |
+| `ci-environment.sh` | Installs the peers a hosted runner lacks. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. **Takes a ROLE since 2026-09-06** — `tests` (default), `interop`, or `all` — and the split is the whole point of the file now. `tests` is what a lane that RUNS tests or examples needs: the userns and ping sysctls, the yaml-test-suite corpus, opcua's open62541 container and its asyncua venv, imap's pymap venv, and the pinned `websockets` the websocket EXAMPLE judges itself against. `interop` is what only `zig build interop-<m>` reaches: a C compiler + wolfSSL headers (dtls) and `jinja2==3.1.6`/sympy/brotli/protobuf plus a grpcio venv (the five Python-driven ones). ⛔ **The `interop` half is not deletable.** Those six modules replay committed transcripts and pass on a host with no compiler and no Python — but a transcript nobody can RE-TAKE is a frozen anchor, extendable and correctable by nobody. `dnssec` lost one exactly that way and `gen-dnssec-oracle.sh` had to be written from nothing to get it back. |
 | `check-citations.py` | Verifies the RFC/standard citations in module docs point at something real. **Manual, not a gate:** measured on `dns`, it pairs an `RFC NNNN` mention with any nearby quoted string, so a quoted SPEC.md heading reports as a mismatch. Useful with triage, not as a red/green. 2026-09-06: 933 citations, 404 VERIFIED / 487 MISMATCH / 42 UNFETCHABLE — and two of the samples read by hand are genuinely wrong quotes, not extraction noise. See "Standards citations" below. |
 | `check-uapi-consts.py` | Diffs the kernel UAPI constants modules hardcode against the headers they came from. Driven by `zig build check-uapi`, which the gate runs; it SKIPS (never fails) on a host without python3 or kernel headers. Currently 689 matched / 0 mismatched across five modules, with 263 constants unresolved — it says so rather than counting them as passes. |
 | `gen-qr-decode-vectors.py` | External DECODE oracle for `qr`: **segno** (BSD-3, independently authored) produces the module grid and this module's decoder must read segno's own bytes back out. **Keep it.** `modules/qr/SPEC.md` named this gap in its own words — the committed golden set anchors the ENCODER, and only 10 of 40 versions, so the decoder (the untrusted-input half) had no external anchor at all until 2026-09-04. Emits all 960 vectors; 160 stratified ones are committed. Needs `segno`, so it is not a gate step. |
@@ -49,6 +49,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | **Before committing** | `scripts/test.sh all` | Every module — the same gate CI runs |
 | Reproducing a CI lane | `scripts/test.sh all -Dstrict-debug` / `-Doptimize=ReleaseFast` | Trailing args pass through to `zig build` |
 | Investigating slowness | `scripts/test.sh time` | Serial per-module duration table |
+| Before cutting a tag | `scripts/test.sh interop` | Re-takes the six interop anchors against REAL peers — see below. Needs `scripts/ci-environment.sh interop`; ~35 s warm |
 
 ## Environment gaps
 
@@ -71,6 +72,43 @@ nor a rootless podman container can grant it — both run in a user namespace
 a `NOPASSWD` sudoers rule for `zig build` would not be a narrow grant: `zig
 build` executes `build.zig`, i.e. arbitrary code, as root. One skipped test
 group is the better trade.
+
+## A module is standalone Zig — and where the foreign half lives
+
+Owner's rule, 2026-09-06: a module is standalone Zig with no external dependency, and an
+anchor against a foreign implementation is an EXTERNAL test that belongs in
+`modules/<m>/tools/`, not inside the module. Six modules were separated from their interop
+programs that day. Two things in this harness stand on that rule.
+
+**`zig build check-module-purity`** (in the fast group, ~1.4 s, same order as
+`check-copyleft` beside it) stops the shape coming back. It refuses a file under
+`modules/<m>/src/` that starts a child process **and** either names a foreign toolchain
+(`cc`, `python3`, `node`, `make`, …) or `@embedFile`s foreign SOURCE.
+
+⭐ **The spawn is the condition, not the file extension**, and that is the entire design.
+Three things in the tree today would be flagged by the obvious "fail any `.c`/`.js`/`.py`
+under `src/`" rule and every one of them is innocent: `json5`'s six `.js` files, whose whole
+content is `080` or `[\n ,null\n]` and whose extension IS the expected verdict ("valid
+JavaScript, invalid JSON5"); `ebpf`'s seven `.bpf.c` files, the committed provenance that
+makes its `.bpf.o` fixtures re-derivable, compiled by a human and never by the module; and
+`qr`'s `reference.py`, a segno driver whose golden test's own title ends "no python
+required". None of their modules spawns anything, so none of them trips the gate and none of
+them needs an exemption entry. A module still on the wrong side states it in one line in its
+own SPEC/README — `**Foreign toolchain:** MIGRATION-OWED via <path> — <argument>`, the
+shape `**Fuzz exemption:**` uses — there is no spelling that approves one, and the line
+expires by itself because the gate fails on a declaration whose file has stopped spawning.
+`opcua` is the only module carrying it: `src/server_interop.zig` holds a ~190-line Python
+`asyncua` driver as an inline `\\` literal and runs it with `python3 -c`.
+
+**`scripts/test.sh interop`** is the other half, and it exists because nothing was running
+one. `test-dtls` replays a wolfSSL transcript and passes 268/268 on a box with no compiler;
+`test-grpc` went from 13 silent skips to 119/119 with no Python. What replay cannot do is
+notice that something NEW we send provokes a different reaction, or that the peer moved —
+only running the peer does. This command runs `check-interop` (compiles all six with no peer,
+so a program that stopped building is reported as that) and then each `interop-<m>`. It
+**verifies against the committed transcript rather than rewriting it**, so it leaves a clean
+tree and goes red on divergence; re-blessing is a flag a human passes. Pre-release, not
+per-commit: it is a lane of the CI matrix, which runs on tags and dispatch only.
 
 ## How `changed` decides what to run
 

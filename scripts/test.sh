@@ -306,6 +306,19 @@ harness_smoke() {
     # a copyright notice -- does not trip it. Copyleft in shipped code is a
     # defect to be removed, not a paperwork item.
     step "check-copyleft" zig build check-copyleft
+
+    # The teeth on the owner's rule of 2026-09-06 -- a module is standalone Zig
+    # with no external dependency, and an anchor against a foreign
+    # implementation is an EXTERNAL test that belongs in `modules/<m>/tools/`.
+    # Six modules were separated from their interop programs that day; nothing
+    # stopped the seventh being written the old way tomorrow. It refuses a file
+    # under `modules/<m>/src/` that starts a child process AND either names a
+    # foreign toolchain (`cc`, `python3`, `node`, `make`, ...) or `@embedFile`s
+    # foreign SOURCE. The spawn is the condition, which is why json5's six `.js`
+    # fixtures, ebpf's `.bpf.c` provenance and qr's `reference.py` -- none of
+    # which anything in their own file can run -- do not trip it. ~1.4 s, the
+    # same order as check-copyleft beside it.
+    step "check-module-purity" zig build check-module-purity
     step "check-uapi" zig build check-uapi
     step "check-changelog" zig build check-changelog
 
@@ -956,10 +969,19 @@ capability_check() {
     # ⚠ A PROBE MUST USE THE INTERPRETER THE TEST USES, and the first draft of
     # this loop did not. Three of the four spawn a bare `python3`; `grpc` tries
     # `~/.cache/zig-libs-grpc/bin/python` first and falls back (see
-    # `interpreter()` in its reference_interop.zig). Probing `python3` for all
+    # `pythonInterpreter()` in `modules/grpc/tools/interop.zig` -- the file was
+    # `src/reference_interop.zig` until 2026-09-06). Probing `python3` for all
     # four reported a grpcio gap on a host where grpc's tests were running fine
     # from its venv — a false gap, which spends the reader's trust in exactly
     # the report that most needs it.
+    #
+    # ⚠ ALL FOUR NOW COST AN `interop-<m>` RE-TAKE, NOT A TEST. Since the
+    # 2026-09-06 split these four modules' own tests replay committed
+    # transcripts and pass with no Python at all, so a lane that runs only
+    # `test.sh modules` will report these four gaps and lose no coverage by
+    # them. The lane that actually needs them is `test.sh interop`, and the
+    # cost text below says so per module rather than leaving the reader to
+    # infer it.
     #
     # ⚠ AND IT MUST IMPORT EVERYTHING THAT INTERPRETER WILL BE ASKED TO IMPORT.
     # `grpc` is one entry with two packages: both of its oracle scripts import
@@ -983,7 +1005,7 @@ capability_check() {
             fix="python3 -m venv ~/.cache/$venv && ~/.cache/$venv/bin/pip -q install $pkg"
         fi
         "$py" -c "import $mod" >/dev/null 2>&1 \
-            || gaps+=("python lacks $pkg|up to $cost skip|$fix")
+            || gaps+=("python lacks $pkg|$cost|$fix")
     done
 
     # ⭐ TWO MORE, FOUND BY READING THE UNCAPPED SKIP LIST. The digest's tail —
@@ -1305,6 +1327,11 @@ cmd_changed() {
     # makes the same claim a skipped test makes, which is that someone looked.
     step "check-fuzz" zig build check-fuzz
     step "check-copyleft" zig build check-copyleft
+
+    # Same reasoning as check-copyleft above, and the same order of cost
+    # (~1.4 s): a source scan that refuses a module whose own code runs a
+    # foreign toolchain. See phase_checks_fast_tail for the rule in full.
+    step "check-module-purity" zig build check-module-purity
     step "check-global-alloc" zig build check-global-alloc
 
     # 32-bit compile of every `platform = .any` module. ~6s cold for all 195,
@@ -1469,6 +1496,19 @@ phase_checks_fast_tail() {
     # a copyright notice -- does not trip it. Copyleft in shipped code is a
     # defect to be removed, not a paperwork item.
     step "check-copyleft" zig build check-copyleft
+
+    # The teeth on the owner's rule of 2026-09-06 -- a module is standalone Zig
+    # with no external dependency, and an anchor against a foreign
+    # implementation is an EXTERNAL test that belongs in `modules/<m>/tools/`.
+    # Six modules were separated from their interop programs that day; nothing
+    # stopped the seventh being written the old way tomorrow. It refuses a file
+    # under `modules/<m>/src/` that starts a child process AND either names a
+    # foreign toolchain (`cc`, `python3`, `node`, `make`, ...) or `@embedFile`s
+    # foreign SOURCE. The spawn is the condition, which is why json5's six `.js`
+    # fixtures, ebpf's `.bpf.c` provenance and qr's `reference.py` -- none of
+    # which anything in their own file can run -- do not trip it. ~1.4 s, the
+    # same order as check-copyleft beside it.
+    step "check-module-purity" zig build check-module-purity
     step "check-uapi" zig build check-uapi
     step "check-changelog" zig build check-changelog
 
@@ -1538,6 +1578,74 @@ cmd_checks_fast() {
 cmd_checks() {
     echo "checks: the mode- and arch-independent gates, once for the whole matrix"
     phase_checks
+    summary
+}
+
+# ⭐ THE `interop` LANE: RE-TAKE THE ANCHORS, which is the half of an interop
+# test that a transcript cannot carry.
+#
+# On 2026-09-06 six modules were separated from their interop programs: the
+# program moved to `modules/<m>/tools/interop.zig` and what it produced became a
+# committed transcript the module's own tests replay hermetically. That was a
+# clear win — `test-grpc` went from 13 silent skips on a host without Python to
+# 119/119 passing anywhere — but it left a hole nobody was standing in. Replay
+# proves our side still agrees with what the peer said LAST TIME. It cannot
+# discover that something new we send provokes a different reaction, and it
+# cannot notice that the peer changed. Only running the real thing does that.
+#
+# ⛔ AND NO LANE RAN IT. Between the migration and this command, `zig build
+# interop-<m>` existed and nothing anywhere invoked it: CI installed five Python
+# oracles and wolfSSL for lanes that no longer touched any of them, while the
+# six programs that DID need them were run by nobody. A transcript nobody can
+# re-take is a frozen anchor — `modules/dnssec` lost one exactly that way, and
+# `scripts/gen-dnssec-oracle.sh` had to be written from nothing to get it back.
+#
+# PRE-RELEASE, NOT PER-COMMIT, and that is the migration's own stated intent.
+# The full matrix runs on tags and dispatch only, so a lane here is exactly a
+# pre-release check. Running it on every push would put six live peers —
+# a container, a compiler, four pip installs — back on the path of every commit,
+# which is the cost the migration removed.
+#
+# `check-interop` first, deliberately: it COMPILES all six with no peer present,
+# so a program that stopped building is reported as that, not as a peer that
+# would not start. Each program then gets its own step, because "interop failed"
+# over six peers is not a diagnosis.
+#
+# ⚠ THIS VERIFIES, IT DOES NOT REWRITE. Each program compares what the peer
+# says NOW against the committed transcript and reports mismatches; re-blessing
+# is `zig build interop-<m> -- --capture`, which a human runs after reading the
+# mismatch. So this leaves a clean tree and goes red on divergence -- a lane
+# that silently rewrote its own anchor would be a lane that can never fail.
+cmd_interop() {
+    set_extra_args "$@"
+    capability_check
+    local m progs=()
+    for m in modules/*/tools/interop.zig; do
+        [[ -e "$m" ]] || continue
+        m="${m#modules/}"
+        progs+=("${m%%/*}")
+    done
+    if (( ${#progs[@]} == 0 )); then
+        echo "interop: no modules/*/tools/interop.zig in the tree — nothing to re-take" >&2
+        exit 1
+    fi
+    echo "interop: re-taking the anchors of ${#progs[@]} module(s) against real peers: ${progs[*]}"
+    echo "  ⚠ these need the peers scripts/ci-environment.sh installs under the \`interop\` role;"
+    echo "    the transcripts they produce are what test-<m> replays hermetically."
+    step "check-interop" zig build check-interop "${EXTRA_ZIG_ARGS[@]}"
+    # ⚠ `ZL_STEP_STDERR_IS_OUTPUT` for the runs, NOT for `check-interop` above.
+    # These steps run PROGRAMS whose narration is their point -- interop-brotli
+    # prints "reference: python brotli 1.2.0 ..., 114 checks, 0 mismatches" --
+    # and `std.debug.print` writes to stderr, so the ordinary rule (exit 0 with
+    # anything on stderr is a failure) rejected a run that had just proved 114
+    # checks. `check-interop` is a compile and stays under the strict rule,
+    # because a compiler that succeeds while complaining is exactly what that
+    # rule exists to catch. Exit status still decides either way.
+    local m_rc=0
+    for m in "${progs[@]}"; do
+        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" || m_rc=1
+    done
+    (( m_rc )) || true
     summary
 }
 
@@ -1801,6 +1909,22 @@ Usage: scripts/test.sh [subcommand] [args]
                         ⚠ Does NOT update the module-graph snapshot: a run that
                         executed no test must not tell `changed` that anything
                         was covered.
+  interop               PRE-RELEASE ONLY — re-take the interop anchors. Runs
+                        every `modules/<m>/tools/interop.zig` against a REAL
+                        foreign peer (wolfSSL, grpcio, Jinja2, google/brotli,
+                        the protobuf runtime, sympy) and compares what the
+                        peer says NOW against the committed transcript the
+                        module replays. It VERIFIES: it leaves a clean tree and
+                        goes red on divergence. Re-blessing is a flag a human
+                        passes (`zig build interop-<m> -- --capture`), never
+                        this command. `test-<m>` never needs
+                        any of that — it replays a committed transcript and
+                        passes on a host with no compiler and no Python. This
+                        is the half replay cannot carry: replay proves we still
+                        agree with what the peer said LAST time, and only this
+                        can find that something new we send provokes a
+                        different reaction, or that the peer moved. Needs
+                        `scripts/ci-environment.sh interop`.
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.
@@ -1847,6 +1971,7 @@ main() {
         checks) cmd_checks ;;
         modules) cmd_modules "${rest[@]:-}" ;;
         examples) cmd_examples "${rest[@]:-}" ;;
+        interop) cmd_interop "${rest[@]:-}" ;;
         time) cmd_time "${rest[@]:-}" ;;
         vm) cmd_vm "${rest[@]:-}" ;;
         -h|--help|help) usage ;;
