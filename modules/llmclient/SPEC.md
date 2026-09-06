@@ -30,12 +30,44 @@ grammar) — see NOTICE. No third-party client library or SDK code copied.
 ## Threat model / out of scope
 The API key is a bearer credential handled like any HTTP client credential: held in memory for the
 `Client`'s lifetime, never logged, sent only over the (real, `std.crypto.tls`) HTTPS connection to
-`base_url`. A caller who overrides `base_url` (e.g. to a proxy) redirects where the key is sent —
-that is a caller configuration choice, not a module gap. `sse_parse` makes two deliberate,
+`base_url` — **and to no other host, whatever the peer says.** A caller who overrides `base_url`
+(e.g. to a proxy) chooses where the key is sent; a peer that answers a 3xx does not: redirects are
+never followed (`follow_redirects = false` on every request), and a 3xx is `error.UnexpectedStatus`
+with its body in `lastErrorBody`. Measured 2026-09-06 (A1 F1) before that line existed: one
+`Location:` from `base_url` sent `x-api-key` and the whole prompt to a host of the peer's choosing
+and `create` returned `OK` — `http.Client` strips `Authorization`/`Cookie` across an origin change
+but cannot know `x-api-key` is a credential, and even a same-origin hop resends the prompt.
+
+**Bounds, and which quantity each one bounds.** The peer controls the size of everything it sends
+and the pace at which it sends it; each of the four is bounded by a knob on `Client`:
+- `max_response_bytes` (10 MiB) — bytes ON THE WIRE of a buffered body. That is not what a body
+  costs: 7.8 MB of one-character content blocks parsed into 310 MiB of `std.json` nodes under it
+  (A1 F5), so
+- `max_parsed_bytes` (64 MiB) — the memory a response's or an event's parse may allocate, enforced by
+  a `BoundedAllocator` over the parse arena; past it, `error.ResponseTooLarge` and the arena is
+  released, never `OK` with a giant tree.
+- `max_event_bytes` (1 MiB) — one SSE dispatch group's joined `data:` payload
+  (`sse_parse.Parser.max_data_bytes`). Each line is bounded by the reader (~4 KiB); the number of
+  lines in a group was not, and 10 MB of legal lines made 2.4 GB live that stayed allocated after
+  the error (A1 F3/F15). Past it, `error.ResponseTooLarge` and the buffers are freed.
+- `read_timeout_ms` (60 s) — the body read: the whole body for `create`, each `next()` for a stream.
+  `http.Client.total_timeout_ms` covers connect + request + response HEAD and, by its own design,
+  not the body; a peer trickling one byte a second held `create` 30 s against a 2 s total timeout
+  and a stream 60 s, both ended by the peer (A1 F4). Enforced by racing the read on a concurrent
+  task (the same shape `http.Client` uses for its total timeout); when the `std.Io` cannot spare a
+  unit of concurrency the read runs unbounded, as `http.Client`'s does.
+
+**Numbers from the wire are checked, not cast.** A content-block `index` above `u32`, or a
+`usage` count that is negative, ≥ 2^64, or not finite, is `error.MalformedResponse`. They were
+`@intCast`/`@intFromFloat` on the raw value: a panic in Debug/ReleaseSafe and a silently wrong
+`index`/billing number in ReleaseFast (A1 F2).
+
+`sse_parse` makes two deliberate,
 documented simplifications vs. the full WHATWG grammar (LF/CRLF only, no persisted "last event ID
 buffer" across dispatch groups) — acceptable for a well-behaved API like Anthropic's, not a
 generic browser-grade parser; malformed/hostile SSE bytes resolve to typed errors
-(`EndOfStream`/`LineTooLong` surfaced as `error.HttpFailed`; `ReadFailed` goes through
+(`EndOfStream`/`LineTooLong` surfaced as `error.HttpFailed`; `DataTooLarge` as
+`error.ResponseTooLarge`; `ReadFailed` goes through
 `http.Client.Response.readFailure()` first and surfaces as `error.Canceled` when a
 `std.Io` cancelation is the real cause, `error.HttpFailed` otherwise), not panics. Out of
 scope: OpenAI-compatible variant, retries/429 backoff (compose with `resilience` instead),

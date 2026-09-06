@@ -136,18 +136,44 @@ fn optStrField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
-fn u64Field(obj: std.json.ObjectMap, name: []const u8) u64 {
+/// A non-negative integer field (token counts, block indexes). Absent or
+/// non-numeric → 0 (the field is optional on the wire); present but not
+/// representable — negative, a float at or above 2^64, NaN — →
+/// `MalformedResponse`. These used to be `@intCast`/`@intFromFloat` on the
+/// raw value, which is a panic in Debug/ReleaseSafe and a silently wrong
+/// number in ReleaseFast — on `index` (what a caller indexes its content
+/// blocks by) and on `usage` (what it bills by). Measured 2026-09-06 with
+/// `"index":4294967296` and `"input_tokens":1e300`: exit 134 in both safe
+/// modes, `index=0` / `input_tokens=9223372036854775808` in ReleaseFast.
+fn u64Field(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
     const v = obj.get(name) orelse return 0;
     return switch (v) {
-        .integer => |i| if (i < 0) 0 else @intCast(i),
-        .float => |f| if (f < 0) 0 else @intFromFloat(f),
+        .integer => |i| if (i < 0) error.MalformedResponse else @intCast(i),
+        .float => |f| blk: {
+            // 2^64 as f64 is exact; anything at or above it, or negative,
+            // or NaN (which fails every comparison) has no u64 value.
+            if (!(f >= 0.0 and f < 18446744073709551616.0)) return error.MalformedResponse;
+            break :blk @intFromFloat(f);
+        },
+        // `1e400` parses as +inf under `std.json` → rejected above; a
+        // number too long for the parser's own limits arrives as
+        // `.number_string` and is not a count this client can use.
+        .number_string => error.MalformedResponse,
         else => 0,
     };
 }
 
-fn optU64Field(obj: std.json.ObjectMap, name: []const u8) ?u64 {
+fn optU64Field(obj: std.json.ObjectMap, name: []const u8) ParseError!?u64 {
     if (obj.get(name) == null) return null;
-    return u64Field(obj, name);
+    return try u64Field(obj, name);
+}
+
+/// A content-block `index`: `u64Field` narrowed to the `u32` the
+/// `StreamEvent` carries, `MalformedResponse` past it.
+fn indexField(obj: std.json.ObjectMap) ParseError!u32 {
+    const v = try u64Field(obj, "index");
+    if (v > std.math.maxInt(u32)) return error.MalformedResponse;
+    return @intCast(v);
 }
 
 fn objField(obj: std.json.ObjectMap, name: []const u8) ?std.json.ObjectMap {
@@ -165,12 +191,12 @@ fn stopReasonFromString(s: ?[]const u8) ?StopReason {
     return std.meta.stringToEnum(StopReason, str) orelse .unknown;
 }
 
-fn parseUsage(obj: std.json.ObjectMap) Usage {
+fn parseUsage(obj: std.json.ObjectMap) ParseError!Usage {
     return .{
-        .input_tokens = u64Field(obj, "input_tokens"),
-        .output_tokens = u64Field(obj, "output_tokens"),
-        .cache_creation_input_tokens = optU64Field(obj, "cache_creation_input_tokens"),
-        .cache_read_input_tokens = optU64Field(obj, "cache_read_input_tokens"),
+        .input_tokens = try u64Field(obj, "input_tokens"),
+        .output_tokens = try u64Field(obj, "output_tokens"),
+        .cache_creation_input_tokens = try optU64Field(obj, "cache_creation_input_tokens"),
+        .cache_read_input_tokens = try optU64Field(obj, "cache_read_input_tokens"),
     };
 }
 
@@ -210,14 +236,14 @@ fn parseDelta(obj: std.json.ObjectMap) ParseError!Delta {
     return error.MalformedResponse;
 }
 
-fn messageFromObject(arena: std.mem.Allocator, obj: std.json.ObjectMap) Message {
+fn messageFromObject(arena: std.mem.Allocator, obj: std.json.ObjectMap) ParseError!Message {
     const items = arrField(obj, "content");
     var content: []ContentBlock = &.{};
     if (items.len != 0) {
         // `obj`'s strings/arrays already live in the caller's arena (they
         // came from one `std.json.Value` parse); the content slice we
         // build here just needs the same arena to allocate into.
-        const buf: []ContentBlock = arena.alloc(ContentBlock, items.len) catch &.{};
+        const buf: []ContentBlock = try arena.alloc(ContentBlock, items.len);
         for (items, 0..) |item, i| {
             buf[i] = if (item == .object) parseContentBlock(item.object) else .{ .other = .{ .object = .empty } };
         }
@@ -233,7 +259,7 @@ fn messageFromObject(arena: std.mem.Allocator, obj: std.json.ObjectMap) Message 
     }
 
     var usage: Usage = .{};
-    if (objField(obj, "usage")) |u| usage = parseUsage(u);
+    if (objField(obj, "usage")) |u| usage = try parseUsage(u);
 
     return .{
         .id = strField(obj, "id"),
@@ -256,7 +282,7 @@ pub fn parseMessage(arena: std.mem.Allocator, body: []const u8) ParseError!Messa
         else => return error.MalformedResponse,
     };
     if (root != .object) return error.MalformedResponse;
-    return messageFromObject(arena, root.object);
+    return try messageFromObject(arena, root.object);
 }
 
 /// Parse one SSE `data:` payload (already joined/trimmed by `sse_parse`)
@@ -273,28 +299,28 @@ pub fn parseStreamEvent(arena: std.mem.Allocator, data: []const u8) ParseError!S
 
     if (std.mem.eql(u8, t, "message_start")) {
         const msg_obj = objField(obj, "message") orelse return error.MalformedResponse;
-        return .{ .message_start = .{ .message = messageFromObject(arena, msg_obj) } };
+        return .{ .message_start = .{ .message = try messageFromObject(arena, msg_obj) } };
     }
     if (std.mem.eql(u8, t, "content_block_start")) {
         const cb = objField(obj, "content_block") orelse return error.MalformedResponse;
         return .{ .content_block_start = .{
-            .index = @intCast(u64Field(obj, "index")),
+            .index = try indexField(obj),
             .content_block = parseContentBlockStart(cb),
         } };
     }
     if (std.mem.eql(u8, t, "content_block_delta")) {
         const d = objField(obj, "delta") orelse return error.MalformedResponse;
         return .{ .content_block_delta = .{
-            .index = @intCast(u64Field(obj, "index")),
+            .index = try indexField(obj),
             .delta = try parseDelta(d),
         } };
     }
     if (std.mem.eql(u8, t, "content_block_stop")) {
-        return .{ .content_block_stop = .{ .index = @intCast(u64Field(obj, "index")) } };
+        return .{ .content_block_stop = .{ .index = try indexField(obj) } };
     }
     if (std.mem.eql(u8, t, "message_delta")) {
         const d = objField(obj, "delta") orelse return error.MalformedResponse;
-        const usage: ?Usage = if (objField(obj, "usage")) |u| parseUsage(u) else null;
+        const usage: ?Usage = if (objField(obj, "usage")) |u| try parseUsage(u) else null;
         return .{ .message_delta = .{
             .delta = .{
                 .stop_reason = stopReasonFromString(optStrField(d, "stop_reason")),
@@ -550,6 +576,28 @@ test "parseStreamEvent: tool_use content_block_start + input_json_delta + error 
     try testing.expect(ping_ev == .ping);
 }
 
+test "parseStreamEvent/parseMessage: an index or count the type cannot hold is MalformedResponse, never a panic or a wrong number (A1 F2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The edge that fits, then the four shapes that used to panic in
+    // Debug/ReleaseSafe and truncate in ReleaseFast.
+    const ok = try parseStreamEvent(a, "{\"type\":\"content_block_stop\",\"index\":4294967295}");
+    try testing.expectEqual(@as(u32, 4294967295), ok.content_block_stop.index);
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "{\"type\":\"content_block_stop\",\"index\":4294967296}"));
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "{\"type\":\"content_block_stop\",\"index\":9223372036854775807}"));
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "{\"type\":\"content_block_delta\",\"index\":1000000000000000000,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}"));
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1e300}}}"));
+    // Negative and non-finite counts are not counts; `1e400` is +inf.
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "{\"type\":\"content_block_stop\",\"index\":-1}"));
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "{\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":-5}}"));
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "{\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":1e400}}"));
+    try testing.expectError(error.MalformedResponse, parseMessage(a, "{\"id\":\"m\",\"content\":[],\"usage\":{\"input_tokens\":1e300}}"));
+    // A float that is a whole number in range is accepted as that number.
+    const f = try parseStreamEvent(a, "{\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":12.0}}");
+    try testing.expectEqual(@as(u64, 12), f.message_delta.usage.?.output_tokens);
+}
+
 test "parseStreamEvent: unrecognized top-level type is a MalformedResponse error" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -570,26 +618,36 @@ test "parseStreamEvent: missing content_block on content_block_start is a Malfor
 
 // ── fuzz: untrusted JSON bytes never panic ──────────────────────────────────
 
+// `smith.slice`, not `bytes` + a ranged length (that pair always yields the
+// empty input), and seeds that reach the typed walk — without them the
+// harnesses saw one empty string each (A1 F9).
 fn fuzzParseMessage(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len = smith.slice(&buf);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     _ = parseMessage(arena.allocator(), buf[0..len]) catch return;
 }
 test "fuzz parseMessage never panics" {
-    try testing.fuzz({}, fuzzParseMessage, .{});
+    try testing.fuzz({}, fuzzParseMessage, .{ .corpus = &.{
+        "{\"id\":\"msg_1\",\"model\":\"m\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}",
+        "{\"content\":[{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"n\",\"input\":{}}],\"usage\":{\"input_tokens\":1e300}}",
+        "{\"content\":[1,2,3],\"stop_details\":{\"category\":5}}",
+    } });
 }
 
 fn fuzzParseStreamEvent(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len = smith.slice(&buf);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     _ = parseStreamEvent(arena.allocator(), buf[0..len]) catch return;
 }
 test "fuzz parseStreamEvent never panics" {
-    try testing.fuzz({}, fuzzParseStreamEvent, .{});
+    try testing.fuzz({}, fuzzParseStreamEvent, .{ .corpus = &.{
+        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
+        "{\"type\":\"content_block_stop\",\"index\":4294967296}",
+        "{\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":-1}}}",
+        "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}",
+    } });
 }

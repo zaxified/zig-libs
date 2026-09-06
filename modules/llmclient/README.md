@@ -71,6 +71,16 @@ prompts are all on `MessageRequest` — see `src/types.zig` for the full
 shape and the `textBlock`/`thinkingBlock`/`toolUseBlock`/`toolResultBlock`
 content-block constructors.
 
+**Knobs on `Client`, and what each one bounds** (defaults in brackets):
+`max_response_bytes` [10 MiB] — a buffered body's bytes on the wire;
+`max_parsed_bytes` [64 MiB] — the memory one response or one stream event
+may cost to parse (`error.ResponseTooLarge` past it — this is the one that
+protects you, the wire cap alone does not); `max_event_bytes` [1 MiB] —
+one SSE dispatch group; `read_timeout_ms` [60 s] — the body read
+(`error.Timeout`; the transport's `total_timeout_ms` stops at the response
+head). The key is sent to `base_url` only: a 3xx is `error.UnexpectedStatus`,
+never followed.
+
 ## Design notes
 
 - **Polymorphic wire shapes vs. `std.json`'s union encoding.** Anthropic's

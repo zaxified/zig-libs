@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — **The key stays at `base_url`, the wire's numbers are checked, and
+  what the peer sends is bounded in the quantity that costs.** The five HIGH findings
+  of the A1 audit (2026-09-06), plus F9/F10/F15.
+  - **BEHAVIOURAL, not breaking — redirects are never followed (F1).** A 3xx from
+    `base_url` is `error.UnexpectedStatus` with its body in `lastErrorBody`. Before,
+    one `Location:` sent `x-api-key` and the whole prompt to the host the peer named,
+    and `create` returned `OK`. The API never answers 3xx; a proxy that does was
+    getting the key forwarded through it.
+  - **`error.MalformedResponse` instead of a panic (F2):** a content-block `index`
+    above `u32`, or a `usage` count that is negative, ≥ 2^64 or non-finite, was
+    `@intCast`/`@intFromFloat` on the raw value — exit 134 in Debug/ReleaseSafe, a
+    wrong `index`/billing number in ReleaseFast.
+  - **New knobs, new error `ResponseTooLarge`:** `max_parsed_bytes` [64 MiB] bounds
+    the memory a response's or an event's parse may allocate (F5: 7.8 MB under the
+    10 MiB wire cap parsed into 310 MiB and returned `OK`); `max_event_bytes` [1 MiB]
+    bounds one SSE dispatch group (F3: 10 MB of legal 4 KiB lines in one group →
+    2.4 GB live, kept after the error — the buffers are released now, F15);
+    `read_timeout_ms` [60 s] bounds the body read on `create` and each `next()`
+    (F4: a one-byte-a-second peer held `create` 30 s against a 2 s total timeout).
+    `http`'s `BodyTooLarge` also maps to `ResponseTooLarge` now rather than
+    `HttpFailed`. `EventIterator` gained an `io` field (copied from the transport).
+  - `lastErrorBody` after `stream` keeps the first 512 bytes of a longer error body
+    instead of returning null (F10).
+  - The three fuzz harnesses use `smith.slice` and carry seeds (F9).
+
 - **2026-08-22** — `EventIterator.next` now surfaces a canceled SSE body read as
   `Error.Canceled`, closing the gap the previous entry (below) flagged and left
   open. `http.Client.Response` gained a public `readFailure()` accessor (an

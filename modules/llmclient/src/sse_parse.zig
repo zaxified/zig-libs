@@ -36,6 +36,13 @@ pub const Error = error{
     ReadFailed,
     /// A single line exceeded the reader's buffer capacity.
     LineTooLong,
+    /// One dispatch group's joined `data:` payload exceeded
+    /// `Parser.max_data_bytes` — the only bound the accumulator has on the
+    /// memory a peer can make it hold (each `data:` line is bounded by the
+    /// reader, the number of lines in a group was not: measured
+    /// 2026-09-06, 10.0 MB of legal 4 KiB lines in one group → 2.40 GB
+    /// live, and the buffer kept its capacity after the error).
+    DataTooLarge,
     OutOfMemory,
 };
 
@@ -64,6 +71,16 @@ pub const Parser = struct {
     event_buf: std.ArrayList(u8),
     id_buf: std.ArrayList(u8),
     data_buf: std.ArrayList(u8),
+    /// Cap on one group's joined `data:` payload (the `\n`-joined lines,
+    /// terminator included); `error.DataTooLarge` past it, and the
+    /// buffers are released so the failed group's memory does not stay
+    /// pinned for the parser's lifetime. Set it after `init`. The default
+    /// is generous for any single API event (which is one line under the
+    /// reader's own ~4 KiB line bound) and small against the 240×
+    /// amplification a many-line group achieved before the cap existed.
+    max_data_bytes: usize = default_max_data_bytes,
+
+    pub const default_max_data_bytes: usize = 1 << 20;
 
     pub fn init(reader: *std.Io.Reader, gpa: std.mem.Allocator) Parser {
         return .{
@@ -80,6 +97,15 @@ pub const Parser = struct {
         p.id_buf.deinit(p.gpa);
         p.data_buf.deinit(p.gpa);
         p.* = undefined;
+    }
+
+    /// Give the accumulated buffers' capacity back to `gpa`. Called on
+    /// `DataTooLarge`, and available to a caller that wants an idle
+    /// parser to hold nothing between events.
+    pub fn releaseBuffers(p: *Parser) void {
+        p.event_buf.clearAndFree(p.gpa);
+        p.id_buf.clearAndFree(p.gpa);
+        p.data_buf.clearAndFree(p.gpa);
     }
 
     /// Read and accumulate lines until a dispatch (a data-bearing group
@@ -118,6 +144,10 @@ pub const Parser = struct {
                     p.event_buf.clearRetainingCapacity();
                     try p.event_buf.appendSlice(p.gpa, val);
                 } else if (std.mem.eql(u8, field, "data")) {
+                    if (val.len + 1 > p.max_data_bytes - p.data_buf.items.len) {
+                        p.releaseBuffers();
+                        return error.DataTooLarge;
+                    }
                     try p.data_buf.appendSlice(p.gpa, val);
                     try p.data_buf.append(p.gpa, '\n');
                 } else if (std.mem.eql(u8, field, "id")) {
@@ -215,6 +245,30 @@ test "Parser: malformed retry is ignored, not fatal" {
     try testing.expectEqualStrings("ok", e.data);
 }
 
+test "Parser: a group whose joined data exceeds max_data_bytes is DataTooLarge, and the buffer is released (A1 F3)" {
+    // 300 legal 40-byte `data:` lines in ONE group: each line is well under
+    // any per-line bound, the group is not.
+    const line = "data: 0123456789012345678901234567890123\n";
+    const wire = line ** 300 ++ "\n";
+    var reader: std.Io.Reader = .fixed(wire);
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    p.max_data_bytes = 4096;
+    try testing.expectError(error.DataTooLarge, p.next());
+    try testing.expectEqual(@as(usize, 0), p.data_buf.capacity);
+    // Exactly at the cap is fine: 100 lines × (34 + 1) = 3500 ≤ 4096.
+    var reader2: std.Io.Reader = .fixed(line ** 100 ++ "\n");
+    var p2 = Parser.init(&reader2, testing.allocator);
+    defer p2.deinit();
+    p2.max_data_bytes = 3500;
+    const e = (try p2.next()).?;
+    try testing.expectEqual(@as(usize, 3499), e.data.len);
+    p2.max_data_bytes = 3499;
+    var reader3: std.Io.Reader = .fixed(line ** 100 ++ "\n");
+    p2.reader = &reader3;
+    try testing.expectError(error.DataTooLarge, p2.next());
+}
+
 test "Parser: stream cut mid-group surfaces error.EndOfStream" {
     var reader: std.Io.Reader = .fixed("event: message_start\ndata: partial");
     var p = Parser.init(&reader, testing.allocator);
@@ -235,8 +289,7 @@ test "Parser: clean close between groups returns null" {
 
 fn fuzzParserNext(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len = smith.slice(&buf); // not `bytes` + a ranged length: that always yields 0
     var reader: std.Io.Reader = .fixed(buf[0..len]);
     var p = Parser.init(&reader, testing.allocator);
     defer p.deinit();
@@ -246,5 +299,8 @@ fn fuzzParserNext(_: void, smith: *std.testing.Smith) !void {
     }
 }
 test "fuzz Parser.next never panics" {
-    try testing.fuzz({}, fuzzParserNext, .{});
+    try testing.fuzz({}, fuzzParserNext, .{ .corpus = &.{
+        "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+        "data: a\ndata: b\r\nid: x\x00y\nretry: 12\n\n: comment\n\ndata: partial",
+    } });
 }
