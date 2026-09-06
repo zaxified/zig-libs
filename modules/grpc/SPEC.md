@@ -317,29 +317,39 @@ Fourteen mutations were applied to the implementation and the whole suite re-run
 in full, and once with the interop tests forced to skip (`GRPC_PYTHON` pointed at a nonexistent
 interpreter), which answers "what would we know *without* the reference?".
 
-⚠ Both columns date from before 2026-09-06, when the anchor was live-only and skippable. Since
-the split (`tools/interop.zig` + `src/reference_replay.zig`) the "Offline-only" column no longer
-describes any reachable configuration of `test-grpc`: the reference's evidence is replayed from
-a committed recording, so the lane that used to be the left column now carries most of the right
-one. The rows are kept because what each mutation *is*, and which layer catches it, has not
-changed — only where the catching happens. A re-run against the replay is owed.
+✅ **Re-run against the replay, 2026-09-06.** The "Offline-only" column above was retired: it
+named a `test-grpc` configuration (interop forced to skip) that no longer exists — `test-grpc`
+is now always hermetic and always includes the replayed reference evidence, so there is exactly
+one number per mutation, not two. It is replaced by **`test-grpc` (replay)**, measured directly:
+each mutation applied to a clean tree, `./scripts/capped zig build test-grpc --summary all` run
+(119 tests total), the failure/crash counts read off the summary, then `git checkout` to restore
+before the next one. A no-op control (an added comment, no behavior change) was run first and
+last and stayed green both times (119/119), so the runner itself is not the thing that changed
+between rows. Every one of the 22 mutations below was caught — the suite went red — and every
+one compiled cleanly (`grep`-checked for `\.zig:[0-9]+:[0-9]+: error:` in each log; none found).
+The old "Full suite" column is kept for its historical value (it is not something this pass
+re-verified, since `interop-grpc` spawns a real Python peer and was out of scope here) but note
+one thing it gets wrong now: mutations 1, 2 and S3 no longer **hang**. A live `grpcio` peer
+genuinely blocked forever on a five-byte prefix claiming an enormous length; the replay has no
+socket to hang on — it just reads the recorded bytes back and the byte-golden assertions fail
+immediately. The mutation still dies, just by a different mechanism.
 
-| # | Mutation | Offline-only | Full suite |
+| # | Mutation | Full suite (historical, live) | `test-grpc` (replay, 2026-09-06) |
 |---|---|---|---|
-| 1 | LPM length little-endian, **consistently** in writer and reader | 9 tests | **hangs** |
-| 2 | Compressed flag after the length, **consistently** in both halves | 12 tests | **hangs** |
-| 3 | A split message handed over short instead of waited for | 6 tests | 7 (+ live reassembly) |
-| 4 | `grpc-status` read from the response headers, not the trailers | 8 tests | 17 (+ 9 live) |
-| 5 | Trailers-Only not detected (an error reads as an empty body) | 3 tests | 5 (+ 2 live) |
-| 6 | A non-OK status not raised as an error | 3 tests | 6 (+ 3 live) |
-| 7 | `max_recv_message_size` not enforced | 9 tests | 10 (+ live limit) |
-| 8 | `grpc-status` parsed leniently (`parseInt` with no prescan) | 3 tests | 3 |
-| 9 | `grpc-message` passed through raw, not percent-decoded | 2 tests | 3 (+ live failure) |
-| 10 | `-bin` metadata sent raw instead of base64 | 2 tests | 3 (+ live metadata) |
-| 11 | `te: trailers` omitted from the request | 1 test | 13 (+ **all 12 live**) |
-| 12 | `grpc-timeout` rounded down instead of up | 1 test | 1 |
-| 13 | Response `content-type` not validated | 1 test | 1 |
-| 14 | A stream ending mid-message accepted as a clean end | 3 tests | 3 |
+| 1 | LPM length little-endian, **consistently** in writer and reader | **hangs** | 23 fail, 1 crash |
+| 2 | Compressed flag after the length, **consistently** in both halves | **hangs** | 27 fail, 1 crash |
+| 3 | A split message handed over short instead of waited for | 7 (+ live reassembly) | 8 fail, 1 crash |
+| 4 | `grpc-status` read from the response headers, not the trailers | 17 (+ 9 live) | 18 fail |
+| 5 | Trailers-Only not detected (an error reads as an empty body) | 5 (+ 2 live) | 5 fail (+1 leak) |
+| 6 | A non-OK status not raised as an error | 6 (+ 3 live) | 6 fail |
+| 7 | `max_recv_message_size` not enforced | 10 (+ live limit) | 4 fail (+2 leaks) |
+| 8 | `grpc-status` parsed leniently (`parseInt` with no prescan) | 3 | 3 fail |
+| 9 | `grpc-message` passed through raw, not percent-decoded | 3 (+ live failure) | 3 fail |
+| 10 | `-bin` metadata sent raw instead of base64 | 3 (+ live metadata) | 4 fail, 1 crash |
+| 11 | `te: trailers` omitted from the request | 13 (+ **all 12 live**) | 1 crash |
+| 12 | `grpc-timeout` rounded down instead of up | 1 | 1 fail |
+| 13 | Response `content-type` not validated | 1 | 1 fail |
+| 14 | A stream ending mid-message accepted as a clean end | 3 | 4 fail |
 
 Every mutation died, and none of them needed the reference to die — which is the point of how
 the offline suite is written, not a sign that the anchor is redundant. Mutations 1, 2 and 10 are
@@ -361,19 +371,37 @@ clean error from the network; it gets silence.
 
 ### Mutation testing — the server
 
-Eight more, same protocol (full run, then a run with the live tests forced to skip). "Offline"
-counts exclude the 13 then-skippable live tests — see the ⚠ above: those 13 no longer skip.
+Eight more, same protocol. The "Offline-only" column is retired for the same reason as the
+client table above — replaced by `test-grpc` (replay), measured 2026-09-06 the same way (clean
+mutation, `./scripts/capped zig build test-grpc --summary all`, counts read off the summary,
+restore, repeat; no-op control green before and after). All eight died; none failed to compile.
 
-| # | Mutation | Offline-only | Full suite |
+**S7 needs a caveat the client mutations do not.** The SPEC previously recorded S7 as the sharpest
+result in the file: turning the streaming predicate off killed **zero** offline tests, because the
+old offline harness staged the whole request before the server ran — a body buffered to
+END_STREAM read back identically. Only a *live* run caught it, and only because the interleaved
+bidirectional call genuinely deadlocked (our server waiting for END_STREAM, the reference waiting
+for a reply before sending the next request, neither moving). The replay is not live traffic — it
+is recorded bytes fed back with no real concurrency — so it **cannot** reproduce that deadlock
+either, live-only property or not. What it caught instead is a different, real consequence of the
+same mutation: with every request now buffered ahead of dispatch, the 128 KiB-over-a-64-KiB-limit
+request (`toolarge.code`) no longer gets a clean `RESOURCE_EXHAUSTED` — buffering hits a
+transport-level body limit before the gRPC deframer ever sees the frame, and the assertion fails
+with "no grpc-status on the response at all". So the suite does go red under replay, but not
+because the interleaved-deadlock property became visible offline; that property is still provably
+invisible without a live, genuinely concurrent peer, and remains this repository's argument for
+keeping `interop-grpc` as a pre-release check rather than retiring it now that replay exists.
+
+| # | Mutation | Full suite (historical, live) | `test-grpc` (replay, 2026-09-06) |
 |---|---|---|---|
-| S1 | `grpc-status` set as a response **header** instead of a trailer | 8 tests | 9 (+ live) |
-| S2 | The Trailers-Only path emits a trailer section as well | 10 tests | 10 (**live: no**) |
-| S3 | LPM length little-endian, **consistently** in writer and reader | 12 tests | **hangs** |
-| S4 | A non-OK status never reaches the client (always `0`) | 10 tests | 11 (+ live) |
-| S5 | `max_recv_message_size` not applied to request messages | 2 tests | 3 (+ live) |
-| S6 | Trailers-Only decided by "the call failed", not "nothing sent yet" | 2 tests | 3 (+ live) |
-| S7 | Request bodies buffered to END_STREAM (streaming predicate off) | **0 tests** | 1 (**live only**) |
-| S8 | A non-gRPC `content-type` accepted instead of answered 415 | 1 test | 1 (**live: no**) |
+| S1 | `grpc-status` set as a response **header** instead of a trailer | 9 (+ live) | 4 fail, 7 crash |
+| S2 | The Trailers-Only path emits a trailer section as well | 10 (**live: no**) | 11 fail |
+| S3 | LPM length little-endian, **consistently** in writer and reader | **hangs** | 23 fail, 1 crash |
+| S4 | A non-OK status never reaches the client (always `0`) | 11 (+ live) | 12 fail |
+| S5 | `max_recv_message_size` not applied to request messages | 3 (+ live) | 3 fail |
+| S6 | Trailers-Only decided by "the call failed", not "nothing sent yet" | 3 (+ live) | 2 fail, 1 crash |
+| S7 | Request bodies buffered to END_STREAM (streaming predicate off) | 1 (**live only**) | 1 fail (different cause — see above) |
+| S8 | A non-gRPC `content-type` accepted instead of answered 415 | 1 (**live: no**) | 1 fail |
 
 Every one died. Four of them are worth reading closely, because they are the ones that say
 something about *how* the suite is written rather than that it exists.
@@ -406,7 +434,9 @@ reply N before sending request N+1, neither moves, and the reference reports `UN
 "Stream removed (Socket closed)"` after its watchdog fires. That is why the reference client's
 bidirectional generator is written to withhold its next request until the previous reply lands —
 a shape that "works" against a cooperative peer that sends everything up front is not the same
-as one that works.
+as one that works. This is still true of the replay lane added 2026-09-06 — see the caveat above
+the mutation table: replay has no live concurrency to deadlock, so it cannot see this specific
+property either, though the same mutation does turn the replay suite red for an unrelated reason.
 
 S3 confirms on the server what the client mutations already showed, and adds one thing: a
 consistently little-endian length is invisible to every round trip and dies to the tests that
