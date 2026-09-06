@@ -289,5 +289,5 @@ test {
     _ = @import("call_test.zig");
     _ = @import("adversarial.zig");
     _ = server_mod;
-    _ = @import("reference_interop.zig");
+    _ = @import("reference_replay.zig");
 }

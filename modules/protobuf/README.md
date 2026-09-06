@@ -136,22 +136,28 @@ const forwarded = try protobuf.encodeAlloc(gpa, partial.value, .{}); // still ca
 ## Verify
 
 ```bash
-zig build test-protobuf --summary all      # 59 tests
+zig build test-protobuf --summary all      # 65 tests, none of them skipped
 ```
 
-The interop tests (`reference_interop.zig`) drive the **Python `protobuf` package** (Google's own
-implementation) as an external oracle: schemas are built at run time from `descriptor_pb2` +
-`descriptor_pool` + `message_factory`, so neither a `.proto` file nor `protoc` is needed. They
-compare our bytes with the reference's byte-for-byte, decode the reference's bytes with ours, and
-hand the reference shapes it would never emit itself. They **skip loudly** (never silently, never
-as a failure) when `python3` or the package is missing — set `ZIG_LIBS_VERBOSE_SKIP=1` to see the
-reason.
+**The suite is hermetic.** It needs no python3, no subprocess and no network, and it has no skip
+path — every test runs on every machine, including CI.
 
-`golden_test.zig` freezes the same anchor for every machine that lacks the reference package
-(including CI, which always does): 36 cases' worth of bytes that the reference package actually
-produced were captured once into `testdata/golden_bytes.zig` and are checked byte-for-byte both
-ways — no python3, no subprocess, no skip path. See that file's doc comment for the exact
-capture recipe and for what stays live-only and why.
+The anchor is still the **Python `protobuf` package** (Google's own implementation), but it is now
+consulted by a separate program rather than from inside the suite:
+
+```bash
+zig build interop-protobuf                 # live, needs `pip install protobuf`
+zig build interop-protobuf -- --capture    # re-freeze the fixtures from it
+```
+
+`tools/interop.zig` builds descriptors at run time from `descriptor_pb2` + `descriptor_pool` +
+`message_factory` (no `.proto` file, no `protoc`), compares our bytes with the reference's byte for
+byte, decodes the reference's bytes with ours, and hands the reference shapes it would never emit
+itself. `--capture` writes what it observed into two committed fixtures — `testdata/golden_bytes.zig`
+(the reference's encoder output for all 36 canonical cases) and `testdata/interop_vectors.zig` (the
+reference's parser verdict on the 8 non-canonical byte strings) — and `golden_test.zig` +
+`interop_replay_test.zig` replay both. `zig build check-interop` compiles the program without
+running it, so it cannot rot unnoticed.
 
 ## Not implemented
 

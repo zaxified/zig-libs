@@ -5,6 +5,52 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — **The external anchor moved out of the module and its evidence moved in.**
+  `src/reference_interop.zig` spawned Python `grpcio` from inside `test-grpc` and
+  `@embedFile`d `src/testdata/reference_server.py` / `reference_client.py` into module
+  source. Two things were wrong with that. A `zig-libs` module is standalone Zig with no
+  external dependency, and this one shipped 16 KB of foreign-driving Python to every
+  consumer. Worse, the 13 live tests **skipped loudly** when the interpreter was missing —
+  and a skip is a pass, so on any host without `grpcio` the module's strongest evidence
+  evaporated without a sound.
+
+  The split:
+
+  - `tools/interop.zig` is now a standalone PROGRAM (`zig build interop-grpc`). It spawns
+    `tools/reference_server.py` / `tools/reference_client.py` **from their own path** — no
+    `@embedFile` — compares live in both directions, and is never compiled into `test-grpc`
+    or into `zig build`. `zig build check-interop` compiles it and runs no peer. A missing
+    `grpcio` exits 2 with instructions, never a silent pass.
+  - `zig build interop-grpc -- --capture` records **every byte the reference put on the
+    wire** into `src/testdata/grpcio/*.bin`, with the manifest `src/testdata/grpcio_capture.zig`
+    naming the implementation (`Python grpcio 1.83.0 / protobuf 7.35.1`), the date, the exact
+    command, and what had to be pinned for replay to be deterministic (one connection per
+    forward case so stream ids and the HPACK dynamic table restart; the reference's own
+    `grpc-timeout` rendering; the reverse direction's advertised SETTINGS).
+  - `src/reference_replay.zig` replays it inside the ordinary test lane: pure Zig, no child
+    process, no socket, no foreign source. Both directions are covered — the reference
+    server's bytes parsed by our client, and the reference client's bytes fed to our server
+    through the same `h2_server.serve` entry point the capture ran on. The reverse
+    assertions are checked against `grpcio`'s own readings, captured alongside as
+    `src/testdata/grpcio/reverse_report.txt`, so they are the reference's numbers and not
+    hand-typed ones.
+
+  **Coverage did not shrink.** Every one of the 15 old tests has a replay: 12 forward
+  interactions (the three `grpc-timeout` calls, previously three calls on one connection,
+  are now three recordings — see the note in `tools/interop.zig` on why a recording of
+  sequential calls cannot be replayed on one connection; `multiplex` keeps the
+  several-calls-one-connection coverage), the 28-observation reverse run, and the two frozen
+  byte constants from 2026-08-08. `test-grpc` went from **15 tests of which 13 skipped
+  without `grpcio`** to **119 tests, 0 skipped**, verified on a `PATH` with no `python3`,
+  no `go` and a `HOME` without the virtualenv.
+
+  What replay cannot carry, stated rather than papered over: `grpcio`'s *parser* running on
+  freshly produced bytes. A genuinely NEW divergence in the reverse direction is still only
+  findable by `zig build interop-grpc`, which is now a pre-release check.
+
+  **No API change.** `src/testdata/reference_{client,server}.py` are gone from the module;
+  `zig build interop-grpc` and `zig build check-interop` are new entry points.
+
 - **2026-08-21** — Published `statusParse` and the `grpc-message` percent-codec
   (`statusDecodeMessage`, `statusDecodeMessageAlloc`, `statusEncodeMessage`,
   `statusEncodedMessageLen`). They existed and were `pub` inside the module, but the

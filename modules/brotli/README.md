@@ -57,13 +57,27 @@ reference vectors byte-exact (empty, static-dictionary, complex-Huffman
 that must never panic, and output-cap enforcement.
 
 On the encoder side the tests are anchored **outside this repository**: every
-stream it produces is decompressed by the reference implementation (google/
-brotli via Python `brotli`), across a property sweep of input shapes — empty,
-single byte, one-byte runs sized around the length-code boundaries, 1..5-symbol
-alphabets flat and skewed, every byte value, incompressible random, text, and
-multi-meta-block streams mixing compressed and stored blocks. Those tests skip
-loudly (never silently, never as a failure) when python3 or the `brotli`
-package is unavailable; run with `ZIG_LIBS_VERBOSE_SKIP=1` to see the reason.
+stream it produces has been decompressed by the reference implementation
+(google/brotli via Python `brotli`), across a property sweep of 45 input shapes
+— empty, single byte, one-byte runs sized around the length-code boundaries,
+1..5-symbol alphabets flat and skewed, every byte value, incompressible random,
+text, and multi-meta-block streams mixing compressed and stored blocks.
+
+That comparison is a separate program, not part of the suite:
+
+```bash
+zig build interop-brotli                 # live, needs `pip install brotli`
+zig build interop-brotli -- --capture    # re-freeze the fixtures from it
+```
+
+The suite itself is **hermetic** — no python3, no subprocess, no skip path. It
+replays what the capture froze: `src/testdata/ref/*.br` are 24 streams the
+reference compressed (five qualities on `alice29.txt`, three window sizes, and
+both extremes of quality over the rest of the corpus) which our decoder must
+turn back into the plaintext, and `src/testdata/interop_blessed.zig` pins the
+digest of the exact stream google/brotli accepted for each of the 45 shapes. An
+encoder change therefore fails the suite until it is re-blessed against a real
+google/brotli — which is the point of an anchor.
 The writer's own pieces — the complex-prefix-code header, the `16`/`17` repeat
 chains, length-limited Huffman, and the command/distance code tables — are unit
 tested against the decoder's own `BitReader`, `huffman.zig` and `tables.zig`.

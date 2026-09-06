@@ -99,6 +99,15 @@ pub const Decoded = decode_mod.Decoded;
 /// `deinit()`.
 pub const decode = decode_mod.decode;
 
+// ── conformance corpus (not part of the codec API) ──────────────────────────
+
+/// The message fixtures and case tables the interop program and the module's
+/// own frozen replay share, plus the frozen record itself. Public for exactly
+/// one reason: `tools/interop.zig` is a separate program and cannot `@import`
+/// a path inside this module, so the one shared table has to be reachable
+/// from the module root. Nothing here is part of the codec API.
+pub const conformance = @import("conformance.zig");
+
 test {
     // Every submodule's tests, explicitly — a `pub const` re-export does not
     // pull them in (CONVENTIONS.md §6.3, the dark-tests rule).
@@ -108,8 +117,8 @@ test {
     _ = decode_mod;
     _ = @import("codec_test.zig");
     _ = @import("adversarial.zig");
-    _ = @import("reference_interop.zig");
     _ = @import("golden_test.zig");
+    _ = @import("interop_replay_test.zig");
 }
 
 test "readme example round trips" {

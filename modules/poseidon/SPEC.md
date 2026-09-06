@@ -205,7 +205,7 @@ What stands in its place, and what it is worth:
 | evidence | what it does prove | what it does NOT |
 |---|---|---|
 | `constants_test.zig` — 18 shipped tables byte-identical to circomlib / the authors' sage, plus `mds_candidates == 1` | adding the checks changed nothing that is externally pinned | that a *rejection* is handled correctly — none occurs |
-| `reference_interop.zig` — an independent sympy port of the four algorithms, fed matrices over `GF(101)`/`GF(251)` where rejections are common (19 of 168), compared on the verdict, the **sub-code** and the failing round | transcription fidelity, on inputs that actually fail | anything about a *shared misreading* of the sage source: both ports are ours |
+| `src/mds_replay_test.zig` + `src/testdata/mds_subspace_trail.txt` — 182 matrices over `GF(101)`/`GF(251)`/BN254 where rejections are common (19 of the 168 random ones), with an independent sympy port's verdict, **sub-code** and failing round captured per matrix and replayed with no Python | transcription fidelity, on inputs that actually fail, on every host | anything about a *shared misreading* of the sage source: both ports are ours |
 | `rejection_test.zig` — `derive` over `GF(101)`, accepted matrix is the k-th draw and differs from the first | the loop advances the Grain stream, which is the failure mode that looks correct | — |
 | the equivalence tests in `mds_security.zig` — fast path vs the literal transcription | the two `O(t^3)` rewrites (see that file) are not doing something else | — |
 
@@ -213,6 +213,23 @@ The sympy oracle is **not** external validation and is not described as such
 anywhere. It is a second transcription of the same text by the same author; it
 catches an index slip and it cannot catch a misread specification. sage is not
 installed on the development host and installing it was out of scope.
+
+**Where it runs, since 2026-09-06.** The oracle is a program in `tools/`, not a
+test: `tools/interop.zig` builds the 182 matrices, drives `tools/subspace_trail.py`
+and writes what it said — matrix and verdicts, per case — into
+`src/testdata/mds_subspace_trail.txt`, with the driver, the Python and sympy
+versions, the capture date and the capture command in the header. The module's
+own `src/mds_replay_test.zig` replays that transcript and spawns nothing, so the
+comparison asserts on every host; before the split it skipped wherever sympy was
+missing, which on a `continue-on-error` CI install meant it might assert nothing
+at all. The verdicts are a pure function of `(p, t, matrix)` — the four
+algorithms take no randomness, time or environment — so the transcript needs no
+determinism pinning beyond recording the matrices, which it does in full. The
+replay regenerates every matrix from this module's own code and requires it to
+equal the recorded one, and a coverage test pins the 12 batch names and the
+total of 182, so the transcript cannot drift into pinning inputs nobody produces
+or shrink quietly. Only the live program can see the *peer* change; that is what
+`zig build interop-poseidon` is for, as a pre-release check.
 
 ### Mutation — evidence the tests bite
 
@@ -224,7 +241,7 @@ from a pristine copy, never `git checkout`).
 
 | mutation | result |
 |---|---|
-| `algorithm_1` tests `M^(i+1)` where the reference tests `M^i` | **caught** — the constructed sub-code batch in `reference_interop.zig` |
+| `algorithm_1` tests `M^(i+1)` where the reference tests `M^i` | **caught** — the constructed sub-code batch (`gf101_constructed_t3`/`_t4`) |
 | `algorithm_1`'s sub-codes 2 and 3 swapped | **caught** — the code-2 unit test and the oracle's sub-code comparison |
 | `IS` accumulates the whole eigenspace instead of `S_i ∩ E_λ` | **caught** — 6 tests, incl. fast-vs-literal agreement and every random-matrix oracle batch |
 | `algorithm_3`'s divisor reduction inverted (`r` in `[2, 2t]` instead of `(2t, 4t]`) | **caught** — 4 tests, incl. `rejection_test` and the oracle |

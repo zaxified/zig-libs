@@ -443,10 +443,9 @@ test {
     _ = @import("filters.zig");
     _ = @import("diag.zig");
     _ = @import("engine_test.zig");
-    _ = @import("corpus.zig");
-    _ = @import("golden_test.zig");
+    _ = @import("conform.zig");
+    _ = @import("reference_replay_test.zig");
     _ = @import("bench.zig");
-    _ = @import("reference_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("loader.zig");
     _ = @import("loader_test.zig");

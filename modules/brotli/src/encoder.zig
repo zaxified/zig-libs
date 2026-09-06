@@ -35,8 +35,10 @@
 //! `decodeCompressedMetablock` / `readComplexHuffman` / `runCommands`. Because
 //! a writer and a reader can share a misreading of RFC 7932 and still round
 //! trip perfectly, correctness is anchored *outside* this repository: see
-//! `reference_interop.zig`, which pushes this encoder's output through the
-//! reference implementation (google/brotli via Python `brotli`).
+//! `tools/interop.zig`, which pushes this encoder's output through the
+//! reference implementation (google/brotli via Python `brotli`), and
+//! `interop_replay_test.zig`, which holds the reference's verdict on every
+//! stream it accepted without needing that implementation present.
 
 const std = @import("std");
 const huffman = @import("huffman.zig");
@@ -1032,7 +1034,9 @@ pub fn compress(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Err
 // data. That is enough to catch any mutation of the WRITER, which is what these
 // tests are for; it is NOT enough to catch a misreading of RFC 7932 shared by
 // this file and `decoder.zig`. That class of bug is caught only in
-// `reference_interop.zig`, where google/brotli decodes what we emit.
+// `tools/interop.zig`, where google/brotli decodes what we emit — and, once
+// captured, in `interop_replay_test.zig`, which pins the digest of every
+// stream it accepted.
 // ===========================================================================
 
 const testing = std.testing;

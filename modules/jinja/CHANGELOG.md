@@ -5,6 +5,38 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — The Python oracle leaves the module. `src/reference_test.zig`
+  `@embedFile`d the Jinja2 driver into module source and spawned `python3` from
+  inside `zig build test-jinja`, so every consumer carried foreign source and the
+  live half of the anchor **skipped** — asserting nothing — on any host without
+  jinja2, CI's `continue-on-error` peer install included.
+
+  - the corpus and the driver are now `tools/corpus.zig` and `tools/reference.py`,
+    run only by the new `tools/interop.zig` program (`zig build interop-jinja`,
+    `-- --capture`), which `zig build check-interop` compiles and never runs;
+  - `src/testdata/golden.json` becomes a self-describing transcript: all **351**
+    cases, each carrying the inputs the reference was given (template, loader
+    templates, JSON context, and the autoescape / undefined / whitespace knobs)
+    next to the bytes it returned — where before it held outputs alone and leaned
+    on `src/corpus.zig` for the inputs;
+  - its header now records the Jinja2 **and MarkupSafe** versions, the Python
+    version, the capture date and command, and a `determinism` block: the pinned
+    child environment (`PYTHONHASHSEED=0`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`), the
+    float repr style, the delimiters, the loaded extensions (none) and Jinja's
+    whole `policies` table;
+  - `src/golden_test.zig` becomes `src/reference_replay_test.zig` and replays it
+    with **no `python3` anywhere**. Coverage is unchanged at 351 of 351 cases
+    compared byte for byte; `test-jinja` goes from 74 tests with 3 skipped on a
+    Python-less host to **72 tests with 1 skipped** — and that one is the
+    env-gated benchmark, not conformance.
+  - the replay refuses to shrink: it fails below 351 cases, requires unique
+    names, requires every entry to carry its inputs, requires the corner counts
+    the corpus exists for (≥50 with a loader, ≥30 the reference refuses, ≥35
+    autoescaped), and requires the provenance header.
+
+  `src/conform.zig` now decodes a case from the transcript instead of reading a
+  Zig table; no published API changed.
+
 - **2026-09-02** — Drift re-audit (W2, window `d163578..HEAD`). Thirteen findings, all fixed:
 
   - **CRITICAL, escaping:** `xmlattr` did not validate attribute *names*. `escapeTo` is

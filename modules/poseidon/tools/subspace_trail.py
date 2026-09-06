@@ -5,6 +5,13 @@ checks — `algorithm_1`, `algorithm_2`, `algorithm_3` and
 sympy's `DomainMatrix` over `GF(p)`, standing in for sage's `VectorSpace`/
 `matrix` when sage is not installed.
 
+WHERE THIS LIVES AND WHY. `modules/poseidon/tools/`, not `src/`: a module in
+this repository is standalone Zig with no external dependency, and this file
+needs a `python3` with `sympy`. It is driven by `tools/interop.zig` and never
+by `zig build test-poseidon`; what it produces is captured once into
+`src/testdata/mds_subspace_trail.txt`, and the module's own hermetic tests
+replay that transcript with no Python anywhere.
+
 WHAT THIS IS AND IS NOT
 -----------------------
 This is a *second transcription of the same sage text*, written to cross-check
@@ -30,14 +37,21 @@ Deliberate independence from the Zig side:
     polynomial is irreducible", which is the shortcut the Zig side proves and
     uses.
 
-Protocol (files in the cwd, so no argv quoting games):
-  in.txt   p / t / count, then `count` matrices of `t` rows of `t` decimal ints
-  out.txt  one line per matrix:
-           `<alg1_secure> <alg1_code> <alg1_round> <alg2> <alg3> <minpoly>`
+Protocol:
+  subspace_trail.py <in> <out>
+     <in>   p / t / count / want_minpoly, then `count` matrices of `t` rows of
+            `t` decimal ints
+     <out>  one line per matrix:
+            `<alg1_secure> <alg1_code> <alg1_round> <alg2> <alg3> <minpoly>`
+  subspace_trail.py --meta
+     prints `<python-version> <sympy-version> <utc-timestamp>` on stdout, which
+     is what the captured transcript's provenance header records.
 """
 
+import datetime
 import sys
 
+import sympy
 from sympy import GF, Poly, symbols
 from sympy.polys.matrices import DomainMatrix
 
@@ -254,8 +268,20 @@ def check_minpoly_condition(m, t, p, K):
 
 # ── driver ──────────────────────────────────────────────────────────────────
 
+def meta():
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print("%s %s %s" % (sys.version.split()[0], sympy.__version__, stamp))
+    return 0
+
+
 def main():
-    tokens = open("in.txt").read().split()
+    if len(sys.argv) > 1 and sys.argv[1] == "--meta":
+        return meta()
+    if len(sys.argv) != 3:
+        print("usage: subspace_trail.py <in> <out> | --meta", file=sys.stderr)
+        return 2
+
+    tokens = open(sys.argv[1]).read().split()
     pos = 0
     p = int(tokens[pos]); pos += 1
     t = int(tokens[pos]); pos += 1
@@ -276,7 +302,7 @@ def main():
         lines.append("%d %d %d %d %d %d" % (
             1 if a1[0] else 0, a1[1], a1[2],
             1 if a2 else 0, 1 if a3 else 0, 1 if mp else 0))
-    with open("out.txt", "w") as fh:
+    with open(sys.argv[2], "w") as fh:
         fh.write("\n".join(lines) + "\n")
     return 0
 

@@ -130,8 +130,9 @@ primitive**: a sender appends a second, near-empty copy of a submessage and ever
 copy set reverts to its type default in front of whatever authorisation or validation decision
 reads the value — while a reference peer, and therefore any filter in front of us, still sees the
 original field. No round trip can see this, because a canonical encoding never emits the shape;
-only a foreign parser can settle it, which is why the case is in `reference_interop.zig` as well as
-in the offline `adversarial.zig`.
+only a foreign parser can settle it, which is why the case is in the interop corpus
+(`conformance.zig`'s `semantic_cases`, replayed offline from the reference's own recorded verdict)
+as well as in `adversarial.zig`.
 
 It is implemented through the equivalence the spec itself states — parsing the concatenation of two
 encodings equals parsing each and merging — so the *payload bytes* are gathered and decoded once
@@ -186,12 +187,13 @@ Four layers, in increasing order of what they can prove.
 2. **Golden bytes hand-derived from the spec** (`codec_test.zig`), including the canonical
    `08 96 01`, the ten-byte negative `int32`, zigzag vectors, little-endian fixed widths, and both
    packing forms.
-3. **The live reference implementation** (`reference_interop.zig`), which is the real anchor. The
-   Python `protobuf` package is Google's own; descriptors are built at run time from
-   `descriptor_pb2` + `descriptor_pool` + `message_factory`, so no `.proto` file and no `protoc`
-   are involved. Its `testdata/reference.py` `CASES` table and the Zig `wide_cases` /
-   `repeated_cases` / `presence_cases` tables mirror each other by name — that shared table is the
-   entire marshalling protocol between the two processes. Three directions run:
+3. **The live reference implementation** (`tools/interop.zig`, run by `zig build interop-protobuf`),
+   which is the real anchor. The Python `protobuf` package is Google's own; descriptors are built
+   at run time from `descriptor_pb2` + `descriptor_pool` + `message_factory`, so no `.proto` file
+   and no `protoc` are involved. Its `tools/reference.py` `CASES` table and the Zig `wide_cases` /
+   `repeated_cases` / `presence_cases` tables in `src/conformance.zig` mirror each other by name —
+   that shared table is the entire marshalling protocol between the two processes. Three
+   directions run:
    - our bytes vs the reference's bytes, **byte for byte** (proto3 field-number ordering makes
      these messages' encodings canonical, so equality is the right assertion, not "it parses");
    - the reference's bytes decoded by us, compared field by field through a comptime-generic
@@ -200,14 +202,21 @@ Four layers, in increasing order of what they can prove.
      — packing flipped in both directions, and a message reassembled out of preserved unknown
      fields.
 
-   Tests skip loudly (`ZIG_LIBS_VERBOSE_SKIP=1` to see why) when python3 or the package is absent
-   — which is every CI run, since nothing in this repository depends on a Python package at build
-   time. A skip is not a failure, but it is also not an anchor: a machine without the package gets
-   none of layer 3's evidence, silently falling back to layers 1-2 alone.
-4. **Frozen reference bytes** (`golden_test.zig` + `testdata/golden_bytes.zig`), which closes that
-   gap. The bytes in `golden_bytes.zig` are not hand-derived — they are
-   `msg.SerializeToString(deterministic=True)` output that the Python `protobuf` package actually
-   produced, captured once (see that file's header for the exact command) and committed. Every
+   Since 2026-09-06 this layer is a PROGRAM, not a test: it is never built by `test-protobuf` and
+   never by `zig build`, so the module ships no foreign source and the suite needs no python3.
+   Before that it was `src/reference_interop.zig`, a test that spawned `python3` and skipped when
+   it was absent — which is every CI run, since nothing in this repository depends on a Python
+   package at build time. A skip is not a failure, but it is also not an anchor: the mess was paid
+   for and the evidence still might not be taken. It is now a pre-release check
+   (`zig build interop-protobuf`), whose findings reach every machine through layer 4.
+4. **Frozen reference bytes** (`golden_test.zig` + `testdata/golden_bytes.zig`, and
+   `interop_replay_test.zig` + `testdata/interop_vectors.zig`), which closes that gap. The bytes in
+   `golden_bytes.zig` are not hand-derived — they are `msg.SerializeToString(deterministic=True)`
+   output that the Python `protobuf` package actually produced, captured by
+   `zig build interop-protobuf -- --capture` and committed. `interop_vectors.zig` is the other half:
+   the reference's own parse of each non-canonical input, re-serialized canonically, so the packing
+   flip, the `MergeFrom` rule and `string`-field UTF-8 rejection are replayed from a foreign
+   parser's verdict rather than re-checked against ourselves. Every
    case in layer 3's tables is checked against them, both directions, with no subprocess and no
    skip path: our encoder must reproduce the frozen bytes, and our decoder must recover the
    matching value from them. This is what layer 3 degrades to when python3 or the package is

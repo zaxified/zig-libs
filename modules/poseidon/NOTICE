@@ -10,7 +10,8 @@ This adds no condition beyond MIT's own: it is the same "preserve the notice"
 requirement that already applies to zig-libs' own code, owed to a different
 author.
 
-## hadeshash reference implementation  (affects: src/grain.zig, src/mds_security.zig)
+## hadeshash reference implementation  (affects: src/grain.zig,
+## src/mds_security.zig, tools/subspace_trail.py)
 
 `src/grain.zig` ports the reference `generate_parameters_grain.sage`: the 80-bit
 Grain LFSR and its seeding (`init_generator`), the round-constant draw
@@ -45,6 +46,13 @@ reproduced here as its terms require:
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
     DEALINGS IN THE SOFTWARE.
+
+`tools/subspace_trail.py` is a SECOND port of the same acceptance checks, on
+sympy, written to cross-check the Zig one; it is this repository's own file
+(MIT) and reproduces no sage source verbatim, but it is derived from the same
+script and is named here for that reason. It is a test instrument: nothing in
+the published module builds it or runs it, and `zig build test-poseidon` never
+spawns it — `src/mds_replay_test.zig` replays a captured transcript instead.
 
 Deliberate divergences from the reference are documented in `src/grain.zig`'s
 module doc (rejection vs reduction in two places, and the Grain output filter's

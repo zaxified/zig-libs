@@ -1,32 +1,30 @@
 // SPDX-License-Identifier: MIT
 
-//! Golden bytes captured ONCE from the reference `google.protobuf` Python
-//! package (the same package `reference.py` drives live) and committed here
-//! so the anchor holds even where python3/the `protobuf` package is not
-//! installed — including CI, which never has it.
+//! Golden bytes captured from the reference `google.protobuf` Python
+//! package -- the same package `tools/reference.py` drives live -- and
+//! committed here so the anchor holds everywhere python3 and the
+//! `protobuf` package are not installed, including CI, which never has it.
 //!
 //! These are not hand-derived: each entry is the literal
 //! `msg.SerializeToString(deterministic=True)` output for the value
-//! `reference.py`'s `CASES` table (or, for `chain3`, its own case) builds
-//! for that name — genuinely produced by Google's own encoder, not by our
-//! reading of the spec. `golden_test.zig` asserts both directions against
-//! them without ever invoking python: our encoder must reproduce these
-//! bytes exactly, and our decoder must recover the matching value from them.
+//! `tools/reference.py`'s `CASES` table builds for that name -- genuinely
+//! produced by Google's own encoder, not by our reading of the spec.
+//! `golden_test.zig` asserts both directions against them without ever
+//! invoking python: our encoder must reproduce these bytes exactly, and
+//! our decoder must recover the matching value from them.
 //!
-//! Captured with `google.protobuf` 4.21.12 (`pip show protobuf`) on
-//! Python 3, via:
+//! DETERMINISM. `deterministic=True` is what makes the capture a pure
+//! function of the case: without it the reference is free to order map
+//! entries (and, historically, unknown fields) however it likes. proto3
+//! field-number order then makes the encoding canonical for these
+//! messages, which is why `golden_test.zig` can assert byte equality
+//! rather than "it parses".
 //!
-//!   cd src/testdata && python3 -c "
-//!   import reference as r
-//!   for name in r.CASES:
-//!       msg = r.make(name)
-//!       print(name, msg.SerializeToString(deterministic=True).hex())
-//!   "
+//! GENERATED FILE -- do NOT hand-edit the byte arrays below. Regenerate:
 //!
-//! Regenerate the same way after changing `reference.py`'s `CASES`/`SCHEMAS`
-//! or `reference_interop.zig`'s case tables — the two must stay in lock
-//! step by name (`golden_test.zig`'s count canary fails loudly if they
-//! drift). Do NOT hand-edit the byte arrays below; regenerate them.
+//!   zig build interop-protobuf -- --capture
+//!
+//! Reference: google.protobuf 4.21.12 on Python 3.14.4, 2026-09-06
 
 const Entry = struct { name: []const u8, bytes: []const u8 };
 
@@ -74,6 +72,6 @@ pub const presence = [_]Entry{
     .{ .name = "pres_str_0", .bytes = &.{ 0x22, 0x00 } },
 };
 
-/// `Chain{depth=1, next=Chain{depth=2, next=Chain{depth=3}}}` — the same
-/// value `reference_interop.zig`'s boxed-recursive-chain test builds.
+/// `Chain{depth=1, next=Chain{depth=2, next=Chain{depth=3}}}` -- the same
+/// value `conformance.zig`'s `chain3` builds.
 pub const chain3: []const u8 = &.{ 0x08, 0x01, 0x12, 0x06, 0x08, 0x02, 0x12, 0x02, 0x08, 0x03 };

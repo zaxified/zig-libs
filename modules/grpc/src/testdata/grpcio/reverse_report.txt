@@ -1,0 +1,35 @@
+unary.text	echo:hello reference
+unary.index	7
+unary.blob	00ff10
+unary.code	OK
+serverstream.texts	tick-0,tick-1,tick-2,tick-3,tick-4
+serverstream.code	OK
+clientstream.text	a|bb|ccc
+clientstream.index	3
+clientstream.code	OK
+bidi.texts	re:one,re:two,re:three
+fail.code	PERMISSION_DENIED
+fail.details_match	1
+fail.details_repr	'boom\nline two ☃ 100% done'
+fail.x_why	because
+streamfail.code	DATA_LOSS
+streamfail.details	gave up after 3
+streamfail.count	3
+unknown.code	UNIMPLEMENTED
+unknown.details	unknown method NoSuchMethod for service echo.Echo
+meta.body_text	probe-value
+meta.body_blob	0001feff0a25
+meta.initial_ascii	probe-value
+meta.initial_bin	0001feff0a25
+meta.trailing_ascii	probe-value
+meta.trailing_bin	0001feff0a25
+meta.tail_not_initial	1
+deadline.band	1
+deadline.raw	30100m
+deadline.none	-1
+big.len	49152
+big.all_5a	1
+toolarge.code	RESOURCE_EXHAUSTED
+empty.count	0
+empty.code	OK
+DONE	1

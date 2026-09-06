@@ -1,14 +1,74 @@
 // SPDX-License-Identifier: MIT
-//! Shared machinery for the two conformance oracles: run one corpus case
-//! through *this* engine, and compare an outcome against a reference outcome.
+//! Shared machinery for the conformance replay: decode one case out of the
+//! committed transcript, run it through *this* engine, and compare the outcome
+//! against the reference's.
 //!
-//! Kept separate so the golden test and the live-peer test agree on what
-//! "rendering a case" means — if that drifted, the two oracles would stop
-//! being about the same thing.
+//! Kept separate from the test that drives it so that "rendering a case" has
+//! one definition — the transcript records the inputs the reference was given,
+//! and this file is where those inputs become a call into the public API. If
+//! the two drifted, the comparison would stop being about the same thing.
+//!
+//! Nothing here spawns anything: the reference's side of every comparison
+//! arrives as bytes from `testdata/golden.json`. See
+//! `reference_replay_test.zig` for how that file is taken.
 
 const std = @import("std");
 const jinja = @import("root.zig");
-const corpus = @import("corpus.zig");
+
+/// An extra template the case's loader can serve, so composition tags have
+/// something to name.
+pub const Tpl = struct {
+    name: []const u8,
+    source: []const u8,
+};
+
+/// One corpus case, exactly as the transcript records the reference having been
+/// given it. The authoring form lives in `tools/corpus.zig`; this is the decoded
+/// form, with slices pointing into the parsed JSON.
+pub const Case = struct {
+    name: []const u8,
+    template: []const u8,
+    /// The loader's contents. Zig builds a `MapLoader`; the reference driver
+    /// built a `DictLoader` from the same table.
+    templates: []const Tpl = &.{},
+    /// The render context, as JSON (so both sides got it verbatim).
+    context: []const u8 = "{}",
+    autoescape: bool = false,
+    /// `true` selected `StrictUndefined` on the Python side and `.strict` here;
+    /// `false` selected the reference's default `Undefined` and `.lenient`.
+    strict: bool = false,
+    trim_blocks: bool = false,
+    lstrip_blocks: bool = false,
+    keep_trailing_newline: bool = false,
+    /// The reference was expected to raise. We then require that we fail too —
+    /// with any error, since the exception *types* are Python's, not ours.
+    expect_error: bool = false,
+};
+
+/// Decodes one entry of the transcript's `cases` array. `arena` owns only the
+/// `templates` slice; every string points into `parsed`.
+pub fn caseFromJson(arena: std.mem.Allocator, v: std.json.Value) !Case {
+    const o = v.object;
+    const tpls = o.get("templates").?.object;
+    var entries = try arena.alloc(Tpl, tpls.count());
+    var it = tpls.iterator();
+    var i: usize = 0;
+    while (it.next()) |e| : (i += 1) {
+        entries[i] = .{ .name = e.key_ptr.*, .source = e.value_ptr.*.string };
+    }
+    return .{
+        .name = o.get("name").?.string,
+        .template = o.get("template").?.string,
+        .templates = entries,
+        .context = o.get("context").?.string,
+        .autoescape = o.get("autoescape").?.bool,
+        .strict = o.get("strict").?.bool,
+        .trim_blocks = o.get("trim_blocks").?.bool,
+        .lstrip_blocks = o.get("lstrip_blocks").?.bool,
+        .keep_trailing_newline = o.get("keep_trailing_newline").?.bool,
+        .expect_error = o.get("expect_error").?.bool,
+    };
+}
 
 pub const Outcome = union(enum) {
     ok: []u8,
@@ -27,7 +87,7 @@ pub const Outcome = union(enum) {
 
 /// Render `c` with this module. The JSON context goes in through
 /// `valueFromJson`, which is also the ingress path a real caller uses.
-pub fn renderCase(gpa: std.mem.Allocator, c: corpus.Case) !Outcome {
+pub fn renderCase(gpa: std.mem.Allocator, c: Case) !Outcome {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -56,22 +116,22 @@ pub fn renderCase(gpa: std.mem.Allocator, c: corpus.Case) !Outcome {
     return .{ .ok = out };
 }
 
-/// One reference result, decoded from the driver's JSON.
+/// One reference result, decoded from the transcript.
 pub const RefOutcome = struct {
     ok: bool,
     out: []const u8 = "",
     kind: []const u8 = "",
 };
 
-pub fn refOutcome(cases: std.json.Value, name: []const u8) ?RefOutcome {
-    const entry = cases.object.get(name) orelse return null;
-    const status = entry.object.get("status").?.string;
-    if (std.mem.eql(u8, status, "ok")) return .{ .ok = true, .out = entry.object.get("out").?.string };
-    return .{ .ok = false, .kind = entry.object.get("kind").?.string };
+pub fn refFromJson(v: std.json.Value) RefOutcome {
+    const o = v.object;
+    if (std.mem.eql(u8, o.get("status").?.string, "ok"))
+        return .{ .ok = true, .out = o.get("out").?.string };
+    return .{ .ok = false, .kind = o.get("kind").?.string };
 }
 
 /// Compare one case, printing enough on failure to debug it without rerunning.
-pub fn expectMatch(gpa: std.mem.Allocator, c: corpus.Case, ref: RefOutcome, label: []const u8) !void {
+pub fn expectMatch(gpa: std.mem.Allocator, c: Case, ref: RefOutcome, label: []const u8) !void {
     const mine = try renderCase(gpa, c);
     defer mine.deinit(gpa);
 

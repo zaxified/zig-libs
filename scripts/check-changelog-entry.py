@@ -223,10 +223,24 @@ TEST_RE = re.compile(r"^\s*test\s+[\"\w]")
 
 
 def git(*args, check=True):
-    p = subprocess.run(["git", *args], capture_output=True, text=True)
+    # ⚠ DECODED LENIENTLY, ON PURPOSE. `text=True` decodes as strict UTF-8 and
+    # RAISES on the first byte that is not — which is not a theoretical worry
+    # here: git calls a file text when its first 8000 bytes hold no NUL, so a
+    # DER certificate or a raw key under `modules/<m>/src/testdata/` lands in
+    # `git diff` as bytes. Found 2026-09-06 by a peer session, on
+    # `modules/dtls/src/testdata/certs/client-key.bin`: the gate died with
+    # UnicodeDecodeError at byte 0xf8 instead of reporting anything, and would
+    # have done the same inside `hooks/pre-commit` for anyone committing with
+    # those files staged. A gate that CRASHES is worse than one that is wrong:
+    # it takes the whole run down and says nothing about the question it was
+    # asked. Replacement characters cannot corrupt the verdict, because the
+    # caller counts lines only for paths ending in `.zig` (see `src_churn`) and
+    # the mangled hunks belong to files it has already skipped.
+    p = subprocess.run(["git", *args], capture_output=True)
     if check and p.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {p.stderr.strip()}")
-    return p.stdout
+        err = p.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git {' '.join(args)} failed: {err}")
+    return p.stdout.decode("utf-8", errors="replace")
 
 
 def test_block_lines(text):
@@ -265,11 +279,16 @@ def blob(rev, path):
             return Path(path).read_text(errors="replace")
         except OSError:
             return ""
+    # Same leniency as `git()` above, and for the same reason: `--staged` reads
+    # blobs straight out of the index, so it meets the raw `.der`/`.bin` bytes
+    # one call earlier than the diff does. This was the second half of the
+    # 2026-09-06 crash and it only shows in the hook's mode, which is exactly
+    # the mode a human runs at commit time.
     if rev == ":":  # the index
-        p = subprocess.run(["git", "show", f":{path}"], capture_output=True, text=True)
+        p = subprocess.run(["git", "show", f":{path}"], capture_output=True)
     else:
-        p = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True, text=True)
-    return p.stdout if p.returncode == 0 else ""
+        p = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True)
+    return p.stdout.decode("utf-8", errors="replace") if p.returncode == 0 else ""
 
 
 class Range:

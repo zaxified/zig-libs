@@ -257,10 +257,30 @@ a header or a trailer?" is unanswerable from field values and trivial from frame
 mutation of the two response paths dies here, including the one the live reference does not
 catch.
 
-**Live interop** (`reference_interop.zig`) is the module's real anchor, and it runs in **both
-directions**:
+**The external anchor** is the module's real evidence, and it runs in **both directions**. Since
+2026-09-06 it runs in two places, for one reason: `test-grpc` used to spawn Python `grpcio` and
+"skip loudly" without it, and a skip is a pass — so on any host without grpcio the strongest
+evidence this module has quietly evaporated, while every consumer of the library still carried
+two `@embedFile`d Python scripts inside `src/`.
 
-- *our client → a Python `grpcio` server* on an ephemeral loopback port: all four call shapes, a
+- **`tools/interop.zig`** (`zig build interop-grpc`) does the *taking*: it spawns
+  `tools/reference_server.py` / `tools/reference_client.py`, talks to them over real sockets, and
+  compares live. It is never compiled into `test-grpc`. `-- --capture` records every byte the
+  reference put on the wire into `src/testdata/grpcio/*.bin` plus the manifest
+  `src/testdata/grpcio_capture.zig` (provenance: which grpcio, which day, which command, what was
+  pinned). `zig build check-interop` compiles it and runs no peer.
+- **`src/reference_replay.zig`** replays that recording in the ordinary test lane — pure Zig, no
+  child process, no socket, no foreign source, nothing skipped.
+
+What replay cannot carry is grpcio's *parser* running on freshly produced bytes, so a genuinely
+new divergence in the reverse direction is findable only by the live program; that is a
+pre-release check. What replay does carry is everything the reference produced or read at capture
+time, and the reverse assertions are checked against `grpcio`'s own readings
+(`src/testdata/grpcio/reverse_report.txt`) rather than against constants typed by hand.
+
+Both directions, in either place:
+
+- *our client ← a Python `grpcio` server*: all four call shapes, a
   Trailers-Only failure with a `grpc-message` full of bytes the ABNF forbids, a status in a
   trailer section after three messages, metadata both ways including `-bin`, a deadline the
   reference reads back, a 256 KiB reply reassembled across DATA frames, the receive limit
@@ -296,6 +316,13 @@ being validated against a stack that has never seen our code.
 Fourteen mutations were applied to the implementation and the whole suite re-run — twice: once
 in full, and once with the interop tests forced to skip (`GRPC_PYTHON` pointed at a nonexistent
 interpreter), which answers "what would we know *without* the reference?".
+
+⚠ Both columns date from before 2026-09-06, when the anchor was live-only and skippable. Since
+the split (`tools/interop.zig` + `src/reference_replay.zig`) the "Offline-only" column no longer
+describes any reachable configuration of `test-grpc`: the reference's evidence is replayed from
+a committed recording, so the lane that used to be the left column now carries most of the right
+one. The rows are kept because what each mutation *is*, and which layer catches it, has not
+changed — only where the catching happens. A re-run against the replay is owed.
 
 | # | Mutation | Offline-only | Full suite |
 |---|---|---|---|
@@ -335,7 +362,7 @@ clean error from the network; it gets silence.
 ### Mutation testing — the server
 
 Eight more, same protocol (full run, then a run with the live tests forced to skip). "Offline"
-counts exclude the 13 skipped live tests.
+counts exclude the 13 then-skippable live tests — see the ⚠ above: those 13 no longer skip.
 
 | # | Mutation | Offline-only | Full suite |
 |---|---|---|---|

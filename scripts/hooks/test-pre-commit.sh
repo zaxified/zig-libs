@@ -197,6 +197,30 @@ else
     fails=$((fails + 1))
 fi
 
+# 18: a staged file git calls TEXT but that is not UTF-8 must not CRASH the
+# gate. git decides text-vs-binary by looking for a NUL in the first 8000
+# bytes, so a DER certificate or a raw key under `src/testdata/` reaches
+# `git diff` and `git show :<path>` as raw bytes. On 2026-09-06 both decoded
+# strictly and the gate died with UnicodeDecodeError instead of answering --
+# in the diff for `HEAD`, and one call earlier, in the index, for `--staged`,
+# which is the mode this hook runs. A crash is worse than a wrong verdict: it
+# takes the commit down and says nothing about the question it was asked.
+# Found by a peer session, not by this self-test, which is why it is here now.
+git reset -q --hard >/dev/null
+mkdir -p modules/otp/src/testdata
+python3 -c "import sys; sys.stdout.buffer.write(b'0\x82\x01\xf8' + b'A'*200)" \
+    > modules/otp/src/testdata/not-utf8.bin
+body 30 2; git add modules
+out=$("$HOOK" 2>&1); rc=$?
+git reset -q --hard >/dev/null; rm -f modules/otp/src/testdata/not-utf8.bin
+rmdir modules/otp/src/testdata 2>/dev/null
+if [[ "$out" == *UnicodeDecodeError* || "$out" == *Traceback* ]]; then
+    printf '  FAIL %-52s\n' "non-UTF-8 staged file crashes the gate"
+    fails=$((fails + 1))
+else
+    printf '  ok   %-52s (exit %s)\n' "non-UTF-8 staged file does not crash" "$rc"
+fi
+
 echo
 if [[ $fails -eq 0 ]]; then
     echo "pre-commit hook self-test: all cases behaved"

@@ -23,6 +23,17 @@ as ported source does — the same shape as `bech32`, `csvstream`, `decimal`,
 Required attribution — google/brotli test corpus
 ------------------------------------------------
 
+ADDED 2026-09-06: `src/testdata/ref/*.br`. These 24 files are not copies of anything
+upstream publishes -- they are the OUTPUT of running the reference implementation
+(google/brotli, via the Python `brotli` C extension) over inputs from the corpus
+listed below, at pinned quality and window settings, captured by
+`zig build interop-brotli -- --capture`. They are nonetheless derived from the
+attributed corpus and produced by the attributed project's own code, so they are
+covered by the same notice and listed here rather than left unmentioned. No
+google/brotli source is present in this module; these are compressed forms of
+`alice29.txt`, `quickfox_repeated`, `monkey`, `ukkonooa`, `cp852-utf8`,
+`cp1251-utf16le`, `zeros`, `random_org_10k.bin`, `x` and `empty`.
+
 Files: `src/testdata/*` (17 input/`.compressed` pairs: 10x10y, 64x, alice29.txt,
 backward65536, compressed_file, cp1251-utf16le, cp852-utf8, empty, monkey,
 quickfox, quickfox_repeated, random_org_10k.bin, ukkonooa, x, xyzzy, zeros,

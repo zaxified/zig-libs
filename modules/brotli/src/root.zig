@@ -11,7 +11,9 @@
 //! literals, insert-and-copy commands and distances, with a store-mode fallback
 //! for anything that would not shrink. Roughly 2.8x on English text. Its output
 //! is checked against the reference implementation (google/brotli), not only
-//! against this module's own decoder; see SPEC.md.
+//! against this module's own decoder: `tools/interop.zig` runs that comparison
+//! live and freezes it into `src/testdata/`, which `interop_replay_test.zig`
+//! replays with no python3 anywhere. See SPEC.md.
 
 const std = @import("std");
 
@@ -38,6 +40,14 @@ pub const meta = .{
 const decoder = @import("decoder.zig");
 const encoder = @import("encoder.zig");
 
+/// The interop corpus: the input shapes google/brotli has judged this
+/// encoder's output on, the matrix of reference-produced streams the decoder
+/// is judged on, and the frozen record of both. Public for exactly one reason:
+/// `tools/interop.zig` is a separate program and cannot `@import` a path
+/// inside this module, so the one shared table has to be reachable from the
+/// module root. Nothing here is part of the compression API.
+pub const interop_corpus = @import("interop_corpus.zig");
+
 pub const BrotliError = @import("errors.zig").BrotliError;
 pub const Options = decoder.Options;
 
@@ -55,9 +65,10 @@ pub const compress = encoder.compress;
 const testing = std.testing;
 
 test {
-    // Live interop against the reference implementation (skips loudly when
-    // python3 / the `brotli` package is unavailable).
-    _ = @import("reference_interop.zig");
+    // The reference implementation's own verdicts, replayed from committed
+    // fixtures — no python3, no child process, no skip path. The live run that
+    // produced them is `tools/interop.zig`.
+    _ = @import("interop_replay_test.zig");
 }
 
 fn expectDecodes(comptime name: []const u8) !void {

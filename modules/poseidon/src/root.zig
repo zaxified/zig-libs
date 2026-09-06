@@ -129,7 +129,7 @@ test {
     _ = @import("constants_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("rejection_test.zig");
-    _ = @import("reference_interop.zig");
+    _ = @import("mds_replay_test.zig");
     _ = @import("small_field.zig");
 }
 

@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — The sympy oracle leaves the module. `src/reference_interop.zig`
+  `@embedFile`d a 285-line Python driver into module source and spawned `python3`
+  from inside `zig build test-poseidon`, so every consumer carried foreign source
+  and the comparison **skipped** — asserting nothing — on any host without sympy,
+  CI's `continue-on-error` peer install included.
+
+  - the driver is now `tools/subspace_trail.py` and is run only by the new
+    `tools/interop.zig` program (`zig build interop-poseidon`, `-- --capture`),
+    which `zig build check-interop` compiles and never runs;
+  - what it says is captured into `src/testdata/mds_subspace_trail.txt` — 182
+    matrices in 12 named batches, each with the matrix in full and the reference's
+    `algorithm_1` verdict, sub-code and failing round plus `algorithm_2`,
+    `algorithm_3` and `check_minpoly_condition` — with the driver, the Python and
+    sympy versions, the capture timestamp and the capture command in its header;
+  - `src/mds_replay_test.zig` replays it with **no `python3` anywhere**. Coverage
+    is unchanged at 182 matrices (19 of the 168 random ones rejected, every
+    `algorithm_1` sub-code exercised); `test-poseidon` goes from 62 tests with 5
+    skipped on a Python-less host to **64 tests, none skipped**.
+  - the replay regenerates every matrix from this module's own code and requires
+    it to equal the recorded one, and pins the batch names and the total, so the
+    transcript can neither pin stale inputs nor shrink quietly.
+
+  No behaviour change: `src/root.zig` swaps one test import, and nothing in the
+  published API moved.
+
 - **2026-09-06** — Provenance, not arithmetic: the circomlibjs known answers in
   `src/vectors_test.zig` are now **produced by running circomlibjs**, not read out
   of its test suite. `iden3/circomlibjs` is GPL-3.0, so values transcribed from its

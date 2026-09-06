@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 
-//! Offline anchor: the same case tables `reference_interop.zig` drives live
+//! Offline anchor: the same case tables `tools/interop.zig` drives live
 //! against the Python `protobuf` package, checked here against bytes that
-//! package already produced — captured once into `testdata/golden_bytes.zig`
-//! and committed. No python3, no subprocess, no skip path: these tests run
-//! everywhere, including CI, which never has `google.protobuf` installed.
+//! package already produced — captured into `testdata/golden_bytes.zig` by
+//! `zig build interop-protobuf -- --capture` and committed. No python3, no
+//! subprocess, no skip path: these tests run everywhere, including CI, which
+//! never has `google.protobuf` installed.
 //!
-//! Why this exists alongside the live tests rather than instead of them: a
+//! Why this exists alongside the live program rather than instead of it: a
 //! live oracle is strictly stronger evidence (it re-derives the bytes from
 //! the reference's *own* encoder every run), but it can only anchor a
 //! machine that has the reference installed — which is exactly the gap this
@@ -24,7 +25,7 @@
 //!     spec-conformant bytes wrong, independently of whatever our own
 //!     encoder does — the "consistent bug in both halves" blind spot).
 //!
-//! Every case in `reference_interop.zig`'s tables must have a golden entry
+//! Every case in `conformance.zig`'s tables must have a golden entry
 //! here by name, checked at comptime (`@compileError` if not) — nothing is
 //! silently skipped — and the count canary below fails loudly if the two
 //! tables drift apart in size.
@@ -37,22 +38,18 @@
 //!     `wire.Cursor.tag` rejects them by name (see wire.zig's own tests).
 //!   - `oneof`, `Any`, well-known types, JSON mapping — not implemented.
 //!   - the packing-flip and partial-schema-forwarding semantic tests in
-//!     `reference_interop.zig` ("accepts our packing flipped", "a message
-//!     proxied through a partial schema is unchanged") are deliberately
-//!     NOT frozen here: what they check is that a *live* foreign parser
-//!     accepts shapes it would never itself emit, which is a claim about
-//!     the reference implementation's behaviour, not just about our bytes.
-//!     Freezing them would only re-check our own decoder against itself.
-//!     `codec_test.zig` already covers the same shapes offline via
-//!     hand-derived bytes ("decoder accepts both packed and unpacked
-//!     forms", the unknown-field-preservation tests); those, plus the two
-//!     directions checked below, are what make python3's absence harmless.
+//!     `conformance.zig`'s `semantic_cases` (packing flipped, the
+//!     `MergeFrom` rule, UTF-8 in a `string` field) are not frozen HERE:
+//!     they are frozen next door, in `testdata/interop_vectors.zig`, as the
+//!     reference's own recorded verdict on each of those byte strings, and
+//!     replayed by `interop_replay_test.zig`. This file stays what it was —
+//!     the reference's ENCODER output for the canonical cases.
 
 const std = @import("std");
 const testing = std.testing;
 const pb = @import("root.zig");
 const ct = @import("codec_test.zig");
-const ri = @import("reference_interop.zig");
+const ri = @import("conformance.zig");
 const golden = @import("testdata/golden_bytes.zig");
 
 /// Golden bytes for `name`, or a compile error if none were captured —
@@ -125,7 +122,7 @@ test "golden: a boxed recursive chain matches frozen reference bytes, no python 
 // ── count canary ─────────────────────────────────────────────────────────
 //
 // Guards against the two tables silently drifting apart: someone adds a
-// case to `reference_interop.zig` and forgets to capture+add its golden
+// case to `conformance.zig` and forgets to capture+add its golden
 // (already loud, via `find`'s @compileError — but only for entries actually
 // iterated above); someone deletes a case from the live table without
 // noticing its golden entry is now dead weight nobody checks. Pinning the

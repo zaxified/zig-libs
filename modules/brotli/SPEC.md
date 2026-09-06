@@ -149,8 +149,8 @@ larger than its input, and `compress` itself never fails except on allocation.
   always return a typed error; the output cap is enforced.
 - **Encoder, anchored outside this repository.** A writer and a reader can
   share a misreading of RFC 7932 and still round trip perfectly, so a
-  self round-trip proves nothing on its own. `src/reference_interop.zig` pushes
-  every stream this encoder emits through the **reference** implementation
+  self round-trip proves nothing on its own. `tools/interop.zig` (run by
+  `zig build interop-brotli`) pushes every stream this encoder emits through the **reference** implementation
   (google/brotli, via the Python `brotli` C extension) and asserts the original
   bytes come back — over a property sweep of input shapes: empty, single byte,
   one-byte runs sized around the insert/copy length-code boundaries (1..6, 9,
@@ -158,10 +158,19 @@ larger than its input, and `compress` itself never fails except on allocation.
   (every simple-code shape plus the first complex one), all 256 byte values,
   incompressible random, text at and either side of the 65 520-byte window-bits
   switch, and multi-meta-block streams that mix compressed and stored blocks in
-  both orders. The same file also runs the *other* direction: our decoder
-  against reference output at qualities 0/1/5/9/11. All of it **skips loudly**
-  (never silently, never as a failure) when python3 or the `brotli` package is
-  missing.
+  both orders. The same program also runs the *other* direction: our decoder
+  against reference output at qualities 0/1/5/9/11.
+- **…replayed hermetically.** Since 2026-09-06 the live comparison is a PROGRAM,
+  never built by `test-brotli` and never by `zig build`, so the module ships no
+  foreign source and the suite needs no python3. `--capture` freezes what the
+  reference did into `src/testdata/`: 24 reference-compressed streams
+  (`testdata/ref/*.br`, five qualities on `alice29.txt`, three window sizes on
+  `quickfox_repeated`, and q1/q11 over the rest of the corpus), which
+  `interop_replay_test.zig` decodes back to the plaintext; and, for each of the
+  45 input shapes, the SHA-256 of the exact stream google/brotli accepted
+  (`testdata/interop_blessed.zig`), which the same file re-derives from the
+  encoder. Before that it was `src/reference_interop.zig`, a test that spawned
+  `python3` and skipped when it was absent — which is every CI run.
 - **One-off randomized sweep** (not part of the suite, reproducible from the
   seed): 600 generated inputs across nine shapes and four size classes (up to
   200 KB, 20.3 MB of plaintext in total) compressed and then decompressed by
@@ -199,4 +208,4 @@ larger than its input, and `compress` itself never fails except on allocation.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** reference_interop.zig round-trips streams through real google/brotli via Python ext
+**What the tests actually contain.** tools/interop.zig round-trips streams through real google/brotli via Python ext; the suite replays its captured verdicts

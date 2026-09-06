@@ -1,1440 +1,5100 @@
 {
- "cases": {
-  "adjacent_string_literals": {
-   "out": "foobar",
-   "status": "ok"
-  },
-  "arith_basic": {
-   "out": "3|-3|12",
-   "status": "ok"
-  },
-  "attribute_access": {
-   "out": "7",
-   "status": "ok"
-  },
-  "autoescape_block_and_super": {
-   "out": "<b>&lt;i&gt;",
-   "status": "ok"
-  },
-  "autoescape_caller_output": {
-   "out": "[<i>&lt;b&gt;]",
-   "status": "ok"
-  },
-  "autoescape_filter_block": {
-   "out": "&LT;B&GT;",
-   "status": "ok"
-  },
-  "autoescape_included_output_is_not_double_escaped": {
-   "out": "<b>&lt;i&gt;</b>",
-   "status": "ok"
-  },
-  "autoescape_macro_output_is_markup": {
-   "out": "<b>&lt;i&gt;</b>",
-   "status": "ok"
-  },
-  "block_body_may_contain_a_for": {
-   "out": "12",
-   "status": "ok"
-  },
-  "block_in_for_is_not_scoped_by_default": {
-   "out": "<><>",
-   "status": "ok"
-  },
-  "block_in_for_scoped_sees_the_loop_var": {
-   "out": "<1><2>",
-   "status": "ok"
-  },
-  "block_sees_template_level_set_of_the_root": {
-   "out": "[R]",
-   "status": "ok"
-  },
-  "bool_arithmetic": {
-   "out": "2|3|1",
-   "status": "ok"
-  },
-  "call_block_basic": {
-   "out": "<BODY>",
-   "status": "ok"
-  },
-  "call_block_body_sees_the_enclosing_loop": {
-   "out": "(1)(2)",
-   "status": "ok"
-  },
-  "call_block_caller_invoked_twice": {
-   "out": "xx",
-   "status": "ok"
-  },
-  "call_block_on_a_macro_without_caller_errors": {
-   "kind": "TypeError",
-   "msg": "macro 'm' was invoked with two values for the special caller argument. This is most likely a bug.",
-   "status": "error"
-  },
-  "call_block_on_an_imported_macro": {
-   "out": "[inner]",
-   "status": "ok"
-  },
-  "call_block_with_arguments": {
-   "out": "<X2>",
-   "status": "ok"
-  },
-  "call_block_with_keyword_argument": {
-   "out": "[1]",
-   "status": "ok"
-  },
-  "chained_filters_on_dict": {
-   "out": "('a', 2)",
-   "status": "ok"
-  },
-  "comment_multiline": {
-   "out": "ab",
-   "status": "ok"
-  },
-  "comment_removed": {
-   "out": "ab",
-   "status": "ok"
-  },
-  "compare_chained": {
-   "out": "True|False|True",
-   "status": "ok"
-  },
-  "compare_lists": {
-   "out": "True|True",
-   "status": "ok"
-  },
-  "compare_mismatched_types_errors": {
-   "kind": "TypeError",
-   "msg": "'<' not supported between instances of 'int' and 'str'",
-   "status": "error"
-  },
-  "compare_ops": {
-   "out": "True|True|False|True|True|True",
-   "status": "ok"
-  },
-  "compare_strings": {
-   "out": "True|True",
-   "status": "ok"
-  },
-  "concat_with_none": {
-   "out": "[Nonex]|[12]",
-   "status": "ok"
-  },
-  "conditional_expression": {
-   "out": "yes|no",
-   "status": "ok"
-  },
-  "conditional_nested": {
-   "out": "b",
-   "status": "ok"
-  },
-  "conditional_without_else": {
-   "out": "[]|[a]",
-   "status": "ok"
-  },
-  "config_acl_with_namespace": {
-   "out": "10 permit ip any any\n20 deny tcp 10.0.0.0/8 any\n",
-   "status": "ok"
-  },
-  "config_composed_device": {
-   "out": "hostname sw1\n!\ninterface Gi0/1\n description uplink\n ip address 10.0.0.1 255.255.255.0\ninterface Gi0/2\n ip address 10.0.1.1 255.255.255.0\n!\nno ip routing\nip routing\n!",
-   "status": "ok"
-  },
-  "config_interfaces": {
-   "out": "hostname sw1\n!\ninterface Gi0/1\n description uplink\n ip address 10.0.0.1 255.255.255.0\n no shutdown\n!\ninterface Gi0/2\n no ip address\n shutdown\n!\n",
-   "status": "ok"
-  },
-  "config_json_payload": {
-   "out": "{\"name\": \"a\\\"b\", \"tags\": [\"x\", \"y\"]}",
-   "status": "ok"
-  },
-  "crlf_trailing_dropped": {
-   "out": "line",
-   "status": "ok"
-  },
-  "dict_items_render_directly": {
-   "out": "[('a', 1)]",
-   "status": "ok"
-  },
-  "dict_literal_trailing_close": {
-   "out": "1",
-   "status": "ok"
-  },
-  "dict_methods": {
-   "out": "['a', 'b']|[1, 2]|1|dflt",
-   "status": "ok"
-  },
-  "div_by_zero_errors": {
-   "kind": "ZeroDivisionError",
-   "msg": "division by zero",
-   "status": "error"
-  },
-  "dot_integer_index": {
-   "out": "20",
-   "status": "ok"
-  },
-  "endblock_may_repeat_the_name": {
-   "out": "[c]",
-   "status": "ok"
-  },
-  "escape_argument_bearing_filters_on_plain_input": {
-   "out": "abcdefghijabcde&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|[[&#39;&lt;a&gt;&#39;, &#39;b&#39;], [&#39;c&#39;, &#39;&lt;i&gt;&amp;\\&#39;&#34;&lt;/i&gt;&#39;]]|[[&#39;&lt;a&gt;&#39;, &#39;b&#39;], [&#39;c&#39;, &#39;&lt;i&gt;&amp;\\&#39;&#34;&lt;/i&gt;&#39;]]",
-   "status": "ok"
-  },
-  "escape_capitalize_title_center_truncate_plain_input": {
-   "out": "&lt;b&gt;x&lt;/b&gt;|&lt;B&gt;x&lt;/b&gt;|  &lt;b&gt;x&lt;/b&gt;  |&lt;b&gt;x&lt;/b&gt;",
-   "status": "ok"
-  },
-  "escape_capitalize_title_center_truncate_preserve_markup": {
-   "out": "<b>x</b>|&lt;B&gt;x&lt;/b&gt;|  <b>x</b>  |<b>x</b>",
-   "status": "ok"
-  },
-  "escape_chars_iteration_loses_markup_per_character": {
-   "out": "&lt;|>|&lt;b|&lt;b&gt;x&lt;/b&gt;",
-   "status": "ok"
-  },
-  "escape_filter_when_off": {
-   "out": "&lt;b&gt;",
-   "status": "ok"
-  },
-  "escape_forceescape_double": {
-   "out": "&lt;b&gt;",
-   "status": "ok"
-  },
-  "escape_indent_string_width_splices_raw": {
-   "out": "<i>&'\"</i>q|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a\n&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b",
-   "status": "ok"
-  },
-  "escape_join_escapes_items": {
-   "out": "&lt;a&gt;&lt;&gt;&lt;b&gt;",
-   "status": "ok"
-  },
-  "escape_join_markup_separator_and_items": {
-   "out": "a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b|<b>&lt;-&gt;&lt;i&gt;",
-   "status": "ok"
-  },
-  "escape_markup_add": {
-   "out": "<b>&lt;i&gt;",
-   "status": "ok"
-  },
-  "escape_markup_concat": {
-   "out": "<b>&lt;i&gt;",
-   "status": "ok"
-  },
-  "escape_non_string_values": {
-   "out": "[&#39;&lt;a&gt;&#39;]",
-   "status": "ok"
-  },
-  "escape_off_passes_through": {
-   "out": "<b>&'\"",
-   "status": "ok"
-  },
-  "escape_off_replace_method_markup_receiver": {
-   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q <i>&'\"</i> q",
-   "status": "ok"
-  },
-  "escape_on_escapes": {
-   "out": "&lt;b&gt;&amp;&#39;&#34;",
-   "status": "ok"
-  },
-  "escape_on_safe": {
-   "out": "<b>",
-   "status": "ok"
-  },
-  "escape_replace_empty_old_markup_matrix": {
-   "out": "&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;&lt;&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;<&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;&&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;l&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;t&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;;&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;<&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;",
-   "status": "ok"
-  },
-  "escape_replace_filter_block": {
-   "out": "q &lt;script&gt;a&amp;b&#39;&#34;&lt;/script&gt; q",
-   "status": "ok"
-  },
-  "escape_replace_filter_block_count": {
-   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; x q",
-   "status": "ok"
-  },
-  "escape_replace_markup_matrix": {
-   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q <i>&'\"</i> q|q <i>&'\"</i> q",
-   "status": "ok"
-  },
-  "escape_replace_markup_old_is_not_escaped": {
-   "out": "Yx</b>|&lt;b&gt;x&lt;/b&gt;|&lt;b&gt;x&lt;/b&gt;",
-   "status": "ok"
-  },
-  "escape_replace_method_matrix": {
-   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q <i>&'\"</i> q",
-   "status": "ok"
-  },
-  "escape_replace_non_string_argument": {
-   "out": "q 5 q|q [&#39;&lt;a&gt;&#39;] q|q None q",
-   "status": "ok"
-  },
-  "escape_replace_set_block": {
-   "out": "q &lt;script&gt;a&amp;b&#39;&#34;&lt;/script&gt; q",
-   "status": "ok"
-  },
-  "escape_replace_through_map": {
-   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q",
-   "status": "ok"
-  },
-  "escape_reverse_preserves_markup_of_whole_result": {
-   "out": ">ba<",
-   "status": "ok"
-  },
-  "escape_safe_then_escape_is_noop": {
-   "out": "<b>",
-   "status": "ok"
-  },
-  "escape_set_block_is_markup": {
-   "out": "&lt;b&gt;",
-   "status": "ok"
-  },
-  "escape_split_preserves_markup_per_part": {
-   "out": "<a>|<a>|</a>\n<b>|<a>x</a>|<b>",
-   "status": "ok"
-  },
-  "escape_tojson_is_safe": {
-   "out": "{\"k\": \"\\u003cv\\u003e\"}",
-   "status": "ok"
-  },
-  "escape_trim_chars_argument_is_not_spliced": {
-   "out": "b>x</b|b&gt;x&lt;/b|b>x</b>|b>x</b>",
-   "status": "ok"
-  },
-  "escape_truncate_end_argument_matrix": {
-   "out": "<&lt;i&gt;|&lt;&lt;i&gt;|<<i>",
-   "status": "ok"
-  },
-  "escape_upper_preserves_markup": {
-   "out": "<B>X",
-   "status": "ok"
-  },
-  "escape_xmlattr": {
-   "out": "<a href=\"a&amp;b\">",
-   "status": "ok"
-  },
-  "extends_basic": {
-   "out": "[child]",
-   "status": "ok"
-  },
-  "extends_block_not_overridden": {
-   "out": "[a!B]",
-   "status": "ok"
-  },
-  "extends_child_text_is_discarded": {
-   "out": "[c]",
-   "status": "ok"
-  },
-  "extends_child_toplevel_set_is_visible_in_block": {
-   "out": "[42]",
-   "status": "ok"
-  },
-  "extends_computed_name": {
-   "out": "ONE !",
-   "status": "ok"
-  },
-  "extends_cycle_errors": {
-   "kind": "RecursionError",
-   "msg": "maximum recursion depth exceeded",
-   "status": "error"
-  },
-  "extends_missing_template_errors": {
-   "kind": "TemplateNotFound",
-   "msg": "nope",
-   "status": "error"
-  },
-  "extends_name_from_set_above_it": {
-   "out": "TWO !",
-   "status": "ok"
-  },
-  "extends_with_trim_and_lstrip": {
-   "out": "start\n  child\nend",
-   "status": "ok"
-  },
-  "filter_abs_round": {
-   "out": "3|2.0|4.0|2.67|3.0|2.0",
-   "status": "ok"
-  },
-  "filter_arg_evaluation_order": {
-   "out": "y",
-   "status": "ok"
-  },
-  "filter_batch": {
-   "out": "[[1, 2], [3, 4], [5]]|[[1, 2], [3, 0]]",
-   "status": "ok"
-  },
-  "filter_batch_negative_linecount": {
-   "out": "[['a/b', 'c', 3]]|[['a/b', 'c', 3]]|[]",
-   "status": "ok"
-  },
-  "filter_block": {
-   "out": "QUIET",
-   "status": "ok"
-  },
-  "filter_capitalize_title": {
-   "out": "Hello world|Hello World",
-   "status": "ok"
-  },
-  "filter_center": {
-   "out": "[   ab  ]",
-   "status": "ok"
-  },
-  "filter_center_negative_width": {
-   "out": "[a/b]|[a/b]",
-   "status": "ok"
-  },
-  "filter_chain": {
-   "out": "heLLo",
-   "status": "ok"
-  },
-  "filter_default": {
-   "out": "[D]|[]|[D]",
-   "status": "ok"
-  },
-  "filter_default_short": {
-   "out": "5",
-   "status": "ok"
-  },
-  "filter_default_then_arithmetic": {
-   "out": "2",
-   "status": "ok"
-  },
-  "filter_dictsort": {
-   "out": "[('A', 2), ('b', 1)]|[('b', 1), ('A', 2)]",
-   "status": "ok"
-  },
-  "filter_first_last_list": {
-   "out": "['a', 'b', 'c']|1|3",
-   "status": "ok"
-  },
-  "filter_indent": {
-   "out": "[a\n  b\n  c]",
-   "status": "ok"
-  },
-  "filter_indent_first": {
-   "out": "[  a\n  b]",
-   "status": "ok"
-  },
-  "filter_indent_negative_width": {
-   "out": "[a\n<b>\nc]",
-   "status": "ok"
-  },
-  "filter_int_float": {
-   "out": "42|0|9|1|3|2.5|1.5",
-   "status": "ok"
-  },
-  "filter_int_out_of_range_base": {
-   "out": "10|10",
-   "status": "ok"
-  },
-  "filter_items": {
-   "out": "[('b', 1), ('a', 2)]",
-   "status": "ok"
-  },
-  "filter_join_attribute": {
-   "out": "1, 2",
-   "status": "ok"
-  },
-  "filter_join_plain": {
-   "out": "ab|1+2",
-   "status": "ok"
-  },
-  "filter_length_count": {
-   "out": "3|3|1",
-   "status": "ok"
-  },
-  "filter_map_attribute": {
-   "out": "1,2",
-   "status": "ok"
-  },
-  "filter_map_name": {
-   "out": "A,B",
-   "status": "ok"
-  },
-  "filter_min_max": {
-   "out": "1|3|A",
-   "status": "ok"
-  },
-  "filter_on_expression": {
-   "out": "3",
-   "status": "ok"
-  },
-  "filter_rejectattr": {
-   "out": "1",
-   "status": "ok"
-  },
-  "filter_replace": {
-   "out": "bbb|bba",
-   "status": "ok"
-  },
-  "filter_replace_count_from_data": {
-   "out": "b<b>b",
-   "status": "ok"
-  },
-  "filter_replace_empty_old": {
-   "out": "XaXbXcX|X|XaXbc|abc|XaXbXcX",
-   "status": "ok"
-  },
-  "filter_replace_empty_old_unicode": {
-   "out": "X\u00e1XbX|-\u011b-\u0161-",
-   "status": "ok"
-  },
-  "filter_replace_negative_count": {
-   "out": "b<b>b|b<b>b|a<a>a",
-   "status": "ok"
-  },
-  "filter_reverse": {
-   "out": "[3, 2, 1]|cba",
-   "status": "ok"
-  },
-  "filter_round_saturating_precision": {
-   "out": "1.5|0.0|0",
-   "status": "ok"
-  },
-  "filter_round_ties_and_precision": {
-   "out": "0.0|2.0|-2.0|1.0|2.35|0.07812|1200|1200",
-   "status": "ok"
-  },
-  "filter_select_reject": {
-   "out": "[1, 3]|[2, 4]",
-   "status": "ok"
-  },
-  "filter_select_truthy": {
-   "out": "[1, 2]",
-   "status": "ok"
-  },
-  "filter_selectattr": {
-   "out": "1",
-   "status": "ok"
-  },
-  "filter_selectattr_test": {
-   "out": "2,3",
-   "status": "ok"
-  },
-  "filter_slice": {
-   "out": "[[1, 2], [3, 4], [5]]",
-   "status": "ok"
-  },
-  "filter_slice_negative_slices": {
-   "out": "[]|[]",
-   "status": "ok"
-  },
-  "filter_sort_case_sensitive": {
-   "out": "A,b,c",
-   "status": "ok"
-  },
-  "filter_sort_default_is_case_insensitive": {
-   "out": "A,b,c",
-   "status": "ok"
-  },
-  "filter_sort_reverse_attribute": {
-   "out": "3,2,1",
-   "status": "ok"
-  },
-  "filter_string": {
-   "out": "42!",
-   "status": "ok"
-  },
-  "filter_striptags": {
-   "out": "bold and & more",
-   "status": "ok"
-  },
-  "filter_sum": {
-   "out": "6|3|0",
-   "status": "ok"
-  },
-  "filter_title_word_boundary_set": {
-   "out": "A/b C-D(E|Eth0.100:tag|It's Ok",
-   "status": "ok"
-  },
-  "filter_tojson_escapes": {
-   "out": "\"\\u003ca\\u003e\\u0026\\u0027\\\"\\n\"",
-   "status": "ok"
-  },
-  "filter_tojson_indent": {
-   "out": "{\n  \"a\": [\n    1,\n    2\n  ]\n}",
-   "status": "ok"
-  },
-  "filter_tojson_negative_indent": {
-   "out": "{\n\"a\": \"\\u003cx\\u003e\",\n\"b\": 1\n}",
-   "status": "ok"
-  },
-  "filter_tojson_scalars": {
-   "out": "{\"a\": \"x\", \"b\": 1, \"c\": [true, null, 1.5]}",
-   "status": "ok"
-  },
-  "filter_trim": {
-   "out": "[pad]|[hi]",
-   "status": "ok"
-  },
-  "filter_truncate": {
-   "out": "the...|the quick...",
-   "status": "ok"
-  },
-  "filter_truncate_negative_leeway": {
-   "kind": "AssertionError",
-   "msg": "expected leeway >= 0, got -1",
-   "status": "error"
-  },
-  "filter_truncate_negative_length": {
-   "kind": "AssertionError",
-   "msg": "expected length >= 3, got -1",
-   "status": "error"
-  },
-  "filter_unique": {
-   "out": "a,b|a,A,b",
-   "status": "ok"
-  },
-  "filter_upper_lower": {
-   "out": "MIXED|mixed",
-   "status": "ok"
-  },
-  "filter_urlencode": {
-   "out": "a%20b/c%3Fd%3De",
-   "status": "ok"
-  },
-  "filter_wordcount": {
-   "out": "4",
-   "status": "ok"
-  },
-  "floordiv_float": {
-   "out": "3.0|-4.0",
-   "status": "ok"
-  },
-  "floordiv_negatives": {
-   "out": "3|-4|-4|3",
-   "status": "ok"
-  },
-  "for_basic": {
-   "out": "1,2,3,",
-   "status": "ok"
-  },
-  "for_else_empty": {
-   "out": "none",
-   "status": "ok"
-  },
-  "for_filtered_else": {
-   "out": "none",
-   "status": "ok"
-  },
-  "for_filtered_length": {
-   "out": "1:1/3 3:2/3 5:3/3 ",
-   "status": "ok"
-  },
-  "for_loop_changed": {
-   "out": "True False True False True ",
-   "status": "ok"
-  },
-  "for_loop_cycle": {
-   "out": "odd even odd even odd ",
-   "status": "ok"
-  },
-  "for_loop_fields": {
-   "out": "1/0/3/2/True/False/3 2/1/2/1/False/False/3 3/2/1/0/False/True/3 ",
-   "status": "ok"
-  },
-  "for_loop_previtem_nextitem": {
-   "out": "[-<1>2][1<2>3][2<3>-]",
-   "status": "ok"
-  },
-  "for_nested_loop_shadows": {
-   "out": "x1:1/2 x2:2/2 |y1:1/2 y2:2/2 |",
-   "status": "ok"
-  },
-  "for_nested_outer_loop_saved": {
-   "out": "1.1 1.2 2.1 2.2 ",
-   "status": "ok"
-  },
-  "for_over_dict_yields_keys": {
-   "out": "b,a,",
-   "status": "ok"
-  },
-  "for_over_items_unpack": {
-   "out": "b=1;a=2;",
-   "status": "ok"
-  },
-  "for_over_range": {
-   "out": "012|25|321",
-   "status": "ok"
-  },
-  "for_over_string": {
-   "out": "[a][b][c]",
-   "status": "ok"
-  },
-  "for_over_undefined_errors_strict": {
-   "kind": "UndefinedError",
-   "msg": "'nope' is undefined",
-   "status": "error"
-  },
-  "for_over_undefined_is_empty_lenient": {
-   "out": "[]",
-   "status": "ok"
-  },
-  "for_recursive_depth_and_length": {
-   "out": "1/1 2/2 2/2 ",
-   "status": "ok"
-  },
-  "for_recursive_indent": {
-   "out": "a\n  b\n",
-   "status": "ok"
-  },
-  "for_recursive_tree": {
-   "out": "[1[2]][3]",
-   "status": "ok"
-  },
-  "from_import_missing_name_is_undefined_not_an_error": {
-   "out": "[]",
-   "status": "ok"
-  },
-  "from_import_several": {
-   "out": "AB",
-   "status": "ok"
-  },
-  "from_import_with_alias": {
-   "out": "f=3",
-   "status": "ok"
-  },
-  "from_import_with_context": {
-   "out": "<V>",
-   "status": "ok"
-  },
-  "global_dict": {
-   "out": "{'a': 1, 'b': 2}",
-   "status": "ok"
-  },
-  "global_range_float_out_of_range": {
-   "kind": "TypeError",
-   "msg": "'float' object cannot be interpreted as an integer",
-   "status": "error"
-  },
-  "global_range_repr": {
-   "out": "[0, 1, 2]",
-   "status": "ok"
-  },
-  "if_elif_else": {
-   "out": "mid",
-   "status": "ok"
-  },
-  "if_falsey_values": {
-   "out": "-",
-   "status": "ok"
-  },
-  "if_nested": {
-   "out": "a",
-   "status": "ok"
-  },
-  "import_defaults_to_without_context": {
-   "out": "<>",
-   "status": "ok"
-  },
-  "import_exposes_module_variables_not_just_macros": {
-   "out": "42",
-   "status": "ok"
-  },
-  "import_ignores_blocks_in_the_module": {
-   "out": "F",
-   "status": "ok"
-  },
-  "import_macro_sees_a_module_set_written_after_it": {
-   "out": "<LATE>",
-   "status": "ok"
-  },
-  "import_missing_template_errors": {
-   "kind": "TemplateNotFound",
-   "msg": "nope",
-   "status": "error"
-  },
-  "import_module_level_set_is_visible_to_its_macros": {
-   "out": "<M>",
-   "status": "ok"
-  },
-  "import_produces_no_output": {
-   "out": "[]F",
-   "status": "ok"
-  },
-  "import_with_context": {
-   "out": "<1>",
-   "status": "ok"
-  },
-  "import_with_context_is_a_snapshot_not_a_view": {
-   "out": "<>",
-   "status": "ok"
-  },
-  "import_without_context_hides_the_render_context_too": {
-   "out": "<>",
-   "status": "ok"
-  },
-  "imported_macro_calls_another_macro_in_its_module": {
-   "out": "[A]",
-   "status": "ok"
-  },
-  "imported_macro_uses_a_caller_registered_filter": {
-   "out": "HI!",
-   "status": "ok"
-  },
-  "in_operator": {
-   "out": "True|True|True|True",
-   "status": "ok"
-  },
-  "include_basic": {
-   "out": "a<included>b",
-   "status": "ok"
-  },
-  "include_candidate_list_all_missing_errors": {
-   "kind": "TemplatesNotFound",
-   "msg": "none of the templates given were found: nope, alsonope",
-   "status": "error"
-  },
-  "include_candidate_list_all_missing_ignored": {
-   "out": "[]",
-   "status": "ok"
-  },
-  "include_candidate_list_picks_the_first_that_exists": {
-   "out": "B",
-   "status": "ok"
-  },
-  "include_ignore_missing": {
-   "out": "[end]",
-   "status": "ok"
-  },
-  "include_inside_a_macro_sees_the_parameter": {
-   "out": "<7>",
-   "status": "ok"
-  },
-  "include_missing_without_ignore_errors": {
-   "kind": "TemplateNotFound",
-   "msg": "nope",
-   "status": "error"
-  },
-  "include_of_a_template_that_extends": {
-   "out": "B[C]",
-   "status": "ok"
-  },
-  "include_runs_in_order_with_surrounding_sets": {
-   "out": "<><1>",
-   "status": "ok"
-  },
-  "include_sees_context_by_default": {
-   "out": "<1>",
-   "status": "ok"
-  },
-  "include_sees_the_loop_variable": {
-   "out": "<1><2>",
-   "status": "ok"
-  },
-  "include_self_errors": {
-   "kind": "RecursionError",
-   "msg": "maximum recursion depth exceeded",
-   "status": "error"
-  },
-  "include_set_does_not_leak_back": {
-   "out": "[9][]",
-   "status": "ok"
-  },
-  "include_with_trim_blocks": {
-   "out": "A\n1\n2\nB",
-   "status": "ok"
-  },
-  "include_without_context_sees_nothing": {
-   "out": "<><>",
-   "status": "ok"
-  },
-  "index_out_of_range_is_undefined": {
-   "out": "[]",
-   "status": "ok"
-  },
-  "int_base_zero_binary": {
-   "out": "5",
-   "status": "ok"
-  },
-  "int_base_zero_hex": {
-   "out": "31",
-   "status": "ok"
-  },
-  "int_base_zero_octal": {
-   "out": "15",
-   "status": "ok"
-  },
-  "list_concat_repeat": {
-   "out": "[1, 2, 3]|[0, 0, 0]",
-   "status": "ok"
-  },
-  "list_literal": {
-   "out": "1-2-3",
-   "status": "ok"
-  },
-  "list_methods": {
-   "out": "2|2",
-   "status": "ok"
-  },
-  "logic_returns_operand": {
-   "out": "[x]|[None]|[2]|[0]",
-   "status": "ok"
-  },
-  "loop_index_inside_if": {
-   "out": "2;3;",
-   "status": "ok"
-  },
-  "loop_var_does_not_leak": {
-   "out": "[gone]",
-   "status": "ok"
-  },
-  "macro_defaults_and_keywords": {
-   "out": "121978",
-   "status": "ok"
-  },
-  "macro_extra_positional_without_varargs_errors": {
-   "kind": "TypeError",
-   "msg": "macro 'f' takes not more than 1 argument(s)",
-   "status": "error"
-  },
-  "macro_infinite_recursion_errors": {
-   "kind": "RecursionError",
-   "msg": "maximum recursion depth exceeded",
-   "status": "error"
-  },
-  "macro_inside_a_for_body": {
-   "out": "[1][2]",
-   "status": "ok"
-  },
-  "macro_introspection_attributes": {
-   "out": "f|('a', 'b')|False|False|False",
-   "status": "ok"
-  },
-  "macro_local_definition_and_call": {
-   "out": "[1][x]",
-   "status": "ok"
-  },
-  "macro_missing_argument_is_undefined": {
-   "out": "[]",
-   "status": "ok"
-  },
-  "macro_output_is_a_value": {
-   "out": "[pad]",
-   "status": "ok"
-  },
-  "macro_recursive_by_name": {
-   "out": "3210",
-   "status": "ok"
-  },
-  "macro_repr": {
-   "out": "<Macro 'f'>",
-   "status": "ok"
-  },
-  "macro_sees_a_later_template_level_set": {
-   "out": "[1V]",
-   "status": "ok"
-  },
-  "macro_unexpected_keyword_errors": {
-   "kind": "TypeError",
-   "msg": "macro 'f' takes no keyword argument 'zzz'",
-   "status": "error"
-  },
-  "macro_varargs_and_kwargs": {
-   "out": "1|(2, 3)|{'k': 4}",
-   "status": "ok"
-  },
-  "macro_varargs_empty": {
-   "out": "()",
-   "status": "ok"
-  },
-  "macro_whitespace_control": {
-   "out": "[1]",
-   "status": "ok"
-  },
-  "map_string_then_join": {
-   "out": "1+2|abc",
-   "status": "ok"
-  },
-  "missing_key_is_undefined": {
-   "out": "[]",
-   "status": "ok"
-  },
-  "mod_by_zero_errors": {
-   "kind": "ZeroDivisionError",
-   "msg": "division by zero",
-   "status": "error"
-  },
-  "mod_float": {
-   "out": "1.5|0.5",
-   "status": "ok"
-  },
-  "mod_negatives": {
-   "out": "1|1|-1|-1",
-   "status": "ok"
-  },
-  "namespace_survives_loop": {
-   "out": "6",
-   "status": "ok"
-  },
-  "nested_blocks": {
-   "out": "[o(I)]",
-   "status": "ok"
-  },
-  "nested_blocks_outer_overridden_drops_inner": {
-   "out": "[O]",
-   "status": "ok"
-  },
-  "nested_loop_first_last": {
-   "out": "TrueFalse FalseTrue TrueFalse|TrueFalse FalseTrue FalseTrue|",
-   "status": "ok"
-  },
-  "not_binds_looser_than_compare": {
-   "out": "True",
-   "status": "ok"
-  },
-  "number_forms": {
-   "out": "31|15|5|1000|150.0",
-   "status": "ok"
-  },
-  "out_dict_repr": {
-   "out": "{'a': 1, 'b': [2, 3]}",
-   "status": "ok"
-  },
-  "out_float_big": {
-   "out": "1e+100|1.5e-08",
-   "status": "ok"
-  },
-  "out_float_exponent": {
-   "out": "1e+16|1000000000000000.0|1e-05|0.0001",
-   "status": "ok"
-  },
-  "out_float_integral": {
-   "out": "1.0|3.0|-2.0",
-   "status": "ok"
-  },
-  "out_float_repr": {
-   "out": "0.1|1.5|0.6666666666666666",
-   "status": "ok"
-  },
-  "out_int": {
-   "out": "42",
-   "status": "ok"
-  },
-  "out_list_repr": {
-   "out": "[1, 'a', True, None]",
-   "status": "ok"
-  },
-  "out_negative_int": {
-   "out": "-7",
-   "status": "ok"
-  },
-  "out_nested_repr": {
-   "out": "{'k': ['a', 1.5, None]}",
-   "status": "ok"
-  },
-  "out_none": {
-   "out": "[None]|[None]",
-   "status": "ok"
-  },
-  "out_str_repr_quotes": {
-   "out": "[\"it's\", 'say \"hi\"', 'a\\nb']",
-   "status": "ok"
-  },
-  "out_string": {
-   "out": "hi",
-   "status": "ok"
-  },
-  "out_true": {
-   "out": "True|True|False",
-   "status": "ok"
-  },
-  "plain_text": {
+ "captured": "2026-09-06T17:33:02Z",
+ "cases": [
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "plain_text",
    "out": "hello world",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "hello world",
+   "templates": {},
+   "trim_blocks": false
   },
-  "pow_negative_zero_to_negative_errors": {
-   "kind": "ZeroDivisionError",
-   "msg": "zero to a negative power",
-   "status": "error"
-  },
-  "pow_zero_base_non_negative": {
-   "out": "1|1.0|0|1.0|0.25|4.0",
-   "status": "ok"
-  },
-  "pow_zero_to_negative_errors": {
-   "kind": "ZeroDivisionError",
-   "msg": "zero to a negative power",
-   "status": "error"
-  },
-  "pow_zero_to_negative_float_base_errors": {
-   "kind": "ZeroDivisionError",
-   "msg": "zero to a negative power",
-   "status": "error"
-  },
-  "pow_zero_to_negative_float_exponent_errors": {
-   "kind": "ZeroDivisionError",
-   "msg": "zero to a negative power",
-   "status": "error"
-  },
-  "power": {
-   "out": "1024|1|0.5",
-   "status": "ok"
-  },
-  "precedence_mixed": {
-   "out": "5.0",
-   "status": "ok"
-  },
-  "range_fill_steps_past_i64_end": {
-   "out": "[9223372036854775806]|[-9223372036854775807]",
-   "status": "ok"
-  },
-  "range_span_overflows_i64": {
-   "kind": "OverflowError",
-   "msg": "Python int too large to convert to C ssize_t",
-   "status": "error"
-  },
-  "raw_block": {
-   "out": "{{ not_a_var }} {% if %}",
-   "status": "ok"
-  },
-  "raw_with_whitespace_control": {
-   "out": "a{{x}}b",
-   "status": "ok"
-  },
-  "repeat_list_product_overflows": {
-   "kind": "MemoryError",
-   "msg": "",
-   "status": "error"
-  },
-  "repeat_str_product_overflows": {
-   "kind": "OverflowError",
-   "msg": "repeated string is too long",
-   "status": "error"
-  },
-  "required_block_not_overridden_errors": {
-   "kind": "TemplateRuntimeError",
-   "msg": "Required block 'x' not found",
-   "status": "error"
-  },
-  "required_block_overridden": {
-   "out": "[ok]",
-   "status": "ok"
-  },
-  "self_block_reference": {
-   "out": "Y|Y",
-   "status": "ok"
-  },
-  "set_basic": {
-   "out": "5",
-   "status": "ok"
-  },
-  "set_block": {
-   "out": "[hi bob]",
-   "status": "ok"
-  },
-  "set_block_filtered": {
-   "out": "[HI]",
-   "status": "ok"
-  },
-  "set_in_for_does_not_leak": {
-   "out": "0",
-   "status": "ok"
-  },
-  "set_in_for_visible_within_loop": {
-   "out": "246",
-   "status": "ok"
-  },
-  "set_in_if_leaks": {
-   "out": "2",
-   "status": "ok"
-  },
-  "set_tuple": {
-   "out": "12",
-   "status": "ok"
-  },
-  "slice_basic": {
-   "out": "[1, 2]|[0, 1]|[2, 3, 4]",
-   "status": "ok"
-  },
-  "slice_negative_and_step": {
-   "out": "[3, 4]|[0, 2, 4]|[4, 3, 2, 1, 0]",
-   "status": "ok"
-  },
-  "slice_step_saturates_at_i64_bounds": {
-   "out": "[1]|[3]|[2]",
-   "status": "ok"
-  },
-  "slice_step_zero_errors": {
-   "kind": "ValueError",
-   "msg": "slice step cannot be zero",
-   "status": "error"
-  },
-  "slice_string": {
-   "out": "bcd|fedcba",
-   "status": "ok"
-  },
-  "strict_default_filter_still_works": {
-   "out": "ok",
-   "status": "ok"
-  },
-  "strict_defined_test_still_works": {
-   "out": "False|True",
-   "status": "ok"
-  },
-  "strict_if_errors": {
-   "kind": "UndefinedError",
-   "msg": "'missing' is undefined",
-   "status": "error"
-  },
-  "strict_output_errors": {
-   "kind": "UndefinedError",
-   "msg": "'missing' is undefined",
-   "status": "error"
-  },
-  "strict_present_value_fine": {
-   "out": "1",
-   "status": "ok"
-  },
-  "string_concat_plus": {
-   "out": "ab",
-   "status": "ok"
-  },
-  "string_escapes": {
-   "out": "a\tb\nc|q\"q",
-   "status": "ok"
-  },
-  "string_index": {
-   "out": "h|o",
-   "status": "ok"
-  },
-  "string_join_method": {
-   "out": "a-b",
-   "status": "ok"
-  },
-  "string_methods": {
-   "out": "HELLO|True|['he', '', 'o']|heLLo|2",
-   "status": "ok"
-  },
-  "string_multiplied_by_zero": {
-   "out": "[]|[]",
-   "status": "ok"
-  },
-  "string_repeat": {
-   "out": "-----|ababab",
-   "status": "ok"
-  },
-  "striptags_unterminated_lt_is_text": {
-   "out": "a<b",
-   "status": "ok"
-  },
-  "subscript_int": {
-   "out": "10|30",
-   "status": "ok"
-  },
-  "subscript_string_key": {
-   "out": "1",
-   "status": "ok"
-  },
-  "sum_with_start": {
-   "out": "16",
-   "status": "ok"
-  },
-  "super_skips_a_level_that_does_not_define_it": {
-   "out": "[a]",
-   "status": "ok"
-  },
-  "super_three_levels": {
-   "out": "A[c(b(a))]",
-   "status": "ok"
-  },
-  "super_twice_in_one_block": {
-   "out": "aa",
-   "status": "ok"
-  },
-  "tag_at_very_start_and_end": {
-   "out": "1mid2",
-   "status": "ok"
-  },
-  "test_comparison_tests": {
-   "out": "True|False|True|True",
-   "status": "ok"
-  },
-  "test_defined_undefined": {
-   "out": "True|False|True",
-   "status": "ok"
-  },
-  "test_even_odd_divisibleby": {
-   "out": "True|False|True|False",
-   "status": "ok"
-  },
-  "test_in": {
-   "out": "True|False",
-   "status": "ok"
-  },
-  "test_negated_in_condition": {
-   "out": "no",
-   "status": "ok"
-  },
-  "test_none": {
-   "out": "True|False|False",
-   "status": "ok"
-  },
-  "test_types": {
-   "out": "True|True|True|True|True|True|True",
-   "status": "ok"
-  },
-  "test_upper_lower": {
-   "out": "True|False|True",
-   "status": "ok"
-  },
-  "text_with_braces": {
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "text_with_braces",
    "out": "a { b } c {not-a-tag} d",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "a { b } c {not-a-tag} d",
+   "templates": {},
+   "trim_blocks": false
   },
-  "tilde_concat_mixed": {
-   "out": "n=5/True",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "comment_removed",
+   "out": "ab",
+   "status": "ok",
+   "strict": false,
+   "template": "a{# nothing #}b",
+   "templates": {},
+   "trim_blocks": false
   },
-  "trailing_newline_dropped": {
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "comment_multiline",
+   "out": "ab",
+   "status": "ok",
+   "strict": false,
+   "template": "a{# one\ntwo #}b",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "trailing_newline_dropped",
    "out": "line",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "line\n",
+   "templates": {},
+   "trim_blocks": false
   },
-  "trailing_newline_kept": {
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": true,
+   "lstrip_blocks": false,
+   "name": "trailing_newline_kept",
    "out": "line\n",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "line\n",
+   "templates": {},
+   "trim_blocks": false
   },
-  "true_division_is_float": {
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "crlf_trailing_dropped",
+   "out": "line",
+   "status": "ok",
+   "strict": false,
+   "template": "line\r\n",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"hi\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_string",
+   "out": "hi",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"n\": 42}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_int",
+   "out": "42",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ n }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"n\": -7}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_negative_int",
+   "out": "-7",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ n }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_true",
+   "out": "True|True|False",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ true }}|{{ True }}|{{ false }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_none",
+   "out": "[None]|[None]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ none }}]|[{{ None }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_float_integral",
+   "out": "1.0|3.0|-2.0",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1.0 }}|{{ 3.0 }}|{{ -2.0 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_float_repr",
+   "out": "0.1|1.5|0.6666666666666666",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 0.1 }}|{{ 1.5 }}|{{ 2 / 3 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_float_exponent",
+   "out": "1e+16|1000000000000000.0|1e-05|0.0001",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1e16 }}|{{ 1e15 }}|{{ 1e-5 }}|{{ 1e-4 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_float_big",
+   "out": "1e+100|1.5e-08",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1e100 }}|{{ 1.5e-8 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_list_repr",
+   "out": "[1, 'a', True, None]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1, 'a', true, none] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_dict_repr",
+   "out": "{'a': 1, 'b': [2, 3]}",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ {'a': 1, 'b': [2, 3]} }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"k\": [\"a\", 1.5, null]}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_nested_repr",
+   "out": "{'k': ['a', 1.5, None]}",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "out_str_repr_quotes",
+   "out": "[\"it's\", 'say \"hi\"', 'a\\nb']",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [\"it's\", 'say \"hi\"', 'a\\nb'] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "arith_basic",
+   "out": "3|-3|12",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1 + 2 }}|{{ 5 - 8 }}|{{ 3 * 4 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "true_division_is_float",
    "out": "2.0|3.5|-3.5",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 4 / 2 }}|{{ 7 / 2 }}|{{ -7 / 2 }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "truncate_no_space_empty_end": {
-   "out": "aaaaaaaaaaaa",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "floordiv_negatives",
+   "out": "3|-4|-4|3",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 7 // 2 }}|{{ -7 // 2 }}|{{ 7 // -2 }}|{{ -7 // -2 }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "truncate_no_space_keeps_prefix": {
-   "out": "https://example.c...",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "mod_negatives",
+   "out": "1|1|-1|-1",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 7 % 2 }}|{{ -7 % 2 }}|{{ 7 % -2 }}|{{ -7 % -2 }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "truncate_no_space_short": {
-   "out": "abcdefg...",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "mod_float",
+   "out": "1.5|0.5",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 7.5 % 2 }}|{{ -7.5 % 2 }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "unary_minus_binds_after_pow": {
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "floordiv_float",
+   "out": "3.0|-4.0",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 7.5 // 2 }}|{{ -7.5 // 2 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "power",
+   "out": "1024|1|0.5",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 2 ** 10 }}|{{ 2 ** 0 }}|{{ 2 ** -1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "unary_minus_binds_after_pow",
    "out": "4",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "{{ -2 ** 2 }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "undefined_arithmetic_errors_lenient": {
-   "kind": "UndefinedError",
-   "msg": "'missing' is undefined",
-   "status": "error"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "precedence_mixed",
+   "out": "5.0",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1 + 2 * 3 - 4 / 2 }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "undefined_attribute_errors_lenient": {
-   "kind": "UndefinedError",
-   "msg": "'missing' is undefined",
-   "status": "error"
-  },
-  "undefined_default_filter_lenient": {
-   "out": "ok",
-   "status": "ok"
-  },
-  "undefined_equality_lenient": {
-   "out": "True|False|False",
-   "status": "ok"
-  },
-  "undefined_is_falsey_lenient": {
-   "out": "no",
-   "status": "ok"
-  },
-  "undefined_iteration_is_empty_lenient": {
-   "out": "[[]]",
-   "status": "ok"
-  },
-  "undefined_renders_empty_lenient": {
-   "out": "[]",
-   "status": "ok"
-  },
-  "urlencode_map_key_space_is_plus": {
-   "out": "a+b=c",
-   "status": "ok"
-  },
-  "urlencode_map_slash_is_encoded": {
-   "out": "k=a%2Fb",
-   "status": "ok"
-  },
-  "urlencode_map_space_is_plus": {
-   "out": "k=a+b",
-   "status": "ok"
-  },
-  "urlencode_string_keeps_percent20": {
-   "out": "a%20b",
-   "status": "ok"
-  },
-  "whitespace_only_template": {
-   "out": "   \n   ",
-   "status": "ok"
-  },
-  "with_scope": {
-   "out": "1[gone]",
-   "status": "ok"
-  },
-  "wordcount_dotted": {
-   "out": "2",
-   "status": "ok"
-  },
-  "wordcount_punctuation_splits": {
-   "out": "3",
-   "status": "ok"
-  },
-  "wordcount_underscore_is_one_word": {
-   "out": "1",
-   "status": "ok"
-  },
-  "ws_both_options": {
-   "out": "x\n  body\ny",
-   "status": "ok"
-  },
-  "ws_comment_dash": {
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "string_concat_plus",
    "out": "ab",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a' + 'b' }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_dash_beats_options": {
-   "out": "xbodyy",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "tilde_concat_mixed",
+   "out": "n=5/True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'n=' ~ 5 ~ '/' ~ true }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_dash_both": {
-   "out": "abc",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "string_repeat",
+   "out": "-----|ababab",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ '-' * 5 }}|{{ 3 * 'ab' }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_dash_left": {
-   "out": "ab",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "list_concat_repeat",
+   "out": "[1, 2, 3]|[0, 0, 0]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1] + [2, 3] }}|{{ [0] * 3 }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_dash_right": {
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "ZeroDivisionError",
+   "lstrip_blocks": false,
+   "msg": "division by zero",
+   "name": "div_by_zero_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{{ 1 / 0 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "ZeroDivisionError",
+   "lstrip_blocks": false,
+   "msg": "division by zero",
+   "name": "mod_by_zero_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{{ 1 % 0 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "ZeroDivisionError",
+   "lstrip_blocks": false,
+   "msg": "zero to a negative power",
+   "name": "pow_zero_to_negative_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{{ 0 ** -1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "ZeroDivisionError",
+   "lstrip_blocks": false,
+   "msg": "zero to a negative power",
+   "name": "pow_zero_to_negative_float_base_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{{ 0.0 ** -1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "ZeroDivisionError",
+   "lstrip_blocks": false,
+   "msg": "zero to a negative power",
+   "name": "pow_zero_to_negative_float_exponent_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{{ 0 ** -0.5 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "ZeroDivisionError",
+   "lstrip_blocks": false,
+   "msg": "zero to a negative power",
+   "name": "pow_negative_zero_to_negative_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{{ -0.0 ** -1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "pow_zero_base_non_negative",
+   "out": "1|1.0|0|1.0|0.25|4.0",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 0 ** 0 }}|{{ 0.0 ** 0 }}|{{ 0 ** 3 }}|{{ 0.0 ** -0.0 }}|{{ 2 ** -2 }}|{{ 0.5 ** -2 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "compare_ops",
+   "out": "True|True|False|True|True|True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1 < 2 }}|{{ 2 <= 2 }}|{{ 3 > 4 }}|{{ 3 >= 3 }}|{{ 1 == 1.0 }}|{{ 'a' != 'b' }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "compare_chained",
+   "out": "True|False|True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1 < 2 < 3 }}|{{ 1 < 3 < 2 }}|{{ 3 > 2 > 1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "compare_strings",
+   "out": "True|True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'abc' < 'abd' }}|{{ 'B' < 'a' }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "compare_lists",
+   "out": "True|True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1, 2] < [1, 3] }}|{{ [1] < [1, 0] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "logic_returns_operand",
+   "out": "[x]|[None]|[2]|[0]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ 0 or 'x' }}]|[{{ '' or none }}]|[{{ 1 and 2 }}]|[{{ 0 and 2 }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "not_binds_looser_than_compare",
+   "out": "True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ not 1 == 2 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "in_operator",
+   "out": "True|True|True|True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 2 in [1,2,3] }}|{{ 'ell' in 'hello' }}|{{ 'a' in {'a': 1} }}|{{ 5 not in [1] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "conditional_expression",
+   "out": "yes|no",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'yes' if 1 else 'no' }}|{{ 'yes' if 0 else 'no' }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"n\": 4}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "conditional_nested",
    "out": "b",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a' if n > 5 else 'b' if n > 2 else 'c' }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_loop_trim_blocks": {
-   "out": "1\n2\n",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TypeError",
+   "lstrip_blocks": false,
+   "msg": "'<' not supported between instances of 'int' and 'str'",
+   "name": "compare_mismatched_types_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{{ 1 < 'a' }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_lstrip_blocks": {
-   "out": "x\n\n  body\n\ny",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"a\": {\"b\": 7}}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "attribute_access",
+   "out": "7",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d.a.b }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_lstrip_not_for_output_tags": {
-   "out": "x\n    1\ny",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"a\": 1}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "subscript_string_key",
+   "out": "1",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d['a'] }}",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_output_dash": {
+  {
+   "autoescape": false,
+   "context": "{\"l\": [10, 20, 30]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "subscript_int",
+   "out": "10|30",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l[0] }}|{{ l[-1] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [10, 20, 30]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "dot_integer_index",
+   "out": "20",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l.1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"hello\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "string_index",
+   "out": "h|o",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s[0] }}|{{ s[-1] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [0,1,2,3,4]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "slice_basic",
+   "out": "[1, 2]|[0, 1]|[2, 3, 4]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l[1:3] }}|{{ l[:2] }}|{{ l[2:] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [0,1,2,3,4]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "slice_negative_and_step",
+   "out": "[3, 4]|[0, 2, 4]|[4, 3, 2, 1, 0]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l[-2:] }}|{{ l[::2] }}|{{ l[::-1] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"abcdef\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "slice_string",
+   "out": "bcd|fedcba",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s[1:4] }}|{{ s[::-1] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "missing_key_is_undefined",
+   "out": "[]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ d.nope }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "index_out_of_range_is_undefined",
+   "out": "[]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ l[9] }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "list_literal",
+   "out": "1-2-3",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1, 2, 3]|join('-') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "dict_literal_trailing_close",
+   "out": "1",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ {'a': 1}['a'] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "adjacent_string_literals",
+   "out": "foobar",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'foo' 'bar' }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "string_escapes",
+   "out": "a\tb\nc|q\"q",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a\\tb\\nc' }}|{{ \"q\\\"q\" }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "number_forms",
+   "out": "31|15|5|1000|150.0",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 0x1f }}|{{ 0o17 }}|{{ 0b101 }}|{{ 1_000 }}|{{ 1.5e2 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_upper_lower",
+   "out": "MIXED|mixed",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'MiXed'|upper }}|{{ 'MiXed'|lower }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_capitalize_title",
+   "out": "Hello world|Hello World",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'hello world'|capitalize }}|{{ 'hello world'|title }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_trim",
+   "out": "[pad]|[hi]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ '  pad  '|trim }}]|[{{ 'xxhixx'|trim('x') }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_length_count",
+   "out": "3|3|1",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1,2,3]|length }}|{{ 'abc'|count }}|{{ {'a':1}|length }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"rows\": [{\"n\": 1}, {\"n\": 2}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_join_attribute",
+   "out": "1, 2",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ rows|join(', ', attribute='n') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_join_plain",
+   "out": "ab|1+2",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ ['a','b']|join }}|{{ [1,2]|join('+') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_replace",
+   "out": "bbb|bba",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'aaa'|replace('a','b') }}|{{ 'aaa'|replace('a','b',2) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_replace_empty_old",
+   "out": "XaXbXcX|X|XaXbc|abc|XaXbXcX",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'abc'|replace('','X') }}|{{ ''|replace('','X') }}|{{ 'abc'|replace('','X',2) }}|{{ 'abc'|replace('','X',0) }}|{{ 'abc'|replace('','X',-1) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_replace_empty_old_unicode",
+   "out": "X\u00e1XbX|-\u011b-\u0161-",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ '\u00e1b'|replace('','X') }}|{{ '\u011b\u0161'.replace('','-') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_default",
+   "out": "[D]|[]|[D]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ missing|default('D') }}]|[{{ ''|default('D') }}]|[{{ ''|default('D', true) }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_default_short",
+   "out": "5",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ nope|d(5) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_int_float",
+   "out": "42|0|9|1|3|2.5|1.5",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ '42'|int }}|{{ 'x'|int }}|{{ 'x'|int(9) }}|{{ '1.9'|int }}|{{ 3.9|int }}|{{ '2.5'|float }}|{{ 'x'|float(1.5) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_abs_round",
+   "out": "3|2.0|4.0|2.67|3.0|2.0",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ -3|abs }}|{{ 2.5|round }}|{{ 3.5|round }}|{{ 2.675|round(2) }}|{{ 2.1|round(0,'ceil') }}|{{ 2.9|round(0,'floor') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_round_ties_and_precision",
+   "out": "0.0|2.0|-2.0|1.0|2.35|0.07812|1200|1200",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 0.5|round }}|{{ 1.5|round }}|{{ -2.5|round }}|{{ 1.005|round(2) }}|{{ 2.345|round(2) }}|{{ 0.078125|round(5) }}|{{ 1234|round(-2) }}|{{ 1250|round(-2) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_first_last_list",
+   "out": "['a', 'b', 'c']|1|3",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'abc'|list }}|{{ [1,2,3]|first }}|{{ [1,2,3]|last }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_reverse",
+   "out": "[3, 2, 1]|cba",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1,2,3]|reverse|list }}|{{ 'abc'|reverse }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_sort_default_is_case_insensitive",
+   "out": "A,b,c",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ ['b','A','c']|sort|join(',') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_sort_case_sensitive",
+   "out": "A,b,c",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ ['b','A','c']|sort(case_sensitive=true)|join(',') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"rows\": [{\"n\": 2}, {\"n\": 3}, {\"n\": 1}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_sort_reverse_attribute",
+   "out": "3,2,1",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ rows|sort(reverse=true, attribute='n')|map(attribute='n')|join(',') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_min_max",
+   "out": "1|3|A",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [3,1,2]|min }}|{{ [3,1,2]|max }}|{{ ['b','A']|min }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"rows\": [{\"n\": 1}, {\"n\": 2}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_sum",
+   "out": "6|3|0",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1,2,3]|sum }}|{{ rows|sum(attribute='n') }}|{{ []|sum }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_unique",
+   "out": "a,b|a,A,b",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ ['a','A','b','a']|unique|join(',') }}|{{ ['a','A','b']|unique(true)|join(',') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_batch",
+   "out": "[[1, 2], [3, 4], [5]]|[[1, 2], [3, 0]]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1,2,3,4,5]|batch(2)|list }}|{{ [1,2,3]|batch(2, 0)|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_slice",
+   "out": "[[1, 2], [3, 4], [5]]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1,2,3,4,5]|slice(3)|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_indent",
+   "out": "[a\n  b\n  c]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ 'a\\nb\\nc'|indent(2) }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_indent_first",
+   "out": "[  a\n  b]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ 'a\\nb'|indent(2, true) }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_center",
+   "out": "[   ab  ]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ 'ab'|center(7) }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_truncate",
+   "out": "the...|the quick...",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'the quick brown fox jumps'|truncate(12) }}|{{ 'the quick brown fox jumps'|truncate(12, true) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_wordcount",
+   "out": "4",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a b  c\\nd'|wordcount }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_striptags",
+   "out": "bold and & more",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ '<b>bold</b>  and &amp; more'|striptags }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_string",
+   "out": "42!",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 42|string + '!' }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"b\": 1, \"a\": 2}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_items",
+   "out": "[('b', 1), ('a', 2)]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|items|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"b\": 1, \"A\": 2}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_dictsort",
+   "out": "[('A', 2), ('b', 1)]|[('b', 1), ('A', 2)]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|dictsort }}|{{ d|dictsort(by='value') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_map_name",
+   "out": "A,B",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ ['a','b']|map('upper')|join(',') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"rows\": [{\"n\": 1}, {\"n\": 2}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_map_attribute",
+   "out": "1,2",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ rows|map(attribute='n')|join(',') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_select_reject",
+   "out": "[1, 3]|[2, 4]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1,2,3,4]|select('odd')|list }}|{{ [1,2,3,4]|reject('odd')|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_select_truthy",
+   "out": "[1, 2]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [0,1,'',2]|select|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"rows\": [{\"n\": 1, \"ok\": true}, {\"n\": 2, \"ok\": false}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_selectattr",
+   "out": "1",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ rows|selectattr('ok')|map(attribute='n')|join(',') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"rows\": [{\"n\": 1}, {\"n\": 2}, {\"n\": 3}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_selectattr_test",
+   "out": "2,3",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ rows|selectattr('n','gt',1)|map(attribute='n')|join(',') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"rows\": [{\"n\": 1}, {\"n\": 2}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_rejectattr",
+   "out": "1",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ rows|rejectattr('n','eq',2)|map(attribute='n')|join(',') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_chain",
+   "out": "heLLo",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ '  Hello  '|trim|lower|replace('l','L') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_urlencode",
+   "out": "a%20b/c%3Fd%3De",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a b/c?d=e'|urlencode }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"b\": 1, \"a\": \"x\", \"c\": [true, null, 1.5]}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_tojson_scalars",
+   "out": "{\"a\": \"x\", \"b\": 1, \"c\": [true, null, 1.5]}",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|tojson }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"<a>&'\\\"\\n\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_tojson_escapes",
+   "out": "\"\\u003ca\\u003e\\u0026\\u0027\\\"\\n\"",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|tojson }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"a\": [1, 2]}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_tojson_indent",
+   "out": "{\n  \"a\": [\n    1,\n    2\n  ]\n}",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|tojson(2) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"a\": \"x\", \"b\": \"y\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_arg_evaluation_order",
+   "out": "y",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'x'|replace(a, b) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_on_expression",
+   "out": "3",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (1 + 2)|string }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"a\": 1}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "test_defined_undefined",
+   "out": "True|False|True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ a is defined }}|{{ b is defined }}|{{ b is undefined }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"n\": null, \"x\": 1}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "test_none",
+   "out": "True|False|False",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ n is none }}|{{ n is not none }}|{{ x is none }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "test_types",
+   "out": "True|True|True|True|True|True|True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1 is integer }}|{{ 1.0 is float }}|{{ 1 is number }}|{{ 'a' is string }}|{{ [1] is sequence }}|{{ {'a':1} is mapping }}|{{ true is boolean }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "test_even_odd_divisibleby",
+   "out": "True|False|True|False",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 4 is even }}|{{ 4 is odd }}|{{ 9 is divisibleby(3) }}|{{ 9 is divisibleby 4 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "test_comparison_tests",
+   "out": "True|False|True|True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1 is eq 1 }}|{{ 1 is equalto(2) }}|{{ 3 is gt 2 }}|{{ 3 is le 3 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "test_in",
+   "out": "True|False",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 2 is in([1,2]) }}|{{ 'z' is in 'abc' }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "test_upper_lower",
+   "out": "True|False|True",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'AB' is upper }}|{{ 'Ab' is upper }}|{{ 'ab' is lower }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "test_negated_in_condition",
+   "out": "no",
+   "status": "ok",
+   "strict": false,
+   "template": "{% if x is not defined %}no{% else %}yes{% endif %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"n\": 3}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "if_elif_else",
+   "out": "mid",
+   "status": "ok",
+   "strict": false,
+   "template": "{% if n > 5 %}big{% elif n > 2 %}mid{% else %}small{% endif %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "if_falsey_values",
+   "out": "-",
+   "status": "ok",
+   "strict": false,
+   "template": "{% if [] %}a{% endif %}{% if {} %}b{% endif %}{% if '' %}c{% endif %}{% if 0 %}d{% endif %}{% if none %}e{% endif %}-",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"a\": true, \"b\": false}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "if_nested",
+   "out": "a",
+   "status": "ok",
+   "strict": false,
+   "template": "{% if a %}{% if b %}ab{% else %}a{% endif %}{% endif %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2,3]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_basic",
+   "out": "1,2,3,",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in l %}{{ x }},{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": []}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_else_empty",
+   "out": "none",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in l %}{{ x }}{% else %}none{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"b\": 1, \"a\": 2}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_over_dict_yields_keys",
+   "out": "b,a,",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for k in d %}{{ k }},{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"b\": 1, \"a\": 2}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_over_items_unpack",
+   "out": "b=1;a=2;",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for k, v in d.items() %}{{ k }}={{ v }};{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_over_string",
+   "out": "[a][b][c]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for c in 'abc' %}[{{ c }}]{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [\"a\",\"b\",\"c\"]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_loop_fields",
+   "out": "1/0/3/2/True/False/3 2/1/2/1/False/False/3 3/2/1/0/False/True/3 ",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in l %}{{ loop.index }}/{{ loop.index0 }}/{{ loop.revindex }}/{{ loop.revindex0 }}/{{ loop.first }}/{{ loop.last }}/{{ loop.length }} {% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2,3]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_loop_previtem_nextitem",
+   "out": "[-<1>2][1<2>3][2<3>-]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in l %}[{{ loop.previtem|default('-') }}<{{ x }}>{{ loop.nextitem|default('-') }}]{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2,3,4,5]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_loop_cycle",
+   "out": "odd even odd even odd ",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in l %}{{ loop.cycle('odd','even') }} {% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,1,2,2,1]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_loop_changed",
+   "out": "True False True False True ",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in l %}{{ loop.changed(x) }} {% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"outer\": [\"x\",\"y\"], \"inner\": [1,2]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_nested_loop_shadows",
+   "out": "x1:1/2 x2:2/2 |y1:1/2 y2:2/2 |",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for a in outer %}{% for b in inner %}{{ a }}{{ b }}:{{ loop.index }}/{{ loop.length }} {% endfor %}|{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"outer\": [\"x\",\"y\"], \"inner\": [1,2]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_nested_outer_loop_saved",
+   "out": "1.1 1.2 2.1 2.2 ",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for a in outer %}{% set ol = loop %}{% for b in inner %}{{ ol.index }}.{{ loop.index }} {% endfor %}{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2,3,4,5]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_filtered_length",
+   "out": "1:1/3 3:2/3 5:3/3 ",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in l if x is odd %}{{ x }}:{{ loop.index }}/{{ loop.length }} {% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_filtered_else",
+   "out": "none",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in l if x > 10 %}{{ x }}{% else %}none{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_over_range",
+   "out": "012|25|321",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for i in range(3) %}{{ i }}{% endfor %}|{% for i in range(2, 8, 3) %}{{ i }}{% endfor %}|{% for i in range(3, 0, -1) %}{{ i }}{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_over_undefined_is_empty_lenient",
+   "out": "[]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{% for x in nope %}{{ x }}{% endfor %}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "UndefinedError",
+   "lstrip_blocks": false,
+   "msg": "'nope' is undefined",
+   "name": "for_over_undefined_errors_strict",
+   "status": "error",
+   "strict": true,
+   "template": "{% for x in nope %}{{ x }}{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "set_basic",
+   "out": "5",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set x = 5 %}{{ x }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "set_tuple",
+   "out": "12",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set a, b = [1, 2] %}{{ a }}{{ b }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "set_in_if_leaks",
+   "out": "2",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set x = 1 %}{% if true %}{% set x = 2 %}{% endif %}{{ x }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "set_in_for_does_not_leak",
+   "out": "0",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set t = 0 %}{% for x in [1,2,3] %}{% set t = t + x %}{% endfor %}{{ t }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "set_in_for_visible_within_loop",
+   "out": "246",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in [1,2,3] %}{% set t = x * 2 %}{{ t }}{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "namespace_survives_loop",
+   "out": "6",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set ns = namespace(total=0) %}{% for x in [1,2,3] %}{% set ns.total = ns.total + x %}{% endfor %}{{ ns.total }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"name\": \"bob\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "set_block",
+   "out": "[hi bob]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set greeting %}hi {{ name }}{% endset %}[{{ greeting }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "set_block_filtered",
+   "out": "[HI]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set g | upper %}hi{% endset %}[{{ g }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "with_scope",
+   "out": "1[gone]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% with a = 1 %}{{ a }}{% endwith %}[{{ a|default('gone') }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_block",
+   "out": "QUIET",
+   "status": "ok",
+   "strict": false,
+   "template": "{% filter upper %}quiet{% endfilter %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "loop_var_does_not_leak",
+   "out": "[gone]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in [1] %}{% endfor %}[{{ x|default('gone') }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "raw_block",
+   "out": "{{ not_a_var }} {% if %}",
+   "status": "ok",
+   "strict": false,
+   "template": "{% raw %}{{ not_a_var }} {% if %}{% endraw %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "raw_with_whitespace_control",
+   "out": "a{{x}}b",
+   "status": "ok",
+   "strict": false,
+   "template": "a  {%- raw -%}  {{x}}  {%- endraw -%}  b",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "ws_dash_left",
+   "out": "ab",
+   "status": "ok",
+   "strict": false,
+   "template": "a   {%- if true %}b{% endif %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "ws_dash_right",
+   "out": "b",
+   "status": "ok",
+   "strict": false,
+   "template": "{% if true -%}   b{% endif %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "ws_dash_both",
+   "out": "abc",
+   "status": "ok",
+   "strict": false,
+   "template": "a\n  {%- if true -%}  \n b\n  {%- endif -%}  \nc",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "ws_output_dash",
    "out": "axb",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "a   {{- 'x' -}}   b",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_plus_defeats_trim": {
-   "out": "\nline\n",
-   "status": "ok"
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "ws_comment_dash",
+   "out": "ab",
+   "status": "ok",
+   "strict": false,
+   "template": "a   {#- c -#}   b",
+   "templates": {},
+   "trim_blocks": false
   },
-  "ws_realistic_config": {
-   "out": "interface Gi0/1\n vlan 10\n vlan 20\n!",
-   "status": "ok"
-  },
-  "ws_trim_blocks": {
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "ws_trim_blocks",
    "out": "line\ntail",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "{% if true %}\nline\n{% endif %}\ntail",
+   "templates": {},
+   "trim_blocks": true
   },
-  "ws_trim_blocks_off": {
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "ws_trim_blocks_off",
    "out": "\nline\n\ntail",
-   "status": "ok"
+   "status": "ok",
+   "strict": false,
+   "template": "{% if true %}\nline\n{% endif %}\ntail",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "ws_lstrip_blocks",
+   "out": "x\n\n  body\n\ny",
+   "status": "ok",
+   "strict": false,
+   "template": "x\n    {% if true %}\n  body\n    {% endif %}\ny",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "ws_both_options",
+   "out": "x\n  body\ny",
+   "status": "ok",
+   "strict": false,
+   "template": "x\n    {% if true %}\n  body\n    {% endif %}\ny",
+   "templates": {},
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "ws_plus_defeats_trim",
+   "out": "\nline\n",
+   "status": "ok",
+   "strict": false,
+   "template": "{% if true +%}\nline\n{% endif %}",
+   "templates": {},
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "ws_lstrip_not_for_output_tags",
+   "out": "x\n    1\ny",
+   "status": "ok",
+   "strict": false,
+   "template": "x\n    {{ 1 }}\ny",
+   "templates": {},
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "ws_dash_beats_options",
+   "out": "xbodyy",
+   "status": "ok",
+   "strict": false,
+   "template": "x\n    {%- if true -%}\nbody\n{%- endif %}\ny",
+   "templates": {},
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{\"i\": \"Gi0/1\", \"vlans\": [10, 20]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "ws_realistic_config",
+   "out": "interface Gi0/1\n vlan 10\n vlan 20\n!",
+   "status": "ok",
+   "strict": false,
+   "template": "interface {{ i }}\n{%- for v in vlans %}\n vlan {{ v }}\n{%- endfor %}\n!\n",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "ws_loop_trim_blocks",
+   "out": "1\n2\n",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for v in l %}\n{{ v }}\n{% endfor %}",
+   "templates": {},
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "undefined_renders_empty_lenient",
+   "out": "[]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ missing }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "undefined_is_falsey_lenient",
+   "out": "no",
+   "status": "ok",
+   "strict": false,
+   "template": "{% if missing %}yes{% else %}no{% endif %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "UndefinedError",
+   "lstrip_blocks": false,
+   "msg": "'missing' is undefined",
+   "name": "undefined_attribute_errors_lenient",
+   "status": "error",
+   "strict": false,
+   "template": "{{ missing.attr }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "UndefinedError",
+   "lstrip_blocks": false,
+   "msg": "'missing' is undefined",
+   "name": "undefined_arithmetic_errors_lenient",
+   "status": "error",
+   "strict": false,
+   "template": "{{ missing + 1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "undefined_iteration_is_empty_lenient",
+   "out": "[[]]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ missing|list }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "undefined_default_filter_lenient",
+   "out": "ok",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ missing|default('ok') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "UndefinedError",
+   "lstrip_blocks": false,
+   "msg": "'missing' is undefined",
+   "name": "strict_output_errors",
+   "status": "error",
+   "strict": true,
+   "template": "[{{ missing }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "UndefinedError",
+   "lstrip_blocks": false,
+   "msg": "'missing' is undefined",
+   "name": "strict_if_errors",
+   "status": "error",
+   "strict": true,
+   "template": "{% if missing %}a{% endif %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "strict_defined_test_still_works",
+   "out": "False|True",
+   "status": "ok",
+   "strict": true,
+   "template": "{{ missing is defined }}|{{ missing is undefined }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "strict_default_filter_still_works",
+   "out": "ok",
+   "status": "ok",
+   "strict": true,
+   "template": "{{ missing|default('ok') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"a\": 1}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "strict_present_value_fine",
+   "out": "1",
+   "status": "ok",
+   "strict": true,
+   "template": "{{ a }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"<b>&'\\\"\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_off_passes_through",
+   "out": "<b>&'\"",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>&'\\\"\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_on_escapes",
+   "out": "&lt;b&gt;&amp;&#39;&#34;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_on_safe",
+   "out": "<b>",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|safe }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"<b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_filter_when_off",
+   "out": "&lt;b&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|escape }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_safe_then_escape_is_noop",
+   "out": "<b>",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|safe|escape }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_forceescape_double",
+   "out": "&lt;b&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|safe|forceescape }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>\", \"t\": \"<i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_markup_concat",
+   "out": "<b>&lt;i&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe) ~ t }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>\", \"t\": \"<i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_markup_add",
+   "out": "<b>&lt;i&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe) + t }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"l\": [\"<a>\", \"<b>\"]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_join_escapes_items",
+   "out": "&lt;a&gt;&lt;&gt;&lt;b&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l|join('<>') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>x\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_upper_preserves_markup",
+   "out": "<B>X",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|safe|upper }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"l\": [\"<a>\"]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_non_string_values",
+   "out": "[&#39;&lt;a&gt;&#39;]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_set_block_is_markup",
+   "out": "&lt;b&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set b %}{{ s }}{% endset %}{{ b }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"d\": {\"k\": \"<v>\"}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_tojson_is_safe",
+   "out": "{\"k\": \"\\u003cv\\u003e\"}",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|tojson }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"d\": {\"href\": \"a&b\", \"n\": null}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_xmlattr",
+   "out": "<a href=\"a&amp;b\">",
+   "status": "ok",
+   "strict": false,
+   "template": "<a{{ d|xmlattr }}>",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "truncate_no_space_keeps_prefix",
+   "out": "https://example.c...",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'https://example.com/averylongpath'|truncate(20) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "truncate_no_space_short",
+   "out": "abcdefg...",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'abcdefghijklmnop'|truncate(10) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "truncate_no_space_empty_end",
+   "out": "aaaaaaaaaaaa",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'aaaaaaaaaaaaaaaaaa'|truncate(12, false, '') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "int_base_zero_binary",
+   "out": "5",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ '0b101'|int(0, 0) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "int_base_zero_octal",
+   "out": "15",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ '0o17'|int(0, 0) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "int_base_zero_hex",
+   "out": "31",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ '0x1f'|int(0, 0) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "wordcount_punctuation_splits",
+   "out": "3",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a-b-c'|wordcount }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "wordcount_dotted",
+   "out": "2",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'foo.bar'|wordcount }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "wordcount_underscore_is_one_word",
+   "out": "1",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a_b'|wordcount }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "striptags_unterminated_lt_is_text",
+   "out": "a<b",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a<b'|striptags }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"k\": \"a b\"}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "urlencode_map_space_is_plus",
+   "out": "k=a+b",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|urlencode }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"a b\": \"c\"}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "urlencode_map_key_space_is_plus",
+   "out": "a+b=c",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|urlencode }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"k\": \"a/b\"}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "urlencode_map_slash_is_encoded",
+   "out": "k=a%2Fb",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|urlencode }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "urlencode_string_keeps_percent20",
+   "out": "a%20b",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a b'|urlencode }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"evil\": \"<script>a&b'\\\"</script>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_replace_filter_block",
+   "out": "q &lt;script&gt;a&amp;b&#39;&#34;&lt;/script&gt; q",
+   "status": "ok",
+   "strict": false,
+   "template": "{% filter replace('x', evil) %}q x q{% endfilter %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"evil\": \"<script>a&b'\\\"</script>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_replace_set_block",
+   "out": "q &lt;script&gt;a&amp;b&#39;&#34;&lt;/script&gt; q",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set b %}q x q{% endset %}{{ b|replace('x', evil) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"evil\": \"<i>&'\\\"</i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_replace_filter_block_count",
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; x q",
+   "status": "ok",
+   "strict": false,
+   "template": "{% filter replace('x', evil, 1) %}q x x q{% endfilter %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"q x q\", \"evil\": \"<i>&'\\\"</i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_replace_markup_matrix",
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q <i>&'\"</i> q|q <i>&'\"</i> q",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe)|replace('x', evil) }}|{{ s|replace('x', evil) }}|{{ s|replace('x', evil|safe) }}|{{ (s|safe)|replace('x', evil|safe) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"h\": \"<b>x</b>\", \"t\": \"<b>\", \"evil\": \"<i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_replace_markup_old_is_not_escaped",
+   "out": "Yx</b>|&lt;b&gt;x&lt;/b&gt;|&lt;b&gt;x&lt;/b&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (h|safe)|replace('<b>','Y') }}|{{ h|replace(t|safe,'Y') }}|{{ h|replace('<b>', evil|safe) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"q x q\", \"evil\": \"<i>&'\\\"</i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_replace_method_matrix",
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q <i>&'\"</i> q",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe).replace('x', evil) }}|{{ s.replace('x', evil) }}|{{ s.replace('x', evil|safe) }}|{{ (s|safe).replace('x', evil|safe) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"q x q\", \"evil\": \"<i>&'\\\"</i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_off_replace_method_markup_receiver",
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q|q <i>&'\"</i> q",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe).replace('x', evil) }}|{{ s.replace('x', evil) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"a<b\", \"evil\": \"<i>&'\\\"</i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_replace_empty_old_markup_matrix",
+   "out": "&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;&lt;&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;<&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;&&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;l&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;t&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;;&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;<&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|replace('', evil) }}|{{ (s|safe)|replace('', evil) }}|{{ s|replace(''|safe, evil) }}|{{ (s|safe).replace('', evil) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"q x q\", \"n\": 5, \"l\": [\"<a>\"]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_replace_non_string_argument",
+   "out": "q 5 q|q [&#39;&lt;a&gt;&#39;] q|q None q",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe)|replace('x', n) }}|{{ (s|safe)|replace('x', l) }}|{{ (s|safe)|replace('x', none) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"q x q\", \"evil\": \"<i>&'\\\"</i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_replace_through_map",
+   "out": "q &lt;i&gt;&amp;&#39;&#34;&lt;/i&gt; q",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [s|safe]|map('replace','x',evil)|list|join('') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"h\": \"a\\nb\", \"evil\": \"<i>&'\\\"</i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_indent_string_width_splices_raw",
+   "out": "<i>&'\"</i>q|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;a\n&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b",
+   "status": "ok",
+   "strict": false,
+   "template": "{% filter indent(evil, true) %}q{% endfilter %}|{{ h|indent(evil, true) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"h\": \"<b>x</b>\", \"evil\": \"<script>&'\\\"\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_trim_chars_argument_is_not_spliced",
+   "out": "b>x</b|b&gt;x&lt;/b|b>x</b>|b>x</b>",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (h|safe)|trim(evil) }}|{{ h|trim(evil) }}|{{ (h|safe).lstrip(evil) }}|{{ (h|safe).removeprefix('<') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"l\": [\"a\", \"b\"], \"h\": \"<b>\", \"t\": \"<i>\", \"evil\": \"<i>&'\\\"</i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_join_markup_separator_and_items",
+   "out": "a&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;b|<b>&lt;-&gt;&lt;i&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l|join(evil) }}|{{ [h|safe, t]|join('<->') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"long\": \"abcdefghijabcdefghijabcdefghijabcdefghij\", \"l\": [\"<a>\", \"b\", \"c\"], \"evil\": \"<i>&'\\\"</i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_argument_bearing_filters_on_plain_input",
+   "out": "abcdefghijabcde&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|&lt;i&gt;&amp;&#39;&#34;&lt;/i&gt;|[[&#39;&lt;a&gt;&#39;, &#39;b&#39;], [&#39;c&#39;, &#39;&lt;i&gt;&amp;\\&#39;&#34;&lt;/i&gt;&#39;]]|[[&#39;&lt;a&gt;&#39;, &#39;b&#39;], [&#39;c&#39;, &#39;&lt;i&gt;&amp;\\&#39;&#34;&lt;/i&gt;&#39;]]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ long|truncate(25, true, evil) }}|{{ missing|default(evil) }}|{{ l|batch(2, evil)|list }}|{{ l|slice(2, evil)|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>x</b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_capitalize_title_center_truncate_preserve_markup",
+   "out": "<b>x</b>|&lt;B&gt;x&lt;/b&gt;|  <b>x</b>  |<b>x</b>",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe)|capitalize }}|{{ (s|safe)|title }}|{{ (s|safe)|center(12) }}|{{ (s|safe)|truncate(4,true) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>x</b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_capitalize_title_center_truncate_plain_input",
+   "out": "&lt;b&gt;x&lt;/b&gt;|&lt;B&gt;x&lt;/b&gt;|  &lt;b&gt;x&lt;/b&gt;  |&lt;b&gt;x&lt;/b&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|capitalize }}|{{ s|title }}|{{ s|center(12) }}|{{ s|truncate(4,true) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>xxxxxxxx</b>\", \"evil\": \"<i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_truncate_end_argument_matrix",
+   "out": "<&lt;i&gt;|&lt;&lt;i&gt;|<<i>",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe)|truncate(4, true, evil) }}|{{ s|truncate(4, true, evil) }}|{{ (s|safe)|truncate(4, true, evil|safe) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>x</b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_chars_iteration_loses_markup_per_character",
+   "out": "&lt;|>|&lt;b|&lt;b&gt;x&lt;/b&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe)|first }}|{{ (s|safe)|last }}|{{ (s|safe)|batch(2)|first|join('') }}|{{ (s|safe)|list|join('') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<a>x</a>\\n<b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_split_preserves_markup_per_part",
+   "out": "<a>|<a>|</a>\n<b>|<a>x</a>|<b>",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe).split('x')|first }}|{{ (s|safe).split('x')|join('|') }}|{{ (s|safe).splitlines()|join('|') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<ab>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "escape_reverse_preserves_markup_of_whole_result",
+   "out": ">ba<",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (s|safe)|reverse }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_title_word_boundary_set",
+   "out": "A/b C-D(E|Eth0.100:tag|It's Ok",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 'a/b c-d(e'|title }}|{{ 'eth0.100:tag'|title }}|{{ \"it's ok\"|title }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"hello\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "string_methods",
+   "out": "HELLO|True|['he', '', 'o']|heLLo|2",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s.upper() }}|{{ s.startswith('he') }}|{{ s.split('l')|list }}|{{ s.replace('l','L') }}|{{ s.find('ll') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"a\": 1, \"b\": 2}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "dict_methods",
+   "out": "['a', 'b']|[1, 2]|1|dflt",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d.keys()|list }}|{{ d.values()|list }}|{{ d.get('a') }}|{{ d.get('z', 'dflt') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,1,2]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "list_methods",
+   "out": "2|2",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l.count(1) }}|{{ l.index(2) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "string_join_method",
+   "out": "a-b",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ '-'.join(['a','b']) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "global_range_repr",
+   "out": "[0, 1, 2]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ range(3)|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "global_dict",
+   "out": "{'a': 1, 'b': 2}",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ dict(a=1, b=2) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "bool_arithmetic",
+   "out": "2|3|1",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ true + true }}|{{ true * 3 }}|{{ false + 1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "conditional_without_else",
+   "out": "[]|[a]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ 'a' if false }}]|[{{ 'a' if true }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "undefined_equality_lenient",
+   "out": "True|False|False",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ missing == missing }}|{{ missing == none }}|{{ missing == 1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "sum_with_start",
+   "out": "16",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1,2,3]|sum(start=10) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "concat_with_none",
+   "out": "[Nonex]|[12]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ none ~ 'x' }}]|[{{ 1 ~ 2 }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "map_string_then_join",
+   "out": "1+2|abc",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ [1,2]|map('string')|join('+') }}|{{ 'abc'|list|join('') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2,3]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "loop_index_inside_if",
+   "out": "2;3;",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for x in l %}{% if x > 1 %}{{ loop.index }};{% endif %}{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "nested_loop_first_last",
+   "out": "TrueFalse FalseTrue TrueFalse|TrueFalse FalseTrue FalseTrue|",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for a in [1,2] %}{% for b in [1,2] %}{{ loop.first }}{{ loop.last }} {% endfor %}{{ loop.first }}{{ loop.last }}|{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_default_then_arithmetic",
+   "out": "2",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ (missing|default(1)) + 1 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"s\": \"<b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "autoescape_filter_block",
+   "out": "&LT;B&GT;",
+   "status": "ok",
+   "strict": false,
+   "template": "{% filter upper %}{{ s }}{% endfilter %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"a\": 1}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "dict_items_render_directly",
+   "out": "[('a', 1)]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d.items()|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2]}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "ValueError",
+   "lstrip_blocks": false,
+   "msg": "slice step cannot be zero",
+   "name": "slice_step_zero_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{{ l[::0] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "string_multiplied_by_zero",
+   "out": "[]|[]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ 'ab' * 0 }}]|[{{ 'ab' * -1 }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"b\": 1, \"a\": 2}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "chained_filters_on_dict",
+   "out": "('a', 2)",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|dictsort|first }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "whitespace_only_template",
+   "out": "   \n   ",
+   "status": "ok",
+   "strict": false,
+   "template": "   \n   ",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "tag_at_very_start_and_end",
+   "out": "1mid2",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ 1 }}mid{{ 2 }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"a<a>a\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_replace_negative_count",
+   "out": "b<b>b|b<b>b|a<a>a",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|replace('a','b',-1) }}|{{ s|replace('a','b',-5) }}|{{ s|replace('a','b',0) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"a<a>a\", \"n\": -5}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_replace_count_from_data",
+   "out": "b<b>b",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|replace('a','b',n) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"a\\n<b>\\nc\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_indent_negative_width",
+   "out": "[a\n<b>\nc]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ s|indent(-1, true) }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"a/b\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_center_negative_width",
+   "out": "[a/b]|[a/b]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{{ s|center(-1) }}]|[{{ s|center(0) }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"10\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_int_out_of_range_base",
+   "out": "10|10",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ s|int(0, -1) }}|{{ s|int(0, 99) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"x\": 1.5, \"n\": 15}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_round_saturating_precision",
+   "out": "1.5|0.0|0",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ x|round(10000000000) }}|{{ x|round(-10000000000) }}|{{ n|round(-400) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [\"a/b\", \"c\", 3], \"e\": []}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_batch_negative_linecount",
+   "out": "[['a/b', 'c', 3]]|[['a/b', 'c', 3]]|[]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l|batch(-1)|list }}|{{ l|batch(-1,'x')|list }}|{{ e|batch(-1)|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2,3]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_slice_negative_slices",
+   "out": "[]|[]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l|slice(-1)|list }}|{{ l|slice(-2,'x')|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"d\": {\"b\": 1, \"a\": \"<x>\"}}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "filter_tojson_negative_indent",
+   "out": "{\n\"a\": \"\\u003cx\\u003e\",\n\"b\": 1\n}",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ d|tojson(-1) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"abcdefghijklmnop\"}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "AssertionError",
+   "lstrip_blocks": false,
+   "msg": "expected length >= 3, got -1",
+   "name": "filter_truncate_negative_length",
+   "status": "error",
+   "strict": false,
+   "template": "{{ s|truncate(-1) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"abcdefghijklmnop\"}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "AssertionError",
+   "lstrip_blocks": false,
+   "msg": "expected leeway >= 0, got -1",
+   "name": "filter_truncate_negative_leeway",
+   "status": "error",
+   "strict": false,
+   "template": "{{ s|truncate(5, true, '...', -1) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TypeError",
+   "lstrip_blocks": false,
+   "msg": "'float' object cannot be interpreted as an integer",
+   "name": "global_range_float_out_of_range",
+   "status": "error",
+   "strict": false,
+   "template": "{{ range(1e300)|length }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"s\": \"abcd\"}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "OverflowError",
+   "lstrip_blocks": false,
+   "msg": "repeated string is too long",
+   "name": "repeat_str_product_overflows",
+   "status": "error",
+   "strict": false,
+   "template": "{{ (s * 4611686018427387904)|length }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2,3,4]}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "MemoryError",
+   "lstrip_blocks": false,
+   "msg": "",
+   "name": "repeat_list_product_overflows",
+   "status": "error",
+   "strict": false,
+   "template": "{{ (l * 4611686018427387904)|length }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"l\": [1,2,3], \"big\": 9223372036854775807, \"small\": -9223372036854775808}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "slice_step_saturates_at_i64_bounds",
+   "out": "[1]|[3]|[2]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ l[::big] }}|{{ l[::small] }}|{{ l[1::big] }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"big\": 9223372036854775807, \"small\": -9223372036854775808}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "OverflowError",
+   "lstrip_blocks": false,
+   "msg": "Python int too large to convert to C ssize_t",
+   "name": "range_span_overflows_i64",
+   "status": "error",
+   "strict": false,
+   "template": "{{ range(small, big)|length }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"big\": 9223372036854775807, \"bigm1\": 9223372036854775806, \"small\": -9223372036854775808, \"smallp1\": -9223372036854775807}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "range_fill_steps_past_i64_end",
+   "out": "[9223372036854775806]|[-9223372036854775807]",
+   "status": "ok",
+   "strict": false,
+   "template": "{{ range(bigm1, big, big)|list }}|{{ range(smallp1, small, small)|list }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "extends_basic",
+   "out": "[child]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block body %}child{% endblock %}",
+   "templates": {
+    "base": "[{% block body %}base{% endblock %}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "extends_block_not_overridden",
+   "out": "[a!B]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block a %}a!{% endblock %}",
+   "templates": {
+    "base": "[{% block a %}A{% endblock %}{% block b %}B{% endblock %}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "extends_child_text_is_discarded",
+   "out": "[c]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}THIS TEXT VANISHES{% block x %}c{% endblock %}",
+   "templates": {
+    "base": "[{% block x %}base{% endblock %}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "extends_child_toplevel_set_is_visible_in_block",
+   "out": "[42]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% set v = 42 %}{% block x %}{{ v }}{% endblock %}",
+   "templates": {
+    "base": "[{% block x %}base{% endblock %}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"n\": \"b1\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "extends_computed_name",
+   "out": "ONE !",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends n %}{% block x %}!{% endblock %}",
+   "templates": {
+    "b1": "ONE {% block x %}{% endblock %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "extends_name_from_set_above_it",
+   "out": "TWO !",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set which = 'b2' %}{% extends which %}{% block x %}!{% endblock %}",
+   "templates": {
+    "b2": "TWO {% block x %}{% endblock %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "super_three_levels",
+   "out": "A[c(b(a))]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'b' %}{% block x %}c({{ super() }}){% endblock %}",
+   "templates": {
+    "a": "A[{% block x %}a{% endblock %}]",
+    "b": "{% extends 'a' %}{% block x %}b({{ super() }}){% endblock %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "super_twice_in_one_block",
+   "out": "aa",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'a' %}{% block x %}{{ super() }}{{ super() }}{% endblock %}",
+   "templates": {
+    "a": "{% block x %}a{% endblock %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "super_skips_a_level_that_does_not_define_it",
+   "out": "[a]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'b' %}{% block x %}[{{ super() }}]{% endblock %}",
+   "templates": {
+    "a": "{% block x %}a{% endblock %}",
+    "b": "{% extends 'a' %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "nested_blocks",
+   "out": "[o(I)]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block i %}I{% endblock %}",
+   "templates": {
+    "base": "[{% block o %}o({% block i %}i{% endblock %}){% endblock %}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "nested_blocks_outer_overridden_drops_inner",
+   "out": "[O]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block o %}O{% endblock %}{% block i %}I{% endblock %}",
+   "templates": {
+    "base": "[{% block o %}o({% block i %}i{% endblock %}){% endblock %}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "block_in_for_is_not_scoped_by_default",
+   "out": "<><>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block x %}<{{ i }}>{% endblock %}",
+   "templates": {
+    "base": "{% for i in [1,2] %}{% block x %}[{{ i }}]{% endblock %}{% endfor %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "block_in_for_scoped_sees_the_loop_var",
+   "out": "<1><2>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block x scoped %}<{{ i }}>{% endblock %}",
+   "templates": {
+    "base": "{% for i in [1,2] %}{% block x scoped %}[{{ i }}]{% endblock %}{% endfor %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "block_sees_template_level_set_of_the_root",
+   "out": "[R]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block x %}[{{ r }}]{% endblock %}",
+   "templates": {
+    "base": "{% set r = 'R' %}{% block x %}{{ r }}{% endblock %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "block_body_may_contain_a_for",
+   "out": "12",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block x %}{% for i in [1,2] %}{{ i }}{% endfor %}{% endblock %}",
+   "templates": {
+    "base": "{% block x %}{% endblock %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "required_block_overridden",
+   "out": "[ok]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block x %}ok{% endblock %}",
+   "templates": {
+    "base": "[{% block x required %}{% endblock %}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TemplateRuntimeError",
+   "lstrip_blocks": false,
+   "msg": "Required block 'x' not found",
+   "name": "required_block_not_overridden_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% extends 'base' %}",
+   "templates": {
+    "base": "[{% block x required %}{% endblock %}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "endblock_may_repeat_the_name",
+   "out": "[c]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block x %}c{% endblock x %}",
+   "templates": {
+    "base": "[{% block x %}b{% endblock x %}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "self_block_reference",
+   "out": "Y|Y",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block x %}Y{% endblock %}",
+   "templates": {
+    "base": "{% block x %}X{% endblock %}|{{ self.x() }}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TemplateNotFound",
+   "lstrip_blocks": false,
+   "msg": "nope",
+   "name": "extends_missing_template_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% extends 'nope' %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "RecursionError",
+   "lstrip_blocks": false,
+   "msg": "maximum recursion depth exceeded",
+   "name": "extends_cycle_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% extends 'a' %}",
+   "templates": {
+    "a": "{% extends 'a' %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_basic",
+   "out": "a<included>b",
+   "status": "ok",
+   "strict": false,
+   "template": "a{% include 'inc' %}b",
+   "templates": {
+    "inc": "<included>"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_sees_context_by_default",
+   "out": "<1>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set v = 1 %}{% include 'inc' %}",
+   "templates": {
+    "inc": "<{{ v }}>"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"ctxvar\": \"C\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_without_context_sees_nothing",
+   "out": "<><>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set v = 1 %}{% include 'inc' without context %}",
+   "templates": {
+    "inc": "<{{ v }}><{{ ctxvar }}>"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_sees_the_loop_variable",
+   "out": "<1><2>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for i in [1,2] %}{% include 'inc' %}{% endfor %}",
+   "templates": {
+    "inc": "<{{ i }}>"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_set_does_not_leak_back",
+   "out": "[9][]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% include 'inc' %}[{{ w }}]",
+   "templates": {
+    "inc": "{% set w = 9 %}[{{ w }}]"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_ignore_missing",
+   "out": "[end]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% include 'nope' ignore missing %}[end]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TemplateNotFound",
+   "lstrip_blocks": false,
+   "msg": "nope",
+   "name": "include_missing_without_ignore_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% include 'nope' %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_candidate_list_picks_the_first_that_exists",
+   "out": "B",
+   "status": "ok",
+   "strict": false,
+   "template": "{% include ['nope', 'b'] %}",
+   "templates": {
+    "b": "B"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TemplatesNotFound",
+   "lstrip_blocks": false,
+   "msg": "none of the templates given were found: nope, alsonope",
+   "name": "include_candidate_list_all_missing_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% include ['nope', 'alsonope'] %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_candidate_list_all_missing_ignored",
+   "out": "[]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{% include ['nope', 'alsonope'] ignore missing %}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_of_a_template_that_extends",
+   "out": "B[C]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% include 'c' %}",
+   "templates": {
+    "base": "B[{% block x %}b{% endblock %}]",
+    "c": "{% extends 'base' %}{% block x %}C{% endblock %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_inside_a_macro_sees_the_parameter",
+   "out": "<7>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m(a) %}{% include 'inc' %}{% endmacro %}{{ m(7) }}",
+   "templates": {
+    "inc": "<{{ a }}>"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "include_runs_in_order_with_surrounding_sets",
+   "out": "<><1>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% include 'inc' %}{% set v = 1 %}{% include 'inc' %}",
+   "templates": {
+    "inc": "<{{ v }}>"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "RecursionError",
+   "lstrip_blocks": false,
+   "msg": "maximum recursion depth exceeded",
+   "name": "include_self_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% include 'loop' %}",
+   "templates": {
+    "loop": "x{% include 'loop' %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "import_defaults_to_without_context",
+   "out": "<>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set v = 1 %}{% import 'm' as m %}{{ m.f() }}",
+   "templates": {
+    "m": "{% macro f() %}<{{ v }}>{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "import_with_context",
+   "out": "<1>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set v = 1 %}{% import 'm' as m with context %}{{ m.f() }}",
+   "templates": {
+    "m": "{% macro f() %}<{{ v }}>{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"ctxvar\": \"C\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "import_without_context_hides_the_render_context_too",
+   "out": "<>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% import 'm' as m %}{{ m.f() }}",
+   "templates": {
+    "m": "{% macro f() %}<{{ ctxvar }}>{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "import_with_context_is_a_snapshot_not_a_view",
+   "out": "<>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% import 'm' as m with context %}{% set v = 'later' %}{{ m.f() }}",
+   "templates": {
+    "m": "{% macro f() %}<{{ v }}>{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "import_module_level_set_is_visible_to_its_macros",
+   "out": "<M>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% import 'm' as m %}{{ m.f() }}",
+   "templates": {
+    "m": "{% set mv = 'M' %}{% macro f() %}<{{ mv }}>{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "import_macro_sees_a_module_set_written_after_it",
+   "out": "<LATE>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% import 'm' as m %}{{ m.f() }}",
+   "templates": {
+    "m": "{% macro f() %}<{{ mv }}>{% endmacro %}{% set mv = 'LATE' %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "import_produces_no_output",
+   "out": "[]F",
+   "status": "ok",
+   "strict": false,
+   "template": "[{% import 'm' as m %}]{{ m.f() }}",
+   "templates": {
+    "m": "LOOSE TEXT{% macro f() %}F{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "import_exposes_module_variables_not_just_macros",
+   "out": "42",
+   "status": "ok",
+   "strict": false,
+   "template": "{% import 'm' as m %}{{ m.answer }}",
+   "templates": {
+    "m": "{% set answer = 42 %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "from_import_with_alias",
+   "out": "f=3",
+   "status": "ok",
+   "strict": false,
+   "template": "{% from 'm' import f as g %}{{ g(3) }}",
+   "templates": {
+    "m": "{% macro f(a) %}f={{ a }}{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "from_import_several",
+   "out": "AB",
+   "status": "ok",
+   "strict": false,
+   "template": "{% from 'm' import a, b %}{{ a() }}{{ b() }}",
+   "templates": {
+    "m": "{% macro a() %}A{% endmacro %}{% macro b() %}B{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "from_import_missing_name_is_undefined_not_an_error",
+   "out": "[]",
+   "status": "ok",
+   "strict": false,
+   "template": "[{% from 'm' import g %}{{ g }}]",
+   "templates": {
+    "m": "{% macro f() %}{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "from_import_with_context",
+   "out": "<V>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set v = 'V' %}{% from 'm' import f with context %}{{ f() }}",
+   "templates": {
+    "m": "{% macro f() %}<{{ v }}>{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TemplateNotFound",
+   "lstrip_blocks": false,
+   "msg": "nope",
+   "name": "import_missing_template_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% import 'nope' as m %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "import_ignores_blocks_in_the_module",
+   "out": "F",
+   "status": "ok",
+   "strict": false,
+   "template": "{% import 'm' as m %}{{ m.f() }}",
+   "templates": {
+    "m": "{% block b %}B{% endblock %}{% macro f() %}F{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_local_definition_and_call",
+   "out": "[1][x]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m(a) %}[{{ a }}]{% endmacro %}{{ m(1) }}{{ m('x') }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_defaults_and_keywords",
+   "out": "121978",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro f(a, b=2) %}{{ a }}{{ b }}{% endmacro %}{{ f(1) }}{{ f(1,9) }}{{ f(b=8,a=7) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_missing_argument_is_undefined",
+   "out": "[]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro f(a) %}[{{ a }}]{% endmacro %}{{ f() }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_sees_a_later_template_level_set",
+   "out": "[1V]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m(a) %}[{{ a }}{{ v }}]{% endmacro %}{% set v='V' %}{{ m(1) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_varargs_and_kwargs",
+   "out": "1|(2, 3)|{'k': 4}",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro f(a) %}{{ a }}|{{ varargs }}|{{ kwargs }}{% endmacro %}{{ f(1,2,3,k=4) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_varargs_empty",
+   "out": "()",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro f(a) %}{{ varargs }}{% endmacro %}{{ f(1) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TypeError",
+   "lstrip_blocks": false,
+   "msg": "macro 'f' takes not more than 1 argument(s)",
+   "name": "macro_extra_positional_without_varargs_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% macro f(a) %}{{ a }}{% endmacro %}{{ f(1,2) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TypeError",
+   "lstrip_blocks": false,
+   "msg": "macro 'f' takes no keyword argument 'zzz'",
+   "name": "macro_unexpected_keyword_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% macro f(a) %}{{ a }}{% endmacro %}{{ f(1, zzz=2) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_introspection_attributes",
+   "out": "f|('a', 'b')|False|False|False",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro f(a, b=1) %}{% endmacro %}{{ f.name }}|{{ f.arguments }}|{{ f.catch_kwargs }}|{{ f.catch_varargs }}|{{ f.caller }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_repr",
+   "out": "<Macro 'f'>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro f() %}x{% endmacro %}{{ f }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_recursive_by_name",
+   "out": "3210",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro f(n) %}{{ n }}{% if n > 0 %}{{ f(n-1) }}{% endif %}{% endmacro %}{{ f(3) }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "RecursionError",
+   "lstrip_blocks": false,
+   "msg": "maximum recursion depth exceeded",
+   "name": "macro_infinite_recursion_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% macro f() %}{{ f() }}{% endmacro %}{{ f() }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_inside_a_for_body",
+   "out": "[1][2]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for i in [1,2] %}{% macro m() %}[{{ i }}]{% endmacro %}{{ m() }}{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_output_is_a_value",
+   "out": "[pad]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m() %}  pad  {% endmacro %}[{{ m()|trim }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "imported_macro_uses_a_caller_registered_filter",
+   "out": "HI!",
+   "status": "ok",
+   "strict": false,
+   "template": "{% import 'm' as m %}{{ m.f('hi') }}",
+   "templates": {
+    "m": "{% macro f(x) %}{{ x|upper }}!{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "imported_macro_calls_another_macro_in_its_module",
+   "out": "[A]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% from 'm' import b %}{{ b() }}",
+   "templates": {
+    "m": "{% macro a() %}A{% endmacro %}{% macro b() %}[{{ a() }}]{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "call_block_basic",
+   "out": "<BODY>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m() %}<{{ caller() }}>{% endmacro %}{% call m() %}BODY{% endcall %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "call_block_with_arguments",
+   "out": "<X2>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m() %}{{ caller('X', 2) }}{% endmacro %}{% call(a, b) m() %}<{{ a }}{{ b }}>{% endcall %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "call_block_with_keyword_argument",
+   "out": "[1]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m() %}{{ caller(x=1) }}{% endmacro %}{% call(x) m() %}[{{ x }}]{% endcall %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "call_block_body_sees_the_enclosing_loop",
+   "out": "(1)(2)",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m() %}({{ caller() }}){% endmacro %}{% for i in [1,2] %}{% call m() %}{{ i }}{% endcall %}{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "call_block_caller_invoked_twice",
+   "out": "xx",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m() %}{{ caller() }}{{ caller() }}{% endmacro %}{% call m() %}x{% endcall %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": true,
+   "keep_trailing_newline": false,
+   "kind": "TypeError",
+   "lstrip_blocks": false,
+   "msg": "macro 'm' was invoked with two values for the special caller argument. This is most likely a bug.",
+   "name": "call_block_on_a_macro_without_caller_errors",
+   "status": "error",
+   "strict": false,
+   "template": "{% macro m() %}M{% endmacro %}{% call m() %}body{% endcall %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "call_block_on_an_imported_macro",
+   "out": "[inner]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% import 'm' as m %}{% call m.wrap() %}inner{% endcall %}",
+   "templates": {
+    "m": "{% macro wrap() %}[{{ caller() }}]{% endmacro %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"t\": [{\"n\": 1, \"c\": [{\"n\": 2, \"c\": []}]}, {\"n\": 3, \"c\": []}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_recursive_tree",
+   "out": "[1[2]][3]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for i in t recursive %}[{{ i.n }}{{ loop(i.c) if i.c }}]{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"t\": [{\"c\": [{\"c\": []}, {\"c\": []}]}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_recursive_depth_and_length",
+   "out": "1/1 2/2 2/2 ",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for i in t recursive %}{{ loop.depth }}/{{ loop.length }} {{ loop(i.c) }}{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"t\": [{\"n\": \"a\", \"c\": [{\"n\": \"b\", \"c\": []}]}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "for_recursive_indent",
+   "out": "a\n  b\n",
+   "status": "ok",
+   "strict": false,
+   "template": "{% for i in t recursive %}{{ '  ' * (loop.depth0) }}{{ i.n }}\n{{ loop(i.c) }}{% endfor %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"x\": \"<i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "autoescape_macro_output_is_markup",
+   "out": "<b>&lt;i&gt;</b>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m() %}<b>{{ x }}</b>{% endmacro %}{{ m() }}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"v\": \"<i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "autoescape_block_and_super",
+   "out": "<b>&lt;i&gt;",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}{% block x %}{{ super() }}{{ v }}{% endblock %}",
+   "templates": {
+    "base": "{% block x %}<b>{% endblock %}"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"v\": \"<i>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "autoescape_included_output_is_not_double_escaped",
+   "out": "<b>&lt;i&gt;</b>",
+   "status": "ok",
+   "strict": false,
+   "template": "{% include 'inc' %}",
+   "templates": {
+    "inc": "<b>{{ v }}</b>"
+   },
+   "trim_blocks": false
+  },
+  {
+   "autoescape": true,
+   "context": "{\"v\": \"<b>\"}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "autoescape_caller_output",
+   "out": "[<i>&lt;b&gt;]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m() %}[{{ caller() }}]{% endmacro %}{% call m() %}<i>{{ v }}{% endcall %}",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "extends_with_trim_and_lstrip",
+   "out": "start\n  child\nend",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'base' %}\n{% block x %}\n  child\n{% endblock %}\n",
+   "templates": {
+    "base": "start\n    {% block x %}\n    body\n    {% endblock %}\nend\n"
+   },
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "include_with_trim_blocks",
+   "out": "A\n1\n2\nB",
+   "status": "ok",
+   "strict": false,
+   "template": "A\n{% include 'inc' %}\nB",
+   "templates": {
+    "inc": "{% for i in [1,2] %}\n{{ i }}\n{% endfor %}"
+   },
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "macro_whitespace_control",
+   "out": "[1]",
+   "status": "ok",
+   "strict": false,
+   "template": "{% macro m(x) -%}\n  {{ x }}\n{%- endmacro %}[{{ m(1) }}]",
+   "templates": {},
+   "trim_blocks": false
+  },
+  {
+   "autoescape": false,
+   "context": "{\"host\": \"sw1\", \"interfaces\": [\n  {\"name\": \"Gi0/1\", \"addr\": \"10.0.0.1\", \"mask\": \"255.255.255.0\", \"desc\": \"uplink\"},\n  {\"name\": \"Gi0/2\", \"addr\": \"10.0.1.1\", \"mask\": \"255.255.255.0\", \"desc\": null}\n]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "config_composed_device",
+   "out": "hostname sw1\n!\ninterface Gi0/1\n description uplink\n ip address 10.0.0.1 255.255.255.0\ninterface Gi0/2\n ip address 10.0.1.1 255.255.255.0\n!\nno ip routing\nip routing\n!",
+   "status": "ok",
+   "strict": false,
+   "template": "{% extends 'device_base' %}\n{% import 'macros' as m %}\n{% block interfaces %}\n{% for i in interfaces %}{{ m.iface(i.name, i.addr, i.mask, i.desc) }}{% endfor %}\n{% endblock %}\n{% block routing %}{{ super() }}\nip routing\n{% endblock %}",
+   "templates": {
+    "device_base": "hostname {{ host }}\n!\n{% block interfaces %}{% endblock %}\n!\n{% block routing %}no ip routing{% endblock %}\n!",
+    "macros": "{% macro iface(name, addr, mask, desc=none) %}\ninterface {{ name }}\n{% if desc %} description {{ desc }}\n{% endif %} ip address {{ addr }} {{ mask }}\n{% endmacro %}"
+   },
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{\"host\": \"sw1\", \"interfaces\": [\n  {\"name\": \"Gi0/1\", \"description\": \"uplink\", \"address\": \"10.0.0.1\", \"mask\": \"255.255.255.0\", \"shutdown\": false},\n  {\"name\": \"Gi0/2\", \"address\": null, \"shutdown\": true}\n]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "config_interfaces",
+   "out": "hostname sw1\n!\ninterface Gi0/1\n description uplink\n ip address 10.0.0.1 255.255.255.0\n no shutdown\n!\ninterface Gi0/2\n no ip address\n shutdown\n!\n",
+   "status": "ok",
+   "strict": false,
+   "template": "hostname {{ host }}\n!\n{% for i in interfaces %}\ninterface {{ i.name }}\n{% if i.description is defined %}\n description {{ i.description }}\n{% endif %}\n{% if i.address %}\n ip address {{ i.address }} {{ i.mask }}\n{% else %}\n no ip address\n{% endif %}\n {{ 'shutdown' if i.shutdown else 'no shutdown' }}\n!\n{% endfor %}",
+   "templates": {},
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{\"rules\": [{\"action\": \"permit\", \"src\": \"any\", \"dst\": \"any\"},\n           {\"action\": \"deny\", \"proto\": \"tcp\", \"src\": \"10.0.0.0/8\", \"dst\": \"any\"}]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": true,
+   "name": "config_acl_with_namespace",
+   "out": "10 permit ip any any\n20 deny tcp 10.0.0.0/8 any\n",
+   "status": "ok",
+   "strict": false,
+   "template": "{% set ns = namespace(seq=10) %}\n{% for r in rules %}\n{{ ns.seq }} {{ r.action }} {{ r.proto|default('ip') }} {{ r.src }} {{ r.dst }}\n{% set ns.seq = ns.seq + 10 %}\n{% endfor %}",
+   "templates": {},
+   "trim_blocks": true
+  },
+  {
+   "autoescape": false,
+   "context": "{\"name\": \"a\\\"b\", \"tags\": [\"x\", \"y\"]}",
+   "expect_error": false,
+   "keep_trailing_newline": false,
+   "lstrip_blocks": false,
+   "name": "config_json_payload",
+   "out": "{\"name\": \"a\\\"b\", \"tags\": [\"x\", \"y\"]}",
+   "status": "ok",
+   "strict": false,
+   "template": "{\"name\": {{ name|tojson }}, \"tags\": {{ tags|tojson }}}",
+   "templates": {},
+   "trim_blocks": false
   }
+ ],
+ "command": "zig build interop-jinja -- --capture",
+ "determinism": {
+  "autoescape_default": false,
+  "delimiters": {
+   "block": [
+    "{%",
+    "%}"
+   ],
+   "comment": [
+    "{#",
+    "#}"
+   ],
+   "line_comment_prefix": null,
+   "line_statement_prefix": null,
+   "variable": [
+    "{{",
+    "}}"
+   ]
+  },
+  "extensions": [],
+  "float_repr_style": "short",
+  "keep_trailing_newline_default": false,
+  "newline_sequence": "\n",
+  "policies": {
+   "compiler.ascii_str": "True",
+   "ext.i18n.trimmed": "False",
+   "json.dumps_function": "None",
+   "json.dumps_kwargs": "{'sort_keys': True}",
+   "truncate.leeway": "5",
+   "urlize.extra_schemes": "None",
+   "urlize.rel": "'noopener'",
+   "urlize.target": "None"
+  },
+  "process_env": {
+   "LANG": "C",
+   "LC_ALL": "C",
+   "PYTHONHASHSEED": "0",
+   "TZ": "UTC"
+  },
+  "undefined_default": "Undefined"
  },
+ "driver": "modules/jinja/tools/reference.py",
  "jinja2": "3.1.6",
+ "markupsafe": "3.0.3",
  "python": "3.14.4"
 }

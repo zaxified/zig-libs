@@ -913,7 +913,7 @@ capability_check() {
         modules/jinja/src/testdata/golden.json 2>/dev/null | head -1)"
     live_j2="$(python3 -c 'import jinja2; print(jinja2.__version__)' 2>/dev/null)"
     if [[ -z "$live_j2" ]]; then
-        gaps+=("python lacks jinja2|the whole jinja live-reference suite skips — 337 corpus cases stop being checked against the real engine|pip install 'jinja2==${golden_j2:-3.1.6}'")
+        gaps+=("python lacks jinja2|'zig build interop-jinja' cannot re-render the 351-case corpus against the real engine (test-jinja replays the transcript hermetically since 2026-09-06)|pip install 'jinja2==${golden_j2:-3.1.6}'")
     elif [[ -n "$golden_j2" && "$live_j2" != "$golden_j2" ]]; then
         gaps+=("jinja2 $live_j2 != golden's $golden_j2|the live oracle is not the one the committed golden was generated from, so a red jinja case may be drift rather than a defect|pip install 'jinja2==$golden_j2'")
     fi
@@ -964,10 +964,10 @@ capability_check() {
     # test then failed on the missing import rather than skipping.
     local oracle
     for oracle in \
-        "grpc, google.protobuf|grpcio protobuf|zig-libs-grpc|15 grpc reference-interop tests (the gRPC wire format against a real grpcio peer)" \
-        "sympy|sympy||5 poseidon subspace-trail tests (the algebraic attack bound, recomputed rather than trusted)" \
-        "brotli|brotli||4 brotli reference-interop tests (round-trips against google/brotli itself)" \
-        "google.protobuf|protobuf||9 protobuf reference-interop tests (our encoding against the upstream Python runtime)"
+        "grpc, google.protobuf|grpcio protobuf|zig-libs-grpc|'zig build interop-grpc' cannot re-take the wire recording against a real grpcio peer (test-grpc itself is hermetic since 2026-09-06 and does not need this)" \
+        "sympy|sympy||'zig build interop-poseidon' cannot re-take the MDS subspace-trail transcript (test-poseidon replays it hermetically since 2026-09-06)" \
+        "brotli|brotli||'zig build interop-brotli' cannot re-bless the reference streams against google/brotli (test-brotli replays them hermetically since 2026-09-06)" \
+        "google.protobuf|protobuf||'zig build interop-protobuf' cannot re-capture against the upstream Python runtime (test-protobuf replays the capture hermetically since 2026-09-06)"
     do
         local mod="${oracle%%|*}" rest2="${oracle#*|}"
         local pkg="${rest2%%|*}"; rest2="${rest2#*|}"

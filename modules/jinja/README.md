@@ -27,19 +27,22 @@ lists every one.
 Provenance: clean-room from the Jinja2 documentation (the template-designer
 and API docs at jinja.palletsprojects.com) plus the observable behaviour of the
 installed reference implementation. NO Jinja2 (or MarkupSafe) source was read or
-ported. Python Jinja2 3.1.6 is used only as a byte-exact black-box test ORACLE
-in a subprocess (`SPEC.md` §7) — the root `NOTICE` §0 relationship, needing no
-attribution — and is recorded here because the module's behaviour, operator
-precedence, filter/test vocabulary and API shape are deliberately modelled on it
+ported. Python Jinja2 3.1.6 is used only as a byte-exact black-box test ORACLE,
+run in a subprocess by `tools/interop.zig` and never by the module (`SPEC.md`
+§7) — the root `NOTICE` §0 relationship, needing no attribution — and is
+recorded here because the module's behaviour, operator precedence, filter/test
+vocabulary and API shape are deliberately modelled on it
 (pallets/jinja, **BSD-3-Clause**; pallets/markupsafe, **BSD-3-Clause** —
 behaviour only, no source copied). The Python language semantics reproduced
 along the way (floored `//`/`%`, `repr` forms, banker's rounding) are facts of a
 published language specification, not of any implementation. This is a
 provenance record and carries no condition beyond zig-libs' MIT license. Test
-data: `src/testdata/reference.py` is this repo's own script
+data: `tools/reference.py` is this repo's own script
 (`SPDX-License-Identifier: MIT`) — it merely invokes Jinja2, and none of
 Jinja2's source is reproduced in it — and `src/testdata/golden.json` is that
-script's output, so both are our own work.
+script's output, so both are our own work. The module itself ships no Python and
+spawns none: the driver lives in `tools/`, outside the module, and only
+`zig build interop-jinja` runs it.
 
 ## Import
 
@@ -390,15 +393,20 @@ and the render arena are gone.
 ## Verify
 
 ```sh
-zig build test-jinja --summary all           # unit + golden + live-reference
-ZIG_LIBS_VERBOSE_SKIP=1 zig build test-jinja # say why a live test skipped
+zig build test-jinja --summary all           # unit + conformance replay
 zig build test-jinja --fuzz --release=safe   # fuzz the compiler
+zig build interop-jinja                      # re-run the live Python peer
+zig build interop-jinja -- --capture         # re-take the transcript
 ```
 
-The conformance suite renders a 330-case corpus with **Python Jinja2 3.1.6** in
-a subprocess and compares byte for byte, and separately against a committed
-golden file produced by that same reference so an offline host still asserts
-conformance. Python is a test oracle only — nothing links against it. If
-`python3` or `jinja2` is missing, the live tests skip loudly and the golden
-tests still run. See `SPEC.md` for the design, the full divergence table and the
-regeneration procedure.
+The conformance suite replays `src/testdata/golden.json` — 351 cases, each one
+an input the reference was given and the bytes **Python Jinja2 3.1.6** returned
+for it — and compares byte for byte. That runs everywhere: no `python3`, no
+subprocess, no foreign source in the module.
+
+Taking that transcript is a separate program, `tools/interop.zig`, which renders
+`tools/corpus.zig` with the real Jinja2 and is the only thing that can notice the
+*reference* changing. It needs `python3` with `jinja2`; it is never built by
+`test-jinja`, and `zig build check-interop` compiles it without running it. See
+`SPEC.md` §7 for the design, what the transcript pins, and the full divergence
+table.

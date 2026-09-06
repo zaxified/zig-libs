@@ -434,6 +434,10 @@ pub fn build(b: *std.Build) void {
         mods.put(m.name, mod) catch @panic("OOM");
     }
 
+    // Aggregates for the interop programs created inside the loop below.
+    const interop_all = b.step("interop", "Run every module's interop program (needs the foreign peers)");
+    const check_interop = b.step("check-interop", "Compile every interop program -- rot guard, runs no peer");
+
     // Pass 2: wire deps + register a test build per module.
     for (module_list) |m| {
         const mod = mods.get(m.name).?;
@@ -492,6 +496,60 @@ pub fn build(b: *std.Build) void {
         // Per-module test step: `zig build test-<name>`.
         const one = b.step(b.fmt("test-{s}", .{m.name}), b.fmt("Test the {s} module", .{m.name}));
         one.dependOn(&run.step);
+
+        // ⭐ INTEROP PROGRAMS LIVE OUTSIDE THE MODULE, AND OUTSIDE ITS TESTS.
+        //
+        // A module is standalone Zig with no external dependency. An anchor
+        // against a foreign implementation is a different thing: it needs a C
+        // compiler, a Python, a container, a system library. Until 2026-09-06
+        // those two lived in one file -- `modules/dtls/src/wolfssl_interop.zig`
+        // `@embedFile`d a 555-line C peer and shelled out to `cc -lwolfssl`
+        // from inside `test-dtls`, and five more modules did the same with
+        // `python3` -- so every consumer of the library carried foreign source,
+        // and `test-<m>` could not run without a toolchain it had no business
+        // needing. It "skipped loudly" instead, and CI's peer install is
+        // `continue-on-error`, so a failed install degraded to a silent skip:
+        // the mess was paid for and the anchor still might not run.
+        //
+        // The split: `modules/<m>/tools/interop.zig` is a standalone PROGRAM.
+        // It may spawn anything. It is never compiled into the module and
+        // never into `test-<m>`. What it produces -- a transcript of the
+        // exchange, committed under `src/testdata/` -- is what the module's own
+        // hermetic tests replay, so the anchor's VALUE runs in the lane that
+        // runs everywhere while the anchor's TAKING stays here.
+        //
+        // Discovered by existence, not declared in a table: a module either has
+        // the file or does not, and a table would be a second place to forget.
+        if (moduleHasInterop(b, m.name)) {
+            const interop_mod = b.createModule(.{
+                .root_source_file = b.path(b.fmt("modules/{s}/tools/interop.zig", .{m.name})),
+                .target = target,
+                .optimize = if (m.heavy) heavy_optimize else optimize,
+            });
+            interop_mod.addImport(m.name, mod);
+            for (m.deps) |dep| interop_mod.addImport(dep, mods.get(dep).?);
+            for (m.test_deps) |dep| interop_mod.addImport(dep, mods.get(dep).?);
+
+            const interop_exe = b.addExecutable(.{
+                .name = b.fmt("interop-{s}", .{m.name}),
+                .root_module = interop_mod,
+            });
+            const interop_run = b.addRunArtifact(interop_exe);
+            if (b.args) |args| interop_run.addArgs(args);
+            const interop_one = b.step(
+                b.fmt("interop-{s}", .{m.name}),
+                b.fmt("Run the {s} interop program against a real foreign peer (needs that peer)", .{m.name}),
+            );
+            interop_one.dependOn(&interop_run.step);
+            interop_all.dependOn(&interop_run.step);
+
+            // Rot guard, the same shape `check-ctgrind` uses for its harnesses:
+            // COMPILE every interop program on a lane that has no peers at all.
+            // An instrument nothing builds is an instrument that stops building
+            // without anyone hearing, and this repository has lost an anchor
+            // that way before.
+            check_interop.dependOn(&interop_exe.step);
+        }
 
         // `check-pubfn-reach`: compile a second root over the SAME module graph
         // whose only job is to take a reference to every public declaration.
@@ -1508,6 +1566,15 @@ fn ownFilesModule(b: *std.Build, name: []const u8) *std.Build.Module {
     const opts = b.addOptions();
     opts.addOption([]const []const u8, "names", moduleFileNamespaces(b, b.graph.io, name));
     return opts.createModule();
+}
+
+/// Whether a module carries an interop PROGRAM — `modules/<name>/tools/interop.zig`.
+/// Existence is the declaration: a table listing which modules have one would be
+/// a second place to forget, and this repository retired two such tables in
+/// August for exactly that reason.
+fn moduleHasInterop(b: *std.Build, name: []const u8) bool {
+    const path = b.fmt("modules/{s}/tools/interop.zig", .{name});
+    return if (b.build_root.handle.access(b.graph.io, path, .{})) |_| true else |_| false;
 }
 
 fn moduleHasExample(b: *std.Build, name: []const u8) bool {

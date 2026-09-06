@@ -240,9 +240,9 @@ test "hostile: an exhaustive enum rejects a value it cannot represent" {
 // whatever authorisation decision reads the value.
 //
 // Every expected value below was read off the reference implementation
-// (Python `protobuf` 4.21.12, the same descriptor pool `testdata/reference.py`
+// (Python `protobuf` 4.21.12, the same descriptor pool `tools/reference.py`
 // builds), not off this decoder. The live counterparts in
-// `reference_interop.zig` re-derive them from the reference on every run where
+// `tools/interop.zig` re-derive them from the reference on every run where
 // python3 is present; these run everywhere.
 
 test "hostile: a second copy of a singular submessage merges, it cannot hide a field" {

@@ -5,8 +5,8 @@
 //! The byte vectors here are hand-derived from the published encoding spec,
 //! not from our own encoder, so they stay meaningful even if encoder and
 //! decoder drift together. The live reference implementation checks the same
-//! ground independently in `reference_interop.zig` — see SPEC.md for why
-//! both exist.
+//! ground independently in `tools/interop.zig` — see SPEC.md for why both
+//! exist.
 
 const std = @import("std");
 const testing = std.testing;
@@ -15,125 +15,23 @@ const pb = @import("root.zig");
 const Field = pb.Field;
 
 // ── shared fixtures ─────────────────────────────────────────────────────────
+//
+// The message types themselves live in `conformance.zig`, which the
+// out-of-tree interop program (`tools/interop.zig`) also imports — one table,
+// so the live run against the reference and the frozen replay here judge the
+// same schemas. Re-exported under their old names so every existing reference
+// (`ct.Wide`, `ct.Chain`, …) keeps working.
 
-pub const Color = enum(i32) {
-    unspecified = 0,
-    red = 1,
-    green = 2,
-    _, // open, as proto3 enums are
-};
+const conformance = @import("conformance.zig");
 
-pub const Inner = struct {
-    v: i32 = 0,
-    note: []const u8 = "",
-    pub const pb_fields = .{
-        .v = Field{ .number = 1, .kind = .int32 },
-        .note = Field{ .number = 2, .kind = .string },
-    };
-};
-
-pub const Wide = struct {
-    i32_: i32 = 0,
-    i64_: i64 = 0,
-    u32_: u32 = 0,
-    u64_: u64 = 0,
-    s32: i32 = 0,
-    s64: i64 = 0,
-    b: bool = false,
-    color: Color = .unspecified,
-    f64_: u64 = 0,
-    sf64: i64 = 0,
-    d: f64 = 0,
-    f32_: u32 = 0,
-    sf32: i32 = 0,
-    f: f32 = 0,
-    s: []const u8 = "",
-    raw: []const u8 = "",
-    inner: ?Inner = null,
-
-    pub const pb_fields = .{
-        .i32_ = Field{ .number = 1, .kind = .int32 },
-        .i64_ = Field{ .number = 2, .kind = .int64 },
-        .u32_ = Field{ .number = 3, .kind = .uint32 },
-        .u64_ = Field{ .number = 4, .kind = .uint64 },
-        .s32 = Field{ .number = 5, .kind = .sint32 },
-        .s64 = Field{ .number = 6, .kind = .sint64 },
-        .b = Field{ .number = 7, .kind = .bool },
-        .color = Field{ .number = 8, .kind = .@"enum" },
-        .f64_ = Field{ .number = 9, .kind = .fixed64 },
-        .sf64 = Field{ .number = 10, .kind = .sfixed64 },
-        .d = Field{ .number = 11, .kind = .double },
-        .f32_ = Field{ .number = 12, .kind = .fixed32 },
-        .sf32 = Field{ .number = 13, .kind = .sfixed32 },
-        .f = Field{ .number = 14, .kind = .float },
-        .s = Field{ .number = 15, .kind = .string },
-        .raw = Field{ .number = 16, .kind = .bytes },
-        .inner = Field{ .number = 17, .kind = .message },
-    };
-};
-
-pub const Repeated = struct {
-    nums: []const i32 = &.{},
-    unpacked: []const i32 = &.{},
-    zz: []const i64 = &.{},
-    fixed: []const u32 = &.{},
-    flags: []const bool = &.{},
-    colors: []const Color = &.{},
-    names: []const []const u8 = &.{},
-    inners: []const Inner = &.{},
-
-    pub const pb_fields = .{
-        .nums = Field{ .number = 1, .kind = .int32 },
-        .unpacked = Field{ .number = 2, .kind = .int32, .packed_encoding = false },
-        .zz = Field{ .number = 3, .kind = .sint64 },
-        .fixed = Field{ .number = 4, .kind = .fixed32 },
-        .flags = Field{ .number = 5, .kind = .bool },
-        .colors = Field{ .number = 6, .kind = .@"enum" },
-        .names = Field{ .number = 7, .kind = .string },
-        .inners = Field{ .number = 8, .kind = .message },
-    };
-};
-
-pub const Presence = struct {
-    implicit: i32 = 0,
-    explicit: ?i32 = null,
-    implicit_str: []const u8 = "",
-    explicit_str: ?[]const u8 = null,
-
-    pub const pb_fields = .{
-        .implicit = Field{ .number = 1, .kind = .int32 },
-        .explicit = Field{ .number = 2, .kind = .int32 },
-        .implicit_str = Field{ .number = 3, .kind = .string },
-        .explicit_str = Field{ .number = 4, .kind = .string },
-    };
-};
-
-/// A message that keeps what it does not understand.
-pub const Keeps = struct {
-    known: i32 = 0,
-    unknown: pb.Unknown = .empty,
-    pub const pb_fields = .{
-        .known = Field{ .number = 1, .kind = .int32 },
-    };
-};
-
-/// The same field numbers, minus the fields a newer peer knows about.
-pub const Drops = struct {
-    known: i32 = 0,
-    pub const pb_fields = .{
-        .known = Field{ .number = 1, .kind = .int32 },
-    };
-};
-
-/// Self-recursive via a boxed optional — the shape a linked structure needs.
-pub const Chain = struct {
-    depth: i32 = 0,
-    next: ?*const Chain = null,
-    pub const pb_fields = .{
-        .depth = Field{ .number = 1, .kind = .int32 },
-        .next = Field{ .number = 2, .kind = .message },
-    };
-};
+pub const Color = conformance.Color;
+pub const Inner = conformance.Inner;
+pub const Wide = conformance.Wide;
+pub const Repeated = conformance.Repeated;
+pub const Presence = conformance.Presence;
+pub const Keeps = conformance.Keeps;
+pub const Drops = conformance.Drops;
+pub const Chain = conformance.Chain;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 

@@ -19,9 +19,12 @@ ordinary Zig structs with a `pb_fields` descriptor.
 Provenance: the `grpc-over-http2` protocol specification and `doc/compression.md` are public
 specifications (merger doctrine — CONVENTIONS.md §5); clean-room, no gRPC implementation source
 ported or studied. The Python `grpcio` package is run as a black-box test oracle only. No NOTICE
-entry needed. Test data: `src/testdata/reference_client.py` and
-`src/testdata/reference_server.py` are this repo's own scripts
-(`SPDX-License-Identifier: MIT`) that drive that oracle; neither reproduces any part of `grpcio`.
+entry needed. The two scripts that drive that oracle — `tools/reference_client.py` and
+`tools/reference_server.py` — are this repo's own (`SPDX-License-Identifier: MIT`) and neither
+reproduces any part of `grpcio`. They live in `tools/`, **outside the module**: `src/` is
+standalone Zig with no external dependency, and nothing under `src/` spawns a process. What the
+module's own tests use is `src/testdata/grpcio/*.bin` — a recording of one real conversation
+with `grpcio`, replayed offline.
 
 ## Quick start
 
@@ -270,24 +273,38 @@ exact and never sleep.
 zig build test-grpc --summary all
 ```
 
-The interop tests drive **Python `grpcio`** as an external oracle in **both directions**:
+**`test-grpc` needs nothing but Zig — no `python3`, no `go`, no network, no child process — and
+it skips nothing.** The external anchor still runs there, as a *replay*: `src/reference_replay.zig`
+feeds `src/testdata/grpcio/*.bin` — a byte-for-byte recording of one real conversation with
+`grpcio`, in **both directions** — back through the same code paths that made it.
 
-- *our client → the reference server*: all four shapes, a Trailers-Only failure, a status in a
-  trailer section after a body, metadata both ways including `-bin`, a deadline the reference
-  reads back, a 256 KiB reply reassembled across DATA frames, and the receive limit refusing an
-  oversized one;
-- *the reference client → our server*: the same twelve observations, this time with everything
-  **we produce** under a real parser — which is the stronger direction, because a client that
-  mis-frames can still be understood by a lenient peer while a server that mis-frames cannot.
+- *the reference server's bytes → our client*: all four shapes, a Trailers-Only failure whose
+  `grpc-message` is full of bytes the ABNF forbids, a status in a trailer section after a body,
+  metadata both ways including `-bin`, a deadline the reference read back, a 256 KiB reply
+  reassembled across DATA frames, the receive limit refusing an oversized one, three calls
+  multiplexed on one connection;
+- *the reference client's bytes → our server*: the same twelve observations, with everything
+  **we produce** decoded at the frame level and checked against what `grpcio` itself read off
+  the wire at capture time. That is the stronger direction, because a client that mis-frames can
+  still be understood by a lenient peer while a server that mis-frames cannot.
+
+The **live** comparison is a separate program, `tools/interop.zig`, and it is the only thing that
+can find a *new* divergence:
+
+```bash
+zig build interop-grpc               # live, both directions (needs grpcio)
+zig build interop-grpc -- --capture  # …and rewrite the replay fixture
+zig build check-interop              # compile it; run no peer (rot guard)
+```
+
+`$GRPC_PYTHON` points it at a virtualenv with `grpcio` and `protobuf`; without one it says so and
+exits 2, never as a silent pass. `src/testdata/grpcio_capture.zig` records which grpcio, on which
+day, by which command, and what was pinned to make replay deterministic.
 
 Offline, the server tests put an `h2.Connection` in client role on the other end of
 `h2_server.serve` and assert on **frames**, not field values: how many HEADERS blocks, which one
 carried END_STREAM, whether a DATA frame exists at all. That is the only way to see the
 Trailers-Only distinction, since both shapes use the same field names.
-
-All of them **skip loudly** (never silently, never as a failure) when the interpreter or
-`grpcio` is missing; set `GRPC_PYTHON` to point at a virtualenv and `ZIG_LIBS_VERBOSE_SKIP=1` to
-see skip reasons.
 
 ## Not implemented
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! The conformance corpus: templates + contexts, rendered by BOTH this module
-//! and Python Jinja2 and compared byte for byte.
+//! The conformance corpus: templates + contexts, rendered by Python Jinja2 and
+//! by this module, and compared byte for byte.
 //!
 //! It is deliberately weighted towards the parts that are easy to get subtly
 //! wrong and hard to notice — whitespace control combinations, `loop` inside
@@ -8,10 +8,22 @@
 //! on negatives, filter argument evaluation, and autoescape interacting with
 //! `|safe` — rather than towards the parts a smoke test already covers.
 //!
-//! One table, two consumers: `reference_test.zig` (live Python) and
-//! `golden_test.zig` (committed output of that same Python). Adding a case here
-//! makes both oracles cover it; the golden test fails until the golden file is
-//! regenerated, which is the intended friction.
+//! ## Why this lives in `tools/` and not in `src/`
+//!
+//! This table is the input half of an instrument that runs a foreign peer, and
+//! `build.zig`'s interop mechanism gives a `tools/` program exactly one view of
+//! the module: its published root. Keeping the corpus in `src/` would therefore
+//! have meant exporting a 350-case test table from the library's public API so
+//! that an out-of-tree program could see it — growing what every consumer gets
+//! in order to serve a test. The corpus goes where the instrument that consumes
+//! it is instead.
+//!
+//! Nothing is lost to the module: `tools/interop.zig` renders this table with
+//! Python Jinja2 and captures every case — inputs *and* reference output — into
+//! `src/testdata/golden.json`, and `src/reference_replay_test.zig` replays that
+//! file hermetically. Adding a case here covers it in both, once re-captured;
+//! until then the replay test simply keeps asserting the cases it has, and
+//! `zig build interop-jinja` reports the corpus/fixture difference.
 
 const std = @import("std");
 
@@ -986,16 +998,19 @@ pub const cases = [_]Case{
     },
 };
 
-test "corpus names are unique" {
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen.deinit(std.testing.allocator);
-    for (cases) |c| {
-        const gop = try seen.getOrPut(std.testing.allocator, c.name);
-        try std.testing.expect(!gop.found_existing);
+// Case names must be unique — they are the key the transcript is read back
+// by. Asserted at comptime here (this file is never a test target) and again,
+// over the captured artifact, in `src/reference_replay_test.zig`.
+comptime {
+    @setEvalBranchQuota(400_000);
+    for (cases, 0..) |a, i| {
+        for (cases[i + 1 ..]) |b| {
+            if (std.mem.eql(u8, a.name, b.name)) @compileError("duplicate corpus case name: " ++ a.name);
+        }
     }
 }
 
-/// Serialize the corpus the way `testdata/reference.py` expects to read it.
+/// Serialize the corpus the way `reference.py` expects to read it.
 pub fn toJson(gpa: std.mem.Allocator) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();

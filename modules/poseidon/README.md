@@ -168,12 +168,22 @@ The Debug lane is slow because `std.crypto.ff`'s constant-time multiply costs
 ~70 000 multiplications at `t = 17`. `SPEC.md` §"Performance note" records why
 marking the module `heavy` was measured and makes it *worse*.
 
-Four tests cross-check the security checks against an independent sympy port
-of the same sage source (`src/testdata/subspace_trail.py`). They **skip
-loudly** without `python3` + `sympy`; set `ZIG_LIBS_VERBOSE_SKIP=1` to see the
-reason. That oracle is grade 2 — a second transcription by the same author,
-not external validation. `SPEC.md` §"Anchoring" is explicit about what it can
-and cannot prove.
+The security checks are cross-checked against an independent sympy port of the
+same sage source. Since 2026-09-06 that comparison is split in two, because a
+module here is standalone Zig and an oracle that needs `python3` is not:
+
+```sh
+zig build interop-poseidon                # re-run the sympy peer, diff, no rewrite
+zig build interop-poseidon -- --capture   # re-take the transcript
+```
+
+`tools/interop.zig` drives `tools/subspace_trail.py` and captures its verdicts
+for 182 matrices into `src/testdata/mds_subspace_trail.txt`;
+`src/mds_replay_test.zig` replays that file with **no `python3` anywhere**, so
+the comparison now asserts on every host instead of skipping on the ones without
+sympy. That oracle is grade 2 — a second transcription by the same author, not
+external validation. `SPEC.md` §"Anchoring" is explicit about what it can and
+cannot prove.
 
 ## Not here
 

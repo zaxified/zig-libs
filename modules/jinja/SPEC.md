@@ -256,49 +256,66 @@ the reference too.
 ## 7. Verification
 
 The anchor is **Python Jinja2 3.1.6**, the reference implementation, and the
-comparison is byte-for-byte: `src/corpus.zig` holds 330 cases (template + the
+comparison is byte-for-byte: `tools/corpus.zig` holds 351 cases (template + the
 other templates its loader serves + JSON context + syntax options), and both
-oracles render exactly that table — Zig against a `MapLoader`, Python against a
+sides render exactly that table — Zig against a `MapLoader`, Python against a
 `DictLoader` built from the same table.
 
-**Live peer** (`reference_test.zig`). `testdata/reference.py` renders the whole
-corpus in a `python3` subprocess and returns JSON; every case is compared
-against ours. This is the only oracle that has never seen this code, and it is
-what catches the defect class self-written expectations cannot: a *consistent*
-misreading. Implement `%` with C truncation instead of Python flooring and every
-hand-written test in this repository still passes while every template ported
-from a real Jinja deployment renders a different configuration.
+Since **2026-09-06** the anchor is *taken* outside the module and *replayed*
+inside it. A module here is standalone Zig with no external dependency; an
+oracle that needs a `python3` is not, so the two are no longer the same file.
 
-**Committed golden** (`golden_test.zig` + `testdata/golden.json`). The same
-driver's output, committed, with the reference's version recorded in the file.
-It is checked in both directions: a corpus case with no golden entry fails, and
-a golden entry with no corpus case fails.
-
-Neither subsumes the other, which is why both are kept. The live peer catches
-drift that a committed expectation would happily agree with; the golden keeps
-the assertion alive on a host with no Python at all, and pins the *specific*
-bytes that a tolerant peer, a newer peer, or an absent peer would leave
-unasserted. A regression on a Python-less CI runner is exactly the case where
-one oracle without the other proves nothing.
-
-**Regenerating the golden** (required after any corpus change):
+**Taking it** (`tools/interop.zig` + `tools/reference.py`, a program, never
+built by `test-jinja`). It renders the corpus with the reference and captures
+every case — inputs *and* rendered bytes — into `src/testdata/golden.json`:
 
 ```sh
-ZIG_LIBS_JINJA_REGEN=$PWD/modules/jinja/src/testdata/golden.json \
-  zig build test-jinja
+zig build interop-jinja -- --capture   # re-take the transcript
+zig build interop-jinja                # re-run the peer and diff, no rewrite
 ```
 
-The hook lives inside the live test, so the golden can only ever be produced by
-the same procedure the live comparison uses.
+This is the only oracle that has never seen this code, and it is what catches
+the defect class self-written expectations cannot: a *consistent* misreading.
+Implement `%` with C truncation instead of Python flooring and every
+hand-written test in this repository still passes while every template ported
+from a real Jinja deployment renders a different configuration. It is also the
+only thing that can see the *reference* change under us, which makes it a
+pre-release check rather than a per-commit one.
+
+**Replaying it** (`src/reference_replay_test.zig`). Every recorded case is
+rendered by this engine and compared with the reference's bytes — no child
+process, no Python, no foreign source in the module, so the assertion runs on
+every host rather than skipping on the ones without a peer. Before the split
+this half ran only where Python did; CI's peer install is `continue-on-error`,
+so a failed install degraded to a silent skip.
+
+**What the transcript pins.** Rendering is not a function of the template
+alone, so the file records the Jinja2 version, the MarkupSafe version, the
+Python version, the capture date and command, and a `determinism` block: the
+pinned process environment (`PYTHONHASHSEED=0`, `LC_ALL=C`, `LANG=C`, `TZ=UTC`),
+`sys.float_repr_style`, the default delimiters, the loaded extensions (none),
+and Jinja's whole `policies` table — which is what decides `tojson`'s key order
+and `truncate`'s leeway. The per-case knobs (autoescape, undefined policy,
+`trim_blocks`, `lstrip_blocks`, `keep_trailing_newline`) are recorded in the
+case. Determinism is reached by pinning those, never by comparing less: all 351
+cases are compared, on the full rendered byte string.
+
+**The replay cannot shrink quietly.** The corpus lives outside the module now,
+so the module holds its own floor: the replay test fails below 351 cases,
+requires the corner counts the corpus exists for (≥50 cases with a loader, ≥30
+that the reference refuses, ≥35 autoescaped), requires unique names, requires
+every entry to carry its inputs, and requires the provenance header to be
+present. Measured 2026-09-06: a dropped case, a flipped output byte, and a
+missing header field each fail it.
 
 **Load-bearing check.** The oracle is verified to be load-bearing by mutation,
 once per surface. For the expression engine: changing `pyMod` from Python's
 floored remainder to `@rem` (C truncation) — a change no unit test notices —
-turns `mod_negatives` red in both oracles (`1|1|-1|-1` vs `1|-1|1|-1`). For
+turns `mod_negatives` red in the replay (`1|1|-1|-1` vs `1|-1|1|-1`). For
 composition: making every `{% block %}` behave as if it were `scoped` — the
 single most tempting simplification in the whole inheritance implementation,
 and one that no self-written test would catch because it makes blocks see
-*more* — turns `block_in_for_is_not_scoped_by_default` red in both oracles
+*more* — turns `block_in_for_is_not_scoped_by_default` red in the replay
 (`<><>` vs `<1><2>`). Both mutations were reverted.
 
 **What the corpus is weighted towards.** Not the easy paths: whitespace-control
@@ -565,4 +582,4 @@ makes these bound tests rather than "it errored eventually" tests.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** golden.json captured from real Python Jinja2 3.1.6 output + live subprocess oracle
+**What the tests actually contain.** golden.json — 351 input-to-output pairs captured from real Python Jinja2 3.1.6 by `tools/interop.zig`, replayed hermetically by `src/reference_replay_test.zig`; the live peer runs as `zig build interop-jinja`

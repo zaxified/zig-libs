@@ -1,19 +1,29 @@
 # SPDX-License-Identifier: MIT
 #
-# Reference driver for the protobuf module's interop tests.
+# Reference driver for the protobuf module's interop program.
+#
+# FOREIGN CODE LIVES HERE, NOT IN THE MODULE. This file is driven only by
+# `tools/interop.zig`, a standalone program run by `zig build interop-protobuf`.
+# Nothing under `../src/` embeds, spawns or otherwise needs it: the module's own
+# tests replay what a capture run froze into `../src/testdata/`.
 #
 # Builds message descriptors AT RUNTIME with google.protobuf.descriptor_pb2 +
 # descriptor_pool + message_factory, so no .proto file and no protoc are
 # needed -- only `pip install protobuf`. The schemas below mirror the Zig
-# fixtures in ../codec_test.zig field-for-field; the CASES table holds the
-# same values the Zig tests build, keyed by name, so neither side has to
+# fixtures in ../src/conformance.zig field-for-field; the CASES table holds the
+# same values the Zig side builds, keyed by name, so neither side has to
 # marshal values across the process boundary.
 #
-# Usage (cwd = a scratch dir):
-#   python3 reference.py ref_encode <case>   -> writes out.bin
-#   python3 reference.py dump <case>         -> reads in.bin, writes out.txt
-#   python3 reference.py selftest            -> sanity check, no files
+# Every op takes explicit file paths, so the caller chooses the scratch
+# directory and this script never depends on its own cwd:
+#   python3 reference.py version <out.txt>
+#   python3 reference.py ref_encode <case> <out.bin>
+#   python3 reference.py dump <case> <in.bin> <out.txt>
+#   python3 reference.py expect_dump <case> <out.txt>
+#   python3 reference.py normalize <MsgName> <in.bin> <out.bin>
+#   python3 reference.py selftest
 
+import datetime
 import sys
 from google.protobuf import descriptor_pb2 as dp
 from google.protobuf import descriptor_pool, message_factory
@@ -245,20 +255,41 @@ def main(argv):
             assert dump(back) == dump(msg), name
             print("%-14s %s" % (name, raw.hex()))
         return 0
+    if op == "version":
+        # One line, copied verbatim into the header of every captured fixture:
+        # it is the whole provenance of the bytes below it.
+        import google.protobuf as gp
+        with open(argv[2], "w") as fh:
+            fh.write("google.protobuf %s on Python %d.%d.%d, %s" % (
+                gp.__version__,
+                sys.version_info[0], sys.version_info[1], sys.version_info[2],
+                datetime.date.today().isoformat(),
+            ))
+        return 0
+    if op == "normalize":
+        # The reference's own parse of arbitrary bytes, re-serialized
+        # canonically. Raises on malformed input -> non-zero exit, which the
+        # Zig side reports as a REJECTION by the reference.
+        msg = cls(argv[2])()
+        msg.ParseFromString(open(argv[3], "rb").read())
+        with open(argv[4], "wb") as fh:
+            fh.write(msg.SerializeToString(deterministic=True))
+        return 0
+
     case = argv[2]
     msg_name = CASES[case][0]
     if op == "ref_encode":
-        with open("out.bin", "wb") as fh:
+        with open(argv[3], "wb") as fh:
             fh.write(make(case).SerializeToString(deterministic=True))
     elif op == "dump":
         msg = cls(msg_name)()
         # ParseFromString raises on malformed input -> non-zero exit, which
         # the Zig side reports as error.ReferenceRejected.
-        msg.ParseFromString(open("in.bin", "rb").read())
-        with open("out.txt", "w") as fh:
+        msg.ParseFromString(open(argv[3], "rb").read())
+        with open(argv[4], "w") as fh:
             fh.write(dump(msg))
     elif op == "expect_dump":
-        with open("out.txt", "w") as fh:
+        with open(argv[3], "w") as fh:
             fh.write(dump(make(case)))
     else:
         raise SystemExit("unknown op " + op)
