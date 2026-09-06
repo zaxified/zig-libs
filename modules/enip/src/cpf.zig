@@ -494,14 +494,54 @@ test "connection id reads only from a connected address item" {
     );
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(40_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// Common Packet Format item lists: the item count, then typed items. One list
+/// per shape `decode` and its typed views understand, plus the truncations.
+const cpf_seeds = [_][]const u8{
+    fuzzSeed("020000000000b20006004c0220062401"), // null address + unconnected data
+    fuzzSeed("0200a100040011223344b1000800010000004c02"), // connected address + sequenced data
+    fuzzSeed("010000000000"), // one null address item
+    fuzzSeed("0100b2000400aabbccdd"), // one unconnected data item
+    fuzzSeed("020000000000800010000002af12c0a8010500000000000000"), // null address + sockaddr item
+    fuzzSeed("0000"), // an item count of zero
+    fuzzSeed("0800"), // eight items and nothing behind them
+    fuzzSeed("0100000000000000ff"), // one item and a trailing octet
+    fuzzSeed("0100b2000600aabb"), // a declared item length past the end
+    fuzzSeed("0102"), // truncated inside the count
+};
+
 test "fuzz: cpf decode never panics and re-encodes exactly" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &cpf_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 10
+    // non-empty and 0 decoded before, 10 of 10 non-empty and 4 decoded after.**
+    const len: usize = smith.slice(&buf);
     var storage: [16]Item = undefined;
     const list = decode(buf[0..len], &storage) catch return;
     try testing.expectEqual(len, list.encoded_len);
@@ -518,14 +558,29 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+/// The same lists behind the interface handle and timeout an encapsulated
+/// SendRRData body carries.
+const envelope_seeds = [_][]const u8{
+    fuzzSeed("00000000e803020000000000b20006004c0220062401"),
+    fuzzSeed("000000000000010000000000"), // handle 0, timeout 0, one null item
+    fuzzSeed("01000000e8030000"), // a non-zero interface handle, no items
+    fuzzSeed("00000000e803"), // the item count missing
+    fuzzSeed("000000"), // shorter than the fixed part
+};
+
 test "fuzz: envelope decode never panics" {
-    try std.testing.fuzz({}, fuzzEnvelope, .{});
+    try std.testing.fuzz({}, fuzzEnvelope, .{ .corpus = &envelope_seeds });
 }
 
 fn fuzzEnvelope(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 5
+    // non-empty and 0 decoded before, 5 of 5 non-empty and 3 decoded after.**
+    const len: usize = smith.slice(&buf);
     var storage: [16]Item = undefined;
     const env = decodeEnvelope(buf[0..len], &storage) catch return;
     var round: [512]u8 = undefined;

@@ -344,14 +344,64 @@ test "parseItem is the one-call form" {
     try testing.expectEqual(@as(u24, 160), it.address);
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`.
+/// `Smith.slice` reads a little-endian u32 length before it copies anything,
+/// so the text carries that header; without it the first four characters would
+/// be eaten as the length and the rest delivered shifted.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles with the RIGHT length and garbage
+/// behind it (measured 2026-09-06).
+fn fuzzSeed(comptime s: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(s.len))) ++ s[0..s.len].*;
+    }.bytes;
+}
+
+/// Real STEP 7 address literals, one per area and transport size the parser
+/// knows, in both notations, plus the malformed shapes its tests pin.
+const address_seeds = [_][]const u8{
+    fuzzSeed("DB1.DBW20"),
+    fuzzSeed("DB12.DBB100"),
+    fuzzSeed("DB2.DBD8"),
+    fuzzSeed("DB1.DBX0.3"),
+    fuzzSeed("db5.dbw2"),
+    fuzzSeed("  DB5.DBW2 "),
+    fuzzSeed("M10.2"),
+    fuzzSeed("MB10"),
+    fuzzSeed("MW10"),
+    fuzzSeed("MD10"),
+    fuzzSeed("I0.0"),
+    fuzzSeed("E0.7"),
+    fuzzSeed("Q1.5"),
+    fuzzSeed("A1.5"),
+    fuzzSeed("QW4"),
+    fuzzSeed("AB4"),
+    fuzzSeed("T5"),
+    fuzzSeed("C3"),
+    fuzzSeed("Z3"),
+    fuzzSeed("DB1.DBX0.8"), // bit index out of range
+    fuzzSeed("DB0.DBW0"),
+    fuzzSeed("DB65536.DBW0"), // DB number past a u16
+    fuzzSeed("DB1.DBQ0"), // no such transport size
+    fuzzSeed("DB1."),
+    fuzzSeed("......"),
+};
+
 test "fuzz: address parser never panics" {
-    try std.testing.fuzz({}, fuzzParse, .{});
+    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &address_seeds });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [40]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 25
+    // non-empty and 0 that parsed before, 25 of 25 non-empty and 19 that parsed
+    // after.**
+    const len: usize = smith.slice(&buf);
     const a = parse(buf[0..len]) catch return;
     // Anything that parses must build an item or fail cleanly.
     const it = a.item(1) catch return;

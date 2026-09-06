@@ -57,5 +57,5 @@ The suite's own terms (`LICENSE.md` at the pinned commit):
 
 Only test-fixture text is reproduced. The implementation under test
 (`preprocess`/`preprocessAnnotated` in `src/root.zig`) is the authors' own
-(MIT); its DESIGN reference (the JSON5 spec at json5.org) is recorded in the
-repository NOTICE §2 as provenance, not as a condition.
+(MIT); its DESIGN reference (the JSON5 spec at json5.org) is recorded in this
+module's `README.md` `Provenance:` statement as provenance, not as a condition.

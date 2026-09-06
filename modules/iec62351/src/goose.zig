@@ -1521,16 +1521,60 @@ test "F6: build's tag scratch buffer is sized per sealer, not always rsa.max_mod
     try testing.expectEqual(@as(usize, 10), r.tag.len);
 }
 
+/// Writes `frame` into `out` behind the little-endian u32 length header that
+/// `Smith.slice` reads before it copies anything, and returns the seed. Built
+/// at run time because the corpus below comes from this module's own encoders.
+fn fuzzSeedInto(out: []u8, frame: []const u8) []const u8 {
+    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
+    @memcpy(out[4..][0..frame.len], frame);
+    return out[0 .. 4 + frame.len];
+}
+
+/// A seed followed by the eight octets the `profile` draw reads, so the corpus
+/// chooses the header profile — which the collapsed `value(bool)` could not.
+fn gooseSeed(out: []u8, frame: []const u8, ed2020: bool) []const u8 {
+    const s = fuzzSeedInto(out, frame);
+    std.mem.writeInt(u64, out[s.len..][0..8], if (ed2020) 1 else 0, .little);
+    return out[0 .. s.len + 8];
+}
+
 test "fuzz: frame parse never panics and stays inside the buffer" {
-    try testing.fuzz({}, fuzzParse, .{});
+    var built: [256]u8 = undefined;
+    const frame = try buildSample(&built, .hmac_sha256_128, &sample_key);
+    var flipped: [256]u8 = undefined;
+    @memcpy(flipped[0..frame.len], frame);
+    flipped[frame.len - 1] ^= 0xFF; // a frame whose MAC will not verify
+    var short: [256]u8 = undefined;
+    @memcpy(short[0..frame.len], frame);
+    short[3] = 0x00; // a length field that disagrees with the frame
+
+    var bufs: [7][300]u8 = undefined;
+    const seeds = [_][]const u8{
+        gooseSeed(&bufs[0], frame, true),
+        gooseSeed(&bufs[1], frame, false),
+        gooseSeed(&bufs[2], flipped[0..frame.len], true),
+        gooseSeed(&bufs[3], short[0..frame.len], true),
+        gooseSeed(&bufs[4], frame[0 .. frame.len / 2], true), // truncated
+        gooseSeed(&bufs[5], frame[0..4], false), // header only
+        gooseSeed(&bufs[6], &.{ 0x01, 0x02 }, true),
+    };
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &seeds });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [160]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 7
+    // non-empty, 0 that parsed, and `profile` `.ts2007` on every single run
+    // before; 7 of 7 non-empty, 4 that parsed, and `.ed2020` on 5 of the 7
+    // after.**
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
-    const profile: HeaderProfile = if (smith.value(bool)) .ed2020 else .ts2007;
+    // `profile` follows the frame and is drawn with a full-width `value`.
+    const profile: HeaderProfile = if (smith.value(u64) & 1 == 1) .ed2020 else .ts2007;
 
     const f = parse(bytes, profile) catch return;
     try testing.expect(f.bytes.len <= bytes.len);
@@ -1542,14 +1586,38 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: extension parse never panics for arbitrary extension octets" {
-    try testing.fuzz({}, fuzzExtension, .{});
+    var built: [256]u8 = undefined;
+    const frame = try buildSample(&built, .hmac_sha256_128, &sample_key);
+    const parsed = try parse(frame, .ed2020);
+    const gmac_key = [_]u8{0x2a} ** 16;
+    var gmac_built: [256]u8 = undefined;
+    const gmac_frame = try buildSample(&gmac_built, .aes_gmac_128, &gmac_key);
+    const gmac_parsed = try parse(gmac_frame, .ed2020);
+
+    var bufs: [6][300]u8 = undefined;
+    const seeds = [_][]const u8{
+        gooseSeed(&bufs[0], parsed.extension, false), // an HMAC extension, no IV
+        gooseSeed(&bufs[1], parsed.extension, true), // ... read as if it had one
+        gooseSeed(&bufs[2], gmac_parsed.extension, true), // a GMAC extension, with IV
+        gooseSeed(&bufs[3], gmac_parsed.extension, false),
+        gooseSeed(&bufs[4], parsed.extension[0 .. parsed.extension.len / 2], false),
+        gooseSeed(&bufs[5], &.{0x80}, false),
+    };
+    try testing.fuzz({}, fuzzExtension, .{ .corpus = &seeds });
 }
 
 fn fuzzExtension(_: void, smith: *std.testing.Smith) !void {
     var buf: [96]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-    const expect_iv = smith.value(bool);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 6
+    // non-empty, 0 that parsed, and `expect_iv` `false` on every single run
+    // before; 6 of 6 non-empty, 4 that parsed, and `true` on 2 of the 6 after.**
+    const len: usize = smith.slice(&buf);
+    // `expect_iv` follows the octets and is drawn with a full-width `value`.
+    const expect_iv = smith.value(u64) & 1 == 1;
     const v = AuthenticationValue.parse(buf[0..len], expect_iv, max_mac_len) catch return;
     try testing.expect(v.tag.len <= max_mac_len);
     try testing.expectEqual(expect_iv, v.iv != null);

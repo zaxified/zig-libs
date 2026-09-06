@@ -892,14 +892,62 @@ test "path size is words and an odd path is refused" {
     try testing.expectError(error.OddPathLength, b.words());
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(40_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// EPATHs: one per segment type this module encodes and decodes, plus the
+/// declared lengths that overrun.
+const epath_seeds = [_][]const u8{
+    fuzzSeed("200124013007"), // class 1, instance 1, attribute 7
+    fuzzSeed("20062401"), // class 6, instance 1
+    fuzzSeed("9105534341444100"), // an ANSI symbol, odd length, padded
+    fuzzSeed("910441424344"), // an ANSI symbol, even length
+    fuzzSeed("91055343414441002800"), // a symbol with a member index
+    fuzzSeed("12010501"), // a port segment with a link address
+    fuzzSeed("120831302e302e302e35"), // a port segment with an extended link address
+    fuzzSeed("11010000"), // a port segment, port 1
+    fuzzSeed("1f01030000aa"), // an extended logical segment
+    fuzzSeed("0f341207"), // a segment type nobody defines
+    fuzzSeed("0f0300aa"), // a declared length past the end
+    fuzzSeed("03aa"), // an odd trailing octet
+    fuzzSeed("200124"), // truncated inside a logical segment
+};
+
 test "fuzz: epath iteration never panics and re-encodes exactly" {
-    try std.testing.fuzz({}, fuzzPath, .{});
+    try std.testing.fuzz({}, fuzzPath, .{ .corpus = &epath_seeds });
 }
 
 fn fuzzPath(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 13
+    // non-empty before, 13 of 13 after; 10 of those 13 now re-encode.**
+    //
+    // ⚠ The re-encode count was not zero before — it was 13 of 13, because an
+    // EMPTY path re-encodes to an empty path and `reencode("")` succeeds. A
+    // pass rate of 100 % with one distinct input, and every accessor below
+    // walking nothing: acceptance is not reach.
+    const len: usize = smith.slice(&buf);
     var round: [512]u8 = undefined;
     if (reencode(buf[0..len], &round)) |again| {
         try testing.expectEqualSlices(u8, buf[0..len], again);

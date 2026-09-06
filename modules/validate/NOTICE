@@ -31,7 +31,8 @@ This module implements JSON Schema 2020-12's `format` VOCABULARY (a set of
 independent string-shape assertions), not the full JSON Schema document
 model (`type`/`properties`/`$ref`/`allOf`/etc. composition) — its `Rule`
 struct is this module's own vocabulary, only modeled after JSON Schema's
-keyword semantics (see root NOTICE §2 and root.zig's module doc). So only the
+keyword semantics (see this module's `README.md` `Provenance:` statement and
+root.zig's module doc). So only the
 `format`-keyword sub-corpus is in scope; the main per-keyword suite
 (`tests/draft2020-12/*.json`, outside `optional/`) tests a document model this
 module does not have and is not vendored.
@@ -80,4 +81,5 @@ The suite's own terms (`LICENSE` at the pinned commit):
 Only test-fixture text is reproduced. The implementation under test
 (`validateFormat` and friends in `src/root.zig`) is the authors' own (MIT);
 its DESIGN reference (JSON Schema 2020-12 + the cited RFCs) is recorded in
-the repository NOTICE §2 as provenance, not as a condition.
+this module's `README.md` `Provenance:` statement as provenance, not as a
+condition.

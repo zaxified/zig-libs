@@ -1014,16 +1014,81 @@ test "signed token: structurally broken tokens are typed errors" {
     try testing.expectError(error.MalformedToken, SignedToken.parse(input));
 }
 
+/// Writes `frame` into `out` behind the little-endian u32 length header that
+/// `Smith.slice` reads before it copies anything, and returns the seed. Built
+/// at run time because the corpus below comes from this module's own encoders.
+fn fuzzSeedInto(out: []u8, frame: []const u8) []const u8 {
+    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
+    @memcpy(out[4..][0..frame.len], frame);
+    return out[0 .. 4 + frame.len];
+}
+
+/// One seed per ACSE shape `findAuthFields` walks: the sample AARQ, the same
+/// with authentication fields spliced in, an AARE, and the truncations. Each is
+/// followed by the eight octets the `kind` draw reads, so the corpus decides
+/// whether the PDU is parsed as an AARQ or an AARE — which the collapsed
+/// `value(bool)` could never do.
+fn acseSeed(out: []u8, frame: []const u8, aarq: bool) []const u8 {
+    const s = fuzzSeedInto(out, frame);
+    std.mem.writeInt(u64, out[s.len..][0..8], if (aarq) 1 else 0, .little);
+    return out[0 .. s.len + 8];
+}
+
 test "fuzz: ACSE field discovery never panics" {
-    try testing.fuzz({}, fuzzFind, .{});
+    const with_auth = [_]u8{
+        0x60, 0x2a,
+        0x80, 0x02,
+        0x07, 0x80,
+        0xa1, 0x07,
+        0x06, 0x05,
+        0x28, 0xca,
+        0x22, 0x02,
+        0x03,
+        0x8a, 0x02, 0x00, 0x80, // [10] acse-requirements: authentication
+        0x8b, 0x02, 0x51, 0x01, // [11] mechanism-name
+        0xac, 0x04, 0x80, 0x02, 0xaa, 0xbb, // [12] calling-authentication-value
+        0xbe, 0x0d, 0x28, 0x0b, 0x06, 0x02,
+        0x51, 0x01, 0xa0, 0x05, 0xa8, 0x03,
+        0x80, 0x01, 0x05,
+    };
+    const aare = [_]u8{
+        0x61, 0x18,
+        0x80, 0x02,
+        0x07, 0x80,
+        0xa1, 0x07,
+        0x06, 0x05,
+        0x28, 0xca,
+        0x22, 0x02,
+        0x03,
+        0x82, 0x02, 0x00, 0x00, // [2] result
+        0x8a, 0x02, 0x00, 0x80, // [10] acse-requirements
+    };
+    var bufs: [7][160]u8 = undefined;
+    const seeds = [_][]const u8{
+        acseSeed(&bufs[0], &sample_aarq, true),
+        acseSeed(&bufs[1], &sample_aarq, false),
+        acseSeed(&bufs[2], &with_auth, true),
+        acseSeed(&bufs[3], &aare, false),
+        acseSeed(&bufs[4], &aare, true),
+        acseSeed(&bufs[5], sample_aarq[0 .. sample_aarq.len - 4], true), // truncated
+        acseSeed(&bufs[6], &.{ 0x60, 0x7f }, true), // a declared length past the end
+    };
+    try testing.fuzz({}, fuzzFind, .{ .corpus = &seeds });
 }
 
 fn fuzzFind(_: void, smith: *std.testing.Smith) !void {
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 7
+    // non-empty, 0 whose fields were found, and `kind` `.aare` on every single
+    // run before; 7 of 7 non-empty, 2 found, and `.aarq` on 5 of the 7 after.**
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
-    const kind: PduKind = if (smith.value(bool)) .aarq else .aare;
+    // `kind` follows the PDU and is drawn with a full-width `value`.
+    const kind: PduKind = if (smith.value(u64) & 1 == 1) .aarq else .aare;
     const f = findAuthFields(bytes, kind) catch return;
     // Anything reported must point inside the input.
     if (f.mechanism_name) |m| try testing.expect(m.len <= bytes.len);
@@ -1032,14 +1097,48 @@ fn fuzzFind(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: token parsing never panics and never verifies garbage" {
-    try testing.fuzz({}, fuzzToken, .{});
+    // Real tokens, signed with a key this harness does NOT hold, plus
+    // truncations and a one-octet corruption. The point of the harness is that
+    // nothing here verifies against the harness's own key; a corpus of tokens
+    // that at least PARSE is what makes that claim mean anything.
+    const signer_kp = EcdsaP256.KeyPair.generateDeterministic([_]u8{0x37} ** EcdsaP256.KeyPair.seed_length) catch unreachable;
+    var tok_buf: [256]u8 = undefined;
+    var sig_buf: [128]u8 = undefined;
+    const token = try signToken(
+        &tok_buf,
+        &sig_buf,
+        .{ .ecdsa_p256_sha256 = .{ .key_pair = signer_kp, .noise = null } },
+        1,
+        test_now_s,
+        "operator@substation",
+    );
+    var bufs: [5][300]u8 = undefined;
+    var corrupt: [256]u8 = undefined;
+    @memcpy(corrupt[0..token.len], token);
+    corrupt[token.len - 1] ^= 0xFF;
+    const seeds = [_][]const u8{
+        fuzzSeedInto(&bufs[0], token),
+        fuzzSeedInto(&bufs[1], corrupt[0..token.len]),
+        fuzzSeedInto(&bufs[2], token[0 .. token.len / 2]),
+        fuzzSeedInto(&bufs[3], token[0..2]),
+        fuzzSeedInto(&bufs[4], &.{ 0x30, 0x03, 0x02, 0x01, 0x01 }),
+    };
+    try testing.fuzz({}, fuzzToken, .{ .corpus = &seeds });
 }
 
 fn fuzzToken(_: void, smith: *std.testing.Smith) !void {
     const kp = EcdsaP256.KeyPair.generateDeterministic([_]u8{0x21} ** EcdsaP256.KeyPair.seed_length) catch unreachable;
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 5
+    // non-empty and 0 that `SignedToken.parse` accepted before, 5 of 5 non-empty
+    // and 2 that parsed after** — so the assertion below, that nothing
+    // verifies against this key, was until now only ever made about the empty
+    // string.
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
     _ = SignedToken.parse(bytes) catch return;
     // Random bytes must never verify against a real key.

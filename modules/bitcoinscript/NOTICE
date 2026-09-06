@@ -35,5 +35,6 @@ module's README "Provenance" note. What is reproduced here, and only here, is
 conformance DATA — which is precisely why the notice lives beside it.
 
 The sibling `bitcointx` module cites Bitcoin Core as a design reference for the
-legacy sighash algorithm; that is a §2-style provenance record and is in the
-root `NOTICE`, not here, because nothing of theirs is reproduced there.
+legacy sighash algorithm; that is a design-reference record and lives in that
+module's own `README.md` `Provenance:` statement, not here, because nothing of
+theirs is reproduced there.

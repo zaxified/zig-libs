@@ -59,4 +59,4 @@ comparison target: `src/constants_test.zig` pins SHA-256 digests of tables THIS
 module derives, and documents how to re-clone circomlibjs and recompute the
 comparison yourself. No circomlib source and no circomlib data is present in
 this repository, so its terms do not reach this module. It is recorded as a
-design reference in the repository NOTICE §2.
+design reference in this module's `README.md` `Provenance:` statement.

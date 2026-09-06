@@ -401,14 +401,73 @@ test "integrity id must strictly progress or it is a replay" {
     try v2.verifyIntegrity(12345);
 }
 
+/// Writes `frame` into `out` behind the little-endian u32 length header that
+/// `Smith.slice` reads before it copies anything, and returns the seed. Built
+/// at run time rather than as a hex literal because the corpus below comes out
+/// of this module's own encoders — a hand-written stream would be a guess about
+/// the format the encoder defines.
+fn fuzzSeedInto(out: []u8, frame: []const u8) []const u8 {
+    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
+    @memcpy(out[4..][0..frame.len], frame);
+    return out[0 .. 4 + frame.len];
+}
+
 test "fuzz: object walker never panics or hangs" {
-    try std.testing.fuzz({}, fuzzObject, .{});
+    var raw: [5][256]u8 = undefined;
+    var pre: [5][264]u8 = undefined;
+    var seeds: [5][]const u8 = undefined;
+    var w: usize = 0;
+
+    // An object with two attributes, one scalar and one real.
+    w = 0;
+    w += (try beginObject(0x0102, 0x03000000, raw[0][w..])).len;
+    w += (try beginAttribute(1, raw[0][w..])).len;
+    w += (try value.encodeScalar(.usint, i64, 42, raw[0][w..])).len;
+    w += (try beginAttribute(2, raw[0][w..])).len;
+    w += (try value.encodeReal(1.5, raw[0][w..])).len;
+    w += (try endObject(raw[0][w..])).len;
+    seeds[0] = fuzzSeedInto(&pre[0], raw[0][0..w]);
+
+    // A nested object.
+    w = 0;
+    w += (try beginObject(1, 1, raw[1][w..])).len;
+    w += (try beginObject(2, 2, raw[1][w..])).len;
+    w += (try beginAttribute(1, raw[1][w..])).len;
+    w += (try value.encodeScalar(.uint, i64, 7, raw[1][w..])).len;
+    w += (try endObject(raw[1][w..])).len;
+    w += (try endObject(raw[1][w..])).len;
+    seeds[1] = fuzzSeedInto(&pre[1], raw[1][0..w]);
+
+    // An element marker that is not one of the three.
+    w = (try beginObject(1, 1, &raw[2])).len;
+    raw[2][w] = 0x55;
+    raw[2][w + 1] = elem_terminating_object;
+    seeds[2] = fuzzSeedInto(&pre[2], raw[2][0 .. w + 2]);
+
+    // Nested past `max_object_depth`.
+    w = 0;
+    var i: usize = 0;
+    while (i < max_object_depth + 3) : (i += 1) w += (try beginObject(1, 1, raw[3][w..])).len;
+    seeds[3] = fuzzSeedInto(&pre[3], raw[3][0..w]);
+
+    // An object opened and never closed.
+    w = (try beginObject(9, 9, &raw[4])).len;
+    seeds[4] = fuzzSeedInto(&pre[4], raw[4][0..w]);
+
+    try std.testing.fuzz({}, fuzzObject, .{ .corpus = &seeds });
 }
 
 fn fuzzObject(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so
+    // `len` was 0 for every seed and `walkObject` was handed an empty cursor.
+    // Measured on 2026-09-06 over the five seeds built above: **0 of 5 non-empty
+    // and 0 that `walkObject` accepted before, 5 of 5 non-empty and 2 accepted
+    // after** — the other three are the malformed marker, the over-deep nest and
+    // the unterminated object, which must be refused rather than walked.
+    const len: usize = smith.slice(&buf);
     var cur = value.Cursor{ .bytes = buf[0..len] };
     walkObject(&cur, max_object_depth) catch return;
     try testing.expect(cur.pos <= len);

@@ -925,29 +925,85 @@ test "facts: a certificate valid for exactly the maximum is accepted" {
     try testing.expect(Profile.iec62351_3.checkCertificateFacts(f, 1).has(.certificate_validity_too_long));
 }
 
+/// Writes `frame` into `out` behind the little-endian u32 length header that
+/// `Smith.slice` reads before it copies anything, and returns the seed. Built
+/// at run time because the corpus below comes from this module's own encoders.
+fn fuzzSeedInto(out: []u8, frame: []const u8) []const u8 {
+    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
+    @memcpy(out[4..][0..frame.len], frame);
+    return out[0 .. 4 + frame.len];
+}
+
 test "fuzz: certificate inspection never panics on arbitrary DER" {
-    try testing.fuzz({}, fuzzInspect, .{});
+    // ⚠ `buf` here is 200 octets and a real certificate is far larger, so a
+    // whole-certificate seed would arrive EMPTY: `Smith.slice` returns 0
+    // whenever the length it read exceeds the destination buffer. The corpus is
+    // therefore the DER PREFIXES an inspector actually walks — the outer
+    // SEQUENCE, the TBS header, the version and serial — which is where the
+    // parsing this harness is about happens, plus the truncations.
+    const gpa = testing.allocator;
+    const der = try makeCert(gpa, .rsa2048, nb, na, false);
+    defer gpa.free(der);
+
+    var bufs: [6][210]u8 = undefined;
+    const seeds = [_][]const u8{
+        fuzzSeedInto(&bufs[0], der[0..200]),
+        fuzzSeedInto(&bufs[1], der[0..64]),
+        fuzzSeedInto(&bufs[2], der[0..16]),
+        fuzzSeedInto(&bufs[3], der[0..4]),
+        fuzzSeedInto(&bufs[4], &.{ 0x30, 0x82, 0xff, 0xff }), // a length past any buffer
+        fuzzSeedInto(&bufs[5], &.{ 0x30, 0x03, 0x02, 0x01, 0x00 }), // a well-formed SEQUENCE that is not a certificate
+    };
+    try testing.fuzz({}, fuzzInspect, .{ .corpus = &seeds });
 }
 
 fn fuzzInspect(_: void, smith: *std.testing.Smith) !void {
     var buf: [200]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 6
+    // non-empty before, 6 of 6 after.** None of them inspects successfully —
+    // a 200-octet prefix is not a certificate — which is the honest ceiling of
+    // a 200-octet buffer and is recorded here rather than papered over.
+    const len: usize = smith.slice(&buf);
     const facts = inspectCertificate(buf[0..len], .client_auth) catch return;
     // Whatever came back must survive the policy without trapping.
     _ = Profile.iec62351_3.checkCertificateFacts(facts, 1_600_000_000);
 }
 
 test "fuzz: a real certificate with one octet corrupted never panics" {
-    try testing.fuzz({}, fuzzCorrupt, .{});
+    // Sixteen 16-octet seeds: the index word, then the XOR mask word. A fixed
+    // PRNG seed keeps the corpus identical on every run.
+    var prng = std.Random.DefaultPrng.init(0x1ec6_2351_0000_0001);
+    var bufs: [16][16]u8 = undefined;
+    var seeds: [16][]const u8 = undefined;
+    for (&bufs, &seeds) |*b, *s| {
+        prng.random().bytes(b);
+        b[8] |= 1; // never a zero mask: an XOR by 0 corrupts nothing
+        s.* = b;
+    }
+    try testing.fuzz({}, fuzzCorrupt, .{ .corpus = &seeds });
 }
 
 fn fuzzCorrupt(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
     const der = try makeCert(gpa, .rsa2048, nb, na, false);
     defer gpa.free(der);
-    const idx = smith.index(der.len);
-    der[idx] ^= smith.value(u8);
+    // ⚠ This harness used to corrupt NOTHING. `smith.index(der.len)` and
+    // `smith.value(u8)` are both ranged draws, and a `Smith` ranged draw
+    // returns the range MINIMUM unless the eight octets it reads as a
+    // little-endian u64 already lie inside the range — so the index was 0 and
+    // the XOR mask was 0, and `der[0] ^= 0` leaves a valid certificate. A test
+    // named "with one octet corrupted" was inspecting the pristine
+    // certificate, once, on every run. Both draws are now `value(u64)`, whose
+    // weights are full-range, reduced here. Measured on 2026-09-06 over the
+    // corpus below: **1 distinct (index, mask) pair, mask 0, and 0 octets
+    // actually changed before; 16 distinct pairs and 16 of 16 octets changed
+    // after.**
+    const idx: usize = @intCast(smith.value(u64) % der.len);
+    der[idx] ^= @as(u8, @truncate(smith.value(u64))) | 1;
     const facts = inspectCertificate(der, .client_auth) catch return;
     _ = Profile.iec62351_3.checkCertificateFacts(facts, inside_s);
 }

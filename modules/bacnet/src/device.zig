@@ -1429,8 +1429,46 @@ test "a full subscription table is refused with a resources error" {
     try testing.expectEqual(@as(usize, 1), dev.subscriptionCount());
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, in the
+/// hex spelling of the datagram. `Smith.slice` reads a little-endian u32 length
+/// and then that many bytes, so a datagram that is to arrive verbatim has to
+/// carry that header; a raw one would lose its BVLC header to the length read.
+///
+/// ⚠ The array has to live in static memory. A `const` local in this function
+/// is NOT promoted and the returned slice dangles; measured on 2026-09-06, that
+/// spelling hands back the RIGHT length with garbage behind it.
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const frame = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame;
+    }.bytes;
+}
+
+/// Whole BACnet/IP datagrams as they arrive on the wire — BVLC header, NPDU,
+/// APDU — because that is what `inject` takes. Addressed at instance 599, which
+/// is the device the rig below builds.
+const device_seeds = [_][]const u8{
+    fuzzSeed("810b000c0100100809011964"), // Who-Is, both limits
+    fuzzSeed("810b000801001008"), // Who-Is, unrestricted
+    fuzzSeed("810b001501001000c4020002572205c491032203e7"), // I-Am from a peer
+    fuzzSeed("810a001101040005010c0c000000051955"), // confirmed ReadProperty, reply expected
+    fuzzSeed("810a00090104000501"), // the same, truncated inside the APDU
+    fuzzSeed("810a0009010020010f"), // a simple ACK nobody asked for
+    fuzzSeed("81040012c0000205bac00100100809011964"), // Forwarded-NPDU
+    fuzzSeed("81050006003c"), // Register-Foreign-Device at a device that is no BBMD
+    fuzzSeed("810b000c0100100809011964ff"), // one octet past the declared length
+    fuzzSeed("81ff0004"), // unknown BVLC function
+    fuzzSeed("820b0004"), // not BACnet/IP at all
+    fuzzSeed("810b0000"), // declared length zero
+};
+
 test "fuzz: the device never crashes on an arbitrary datagram" {
-    try std.testing.fuzz({}, fuzzDevice, .{});
+    try std.testing.fuzz({}, fuzzDevice, .{ .corpus = &device_seeds });
 }
 
 fn fuzzDevice(_: void, smith: *std.testing.Smith) !void {
@@ -1440,8 +1478,14 @@ fn fuzzDevice(_: void, smith: *std.testing.Smith) !void {
     var dev = DefaultDevice.init(rig.device_ep.transport(), .{ .instance = 599 }, db.wire());
 
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
+    // finds fewer than eight bytes left and returns the range MINIMUM — so the
+    // length was 0 for every seed and the device was injected with a zero-byte
+    // datagram, once. Measured on 2026-09-06 over the corpus above: **0 of 12
+    // non-empty and 0 that got past the BVLC header before, 12 of 12 non-empty
+    // and 8 past it after.**
+    const len: usize = smith.slice(&buf);
     rig.device_ep.inject(rig.client_ep.address, buf[0..len]);
     _ = dev.poll(0) catch {};
 }

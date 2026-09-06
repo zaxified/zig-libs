@@ -245,14 +245,51 @@ test "resolve maps the root and passes steps through" {
     try testing.expectError(error.UnknownRoot, resolve(bad, &roots));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`.
+/// `Smith.slice` reads a little-endian u32 length before it copies anything,
+/// so the text carries that header; without it the first four characters would
+/// be eaten as the length and the rest delivered shifted.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles with the RIGHT length and garbage
+/// behind it (measured 2026-09-06).
+fn fuzzSeed(comptime s: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(s.len))) ++ s[0..s.len].*;
+    }.bytes;
+}
+
+/// Real symbolic paths, plus one per error the parser can return.
+const path_seeds = [_][]const u8{
+    fuzzSeed("\"MotorData\".Speed"),
+    fuzzSeed("\"MotorData\".Axis[2].Position"),
+    fuzzSeed("\"Config\".\"Set Point\""),
+    fuzzSeed("\"DB\""),
+    fuzzSeed("\"Nope\".x"),
+    fuzzSeed("MotorData.Speed"), // MissingRoot
+    fuzzSeed("\"MotorData"), // UnterminatedQuote
+    fuzzSeed("\"\".x"), // EmptyComponent
+    fuzzSeed("\"DB\"."), // EmptyComponent
+    fuzzSeed("\"DB\"..x"), // EmptyComponent
+    fuzzSeed("\"DB\".a[]"), // BadIndex
+    fuzzSeed("\"DB\".a[999999999999]"), // an index past a u32
+    fuzzSeed("\"a\".b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r"), // more components than fit
+};
+
 test "fuzz: path parse never panics" {
-    try std.testing.fuzz({}, fuzzParse, .{});
+    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &path_seeds });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 13
+    // non-empty and 0 that parsed before, 13 of 13 non-empty and 5 that parsed
+    // after.**
+    const len: usize = smith.slice(&buf);
     var comps: [16]Component = undefined;
     const p = parse(buf[0..len], &comps) catch return;
     // Anything that parses has a root that points inside the input.

@@ -618,28 +618,96 @@ test "payloadBytes covers the element widths" {
     try testing.expect((try Item.at(.db, 1, 0, 0, @enumFromInt(0x77), 1)).payloadBytes() == null);
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// Twelve-octet S7ANY item descriptors: one per transport size a client really
+/// asks for, the two areas whose address counts elements rather than bits, and
+/// the prefixes `decode` refuses.
+const item_seeds = [_][]const u8{
+    fuzzSeed("120a10020004000184000000"), // word, 4 elements, DB 1
+    fuzzSeed("120a10010001000184000003"), // bit, DB 1, bit 3
+    fuzzSeed("120a10020001000084000020"), // word, DB 0
+    fuzzSeed("120a10040002000184000020"), // dword
+    fuzzSeed("120a10010008000083000000"), // bit in the flag area
+    fuzzSeed("120a10010001000081000000"), // inputs
+    fuzzSeed("120a10010001000082000000"), // outputs
+    fuzzSeed("120a1005000100001c000000"), // counter
+    fuzzSeed("120a1005000100001d000000"), // timer
+    fuzzSeed("120a10ff0001000184000000"), // a transport size nobody defines
+    fuzzSeed("120a10020000000184000000"), // element count zero
+    fuzzSeed("120a1002ffff000184000000"), // element count 65535
+    fuzzSeed("110a10020004000184000000"), // wrong specification octet
+    fuzzSeed("120b10020004000184000000"), // wrong length octet
+    fuzzSeed("120a10"), // shorter than one item
+};
+
 test "fuzz: item decode never panics" {
-    try std.testing.fuzz({}, fuzzItem, .{});
+    try std.testing.fuzz({}, fuzzItem, .{ .corpus = &item_seeds });
 }
 
 fn fuzzItem(_: void, smith: *std.testing.Smith) !void {
     var buf: [32]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 15
+    // non-empty and 0 decoded before, 15 of 15 non-empty and 12 decoded after.**
+    const len: usize = smith.slice(&buf);
     const it = Item.decode(buf[0..len]) catch return;
     var round: [item_len]u8 = undefined;
     try testing.expectEqualSlices(u8, buf[0..item_len], try it.encode(&round));
 }
 
+/// Data-item blocks as a Read/Write Var reply carries them: a return code, a
+/// transport size, a length that is counted in BITS for `byte_word_dword`, and
+/// the payload — with and without the odd-length pad octet.
+const data_item_seeds = [_][]const u8{
+    fuzzSeed("ff040008aa"), // one item, 8 bits = 1 octet
+    fuzzSeed("ff040010aabb"), // one item, 2 octets
+    fuzzSeed("ff040008aa00ff040008bb"), // two items, the first padded
+    fuzzSeed("ff040100aabb"), // a length of 0x0100 bits = 32 octets, 2 present
+    fuzzSeed("0a000000"), // an error entry: return code, null size, length 0
+    fuzzSeed("0a0000000a000000"), // two error entries
+    fuzzSeed("ff09000400110000"), // an octet-counted size
+    fuzzSeed("ff04"), // truncated inside the header
+    fuzzSeed("ff040000"), // declared length zero
+    fuzzSeed("ffff0008aa"), // a transport size nobody defines
+};
+
 test "fuzz: data item iterator never panics or runs past its block" {
-    try std.testing.fuzz({}, fuzzDataItems, .{});
+    try std.testing.fuzz({}, fuzzDataItems, .{ .corpus = &data_item_seeds });
 }
 
 fn fuzzDataItems(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const count: u16 = smith.valueRangeAtMost(u16, 0, 40);
+    // ⚠ See `fuzzItem`. `count` is drawn AFTER the block now and with
+    // `value(u64)`, not `valueRangeAtMost`: a ranged draw returns its minimum
+    // unless the word it reads already lies inside the range, so the iterator
+    // was always constructed with a count of 0 and stopped before its first
+    // step. Measured on 2026-09-06 over the corpus above: **0 of 10 non-empty
+    // and one single (block, count) pair before; 10 of 10 non-empty
+    // and 6 distinct pairs after.**
+    const len: usize = smith.slice(&buf);
+    const count: u16 = @intCast(smith.value(u64) % 41);
     var it = DataItemIterator.init(buf[0..len], count);
     var guard: usize = 0;
     while (true) {

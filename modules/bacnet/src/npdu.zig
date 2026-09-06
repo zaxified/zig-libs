@@ -828,14 +828,53 @@ test "mac_len cannot name an octet outside the MAC storage" {
     try testing.expectError(error.InvalidControl, decode(&wire));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`.
+///
+/// `Smith.slice` reads a little-endian u32 length and then that many bytes, so
+/// a frame that is to arrive verbatim has to carry that header: a raw frame
+/// would have its own first four octets eaten as the length and the remainder
+/// handed over shifted by four.
+///
+/// ⚠ The array has to live in static memory. A `const` local in this function
+/// is NOT promoted and the returned slice dangles; measured on 2026-09-06, that
+/// spelling hands back the RIGHT length with garbage behind it, which is the
+/// hardest possible shape to notice.
+fn fuzzSeed(comptime frame: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
+    }.bytes;
+}
+
+/// Every NPCI shape the tests above pin: no specifier, source only, global
+/// broadcast, a network-layer message with and without a payload, plus the
+/// rejections that bound the version and control octets.
+const npdu_seeds = [_][]const u8{
+    fuzzSeed(&.{ 0x01, 0x00, 0x10, 0x08 }), // plainest: version, control, APDU
+    fuzzSeed(&.{ 0x01, 0x08, 0x16, 0x2E, 0x01, 0x0B, 0x10, 0x08 }), // source only, no hop count
+    fuzzSeed(&.{ 0x01, 0x20, 0xFF, 0xFF, 0x00, 0xFF, 0x10, 0x08 }), // global broadcast
+    fuzzSeed(&.{ 0x01, 0x24, 0x04, 0xD2, 0x06, 0xC0, 0x00, 0x02, 0x05, 0xBA, 0xC0, 0xFA, 0x10, 0x08 }), // dest MAC + hop
+    fuzzSeed(&.{ 0x01, 0x80, 0x00 }), // network message: Who-Is-Router-To-Network, all
+    fuzzSeed(&.{ 0x01, 0x80, 0x00, 0x04, 0xD2 }), // network message with a DNET
+    fuzzSeed(&.{ 0x01, 0x08, 0x16, 0x2E, 0x00, 0x10, 0x08 }), // SLEN 0: nothing to reply to
+    fuzzSeed(&.{ 0x01, 0x20, 0x04, 0xD2, 0x06, 1, 2, 3 }), // truncated inside the DADR
+    fuzzSeed(&.{ 0x02, 0x00, 0x10 }), // unsupported version
+    fuzzSeed(&.{ 0x01, 0x40, 0x10 }), // reserved control bit
+    fuzzSeed(&.{0x01}), // truncated
+};
+
 test "fuzz: NPDU decode never panics and canonical headers re-encode" {
-    try std.testing.fuzz({}, fuzzNpdu, .{});
+    try std.testing.fuzz({}, fuzzNpdu, .{ .corpus = &npdu_seeds });
 }
 
 fn fuzzNpdu(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
+    // finds fewer than eight bytes left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever decoded the empty
+    // NPDU. Measured on 2026-09-06 over the corpus above: **0 of 11 non-empty
+    // and 0 decoded before, 11 of 11 non-empty and 6 decoded after.**
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
     const n = decode(input) catch return;
     switch (n.payload) {

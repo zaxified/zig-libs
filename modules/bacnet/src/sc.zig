@@ -1244,14 +1244,81 @@ test "a message with no destination is a broadcast, and so is the all-ones VMAC"
 
 // ── fuzz ───────────────────────────────────────────────────────────────────
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, in the
+/// same hex spelling the tests above use.
+///
+/// `Smith.slice` reads a little-endian u32 length and then that many bytes, so
+/// a frame that is to arrive verbatim has to carry that header: a raw frame
+/// would have its own first four octets eaten as the length — which for a
+/// BVLC-SC frame is exactly the fixed header — and the rest handed over
+/// shifted.
+///
+/// ⚠ The array has to live in static memory. A `const` local in this function
+/// is NOT promoted and the returned slice dangles; measured on 2026-09-06, that
+/// spelling hands back the RIGHT length with garbage behind it.
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const frame = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame;
+    }.bytes;
+}
+
+/// One frame per function this decoder dispatches on, lifted from the tests
+/// above, plus the rejections that bound the control octet and the body length.
+const sc_seeds = [_][]const u8{
+    fuzzSeed("0a000001"), // heartbeat-request, the minimal message
+    fuzzSeed("0a0cffff0102030405060a0b0c0d0e0f"), // source and destination VMACs
+    fuzzSeed("0a0400030a0b0c0d0e0f"), // destination only
+    fuzzSeed("000000010600"), // BVLC-Result ACK
+    fuzzSeed("00000001060100000700976475706c6963617465"), // BVLC-Result NAK with details
+    fuzzSeed("0000020301011f00070092"), // NAK, empty details, non-zero marker
+    fuzzSeed("0600000101020304050600112233445566778899aabbccddeeff05780514"), // connect-request
+    fuzzSeed("04000001010105780514"), // advertisement
+    fuzzSeed("02000001"), // an empty-body function
+    fuzzSeed("0102000a470100"), // a must-understand option we do not know
+    fuzzSeed("010201023f000503e70301020100"), // a proprietary option with a vendor block
+    fuzzSeed("010200016100000100"), // data flag with zero length
+    fuzzSeed("010200c1c1"), // an option list that never terminates
+    fuzzSeed("0102000a3f00ff0102"), // an option header that overruns the frame
+    fuzzSeed("0a100001"), // a reserved control bit
+    fuzzSeed("0d000001"), // an unknown function
+    fuzzSeed("0a0000"), // shorter than the fixed header
+};
+
+/// Option lists on their own, which is what `OptionIter`/`scanOptions` take —
+/// the tails of the frames above, not whole frames.
+const option_seeds = [_][]const u8{
+    fuzzSeed("47"), // must-understand, type we do not know
+    fuzzSeed("07"), // the same without the bit
+    fuzzSeed("41"), // secure path
+    fuzzSeed("610000"), // data flag, zero length
+    fuzzSeed("3f000503e7030102"), // proprietary, full vendor block
+    fuzzSeed("3f000203e701"), // proprietary, vendor block one octet short
+    fuzzSeed("c13f000503e7030102"), // secure path, then a proprietary terminator
+    fuzzSeed("c1c1"), // two "more" markers and then nothing
+    fuzzSeed("3f00ff0102"), // a declared header length past the end
+    fuzzSeed("3f00"), // the length octets themselves missing
+    fuzzSeed("c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c101"), // a long "more" chain
+};
+
 test "fuzz: decode never panics, hangs or hands back a slice outside the input" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &sc_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
+    // finds fewer than eight bytes left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever decoded the empty
+    // frame. Measured on 2026-09-06 over the corpus above: **0 of 17 non-empty
+    // and 0 decoded before, 17 of 17 non-empty and 12 decoded after.**
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
     const m = decode(input) catch return;
 
@@ -1285,13 +1352,15 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: option walking always makes forward progress" {
-    try std.testing.fuzz({}, fuzzOptions, .{});
+    try std.testing.fuzz({}, fuzzOptions, .{ .corpus = &option_seeds });
 }
 
 fn fuzzOptions(_: void, smith: *std.testing.Smith) !void {
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ See `fuzzDecode`: `bytes` then a ranged length always yielded 0.
+    // Measured on 2026-09-06 over `option_seeds`: **0 of 11 non-empty and 0
+    // lists walked before, 11 of 11 non-empty and 9 walked after.**
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
 
     var it: OptionIter = .{ .rest = input };

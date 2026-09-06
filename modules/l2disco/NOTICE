@@ -88,8 +88,8 @@ for `tests/`) applies repository-wide:
 Only raw frame bytes are reproduced (as test fixtures), not tcpdump's own C
 dissector source, none of which was read or ported. The implementation under
 test (`lldp.zig`/`cdp.zig`/`arp.zig`/`dhcp.zig`) is the authors' own
-clean-room work from the public IEEE/RFC specifications, as the root `NOTICE`
-§2 `l2disco` entry and this module's README "Provenance" note already record;
+clean-room work from the public IEEE/RFC specifications, as this module's
+README "Provenance" note already records;
 these captures anchor that implementation against genuine wire bytes,
 including — for several of the LLDP fixtures — the exact byte sequences that
 are publicly documented (by the fixture's own file name in the upstream

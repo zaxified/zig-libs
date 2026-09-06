@@ -288,14 +288,55 @@ test "encode refuses an integrity part on a type that has none" {
     try testing.expectError(error.BadIntegrity, encode(.data_fw3, &[_]u8{0x01}, &.{}, &buf));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// S7CommPlus frames: the 0x72 protocol octet, a PDU type, a big-endian data
+/// length and that many octets — single, chained, and every truncation.
+const frame_seeds = [_][]const u8{
+    fuzzSeed("7201000931000004ca00000001"), // a request carrying an object stream
+    fuzzSeed("7202000732000004f20003"), // a response
+    fuzzSeed("7202000232000004e2000572"), // a notification-shaped frame
+    fuzzSeed("72020002aabb72020000"), // two frames chained
+    fuzzSeed("72020002aabb99020000"), // a chained frame with the wrong protocol id
+    fuzzSeed("72020002aabbcc72020000"), // a stray octet between frames
+    fuzzSeed("720200"), // shorter than the header
+    fuzzSeed("32010000"), // protocol id is not 0x72
+    fuzzSeed("72550000"), // a PDU type nobody defines
+    fuzzSeed("7201004000"), // declares 64 octets, delivers 1
+    fuzzSeed("72010000"), // an empty data section
+};
+
 test "fuzz: frame decode never panics" {
-    try std.testing.fuzz({}, fuzzFrame, .{});
+    try std.testing.fuzz({}, fuzzFrame, .{ .corpus = &frame_seeds });
 }
 
 fn fuzzFrame(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 11
+    // non-empty and 0 decoded before, 11 of 11 non-empty and 3 decoded after.**
+    const len: usize = smith.slice(&buf);
     const f = decode(buf[0..len]) catch return;
     try testing.expect(f.total_len <= len);
     try testing.expect(f.data.len <= len);

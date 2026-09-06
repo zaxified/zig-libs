@@ -37,5 +37,5 @@ beside it.
 This module's BIP143/BIP341 signature-hashing tests are anchored against
 public BIP/spec-published examples (`bip-0143.mediawiki`, `bip-0341/
 wallet-test-vectors.json`), which are not third-party CODE or DATA in the
-sense this file exists to flag — see the root `NOTICE` §2 for that design
-reference instead.
+sense this file exists to flag — see this module's `README.md` `Provenance:`
+statement for that design reference instead.

@@ -649,15 +649,65 @@ test "a write of a structure carries its handle" {
     try testing.expectError(error.MissingStructureHandle, WriteTagRequest.decode(&[_]u8{ 0xA0, 0x02, 0x34, 0x12, 0x01 }));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(40_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// Tag payloads: a two-octet type code and its value, which is what `TagData`
+/// and `WriteTagRequest` both read, plus the bare values `decodeValue` takes.
+const type_seeds = [_][]const u8{
+    fuzzSeed("c2002a"), // SINT 42
+    fuzzSeed("c3002a00"), // INT 42
+    fuzzSeed("c4002a000000"), // DINT 42
+    fuzzSeed("ca0000006040"), // REAL 3.5
+    fuzzSeed("c10001"), // BOOL true
+    fuzzSeed("c4000100020003000400"), // a DINT array, four elements
+    fuzzSeed("a002341201"), // a structure with a template handle
+    fuzzSeed("a0023412010000aabb"), // a structure with a body
+    fuzzSeed("a0023412aabbcc"), // a structure whose body is not a whole number of elements
+    fuzzSeed("c4002a00"), // a DINT with only two octets of value
+    fuzzSeed("050068656c6c6f"), // a SHORT_STRING
+    fuzzSeed("030000616263"), // a STRING
+    fuzzSeed("ffffaabb"), // a type code nobody defines
+    fuzzSeed("c400"), // a type code and no value
+};
+
 test "fuzz: value and tag payload decoding never panics" {
-    try std.testing.fuzz({}, fuzzTypes, .{});
+    try std.testing.fuzz({}, fuzzTypes, .{ .corpus = &type_seeds });
 }
 
 fn fuzzTypes(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const code = smith.valueRangeAtMost(u16, 0, 0xFFFF);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 14
+    // non-empty, one single (payload, type code) pair, and 0 that `TagData`
+    // accepted before; 14 of 14 non-empty, 14 distinct pairs and 14 accepted
+    // after.**
+    const len: usize = smith.slice(&buf);
+    // The type code follows the payload and is drawn with `value(u64)`. A
+    // ranged draw over the WHOLE `u16` range does contain the word it reads
+    // whenever that word happens to be below 65536, so this one was not
+    // hopeless — but `bytes` had already emptied the seed, so it was 0 anyway.
+    const code: u16 = @truncate(smith.value(u64));
     const t: DataType = @enumFromInt(code);
     _ = decodeValue(t, buf[0..len]) catch {};
 

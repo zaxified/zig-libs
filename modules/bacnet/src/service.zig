@@ -1398,14 +1398,82 @@ test "wire integers wider than the field they land in are refused, not truncated
     try testing.expectEqual(@as(?u32, 5), ok.array_index);
 }
 
+/// A `Smith` seed whose whole content is the hex given, byte for byte. Use it
+/// when the seed has to spell out a draw SCHEDULE — a length header, then the
+/// bytes, then the eight octets a `value(u64)` draw will read.
+fn fuzzRawSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const bytes = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+    }.bytes;
+}
+
+/// A `Smith` seed for a harness whose first — and only — draw is
+/// `smith.slice(&buf)`: the frame with the little-endian u32 length header
+/// `Smith.slice` reads before it copies anything.
+///
+/// ⚠ The array has to live in static memory. A `const` local in this function
+/// is NOT promoted and the returned slice dangles; measured on 2026-09-06, that
+/// spelling hands back the RIGHT length with garbage behind it.
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const frame = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame;
+    }.bytes;
+}
+
+/// One real body per decoder this harness calls, in the same hex spelling the
+/// tests above use, plus the two RPM iterator shapes and a truncation.
+const service_seeds = [_][]const u8{
+    fuzzSeed("09011964"), // Who-Is with both limits
+    fuzzSeed("09001b3fffff"), // Who-Is over the whole instance range
+    fuzzSeed("c4020002572205c491032203e7"), // I-Am
+    fuzzSeed("c4023fffff2201e09100210f"), // I-Am from an unconfigured device
+    fuzzSeed("3d0a005a4f4e452d54454d50"), // Who-Has by object name
+    fuzzSeed("090119642c00000003"), // Who-Has by identifier, with limits
+    fuzzSeed("c402000257c400000003750a005a4f4e452d54454d50"), // I-Have
+    fuzzSeed("0c000000051955"), // ReadProperty
+    fuzzSeed("0c0000000519552905"), // ReadProperty with an array index
+    fuzzSeed("0c0000000519553e44429100003f"), // ReadProperty-ACK
+    fuzzSeed("0c0040000119553e4441a800003f4908"), // WriteProperty with a priority
+    fuzzSeed("09071c0000000529013a012c"), // SubscribeCOV
+    fuzzSeed("09071c00000005"), // SubscribeCOV cancellation
+    fuzzSeed("09071c020002572c000000053a01184e09552e44429100002f096f2e8204002f4f"), // COV notification
+    fuzzSeed("0c050000011983"), // ReadRange, whole property
+    fuzzSeed("0c0500000119833e2101310a3f"), // ReadRange by position
+    fuzzSeed("0c000000051e0955096f1f"), // RPM request
+    fuzzSeed("0c000000051e29554e44429100004f296f4e8204004f1f"), // RPM ACK
+    fuzzSeed("0c000000"), // truncated inside the object identifier
+};
+
 test "fuzz: service decoders never crash on arbitrary bodies" {
-    try std.testing.fuzz({}, fuzzServices, .{});
+    try std.testing.fuzz({}, fuzzServices, .{ .corpus = &service_seeds });
 }
 
 fn fuzzServices(_: void, smith: *std.testing.Smith) !void {
     var buf: [192]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
+    // finds fewer than eight bytes left and returns the range MINIMUM — so the
+    // length was 0 for every seed and all ten decoders below were handed the
+    // empty body. Measured on 2026-09-06 over the corpus above: **0 of 19
+    // non-empty before, 19 of 19 after; 16 of the 19 are now accepted by at
+    // least one of the ten decoders.**
+    //
+    // ⚠ "Accepted" was NOT zero before, and that is the trap worth recording:
+    // `WhoIs.decode("")` is legal — it is the unrestricted Who-Is — so the
+    // collapsed harness scored 19 of 19 "accepted" while carrying exactly one
+    // distinct input. An acceptance rate can be 100 % with no reach at all.
+    const len: usize = smith.slice(&buf);
     const data = buf[0..len];
 
     _ = WhoIs.decode(data) catch {};
@@ -1491,16 +1559,53 @@ fn wireRaw(out: []u8, data: []const u8) usize {
     return data.len;
 }
 
+/// This harness's seed format is its own draw schedule, so it is spelled out
+/// verbatim: a little-endian u32 width, that many octets of integer, then the
+/// eight little-endian octets `smith.value(u64)` reads to choose the arm. One
+/// seed per arm, with the integer width rotating across 1..8 — the two things
+/// this harness varies, neither of which it could vary before.
+const integer_seeds = [_][]const u8{
+    fuzzRawSeed("01000000010000000000000000"), // arm 0, 1-octet integer
+    fuzzRawSeed("02000000ffff0100000000000000"), // arm 1, 2-octet
+    fuzzRawSeed("030000008000000200000000000000"), // arm 2, 3-octet
+    fuzzRawSeed("040000007fffffff0300000000000000"), // arm 3, 4-octet
+    fuzzRawSeed("04000000ffffffff0400000000000000"), // arm 4, 4-octet, all ones
+    fuzzRawSeed("0500000001000000000500000000000000"), // arm 5, 5-octet
+    fuzzRawSeed("06000000ffffffffffff0600000000000000"), // arm 6, 6-octet
+    fuzzRawSeed("07000000800000000000000700000000000000"), // arm 7, 7-octet
+    fuzzRawSeed("08000000ffffffffffffffff0800000000000000"), // arm 8, 8-octet
+    fuzzRawSeed("01000000010900000000000000"), // arm 9
+    fuzzRawSeed("02000000ffff0a00000000000000"), // arm 10
+    fuzzRawSeed("030000008000000b00000000000000"), // arm 11
+    fuzzRawSeed("040000007fffffff0c00000000000000"), // arm 12
+    fuzzRawSeed("04000000ffffffff0d00000000000000"), // arm 13
+    fuzzRawSeed("0500000001000000000e00000000000000"), // arm 14
+    fuzzRawSeed("06000000ffffffffffff0f00000000000000"), // arm 15
+    fuzzRawSeed("07000000800000000000001000000000000000"), // arm 16
+    fuzzRawSeed("08000000ffffffffffffffff1100000000000000"), // arm 17
+    fuzzRawSeed("01000000011200000000000000"), // arm 18
+};
+
 test "fuzz: a wire integer of any width never truncates into a service field" {
-    try std.testing.fuzz({}, fuzzServiceIntegers, .{});
+    try std.testing.fuzz({}, fuzzServiceIntegers, .{ .corpus = &integer_seeds });
 }
 
 fn fuzzServiceIntegers(_: void, smith: *std.testing.Smith) !void {
     var digits: [8]u8 = undefined;
-    smith.bytes(&digits);
-    const width: usize = smith.valueRangeAtMost(u8, 1, 8);
+    // ⚠ `bytes` followed by `valueRangeAtMost(u8, 1, 8)` drew nothing: `bytes`
+    // ate the seed and the ranged draw returned its MINIMUM, so `width` was 1
+    // for every input and `which` — a range whose minimum is 0 — was 0. This
+    // harness tested a single one-octet integer in a single arm. `slice` gives
+    // the width from the seed, and `value(u64)` is full-range so every input
+    // word survives the reduction. Measured on 2026-09-06 over the corpus
+    // above: **3 distinct (width, arm) pairs before, 19 after — 8 widths across
+    // all 19 arms.** Three, not one, because the seeds here are longer than
+    // `digits`: `bytes` stops at 8 octets and the ranged draw then finds a full
+    // word left and occasionally lands inside its range. With no corpus at all
+    // — which is what this harness had — it is exactly one pair.
+    const width: usize = @max(1, smith.slice(&digits));
     const int = digits[0..width];
-    const which = smith.valueRangeAtMost(u8, 0, 18);
+    const which: u8 = @intCast(smith.value(u64) % 19);
 
     const oid = [_]u8{ 0x00, 0x00, 0x00, 0x05 };
     const present_value = [_]u8{0x55};

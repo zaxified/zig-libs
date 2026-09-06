@@ -638,14 +638,59 @@ test "TpduSize.bytes maps only the defined codes" {
     try testing.expect(@as(TpduSize, @enumFromInt(0xFF)).bytes() == null);
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// One TPDU per code `decode` dispatches on, plus every rejection the tests
+/// above pin.
+const cotp_seeds = [_][]const u8{
+    fuzzSeed("02f08032010000"), // DT with an S7 payload
+    fuzzSeed("02f003aa"), // DT, not end of TSDU
+    fuzzSeed("06800001000200"), // DR
+    fuzzSeed("0470000101"), // ER
+    fuzzSeed("06e00000000100"), // CR, class 0, no parameters
+    fuzzSeed("06d00001000200"), // CC
+    fuzzSeed("0be00000000100c103010203"), // CR with a TSAP parameter
+    fuzzSeed("0be00000000100c003010203"), // CR with a TPDU-size parameter
+    fuzzSeed("7fe000"), // length indicator past the buffer
+    fuzzSeed("fff08032"), // length indicator 255
+    fuzzSeed("00f0"), // length indicator zero
+    fuzzSeed("021000"), // unknown TPDU code
+    fuzzSeed("06e00000000140"), // a class this module does not accept
+    fuzzSeed("03e0000000"), // CR shorter than its fixed part
+    fuzzSeed("03f08000"), // DT with a trailing octet
+};
+
 test "fuzz: cotp decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &cotp_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [300]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 15
+    // non-empty and 0 decoded before, 15 of 15 non-empty and 6 decoded after.**
+    const len: usize = smith.slice(&buf);
     const t = decode(buf[0..len]) catch return;
     // Anything that decoded as one of the four codes with no CDT field must
     // have come from a full-octet code (RFC 905 Table 8). DR/DC/ER have no

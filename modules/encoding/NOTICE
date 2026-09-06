@@ -63,5 +63,5 @@ Only conformance DATA is reproduced from either source — no WHATWG or
 Unicode.org source code is present in this module. The implementation under
 test (`decodeToUtf8`/`encodeFromUtf8`/the per-page tables in `root.zig`) is
 the authors' own (MIT), modeled after the WHATWG Encoding Standard's
-single-byte European subset as design reference (recorded in the root
-`NOTICE` §2), not copied from it.
+single-byte European subset as design reference (recorded in this module's
+`README.md` `Provenance:` statement), not copied from it.

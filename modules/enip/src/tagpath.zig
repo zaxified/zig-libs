@@ -329,14 +329,53 @@ test "path size in words matches what the builder produced" {
     try testing.expectEqual(@as(u8, @intCast(wire.len / 2)), try p.words(&scratch));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`.
+/// `Smith.slice` reads a little-endian u32 length before it copies anything, so
+/// the text carries that header; without it the first four characters would be
+/// eaten as the length and the rest delivered shifted.
+fn fuzzSeed(comptime s: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(s.len))) ++ s[0..s.len].*;
+    }.bytes;
+}
+
+/// Real Logix tag paths, one per component shape the parser builds, plus the
+/// malformed ones its tests pin.
+const tagpath_seeds = [_][]const u8{
+    fuzzSeed("SCADA"),
+    fuzzSeed("SCADA[0]"),
+    fuzzSeed("SCADA[1,2]"),
+    fuzzSeed("SCADA[1,2,3]"),
+    fuzzSeed("Motor.Speed"),
+    fuzzSeed("Motor.Axis[2].Position"),
+    fuzzSeed("Program:MainProgram.Counter"),
+    fuzzSeed("Program:MainProgram.Array[10]"),
+    fuzzSeed("A"),
+    fuzzSeed(""),
+    fuzzSeed("."),
+    fuzzSeed("SCADA["),
+    fuzzSeed("SCADA[]"),
+    fuzzSeed("SCADA[4294967296]"), // an index past a u32
+    fuzzSeed("SCADA[1,2,3,4]"), // more dimensions than Logix has
+    fuzzSeed("a.b.c.d.e.f.g.h.i.j"), // more components than the storage holds
+    fuzzSeed("Program:"),
+};
+
 test "fuzz: tag path parsing never panics and always encodes" {
-    try std.testing.fuzz({}, fuzzParse, .{});
+    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &tagpath_seeds });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 17
+    // non-empty and 0 that parsed before, 16 of 17 non-empty and 9 that parsed
+    // after** — 16, because one seed is the empty path, which is a real input
+    // for this parser and indistinguishable from the smoke round.
+    const len: usize = smith.slice(&buf);
     var storage: [8]Component = undefined;
     const p = parse(buf[0..len], &storage) catch return;
     // Anything that parses must encode to a legal, even-length EPATH.

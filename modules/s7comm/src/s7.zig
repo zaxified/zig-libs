@@ -397,14 +397,56 @@ test "encode derives the length fields from the slices" {
     _ = try decode(enc);
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// One PDU per ROSCTR `decode` accepts, and every rejection the tests pin.
+const s7_seeds = [_][]const u8{
+    fuzzSeed("320100000001000200008704"), // job, 2 parameter octets
+    fuzzSeed("3201000000010001000004aa"), // job, 1 parameter octet
+    fuzzSeed("320100000001000e00000401120a10010000000184000200"), // a Read Var job
+    fuzzSeed("32010000000100080000f000000001000101e0"), // Setup Communication
+    fuzzSeed("3203000000010002000000000401"), // ack_data with an error field
+    fuzzSeed("3203000000010002000500000401"), // ack_data, non-zero error
+    fuzzSeed("320700000001000800000001120411440100"), // userdata
+    fuzzSeed("3201"), // shorter than the header
+    fuzzSeed("33010000000100000000"), // protocol id is not 0x32
+    fuzzSeed("32090000000100000000"), // unknown ROSCTR
+    fuzzSeed("32000000000100000000"), // ROSCTR zero
+    fuzzSeed("32030000000100000000"), // ack_data without its error field
+    fuzzSeed("320100000001000300008704"), // declared parameter length past the end
+};
+
 test "fuzz: s7 decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &s7_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 13
+    // non-empty and 0 decoded before, 13 of 13 non-empty and 4 decoded after.**
+    const len: usize = smith.slice(&buf);
     const pdu = decode(buf[0..len]) catch return;
     var round: [512]u8 = undefined;
     const again = try encode(pdu.header, pdu.parameters, pdu.data, &round);

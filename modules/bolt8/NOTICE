@@ -28,7 +28,7 @@ This module is built ON this repo's own `noise` module (`../noise`,
 `Suite(DH, Cipher, Hash).SymmetricState`) — a from-scratch, clean-room
 implementation of the (also public, also non-copyrightable) Noise Protocol
 Framework specification. `noise` has no module-local NOTICE of its own;
-its provenance is recorded in the root `../../NOTICE`'s "noise" entry.
+its provenance is recorded in `../noise/README.md`'s `Provenance:` statement.
 Nothing in `noise` is Lightning-specific and nothing in this module was
 ported from `noise` (it is imported as a sibling dependency, per this
 repo's `deps` convention).

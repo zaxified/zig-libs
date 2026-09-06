@@ -975,8 +975,45 @@ test "the adapter never panics on hostile encapsulation input" {
     }
 }
 
+/// A `Smith` seed for `fuzzAdapter`: the message behind the little-endian u32
+/// length header `Smith.slice` reads, then the eight octets the session-open
+/// draw consumes as a little-endian u64.
+///
+/// ⚠ The array has to be static; a `const` local here is not promoted and the
+/// slice comes back dangling with the right length and garbage behind it.
+fn fuzzAdapterSeed(comptime h: []const u8, comptime session_open: bool) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(40_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f ++
+            std.mem.toBytes(@as(u64, if (session_open) 1 else 0));
+    }.bytes;
+}
+
+/// Whole encapsulation messages as an adapter receives them, each run once with
+/// the session already open and once without — which is what the
+/// `boolWeighted` draw was there to arrange and could not.
+const adapter_seeds = [_][]const u8{
+    fuzzAdapterSeed("630000000000000000000000000000000000000000000000", false), // ListIdentity
+    fuzzAdapterSeed("040000000000000000000000000000000000000000000000", false), // ListServices
+    fuzzAdapterSeed("65000400000000000000000000000000000000000000000001000000", false), // RegisterSession
+    fuzzAdapterSeed("660000000100a5a500000000000000000000000000000000", true), // UnregisterSession
+    fuzzAdapterSeed("6f0016000100a5a50000000000000000000000000000000000000000e803020000000000b20006004c0220062401", true), // SendRRData, session open
+    fuzzAdapterSeed("6f0016000100a5a50000000000000000000000000000000000000000e803020000000000b20006004c0220062401", false), // ... and closed
+    fuzzAdapterSeed("6f001d000100a5a50000000000000000000000000000000000000000e803020000000000b2000d004c03910553434144410001000100", true), // Read Tag "SCADA"
+    fuzzAdapterSeed("700016000100a5a50000000000000000000000000000000000000000e803020000000000b20006004c0220062401", true), // SendUnitData
+    fuzzAdapterSeed("6f0000000100a5a500000000000000000000000000000000", true), // SendRRData with no body
+    fuzzAdapterSeed("6f000e0000000000000000000000000000000000000000000000000000000800000000000000", true), // a CPF count that overruns
+    fuzzAdapterSeed("341200000000000000000000000000000000000000000000", false), // an unknown command
+    fuzzAdapterSeed("6f0008000000000000000000", false), // shorter than the header
+};
+
 test "fuzz: the adapter never panics on arbitrary messages" {
-    try std.testing.fuzz({}, fuzzAdapter, .{});
+    try std.testing.fuzz({}, fuzzAdapter, .{ .corpus = &adapter_seeds });
 }
 
 // F6 (2026-08-11 re-audit): `Config.max_reply`'s default (4000) used to be
@@ -1000,13 +1037,22 @@ fn fuzzAdapter(_: void, smith: *std.testing.Smith) !void {
     var real: [16]u8 = @splat(0);
     var tags = testTags(&scada, &dint, &real);
     var target = Adapter.init(.{}, &tags);
-    // Half the runs start with a session already open, so the paths past the
-    // session check are reachable.
-    if (smith.boolWeighted(1, 1)) target.session_handle = 0xA5A5_0001;
 
     var input: [1024]u8 = undefined;
-    smith.bytes(&input);
-    const len: usize = smith.valueRangeAtMost(u16, 0, input.len);
+    // ⚠ The message is drawn FIRST, with one `smith.slice` call. It used to be
+    // `smith.bytes(&input)` followed by `smith.valueRangeAtMost(u16, 0, ...)`,
+    // behind a `smith.boolWeighted(1, 1)`. Both of those are ranged draws, and
+    // a `Smith` ranged draw returns the range MINIMUM unless the eight octets
+    // it reads as a little-endian u64 already lie inside the range: the
+    // `boolWeighted` was `false` on every run, so the "half the runs start with
+    // a session already open" the comment promised was NONE of them, and the
+    // length was 0, so the adapter was handed the empty message. Measured on
+    // 2026-09-06 over the corpus above: **0 of 12 non-empty, 0 replies, and the
+    // session never open before; 12 of 12 non-empty, 9 replies, and the session
+    // open on 6 of the 12 after.**
+    const len: usize = smith.slice(&input);
+    // The session flag follows the message, drawn with a full-width `value`.
+    if (smith.value(u64) & 1 == 1) target.session_handle = 0xA5A5_0001;
     var out: [fuzz_out_len]u8 = undefined;
     const reply = target.handle(input[0..len], &out) catch return;
     const r = reply orelse return;
@@ -1063,15 +1109,33 @@ test "F6: the SHIPPED default max_reply (Config omits it) actually binds under t
     try testing.expectEqualSlices(u8, scada[0..3992], td.data);
 }
 
+/// Encapsulation replies as a client receives them. Every entry is at least
+/// the 24-octet header, because the harness rewrites the header anyway and a
+/// shorter draw would be padded back up to 24.
+const client_reply_seeds = [_][]const u8{
+    fuzzAdapterSeed("6f001d000100a5a50000000000000000000000000000000000000000e803020000000000b2000d00cc000000c401000002000000", false)[4..],
+    fuzzAdapterSeed("6f0016000100a5a50000000000000000000000000000000000000000e803020000000000b20006004c0220062401", false)[4..],
+    fuzzAdapterSeed("6f0000000100a5a500000000000000000000000000000000", false)[4..],
+    fuzzAdapterSeed("6f000e0000000000000000000000000000000000000000000000000000000800000000000000", false)[4..],
+    fuzzAdapterSeed("6f0010000100a5a5000000000000000000000000000000000000000000000000010000000000", false)[4..],
+    fuzzAdapterSeed("6f0038000100a5a50000000000000000000000000000000000000000e803ffff0000000000b2002e00cc0001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021", false)[4..],
+};
+
 test "fuzz: a client survives an arbitrary reply without panicking" {
-    try std.testing.fuzz({}, fuzzClientReply, .{});
+    try std.testing.fuzz({}, fuzzClientReply, .{ .corpus = &client_reply_seeds });
 }
 
 fn fuzzClientReply(_: void, smith: *std.testing.Smith) !void {
     var lt: transport.LoopTransport = .{};
     var reply: [512]u8 = undefined;
-    smith.bytes(&reply);
-    const len: usize = smith.valueRangeAtMost(u16, 24, reply.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length. The
+    // ranged draw here had a MINIMUM of 24, not 0, so the collapse was quieter
+    // than most: `len` was 24 on every run and the client was fed a bare
+    // header with an empty body, forever. Measured on 2026-09-06 over the
+    // corpus above: **`len` was 24 on every one of the six
+    // seeds before — a header and nothing else; after, it is 28, 42, 42, 50, 56
+    // and 82, so the CPF body reaches the reply decoder for the first time.**
+    const len: usize = @max(24, smith.slice(&reply));
     // Make it a plausible frame so the decoder gets past the header.
     reply[0] = 0x6F;
     reply[1] = 0x00;

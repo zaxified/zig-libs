@@ -211,14 +211,54 @@ test "encodeRequest refuses more items than the count octet holds" {
     try testing.expectError(error.BufferTooSmall, encodeRequest(.read_var, &list, &buf));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// Read/Write Var request parameter blocks: the function octet, the item count,
+/// and that many twelve-octet S7ANY descriptors — with the count agreeing with
+/// what follows, and with it lying in both directions.
+const request_seeds = [_][]const u8{
+    fuzzSeed("0401120a10020004000184000000"), // Read Var, one item
+    fuzzSeed("0402120a10020004000184000000120a10010001000183000000"), // two items
+    fuzzSeed("0501120a10020004000184000000"), // Write Var, one item
+    fuzzSeed("0402120a10020004000184000000"), // count 2, one item present
+    fuzzSeed("0401120a10020004000184000000120a10010001000183000000"), // count 1, two present
+    fuzzSeed("0400"), // count zero
+    fuzzSeed("04ff120a10020004000184000000"), // count 255
+    fuzzSeed("04"), // the count octet missing
+    fuzzSeed("0601120a10020004000184000000"), // a function octet nobody defines
+};
+
 test "fuzz: request parameter decode never panics" {
-    try std.testing.fuzz({}, fuzzRequest, .{});
+    try std.testing.fuzz({}, fuzzRequest, .{ .corpus = &request_seeds });
 }
 
 fn fuzzRequest(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 9
+    // non-empty and 0 decoded before, 9 of 9 non-empty and 4 decoded after.**
+    const len: usize = smith.slice(&buf);
     const req = decodeRequest(buf[0..len]) catch return;
     var it = req.iterator();
     var seen: usize = 0;

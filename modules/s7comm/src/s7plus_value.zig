@@ -654,14 +654,79 @@ test "a valid small array round trips through skipValue" {
     try testing.expectEqual(w, try valueLen(buf[0..w]));
 }
 
+/// Writes `frame` into `out` behind the little-endian u32 length header that
+/// `Smith.slice` reads before it copies anything, and returns the seed. Built
+/// at run time rather than as a hex literal because the corpus below comes out
+/// of this module's own encoders — a hand-written stream would be a guess about
+/// the format the encoder defines.
+fn fuzzSeedInto(out: []u8, frame: []const u8) []const u8 {
+    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
+    @memcpy(out[4..][0..frame.len], frame);
+    return out[0 .. 4 + frame.len];
+}
+
 test "fuzz: value walker never panics or hangs" {
-    try std.testing.fuzz({}, fuzzValue, .{});
+    var raw: [6][256]u8 = undefined;
+    var pre: [6][264]u8 = undefined;
+    var seeds: [6][]const u8 = undefined;
+    var w: usize = 0;
+
+    // A bare scalar, and a real.
+    seeds[0] = fuzzSeedInto(&pre[0], try encodeScalar(.usint, i64, 42, &raw[0]));
+    seeds[1] = fuzzSeedInto(&pre[1], try encodeReal(1.5, &raw[1]));
+
+    // A struct wrapping a scalar, terminated.
+    w = 0;
+    raw[2][w] = 0;
+    w += 1;
+    raw[2][w] = @intFromEnum(Datatype.s7struct);
+    w += 1;
+    w += (try putVarUint(1, raw[2][w..])).len;
+    w += (try encodeScalar(.uint, i64, 0x0102, raw[2][w..])).len;
+    w += (try putVarUint(0, raw[2][w..])).len;
+    seeds[2] = fuzzSeedInto(&pre[2], raw[2][0..w]);
+
+    // A small array that is entirely present.
+    raw[3][0] = flag_array;
+    raw[3][1] = @intFromEnum(Datatype.byte);
+    w = 2;
+    w += (try putVarUint(3, raw[3][w..])).len;
+    raw[3][w] = 0xAA;
+    raw[3][w + 1] = 0xBB;
+    raw[3][w + 2] = 0xCC;
+    w += 3;
+    seeds[3] = fuzzSeedInto(&pre[3], raw[3][0..w]);
+
+    // An array count that overruns what follows.
+    raw[4][0] = flag_array;
+    raw[4][1] = @intFromEnum(Datatype.uint);
+    w = 2 + (try putVarUint(100, raw[4][2..])).len + 4;
+    seeds[4] = fuzzSeedInto(&pre[4], raw[4][0..w]);
+
+    // Structs nested past `max_depth`.
+    w = 0;
+    var i: usize = 0;
+    while (i < max_depth + 5) : (i += 1) {
+        raw[5][w] = 0;
+        w += 1;
+        raw[5][w] = @intFromEnum(Datatype.s7struct);
+        w += 1;
+        w += (try putVarUint(1, raw[5][w..])).len;
+    }
+    seeds[5] = fuzzSeedInto(&pre[5], raw[5][0..w]);
+
+    try std.testing.fuzz({}, fuzzValue, .{ .corpus = &seeds });
 }
 
 fn fuzzValue(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length;
+    // the ranged length was 0 for every seed and `skipValue` was handed an
+    // empty cursor. Measured on 2026-09-06 over the six seeds built above:
+    // **0 of 6 non-empty and 0 that `skipValue` accepted before, 6 of 6
+    // non-empty and 4 accepted after** — the other two are the overrunning
+    // array count and the over-deep nest, which must be refused.
+    const len: usize = smith.slice(&buf);
     var cur = Cursor{ .bytes = buf[0..len] };
     // Either it validates a prefix as a value (consuming no more than present)
     // or it returns a typed error. Never a panic, never past the buffer.
@@ -669,14 +734,46 @@ fn fuzzValue(_: void, smith: *std.testing.Smith) !void {
     try testing.expect(cur.pos <= len);
 }
 
+/// A `Smith` seed for `fuzzVar`, from the hex of the varint octets.
+fn fuzzHexSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// Varint octet strings: one-octet values, the two-octet form the tests pin,
+/// the over-long encodings, a continuation that never ends, and the widest
+/// legal ten-octet value.
+const varint_seeds = [_][]const u8{
+    fuzzHexSeed("00"),
+    fuzzHexSeed("2c"),
+    fuzzHexSeed("7f"),
+    fuzzHexSeed("822c"),
+    fuzzHexSeed("818080808000"), // an over-long encoding of a small value
+    fuzzHexSeed("9fffffff7f"),
+    fuzzHexSeed("ffffffffffffffffff7f"), // ten octets, the widest legal form
+    fuzzHexSeed("ffffffffffffffffffff"), // eleven continuations, no terminator
+    fuzzHexSeed("80"), // a continuation octet and then nothing
+    fuzzHexSeed("41"), // the zig-zag negative form
+    fuzzHexSeed("ff01"),
+};
+
 test "fuzz: varint decoders never panic" {
-    try std.testing.fuzz({}, fuzzVar, .{});
+    try std.testing.fuzz({}, fuzzVar, .{ .corpus = &varint_seeds });
 }
 
 fn fuzzVar(_: void, smith: *std.testing.Smith) !void {
     var buf: [16]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ See `fuzzValue`. Measured on 2026-09-06 over `varint_seeds`: **0 of 11
+    // non-empty and 0 that decoded before, 11 of 11 non-empty and 8 that
+    // decoded after.**
+    const len: usize = smith.slice(&buf);
     if (getVarUint(u64, buf[0..len], 10)) |r| {
         try testing.expect(r.len <= len);
         // Re-encoding a decoded value and decoding again is a fixed point

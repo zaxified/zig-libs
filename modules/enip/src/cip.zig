@@ -632,14 +632,58 @@ test "encode refuses an odd path and an oversized additional status" {
     }).encode(&out));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(40_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// CIP messages. `Request` and `Reply` read the same octets two ways, so the
+/// corpus carries both shapes: service, path size, path, data — and service
+/// with the reply bit, reserved, general status, extended-status size.
+const message_seeds = [_][]const u8{
+    fuzzSeed("0e03200124013007"), // Get_Attribute_Single on Identity, attribute 7
+    fuzzSeed("010220062401"), // Get_Attributes_All
+    fuzzSeed("4c0391055343414441"), // Read Tag "SCADA"
+    fuzzSeed("4c0391055343414441000100"), // Read Tag with an element count
+    fuzzSeed("4c03910441424344"), // Read Tag "ABCD"
+    fuzzSeed("8e000000"), // a success reply, no data
+    fuzzSeed("cc000000c40100000200"), // a Read Tag reply carrying a DINT
+    fuzzSeed("01000100aabb"), // a reply with general status 1
+    fuzzSeed("0100c800aabb"), // a reply with an extended status word
+    fuzzSeed("0e082001"), // a path size that overruns
+    fuzzSeed("200124"), // an EPATH with no service in front of it
+    fuzzSeed("0100"), // two octets
+};
+
 test "fuzz: request and reply decoders never panic and re-encode exactly" {
-    try std.testing.fuzz({}, fuzzMessages, .{});
+    try std.testing.fuzz({}, fuzzMessages, .{ .corpus = &message_seeds });
 }
 
 fn fuzzMessages(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 12
+    // non-empty and 0 accepted by either decoder before, 12 of 12 non-empty and
+    // 10 accepted after.**
+    const len: usize = smith.slice(&buf);
     var round: [512]u8 = undefined;
     if (Request.decode(buf[0..len])) |req| {
         try testing.expectEqualSlices(u8, buf[0..len], try req.encode(&round));
@@ -651,14 +695,33 @@ fn fuzzMessages(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
 }
 
+/// Multiple Service Packet payloads: a count, that many little-endian offsets,
+/// then the embedded messages — with offsets that are honest, out of order, and
+/// past the end.
+const multiple_seeds = [_][]const u8{
+    fuzzSeed("0200060010000e032001240130070e03200124013006"), // two honest messages
+    fuzzSeed("0200010000003412070014000000"), // offsets before the table itself
+    fuzzSeed("02000a000600010203040506"), // the second offset before the first
+    fuzzSeed("010004000e03200124013007"), // one message
+    fuzzSeed("0100"), // a count with no offset table
+    fuzzSeed("02000600"), // count 2, one offset
+    fuzzSeed("0000"), // count zero
+    fuzzSeed("ffff"), // 65535 messages and nothing behind them
+};
+
 test "fuzz: multiple service packet walking never panics" {
-    try std.testing.fuzz({}, fuzzMultiple, .{});
+    try std.testing.fuzz({}, fuzzMultiple, .{ .corpus = &multiple_seeds });
 }
 
 fn fuzzMultiple(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 8
+    // non-empty and 0 decoded before, 8 of 8 non-empty and 5 decoded after.**
+    const len: usize = smith.slice(&buf);
     const ms = MultipleService.decode(buf[0..len]) catch return;
     var i: usize = 0;
     while (i < ms.count) : (i += 1) {
@@ -670,15 +733,36 @@ fn fuzzMultiple(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+/// Attribute lists: a count and that many (id, status, value) entries, at the
+/// several value widths the iterator is asked to walk.
+const attr_seeds = [_][]const u8{
+    fuzzSeed("02000100000002000000"), // two entries, zero-width values
+    fuzzSeed("020001000000aabb02000000ccdd"), // two entries, two-octet values
+    fuzzSeed("01000700000001020304"), // one entry, four-octet value
+    fuzzSeed("0100010001000000"), // one entry with a non-zero status
+    fuzzSeed("0000"), // a count of zero
+    fuzzSeed("ffff01000000"), // 65535 entries, one present
+    fuzzSeed("0100"), // a count with no entry behind it
+    fuzzSeed("01"), // one octet
+};
+
 test "fuzz: attribute list iteration never panics or hangs" {
-    try std.testing.fuzz({}, fuzzAttrList, .{});
+    try std.testing.fuzz({}, fuzzAttrList, .{ .corpus = &attr_seeds });
 }
 
 fn fuzzAttrList(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const width: usize = smith.valueRangeAtMost(u8, 0, 8);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 8
+    // non-empty and one single (list, width) pair before, 8 of 8 non-empty and
+    // 8 distinct pairs after.**
+    const len: usize = smith.slice(&buf);
+    // `width` follows the list and is drawn with `value(u64)` rather than a
+    // ranged draw, so the seed chooses it too.
+    const width: usize = @intCast(smith.value(u64) % 9);
     var it = AttributeListIterator.init(buf[0..len]) catch return;
     var guard: usize = 0;
     while (true) {

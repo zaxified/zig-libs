@@ -557,7 +557,21 @@ test "a Read Var item with count 0 on the bit path does not index past the area"
 }
 
 test "fuzz: the responder never panics on hostile requests inside a well-formed envelope" {
-    try std.testing.fuzz({}, fuzzHandle, .{});
+    // The corpus is generated here from a FIXED PRNG seed rather than written
+    // out as literals. This harness's seed format IS its draw schedule — one
+    // 64-bit word per knob, four requests deep — so a hand-written seed would
+    // be two kilobytes of hex that tells a reader nothing, and a corpus of
+    // real S7 frames would be the wrong shape entirely: the frames are BUILT
+    // here, not drawn. A fixed PRNG seed keeps the corpus identical on every
+    // run, so a failure is reproducible from the source alone.
+    var prng = std.Random.DefaultPrng.init(0x5337c0ffee001234);
+    var bufs: [8][2048]u8 = undefined;
+    var seeds: [8][]const u8 = undefined;
+    for (&bufs, &seeds) |*b, *s| {
+        prng.random().bytes(b);
+        s.* = b;
+    }
+    try std.testing.fuzz({}, fuzzHandle, .{ .corpus = &seeds });
 }
 
 // ── the structure-aware responder harness ───────────────────────────────────
@@ -606,6 +620,55 @@ const fuzz_common_sizes = [_]u8{ 0x01, 0x02, 0x04, 0x05, 0x06, 0x07, 0x08 };
 /// Data-block transport sizes, including `null_size` and unknown-to-us values.
 const fuzz_data_sizes = [_]u8{ 0x00, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09 };
 
+/// A knob draw this harness's SEED can actually steer.
+///
+/// `Smith`'s ranged draws — `valueRangeAtMost`, `index`, `boolWeighted`, and
+/// `value` of any type narrower than 64 bits — read EIGHT input octets as a
+/// little-endian u64 and return the range MINIMUM unless that word already lies
+/// inside the range. Every knob below used to be one of those, and the effect
+/// was not a bias: it was total. Outside `zig build --fuzz` the test runner
+/// replays seeds through a `Smith` reading real bytes, and there the request
+/// builder produced ONE request — transport size `0x01`, element count 0, DB 0,
+/// area `0x1C`, address 0, Setup Communication — for every seed it was ever
+/// given, four times over. The comment above about spending the fuzzer's
+/// entropy where the responder makes decisions was true of the *design* and
+/// false of the *behaviour*.
+///
+/// `value(u64)` has full-range weights, so `weightsContain` is always true and
+/// every input word survives. The reduction is ours.
+///
+/// Measured on 2026-09-06, over eight 2 KB seeds and four requests each, by
+/// re-running the builder with each of these three helpers switched back to the
+/// collapsing draw it replaced: **32 requests built, 1 DISTINCT, and 0 of them
+/// accepted by `Responder.handle` — before. 32 built, 32 distinct, 25 accepted
+/// with a reply — after.** The harness was not merely narrow: the single
+/// request it could build is one `handle` refuses, so `doRead`, `doWrite`,
+/// `applyWrite` and `handleUserdata` had no fuzz coverage at all — exactly the
+/// hole the comment above was written to close.
+///
+/// ⛔ This target is NOT a candidate for a `STRUCTURED` fuzz-reach exemption,
+/// though it looks like one. It does draw a shape rather than a byte string —
+/// but the gate's own remedy for that case is the second in its list, "draw the
+/// knob with `value(u64)` and reduce it yourself", and that is a three-function
+/// change here. An exemption would have recorded the collapse as acceptable and
+/// left the responder untested.
+fn drawBelow(smith: *std.testing.Smith, bound: u64) u64 {
+    return smith.value(u64) % bound;
+}
+
+/// `boolWeighted(num, den - num)` with a draw the seed can steer.
+fn drawOdds(smith: *std.testing.Smith, num: u64, den: u64) bool {
+    return drawBelow(smith, den) < num;
+}
+
+/// `smith.value(T)` for a `T` narrower than 64 bits collapses exactly like a
+/// ranged draw: its weights are `0..maxInt(T)`, and `weightsContain` is false
+/// for all but a vanishing fraction of the 64-bit words it reads, so it too
+/// returned 0. Truncating a full-width `value(u64)` keeps every input word.
+fn drawWide(smith: *std.testing.Smith, comptime T: type) T {
+    return @truncate(smith.value(u64));
+}
+
 /// Writes one 12-octet S7ANY item descriptor. The three-octet prefix is fixed
 /// because a wrong one is rejected by `items.Item.decode` before the responder
 /// ever sees the item — that refusal is `items.zig`'s harness's job, not this
@@ -614,38 +677,38 @@ fn fuzzItemBytes(smith: *std.testing.Smith, out: *[12]u8) void {
     out[0] = 0x12;
     out[1] = 0x0A;
     out[2] = 0x10;
-    out[3] = switch (smith.valueRangeAtMost(u8, 0, 9)) {
-        0...5 => fuzz_common_sizes[smith.index(fuzz_common_sizes.len)],
-        6...8 => fuzz_sizes[smith.index(fuzz_sizes.len)],
-        else => smith.value(u8),
+    out[3] = switch (drawBelow(smith, 10)) {
+        0...5 => fuzz_common_sizes[@intCast(drawBelow(smith, fuzz_common_sizes.len))],
+        6...8 => fuzz_sizes[@intCast(drawBelow(smith, fuzz_sizes.len))],
+        else => drawWide(smith, u8),
     };
     // Biased small: that is the region where an item is *accepted* and the
     // bounds arithmetic is what decides the outcome. Zero is deliberately in
     // range — a zero count makes `payloadBytes()` zero for every size.
-    const count: u16 = switch (smith.valueRangeAtMost(u8, 0, 9)) {
-        0...5 => smith.valueRangeAtMost(u16, 0, 8),
-        6...8 => smith.valueRangeAtMost(u16, 0, 64),
-        else => smith.value(u16),
+    const count: u16 = switch (drawBelow(smith, 10)) {
+        0...5 => @intCast(drawBelow(smith, 9)),
+        6...8 => @intCast(drawBelow(smith, 65)),
+        else => drawWide(smith, u16),
     };
     out[4] = @intCast(count >> 8);
     out[5] = @truncate(count);
     // DB 1 is registered; 0 and 2 are not.
-    const db: u16 = smith.valueRangeAtMost(u16, 0, 2);
+    const db: u16 = @intCast(drawBelow(smith, 3));
     out[6] = @intCast(db >> 8);
     out[7] = @truncate(db);
-    out[8] = if (smith.boolWeighted(2, 3))
-        fuzz_bound_areas[smith.index(fuzz_bound_areas.len)]
+    out[8] = if (drawOdds(smith, 2, 5))
+        fuzz_bound_areas[@intCast(drawBelow(smith, fuzz_bound_areas.len))]
     else
-        fuzz_areas[smith.index(fuzz_areas.len)];
+        fuzz_areas[@intCast(drawBelow(smith, fuzz_areas.len))];
     // The address is generated the way a client writes one -- a byte offset
     // plus a bit index -- rather than as a raw 24-bit number, and the byte
     // offset is drawn from a range that straddles the end of both 64-octet
     // areas. Uniform over 2^24 the boundary is never hit; uniform over the
     // wire encoding it is hit only by accident.
-    const addr: u24 = switch (smith.valueRangeAtMost(u8, 0, 9)) {
-        0...6 => @as(u24, smith.valueRangeAtMost(u8, 0, 80)) * 8 + smith.valueRangeAtMost(u8, 0, 7),
-        7...8 => smith.valueRangeAtMost(u24, 0, 4096),
-        else => smith.value(u24),
+    const addr: u24 = switch (drawBelow(smith, 10)) {
+        0...6 => @as(u24, @intCast(drawBelow(smith, 81))) * 8 + @as(u24, @intCast(drawBelow(smith, 8))),
+        7...8 => @intCast(drawBelow(smith, 4097)),
+        else => drawWide(smith, u24),
     };
     out[9] = @intCast((addr >> 16) & 0xFF);
     out[10] = @intCast((addr >> 8) & 0xFF);
@@ -658,10 +721,10 @@ fn fuzzItemBytes(smith: *std.testing.Smith, out: *[12]u8) void {
 /// whole request is wasted — but sometimes a lie, which is the case
 /// `applyWrite`'s own `value.payload.len < want` guard exists for.
 fn fuzzWriteValue(smith: *std.testing.Smith, data: []u8, pos: usize, last: bool) ?usize {
-    const ts: items.DataTransportSize = @enumFromInt(fuzz_data_sizes[smith.index(fuzz_data_sizes.len)]);
-    const n: usize = smith.valueRangeAtMost(u8, 0, 32);
+    const ts: items.DataTransportSize = @enumFromInt(fuzz_data_sizes[@intCast(drawBelow(smith, fuzz_data_sizes.len))]);
+    const n: usize = @intCast(drawBelow(smith, 33));
     const honest = items.encodeLength(ts, n) catch return null;
-    const raw: u16 = if (smith.boolWeighted(7, 1)) honest else smith.value(u16);
+    const raw: u16 = if (drawOdds(smith, 7, 8)) honest else drawWide(smith, u16);
     if (pos + 4 + n > data.len) return null;
     data[pos] = 0x00; // a request item's return-code octet is `reserved`
     data[pos + 1] = @intFromEnum(ts);
@@ -717,13 +780,13 @@ fn fuzzRequest(smith: *std.testing.Smith, out: []u8) ?[]const u8 {
     // Read Var is drawn most often: it is the request with the most
     // wire-controlled arithmetic behind it, and the only one that can be sent
     // with no prior exchange at all.
-    switch (smith.valueRangeAtMost(u8, 0, 9)) {
+    switch (drawBelow(smith, 10)) {
         // Setup communication: the negotiated PDU length gates every reply.
         0 => {
-            const asked = if (smith.boolWeighted(3, 1))
-                smith.valueRangeAtMost(u16, 0, 960)
+            const asked: u16 = if (drawOdds(smith, 3, 4))
+                @intCast(drawBelow(smith, 961))
             else
-                smith.value(u16);
+                drawWide(smith, u16);
             params[0] = 0xF0;
             params[1] = 0x00;
             params[2] = 0x00;
@@ -737,7 +800,7 @@ fn fuzzRequest(smith: *std.testing.Smith, out: []u8) ?[]const u8 {
         // Read Var / Write Var.
         1...6 => |k| {
             const func: u8 = if (k >= 5) 0x05 else 0x04;
-            const n: u8 = smith.valueRangeAtMost(u8, 1, 12);
+            const n: u8 = @intCast(1 + drawBelow(smith, 12));
             params[0] = func;
             params[1] = n;
             plen = 2;
@@ -756,11 +819,11 @@ fn fuzzRequest(smith: *std.testing.Smith, out: []u8) ?[]const u8 {
         // PLC control, and — via an arbitrary function octet — `handleJob`'s
         // unrecognised-function arm.
         7 => {
-            params[0] = if (smith.boolWeighted(2, 1))
-                (if (smith.value(bool)) @as(u8, 0x29) else 0x28)
+            params[0] = if (drawOdds(smith, 2, 3))
+                (if (drawOdds(smith, 1, 2)) @as(u8, 0x29) else 0x28)
             else
-                smith.value(u8);
-            const tail: usize = smith.valueRangeAtMost(u8, 0, 24);
+                drawWide(smith, u8);
+            const tail: usize = @intCast(drawBelow(smith, 25));
             smith.bytes(params[1..][0..tail]);
             plen = 1 + tail;
         },
@@ -768,18 +831,18 @@ fn fuzzRequest(smith: *std.testing.Smith, out: []u8) ?[]const u8 {
         else => {
             rosctr = 0x07;
             const p = (userdata.Param{
-                .message_type = @enumFromInt(@as(u4, @truncate(if (smith.boolWeighted(7, 1)) @as(u8, 0) else smith.value(u8)))),
-                .function_group = @enumFromInt(@as(u4, @truncate(if (smith.boolWeighted(7, 1)) @as(u8, 4) else smith.value(u8)))),
-                .subfunction = if (smith.boolWeighted(7, 1)) 0x01 else smith.value(u8),
+                .message_type = @enumFromInt(@as(u4, @truncate(if (drawOdds(smith, 7, 8)) @as(u8, 0) else drawWide(smith, u8)))),
+                .function_group = @enumFromInt(@as(u4, @truncate(if (drawOdds(smith, 7, 8)) @as(u8, 4) else drawWide(smith, u8)))),
+                .subfunction = if (drawOdds(smith, 7, 8)) 0x01 else drawWide(smith, u8),
             }).encodeRequest(&params) catch return null;
             plen = p.len;
             var payload: [32]u8 = undefined;
-            const n: usize = smith.valueRangeAtMost(u8, 0, 8);
+            const n: usize = @intCast(drawBelow(smith, 9));
             smith.bytes(payload[0..n]);
-            if (n >= 2 and smith.boolWeighted(3, 1)) {
+            if (n >= 2 and drawOdds(smith, 3, 4)) {
                 // Steer the list id onto one the responder implements.
                 const known = [_]u16{ 0x0011, 0x0424 };
-                const id = known[smith.index(known.len)];
+                const id = known[@intCast(drawBelow(smith, known.len))];
                 payload[0] = @intCast(id >> 8);
                 payload[1] = @truncate(id);
             }

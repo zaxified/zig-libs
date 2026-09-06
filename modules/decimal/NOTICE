@@ -29,5 +29,5 @@ its own header. The suite's terms:
 Only test-case text is reproduced. The implementation under test is the
 authors' own (MIT), built on `std.math.big.int`; its DESIGN references (Java
 `BigDecimal`, the IBM General Decimal Arithmetic specification, the Python
-`decimal` docs) are recorded in the repository NOTICE §2 as provenance, not as
-a condition.
+`decimal` docs) are recorded in this module's `README.md` `Provenance:`
+statement as provenance, not as a condition.

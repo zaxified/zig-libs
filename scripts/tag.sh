@@ -134,14 +134,49 @@ for lane in "${lanes[@]}"; do
     log="$LOG_DIR/${label//[^a-zA-Z0-9]/_}.log"
     printf 'tag.sh: lane %-24s ... ' "$label"
     start=$(date +%s)
-    # Each lane runs INSIDE the memory cap, not beside it. `scripts/test.sh`
-    # sources test-lib.sh but never calls `_zl_cap_argv`, so a bare
-    # `test.sh all` is unbounded — and three of them in a row is what killed
-    # a desktop here on 2026-08-18: the kernel OOM killer picks its victim by
-    # size, and under an IDE that victim is the editor. Capping the lane means
-    # a runaway dies as one red lane (exit 137) instead.
+    # Each lane runs INSIDE the memory cap, not beside it. A bare `test.sh all`
+    # left unbounded is what killed a desktop here on 2026-08-18: the kernel OOM
+    # killer picks its victim by size, and under an IDE that victim is the
+    # editor. Capping the lane means a runaway dies as one red lane (exit 137).
+    #
+    # ⛔ AND THE LANE MUST BE TOLD IT IS ALREADY IN A SCOPE, or it starts none
+    # of them. The comment here used to say `test.sh` "never calls
+    # `_zl_cap_argv`, so a bare `test.sh all` is unbounded". That stopped being
+    # true on 2026-08-22, when `test.sh` began re-execing its WHOLE run into a
+    # scope of its own (`scripts/test.sh`, the `_ZL_IN_RUN_SCOPE` block). Two
+    # scopes do not nest: `systemd-run --user --scope` names its unit
+    # `run-p<PID>-i<instance>.scope` from the client's PID, and inside the outer
+    # scope the inner client draws the name the outer unit already holds, so
+    # systemd refuses it -- `Failed to start transient scope unit: Unit
+    # run-p…​.scope was already loaded or has a fragment file`. The `exec` then
+    # fails, `test.sh` exits 1 having run NOTHING, and every lane here reads as
+    # red. Measured 2026-09-06: 5 attempts, 5 failures, 0 tests run. Reproduce
+    # the composition without a full gate run:
+    #
+    #   bash -c 'source scripts/test-lib.sh; _zl_cap_argv;
+    #            ${_ZL_CAP[@]+"${_ZL_CAP[@]}"} bash scripts/test.sh --help'
+    #
+    # `scripts/test-tag.sh` cannot see this: it stubs `scripts/test.sh` with a
+    # plain script that re-execs nothing, so the stand-in lacks the very
+    # property that breaks the real one.
+    #
+    # Exporting `_ZL_IN_RUN_SCOPE` is the contract `test.sh` and `capped`
+    # already share for "you are inside the run scope already" -- it suppresses
+    # the inner re-exec and the per-step wrapper both. Set only when a scope was
+    # actually created, so a host without the cap (macOS, container, non-systemd)
+    # still lets `test.sh` make its own decision.
+    # ⚠ The guard is `${_ZL_CAP[*]+…}`, the same set-or-not idiom the call below
+    # already uses, and NOT `${#_ZL_CAP[@]}`: under `set -u` the latter aborts
+    # the shell when the array is unset, and it IS unset in `scripts/test-tag.sh`
+    # -- that harness copies only `tag.sh` into its throwaway repo, so the
+    # `source scripts/test-lib.sh` above fails there and `_zl_cap_argv` never
+    # defines it. Empty (no cap available) and unset (no test-lib) both mean the
+    # same thing here: no scope was made, so say nothing about one.
     _zl_cap_argv
-    if ${_ZL_CAP[@]+"${_ZL_CAP[@]}"} bash scripts/test.sh $lane >"$log" 2>&1; then
+    lane_env=()
+    [[ -n "${_ZL_CAP[*]+set}" ]] && lane_env=(env _ZL_IN_RUN_SCOPE=1)
+    if ${_ZL_CAP[@]+"${_ZL_CAP[@]}"} ${lane_env[@]+"${lane_env[@]}"} \
+        bash scripts/test.sh $lane >"$log" 2>&1; then
         printf 'OK   %ss\n' "$(($(date +%s) - start))"
     else
         printf 'FAILED %ss\n' "$(($(date +%s) - start))"

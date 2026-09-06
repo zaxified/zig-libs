@@ -1314,8 +1314,37 @@ test "the transport dropping at any point lands in backoff, never in limbo" {
     }
 }
 
+/// A `Smith` seed spelled out verbatim, because this harness's seed format IS
+/// its draw schedule: eight octets for the PRNG seed, eight for the starting
+/// state, then eight repetitions of {u32 length, that many octets of frame,
+/// eight octets for the clock step}.
+///
+/// The state selector is `valueRangeAtMost(u8, 0, 3)`, and that one is
+/// genuinely reachable from a seed — a range this narrow contains the word it
+/// reads whenever the word is 0..3 — which is why it needs no code change and
+/// why the corpus below can choose the state. It is the sort of ranged draw
+/// that does NOT collapse, and worth keeping distinct from the ones that do.
+fn fuzzRawSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const bytes = blk: {
+            @setEvalBranchQuota(40_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+    }.bytes;
+}
+
+/// One eight-frame conversation per starting state, over real BVLC-SC frames.
+const node_seeds = [_][]const u8{
+    fuzzRawSeed("070000000000000000000000000000000c0000000100000101001008090119640000000000000000040000000200000260ea0000000000000400000005000003c0d4010000000000040000000a000004801a060000000000040000000b0000050100000000000000090000000c00000703e703010290d0030000000000040000000d0000080000000000000000070000000102000a470100905f010000000000"), // fresh
+    fuzzRawSeed("08000000000000000100000000000000040000000a0000040000000000000000040000000b00000560ea000000000000090000000c00000703e7030102c0d4010000000000040000000d000008801a060000000000070000000102000a47010001000000000000001e0000000600000101020304050600112233445566778899aabbccddeeff0578051490d003000000000004000000080000090000000000000000040000000a10000a905f010000000000"), // started
+    fuzzRawSeed("09000000000000000200000000000000040000000d0000080000000000000000070000000102000a47010060ea0000000000001e0000000600000101020304050600112233445566778899aabbccddeeff05780514c0d40100000000000400000008000009801a060000000000040000000a10000a010000000000000004000000ff00000b90d00300000000000c00000001000001010010080901196400000000000000000400000002000002905f010000000000"), // socket open
+    fuzzRawSeed("0a00000000000000030000000000000004000000080000090000000000000000040000000a10000a60ea00000000000004000000ff00000bc0d40100000000000c000000010000010100100809011964801a06000000000004000000020000020100000000000000040000000500000390d0030000000000040000000a0000040000000000000000040000000b000005905f010000000000"), // connected
+};
+
 test "fuzz: a node survives arbitrary frames in every state" {
-    try std.testing.fuzz({}, fuzzNode, .{});
+    try std.testing.fuzz({}, fuzzNode, .{ .corpus = &node_seeds });
 }
 
 fn fuzzNode(_: void, smith: *std.testing.Smith) !void {
@@ -1343,8 +1372,21 @@ fn fuzzNode(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
     var now: u64 = 0;
     for (0..8) |_| {
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+        // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+        // `Smith.bytes` ate the whole remaining seed on the FIRST of these
+        // eight iterations, so the ranged length was 0 here and in the seven
+        // after it, and the clock never moved either: the node was handed eight
+        // empty frames at t=0. Measured on 2026-09-06 over `node_seeds`
+        // (4 seeds x 8 iterations = 32 frames): **0 of 32 non-empty, 0
+        // decodable, and the clock never leaving 0 ms before; 32 of 32
+        // non-empty, 24 decodable as BVLC-SC, and the clock advancing
+        // 3 680 004 ms after.**
+        //
+        // The starting state is NOT part of that gain: all four states are
+        // reached both before and after, because `valueRangeAtMost(u8, 0, 3)`
+        // is narrow enough to contain the word it reads. With no corpus — what
+        // this harness had — it is one state, one empty frame, t=0.
+        const len: usize = smith.slice(&buf);
         _ = node.onMessage(now, buf[0..len]) catch {};
         _ = node.poll(now) catch {};
         while (node.nextOutgoing()) |frame| {

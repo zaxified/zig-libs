@@ -674,14 +674,57 @@ test "service name is whatever is left in the item, not a fixed 16 octets" {
     try testing.expectEqualSlices(u8, &padded, try s2.encode(&out));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(40_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// Whole EtherNet/IP encapsulation messages — the 24-octet header and its body
+/// — one per command this decoder dispatches on, plus the framing rejections.
+const encap_seeds = [_][]const u8{
+    fuzzSeed("630000000000000000000000000000000000000000000000"), // ListIdentity
+    fuzzSeed("040000000000000000000000000000000000000000000000"), // ListServices
+    fuzzSeed("640000000000000000000000000000000000000000000000"), // ListInterfaces
+    fuzzSeed("000000000000000000000000000000000000000000000000"), // NOP
+    fuzzSeed("65000400000000000000000000000000000000000000000001000000"), // RegisterSession
+    fuzzSeed("660000000100a5a500000000000000000000000000000000"), // UnregisterSession
+    fuzzSeed("6f0016000100a5a50000000000000000000000000000000000000000e803020000000000b20006004c0220062401"), // SendRRData
+    fuzzSeed("700016000100a5a50000000000000000000000000000000000000000e803020000000000b20006004c0220062401"), // SendUnitData
+    fuzzSeed("6f0000000000000000000000000000000000000000000000"), // SendRRData with no body
+    fuzzSeed("6f000e0000000000000000000000000000000000000000000000000000000800000000000000"), // a CPF item count that overruns
+    fuzzSeed("341200000000000000000000000000000000000000000000"), // an unknown command
+    fuzzSeed("6f0008000000000000000000000000000000000000000000"), // declares 8 body octets, delivers 0
+    fuzzSeed("6f0008000000000000000000"), // shorter than the header
+};
+
 test "fuzz: encapsulation decode never panics and re-encodes exactly" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &encap_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 13
+    // non-empty and 0 decoded before, 13 of 13 non-empty and 11 decoded after.**
+    const len: usize = smith.slice(&buf);
     const msg = decode(buf[0..len]) catch return;
     try testing.expectEqual(len, msg.total_len);
     var round: [512]u8 = undefined;
@@ -689,14 +732,31 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     try testing.expectEqualSlices(u8, buf[0..len], again);
 }
 
+/// Streams for the framer: two messages back to back, a body split across the
+/// 64-octet feed chunk, and a stream that stops mid-header.
+const framer_seeds = [_][]const u8{
+    fuzzSeed("630000000000000000000000000000000000000000000000630000000000000000000000000000000000000000000000"),
+    fuzzSeed("6f0016000100a5a50000000000000000000000000000000000000000e803020000000000b20006004c0220062401630000000000000000000000000000000000000000000000"),
+    fuzzSeed("6f0008000000000000000000000000000000000000000000"), // declares 8 and stops
+    fuzzSeed("6f00"), // two octets, then end of stream
+    fuzzSeed("341200000000000000000000000000000000000000000000630000000000000000000000000000000000000000000000"),
+};
+
 test "fuzz: framer never panics or hangs" {
-    try std.testing.fuzz({}, fuzzFramer, .{});
+    try std.testing.fuzz({}, fuzzFramer, .{ .corpus = &framer_seeds });
 }
 
 fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     var input: [512]u8 = undefined;
-    smith.bytes(&input);
-    const len: usize = smith.valueRangeAtMost(u16, 0, input.len);
+    // ⚠ Same defect as `fuzzDecode` above, and NOT flagged by
+    // `check-fuzz-reach`: its R2 rule looks for the drawn buffer being sliced
+    // directly by the ranged length, and here `len` reaches the buffer one
+    // level down, through `input[off..][0..chunk]`. The collapse was identical
+    // — `len` was 0, `while (off < len)` never ran, and this harness fed the
+    // framer nothing at all. Measured on 2026-09-06 over the corpus above:
+    // **0 of 5 seeds fed a single octet and 0 messages came out before; 5 of 5
+    // fed and 6 messages out after.**
+    const len: usize = smith.slice(&input);
     var storage: [1024]u8 = undefined;
     var f = Framer.init(&storage);
     var off: usize = 0;
@@ -716,14 +776,33 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+/// The three decoders this harness calls read three different bodies out of
+/// the same octets, so the corpus carries all three: a CIP Identity object, a
+/// ListServices entry, and a 16-octet sockaddr_in.
+const item_seeds = [_][]const u8{
+    fuzzSeed("0100000c003100a5000000004e31323334353637383941424344454600"), // Identity-shaped
+    fuzzSeed("0100020000000c0000000000000000000000000000000000"), // Service-shaped
+    fuzzSeed("000002af12c0a8010500000000000000"), // a sockaddr_in, port 0xaf12
+    fuzzSeed("0002af12c0a8010500000000000000"), // one octet short of one
+    fuzzSeed("0100"), // a version and nothing else
+    fuzzSeed("01000c003100a500"), // truncated inside the identity
+    fuzzSeed("ffffffffffffffffffffffffffffffff"), // sixteen octets of anything
+};
+
 test "fuzz: identity and service decoders never panic" {
-    try std.testing.fuzz({}, fuzzItems, .{});
+    try std.testing.fuzz({}, fuzzItems, .{ .corpus = &item_seeds });
 }
 
 fn fuzzItems(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 7
+    // non-empty and 0 accepted by any of the three before, 7 of 7 non-empty and
+    // 6 accepted after.**
+    const len: usize = smith.slice(&buf);
     if (Identity.decode(buf[0..len])) |ident| {
         var round: [256]u8 = undefined;
         const again = try ident.encode(&round);

@@ -220,14 +220,65 @@ test "iterate: walks siblings" {
     try testing.expect(try it.next() == null);
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the encoding. `Smith.slice` reads a little-endian u32 length
+/// before it copies anything, so an element that is to arrive verbatim carries
+/// that header; a raw one would lose its own tag and length to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles with the RIGHT length and garbage
+/// behind it (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// BER encodings: primitive and constructed, short and long form lengths, the
+/// multi-octet tag form, and every truncation the reader has an error for.
+const ber_seeds = [_][]const u8{
+    fuzzSeed("020105"), // INTEGER 5
+    fuzzSeed("0403aabbcc"), // OCTET STRING, three octets
+    fuzzSeed("0500"), // NULL
+    fuzzSeed("06052863ca2203"), // OBJECT IDENTIFIER
+    fuzzSeed("30060201050500"), // SEQUENCE of two children
+    fuzzSeed("a107060528ca220203"), // a context-constructed [1]
+    fuzzSeed("601c80020780a107060528ca220203be0d280b06025101a005a803800105"), // a whole AARQ
+    fuzzSeed("048140" ++ ("aa" ** 64)), // long-form length, one length octet
+    fuzzSeed("04820040" ++ ("bb" ** 64)), // long-form length, two length octets
+    fuzzSeed("1f81020105"), // a multi-octet tag number
+    fuzzSeed("0403aabb"), // a declared length past the end
+    fuzzSeed("0484ffffffff"), // a length that cannot fit the buffer
+    fuzzSeed("02"), // a tag with no length octet
+    fuzzSeed("3006020105"), // a constructed element whose children run out
+};
+
 test "fuzz: BER reader never panics and never escapes the buffer" {
-    try testing.fuzz({}, fuzzRead, .{});
+    try testing.fuzz({}, fuzzRead, .{ .corpus = &ber_seeds });
 }
 
 fn fuzzRead(_: void, smith: *std.testing.Smith) !void {
     var buf: [96]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 14
+    // non-empty and 0 that the reader accepted before, 14 of 14 non-empty and
+    // 6 accepted after.**
+    //
+    // ⚠ Two seeds had to be SHRUNK to get there. `Smith.slice` returns 0
+    // whenever the length it read exceeds the destination buffer, and `buf` is
+    // 96 octets: the long-form-length seeds were 131 and 132 octets and arrived
+    // EMPTY — 12 of 14, not 14 — until they were cut to 67 and 68. A seed
+    // longer than the harness's buffer is silently no seed at all.
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
     const e = read(bytes) catch return;
     // Any element the reader accepts must sit wholly inside the input.

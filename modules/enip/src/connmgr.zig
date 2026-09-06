@@ -981,14 +981,57 @@ test "backplane route builds port 1 link slot" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x03 }, try backplaneRoute(3, &buf));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(40_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// Connection Manager service bodies. The five decoders this harness calls
+/// read the same octets five ways, so the corpus carries one body of each
+/// shape plus the truncations that bound them.
+const connmgr_seeds = [_][]const u8{
+    fuzzSeed("059d0a004c0391055343414441000100010220022401"), // Unconnected_Send
+    fuzzSeed("059d08004c03910441424344010220022401"), // the same, even-length embedded message
+    fuzzSeed("059dc80001020304"), // an embedded length that overruns
+    fuzzSeed("059d0200010201ff0102"), // a tick/timeout pair with a short body
+    fuzzSeed("0000000000000000010000000000000010270000000000001027000000000000a3030220022401"), // Forward_Open-shaped
+    fuzzSeed("00000000000000000100000000000000"), // Forward_Close-shaped
+    fuzzSeed("010220022401"), // a bare connection path
+    fuzzSeed("0100"), // two octets
+    fuzzSeed("0103"), // a tick count with no body
+};
+
 test "fuzz: connection manager decoders never panic" {
-    try std.testing.fuzz({}, fuzzConnMgr, .{});
+    try std.testing.fuzz({}, fuzzConnMgr, .{ .corpus = &connmgr_seeds });
 }
 
 fn fuzzConnMgr(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 9
+    // non-empty and 0 accepted by any of the five decoders before, 9 of 9
+    // non-empty and 2 accepted after** — the two Unconnected_Send bodies; the
+    // Forward_Open and Forward_Close shapes below are still reached only as
+    // rejections, which is a corpus gap this note records rather than hides.
+    const len: usize = smith.slice(&buf);
     var round: [1024]u8 = undefined;
     if (UnconnectedSend.decode(buf[0..len])) |us| {
         const again = try us.encode(&round);

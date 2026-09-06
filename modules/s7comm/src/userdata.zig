@@ -440,14 +440,58 @@ test "cpu status is read from the 0x0424 record" {
     try testing.expect(cpuStatusFrom(try SzlResponse.decode(short)) == null);
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// The three decoders this harness calls read three different framings out of
+/// the same octets, so the corpus carries all three: userdata parameter heads,
+/// data blocks, and an SZL response with its record table.
+const userdata_seeds = [_][]const u8{
+    fuzzSeed("0001120411440100"), // a Read SZL request parameter
+    fuzzSeed("0001120812840100"), // a response parameter, 8 octets
+    fuzzSeed("000112"), // shorter than a parameter
+    fuzzSeed("0002120411440100"), // the head is not 00 01 12
+    fuzzSeed("0001120812840100"), // a declared parameter length that does not fit
+    fuzzSeed("01320004"), // a data block header
+    fuzzSeed("ff09000400110000"), // a data block with a payload
+    fuzzSeed("ff09004000"), // declares 64 octets, delivers 1
+    fuzzSeed("ff09"), // truncated inside the data block header
+    fuzzSeed("ff090008001100010004000000010002"), // an SZL response with one record
+    fuzzSeed("ff09000c00110002000400000001000200030004"), // two records
+    fuzzSeed("ff0900080011000400040000"), // a record count past the payload
+};
+
 test "fuzz: userdata decoders never panic" {
-    try std.testing.fuzz({}, fuzzUserdata, .{});
+    try std.testing.fuzz({}, fuzzUserdata, .{ .corpus = &userdata_seeds });
 }
 
 fn fuzzUserdata(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 12
+    // non-empty and 0 accepted by any of the three decoders before, 12 of 12
+    // non-empty and 5 accepted after.**
+    const len: usize = smith.slice(&buf);
     _ = Param.decode(buf[0..len]) catch {};
     if (DataBlock.decode(buf[0..len])) |db| {
         try testing.expect(db.payload.len + 4 <= len);

@@ -939,8 +939,36 @@ test "a malformed frame from a connected node is a typed error" {
     try testing.expectEqual(@as(usize, 1), hub.nodeCount());
 }
 
+/// A `Smith` seed spelled out verbatim, because this harness's seed format IS
+/// its draw schedule and no single-frame helper can express it: eight octets
+/// for the PRNG seed, then eight repetitions of {u32 length, that many octets
+/// of frame, eight octets for the connection choice, eight octets for the clock
+/// step}. `Smith.slice` reads the u32 and copies; `value(bool)` and the ranged
+/// clock draw each read eight octets as a little-endian u64.
+fn fuzzRawSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const bytes = blk: {
+            @setEvalBranchQuota(40_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+    }.bytes;
+}
+
+/// Three eight-frame conversations against an admitted node: real BVLC-SC
+/// frames — encapsulated NPDU, address resolution, advertisement solicitation,
+/// heartbeat, proprietary, a duplicate Connect-Request, a disconnect — with a
+/// reserved control bit and two unknown functions mixed in, alternating between
+/// the two admitted connections and stepping the clock past the hub's timers.
+const hub_seeds = [_][]const u8{
+    fuzzRawSeed("01000000000000000c000000010000010100100809011964000000000000000000000000000000000400000002000002010000000000000060ea00000000000004000000050000030000000000000000c0d4010000000000040000000a0000040100000000000000801a060000000000040000000b00000500000000000000000100000000000000090000000c00000703e7030102010000000000000090d0030000000000040000000d00000800000000000000000000000000000000070000000102000a4701000100000000000000905f010000000000"),
+    fuzzRawSeed("0200000000000000040000000b00000501000000000000000000000000000000090000000c00000703e7030102000000000000000060ea000000000000040000000d0000080100000000000000c0d4010000000000070000000102000a4701000000000000000000801a0600000000001e0000000600000101020304050600112233445566778899aabbccddeeff05780514010000000000000001000000000000000400000008000009000000000000000090d0030000000000040000000a10000a0100000000000000000000000000000004000000ff00000b0000000000000000905f010000000000"),
+    fuzzRawSeed("03000000000000001e0000000600000101020304050600112233445566778899aabbccddeeff05780514010000000000000000000000000000000400000008000009010000000000000060ea000000000000040000000a10000a0100000000000000c0d401000000000004000000ff00000b0100000000000000801a0600000000000c000000010000010100100809011964010000000000000001000000000000000400000002000002010000000000000090d0030000000000040000000500000301000000000000000000000000000000040000000a0000040100000000000000905f010000000000"),
+};
+
 test "fuzz: a hub survives arbitrary frames from an admitted node" {
-    try std.testing.fuzz({}, fuzzHub, .{});
+    try std.testing.fuzz({}, fuzzHub, .{ .corpus = &hub_seeds });
 }
 
 fn fuzzHub(_: void, smith: *std.testing.Smith) !void {
@@ -958,8 +986,18 @@ fn fuzzHub(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
     var now: u64 = 0;
     for (0..8) |_| {
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+        // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+        // `Smith.bytes` ate the whole remaining seed on the FIRST of these
+        // eight iterations, so the ranged length was 0 here and in the seven
+        // iterations after it: the hub was handed eight empty frames and every
+        // later draw in this loop — the connection choice, the clock step —
+        // was its own minimum too. Measured on 2026-09-06 over `hub_seeds`
+        // (3 seeds x 8 iterations = 24 frames): **0 of 24 non-empty, 0
+        // decodable, connection `b` never once addressed, and the clock never
+        // leaving 0 ms before; 24 of 24 non-empty, 18 decodable as BVLC-SC,
+        // `b` addressed 16 times, and the clock advancing 2 760 003 ms — past
+        // both the 10 s connect wait and the 300 s heartbeat timeout — after.**
+        const len: usize = smith.slice(&buf);
         const which: ConnId = if (smith.value(bool)) a else b;
         _ = hub.onMessage(now, which, buf[0..len]) catch {};
         _ = hub.poll(now) catch {};

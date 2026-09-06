@@ -103,6 +103,6 @@ Only test-case TEXT (header values and their pass/fail verdicts) is
 reproduced. The implementation under test (`TraceContext.middleware`,
 `TraceParent.parse`, `isValidState`, `combinedHeader`, `singleHeader` in
 `src/root.zig`) is the authors' own (MIT), clean-room from the W3C Trace
-Context Level 1 recommendation itself (a public specification — see root
-`NOTICE` §2's existing `tracecontext` entry, which this file supplements,
+Context Level 1 recommendation itself (a public specification — see this
+module's `README.md` `Provenance:` statement, which this file supplements,
 not replaces).

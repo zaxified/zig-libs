@@ -241,14 +241,55 @@ test "framer surfaces a bad version rather than resynchronising" {
     try testing.expectError(error.BadVersion, f.next());
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
+/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
+/// it copies anything, so a frame that is to arrive verbatim carries that
+/// header; a raw frame would lose its own first four octets to the length read.
+///
+/// ⚠ The array has to be static. A `const` local in this function is NOT
+/// promoted and the returned slice dangles — with the RIGHT length and garbage
+/// behind it, which is the hardest shape to notice (measured 2026-09-06).
+fn fuzzSeed(comptime h: []const u8) []const u8 {
+    return &struct {
+        const f = blk: {
+            @setEvalBranchQuota(20_000);
+            var out: [h.len / 2]u8 = undefined;
+            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
+    }.bytes;
+}
+
+/// Real TPKT packets: a COTP-DT carrying an S7 header, a full Read Var job, and
+/// every rejection `decode` has an error for.
+const tpkt_seeds = [_][]const u8{
+    fuzzSeed("0300000702f080"), // COTP-DT, empty S7 payload
+    fuzzSeed("0300000902f0803201"), // the first two S7 octets
+    fuzzSeed("0300001f02f080320100000001000e00000401120a10010000000184000200"), // a Read Var job
+    fuzzSeed("03000100aabbccdd"), // declares 256 octets, delivers 8
+    fuzzSeed("0300000702f08032"), // one octet past the declared length
+    fuzzSeed("030000"), // shorter than the header
+    fuzzSeed("0400000500"), // version is not 3
+    fuzzSeed("0301000500"), // the reserved octet is not zero
+    fuzzSeed("03000004"), // length below the header
+    fuzzSeed("03000000"), // length zero
+    fuzzSeed("0300002000"), // length past the end
+};
+
 test "fuzz: tpkt decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &tpkt_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
+    // finds fewer than eight octets left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever saw the empty
+    // input. Measured on 2026-09-06 over the corpus above: **0 of 11
+    // non-empty and 0 decoded before, 11 of 11 non-empty and 4 decoded after.**
+    const len: usize = smith.slice(&buf);
     const pkt = decode(buf[0..len]) catch return;
     try testing.expect(pkt.total_len <= len);
     try testing.expectEqual(pkt.total_len, pkt.payload.len + header_len);
@@ -257,14 +298,32 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     try testing.expectEqualSlices(u8, buf[0..pkt.total_len], again);
 }
 
+/// Streams for the framer: two whole packets back to back, a packet split so
+/// the 64-octet feed chunk lands inside the header, and a stream that never
+/// completes its declared length.
+const framer_seeds = [_][]const u8{
+    fuzzSeed("0300000702f0800300000702f080"), // two complete packets
+    fuzzSeed("0300001f02f080320100000001000e00000401120a100100000001840002000300000702f080"),
+    fuzzSeed("03000100aabbccdd"), // declares 256 and stops
+    fuzzSeed("03"), // one octet, then end of stream
+    fuzzSeed("04000005000300000702f080"), // a bad version ahead of a good packet
+};
+
 test "fuzz: framer never panics or hangs" {
-    try std.testing.fuzz({}, fuzzFramer, .{});
+    try std.testing.fuzz({}, fuzzFramer, .{ .corpus = &framer_seeds });
 }
 
 fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     var input: [512]u8 = undefined;
-    smith.bytes(&input);
-    const len: usize = smith.valueRangeAtMost(u16, 0, input.len);
+    // ⚠ Same defect as `fuzzDecode` above, and NOT flagged by
+    // `check-fuzz-reach`: the gate's R2 rule looks for the drawn buffer being
+    // sliced directly by the ranged length, and here `len` reaches the buffer
+    // one level down, through `input[off..][0..chunk]`. The collapse was
+    // identical — `len` was 0, the `while (off < len)` loop never ran, and this
+    // harness fed the framer nothing at all. Measured on 2026-09-06 over the
+    // corpus above: **0 of 5 seeds fed the framer a single octet, and 0 packets
+    // came out, before; 5 of 5 fed, 4 packets out, after.**
+    const len: usize = smith.slice(&input);
     var storage: [1024]u8 = undefined;
     var f = Framer.init(&storage);
     var off: usize = 0;

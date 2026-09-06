@@ -179,7 +179,17 @@ def extract_file(path, rel):
 def extract_claims(root, module_filter):
     res = []
     for dp, dns, fns in os.walk(root):
-        dns[:] = [d for d in dns if d not in (".git", ".zig-cache", "zig-out")]
+        # ⚠ `zig-pkg` belongs here and was missing until 2026-09-06. It is the
+        # dependency checkout `example-apps/*` and the root build fetch into,
+        # and because this collection's apps depend on THIS collection, each
+        # one holds a complete second copy of `modules/`. Measured on this
+        # tree: 12 such copies (one root `zig-pkg` with 7 package hashes plus
+        # one per example app), and the whole-repo run reported 12189
+        # citations of which 6887 -- 56% -- were the same source lines read
+        # again out of a checkout nobody edits. Every one of them was also
+        # FETCHED against, so the run cost scaled with the duplicates too.
+        # `.gitignore` already lists `zig-pkg/`; this walk simply did not.
+        dns[:] = [d for d in dns if d not in (".git", ".zig-cache", "zig-out", "zig-pkg")]
         for fn in fns:
             if not fn.endswith((".zig", ".md")):
                 continue

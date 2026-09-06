@@ -548,19 +548,52 @@ test "serialNewer: forward within half the space, backward otherwise" {
     try testing.expect(serialNewer(u16, 0, 65535));
 }
 
+/// A knob draw this harness's SEED can steer.
+///
+/// `smith.valueRangeAtMost` reads EIGHT octets as a little-endian u64 and
+/// returns the range MINIMUM unless that word already lies inside the range.
+/// All three draws below were ranged, so `st_num`, `sq_num` and the clock skew
+/// were 0 on every step of every run: this harness offered the guard the SAME
+/// identity thirty-two times, and neither the "accepting must mean the pair
+/// moved strictly forward" branch nor the rejection branch below could see a
+/// pair that had moved. `value(u64)` has full-range weights, so every input
+/// word survives; the reduction is ours.
+///
+/// ⛔ This target is not a `STRUCTURED` fuzz-reach exemption candidate even
+/// though it draws a shape rather than a byte string: the gate's own second
+/// remedy — draw with `value(u64)` and reduce — is this one line.
+fn drawBelow(smith: *std.testing.Smith, bound: u64) u32 {
+    return @intCast(smith.value(u64) % bound);
+}
+
 test "fuzz: a GOOSE guard never accepts a strictly older (stNum, sqNum) pair" {
-    try testing.fuzz({}, fuzzGoose, .{});
+    // 32 steps x 3 draws x 8 octets = 768 octets per seed. A fixed PRNG seed
+    // keeps the corpus identical on every run.
+    var prng = std.Random.DefaultPrng.init(0x600_5e00_0000_0001);
+    var bufs: [8][768]u8 = undefined;
+    var seeds: [8][]const u8 = undefined;
+    for (&bufs, &seeds) |*b, *s| {
+        prng.random().bytes(b);
+        s.* = b;
+    }
+    try testing.fuzz({}, fuzzGoose, .{ .corpus = &seeds });
 }
 
 fn fuzzGoose(_: void, smith: *std.testing.Smith) !void {
     var g: GooseGuard = .init(.{ .max_state_age_ns = std.math.maxInt(u64) / 4, .max_skew_ns = ns_per_s });
     var now = t0;
     var steps: usize = 0;
+    // Measured on 2026-09-06 over the corpus above (8 seeds x 32 steps):
+    // **1 distinct identity offered across all 256 steps and 8 acceptances
+    // before; 256 distinct identities and 15 acceptances after.** The 8
+    // acceptances before were the eight first steps — one per seed, the guard
+    // having no state yet — after which the same identity was refused 31 times
+    // in a row, which is the whole of what this harness used to test.
     while (steps < 32) : (steps += 1) {
         const id: GooseIdentity = .{
-            .st_num = smith.valueRangeAtMost(u32, 0, 8),
-            .sq_num = smith.valueRangeAtMost(u32, 0, 8),
-            .t_ns = now -| smith.valueRangeAtMost(u32, 0, 1000),
+            .st_num = drawBelow(smith, 9),
+            .sq_num = drawBelow(smith, 9),
+            .t_ns = now -| drawBelow(smith, 1001),
         };
         const before = g.state;
         const v = g.accept(id, now);

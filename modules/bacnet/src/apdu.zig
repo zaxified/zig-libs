@@ -743,14 +743,54 @@ test "unknown PDU types and empty buffers" {
     }
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`.
+///
+/// `Smith.slice` reads a little-endian u32 length and then that many bytes, so
+/// a frame that is to arrive verbatim has to carry that header: a raw frame
+/// would have its own first four octets eaten as the length and the remainder
+/// handed over shifted by four.
+///
+/// ⚠ The array has to live in static memory. A `const` local in this function
+/// is NOT promoted and the returned slice dangles; measured on 2026-09-06, that
+/// spelling hands back the RIGHT length with garbage behind it, which is the
+/// hardest possible shape to notice.
+fn fuzzSeed(comptime frame: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
+    }.bytes;
+}
+
+/// One APDU per PDU type this decoder dispatches on, lifted from the tests
+/// above, plus the two rejections that bound the type octet.
+const apdu_seeds = [_][]const u8{
+    fuzzSeed(&.{ 0x10, 0x08, 0x09, 0x01, 0x19, 0x64 }), // unconfirmed Who-Is
+    fuzzSeed(&.{ 0x00, 0x05, 0x01, 0x0C, 0xAA, 0xBB }), // confirmed request, unsegmented
+    fuzzSeed(&.{ 0x0C, 0x05, 0x01, 0x00, 0x10, 0x0C, 0xAA, 0xBB }), // confirmed request, segmented
+    fuzzSeed(&.{ 0x20, 0x01, 0x0F }), // simple ACK
+    fuzzSeed(&.{ 0x30, 0x01, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x05 }), // complex ACK
+    fuzzSeed(&.{ 0x3C, 0x01, 0x00, 0x10, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x05 }), // complex ACK, segmented
+    fuzzSeed(&.{ 0x38, 0x01, 0x03, 0x10, 0x0C, 0xAA }), // complex ACK, last segment
+    fuzzSeed(&.{ 0x42, 0x01, 0x03, 0x10 }), // segment ACK
+    fuzzSeed(&.{ 0x50, 0x01, 0x0C, 0x91, 0x01, 0x91, 0x20 }), // error
+    fuzzSeed(&.{ 0x60, 0x01, 0x09 }), // reject
+    fuzzSeed(&.{ 0x71, 0x01, 0x04 }), // abort
+    fuzzSeed(&.{ 0x12, 0x08 }), // reserved bits set in the type octet
+    fuzzSeed(&.{0x10}), // truncated
+};
+
 test "fuzz: APDU decode never panics and round-trips what it accepts" {
-    try std.testing.fuzz({}, fuzzApdu, .{});
+    try std.testing.fuzz({}, fuzzApdu, .{ .corpus = &apdu_seeds });
 }
 
 fn fuzzApdu(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed, and a ranged draw then
+    // finds fewer than eight bytes left and returns the range MINIMUM — so the
+    // length was 0 for every seed and this harness only ever decoded the empty
+    // APDU. Measured on 2026-09-06 over the corpus above: **0 of 13 non-empty
+    // and 0 decoded before, 13 of 13 non-empty and 11 decoded after.**
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
     const a = decode(input) catch return;
     var out: [256]u8 = undefined;

@@ -577,14 +577,54 @@ test "encode refuses to overflow the length field or the buffer" {
     ));
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`.
+///
+/// `Smith.slice` reads a little-endian u32 length and then that many bytes, so
+/// a frame that is to arrive verbatim has to carry that header: a raw frame
+/// would have its own first four octets eaten as the length and the remainder
+/// handed over shifted by four — which for a BVLC datagram removes exactly the
+/// header the decoder dispatches on.
+///
+/// ⚠ The array has to live in static memory. A `const` local in this function
+/// is not promoted and the returned slice dangles; measured on 2026-09-06, that
+/// spelling returns the RIGHT length with garbage bytes behind it, which is the
+/// hardest possible shape to notice.
+fn fuzzSeed(comptime frame: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
+    }.bytes;
+}
+
+/// Real BACnet/IP datagrams, lifted from the tests above: one per function this
+/// decoder dispatches on, plus the three rejections that bound it.
+const bvlc_seeds = [_][]const u8{
+    fuzzSeed(&.{ 0x81, 0x0B, 0x00, 0x0C, 0x01, 0x00, 0x10, 0x08, 0x09, 0x01, 0x19, 0x64 }), // original-broadcast
+    fuzzSeed(&.{ 0x81, 0x0A, 0x00, 0x0C, 0x01, 0x00, 0x10, 0x08, 0x09, 0x01, 0x19, 0x64 }), // original-unicast
+    fuzzSeed(&.{ 0x81, 0x04, 0x00, 0x12, 0xC0, 0x00, 0x02, 0x05, 0xBA, 0xC0, 0x01, 0x00, 0x10, 0x08, 0x09, 0x01, 0x19, 0x64 }), // forwarded
+    fuzzSeed(&.{ 0x81, 0x05, 0x00, 0x06, 0x00, 0x3C }), // register-foreign-device
+    fuzzSeed(&.{ 0x81, 0x00, 0x00, 0x06, 0x00, 0x00 }), // result: success
+    fuzzSeed(&.{ 0x81, 0x00, 0x00, 0x06, 0x00, 0x30 }), // result: register-FD NAK
+    fuzzSeed(&.{ 0x81, 0x02, 0x00, 0x04 }), // read-BDT
+    fuzzSeed(&.{ 0x81, 0x06, 0x00, 0x04 }), // read-FDT
+    fuzzSeed(&.{ 0x81, 0x08, 0x00, 0x0A, 0xCB, 0x00, 0x71, 0x09, 0xBA, 0xC0 }), // delete-FDT-entry
+    fuzzSeed(&.{ 0x81, 0x0B, 0x00, 0x0C, 0x01, 0x00, 0x10, 0x08, 0x09, 0x01, 0x19 }), // length mismatch
+    fuzzSeed(&.{ 0x81, 0xFF, 0x00, 0x04 }), // unknown function
+    fuzzSeed(&.{ 0x82, 0x0B, 0x00, 0x04 }), // not BVLC at all
+};
+
 test "fuzz: BVLC decode never panics and re-encodes identically" {
-    try std.testing.fuzz({}, fuzzBvlc, .{});
+    try std.testing.fuzz({}, fuzzBvlc, .{ .corpus = &bvlc_seeds });
 }
 
 fn fuzzBvlc(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    // `Smith.bytes` consumes the whole remaining seed and a ranged draw then
+    // reads fewer than eight bytes and returns the range MINIMUM, so the length
+    // was 0 for every seed and this harness decoded the empty datagram, once.
+    // Measured on 2026-09-06 over the corpus above: **0 of 12 non-empty and 0
+    // decoded before, 12 of 12 non-empty and 9 decoded after.**
+    const len: usize = smith.slice(&buf);
     const dgram = buf[0..len];
     const msg = decode(dgram) catch return;
     var out: [512]u8 = undefined;

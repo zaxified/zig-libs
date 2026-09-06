@@ -1722,14 +1722,70 @@ test "decoder: hostile primitive payloads" {
     }
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`.
+///
+/// `Smith.slice` reads a little-endian u32 length and then that many bytes, so
+/// a frame that is to arrive verbatim has to carry that header: a raw frame
+/// would have its own first four octets eaten as the length and the remainder
+/// handed over shifted by four.
+///
+/// ⚠ The array has to live in static memory. A `const` local in this function
+/// is NOT promoted and the returned slice dangles; measured on 2026-09-06, that
+/// spelling hands back the RIGHT length with garbage behind it, which is the
+/// hardest possible shape to notice.
+fn fuzzSeed(comptime frame: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
+    }.bytes;
+}
+
+/// Tag streams: one per application class the reader decodes, the bracket
+/// shapes `openedBlock` walks, and the two overlong forms the tests pin.
+const tag_seeds = [_][]const u8{
+    fuzzSeed(&.{ 0x10, 0x08, 0x09, 0x01, 0x19, 0x64 }), // context 0/1 unsigned pair
+    fuzzSeed(&.{ 0x0C, 0x00, 0x00, 0x00, 0x05, 0x19, 0x55 }), // context object id + property id
+    fuzzSeed(&.{ 0x3E, 0x21, 0x05, 0x3F }), // opening 3, unsigned, closing 3
+    fuzzSeed(&.{ 0x0E, 0x0C, 0x00, 0x00, 0x00, 0x05, 0x0F }), // opening 0 … closing 0
+    fuzzSeed(&.{ 0x1E, 0x3E, 0x21, 0x05, 0x3F, 0x1F }), // nested brackets, 1 outside 3
+    fuzzSeed(&.{ 0x74, 0x63, 0x61, 0x62, 0x63 }), // character string
+    fuzzSeed(&.{ 0xA4, 0x7C, 0x0F, 0x17, 0x02 }), // date
+    fuzzSeed(&.{ 0xB4, 0x0D, 0x3C, 0x1E, 0x32 }), // time
+    fuzzSeed(&.{ 0x82, 0x08, 0xFF }), // bit string
+    fuzzSeed(&.{ 0x65, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0x01 }), // extended length, near 2^32
+    fuzzSeed(&.{ 0x25, 0x09, 1, 2, 3, 4, 5, 6, 7, 8, 9 }), // unsigned wider than 8 octets
+    fuzzSeed(&.{0x3F}), // a bare closing tag
+    fuzzSeed(&.{ 0x72, 0x00, 0xFF }), // declared length past the end
+};
+
+/// `decodeHeader` reads at most `max_header_len` octets, and `Smith.slice`
+/// returns 0 whenever the seed's declared length exceeds the destination
+/// buffer — so this harness needs its own corpus of headers that FIT, not the
+/// stream corpus above. Every entry here is <= `max_header_len` by
+/// construction; a longer one would be silently delivered as empty.
+const header_seeds = [_][]const u8{
+    fuzzSeed(&.{0x21}), // context 2, length 1
+    fuzzSeed(&.{0x09}), // context 0, length 1
+    fuzzSeed(&.{0x3E}), // opening tag 3
+    fuzzSeed(&.{0x3F}), // closing tag 3
+    fuzzSeed(&.{0xC4}), // application object id
+    fuzzSeed(&.{ 0xF0, 0x01 }), // extended tag NUMBER, short length
+    fuzzSeed(&.{ 0x7D, 0x00 }), // extended LENGTH escape where the short form fits
+    fuzzSeed(&.{ 0x25, 0x09 }), // declared length 9
+    fuzzSeed(&.{ 0x65, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF }), // 32-bit extended length
+    fuzzSeed(&.{ 0x55, 0xFE, 0x01, 0x02 }), // 16-bit extended length
+};
+
 test "fuzz: tag skipping never crashes, hangs or stalls" {
-    try std.testing.fuzz({}, fuzzSkip, .{});
+    try std.testing.fuzz({}, fuzzSkip, .{ .corpus = &tag_seeds });
 }
 
 fn fuzzSkip(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length; the
+    // ranged length was 0 for every seed. Measured on 2026-09-06 over
+    // `tag_seeds`: **0 of 13 non-empty and 0 whose first tag `skip` accepted
+    // before; 13 of 13 non-empty and 11 accepted after.**
+    const len: usize = smith.slice(&buf);
     var r = Reader.init(buf[0..len]);
     var guard: usize = 0;
     while (!r.atEnd() and guard < 4096) : (guard += 1) {
@@ -1742,13 +1798,13 @@ fn fuzzSkip(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: application values never crash the decoder" {
-    try std.testing.fuzz({}, fuzzAppValue, .{});
+    try std.testing.fuzz({}, fuzzAppValue, .{ .corpus = &tag_seeds });
 }
 
 fn fuzzAppValue(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ See `fuzzSkip`: `bytes` then a ranged length always yielded 0.
+    const len: usize = smith.slice(&buf);
     var r = Reader.init(buf[0..len]);
     var guard: usize = 0;
     while (!r.atEnd() and guard < 4096) : (guard += 1) {
@@ -1759,7 +1815,7 @@ fn fuzzAppValue(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: openedBlock returns a sub-slice of its input or nothing" {
-    try std.testing.fuzz({}, fuzzOpenedBlock, .{});
+    try std.testing.fuzz({}, fuzzOpenedBlock, .{ .corpus = &tag_seeds });
 }
 
 /// W2-05 lived through a clean coverage-guided sweep because `openedBlock` was
@@ -1770,8 +1826,8 @@ test "fuzz: openedBlock returns a sub-slice of its input or nothing" {
 /// buffer it was borrowed from.
 fn fuzzOpenedBlock(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ See `fuzzSkip`: `bytes` then a ranged length always yielded 0.
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
     // Every bracket number a service decoder in this module actually opens,
     // plus one extended-form number, so a closing bracket of a *different*
@@ -1792,13 +1848,19 @@ fn fuzzOpenedBlock(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: every canonically decoded header re-encodes to the same octets" {
-    try std.testing.fuzz({}, fuzzHeaderRoundTrip, .{});
+    try std.testing.fuzz({}, fuzzHeaderRoundTrip, .{ .corpus = &header_seeds });
 }
 
 fn fuzzHeaderRoundTrip(_: void, smith: *std.testing.Smith) !void {
     var buf: [max_header_len]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ See `fuzzSkip`. This one takes `header_seeds`, not `tag_seeds`:
+    // `Smith.slice` returns 0 when the seed's declared length exceeds the
+    // destination buffer, and `buf` is only `max_header_len` octets. Measured
+    // on 2026-09-06: **0 of 10 non-empty and 0 headers decoded before, 10 of 10
+    // non-empty and 10 decoded after** — and `tag_seeds`' 11-octet entry fed
+    // into this 7-octet buffer arrives empty, which is why the corpus is
+    // separate rather than shared.
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
     const t = decodeHeader(input) catch return;
     // A peer may take an escape where the short form would have fitted — for
