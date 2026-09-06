@@ -60,11 +60,18 @@ Logical states: `down`, `initializing`, `up`. Events: `start(now)`, `stop()`,
 
 ### 4.1 State × event → next-state + effect
 
-| State | `rxHello` accepted, **not** echoed-by-neighbour | `rxHello` accepted, echoed **and** neighbour past-Down | `tick`, `now ≥ hold_deadline` | `stop()` |
-|-------|---|---|---|---|
-| `down` | → `initializing` (transition) | → `up` (`adjacency_up`) | — (no hold set) | → `down` |
-| `initializing` | stay `initializing` | → `up` (`adjacency_up`) | → `down` | → `down` |
-| `up` | → `initializing` (`adjacency_down = neighbor_restarted`) | stay `up` | → `down` (`adjacency_down = hold_expired`) | → `down` (`adjacency_down = stopped`) |
+| State | `rxHello` accepted, **not** echoed-by-neighbour | `rxHello` accepted, echoed **and** neighbour past-Down | received 240 state **Up** | `tick`, `now ≥ hold_deadline` | `stop()` |
+|-------|---|---|---|---|---|
+| `down` | → `initializing` (transition) | → `up` (`adjacency_up`) | **rejected `.neighbor_up_while_down`**, nothing recorded (RFC 5303 table: Down × Up = Down, "Neighbor restarted") | — (no hold set) | → `down` |
+| `initializing` | stay `initializing` | → `up` (`adjacency_up`) | as the echo column | → `down` (transition only) | → `down` |
+| `up` | → `initializing` (`adjacency_down = neighbor_restarted`) | stay `up` | as the echo column | → `down` (`adjacency_down = hold_expired`) | → `down` (`adjacency_down = stopped`) |
+
+Two rules run BEFORE the table and before any mutation, on the received TLV 240
+(RFC 5303 §3.2): a neighbour block naming another system, or our system on
+another extended local circuit id, discards the PDU whole (`.neighbor_mismatch`);
+and, at local `down`, a received three-way state of Up is the table's
+(Down, Up) cell — the peer's claim is stale, we record nothing and our next hello
+(Down, no neighbour block) sends it back through Initializing.
 
 - **echoed** ≡ the neighbour's TLV 240 carries a neighbour block whose
   (system-id, extended-local-circuit-id) equals **ours**. This is the loop guard.
@@ -81,8 +88,9 @@ Logical states: `down`, `initializing`, `up`. Events: `start(now)`, `stop()`,
   records the neighbour's system-id (from source-id) and extended-local-circuit-id
   (from its 240, if any). The hold deadline is *derived state*, never a timer
   object.
-- `start(now)` resets to `down`, primes `next_hello_due = now`, and returns the
-  first IIH immediately (so the handshake does not wait a full interval).
+- `start(now)` resets to `down`, returns the first IIH immediately (so the
+  handshake does not wait a full interval) and schedules the next one at
+  `now + hello_interval`.
 - `tick` also emits a `send_hello` whenever `now ≥ next_hello_due`, rescheduling
   by `hello_interval`. Hold-expiry and a due hello can occur in the same `tick`.
 
@@ -104,15 +112,35 @@ Implemented (cheap, and they gate adjacency formation):
   L1-only vs L2-only P2P pairing.
 - **Not started** — `rxHello` before `start` → `rejected = .not_started`.
 - **Third neighbour** — a P2P circuit carries exactly one adjacency (ISO/IEC
-  10589 §8.2.4). Once `neighbor_system_id` is populated, an IIH from a *different*
-  source system-id → `rejected = .other_neighbor`, checked **before** any
-  mutation. An IIH is unauthenticated unless TLV 10 is configured, so without
-  this check any station on the wire could refresh our hold timer with its own
-  `holding_time`, overwrite the recorded neighbour, and — being unable to echo
-  our system-id in TLV 240 — flap the adjacency Up→Initializing on every frame,
-  while the inflated hold kept the FSM from ever reaching a clean Down. The
-  circuit is released only when the incumbent's hold genuinely expires (`tick`
-  → Down clears the neighbour), so a real neighbour change converges in one hold.
+  10589 §8.2.4). While the adjacency is **Up**, an IIH from a *different* source
+  system-id → `rejected = .other_neighbor`, checked **before** any mutation. An
+  IIH is unauthenticated unless TLV 10 is configured, so without this check any
+  station on the wire could refresh our hold timer with its own `holding_time`,
+  overwrite the recorded neighbour, and — being unable to echo our system-id in
+  TLV 240 — flap the adjacency Up→Initializing on every frame. The lock releases
+  when the incumbent's hold genuinely expires (`tick` → Down clears the
+  neighbour). **It does not apply at Initializing**: a candidate heard but not
+  proven is replaced by the next hello from a different system (ISO 10589 / FRR
+  semantics). The A1 audit (F2) showed why the earlier "lock on first hello"
+  rule was worse than the flap it replaced — one unauthenticated frame with
+  `holding_time = 65535` kept the real neighbour out for 65 535 units (1998/1998
+  of its hellos rejected). A stranger now has to keep transmitting to keep
+  displacing the candidate, and the genuine neighbour's next echoing hello goes
+  to Up and engages the lock. Trade-off stated plainly: at Up we keep the
+  incumbent (FRR lets the newcomer take over, which is spoofable teardown); at
+  Initializing we let the newcomer in (FRR does too). Neither is authentication.
+- **Neighbour-block mismatch** — RFC 5303 §3.2: a TLV 240 whose neighbour block
+  names another system, or our system with another extended local circuit id
+  (a parallel circuit's handshake), is discarded whole →
+  `rejected = .neighbor_mismatch`, before any mutation. The earlier code let such
+  a PDU through as "not an echo" and processed it: one frame naming a third
+  system dropped an Up adjacency to Initializing, set the hold to the sender's
+  `holding_time` and overwrote the recorded extended circuit id (A1 audit F1).
+- **Stale Up** — at local Down, a received three-way state of Up →
+  `rejected = .neighbor_up_while_down` (RFC 5303 table, (Down, Up) = Down,
+  "Neighbor restarted"). One replayed or live "Up + echoes you" frame used to
+  take a fresh circuit straight to Up — a unidirectional link after our restart
+  declared functional (A1 audit F3).
 - **Maximum Area Addresses mismatch** — the IIH's common-header Maximum Area
   Addresses (ISO 10589 §9.6) differs from `Config.max_area_addresses` →
   `rejected = .max_area_mismatch` (ISO 10589 §8.2). Always enforced; there is
@@ -133,7 +161,10 @@ Implemented (cheap, and they gate adjacency formation):
 Malformed input is a typed **error** (not a soft reject) from `rxHelloBytes`:
 a bad common header / P2P body surfaces `isis`'s `pdu.DecodeError`
 (`BadDiscriminator`, `TruncatedBody`, `BadPduLength`, `WrongPduType`, …); a bad
-TLV walk surfaces `tlv.Error`; a bad 240 surfaces `BadLength`/`BadState`. In
+TLV walk surfaces `tlv.Error` — the WHOLE stream is walked (`isis.tlv.count`),
+not just the prefix up to the TLVs this module reads, so a TLV lying about its
+length behind the 240 fails the PDU exactly as it does in a sibling that walks
+it all (A1 audit F6); a bad 240 surfaces `BadLength`/`BadState`. In
 every error case the FSM mutates nothing (the decode happens before any state
 change) — a hostile PDU cannot corrupt the machine. The fuzz test pins this
 "errored ⇒ state unchanged" invariant.
@@ -207,7 +238,16 @@ for it here.
   (`three_way_required = false`) wrongly reaches Up on the half-open hello — so if
   the guard in `rxHello` were removed, the three-way-guard test would go RED.
 - **Fuzz**: `std.testing.fuzz` over `rxHelloBytes` — hostile bytes never panic,
-  the walk terminates, an errored decode is inert.
+  the walk terminates, an errored decode is inert. Seeded with the three
+  Wireshark-anchored hellos plus a foreign-neighbour-block and a stale-Up PDU,
+  because 200 010 unseeded runs never produced a TLV 240 (A1 audit F9).
+- **A1 audit regressions (2026-09-06)**: a neighbour block naming a third
+  system on an Up adjacency changes nothing; a stale Up on a fresh circuit is
+  refused five times running and the handshake then completes from
+  Initializing; a stranger heard first no longer locks the circuit for its
+  `holding_time`; the hold expires at Initializing; a missing or malformed
+  Area Addresses TLV on an enforced L1 circuit is a mismatch; a TLV lying about
+  its length behind the 240 fails the PDU.
 
 Green in Debug + ReleaseFast; `zig fmt --check` clean; `zig build check-catalog`
 green; the sibling `isis` test suite unaffected.

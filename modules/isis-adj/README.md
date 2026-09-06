@@ -79,13 +79,20 @@ whose independent fields tell the caller what to do:
 
 ## Acceptance / reject rules
 
-Implemented (cheap, adjacency-forming): **loopback** — an IIH whose source
-system-id equals ours is rejected (`.looped_back`); **level mismatch** — the
-circuit-type low bits are a level bitmask (bit0 = L1, bit1 = L2) and disjoint
-masks share no level (`.level_mismatch`); **not started** — `rxHello` before
-`start` is inert (`.not_started`). Malformed bytes or a malformed TLV 240 are
-typed *errors* from `rxHelloBytes` that leave the FSM state untouched.
-Area-address matching (L1) is a documented **hook**, deferred — see `SPEC.md`.
+A received IIH is ignored — `Effect.rejected`, no state change — for:
+**loopback** (source system-id equals ours, `.looped_back`); **level mismatch**
+(disjoint circuit-type level masks, `.level_mismatch`); **not started**
+(`.not_started`); **Maximum Area Addresses mismatch** (`.max_area_mismatch`);
+**area mismatch** on a pure L1 circuit with `local_areas` configured
+(`.area_mismatch`, fail closed on a missing or malformed TLV); **another system
+while the adjacency is Up** (`.other_neighbor` — at Initializing a candidate is
+simply replaced); a **TLV 240 neighbour block naming someone else** or our
+system on another circuit (`.neighbor_mismatch`, RFC 5303 §3.2 discard); and a
+**neighbour claiming Up while we are Down** (`.neighbor_up_while_down`, the RFC
+5303 table's "Neighbor restarted" cell). Malformed bytes, a malformed TLV 240,
+or any malformed TLV anywhere in the stream are typed *errors* from
+`rxHelloBytes` that leave the FSM state untouched. Details and the reasoning
+behind each rule: `SPEC.md` §5.
 
 ## API sketch
 

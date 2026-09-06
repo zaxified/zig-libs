@@ -78,19 +78,51 @@ pub const RejectReason = enum {
     level_mismatch,
     /// The circuit has not been `start`ed.
     not_started,
-    /// A **third** system sent an IIH while this circuit already has a
-    /// neighbour. A point-to-point circuit carries exactly ONE adjacency
-    /// (ISO/IEC 10589 §8.2.4 — the P2P adjacency is the circuit's, and there is
-    /// one neighbour per circuit), so an IIH whose source-id differs from the
-    /// neighbour we are already tracking is not "the neighbour" and must not be
-    /// acted on. Accepting it would let any unauthenticated station on the wire
-    /// (an IIH carries no authentication unless TLV 10 is configured) refresh
+    /// A **third** system sent an IIH while this circuit has an **Up**
+    /// adjacency. A point-to-point circuit carries exactly ONE adjacency
+    /// (ISO/IEC 10589 §8.2.4), so an IIH whose source-id differs from the
+    /// neighbour the handshake completed with is not "the neighbour" and must
+    /// not be acted on: an IIH carries no authentication unless TLV 10 is
+    /// configured, and acting on it would let any station on the wire refresh
     /// *our* hold timer with *its* chosen holding-time, overwrite the recorded
-    /// neighbour, and — because it cannot echo our system-id in TLV 240 — drag
-    /// the adjacency Up→Initializing on every frame. The incumbent is kept and
-    /// nothing is mutated; the stranger can only be adopted once the incumbent's
-    /// hold genuinely expires (`tick` → Down clears the neighbour).
+    /// neighbour, and drag the adjacency Up→Initializing. The incumbent is kept
+    /// and nothing is mutated until its hold genuinely expires.
+    ///
+    /// The lock guards an ESTABLISHED adjacency only. While the adjacency is
+    /// still `initializing` — a neighbour heard, nothing proven — a different
+    /// source-id simply replaces the recorded candidate (ISO 10589 / FRR
+    /// semantics). The earlier rule locked the circuit on the FIRST hello
+    /// heard, so one unauthenticated frame from a stranger, carrying a
+    /// `holding_time` of its choosing (up to 65 535 units), kept the real
+    /// neighbour out for exactly that long (the A1 audit measured 1998/1998
+    /// of its hellos rejected). A stranger now has to keep transmitting to
+    /// keep displacing the candidate, and the genuine neighbour's next echoing
+    /// hello takes the circuit to Up — at which point the lock applies.
     other_neighbor,
+    /// The IIH's TLV 240 carries a neighbour block that names ANOTHER system
+    /// (or our system with another extended local circuit id — a parallel
+    /// circuit's handshake). RFC 5303 §3.2 (ISO 10589 §8.2.4.1.1 as amended):
+    /// "If they are present, and the Neighbor System ID contained therein does
+    /// not match the local system's ID, or the Neighbor Extended Local Circuit
+    /// ID does not match the local system's extended circuit ID, the PDU SHALL
+    /// be discarded and no further action is taken." Checked BEFORE any
+    /// mutation: such a PDU refreshes no hold, records no neighbour and causes
+    /// no transition. Before this rule existed the mismatch only made the
+    /// hello "not an echo" and the PDU was otherwise processed — one frame
+    /// naming a third system dropped an Up adjacency to Initializing, moved
+    /// the hold to the attacker's `holding_time` and overwrote the recorded
+    /// neighbour's extended circuit id.
+    neighbor_mismatch,
+    /// The neighbour advertises three-way state **Up** while we are **Down**.
+    /// RFC 5303 §3.2 table, cell (local Down, received Up) = Down, "Neighbor
+    /// restarted": we have no adjacency, so its claim to a completed handshake
+    /// is stale — one side restarted, and the neighbour must be driven back
+    /// through Initializing before the link is trusted. Nothing is recorded.
+    /// Before this rule one such frame — a replay, or the live hellos of a
+    /// neighbour that never noticed our restart — took a fresh circuit
+    /// straight to Up, declaring a possibly unidirectional link functional,
+    /// which is the exact failure the three-way handshake exists to prevent.
+    neighbor_up_while_down,
     /// The IIH's Maximum Area Addresses (common-header field, ISO/IEC 10589
     /// §9.6) differs from ours. ISO 10589 §8.2 requires such an IIH be
     /// discarded outright — the two systems disagree on how many area
@@ -333,6 +365,11 @@ pub const Adjacency = struct {
     /// decode succeeds).
     pub fn rxHelloBytes(self: *Adjacency, bytes: []const u8, now: Time) DecodeError!Effect {
         const p = try isis.P2pHello.decode(bytes);
+        // The whole TLV stream must be well formed, not just the prefix up to
+        // the TLVs we read: `findFirst` stops at its first hit, so a TLV lying
+        // about its length BEHIND the 240 used to pass — and the same PDU is
+        // refused by a sibling that walks it all. One PDU, one verdict.
+        _ = try isis.tlv.count(p.tlv_bytes);
         var tw: ?ThreeWayTlv = null;
         if (try isis.tlv.findFirst(p.tlv_bytes, three_way.tlv_code)) |val| {
             tw = try ThreeWayTlv.decode(val);
@@ -385,16 +422,41 @@ pub const Adjacency = struct {
                 return .{ .rejected = .area_mismatch };
             }
         }
-        // One circuit, one neighbour (ISO/IEC 10589 §8.2.4). Once we have heard
-        // a neighbour, only *that* system-id drives this adjacency. Checked
+        // One circuit, one neighbour (ISO/IEC 10589 §8.2.4). Once the handshake
+        // has COMPLETED, only that system-id drives this adjacency. Checked
         // BEFORE any mutation, so a stranger's IIH refreshes no hold, overwrites
-        // no neighbour and forces no transition — see `RejectReason.other_neighbor`.
-        // The lock releases exactly when the incumbent's hold expires: `tick`
-        // clears `neighbor_system_id` on the way to Down, and `start`/`stop` do
-        // the same, so a genuine neighbour change still converges in one hold.
-        if (self.neighbor_system_id) |incumbent| {
-            if (!std.mem.eql(u8, &incumbent, &rx.source_id)) {
-                return .{ .rejected = .other_neighbor };
+        // no neighbour and forces no transition — see `RejectReason.other_neighbor`
+        // for why the lock applies to an Up adjacency and not to a candidate
+        // still at Initializing. The lock releases when the incumbent's hold
+        // expires (`tick` clears `neighbor_system_id` on the way to Down) or on
+        // `start`/`stop`.
+        if (self.state == .up) {
+            if (self.neighbor_system_id) |incumbent| {
+                if (!std.mem.eql(u8, &incumbent, &rx.source_id)) {
+                    return .{ .rejected = .other_neighbor };
+                }
+            }
+        }
+        // RFC 5303 §3.2: a neighbour block that names someone else — or our
+        // system on another circuit — means this PDU is not about THIS
+        // adjacency at all. Discard it whole, before anything is touched.
+        if (rx.three_way) |tw| {
+            if (tw.neighbor) |nb| {
+                if (!std.mem.eql(u8, &nb.system_id, &self.cfg.system_id)) {
+                    return .{ .rejected = .neighbor_mismatch };
+                }
+                if (nb.extended_local_circuit_id) |ext| {
+                    if (ext != self.cfg.extended_local_circuit_id) return .{ .rejected = .neighbor_mismatch };
+                }
+            }
+        }
+        // RFC 5303 §3.2 table, (local Down, received Up) = Down / "Neighbor
+        // restarted": we hold no adjacency, so a peer that claims the handshake
+        // is complete is stale. It must see us at Down (our next hello says so)
+        // and come back through Initializing; we record nothing from this PDU.
+        if (self.state == .down) {
+            if (rx.three_way) |tw| {
+                if (tw.state == .up) return .{ .rejected = .neighbor_up_while_down };
             }
         }
 
@@ -411,7 +473,9 @@ pub const Adjacency = struct {
 
         // ── three-way decision ──────────────────────────────────────────────
         // echoed == the neighbour's 240 names US (our system-id AND our extended
-        // circuit id) — proof it has heard us. The loop guard.
+        // circuit id) — proof it has heard us. The loop guard. A block naming
+        // anyone else was discarded above (`neighbor_mismatch`), so here a
+        // present block either echoes us or is the bare-system-id shape.
         //
         // The neighbour's extended-local-circuit-id is itself optional on the
         // wire (RFC 5303 §3.1's 11-octet shape — system-id present, extended id
@@ -880,8 +944,13 @@ test "neighbour system-id present WITHOUT its extended-circuit-id (11-octet wire
     try testing.expect(e.adjacency_up == false);
 }
 
-test "echo requires BOTH system-id and circuit-id to match, not just one" {
-    // system-id matches ours but the extended circuit-id does not.
+test "a neighbour block naming someone else is a DISCARD, not a half-echo (RFC 5303 \u{a7}3.2, audit F1)" {
+    // Both halves of the reference must match; a block that names our
+    // system-id on another extended circuit id is a parallel circuit's
+    // handshake, one that names another system is not about us at all. Either
+    // way the PDU is discarded whole: no neighbour recorded, no hold set, no
+    // transition. (This used to leave the adjacency at Initializing — the PDU
+    // was processed and merely "not an echo".)
     var adj = Adjacency.init(cfgA());
     _ = adj.start(0);
     const e1 = adj.rxHello(.{
@@ -895,13 +964,12 @@ test "echo requires BOTH system-id and circuit-id to match, not just one" {
             .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xFF },
         },
     }, 1);
-    try testing.expectEqual(State.initializing, adj.currentState());
-    try testing.expect(e1.adjacency_up == false);
+    try testing.expectEqual(@as(?RejectReason, .neighbor_mismatch), e1.rejected);
+    try testing.expectEqual(State.down, adj.currentState());
+    try testing.expect(adj.neighbor_system_id == null);
+    try testing.expectEqual(@as(Time, 0), adj.hold_deadline);
 
-    // extended circuit-id matches ours but the system-id does not.
-    var adj2 = Adjacency.init(cfgA());
-    _ = adj2.start(0);
-    const e2 = adj2.rxHello(.{
+    const e2 = adj.rxHello(.{
         .source_id = sys_b,
         .holding_time = 30,
         .circuit_type = .level1_2,
@@ -912,8 +980,195 @@ test "echo requires BOTH system-id and circuit-id to match, not just one" {
             .neighbor = .{ .system_id = sys_b, .extended_local_circuit_id = 0xA1 },
         },
     }, 1);
+    try testing.expectEqual(@as(?RejectReason, .neighbor_mismatch), e2.rejected);
+    try testing.expectEqual(State.down, adj.currentState());
+}
+
+test "audit F1: one IIH whose neighbour block names a third system cannot touch an Up adjacency" {
+    // The audit's P2 probe: before the fix this frame dropped Up→Initializing
+    // with `neighbor_restarted`, moved the hold to now + 65535 and overwrote
+    // the recorded neighbour's extended circuit id — all from a PDU RFC 5303
+    // says to discard before anything is examined further.
+    const sys_c: SystemId = .{ 0, 0, 0, 0, 0, 0xC };
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    _ = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+    }, 1);
+    try testing.expectEqual(State.up, adj.currentState());
+    try testing.expectEqual(@as(Time, 31), adj.hold_deadline);
+
+    // Same source-id as the real neighbour (spoofed), so the one-neighbour
+    // lock does not catch it — only the neighbour-block rule can.
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 65535,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0x77, .neighbor = .{ .system_id = sys_c, .extended_local_circuit_id = 0xC1 } },
+    }, 5);
+    try testing.expectEqual(@as(?RejectReason, .neighbor_mismatch), e.rejected);
+    try testing.expect(e.transition == null);
+    try testing.expect(e.adjacency_down == null);
+    try testing.expectEqual(State.up, adj.currentState());
+    try testing.expectEqual(@as(Time, 31), adj.hold_deadline); // not 65540
+    try testing.expectEqual(@as(?u32, 0xB1), adj.neighbor_ext_circuit_id); // not 0x77
+    // Our outgoing 240 still echoes B.
+    try testing.expectEqual(sys_b, adj.helloFields().three_way.neighbor.?.system_id);
+}
+
+test "audit F3: a fresh circuit does not go Up on a neighbour that already claims Up (RFC 5303 table, Down x Up = Down)" {
+    // A restarted (our side) or replayed "Up + echoes you" hello on a Down
+    // circuit used to reach Up in one frame — declaring a link functional
+    // that nothing we send may be reaching. The cell says Down, "Neighbor
+    // restarted": record nothing, let the peer see our Down and re-initialize.
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    const stale_up: RxHello = .{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .up, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+    };
+    var n: usize = 0;
+    while (n < 5) : (n += 1) {
+        const e = adj.rxHello(stale_up, 1 + n);
+        try testing.expectEqual(@as(?RejectReason, .neighbor_up_while_down), e.rejected);
+        try testing.expect(!e.adjacency_up);
+        try testing.expectEqual(State.down, adj.currentState());
+        try testing.expect(adj.neighbor_system_id == null);
+    }
+    // Our hello keeps saying Down, with no neighbour block — the peer, per the
+    // same table (its Up x our Down = Down), falls back and re-initializes.
+    try testing.expectEqual(ThreeWayState.down, adj.helloFields().three_way.state);
+    try testing.expect(adj.helloFields().three_way.neighbor == null);
+
+    // Once it comes back at Initializing (echoing us), the handshake proceeds.
+    const init_echo: RxHello = .{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+    };
+    const up = adj.rxHello(init_echo, 10);
+    try testing.expect(up.adjacency_up);
+    try testing.expectEqual(State.up, adj.currentState());
+    // And from Initializing/Up, a received Up is fine (cells Init x Up = Up,
+    // Up x Up = Accept): the rule is specific to local Down.
+    var adj2 = Adjacency.init(cfgA());
+    _ = adj2.start(0);
+    _ = adj2.rxHello(.{ .source_id = sys_b, .holding_time = 30, .circuit_type = .level1_2, .local_circuit_id = 1, .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1 } }, 1);
     try testing.expectEqual(State.initializing, adj2.currentState());
-    try testing.expect(e2.adjacency_up == false);
+    try testing.expect(adj2.rxHello(stale_up, 2).adjacency_up);
+    try testing.expect(adj2.rxHello(stale_up, 3).rejected == null);
+    try testing.expectEqual(State.up, adj2.currentState());
+}
+
+test "audit F2: a stranger's hello while still Initializing does not lock the circuit for its holding_time" {
+    // Before: the first hello heard (from anyone, unauthenticated, no 240)
+    // locked the circuit for ITS holding_time — 65 535 units — and every hello
+    // of the real neighbour was rejected `.other_neighbor` until then. Now a
+    // candidate at Initializing is replaced by the next hello from someone
+    // else; the real neighbour's echo takes the circuit to Up, and only THEN
+    // does the lock hold (see the "third system-id cannot hijack" test).
+    const sys_c: SystemId = .{ 0, 0, 0, 0, 0, 0xC };
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+
+    const stranger = adj.rxHello(.{ .source_id = sys_c, .holding_time = 65535, .circuit_type = .level1_2, .local_circuit_id = 1 }, 1);
+    try testing.expect(stranger.rejected == null);
+    try testing.expectEqual(State.initializing, adj.currentState());
+    try testing.expectEqual(sys_c, adj.neighbor_system_id.?);
+
+    const real = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+    }, 2);
+    try testing.expect(real.rejected == null); // was: .other_neighbor for 65 535 units
+    try testing.expect(real.adjacency_up);
+    try testing.expectEqual(sys_b, adj.neighbor_system_id.?);
+    try testing.expectEqual(@as(Time, 32), adj.hold_deadline); // B's hold, not the stranger's
+
+    // Up: the stranger is now locked out, and its frame changes nothing.
+    const again = adj.rxHello(.{ .source_id = sys_c, .holding_time = 65535, .circuit_type = .level1_2, .local_circuit_id = 1 }, 3);
+    try testing.expectEqual(@as(?RejectReason, .other_neighbor), again.rejected);
+    try testing.expectEqual(State.up, adj.currentState());
+    try testing.expectEqual(@as(Time, 32), adj.hold_deadline);
+}
+
+test "audit F10: the hold expires at Initializing too — the state a candidate parks in" {
+    // M23 in the audit weakened `tick` so the hold only expired from Up and
+    // 37/37 stayed green. A candidate that went silent must fall back to Down
+    // (transition, no `adjacency_down` — it was never Up).
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    _ = adj.rxHello(.{ .source_id = sys_b, .holding_time = 30, .circuit_type = .level1_2, .local_circuit_id = 1, .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1 } }, 1);
+    try testing.expectEqual(State.initializing, adj.currentState());
+    try testing.expect(adj.tick(30).transition == null);
+    const e = adj.tick(31);
+    try testing.expectEqual(Transition{ .from = .initializing, .to = .down }, e.transition.?);
+    try testing.expect(e.adjacency_down == null);
+    try testing.expectEqual(State.down, adj.currentState());
+    try testing.expect(adj.neighbor_system_id == null);
+    try testing.expect(adj.neighbor_ext_circuit_id == null);
+}
+
+test "audit F11: on an enforced L1 circuit a MISSING or MALFORMED Area Addresses TLV is a mismatch (fail closed)" {
+    // SPEC §5 promised both halves; mutations M15/M16 turned each fail-open
+    // with the suite green, because every test supplied a well-formed TLV.
+    const our_area = [_]u8{ 0x49, 0x00, 0x01 };
+    var adj = Adjacency.init(.{ .system_id = sys_a, .extended_local_circuit_id = 1, .circuit_type = .level1, .local_areas = &.{&our_area} });
+    _ = adj.start(0);
+    const echo: ThreeWayTlv = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 } };
+
+    const missing = adj.rxHello(.{ .source_id = sys_b, .holding_time = 30, .circuit_type = .level1, .local_circuit_id = 1, .neighbor_area_addresses = null, .three_way = echo }, 1);
+    try testing.expectEqual(@as(?RejectReason, .area_mismatch), missing.rejected);
+    try testing.expectEqual(State.down, adj.currentState());
+
+    // Inner record claims 9 bytes, TLV holds 2: malformed → no shared area.
+    const malformed = adj.rxHello(.{ .source_id = sys_b, .holding_time = 30, .circuit_type = .level1, .local_circuit_id = 1, .neighbor_area_addresses = &[_]u8{ 9, 0x49 }, .three_way = echo }, 2);
+    try testing.expectEqual(@as(?RejectReason, .area_mismatch), malformed.rejected);
+    try testing.expectEqual(State.down, adj.currentState());
+}
+
+test "audit F6: a TLV lying about its length BEHIND the 240 fails the whole PDU, state unchanged" {
+    // `findFirst` stopped at its first hit, so the rest of the stream was never
+    // walked; this PDU used to be accepted and raise the adjacency to Up.
+    var buf: [128]u8 = undefined;
+    var pb = try isis.pdu.P2pHelloBuilder.init(&buf, .{ .source_id = sys_b, .holding_time = 30 });
+    var val_buf: [15]u8 = undefined;
+    const tw: ThreeWayTlv = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } };
+    try pb.tlvs.addTlv(three_way.tlv_code, try tw.encode(&val_buf));
+    // An Area Addresses (#1) TLV too, so BOTH lookups this module performs
+    // succeed before the liar is reached — without the whole-stream walk the
+    // liar is then never seen (the audit's P9 shape).
+    try isis.tlvs.addAreaAddresses(&pb.tlvs, &.{&[_]u8{ 0x49, 0x00, 0x01 }});
+    try pb.tlvs.addTlv(0x81, &[_]u8{0x01}); // protocols supported, fine
+    const good_len = pb.finish().len;
+    // Append a TLV header that claims 200 bytes of value with none behind it,
+    // and patch the PDU length so the header is inside the PDU.
+    var wire: [128]u8 = undefined;
+    @memcpy(wire[0..good_len], buf[0..good_len]);
+    wire[good_len] = 0x63;
+    wire[good_len + 1] = 200;
+    const total = good_len + 2;
+    std.mem.writeInt(u16, wire[17..19], @intCast(total), .big); // P2P IIH pdu_length offset
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    try testing.expectError(error.TruncatedTlv, adj.rxHelloBytes(wire[0..total], 1));
+    try testing.expectEqual(State.down, adj.currentState());
+    try testing.expect(adj.neighbor_system_id == null);
+    // The same PDU without the liar is accepted and goes Up.
+    try testing.expect((try adj.rxHelloBytes(buf[0..good_len], 1)).adjacency_up);
 }
 
 test "echo with neighbour claiming Down does NOT bring us Up" {
@@ -977,13 +1232,15 @@ test "malformed bytes and a malformed 240 are typed errors, state unchanged" {
 test "hold timer expires the adjacency to Down with hold_expired" {
     var adj = Adjacency.init(cfgA());
     _ = adj.start(0);
-    // Bring Up at t=1 with holding_time 30 → deadline 31.
+    // Bring Up at t=1 with holding_time 30 → deadline 31. (The neighbour
+    // advertises Initializing: a peer claiming Up towards a Down circuit is
+    // the RFC 5303 (Down, Up) cell and is refused — see the F3 test.)
     _ = adj.rxHello(.{
         .source_id = sys_b,
         .holding_time = 30,
         .circuit_type = .level1_2,
         .local_circuit_id = 1,
-        .three_way = .{ .state = .up, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
     }, 1);
     try testing.expectEqual(State.up, adj.currentState());
     // Just before the deadline: still Up.
@@ -999,14 +1256,15 @@ test "hold timer expires the adjacency to Down with hold_expired" {
 test "a refreshing hello just before the deadline keeps it Up" {
     var adj = Adjacency.init(cfgA());
     _ = adj.start(0);
-    const up: RxHello = .{
+    var up: RxHello = .{
         .source_id = sys_b,
         .holding_time = 10,
         .circuit_type = .level1_2,
         .local_circuit_id = 1,
-        .three_way = .{ .state = .up, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
     };
     _ = adj.rxHello(up, 1); // deadline 11
+    up.three_way.?.state = .up; // the peer has seen us Up by now — refreshes carry Up
     _ = adj.tick(10); // still Up
     _ = adj.rxHello(up, 10); // refresh → deadline 20
     try testing.expectEqual(State.up, adj.currentState());
@@ -1033,7 +1291,7 @@ test "stop from Up reports adjacency_down = stopped" {
         .holding_time = 30,
         .circuit_type = .level1_2,
         .local_circuit_id = 1,
-        .three_way = .{ .state = .up, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
     }, 1);
     const e = adj.stop();
     try testing.expectEqual(DownReason.stopped, e.adjacency_down.?);

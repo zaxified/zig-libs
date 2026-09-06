@@ -318,25 +318,40 @@ test "golden P2P Hello with 11-octet TLV240 (Wireshark-anchored): rxHelloBytes d
 
 // ── fuzz: hostile IIH bytes must never panic and never corrupt the FSM ───────
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`:
+/// `Smith.slice` reads a little-endian u32 length and then that many bytes,
+/// so a PDU that is to arrive verbatim carries that header. Static memory.
+fn fuzzSeed(comptime pdu: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(pdu.len))) ++ pdu[0..pdu.len].*;
+    }.bytes;
+}
+
+/// The three Wireshark-anchored hellos (Down/5, Init/15 echoing B, Init/11
+/// bare system-id) plus the two shapes the FSM must refuse: a neighbour block
+/// naming a third system, and a stale Up. The A1 audit measured that 200 010
+/// runs of the unseeded harness never produced a TLV 240 at all — the whole
+/// `three_way.zig` path was unfuzzed; every seed here carries one.
+const rx_seeds = [_][]const u8{
+    fuzzSeed(&golden_p2p_hello_down_5),
+    fuzzSeed(&golden_p2p_hello_init_15),
+    fuzzSeed(&golden_p2p_hello_240_11),
+    // B, Init, 15-octet 240 whose neighbour block names system ...0c on circuit 0xc1
+    fuzzSeed(&.{ 0x83, 0x14, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x1e, 0x00, 0x25, 0x01, 0xf0, 0x0f, 0x01, 0x00, 0x00, 0x00, 0xb1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0xc1 }),
+    // B, Up (state byte 0), echoing A on 0xa1 — stale Up on a fresh circuit
+    fuzzSeed(&.{ 0x83, 0x14, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x1e, 0x00, 0x25, 0x01, 0xf0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0xb1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0xa1 }),
+};
+
 test "fuzz: rxHelloBytes on hostile bytes never panics; a rejected PDU is inert" {
-    try std.testing.fuzz({}, fuzzRx, .{});
+    try std.testing.fuzz({}, fuzzRx, .{ .corpus = &rx_seeds });
 }
 
 fn fuzzRx(_: void, smith: *std.testing.Smith) !void {
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
+    // One `smith.slice` draw — never `bytes` followed by a ranged length,
+    // which handed this harness the EMPTY input once per unseeded run.
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
-
-    // Bias toward a valid-looking P2P IIH header so deeper paths are reached.
-    if (len >= 20 and smith.value(bool)) {
-        buf[0] = 0x83; // discriminator
-        buf[1] = 20; // length indicator (P2P IIH fixed header)
-        buf[2] = 1; // version
-        buf[3] = 0; // id length 0 => 6
-        buf[4] = 17; // p2p_iih
-        buf[5] = 1; // version
-    }
 
     var adj = Adjacency.init(.{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 });
     _ = adj.start(0);
