@@ -2,17 +2,18 @@ zig-libs
 Copyright (c) 2026 zig-libs contributors
 Licensed under the MIT License (see LICENSE).
 
-This file answers ONE question: does consuming zig-libs oblige you to anything
-beyond MIT? §1 answers it, and §0 says what has to be entered here to get
-there. It is NOT a catalogue of the collection's provenance — design
-references, and the licence arguments behind them, are recorded at the module
-that has them (§2). A module's internal development origin — which of the
-authors' own projects it was first prototyped in — is not recorded anywhere: it
-carries no attribution weight and would read backwards once those projects
-import zig-libs.
+This file answers ONE question: is zig-libs, AS A WHOLE, still plain MIT? §1
+answers it and states the rule that keeps the answer true; §0 says which
+relationships to third-party work are capable of changing it. It is NOT an
+index of the collection's provenance, and since 2026-09-06 it is not an index
+of the modules that carry their own attribution either — both live at the
+module that has them (§1, §2). A module's internal development origin — which
+of the authors' own projects it was first prototyped in — is not recorded
+anywhere: it carries no attribution weight and would read backwards once those
+projects import zig-libs.
 
 ====================================================================
-0. POLICY — what requires an entry here
+0. POLICY — what each relationship to third-party work requires
 ====================================================================
 
 A public specification or RFC is not itself a copyrightable work (merger
@@ -22,13 +23,14 @@ closely, is not "derived from" anyone's code. Accordingly:
 
   - A module that is pure clean-room-from-a-public-spec/RFC, with NO
     third-party source code ported and NO third-party implementation studied as
-    a design reference, needs NO entry in this file. Its RFC/spec citation
-    lives in the module's own SPEC.md instead — see e.g. whois (RFC 3912),
-    rdap (RFC 7480-family), tar (POSIX ustar + documented GNU extensions).
+    a design reference, needs NO file of its own. Its RFC/spec citation lives
+    in the module's own SPEC.md instead — see e.g. whois (RFC 3912), rdap
+    (RFC 7480-family), tar (POSIX ustar + documented GNU extensions).
   - Third-party source actually ported/translated, or third-party DATA
     reproduced, requires its license terms reproduced — in
     `modules/<name>/NOTICE`, beside the files, so the notice travels with what
-    owes it. Never in this file; this file only lists which modules those are.
+    owes it. Never in this file, and this file does not enumerate those modules
+    either; §1 says how they are found instead.
   - A DESIGN REFERENCE — a named third-party implementation consulted for
     behavior, algorithm shape, or API design, with no source copied — is
     recorded for provenance so any future line-level reuse is caught, WITH ITS
@@ -63,42 +65,55 @@ closely, is not "derived from" anyone's code. Accordingly:
     claim, not a verification.
 
 ====================================================================
-1. REQUIRED ATTRIBUTION — ported code
+1. IS THE WHOLE LIBRARY STILL PLAIN MIT?
 ====================================================================
 
-NONE at the repository level. zig-libs imposes no redistribution condition
-beyond its own MIT license.
+YES. zig-libs is distributed under the MIT License and carries no
+redistribution condition of its own beyond it. Nothing in this file adds one.
 
-TWENTY-FOUR modules port third-party code or reproduce third-party data whose
-notice must be preserved. Each carries its own `NOTICE` beside its source —
-first line `<name> — third-party attribution` — stating what was taken and
-reproducing that upstream's terms in full. These are the ONLY files in the
-repository carrying a condition that names anyone other than the zig-libs
-authors, and every one of those conditions is the same: keep the notice with
-the files. To answer "does consuming zig-libs oblige me to anything beyond
-MIT?", read these and nothing else:
+**Code or data whose own licence is copyleft — GPL, LGPL, AGPL, or anything
+else that would attach its terms to the distribution as a whole — is a DEFECT,
+not a paperwork item.** It is removed, not documented. There is no entry in
+this file, and no wording anywhere else, that makes such material acceptable:
+the remedy is to delete it and re-implement what it did. That is the whole of
+what this section is for. If the answer above ever becomes "no", the answer is
+not amended here — the cause is taken out of the tree.
 
-  `modules/bech32/NOTICE`, `modules/bitcoinscript/NOTICE`,
-  `modules/bitcointx/NOTICE`, `modules/brotli/NOTICE`,
-  `modules/csvstream/NOTICE`, `modules/decimal/NOTICE`,
-  `modules/encoding/NOTICE`, `modules/falcon/NOTICE`,
-  `modules/iec62351/NOTICE`, `modules/imap/NOTICE`, `modules/json5/NOTICE`,
-  `modules/l2disco/NOTICE`, `modules/lninvoice/NOTICE`,
-  `modules/lnwire/NOTICE`, `modules/metrics/NOTICE`,
-  `modules/minisign/NOTICE`, `modules/openapi/NOTICE`,
-  `modules/poseidon/NOTICE`, `modules/psbt/NOTICE`, `modules/rescue/NOTICE`,
-  `modules/security-headers/NOTICE`, `modules/tracecontext/NOTICE`,
-  `modules/validate/NOTICE`, `modules/xml/NOTICE`
+WHY THERE IS NO LONGER A LIST HERE (policy change, 2026-09-06). This section
+used to enumerate the modules that carry their own `modules/<name>/NOTICE` —
+twenty-six paths, maintained by hand. That enumeration is gone. A module that
+ports third-party material has a legal question of its OWN, and it is
+discharged where the material is, by the module's own NOTICE; restating which
+modules those are made this file an index of somebody else's obligations
+rather than an answer about the library, and made every new attribution file a
+two-file edit whose second half was silently forgettable. This file is now
+reserved for the one case that would oblige a change to the WHOLE library —
+and per the rule above, that case is a defect to be removed, not an entry to
+be added.
 
-A new module in that position follows the same pattern: a
-`modules/<name>/NOTICE` beside the files that owe it, and its path added above.
+HOW TO FIND A MODULE'S OBLIGATION, now that nothing here points at it. Every
+`modules/<name>/NOTICE` declares its kind on its own FIRST LINE:
 
-A SECOND KIND of `modules/<name>/NOTICE` exists and is deliberately not in that
-list: a **provenance note**, first line `<name> — provenance note`, which
-records design references and argues why nothing is owed. Those impose NO
-condition. `zig build check-catalog` enforces both that the two kinds stay
-distinguishable by that first line and that only the condition-bearing ones are
-listed here; CONVENTIONS.md §5 decides which kind a module needs, not size.
+    <name> — third-party attribution      carries a CONDITION
+    <name> — provenance note              record only, no condition
+
+so the condition-bearing files are enumerated by reading first lines rather
+than by trusting an index — `head -1 modules/*/NOTICE` is the entire query,
+and `zig build check-catalog` holds every such file's first line to exactly
+one of those two shapes, which is what makes the query sound. Every condition
+so far is the same one: keep the notice with the files. If you redistribute a
+module, ship its NOTICE with it.
+
+WHAT ENFORCES THE RULE ABOVE. `zig build check-copyleft` reads each shipped
+file's OWN licence declaration — an `SPDX-License-Identifier:` naming a
+copyleft licence, or an FSF grant paragraph — rather than searching for the
+string "GPL", because naming a copyleft licence is not the defect and being
+under one is. Two things in this tree say "GPL" and neither is a violation:
+`modules/ebpf/src/testdata/*.bpf.c` set `_license = "GPL"`, which is a value
+the kernel's BPF verifier reads to decide which helpers a program may call and
+not a copyright notice (`modules/ebpf/README.md` explains it), and
+`modules/poseidon` names LGPL-3.0 circomlib as a comparison ORACLE it runs
+against, shipping none of it.
 
 ====================================================================
 2. DESIGN REFERENCES — recorded at the module, not here
@@ -117,6 +132,8 @@ most easily drifts into "verified against".
 None of those records imposes any obligation beyond zig-libs' own MIT license,
 even though the projects they name include GPL-2.0, GPL-3.0, LGPL-2.1,
 LGPL-3.0 and AGPL-3.0 ones — a design reference carries no license condition at
-all. A module with no such record needs none: pure clean-room from a public
-spec/RFC, per §0. A full provenance/license audit was completed 2026-07-09 and
-re-examined 2026-07-29; both are recorded in the project git history.
+all, which is why §1's defect rule is about what is SHIPPED and not about what
+is named. A module with no such record needs none: pure clean-room from a
+public spec/RFC, per §0. A full provenance/license audit was completed
+2026-07-09 and re-examined 2026-07-29; both are recorded in the project git
+history.

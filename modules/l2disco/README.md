@@ -69,5 +69,5 @@ described / reverse-engineered format — behaviour reference only), RFC 826
 (ARP), and RFC 2131 / RFC 2132 (DHCP). Test data is a separate matter and is
 answered in [`NOTICE`](NOTICE) beside this file: the module vendors real
 tcpdump `tests/*.pcap` capture frames (BSD-3-Clause), which carry required
-attribution, and it is listed in the root `NOTICE` §1. No third-party dissector source
+attribution, and that file is where the obligation lives. No third-party dissector source
 (Wireshark, lldpd, net-snmp, tcpdump) was consulted or copied. License: MIT.

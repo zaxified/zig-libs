@@ -74,7 +74,7 @@ Options: `max_depth`, `max_attributes`, `max_name_len`, `doctype`
 Provenance: original work of the zig-libs authors (MIT) — for the CODE. The
 test data is a separate matter: this module vendors a slice of the W3C XML
 Conformance Test Suite, which carries required attribution, so see
-[`NOTICE`](NOTICE) beside this file (it is listed in the root `NOTICE` §1).
+[`NOTICE`](NOTICE) beside this file, which is where the obligation lives.
 
 ## Out of scope
 

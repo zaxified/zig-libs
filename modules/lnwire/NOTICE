@@ -141,5 +141,5 @@ work). What is reproduced here, and only here, is third-party TEST-CASE
 DATA — the SPECIFICATION AUTHORS' OWN vectors (`lightning/bolts`) and an
 INDEPENDENT IMPLEMENTATION'S frozen encoder output (`rust-lightning`) —
 which is precisely why this notice exists and lives beside it rather than
-in root `NOTICE` (per root `NOTICE` §1's policy: attribution for reproduced
+in root `NOTICE` (per root `NOTICE` §1: attribution for reproduced
 third-party data travels with the module that owes it).

@@ -28,7 +28,7 @@ required (root [`NOTICE`](../../NOTICE) §0).
 clean-room. The module now separately vendors `lightning/bolts`' own
 BOLT#12 test-vector DATA (`offers-test.json`/`format-string-test.json`,
 CC-BY 4.0), which does require attribution — see
-[`NOTICE`](./NOTICE), a module-local file per root NOTICE §1's policy.
+[`NOTICE`](./NOTICE), the module-local file where the obligation lives.
 
 ## Scope
 

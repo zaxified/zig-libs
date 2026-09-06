@@ -1098,6 +1098,23 @@ pub fn build(b: *std.Build) void {
     });
     check_changelog.dependOn(check_changelog_inner);
 
+    // Pure-MIT gate: `zig build check-copyleft`. The teeth on root NOTICE §1's
+    // rule (owner's decision, 2026-09-06): copyleft in shipped code or data is
+    // a DEFECT to be removed, not an entry to be added. It landed with the same
+    // policy change that retired root §1's per-module list -- with no list left
+    // saying which modules carry third-party material, the question "is the
+    // whole library still plain MIT?" needed an answer that is derived from the
+    // files rather than maintained by hand. See `checkCopyleft`.
+    const check_copyleft = b.step("check-copyleft", "Verify no shipped file declares itself under a copyleft licence");
+    const check_copyleft_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    check_copyleft_inner.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "check-copyleft",
+        .owner = b,
+        .makeFn = checkCopyleft,
+    });
+    check_copyleft.dependOn(check_copyleft_inner);
+
     // Fuzz-coverage gate: `zig build check-fuzz`. Deliberately a SEPARATE step
     // from `check-catalog` rather than a section of it -- see `checkFuzz` for
     // why, and for the one-line change that folds it in once the tree is green.
@@ -2549,10 +2566,13 @@ fn unreleasedSection(text: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
-/// Provenance gate: every module says where it came from, and the repository
-/// can still answer "what do I owe a third party?" from ONE file.
+/// Provenance gate: every module says where it came from, every NOTICE in the
+/// tree declares what kind of file it is, and no NOTICE points at a module that
+/// does not exist.
 ///
-/// Three claims, each of which was false somewhere when this was written:
+/// The claims keep their original numbers, including the gap where 3 was, so
+/// that the "verified by planting the defect it describes" record below still
+/// names the same claims it was written about.
 ///
 ///  1. Every module has a `README.md` carrying a `Provenance:` line
 ///     (CONVENTIONS §6.1). 22 modules had no such line and 5 -- `ethfrag`,
@@ -2564,17 +2584,20 @@ fn unreleasedSection(text: []const u8) ?[]const u8 {
 ///     `<m> — third-party attribution` (carries a condition) or
 ///     `<m> — provenance note` (record only). Without a discriminator the two
 ///     are indistinguishable without reading all 42, and one of them is the
-///     one that matters legally.
+///     one that matters legally. Since the 2026-09-06 policy change this line
+///     is not a discriminator among other discriminators, it is the ONLY one:
+///     `head -1 modules/*/NOTICE` is now how a consumer enumerates what they
+///     owe, so a wrong first line is no longer a disagreement with a list kept
+///     elsewhere -- it is the whole answer being wrong.
 ///
-///  3. The root NOTICE §1 list of condition-bearing modules is EXACTLY the set
-///     of `third-party attribution` files -- no missing entry (root §1 said
-///     "one module does" while listing three, when four existed: `imap` had
-///     been added a day earlier and root §1 was not) and no stale one.
+///  3. RETIRED 2026-09-06 -- see "WHY CLAIM 3 IS GONE" below.
 ///
-///  4. Every `modules/<x>/NOTICE` §1 cites is a real module. Checks 1-3 are
-///     driven FROM `module_list`, so they can only ever see a module whose
-///     files disagree with §1 -- never a §1 row corresponding to nothing. A
-///     planted `modules/ghost/NOTICE` row passed all three.
+///  4. Every `` `modules/<x>/…` `` path CITED by a NOTICE -- the root file or
+///     any module's -- names a real module. Claims 1, 2 and 5 are driven FROM
+///     `module_list`, so they can only ever see a module whose files disagree
+///     with something; they are structurally blind to a citation that
+///     corresponds to nothing. A planted `modules/ghost/NOTICE` row passed all
+///     of them.
 ///
 ///  5. A module's provenance note either STATES an answer (clean-room /
 ///     original work / no entry needed) or has somewhere real to send the
@@ -2583,31 +2606,58 @@ fn unreleasedSection(text: []const u8) ?[]const u8 {
 ///     exist. A pointer to nothing is worse than silence -- the reader cannot
 ///     tell "clean-room" from "somebody forgot".
 ///
-/// Claim 3 is the load-bearing one. §1 is what lets a consumer conclude
-/// "zig-libs is plain MIT" without opening every module; an unlisted
-/// attribution file makes that conclusion wrong, which no test would ever
-/// notice. Claim 5 found the one real license defect of the sweep:
-/// `bitcoinscript` reproduces ~2000 rows of Bitcoin Core's `script_tests.json`
-/// verbatim -- the same shape as `decimal`'s decTest corpus -- with no
-/// attribution file at all.
+/// WHY CLAIM 3 IS GONE (policy change by the repository owner, 2026-09-06).
+/// Claim 3 held that the root NOTICE §1 list of condition-bearing modules was
+/// EXACTLY the set of `third-party attribution` files -- no missing entry (root
+/// §1 once said "one module does" while listing three, when four existed:
+/// `imap` had been added a day earlier and root §1 was not) and no stale one.
+/// It was, until that morning, the load-bearing claim of this gate: §1 was what
+/// let a consumer conclude "zig-libs is plain MIT" without opening every
+/// module, so an unlisted attribution file made that conclusion wrong in a way
+/// no test could notice.
+///
+/// The list itself was then retired, and the claim has no subject any more.
+/// The owner's reasoning, which is now the root NOTICE §1 and CONVENTIONS §5:
+/// a module that needs third-party material has a legal question of its OWN,
+/// and it is discharged by the module's own NOTICE beside the files that owe
+/// it. The root file exists only for the case that would make the WHOLE library
+/// non-pure-MIT -- and that case is a DEFECT to be removed, not an entry to be
+/// added, so the root file has nothing per-module left to enumerate.
+///
+/// This is the same deletion shape as `checkChangelog`'s retired index checks,
+/// and it is worth naming: claim 3's entire subject was a COPY. Twenty-six
+/// paths in the root file restating twenty-six first lines in the modules.
+/// Delete the copy and the drift goes with it -- there is no longer a claim
+/// that can be silently wrong, which is the opposite of fail-open. What claim 3
+/// really protected was the enumerability of the condition-bearing set, and
+/// that survives intact in claim 2: the first line of each module NOTICE is a
+/// derivation of the same set from the files themselves, with nothing to keep
+/// in sync. Claim 2's stakes went UP the moment the list went away, which is
+/// why its note above was rewritten rather than left alone.
+///
+/// WHAT CLAIM 4 AIMS AT NOW. It used to scan root §1's rows, the only place
+/// `modules/<x>/NOTICE` paths were cited in bulk. With §1 gone it was re-aimed
+/// at the whole population of such citations rather than retired with claim 3,
+/// because its subject was never the list: it is the one direction this gate
+/// cannot reach from `module_list`. Measured at the moment of the change, the
+/// re-aimed scan reads 37 distinct cited module names across the root NOTICE
+/// and 84 module NOTICEs, against the 26 rows it used to check -- so the claim
+/// covers strictly more after the policy change than before it, including every
+/// cross-reference one module's NOTICE makes to a sibling.
 ///
 /// Every claim was verified by planting the defect it describes and watching
 /// this step go red. Two lessons are baked into the code above:
 ///
 ///   - Claim 4 exists BECAUSE its mutation was the one that stayed green: the
 ///     other checks are all driven FROM `module_list` and are structurally
-///     blind to a §1 row that corresponds to nothing.
+///     blind to a citation that corresponds to nothing.
 ///   - Judge these mutations by the step's EXIT CODE. Grepping for `^error:`
 ///     silently passed a build that did not compile (`build.zig:657: error:`
 ///     does not start the line with `error:`), so two mutations "survived"
 ///     against a binary that was never built.
 fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
     const notice = try b.build_root.handle.readFileAlloc(io, "NOTICE", b.allocator, .limited(4 * 1024 * 1024));
-    const sec1 = sectionSlice(notice, "1. REQUIRED ATTRIBUTION", "2. DESIGN REFERENCES") orelse {
-        std.log.err("NOTICE has no \"1. REQUIRED ATTRIBUTION\" section for the provenance gate to check", .{});
-        failed.* = true;
-        return;
-    };
+    checkModuleCitations(notice, "NOTICE", failed);
 
     for (module_list) |m| {
         const readme_path = b.fmt("modules/{s}/README.md", .{m.name});
@@ -2623,8 +2673,8 @@ fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
             {
                 std.log.err(
                     "modules/{s}/README.md has no `Provenance:` line — say whether it is clean-room " ++
-                        "from a spec, a studied design reference (root NOTICE), or ported source " ++
-                        "(modules/{s}/NOTICE). See CONVENTIONS.md §5.",
+                        "from a spec, a studied design reference, or ported source (the latter two " ++
+                        "in modules/{s}/NOTICE; the root NOTICE names no module). See CONVENTIONS.md §5.",
                     .{ m.name, m.name },
                 );
                 failed.* = true;
@@ -2666,12 +2716,20 @@ fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
                     "source is ported",     "source read",    "source was read", "source consulted",
                     "source was consulted", "no third-party",
                 });
-                if (!answers and !hasNoticeEntry(notice, m.name) and !fileExists(b, io, b.fmt("modules/{s}/NOTICE", .{m.name}))) {
+                // The "or the root NOTICE has an entry for this module" arm was
+                // dropped on 2026-09-06 with the §1 list. It had been dead
+                // since 2026-08-14 in fact -- the root file has carried no
+                // per-module `<name> — …` entry since the design references
+                // moved out -- but it read as a live alternative, so a module
+                // could look like it had somewhere to point when it did not.
+                // Its helper (`hasNoticeEntry`) went with it rather than being
+                // left behind describing two layouts the file no longer has.
+                if (!answers and !fileExists(b, io, b.fmt("modules/{s}/NOTICE", .{m.name}))) {
                     std.log.err(
                         "modules/{s}/README.md's Provenance note neither states an answer " ++
                             "(clean-room / original work / no entry needed) nor has anything to point " ++
-                            "at: no `{s}` entry in NOTICE and no modules/{s}/NOTICE",
-                        .{ m.name, m.name, m.name },
+                            "at: there is no modules/{s}/NOTICE",
+                        .{ m.name, m.name },
                     );
                     failed.* = true;
                 }
@@ -2723,20 +2781,13 @@ fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
             }
         } else |_| {}
 
-        // The module-local NOTICE, if there is one, must declare its kind, and
-        // §1 must agree about whether it carries a condition.
+        // The module-local NOTICE, if there is one, must declare its kind on
+        // line 1 -- which since 2026-09-06 is the only thing that says whether
+        // a condition travels with this module -- and every module it cites
+        // must exist.
         const notice_path = b.fmt("modules/{s}/NOTICE", .{m.name});
-        const mod_notice = b.build_root.handle.readFileAlloc(io, notice_path, b.allocator, .limited(4 * 1024 * 1024)) catch {
-            // No module-local NOTICE: §1 must not claim there is one.
-            if (std.mem.indexOf(u8, sec1, notice_path) != null) {
-                std.log.err(
-                    "NOTICE §1 lists `{s}`, but that file does not exist",
-                    .{notice_path},
-                );
-                failed.* = true;
-            }
-            continue;
-        };
+        const mod_notice = b.build_root.handle.readFileAlloc(io, notice_path, b.allocator, .limited(4 * 1024 * 1024)) catch continue;
+        checkModuleCitations(mod_notice, notice_path, failed);
 
         const first_line = mod_notice[0 .. std.mem.indexOfScalar(u8, mod_notice, '\n') orelse mod_notice.len];
         const attribution = b.fmt("{s} — third-party attribution", .{m.name});
@@ -2754,46 +2805,53 @@ fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
             continue;
         }
 
-        const listed = std.mem.indexOf(u8, sec1, notice_path) != null;
-        if (is_attribution and !listed) {
-            std.log.err(
-                "{s} carries required attribution but NOTICE §1 does not list it — a consumer " ++
-                    "reading §1 would wrongly conclude zig-libs owes nothing beyond MIT",
-                .{notice_path},
-            );
-            failed.* = true;
-        } else if (is_provenance and listed) {
-            std.log.err(
-                "NOTICE §1 lists {s}, but that file is a provenance note and carries no condition — " ++
-                    "§1 must contain exactly the condition-bearing files",
-                .{notice_path},
-            );
-            failed.* = true;
-        }
+        // NOTE, since 2026-09-06: nothing follows. `is_attribution` /
+        // `is_provenance` used to be cross-checked against the root NOTICE §1
+        // list (claim 3); with that list retired there is no second copy of
+        // this fact left to disagree with, and the first line IS the answer.
+        // The two are still computed because the branch above needs to know
+        // that NEITHER shape matched, which is a different failure from either
+        // shape being present.
     }
+}
 
-    // The other direction. Everything above is driven FROM module_list, so it
-    // can only see a module whose file disagrees with §1 -- never a §1 entry
-    // that corresponds to no module at all. A planted `modules/ghost/NOTICE`
-    // row sailed through until this loop existed, which is the same
-    // one-directional blind spot the catalog check itself had.
+/// Claim 4: every `` `modules/<x>/…` `` path a NOTICE cites names a real module.
+///
+/// The one direction `checkProvenance` cannot reach from `module_list`. Every
+/// other claim starts at a module and asks whether its files agree; none of them
+/// can see a citation that corresponds to no module at all, which is why a
+/// planted `modules/ghost/NOTICE` row used to sail through.
+///
+/// It scanned only the root NOTICE §1 until the 2026-09-06 policy change
+/// retired that list. Re-aimed rather than retired with it: the subject was
+/// never the list but the citations, and the tree has 37 distinct cited module
+/// names across the root NOTICE and 84 module NOTICEs -- more than the 26 rows
+/// §1 held, and including every cross-reference one module's NOTICE makes to a
+/// sibling, which nothing checked before.
+///
+/// Any citation under `modules/` counts, not only ones ending in `/NOTICE`: a
+/// module NOTICE that cites `modules/<x>/src/foo.zig` is making the same claim
+/// about `<x>` existing. A `<` in the name means the text is spelling the
+/// PATTERN (`modules/<name>/NOTICE`) rather than citing a module, and is
+/// skipped -- root §0 and CONVENTIONS both do that.
+fn checkModuleCitations(text: []const u8, source_path: []const u8, failed: *bool) void {
     var scan: usize = 0;
-    while (std.mem.indexOfPos(u8, sec1, scan, "`modules/")) |open| {
+    while (std.mem.indexOfPos(u8, text, scan, "`modules/")) |open| {
         const after = open + "`modules/".len;
-        const close = std.mem.indexOfScalarPos(u8, sec1, after, '`') orelse break;
+        const close = std.mem.indexOfScalarPos(u8, text, after, '`') orelse break;
         scan = close + 1;
-        const cited = sec1[after..close];
-        if (!std.mem.endsWith(u8, cited, "/NOTICE")) continue;
-        const name = cited[0 .. cited.len - "/NOTICE".len];
-        // §1's prose spells the pattern itself as `modules/<name>/NOTICE`.
+        const cited = text[after..close];
+        const name_end = std.mem.indexOfAny(u8, cited, "/ ") orelse cited.len;
+        const name = cited[0..name_end];
+        if (name.len == 0) continue;
         if (std.mem.indexOfScalar(u8, name, '<') != null) continue;
         const known = for (module_list) |m| {
             if (std.mem.eql(u8, m.name, name)) break true;
         } else false;
         if (!known) {
             std.log.err(
-                "NOTICE §1 cites `modules/{s}` but there is no module '{s}'",
-                .{ cited, name },
+                "{s} cites `modules/{s}` but there is no module '{s}'",
+                .{ source_path, cited, name },
             );
             failed.* = true;
         }
@@ -2982,6 +3040,323 @@ fn checkAnchors(b: *std.Build, io: std.Io, failed: *bool) !void {
             failed.* = true;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `zig build check-copyleft` — the pure-MIT gate.
+// ---------------------------------------------------------------------------
+
+/// The licences whose terms would reach the WHOLE distribution if any file we
+/// ship were under one. The repository owner's rule (root NOTICE §1, decided
+/// 2026-09-06) is that such a file is a DEFECT to be removed, not a paperwork
+/// item to be documented, and this list is what "such a file" means here.
+///
+/// Substring matching, case-insensitive, so "GPL" also covers "LGPL", "AGPL",
+/// "GPL-2.0-only", "GPL-3.0-or-later" and every other spelling of the family.
+///
+/// DELIBERATELY NOT IN THIS SET: MPL-2.0, CDDL, EPL. Their copyleft is
+/// file-level — they attach to the files themselves and to modifications of
+/// them, not to a work that merely contains them — so a file under one of them
+/// would not make zig-libs non-pure-MIT, which is the only question the root
+/// NOTICE exists to answer. It would still owe attribution, and that is
+/// `check-catalog`'s claim 5 and CONVENTIONS §5, not this gate. Stated here so
+/// that the omission reads as a decision rather than as an oversight.
+const copyleft_ids = [_][]const u8{ "GPL", "EUPL", "CeCILL", "SSPL", "OSL-" };
+
+/// The FSF-style grant paragraphs, for a file that states its licence in prose
+/// instead of an SPDX tag. Matched in full sentences on purpose — see
+/// `copyleftSelfDeclaration`.
+const copyleft_grants = [_][]const u8{
+    "GNU General Public License",
+    "GNU Lesser General Public License",
+    "GNU Library General Public License",
+    "GNU Affero General Public License",
+    "European Union Public Licence",
+    "Server Side Public License",
+};
+
+/// What a shipped file says about ITS OWN licence — or null, which is the
+/// answer for every file in this repository today.
+///
+/// THE WHOLE DESIGN IS IN WHAT THIS DOES NOT MATCH. Searching shipped files for
+/// the string "GPL" finds ~120 files in this tree and every one of them is
+/// innocent, so a gate built that way would be turned off within a day. Two
+/// cases exist right now that no token search can tell from a violation:
+///
+///   - `modules/ebpf/src/testdata/*.bpf.c` contain
+///     `char _license[] SEC("license") = "GPL";`. That string is a value the
+///     kernel's BPF verifier reads at program load to decide whether the
+///     program may call GPL-only helpers. It is a declaration made by whoever
+///     writes the program, and here that is us; the fixtures were written and
+///     compiled in this repository. `modules/ebpf/README.md` explains it at
+///     length precisely because a scanner will stop there.
+///   - `modules/poseidon` names `iden3/circomlib` (LGPL-3.0) as a comparison
+///     ORACLE it runs against, shipping none of it.
+///
+/// So this function does not look for the NAME of a licence. It looks for a
+/// file GRANTING ITSELF under one, which is a different and much narrower
+/// thing, and which is how real third-party code arrives:
+///
+///   1. An `SPDX-License-Identifier:` tag whose expression names one of
+///      `copyleft_ids`. Every one of this repository's own 1428 tagged files
+///      says `MIT`; a vendored GPL file brings its own tag with it.
+///   2. An FSF grant paragraph ("... under the terms of the GNU General Public
+///      License ..."), for upstreams that predate SPDX tags. Zero occurrences
+///      in this tree today, checked before the gate was written.
+///
+/// Neither shape can be produced by discussing a licence, which is why
+/// documentation is excluded from the scan by extension rather than by an
+/// exemption list: a `.md` file that talks about the GPL is doing its job, and
+/// an exemption list would need an entry for every future one. `ebpf`'s
+/// verifier string is not exempted at all — it simply is not a licence grant,
+/// and that distinction is the gate's whole claim to being maintainable.
+///
+/// Returns the matched evidence so the diagnostic can quote it. A gate that
+/// says "this file is copyleft" without showing what it read is a gate people
+/// argue with.
+fn copyleftSelfDeclaration(src: []const u8) ?[]const u8 {
+    const spdx = "SPDX-License-Identifier:";
+    var scan: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(src, scan, spdx)) |at| {
+        const rest = src[at..];
+        const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const line = std.mem.trim(u8, rest[0..line_end], " \t\r");
+        scan = at + line_end;
+        if (containsAnyIgnoreCase(line, &copyleft_ids)) return line;
+        if (line_end == rest.len) break;
+    }
+    for (copyleft_grants) |g| {
+        if (std.ascii.indexOfIgnoreCase(src, g)) |at| {
+            const end = @min(src.len, at + g.len + 24);
+            return std.mem.trim(u8, src[at..end], " \t\r\n");
+        }
+    }
+    return null;
+}
+
+/// Walk everything a module ships and hold each file to `copyleftSelfDeclaration`.
+///
+/// WHAT IS SCANNED. `build.zig.zon`'s `.paths` ships `modules` wholesale, so
+/// the unit of "shipped" is the module directory, not a curated file list — a
+/// curated list is a second place to forget something. Driven from
+/// `module_list`, like every other claim in `check-catalog`, which is also why
+/// the vendored `example-apps/*/zig-pkg/` copies of this repository are not
+/// scanned twice.
+///
+/// WHAT IS SKIPPED, and why each skip is safe:
+///
+///   - `zig-out`, `.zig-cache`, `zig-pkg` — build output. They are in this
+///     repository's own `.gitignore` and are not shipped. Not a nicety:
+///     `modules/http/sizeprobe/zig-out` alone is 949 MB against 54 MB for
+///     everything tracked under `modules/`, so a walk that did not skip them
+///     would read the tree twenty times over on every build.
+///   - `*.md` — documentation. See `copyleftSelfDeclaration` for why this is an
+///     extension rule and not an exemption list.
+///   - the module's own `NOTICE` — handled by `checkCopyleftDeclaration`, which
+///     asks a better question of it than "does it grant itself GPL".
+///
+/// A file that cannot be READ fails the gate rather than being skipped. "Skip
+/// whatever you could not read" is the reflex that put a hole in
+/// `check-changelog` (see its note on why claim 1 demands the file), and a gate
+/// about licences is the last place to repeat it.
+fn scanShippedForCopyleft(b: *std.Build, io: std.Io, dir_path: []const u8, depth: u8, failed: *bool) void {
+    if (depth > 8) return;
+    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch |e| {
+        std.log.err("check-copyleft cannot open {s}: {s}", .{ dir_path, @errorName(e) });
+        failed.* = true;
+        return;
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch |e| {
+        std.log.err("check-copyleft cannot read {s}: {s}", .{ dir_path, @errorName(e) });
+        failed.* = true;
+        return;
+    }) |entry| {
+        const path = b.fmt("{s}/{s}", .{ dir_path, entry.name });
+        switch (entry.kind) {
+            .directory => {
+                if (containsName(&.{ "zig-out", ".zig-cache", "zig-pkg" }, entry.name)) continue;
+                scanShippedForCopyleft(b, io, path, depth + 1, failed);
+            },
+            .file => {
+                if (std.mem.endsWith(u8, entry.name, ".md")) continue;
+                if (std.mem.eql(u8, entry.name, "NOTICE")) continue;
+                const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(8 * 1024 * 1024)) catch |e| {
+                    std.log.err("check-copyleft cannot read {s}: {s}", .{ path, @errorName(e) });
+                    failed.* = true;
+                    continue;
+                };
+                if (copyleftSelfDeclaration(src)) |evidence| {
+                    std.log.err(
+                        "{s} declares itself under a copyleft licence — \"{s}\". Copyleft in shipped " ++
+                            "code or data is a DEFECT, not a paperwork item: remove the file and " ++
+                            "re-implement what it did. No NOTICE entry makes it acceptable (root NOTICE §1).",
+                        .{ path, evidence },
+                    );
+                    failed.* = true;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// The judgement this gate refuses to make on a human's behalf.
+///
+/// A module NOTICE that NAMES a copyleft licence is not a violation — 43 of
+/// them do, because root NOTICE §0 requires a design reference to be recorded
+/// WITH ITS UPSTREAM LICENSE NAME, and plenty of the implementations this
+/// collection was checked against are GPL. But "names it" and "ships it" look
+/// identical to any scanner, so the relationship has to be stated by someone
+/// who knows, in a line a scanner can read.
+///
+/// WHICH FILES ARE ASKED, and why it is not all 43. A `<m> — provenance note`
+/// declares on its own first line, and by CONVENTIONS §5, that the whole file
+/// carries NO condition; naming an upstream's GPL there is exactly the §0
+/// design-reference record, and asking those 41 files to repeat per licence
+/// what their first line already says for the file would add a line the gate
+/// already knows the answer to. A `<m> — third-party attribution` file makes
+/// the opposite declaration — "this module ships third-party material, here are
+/// its terms" — so when such a file ALSO names a copyleft licence, nothing in
+/// the tree says which side of that line the copyleft thing falls on. That is
+/// the ambiguity worth one stated line, and it is two files today (`megolm`,
+/// which names GPL/LGPL/AGPL only to deny consulting any, and `poseidon`, whose
+/// circomlib is an oracle).
+///
+/// THE SHAPE is the repo's house style for a single stated fact, the same one
+/// `**Fuzz exemption:**` uses and for the same reason its repository-level TSV
+/// was retired: one line in the module's own file, argument in the prose after
+/// it, nothing to keep in sync.
+///
+///     **Copyleft:** NONE-SHIPPED — <why nothing under that licence is here>
+///
+/// TWO VALUES, ONE OF WHICH FAILS. `NONE-SHIPPED` passes. `SHIPPED` parses and
+/// then fails the build with the policy's own words. That is deliberate: the
+/// alternative is a vocabulary in which the defect cannot be spelled, and a
+/// defect that cannot be spelled gets written as `NONE-SHIPPED` by whoever is
+/// in a hurry. Making it sayable and immediately red is what turns the line
+/// into a decision rather than a formality. An argument after the em dash is
+/// required for the same reason `moduleFuzzExemption`'s evidence is: a bare
+/// verdict is not a judgement.
+fn checkCopyleftDeclaration(name: []const u8, path: []const u8, notice: []const u8, failed: *bool) void {
+    const first_line = notice[0 .. std.mem.indexOfScalar(u8, notice, '\n') orelse notice.len];
+    if (std.mem.indexOf(u8, first_line, "third-party attribution") == null) return;
+    if (!containsAnyIgnoreCase(notice, &copyleft_ids) and
+        std.ascii.indexOfIgnoreCase(notice, "copyleft") == null) return;
+
+    const needle = "**Copyleft:** ";
+    const at = std.mem.indexOf(u8, notice, needle) orelse {
+        std.log.err(
+            "{s} is a third-party attribution file and names a copyleft licence, but does not say " ++
+                "what the relationship is. Add one line: `**Copyleft:** NONE-SHIPPED — <why nothing " ++
+                "under that licence is in this repository>`. CONVENTIONS.md §5.",
+            .{path},
+        );
+        failed.* = true;
+        return;
+    };
+    if (std.mem.indexOfPos(u8, notice, at + needle.len, needle) != null) {
+        std.log.err("module '{s}': {s} states a copyleft relationship twice", .{ name, path });
+        failed.* = true;
+        return;
+    }
+
+    const rest = notice[at + needle.len ..];
+    const line = std.mem.trim(u8, rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len], " \t\r");
+    const dash = " — ";
+    const cut = std.mem.indexOf(u8, line, dash) orelse {
+        std.log.err(
+            "{s}: `{s}{s}` states a verdict with no argument — the line must read " ++
+                "`**Copyleft:** <RELATION> — <argument>`",
+            .{ path, needle, line },
+        );
+        failed.* = true;
+        return;
+    };
+    const relation = std.mem.trim(u8, line[0..cut], " \t");
+    const argument = std.mem.trim(u8, line[cut + dash.len ..], " \t");
+
+    if (std.mem.eql(u8, relation, "SHIPPED")) {
+        std.log.err(
+            "{s} declares `**Copyleft:** SHIPPED` — that is the defect itself. Copyleft in shipped " ++
+                "code or data is removed, not documented (root NOTICE §1). Reason given: \"{s}\"",
+            .{ path, argument },
+        );
+        failed.* = true;
+        return;
+    }
+    if (!std.mem.eql(u8, relation, "NONE-SHIPPED")) {
+        std.log.err(
+            "{s}: `**Copyleft:** {s}` is not a relation — it must be NONE-SHIPPED (nothing under " ++
+                "that licence is in this repository) or SHIPPED (which fails, by policy)",
+            .{ path, relation },
+        );
+        failed.* = true;
+        return;
+    }
+    if (argument.len == 0) {
+        std.log.err(
+            "{s}: `**Copyleft:** NONE-SHIPPED` with no argument after the em dash — say WHY nothing " ++
+                "under that licence is here (design reference / test oracle / negative statement)",
+            .{path},
+        );
+        failed.* = true;
+    }
+}
+
+/// `zig build check-copyleft` — the whole library is still plain MIT.
+///
+/// The repository owner's rule, 2026-09-06, in their own terms: the central
+/// NOTICE serves only for the case where we would have to change the whole
+/// library to non-pure-MIT, "for example by bringing in some GPL code", and if
+/// that ever happened it would be treated as a DEFECT and the dirty code
+/// removed. Root NOTICE §1 states the rule; this step is the rule's teeth.
+///
+/// Two claims, and the interesting part of both is what they refuse to fire on:
+///
+///  A. No file a module ships declares ITSELF under a copyleft licence. See
+///     `copyleftSelfDeclaration` for why it reads grants rather than the string
+///     "GPL", and `scanShippedForCopyleft` for what counts as shipped. There is
+///     no violation in the tree today, so the claim was verified by planting
+///     one — a file carrying `SPDX-License-Identifier: GPL-3.0-or-later`, and
+///     separately one carrying the FSF grant paragraph — and by confirming that
+///     `modules/ebpf` and `modules/poseidon`, the two cases a token search
+///     cannot distinguish from a violation, do not trip it.
+///
+///  B. A third-party attribution NOTICE that names a copyleft licence says, in
+///     one line, what the relationship is. See `checkCopyleftDeclaration`.
+///
+/// A SEPARATE STEP, not a section of `check-catalog`, for the reason
+/// `check-fuzz` is: the change signal differs. `check-catalog` is driven by
+/// `module_list` and reads a handful of documents per module; this one reads
+/// every byte a module ships (~54 MB) and should run when SOURCE OR DATA lands,
+/// not when a README moves. Folding it in would make the cheap gate expensive
+/// and hide which of the two went red.
+///
+/// WHAT THIS GATE CANNOT SEE, stated so a green run is not read as more than it
+/// is: third-party code that arrives with its licence header STRIPPED. Nothing
+/// mechanical can catch that — the file then makes no claim about itself at all
+/// — and the check that does reach it is `check-catalog`'s claim 5, which
+/// demands a provenance answer per module from a human. This gate is the
+/// backstop for material that arrives honestly labelled, which is how it
+/// normally arrives.
+fn checkCopyleft(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    var failed = false;
+
+    for (module_list) |m| {
+        scanShippedForCopyleft(b, io, b.fmt("modules/{s}", .{m.name}), 0, &failed);
+
+        const notice_path = b.fmt("modules/{s}/NOTICE", .{m.name});
+        const notice = b.build_root.handle.readFileAlloc(io, notice_path, b.allocator, .limited(4 * 1024 * 1024)) catch continue;
+        checkCopyleftDeclaration(m.name, notice_path, notice, &failed);
+    }
+
+    if (failed) return step.fail("copyleft is a defect, not a paperwork item — see errors above", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -4447,34 +4822,13 @@ fn fileExists(b: *std.Build, io: std.Io, path: []const u8) bool {
     return true;
 }
 
-/// Whether the root NOTICE has an entry for `name`. Two layouts are in use --
-/// `  name  — …` and `` `name`  — … `` -- and both must count, or the check
-/// reports a missing entry that is right there (this bit me: a first pass
-/// matched only the unquoted form and called `jinja` and `reconcilable`
-/// undocumented).
-fn hasNoticeEntry(notice: []const u8, name: []const u8) bool {
-    var it = std.mem.splitScalar(u8, notice, '\n');
-    while (it.next()) |line| {
-        const t = std.mem.trimStart(u8, line, " ");
-        const body = if (std.mem.startsWith(u8, t, "`")) t[1..] else t;
-        if (!std.mem.startsWith(u8, body, name)) continue;
-        const after = body[name.len..];
-        const tail = if (std.mem.startsWith(u8, after, "`")) after[1..] else after;
-        const trimmed = std.mem.trimStart(u8, tail, " ");
-        if (std.mem.startsWith(u8, trimmed, "—") or std.mem.startsWith(u8, trimmed, "-")) return true;
-    }
-    return false;
-}
-
-/// The slice of `haystack` between the first occurrence of `from` and the next
-/// occurrence of `to` after it. Null if either marker is missing or `to`
-/// precedes `from`.
-fn sectionSlice(haystack: []const u8, from: []const u8, to: []const u8) ?[]const u8 {
-    const start = std.mem.indexOf(u8, haystack, from) orelse return null;
-    const rest = haystack[start..];
-    const end = std.mem.indexOf(u8, rest, to) orelse return null;
-    return rest[0..end];
-}
+// `hasNoticeEntry` and `sectionSlice` lived here until 2026-09-06. Both existed
+// only to read the root NOTICE §1 list -- one to find a module's row, one to cut
+// the section the rows lived in -- and the policy change that retired the list
+// left them with nothing to read. `hasNoticeEntry`'s doc comment had also
+// outlived its subject: it explained which two ROW LAYOUTS the root file used,
+// and the root file has had no per-module rows at all since the design
+// references moved out on 2026-08-14.
 
 /// Non-goals gate: the "Non-goals — deliberately not built here" section must
 /// not name a capability that IS a module.

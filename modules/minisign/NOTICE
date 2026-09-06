@@ -3,7 +3,8 @@ minisign — third-party attribution
 This file carries a CONDITION. `src/root.zig`'s `isPrintableComment` is a port
 of `is_printable` from jedisct1/minisign, and the ISC license that project
 ships under requires its copyright notice and permission text to be retained.
-That text is reproduced in full below, and root NOTICE §1 lists this file.
+That text is reproduced in full below. The obligation lives here, beside the
+files that owe it; the root NOTICE does not list modules.
 
 WHY THIS FILE EXISTS, 2026-08-14. Until this revision the module argued merger
 doctrine instead: a thirty-line control-character predicate is small and

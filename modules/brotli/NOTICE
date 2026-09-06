@@ -3,7 +3,8 @@ brotli — third-party attribution
 This file carries a CONDITION. `src/testdata/` reproduces google/brotli's own
 test corpus verbatim, and the MIT license those files ship under requires its
 copyright notice and permission text to travel with them. That text is
-reproduced in full below, and root NOTICE §1 lists this file.
+reproduced in full below. The obligation lives here, beside the files that owe
+it; the root NOTICE does not list modules.
 
 WHAT CHANGED AND WHY, 2026-08-12. Until this revision the file was headed
 `brotli — provenance note`, i.e. a record carrying no condition, and it said the

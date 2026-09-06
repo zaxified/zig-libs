@@ -130,5 +130,5 @@ encoding.md` / `12-offer-encoding.md`) — that needs no attribution per root
 `NOTICE` §0 (a public spec is not a copyrightable work). What is reproduced
 here, and only here, is the SPECIFICATION AUTHORS' OWN TEST-CASE DATA, which
 is precisely why this notice exists and lives beside it rather than in root
-`NOTICE` (per root `NOTICE` §1's policy: attribution for reproduced
+`NOTICE` (per root `NOTICE` §1: attribution for reproduced
 third-party data travels with the module that owes it).

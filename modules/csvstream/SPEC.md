@@ -4,7 +4,7 @@ Streaming RFC 4180 CSV reader that preserves byte offsets. Usage: see ./README.m
 Attribution/provenance: the codec itself is clean-room original work (root `NOTICE` §0 — no
 entry needed for that). The conformance test suite separately vendors the third-party
 `maxogden/csv-spectrum` fixture corpus (test data only) — see this module's own `NOTICE`,
-listed in root `NOTICE` §1.
+a `third-party attribution` file, which is where the obligation lives.
 
 ## Design & invariants
 - **Two layers, one record model:** both emit `LineSlice { bytes, byte_offset, unbalanced_quote }`.

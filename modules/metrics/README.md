@@ -8,7 +8,7 @@ cluster.
 Provenance: clean-room — original work of the zig-libs authors (MIT), no
 third-party code; the module nevertheless carries required attribution in
 [`NOTICE`](NOTICE) beside this file for a reproduced Prometheus documentation
-excerpt, and is listed in the root `NOTICE` §1. Design
+excerpt. Design
 references: Prometheus client_golang (Apache-2.0 — registry and instrument
 semantics: get-or-register per (name, label values), lazy series creation,
 `le`-inclusive buckets, NaN handling) and the Prometheus text exposition

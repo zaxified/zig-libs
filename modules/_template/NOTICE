@@ -21,13 +21,15 @@ had to be corrected on 2026-08-12.
   third-party attribution — third-party code was ported or translated, OR
       third-party data is reproduced whose notice must travel with it. This
       file then CARRIES A CONDITION naming someone other than the zig-libs
-      authors, and the module MUST also appear in the root NOTICE section 1.
+      authors. It discharges that condition HERE, in this file — the root
+      NOTICE does not list modules (policy change 2026-09-06; it answers only
+      whether the library as a whole is still plain MIT).
       State the upstream project, its license, exactly what was taken, and
       whether it is source or data.
 
   provenance note — a named third-party implementation was studied for
       behavior, algorithm or API shape, and nothing was copied. This file
-      carries NO condition and the module MUST NOT appear in root section 1.
+      carries NO condition. Its first line is what tells a reader that.
       State the upstream project and its license anyway: that is the record of
       whose terms would apply if a line were ever copied from it later.
 

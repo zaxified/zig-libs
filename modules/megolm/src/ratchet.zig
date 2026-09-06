@@ -1,4 +1,19 @@
 // SPDX-License-Identifier: MIT
+//
+// PORTED FILE — Apache-2.0 §4(b) notice of modification.
+//
+// The ratchet below is a port of Apache-2.0 licensed code:
+//   Copyright 2016 OpenMarket Ltd                  — libolm `src/megolm.c`
+//   Copyright 2016 OpenMarket Ltd,
+//   Copyright 2021 The Matrix.org Foundation C.I.C. — vodozemac
+//                                                     `src/megolm/ratchet.rs`
+//
+// This file has been MODIFIED from those originals: rewritten in Zig, with
+// libolm's manual buffer arithmetic replaced by fixed arrays and slices, its
+// `struct Megolm` by `Ratchet`, its return codes by Zig error unions, and
+// every primitive taken from Zig's standard library or this repository's
+// `aescbc` module rather than from upstream. See `modules/megolm/NOTICE`,
+// which reproduces the Apache License 2.0 in full and states what changed.
 
 //! ratchet.zig — the Megolm one-way hash ratchet itself: 128 bytes held as
 //! four 32-byte parts `R0..R3` plus a 32-bit counter, advanced so that

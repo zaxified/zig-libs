@@ -1,8 +1,8 @@
 zipstream — provenance note
 
 A record only. This file carries NO condition beyond zig-libs' own MIT license,
-and `zipstream` is deliberately absent from root NOTICE §1 (the exhaustive list
-of condition-bearing files) for that reason.
+and its first line is what says so — since 2026-09-06 that first line is the
+only place a reader looks, the root NOTICE having stopped listing modules.
 
 WHY IT EXISTS AT ALL. The module's implementation is clean-room from the public
 PKWARE ZIP spec (APPNOTE.TXT) and the ECMA-376 OOXML package layout, and owes

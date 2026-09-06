@@ -46,9 +46,10 @@ public RFC 6960 wire protocol was captured, exactly as those local-binary
 captures are. A signed OCSP response's bytes are themselves almost entirely
 protocol-structure (ASN.1 DER dictated by the RFC) plus facts (timestamps, a
 serial number, a cryptographic signature) — not copyrightable expression —
-so this is neither a vendored third-party corpus (root NOTICE §1, e.g.
-`csvstream`'s CSV acid-test suite) nor a design reference (§2): no entry in
-either place, and no root NOTICE change accompanies this addition. See
+so this is neither a vendored third-party corpus (the shape `csvstream`'s CSV
+acid-test suite has, recorded in its own module NOTICE) nor a design reference
+(root NOTICE §2): no entry in either place, and no root NOTICE change
+accompanies this addition. See
 `goldens.zig`'s own doc comment for the exact capture recipe and what each
 response exercises that the constructed fixtures do not.
 

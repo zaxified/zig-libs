@@ -1,5 +1,13 @@
-mls — provenance note
-======================
+mls — third-party attribution
+=============================
+
+This file carries a CONDITION, added 2026-09-06: the 15 JSON files under
+`src/data/` come from the IETF MLS working group's interop repository, and the
+IETF Trust's outbound licence grants the right to redistribute them subject to
+attributing IETF and identifying what was taken. See "IETF Trust grant" below.
+This file's own first line is what marks it condition-bearing; the root NOTICE
+lists no module (policy, 2026-09-06) and answers only whether the library as a
+whole is still plain MIT.
 
 Kept as a module-local NOTICE (same placement as the sibling `bn254`/
 `bls12_381`/`bip340`/`adaptor` modules — self-contained crypto/protocol
@@ -35,6 +43,68 @@ Provenance
    the relationship is "port", not "clean-room from prose" — matching
    the standard this repo's `CONVENTIONS.md` §5 sets for when a design
    reference (even a public-spec one) is worth naming precisely.
+
+IETF Trust grant — verified 2026-09-06
+--------------------------------------
+
+Until this revision every `mlswg/mls-implementations` item below rested on
+"public conformance data, not copyrightable expression" (merger doctrine), and
+noted that the repository has no licence file. That reasoning was weaker than it
+needed to be: there is a WRITTEN GRANT, and it was checked rather than recalled.
+
+  - **BCP 78 (RFC 5378) §1.a** defines an IETF Contribution as, among other
+    things, *"written and electronic communications, made at any time or place,
+    that are addressed to: ... any IETF working group or portion thereof"*.
+    The files below were committed to the MLS working group's own GitHub
+    organisation (`github.com/mlswg`) and are the vectors that working group
+    runs its interop against.
+  - **IETF Trust Legal Provisions 5.0 §3.a** — "Licenses For Use Outside the
+    IETF Standards Process" — grants *"to each person who wishes to exercise
+    such rights ... a non-exclusive, royalty-free, worldwide right and license
+    ... i. to copy, publish, display and distribute IETF Contributions and IETF
+    Documents in full and without modification"*, and *"iii. to copy, publish,
+    display and distribute unmodified portions ... provided that (x) each such
+    portion is clearly attributed to IETF and identifies the RFC or other IETF
+    Document or IETF Contribution from which it is taken"*.
+
+What we actually ship, measured against upstream at HEAD
+`cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` on 2026-09-06 (`curl` + `cmp`, and
+`json.load` record comparison for the rest):
+
+  - **9 files byte-identical, 2 583 432 B** — `crypto-basics.json`,
+    `key-schedule.json`, `message-protection.json`, `passive-client-random.json`,
+    `psk_secret.json`, `secret-tree.json`, `transcript-hashes.json`,
+    `tree-math.json`, `welcome.json`. These are §3.a(i): in full and without
+    modification.
+  - **5 files are proper subsets of upstream records, every retained record
+    unmodified** — `messages.json` (upstream 2 685 714 B), `treekem.json`
+    (11 of 77 records), `tree-validation.json`, `passive-client-welcome.json`,
+    `passive-client-handling-commit.json`. These are §3.a(iii): unmodified
+    portions.
+  - **1 file, `tree-operations.json`, holds all 5 upstream records unmodified
+    but was re-serialised**, so its bytes differ (50 429 B vs 50 670 B) while
+    its content does not. Recorded rather than glossed: §3.d grants no licence
+    to MODIFY, and re-serialising a container is the closest thing here to one.
+    The records themselves are what §3.a(iii) speaks of, and they are untouched.
+
+**Attribution, per §3.a(iii)(x):** the material above is taken from IETF
+Contributions to the IETF MLS working group, published at
+https://github.com/mlswg/mls-implementations, at the commit named with each
+item below. §3.a(iii)(y)'s legend requirement is about reproducing a substantial
+portion — in any event more than one-fifth — of the text of an IETF RFC; no RFC
+text is reproduced in these files.
+
+⚠ Two limits stated rather than argued away. **RFC 8874 §2 requires that
+"notices on repositories MUST include citations for the IETF Note Well"**, and
+this repository carries none — no CONTRIBUTING file, no licence, and a 15-line
+README that never mentions it (checked 2026-09-06). That is a defect on the
+working group's side, not a grant we can supply for them, and it is the reason
+this file previously concluded the IETF route did not reach. The grant above
+flows from what the contributors did (contributing to a working group), not from
+whether the repository posted the notice. Second, the merger-doctrine argument is
+kept below as a fallback, not deleted: across all 15 files there are only four
+English strings and they are RFC 9420 label names, so nothing here is authored
+prose either way.
 
 3. **`mlswg/mls-implementations`** (the IETF MLS working group's
    interop test-vector repository, no explicit OSS license file present

@@ -952,7 +952,7 @@ test "integration: a 200 over loopback carries the headers; handler override win
 //     root NOTICE SS0's spec/RFC carve-out, no NOTICE entry needed.
 //   - The OWASP Secure Headers Project excerpt is a curated third-party
 //     recommendations document (Apache License 2.0, not an RFC) — see
-//     `modules/security-headers/NOTICE` and root NOTICE SS1.
+//     `modules/security-headers/NOTICE`, which is where the obligation lives.
 //
 // This is a genuine external anchor for the headers it covers. It does NOT
 // cover Content-Security-Policy: neither RFC 7034/6797 nor the OWASP page

@@ -54,6 +54,9 @@ bit consumption) and in `src/mds_security.zig`'s (the two proved rewrites, and
 
 ## NOT reproduced here: circomlib
 
+**Copyleft:** NONE-SHIPPED — circomlib is an ORACLE this module compares
+against, not code it ships; no circomlib source or data is in this repository.
+
 `iden3/circomlib` and `circomlibjs` are **LGPL-3.0** and are used only as a
 comparison target: `src/constants_test.zig` pins SHA-256 digests of tables THIS
 module derives, and documents how to re-clone circomlibjs and recompute the

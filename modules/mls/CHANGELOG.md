@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — **`NOTICE` rests the `src/data/` vectors on the IETF Trust's
+  written grant instead of on merger doctrine, and becomes a third-party
+  attribution.** The 15 JSON files come from the MLS working group's interop
+  repository, which has no licence file — the old reasoning was "conformance
+  data is not copyrightable expression", and the file even recorded that the
+  IETF route did not reach. It does: BCP 78 §1.a makes a communication addressed
+  to an IETF working group a Contribution, and TLP 5.0 §3.a licenses everyone to
+  redistribute Contributions in full (§3.a(i)) or as unmodified portions with
+  attribution to IETF (§3.a(iii)). Measured against upstream the same day: 9 of
+  the 15 files are byte-identical (2 583 432 B), 5 are proper subsets whose every
+  retained record is unmodified, and `tree-operations.json` holds all 5 upstream
+  records unmodified but re-serialised — recorded, because §3.d grants no licence
+  to modify. Root `NOTICE` §1 lists this module, 25 entries to 26. **No code
+  changed.**
+
 - **2026-08-12** — `create` and the commit path draw `init_secret` and `path_secret_0` with
   `io.randomSecure` rather than `io.random`. Not breaking — both functions
   already returned an error union, so `error.EntropyUnavailable` joins an

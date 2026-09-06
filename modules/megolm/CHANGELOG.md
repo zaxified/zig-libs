@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — **`NOTICE` corrected: this module carries an Apache-2.0 condition.**
+  It was headed `provenance note` and called the implementation "clean-room ...
+  no libolm C or vodozemac Rust source was copied, ported, or transliterated",
+  while `src/ratchet.zig:17-18` said "this module is a direct, byte-for-byte port
+  of theirs" about the same code. The source comment is the accurate one. The
+  file is now a `third-party attribution`, reproduces the Apache License 2.0 in
+  full (§4(a)), retains OpenMarket Ltd's and The Matrix.org Foundation's
+  copyright notices (§4(c)), and states what was changed in the port (§4(b));
+  `src/ratchet.zig` carries the same modification notice in its header. Neither
+  upstream ships a NOTICE file, checked the same day, so §4(d) adds nothing.
+  Root `NOTICE` §1 lists this module, 24 entries to 25. **No code changed** —
+  the condition was always there, it was written down wrongly.
+
 - **2026-08-13** — Test-only, neither BREAKING nor BEHAVIOURAL: `session.zig` gained a
   seam test proving `OutboundSession.init`'s two `entropy.fill` draws (the
   ratchet R₀ and the Ed25519 signing key) are both actually read (two

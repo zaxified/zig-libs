@@ -4,7 +4,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 transcoding logic itself is clean-room (root `NOTICE` §0 — no root entry needed for a
 clean-room spec implementation). The test suite additionally vendors third-party
 normative DATA (WHATWG `index-*.txt` tables + Unicode.org `8859-1.TXT`) to anchor every
-table entry; see `modules/encoding/NOTICE` and root `NOTICE` §1 for that attribution.
+table entry; see `modules/encoding/NOTICE` for that attribution.
 
 ## Design & invariants
 Legacy single-byte code page ↔ UTF-8 transcoding for the five European code pages a legacy broker /

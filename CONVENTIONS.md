@@ -338,7 +338,7 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 | the catalog's Platform cell | `meta.platform_note` in the module's `src/root.zig` | same — generated |
 | paragraph purpose + API + import + verify steps | `modules/<m>/README.md` | — |
 | design & invariants, threat-model, verification detail, per-module backlog | `modules/<m>/SPEC.md` | — |
-| license attribution / provenance | `NOTICE` | README/SPEC only point to it, never restate the terms |
+| license attribution / provenance | `modules/<m>/NOTICE` — the root `NOTICE` answers only whether the library AS A WHOLE is still plain MIT, and names no module | README/SPEC only point to it, never restate the terms |
 | which modules have a LIVE external peer | `.live` on the `module_list` entry | `zig build module-graph` publishes it; the shell scripts derive theirs from that, never a list of their own |
 | which modules have a constant-time harness | `modules/<m>/src/ctgrind_harness.zig` **existing** | derived — build.zig scans for it, `module-graph` publishes it, `scripts/ctgrind.sh` reads it from there |
 | standalone consumer applications | `example-apps/<name>/`, declared in `example_apps` in `build.zig` | `scripts/check-apps.sh --run` builds each against the working tree with `--fork` and then RUNS its `smoke.sh` (required, and it must be executable) in BOTH `ReleaseSafe` and `ReleaseFast` on every run, and `--pinned` builds each from its manifest — fetch by URL and hash — on a tag ref, where the pin and the commit are the same content. Both are blocking (`consumer` job). An app's source is written against the TREE; the pin is for the downloader, a tag being the only ref that carries the all-lanes-green claim. An app importing exactly one module discharges that module's §7.2 obligation |
@@ -346,18 +346,37 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 | all repo rules | this file (`CONVENTIONS.md`) | — |
 | module catalog | root `README.md` table | — |
 
-**When does NOTICE need an entry?** A public spec/RFC is not a copyrightable work (merger
+**When does a module need a NOTICE?** A public spec/RFC is not a copyrightable work (merger
 doctrine — implementing one, however closely, is not "derived from" anyone's code). A module that
 is pure clean-room-from-spec, with no third-party source ported and no third-party implementation
-studied as a design reference, needs **no NOTICE entry** — its RFC/spec citation lives in the
-module's own SPEC.md instead (see whois/rdap/tar). The root NOTICE is reserved for **design
-references** — a named third-party implementation consulted for behavior/algorithm/API shape
-without copying source. Those are provenance records, never license conditions.
+studied as a design reference, needs **no NOTICE at all** — its RFC/spec citation lives in the
+module's own SPEC.md instead (see whois/rdap/tar). A **design reference** — a named third-party
+implementation consulted for behavior/algorithm/API shape without copying source — is recorded at
+the module too, in its README `Provenance:` line or, when the argument needs paragraphs, in a
+module-local provenance note. Those are provenance records, never license conditions. (Design
+references lived in the root NOTICE §2 until 2026-08-14, where they had grown to ~1000 lines
+indexing 84 modules; that is no longer a destination.)
 
 **Required attribution goes in the module, not the root.** If a module ports third-party source,
 its license terms are reproduced in `modules/<name>/NOTICE`, beside the code that owes them, so the
 notice travels with the module (see `falcon`). Never add such an entry to the root NOTICE: keeping
 the root free of redistribution conditions is what lets zig-libs be consumed as plain MIT.
+
+**What the root `NOTICE` is for, since 2026-09-06.** Exactly one question — is the library AS A
+WHOLE still plain MIT? — and the rule that keeps the answer true. It names no module. It used to
+carry a §1 list of the twenty-six condition-bearing `modules/<name>/NOTICE` paths, maintained by
+hand and gated by `check-catalog`; the list is gone, because a module's third-party material is the
+module's legal question and the module's own NOTICE discharges it. Restating which modules those
+are turned the file into an index of other people's obligations rather than an answer about the
+library, and made every new attribution file a two-file edit whose second half nothing but the gate
+remembered. **Copyleft in shipped code — GPL/LGPL/AGPL, or anything else that would attach its
+terms to the distribution as a whole — is a DEFECT, not a paperwork item:** it is removed, not
+documented, and there is no entry anywhere that would make it acceptable. `zig build check-copyleft`
+enforces that by reading each shipped file's own licence declaration (an `SPDX-License-Identifier:`
+naming a copyleft licence, or an FSF grant paragraph) rather than the string "GPL" — naming a
+copyleft licence is not the defect, being under one is. `modules/ebpf`'s `_license = "GPL"` BPF
+verifier strings and `modules/poseidon`'s LGPL-3.0 circomlib oracle are the two cases in this tree
+that a string search cannot tell from a violation.
 
 **Two kinds of `modules/<name>/NOTICE`, and the first line says which.** A module-local NOTICE is
 either
@@ -365,20 +384,36 @@ either
 | First line | Kind | Meaning |
 |---|---|---|
 | `<name> — third-party attribution` | **condition-bearing** | ported source/data; its terms are reproduced here and travel with the module |
-| `<name> — provenance note` | **record only** | a §2-style design-reference record kept beside the module instead of in the root NOTICE |
+| `<name> — provenance note` | **record only** | a design-reference record kept beside the module |
 
-A provenance note is the right home when a module's provenance is long enough to drown the root
-file — the self-contained crypto/protocol modules run to hundreds of lines each (`bls12_381` is
-over 800). It is a placement choice, nothing more: a provenance note **must not** carry any
-condition, and the root NOTICE §1 lists the condition-bearing files exhaustively so a consumer can
-answer "what do I owe?" by reading those and nothing else. `zig build check-catalog` enforces the
-first-line discriminator, that every condition-bearing file is listed in root §1, and that no
-provenance note is.
+A provenance note is the right home when a module's provenance is long enough to drown a README —
+the self-contained crypto/protocol modules run to hundreds of lines each (`bls12_381` is over 800).
+It is a placement choice, nothing more: a provenance note **must not** carry any condition. That
+first line is now the ONLY discriminator, and it does real work: with the root §1 list retired,
+`head -1 modules/*/NOTICE` is how a consumer enumerates what they owe, so a wrong or missing first
+line is no longer a duplicate of a list somewhere else — it is the whole answer. `zig build
+check-catalog` holds every module NOTICE's first line to exactly one of the two shapes above, and
+holds every `` `modules/<x>/…` `` path cited from any NOTICE to a module that exists.
+
+Because that first line already states, for the whole file, whether a condition travels with the
+module, it also answers the copyleft question for a provenance note: naming an upstream's GPL/LGPL/
+AGPL licence there is the design-reference record §0 of the root NOTICE asks for, and carries
+nothing. An **attribution** file makes the opposite declaration — "this module ships third-party
+material under these terms" — so if such a file also names a copyleft licence, nothing yet says
+which side of the line that licence falls on. Those files must say so in one stated line:
+
+    **Copyleft:** NONE-SHIPPED — <why nothing under that licence is in this repository>
+
+`NONE-SHIPPED` is the only value that passes; `SHIPPED` is accepted by the parser precisely so that
+declaring it fails the build with the policy's own words, rather than being unsayable and therefore
+unnoticed. `zig build check-copyleft` checks it. (Same shape and same reason as `**Fuzz
+exemption:**` in a module's SPEC/README: one stated line in the module's own file, with the argument
+in the prose after it — not a repository-level table of one row.)
 
 **Never justify placement by pointing at a sibling.** Cite this section instead. Chained
 "same placement as the sibling X/Y/Z modules" reasoning is how the practice drifted for 38 modules
 without anyone deciding it, and how the root NOTICE came to claim one module carried its own file
-while four did.
+while four did — the drift that finally retired the list.
 
 Running an installed third-party binary purely as a black-box compatibility
 test oracle (e.g. diffing output against `tar`/`nft`) is neither of the above and needs no entry.

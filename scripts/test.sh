@@ -295,6 +295,17 @@ harness_smoke() {
     step "check-scripts-doc" zig build check-scripts-doc
     step "check-package" zig build check-package
     step "check-catalog" zig build check-catalog
+
+    # The root NOTICE stopped listing modules on 2026-09-06: a module's
+    # third-party obligation is discharged in the module's own NOTICE, and the
+    # root file answers one question only -- is the library as a whole still
+    # plain MIT. This is what makes that answer checkable. It refuses a shipped
+    # file that GRANTS ITSELF under a copyleft licence (an SPDX expression
+    # naming GPL/AGPL/LGPL/EUPL/CeCILL/SSPL/OSL, or an FSF grant paragraph),
+    # which is why `ebpf`'s `_license = "GPL"` -- a BPF verifier ABI value, not
+    # a copyright notice -- does not trip it. Copyleft in shipped code is a
+    # defect to be removed, not a paperwork item.
+    step "check-copyleft" zig build check-copyleft
     step "check-uapi" zig build check-uapi
     step "check-changelog" zig build check-changelog
 
@@ -1288,6 +1299,7 @@ cmd_changed() {
     # been red for weeks on 21 modules: a gate that exists and is never invoked
     # makes the same claim a skipped test makes, which is that someone looked.
     step "check-fuzz" zig build check-fuzz
+    step "check-copyleft" zig build check-copyleft
     step "check-global-alloc" zig build check-global-alloc
 
     # 32-bit compile of every `platform = .any` module. ~6s cold for all 195,
@@ -1441,6 +1453,17 @@ phase_checks_fast_tail() {
     step "check-scripts-doc" zig build check-scripts-doc
     step "check-package" zig build check-package
     step "check-catalog" zig build check-catalog
+
+    # The root NOTICE stopped listing modules on 2026-09-06: a module's
+    # third-party obligation is discharged in the module's own NOTICE, and the
+    # root file answers one question only -- is the library as a whole still
+    # plain MIT. This is what makes that answer checkable. It refuses a shipped
+    # file that GRANTS ITSELF under a copyleft licence (an SPDX expression
+    # naming GPL/AGPL/LGPL/EUPL/CeCILL/SSPL/OSL, or an FSF grant paragraph),
+    # which is why `ebpf`'s `_license = "GPL"` -- a BPF verifier ABI value, not
+    # a copyright notice -- does not trip it. Copyleft in shipped code is a
+    # defect to be removed, not a paperwork item.
+    step "check-copyleft" zig build check-copyleft
     step "check-uapi" zig build check-uapi
     step "check-changelog" zig build check-changelog
 
