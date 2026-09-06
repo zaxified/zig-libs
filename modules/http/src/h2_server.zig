@@ -1021,7 +1021,12 @@ const Session = struct {
             // surfaced. (Dropping, not resetting: it stays byte-compatible
             // with the previous behavior and cannot be used to kill a
             // stream the handler is already working on.)
-            if (job.trailers == null and !containsPseudoHeader(hd.headers)) {
+            //
+            // The same drop covers a trailer field that fails §8.2.1: the
+            // block is re-serialized into `Request.trailer`'s CRLF form
+            // exactly as the request headers are, so a CR/LF in a trailer
+            // value is the same injection primitive one stage later.
+            if (job.trailers == null and trailerBlockIsValid(hd.headers)) {
                 job.trailers = hd.headers; // ownership moves into the job
             } else hd.headers.deinit(s.gpa);
             if (hd.end_stream) job.complete = true;
@@ -1335,6 +1340,20 @@ const Session = struct {
         const arena = arena_state.allocator();
 
         // ── §8.3 pseudo-headers + §8.2 header validity ──────────────────
+        //
+        // Every field is held to §8.2.1 HERE, before anything below reads
+        // it, because of what happens below: the decoded fields are
+        // re-serialized into a CRLF block for `Request.header`/
+        // `iterateHeaders`, and `:path` becomes `req.path` for the handler
+        // and for whatever the handler forwards it to. A value with a CR/LF
+        // in it would come out of that block as a header the peer never
+        // legally sent; a `:path` with one would come out of a reverse
+        // proxy's request line as a SECOND request (measured end to end
+        // through `proxy.ProxyHandler`, 2026-09-04). HPACK frames each
+        // field by length, so nothing on the h2 wire stops those bytes —
+        // the check is the whole defence, and it is the same predicate set
+        // the h1 parser applies to its own wire (`h1.isToken`,
+        // `h1.isValidFieldValue`, `h1.isValidRequestTarget`, `h1.isValidHost`).
         var method_tok: ?[]const u8 = null;
         var path_full: ?[]const u8 = null;
         var scheme: ?[]const u8 = null;
@@ -1371,16 +1390,28 @@ const Session = struct {
                 put.* = f.value;
             } else {
                 pseudo_done = true;
-                // §8.2.1: field names must be lowercase.
-                for (f.name) |c| {
-                    if (c >= 'A' and c <= 'Z') malformed = true;
-                }
+                // §8.2.1: a regular field name is a lowercase token, its
+                // value carries no CR/LF/NUL/control byte and does not
+                // start or end with whitespace.
+                if (!regularFieldIsValid(f)) malformed = true;
                 // §8.2.2: connection-specific headers are malformed;
                 // `te` is allowed only as exactly "trailers".
                 if (isConnectionSpecific(f.name)) malformed = true;
-                if (std.ascii.eqlIgnoreCase(f.name, "te") and
+                if (std.mem.eql(u8, f.name, "te") and
                     !std.mem.eql(u8, f.value, "trailers")) malformed = true;
-                if (std.ascii.eqlIgnoreCase(f.name, "content-length")) {
+                // §8.3.1: `host` beside `:authority` must name the same
+                // thing; alone, it plays `:authority`'s part (it is what an
+                // h1→h2 intermediary forwards). Either way it is checked as
+                // a Host (h1 answers a bad one 400) and written into the
+                // synthesized block exactly once, from `authority`.
+                if (std.mem.eql(u8, f.name, "host")) {
+                    if (!h1.isValidHost(f.value)) {
+                        malformed = true;
+                    } else if (authority) |a| {
+                        if (!std.ascii.eqlIgnoreCase(a, f.value)) malformed = true;
+                    } else authority = f.value;
+                }
+                if (std.mem.eql(u8, f.name, "content-length")) {
                     // Strict 1*DIGIT, matching the h1 parser: `parseInt`
                     // would accept `+5` and `1_0`, and §8.1.1 makes a
                     // duplicate with a different value malformed too.
@@ -1394,6 +1425,23 @@ const Session = struct {
             }
         }
         if (method_tok == null) malformed = true;
+        // The pseudo-header VALUES, to the rule the h1 request line applies
+        // to the same things: the method is a token, the target is a URI
+        // (ASCII, no whitespace, no control byte), the authority is a Host.
+        // `:scheme` is checked as a token — a superset of RFC 3986's scheme
+        // grammar that still excludes every byte that could split a line.
+        if (method_tok) |m| if (!h1.isToken(m)) {
+            malformed = true;
+        };
+        if (path_full) |p| if (!h1.isValidRequestTarget(p)) {
+            malformed = true;
+        };
+        if (scheme) |sc| if (!h1.isToken(sc)) {
+            malformed = true;
+        };
+        if (authority) |a| if (!h1.isValidHost(a)) {
+            malformed = true;
+        };
         // §8.1.1: a malformed request is a STREAM ERROR of type
         // PROTOCOL_ERROR -- RST_STREAM, not a 400. This used to answer 400
         // with a body, which a client reads as a response to a request it
@@ -1414,24 +1462,47 @@ const Session = struct {
         }
 
         // `:path` is origin-form or "*" (§8.3.1); anything else is malformed.
+        // "*" belongs to OPTIONS alone (RFC 9112 §3.2.4 — h1 parity).
         const target = path_full.?;
         if (target[0] != '/' and !std.mem.eql(u8, target, "*"))
             return s.protocolError(id);
+        if (std.mem.eql(u8, target, "*") and method != .options)
+            return s.respondError(id, 400);
         var path: []const u8 = target;
         var query: []const u8 = "";
         if (std.mem.indexOfScalar(u8, target, '?')) |i| {
             path = target[0..i];
             query = target[i + 1 ..];
         }
+        // The h1 path guard and normalization, verbatim (`Server.
+        // checkOriginPath` / `normalizePathInto`): 414 over the length
+        // cap, 400 on NUL/`%00`, and `.`/`..` segments collapsed so a `..`
+        // cannot walk a route prefix. The h1 loop does this on its serving
+        // frame; here the copy is one arena allocation, taken only when a
+        // dot-segment is actually present.
+        if (path[0] == '/') {
+            Server.checkOriginPath(path) catch |err| return s.respondError(id, switch (err) {
+                error.PathTooLong => 414,
+                error.PathForbidden => 400,
+            });
+            if (Server.pathHasDotSegments(path)) {
+                const norm_buf = arena.alloc(u8, path.len) catch return .close;
+                path = Server.normalizePathInto(norm_buf, path);
+            }
+        }
 
         // ── synthesize the h1-shaped request the handler expects ────────
         // `Request.header`/`iterateHeaders` read a raw header block, so one
         // is rebuilt from the decoded fields (:authority becomes `host`,
-        // matching its §8.3.1 role as the h1 Host).
+        // matching its §8.3.1 role as the h1 Host; a `host` field the peer
+        // sent has already been folded into `authority` above, so it is not
+        // written a second time). Every name and value here passed
+        // `regularFieldIsValid`, which is what makes a `print` of them into
+        // CRLF framing sound.
         var block: Writer.Allocating = .init(arena);
         if (authority) |a| block.writer.print("host: {s}\r\n", .{a}) catch return .close;
         for (req_headers.fields) |f| {
-            if (f.name[0] == ':') continue;
+            if (f.name[0] == ':' or std.mem.eql(u8, f.name, "host")) continue;
             block.writer.print("{s}: {s}\r\n", .{ f.name, f.value }) catch return .close;
         }
         const head: h1.RequestHead = .{
@@ -2240,13 +2311,33 @@ const StreamBody = struct {
     }
 };
 
-/// Whether a decoded field block contains any pseudo-header field — never
-/// legal in a trailer section (RFC 9113 §8.1).
-fn containsPseudoHeader(list: hpack.HeaderList) bool {
-    for (list.fields) |f| {
-        if (f.name.len != 0 and f.name[0] == ':') return true;
+/// RFC 9113 §8.2.1 for one regular (non-pseudo) field: the name is a
+/// lowercase token — no byte in 0x00–0x20, 0x41–0x5A or 0x7F–0xFF, and no
+/// `:` — and the value carries no NUL, LF or CR (nor any other control
+/// byte; `h1.isValidFieldValue` is the h1 wire rule and is applied
+/// unchanged) and neither starts nor ends with SP/HTAB. A field failing
+/// this makes the request malformed (§8.1.1).
+fn regularFieldIsValid(f: hpack.Field) bool {
+    if (!h1.isToken(f.name)) return false;
+    for (f.name) |c| if (c >= 'A' and c <= 'Z') return false;
+    if (!h1.isValidFieldValue(f.value)) return false;
+    if (f.value.len != 0) {
+        const first = f.value[0];
+        const last = f.value[f.value.len - 1];
+        if (first == ' ' or first == '\t' or last == ' ' or last == '\t') return false;
     }
-    return false;
+    return true;
+}
+
+/// Whether a decoded trailer block may be surfaced: no pseudo-header field
+/// (never legal in a trailer section, RFC 9113 §8.1) and every field
+/// §8.2.1-valid. A block is admitted whole or dropped whole.
+fn trailerBlockIsValid(list: hpack.HeaderList) bool {
+    for (list.fields) |f| {
+        if (f.name.len != 0 and f.name[0] == ':') return false;
+        if (!regularFieldIsValid(f)) return false;
+    }
+    return true;
 }
 
 /// Connection-specific headers that must not cross the h1↔h2 boundary
@@ -2351,6 +2442,16 @@ fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
         var n: usize = 0;
         while (it.next()) |_| n += 1;
         try w.print(" count={d}", .{n});
+        try rw.writeAll(w.buffered());
+    } else if (std.mem.eql(u8, req.path, "/headers")) {
+        // Every header the handler can see, in wire order, plus the routed
+        // path and query — what the §8.2.1 tests read to prove that no
+        // field reached the handler that the peer did not legally send.
+        var buf: [1024]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        try w.print("path={s} query={s}", .{ req.path, req.query });
+        var it = req.iterateHeaders();
+        while (it.next()) |e| try w.print(" [{s}={s}]", .{ e.name, e.value });
         try rw.writeAll(w.buffered());
     } else if (std.mem.eql(u8, req.path, "/fail")) {
         try rw.writeAll("partial");
@@ -2831,6 +2932,198 @@ test "h2c serve: malformed requests → RST_STREAM(PROTOCOL_ERROR)/501, connecti
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
 
+/// The four pseudo-headers of a GET plus one regular field — the shape every
+/// §8.2.1 case below varies one byte of.
+fn fieldsWith(path: []const u8, authority: []const u8, name: []const u8, value: []const u8) [5]hpack.Field {
+    return .{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = name, .value = value },
+    };
+}
+
+test "h2c serve: RFC 9113 §8.2.1 — a CR/LF/NUL/control byte in a field, or a name that is not a lowercase token, is RST_STREAM(PROTOCOL_ERROR)" {
+    // HPACK frames each field by length, so every one of these arrives
+    // intact — and each used to be re-serialized into the handler's CRLF
+    // header block byte for byte, where `"v\r\nx-injected: PWNED"` became a
+    // real `x-injected` header and a CR in a NAME made the original field
+    // vanish (measured 2026-09-04, A1 F1). The §8.2.1 rule is now enforced
+    // before anything is rebuilt, and the request is malformed (§8.1.1).
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+
+    const bad = [_][2][]const u8{
+        .{ "x-benign", "v\r\nx-injected: PWNED" }, // CRLF in a value
+        .{ "x-benign", "v\nx-injected: PWNED" }, // bare LF in a value
+        .{ "x-benign", "v\rx" }, // bare CR in a value
+        .{ "x-benign", "v\x00x" }, // NUL in a value
+        .{ "x-benign", "v\x7fx" }, // DEL in a value
+        .{ "x-benign", " v" }, // leading SP
+        .{ "x-benign", "v\t" }, // trailing HTAB
+        .{ "a\r\nx-injected2", "PWNED2" }, // CRLF in a name
+        .{ "x benign", "v" }, // SP in a name
+        .{ "x:benign", "v" }, // ':' in a name
+        .{ "X-Benign", "v" }, // uppercase (was the only check, and unguarded)
+        .{ "x-b\x80", "v" }, // non-ASCII in a name
+    };
+    var sids: [bad.len]u31 = undefined;
+    for (bad, 0..) |case, i| {
+        sids[i] = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", case[0], case[1]), true);
+    }
+    // The legal shapes right at the edge of the rule still serve: an
+    // interior tab, obs-text, an empty value, and every tchar in a name.
+    const sid_ok = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "x-ok!#$%&'*+.^_`|~", "a\tb \xc3\xa9"), true);
+    const sid_empty = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "x-empty", ""), true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    for (sids, 0..) |sid, i| {
+        testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid).rst) catch |err| {
+            std.debug.print("case {d} ({s}={s}) was not reset\n", .{ i, bad[i][0], bad[i][1] });
+            return err;
+        };
+        try testing.expectEqual(@as(u16, 0), peer.resp(sid).status);
+    }
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_ok).status);
+    try testing.expectEqualStrings("path=/headers query= [host=t] [x-ok!#$%&'*+.^_`|~=a\tb \xc3\xa9]", peer.resp(sid_ok).body.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_empty).status);
+    try testing.expectEqualStrings("path=/headers query= [host=t] [x-empty=]", peer.resp(sid_empty).body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2c serve: pseudo-header values are held to the h1 request-line rules — :path/:authority/:method/:scheme with CR/LF/SP/NUL → RST_STREAM(PROTOCOL_ERROR)" {
+    // `:path` used to be checked for `target[0] == '/'` and nothing else, so
+    // `"/a\r\nX: y\r\n\r\nGET /admin HTTP/1.1\r\nHost: internal\r\n\r\n"`
+    // reached the handler as `req.path` byte for byte — and through
+    // `proxy.ProxyHandler`'s request line, the backend as a SECOND request
+    // (A1 G1, CRITICAL). The same target on the h1 request line has always
+    // been `MalformedHead`; the two paths now share the predicate.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+
+    const smuggle = "/a\r\nX-Path-Injected: yes\r\nContent-Length: 0\r\n\r\nGET /admin HTTP/1.1\r\nHost: internal\r\n\r\n";
+    const sid_path_crlf = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", smuggle), true);
+    const sid_path_lf = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/a\nx"), true);
+    const sid_path_sp = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/a HTTP/1.1"), true);
+    const sid_path_nul = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/a\x00b"), true);
+    const sid_path_hi = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/caf\xc3\xa9"), true);
+    const sid_auth_crlf = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/headers" },
+        .{ .name = ":authority", .value = "front.example\r\nX-Authority-Injected: yes" },
+    }, true);
+    const sid_auth_sp = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/headers" },
+        .{ .name = ":authority", .value = "a b" },
+    }, true);
+    const sid_auth_empty = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/headers" },
+        .{ .name = ":authority", .value = "" },
+    }, true);
+    const sid_method = try peer.conn.startStream(&peer.wire, &fieldsFor("GE\r\nT", "/headers"), true);
+    const sid_scheme = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "ht tp" },
+        .{ .name = ":path", .value = "/headers" },
+        .{ .name = ":authority", .value = "t" },
+    }, true);
+    // Control: the innocent neighbour of every case above still serves.
+    const sid_ok = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/headers?q=1"), true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    for ([_]u31{ sid_path_crlf, sid_path_lf, sid_path_sp, sid_path_nul, sid_path_hi, sid_auth_crlf, sid_auth_sp, sid_auth_empty, sid_method, sid_scheme }) |sid| {
+        try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid).rst);
+        try testing.expectEqual(@as(u16, 0), peer.resp(sid).status);
+    }
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_ok).status);
+    try testing.expectEqualStrings("path=/headers query=q=1 [host=t]", peer.resp(sid_ok).body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2c serve: :path gets the h1 path guard — dot segments collapsed, %00 → 400, over the cap → 414, '*' outside OPTIONS → 400" {
+    // On h1 these four have been enforced in `serveOne` since the router
+    // existed; the h2 `:path` skipped all of them (A1 F13), so
+    // `/public/../admin` routed on `..` and `%00` reached the handler.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+
+    const sid_dotdot = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/public/../headers?a=1"), true);
+    const sid_dot = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/./headers"), true);
+    const sid_root_escape = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/../../headers"), true);
+    // Percent-encoding is NOT decoded: `%2e%2e` stays a literal segment and
+    // must NOT be walked as `..`.
+    const sid_pct = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/x/%2e%2e/headers"), true);
+    const sid_nul_pct = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/headers%00.txt"), true);
+    const sid_nul_pct_uc = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/headers%00"), true);
+    var long_path: [2 * 1024 + 1]u8 = undefined;
+    @memset(&long_path, 'a');
+    long_path[0] = '/';
+    const sid_long = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", &long_path), true);
+    const sid_star_get = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "*"), true);
+    const sid_star_options = try peer.conn.startStream(&peer.wire, &fieldsFor("OPTIONS", "*"), true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_dotdot).status);
+    try testing.expectEqualStrings("path=/headers query=a=1 [host=t]", peer.resp(sid_dotdot).body.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_dot).status);
+    try testing.expectEqualStrings("path=/headers query= [host=t]", peer.resp(sid_dot).body.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_root_escape).status); // clamped at root
+    try testing.expectEqual(@as(u16, 404), peer.resp(sid_pct).status); // `/x/%2e%2e/headers`, literally
+    try testing.expectEqual(@as(u16, 400), peer.resp(sid_nul_pct).status);
+    try testing.expectEqual(@as(u16, 400), peer.resp(sid_nul_pct_uc).status);
+    try testing.expectEqual(@as(u16, 414), peer.resp(sid_long).status);
+    try testing.expectEqual(@as(u16, 400), peer.resp(sid_star_get).status);
+    try testing.expectEqual(@as(u16, 404), peer.resp(sid_star_options).status); // reached the handler
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2c serve: a `host` field beside :authority must agree (§8.3.1), is written into the handler's block once, and stands in for a missing :authority" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+
+    const sid_agree = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "T.example", "host", "t.example"), true);
+    const sid_disagree = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t.example", "host", "other.example"), true);
+    const sid_bad_host = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t.example", "host", "a b"), true);
+    const sid_host_only = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/headers" },
+        .{ .name = "host", .value = "alone.example" },
+    }, true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_agree).status);
+    // One `host` line, spelled as `:authority` sent it — not two.
+    try testing.expectEqualStrings("path=/headers query= [host=T.example]", peer.resp(sid_agree).body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_disagree).rst);
+    try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid_bad_host).rst);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_host_only).status);
+    try testing.expectEqualStrings("path=/headers query= [host=alone.example]", peer.resp(sid_host_only).body.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
 test "h2c serve: garbage after the preface → GOAWAY (offline)" {
     const gpa = testing.allocator;
     var peer: TestPeer = .init(gpa, .{});
@@ -3188,6 +3481,37 @@ test "h2: a request trailer block with pseudo-headers is dropped, not surfaced" 
     try testing.expectEqualStrings("trailer=none count=0", c.body.items);
     // …and the stream still completed normally (END_STREAM was honored).
     try testing.expect(c.end);
+}
+
+test "h2: a request trailer block with a §8.2.1-invalid field is dropped whole, like one with a pseudo-header" {
+    // The trailer block is re-serialized into `Request.trailer`'s CRLF form
+    // exactly as the header block is, so a CR/LF in a trailer value is the
+    // same injection one stage later — and an uppercase or non-token name
+    // is malformed by the same section.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_crlf = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/reqtrailers"), false);
+    try peer.conn.sendData(&peer.wire, sid_crlf, "Wikipedia", false);
+    try peer.conn.sendHeaders(&peer.wire, sid_crlf, &.{
+        .{ .name = "x-checksum", .value = "deadbeef\r\nx-injected: yes" },
+    }, true);
+    const sid_name = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/reqtrailers"), false);
+    try peer.conn.sendData(&peer.wire, sid_name, "Wikipedia", false);
+    try peer.conn.sendHeaders(&peer.wire, sid_name, &.{
+        .{ .name = "X-Checksum", .value = "deadbeef" },
+    }, true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    for ([_]u31{ sid_crlf, sid_name }) |sid| {
+        const c = peer.resp(sid);
+        try testing.expectEqual(@as(u16, 200), c.status);
+        try testing.expectEqualStrings("trailer=none count=0", c.body.items);
+        try testing.expect(c.end);
+    }
 }
 
 // ── incremental request body (Options.stream_request) ───────────────────────

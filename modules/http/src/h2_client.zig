@@ -81,6 +81,7 @@
 
 const std = @import("std");
 const http = @import("root.zig");
+const h1 = @import("h1.zig");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
 const Allocator = std.mem.Allocator;
@@ -118,6 +119,15 @@ pub const Error = error{
     ConnectionClosed,
     /// The response is missing a valid `:status` pseudo-header (§8.3.2).
     MalformedResponse,
+    /// The request head cannot be sent as the fields it claims to be: a
+    /// `:path` that is not a request-target (whitespace, a control byte, a
+    /// byte >= 0x80), an `:authority` that is not a host, or a header whose
+    /// name is not a token or whose value carries a CR/LF/NUL (§8.2.1). A
+    /// peer MUST treat such a request as malformed, and a peer that instead
+    /// re-serializes it into HTTP/1.1 would forward the injected line —
+    /// so it is refused here, before anything is framed. Same rule as
+    /// `Client.Error.InvalidHeader` on the h1 side.
+    InvalidHeader,
     WriteFailed,
     OutOfMemory,
 };
@@ -390,6 +400,18 @@ pub const Session = struct {
     ) Error!u31 {
         if (s.broken) |e| return e;
         if (s.goaway != null) return error.GoawayReceived;
+
+        // §8.2.1 / §8.3.1 on the way OUT, to the same predicates the h1
+        // request line and `h2_server` apply on the way in — see
+        // `Error.InvalidHeader`. Checked before the arena exists, so a
+        // refused request allocates nothing.
+        if (!h1.isValidRequestTarget(path) or !h1.isToken(options.scheme)) return error.InvalidHeader;
+        if (options.authority) |a| {
+            if (a.len != 0 and !h1.isValidHost(a)) return error.InvalidHeader;
+        }
+        for (options.headers) |hd| {
+            if (!h1.isToken(hd.name) or !h1.isValidFieldValue(hd.value)) return error.InvalidHeader;
+        }
 
         var arena_state = std.heap.ArenaAllocator.init(s.gpa);
         defer arena_state.deinit();
@@ -967,6 +989,38 @@ fn serveStaged(in: *Reader, out: *const Writer, srv_out: []u8, opts: h2_server.O
     var srv_w: Writer = .fixed(srv_out);
     h2_server.serve(testing.allocator, opts, &srv_in, &srv_w);
     in.* = .fixed(srv_w.buffered());
+}
+
+test "h2 client: a :path, :authority or header that fails §8.2.1/§8.3.1 is InvalidHeader, and nothing is framed" {
+    // The outbound rule mirrors `h2_server`'s inbound one, so this client
+    // can never be the peer that sends what that server resets — and a
+    // proxy forwarding over h2 (`h2_upstream`) cannot relay a request line
+    // its h1 side would have refused.
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [16384]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const framed_before = out.buffered().len; // the preface + SETTINGS
+
+    try testing.expectError(error.InvalidHeader, s.request(.get, "/a\r\nx-injected: yes", .{ .authority = "t" }));
+    try testing.expectError(error.InvalidHeader, s.request(.get, "/a HTTP/1.1", .{ .authority = "t" }));
+    try testing.expectError(error.InvalidHeader, s.request(.get, "/a\x00", .{ .authority = "t" }));
+    try testing.expectError(error.InvalidHeader, s.request(.get, "", .{ .authority = "t" }));
+    try testing.expectError(error.InvalidHeader, s.request(.get, "/hello", .{ .authority = "t\r\nx: y" }));
+    try testing.expectError(error.InvalidHeader, s.request(.get, "/hello", .{ .authority = "t", .scheme = "ht tp" }));
+    try testing.expectError(error.InvalidHeader, s.request(.get, "/hello", .{
+        .authority = "t",
+        .headers = &.{.{ .name = "X-Custom", .value = "v\r\nx-injected: yes" }},
+    }));
+    try testing.expectError(error.InvalidHeader, s.openStream(.post, "/hello", .{
+        .authority = "t",
+        .headers = &.{.{ .name = "X Custom", .value = "v" }},
+    }));
+    try testing.expectEqual(framed_before, out.buffered().len);
+    // No stream id was spent on any of them: the next legal request is #1.
+    try testing.expectEqual(@as(u31, 1), try s.request(.get, "/hello", .{ .authority = "t" }));
 }
 
 test "h2 client: GET and POST round-trip against the h2c server engine (offline)" {

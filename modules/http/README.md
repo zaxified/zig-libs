@@ -265,7 +265,11 @@ Reader/Writer pair — that is what the offline tests (and the future
 
 The h2 serving loop (`Options.enable_h2c`, or `h2_server.serveStream` behind
 your own TLS) runs the *same* `Options.handler` as HTTP/1.1. Both directions
-stream, and both can be live on one stream at once.
+stream, and both can be live on one stream at once. What the handler sees is
+held to the same rules on both protocols: an h2 field is validated per RFC
+9113 §8.2.1 (a CR/LF/NUL in a value, or a name that is not a lowercase token,
+resets the stream), and `:path` passes the h1 path guard — dot-segments
+collapsed, NUL/`%00` → 400, over-long → 414 — before it becomes `req.path`.
 
 **Responses stream always — no opt-in, and no second code path.** The
 handler still writes an ordinary HTTP/1.1 response through `ResponseWriter`;

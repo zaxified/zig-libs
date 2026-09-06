@@ -250,7 +250,27 @@ pub const Error = error{
     /// one size class and this dial needs a different one. Checked before
     /// any allocation or I/O.
     BufferPoolSizeMismatch,
+    /// A `RequestOptions.headers` entry cannot be put on the wire as the
+    /// one field it claims to be: the name is not an RFC 9110 token, or the
+    /// value carries a CR, LF, NUL or other control byte. Written into a
+    /// `name: value\r\n` line such a value would become a second header (or
+    /// a second request) the caller never made — the header-injection
+    /// primitive — so it is refused here, before any dial. Same rule for
+    /// the URL's path/query: whitespace or a control byte there fails
+    /// `Url.parse` as `BadUrl`.
+    InvalidHeader,
 };
+
+/// The outbound half of the header-injection defence: every caller-supplied
+/// field is held to the rule the inbound h1 parser enforces on the wire
+/// (`h1.isToken` / `h1.isValidFieldValue`), so no request this client
+/// writes can contain a line it did not mean to. Called before a connection
+/// is acquired — a refused request costs no dial.
+fn validateHeaders(headers: []const http.Header) error{InvalidHeader}!void {
+    for (headers) |hd| {
+        if (!h1.isToken(hd.name) or !h1.isValidFieldValue(hd.value)) return error.InvalidHeader;
+    }
+}
 
 /// `io` must support the net + async vtable operations (e.g.
 /// `std.Io.Threaded`). The allocator is used for per-request connection
@@ -320,6 +340,7 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
     const deadline = c.totalDeadline();
 
     var url = try http.Url.parse(url_text);
+    try validateHeaders(options.headers);
     // Slices in `original_url` point into `url_text` (caller-owned, valid for
     // the whole call), so keeping this copy around stays valid even after
     // `url` itself gets reassigned to a redirect target below.
@@ -457,6 +478,7 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
 
     var url = try http.Url.parse(url_text);
     if (url.scheme != .http) return error.UnsupportedScheme;
+    try validateHeaders(options.headers);
     const original_url = url;
     var current_method = method;
     var current_body = options.body;
@@ -660,6 +682,7 @@ pub const Upload = struct {
 pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions, content_length: ?u64) Error!Upload {
     std.debug.assert(options.body == null);
     const url = try http.Url.parse(url_text);
+    try validateHeaders(options.headers);
     const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
 
     var reused = false;
@@ -711,6 +734,7 @@ pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const 
     std.debug.assert(options.body == null);
     const url = try http.Url.parse(url_text);
     if (url.scheme != .http) return error.UnsupportedScheme;
+    try validateHeaders(options.headers);
     const plan: BodyPlan = if (content_length) |n| .{ .content_length = n } else .chunked;
 
     var reused = false;
@@ -3399,6 +3423,49 @@ test "live: redirect follow (http → https)" {
 // away the duplication") — dial count would then jump on the https:// case,
 // and if the target happened to be a real host it would dial TLS
 // successfully instead of failing closed.
+test "request/requestPlain/requestStreaming/requestStreamingPlain: a header that cannot be one line, or a URL with a byte a URI cannot hold, is refused before any dial" {
+    // The outbound half of the header-injection defence (A1 G1): the
+    // proxy forwards `req.iterateHeaders()` and `req.path` into this
+    // client, so the client is the last place a CR/LF can be stopped
+    // before it becomes a second header — or a second request — on the
+    // backend's wire. Refused before `acquireConn`, so `dialCount` stays 0
+    // and TEST-NET-1 is never contacted.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    const url = "http://192.0.2.1/";
+
+    const bad_headers = [_][]const http.Header{
+        &.{.{ .name = "X-Benign", .value = "v\r\nX-Injected: yes" }},
+        &.{.{ .name = "X-Benign", .value = "v\nX-Injected: yes" }},
+        &.{.{ .name = "X-Benign", .value = "v\x00" }},
+        &.{.{ .name = "X-Benign", .value = "v\x7f" }},
+        &.{.{ .name = "X-Benign\r\nX-Injected", .value = "yes" }},
+        &.{.{ .name = "X Benign", .value = "v" }},
+        &.{.{ .name = "X:Benign", .value = "v" }},
+        &.{.{ .name = "", .value = "v" }},
+        &.{ .{ .name = "X-Fine", .value = "v" }, .{ .name = "X-Bad", .value = "\r" } },
+    };
+    for (bad_headers) |headers| {
+        try testing.expectError(error.InvalidHeader, client.request(.get, url, .{ .headers = headers }));
+        try testing.expectError(error.InvalidHeader, client.requestPlain(.get, url, .{ .headers = headers }));
+        try testing.expectError(error.InvalidHeader, client.requestStreaming(.put, url, .{ .headers = headers }, 0));
+        try testing.expectError(error.InvalidHeader, client.requestStreamingPlain(.put, url, .{ .headers = headers }, 0));
+    }
+    // The URL side of the same rule is `Url.parse`'s, and it runs first.
+    const bad_url = "http://192.0.2.1/a\r\nX-Path-Injected: yes\r\n\r\nGET /admin HTTP/1.1";
+    try testing.expectError(error.BadUrl, client.request(.get, bad_url, .{}));
+    try testing.expectError(error.BadUrl, client.requestPlain(.get, bad_url, .{}));
+    try testing.expectError(error.BadUrl, client.requestStreaming(.put, bad_url, .{}, 0));
+    try testing.expectError(error.BadUrl, client.requestStreamingPlain(.put, bad_url, .{}, 0));
+    try testing.expectError(error.BadUrl, client.request(.get, "http://192.0.2.1/a HTTP/1.1", .{}));
+    try testing.expectEqual(@as(usize, 0), client.dialCount());
+}
+
 test "requestPlain/requestStreamingPlain/putFilePlain: https:// is rejected before any dial" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

@@ -847,6 +847,41 @@ const max_unread_body_drain = 256 * 1024;
 /// above this saves work but not a byte of memory.
 const max_normalized_path = 2 * 1024;
 
+/// What the origin-form path guard turns away, and the status each maps to
+/// on both protocols: `PathTooLong` → 414, `PathForbidden` → 400.
+pub const PathGuardError = error{ PathTooLong, PathForbidden };
+
+/// The path guard the h1 request line has always had, as one predicate so
+/// the h2 `:path` is held to exactly the same thing (RFC 3986 §5.2.4 +
+/// path-truncation tricks): longer than `max_normalized_path` is 414, an
+/// embedded NUL or `%00` is 400. Origin-form only — the caller has already
+/// established `path[0] == '/'`. Normalization itself is `normalizePathInto`,
+/// and `pathHasDotSegments` says whether it has anything to do.
+pub fn checkOriginPath(path: []const u8) PathGuardError!void {
+    if (path.len > max_normalized_path) return error.PathTooLong;
+    if (std.mem.indexOfScalar(u8, path, 0) != null or
+        std.ascii.indexOfIgnoreCase(path, "%00") != null)
+        return error.PathForbidden;
+}
+
+/// Whether `removeDotSegments` would move a byte of `path`: every branch of
+/// it that does needs a "/." to fire, and a path without one comes back byte
+/// for byte at the same length — so a caller may skip the copy.
+pub fn pathHasDotSegments(path: []const u8) bool {
+    return std.mem.indexOf(u8, path, "/.") != null;
+}
+
+/// Copy `path` into `buf` (which must hold `path.len` bytes) and collapse
+/// its `.`/`..` segments there, so a `..` cannot walk a route prefix. The
+/// raw target is never touched; percent-encoding is NOT decoded, so `%2F`/
+/// `%2E` can never turn into a routing separator or a dot-segment;
+/// `removeDotSegments` clamps at root (a leading `..` is dropped, never
+/// escapes). Returns the normalized path, a prefix of `buf`.
+pub fn normalizePathInto(buf: []u8, path: []const u8) []const u8 {
+    @memcpy(buf[0..path.len], path);
+    return buf[0..http.removeDotSegments(buf[0..path.len])];
+}
+
 fn connMain(s: *Server, stream: net.Stream) void {
     defer stream.close(s.io);
     defer _ = s.active_conns.fetchSub(1, .monotonic); // paired with serve()
@@ -1585,17 +1620,18 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // routing separator or dot-segment. `removeDotSegments` clamps at root
     // (a leading `..` is dropped, never escapes). Origin-form only — the
     // asterisk-form target ("*") is left untouched.
+    // The guard and the normalization are `checkOriginPath` /
+    // `normalizePathInto`, shared with the h2 `:path` — one definition, so
+    // the two protocols cannot drift on what a handler may be routed on.
     var norm_buf: [max_normalized_path]u8 = undefined;
     if (path.len != 0 and path[0] == '/') {
-        if (path.len > norm_buf.len) return respondError(opts, out, date, 414);
-        if (std.mem.indexOfScalar(u8, path, 0) != null or
-            std.ascii.indexOfIgnoreCase(path, "%00") != null)
-            return respondError(opts, out, date, 400);
+        checkOriginPath(path) catch |err| return respondError(opts, out, date, switch (err) {
+            error.PathTooLong => 414,
+            error.PathForbidden => 400,
+        });
         // ⭐⭐ The copy exists so that normalization -- which rewrites in
         // place -- cannot touch the raw target. Where there is nothing to
-        // normalize there is nothing to protect: every branch of
-        // `removeDotSegments` that moves a byte needs a "/." to fire, and a
-        // path without one comes back byte for byte at the same length. So
+        // normalize there is nothing to protect (`pathHasDotSegments`), so
         // the copy is skipped, and `path` keeps pointing into the head buffer
         // it already pointed into.
         //
@@ -1606,10 +1642,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         // and a static-asset path like `/app.js` -- a dot, but not a dot
         // SEGMENT -- was paying it. `/foo/./bar` and `/foo/../bar` still take
         // the copy, which is the only case that ever needed it.
-        if (std.mem.indexOf(u8, path, "/.") != null) {
-            @memcpy(norm_buf[0..path.len], path);
-            path = norm_buf[0..http.removeDotSegments(norm_buf[0..path.len])];
-        }
+        if (pathHasDotSegments(path)) path = normalizePathInto(&norm_buf, path);
     }
 
     // Persistence: HTTP/1.1 defaults to keep-alive unless the client asked
@@ -1775,7 +1808,10 @@ pub const Request = struct {
     method: http.Method,
     /// Raw request-target as sent ("/path?q=1" or "*").
     target: []const u8,
-    /// Target up to the '?' (the whole target when there is none).
+    /// Target up to the '?' (the whole target when there is none), with
+    /// `.`/`..` segments collapsed (`checkOriginPath`/`normalizePathInto`)
+    /// — on h1 and h2 alike, so a `..` cannot walk a route prefix and a
+    /// NUL/`%00` never reaches a router. Percent-encoding is untouched.
     path: []const u8,
     /// Target after the '?', or "".
     query: []const u8,
@@ -3052,9 +3088,7 @@ pub const ResponseWriter = struct {
 /// only). Rejects the space/`:`/control bytes that would break the
 /// `name: value` framing.
 fn validHeaderName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |c| if (!h1.isTchar(c)) return false;
-    return true;
+    return h1.isToken(name);
 }
 
 /// A safe response header value: no CR, LF or NUL (RFC 9110 §5.5 — the

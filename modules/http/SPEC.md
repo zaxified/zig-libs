@@ -128,6 +128,25 @@ Hardened for direct internet exposure (no reverse proxy required):
 - **Request smuggling:** duplicate/disagreeing Content-Length → 400; Content-Length **and**
   Transfer-Encoding both present → 400 (no CL.TE); TE-without-chunked, duplicate Host, obs-fold, and
   **bare-LF** line endings (RFC 9112 §2.2) all rejected.
+- **The h2→h1 seam (RFC 9113 §8.2.1 / §8.3.1):** an h2 request reaches the handler as a
+  synthesized h1 head — the decoded fields re-serialized into a CRLF block, `:path` as
+  `req.path` — so a field carrying a CR/LF/NUL, or a `:path` with a space or control byte in it,
+  would come out of that block (and out of `proxy.ProxyHandler`'s request line to a backend) as
+  a header or a whole request the peer never legally sent. HPACK frames by length and stops none
+  of it. Every field is therefore held to §8.2.1 before anything is rebuilt — lowercase token
+  names, values with no CR/LF/NUL/control byte and no leading/trailing whitespace — and the
+  pseudo-header values to the h1 request-line rules (`h1.isToken` / `h1.isValidRequestTarget` /
+  `h1.isValidHost`, the SAME predicates the h1 parser applies); a `host` field must agree with
+  `:authority`. A violation is a malformed request: RST_STREAM(PROTOCOL_ERROR), no response
+  head. `:path` then gets the h1 path guard verbatim (`Server.checkOriginPath` /
+  `normalizePathInto`: 414 over the cap, 400 on NUL/`%00`, dot-segments collapsed so `..` cannot
+  walk a route prefix, `*` outside OPTIONS → 400). A trailer block failing §8.2.1 is dropped
+  whole, like one carrying a pseudo-header. **The outbound side has the same rule:** `Client`
+  refuses a header it cannot write as one line (`error.InvalidHeader`) and `Url.parse` a URL
+  with a byte a URI cannot hold (`BadUrl`), both before any dial; `h2_client` likewise
+  (`InvalidHeader`, nothing framed). Measured end to end before the fix (2026-09-04, A1 G1): an
+  unauthenticated h2c client's `:path` became a complete second HTTP/1.1 request on the
+  backend's wire, answered 200. `proxy.zig`'s "A1 G1" integration test stands on that wire.
 - **Resource/DoS:** slowloris read/request/write timeouts; size caps (413/431/414); per-connection
   request-count cap; inbound gzip is zip-bomb-capped (`max_decompressed_request_bytes` → 413).
 - **HTTP/2 DoS:** rapid-reset (CVE-2023-44487), CONTINUATION-flood (CVE-2024-27316),

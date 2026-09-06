@@ -5,6 +5,53 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — **An h2 request is held to RFC 9113 §8.2.1/§8.3.1 before
+  it is turned into the handler's h1-shaped head, and `:path` gets the h1
+  path guard.** The h2 serving loop rebuilds the decoded fields into a CRLF
+  header block for `Request.header`/`iterateHeaders` and hands `:path` to the
+  handler as `req.path`; the only field check on that path was "no uppercase
+  in a name", and `:path` was checked for a leading `/` and nothing else. So a
+  value of `"v\r\nx-injected: PWNED"` came out of the block as a real
+  `x-injected` header, and a `:path` of
+  `"/a\r\n…\r\n\r\nGET /admin HTTP/1.1\r\nHost: internal\r\n\r\n"` reached a
+  `proxy.ProxyHandler` and — the request line being built from `req.path` —
+  the backend's wire as a complete second request, answered 200 to an
+  unauthenticated h2c client (measured end to end, 2026-09-04). HPACK frames
+  every field by length, so nothing on the h2 wire stops those bytes.
+
+  Now, before anything is rebuilt: a regular field name must be a lowercase
+  token and its value free of CR/LF/NUL and every other control byte, with no
+  leading/trailing SP/HTAB; `:method`/`:scheme` are tokens, `:path` a
+  request-target (ASCII, no whitespace or control byte), `:authority` a
+  host — the SAME predicates the h1 parser applies to its own request line
+  (`h1.isToken`, `h1.isValidRequestTarget`, `h1.isValidHost`,
+  `h1.isValidFieldValue`, all newly `pub`); a `host` field must agree with
+  `:authority` (§8.3.1) and is written into the block once. A violation is a
+  malformed request: RST_STREAM(PROTOCOL_ERROR), as for the §8.3 violations
+  already handled. Then `:path` passes exactly the guard the h1 request line
+  has always passed — over `max_normalized_path` → 414, NUL/`%00` → 400,
+  `.`/`..` segments collapsed, `*` outside OPTIONS → 400 — through
+  `Server.checkOriginPath` / `pathHasDotSegments` / `normalizePathInto`,
+  which the h1 loop now calls too, so the two cannot drift. A request
+  trailer block with a §8.2.1-invalid field is dropped whole, as one with a
+  pseudo-header already was.
+
+  **The outbound side got the matching rule.** `Client.request` /
+  `requestPlain` / `requestStreaming` / `requestStreamingPlain` refuse a
+  header whose name is not a token or whose value carries a CR/LF/NUL/control
+  byte with the new **`Client.Error.InvalidHeader`**, before any dial;
+  `Url.parse` refuses a URL containing whitespace, a control byte or a byte
+  ≥ 0x80 (**`BadUrl`** — a redirect `Location` with one is now
+  `BadRedirect`); `h2_client.Session.request`/`openStream` refuse the same
+  shapes, plus a non-target `:path` and a non-host `:authority`, with the new
+  **`h2_client.Error.InvalidHeader`**, framing nothing. Both error sets
+  gained one member; every in-tree consumer switches with `else`.
+
+  Regression: `h2_server.zig` (§8.2.1 fields, pseudo-header values, the
+  path guard, `host` vs `:authority`, trailers), `Client.zig`, `h2_client.zig`,
+  `root.zig` (`Url.parse`), and `proxy.zig`'s "A1 G1" test, which drives a raw
+  `h2.Connection` through an `enable_h2c` proxy and reads the backend's wire.
+
 - **2026-08-28** — **An h2 connection no longer grows by a stream table entry
   per request served.** `Connection.streams` kept every stream ever created,
   because presence in the table was how a *closed* stream was told apart from

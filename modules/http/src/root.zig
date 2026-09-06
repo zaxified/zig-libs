@@ -207,8 +207,14 @@ pub const Url = struct {
     pub const ParseError = error{ UnsupportedScheme, BadUrl };
 
     /// Parse `http[s]://host[:port][/path][?query][#fragment]`. The fragment
-    /// is discarded; userinfo (`user@host`) is rejected.
+    /// is discarded; userinfo (`user@host`) is rejected. So is any byte a
+    /// URI cannot contain (RFC 3986 §2: whitespace, a control byte, a byte
+    /// >= 0x80) — `BadUrl`. A URL is what a client writes into a request
+    /// line, and one with a space or a CR/LF in it would be written as a
+    /// second request; a caller that has such a string has unencoded input,
+    /// not a URL.
     pub fn parse(text: []const u8) ParseError!Url {
+        for (text) |c| if (c <= ' ' or c >= 0x7f) return error.BadUrl;
         var scheme: Scheme = undefined;
         var rest: []const u8 = undefined;
         if (std.ascii.startsWithIgnoreCase(text, "http://")) {
@@ -544,6 +550,23 @@ test "Url.parse: rejects malformed input" {
     try testing.expectError(error.BadUrl, Url.parse("http://[not-v6]/"));
     try testing.expectError(error.BadUrl, Url.parse("http://[::1]8080/"));
     try testing.expectError(error.BadUrl, Url.parse("http://2001:db8::1/")); // v6 needs brackets
+}
+
+test "Url.parse: whitespace, control bytes and non-ASCII are not URL bytes (RFC 3986 §2)" {
+    // Each of these would be written into a request line verbatim; the
+    // first two would end that line and start another.
+    try testing.expectError(error.BadUrl, Url.parse("http://h/a\r\nX: y\r\n\r\nGET /admin HTTP/1.1"));
+    try testing.expectError(error.BadUrl, Url.parse("http://h/a\nb"));
+    try testing.expectError(error.BadUrl, Url.parse("http://h/a HTTP/1.1"));
+    try testing.expectError(error.BadUrl, Url.parse("http://h/a?q=x y"));
+    try testing.expectError(error.BadUrl, Url.parse("http://h/a\x00b"));
+    try testing.expectError(error.BadUrl, Url.parse("http://h\r\nX: y/"));
+    try testing.expectError(error.BadUrl, Url.parse("http://h/caf\xc3\xa9"));
+    try testing.expectError(error.BadUrl, Url.parse("http://h/a\x7f"));
+    // Percent-encoded, the same characters are fine — and untouched.
+    const u = try Url.parse("http://h/a%20b?q=x%0d%0ay");
+    try testing.expectEqualStrings("/a%20b", u.path);
+    try testing.expectEqualStrings("q=x%0d%0ay", u.query);
 }
 
 test "Url host header form" {

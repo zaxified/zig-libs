@@ -101,6 +101,7 @@
 const std = @import("std");
 const http = @import("root.zig");
 const h1 = @import("h1.zig");
+const h2 = @import("h2.zig");
 const Server = @import("Server.zig");
 const Client = @import("Client.zig");
 const h2_upstream = @import("h2_upstream.zig");
@@ -1224,6 +1225,210 @@ test "integration: an h2 backend header set the proxy cannot relay answers 502, 
     try testing.expectEqual(@as(?usize, 100), fits.fat_first);
     try testing.expectEqual(@as(?usize, 100), fits.fat_last);
     try testing.expectEqualStrings("ok", fits.body());
+}
+
+// ── integration: the h2c → h1 request-smuggling seam (A1 G1) ────────────────
+
+/// A backend that is not an `http.Server` on purpose: it records the raw
+/// bytes the proxy puts on its wire — the only place the smuggled second
+/// request could be observed — and answers 200 to whatever it got. One
+/// accept per entry in `expected`, so the thread can never be left parked
+/// in `accept` for a connection the proxy was right not to make.
+const RawBackend = struct {
+    io: std.Io,
+    listener: *net.Server,
+    /// Everything received, across all accepted connections, in order.
+    buf: [8192]u8 = undefined,
+    len: usize = 0,
+    accepts: usize,
+
+    fn run(b: *RawBackend) void {
+        for (0..b.accepts) |_| {
+            const s = b.listener.accept(b.io) catch return;
+            defer s.close(b.io);
+            var rbuf: [8192]u8 = undefined;
+            var wbuf: [256]u8 = undefined;
+            var sr = s.reader(b.io, &rbuf);
+            var sw = s.writer(b.io, &wbuf);
+            const start = b.len;
+            while (b.len < b.buf.len) {
+                const avail = sr.interface.peekGreedy(1) catch break;
+                const take = @min(avail.len, b.buf.len - b.len);
+                @memcpy(b.buf[b.len..][0..take], avail[0..take]);
+                b.len += take;
+                sr.interface.toss(take);
+                if (std.mem.indexOf(u8, b.buf[start..b.len], "\r\n\r\n") != null) break;
+            }
+            sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") catch {};
+            sw.interface.flush() catch {};
+        }
+    }
+};
+
+/// The attacker's side: a bare `h2.Connection` driven over a socket, so the
+/// request head can carry bytes `Client.connectH2c` now refuses to frame.
+const RawH2Peer = struct {
+    gpa: std.mem.Allocator,
+    conn: h2.Connection,
+    wire: std.ArrayList(u8) = .empty,
+    events: std.ArrayList(h2.Event) = .empty,
+    /// Per stream: the reset code, or the `:status`, whichever arrived.
+    rst: std.AutoArrayHashMapUnmanaged(u31, h2.ErrorCode) = .empty,
+    status: std.AutoArrayHashMapUnmanaged(u31, u16) = .empty,
+    ended: std.AutoArrayHashMapUnmanaged(u31, void) = .empty,
+
+    fn deinit(p: *RawH2Peer) void {
+        p.ended.deinit(p.gpa);
+        p.status.deinit(p.gpa);
+        p.rst.deinit(p.gpa);
+        p.events.deinit(p.gpa);
+        p.wire.deinit(p.gpa);
+        p.conn.deinit();
+    }
+
+    fn flush(p: *RawH2Peer, w: *std.Io.Writer) !void {
+        if (p.wire.items.len == 0) return;
+        try w.writeAll(p.wire.items);
+        try w.flush();
+        p.wire.clearRetainingCapacity();
+    }
+
+    fn pump(p: *RawH2Peer, r: *std.Io.Reader) !void {
+        _ = try r.peekGreedy(1);
+        const bytes = r.buffered();
+        try p.conn.recv(bytes, &p.wire, &p.events);
+        r.toss(bytes.len);
+        for (p.events.items) |*ev| {
+            switch (ev.*) {
+                .headers => |*hd| {
+                    for (hd.headers.fields) |f| {
+                        if (std.mem.eql(u8, f.name, ":status"))
+                            try p.status.put(p.gpa, hd.stream_id, std.fmt.parseInt(u16, f.value, 10) catch 0);
+                    }
+                    if (hd.end_stream) try p.ended.put(p.gpa, hd.stream_id, {});
+                },
+                .data => |d| if (d.end_stream) try p.ended.put(p.gpa, d.stream_id, {}),
+                .stream_reset => |rs| {
+                    try p.rst.put(p.gpa, rs.stream_id, rs.code);
+                    try p.ended.put(p.gpa, rs.stream_id, {});
+                },
+                else => {},
+            }
+            ev.deinit(p.gpa);
+        }
+        p.events.clearRetainingCapacity();
+    }
+};
+
+test "integration: an h2c :path/:authority carrying CR/LF or SP never becomes a second request on the h1 backend's wire (A1 G1)" {
+    // Measured 2026-09-04 (`A1/repro/http/client/probe3.zig`): with
+    // `enable_h2c`, a `:path` of
+    // `/a\r\nX-Path-Injected: yes\r\nContent-Length: 0\r\n\r\nGET /admin HTTP/1.1\r\nHost: internal\r\n\r\n`
+    // reached the backend as exactly that — a complete second request —
+    // and the unauthenticated h2c client got 200 for it. Three guards were
+    // missing (h2 §8.2.1 field validity, the h2 `:path` guard, and the
+    // client's own line discipline); this test stands on the composition,
+    // at the one place the attack is observable: the backend's wire.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("raw backend listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    // Exactly ONE backend connection is expected: the control request. If a
+    // malformed request were forwarded the count would be higher — and the
+    // extra bytes would be in `backend.buf` — so the backend accepts once
+    // and the assertions below read what that one connection carried.
+    var backend: RawBackend = .{ .io = io, .listener = &listener, .accepts = 1 };
+    const backend_port = listener.socket.address.getPort();
+    const bt = try std.Thread.spawn(.{}, RawBackend.run, .{&backend});
+
+    var proxy_client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
+    defer proxy_client.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .backend = .{ .host = "127.0.0.1", .port = backend_port },
+    });
+    var proxy = Server.init(io, gpa, .{
+        .handler = ProxyHandler.handler,
+        .context = &ph,
+        .enable_h2c = true,
+    });
+    defer proxy.deinit();
+    proxy.bind() catch |err| {
+        std.debug.print("proxy bind failed ({s}), skipping\n", .{@errorName(err)});
+        bt.join();
+        return error.SkipZigTest;
+    };
+    const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
+    defer pt.join();
+    defer proxy.shutdown();
+
+    const stream = proxy.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        bt.join();
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [8192]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+
+    var peer: RawH2Peer = .{ .gpa = gpa, .conn = .init(gpa, .client, .{}) };
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const smuggle = "/a\r\nX-Path-Injected: yes\r\nContent-Length: 0\r\n\r\nGET /admin HTTP/1.1\r\nHost: internal\r\n\r\n";
+    const attacks = [_][2][]const u8{
+        .{ smuggle, "front.example" }, // A: CRLF in :path — the full second request
+        .{ "/front", "front.example\r\nX-Authority-Injected: yes" }, // B: CRLF in :authority
+        .{ "/a HTTP/1.1", "front.example" }, // C: SP in :path — request-line confusion
+    };
+    var attack_sids: [attacks.len]u31 = undefined;
+    for (attacks, 0..) |a, i| {
+        attack_sids[i] = try peer.conn.startStream(&peer.wire, &.{
+            .{ .name = ":method", .value = "GET" },
+            .{ .name = ":scheme", .value = "http" },
+            .{ .name = ":path", .value = a[0] },
+            .{ .name = ":authority", .value = a[1] },
+        }, true);
+    }
+    // Control: the benign neighbour, forwarded and answered normally.
+    const sid_control = try peer.conn.startStream(&peer.wire, &.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/front" },
+        .{ .name = ":authority", .value = "front.example" },
+    }, true);
+    try peer.flush(&sw.interface);
+
+    var all_ended = false;
+    while (!all_ended) {
+        try peer.pump(&sr.interface);
+        try peer.flush(&sw.interface); // SETTINGS ACKs, window updates
+        all_ended = peer.ended.contains(sid_control);
+        for (attack_sids) |sid| all_ended = all_ended and peer.ended.contains(sid);
+    }
+    bt.join();
+
+    for (attack_sids) |sid| {
+        try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.rst.get(sid));
+        try testing.expectEqual(@as(?u16, null), peer.status.get(sid));
+    }
+    try testing.expectEqual(@as(?u16, 200), peer.status.get(sid_control));
+
+    const seen = backend.buf[0..backend.len];
+    try testing.expect(std.mem.startsWith(u8, seen, "GET /front HTTP/1.1\r\n"));
+    // One request line on the backend's wire, and none of the injected bytes.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, seen, "HTTP/1.1\r\n"));
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, seen, "GET /admin"));
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, seen, "X-Path-Injected"));
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, seen, "X-Authority-Injected"));
 }
 
 test "integration: h2c backend unreachable → 502 Bad Gateway" {

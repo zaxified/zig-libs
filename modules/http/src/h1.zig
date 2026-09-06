@@ -158,6 +158,42 @@ const value_char_table: [256]bool = blk: {
     break :blk t;
 };
 
+/// A non-empty RFC 9110 §5.6.2 token: what a method name, a field name and
+/// a transfer-coding are made of. The one definition every path that admits
+/// a name — inbound h1 (`parseHeaderLine`), inbound h2 (`h2_server`, on top
+/// of its own lowercase rule), outbound `Client` and `ResponseWriter` — is
+/// held to, so a name one side accepts is a name the other side would
+/// have produced.
+pub fn isToken(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| if (!tchar_table[c]) return false;
+    return true;
+}
+
+/// RFC 9110 §5.5 field-value bytes only: VCHAR / obs-text / SP / HTAB. A
+/// CR, LF, NUL — the header-injection bytes — or any other control byte
+/// fails it. This is the SAME predicate the inbound h1 parser applies, so a
+/// value that reaches a handler over h2 (where the field arrives HPACK-
+/// framed and is re-serialized into a CRLF block) or leaves through the
+/// client (where it is written into one) is held to what h1 would have
+/// accepted on the wire.
+pub fn isValidFieldValue(value: []const u8) bool {
+    for (value) |c| if (!value_char_table[c]) return false;
+    return true;
+}
+
+/// The bytes a request-target may consist of: a URI reference is ASCII (RFC
+/// 3986 §2) and contains no whitespace or control byte, so a `:path` or a
+/// request-line target with a space, a CR/LF or a NUL in it is not a target
+/// at all — it is the classic vehicle for splitting the request line into a
+/// second request. Shared by the h1 request line, the h2 `:path` and the
+/// outbound client, for the same reason `isToken` is.
+pub fn isValidRequestTarget(target: []const u8) bool {
+    if (target.len == 0) return false;
+    for (target) |c| if (c <= ' ' or c >= 0x7f) return false;
+    return true;
+}
+
 /// Strict header-line split (no obs-fold, no whitespace around the name);
 /// the value is trimmed of optional whitespace. `line` must be non-empty and
 /// already stripped of its line ending.
@@ -175,7 +211,7 @@ fn parseHeaderLine(line: []const u8) HeadParseError!HeaderEntry {
     if (i == 0 or i >= line.len or line[i] != ':') return error.MalformedHead;
     const name = line[0..i];
     const value = std.mem.trim(u8, line[i + 1 ..], " \t");
-    for (value) |c| if (!value_char_table[c]) return error.MalformedHead;
+    if (!isValidFieldValue(value)) return error.MalformedHead;
     return .{ .name = name, .value = value };
 }
 
@@ -428,14 +464,12 @@ pub const RequestHead = struct {
         const target = request_line[sp1 + 1 .. sp2];
         const version = request_line[sp2 + 1 ..];
 
-        if (method.len == 0) return error.MalformedHead;
-        for (method) |c| if (!isTchar(c)) return error.MalformedHead;
-        if (target.len == 0) return error.MalformedHead;
+        if (!isToken(method)) return error.MalformedHead;
         // A request-target is a URI reference, and a URI is ASCII (RFC 3986
         // §2): a raw byte >= 0x80 in it is a client that did not
         // percent-encode, and routing on it would route on the bytes of
         // whichever encoding it happened to use.
-        for (target) |c| if (c <= ' ' or c >= 0x7f) return error.MalformedHead;
+        if (!isValidRequestTarget(target)) return error.MalformedHead;
         if (version.len != 8 or !std.mem.startsWith(u8, version, "HTTP/"))
             return error.MalformedHead;
         if (version[5] != '1' or version[6] != '.') return error.UnsupportedVersion;
