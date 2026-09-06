@@ -357,14 +357,17 @@ test "encode: TooLong rejected" {
 // charset/checksum math this file's own doc calls out as the real target.
 
 test "fuzz: decode never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzDecode, .{});
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = &.{
+        "a12uel5l",
+        "an83characterlonghumanreadablepartthatcontainsthenumber1andtheexcludedcharactersbio1tt5tgs",
+        "split1checkupstagehandshakeupstreamerranterredcaperred2y9e3w",
+    } });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     const alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l1"; // charset + separator
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const len = smith.slice(&buf); // not `bytes` + a ranged length: that always yields 0
     for (buf[0..len]) |*c| {
         if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
     }

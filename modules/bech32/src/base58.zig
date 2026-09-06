@@ -13,6 +13,21 @@
 //! WIF: 33-34; xprv/xpub: 78) with headroom, while still rejecting a
 //! pathologically long untrusted `decode` input up front rather than
 //! walking it through the O(n^2) carry loop.
+//!
+//! **Secrets pass through here** — WIF and `xprv` are Base58Check payloads,
+//! and `bip32` is an in-tree caller that wipes its own copy. So every
+//! scratch buffer that holds the payload or its base-58 digits (`encode`'s
+//! `b58`, `decode`'s `b256`, the `checkEncode`/`checkDecode` staging
+//! buffers) is a CONVENTIONS.md §2.1 Z1 site and is wiped on every exit —
+//! measured 2026-09-06: without the wipes, one literal copy of a 32-byte
+//! secret after `checkEncode` and two after `checkDecode` survived on the
+//! dead stack in ReleaseFast even though the caller had zeroed its own
+//! buffer. **Not constant-time**: `alphabet[d]` is indexed by the base-58
+//! digits of the payload and the carry loops run a value-dependent number
+//! of iterations (ctgrind: 13 contexts on `checkEncode`, 3 on
+//! `checkDecode`). Key material that must not leak through timing should
+//! not be base58-encoded on a shared host; the wallet-address path this
+//! module exists for is public data.
 
 const std = @import("std");
 const ripemd160 = @import("ripemd160");
@@ -60,6 +75,9 @@ pub fn encode(data: []const u8, out: []u8) Error![]const u8 {
     while (zeros < data.len and data[zeros] == 0) zeros += 1;
 
     var b58: [max_encoded_len]u8 = undefined;
+    // Z1: the base-58 digits of a WIF/xprv payload are the secret in
+    // another radix. Registered before the fill so every exit path wipes.
+    defer std.crypto.secureZero(u8, &b58);
     @memset(&b58, 0);
     var length: usize = 0;
 
@@ -97,6 +115,7 @@ pub fn decode(s: []const u8, out: []u8) Error![]const u8 {
     while (zeros < s.len and s[zeros] == '1') zeros += 1;
 
     var b256: [max_encoded_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &b256); // Z1, see the module doc
     const size = s.len;
     @memset(b256[0..size], 0);
     var length: usize = 0;
@@ -148,9 +167,14 @@ pub const CheckError = Error || error{
 /// Base58Check envelope (version-byte-prefixed payloads: P2PKH/P2SH/WIF/
 /// xprv/xpub all use this).
 pub fn checkEncode(payload: []const u8, out: []u8) Error![]const u8 {
-    if (payload.len > max_payload_len) return error.PayloadTooLarge;
+    // The bound is on the ENVELOPE (`payload ++ checksum`), which is what
+    // `encode` sees: a payload in `(max_payload_len - 4, max_payload_len]`
+    // used to pass this check and then fail `encode`'s with the same error
+    // name — the same verdict, reached one copy of the payload later.
+    if (payload.len + checksum_len > max_payload_len) return error.PayloadTooLarge;
 
     var buf: [max_payload_len + checksum_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf); // Z1: a literal copy of the payload
     @memcpy(buf[0..payload.len], payload);
     var h: [32]u8 = undefined;
     sha256d(payload, &h);
@@ -163,7 +187,13 @@ pub fn checkEncode(payload: []const u8, out: []u8) Error![]const u8 {
 /// (checksum stripped). Fail-closed: a bad checksum is `error.ChecksumMismatch`,
 /// never a silently-truncated/garbage payload.
 pub fn checkDecode(s: []const u8, out: []u8) CheckError![]const u8 {
+    // `decode` can produce up to `max_encoded_len` bytes (a string of 180
+    // '1's decodes to 180 zero bytes), which is more than this buffer
+    // holds; `decode`'s own `BufferTooSmall` guard is what keeps that
+    // from being a write past the end of `buf` — see the test that pins
+    // it, and the ReleaseFast measurement in `../SPEC.md`.
     var buf: [max_payload_len + checksum_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf); // Z1: the decoded payload, checksum and all
     const decoded = try decode(s, &buf);
     if (decoded.len < checksum_len) return error.TooShort;
 
@@ -260,6 +290,66 @@ test "base58 encode/decode against Bitcoin Core's base58_encode_decode.json (ext
         try testing.expectEqualSlices(u8, payload, got_dec);
     }
     try testing.expectEqual(@as(usize, 1), oversized_seen); // exactly the 256-byte stress vector
+}
+
+test "base58 decode: BufferTooSmall is the only wall between a pasted 180-'1' string and a write past the caller's buffer (A1 H1)" {
+    // `max_encoded_len` deliberately admits a 180-character string, and
+    // 180 leading '1's decode to 180 ZERO BYTES — more than `checkDecode`'s
+    // 132-byte staging buffer, and far more than a wallet's 8-byte `out`.
+    // The `total > out.len` check in `decode` is the only thing standing
+    // between that input and `@memset(out[0..zeros], 0)` running past the
+    // end: with it deleted, Debug panics and ReleaseFast writes 48 bytes
+    // past `checkDecode`'s buffer and returns a 180-byte slice into an
+    // 8-byte array (measured 2026-09-06). The old ledger cited this guard
+    // as proof of a PASS; nothing asserted it until now.
+    var ones: [max_encoded_len]u8 = undefined;
+    @memset(&ones, '1');
+
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, decode(&ones, &tiny));
+    var check_out: [max_payload_len]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, checkDecode(&ones, &check_out));
+    // One byte short of the exact fit is still too small; the exact fit
+    // decodes to 180 zero bytes.
+    var almost: [max_encoded_len - 1]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, decode(&ones, &almost));
+    var exact: [max_encoded_len]u8 = undefined;
+    const got = try decode(&ones, &exact);
+    try testing.expectEqual(@as(usize, max_encoded_len), got.len);
+    try testing.expect(std.mem.allEqual(u8, got, 0));
+    // The same wall on the encode side and on the Base58Check envelope
+    // (whose payload bound is `max_payload_len - checksum_len`, so that the
+    // envelope `encode` sees is within `max_payload_len`).
+    var payload: [max_payload_len]u8 = undefined;
+    @memset(&payload, 0xff);
+    try testing.expectError(error.BufferTooSmall, encode(&payload, &tiny));
+    try testing.expectError(error.BufferTooSmall, checkEncode(payload[0 .. max_payload_len - checksum_len], &tiny));
+    try testing.expectError(error.PayloadTooLarge, checkEncode(payload[0 .. max_payload_len - checksum_len + 1], &exact));
+    // And a decoded value shorter than the checksum itself is `TooShort`,
+    // never a slice with a negative length: "111" is three zero bytes.
+    try testing.expectError(error.TooShort, checkDecode("111", &check_out));
+}
+
+test "base58check: every one of the four checksum bytes is compared, not only the last (A1 M4)" {
+    // The existing bit-flip control flips the LAST checksum byte; a compare
+    // pinned to index 3 alone passed it. Each byte in turn, and a two-byte
+    // swap, must all be rejected.
+    var full_buf: [25]u8 = undefined;
+    _ = std.fmt.hexToBytes(&full_buf, p2pkh_vector_full_hex) catch unreachable;
+    for (21..25) |i| {
+        var tampered = full_buf;
+        tampered[i] ^= 0x80;
+        var enc_buf: [64]u8 = undefined;
+        const address = try encode(&tampered, &enc_buf);
+        var out: [64]u8 = undefined;
+        try testing.expectError(error.ChecksumMismatch, checkDecode(address, &out));
+    }
+    var swapped = full_buf;
+    std.mem.swap(u8, &swapped[21], &swapped[22]);
+    var enc_buf: [64]u8 = undefined;
+    const address = try encode(&swapped, &enc_buf);
+    var out: [64]u8 = undefined;
+    try testing.expectError(error.ChecksumMismatch, checkDecode(address, &out));
 }
 
 test "base58 decode: invalid character rejected (0, O, I, l excluded)" {
@@ -363,13 +453,21 @@ test "p2wpkhWitnessProgram is exactly hash160(pubkey)" {
 // alphabet characters, and the checksum are all attacker/user chosen).
 
 test "fuzz: decode/checkDecode never panic on arbitrary text" {
-    try testing.fuzz({}, fuzzDecode, .{});
+    // Seeds: a real address, the 180-'1' boundary input and a near-miss
+    // of it — without a corpus the harness saw one empty string.
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = &.{
+        p2pkh_vector_address,
+        &([_]u8{'1'} ** max_encoded_len),
+        &([_]u8{'1'} ** (max_encoded_len + 1)),
+        "1111111111111111111114oLvT2",
+    } });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    var buf: [max_encoded_len + 8]u8 = undefined;
+    // `smith.slice`, not `bytes` + a ranged length: `bytes` consumes the
+    // whole seed and the length draw is then always 0.
+    const len = smith.slice(&buf);
     for (buf[0..len]) |*c| {
         if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
     }

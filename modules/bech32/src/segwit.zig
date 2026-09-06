@@ -190,6 +190,50 @@ test "decodeSegwit: wrong HRP rejected" {
     try testing.expectError(error.InvalidHrp, decodeSegwit("tb", addr.slice()));
 }
 
+test "decodeSegwit: the HRP is compared whole — a chain whose HRP extends the expected one is not that chain (A1 M2)" {
+    // The corpus's only negative HRP vector differs in its FIRST byte
+    // (`tc` vs `bc`), so a compare weakened to a prefix test — or to the
+    // first byte alone — stayed green. Regtest is `bcrt`: under a prefix
+    // compare a regtest address passes as MAINNET, which is the chain-id
+    // confusion the HRP exists to prevent.
+    var program: [20]u8 = undefined;
+    @memset(&program, 0xAB);
+    const regtest = try encodeSegwit("bcrt", 0, &program);
+    try testing.expectError(error.InvalidHrp, decodeSegwit("bc", regtest.slice()));
+    const mainnet = try encodeSegwit("bc", 0, &program);
+    try testing.expectError(error.InvalidHrp, decodeSegwit("bcrt", mainnet.slice()));
+    try testing.expectError(error.InvalidHrp, decodeSegwit("b", mainnet.slice()));
+    // Same first byte, different chain: testnet `tb` vs a hypothetical `tc`.
+    const testnet = try encodeSegwit("tb", 0, &program);
+    try testing.expectError(error.InvalidHrp, decodeSegwit("tc", testnet.slice()));
+    _ = try decodeSegwit("tb", testnet.slice());
+}
+
+test "decodeSegwit: an incomplete tail group of 5 or more bits is InvalidPadding even when the bits are zero (A1 M3)" {
+    // BIP173 "Decoding": the incomplete group "MUST be 4 bits or less" AND
+    // "MUST be all zeroes". The official invalid vectors only exercise the
+    // second half; a check weakened to `bits > 5` accepted a 20-byte
+    // program carried in 33 quintets (165 bits: 160 + a whole zero
+    // padding quintet), which decodes to the SAME program as the canonical
+    // 32-quintet form — a second valid spelling of one address.
+    var program: [20]u8 = undefined;
+    @memset(&program, 0x42);
+    var data: [1 + 33]u5 = undefined;
+    data[0] = 0;
+    const nq = programToQuintets(&program, data[1..]);
+    try testing.expectEqual(@as(usize, 32), nq);
+    data[1 + nq] = 0; // one extra all-zero quintet: 5 leftover bits
+    const padded = try bech32.encode("bc", &data, .bech32);
+    try testing.expectError(error.InvalidPadding, decodeSegwit("bc", padded.slice()));
+    // The canonical spelling of the same program still decodes.
+    const canonical = try bech32.encode("bc", data[0 .. 1 + nq], .bech32);
+    const got = try decodeSegwit("bc", canonical.slice());
+    try testing.expectEqualSlices(u8, &program, got.program());
+    // And the audit's concrete instance: the BIP173 vector address with a
+    // whole zero padding quintet inserted before the checksum.
+    try testing.expectError(error.InvalidPadding, decodeSegwit("bc", "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kqkhhp9x"));
+}
+
 test "decodeSegwit: v0 program length must be 20 or 32" {
     var program21: [21]u8 = undefined;
     @memset(&program21, 1);
@@ -232,14 +276,17 @@ test "decodeSegwit: malicious oversized data section fails closed, no overflow" 
 // version/program-length validation the regression above targets.
 
 test "fuzz: decodeSegwit never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzDecodeSegwit, .{});
+    try testing.fuzz({}, fuzzDecodeSegwit, .{ .corpus = &.{
+        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kqkhhp9x",
+    } });
 }
 
 fn fuzzDecodeSegwit(_: void, smith: *std.testing.Smith) !void {
     const alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l1bc";
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const len = smith.slice(&buf); // not `bytes` + a ranged length: that always yields 0
     for (buf[0..len]) |*c| {
         if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
     }

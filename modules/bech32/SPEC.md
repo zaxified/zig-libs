@@ -21,6 +21,29 @@ base58/base58check (P2PKH/P2SH/WIF). Usage: see ./README.md. Attribution/provena
   *before* the O(n²) bignum carry loop runs, so an oversized string can't be used to burn CPU on a
   parse that was always going to fail.
 
+- **`base58.decode`'s `BufferTooSmall` guard is load-bearing, and it is pinned.** `max_encoded_len`
+  admits a 180-character string on purpose, and 180 leading `1`s decode to 180 zero bytes — more
+  than `checkDecode`'s 132-byte staging buffer. The `total > out.len` check is the only thing
+  between that paste and a write past the end: measured 2026-09-06 with the check deleted, Debug
+  panics and **ReleaseFast writes 48 bytes past the buffer and hands a wallet a 180-byte slice
+  into its 8-byte array**. The 2026-08-08 ledger cited that guard as its proof of a PASS while no
+  test asserted it; "BufferTooSmall is the only wall…" in `base58.zig` does now, on both
+  directions and on the Base58Check envelope (whose payload bound is `max_payload_len - 4`, so the
+  envelope `encode` sees stays within `max_payload_len` instead of failing one copy later).
+
+- **`base58` carries secrets and wipes its scratch; it is NOT constant-time.** WIF and `xprv`
+  are Base58Check payloads and `bip32` is the in-tree caller. Every scratch buffer that holds the
+  payload or its base-58 digits is a CONVENTIONS.md §2.1 Z1 site and is wiped on every exit
+  (`encode`'s `b58`, `decode`'s `b256`, both Base58Check staging buffers) — without the wipes,
+  one literal copy of a 32-byte secret after `checkEncode` and two after `checkDecode` survived on
+  the dead stack in ReleaseFast even though the caller had zeroed its own buffer (2026-09-06; a
+  stack wipe is justified by §2.1's rule, not by a regression test, which §2.1 says cannot see
+  it). Timing is a separate matter and is not fixed: `alphabet[d]` is indexed by the payload's
+  base-58 digits and the carry loops run a value-dependent number of iterations (ctgrind:
+  13 contexts on `checkEncode`, 3 on `checkDecode`/`decode`). The address path this module exists
+  for is public data; a caller base58-encoding key material on a host with a co-tenant is
+  outside what this module promises. `bech32.zig`/`segwit.zig` hold no secret at all.
+
 - **Fail-closed on untrusted input, with a specific typed error per rejection reason** (not one
   catch-all): `bech32.DecodeError` distinguishes `MixedCase` / `NoSeparator` / `EmptyHrp` /
   `HrpTooLong` / `HrpCharOutOfRange` / `DataTooShort` / `InvalidDataChar` / `InvalidChecksum` /
