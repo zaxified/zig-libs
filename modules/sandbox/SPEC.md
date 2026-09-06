@@ -32,16 +32,31 @@ citation lives here:
   a thin, verified wrapper over one syscall family.
 - **Order-safety is enforced, not documented.** `dropPrivileges` does `setgroups([]) → setgid →
   setuid` (the only safe order — setuid first strips the privilege setgid/setgroups themselves need)
-  and then **reads back** `getuid`/`geteuid`/`getgid`/`getegid`, returning `error.DropNotEffective`
-  if any of the real *or* effective ids did not become the target. A partial/spoofed drop is fatal,
-  never silently tolerated.
+  and then **reads back** real, effective AND saved uid/gid (`getresuid`/`getresgid` — the saved id
+  is the `seteuid` ladder back up) plus `getgroups() == 0`, returning `error.DropNotEffective` on
+  any mismatch. A partial/spoofed drop is fatal, never silently tolerated. The capability bounding
+  set must be dropped BEFORE `dropPrivileges`: `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, which a
+  non-root uid no longer holds (the earlier README recipe had it after, where it always hit EPERM and
+  a `catch {}` swallowed it).
 - **seccomp is an allow-list with a mandatory arch guard.** The generated classic-BPF program loads
-  `seccomp_data.arch`, KILLs on a mismatch (always KILL, independent of the configured deny action —
-  a foreign ABI like x86-64's x32 reuses syscall numbers and must not be able to alias an allowed
-  `nr`), loads `nr`, then a linear `JEQ nr_i → ALLOW` chain with a single deny leaf. Jump offsets
-  (`jt`) are a `u8`, so the flat encoding caps at 255 allowed calls (`error.TooManySyscalls` past
-  that). The default allow-list is comptime-filtered by `@hasField(linux.SYS, name)` so it stays
-  valid on any arch. `sock_filter` is asserted 8 bytes; `landlock_path_beneath_attr` asserted 12
+  `seccomp_data.arch`, KILLs on a mismatch (always KILL, independent of the configured deny action),
+  loads `nr`, then a linear `JEQ nr_i → ALLOW` chain with a single deny leaf. What the guard is FOR:
+  a syscall entered through a foreign ABI's entry point, where the same number is a different call —
+  on x86-64 the i386 `int $0x80` entry reports `AUDIT_ARCH_I386` and its nr 39 is `mkdir`, while the
+  allow-listed x86-64 nr 39 is `getpid`; measured, a getpid-only filter without the guard created a
+  directory. What it is NOT for: x32. The x32 ABI reports `AUDIT_ARCH_X86_64` (measured) and passes
+  the guard; it is stopped by default-deny, because an x32 number carries `__X32_SYSCALL_BIT`
+  (`0x40000000`) and never equals a bare allow-listed `nr`. Both `build` and `buildWx` are pinned
+  structurally (opcode, `k`, AND the jump targets `jt`/`jf` — a `jf: 0 → 1` mutation keeps opcode and
+  `k` and makes the KILL leaf unreachable) and behaviourally on x86-64 (a child issues `int $0x80`
+  nr 39 and must die of SIGSYS). Jump offsets (`jt`) are a `u8`, so the flat encoding caps at 255
+  allowed calls (`error.TooManySyscalls` past that). `Action.errno` must be in `1..4095`
+  (`error.InvalidErrno`): `0` would make a denied syscall report SUCCESS, and the kernel clamps
+  above 4095. The default allow-list is comptime-filtered by `@hasField(linux.SYS, name)` so it stays
+  valid on any arch — and a test names its content (and, on x86-64, that exactly one spelling is
+  dropped), because that filter also swallows a misspelling silently: syscall 262 is `newfstatat` in
+  some tables and `fstatat64` in std's x86-64 table, and only the former was listed, so C code's
+  `stat(2)` died of SIGSYS under a list whose author had allowed it. `sock_filter` is asserted 8 bytes; `landlock_path_beneath_attr` asserted 12
   (packed u64+s32) so the byte layout matches the kernel's `copy_from_user`.
 - **The W^X preset (`seccomp.buildWx`/`buildDefaultWx`) adds argument-checked blocks, not a
   different filter shape.** For each of `{mmap, mprotect, pkey_mprotect}` present in the allow-list,
@@ -58,7 +73,13 @@ citation lives here:
   non-zero high word is treated as a violation here, not ignored). `PROT_WRITE`/`PROT_EXEC` are
   hardcoded (`0x2`/`0x4`, `mman-common.h`, identical on every Linux arch) rather than taken from
   std's `linux.PROT`, whose packed-struct field layout isn't a byte-order-independent value to
-  compare inside a BPF program.
+  compare inside a BPF program. **What the preset guarantees, precisely:** no single `mmap`/
+  `mprotect`/`pkey_mprotect` call may request `PROT_WRITE` and `PROT_EXEC` together. It does NOT
+  prevent the two-step `mmap(RW)` → write code → `mprotect(RX)` → execute sequence (measured: a
+  function written that way returned), because `RX` alone never trips the mask. That is the shape
+  every JIT and `dlopen` use, and refusing it (deny `PROT_EXEC` on `mprotect` entirely) would break
+  them — so this preset is "no simultaneous W|X", not W^X in the strict sense. A caller who needs the
+  strict property adds a rule denying `PROT_EXEC` on `mprotect` for its own binary.
 - **`seccomp.installTsync` uses the `seccomp(2)` syscall (not `prctl`) with `SECCOMP_FILTER_FLAG_TSYNC`**
   to apply a filter to every thread of the process atomically, for the case where hardening happens
   after workers already exist (`install()`'s prctl form only ever touches the calling thread).
@@ -67,6 +88,20 @@ citation lives here:
   `install()`'s `linux.errno(rc) != .SUCCESS` check here would silently read that as success (a
   positive value decodes to `.SUCCESS` under `linux.errno`'s `(-4096, 0)` window). `installTsync`
   checks for this explicitly and reports `error.ThreadSyncFailed` rather than `error.SeccompFailed`.
+- **Landlock: `init()` handles everything; `allowPath` grants.** Landlock only restricts rights
+  that are *handled*; an unhandled right is unrestricted everywhere. `Ruleset.init()` therefore
+  handles `access.all` (every `LANDLOCK_ACCESS_FS_*` bit this module knows, clamped to the ABI) and
+  `allowPath(path, rights)` says what each tree may be used for. The earlier `init(handled)` took a
+  mask, and every piece of documentation passed `access.read_only` to BOTH calls — a ruleset that
+  handled `read_file|read_dir` only, leaving the other 14 rights (write, create, unlink, mkdir,
+  symlink, truncate, …) unrestricted for the whole filesystem. The A1 audit measured a process
+  "confined to a read-only tree" creating, truncating, unlinking and symlinking outside it, and
+  writing inside it. The explicit form survives as `initHandling(mask)` for the rare deployment that
+  wants a right left unhandled on purpose. `allowPath` opens with `O_NOFOLLOW` and refuses a final-
+  component symlink (`error.PathIsSymlink`) — a rule attaches to what the configuration names, not to
+  what a symlink (writable by anyone with write access to its parent) points at; one
+  `link_to_root -> /` had granted the whole filesystem. Intermediate symlink components are still
+  followed.
 - **Landlock degrades, never faults, on old kernels.** The ABI version is queried first
   (`landlock_create_ruleset(NULL,0,VERSION)`); the handled-access mask and each rule's allowed-access
   are intersected with the bits that ABI understands, so passing a newer access bit to an older
@@ -76,8 +111,11 @@ citation lives here:
   numbers). Failures are typed errors; there is no path that panics on a malformed or
   unsupported-kernel result — a server must be able to log and choose policy.
 - **Concurrency:** single_owner — applied once at startup by the owning thread. The prctl-form
-  seccomp install and Landlock `restrict_self` affect the calling thread (and its future children);
-  install before spawning workers, or use the deferred `seccomp(2)` TSYNC form.
+  seccomp install and Landlock `restrict_self` affect the CALLING THREAD (and its future children).
+  For seccomp, `installTsync` reaches threads that already exist. **For Landlock there is no
+  equivalent** — the kernel offers no TSYNC flag for `landlock_restrict_self` — so a worker spawned
+  before `restrictSelf` stays unconfined for good (measured: main thread EACCES, pre-existing worker
+  SUCCESS on the same path; pinned by a test). Restrict before spawning workers.
 
 ## Threat model / out of scope
 
@@ -104,19 +142,34 @@ ptrace — pair it with seccomp + a namespace for those. Out of scope: general s
 The enforcement tests **fork a child**, apply one restriction, attempt the forbidden action and
 assert the child terminates exactly as configured, with a control child (no restriction) succeeding —
 the only honest way to test a security boundary; a pure unit test would prove nothing about the
-kernel actually enforcing it. Unprivileged and always-run: seccomp (KILL child dies of `SIGSYS`,
+kernel actually enforcing it. **Skips are decided before the child runs**, from a probe of the
+kernel (`seccomp.available()`, `landlockAbiVersion()`, a writable `/tmp`, `int $0x80` being
+emulated) — never from the child's own failure exit. The earlier shape `if (child failed to
+install) return error.SkipZigTest` turned a broken mechanism into a green suite (A1 audit S5: a
+mutation disabling Landlock entirely produced "15 pass / 3 skip", exit 0); now `init`/`install`
+failing after the probe said yes is a failing test. `runInChild` checks `waitpid`'s return too — a
+failed wait used to leave `status = 0`, which reads as "exited 0". Unprivileged and always-run: seccomp (KILL child dies of `SIGSYS`,
 ERRNO child sees `-EPERM`, control survives), the same KILL/ERRNO shape re-verified through
 `installTsync`'s `seccomp(2)` path, a cross-thread test that spawns a worker *before* installing
 (via `installTsync`) and confirms the worker's own denied syscall brings the whole process down
 (proof `TSYNC` actually reached a thread that never called into seccomp itself — `install()`'s
 prctl form cannot do this), the W^X preset (RW `mprotect`/`mmap` still succeed; RWX denied; a raw
 syscall with a crafted non-zero high word on the `prot` argument is denied too, proving the 64-bit
-argument check and not just its low half is active), Landlock (child confined to a temp dir is
-denied `/etc/passwd`, allowed its own file — skips pre-5.13), rlimit (`RLIMIT_NOFILE` bites at the
-cap with EMFILE and cannot be raised back; `RLIMIT_CORE=0`). Root-gated + `SkipZigTest` otherwise:
-privilege drop (drops to `nobody`, asserts `setuid(0)` fails) and capability bounding-set drop.
-Pure/logic tests cover the BPF program shape (arch guard + per-syscall compare + allow/deny leaves +
-descending `jt`), struct ABI sizes, and the monotone Landlock access mask. Run:
+argument check and not just its low half is active), the arch guard's real job on x86-64 (a child
+under a getpid-only filter — `build` and `buildWx` — issues `int $0x80` nr 39, the i386 `mkdir`, and
+must die of SIGSYS; a directory appearing is the escape), Landlock (child confined to a temp dir is
+denied `/etc/passwd`, allowed its own file; with `init()` + `allowPath(read_only)` it is denied
+create/overwrite/mkdir/symlink/unlink outside the tree and writes inside it, while `read_write` on
+the tree still permits creating there; a symlink handed to `allowPath` is refused by name; a worker
+spawned before `restrictSelf` is measured unconfined — skips pre-5.13), rlimit (`RLIMIT_NOFILE`
+bites at the cap with EMFILE and cannot be raised back; `RLIMIT_CORE` read back as 0). Root-gated +
+`SkipZigTest` otherwise: privilege drop (drops to `nobody`, asserts uid AND gid AND saved uid, and
+that `setuid(0)`/`setgid(0)` fail) and capability bounding-set drop — ⚠ in an unprivileged run
+these two are inert, so the setuid-before-setgid hole is NOT caught by the ordinary gate; a
+privileged lane is the only cure. Pure/logic tests cover the BPF program shape for `build` AND
+`buildWx` (arch guard including its jump targets, per-syscall compare, W^X block layout, allow/deny
+leaves, descending `jt`), the default allow-list's named content, `Action.errno` bounds, struct ABI
+sizes, and the monotone Landlock access mask. Run:
 `zig build test-sandbox` (add `-Doptimize=ReleaseFast` for the release check; `sudo` prefix to also
 exercise the two root-gated tests).
 

@@ -66,7 +66,12 @@ pub fn main() !void {
     };
     std.debug.print("landlock ABI version {d}\n", .{abi});
 
-    var ruleset = try sandbox.Landlock.init(sandbox.Landlock.access.read_only);
+    // `init()` handles EVERY filesystem right the kernel knows — deny by
+    // default — and `allowPath` below says what a tree may be used for. (An
+    // earlier revision passed `access.read_only` to `init` too, which left
+    // the other 14 rights — write, create, unlink, mkdir, … — unrestricted
+    // everywhere: a "read-only" sandbox that could overwrite any file.)
+    var ruleset = try sandbox.Landlock.init();
     defer ruleset.deinit();
 
     // A path that does not exist must fail by name, not by crashing the
@@ -81,6 +86,15 @@ pub fn main() !void {
     try ruleset.allowPath("/tmp", sandbox.Landlock.access.read_only);
     try ruleset.restrictSelf();
     std.debug.print("landlock restricted to read-only /tmp\n", .{});
+
+    // Prove the restriction means what it says: creating a file OUTSIDE the
+    // allow-list must fail, and so must creating one INSIDE the read-only
+    // tree (read_only grants reading, nothing else).
+    const outside_rc = std.os.linux.open("/var/tmp/zig_sandbox_example_should_not_exist", .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600);
+    if (std.os.linux.errno(outside_rc) == .SUCCESS) return error.SandboxLetAWriteThrough;
+    const inside_rc = std.os.linux.open("/tmp/zig_sandbox_example_should_not_exist", .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600);
+    if (std.os.linux.errno(inside_rc) == .SUCCESS) return error.SandboxLetAWriteThrough;
+    std.debug.print("landlock: creating files outside the allow-list and inside the read-only tree both refused\n", .{});
 
     // Step 5: build the default network-server seccomp allow-list. Built and
     // freed here to exercise the allocator path end to end (see the module

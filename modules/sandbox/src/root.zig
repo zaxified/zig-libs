@@ -31,16 +31,24 @@
 //! kernel UAPI (`prctl.h`, `seccomp.h`, `landlock.h`, `capability.h`); see
 //! SPEC.md for the citation.
 //!
-//! Basic usage (order matters — do this last, after bind/listen):
+//! Basic usage (order matters — do this last, after bind/listen, and BEFORE
+//! spawning worker threads: Landlock's `restrictSelf` and the prctl-form
+//! `seccomp.install` confine the calling thread only, and Landlock has no
+//! TSYNC equivalent at all):
 //!
 //! ```zig
 //! const sandbox = @import("sandbox");
 //!
 //! try sandbox.noNewPrivs();
 //! try sandbox.disableCoreDumps();
+//! // Bounding set FIRST — it needs CAP_SETPCAP, which the uid drop below
+//! // takes away (after setuid to a non-root uid every capability is gone).
+//! sandbox.dropCapabilityBoundingSet() catch {};
 //! try sandbox.dropPrivileges(.{ .uid = 65534, .gid = 65534 });
 //!
-//! var ll = try sandbox.Landlock.init(sandbox.Landlock.access.read_only);
+//! // Landlock: `init()` handles EVERY filesystem right the kernel knows
+//! // (deny-by-default), and `allowPath` grants what a tree may be used for.
+//! var ll = try sandbox.Landlock.init();
 //! defer ll.deinit();
 //! try ll.allowPath("/var/www", sandbox.Landlock.access.read_only);
 //! try ll.restrictSelf();
@@ -114,9 +122,15 @@ pub const DropError = error{
 /// Doing setuid *before* setgid is the classic bug: dropping uid 0 first
 /// removes the privilege that setgid and setgroups themselves require, so the
 /// supplementary groups / gid silently stay elevated. We also verify with a
-/// read-back (`getuid`/`geteuid`/`getgid`/`getegid`) that the real *and*
-/// effective ids all became the requested values — a defence against a partial
-/// or spoofed drop. Call `noNewPrivs()` first if you also want execve() locked.
+/// read-back that the drop is TOTAL: real, effective AND saved uid/gid
+/// (`getresuid`/`getresgid` — the saved id is exactly what `seteuid(2)`
+/// climbs back up through, so checking only real+effective left the door it
+/// guards untested), and that the supplementary group list is empty
+/// (`getgroups` — `setgroups` returning success is not the same as the list
+/// being empty). Any mismatch is `error.DropNotEffective`: a partial or
+/// spoofed drop is fatal, never tolerated. Call `noNewPrivs()` first if you
+/// also want execve() locked, and drop the capability bounding set BEFORE
+/// this call — it needs `CAP_SETPCAP`, which a non-root uid no longer holds.
 pub fn dropPrivileges(creds: Credentials) DropError!void {
     // 1. Clear supplementary groups — must happen while still privileged.
     const no_groups = [_]linux.gid_t{};
@@ -128,11 +142,21 @@ pub fn dropPrivileges(creds: Credentials) DropError!void {
     // 3. Real+effective+saved uid, LAST — this is the point of no return.
     if (linux.errno(linux.setuid(creds.uid)) != .SUCCESS) return error.SetIdFailed;
 
-    // 4. Read back: the drop must be total, not just the real ids.
-    if (linux.getuid() != creds.uid) return error.DropNotEffective;
-    if (linux.geteuid() != creds.uid) return error.DropNotEffective;
-    if (linux.getgid() != creds.gid) return error.DropNotEffective;
-    if (linux.getegid() != creds.gid) return error.DropNotEffective;
+    // 4. Read back: the drop must be total — real, effective AND saved ids,
+    //    and no supplementary group left behind.
+    var ruid: linux.uid_t = undefined;
+    var euid: linux.uid_t = undefined;
+    var suid: linux.uid_t = undefined;
+    if (linux.errno(linux.getresuid(&ruid, &euid, &suid)) != .SUCCESS) return error.DropNotEffective;
+    if (ruid != creds.uid or euid != creds.uid or suid != creds.uid) return error.DropNotEffective;
+    var rgid: linux.gid_t = undefined;
+    var egid: linux.gid_t = undefined;
+    var sgid: linux.gid_t = undefined;
+    if (linux.errno(linux.getresgid(&rgid, &egid, &sgid)) != .SUCCESS) return error.DropNotEffective;
+    if (rgid != creds.gid or egid != creds.gid or sgid != creds.gid) return error.DropNotEffective;
+    // getgroups(0, NULL) returns the number of supplementary groups.
+    const ngroups = linux.getgroups(0, null);
+    if (linux.errno(ngroups) != .SUCCESS or ngroups != 0) return error.DropNotEffective;
 }
 
 pub const CapabilityError = error{
@@ -287,6 +311,16 @@ pub const LandlockError = error{
     Disabled,
     /// A path handed to `allowPath` could not be opened.
     PathOpenFailed,
+    /// The final component of a path handed to `allowPath` is a symlink.
+    /// `allowPath` opens with `O_NOFOLLOW` so the tree a rule grants is the
+    /// one the configuration names, not whatever a symlink — writable by
+    /// anyone with write access to its parent — points at today (the A1 audit
+    /// granted the whole filesystem through one `link_to_root -> /`).
+    /// Resolve the link yourself and pass the target if that is what you mean.
+    /// Intermediate components are still followed (`O_NOFOLLOW` applies to
+    /// the last one only), so `/var/run/app` on a system where `/var/run` is
+    /// a symlink keeps working.
+    PathIsSymlink,
     /// A landlock syscall failed unexpectedly.
     RulesetFailed,
     /// `restrictSelf` needs PR_SET_NO_NEW_PRIVS set first (or CAP_SYS_ADMIN).
@@ -343,6 +377,14 @@ pub const Ruleset = struct {
         /// Read + write + create/remove regular files (a typical data dir).
         pub const read_write: u64 = read_file | read_dir | write_file |
             make_reg | remove_file | truncate;
+        /// Every filesystem right this module knows (bits 0..15). `init()`
+        /// handles this set — clamped to what the running ABI understands —
+        /// so that a right nobody `allowPath`s is DENIED. Landlock only ever
+        /// restricts rights that are handled; a right left out of the
+        /// handled mask stays unrestricted everywhere, which is why the
+        /// `read_only`/`read_write` unions are for `allowPath`, never for
+        /// the ruleset itself.
+        pub const all: u64 = (1 << 16) - 1;
     };
 
     /// Bits of `access` a given ABI version understands. Passing a bit the ABI
@@ -359,9 +401,33 @@ pub const Ruleset = struct {
         return m;
     }
 
-    /// Create a ruleset that *handles* (denies-by-default) `handled_access`,
-    /// after negotiating the kernel's ABI version and clamping the mask to it.
-    pub fn init(handled_access: u64) LandlockError!Ruleset {
+    /// Create a ruleset that handles — denies unless a rule re-allows —
+    /// EVERY filesystem right the running kernel's Landlock ABI knows
+    /// (`access.all` clamped by `accessMaskForAbi`). This is the shape a
+    /// sandbox wants: `allowPath` then says what each tree may be used for,
+    /// and anything not granted anywhere is refused.
+    ///
+    /// Why there is no argument: the earlier `init(handled)` invited passing
+    /// the same `access.read_only` here and to `allowPath`, and every piece of
+    /// this module's documentation did exactly that. A ruleset that handles
+    /// only `read_file|read_dir` leaves the other 14 rights — write, create,
+    /// unlink, mkdir, symlink, truncate, … — completely unrestricted
+    /// everywhere, so a process "confined to a read-only tree" could still
+    /// create and overwrite any file its DAC permissions reached (measured by
+    /// the A1 audit: create/truncate/mkdir/symlink/unlink outside the
+    /// allow-list all SUCCESS). `initHandling` keeps the explicit form for
+    /// the rare case that genuinely wants some right left unhandled.
+    pub fn init() LandlockError!Ruleset {
+        return initHandling(access.all);
+    }
+
+    /// Create a ruleset that handles exactly `handled_access` (clamped to the
+    /// ABI). ⚠ A right NOT in this mask is not denied anywhere — it is
+    /// unrestricted, for every path, forever. Use `init()` unless you are
+    /// deliberately leaving a right unrestricted (e.g. `execute` for a process
+    /// that must be able to exec anything), and never pass a convenience
+    /// union meant for `allowPath` here.
+    pub fn initHandling(handled_access: u64) LandlockError!Ruleset {
         const abi = try landlockAbiVersion();
         const handled = handled_access & accessMaskForAbi(abi);
         const attr = RulesetAttr{ .handled_access_fs = handled };
@@ -379,11 +445,20 @@ pub const Ruleset = struct {
     /// single file). The access is clamped to the ruleset's handled set — you
     /// cannot allow a right the ruleset does not deny in the first place.
     pub fn allowPath(self: *Ruleset, path: [*:0]const u8, allowed_access: u64) LandlockError!void {
-        // O_PATH|O_CLOEXEC: we only need a handle to name the tree, not to read it.
-        const ofd = linux.open(path, .{ .PATH = true, .CLOEXEC = true, .DIRECTORY = false }, 0);
+        // O_PATH|O_CLOEXEC: we only need a handle to name the tree, not to
+        // read it. O_NOFOLLOW: the rule must attach to what the configuration
+        // names, not to a symlink's current target (see `PathIsSymlink`).
+        const ofd = linux.open(path, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true, .DIRECTORY = false }, 0);
         if (linux.errno(ofd) != .SUCCESS) return error.PathOpenFailed;
         const parent_fd: i32 = @intCast(@as(isize, @bitCast(ofd)));
         defer _ = linux.close(parent_fd);
+        // With O_NOFOLLOW an O_PATH open of a symlink SUCCEEDS and refers to
+        // the link itself; refuse it by name rather than let the kernel's
+        // add_rule report an opaque failure.
+        var st: linux.Statx = undefined;
+        const at_empty_path: u32 = 0x1000; // AT_EMPTY_PATH: operate on `parent_fd` itself
+        if (linux.errno(linux.statx(parent_fd, "", at_empty_path, .{ .TYPE = true }, &st)) != .SUCCESS) return error.PathOpenFailed;
+        if (linux.S.ISLNK(st.mode)) return error.PathIsSymlink;
 
         const attr = PathBeneathAttr{
             .allowed_access = allowed_access & self.handled,
@@ -393,9 +468,15 @@ pub const Ruleset = struct {
         if (linux.errno(rc) != .SUCCESS) return error.RulesetFailed;
     }
 
-    /// Enforce the ruleset on the calling thread and all future children.
-    /// Irreversible. Requires PR_SET_NO_NEW_PRIVS (call `noNewPrivs()` first)
-    /// unless the process holds `CAP_SYS_ADMIN`.
+    /// Enforce the ruleset on the CALLING THREAD and everything it later
+    /// forks/spawns. Irreversible. Requires PR_SET_NO_NEW_PRIVS (call
+    /// `noNewPrivs()` first) unless the process holds `CAP_SYS_ADMIN`.
+    ///
+    /// ⚠ Per-thread, like the prctl-form seccomp install — and unlike
+    /// seccomp, Landlock offers NO `TSYNC`-style flag that would reach threads
+    /// already running. A worker spawned before this call stays unconfined
+    /// (measured: main thread EACCES, pre-existing worker SUCCESS on the same
+    /// path). Restrict before spawning workers; there is no later fix-up.
     pub fn restrictSelf(self: *Ruleset) LandlockError!void {
         const rc = sys_landlock_restrict_self(self.fd, 0);
         switch (linux.errno(rc)) {
@@ -460,8 +541,14 @@ pub const bpf = struct {
 /// 64-bit and little-endian flags. Computed clean-room from the UAPI (audit.h /
 /// elf.h EM numbers) rather than via `std.os.linux.AUDIT.ARCH`, whose enum body
 /// is unbuildable in this std (a bad `elf.EM.FRV` member). The seccomp filter
-/// checks `seccomp_data.arch` against this so a foreign ABI (e.g. x86-64's x32,
-/// which reuses syscall numbers) cannot slip past a number-only allow-list.
+/// checks `seccomp_data.arch` against this so a syscall entered through a
+/// FOREIGN ABI's entry point cannot alias an allowed number: on x86-64 the
+/// i386 `int $0x80` entry reports `AUDIT_ARCH_I386`, where nr 39 is `mkdir`
+/// while the allow-listed x86-64 nr 39 is `getpid` (measured: without the
+/// guard a getpid-only filter created a directory). NB the x32 ABI is NOT
+/// what this guard stops — x32 reports `AUDIT_ARCH_X86_64` too; what stops it
+/// is default-deny, because an x32 number carries `__X32_SYSCALL_BIT`
+/// (0x40000000) and so never equals a bare allow-listed `nr`.
 const audit_arch: u32 = blk: {
     const bit64: u32 = 0x8000_0000;
     const le: u32 = 0x4000_0000;
@@ -487,7 +574,11 @@ pub const seccomp = struct {
         /// SIGSYS-kill only the offending thread.
         kill_thread,
         /// Let the call return `-errno` instead of running — softer, lets a
-        /// program feature-probe without dying. Common choice: EPERM.
+        /// program feature-probe without dying. Common choice: EPERM. Must
+        /// be in `1..4095`: `0` would make a DENIED syscall return 0, i.e.
+        /// report success to the caller (`build` refuses it with
+        /// `error.InvalidErrno`), and the kernel clamps anything above 4095
+        /// to 4095, so a larger value is a mistake, not an errno.
         errno: u16,
         /// Raise SIGSYS so a handler can decide (used by tracing sandboxes).
         trap,
@@ -534,7 +625,36 @@ pub const seccomp = struct {
         /// is a u8, so the allow-list cannot be encoded in this flat shape.
         /// (Split into ranges / a binary search if you ever hit this.)
         TooManySyscalls,
+        /// An `Action.errno` outside `1..4095` — see `Action.errno`.
+        InvalidErrno,
     };
+
+    /// The largest errno the kernel will hand back through `SECCOMP_RET_ERRNO`
+    /// (`SECCOMP_RET_DATA` is 16 bits, but errnos are `< 4096` and the kernel
+    /// clamps the value there).
+    pub const max_errno: u16 = 4095;
+
+    fn validateAction(a: Action) BuildError!void {
+        switch (a) {
+            .errno => |e| if (e == 0 or e > max_errno) return error.InvalidErrno,
+            else => {},
+        }
+    }
+
+    /// `SECCOMP_GET_ACTION_AVAIL` (UAPI seccomp.h, operation 2).
+    const seccomp_get_action_avail: u32 = 2;
+
+    /// True when this kernel can install a seccomp-bpf filter at all
+    /// (`CONFIG_SECCOMP_FILTER`, and the `seccomp(2)` syscall). Probed with
+    /// `SECCOMP_GET_ACTION_AVAIL`, which needs no privilege and changes
+    /// nothing. Callers — and this module's own tests — use it to decide UP
+    /// FRONT whether a filter can exist; a failing `install` after this said
+    /// yes is then a real failure, never something to skip past.
+    pub fn available() bool {
+        const action: u32 = ret_kill_process;
+        const rc = linux.syscall3(.seccomp, seccomp_get_action_avail, 0, @intFromPtr(&action));
+        return linux.errno(rc) == .SUCCESS;
+    }
 
     pub const InstallError = error{
         /// prctl(PR_SET_SECCOMP) returned an error. Almost always: no
@@ -561,10 +681,13 @@ pub const seccomp = struct {
     /// KILL, independent of `on_deny`. Caller owns the returned slice.
     pub fn build(gpa: Allocator, allowed: []const linux.SYS, on_deny: Action) BuildError![]SockFilter {
         if (allowed.len > 255) return error.TooManySyscalls;
+        try validateAction(on_deny);
         const m: u8 = @intCast(allowed.len);
 
         var list: std.ArrayList(SockFilter) = .empty;
         errdefer list.deinit(gpa);
+        // 3 (arch guard) + 1 (ld nr) + m compares + 2 leaves — known up front.
+        try list.ensureTotalCapacityPrecise(gpa, 6 + allowed.len);
 
         // Arch check.
         try list.append(gpa, bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_arch));
@@ -658,37 +781,40 @@ pub const seccomp = struct {
     /// purpose. Deliberately excludes execve/fork/ptrace/mount/etc.
     const default_names = [_][:0]const u8{
         // core I/O
-        "read",         "write",           "readv",           "writev",
-        "pread64",      "pwrite64",        "recvfrom",        "sendto",
-        "recvmsg",      "sendmsg",         "sendmmsg",        "recvmmsg",
+        "read",            "write",        "readv",           "writev",
+        "pread64",         "pwrite64",     "recvfrom",        "sendto",
+        "recvmsg",         "sendmsg",      "sendmmsg",        "recvmmsg",
         // socket lifecycle (accept only; server already bound/listened)
-        "accept",       "accept4",         "shutdown",        "getsockname",
-        "getpeername",  "getsockopt",      "setsockopt",
+        "accept",          "accept4",      "shutdown",        "getsockname",
+        "getpeername",     "getsockopt",   "setsockopt",
         // fd lifecycle
              "close",
-        "dup",          "dup2",            "dup3",            "fcntl",
-        "fstat",        "newfstatat",      "statx",           "lseek",
-        "pipe2",        "eventfd2",
+        "dup",             "dup2",         "dup3",            "fcntl",
+        // syscall 262 is spelled `newfstatat` on some arches' tables and
+        // `fstatat64` on others (x86-64 in std) — list both so the intent
+        // ("stat by path") survives `@hasField`'s silent filter.
+        "fstat",           "newfstatat",   "fstatat64",       "statx",
+        "lseek",           "pipe2",        "eventfd2",
         // readiness / timers
-               "epoll_create1",   "epoll_ctl",
-        "epoll_wait",   "epoll_pwait",     "poll",            "ppoll",
-        "pselect6",     "timerfd_create",  "timerfd_settime", "timerfd_gettime",
+               "epoll_create1",
+        "epoll_ctl",       "epoll_wait",   "epoll_pwait",     "poll",
+        "ppoll",           "pselect6",     "timerfd_create",  "timerfd_settime",
+        "timerfd_gettime",
         // scheduling / sync
-        "futex",        "sched_yield",     "restart_syscall", "membarrier",
-        "nanosleep",    "clock_nanosleep",
+        "futex",        "sched_yield",     "restart_syscall",
+        "membarrier",      "nanosleep",    "clock_nanosleep",
         // time / entropy
-        "clock_gettime",   "gettimeofday",
-        "getrandom",
+        "clock_gettime",
+        "gettimeofday",    "getrandom",
         // memory
-           "mmap",            "munmap",          "mremap",
-        "mprotect",     "madvise",         "brk",
+           "mmap",            "munmap",
+        "mremap",          "mprotect",     "madvise",         "brk",
         // signals
-                    "rt_sigreturn",
-        "rt_sigaction", "rt_sigprocmask",  "sigaltstack",
+        "rt_sigreturn",    "rt_sigaction", "rt_sigprocmask",  "sigaltstack",
         // process identity / exit
-            "getpid",
-        "gettid",       "getuid",          "getgid",          "geteuid",
-        "getegid",      "exit",            "exit_group",      "tgkill",
+        "getpid",          "gettid",       "getuid",          "getgid",
+        "geteuid",         "getegid",      "exit",            "exit_group",
+        "tgkill",
     };
 
     /// The default network-server allow-list, resolved to concrete `linux.SYS`
@@ -726,6 +852,9 @@ pub const seccomp = struct {
     /// pkey_mprotect all share the shape `(ptr, len, int prot, ...)`, so
     /// their protection flags sit at `arg2` on every arch.
     const WxRule = struct { sysno: linux.SYS, mask: u32 };
+
+    /// Instructions per W^X block (the 9-instruction shape `buildWx` emits).
+    pub const wx_block_len: usize = 9;
 
     const wx_names = [_][:0]const u8{ "mmap", "mprotect", "pkey_mprotect" };
 
@@ -778,10 +907,17 @@ pub const seccomp = struct {
     ///    treated as a violation here (fail closed), never silently ignored.
     pub fn buildWx(gpa: Allocator, allowed: []const linux.SYS, on_deny: Action, wx_action: Action) BuildError![]SockFilter {
         if (allowed.len > 255) return error.TooManySyscalls;
+        try validateAction(on_deny);
+        try validateAction(wx_action);
         const m: u8 = @intCast(allowed.len);
 
         var list: std.ArrayList(SockFilter) = .empty;
         errdefer list.deinit(gpa);
+        var wx_blocks: usize = 0;
+        for (wx_arg_rules) |rule| {
+            if (containsSyscall(allowed, rule.sysno)) wx_blocks += 1;
+        }
+        try list.ensureTotalCapacityPrecise(gpa, 6 + allowed.len + wx_block_len * wx_blocks);
 
         // Arch check (identical to `build`).
         try list.append(gpa, bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_arch));
@@ -880,7 +1016,16 @@ fn runInChild(child: *const fn () void) !ChildResult {
         linux.exit(0); // child forgot to exit — treat as "did not enforce"
     }
     var status: u32 = 0;
-    _ = linux.waitpid(pid, &status, 0);
+    // A failed waitpid must not leave `status = 0` — which `exitedWith(0)`
+    // would read as the child having PASSED.
+    while (true) {
+        const wrc = linux.waitpid(pid, &status, 0);
+        switch (linux.errno(wrc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+    }
     return .{ .status = status };
 }
 
@@ -903,11 +1048,17 @@ test "seccomp.build emits arch-guard + one compare per syscall + allow/deny leav
     // 3 (arch guard) + 1 (ld nr) + 3 (compares) + 2 (deny, allow) = 9.
     try testing.expectEqual(@as(usize, 9), prog.len);
 
-    // Arch guard.
+    // Arch guard — including the jump TARGETS: `jf: 0 -> 1` keeps the
+    // opcode and `k` intact yet makes the KILL leaf unreachable (audit S2, a
+    // mutation this test used to survive; the escape it enables is the
+    // `int $0x80` test below).
     try testing.expectEqual(@as(u16, bpf.ld | bpf.w | bpf.abs), prog[0].code);
     try testing.expectEqual(@as(u32, seccomp.off_arch), prog[0].k);
     try testing.expectEqual(@as(u16, bpf.jmp | bpf.jeq | bpf.k), prog[1].code);
     try testing.expectEqual(audit_arch, prog[1].k);
+    try testing.expectEqual(@as(u8, 1), prog[1].jt);
+    try testing.expectEqual(@as(u8, 0), prog[1].jf);
+    try testing.expectEqual(@as(u16, bpf.ret | bpf.k), prog[2].code);
     try testing.expectEqual(@as(u32, seccomp.ret_kill_process), prog[2].k);
 
     // ld nr.
@@ -929,6 +1080,100 @@ test "seccomp default allow-list is non-empty and reasonable" {
     const prog = try seccomp.buildDefault(testing.allocator, .kill_process);
     defer testing.allocator.free(prog);
     try testing.expectEqual(seccomp.default_allowlist.len + 6, prog.len);
+}
+
+test "seccomp default allow-list: named CONTENT, and no silent drop by @hasField (audit S8)" {
+    // The only tests on this list used to be its length; 38 of 68 names could
+    // be deleted with the suite green, and `newfstatat` — spelled `fstatat64`
+    // in std's x86-64 table — was silently filtered out, so C code's stat(2)
+    // died of SIGSYS under a list whose author had allowed it.
+    const must_have = [_]linux.SYS{ .read, .write, .close, .epoll_wait, .accept4, .futex, .mmap, .exit_group, .rt_sigreturn, .getrandom };
+    for (must_have) |s| try testing.expect(seccomp.containsSyscall(seccomp.default_allowlist, s));
+    const must_not = [_]linux.SYS{ .execve, .fork, .clone, .ptrace, .mount, .openat, .socket, .connect, .ioctl, .prctl, .seccomp, .setuid };
+    for (must_not) |s| try testing.expect(!seccomp.containsSyscall(seccomp.default_allowlist, s));
+    if (builtin.cpu.arch == .x86_64) {
+        // stat-by-path (262) is present under std's spelling …
+        try testing.expect(seccomp.containsSyscall(seccomp.default_allowlist, .fstatat64));
+        // … and `newfstatat` is the ONLY name the arch filter drops here.
+        try testing.expectEqual(seccomp.default_names.len - 1, seccomp.default_allowlist.len);
+    }
+}
+
+test "seccomp.build/buildWx refuse an errno of 0 or above 4095 (audit S9)" {
+    // `.errno = 0` made a DENIED syscall return 0 — success — to the caller
+    // (the audit's probe with it looped at 100 % CPU on a std print path that
+    // kept retrying a "successful" refused write). Above 4095 the kernel
+    // clamps, so 65535 meant -4095, not EINVAL.
+    const allowed = [_]linux.SYS{ .exit_group, .getpid };
+    try testing.expectError(error.InvalidErrno, seccomp.build(testing.allocator, &allowed, .{ .errno = 0 }));
+    try testing.expectError(error.InvalidErrno, seccomp.build(testing.allocator, &allowed, .{ .errno = 4096 }));
+    try testing.expectError(error.InvalidErrno, seccomp.build(testing.allocator, &allowed, .{ .errno = 65535 }));
+    try testing.expectError(error.InvalidErrno, seccomp.buildWx(testing.allocator, &allowed, .kill_process, .{ .errno = 0 }));
+    try testing.expectError(error.InvalidErrno, seccomp.buildWx(testing.allocator, &allowed, .{ .errno = 0 }, .kill_process));
+    const ok1 = try seccomp.build(testing.allocator, &allowed, .{ .errno = 1 });
+    testing.allocator.free(ok1);
+    const ok2 = try seccomp.build(testing.allocator, &allowed, .{ .errno = seccomp.max_errno });
+    testing.allocator.free(ok2);
+}
+
+test "seccomp.buildWx structure: arch guard with its jump targets, one 9-instruction block per guarded syscall, then the plain chain (audit S3)" {
+    // `buildWx` had no structural test at all — its arch guard could be
+    // deleted outright (91 -> 88 instructions) or weakened (`jf` 0 -> 1) with
+    // the suite green, and either let the i386 `int $0x80` alias through.
+    const allowed = [_]linux.SYS{ .exit, .exit_group, .mmap, .mprotect, .read };
+    const prog = try seccomp.buildWx(testing.allocator, &allowed, .{ .errno = @intFromEnum(E.PERM) }, .kill_process);
+    defer testing.allocator.free(prog);
+
+    // 3 (arch) + 2 blocks x 9 + 1 (ld nr) + 5 compares + 2 leaves.
+    var guarded: usize = 0;
+    for (allowed) |s| {
+        if (s == .mmap or s == .mprotect) guarded += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), guarded);
+    try testing.expectEqual(6 + allowed.len + seccomp.wx_block_len * guarded, prog.len);
+
+    // Arch guard, identical to `build` — targets included.
+    try testing.expectEqual(@as(u16, bpf.ld | bpf.w | bpf.abs), prog[0].code);
+    try testing.expectEqual(@as(u32, seccomp.off_arch), prog[0].k);
+    try testing.expectEqual(@as(u16, bpf.jmp | bpf.jeq | bpf.k), prog[1].code);
+    try testing.expectEqual(audit_arch, prog[1].k);
+    try testing.expectEqual(@as(u8, 1), prog[1].jt);
+    try testing.expectEqual(@as(u8, 0), prog[1].jf);
+    try testing.expectEqual(@as(u16, bpf.ret | bpf.k), prog[2].code);
+    try testing.expectEqual(@as(u32, seccomp.ret_kill_process), prog[2].k);
+
+    // Each block: ld nr / jeq nr (0,7) / ld hi / jeq 0 (0,3) / ld lo / and mask / jeq mask (0,1) / ret wx / ret ALLOW.
+    var pos: usize = 3;
+    var seen_mmap = false;
+    var seen_mprotect = false;
+    while (pos < 3 + seccomp.wx_block_len * guarded) : (pos += seccomp.wx_block_len) {
+        const b = prog[pos..][0..seccomp.wx_block_len];
+        try testing.expectEqual(@as(u16, bpf.ld | bpf.w | bpf.abs), b[0].code);
+        try testing.expectEqual(@as(u32, seccomp.off_nr), b[0].k);
+        try testing.expectEqual(@as(u16, bpf.jmp | bpf.jeq | bpf.k), b[1].code);
+        if (b[1].k == @as(u32, @intCast(@intFromEnum(linux.SYS.mmap)))) seen_mmap = true;
+        if (b[1].k == @as(u32, @intCast(@intFromEnum(linux.SYS.mprotect)))) seen_mprotect = true;
+        try testing.expectEqual(@as(u8, 0), b[1].jt);
+        try testing.expectEqual(@as(u8, 7), b[1].jf);
+        try testing.expectEqual(@as(u32, seccomp.arg2.hi), b[2].k);
+        try testing.expectEqual(@as(u32, 0), b[3].k);
+        try testing.expectEqual(@as(u8, 3), b[3].jf);
+        try testing.expectEqual(@as(u32, seccomp.arg2.lo), b[4].k);
+        try testing.expectEqual(@as(u16, bpf.alu | bpf.and_ | bpf.k), b[5].code);
+        try testing.expectEqual(seccomp.prot_write_exec, b[5].k);
+        try testing.expectEqual(seccomp.prot_write_exec, b[6].k);
+        try testing.expectEqual(@as(u8, 1), b[6].jf);
+        try testing.expectEqual(@as(u32, seccomp.ret_kill_process), b[7].k); // wx_action
+        try testing.expectEqual(@as(u32, seccomp.ret_allow), b[8].k);
+    }
+    try testing.expect(seen_mmap and seen_mprotect);
+
+    // Plain chain: ld nr, descending jt, deny leaf (ERRNO|EPERM), ALLOW leaf.
+    try testing.expectEqual(@as(u32, seccomp.off_nr), prog[pos].k);
+    try testing.expectEqual(@as(u8, 5), prog[pos + 1].jt);
+    try testing.expectEqual(@as(u8, 1), prog[pos + 5].jt);
+    try testing.expectEqual(seccomp.ret_errno | @as(u32, @intFromEnum(E.PERM)), prog[pos + 6].k);
+    try testing.expectEqual(@as(u32, seccomp.ret_allow), prog[pos + 7].k);
 }
 
 test "landlock access mask grows monotonically with ABI" {
@@ -979,14 +1224,36 @@ fn childSeccompControl() void {
     linux.exit(7);
 }
 
+// Audit S5: a skip must be decided BEFORE the code under test runs, from a
+// probe of the kernel ("the mechanism is not here"), never from that code's
+// own failure exit. The earlier `if (res.exitedWith(102)) return
+// error.SkipZigTest` turned a broken `install` (or a no-op `noNewPrivs`) into
+// a green suite: a mutation that disabled Landlock entirely left "15 pass /
+// 3 skip", exit 0.
+fn requireSeccompFilter() !void {
+    if (!seccomp.available()) return error.SkipZigTest; // no CONFIG_SECCOMP_FILTER / seccomp(2)
+}
+
+test "seccomp.available agrees with a real install attempt" {
+    // If the probe says filters exist, installing one in a child must not
+    // fail; the two must never disagree, or every skip decision is wrong.
+    try requireSeccompFilter();
+    g_allow_prog = try seccomp.build(testing.allocator, &seccomp_min_with_getpid, .kill_process);
+    defer testing.allocator.free(g_allow_prog);
+    const control = try runInChild(childSeccompControl);
+    try testing.expect(control.exitedWith(7));
+}
+
 test "seccomp KILL_PROCESS: denied syscall kills the child; control survives" {
+    try requireSeccompFilter();
     g_kill_prog = try seccomp.build(testing.allocator, &seccomp_min_no_getpid, .kill_process);
     defer testing.allocator.free(g_kill_prog);
     g_allow_prog = try seccomp.build(testing.allocator, &seccomp_min_with_getpid, .kill_process);
     defer testing.allocator.free(g_allow_prog);
 
     const killed = try runInChild(childSeccompKill);
-    if (killed.exitedWith(102)) return error.SkipZigTest; // kernel lacks CONFIG_SECCOMP_FILTER
+    try testing.expect(!killed.exitedWith(101)); // noNewPrivs failed — the module, not the kernel
+    try testing.expect(!killed.exitedWith(102)); // install failed although `available()` said yes
     try testing.expect(killed.killedBy(.SYS)); // SIGSYS
 
     const control = try runInChild(childSeccompControl);
@@ -994,12 +1261,109 @@ test "seccomp KILL_PROCESS: denied syscall kills the child; control survives" {
 }
 
 test "seccomp ERRNO: denied syscall returns -EPERM instead of dying" {
+    try requireSeccompFilter();
     g_errno_prog = try seccomp.build(testing.allocator, &seccomp_min_no_getpid, .{ .errno = @intFromEnum(E.PERM) });
     defer testing.allocator.free(g_errno_prog);
 
     const res = try runInChild(childSeccompErrno);
-    if (res.exitedWith(102)) return error.SkipZigTest; // no seccomp filter support
-    try testing.expect(res.exitedWith(0)); // getpid saw EPERM, not a signal
+    try testing.expect(res.exitedWith(0)); // getpid saw EPERM, not a signal (101/102/42 are all failures)
+}
+
+// ── real: the arch guard's actual job — the i386 `int $0x80` entry (x86-64) ──
+//
+// On x86-64 the 32-bit compat entry reports `AUDIT_ARCH_I386`, where the same
+// number means a different syscall: nr 39 is `getpid` on x86-64 and `mkdir`
+// on i386. A filter allowing only `getpid` therefore lets a process create
+// directories — unless the arch guard KILLs first. The A1 audit showed both
+// `build` and `buildWx` losing this to a `jf: 0 -> 1` mutation with the
+// suite green; these children pin the guard by the escape it prevents.
+const X86Alias = if (builtin.cpu.arch == .x86_64) struct {
+    const low_page: usize = 0x10_0000; // below 4 GiB: reachable from a 32-bit ebx
+    const i386_nr_getpid: usize = 20;
+    const i386_nr_mkdir: usize = 39; // == x86-64 getpid, allow-listed below
+    const dir_name = "zig_sandbox_i386_alias_dir\x00";
+
+    fn int80(nr: usize, a1: usize, a2: usize) usize {
+        return asm volatile ("int $0x80"
+            : [ret] "={eax}" (-> usize),
+            : [nr] "{eax}" (nr),
+              [a1] "{ebx}" (a1),
+              [a2] "{ecx}" (a2),
+            : .{ .memory = true });
+    }
+
+    /// Control: does this kernel even take `int $0x80` (CONFIG_IA32_EMULATION)?
+    fn childProbeEmulation() void {
+        const rc = int80(i386_nr_getpid, 0, 0);
+        // A pid is positive and small; ENOSYS/SIGSEGV paths never get here with one.
+        linux.exit(if (@as(isize, @bitCast(rc)) > 0) 0 else 3);
+    }
+
+    /// Map a low page holding the directory name (the compat entry sees only
+    /// 32-bit pointers), install `prog`, then try to mkdir through the i386
+    /// alias of an allow-listed x86-64 number. With the guard: SIGSYS. Without:
+    /// the directory appears and the child exits 0.
+    fn childAliasEscape(prog: []const SockFilter) void {
+        const m = linux.mmap(@ptrFromInt(low_page), 4096, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true }, -1, 0);
+        if (linux.errno(m) != .SUCCESS) linux.exit(110);
+        const path: [*]u8 = @ptrFromInt(low_page);
+        @memcpy(path[0..dir_name.len], dir_name);
+        noNewPrivs() catch linux.exit(101);
+        seccomp.install(prog) catch linux.exit(102);
+        _ = int80(i386_nr_mkdir, low_page, 0o700); // guard present: never returns
+        linux.exit(0);
+    }
+    fn childBuild() void {
+        childAliasEscape(g_alias_prog);
+    }
+    fn childWx() void {
+        childAliasEscape(g_alias_wx_prog);
+    }
+} else struct {};
+
+var g_alias_prog: []const SockFilter = &.{};
+var g_alias_wx_prog: []const SockFilter = &.{};
+
+fn expectAliasKilled(res: ChildResult) !void {
+    // Clean up first so a RED run does not leave the directory behind.
+    const created = linux.errno(linux.rmdir("zig_sandbox_i386_alias_dir")) == .SUCCESS;
+    try testing.expect(!created); // a directory means the alias went THROUGH the filter
+    try testing.expect(!res.exitedWith(101) and !res.exitedWith(102) and !res.exitedWith(110));
+    try testing.expect(res.killedBy(.SYS));
+}
+
+test "seccomp arch guard (build): the i386 int $0x80 alias of an allowed number is KILLED, not executed (audit S2)" {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            try requireSeccompFilter();
+            const probe = try runInChild(X86Alias.childProbeEmulation);
+            if (!probe.exitedWith(0)) return error.SkipZigTest; // no CONFIG_IA32_EMULATION here
+            g_alias_prog = try seccomp.build(testing.allocator, &seccomp_min_with_getpid, .kill_process);
+            defer testing.allocator.free(g_alias_prog);
+            try expectAliasKilled(try runInChild(X86Alias.childBuild));
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+test "seccomp arch guard (buildWx): the same i386 alias is KILLED through the W^X-shaped program too (audit S3)" {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            try requireSeccompFilter();
+            const probe = try runInChild(X86Alias.childProbeEmulation);
+            if (!probe.exitedWith(0)) return error.SkipZigTest;
+            // nr 39 must not collide with a W^X block (an i386 nr aliasing
+            // mmap/mprotect would be killed by the block's hi-word check, not
+            // by the arch guard — the audit's first probe measured exactly
+            // that false CAUGHT), so the allow-list has getpid AND the guarded
+            // pair.
+            const allowed = [_]linux.SYS{ .exit, .exit_group, .write, .getpid, .mmap, .mprotect };
+            g_alias_wx_prog = try seccomp.buildWx(testing.allocator, &allowed, .kill_process, .{ .errno = @intFromEnum(E.PERM) });
+            defer testing.allocator.free(g_alias_wx_prog);
+            try expectAliasKilled(try runInChild(X86Alias.childWx));
+        },
+        else => return error.SkipZigTest,
+    }
 }
 
 // ── real: seccomp W^X preset (fork children) ─────────────────────────────────
@@ -1046,12 +1410,12 @@ fn childWx() void {
 }
 
 test "seccomp W^X guard: RW mprotect/mmap allowed, RWX and crafted hi-word denied" {
+    try requireSeccompFilter();
     const allowed = [_]linux.SYS{ .exit, .exit_group, .mmap, .mprotect };
     g_wx_prog = try seccomp.buildWx(testing.allocator, &allowed, .kill_process, .{ .errno = @intFromEnum(E.PERM) });
     defer testing.allocator.free(g_wx_prog);
 
     const res = try runInChild(childWx);
-    if (res.exitedWith(102)) return error.SkipZigTest; // kernel lacks CONFIG_SECCOMP_FILTER
     try testing.expect(res.exitedWith(0));
 }
 
@@ -1081,13 +1445,15 @@ fn childTsyncControl() void {
 }
 
 test "seccomp(2)+TSYNC: denied syscall kills the child; control survives (single thread)" {
+    try requireSeccompFilter();
     g_tsync_kill_prog = try seccomp.build(testing.allocator, &seccomp_min_no_getpid, .kill_process);
     defer testing.allocator.free(g_tsync_kill_prog);
     g_tsync_allow_prog = try seccomp.build(testing.allocator, &seccomp_min_with_getpid, .kill_process);
     defer testing.allocator.free(g_tsync_allow_prog);
 
     const killed = try runInChild(childTsyncKill);
-    if (killed.exitedWith(102) or killed.exitedWith(103)) return error.SkipZigTest; // no seccomp(2)/TSYNC
+    // 102/103 here are failures of installTsync on a single thread that has
+    // set no_new_privs — nothing to skip past.
     try testing.expect(killed.killedBy(.SYS));
 
     const control = try runInChild(childTsyncControl);
@@ -1170,10 +1536,10 @@ test "seccomp(2)+TSYNC: filter installed on main thread also kills a pre-existin
     g_tsync_prop_prog = try seccomp.build(testing.allocator, &tsync_prop_allowed, .kill_process);
     defer testing.allocator.free(g_tsync_prop_prog);
 
+    try requireSeccompFilter();
     const res = try runInChild(childTsyncPropagation);
-    if (res.exitedWith(102) or res.exitedWith(103)) return error.SkipZigTest; // no seccomp(2)/TSYNC
-    if (res.exitedWith(120)) return error.SkipZigTest; // couldn't even spawn a thread here
-    try testing.expect(res.killedBy(.SYS)); // TSYNC propagated: whole process died
+    if (res.exitedWith(120)) return error.SkipZigTest; // couldn't even spawn a thread here — not the module's code
+    try testing.expect(res.killedBy(.SYS)); // TSYNC propagated: whole process died (102/103/55 are failures)
 }
 
 // ── real: landlock (fork children) ───────────────────────────────────────────
@@ -1192,7 +1558,7 @@ fn openReadonly(path: [*:0]const u8) E {
 }
 
 fn childLandlock() void {
-    var rs = Ruleset.init(Ruleset.access.read_only) catch linux.exit(80);
+    var rs = Ruleset.init() catch linux.exit(80);
     defer rs.deinit();
     rs.allowPath(g_ll_allowed_dir.ptr, Ruleset.access.read_only) catch linux.exit(81);
     noNewPrivs() catch linux.exit(82);
@@ -1206,33 +1572,215 @@ fn childLandlock() void {
     linux.exit(0);
 }
 
-test "landlock: child restricted to a temp dir cannot read /etc/passwd, can read allowed" {
-    _ = landlockAbiVersion() catch return error.SkipZigTest; // pre-5.13 / disabled
-    if (openReadonly(ll_forbidden_file) != .SUCCESS) return error.SkipZigTest; // no /etc/passwd
+// Paths for the write-denial test: a second directory OUTSIDE the allow-list
+// holding an existing victim file, and names for things the child must fail
+// to create.
+var g_ll_outside_victim: [:0]const u8 = "";
+var g_ll_outside_new: [:0]const u8 = "";
+var g_ll_outside_dir: [:0]const u8 = "";
+var g_ll_inside_new: [:0]const u8 = "";
 
-    // Build a real allowed dir + file with raw syscalls (consistent with the
-    // module; sidesteps the churning std.Io.Dir API). Unique per pid.
-    var dir_buf: [64]u8 = undefined;
-    const dir_z = try std.fmt.bufPrintZ(&dir_buf, "/tmp/zig_sandbox_ll_{d}", .{linux.getpid()});
-    var file_buf: [80]u8 = undefined;
-    const file_z = try std.fmt.bufPrintZ(&file_buf, "{s}/ok.txt", .{dir_z});
+fn expectDenied(e: E) bool {
+    return e == .ACCES or e == .PERM;
+}
 
-    _ = linux.mkdir(dir_z.ptr, 0o700); // ignore EEXIST from a prior run
-    const fd_rc = linux.open(file_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
-    if (linux.errno(fd_rc) != .SUCCESS) return error.SkipZigTest; // /tmp not writable
-    const fd: i32 = @intCast(@as(isize, @bitCast(fd_rc)));
-    _ = linux.write(fd, "allowed\n", 8);
-    _ = linux.close(fd);
-    defer {
-        _ = linux.unlink(file_z.ptr);
-        _ = linux.rmdir(dir_z.ptr);
+/// Audit S1: with `init()` handling every right, a tree allowed `read_only`
+/// is read-only, and the rest of the filesystem is closed for WRITING too —
+/// not just for reading. Before, `init(access.read_only)` handled only
+/// read_file|read_dir, so create/truncate/mkdir/symlink/unlink outside the
+/// allow-list (and writes INSIDE the "read-only" tree) all succeeded.
+fn childLandlockDeniesWrites() void {
+    var rs = Ruleset.init() catch linux.exit(80);
+    defer rs.deinit();
+    rs.allowPath(g_ll_allowed_dir.ptr, Ruleset.access.read_only) catch linux.exit(81);
+    noNewPrivs() catch linux.exit(82);
+    rs.restrictSelf() catch linux.exit(83);
+
+    // Reading the allowed file still works (the ruleset is not simply "deny everything").
+    if (openReadonly(g_ll_allowed_file.ptr) != .SUCCESS) linux.exit(31);
+    // CREATE a new file outside the allow-list.
+    if (!expectDenied(linux.errno(linux.open(g_ll_outside_new.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600)))) linux.exit(40);
+    // OVERWRITE an existing file outside.
+    if (!expectDenied(linux.errno(linux.open(g_ll_outside_victim.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true }, 0)))) linux.exit(41);
+    // MKDIR outside.
+    if (!expectDenied(linux.errno(linux.mkdir(g_ll_outside_dir.ptr, 0o700)))) linux.exit(42);
+    // SYMLINK outside.
+    if (!expectDenied(linux.errno(linux.symlink("/etc/shadow", g_ll_outside_dir.ptr)))) linux.exit(43);
+    // UNLINK outside.
+    if (!expectDenied(linux.errno(linux.unlink(g_ll_outside_victim.ptr)))) linux.exit(44);
+    // And a WRITE inside the read-only tree is denied too — read_only grants reading.
+    if (!expectDenied(linux.errno(linux.open(g_ll_inside_new.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600)))) linux.exit(45);
+    linux.exit(0);
+}
+
+/// Positive control for the above: `read_write` on the allowed tree does
+/// permit creating a file there, so `init()` did not brick the process.
+fn childLandlockReadWriteTree() void {
+    var rs = Ruleset.init() catch linux.exit(80);
+    defer rs.deinit();
+    rs.allowPath(g_ll_allowed_dir.ptr, Ruleset.access.read_write) catch linux.exit(81);
+    noNewPrivs() catch linux.exit(82);
+    rs.restrictSelf() catch linux.exit(83);
+    const rc = linux.open(g_ll_inside_new.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600);
+    if (linux.errno(rc) != .SUCCESS) linux.exit(46);
+    _ = linux.close(@intCast(@as(isize, @bitCast(rc))));
+    if (linux.errno(linux.unlink(g_ll_inside_new.ptr)) != .SUCCESS) linux.exit(47);
+    // Still no reaching outside.
+    if (!expectDenied(linux.errno(linux.open(g_ll_outside_new.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .CLOEXEC = true }, 0o600)))) linux.exit(40);
+    linux.exit(0);
+}
+
+const LandlockFixture = struct {
+    dir_buf: [64]u8 = undefined,
+    file_buf: [80]u8 = undefined,
+    out_dir_buf: [80]u8 = undefined,
+    out_victim_buf: [96]u8 = undefined,
+    out_new_buf: [96]u8 = undefined,
+    out_sub_buf: [96]u8 = undefined,
+    in_new_buf: [96]u8 = undefined,
+    dir: [:0]const u8 = "",
+    file: [:0]const u8 = "",
+    out_dir: [:0]const u8 = "",
+    out_victim: [:0]const u8 = "",
+    out_new: [:0]const u8 = "",
+    out_sub: [:0]const u8 = "",
+    in_new: [:0]const u8 = "",
+
+    /// Skip decisions are made HERE, before any child runs: no Landlock, no
+    /// /etc/passwd, or no writable /tmp are all "the mechanism/fixture is not
+    /// here" — a child later failing is the module failing.
+    fn setup(f: *LandlockFixture) !void {
+        _ = landlockAbiVersion() catch return error.SkipZigTest; // pre-5.13 / disabled
+        if (openReadonly(ll_forbidden_file) != .SUCCESS) return error.SkipZigTest; // no /etc/passwd
+        const pid = linux.getpid();
+        f.dir = try std.fmt.bufPrintZ(&f.dir_buf, "/tmp/zig_sandbox_ll_{d}", .{pid});
+        f.file = try std.fmt.bufPrintZ(&f.file_buf, "{s}/ok.txt", .{f.dir});
+        f.out_dir = try std.fmt.bufPrintZ(&f.out_dir_buf, "/tmp/zig_sandbox_ll_{d}_outside", .{pid});
+        f.out_victim = try std.fmt.bufPrintZ(&f.out_victim_buf, "{s}/victim.txt", .{f.out_dir});
+        f.out_new = try std.fmt.bufPrintZ(&f.out_new_buf, "{s}/created.txt", .{f.out_dir});
+        f.out_sub = try std.fmt.bufPrintZ(&f.out_sub_buf, "{s}/newdir", .{f.out_dir});
+        f.in_new = try std.fmt.bufPrintZ(&f.in_new_buf, "{s}/written.txt", .{f.dir});
+        _ = linux.mkdir(f.dir.ptr, 0o700); // ignore EEXIST from a prior run
+        _ = linux.mkdir(f.out_dir.ptr, 0o700);
+        for ([_][:0]const u8{ f.file, f.out_victim }) |p| {
+            const fd_rc = linux.open(p.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+            if (linux.errno(fd_rc) != .SUCCESS) return error.SkipZigTest; // /tmp not writable
+            const fd: i32 = @intCast(@as(isize, @bitCast(fd_rc)));
+            _ = linux.write(fd, "allowed\n", 8);
+            _ = linux.close(fd);
+        }
+        g_ll_allowed_dir = f.dir;
+        g_ll_allowed_file = f.file;
+        g_ll_outside_dir = f.out_sub;
+        g_ll_outside_victim = f.out_victim;
+        g_ll_outside_new = f.out_new;
+        g_ll_inside_new = f.in_new;
     }
 
-    g_ll_allowed_dir = dir_z;
-    g_ll_allowed_file = file_z;
+    fn teardown(f: *LandlockFixture) void {
+        _ = linux.unlink(f.in_new.ptr);
+        _ = linux.unlink(f.file.ptr);
+        _ = linux.rmdir(f.dir.ptr);
+        _ = linux.unlink(f.out_new.ptr);
+        _ = linux.unlink(f.out_victim.ptr);
+        _ = linux.unlink(f.out_sub.ptr); // a symlink, if the child managed one
+        _ = linux.rmdir(f.out_sub.ptr);
+        _ = linux.rmdir(f.out_dir.ptr);
+    }
+};
 
+test "landlock: child restricted to a temp dir cannot read /etc/passwd, can read allowed" {
+    var f: LandlockFixture = .{};
+    try f.setup();
+    defer f.teardown();
     const res = try runInChild(childLandlock);
-    if (res.exitedWith(80)) return error.SkipZigTest; // ruleset create failed (ABI edge)
+    // 80 (init failed) is a FAILURE here: landlockAbiVersion said Landlock exists.
+    try testing.expect(res.exitedWith(0));
+}
+
+test "landlock: init() + allowPath(read_only) denies create/overwrite/mkdir/symlink/unlink outside AND writes inside (audit S1)" {
+    var f: LandlockFixture = .{};
+    try f.setup();
+    defer f.teardown();
+    const res = try runInChild(childLandlockDeniesWrites);
+    try testing.expect(res.exitedWith(0));
+}
+
+test "landlock: init() + allowPath(read_write) still permits creating a file in the allowed tree (positive control)" {
+    var f: LandlockFixture = .{};
+    try f.setup();
+    defer f.teardown();
+    const res = try runInChild(childLandlockReadWriteTree);
+    try testing.expect(res.exitedWith(0));
+}
+
+test "landlock: initHandling(read_only) is the explicit, weaker form — access.all is what init() handles" {
+    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    var narrow = try Ruleset.initHandling(Ruleset.access.read_only);
+    defer narrow.deinit();
+    try testing.expectEqual(Ruleset.access.read_only, narrow.handled);
+    var full = try Ruleset.init();
+    defer full.deinit();
+    try testing.expectEqual(Ruleset.accessMaskForAbi(full.abi), full.handled);
+    try testing.expect(full.handled & Ruleset.access.write_file != 0);
+    try testing.expect(full.handled & Ruleset.access.make_dir != 0);
+    try testing.expect(full.handled & Ruleset.access.make_sym != 0);
+    try testing.expect(full.handled & Ruleset.access.remove_file != 0);
+    try testing.expectEqual(@as(u64, (1 << 16) - 1), Ruleset.access.all);
+}
+
+test "landlock: allowPath refuses a symlink by name instead of granting its target (audit S10)" {
+    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    var link_buf: [64]u8 = undefined;
+    const link_z = try std.fmt.bufPrintZ(&link_buf, "/tmp/zig_sandbox_ll_{d}_link", .{linux.getpid()});
+    _ = linux.unlink(link_z.ptr);
+    if (linux.errno(linux.symlink("/", link_z.ptr)) != .SUCCESS) return error.SkipZigTest; // /tmp not writable
+    defer _ = linux.unlink(link_z.ptr);
+    var rs = try Ruleset.init();
+    defer rs.deinit();
+    try testing.expectError(error.PathIsSymlink, rs.allowPath(link_z.ptr, Ruleset.access.read_only));
+    // The real directory behind an intermediate symlink component is fine:
+    // O_NOFOLLOW applies to the final component only.
+    try rs.allowPath("/tmp", Ruleset.access.read_only);
+}
+
+// Audit S4: `landlock_restrict_self` confines the calling thread; there is no
+// TSYNC for Landlock. This pins the measured kernel behaviour so the docs'
+// "restrict BEFORE spawning workers" is a tested statement, not a hope.
+var g_ll_worker_result: std.atomic.Value(u32) = .init(0);
+
+fn landlockWorker(release: *std.atomic.Value(bool)) void {
+    while (!release.load(.acquire)) {
+        var ts = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+    g_ll_worker_result.store(if (openReadonly(ll_forbidden_file.ptr) == .SUCCESS) 1 else 2, .release);
+}
+
+fn childLandlockThreads() void {
+    armWatchdog(5);
+    var release = std.atomic.Value(bool).init(false);
+    const worker = std.Thread.spawn(.{}, landlockWorker, .{&release}) catch linux.exit(120);
+    var rs = Ruleset.init() catch linux.exit(80);
+    defer rs.deinit();
+    rs.allowPath(g_ll_allowed_dir.ptr, Ruleset.access.read_only) catch linux.exit(81);
+    noNewPrivs() catch linux.exit(82);
+    rs.restrictSelf() catch linux.exit(83);
+    // Main thread: confined.
+    if (!expectDenied(openReadonly(ll_forbidden_file.ptr))) linux.exit(30);
+    release.store(true, .release);
+    worker.join();
+    // Worker spawned BEFORE restrictSelf: NOT confined (1). 2 would mean the
+    // kernel now propagates — a change worth knowing about by name.
+    linux.exit(if (g_ll_worker_result.load(.acquire) == 1) 0 else 50);
+}
+
+test "landlock: restrictSelf confines the calling thread only — a worker spawned before it is not confined (audit S4)" {
+    var f: LandlockFixture = .{};
+    try f.setup();
+    defer f.teardown();
+    const res = try runInChild(childLandlockThreads);
+    if (res.exitedWith(120)) return error.SkipZigTest; // could not spawn a thread here
     try testing.expect(res.exitedWith(0));
 }
 
@@ -1272,6 +1820,12 @@ test "disableCoreDumps sets RLIMIT_CORE to zero in the child" {
     const Local = struct {
         fn child() void {
             disableCoreDumps() catch linux.exit(50);
+            // Read it back: the function returning success is not the limit
+            // being zero (audit S15 — a mutation leaving RLIMIT_CORE
+            // unlimited passed this test).
+            var rl: linux.rlimit = undefined;
+            if (linux.errno(linux.getrlimit(.CORE, &rl)) != .SUCCESS) linux.exit(51);
+            if (rl.cur != 0 or rl.max != 0) linux.exit(52);
             linux.exit(0);
         }
     };
@@ -1319,8 +1873,17 @@ const nobody_gid: linux.gid_t = 65534;
 fn childDropThenTryRegain() void {
     dropPrivileges(.{ .uid = nobody_uid, .gid = nobody_gid }) catch linux.exit(90);
     if (linux.getuid() != nobody_uid) linux.exit(91);
+    // gid too — the classic setuid-first hole leaves gid 0 behind while uid
+    // reads as nobody (audit S13: the old check was uid-only).
+    if (linux.getgid() != nobody_gid or linux.getegid() != nobody_gid) linux.exit(93);
+    var ruid: linux.uid_t = 0;
+    var euid: linux.uid_t = 0;
+    var suid: linux.uid_t = 0;
+    _ = linux.getresuid(&ruid, &euid, &suid);
+    if (suid != nobody_uid) linux.exit(94); // saved uid is the seteuid ladder back up
     // Must not be able to climb back to uid 0.
     if (linux.errno(linux.setuid(0)) == .SUCCESS) linux.exit(92); // regained root!
+    if (linux.errno(linux.setgid(0)) == .SUCCESS) linux.exit(95);
     linux.exit(0);
 }
 
