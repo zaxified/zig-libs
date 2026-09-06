@@ -76,8 +76,12 @@ echo "::endgroup::"
 
 echo "::group::apt"
 sudo apt-get update "${APT_QUIET[@]}" >/dev/null 2>&1 || true
-# dtls's live DTLS 1.3 peer. wolfSSL specifically, because OpenSSL 3.5 and
-# GnuTLS 3.8 have no DTLS 1.3 at all.
+# dtls's live DTLS 1.3 peer, for `zig build interop-dtls` ONLY. wolfSSL
+# specifically, because OpenSSL 3.5 and GnuTLS 3.8 have no DTLS 1.3 at all.
+# ⚠ `test-dtls` has NOT needed this since 2026-09-06 -- it replays a captured
+# transcript and passes 268/268 on a box with no compiler and no wolfSSL. This
+# install exists so a lane can RE-TAKE that transcript; a lane that only runs
+# tests does not need it.
 sudo apt-get install "${APT_QUIET[@]}" libwolfssl-dev >/dev/null 2>&1 \
     && echo "wolfssl: OK" || echo "wolfssl: install failed"
 echo "::endgroup::"

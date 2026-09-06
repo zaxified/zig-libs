@@ -80,6 +80,13 @@ const Module = struct {
     ///
     /// `jinja` is deliberately absent: its live peer is a Python script it runs
     /// to completion, not a network peer with a clock.
+    ///
+    /// `dtls` LEFT this list on 2026-09-06 and the reason generalises: its
+    /// wolfSSL peer moved to `tools/interop.zig`, so `test-dtls` no longer
+    /// opens anything at all -- it replays a captured transcript. A module
+    /// whose foreign peer lives under `tools/` is never `live`, because the
+    /// thing this flag serialises has left the test binary. Declaring it
+    /// anyway costs the serial run for nothing.
     live: bool = false,
 };
 
@@ -265,7 +272,7 @@ const module_list = [_]Module{
     .{ .name = "slhdsa", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "falcon", .libs = &.{"crypto"} },
     .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true },
-    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"}, .live = true },
+    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" } },
     .{ .name = "tlsresume", .libs = &.{"crypto"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{"chachapoly"} },
     .{ .name = "sandbox", .libs = &.{"os"} },

@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** `dtls` stops declaring itself
+  `live` and stops declaring a `testkit` test dependency. Both went stale earlier
+  the same day, when the wolfSSL peer moved to `tools/interop.zig`: `live` means
+  "this module's tests talk to a real external peer, so run them serially", and
+  `test-dtls` now opens nothing — it replays `src/testdata/wolfssl_transcript.txt`
+  and passes 268/268 with no compiler and no wolfSSL on the box. Nothing under
+  `src/` had imported `testkit` since the move either. The cost of leaving them
+  was a needlessly serialised test run; no behaviour, API or output changes.
+
 - **2026-09-06** — **The module stops shipping foreign source.** The live
   wolfSSL interop moved out of `src/` and became a standalone program; what it
   proves moved *in*, as a committed recording.

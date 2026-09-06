@@ -874,14 +874,19 @@ capability_check() {
         fi
     fi
 
-    # dtls's live third-party interop compiles a small wolfSSL peer with cc.
-    # Both are needed: no compiler, or no wolfSSL headers/library, and the
-    # tests skip. wolfSSL is the DTLS 1.3 peer here because OpenSSL 3.5.5 and
-    # GnuTLS 3.8.12 have no DTLS 1.3 at all.
+    # dtls's interop PROGRAM compiles a small wolfSSL peer with cc. Both are
+    # needed to re-take the transcript; neither is needed to check it. Since
+    # 2026-09-06 `test-dtls` replays `src/testdata/wolfssl_transcript.txt` and
+    # passes 268/268 with no compiler and no wolfSSL on the box -- it used to
+    # skip 14 tests there, silently, which is why this gap is still reported
+    # rather than deleted: without these, the transcript can never be RE-TAKEN,
+    # and a frozen anchor that nobody can refresh is how this repo lost one
+    # before. wolfSSL is the DTLS 1.3 peer because OpenSSL 3.5.5 and GnuTLS
+    # 3.8.12 have no DTLS 1.3 at all.
     if ! command -v cc >/dev/null 2>&1; then
-        gaps+=("no C compiler (cc)|2 dtls live wolfSSL interop tests skip|sudo apt install build-essential")
+        gaps+=("no C compiler (cc)|'zig build interop-dtls' cannot re-take the wolfSSL transcript (test-dtls replays it hermetically)|sudo apt install build-essential")
     elif [[ ! -e /usr/include/wolfssl/ssl.h ]]; then
-        gaps+=("wolfSSL headers missing|2 dtls live wolfSSL interop tests skip|sudo apt install libwolfssl-dev")
+        gaps+=("wolfSSL headers missing|'zig build interop-dtls' cannot re-take the wolfSSL transcript (test-dtls replays it hermetically)|sudo apt install libwolfssl-dev")
     fi
 
     # ssh's live interop needs BOTH directions of a real OpenSSH: `sshd` for
