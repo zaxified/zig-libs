@@ -657,7 +657,24 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   maturity is answerable from the module itself; `modules/_template/CHANGELOG.md` is the
   skeleton, and a module without one fails `zig build check-changelog`. Within the file, a
   change to behaviour or API is recorded newest first, each entry naming the tag it shipped in
-  and flagging breaking changes **BREAKING**. Routine internal refactors need no entry. The root
+  and flagging breaking changes **BREAKING**. Routine internal refactors need no entry.
+  **What "needs an entry" means mechanically** (2026-09-06): `zig build check-changelog` proves
+  the file is there and well formed; `scripts/check-changelog-entry.py` proves it MOVED when the
+  module did, by this rule — a module owes a new dated bullet whenever, under
+  `modules/<name>/src/`, the change-set touches a line beginning with `pub` **or** moves more
+  than 25 lines of code, where "code" excludes blank lines, comment lines, whitespace-only
+  differences and everything inside a `test` block, and `example/`, `README.md` and `SPEC.md`
+  are not looked at. Two triggers and not one, because a line threshold gets both ends
+  backwards: widening a return type is one line every consumer must recompile against, and
+  re-flowing a match is 200 lines nobody can observe; the `test` exclusion is load-bearing here
+  because tests live in `src/` (§7), so without it a batch of regression tests reads as a
+  rewrite. The comparison is the base ref against the tree — CI passes the push or PR base and
+  that run is the authority; the pre-commit hook asks the same question of one commit and is
+  early, not authoritative. **A change that genuinely cannot be seen from outside the module
+  still writes the bullet**, in the same dated form, marked `**NO CONSUMER-VISIBLE CHANGE:**` —
+  there is no exemption flag, no allow-list and no per-module table, for the same reason the
+  `**BREAKING` index and `FUZZ-EXEMPT.tsv` were both retired on 2026-08-14, and the gate names
+  every module that used the escape on every run so it is counted rather than hidden. The root
   `CHANGELOG.md` stays as the per-release index — which modules a tag touched — and does not
   restate the detail. A consumer of three modules should be able to answer "what changed for
   me" by reading three files, not by scanning every release section of one.
@@ -793,3 +810,50 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   transitive sibling deps + a minimal `build.zig`) to GitHub releases — `zig fetch`
   accepts any tarball URL. That is the answer to "the repo is too big to fetch";
   splitting the repository is not.
+
+## 9. Where a verification instrument lives
+
+An **instrument** is anything built to *check* this code rather than to be shipped by it: a
+test, a fuzz or ctgrind harness, a probe, a benchmark, a fixture, a corpus, a mutation
+runner, a hostile stand-in peer, a counting allocator, or an oracle that recomputes an
+answer some other way. An instrument is code. It rots exactly like code, and only a gate
+that reaches it can notice.
+
+- **An instrument that serves ONE module lives in that module's directory.** Under
+  `modules/<name>/`, beside the thing it checks and inside what the module's own steps
+  already compile — `src/` for tests and for the fuzz/ctgrind harnesses the build scans
+  for (§5), a subdirectory of the module for fixtures, corpora and reference scripts.
+  **Never in an audit directory, and never pasted into an audit document.** An audit finding
+  cites the instrument by its path in this repository; it does not carry the instrument's
+  body.
+- **An instrument that serves SEVERAL modules lives in `scripts/`** — or in a `tools/`
+  directory beside it, if one is ever created for instruments that are not shell entry
+  points. `scripts/` is already the documented home for repo-wide checks, and
+  `check-scripts-doc` already holds each file there to a mention. A shared harness written
+  in Zig that modules *import* is a different thing and goes to
+  [`testkit`](modules/testkit) under §6.1 instead — `test_deps`, never `deps`.
+- **A developer's private notebook is not a location for an instrument.** Audit records,
+  findings, campaign ledgers and working notes legitimately live outside this repository.
+  The instruments that produced their numbers do not. If a number in a note was measured,
+  the thing that measured it is a file in this tree, and the note names that path.
+
+**The concrete failure this prevents.** An instrument parked in an audit directory is
+outside every gate its module has. `zig build test-<name>` does not compile it;
+`check-fuzz`, `check-ctgrind`, `check-dark-tests`, `check-portable` and `check-pubfn-reach`
+cannot see it; CI never runs it; `zig fmt --check` never touches it. So when the module's
+API moves under it, nothing reddens — the instrument simply stops being true, silently, and
+the finding it once backed keeps citing it. The next audit of that module then opens a tree
+with no instrument in it and builds the same one again from scratch, which is the expensive
+half of an audit paid for twice.
+
+That is measured, not hypothetical. The 2026-09 audit campaign built a counting allocator
+for memory amplification, a stalling stand-in peer to prove a missing deadline, a mutation
+runner to show which guards no test has teeth on, and several oracles that recompute a
+result against a foreign reference implementation — and left every one of them outside this
+repository. Each was then rebuilt by hand, module after module, because there was nothing
+here to reach for.
+
+**So an instrument is finished when it is in the tree and something runs it**, not when it
+has printed its number. If it is worth citing in a finding, it is worth a path here. If it
+is genuinely single-use scratch that reproduces nothing, it is deleted rather than filed
+somewhere a future reader will mistake for an asset.

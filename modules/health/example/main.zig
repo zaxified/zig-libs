@@ -27,6 +27,15 @@ const health = @import("health");
 const router = @import("router");
 const http = @import("http");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
     var in: std.Io.Reader = .fixed(bytes);
     var out: std.Io.Writer = .fixed(out_buf);
@@ -99,10 +108,10 @@ pub fn main() !void {
         db_ready.store(false, .release);
         var buf: [2048]u8 = undefined;
         const live = runWire(&r, wire("GET", "/healthz"), &buf);
-        std.debug.assert(statusOf(live) == 200);
+        must(statusOf(live) == 200, @src());
         const ready = runWire(&r, wire("GET", "/readyz"), &buf);
-        std.debug.assert(statusOf(ready) == 503);
-        std.debug.assert(std.mem.eql(u8, bodyOf(ready), "not ready: database\n"));
+        must(statusOf(ready) == 503, @src());
+        must(std.mem.eql(u8, bodyOf(ready), "not ready: database\n"), @src());
         std.debug.print("liveness 200 + readiness 503: the two signals stayed independent\n", .{});
     }
 
@@ -112,8 +121,8 @@ pub fn main() !void {
         db_ready.store(true, .release);
         var buf: [2048]u8 = undefined;
         const ready = runWire(&r, wire("GET", "/readyz"), &buf);
-        std.debug.assert(statusOf(ready) == 200);
-        std.debug.assert(std.mem.eql(u8, bodyOf(ready), "OK\n"));
+        must(statusOf(ready) == 200, @src());
+        must(std.mem.eql(u8, bodyOf(ready), "OK\n"), @src());
         std.debug.print("recovery: readiness returned to 200 as soon as the dependency did\n", .{});
     }
 
@@ -121,9 +130,9 @@ pub fn main() !void {
     // its own test suite, before this, only ever drove GET).
     {
         var buf: [2048]u8 = undefined;
-        std.debug.assert(statusOf(runWire(&r, wire("HEAD", "/healthz"), &buf)) == 200);
+        must(statusOf(runWire(&r, wire("HEAD", "/healthz"), &buf)) == 200, @src());
         db_ready.store(false, .release);
-        std.debug.assert(statusOf(runWire(&r, wire("HEAD", "/readyz"), &buf)) == 503);
+        must(statusOf(runWire(&r, wire("HEAD", "/readyz"), &buf)) == 503, @src());
         db_ready.store(true, .release);
         std.debug.print("HEAD probes on both paths behave like GET\n", .{});
     }
@@ -134,9 +143,9 @@ pub fn main() !void {
     {
         var buf: [2048]u8 = undefined;
         const app = runWire(&r, wire("GET", "/"), &buf);
-        std.debug.assert(std.mem.eql(u8, bodyOf(app), "app"));
+        must(std.mem.eql(u8, bodyOf(app), "app"), @src());
         const posted = runWire(&r, "POST /readyz HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", &buf);
-        std.debug.assert(statusOf(posted) == 404); // no POST /readyz route registered
+        must(statusOf(posted) == 404, @src()); // no POST /readyz route registered
     }
 
     // 5. `detail = false`: the status is unchanged but the dependency name
@@ -152,9 +161,9 @@ pub fn main() !void {
         db_ready.store(false, .release);
         var buf: [2048]u8 = undefined;
         const down = runWire(&r2, wire("GET", "/readyz"), &buf);
-        std.debug.assert(statusOf(down) == 503);
-        std.debug.assert(std.mem.eql(u8, bodyOf(down), "not ready\n"));
-        std.debug.assert(std.mem.indexOf(u8, down, "database") == null);
+        must(statusOf(down) == 503, @src());
+        must(std.mem.eql(u8, bodyOf(down), "not ready\n"), @src());
+        must(std.mem.indexOf(u8, down, "database") == null, @src());
         db_ready.store(true, .release);
         std.debug.print("detail=false: 503 preserved, dependency name withheld\n", .{});
     }
@@ -178,11 +187,11 @@ pub fn main() !void {
 
         var buf: [4096]u8 = undefined;
         const down = runWire(&r3, wire("GET", "/readyz"), &buf);
-        std.debug.assert(statusOf(down) == 503);
+        must(statusOf(down) == 503, @src());
         const body = bodyOf(down);
-        std.debug.assert(std.mem.endsWith(u8, body, "not ready: ...\n")); // truncation marker
-        std.debug.assert(std.mem.indexOf(u8, body, "dep000") != null); // earliest failures survive
-        std.debug.assert(std.mem.indexOf(u8, body, "dep039") == null); // the last one did not fit
+        must(std.mem.endsWith(u8, body, "not ready: ...\n"), @src()); // truncation marker
+        must(std.mem.indexOf(u8, body, "dep000") != null, @src()); // earliest failures survive
+        must(std.mem.indexOf(u8, body, "dep039") == null, @src()); // the last one did not fit
         std.debug.print("capacity: {d} simultaneous failures truncated the 512-byte detail body ({d} bytes)\n", .{ many.len, body.len });
     }
 
@@ -227,7 +236,7 @@ pub fn main() !void {
         flipper.join();
         db_ready.store(true, .release);
 
-        std.debug.assert(seen_200.load(.seq_cst) + seen_503.load(.seq_cst) == 4 * 2_000);
+        must(seen_200.load(.seq_cst) + seen_503.load(.seq_cst) == 4 * 2_000, @src());
         std.debug.print("concurrency: 4 threads x 2000 probes raced a flipping dependency ({d} ok / {d} down), no crash\n", .{ seen_200.load(.seq_cst), seen_503.load(.seq_cst) });
     }
 

@@ -22,6 +22,15 @@
 const std = @import("std");
 const isis_dis = @import("isis-dis");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn snpa(last: u8) isis_dis.Snpa {
     return .{ 0x00, 0x00, 0x00, 0x00, 0x00, last };
 }
@@ -53,8 +62,8 @@ pub fn main() !void {
     // t=1: local is alone on the LAN → local becomes DIS.
     const s0 = election.recompute(&.{}, 1);
     reportEffect("t=1 (alone)", s0);
-    std.debug.assert(s0.result.is_local_dis);
-    std.debug.assert(s0.change.?.became_dis);
+    must(s0.result.is_local_dis, @src());
+    must(s0.change.?.became_dis, @src());
 
     // t=2: a neighbour with equal priority but a lower SNPA joins — local
     // still wins the tie-break, no change.
@@ -65,7 +74,7 @@ pub fn main() !void {
     };
     const s1 = election.recompute(&.{weaker}, 2);
     reportEffect("t=2 (weaker neighbour)", s1);
-    std.debug.assert(s1.change == null);
+    must(s1.change == null, @src());
 
     // t=3: a higher-priority router appears → immediate preemption, no
     // hold-down (unlike OSPF's DR) — local must resign right away.
@@ -77,8 +86,8 @@ pub fn main() !void {
     };
     const s2 = election.recompute(&.{ weaker, king }, 3);
     reportEffect("t=3 (king arrives)", s2);
-    std.debug.assert(!s2.result.is_local_dis);
-    std.debug.assert(s2.change.?.resigned_dis);
+    must(!s2.result.is_local_dis, @src());
+    must(s2.change.?.resigned_dis, @src());
 
     // The new DIS's pseudonode LSP-ID — what a real listener would purge
     // its OWN pseudonode LSP against, and what it would start tracking for
@@ -90,6 +99,6 @@ pub fn main() !void {
     // t=4: the king leaves → local resumes DIS immediately.
     const s3 = election.recompute(&.{weaker}, 4);
     reportEffect("t=4 (king departs)", s3);
-    std.debug.assert(s3.result.is_local_dis);
-    std.debug.assert(s3.change.?.became_dis);
+    must(s3.result.is_local_dis, @src());
+    must(s3.change.?.became_dis, @src());
 }

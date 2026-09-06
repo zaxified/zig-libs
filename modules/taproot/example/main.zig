@@ -60,6 +60,15 @@ const std = @import("std");
 const bip340 = @import("bip340");
 const taproot = @import("taproot");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn hexBytes(comptime hex: *const [64]u8) [32]u8 {
     var out: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
@@ -87,22 +96,22 @@ pub fn main() !void {
     const internal_pub = internal_kp.public;
     // ACTUALLY RUN: embit `PrivateKey(...).get_public_key().xonly()`.
     const expected_internal_x = hexBytes("fd35c07037862d197059d2a5b7a53d0325192f7a924451ad54904b009bc8ec57");
-    std.debug.assert(std.mem.eql(u8, &internal_pub.x, &expected_internal_x));
+    must(std.mem.eql(u8, &internal_pub.x, &expected_internal_x), @src());
 
     // ── key-path-only output: no script tree at all ────────────────────────
     {
         const tweak = try taproot.tweakPublicKey(internal_pub, null);
         const expected_x = hexBytes("c5add8d76df8f1a674125667572a82b5bc499b71d457a310017e6bfcc4ffea84");
-        std.debug.assert(std.mem.eql(u8, &tweak.output.x, &expected_x));
+        must(std.mem.eql(u8, &tweak.output.x, &expected_x), @src());
         // Parity confirmed via the from-spec re-implementation, NOT embit
         // — see file doc comment.
-        std.debug.assert(tweak.output.parity == 1);
+        must(tweak.output.parity == 1, @src());
         std.debug.print("key-path-only output key: {x} parity={d}\n", .{ tweak.output.x, tweak.output.parity });
 
         const q_bytes = try taproot.tweakSecretKey(internal_sk, null);
         const q_sk = try bip340.SecretKey.fromBytes(q_bytes);
         const sig = try bip340.sign(q_sk, &message, aux_rand, io);
-        std.debug.assert(bip340.verify(tweak.output.asXOnly(), &message, try bip340.Signature.fromBytes(sig)));
+        must(bip340.verify(tweak.output.asXOnly(), &message, try bip340.Signature.fromBytes(sig)), @src());
         std.debug.print("key-path-only signature: {x}\n", .{sig});
         // ACTUALLY RUN: embit's `PublicKey.schnorr_verify(sig, msg)` against
         // `tweak.output`'s xonly accepted this exact signature.
@@ -112,16 +121,16 @@ pub fn main() !void {
     {
         const tweak = try taproot.tweakPublicKey(internal_pub, merkle_root_bytes);
         const expected_x = hexBytes("1355fd61d30950d5d7afbc6bfb80d6b45a202fb29932b20fb868d7292d448935");
-        std.debug.assert(std.mem.eql(u8, &tweak.output.x, &expected_x));
+        must(std.mem.eql(u8, &tweak.output.x, &expected_x), @src());
         // Parity confirmed via the from-spec re-implementation, NOT embit
         // — see file doc comment.
-        std.debug.assert(tweak.output.parity == 1);
+        must(tweak.output.parity == 1, @src());
         std.debug.print("script-committed output key: {x} parity={d}\n", .{ tweak.output.x, tweak.output.parity });
 
         const q_bytes = try taproot.tweakSecretKey(internal_sk, merkle_root_bytes);
         const q_sk = try bip340.SecretKey.fromBytes(q_bytes);
         const sig = try bip340.sign(q_sk, &message, aux_rand, io);
-        std.debug.assert(bip340.verify(tweak.output.asXOnly(), &message, try bip340.Signature.fromBytes(sig)));
+        must(bip340.verify(tweak.output.asXOnly(), &message, try bip340.Signature.fromBytes(sig)), @src());
         std.debug.print("script-committed signature: {x}\n", .{sig});
         // ACTUALLY RUN: embit's `PublicKey.schnorr_verify(sig, msg)` against
         // `tweak.output`'s xonly accepted this exact signature too.
@@ -129,7 +138,7 @@ pub fn main() !void {
         // Sanity: committing a script tree changes the output key versus
         // the key-path-only case above, even from the same internal key.
         const keypath_only = try taproot.tweakPublicKey(internal_pub, null);
-        std.debug.assert(!std.mem.eql(u8, &tweak.output.x, &keypath_only.output.x));
+        must(!std.mem.eql(u8, &tweak.output.x, &keypath_only.output.x), @src());
     }
 
     // ── negative paths: named errors, never a blanket catch ───────────────

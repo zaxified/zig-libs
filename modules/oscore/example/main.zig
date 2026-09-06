@@ -54,6 +54,15 @@
 const std = @import("std");
 const oscore = @import("oscore");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A fabricated, non-secret 16-byte OSCORE Master Secret for this scenario
 /// only — not a published vector, not a real key.
 const master_secret = [16]u8{ 0x9e, 0x7c, 0xa9, 0x00, 0x35, 0x1a, 0x6c, 0x7d, 0x1b, 0x9e, 0x22, 0x64, 0xb1, 0xd8, 0xa9, 0x51 };
@@ -82,8 +91,8 @@ pub fn main() !void {
     var server_ctx = try oscore.deriveContext(gpa, &master_secret, master_salt, null, server_id, client_id, .aes_ccm_16_64_128);
     // Figure 4's mirroring: this endpoint's sender key is the peer's
     // recipient key, and vice versa.
-    std.debug.assert(std.mem.eql(u8, &client_ctx.sender.key, &server_ctx.recipient.key));
-    std.debug.assert(std.mem.eql(u8, &client_ctx.recipient.key, &server_ctx.sender.key));
+    must(std.mem.eql(u8, &client_ctx.sender.key, &server_ctx.recipient.key), @src());
+    must(std.mem.eql(u8, &client_ctx.recipient.key, &server_ctx.sender.key), @src());
 
     // ── Round 1: client GET request -> server response, reusing the
     // request's nonce (RFC 8613 §5.2's "typically" case) ───────────────
@@ -100,14 +109,14 @@ pub fn main() !void {
     defer gpa.free(protected1.ciphertext);
     const option1_wire = try protected1.option.encode(gpa);
     defer gpa.free(option1_wire);
-    std.debug.assert(client_ctx.sender.sequence_number == 1); // incremented by protect
+    must(client_ctx.sender.sequence_number == 1, @src()); // incremented by protect
 
     // "Over the wire": the server only ever sees encoded bytes.
     const decoded_option1 = try oscore.OscoreOption.decode(option1_wire);
     const aad1_server = oscore.AadParams{ .request_kid = decoded_option1.kid.?, .request_piv = req1_piv_bytes };
     const server_view1 = try oscore.unprotect(gpa, &server_ctx, decoded_option1, protected1.ciphertext, aad1_server, null, true);
     defer gpa.free(server_view1);
-    std.debug.assert(std.mem.eql(u8, server_view1, request1_plaintext));
+    must(std.mem.eql(u8, server_view1, request1_plaintext), @src());
     std.debug.print("round1 request: server recovered {s}\n", .{server_view1});
 
     // Server's response, hand-assembled per §5.2's majority case: reuse
@@ -143,7 +152,7 @@ pub fn main() !void {
     const response1_option: oscore.OscoreOption = .{};
     const response1_option_wire = try response1_option.encode(gpa);
     defer gpa.free(response1_option_wire);
-    std.debug.assert(response1_option_wire.len == 0);
+    must(response1_option_wire.len == 0, @src());
 
     // Client receives the response: no Partial IV in the option -> it
     // must supply the ORIGINAL REQUEST's (id, Partial IV) itself.
@@ -151,7 +160,7 @@ pub fn main() !void {
     const request1_nonce_source = oscore.NonceSource{ .id = client_ctx.sender.id, .partial_iv = 0 };
     const client_view1 = try oscore.unprotect(gpa, &client_ctx, decoded_response1_option, ciphertext1_resp, req1_aad, request1_nonce_source, false);
     defer gpa.free(client_view1);
-    std.debug.assert(std.mem.eql(u8, client_view1, response1_plaintext));
+    must(std.mem.eql(u8, client_view1, response1_plaintext), @src());
     std.debug.print("round1 response: client recovered {s}\n", .{client_view1});
 
     // ── Round 2: a second full request/response exchange — proves the
@@ -163,7 +172,7 @@ pub fn main() !void {
     const req2_aad = oscore.AadParams{ .request_kid = client_ctx.sender.id, .request_piv = req2_piv_bytes };
     const protected2 = try oscore.protect(gpa, &client_ctx, request2_plaintext, req2_aad, true, null);
     defer gpa.free(protected2.ciphertext);
-    std.debug.assert(client_ctx.sender.sequence_number == 2);
+    must(client_ctx.sender.sequence_number == 2, @src());
 
     const option2_wire = try protected2.option.encode(gpa);
     defer gpa.free(option2_wire);
@@ -172,9 +181,9 @@ pub fn main() !void {
     const aad2_server = oscore.AadParams{ .request_kid = decoded_option2.kid.?, .request_piv = req2_piv_bytes };
     const server_view2 = try oscore.unprotect(gpa, &server_ctx, decoded_option2, protected2.ciphertext, aad2_server, null, true);
     defer gpa.free(server_view2);
-    std.debug.assert(std.mem.eql(u8, server_view2, request2_plaintext));
+    must(std.mem.eql(u8, server_view2, request2_plaintext), @src());
     std.debug.print("round2 request: server recovered {s}\n", .{server_view2});
-    std.debug.assert(server_ctx.recipient.replay_window.highest_seen == 1); // seq numbers are 0-based; round2's piv is 1
+    must(server_ctx.recipient.replay_window.highest_seen == 1, @src()); // seq numbers are 0-based; round2's piv is 1
 
     // ── Negative path 1: replaying round 1's exact wire bytes must be
     // rejected by NAME, not silently re-accepted (state carried from
@@ -199,7 +208,7 @@ pub fn main() !void {
     const req3_aad = oscore.AadParams{ .request_kid = client_ctx.sender.id, .request_piv = req3_piv_bytes };
     const protected3 = try oscore.protect(gpa, &client_ctx, request3_plaintext, req3_aad, true, null);
     defer gpa.free(protected3.ciphertext);
-    std.debug.assert(client_ctx.sender.sequence_number == 3);
+    must(client_ctx.sender.sequence_number == 3, @src());
     const option3_wire = try protected3.option.encode(gpa);
     defer gpa.free(option3_wire);
     const decoded_option3 = try oscore.OscoreOption.decode(option3_wire);
@@ -227,7 +236,7 @@ pub fn main() !void {
     // the real message at the same Partial IV must still be accepted.
     const server_view3 = try oscore.unprotect(gpa, &server_ctx, decoded_option3, protected3.ciphertext, aad3_server, null, true);
     defer gpa.free(server_view3);
-    std.debug.assert(std.mem.eql(u8, server_view3, request3_plaintext));
+    must(std.mem.eql(u8, server_view3, request3_plaintext), @src());
     std.debug.print("round3 request (after rejected forgery, same seq#): server recovered {s}\n", .{server_view3});
 
     std.debug.print("oscore example: OK\n", .{});

@@ -19,6 +19,15 @@ const std = @import("std");
 const pagecache = @import("pagecache");
 const kvtree = @import("kvtree");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -57,7 +66,7 @@ pub fn main() !void {
 
     const s = cache.stats();
     std.debug.print("cache stats: hits={d} misses={d} resident_pages={d}\n", .{ s.hits, s.misses, s.resident_pages });
-    std.debug.assert(s.hits > 0);
+    must(s.hits > 0, @src());
 
     // A second exclusive opener over the same store is refused by name --
     // kvtree's whole correctness case rests on being the sole writer of its

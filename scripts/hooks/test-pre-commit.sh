@@ -13,6 +13,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="$SCRIPT_DIR/pre-commit"
 [[ -x "$HOOK" ]] || { echo "test-pre-commit: $HOOK is not executable" >&2; exit 1; }
+CLE="$SCRIPT_DIR/../check-changelog-entry.py"
+[[ -x "$CLE" ]] || { echo "test-pre-commit: $CLE is not executable" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -20,6 +22,11 @@ cd "$WORK" || exit 1
 git init -q .
 git config user.email t@t
 git config user.name t
+# The hook resolves its sibling checks from `git rev-parse --show-toplevel`, so
+# the throwaway repo gets a real copy of the changelog gate. Cases 1-8 below
+# therefore run the WHOLE hook, not the fmt half of it.
+mkdir -p scripts
+cp "$CLE" scripts/check-changelog-entry.py
 
 fails=0
 check() { # check <label> <expected-exit> <actual-exit>
@@ -82,6 +89,111 @@ if [[ "$before" == "$after" ]]; then
     printf '  ok   %-52s\n' "fmt preserves trailing space in a \\\\ string"
 else
     printf '  FAIL %-52s zig fmt REWROTE string data\n' "fmt preserves trailing space in a \\\\ string"
+    fails=$((fails + 1))
+fi
+
+# --------------------------------------------------------------------------
+# 9-17: the changelog half. Same construction: a throwaway module, staged
+# content only, and every case stated as the pair "this shape must / must not
+# be refused" rather than as one green run.
+# --------------------------------------------------------------------------
+git reset -q --hard >/dev/null
+mkdir -p modules/demo/src modules/demo/example
+
+changelog() { # changelog [extra-entry-text]
+    {
+        printf '# demo — changelog\n\n## Unreleased\n\n'
+        [[ -n "${1:-}" ]] && printf -- "- **2026-09-06** — %s\n" "$1"
+        printf -- '- **2026-01-01** — New module: a fixture.\n'
+    } > modules/demo/CHANGELOG.md
+}
+
+# `n` code lines, deliberately none of them starting with `pub`, so each case
+# isolates ONE trigger.
+body() { # body <n> <marker>
+    { echo 'const std = @import("std");'
+      echo 'fn helper(x: u32) u32 {'
+      echo '    var a: u32 = x;'
+      for ((i = 0; i < $1; i++)); do echo "    a = a +% $2 + $i;"; done
+      echo '    return a;'
+      echo '}'
+    } > modules/demo/src/root.zig
+}
+
+body 5 1; changelog; git add modules; git commit -qm "demo base"
+
+# 9: THE POSITIVE CONTROL. Well over the threshold, no entry -> refuse.
+body 60 2; git add modules
+"$HOOK" >/dev/null 2>&1; check "src moves 60 code lines, no entry -> refuse" 1 $?
+
+# 10: the same change WITH a dated bullet -> allow. Nothing else differs, so
+# this pins that it is the ENTRY that flips the verdict and not the diff.
+changelog "the helper now folds a different constant."; git add modules
+"$HOOK" >/dev/null 2>&1; check "same change, dated entry added -> allow" 0 $?
+
+# 11: the escape. Also an entry, so it passes for the same reason -- what is
+# being pinned is that the documented wording is not accidentally special-cased
+# into a refusal.
+changelog "**NO CONSUMER-VISIBLE CHANGE:** helper split, identical output."
+git add modules
+"$HOOK" >/dev/null 2>&1; check "escape entry -> allow" 0 $?
+
+# 12: an entry that already existed and did NOT move must not satisfy the rule.
+# This is the difference between this gate and `zig build check-changelog`,
+# which only asks whether the file is there.
+git commit -qm "demo entry"
+body 130 3; git add modules
+"$HOOK" >/dev/null 2>&1; check "changelog present but unchanged -> refuse" 1 $?
+
+# 13: THE EXCLUSION THAT MATTERS. Tests live in `test` blocks inside src/ in
+# this collection, so the same 60 lines added as a test must NOT trip it.
+git reset -q --hard >/dev/null
+{ cat modules/demo/src/root.zig
+  echo 'test "a large regression test" {'
+  for ((i = 0; i < 60; i++)); do echo "    _ = helper($i);"; done
+  echo '}'
+} > ./.scratch && mv ./.scratch modules/demo/src/root.zig
+git add modules
+"$HOOK" >/dev/null 2>&1; check "60 lines added inside a test block -> allow" 0 $?
+
+# 14: one line, and it is a published declaration -> refuse. The case a line
+# threshold alone gets backwards.
+git reset -q --hard >/dev/null
+sed -i 's/^fn helper(x: u32) u32 {/pub fn helper(x: u32, y: u32) u32 {/' modules/demo/src/root.zig
+sed -i 's/^    var a: u32 = x;/    var a: u32 = x +% y;/' modules/demo/src/root.zig
+git add modules
+"$HOOK" >/dev/null 2>&1; check "one changed \`pub fn\` line, no volume -> refuse" 1 $?
+
+# 15: comments are not code. A doc pass over src/ must not demand an entry.
+git reset -q --hard >/dev/null
+{ for ((i = 0; i < 80; i++)); do echo "// a documentation line $i"; done
+  cat modules/demo/src/root.zig
+} > ./.scratch && mv ./.scratch modules/demo/src/root.zig
+git add modules
+"$HOOK" >/dev/null 2>&1; check "80 comment lines added to src -> allow" 0 $?
+
+# 16: only `example/` moved. An example is a consumer of the module, not the
+# module, and the rule says so.
+git reset -q --hard >/dev/null
+for ((i = 0; i < 200; i++)); do echo "const x$i = $i;"; done > modules/demo/example/main.zig
+git add modules
+"$HOOK" >/dev/null 2>&1; check "200 lines in example/ only -> allow" 0 $?
+
+# 17: VACUITY GUARD. Every "-> allow" case above would also pass if the
+# changelog check were never reached at all -- a typo in the path, a
+# non-executable bit, a python3 that is not there. Remove the script and the
+# one case that MUST be refused stops being refused; if it does not, cases
+# 9-16 were proving nothing.
+git reset -q --hard >/dev/null
+body 60 4; git add modules
+"$HOOK" >/dev/null 2>&1; before=$?
+mv scripts/check-changelog-entry.py scripts/check-changelog-entry.py.off
+"$HOOK" >/dev/null 2>&1; after=$?
+mv scripts/check-changelog-entry.py.off scripts/check-changelog-entry.py
+if [[ "$before" == 1 && "$after" == 0 ]]; then
+    printf '  ok   %-52s\n' "removing the script flips refuse -> allow"
+else
+    printf '  FAIL %-52s with=%s without=%s\n' "the changelog check is not being reached" "$before" "$after"
     fails=$((fails + 1))
 fi
 

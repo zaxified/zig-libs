@@ -48,6 +48,15 @@
 const std = @import("std");
 const blindrsa = @import("blindrsa");
 const rsa = @import("rsa");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const Sha384 = std.crypto.hash.sha2.Sha384;
 
 pub fn main() !void {
@@ -96,7 +105,7 @@ pub fn main() !void {
     var ctx2: blindrsa.Context = undefined;
     var blinded_buf2: [blindrsa.max_modulus_len]u8 = undefined;
     const blinded2 = try blindrsa.blind(kp.public_key, Sha384, prepared2, &salt2, random, &ctx2, &blinded_buf2);
-    std.debug.assert(!std.mem.eql(u8, blinded1, blinded2));
+    must(!std.mem.eql(u8, blinded1, blinded2), @src());
 
     var blind_sig_buf2: [blindrsa.max_modulus_len]u8 = undefined;
     const blind_sig2 = try blindrsa.blindSign(kp.secret_key, kp.public_key, random, blinded2, &blind_sig_buf2);
@@ -104,7 +113,7 @@ pub fn main() !void {
     var sig_buf2: [blindrsa.max_modulus_len]u8 = undefined;
     const sig2 = try blindrsa.finalize(kp.public_key, Sha384, blind_sig2, &ctx2, &sig_buf2);
     try blindrsa.verify(kp.public_key, Sha384, prepared2, sig2, salt2.len);
-    std.debug.assert(!std.mem.eql(u8, sig1, sig2));
+    must(!std.mem.eql(u8, sig1, sig2), @src());
     std.debug.print("request 2 (PSS-Randomized): independent token, distinct from request 1\n", .{});
 
     // Unlinkability sanity: blinding the SAME message again (a THIRD call)
@@ -118,7 +127,7 @@ pub fn main() !void {
     var ctx1b: blindrsa.Context = undefined;
     var blinded_buf1b: [blindrsa.max_modulus_len]u8 = undefined;
     const blinded1b = try blindrsa.blind(kp.public_key, Sha384, prepared1b, &salt1b, random, &ctx1b, &blinded_buf1b);
-    std.debug.assert(!std.mem.eql(u8, blinded1, blinded1b));
+    must(!std.mem.eql(u8, blinded1, blinded1b), @src());
     std.debug.print("re-blinding the same underlying message: unrelated blinded_msg (unlinkability)\n", .{});
 
     // ── request 3: RSABSSA-SHA384-PSSZERO-Deterministic ─────────────────

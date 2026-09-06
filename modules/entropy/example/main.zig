@@ -23,6 +23,15 @@
 const std = @import("std");
 const entropy = @import("entropy");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     // A DebugAllocator that panics on leak makes this example a leak
     // detector too, even though `fill`/`SecureSource` hold no state and
@@ -41,7 +50,7 @@ pub fn main() !void {
         var b: [32]u8 = undefined;
         entropy.fill(io, &a);
         entropy.fill(io, &b);
-        std.debug.assert(!std.mem.eql(u8, &a, &b));
+        must(!std.mem.eql(u8, &a, &b), @src());
         std.debug.print("fill: two 32-byte draws differ\n", .{});
     }
 
@@ -60,7 +69,7 @@ pub fn main() !void {
 
         var i: usize = 0;
         while (i + 16 <= buf.len) : (i += 1) {
-            std.debug.assert(!std.mem.allEqual(u8, buf[i..][0..16], sentinel));
+            must(!std.mem.allEqual(u8, buf[i..][0..16], sentinel), @src());
         }
         std.debug.print("fill: whole 4096-byte buffer overwritten, sliding-window check clean\n", .{});
     }
@@ -81,12 +90,12 @@ pub fn main() !void {
         random.bytes(&buf);
         var i: usize = 0;
         while (i + 16 <= buf.len) : (i += 1) {
-            std.debug.assert(!std.mem.allEqual(u8, buf[i..][0..16], sentinel));
+            must(!std.mem.allEqual(u8, buf[i..][0..16], sentinel), @src());
         }
 
         const x = random.int(u64);
         const y = random.int(u64);
-        std.debug.assert(x != y);
+        must(x != y, @src());
         std.debug.print("SecureSource: std.Random.bytes fully overwritten, two int(u64) draws differ\n", .{});
     }
 
@@ -111,7 +120,7 @@ pub fn main() !void {
 
     // The panic message itself is public API worth pinning: it must name
     // its cause so whoever reads the crash knows what to check.
-    std.debug.assert(std.mem.indexOf(u8, entropy.unavailable_message, "EntropyUnavailable") != null);
-    std.debug.assert(std.mem.indexOf(u8, entropy.unavailable_message, "getrandom(2)") != null);
+    must(std.mem.indexOf(u8, entropy.unavailable_message, "EntropyUnavailable") != null, @src());
+    must(std.mem.indexOf(u8, entropy.unavailable_message, "getrandom(2)") != null, @src());
     std.debug.print("unavailable_message: names its cause\n", .{});
 }

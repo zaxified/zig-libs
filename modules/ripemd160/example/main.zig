@@ -22,8 +22,9 @@
 //! this exact fresh 294-byte message, and `openssl dgst -sha256 -binary |
 //! openssl dgst -rmd160` (the same SHA256-then-RIPEMD160 chain `hash160`
 //! implements) on a fresh 33-byte compressed-pubkey-shaped input — neither
-//! drawn from the module's own KATs. Both checked with `std.debug.assert`
-//! right after the corresponding call, so a regression fails the example.
+//! drawn from the module's own KATs. Both checked with `must` right after the
+//! corresponding call, so a regression fails the example in every optimize
+//! mode, which a debug-only assertion would not.
 //!
 //! `Ripemd160`/`hash160` never allocate — the streaming state is a fixed-size
 //! struct and every digest is a fixed-size array. There is nothing for a
@@ -32,6 +33,15 @@
 
 const std = @import("std");
 const ripemd160 = @import("ripemd160");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const Ripemd160 = ripemd160.Ripemd160;
 
 pub fn main() !void {
@@ -51,7 +61,7 @@ pub fn main() !void {
     // One-shot path.
     var one_shot: [Ripemd160.digest_length]u8 = undefined;
     Ripemd160.hash(msg, &one_shot, .{});
-    std.debug.assert(std.mem.eql(u8, &expected_digest, &one_shot));
+    must(std.mem.eql(u8, &expected_digest, &one_shot), @src());
     std.debug.print("one-shot hash: byte-exact match against openssl's independent RIPEMD-160\n", .{});
 
     // Streaming path, fed in 37-byte chunks -- not a divisor of the 64-byte
@@ -88,7 +98,7 @@ pub fn main() !void {
 
     var h160: [Ripemd160.digest_length]u8 = undefined;
     ripemd160.hash160(&pubkey_shaped, &h160);
-    std.debug.assert(std.mem.eql(u8, &expected_hash160, &h160));
+    must(std.mem.eql(u8, &expected_hash160, &h160), @src());
     std.debug.print("hash160: byte-exact match against openssl's independent SHA256|RIPEMD160 chain\n", .{});
 }
 

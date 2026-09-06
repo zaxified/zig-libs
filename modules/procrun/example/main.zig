@@ -19,6 +19,15 @@ const std = @import("std");
 const procrun = @import("procrun");
 const argsafe = @import("argsafe");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     // A DebugAllocator that panics on leak makes this example a leak
     // detector for the module's ownership contract (CONVENTIONS.md §7.2) —
@@ -37,8 +46,8 @@ pub fn main() !void {
     {
         var out = try procrun.run(gpa, io, .{ .argv = &.{ "/bin/echo", "hello from procrun" } }, "");
         defer out.deinit(gpa);
-        std.debug.assert(out.term == .exited and out.term.exited == 0);
-        std.debug.assert(std.mem.indexOf(u8, out.stdout, "hello from procrun") != null);
+        must(out.term == .exited and out.term.exited == 0, @src());
+        must(std.mem.indexOf(u8, out.stdout, "hello from procrun") != null, @src());
         std.debug.print("echo: exited 0, captured {d} stdout bytes\n", .{out.stdout.len});
     }
 
@@ -47,7 +56,7 @@ pub fn main() !void {
     {
         var out = try procrun.run(gpa, io, .{ .argv = &.{"/bin/false"} }, "");
         defer out.deinit(gpa);
-        std.debug.assert(out.term == .exited and out.term.exited == 1);
+        must(out.term == .exited and out.term.exited == 1, @src());
         std.debug.print("false: exited {d} (expected non-zero)\n", .{out.term.exited});
     }
 
@@ -57,9 +66,9 @@ pub fn main() !void {
             .argv = &.{ "/bin/sh", "-c", "echo to-stdout; echo to-stderr 1>&2; exit 7" },
         }, "");
         defer out.deinit(gpa);
-        std.debug.assert(out.term == .exited and out.term.exited == 7);
-        std.debug.assert(std.mem.eql(u8, out.stdout, "to-stdout\n"));
-        std.debug.assert(std.mem.eql(u8, out.stderr, "to-stderr\n"));
+        must(out.term == .exited and out.term.exited == 7, @src());
+        must(std.mem.eql(u8, out.stdout, "to-stdout\n"), @src());
+        must(std.mem.eql(u8, out.stderr, "to-stderr\n"), @src());
         std.debug.print("sh: streams stayed separated, exit code 7\n", .{});
     }
 
@@ -72,9 +81,9 @@ pub fn main() !void {
             .max_output_bytes = 4096,
         }, "");
         defer out.deinit(gpa);
-        std.debug.assert(out.term == .exited and out.term.exited == 0);
-        std.debug.assert(out.stdout.len == 4096);
-        std.debug.assert(out.truncated_stdout);
+        must(out.term == .exited and out.term.exited == 0, @src());
+        must(out.stdout.len == 4096, @src());
+        must(out.truncated_stdout, @src());
         std.debug.print("300000-byte child stdout capped at {d}, truncated=true\n", .{out.stdout.len});
     }
 
@@ -87,7 +96,7 @@ pub fn main() !void {
 
         var out = try procrun.run(gpa, io, .{ .argv = &.{"cat"}, .stdin = .pipe }, body);
         defer out.deinit(gpa);
-        std.debug.assert(std.mem.eql(u8, body, out.stdout));
+        must(std.mem.eql(u8, body, out.stdout), @src());
         std.debug.print("cat round-tripped {d} bytes of stdin without deadlock\n", .{out.stdout.len});
     }
 
@@ -95,7 +104,7 @@ pub fn main() !void {
     {
         var out = try procrun.runTimeout(gpa, io, .{ .argv = &.{ "sleep", "2" } }, "", 50 * std.time.ns_per_ms);
         defer out.deinit(gpa);
-        std.debug.assert(out.term == .signal);
+        must(out.term == .signal, @src());
         std.debug.print("sleep 2 under a 50ms deadline: killed by signal {d}\n", .{out.term.signal});
     }
 
@@ -130,10 +139,10 @@ pub fn main() !void {
         sink.h = h;
 
         const term = h.wait();
-        std.debug.assert(term == .exited and term.exited == 0);
-        std.debug.assert(sink.saw_exit and sink.exit_code == 0);
-        std.debug.assert(std.mem.indexOf(u8, sink.out.items, "line1") != null);
-        std.debug.assert(std.mem.indexOf(u8, sink.out.items, "line3") != null);
+        must(term == .exited and term.exited == 0, @src());
+        must(sink.saw_exit and sink.exit_code == 0, @src());
+        must(std.mem.indexOf(u8, sink.out.items, "line1") != null, @src());
+        must(std.mem.indexOf(u8, sink.out.items, "line3") != null, @src());
         std.debug.print("spawnStreaming: {d} bytes streamed under 1-permit backpressure, on_exit fired\n", .{sink.out.items.len});
     }
 
@@ -171,8 +180,8 @@ pub fn main() !void {
             "",
         );
         defer out.deinit(gpa);
-        std.debug.assert(out.term == .exited and out.term.exited == 0);
-        std.debug.assert(std.mem.indexOf(u8, out.stdout, "safe-arg") != null);
+        must(out.term == .exited and out.term.exited == 0, @src());
+        must(std.mem.indexOf(u8, out.stdout, "safe-arg") != null, @src());
         std.debug.print("runValidated: safe args accepted and run\n", .{});
     }
 

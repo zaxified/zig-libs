@@ -47,6 +47,15 @@
 const std = @import("std");
 const otp = @import("otp");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 // SHA-256("zig-libs otp example secret") — a fresh 32-byte secret, not the
 // RFC's own "12345678901234567890"/-32/-64 test key.
 const secret_hex = "0077c6dff0553c7a756f4a7860a4e9af850fc1b76d12cc6f8e72eb008ef5ad9f";
@@ -71,7 +80,7 @@ pub fn main() !void {
     for (hotp_cases) |c| {
         var buf: [6]u8 = undefined;
         const code = try otp.hotpFmt(.sha1, &secret, c.counter, 6, &buf);
-        std.debug.assert(std.mem.eql(u8, code, c.expected));
+        must(std.mem.eql(u8, code, c.expected), @src());
         std.debug.print("HOTP SHA1 counter={d}: {s}\n", .{ c.counter, code });
     }
 
@@ -98,7 +107,7 @@ pub fn main() !void {
             if (c.alg != alg) continue;
             var buf: [8]u8 = undefined;
             const code = try otp.totpFmt(alg, &secret, c.unix_time, 30, 0, 8, &buf);
-            std.debug.assert(std.mem.eql(u8, code, c.expected));
+            must(std.mem.eql(u8, code, c.expected), @src());
             std.debug.print("TOTP {s} t={d}: {s}\n", .{ @tagName(alg), c.unix_time, code });
         }
     }
@@ -114,25 +123,25 @@ pub fn main() !void {
     const server_time: u64 = 1_700_000_000; // step 56,666,666
 
     const code_now = otp.totp(.sha256, &secret, server_time, period, 0, digits);
-    std.debug.assert(otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, code_now, 1));
+    must(otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, code_now, 1), @src());
     std.debug.print("current-step code accepted at skew=1\n", .{});
 
     // (1) The PREVIOUS step's code (client clock 30s behind) — accepted
     // within the ±1 window, rejected at exact-match-only (skew=0).
     const code_prev = otp.totp(.sha256, &secret, server_time - period, period, 0, digits);
-    std.debug.assert(otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, code_prev, 1));
-    std.debug.assert(!otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, code_prev, 0));
+    must(otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, code_prev, 1), @src());
+    must(!otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, code_prev, 0), @src());
     std.debug.print("previous-step code: accepted at skew=1, rejected at skew=0 (expected)\n", .{});
 
     // (2) A code from TWO steps back — outside even the ±1 window, a stale/
     // replayed submission that must be rejected regardless of skew=1.
     const code_stale = otp.totp(.sha256, &secret, server_time - 2 * period, period, 0, digits);
-    std.debug.assert(!otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, code_stale, 1));
+    must(!otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, code_stale, 1), @src());
     std.debug.print("two-steps-stale code: rejected even at skew=1 (expected)\n", .{});
 
     // (3) A flat wrong code (not derived from any nearby step at all).
     const wrong_code = code_now +% 1;
-    std.debug.assert(wrong_code != code_prev and wrong_code != code_stale);
-    std.debug.assert(!otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, wrong_code, 1));
+    must(wrong_code != code_prev and wrong_code != code_stale, @src());
+    must(!otp.totpVerify(.sha256, &secret, server_time, period, 0, digits, wrong_code, 1), @src());
     std.debug.print("unrelated wrong code: rejected (expected)\n", .{});
 }

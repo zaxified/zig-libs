@@ -16,6 +16,15 @@
 const std = @import("std");
 const filestore = @import("filestore");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A deterministic clock for the TTL demonstration — `filestore.Store.Clock`
 /// is a public struct with public `ctx`/`nowFn` fields (the same shape the
 /// module's own tests use), so a consumer can inject one without any
@@ -80,7 +89,7 @@ pub fn main() !void {
         },
         else => return err,
     };
-    std.debug.assert(v1 != v2);
+    must(v1 != v2, @src());
 
     // ── TTL: present before the deadline, absent after, via an injected
     //    deterministic clock (no real sleeping in an example) ───────────
@@ -89,10 +98,10 @@ pub fn main() !void {
     try store.putWithTTL("sessions", "sess-1", "logged-in", 500); // deadline = 1500
 
     clk.now_ns = 1_499;
-    std.debug.assert((try store.getBytes(arena, "sessions", "sess-1")) != null);
+    must((try store.getBytes(arena, "sessions", "sess-1")) != null, @src());
 
     clk.now_ns = 1_500;
-    std.debug.assert((try store.getBytes(arena, "sessions", "sess-1")) == null);
+    must((try store.getBytes(arena, "sessions", "sess-1")) == null, @src());
     std.debug.print("session expired as scheduled\n", .{});
 
     // sweep physically reclaims the now-expired record.

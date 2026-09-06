@@ -16,6 +16,15 @@ const std = @import("std");
 const numparse = @import("numparse");
 const Decimal = @import("decimal").Decimal;
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -26,7 +35,7 @@ pub fn main() !void {
     // case.
     const american = numparse.parseGroupedNumber("1,234.56", ',', '.').?;
     std.debug.print("American \"1,234.56\" (glibc en_US.UTF-8 printf output) -> {s}\n", .{american.toString(&buf)});
-    std.debug.assert(american.raw == (try Decimal.parse("1234.56")).raw);
+    must(american.raw == (try Decimal.parse("1234.56")).raw, @src());
 
     // European convention (thousands='.', decimal=','). No European glibc
     // locale is installed on this machine to shell out to, so this is
@@ -34,13 +43,13 @@ pub fn main() !void {
     // published de_DE grouping) rather than a live oracle.
     const european = numparse.parseGroupedNumber("1.234.567,89", '.', ',').?;
     std.debug.print("European \"1.234.567,89\" (ICU CLDR de_DE grouping) -> {s}\n", .{european.toString(&buf)});
-    std.debug.assert(european.raw == (try Decimal.parse("1234567.89")).raw);
+    must(european.raw == (try Decimal.parse("1234567.89")).raw, @src());
 
     // A caller who takes the task description's "1 234,56" (plain ASCII
     // space) at face value gets a clean parse using thousands_sep=' ':
     const space_grouped = numparse.parseGroupedNumber("1 234,56", ' ', ',').?;
     std.debug.print("space-grouped \"1 234,56\" (ASCII 0x20 separator) -> {s}\n", .{space_grouped.toString(&buf)});
-    std.debug.assert(space_grouped.raw == (try Decimal.parse("1234.56")).raw);
+    must(space_grouped.raw == (try Decimal.parse("1234.56")).raw, @src());
 
     // But that is not what glibc's own locale formatter actually emits.
     // `python3 -c "import locale; locale.setlocale(locale.LC_ALL,
@@ -56,11 +65,11 @@ pub fn main() !void {
     // 0x80 (continuation byte, not a digit).
     const glibc_cs_locale_bytes = "1\xe2\x80\xaf234,56"; // literal glibc cs_CZ.UTF-8 output
     const rejected = numparse.parseGroupedNumber(glibc_cs_locale_bytes, ' ', ',');
-    std.debug.assert(rejected == null);
+    must(rejected == null, @src());
     std.debug.print("glibc cs_CZ.UTF-8 output (U+202F separator) rejected: numparse's u8 separator cannot express it (finding)\n", .{});
 
     // Structural validation: a lone 2-digit group is rejected outright
     // (grammar requires exactly 3 digits per group after the first).
-    std.debug.assert(numparse.parseGroupedNumber("1,23", ',', '.') == null);
+    must(numparse.parseGroupedNumber("1,23", ',', '.') == null, @src());
     std.debug.print("malformed group \"1,23\" (2 digits, not 3): rejected\n", .{});
 }

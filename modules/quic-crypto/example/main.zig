@@ -34,6 +34,15 @@
 
 const std = @import("std");
 const qc = @import("quic-crypto");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 
@@ -83,7 +92,7 @@ pub fn main() !void {
     const P = qc.protection.Protection(Aes128Gcm);
     var ciphertext: [payload.len + P.tag_length]u8 = undefined;
     const ct_len = try P.seal(client_keys.key, client_keys.iv, packet_number, &header, payload, &ciphertext);
-    std.debug.assert(ct_len == ciphertext.len);
+    must(ct_len == ciphertext.len, @src());
 
     // Print everything the external oracle needs: key, the nonce
     // `Protection.nonce` derived internally (iv XOR left-pad(pn)), the AAD,
@@ -124,10 +133,10 @@ pub fn main() !void {
     const recv_sample: [16]u8 = recv_packet[pn_offset + 4 ..][0..16].*;
     const recv_mask = qc.headerprot.computeMaskAes(&client_keys.hp, recv_sample);
     const removed = try qc.headerprot.remove(&recv_packet, .long, pn_offset, recv_mask);
-    std.debug.assert(removed.pn_len == 4);
+    must(removed.pn_len == 4, @src());
 
     const recovered_pn = std.mem.readInt(u32, recv_packet[pn_offset..][0..4], .big);
-    std.debug.assert(recovered_pn == packet_number);
+    must(recovered_pn == packet_number, @src());
     std.debug.print("header protection removed: recovered pn_len={d}, packet_number={d}\n", .{ removed.pn_len, recovered_pn });
 
     const recv_header = recv_packet[0 .. pn_offset + 4];
@@ -147,7 +156,7 @@ pub fn main() !void {
     const t_sample: [16]u8 = tampered_packet[pn_offset + 4 ..][0..16].*;
     const t_mask = qc.headerprot.computeMaskAes(&client_keys.hp, t_sample);
     const t_removed = try qc.headerprot.remove(&tampered_packet, .long, pn_offset, t_mask);
-    std.debug.assert(t_removed.pn_len == 4);
+    must(t_removed.pn_len == 4, @src());
     const t_pn = std.mem.readInt(u32, tampered_packet[pn_offset..][0..4], .big);
     var discard: [payload.len]u8 = undefined;
     if (P.open(client_keys.key, client_keys.iv, t_pn, tampered_packet[0 .. pn_offset + 4], tampered_packet[pn_offset + 4 ..], &discard)) |_| {
@@ -159,8 +168,8 @@ pub fn main() !void {
 
     // ── key update (§6): hp is deliberately NOT re-derived ────────────────
     const ku = qc.advanceKeys(HkdfSha256, 16, secrets.client_initial_secret);
-    std.debug.assert(!@hasField(@TypeOf(ku), "hp"));
-    std.debug.assert(!std.mem.eql(u8, &ku.key, &client_keys.key)); // key DID change
+    must(!@hasField(@TypeOf(ku), "hp"), @src());
+    must(!std.mem.eql(u8, &ku.key, &client_keys.key), @src()); // key DID change
     std.debug.print("key update: new key/iv derived; hp field absent by type (unchanged per RFC 9001 §6.1)\n", .{});
 }
 

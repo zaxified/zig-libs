@@ -58,6 +58,15 @@ const timelock_envelope = @import("timelock_envelope");
 const tlock = @import("tlock");
 const hqc = @import("hqc");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 const Envelope128 = timelock_envelope.Envelope128;
 const Envelope192 = timelock_envelope.Envelope192;
 
@@ -131,7 +140,7 @@ pub fn main() !void {
     const round1_signature = beacon.signRound(round1);
     const opened1 = try Envelope128.open(gpa, sealed1, bob.dk, round1_signature);
     defer gpa.free(opened1);
-    std.debug.assert(std.mem.eql(u8, opened1, plaintext1));
+    must(std.mem.eql(u8, opened1, plaintext1), @src());
     std.debug.print("session1: opened after round {d}: {s}\n", .{ round1, opened1 });
 
     // ── External-oracle material for session 1: independently recover
@@ -152,7 +161,7 @@ pub fn main() !void {
     for (&rnd2.s_time, 0..) |*b, i| b.* = @intCast(i + 200);
     for (&rnd2.tlock_sigma, 0..) |*b, i| b.* = @intCast(i + 50);
     for (&rnd2.kem_coins, 0..) |*b, i| b.* = @intCast(i + 30);
-    std.debug.assert(!std.mem.eql(u8, &rnd1.s_time, &rnd2.s_time));
+    must(!std.mem.eql(u8, &rnd1.s_time, &rnd2.s_time), @src());
 
     const plaintext2 = "second message: transfer control now";
     const sealed2 = try Envelope128.seal(gpa, plaintext2, bob.ek, p_pub, round2, rnd2);
@@ -160,7 +169,7 @@ pub fn main() !void {
     const round2_signature = beacon.signRound(round2);
     const opened2 = try Envelope128.open(gpa, sealed2, bob.dk, round2_signature);
     defer gpa.free(opened2);
-    std.debug.assert(std.mem.eql(u8, opened2, plaintext2));
+    must(std.mem.eql(u8, opened2, plaintext2), @src());
     std.debug.print("session2: sealed + opened round {d}: {s}\n", .{ round2, opened2 });
 
     // ── Negative path 2: the round IS reached, but the opener holds the

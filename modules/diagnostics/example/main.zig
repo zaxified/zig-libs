@@ -14,6 +14,15 @@
 const std = @import("std");
 const diagnostics = @import("diagnostics");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// One raw config field as a loader would see it, before validation.
 const RawField = struct { path: []const u8, key: []const u8, value: []const u8 };
 
@@ -118,7 +127,7 @@ fn closestKnownKey(key: []const u8) ?[]const u8 {
 
 fn levenshtein(a: []const u8, b: []const u8) usize {
     var buf: [64]usize = undefined;
-    std.debug.assert(b.len < buf.len);
+    must(b.len < buf.len, @src());
     for (0..b.len + 1) |j| buf[j] = j;
     for (a, 1..) |ca, i| {
         var prev = buf[0];

@@ -17,6 +17,15 @@
 const std = @import("std");
 const framing = @import("framing");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A domain-free tagged union standing in for a real protocol's message set
 /// (`framing`'s own tests use one shaped just like it) — proves
 /// `EnvelopeCodec` from outside without importing any application type.
@@ -99,18 +108,18 @@ pub fn main() !void {
     const p1 = try framing.readFrame(&dr.interface, &frame_buf, .{});
     var m1 = try Codec.parse(gpa, p1);
     defer m1.deinit();
-    std.debug.assert(m1.value == .ping and m1.value.ping.seq == 1);
+    must(m1.value == .ping and m1.value.ping.seq == 1, @src());
 
     const p2 = try framing.readFrame(&dr.interface, &frame_buf, .{});
     var m2 = try Codec.parse(gpa, p2);
     defer m2.deinit();
-    std.debug.assert(m2.value == .status and m2.value.status.ok);
-    std.debug.assert(std.mem.eql(u8, m2.value.status.note, "warming up"));
+    must(m2.value == .status and m2.value.status.ok, @src());
+    must(std.mem.eql(u8, m2.value.status.note, "warming up"), @src());
 
     const p3 = try framing.readFrame(&dr.interface, &frame_buf, .{});
     var m3 = try Codec.parse(gpa, p3);
     defer m3.deinit();
-    std.debug.assert(m3.value == .bye);
+    must(m3.value == .bye, @src());
     std.debug.print("dribble-fed reader (3 bytes/read): all 3 frames decoded intact\n", .{});
 
     // The stream is now exhausted: a 4th read must fail by name, not hang or

@@ -24,6 +24,15 @@ const throttle = @import("throttle");
 const router = @import("router");
 const http = @import("http");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn sleepMs(io: std.Io, ms: u32) !void {
     const d: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake };
     d.sleep(io) catch return error.Canceled;
@@ -92,25 +101,25 @@ pub fn main() !void {
     {
         var th: throttle.Throttle = .init(.{ .max_in_flight = 3 });
         defer th.deinit();
-        std.debug.assert(th.tryAcquire());
-        std.debug.assert(th.tryAcquire());
-        std.debug.assert(th.tryAcquire());
-        std.debug.assert(th.inFlight() == 3);
+        must(th.tryAcquire(), @src());
+        must(th.tryAcquire(), @src());
+        must(th.tryAcquire(), @src());
+        must(th.inFlight() == 3, @src());
 
-        std.debug.assert(!th.tryAcquire()); // capacity: shed, consumes nothing
-        std.debug.assert(!th.tryAcquire());
-        std.debug.assert(th.inFlight() == 3);
-
-        th.release();
-        std.debug.assert(th.inFlight() == 2);
-        std.debug.assert(th.tryAcquire());
-        std.debug.assert(!th.tryAcquire());
+        must(!th.tryAcquire(), @src()); // capacity: shed, consumes nothing
+        must(!th.tryAcquire(), @src());
+        must(th.inFlight() == 3, @src());
 
         th.release();
+        must(th.inFlight() == 2, @src());
+        must(th.tryAcquire(), @src());
+        must(!th.tryAcquire(), @src());
+
         th.release();
         th.release();
-        std.debug.assert(th.inFlight() == 0);
-        std.debug.assert(th.tryAcquire());
+        th.release();
+        must(th.inFlight() == 0, @src());
+        must(th.tryAcquire(), @src());
         th.release();
         std.debug.print("bare semaphore: capacity held exactly at 3, recovered after release\n", .{});
     }
@@ -132,18 +141,18 @@ pub fn main() !void {
         try r.get("/t", hCount);
 
         var buf: [1024]u8 = undefined;
-        std.debug.assert(statusOf(runWire(&r, wire("/t"), &buf)) == 200);
-        std.debug.assert(hits == 1);
+        must(statusOf(runWire(&r, wire("/t"), &buf)) == 200, @src());
+        must(hits == 1, @src());
 
-        std.debug.assert(th.tryAcquire()); // occupy the only slot
+        must(th.tryAcquire(), @src()); // occupy the only slot
         const shed = runWire(&r, wire("/t"), &buf);
-        std.debug.assert(statusOf(shed) == 503);
-        std.debug.assert(headerValue(shed, "Retry-After") != null);
-        std.debug.assert(hits == 1); // handler never ran
+        must(statusOf(shed) == 503, @src());
+        must(headerValue(shed, "Retry-After") != null, @src());
+        must(hits == 1, @src()); // handler never ran
 
         th.release();
-        std.debug.assert(statusOf(runWire(&r, wire("/t"), &buf)) == 200);
-        std.debug.assert(hits == 2);
+        must(statusOf(runWire(&r, wire("/t"), &buf)) == 200, @src());
+        must(hits == 2, @src());
         std.debug.print("middleware: 200 when free, 503+Retry-After when saturated, recovers after release\n", .{});
     }
 
@@ -159,9 +168,9 @@ pub fn main() !void {
         try r.get("/boom", hBoom);
 
         var buf: [1024]u8 = undefined;
-        std.debug.assert(statusOf(runWire(&r, wire("/boom"), &buf)) == 500);
-        std.debug.assert(th.inFlight() == 0); // released despite the error
-        std.debug.assert(th.tryAcquire());
+        must(statusOf(runWire(&r, wire("/boom"), &buf)) == 500, @src());
+        must(th.inFlight() == 0, @src()); // released despite the error
+        must(th.tryAcquire(), @src());
         th.release();
         std.debug.print("handler error: slot still released, server answered 500\n", .{});
     }
@@ -175,7 +184,7 @@ pub fn main() !void {
             .io = io,
         });
         defer th.deinit();
-        std.debug.assert(th.tryAcquire()); // saturate
+        must(th.tryAcquire(), @src()); // saturate
 
         const Releaser = struct {
             fn run(t: *throttle.Throttle, io_: std.Io) void {
@@ -186,8 +195,8 @@ pub fn main() !void {
         const releaser = try std.Thread.spawn(.{}, Releaser.run, .{ &th, io });
         defer releaser.join();
 
-        std.debug.assert(th.acquire()); // woken well before the 5s deadline
-        std.debug.assert(th.inFlight() == 1);
+        must(th.acquire(), @src()); // woken well before the 5s deadline
+        must(th.inFlight() == 1, @src());
         th.release();
         std.debug.print("bounded wait: a release inside the window handed over the slot\n", .{});
     }
@@ -201,12 +210,12 @@ pub fn main() !void {
             .io = io,
         });
         defer th.deinit();
-        std.debug.assert(th.tryAcquire()); // saturate for good
+        must(th.tryAcquire(), @src()); // saturate for good
         const t0 = throttle.Clock.monotonic.now();
-        std.debug.assert(!th.acquire()); // parks, then sheds at the deadline
+        must(!th.acquire(), @src()); // parks, then sheds at the deadline
         const elapsed_ms = (throttle.Clock.monotonic.now() - t0) / std.time.ns_per_ms;
-        std.debug.assert(elapsed_ms >= 80);
-        std.debug.assert(th.waiting() == 0);
+        must(elapsed_ms >= 80, @src());
+        must(th.waiting() == 0, @src());
         th.release();
         std.debug.print("bounded wait: deadline honored ({d}ms), then shed\n", .{elapsed_ms});
     }
@@ -223,7 +232,7 @@ pub fn main() !void {
             .io = io,
         });
         defer th.deinit();
-        std.debug.assert(th.tryAcquire()); // saturate
+        must(th.tryAcquire(), @src()); // saturate
 
         const Waiter = struct {
             fn run(t: *throttle.Throttle, got: *std.atomic.Value(u8)) void {
@@ -241,9 +250,9 @@ pub fn main() !void {
         }
 
         const t0 = throttle.Clock.monotonic.now();
-        std.debug.assert(!th.acquire()); // queue full -> shed now, no wait
+        must(!th.acquire(), @src()); // queue full -> shed now, no wait
         const elapsed_ms = (throttle.Clock.monotonic.now() - t0) / std.time.ns_per_ms;
-        std.debug.assert(elapsed_ms < 5_000); // nowhere near the 60s deadline
+        must(elapsed_ms < 5_000, @src()); // nowhere near the 60s deadline
 
         th.release(); // frees the slot for the parked waiter
         tries = 0;
@@ -251,7 +260,7 @@ pub fn main() !void {
             if (tries > 2000) return error.ExampleTimeout;
             try sleepMs(io, 5);
         }
-        std.debug.assert(got.load(.seq_cst) == 1);
+        must(got.load(.seq_cst) == 1, @src());
         th.release(); // on the waiter's behalf
         std.debug.print("waiter-queue capacity: a full queue sheds instantly ({d}ms); the parked waiter still won\n", .{elapsed_ms});
     }
@@ -287,8 +296,8 @@ pub fn main() !void {
         var handles: [n_threads]std.Thread = undefined;
         for (&handles) |*h| h.* = try std.Thread.spawn(.{}, Worker.run, .{ &th, &shared });
         for (handles) |h| h.join();
-        std.debug.assert(shared.violations.load(.seq_cst) == 0);
-        std.debug.assert(th.inFlight() == 0);
+        must(shared.violations.load(.seq_cst) == 0, @src());
+        must(th.inFlight() == 0, @src());
         std.debug.print("concurrency: {d} threads x {d} iters hammering one Throttle, cap {d} never exceeded\n", .{ n_threads, iters, cap });
     }
 

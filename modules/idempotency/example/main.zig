@@ -21,6 +21,15 @@ const router = @import("router");
 const http = @import("http");
 const ramcache = @import("ramcache");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A fake, caller-controlled clock -- the module injects one so TTL
 /// accounting is deterministic and offline. Same shape as
 /// `idempotency.Clock`: `.ctx` + `.nowFn`.
@@ -159,10 +168,10 @@ pub fn main() !void {
     {
         var buf: [2048]u8 = undefined;
         const first = runWire(&r, reqKeyBody("POST", "/orders", "abc-123", "{\"amt\":10}"), &buf);
-        std.debug.assert(std.mem.startsWith(u8, first, "HTTP/1.1 201"));
-        std.debug.assert(std.mem.eql(u8, bodyOf(first), "order-1"));
-        std.debug.assert(app.calls == 1);
-        std.debug.assert(headerValue(first, "Idempotent-Replayed") == null);
+        must(std.mem.startsWith(u8, first, "HTTP/1.1 201"), @src());
+        must(std.mem.eql(u8, bodyOf(first), "order-1"), @src());
+        must(app.calls == 1, @src());
+        must(headerValue(first, "Idempotent-Replayed") == null, @src());
     }
 
     // 2. Retry -- deliberate duplicate operation: same key, same body. Must
@@ -170,9 +179,9 @@ pub fn main() !void {
     {
         var buf: [2048]u8 = undefined;
         const replay = runWire(&r, reqKeyBody("POST", "/orders", "abc-123", "{\"amt\":10}"), &buf);
-        std.debug.assert(std.mem.eql(u8, bodyOf(replay), "order-1"));
-        std.debug.assert(std.mem.eql(u8, headerValue(replay, "Idempotent-Replayed").?, "true"));
-        std.debug.assert(app.calls == 1); // unchanged -- the whole point
+        must(std.mem.eql(u8, bodyOf(replay), "order-1"), @src());
+        must(std.mem.eql(u8, headerValue(replay, "Idempotent-Replayed").?, "true"), @src());
+        must(app.calls == 1, @src()); // unchanged -- the whole point
         std.debug.print("replay of a duplicate request returned the cached response, handler not re-run\n", .{});
     }
 
@@ -182,8 +191,8 @@ pub fn main() !void {
     {
         var buf: [2048]u8 = undefined;
         const mismatch = runWire(&r, reqKeyBody("POST", "/orders", "abc-123", "{\"amt\":999}"), &buf);
-        std.debug.assert(std.mem.startsWith(u8, mismatch, "HTTP/1.1 422"));
-        std.debug.assert(app.calls == 1);
+        must(std.mem.startsWith(u8, mismatch, "HTTP/1.1 422"), @src());
+        must(app.calls == 1, @src());
         std.debug.print("same key, different body correctly rejected: 422, no re-run\n", .{});
     }
 
@@ -204,8 +213,8 @@ pub fn main() !void {
 
         var buf: [2048]u8 = undefined;
         const over = runWire(&r2, reqKeyBody("POST", "/orders", "over-cap", "AAAAAAAAA"), &buf); // 9 bytes > 8
-        std.debug.assert(std.mem.startsWith(u8, over, "HTTP/1.1 413"));
-        std.debug.assert(small_app.calls == 0);
+        must(std.mem.startsWith(u8, over, "HTTP/1.1 413"), @src());
+        must(small_app.calls == 0, @src());
         std.debug.print("oversized body correctly rejected: 413, no handler run\n", .{});
     }
 
@@ -214,8 +223,8 @@ pub fn main() !void {
     {
         var buf: [2048]u8 = undefined;
         const distinct = runWire(&r, reqKeyBody("POST", "/refunds", "abc-123", "{\"amt\":5}"), &buf);
-        std.debug.assert(std.mem.eql(u8, bodyOf(distinct), "order-2"));
-        std.debug.assert(app.calls == 2);
+        must(std.mem.eql(u8, bodyOf(distinct), "order-2"), @src());
+        must(app.calls == 2, @src());
     }
 
     // 6. Concurrent first-flight of the same key: the in-flight reservation
@@ -236,9 +245,9 @@ pub fn main() !void {
 
         var buf: [2048]u8 = undefined;
         const outer = runWire(&r3, reqKey("POST", "/orders", "racey"), &buf);
-        std.debug.assert(std.mem.startsWith(u8, outer, "HTTP/1.1 201"));
-        std.debug.assert(re_app.calls == 1); // the nested duplicate did NOT re-enter the handler
-        std.debug.assert(re_app.second_status == 409);
+        must(std.mem.startsWith(u8, outer, "HTTP/1.1 201"), @src());
+        must(re_app.calls == 1, @src()); // the nested duplicate did NOT re-enter the handler
+        must(re_app.second_status == 409, @src());
         std.debug.print("concurrent in-flight duplicate correctly rejected: 409, handler ran once\n", .{});
     }
 
@@ -249,9 +258,9 @@ pub fn main() !void {
         fake_clock.now_ns += 2000; // > ttl_ns (1000)
         var buf: [2048]u8 = undefined;
         const stale = runWire(&r, reqKeyBody("POST", "/orders", "abc-123", "{\"amt\":10}"), &buf);
-        std.debug.assert(std.mem.eql(u8, bodyOf(stale), "order-3"));
-        std.debug.assert(headerValue(stale, "Idempotent-Replayed") == null);
-        std.debug.assert(app.calls == 3);
+        must(std.mem.eql(u8, bodyOf(stale), "order-3"), @src());
+        must(headerValue(stale, "Idempotent-Replayed") == null, @src());
+        must(app.calls == 3, @src());
         std.debug.print("TTL-expired entry re-ran the handler instead of replaying stale data\n", .{});
     }
 
@@ -269,10 +278,10 @@ pub fn main() !void {
             const req = try std.fmt.allocPrint(gpa, "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: {s}\r\nConnection: close\r\n\r\n", .{key});
             defer gpa.free(req);
             const resp = runWire(&r, req, &buf);
-            std.debug.assert(std.mem.startsWith(u8, resp, "HTTP/1.1 201"));
-            std.debug.assert(cache.stats.entries <= 32);
+            must(std.mem.startsWith(u8, resp, "HTTP/1.1 201"), @src());
+            must(cache.stats.entries <= 32, @src());
         }
-        std.debug.assert(cache.stats.evictions > 0);
+        must(cache.stats.evictions > 0, @src());
         std.debug.print("capacity: 64 more distinct keys through a 32-entry store -> {d} evictions, {d} live entries\n", .{ cache.stats.evictions, cache.stats.entries });
     }
 }

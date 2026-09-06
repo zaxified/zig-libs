@@ -18,6 +18,15 @@
 
 const std = @import("std");
 const cbor = @import("cbor");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const Value = cbor.Value;
 
 pub fn main() !void {
@@ -30,10 +39,10 @@ pub fn main() !void {
         const wire = [_]u8{ 0x1a, 0x00, 0x0f, 0x42, 0x40 };
         const v = try cbor.decode(gpa, &wire, .{});
         defer cbor.freeValue(gpa, v);
-        std.debug.assert(v == .uint and v.uint == 1000000);
+        must(v == .uint and v.uint == 1000000, @src());
         const re = try cbor.encode(gpa, v, .{});
         defer gpa.free(re);
-        std.debug.assert(std.mem.eql(u8, re, &wire));
+        must(std.mem.eql(u8, re, &wire), @src());
         std.debug.print("A.1 1000000: decoded + re-encoded byte-exact\n", .{});
     }
 
@@ -43,7 +52,7 @@ pub fn main() !void {
         const wire = [_]u8{ 0x38, 0x63 };
         const v = try cbor.decode(gpa, &wire, .{});
         defer cbor.freeValue(gpa, v);
-        std.debug.assert(v.toI64().? == -100);
+        must(v.toI64().? == -100, @src());
         std.debug.print("A.1 -100: toI64() == -100\n", .{});
     }
 
@@ -52,7 +61,7 @@ pub fn main() !void {
         const wire = [_]u8{ 0x64, 0x49, 0x45, 0x54, 0x46 };
         const v = try cbor.decode(gpa, &wire, .{});
         defer cbor.freeValue(gpa, v);
-        std.debug.assert(v == .text and std.mem.eql(u8, v.text, "IETF"));
+        must(v == .text and std.mem.eql(u8, v.text, "IETF"), @src());
         std.debug.print("A.1 \"IETF\": {s}\n", .{v.text});
     }
 
@@ -61,11 +70,11 @@ pub fn main() !void {
         const wire = [_]u8{ 0x83, 0x01, 0x02, 0x03 };
         const v = try cbor.decode(gpa, &wire, .{});
         defer cbor.freeValue(gpa, v);
-        std.debug.assert(v == .array and v.array.len == 3);
-        std.debug.assert(v.array[0].uint == 1 and v.array[1].uint == 2 and v.array[2].uint == 3);
+        must(v == .array and v.array.len == 3, @src());
+        must(v.array[0].uint == 1 and v.array[1].uint == 2 and v.array[2].uint == 3, @src());
         const re = try cbor.encode(gpa, v, .{});
         defer gpa.free(re);
-        std.debug.assert(std.mem.eql(u8, re, &wire));
+        must(std.mem.eql(u8, re, &wire), @src());
         std.debug.print("A.1 [1,2,3]: decoded + re-encoded byte-exact\n", .{});
     }
 
@@ -74,9 +83,9 @@ pub fn main() !void {
         const wire = [_]u8{ 0xa2, 0x61, 0x61, 0x01, 0x61, 0x62, 0x82, 0x02, 0x03 };
         const v = try cbor.decode(gpa, &wire, .{});
         defer cbor.freeValue(gpa, v);
-        std.debug.assert(v == .map and v.map.len == 2);
-        std.debug.assert(std.mem.eql(u8, v.map[0].key.text, "a") and v.map[0].value.uint == 1);
-        std.debug.assert(std.mem.eql(u8, v.map[1].key.text, "b") and v.map[1].value.array.len == 2);
+        must(v == .map and v.map.len == 2, @src());
+        must(std.mem.eql(u8, v.map[0].key.text, "a") and v.map[0].value.uint == 1, @src());
+        must(std.mem.eql(u8, v.map[1].key.text, "b") and v.map[1].value.array.len == 2, @src());
         std.debug.print("A.1 {{\"a\":1,\"b\":[2,3]}}: fields check out\n", .{});
     }
 
@@ -85,7 +94,7 @@ pub fn main() !void {
         const wire = [_]u8{ 0xf9, 0x3e, 0x00 };
         const v = try cbor.decode(gpa, &wire, .{});
         defer cbor.freeValue(gpa, v);
-        std.debug.assert(v == .f16 and v.f16 == 1.5);
+        must(v == .f16 and v.f16 == 1.5, @src());
         std.debug.print("A.1 f16 1.5: decoded exact\n", .{});
     }
 
@@ -103,8 +112,8 @@ pub fn main() !void {
         defer gpa.free(encoded);
         const decoded = try cbor.decode(gpa, encoded, .{});
         defer cbor.freeValue(gpa, decoded);
-        std.debug.assert(std.mem.eql(u8, decoded.map[0].key.text, "b"));
-        std.debug.assert(std.mem.eql(u8, decoded.map[1].key.text, "aa"));
+        must(std.mem.eql(u8, decoded.map[0].key.text, "b"), @src());
+        must(std.mem.eql(u8, decoded.map[1].key.text, "aa"), @src());
         std.debug.print("canonical map: \"b\" (shorter key) sorts before \"aa\"\n", .{});
     }
 
@@ -144,13 +153,13 @@ pub fn main() !void {
         defer cbor.freeValue(gpa, v);
 
         const s1 = try cbor.cose.parseSign1(v);
-        std.debug.assert(std.mem.eql(u8, s1.payload.?, "This is the content."));
+        must(std.mem.eql(u8, s1.payload.?, "This is the content."), @src());
 
         // The property this layer exists to protect: `protected` is handed back
         // as the ORIGINAL serialized bytes, so what gets verified is what was
         // signed. Re-encoding `{1: -7}` here instead would be the classic
         // COSE forgery seam.
-        std.debug.assert(std.mem.eql(u8, s1.protected, &[_]u8{ 0xa1, 0x01, 0x26 }));
+        must(std.mem.eql(u8, s1.protected, &[_]u8{ 0xa1, 0x01, 0x26 }), @src());
 
         // `Sig_structure` — the exact bytes a signature covers. Compared against
         // the value published in `cose-wg/Examples` sign1-tests/sign-fail-01.json
@@ -163,7 +172,7 @@ pub fn main() !void {
             0x73, 0x20, 0x74, 0x68, 0x65, 0x20, 0x63, 0x6f, 0x6e, 0x74, 0x65, 0x6e,
             0x74, 0x2e,
         };
-        std.debug.assert(std.mem.eql(u8, tbs, &published_tbs));
+        must(std.mem.eql(u8, tbs, &published_tbs), @src());
         std.debug.print("COSE_Sign1 (RFC 9052 C.2.1): protected kept verbatim, Sig_structure matches the published bytes\n", .{});
     }
 

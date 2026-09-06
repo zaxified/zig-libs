@@ -16,6 +16,15 @@
 const std = @import("std");
 const dataset = @import("dataset");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     // dataset's documented memory model: the caller owns an arena for the
     // whole pipeline, transforms allocate from it, nothing is freed
@@ -56,7 +65,7 @@ pub fn main() !void {
         },
         error.OutOfMemory => return err,
     };
-    std.debug.assert(restored.rowCount() == blotter.rowCount());
+    must(restored.rowCount() == blotter.rowCount(), @src());
 
     // A deliberately truncated buffer must fail by name, not panic — the
     // module's error set has to be nameable from outside to be handled here.

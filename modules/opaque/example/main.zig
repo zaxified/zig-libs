@@ -50,6 +50,15 @@
 const std = @import("std");
 const opq = @import("opaque"); // `opaque` is a keyword — see file doc comment.
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn bytes32(label: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(label, &out, .{});
@@ -122,9 +131,9 @@ pub fn main() !void {
     const ke3_res_1 = try opq.generateKE3(ke1_res_1.state, identities, context, ke2_res_1.ke2);
     // The export_key is a client-only value, re-derived (not transmitted)
     // — it must match what registration produced, every successful login.
-    std.debug.assert(std.mem.eql(u8, &export_key_registration, &ke3_res_1.export_key));
+    must(std.mem.eql(u8, &export_key_registration, &ke3_res_1.export_key), @src());
     const session_key_server_1 = try opq.serverFinish(ke2_res_1.state, ke3_res_1.ke3);
-    std.debug.assert(std.mem.eql(u8, &ke3_res_1.session_key, &session_key_server_1));
+    must(std.mem.eql(u8, &ke3_res_1.session_key, &session_key_server_1), @src());
     std.debug.print("login 1: client and server agree on session_key and export_key\n", .{});
 
     // ── login session 2: fresh ephemeral randomness throughout ────────
@@ -152,11 +161,11 @@ pub fn main() !void {
         bytes32("server login-2 keyshare seed"),
     );
     const ke3_res_2 = try opq.generateKE3(ke1_res_2.state, identities, context, ke2_res_2.ke2);
-    std.debug.assert(std.mem.eql(u8, &export_key_registration, &ke3_res_2.export_key));
+    must(std.mem.eql(u8, &export_key_registration, &ke3_res_2.export_key), @src());
     const session_key_server_2 = try opq.serverFinish(ke2_res_2.state, ke3_res_2.ke3);
-    std.debug.assert(std.mem.eql(u8, &ke3_res_2.session_key, &session_key_server_2));
+    must(std.mem.eql(u8, &ke3_res_2.session_key, &session_key_server_2), @src());
     // Two independent sessions must not share a session_key.
-    std.debug.assert(!std.mem.eql(u8, &ke3_res_1.session_key, &ke3_res_2.session_key));
+    must(!std.mem.eql(u8, &ke3_res_1.session_key, &ke3_res_2.session_key), @src());
     std.debug.print("login 2: independent session_key from login 1, both sides still agree\n", .{});
 
     // ── failure path 1: wrong password (named error, client-side) ─────

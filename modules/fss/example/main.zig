@@ -19,6 +19,15 @@
 const std = @import("std");
 const fss = @import("fss");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 // A 256-record domain (n=8), votes counted in a 32-bit group (L=4 bytes).
 const D = fss.Dpf(8, 4);
 
@@ -86,7 +95,7 @@ pub fn main() !void {
     sha_keys[0].toBytesTagged(&sha_buf);
     // Same tagged length as the AES instantiation, so only the tag byte
     // stands between this and silently wrong bytes.
-    std.debug.assert(sha_buf.len == buf0.len);
+    must(sha_buf.len == buf0.len, @src());
     _ = D.Key.fromBytesTagged(&sha_buf) catch |err| switch (err) {
         error.UnsupportedKeyFormat => std.debug.print("cross-PRG key correctly rejected by its format tag\n", .{}),
     };

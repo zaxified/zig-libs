@@ -297,6 +297,16 @@ harness_smoke() {
     step "check-catalog" zig build check-catalog
     step "check-uapi" zig build check-uapi
     step "check-changelog" zig build check-changelog
+
+    # `check-changelog` above proves the file EXISTS and is well formed; it reads
+    # the tree, never a diff, so it cannot see that a module's parser was
+    # rewritten while its changelog last moved six weeks ago. This one reads the
+    # diff. Replayed over the last 120 commits it found public declarations that
+    # reached no changelog at any later point either -- `http.setHeaderStatic`,
+    # `cors.applyPreflight`, `ssh.max_packets_per_direction`. The `changed` lane
+    # instance is the one CI reaches with a real base ref; the other two are
+    # no-ops on a clean checkout.
+    step "check-changelog-entry" ./scripts/check-changelog-entry.py ${base_ref:+"$base_ref"}
     step "check-testonly" zig build check-testonly
     step "check-ctgrind" zig build check-ctgrind
     step "check-fuzz" zig build check-fuzz
@@ -330,6 +340,24 @@ harness_smoke() {
     # the emulation is bypassed. See the script header.
     step "check-fp-freedom" ./scripts/check-fp-freedom.sh
     step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
+
+    # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
+    # input. A `Smith` ranged draw returns the range MINIMUM unless the eight
+    # bytes it reads as a little-endian u64 already lie inside the range, so a
+    # harness that opens with one -- or that slices its drawn bytes to a length
+    # that came from one -- replays every corpus seed, and every crash `--fuzz`
+    # minimises into a seed, as the same fixed input. 416 of 474 targets did at
+    # landing; `--advisory` prints that burn-down without failing, and comes off
+    # when it reaches zero. It still FAILS on a malformed or stale exemption.
+    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --advisory
+
+    # `run-examples` builds and runs each example in the LANE's optimize mode,
+    # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
+    # and the example prints its success lines having checked nothing. Three
+    # examples compared against an external oracle that way and printed that it
+    # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
+    # exiting 0 and still claiming a byte-exact match.
+    step "check-example-assert" ./scripts/check-example-assert.py
     run_modules "$plain $netns"
     graph_save
     summary
@@ -1070,7 +1098,7 @@ cmd_changed() {
                 # Might have changed the graph — ask the graph, do not assume.
                 trigger_graph=1
                 ;;
-            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/check-fp-freedom.sh|scripts/check-skip-as-pass.py|scripts/hooks/*)
+            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/check-fp-freedom.sh|scripts/check-skip-as-pass.py|scripts/check-fuzz-reach.py|scripts/check-example-assert.py|scripts/check-changelog-entry.py|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed.
@@ -1235,6 +1263,16 @@ cmd_changed() {
     # skipping this).
     step "check-changelog" zig build check-changelog
 
+    # `check-changelog` above proves the file EXISTS and is well formed; it reads
+    # the tree, never a diff, so it cannot see that a module's parser was
+    # rewritten while its changelog last moved six weeks ago. This one reads the
+    # diff. Replayed over the last 120 commits it found public declarations that
+    # reached no changelog at any later point either -- `http.setHeaderStatic`,
+    # `cors.applyPreflight`, `ssh.max_packets_per_direction`. The `changed` lane
+    # instance is the one CI reaches with a real base ref; the other two are
+    # no-ops on a clean checkout.
+    step "check-changelog-entry" ./scripts/check-changelog-entry.py ${base_ref:+"$base_ref"}
+
     # Always: a testkit leak into published code is introduced by editing a
     # MODULE, not build.zig, so there is no change signal to gate this on --
     # and it is ~0.5s cold, ~0.15s warm, so gating would save nothing.
@@ -1303,6 +1341,24 @@ cmd_changed() {
     # the emulation is bypassed. See the script header.
     step "check-fp-freedom" ./scripts/check-fp-freedom.sh
     step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
+
+    # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
+    # input. A `Smith` ranged draw returns the range MINIMUM unless the eight
+    # bytes it reads as a little-endian u64 already lie inside the range, so a
+    # harness that opens with one -- or that slices its drawn bytes to a length
+    # that came from one -- replays every corpus seed, and every crash `--fuzz`
+    # minimises into a seed, as the same fixed input. 416 of 474 targets did at
+    # landing; `--advisory` prints that burn-down without failing, and comes off
+    # when it reaches zero. It still FAILS on a malformed or stale exemption.
+    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --advisory
+
+    # `run-examples` builds and runs each example in the LANE's optimize mode,
+    # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
+    # and the example prints its success lines having checked nothing. Three
+    # examples compared against an external oracle that way and printed that it
+    # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
+    # exiting 0 and still claiming a byte-exact match.
+    step "check-example-assert" ./scripts/check-example-assert.py
 
     if [[ -z "$closure" ]]; then
         graph_save
@@ -1387,6 +1443,16 @@ phase_checks_fast_tail() {
     step "check-catalog" zig build check-catalog
     step "check-uapi" zig build check-uapi
     step "check-changelog" zig build check-changelog
+
+    # `check-changelog` above proves the file EXISTS and is well formed; it reads
+    # the tree, never a diff, so it cannot see that a module's parser was
+    # rewritten while its changelog last moved six weeks ago. This one reads the
+    # diff. Replayed over the last 120 commits it found public declarations that
+    # reached no changelog at any later point either -- `http.setHeaderStatic`,
+    # `cors.applyPreflight`, `ssh.max_packets_per_direction`. The `changed` lane
+    # instance is the one CI reaches with a real base ref; the other two are
+    # no-ops on a clean checkout.
+    step "check-changelog-entry" ./scripts/check-changelog-entry.py ${base_ref:+"$base_ref"}
     step "check-portable-table" zig build check-portable-table
     step "check-libs-table" zig build check-libs-table
     step "check-catalog-table" zig build check-catalog-table
@@ -1414,6 +1480,24 @@ phase_checks() {
     # the emulation is bypassed. See the script header.
     step "check-fp-freedom" ./scripts/check-fp-freedom.sh
     step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
+
+    # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
+    # input. A `Smith` ranged draw returns the range MINIMUM unless the eight
+    # bytes it reads as a little-endian u64 already lie inside the range, so a
+    # harness that opens with one -- or that slices its drawn bytes to a length
+    # that came from one -- replays every corpus seed, and every crash `--fuzz`
+    # minimises into a seed, as the same fixed input. 416 of 474 targets did at
+    # landing; `--advisory` prints that burn-down without failing, and comes off
+    # when it reaches zero. It still FAILS on a malformed or stale exemption.
+    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --advisory
+
+    # `run-examples` builds and runs each example in the LANE's optimize mode,
+    # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
+    # and the example prints its success lines having checked nothing. Three
+    # examples compared against an external oracle that way and printed that it
+    # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
+    # exiting 0 and still claiming a byte-exact match.
+    step "check-example-assert" ./scripts/check-example-assert.py
     step "check-ctgrind" zig build check-ctgrind
 }
 

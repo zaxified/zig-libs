@@ -17,8 +17,9 @@
 //! package (`ChaCha20Poly1305`, OpenSSL-backed) on this exact fresh key/
 //! nonce/AD/plaintext (none of it drawn from the module's own RFC 8439 §2.8.2
 //! test vector) reproduces the `expected_ct`/`expected_tag` bytes below
-//! byte-for-byte — checked by the `std.debug.assert`s right after `encrypt`,
-//! so a regression here fails the example, not just a comment.
+//! byte-for-byte — checked by the `must` calls right after `encrypt`, so a
+//! regression here fails the example, not just a comment. (`must` and not a
+//! debug-only assert: see its doc comment.)
 //!
 //! `ChaCha20.xor`/`ChaCha20Poly1305.encrypt`/`.decrypt` never allocate —
 //! every buffer below is caller-owned and sized by hand (`m.len` for the
@@ -28,6 +29,15 @@
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
 
 pub fn main() !void {
@@ -57,8 +67,8 @@ pub fn main() !void {
     var ct: [m.len]u8 = undefined;
     var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
     ChaCha20Poly1305.encrypt(&ct, &tag, m, ad, nonce, key);
-    std.debug.assert(std.mem.eql(u8, &expected_ct, &ct));
-    std.debug.assert(std.mem.eql(u8, &expected_tag, &tag));
+    must(std.mem.eql(u8, &expected_ct, &ct), @src());
+    must(std.mem.eql(u8, &expected_tag, &tag), @src());
     std.debug.print("encrypt: byte-exact match against the independent OpenSSL-backed ChaCha20-Poly1305 oracle\n", .{});
 
     var opened: [m.len]u8 = undefined;
@@ -88,7 +98,7 @@ pub fn main() !void {
             const all_zero = for (poisoned) |b| {
                 if (b != 0) break false;
             } else true;
-            std.debug.assert(all_zero); // stronger-than-std promise: m is really zeroed
+            must(all_zero, @src()); // stronger-than-std promise: m is really zeroed
             std.debug.print("output buffer zeroed on failure (stronger than std's 'undefined'): confirmed\n", .{});
         },
     }

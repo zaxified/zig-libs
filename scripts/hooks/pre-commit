@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Refuse a commit whose STAGED Zig sources are not `zig fmt` clean.
+# Refuse a commit whose STAGED Zig sources are not `zig fmt` clean, or whose
+# STAGED content changes a module substantially without recording it in that
+# module's CHANGELOG.md.
+#
+# Two checks, one hook, because both answer the same question — "is this
+# commit-shaped?" — and both are cheap enough to pay on every commit. Neither
+# is the authority: `scripts/test.sh` and CI are, and this hook exists only so
+# that what they will say is said now, before the commit is written.
 #
 # WHY THIS EXISTS. Formatting is gated in three places already — `scripts/
 # test.sh all` fmt-checks the whole tree, `scripts/test.sh changed` fmt-checks
@@ -28,6 +35,50 @@
 
 set -u
 
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
+
+# --- 1. changelog ---------------------------------------------------------
+#
+# WHY IT IS HERE AT ALL. `zig build check-changelog` proves every module HAS a
+# well-formed dated changelog; it reads the tree, never a diff, so it cannot
+# see that a module's parser was rewritten and its changelog last moved six
+# weeks ago. Replaying `check-changelog-entry.py` over this repository's own
+# recent history found API additions that reached no changelog at any later
+# point either (`http.setHeaderStatic`, `cors.applyPreflight`,
+# `ssh.max_packets_per_direction` among them) — the drift is not hypothetical,
+# it is already in the tree.
+#
+# WHY --staged. Same reason the fmt check below reads the index: what gets
+# committed is the staged content.
+#
+# ⚠ THE HOOK IS EARLY, NOT AUTHORITATIVE. It judges ONE commit, so a branch
+# that writes its entry in commit 3 has commits 1 and 2 refused here and
+# accepted by CI, which judges the whole push range. That asymmetry is the
+# price of catching it at commit time; `--no-verify` is the answer, and the
+# message below says so.
+#
+# A missing script or interpreter WARNS and does not block: this check is a
+# courtesy in front of the real gate, and a hook that bricks every commit
+# because python3 is absent is a hook people uninstall. The fmt check below
+# does block, because `zig` is already required to do anything in this repo.
+CLE="$ROOT/scripts/check-changelog-entry.py"
+if [[ ! -x "$CLE" ]]; then
+    echo "pre-commit: warning: $CLE missing or not executable — changelog check skipped" >&2
+elif ! command -v python3 >/dev/null 2>&1; then
+    echo "pre-commit: warning: no python3 — changelog check skipped" >&2
+else
+    if ! out="$("$CLE" --staged --quiet 2>&1)"; then
+        printf '%s\n' "$out" >&2
+        echo >&2
+        echo "This is the pre-commit hook, which judges THIS commit alone. If the entry" >&2
+        echo "belongs to a later commit of the same branch, --no-verify bypasses; CI" >&2
+        echo "judges the whole push range and is the authority." >&2
+        exit 1
+    fi
+fi
+
+# --- 2. zig fmt -----------------------------------------------------------
+#
 # Only files that will exist in the commit: Added, Copied, Modified. Deletions
 # and renames-away have no content to check.
 mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACM -z |

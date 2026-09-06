@@ -12,8 +12,9 @@
 //! enc -aes-256-cbc -K <key> -iv <iv>` on this exact fresh key/iv/plaintext
 //! (none of it drawn from the module's own NIST SP800-38A test vectors)
 //! reproduces the `expected_ct` bytes below byte-for-byte — this is checked
-//! by the `std.debug.assert` right after `encrypt`, so a regression here
-//! fails the example, not just a comment.
+//! by the `must` call right after `encrypt`, so a regression here fails the
+//! example, not just a comment. (`must` and not a debug-only assert: see its
+//! doc comment.)
 //!
 //! `aescbc.encrypt`/`decrypt`/`padPkcs7`/`unpadPkcs7`/`unpadXmlEnc` never
 //! allocate — every buffer below is caller-owned and stack-sized by the
@@ -23,6 +24,15 @@
 
 const std = @import("std");
 const aescbc = @import("aescbc");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const Aes256 = std.crypto.core.aes.Aes256;
 
 pub fn main() !void {
@@ -44,16 +54,16 @@ pub fn main() !void {
     // how much room `padPkcs7` needs (msg.len=65 -> 80, one full pad block
     // beyond the 4 whole blocks msg already fills).
     const padded_len = aescbc.paddedLenPkcs7(msg.len);
-    std.debug.assert(padded_len == 80);
+    must(padded_len == 80, @src());
     var padded: [80]u8 = undefined;
     const n = try aescbc.padPkcs7(msg, &padded);
-    std.debug.assert(n == padded_len);
+    must(n == padded_len, @src());
 
     // Encrypt the padded buffer in place-sized output; ciphertext length
     // equals the padded plaintext length for CBC (no further expansion).
     var ct: [80]u8 = undefined;
     _ = try aescbc.encrypt(Aes256, key, iv, &padded, &ct);
-    std.debug.assert(std.mem.eql(u8, &expected_ct, &ct));
+    must(std.mem.eql(u8, &expected_ct, &ct), @src());
     std.debug.print("encrypt: byte-exact match against openssl's independent AES-256-CBC ciphertext\n", .{});
 
     // Decrypt + unpad recovers the original message.

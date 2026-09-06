@@ -39,6 +39,15 @@ const std = @import("std");
 const spf = @import("spf-ect");
 const bumtree = @import("bumtree");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 const NodeId = bumtree.NodeId;
 const source: NodeId = 0;
 const members = [_]NodeId{ 3, 4, 5 };
@@ -119,29 +128,29 @@ pub fn main() !void {
 
         // Reachability: every one of the 7 nodes is on the SPT (this graph
         // is connected), including the tied node 3.
-        std.debug.assert(bt.node_count == 7);
+        must(bt.node_count == 7, @src());
         var n: NodeId = 1;
-        while (n < 7) : (n += 1) std.debug.assert(bt.rpfIngress(n) != null);
-        std.debug.assert(bt.rpfIngress(0) == null); // the source has no ingress
+        while (n < 7) : (n += 1) must(bt.rpfIngress(n) != null, @src());
+        must(bt.rpfIngress(0) == null, @src()); // the source has no ingress
 
         // Membership, independent of the tie.
-        for ([_]NodeId{ 0, 1, 2, 6 }) |x| std.debug.assert(!bt.isMember(x));
-        for ([_]NodeId{ 3, 4, 5 }) |x| std.debug.assert(bt.isMember(x));
+        for ([_]NodeId{ 0, 1, 2, 6 }) |x| must(!bt.isMember(x), @src());
+        for ([_]NodeId{ 3, 4, 5 }) |x| must(bt.isMember(x), @src());
 
         // Pruning: node 6 is a member-less leaf and must NEVER be a
         // replication target, regardless of which way node 3's tie resolved.
-        for (0..7) |i| std.debug.assert(std.mem.indexOfScalar(NodeId, bt.replicateTo(@intCast(i)), 6) == null);
+        for (0..7) |i| must(std.mem.indexOfScalar(NodeId, bt.replicateTo(@intCast(i)), 6) == null, @src());
 
         // The tie: node 3's parent is 1 or 2 (both legitimate), and it is
         // stable across an independent rebuild of the same graph — not a
         // fresh coin flip per call.
         const pred3 = bt.rpfIngress(3).?;
-        std.debug.assert(pred3 == 1 or pred3 == 2);
+        must(pred3 == 1 or pred3 == 2, @src());
         var g2 = try buildGraph(gpa);
         defer g2.deinit();
         var bt2 = try bumtree.build(gpa, &g2, source, &members);
         defer bt2.deinit();
-        std.debug.assert(bt2.rpfIngress(3).? == pred3);
+        must(bt2.rpfIngress(3).? == pred3, @src());
 
         // The reachability set, checked by actually flooding, not by
         // trusting `build`'s return: every member (3, 4, 5) is visited
@@ -149,9 +158,9 @@ pub fn main() !void {
         // visited more than once anywhere (tree ⇒ no loop, no duplicate).
         const visits = try floodViaTree(gpa, &bt);
         defer gpa.free(visits);
-        for ([_]NodeId{ 3, 4, 5 }) |m| std.debug.assert(visits[m] == 1);
-        std.debug.assert(visits[6] == 0);
-        for (visits) |v| std.debug.assert(v <= 1);
+        for ([_]NodeId{ 3, 4, 5 }) |m| must(visits[m] == 1, @src());
+        must(visits[6] == 0, @src());
+        for (visits) |v| must(v <= 1, @src());
         std.debug.print("run 1: 7-node fabric, tie at node 3 stable, node 6 correctly pruned, every member reached exactly once\n", .{});
 
         // Loop-freedom under the REAL hazard: a stale-node flood over the
@@ -162,15 +171,15 @@ pub fn main() !void {
         {
             const accepts = try floodWithRpf(gpa, &g, &bt, true);
             defer gpa.free(accepts);
-            for (accepts) |acc| std.debug.assert(acc <= 1);
-            for ([_]NodeId{ 3, 4, 5 }) |m| std.debug.assert(accepts[m] == 1);
+            for (accepts) |acc| must(acc <= 1, @src());
+            for ([_]NodeId{ 3, 4, 5 }) |m| must(accepts[m] == 1, @src());
         }
         {
             const accepts = try floodWithRpf(gpa, &g, &bt, false);
             defer gpa.free(accepts);
             var max: u32 = 0;
             for (accepts) |acc| max = @max(max, acc);
-            std.debug.assert(max > 1); // the cycle DOES duplicate without RPF
+            must(max > 1, @src()); // the cycle DOES duplicate without RPF
         }
         std.debug.print("RPF backstop: <=1 accept per node under a stale full-neighbour flood; without RPF the same flood duplicates\n", .{});
     }
@@ -187,11 +196,11 @@ pub fn main() !void {
         var bt = try bumtree.build(gpa, &g, source, &members2);
         defer bt.deinit();
 
-        std.debug.assert(bt.isMember(6));
-        std.debug.assert(std.mem.indexOfScalar(NodeId, bt.replicateTo(1), 6) != null); // now present
+        must(bt.isMember(6), @src());
+        must(std.mem.indexOfScalar(NodeId, bt.replicateTo(1), 6) != null, @src()); // now present
         const visits = try floodViaTree(gpa, &bt);
         defer gpa.free(visits);
-        std.debug.assert(visits[6] == 1); // and actually reached
+        must(visits[6] == 1, @src()); // and actually reached
         std.debug.print("run 2 (6 gains membership): the previously-pruned branch now appears and is reached\n", .{});
     }
 

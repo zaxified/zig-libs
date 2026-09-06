@@ -57,6 +57,15 @@ const std = @import("std");
 const decaf448 = @import("decaf448");
 const ed448 = @import("ed448");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 const Element = decaf448.Element;
 const Scalar = decaf448.scalar.CompressedScalar;
 
@@ -116,7 +125,7 @@ pub fn main() !void {
 
         const alice_shared = Element.scalarMul(alice_pub_recv, alice_sk);
         const bob_shared = Element.scalarMul(bob_pub_recv, bob_sk);
-        std.debug.assert(alice_shared.equals(bob_shared));
+        must(alice_shared.equals(bob_shared), @src());
 
         const shared_wire = alice_shared.encode();
         std.debug.print("session {d}: DH shared secret agrees: {x}\n", .{ session, shared_wire });
@@ -124,7 +133,7 @@ pub fn main() !void {
         // A fresh session must not silently reproduce the previous one's
         // shared secret — the state-carried-between-sessions check the
         // task calls for, even though this module keeps none itself.
-        if (prev_shared) |prev| std.debug.assert(!std.mem.eql(u8, &prev, &shared_wire));
+        if (prev_shared) |prev| must(!std.mem.eql(u8, &prev, &shared_wire), @src());
         prev_shared = shared_wire;
 
         // Algebraic cross-check (see file doc comment: no external oracle
@@ -134,7 +143,7 @@ pub fn main() !void {
         const sum_sk = decaf448.scalar.add(alice_sk, bob_sk);
         const lhs = Element.scalarMul(G, sum_sk);
         const rhs = Element.add(alice_pub, bob_pub);
-        std.debug.assert(lhs.equals(rhs));
+        must(lhs.equals(rhs), @src());
     }
     std.debug.print("distributivity identity [a+b]G == [a]G + [b]G held both sessions\n", .{});
 
@@ -144,8 +153,8 @@ pub fn main() !void {
     // relative to G.
     const h_input = expand(112, "decaf448 example pedersen basis H");
     const H = decaf448.element.oneWayMap(h_input);
-    std.debug.assert(!H.equals(Element.identity));
-    std.debug.assert(!H.equals(G));
+    must(!H.equals(Element.identity), @src());
+    must(!H.equals(G), @src());
 
     const m = scalarFromLabel("decaf448 example pedersen message m=42");
     const r = scalarFromLabel("decaf448 example pedersen blinding r, run 1");
@@ -159,14 +168,14 @@ pub fn main() !void {
     // Verifier, given the real opening, recomputes and checks equality —
     // never trusts the prover's own claim of what the commitment encodes.
     const reopened = Element.add(Element.scalarMul(G, m), Element.scalarMul(H, r));
-    std.debug.assert(commitment_recv.equals(reopened));
+    must(commitment_recv.equals(reopened), @src());
     std.debug.print("Pedersen commitment: correct opening accepted\n", .{});
 
     // A dishonest prover claiming a DIFFERENT message for the SAME
     // commitment must be rejected — the binding property.
     const wrong_m = scalarFromLabel("decaf448 example pedersen message m=43 (wrong)");
     const wrong_reopened = Element.add(Element.scalarMul(G, wrong_m), Element.scalarMul(H, r));
-    std.debug.assert(!commitment_recv.equals(wrong_reopened));
+    must(!commitment_recv.equals(wrong_reopened), @src());
     std.debug.print("Pedersen commitment: wrong opening rejected\n", .{});
 
     // ── negative paths at the wire boundary: named errors only ───────────

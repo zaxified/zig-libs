@@ -14,6 +14,15 @@
 const std = @import("std");
 const json5 = @import("json5");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -81,8 +90,8 @@ pub fn main() !void {
     while (it.next()) |entry| {
         if (std.mem.startsWith(u8, entry.key_ptr.*, "$err_")) saw_err_entry = true;
     }
-    std.debug.assert(saw_err_entry);
-    std.debug.assert(recovered.value.object.get("good").?.integer == 1);
-    std.debug.assert(recovered.value.object.get("ok").?.integer == 2);
+    must(saw_err_entry, @src());
+    must(recovered.value.object.get("good").?.integer == 1, @src());
+    must(recovered.value.object.get("ok").?.integer == 2, @src());
     std.debug.print("recovery: good/ok survived, malformed entry surfaced as $err_* data\n", .{});
 }

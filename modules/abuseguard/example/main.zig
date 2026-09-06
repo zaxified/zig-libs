@@ -19,6 +19,15 @@
 const std = @import("std");
 const abuseguard = @import("abuseguard");
 const netaddr = @import("netaddr");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const net = std.Io.net;
 
 /// A fake, caller-controlled clock -- same `.ctx`/`.nowFn` shape the module
@@ -72,11 +81,11 @@ pub fn main() !void {
             var buf: [16]u8 = undefined;
             const text = std.fmt.bufPrint(&buf, "10.0.0.{d}", .{round + 1}) catch unreachable;
             const client = ip(text);
-            std.debug.assert(g.admit(client) == .admitted);
-            std.debug.assert(g.admit(client) == .admitted);
+            must(g.admit(client) == .admitted, @src());
+            must(g.admit(client) == .admitted, @src());
             g.connClosed(client);
             g.connClosed(client);
-            std.debug.assert(g.connCount(client) == 0);
+            must(g.connCount(client) == 0, @src());
         }
     }
     std.debug.print("12 benign clients cycled connections; tracked={d}\n", .{g.trackedCount()});
@@ -87,20 +96,20 @@ pub fn main() !void {
     const attacker = ip("198.51.100.7");
     g.record(attacker, 1);
     g.record(attacker, 1);
-    std.debug.assert(!g.isGreylisted(attacker)); // 2 strikes < threshold 3
+    must(!g.isGreylisted(attacker), @src()); // 2 strikes < threshold 3
     g.record(attacker, 1); // 3rd strike: offense #1
-    std.debug.assert(g.isGreylisted(attacker));
-    std.debug.assert(!g.isBanned(attacker));
+    must(g.isGreylisted(attacker), @src());
+    must(!g.isBanned(attacker), @src());
     var retry: usize = 0;
     while (retry < 3) : (retry += 1) {
-        std.debug.assert(g.admit(attacker) == .greylisted); // retried, still denied
+        must(g.admit(attacker) == .greylisted, @src()); // retried, still denied
     }
 
     // 3. The greylist TTL expires (clock advanced, never slept): the client
     // is readmitted and its slot closes normally.
     fc.advanceMs(60_001);
-    std.debug.assert(!g.isGreylisted(attacker));
-    std.debug.assert(g.admit(attacker) == .admitted);
+    must(!g.isGreylisted(attacker), @src());
+    must(g.admit(attacker) == .admitted, @src());
     g.connClosed(attacker);
     std.debug.print("attacker's greylist expired through the injected clock; readmitted\n", .{});
 
@@ -109,20 +118,20 @@ pub fn main() !void {
     // `ban_after_offenses` and escalates to a *permanent* ban -- unlike the
     // greylist, a ban carries no TTL and time alone never lifts it.
     g.record(attacker, 3); // straight to the threshold
-    std.debug.assert(g.isBanned(attacker));
+    must(g.isBanned(attacker), @src());
     retry = 0;
     while (retry < 3) : (retry += 1) {
-        std.debug.assert(g.admit(attacker) == .banned); // retried denial, stable
+        must(g.admit(attacker) == .banned, @src()); // retried denial, stable
     }
     fc.advanceMs(10 * std.time.ms_per_min); // a ban never expires on its own
-    std.debug.assert(g.admit(attacker) == .banned);
+    must(g.admit(attacker) == .banned, @src());
     std.debug.print("attacker escalated to a permanent ban; still denied after 10 min\n", .{});
 
     // 5. Only an explicit `unban` lifts a permanent ban -- full forgiveness:
     // clears the ban, the greylist, all strikes and the offense history.
     g.unban(attacker);
-    std.debug.assert(!g.isBanned(attacker));
-    std.debug.assert(g.admit(attacker) == .admitted);
+    must(!g.isBanned(attacker), @src());
+    must(g.admit(attacker) == .admitted, @src());
     g.connClosed(attacker);
     std.debug.print("unban restored the attacker to a clean slate\n", .{});
 
@@ -130,17 +139,17 @@ pub fn main() !void {
     // slot is released. A cap rejection must not corrupt bookkeeping.
     {
         const busy = ip("203.0.113.50");
-        std.debug.assert(g.admit(busy) == .admitted);
-        std.debug.assert(g.admit(busy) == .admitted);
-        std.debug.assert(g.admit(busy) == .admitted);
-        std.debug.assert(g.admit(busy) == .per_ip_cap); // 4th over max_conns_per_ip=3
+        must(g.admit(busy) == .admitted, @src());
+        must(g.admit(busy) == .admitted, @src());
+        must(g.admit(busy) == .admitted, @src());
+        must(g.admit(busy) == .per_ip_cap, @src()); // 4th over max_conns_per_ip=3
         g.connClosed(busy);
-        std.debug.assert(g.admit(busy) == .admitted); // one freed slot -> readmitted
-        std.debug.assert(g.connCount(busy) == 3);
+        must(g.admit(busy) == .admitted, @src()); // one freed slot -> readmitted
+        must(g.connCount(busy) == 3, @src());
         g.connClosed(busy);
         g.connClosed(busy);
         g.connClosed(busy);
-        std.debug.assert(g.connCount(busy) == 0);
+        must(g.connCount(busy) == 0, @src());
     }
     std.debug.print("per-IP cap held exactly at the boundary and recovered after release\n", .{});
 
@@ -154,18 +163,18 @@ pub fn main() !void {
         const e = ip("203.0.113.52");
         const f = ip("203.0.113.53");
         var i: usize = 0;
-        while (i < 3) : (i += 1) std.debug.assert(g.admit(d) == .admitted);
+        while (i < 3) : (i += 1) must(g.admit(d) == .admitted, @src());
         i = 0;
-        while (i < 3) : (i += 1) std.debug.assert(g.admit(e) == .admitted);
-        std.debug.assert(g.totalConns() == 6);
-        std.debug.assert(g.admit(f) == .admitted); // total 7
-        std.debug.assert(g.admit(f) == .admitted); // total 8: exactly at max_conns_total
-        std.debug.assert(g.admit(f) == .total_cap); // f itself is nowhere near its own cap
-        std.debug.assert(g.connCount(f) == 2);
+        while (i < 3) : (i += 1) must(g.admit(e) == .admitted, @src());
+        must(g.totalConns() == 6, @src());
+        must(g.admit(f) == .admitted, @src()); // total 7
+        must(g.admit(f) == .admitted, @src()); // total 8: exactly at max_conns_total
+        must(g.admit(f) == .total_cap, @src()); // f itself is nowhere near its own cap
+        must(g.connCount(f) == 2, @src());
 
         g.connClosed(f); // total 7: one slot freed
-        std.debug.assert(g.admit(f) == .admitted); // retried, admitted this time: total 8
-        std.debug.assert(g.totalConns() == 8);
+        must(g.admit(f) == .admitted, @src()); // retried, admitted this time: total 8
+        must(g.totalConns() == 8, @src());
 
         i = 0;
         while (i < 3) : (i += 1) g.connClosed(d);
@@ -173,7 +182,7 @@ pub fn main() !void {
         while (i < 3) : (i += 1) g.connClosed(e);
         i = 0;
         while (i < 2) : (i += 1) g.connClosed(f);
-        std.debug.assert(g.totalConns() == 0);
+        must(g.totalConns() == 0, @src());
     }
     std.debug.print("global cap held exactly at max_conns_total, independent of any single IP's own cap\n", .{});
 
@@ -188,20 +197,20 @@ pub fn main() !void {
         const peer_a2 = try net.IpAddress.parseIp4("203.0.113.60", 2222);
         const client_a = ip("203.0.113.60");
 
-        std.debug.assert(g.onConnect()(g.onConnectCtx(), peer_a) == .accept);
-        std.debug.assert(g.onConnect()(g.onConnectCtx(), peer_a2) == .accept);
-        std.debug.assert(g.connCount(client_a) == 2);
+        must(g.onConnect()(g.onConnectCtx(), peer_a) == .accept, @src());
+        must(g.onConnect()(g.onConnectCtx(), peer_a2) == .accept, @src());
+        must(g.connCount(client_a) == 2, @src());
 
         g.onConnState()(g.onConnStateCtx(), peer_a, .active);
         g.onConnState()(g.onConnStateCtx(), peer_a, .idle);
-        std.debug.assert(g.connCount(client_a) == 2); // non-.closed states never release
+        must(g.connCount(client_a) == 2, @src()); // non-.closed states never release
 
         g.onConnState()(g.onConnStateCtx(), peer_a, .closed);
-        std.debug.assert(g.connCount(client_a) == 1);
+        must(g.connCount(client_a) == 1, @src());
         g.onConnState()(g.onConnStateCtx(), peer_a2, .closed);
-        std.debug.assert(g.connCount(client_a) == 0);
+        must(g.connCount(client_a) == 0, @src());
         g.onConnState()(g.onConnStateCtx(), peer_a, .closed); // duplicate/retried close
-        std.debug.assert(g.connCount(client_a) == 0); // ignored, no underflow
+        must(g.connCount(client_a) == 0, @src()); // ignored, no underflow
     }
     std.debug.print("hook pair: same IP two ports share one budget; a duplicate close is a no-op\n", .{});
 
@@ -238,18 +247,18 @@ pub fn main() !void {
         g_bounded.record(ip("10.2.0.1"), 1);
         g_bounded.record(ip("10.2.0.2"), 1);
         g_bounded.record(ip("10.2.0.3"), 1);
-        std.debug.assert(g_bounded.trackedCount() == 3);
+        must(g_bounded.trackedCount() == 3, @src());
 
         g_bounded.record(ip("10.2.0.1"), 1); // touch .1 -> .2 becomes the LRU tail
         g_bounded.record(ip("10.2.0.4"), 1); // at cap -> evicts .2, not the touched .1
-        std.debug.assert(g_bounded.trackedCount() == 3);
+        must(g_bounded.trackedCount() == 3, @src());
 
         // .1 kept its accumulated strikes across the eviction pressure...
         g_bounded.record(ip("10.2.0.1"), 98); // 2 + 98 = 100 -> crosses ban_threshold
-        std.debug.assert(g_bounded.isGreylisted(ip("10.2.0.1")));
+        must(g_bounded.isGreylisted(ip("10.2.0.1")), @src());
         // ...while the evicted .2 starts over from zero (the price of eviction).
         g_bounded.record(ip("10.2.0.2"), 98);
-        std.debug.assert(!g_bounded.isGreylisted(ip("10.2.0.2")));
+        must(!g_bounded.isGreylisted(ip("10.2.0.2")), @src());
     }
     std.debug.print("bounded store: LRU eviction at max_tracked_ips kept the touched entry, dropped the stale one\n", .{});
 
@@ -268,8 +277,8 @@ pub fn main() !void {
             .store_full => std.debug.print("OOM on entry tracking: store_full (fail-closed, as documented)\n", .{}),
             else => return error.UnexpectedVerdict,
         }
-        std.debug.assert(g2.trackedCount() == 0);
-        std.debug.assert(g2.totalConns() == 0);
+        must(g2.trackedCount() == 0, @src());
+        must(g2.totalConns() == 0, @src());
     }
 
     std.debug.print("abuseguard example done; tracked={d} total_conns={d}\n", .{ g.trackedCount(), g.totalConns() });

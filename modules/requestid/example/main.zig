@@ -29,6 +29,15 @@ const requestid = @import("requestid");
 const router = @import("router");
 const http = @import("http");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
     var in: std.Io.Reader = .fixed(bytes);
     var out: std.Io.Writer = .fixed(out_buf);
@@ -96,9 +105,9 @@ pub fn main() !void {
         var buf: [1024]u8 = undefined;
         const got = runWire(&r, wireGet("/"), &buf);
         const hdr = headerValue(got, "X-Request-Id").?;
-        std.debug.assert(hdr.len == requestid.generated_len);
-        for (hdr) |c| std.debug.assert(std.ascii.isHex(c));
-        std.debug.assert(std.mem.eql(u8, hdr, bodyOf(got)));
+        must(hdr.len == requestid.generated_len, @src());
+        for (hdr) |c| must(std.ascii.isHex(c), @src());
+        must(std.mem.eql(u8, hdr, bodyOf(got)), @src());
         std.debug.print("generated ID: {s} (echoed + matches current())\n", .{hdr});
     }
 
@@ -108,7 +117,7 @@ pub fn main() !void {
         var b2: [1024]u8 = undefined;
         const id1 = headerValue(runWire(&r, wireGet("/"), &b1), "X-Request-Id").?;
         const id2 = headerValue(runWire(&r, wireGet("/"), &b2), "X-Request-Id").?;
-        std.debug.assert(!std.mem.eql(u8, id1, id2));
+        must(!std.mem.eql(u8, id1, id2), @src());
         std.debug.print("two requests: distinct generated IDs\n", .{});
     }
 
@@ -119,8 +128,8 @@ pub fn main() !void {
         var buf: [1024]u8 = undefined;
         const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\n" ++
             "X-Request-Id: edge-abc-123\r\nConnection: close\r\n\r\n", &buf);
-        std.debug.assert(std.mem.eql(u8, headerValue(got, "X-Request-Id").?, "edge-abc-123"));
-        std.debug.assert(std.mem.eql(u8, bodyOf(got), "edge-abc-123"));
+        must(std.mem.eql(u8, headerValue(got, "X-Request-Id").?, "edge-abc-123"), @src());
+        must(std.mem.eql(u8, bodyOf(got), "edge-abc-123"), @src());
         std.debug.print("inbound ID honoured: edge-abc-123 propagated unchanged\n", .{});
     }
 
@@ -143,8 +152,8 @@ pub fn main() !void {
             const req = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{bad}) catch unreachable;
             const got = runWire(&r, req, &resp_buf);
             const hdr = headerValue(got, "X-Request-Id").?;
-            std.debug.assert(hdr.len == requestid.generated_len); // regenerated, not adopted
-            std.debug.assert(!std.mem.eql(u8, hdr, bad));
+            must(hdr.len == requestid.generated_len, @src()); // regenerated, not adopted
+            must(!std.mem.eql(u8, hdr, bad), @src());
         }
         std.debug.print("{d} malformed inbound IDs all rejected, fresh IDs generated instead\n", .{malformed.len});
     }
@@ -159,13 +168,13 @@ pub fn main() !void {
         const at_cap: [requestid.max_adopt_len]u8 = @splat('a');
         const req1 = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{at_cap}) catch unreachable;
         const got1 = runWire(&r, req1, &resp_buf);
-        std.debug.assert(std.mem.eql(u8, headerValue(got1, "X-Request-Id").?, &at_cap));
+        must(std.mem.eql(u8, headerValue(got1, "X-Request-Id").?, &at_cap), @src());
 
         const over_cap: [requestid.max_adopt_len + 1]u8 = @splat('a');
         const req2 = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{over_cap}) catch unreachable;
         const got2 = runWire(&r, req2, &resp_buf);
         const hdr2 = headerValue(got2, "X-Request-Id").?;
-        std.debug.assert(hdr2.len == requestid.generated_len); // over the cap: regenerated
+        must(hdr2.len == requestid.generated_len, @src()); // over the cap: regenerated
         std.debug.print("adopt-length boundary: exactly {d} bytes adopted, {d} bytes regenerated\n", .{ requestid.max_adopt_len, requestid.max_adopt_len + 1 });
     }
 
@@ -181,7 +190,7 @@ pub fn main() !void {
         var buf: [1024]u8 = undefined;
         const got = runWire(&r2, "GET / HTTP/1.1\r\nHost: t\r\n" ++
             "X-Request-Id: edge-xyz\r\nConnection: close\r\n\r\n", &buf);
-        std.debug.assert(!std.mem.eql(u8, "edge-xyz", headerValue(got, "X-Request-Id").?));
+        must(!std.mem.eql(u8, "edge-xyz", headerValue(got, "X-Request-Id").?), @src());
         std.debug.print("trust_incoming=false: a valid inbound ID was still ignored\n", .{});
     }
 
@@ -196,8 +205,8 @@ pub fn main() !void {
 
         var buf: [1024]u8 = undefined;
         const got = runWire(&r3, wireGet("/"), &buf);
-        std.debug.assert(headerValue(got, "X-Request-Id") == null);
-        std.debug.assert(bodyOf(got).len == requestid.generated_len); // current() still set
+        must(headerValue(got, "X-Request-Id") == null, @src());
+        must(bodyOf(got).len == requestid.generated_len, @src()); // current() still set
         std.debug.print("echo=false: no response header, current() still populated\n", .{});
     }
 
@@ -212,7 +221,7 @@ pub fn main() !void {
         var buf: [1024]u8 = undefined;
         const got = runWire(&r4, "GET / HTTP/1.1\r\nHost: t\r\n" ++
             "X-Correlation-Id: trace-42\r\nConnection: close\r\n\r\n", &buf);
-        std.debug.assert(std.mem.eql(u8, headerValue(got, "X-Correlation-Id").?, "trace-42"));
+        must(std.mem.eql(u8, headerValue(got, "X-Correlation-Id").?, "trace-42"), @src());
     }
 
     // 9. Registered outermost: a 404 short-circuit (no route matches) still
@@ -221,9 +230,9 @@ pub fn main() !void {
     {
         var buf: [1024]u8 = undefined;
         const got = runWire(&r, wireGet("/does-not-exist"), &buf);
-        std.debug.assert(statusOf(got) == 404);
+        must(statusOf(got) == 404, @src());
         const hdr = headerValue(got, "X-Request-Id").?;
-        std.debug.assert(hdr.len == requestid.generated_len);
+        must(hdr.len == requestid.generated_len, @src());
         std.debug.print("404 short-circuit still carried a request ID\n", .{});
     }
 
@@ -252,7 +261,7 @@ pub fn main() !void {
         var threads: [4]std.Thread = undefined;
         for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &r, &mismatches });
         for (threads) |t| t.join();
-        std.debug.assert(mismatches.load(.seq_cst) == 0);
+        must(mismatches.load(.seq_cst) == 0, @src());
         std.debug.print("concurrency: 4 threads x 500 requests each, header always matched current() (no cross-thread bleed)\n", .{});
     }
 

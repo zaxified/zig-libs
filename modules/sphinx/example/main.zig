@@ -42,6 +42,15 @@ const std = @import("std");
 const sphinx = @import("sphinx");
 const Secp256k1 = @import("k256").Secp256k1;
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn pointOf(secret: [32]u8) [33]u8 {
     return (Secp256k1.combMulBase(secret, .big) catch unreachable).toCompressedSec1();
 }
@@ -91,21 +100,21 @@ pub fn main() !void {
     // hop — each iteration re-parses from bytes, the way a real
     // forwarding node receives it, never touching `session_key` again. ──
     const packet = try sphinx.construct(session_key, &node_pubkeys, &payloads, &associated_data);
-    std.debug.assert(std.mem.eql(u8, &packet.public_key, &hop_secrets[0].ephemeral_pubkey));
+    must(std.mem.eql(u8, &packet.public_key, &hop_secrets[0].ephemeral_pubkey), @src());
 
     var wire = packet.toBytes();
     var hop: usize = 0;
     while (hop < num_hops) : (hop += 1) {
         const received = try sphinx.OnionPacket.fromSlice(&wire);
         const result = try sphinx.process(node_privkeys[hop], received, &associated_data);
-        std.debug.assert(std.mem.eql(u8, result.payload(), payloads[hop]));
+        must(std.mem.eql(u8, result.payload(), payloads[hop]), @src());
         std.debug.print("hop {d}: recovered its own payload ({d} bytes), next_packet={s}\n", .{ hop, result.payload().len, if (result.next_packet != null) "present" else "null (final hop)" });
 
         if (hop + 1 < num_hops) {
-            std.debug.assert(result.next_packet != null);
+            must(result.next_packet != null, @src());
             wire = result.next_packet.?.toBytes();
         } else {
-            std.debug.assert(result.next_packet == null); // BOLT#4: all-zero next_hmac at the final hop
+            must(result.next_packet == null, @src()); // BOLT#4: all-zero next_hmac at the final hop
         }
     }
     std.debug.print("onion fully peeled: all {d} hops recovered their payload\n", .{num_hops});

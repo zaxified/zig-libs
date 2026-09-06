@@ -15,8 +15,8 @@
 const std = @import("std");
 const testkit = @import("testkit");
 
-/// A gate, not a printout: every check below goes through this rather than
-/// `std.debug.assert`, which `ReleaseFast` compiles out entirely -- an
+/// A gate, not a printout: every check below goes through this rather than a
+/// debug-only assertion, which `ReleaseFast` compiles out entirely -- an
 /// example meant to fail loudly must not rely on a mechanism that can
 /// silently stop checking anything.
 fn check(cond: bool, comptime what: []const u8) !void {

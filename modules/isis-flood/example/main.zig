@@ -27,6 +27,15 @@ const isis = @import("isis");
 const lsdb = @import("isis-lsdb");
 const flood = @import("isis-flood");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 const sys_a: [6]u8 = .{ 0, 0, 0, 0, 0, 0xA };
 const sys_b: [6]u8 = .{ 0, 0, 0, 0, 0, 0xB };
 const sys_c: [6]u8 = .{ 0, 0, 0, 0, 0, 0xC };
@@ -111,7 +120,7 @@ pub fn main() !void {
 
     {
         const r = a_sched.poll(0, up(0), &a_db, &out, &scratch);
-        std.debug.assert(onlyLsps(r.effects, 0) == 1);
+        must(onlyLsps(r.effects, 0) == 1, @src());
         for (r.effects) |e| {
             if (e.kind != .lsp) continue;
             _ = try b_db.insert(e.bytes, 0, 0); // B receives on its iface 0 (arrival)
@@ -119,32 +128,32 @@ pub fn main() !void {
     }
     // Split horizon at B: the LSP arrived on iface 0, so it must be queued to
     // flood on iface 1 (toward C) and NEVER back on iface 0 (toward A).
-    std.debug.assert(b_db.srmSet(id_a).?.isSet(1));
-    std.debug.assert(!b_db.srmSet(id_a).?.isSet(0));
+    must(b_db.srmSet(id_a).?.isSet(1), @src());
+    must(!b_db.srmSet(id_a).?.isSet(0), @src());
 
     {
         const r = b_sched.poll(0, up2(0, 1), &b_db, &out, &scratch);
-        std.debug.assert(onlyLsps(r.effects, 1) == 1); // only on the onward interface
-        std.debug.assert(onlyLsps(r.effects, 0) == 0); // never back toward A
+        must(onlyLsps(r.effects, 1) == 1, @src()); // only on the onward interface
+        must(onlyLsps(r.effects, 0) == 0, @src()); // never back toward A
         for (r.effects) |e| {
             if (e.kind != .lsp or e.iface != 1) continue;
             _ = try c_db.insert(e.bytes, 0, 0); // C receives on its iface 0 (arrival, from B)
         }
     }
     // Split horizon at C too: must flood onward to D (iface 1), never back to B.
-    std.debug.assert(c_db.srmSet(id_a).?.isSet(1));
-    std.debug.assert(!c_db.srmSet(id_a).?.isSet(0));
+    must(c_db.srmSet(id_a).?.isSet(1), @src());
+    must(!c_db.srmSet(id_a).?.isSet(0), @src());
 
     {
         const r = c_sched.poll(0, up2(0, 1), &c_db, &out, &scratch);
-        std.debug.assert(onlyLsps(r.effects, 1) == 1);
+        must(onlyLsps(r.effects, 1) == 1, @src());
         for (r.effects) |e| {
             if (e.kind != .lsp or e.iface != 1) continue;
             _ = try d_db.insert(e.bytes, 0, 0); // D receives on its iface 0 (arrival, from C)
         }
     }
-    std.debug.assert(d_db.get(id_a, 0) != null);
-    std.debug.assert(d_db.get(id_a, 0).?.sequence_number == 1);
+    must(d_db.get(id_a, 0) != null, @src());
+    must(d_db.get(id_a, 0).?.sequence_number == 1, @src());
     std.debug.print("run 1: A's seq=1 LSP propagated A->B->C->D, split horizon held at every hop\n", .{});
 
     // ── newer sequence number replacing an older one ─────────────────────────
@@ -153,14 +162,14 @@ pub fn main() !void {
     // interval so this is unambiguously the new-content flood, not a stale
     // retransmit of seq=1.
     const r2 = try a_db.insert(buildA(&abuf, 2), null, 20);
-    std.debug.assert(r2.ordering == .newer and r2.stored);
+    must(r2.ordering == .newer and r2.stored, @src());
 
     {
         const r = a_sched.poll(20, up(0), &a_db, &out, &scratch);
         for (r.effects) |e| {
             if (e.kind != .lsp) continue;
             const ins = try b_db.insert(e.bytes, 0, 20);
-            std.debug.assert(ins.ordering == .newer and ins.stored);
+            must(ins.ordering == .newer and ins.stored, @src());
         }
     }
     {
@@ -168,7 +177,7 @@ pub fn main() !void {
         for (r.effects) |e| {
             if (e.kind != .lsp or e.iface != 1) continue;
             const ins = try c_db.insert(e.bytes, 0, 20);
-            std.debug.assert(ins.ordering == .newer and ins.stored);
+            must(ins.ordering == .newer and ins.stored, @src());
         }
     }
     {
@@ -176,10 +185,10 @@ pub fn main() !void {
         for (r.effects) |e| {
             if (e.kind != .lsp or e.iface != 1) continue;
             const ins = try d_db.insert(e.bytes, 0, 20);
-            std.debug.assert(ins.ordering == .newer and ins.stored);
+            must(ins.ordering == .newer and ins.stored, @src());
         }
     }
-    std.debug.assert(d_db.get(id_a, 20).?.sequence_number == 2);
+    must(d_db.get(id_a, 20).?.sequence_number == 2, @src());
     std.debug.print("run 2 (topology unchanged, LSP updated): seq=2 propagated end to end, superseding seq=1\n", .{});
 
     // ── an older sequence number is rejected ──────────────────────────────────
@@ -193,10 +202,10 @@ pub fn main() !void {
     {
         const before = c_db.get(id_a, 20).?.sequence_number;
         const older = try c_db.insert(stale_seq1, 0, 25);
-        std.debug.assert(older.ordering == .older);
-        std.debug.assert(!older.stored);
-        std.debug.assert(c_db.get(id_a, 25).?.sequence_number == before); // unchanged
-        std.debug.assert(c_db.srmSet(id_a).?.isSet(0)); // correct the stale sender back
+        must(older.ordering == .older, @src());
+        must(!older.stored, @src());
+        must(c_db.get(id_a, 25).?.sequence_number == before, @src()); // unchanged
+        must(c_db.srmSet(id_a).?.isSet(0), @src()); // correct the stale sender back
         std.debug.print("older replay of seq=1 at C (holding seq=2): rejected (ordering=.older, stored=false)\n", .{});
     }
 
@@ -232,7 +241,7 @@ pub fn main() !void {
             error.CorruptedLsp => std.debug.print("corrupted checksum at D: CorruptedLsp (expected), store unchanged\n", .{}),
             else => return err,
         }
-        std.debug.assert(d_db.count() == before); // rejected cleanly, nothing stored
+        must(d_db.count() == before, @src()); // rejected cleanly, nothing stored
     }
 
     // ── a failure path that allocates and returns early, by NAMED error ─────
@@ -254,6 +263,6 @@ pub fn main() !void {
             error.OutOfMemory => std.debug.print("insert under a FailingAllocator: OutOfMemory (expected), store left empty\n", .{}),
             else => return err,
         }
-        std.debug.assert(fdb.count() == 0); // nothing partially stored
+        must(fdb.count() == 0, @src()); // nothing partially stored
     }
 }

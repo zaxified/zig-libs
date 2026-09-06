@@ -18,6 +18,15 @@
 const std = @import("std");
 const bacnet = @import("bacnet");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     // ── wire a device and a client onto one in-memory network ───────────
     var net: bacnet.transport.LoopNetwork = .{};
@@ -56,7 +65,7 @@ pub fn main() !void {
     var ack_len: usize = 0;
     switch (answer) {
         .complex_ack => |ca| {
-            std.debug.assert(ca.invoke_id == invoke_id);
+            must(ca.invoke_id == invoke_id, @src());
             ack_len = ca.data.len;
             @memcpy(ack_buf[0..ack_len], ca.data);
             const ack = try bacnet.service.ReadPropertyAck.decode(ack_buf[0..ack_len]);
@@ -74,7 +83,7 @@ pub fn main() !void {
     const refusal = try client.poll(now_ms);
     switch (refusal) {
         .err => |e| {
-            std.debug.assert(e.invoke_id == bad_invoke);
+            must(e.invoke_id == bad_invoke, @src());
             std.debug.print("read 'description' refused: class={s} code={s}\n", .{ @tagName(e.class), @tagName(e.code) });
         },
         else => return error.UnexpectedEvent,

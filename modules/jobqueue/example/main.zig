@@ -22,6 +22,15 @@ const std = @import("std");
 const jobqueue = @import("jobqueue");
 const kv = @import("kv");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A controllable wall clock (Unix-epoch nanoseconds), injected so the
 /// schedule-driven paths (`delay_ns`/`run_at`/`nack` backoff visibility) are
 /// deterministic — this module has no way to read the system clock from
@@ -87,8 +96,8 @@ pub fn main() !void {
         _ = try q.enqueue("report.build", "q3", .{ .partition = "reports", .priority = .low });
         _ = try q.enqueue("alert.page", "disk-full", .{ .priority = .critical });
         _ = try q.enqueue("email.send", "to:carol", .{ .partition = "email", .delay_ns = 30 * s });
-        std.debug.assert(q.readyCount() == 5);
-        std.debug.assert(q.totalCount() == 5);
+        must(q.readyCount() == 5, @src());
+        must(q.totalCount() == 5, @src());
         std.debug.print("enqueued 5 jobs across 3 partitions, one scheduled 30s out\n", .{});
     }
 
@@ -97,11 +106,11 @@ pub fn main() !void {
     // partition-filtered dequeue folds "email" in enqueue order.
     {
         const critical = (try q.dequeue(.{ .visibility_timeout_ns = 5 * s })).?;
-        std.debug.assert(std.mem.eql(u8, critical.job_type, "alert.page"));
+        must(std.mem.eql(u8, critical.job_type, "alert.page"), @src());
         try q.ack(critical);
 
         const alice = (try q.dequeue(.{ .partition = "email", .visibility_timeout_ns = 5 * s })).?;
-        std.debug.assert(std.mem.eql(u8, alice.payload, "to:alice"));
+        must(std.mem.eql(u8, alice.payload, "to:alice"), @src());
         try q.ack(alice);
         std.debug.print("critical job dispatched ahead of FIFO, then partition FIFO honored\n", .{});
     }
@@ -123,10 +132,10 @@ pub fn main() !void {
     // though it is the only thing left in "email", until the wall clock
     // reaches its schedule.
     {
-        std.debug.assert((try q.dequeue(.{ .partition = "email", .visibility_timeout_ns = 5 * s })) == null);
+        must((try q.dequeue(.{ .partition = "email", .visibility_timeout_ns = 5 * s })) == null, @src());
         wall.advance(30 * s);
         const carol = (try q.dequeue(.{ .partition = "email", .visibility_timeout_ns = 5 * s })).?;
-        std.debug.assert(std.mem.eql(u8, carol.payload, "to:carol"));
+        must(std.mem.eql(u8, carol.payload, "to:carol"), @src());
         try q.ack(carol);
         std.debug.print("delayed job stayed invisible until its schedule, then dispatched\n", .{});
     }
@@ -137,14 +146,14 @@ pub fn main() !void {
     // can no longer touch the job.
     {
         const lease1 = (try q.dequeue(.{ .visibility_timeout_ns = 10 * ms })).?;
-        std.debug.assert(std.mem.eql(u8, lease1.job_type, "report.build"));
-        std.debug.assert(lease1.attempt == 1);
-        std.debug.assert(q.leasedCount() == 1);
+        must(std.mem.eql(u8, lease1.job_type, "report.build"), @src());
+        must(lease1.attempt == 1, @src());
+        must(q.leasedCount() == 1, @src());
 
         mono.advance(11 * ms);
-        std.debug.assert(try q.reapExpiredLeases() == 1);
-        std.debug.assert(q.leasedCount() == 0);
-        std.debug.assert(q.readyCount() == 1);
+        must(try q.reapExpiredLeases() == 1, @src());
+        must(q.leasedCount() == 0, @src());
+        must(q.readyCount() == 1, @src());
 
         if (q.ack(lease1)) |_| {
             unreachable;
@@ -154,7 +163,7 @@ pub fn main() !void {
         }
 
         const lease2 = (try q.dequeue(.{ .visibility_timeout_ns = 5 * s })).?;
-        std.debug.assert(lease2.attempt == 2); // second delivery, bumped by the reaper
+        must(lease2.attempt == 2, @src()); // second delivery, bumped by the reaper
         try q.ack(lease2);
         std.debug.print("lease-timeout sweep requeued the job with a bumped attempt count\n", .{});
     }
@@ -168,24 +177,24 @@ pub fn main() !void {
         var attempt: u32 = 1;
         while (attempt <= 3) : (attempt += 1) {
             const lease = (try q.dequeue(.{ .visibility_timeout_ns = 5 * s })).?;
-            std.debug.assert(lease.attempt == attempt);
+            must(lease.attempt == attempt, @src());
             try q.nack(lease, .{ .backoff_ns = 20 * ms });
             if (attempt < 3) {
                 // Backoff not elapsed yet: not redispatchable until it is.
-                std.debug.assert((try q.dequeue(.{ .visibility_timeout_ns = 5 * s })) == null);
+                must((try q.dequeue(.{ .visibility_timeout_ns = 5 * s })) == null, @src());
                 wall.advance(20 * ms);
             }
         }
 
-        std.debug.assert(q.deadLetterCount() == 1);
-        std.debug.assert(q.readyCount() == 0);
-        std.debug.assert((try q.dequeue(.{ .visibility_timeout_ns = 5 * s })) == null);
+        must(q.deadLetterCount() == 1, @src());
+        must(q.readyCount() == 0, @src());
+        must((try q.dequeue(.{ .visibility_timeout_ns = 5 * s })) == null, @src());
 
         const dead = try q.deadLetterList(gpa);
         defer jobqueue.Queue.freeDeadLetterList(gpa, dead);
-        std.debug.assert(dead.len == 1);
-        std.debug.assert(std.mem.eql(u8, dead[0].job_type, "flaky.job"));
-        std.debug.assert(dead[0].attempts == 3);
+        must(dead.len == 1, @src());
+        must(std.mem.eql(u8, dead[0].job_type, "flaky.job"), @src());
+        must(dead[0].attempts == 3, @src());
         std.debug.print("job exhausted max_attempts via nack backoff and landed in the DLQ\n", .{});
     }
 
@@ -207,7 +216,7 @@ pub fn main() !void {
             error.FieldTooLarge => std.debug.print("oversized job_type correctly rejected: FieldTooLarge\n", .{}),
             else => return err,
         }
-        std.debug.assert(q.totalCount() == before_total); // rejected cleanly, no partial state
+        must(q.totalCount() == before_total, @src()); // rejected cleanly, no partial state
     }
 
     // Crash recovery: close with one job leased-but-unacked, reopen over the
@@ -232,13 +241,13 @@ pub fn main() !void {
         // The earlier dead-lettered "flaky.job" is durable too (dead-lettered
         // jobs stay indexed, never deleted), so it survives recovery
         // alongside the orphan — only the acked job is actually gone.
-        std.debug.assert(q.totalCount() == 2);
-        std.debug.assert(q.readyCount() == 1);
-        std.debug.assert(q.leasedCount() == 0); // the lease itself never persisted
-        std.debug.assert(q.deadLetterCount() == 1);
+        must(q.totalCount() == 2, @src());
+        must(q.readyCount() == 1, @src());
+        must(q.leasedCount() == 0, @src()); // the lease itself never persisted
+        must(q.deadLetterCount() == 1, @src());
 
         const recovered = (try q.dequeue(.{ .visibility_timeout_ns = 5 * s })).?;
-        std.debug.assert(std.mem.eql(u8, recovered.payload, "will-be-orphaned"));
+        must(std.mem.eql(u8, recovered.payload, "will-be-orphaned"), @src());
         try q.ack(recovered);
         std.debug.print("reopen over the same store recovered the orphaned lease, dropped the acked job\n", .{});
     }

@@ -17,6 +17,15 @@
 const std = @import("std");
 const threshold_ecdsa = @import("threshold_ecdsa");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -48,8 +57,8 @@ pub fn main() !void {
     // A quorum of 2 (of 3) shares reconstructs the original secret.
     const quorum = [_]threshold_ecdsa.ShamirShare{ split.shares[0], split.shares[2] };
     const reconstructed = try threshold_ecdsa.reconstructSecret(&quorum);
-    std.debug.assert(reconstructed.toBytes(.big).len == secret_key.toBytes(.big).len);
-    std.debug.assert(std.mem.eql(u8, &reconstructed.toBytes(.big), &secret_key.toBytes(.big)));
+    must(reconstructed.toBytes(.big).len == secret_key.toBytes(.big).len, @src());
+    must(std.mem.eql(u8, &reconstructed.toBytes(.big), &secret_key.toBytes(.big)), @src());
     std.debug.print("reconstructed secret matches the dealt one\n", .{});
 
     // A caller-supplied duplicate share index must be a nameable error, not

@@ -14,6 +14,15 @@ const std = @import("std");
 const jsonshape = @import("jsonshape");
 const dataset = @import("dataset");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 // A sensor feed shaped like a real `getDataview`-style endpoint response.
 // `jq -c '[.readings[] | select(.value > 5) | .sensor]'` on this document
 // prints `["b","c"]` — the external oracle for the filter-expression case
@@ -50,9 +59,9 @@ pub fn main() !void {
         .path = "readings[?(@.value > 5)]",
         .columns = &cols,
     });
-    std.debug.assert(filtered.rowCount() == 2);
-    std.debug.assert(std.mem.eql(u8, filtered.cell(0, "sensor").?.asText().?, "b"));
-    std.debug.assert(std.mem.eql(u8, filtered.cell(1, "sensor").?.asText().?, "c"));
+    must(filtered.rowCount() == 2, @src());
+    must(std.mem.eql(u8, filtered.cell(0, "sensor").?.asText().?, "b"), @src());
+    must(std.mem.eql(u8, filtered.cell(1, "sensor").?.asText().?, "c"), @src());
     std.debug.print("filter [?(@.value > 5)]: {d} rows, matches jq's select(.value > 5)\n", .{filtered.rowCount()});
 
     // The poc-compatible `[x,y]` default (no `columns`): x/y pulled
@@ -62,7 +71,7 @@ pub fn main() !void {
         .x = "sensor",
         .y = "value",
     });
-    std.debug.assert(xy.rowCount() == 3);
+    must(xy.rowCount() == 3, @src());
     const series = try xy.seriesXY(a, "x", "y");
     std.debug.print("[x,y] default over readings[*]: {d} points, first=({d:.1})\n", .{ series.len, series[0][1] });
 
@@ -71,7 +80,7 @@ pub fn main() !void {
     // documented behavior contract, exercised as an effect since it is not
     // a failure the module raises.
     const empty = try jsonshape.shape(a, feed, .{ .path = "no_such_key", .columns = &cols });
-    // ⚠ These were `std.debug.assert`, and the refusal below was `unreachable`.
+    // ⚠ These were debug-only assertions, and the refusal below was `unreachable`.
     // Both are compiled OUT in ReleaseFast, which is one of the two modes
     // `scripts/check-apps.sh` runs examples in — so in the mode that matters
     // this file asserted nothing at all. Returned errors instead.

@@ -59,6 +59,15 @@
 
 const std = @import("std");
 const ibe = @import("ibe");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const g1 = ibe.bls12_381.g1;
 const g2 = ibe.bls12_381.g2;
 const Fr = ibe.bls12_381.Fr;
@@ -91,7 +100,7 @@ pub fn main() !void {
     const wire1 = ct1.toBytes();
     const received1 = try ibe.Ciphertext.fromBytes(wire1);
     const pt1 = try ibe.decrypt(d_id_alice, received1);
-    std.debug.assert(std.mem.eql(u8, &pt1, &message1));
+    must(std.mem.eql(u8, &pt1, &message1), @src());
     std.debug.print("round1: alice decrypted her message ({d} bytes)\n", .{pt1.len});
 
     printHex("round1 msk", &msk1_bytes);
@@ -120,7 +129,7 @@ pub fn main() !void {
     const sigma2 = ibe.ciphersuite.randomSigma(io); // the real production randomness path
     const ct2 = ibe.encrypt(kp2.mpk, bob_id, message2, sigma2);
     const pt2 = try ibe.decrypt(d_id_bob2, ct2);
-    std.debug.assert(std.mem.eql(u8, &pt2, &message2));
+    must(std.mem.eql(u8, &pt2, &message2), @src());
     std.debug.print("round2 (new PKG epoch): bob decrypted his message ({d} bytes)\n", .{pt2.len});
 
     // ── Negative paths: three distinct ways decrypt can fail, all

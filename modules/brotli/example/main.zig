@@ -16,6 +16,15 @@
 const std = @import("std");
 const brotli = @import("brotli");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 const body = "The quick brown fox jumps over the lazy dog. " ** 40;
 
 pub fn main() !void {
@@ -31,7 +40,7 @@ pub fn main() !void {
     // Decompress it back on the receiving end, with default options.
     const decompressed = try brotli.decompress(gpa, compressed, .{});
     defer gpa.free(decompressed);
-    std.debug.assert(std.mem.eql(u8, body, decompressed));
+    must(std.mem.eql(u8, body, decompressed), @src());
     std.debug.print("round-trip verified, {d} bytes\n", .{decompressed.len});
 
     // A server terminating an untrusted `br` body must bound the output

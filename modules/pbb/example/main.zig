@@ -26,6 +26,15 @@
 const std = @import("std");
 const pbb = @import("pbb");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -54,13 +63,13 @@ pub fn main() !void {
 
         const wire = try pbb.encodeAlloc(gpa, fields, &customer_data);
         defer gpa.free(wire);
-        std.debug.assert(wire.len == pbb.headerLen(true) + customer_data.len);
+        must(wire.len == pbb.headerLen(true) + customer_data.len, @src());
 
         const dec = try pbb.decode(wire);
-        std.debug.assert(std.meta.eql(fields, dec.fields));
-        std.debug.assert(std.mem.eql(u8, &customer_data, dec.customer_data));
-        std.debug.assert(dec.fields.bvid().? == 200);
-        std.debug.assert(dec.fields.hasBTag());
+        must(std.meta.eql(fields, dec.fields), @src());
+        must(std.mem.eql(u8, &customer_data, dec.customer_data), @src());
+        must(dec.fields.bvid().? == 200, @src());
+        must(dec.fields.hasBTag(), @src());
         std.debug.print("run 1 (B-Tagged, I-SID 0x1000): encode/decode round-trips every field\n", .{});
     }
 
@@ -82,14 +91,14 @@ pub fn main() !void {
         };
         const wire = try pbb.encodeAlloc(gpa, fields, "");
         defer gpa.free(wire);
-        std.debug.assert(wire.len == pbb.min_frame_len);
+        must(wire.len == pbb.min_frame_len, @src());
 
         const dec = try pbb.decode(wire);
-        std.debug.assert(std.meta.eql(fields, dec.fields));
-        std.debug.assert(dec.customer_data.len == 0);
-        std.debug.assert(dec.fields.bvid() == null);
-        std.debug.assert(!dec.fields.hasBTag());
-        std.debug.assert(dec.fields.i_sid != 0x00_1000); // distinct from run 1's tenant
+        must(std.meta.eql(fields, dec.fields), @src());
+        must(dec.customer_data.len == 0, @src());
+        must(dec.fields.bvid() == null, @src());
+        must(!dec.fields.hasBTag(), @src());
+        must(dec.fields.i_sid != 0x00_1000, @src()); // distinct from run 1's tenant
         std.debug.print("run 2 (untagged, I-SID 0xABCD): encode/decode round-trips every field\n", .{});
     }
 

@@ -10,6 +10,15 @@ const std = @import("std");
 const isis = @import("isis");
 const lsdb = @import("isis-lsdb");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 const sys_local: [6]u8 = .{ 0, 0, 0, 0, 0, 0x01 };
 const sys_peer: [6]u8 = .{ 0, 0, 0, 0, 0, 0x02 };
 
@@ -53,7 +62,7 @@ pub fn main() !void {
         error.CorruptedLsp => std.debug.print("insert(corrupted): CorruptedLsp (expected)\n", .{}),
         else => return err,
     }
-    std.debug.assert(db.count() == 1); // the reject left the store unchanged
+    must(db.count() == 1, @src()); // the reject left the store unchanged
 
     // The neighbour's CSNP summarises ITS database: one LSP we don't have.
     var peer = lsdb.Lsdb.init(gpa, .{ .local_system_id = sys_peer, .interface_count = 2, .capacity = 16 });

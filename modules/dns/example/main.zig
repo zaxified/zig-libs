@@ -59,6 +59,15 @@
 const std = @import("std");
 const dns = @import("dns");
 const netaddr = @import("netaddr");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const net = std.Io.net;
 
 const Allocator = std.mem.Allocator;
@@ -440,7 +449,7 @@ const FixtureServer = struct {
         if (incoming.data.len < 2) return error.MalformedQuery;
 
         var resp_buf: [256]u8 = undefined;
-        std.debug.assert(golden.len <= resp_buf.len);
+        must(golden.len <= resp_buf.len, @src());
         @memcpy(resp_buf[0..golden.len], golden);
         resp_buf[0] = incoming.data[0]; // echo the query id -- the only
         resp_buf[1] = incoming.data[1]; // thing decodeResponse checks
@@ -614,7 +623,7 @@ fn probeTruncation(gpa: Allocator, io: std.Io, out: *std.Io.Writer, opts: Option
     // TC bit, decoded through the public codec rather than hand-indexed).
     var probe_msg = message.decode(gpa, incoming.data) catch return;
     defer probe_msg.deinit();
-    std.debug.assert(probe_msg.header.truncated == tc);
+    must(probe_msg.header.truncated == tc, @src());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

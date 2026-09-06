@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-02** — **Truncation is reported instead of being invisible, and `/proc` is treated as
+  untrusted input.** Eight findings from the drift re-audit (`952ec657`), each pinned by a test
+  that goes red when the fix is reverted. `readSockets` returned a bare `[]SocketEntry`, which
+  has no channel for "this table was cut" — a host with ~3500 sockets in one table got a
+  silently short listing, and both siblings in this module already reported truncation, so it
+  was an inconsistency inside the module rather than a house style. `readConntrack`'s
+  documented "true total row count" was itself computed from a 4 MiB prefix, so past ~20000
+  flows the signal that says "this view is partial" was partial too, and short by a plausible
+  amount. `snapshot()` converted `/proc/uptime` with a bare `@intFromFloat`, and `parseFloat`
+  accepts `nan`, `inf`, `-1.0` and `1e30` — SIGABRT in Debug and ReleaseSafe, an uptime of 584
+  billion years in ReleaseFast; SPEC's threat model claimed `/proc` is not attacker-controlled
+  while five of this module's own fuzz harnesses said the opposite, and lxcfs bind-mounts
+  `/proc/uptime` into every LXC container. **New public surface:** `SocketTable` (with its
+  `deinit`) and `readSockets` returning it, `socket_table_read_limit`, `VirtualFile`,
+  `readVirtualFileReporting`, `copyClamped`. **BREAKING** for a caller that bound
+  `readSockets`' result as a slice.
+  ⚠ Entry written 2026-09-06, four days after the commit: `scripts/check-changelog-entry.py`
+  landed that day and named this module as the one open case in the whole tree.
+
 - **2026-08-24** — The IPv6 half of the big-endian byte-order rule is measured rather than
   derived. The same guest that produced the `tcp` capture also produced a `tcp6` one
   (`testdata/tcp6-mips-be.txt`): a socket bound to `2001:db8:1:2:3:4:5:6`, asymmetric in all

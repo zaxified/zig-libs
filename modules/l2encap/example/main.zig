@@ -19,6 +19,15 @@
 const std = @import("std");
 const l2encap = @import("l2encap");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A real Ethernet II frame, 802.1Q-tagged: dst MAC, src MAC, an 0x8100 TPID
 /// + VLAN tag (PCP=0, DEI=0, VID=100), the real ethertype (IPv4, 0x0800)
 /// behind the tag, then a stand-in IPv4 payload. `l2encap` never looks inside
@@ -45,7 +54,7 @@ pub fn main() !void {
     const pe_b: u16 = 2; // core hop 1
     const pe_c: u16 = 3; // core hop 2
 
-    std.debug.assert(l2encap.looksLikeEthernet(&customer_frame_v4));
+    must(l2encap.looksLikeEthernet(&customer_frame_v4), @src());
 
     const bum_fields: l2encap.Fields = .{
         .isid = 0x00_10_20, // tenant 0x1020
@@ -55,30 +64,30 @@ pub fn main() !void {
     };
     const wire = try l2encap.encodeAlloc(gpa, bum_fields, &customer_frame_v4);
     defer gpa.free(wire);
-    std.debug.assert(wire.len == l2encap.encodedLen(customer_frame_v4.len));
+    must(wire.len == l2encap.encodedLen(customer_frame_v4.len), @src());
 
     var dec = try l2encap.decode(wire);
-    std.debug.assert(dec.fields.isid == 0x00_10_20);
-    std.debug.assert(dec.fields.bum);
-    std.debug.assert(std.mem.eql(u8, dec.payload, &customer_frame_v4));
-    std.debug.assert(l2encap.looksLikeEthernet(dec.payload));
+    must(dec.fields.isid == 0x00_10_20, @src());
+    must(dec.fields.bum, @src());
+    must(std.mem.eql(u8, dec.payload, &customer_frame_v4), @src());
+    must(l2encap.looksLikeEthernet(dec.payload), @src());
     std.debug.print("encapsulated a real 802.1Q Ethernet frame as a BUM tenant frame, decoded intact\n", .{});
 
     // ── relay the BUM frame across three PE hops, the way a real core does ──
     // At each hop: split-horizon is checked first (a real PE would drop and
     // stop here), then TTL is decremented before the frame goes onward.
-    std.debug.assert(!l2encap.droppedBySplitHorizon(dec.fields, pe_b));
+    must(!l2encap.droppedBySplitHorizon(dec.fields, pe_b), @src());
     dec.fields = try l2encap.decrementTtl(dec.fields);
-    std.debug.assert(dec.fields.ttl == l2encap.default_ttl - 1);
-    std.debug.assert(dec.fields.ingress_pe == pe_a); // originator preserved, not the relayer
+    must(dec.fields.ttl == l2encap.default_ttl - 1, @src());
+    must(dec.fields.ingress_pe == pe_a, @src()); // originator preserved, not the relayer
 
-    std.debug.assert(!l2encap.droppedBySplitHorizon(dec.fields, pe_c));
+    must(!l2encap.droppedBySplitHorizon(dec.fields, pe_c), @src());
     dec.fields = try l2encap.decrementTtl(dec.fields);
-    std.debug.assert(dec.fields.ttl == l2encap.default_ttl - 2);
+    must(dec.fields.ttl == l2encap.default_ttl - 2, @src());
 
     // The one case split-horizon DOES own: the frame reflected back to its
     // own originator, however many hops it took to get there.
-    std.debug.assert(l2encap.droppedBySplitHorizon(dec.fields, pe_a));
+    must(l2encap.droppedBySplitHorizon(dec.fields, pe_a), @src());
     std.debug.print("relayed across 2 core hops: split-horizon silent en route, fires on reflection to origin PE {d}\n", .{pe_a});
 
     // ── TTL backstop: drive it all the way to expiry, under pressure ───────
@@ -90,7 +99,7 @@ pub fn main() !void {
     } else |err| switch (err) {
         error.TtlExpired => std.debug.print("TTL backstop: dropped after {d} hops (expected)\n", .{hops}),
     }
-    std.debug.assert(hops == 3);
+    must(hops == 3, @src());
 
     // ── the unicast twin, through the caller-buffer (non-allocating) form ──
     {
@@ -98,8 +107,8 @@ pub fn main() !void {
         const uni_fields: l2encap.Fields = .{ .isid = 0x00_10_20, .ttl = 32, .bum = false, .ingress_pe = pe_a };
         const out = try l2encap.encode(uni_fields, &customer_frame_v4, &buf);
         const udec = try l2encap.decode(out);
-        std.debug.assert(!udec.fields.bum);
-        std.debug.assert(!l2encap.droppedBySplitHorizon(udec.fields, pe_a)); // unicast: never split-horizon-dropped
+        must(!udec.fields.bum, @src());
+        must(!l2encap.droppedBySplitHorizon(udec.fields, pe_a), @src()); // unicast: never split-horizon-dropped
         std.debug.print("unicast twin: caller-buffer encode round-trips, split-horizon never touches it\n", .{});
     }
 
@@ -166,7 +175,7 @@ pub fn main() !void {
             unreachable;
         } else |err| switch (err) {
             error.BufferTooSmall => {
-                std.debug.assert(std.mem.allEqual(u8, &too_small, 0xAA)); // nothing written
+                must(std.mem.allEqual(u8, &too_small, 0xAA), @src()); // nothing written
                 std.debug.print("4-byte output buffer for an 8+2-byte frame: BufferTooSmall, untouched (expected)\n", .{});
             },
             else => return err,

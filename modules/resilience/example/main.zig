@@ -15,6 +15,15 @@
 const std = @import("std");
 const resilience = @import("resilience");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A pretend upstream call: fails while `remaining_failures > 0`, then
 /// succeeds. Shape required by `resilience.run`: a `call()` method returning
 /// an error union.
@@ -75,7 +84,7 @@ pub fn main() !void {
         error.CircuitOpen => std.debug.print("fast-failed: breaker is open, operation not called\n", .{}),
         else => return err,
     }
-    std.debug.assert(untouched.attempts == 0);
+    must(untouched.attempts == 0, @src());
 
     // A bulkhead bounds concurrent in-flight calls independently of the
     // breaker — acquire, use, release.

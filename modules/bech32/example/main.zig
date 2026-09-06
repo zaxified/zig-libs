@@ -42,6 +42,15 @@
 const std = @import("std");
 const bech32 = @import("bech32");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 // secp256k1 base point G, compressed (0x02 || Gx) — a public, non-secret
 // constant with no discrete log known to anyone, the standard "obviously
 // not a real secret" throwaway pubkey in Bitcoin tooling examples.
@@ -70,12 +79,12 @@ pub fn main() !void {
         // hash160 too — coincidence of a shared public constant, not a
         // copy of the vector table).
         const expected = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
-        std.debug.assert(std.mem.eql(u8, addr.slice(), expected));
+        must(std.mem.eql(u8, addr.slice(), expected), @src());
         std.debug.print("v0 P2WPKH address: {s}\n", .{addr.slice()});
 
         const dec = try bech32.decodeSegwit("bc", addr.slice());
-        std.debug.assert(dec.witver == 0);
-        std.debug.assert(std.mem.eql(u8, dec.program(), &program));
+        must(dec.witver == 0, @src());
+        must(std.mem.eql(u8, dec.program(), &program), @src());
         std.debug.print("  round-trip: witver={d} program={x}\n", .{ dec.witver, dec.program() });
     }
 
@@ -88,12 +97,12 @@ pub fn main() !void {
         // Cross-checked (see file doc comment) via the PyPI package's own
         // polymod/hrp-expand plus BIP350's published 0x2bc830a3 constant.
         const expected = "bc1p5ew3pxzmy4rqmu542zvhcgv6ze2ykne52z2ucjqvg475fkuk6zfsy503zq";
-        std.debug.assert(std.mem.eql(u8, addr.slice(), expected));
+        must(std.mem.eql(u8, addr.slice(), expected), @src());
         std.debug.print("v1 taproot-shaped address: {s}\n", .{addr.slice()});
 
         const dec = try bech32.decodeSegwit("bc", addr.slice());
-        std.debug.assert(dec.witver == 1);
-        std.debug.assert(std.mem.eql(u8, dec.program(), &xonly));
+        must(dec.witver == 1, @src());
+        must(std.mem.eql(u8, dec.program(), &xonly), @src());
         std.debug.print("  round-trip: witver={d} program={x}\n", .{ dec.witver, dec.program() });
     }
 
@@ -105,11 +114,11 @@ pub fn main() !void {
         const data = [_]u5{ 3, 1, 4, 1, 5, 9, 2, 6 };
         const enc = try bech32.encode("example", &data, .bech32);
         // ACTUALLY RUN: PyPI `bech32.bech32_encode("example", [3,1,4,1,5,9,2,6])`.
-        std.debug.assert(std.mem.eql(u8, enc.slice(), "example1rpyp9fzxtfdz37"));
+        must(std.mem.eql(u8, enc.slice(), "example1rpyp9fzxtfdz37"), @src());
         const dec = try bech32.decode(enc.slice());
-        std.debug.assert(dec.encoding == .bech32);
-        std.debug.assert(std.mem.eql(u8, dec.hrp(), "example"));
-        std.debug.assert(std.mem.eql(u5, dec.data(), &data));
+        must(dec.encoding == .bech32, @src());
+        must(std.mem.eql(u8, dec.hrp(), "example"), @src());
+        must(std.mem.eql(u5, dec.data(), &data), @src());
         std.debug.print("generic bech32: {s}\n", .{enc.slice()});
     }
     {
@@ -117,9 +126,9 @@ pub fn main() !void {
         const enc = try bech32.encode("zlib", &data, .bech32m);
         // ACTUALLY RUN: PyPI package's polymod/hrp_expand + BIP350 constant
         // 0x2bc830a3 substituted by hand from the spec (see doc comment).
-        std.debug.assert(std.mem.eql(u8, enc.slice(), "zlib1z8pgzg3x4fet"));
+        must(std.mem.eql(u8, enc.slice(), "zlib1z8pgzg3x4fet"), @src());
         const dec = try bech32.decode(enc.slice());
-        std.debug.assert(dec.encoding == .bech32m);
+        must(dec.encoding == .bech32m, @src());
         std.debug.print("generic bech32m: {s}\n", .{enc.slice()});
     }
 
@@ -131,12 +140,12 @@ pub fn main() !void {
 
         var payload_buf: [bech32.base58.max_payload_len]u8 = undefined;
         const payload = try bech32.base58.checkDecode(addr, &payload_buf);
-        std.debug.assert(payload.len == bech32.base58.p2pkh_payload_len);
-        std.debug.assert(payload[0] == 0x6f);
+        must(payload.len == bech32.base58.p2pkh_payload_len, @src());
+        must(payload[0] == 0x6f, @src());
 
         var program: [20]u8 = undefined;
         bech32.base58.p2wpkhWitnessProgram(&g_pubkey, &program);
-        std.debug.assert(std.mem.eql(u8, payload[1..], &program));
+        must(std.mem.eql(u8, payload[1..], &program), @src());
     }
 
     // ── negative paths: a pasted/received address, five distinct defects ──
@@ -206,7 +215,7 @@ pub fn main() !void {
 
         const good = try bech32.encodeSegwit("bc", 1, &xonly);
         const parts = try bech32.decode(good.slice());
-        std.debug.assert(parts.encoding == .bech32m);
+        must(parts.encoding == .bech32m, @src());
 
         const wrong_variant = try bech32.encode(parts.hrp(), parts.data(), .bech32);
         if (bech32.decodeSegwit("bc", wrong_variant.slice())) |_| {

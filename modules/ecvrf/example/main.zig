@@ -48,6 +48,15 @@
 const std = @import("std");
 const ecvrf = @import("ecvrf");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn keyFromLabel(label: []const u8) ecvrf.SecretKey {
     var sk: ecvrf.SecretKey = undefined;
     std.crypto.hash.sha2.Sha256.hash(label, &sk, .{});
@@ -70,20 +79,20 @@ pub fn main() !void {
     const pi1 = ecvrf.prove(alice_sk, round1_alpha);
     const beta1_direct = try ecvrf.proofToHash(pi1);
     const beta1_verify = try ecvrf.verify(alice_pk, round1_alpha, pi1);
-    std.debug.assert(std.mem.eql(u8, &beta1_direct, &beta1_verify));
+    must(std.mem.eql(u8, &beta1_direct, &beta1_verify), @src());
     std.debug.print("round 1: proofToHash and verify agree on beta\n", .{});
 
     // Determinism (RFC 9381's uniqueness property, and the module's own
     // "no hidden state" property — same (sk, alpha) in, byte-identical pi
     // out, every time; nothing carried between calls).
     const pi1_again = ecvrf.prove(alice_sk, round1_alpha);
-    std.debug.assert(std.mem.eql(u8, &pi1, &pi1_again));
+    must(std.mem.eql(u8, &pi1, &pi1_again), @src());
     std.debug.print("round 1: prove is deterministic (same pi both times)\n", .{});
 
     // ── round 2: the SAME key, a DIFFERENT round's input ──────────────
     const pi2 = ecvrf.prove(alice_sk, round2_alpha);
     const beta2 = try ecvrf.verify(alice_pk, round2_alpha, pi2);
-    std.debug.assert(!std.mem.eql(u8, &beta1_direct, &beta2));
+    must(!std.mem.eql(u8, &beta1_direct, &beta2), @src());
     std.debug.print("round 2: fresh beta, distinct from round 1\n", .{});
 
     // ── bob proves over round 1's SAME alpha, under his OWN key ─────────
@@ -91,7 +100,7 @@ pub fn main() !void {
     // keys over the identical input do not collide.
     const pi_bob = ecvrf.prove(bob_sk, round1_alpha);
     const beta_bob = try ecvrf.verify(bob_pk, round1_alpha, pi_bob);
-    std.debug.assert(!std.mem.eql(u8, &beta1_direct, &beta_bob));
+    must(!std.mem.eql(u8, &beta1_direct, &beta_bob), @src());
     std.debug.print("round 1, bob's key: fresh beta, distinct from alice's\n", .{});
 
     // Bob's proof is not valid under Alice's public key, even for the same

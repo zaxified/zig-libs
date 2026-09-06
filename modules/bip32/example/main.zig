@@ -38,6 +38,15 @@ const std = @import("std");
 const bip32 = @import("bip32");
 const bech32 = @import("bech32");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 // Fresh entropy, distinct from every pattern in the embedded Trezor vector
 // table (`00000000..`, `7f7f7f7f..`, `80808080..`, `ffffffff..`).
 const entropy_hex = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
@@ -57,7 +66,7 @@ pub fn main() !void {
     const phrase = try bip32.mnemonic.entropyToMnemonic(&entropy, &mnemonic_buf);
     // ACTUALLY RUN: Python `Mnemonic("english").to_mnemonic(entropy)`.
     const expected_phrase = "payment noodle vivid slogan gather metal pilot enact fragile hip physical canvas";
-    std.debug.assert(std.mem.eql(u8, phrase, expected_phrase));
+    must(std.mem.eql(u8, phrase, expected_phrase), @src());
     std.debug.print("mnemonic: {s}\n", .{phrase});
 
     try bip32.mnemonic.validateMnemonic(phrase);
@@ -68,13 +77,13 @@ pub fn main() !void {
     const expected_seed_hex = "df084a26af4b6f0502d1311f20225fbe7181e5d8676cc0c5d28f06f196d1fff0bba709cddcd4818f42b5b92d93d488b887366e068dc9abf37833223674cb21ef";
     var expected_seed: [64]u8 = undefined;
     _ = std.fmt.hexToBytes(&expected_seed, expected_seed_hex) catch unreachable;
-    std.debug.assert(std.mem.eql(u8, &seed, &expected_seed));
+    must(std.mem.eql(u8, &seed, &expected_seed), @src());
 
     // ── BIP-32: seed -> master -> account -> receive address ──────────────
 
     var master = try bip32.masterFromSeed(&seed);
     defer master.deinit();
-    std.debug.assert(master.isMaster());
+    must(master.isMaster(), @src());
 
     var path_buf: [bip32.max_path_depth]u32 = undefined;
     const receive_indices = try bip32.parsePath(receive_path, &path_buf);
@@ -86,27 +95,27 @@ pub fn main() !void {
     // ACTUALLY RUN: the from-spec Python re-implementation (see file doc
     // comment), sanity-checked against BIP-32 Test Vector 1 first.
     const expected_xprv = "xprvA44AZhTuxqQYC15kQX4LrXdNFZaMZMaHXdgMS76DnTR4dASrhsrr7RscrS6UatP3v7oXTu8RvjPwQYzZPyNyoUD9uahvacPajSmyMyx7a59";
-    std.debug.assert(std.mem.eql(u8, xprv, expected_xprv));
+    must(std.mem.eql(u8, xprv, expected_xprv), @src());
     std.debug.print("receive xprv: {s}\n", .{xprv});
 
     const receive_pub = try bip32.neuter(receive_key);
     var xpub_buf: [bip32.max_serialized_len]u8 = undefined;
     const xpub = try bip32.serializePub(receive_pub, &xpub_buf);
     const expected_xpub = "xpub6H3WyCzooCxqQVADWYbMDfa6obQqxpJ8trbxEVVqLnx3Vxn1FRB6fEC6hjtXLJ6Djp7fkwxT1Qd1GgXLahjtcN8eSV4e94u8Jt3PCwEfGe8";
-    std.debug.assert(std.mem.eql(u8, xpub, expected_xpub));
+    must(std.mem.eql(u8, xpub, expected_xpub), @src());
     std.debug.print("receive xpub: {s}\n", .{xpub});
 
     // Round-trip both through the untrusted-text parser a wallet uses when
     // IMPORTING a key a user pasted in.
     {
         const parsed = try bip32.parseExtended(xprv);
-        std.debug.assert(parsed == .private);
-        std.debug.assert(std.mem.eql(u8, &parsed.private.privkey, &receive_key.privkey));
+        must(parsed == .private, @src());
+        must(std.mem.eql(u8, &parsed.private.privkey, &receive_key.privkey), @src());
     }
     {
         const parsed = try bip32.parseExtended(xpub);
-        std.debug.assert(parsed == .public);
-        std.debug.assert(std.mem.eql(u8, &parsed.public.pubkey, &receive_pub.pubkey));
+        must(parsed == .public, @src());
+        must(std.mem.eql(u8, &parsed.public.pubkey, &receive_pub.pubkey), @src());
     }
 
     // ── BIP-44 watch-only pattern: share the ACCOUNT xpub, derive further
@@ -124,7 +133,7 @@ pub fn main() !void {
         const master_pub = try bip32.neuter(master);
         var purpose_key = try bip32.ckdPriv(master, bip32.hardened_offset + 44);
         defer purpose_key.deinit();
-        std.debug.assert(std.mem.eql(u8, &bip32.fingerprint(master_pub.pubkey), &purpose_key.parent_fingerprint));
+        must(std.mem.eql(u8, &bip32.fingerprint(master_pub.pubkey), &purpose_key.parent_fingerprint), @src());
 
         // external chain (index 0) and receive address 0, both via
         // public-only `ckdPub` — no `account_key.privkey` touched below.
@@ -132,8 +141,8 @@ pub fn main() !void {
         const receive_pub_via_watch_only = try bip32.ckdPub(external_pub, 0);
 
         // Must agree with the fully-private derivation above (m/44'/0'/0'/0/0).
-        std.debug.assert(std.mem.eql(u8, &receive_pub_via_watch_only.pubkey, &receive_pub.pubkey));
-        std.debug.assert(std.mem.eql(u8, &receive_pub_via_watch_only.chain_code, &receive_pub.chain_code));
+        must(std.mem.eql(u8, &receive_pub_via_watch_only.pubkey, &receive_pub.pubkey), @src());
+        must(std.mem.eql(u8, &receive_pub_via_watch_only.chain_code, &receive_pub.chain_code), @src());
         std.debug.print("watch-only receive[0] pubkey matches privately-derived: {x}\n", .{receive_pub_via_watch_only.pubkey});
 
         // A second receive address, still with no private key: this is the

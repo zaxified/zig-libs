@@ -17,6 +17,15 @@ const ratelimit = @import("ratelimit");
 const netaddr = @import("netaddr");
 const http = @import("http");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A deterministic clock a caller controls — the module never reads the wall
 /// clock on its own, it only offers `Clock.monotonic` as a default. Mirrors
 /// the `TestClock` idiom the module's own tests use, built here from public
@@ -67,9 +76,9 @@ pub fn main() !void {
                 if (limiter.allowAt(c, fc.ns).allowed) total_allowed += 1;
             }
         }
-        std.debug.assert(total_allowed > 0);
+        must(total_allowed > 0, @src());
         // Eight distinct keys hit a 4-key cap: the table never grows past it.
-        std.debug.assert(limiter.keyCount() <= 4);
+        must(limiter.keyCount() <= 4, @src());
         std.debug.print("part1: {d} distinct clients, table capped at {d} keys\n", .{ clients.len, limiter.keyCount() });
 
         // One client exhausts its own burst and is denied — draining a fresh
@@ -81,23 +90,23 @@ pub fn main() !void {
             const d = limiter.allowAt(heavy, fc.ns);
             if (d.allowed) allowed_for_heavy += 1 else denied_for_heavy = true;
         }
-        std.debug.assert(allowed_for_heavy == 3); // exactly the burst
-        std.debug.assert(denied_for_heavy);
+        must(allowed_for_heavy == 3, @src()); // exactly the burst
+        must(denied_for_heavy, @src());
         std.debug.print("part1: heavy client got {d}/5, denied past burst\n", .{allowed_for_heavy});
 
         // A retried/duplicate request while still denied: the retry itself
         // must not further drain or otherwise corrupt the bucket.
         const retry1 = limiter.allowAt(heavy, fc.ns);
         const retry2 = limiter.allowAt(heavy, fc.ns);
-        std.debug.assert(!retry1.allowed and !retry2.allowed);
-        std.debug.assert(retry1.retry_after_ms == retry2.retry_after_ms);
+        must(!retry1.allowed and !retry2.allowed, @src());
+        must(retry1.retry_after_ms == retry2.retry_after_ms, @src());
 
         // Time advances by exactly the reported wait: the window refills and
         // the next attempt is admitted, per the module's documented
         // "waiting retry_after_ms guarantees the next attempt passes".
         fc.advanceMs(retry2.retry_after_ms);
         const after_wait = limiter.allowAt(heavy, fc.ns);
-        std.debug.assert(after_wait.allowed);
+        must(after_wait.allowed, @src());
         std.debug.print("part1: after waiting retry_after_ms, heavy client passes again\n", .{});
 
         // Idle-expiry pressure: let every currently-tracked key sit past the
@@ -105,8 +114,8 @@ pub fn main() !void {
         // bucket rather than staying (incorrectly) exhausted or erroring.
         fc.advanceMs(6_000); // > ttl_ms
         const revived = limiter.allowAt(heavy, fc.ns);
-        std.debug.assert(revived.allowed);
-        std.debug.assert(revived.remaining == 2); // full burst (3) minus this one
+        must(revived.allowed, @src());
+        must(revived.remaining == 2, @src()); // full burst (3) minus this one
         std.debug.print("part1: idle key past TTL resets to a full bucket\n", .{});
     }
 
@@ -127,8 +136,8 @@ pub fn main() !void {
         // policy is fail-open (never turn OOM into an outage), not a crash
         // and not a silent leak of a half-built entry.
         const d = limiter.allowAt("192.0.2.50", fc.ns);
-        std.debug.assert(d.allowed);
-        std.debug.assert(limiter.keyCount() == 0); // never got tracked
+        must(d.allowed, @src());
+        must(limiter.keyCount() == 0, @src()); // never got tracked
         std.debug.print("part2: allocator exhaustion on a new key still admits (fail-open)\n", .{});
     }
 
@@ -162,15 +171,15 @@ pub fn main() !void {
             const d = cl.allowPeerAt(netaddr.parseIp(txt).?, fc.ns);
             if (d.allowed) user_allowed += 1 else user_denied = true;
         }
-        std.debug.assert(user_allowed == 4);
-        std.debug.assert(user_denied);
+        must(user_allowed == 4, @src());
+        must(user_denied, @src());
         std.debug.print("part3: configured user got {d}/5 across two addresses, denied past burst\n", .{user_allowed});
 
         // A dual-stack listener's mapped spelling of the SAME address must
         // land on the SAME (already-drained) bucket — bucket identity, not
         // `.allowed` alone (a fresh bucket would allow a stranger too).
         const mapped = cl.allowPeerAt(netaddr.parseIp("::ffff:192.0.2.7").?, fc.ns);
-        std.debug.assert(!mapped.allowed);
+        must(!mapped.allowed, @src());
 
         // Unlisted-table pressure: more distinct strangers than
         // `max_unlisted_keys` — the table must stay bounded via LRU
@@ -178,20 +187,20 @@ pub fn main() !void {
         // survive without unbounded memory growth.
         const strangers = [_][]const u8{ "203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4", "203.0.113.5" };
         for (strangers) |txt| _ = cl.allowPeerAt(netaddr.parseIp(txt).?, fc.ns);
-        std.debug.assert(cl.unlistedKeyCount() <= 3);
+        must(cl.unlistedKeyCount() <= 3, @src());
         std.debug.print("part3: {d} distinct unlisted strangers, table capped at {d}\n", .{ strangers.len, cl.unlistedKeyCount() });
 
         // Time advances: the configured user's bucket refills and passes
         // again (default fake clock never touches the real one).
         fc.advanceMs(1_000);
-        std.debug.assert(cl.allowPeerAt(netaddr.parseIp("192.0.2.7").?, fc.ns).allowed);
+        must(cl.allowPeerAt(netaddr.parseIp("192.0.2.7").?, fc.ns).allowed, @src());
 
         // The `on_connect` hook shape itself: assignable to the http.Server
         // seam without a shim, and returns the accept/reject enum it wraps.
         const hook: http.Server.OnConnectFn = ratelimit.ConnectionLimiter.onConnect;
         const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 1 }, .port = 1234 } };
         const decision = hook(&cl, peer);
-        std.debug.assert(decision == .accept or decision == .reject);
+        must(decision == .accept or decision == .reject, @src());
         std.debug.print("part3: on_connect hook wired to http.Server.OnConnectFn, decision={s}\n", .{@tagName(decision)});
     }
 

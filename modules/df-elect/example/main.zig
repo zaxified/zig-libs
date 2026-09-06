@@ -15,6 +15,15 @@
 const std = @import("std");
 const df_elect = @import("df-elect");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// The segment this node (id 3) shares with its peer (id 4). Lower priority
 /// wins the DF election — node 3 is the owner here.
 const segment: df_elect.EdgeSegment = .{
@@ -71,7 +80,7 @@ pub fn main() !void {
     const ce_frame = try df_elect.BumFrame.decode(&ce_buf);
     const ce_decision = df_elect.decide(view, ce_frame.ingress_segment, segment.id);
     std.debug.print("same-segment frame: allow_forward={} (must be false)\n", .{ce_decision.allow_forward});
-    std.debug.assert(!ce_decision.allow_forward);
+    must(!ce_decision.allow_forward, @src());
 
     // A truncated frame off the wire must be rejected by name, not panic.
     if (df_elect.Hello.decode(hello_buf[0..3])) |_| {

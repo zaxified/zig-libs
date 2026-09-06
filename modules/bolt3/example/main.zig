@@ -51,6 +51,15 @@ const std = @import("std");
 const bolt3 = @import("bolt3");
 const Secp256k1 = @import("k256").Secp256k1;
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn pointOf(secret: [32]u8) [33]u8 {
     return (Secp256k1.combMulBase(secret, .big) catch unreachable).toCompressedSec1();
 }
@@ -118,11 +127,11 @@ pub fn main() !void {
         // reveals after the fact.
         if (prev_pcp != null) {
             const revoked_secret = bolt3.perCommitmentSecret(peer_seed, prev_index);
-            std.debug.assert(std.mem.eql(u8, &pointOf(revoked_secret), &prev_pcp.?));
+            must(std.mem.eql(u8, &pointOf(revoked_secret), &prev_pcp.?), @src());
 
             const revocationprivkey = try bolt3.deriveRevocationPrivateKey(local_revocation_basepoint_secret, revoked_secret);
             const revocationpubkey_from_priv = pointOf(revocationprivkey);
-            std.debug.assert(std.mem.eql(u8, &revocationpubkey_from_priv, &prev_revocation_pubkey.?));
+            must(std.mem.eql(u8, &revocationpubkey_from_priv, &prev_revocation_pubkey.?), @src());
             std.debug.print("round {d}: revoked round {d}'s commitment — justice key recovered, matches blind derivation\n", .{ round, round - 1 });
         }
 
@@ -162,14 +171,14 @@ pub fn main() !void {
     const wrong_revocation_basepoint_secret = [_]u8{0xEE} ** 32;
     const wrong_revocation_basepoint = pointOf(wrong_revocation_basepoint_secret);
     const wrong_revocationpubkey = try bolt3.deriveRevocationPublicKey(wrong_revocation_basepoint, prev_pcp.?);
-    std.debug.assert(!std.mem.eql(u8, &wrong_revocationpubkey, &prev_revocation_pubkey.?));
+    must(!std.mem.eql(u8, &wrong_revocationpubkey, &prev_revocation_pubkey.?), @src());
     std.debug.print("wrong revocation basepoint: revocationpubkey does NOT match (expected)\n", .{});
 
     // `perCommitmentSecret` is a pure function of (seed, index) — a node
     // never needs to STORE a once-derived secret, only recompute it.
     const recomputed = bolt3.perCommitmentSecret(peer_seed, bolt3.max_index);
     const first = bolt3.perCommitmentSecret(peer_seed, bolt3.max_index);
-    std.debug.assert(std.mem.eql(u8, &recomputed, &first));
+    must(std.mem.eql(u8, &recomputed, &first), @src());
 
     std.debug.print("bolt3 example: OK\n", .{});
 }

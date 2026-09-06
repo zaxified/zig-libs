@@ -31,6 +31,15 @@
 const std = @import("std");
 const sealedbox = @import("sealedbox");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -52,20 +61,20 @@ pub fn main() !void {
     // std's clamping/scalar-mult ever diverged from libsodium's, this would
     // catch it; a self-consistency check inside this module never could.
     const expected_pk = hex32("27e10fb4dba861e1a07264255ffd06c692f752e4d42e687f4faa404f5a1dc41b");
-    std.debug.assert(std.mem.eql(u8, &expected_pk, &kp.public_key));
+    must(std.mem.eql(u8, &expected_pk, &kp.public_key), @src());
     std.debug.print("keyPairFromSecretKey: public key byte-exact vs. PyNaCl's independent X25519\n", .{});
 
     // ── no-alloc buffer API ─────────────────────────────────────────────
     //
     // Buffer sizing is the caller's job: `out` must be exactly
     // `msg.len + overhead` (48 bytes: 32-byte ephemeral pubkey + 16-byte
-    // Poly1305 tag) -- get this wrong and `seal`'s `std.debug.assert` catches
-    // it in a safe build, but a ReleaseFast caller would corrupt memory
+    // Poly1305 tag) -- get this wrong and `seal`'s own debug-only assertion
+    // catches it in a safe build, but a ReleaseFast caller would corrupt memory
     // instead, so the buffer math belongs in the caller's types, not in a
     // runtime check alone.
     const msg1 = "meet at the usual place, bring the fresh evidence";
     var boxed1: [msg1.len + sealedbox.overhead]u8 = undefined;
-    std.debug.assert(boxed1.len == sealedbox.sealedLen(msg1.len));
+    must(boxed1.len == sealedbox.sealedLen(msg1.len), @src());
     try sealedbox.seal(io, &boxed1, msg1, kp.public_key);
 
     var opened1: [msg1.len]u8 = undefined;
@@ -82,7 +91,7 @@ pub fn main() !void {
     const msg2 = "a longer tip that a caller would rather not size a stack buffer for";
     const boxed2 = try sealedbox.sealAlloc(gpa, io, msg2, kp.public_key);
     defer gpa.free(boxed2);
-    std.debug.assert(boxed2.len == sealedbox.sealedLen(msg2.len));
+    must(boxed2.len == sealedbox.sealedLen(msg2.len), @src());
 
     const opened2 = try sealedbox.openAlloc(gpa, boxed2, kp);
     defer gpa.free(opened2);
@@ -120,13 +129,13 @@ pub fn main() !void {
     // ── key-text round trip: what a config file actually stores ─────────
     const pk_text = sealedbox.encodePublicKeyBase64(kp.public_key);
     const pk_back = try sealedbox.parsePublicKeyBase64(&pk_text);
-    std.debug.assert(std.mem.eql(u8, &kp.public_key, &pk_back));
+    must(std.mem.eql(u8, &kp.public_key, &pk_back), @src());
 
     var sk_text = sealedbox.encodeSecretKeyHex(kp.secret_key);
     const sk_back = try sealedbox.parseSecretKeyHex(&sk_text);
-    std.debug.assert(std.mem.eql(u8, &kp.secret_key, &sk_back));
+    must(std.mem.eql(u8, &kp.secret_key, &sk_back), @src());
     sealedbox.wipe(&sk_text); // hygiene: this is throwaway key material, but the API is the point
-    for (sk_text) |c| std.debug.assert(c == 0);
+    for (sk_text) |c| must(c == 0, @src());
     std.debug.print("key-text round trip: base64 pubkey + hex secret, secret wiped after use\n", .{});
 
     // Malformed key text is a typed error, not a panic -- a config-file

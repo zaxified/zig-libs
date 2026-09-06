@@ -22,6 +22,15 @@
 
 const std = @import("std");
 const pollworker = @import("pollworker");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const linux = std.os.linux;
 
 const Job = struct { res: pollworker.ProcResult = undefined };
@@ -65,20 +74,20 @@ pub fn main() !void {
     // the read end readable -- the exact seam a real accept loop drives.
     {
         var fds: [2]i32 = undefined;
-        std.debug.assert(@as(isize, @bitCast(linux.pipe(&fds))) >= 0);
+        must(@as(isize, @bitCast(linux.pipe(&fds))) >= 0, @src());
         const rfd = fds[0];
         const wfd = fds[1];
         defer _ = linux.close(rfd);
         defer _ = linux.close(wfd);
 
         var pfd = [_]pollworker.Loop.pollfd{.{ .fd = rfd, .events = pollworker.Loop.POLL.IN, .revents = 0 }};
-        std.debug.assert(try pollworker.Loop.poll(&pfd, 20) == 0); // nothing written: timeout
+        must(try pollworker.Loop.poll(&pfd, 20) == 0, @src()); // nothing written: timeout
 
         const byte = [_]u8{'x'};
-        std.debug.assert(@as(isize, @bitCast(linux.write(wfd, &byte, 1))) == 1);
+        must(@as(isize, @bitCast(linux.write(wfd, &byte, 1))) == 1, @src());
         pfd[0].revents = 0;
-        std.debug.assert(try pollworker.Loop.poll(&pfd, 1000) == 1);
-        std.debug.assert(pfd[0].revents & pollworker.Loop.POLL.IN != 0);
+        must(try pollworker.Loop.poll(&pfd, 1000) == 1, @src());
+        must(pfd[0].revents & pollworker.Loop.POLL.IN != 0, @src());
         std.debug.print("Loop.poll: idle pipe timed out, then reported readable after a write\n", .{});
     }
 
@@ -97,7 +106,7 @@ pub fn main() !void {
     try loop.addTask(gpa, .{ .context = &tick_count, .run = TickCounter.bump });
     loop.tick();
     loop.tick();
-    std.debug.assert(tick_count == 2);
+    must(tick_count == 2, @src());
 
     // 3. Capacity pressure: a 2-slot table filled by two real `/bin/true`
     // submissions, then a third submission is rejected -- `TableFull` by
@@ -108,7 +117,7 @@ pub fn main() !void {
 
         try table.spawnDetached(gpa, &.{"/bin/true"}, report);
         try table.spawnDetached(gpa, &.{"/bin/true"}, report);
-        std.debug.assert(table.busy() == 2);
+        must(table.busy() == 2, @src());
 
         if (table.spawnDetached(gpa, &.{"/bin/true"}, report)) |_| {
             unreachable;
@@ -116,7 +125,7 @@ pub fn main() !void {
             error.TableFull => std.debug.print("3rd submission on a 2-slot table rejected: TableFull (expected)\n", .{}),
             else => return err,
         }
-        std.debug.assert(table.busy() == 2); // the rejected attempt claimed nothing
+        must(table.busy() == 2, @src()); // the rejected attempt claimed nothing
 
         try waitDone(&table, 2);
         const Sum = struct {
@@ -127,14 +136,14 @@ pub fn main() !void {
         };
         Sum.oks = 0;
         table.drain(Sum.onDone);
-        std.debug.assert(Sum.oks == 2);
-        std.debug.assert(table.busy() == 0);
+        must(Sum.oks == 2, @src());
+        must(table.busy() == 0, @src());
 
         // Capacity recovered: the table accepts new work again.
         try table.spawnDetached(gpa, &.{"/bin/true"}, report);
         try waitDone(&table, 1);
         table.drain(Sum.onDone);
-        std.debug.assert(Sum.oks == 3);
+        must(Sum.oks == 3, @src());
         std.debug.print("capacity recovered after drain: a 4th submission was accepted and completed\n", .{});
     }
 
@@ -153,8 +162,8 @@ pub fn main() !void {
         };
         Fail.saw_failure = false;
         table.drain(Fail.onDone);
-        std.debug.assert(Fail.saw_failure);
-        std.debug.assert(table.busy() == 0);
+        must(Fail.saw_failure, @src());
+        must(table.busy() == 0, @src());
         std.debug.print("failing task: /bin/false reported ok=false, exit_code=1\n", .{});
     }
 
@@ -167,14 +176,14 @@ pub fn main() !void {
     // "busy" slot nor get silently reported to `on_done`.
     {
         const job = table.claim().?;
-        std.debug.assert(table.busy() == 1); // outstanding at "shutdown" time
+        must(table.busy() == 1, @src()); // outstanding at "shutdown" time
         table.release(job);
-        std.debug.assert(table.busy() == 0); // rolled back, not stuck RUNNING
+        must(table.busy() == 0, @src()); // rolled back, not stuck RUNNING
         // Genuinely FREE, reclaimable without going through `drain` first.
         const job2 = table.claim().?;
-        std.debug.assert(table.busy() == 1);
+        must(table.busy() == 1, @src());
         table.release(job2);
-        std.debug.assert(table.busy() == 0);
+        must(table.busy() == 0, @src());
         std.debug.print("shutdown with outstanding work: claimed-but-unrun slot rolled back via release\n", .{});
     }
 
@@ -190,7 +199,7 @@ pub fn main() !void {
             error.OutOfMemory => std.debug.print("spawnDetached under a FailingAllocator (arg 0): OutOfMemory (expected)\n", .{}),
             else => return err,
         }
-        std.debug.assert(table.busy() == 0); // the claim was rolled back, not leaked
+        must(table.busy() == 0, @src()); // the claim was rolled back, not leaked
     }
 
     // 7. Allocator failure, later in the same call: argv (array + one
@@ -206,7 +215,7 @@ pub fn main() !void {
             error.OutOfMemory => std.debug.print("spawnDetached under a FailingAllocator (ctx): OutOfMemory (expected)\n", .{}),
             else => return err,
         }
-        std.debug.assert(table.busy() == 0);
+        must(table.busy() == 0, @src());
     }
 
     std.debug.print("pollworker example done\n", .{});

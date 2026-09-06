@@ -22,6 +22,15 @@ const std = @import("std");
 const spf = @import("isis-spf");
 const spbfib = @import("spbfib");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn sysId(last: u8) spf.SystemId {
     return .{ 0, 0, 0, 0, 0, last };
 }
@@ -63,36 +72,36 @@ pub fn main() !void {
         var fib = try spbfib.build(gpa, &table, &map);
         defer fib.deinit();
 
-        std.debug.assert(fib.entries.len == 3);
+        must(fib.entries.len == 3, @src());
 
         // Self route: local delivery.
         const self_e = fib.lookup(bmac(0xA)).?;
-        std.debug.assert(self_e.local and self_e.metric == 0);
-        std.debug.assert(std.mem.eql(u8, &self_e.next_hop_bmac, &bmac(0xA)));
+        must(self_e.local and self_e.metric == 0, @src());
+        must(std.mem.eql(u8, &self_e.next_hop_bmac, &bmac(0xA)), @src());
 
         // Direct neighbour B: next-hop B-MAC == dest B-MAC (one hop, no
         // distinction between "who to address" and "who to hand it to").
         const b_e = fib.lookup(bmac(0xB)).?;
-        std.debug.assert(!b_e.local and b_e.metric == 10);
-        std.debug.assert(std.mem.eql(u8, &b_e.next_hop_bmac, &bmac(0xB)));
+        must(!b_e.local and b_e.metric == 10, @src());
+        must(std.mem.eql(u8, &b_e.next_hop_bmac, &bmac(0xB)), @src());
 
         // C: the load-bearing property. The frame DA (what the FIB is keyed
         // by, and what every transit node forwards on unchanged) is C's OWN
         // B-MAC — but the entry's next-hop B-MAC is B's, selecting the
         // egress adjacency toward the real next router, NOT the destination.
         const c_e = fib.lookup(bmac(0xC)).?;
-        std.debug.assert(!c_e.local and c_e.metric == 20);
-        std.debug.assert(std.mem.eql(u8, &c_e.dest_bmac, &bmac(0xC))); // keyed by DEST
-        std.debug.assert(std.mem.eql(u8, &c_e.next_hop_bmac, &bmac(0xB))); // egress != dest
-        std.debug.assert(!std.mem.eql(u8, &c_e.dest_bmac, &c_e.next_hop_bmac));
+        must(!c_e.local and c_e.metric == 20, @src());
+        must(std.mem.eql(u8, &c_e.dest_bmac, &bmac(0xC)), @src()); // keyed by DEST
+        must(std.mem.eql(u8, &c_e.next_hop_bmac, &bmac(0xB)), @src()); // egress != dest
+        must(!std.mem.eql(u8, &c_e.dest_bmac, &c_e.next_hop_bmac), @src());
 
         // A destination whose B-MAC the caller never supplied is skipped,
         // not a crash and not a partial/wrong entry — the FIB never carries
         // an entry it could not actually forward on.
         var fib2 = try spbfib.build(gpa, &table, map[0..2]); // C's B-MAC withheld
         defer fib2.deinit();
-        std.debug.assert(fib2.entries.len == 2);
-        std.debug.assert(fib2.lookup(bmac(0xC)) == null);
+        must(fib2.entries.len == 2, @src());
+        must(fib2.lookup(bmac(0xC)) == null, @src());
         std.debug.print("run 1 (A-B-C line): self/direct/multi-hop FIB entries match; unknown B-MAC skipped\n", .{});
     }
 
@@ -119,16 +128,16 @@ pub fn main() !void {
         var fib = try spbfib.build(gpa, &table, &map);
         defer fib.deinit();
 
-        std.debug.assert(fib.entries.len == 4);
+        must(fib.entries.len == 4, @src());
         const d_e = fib.lookup(bmac(0xD)).?;
-        std.debug.assert(d_e.metric == 30);
-        std.debug.assert(std.mem.eql(u8, &d_e.dest_bmac, &bmac(0xD)));
-        std.debug.assert(std.mem.eql(u8, &d_e.next_hop_bmac, &bmac(0xB))); // still egresses via B
+        must(d_e.metric == 30, @src());
+        must(std.mem.eql(u8, &d_e.dest_bmac, &bmac(0xD)), @src());
+        must(std.mem.eql(u8, &d_e.next_hop_bmac, &bmac(0xB)), @src()); // still egresses via B
 
         // Entries are sorted ascending by key B-MAC — a caller relies on
         // this for the binary-search `lookup` itself.
         for (fib.entries[0 .. fib.entries.len - 1], fib.entries[1..]) |x, y|
-            std.debug.assert(std.mem.order(u8, &x.dest_bmac, &y.dest_bmac) == .lt);
+            must(std.mem.order(u8, &x.dest_bmac, &y.dest_bmac) == .lt, @src());
         std.debug.print("run 2 (topology grew a 4th node D): rebuilt FIB has 4 entries, D still egresses via B\n", .{});
     }
 
@@ -136,12 +145,12 @@ pub fn main() !void {
     {
         // RFC 6329 §4.4 worked example: SPSourceID 0x04001, I-SID 200 (0xC8).
         const da1 = spbfib.groupDa(0x04001, 200);
-        std.debug.assert(std.mem.eql(u8, &da1, &.{ 0x03, 0x40, 0x01, 0x00, 0x00, 0xC8 }));
+        must(std.mem.eql(u8, &da1, &.{ 0x03, 0x40, 0x01, 0x00, 0x00, 0xC8 }), @src());
         const back1 = spbfib.parseGroupDa(da1).?;
-        std.debug.assert(back1.spsourceid == 0x04001 and back1.isid == 200);
+        must(back1.spsourceid == 0x04001 and back1.isid == 200, @src());
 
         // A non-SPBM DA (broadcast) is rejected, not misparsed.
-        std.debug.assert(spbfib.parseGroupDa(.{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }) == null);
+        must(spbfib.parseGroupDa(.{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }) == null, @src());
         std.debug.print("groupDa/parseGroupDa: RFC 6329 worked example round-trips, non-SPBM DA rejected\n", .{});
     }
 

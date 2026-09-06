@@ -41,6 +41,15 @@
 const std = @import("std");
 const bip340 = @import("bip340");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 fn hexBytes(comptime hex: *const [64]u8) [32]u8 {
     var out: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
@@ -84,8 +93,8 @@ pub fn main() !void {
     defer alice_kp.deinit();
     var bob_kp = try bip340.KeyPair.fromSecretKey(bob_sk);
     defer bob_kp.deinit();
-    std.debug.assert(std.mem.eql(u8, &alice_kp.public.x, &expected_alice_pub));
-    std.debug.assert(std.mem.eql(u8, &bob_kp.public.x, &expected_bob_pub));
+    must(std.mem.eql(u8, &alice_kp.public.x, &expected_alice_pub), @src());
+    must(std.mem.eql(u8, &bob_kp.public.x, &expected_bob_pub), @src());
     std.debug.print("alice pubkey: {x}\n", .{alice_kp.public.x});
     std.debug.print("bob pubkey:   {x}\n", .{bob_kp.public.x});
 
@@ -93,10 +102,10 @@ pub fn main() !void {
     // Two independently keyed sessions over one message — the shape a
     // multi-party protocol checks each contribution against.
     const alice_sig1 = try bip340.sign(alice_sk, &msg1, alice_aux1, io);
-    std.debug.assert(std.mem.eql(u8, &alice_sig1, &expected_alice_sig1));
+    must(std.mem.eql(u8, &alice_sig1, &expected_alice_sig1), @src());
     const bob_sig1 = try bip340.sign(bob_sk, &msg1, bob_aux1, io);
-    std.debug.assert(bip340.verify(alice_kp.public, &msg1, try bip340.Signature.fromBytes(alice_sig1)));
-    std.debug.assert(bip340.verify(bob_kp.public, &msg1, try bip340.Signature.fromBytes(bob_sig1)));
+    must(bip340.verify(alice_kp.public, &msg1, try bip340.Signature.fromBytes(alice_sig1)), @src());
+    must(bip340.verify(bob_kp.public, &msg1, try bip340.Signature.fromBytes(bob_sig1)), @src());
     std.debug.print("session 1: both signatures verify\n", .{});
 
     // ── session 2: alice signs a SECOND, unrelated message ──────────────
@@ -105,10 +114,10 @@ pub fn main() !void {
     // everything by value and returns a plain array, so there is nothing to
     // carry between calls).
     const alice_sig2 = try bip340.sign(alice_sk, &msg2, alice_aux2, io);
-    std.debug.assert(bip340.verify(alice_kp.public, &msg2, try bip340.Signature.fromBytes(alice_sig2)));
+    must(bip340.verify(alice_kp.public, &msg2, try bip340.Signature.fromBytes(alice_sig2)), @src());
     // Cross-session confusion must fail: session 1's signature does not
     // verify against session 2's message, even under the same key.
-    std.debug.assert(!bip340.verify(alice_kp.public, &msg2, try bip340.Signature.fromBytes(alice_sig1)));
+    must(!bip340.verify(alice_kp.public, &msg2, try bip340.Signature.fromBytes(alice_sig1)), @src());
     std.debug.print("session 2: verifies; session-1 signature correctly rejected under msg2\n", .{});
 
     // ── batch verification: a mixed-signer set ──────────────────────────
@@ -116,7 +125,7 @@ pub fn main() !void {
         .{ .pubkey = alice_kp.public, .msg = &msg1, .sig = try bip340.Signature.fromBytes(alice_sig1) },
         .{ .pubkey = bob_kp.public, .msg = &msg1, .sig = try bip340.Signature.fromBytes(bob_sig1) },
     };
-    std.debug.assert(bip340.verifyBatch(&good_batch, io));
+    must(bip340.verifyBatch(&good_batch, io), @src());
     std.debug.print("batch of 2 (alice + bob over msg1): verifies\n", .{});
 
     // Corrupt just bob's signature in the batch — the whole batch must
@@ -127,7 +136,7 @@ pub fn main() !void {
         good_batch[0],
         .{ .pubkey = bob_kp.public, .msg = &msg1, .sig = try bip340.Signature.fromBytes(corrupted_bob_sig) },
     };
-    std.debug.assert(!bip340.verifyBatch(&bad_batch, io));
+    must(!bip340.verifyBatch(&bad_batch, io), @src());
     std.debug.print("batch with one corrupted signature: rejected\n", .{});
 
     // ── negative paths at the wire boundary: named errors only ─────────
@@ -181,6 +190,6 @@ pub fn main() !void {
     // boolean contract directly.
     var tampered = alice_sig1;
     tampered[0] ^= 0x01;
-    std.debug.assert(!bip340.verify(alice_kp.public, &msg1, try bip340.Signature.fromBytes(tampered)));
+    must(!bip340.verify(alice_kp.public, &msg1, try bip340.Signature.fromBytes(tampered)), @src());
     std.debug.print("bit-flipped signature: verify() == false (expected)\n", .{});
 }

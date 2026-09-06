@@ -25,6 +25,15 @@ const aaa_gate = @import("aaa-gate");
 const router = @import("router");
 const http = @import("http");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A fake, caller-controlled clock -- the module injects one so the
 /// denied-request throttle's window accounting is deterministic and
 /// offline. Same shape as `aaa_gate.Clock`: `.ctx` + `.nowFn`.
@@ -179,10 +188,10 @@ pub fn main() !void {
     {
         var buf: [2048]u8 = undefined;
         const resp = runWire(&r, reqOrders(buf[1024..], "Bearer s3cr3t-primary", "10.0.0.1"), buf[0..1024]);
-        std.debug.assert(statusOf(resp) == 200);
-        std.debug.assert(app.calls == 1);
-        std.debug.assert(app.last_scheme.? == .bearer);
-        std.debug.assert(log.authed == 1);
+        must(statusOf(resp) == 200, @src());
+        must(app.calls == 1, @src());
+        must(app.last_scheme.? == .bearer, @src());
+        must(log.authed == 1, @src());
         std.debug.print("allowed bearer request: 200, audited\n", .{});
     }
 
@@ -191,10 +200,10 @@ pub fn main() !void {
     {
         var buf: [2048]u8 = undefined;
         const resp = runWire(&r, reqOrders(buf[1024..], null, "10.0.0.2"), buf[0..1024]);
-        std.debug.assert(statusOf(resp) == 401);
-        std.debug.assert(std.mem.eql(u8, headerValue(resp, "WWW-Authenticate").?, "Bearer"));
-        std.debug.assert(app.calls == 1); // unchanged
-        std.debug.assert(log.denied == 1);
+        must(statusOf(resp) == 401, @src());
+        must(std.mem.eql(u8, headerValue(resp, "WWW-Authenticate").?, "Bearer"), @src());
+        must(app.calls == 1, @src()); // unchanged
+        must(log.denied == 1, @src());
         std.debug.print("missing credential denied: 401 + WWW-Authenticate: Bearer\n", .{});
     }
 
@@ -204,9 +213,9 @@ pub fn main() !void {
     {
         var buf: [2048]u8 = undefined;
         const resp = runWire(&r, reqOrders(buf[1024..], "Bearer nobody-knows-this-token", "10.0.0.3"), buf[0..1024]);
-        std.debug.assert(statusOf(resp) == 401);
-        std.debug.assert(app.calls == 1);
-        std.debug.assert(log.denied == 2);
+        must(statusOf(resp) == 401, @src());
+        must(app.calls == 1, @src());
+        must(log.denied == 2, @src());
         std.debug.print("unknown principal denied: 401\n", .{});
     }
 
@@ -216,10 +225,10 @@ pub fn main() !void {
     {
         var buf: [2048]u8 = undefined;
         const wrong_scheme = runWire(&r, reqOrders(buf[1024..], "Basic dXNlcjpwYXNz", "10.0.0.4"), buf[0..1024]);
-        std.debug.assert(statusOf(wrong_scheme) == 401);
+        must(statusOf(wrong_scheme) == 401, @src());
         const empty_bearer = runWire(&r, reqOrders(buf[1024..], "Bearer", "10.0.0.5"), buf[0..1024]);
-        std.debug.assert(statusOf(empty_bearer) == 401);
-        std.debug.assert(app.calls == 1);
+        must(statusOf(empty_bearer) == 401, @src());
+        must(app.calls == 1, @src());
         std.debug.print("malformed Authorization headers denied without panicking\n", .{});
     }
 
@@ -228,17 +237,17 @@ pub fn main() !void {
     // that admitted step 1's request is now denied -- same principal, now
     // revoked, not merely unknown.
     {
-        std.debug.assert(g.tokenCount() == 2);
+        must(g.tokenCount() == 2, @src());
         g.removeToken("s3cr3t-primary");
-        std.debug.assert(g.tokenCount() == 1);
+        must(g.tokenCount() == 1, @src());
         var buf: [2048]u8 = undefined;
         const resp = runWire(&r, reqOrders(buf[1024..], "Bearer s3cr3t-primary", "10.0.0.6"), buf[0..1024]);
-        std.debug.assert(statusOf(resp) == 401);
-        std.debug.assert(app.calls == 1);
+        must(statusOf(resp) == 401, @src());
+        must(app.calls == 1, @src());
         // The spare token, never revoked, still admits.
         const resp2 = runWire(&r, reqOrders(buf[1024..], "Bearer s3cr3t-spare", "10.0.0.7"), buf[0..1024]);
-        std.debug.assert(statusOf(resp2) == 200);
-        std.debug.assert(app.calls == 2);
+        must(statusOf(resp2) == 200, @src());
+        must(app.calls == 2, @src());
         std.debug.print("revoked token denied; un-revoked spare still admits\n", .{});
     }
 
@@ -251,17 +260,17 @@ pub fn main() !void {
         const denied_before = log.denied;
         var buf: [2048]u8 = undefined;
         _ = runWire(&r, reqOrders(buf[1024..], null, "10.0.0.99"), buf[0..1024]); // admitted denial #1
-        std.debug.assert(log.denied == denied_before + 1);
+        must(log.denied == denied_before + 1, @src());
         var i: usize = 0;
         while (i < 5) : (i += 1) {
             _ = runWire(&r, reqOrders(buf[1024..], null, "10.0.0.99"), buf[0..1024]); // coalesced
         }
-        std.debug.assert(log.denied == denied_before + 1); // still just the one entry
+        must(log.denied == denied_before + 1, @src()); // still just the one entry
 
         fake_clock.advanceMs(1001); // > throttle_window_ms
         _ = runWire(&r, reqOrders(buf[1024..], null, "10.0.0.99"), buf[0..1024]); // window reopened
-        std.debug.assert(log.denied == denied_before + 2);
-        std.debug.assert(log.last_suppressed == 5); // the 5 coalesced denials, folded in
+        must(log.denied == denied_before + 2, @src());
+        must(log.last_suppressed == 5, @src()); // the 5 coalesced denials, folded in
         std.debug.print("throttle: 5 repeated 401s from one key coalesced, suppressed count folded in as {d}\n", .{log.last_suppressed});
     }
 
@@ -274,9 +283,9 @@ pub fn main() !void {
         const denied_before = log.denied;
         var buf: [2048]u8 = undefined;
         const resp = runWire(&r, reqHealthz(buf[1024..]), buf[0..1024]);
-        std.debug.assert(statusOf(resp) == 200);
-        std.debug.assert(log.authed == authed_before);
-        std.debug.assert(log.denied == denied_before);
+        must(statusOf(resp) == 200, @src());
+        must(log.authed == authed_before, @src());
+        must(log.denied == denied_before, @src());
         std.debug.print("exempt /healthz: 200, no credential, no audit entry\n", .{});
     }
 
@@ -307,15 +316,15 @@ pub fn main() !void {
         w.writeAll("POST /orders HTTP/1.1\r\nHost: t\r\nX-Api-Key: either-key\r\n") catch unreachable;
         w.writeAll("Connection: close\r\nContent-Length: 0\r\n\r\n") catch unreachable;
         const key_only = runWire(&r2, w.buffered(), buf[0..1024]);
-        std.debug.assert(statusOf(key_only) == 200);
-        std.debug.assert(app2.last_scheme.? == .api_key);
+        must(statusOf(key_only) == 200, @src());
+        must(app2.last_scheme.? == .api_key, @src());
 
         var w2: std.Io.Writer = .fixed(buf[1024..]);
         w2.writeAll("POST /orders HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer either-bearer\r\n") catch unreachable;
         w2.writeAll("X-Api-Key: either-key\r\nConnection: close\r\nContent-Length: 0\r\n\r\n") catch unreachable;
         const both = runWire(&r2, w2.buffered(), buf[0..1024]);
-        std.debug.assert(statusOf(both) == 200);
-        std.debug.assert(app2.last_scheme.? == .bearer); // precedence, documented
+        must(statusOf(both) == 200, @src());
+        must(app2.last_scheme.? == .bearer, @src()); // precedence, documented
         std.debug.print(".either mode: API key alone admits; bearer wins when both are presented\n", .{});
     }
 
@@ -330,7 +339,7 @@ pub fn main() !void {
             var key_buf: [16]u8 = undefined;
             const key = std.fmt.bufPrint(&key_buf, "192.0.2.{d}", .{i}) catch unreachable;
             _ = runWire(&r, reqOrders(buf[1024..], null, key), buf[0..1024]);
-            std.debug.assert(g.throttleKeyCount() <= 4);
+            must(g.throttleKeyCount() <= 4, @src());
         }
         std.debug.print("throttle capacity: 16 distinct denied keys through a 4-key store, count stayed <= 4\n", .{});
     }
@@ -367,7 +376,7 @@ pub fn main() !void {
         } else |err| switch (err) {
             error.OutOfMemory => std.debug.print("addToken under a FailingAllocator: OutOfMemory (expected)\n", .{}),
         }
-        std.debug.assert(g3.tokenCount() == 0); // the failed append left nothing behind
+        must(g3.tokenCount() == 0, @src()); // the failed append left nothing behind
     }
 
     std.debug.print("aaa-gate example done; authed={d} denied={d} tokens={d}\n", .{ log.authed, log.denied, g.tokenCount() });

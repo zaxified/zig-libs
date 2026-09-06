@@ -72,7 +72,7 @@ fn insertReach(
 
 /// The example's assertions, in EVERY optimize mode.
 ///
-/// ⚠ These were `std.debug.assert`, which is compiled OUT in ReleaseFast — and
+/// ⚠ These were debug-only assertions, compiled OUT in ReleaseFast — and
 /// `scripts/test.sh` does not merely build examples, it RUNS them in the lane's
 /// own optimize mode, one of which is ReleaseFast. Measured 2026-09-03 with the
 /// ISO §7.2.8.2 two-way check disabled in a scratch copy of the module (so the

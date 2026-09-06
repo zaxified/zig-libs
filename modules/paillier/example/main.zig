@@ -41,6 +41,15 @@
 
 const std = @import("std");
 const paillier = @import("paillier");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 const Fe = paillier.Fe;
 
 fn printHex(label: []const u8, out: []const u8) void {
@@ -63,7 +72,7 @@ pub fn main() !void {
         const probe = try Fe.fromPrimitive(u64, kp_gen.public.n_sq, 42);
         const ct = try paillier.encryptRandom(kp_gen.public, probe, random);
         const pt = try paillier.decrypt(kp_gen.secret, ct);
-        std.debug.assert(pt.eql(try Fe.fromPrimitive(u64, kp_gen.secret.n, 42)));
+        must(pt.eql(try Fe.fromPrimitive(u64, kp_gen.secret.n, 42)), @src());
         std.debug.print("real generate({d} bits): keygen + encrypt/decrypt round-trip OK\n", .{paillier.min_generate_bits});
     }
 
@@ -104,7 +113,7 @@ pub fn main() !void {
     const sum_ct = paillier.addCiphertexts(pk, ct1, ct2); // cannot fail
     const round1_total = try paillier.decrypt(sk, sum_ct);
     const expected_round1 = try Fe.fromPrimitive(u64, sk.n, salary1 + salary2);
-    std.debug.assert(round1_total.eql(expected_round1));
+    must(round1_total.eql(expected_round1), @src());
     std.debug.print("round1: decrypt(E(s1)*E(s2)) == s1+s2 ({d})\n", .{salary1 + salary2});
 
     // ── Round 2: builds on round 1's STILL-ENCRYPTED output — a bonus
@@ -125,7 +134,7 @@ pub fn main() !void {
     const final_total = try paillier.decrypt(sk, ct_matched);
     const expected_final = (salary1 + salary2 + bonus) * match_multiplier;
     const expected_final_fe = try Fe.fromPrimitive(u64, sk.n, expected_final);
-    std.debug.assert(final_total.eql(expected_final_fe));
+    must(final_total.eql(expected_final_fe), @src());
     std.debug.print("round2: decrypt(((E(s1)*E(s2))+bonus)*match_multiplier) == {d}\n", .{expected_final});
 
     // ── An honest finding, not a negative test: vanilla Paillier (this
@@ -149,7 +158,7 @@ pub fn main() !void {
         tampered[tampered.len - 1] ^= 0x01;
         const bad_ct = try paillier.Ciphertext.fromBytes(pk, &tampered);
         const decrypted_garbage = try paillier.decrypt(sk, bad_ct);
-        std.debug.assert(!decrypted_garbage.eql(try Fe.fromPrimitive(u64, sk.n, salary1)));
+        must(!decrypted_garbage.eql(try Fe.fromPrimitive(u64, sk.n, salary1)), @src());
         std.debug.print("tampered ct1 (one flipped byte): decrypted CLEANLY to a different value (Paillier has no ciphertext integrity — expected, not a defect)\n", .{});
     }
 

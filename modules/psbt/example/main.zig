@@ -39,6 +39,15 @@ const std = @import("std");
 const bitcointx = @import("bitcointx");
 const psbt = @import("psbt");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 const hardened_offset: u32 = 0x8000_0000;
 
 // secp256k1 base point G, compressed — a public, non-secret constant, the
@@ -149,27 +158,27 @@ pub fn main() !void {
     var received = try psbt.parse(gpa, wire);
     defer received.deinit(gpa);
 
-    std.debug.assert(received.version() == null); // PSBT_GLOBAL_VERSION omitted -> BIP174 default 0
+    must(received.version() == null, @src()); // PSBT_GLOBAL_VERSION omitted -> BIP174 default 0
 
     const witness_utxo = (try psbt.inputWitnessUtxo(received.inputs[0])).?;
-    std.debug.assert(witness_utxo.value == 150_000);
-    std.debug.assert(std.mem.eql(u8, witness_utxo.script_pubkey, &p2wpkh_script));
+    must(witness_utxo.value == 150_000, @src());
+    must(std.mem.eql(u8, witness_utxo.script_pubkey, &p2wpkh_script), @src());
     std.debug.print("witness utxo: {d} sats, script {x}\n", .{ witness_utxo.value, witness_utxo.script_pubkey });
 
-    std.debug.assert(psbt.inputSighashType(received.inputs[0]).? == 1);
+    must(psbt.inputSighashType(received.inputs[0]).? == 1, @src());
 
     const in_deriv = psbt.inputBip32Derivation(received.inputs[0], &g_pubkey).?;
-    std.debug.assert(in_deriv.len() == 5);
-    for (receive_path, 0..) |want, i| std.debug.assert(in_deriv.at(i) == want);
+    must(in_deriv.len() == 5, @src());
+    for (receive_path, 0..) |want, i| must(in_deriv.at(i) == want, @src());
     std.debug.print("input derivation: fingerprint={x} path_len={d}\n", .{ in_deriv.fingerprint, in_deriv.len() });
 
     const out_deriv = psbt.outputBip32Derivation(received.outputs[0], &g_pubkey).?;
-    std.debug.assert(out_deriv.at(3) == 1); // change chain, not external
+    must(out_deriv.at(3) == 1, @src()); // change chain, not external
 
     var utx_back = try received.unsignedTx(gpa);
     defer utx_back.deinit(gpa);
-    std.debug.assert(utx_back.vin.len == 1 and utx_back.vout.len == 1);
-    std.debug.assert(utx_back.vout[0].value == 100_000);
+    must(utx_back.vin.len == 1 and utx_back.vout.len == 1, @src());
+    must(utx_back.vout[0].value == 100_000, @src());
 
     // ── negative paths: named errors, never a blanket catch ───────────────
 

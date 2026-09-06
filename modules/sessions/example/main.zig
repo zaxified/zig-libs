@@ -15,6 +15,15 @@ const std = @import("std");
 const sessions = @import("sessions");
 const ramcache = @import("ramcache");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// A fake, caller-controlled clock -- the module injects one so timeout
 /// accounting is deterministic and offline (no real clock-dependent
 /// assertions). Same shape as `sessions.Clock`: `.ctx` + `.nowFn`.
@@ -65,7 +74,7 @@ pub fn main() !void {
             var s: sessions.Session = .{};
             m.create(&s);
             try s.setData("user-session");
-            std.debug.assert(m.persist(&s)); // create-CAS: expected generation 0
+            must(m.persist(&s), @src()); // create-CAS: expected generation 0
             @memcpy(ids[i][0..s.id_len], s.id());
             id_lens[i] = s.id_len;
         }
@@ -90,8 +99,8 @@ pub fn main() !void {
         // The failed attempt must not have corrupted the record: a normal
         // allocator still reads it back intact right after.
         var l: sessions.Session = .{};
-        std.debug.assert(m.lookup(id, &l) == .loaded);
-        std.debug.assert(std.mem.eql(u8, l.data(), "user-session"));
+        must(m.lookup(id, &l) == .loaded, @src());
+        must(std.mem.eql(u8, l.data(), "user-session"), @src());
     }
 
     // 3. Load one back, mutate its payload, save again (normal request
@@ -99,11 +108,11 @@ pub fn main() !void {
     {
         var s: sessions.Session = .{};
         const id = ids[0][0..id_lens[0]];
-        std.debug.assert(m.lookup(id, &s) == .loaded);
+        must(m.lookup(id, &s) == .loaded, @src());
         const g0 = s.generation;
         try s.setData("user-session;cart=3");
-        std.debug.assert(m.persist(&s));
-        std.debug.assert(s.generation > g0);
+        must(m.persist(&s), @src());
+        must(s.generation > g0, @src());
     }
 
     // 4. Error path: a payload over `max_session_bytes` must be rejected by
@@ -129,9 +138,9 @@ pub fn main() !void {
         const id = ids[1][0..id_lens[1]];
         fake_clock.now_ns += 1000 * std.time.ns_per_s; // > idle_timeout_ns
         var s: sessions.Session = .{};
-        std.debug.assert(m.lookup(id, &s) == .expired);
+        must(m.lookup(id, &s) == .expired, @src());
         var s2: sessions.Session = .{};
-        std.debug.assert(m.lookup(id, &s2) == .absent);
+        must(m.lookup(id, &s2) == .absent, @src());
         std.debug.print("idle-expired session evicted: expired then absent\n", .{});
     }
     fake_clock.now_ns = 1_000_000_000; // reset for the remaining scenarios
@@ -142,13 +151,13 @@ pub fn main() !void {
     {
         var s: sessions.Session = .{};
         m.create(&s);
-        std.debug.assert(m.persist(&s));
+        must(m.persist(&s), @src());
         const id = try gpa.dupe(u8, s.id());
         defer gpa.free(id);
 
         fake_clock.now_ns += 2500 * std.time.ns_per_s; // > absolute_timeout_ns
         var s2: sessions.Session = .{};
-        std.debug.assert(m.lookup(id, &s2) == .expired);
+        must(m.lookup(id, &s2) == .expired, @src());
     }
     fake_clock.now_ns = 1_000_000_000;
 
@@ -157,16 +166,16 @@ pub fn main() !void {
     {
         const old_id = ids[2][0..id_lens[2]];
         var s: sessions.Session = .{};
-        std.debug.assert(m.lookup(old_id, &s) == .loaded);
+        must(m.lookup(old_id, &s) == .loaded, @src());
         m.regenerate(&s);
-        std.debug.assert(!std.mem.eql(u8, old_id, s.id()));
-        std.debug.assert(m.persist(&s)); // new id: create-CAS (generation reset to 0)
+        must(!std.mem.eql(u8, old_id, s.id()), @src());
+        must(m.persist(&s), @src()); // new id: create-CAS (generation reset to 0)
 
         var lo: sessions.Session = .{};
-        std.debug.assert(m.lookup(old_id, &lo) == .absent); // old id dead
+        must(m.lookup(old_id, &lo) == .absent, @src()); // old id dead
         var ln: sessions.Session = .{};
-        std.debug.assert(m.lookup(s.id(), &ln) == .loaded);
-        std.debug.assert(std.mem.eql(u8, ln.data(), "user-session"));
+        must(m.lookup(s.id(), &ln) == .loaded, @src());
+        must(std.mem.eql(u8, ln.data(), "user-session"), @src());
         std.debug.print("regenerate: old id dead, new id carries data\n", .{});
     }
 
@@ -179,19 +188,19 @@ pub fn main() !void {
         const id = ids[3][0..id_lens[3]];
         var a: sessions.Session = .{};
         var b: sessions.Session = .{};
-        std.debug.assert(m.lookup(id, &a) == .loaded);
-        std.debug.assert(m.lookup(id, &b) == .loaded);
-        std.debug.assert(a.generation == b.generation);
+        must(m.lookup(id, &a) == .loaded, @src());
+        must(m.lookup(id, &b) == .loaded, @src());
+        must(a.generation == b.generation, @src());
 
         // A's request logs out.
         store.store().delete(a.id());
 
         // B's trailing save races in with a now-stale generation.
         try b.setData("stale-write");
-        std.debug.assert(!m.persist(&b)); // CAS must fail, not resurrect
+        must(!m.persist(&b), @src()); // CAS must fail, not resurrect
 
         var l: sessions.Session = .{};
-        std.debug.assert(m.lookup(id, &l) == .absent); // stays dead
+        must(m.lookup(id, &l) == .absent, @src()); // stays dead
         std.debug.print("cross-request race: stale save could not resurrect a destroyed session\n", .{});
     }
 
@@ -209,10 +218,10 @@ pub fn main() !void {
             var s: sessions.Session = .{};
             m.create(&s);
             try s.setData("bulk");
-            std.debug.assert(m.persist(&s));
-            std.debug.assert(cache.stats.entries <= max_entries);
+            must(m.persist(&s), @src());
+            must(cache.stats.entries <= max_entries, @src());
         }
-        std.debug.assert(cache.stats.evictions > 0);
+        must(cache.stats.evictions > 0, @src());
         std.debug.print("capacity: {d} more sessions through a {d}-entry store -> {d} evictions, {d} live entries\n", .{ bulk_count, max_entries, cache.stats.evictions, cache.stats.entries });
     }
 }

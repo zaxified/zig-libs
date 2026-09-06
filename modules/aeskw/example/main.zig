@@ -8,9 +8,9 @@
 //! External oracle actually run (see the report): `openssl enc -id-aes256-wrap
 //! -K <kek> -iv A6A6A6A6A6A6A6A6` on this exact fresh KEK/plaintext (none of
 //! it drawn from the module's own RFC 3394 §4 test vectors) reproduces the
-//! `expected_ct` bytes below byte-for-byte — checked by the
-//! `std.debug.assert` right after `wrap`, so a regression here fails the
-//! example, not just a comment.
+//! `expected_ct` bytes below byte-for-byte — checked by the `must` call
+//! right after `wrap`, so a regression here fails the example, not just a
+//! comment. (`must` and not a debug-only assert: see its doc comment.)
 //!
 //! `wrap`/`unwrap` never allocate — every buffer below is caller-owned and
 //! sized by hand from the RFC 3394 §2.2 shape (`plaintext.len + 8` to wrap,
@@ -20,6 +20,15 @@
 
 const std = @import("std");
 const aeskw = @import("aeskw");
+
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
 
 pub fn main() !void {
     // Fresh throwaway AES-256 KEK and 40-byte (5-semiblock) key blob —
@@ -43,8 +52,8 @@ pub fn main() !void {
     // register); unwrap output is ciphertext.len - 8.
     var wrapped: [40 + 8]u8 = undefined;
     const w = try aeskw.wrap(&kek, &plaintext, &wrapped);
-    std.debug.assert(w.len == wrapped.len);
-    std.debug.assert(std.mem.eql(u8, &expected_ct, w));
+    must(w.len == wrapped.len, @src());
+    must(std.mem.eql(u8, &expected_ct, w), @src());
     std.debug.print("wrap: byte-exact match against openssl's independent AES256-WRAP ciphertext\n", .{});
 
     var recovered: [40]u8 = undefined;
@@ -70,7 +79,7 @@ pub fn main() !void {
             const all_zero = for (out_on_failure) |b| {
                 if (b != 0) break false;
             } else true;
-            std.debug.assert(all_zero); // no partial-key leak on failure
+            must(all_zero, @src()); // no partial-key leak on failure
             std.debug.print("out buffer wiped to zero on failure: confirmed\n", .{});
         },
         else => return err,

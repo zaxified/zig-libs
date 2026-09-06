@@ -53,6 +53,15 @@
 const std = @import("std");
 const spake = @import("spake2plus");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 /// Expand a label into `n` pseudo-random bytes via SHA-256 counter-mode
 /// expansion. `spake2plus` has no internal RNG (by design — every
 /// scalar/nonce is caller-supplied); a real deployment draws these from a
@@ -147,7 +156,7 @@ fn runSession(
     );
     defer gpa.free(verifier_result.tt);
 
-    std.debug.assert(std.mem.eql(u8, &prover_result.k_shared, &verifier_result.k_shared));
+    must(std.mem.eql(u8, &prover_result.k_shared, &verifier_result.k_shared), @src());
 
     return .{ .k_shared_prover = prover_result.k_shared, .k_shared_verifier = verifier_result.k_shared };
 }
@@ -178,7 +187,7 @@ pub fn main() !void {
     const scalars2 = w0w1FromLabel("spake2plus example: session 2 ephemeral scalars");
     const result2 = try runSession(gpa, w0, w1, l, context, id_prover, id_verifier, scalars2.w0, scalars2.w1);
     // Two independent sessions must not share a K_shared.
-    std.debug.assert(!std.mem.eql(u8, &result1.k_shared_prover, &result2.k_shared_prover));
+    must(!std.mem.eql(u8, &result1.k_shared_prover, &result2.k_shared_prover), @src());
     std.debug.print("session 2: independent K_shared from session 1\n", .{});
 
     // ── failure path 1: wrong password (named error) ──────────────────

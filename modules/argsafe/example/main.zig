@@ -17,6 +17,15 @@
 const std = @import("std");
 const argsafe = @import("argsafe");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     // A DebugAllocator that panics on leak makes this example a leak
     // detector for `Argv`'s ownership contract (CONVENTIONS.md §7.2) — in
@@ -27,26 +36,26 @@ pub fn main() !void {
     const gpa = da.allocator();
 
     // ── the shapes this module exists to reject, on the convenience predicates ──
-    std.debug.assert(!argsafe.isSafeIdentifier("--help")); // leading '-'
-    std.debug.assert(!argsafe.isSafeIdentifier("-rf"));
-    std.debug.assert(!argsafe.isSafeIdentifier("a;rm -rf /")); // shell metachar
-    std.debug.assert(!argsafe.isSafeIdentifier("a\x00b")); // embedded NUL
-    std.debug.assert(!argsafe.isSafeIdentifier("")); // empty argument
-    std.debug.assert(!argsafe.isSafePath("../../etc/shadow")); // traversal, not absolute
-    std.debug.assert(!argsafe.isSafePath("/etc/passwd\x00.jpg")); // NUL smuggling past a "looks safe" prefix
-    std.debug.assert(!argsafe.isSafeUrl("http://host/`id`")); // command-substitution shape
-    std.debug.assert(!argsafe.isSafeKvValue("-tcp", false)); // flag injection via a value position
+    must(!argsafe.isSafeIdentifier("--help"), @src()); // leading '-'
+    must(!argsafe.isSafeIdentifier("-rf"), @src());
+    must(!argsafe.isSafeIdentifier("a;rm -rf /"), @src()); // shell metachar
+    must(!argsafe.isSafeIdentifier("a\x00b"), @src()); // embedded NUL
+    must(!argsafe.isSafeIdentifier(""), @src()); // empty argument
+    must(!argsafe.isSafePath("../../etc/shadow"), @src()); // traversal, not absolute
+    must(!argsafe.isSafePath("/etc/passwd\x00.jpg"), @src()); // NUL smuggling past a "looks safe" prefix
+    must(!argsafe.isSafeUrl("http://host/`id`"), @src()); // command-substitution shape
+    must(!argsafe.isSafeKvValue("-tcp", false), @src()); // flag injection via a value position
     std.debug.print("convenience predicates: every rejection shape confirmed rejected\n", .{});
 
     // ── the same discipline, hand-assembled via CharClass directly ──────────
     const iface_class: argsafe.CharClass = .{ .extra = "_-", .max_len = 16, .first_char = .alnum };
-    std.debug.assert(iface_class.check("wg0"));
-    std.debug.assert(!iface_class.check("; rm -rf /"));
-    std.debug.assert(!iface_class.check("-x"));
-    std.debug.assert(!iface_class.check(""));
+    must(iface_class.check("wg0"), @src());
+    must(!iface_class.check("; rm -rf /"), @src());
+    must(!iface_class.check("-x"), @src());
+    must(!iface_class.check(""), @src());
     const iface_pred = iface_class.predicate();
-    std.debug.assert(iface_pred("wg0"));
-    std.debug.assert(!iface_pred("$(whoami)"));
+    must(iface_pred("wg0"), @src());
+    must(!iface_pred("$(whoami)"), @src());
 
     // ── a realistic argv end to end: `wg set wg0 peer <key> allowed-ips <cidr>` ──
     {
@@ -71,7 +80,7 @@ pub fn main() !void {
         }.f);
 
         const got = try argv.slice();
-        std.debug.assert(got.len == 7);
+        must(got.len == 7, @src());
         std.debug.print("assembled argv ({d} elements):", .{got.len});
         for (got) |tok| std.debug.print(" {s}", .{tok});
         std.debug.print("\n", .{});
@@ -108,7 +117,7 @@ pub fn main() !void {
 
     // ── isInAllowlist: exact membership only, no partial/metachar match ────
     const levels = &.{ "err", "warn", "info", "debug" };
-    std.debug.assert(argsafe.isInAllowlist("info", levels));
-    std.debug.assert(!argsafe.isInAllowlist("info; rm -rf /", levels));
+    must(argsafe.isInAllowlist("info", levels), @src());
+    must(!argsafe.isInAllowlist("info; rm -rf /", levels), @src());
     std.debug.print("isInAllowlist: exact membership only\n", .{});
 }

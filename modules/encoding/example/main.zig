@@ -13,6 +13,15 @@
 const std = @import("std");
 const encoding = @import("encoding");
 
+/// A check that survives EVERY optimize mode, unlike a debug-only assert:
+/// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
+/// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
+/// so in a release lane the check vanished and the example went on printing
+/// that it had passed. See `scripts/check-example-assert.py`.
+fn must(ok: bool, src: std.builtin.SourceLocation) void {
+    if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
+}
+
 pub fn main() !void {
     var da: std.heap.DebugAllocator(.{}) = .init;
     defer if (da.deinit() == .leak) @panic("leak");
@@ -34,13 +43,13 @@ pub fn main() !void {
     };
     const encoded = try encoding.encodeFromUtf8(gpa, utf8_src, enc);
     defer gpa.free(encoded);
-    std.debug.assert(std.mem.eql(u8, encoded, &iconv_windows1250));
+    must(std.mem.eql(u8, encoded, &iconv_windows1250), @src());
     std.debug.print("encodeFromUtf8(.windows_1250): {d} bytes, matches iconv byte-exact\n", .{encoded.len});
 
     // Round-trip back to UTF-8.
     const decoded = try encoding.decodeToUtf8(gpa, encoded, enc);
     defer gpa.free(decoded);
-    std.debug.assert(std.mem.eql(u8, decoded, utf8_src));
+    must(std.mem.eql(u8, decoded, utf8_src), @src());
     std.debug.print("decodeToUtf8(.windows_1250): round-trips to the original UTF-8\n", .{});
 
     // Latin-1: "café", cross-checked against `iconv -f UTF-8 -t ISO-8859-1`
@@ -49,7 +58,7 @@ pub fn main() !void {
     const iconv_latin1 = [_]u8{ 0x63, 0x61, 0x66, 0xe9 };
     const cafe_enc = try encoding.encodeFromUtf8(gpa, cafe_utf8, .iso_8859_1);
     defer gpa.free(cafe_enc);
-    std.debug.assert(std.mem.eql(u8, cafe_enc, &iconv_latin1));
+    must(std.mem.eql(u8, cafe_enc, &iconv_latin1), @src());
     std.debug.print("encodeFromUtf8(.iso_8859_1) \"caf\\u00e9\": matches iconv byte-exact\n", .{});
 
     // README: "Data-lenient — never traps... a codepoint with no
@@ -63,6 +72,6 @@ pub fn main() !void {
     const unrepresentable_utf8 = "\u{65e5}\u{672c}"; // "日本" - not in windows-1250
     const substituted = try encoding.encodeFromUtf8(gpa, unrepresentable_utf8, .windows_1250);
     defer gpa.free(substituted);
-    std.debug.assert(std.mem.eql(u8, substituted, "??"));
+    must(std.mem.eql(u8, substituted, "??"), @src());
     std.debug.print("encodeFromUtf8(.windows_1250) on non-representable text -> \"??\" (iconv would hard-fail here; this API never traps)\n", .{});
 }
