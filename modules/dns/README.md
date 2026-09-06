@@ -77,19 +77,34 @@ defer decoded.deinit();
 - EDNS(0) advertises a 1232-byte UDP payload by default (DNS flag day 2020);
   set `edns_udp_size = null` for plain RFC 1035 queries.
 - DoH uses query id 0 (RFC 8484 §4.1 cache friendliness).
+- A reply is accepted only if it comes from the server queried, carries the
+  (per-datagram fresh) transaction id, has QR set and echoes exactly our
+  question — name (case-insensitive), type, class IN. `lookupIp`/`reverse`
+  additionally return only records owned by the queried name or by a CNAME
+  target chained from it in the same answer; `resolve`/`query` hand back the
+  whole message for the caller to judge.
 - Compression pointers must point strictly backwards (Go dnsmessage rule);
   combined with the 253-char name cap and a 16-jump budget, adversarial
-  pointer loops always fail fast with an error — the fuzz test hammers this.
-- TCP/DoH connect timeouts fall back to the OS default until std's
-  `Io.Threaded` implements `netConnectIp*` with a timeout (same TODO as
-  `http.Client`).
+  pointer loops always fail fast with an error — the fuzz test starts from
+  the six live captures and hammers this.
+- `timeout_ms` bounds each UDP attempt and each TCP attempt end to end
+  (connect + write + reads, via a canceled task — std 0.16.0 has no stream
+  read deadline). It is per attempt per server: a `query` may take
+  `timeout_ms × attempts × servers`, and `lookupIp` runs one per search
+  candidate and address family on top. Set it small, shorten `servers`, or
+  pass a rooted name (trailing dot) when a call must be bounded.
+- DoH-JSON (`queryJson`) validates `name` like the wire path and
+  percent-encodes it into the URL.
 
 ## Tests
 
 `zig build test-dns` — offline: golden query bytes, canned responses
 (compression, CNAME chain, MX/TXT/SOA/OPT, PTR), adversarial packets
 (truncations at every offset, pointer loops, bad rdata lengths, hostile
-counts), fuzzed decode, resolv.conf/hosts fixtures, search-list order,
-reverse-name goldens (incl. the RFC 3596 example). Live tests (UDP, TCP, DoH
-POST/GET, DoH-JSON, PTR of 8.8.8.8) skip gracefully via `error.SkipZigTest`
-when the network is unavailable.
+counts under a memory limit), fuzzed decode seeded with the live captures,
+resolv.conf/hosts fixtures, search-list order, reverse-name goldens (incl. the
+RFC 3596 example), response correlation, the bailiwick rule, DoH-JSON URL
+encoding, and loopback stubs (a lying UDP server, a silent TCP server). Live
+tests (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of 8.8.8.8) run against public
+resolvers when the network is up and skip via `error.SkipZigTest` when it is
+not.

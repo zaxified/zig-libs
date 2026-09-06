@@ -12,9 +12,21 @@
 //! thread (`.single_owner`); every call blocks until an answer or timeout.
 //!
 //! Timeout model: `timeout_ms` bounds each UDP attempt natively
-//! (`Socket.receiveTimeout`). TCP/DoH connects currently rely on the OS
-//! default because std 0.16.0's `Io.Threaded` has not implemented
-//! `netConnectIp*` with a timeout yet (same TODO as http.Client).
+//! (`Socket.receiveTimeout`) and each TCP attempt — connect, write AND the
+//! two reads — by running the exchange on its own task and canceling it at
+//! the deadline (`runBounded`, the same shape `http.Client` uses, because std
+//! 0.16.0 has no per-read deadline on a stream). DoH attempts are bounded by
+//! `http.Client`'s `total_timeout_ms`, set from the same `timeout_ms`. What
+//! the budget is NOT is a bound on a whole `lookupIp`/`resolve` call — see
+//! `Error.Timeout`.
+//!
+//! What a response must prove before it is believed (RFC 5452 §9.1): it came
+//! from the server we sent to (UDP: address AND port), carries our transaction
+//! id, has the QR bit set, and echoes exactly our question — name
+//! (case-insensitive), type and class. `lookupIp`/`reverse` additionally
+//! take only answer records whose owner is the queried name or a CNAME target
+//! reachable from it inside the same answer section, so an unrelated record a
+//! server slips into the answer section is ignored, not returned.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -81,7 +93,14 @@ pub const Error = error{
     /// From the codec: name over 253 chars / bad label (see message.zig).
     NameTooLong,
     BadName,
-    /// No response within `timeout_ms × attempts`.
+    /// No response within the budget. `timeout_ms` is PER ATTEMPT PER
+    /// SERVER: one `query` can take up to `timeout_ms × attempts × servers`
+    /// (every server is tried in every round), and `lookupIp` runs a query
+    /// per (search-list candidate × {A, AAAA}) on top of that — with the
+    /// defaults (5 s, 2 attempts, a 3-server resolv.conf, 6 search domains)
+    /// that is 7 minutes for a name that resolves nowhere. Callers that need
+    /// a bound on the CALL set `timeout_ms`/`attempts` small, or pass a name
+    /// with a trailing dot (no search-list expansion), or shorten `servers`.
     Timeout,
     /// Socket-level failure (bind/send/connect/read).
     NetworkFailed,
@@ -195,9 +214,7 @@ pub fn lookupIp(r: *Resolver, name: []const u8) Error![]netaddr.Ip {
                 else => continue, // tolerate one family failing (Go aggregates too)
             };
             defer msg.deinit();
-            for (msg.answers) |rec| {
-                if (dns.recordIp(rec)) |ip| try list.append(r.gpa, ip);
-            }
+            try collectAddresses(r.gpa, &list, &msg, candidate);
         }
         if (list.items.len > 0) break; // first useful candidate wins
     }
@@ -229,13 +246,94 @@ pub fn reverse(r: *Resolver, ip: netaddr.Ip) Error![]const []const u8 {
     var rev_buf: [dns.max_reverse_name_len]u8 = undefined;
     // rev_buf is sized to exactly max_reverse_name_len: reverseName cannot
     // fail here.
-    var msg = try r.query(dns.reverseName(ip, &rev_buf) catch unreachable, .ptr);
+    const rev = dns.reverseName(ip, &rev_buf) catch unreachable;
+    var msg = try r.query(rev, .ptr);
     defer msg.deinit();
+    try collectPtrNames(r.gpa, &names, &msg, rev);
+    return names.toOwnedSlice(r.gpa);
+}
+
+/// Appends (gpa-duped) the PTR targets in `msg.answers` that answer `rev` —
+/// owner equal to the reverse name or to a CNAME target chained from it
+/// (RFC 2317 classless in-addr.arpa delegation is exactly such a chain),
+/// class IN. A PTR for some other owner is not this answer. Pure over the
+/// decoded message; the `reverse` counterpart of `collectAddresses`.
+fn collectPtrNames(gpa: std.mem.Allocator, names: *std.ArrayList([]const u8), msg: *const message.Message, rev: []const u8) error{OutOfMemory}!void {
+    var chain: OwnerChain = .init(rev);
+    chain.follow(msg.answers);
     for (msg.answers) |rec| switch (rec.data) {
-        .ptr => |name| try names.append(r.gpa, try r.gpa.dupe(u8, name)),
+        .ptr => |name| if (rec.class == .in and chain.contains(rec.name)) try names.append(gpa, try gpa.dupe(u8, name)),
         else => {},
     };
-    return names.toOwnedSlice(r.gpa);
+}
+
+/// Case-insensitive DNS name equality on the codec's text form; one trailing
+/// root dot on either side is ignored (`writeName` accepts it, the decoder
+/// never emits it). Labels are raw bytes, so this is ASCII case folding only
+/// (RFC 4343) — the same rule every resolver applies to owner names.
+fn namesEqual(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(stripRootDot(a), stripRootDot(b));
+}
+
+fn stripRootDot(name: []const u8) []const u8 {
+    return if (name.len > 1 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+}
+
+/// The owner names an answer record may carry and still be an answer to
+/// `qname`: the question name itself plus every CNAME target reachable from
+/// it through CNAME records IN THE SAME answer section (RFC 1034 §3.6.2's
+/// alias chain, as a recursive resolver returns it). Anything else in the
+/// answer section — an A record for `victim.test` in a reply to
+/// `example.com` — is out of bailiwick for the question and is not
+/// something `lookupIp` may hand to a caller that will connect to it.
+/// Bounded: a chain longer than `max_cname_chain` hops is cut there (glibc
+/// and Go stop at a small constant too); a CNAME loop cannot extend it,
+/// because a name already in the chain is never added twice.
+const OwnerChain = struct {
+    names: [max_cname_chain + 1][]const u8,
+    len: usize,
+
+    const max_cname_chain = 8;
+
+    fn init(qname: []const u8) OwnerChain {
+        var c: OwnerChain = .{ .names = undefined, .len = 1 };
+        c.names[0] = qname;
+        return c;
+    }
+
+    fn contains(c: *const OwnerChain, name: []const u8) bool {
+        for (c.names[0..c.len]) |n| if (namesEqual(n, name)) return true;
+        return false;
+    }
+
+    /// Adds CNAME targets until a full pass adds nothing (records may arrive
+    /// in any order) or the chain is full.
+    fn follow(c: *OwnerChain, answers: []const message.Record) void {
+        var progressed = true;
+        while (progressed and c.len < c.names.len) {
+            progressed = false;
+            for (answers) |rec| {
+                if (rec.class != .in or rec.data != .cname) continue;
+                if (!c.contains(rec.name) or c.contains(rec.data.cname)) continue;
+                c.names[c.len] = rec.data.cname;
+                c.len += 1;
+                progressed = true;
+                if (c.len == c.names.len) break;
+            }
+        }
+    }
+};
+
+/// Appends the A/AAAA addresses in `msg.answers` that answer `qname` — owner
+/// equal to `qname` or to a CNAME target chained from it (see `OwnerChain`),
+/// class IN. Pure over the decoded message, so it is testable offline.
+fn collectAddresses(gpa: std.mem.Allocator, list: *std.ArrayList(netaddr.Ip), msg: *const message.Message, qname: []const u8) error{OutOfMemory}!void {
+    var chain: OwnerChain = .init(qname);
+    chain.follow(msg.answers);
+    for (msg.answers) |rec| {
+        if (rec.class != .in or !chain.contains(rec.name)) continue;
+        if (dns.recordIp(rec)) |ip| try list.append(gpa, ip);
+    }
 }
 
 /// Free a slice returned by `reverse`.
@@ -254,13 +352,12 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
         const packet = try encodeChecked(&qbuf, name, ty, 0, r.options.edns_udp_size);
         const raw = try r.dohExchange(packet);
         defer r.gpa.free(raw);
-        return r.decodeResponse(raw, 0);
+        return r.decodeResponse(raw, 0, name, ty);
     }
 
-    var id_bytes: [2]u8 = undefined;
-    r.io.random(&id_bytes);
-    const id = std.mem.readInt(u16, &id_bytes, .big);
-    const packet = try encodeChecked(&qbuf, name, ty, id, r.options.edns_udp_size);
+    // Validate the name before touching the network (the per-attempt encode
+    // below cannot fail differently).
+    _ = try encodeChecked(&qbuf, name, ty, 0, r.options.edns_udp_size);
 
     const servers = try r.serverList();
     const rbuf = try r.gpa.alloc(u8, @max(512, r.options.edns_udp_size orelse 0));
@@ -270,6 +367,15 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
     var attempt: u8 = 0;
     while (attempt < @max(1, r.options.attempts)) : (attempt += 1) {
         for (servers) |server| {
+            // A fresh transaction id for EVERY datagram sent. One id per
+            // `query` meant a retry re-used an id an off-path attacker may
+            // already have seen or guessed on the previous attempt, so every
+            // round was another shot at a half-known target.
+            var id_bytes: [2]u8 = undefined;
+            r.io.random(&id_bytes);
+            const id = std.mem.readInt(u16, &id_bytes, .big);
+            const packet = try encodeChecked(&qbuf, name, ty, id, r.options.edns_udp_size);
+
             if (r.options.transport == .tcp) {
                 const raw = r.tcpExchange(server, packet) catch |err| switch (err) {
                     error.Canceled, error.OutOfMemory => |e| return e,
@@ -279,7 +385,7 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
                     },
                 };
                 defer r.gpa.free(raw);
-                return r.decodeResponse(raw, id);
+                return r.decodeResponse(raw, id, name, ty);
             }
 
             const raw = r.udpExchange(server, packet, id, rbuf) catch |err| switch (err) {
@@ -298,9 +404,9 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
                     },
                 };
                 defer r.gpa.free(traw);
-                return r.decodeResponse(traw, id);
+                return r.decodeResponse(traw, id, name, ty);
             }
-            return r.decodeResponse(raw, id);
+            return r.decodeResponse(raw, id, name, ty);
         }
     }
     return last_err orelse error.Timeout;
@@ -314,13 +420,22 @@ fn encodeChecked(buf: []u8, name: []const u8, ty: message.Type, id: u16, edns: ?
     };
 }
 
-fn decodeResponse(r: *Resolver, raw: []const u8, id: u16) Error!message.Message {
+/// Decode `raw` and accept it only as a response to the query
+/// `(id, name, ty)`: QR set, id equal, and — RFC 5452 §9.1 — exactly one
+/// question that echoes our name (case-insensitive), type and class IN.
+/// Before the question check an off-path attacker needed only the 16-bit id
+/// and the source port; a reply whose question section named some other
+/// name, or had no question section at all, was taken as the answer to ours.
+fn decodeResponse(r: *Resolver, raw: []const u8, id: u16, name: []const u8, ty: message.Type) Error!message.Message {
     var msg = message.decode(r.gpa, raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
     };
     errdefer msg.deinit();
     if (!msg.header.response or msg.header.id != id) return error.MalformedResponse;
+    if (msg.questions.len != 1) return error.MalformedResponse;
+    const q = msg.questions[0];
+    if (q.ty != ty or q.class != .in or !namesEqual(q.name, name)) return error.MalformedResponse;
     return msg;
 }
 
@@ -388,6 +503,87 @@ fn attemptDeadline(r: *Resolver) std.Io.Timeout {
     return t.toDeadline(r.io);
 }
 
+/// `attemptDeadline` as the absolute timestamp `runBounded` takes; null when
+/// `timeout_ms == 0` (no bound, by the caller's choice).
+fn attemptTimestamp(r: *Resolver) ?std.Io.Clock.Timestamp {
+    return r.attemptDeadline().toTimestamp(r.io);
+}
+
+fn BoundedResult(comptime func: anytype) type {
+    const eu = @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union;
+    return (eu.error_set || error{ConcurrencyUnavailable})!eu.payload;
+}
+
+/// Run `func(args)` on its own concurrent task and give it until `deadline`
+/// (null = no bound). The same construction as `http.Client.runBounded`
+/// (module-private there, hence a copy): std 0.16.0 offers no per-read
+/// deadline on a `net.Stream` — the read/write/connect syscalls take no
+/// timeout and there is no `SO_RCVTIMEO` seam — but `Io.Threaded` implements
+/// `Future.cancel` by signalling the task's thread until the blocked syscall
+/// returns `EINTR`, so "run it over there, then cancel it at the deadline"
+/// is the one way to bound a blocking TCP exchange. That only works for a
+/// task the `Io` owns: a syscall on the caller's own thread has no
+/// cancelation state, which is why this spawns rather than sleeps.
+///
+/// Contract: finished in time → `func`'s own result; deadline hit → the task
+/// is canceled and JOINED (its frame borrows this stack), then
+/// `error.Timeout` — unless it completed inside the cancelation window, in
+/// which case its value is returned (a response the task already allocated
+/// must not be dropped); this task canceled while waiting → the same unwind,
+/// then `error.Canceled`; no unit of concurrency → `error.ConcurrencyUnavailable`,
+/// never a silent unbounded run.
+fn runBounded(
+    io: std.Io,
+    deadline: ?std.Io.Clock.Timestamp,
+    comptime func: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(func)),
+) BoundedResult(func) {
+    const Result = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+    const Ctx = struct {
+        io: std.Io,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+        result: Result = undefined,
+        /// 0 while the task runs, 1 once `result` is published; doubles as
+        /// the futex word the waiter parks on.
+        state: std.atomic.Value(u32) = .init(0),
+
+        fn run(ctx: *@This()) void {
+            ctx.result = @call(.auto, func, ctx.args);
+            ctx.state.store(1, .release);
+            ctx.io.futexWake(u32, &ctx.state.raw, 1);
+        }
+    };
+
+    var ctx: Ctx = .{ .io = io, .args = args };
+    var future = try io.concurrent(Ctx.run, .{&ctx});
+
+    var canceled = false;
+    var expired = false;
+    while (ctx.state.load(.acquire) == 0) {
+        const timeout: std.Io.Timeout = if (deadline) |d| t: {
+            if (d.durationFromNow(io).raw.nanoseconds <= 0) {
+                expired = true;
+                break;
+            }
+            break :t .{ .deadline = d };
+        } else .none;
+        // Spurious wakeups are allowed here; the loop re-reads `state`.
+        io.futexWaitTimeout(u32, &ctx.state.raw, 0, timeout) catch {
+            canceled = true;
+            break;
+        };
+    }
+    if (!expired and !canceled) {
+        future.await(io);
+        return ctx.result;
+    }
+    future.cancel(io);
+    // `cancel` joined the task, so `result` is written either way. A success
+    // that landed in the cancelation window is still a success.
+    if (ctx.result) |value| return value else |_| {}
+    return if (expired) error.Timeout else error.Canceled;
+}
+
 /// One UDP round-trip. Datagrams from the wrong peer or with the wrong id
 /// are ignored (anti-spoofing, same as Go/c-ares) until the deadline.
 /// The returned slice points into `rbuf`.
@@ -439,12 +635,29 @@ fn writeFailure(sw: *const net.Stream.Writer) Error {
 }
 
 /// One TCP round-trip: 2-byte big-endian length prefix both ways
-/// (RFC 1035 §4.2.2). Returns a gpa-owned response.
+/// (RFC 1035 §4.2.2). Returns a gpa-owned response. The WHOLE exchange —
+/// connect, write, the length read and the body read — runs under
+/// `attemptDeadline` via `runBounded`. Before that, `timeout_ms` bounded the
+/// UDP path only: a server that accepted the TCP connection and never
+/// answered (or announced a 65 535-byte length and trickled it) held the
+/// caller until the OS gave up, and reaching this path needed no
+/// `transport = .tcp` — one UDP datagram with the TC bit set was enough.
+/// `timeout_ms == 0` runs unbounded, as documented. An `Io` without a unit
+/// of concurrency to spare cannot be bounded and fails this attempt with
+/// `error.NetworkFailed` rather than run it without a deadline.
 fn tcpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
+    const deadline = r.attemptTimestamp() orelse return tcpExchangeInner(r, server, packet);
+    return runBounded(r.io, deadline, tcpExchangeInner, .{ r, server, packet }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.NetworkFailed,
+        else => |e| return e,
+    };
+}
+
+fn tcpExchangeInner(r: *Resolver, server: netaddr.Ip, packet: []const u8) Error![]u8 {
     const io = r.io;
     const dest = toNetAddress(server, r.options.port);
-    // No native connect timeout: std 0.16.0 Io.Threaded panics on it (same
-    // TODO as http.Client.connectTimeout); the OS default applies.
+    // No native connect timeout in std 0.16.0 Io.Threaded (same TODO as
+    // http.Client); the deadline is enforced from outside by `runBounded`.
     const stream = dest.connect(io, .{ .mode = .stream }) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         error.Timeout => return error.Timeout,
@@ -551,10 +764,7 @@ pub fn queryJson(r: *Resolver, name: []const u8, ty: message.Type) Error!JsonAns
     const url = r.options.doh_url orelse return error.NoDohEndpoint;
     const client = &(r.http_client.?);
 
-    const sep: u8 = if (std.mem.indexOfScalar(u8, url, '?') != null) '&' else '?';
-    const full = std.fmt.allocPrint(r.gpa, "{s}{c}name={s}&type={d}", .{
-        url, sep, name, @intFromEnum(ty),
-    }) catch return error.OutOfMemory;
+    const full = try jsonQueryUrl(r.gpa, url, name, ty);
     defer r.gpa.free(full);
 
     var res = client.request(.get, full, .{
@@ -580,6 +790,40 @@ pub fn queryJson(r: *Resolver, name: []const u8, ty: message.Type) Error!JsonAns
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
     };
+}
+
+/// `url?name=<name>&type=<n>` for the DoH-JSON API. `name` is held to the
+/// SAME rule the wire path applies (`writeName`: non-empty labels of at most
+/// 63 bytes, 253 chars total — `error.BadName`/`error.NameTooLong` otherwise)
+/// and then percent-encoded, so no byte a caller passes reaches the
+/// request-line as syntax: RFC 3986 §2.3 unreserved characters pass, every
+/// other byte — `&`, `=`, `#`, space, CR, LF, `%` itself — becomes `%XX`.
+/// This was the one place in the module where a caller's name went onto the
+/// wire unvalidated and unescaped: `name = "a&type=255&name=b"` rewrote the
+/// query, and a name with a bare LF split the HTTP request line.
+fn jsonQueryUrl(gpa: std.mem.Allocator, url: []const u8, name: []const u8, ty: message.Type) Error![]u8 {
+    var discard: [message.max_name_text_len + 2]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&discard);
+    message.writeName(&w, name) catch |err| switch (err) {
+        error.NameTooLong, error.WriteFailed, error.BufferTooSmall => return error.NameTooLong,
+        error.BadName => return error.BadName,
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, url);
+    try out.append(gpa, if (std.mem.indexOfScalar(u8, url, '?') != null) '&' else '?');
+    try out.appendSlice(gpa, "name=");
+    for (name) |b| {
+        if (std.ascii.isAlphanumeric(b) or b == '-' or b == '.' or b == '_' or b == '~') {
+            try out.append(gpa, b);
+        } else {
+            const hex = "0123456789ABCDEF";
+            try out.appendSlice(gpa, &.{ '%', hex[b >> 4], hex[b & 0xf] });
+        }
+    }
+    try out.print(gpa, "&type={d}", .{@intFromEnum(ty)});
+    return out.toOwnedSlice(gpa);
 }
 
 // ── tests (offline) ─────────────────────────────────────────────────────────
@@ -623,21 +867,179 @@ test "decodeResponse rejects id mismatch and non-response packets (anti-spoofing
         .conf_text = null,
     };
 
-    // A minimal, well-formed response: header only, QR set, id 0x1234.
-    var good: [message.header_len]u8 = @splat(0);
-    std.mem.writeInt(u16, good[0..2], 0x1234, .big);
-    good[2] = 0x80; // QR=1
+    // A minimal, well-formed response: QR set, id 0x1234, our question echoed.
+    const good = "\x12\x34" ++ "\x80\x00" ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++
+        "\x07example\x03com\x00" ++ "\x00\x01" ++ "\x00\x01";
 
-    var msg = try r.decodeResponse(&good, 0x1234);
+    var msg = try r.decodeResponse(good, 0x1234, "example.com", .a);
     msg.deinit();
 
     // Same packet, wrong expected id: rejected, not silently accepted.
-    try testing.expectError(error.MalformedResponse, r.decodeResponse(&good, 0x1235));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(good, 0x1235, "example.com", .a));
 
     // QR=0 (a query, not a response) with the matching id: also rejected.
-    var not_response = good;
+    var not_response = good.*;
     not_response[2] = 0x00;
-    try testing.expectError(error.MalformedResponse, r.decodeResponse(&not_response, 0x1234));
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(&not_response, 0x1234, "example.com", .a));
+}
+
+test "decodeResponse: the echoed question must be OUR question — name, type, class, and exactly one (RFC 5452 \u{a7}9.1)" {
+    // Before this check a reply needed only the id: a question section
+    // naming `attacker.example TXT`, no question section at all, and a CH
+    // class echo were all accepted as the answer to `example.com A`.
+    var r: Resolver = .{
+        .io = undefined,
+        .gpa = testing.allocator,
+        .options = .{},
+        .http_client = null,
+        .conf = null,
+        .conf_text = null,
+    };
+    const head = "\x12\x34" ++ "\x80\x00";
+
+    // (a) a different name
+    const other_name = head ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x08attacker\x07example\x00" ++ "\x00\x01" ++ "\x00\x01";
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(other_name, 0x1234, "example.com", .a));
+    // (b) no question section at all
+    const no_question = head ++ "\x00\x00\x00\x00\x00\x00\x00\x00";
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(no_question, 0x1234, "example.com", .a));
+    // (c) two questions
+    const two = head ++ "\x00\x02\x00\x00\x00\x00\x00\x00" ++ "\x07example\x03com\x00\x00\x01\x00\x01" ++ "\x07example\x03com\x00\x00\x01\x00\x01";
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(two, 0x1234, "example.com", .a));
+    // (d) our name, wrong type
+    const wrong_type = head ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x07example\x03com\x00" ++ "\x00\x10" ++ "\x00\x01";
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(wrong_type, 0x1234, "example.com", .a));
+    // (e) our name and type, class CH
+    const wrong_class = head ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x07example\x03com\x00" ++ "\x00\x01" ++ "\x00\x03";
+    try testing.expectError(error.MalformedResponse, r.decodeResponse(wrong_class, 0x1234, "example.com", .a));
+
+    // Accepted: case differences (RFC 4343 — 0x20 randomization echoes the
+    // query's case, other servers normalize) and our own trailing root dot.
+    const upper = head ++ "\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x07EXAMPLE\x03Com\x00" ++ "\x00\x01" ++ "\x00\x01";
+    var m1 = try r.decodeResponse(upper, 0x1234, "example.com", .a);
+    m1.deinit();
+    var m2 = try r.decodeResponse(upper, 0x1234, "Example.COM.", .a);
+    m2.deinit();
+}
+
+test "collectAddresses: only the queried owner and its CNAME chain count (bailiwick)" {
+    // A reply to `example.com A` whose answer section carries an A record
+    // for `victim.test`: `lookupIp` used to return that address. With a
+    // CNAME chain (example.com -> www.example.com -> cdn.example.net), the
+    // addresses of the chain's END are the answer; a record owned by a name
+    // the chain never reaches is not, even in the same section.
+    const resp = "\x00\x01\x81\x80" ++ "\x00\x01\x00\x05\x00\x00\x00\x00" ++
+        // question @12: example.com A IN  (ends @29)
+        "\x07example\x03com\x00\x00\x01\x00\x01" ++
+        // @29: victim.test A 203.0.113.66 — NOT ours
+        "\x06victim\x04test\x00" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xcb\x00\x71\x42" ++
+        // @56: cdn.example.net A 198.51.100.7 — reached only via the chain, listed BEFORE the CNAMEs (order must not matter); ends @87
+        "\x03cdn\x07example\x03net\x00" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc6\x33\x64\x07" ++
+        // @87: example.com (ptr @12) CNAME www.example.com  (rdata @99: "\x03www" + ptr @12)
+        "\xc0\x0c" ++ "\x00\x05\x00\x01\x00\x00\x00\x3c\x00\x06" ++ "\x03www\xc0\x0c" ++
+        // @105: www.example.com (ptr @99 = 0x63) CNAME cdn.example.net (ptr @56 = 0x38)
+        "\xc0\x63" ++ "\x00\x05\x00\x01\x00\x00\x00\x3c\x00\x02" ++ "\xc0\x38" ++
+        // @119: EXAMPLE.COM (different case, uncompressed) A 192.0.2.9 — ours
+        "\x07EXAMPLE\x03COM\x00" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x09";
+    var msg = try message.decode(testing.allocator, resp);
+    defer msg.deinit();
+    try testing.expectEqual(@as(usize, 5), msg.answers.len);
+    try testing.expectEqualStrings("cdn.example.net", msg.answers[3].data.cname);
+
+    var list: std.ArrayList(netaddr.Ip) = .empty;
+    defer list.deinit(testing.allocator);
+    try collectAddresses(testing.allocator, &list, &msg, "example.com");
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expect(list.items[0].eql(netaddr.parseIp("198.51.100.7").?));
+    try testing.expect(list.items[1].eql(netaddr.parseIp("192.0.2.9").?));
+
+    // Asked about the victim instead, only its own record qualifies.
+    list.clearRetainingCapacity();
+    try collectAddresses(testing.allocator, &list, &msg, "victim.test.");
+    try testing.expectEqual(@as(usize, 1), list.items.len);
+    try testing.expect(list.items[0].eql(netaddr.parseIp("203.0.113.66").?));
+}
+
+test "collectPtrNames: a PTR owned by another reverse name is not this answer; RFC 2317 CNAME delegation is" {
+    // Reply to 1.2.0.192.in-addr.arpa PTR: a PTR for 2.2.0.192.in-addr.arpa
+    // (not asked), then RFC 2317: 1.2.0.192.in-addr.arpa CNAME
+    // 1.0-127.2.0.192.in-addr.arpa, whose PTR is the real answer.
+    const resp = "\x00\x01\x81\x80" ++ "\x00\x01\x00\x03\x00\x00\x00\x00" ++
+        // question @12: 1.2.0.192.in-addr.arpa PTR IN ("\x011\x012\x010\x03192\x07in-addr\x04arpa\x00" = 24 bytes, ends @40)
+        "\x011\x012\x010\x03192\x07in-addr\x04arpa\x00" ++ "\x00\x0c\x00\x01" ++
+        // @40: 2.2.0.192.in-addr.arpa (uncompressed) PTR other.example — NOT ours
+        "\x012\x012\x010\x03192\x07in-addr\x04arpa\x00" ++ "\x00\x0c\x00\x01\x00\x00\x00\x3c\x00\x0f" ++ "\x05other\x07example\x00" ++
+        // @89: 1.2.0.192.in-addr.arpa (ptr @12) CNAME 1.0-127.2.0.192.in-addr.arpa ("\x011\x050-127" + ptr @14 "2.0.192.in-addr.arpa")
+        "\xc0\x0c" ++ "\x00\x05\x00\x01\x00\x00\x00\x3c\x00\x0a" ++ "\x011\x050-127\xc0\x0e" ++
+        // @111: 1.0-127.2.0.192.in-addr.arpa (ptr @101) PTR host.example
+        "\xc0\x65" ++ "\x00\x0c\x00\x01\x00\x00\x00\x3c\x00\x0e" ++ "\x04host\x07example\x00";
+    var msg = try message.decode(testing.allocator, resp);
+    defer msg.deinit();
+    try testing.expectEqual(@as(usize, 3), msg.answers.len);
+    try testing.expectEqualStrings("1.0-127.2.0.192.in-addr.arpa", msg.answers[1].data.cname);
+    try testing.expectEqualStrings("1.0-127.2.0.192.in-addr.arpa", msg.answers[2].name);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| testing.allocator.free(n);
+        names.deinit(testing.allocator);
+    }
+    try collectPtrNames(testing.allocator, &names, &msg, "1.2.0.192.in-addr.arpa");
+    try testing.expectEqual(@as(usize, 1), names.items.len);
+    try testing.expectEqualStrings("host.example", names.items[0]);
+}
+
+test "OwnerChain: a CNAME loop and an over-long chain stay bounded" {
+    // a -> b -> a (loop) plus c -> d: from `a`, the chain is {a, b}; `c`/`d`
+    // are never reached. A chain of 12 hops is cut at max_cname_chain.
+    const mk = struct {
+        fn cname(owner: []const u8, target: []const u8) message.Record {
+            return .{ .name = owner, .ty = .cname, .class = .in, .ttl = 0, .data = .{ .cname = target } };
+        }
+    };
+    const loop = [_]message.Record{ mk.cname("a", "b"), mk.cname("b", "a"), mk.cname("c", "d") };
+    var chain: OwnerChain = .init("a");
+    chain.follow(&loop);
+    try testing.expectEqual(@as(usize, 2), chain.len);
+    try testing.expect(chain.contains("B"));
+    try testing.expect(!chain.contains("c"));
+    try testing.expect(!chain.contains("d"));
+
+    const hops = [_][]const u8{ "n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9", "n10", "n11", "n12" };
+    var long: [12]message.Record = undefined;
+    for (&long, 0..) |*rec, i| rec.* = mk.cname(hops[i], hops[i + 1]);
+    var chain2: OwnerChain = .init("n0");
+    chain2.follow(&long);
+    try testing.expectEqual(OwnerChain.max_cname_chain + 1, chain2.len);
+    try testing.expect(chain2.contains("n8"));
+    try testing.expect(!chain2.contains("n9"));
+}
+
+test "jsonQueryUrl: the name is validated like the wire path and percent-encoded" {
+    const gpa = testing.allocator;
+    const plain = try jsonQueryUrl(gpa, "https://dns.google/resolve", "example.com", .a);
+    defer gpa.free(plain);
+    try testing.expectEqualStrings("https://dns.google/resolve?name=example.com&type=1", plain);
+
+    // An endpoint URL that already carries a query string gets `&`.
+    const amp = try jsonQueryUrl(gpa, "https://x.test/r?ct=json", "a-b_c.test.", .aaaa);
+    defer gpa.free(amp);
+    try testing.expectEqualStrings("https://x.test/r?ct=json&name=a-b_c.test.&type=28", amp);
+
+    // Parameter injection: `&`/`=` are data, not syntax.
+    const inj = try jsonQueryUrl(gpa, "https://x.test/r", "example.com&type=255&name=attacker.test", .a);
+    defer gpa.free(inj);
+    try testing.expectEqualStrings("https://x.test/r?name=example.com%26type%3D255%26name%3Dattacker.test&type=1", inj);
+
+    // Request-line splitting: CR, LF, space and `%` are escaped too.
+    const crlf = try jsonQueryUrl(gpa, "https://x.test/r", "a.test\r\nX-Injected: yes%00", .a);
+    defer gpa.free(crlf);
+    try testing.expectEqualStrings("https://x.test/r?name=a.test%0D%0AX-Injected%3A%20yes%2500&type=1", crlf);
+
+    // And what the wire path refuses, this refuses by the same name.
+    try testing.expectError(error.BadName, jsonQueryUrl(gpa, "https://x.test/r", "a..b", .a));
+    try testing.expectError(error.BadName, jsonQueryUrl(gpa, "https://x.test/r", "a" ** 64 ++ ".test", .a));
+    try testing.expectError(error.NameTooLong, jsonQueryUrl(gpa, "https://x.test/r", ("abcdefg." ** 32) ++ "x", .a));
 }
 
 test "serverList falls back to default_servers when resolv.conf is missing/empty" {
@@ -785,6 +1187,217 @@ test "live: DoH-JSON via dns.google/resolve" {
     defer parsed.deinit();
     try testing.expectEqual(@as(u32, 0), parsed.value.Status);
     try testing.expect(parsed.value.Answer.len > 0);
+}
+
+// ── tests (loopback stubs, offline) ──────────────────────────────────────────
+
+/// Build a response to `query_bytes` on a loopback stub: echoes the id (and,
+/// unless `lie_about_question`, the question section verbatim), then appends
+/// `answers` raw records. Test-only — the module publishes no response
+/// encoder, and the stubs here need to LIE in controlled ways.
+fn stubResponse(buf: []u8, query_bytes: []const u8, flags: u16, question: []const u8, answers: []const u8, ancount: u16) []u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll(query_bytes[0..2]) catch unreachable;
+    w.writeInt(u16, flags, .big) catch unreachable;
+    w.writeInt(u16, if (question.len == 0) 0 else 1, .big) catch unreachable;
+    w.writeInt(u16, ancount, .big) catch unreachable;
+    w.writeInt(u16, 0, .big) catch unreachable;
+    w.writeInt(u16, 0, .big) catch unreachable;
+    w.writeAll(question) catch unreachable;
+    w.writeAll(answers) catch unreachable;
+    return w.buffered();
+}
+
+/// One-shot UDP stub: receives a query and answers per `Script`.
+const UdpStub = struct {
+    io: std.Io,
+    sock: net.Socket,
+    script: Script,
+    served: usize = 0,
+
+    const Script = enum {
+        /// Question echoed correctly; answer = victim.test A 203.0.113.66 + example.com A 192.0.2.1.
+        off_bailiwick_plus_honest,
+        /// Question section says attacker.example TXT; answer = example.com A 192.0.2.1.
+        wrong_question,
+        /// No question section; answer = example.com A 192.0.2.1.
+        no_question,
+        /// Header only with the TC bit set: the resolver must go to TCP.
+        truncated,
+    };
+
+    fn run(st: *UdpStub) void {
+        st.serveOne() catch |err| std.debug.print("UdpStub: {t}\n", .{err});
+    }
+
+    fn serveOne(st: *UdpStub) !void {
+        var rbuf: [message.max_query_len]u8 = undefined;
+        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .awake } };
+        const incoming = try st.sock.receiveTimeout(st.io, &rbuf, t.toDeadline(st.io));
+        const q = incoming.data;
+        const question_echo = "\x07example\x03com\x00\x00\x01\x00\x01";
+        const a_example = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x01";
+        const a_victim = "\x06victim\x04test\x00" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xcb\x00\x71\x42";
+        var out: [512]u8 = undefined;
+        const resp = switch (st.script) {
+            .off_bailiwick_plus_honest => stubResponse(&out, q, 0x8180, question_echo, a_victim ++ a_example, 2),
+            .wrong_question => stubResponse(&out, q, 0x8180, "\x08attacker\x07example\x00\x00\x10\x00\x01", "\x07example\x03com\x00" ++ a_example[2..], 1),
+            .no_question => stubResponse(&out, q, 0x8180, "", "\x07example\x03com\x00" ++ a_example[2..], 1),
+            .truncated => stubResponse(&out, q, 0x8380, question_echo, "", 0),
+        };
+        try st.sock.send(st.io, &incoming.from, resp);
+        st.served += 1;
+    }
+};
+
+/// Static, so the slice `Options.servers` keeps outlives every test that
+/// hands it over (an `&.{…}` literal inside the call would dangle).
+const loopback_servers = [_]netaddr.Ip{.{ .v4 = .{ 127, 0, 0, 1 } }};
+
+fn udpStubResolver(io: std.Io, stub: *UdpStub, attempts: u8) !Resolver {
+    const port = stub.sock.address.getPort();
+    return Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .port = port,
+        .timeout_ms = 1500,
+        .attempts = attempts,
+        .use_hosts = false,
+        .use_search = false,
+    });
+}
+
+fn bindUdpStub(io: std.Io, script: UdpStub.Script) !UdpStub {
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = try addr.bind(io, .{ .mode = .dgram });
+    return .{ .io = io, .sock = sock, .script = script };
+}
+
+test "lookupIp: an answer record the question never asked about is ignored (bailiwick), end to end over loopback" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var stub = bindUdpStub(io, .off_bailiwick_plus_honest) catch return error.SkipZigTest;
+    defer stub.sock.close(io);
+    var stub_fut = try io.concurrent(UdpStub.run, .{&stub});
+    defer stub_fut.await(io);
+
+    var r = try udpStubResolver(io, &stub, 1);
+    defer r.deinit();
+    // The stub answers one datagram (the A query); the AAAA query times out
+    // (1.5 s) and lookupIp tolerates one family failing.
+    const ips = try r.lookupIp("example.com");
+    defer testing.allocator.free(ips);
+    try testing.expectEqual(@as(usize, 1), ips.len);
+    try testing.expect(ips[0].eql(netaddr.parseIp("192.0.2.1").?)); // never 203.0.113.66
+}
+
+test "query: a reply whose question is not ours is not the answer, over loopback" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    inline for (.{ UdpStub.Script.wrong_question, UdpStub.Script.no_question }) |script| {
+        var stub = bindUdpStub(io, script) catch return error.SkipZigTest;
+        defer stub.sock.close(io);
+        var stub_fut = try io.concurrent(UdpStub.run, .{&stub});
+        defer stub_fut.await(io);
+
+        var r = try udpStubResolver(io, &stub, 1);
+        defer r.deinit();
+        try testing.expectError(error.MalformedResponse, r.query("example.com", .a));
+        try testing.expectEqual(@as(usize, 1), stub.served);
+    }
+}
+
+/// A TCP listener that accepts the connection and never answers — the
+/// shape that held the resolver until the OS gave up (measured 45-60 s in
+/// the audit at `timeout_ms = 1000`).
+const SilentTcp = struct {
+    io: std.Io,
+    server: net.Server,
+    stop: std.atomic.Value(u32) = .init(0),
+
+    fn run(st: *SilentTcp) void {
+        const stream = st.server.accept(st.io) catch return;
+        defer stream.close(st.io);
+        // Hold the connection open until told to stop; never write.
+        while (st.stop.load(.acquire) == 0) {
+            st.io.futexWaitTimeout(u32, &st.stop.raw, 0, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }) catch break;
+        }
+    }
+};
+
+test "tcpExchange: a server that accepts and never answers is bounded by timeout_ms (audit F1)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch return error.SkipZigTest };
+    defer silent.server.socket.close(io);
+    var fut = try io.concurrent(SilentTcp.run, .{&silent});
+    defer {
+        silent.stop.store(1, .release);
+        io.futexWake(u32, &silent.stop.raw, 1);
+        fut.await(io);
+    }
+
+    var r = Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .port = silent.server.socket.address.ip4.port,
+        .transport = .tcp,
+        .timeout_ms = 300,
+        .attempts = 1,
+        .use_search = false,
+    });
+    defer r.deinit();
+
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, r.query("example.com", .a));
+    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    try testing.expect(elapsed_ns >= 250 * std.time.ns_per_ms);
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s); // was: until the OS gave up
+}
+
+test "query: the TC-bit path into a silent TCP server is bounded too (default transport .auto)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // TCP first on an ephemeral port, then UDP on the SAME port number.
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch return error.SkipZigTest };
+    defer silent.server.socket.close(io);
+    const port = silent.server.socket.address.ip4.port;
+    const udp_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    const udp_sock = udp_addr.bind(io, .{ .mode = .dgram }) catch return error.SkipZigTest;
+    var stub: UdpStub = .{ .io = io, .sock = udp_sock, .script = .truncated };
+    defer stub.sock.close(io);
+
+    var tcp_fut = try io.concurrent(SilentTcp.run, .{&silent});
+    defer {
+        silent.stop.store(1, .release);
+        io.futexWake(u32, &silent.stop.raw, 1);
+        tcp_fut.await(io);
+    }
+    var udp_fut = try io.concurrent(UdpStub.run, .{&stub});
+    defer udp_fut.await(io);
+
+    var r = Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .port = port,
+        .timeout_ms = 300,
+        .attempts = 1,
+        .use_search = false,
+    });
+    defer r.deinit();
+
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, r.query("example.com", .a));
+    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    try testing.expectEqual(@as(usize, 1), stub.served); // UDP answered with TC
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
 }
 
 // ── tests (cancellation, offline) ────────────────────────────────────────────

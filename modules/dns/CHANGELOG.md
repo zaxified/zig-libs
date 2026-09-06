@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — A1 security audit, the four HIGH findings fixed. **Consumer-visible
+  behaviour change (stricter acceptance, no new error values):** `Resolver` now refuses a
+  reply that does not echo exactly our question — one question, our name (ASCII
+  case-insensitive), our type, class IN — as `error.MalformedResponse` (RFC 5452 §9.1;
+  before, id + QR bit was the whole check, so a reply whose question section named
+  `attacker.example TXT`, or had no question section, was taken as the answer to
+  `example.com A`). `lookupIp` and `reverse` return only records whose owner is the
+  queried name or a CNAME target chained from it inside the same answer section (8 hops
+  max; a reply to `example.com` carrying `victim.test A 203.0.113.66` used to yield that
+  address). `resolve`/`query` are unchanged in what they return. `timeout_ms` now bounds
+  each TCP attempt end to end — connect, write, length read, body read — by running the
+  exchange on its own task and canceling it at the deadline (`runBounded`, the
+  `http.Client` construction); before, only UDP was bounded, and a server that accepted
+  the connection and never answered held the caller until the OS gave up (measured 45-60 s
+  at `timeout_ms = 1000`), reachable on the default `.auto` transport by one TC-bit
+  datagram. An `Io` with no unit of concurrency fails such an attempt as `NetworkFailed`
+  rather than run it unbounded. `queryJson` validates `name` by the wire path's rule
+  (`BadName`/`NameTooLong`) and percent-encodes it into the URL (`&`, `=`, CR, LF, space,
+  `%` were passed through into the request line). A fresh transaction id is drawn for every
+  datagram sent, not once per `query`. `Error.Timeout`'s doc now states the real budget
+  (`timeout_ms × attempts × servers` per query, more for `lookupIp`) instead of
+  `timeout_ms × attempts`. Tests: correlation, bailiwick (incl. out-of-order chain, loop,
+  over-long chain), URL encoding, hostile section counts under a 4 KiB memory limit (the
+  old test accepted `Truncated` from a decoder that had first allocated 8.6 MB), SOA/MX
+  RDLENGTH shorter than their fields, and loopback stubs — a UDP server that lies about the
+  question or slips in an off-bailiwick record, a TCP server that accepts and never
+  answers, via both `.tcp` and the TC-bit path. The fuzz harness draws one `smith.slice`
+  and is seeded with the six live captures (it had decoded the empty packet once per run).
 - **2026-08-23** — **Breaking:** `reverseName` returns
   `ReverseNameError![]const u8` (`error{OutputTooSmall}`) instead of
   `[]const u8`. It used to guard `buf.len >= max_reverse_name_len` with

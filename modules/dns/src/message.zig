@@ -1002,6 +1002,29 @@ test "decode: adversarial counts cannot force large allocations" {
     try expectDecodeError(error.Truncated, p);
 }
 
+test "decode: hostile ANCOUNT/QDCOUNT are refused BEFORE the section is allocated — measured, not inferred" {
+    // The test above checks only the error name, and `error.Truncated` is
+    // what the decoder returns with the up-front count guard REMOVED as
+    // well — it just gets there after allocating 65 535 `Record`s (the audit
+    // measured 8 650 724 B for a 17-byte packet, 508 866× the input). So the
+    // guard is pinned by the quantity it exists for: with a 4 KiB memory
+    // limit, the refusal must still be `Truncated`, never `OutOfMemory`.
+    var limited: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .init;
+    defer _ = limited.deinit();
+    limited.requested_memory_limit = 4096;
+    const gpa = limited.allocator();
+
+    const ancount = "\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00" ++ "\x01a\x00\x00\x01";
+    try testing.expectError(error.Truncated, decode(gpa, ancount));
+    const qdcount = "\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00" ++ "\x01a\x00\x00\x01";
+    try testing.expectError(error.Truncated, decode(gpa, qdcount));
+    const nscount = "\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00" ++ "\x01a\x00\x00\x01";
+    try testing.expectError(error.Truncated, decode(gpa, nscount));
+    // And a legitimate small packet still decodes under the same limit.
+    var ok = try decode(gpa, "\x00\x01\x80\x00" ++ "\x00\x00" ** 4);
+    ok.deinit();
+}
+
 test "decode: bad rdata lengths are rejected" {
     const head = "\x00\x00\x80\x00\x00\x00\x00\x01\x00\x00\x00\x00";
     // A record with RDLENGTH 3.
@@ -1037,6 +1060,15 @@ test "decode: bad rdata lengths are rejected" {
     // CAA with an empty tag (RFC 8659 requires 1+ chars).
     try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x01\x01\x00\x01" ++
         "\x00\x00\x00\x00" ++ "\x00\x03" ++ "\x00\x00x");
+    // SOA with RDLENGTH 4 (two root names) and the packet continuing after:
+    // the five 32-bit fields would be read from OUTSIDE the record's own
+    // RDATA. Without the `d.pos > rdata_end` guard this decoded, with
+    // `serial = 0x11223344` taken from the next record's bytes.
+    try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x00\x06\x00\x01" ++
+        "\x00\x00\x00\x00" ++ "\x00\x04" ++ "\x00\x00\x11\x22" ++ "\x33\x44" ++ "\x00" ** 20);
+    // MX with RDLENGTH 2: the exchange name would come from past the RDATA.
+    try expectDecodeError(error.BadRecord, head ++ "\x01a\x00" ++ "\x00\x0f\x00\x01" ++
+        "\x00\x00\x00\x00" ++ "\x00\x02" ++ "\x00\x0a" ++ "\x02mx\x00" ++ "\x00" ** 4);
 }
 
 test "decode: opcode field decodes from the right flag bits" {
@@ -1066,14 +1098,43 @@ test "decode: empty and header-only packets" {
     try testing.expectEqual(@as(usize, 0), msg.questions.len);
 }
 
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`:
+/// `Smith.slice` reads a little-endian u32 length and then that many bytes,
+/// so a packet that is to arrive verbatim carries that header. Static
+/// memory — a `const` local would dangle.
+fn fuzzSeed(comptime packet: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(packet.len))) ++ packet[0..packet.len].*;
+    }.bytes;
+}
+
+/// The six live captures in `goldens.zig` (compression, a CNAME chain, MX,
+/// TXT, an NXDOMAIN with a mid-name-compressed SOA) plus the shapes the
+/// adversarial tests above reject — so a run WITHOUT `--fuzz` still parses
+/// real packets, and a run with it starts from them.
+const decode_seeds = [_][]const u8{
+    fuzzSeed(@import("goldens.zig").a_example_com),
+    fuzzSeed(@import("goldens.zig").aaaa_example_com),
+    fuzzSeed(@import("goldens.zig").cname_chain_wikipedia),
+    fuzzSeed(@import("goldens.zig").mx_iana_org),
+    fuzzSeed(@import("goldens.zig").txt_example_com),
+    fuzzSeed(@import("goldens.zig").nxdomain_zig_libs_test),
+    fuzzSeed("\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00" ++ "\x01a\xc0\x0c" ++ "\x00\x01\x00\x01"), // pointer cycle
+    fuzzSeed("\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00" ++ "\x01a\x00\x00\x01"), // hostile ANCOUNT
+    fuzzSeed("\x00\x00\x80\x00\x00\x00\x00\x01\x00\x00\x00\x00" ++ "\x01a\x00" ++ "\x00\x10\x00\x01" ++ "\x00\x00\x00\x00" ++ "\x00\x03" ++ "\x09ab"), // TXT string past RDATA
+};
+
 test "fuzz: decoder never crashes or leaks on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecode, .{});
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var packet: [512]u8 = undefined;
-    smith.bytes(&packet);
-    const len: usize = smith.valueRangeAtMost(u16, 0, packet.len);
+    // One `smith.slice` draw — never `bytes` followed by a ranged length:
+    // `bytes` consumed the whole seed and the ranged draw then returned its
+    // minimum, so the default gate decoded the EMPTY packet once per run
+    // (the audit instrumented it: `runs=1 len_min=0 len_max=0`).
+    const len: usize = smith.slice(&packet);
     if (decode(testing.allocator, packet[0..len])) |msg| {
         var m = msg;
         m.deinit();
