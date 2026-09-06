@@ -475,6 +475,7 @@ fn finalizeOneInput(
     resolved: []const bool,
     binding_err: []const ?UtxoBindingError,
     all_resolved: bool,
+    precomputed: ?bitcointx.PrecomputedTransactionData,
     index: usize,
 ) InputFinalizeError!void {
     const m = ps.inputs[index];
@@ -512,7 +513,15 @@ fn finalizeOneInput(
         return error.NonStandardScript;
     }
 
-    const ctx: bitcoinscript.TxContext = .{ .tx = utx, .input_index = index, .spent_outputs = spent };
+    // The per-transaction sighash cache was built ONCE by `finalize`, so
+    // verifying this input costs O(1) commitment hashes, not a fresh
+    // O(vin.len) set per CHECKSIG — BIP143/BIP341's whole point (A1 P1).
+    const ctx: bitcoinscript.TxContext = .{
+        .tx = utx,
+        .input_index = index,
+        .spent_outputs = spent,
+        .precomputed = precomputed,
+    };
     try bitcoinscript.verifyScript(
         allocator,
         final_script_sig orelse &.{},
@@ -528,7 +537,7 @@ fn finalizeOneInput(
     old.deinit(allocator);
 }
 
-pub const FinalizeSetupError = Allocator.Error || bitcointx.tx.DeserializeError;
+pub const FinalizeSetupError = Allocator.Error || bitcointx.tx.DeserializeError || bitcointx.precomputed.PrecomputedError;
 
 /// Finalizes every input of `ps` it can, mutating `ps.inputs` in place
 /// (module doc comment: `Psbt.inputs` is a slice, so mutation through this
@@ -579,9 +588,23 @@ pub fn finalize(allocator: Allocator, ps: psbt.Psbt) FinalizeSetupError![]?Input
         }
     }
 
+    // The sighash cache, once per transaction and before the loop — the
+    // reason the loop below is linear in the number of inputs rather than
+    // quadratic. Measured before this existed (A1 P1, 2026-09-06): every
+    // input built its own `TxContext` with `precomputed = null`, so a
+    // 614 kB transaction of 8 192 inputs cost 25.9 s of sighashing where
+    // the cache costs 10 ms. The BIP341 half needs every spent output; when
+    // one is unresolved the placeholder zeros in `spent` must not be baked
+    // into a cache (a taproot input's sighash would then be WRONG rather
+    // than merely uncached), so only the BIP143 half — a function of the
+    // transaction alone — is built then, and taproot inputs, which
+    // `finalizeWitnessProgram` refuses without `all_resolved` anyway, fall
+    // back to the uncached, byte-exact path.
+    const precomputed = try bitcointx.PrecomputedTransactionData.init(allocator, utx, if (all_resolved) spent else null);
+
     const results = try allocator.alloc(?InputFinalizeError, n);
     for (0..n) |i| {
-        results[i] = if (finalizeOneInput(allocator, ps, utx, spent, resolved, binding_err, all_resolved, i)) |_| null else |e| e;
+        results[i] = if (finalizeOneInput(allocator, ps, utx, spent, resolved, binding_err, all_resolved, precomputed, i)) |_| null else |e| e;
     }
     return results;
 }

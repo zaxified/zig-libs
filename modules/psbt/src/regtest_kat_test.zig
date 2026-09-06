@@ -43,7 +43,15 @@ test "regtest P2WPKH: finalize reproduces Core's bytes and clears exactly what B
     try testing.expect(ps.inputs[0].find(psbt.input_key.WITNESS_UTXO) != null);
     try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
 
+    // The commitment-hash oracle from `bitcointx.instrument`: BIP143's three
+    // and BIP341's five midstates are computed ONCE per `finalize`, however
+    // many CHECKSIGs the inputs run — 8, for a one-signature P2WPKH and for
+    // a two-signature 2-of-3 alike. Before `finalize` hoisted the cache
+    // (A1 P1, 2026-09-06) the count was 3 per signature, i.e. 3 and 6 here
+    // and 3 × signatures × inputs on a large transaction.
+    bitcointx.instrument.reset();
     _ = try psbt.finalize(a, ps);
+    try testing.expectEqual(@as(usize, 8), bitcointx.instrument.count());
 
     const got = try psbt.serialize(a, ps);
     const want = try hexToBytesAlloc(a, vectors.p2wpkh_finalized_hex);
@@ -103,7 +111,15 @@ test "regtest P2WSH 2-of-3 multisig: finalize reproduces Core's bytes and clears
     try testing.expect(ps.inputs[0].find(psbt.input_key.WITNESS_UTXO) != null);
     try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
 
+    // The commitment-hash oracle from `bitcointx.instrument`: BIP143's three
+    // and BIP341's five midstates are computed ONCE per `finalize`, however
+    // many CHECKSIGs the inputs run — 8, for a one-signature P2WPKH and for
+    // a two-signature 2-of-3 alike. Before `finalize` hoisted the cache
+    // (A1 P1, 2026-09-06) the count was 3 per signature, i.e. 3 and 6 here
+    // and 3 × signatures × inputs on a large transaction.
+    bitcointx.instrument.reset();
     _ = try psbt.finalize(a, ps);
+    try testing.expectEqual(@as(usize, 8), bitcointx.instrument.count());
 
     const got = try psbt.serialize(a, ps);
     const want = try hexToBytesAlloc(a, vectors.p2wsh_multisig_finalized_hex);
