@@ -570,9 +570,16 @@ covers the client population; `deflate` adds nothing over it).
 ## Client behavior notes
 
 - **Redirects:** 301/302/303 rewrite non-GET/HEAD to GET and drop the body;
-  307/308 preserve method + body (Go semantics). `Authorization` is dropped
-  when the redirect changes the host (exact host match, unlike Go's
-  subdomain rule). Cap via `Options.max_redirects`.
+  307/308 preserve method + body (Go semantics). On a hop that changes the
+  origin (scheme, host or port — exact match, unlike Go's subdomain rule)
+  `Authorization`, `Cookie` and `Proxy-Authorization` are dropped and a
+  caller-supplied `Host` is replaced by the hop's own authority. Cap via
+  `Options.max_redirects`. **Where a redirect may go is the caller's
+  decision:** `RequestOptions.redirect_filter` is consulted with the URL
+  being left and the resolved target before any dial (`false` →
+  `error.RedirectRefused`, nothing sent); unset, every redirect within the
+  cap is followed — a consumer that accepts user-supplied URLs and does not
+  set it has no destination gate.
 - **Connections:** a keyed idle-connection `Pool` (`Options.pool`, on by
   default) keeps warm, keep-alive-eligible connections per origin; a
   request checks one out on a hit or dials fresh on a miss, and returns it

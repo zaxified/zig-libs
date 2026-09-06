@@ -163,6 +163,17 @@ Hardened for direct internet exposure (no reverse proxy required):
   before it. **Not covered:** per-user connection-rate limiting — that belongs on the accept path
   (`Options.on_connect`), not in the h2 loop.
 - **Header injection:** outbound header names/values reject CR/LF/NUL (response-splitting guard).
+- **Redirect hops (client):** on an origin change the client drops `Authorization`, `Cookie` and
+  `Proxy-Authorization` and replaces a caller-supplied `Host` with the hop's authority (A1 G3/G4,
+  2026-09-06 — before that `Host: vhost.internal` and `Proxy-Authorization` arrived at the second
+  origin). **The destination itself is not judged by default.** `RequestOptions.redirect_filter`
+  is the gate (consulted before any dial; `RedirectRefused` sends nothing), and `null` means every
+  redirect within `max_redirects` is followed. That default is a recorded decision, not an
+  omission: 27 in-tree consumers follow cross-origin redirects legitimately (`rdap` referrals,
+  `acme`, `jwt` discovery), so a default-deny would have to be re-enabled in each; the
+  consequence is that **a consumer that follows redirects across origins without setting
+  `redirect_filter` has no destination gate** (loopback, link-local, RFC 1918 — the SSRF class)
+  and owes its own. `llmclient` chose the other option and follows no redirect at all.
 - Response bodies of 304/204/1xx are suppressed (framing correctness).
 - **Out of scope:** TLS termination (bring-your-own via the seam — reverse proxy today, ianic/std
   server later), HTTP/3 (QUIC), auth (`aaa-gate`/`jwt`), rate limiting (`ratelimit`), path-traversal

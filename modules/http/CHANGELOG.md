@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — **A cross-origin redirect hop no longer carries the caller's `Host` or
+  `Proxy-Authorization`, and `RequestOptions.redirect_filter` is the destination gate** (A1
+  G3, G4, G5). Measured over two loopback hops: `Host: vhost.internal` and
+  `Proxy-Authorization: Basic SECRET` both arrived at the second origin while
+  `Authorization`/`Cookie` were correctly gone — the strip list had two names and the
+  caller's `Host` was computed once for every hop. Now the hop's own authority is the
+  `Host`, and the strip list is three names; same-origin hops keep all four.
+  `redirect_filter` (`ctx` + `allow(ctx, from, to) bool`) is consulted with the URL being
+  left and the resolved target before any dial; refusing is the new
+  **`Client.Error.RedirectRefused`** and sends nothing. **Unset, every redirect within
+  `max_redirects` is still followed** — a recorded default (SPEC "Redirect hops"), so a
+  consumer that accepts user-supplied URLs owes its own gate. `Error` gained one member;
+  every in-tree consumer switches with `else`.
+
 - **2026-09-06** — **An h2 request is held to RFC 9113 §8.2.1/§8.3.1 before
   it is turned into the handler's h1-shaped head, and `:path` gets the h1
   path guard.** The h2 serving loop rebuilds the decoded fields into a CRLF

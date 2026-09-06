@@ -217,6 +217,26 @@ pub const RequestOptions = struct {
     /// redirects). For streaming uploads use `requestStreaming`.
     body: ?[]const u8 = null,
     follow_redirects: bool = true,
+    /// The destination gate for redirects (A1 G5): consulted with the URL
+    /// being left and the resolved `Location` before any dial to the
+    /// latter; `false` ends the request with `error.RedirectRefused`
+    /// (nothing was sent to the refused host). This is where a consumer
+    /// that lets a user supply a URL keeps a 3xx from walking it onto a
+    /// loopback, link-local or RFC 1918 address, or off an allow-list of
+    /// hosts — without turning `follow_redirects` off and re-implementing
+    /// the chain. `null` = every redirect within `Options.max_redirects` is
+    /// followed, as before: **a consumer that follows redirects across
+    /// origins without setting this has no destination gate** (a recorded
+    /// default, see SPEC.md — credentials are stripped on such a hop,
+    /// destinations are not judged). The first hop is the caller's own URL
+    /// and is not gated here.
+    redirect_filter: ?RedirectFilter = null,
+};
+
+pub const RedirectFilter = struct {
+    ctx: ?*anyopaque = null,
+    /// `from` is the URL that answered 3xx, `to` the resolved target.
+    allow: *const fn (ctx: ?*anyopaque, from: http.Url, to: http.Url) bool,
 };
 
 pub const Error = error{
@@ -259,6 +279,9 @@ pub const Error = error{
     /// the URL's path/query: whitespace or a control byte there fails
     /// `Url.parse` as `BadUrl`.
     InvalidHeader,
+    /// `RequestOptions.redirect_filter` said no to a redirect target; the
+    /// refused host was never dialed.
+    RedirectRefused,
 };
 
 /// The outbound half of the header-injection defence: every caller-supplied
@@ -433,6 +456,12 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
             // double-free, just gated on a malformed redirect target instead
             // of a failed redial.
             const next_url = http.Url.parse(resolved) catch return error.BadRedirect;
+            // The destination gate, before `conn.destroy()` for the same
+            // reason as the parse above, and before any dial: a refused
+            // host receives nothing.
+            if (options.redirect_filter) |f| {
+                if (!f.allow(f.ctx, url, next_url)) return error.RedirectRefused;
+            }
 
             conn.destroy();
             owned = false;
@@ -538,6 +567,9 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
             // `conn.destroy()` below (see `owned`'s doc comment) so this
             // return can never double-free it.
             if (next_url.scheme != .http) return error.UnsupportedScheme;
+            if (options.redirect_filter) |f| {
+                if (!f.allow(f.ctx, url, next_url)) return error.RedirectRefused;
+            }
 
             conn.destroy();
             owned = false;
@@ -1843,10 +1875,16 @@ fn crossOrigin(a: http.Url, b: http.Url) bool {
 /// omitted — HTTP/1.1 defaults to persistent, which is what makes the
 /// connection eligible for the pool afterwards); `Content-Length` /
 /// `Transfer-Encoding` from `plan`; `Host`, `User-Agent`, `Accept-Encoding`
-/// defaulted unless the caller supplies them; `Authorization` and `Cookie`
-/// both dropped when `strip_sensitive` (cross-origin redirect — see
-/// `crossOrigin`) since either can carry credentials that must not leak to a
-/// different scheme/host/port.
+/// defaulted unless the caller supplies them. When `strip_sensitive` (a
+/// cross-origin redirect hop — see `crossOrigin`): `Authorization`, `Cookie`
+/// and `Proxy-Authorization` are dropped, since each carries credentials
+/// that must not leak to a different scheme/host/port (the last is by
+/// definition for the nearest proxy only, RFC 9110 §11.7.1 — A1 G4), and a
+/// caller-supplied `Host` is replaced by the hop's own authority: it named
+/// the ORIGINAL origin, and sending it to another host routes the request
+/// as a vhost that host is not (A1 G3 — the client-side twin of the
+/// absolute-form host confusion the server fixed). Same-origin hops keep all
+/// four.
 fn writeRequestHead(
     w: *std.Io.Writer,
     method: http.Method,
@@ -1866,7 +1904,7 @@ fn writeRequestHead(
         if (std.ascii.eqlIgnoreCase(hd.name, "accept-encoding")) custom_ae = true;
     }
 
-    writeHead(w, method, url, headers, user_agent, plan, strip_sensitive, send_close, custom_host, custom_ua, custom_ae) catch
+    writeHead(w, method, url, headers, user_agent, plan, strip_sensitive, send_close, if (strip_sensitive) null else custom_host, custom_ua, custom_ae) catch
         return error.WriteFailed;
 }
 
@@ -1899,7 +1937,8 @@ fn writeHead(
             std.ascii.eqlIgnoreCase(hd.name, "content-length") or
             std.ascii.eqlIgnoreCase(hd.name, "transfer-encoding")) continue;
         if (strip_sensitive and (std.ascii.eqlIgnoreCase(hd.name, "authorization") or
-            std.ascii.eqlIgnoreCase(hd.name, "cookie"))) continue;
+            std.ascii.eqlIgnoreCase(hd.name, "cookie") or
+            std.ascii.eqlIgnoreCase(hd.name, "proxy-authorization"))) continue;
         try w.print("{s}: {s}\r\n", .{ hd.name, hd.value });
     }
 
@@ -2079,6 +2118,36 @@ test "writeRequestHead: Authorization and Cookie both stripped on cross-origin r
     try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true, true);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
+}
+
+test "writeRequestHead: a caller's Host and Proxy-Authorization do not survive a cross-origin hop either (A1 G3/G4)" {
+    // Measured before the fix over two loopback hops: `Host: vhost.internal`
+    // and `Proxy-Authorization: Basic SECRET` both arrived at the second
+    // origin, while Authorization/Cookie were correctly gone — the strip
+    // list had two names and `custom_host` was computed once for every hop.
+    const url = try http.Url.parse("http://second.example:8081/final");
+    const hdrs = [_]http.Header{
+        .{ .name = "Host", .value = "vhost.internal" },
+        .{ .name = "Proxy-Authorization", .value = "Basic SECRET" },
+        .{ .name = "X-Keep", .value = "kept" },
+    };
+    var buf: [512]u8 = undefined;
+
+    // Same-origin hop: the caller's Host is the vhost they asked for, and
+    // the proxy credential is for the proxy in front of that origin.
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, false, true);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Host: vhost.internal\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Proxy-Authorization: Basic SECRET\r\n") != null);
+
+    // Cross-origin hop: the hop's own authority as Host, no proxy credential,
+    // the innocent header still there.
+    w = .fixed(&buf);
+    try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true, true);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Host: second.example:8081\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "vhost.internal") == null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Proxy-Authorization") == null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "X-Keep: kept\r\n") != null);
 }
 
 test "request(): same-host scheme downgrade and same-host port change both strip Authorization+Cookie" {
@@ -3534,6 +3603,82 @@ fn plainRedirectToHttpsHandler(req: *Server.Request, rw: *Server.ResponseWriter)
     _ = req;
     rw.status = 302;
     try rw.setHeader("Location", "https://elsewhere.example/final");
+    try rw.writeAll("");
+}
+
+fn refuseAllRedirects(_: ?*anyopaque, _: http.Url, _: http.Url) bool {
+    return false;
+}
+
+const RecordingFilter = struct {
+    calls: usize = 0,
+    from_port: u16 = 0,
+    to_host_buf: [64]u8 = undefined,
+    to_host_len: usize = 0,
+    verdict: bool,
+
+    fn allow(ctx: ?*anyopaque, from: http.Url, to: http.Url) bool {
+        const self: *RecordingFilter = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        self.from_port = from.port;
+        self.to_host_len = @min(to.host.len, self.to_host_buf.len);
+        @memcpy(self.to_host_buf[0..self.to_host_len], to.host[0..self.to_host_len]);
+        return self.verdict;
+    }
+};
+
+test "request/requestPlain: redirect_filter gates the destination before any dial — refused means the host is never contacted (A1 G5)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const server = try testing.allocator.create(Server);
+    defer testing.allocator.destroy(server);
+    server.* = Server.init(io, testing.allocator, .{ .handler = redirectToPortOneHandler });
+    server.bind() catch |err| {
+        server.deinit();
+        std.debug.print("redirect_filter test loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, poolTestServeWrap, .{server});
+    defer thread.join();
+    defer server.shutdown();
+    const port = server.boundAddress().getPort();
+
+    var client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    // Refused: one dial (the request that got the 302), the target — port 1,
+    // unbindable, so a dial would fail loudly — never attempted.
+    var rec: RecordingFilter = .{ .verdict = false };
+    const filter: RedirectFilter = .{ .ctx = &rec, .allow = RecordingFilter.allow };
+    try testing.expectError(error.RedirectRefused, client.request(.get, url, .{ .redirect_filter = filter }));
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+    try testing.expectEqual(port, rec.from_port);
+    try testing.expectEqualStrings("127.0.0.1", rec.to_host_buf[0..rec.to_host_len]);
+    try testing.expectError(error.RedirectRefused, client.requestPlain(.get, url, .{ .redirect_filter = .{ .allow = refuseAllRedirects } }));
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+
+    // Positive control: the same filter saying yes lets the hop happen — the
+    // second dial is attempted (and refused by the kernel, port 1).
+    rec = .{ .verdict = true };
+    try testing.expectError(error.ConnectFailed, client.request(.get, url, .{ .redirect_filter = filter }));
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+    // (`dialCount` counts connections that came up, so the refused connect
+    // to port 1 leaves it at 3 — the ConnectFailed above is the evidence
+    // that the hop was attempted.)
+    try testing.expectEqual(@as(usize, 3), client.dialCount());
+}
+
+fn redirectToPortOneHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    _ = req;
+    rw.status = 302;
+    try rw.setHeader("Location", "http://127.0.0.1:1/final");
     try rw.writeAll("");
 }
 
