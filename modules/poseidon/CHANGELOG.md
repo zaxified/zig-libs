@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — Provenance, not arithmetic: the circomlibjs known answers in
+  `src/vectors_test.zig` are now **produced by running circomlibjs**, not read out
+  of its test suite. `iden3/circomlibjs` is GPL-3.0, so values transcribed from its
+  sources were copyleft-licensed data sitting in an MIT tree; values obtained by
+  executing it are this repository's own measurement of a black box (root NOTICE
+  §0). The recipe stopped being a comment and became an instrument: new
+  `tools/gen_vectors.mjs` (CONVENTIONS.md §9) imports circomlibjs from a
+  disposable clone, computes every circomlibjs-derived value in the test file
+  twice — `poseidon_reference.js` and `poseidon_opt.js`, whose MDS storage and
+  round folding differ — and requires the two to agree. Run against circomlibjs
+  0.1.8 (`48b3ab3`): all 29 distinct values identical to what was committed, which
+  is the expected result and the reason this is a provenance change and not a
+  vector change. No test name, input or assertion moved. `NOTICE` corrected while
+  here: circomlibjs is GPL-3.0, not LGPL-3.0 — LGPL-3.0 is `iden3/circomlib`, the
+  circom circuits, from which this module takes nothing at all.
+
 - **2026-08-06** — Security audit: two findings fixed, two documented as accepted (not
   defects) — part of the collection-wide audit. Verified: byte-exact against the
   Poseidon authors' own `hadeshash` test vectors, all four published GF(p) instances.

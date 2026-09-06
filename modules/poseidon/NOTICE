@@ -52,14 +52,31 @@ bit consumption) and in `src/mds_security.zig`'s (the two proved rewrites, and
 `check_minpoly_condition` belonging to `generate_matrix_partial` rather than to
 `generate_matrix`'s acceptance loop).
 
-## NOT reproduced here: circomlib
+## NOT reproduced here: circomlib / circomlibjs
 
-**Copyleft:** NONE-SHIPPED — circomlib is an ORACLE this module compares
-against, not code it ships; no circomlib source or data is in this repository.
+**Copyleft:** NONE-SHIPPED — circomlibjs is an ORACLE this module RUNS, not code
+it ships: every number here that involves it was produced by executing it, so no
+circomlib source and no circomlib data is in this repository.
 
-`iden3/circomlib` and `circomlibjs` are **LGPL-3.0** and are used only as a
-comparison target: `src/constants_test.zig` pins SHA-256 digests of tables THIS
-module derives, and documents how to re-clone circomlibjs and recompute the
-comparison yourself. No circomlib source and no circomlib data is present in
-this repository, so its terms do not reach this module. It is recorded as a
-design reference in this module's `README.md` `Provenance:` statement.
+`iden3/circomlibjs` (**GPL-3.0**, stated in its `package.json`) and
+`iden3/circomlib` (**LGPL-3.0**, the circom circuits) are used only as
+comparison targets, and only ever by being *run* or by being *digested* — never
+by being copied:
+
+* `src/vectors_test.zig`'s circomlibjs known answers are computed by
+  `tools/gen_vectors.mjs`, which imports circomlibjs from a disposable clone,
+  runs both its reference and its optimized implementation and requires the two
+  to agree. The clone lives outside this tree (`.zig-cache/`, gitignored) and
+  what the generator prints is this repository's own measurement of a black box,
+  not a transcription of upstream's test file. Last regenerated 2026-09-06
+  against circomlibjs 0.1.8 (`48b3ab37013c5ed21e9ff8a80a5b010795c97094`): every
+  value was unchanged — Poseidon is deterministic — which is the point, since
+  what the run replaced was the provenance and not the arithmetic.
+* `src/constants_test.zig` pins SHA-256 digests of tables THIS module derives
+  with its own Grain-LFSR port, and documents how to re-clone circomlibjs and
+  recompute the comparison yourself. A digest is not the data.
+
+Nothing at all is taken from `iden3/circomlib`; it is a design reference,
+recorded as such in this module's `README.md` `Provenance:` statement and in
+`SPEC.md`. No circomlib or circomlibjs source and no circomlib or circomlibjs
+data is present in this repository, so their terms do not reach this module.

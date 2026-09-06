@@ -27,12 +27,14 @@ that owes them. The permutation and its parameter generation otherwise follow
 eprint 2019/458 (Grassi-Khovratovich-Rechberger-Roy-Schofnegger) and the
 subspace-trail analysis of eprint 2020/500 (Grassi-Rechberger-Schofnegger), and
 the GF(p) linear algebra (`linalg.zig`) is the authors' own.
-`iden3/circomlib` + `circomlibjs` (**LGPL-3.0**) are a design/comparison
-reference for the deployed constants, used ONLY as a comparison target:
-`constants_test.zig` pins SHA-256 digests of tables this module derives itself
-and documents how to re-clone circomlibjs and recompute the comparison. No
-circomlib source or data is present, so its copyleft terms do not reach this
-repository, and neither reference imposes a condition beyond MIT's own.
+`iden3/circomlibjs` (**GPL-3.0**) and `iden3/circomlib` (**LGPL-3.0**) are a
+design/comparison reference for the deployed constants, used ONLY by being
+*run* or *digested*: `vectors_test.zig`'s circomlibjs known answers are
+produced by executing the library (`tools/gen_vectors.mjs`), never read out of
+its sources, and `constants_test.zig` pins SHA-256 digests of tables this
+module derives itself. No circomlib or circomlibjs source or data is present,
+so their copyleft terms do not reach this repository, and neither reference
+imposes a condition beyond MIT's own.
 
 ## Read this first
 
@@ -104,16 +106,18 @@ match Filecoin's `neptune` or dusk, which use domain tags. See `SPEC.md`.
 ## Anchoring
 
 Grade 1 — published vectors and reference-implementation output, byte-exact —
-throughout. Three upstream sources, each with its retrieval command recorded
+throughout. Two upstream sources, each with its retrieval command recorded
 in the test files rather than summarised:
 
 * `hadeshash/code/test_vectors.txt` — the Poseidon authors' permutation KATs,
   all four GF(p) instances, every output word;
-* `circomlibjs/test/poseidon.js` — the deployed reference implementation's own
-  known answers, including non-zero initial state and multi-output;
-* circomlibjs **executed** — a `t = 2..17` sweep with the optimized and the
-  reference JS implementations required to agree, so every published width and
-  every `N_ROUNDS_P` entry is covered.
+* circomlibjs **executed** — `tools/gen_vectors.mjs`, which runs the optimized
+  and the reference JS implementations and requires them to agree. It covers
+  the input sets upstream's own suite exercises (non-zero initial state,
+  multi-output) *and* a `t = 2..17` sweep, so every published width and every
+  `N_ROUNDS_P` entry is included. Nothing is transcribed from circomlibjs'
+  test file: it is GPL-3.0, and this repository runs it rather than reading
+  it (see [`NOTICE`](NOTICE)).
 
 The round constants and MDS matrices are separately pinned by SHA-256 against
 `circomlibjs/src/poseidon_constants.json` (all 16 BN254 widths) and the

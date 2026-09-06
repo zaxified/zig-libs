@@ -43,7 +43,9 @@ Primary, in the order they were consulted:
    (`circuits/poseidon.circom`, `circuits/poseidon_constants.circom`,
    and their `_old` counterparts) and `iden3/circomlibjs`
    (`src/poseidon_reference.js`, `src/poseidon_opt.js`,
-   `src/poseidon_constants.json`, `test/poseidon.js`).
+   `src/poseidon_constants.json`). Both are copyleft — circomlibjs GPL-3.0,
+   circomlib LGPL-3.0 — so they are consulted as behaviour, by being run, and
+   nothing is copied out of them; see this module's `NOTICE`.
 
 The paper and the deployed implementation **do not conflict on the function**.
 They conflict on nothing that changes a digest, which was the thing worth
@@ -163,14 +165,14 @@ coverage.
 **What the tests actually contain.** circomlibjs JSON consts byte-identical (constants_test.zig)
 
 Grade 1 (published vectors / reference-implementation output) throughout —
-this repo's strongest tier. Three upstream sources, each with the exact
+this repo's strongest tier. Two upstream sources, each with the exact
 retrieval command recorded in `src/vectors_test.zig` and
 `src/constants_test.zig`:
 
 | what | source | covers |
 |---|---|---|
 | permutation KATs | `hadeshash/code/test_vectors.txt` | BN254 `t = 3, 5`; BLS12-381 `t = 3, 5` — all `t` output words |
-| hash-framing KATs | `circomlibjs/test/poseidon.js` | `Poseidon(1/2/4/6/16)`, non-zero initial state, multi-output |
+| hash-framing KATs | circomlibjs *executed* (`tools/gen_vectors.mjs`), on the input sets upstream's own suite exercises | `Poseidon(1/2/4/6/16)`, non-zero initial state, multi-output |
 | width sweep | circomlibjs *executed* (`poseidon_reference.js` and `poseidon_opt.js`, required to agree) | every `t = 2..17`, plus inputs at `r-1` |
 | constants | `circomlibjs/src/poseidon_constants.json`; `hadeshash/code/poseidonperm_x5_25{4,5}_3.sage` | SHA-256 pins for all 18 shipped tables + literal spot values |
 

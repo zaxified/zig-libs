@@ -4,17 +4,27 @@
 //! Anchoring grade, in this repo's vocabulary:
 //!
 //!   * **Grade 1 — published vectors / reference-implementation output.**
-//!     Everything in this file. Three independent upstream sources, each
-//!     listed with the exact command that produced the numbers:
+//!     Everything in this file. Two independent upstream sources, each listed
+//!     with the exact command that produced the numbers:
 //!
 //!     1. `hadeshash/code/test_vectors.txt` — the Poseidon *authors'* own
 //!        permutation vectors, for all four GF(p) instances they publish.
-//!     2. `circomlibjs/test/poseidon.js` — the known-answer values in the
-//!        deployed reference implementation's own test suite.
-//!     3. circomlibjs *executed* — a width sweep produced by running
-//!        `poseidon_reference.js` and `poseidon_opt.js` and requiring the two
-//!        to agree, so all 16 published widths are covered rather than only
-//!        the three the upstream suite happens to exercise.
+//!     2. circomlibjs *executed* — the deployed reference implementation run
+//!        as a black box by `tools/gen_vectors.mjs`, which computes every
+//!        value twice (`poseidon_reference.js` and `poseidon_opt.js`, whose
+//!        MDS storage and round folding differ) and requires the two to agree,
+//!        so agreement is evidence about the *parameters* and not about one
+//!        code path.
+//!
+//!     Nothing below is read out of circomlibjs' sources. That is a licence
+//!     boundary, not a preference: circomlibjs is GPL-3.0, so a value
+//!     transcribed from its test suite would be copyleft-licensed data sitting
+//!     in an MIT tree, while a value obtained by running it is this
+//!     repository's own measurement of a black box (root NOTICE §0, and this
+//!     module's NOTICE). Which *inputs* to feed it is a separate question, and
+//!     the sets used here are the ones upstream's own suite exercises — that
+//!     is a choice of inputs, recorded in the generator; every *answer* is
+//!     computed, never copied.
 //!
 //!   * Grade 2 (independent re-derivation) and grade 3 (self round-trip) are
 //!     **not** what this file rests on. A grade-2 cross-check did happen
@@ -29,26 +39,21 @@
 //! git clone --depth 1 https://extgit.iaik.tugraz.at/krypto/hadeshash.git
 //! cat hadeshash/code/test_vectors.txt          # source 1, verbatim below
 //!
-//! git clone --depth 1 https://github.com/iden3/circomlibjs.git
-//! sed -n '20,40p' circomlibjs/test/poseidon.js # source 2 (decimal there)
+//! # source 2 — every circomlibjs-derived value in this file, in one run
+//! git clone --depth 1 https://github.com/iden3/circomlibjs.git .zig-cache/circomlibjs
+//! (cd .zig-cache/circomlibjs && bun install)   # node + npm work too
+//! bun modules/poseidon/tools/gen_vectors.mjs .zig-cache/circomlibjs
 //! ```
 //!
-//! Source 3, the width sweep — `bun install` in the circomlibjs clone, then
-//! run this from inside it (node works too; `bun` is what was used here):
+//! Clone into a disposable directory — `.zig-cache/` here, which is
+//! gitignored. Neither the checkout nor its `node_modules` may ever enter this
+//! tree; the library is *run*, never vendored.
 //!
-//! ```js
-//! // gen_vectors.mjs
-//! import buildPoseidonReference from "./src/poseidon_reference.js";
-//! import buildPoseidonOpt from "./src/poseidon_opt.js";
-//! const ref = await buildPoseidonReference(), opt = await buildPoseidonOpt();
-//! const F = ref.F, hex = (x) => F.toObject(x).toString(16).padStart(64, "0");
-//! for (let n = 1; n <= 16; n++) {
-//!   const inputs = Array.from({length: n}, (_, i) => i + 1);
-//!   const r = hex(ref(inputs)), o = hex(opt(inputs));
-//!   if (r !== o) throw new Error("ref != opt");   // cross-check, not decoration
-//!   console.log("t=" + (n + 1) + " " + r);
-//! }
-//! ```
+//! Last run 2026-09-06 against circomlibjs 0.1.8, commit
+//! `48b3ab37013c5ed21e9ff8a80a5b010795c97094`. All 29 distinct values it
+//! printed matched what was already committed here byte for byte, which is the
+//! expected outcome — Poseidon is deterministic, so what this run changed is
+//! the provenance of these numbers, not the numbers.
 
 const std = @import("std");
 const bn = @import("bn254_poseidon.zig");
@@ -85,11 +90,9 @@ test "hadeshash poseidonperm_x5_254_3 (BN254, t=3)" {
 // bug that special-cases zero (a stray `if (x.isZero()) return x/state`
 // shortcut, an S-box that mishandles `0^5`, an MDS row that only mixes
 // nonzero entries correctly) would be invisible to all of them. This vector
-// — capacity element AND both inputs zero — is source 3's methodology
-// (circomlibjs `poseidon_reference.js`/`poseidon_opt.js`, executed, cross-
-// checked against each other) applied to `inputs=[0,0]`, `initState=0`,
-// `nOut=3`, so it pins the full permuted state exactly like the hadeshash
-// vector above, not just one hash output.
+// — capacity element AND both inputs zero — is `tools/gen_vectors.mjs` run
+// on `inputs=[0,0]`, `initState=0`, `nOut=3`, so it pins the full permuted
+// state exactly like the hadeshash vector above, not just one hash output.
 test "circomlibjs (executed): the all-zero permutation state (BN254, t=3)" {
     const P = bn.Perm(3).init();
     const out = P.permute(.{ bn.Fr.zero, bn.Fr.zero, bn.Fr.zero });
@@ -134,12 +137,16 @@ test "hadeshash poseidonperm_x5_255_5 (BLS12-381, t=5)" {
     try expectFr("03ff622da276830b9451b88b85e6184fd6ae15c8ab3ee25a5667be8592cce3b1", out[4]);
 }
 
-// ── source 2: circomlibjs' own test suite ────────────────────────────────────
+// ── circomlibjs executed: the cases upstream's own suite exercises ─────────
 //
-// `circomlibjs/test/poseidon.js`. Values are decimal there; the hex below is
-// `int(v).to_bytes(32, "big").hex()`. These exercise the *hash* framing —
-// state `[initialState] ++ inputs` — including the non-zero `initialState`
-// and multi-output paths that `hadeshash` does not cover.
+// Produced by `tools/gen_vectors.mjs` (see the module doc for the command).
+// The input sets are the ones `circomlibjs/test/poseidon.js` covers; the
+// answers are this repository's own, computed by running the library, not
+// read out of that file. These exercise the *hash* framing — state
+// `[initialState] ++ inputs` — including the non-zero `initialState` and the
+// multi-output paths that `hadeshash` does not cover. Each test still names
+// the upstream `it(...)` whose input set it borrows, so the two suites stay
+// comparable case by case.
 
 test "circomlibjs Poseidon(2) and Poseidon(4)" {
     // it("Should check constrain reference implementation poseidonperm_x5_254_3")
@@ -204,13 +211,13 @@ test "circomlibjs Poseidon with n outputs" {
     try expectFr("136b35876ea275fe30d8721944a1fc499fa2e9bf81a1711074ccb0d6023936ba", o3[2]);
 }
 
-// ── source 3: circomlibjs executed, every published width ────────────────────
+// ── circomlibjs executed: every published width ────────────────────────────
 //
 // `Poseidon(n)` over inputs `[1, 2, …, n]` for n = 1..16, i.e. t = 2..17.
 // This is the test with the most teeth in the file: it touches every entry of
 // `N_ROUNDS_P` and every derived MDS matrix, so a width-indexing slip or a
 // single wrong round count cannot hide behind the three widths the upstream
-// suite happens to exercise. Produced by `gen_vectors.mjs` above, with the
+// suite happens to exercise. Produced by `tools/gen_vectors.mjs`, with the
 // optimized and the reference JS implementations required to agree.
 
 const width_sweep = [16]*const [64:0]u8{
@@ -242,7 +249,7 @@ test "circomlibjs width sweep, t = 2..17" {
 }
 
 test "circomlibjs, inputs at the top of the field" {
-    // Same source, `gen_vectors.mjs` with inputs `[r-1, r-1]`. The largest
+    // Same generator, with inputs `[r-1, r-1]`. The largest
     // canonical element is where a sloppy reduction or an off-by-one in
     // `fromBytes` shows up and small-integer inputs never would.
     const P = bn.Perm(3).init();
