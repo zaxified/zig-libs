@@ -57,11 +57,19 @@ fragmentation/reassembly, RFC 9147 §7 ACK + retransmission timer + flight
 bookkeeping, and the handshake message bodies incl. the PSK and cert-mode
 extensions.
 
-**Third-party interop (`src/wolfssl_interop.zig`):** real DTLS 1.3
-handshakes over a loopback UDP socket against **wolfSSL 5.9.1**, each
-followed by an application-data round trip. The peer is a small C program
-compiled at test time; the tests skip loudly when `cc` or wolfSSL is missing
-(`sudo apt install libwolfssl-dev`). Covered live:
+**Third-party interop — taken live, replayed hermetically.** The module
+itself ships no foreign source and needs no C compiler. Fourteen real DTLS 1.3
+handshakes against **wolfSSL 5.9.1** over a loopback UDP socket, each followed
+by an application-data round trip, are run by `tools/interop.zig` — a
+standalone program *outside* the module (`zig build interop-dtls`, needs
+`sudo apt install libwolfssl-dev`). What it records into
+`src/testdata/wolfssl_transcript.txt` — every datagram in both directions, the
+seed, the configuration and the post-handshake assertions — is replayed
+byte-for-byte by `src/wolfssl_replay.zig` in `zig build test-dtls`, in pure
+Zig, with no wolfSSL, no C compiler, no child process and no socket. The
+replay is what runs per commit; the live program is the pre-release check and
+the only thing that can find a NEW divergence. Covered live, and in the
+recording:
 
 - **PSK, both roles** — our client against its server, our server against
   its client;
@@ -306,7 +314,10 @@ missing extension until you know to look.
 ## Verify
 
 ```sh
-zig build test-dtls
+zig build test-dtls        # includes the hermetic wolfSSL replay; needs nothing external
+zig build check-interop    # compiles the live interop program without running it
+zig build interop-dtls     # runs the live wolfSSL handshakes (needs libwolfssl-dev + cc)
+zig build interop-dtls -- --capture   # ...and re-records src/testdata/wolfssl_transcript.txt
 ```
 
 ## Provenance

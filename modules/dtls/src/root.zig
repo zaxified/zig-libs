@@ -94,9 +94,14 @@
 //!   hasn't arrived. Proven by an in-memory client↔server interop test —
 //!   no external DTLS peer required (see `Connection.zig`'s tests).
 //!
-//!   ALSO proven against a THIRD-PARTY stack: `wolfssl_interop.zig` runs a
-//!   real DTLS 1.3 PSK handshake over a loopback UDP socket against wolfSSL
-//!   5.9.1 in both roles, each followed by an application-data round trip.
+//!   ALSO proven against a THIRD-PARTY stack: `tools/interop.zig` — a
+//!   standalone program OUTSIDE this module, so nothing here ships or
+//!   compiles foreign source — runs real DTLS 1.3 PSK handshakes over a
+//!   loopback UDP socket against wolfSSL 5.9.1 in both roles, each followed
+//!   by an application-data round trip, and records them into
+//!   `testdata/wolfssl_transcript.txt`. `wolfssl_replay.zig` replays that
+//!   recording in pure Zig, with no wolfSSL and no C compiler, so the
+//!   anchor's value runs everywhere while the taking of it does not.
 //!   That mattered: self-interop passed for four separate wire defects
 //!   (missing `legacy_cookie`, a PSK-binder transcript two bytes too long,
 //!   no `supported_versions` in either Hello, and no §7 ACK for the client's
@@ -120,7 +125,7 @@
 //!   bounds" section for the sizing argument. SENDING is still
 //!   single-fragment: this engine never splits a message it emits.
 //!
-//!   Certificate mode is ALSO live now: `wolfssl_interop.zig` drives a
+//!   Certificate mode is ALSO live now: `tools/interop.zig` drives a
 //!   PSK-less `.cert_dhe` handshake (X25519 (EC)DHE + an ECDSA P-256 chain
 //!   verified against this repo's own trust anchor) against a real wolfSSL
 //!   certificate server, and repeats it at a 256-byte peer MTU where
@@ -402,7 +407,7 @@ test {
     _ = connection;
     _ = certverify;
     _ = certauth;
-    _ = @import("wolfssl_interop.zig");
+    _ = @import("wolfssl_replay.zig");
 }
 
 test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing + Connection.zig's ChaCha20-Poly1305 suite; the PSK flight engine itself needs no sibling modules)" {

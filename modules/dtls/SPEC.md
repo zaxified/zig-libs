@@ -324,9 +324,46 @@ follow-up.
 
 ## Live third-party interop — done, and what it cost
 
-`src/wolfssl_interop.zig` runs a real DTLS 1.3 PSK handshake over a loopback
-UDP socket against **wolfSSL 5.9.1**, in both roles, each followed by an
-application-data round trip.
+`tools/interop.zig` runs real DTLS 1.3 handshakes over a loopback UDP socket
+against **wolfSSL 5.9.1**, in both roles and in both PSK and certificate mode,
+each followed by an application-data round trip — fourteen cases in all.
+
+**It is a PROGRAM, not a test, since 2026-09-06, and that is the design.** A
+zig-libs module is standalone Zig with no external dependency; an anchor against
+a foreign implementation needs a C compiler and a system library. Those two used
+to live in one file (`src/wolfssl_interop.zig`, compiled into `test-dtls`), so
+the module shipped 555 lines of C, `zig build test-dtls` wanted a toolchain it
+had no business wanting, and where that toolchain was missing all fourteen cases
+skipped — silently, in CI, where the peer install is `continue-on-error`. The
+split:
+
+- `tools/interop.zig` + `tools/wolfssl_peer.c` — outside the module, run by
+  `zig build interop-dtls`, compiled (never run) by `zig build check-interop`.
+  This is the only thing that can discover a NEW divergence, and it is a
+  pre-release check.
+- `src/testdata/wolfssl_transcript.txt` — what `--capture` records: every
+  datagram in both directions, plus the seed, configuration and post-handshake
+  assertions each case ran with.
+- `src/wolfssl_replay.zig` — replays that transcript in pure Zig, with no
+  wolfSSL, no C compiler, no child process and no socket, so the anchor's value
+  runs in the per-commit lane.
+
+**What pins the replay.** Our side draws every random byte from the
+caller-supplied `Entropy` (std 0.16 removed `std.crypto.random`, so the module
+has no hidden generator), and the live runs have always used its
+`.seeded_for_test` arm from a fixed seed — originally so a failing interop run
+could be re-run byte-for-byte. Nothing was added, weakened or stubbed to make
+the replay deterministic; the transcript records the seed and the replay reads
+it back.
+
+**What the replay cannot do**, stated because a green run is weaker than it
+looks: it cannot discover a new divergence (the peer's bytes are frozen at one
+release); a failure is not proof of non-interoperability (a change that emits
+different-but-still-valid bytes fails it without any peer having refused
+anything — re-run the live program, and re-capture if it is green); and it
+cannot re-check what was never on the wire — the peer's exit status, its
+`wolfSSL_get_verify_result` and the `PEERCERT` subject it printed were checked
+when the recording was taken and are kept in the file as comments.
 
 **The oracle ranking this section used to carry was wrong, and the error was
 not a detail.** It ranked OpenSSL first on the claim that "OpenSSL 3.2+ has
@@ -338,9 +375,11 @@ backlog entry that read "blocked: no DTLS 1.3 peer exists" for as long as
 nobody checked what could be *installed*. wolfSSL was packaged the whole
 time (`libwolfssl-dev`, built with `WOLFSSL_DTLS13`).
 
-The peer is a ~170-line C program (`src/testdata/wolfssl_peer.c`) embedded
-into the test and compiled with `cc` at test time, so the test carries its
-own oracle; it skips loudly when `cc` or wolfSSL is absent.
+The peer is a 555-line C program (`tools/wolfssl_peer.c`), read from its own
+path and compiled with `cc -lwolfssl` when `zig build interop-dtls` runs. It is
+not embedded in anything and it is not part of the shipped module; the program
+fails with an actionable message (`sudo apt install libwolfssl-dev`) rather than
+skipping, because unlike a test it is allowed to require its peer.
 
 ### What it found
 
@@ -494,4 +533,4 @@ two `Connection`s written from the same reading of the RFC cannot see.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** live interop vs real wolfSSL 5.9.1 peer, both roles, multiple flows
+**What the tests actually contain.** a committed transcript of live interop vs a real wolfSSL 5.9.1 peer (both roles, both key exchanges, fourteen flows), replayed byte-for-byte by `src/wolfssl_replay.zig` with no wolfSSL present; the live exchanges themselves are `tools/interop.zig` (`zig build interop-dtls`)

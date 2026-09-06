@@ -1,11 +1,18 @@
-// A real third-party DTLS 1.3 peer for `wolfssl_interop.zig` — wolfSSL in
-// either role, speaking PSK-only DTLS 1.3 on loopback.
+// A real third-party DTLS 1.3 peer for `tools/interop.zig` — wolfSSL in
+// either role, speaking DTLS 1.3 on loopback.
+//
+// THIS FILE IS NOT PART OF THE `dtls` MODULE. It lives beside the program that
+// compiles it, outside `src/`, because a zig-libs module is standalone Zig with
+// no external dependency; it used to sit in `src/testdata/` only because the
+// test `@embedFile`d it and a module may not embed a file outside its own
+// package root. `tools/interop.zig` now reads it from this path at run time.
 //
 //   cc -o wolfssl_peer wolfssl_peer.c -lwolfssl
 //   ./wolfssl_peer server <port>      # prints READY, then accepts + echoes
 //   ./wolfssl_peer server-hrr <port>  # same, but with the DEFAULT cookie
 //                                     # exchange (HelloRetryRequest) left on
 //   ./wolfssl_peer client <port>      # connects, sends, expects the echo
+//   ./wolfssl_peer version            # prints the runtime wolfSSL version
 //   ./wolfssl_peer server-cert <port> [mtu]
 //                                     # PSK-LESS certificate server: X25519
 //                                     # (EC)DHE + an ECDSA P-256 chain read
@@ -67,7 +74,7 @@
 //     This module also has ChaCha20-Poly1305; CCM is unwired (std nonce
 //     width), which is why the CoAP-profile default suite is not used here.
 //
-// The PSK and identity below are fixtures duplicated in wolfssl_interop.zig;
+// The PSK and identity below are fixtures duplicated in `tools/interop.zig`;
 // they are test material, never a default for anything.
 
 #include <arpa/inet.h>
@@ -489,12 +496,20 @@ static int run_client(int port) {
 }
 
 int main(int argc, char **argv) {
+    // `version` prints the RUNTIME library version and exits. The recorder
+    // stamps the committed transcript with whatever this prints, so the header
+    // names the wolfSSL that actually produced the bytes -- not a constant in
+    // the Zig side that a package upgrade would leave behind.
+    if (argc == 2 && strcmp(argv[1], "version") == 0) {
+        printf("%s\n", wolfSSL_lib_version());
+        return 0;
+    }
     if (argc != 3 && argc != 4) {
         fprintf(stderr,
                 "usage: %s server|server-hrr|server-cert|server-cert-hrr|"
                 "server-cert-p256|server-cert-p256-hrr|server-cert-mlkem|"
                 "server-cert-mutual|client|client-cert|client-cert-mlkem "
-                "<port> [mtu]\n",
+                "<port> [mtu] | version\n",
                 argv[0]);
         return 2;
     }

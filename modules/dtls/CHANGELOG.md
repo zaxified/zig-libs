@@ -5,6 +5,58 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-06** — **The module stops shipping foreign source.** The live
+  wolfSSL interop moved out of `src/` and became a standalone program; what it
+  proves moved *in*, as a committed recording.
+
+  **Consumer-visible:** `modules/dtls/src/wolfssl_interop.zig` and
+  `modules/dtls/src/testdata/wolfssl_peer.c` are gone. A consumer of this
+  module no longer receives 555 lines of C, and `zig build test-dtls` no longer
+  wants a C compiler or `libwolfssl-dev` for anything: it went from *266 pass /
+  14 skip* to *268 pass / 0 skip* on a host with no `cc`, `gcc`, `clang` or
+  `ld` on `PATH`. The fourteen skips were not a small loss — CI installs the
+  peer with `continue-on-error`, so a failed install degraded the entire
+  third-party anchor to a silent skip.
+
+  The pieces now:
+
+  - `tools/interop.zig` — the live handshakes, a program, run by
+    `zig build interop-dtls` and compiled (never run) by
+    `zig build check-interop`. It reads `tools/wolfssl_peer.c` from its own
+    path at run time instead of `@embedFile`ing it, which is what had forced
+    the C to live under `src/` in the first place. All fourteen cases pass
+    against wolfSSL 5.9.1.
+  - `src/testdata/wolfssl_transcript.txt` — what `--capture` writes: every
+    datagram in both directions, the seed, the configuration and the
+    post-handshake assertions for each case, with a header naming the wolfSSL
+    version, the date and the exact command.
+  - `src/wolfssl_replay.zig` — replays it in pure Zig, no child process, no
+    socket. A seven-mutation sweep over the fixture (a peer byte, one of our
+    bytes, the seed, a dropped case, a changed `expect group=`, an
+    application-record byte, a changed skip-error) is caught 7/7.
+
+  **The replay is deterministic because the module already had the seam.**
+  Randomness comes from the caller-supplied `Entropy`, and the live runs have
+  used its `.seeded_for_test` arm from a fixed seed since they were written.
+  Nothing was added, weakened, or asserted-on-a-stable-subset to make the
+  recording replay.
+
+  **What the replay cannot do**, recorded so a green run is not overread: it
+  cannot discover a NEW divergence (the peer's bytes are frozen at wolfSSL
+  5.9.1); a failure is a summons to re-run the live program, not a verdict of
+  non-interoperability, because a change that emits different-but-still-valid
+  bytes fails it too; and it cannot re-check anything that was not on the wire
+  — the peer's exit status, its `wolfSSL_get_verify_result` and the `PEERCERT`
+  subject it printed are kept in the transcript as comments precisely because
+  only the live run can check them.
+
+  **Also:** `src/certauth_kat_vectors.zig`'s hex literals became
+  `@embedFile`s of `src/testdata/certs/*` (identical bytes, identical types).
+  The interop program cannot import across the module's package root, and both
+  sides must hand wolfSSL the same anchor and leaf — a second hex literal in
+  `tools/` would have been a second thing to keep in step. `SPEC.md` called the
+  peer "~170-line"; it is 555.
+
 - **2026-08-31** — Post-quantum hybrid key exchange: `.cert_dhe` now speaks
   **X25519MLKEM768** (`0x11ec`, draft-ietf-tls-ecdhe-mlkem) alongside
   X25519 and secp256r1 — the last TLS-family path in this collection with

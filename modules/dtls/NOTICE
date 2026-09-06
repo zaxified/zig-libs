@@ -49,4 +49,28 @@ handshake framing/fragmentation, flight/ACK logic, and message-body framing
 tested. `Connection.startHandshake` (the handshake flight engine) is not yet
 built.
 
+Committed test data
+-------------------
+
+Everything under `src/testdata/` was produced by this repository's own tooling
+on this repository's own machines; none of it is reproduced from a third party,
+so none of it carries an upstream condition.
+
+  * `src/testdata/certs/*.der`, `*.bin` — the fixture X.509 chain and its raw
+    private scalars, generated with OpenSSL 3.5.5 (`openssl req -x509 …` /
+    `openssl x509 -req … -CA …`). They are on disk rather than as hex literals
+    in `src/certauth_kat_vectors.zig` because the live interop program, which
+    is outside this module and cannot import across the package root, must hand
+    wolfSSL the SAME bytes the Zig side trusts. Test material only; used
+    nowhere outside this repository's tests.
+  * `src/testdata/wolfssl_transcript.txt` — a capture of this module's own
+    handshakes against a locally installed wolfSSL 5.9.1, recorded by
+    `tools/interop.zig`. It contains bytes wolfSSL emitted on a loopback
+    socket; it contains no wolfSSL source, and wolfSSL is neither linked nor
+    vendored here.
+
+`tools/wolfssl_peer.c` is original work written in this repository against
+wolfSSL's public API; it is not part of the shipped module and is compiled
+only by `zig build interop-dtls`.
+
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.

@@ -7017,7 +7017,8 @@ test "hybrid X25519MLKEM768: peer-supplied garbage is a typed error, never a pan
 
 // ── HelloRetryRequest in `.cert_dhe` mode (RFC 8446 §4.1.4's (EC)DHE half) ──
 //
-// The live wolfSSL tests (`wolfssl_interop.zig`) are the ORACLE for this
+// The live wolfSSL exchanges (`tools/interop.zig`, replayed hermetically by
+// `wolfssl_replay.zig`) are the ORACLE for this
 // path — a real server naming secp256r1, and the handshake then completing
 // on P-256. What follows are the checks a live peer cannot make for us:
 // what ClientHello2 is allowed to contain, and which retries must be
