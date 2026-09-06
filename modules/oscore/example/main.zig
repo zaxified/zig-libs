@@ -5,8 +5,11 @@
 //! full request/response exchanges (the module's own state — the Sender
 //! Sequence Number and the Recipient's `ReplayWindow` — carries across
 //! them, which a single-shot vector test can never exercise), reject a
-//! replayed request by name, and reject a tampered ciphertext by name
-//! without leaking the buffer it allocated for the failed decrypt.
+//! replayed request by name, reject a tampered ciphertext by name without
+//! leaking the buffer it allocated for the failed decrypt, and — after a
+//! simulated reboot — show the RFC 8613 §7.5 hazard (a re-derived context
+//! accepts the old request again) and Appendix B.1's recovery on both
+//! sides (`resumeAfterRestart`, `resumeAtLowerLimit`).
 //!
 //! The RESPONSE side deliberately does NOT call `protect` — RFC 8613 §5.2
 //! says a response "typically" reuses the ORIGINAL REQUEST's nonce and
@@ -238,6 +241,82 @@ pub fn main() !void {
     defer gpa.free(server_view3);
     must(std.mem.eql(u8, server_view3, request3_plaintext), @src());
     std.debug.print("round3 request (after rejected forgery, same seq#): server recovered {s}\n", .{server_view3});
+
+    // ── Reboot: what RFC 8613 §7.5 / Appendix B.1 asks of the CALLER ────
+    // The Sender Sequence Number and the ReplayWindow are RAM state. A
+    // re-derived context restarts at Partial IV 0 — under the SAME keys as
+    // round 1 — and its empty window accepts round 1's captured request
+    // again. The module supplies the arithmetic (B.1.1 checkpoint/resume,
+    // B.1.2 lower limit); this example plays the nonvolatile storage.
+    const k: u64 = 2; // checkpoint every 2nd sequence number (tiny, to fire here)
+    var nonvolatile_ssn: u64 = 0;
+    // The client protected sequence numbers 0, 1, 2 above; B.1.1 stores the
+    // value BEFORE the protect that consumes a multiple of K — replaying that
+    // discipline over the three sends gives checkpoints at 0 and 2.
+    var replayed_ssn: u64 = 0;
+    while (replayed_ssn < client_ctx.sender.sequence_number) : (replayed_ssn += 1) {
+        const probe = oscore.SenderContext{ .id = client_id, .key = client_ctx.sender.key, .sequence_number = replayed_ssn };
+        if (probe.needsCheckpoint(k)) nonvolatile_ssn = replayed_ssn;
+    }
+    must(nonvolatile_ssn == 2, @src());
+
+    var client_after = try oscore.deriveContext(gpa, &master_secret, master_salt, null, client_id, server_id, .aes_ccm_16_64_128);
+    var server_after = try oscore.deriveContext(gpa, &master_secret, master_salt, null, server_id, client_id, .aes_ccm_16_64_128);
+    must(client_after.sender.sequence_number == 0, @src()); // the hazard, as derived
+    must(std.mem.eql(u8, &client_after.sender.key, &client_ctx.sender.key), @src()); // same keys
+
+    // B.1.1 on the client: SSN2 = SSN1 + K + F = 2 + 2 + 1 = 5, strictly above
+    // every number (0..2) the pre-reboot process used.
+    try client_after.sender.resumeAfterRestart(nonvolatile_ssn, k, 1);
+    must(client_after.sender.sequence_number == 5, @src());
+    must(client_after.sender.sequence_number > protected3.option.partial_iv.?, @src());
+
+    // B.1.2 on the server: the first request after the reboot is verified
+    // FRESH by the CoAP layer (Echo option, RFC 9175 — not modelled here);
+    // its Partial IV becomes the window's lower limit.
+    // Own Partial IV buffers from here on: `aad1_server.request_piv` still
+    // points into `piv_buf`, and round 1's AAD is replayed below.
+    var piv_buf4: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    var piv_buf5: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const request4_plaintext = "\x01" ++ "\xff" ++ "after?";
+    const req4_piv_bytes = oscore.OscoreOption.encodePartialIv(client_after.sender.sequence_number, &piv_buf4);
+    const req4_aad = oscore.AadParams{ .request_kid = client_after.sender.id, .request_piv = req4_piv_bytes };
+    const protected4 = try oscore.protect(gpa, &client_after, request4_plaintext, req4_aad, true, null);
+    defer gpa.free(protected4.ciphertext);
+    server_after.recipient.replay_window.resumeAtLowerLimit(protected4.option.partial_iv.?);
+
+    // Round 1's captured request — accepted by a NAIVELY re-derived server,
+    // rejected by name once the lower limit is set. Its AAD is rebuilt with
+    // round 1's own Partial IV (0): `piv_buf` was reused by rounds 2 and 3
+    // above, so `aad1_server.request_piv` no longer reads 0x00 — the earlier
+    // replay check never noticed because `Replayed` fires before the AAD is
+    // ever compared, while the naive server below gets as far as the AEAD.
+    var piv_buf1_again: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const aad1_again = oscore.AadParams{ .request_kid = decoded_option1.kid.?, .request_piv = oscore.OscoreOption.encodePartialIv(0, &piv_buf1_again) };
+    {
+        var naive_server = try oscore.deriveContext(gpa, &master_secret, master_salt, null, server_id, client_id, .aes_ccm_16_64_128);
+        const accepted = try oscore.unprotect(gpa, &naive_server, decoded_option1, protected1.ciphertext, aad1_again, null, true);
+        gpa.free(accepted);
+        std.debug.print("reboot WITHOUT B.1.2: round1 request replayed and ACCEPTED (the hazard)\n", .{});
+
+        const result = oscore.unprotect(gpa, &server_after, decoded_option1, protected1.ciphertext, aad1_again, null, true);
+        if (result) |_| {
+            return error.UnexpectedAccept;
+        } else |err| switch (err) {
+            error.Replayed => std.debug.print("reboot WITH B.1.2 lower limit: round1 request Replayed (expected)\n", .{}),
+            else => return err,
+        }
+    }
+    // The next genuine request after the fresh one is accepted.
+    const request5_plaintext = "\x01" ++ "\xff" ++ "next?";
+    const req5_piv_bytes = oscore.OscoreOption.encodePartialIv(client_after.sender.sequence_number, &piv_buf5);
+    const req5_aad = oscore.AadParams{ .request_kid = client_after.sender.id, .request_piv = req5_piv_bytes };
+    const protected5 = try oscore.protect(gpa, &client_after, request5_plaintext, req5_aad, true, null);
+    defer gpa.free(protected5.ciphertext);
+    const server_view5 = try oscore.unprotect(gpa, &server_after, protected5.option, protected5.ciphertext, req5_aad, null, true);
+    defer gpa.free(server_view5);
+    must(std.mem.eql(u8, server_view5, request5_plaintext), @src());
+    std.debug.print("after reboot: resumed client sealed at piv={d}, server recovered {s}\n", .{ protected5.option.partial_iv.?, server_view5 });
 
     std.debug.print("oscore example: OK\n", .{});
 }

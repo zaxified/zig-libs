@@ -91,6 +91,46 @@ if (rw.check(seq)) {
 }
 ```
 
+### Surviving a restart (RFC 8613 §7.5 / Appendix B.1)
+
+`sender.sequence_number` and `recipient.replay_window` are RAM state.
+Re-deriving the same context after a reboot restarts the nonce sequence
+at 0 (a two-time pad against every message already sent) and forgets
+every request already accepted (every captured request replays). A
+context that outlives the process needs the caller to persist and resume
+that state — the module supplies the arithmetic, the caller the storage:
+
+```zig
+// Sending side, B.1.1: checkpoint every K messages, BEFORE protect.
+const k: u64 = 64;
+if (client_ctx.sender.needsCheckpoint(k)) try nonvolatile.write(client_ctx.sender.sequence_number);
+const protected = try oscore.protect(allocator, &client_ctx, plaintext, aad, true, null);
+
+// ... reboot ...
+var client_ctx = try oscore.deriveContext(allocator, master_secret, master_salt, id_context, sender_id, recipient_id, .aes_ccm_16_64_128);
+// SSN2 = SSN1 + K + F; F covers the storage's own write delay.
+try client_ctx.sender.resumeAfterRestart(try nonvolatile.read(), k, 1);
+
+// Receiving side, B.1.2: once the CoAP layer has verified ONE request as
+// fresh after the reboot (Echo option, RFC 9175), its Partial IV becomes
+// the window's lower limit — everything at or below it is a replay.
+server_ctx.recipient.replay_window.resumeAtLowerLimit(fresh_request_option.partial_iv.?);
+```
+
+Or derive a fresh context from new randomness (Appendix B.2) — new keys
+make both problems disappear. What is NOT safe is doing neither. See
+[SPEC.md](SPEC.md) "Persistence" for why `highest_seen`/`mask` must not
+simply be stored and reloaded.
+
+### Limits `protect`/`unprotect` enforce
+
+| Limit | Constant | Error |
+|---|---|---|
+| Plaintext per message (AES-CCM 2-byte length field) | `max_plaintext_len` = 65 535 | `error.MessageTooLong` |
+| Payload `unprotect` will look at | `max_ciphertext_len` = 65 543 | `error.MessageTooLong` (before the AEAD, so never a panic) |
+| Partial IV, on BOTH paths | `max_partial_iv` = 2^40 − 1 | `error.SequenceNumberExhausted` (protect) / `error.PartialIvTooLarge` (computeNonce, unprotect) |
+| Sender/Recipient ID length | `id_piv_field_width` = 7 | `error.IdTooLong` |
+
 ## Import graph
 
 ```
@@ -111,7 +151,9 @@ zig fmt --check modules/oscore/
 `kat_test.zig` asserts byte-exact `deriveKey`/`deriveContext`/
 `computeNonce`/`buildAad`/`protect`/`unprotect` output against every RFC
 8613 Appendix C.1-C.8 value, plus a tampered-ciphertext rejection, a
-replayed-Partial-IV rejection, and an end-to-end round trip with fresh
-(non-published) key material.
+replayed-Partial-IV rejection, an end-to-end round trip with fresh
+(non-published) key material, and the guards Appendix C is blind to
+(message length, Partial IV ceiling on the receive path, real double
+delivery, Class I options in the AAD, restart recovery — see SPEC.md).
 
 Provenance: see [NOTICE](NOTICE).

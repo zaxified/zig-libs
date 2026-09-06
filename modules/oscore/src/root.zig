@@ -121,8 +121,32 @@ pub const tag_length: usize = 8;
 pub const id_piv_field_width: usize = nonce_length - 6;
 
 /// The Partial IV / Sender Sequence Number's maximum value: it must fit
-/// in the AEAD nonce's 5-byte PIV field (§5.2), i.e. `< 2^40`.
+/// in the AEAD nonce's 5-byte PIV field (§5.2), i.e. `< 2^40`. Enforced
+/// at EVERY place a Partial IV enters a nonce — `protect` (as
+/// `error.SequenceNumberExhausted`) and `computeNonce`/`unprotect` (as
+/// `error.PartialIvTooLarge`) — not only on the sending side: a
+/// `partial_iv >= 2^40` silently truncated to its low 5 bytes would
+/// collide with the nonce of `partial_iv mod 2^40`.
 pub const max_partial_iv: u64 = (1 << 40) - 1;
+
+/// AES-CCM-16-64-128's per-message plaintext ceiling. CCM (RFC 3610 §2)
+/// spends `L = 15 - nonce_length` bytes of its B_0 block on the message
+/// length; at `nonce_length == 13` that is `L = 2`, so ONE AEAD invocation
+/// covers at most `2^16 - 1 = 65 535` bytes of plaintext. `std`'s
+/// `Aes128Ccm8` states this bound only as a debug `assert` on the
+/// ENCRYPT path (nothing at all on decrypt), so `protect`/`unprotect`
+/// enforce it themselves, before any AEAD work: in Debug/ReleaseSafe the
+/// unguarded decrypt path panicked in `formatB0Block`'s `@intCast` BEFORE
+/// the tag was checked (a pre-authentication remote crash), and in
+/// ReleaseFast the encrypt path emitted a message whose length field was
+/// `len mod 2^16` — bytes no conformant CCM implementation can verify.
+/// A CoAP stack that assembles a block-wise (RFC 7959) body MUST protect
+/// each block separately; OSCORE itself never protects more than one
+/// CoAP message per AEAD call.
+pub const max_plaintext_len: usize = (1 << 16) - 1;
+/// `max_plaintext_len + tag_length`: the longest OSCORE payload
+/// (ciphertext-then-tag) `unprotect` will accept.
+pub const max_ciphertext_len: usize = max_plaintext_len + tag_length;
 
 // ── security context (RFC 8613 §3.1) ────────────────────────────────────
 
@@ -146,7 +170,47 @@ pub const SenderContext = struct {
     /// The Sender Sequence Number (§3.1/§3.2.2): starts at 0, incremented
     /// by `protect` on every successful call. Used as this endpoint's own
     /// Partial IV.
+    ///
+    /// ⚠ This is RAM state (§7.5): it does NOT survive a reboot on its
+    /// own, and re-deriving the context restarts it at 0 — which reuses
+    /// every `(key, nonce)` pair already spent, a full AES-CCM break (the
+    /// second plaintext falls out of the XOR of two ciphertexts, no key
+    /// needed). A caller whose Security Context outlives the process MUST
+    /// checkpoint it (`needsCheckpoint`) and resume it after a restart
+    /// (`resumeAfterRestart`) per Appendix B.1.1, or establish a fresh
+    /// context (§7.5 alternatives 2-4) instead.
     sequence_number: u64 = 0,
+
+    /// RFC 8613 Appendix B.1.1, the write side: "Before using a Sender
+    /// Sequence Number that is evenly divisible by K ... store the Sender
+    /// Sequence Number (SSN1) in nonvolatile memory." Returns `true` when
+    /// the NEXT `protect` call will consume a sequence number that is a
+    /// multiple of `k` — the caller then persists `sequence_number`
+    /// BEFORE calling `protect`. `k` trades storage writes for burned
+    /// sequence numbers (a restart skips up to `k + f` of them).
+    pub fn needsCheckpoint(sc: SenderContext, k: u64) bool {
+        std.debug.assert(k > 0);
+        return sc.sequence_number % k == 0;
+    }
+
+    /// RFC 8613 Appendix B.1.1, the read side after a reboot: "SSN2 =
+    /// SSN1 + K + F", where `stored` is the last value `needsCheckpoint`
+    /// had the caller persist, `k` is the SAME step it was persisted
+    /// with, and `f` (positive) covers the nonvolatile write's own delay
+    /// or failure — B.1.1: "F MUST be set so that the last Sender
+    /// Sequence Number used before reboot is never larger than SSN2", and
+    /// if no such `f` can be guaranteed for the storage at hand, this
+    /// method MUST NOT be used (re-derive with fresh randomness instead,
+    /// Appendix B.2). Fails with `error.SequenceNumberExhausted` when the
+    /// resumed value would exceed `max_partial_iv`: the context has no
+    /// safe nonce left and must be re-established (§7.2.1), never resumed.
+    pub fn resumeAfterRestart(sc: *SenderContext, stored: u64, k: u64, f: u64) error{SequenceNumberExhausted}!void {
+        std.debug.assert(k > 0 and f > 0);
+        const step = std.math.add(u64, k, f) catch return error.SequenceNumberExhausted;
+        const resumed = std.math.add(u64, stored, step) catch return error.SequenceNumberExhausted;
+        if (resumed > max_partial_iv) return error.SequenceNumberExhausted;
+        sc.sequence_number = resumed;
+    }
 };
 
 /// The Recipient Context (§3.1): the OTHER endpoint's identity + key,
@@ -163,6 +227,12 @@ pub const RecipientContext = struct {
     /// (Server only)"), but harmless to carry on a client too (a client
     /// that never receives Observe-style repeated requests simply never
     /// exercises it).
+    ///
+    /// ⚠ RAM state (§7.5): a re-derived context starts with an EMPTY
+    /// window that accepts any Partial IV, so every request captured
+    /// before the restart replays cleanly. A server whose context
+    /// outlives the process MUST NOT trust a fresh window — see
+    /// `ReplayWindow.resumeAtLowerLimit` for Appendix B.1.2's recovery.
     replay_window: ReplayWindow = .{},
 };
 
@@ -271,6 +341,31 @@ pub const ReplayWindow = struct {
         }
         // seq == highest_seen: already implicitly "seen" (check's diff==0
         // branch); nothing further to record.
+    }
+
+    /// RFC 8613 Appendix B.1.2, after a reboot lost the window: "the
+    /// Partial IV of the second request is set as the lower limit of the
+    /// Replay Window". Re-initializes the window so that `lower_limit`
+    /// AND EVERY Partial IV below it are rejected as replays, and only
+    /// `lower_limit + 1` onwards is accepted — the window is
+    /// `initialized` with `highest_seen = lower_limit` and a fully SET
+    /// mask (nothing below the mark is "unseen"), so genuinely reordered
+    /// older requests are lost too. That is the fail-closed side §7.5
+    /// mandates ("MUST NOT accept previously received messages").
+    ///
+    /// The ONLY safe sources of `lower_limit` are (a) B.1.2's own: the
+    /// Partial IV of a request the server has just verified FRESH via the
+    /// Echo option (RFC 9175) after the reboot — the caller does that
+    /// exchange, this module has no CoAP layer; or (b) a persisted
+    /// high-water mark that was written to nonvolatile memory BEFORE the
+    /// message carrying it was accepted (write-ahead), never after. A
+    /// value persisted lazily is a replay hole exactly as wide as the
+    /// messages accepted between the last write and the crash — do NOT
+    /// simply store and reload `highest_seen`/`mask`.
+    pub fn resumeAtLowerLimit(rw: *ReplayWindow, lower_limit: u64) void {
+        rw.highest_seen = lower_limit;
+        rw.mask = std.math.maxInt(u64);
+        rw.initialized = true;
     }
 };
 
@@ -719,6 +814,16 @@ pub const DeriveContextError = std.mem.Allocator.Error;
 /// `sender.sequence_number` starts at 0 (§3.2.2); `recipient.replay_window`
 /// starts at its zero value (`.initialized == false`).
 ///
+/// ⚠ Both of those are the "rapidly changing parts of the context" RFC
+/// 8613 §7.5 warns about: deriving the SAME context a second time (after
+/// a reboot, say) restarts the nonce sequence at 0 and forgets every
+/// request already accepted. Calling this twice with the same inputs is
+/// therefore safe only when the FIRST context never protected anything;
+/// otherwise resume the mutable state per Appendix B.1
+/// (`SenderContext.resumeAfterRestart`, `ReplayWindow.resumeAtLowerLimit`)
+/// or derive a fresh context from new randomness (Appendix B.2). SPEC.md
+/// "Persistence" spells out the procedure.
+///
 /// Byte-exact target: the SAME Appendix C.1-C.3 vectors as `deriveKey`,
 /// but exercised through this composed entry point.
 pub fn deriveContext(
@@ -741,6 +846,18 @@ pub fn deriveContext(
     var common_iv: [nonce_length]u8 = undefined;
     try deriveKey(allocator, master_secret, master_salt, &.{}, id_context, algorithm, .iv, &common_iv);
 
+    // The three derived values are copied into the returned context; the
+    // stack locals must not stay behind as a second, unowned copy of key
+    // material, and neither may the frames `deriveKey` -> HKDF -> HMAC
+    // just vacated BELOW this one (audit F7 read the dead stack and found
+    // the Sender Key 2-4x there; wiping only the locals changed nothing,
+    // because every copy sat in std's frames). `scrubStackBelow` reoccupies
+    // that region with a frame of its own and zeroes it.
+    defer std.crypto.secureZero(u8, &sender_key);
+    defer std.crypto.secureZero(u8, &recipient_key);
+    defer std.crypto.secureZero(u8, &common_iv);
+    defer scrubStackBelow();
+
     return .{
         .common = .{ .algorithm = algorithm, .common_iv = common_iv },
         .sender = .{ .id = sender_id, .key = sender_key },
@@ -748,7 +865,33 @@ pub fn deriveContext(
     };
 }
 
-pub const ComputeNonceError = error{IdTooLong};
+/// Zeroes a stretch of stack immediately below the caller's frame — the
+/// region the caller's own callees (std's HKDF/HMAC/AES frames) have just
+/// returned from, where they leave key schedules and expanded keys behind
+/// (`secureZero` on this module's locals cannot reach them: the audit's
+/// probe found the derived keys 2-4 times in exactly that region). The
+/// stores are volatile through `secureZero`, so the optimizer cannot drop
+/// them as dead. `noinline` so the frame really sits below the caller's.
+/// One-time cost at context derivation; not on the per-message path.
+noinline fn scrubStackBelow() void {
+    var pad: [scrub_bytes]u8 = undefined;
+    std.crypto.secureZero(u8, &pad);
+}
+/// Sized from the measured depth of `deriveKey`'s HKDF/HMAC-SHA-256 call
+/// chain in Debug (the deepest of the three modes) with headroom.
+const scrub_bytes: usize = 8 * 1024;
+
+pub const ComputeNonceError = error{
+    IdTooLong,
+    /// `partial_iv > max_partial_iv` — it does not fit the 5-byte PIV
+    /// field and would silently collide with `partial_iv mod 2^40`'s
+    /// nonce if truncated. On the receive path this reaches `unprotect`
+    /// through `request_nonce_source.partial_iv` (an unbounded `u64` the
+    /// caller tracked from an earlier request); `OscoreOption.decode`
+    /// itself can never yield one (its Partial IV field is at most 5
+    /// bytes wide by §6.1).
+    PartialIvTooLarge,
+};
 
 /// RFC 8613 §5.2's AEAD nonce construction, Figure 8, byte-exact:
 ///
@@ -776,9 +919,10 @@ pub const ComputeNonceError = error{IdTooLong};
 ///    LEFT-padded with zero bytes (e.g. a 1-byte ID `0x01` becomes
 ///    `0x00000000000001` at `id_piv_field_width == 7`).
 /// 3. `piv_padded`: 5 bytes, `partial_iv` (big-endian) right-aligned,
-///    LEFT-padded with zero bytes — always fits, since `partial_iv <=
-///    max_partial_iv` (`< 2^40`, 5 bytes' worth) is the Sender Sequence
-///    Number's own §3.1 ceiling.
+///    LEFT-padded with zero bytes — fail (`error.PartialIvTooLarge`) if
+///    `partial_iv > max_partial_iv` (`>= 2^40`): the field is never
+///    truncated to fit, because the low 5 bytes of a larger value are
+///    exactly the nonce of a smaller one.
 /// 4. `block = [S] || id_piv_padded || piv_padded` — exactly
 ///    `nonce_length` (13) bytes.
 /// 5. `nonce[i] = block[i] ^ common_iv[i]` for every byte.
@@ -791,6 +935,7 @@ pub const ComputeNonceError = error{IdTooLong};
 /// (`kat_test.zig`).
 pub fn computeNonce(common_iv: [nonce_length]u8, id_piv: []const u8, partial_iv: u64) ComputeNonceError![nonce_length]u8 {
     if (id_piv.len > id_piv_field_width) return error.IdTooLong;
+    if (partial_iv > max_partial_iv) return error.PartialIvTooLarge;
 
     var block = [_]u8{0} ** nonce_length;
     // Step 1: S, a single byte.
@@ -799,8 +944,8 @@ pub fn computeNonce(common_iv: [nonce_length]u8, id_piv: []const u8, partial_iv:
     // id_piv_field_width-byte field at bytes 1..1+id_piv_field_width.
     @memcpy(block[1 + (id_piv_field_width - id_piv.len) ..][0..id_piv.len], id_piv);
     // Step 3: partial_iv as 5 big-endian bytes, right-aligned in the
-    // trailing 5-byte PIV field (always fits: partial_iv <= max_partial_iv
-    // < 2^40 is the Sender Sequence Number's own §3.1 ceiling).
+    // trailing 5-byte PIV field (fits: partial_iv <= max_partial_iv was
+    // checked above, so the three high bytes dropped here are zero).
     var piv_wide: [8]u8 = undefined;
     std.mem.writeInt(u64, &piv_wide, partial_iv, .big);
     @memcpy(block[nonce_length - 5 ..], piv_wide[3..8]);
@@ -824,6 +969,10 @@ pub const NonceSource = struct {
 pub const ProtectError = error{
     OutOfMemory,
     IdTooLong,
+    /// `plaintext.len > max_plaintext_len` (65 535 B): AES-CCM-16-64-128
+    /// cannot express the length in its 2-byte B_0 length field. Protect
+    /// the CoAP message block-wise (RFC 7959) instead.
+    MessageTooLong,
     /// `ctx.sender.sequence_number` would exceed `max_partial_iv`
     /// (`>= 2^40`) — the Sender Context has exhausted every nonce this
     /// algorithm can safely generate and MUST be re-established (§7.2.1)
@@ -873,6 +1022,9 @@ pub const Protected = struct {
 ///
 /// Construction (RFC 8613 §8.1/§8.3, "Protecting the Request"/
 /// "Protecting the Response"):
+/// 0. Fail (`error.MessageTooLong`) if `plaintext.len > max_plaintext_len`
+///    — the AEAD's own per-message ceiling, checked before a sequence
+///    number is looked at so a rejected call burns nothing.
 /// 1. `piv = ctx.sender.sequence_number`; fail
 ///    (`error.SequenceNumberExhausted`) if `piv > max_partial_iv`.
 /// 2. `nonce = computeNonce(ctx.common.common_iv, ctx.sender.id, piv)`
@@ -898,10 +1050,17 @@ pub fn protect(
     include_kid: bool,
     kid_context: ?[]const u8,
 ) ProtectError!Protected {
+    if (plaintext.len > max_plaintext_len) return error.MessageTooLong;
+
     const piv = ctx.sender.sequence_number;
     if (piv > max_partial_iv) return error.SequenceNumberExhausted;
 
-    const nonce = try computeNonce(ctx.common.common_iv, ctx.sender.id, piv);
+    const nonce = computeNonce(ctx.common.common_iv, ctx.sender.id, piv) catch |err| switch (err) {
+        error.IdTooLong => return error.IdTooLong,
+        // Same condition as the check just above, seen from inside the
+        // nonce construction; one name for one cause on this path.
+        error.PartialIvTooLarge => return error.SequenceNumberExhausted,
+    };
 
     const full_aad = try buildAad(allocator, aad);
     defer allocator.free(full_aad);
@@ -933,9 +1092,17 @@ pub fn protect(
 pub const UnprotectError = error{
     OutOfMemory,
     IdTooLong,
+    /// `ciphertext.len > max_ciphertext_len` (65 543 B): longer than any
+    /// AES-CCM-16-64-128 output can be, so it cannot authenticate — and
+    /// must be rejected BEFORE the AEAD is asked, which would otherwise
+    /// panic in Debug/ReleaseSafe ahead of the tag check.
+    MessageTooLong,
     /// Neither `option.partial_iv` nor `request_nonce_source` supplied a
     /// Partial IV to build the nonce from (§5.2's two sources).
     MissingPartialIv,
+    /// `request_nonce_source.partial_iv > max_partial_iv` — see
+    /// `ComputeNonceError.PartialIvTooLarge`.
+    PartialIvTooLarge,
     /// `ctx.recipient.replay_window.check` rejected `piv` — a request
     /// only (§8.4: a response is never replay-checked).
     Replayed,
@@ -961,8 +1128,19 @@ pub const UnprotectError = error{
 /// requests are replay-checked; a response's freshness is implied by the
 /// request/response exchange itself).
 ///
+/// ⚠ `option.kid` and `option.kid_context` are NOT read here. They are
+/// §5.1/§6.1 CONTEXT-SELECTION hints: the caller uses them to pick which
+/// `SecurityContext` to pass in (§8.2 step 2), and this function then
+/// trusts that choice — the nonce is built from `ctx.recipient.id`, not
+/// from `option.kid`. A `kid` that contradicts `ctx` is therefore not
+/// detected by name; it fails only indirectly, because the wrong context
+/// holds the wrong key and the AEAD tag will not verify.
+///
 /// Construction (RFC 8613 §8.2/§8.4, "Verifying the Request"/"Verifying
 /// the Response"):
+/// 0. Fail (`error.MessageTooLong`) if `ciphertext.len >
+///    max_ciphertext_len` — nothing that long is an AES-CCM-16-64-128
+///    output, and the AEAD must never see it (see `max_plaintext_len`).
 /// 1. Resolve `(id_piv, piv)`: `(ctx.recipient.id, option.partial_iv.?)`
 ///    if `option.partial_iv` is present, else
 ///    `(request_nonce_source.?.id, request_nonce_source.?.partial_iv)` —
@@ -995,6 +1173,10 @@ pub fn unprotect(
     request_nonce_source: ?NonceSource,
     is_request: bool,
 ) UnprotectError![]u8 {
+    // Step 0: the AEAD's own length ceiling, before anything else is
+    // touched — a rejected message must not even reach the replay check.
+    if (ciphertext.len > max_ciphertext_len) return error.MessageTooLong;
+
     // Step 1: resolve (id_piv, piv) — §5.2's two possible nonce sources.
     var id_piv: []const u8 = undefined;
     var piv: u64 = undefined;
@@ -1195,19 +1377,62 @@ test "ReplayWindow: a jump at/beyond window_size clears the old mask entirely" {
     try std.testing.expect(!rw.check(0)); // far outside the window now
 }
 
-fn fuzzOscoreOptionDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    // §6.1's wire-facing decoder: arbitrary bytes must only ever produce a
-    // typed error (reserved bits/length, truncation) or a borrowed-slice
-    // struct — never a panic or OOB read.
-    const opt = OscoreOption.decode(buf[0..len]) catch return;
-    _ = opt;
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`:
+/// `Smith.slice` reads a little-endian u32 length and then that many
+/// bytes, so a wire value that is to arrive verbatim carries that header.
+/// The array has to live in static memory — a `const` local would dangle.
+fn fuzzSeed(comptime wire: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(wire.len))) ++ wire[0..wire.len].*;
+    }.bytes;
 }
 
-test "fuzz: OscoreOption.decode never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzOscoreOptionDecode, .{});
+/// Real §6.1 option values: Appendix C.4-C.8's five published ones, then
+/// the edges the decoder dispatches on (both flag bits with a non-empty
+/// kid AND kid context, a 5-byte Partial IV, and the three rejections).
+const option_seeds = [_][]const u8{
+    fuzzSeed(&.{ 0x09, 0x14 }), // C.4: piv=20, kid=""
+    fuzzSeed(&.{ 0x09, 0x14, 0x00 }), // C.5: piv=20, kid=0x00
+    fuzzSeed(&.{ 0x19, 0x14, 0x08, 0x37, 0xcb, 0xf3, 0x21, 0x00, 0x17, 0xa2, 0xd3 }), // C.6: piv + kid context + empty kid
+    fuzzSeed(&.{}), // C.7: response, everything absent
+    fuzzSeed(&.{ 0x01, 0x00 }), // C.8: response with its own piv=0
+    fuzzSeed(&.{ 0x18, 0x02, 'C', 'D', 'A', 'B' }), // kid context + kid, both non-empty
+    fuzzSeed(&.{ 0x0d, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 }), // 5-byte piv = max_partial_iv
+    fuzzSeed(&.{0x06}), // reserved n
+    fuzzSeed(&.{0x20}), // reserved flag bit
+    fuzzSeed(&.{ 0x12, 0x05, 0xaa }), // kid context length past the end
+};
+
+fn fuzzOscoreOptionDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [64]u8 = undefined;
+    // One `smith.slice` draw — never `bytes` followed by a ranged length:
+    // `bytes` consumes the whole seed and the ranged draw then returns its
+    // minimum, so the harness decoded the EMPTY option once per run
+    // (audit F9 instrumented it: `call=1 len=0`).
+    const len: usize = smith.slice(&buf);
+    // §6.1's wire-facing decoder: arbitrary bytes must only ever produce a
+    // typed error (reserved bits/length, truncation) or a borrowed-slice
+    // struct — never a panic or OOB read. Whatever it accepts must
+    // re-encode to bytes that decode to the same fields (the encoder's
+    // shortest-form rule means the bytes themselves may differ, e.g. a
+    // non-minimal Partial IV).
+    const opt = OscoreOption.decode(buf[0..len]) catch return;
+    const again = opt.encode(std.testing.allocator) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        // A decoded option always fits: n <= 5 bytes and s <= 255.
+        error.PartialIvTooLarge, error.KidContextTooLong => return error.TestUnexpectedResult,
+    };
+    defer std.testing.allocator.free(again);
+    const opt2 = try OscoreOption.decode(again);
+    try std.testing.expectEqual(opt.partial_iv, opt2.partial_iv);
+    try std.testing.expectEqual(opt.kid == null, opt2.kid == null);
+    try std.testing.expectEqual(opt.kid_context == null, opt2.kid_context == null);
+    if (opt.kid) |k| try std.testing.expectEqualSlices(u8, k, opt2.kid.?);
+    if (opt.kid_context) |kc| try std.testing.expectEqualSlices(u8, kc, opt2.kid_context.?);
+}
+
+test "fuzz: OscoreOption.decode never panics on arbitrary bytes, and what it accepts round-trips" {
+    try std.testing.fuzz({}, fuzzOscoreOptionDecode, .{ .corpus = &option_seeds });
 }
 
 test "ReplayWindow: oversized window_size (>64) + hostile diff/shift does not panic (audit F1)" {

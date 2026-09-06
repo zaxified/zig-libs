@@ -52,14 +52,14 @@ in `kat_vectors.zig` was hand-verified against the RFC 8613 Appendix C
 text at the time of writing (cross-checked arithmetically for the §5.2
 nonce XOR construction — see `kat_vectors.zig`'s own doc comment).
 
-**Status: scaffold.** The §3.2.1 `info` CBOR encoder (`encodeInfo`), the
-§5.4 `aad_array`/`Enc_structure` CBOR encoders (`encodeAadArray`,
-`encodeEncStructure`), the §6.1 compressed COSE option codec
-(`OscoreOption`), and the §3.2.2 anti-replay sliding window
-(`ReplayWindow`) are implemented and tested for real. The six crypto
-cores — `deriveKey`, `deriveContext`, `computeNonce`, `buildAad`,
-`protect`, `unprotect` — are `@panic("TODO(fable): ...")` stubs with their
-final signatures fixed and their exact RFC 8613 construction fully
-specified in `root.zig`'s doc comments and `SPEC.md`; `kat_vectors.zig` /
-`kat_test.zig` are ready to validate a crypto-core implementation
-byte-exactly the moment one lands. See `SPEC.md`'s "TODO(fable)" section.
+**Status: complete.** Every piece named above — the CBOR encoders, the
+§6.1 option codec, the replay window, and the six crypto cores
+(`deriveKey`, `deriveContext`, `computeNonce`, `buildAad`, `protect`,
+`unprotect`) — is implemented and validated byte-exact against these
+vectors by `src/kat_test.zig`. (An earlier revision of this file described
+the cores as stubs; that was true of the scaffold and stale ever since.)
+
+The Appendix B.1 restart procedures (`SenderContext.needsCheckpoint`/
+`resumeAfterRestart`, `ReplayWindow.resumeAtLowerLimit`) were likewise
+implemented from the RFC's own Appendix text; RFC 9175 (the Echo option
+B.1.2 relies on) is referenced in documentation only — no code of it here.

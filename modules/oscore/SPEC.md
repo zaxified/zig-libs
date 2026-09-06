@@ -97,7 +97,7 @@ byte string as `Enc_structure`'s third array element — note that
 `external_aad`'s own CBOR encoding IS just "wrap these bytes in a bstr
 header"; `encodeEncStructure`'s `external_aad` parameter takes the RAW
 `aad_array` bytes and does that wrapping itself, matching the RFC's own
-"`external_aad = bstr .cbor aad_array`" notation. `buildAad` (STUB) is the
+"`external_aad = bstr .cbor aad_array`" notation. `buildAad` is the
 two-line composition of both. Every one of these three functions was
 hand-verified against Appendix C.4's worked example while writing them:
 `aad_array = 0x8501810a40411440` (8 bytes: array(5), uint(1), array(1)
@@ -143,6 +143,58 @@ invariants matter:
 does not mandate an exact size ("may be different in the two endpoints",
 §3.2), and 64 comfortably covers the §3.2.2 stated default of 32.
 
+## Persistence — RFC 8613 §7.5, Appendix B.1 (the state that is NOT the keys)
+
+A `SecurityContext` has two rapidly changing parts that live in RAM:
+`sender.sequence_number` and `recipient.replay_window`. §7.5 is normative
+about them: an endpoint that keeps a Security Context across a reboot
+**MUST NOT reuse a previous Sender Sequence Number and MUST NOT accept
+previously received messages**. `deriveContext` cannot help with either —
+it is a pure function of the §3.2 inputs, so calling it again after a
+restart yields the SAME keys with the sequence number back at 0 and an
+EMPTY replay window. Concretely (measured by the 2026-09-05 audit):
+
+- the first message after the re-derivation is sealed under the SAME
+  `(key, nonce)` as the first message before it — AES-CCM is CTR mode, so
+  the XOR of the two ciphertexts is the XOR of the two plaintexts, and the
+  second plaintext falls out **without the key** (a two-time pad);
+- every request captured before the restart replays cleanly (500/500 in
+  the audit's probe), because the fresh window has nothing to compare
+  against.
+
+This module has no nonvolatile storage and no CoAP layer, so it cannot
+persist anything itself. What it provides is the two operations Appendix
+B.1 describes, so that a caller who owns the storage does not have to
+re-derive the arithmetic:
+
+- **Sender side, B.1.1** — `SenderContext.needsCheckpoint(k)` is true
+  when the NEXT `protect` will consume a sequence number divisible by `k`;
+  the caller then writes `sequence_number` to nonvolatile memory BEFORE
+  calling `protect`. After a reboot, `SenderContext.resumeAfterRestart(
+  stored, k, f)` sets `SSN2 = SSN1 + K + F` — strictly above any number
+  the pre-reboot process can have used, provided `f` covers the storage's
+  own write delay (B.1.1: if no such `f` can be guaranteed, this method
+  MUST NOT be used; derive a fresh context per Appendix B.2 instead). The
+  resume fails with `error.SequenceNumberExhausted` rather than land past
+  `max_partial_iv`.
+- **Receiver side, B.1.2** — `ReplayWindow.resumeAtLowerLimit(piv)`
+  re-initializes the window so that `piv` and everything below it is a
+  replay and only `piv + 1` onwards is accepted. B.1.2's source for `piv`
+  is the Partial IV of the first request the server has verified FRESH
+  after the reboot via the Echo option (RFC 9175) — that challenge/response
+  is the CoAP layer's job. A persisted high-water mark is an acceptable
+  source ONLY if it was written before the message carrying it was
+  accepted (write-ahead); a lazily persisted `highest_seen`/`mask` pair is
+  a replay hole exactly as wide as the messages accepted after the last
+  write. Do not store and reload the window verbatim.
+
+Both operations are pure bookkeeping on the context and are gated by tests
+that run the real `protect`/`unprotect` across a simulated restart
+(`kat_test.zig`, "F3" tests). The alternative to all of this is §7.5's
+options 2-4: a fresh Master Secret or a fresh ID Context (Appendix B.2,
+random `kid context`), i.e. NEW keys — outside this module's scope but
+always correct.
+
 ## Threat model / limits
 
 - **This module supplies no transport, no exchange tracking, and no CoAP
@@ -160,7 +212,30 @@ does not mandate an exact size ("may be different in the two endpoints",
   Number past `max_partial_iv` (`2^40 - 1`) — reusing a `(key, nonce)`
   pair is a full AEAD break (RFC 8613 §7.2.1's own warning). A Security
   Context that hits this ceiling MUST be re-established, not patched
-  around.
+  around. **The same ceiling holds on the receive path**: `computeNonce`
+  (and `unprotect`, through `request_nonce_source.partial_iv`) fails with
+  `error.PartialIvTooLarge` instead of truncating a `>= 2^40` value to its
+  low 5 bytes — which would be the nonce of `partial_iv mod 2^40`, i.e. a
+  collision. `OscoreOption.decode` can never produce such a value (§6.1
+  caps the field at 5 bytes); the caller-tracked `NonceSource` can.
+- **AEAD message length**: AES-CCM-16-64-128 frames at most
+  `max_plaintext_len = 65 535` bytes per invocation (2-byte CCM length
+  field). `protect` fails with `error.MessageTooLong` above it and
+  `unprotect` rejects any payload longer than `max_ciphertext_len` (that
+  plus the tag) BEFORE touching the AEAD. Without those two checks the
+  decrypt path panicked in Debug/ReleaseSafe ahead of the tag check — a
+  keyless remote crash on one oversized CoAP payload — and the encrypt
+  path in ReleaseFast emitted a length field of `len mod 2^16`. A
+  block-wise (RFC 7959) body is protected block by block, never as one
+  reassembled message.
+- **Context loss across a restart** — see "Persistence" above. Re-deriving
+  a context that has already protected a message reuses nonces; a fresh
+  replay window accepts old requests.
+- **`kid`/`kid context` are selection hints, not checked fields**:
+  `unprotect` builds the nonce from `ctx.recipient.id` and never compares
+  `option.kid`/`option.kid_context` against the context. The caller
+  selects the context from them (§8.2 step 2); a contradiction fails
+  only indirectly, via the wrong key failing the AEAD.
 - **Never record an unverified sequence number as seen** — see the replay
   window section above; this is the single easiest correctness property
   to get backwards when implementing `unprotect` (check-before-decrypt is
@@ -213,10 +288,36 @@ ciphertext/option value, plus a tamper-rejection test, a replay-rejection
 test, and an end-to-end round trip with fresh (non-published) key
 material.
 
+What Appendix C alone cannot see, and what the module's own tests add on
+top of it (A1 audit, 2026-09-06 — each was a mutation that had survived
+the Appendix C suite green): a request genuinely delivered twice through
+`unprotect`; the default window width exercised at its edge (Partial IV
+40, then 8 accepted, 7 rejected); a response opened with a
+`request_nonce_source.id` that differs from `recipient.id`; non-empty
+Class I `options` changing the tag; `kid` AND `kid context` both
+non-empty (every published vector has at most one); and the guards
+`MessageTooLong`, `PartialIvTooLarge`, `IdTooLong`, `MissingPartialIv`,
+sub-tag-length payloads, and the Appendix B.1 restart procedures.
+
 ## Verification
 
 - `zig build test-oscore` and `-Doptimize=ReleaseFast` both go green;
   `zig fmt --check modules/oscore/` clean.
+- `zig build run-example-oscore` walks two full exchanges, a replay, a
+  tamper, and a simulated reboot with Appendix B.1 recovery.
+- **Key material on the dead stack** (audit F7): `deriveContext` wipes its
+  three derived-value locals and then zeroes the stack region its HKDF/
+  HMAC callees vacated (`scrubStackBelow`, 8 KiB, once per derivation).
+  Measured with the audit's probe re-pointed at heap-resident needles so
+  the caller's own live copies do not count: in ReleaseSafe/ReleaseFast
+  the derived keys were found 1-2 times below the caller before, at most
+  once after (that copy sits at the probe wrapper's own return slot). The
+  per-message path is NOT scrubbed: `protect`/`unprotect` leave std's
+  AES-128 round-key schedule behind (its first round key is the Sender/
+  Recipient Key itself) — 6 copies in Debug, 1 in release modes — and a
+  per-message scrub would cost as much as the AEAD call it follows. That
+  residue is a property of `std.crypto`'s AES, recorded here rather than
+  hidden.
 
 ## Anchoring
 

@@ -2,15 +2,13 @@
 //! Tests against RFC 8613 (OSCORE) Appendix C's official test vectors
 //! (`kat_vectors.zig`).
 //!
-//! **Current status: all six crypto cores are REAL and every test below
-//! PASSES.** The CBOR/codec tests (`encodeInfo`, `encodeAadArray`,
-//! `OscoreOption`) cross-validate this module's deterministic
-//! byte-assembly against every `info`/`aad_array`/`OSCORE option value`
-//! field Appendix C publishes; the tests calling `deriveKey`/
-//! `deriveContext`/`computeNonce`/`buildAad`/`protect`/`unprotect` run
-//! and pass against the same Appendix C vectors. No `@panic`/TODO stub
-//! remains in `root.zig`. See `root.zig`'s module doc comment for exactly
-//! which construction each function follows.
+//! The CBOR/codec tests (`encodeInfo`, `encodeAadArray`, `OscoreOption`)
+//! cross-validate this module's deterministic byte-assembly against every
+//! `info`/`aad_array`/`OSCORE option value` field Appendix C publishes;
+//! the tests calling `deriveKey`/`deriveContext`/`computeNonce`/`buildAad`/
+//! `protect`/`unprotect` run against the same Appendix C vectors. See
+//! `root.zig`'s module doc comment for exactly which construction each
+//! function follows.
 //!
 //! Coverage, by category:
 //!
@@ -26,13 +24,17 @@
 //!     `option_value` byte-exact; `unprotect` round-trips each back to
 //!     `plaintext`.
 //!   - `unprotect` rejects a tampered ciphertext (flipped byte -> AEAD
-//!     tag failure) and a replayed Partial IV (`ReplayWindow` — the
-//!     bitmap itself is REAL and independently tested in `root.zig`, but
-//!     `unprotect`'s own use of it is gated on `unprotect` itself being
-//!     filled in).
+//!     tag failure) and a replayed Partial IV — both by pre-seeding the
+//!     window AND by genuinely delivering the same wire bytes twice.
 //!   - An end-to-end round trip: `deriveContext` -> `protect` ->
 //!     `unprotect` with FRESH random-ish key material (not a published
 //!     vector), both directions.
+//!   - The guards the A1 audit (2026-09-06) found untested or missing:
+//!     the AES-CCM message-length ceiling, the Partial IV ceiling on the
+//!     receive path, Appendix B.1 restart recovery, Class I `options`
+//!     binding in the AAD, §6.1 field order with BOTH kid fields present,
+//!     §8.4 (responses never touch the window), and the three fail-closed
+//!     guards (`IdTooLong`, `MissingPartialIv`, sub-tag-length payload).
 
 const std = @import("std");
 const oscore = @import("root.zig");
@@ -46,7 +48,7 @@ fn hexBytes(buf: []u8, hex_str: []const u8) []const u8 {
     return buf[0..n];
 }
 
-// ── encodeInfo — REAL, PASSES today ──────────────────────────────────────
+// ── encodeInfo ───────────────────────────────────────────────────────────
 
 test "encodeInfo reproduces every Appendix C.1-C.3 info field, byte-exact" {
     const allocator = std.testing.allocator;
@@ -96,7 +98,7 @@ test "encodeInfo reproduces every Appendix C.1-C.3 Common IV info field, byte-ex
     }
 }
 
-// ── encodeAadArray — REAL, PASSES today ──────────────────────────────────
+// ── encodeAadArray ───────────────────────────────────────────────────────
 
 test "encodeAadArray reproduces every Appendix C.4-C.8 aad_array field, byte-exact" {
     const allocator = std.testing.allocator;
@@ -114,7 +116,7 @@ test "encodeAadArray reproduces every Appendix C.4-C.8 aad_array field, byte-exa
     }
 }
 
-// ── OscoreOption — REAL, PASSES today ────────────────────────────────────
+// ── OscoreOption ─────────────────────────────────────────────────────────
 
 test "OscoreOption.encode reproduces every Appendix C.4-C.8 OSCORE option value, byte-exact" {
     const allocator = std.testing.allocator;
@@ -160,7 +162,7 @@ test "OscoreOption.decode reproduces every Appendix C.4-C.8 option's fields from
     }
 }
 
-// ── deriveKey / deriveContext — STUBBED, panics until filled in ─────────
+// ── deriveKey / deriveContext ────────────────────────────────────────────
 
 test "deriveKey reproduces every Appendix C.1-C.3 Sender Key, byte-exact" {
     const allocator = std.testing.allocator;
@@ -207,7 +209,7 @@ test "deriveContext reproduces every Appendix C.1-C.3 Sender Key, Recipient Key,
     }
 }
 
-// ── computeNonce — STUBBED, panics until filled in ───────────────────────
+// ── computeNonce ─────────────────────────────────────────────────────────
 
 test "computeNonce reproduces every Appendix C.1-C.3 sender/recipient nonce at partial_iv=0" {
     var iv_buf: [16]u8 = undefined;
@@ -240,7 +242,7 @@ test "computeNonce reproduces Appendix C.4/C.5/C.6/C.8's message-vector nonce, b
     }
 }
 
-// ── buildAad — STUBBED, panics until filled in ───────────────────────────
+// ── buildAad ─────────────────────────────────────────────────────────────
 
 test "buildAad reproduces every Appendix C.4-C.8 AAD field, byte-exact" {
     const allocator = std.testing.allocator;
@@ -258,7 +260,7 @@ test "buildAad reproduces every Appendix C.4-C.8 AAD field, byte-exact" {
     }
 }
 
-// ── protect / unprotect — STUBBED, panics until filled in ────────────────
+// ── protect / unprotect ──────────────────────────────────────────────────
 
 fn contextFor(
     vec: v.MessageVector,
@@ -506,4 +508,399 @@ test "unprotect: a failed-auth attempt does not poison the replay window (§8.4)
     // succeed — the failed attempt above must not have recorded it.
     const plaintext = try oscore.unprotect(allocator, &ctx, .{ .partial_iv = vec.option_partial_iv }, good_ciphertext, aad, null, true);
     allocator.free(plaintext);
+}
+
+// ── A1 audit 2026-09-06: guards that were missing or had no test ─────────
+
+/// A mirrored client/server pair with fresh (non-published) material —
+/// the shape every test below that needs BOTH directions uses.
+const Pair = struct {
+    client: oscore.SecurityContext,
+    server: oscore.SecurityContext,
+
+    fn init(allocator: std.mem.Allocator) !Pair {
+        const secret = "a1 audit master secret, 32 byte";
+        return .{
+            .client = try oscore.deriveContext(allocator, secret, "salt", null, "c1", "s1", .aes_ccm_16_64_128),
+            .server = try oscore.deriveContext(allocator, secret, "salt", null, "s1", "c1", .aes_ccm_16_64_128),
+        };
+    }
+};
+
+/// A client request's AAD for the sequence number `protect` is ABOUT to
+/// consume (README's own recipe), plus the options bytes.
+fn requestAad(ctx: *const oscore.SecurityContext, piv_buf: *[oscore.OscoreOption.max_partial_iv_bytes]u8, options: []const u8) oscore.AadParams {
+    return .{
+        .request_kid = ctx.sender.id,
+        .request_piv = oscore.OscoreOption.encodePartialIv(ctx.sender.sequence_number, piv_buf),
+        .options = options,
+    };
+}
+
+test "F1: protect refuses a plaintext longer than AES-CCM-16-64-128 can frame, accepts exactly the ceiling" {
+    // L = 2 length bytes -> 65 535 B. std's Aes128Ccm8 only debug-asserts
+    // this on encrypt; without the module's own check, ReleaseFast emitted
+    // a message whose B_0 length field was `len mod 2^16`.
+    const allocator = std.testing.allocator;
+    var pair = try Pair.init(allocator);
+
+    const big = try allocator.alloc(u8, oscore.max_plaintext_len + 1);
+    defer allocator.free(big);
+    @memset(big, 0x5a);
+
+    var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const aad = requestAad(&pair.client, &piv_buf, &.{});
+    try std.testing.expectError(error.MessageTooLong, oscore.protect(allocator, &pair.client, big, aad, true, null));
+    // A rejected call must not have burned a sequence number.
+    try std.testing.expectEqual(@as(u64, 0), pair.client.sender.sequence_number);
+
+    // Exactly the ceiling is legal and round-trips.
+    const at_ceiling = big[0..oscore.max_plaintext_len];
+    const protected = try oscore.protect(allocator, &pair.client, at_ceiling, aad, true, null);
+    defer allocator.free(protected.ciphertext);
+    try std.testing.expectEqual(oscore.max_ciphertext_len, protected.ciphertext.len);
+    const back = try oscore.unprotect(allocator, &pair.server, protected.option, protected.ciphertext, aad, null, true);
+    defer allocator.free(back);
+    try std.testing.expectEqualSlices(u8, at_ceiling, back);
+}
+
+test "F1: unprotect refuses an over-long payload BEFORE the AEAD (no pre-authentication panic), window untouched" {
+    // Without the check, Debug/ReleaseSafe panicked in formatB0Block's
+    // @intCast before the tag was compared — a remote, keyless crash.
+    const allocator = std.testing.allocator;
+    var pair = try Pair.init(allocator);
+
+    const oversized = try allocator.alloc(u8, oscore.max_ciphertext_len + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 0);
+
+    const aad = oscore.AadParams{ .request_kid = "c1", .request_piv = &.{0x00} };
+    try std.testing.expectError(error.MessageTooLong, oscore.unprotect(allocator, &pair.server, .{ .partial_iv = 0 }, oversized, aad, null, true));
+    // Rejected before step 2: the replay window never saw Partial IV 0.
+    try std.testing.expect(!pair.server.recipient.replay_window.initialized);
+
+    // The same length through the RESPONSE path (nonce from the request) is
+    // rejected by the same name, not by the AEAD.
+    try std.testing.expectError(error.MessageTooLong, oscore.unprotect(allocator, &pair.client, .{}, oversized, aad, .{ .id = "c1", .partial_iv = 0 }, false));
+}
+
+test "F2: computeNonce refuses a Partial IV that does not fit its 5-byte field instead of truncating it" {
+    // Truncation made nonce(2^40 + x) == nonce(x): a nonce collision under
+    // one key, reachable through unprotect's request_nonce_source.
+    const common_iv = [_]u8{0} ** oscore.nonce_length;
+    _ = try oscore.computeNonce(common_iv, &.{0x01}, oscore.max_partial_iv);
+    try std.testing.expectError(error.PartialIvTooLarge, oscore.computeNonce(common_iv, &.{0x01}, oscore.max_partial_iv + 1));
+    try std.testing.expectError(error.PartialIvTooLarge, oscore.computeNonce(common_iv, &.{0x01}, (1 << 40) + 7));
+    try std.testing.expectError(error.PartialIvTooLarge, oscore.computeNonce(common_iv, &.{0x01}, std.math.maxInt(u64)));
+}
+
+test "F2: unprotect refuses a request_nonce_source.partial_iv beyond max_partial_iv by name" {
+    const allocator = std.testing.allocator;
+    var pair = try Pair.init(allocator);
+
+    // Seal a response at Partial IV 0 the way a server does (request-nonce
+    // reuse), then have the client claim the request used 2^40 — which
+    // truncates to the same nonce. It must be refused, not verified.
+    var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const aad = requestAad(&pair.client, &piv_buf, &.{});
+    const nonce = try oscore.computeNonce(pair.server.common.common_iv, pair.server.recipient.id, 0);
+    const full_aad = try oscore.buildAad(allocator, aad);
+    defer allocator.free(full_aad);
+    const response_plaintext = "\x45\xffok";
+    var response: [response_plaintext.len + oscore.tag_length]u8 = undefined;
+    std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(response[0..response_plaintext.len], response[response_plaintext.len..], response_plaintext, full_aad, nonce, pair.server.sender.key);
+
+    try std.testing.expectError(error.PartialIvTooLarge, oscore.unprotect(allocator, &pair.client, .{}, &response, aad, .{ .id = "c1", .partial_iv = 1 << 40 }, false));
+    // And the honest source still verifies — the guard rejects the value,
+    // not the path.
+    const ok = try oscore.unprotect(allocator, &pair.client, .{}, &response, aad, .{ .id = "c1", .partial_iv = 0 }, false);
+    defer allocator.free(ok);
+    try std.testing.expectEqualSlices(u8, response_plaintext, ok);
+}
+
+test "F3: Appendix B.1.1 — needsCheckpoint fires on multiples of K, resumeAfterRestart lands at SSN1 + K + F" {
+    var sc = oscore.SenderContext{ .id = "c1", .key = [_]u8{0} ** oscore.key_length };
+    try std.testing.expect(sc.needsCheckpoint(16)); // 0 is a multiple of everything
+    sc.sequence_number = 15;
+    try std.testing.expect(!sc.needsCheckpoint(16));
+    sc.sequence_number = 32;
+    try std.testing.expect(sc.needsCheckpoint(16));
+
+    // Stored 32 with K = 16, F = 4 -> resume at 52; every number the
+    // pre-reboot process could have used (32..47) is below it.
+    try sc.resumeAfterRestart(32, 16, 4);
+    try std.testing.expectEqual(@as(u64, 52), sc.sequence_number);
+
+    // Resuming past the nonce space is refused, never wrapped or clamped.
+    try std.testing.expectError(error.SequenceNumberExhausted, sc.resumeAfterRestart(oscore.max_partial_iv - 10, 16, 4));
+    try std.testing.expectError(error.SequenceNumberExhausted, sc.resumeAfterRestart(std.math.maxInt(u64), 1, 1));
+    try std.testing.expectError(error.SequenceNumberExhausted, sc.resumeAfterRestart(1, std.math.maxInt(u64), 1));
+    // A refused resume leaves the counter where it was.
+    try std.testing.expectEqual(@as(u64, 52), sc.sequence_number);
+    // Exactly the ceiling is still a legal Partial IV.
+    try sc.resumeAfterRestart(oscore.max_partial_iv - 5, 4, 1);
+    try std.testing.expectEqual(oscore.max_partial_iv, sc.sequence_number);
+}
+
+test "F3: a resumed sender never re-seals under a nonce the pre-restart context spent" {
+    // The two-time-pad the audit demonstrated: re-derive, protect at
+    // Partial IV 0 again, XOR the ciphertexts. With B.1.1 applied the
+    // resumed context's first Partial IV is strictly above anything the
+    // old one could have used.
+    const allocator = std.testing.allocator;
+    var before = try Pair.init(allocator);
+    var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const k: u64 = 8;
+
+    var spent: [11]u64 = undefined;
+    for (&spent) |*slot| {
+        if (before.client.sender.needsCheckpoint(k)) {
+            // "persist" — the last checkpoint the test remembers
+            last_checkpoint = before.client.sender.sequence_number;
+        }
+        const aad = requestAad(&before.client, &piv_buf, &.{});
+        const p = try oscore.protect(allocator, &before.client, "x", aad, true, null);
+        allocator.free(p.ciphertext);
+        slot.* = p.option.partial_iv.?;
+    }
+    // Checkpoints fired at 0 and 8; the last one wrote 8.
+    try std.testing.expectEqual(@as(u64, 8), last_checkpoint);
+
+    // Reboot: same inputs, fresh derivation, then B.1.1 resume.
+    var after = try Pair.init(allocator);
+    try std.testing.expectEqual(@as(u64, 0), after.client.sender.sequence_number); // the hazard, on its own
+    try after.client.sender.resumeAfterRestart(last_checkpoint, k, 1);
+    const aad = requestAad(&after.client, &piv_buf, &.{});
+    const p = try oscore.protect(allocator, &after.client, "y", aad, true, null);
+    defer allocator.free(p.ciphertext);
+    for (spent) |old| try std.testing.expect(p.option.partial_iv.? > old);
+}
+var last_checkpoint: u64 = 0;
+
+test "F3: Appendix B.1.2 — resumeAtLowerLimit rejects every pre-restart request, accepts what follows" {
+    const allocator = std.testing.allocator;
+    var pair = try Pair.init(allocator);
+    var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+
+    // Capture three requests before the "reboot".
+    var captured: [3]oscore.Protected = undefined;
+    var captured_aad: [3]oscore.AadParams = undefined;
+    var piv_bufs: [3][oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    for (&captured, &captured_aad, &piv_bufs) |*c, *a, *pb| {
+        a.* = requestAad(&pair.client, pb, &.{});
+        c.* = try oscore.protect(allocator, &pair.client, "req", a.*, true, null);
+        const seen = try oscore.unprotect(allocator, &pair.server, c.option, c.ciphertext, a.*, null, true);
+        allocator.free(seen);
+    }
+    defer for (captured) |c| allocator.free(c.ciphertext);
+
+    // Server reboots: a fresh derivation accepts all three replays — the
+    // hazard the audit measured as 500/500.
+    var rebooted = try oscore.deriveContext(allocator, "a1 audit master secret, 32 byte", "salt", null, "s1", "c1", .aes_ccm_16_64_128);
+    {
+        const replayed = try oscore.unprotect(allocator, &rebooted, captured[0].option, captured[0].ciphertext, captured_aad[0], null, true);
+        allocator.free(replayed);
+    }
+
+    // B.1.2: the first fresh request after the reboot (verified via Echo by
+    // the CoAP layer — here, the client's next genuine request, Partial IV
+    // 3) becomes the window's lower limit. Everything at or below it is a
+    // replay from then on.
+    var rebooted2 = try oscore.deriveContext(allocator, "a1 audit master secret, 32 byte", "salt", null, "s1", "c1", .aes_ccm_16_64_128);
+    const fresh_aad = requestAad(&pair.client, &piv_buf, &.{});
+    const fresh = try oscore.protect(allocator, &pair.client, "fresh", fresh_aad, true, null);
+    defer allocator.free(fresh.ciphertext);
+    rebooted2.recipient.replay_window.resumeAtLowerLimit(fresh.option.partial_iv.?);
+
+    for (captured, captured_aad) |c, a| {
+        try std.testing.expectError(error.Replayed, oscore.unprotect(allocator, &rebooted2, c.option, c.ciphertext, a, null, true));
+    }
+    // The lower limit itself counts as seen (it was the fresh request).
+    try std.testing.expectError(error.Replayed, oscore.unprotect(allocator, &rebooted2, fresh.option, fresh.ciphertext, fresh_aad, null, true));
+    // The next one is accepted.
+    var piv_buf2: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const next_aad = requestAad(&pair.client, &piv_buf2, &.{});
+    const next = try oscore.protect(allocator, &pair.client, "next", next_aad, true, null);
+    defer allocator.free(next.ciphertext);
+    const got = try oscore.unprotect(allocator, &rebooted2, next.option, next.ciphertext, next_aad, null, true);
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(u8, "next", got);
+}
+
+test "F4: delivering the SAME request twice through unprotect is rejected the second time, and the window moved" {
+    // The older replay test pre-seeded the window by hand, so it proved
+    // `check`, not that `unprotect` records what it accepts (audit
+    // mutation R01 — never update — survived it).
+    const allocator = std.testing.allocator;
+    var pair = try Pair.init(allocator);
+    var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+
+    // Advance the client to Partial IV 5 so the mark is not the trivial 0.
+    pair.client.sender.sequence_number = 5;
+    const aad = requestAad(&pair.client, &piv_buf, &.{});
+    const p = try oscore.protect(allocator, &pair.client, "once", aad, true, null);
+    defer allocator.free(p.ciphertext);
+
+    try std.testing.expect(!pair.server.recipient.replay_window.initialized);
+    const first = try oscore.unprotect(allocator, &pair.server, p.option, p.ciphertext, aad, null, true);
+    allocator.free(first);
+    try std.testing.expect(pair.server.recipient.replay_window.initialized);
+    try std.testing.expectEqual(@as(u64, 5), pair.server.recipient.replay_window.highest_seen); // piv, not piv+1
+    try std.testing.expectEqual(@as(u64, 0), pair.server.recipient.replay_window.mask);
+
+    try std.testing.expectError(error.Replayed, oscore.unprotect(allocator, &pair.server, p.option, p.ciphertext, aad, null, true));
+
+    // A later, then an earlier-but-unseen one: accepted; the earlier one
+    // lands in the mask at bit (7 - 3 - 1).
+    pair.client.sender.sequence_number = 7;
+    var pb7: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const aad7 = requestAad(&pair.client, &pb7, &.{});
+    const p7 = try oscore.protect(allocator, &pair.client, "seven", aad7, true, null);
+    defer allocator.free(p7.ciphertext);
+    allocator.free(try oscore.unprotect(allocator, &pair.server, p7.option, p7.ciphertext, aad7, null, true));
+    pair.client.sender.sequence_number = 3;
+    var pb3: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const aad3 = requestAad(&pair.client, &pb3, &.{});
+    const p3 = try oscore.protect(allocator, &pair.client, "three", aad3, true, null);
+    defer allocator.free(p3.ciphertext);
+    allocator.free(try oscore.unprotect(allocator, &pair.server, p3.option, p3.ciphertext, aad3, null, true));
+    try std.testing.expectEqual(@as(u64, 7), pair.server.recipient.replay_window.highest_seen);
+    try std.testing.expectEqual(@as(u64, (1 << 1) | (1 << 3)), pair.server.recipient.replay_window.mask); // 5 at diff 2, 3 at diff 4
+    try std.testing.expectError(error.Replayed, oscore.unprotect(allocator, &pair.server, p3.option, p3.ciphertext, aad3, null, true));
+}
+
+test "F4: the default window is RFC 8613 \u{a7}3.2.2's 32 — through unprotect, not just the constant" {
+    const allocator = std.testing.allocator;
+    var pair = try Pair.init(allocator);
+    try std.testing.expectEqual(@as(u7, 32), pair.server.recipient.replay_window.window_size);
+
+    const sealAt = struct {
+        fn f(alloc: std.mem.Allocator, client: *oscore.SecurityContext, piv: u64, pb: *[oscore.OscoreOption.max_partial_iv_bytes]u8) !struct { oscore.Protected, oscore.AadParams } {
+            client.sender.sequence_number = piv;
+            const aad = requestAad(client, pb, &.{});
+            return .{ try oscore.protect(alloc, client, "w", aad, true, null), aad };
+        }
+    }.f;
+
+    var pb_hi: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const hi = try sealAt(allocator, &pair.client, 40, &pb_hi);
+    defer allocator.free(hi[0].ciphertext);
+    allocator.free(try oscore.unprotect(allocator, &pair.server, hi[0].option, hi[0].ciphertext, hi[1], null, true));
+
+    // 40 - 32 = 8 is the oldest Partial IV still inside the window.
+    var pb_in: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const inside = try sealAt(allocator, &pair.client, 8, &pb_in);
+    defer allocator.free(inside[0].ciphertext);
+    allocator.free(try oscore.unprotect(allocator, &pair.server, inside[0].option, inside[0].ciphertext, inside[1], null, true));
+
+    // 7 fell off the trailing edge: too old, rejected as a replay.
+    var pb_out: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const outside = try sealAt(allocator, &pair.client, 7, &pb_out);
+    defer allocator.free(outside[0].ciphertext);
+    try std.testing.expectError(error.Replayed, oscore.unprotect(allocator, &pair.server, outside[0].option, outside[0].ciphertext, outside[1], null, true));
+}
+
+test "F4/F11: a response reusing the request's nonce is opened with request_nonce_source.id, and never touches the window (\u{a7}8.4)" {
+    // In the Appendix C round-trip test recipient.id == nonce_id, so a
+    // mutation that ignored request_nonce_source.id survived (P06). Here
+    // the client's recipient id is "s1" while the request nonce used "c1".
+    const allocator = std.testing.allocator;
+    var pair = try Pair.init(allocator);
+    var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+
+    const req_aad = requestAad(&pair.client, &piv_buf, &.{});
+    const req = try oscore.protect(allocator, &pair.client, "\x01\xffq", req_aad, true, null);
+    defer allocator.free(req.ciphertext);
+    allocator.free(try oscore.unprotect(allocator, &pair.server, req.option, req.ciphertext, req_aad, null, true));
+
+    // Server response: request nonce = (recipient id "c1", piv 0), no own PIV.
+    const nonce = try oscore.computeNonce(pair.server.common.common_iv, pair.server.recipient.id, req.option.partial_iv.?);
+    const full_aad = try oscore.buildAad(allocator, req_aad);
+    defer allocator.free(full_aad);
+    const resp_pt = "\x45\xffr";
+    var resp: [resp_pt.len + oscore.tag_length]u8 = undefined;
+    std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(resp[0..resp_pt.len], resp[resp_pt.len..], resp_pt, full_aad, nonce, pair.server.sender.key);
+
+    const src = oscore.NonceSource{ .id = pair.client.sender.id, .partial_iv = 0 };
+    try std.testing.expect(!std.mem.eql(u8, src.id, pair.client.recipient.id)); // the test's premise
+    const before = pair.client.recipient.replay_window;
+    const one = try oscore.unprotect(allocator, &pair.client, .{}, &resp, req_aad, src, false);
+    allocator.free(one);
+    // §8.4: the same response opened again still verifies — responses are
+    // never replay-checked — and the client's window did not move.
+    const two = try oscore.unprotect(allocator, &pair.client, .{}, &resp, req_aad, src, false);
+    allocator.free(two);
+    try std.testing.expectEqual(before, pair.client.recipient.replay_window);
+
+    // With the wrong id in the source, the nonce differs and the AEAD fails.
+    try std.testing.expectError(error.AuthenticationFailed, oscore.unprotect(allocator, &pair.client, .{}, &resp, req_aad, .{ .id = "s1", .partial_iv = 0 }, false));
+}
+
+test "F5: Class I options are bound by the AAD — a different options byte string is a different message" {
+    // Every Appendix C vector has empty `options`, so the aad_array field
+    // could be replaced by a constant empty bstr with the suite green.
+    const allocator = std.testing.allocator;
+    var pair = try Pair.init(allocator);
+    var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+
+    const opts_a = "\x61\x05"; // a fabricated delta-encoded Class I option
+    const opts_b = "\x61\x06";
+    const aad_a = requestAad(&pair.client, &piv_buf, opts_a);
+    const aad_b = requestAad(&pair.client, &piv_buf, opts_b);
+
+    const pa = try oscore.protect(allocator, &pair.client, "same plaintext", aad_a, true, null);
+    defer allocator.free(pa.ciphertext);
+    pair.client.sender.sequence_number = 0; // same nonce, only the options differ
+    const pb = try oscore.protect(allocator, &pair.client, "same plaintext", aad_b, true, null);
+    defer allocator.free(pb.ciphertext);
+    // CCM: ciphertext body is the CTR stream, so only the TAG can differ —
+    // and it must.
+    try std.testing.expectEqualSlices(u8, pa.ciphertext[0 .. pa.ciphertext.len - oscore.tag_length], pb.ciphertext[0 .. pb.ciphertext.len - oscore.tag_length]);
+    try std.testing.expect(!std.mem.eql(u8, pa.ciphertext[pa.ciphertext.len - oscore.tag_length ..], pb.ciphertext[pb.ciphertext.len - oscore.tag_length ..]));
+
+    // An on-path change of the Class I options is caught by the receiver.
+    try std.testing.expectError(error.AuthenticationFailed, oscore.unprotect(allocator, &pair.server, pa.option, pa.ciphertext, aad_b, null, true));
+    const ok = try oscore.unprotect(allocator, &pair.server, pa.option, pa.ciphertext, aad_a, null, true);
+    allocator.free(ok);
+}
+
+test "F10: \u{a7}6.1 field order with BOTH a non-empty kid context and a non-empty kid" {
+    // No Appendix C vector has both non-empty, so swapping the encoder's
+    // two trailing fields was invisible to the suite.
+    const allocator = std.testing.allocator;
+    const opt = oscore.OscoreOption{ .partial_iv = 1, .kid_context = "CD", .kid = "AB" };
+    const wire = try opt.encode(allocator);
+    defer allocator.free(wire);
+    // flag: h|k|n=1 = 0x19; piv 0x01; s = 2; kid context; kid LAST.
+    try std.testing.expectEqualSlices(u8, &.{ 0x19, 0x01, 0x02, 'C', 'D', 'A', 'B' }, wire);
+    const back = try oscore.OscoreOption.decode(wire);
+    try std.testing.expectEqualSlices(u8, "CD", back.kid_context.?);
+    try std.testing.expectEqualSlices(u8, "AB", back.kid.?);
+    try std.testing.expectEqual(@as(?u64, 1), back.partial_iv);
+}
+
+test "F12: the three fail-closed guards — IdTooLong, MissingPartialIv, a payload shorter than the tag" {
+    const allocator = std.testing.allocator;
+    var pair = try Pair.init(allocator);
+    const aad = oscore.AadParams{ .request_kid = "c1", .request_piv = &.{0x00} };
+
+    // IdTooLong: an 8-byte id does not fit the 7-byte ID_PIV field; without
+    // the guard the left-padding arithmetic underflows.
+    try std.testing.expectError(error.IdTooLong, oscore.computeNonce(pair.client.common.common_iv, "8bytes!!", 0));
+    pair.client.sender.id = "8bytes!!";
+    try std.testing.expectError(error.IdTooLong, oscore.protect(allocator, &pair.client, "x", aad, true, null));
+    try std.testing.expectEqual(@as(u64, 0), pair.client.sender.sequence_number);
+    try std.testing.expectError(error.IdTooLong, oscore.unprotect(allocator, &pair.server, .{}, &([_]u8{0} ** 9), aad, .{ .id = "8bytes!!", .partial_iv = 0 }, false));
+
+    // MissingPartialIv: no Partial IV in the option and no request source.
+    try std.testing.expectError(error.MissingPartialIv, oscore.unprotect(allocator, &pair.server, .{}, &([_]u8{0} ** 9), aad, null, false));
+
+    // Shorter than the tag: 0..7 bytes cannot carry a tag; rejected as a
+    // tag failure without an underflow, and without touching the window.
+    var short: [oscore.tag_length]u8 = [_]u8{0} ** oscore.tag_length;
+    var len: usize = 0;
+    while (len < oscore.tag_length) : (len += 1) {
+        try std.testing.expectError(error.AuthenticationFailed, oscore.unprotect(allocator, &pair.server, .{ .partial_iv = 9 }, short[0..len], aad, null, true));
+    }
+    try std.testing.expect(!pair.server.recipient.replay_window.initialized);
 }
