@@ -74,7 +74,6 @@ montint 2
 mqtt 1
 musig2 1
 netconf 3
-nftables 2
 noise 1
 ocsp 2
 ocspcache 2

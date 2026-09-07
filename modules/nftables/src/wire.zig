@@ -64,6 +64,9 @@ const builtin = @import("builtin");
 const nl = @import("nl.zig");
 const types = @import("types.zig");
 const expr = @import("expr.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 const native_endian = builtin.cpu.arch.endian();
 
@@ -1279,35 +1282,264 @@ test "decoders survive hostile and truncated attribute streams" {
     try testing.expectError(error.Truncated, decodeRule(&.{ 1, 0 }));
 }
 
-test "fuzz: object decoders never crash, loop or over-read" {
-    try testing.fuzz({}, fuzzDecoders, .{});
-}
+/// `NFT_MSG_NEW*` reply payloads for `fuzzDecoders`, in the format
+/// `Smith.slice` reads (see `testkit.fuzz`): a little-endian u32 length, then
+/// the payload.
+///
+/// ⭐ Built at run time by this file's own `appendNfgenmsg` and the shared
+/// netlink attribute writers rather than quoted as hex: an `nla_len`/
+/// `nla_type` pair is HOST byte order (the nftables VALUES are big-endian, the
+/// framing is not), so a hex corpus would be a little-endian one and the
+/// counts pinned below would be false on a big-endian target instead of
+/// failing there.
+///
+/// The harness reads every payload through all five decoders at once, which is
+/// the point: the attribute NUMBERS collide across object kinds, so a chain
+/// reply read as a table is a shape only a fuzzer would produce and exactly
+/// the one that finds a decoder trusting a length it did not check.
+const WireCorpus = struct {
+    scratch: [16384]u8 = undefined,
+    store: [16384]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    n: usize = 0,
 
-fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
-    var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
-    const buf = raw[0..len];
+    fn push(self: *WireCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
 
-    _ = decodeTable(buf) catch {};
-    _ = decodeChain(buf) catch {};
-    _ = decodeSet(buf) catch {};
+    fn build(self: *WireCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A table reply with every field the decoder types out.
+        var table: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &table, types.NFPROTO.INET, 0);
+        try nl.appendAttrString(gpa, &table, NFTA_TABLE.NAME, "filter");
+        try nl.appendAttrBe32(gpa, &table, NFTA_TABLE.FLAGS, 0);
+        try nl.appendAttrBe32(gpa, &table, NFTA_TABLE.USE, 3);
+        try nl.appendAttrBe64(gpa, &table, NFTA_TABLE.HANDLE, 42);
+        self.push(table.items);
+
+        // A base chain: the HOOK nest, the policy, and a device.
+        var chain: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &chain, types.NFPROTO.INET, 0);
+        try nl.appendAttrString(gpa, &chain, NFTA_CHAIN.TABLE, "filter");
+        try nl.appendAttrString(gpa, &chain, NFTA_CHAIN.NAME, "input");
+        try nl.appendAttrBe64(gpa, &chain, NFTA_CHAIN.HANDLE, 1);
+        try nl.appendAttrString(gpa, &chain, NFTA_CHAIN.TYPE, "filter");
+        try nl.appendAttrBe32(gpa, &chain, NFTA_CHAIN.POLICY, 0);
+        {
+            const hook = try nl.nestBegin(gpa, &chain, nl.NLA_F_NESTED | NFTA_CHAIN.HOOK);
+            try nl.appendAttrBe32(gpa, &chain, NFTA_HOOK.HOOKNUM, 1);
+            try nl.appendAttrBe32(gpa, &chain, NFTA_HOOK.PRIORITY, 0);
+            try nl.appendAttrString(gpa, &chain, NFTA_HOOK.DEV, "eth0");
+            try nl.nestEnd(&chain, hook);
+        }
+        self.push(chain.items);
+
+        // A rule carrying two expressions, so `exprIterator` has a nest with
+        // something in it — the loop the harness bounds and never entered.
+        var rule: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &rule, types.NFPROTO.INET, 0);
+        try nl.appendAttrString(gpa, &rule, NFTA_RULE.TABLE, "filter");
+        try nl.appendAttrString(gpa, &rule, NFTA_RULE.CHAIN, "input");
+        try nl.appendAttrBe64(gpa, &rule, NFTA_RULE.HANDLE, 7);
+        {
+            var p = expr.Program.init(gpa, .inet);
+            const exprs = try p.tcpDport(22).counter().drop().finish();
+            const nest = try nl.nestBegin(gpa, &rule, nl.NLA_F_NESTED | NFTA_RULE.EXPRESSIONS);
+            for (exprs) |e| try expr.appendExpr(gpa, &rule, e);
+            try nl.nestEnd(&rule, nest);
+        }
+        self.push(rule.items);
+
+        // A set reply with the optional scalars present.
+        var set: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &set, types.NFPROTO.INET, 0);
+        try nl.appendAttrString(gpa, &set, NFTA_SET.TABLE, "filter");
+        try nl.appendAttrString(gpa, &set, NFTA_SET.NAME, "badhosts");
+        try nl.appendAttrBe32(gpa, &set, NFTA_SET.FLAGS, 0);
+        try nl.appendAttrBe32(gpa, &set, NFTA_SET.KEY_LEN, 4);
+        try nl.appendAttrBe64(gpa, &set, NFTA_SET.TIMEOUT, 3_600_000);
+        try nl.appendAttrBe64(gpa, &set, NFTA_SET.HANDLE, 9);
+        {
+            const desc = try nl.nestBegin(gpa, &set, nl.NLA_F_NESTED | NFTA_SET.DESC);
+            try nl.appendAttrBe32(gpa, &set, NFTA_SET_DESC.SIZE, 65536);
+            try nl.nestEnd(&set, desc);
+        }
+        self.push(set.items);
+
+        // A set-element reply with three elements, so `SetElemIterator` walks.
+        var elems: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &elems, types.NFPROTO.INET, 0);
+        try nl.appendAttrString(gpa, &elems, NFTA_SET_ELEM_LIST.TABLE, "filter");
+        try nl.appendAttrString(gpa, &elems, NFTA_SET_ELEM_LIST.SET, "badhosts");
+        {
+            const list = try nl.nestBegin(gpa, &elems, nl.NLA_F_NESTED | NFTA_SET_ELEM_LIST.ELEMENTS);
+            for ([_][4]u8{ .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, .{ 192, 168, 1, 1 } }) |addr| {
+                const el = try nl.nestBegin(gpa, &elems, nl.NLA_F_NESTED | expr.NFTA_LIST_ELEM);
+                const key = try nl.nestBegin(gpa, &elems, nl.NLA_F_NESTED | NFTA_SET_ELEM.KEY);
+                try nl.appendAttr(gpa, &elems, expr.NFTA_DATA.VALUE, &addr);
+                try nl.nestEnd(&elems, key);
+                try nl.nestEnd(&elems, el);
+            }
+            try nl.nestEnd(&elems, list);
+        }
+        self.push(elems.items);
+
+        // A bare `nfgenmsg`: every decoder succeeds and returns all defaults.
+        // The shape a reach guard must not count as work.
+        var bare: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &bare, types.NFPROTO.INET, 0);
+        self.push(bare.items);
+
+        // ── the length checks a real reply cannot exercise ─────────────────
+        // A FLAGS of two octets where `asBe32` wants four.
+        var wide: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &wide, types.NFPROTO.INET, 0);
+        try nl.appendAttr(gpa, &wide, NFTA_TABLE.FLAGS, &.{ 1, 2 });
+        self.push(wide.items);
+        // A HANDLE of four octets where `asBe64` wants eight.
+        var short_handle: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &short_handle, types.NFPROTO.INET, 0);
+        try nl.appendAttr(gpa, &short_handle, NFTA_TABLE.HANDLE, &.{ 0, 0, 0, 1 });
+        self.push(short_handle.items);
+        // A zero-length TLV, which must not loop.
+        {
+            var zero: [nfgenmsg_len + 4]u8 = @splat(0);
+            std.mem.writeInt(u16, zero[nfgenmsg_len..][2..4], NFTA_CHAIN.NAME, native_endian);
+            self.push(&zero);
+        }
+        // An attribute declaring 200 octets over a four-octet payload.
+        {
+            var over: [nfgenmsg_len + 4]u8 = @splat(0);
+            std.mem.writeInt(u16, over[nfgenmsg_len..][0..2], 200, native_endian);
+            std.mem.writeInt(u16, over[nfgenmsg_len..][2..4], NFTA_RULE.EXPRESSIONS, native_endian);
+            self.push(&over);
+        }
+        // An EXPRESSIONS nest whose own body is a truncated element.
+        var bad_exprs: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &bad_exprs, types.NFPROTO.INET, 0);
+        try nl.appendAttr(gpa, &bad_exprs, NFTA_RULE.EXPRESSIONS, &.{ 0xff, 0x00, 0x01, 0x80 });
+        self.push(bad_exprs.items);
+
+        // Two octets: shorter than an `nfgenmsg`.
+        self.push(&.{ 1, 0 });
+
+        return self.entries[0..self.n];
+    }
+};
+
+/// What one payload yielded. Shared by the fuzz target and its corpus guard so
+/// the guard drives the SAME five decoders.
+const WireTally = struct {
+    named: usize = 0,
+    handles: usize = 0,
+    exprs: usize = 0,
+    elements: usize = 0,
+};
+
+fn walkDecoders(buf: []const u8) !WireTally {
+    var t: WireTally = .{};
+    if (decodeTable(buf)) |x| {
+        if (x.name.len != 0) t.named += 1;
+        if (x.handle != 0) t.handles += 1;
+    } else |_| {}
+    if (decodeChain(buf)) |x| {
+        if (x.name.len != 0) t.named += 1;
+        if (x.handle != 0) t.handles += 1;
+    } else |_| {}
+    if (decodeSet(buf)) |x| {
+        if (x.name.len != 0) t.named += 1;
+    } else |_| {}
     if (decodeRule(buf) catch null) |r| {
+        if (r.chain.len != 0) t.named += 1;
+        if (r.handle != 0) t.handles += 1;
         var ei = r.exprIterator();
         var steps: usize = 0;
         while (ei.next() catch null) |_| {
             steps += 1;
             try testing.expect(steps <= r.expressions.len / 4 + 1);
+            t.exprs += 1;
         }
     }
     if (decodeSetElemReply(buf) catch null) |sr| {
+        if (sr.set.len != 0) t.named += 1;
         var si = sr.iterator();
         var steps: usize = 0;
         while (si.next() catch null) |_| {
             steps += 1;
             try testing.expect(steps <= sr.elements.len / 4 + 1);
+            t.elements += 1;
         }
     }
+    return t;
+}
+
+test "fuzz: object decoders never crash, loop or over-read" {
+    var corpus: WireCorpus = .{};
+    try testing.fuzz({}, fuzzDecoders, .{ .corpus = try corpus.build() });
+}
+
+fn fuzzDecoders(_: void, smith: *std.testing.Smith) !void {
+    // 2048, not 512: a rule reply carrying real expressions and a set-element
+    // reply carrying several elements both run past 512, and a seed longer
+    // than the buffer is not a big seed — `Smith.slice` reads it back as the
+    // EMPTY one.
+    var raw: [2048]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all five decoders were handed an EMPTY
+    // slice with the reply sitting unread in `raw`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 12 seeds non-empty,
+    // 0 objects named, 0 expressions and 0 set elements walked before; 12 of
+    // 12 non-empty, 11 objects named, 3 handles read, 6 expressions and 3 set
+    // elements walked, after.** The empty
+    // slice is refused at `payload.len < nfgenmsg_len`, so neither the
+    // expression iterator nor the set-element iterator — the two loops this
+    // target bounds with a `try testing.expect` — had ever executed.
+    const len: usize = smith.slice(&raw);
+    std.mem.doNotOptimizeAway(try walkDecoders(raw[0..len]));
+}
+
+test "corpus: every wire seed reaches the decoders, and the walked counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkDecoders`.
+    // `nonempty` is the reach claim and the only check that catches a seed
+    // grown past the harness's buffer, which `Smith.slice` reads back as the
+    // EMPTY one.
+    //
+    // ⛔ A decode count would not be a guard: a bare `nfgenmsg` with no
+    // attributes behind it is a legal reply and ALL FIVE decoders succeed on
+    // it, returning structs of defaults — one of the seeds above is exactly
+    // that, on purpose. `named`, `handles`, `exprs` and `elements` count work
+    // the empty payload cannot do.
+    var corpus: WireCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var total: WireTally = .{};
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [2048]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const t = try walkDecoders(raw[0..len]);
+        total.named += t.named;
+        total.handles += t.handles;
+        total.exprs += t.exprs;
+        total.elements += t.elements;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 11), total.named);
+    try testing.expectEqual(@as(usize, 3), total.handles);
+    try testing.expectEqual(@as(usize, 6), total.exprs);
+    try testing.expectEqual(@as(usize, 3), total.elements);
 }
 
 test "a set-element list too big for one message is refused, not silently truncated" {
