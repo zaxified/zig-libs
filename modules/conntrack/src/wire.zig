@@ -38,6 +38,9 @@ const builtin = @import("builtin");
 const netlink = @import("netlink");
 const netaddr = @import("netaddr");
 const codec = netlink.codec;
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const native_endian = builtin.cpu.arch.endian();
 
 // ── kernel UAPI constants ───────────────────────────────────────────────────
@@ -1347,19 +1350,140 @@ test "decoder survives misaligned and adversarially nested attribute streams" {
     }
 }
 
-test "fuzz: decodeFlow never crashes, hangs or reads out of bounds" {
-    try testing.fuzz({}, fuzzDecode, .{});
-}
+/// ctnetlink bytes for `fuzzDecode`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the bytes.
+///
+/// ⭐ Built at run time from this module's captured goldens and its own
+/// encoders rather than quoted as hex: an `nla_len`/`nla_type` pair is HOST
+/// byte order (the conntrack VALUES are big-endian, the netlink FRAMING is
+/// not), so a hex corpus would be a little-endian one and the counts pinned
+/// below would be false on a big-endian target instead of failing there.
+///
+/// The harness reads these bytes four ways at once — as a flow payload, as an
+/// `nfgenmsg`, as a tuple nest, and as a stream of whole netlink messages —
+/// so the corpus holds both whole datagrams and bare payloads.
+const DecodeCorpus = struct {
+    scratch: [16384]u8 = undefined,
+    store: [16384]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    n: usize = 0,
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
-    const buf = raw[0..len];
+    fn push(self: *DecodeCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
 
-    _ = decodeFlow(buf) catch {};
-    _ = parseNfgenmsg(buf) catch {};
-    if (buf.len > nfgenmsg_len) _ = decodeTuple(buf[nfgenmsg_len..]) catch {};
+    fn build(self: *DecodeCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // Whole captured datagrams: three flows in one, and one carrying the
+        // per-direction counters. Only the `MessageIterator` half reaches
+        // these — as a flat payload the first four octets are an nlmsghdr.
+        self.push(&goldens.dump_reply_three_flows);
+        self.push(&goldens.dump_reply_with_counters);
+        self.push(&goldens.get_reply_udp4);
+        // The same reply one level in: a bare payload, which is what
+        // `decodeFlow` and `parseNfgenmsg` take directly.
+        self.push(goldens.get_reply_udp4[codec.header_len..]);
+
+        // A tuple nest on its own, so `decodeTuple(buf[nfgenmsg_len..])`
+        // reaches the IP and PROTO sub-nests rather than a truncated header.
+        var tuple: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &tuple, .ipv4, 0);
+        {
+            const ip = try codec.nestBegin(gpa, &tuple, CTA_TUPLE.IP);
+            try codec.appendAttr(gpa, &tuple, CTA_IP.V4_SRC, &[_]u8{ 10, 0, 0, 1 });
+            try codec.appendAttr(gpa, &tuple, CTA_IP.V4_DST, &[_]u8{ 10, 0, 0, 2 });
+            try codec.nestEnd(&tuple, ip);
+            const proto = try codec.nestBegin(gpa, &tuple, CTA_TUPLE.PROTO);
+            try codec.appendAttrU8(gpa, &tuple, CTA_PROTO.NUM, 6);
+            try codec.appendAttrBe16(gpa, &tuple, CTA_PROTO.SRC_PORT, 1234);
+            try codec.appendAttrBe16(gpa, &tuple, CTA_PROTO.DST_PORT, 80);
+            try codec.nestEnd(&tuple, proto);
+        }
+        self.push(tuple.items);
+
+        // An IPv6 tuple, which is the only path that reads a 16-octet address.
+        var tuple6: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &tuple6, .ipv6, 0);
+        {
+            const ip = try codec.nestBegin(gpa, &tuple6, CTA_TUPLE.IP);
+            try codec.appendAttr(gpa, &tuple6, CTA_IP.V6_SRC, &([_]u8{0x20} ++ [_]u8{0} ** 15));
+            try codec.appendAttr(gpa, &tuple6, CTA_IP.V6_DST, &([_]u8{0xfe} ++ [_]u8{0} ** 15));
+            try codec.nestEnd(&tuple6, ip);
+        }
+        self.push(tuple6.items);
+
+        // ── the fixed-length checks, which a real reply cannot exercise ────
+        // A V4_SRC of 16 octets and a V6_SRC of 4: `fixed()`'s two directions.
+        var wrong_ip: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &wrong_ip, .ipv4, 0);
+        {
+            const ip = try codec.nestBegin(gpa, &wrong_ip, CTA_TUPLE.IP);
+            try codec.appendAttr(gpa, &wrong_ip, CTA_IP.V4_SRC, &([_]u8{0} ** 16));
+            try codec.nestEnd(&wrong_ip, ip);
+        }
+        self.push(wrong_ip.items);
+        var wrong_ip6: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &wrong_ip6, .ipv6, 0);
+        {
+            const ip = try codec.nestBegin(gpa, &wrong_ip6, CTA_TUPLE.IP);
+            try codec.appendAttr(gpa, &wrong_ip6, CTA_IP.V6_SRC, &([_]u8{0} ** 4));
+            try codec.nestEnd(&wrong_ip6, ip);
+        }
+        self.push(wrong_ip6.items);
+
+        // Odd-length scalars where `asBe32`/`asBe16` want exact widths.
+        var odd: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &odd, .ipv4, 0);
+        try codec.appendAttr(gpa, &odd, CTA.TIMEOUT, &[_]u8{ 0xa5, 0xa5, 0xa5 });
+        self.push(odd.items);
+        var odd_zone: std.ArrayList(u8) = .empty;
+        try appendNfgenmsg(gpa, &odd_zone, .ipv4, 0);
+        try codec.appendAttr(gpa, &odd_zone, CTA.ZONE, &[_]u8{0xa5});
+        self.push(odd_zone.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // One octet short of an `nfgenmsg`.
+        self.push(&[_]u8{ 2, 0, 0 });
+        // An attribute header declaring 200 octets over a four-octet payload.
+        {
+            var raw: [nfgenmsg_len + 4]u8 = @splat(0);
+            raw[0] = 2;
+            std.mem.writeInt(u16, raw[4..6], 200, native_endian);
+            std.mem.writeInt(u16, raw[6..8], CTA.TUPLE_ORIG, native_endian);
+            self.push(&raw);
+        }
+
+        return self.entries[0..self.n];
+    }
+};
+
+/// What one buffer yielded. Shared by the fuzz target and its corpus guard so
+/// the guard drives the SAME four readings.
+const DecodeTally = struct {
+    flat: usize = 0,
+    tuples: usize = 0,
+    addresses: usize = 0,
+    messages: usize = 0,
+    flows: usize = 0,
+};
+
+fn walkDecode(buf: []const u8) !DecodeTally {
+    var t: DecodeTally = .{};
+    if (decodeFlow(buf)) |_| t.flat += 1 else |_| {}
+    std.mem.doNotOptimizeAway(parseNfgenmsg(buf) catch null);
+    if (buf.len > nfgenmsg_len) {
+        if (decodeTuple(buf[nfgenmsg_len..])) |tp| {
+            t.tuples += 1;
+            if (tp.src != null) t.addresses += 1;
+            if (tp.dst != null) t.addresses += 1;
+        } else |_| {}
+    }
 
     // …and the same bytes seen as a stream of whole netlink messages, which is
     // how a dump reply actually arrives.
@@ -1368,6 +1492,76 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     while (it.next() catch null) |m| {
         steps += 1;
         try testing.expect(steps <= buf.len / 4 + 1);
-        _ = decodeFlow(m.payload) catch {};
+        t.messages += 1;
+        if (decodeFlow(m.payload)) |f| {
+            t.flows += 1;
+            if (f.orig.src != null) t.addresses += 1;
+            if (f.reply.src != null) t.addresses += 1;
+        } else |_| {}
     }
+    return t;
+}
+
+test "fuzz: decodeFlow never crashes, hangs or reads out of bounds" {
+    var corpus: DecodeCorpus = .{};
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    // 2048, not 512: `dump_reply_three_flows` is a whole captured datagram and
+    // a seed longer than the buffer is not a big seed — `Smith.slice` reads it
+    // back as the EMPTY one, so the module's own largest capture would have
+    // been silently unusable as a seed.
+    var raw: [2048]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all four readings below were handed an
+    // EMPTY slice with the reply sitting unread in `raw`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 12 seeds non-empty,
+    // 0 flows decoded, 0 tuples walked and 0 messages framed before; 12 of 12
+    // non-empty, 6 messages framed, 6 flows decoded out of them, 4 tuple
+    // nests walked and 16 addresses read, after.** The empty slice
+    // is refused at `payload.len < nfgenmsg_len`, and `MessageIterator` yields
+    // nothing from it, so neither the attribute walk nor the nested tuple
+    // decode had ever run.
+    const len: usize = smith.slice(&raw);
+    std.mem.doNotOptimizeAway(try walkDecode(raw[0..len]));
+}
+
+test "corpus: every decode seed reaches the walkers, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkDecode`. `nonempty`
+    // is the reach claim and the only check that catches a seed grown past the
+    // harness's buffer, which `Smith.slice` reads back as the EMPTY one —
+    // which is exactly what would have happened to `dump_reply_three_flows`
+    // at the old 512-octet buffer.
+    //
+    // ⛔ `flat` is not a guard on its own: an `nfgenmsg` with no attributes
+    // behind it decodes into an all-default `Flow`, so acceptance says nothing
+    // about whether the attribute walk ran. `tuples`, `addresses` and `flows`
+    // count work the empty input cannot do.
+    var corpus: DecodeCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var total: DecodeTally = .{};
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [2048]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const t = try walkDecode(raw[0..len]);
+        total.flat += t.flat;
+        total.tuples += t.tuples;
+        total.addresses += t.addresses;
+        total.messages += t.messages;
+        total.flows += t.flows;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 1), total.flat);
+    try testing.expectEqual(@as(usize, 4), total.tuples);
+    try testing.expectEqual(@as(usize, 16), total.addresses);
+    try testing.expectEqual(@as(usize, 6), total.messages);
+    try testing.expectEqual(@as(usize, 6), total.flows);
 }

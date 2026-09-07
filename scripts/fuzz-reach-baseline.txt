@@ -27,7 +27,6 @@ cbor 2
 chachapoly 2
 coap 1
 coconut 1
-conntrack 2
 cookies 1
 cors 1
 csvstream 2
