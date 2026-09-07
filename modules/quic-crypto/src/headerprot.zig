@@ -181,24 +181,119 @@ const testing = std.testing;
 // fuzzed too so short/zero-length PN windows and windows that hang off the
 // end of `packet` are both hit deliberately.
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// 64 packet octets after a 7-octet script prefix — three times the longest
+/// header this module quotes (the 22-octet RFC A.2 client Initial), and
+/// enough for `pn_offset` to sit inside, at, and past the end.
+const hp_packet_len = 64;
+/// `form`, `pn_offset`, then the five `Mask` octets.
+const hp_script_len = 7;
+
+/// The four arguments `remove` takes, read out of ONE drawn slice.
+///
+/// ⛔ They used to be four separate draws made AFTER `smith.bytes(&packet)`,
+/// which is fatal on a corpus replay: `bytes` consumes `@min(buf.len, in.len)`
+/// octets, and every draw after that finds an exhausted input and returns its
+/// minimum. So `len` was 0, `smith.value(bool)` was false, `pn_offset` was 0
+/// and the mask memset to zero — `remove` was called as
+/// `remove(&.{}, .short, 0, .{0,0,0,0,0})` on every input this lane can
+/// carry, and returned `error.PacketTooShort` from its first line. Measured
+/// 2026-09-07: `firstByteMask` had never been evaluated, the §5.4.1 pn_len
+/// recovery this whole module is about had never run once, and the harness's
+/// own comment about `pn_offset` being "fuzzed too so short/zero-length PN
+/// windows and windows that hang off the end of `packet` are both hit
+/// deliberately" was false when it was written.
+const RemoveInput = struct {
+    form: HeaderForm,
+    pn_offset: usize,
+    mask: Mask,
+    packet: []u8,
+};
+
+fn removeInput(raw: []u8) RemoveInput {
+    var out: RemoveInput = .{
+        .form = .short,
+        .pn_offset = 0,
+        .mask = .{ 0, 0, 0, 0, 0 },
+        .packet = raw[0..0],
+    };
+    if (raw.len >= 1) out.form = if (raw[0] & 1 == 1) .long else .short;
+    // Deliberately a whole octet: `pn_offset` reaches 255 against a packet of
+    // at most 64, because a peer's connection-ID length field can claim
+    // anything and the offset is derived from it before anything is
+    // authenticated.
+    if (raw.len >= 2) out.pn_offset = raw[1];
+    if (raw.len >= hp_script_len) out.mask = raw[2..hp_script_len].*;
+    if (raw.len > hp_script_len) out.packet = raw[hp_script_len..];
+    return out;
+}
+
+/// Seeds are `form, pn_offset, mask[5]` then the packet octets. The RFC 9001
+/// Appendix A vectors appear with their real masks and offsets, so the target
+/// walks the receive path over headers that actually unprotect.
+const remove_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // the empty script: `remove(&.{}, .short, 0, zeroes)`, which is all this target ever ran
+    fuzzseed.seedHex("01" ++ "12" ++ "437b9aec36" ++ "c000000001088394c8f03e5157080000449e7b9aec34"), // ⭐ RFC A.2 client Initial, long, pn_offset 18, real mask → pn_len 4
+    fuzzseed.seedHex("01" ++ "12" ++ "2ec0d8356a" ++ "cf000000010008f067a5502a4262b5004075c0d9"), // ⭐ RFC A.3 server Initial, long, pn_offset 18 → pn_len 2
+    fuzzseed.seedHex("00" ++ "01" ++ "aefefe7d03" ++ "4cfe4189"), // ⭐ RFC A.5 short header, pn_offset 1 → pn_len 3
+    fuzzseed.seedHex("01" ++ "01" ++ "aefefe7d03" ++ "4cfe4189"), // the same bytes read as a LONG header: 4 mask bits, not 5, so a different pn_len
+    fuzzseed.seedHex("00" ++ "00" ++ "0000000000" ++ "00"), // a one-octet packet: pn_len 1 exactly fills it
+    fuzzseed.seedHex("00" ++ "01" ++ "0000000000" ++ "00"), // ⭐ pn_offset 1 against a one-octet packet: the atomic-restore path
+    fuzzseed.seedHex("00" ++ "00" ++ "1f00000000" ++ "03"), // ⭐ the mask itself sets the low bits: unmasked first byte 0x1c → pn_len 1
+    fuzzseed.seedHex("01" ++ "00" ++ "0f00000000" ++ "03"), // the same mask octet through the LONG 0x0f: 0x0c → pn_len 1
+    fuzzseed.seedHex("00" ++ "00" ++ "0300000000" ++ "00" ++ "ffffffff"), // unmasked first byte 0x03 → the maximum pn_len 4
+    fuzzseed.seedHex("00" ++ "ff" ++ "0000000000" ++ "0102030405"), // pn_offset 255, far past the packet: PacketTooShort after the restore
+    fuzzseed.seedHex("00" ++ "04" ++ "0000000000" ++ "03000000"), // pn_offset at exactly packet.len: the boundary of `pn_offset > packet.len`
+    fuzzseed.seedHex("01" ++ "12" ++ "437b9aec36"), // the script with NO packet: length 0, the first-line refusal, kept on purpose
+    fuzzseed.seedHex("01" ++ "10" ++ "ffffffffff" ++ "ff" ** hp_packet_len), // ⭐ a full-buffer packet of 0xff with an all-ones mask
+};
+
 test "fuzz: remove never panics on arbitrary packet bytes / offsets / masks" {
-    try testing.fuzz({}, fuzzRemove, .{});
+    try testing.fuzz({}, fuzzRemove, .{ .corpus = &remove_seeds });
 }
 
 fn fuzzRemove(_: void, smith: *std.testing.Smith) !void {
-    var packet: [64]u8 = undefined;
-    smith.bytes(&packet);
-    const len: usize = smith.valueRangeAtMost(u8, 0, packet.len);
+    var raw: [hp_script_len + hp_packet_len]u8 = undefined;
+    // ⚠ ONE draw. See `RemoveInput` for what the four separate draws did.
+    const n: usize = smith.slice(&raw);
+    const in = removeInput(raw[0..n]);
+    _ = remove(in.packet, in.form, in.pn_offset, in.mask) catch {};
+}
 
-    const form: HeaderForm = if (smith.value(bool)) .long else .short;
-    // pn_offset is deliberately allowed to range past packet.len (an
-    // attacker-controlled connection-ID length field can claim anything).
-    const pn_offset: usize = smith.valueRangeAtMost(u16, 0, packet.len + 8);
-
-    var mask: Mask = undefined;
-    smith.bytes(&mask);
-
-    _ = remove(packet[0..len], form, pn_offset, mask) catch {};
+test "corpus: every seed reaches remove, and the pn_len values recovered are pinned" {
+    // ⭐ "Did it succeed" is not the number to pin: `remove` succeeds on a
+    // single zero octet, which is close to the degenerate input. The numbers
+    // the collapsed harness could not produce are the PN lengths RECOVERED —
+    // step 2 of the §5.4.1 ordering hazard — and the count of long-header
+    // seeds, since `firstByteMask(.long)` had never been evaluated at all.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var long_form: usize = 0;
+    var pn_len_seen = [_]bool{false} ** 4;
+    var pn_octets: usize = 0;
+    for (remove_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [hp_script_len + hp_packet_len]u8 = undefined;
+        const n: usize = smith.slice(&raw);
+        if (n != 0) nonempty += 1;
+        const in = removeInput(raw[0..n]);
+        if (in.form == .long) long_form += 1;
+        const r = remove(in.packet, in.form, in.pn_offset, in.mask) catch continue;
+        accepted += 1;
+        pn_octets += r.pn_len;
+        pn_len_seen[r.pn_len - 1] = true;
+    }
+    // One seed is deliberately the empty script.
+    try testing.expectEqual(remove_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draws were restructured: 0 non-empty,
+    // 0 accepted, 0 long-header rounds, no pn_len ever recovered.
+    try testing.expectEqual(@as(usize, 9), accepted);
+    try testing.expectEqual(@as(usize, 6), long_form);
+    try testing.expectEqual(@as(usize, 20), pn_octets);
+    // All four on-wire PN lengths, which is what "the attacker picks the
+    // field width" means here.
+    for (pn_len_seen) |seen| try testing.expect(seen);
 }
 
 fn hexTo(comptime n: usize, s: []const u8) [n]u8 {
