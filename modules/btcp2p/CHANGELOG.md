@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **The two `--fuzz` aids in `fuzzDecodeBlock` and `fuzzDecodeMessage` still
+  had not run once in the ordinary lane.** Both are knobs drawn AFTER the byte draw, and
+  `Smith.slice` leaves the seed exhausted, so `smith.value(bool)` returned its weight minimum:
+  measured 2026-09-08, the block's transaction-count bias fired on **0 of 6** seeds and the
+  envelope's magic stamp on **0 of 14**. (The 2026-09-07 entry below records the same branches
+  being unreachable for a different reason and fixing only the first half.) Seeds carrying a
+  `u64` word per knob now make each branch do visible work: `genesis_bad_count` is the genesis
+  block with its `01` transaction count replaced by a `0xfd` CompactSize prefix — refused as it
+  stands, accepted once the bias rewrites offset 80 — and three magic-less veracks are each
+  accepted by exactly one network once the stamp runs. Both corpus guards replay the knobs and
+  pin them as exact counts (`biased`/`txns`, `stamped`/`stamped_accepted`), never `> 0`, because
+  an empty block and a bad-magic refusal both score the same on `accepted` alone. Tests only.
+
 - **2026-09-07** — **All eleven fuzz harnesses now receive their input; none of
   them did before.** Every one opened `smith.bytes(&buf)` and then drew the
   length with a ranged draw. `bytes` takes `@min(buf.len, in.len)` octets, so
