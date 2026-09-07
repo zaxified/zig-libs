@@ -163,7 +163,7 @@ const module_list = [_]Module{
     .{ .name = "isis-spf", .libs = &.{"net"}, .deps = &.{ "isis", "isis-lsdb", "spf-ect" }, .test_deps = &.{"testkit"} },
     .{ .name = "isis-sim", .libs = &.{"net"}, .deps = &.{ "netsim", "isis", "isis-lsdb", "isis-flood", "isis-spf" } },
     .{ .name = "aeadframe", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
-    .{ .name = "tenantkex", .libs = &.{"crypto"}, .deps = &.{"noise"} },
+    .{ .name = "tenantkex", .libs = &.{"crypto"}, .deps = &.{"noise"}, .test_deps = &.{"testkit"} },
     .{ .name = "netsim", .libs = &.{"net"} },
     .{ .name = "loopfree-reconv", .libs = &.{"net"}, .deps = &.{ "netsim", "spf-ect" } },
     .{ .name = "df-elect", .libs = &.{"net"}, .deps = &.{"netsim"} },
