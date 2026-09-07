@@ -187,6 +187,10 @@ fn xorCounter(a: *[8]u8, t: u64) void {
     for (a, tb) |*x, y| x.* ^= y;
 }
 
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
+
 fn hexToBytes(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
@@ -283,60 +287,176 @@ test "unwrap fails closed: wrong KEK / corrupted ciphertext -> Unauthentic, outp
 //     same way (the campaign brief's own caveat), which is exactly why (1)
 //     exists as an independent check that does not go through `wrap` at
 //     all.
-test "fuzz: unwrap never leaks partial key material on failure, on arbitrary ciphertext" {
-    try std.testing.fuzz({}, fuzzUnwrapNoLeak, .{});
-}
+// ⚠ Both harnesses drew their knobs BEFORE any bytes and carried no corpus,
+// which made oracle (1) above dead code. `smith.value(bool)` reads eight octets
+// as a little-endian u64 and returns the range minimum when fewer remain, so on
+// the one input the ordinary lane runs (`in = ""`) the KEK was always 32 zero
+// octets — and in `fuzzUnwrapNoLeak` the ranged `ct_len` collapsed to 0 too, so
+// `unwrap` returned `InvalidLength`, the `err != error.Unauthentic` guard
+// returned, and the no-partial-key-leak assertion had **never executed once**.
+// `fuzzWrapUnwrapRoundTrip` ran exactly one case for ever: a 32-octet zero KEK
+// over 16 zero plaintext octets, at one of the 30 legal sizes its own name
+// claims to cover.
+//
+// ⛔ Arbitrary bytes cannot repair either. A ciphertext only reaches the
+// integrity check if its LENGTH is legal, and only authenticates if the
+// register lands on the default IV — 2^-64. So the ciphertext corpus is RFC
+// 3394's own vectors plus one-octet perturbations of them, the KEK is fixed to
+// RFC 3394's, and BOTH KEK lengths now run on every input instead of hanging on
+// a draw that is the range minimum on every corpus replay.
 
-fn fuzzUnwrapNoLeak(_: void, smith: *std.testing.Smith) !void {
-    const kek_len: usize = if (smith.value(bool)) 16 else 32;
-    var kek_buf: [32]u8 = undefined;
-    smith.bytes(kek_buf[0..kek_len]);
-    const kek = kek_buf[0..kek_len];
+/// RFC 3394 §4's two KEKs. Fixed rather than drawn: a KEK drawn after the
+/// ciphertext would be dead on a corpus replay, and a KEK drawn before it is
+/// what made this harness collapse in the first place.
+const rfc3394_kek128 = hexToBytes("000102030405060708090A0B0C0D0E0F");
+const rfc3394_kek256 = hexToBytes("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
 
-    // Length drawn first so every mutated byte lands inside `ct`, not
-    // scattered across a fixed 256-byte draw a small `ct_len` would discard.
-    var ct_buf: [256]u8 = undefined;
-    const ct_len = smith.valueRangeAtMost(u16, 0, ct_buf.len);
-    smith.bytes(ct_buf[0..ct_len]);
-    const ct = ct_buf[0..ct_len];
+const UnwrapProbe = struct {
+    /// Ciphertexts that authenticated under one of the two KEKs.
+    accepted: usize = 0,
+    /// Octets of key material recovered. ⛔ This is the number the collapsed
+    /// harness cannot produce: `unwrap` of an empty or wrong-length ciphertext
+    /// recovers nothing, so a corpus that quietly emptied would read 0 here
+    /// while an `accepted > 0` check could still be satisfied elsewhere.
+    recovered: usize = 0,
+    /// Refusals that reached the integrity check rather than a length guard —
+    /// i.e. the inputs on which oracle (1) actually ran.
+    unauthentic: usize = 0,
+};
 
-    var out: [256]u8 = undefined;
-    if (unwrap(kek, ct, &out)) |_| {
-        // Astronomically unlikely for random bytes (would require the
-        // integrity register to land on the default IV by chance), but not
-        // impossible in principle -- nothing to assert beyond "no crash".
-    } else |err| {
-        if (err != error.Unauthentic) return;
-        const n = ct.len / 8 - 1;
-        for (out[0..n]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+/// `fuzzUnwrapNoLeak`'s body, factored out so the corpus guard measures the
+/// same code the harness runs rather than a second copy of it.
+fn probeUnwrap(ct: []const u8, res: *UnwrapProbe) !void {
+    inline for (.{ rfc3394_kek128, rfc3394_kek256 }) |kek_bytes| {
+        const kek: []const u8 = &kek_bytes;
+        var out: [256]u8 = undefined;
+        if (unwrap(kek, ct, &out)) |got| {
+            res.accepted += 1;
+            res.recovered += got.len;
+        } else |err| {
+            if (err == error.Unauthentic) {
+                res.unauthentic += 1;
+                const n = ct.len / 8 - 1;
+                for (out[0..n]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+            }
+        }
     }
 }
 
+const unwrap_seeds = [_][]const u8{
+    // RFC 3394 §4.1: 128-bit KEK, 128-bit key. Authenticates under kek128.
+    testkit.fuzz.seedHex("1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5"),
+    // §4.3: 256-bit KEK, 128-bit key.
+    testkit.fuzz.seedHex("64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7"),
+    // §4.5: 256-bit KEK, 192-bit key — three semiblocks out.
+    testkit.fuzz.seedHex("A8F9BC1612C68B3FF6E6F4FBE30E71E4769C8B80A32CB8958CD5D17D6B254DA1"),
+    // §4.6: 256-bit KEK, 256-bit key — four semiblocks out.
+    testkit.fuzz.seedHex("28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21"),
+    // §4.1's ciphertext with its last octet changed: legal length, so it walks
+    // the whole unwrap recurrence and dies at the IV comparison. This is the
+    // seed oracle (1) is really about.
+    testkit.fuzz.seedHex("1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE4"),
+    // §4.1's ciphertext with an octet changed in the MIDDLE, so a different
+    // semiblock is the corrupted one.
+    testkit.fuzz.seedHex("1FA68B0A8112B447AEF24BD8FB5A7B829D3E862371D2CFE5"),
+    // 16 octets: below the two-semiblock floor, refused by the length guard.
+    testkit.fuzz.seedHex("1FA68B0A8112B447AEF34BD8FB5A7B82"),
+    // 25 octets: not a multiple of 8.
+    testkit.fuzz.seedHex("1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5FF"),
+    // The input this target ran, and only ran, for ever.
+    testkit.fuzz.seed(""),
+};
+
+test "fuzz: unwrap never leaks partial key material on failure, on arbitrary ciphertext" {
+    try std.testing.fuzz({}, fuzzUnwrapNoLeak, .{ .corpus = &unwrap_seeds });
+}
+
+fn fuzzUnwrapNoLeak(_: void, smith: *std.testing.Smith) !void {
+    var ct_buf: [256]u8 = undefined;
+    const ct_len = smith.slice(&ct_buf);
+    var res: UnwrapProbe = .{};
+    try probeUnwrap(ct_buf[0..ct_len], &res);
+    std.mem.doNotOptimizeAway(res.recovered);
+}
+
+test "corpus: every unwrap seed reaches the recurrence, counts pinned" {
+    var nonempty: usize = 0;
+    var res: UnwrapProbe = .{};
+    for (unwrap_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var ct_buf: [256]u8 = undefined;
+        const ct_len = smith.slice(&ct_buf);
+        if (ct_len != 0) nonempty += 1;
+        try probeUnwrap(ct_buf[0..ct_len], &res);
+    }
+    try std.testing.expectEqual(unwrap_seeds.len - 1, nonempty); // the last is empty
+    try std.testing.expectEqual(@as(usize, 4), res.accepted);
+    try std.testing.expectEqual(@as(usize, 88), res.recovered); // 16 + 16 + 24 + 32
+    // 8 refusals that walked the whole recurrence: the four RFC vectors each
+    // under the KEK that is NOT theirs, plus the two perturbations under both.
+    try std.testing.expectEqual(@as(usize, 8), res.unauthentic);
+}
+
+/// `fuzzWrapUnwrapRoundTrip`'s body, likewise shared with its guard.
+fn probeRoundTrip(pt: []const u8, recovered_total: *usize) !void {
+    inline for (.{ rfc3394_kek128, rfc3394_kek256 }) |kek_bytes| {
+        const kek: []const u8 = &kek_bytes;
+        var ct_buf: [256]u8 = undefined;
+        const ct = try wrap(kek, pt, &ct_buf);
+        var out: [248]u8 = undefined;
+        const recovered = try unwrap(kek, ct, &out);
+        try std.testing.expectEqualSlices(u8, pt, recovered);
+        recovered_total.* += recovered.len;
+    }
+}
+
+/// The seed's LENGTH picks the semiblock count, so the corpus below is a set of
+/// lengths rather than a set of frames.
+const roundtrip_seeds = [_][]const u8{
+    testkit.fuzz.seed("A" ** 16), // n = 2, the floor
+    testkit.fuzz.seed("B" ** 24), // n = 3
+    testkit.fuzz.seed("C" ** 32), // n = 4
+    testkit.fuzz.seed("D" ** 17), // rounded down to n = 2
+    testkit.fuzz.seed("E" ** 100), // rounded down to n = 12
+    testkit.fuzz.seed("F" ** 248), // n = 31, the ceiling `wrap`'s output holds
+    testkit.fuzz.seed("G" ** 7), // below the floor: raised to n = 2
+    testkit.fuzz.seed(""), // the only case this target used to run
+};
+
 test "fuzz: wrap then unwrap recovers the exact plaintext, at every legal size" {
-    try std.testing.fuzz({}, fuzzWrapUnwrapRoundTrip, .{});
+    try std.testing.fuzz({}, fuzzWrapUnwrapRoundTrip, .{ .corpus = &roundtrip_seeds });
 }
 
 fn fuzzWrapUnwrapRoundTrip(_: void, smith: *std.testing.Smith) !void {
-    const kek_len: usize = if (smith.value(bool)) 16 else 32;
-    var kek_buf: [32]u8 = undefined;
-    smith.bytes(kek_buf[0..kek_len]);
-    const kek = kek_buf[0..kek_len];
-
-    // n semiblocks, n in [2, 31] -> plaintext length in [16, 248], a
-    // multiple of 8 as `wrap` requires. Drawn before the bytes it bounds,
-    // same reasoning as above.
-    const n = smith.valueRangeAtMost(u8, 2, 31);
     var pt_buf: [248]u8 = undefined;
-    const pt_len = @as(usize, n) * 8;
-    smith.bytes(pt_buf[0..pt_len]);
-    const pt = pt_buf[0..pt_len];
+    const drawn = smith.slice(&pt_buf);
+    @memset(pt_buf[drawn..], 0);
+    // n semiblocks, n in [2, 31] -> plaintext length in [16, 248], a multiple
+    // of 8 as `wrap` requires. The SEED's own length picks n now; a shorter
+    // seed is zero-extended to the floor rather than being thrown away.
+    const pt_len = @max(@as(usize, 16), drawn - drawn % 8);
+    var total: usize = 0;
+    try probeRoundTrip(pt_buf[0..pt_len], &total);
+    std.mem.doNotOptimizeAway(total);
+}
 
-    var ct_buf: [256]u8 = undefined;
-    const ct = try wrap(kek, pt, &ct_buf);
-
-    var out: [248]u8 = undefined;
-    const recovered = try unwrap(kek, ct, &out);
-    try std.testing.expectEqualSlices(u8, pt, recovered);
+test "corpus: the round trip runs at the sizes the seeds name, count pinned" {
+    var total: usize = 0;
+    var nonempty: usize = 0;
+    for (roundtrip_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var pt_buf: [248]u8 = undefined;
+        const drawn = smith.slice(&pt_buf);
+        @memset(pt_buf[drawn..], 0);
+        if (drawn != 0) nonempty += 1;
+        const pt_len = @max(@as(usize, 16), drawn - drawn % 8);
+        try probeRoundTrip(pt_buf[0..pt_len], &total);
+    }
+    try std.testing.expectEqual(roundtrip_seeds.len - 1, nonempty);
+    // ⛔ Two KEKs × the rounded-down length of every seed. The collapsed
+    // harness could only ever make 2 × 16 = 32 out of one input, so this is the
+    // number that says the seeds' own lengths were read.
+    try std.testing.expectEqual(@as(usize, 928), total); // 2 × (16+24+32+16+96+248+16+16)
 }
 
 test "length + KEK validation (incl. the 192-bit-KEK std gap), with positive controls" {

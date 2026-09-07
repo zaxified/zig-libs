@@ -19,6 +19,10 @@ const chachapoly = @import("chachapoly");
 const record = @import("record.zig");
 const replay = @import("replay.zig");
 
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
+
 pub const key_length = 32;
 
 /// Upper bound on the caller-supplied `aad` accepted by `seal`/`open`. Both
@@ -718,21 +722,133 @@ test "positive control: an always-accept replay filter WOULD admit a replay" {
 }
 
 // ── untrusted-decode fuzz: open() over arbitrary bytes never panics ───────────
+//
+// ⚠ This harness used to open with
+//
+//     smith.bytes(&buf);
+//     const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+//
+// and carried no corpus. `bytes` consumes what the seed has, and the ranged
+// draw then finds fewer than the eight octets it reads as a little-endian u64,
+// so `len` was the range MINIMUM — zero. Outside `--fuzz` the target therefore
+// ran exactly one input for ever: `open(&out, "", "aad")`, which `record.parse`
+// refuses as `Truncated` before anything else runs. The assertion this harness
+// exists for — `m + record.overhead <= len` — had never executed once.
+//
+// ⛔ Arbitrary bytes cannot repair that on their own: a record only gets past
+// `Aead.decrypt` if it carries a valid tag over its own header, so the chance
+// of drawing one is 2^-128. The corpus below therefore comes out of this
+// module's OWN sealer, under the same key/epoch/aad the harness opens with, and
+// the near-misses are that record with a single octet changed — the shape that
+// reaches past `parse` and into the epoch/replay/AEAD checks behind it.
+
+/// Key, epoch and caller-aad the corpus is sealed under. The harness and the
+/// guard both open with exactly these, so "accepted" means the seed's own
+/// octets authenticated — not that some other input happened to be legal.
+const fuzz_key = [_]u8{0x5A} ** 32;
+const fuzz_epoch: u32 = 0;
+const fuzz_aad = "aad";
+
+/// The corpus is built at run time (only the sealer can produce a record), so
+/// the guard below builds it from HERE rather than from a second copy — a
+/// guard measuring a different corpus is not a guard.
+const OpenCorpus = struct {
+    const count = 8;
+    /// 128 is the harness's buffer; a seed longer than it reads back EMPTY.
+    frames: [count][128]u8 = undefined,
+    store: [count][4 + 128]u8 = undefined,
+    seeds: [count][]const u8 = undefined,
+
+    fn set(self: *OpenCorpus, i: usize, frame: []const u8) void {
+        @memcpy(self.frames[i][0..frame.len], frame);
+        self.seeds[i] = testkit.fuzz.seedInto(&self.store[i], self.frames[i][0..frame.len]);
+    }
+
+    fn setPerturbed(self: *OpenCorpus, i: usize, frame: []const u8, at: usize, mask: u8) void {
+        var tmp: [128]u8 = undefined;
+        @memcpy(tmp[0..frame.len], frame);
+        tmp[at] ^= mask;
+        self.set(i, tmp[0..frame.len]);
+    }
+
+    fn build(self: *OpenCorpus) void {
+        var s = ChaChaChannel.Sealer.init(fuzz_key, fuzz_epoch);
+        var rec: [128]u8 = undefined;
+
+        // seq 0: a genuine record. A fresh Opener has committed nothing, so
+        // this one authenticates and commits.
+        const n0 = s.seal(&rec, "hello", fuzz_aad) catch unreachable;
+        self.set(0, rec[0..n0]);
+        var real: [128]u8 = undefined;
+        @memcpy(real[0..n0], rec[0..n0]);
+
+        // seq 1, empty plaintext: the shortest record that exists (exactly
+        // `overhead`), and the boundary `parse` measures `Truncated` against.
+        const n1 = s.seal(&rec, "", fuzz_aad) catch unreachable;
+        self.set(1, rec[0..n1]);
+
+        // seq 2, the longest record the harness's buffer can carry.
+        const big = [_]u8{0xA5} ** (128 - record.overhead);
+        const n2 = s.seal(&rec, &big, fuzz_aad) catch unreachable;
+        self.set(2, rec[0..n2]);
+
+        // One ciphertext octet flipped: parses, epoch matches, window admits
+        // it, and only Poly1305 refuses — the deepest refusal in `open`.
+        self.setPerturbed(3, real[0..n0], record.header_len, 0x01);
+        // Version octet wrong: `UnsupportedVersion`, before any AEAD work.
+        self.setPerturbed(4, real[0..n0], 0, 0x01);
+        // Epoch octet wrong: `EpochMismatch`.
+        self.setPerturbed(5, real[0..n0], 1, 0x01);
+        // One octet short of `overhead`: `Truncated`.
+        self.set(6, real[0 .. record.overhead - 1]);
+        // And the input this target used to run for ever.
+        self.set(7, "");
+    }
+};
 
 fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     var out: [128]u8 = undefined;
-    var o = ChaChaChannel.Opener.init([_]u8{0x5A} ** 32, 0);
+    var o = ChaChaChannel.Opener.init(fuzz_key, fuzz_epoch);
     // Arbitrary bytes must only ever yield a typed error or a plaintext length
     // <= input — never a panic, OOB, or hang. Bounded allocation (none).
-    const m = o.open(&out, buf[0..len], "aad") catch return;
+    const m = o.open(&out, buf[0..len], fuzz_aad) catch return;
     try testing.expect(m + record.overhead <= len);
 }
 
 test "fuzz: Opener.open never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzOpen, .{});
+    var corpus: OpenCorpus = .{};
+    corpus.build();
+    try testing.fuzz({}, fuzzOpen, .{ .corpus = &corpus.seeds });
+}
+
+test "corpus: every open seed reaches the record parser, counts pinned" {
+    var corpus: OpenCorpus = .{};
+    corpus.build();
+
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ `accepted > 0` would be no guard here: it is the plaintext OCTETS the
+    // collapsed harness cannot produce. `open("")` is refused, and the
+    // empty-plaintext record is accepted while yielding nothing, so this second
+    // number only moves when a seed's own ciphertext actually decrypted.
+    var plaintext_octets: usize = 0;
+    for (corpus.seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [128]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var out: [128]u8 = undefined;
+        var o = ChaChaChannel.Opener.init(fuzz_key, fuzz_epoch);
+        const m = o.open(&out, buf[0..len], fuzz_aad) catch continue;
+        accepted += 1;
+        plaintext_octets += m;
+    }
+    try testing.expectEqual(OpenCorpus.count - 1, nonempty); // seed 7 is empty
+    try testing.expectEqual(@as(usize, 3), accepted);
+    // 5 ("hello") + 0 (empty plaintext) + 99 (the buffer-filling record).
+    try testing.expectEqual(@as(usize, 104), plaintext_octets);
 }
 
 // ── key destruction (CONVENTIONS §2.1 Z1) ─────────────────────────────────────

@@ -211,6 +211,11 @@ pub fn unpadXmlEnc(buf: []const u8) PaddingError!usize {
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
+
 const Aes128 = std.crypto.core.aes.Aes128;
 const Aes256 = std.crypto.core.aes.Aes256;
 
@@ -448,16 +453,56 @@ test "XML-Enc unpad round-trip through real CBC encrypt/decrypt" {
 // specific, checkable claim about the buffer's *last byte* and (for PKCS#7)
 // every byte in the claimed pad — so the harness asserts that claim holds,
 // which is strictly stronger than surviving without a crash.
+// ⚠ Both halves of this harness were dead until 2026-09-07. It opened with
+//
+//     const len = smith.valueRangeAtMost(u16, 0, buf.len);
+//     smith.bytes(buf[0..len]);
+//
+// and carried no corpus. A ranged draw reads eight octets as a little-endian
+// u64 and returns the range MINIMUM when fewer than eight remain, so `len` was
+// 0 on every input — and the comment that used to sit here, "length drawn first
+// so every mutated byte lands inside `data`", described a `data` that was
+// always empty. `unpadPkcs7("")`/`unpadXmlEnc("")` both return `InvalidPadding`
+// at the first line, so NEITHER of the two invariant blocks below had ever
+// executed a single assertion.
+//
+// The fix is one byte-first draw (`smith.slice`) plus a corpus: a random
+// 16-octet buffer ends in a pad byte in `1..16` about 6% of the time, so
+// arbitrary bytes do reach the success path eventually, but not in the one
+// input the ordinary lane runs. The seeds below pin both accepting shapes and
+// the four distinct refusals.
+const unpad_seeds = [_][]const u8{
+    // PKCS#7-valid, one block: 11 octets of message + 5 × 0x05.
+    testkit.fuzz.seedHex("6161616161616161616161" ++ "0505050505"),
+    // PKCS#7-valid, two blocks, a full block of padding (N = 16).
+    testkit.fuzz.seedHex("00112233445566778899aabbccddeeff" ++ ("10" ** 16)),
+    // PKCS#7-valid with N = 1: the shortest pad the scheme allows.
+    testkit.fuzz.seedHex("000102030405060708090a0b0c0d0e" ++ "01"),
+    // ⭐ The scheme split: last byte 0x10 but the preceding 15 are not, so
+    // PKCS#7 refuses and XML-Enc — which only reads the LENGTH byte — accepts
+    // and returns 0. The one seed that tells the two functions apart.
+    testkit.fuzz.seedHex(("a5" ** 15) ++ "10"),
+    // N = 0: refused by both, and the reason `unpadPkcs7` latches a flag
+    // instead of returning early.
+    testkit.fuzz.seedHex(("a5" ** 15) ++ "00"),
+    // N = 17 > block_len: refused by both, and the input that would run the
+    // `@min` clamp off the end of the buffer if it were not clamped.
+    testkit.fuzz.seedHex(("a5" ** 15) ++ "11"),
+    // 20 octets: not block-aligned, refused before the last byte is read.
+    testkit.fuzz.seedHex("00112233445566778899aabbccddeeff" ++ "05050505"),
+    // The input this target ran, and only ran, for ever.
+    testkit.fuzz.seed(""),
+};
+
 test "fuzz: unpad functions never panic, and a successful unpad's invariant actually holds" {
-    try testing.fuzz({}, fuzzUnpad, .{});
+    try testing.fuzz({}, fuzzUnpad, .{ .corpus = &unpad_seeds });
 }
 
 fn fuzzUnpad(_: void, smith: *testing.Smith) !void {
-    // Length drawn first so every mutated byte lands inside `data`, not
-    // scattered across a fixed 512-byte draw a small `len` would discard.
+    // One byte-first draw: the length is the seed's own, not a collapsing
+    // ranged draw taken before it.
     var buf: [512]u8 = undefined;
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
-    smith.bytes(buf[0..len]);
+    const len = smith.slice(&buf);
     const data = buf[0..len];
 
     if (unpadPkcs7(data)) |n| {
@@ -474,6 +519,35 @@ fn fuzzUnpad(_: void, smith: *testing.Smith) !void {
         try testing.expect(pad >= 1 and pad <= block_len);
         try testing.expectEqual(data.len - @as(usize, pad), n);
     } else |_| {}
+}
+
+test "corpus: every unpad seed reaches the guards, counts pinned" {
+    var nonempty: usize = 0;
+    var pkcs7_ok: usize = 0;
+    var xmlenc_ok: usize = 0;
+    // ⛔ A count of successes alone would not notice a corpus that collapsed to
+    // one seed. `pkcs7_octets` is the number the empty input cannot make: it
+    // only moves when a seed's OWN length and pad byte were both read.
+    var pkcs7_octets: usize = 0;
+    for (unpad_seeds) |sd| {
+        var smith: testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (unpadPkcs7(buf[0..len])) |n| {
+            pkcs7_ok += 1;
+            pkcs7_octets += n;
+        } else |_| {}
+        if (unpadXmlEnc(buf[0..len])) |_| {
+            xmlenc_ok += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(unpad_seeds.len - 1, nonempty); // the last seed is empty
+    try testing.expectEqual(@as(usize, 3), pkcs7_ok);
+    // One more than PKCS#7: the "length byte only" seed, which is the whole
+    // difference between the two schemes.
+    try testing.expectEqual(@as(usize, 4), xmlenc_ok);
+    try testing.expectEqual(@as(usize, 42), pkcs7_octets); // 11 + 16 + 15
 }
 
 test "raw CBC vs jwe's/xmlenc's hand-rolled shape: same output on the same input" {
