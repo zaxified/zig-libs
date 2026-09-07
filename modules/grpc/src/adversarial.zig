@@ -183,34 +183,203 @@ test "hostile: a grpc-timeout value outside the grammar is rejected" {
 
 // ── fuzz ───────────────────────────────────────────────────────────────────
 
-fn fuzzDeframerNeverPanics(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
-    const chunk = smith.valueRangeAtMost(u16, 1, 64);
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the streams
+/// they are. A corpus entry is not the frame: `Smith.slice` reads a
+/// little-endian u32 length first (see `testkit/src/fuzz.zig`).
+const seed = @import("testkit").fuzz.seedHex;
+const testkit = @import("testkit");
 
+/// What a stream did to the deframer, so the guard below can measure the
+/// corpus rather than assert it merely ran.
+const DeframeOutcome = struct {
+    messages: usize = 0,
+    refused: bool = false,
+};
+
+/// The body of `fuzzDeframerNeverPanics`, factored out so the harness and the
+/// corpus guard drive the SAME deframer over the same octets and the same
+/// chunk size.
+fn runDeframeStream(bytes: []const u8, chunk: usize) !DeframeOutcome {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
+    var out: DeframeOutcome = .{};
     var d: frame.Deframer = .{ .max_recv_message_size = 4096 };
     var i: usize = 0;
-    while (i < len) {
-        const end = @min(len, i + chunk);
-        d.push(a, buf[i..end]) catch return;
-        while (d.next() catch return) |_| {}
+    while (i < bytes.len) {
+        const end = @min(bytes.len, i + chunk);
+        d.push(a, bytes[i..end]) catch {
+            out.refused = true;
+            return out;
+        };
+        while (d.next() catch {
+            out.refused = true;
+            return out;
+        }) |_| out.messages += 1;
         i = end;
     }
-    d.endOfStream() catch return;
+    d.endOfStream() catch {
+        out.refused = true;
+    };
+    return out;
 }
+
+/// Length-prefixed message streams paired with the chunk size they are fed in,
+/// in the format `Smith` reads: `slice` framing for the stream, then an
+/// eight-octet word for the chunk.
+///
+/// ⚠ The chunk is not decoration. The test's name promises "however they are
+/// chopped", and the chunk used to be a `valueRangeAtMost(u16, 1, 64)` drawn
+/// AFTER the byte draw — i.e. after the input was exhausted — so it was the
+/// range minimum, **1**, on every replay. One octet at a time is the single
+/// chopping that never puts a header boundary anywhere interesting.
+const DeframeCorpus = struct {
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [16][]const u8 = undefined,
+    chunks: [16]usize = undefined,
+    n: usize = 0,
+
+    fn push(self: *DeframeCorpus, stream: []const u8, chunk: u16) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], stream);
+        // ⚠ `chunk - 1`, because the harness reads the word as `% 64 + 1`.
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], chunk - 1, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.chunks[self.n] = chunk;
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    fn pushHex(self: *DeframeCorpus, comptime h: []const u8, chunk: u16) void {
+        var stream: [h.len / 2]u8 = undefined;
+        _ = std.fmt.hexToBytes(&stream, h) catch unreachable;
+        self.push(&stream, chunk);
+    }
+
+    fn build(self: *DeframeCorpus) []const []const u8 {
+        // One message, delivered whole and then one octet at a time.
+        self.pushHex("00" ++ "00000005" ++ "68656c6c6f", 64);
+        self.pushHex("00" ++ "00000005" ++ "68656c6c6f", 1);
+        // Two back to back, chopped at 7 — a boundary inside the second header.
+        self.pushHex("00" ++ "00000005" ++ "68656c6c6f" ++ "00" ++ "00000003" ++ "626172", 7);
+        // A zero-length message: a legal frame that carries nothing.
+        self.pushHex("00" ++ "00000000", 64);
+        // 200 octets, so the payload spans several 64-octet pushes.
+        self.pushHex("00" ++ "000000C8" ++ ("AA" ** 200), 64);
+        // Truncated: a header with no body, and a body one octet short.
+        self.pushHex("00" ++ "000000", 64);
+        self.pushHex("00" ++ "00000005" ++ "68656c", 64);
+        // The compressed flag with no encoding negotiated.
+        self.pushHex("01" ++ "00000005" ++ "68656c6c6f", 64);
+        // 8192 declared against a 4096 ceiling: refused before the body arrives.
+        self.pushHex("00" ++ "00002000", 64);
+        // One whole message followed by a truncated second.
+        self.pushHex("00" ++ "00000005" ++ "68656c6c6f" ++ "00" ++ "000000", 64);
+        // 512 zero octets: an accidental stream of empty messages, five octets
+        // each, with two left over that `endOfStream` refuses.
+        self.pushHex("00" ** 512, 64);
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: the deframer never panics on arbitrary bytes, however they are chopped" {
-    try std.testing.fuzz({}, fuzzDeframerNeverPanics, .{});
+    var corpus: DeframeCorpus = .{};
+    try std.testing.fuzz({}, fuzzDeframerNeverPanics, .{ .corpus = corpus.build() });
+}
+
+fn fuzzDeframerNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM.
+    // And `len` here is not merely the end of the slice — it is the bound of
+    // the loop that pushes into the deframer, so the body never executed and
+    // `push` was **never called**: this harness fed the deframer nothing at
+    // all. `check-fuzz-reach` only learned to see that shape on 2026-09-07.
+    // Measured over the corpus above: **0 of 11 seeds reached `push` and 0
+    // messages were deframed before, 11 of 11 and 109 messages after.**
+    const len: usize = smith.slice(&buf);
+    // ⚠ `value(u64)` and a `%`, not `valueRangeAtMost(u16, 1, 64)`: a ranged
+    // draw taken after the bytes is its minimum, so every stream was chopped
+    // one octet at a time. See `DeframeCorpus`.
+    const chunk: usize = @intCast(smith.value(u64) % 64 + 1);
+    _ = try runDeframeStream(buf[0..len], chunk);
+}
+
+test "corpus: every deframer seed reaches push with the chunk size it was written for" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `messages` is the second number and the
+    // one an empty stream cannot produce; `chunks` pins that the chopping word
+    // arrived as written, without which the "however they are chopped" half of
+    // the harness silently goes back to one octet at a time.
+    var corpus: DeframeCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var chunks: usize = 0;
+    var messages: usize = 0;
+    var refusals: usize = 0;
+    for (entries, corpus.chunks[0..corpus.n]) |sd, want_chunk| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const chunk: usize = @intCast(smith.value(u64) % 64 + 1);
+        if (chunk == want_chunk) chunks += 1;
+        const out = try runDeframeStream(buf[0..len], chunk);
+        messages += out.messages;
+        if (out.refused) refusals += 1;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(entries.len, chunks);
+    try testing.expectEqual(@as(usize, 109), messages);
+    try testing.expectEqual(@as(usize, 6), refusals);
+}
+
+/// Field values, in the format `Smith.slice` reads. These are header values,
+/// not frames: `grpc-status`, `grpc-timeout` and `grpc-message` off the wire,
+/// plus the base64 a `-bin` metadata key carries.
+///
+/// ⛔ A corpus of refusals is not enough here and neither is `accepted > 0`:
+/// `status.decodeMessage` has no failure mode at all — it copies what it
+/// cannot decode — so it "succeeds" on every input including the empty one.
+/// The guard pins what each parser actually RESOLVED.
+const field_seeds = [_][]const u8{
+    seed("30"), // "0" — OK
+    seed("3136"), // "16" — UNAUTHENTICATED
+    seed("3939"), // "99" — a status number with no name
+    seed("6E6F742D612D6E756D626572"), // "not-a-number"
+    seed("3020"), // "0 " — a trailing space is not the grammar
+    seed("3153"), // "1S" — one second
+    seed("3130306D"), // "100m" — 100 milliseconds
+    seed("39393939393939393953"), // "999999999S" — nine digits, one too many
+    seed("3173"), // "1s" — lowercase is not a unit
+    seed("312E3553"), // "1.5S"
+    seed("6E6F253230656E747279253041686572"), // "no%20entry%0Ahere" — the percent-encoded message
+    seed("2530302564"), // "%00%d" — a valid escape and a broken one
+    seed("25"), // a lone percent at the end of the value
+    seed("616263"), // "abc" — nothing to decode
+    seed("61474673624738"), // "aGVsbG8" — base64 for "hello", unpadded
+    seed("6147567362473839"), // "aGVsbG8=" — the same, padded
+    seed("2121212121"), // "!!!!!" — not base64 at all
+    seed("41423D43"), // "AB=C" — padding in the middle
+    seed("3D3D3D3D"), // "===="
+    seed("41414141"), // "AAAA" — three octets out
+};
+
+test "fuzz: status, timeout and metadata field parsing never panic" {
+    try std.testing.fuzz({}, fuzzFieldValuesNeverPanic, .{ .corpus = &field_seeds });
 }
 
 fn fuzzFieldValuesNeverPanic(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length — see `fuzzDeframerNeverPanics` above. `len` was 0 for every
+    // input, so all four parsers here were called with `""` for ever.
+    // Measured over the corpus above: **0 of 20 seeds non-empty, 0 statuses,
+    // 0 timeouts and 0 binary values resolved before; 20 of 20 non-empty, 3
+    // statuses, 2 timeouts and 6 binary values after.**
+    const len: usize = smith.slice(&buf);
     const value = buf[0..len];
 
     _ = status.parse(value);
@@ -227,6 +396,35 @@ fn fuzzFieldValuesNeverPanic(_: void, smith: *std.testing.Smith) !void {
     const r = metadata.decodeValue(std.testing.allocator, "x-bin", value) catch return;
     r.deinit(std.testing.allocator);
 }
-test "fuzz: status, timeout and metadata field parsing never panic" {
-    try std.testing.fuzz({}, fuzzFieldValuesNeverPanic, .{});
+
+test "corpus: every field seed reaches the parsers, and what they resolved is pinned" {
+    // ⭐ Three second numbers rather than one, because this harness runs four
+    // parsers over the same octets and a corpus that feeds one of them says
+    // nothing about the other three. `decoded_bytes` in particular is the only
+    // check that `decodeMessage` did any percent-decoding at all — it has no
+    // error path, so it "works" on every input including `""`.
+    var nonempty: usize = 0;
+    var statuses: usize = 0;
+    var timeouts: usize = 0;
+    var bin_values: usize = 0;
+    var decoded_bytes: usize = 0;
+    for (field_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const value = buf[0..len];
+        if (status.parse(value) != null) statuses += 1;
+        if (call.Timeout.parse(value) != null) timeouts += 1;
+        var out: [256]u8 = undefined;
+        decoded_bytes += status.decodeMessage(value, &out).len;
+        const r = metadata.decodeValue(std.testing.allocator, "x-bin", value) catch continue;
+        defer r.deinit(std.testing.allocator);
+        bin_values += 1;
+    }
+    try testing.expectEqual(field_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), statuses);
+    try testing.expectEqual(@as(usize, 2), timeouts);
+    try testing.expectEqual(@as(usize, 6), bin_values);
+    try testing.expectEqual(@as(usize, 92), decoded_bytes);
 }

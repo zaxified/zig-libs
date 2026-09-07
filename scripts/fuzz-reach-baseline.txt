@@ -49,7 +49,6 @@ framing 1
 frost 1
 fuzzysearch 2
 geoindex 2
-grpc 3
 ibe 1
 icmp 1
 isis 1

@@ -241,7 +241,7 @@ const module_list = [_]Module{
     .{ .name = "jinja", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "cbor", .libs = &.{"format"} },
     .{ .name = "protobuf", .libs = &.{ "format", "web" } },
-    .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf" } },
+    .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"} },
     .{ .name = "webauthn", .libs = &.{"crypto"}, .deps = &.{ "cbor", "rsa", "p256", "x509" } },
     .{ .name = "zipstream", .libs = &.{"format"} },
     .{ .name = "qr", .libs = &.{"format"} },

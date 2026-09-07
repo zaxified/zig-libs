@@ -19,6 +19,11 @@ const pb = @import("protobuf");
 const grpc = @import("root.zig");
 
 const testing = std.testing;
+
+/// `testkit.fuzz.seedHex`, aliased so the scripts below read as the octets they
+/// are. A corpus entry is not the script: `Smith.slice` reads a little-endian
+/// u32 length first (see `testkit/src/fuzz.zig`).
+const seed = @import("testkit").fuzz.seedHex;
 const h2 = http.h2;
 const h2c = http.h2_client;
 const hpack = http.hpack;
@@ -888,12 +893,48 @@ fn fieldValue(hl: hpack.HeaderList, name: []const u8) ?[]const u8 {
 // The first is what stops an error response from hanging a client that waits
 // for trailers that will never come.
 test "fuzz: the Trailers-Only decision over scripted response shapes" {
-    try std.testing.fuzz({}, fuzzResponseShape, .{ .corpus = shape_seeds });
+    try std.testing.fuzz({}, fuzzResponseShape, .{ .corpus = &shape_seeds });
 }
 
 const status_values = [_][]const u8{ "0", "1", "7", "16", "99", "", "not-a-number", "0 " };
 
-fn fuzzResponseShape(_: void, smith: *std.testing.Smith) !void {
+/// `testkit.fuzz.Cursor` over one corpus seed, which is what drives
+/// `fuzzResponseShape`.
+///
+/// ⚠ Every choice here used to come from a scalar `Smith` draw, the first of
+/// them a `value(bool)` — `check-fuzz-reach` classifies that R1. A scalar draw
+/// reads eight octets as a little-endian u64 and returns the range MINIMUM
+/// unless the whole word falls inside the range, so a corpus for it has to be
+/// written as a list of u64 words, which is what `shapeSeed` was: it packed
+/// `(bits >> w) & 0x07` into eight-octet words so ranged draws would survive.
+/// That worked, and it was unreadable — nobody could tell from a seed which
+/// shape it scripts, and the guard below could not have been written against
+/// it. Reading the choices out of ONE `smith.slice` fixes both halves: the
+/// draw is byte-first, so the gate is satisfied honestly, and a seed becomes a
+/// script you can read. Under `--fuzz` the fuzzer still drives every choice,
+/// because it drives the slice.
+const Script = @import("testkit").fuzz.Cursor;
+
+/// The shape a script scripted, plus what the client made of it — so the guard
+/// below can measure the corpus rather than assert it merely ran.
+const ShapeOutcome = struct {
+    trailers_only: bool = false,
+    /// `grpc-status` was put in the initial header block.
+    status_in_head: bool = false,
+    /// The initial HEADERS carried END_STREAM.
+    head_end: bool = false,
+    /// DATA frames the peer emitted.
+    data_frames: usize = 0,
+    /// The peer sent a trailer section rather than an empty end-of-stream DATA.
+    sent_trailers: bool = false,
+    /// Messages the client actually deframed.
+    messages: usize = 0,
+};
+
+/// The body of `fuzzResponseShape`, factored out so the harness and the corpus
+/// guard drive the SAME script from the same octets. A guard measuring a
+/// different sequence from the one the harness runs is not a guard.
+fn runShapeScript(bytes: []const u8) !ShapeOutcome {
     const gpa = testing.allocator;
     const fx = try Fx.init(gpa, .{});
     defer fx.deinit();
@@ -905,11 +946,21 @@ fn fuzzResponseShape(_: void, smith: *std.testing.Smith) !void {
     var peer = try Peer.init(fx.clientBytes());
     defer peer.deinit();
 
-    const http_ok = smith.value(bool);
-    const grpc_ct = smith.value(bool);
-    const status_in_head = smith.value(bool);
-    const head_end = smith.value(bool);
-    const head_status = status_values[smith.valueRangeAtMost(u8, 0, status_values.len - 1)];
+    // ⚠ Every knob is read unconditionally, even the ones this shape will not
+    // use, so a seed's octets always mean the same thing. A cursor whose
+    // offsets depend on earlier choices is a script nobody can review.
+    var s = Script{ .bytes = bytes };
+    const http_ok = s.byte() & 1 != 0;
+    const grpc_ct = s.byte() & 1 != 0;
+    const status_in_head = s.byte() & 1 != 0;
+    const head_end = s.byte() & 1 != 0;
+    const head_status = status_values[s.ranged(0, status_values.len - 1)];
+    const message_in_head = s.byte() & 1 != 0;
+    const n_data = s.ranged(0, 2);
+    const send_trailers = s.byte() & 1 != 0;
+    const trailer_status = status_values[s.ranged(0, status_values.len - 1)];
+
+    var out: ShapeOutcome = .{ .status_in_head = status_in_head, .head_end = head_end };
 
     var fields: [5]hpack.Field = undefined;
     var nf: usize = 0;
@@ -923,7 +974,7 @@ fn fuzzResponseShape(_: void, smith: *std.testing.Smith) !void {
     if (status_in_head) {
         fields[nf] = .{ .name = "grpc-status", .value = head_status };
         nf += 1;
-        if (smith.value(bool)) {
+        if (message_in_head) {
             fields[nf] = .{ .name = "grpc-message", .value = "no%20entry%0Ahere" };
             nf += 1;
         }
@@ -931,24 +982,31 @@ fn fuzzResponseShape(_: void, smith: *std.testing.Smith) !void {
     try peer.conn.sendHeaders(&peer.wire, 1, fields[0..nf], head_end);
 
     if (!head_end) {
-        const n_data = smith.valueRangeAtMost(u8, 0, 2);
-        var i: u8 = 0;
+        var i: u32 = 0;
         while (i < n_data) : (i += 1) {
-            const body = try framed(gpa, .{ .text = "pong", .n = smith.value(i8) });
+            const msg_n: i8 = @bitCast(s.byte());
+            const keep_whole = s.byte() & 1 != 0;
+            const body = try framed(gpa, .{ .text = "pong", .n = msg_n });
             defer gpa.free(body);
             // A truncated body is a shape too — a deframer waiting on the
             // rest of a message when the stream ends is a distinct outcome
             // from a clean end.
-            const keep = if (smith.value(bool)) body.len else smith.valueRangeAtMost(u8, 0, @intCast(body.len));
+            //
+            // ⚠ `partial` is drawn whether or not it is used. It used to sit
+            // inside the `else`, and a cursor read that only happens on one
+            // branch shifts every later octet: the second DATA frame of the
+            // three-octets-per-frame script read the FIRST frame's unused
+            // fraction as its own message number, and was truncated to one
+            // octet by an octet meant for something else. Measured: two whole
+            // messages scripted, one delivered.
+            const partial = s.ranged(0, @intCast(body.len));
+            const keep = if (keep_whole) body.len else partial;
             try peer.data(1, body[0..keep], false);
+            out.data_frames += 1;
         }
-        if (smith.value(bool)) {
-            try peer.trailers(1, &.{
-                .{
-                    .name = "grpc-status",
-                    .value = status_values[smith.valueRangeAtMost(u8, 0, status_values.len - 1)],
-                },
-            });
+        if (send_trailers) {
+            out.sent_trailers = true;
+            try peer.trailers(1, &.{.{ .name = "grpc-status", .value = trailer_status }});
         } else {
             // No trailer section at all: the stream just ends. A client that
             // takes this for a status is the defect.
@@ -961,8 +1019,10 @@ fn fuzzResponseShape(_: void, smith: *std.testing.Smith) !void {
     while (guard < 8) : (guard += 1) {
         const m = c.receive() catch break;
         if (m == null) break;
+        out.messages += 1;
     }
     c.finish() catch {};
+    out.trailers_only = c.trailers_only;
 
     // The shape decision, against the wire that was actually scripted.
     //
@@ -987,28 +1047,80 @@ fn fuzzResponseShape(_: void, smith: *std.testing.Smith) !void {
         // not Trailers-Only is if the decision was missed.
         return error.TrailersOnlyMissed;
     }
-}
-
-/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
-/// `options.corpus` plus one empty input, and an empty input makes every draw
-/// return its range minimum — one single shape, forever.
-fn shapeSeed(comptime bits: u64, comptime n: usize) [n]u8 {
-    @setEvalBranchQuota(100_000);
-    var out: [n]u8 = undefined;
-    var i: usize = 0;
-    var w: u6 = 0;
-    while (i + 8 <= n) : (i += 8) {
-        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x07, .little);
-        w +%= 1;
-    }
-    @memset(out[i..], 0);
     return out;
 }
 
-const shape_seeds: []const []const u8 = &.{
-    &shapeSeed(0x9E37_79B9_7F4A_7C15, 256),
-    &shapeSeed(0x0123_4567_89AB_CDEF, 256),
-    &shapeSeed(0xF0E1_D2C3_B4A5_9687, 256),
-    &shapeSeed(0xFFFF_FFFF_FFFF_FFFF, 256),
-    &shapeSeed(0x6C62_1F4D_3A98_5E27, 256),
+fn fuzzResponseShape(_: void, smith: *std.testing.Smith) !void {
+    var script: [256]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runShapeScript(script[0..n]);
+}
+
+/// Response scripts. The layout the cursor reads is, one octet each:
+/// `httpOk, grpcContentType, statusInHead, headEnd, headStatusIndex,
+/// grpcMessageInHead, dataFrames(0..2), sendTrailers, trailerStatusIndex`,
+/// then per DATA frame `msgN, keepWhole, keepFraction`. Odd means true; a
+/// short script cycles, so `"00"` is the all-zero shape.
+const shape_seeds = [_][]const u8{
+    // The conforming Trailers-Only response: 200, gRPC content type, status in
+    // the head, END_STREAM on the HEADERS. This is the shape whose mishandling
+    // hangs a client waiting for trailers that never come.
+    seed("01" ++ "01" ++ "01" ++ "01" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00"),
+    // The same with a grpc-message alongside the status.
+    seed("01" ++ "01" ++ "01" ++ "01" ++ "03" ++ "01" ++ "00" ++ "00" ++ "00"),
+    // The ordinary response: head, two whole messages, then trailers.
+    seed("01" ++ "01" ++ "00" ++ "00" ++ "00" ++ "00" ++ "02" ++ "01" ++ "00" ++
+        "07" ++ "01" ++ "00" ++ "2A" ++ "01" ++ "00"),
+    // One message truncated mid-frame, then trailers: the deframer is left
+    // waiting on the rest of a message when the stream ends.
+    seed("01" ++ "01" ++ "00" ++ "00" ++ "00" ++ "00" ++ "01" ++ "01" ++ "00" ++
+        "07" ++ "00" ++ "02"),
+    // A stream that just ends with no trailer section at all. A client that
+    // takes this for a status is the defect.
+    seed("01" ++ "01" ++ "00" ++ "00" ++ "00" ++ "00" ++ "01" ++ "00" ++ "00" ++
+        "07" ++ "01" ++ "00"),
+    // grpc-status in the head WITHOUT END_STREAM, and a trailer section too —
+    // the hybrid the ⚠ above is about, found on this harness's 62nd input.
+    seed("01" ++ "01" ++ "01" ++ "00" ++ "00" ++ "00" ++ "00" ++ "01" ++ "00"),
+    // HTTP 503: not a gRPC response at all, so Trailers-Only must not be claimed.
+    seed("00" ++ "01" ++ "01" ++ "01" ++ "01" ++ "00" ++ "00" ++ "00" ++ "00"),
+    // 200 with a non-gRPC content type and a status in the head.
+    seed("01" ++ "00" ++ "01" ++ "01" ++ "01" ++ "00" ++ "00" ++ "00" ++ "00"),
+    // The junk status values: "", "not-a-number", "0 " in head and trailers.
+    seed("01" ++ "01" ++ "01" ++ "01" ++ "05" ++ "00" ++ "00" ++ "00" ++ "06"),
+    seed("01" ++ "01" ++ "00" ++ "00" ++ "07" ++ "00" ++ "00" ++ "01" ++ "06"),
+    // One octet, cycled: the degenerate script, and exactly the shape the
+    // collapsed harness ran on every input for its whole life.
+    seed("00"),
 };
+
+test "corpus: every shape seed scripts a distinct response, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets and through the SAME `runShapeScript`.
+    //
+    // `nonempty` is the reach claim. The other three are what it cannot say:
+    // this harness's subject is a DECISION, so a corpus that reaches it and
+    // scripts one shape eleven times is worth one seed. `trailers_only` counts
+    // the seeds that reach the branch the harness exists to test, `data_frames`
+    // the seeds that get past the header block at all, and `messages` that the
+    // deframer was actually driven — none of which the all-zero script (the
+    // collapsed harness's one and only input) can produce.
+    var nonempty: usize = 0;
+    var trailers_only: usize = 0;
+    var data_frames: usize = 0;
+    var messages: usize = 0;
+    for (shape_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [256]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        const out = try runShapeScript(script[0..n]);
+        if (out.trailers_only) trailers_only += 1;
+        data_frames += out.data_frames;
+        messages += out.messages;
+    }
+    try testing.expectEqual(shape_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), trailers_only);
+    try testing.expectEqual(@as(usize, 4), data_frames);
+    try testing.expectEqual(@as(usize, 3), messages);
+}

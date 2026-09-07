@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: all three harnesses ran on a single fixed input, and one of
+  them never called the code it names. `adversarial.fuzzDeframerNeverPanics` and
+  `fuzzFieldValuesNeverPanic` opened with `smith.bytes(&buf)` followed by a ranged length
+  draw; a ranged draw reads eight octets as a little-endian u64 and returns the range MINIMUM
+  when fewer than eight remain, and `bytes` had already eaten the seed, so `len` was **0 on
+  every input**. In the deframer harness that `len` bounds the loop that pushes into the
+  deframer, so `push` was **never called at all** — the harness fed the deframer nothing while
+  its name promises "however they are chopped". Its `chunk` was a second casualty: drawn after
+  the bytes, it was always the range minimum **1**, the one chopping that never puts a header
+  boundary anywhere interesting. Both now draw with one `smith.slice(&buf)`, the chunk travels
+  in the seed as a `value(u64)` word, and each has a corpus with a guard pinning measured
+  numbers. Before → after: `fuzzDeframerNeverPanics` 0/11 seeds reaching `push` and 0 messages
+  deframed → 11/11 and 109; `fuzzFieldValuesNeverPanic` 0/20 non-empty with 0 statuses, 0
+  timeouts and 0 binary values resolved → 20/20 with 3, 2 and 6, and 92 octets percent-decoded.
+- **2026-09-07** — `call_test.fuzzResponseShape` moved off scalar `Smith` draws onto
+  `testkit.fuzz.Cursor`. Its corpus was a list of u64 words built by `shapeSeed`, which worked
+  — the words were `& 0x07` so ranged draws survived — but was unreadable: no reviewer could
+  tell which response shape a seed scripts, and no guard could be written against it. The
+  choices now come out of one `smith.slice` as a byte script, so the harness is byte-first and
+  a seed is a reviewable line. ⛔ Writing the guard immediately found a defect in the harness
+  that the u64 corpus had hidden: the per-DATA-frame "keep the whole body" fraction was drawn
+  **inside the `else` branch**, so a cursor read that only happened on one path shifted every
+  later octet — the second DATA frame read the first frame's unused fraction as its own message
+  number and was truncated by an octet meant for something else. Two whole messages scripted,
+  one delivered. Every knob is now read unconditionally. Guard pins 11 of 11 seeds non-empty,
+  4 Trailers-Only decisions, 4 DATA frames and 3 messages deframed.
+
 - **2026-09-06** — **The external anchor moved out of the module and its evidence moved in.**
   `src/reference_interop.zig` spawned Python `grpcio` from inside `test-grpc` and
   `@embedFile`d `src/testdata/reference_server.py` / `reference_client.py` into module
