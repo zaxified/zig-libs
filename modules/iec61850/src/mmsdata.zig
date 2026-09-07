@@ -44,6 +44,12 @@
 const std = @import("std");
 const ber = @import("ber.zig");
 
+/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the frames it
+/// is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw frame would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seedHex;
+
 pub const Error = ber.Error || error{
     /// A context tag that is not one of the `Data` alternatives.
     UnknownDataType,
@@ -664,14 +670,51 @@ test "generalized time is checked for shape" {
     try testing.expectError(error.BadTime, (try Data.decode(&bad)).generalizedTime());
 }
 
+/// `Data` TLVs, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// One member of every alternative the `CHOICE` above names that this module's
+/// value tests carry a literal for, the two constructed ones, and the refusals
+/// `decode` and `validate` name. Uniform random octets clear `Kind.fromTag`
+/// only when the first octet happens to be a context tag in 1…17 and the length
+/// agrees with what follows, so without these the harness proves little beyond
+/// that the tag check rejects noise.
+const data_seeds = [_][]const u8{
+    seed("A206830101850107"), // a structure holding a boolean and an integer
+    seed("A106850101850102"), // an array of two integers
+    seed("830101"), // boolean TRUE
+    seed("850107"), // integer 7
+    seed("860109"), // unsigned 9
+    seed("8705083D2A5155"), // floating-point, from the accessor test
+    seed("88043F800000"), // the withdrawn `real` alternative
+    seed("890444332211"), // an octet string
+    seed("8A0361626364"), // a visible string, "abcd"
+    seed("84020007"), // a bit string with one unused bit
+    seed("8B0F" ++ "32303236303732323132303030305A"), // generalized time, "20260722120000Z"
+    seed("8C0601E9C1113CB8"), // binary time: the TimeOfEntry of a captured report
+    seed("91086A61D98FC418930A"), // utc-time: the `t` of a captured GOOSE frame
+    seed("A20D9108000000000000001A850101"), // validate: a reserved accuracy buried in a structure
+    seed("8000"), // UnknownDataType: context [0]
+    seed("9200"), // UnknownDataType: context [18]
+    seed("020105"), // UnknownDataType: a universal tag
+    seed("8200"), // WrongDataType: a primitive `structure`
+    seed("A500"), // WrongDataType: a constructed `integer`
+    seed("A800"), // WrongDataType: a constructed `real`
+    seed("8B0432307878"), // decodes, but `generalizedTime` refuses "20xx"
+    seed("A2"), // a constructed header with no length octet
+};
+
 test "fuzz: Data decode and validate never panic" {
-    try std.testing.fuzz({}, fuzzData, .{});
+    try std.testing.fuzz({}, fuzzData, .{ .corpus = &data_seeds });
 }
 
 fn fuzzData(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so the length was 0 for every seed and `decode` was handed an empty slice
+    // with the seed sitting unread in the buffer.
+    const len: usize = smith.slice(&buf);
     const d = Data.decode(buf[0..len]) catch return;
     d.validate() catch return;
     // Everything that validated must be walkable without error.
@@ -689,4 +732,32 @@ fn fuzzData(_: void, smith: *std.testing.Smith) !void {
         _ = d.utcTime() catch {};
         _ = d.binaryTime() catch {};
     }
+}
+
+test "corpus: every Data seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so this pins the number rather than asserting it is > 0.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var validated: usize = 0;
+    for (data_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (Data.decode(buf[0..len])) |d| {
+            decoded += 1;
+            if (d.validate()) |_| validated += 1 else |_| {}
+        } else |_| {}
+    }
+    try testing.expectEqual(data_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 15), decoded);
+    // `validate` is the second gate and the one the deep walk below it needs;
+    // a corpus that decodes but never validates never reaches `members()`.
+    try testing.expectEqual(@as(usize, 14), validated);
 }

@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`ber`, `mmsdata` and `acsi`: four more harnesses that threw
+  their input away, and a round-trip assertion that was false.** `ber.fuzzDecode`,
+  `ber.fuzzIterate`, `mmsdata.fuzzData` and `acsi.fuzzParse` all opened
+  `smith.bytes(&buf)` and then drew the length with a ranged draw, which returns
+  the range MINIMUM when fewer than eight octets remain — the length was **0 for
+  every seed**. `ber.fuzzTagLength` was the other shape: its first draw was
+  `smith.value(u32)`, so all but 1 in 2^32 input words collapsed the tag number
+  to 0, and it never decoded octets a peer could send at all — it only ran
+  encode-then-decode on its own output. It now draws the octets first and runs
+  the codecs in wire order (identifier, then length), feeding the encode
+  direction from those same octets so one seed drives the whole body.
+  Each now carries a corpus taken from this file's own value tests. Measured:
+  `ber.fuzzDecode` 19 of 19 seeds non-empty and **9 decoded**; `ber.fuzzIterate`
+  9 of 9 and **10 members yielded**; `ber.fuzzTagLength` 14 of 15 non-empty (one
+  empty seed on purpose) and **10 tags / 6 lengths** decoded; `mmsdata.fuzzData`
+  22 of 22 and **15 decoded, 14 validated**; `acsi.fuzzParse` 22 of 22 and
+  **4 ACSI / 4 MMS** references parsed. Before the fix every one of those
+  numbers was 0, because every seed read back as the empty slice.
+- ⭐ **2026-09-07** — **`ber.fuzzDecode` asserted something untrue about BER.**
+  Seeding it exposed it: the harness required a definite-length element to
+  re-encode to exactly the octets it arrived in, but `decodeLength` accepts the
+  **non-minimal** long form — X.690 mandates minimal length octets in DER
+  (§10.1), not in BER — so `04 81 03 'a' 'b' 'c'` decodes here and re-encodes as
+  the four-octet `04 03 'a' 'b' 'c'`. The assertion had never executed, because
+  the length draw above it was always 0. It is now guarded on the incoming
+  encoding being minimal, and `a non-minimal long-form length decodes, and does
+  not re-encode to its own octets` pins the behaviour as a value test.
+
 - **2026-09-07** — **Six fuzz harnesses now receive their input; they did not
   before.** `tpkt.fuzzDecode`, `tpkt.fuzzFramer`, `cotp.fuzzDecode`,
   `session.fuzzDecode`, `presentation.fuzzDecode` and `acse.fuzzDecode` all

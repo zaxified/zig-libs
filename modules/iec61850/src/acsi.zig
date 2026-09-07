@@ -28,6 +28,12 @@
 const std = @import("std");
 const mms = @import("mms.zig");
 
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the references it
+/// is. A corpus entry is not the reference: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw string would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
 pub const Error = error{
     /// No `/` separating the logical device from the logical node.
     MissingLogicalDevice,
@@ -446,14 +452,50 @@ test "a reference with no components below the logical node round trips" {
     try testing.expectEqualStrings("LLN0", try ref.mmsItem(&buf));
 }
 
+/// Object references, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// The harness runs both parsers over the same octets, so the corpus carries
+/// both forms plus the strings that make each of them refuse. Uniform random
+/// octets contain a `/` at all with probability ~1/256 per octet and then have
+/// to survive `EmptyComponent`, so without these the harness proves only that
+/// `MissingLogicalDevice` fires on noise.
+const parse_seeds = [_][]const u8{
+    seed("simpleIOGenericIO/GGIO1.AnIn1.mag.f"), // the captured ACSI reference
+    seed("simpleIOGenericIO/GGIO1$MX$AnIn1$mag$f"), // …and its MMS form
+    seed("simpleIOGenericIO/LLN0$RP$EventsRCB01"), // a report control block
+    seed("simpleIOGenericIO/LLN0$RP$EventsRCB01$TrgOps"), // …and an attribute under it
+    seed("simpleIOGenericIO/LLN0$GO$gcbAnalogValues"), // a GOOSE control block
+    seed("LD/GGIO1.Ind1.stVal"), // the short ACSI form
+    seed("LD/LLN0"), // no components below the logical node
+    seed("GGIO1.AnIn1"), // MissingLogicalDevice
+    seed("/GGIO1.AnIn1"), // EmptyComponent: no logical device
+    seed("LD/"), // EmptyComponent: no logical node
+    seed("LD/GGIO1."), // EmptyComponent: a trailing separator
+    seed("LD/GGIO1..mag"), // EmptyComponent: a doubled separator
+    seed("LD/GGIO1$ST$Ind1.stVal"), // UnexpectedSeparator in the MMS form
+    seed("LD/GGIO1/X"), // UnexpectedSeparator: a second `/`
+    seed("LD/LN.a.b.c.d.e.f.g.h.i"), // TooManyComponents
+    seed("LD/LN$ST$a$b$c$d$e$f$g$h$i"), // TooManyComponents, MMS form
+    seed("LD/LN$ZZ$DO"), // UnknownFunctionalConstraint
+    seed("LD/GGIO1"), // IncompleteReference: no FC
+    seed("LD/$ST$Ind1"), // EmptyComponent: no logical node
+    seed("LD/GGIO1$$Ind1"), // EmptyComponent: no FC
+    seed("LD/GGIO1$ST$"), // EmptyComponent: nothing below the FC
+    seed("LD/" ++ ("x" ** 200)), // ReferenceTooLong
+};
+
 test "fuzz: reference parsing never panics" {
-    try std.testing.fuzz({}, fuzzParse, .{});
+    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, 200);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so the length was 0 for every seed and both parsers were handed an empty
+    // string with the seed sitting unread in the buffer.
+    const len: usize = smith.slice(&buf);
     const s = buf[0..len];
     if (parseAcsi(s, .ST)) |ref| {
         var out: [512]u8 = undefined;
@@ -470,4 +512,28 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         const again = try parseMms(wire);
         try testing.expect(ref.eql(&again));
     } else |_| {}
+}
+
+test "corpus: every seed reaches both parsers, and the accepted counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so this pins the numbers rather than asserting they are > 0.
+    var nonempty: usize = 0;
+    var acsi_ok: usize = 0;
+    var mms_ok: usize = 0;
+    for (parse_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parseAcsi(buf[0..len], .ST)) |_| acsi_ok += 1 else |_| {}
+        if (parseMms(buf[0..len])) |_| mms_ok += 1 else |_| {}
+    }
+    try testing.expectEqual(parse_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), acsi_ok);
+    try testing.expectEqual(@as(usize, 4), mms_ok);
 }
