@@ -946,8 +946,9 @@ test "corpus: the recover seeds drive every knob, and the counts are pinned" {
         if (run.root_kind == @intFromEnum(format.NodeKind.branch)) branch_roots += 1;
     }
     try testing.expectEqual(@as(usize, 12), metas_stamped);
-    // random, leaf, branch, freelist — all four shapes stamped at least once.
-    // Before the corpus all 40 data pages were shape 0.
+    // random, leaf, branch, freelist — all four shapes stamped at least once,
+    // over 10 seeds x 4 data pages. Before the corpus there was ONE run, and
+    // its four data pages were all shape 0.
     try testing.expectEqual([4]usize{ 25, 10, 1, 4 }, shapes);
     // 3 of 10 seeds recover; the other 7 are the refusals named above. The txn
     // sum pins WHICH three, so a seed that stops being adopted cannot be
