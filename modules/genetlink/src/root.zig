@@ -47,6 +47,11 @@ const linux = std.os.linux;
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const native_endian = builtin.cpu.arch.endian();
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads. A corpus entry is
+// not the frame — `Smith.slice` reads a little-endian u32 length first. See
+// `testkit/src/fuzz.zig` for the three hazards it carries for the caller.
+const testkit = @import("testkit");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -532,58 +537,275 @@ fn buildMcastGroupsAttrs(
 // CTRL_ATTR_MCAST_GROUPS -> per-group nest -> NAME/ID) — the deeper,
 // actually-interesting parser reachable from `splitPayload`'s output.
 
+/// genl payloads for `fuzzSplitPayload`, in the format `Smith.slice` reads
+/// (see `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by this module's and `codec`'s own encoders rather than
+/// quoted as hex. The genlmsghdr itself is byte-order-free, but everything
+/// after it is a netlink TLV, whose lengths and scalars are HOST byte order —
+/// a hex corpus would be a little-endian one and the pinned counts below would
+/// be false on a big-endian target rather than failing there.
+const Corpus = struct {
+    scratch: [2048]u8 = undefined,
+    store: [2048]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A bare genlmsghdr: the shortest payload `splitPayload` accepts, and
+        // the one whose attribute list is empty.
+        var bare: std.ArrayList(u8) = .empty;
+        try appendHeader(gpa, &bare, CTRL_CMD_GETFAMILY, 1);
+        self.push(bare.items);
+
+        // A CTRL_CMD_NEWFAMILY-shaped reply: genlmsghdr, a family id, and the
+        // mcast-group nest `findMcastGroupId` walks.
+        var reply: std.ArrayList(u8) = .empty;
+        try appendHeader(gpa, &reply, 1, 2); // CTRL_CMD_NEWFAMILY, version 2
+        try buildMcastGroupsAttrs(gpa, &reply, &.{
+            .{ .name = "config", .id = 5 },
+            .{ .name = "scan", .id = 6 },
+        });
+        self.push(reply.items);
+
+        // The same reply with its last octet chopped: the outer nest now
+        // claims more than is there.
+        self.push(reply.items[0 .. reply.items.len - 1]);
+
+        // Header plus an attribute whose declared length runs past the buffer.
+        var overrun: std.ArrayList(u8) = .empty;
+        try appendHeader(gpa, &overrun, 1, 2);
+        var bad: [4]u8 = undefined;
+        std.mem.writeInt(u16, bad[0..2], 200, native_endian);
+        std.mem.writeInt(u16, bad[2..4], CTRL_ATTR_FAMILY_ID, native_endian);
+        try overrun.appendSlice(gpa, &bad);
+        self.push(overrun.items);
+
+        // One and three octets: shorter than the 4-byte genlmsghdr, which is
+        // the only thing `splitPayload` itself checks.
+        self.push(&[_]u8{0x03});
+        self.push(&[_]u8{ 0x03, 0x01, 0x00 });
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: splitPayload never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzSplitPayload, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzSplitPayload, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzSplitPayload(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `splitPayload` was handed an empty
+    // slice with the payload sitting unread in `buf`. Measured 2026-09-07 over
+    // the corpus above: **0 of 6 seeds non-empty and 0 accepted before, 6 of 6
+    // non-empty and 4 accepted after.**
+    const len: usize = smith.slice(&buf);
     _ = splitPayload(buf[0..len]) catch {};
 }
 
+test "corpus: every splitPayload seed reaches it, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than in a comment, over the SAME
+    // corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the 64-octet buffer, which
+    // `Smith.slice` reads back as the empty one. `accepted` is pinned rather
+    // than asserted `> 0` — and it matters here more than usual, because
+    // `splitPayload` accepts anything four octets or longer, so a corpus of
+    // nothing but 4-byte headers would score full marks while walking nothing.
+    // `attrs` is what says the attribute list behind the header is real.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var attrs: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (splitPayload(buf[0..len])) |split| {
+            accepted += 1;
+            var it: codec.AttrIterator = .{ .buf = split.attrs };
+            while (it.next() catch null) |_| attrs += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), accepted);
+    try testing.expectEqual(@as(usize, 3), attrs);
+}
+
+/// Attribute blobs and the group name to look for, laid out the way
+/// `fuzzFindMcastGroupId` draws them: two `testkit.fuzz` slice seeds back to
+/// back (u32 length + bytes, twice).
+///
+/// The attribute bytes come from `buildMcastGroupsAttrs` at run time, so the
+/// corpus tracks this module's encoder instead of freezing a paste of it.
+const FindCorpus = struct {
+    scratch: [2048]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    wants: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *FindCorpus, attrs: []const u8, want: []const u8) void {
+        const a = testkit.fuzz.seedInto(self.store[self.used..], attrs);
+        const b = testkit.fuzz.seedInto(self.store[self.used + a.len ..], want);
+        self.entries[self.n] = self.store[self.used..][0 .. a.len + b.len];
+        self.wants[self.n] = want;
+        self.used += a.len + b.len;
+        self.n += 1;
+    }
+
+    fn build(self: *FindCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        var groups: std.ArrayList(u8) = .empty;
+        try buildMcastGroupsAttrs(gpa, &groups, &.{
+            .{ .name = "config", .id = 5 },
+            .{ .name = "scan", .id = 6 },
+            .{ .name = "mlme", .id = 8 },
+        });
+        // A name that is published, one that is not, and a prefix of a real
+        // one — the three outcomes of the comparison branch.
+        self.push(groups.items, "scan");
+        self.push(groups.items, "vendor");
+        self.push(groups.items, "sca");
+        // The truncated nest: the outer length now claims more than is there.
+        self.push(groups.items[0 .. groups.items.len - 1], "scan");
+
+        // A matching group with no id at all — `error.BadLength`, the one
+        // refusal this function raises about its own contents rather than
+        // about the framing.
+        var noid: std.ArrayList(u8) = .empty;
+        {
+            const outer = try codec.nestBegin(gpa, &noid, CTRL_ATTR_MCAST_GROUPS);
+            const inner = try codec.nestBegin(gpa, &noid, 1);
+            try codec.appendAttrString(gpa, &noid, CTRL_ATTR_MCAST_GRP_NAME, "scan");
+            try codec.nestEnd(&noid, inner);
+            try codec.nestEnd(&noid, outer);
+        }
+        self.push(noid.items, "scan");
+
+        // An empty outer nest, and attribute bytes that are not a nest at all.
+        var empty: std.ArrayList(u8) = .empty;
+        {
+            const outer = try codec.nestBegin(gpa, &empty, CTRL_ATTR_MCAST_GROUPS);
+            try codec.nestEnd(&empty, outer);
+        }
+        self.push(empty.items, "scan");
+
+        var sibling: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU16(gpa, &sibling, CTRL_ATTR_FAMILY_ID, 0x1c);
+        self.push(sibling.items, "scan");
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: findMcastGroupId never panics on arbitrary or structurally-nested attribute bytes" {
-    try testing.fuzz({}, fuzzFindMcastGroupId, .{});
+    var corpus: FindCorpus = .{};
+    try testing.fuzz({}, fuzzFindMcastGroupId, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzFindMcastGroupId(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-
-    // Half the time: raw random bytes (the outer AttrIterator walk itself).
-    // The other half: a structurally valid CTRL_ATTR_MCAST_GROUPS nest of
-    // valid group sub-nests wrapping RANDOM name/id attribute bytes, so the
-    // fuzzer reaches the inner nest walk and the name-comparison branch
-    // instead of bailing out at the first `Truncated`/`BadLength`.
-    const len: usize = if (smith.value(bool)) blk: {
-        smith.bytes(&buf);
-        break :blk smith.valueRangeAtMost(u16, 0, buf.len);
-    } else blk: {
-        var list: std.ArrayList(u8) = .empty;
-        defer list.deinit(testing.allocator);
-        const outer = codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS) catch return;
-        const n_groups = smith.valueRangeAtMost(u8, 0, 4);
-        for (0..n_groups) |i| {
-            const inner = codec.nestBegin(testing.allocator, &list, @intCast(i + 1)) catch return;
-            if (smith.value(bool)) {
-                codec.appendAttrU32(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_ID, smith.value(u32)) catch return;
-            }
-            var name_buf: [16]u8 = undefined;
-            smith.bytes(&name_buf);
-            const name_len: usize = smith.valueRangeAtMost(u8, 0, name_buf.len);
-            codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_NAME, name_buf[0..name_len]) catch return;
-            try codec.nestEnd(&list, inner);
-        }
-        try codec.nestEnd(&list, outer);
-        if (list.items.len > buf.len) return;
-        @memcpy(buf[0..list.items.len], list.items);
-        break :blk list.items.len;
-    };
-
     var want_buf: [16]u8 = undefined;
-    smith.bytes(&want_buf);
-    const want_len: usize = smith.valueRangeAtMost(u8, 0, want_buf.len);
-    _ = findMcastGroupId(buf[0..len], want_buf[0..want_len]) catch {};
+    // ⚠ The bytes come FIRST, in one `slice` call each. This harness used to
+    // open with `smith.value(bool)` to pick between a raw walk and a
+    // structured one — a 1-bit draw, which outside `--fuzz` is the range
+    // MINIMUM for all but 1 in 2^63 seeds, so the raw branch was dead and the
+    // seed was discarded before a single octet of it had been read. Inside the
+    // surviving branch `n_groups` was `valueRangeAtMost(u8, 0, 4)`, also the
+    // minimum, so the nest it built had ZERO groups: the inner nest walk and
+    // the name comparison that branch exists for were never reached either.
+    // Both halves now run on every seed, from the same drawn octets. Measured
+    // 2026-09-07 over the corpus above: **not one of the 7 seeds contributed a
+    // single octet before — the harness built the identical 4-octet empty nest
+    // for every one of them, 0 group ids found and 0 refusals — against 7 of 7
+    // seeds non-empty, 1 id found and 2 refused after.**
+    const attrs_len: usize = smith.slice(&buf);
+    const want_len: usize = smith.slice(&want_buf);
+    const want = want_buf[0..want_len];
+
+    // (a) The raw walk: the drawn octets straight into the outer iterator.
+    _ = findMcastGroupId(buf[0..attrs_len], want) catch {};
+
+    // (b) The structured walk: the same octets carved into group NAME
+    //     attributes inside a well-formed CTRL_ATTR_MCAST_GROUPS nest, so the
+    //     inner walk and the name comparison are reached even when the drawn
+    //     bytes are not a valid nest.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const outer = codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS) catch return;
+    const n_groups: usize = @intCast(smith.value(u64) % 5);
+    var off: usize = 0;
+    for (0..n_groups) |i| {
+        const inner = codec.nestBegin(testing.allocator, &list, @intCast(i + 1)) catch return;
+        if (smith.eos()) {
+            codec.appendAttrU32(
+                testing.allocator,
+                &list,
+                CTRL_ATTR_MCAST_GRP_ID,
+                @truncate(smith.value(u64)),
+            ) catch return;
+        }
+        const take = @min(attrs_len - off, @as(usize, 16));
+        codec.appendAttrString(
+            testing.allocator,
+            &list,
+            CTRL_ATTR_MCAST_GRP_NAME,
+            buf[off..][0..take],
+        ) catch return;
+        off += take;
+        codec.nestEnd(&list, inner) catch return;
+    }
+    codec.nestEnd(&list, outer) catch return;
+    _ = findMcastGroupId(list.items, want) catch {};
+}
+
+test "corpus: every findMcastGroupId seed reaches the walk, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than in a comment, over the SAME
+    // corpus the harness gets. `found` is pinned rather than asserted `> 0`:
+    // `findMcastGroupId` answers `null` for "walked the whole nest and the
+    // group is not published", which is a success, so a corpus that never
+    // matched anything would look exactly as healthy as this one.
+    var corpus: FindCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var found: usize = 0;
+    var refused: usize = 0;
+    for (entries, corpus.wants[0..corpus.n]) |sd, want| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        var want_buf: [16]u8 = undefined;
+        const attrs_len: usize = smith.slice(&buf);
+        const want_len: usize = smith.slice(&want_buf);
+        if (attrs_len != 0) nonempty += 1;
+        try testing.expectEqualSlices(u8, want, want_buf[0..want_len]);
+        if (findMcastGroupId(buf[0..attrs_len], want_buf[0..want_len])) |id| {
+            if (id != null) found += 1;
+        } else |_| refused += 1;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 1), found);
+    try testing.expectEqual(@as(usize, 2), refused);
 }
 
 test "findMcastGroupId picks the named group out of CTRL_ATTR_MCAST_GROUPS" {

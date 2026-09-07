@@ -132,7 +132,7 @@ const module_list = [_]Module{
     .{ .name = "resilience", .libs = &.{ "web", "net" } },
     .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy" } },
     .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
-    .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"} },
+    .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
     .{ .name = "ethtool", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
     .{ .name = "devlink", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
