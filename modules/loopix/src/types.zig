@@ -336,13 +336,111 @@ test "MixHeader.decode fails closed on truncated / malformed input, never OOB" {
 // The manual truncation/malformed sweep above is example-based; this adds
 // `Smith` corpus-guided coverage of the same function.
 
+/// `testkit.fuzz.seed`: a corpus entry is NOT the header. `Smith.slice` reads
+/// a little-endian `u32` length first, so a raw 39-octet header handed to the
+/// corpus would arrive with its kind byte and half its id shorn off.
+const seed = @import("testkit").fuzz.seed;
+
+/// One `MixHeader`, encoded through the module's own `encode`, as a comptime
+/// byte array — the corpus cannot quote a header, only build one.
+fn encodedHeader(comptime kind: MsgKind, comptime id: u64, comptime hop: u8, comptime n_hops: u8, comptime route: [max_hops]NodeId) [MixHeader.wire_len]u8 {
+    comptime {
+        var h = MixHeader{ .kind = kind, .id = id, .hop = hop, .n_hops = n_hops, .route = route };
+        var buf: [MixHeader.wire_len]u8 = undefined;
+        h.encode(&buf);
+        return buf;
+    }
+}
+
+const valid_header = encodedHeader(.loop_cover, 0xDEADBEEFCAFE, 2, 3, .{ 2, 4, 7, 11, 0, 0, 0 });
+const boundary_header = encodedHeader(.real, 42, max_layers, max_layers, .{0} ** max_hops);
+
+/// The three malformed shapes `MixHeader.decode fails closed on truncated /
+/// malformed input` builds at run time, lifted to comptime for the corpus.
+const bad_kind_header = blk: {
+    var b = valid_header;
+    b[0] = 0x7F; // not a valid MsgKind
+    const out = b;
+    break :blk out;
+};
+const bad_nhops_header = blk: {
+    var b = valid_header;
+    b[10] = max_layers + 1; // n_hops past the route capacity
+    const out = b;
+    break :blk out;
+};
+const bad_hop_header = blk: {
+    var b = valid_header;
+    b[9] = 4; // hop > n_hops (3)
+    const out = b;
+    break :blk out;
+};
+const long_header = valid_header ++ [_]u8{0xAA} ** 8;
+
+/// Headers in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// `decode` demands a valid `MsgKind` in octet 0 and `hop <= n_hops <=
+/// max_layers` in octets 9 and 10, over exactly `wire_len` octets. Uniform
+/// random bytes clear all of that with probability well under 2^-10 per draw
+/// AND have to land on the exact length, so without these the target proved
+/// only that the length check rejects noise.
+const header_seeds = [_][]const u8{
+    seed(&valid_header), // the round-trip header from the value test: decodes
+    seed(&boundary_header), // n_hops == max_layers, hop == n_hops: the boundary, decodes
+    seed(valid_header[0 .. MixHeader.wire_len - 1]), // one octet short
+    seed(valid_header[0..11]), // truncated just past the fixed fields
+    seed(&bad_kind_header), // MalformedMixHeader: not a valid MsgKind
+    seed(&bad_nhops_header), // MalformedMixHeader: n_hops past the route capacity
+    seed(&bad_hop_header), // MalformedMixHeader: hop > n_hops
+    seed(&long_header), // longer than wire_len: still decodes
+    seed(&[_]u8{0} ** MixHeader.wire_len), // all zeros: kind .real, hop 0, n_hops 0
+    seed(""), // the ONE input the collapsed harness ever ran
+};
+
 test "fuzz: MixHeader.decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzMixHeaderDecode, .{});
+    try testing.fuzz({}, fuzzMixHeaderDecode, .{ .corpus = &header_seeds });
 }
 
 fn fuzzMixHeaderDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input and `decode` refused on its
+    // `payload.len < wire_len` line before reading a field, with the header
+    // sitting unread in `buf`. Measured 2026-09-07 over the corpus above:
+    // **0 of 10 seeds non-empty and 0 headers decoded before, 9 of 10
+    // non-empty (one seed IS the empty payload) and 4 decoded after.**
+    const len: usize = smith.slice(&buf);
     _ = MixHeader.decode(buf[0..len]) catch return;
+}
+
+test "corpus: every header reaches decode, and the decoded count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) and nothing else would notice.
+    //
+    // `hops` is pinned beside `decoded`: the empty payload cannot yield a
+    // single routed hop, so it is a statement about reach rather than about
+    // what `decode` considers legal (an all-zero header IS legal here — kind
+    // `.real`, hop 0, n_hops 0 — which is exactly the trap a bare
+    // `decoded > 0` guard would walk into).
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var hops: usize = 0;
+    for (header_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const h = MixHeader.decode(buf[0..len]) catch continue;
+        decoded += 1;
+        hops += h.n_hops;
+    }
+    // One seed IS the empty payload, a legal member of a refusal corpus.
+    try testing.expectEqual(header_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 decoded
+    // and 0 hops — the same empty slice ten times. After:
+    try testing.expectEqual(@as(usize, 4), decoded);
+    try testing.expectEqual(@as(usize, 12), hops);
 }

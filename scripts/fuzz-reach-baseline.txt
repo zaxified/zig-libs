@@ -8,7 +8,6 @@
 
 adaptor 1
 bbs 1
-bip32 2
 bip340 1
 bitcoinscript 2
 bitcointx 2
@@ -16,7 +15,6 @@ brotli 1
 bulletproofs 2
 cbor 2
 chachapoly 2
-coconut 1
 cookies 1
 cors 1
 ctap2pin 1
@@ -30,7 +28,6 @@ frost 1
 ibe 1
 jwe 2
 k256 2
-loopix 1
 mcp 2
 mcp-http 1
 megolm 2

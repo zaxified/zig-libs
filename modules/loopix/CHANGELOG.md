@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — `fuzzMixHeaderDecode` had only ever decoded the empty slice. It drew its
+  bytes with `smith.bytes(&buf)` and then took a length from
+  `smith.valueRangeAtMost(u8, 0, 64)`; a ranged `Smith` draw reads eight octets as a
+  little-endian `u64` and returns the range MINIMUM when fewer remain, and `bytes` had already
+  consumed them — so `len` was 0 on every input and `MixHeader.decode` refused on its
+  `payload.len < wire_len` line, with the header sitting unread in `buf`. Now one
+  `smith.slice(&buf)` call, plus a ten-header corpus built through the module's own `encode`
+  (the round-trip header, the `n_hops == max_layers` boundary, two truncations, the invalid
+  `MsgKind`, the over-capacity `n_hops`, `hop > n_hops`, an over-long payload, an all-zero
+  header and the empty one). Measured: **0 of 10 seeds non-empty and 0 headers decoded
+  before; 9 of 10 non-empty, 4 decoded and 12 routed hops after.** The guard pins the hop
+  count rather than just `decoded`, because an all-zero header is legally decodable here
+  (kind `.real`, `hop = 0`, `n_hops = 0`).
+
 - **2026-08-18** — Portability fix (`check-portable`), two test sites in
   `adversary.zig`: both looped a `u64` index to index the fixed test array `deps[i]`
   (and, in one case, `deps_sorted[i]`), which doesn't fit `usize`'s slice-index

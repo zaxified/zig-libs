@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — `fuzzShowProofDecode` had only ever decoded the empty slice. It drew its
+  bytes with `smith.bytes(&buf)` and then took a length from
+  `smith.valueRangeAtMost(u16, 0, 1024)`; a ranged `Smith` draw reads eight octets as a
+  little-endian `u64` and returns the range MINIMUM when fewer remain, and `bytes` had already
+  consumed them — so `len` was 0 on every input and `ShowProof.fromBytes` refused on its
+  `bytes.len < 2` line. The "attacker-controlled count vs. actual buffer length" surface the
+  harness's own comment describes was never entered once. Now one `smith.slice(&buf)` call,
+  plus an eight-seed corpus built through the module's own `toBytes` (a valid `ShowProof`
+  carries four compressed group elements and three `Fr` scalars, so nothing hand-written gets
+  past `g1.fromBytesCompressed`) covering the round-trip encoding, a short encoding, an
+  out-of-range `disclosed` octet, a `q` of `0xFFFF` against the real length, `q = 0`, an extra
+  scalar, an all-zero body and a two-octet stub. Measured: **0 of 8 seeds non-empty, 0 proofs
+  decoded and 0 disclosure octets walked before; 8 of 8 non-empty, 1 decoded, 3 disclosure
+  octets walked and 7 typed errors after.**
+
 - **2026-08-12** — **BREAKING:** `keygen` and `proveCredential` take `io: std.Io` instead of
   `random: std.Random`, and draw from `std.Io.random` — contractually a
   CSPRNG. The old shape did not merely permit the mistake, it *taught* it:

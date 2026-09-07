@@ -772,10 +772,94 @@ test "fuzz PartialCredential.fromBytes never panics" {
     try std.testing.fuzz({}, fuzzPartialCredentialDecode, .{});
 }
 
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+
+/// The harness buffer, and therefore the largest proof the corpus can carry.
+/// ⚠ A seed longer than this reads back EMPTY, not truncated — `Smith.slice`
+/// falls back to the range minimum — so the builder below asserts the encoded
+/// proof fits rather than letting it vanish.
+const show_proof_buf_len = 1024;
+const show_proof_seed_count = 8;
+
+/// The corpus both the harness and its guard replay. A valid `ShowProof`
+/// encoding carries four COMPRESSED group elements and three `Fr` scalars, so
+/// only the module's own `toBytes` can produce one — a hand-written byte
+/// string dies at `g1.fromBytesCompressed` on the first of them, which is a
+/// refusal path this corpus is not about.
+const ShowProofCorpus = struct {
+    stores: [show_proof_seed_count][4 + show_proof_buf_len]u8 = undefined,
+    slots: [show_proof_seed_count][]const u8 = undefined,
+
+    fn build(self: *ShowProofCorpus, allocator: std.mem.Allocator) ![]const []const u8 {
+        const responses = try allocator.dupe(Fr, &[_]Fr{ frOf(101), frOf(202) });
+        const disclosed = try allocator.dupe(bool, &[_]bool{ true, false, false });
+        const proof = ShowProof{
+            .sigma1 = g1.Affine.generator,
+            .sigma2 = g1.Affine.generator,
+            .kappa = g2.Affine.generator,
+            .nu = g1.Affine.generator,
+            .challenge = frOf(9),
+            .response_r = frOf(8),
+            .responses_m = responses,
+            .disclosed = disclosed,
+        };
+        defer proof.deinit(allocator);
+        const bytes = try proof.toBytes(allocator);
+        defer allocator.free(bytes);
+        try std.testing.expect(bytes.len <= show_proof_buf_len);
+
+        // A scratch copy for the mutants, so each seed is independent.
+        var mutant: [show_proof_buf_len]u8 = undefined;
+
+        // 0: the encoding the round-trip test produces. Decodes.
+        self.slots[0] = tkfuzz.seedInto(&self.stores[0], bytes);
+        // 1: one octet short — `(len - floor) % 32 != 0`.
+        self.slots[1] = tkfuzz.seedInto(&self.stores[1], bytes[0 .. bytes.len - 1]);
+        // 2: a `disclosed` octet that is neither 0 nor 1.
+        @memcpy(mutant[0..bytes.len], bytes);
+        mutant[2] = 2;
+        self.slots[2] = tkfuzz.seedInto(&self.stores[2], mutant[0..bytes.len]);
+        // 3: one extra scalar, so `k + revealed != q` → InvalidDisclosure.
+        @memcpy(mutant[0..bytes.len], bytes);
+        @memset(mutant[bytes.len..][0..32], 0);
+        self.slots[3] = tkfuzz.seedInto(&self.stores[3], mutant[0 .. bytes.len + 32]);
+        // 4: `q` declared 0xFFFF against the same buffer — the classic
+        // attacker-controlled count against the real length.
+        @memcpy(mutant[0..bytes.len], bytes);
+        std.mem.writeInt(u16, mutant[0..2], 0xFFFF, .big);
+        self.slots[4] = tkfuzz.seedInto(&self.stores[4], mutant[0..bytes.len]);
+        // 5: `q = 0`, so every hidden response has to account for itself.
+        @memcpy(mutant[0..bytes.len], bytes);
+        std.mem.writeInt(u16, mutant[0..2], 0, .big);
+        self.slots[5] = tkfuzz.seedInto(&self.stores[5], mutant[0..bytes.len]);
+        // 6: the right length, all zeros — invalid compressed points.
+        @memset(mutant[0..bytes.len], 0);
+        self.slots[6] = tkfuzz.seedInto(&self.stores[6], mutant[0..bytes.len]);
+        // 7: two octets: past the `bytes.len < 2` check and nothing else.
+        self.slots[7] = tkfuzz.seedInto(&self.stores[7], &[_]u8{ 0x00, 0x00 });
+        return &self.slots;
+    }
+};
+
+test "fuzz ShowProof.fromBytes never panics" {
+    var corpus: ShowProofCorpus = .{};
+    const seeds = try corpus.build(std.testing.allocator);
+    try std.testing.fuzz({}, fuzzShowProofDecode, .{ .corpus = seeds });
+}
+
 fn fuzzShowProofDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [show_proof_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input and `fromBytes` refused on its
+    // `bytes.len < 2` line, with the proof sitting unread in `buf`. The
+    // "attacker-controlled count vs. actual buffer length" surface the comment
+    // below describes was never entered once. Measured 2026-09-07 over the
+    // corpus above: **0 of 8 seeds non-empty and 0 proofs decoded before, 8 of
+    // 8 non-empty and 1 decoded after.**
+    const len: usize = smith.slice(&buf);
     // Self-describing (length-prefixed `q`, then a `disclosed` mask, then a
     // count of remaining 32-byte scalars derived from the REST of the
     // buffer) — the classic "attacker-controlled count vs. actual buffer
@@ -783,8 +867,40 @@ fn fuzzShowProofDecode(_: void, smith: *std.testing.Smith) !void {
     const proof = ShowProof.fromBytes(std.testing.allocator, buf[0..len]) catch return;
     defer proof.deinit(std.testing.allocator);
 }
-test "fuzz ShowProof.fromBytes never panics" {
-    try std.testing.fuzz({}, fuzzShowProofDecode, .{});
+
+test "corpus: every ShowProof seed reaches fromBytes, and the counts are pinned" {
+    // ⭐ Built from `ShowProofCorpus.build`, the same call the harness makes:
+    // a guard measuring a different corpus is not a guard.
+    //
+    // `q_walked` is pinned beside `decoded`: it counts the `disclosed` octets
+    // the decoder actually walked, across all seeds, which the empty input
+    // cannot move — and it notices a seed being shortened as well as dropped.
+    var corpus: ShowProofCorpus = .{};
+    const seeds = try corpus.build(std.testing.allocator);
+
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var q_walked: usize = 0;
+    var typed_errors: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [show_proof_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (ShowProof.fromBytes(std.testing.allocator, buf[0..len])) |p| {
+            defer p.deinit(std.testing.allocator);
+            decoded += 1;
+            q_walked += p.disclosed.len;
+        } else |_| {
+            typed_errors += 1;
+        }
+    }
+    try std.testing.expectEqual(seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 decoded
+    // and 0 disclosure octets walked — the same empty slice eight times.
+    try std.testing.expectEqual(@as(usize, 1), decoded);
+    try std.testing.expectEqual(@as(usize, 3), q_walked);
+    try std.testing.expectEqual(@as(usize, 7), typed_errors);
 }
 
 // ── RNG-seam pin (B6, 2026-08-12) ───────────────────────────────────────────
