@@ -165,13 +165,109 @@ test "fromSlice rejects the wrong length" {
 
 // ── fuzz: the untrusted-wire entry point never panics/OOB ──────────────────
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// `packet_len` plus a margin, so lengths on BOTH sides of the exact-length
+/// gate are reachable. A seed larger than this reads back EMPTY — which is
+/// why the corpus below stops at `packet_len + 8` and not at the buffer.
+const decode_buf_len = packet_len + 32;
+
+/// A wire packet assembled at comptime, so a 1366-octet seed can be a
+/// `comptime` literal. `fromSlice` refuses anything that is not exactly
+/// `packet_len`, so a corpus of short strings would only ever reach
+/// `error.WrongLength` and nothing behind it.
+fn wire(
+    comptime version: u8,
+    comptime pubkey_hex: []const u8,
+    comptime payload_fill: u8,
+    comptime hmac_fill: u8,
+    comptime extra: usize,
+) [packet_len + extra]u8 {
+    @setEvalBranchQuota(200_000);
+    var out: [packet_len + extra]u8 = undefined;
+    @memset(out[0..], 0);
+    out[0] = version;
+    var key: [pubkey_len]u8 = undefined;
+    _ = std.fmt.hexToBytes(&key, pubkey_hex) catch unreachable;
+    out[1..][0..pubkey_len].* = key;
+    @memset(out[1 + pubkey_len ..][0..hop_payloads_len], payload_fill);
+    @memset(out[1 + pubkey_len + hop_payloads_len ..][0..hmac_len], hmac_fill);
+    return out;
+}
+
+/// The compressed secp256k1 point the value tests above use — the one pubkey
+/// in this module known to be on the curve.
+const good_pubkey_hex = "02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619";
+
+/// The accepted packet, kept as a named constant so a truncation of it can
+/// be spelled as a slice.
+const good_packet = wire(version_byte, good_pubkey_hex, 0x00, 0x00, 0);
+
+const decode_seeds = [_][]const u8{
+    fuzzseed.seed(""), // the empty slice: exactly what the collapsed draw ran, for ever
+    fuzzseed.seed(&.{ 1, 2, 3 }), // the WrongLength case the value test uses
+    fuzzseed.seed(&good_packet), // ⭐ a complete, accepted packet
+    fuzzseed.seed(&wire(version_byte, good_pubkey_hex, 0xff, 0xff, 0)), // the same, all-ones payload and hmac: `toBytes` must round-trip it
+    fuzzseed.seed(&wire(version_byte, "03eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619", 0x5a, 0xa5, 0)), // the odd-y sign byte for the same x
+    fuzzseed.seed(&wire(1, good_pubkey_hex, 0x00, 0x00, 0)), // UnsupportedVersion, with a valid key so nothing else can fail first
+    fuzzseed.seed(&wire(0xff, good_pubkey_hex, 0x00, 0x00, 0)), // the same at the far end of the version octet
+    fuzzseed.seed(&wire(version_byte, "01" ++ "00" ** 32, 0x00, 0x00, 0)), // 0x01 is not a SEC1 encoding type: InvalidPublicKey
+    fuzzseed.seed(&wire(version_byte, "00" ** 33, 0x00, 0x00, 0)), // 33 zero octets: the identity encoding padded out
+    fuzzseed.seed(&wire(version_byte, "02" ++ "00" ** 32, 0x00, 0x00, 0)), // ⭐ a well-formed prefix over x = 0, which is not on the curve
+    fuzzseed.seed(&wire(version_byte, "02" ++ "ff" ** 32, 0x00, 0x00, 0)), // x above the field prime: the non-canonical branch
+    fuzzseed.seed(good_packet[0 .. packet_len - 1]), // ⭐ one octet short of the exact length
+    fuzzseed.seed(&wire(version_byte, good_pubkey_hex, 0x00, 0x00, 1)), // ⭐ one octet over
+    fuzzseed.seed(&wire(version_byte, good_pubkey_hex, 0x00, 0x00, 8)), // eight over, still inside the buffer
+};
+
 fn fuzzOnionPacketDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [packet_len + 32]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [decode_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice`, never `bytes` then a ranged draw. `bytes` consumes
+    // `@min(buf.len, in.len)` octets, so the ranged length that followed found
+    // fewer than the eight it reads as a little-endian `u64` and returned the
+    // range MINIMUM: `len` was 0 for every input this lane can carry, and
+    // `fromSlice` refused it with `error.WrongLength` before touching a byte.
+    // `fromBytes` — the version check, the SEC1 decode, and `toBytes` behind
+    // it — had never run from this target at all. Measured 2026-09-07 over the
+    // corpus: 0 of 14 seeds arrived non-empty and 0 packets parsed before;
+    // 13 of 14 and 3 after.
+    const len: usize = smith.slice(&buf);
     const pkt = OnionPacket.fromSlice(buf[0..len]) catch return;
     _ = pkt.toBytes();
 }
 test "fuzz OnionPacket.fromSlice never panics" {
-    try testing.fuzz({}, fuzzOnionPacketDecode, .{});
+    try testing.fuzz({}, fuzzOnionPacketDecode, .{ .corpus = &decode_seeds });
+}
+
+test "corpus: every seed reaches fromSlice, and which of them get past the length gate is pinned" {
+    // ⭐ The trap here is the opposite of an `accepted > 0` guard: `fromSlice`
+    // is an EXACT-length gate, so a seed that is one octet off — or one that
+    // overran the buffer and read back empty — never reaches the version
+    // check or the SEC1 decode at all. So the numbers pinned are how many
+    // seeds passed the length gate (`WrongLength` vs everything else) and how
+    // many of those parsed; a corpus of only-refusals would show as
+    // `past_length == accepted == 0`.
+    var nonempty: usize = 0;
+    var past_length: usize = 0;
+    var accepted: usize = 0;
+    var round_tripped: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [decode_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (len == packet_len) past_length += 1;
+        if (OnionPacket.fromSlice(buf[0..len])) |pkt| {
+            accepted += 1;
+            if (std.mem.eql(u8, buf[0..len], &pkt.toBytes())) round_tripped += 1;
+        } else |_| {}
+    }
+    // One seed is deliberately the empty slice.
+    try testing.expectEqual(decode_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draw was restructured all three were 0:
+    // the only input this target ever handed `fromSlice` was the empty slice,
+    // which `error.WrongLength` refuses on the first line.
+    try testing.expectEqual(@as(usize, 9), past_length);
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(accepted, round_tripped);
 }
