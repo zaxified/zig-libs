@@ -268,7 +268,7 @@ const module_list = [_]Module{
     .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
     .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" } },
     .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa" } },
-    .{ .name = "dnp3", .libs = &.{"net"}, .deps = &.{"aeskw"} },
+    .{ .name = "dnp3", .libs = &.{"net"}, .deps = &.{"aeskw"}, .test_deps = &.{"testkit"} },
     .{ .name = "slhdsa", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "falcon", .libs = &.{"crypto"} },
     .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true },

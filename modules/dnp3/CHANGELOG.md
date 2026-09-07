@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: all three harnesses ran on one fixed input. `link.fuzzDecodeFrame`
+  opened with `smith.bytes(&frame)` followed by `smith.valueRangeAtMost(u16, 0, frame.len)`; a
+  ranged draw reads eight octets as a little-endian u64 and returns the range MINIMUM when
+  fewer than eight remain, and `bytes` had already eaten the seed, so `len` was **0 on every
+  input** and `decodeFrame` answered `ShortFrame` on its first line. The CRC block loop its own
+  comment calls "the primary untrusted-wire surface (the classic block-runs-past-end attack)"
+  was never entered. It now draws with one `smith.slice`, over a corpus built by this module's
+  own `encodeFrame` — every frame carries a CRC-16/DNP over the header and one more per
+  16-octet block, so a hand-written frame is a `BadHeaderCrc` and nothing else, which is also
+  why random octets could never have reached the loop. Measured: **0 of 13 seeds non-empty, 0
+  decoded, 0 user octets → 12/13, 5 decoded, 288 user octets.**
+- **2026-09-07** — `outstation.fuzzStructuredHandle` and `fuzzStructuredSession` moved off
+  `smith.index(n)` onto `testkit.fuzz.Cursor`. `index` reads eight octets as a u64 and returns
+  the range MINIMUM unless the whole word falls below `n`, so for `n` of 4 or 16 or 256 every
+  draw was **0** — `drawRequest` was a constant function, drawing one fragment from the first
+  entry of every hostile table, for ever. ⛔ The two shapes the F4 and F5 findings came from
+  (`full_width_range`, `index_past_u16`) were therefore unreachable, which is precisely what
+  the in-tree `Xorshift` loops assert must not happen; and in the Session harness every frame
+  went to `dests[0]` from source 0, so the master-address filter dropped all of them and the
+  outstation behind it was never fed. Both now draw one `smith.slice` and read the choices as a
+  byte script. ⭐ The corpus needed **two hand-written scripts**: eight generated ones reach
+  `full_width_range` between them but never `index_past_u16` — 8 x 32 fragments against a
+  conjunction of six table choices, where the in-tree loop needs 20 000 draws — so that shape
+  is written down as a reviewable 35-octet script instead. The guard pins both shapes, pins 32
+  frames past both address filters, and pins that the all-zero script (what the collapsed
+  harness ran on every input) reaches neither shape and no frame.
+
 - **2026-09-02** — **Audit (drift campaign): 1 CRITICAL, 2 HIGH, 2 MEDIUM, 1 LOW fixed.** All in
   the read/command path, and none of them needed a malformed request.
   **CRITICAL — a legal request drove a response series that never ended.** `emitRun` returned a
