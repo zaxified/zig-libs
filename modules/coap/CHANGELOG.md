@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`fuzzParse` replayed an EMPTY datagram for every input it was
+  ever given, and had no corpus at all.**
+
+  It opened with `smith.bytes(&buf)` followed by
+  `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` consumes `min(buf.len, in.len)`
+  octets and a ranged draw then reads eight *more* as a little-endian u64, returning
+  the range minimum when fewer remain — so the drawn length was 0 for every input a
+  seed can carry, and `parse` was handed `buf[0..0]` while the datagram sat unread in
+  `buf`. With no corpus the lane ran that one empty input and nothing else, so the
+  delta-encoded option decoder — the reason this harness exists, and the place an
+  off-by-one walks past the buffer — had never been entered.
+
+  One `smith.slice(&buf)` draw, an 18-entry hex corpus lifted from the value tests
+  (the hand-built CON GET, the payload-marker frame, the option-number accumulator
+  from the TEETH test, every refusal `parse` names, and the 337-octet
+  extended-nibble message — the largest frame this module builds), and a guard test
+  pinning what it produced. The harness now also asserts what `parse` promises:
+  non-decreasing option numbers, and `serialize` reproducing the exact input octets.
+
+  Measured 2026-09-07, before → after: **0 of 18 seeds non-empty → 18 of 18**,
+  0 parsed → 6, and **0 options walked → 9**. The options column is the
+  discriminating one: a bare four-octet CoAP header parses fine and yields zero
+  options, so an `accepted > 0` guard would have reported health over a corpus that
+  never reached the option loop.
+
 - **2026-09-03** — Drift re-audit (last audited `e5594e8`; the codec's byte handling came back
   PASS then and still does — what changed is that the state machines and the resource surfaces got
   looked at). Six fixes, nine mutations, nine red.

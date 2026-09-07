@@ -614,19 +614,104 @@ test "checksum property: inserting the checksum makes packets verify" {
     }
 }
 
+/// `testkit.fuzz.seedHex`. A corpus entry is not the packet: `Smith.slice`
+/// reads a little-endian u32 length first, so a raw packet would arrive minus
+/// its own first four octets — for ICMP, type/code/checksum.
+const seed = @import("testkit").fuzz.seedHex;
+
+/// ICMP packets, in the format `Smith.slice` reads.
+///
+/// The real captures above, the constructed quoted-error frames from the value
+/// tests, and the exact quoted-header boundary (27 octets of quote rejected, 28
+/// accepted). Uniform random octets land on one of the six types `parseV4`
+/// switches on with probability ~6/256 and then have to carry a self-consistent
+/// quoted IP header, so without these the harness proves only that the `else`
+/// arm returns `.ignored`.
+const parser_seeds = [_][]const u8{
+    seed("00006DD895550001DBDE6D6A00000000F2B4020000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // v4 echo reply, real loopback capture
+    seed("080065D895550001DBDE6D6A00000000F2B4020000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // v4 echo REQUEST: ours, but not a reply — ignored
+    seed("45000054A9E100004001D2C57F0000017F000001" ++ "00006DD895550001DBDE6D6A00000000F2B4020000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // the same reply with its real IPv4 header: the SOCK_RAW path
+    seed("03033D3A0000000045000021875740004011B5727F0000017F000001E1829C3F000DFE2068656C6C6F"), // v4 port-unreachable quoting a UDP datagram — not ours
+    seed("0301000000000000" ++ "45" ++ ("00" ** 19) ++ "080000001234004D"), // v4 host-unreachable quoting OUR echo request
+    seed("0B00000000000000" ++ "45" ++ ("00" ** 19) ++ "0D00000000550042"), // v4 time-exceeded quoting our TIMESTAMP request, the other accepted quote
+    seed("0D00AF6E13570001000030390000000000000000"), // v4 timestamp request: ignored
+    seed("0E0046471357000100003039028FB184028FB184"), // v4 timestamp reply: carries TsData
+    seed("0B" ++ ("00" ** 7) ++ "45" ++ ("00" ** 19) ++ "08" ++ ("00" ** 6)), // 27 octets of quote: one short of qihl+8, rejected
+    seed("0B" ++ ("00" ** 7) ++ "45" ++ ("00" ** 19) ++ "08" ++ ("00" ** 7)), // 28 octets of quote: the exact accepting edge
+    seed("81004D52955A0001DBDE6D6A0000000087B90C0000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // v6 echo reply, real loopback capture
+    seed("80004E52955A0001DBDE6D6A0000000087B90C0000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // v6 echo request: ignored
+    seed("0104FF6E000000006002D283000E11400000000000000000000000000000000100000000000000000000000000000001DAC59C3F000E002168656C6C6F36"), // v6 port-unreachable quoting UDP: next header 17, not 58
+    seed("01" ++ ("00" ** 13) ++ "3A" ++ ("00" ** 33) ++ "8000" ++ "0000" ++ "BEEF" ++ "0009"), // v6 dest-unreachable quoting OUR echo request
+    seed("010203"), // three octets: shorter than any header
+    seed("6300000000000000"), // a header-length packet of a type nobody handles
+    seed(""), // the empty datagram
+};
+
 test "fuzz: parsers never crash on arbitrary packets" {
     // Fuzzing is built into the Zig toolchain (`zig build test --fuzz`);
     // under a plain `zig build test` this runs as a smoke test. The
     // parsers handle untrusted bytes straight from the network, and safe
     // build modes turn any out-of-bounds access into a caught panic.
-    try std.testing.fuzz({}, fuzzParsers, .{});
+    try std.testing.fuzz({}, fuzzParsers, .{ .corpus = &parser_seeds });
 }
 
 fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    _ = parseV4(buf[0..len], false);
-    _ = parseV4(buf[0..len], true);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 on every input and all three parsers were handed an empty
+    // slice, which they reject on their first line. Measured 2026-09-07 over
+    // the corpus above: 0 of 17 seeds non-empty and 0 packets classified as
+    // anything but `.ignored` before; 16 of 17 non-empty (the empty datagram is
+    // a seed on purpose) and 8 classified after.
+    const len: usize = smith.slice(&buf);
+    const raw = parseV4(buf[0..len], false);
+    const stripped = parseV4(buf[0..len], true);
     _ = parseV6(buf[0..len]);
+
+    // The strip path must be the plain path over what follows the IP header,
+    // and nothing else: with a minimum-length IPv4 header in front, the two
+    // calls have to agree.
+    if (len >= 20 and (buf[0] & 0x0f) == 5) {
+        try std.testing.expectEqual(parseV4(buf[20..len], false), stripped);
+    }
+    // An error reply only ever comes back for a type this parser claims, and
+    // never for a packet too short to hold the quote it reports.
+    if (raw == .icmp_error) try std.testing.expect(len >= echo_header_len + 20 + echo_header_len);
+}
+
+test "corpus: every parser seed reaches the parsers, and the counts are pinned" {
+    // Four numbers. `nonempty` is the reach claim. The other three are what an
+    // empty datagram cannot produce: `.ignored` is what BOTH a rejected packet
+    // and an unread one come back as, so counting acceptances is the only way
+    // to tell a corpus that walks the quoted-header logic from one that does
+    // not reach the switch at all.
+    var nonempty: usize = 0;
+    var v4_replies: usize = 0;
+    var v4_errors: usize = 0;
+    var v6_replies: usize = 0;
+    var v6_errors: usize = 0;
+    for (parser_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        switch (parseV4(buf[0..len], false)) {
+            .echo_reply => v4_replies += 1,
+            .icmp_error => v4_errors += 1,
+            .ignored => {},
+        }
+        if (parseV4(buf[0..len], true) == .echo_reply) v4_replies += 1;
+        switch (parseV6(buf[0..len])) {
+            .echo_reply => v6_replies += 1,
+            .icmp_error => v6_errors += 1,
+            .ignored => {},
+        }
+    }
+    try std.testing.expectEqual(parser_seeds.len - 1, nonempty); // the empty seed is deliberate
+    try std.testing.expectEqual(@as(usize, 3), v4_replies);
+    try std.testing.expectEqual(@as(usize, 3), v4_errors);
+    try std.testing.expectEqual(@as(usize, 1), v6_replies);
+    try std.testing.expectEqual(@as(usize, 1), v6_errors);
 }

@@ -619,15 +619,100 @@ test "Code helpers" {
 // the delta-encoded option lengths (a classic place for an off-by-one to
 // walk past the buffer).
 
+/// `testkit.fuzz.seedHex`. A corpus entry is not the datagram: `Smith.slice`
+/// reads a little-endian u32 length first, so a raw frame would arrive minus
+/// its own first four octets — which for CoAP is exactly the header.
+const seed = @import("testkit").fuzz.seedHex;
+
+/// CoAP datagrams, in the format `Smith.slice` reads.
+///
+/// Lifted from the value tests above: the hand-built CON GET, the payload
+/// marker frame, the accumulator overflow from the TEETH test, and every
+/// refusal `parse` names. Uniform random octets clear the version check with
+/// probability 1/4 and then have to produce self-consistent delta/length
+/// nibbles, so without these the harness proves only that `BadVersion` fires.
+const parse_seeds = [_][]const u8{
+    // CON GET, 2-octet token, Uri-Path "temp" twice — the hand-built datagram.
+    seed("42013039" ++ "abcd" ++ "b4" ++ "74656d70" ++ "04" ++ "74656d70"),
+    seed("40450001" ++ "ff" ++ "6869"), // 2.05 Content with the payload "hi"
+    seed("40450001ff"), // EmptyPayload: a lone payload marker
+    seed("400100"), // TooShort: three octets
+    seed("00010001"), // BadVersion: Ver = 0
+    seed("49010001"), // BadTokenLength: TKL = 9
+    seed("42010001ab"), // Truncated: token shorter than TKL
+    seed("4001000103" ++ "61"), // Truncated: option value shorter than its nibble
+    seed("40010001d0"), // Truncated: 1-octet delta extension with nothing behind it
+    seed("400100010e01"), // Truncated: 2-octet length extension, one octet delivered
+    seed("40010001f0"), // BadOption: reserved delta nibble 15
+    seed("400100010f"), // BadOption: reserved length nibble 15
+    seed("40010001" ++ "E0FE00" ++ "E0FE00"), // BadOption: the accumulator past u16
+    seed("40010001" ++ "E0FE00"), // the same extension alone: option number 65293
+    seed("40010001" ++ "1010"), // two zero-length options, numbers 1 and 2
+    seed("70000000"), // RST, code 0.00, no token, no options, no payload
+    // The extended-nibble message from the round-trip test, encoded by hand:
+    // options 12:"a", 25:<20 octets>, 293:"b", 562:<300 octets>. 337 octets in
+    // all — the largest frame this module builds, and the reason the buffer is
+    // 512 and not 256.
+    seed("50450007" ++
+        "c161" ++
+        "dd" ++ "0007" ++ "6162636465666768696a6b6c6d6e6f7071727374" ++
+        "d1" ++ "ff" ++ "62" ++
+        "ee" ++ "0000" ++ "001f" ++ ("78" ** 300)),
+};
+
 test "fuzz: parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParse, .{});
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets, and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 on every input and `parse` was handed `buf[0..0]` every
+    // time, with the datagram sitting unread in `buf`. Measured 2026-09-07 over
+    // the corpus above: 0 of 18 seeds non-empty and 0 parsed before, 18 of 18
+    // non-empty and 6 parsed after (9 options walked, against 0).
+    const len: usize = smith.slice(&buf);
 
     var options_buf: [32]Option = undefined;
-    _ = parse(buf[0..len], &options_buf) catch return;
+    const msg = parse(buf[0..len], &options_buf) catch return;
+
+    // What parse promises, asserted rather than assumed: the option numbers do
+    // not go backwards (that is what makes the delta encoding invertible), and
+    // re-serializing lands on the exact octets it came from.
+    var last: u16 = 0;
+    for (msg.options) |opt| {
+        try testing.expect(opt.number >= last);
+        last = opt.number;
+    }
+    var round: [512]u8 = undefined;
+    const n = try serialize(msg, &round);
+    try testing.expectEqual(encodedLen(msg), n);
+    try testing.expectEqualSlices(u8, buf[0..n], round[0..n]);
+}
+
+test "corpus: every parse seed reaches the decoder, and the counts are pinned" {
+    // Three numbers, not one. `nonempty` is the reach claim. `parsed` says the
+    // corpus is not refusals only. `options` is the one an empty datagram
+    // cannot produce — a four-octet header parses fine and yields zero options,
+    // so acceptance alone would report health while the delta decoder, which is
+    // the whole point of this harness, walked nothing.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var option_count: usize = 0;
+    for (parse_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var options_buf: [32]Option = undefined;
+        if (parse(buf[0..len], &options_buf)) |msg| {
+            parsed += 1;
+            option_count += msg.options.len;
+        } else |_| {}
+    }
+    try testing.expectEqual(parse_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 6), parsed);
+    try testing.expectEqual(@as(usize, 9), option_count);
 }
