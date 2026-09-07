@@ -54,6 +54,9 @@ const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
 const request = @import("request.zig");
 const genl = @import("genetlink");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const ParseError = codec.Error || error{OutOfMemory};
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
@@ -707,19 +710,148 @@ test "appendNewSnapshot omits the id when the kernel is to pick one" {
     try testing.expectEqual(without.items.len + 8, with.items.len);
 }
 
+/// REGION_GET and REGION_READ reply attribute lists for `fuzzRegion`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by the value tests' own builders and this module's own
+/// encoders rather than quoted as hex. A devlink attribute is a netlink TLV,
+/// whose length and scalars are HOST byte order, so a hex corpus would be a
+/// little-endian one and the counts pinned below would be false on a
+/// big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A region with a snapshot budget and two snapshots.
+        var region: std.ArrayList(u8) = .empty;
+        try buildRegionReply(gpa, &region, "cr-space", 1048576, 4, &.{ 1, 7 });
+        self.push(region.items);
+
+        // The same with no snapshots at all.
+        var no_snaps: std.ArrayList(u8) = .empty;
+        try buildRegionReply(gpa, &no_snaps, "fw-health", 4096, 1, &.{});
+        self.push(no_snaps.items);
+
+        // A REGION_READ reply: two chunks the assembler has to stitch, in
+        // ascending address order.
+        var chunks: std.ArrayList(u8) = .empty;
+        try buildChunks(gpa, &chunks, &.{
+            .{ .addr = 0, .data = &[_]u8{0xaa} ** 32 },
+            .{ .addr = 32, .data = &[_]u8{0xbb} ** 32 },
+        });
+        self.push(chunks.items);
+
+        // The same two chunks out of order, and one that starts past the
+        // assembler's 256-octet window.
+        var reordered: std.ArrayList(u8) = .empty;
+        try buildChunks(gpa, &reordered, &.{
+            .{ .addr = 64, .data = &[_]u8{0xcc} ** 16 },
+            .{ .addr = 0, .data = &[_]u8{0xdd} ** 16 },
+            .{ .addr = 4096, .data = &[_]u8{0xee} ** 16 },
+        });
+        self.push(reordered.items);
+
+        // ── the refusals and the degenerate shapes ─────────────────────────
+        // A chunk nest with data but no address.
+        var no_addr: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &no_addr, .pci("0000:65:00.0"));
+        {
+            const top = try codec.nestBegin(gpa, &no_addr, uapi.ATTR.REGION_CHUNKS);
+            const one = try codec.nestBegin(gpa, &no_addr, uapi.ATTR.REGION_CHUNK);
+            try codec.appendAttr(gpa, &no_addr, uapi.ATTR.REGION_CHUNK_DATA, &[_]u8{0x11} ** 8);
+            try codec.nestEnd(&no_addr, one);
+            try codec.nestEnd(&no_addr, top);
+        }
+        self.push(no_addr.items);
+        // A REGION_SIZE of four octets where a u64 belongs.
+        var narrow: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &narrow, .pci("0000:65:00.0"));
+        try codec.appendAttrString(gpa, &narrow, uapi.ATTR.REGION_NAME, "cr-space");
+        try codec.appendAttrU32(gpa, &narrow, uapi.ATTR.REGION_SIZE, 4096);
+        self.push(narrow.items);
+        // An attribute header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 });
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: region decoding and chunk reassembly never crash" {
-    try testing.fuzz({}, fuzzRegion, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzRegion, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzRegion(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed, and both `parseRegion` and the assembler
+    // were handed an empty attribute list with the reply sitting unread in
+    // `buf`.
+    //
+    // ⛔ And it looked HEALTHIER that way. Measured 2026-09-07 over the corpus
+    // above: **0 of 7 seeds non-empty, 7 of 7 "decoded" and 0 octets assembled
+    // before; 7 of 7 non-empty, 5 decoded and 64 octets assembled after.** An
+    // empty attribute list is a legal devlink reply — every field is optional,
+    // and `Assembler.feed` explicitly tolerates a message with no chunks — so
+    // the collapsed harness scored a perfect 7 of 7 while placing nothing.
+    const len: usize = smith.slice(&buf);
     if (parseRegion(buf[0..len])) |r| std.mem.doNotOptimizeAway(&r) else |_| {}
 
     var a = Assembler.init(testing.allocator, 0, 256) catch return;
     defer a.deinit(testing.allocator);
     a.feed(buf[0..len]) catch {};
+}
+
+test "corpus: every region seed reaches both paths, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over
+    // the SAME corpus the harness gets. `nonempty` is the reach claim and the
+    // only check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The parse counts
+    // are pinned rather than asserted `> 0`: a corpus of nothing but refusals
+    // would score full marks on reach while exercising only the error path.
+    //
+    // `filled` is the second number, and it is the one that says the CHUNKS
+    // half of the harness is alive: `parseRegion` is happy with a reply that
+    // carries no chunks at all, so a corpus of REGION_GET replies only would
+    // score full marks while the assembler stitched nothing.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var filled: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parseRegion(buf[0..len])) |_| {
+            decoded += 1;
+        } else |_| {}
+        var a = try Assembler.init(testing.allocator, 0, 256);
+        defer a.deinit(testing.allocator);
+        if (a.feed(buf[0..len])) |_| {
+            filled += a.covered;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 5), decoded);
+    try testing.expectEqual(@as(usize, 64), filled);
 }
 
 fn attrPresent(attr_bytes: []const u8, want: u16) codec.Error!bool {

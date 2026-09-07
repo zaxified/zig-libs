@@ -45,6 +45,9 @@ const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
 const request = @import("request.zig");
 const genl = @import("genetlink");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const ParseError = codec.Error || error{ OutOfMemory, TooManyVersions };
 
@@ -397,20 +400,140 @@ test "parseInfo: hostile input is a typed error, never a read past the end" {
     try testing.expectError(error.BadLength, parseInfo(gpa, list.items));
 }
 
+/// DEV_GET and INFO_GET reply attribute lists for `fuzzDev`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by the value tests' own builders and this module's own
+/// encoders rather than quoted as hex. A devlink attribute is a netlink TLV,
+/// whose length and scalars are HOST byte order, so a hex corpus would be a
+/// little-endian one and the counts pinned below would be false on a
+/// big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A device with a reload-stats nest and the reload-failed flag.
+        var dev: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &dev, .pci("0000:65:00.0"));
+        try codec.appendAttrU8(gpa, &dev, uapi.ATTR.RELOAD_FAILED, 0);
+        const stats = try codec.nestBegin(gpa, &dev, uapi.ATTR.DEV_STATS);
+        try codec.nestEnd(&dev, stats);
+        self.push(dev.items);
+
+        // A bare handle: every optional absent.
+        var bare: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &bare, .{ .bus = "netdevsim", .dev = "netdevsim1" });
+        self.push(bare.items);
+
+        // An INFO_GET reply: the three version kinds as repeated siblings,
+        // including two with the same name in different nests.
+        var info: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &info, .pci("0000:65:00.0"));
+        try codec.appendAttrString(gpa, &info, uapi.ATTR.INFO_DRIVER_NAME, "mlx5_core");
+        try codec.appendAttrString(gpa, &info, uapi.ATTR.INFO_SERIAL_NUMBER, "MT0000X00000");
+        try codec.appendAttrString(gpa, &info, uapi.ATTR.INFO_BOARD_SERIAL_NUMBER, "MT0000X00000");
+        try appendVersion(gpa, &info, uapi.ATTR.INFO_VERSION_FIXED, "fw.psid", "MT_0000000000");
+        try appendVersion(gpa, &info, uapi.ATTR.INFO_VERSION_RUNNING, "fw.version", "22.35.1012");
+        try appendVersion(gpa, &info, uapi.ATTR.INFO_VERSION_RUNNING, "fw", "22.35.1012");
+        try appendVersion(gpa, &info, uapi.ATTR.INFO_VERSION_STORED, "fw.version", "22.36.1010");
+        self.push(info.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A driver name longer than the module accepts.
+        var long_name: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &long_name, .pci("0000:65:00.0"));
+        try codec.appendAttrString(gpa, &long_name, uapi.ATTR.INFO_DRIVER_NAME, "d" ** (uapi.name_max + 1));
+        self.push(long_name.items);
+        // An attribute header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 });
+        // A version nest with no name attribute in it at all.
+        var nameless: std.ArrayList(u8) = .empty;
+        {
+            const nest = try codec.nestBegin(gpa, &nameless, uapi.ATTR.INFO_VERSION_RUNNING);
+            try codec.appendAttrString(gpa, &nameless, uapi.ATTR.INFO_VERSION_VALUE, "1.0");
+            try codec.nestEnd(&nameless, nest);
+        }
+        self.push(nameless.items);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: device and info decoding never crash" {
-    try testing.fuzz({}, fuzzDev, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzDev, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDev(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and both parsers were handed an empty
+    // attribute list with the reply sitting unread in `buf`.
+    //
+    // ⛔ And it looked HEALTHIER that way. Measured 2026-09-07 over the corpus
+    // above: **0 of 6 seeds non-empty, 6 devices and 6 infos "decoded" and 0
+    // versions collected before; 6 of 6 non-empty, 5 devices, 3 infos and 4
+    // versions after.** An empty attribute list is a legal devlink reply —
+    // every field is optional — so both parsers succeed on it, and the
+    // collapsed harness scored 6 of 6 twice over while never entering the TLV
+    // walk. `versions` is the number that can tell the two apart.
+    const len: usize = smith.slice(&buf);
     if (parseDevice(buf[0..len])) |d| std.mem.doNotOptimizeAway(&d) else |_| {}
     if (parseInfo(testing.allocator, buf[0..len])) |info| {
         var v = info;
         _ = v.hasPendingUpdate();
         v.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "corpus: every dev seed reaches both parsers, and the decoded counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over
+    // the SAME corpus the harness gets. `nonempty` is the reach claim and the
+    // only check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The parse counts
+    // are pinned rather than asserted `> 0`: a corpus of nothing but refusals
+    // would score full marks on reach while exercising only the error path.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var devices: usize = 0;
+    var infos: usize = 0;
+    var versions: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parseDevice(buf[0..len])) |_| {
+            devices += 1;
+        } else |_| {}
+        if (parseInfo(testing.allocator, buf[0..len])) |info| {
+            infos += 1;
+            var v = info;
+            versions += v.versions.len;
+            v.deinit(testing.allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 5), devices);
+    try testing.expectEqual(@as(usize, 3), infos);
+    try testing.expectEqual(@as(usize, 4), versions);
 }
 
 test "buildDevices is a bare dump; buildInfo is a handle-bearing doit" {

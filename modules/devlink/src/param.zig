@@ -47,6 +47,9 @@ const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
 const request = @import("request.zig");
 const genl = @import("genetlink");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const ParseError = codec.Error || error{OutOfMemory};
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
@@ -678,19 +681,142 @@ test "Bytes.from bounds the value length" {
     try testing.expectEqual(@as(usize, uapi.value_max), b.get().len);
 }
 
+/// PARAM_GET reply attribute lists for `fuzzParam`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by the value tests' own builders and this module's own
+/// encoders rather than quoted as hex. A devlink attribute is a netlink TLV,
+/// whose length and scalars are HOST byte order, so a hex corpus would be a
+/// little-endian one and the counts pinned below would be false on a
+/// big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A u32 parameter with both a runtime and a driverinit value: the
+        // shape `reloadWouldChange` exists for.
+        var u32_param: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &u32_param, .pci("0000:65:00.0"));
+        try buildParamNest(gpa, &u32_param, "max_macs", @intFromEnum(uapi.ParamType.u32_), true, &.{
+            .{ .cmode = .runtime, .data = &[_]u8{ 128, 0, 0, 0 } },
+            .{ .cmode = .driverinit, .data = &[_]u8{ 64, 0, 0, 0 } },
+        });
+        self.push(u32_param.items);
+
+        // A flag parameter: PARAM_VALUE_DATA is present but empty.
+        var flag_param: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &flag_param, .pci("0000:65:00.0"));
+        try buildParamNest(gpa, &flag_param, "enable_roce", @intFromEnum(uapi.ParamType.flag), true, &.{
+            .{ .cmode = .driverinit, .data = &.{} },
+        });
+        self.push(flag_param.items);
+
+        // A string parameter.
+        var str_param: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &str_param, .pci("0000:65:00.0"));
+        try buildParamNest(gpa, &str_param, "fw_load_policy", @intFromEnum(uapi.ParamType.string), false, &.{
+            .{ .cmode = .permanent, .data = "flash" },
+        });
+        self.push(str_param.items);
+
+        // ── the refusals and the degenerate shapes ─────────────────────────
+        // No PARAM_TYPE at all: the decoder cannot know the value's width.
+        var untyped: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &untyped, .pci("0000:65:00.0"));
+        try buildParamNest(gpa, &untyped, "max_macs", null, false, &.{
+            .{ .cmode = .runtime, .data = &[_]u8{ 128, 0, 0, 0 } },
+        });
+        self.push(untyped.items);
+        // A u32 parameter whose value is two octets wide.
+        var narrow: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &narrow, .pci("0000:65:00.0"));
+        try buildParamNest(gpa, &narrow, "max_macs", @intFromEnum(uapi.ParamType.u32_), false, &.{
+            .{ .cmode = .runtime, .data = &[_]u8{ 128, 0 } },
+        });
+        self.push(narrow.items);
+        // The handle with no PARAM nest, and an attribute header declaring
+        // 0x40 octets over a 2-octet buffer.
+        var no_nest: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &no_nest, .pci("0000:65:00.0"));
+        self.push(no_nest.items);
+        self.push(&[_]u8{ 0x40, 0x00 });
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: parameter decoding never crashes" {
-    try testing.fuzz({}, fuzzParam, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzParam, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParam(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an empty attribute
+    // list with the reply sitting unread in `buf`.
+    //
+    // ⛔ And it looked HEALTHIER that way. Measured 2026-09-07 over the corpus
+    // above: **0 of 7 seeds non-empty, 7 of 7 "decoded" and 0 carrying a value
+    // before; 7 of 7 non-empty, 5 decoded and 4 valued after.** An empty
+    // attribute list is a legal devlink reply — every field is optional — so
+    // `parse("")` succeeds, and the collapsed harness scored a perfect 7 of 7
+    // while never entering the PARAM nest or its value list.
+    const len: usize = smith.slice(&buf);
     if (parse(testing.allocator, buf[0..len])) |p| {
         var v = p;
         _ = v.reloadWouldChange();
         v.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "corpus: every param seed reaches the parser, and the decoded count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over
+    // the SAME corpus the harness gets. `nonempty` is the reach claim and the
+    // only check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The parse counts
+    // are pinned rather than asserted `> 0`: a corpus of nothing but refusals
+    // would score full marks on reach while exercising only the error path.
+    //
+    // `valued` is the second number: `parse` answers with an all-absent
+    // `Param` for a reply carrying no PARAM nest, so "decoded" alone would
+    // count a corpus that never reached the value list as a full success.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var valued: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parse(testing.allocator, buf[0..len])) |p| {
+            decoded += 1;
+            var v = p;
+            if (v.values.len != 0) valued += 1;
+            v.deinit(testing.allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 5), decoded);
+    try testing.expectEqual(@as(usize, 4), valued);
 }
 
 test "buildSetParam frames a whole PARAM_SET, headers and all" {

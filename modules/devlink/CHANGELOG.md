@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **all seven fuzz harnesses fetched their input and threw it away — and the
+  collapse made them look perfect.** Each opened `smith.bytes(&buf)` and then sliced the buffer
+  to `smith.valueRangeAtMost(u16, 0, buf.len)`; a `Smith` ranged draw reads eight input octets
+  as a little-endian u64 and returns the range MINIMUM unless that word already lies inside the
+  range, so the length was 0 for every seed and every parser was called with an empty attribute
+  list. ⛔ And an empty attribute list is a **legal** devlink reply — every field of a port, a
+  device, a reporter, a parameter, a region or a resource is optional — so every parser
+  *succeeded* on it. Measured with the old draws in place against the new corpora:
+  `fuzzPort` 7 of 7 "decoded", `fuzzDev` 6 devices and 6 infos, `fuzzHealth` 6 of 6,
+  `fuzzParam` 7 of 7, `fuzzRegion` 7 of 7, `fuzzResource` 7 of 7, `fuzzNotification` 5 of 5 —
+  a clean sheet across the module while not one TLV was ever walked. All seven now draw with
+  one `smith.slice(&buf)` call and carry a corpus built at run time by the value tests' own
+  builders and this module's encoders (a devlink attribute is a netlink TLV, whose length and
+  scalars are HOST byte order, so a hex corpus would be a little-endian one). After:
+  `fuzzPort` 4 ports decoded; `fuzzDev` 5 devices, 3 infos, 4 versions; `fuzzHealth` 4 decoded
+  of which 2 carry a reporter name; `fuzzParam` 5 decoded of which 4 carry a value;
+  `fuzzRegion` 5 decoded and 64 octets assembled; `fuzzResource` 5 decoded and 11 resources
+  found; `fuzzNotification` 3 parsed and 2 recognised as notifications. Every harness carries a
+  corpus guard pinning both numbers — the "decoded" count alone cannot distinguish a real reply
+  from the empty one, which is exactly how this hid.
+- **2026-09-07** — `client.fuzzNotification` also drew its genl command byte with
+  `valueRangeAtMost(u8, 0, 255)`, so `cmd` was **0 on every round** — not a devlink command at
+  all, and `Notification.isNotification()` was therefore false for every input the harness ever
+  built. The command is a full-width `smith.value(u64)` now and travels in the seed.
+
 - **2026-09-02** — **Audit (drift campaign): 2 MEDIUM, 4 LOW.** ⭐ No memory-safety or
   wrong-write defect is live; the new public `buildX` request layer is well anchored (the request
   goldens are real `strace` captures of iproute2 6.19.0, and reply goldens now exist twice — UAPI

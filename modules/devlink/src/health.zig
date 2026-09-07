@@ -34,6 +34,9 @@ const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
 const request = @import("request.zig");
 const genl = @import("genetlink");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
 
@@ -376,18 +379,134 @@ test "appendPortGet puts the port index between the handle and the name" {
     try testing.expectEqual(uapi.ATTR.HEALTH_REPORTER_NAME, (try it.next()).?.type);
 }
 
+/// HEALTH_REPORTER_GET reply attribute lists for `fuzzHealth`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by the value tests' own builders and this module's own
+/// encoders rather than quoted as hex. A devlink attribute is a netlink TLV,
+/// whose length and scalars are HOST byte order, so a hex corpus would be a
+/// little-endian one and the counts pinned below would be false on a
+/// big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [4096]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A healthy reporter with no faults.
+        var healthy: std.ArrayList(u8) = .empty;
+        try buildReporterReply(gpa, &healthy, .{ .name = "fw" });
+        self.push(healthy.items);
+
+        // One in error with an unrecovered fault and a dump waiting.
+        var faulted: std.ArrayList(u8) = .empty;
+        try buildReporterReply(gpa, &faulted, .{
+            .name = "fw_fatal",
+            .state = 1,
+            .err_count = 7,
+            .recover_count = 2,
+            .dump_ts = 1690000000,
+            .auto_recover = 0,
+        });
+        self.push(faulted.items);
+
+        // ── the refusals and the degenerate shapes ─────────────────────────
+        // The handle without the reporter nest the parser is looking for.
+        var no_nest: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &no_nest, .pci("0000:65:00.0"));
+        self.push(no_nest.items);
+        // An empty reporter nest.
+        var empty_nest: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &empty_nest, .pci("0000:65:00.0"));
+        {
+            const nest = try codec.nestBegin(gpa, &empty_nest, uapi.ATTR.HEALTH_REPORTER);
+            try codec.nestEnd(&empty_nest, nest);
+        }
+        self.push(empty_nest.items);
+        // An ERR_COUNT of four octets where a u64 belongs.
+        var narrow: std.ArrayList(u8) = .empty;
+        {
+            const nest = try codec.nestBegin(gpa, &narrow, uapi.ATTR.HEALTH_REPORTER);
+            try codec.appendAttrString(gpa, &narrow, uapi.ATTR.HEALTH_REPORTER_NAME, "fw");
+            try codec.appendAttrU32(gpa, &narrow, uapi.ATTR.HEALTH_REPORTER_ERR_COUNT, 7);
+            try codec.nestEnd(&narrow, nest);
+        }
+        self.push(narrow.items);
+        // An attribute header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 });
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: reporter decoding never crashes" {
-    try testing.fuzz({}, fuzzHealth, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzHealth, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzHealth(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an empty attribute
+    // list with the reply sitting unread in `buf`.
+    //
+    // ⛔ And it looked HEALTHIER that way. Measured 2026-09-07 over the corpus
+    // above: **0 of 6 seeds non-empty, 6 of 6 "decoded" and 0 of them carrying
+    // a reporter name before; 6 of 6 non-empty, 4 decoded and 2 named after.**
+    // An empty attribute list is a legal devlink reply — every field is
+    // optional — so `parse("")` succeeds, and the collapsed harness scored a
+    // perfect 6 of 6 while never entering the reporter nest.
+    const len: usize = smith.slice(&buf);
     if (parse(buf[0..len])) |r| {
         _ = r.unrecoveredCount();
         _ = r.hasDump();
     } else |_| {}
+}
+
+test "corpus: every reporter seed reaches the parser, and the decoded count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over
+    // the SAME corpus the harness gets. `nonempty` is the reach claim and the
+    // only check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The parse counts
+    // are pinned rather than asserted `> 0`: a corpus of nothing but refusals
+    // would score full marks on reach while exercising only the error path.
+    //
+    // `named` is the second number, and it is the one that matters here:
+    // `parse` answers with an all-absent `Reporter` for a reply that carries
+    // no reporter nest at all, so "decoded" alone would count a corpus that
+    // never reached the nest walk as a full success.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var named: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parse(buf[0..len])) |r| {
+            decoded += 1;
+            if (r.name().len != 0) named += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), decoded);
+    try testing.expectEqual(@as(usize, 2), named);
 }
 
 test "the health builders: dump vs one reporter, GET vs RECOVER" {

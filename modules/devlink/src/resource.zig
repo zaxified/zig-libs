@@ -44,6 +44,9 @@ const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
 const request = @import("request.zig");
 const genl = @import("genetlink");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 /// How deep a `RESOURCE_LIST` chain may nest before the stream is rejected.
 /// Real hardware uses 2.
@@ -480,20 +483,153 @@ test "appendSet builds the id/size pair a RESOURCE_SET carries" {
     try testing.expectEqual(@as(u64, 98304), try uapi.asU64(size));
 }
 
+/// RESOURCE_DUMP reply attribute lists for `fuzzResource`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by the value tests' own builders and this module's own
+/// encoders rather than quoted as hex. A devlink attribute is a netlink TLV,
+/// whose length and scalars are HOST byte order, so a hex corpus would be a
+/// little-endian one and the counts pinned below would be false on a
+/// big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [16384]u8 = undefined,
+    store: [16384]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // The two-level tree a switch ASIC reports.
+        var tree: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &tree, .{ .bus = "pci", .dev = "0000:03:00.0" });
+        try appendTree(gpa, &tree, &.{.{
+            .name = "kvd",
+            .id = 1,
+            .size = 245760,
+            .children = &.{
+                .{ .name = "linear", .id = 2, .size = 98304 },
+                .{
+                    .name = "hash_double",
+                    .id = 3,
+                    .size = 60416,
+                    .children = &.{.{ .name = "singles", .id = 5, .size = 128 }},
+                },
+            },
+        }});
+        self.push(tree.items);
+
+        // A flat list of two unrelated roots.
+        var flat: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &flat, .pci("0000:65:00.0"));
+        try appendTree(gpa, &flat, &.{
+            .{ .name = "a", .id = 1, .size = 16 },
+            .{ .name = "b", .id = 2, .size = 32 },
+        });
+        self.push(flat.items);
+
+        // An empty RESOURCE_LIST.
+        var empty: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &empty, .pci("0000:65:00.0"));
+        try appendTree(gpa, &empty, &.{});
+        self.push(empty.items);
+
+        // ── the shapes the depth bound exists for ──────────────────────────
+        // A nest chain just inside the limit, and one just past it.
+        var shallow: std.ArrayList(u8) = .empty;
+        try buildDeep(gpa, &shallow, 4);
+        self.push(shallow.items);
+        var deep: std.ArrayList(u8) = .empty;
+        try buildDeep(gpa, &deep, max_depth + 1);
+        self.push(deep.items);
+
+        // A resource with no name, and an attribute header declaring 0x40
+        // octets over a 2-octet buffer.
+        var nameless: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &nameless, .pci("0000:65:00.0"));
+        {
+            const top = try codec.nestBegin(gpa, &nameless, uapi.ATTR.RESOURCE_LIST);
+            const one = try codec.nestBegin(gpa, &nameless, uapi.ATTR.RESOURCE);
+            try uapi.appendAttrU64(gpa, &nameless, uapi.ATTR.RESOURCE_ID, 1);
+            try codec.nestEnd(&nameless, one);
+            try codec.nestEnd(&nameless, top);
+        }
+        self.push(nameless.items);
+        self.push(&[_]u8{ 0x40, 0x00 });
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: resource decoding never crashes or runs away" {
-    try testing.fuzz({}, fuzzResource, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzResource, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzResource(_: void, smith: *std.testing.Smith) !void {
     var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an empty attribute
+    // list with the reply sitting unread in `buf`.
+    //
+    // ⛔ And it looked HEALTHIER that way. Measured 2026-09-07 over the corpus
+    // above: **0 of 7 seeds non-empty, 7 of 7 "decoded" and 0 resources found
+    // before; 7 of 7 non-empty, 5 decoded and 11 resources after.** An empty
+    // attribute list is a legal devlink reply — every field is optional — so
+    // `parse("")` succeeds, and the collapsed harness scored a perfect 7 of 7
+    // while never entering the recursive RESOURCE_LIST walk that this
+    // function's whole depth bound exists for.
+    const len: usize = smith.slice(&buf);
     if (parse(testing.allocator, buf[0..len])) |rs| {
         var v = rs;
         _ = v.count();
         _ = v.find("x");
         v.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "corpus: every resource seed reaches the parser, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over
+    // the SAME corpus the harness gets. `nonempty` is the reach claim and the
+    // only check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The parse counts
+    // are pinned rather than asserted `> 0`: a corpus of nothing but refusals
+    // would score full marks on reach while exercising only the error path.
+    //
+    // `resources` is the second number: `parse` is happy with a reply that
+    // has no RESOURCE_LIST in it, so "decoded" alone would count a corpus
+    // that never reached the recursive walk as a full success.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var resources: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parse(testing.allocator, buf[0..len])) |rs| {
+            decoded += 1;
+            var v = rs;
+            resources += v.count();
+            v.deinit(testing.allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 5), decoded);
+    try testing.expectEqual(@as(usize, 11), resources);
 }
 
 test "buildSetResourceSize frames a whole RESOURCE_SET, headers and all" {

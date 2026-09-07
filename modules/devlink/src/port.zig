@@ -47,6 +47,9 @@ const uapi = @import("uapi.zig");
 const handle = @import("handle.zig");
 const request = @import("request.zig");
 const genl = @import("genetlink");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const Error = error{ OutOfMemory, InvalidRequest };
 
@@ -392,15 +395,128 @@ test "appendSplit refuses a count below two" {
     try testing.expectEqual(@as(usize, 44), list.items.len);
 }
 
+/// PORT_GET reply attribute lists for `fuzzPort`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by the value tests' own builders and this module's own
+/// encoders rather than quoted as hex. A devlink attribute is a netlink TLV,
+/// whose length and scalars are HOST byte order, so a hex corpus would be a
+/// little-endian one and the counts pinned below would be false on a
+/// big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [4096]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // The physical port of an mlx5 card, netdev and all.
+        var physical: std.ArrayList(u8) = .empty;
+        try buildPortReply(gpa, &physical);
+        self.push(physical.items);
+
+        // A pci_vf representor: no netdev, a PORT_FUNCTION nest, and the
+        // flavour-specific PCI numbers.
+        var vf: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &vf, .pci("0000:65:00.0"));
+        try codec.appendAttrU32(gpa, &vf, uapi.ATTR.PORT_INDEX, 65535);
+        try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_TYPE, @intFromEnum(uapi.PortType.notset));
+        try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_FLAVOUR, @intFromEnum(uapi.PortFlavour.pci_vf));
+        try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_PCI_PF_NUMBER, 0);
+        try codec.appendAttrU16(gpa, &vf, uapi.ATTR.PORT_PCI_VF_NUMBER, 3);
+        try codec.appendAttrU32(gpa, &vf, uapi.ATTR.PORT_CONTROLLER_NUMBER, 0);
+        try codec.appendAttrU8(gpa, &vf, uapi.ATTR.PORT_EXTERNAL, 0);
+        const fn_nest = try codec.nestBegin(gpa, &vf, uapi.ATTR.PORT_FUNCTION);
+        try codec.nestEnd(&vf, fn_nest);
+        self.push(vf.items);
+
+        // One lane of a split port.
+        var split: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &split, .pci("0000:65:00.0"));
+        try codec.appendAttrU32(gpa, &split, uapi.ATTR.PORT_INDEX, 2);
+        try codec.appendAttrU32(gpa, &split, uapi.ATTR.PORT_NUMBER, 0);
+        try codec.appendAttrU32(gpa, &split, uapi.ATTR.PORT_SPLIT_SUBPORT_NUMBER, 1);
+        try codec.appendAttrU32(gpa, &split, uapi.ATTR.PORT_SPLIT_GROUP, 0);
+        try codec.appendAttrU32(gpa, &split, uapi.ATTR.PORT_SPLIT_COUNT, 4);
+        self.push(split.items);
+
+        // A bare handle: every optional absent.
+        var bare: std.ArrayList(u8) = .empty;
+        try handle.append(gpa, &bare, .{ .bus = "netdevsim", .dev = "netdevsim1" });
+        self.push(bare.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // An attribute header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 });
+        // A DEV_NAME longer than the handle can hold: rejected, not truncated.
+        var oversize: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &oversize, uapi.ATTR.DEV_NAME, &[_]u8{'x'} ** 65);
+        self.push(oversize.items);
+        // PORT_INDEX with a 2-octet payload where a u32 belongs.
+        var narrow: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &narrow, uapi.ATTR.PORT_INDEX, &.{ 1, 0 });
+        self.push(narrow.items);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: port decoding never crashes" {
-    try testing.fuzz({}, fuzzPort, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzPort, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzPort(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an empty attribute
+    // list with the reply sitting unread in `buf`.
+    //
+    // ⛔ And it looked HEALTHIER that way. Measured 2026-09-07 over the corpus
+    // above: **0 of 7 seeds non-empty and 7 of 7 "decoded" before, 7 of 7
+    // non-empty and 4 decoded after.** An empty attribute list is a legal
+    // devlink reply — every field of a port is optional — so `parse("")`
+    // succeeds, and the collapsed harness scored a perfect 7 of 7 while never
+    // once entering the TLV walk.
+    const len: usize = smith.slice(&buf);
     if (parse(buf[0..len])) |p| std.mem.doNotOptimizeAway(&p) else |_| {}
+}
+
+test "corpus: every port seed reaches the parser, and the decoded count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over
+    // the SAME corpus the harness gets. `nonempty` is the reach claim and the
+    // only check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The parse counts
+    // are pinned rather than asserted `> 0`: a corpus of nothing but refusals
+    // would score full marks on reach while exercising only the error path.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parse(buf[0..len])) |_| {
+            decoded += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), decoded);
 }
 
 test "buildPorts dumps; buildPort names one port" {

@@ -49,6 +49,9 @@ const linux = std.os.linux;
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const genl = @import("genetlink");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 const uapi = @import("uapi.zig");
 const handle_mod = @import("handle.zig");
@@ -1098,20 +1101,130 @@ test "parseNotification: malformed attributes are typed errors" {
     try testing.expectError(error.BadLength, parseNotification(testing.allocator, 1, &oversize));
 }
 
+/// Notification attribute lists for `fuzzNotification`, laid out the way its
+/// draws read them: a `testkit.fuzz` slice seed (u32 length + bytes) and then
+/// an eight-octet little-endian word carrying the genl command byte.
+///
+/// ⭐ Built at run time by this module's own encoders rather than quoted as
+/// hex. A devlink attribute is a netlink TLV, whose length and scalars are
+/// HOST byte order, so a hex corpus would be a little-endian one and the
+/// counts pinned below would be false on a big-endian target instead of
+/// failing there.
+///
+/// ⛔ The command word is not decoration. `cmd` decides `isNotification()`,
+/// and it used to be drawn with `valueRangeAtMost(u8, 0, 255)` — the range
+/// minimum, i.e. **0 for every seed**, which is not a devlink command at all.
+const Corpus = struct {
+    scratch: [4096]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8, cmd: u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], cmd, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A PORT_NEW notification: the handle plus a port payload that the
+        // ordinary typed parser can decode afterwards.
+        var port_new: std.ArrayList(u8) = .empty;
+        try handle_mod.append(gpa, &port_new, .pci("0000:65:00.0"));
+        try codec.appendAttrU32(gpa, &port_new, uapi.ATTR.PORT_INDEX, 3);
+        try codec.appendAttrU16(gpa, &port_new, uapi.ATTR.PORT_TYPE, @intFromEnum(uapi.PortType.eth));
+        self.push(port_new.items, uapi.CMD.PORT_NEW);
+
+        // The same bytes under a request-only command: not a notification.
+        self.push(port_new.items, uapi.CMD.PORT_GET);
+
+        // A bare handle under a device notification.
+        var bare: std.ArrayList(u8) = .empty;
+        try handle_mod.append(gpa, &bare, .{ .bus = "netdevsim", .dev = "netdevsim1" });
+        self.push(bare.items, uapi.CMD.NEW);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // An attribute header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 }, uapi.CMD.PORT_NEW);
+        // A DEV_NAME longer than `Owned` can hold: rejected, not truncated.
+        var oversize: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &oversize, uapi.ATTR.DEV_NAME, &[_]u8{'x'} ** 65);
+        self.push(oversize.items, uapi.CMD.PORT_NEW);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: notification parsing never crashes" {
-    try testing.fuzz({}, fuzzNotification, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzNotification, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzNotification(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
-    const cmd = smith.valueRangeAtMost(u8, 0, 255);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parseNotification` was handed an
+    // empty attribute list with the reply sitting unread in `buf`. The command
+    // byte had the same defect and the same cause: it is a full-width
+    // `value(u64)` now, carried in the seed.
+    //
+    // ⛔ And it looked HEALTHIER that way. Measured 2026-09-07 over the corpus
+    // above: **0 of 5 seeds non-empty, 5 of 5 "parsed" and 0 recognised as
+    // notifications before; 5 of 5 non-empty, 3 parsed and 2 recognised
+    // after.** An empty attribute list is a legal devlink reply — the handle
+    // is optional in `handle_mod.parse` — so `parseNotification` succeeded on
+    // every collapsed round, and `cmd` was the constant 0, which is not a
+    // devlink command at all.
+    const len: usize = smith.slice(&buf);
+    const cmd: u8 = @truncate(smith.value(u64));
     if (parseNotification(testing.allocator, cmd, buf[0..len])) |n| {
         var v = n;
         _ = v.isNotification();
         v.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "corpus: every notification seed reaches the parser, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over
+    // the SAME corpus the harness gets. `nonempty` is the reach claim and the
+    // only check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The parse counts
+    // are pinned rather than asserted `> 0`: a corpus of nothing but refusals
+    // would score full marks on reach while exercising only the error path.
+    //
+    // `notifications` is the second number, and the reason the command byte
+    // travels in the seed: `parseNotification` accepts any `cmd` at all, so
+    // "parsed" alone would look identical whether the command reached it or
+    // was the constant 0 it used to be.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var notifications: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        const cmd: u8 = @truncate(smith.value(u64));
+        if (len != 0) nonempty += 1;
+        if (parseNotification(testing.allocator, cmd, buf[0..len])) |n| {
+            parsed += 1;
+            var v = n;
+            if (v.isNotification()) notifications += 1;
+            v.deinit(testing.allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), parsed);
+    try testing.expectEqual(@as(usize, 2), notifications);
 }
 
 // ── C-10 regression: single-object requests must bind the reply's handle ───
