@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: `fuzzLstatPath`'s corpus worked, but only by
+  accident, and one seed was one constant away from silently emptying.** The
+  harness drew `len = smith.valueRangeAtMost(u16, 0, fuzz_path_buf_len)` and
+  only then `smith.bytes(buf[0..len])`, and a local `fuzzCorpusEntry` helper
+  prefixed every seed with its length as a little-endian **u64** — which is
+  exactly the eight octets that ranged draw reads. Measured 2026-09-07 before
+  the change: **4 of the 5 seeds arrived non-empty, carrying 5309 octets**, so
+  unlike the rest of this burn-down this target was genuinely running its
+  corpus. The defect is what holds it up: a ranged draw returns the range
+  MINIMUM unless the whole `u64` falls inside the range, so
+  `fuzz_past_path_max` (5000 separators, the entry that exists to exceed the
+  4096-octet PATH_MAX) only survives while `fuzz_path_buf_len` stays above
+  5000. Lower the buffer and that seed becomes the EMPTY path with every test
+  still green. The harness now draws with one `smith.slice(&buf)`, where an
+  over-long length is clamped rather than collapsed, and the seeds use
+  `testkit.fuzz.seed`. The corpus grows 5 → 12: three embedded-NUL shapes
+  instead of one (including a NUL after a plausible prefix), a seed exactly
+  the size of the buffer, and — new — four paths that actually resolve.
+  Measured after: **11 of 12 seeds non-empty over 13546 octets, 3 `InvalidPath`
+  refusals, and 4 real inodes resolved where the old corpus resolved none.**
+
 - **2026-09-04** — **First audit.** The descent into a directory was an
   `openat()` **without** `O_NOFOLLOW`: the decision to descend came from
   `stat.lstatAt` (which carries `AT_SYMLINK_NOFOLLOW`), and the descent

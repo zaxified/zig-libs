@@ -225,7 +225,7 @@ const module_list = [_]Module{
     .{ .name = "blobstore", .libs = &.{"storage"}, .deps = &.{"hashdigest"} },
     .{ .name = "procnet", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
     .{ .name = "diskfree", .libs = &.{"os"} },
-    .{ .name = "diskusage", .libs = &.{"os"} },
+    .{ .name = "diskusage", .libs = &.{"os"}, .test_deps = &.{"testkit"} },
     .{ .name = "conntrack", .libs = &.{"net"}, .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"} },
     .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{"argsafe"} },
     .{ .name = "dataset", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
