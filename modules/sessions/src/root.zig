@@ -1363,15 +1363,97 @@ test "middleware: small response buffer forces an early flush — no cookie-buff
     try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "Set-Cookie"));
 }
 
+// ── fuzz ───────────────────────────────────────────────────────────────────
+//
+// ⚠ Both targets below used to open `smith.bytes(&buf)` and then draw the
+// length with `smith.valueRangeAtMost`. `bytes` consumes `@min(buf.len,
+// in.len)` octets and a ranged draw reads EIGHT more as a little-endian
+// `u64`, returning the range MINIMUM when fewer remain, so the length was 0
+// for every input a corpus can carry — and neither target had a corpus, so
+// the one input each ever ran was empty. `fuzzSessionRecordDecode` stored a
+// ZERO-LENGTH record and `lookup` answered `.absent` on the `rec.len <
+// record_header_len` line; `fuzzCookieParse` called `cookies.find("", …)`.
+// Measured 2026-09-07: 1 round each, 0 non-empty inputs, 0 records decoded,
+// 0 payload octets copied, 0 cookies found.
+//
+// ⚠ The record buffer was also `record_header_len + max_session_bytes`
+// exactly — 4112 octets — which is one octet short of the smallest record
+// that reaches `lookup`'s own `payload.len > out.data_buf.len` refusal
+// (16 + 4097 = 4113). That branch was structurally unreachable from this
+// harness, and a seed over the buffer reads back EMPTY, so a corpus alone
+// could not have fixed it. The buffer now carries 16 octets of headroom.
+
+/// The corpus for the record decoder, built at run time because the payload
+/// sizes that matter here (4096 and 4097 octets) are not writable as literals.
+///
+/// ⭐ The harness and the guard below both build it from HERE. The clock is
+/// `Env`'s `ManualClock` at `now_ns = 1000`, which is what makes the
+/// `.loaded` / `.expired` split below deterministic.
+const RecordCorpus = struct {
+    const cap = record_header_len + max_session_bytes + 16;
+
+    scratch: [cap]u8 = undefined,
+    stores: [9][4 + cap]u8 = undefined,
+    entries: [9][]const u8 = undefined,
+
+    fn header(self: *RecordCorpus, created: i64, last_seen: i64, payload_len: usize, fill: u8) []const u8 {
+        std.mem.writeInt(i64, self.scratch[0..8], created, .little);
+        std.mem.writeInt(i64, self.scratch[8..16], last_seen, .little);
+        @memset(self.scratch[record_header_len..][0..payload_len], fill);
+        return self.scratch[0 .. record_header_len + payload_len];
+    }
+
+    fn build(self: *RecordCorpus) []const []const u8 {
+        const kit = @import("testkit").fuzz;
+        var n: usize = 0;
+
+        // 0: a live record with no payload. `now_ns` is 1000, so `now - created`
+        //    is 0 and neither timeout fires.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.header(1000, 1000, 0, 0));
+        n += 1;
+        // 1: a live record with a small payload — the ordinary `.loaded` case.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.header(1000, 1000, 5, 'x'));
+        n += 1;
+        // 2: a live record with `max_session_bytes` of payload — the largest
+        //    record `lookup` is allowed to accept, and the memcpy at the edge.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.header(1000, 1000, max_session_bytes, 'y'));
+        n += 1;
+        // 3: ⭐ one octet past it. This is the `payload.len > out.data_buf.len`
+        //    refusal, and it did not fit the old buffer at all.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.header(1000, 1000, max_session_bytes + 1, 'z'));
+        n += 1;
+        // 4: created far in the past → the absolute timeout (100 000 ns) fires.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.header(-1_000_000, 1000, 4, 'a'));
+        n += 1;
+        // 5: last_seen far in the past, created recent → the idle timeout
+        //    (10 000 ns) fires, and only that one.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.header(1000, -1_000_000, 4, 'b'));
+        n += 1;
+        // 6: both timestamps at `maxInt(i64)` → the saturating `-|` path, where
+        //    a plain subtraction would overflow.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.header(std.math.maxInt(i64), std.math.maxInt(i64), 0, 0));
+        n += 1;
+        // 7: fifteen octets — one short of a record header.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.header(1000, 1000, 0, 0)[0 .. record_header_len - 1]);
+        n += 1;
+        // 8: the empty record, which is what an empty corpus produced.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.scratch[0..0]);
+        n += 1;
+
+        std.debug.assert(n == self.entries.len);
+        return &self.entries;
+    }
+};
+
 fn fuzzSessionRecordDecode(_: void, smith: *std.testing.Smith) !void {
     var env = Env.init();
     env.wire();
     defer env.deinit();
     var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
 
-    var record: [record_header_len + max_session_bytes]u8 = undefined;
-    smith.bytes(&record);
-    const len: usize = smith.valueRangeAtMost(u16, 0, record.len);
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
+    var record: [RecordCorpus.cap]u8 = undefined;
+    const len: usize = smith.slice(&record);
     // Bypass `seed`'s structured layout: put a fully arbitrary byte string
     // straight into the store under a fixed id, then decode it exactly like
     // a corrupted/attacker-controlled record would be decoded on `load`.
@@ -1385,13 +1467,84 @@ fn fuzzSessionRecordDecode(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: Manager.lookup's session-record decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzSessionRecordDecode, .{});
+    var corpus: RecordCorpus = .{};
+    try testing.fuzz({}, fuzzSessionRecordDecode, .{ .corpus = corpus.build() });
 }
 
+test "corpus: every record seed reaches lookup, and the payload octets copied are pinned" {
+    // ⭐ The measurement, executable. It draws exactly the way the harness
+    // does, because the defect WAS the draw.
+    //
+    // `octets` is the second number and it is the load-bearing one: `.absent`
+    // is a perfectly legal answer here — it is what a zero-length record
+    // *should* produce, and it is what the collapsed harness got on every run
+    // — so a guard counting "did not panic", or even "returned a result",
+    // would have read green over nothing. Payload octets copied into
+    // `out.data_buf` can only come from a record that passed every check.
+    var corpus: RecordCorpus = .{};
+    const seeds = corpus.build();
+
+    var nonempty: usize = 0;
+    var loaded: usize = 0;
+    var expired: usize = 0;
+    var absent: usize = 0;
+    var octets: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var record: [RecordCorpus.cap]u8 = undefined;
+        const len: usize = smith.slice(&record);
+        if (len != 0) nonempty += 1;
+
+        var env = Env.init();
+        env.wire();
+        defer env.deinit();
+        var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+        const id = "fuzz-session-id";
+        _ = env.store.store().put(id, record[0..len], 0);
+        var out: Session = .{};
+        switch (m.lookup(id, &out)) {
+            .loaded => {
+                loaded += 1;
+                octets += out.data_len;
+            },
+            .expired => expired += 1,
+            .absent => absent += 1,
+        }
+    }
+    // Measured 2026-09-07. Before: 1 round, a zero-length record, `.absent`,
+    // 0 payload octets.
+    try testing.expectEqual(seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 4), loaded);
+    try testing.expectEqual(@as(usize, 2), expired); // the absolute-timeout seed and the idle-timeout seed
+    try testing.expectEqual(@as(usize, 3), absent); // the oversized payload, the 15-octet record, and the empty one
+    try testing.expectEqual(@as(usize, 4101), octets); // 5 from the small record and 4096 from the max-size one
+}
+
+/// `testkit.fuzz.seed`, aliased so the cookie corpus reads as the headers it
+/// is. A corpus entry is not the header: `Smith.slice` reads a little-endian
+/// `u32` length first.
+const fuzzSeed = @import("testkit").fuzz.seed;
+
+/// `Cookie:` request-header values, in the format the length draw reads. The
+/// function under test looks for `default_cookie_name`, so the corpus is
+/// about the ways that name can be present, absent, or nearly present.
+const cookie_header_seeds = [_][]const u8{
+    fuzzSeed(default_cookie_name ++ "=abc123"), // the header `Manager.load` expects
+    fuzzSeed("a=1; " ++ default_cookie_name ++ "=abc123; z=9"), // the id between two other cookies
+    fuzzSeed(default_cookie_name ++ "=\"quoted;value\""), // a DQUOTE-wrapped id containing a ';'
+    fuzzSeed(default_cookie_name ++ "="), // present with an empty value
+    fuzzSeed(default_cookie_name ++ "x=abc123"), // a name that merely starts the same → must not match
+    fuzzSeed("Session=abc123"), // RFC 6265 §5.4 is case-SENSITIVE → must not match
+    fuzzSeed("a=1; b=2"), // the name is simply absent
+    fuzzSeed(";;;  ;  "), // separators and OWS only
+    fuzzSeed(default_cookie_name ++ "=" ++ "a" ** 100), // a 108-octet header, inside the 128 buffer
+    fuzzSeed(""), // zero length: the ONLY input this target ever ran
+};
+
 fn fuzzCookieParse(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
     var header: [128]u8 = undefined;
-    smith.bytes(&header);
-    const len: usize = smith.valueRangeAtMost(u16, 0, header.len);
+    const len: usize = smith.slice(&header);
     // The Cookie request-header decoder this module relies on to find the
     // session id (`Manager.load` → `cookies.get` → `cookies.find`/`parse`):
     // arbitrary bytes must only ever yield null/a borrowed slice, never a
@@ -1401,7 +1554,30 @@ fn fuzzCookieParse(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: cookie header parse (as used by Manager.load) never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzCookieParse, .{});
+    try testing.fuzz({}, fuzzCookieParse, .{ .corpus = &cookie_header_seeds });
+}
+
+test "corpus: every cookie seed reaches find, and the ids recovered are pinned" {
+    // `id_octets` is the second number: `cookies.find` returns null on an
+    // empty header and reports no error, so there is nothing a "did not
+    // crash" guard could have noticed. A recovered id cannot come from an
+    // empty input.
+    var nonempty: usize = 0;
+    var found: usize = 0;
+    var id_octets: usize = 0;
+    for (cookie_header_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var header: [128]u8 = undefined;
+        const len: usize = smith.slice(&header);
+        if (len != 0) nonempty += 1;
+        const v = cookies.find(header[0..len], default_cookie_name) orelse continue;
+        found += 1;
+        id_octets += v.len;
+    }
+    // Measured 2026-09-07. Before: 1 round, `find("", …)`, 0 ids.
+    try testing.expectEqual(cookie_header_seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 5), found);
+    try testing.expectEqual(@as(usize, 124), id_octets);
 }
 
 test "Manager.init rejects an out-of-range id_bytes in every build mode" {

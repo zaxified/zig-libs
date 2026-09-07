@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: neither `fuzzSessionRecordDecode` nor `fuzzCookieParse`
+  reached its decoder. Both opened `smith.bytes(&buf)` and then drew the length with
+  `smith.valueRangeAtMost`; `bytes` consumes `@min(buf.len, in.len)` octets and a ranged
+  draw reads EIGHT more as a little-endian `u64`, returning the range MINIMUM when fewer
+  remain, so the length was 0 for every input a corpus can carry — and neither had a
+  corpus, so the one input each ever ran was empty. `lookup` got a zero-length record and
+  answered `.absent` on its first line; `cookies.find` got an empty header. Measured
+  2026-09-07: 1 round each, 0 records decoded, 0 payload octets copied, 0 ids recovered.
+  ⚠ The record buffer was also `record_header_len + max_session_bytes` exactly (4112),
+  one octet short of the smallest record that reaches `lookup`'s own
+  `payload.len > out.data_buf.len` refusal (4113) — structurally unreachable, and a seed
+  over the buffer reads back EMPTY, so no corpus could have fixed it. The buffer now
+  carries 16 octets of headroom and that seed is in the corpus. Both draws are now one
+  `smith.slice`: the record corpus is built at run time against `Env`'s `ManualClock`
+  (live, small-payload, max-payload, oversized, absolute-expired, idle-expired,
+  `maxInt(i64)` saturating, 15-octet, empty) and the cookie corpus is nine written
+  headers around `default_cookie_name`. Guards pin 4 loaded / 2 expired / 3 absent and
+  4101 payload octets, and 5 ids found over 124 octets.
+
 - **2026-08-13** — Docs only, no behaviour change: the `addSetCookie` failure handling in
   `Manager.writeCookie` and `Csrf.issue` is now explicit about the whole of
   `SetHeaderError`. The comment named only `HeadersSent`, but the set was

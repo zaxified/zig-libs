@@ -683,59 +683,92 @@ test {
 // pure garbage and bytes shaped like the grammar the segment scanner actually
 // branches on (`=`, `;`, `"` — the DQUOTE-toggle state machine that a naive
 // version of the scanner got wrong, per the python-oracle test above).
+// ⛔ AND THE COOKIE-SHAPED HALF NEVER RAN. `buildCookieHeader`'s first act
+// was `smith.valueRangeAtMost(u8, 0, 9)`, the harness's FIRST draw. A `Smith`
+// ranged draw reads eight octets as a little-endian `u64` and returns the
+// range MINIMUM when fewer remain, and this target had no corpus, so outside
+// `--fuzz` the single input it ever ran was empty and that draw was **0 every
+// time** — which is exactly the "one draw in ten is pure arbitrary bytes"
+// branch. Inside it, `smith.bytes(&raw)` filled 512 zeroes and the length
+// draw right after returned 0 as well, so the header was empty. Measured
+// 2026-09-07: 1 round, `parse("")`, 0 cookies yielded, and the DQUOTE-toggle
+// state machine the generator exists to reach was never entered once.
+//
+// The generator is gone. A `Cookie:` header is a byte string off the wire, so
+// it is drawn as one, and the grammar shapes the generator was assembling by
+// hand are a written corpus below — which is also more reviewable, because
+// each one names the branch it is for. Under `--fuzz` the fuzzer mutates real
+// headers, which is what the segment builder was approximating.
+
+/// `testkit.fuzz.seed`, aliased so the corpus reads as the headers it is. A
+/// corpus entry is not the header: `Smith.slice` reads a little-endian `u32`
+/// length first, so a raw header would arrive minus its first four octets.
+const seed = @import("testkit").fuzz.seed;
+
+/// `Cookie:` header values, in the format the length draw reads. The
+/// interesting shapes are the ones the segment scanner branches on — `=`,
+/// `;`, `"` — and above all the DQUOTE toggle, which is what a naive scanner
+/// gets wrong (see the python-oracle test above).
+const cookie_seeds = [_][]const u8{
+    seed("sid=abc123"), // the smallest real header
+    seed("a=1; b=2; c=3"), // three segments, the ordinary case
+    seed("q=\"a;b=c\""), // ⭐ a ';' INSIDE a quoted value: the toggle branch the generator existed for
+    seed("q=\"a\\\"b\"; r=2"), // a '\'-escaped quote inside a quoted value
+    seed("q=\"unterminated; r=2"), // an unterminated quote: the scan runs to the end
+    seed("novalue; a=1"), // a segment with no '=' at all
+    seed("=justvalue; a=1"), // an empty name
+    seed("a=; b=2"), // an empty value
+    seed("  a = 1 ;  b = 2  "), // OWS on both sides of both delimiters
+    seed(";;;"), // nothing but separators
+    seed("a=1;;b=2"), // an empty segment between two real ones
+    seed("\"=\"; \"=\""), // a quote where a name should be
+    seed("a=\t\\,XYZ019"), // the tab, backslash and comma the old alphabet carried
+    seed("a=1; " ** 60), // 300 octets of repetition: a long header, well inside the 512 buffer
+    seed(""), // zero length: the ONLY input this target ever ran
+};
+
 test "fuzz: parse never panics, arbitrary or cookie-shaped bytes" {
-    try std.testing.fuzz({}, fuzzParseNeverPanics, .{});
+    try std.testing.fuzz({}, fuzzParseNeverPanics, .{ .corpus = &cookie_seeds });
 }
 
 fn fuzzParseNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ ONE byte-first draw. Never a ranged draw before the bytes.
     var buf: [512]u8 = undefined;
-    const header = buildCookieHeader(smith, &buf);
-    var it = parse(header);
+    const len: usize = smith.slice(&buf);
+    var it = parse(buf[0..len]);
     while (it.next()) |c| {
         std.mem.doNotOptimizeAway(c.name);
         std.mem.doNotOptimizeAway(c.value);
     }
 }
 
-/// One draw in ten is pure arbitrary bytes; the rest are assembled from the
-/// alphabet a real `Cookie:` header uses — `name=value` segments joined by
-/// `; `, with the value sometimes DQUOTE-wrapped. Arbitrary bytes almost
-/// never spell a quoted value containing a `;`, so without this the quote-
-/// toggle branch (in-quotes tracking in `Iterator.next`) would go unexercised
-/// for the length of any bounded run.
-fn buildCookieHeader(smith: *std.testing.Smith, buf: []u8) []const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    if (smith.valueRangeAtMost(u8, 0, 9) == 0) {
-        var raw: [512]u8 = undefined;
-        smith.bytes(&raw);
-        const len = smith.valueRangeAtMost(u16, 0, @intCast(raw.len));
-        w.writeAll(raw[0..len]) catch {};
-        return w.buffered();
+test "corpus: every cookie seed reaches the scanner, and the segments yielded are pinned" {
+    // ⭐ The measurement, executable. It draws exactly the way the harness
+    // does, because the defect WAS the draw.
+    //
+    // `quoted` is the second number and it is the load-bearing one: `parse`
+    // is allocation-free and infallible — it yields nothing on an empty
+    // header and reports no error — so there is no refusal a guard could
+    // count, and "it did not panic" was satisfied by the collapsed harness on
+    // every run. A cookie whose value survives the DQUOTE toggle cannot come
+    // from an empty input at all.
+    var nonempty: usize = 0;
+    var yielded: usize = 0;
+    var quoted: usize = 0;
+    for (cookie_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var it = parse(buf[0..len]);
+        while (it.next()) |c| {
+            yielded += 1;
+            if (std.mem.indexOfScalar(u8, c.value, ';') != null) quoted += 1;
+        }
     }
-    const n_segments = smith.valueRangeAtMost(u8, 0, 6);
-    var i: u8 = 0;
-    while (i < n_segments) : (i += 1) {
-        if (i != 0) w.writeAll("; ") catch {};
-        writeSegment(smith, &w);
-    }
-    return w.buffered();
-}
-
-fn writeSegment(smith: *std.testing.Smith, w: *std.Io.Writer) void {
-    const alphabet = "abcXYZ019=;\" \t\\,";
-    const name_len = smith.valueRangeAtMost(u8, 0, 6);
-    var i: u8 = 0;
-    while (i < name_len) : (i += 1) {
-        w.writeByte(alphabet[smith.index(alphabet.len)]) catch return;
-    }
-    if (!smith.value(bool)) return;
-    w.writeByte('=') catch return;
-    const quoted = smith.value(bool);
-    if (quoted) w.writeByte('"') catch return;
-    const value_len = smith.valueRangeAtMost(u8, 0, 8);
-    var j: u8 = 0;
-    while (j < value_len) : (j += 1) {
-        w.writeByte(alphabet[smith.index(alphabet.len)]) catch return;
-    }
-    if (quoted) w.writeByte('"') catch return;
+    // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 cookies yielded,
+    // 0 quoted values — the whole target was `parse("")`.
+    try std.testing.expectEqual(cookie_seeds.len - 1, nonempty); // the deliberate empty seed
+    try std.testing.expectEqual(@as(usize, 79), yielded);
+    try std.testing.expectEqual(@as(usize, 3), quoted); // the three seeds whose value survives the DQUOTE toggle with a ';' inside
 }

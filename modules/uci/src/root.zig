@@ -1058,83 +1058,217 @@ test "meta is well-formed" {
 //     never do (a `config`/`option` keyword match is already astronomically
 //     unlikely from raw noise).
 
+// ⚠ Both targets below opened with a collapsing draw and neither carried a
+// corpus, so outside `--fuzz` each ran exactly one input, and it was empty.
+// `fuzzParse` did `smith.bytes(&buf)` and then drew the length with
+// `smith.valueRangeAtMost` — `bytes` eats the input and a ranged draw returns
+// the range MINIMUM when fewer than eight octets remain, so the length was 0
+// and `parse("")` was the whole target. `fuzzRoundTrip` opened
+// `smith.value(bool)`, so every choice in it was a minimum too: no package
+// name, `n_sections` = 0, and therefore an EMPTY `Package` serialized to an
+// empty string and re-parsed. Measured 2026-09-07: 1 round each, 0 sections
+// built, 0 options, 0 values — the serializer's bare-vs-quoted decision and
+// its quote-escaping path, which the comment above names as the whole reason
+// harness 2 exists, were never entered.
+
+/// `testkit.fuzz.seed`, aliased so the corpora read as the config text and
+/// scripts they are. A corpus entry is not the text: `Smith.slice` reads a
+/// little-endian `u32` length first.
+const seed = @import("testkit").fuzz.seed;
+
+/// UCI config text, in the format the length draw reads. Random bytes reject
+/// at the first keyword check essentially always (a `config`/`option` match
+/// out of noise is astronomically unlikely), so a corpus is the only way this
+/// parser is reached at all outside `--fuzz`.
+const parse_seeds = [_][]const u8{
+    seed("config rule\n"), // an anonymous section and nothing else
+    seed("package net\n\nconfig interface 'lan'\n\toption proto 'static'\n"), // a package name, a named section, one option
+    seed("config interface 'lan'\n\tlist ports 'eth0'\n\tlist ports 'eth1'\n"), // the repeated-key → list path
+    seed("config x\n\toption v \"a'b\\\\c\\\"d\"\n"), // every double-quote escape the format defines
+    seed("config x\n\toption v 'a\"b'\n"), // a single-quoted value that takes no escapes
+    seed("config x\n\toption bare value\n"), // an unquoted value
+    seed("config x\n\toption v ''\n"), // an empty quoted value
+    seed("config x\n\toption v 'unterminated\n"), // a quote the line never closes
+    seed("config\n"), // the keyword with no type after it
+    seed("option v 'x'\n"), // an option before any section
+    seed("config x\n\toption k 'a'\n\tlist k 'b'\n"), // mixed option/list under one key → MixedOptionList
+    seed("# a comment\nconfig x\n"), // a comment line
+    seed("config x\n\toption k 'v'\n" ** 40), // ~800 octets, inside the 1024 buffer
+    seed("\x00\x01\x02\xff"), // control and high bytes: the "rejects at the keyword check" half
+    seed(""), // zero length: the ONLY input this target ever ran
+};
+
 test "fuzz: parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParse, .{});
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
     var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     var pkg = parse(testing.allocator, buf[0..len]) catch return;
     pkg.deinit(testing.allocator);
 }
 
-/// Fill `buf` with `smith`-chosen random bytes and return the whole slice —
-/// including bytes below 0x20, which `serialize` legitimately rejects with
+test "corpus: every config seed reaches parse, and the model built is pinned" {
+    // ⭐ The measurement, executable. `values` is the second number and it is
+    // the load-bearing one: `parse("")` SUCCEEDS here — an empty config is a
+    // valid package with no sections — so an "accepted > 0" guard would have
+    // read 100% while the harness walked nothing at all. An option value
+    // cannot be produced by an empty input.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var sections: usize = 0;
+    var values: usize = 0;
+    for (parse_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var pkg = parse(testing.allocator, buf[0..len]) catch continue;
+        defer pkg.deinit(testing.allocator);
+        accepted += 1;
+        sections += pkg.sections.len;
+        for (pkg.sections) |s| for (s.options) |o| {
+            values += o.values.len;
+        };
+    }
+    // Measured 2026-09-07. Before: 1 round, `parse("")`, 0 sections, 0 values.
+    try testing.expectEqual(parse_seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 10), accepted);
+    try testing.expectEqual(@as(usize, 48), sections);
+    try testing.expectEqual(@as(usize, 47), values);
+}
+
+/// Fill `buf` from the script and return the slice — including bytes below
+/// 0x20, which `serialize` legitimately rejects with
 /// `error.UnserializableValue` (UCI text has no escape producing a control
 /// byte, `\n`/`\t`/`\r` included — see the parser's double-quote comment);
 /// the caller is expected to propagate that as an early, no-bug return.
-fn fuzzToken(smith: *std.testing.Smith, buf: []u8, min_len: usize) []const u8 {
-    smith.bytes(buf);
-    const len: usize = @max(min_len, smith.valueRangeAtMost(u16, 0, @intCast(buf.len)));
+fn fuzzToken(c: *testkitFuzz.Cursor, buf: []u8, min_len: usize) []const u8 {
+    const len: usize = @max(min_len, c.ranged(0, @intCast(buf.len)));
+    for (buf[0..len]) |*b| b.* = c.byte();
     return buf[0..len];
 }
 
+const testkitFuzz = @import("testkit").fuzz;
+
+/// Scripts for the round-trip generator. This harness draws a SHAPE, not a
+/// byte string, so there is no frame to be faithful to — the fix is
+/// `testkit.fuzz.Cursor`, which reads every choice out of ONE byte-first
+/// `smith.slice`. That makes the draw honest (the gate's half) and makes a
+/// seed a readable script instead of a sequence of `u64` words (the corpus
+/// half), and under `--fuzz` the fuzzer still drives every choice because it
+/// drives the slice. A short script CYCLES rather than running out.
+const roundtrip_scripts = [_][]const u8{
+    seed(""), // the empty script reproduces the collapsed harness EXACTLY: every read is 0, so the package is empty
+    seed("\x01wan\x01\x02lan\x01\x03proto\x00\x01static"), // a named package, one named section, one single option
+    seed("\x02\x03if\x00\x02a\x01\x01\x02xy\x02b\x00\x01\x01z"), // two sections, one anonymous
+    seed("\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03"), // saturate every count: 3 sections x 3 options x 3 values
+    seed("\x01p\x01\x02t\x01\x01n\x01\x01k\x01\x03'\"\\"), // a value made of the three characters the quoting rules turn on
+    seed("\x01p\x01\x02t\x01\x01n\x01\x01k\x01\x02\x00\x0a"), // a NUL and a newline: the documented UnserializableValue refusal
+};
+
 test "fuzz: parse(serialize(pkg)) round-trips to an equal Package (and reserializes byte-identical)" {
-    try testing.fuzz({}, fuzzRoundTrip, .{});
+    try testing.fuzz({}, fuzzRoundTrip, .{ .corpus = &roundtrip_scripts });
 }
 
-fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
-    var pkg_name_buf: [16]u8 = undefined;
-    var type_bufs: [3][8]u8 = undefined;
-    var name_bufs: [3][16]u8 = undefined;
-    var key_bufs: [3][3][8]u8 = undefined;
-    var val_bufs: [3][3][3][16]u8 = undefined;
-    var value_slices: [3][3][3][]const u8 = undefined;
-    var options: [3][3]Option = undefined;
-    var sections: [3]Section = undefined;
-
-    const pkg_name: ?[]const u8 = if (smith.value(bool)) fuzzToken(smith, &pkg_name_buf, 1) else null;
-
-    const n_sections = smith.valueRangeAtMost(u8, 0, 3);
-    for (0..n_sections) |si| {
-        const sec_type = fuzzToken(smith, &type_bufs[si], 1);
-        const has_name = smith.value(bool);
-        // min_len 1, not 0: the parser collapses an explicit empty-quoted
-        // section name to anonymous (`name = null`, see `parseLine`'s
-        // "config" branch) — a hand-built `Section{ .name = "" }` is a shape
-        // `parse` can never itself produce, so it is deliberately excluded
-        // here rather than hitting a spurious round-trip mismatch.
-        const sec_name: ?[]const u8 = if (has_name) fuzzToken(smith, &name_bufs[si], 1) else null;
-
-        const n_opts = smith.valueRangeAtMost(u8, 0, 3);
-        for (0..n_opts) |oi| {
-            const key = fuzzToken(smith, &key_bufs[si][oi], 1);
-            // Force distinct keys within one section: a real parse can never
-            // produce two Option entries sharing a key (repeated `option`
-            // overwrites; `list`/`option` mixed under one key is itself a
-            // parse error, `MixedOptionList`) — an accidental collision here
-            // would build a Package shape the parser structurally cannot
-            // reproduce, and would misreport as a round-trip bug instead of
-            // a harness artifact.
-            key_bufs[si][oi][0] = 'A' + @as(u8, @intCast(oi));
-            const kind: Option.Kind = if (smith.value(bool)) .single else .list;
-            const n_values: usize = if (kind == .single) 1 else smith.valueRangeAtMost(u8, 1, 3);
-            for (0..n_values) |vi| {
-                value_slices[si][oi][vi] = fuzzToken(smith, &val_bufs[si][oi][vi], 0);
-            }
-            options[si][oi] = .{ .key = key, .kind = kind, .values = value_slices[si][oi][0..n_values] };
-        }
-        sections[si] = .{
-            .type = sec_type,
-            .name = sec_name,
-            .anonymous = sec_name == null,
-            .options = options[si][0..n_opts],
+test "corpus: every round-trip script builds a package, and the sections built are pinned" {
+    // `values` is the second number and it is the load-bearing one: the empty
+    // script builds an EMPTY package, which serializes to "" and re-parses to
+    // an equal empty package — a completely successful round trip that proves
+    // nothing. That is exactly the state the collapsed harness was in on every
+    // run, so a guard counting successful round trips would have read 1 of 1.
+    var built: usize = 0;
+    var sections: usize = 0;
+    var values: usize = 0;
+    for (roundtrip_scripts) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [64]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var c = testkitFuzz.Cursor{ .bytes = script[0..n] };
+        var b: RoundTripBuild = undefined;
+        const pkg = b.make(&c);
+        built += 1;
+        sections += pkg.sections.len;
+        for (pkg.sections) |s| for (s.options) |o| {
+            values += o.values.len;
         };
     }
+    // Measured 2026-09-07. Before: 1 round, 0 sections, 0 options, 0 values.
+    try testing.expectEqual(roundtrip_scripts.len, built);
+    try testing.expectEqual(@as(usize, 13), sections);
+    try testing.expectEqual(@as(usize, 25), values);
+}
 
-    const pkg = Package{ .name = pkg_name, .sections = sections[0..n_sections] };
+/// The generator's scratch, lifted out of the harness body so the corpus
+/// guard above can build the SAME package the harness builds. A guard
+/// measuring a different generator from the one the harness runs is not a
+/// guard.
+const RoundTripBuild = struct {
+    pkg_name_buf: [16]u8 = undefined,
+    type_bufs: [3][8]u8 = undefined,
+    name_bufs: [3][16]u8 = undefined,
+    key_bufs: [3][3][8]u8 = undefined,
+    val_bufs: [3][3][3][16]u8 = undefined,
+    value_slices: [3][3][3][]const u8 = undefined,
+    options: [3][3]Option = undefined,
+    sections: [3]Section = undefined,
+
+    fn make(self: *RoundTripBuild, c: *testkitFuzz.Cursor) Package {
+        const pkg_name: ?[]const u8 = if (c.byte() & 1 == 1) fuzzToken(c, &self.pkg_name_buf, 1) else null;
+
+        const n_sections = c.ranged(0, 3);
+        for (0..n_sections) |si| {
+            const sec_type = fuzzToken(c, &self.type_bufs[si], 1);
+            const has_name = c.byte() & 1 == 1;
+            // min_len 1, not 0: the parser collapses an explicit empty-quoted
+            // section name to anonymous (`name = null`, see `parseLine`'s
+            // "config" branch) — a hand-built `Section{ .name = "" }` is a
+            // shape `parse` can never itself produce, so it is deliberately
+            // excluded here rather than hitting a spurious round-trip
+            // mismatch.
+            const sec_name: ?[]const u8 = if (has_name) fuzzToken(c, &self.name_bufs[si], 1) else null;
+
+            const n_opts = c.ranged(0, 3);
+            for (0..n_opts) |oi| {
+                const key = fuzzToken(c, &self.key_bufs[si][oi], 1);
+                // Force distinct keys within one section: a real parse can
+                // never produce two Option entries sharing a key (repeated
+                // `option` overwrites; `list`/`option` mixed under one key is
+                // itself a parse error, `MixedOptionList`) — an accidental
+                // collision here would build a Package shape the parser
+                // structurally cannot reproduce, and would misreport as a
+                // round-trip bug instead of a harness artifact.
+                self.key_bufs[si][oi][0] = 'A' + @as(u8, @intCast(oi));
+                const kind: Option.Kind = if (c.byte() & 1 == 1) .single else .list;
+                const n_values: usize = if (kind == .single) 1 else c.ranged(1, 3);
+                for (0..n_values) |vi| {
+                    self.value_slices[si][oi][vi] = fuzzToken(c, &self.val_bufs[si][oi][vi], 0);
+                }
+                self.options[si][oi] = .{ .key = key, .kind = kind, .values = self.value_slices[si][oi][0..n_values] };
+            }
+            self.sections[si] = .{
+                .type = sec_type,
+                .name = sec_name,
+                .anonymous = sec_name == null,
+                .options = self.options[si][0..n_opts],
+            };
+        }
+        return .{ .name = pkg_name, .sections = self.sections[0..n_sections] };
+    }
+};
+
+fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ ONE byte-first draw, then a `Cursor` over it. What stood here opened
+    // `smith.value(bool)` and drew every subsequent choice from `smith`
+    // directly, so on the single empty input this target ever ran, every
+    // choice was a minimum and the "package" was empty.
+    var script: [64]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var c = testkitFuzz.Cursor{ .bytes = script[0..n] };
+    var b: RoundTripBuild = undefined;
+    const pkg = b.make(&c);
 
     const gpa = testing.allocator;
     const s1 = serialize(gpa, &pkg) catch |err| switch (err) {

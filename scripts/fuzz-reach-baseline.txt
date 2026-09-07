@@ -16,7 +16,6 @@ bulletproofs 2
 cbor 2
 chachapoly 2
 coconut 1
-cookies 1
 cors 1
 ctap2pin 1
 decimal 2
@@ -50,7 +49,6 @@ rdap 2
 ripemd160 1
 saml 2
 sealedbox 1
-sessions 2
 signal 2
 slhdsa 1
 sntp 1
@@ -64,7 +62,6 @@ tlsresume 2
 tracecontext 1
 tsdb 2
 tz 2
-uci 2
 validate 2
 voprf 1
 webhooksig 1

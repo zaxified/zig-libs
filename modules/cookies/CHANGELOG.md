@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `fuzzParseNeverPanics` only ever ran `parse("")`.
+  `buildCookieHeader`'s first act was `smith.valueRangeAtMost(u8, 0, 9)`, the harness's
+  FIRST draw; a `Smith` ranged draw reads eight octets as a little-endian `u64` and
+  returns the range MINIMUM when fewer remain, and the target had no corpus, so outside
+  `--fuzz` the one input it ever ran was empty and that draw was 0 every time — which is
+  exactly the "one draw in ten is pure arbitrary bytes" branch. Inside it, `smith.bytes`
+  filled 512 zeroes and the length draw right after also returned 0, so the header was
+  empty. The `name=value` segment generator never ran, and the DQUOTE-toggle state
+  machine it exists to reach — the branch a naive scanner gets wrong, per the
+  python-oracle test — was never entered. Measured 2026-09-07: 1 round, 0 cookies
+  yielded. The generator is gone; the header is drawn byte-first with one `smith.slice`
+  and the grammar shapes are 15 written seeds that each name the branch they are for. ⚠
+  The corpus guard pins values that survive the DQUOTE toggle, not "did not panic":
+  `parse` is infallible and yields nothing on an empty header, so there was no refusal a
+  guard could have counted. Pinned: 14 non-empty, 79 cookies yielded, 3 quoted values.
+
 - **2026-08-14** — `zig build check-fuzz` coverage: a `testing.fuzz` harness on `parse`
   (the `Cookie`-header decode entry point), generating both arbitrary bytes and
   cookie-shaped input assembled from the grammar's own alphabet (`=`, `;`,
