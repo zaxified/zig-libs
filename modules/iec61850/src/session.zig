@@ -24,6 +24,12 @@
 
 const std = @import("std");
 
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the frames they
+/// are. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw frame would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seedHex;
+
 pub const Error = error{
     ShortSpdu,
     /// The length indicator points past the octets present.
@@ -380,14 +386,36 @@ test "abort carries its transport-disconnect reason" {
     try testing.expectEqualSlices(u8, &[_]u8{ 0xA0, 0x00 }, ud);
 }
 
+/// ISO 8327-1 session SPDUs, in the format `Smith.slice` reads.
+///
+/// `decodeConnect`, `decodeDataTransfer` and `decodeHeader` are all driven from
+/// the same slice, so the corpus carries one frame that each of them accepts
+/// plus the truncations that bound the parameter iterator.
+const decode_seeds = [_][]const u8{
+    seed("0D0414020002" ++ "61023000"), // CONNECT with a two-octet SPDU parameter
+    seed("0100010061023000"), // an ACCEPT carrying user data
+    seed("0D"), // a type octet and nothing else
+    seed("0D2000"), // a length that runs past the buffer
+    seed("0900"), // GIVE TOKENS: a zero-length SPDU
+    seed("0D0414080002"), // a parameter length that overruns the SPDU
+    seed("0D0114"), // a parameter group that stops mid-header
+    seed("0100020061"), // a DATA TRANSFER whose user data is truncated
+    seed("A000"), // an ASN.1 body with no session header at all
+    seed("AABB"), // two octets of noise
+};
+
 test "fuzz: session decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so the length was 0 for every seed and the decoder was handed an empty
+    // slice with the seed sitting unread in the buffer.
+    const len: usize = smith.slice(&buf);
     _ = decodeConnect(buf[0..len]) catch {};
     _ = decodeDataTransfer(buf[0..len]) catch {};
     const h = decodeHeader(buf[0..len]) catch return;
@@ -400,4 +428,27 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         const p = it.next() catch return;
         if (p == null) break;
     }
+}
+
+test "corpus: every decode seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so this pins the number rather than asserting it is > 0.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeHeader(buf[0..len])) |_| {
+            accepted += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 7), accepted);
 }

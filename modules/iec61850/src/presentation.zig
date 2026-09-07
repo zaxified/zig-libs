@@ -26,6 +26,14 @@
 //! CP wrapper — which is why `decodeUserData` is a separate entry point.
 
 const std = @import("std");
+
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the frames they
+/// are. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw frame would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seedHex;
+
 const ber = @import("ber.zig");
 
 pub const Error = ber.Error || error{
@@ -539,14 +547,66 @@ test "malformed CP PPDUs are typed errors" {
     );
 }
 
+/// Presentation-layer CP and PDV bodies, in the format `Smith.slice` reads.
+///
+/// `decodeCp`, `decodeUserData` and `PdvIterator` all see the same slice, so
+/// the corpus carries a well-formed body for each plus the shapes that make the
+/// iterator stop: an empty list, a wrong outer tag, and a single octet.
+const decode_seeds = [_][]const u8{
+    seed("3105A003800102"), // a CP with a single context-definition entry
+    seed("3106A204A4020500"), // a context-list entry that is not a SEQUENCE
+    seed("3000"), // an empty SEQUENCE where a SET is expected
+    seed("3100"), // an empty SET: a CP with no fields
+    seed("A000"), // a zero-length PDV list
+    seed("0500"), // ASN.1 NULL: a body of the wrong type entirely
+    seed("00"), // one octet
+};
+
+/// The whole corpus: the malformed literals above, plus every CP this layer
+/// ACCEPTS — and those have no captured form in the module, they are built by
+/// its own encoder. So the positive half comes from `encodeCp` / `encodeCpa` /
+/// `encodeUserData` at run time through `testkit.fuzz.seedInto`, and tracks the
+/// encoder instead of freezing a paste of it.
+///
+/// ⭐ The fuzz harness and the corpus guard below both build it from HERE. A
+/// guard that measured a different corpus from the one the harness gets is not
+/// a guard, and this corpus scored **0 of 7 accepted** before the built frames
+/// were added: seven seeds, every one of which `decodeCp` refuses.
+const Corpus = struct {
+    cp_out: [512]u8 = undefined,
+    cpa_out: [512]u8 = undefined,
+    ud_out: [64]u8 = undefined,
+    cp_store: [4 + 512]u8 = undefined,
+    cpa_store: [4 + 512]u8 = undefined,
+    ud_store: [4 + 64]u8 = undefined,
+    entries: [decode_seeds.len + 3][]const u8 = undefined,
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        const body = try encodeUserData(context_acse, &[_]u8{ 0x05, 0x00 }, &self.ud_out);
+        @memcpy(self.entries[0..decode_seeds.len], &decode_seeds);
+        self.entries[decode_seeds.len + 0] =
+            testkit.fuzz.seedInto(&self.cp_store, try encodeCp(body, .{}, &self.cp_out));
+        self.entries[decode_seeds.len + 1] =
+            testkit.fuzz.seedInto(&self.cpa_store, try encodeCpa(body, .{}, &self.cpa_out));
+        self.entries[decode_seeds.len + 2] =
+            testkit.fuzz.seedInto(&self.ud_store, body);
+        return &self.entries;
+    }
+};
+
 test "fuzz: presentation decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    var corpus: Corpus = .{};
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so the length was 0 for every seed and the decoder was handed an empty
+    // slice with the seed sitting unread in the buffer.
+    const len: usize = smith.slice(&buf);
     _ = decodeCp(buf[0..len]) catch {};
     var table = ContextTable{};
     table.define(context_mms, &ber.oids.mms_abstract_syntax) catch return;
@@ -560,4 +620,29 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         const p = it.next() catch return;
         if (p == null) break;
     }
+}
+
+test "corpus: every decode seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so this pins the number rather than asserting it is > 0.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeCp(buf[0..len])) |_| {
+            accepted += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 2), accepted);
 }

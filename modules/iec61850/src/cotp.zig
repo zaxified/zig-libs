@@ -24,6 +24,12 @@
 
 const std = @import("std");
 
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the frames they
+/// are. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw frame would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seedHex;
+
 pub const Error = error{
     ShortTpdu,
     /// `LI` points past the octets present, or is zero.
@@ -405,14 +411,39 @@ test "disconnect round trips" {
     try testing.expectEqual(@as(u8, 0x80), d.reason);
 }
 
+/// COTP TPDUs, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// The two captured connection TPDUs, a data TPDU, and one frame for each of
+/// the eight refusals `decode` names. Uniform random octets reach any of the
+/// typed errors only by accident: `decode` gates on a length indicator that has
+/// to agree with the buffer before the TPDU code is even read.
+const decode_seeds = [_][]const u8{
+    seed("11E00000000100C0010DC2020001C1020001"), // the captured CR TPDU
+    seed("11D00001000100C0010DC2020001C1020001"), // the CC that answers it
+    seed("02F08001000100"), // a DT carrying two octets
+    seed("01000100"), // a DT payload with no TPDU around it
+    seed("02"), // ShortTpdu
+    seed("00F0"), // BadLengthIndicator: LI of zero
+    seed("20E000"), // BadLengthIndicator: LI points past the buffer
+    seed("022000"), // UnknownTpduCode
+    seed("03F08000"), // BadDataTpdu: a class-0 DT with LI != 2
+    seed("05E000000001"), // BadLengthIndicator: a CR that does not cover its fixed part
+    seed("06E00000000140"), // UnsupportedClass: class 4
+    seed("07E00000000100C0"), // BadParameter: a dangling parameter code
+};
+
 test "fuzz: cotp decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so the length was 0 for every seed and the decoder was handed an empty
+    // slice with the seed sitting unread in the buffer.
+    const len: usize = smith.slice(&buf);
     const t = decode(buf[0..len]) catch return;
     var out: [1024]u8 = undefined;
     switch (t) {
@@ -426,4 +457,27 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         },
         else => {},
     }
+}
+
+test "corpus: every decode seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so this pins the number rather than asserting it is > 0.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decode(buf[0..len])) |_| {
+            accepted += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), accepted);
 }

@@ -25,6 +25,13 @@
 //! emits the indirect form so its output matches the reference stack.
 
 const std = @import("std");
+
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the frames they
+/// are. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw frame would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seedHex;
+
 const ber = @import("ber.zig");
 
 pub const Error = ber.Error || error{
@@ -397,15 +404,63 @@ test "malformed ACSE APDUs are typed errors" {
     );
 }
 
+/// ACSE APDUs, in the format `Smith.slice` reads.
+///
+/// One frame per APDU tag `classify` dispatches on, plus a tag it does not define
+/// and a body with no APDU wrapper. The dispatch is a single octet, so uniform
+/// random input reaches five of these one time in fifty and the field decoders
+/// behind them essentially never.
+const decode_seeds = [_][]const u8{
+    seed("6007BE052803020103"), // an AARQ carrying a user-information field
+    seed("6006BE0428020201"), // an AARQ whose user information is a bare INTEGER
+    seed("6004BE020500"), // an AARQ with a NULL user information
+    seed("6005A103020101"), // an AARQ with a protocol-version field
+    seed("6100"), // an empty AARE
+    seed("6200"), // an empty RLRQ
+    seed("6203800100"), // an RLRQ with a reason
+    seed("6303800100"), // an RLRE with a reason
+    seed("6403800100"), // an ABRT with a source
+    seed("6500"), // a tag ACSE does not define
+    seed("BE092807020103A0020500"), // a bare user-information field, no APDU around it
+    seed("0500"), // ASN.1 NULL
+};
+
 test "fuzz: acse decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so the length was 0 for every seed and the decoder was handed an empty
+    // slice with the seed sitting unread in the buffer.
+    const len: usize = smith.slice(&buf);
     _ = decodeAarq(buf[0..len]) catch {};
     _ = decodeAare(buf[0..len]) catch {};
     _ = classify(buf[0..len]) catch {};
+}
+
+test "corpus: every decode seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so this pins the number rather than asserting it is > 0.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (classify(buf[0..len])) |_| {
+            accepted += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 9), accepted);
 }

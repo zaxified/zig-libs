@@ -5,6 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Six fuzz harnesses now receive their input; they did not
+  before.** `tpkt.fuzzDecode`, `tpkt.fuzzFramer`, `cotp.fuzzDecode`,
+  `session.fuzzDecode`, `presentation.fuzzDecode` and `acse.fuzzDecode` all
+  opened `smith.bytes(&buf)` and then drew the length with a ranged draw. `bytes`
+  takes `@min(buf.len, in.len)` octets, so the ranged draw found fewer than the
+  eight it needs and returned the range MINIMUM — the length was **0 for every
+  seed**, and the decoder was called with an empty slice while the input sat
+  unread in the buffer. Measured on `tpkt.fuzzDecode`: 0 of 9 seeds non-empty
+  before, 9 of 9 after. `tpkt.fuzzFramer` was worse and invisible: there the
+  length never touched the buffer at all, it was the bound of the loop that
+  feeds the framer, so `while (off < len)` never ran and a harness named "framer
+  never panics or hangs" fed the framer **nothing**. `check-fuzz-reach`'s R2 rule
+  did not see that shape until it was widened the same day.
+  Each of the six now draws with one `smith.slice` and carries a corpus built
+  from this module's own value tests — the captured CR/CC TPDUs, one frame per
+  typed refusal each decoder names, and for `presentation`, whose accepted CPs
+  exist only as encoder output, three frames built at run time by `encodeCp` /
+  `encodeCpa` / `encodeUserData`.
+  ⭐ The four corpus guards are the part worth keeping: they assert that every
+  seed reads back non-empty (a seed longer than the harness's buffer silently
+  reads back EMPTY) and pin how many the decoder accepts. The `presentation`
+  guard earned itself immediately — its literal-only corpus scored **0 of 7
+  accepted**, exercising the refusal path and nothing else.
+
 - **2026-09-03** — Drift re-audit (window `d163578..HEAD`, +1140/-73 over 14 files). Four findings,
   all fixed and mutation-checked.
 
