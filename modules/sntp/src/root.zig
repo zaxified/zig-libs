@@ -946,14 +946,58 @@ test "golden: real SNTP reply captured from time.google.com, frozen" {
 // across and away from the fixed 48 so both `error.InvalidLength` and the
 // full field decode are exercised.
 
+/// `testkit.fuzz.seedHex`: a corpus entry is NOT the datagram. `Smith.slice`
+/// reads a little-endian `u32` length first, so a raw 48-octet packet handed
+/// to the corpus would arrive at the decoder minus its own first four octets.
+const seed = @import("testkit").fuzz.seedHex;
+
+/// Server datagrams in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// Every one of these is 48 octets — `packet_len` — except the two that exist
+/// to reach `error.InvalidLength`, because the fixed length is the FIRST thing
+/// `decodeResponse` checks and uniform random octets clear nothing behind it:
+/// a random 48-octet datagram carries mode 4 with probability 1/8 and a
+/// version in 1..4 with probability 1/2, so the harness on its own proves only
+/// that the length and mode checks reject noise. Lifted from the value tests
+/// above; the comment on each names the branch it reaches.
+const decode_seeds = [_][]const u8{
+    // The captured pool reply from the "golden exchange" test: accepted.
+    seed("240100EC0000000000000007474F4F47EE187A1CF6989F83EE187A1CEF6B2800EE187A1CF6989F84EE187A1CF6989F86"),
+    // The canned reply: LI=0 VN=4 Mode=4, stratum 2, ref id "GPS\0". Accepted.
+    seed("240204EC0000000000000000475053000000000000000000000000000000000000000064000000000000006500000000"),
+    seed("00" ** 40), // InvalidLength: 40 octets
+    seed("00" ** 56), // InvalidLength: 56 octets
+    // NotServerMode: 0x23 is mode 3 (client).
+    seed("230200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+    // InvalidVersion: VN=0 with a non-zero transmit, so the VN check is what fires.
+    seed("040200000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000"),
+    // UnsynchronizedStratum: stratum 16.
+    seed("241000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000"),
+    // Stratum 15, the top of the valid secondary-reference range: accepted.
+    seed("240F00000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000"),
+    // TransmitTimestampUnset: everything else valid, transmit left all-zero.
+    seed("240200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+    // KissOfDeath with a registered code, which is what writes `kiss_out`.
+    seed("240000000000000000000000524154450000000000000000000000000000000000000000000000000000000000000000"),
+    // KissOfDeath with an unregistered code → `.unrecognized`, not an error.
+    seed("240000000000000000000000FF005A5A0000000000000000000000000000000000000000000000000000000000000000"),
+};
+
 test "fuzz: decodeResponse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeResponse, .{});
+    try testing.fuzz({}, fuzzDecodeResponse, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecodeResponse(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input and `decodeResponse` was called with
+    // `buf[0..0]`, dying at `error.InvalidLength` before it ever read a field,
+    // with the datagram sitting unread in `buf`. Measured 2026-09-07 over the
+    // corpus above: **0 of 11 seeds non-empty and 0 decoded before, 11 of 11
+    // non-empty and 3 decoded after.**
+    const len: usize = smith.slice(&buf);
 
     // Always pass a live kiss_out so the KissOfDeath write path (new in this
     // sweep) is exercised by the same never-panics fuzz target, not just the
@@ -961,4 +1005,38 @@ fn fuzzDecodeResponse(_: void, smith: *std.testing.Smith) !void {
     var kod: KissOfDeath = undefined;
     const reply = decodeResponse(buf[0..len], &kod) catch return;
     verifyOriginate(reply, reply.originate) catch return;
+}
+
+test "corpus: every seed reaches decodeResponse, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. It holds
+    // two things nothing else does: a seed longer than the harness's buffer
+    // reads back EMPTY (`Smith.slice` falls back to the range minimum), which
+    // is silent everywhere else; and a corpus that accepts nothing exercises
+    // only the refusal path. `accepted > 0` would be a weak guard here — but
+    // `error.InvalidLength` is NOT reachable from the empty input alone, so the
+    // second number below is the one the collapsed harness could never produce.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var wrong_length: usize = 0;
+    var kissed: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var kod: KissOfDeath = undefined;
+        if (decodeResponse(buf[0..len], &kod)) |_| {
+            accepted += 1;
+        } else |err| switch (err) {
+            error.InvalidLength => wrong_length += 1,
+            error.KissOfDeath => kissed += 1,
+            else => {},
+        }
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 of 11 non-empty, 0
+    // accepted and 11 of 11 `InvalidLength` from the SAME empty slice. After:
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 2), wrong_length);
+    try testing.expectEqual(@as(usize, 2), kissed);
 }
