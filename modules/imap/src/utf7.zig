@@ -400,14 +400,57 @@ test "invalid UTF-8 is rejected by both directions" {
 // surrogate pairs is the kind of index arithmetic where a truncated run at
 // the very end of the input is the classic off-by-one.
 
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the mailbox names
+/// it is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw name would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// Modified-UTF-7 mailbox names, in the format `Smith.slice` reads.
+///
+/// The RFC 3501 §5.1.3 worked example, the accepted forms from the go-imap
+/// table, and the rejections that matter most: an unterminated shift, a null
+/// shift, a lone surrogate, a non-minimal encoding, and the padding variants.
+/// A `&...-` run has to be base64 in the modified alphabet AND decode to
+/// well-formed UTF-16 AND be minimal, so uniform octets reach the decoder's
+/// interesting half essentially never — the harness's own comment says the
+/// off-by-one it is hunting lives "at the very end of the input", which is a
+/// place only a well-formed shift run gets to.
+const decode_seeds = [_][]const u8{
+    seed("~peter/mail/&U,BTFw-/&ZeVnLIqe-"), // the RFC 3501 §5.1.3 example
+    seed("abc"), // no shift at all: literal text
+    seed("&-abc"), // "&-" is a literal ampersand
+    seed("a&-b&-c"), // several of them
+    seed("&ABk-"), // U+0019, a control character that must be encoded
+    seed("&AB8-"), // U+001F, the boundary of the must-encode range
+    seed("ABk-"), // no '&', so this is literal text, not a shift
+    seed("&-,&-&AP8-&-"), // the go-imap table's mixed run
+    seed("abc &- &AP8A,wD,- &- xyz"), // three code points in one shift run
+    seed("&AP8A,w-"), // two U+00FF in ONE run: the canonical spelling
+    seed("&AP8-&AP8-"), // InvalidUtf7: a null shift the encoder must never emit
+    seed("&AGE-"), // InvalidUtf7: 'a' the long way round, a non-minimal encoding
+    seed("&ACA-"), // InvalidUtf7: U+0020 is directly representable
+    seed("&2A-"), // InvalidUtf7: a lone high surrogate
+    seed("&"), // InvalidUtf7: an unterminated shift, at the very end
+    seed("&Jjo"), // InvalidUtf7: a shift run that never closes
+    seed("Jjo&"), // a trailing '&' after literal text
+    seed("&AAAAHw=-"), // a padded run: the '=' variants the table rejects
+    seed("&ZeVnLIqe\r\n-"), // a CRLF inside a shift run
+    seed("\xff"), // InvalidUtf8: not valid UTF-8 to begin with
+};
+
 test "fuzz: modified UTF-7 decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecode, .{});
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `decodeAlloc` was handed an empty slice
+    // with the seed sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
 
     const out = decodeAlloc(testing.allocator, buf[0..len]) catch return;
     defer testing.allocator.free(out);
@@ -416,4 +459,36 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     // stronger check than "it did not crash". A surrogate mishandled as a
     // lone code point would produce well-formed-looking bytes that are not.
     try testing.expect(std.unicode.utf8ValidateSlice(out));
+}
+
+test "corpus: every UTF-7 seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path.
+    //
+    // ⚠ Acceptance is especially weak evidence in THIS module: `decodeAlloc("")`
+    // is legal and returns the empty string, which is exactly what the
+    // collapsed harness did on its one and only execution — the same shape that
+    // let `bacnet/service` score 19 of 19. The pinned number is what separates
+    // "the decoder ran" from "the decoder returned".
+    const gpa = testing.allocator;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeAlloc(gpa, buf[0..len])) |out| {
+            defer gpa.free(out);
+            accepted += 1;
+            try testing.expect(std.unicode.utf8ValidateSlice(out));
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 20 seeds non-empty and 0 decoded before the
+    // draw was fixed, 20 of 20 non-empty and 999 accepted after.
+    try testing.expectEqual(@as(usize, 10), accepted);
 }
