@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Tests:** `fuzzParseVerify` parsed nothing but the empty
+  document. It filled a buffer with `smith.bytes` and then drew the length with
+  `valueRangeAtMost(u16, 0, buf.len)`; a ranged `Smith` draw reads eight octets
+  as a little-endian u64 and returns the range MINIMUM when fewer remain, so
+  the length was 0 on every input and both `parseInfo` and `parseRound` were
+  handed `""` for the life of the harness. It also had no corpus, so that empty
+  document was the only input it ever ran. Second defect: the buffer was 512
+  octets against `quicknet_info_json`'s 504, and `chaininfo.zig`'s own
+  `quicknet_info_json ++ " trailing"` negative fixture is 513 — over the
+  buffer, which `Smith.slice` reads back as EMPTY rather than as a long seed.
+  Now one `smith.slice(&buf)` draw over 2048 octets and a 16-seed corpus of
+  whole documents (both genuine chains, the audit-F1 forged chain-hash/key
+  pair, an odd-length signature hex, 96 hex octets that are not a G1 point, 200
+  levels of nesting). Measured: 0 chain infos, 0 public keys, 0 rounds and 0
+  signatures decoded before; 2 / 2 / 4 / 4 after. The corpus guard pins the
+  decoded POINTS rather than a parse count, since the two things the verify
+  path stands on are the G2 key and the G1 signature.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
   `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
   helper existed **33 times across 12 modules in three shapes**, each carrying its

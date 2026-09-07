@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Tests:** `fuzzParseServerRef` fetched its input and threw
+  it away. It opened `smith.bytes(&buf)` and then drew the length with
+  `valueRangeAtMost(u8, 0, buf.len)`; a ranged `Smith` draw reads eight octets
+  as a little-endian u64 and returns the range MINIMUM when fewer remain, so
+  the length was 0 on every input a corpus can carry and `parseServerRef` was
+  handed `""` for the life of the harness. It also had no corpus, so that empty
+  slice was the only input it ever ran. Second defect: the buffer was 128
+  octets against this module's own `max_host_len` of 255, so the over-length
+  refusal its value test exercises with `"x" ** 256` could never have been
+  reached through the harness -- a seed longer than the buffer reads back
+  EMPTY. Now one `smith.slice(&buf)` draw over a `max_host_len * 2` buffer, a
+  17-seed corpus, and `nextServer` fed the same bytes. Measured: 0 referrals
+  extracted before, 4 after (303 host octets, 4 replies chased); the corpus
+  guard pins all three, because `parseServerRef("")` returns null rather than
+  erroring and an "it did not panic" guard reads 100% on a harness parsing
+  nothing.
+
 - **2026-08-23** — **Behavioural:** `TransportError` gains `Canceled`, and
   `TcpTransport` recovers it from the concrete reader and writer instead of
   folding every failure into `TransportFailed`. A canceled lookup was

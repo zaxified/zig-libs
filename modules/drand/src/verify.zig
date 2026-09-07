@@ -460,14 +460,70 @@ test "positive control: little-endian round hashing FAILS the genuine KAT (schem
 
 // ── fuzz: parsers + verify path never panic / OOB / hang ───────────────
 
+// ⛔ This harness fetched its document and then threw it away. `smith.bytes`
+// copies `min(buf.len, in.len)` octets and the `valueRangeAtMost` right after
+// it reads EIGHT more as a little-endian u64, returning the range MINIMUM when
+// fewer remain — so `len` was 0 for every input a corpus can carry and both
+// parsers were handed `""` on every iteration. With no corpus, that empty
+// document was the only input the harness ever ran: neither `/info` nor
+// `/public/<round>` was parsed once inside it.
+//
+// ⛔ And the buffer was 512 octets against `quicknet_info_json`'s 504 — eight
+// to spare, and `chaininfo.zig`'s own `quicknet_info_json ++ " trailing"`
+// negative fixture is 513, i.e. over the buffer, which `Smith.slice` reads back
+// as EMPTY rather than as a long seed. Raised to 2048 so
+// the module's own documents and their damaged variants all fit.
+
+/// The corpus-entry format `Smith.slice` reads (a little-endian u32 length,
+/// then the frame). See `testkit/src/fuzz.zig` for the three hazards it carries.
+const parseSeed = @import("testkit").fuzz.seed;
+
+/// Whole JSON documents, in the format the length draw reads. Both parsers are
+/// fed each one, which is the point: a `/public/<round>` document is a
+/// structurally valid but semantically wrong `/info`, and vice versa, so every
+/// seed exercises one accept path and one refusal.
+const parse_seeds = [_][]const u8{
+    parseSeed(quicknet_info_json), // the genuine quicknet /info
+    parseSeed(chaininfo.quicknet_t_info_json), // a genuine SECOND chain (quicknet-t)
+    parseSeed(
+        \\{"public_key":"b15b65b46fb29104f6a4b5d1e11a8da6344463973d423661bb0804846a0ecd1ef93c25057f1c0baab2ac53e56c662b66072f6d84ee791a3382bfb055afab1e6a375538d8ffc451104ac971d2dc9b168e2d3246b0be2015969cbaac298f6502da","period":3,"genesis_time":1692803367,"hash":"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971","groupHash":"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e","schemeID":"bls-unchained-g1-rfc9380","metadata":{"beaconID":"quicknet"}}
+    ), // ⭐ quicknet's chain hash over quicknet-t's key: the audit-F1 ChainHashMismatch
+    parseSeed(round_1000_json), // the genuine /public/1000
+    parseSeed(quicknet_info_json ++ " trailing"), // ⭐ 513 octets: over the OLD 512 buffer, so it read back empty
+    parseSeed(
+        \\{"round": 1000, "signature": "b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39"}
+    ), // a round with no randomness field: legal, the check is skipped
+    parseSeed(
+        \\{"round": 0, "randomness": "fe290beca10872ef2fb164d2aa4442de4566183ec51c56ff3cd603d930e54fdd", "signature": "b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39"}
+    ), // round 0
+    parseSeed(
+        \\{"round": 18446744073709551615, "signature": "b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39"}
+    ), // the u64 ceiling in the round number
+    parseSeed(
+        \\{"round": 1000, "signature": "b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e3"}
+    ), // an odd-length signature hex
+    parseSeed(
+        \\{"round": 1000, "signature": "ff4679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39"}
+    ), // 96 hex octets that are not a G1 point
+    parseSeed(
+        \\{"public_key": "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a", "period": 3, "genesis_time": 1692803367, "hash": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971", "groupHash": "f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e", "schemeID": "not-a-scheme"}
+    ), // an /info whose schemeID this module does not implement
+    parseSeed(
+        \\{"public_key": "00", "period": 3, "genesis_time": 0, "hash": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971", "groupHash": "f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e", "schemeID": "bls-unchained-g1-rfc9380"}
+    ), // a one-octet public key
+    parseSeed("{" ++ "[" ** 200), // 200 levels of unbalanced nesting
+    parseSeed("null"), // valid JSON that is not an object
+    parseSeed("\x00\xff\xfe not json at all"), // non-UTF-8 bytes
+    parseSeed(""), // the empty document: what the collapsed harness ran, every time
+};
+
 test "fuzz: chain-info + round parse and verify never panic on arbitrary input" {
-    try std.testing.fuzz({}, fuzzParseVerify, .{});
+    try std.testing.fuzz({}, fuzzParseVerify, .{ .corpus = &parse_seeds });
 }
 
 fn fuzzParseVerify(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+    var buf: [2048]u8 = undefined;
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
 
     // Parsers must never crash and must bound allocation by the input.
@@ -482,6 +538,40 @@ fn fuzzParseVerify(_: void, smith: *std.testing.Smith) !void {
             verifyRound(&info, &rnd) catch {};
         }
     }
+}
+
+test "corpus: every parse seed reaches a parser, and what each one decodes is pinned" {
+    // ⭐ Not "no seed panicked": that read 100% while both parsers only ever
+    // saw `""`. The numbers the empty document cannot produce are the decoded
+    // G2 public key and the decoded G1 signature — the two points the whole
+    // verify path stands on.
+    var nonempty: usize = 0;
+    var infos: usize = 0;
+    var pubkeys_decoded: usize = 0;
+    var rounds: usize = 0;
+    var sigs_decoded: usize = 0;
+    for (parse_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [2048]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const input = buf[0..len];
+        if (chaininfo.parseInfo(testing.allocator, input)) |info| {
+            infos += 1;
+            if (info.pubkey_g2 != null) pubkeys_decoded += 1;
+        } else |_| {}
+        if (round_mod.parseRound(testing.allocator, input)) |rnd| {
+            rounds += 1;
+            if (rnd.sig_g1 != null) sigs_decoded += 1;
+        } else |_| {}
+    }
+    // One seed is deliberately the empty document.
+    try testing.expectEqual(parse_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: every counter below was 0 before the draw was fixed.
+    try testing.expectEqual(@as(usize, 2), infos);
+    try testing.expectEqual(@as(usize, 2), pubkeys_decoded);
+    try testing.expectEqual(@as(usize, 4), rounds);
+    try testing.expectEqual(@as(usize, 4), sigs_decoded);
 }
 
 // ── fuzz: the verify path itself, which the harness above cannot reach ────

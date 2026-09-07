@@ -843,15 +843,83 @@ test "TcpTransport compiles (never dialed in tests)" {
 // response is exactly this parser's threat model (a malicious or
 // compromised registry server chooses this text).
 
+// ⛔ This harness used to open `smith.bytes(&buf)` and then draw the length
+// with `valueRangeAtMost(u8, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and a ranged draw reads EIGHT more as a little-endian u64,
+// returning the range minimum when fewer remain — so `len` was 0 for every
+// input a corpus can carry, and the referral line sat unread in `buf` while
+// `parseServerRef` was handed `""` on every iteration. It also carried no
+// corpus, so outside `--fuzz` that empty slice was the ONLY input it ever ran.
+//
+// ⛔ And the buffer was 128 octets against this module's own `max_host_len` of
+// 255: the over-length refusal at line 196 — which its value test exercises
+// with `"x" ** 256` — could not be reached through the harness at all, because
+// `Smith.slice` returns the range MINIMUM (0) for a seed longer than the
+// buffer. Raised to `max_host_len * 2` so both sides of that bound fit.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+
+/// Referral lines, in the format the length draw reads. `nextServer` is fed the
+/// same bytes because it is the surface a hostile registry actually reaches:
+/// `parseServerRef` sees one line, `nextServer` scans a whole reply for four
+/// different keys and then calls it.
+const referral_seeds = [_][]const u8{
+    seed("whois://whois.example.net:43"), // the URL form with an explicit port
+    seed(" whois://whois.example.net:4343/ "), // padded, non-default port, trailing path
+    seed("whois.iana.org"), // the bare-host form: the default port
+    seed("rwhois://rwhois.example.net:4321/"), // a scheme that is not RFC 3912
+    seed("http://example.com"), // likewise
+    seed("host:0"), // port 0 is refused
+    seed("host:notaport"), // a port that is not a number
+    seed("host:99999"), // a port past u16
+    seed("no spaces allowed"), // a space is not a legal host octet
+    seed("x" ** 255), // exactly `max_host_len`: accepted
+    seed("x" ** 256), // ⭐ one past it: the refusal a 128-octet buffer could never reach
+    seed("refer:        whois.verisign-grs.com\n"), // a whole IANA line: `nextServer` key 1
+    seed("ReferralServer: whois://whois.ripe.net\n"), // ARIN's key
+    seed("  registrar whois server:  whois.markmonitor.com \r\n"), // Verisign's, case-folded and padded
+    seed("whois:          whois.nic.example\n"), // the IANA TLD-record key
+    seed("\x00\xff garbage \r\r\n::!"), // non-UTF-8 with a bare `::`
+    seed(""), // the empty text: what the collapsed harness ran, every time
+};
+
 test "fuzz: parseServerRef never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzParseServerRef, .{});
+    try testing.fuzz({}, fuzzParseServerRef, .{ .corpus = &referral_seeds });
 }
 
 fn fuzzParseServerRef(_: void, smith: *std.testing.Smith) !void {
-    var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    var buf: [max_host_len * 2]u8 = undefined;
+    const len: usize = smith.slice(&buf);
     _ = parseServerRef(buf[0..len]);
+    _ = nextServer(buf[0..len]);
+}
+
+test "corpus: every referral seed reaches the parser, and what it extracts is pinned" {
+    // ⭐ `parseServerRef("")` returns null and `nextServer("")` returns null, so
+    // "no seed panicked" reads 100% on a harness that parses nothing — which is
+    // exactly what this one did. The numbers an empty text cannot produce are
+    // the referrals actually extracted and the host octets they carry.
+    var nonempty: usize = 0;
+    var refs: usize = 0;
+    var host_octets: usize = 0;
+    var chased: usize = 0;
+    for (referral_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [max_host_len * 2]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parseServerRef(buf[0..len])) |r| {
+            refs += 1;
+            host_octets += r.host.len;
+        }
+        if (nextServer(buf[0..len])) |_| chased += 1;
+    }
+    // One seed is deliberately the empty text.
+    try testing.expectEqual(referral_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: all four were 0 before the draw was fixed.
+    try testing.expectEqual(@as(usize, 4), refs);
+    try testing.expectEqual(@as(usize, 303), host_octets);
+    try testing.expectEqual(@as(usize, 4), chased);
 }
 
 // -- test (cancellation, loopback) -----------------------------------------

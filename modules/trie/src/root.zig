@@ -420,30 +420,139 @@ fn runQueries(f: Frozen) void {
     }
 }
 
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. See `testkit/src/fuzz.zig` for the hazards it carries.
+const testkit = @import("testkit");
+const fuzzSeed = testkit.fuzz.seed;
+
+// ⛔ `fuzzRandom` used to fill `buf` with `smith.bytes` and then draw the
+// length with `valueRangeAtMost(u16, 0, buf.len)`. A ranged `Smith` draw reads
+// EIGHT octets as a little-endian u64 and returns the range MINIMUM when fewer
+// remain, so the length was 0 for every input a corpus can carry and
+// `Frozen.load` was handed an empty slice — `error.Truncated` before it had
+// looked at the magic. With no corpus, that was the only input it ever ran.
+
+/// Whole frozen buffers, in the format the length draw reads. The header is 36
+/// octets of little-endian fields with its own CRC over `[0..32)`, so a
+/// hand-written header has to carry a correct `header_crc` to get past
+/// `Header.load` at all — these were computed with `std.hash.Crc32` and are
+/// what makes the structural refusals below (`MalformedRoot`, a lying
+/// `node_region_len`) reachable rather than masked by `HeaderCorrupt`.
+const random_seeds = [_][]const u8{
+    fuzzSeed("ZTR1"), // the magic alone: Truncated
+    fuzzSeed("ZTR0" ++ "\x01\x00" ++ "\x02\x01" ++ "\x00" ** 28), // wrong magic
+    fuzzSeed("ZTR1" ++ "\x01\x00" ++ "\x02\x01" ++ "\x00" ** 28), // right magic, wrong header CRC
+    fuzzSeed("ZTR1\xff\xff\x02\x01\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xff\xbcc^\x00\x00\x00\x00\x00\x00\x00\x00"), // an unsupported version, correctly sealed
+    fuzzSeed("ZTR1\x01\x00\x01\x02\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xcf,\xf4\xc5\x00\x00\x00\x00\x00\x00\x00\x00"), // the endian marker byte-swapped, correctly sealed
+    fuzzSeed("ZTR1\x01\x00\x02\x01\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xa4\xc5\xbfo"), // node_region_len 4 GiB, correctly sealed: Truncated
+    fuzzSeed("ZTR1\x01\x00\x02\x01\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00^;\xaf\xe5\x00\x00\x00\x00\x00\x00\x00\x00"), // root_offset 4 GiB over a real node region: MalformedRoot
+    fuzzSeed("ZTR1\x01\x00\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xd6\xa1\x95\x9f"), // node_region_len 0: MalformedRoot
+    fuzzSeed("ZTR1\x01\x00\x02\x01\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xf3\x0aS\x7f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"), // ⭐ a sealed header over an all-zero node region: LOADS, and every query is then bounds-checked
+    fuzzSeed("ZTR1\x01\x00\x02\x01\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x00\x00\x00\x00\x00\x00\xf3\x0aS\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"), // ⭐ the same, all-ones node region: an edge_count of 65535 the walk must refuse
+    fuzzSeed("\x00" ** 36), // an all-zero header
+    fuzzSeed("\xff" ** 64), // all ones
+    fuzzSeed(""), // the empty buffer: what the collapsed harness ran, every time
+};
+
 fn fuzzRandom(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     const f = Frozen.load(buf[0..len]) catch return;
     runQueries(f);
 }
 
 test "fuzz: loader + query path never panic on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzRandom, .{});
+    try std.testing.fuzz({}, fuzzRandom, .{ .corpus = &random_seeds });
 }
 
+/// What one mutation script asked for, so the corpus guard can measure the
+/// damage rather than assert that the harness ran.
+const Damage = struct {
+    /// Octets whose value actually changed (a flip that writes the byte
+    /// already there is not damage).
+    changed: usize = 0,
+    /// True when the script asked for the header CRC to be recomputed.
+    resealed: bool = false,
+};
+
+/// ⛔⛔ The two defects this replaces, both measured.
+///
+/// 1. `flips` came from `smith.valueRangeAtMost(u8, 0, 12)` as the FIRST draw,
+///    which returns the range MINIMUM for all but one input word in 2^64. So
+///    the flip count was **0** and the harness loaded the pristine buffer on
+///    every iteration — 20 000 iterations reported clean with an escaping bug
+///    planted in the traversal. Its comment claimed the fuzzer "spends its time
+///    past the magic/CRC gate, deep in node traversal"; it spent it re-loading
+///    an untouched index.
+///
+/// 2. ⭐ Even with the count fixed, a blind byte flip is **CRC-gated**. Any
+///    octet in `[0..36)` breaks the header CRC over `[0..32)`, so every header
+///    mutation comes straight back as `error.HeaderCorrupt` and the traverse
+///    this harness exists for is never entered — the harness would measure the
+///    rejection path and nothing else. The script therefore carries a RE-SEAL
+///    bit: recompute `header_crc` (and optionally `body_crc`) after mutating,
+///    which is exactly what an attacker handing over a crafted index does. That
+///    is what makes a damaged `root_offset`, `node_region_len` or `key_count`
+///    reach the bounds-checked walk instead of dying at the checksum.
+///
+/// Script layout, one octet each unless noted:
+///
+///     0      flags: bit0 = re-seal `header_crc`, bit1 = also re-seal `body_crc`
+///     1      flip count, modulo 13
+///     2..    per flip: offset (2 octets, big-endian, modulo `buf.len`), value
+///
+/// A short script CYCLES rather than running out; the empty script is the
+/// collapsed harness exactly — zero flips, no re-seal.
+fn damage(script: []const u8, buf: []u8, out: *Damage) void {
+    var s = testkit.fuzz.Cursor{ .bytes = script };
+    out.* = .{};
+    if (buf.len == 0) return;
+    const flags = s.byte();
+    const flips: usize = s.byte() % 13;
+    var i: usize = 0;
+    while (i < flips) : (i += 1) {
+        const at: usize = @as(usize, s.word()) % buf.len;
+        const v = s.byte();
+        if (buf[at] != v) out.changed += 1;
+        buf[at] = v;
+    }
+    if (flags & 1 != 0 and buf.len >= format.header_size) {
+        out.resealed = true;
+        if (flags & 2 != 0) {
+            const region = std.mem.readInt(u32, buf[12..16], .little);
+            const end = @min(buf.len, format.header_size + @as(usize, region));
+            std.mem.writeInt(u32, buf[28..32], std.hash.Crc32.hash(buf[format.header_size..end]), .little);
+        }
+        std.mem.writeInt(u32, buf[32..36], std.hash.Crc32.hash(buf[0..32]), .little);
+    }
+}
+
+const mutated_seeds = [_][]const u8{
+    fuzzSeed("\x00\x00"), // no flips, no re-seal: the pristine index — and exactly what the collapsed harness ran
+    fuzzSeed("\x01\x01" ++ "\x00\x18\xff"), // root_offset high byte → 0xff, RE-SEALED: MalformedRoot instead of HeaderCorrupt
+    fuzzSeed("\x01\x01" ++ "\x00\x0c\xff"), // node_region_len damaged, re-sealed: the length the walk is bounded by
+    fuzzSeed("\x01\x01" ++ "\x00\x10\xff"), // key_count damaged, re-sealed
+    fuzzSeed("\x01\x02" ++ "\x00\x04\x02"), // version → 2, re-sealed: UnsupportedVersion, not HeaderCorrupt
+    fuzzSeed("\x00\x01" ++ "\x00\x18\xff"), // ⭐ the same root_offset flip WITHOUT the re-seal: HeaderCorrupt, the rejection path the old harness could only have measured
+    fuzzSeed("\x01\x04" ++ "\x00\x28\xff\x00\x29\xff\x00\x2a\xff\x00\x2b\xff"), // four octets deep in the node region: edge labels and child offsets
+    fuzzSeed("\x01\x08" ++ "\x00\x30\x00\x00\x31\x00\x00\x32\x00\x00\x33\x00\x00\x34\xff\x00\x35\xff\x00\x36\xff\x00\x37\xff"), // eight octets of node payload zeroed and maxed
+    fuzzSeed("\x03\x04" ++ "\x00\x28\xff\x00\x2c\xff\x00\x30\xff\x00\x34\xff"), // node region damaged with BOTH CRCs re-sealed: `loadVerified` accepts it too
+    fuzzSeed("\x01\x0c" ++ "\x00\x24\x01"), // the maximum flip count, cycling over one offset
+    fuzzSeed(""), // the empty script: zero flips, no re-seal
+};
+
 fn fuzzMutated(base: []const u8, smith: *std.testing.Smith) !void {
+    var script: [64]u8 = undefined;
+    const n: usize = smith.slice(&script);
     var copy: [1024]u8 = undefined;
     if (base.len > copy.len) return;
     @memcpy(copy[0..base.len], base);
-    // Apply a handful of smith-driven byte flips to a VALID buffer, so the
-    // fuzzer spends its time past the magic/CRC gate, deep in node traversal.
-    var i: usize = 0;
-    const flips: usize = smith.valueRangeAtMost(u8, 0, 12);
-    while (i < flips) : (i += 1) {
-        const at: usize = smith.valueRangeAtMost(u16, 0, @intCast(base.len - 1));
-        copy[at] = smith.value(u8);
-    }
+    var d: Damage = .{};
+    damage(script[0..n], copy[0..base.len], &d);
+    // Both openers: `load` checks the header only, `loadVerified` also walks
+    // the node region's CRC, so a script that re-seals only the header takes
+    // different branches in the two.
+    _ = Frozen.loadVerified(copy[0..base.len]) catch {};
     const f = Frozen.load(copy[0..base.len]) catch return;
     runQueries(f);
 }
@@ -456,5 +565,73 @@ test "fuzz: mutated-valid-buffer loader + query path never panic" {
         .{ .key = "brno", .value = 4 },
     });
     defer testing.allocator.free(base);
-    try std.testing.fuzz(base, fuzzMutated, .{});
+    try std.testing.fuzz(base, fuzzMutated, .{ .corpus = &mutated_seeds });
+}
+
+test "corpus: the random buffers reach the loader, and what they get past is pinned" {
+    var nonempty: usize = 0;
+    var loaded: usize = 0;
+    var header_corrupt: usize = 0;
+    for (random_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (Frozen.load(buf[0..len])) |_| {
+            loaded += 1;
+        } else |e| {
+            if (e == error.HeaderCorrupt) header_corrupt += 1;
+        }
+    }
+    // One seed is deliberately the empty buffer.
+    try testing.expectEqual(random_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: both were 0 before the draw was fixed — every
+    // iteration handed `Frozen.load` an empty slice and got `Truncated`.
+    try testing.expectEqual(@as(usize, 2), loaded);
+    try testing.expectEqual(@as(usize, 1), header_corrupt);
+}
+
+test "corpus: the mutation scripts actually damage the index, and reach the traverse" {
+    // ⭐⭐ Neither "no seed panicked" nor "some seed loaded" is a guard here.
+    // The old harness applied ZERO flips, so the pristine index loaded on every
+    // iteration and both would have read 100% while nothing was ever mutated.
+    // The numbers the empty script cannot produce are the octets actually
+    // changed and — the CRC trap — the number of DAMAGED buffers that still got
+    // past `Header.load` into the bounds-checked walk.
+    const base = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+        .{ .key = "praha", .value = 1 },
+        .{ .key = "prahasever", .value = 2 },
+        .{ .key = "plzen", .value = 3 },
+        .{ .key = "brno", .value = 4 },
+    });
+    defer testing.allocator.free(base);
+
+    var changed_total: usize = 0;
+    var damaged_and_loaded: usize = 0;
+    var damaged_and_verified: usize = 0;
+    var damaged_and_rejected: usize = 0;
+    for (mutated_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [64]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var copy: [1024]u8 = undefined;
+        @memcpy(copy[0..base.len], base);
+        var d: Damage = .{};
+        damage(script[0..n], copy[0..base.len], &d);
+        changed_total += d.changed;
+        if (d.changed == 0) continue;
+        if (Frozen.loadVerified(copy[0..base.len])) |_| damaged_and_verified += 1 else |_| {}
+        if (Frozen.load(copy[0..base.len])) |f| {
+            damaged_and_loaded += 1;
+            runQueries(f);
+        } else |_| damaged_and_rejected += 1;
+    }
+    // Measured 2026-09-07: `changed_total` was 0 — the flip count was the
+    // first draw and therefore always the range minimum.
+    try testing.expectEqual(@as(usize, 23), changed_total);
+    // ⭐ The CRC trap, as a number: without the re-seal bit every one of these
+    // would land in `damaged_and_rejected` and the traverse would stay unvisited.
+    try testing.expectEqual(@as(usize, 5), damaged_and_loaded);
+    try testing.expectEqual(@as(usize, 4), damaged_and_rejected);
+    try testing.expectEqual(@as(usize, 2), damaged_and_verified);
 }
