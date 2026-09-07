@@ -458,16 +458,82 @@ test "external anchor: parseHello on a real server hello from the `netconf` 2.1.
     try testing.expectEqual(framing.Dialect.chunked, try negotiate(&ours, &h.capabilities));
 }
 
+/// `testkit.fuzz.seed`: a corpus entry is NOT the document. `Smith.slice`
+/// reads a little-endian `u32` length first, so a raw hello handed to the
+/// corpus would reach the parser with its first four octets gone — `lo ` in
+/// place of `<hello`, which is a lexer error, not a hello.
+const seed = @import("testkit").fuzz.seed;
+
+/// Hellos in the format `Smith.slice` reads (see `testkit.fuzz`). Lifted from
+/// the value tests above: the two RFC documents, the live server hello, and
+/// every hostile case `parseHello: hostile / malformed inputs` names.
+///
+/// Uniform random octets do not produce a well-formed XML element, let alone
+/// one in the NETCONF base namespace, so without these the target proves only
+/// that the lexer rejects noise — `parseHello`'s own session-id, namespace and
+/// capability logic is never reached.
+const hello_seeds = [_][]const u8{
+    seed(rfc6241_8_1_server_hello), // 3 capabilities, session-id 4: accepted as .server
+    seed(rfc6242_3_client_hello), // no session-id: MissingSessionId as .server
+    seed(live_netconf_2_1_0_server_hello), // the frozen live hello: accepted
+    seed("<hello/>"), // MalformedHello: no namespace
+    seed("<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"/>"), // MalformedHello: no capabilities
+    seed("<rpc xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/></rpc>"), // MalformedHello
+    seed("<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities><capability></capability></capabilities><session-id>1</session-id></hello>"),
+    seed("<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/><session-id>0</session-id></hello>"), // InvalidSessionId
+    seed("<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/><session-id>x</session-id></hello>"), // InvalidSessionId
+    seed("<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/><session-id>4294967296</session-id></hello>"), // InvalidSessionId: overflow
+    seed("<!DOCTYPE hello [<!ENTITY x \"y\">]><hello/>"), // DoctypeForbidden: the XXE surface stays shut
+    seed("<hello"), // UnexpectedEof
+};
+
 test "fuzz: parseHello never crashes on arbitrary XML-ish input" {
-    try testing.fuzz({}, fuzzHello, .{});
+    try testing.fuzz({}, fuzzHello, .{ .corpus = &hello_seeds });
 }
 
 fn fuzzHello(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input and `parseHello` was handed the empty
+    // string, returning `error.NoRootElement` before it read a byte, with the
+    // document sitting unread in `raw`. Measured 2026-09-07 over the corpus
+    // above: **0 of 12 seeds non-empty and 0 hellos parsed before, 12 of 12
+    // non-empty and 2 parsed after.**
+    const len: usize = smith.slice(&raw);
     if (parseHello(testing.allocator, raw[0..len], .server)) |*h| {
         var m = h.*;
         m.deinit();
     } else |_| {}
+}
+
+test "corpus: every hello seed reaches parseHello, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) and nothing else would notice.
+    //
+    // `parsed` alone would be a weak guard, so `capabilities` is pinned beside
+    // it: the empty input cannot yield a single capability URI, so a non-zero
+    // count is a statement about reach rather than about what parses.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var capabilities: usize = 0;
+    for (hello_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        if (parseHello(testing.allocator, raw[0..len], .server)) |*h| {
+            var m = h.*;
+            defer m.deinit();
+            parsed += 1;
+            capabilities += m.capabilities.list.len;
+        } else |_| {}
+    }
+    try testing.expectEqual(hello_seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 of 12 seeds non-empty,
+    // 0 parsed and 0 capabilities — the same empty string twelve times. After:
+    try testing.expectEqual(@as(usize, 2), parsed);
+    try testing.expectEqual(@as(usize, 5), capabilities);
 }
