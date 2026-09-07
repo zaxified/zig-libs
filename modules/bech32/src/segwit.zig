@@ -275,20 +275,95 @@ test "decodeSegwit: malicious oversized data section fails closed, no overflow" 
 // user pasted or a QR code produced — bech32 decode plus the witness-
 // version/program-length validation the regression above targets.
 
-test "fuzz: decodeSegwit never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzDecodeSegwit, .{ .corpus = &.{
-        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-        "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
-        "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kqkhhp9x",
-    } });
+/// A corpus entry in the format `Smith.slice` actually reads — a little-endian
+/// `u32` length, then the address — followed by one `u64` word per octet the
+/// charset knob in `fuzzDecodeSegwit` reads afterwards (`1` bends that octet
+/// into the charset, `0` leaves it alone; once the words run out every
+/// remaining draw is the weight minimum, i.e. `false`).
+///
+/// ⛔ Two defects were measured here on 2026-09-08, and both were silent.
+/// (1) The corpus was a list of BARE string literals. `Smith.slice` reads a
+/// little-endian `u32` length before the bytes, so the P2WPKH vector reached
+/// the decoder as `"w508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"` — every seed
+/// arrived minus its own first four octets, which for a segwit address takes
+/// away the `bc1` prefix and the separator. **All three BIP-173/BIP-350
+/// vectors were rejected before the witness-version/program-length validation
+/// this harness exists to reach**: 0 of 3 accepted.
+/// (2) With the seed consumed by the byte draw, `boolWeighted(1, 3)` returned
+/// its weight minimum: the loop ran 135 times over the corpus and bent **0**
+/// octets, so the charset-bending branch had never executed once.
+fn bendSeed(comptime raw: []const u8, comptime bends: []const u64) []const u8 {
+    return &struct {
+        const words = blk: {
+            var w: [bends.len * 8]u8 = undefined;
+            for (bends, 0..) |b, i| std.mem.writeInt(u64, w[i * 8 ..][0..8], b, .little);
+            break :blk w;
+        };
+        const bytes = std.mem.toBytes(@as(u32, raw.len)) ++ raw[0..raw.len].* ++ words;
+    }.bytes;
 }
 
+const decode_seeds = [_][]const u8{
+    bendSeed("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", &.{}), // v0 P2WPKH
+    bendSeed("bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0", &.{}), // v1 P2TR
+    bendSeed("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kqkhhp9x", &.{}), // the checksum near-miss
+    bendSeed("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", &.{}), // HrpMismatch: testnet hrp
+    // The charset knob, one word per octet: sixteen octets that are NOT in
+    // the charset, every one of them bent into it — the input a tail-less
+    // seed cannot produce, and the only one that reaches the loop body.
+    bendSeed(&[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &([_]u64{1} ** 16)),
+    bendSeed("", &.{}), // and the input a corpus-less target runs for ever
+};
+
+test "fuzz: decodeSegwit never panics on arbitrary text" {
+    try testing.fuzz({}, fuzzDecodeSegwit, .{ .corpus = &decode_seeds });
+}
+
+const fuzz_alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l1bc";
+
 fn fuzzDecodeSegwit(_: void, smith: *std.testing.Smith) !void {
-    const alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l1bc";
     var buf: [128]u8 = undefined;
     const len = smith.slice(&buf); // not `bytes` + a ranged length: that always yields 0
     for (buf[0..len]) |*c| {
-        if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
+        if (smith.boolWeighted(1, 3)) c.* = fuzz_alphabet[c.* % fuzz_alphabet.len];
     }
     _ = decodeSegwit("bc", buf[0..len]) catch return;
+}
+
+test "corpus: every segwit seed reaches decodeSegwit, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment.
+    //
+    // ⛔ Not `accepted > 0`. `program_octets` is the number the collapsed
+    // corpus cannot move — it only grows when a seed's own octets survive the
+    // draw AND clear the checksum and the length validation — and `bent` is
+    // the one a tail-less corpus cannot move.
+    var nonempty: usize = 0;
+    var bent: usize = 0;
+    var accepted: usize = 0;
+    var program_octets: usize = 0;
+    var witver_total: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [128]u8 = undefined;
+        const len = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        for (buf[0..len]) |*c| {
+            if (smith.boolWeighted(1, 3)) {
+                c.* = fuzz_alphabet[c.* % fuzz_alphabet.len];
+                bent += 1;
+            }
+        }
+        if (decodeSegwit("bc", buf[0..len])) |d| {
+            accepted += 1;
+            program_octets += d.program().len;
+            witver_total += d.witver;
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len - 1, nonempty); // all but the empty string
+    // Measured 2026-09-08. Before: every seed arrived four octets short of the
+    // address it was written as — 0 accepted, 0 program octets, 0 bent. After:
+    try testing.expectEqual(@as(usize, 16), bent);
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try testing.expectEqual(@as(usize, 52), program_octets);
+    try testing.expectEqual(@as(usize, 1), witver_total);
 }
