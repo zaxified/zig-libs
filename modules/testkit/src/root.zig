@@ -42,10 +42,16 @@ pub const meta = .{
 
 test {
     _ = hex;
+    _ = fuzz;
     _ = @import("golden.zig");
 }
 
 pub const hex = @import("hex.zig");
+
+/// Corpus seeds in the format `std.testing.Smith` reads. See its doc comment
+/// for the three hazards it carries — the length prefix, the buffer ceiling,
+/// and the fact that a seed is worthless in a harness that discards it.
+pub const fuzz = @import("fuzz.zig");
 
 pub const expectHex = @import("golden.zig").expectHex;
 pub const expectBytes = @import("golden.zig").expectBytes;

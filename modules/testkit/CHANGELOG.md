@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`fuzz.seed` / `fuzz.seedHex` / `fuzz.seedInto`.** A
+  `std.testing.fuzz` corpus entry is not the frame you want the harness to see:
+  `Smith.slice` reads a little-endian `u32` length first, so a raw frame arrives
+  minus its own first four octets (measured on `netaddr`: `"192.168.1.1"` reached
+  the parser as `"168.1.1"`). Every module that burned its fuzz targets down
+  rediscovered that and wrote the same helper — **33 copies across 12 modules in
+  three shapes**, growing by roughly eight per module burned down, each carrying
+  a comment about the same trap: the returned array has to be container-level or
+  the slice dangles with the RIGHT length and garbage behind it.
+  The tests are the part that matters. They drive the real `std.testing.Smith`
+  over the produced seed rather than round-tripping this file against itself, so
+  a future Zig that changes `slice`'s framing fails here loudly instead of
+  leaving a dozen modules quietly seeding nothing. Two of them pin hazards that
+  cost the burn-down real time: a seed longer than the harness's buffer is not a
+  large seed but the EMPTY one (`slice` falls back to the range minimum), and a
+  seed is worthless in a harness that opens `bytes` then a ranged length — that
+  idiom reads the seed into the buffer (`buf[0] == 'G'`) and then discards it
+  with `len == 0`.
+
 - **2026-09-04** — **Second audit pass** (the first was 2026-08-06).
   `expectBytes` had become a printf: deleting
   its `return error.TestExpectedEqual` left the suite at 22/22 green while five
