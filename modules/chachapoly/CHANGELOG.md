@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Both fuzz targets ran one fixed input for their whole existence.
+  `poly1305.fuzzAgainstStd` drew the key, then the message, then a ranged length; a ranged
+  `Smith` draw reads eight octets as a little-endian `u64` and returns the range MINIMUM when
+  fewer remain, and the two `bytes` calls had already consumed them — so the differential
+  compared the MAC of the **empty message under an all-zero key** against std, once, for ever,
+  which is the shortest input the carry chain has and the one that exercises no lane at all.
+  `root.fuzzDecrypt` was the same shape across five arguments: zero-length ciphertext, zero-
+  length AAD, all-zero key, nonce and tag. The key and nonce are drawn from a single
+  `smith.slice` now, packed as `nonce ‖ key ‖ tag ‖ ad_len ‖ ad ‖ ciphertext`, and the corpus
+  carries a genuine sealed message — the module's comment is right that random bytes reach the
+  authentication-failure path, and wrong that this suffices, because they reach ONLY it and
+  the success branch of `decrypt` was unreachable by construction. Measured: **Poly1305 1
+  distinct (key, message) pair and 0 message octets → 11 pairs and 947 octets; AEAD 1 distinct
+  tuple, 0 ciphertext octets and 0 successful opens → 7 tuples, 230 ciphertext octets, 60 AAD
+  octets and 1 open.**
+
 - **2026-09-02** — **Audit (drift campaign): 2 MEDIUM, 3 LOW.** ⭐ No forgery, no wrong
   ciphertext or tag, no out-of-bounds: byte-exact against `std` at every shape the auditor could
   construct — 400 randomised chunked MAC streams per lane width, a 32×32 AEAD grid to 2 999 B,

@@ -554,29 +554,207 @@ test "parseExtended rejects a bad-length / bad-checksum string" {
 // derivation-path string a caller (config, CLI, wallet UI) may pass through
 // verbatim from a user.
 
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+const pathSeed = tkfuzz.seed;
+
+const xkey_fuzz_buf_len = 128;
+const xkey_seed_count = 8;
+
+/// The corpus both `fuzzParseExtended` and its guard replay.
+///
+/// ⛔ An `xprv`/`xpub` is Base58**Check**: the last four octets are a double
+/// SHA-256 over everything before them. A hand-edited literal therefore dies
+/// at `error.ChecksumMismatch` before `parseExtended` reads a single field, so
+/// the only way to get a seed that reaches the version/depth/key checks is to
+/// serialize one with the module's own `serializePriv`/`serializePub`.
+const XKeyCorpus = struct {
+    stores: [xkey_seed_count][4 + xkey_fuzz_buf_len]u8 = undefined,
+    slots: [xkey_seed_count][]const u8 = undefined,
+
+    fn build(self: *XKeyCorpus) ![]const []const u8 {
+        const master_seed = [_]u8{0x01} ** 32;
+        var master = try masterFromSeed(&master_seed);
+        defer master.deinit();
+
+        var priv_buf: [max_serialized_len]u8 = undefined;
+        const xprv = try serializePriv(master, &priv_buf);
+        const pub_key = try neuter(master);
+        var pub_buf: [max_serialized_len]u8 = undefined;
+        const xpub = try serializePub(pub_key, &pub_buf);
+
+        // A derived child, so the depth/child-number/fingerprint fields are
+        // non-zero on at least one seed rather than all-zero everywhere.
+        var child = try ckdPriv(master, hardened_offset + 44);
+        defer child.deinit();
+        var child_buf: [max_serialized_len]u8 = undefined;
+        const child_xprv = try serializePriv(child, &child_buf);
+
+        var mutant: [xkey_fuzz_buf_len]u8 = undefined;
+
+        self.slots[0] = tkfuzz.seedInto(&self.stores[0], xprv); // parses as .private
+        self.slots[1] = tkfuzz.seedInto(&self.stores[1], xpub); // parses as .public
+        self.slots[2] = tkfuzz.seedInto(&self.stores[2], child_xprv); // depth 1, hardened child
+        // A flipped payload character: the checksum must catch it.
+        @memcpy(mutant[0..xprv.len], xprv);
+        mutant[10] = if (mutant[10] == 'z') 'y' else mutant[10] + 1;
+        self.slots[3] = tkfuzz.seedInto(&self.stores[3], mutant[0..xprv.len]);
+        // A flipped CHECKSUM character, which is a different code path from a
+        // flipped payload character even though both end at the same error.
+        @memcpy(mutant[0..xprv.len], xprv);
+        mutant[xprv.len - 1] = if (mutant[xprv.len - 1] == 'z') 'y' else mutant[xprv.len - 1] + 1;
+        self.slots[4] = tkfuzz.seedInto(&self.stores[4], mutant[0..xprv.len]);
+        // The bad-length/bad-checksum literal the value test above uses.
+        self.slots[5] = tkfuzz.seedInto(
+            &self.stores[5],
+            "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHL",
+        );
+        // Not Base58 at all: `0` and `l` are outside the alphabet.
+        self.slots[6] = tkfuzz.seedInto(&self.stores[6], "xprv0lIO" ++ "1" ** 100);
+        self.slots[7] = tkfuzz.seedInto(&self.stores[7], ""); // the ONE input the collapsed harness ran
+        return &self.slots;
+    }
+};
+
 test "fuzz: parseExtended never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzParseExtended, .{});
+    var corpus: XKeyCorpus = .{};
+    const seeds = try corpus.build();
+    try testing.fuzz({}, fuzzParseExtended, .{ .corpus = seeds });
 }
 
 fn fuzzParseExtended(_: void, smith: *std.testing.Smith) !void {
-    var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    var buf: [xkey_fuzz_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input and `parseExtended` was handed "", which
+    // fails the Base58 length check before touching the checksum, the version
+    // bytes or the key material, with the xprv sitting unread in `buf`.
+    // Measured 2026-09-07 over the corpus above: **0 of 8 seeds non-empty and
+    // 0 keys parsed before, 7 of 8 non-empty (one seed IS the empty string)
+    // and 3 parsed after.**
+    const len: usize = smith.slice(&buf);
     _ = parseExtended(buf[0..len]) catch return;
 }
 
+test "corpus: every xkey seed reaches parseExtended, and the parsed count is pinned" {
+    // ⭐ Built from `XKeyCorpus.build`, the same call the harness makes: a
+    // guard measuring a different corpus is not a guard. It is also the only
+    // thing that would notice a seed outgrowing the 128-octet buffer — such a
+    // seed reads back EMPTY rather than truncated.
+    //
+    // `privates`/`publics` are pinned separately because the two arms of
+    // `ParsedKey` are different code below the checksum, and neither can be
+    // reached by the empty string.
+    var corpus: XKeyCorpus = .{};
+    const seeds = try corpus.build();
+    var nonempty: usize = 0;
+    var privates: usize = 0;
+    var publics: usize = 0;
+    var checksum_failures: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [xkey_fuzz_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parseExtended(buf[0..len])) |k| {
+            switch (k) {
+                .private => |p| {
+                    var m = p;
+                    m.deinit();
+                    privates += 1;
+                },
+                .public => publics += 1,
+            }
+        } else |err| if (err == error.ChecksumMismatch) {
+            checksum_failures += 1;
+        }
+    }
+    // One seed IS the empty string, a legal member of a refusal corpus.
+    try testing.expectEqual(seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 private,
+    // 0 public and 0 checksum failures — one empty string eight times, all
+    // eight rejected on length. After:
+    try testing.expectEqual(@as(usize, 2), privates);
+    try testing.expectEqual(@as(usize, 1), publics);
+    try testing.expectEqual(@as(usize, 3), checksum_failures);
+}
+
+/// Derivation paths in the format `Smith.slice` reads. Unlike an xprv these
+/// are plain text with no checksum, so they can be quoted directly — lifted
+/// from `parsePath: m/44'/0'/0'/0/0 and bare relative paths` and from the F5
+/// regression that pins the `+`/`_`/empty-segment rejections.
+const path_seeds = [_][]const u8{
+    pathSeed("m/44'/0'/0'/0/0"), // the BIP-44 account path
+    pathSeed("0h/1H/2"), // a bare relative path, both hardened spellings
+    pathSeed("m/0"), // the shortest accepted path
+    pathSeed("m/0'/1/2'"), // the path `derivePath matches manual chained ckdPriv` uses
+    pathSeed("m/2147483647'/0"), // the largest legal hardened index
+    pathSeed("m/abc"), // InvalidPathSegment
+    pathSeed("m/2147483648"), // IndexOutOfRange: 2^31 pre-offset
+    pathSeed("m/+5"), // InvalidPathSegment: parseUnsigned leniency, refused here
+    pathSeed("m/1_0'"), // InvalidPathSegment: digit separator
+    pathSeed("m/-5"), // InvalidPathSegment
+    pathSeed("m//0"), // InvalidPathSegment: doubled slash
+    pathSeed("m/0/"), // InvalidPathSegment: trailing slash
+    pathSeed("/m/0"), // InvalidPathSegment: leading slash
+    pathSeed("m" ++ "/0" ** 33), // PathTooDeep: 33 segments against max_path_depth = 32
+    pathSeed(""), // the ONE input the collapsed harness ever ran
+};
+
 test "fuzz: parsePath never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzParsePath, .{});
+    try testing.fuzz({}, fuzzParsePath, .{ .corpus = &path_seeds });
 }
 
 fn fuzzParsePath(_: void, smith: *std.testing.Smith) !void {
     const alphabet = "0123456789/'hHmM";
     var buf: [96]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length — same defect and same measurement as `fuzzParseExtended` above.
+    // Measured 2026-09-07 over the corpus above: **0 of 15 seeds non-empty and
+    // 0 paths parsed before, 14 of 15 non-empty and 5 parsed after.**
+    const len: usize = smith.slice(&buf);
+    // ⚠ A `--fuzz`-only aid: on a corpus replay `Smith` is already drained by
+    // the draw above, so `boolWeighted` is false throughout and every seed
+    // reaches `parsePath` verbatim — which is what a corpus of real paths
+    // wants. Under `--fuzz` the fuzzer still biases raw bytes toward the
+    // path alphabet.
     for (buf[0..len]) |*c| {
         if (smith.boolWeighted(1, 4)) c.* = alphabet[c.* % alphabet.len];
     }
     var out: [max_path_depth]u32 = undefined;
     _ = parsePath(buf[0..len], &out) catch return;
+}
+
+test "corpus: every path reaches parsePath, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment.
+    //
+    // `levels` — total derivation levels parsed across the corpus — is pinned
+    // beside `parsed`, because it is the number the empty input cannot move
+    // and it notices a seed being shortened as well as dropped.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var levels: usize = 0;
+    var hardened: usize = 0;
+    for (path_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [96]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var out: [max_path_depth]u32 = undefined;
+        if (parsePath(buf[0..len], &out)) |p| {
+            parsed += 1;
+            levels += p.len;
+            for (p) |ix| {
+                if (ix >= hardened_offset) hardened += 1;
+            }
+        } else |_| {}
+    }
+    // One seed IS the empty path, a legal member of a refusal corpus.
+    try testing.expectEqual(path_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 parsed,
+    // 0 levels and 0 hardened indices — one empty string fifteen times.
+    try testing.expectEqual(@as(usize, 5), parsed);
+    try testing.expectEqual(@as(usize, 14), levels);
+    try testing.expectEqual(@as(usize, 8), hardened);
 }

@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — All three fuzz targets had been running one fixed input for their whole
+  existence. `fuzzHello`, `fuzzFramer` and `fuzzReply` each drew their document with
+  `smith.bytes(&raw)` and then took a length from `smith.valueRangeAtMost(u16, 0, 512)`; a
+  ranged `Smith` draw reads eight octets as a little-endian `u64` and returns the range
+  MINIMUM when fewer remain, and `bytes` had already consumed them — so `len` was 0 every
+  time and the parsers were handed the empty string, with the document sitting unread in
+  `raw`. Now one `smith.slice(&raw)` call each, plus corpora lifted from the value tests (the
+  RFC 6241/6242 documents, the frozen live server messages and every hostile case) and a
+  corpus guard per target. Measured: **hello 0 of 12 seeds non-empty, 0 parsed, 0
+  capabilities → 12/12, 2 parsed, 5 capabilities; framer 0 of 16 non-empty, 0 messages
+  framed, 0 typed errors → 16/16, 4 framed, 14 typed errors; reply 0 of 16 non-empty, 0
+  replies, 0 notifications, 0 classified → 16/16, 6 replies, 1 notification, 15 classified,
+  2 rpc-errors.** Recorded at the reply corpus: the module's largest fixture
+  (`rfc_7_1_reply`, 506 octets) sits just under the 512-octet harness buffer, and a seed over
+  that buffer reads back EMPTY rather than truncated.
 - **2026-08-22** — `TransportError` gained a `Canceled` variant, widening the vtable
   contract so a `Transport` implementation that owns a socket can report a `std.Io`
   cancellation (`Future.cancel`) instead of disguising it as `ReadFailed`/`WriteFailed`.

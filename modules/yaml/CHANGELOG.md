@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Both composer fuzz targets ran one fixed input for their whole existence.
+  `fuzzComposeNeverPanics` drew its length with `smith.valueRangeAtMost(u16, 1, 512)` and each
+  character with `smith.index(alphabet.len)`; a ranged `Smith` draw reads eight octets as a
+  little-endian `u64` and returns the range MINIMUM when fewer remain, so the length was **1**
+  and the character index **0** — the composer saw the single character `-`, under
+  `max_nodes = 1, max_depth = 1, reject_duplicate_keys = false`, every time. ⛔
+  `fuzzAnchorAlias` was worse: its stated job is to GUARANTEE anchors, aliases and sometimes a
+  cycle, because random bytes never spell `&a … *a` — and with `count`, the scalar index,
+  `cyclic` and `aliased` all drawn from `smith`, it emitted `[&a0 42]` on every run. It
+  guaranteed an anchor and nothing else; the alias-equality and `AliasCycle` oracles below it
+  had never fired. Both now take one `smith.slice` call as their first draw — a real YAML
+  document for the first, a reviewable script read with `testkit.fuzz.Cursor` for the second —
+  with corpora lifted from the value tests. Measured: **composer 1 document (`-`) under 1
+  budget → 19 of 20 seeds non-empty, 12 composed, 3 `AliasCycle`s, 13 distinct budgets;
+  generator 1 distinct document, 0 aliases, 0 cycles → 7 distinct documents, 19 aliases, 2
+  cycles.** The composer guard pins the node count, not just success, because `composeAll("")`
+  legally succeeds as a stream of zero documents.
 - **2026-08-18** — Portability fix (`check-portable`), test-only: "arbitrary input never
   panics" computed two fuzz bounds (`n = 1 + (s % buf.len)`, an alphabet index `(s >> 33)
   % alphabet.len`) as `u64` and used them to slice/index `buf`/`alphabet`, which fails to

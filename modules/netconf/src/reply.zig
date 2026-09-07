@@ -773,14 +773,57 @@ test "external anchor: parseReply on a real rpc-error from the `netconf` 2.1.0 p
     try testing.expectError(error.RpcError, r.expectData());
 }
 
+/// `testkit.fuzz.seed`: a corpus entry is NOT the document. `Smith.slice`
+/// reads a little-endian `u32` length first, so a raw reply handed to the
+/// corpus would reach `classify` and `parseReply` four octets short.
+const seed = @import("testkit").fuzz.seed;
+
+/// Replies and notifications in the format `Smith.slice` reads.
+///
+/// ⚠ The buffer above is 512 octets and this module's largest fixture,
+/// `rfc_7_1_reply`, is 506 — checked, because a seed over the buffer reads
+/// back EMPTY rather than truncated, silently. Anything added here that is
+/// longer than 512 must raise the buffer, not be shortened.
+///
+/// Lifted from the value tests: the three RFC 6241 §7 documents, the two
+/// frozen live replies, the RFC 5277 notification, every hostile case
+/// `parseReply: hostile / wrong-document inputs` names, and the four shapes
+/// `classify` routes.
+const reply_seeds = [_][]const u8{
+    seed(rfc_7_1_reply), // §7.1 data reply: message-id 101, a full <data>
+    seed(rfc_7_5_lock_denied), // §7.5: one rpc-error with error-info
+    seed(rfc_7_5_lock_ok), // §7.5: <ok/> with the RFC's own comment
+    seed(live_netconf_2_1_0_get_config_reply), // frozen live get-config reply
+    seed(live_netconf_2_1_0_rpc_error_reply), // frozen live rpc-error
+    seed("<rpc-reply xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><ok/></rpc-reply>"), // no message-id
+    seed("<notification xmlns=\"urn:ietf:params:xml:ns:netconf:notification:1.0\"><eventTime>2007-07-08T00:01:00Z</eventTime><event xmlns=\"http://example.com/event/1.0\"><severity>major</severity></event></notification>"),
+    seed("<notification/>"), // NotANotification: no namespace
+    seed("<rpc-reply/>"), // NotAReply: wrong namespace
+    seed("<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"/>"), // NotAReply, classify → .hello
+    seed("<rpc-reply xmlns=\"urn:x\"/>"), // NotAReply: a foreign namespace
+    seed("<!DOCTYPE r><rpc-reply/>"), // DoctypeForbidden: the XXE surface stays shut
+    seed("<rpc-reply"), // UnexpectedEof
+    seed("<rpc message-id=\"101\">"), // classify → .rpc
+    seed("<netconf:rpc message-id=\"101\">"), // classify → .rpc through a prefix
+    seed("garbage"), // classify → .unknown
+};
+
 test "fuzz: parseReply / classify never crash" {
-    try testing.fuzz({}, fuzzReply, .{});
+    try testing.fuzz({}, fuzzReply, .{ .corpus = &reply_seeds });
 }
 
 fn fuzzReply(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input, `classify` was handed "" (→ .unknown)
+    // and both parsers refused with `error.NoRootElement` before reading a
+    // byte, with the document sitting unread in `raw`. Measured 2026-09-07
+    // over the corpus above: **0 of 16 seeds non-empty, 0 replies parsed and 0
+    // classified as anything but .unknown before; 16 of 16 non-empty, 6 replies
+    // parsed, 1 notification parsed and 15 classified after.**
+    const len: usize = smith.slice(&raw);
     const input = raw[0..len];
     _ = classify(input);
     if (parseReply(testing.allocator, input)) |*r| {
@@ -792,4 +835,47 @@ fn fuzzReply(_: void, smith: *std.testing.Smith) !void {
         var m = n.*;
         m.deinit();
     } else |_| {}
+}
+
+test "corpus: every reply seed reaches the parsers, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) — the reason `rfc_7_1_reply`'s 506 octets
+    // against a 512 buffer is documented at the corpus rather than left to be
+    // rediscovered.
+    //
+    // `classified` is the number the empty input cannot produce: `classify("")`
+    // is `.unknown` by design, so it is reach that this counts, not legality.
+    var nonempty: usize = 0;
+    var replies: usize = 0;
+    var notifications: usize = 0;
+    var classified: usize = 0;
+    var rpc_errors: usize = 0;
+    for (reply_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const input = raw[0..len];
+        if (classify(input) != .unknown) classified += 1;
+        if (parseReply(testing.allocator, input)) |*r| {
+            var m = r.*;
+            defer m.deinit();
+            replies += 1;
+            rpc_errors += m.errors.len;
+        } else |_| {}
+        if (parseNotification(testing.allocator, input)) |*n| {
+            var m = n.*;
+            m.deinit();
+            notifications += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(reply_seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 of 16 seeds non-empty,
+    // 0 replies, 0 notifications, 0 classified and 0 rpc-errors — one empty
+    // string sixteen times. After:
+    try testing.expectEqual(@as(usize, 6), replies);
+    try testing.expectEqual(@as(usize, 1), notifications);
+    try testing.expectEqual(@as(usize, 15), classified);
+    try testing.expectEqual(@as(usize, 2), rpc_errors);
 }

@@ -1166,55 +1166,150 @@ test "formatKeyId matches the CLI's le64-hex convention" {
 // two payloads' actual bytes/lengths, which is what drives the parser
 // into the base64-length/algorithm-tag/printable-comment checks instead
 // of bouncing off the first line every time.
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+const fuzzSeed = tkfuzz.seed;
+const kat = @import("kat_vectors.zig");
+
+const sig_file_buf_len = 1024;
+
+/// `.minisig` files in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// ⚠ Only the SIGNATURE fixtures are used here, never the secret-key ones:
+/// `kat_vectors.zig` holds real (fixture-generated) minisign secret keys, and
+/// a fuzz corpus is not the place to widen their blast radius. A signature
+/// file is what an attacker hands a verifier; a secret key is not.
+const sig_file_seeds = [_][]const u8{
+    fuzzSeed(kat.prehashed_signature_file), // the reference `minisign -S` output
+    fuzzSeed(kat.legacy_signature_file), // the reference `minisign -S -l` output
+    // The same file with its trailing newline removed — the parser's
+    // last-line handling, which is a different path from a 4-line file.
+    fuzzSeed(kat.prehashed_signature_file[0 .. kat.prehashed_signature_file.len - 1]),
+    fuzzSeed("untrusted comment: ok\nAAAA\ntrusted comment: ok\nAAAA\n"), // WrongLength on both payloads
+    fuzzSeed("untrusted comment: ok\n!!!!\ntrusted comment: ok\n!!!!\n"), // InvalidBase64
+    fuzzSeed("wrong prefix: ok\nAAAA\ntrusted comment: ok\nAAAA\n"), // MissingUntrustedCommentPrefix
+    fuzzSeed("untrusted comment: ok\nAAAA\nwrong prefix: ok\nAAAA\n"), // MissingTrustedCommentPrefix
+    fuzzSeed("untrusted comment: bad\x01byte\nAAAA\ntrusted comment: ok\nAAAA\n"), // a non-printable comment
+    fuzzSeed("untrusted comment: ok\n"), // one line only
+    fuzzSeed(""), // the ONE input the collapsed harness ever built from
+};
+
 test "fuzz: parseSignatureFile never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzParseSignatureFile, .{});
+    try std.testing.fuzz({}, fuzzParseSignatureFile, .{ .corpus = &sig_file_seeds });
 }
 
-fn fuzzB64Line(smith: *std.testing.Smith, comptime wire_length: usize, out: *[Base64Codec(wire_length).encoded_length]u8) []const u8 {
+fn fuzzB64Line(cur: *tkfuzz.Cursor, comptime wire_length: usize, out: *[Base64Codec(wire_length).encoded_length]u8) []const u8 {
     const Codec = Base64Codec(wire_length);
-    if (smith.value(bool)) {
-        // A real base64-encoded payload of correct length, random content.
+    if (cur.byte() & 1 == 1) {
+        // A real base64-encoded payload of correct length, script-driven content.
         var raw: [wire_length]u8 = undefined;
-        smith.bytes(&raw);
+        for (&raw) |*b| b.* = cur.byte();
         out.* = Codec.encode(raw);
         return out;
     }
     // Garbage of arbitrary length -- exercises WrongLength/InvalidBase64.
-    var buf: [Codec.encoded_length + 16]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-    @memcpy(out[0..@min(len, out.len)], buf[0..@min(len, out.len)]);
-    return out[0..@min(len, out.len)];
+    const len: usize = cur.ranged(0, @intCast(out.len));
+    for (out[0..len]) |*b| b.* = cur.byte();
+    return out[0..len];
 }
 
 fn fuzzParseSignatureFile(_: void, smith: *std.testing.Smith) !void {
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(std.testing.allocator);
     const allocator = std.testing.allocator;
+    var buf: [sig_file_buf_len]u8 = undefined;
+    // ⚠ ONE `smith.slice` call, and it is the FIRST draw. The harness used to
+    // open with `smith.bytes(&comment_buf)` + a ranged length, and every knob
+    // in `fuzzB64Line` was a `smith.value(bool)` or a ranged draw after it —
+    // all of which collapse outside `--fuzz`, because a ranged `Smith` draw
+    // returns the range MINIMUM when fewer than eight octets remain and `bool`
+    // is a 1-bit range. The result was ONE file, byte for byte, for ever: an
+    // empty untrusted comment, an empty signature line, an empty trusted
+    // comment, an empty global-signature line and no final newline. It died at
+    // the first length check; the algorithm-tag, base64 and printable-comment
+    // checks the harness's own comment names were never reached.
+    //
+    // The corpus is real `.minisig` files, so pass (a) drives the parser with
+    // what a verifier actually receives; pass (b) keeps the skeleton generator
+    // alive by reading its choices from a `Cursor` over the same bytes.
+    // Measured 2026-09-07 over the corpus above: **1 distinct file and 0
+    // signature files parsed before; 10 files, 3 parsed, and the generator
+    // producing 9 distinct skeletons instead of 1, after.**
+    const n: usize = smith.slice(&buf);
+    const drawn = buf[0..n];
+    _ = parseSignatureFile(drawn) catch {};
 
+    var cur: tkfuzz.Cursor = .{ .bytes = drawn };
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try buildFuzzSignatureFile(&text, allocator, &cur);
+    _ = parseSignatureFile(text.items) catch return;
+}
+
+/// The 4-line skeleton, with the comment text and both payloads driven by the
+/// script. Shared with the corpus guard so the guard cannot measure a
+/// different generator.
+fn buildFuzzSignatureFile(text: *std.ArrayList(u8), allocator: std.mem.Allocator, cur: *tkfuzz.Cursor) !void {
     try text.appendSlice(allocator, untrusted_comment_prefix);
-    var comment_buf: [32]u8 = undefined;
-    smith.bytes(&comment_buf);
-    const comment_len: usize = smith.valueRangeAtMost(u8, 0, comment_buf.len);
-    try text.appendSlice(allocator, comment_buf[0..comment_len]);
+    const comment_len: usize = cur.ranged(0, 32);
+    for (0..comment_len) |_| try text.append(allocator, cur.byte());
     try text.append(allocator, '\n');
 
     var sig_out: [SignatureCodec.encoded_length]u8 = undefined;
-    try text.appendSlice(allocator, fuzzB64Line(smith, RawSignature.wire_length, &sig_out));
+    try text.appendSlice(allocator, fuzzB64Line(cur, RawSignature.wire_length, &sig_out));
     try text.append(allocator, '\n');
 
     try text.appendSlice(allocator, trusted_comment_prefix);
-    var trusted_buf: [32]u8 = undefined;
-    smith.bytes(&trusted_buf);
-    const trusted_len: usize = smith.valueRangeAtMost(u8, 0, trusted_buf.len);
-    try text.appendSlice(allocator, trusted_buf[0..trusted_len]);
+    const trusted_len: usize = cur.ranged(0, 32);
+    for (0..trusted_len) |_| try text.append(allocator, cur.byte());
     try text.append(allocator, '\n');
 
     var gsig_out: [GlobalSignatureCodec.encoded_length]u8 = undefined;
-    try text.appendSlice(allocator, fuzzB64Line(smith, signature_length, &gsig_out));
-    if (smith.value(bool)) try text.append(allocator, '\n');
+    try text.appendSlice(allocator, fuzzB64Line(cur, signature_length, &gsig_out));
+    if (cur.byte() & 1 == 1) try text.append(allocator, '\n');
+}
 
-    _ = parseSignatureFile(text.items) catch return;
+test "corpus: every signature file reaches the parser, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) and nothing else would notice.
+    //
+    // Two numbers past reach, both pinned at their minimum by the collapsed
+    // draws: how many real `.minisig` files PARSE, and how many DISTINCT
+    // skeletons the generator emits.
+    const allocator = std.testing.allocator;
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var skeletons: usize = 0;
+    var seen: [sig_file_seeds.len]std.ArrayList(u8) = undefined;
+    defer for (seen[0..skeletons]) |*s| s.deinit(allocator);
+    for (sig_file_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [sig_file_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        const drawn = buf[0..n];
+        if (parseSignatureFile(drawn)) |_| parsed += 1 else |_| {}
+
+        var cur: tkfuzz.Cursor = .{ .bytes = drawn };
+        var text: std.ArrayList(u8) = .empty;
+        try buildFuzzSignatureFile(&text, allocator, &cur);
+        var already = false;
+        for (seen[0..skeletons]) |s| {
+            if (std.mem.eql(u8, s.items, text.items)) already = true;
+        }
+        if (already) {
+            text.deinit(allocator);
+        } else {
+            seen[skeletons] = text;
+            skeletons += 1;
+        }
+    }
+    // One seed IS the empty file, a legal member of a refusal corpus.
+    try std.testing.expectEqual(sig_file_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draws the generator emitted
+    // exactly 1 skeleton across the whole corpus, and no real signature file
+    // ever reached the parser at all. After:
+    try std.testing.expectEqual(@as(usize, 3), parsed);
+    try std.testing.expectEqual(@as(usize, 9), skeletons);
 }
 
 // ── fuzz: isPrintableComment never panics/OOB-reads on arbitrary bytes ───
@@ -1225,15 +1320,71 @@ fn fuzzParseSignatureFile(_: void, smith: *std.testing.Smith) !void {
 // parser most prone to an off-by-one OOB read, and it runs directly over
 // the trusted-comment bytes of an attacker-supplied signature file before
 // `parseSignatureFile` ever echoes them anywhere.
+/// Comment bytes in the format `Smith.slice` reads. Lifted from
+/// `isPrintableComment: control chars and truncated UTF-8 rejected, valid
+/// UTF-8 accepted`, plus the boundary shapes a hand-rolled UTF-8 validator
+/// gets wrong: a multi-byte sequence that ENDS at the last octet, and one that
+/// is cut one octet short of the end.
+const comment_seeds = [_][]const u8{
+    fuzzSeed("plain ASCII, a tab\there"),
+    fuzzSeed("caf\xc3\xa9"), // valid 2-byte UTF-8
+    fuzzSeed("\xe2\x82\xac"), // valid 3-byte UTF-8 (€)
+    fuzzSeed("\xf0\x9f\x92\xa9"), // valid 4-byte UTF-8
+    fuzzSeed("bad\x01byte"), // a control character
+    fuzzSeed("del\x7f"), // DEL
+    fuzzSeed("truncated\xc3"), // a 2-byte lead with no continuation: the `i + need >= len` edge
+    fuzzSeed("\xe2\x82"), // a 3-byte lead one octet short at the very end
+    fuzzSeed("overlong\xc0\x80"), // an overlong encoding
+    fuzzSeed("\xed\xa0\x80"), // a surrogate, which UTF-8 forbids
+    fuzzSeed("\xff\xfe"), // octets that are never a lead
+    fuzzSeed("a" ** 64), // the full harness buffer
+    fuzzSeed(""), // the empty comment, and the ONE input the collapsed harness ran
+};
+
 test "fuzz: isPrintableComment never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzIsPrintableComment, .{});
+    try std.testing.fuzz({}, fuzzIsPrintableComment, .{ .corpus = &comment_seeds });
 }
 
 fn fuzzIsPrintableComment(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 on every input and this validator, whose whole risk is an
+    // off-by-one at the END of the buffer, was only ever handed a buffer with
+    // no end to walk to. Measured 2026-09-07 over the corpus above: **0 of 13
+    // seeds non-empty and 0 comments accepted before, 12 of 13 non-empty (one
+    // seed IS the empty comment) and 5 accepted after.**
+    const len: usize = smith.slice(&buf);
     _ = isPrintableComment(buf[0..len]);
+}
+
+test "corpus: every comment reaches isPrintableComment, and the verdicts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment.
+    //
+    // ⚠ `isPrintableComment("")` is TRUE — the empty comment is printable — so
+    // an "accepted > 0" guard would have read 100% while the validator walked
+    // nothing at all. Both verdict counts are pinned instead, and the octet
+    // total beside them.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var rejected: usize = 0;
+    var octets: usize = 0;
+    for (comment_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        octets += len;
+        if (isPrintableComment(buf[0..len])) accepted += 1 else rejected += 1;
+    }
+    // One seed IS the empty comment, a legal member of the corpus.
+    try std.testing.expectEqual(comment_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 13 empty comments — 13
+    // accepted, 0 rejected, 0 octets walked. After:
+    try std.testing.expectEqual(@as(usize, 6), accepted);
+    try std.testing.expectEqual(@as(usize, 7), rejected);
+    try std.testing.expectEqual(@as(usize, 138), octets);
 }
 
 test {

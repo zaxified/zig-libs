@@ -757,15 +757,54 @@ test "writeMessage round-trips through the framer in both dialects" {
     }
 }
 
+/// `testkit.fuzz.seed`: a corpus entry is NOT the stream. `Smith.slice` reads
+/// a little-endian `u32` length first, so a raw chunked stream handed to the
+/// corpus would lose its own `\n#4\n` header before the framer ever saw it.
+const seed = @import("testkit").fuzz.seed;
+
+/// Streams in the format `Smith.slice` reads (see `testkit.fuzz`), fed to BOTH
+/// dialects. Lifted from the value tests above and from `chunked hostile`.
+///
+/// A chunked header is `\n#`, decimal digits, `\n` — four specific octets in
+/// order before any payload; an end-of-message stream needs the six-octet
+/// `]]>]]>`. Uniform random bytes produce neither, so without these the target
+/// proves only that the header scanner rejects noise, and the frame-assembly
+/// path it is named for is never entered.
+const framer_seeds = [_][]const u8{
+    seed("<hello/>]]>]]>"), // eom: one complete message
+    seed("<a/>]]>]]><b/>]]>]]>"), // eom: two messages back to back
+    seed("<a/>]]>]]"), // eom: stops one octet inside the delimiter
+    seed("\n#4\n<rpc\n#18\n message-id=\"102\"\n\n#79\n     xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\">\n  <close-session/>\n</rpc>\n##\n"), // RFC 6242 §4.2 verbatim: three chunks, one message
+    seed("\n#4\n<rpc"), // chunked: a chunk with no terminator
+    seed("\n#0\n\n##\n"), // InvalidChunkSize: zero size
+    seed("\n#04\nabcd\n##\n"), // InvalidChunkSize: leading zero
+    seed("\n#\n"), // MalformedChunkHeader: no digits
+    seed("\n#4x\n"), // MalformedChunkHeader: non-digit
+    seed("\n#-4\n"), // MalformedChunkHeader: negative
+    seed("\n##x"), // MalformedChunkHeader: bad end-of-chunks
+    seed("\n##\n"), // EmptyChunkedMessage: 1*chunk violated
+    seed("\n#99999999999\n"), // ChunkTooLarge: 11 digits
+    seed("\n#4294967296\nx"), // ChunkTooLarge: over the RFC cap
+    seed("\n#1234567890123456789012"), // ChunkTooLarge: a never-ending header
+    seed("#4\nabcd"), // ExpectedChunkHeader: missing the leading LF
+};
+
 test "fuzz: no input can make the framer crash or leak" {
-    try testing.fuzz({}, fuzzFramer, .{});
+    try testing.fuzz({}, fuzzFramer, .{ .corpus = &framer_seeds });
 }
 
 fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input and both framers were fed the empty
+    // slice, which yields `null` immediately, with the stream sitting unread
+    // in `raw`. Measured 2026-09-07 over the corpus above: **0 of 16 seeds
+    // non-empty and 0 messages framed before, 16 of 16 non-empty and 4 framed
+    // after.**
+    const len: usize = smith.slice(&raw);
     const input = raw[0..len];
     for ([_]Dialect{ .end_of_message, .chunked }) |d| {
         var f: Framer = .init(gpa, d, .{ .max_message = 4096, .max_chunk = 4096, .max_pending = 8192 });
@@ -776,4 +815,44 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
             if (m == null) break;
         }
     }
+}
+
+test "corpus: every framer seed is fed, and the framed-message count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) and nothing else would notice.
+    //
+    // The second number is `framed` — complete messages the framer handed back
+    // — because an empty feed is *legal* here (it yields `null`, not an error),
+    // so a "no crash" or "no error" count would have read 100% while the
+    // framer assembled nothing at all. That is exactly the state this target
+    // was in.
+    const gpa = testing.allocator;
+    var nonempty: usize = 0;
+    var framed: usize = 0;
+    var typed_errors: usize = 0;
+    for (framer_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        for ([_]Dialect{ .end_of_message, .chunked }) |d| {
+            var f: Framer = .init(gpa, d, .{ .max_message = 4096, .max_chunk = 4096, .max_pending = 8192 });
+            defer f.deinit();
+            f.feed(raw[0..len]) catch continue;
+            while (true) {
+                const m = f.next() catch {
+                    typed_errors += 1;
+                    break;
+                };
+                if (m == null) break;
+                framed += 1;
+            }
+        }
+    }
+    try testing.expectEqual(framer_seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 of 16 seeds non-empty,
+    // 0 messages framed and 0 typed errors — 32 empty feeds. After:
+    try testing.expectEqual(@as(usize, 4), framed);
+    try testing.expectEqual(@as(usize, 14), typed_errors);
 }

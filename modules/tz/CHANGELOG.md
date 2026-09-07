@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Both fuzz targets ran one fixed input for their whole existence, and one of
+  them **already had a corpus that never reached the code under test**. `fuzzFindNeverPanics`
+  went through `buildZoneName`, whose first draw was `smith.valueRangeAtMost(u8, 0, 2)`; a
+  ranged `Smith` draw reads eight octets as a little-endian `u64` and returns the range
+  MINIMUM unless that whole word lands inside the range, so it was always 0 (the "copy a real
+  zone name" branch) and the `smith.index` after it was 0 too — `find` was called with
+  `"Africa/Abidjan"`, the first table entry, and nothing else. The comment promising "one draw
+  in three copies a real zone name" described a distribution that never existed. ⛔
+  `fuzzPosixFooterNeverPanics` already carried six real POSIX-TZ footers as a corpus, and
+  every one of them was replayed as the empty string: the harness's first draw was
+  `smith.valueRangeAtMost(u8, 0, 5)`, which read `"CET-1CES"` as a `u64`, found it outside
+  `0..5`, returned the minimum, took the arbitrary-bytes branch, and the ranged length after
+  it returned 0. Both now take one `smith.slice` call as their first draw; the footer harness
+  runs the drawn bytes verbatim AND as a script for the grammar generator, whose choices moved
+  from `smith` to a `testkit.fuzz.Cursor`. Measured: **`find` 1 distinct name and 1 table hit
+  → 12 distinct names and 6 hits; footer 12 empty strings, 0 DST results and 1 distinct
+  generated string → 11 of 12 seeds non-empty, 3 DST results, 6 non-zero offsets and 11
+  distinct generated strings.** The footer guard counts DST/non-zero results rather than "no
+  crash", because `offsetAt` returns the zone's initial offset for any malformed footer and a
+  crash-free count reads 100% on an empty corpus.
 - **2026-08-23** — Documentation: `meta.doc`, `README.md` and `SPEC.md` still
   said 600 zones after the table dropped to 598. The root README's catalog row
   is rendered from `meta.doc`, so the stale count had propagated there too. A

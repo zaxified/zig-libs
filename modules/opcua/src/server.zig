@@ -5663,37 +5663,159 @@ test "hostile: an ExtensionObject body length that overruns the message is a dec
     try testing.expectEqual(status.bad_decoding_error, rig.channel.last_service_result);
 }
 
+/// `testkit.fuzz.seed`: a corpus entry is NOT the byte script. `Smith.slice`
+/// reads a little-endian `u32` length first, so a raw frame handed to the
+/// corpus would arrive at `feed` minus its own transport header.
+const seed = @import("testkit").fuzz.seed;
+
+/// A HELLO chunk byte-for-byte as `TestRig.handshake` sends one — the 8-octet
+/// transport header, then ProtocolVersion / ReceiveBufferSize /
+/// SendBufferSize / MaxMessageSize / MaxChunkCount and the EndpointUrl.
+///
+/// It is spelled out here rather than reused from `handshake` because the
+/// corpus has to be a byte string: this is the ONLY input that gets the cold
+/// connection past `bad_tcp_message_type_invalid`, and random octets produce
+/// the three ASCII letters `HEL` with probability 2^-24 per draw.
+const hello_frame = blk: {
+    const body_len = 5 * 4 + 4 + test_endpoint_url.len;
+    var f: [8 + body_len]u8 = undefined;
+    f[0..3].* = "HEL".*;
+    f[3] = @intFromEnum(transport.ChunkType.final);
+    std.mem.writeInt(u32, f[4..8], f.len, .little);
+    std.mem.writeInt(u32, f[8..12], 0, .little); // ProtocolVersion
+    std.mem.writeInt(u32, f[12..16], 65536, .little); // ReceiveBufferSize
+    std.mem.writeInt(u32, f[16..20], 65536, .little); // SendBufferSize
+    std.mem.writeInt(u32, f[20..24], 0, .little); // MaxMessageSize
+    std.mem.writeInt(u32, f[24..28], 0, .little); // MaxChunkCount
+    std.mem.writeInt(i32, f[28..32], @intCast(test_endpoint_url.len), .little);
+    f[32..].* = test_endpoint_url.*;
+    break :blk f;
+};
+
+/// `MSG` whose declared size (3) is smaller than the 8-octet header itself —
+/// `bad_tcp_message_type_invalid`, lifted from the hostile-framing test.
+const msg_size_below_header = blk: {
+    var f: [8]u8 = undefined;
+    f[0..3].* = "MSG".*;
+    f[3] = @intFromEnum(transport.ChunkType.final);
+    std.mem.writeInt(u32, f[4..8], 3, .little);
+    break :blk f;
+};
+
+/// `MSG` claiming 20 octets while 40 arrive: the framing the server reads is
+/// garbage and the SecureChannelId it finds belongs to no channel.
+const msg_under_claiming = blk: {
+    var f: [40]u8 = @splat(0xAA);
+    f[0..3].* = "MSG".*;
+    f[3] = @intFromEnum(transport.ChunkType.final);
+    std.mem.writeInt(u32, f[4..8], 20, .little);
+    break :blk f;
+};
+
+/// Byte scripts for `fuzzConnection`, in the format `Smith.slice` reads.
+///
+/// ⚠ The FIRST octet of each script is the connect/no-connect knob, not
+/// payload. It is inside the byte draw on purpose: a knob drawn after the byte
+/// draw is dead on a corpus replay, because `Smith` discards the rest of the
+/// input on the first short read and every later draw returns its minimum.
+/// That is exactly how `smith.value(bool)` here was always `false`, so
+/// `rig.connect()` had **never run once** outside `--fuzz` and the service
+/// layer this target names was unreachable.
+const connection_seeds = [_][]const u8{
+    seed(&[_]u8{0x00} ++ hello_frame), // cold connection, HELLO → ACKNOWLEDGE
+    seed(&[_]u8{0x01} ++ hello_frame), // a second HELLO on a live session
+    seed(&[_]u8{0x01} ++ msg_size_below_header), // live session, bad_tcp_message_type_invalid
+    seed(&[_]u8{0x00} ++ msg_size_below_header), // the same before the handshake
+    seed(&[_]u8{0x01} ++ msg_under_claiming), // live session, unknown SecureChannelId
+    seed(&[_]u8{0x00} ++ "GET / HTTP/1.1\r\n\r\n".*), // a wrong protocol entirely
+    seed(&[_]u8{0x01}), // live session, nothing fed: the pure `tick` path
+    seed(&[_]u8{0x00}), // the collapsed harness's one and only input, kept deliberately
+};
+
 test "fuzz: arbitrary bytes never crash or hang the connection state machine" {
-    try std.testing.fuzz({}, fuzzConnection, .{});
+    try std.testing.fuzz({}, fuzzConnection, .{ .corpus = &connection_seeds });
 }
 
 fn fuzzConnection(_: void, smith: *std.testing.Smith) anyerror!void {
     const gpa = testing.allocator;
+    var script: [1024]u8 = undefined;
+    // ⚠ The byte draw comes FIRST and in ONE `smith.slice` call. It used to be
+    // `smith.value(bool)`, then four rounds of `smith.bytes(&buf)` followed by
+    // `smith.valueRangeAtMost(u16, 0, 512)`. A ranged `Smith` draw reads eight
+    // octets as a little-endian u64 and returns the range MINIMUM when fewer
+    // remain, and `bool` is a 1-bit range — so outside `--fuzz` the bool was
+    // `false`, `connect()` never ran, and all four `len`s were 0. This target
+    // fed the connection state machine NOTHING, four times, from a cold rig,
+    // for its entire existence. Measured 2026-09-07 over the corpus above:
+    // **0 of 8 scripts fed a byte and 0 produced a reply before; 8 of 8 feed
+    // and 6 produce a reply after, 4 of them from a live session.**
+    const n: usize = smith.slice(&script);
+    const live_session = n != 0 and (script[0] & 1) == 1;
+    const feed_bytes = if (n == 0) script[0..0] else script[1..n];
+
     var rig: TestRig = undefined;
     try rig.init(gpa, TestRig.defaultConfig());
     defer rig.deinit();
+    if (live_session) rig.connect() catch {};
 
-    // Half the runs start from a live session so the fuzzer reaches the
-    // service layer, not just the handshake.
-    if (smith.value(bool)) {
-        rig.connect() catch {};
-    }
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
 
     var round: usize = 0;
+    var off: usize = 0;
     while (round < 4) : (round += 1) {
-        var buf: [512]u8 = undefined;
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-        rig.conn.feed(buf[0..len], &out.writer, @intCast(round * 100)) catch |err| switch (err) {
+        const chunk = @min(feed_bytes.len - off, @as(usize, 512));
+        rig.conn.feed(feed_bytes[off..][0..chunk], &out.writer, @intCast(round * 100)) catch |err| switch (err) {
             error.OutOfMemory, error.WriteFailed, error.ValueTooLarge, error.ResponseTooLarge => {},
         };
+        off += chunk;
         rig.conn.tick(&out.writer, @intCast(round * 100)) catch |err| switch (err) {
             error.OutOfMemory, error.WriteFailed, error.ValueTooLarge, error.ResponseTooLarge => {},
         };
         out.clearRetainingCapacity();
     }
+}
+
+test "corpus: every connection script is fed, and the reply count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things nothing else in this module holds: a script longer than the
+    // harness's buffer reads back EMPTY (`Smith.slice` falls back to the range
+    // minimum), silently; and the number of scripts that make the server WRITE
+    // something — which the empty input cannot do, so it is a statement about
+    // reach and not about what the transport happens to tolerate.
+    var fed: usize = 0;
+    var replied: usize = 0;
+    var live: usize = 0;
+    for (connection_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [1024]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        const live_session = n != 0 and (script[0] & 1) == 1;
+        const feed_bytes = if (n == 0) script[0..0] else script[1..n];
+        if (n != 0) fed += 1;
+        if (live_session) live += 1;
+
+        var rig: TestRig = undefined;
+        try rig.init(testing.allocator, TestRig.defaultConfig());
+        defer rig.deinit();
+        if (live_session) rig.connect() catch {};
+
+        var out = std.Io.Writer.Allocating.init(testing.allocator);
+        defer out.deinit();
+        rig.conn.feed(feed_bytes, &out.writer, 0) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed, error.ValueTooLarge, error.ResponseTooLarge => {},
+        };
+        rig.conn.tick(&out.writer, 0) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed, error.ValueTooLarge, error.ResponseTooLarge => {},
+        };
+        if (out.writer.buffered().len != 0) replied += 1;
+    }
+    try testing.expectEqual(connection_seeds.len, fed);
+    // Measured 2026-09-07: with the collapsed draws, 0 scripts carried a byte,
+    // 0 sessions were live and 0 replies came back — the same empty feed on a
+    // cold rig, every time. After:
+    try testing.expectEqual(@as(usize, 6), replied);
+    try testing.expectEqual(@as(usize, 4), live);
 }
 
 test "hostile: a continuation point from another session on the same channel is rejected" {

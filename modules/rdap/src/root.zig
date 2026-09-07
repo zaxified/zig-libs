@@ -2402,8 +2402,43 @@ test "HttpFetcher: every redirect Location is gated, and the chain is bounded (r
 // client fetches to find that server in the first place — both are JSON
 // this process did not produce.
 
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+const seed = tkfuzz.seed;
+
+/// The harness buffers, raised from 512 on 2026-09-07.
+///
+/// ⛔ `domain_json` — this module's own reference RDAP document, the one
+/// `assertMapperReached` parses — is **1549 octets**. A seed longer than the
+/// harness buffer does not arrive truncated, it reads back EMPTY
+/// (`Smith.slice` falls back to the range minimum), so at 512 the document the
+/// module is built around could never have passed through the module's own
+/// harness. Raise the buffer, never shrink the seed.
+const rdap_fuzz_buf_len = 2048;
+
+/// RDAP documents in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// 512 uniform random bytes never form JSON, so without these the target
+/// reached `std.json`'s first token and stopped — the tolerant mapper, which
+/// is the actual untrusted-input surface, was never entered from the fuzzer's
+/// own bytes at all.
+const response_seeds = [_][]const u8{
+    seed(domain_json), // the RFC 9083 §5.3 reference document, 1549 octets
+    seed("{\"objectClassName\":\"domain\",\"handle\":\"H\"}"), // the minimum that maps
+    seed("{\"objectClassName\":\"entity\",\"vcardArray\":[\"vcard\",[[\"fn\",{},\"text\",\"A\"]]]}"), // extractVcard
+    seed("{\"objectClassName\":\"domain\",\"entities\":[{\"objectClassName\":\"entity\",\"handle\":\"E\"}]}"), // mapEntities
+    seed("{\"objectClassName\":\"domain\",\"redacted\":[{\"name\":{\"type\":\"Registrant\"}}]}"), // mapRedacted
+    seed("{\"objectClassName\":\"domain\",\"status\":\"active\"}"), // a string where an array belongs
+    seed("{\"objectClassName\":\"domain\",\"events\":[1,2,3]}"), // an array of the wrong element type
+    seed("{\"errorCode\":404,\"title\":\"Not Found\"}"), // the RFC 9083 §6 error response
+    seed("[]"), // valid JSON, not an RDAP object
+    seed("{"), // InvalidJson: truncated
+    seed("null"),
+    seed(""), // InvalidJson — and the ONE input the collapsed harness ran
+};
+
 test "fuzz: parseResponse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseResponse, .{});
+    try testing.fuzz({}, fuzzParseResponse, .{ .corpus = &response_seeds });
 }
 
 /// The tolerant mapper — `mapObject`/`mapEntities`/`extractVcard`/
@@ -2438,17 +2473,26 @@ fn tolerate(result: ParseError!Parsed) !void {
 /// as a fuzzer-chosen JSON shape. This is what actually drives the mapper's
 /// type switches: a member that is a string where an array is expected, an
 /// array of the wrong element type, a deeply nested value, an absent member.
-fn buildFuzzedResponse(w: *std.Io.Writer, smith: *std.testing.Smith, payload: []const u8) !void {
+/// ⚠ The knobs are read out of `payload` with a `testkit.fuzz.Cursor`, NOT
+/// drawn from `smith` after it. A knob drawn after the byte draw is dead on a
+/// corpus replay — `Smith` discards the rest of its input on the first short
+/// read, so `smith.index` returned 0 every time and this generator produced
+/// `"handle"` as a JSON string, one shape out of six, on every single seed.
+/// Reading them from the payload keeps them alive on a replay (a different
+/// document picks a different member), keeps the seeds pure RDAP JSON, and
+/// still lets `--fuzz` drive every choice, because `--fuzz` drives the bytes.
+fn buildFuzzedResponse(w: *std.Io.Writer, payload: []const u8) !void {
     const members = [_][]const u8{
         "handle",      "ldhName",   "status",    "events",  "entities",
         "nameservers", "links",     "notices",   "remarks", "vcardArray",
         "redacted",    "publicIds", "secureDNS",
     };
-    const member = members[smith.index(members.len)];
+    var knobs: tkfuzz.Cursor = .{ .bytes = payload };
+    const member = members[knobs.ranged(0, members.len - 1)];
     try w.writeAll("{\"objectClassName\":\"domain\",\"handle\":\"H\",\"");
     try w.writeAll(member);
     try w.writeAll("\":");
-    switch (smith.index(6)) {
+    switch (knobs.ranged(0, 5)) {
         0 => try std.json.Stringify.encodeJsonString(payload, .{}, w),
         1 => try w.print("{d}", .{payload.len}),
         2 => {
@@ -2466,8 +2510,8 @@ fn buildFuzzedResponse(w: *std.Io.Writer, smith: *std.testing.Smith, payload: []
         4 => try w.writeAll("null"),
         else => {
             // Nesting, bounded by the fuzzer's own byte budget.
-            const depth = smith.valueRangeAtMost(u8, 0, 32);
-            var i: u8 = 0;
+            const depth = knobs.ranged(0, 32);
+            var i: u32 = 0;
             while (i < depth) : (i += 1) try w.writeAll("[");
             try std.json.Stringify.encodeJsonString(payload, .{}, w);
             i = 0;
@@ -2480,9 +2524,18 @@ fn buildFuzzedResponse(w: *std.Io.Writer, smith: *std.testing.Smith, payload: []
 fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
     try assertMapperReached();
 
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [rdap_fuzz_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input and both passes below ran on "", with the
+    // document sitting unread in `buf`. `assertMapperReached` above kept the
+    // target honest about the mapper being *reachable*, but nothing the fuzzer
+    // produced ever got there. Measured 2026-09-07 over the corpus above:
+    // **0 of 12 seeds non-empty and 0 documents mapped before, 11 of 12
+    // non-empty (one seed IS the empty document) and 8 mapped after; and the
+    // wrapper generator went from 1 distinct document across the corpus to 5.**
+    const len: usize = smith.slice(&buf);
     const payload = buf[0..len];
 
     // (a) the raw bytes, as before: they must never panic.
@@ -2491,18 +2544,111 @@ fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
     // (b) the same bytes inside a document the mapper will actually walk.
     var doc: std.Io.Writer.Allocating = .init(testing.allocator);
     defer doc.deinit();
-    buildFuzzedResponse(&doc.writer, smith, payload) catch return;
+    buildFuzzedResponse(&doc.writer, payload) catch return;
     try tolerate(parseResponse(testing.allocator, doc.written()));
 }
 
+test "corpus: every response seed reaches the mapper, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment — and the
+    // only thing that would notice `domain_json` outgrowing the harness buffer
+    // again, because such a seed reads back EMPTY, not truncated.
+    //
+    // `handles` and `entities` are pinned beside `mapped`: `parseResponse("")`
+    // fails, so `mapped` is already a real signal, but the two structural
+    // counts are what say the tolerant mapper walked something — they cannot
+    // move for an empty document, and they notice a seed being shortened.
+    //
+    // `shapes` is the third: the number of DISTINCT wrapper documents
+    // `buildFuzzedResponse` produced across the corpus. With the knobs drawn
+    // after the byte draw it was 1 — one member, one shape, every seed.
+    var nonempty: usize = 0;
+    var mapped: usize = 0;
+    var handles: usize = 0;
+    var entities: usize = 0;
+    var errors: usize = 0;
+    var shapes: usize = 0;
+    var seen: [response_seeds.len][]const u8 = undefined;
+    var docs: [response_seeds.len]std.Io.Writer.Allocating = undefined;
+    defer for (docs[0..shapes]) |*d| d.deinit();
+    for (response_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [rdap_fuzz_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parseResponse(testing.allocator, buf[0..len])) |p| {
+            var parsed = p;
+            defer parsed.deinit();
+            mapped += 1;
+            switch (parsed.document) {
+                .object => |o| {
+                    if (o.handle != null) handles += 1;
+                    entities += o.entities.len;
+                },
+                .rdap_error => errors += 1,
+            }
+        } else |_| {}
+
+        docs[shapes] = .init(testing.allocator);
+        buildFuzzedResponse(&docs[shapes].writer, buf[0..len]) catch {
+            docs[shapes].deinit();
+            continue;
+        };
+        const wrapper = docs[shapes].written();
+        var already = false;
+        for (seen[0..shapes]) |s| {
+            if (std.mem.eql(u8, s, wrapper)) already = true;
+        }
+        if (already) {
+            docs[shapes].deinit();
+        } else {
+            seen[shapes] = wrapper;
+            shapes += 1;
+        }
+    }
+    // One seed IS the empty document, a legal member of a refusal corpus.
+    try testing.expectEqual(response_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 mapped, 0
+    // handles, 0 entities — and exactly 1 distinct wrapper document, because
+    // the generator's knobs were dead too. After:
+    try testing.expectEqual(@as(usize, 8), mapped);
+    try testing.expectEqual(@as(usize, 2), handles);
+    try testing.expectEqual(@as(usize, 2), entities);
+    try testing.expectEqual(@as(usize, 1), errors);
+    try testing.expectEqual(@as(usize, 5), shapes);
+}
+
+/// IANA bootstrap registry files in the format `Smith.slice` reads.
+const bootstrap_seeds = [_][]const u8{
+    // The RFC 9224 §4 shape: two services, four TLDs. Accepted.
+    seed("{\"version\":\"1.0\",\"services\":[[[\"com\",\"net\"],[\"https://rdap.verisign.com/com/v1/\"]],[[\"org\"],[\"https://rdap.publicinterestregistry.org/rdap/\"]]]}"),
+    seed("{\"version\":\"1.0\",\"publication\":\"2026-01-01T00:00:00Z\",\"services\":[[[\"example\"],[\"https://rdap.example/\"]]]}"),
+    seed("{\"version\":\"1.0\",\"services\":[]}"), // legal and empty: zero services
+    seed("{\"version\":\"1.0\",\"services\":[[[\"a\"],[]]]}"), // an entry with no URL
+    seed("{\"version\":\"1.0\",\"services\":[[[\"a\"],[\"http://plaintext.example/\"]]]}"), // a non-TLS URL
+    seed("{\"version\":\"1.0\"}"), // no services member at all
+    seed("{\"services\":[[[\"com\"],[\"https://x/\"]]]}"), // no version member
+    seed("{\"version\":\"1.0\",\"services\":\"not-an-array\"}"), // wrong type
+    seed("{\"version\":\"1.0\",\"services\":[[\"com\",\"https://x/\"]]}"), // entry not a pair of arrays
+    seed("[]"), // valid JSON, not a bootstrap file
+    seed("{"), // InvalidJson
+    seed(""), // InvalidJson — and the ONE input the collapsed harness ran
+};
+
 test "fuzz: parseBootstrap never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseBootstrap, .{});
+    try testing.fuzz({}, fuzzParseBootstrap, .{ .corpus = &bootstrap_seeds });
 }
 
 fn fuzzParseBootstrap(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [rdap_fuzz_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length — see `fuzzParseResponse` for the measurement. `len` was 0 for
+    // every input, so both `parseBootstrap` calls below ran on "" (once
+    // directly, once wrapped as a service entry of two empty strings), with
+    // the registry file sitting unread in `buf`. Measured 2026-09-07 over the
+    // corpus above: **0 of 12 seeds non-empty and 0 registries parsed before,
+    // 11 of 12 non-empty (one seed IS the empty file), 7 parsed and 5 services
+    // walked after.**
+    const len: usize = smith.slice(&buf);
     const payload = buf[0..len];
 
     // Aim canary: the bootstrap mapper must be reachable, and this says so
@@ -2545,6 +2691,39 @@ fn fuzzParseBootstrap(_: void, smith: *std.testing.Smith) !void {
     } else |err| switch (err) {
         error.InvalidJson, error.InvalidRdap, error.OutOfMemory => {},
     }
+}
+
+test "corpus: every bootstrap seed reaches parseBootstrap, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment.
+    //
+    // ⚠ `parsed` on its own would be the exact trap tranche 2 paid for: a
+    // bootstrap file with an EMPTY services array is legal, so a lenient
+    // count reads high while nothing is walked. `services` is the number the
+    // empty input — and the empty registry — cannot produce.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var services: usize = 0;
+    var resolvable: usize = 0;
+    for (bootstrap_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [rdap_fuzz_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parseBootstrap(testing.allocator, buf[0..len])) |b| {
+            var bs = b;
+            defer bs.deinit();
+            parsed += 1;
+            services += bs.services.len;
+            if (bs.lookupDomain("example.com") != null) resolvable += 1;
+        } else |_| {}
+    }
+    // One seed IS the empty file, a legal member of a refusal corpus.
+    try testing.expectEqual(bootstrap_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 parsed, 0
+    // services and 0 resolvable — one empty string twelve times. After:
+    try testing.expectEqual(@as(usize, 7), parsed);
+    try testing.expectEqual(@as(usize, 5), services);
+    try testing.expectEqual(@as(usize, 2), resolvable);
 }
 
 test {

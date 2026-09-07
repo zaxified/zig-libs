@@ -1015,14 +1015,81 @@ test "query: normal answered path still works, unaffected by the bound" {
     try testing.expectEqual(@as(u16, 4989), result.port);
 }
 
+/// `testkit.fuzz.seed`: a corpus entry is NOT the packet. `Smith.slice` reads a
+/// little-endian `u32` length first, so a raw STUN message handed to the corpus
+/// would reach `decode` minus its own first four octets — that is, with its
+/// message type and length shorn off, which decodes as garbage every time.
+const seed = @import("testkit").fuzz.seed;
+
+// The three mutants `decode rejects non-STUN, bad cookie, and truncation`
+// builds at run time, lifted to comptime so the corpus can carry them.
+const req_bad_cookie = blk: {
+    var b = req_2_1;
+    b[4] = 0x00;
+    break :blk b;
+};
+const req_not_stun = blk: {
+    var b = req_2_1;
+    b[0] = 0xC0; // top two type bits set
+    break :blk b;
+};
+const req_length_past_end = blk: {
+    var b = req_2_1;
+    b[2] = 0x01; // length 0x0158, far past the 108 octets present
+    break :blk b;
+};
+
+/// STUN messages in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// `decode` demands a 20-octet header whose top two type bits are clear, whose
+/// magic cookie is exactly `0x2112A442` and whose length is a multiple of four
+/// that lands inside the buffer: uniform random octets clear all of that with
+/// probability under 2^-34 per draw, so without a corpus this target proves
+/// only that the cookie check rejects noise, and the accessors, the attribute
+/// walk and both verifiers — the code the test's own name promises to cover —
+/// are never reached at all.
+///
+/// ⚠ One fixture is deliberately absent. The `length near u16 max does not
+/// overflow` regression needs a 65 552-octet message; no stack-sized harness
+/// buffer can carry it, so that path stays covered by its own value test and
+/// is out of this harness's reach by construction, not by oversight.
+const decode_seeds = [_][]const u8{
+    seed(&req_2_1), // RFC 5769 §2.1 request: 6 attributes, MI + FINGERPRINT both verify
+    seed(&resp_2_2), // §2.2 success response: IPv4 XOR-MAPPED-ADDRESS
+    seed(&resp_2_3), // §2.3 success response: IPv6 XOR-MAPPED-ADDRESS
+    seed(&req_bad_cookie), // BadCookie
+    seed(&req_not_stun), // NotStun
+    seed(&req_length_past_end), // Truncated: declared length past the buffer
+    seed(&[_]u8{0} ** 8), // Truncated: shorter than the header
+    // A bare 20-octet Binding request: header only, zero attributes. Decodes,
+    // and every accessor below must cope with an empty attribute list.
+    seed(&[_]u8{ 0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42 } ++ rfc5769_txid),
+    // Binding error response carrying ERROR-CODE 401 Unauthorized.
+    seed(&[_]u8{ 0x01, 0x11, 0x00, 0x14, 0x21, 0x12, 0xa4, 0x42 } ++ rfc5769_txid ++
+        [_]u8{ 0x00, 0x09, 0x00, 0x10, 0x00, 0x00, 0x04, 0x01 } ++ "Unauthorized".*),
+    // An attribute whose declared value length runs past the message: the
+    // attribute walk must stop, not read off the end.
+    seed(&[_]u8{ 0x00, 0x01, 0x00, 0x08, 0x21, 0x12, 0xa4, 0x42 } ++ rfc5769_txid ++
+        [_]u8{ 0x80, 0x22, 0xFF, 0xF0, 0xAA, 0xBB, 0xCC, 0xDD }),
+};
+
 test "fuzz: decode + every accessor never crash on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecode, .{});
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var packet: [1024]u8 = undefined;
-    smith.bytes(&packet);
-    const len: usize = smith.valueRangeAtMost(u16, 0, packet.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(packet.len, in.len)` octets and the ranged
+    // draw then finds fewer than the eight it needs and returns the range
+    // MINIMUM — so `len` was 0 on every input, `decode` was handed `packet[0..0]`
+    // and returned `error.Truncated` immediately, with the message sitting
+    // unread in `packet`. Every accessor, both verifiers and the attribute walk
+    // below this line had never executed. Measured 2026-09-07 over the corpus
+    // above: **0 of 10 seeds non-empty and 0 decoded before, 10 of 10 non-empty
+    // and 6 decoded after, walking 15 attributes where the collapsed harness
+    // walked none.**
+    const len: usize = smith.slice(&packet);
     const msg = decode(packet[0..len]) catch return;
     // A successfully-decoded (but otherwise arbitrary) message must survive every
     // accessor + the full attribute walk + both verifiers with no panic/OOB —
@@ -1035,4 +1102,37 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     _ = msg.verifyMessageIntegrity("key");
     var it = msg.attributes();
     while (it.next()) |_| {}
+}
+
+test "corpus: every seed reaches decode, and the walk/accessor counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) and nothing else in the tree would notice.
+    //
+    // ⚠ `accepted` alone would be a weak guard, so `attrs` is pinned beside it:
+    // the empty input cannot walk a single attribute, and neither can the bare
+    // header seed, so a non-zero `attrs` is a statement about REACH rather than
+    // about what `decode` happens to consider legal.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var attrs: usize = 0;
+    var verified: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var packet: [1024]u8 = undefined;
+        const len: usize = smith.slice(&packet);
+        if (len != 0) nonempty += 1;
+        const msg = decode(packet[0..len]) catch continue;
+        accepted += 1;
+        var it = msg.attributes();
+        while (it.next()) |_| attrs += 1;
+        if (msg.verifyFingerprint() and msg.verifyMessageIntegrity(rfc5769_password)) verified += 1;
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 of 10 seeds non-empty,
+    // 0 decoded, 0 attributes walked and 0 verified — one empty slice, ten
+    // times. After:
+    try testing.expectEqual(@as(usize, 6), accepted);
+    try testing.expectEqual(@as(usize, 15), attrs);
+    try testing.expectEqual(@as(usize, 3), verified);
 }

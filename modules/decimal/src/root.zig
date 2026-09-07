@@ -1120,8 +1120,50 @@ test "bridge: the two types agree on arithmetic they can both express" {
 // attacker/user chosen). Bias toward digit/sign/dot/exponent characters so
 // the mantissa and scientific-notation paths are actually reached.
 
+/// `testkit.fuzz.seed`: a corpus entry is NOT the literal. `Smith.slice` reads
+/// a little-endian `u32` length first, so `"-123.456"` handed to the corpus
+/// raw would reach the parser as `".456"`.
+const seed = @import("testkit").fuzz.seed;
+
+/// Decimal literals in the format `Smith.slice` reads (see `testkit.fuzz`),
+/// lifted from `parse + format roundtrip`, `parse rejects` and the overflow
+/// tests. Every comment names the branch the literal reaches.
+///
+/// ⚠ The buffer below is **128**, not the 80 it used to be. `parse hardening:
+/// mantissa width cap prevents i256 accumulator overflow` needs 90 digits, and
+/// a seed longer than the buffer reads back EMPTY rather than truncated
+/// (`Smith.slice` falls back to the range minimum) — so the one input that
+/// distinguishes "the cap fires early and cleanly" from "the accumulator
+/// traps" could never have passed through this module's own harness.
+const parse_seeds = [_][]const u8{
+    seed("0"),
+    seed("123"),
+    seed("-123"),
+    seed("1.5"),
+    seed("+42"),
+    seed("-123.456"),
+    seed("1000.00"), // trailing zeros the formatter drops
+    seed("0.0313646200"),
+    seed("1e30"), // Overflow via the exponent
+    seed("1.5e-3"), // the scientific-notation path, accepted
+    seed(""), // InvalidCharacter — and the ONE input the collapsed harness ran
+    seed("abc"), // InvalidCharacter
+    seed("1,234.56"), // InvalidCharacter: grouping is not handled here
+    seed("1.2.3"), // InvalidCharacter: two dots
+    seed("1e"), // InvalidCharacter: exponent with no digits
+    seed("--1"), // InvalidCharacter: double sign
+    seed("1 "), // InvalidCharacter: trailing space
+    seed("."), // InvalidCharacter
+    seed("-"), // InvalidCharacter
+    seed("1e2.5"), // InvalidCharacter: fractional exponent
+    seed("999999999999999999999999999999"), // Overflow: past i128
+    seed("99999999999999999999999999999e36"), // Overflow: mantissa × exponent
+    seed("1000000000000000000000000000000000000000000000000000000000000"), // 61 digits
+    seed("9" ** 90), // the width cap: 90 digits, past i256's ~77-digit capacity
+};
+
 test "fuzz: parse never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzParse, .{});
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
 }
 
 test "parse hardening: mantissa width cap prevents i256 accumulator overflow" {
@@ -1141,11 +1183,58 @@ test "parse hardening: mantissa width cap prevents i256 accumulator overflow" {
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     const alphabet = "0123456789+-.eE";
-    var buf: [80]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    var buf: [128]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input and `Decimal.parse` was handed "",
+    // refused with `error.InvalidCharacter` at the first byte it did not find,
+    // and the literal sat unread in `buf`. Measured 2026-09-07 over the corpus
+    // above: **0 of 24 seeds non-empty and 0 parsed before, 23 of 24 non-empty
+    // (one seed IS the empty literal) and 9 parsed after.**
+    const len: usize = smith.slice(&buf);
+    // ⚠ This substitution is a `--fuzz`-only aid, and deliberately so: on a
+    // corpus replay `Smith` has already been drained by the draw above, so
+    // `boolWeighted` is false throughout and every seed reaches `parse`
+    // verbatim, which is exactly what a corpus of real literals wants. Under
+    // `--fuzz` the fuzzer still drives it and biases raw bytes toward the
+    // mantissa/exponent alphabet.
     for (buf[0..len]) |*c| {
         if (smith.boolWeighted(1, 4)) c.* = alphabet[c.* % alphabet.len];
     }
     _ = Decimal.parse(buf[0..len]) catch return;
+}
+
+test "corpus: every literal reaches Decimal.parse, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. It is
+    // also the only thing in this module that would notice a seed growing past
+    // the harness buffer — such a seed reads back EMPTY, silently.
+    //
+    // `parsed` alone is a usable guard here (`parse("")` is an error), but
+    // `digits` is pinned beside it because it is the number the empty input
+    // provably cannot move, and it notices a seed being shortened as well as
+    // dropped.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var overflows: usize = 0;
+    var digits: usize = 0;
+    for (parse_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [128]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        digits += len;
+        if (Decimal.parse(buf[0..len])) |_| {
+            parsed += 1;
+        } else |err| if (err == error.Overflow) {
+            overflows += 1;
+        }
+    }
+    // One seed IS the empty literal, a legal member of a refusal corpus.
+    try testing.expectEqual(parse_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 parsed, 0
+    // overflows and 0 octets delivered — one empty string 24 times. After:
+    try testing.expectEqual(@as(usize, 9), parsed);
+    try testing.expectEqual(@as(usize, 5), overflows);
+    try testing.expectEqual(@as(usize, 294), digits);
 }

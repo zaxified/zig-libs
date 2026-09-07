@@ -130,6 +130,57 @@ test "TEETH CHECK: corrupting the classic box vector's expected ciphertext makes
 // in this repo, there is no "nearly valid" bias to lean on here — the
 // AEAD tag makes every byte equally load-bearing, so pure random input
 // already reaches the interesting authentication-failure path).
+/// `testkit.fuzz.seed`: a corpus entry is NOT the ciphertext. `Smith.slice`
+/// reads a little-endian `u32` length first, so the sealed box handed to the
+/// corpus raw would reach `open` with four octets of its ephemeral public key
+/// missing — which is an authentication failure for an uninteresting reason.
+const seed = @import("testkit").fuzz.seed;
+
+/// The module's own KAT sealed box, decoded at comptime so the corpus can
+/// carry it and the three mutants below.
+const kat_sealed = blk: {
+    var out: [kat.expected_sealed_hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, kat.expected_sealed_hex) catch unreachable;
+    break :blk out;
+};
+const kat_sealed_bad_epk = blk: {
+    var b = kat_sealed;
+    b[0] ^= 0x01; // inside the ephemeral public key
+    break :blk b;
+};
+const kat_sealed_bad_tag = blk: {
+    var b = kat_sealed;
+    b[32] ^= 0x01; // inside the Poly1305 tag
+    break :blk b;
+};
+const kat_sealed_bad_body = blk: {
+    var b = kat_sealed;
+    b[b.len - 1] ^= 0x01; // inside the message
+    break :blk b;
+};
+
+/// Ciphertexts in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// The file comment above argues that pure random input already reaches the
+/// authentication-failure path, and that is true — but it reaches ONLY that
+/// path. Nothing random ever opens, so without the KAT box below the success
+/// branch of `open`, and every line after it, was unreachable from this
+/// target. That is the gap a corpus closes here, not the refusal coverage.
+const open_seeds = [_][]const u8{
+    seed(&kat_sealed), // the real sealed box: opens
+    seed(&kat_sealed_bad_epk), // a flipped ephemeral public key
+    seed(&kat_sealed_bad_tag), // a flipped Poly1305 tag
+    seed(&kat_sealed_bad_body), // a flipped message byte
+    seed(&[_]u8{0} ** sealedbox.overhead), // exactly `overhead`: a zero-length plaintext
+    seed(&[_]u8{0} ** (sealedbox.overhead - 1)), // one octet short of `overhead`
+    seed(&[_]u8{0xAA} ** 256), // the full harness buffer
+    seed(""), // the ONE input the collapsed harness ever ran
+};
+
+test "fuzz: open never panics on arbitrary ciphertext bytes" {
+    try std.testing.fuzz({}, fuzzOpen, .{ .corpus = &open_seeds });
+}
+
 fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
     const kp = sealedbox.KeyPair{
         .public_key = hexDecode32(kat.recipient_pk_hex),
@@ -137,8 +188,18 @@ fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
     };
 
     var sealed_buf: [256]u8 = undefined;
-    const sealed_len = smith.valueRangeAtMost(u16, 0, sealed_buf.len);
-    smith.bytes(sealed_buf[0..sealed_len]);
+    // ⚠ One `smith.slice` call. The length used to be drawn FIRST, with
+    // `smith.valueRangeAtMost(u16, 0, 256)`, and the bytes read into
+    // `sealed_buf[0..sealed_len]` afterwards — but a ranged `Smith` draw reads
+    // eight octets as a little-endian u64 and returns the range MINIMUM unless
+    // that whole word lands inside the range, so `sealed_len` was 0 and the
+    // `bytes` call that followed it copied nothing at all. `open` was handed a
+    // zero-length ciphertext, refused it on the `sealed.len < overhead` line,
+    // and no other line of this module ever ran from the fuzzer. Measured
+    // 2026-09-07 over the corpus above: **0 of 8 seeds non-empty and 0 boxes
+    // opened before, 7 of 8 non-empty (one seed IS the empty ciphertext) and 1
+    // opened after.**
+    const sealed_len: usize = smith.slice(&sealed_buf);
     const sealed = sealed_buf[0..sealed_len];
 
     var out_buf: [256]u8 = undefined;
@@ -146,6 +207,38 @@ fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
     sealedbox.open(out_buf[0..out_len], sealed, kp) catch return;
 }
 
-test "fuzz: open never panics on arbitrary ciphertext bytes" {
-    try std.testing.fuzz({}, fuzzOpen, .{});
+test "corpus: every ciphertext reaches open, and the opened count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) and nothing else would notice.
+    //
+    // `opened` is the number the collapsed harness could not produce by
+    // construction: a zero-length ciphertext is shorter than `overhead`, so it
+    // dies before the AEAD. `recovered` pins the plaintext length beside it,
+    // so shortening the KAT seed is caught too.
+    const kp = sealedbox.KeyPair{
+        .public_key = hexDecode32(kat.recipient_pk_hex),
+        .secret_key = hexDecode32(kat.recipient_sk_hex),
+    };
+    var nonempty: usize = 0;
+    var opened: usize = 0;
+    var recovered: usize = 0;
+    for (open_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var sealed_buf: [256]u8 = undefined;
+        const sealed_len: usize = smith.slice(&sealed_buf);
+        if (sealed_len != 0) nonempty += 1;
+        var out_buf: [256]u8 = undefined;
+        const out_len = if (sealed_len >= sealedbox.overhead) sealed_len - sealedbox.overhead else 0;
+        if (sealedbox.open(out_buf[0..out_len], sealed_buf[0..sealed_len], kp)) |_| {
+            opened += 1;
+            recovered += out_len;
+        } else |_| {}
+    }
+    // One seed IS the empty ciphertext, a legal member of a refusal corpus.
+    try testing.expectEqual(open_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the length drawn first, 0 non-empty, 0 opened
+    // and 0 plaintext octets — the same empty ciphertext eight times. After:
+    try testing.expectEqual(@as(usize, 1), opened);
+    try testing.expectEqual(kat.message.len, recovered);
 }

@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — ⛔ `fuzzParse` never got past its own `parse` call. Every choice its
+  generator made came from `smith` directly — the input/output counts, the record counts, the
+  keytypes, the keydata and value lengths, `finalize_them`, the witness-stack bytes — and all
+  of them collapse outside `--fuzz`, because a ranged `Smith` draw reads eight octets as a
+  little-endian `u64` and returns the range MINIMUM when fewer remain, and `bool` is a 1-bit
+  range. So the harness built exactly ONE PSBT for its whole existence: magic, an `UNSIGNED_TX`
+  over a **0-input, 0-output** transaction, and a map terminator. ⛔⛔ And that document does
+  not parse — a legacy-serialized transaction with zero inputs reads back as a BIP144 witness
+  marker, so `parse` returned `error.InvalidWitnessFlag` and the `catch return` on the next
+  line took the rest of the harness with it: `decodeWitnessStack`, `finalize`, `extract`, and
+  all four invariant assertions (`FinalizeResultCountMismatch`, `ExtractChangedInputCount`,
+  `ExtractChangedOutputCount`, `WitnessCountMismatch`) had never executed once. That includes
+  the `finalize`/`extract` coverage the W2 A3 (F4) note in this file says was added — the
+  obstacle was not the generator's keytype list, it was the first call. The generator now
+  reads its choices from a `testkit.fuzz.Cursor` over one `smith.slice` draw, with an
+  eleven-script corpus. Measured: **1 distinct PSBT, 0 input maps, 0 output maps, 0 records
+  parsed and 0 finalizations before; 10 distinct PSBTs, 17 input maps, 13 output maps, 3
+  records parsed and 2 finalizations after** — and the corpus reaches
+  `InvalidPubkeyLength`, `UnexpectedKeyData` and `DuplicateKey`, three per-keytype validators
+  that had no fuzz coverage at all.
+
 - **2026-09-06** — **`finalize` builds the per-transaction sighash cache once, before its loop
   over the inputs, and hands it to every input's `TxContext`.** Each input built its own
   context with `precomputed = null`, so `bitcoinscript.verifyScript` recomputed BIP143's three

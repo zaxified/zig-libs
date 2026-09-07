@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Both fuzz targets had been running on the empty document, and the response
+  target's document generator was stuck on one shape. `fuzzParseResponse` and
+  `fuzzParseBootstrap` drew their payload with `smith.bytes(&buf)` and then took a length from
+  `smith.valueRangeAtMost(u16, 0, 512)`; a ranged `Smith` draw reads eight octets as a
+  little-endian `u64` and returns the range MINIMUM when fewer remain, and `bytes` had already
+  consumed them — so `len` was 0 every time. `assertMapperReached` kept the target honest
+  about the mapper being *reachable*, but nothing the fuzzer produced ever got there.
+  ⛔ **`buildFuzzedResponse` drew its member name, its JSON shape and its nesting depth with
+  `smith.index`/`smith.valueRangeAtMost` AFTER the byte draw**, so on every replay they were
+  all the range minimum: one member (`handle`), one shape (a JSON string), depth 0 — one
+  wrapper document for the whole corpus. Those knobs now come out of the payload's own bytes
+  via `testkit.fuzz.Cursor`, which keeps them alive on a replay and still lets `--fuzz` drive
+  them. ⛔ **The harness buffers were 512 octets while `domain_json` — the module's own RFC
+  9083 §5.3 reference document, the one `assertMapperReached` parses — is 1549**, and a seed
+  longer than the buffer reads back EMPTY rather than truncated, so that document could never
+  have passed through the module's own harness; buffers raised to 2048. Measured: **response 0
+  of 12 seeds non-empty, 0 mapped, 0 entities, 1 distinct wrapper document → 11/12 non-empty,
+  8 mapped, 2 entities, 5 distinct wrappers; bootstrap 0 of 12 non-empty, 0 parsed, 0 services
+  → 11/12, 7 parsed, 5 services.** The bootstrap guard pins `services`, not just `parsed`,
+  because a registry file with an empty `services` array is legal.
 - **2026-09-02** — Drift re-audit (window `becadd6..HEAD`, +1876/-46). The 2026-07-19 audit closed
   an SSRF on the `related`-link follow; this pass found its guard bypassable two ways, found the
   half of the same finding that was never fixed, and found a third dialing path with no guard at

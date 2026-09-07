@@ -932,20 +932,110 @@ test "selected lane count matches the target's features" {
     try testing.expectEqual(simd_active, lanes > 1);
 }
 
+/// `testkit.fuzz.seedHex` — see that module for why a corpus entry is not the
+/// frame.
+const polySeed = @import("testkit").fuzz.seedHex;
+
+/// The key occupies the first 32 octets of every drawn slice; the message is
+/// everything after it. Spelled out here because it is the layout the corpus
+/// below is written in.
+const poly_key_len = 32;
+
+/// `key(32) ‖ message` tuples in the format `Smith.slice` reads.
+///
+/// ⚠ The lengths are the point. `wide_min_groups` routes a message to the
+/// scalar or the wide engine by length, and the RFC 8439 §A.3 vectors exist
+/// precisely because a parallel implementation breaks on the carry chain — so
+/// the corpus carries the block boundaries (0, 1, 15, 16, 17), a full wide
+/// group, and the far end of the harness's 640-octet buffer.
+const poly_seeds = [_][]const u8{
+    // RFC 8439 §2.5.2's worked example: key, then "Cryptographic Forum Research Group".
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++
+        "43727970746f6772617068696320466f72756d2052657365617263682047726f7570"),
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"), // the empty message
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "41"), // one octet
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 15), // one short of a block
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 16), // exactly one block
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 17), // one block plus a leftover
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 128), // a wide run
+    polySeed("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b" ++ "AA" ** 608), // the full 640-octet buffer
+    polySeed("00" ** 32 ++ "AA" ** 64), // an all-zero key: r = 0, every product vanishes
+    polySeed("ff" ** 32 ++ "ff" ** 64), // all-ones key and message: maximal limbs
+    polySeed("02" ** 32), // a key with no message at all
+};
+
 test "fuzz: MAC agrees with std on arbitrary key/message" {
-    try testing.fuzz({}, fuzzAgainstStd, .{});
+    try testing.fuzz({}, fuzzAgainstStd, .{ .corpus = &poly_seeds });
 }
 
 fn fuzzAgainstStd(_: void, smith: *std.testing.Smith) !void {
-    var key: [32]u8 = undefined;
-    smith.bytes(&key);
-    var msg: [640]u8 = undefined;
-    smith.bytes(&msg);
-    const len: usize = smith.valueRangeAtMost(u16, 0, msg.len);
+    var buf: [poly_key_len + 640]u8 = @splat(0);
+    // ⚠ ONE `smith.slice` call, and it is the FIRST draw — the key and the
+    // message are both carved out of it. It used to be `smith.bytes(&key)`,
+    // then `smith.bytes(&msg)`, then
+    // `smith.valueRangeAtMost(u16, 0, 640)`: a ranged `Smith` draw reads eight
+    // octets as a little-endian u64 and returns the range MINIMUM when fewer
+    // remain, and the two `bytes` calls had already consumed everything. So
+    // `len` was 0 on every input and this differential compared the MAC of the
+    // EMPTY message under an ALL-ZERO key against std — one input, for ever,
+    // and the shortest one the carry chain has. Measured 2026-09-07 over the
+    // corpus above: **1 distinct (key, message) pair and 0 message octets
+    // before; 11 pairs and 947 octets after.**
+    const n: usize = smith.slice(&buf);
+    const key: [32]u8 = buf[0..poly_key_len].*;
+    const msg: [640]u8 = buf[poly_key_len..].*;
+    const len: usize = if (n > poly_key_len) n - poly_key_len else 0;
 
     var ours: [16]u8 = undefined;
     var theirs: [16]u8 = undefined;
     Poly1305.create(&ours, msg[0..len], &key);
     StdPoly.create(&theirs, msg[0..len], &key);
     try testing.expectEqualSlices(u8, &theirs, &ours);
+}
+
+test "corpus: every seed reaches the MAC, and the message coverage is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) and nothing else would notice.
+    //
+    // ⚠ "The MACs agreed" is 100% on a corpus of one empty message — that is
+    // exactly the state this target was in. The numbers that carry information
+    // are how many DISTINCT (key, message) pairs the corpus drives and how
+    // many message octets in total, because both are pinned at their minimum
+    // (1 and 0) by the collapsed draw.
+    var pairs: usize = 0;
+    var octets: usize = 0;
+    var wide_runs: usize = 0;
+    var seen: [poly_seeds.len][16]u8 = undefined;
+    for (poly_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [poly_key_len + 640]u8 = @splat(0);
+        const n: usize = smith.slice(&buf);
+        const key: [32]u8 = buf[0..poly_key_len].*;
+        const msg = buf[poly_key_len..];
+        const len: usize = if (n > poly_key_len) n - poly_key_len else 0;
+        octets += len;
+        if (len >= 16 * 3 * lanes) wide_runs += 1; // `wide_min_groups` = 3, see `Generic`
+
+        var tag: [16]u8 = undefined;
+        Poly1305.create(&tag, msg[0..len], &key);
+        var std_tag: [16]u8 = undefined;
+        StdPoly.create(&std_tag, msg[0..len], &key);
+        try testing.expectEqualSlices(u8, &std_tag, &tag);
+
+        var already = false;
+        for (seen[0..pairs]) |t| {
+            if (std.mem.eql(u8, &t, &tag)) already = true;
+        }
+        if (!already) {
+            seen[pairs] = tag;
+            pairs += 1;
+        }
+    }
+    // Measured 2026-09-07: with the collapsing draw, 1 distinct pair (the
+    // empty message under an all-zero key) and 0 message octets, eleven times
+    // over. After:
+    try testing.expectEqual(poly_seeds.len, pairs);
+    try testing.expectEqual(@as(usize, 947), octets);
+    try testing.expect(wide_runs >= 1);
 }

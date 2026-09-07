@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — `fuzzDecrypt` is a damage harness that applied no damage. Its flip count
+  came from `smith.valueRangeAtMost(u8, 0, 6)`, a ranged draw, which reads eight octets as a
+  little-endian `u64` and returns the range MINIMUM unless that whole word lands inside the
+  range — so it was 0 on every replay, the corruption loop never executed once, and
+  `Ciphertext.fromBytes`/`decrypt` were handed the PRISTINE ciphertext every time. The damage
+  script now comes out of one `smith.slice` call as the first draw and is read with
+  `testkit.fuzz.Cursor` (`NN` flips, then position/value pairs), with an eleven-script corpus
+  aimed at the G2 compression flag byte, the far end of `U`, and each of `V` and `W`.
+  Measured: **0 flips and exactly 1 distinct ciphertext across the corpus before; 16 flips, 11
+  distinct ciphertexts, 8 decoded and 1 decrypted after.**
 - **2026-08-14** — Test-only: `kat_test.zig` gained a `testing.fuzz` harness on
   `Ciphertext.fromBytes`/`decrypt` (corrupted ciphertext bytes against a
   fixed, self-consistent beacon-shaped keypair) — `zig build check-fuzz` no

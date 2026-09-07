@@ -759,8 +759,53 @@ test "hostile: keylen of 0xff-class CompactSize with declared length far beyond 
 // (`requirePubkeyLen`/`requireFixedValueLen`/`requireBip32ValueShape`)
 // instead of bouncing off the map-level CompactSize truncation checks
 // every time.
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+const seed = tkfuzz.seedHex;
+
+/// Scripts for the PSBT skeleton generator, in the format `Smith.slice` reads.
+///
+/// ⛔ This target BUILDS a PSBT rather than decoding one — a PSBT is
+/// length-framed CompactSize records around a serialized transaction, so a
+/// hand-written byte string dies at the first `keylen` and never reaches the
+/// per-keytype validators the harness exists for. What comes out of the byte
+/// draw is therefore the SCRIPT, read with a `testkit.fuzz.Cursor`:
+///
+///     NN            input count, 0..3
+///     MM            output count, 0..3
+///     …             consumed sequentially by the record generators below;
+///                   the widths are branch-dependent, so the octets are a
+///                   stream, not a fixed layout
+///
+/// A short script CYCLES rather than running out, so a four-octet seed is a
+/// repeating pattern and the empty script reproduces the collapsed harness
+/// exactly — which is why the last seed here is `""`.
+const psbt_seeds = [_][]const u8{
+    // ⛔ The empty script: 0 inputs, 0 outputs, no extra records, no
+    // finalization. This is the ONE PSBT the harness built for its whole
+    // existence — magic, an UNSIGNED_TX over a 0-in/0-out transaction, and a
+    // map terminator. Kept deliberately.
+    seed(""),
+    // 1 in, 1 out, and NOTHING else — the smallest script whose PSBT actually
+    // parses. Six octets: n_in, n_out, an empty global map, no finalization,
+    // an empty input map, an empty output map.
+    seed("010100000000"),
+    // The same with a `FINAL_SCRIPTSIG` on the single input, which is what
+    // makes `finalize`/`extract` reachable at all (see `appendFinalRecords`).
+    seed("010100010000010000"),
+    // 3 in, 3 out, all maps empty: the multi-map framing without a validator
+    // firing on the way.
+    seed("030300000000000000"),
+    seed("0101" ++ "01" ++ "01" ++ "01" ++ "01" ++ "01"), // 1 in, 1 out, one known-keytype record each
+    seed("0303" ++ "05" ++ "01" ++ "01" ++ "01" ++ "01" ++ "01" ++ "01"), // 3 in, 3 out, a full global map
+    seed("0300" ++ "00" ++ "01" ++ "FF" ++ "20" ++ "AA"), // 3 in, 0 out, finalized with a 32-octet script
+    seed("0102" ++ "02" ++ "00" ++ "FFFF" ++ "41" ++ "00" ++ "50"), // raw keytypes and a 65-octet keydata
+    seed("0201" ++ "03" ++ "01" ++ "00" ++ "01" ++ "01" ++ "04"), // BIP32-shaped 16-octet values
+    seed("AA55" ** 24), // a repeating pattern the Cursor cycles over every branch
+};
+
 test "fuzz: parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParse, .{});
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &psbt_seeds });
 }
 
 fn appendFuzzRecord(list: *std.ArrayList(u8), allocator: Allocator, keytype: u64, keydata: []const u8, value: []const u8) !void {
@@ -781,10 +826,10 @@ fn appendFuzzRecord(list: *std.ArrayList(u8), allocator: Allocator, keytype: u64
 fn appendFuzzedRecords(
     list: *std.ArrayList(u8),
     allocator: Allocator,
-    smith: *std.testing.Smith,
+    cur: *tkfuzz.Cursor,
     known_keytypes: []const u64,
 ) !void {
-    try appendFuzzedRecordsOpen(list, allocator, smith, known_keytypes);
+    try appendFuzzedRecordsOpen(list, allocator, cur, known_keytypes);
     try list.append(allocator, 0x00); // map terminator
 }
 
@@ -793,30 +838,30 @@ fn appendFuzzedRecords(
 fn appendFuzzedRecordsOpen(
     list: *std.ArrayList(u8),
     allocator: Allocator,
-    smith: *std.testing.Smith,
+    cur: *tkfuzz.Cursor,
     known_keytypes: []const u64,
 ) !void {
-    const n = smith.valueRangeAtMost(u8, 0, 5);
-    var i: u8 = 0;
+    const n = cur.ranged(0, 5);
+    var i: u32 = 0;
     while (i < n) : (i += 1) {
-        const keytype: u64 = if (smith.value(bool))
-            known_keytypes[smith.valueRangeAtMost(u8, 0, @intCast(known_keytypes.len - 1))]
+        const keytype: u64 = if (cur.byte() & 1 == 1)
+            known_keytypes[cur.ranged(0, @intCast(known_keytypes.len - 1))]
         else
-            smith.value(u16);
+            cur.word();
 
         var keydata_buf: [65]u8 = undefined;
-        const keydata_len: usize = if (smith.value(bool))
-            (if (smith.value(bool)) @as(usize, 33) else 65) // pubkey-shaped
+        const keydata_len: usize = if (cur.byte() & 1 == 1)
+            (if (cur.byte() & 1 == 1) @as(usize, 33) else 65) // pubkey-shaped
         else
-            smith.valueRangeAtMost(u8, 0, keydata_buf.len);
-        smith.bytes(keydata_buf[0..keydata_len]);
+            cur.ranged(0, @intCast(keydata_buf.len));
+        for (keydata_buf[0..keydata_len]) |*b| b.* = cur.byte();
 
         var value_buf: [80]u8 = undefined;
-        const value_len: usize = if (smith.value(bool))
-            4 * (1 + smith.valueRangeAtMost(u8, 0, 4)) // BIP32/fixed-field-shaped: 4, 8, 12, ...
+        const value_len: usize = if (cur.byte() & 1 == 1)
+            4 * (1 + cur.ranged(0, 4)) // BIP32/fixed-field-shaped: 4, 8, 12, ...
         else
-            smith.valueRangeAtMost(u8, 0, value_buf.len);
-        smith.bytes(value_buf[0..value_len]);
+            cur.ranged(0, @intCast(value_buf.len));
+        for (value_buf[0..value_len]) |*b| b.* = cur.byte();
 
         try appendFuzzRecord(list, allocator, keytype, keydata_buf[0..keydata_len], value_buf[0..value_len]);
     }
@@ -836,22 +881,23 @@ fn appendFuzzedRecordsOpen(
 /// field, `extract` returned `InputNotFinalized` at the first input every
 /// time, and the witness decoder behind it could not be entered however long
 /// the fuzzer ran.
-fn appendFinalRecords(list: *std.ArrayList(u8), allocator: Allocator, smith: *std.testing.Smith) !void {
+fn appendFinalRecords(list: *std.ArrayList(u8), allocator: Allocator, cur: *tkfuzz.Cursor) !void {
     var script_buf: [64]u8 = undefined;
-    smith.bytes(&script_buf);
-    const script = script_buf[0..smith.valueRangeAtMost(u8, 0, script_buf.len)];
+    const script_len: usize = cur.ranged(0, @intCast(script_buf.len));
+    for (script_buf[0..script_len]) |*b| b.* = cur.byte();
+    const script = script_buf[0..script_len];
 
-    const with_sig = smith.value(bool);
+    const with_sig = cur.byte() & 1 == 1;
     if (with_sig) {
         try appendFuzzRecord(list, allocator, input_key.FINAL_SCRIPTSIG, &.{}, script);
     }
-    if (!with_sig or smith.value(bool)) {
+    if (!with_sig or cur.byte() & 1 == 1) {
         // Half the time a well-formed witness-stack encoding, half the time
         // arbitrary octets: `decodeWitnessStack` has to survive both, and only
         // the first form gets past it into `extract`.
-        if (smith.value(bool)) {
+        if (cur.byte() & 1 == 1) {
             const items = [_][]const u8{ script, script[0..@min(script.len, 8)] };
-            const enc = try encodeWitnessStack(allocator, items[0..smith.valueRangeAtMost(u8, 0, 2)]);
+            const enc = try encodeWitnessStack(allocator, items[0..cur.ranged(0, 2)]);
             defer allocator.free(enc);
             try appendFuzzRecord(list, allocator, input_key.FINAL_SCRIPTWITNESS, &.{}, enc);
         } else {
@@ -860,11 +906,13 @@ fn appendFinalRecords(list: *std.ArrayList(u8), allocator: Allocator, smith: *st
     }
 }
 
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+/// The PSBT skeleton both `fuzzParse` and its corpus guard build, so the guard
+/// cannot drift onto a different generator.
+const FuzzPsbtShape = struct { n_in: usize, n_out: usize };
 
-    const n_in: usize = smith.valueRangeAtMost(u8, 0, 3);
-    const n_out: usize = smith.valueRangeAtMost(u8, 0, 3);
+fn buildFuzzPsbt(buf: *std.ArrayList(u8), allocator: Allocator, cur: *tkfuzz.Cursor) !FuzzPsbtShape {
+    const n_in: usize = cur.ranged(0, 3);
+    const n_out: usize = cur.ranged(0, 3);
 
     var vin_buf: [3]bitcointx.TxIn = undefined;
     for (vin_buf[0..n_in]) |*vin| {
@@ -882,34 +930,76 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         .locktime = 0,
         .has_witness = false,
     };
-    const utx_bytes = bitcointx.serializeLegacy(allocator, utx) catch return;
+    const utx_bytes = try bitcointx.serializeLegacy(allocator, utx);
     defer allocator.free(utx_bytes);
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
     try buf.appendSlice(allocator, &magic);
 
     // Global map: the mandatory UNSIGNED_TX record, then fuzzed extras.
-    try appendFuzzRecord(&buf, allocator, global_key.UNSIGNED_TX, &.{}, utx_bytes);
-    try appendFuzzedRecords(&buf, allocator, smith, &.{ global_key.XPUB, global_key.VERSION, global_key.PROPRIETARY });
+    try appendFuzzRecord(buf, allocator, global_key.UNSIGNED_TX, &.{}, utx_bytes);
+    try appendFuzzedRecords(buf, allocator, cur, &.{ global_key.XPUB, global_key.VERSION, global_key.PROPRIETARY });
 
     // See the note below `parse`: without a `FINAL_SCRIPTSIG`/
     // `FINAL_SCRIPTWITNESS` on *every* input, `extract` refuses at the first
     // one and everything behind it stays unreachable.
-    const finalize_them = smith.value(bool);
+    const finalize_them = cur.byte() & 1 == 1;
     var i: usize = 0;
     while (i < n_in) : (i += 1) {
-        try appendFuzzedRecordsOpen(&buf, allocator, smith, &.{
+        try appendFuzzedRecordsOpen(buf, allocator, cur, &.{
             input_key.NON_WITNESS_UTXO, input_key.WITNESS_UTXO,     input_key.PARTIAL_SIG,
             input_key.SIGHASH_TYPE,     input_key.BIP32_DERIVATION,
         });
-        if (finalize_them) try appendFinalRecords(&buf, allocator, smith);
+        if (finalize_them) try appendFinalRecords(buf, allocator, cur);
         try buf.append(allocator, 0x00); // map terminator
     }
     i = 0;
     while (i < n_out) : (i += 1) {
-        try appendFuzzedRecords(&buf, allocator, smith, &.{ output_key.REDEEM_SCRIPT, output_key.BIP32_DERIVATION });
+        try appendFuzzedRecords(buf, allocator, cur, &.{ output_key.REDEEM_SCRIPT, output_key.BIP32_DERIVATION });
     }
+    return .{ .n_in = n_in, .n_out = n_out };
+}
+
+fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+
+    var script: [512]u8 = undefined;
+    // ⚠ The script comes out of ONE `smith.slice` call, and it is the FIRST
+    // draw. Every choice in this generator used to come from `smith` directly
+    // — the input/output counts, the record counts, the keytypes, the keydata
+    // and value lengths, `finalize_them`, the witness-stack bytes. All of them
+    // collapse outside `--fuzz`: a ranged `Smith` draw reads eight octets as a
+    // little-endian u64 and returns the range MINIMUM when fewer remain, and
+    // `bool` is a 1-bit range. So this harness built exactly ONE PSBT for its
+    // whole existence — magic, an UNSIGNED_TX over a **0-input, 0-output**
+    // transaction, and a map terminator — with no input maps and no output
+    // maps at all, `finalize_them` false, and `decodeWitnessStack` handed the
+    // empty slice.
+    //
+    // ⛔⛔ And that one PSBT did not even PARSE. A legacy-serialized
+    // transaction with zero inputs reads back as a BIP144 witness marker, so
+    // `parse` returned `error.InvalidWitnessFlag` — measured 2026-09-07 — and
+    // the `catch return` on the next line took every remaining statement of
+    // this harness with it: `decodeWitnessStack`, `finalize`, `extract`, and
+    // all four of the invariant assertions below (`FinalizeResultCountMismatch`,
+    // `ExtractChangedInputCount`, `ExtractChangedOutputCount`,
+    // `WitnessCountMismatch`). Every per-keytype validator the long comment
+    // above this function describes, and the `finalize`/`extract` coverage the
+    // W2 A3 (F4) note says was added, were unreachable — not because the
+    // generator was too narrow, but because the harness never got past its
+    // first call.
+    //
+    // Measured over the corpus above: **1 distinct PSBT, 0 input maps, 0
+    // output maps, 0 records parsed and 0 finalizations before; 10 distinct
+    // PSBTs, 17 input maps, 13 output maps, 3 records parsed and 2
+    // finalizations after.**
+    const n: usize = smith.slice(&script);
+    var cur: tkfuzz.Cursor = .{ .bytes = script[0..n] };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const shape = buildFuzzPsbt(&buf, allocator, &cur) catch return;
+    const n_in = shape.n_in;
+    const n_out = shape.n_out;
 
     var psbt = parse(allocator, buf.items) catch return;
     defer psbt.deinit(allocator);
@@ -919,8 +1009,8 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     // parses would leave most of its own error paths behind a second gate.
     {
         var wbuf: [96]u8 = undefined;
-        smith.bytes(&wbuf);
-        const wlen = smith.valueRangeAtMost(u8, 0, wbuf.len);
+        const wlen: usize = cur.ranged(0, @intCast(wbuf.len));
+        for (wbuf[0..wlen]) |*b| b.* = cur.byte();
         if (decodeWitnessStack(allocator, wbuf[0..wlen])) |stack| {
             defer allocator.free(stack);
             // Every item is a subslice of the value it was decoded from, and
@@ -950,4 +1040,76 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         if (tx.vout.len != n_out) return error.ExtractChangedOutputCount;
         if (tx.has_witness and tx.witness.len != n_in) return error.WitnessCountMismatch;
     } else |_| {}
+}
+
+test "corpus: every script builds a distinct PSBT, and the map/record counts are pinned" {
+    // ⭐ Built through `buildFuzzPsbt`, the same call the harness makes: a
+    // guard measuring a different generator is not a guard.
+    //
+    // ⚠ For a generator harness "it parsed" is the wrong number: the collapsed
+    // generator's one PSBT parses perfectly well — it is a valid, empty,
+    // 0-input/0-output document, so a `parsed > 0` guard would have read 100%
+    // while nothing was being generated. The numbers that carry information
+    // are how many DISTINCT documents the corpus produces and how many input
+    // maps, output maps and records they contain — all pinned at 1, 0, 0 and 1
+    // by the collapsed draws.
+    const allocator = testing.allocator;
+    var distinct: usize = 0;
+    var input_maps: usize = 0;
+    var output_maps: usize = 0;
+    var records: usize = 0;
+    var finalized: usize = 0;
+    var seen: [psbt_seeds.len]std.ArrayList(u8) = undefined;
+    defer for (seen[0..distinct]) |*b| b.deinit(allocator);
+
+    for (psbt_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var cur: tkfuzz.Cursor = .{ .bytes = script[0..n] };
+
+        var buf: std.ArrayList(u8) = .empty;
+        const shape = buildFuzzPsbt(&buf, allocator, &cur) catch {
+            buf.deinit(allocator);
+            continue;
+        };
+        input_maps += shape.n_in;
+        output_maps += shape.n_out;
+
+        if (parse(allocator, buf.items)) |p| {
+            var psbt = p;
+            defer psbt.deinit(allocator);
+            records += psbt.global.records.len;
+            for (psbt.inputs) |m| records += m.records.len;
+            for (psbt.outputs) |m| records += m.records.len;
+
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            var ps = parse(arena.allocator(), buf.items) catch unreachable;
+            defer ps.deinit(arena.allocator());
+            if (finalize(arena.allocator(), ps)) |_| {
+                finalized += 1;
+            } else |_| {}
+        } else |_| {}
+
+        var already = false;
+        for (seen[0..distinct]) |s| {
+            if (std.mem.eql(u8, s.items, buf.items)) already = true;
+        }
+        if (already) {
+            buf.deinit(allocator);
+        } else {
+            seen[distinct] = buf;
+            distinct += 1;
+        }
+    }
+    // Measured 2026-09-07: with every choice drawn from `smith`, this
+    // generator produced exactly 1 PSBT — magic, an UNSIGNED_TX over a
+    // 0-input/0-output transaction, a map terminator — with 0 input maps, 0
+    // output maps and 1 record, for every input it ever ran. After:
+    try testing.expectEqual(@as(usize, 10), distinct);
+    try testing.expectEqual(@as(usize, 17), input_maps);
+    try testing.expectEqual(@as(usize, 13), output_maps);
+    try testing.expectEqual(@as(usize, 3), records);
+    try testing.expectEqual(@as(usize, 2), finalized);
 }

@@ -946,7 +946,95 @@ test "fuzz: reassembler never panics and stays bounded on hostile fragment strea
     // this drives arbitrary (including deliberately malformed and
     // overlapping) fragment streams at it and asserts only: it never panics,
     // and `inflightCount()` never exceeds `max_inflight`.
-    try testing.fuzz({}, fuzzReassembler, .{});
+    try testing.fuzz({}, fuzzReassembler, .{ .corpus = &reassembler_seeds });
+}
+
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+const seed = tkfuzz.seedHex;
+
+/// Fragment-stream scripts in the format `Smith.slice` reads.
+///
+/// ⛔ This target drives a state machine, so what has to come out of the byte
+/// draw is a SCRIPT, read with a `testkit.fuzz.Cursor`:
+///
+///     NN                        step count, 0..64
+///     per step:
+///       TT TT                   time advance, `% 2001` ns
+///       BB                      bit 0: 1 = a structured fragment, 0 = raw bytes
+///       structured: II OO OO LL MM PP   frag_id %8, offset, len %33, more, payload fill
+///       raw:        LL PP               length % 41, fill
+///
+/// The reassembler's `timeout_ns` is 1000, so a time advance above that is
+/// what expires an in-flight datagram; `max_inflight` is 4, so five distinct
+/// `frag_id`s is what exercises the eviction path.
+const reassembler_seeds = [_][]const u8{
+    // Two halves of one 32-octet datagram, same frag_id, no gap: completes.
+    seed("02" ++ "0000" ++ "01" ++ "00" ++ "0000" ++ "10" ++ "01" ++ "AA" ++
+        "0000" ++ "01" ++ "00" ++ "0010" ++ "10" ++ "00" ++ "BB"),
+    // The same two fragments with the LAST one first — out-of-order arrival.
+    seed("02" ++ "0000" ++ "01" ++ "00" ++ "0010" ++ "10" ++ "00" ++ "BB" ++
+        "0000" ++ "01" ++ "00" ++ "0000" ++ "10" ++ "01" ++ "AA"),
+    // The same first fragment twice: an exact duplicate, then an overlap at
+    // offset 8 that disagrees with it.
+    seed("03" ++ "0000" ++ "01" ++ "00" ++ "0000" ++ "10" ++ "01" ++ "AA" ++
+        "0000" ++ "01" ++ "00" ++ "0000" ++ "10" ++ "01" ++ "AA" ++
+        "0000" ++ "01" ++ "00" ++ "0008" ++ "10" ++ "01" ++ "CC"),
+    // Five distinct frag_ids with nothing completing them: `max_inflight` is
+    // 4, so this is the eviction path.
+    seed("05" ++ "0000" ++ "01" ++ "00" ++ "0000" ++ "08" ++ "01" ++ "11" ++
+        "0000" ++ "01" ++ "01" ++ "0000" ++ "08" ++ "01" ++ "22" ++
+        "0000" ++ "01" ++ "02" ++ "0000" ++ "08" ++ "01" ++ "33" ++
+        "0000" ++ "01" ++ "03" ++ "0000" ++ "08" ++ "01" ++ "44" ++
+        "0000" ++ "01" ++ "04" ++ "0000" ++ "08" ++ "01" ++ "55"),
+    // One fragment, then a 2000 ns jump past `timeout_ns`, then its partner:
+    // the first must have expired, so nothing completes.
+    seed("02" ++ "0000" ++ "01" ++ "00" ++ "0000" ++ "10" ++ "01" ++ "AA" ++
+        "07D0" ++ "01" ++ "00" ++ "0010" ++ "10" ++ "00" ++ "BB"),
+    // An offset of 0xFFFF against a 512-octet `max_frame_len`.
+    seed("01" ++ "0000" ++ "01" ++ "00" ++ "FFFF" ++ "10" ++ "01" ++ "AA"),
+    // Raw bytes: a buffer shorter than the 8-octet header, then a full one.
+    seed("02" ++ "0000" ++ "00" ++ "03" ++ "EE" ++ "0000" ++ "00" ++ "28" ++ "FF"),
+    // The maximum step count, alternating structured and raw.
+    seed("40" ++ ("0001" ++ "01" ++ "00" ++ "0000" ++ "08" ++ "01" ++ "77" ++
+        "0001" ++ "00" ++ "20" ++ "88") ** 8),
+    seed(""), // 0 steps: the state machine's whole history until today
+};
+
+/// One step's worth of the script, applied to `r`. Shared with the corpus
+/// guard so the guard cannot drive a different state machine.
+fn fuzzReassemblerStep(r: *Reassembler, cur: *tkfuzz.Cursor, now: *u64) !?[]u8 {
+    now.* += cur.word() % 2001;
+    if (cur.byte() & 1 == 1) {
+        // A structurally valid-but-hostile fragment: small frag_id range
+        // to force id collisions/overlaps, arbitrary offset/length/more/
+        // payload.
+        var wire: [header_len + 32]u8 = undefined;
+        const frag_id: u16 = @intCast(cur.ranged(0, 7));
+        const offset: u16 = cur.word();
+        const len: u16 = @intCast(cur.ranged(0, 32));
+        const more = cur.byte() & 1 == 1;
+        const fill = cur.byte();
+        const hdr: Header = .{ .frag_id = frag_id, .offset = offset, .length = len, .more = more };
+        hdr.encode(wire[0..header_len]);
+        @memset(wire[header_len..][0..len], fill);
+        const result = r.insert(wire[0 .. header_len + len], now.*) catch return null;
+        return switch (result) {
+            .incomplete => null,
+            .complete => |bytes| bytes,
+        };
+    }
+    // Fully arbitrary bytes, including too-short buffers — exercises
+    // Header.decode's Truncated/InvalidHeader paths directly.
+    var raw: [header_len + 32]u8 = undefined;
+    const len: usize = cur.ranged(0, header_len + 32);
+    const fill = cur.byte();
+    @memset(raw[0..len], fill);
+    const result = r.insert(raw[0..len], now.*) catch return null;
+    return switch (result) {
+        .incomplete => null,
+        .complete => |bytes| bytes,
+    };
 }
 
 fn fuzzReassembler(_: void, smith: *std.testing.Smith) !void {
@@ -959,48 +1047,73 @@ fn fuzzReassembler(_: void, smith: *std.testing.Smith) !void {
     });
     defer r.deinit();
 
+    var script: [1024]u8 = undefined;
+    // ⚠ The script comes out of ONE `smith.slice` call, and it is the FIRST
+    // draw. The step count used to be `smith.valueRangeAtMost(u8, 0, 64)` — a
+    // ranged draw, which reads eight octets as a little-endian u64 and returns
+    // the range MINIMUM unless that whole word lands inside the range. It was
+    // therefore **0 on every replay**, so the loop below never executed once:
+    // the reassembler was constructed, immediately destroyed, and handed
+    // NOTHING, and the `inflightCount() <= max_inflight` assertion this test is
+    // named for never ran either. Measured 2026-09-07 over the corpus above:
+    // **0 steps run, 0 datagrams completed and a peak in-flight count
+    // of 0 before; 81 steps run, 3 datagrams completed and a peak of 4 after.**
+    const n: usize = smith.slice(&script);
+    var cur: tkfuzz.Cursor = .{ .bytes = script[0..n] };
+
     var now: u64 = 0;
-    const steps = smith.valueRangeAtMost(u8, 0, 64);
-    var step: usize = 0;
+    const steps = cur.ranged(0, 64);
+    var step: u32 = 0;
     while (step < steps) : (step += 1) {
-        now += smith.valueRangeAtMost(u16, 0, 2000);
-
-        if (smith.value(bool)) {
-            // A structurally valid-but-hostile fragment: small frag_id range
-            // to force id collisions/overlaps, arbitrary offset/length/more/
-            // payload.
-            var wire: [header_len + 32]u8 = undefined;
-            var payload: [32]u8 = undefined;
-            smith.bytes(&payload);
-            const len = smith.valueRangeAtMost(u8, 0, payload.len);
-            const hdr: Header = .{
-                .frag_id = smith.valueRangeAtMost(u16, 0, 7),
-                .offset = smith.value(u16),
-                .length = len,
-                .more = smith.value(bool),
-            };
-            hdr.encode(wire[0..header_len]);
-            @memcpy(wire[header_len .. header_len + len], payload[0..len]);
-            const result = r.insert(wire[0 .. header_len + len], now) catch continue;
-            switch (result) {
-                .incomplete => {},
-                .complete => |bytes| testing.allocator.free(bytes),
-            }
-        } else {
-            // Fully arbitrary bytes, including too-short buffers — exercises
-            // Header.decode's Truncated/InvalidHeader paths directly.
-            var raw: [header_len + 32]u8 = undefined;
-            smith.bytes(&raw);
-            const len = smith.valueRangeAtMost(u16, 0, raw.len);
-            const result = r.insert(raw[0..len], now) catch continue;
-            switch (result) {
-                .incomplete => {},
-                .complete => |bytes| testing.allocator.free(bytes),
-            }
-        }
-
+        if (try fuzzReassemblerStep(&r, &cur, &now)) |bytes| testing.allocator.free(bytes);
         try testing.expect(r.inflightCount() <= max_inflight);
     }
+}
+
+test "corpus: every script drives the reassembler, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment.
+    //
+    // ⚠ For a state-machine harness "it did not crash" is 100% on a harness
+    // that runs zero steps — which is exactly what this one did. The numbers
+    // that carry information are steps executed, datagrams completed, and the
+    // peak in-flight count, and all three are 0 for the collapsed draw.
+    const max_inflight: usize = 4;
+    var steps_run: usize = 0;
+    var completed: usize = 0;
+    var peak_inflight: usize = 0;
+    for (reassembler_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [1024]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var cur: tkfuzz.Cursor = .{ .bytes = script[0..n] };
+
+        var r = Reassembler.init(testing.allocator, .{
+            .max_inflight = max_inflight,
+            .max_frame_len = 512,
+            .max_fragments_per_datagram = 16,
+            .timeout_ns = 1000,
+        });
+        defer r.deinit();
+
+        var now: u64 = 0;
+        const steps = cur.ranged(0, 64);
+        var step: u32 = 0;
+        while (step < steps) : (step += 1) {
+            steps_run += 1;
+            if (try fuzzReassemblerStep(&r, &cur, &now)) |bytes| {
+                completed += 1;
+                testing.allocator.free(bytes);
+            }
+            try testing.expect(r.inflightCount() <= max_inflight);
+            peak_inflight = @max(peak_inflight, r.inflightCount());
+        }
+    }
+    // Measured 2026-09-07: with the step count drawn as a ranged value, 0
+    // steps, 0 completions and a peak in-flight count of 0 — the loop body
+    // had never executed. After:
+    try testing.expectEqual(@as(usize, 81), steps_run);
+    try testing.expectEqual(@as(usize, 3), completed);
+    try testing.expectEqual(max_inflight, peak_inflight);
 }
 
 test {

@@ -921,23 +921,128 @@ test "indexing the anchor table did not change what anchors mean" {
 // Oracle: never panics, and `composeAll`'s arena is always freed on every
 // path (`testing.allocator` backs the arena, so a leaked page fails the
 // test on its own).
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+const seed = tkfuzz.seed;
+
+/// Documents in the format `Smith.slice` reads (see `testkit.fuzz`), lifted
+/// from the value tests above. Every one of them exercises a line in THIS
+/// file — an anchor, an alias, a cycle, a tag, a duplicate key, a budget —
+/// which is precisely what the byte-soup generator reached only by accident.
+const compose_seeds = [_][]const u8{
+    seed("a: &x [1, 2]\nb: *x\n"), // an alias sharing the anchored node
+    seed("- &a [1]\n- [ *a ]\n"), // a sibling alias, not a cycle
+    seed("&a [ *a ]\n"), // AliasCycle
+    seed("&m { self: *m }\n"), // AliasCycle through a mapping
+    seed("&a [ [ [ *a ] ] ]\n"), // AliasCycle a few levels down
+    seed("x: *nope\n"), // UnknownAlias
+    seed("--- &a 1\n--- *a\n"), // anchors do not cross documents
+    seed("admin: false\nother: 1\nadmin: true\n"), // DuplicateKey (the default)
+    seed("admin: false\nother: 1\n"), // the same document without the repeat
+    seed("? [a, b]\n: v\n1: one\n"), // non-string mapping keys, kept in order
+    seed("x: !!int nope\n"), // BadTaggedScalar
+    seed("x: !!str 42\n"), // an explicit tag overriding resolution
+    seed("x: !unknown 42\n"), // an unknown tag leaves the literal text
+    seed("- 42\n- -7\n- true\n- null\n- 0x1F\n- .inf\n- .nan\n"), // the core schema's kinds
+    seed("---\n---\n"), // a multi-document stream of empty documents
+    seed("...\n"), // a stream with no document at all
+    seed("[" ++ "&a0 1," ** 40 ++ "*a0]\n"), // forty anchors: the indexed anchor table
+    seed("[" ** 80 ++ "]" ** 80 ++ "\n"), // deep nesting, for the depth budget
+    seed("-?:,[]{}#&*!|>'\"%@` \tabc0129\n"), // one line of the old byte-soup alphabet
+    seed(""), // the empty document
+};
+
 test "fuzz: composeAll never panics or leaks, on the same adversarial alphabet as the scanner-level stand-in" {
-    try testing.fuzz({}, fuzzComposeNeverPanics, .{});
+    try testing.fuzz({}, fuzzComposeNeverPanics, .{ .corpus = &compose_seeds });
+}
+
+/// Derive the composer options from the document's own bytes.
+///
+/// ⚠ Not drawn from `smith` after the byte draw: `Smith` discards the rest of
+/// its input on the first short read, so `max_nodes`/`max_depth` were both
+/// their range minimum of **1** and `reject_duplicate_keys` was **false** on
+/// every replay — i.e. a budget of one node, which rejects almost every
+/// document before the anchor and duplicate-key code this file is about.
+fn composeOptionsFrom(source: []const u8) Options {
+    var knobs: tkfuzz.Cursor = .{ .bytes = source };
+    return .{
+        .max_nodes = @intCast(knobs.ranged(1, 500)),
+        .max_depth = @intCast(knobs.ranged(1, 64)),
+        .reject_duplicate_keys = knobs.byte() & 1 == 1,
+    };
 }
 
 fn fuzzComposeNeverPanics(_: void, smith: *testing.Smith) !void {
-    const alphabet = "-?:,[]{}#&*!|>'\"%@` \tabc0129\n";
     var buf: [512]u8 = undefined;
-    const n = smith.valueRangeAtMost(u16, 1, buf.len);
-    for (buf[0..n]) |*b| b.* = alphabet[smith.index(alphabet.len)];
-
-    const options: Options = .{
-        .max_nodes = smith.valueRangeAtMost(u16, 1, 500),
-        .max_depth = smith.valueRangeAtMost(u16, 1, 64),
-        .reject_duplicate_keys = smith.value(bool),
-    };
-    var result = composeAll(testing.allocator, buf[0..n], options) catch return;
+    // ⚠ The document comes out of ONE `smith.slice` call, and it is the FIRST
+    // draw. It used to be `n = smith.valueRangeAtMost(u16, 1, 512)` followed by
+    // `buf[i] = alphabet[smith.index(alphabet.len)]` per byte — a ranged draw
+    // reads eight octets as a little-endian u64 and returns the range MINIMUM
+    // when fewer remain, so `n` was 1 and `smith.index` was 0 for that one
+    // byte: the composer saw the single character `'-'`, and nothing else,
+    // ever. Drawing the bytes directly also stops the generator burning eight
+    // input octets per output character. Measured 2026-09-07 over the corpus
+    // above: **1 document composed before, from the single character `-`,
+    // under the one budget (1, 1, false); 19 of 20 seeds non-empty, 12
+    // composed, 3 AliasCycles and 13 distinct budgets after.**
+    const n: usize = smith.slice(&buf);
+    const source = buf[0..n];
+    var result = composeAll(testing.allocator, source, composeOptionsFrom(source)) catch return;
     defer result.deinit();
+}
+
+test "corpus: every document reaches composeAll, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) and nothing else would notice.
+    //
+    // ⚠ `composed > 0` would be a weak guard: `composeAll("")` SUCCEEDS here —
+    // an empty stream is a legal stream of zero documents. `nodes` is the
+    // number the empty input cannot move, and `budgets` is the second: how
+    // many distinct `(max_nodes, max_depth, reject_duplicate_keys)` triples
+    // the corpus produces. With the options drawn after the byte draw it was
+    // exactly one, `(1, 1, false)`, for every input.
+    var nonempty: usize = 0;
+    var composed: usize = 0;
+    var nodes: usize = 0;
+    var cycles: usize = 0;
+    var budgets: usize = 0;
+    var seen: [compose_seeds.len]Options = undefined;
+    for (compose_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        const source = buf[0..n];
+        const options = composeOptionsFrom(source);
+
+        var already = false;
+        for (seen[0..budgets]) |o| {
+            if (o.max_nodes == options.max_nodes and o.max_depth == options.max_depth and
+                o.reject_duplicate_keys == options.reject_duplicate_keys) already = true;
+        }
+        if (!already) {
+            seen[budgets] = options;
+            budgets += 1;
+        }
+
+        if (composeAll(testing.allocator, source, options)) |r| {
+            var result = r;
+            defer result.deinit();
+            composed += 1;
+            nodes += result.documents.len;
+        } else |err| {
+            if (err == error.AliasCycle) cycles += 1;
+        }
+    }
+    // One seed IS the empty document, a legal member of the corpus.
+    try testing.expectEqual(compose_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draws, the composer saw the
+    // single character `-` twenty times, under one budget, (1, 1, false).
+    try testing.expectEqual(@as(usize, 12), composed);
+    try testing.expectEqual(@as(usize, 11), nodes);
+    try testing.expectEqual(@as(usize, 3), cycles);
+    try testing.expectEqual(@as(usize, 13), budgets);
 }
 
 // (2) A structural generator that GUARANTEES anchors, aliases, and
@@ -956,12 +1061,51 @@ fn fuzzComposeNeverPanics(_: void, smith: *testing.Smith) !void {
 // is "the alias's resolved content is exactly the text that was written
 // under that anchor", generated independently of the composer's alias
 // lookup.)
+/// Scripts for the anchor/alias generator, in the format `Smith.slice` reads.
+///
+/// ⛔ This target builds a document rather than decoding one, so what has to
+/// come out of the byte draw is the SCRIPT, read with a `testkit.fuzz.Cursor`:
+///
+///     NN            entry count MINUS ONE (the draw is `ranged(1, 12)`)
+///     (SS CC AA)*   per entry: scalar index, cyclic flag, alias flag
+///
+/// Every choice used to be drawn from `smith` directly, which is why this
+/// generator produced the SAME one-entry document on every replay — see
+/// `fuzzAnchorAlias`'s comment for the measurement.
+const anchor_alias_seeds = [_][]const u8{
+    seed(&.{ 0, 0, 0, 0 }), // one entry, scalar "42", no alias, no cycle
+    seed(&.{ 0, 0, 0, 1 }), // one entry, aliased
+    seed(&.{ 0, 0, 1, 0 }), // one entry, SELF-REFERENTIAL → AliasCycle
+    seed(&.{ 2, 0, 0, 1, 1, 0, 1, 2, 0, 0 }), // three entries, two aliased
+    seed(&.{ 3, 4, 0, 1, 5, 0, 1, 6, 0, 1, 8, 0, 1 }), // null/hello/0x1F/"" all aliased
+    seed(&.{ 1, 3, 0, 0, 7, 1, 0 }), // a clean entry followed by a cycle
+    seed(&.{ 11, 0, 0, 1, 1, 0, 1, 2, 0, 1, 3, 0, 1, 4, 0, 1, 5, 0, 1, 6, 0, 1, 7, 0, 1, 8, 0, 1, 0, 0, 1, 1, 0, 1, 2, 0, 1 }), // twelve entries, every one aliased
+    seed(""), // the collapsed script: one entry, scalar "42", no alias, no cycle
+};
+
 test "fuzz: an alias always resolves to exactly its anchor's value, and a self-reference is always AliasCycle" {
-    try testing.fuzz({}, fuzzAnchorAlias, .{});
+    try testing.fuzz({}, fuzzAnchorAlias, .{ .corpus = &anchor_alias_seeds });
 }
 
 fn fuzzAnchorAlias(_: void, smith: *testing.Smith) !void {
     const scalars = [_][]const u8{ "42", "-7", "true", "false", "null", "hello", "0x1F", ".inf", "" };
+
+    var script: [64]u8 = undefined;
+    // ⚠ The script comes out of ONE `smith.slice` call, and it is the FIRST
+    // draw. Every choice used to come from `smith` directly — `count` from
+    // `valueRangeAtMost(u8, 1, 12)`, the scalar from `smith.index`, `cyclic`
+    // from `boolWeighted(20, 1)` and `aliased` from `smith.value(bool)`. All
+    // four collapse outside `--fuzz`: a ranged draw returns the range MINIMUM
+    // when fewer than eight octets remain, and `Smith` discards the rest of its
+    // input after the first short read. So this generator emitted `[&a0 42]`,
+    // one entry, no alias, no cycle, on every single run — and its whole
+    // stated purpose is to GUARANTEE anchors, aliases and sometimes a cycle,
+    // because random bytes never spell them. It guaranteed an anchor and
+    // nothing else. Measured 2026-09-07 over the corpus above: **1 distinct
+    // document, 0 aliases and 0 cycles before; 7 distinct documents, 19
+    // aliases and 2 cycles after.**
+    const n: usize = smith.slice(&script);
+    var cur: tkfuzz.Cursor = .{ .bytes = script[0..n] };
 
     var src: std.ArrayList(u8) = .empty;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -969,7 +1113,7 @@ fn fuzzAnchorAlias(_: void, smith: *testing.Smith) !void {
     const scratch = arena.allocator();
     defer src.deinit(std.testing.allocator);
 
-    const count = smith.valueRangeAtMost(u8, 1, 12);
+    const count: u8 = @intCast(cur.ranged(1, 12));
     var aliased: [12]bool = undefined;
     var cyclic: [12]bool = undefined;
 
@@ -977,9 +1121,12 @@ fn fuzzAnchorAlias(_: void, smith: *testing.Smith) !void {
     var i: u8 = 0;
     while (i < count) : (i += 1) {
         if (i != 0) try src.append(std.testing.allocator, ',');
-        const text = scalars[smith.index(scalars.len)];
-        cyclic[i] = smith.boolWeighted(20, 1); // rare: self-reference
-        aliased[i] = !cyclic[i] and smith.value(bool);
+        const text = scalars[cur.ranged(0, scalars.len - 1)];
+        cyclic[i] = cur.byte() != 0; // self-reference
+        // ⚠ Read unconditionally: `!cyclic[i] and cur.byte() != 0` would
+        // short-circuit and leave the script misaligned for the next entry.
+        const alias_flag = cur.byte() != 0;
+        aliased[i] = !cyclic[i] and alias_flag;
         if (cyclic[i]) {
             try src.print(std.testing.allocator, "&a{d} [*a{d}]", .{ i, i });
         } else {
@@ -1020,4 +1167,67 @@ fn fuzzAnchorAlias(_: void, smith: *testing.Smith) !void {
             try testing.expect(valueEql(defined, via_alias));
         }
     }
+}
+
+test "corpus: the anchor/alias generator actually varies, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. This
+    // generator's stated job is to GUARANTEE anchors, aliases and sometimes a
+    // cycle — so the numbers that matter are how many aliases and cycles it
+    // emitted across the corpus, and how many DISTINCT documents it built.
+    // With every choice drawn from `smith` after the first collapsing draw,
+    // all three were 0, 0 and 1.
+    const scalars = [_][]const u8{ "42", "-7", "true", "false", "null", "hello", "0x1F", ".inf", "" };
+    var distinct: usize = 0;
+    var aliases: usize = 0;
+    var cycles: usize = 0;
+    var entries: usize = 0;
+    var seen: [anchor_alias_seeds.len][]const u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    for (anchor_alias_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [64]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var cur: tkfuzz.Cursor = .{ .bytes = script[0..n] };
+
+        var src: std.ArrayList(u8) = .empty;
+        const count: u8 = @intCast(cur.ranged(1, 12));
+        entries += count;
+        try src.append(scratch, '[');
+        var i: u8 = 0;
+        while (i < count) : (i += 1) {
+            if (i != 0) try src.append(scratch, ',');
+            const text = scalars[cur.ranged(0, scalars.len - 1)];
+            const is_cyclic = cur.byte() != 0;
+            const alias_flag = cur.byte() != 0;
+            const is_aliased = !is_cyclic and alias_flag;
+            if (is_cyclic) {
+                cycles += 1;
+                try src.print(scratch, "&a{d} [*a{d}]", .{ i, i });
+            } else {
+                try src.print(scratch, "&a{d} {s}", .{ i, text });
+            }
+            if (is_aliased) {
+                aliases += 1;
+                try src.print(scratch, ", *a{d}", .{i});
+            }
+        }
+        try src.append(scratch, ']');
+
+        var already = false;
+        for (seen[0..distinct]) |s| {
+            if (std.mem.eql(u8, s, src.items)) already = true;
+        }
+        if (!already) {
+            seen[distinct] = src.items;
+            distinct += 1;
+        }
+    }
+    // Measured 2026-09-07: with the choices drawn from `smith`, the generator
+    // emitted `[&a0 42]` — one entry, no alias, no cycle — for every input.
+    try testing.expectEqual(@as(usize, 7), distinct);
+    try testing.expectEqual(@as(usize, 19), aliases);
+    try testing.expectEqual(@as(usize, 2), cycles);
+    try testing.expectEqual(@as(usize, 25), entries);
 }
