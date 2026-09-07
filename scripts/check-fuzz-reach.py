@@ -704,6 +704,34 @@ def verdicts(judged):
                 reasons.append(("R2", why))
         t["reasons"] = reasons
         t["weak_only"] = bool(draws) and all(d.kind == "weak" for d in draws)
+        # ── The tail question, reported but NOT counted as a collapse ─────────
+        #
+        # Two agents found this independently, in different module families.
+        # `smith.bytes(&buf)` consumes `@min(buf.len, in.len)` octets, so a seed
+        # no longer than the buffer leaves NOTHING behind it, and every draw
+        # after it returns its weight minimum. `pir`'s three
+        # `*AnswerHostileShare` harnesses drew `party` that way: party 1 had
+        # never run, in either the value or the tag channel, in any fuzz target
+        # in the module. `nl80211/ie` passed a pinned **0 MHz** into the very
+        # function its "a truncating element cannot force `.open`" tests are
+        # about. `smtp/message`'s harness is named "any body and subject" and
+        # its Subject was always empty.
+        #
+        # ⚠ WHY THIS IS NOT AN R2 AND MUST NOT ENTER THE RATCHET. Whether these
+        # draws are dead is a property of the CORPUS, not of the code: a seed
+        # deliberately longer than the buffer leaves a tail and they are
+        # faithful. That is one of the two blessed fixes, and modules already
+        # burned down use it — so a code-only rule would score finished work as
+        # broken and turn the ratchet red across the tree. It is a worklist,
+        # not a verdict. Answer it per target by reading the corpus.
+        after = []
+        seen_faithful = False
+        for d in draws:
+            if d.kind == "faithful":
+                seen_faithful = True
+            elif d.kind == "collapsing" and seen_faithful:
+                after.append(d)
+        t["post_byte_knobs"] = after
     return judged
 
 
@@ -812,6 +840,7 @@ def main() -> int:
                               f"stale — that target reaches its input now; delete the line")
 
     weak = [t for t in judged if t["weak_only"]]
+    tail = [t for t in judged if t.get("post_byte_knobs") and not t["reasons"]]
 
     counts = {}
     for t in flagged:
@@ -877,6 +906,14 @@ def main() -> int:
                 for rule, why in t["reasons"]:
                     print(f"    {t['path']}:{t['line']}  {t['name']}  [{rule}] {why}")
         print()
+        if tail:
+            print("── knobs drawn AFTER a faithful byte draw "
+                  "(dead unless the seed leaves a tail; not counted, not ratcheted) ──")
+            for t in sorted(tail, key=lambda x: (x["path"], x["line"])):
+                names = ", ".join(d.detail.split("(")[0] for d in t["post_byte_knobs"][:3])
+                print(f"    {t['path']}:{t['line']}  {t['name']}  "
+                      f"{len(t['post_byte_knobs'])} knob(s): {names}")
+            print()
 
     n = len(judged)
     print(f"check-fuzz-reach: {n} fuzz targets judged in "
@@ -890,6 +927,13 @@ def main() -> int:
               f"{len({t['module'] for t in exempted})} modules")
     if weak:
         print(f"  reach only via eos  : {len(weak)}  (one bit per input byte; not a failure)")
+    if tail:
+        print(f"  knobs after the bytes: {len(tail)} target(s) in "
+              f"{len({t['module'] for t in tail})} modules draw a bounded value AFTER a "
+              f"faithful byte draw.")
+        print(f"      Those are dead unless the seed is longer than the buffer and leaves a "
+              f"tail — a property of the CORPUS, so this is a worklist, not a verdict, and "
+              f"it is deliberately outside the ratchet. `--list` names them.")
     for path, line, why in unjudged:
         print(f"  UNJUDGED {path}:{line}: {why}")
 
