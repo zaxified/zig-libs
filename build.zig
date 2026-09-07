@@ -340,7 +340,7 @@ const module_list = [_]Module{
     // field code), so marking it heavy would cost 5x what it saves.
     .{ .name = "rescue", .libs = &.{"crypto"} },
     .{ .name = "tfhe", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
-    .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true },
+    .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "chachapoly", .libs = &.{"crypto"} },
     .{ .name = "k256", .libs = &.{"crypto"} },
     .{ .name = "p256", .libs = &.{ "crypto", "web" } },

@@ -981,32 +981,107 @@ test "public byte loaders instantiate and round-trip (regression: Modint.Error a
 // nothing called them) — the natural next gap being no adversarial-input
 // coverage either.
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// The buffer is 48 octets against `Modint(256)`'s `encoded_bytes` of 32, on
+/// purpose: `elemFromBytesBE` only returns `error.Overflow` for a string whose
+/// significant bytes run past limb `L`, so a buffer sized to the modulus could
+/// never reach that branch at all.
+const loader_buf_len = 48;
+
+/// Big-endian byte strings the loaders have to survive. Each names the branch
+/// it lands on; between them they cover every member of `Error` plus the
+/// accepting path.
+const loader_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // empty → zero value → EvenModulus out of fromElem
+    fuzzseed.seedHex("01"), // 1: odd but ModulusTooSmall
+    fuzzseed.seedHex("02"), // even → EvenModulus
+    fuzzseed.seedHex("03"), // the smallest modulus fromElem accepts
+    fuzzseed.seedHex("000000000003"), // the same, behind leading zeros the loader skips
+    fuzzseed.seedHex("01000000000000000000000000000001"), // 2^120+1, the modulus the value tests use
+    fuzzseed.seedHex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"), // 2^256-1: the widest odd value that still fits L limbs
+    fuzzseed.seedHex("8000000000000000000000000000000000000000000000000000000000000000"), // 2^255: even, and its only set bit is in the top limb
+    fuzzseed.seedHex("01" ++ "00" ** 31 ++ "01"), // 33 significant octets → Overflow
+    fuzzseed.seedHex("ff" ++ "00" ** 32), // ⭐ Overflow from the FIRST byte, with the rest zero: the `limb >= M.L` guard, not the carry one
+    fuzzseed.seedHex("0180" ++ "00" ** 30), // a byte straddling the limb boundary (`sh != 0` carry into limb+1)
+    fuzzseed.seedHex("dEadBeef00112233"), // the 8-octet operand the round-trip test loads
+};
+
 test "fuzz: fromBytesBE never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzFromBytesBE, .{});
+    try std.testing.fuzz({}, fuzzFromBytesBE, .{ .corpus = &loader_seeds });
 }
 
 fn fuzzFromBytesBE(_: void, smith: *std.testing.Smith) !void {
     const M = Modint(256);
-    var buf: [48]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    var buf: [loader_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice`, never `bytes` then a ranged length. `bytes` takes
+    // `@min(buf.len, in.len)` octets and the ranged draw that followed it read
+    // fewer than the eight it needs, so it returned the range MINIMUM: `len`
+    // was 0 on every input this lane can carry, and both loaders below were
+    // only ever handed the empty string. Measured 2026-09-07 over the corpus:
+    // 0 of 12 seeds arrived non-empty before, 12 of 12 after.
+    const len: usize = smith.slice(&buf);
     _ = M.fromBytesBE(buf[0..len]) catch {};
 }
 
 test "fuzz: elementFromBytesBE never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzElementFromBytesBE, .{});
+    try std.testing.fuzz({}, fuzzElementFromBytesBE, .{ .corpus = &loader_seeds });
 }
+
+/// The modulus `elementFromBytesBE` reduces against: already validated, so the
+/// harness measures the reducer and not modulus construction (covered by
+/// `fuzzFromBytesBE`); the two must not be conflated in one harness.
+const element_modulus_be = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
 
 fn fuzzElementFromBytesBE(_: void, smith: *std.testing.Smith) !void {
     const M = Modint(256);
-    // A fixed, already-validated modulus — the byte loader under test is
-    // `elementFromBytesBE`, not modulus construction (covered separately
-    // above); the two must not be conflated in one harness.
-    const m_be = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 };
-    const modulus = M.fromBytesBE(&m_be) catch unreachable;
+    const modulus = M.fromBytesBE(&element_modulus_be) catch unreachable;
 
-    var buf: [48]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    var buf: [loader_buf_len]u8 = undefined;
+    // ⚠ See `fuzzFromBytesBE` for what `bytes` + a ranged length did here.
+    const len: usize = smith.slice(&buf);
     _ = modulus.elementFromBytesBE(buf[0..len]) catch {};
+}
+
+test "corpus: every loader seed reaches both loaders, and what they accept is pinned" {
+    // ⭐ `elementFromBytesBE("")` SUCCEEDS — the zero element is canonical
+    // below any modulus — so an `accepted > 0` guard would have read green
+    // while the harness walked nothing. The numbers an empty input cannot
+    // produce are the moduli built (empty → EvenModulus) and the non-zero
+    // elements reduced.
+    const M = Modint(256);
+    const modulus = try M.fromBytesBE(&element_modulus_be);
+
+    var nonempty: usize = 0;
+    var moduli: usize = 0;
+    var elements: usize = 0;
+    var nonzero_elements: usize = 0;
+    var overflows: usize = 0;
+    for (loader_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [loader_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        if (M.fromBytesBE(buf[0..len])) |_| {
+            moduli += 1;
+        } else |e| {
+            if (e == error.Overflow) overflows += 1;
+        }
+        if (modulus.elementFromBytesBE(buf[0..len])) |v| {
+            elements += 1;
+            var acc: u64 = 0;
+            for (v) |w| acc |= w;
+            if (acc != 0) nonzero_elements += 1;
+        } else |_| {}
+    }
+    // One seed is deliberately empty; the other eleven carry bytes.
+    try std.testing.expectEqual(loader_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draw was restructured every one of
+    // these was the empty-string result: 0 moduli, 12 elements, 0 of them
+    // non-zero, 0 overflows.
+    try std.testing.expectEqual(@as(usize, 5), moduli);
+    try std.testing.expectEqual(@as(usize, 6), elements);
+    try std.testing.expectEqual(@as(usize, 5), nonzero_elements);
+    try std.testing.expectEqual(@as(usize, 2), overflows);
 }

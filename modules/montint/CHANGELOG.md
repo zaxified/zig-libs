@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: both byte-loader fuzz harnesses were handed the
+  empty string on every run.** `fuzzFromBytesBE` and `fuzzElementFromBytesBE`
+  opened with `smith.bytes(&buf)` followed by
+  `smith.valueRangeAtMost(u8, 0, buf.len)`. `bytes` consumes
+  `@min(buf.len, in.len)` octets, so the ranged draw that followed found fewer
+  than the eight it reads as a little-endian `u64` and returned the range
+  MINIMUM: `len` was 0 for every input the ordinary test lane can carry, and
+  neither loader ever saw a byte. Both now draw with one `smith.slice(&buf)`
+  and carry a 12-seed corpus covering every member of `Error` plus the
+  accepting path. Measured 2026-09-07 over that corpus: **0 of 12 seeds
+  arrived non-empty before, 12 of 12 after; 0 moduli built before, 5 after; 0
+  non-zero elements reduced before, 5 after; the `error.Overflow` branch was
+  unreachable before (0), now 2.** ⭐ An `accepted > 0` guard would have read
+  green throughout — `elementFromBytesBE("")` legitimately succeeds, the zero
+  element being canonical below any modulus — so the new corpus guard pins the
+  moduli built and the non-zero elements reduced, neither of which the empty
+  input can produce. The buffer stays at 48 octets against `encoded_bytes` of
+  32 on purpose: a buffer sized to the modulus could never reach
+  `error.Overflow` at all.
+
 - **2026-08-13** — **Re-audit follow-up: coverage and claims only — neither BREAKING nor
   BEHAVIOURAL.** No shipped code path changed; the day's timing fix was
   re-measured from scratch and holds (0 in-file contexts at all three dispatch
