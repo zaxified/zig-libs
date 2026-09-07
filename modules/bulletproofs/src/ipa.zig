@@ -538,13 +538,74 @@ test "proveIpa: zero length rejected before reaching the stub" {
 
 // ── fuzz: untrusted-input decoder never panics ──────────────────────────────
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// `4 + rounds*64 + 64`, so 1024 octets is a 14-round proof with room to
+/// spare — well past the 6-round (n=64) proofs this module produces, and the
+/// encoding is exact-length, so anything bigger could only ever be refused.
+pub const ipa_fuzz_buf_len = 1024;
+
+/// The all-zero 32 octets are the Ristretto255 IDENTITY, which
+/// `Ristretto255.fromBytes` accepts — that is what lets a hand-written seed
+/// be an ACCEPTED proof here without carrying a real transcript.
+const ipa_identity_hex = "00" ** 32;
+/// 32 octets that are not a canonical Ristretto encoding.
+const ipa_bad_point_hex = "ff" ** 32;
+
+pub const ipa_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // the empty slice: exactly what the collapsed draw ran, for ever
+    fuzzseed.seedHex("000000"), // three octets: below the 4-octet rounds field
+    fuzzseed.seedHex("00000000"), // the rounds field alone, with the 64 trailing octets missing
+    fuzzseed.seedHex("00000000" ++ "00" ** 64), // ⭐ rounds = 0: the shortest ACCEPTED proof, a and b only
+    fuzzseed.seedHex("00000001" ++ ipa_identity_hex ** 2 ++ "00" ** 64), // ⭐ rounds = 1, both points the identity: accepted
+    fuzzseed.seedHex("00000002" ++ ipa_identity_hex ** 4 ++ "11" ** 64), // rounds = 2, non-zero a and b scalars
+    fuzzseed.seedHex("00000001" ++ ipa_bad_point_hex ++ ipa_identity_hex ++ "00" ** 64), // ⭐ L is not a valid point: the errdefer-freed path
+    fuzzseed.seedHex("00000001" ++ ipa_identity_hex ++ ipa_bad_point_hex ++ "00" ** 64), // R is not a valid point, one loop iteration further in
+    fuzzseed.seedHex("00000001" ++ ipa_identity_hex ** 2 ++ "00" ** 63), // one octet short of the declared length
+    fuzzseed.seedHex("00000001" ++ ipa_identity_hex ** 2 ++ "00" ** 65), // one octet over
+    fuzzseed.seedHex("0000000e" ++ ipa_identity_hex ** 28 ++ "00" ** 64), // ⭐ rounds = 14: the largest proof that fits the buffer
+    fuzzseed.seedHex("ffffffff" ++ "00" ** 64), // ⭐ rounds = 2^32-1: `expected_len` is 274877906944, and no allocation may be attempted
+    fuzzseed.seedHex("80000000" ++ "00" ** 64), // the high bit of the rounds field set
+};
+
 fn fuzzFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
-    var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [ipa_fuzz_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice`, never `bytes` then a ranged draw. `bytes` consumes
+    // `@min(buf.len, in.len)` octets, so the ranged length that followed found
+    // fewer than the eight it reads as a little-endian `u64` and returned the
+    // range MINIMUM: `len` was 0 for every input this lane can carry, and the
+    // decoder refused it at `bytes.len < 4` without reading an octet.
+    // Measured 2026-09-07: 0 of 13 seeds arrived non-empty and 0 proofs were
+    // decoded before; 12 and 4 after.
+    const len: usize = smith.slice(&buf);
     const proof = InnerProductProof.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch return;
     proof.deinit(std.testing.allocator);
 }
 test "fuzz InnerProductProof.fromBytesAlloc never panics" {
-    try std.testing.fuzz({}, fuzzFromBytesAlloc, .{});
+    try std.testing.fuzz({}, fuzzFromBytesAlloc, .{ .corpus = &ipa_seeds });
+}
+
+test "corpus: every IPA seed reaches the decoder, and the rounds decoded are pinned" {
+    // ⭐ `accepted > 0` is nearly free here — a rounds = 0 proof is legal and
+    // carries no points at all — so the second number is the total ROUNDS
+    // decoded, which is the amount of attacker-declared work the decoder
+    // actually performed. An empty input produces 0 of both.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var rounds_decoded: usize = 0;
+    for (ipa_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [ipa_fuzz_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const proof = InnerProductProof.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch continue;
+        defer proof.deinit(std.testing.allocator);
+        accepted += 1;
+        rounds_decoded += proof.l_vec.len;
+    }
+    // One seed is deliberately the empty slice.
+    try std.testing.expectEqual(ipa_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draw was restructured both were 0.
+    try std.testing.expectEqual(@as(usize, 4), accepted);
+    try std.testing.expectEqual(@as(usize, 17), rounds_decoded);
 }

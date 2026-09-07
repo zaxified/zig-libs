@@ -296,7 +296,7 @@ const module_list = [_]Module{
     .{ .name = "ct25519", .libs = &.{"crypto"} },
     .{ .name = "voprf", .libs = &.{"crypto"}, .deps = &.{"ct25519"} },
     .{ .name = "opaque", .libs = &.{"crypto"}, .deps = &.{ "voprf", "ct25519" } },
-    .{ .name = "bulletproofs", .libs = &.{"crypto"}, .deps = &.{"ct25519"} },
+    .{ .name = "bulletproofs", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .test_deps = &.{"testkit"} },
     .{ .name = "xmss", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "minisign", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
     .{ .name = "otp", .libs = &.{"crypto"} },

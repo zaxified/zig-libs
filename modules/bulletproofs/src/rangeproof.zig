@@ -778,13 +778,71 @@ test "prove: n=64 never rejects any u64 value at the construction-time guard" {
 
 // ── fuzz: untrusted-input decoder never panics ──────────────────────────────
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// `32*7` fixed octets and then a whole `InnerProductProof` behind them, so
+/// the buffer has to hold both. 1024 leaves room for a 10-round IPA tail.
+const rp_fuzz_buf_len = 1024;
+
+/// The Ristretto255 identity - accepted by `fromBytes`, so a hand-written
+/// seed can be a decodable proof without a real transcript behind it.
+const rp_identity_hex = "00" ** 32;
+const rp_bad_point_hex = "ff" ** 32;
+/// `a, s, t1, t2` (four points) then `tau_x, mu, t_hat` (three raw scalars).
+const rp_fixed_hex = rp_identity_hex ** 4 ++ "01" ** 32 ++ "02" ** 32 ++ "03" ** 32;
+
+const rp_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // the empty slice: exactly what the collapsed draw ran, for ever
+    fuzzseed.seedHex("00" ** 223), // one octet short of the 224-octet fixed part
+    fuzzseed.seedHex("00" ** 224), // the fixed part alone: the IPA tail is empty, so the nested decode refuses
+    fuzzseed.seedHex(rp_fixed_hex ++ "00000000" ++ "00" ** 64), // a complete, ACCEPTED proof with a rounds = 0 IPA
+    fuzzseed.seedHex(rp_fixed_hex ++ "00000001" ++ rp_identity_hex ** 2 ++ "00" ** 64), // accepted, one IPA round
+    fuzzseed.seedHex(rp_fixed_hex ++ "00000006" ++ rp_identity_hex ** 12 ++ "44" ** 64), // six rounds - the IPA width an n = 64 range proof produces
+    fuzzseed.seedHex(rp_bad_point_hex ++ rp_identity_hex ** 3 ++ "00" ** 96 ++ "00000000" ++ "00" ** 64), // `a` is not a valid point: refused on the FIRST of the four
+    fuzzseed.seedHex(rp_identity_hex ** 3 ++ rp_bad_point_hex ++ "00" ** 96 ++ "00000000" ++ "00" ** 64), // `t2` is not a valid point: refused on the LAST of the four
+    fuzzseed.seedHex(rp_fixed_hex ++ "00000001" ++ rp_bad_point_hex ++ rp_identity_hex ++ "00" ** 64), // the fixed part decodes and the nested IPA then fails
+    fuzzseed.seedHex(rp_fixed_hex ++ "00000000" ++ "00" ** 63), // the IPA tail one octet short
+    fuzzseed.seedHex(rp_fixed_hex ++ "ffffffff" ++ "00" ** 64), // an absurd nested rounds count behind a valid fixed part
+    fuzzseed.seedHex("ff" ** 224), // every one of the four points invalid
+};
+
 fn fuzzFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
-    var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [rp_fuzz_buf_len]u8 = undefined;
+    // One `smith.slice`, never `bytes` then a ranged draw - see the twin in
+    // `ipa.zig`. `len` was 0 for every input this lane can carry, so the
+    // decoder refused at `bytes.len < 32*7` and neither `Ristretto255.fromBytes`
+    // nor the nested `InnerProductProof.fromBytesAlloc` had ever run from this
+    // target. Measured 2026-09-07: 0 of 12 seeds arrived non-empty and 0
+    // proofs were decoded before; 11 and 3 after.
+    const len: usize = smith.slice(&buf);
     const proof = RangeProof.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch return;
     proof.deinit(std.testing.allocator);
 }
 test "fuzz RangeProof.fromBytesAlloc never panics" {
-    try std.testing.fuzz({}, fuzzFromBytesAlloc, .{});
+    try std.testing.fuzz({}, fuzzFromBytesAlloc, .{ .corpus = &rp_seeds });
+}
+
+test "corpus: every range-proof seed reaches the decoder, and the nested IPA rounds are pinned" {
+    // The second number is the nested IPA's rounds, because that is the
+    // only part of this encoding whose size the attacker declares - and the
+    // part an empty input cannot reach at all, since the four point decodes
+    // come first.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var ipa_rounds: usize = 0;
+    for (rp_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [rp_fuzz_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const proof = RangeProof.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch continue;
+        defer proof.deinit(std.testing.allocator);
+        accepted += 1;
+        ipa_rounds += proof.ipa.l_vec.len;
+    }
+    // One seed is deliberately the empty slice.
+    try std.testing.expectEqual(rp_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draw was restructured both were 0.
+    try std.testing.expectEqual(@as(usize, 3), accepted);
+    try std.testing.expectEqual(@as(usize, 7), ipa_rounds);
 }
