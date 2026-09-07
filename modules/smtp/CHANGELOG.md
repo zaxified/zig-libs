@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Test-only, no production change: `message.fuzzRender`'s corpus carried a
+  24-octet tail for the three draws behind the blob, but sixteen of those octets were
+  literally `[_]u8{0} ** 16` on all ten seeds. A tail that exists is not a tail that
+  carries anything. Measured: the PRNG seed was **0 on 10 of 10 seeds**, so every render
+  produced the SAME MIME boundary — **1 distinct boundary for the whole corpus** — and the
+  harness's own `count(boundary) == 4` assertion, the one that checks a boundary never
+  appears inside the parts it delimits, had only ever been evaluated against one string.
+  `date.unix` was likewise 0 on all ten, so the Date header was 1970-01-01T00:00:00Z every
+  time and **0 seeds** rendered a pre-epoch date. `seedSplit` now takes the PRNG seed and
+  the timestamp per seed, covering the 1901 and 2038 edges, a leap day and four pre-epoch
+  values; the corpus guard pins **8 distinct boundaries and 4 pre-epoch dates**. ⚠ The
+  timestamp word must be the zero-extended 32-bit pattern: `value(i32)` reads eight octets
+  as a little-endian u64 and a sign-extended negative falls outside the type's weight range,
+  coming back as 0.
+
+
 - **2026-09-07** — **All seven fuzz harnesses now receive their input; none of
   them did before.** Every one opened `smith.bytes(&raw)` and then drew the
   length with a ranged draw. `bytes` takes `@min(raw.len, in.len)` octets, so

@@ -869,28 +869,47 @@ test "a very long line in a 7bit-looking body forces an encoding that fits" {
 /// harness whose whole point is "any body AND subject". The eight octets after
 /// the frame are what `valueRangeAtMost` reads as a little-endian u64; the
 /// sixteen after those feed `value(u64)` and `value(i32)`.
-fn seedSplit(comptime blob: []const u8, comptime split: u64) []const u8 {
+///
+/// ⛔ Those last sixteen octets used to be `[_]u8{0} ** 16` on every seed — a
+/// tail that exists is not a tail that carries anything. So the PRNG seed was
+/// 0 for all ten seeds, meaning the MIME boundary was the SAME string every
+/// time and the harness's `count(boundary) == 4` assertion had only ever been
+/// evaluated against one boundary; and `date.unix` was 0 for all ten, so the
+/// Date header was 1970-01-01T00:00:00Z on every render and no pre-epoch or
+/// late date was ever formatted. Both are spelled out per seed now.
+///
+/// ⚠ `unix` is drawn with `value(i32)`, which reads eight octets as a
+/// little-endian u64 and falls back to 0 when the value is outside the type's
+/// weight range. The word therefore has to be the ZERO-EXTENDED 32-bit
+/// pattern, not the sign-extended one: `@as(u64, @as(u32, @bitCast(unix)))`.
+fn seedSplit(
+    comptime blob: []const u8,
+    comptime split: u64,
+    comptime prng_seed: u64,
+    comptime unix: i32,
+) []const u8 {
     return &struct {
         const bytes = std.mem.toBytes(@as(u32, @intCast(blob.len))) ++
             blob[0..blob.len].* ++
             std.mem.toBytes(split) ++
-            [_]u8{0} ** 16;
+            std.mem.toBytes(prng_seed) ++
+            std.mem.toBytes(@as(u64, @as(u32, @bitCast(unix))));
     }.bytes;
 }
 
 /// Subject-plus-body blobs, in the format `Smith.slice` reads, each with the
 /// split point that decides how much of it becomes the Subject header.
 const render_seeds = [_][]const u8{
-    seedSplit("Hello, worldThis is the body text.", 12), // an ordinary ASCII message
-    seedSplit("žluťoučký kůňpříliš dlouhý text", 15), // a non-ASCII subject: forces an RFC 2047 encoded word
-    seedSplit("A" ** 400, 200), // exactly the harness buffer, split down the middle
-    seedSplit("A" ** 400, 0), // the same with no subject at all
-    seedSplit("Subject line\r\n\r\nBody text\r\n", 12), // a subject with CRLF right behind it in the body
-    seedSplit("\r\n" ** 50, 20), // nothing but line breaks
-    seedSplit("=" ** 200, 100), // every octet quoted-printable must escape
-    seedSplit("." ** 100, 40), // leading dots, which the transport layer will stuff
-    seedSplit("\x00" ** 32, 16), // NULs: the subject must be refused, not smuggled
-    seedSplit(" " ** 200, 100), // nothing but fold points
+    seedSplit("Hello, worldThis is the body text.", 12, 0x9E37_79B9_7F4A_7C15, 1_767_225_600), // an ordinary ASCII message, 2026-01-01
+    seedSplit("žluťoučký kůňpříliš dlouhý text", 15, 0x0123_4567_89AB_CDEF, -1), // a non-ASCII subject (forces an RFC 2047 encoded word), one second before the epoch
+    seedSplit("A" ** 400, 200, 0xF0E1_D2C3_B4A5_9687, std.math.maxInt(i32)), // exactly the harness buffer, split down the middle, the 2038 edge
+    seedSplit("A" ** 400, 0, 0xFFFF_FFFF_FFFF_FFFF, std.math.minInt(i32)), // the same with no subject at all, the 1901 edge
+    seedSplit("Subject line\r\n\r\nBody text\r\n", 12, 0x6C62_1F4D_3A98_5E27, 0), // a subject with CRLF right behind it in the body, the epoch itself
+    seedSplit("\r\n" ** 50, 20, 0x2468_ACE0_1357_9BDF, 951_782_400), // nothing but line breaks, 2000-02-29 (a leap day)
+    seedSplit("=" ** 200, 100, 0x1357_9BDF_2468_ACE0, 1_000_000_000), // every octet quoted-printable must escape
+    seedSplit("." ** 100, 40, 0x5A5A_5A5A_A5A5_A5A5, -2_147_483_648 + 1), // leading dots, which the transport layer will stuff
+    seedSplit("\x00" ** 32, 16, 0x0000_0000_0000_0001, 86_399), // NULs: the subject must be refused, not smuggled
+    seedSplit(" " ** 200, 100, 0xDEAD_BEEF_CAFE_F00D, -86_400), // nothing but fold points, one day before the epoch
 };
 
 test "fuzz: any body and subject renders to a document that respects the limits" {
@@ -945,6 +964,13 @@ test "corpus: every render seed reaches the renderer, and the counts are pinned"
     var nonempty: usize = 0;
     var rendered: usize = 0;
     var subject_nonempty: usize = 0;
+    // The two knobs behind the split. `boundaries` is the count of DISTINCT
+    // MIME boundaries the corpus produces: with the old all-zero tail the PRNG
+    // seed was 0 on every seed and this was 1, so the harness's
+    // `count(boundary) == 4` assertion had only ever met one boundary string.
+    var boundaries: std.StringHashMapUnmanaged(void) = .empty;
+    defer boundaries.deinit(gpa);
+    var pre_epoch: usize = 0;
     for (render_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var raw: [400]u8 = undefined;
@@ -954,11 +980,13 @@ test "corpus: every render seed reaches the renderer, and the counts are pinned"
         const split = if (blob.len == 0) 0 else smith.valueRangeAtMost(u16, 0, @intCast(blob.len));
         if (split != 0) subject_nonempty += 1;
         var prng = fixedRandom(smith.value(u64));
+        const unix = smith.value(i32);
+        if (unix < 0) pre_epoch += 1;
         const m = Message{
             .from = .{ .addr = "a@example.com" },
             .to = &.{.{ .addr = "b@example.net" }},
             .subject = blob[0..split],
-            .date = .{ .unix = smith.value(i32) },
+            .date = .{ .unix = unix },
             .message_id = "id@example.com",
             .body = .{ .multipart = .{ .parts = &.{
                 .{ .text = .{ .body = blob[split..] } },
@@ -966,9 +994,20 @@ test "corpus: every render seed reaches the renderer, and the counts are pinned"
             } } },
         };
         if (render(gpa, m, prng.random(), .{})) |out| {
-            gpa.free(out);
+            defer gpa.free(out);
             rendered += 1;
+            const bs = std.mem.indexOf(u8, out, "boundary=\"").? + 10;
+            const be = std.mem.indexOfScalarPos(u8, out, bs, '"').?;
+            if (!boundaries.contains(out[bs..be])) {
+                const owned = try gpa.dupe(u8, out[bs..be]);
+                errdefer gpa.free(owned);
+                try boundaries.put(gpa, owned, {});
+            }
         } else |_| {}
+    }
+    defer {
+        var it = boundaries.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
     }
     try testing.expectEqual(render_seeds.len, nonempty);
     // Measured 2026-09-07: 0 of 10 seeds non-empty before the draw was fixed
@@ -976,4 +1015,9 @@ test "corpus: every render seed reaches the renderer, and the counts are pinned"
     // after.
     try testing.expectEqual(@as(usize, 8), rendered);
     try testing.expectEqual(@as(usize, 9), subject_nonempty);
+    // Measured 2026-09-08. With the old all-zero 16-octet tail these were 1 and
+    // 0: one boundary string for the whole corpus and not a single pre-epoch
+    // date. ⛔ Not `> 1` — the count is what notices a seed losing its tail.
+    try testing.expectEqual(@as(usize, 8), boundaries.count());
+    try testing.expectEqual(@as(usize, 4), pre_epoch);
 }

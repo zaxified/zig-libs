@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Test-only, no production change: both `fuzzParse` harnesses claim in a
+  comment that their alphabet-substitution loop is inert on a corpus replay, and both
+  corpus guards left that loop out — so the claim was unverified and the guard was
+  measuring a different computation from the harness. A seed that grew a tail would have
+  had a quarter of its literal rewritten before `parse` saw it while `digits` and `parsed`
+  went on reporting the same numbers. Both guards now replay the loop and pin the
+  substitution count, measured at **0** in `root.zig` and **0** in `big.zig`.
+
+
 - **2026-09-07** — Both `fuzzParse` targets (`Decimal` and `BigDecimal`) had been parsing the
   empty string and nothing else. Each drew its literal with `smith.bytes(&buf)` and then took
   a length from `smith.valueRangeAtMost(…, 0, buf.len)`; a ranged `Smith` draw reads eight

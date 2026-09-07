@@ -1832,12 +1832,24 @@ test "corpus: every literal reaches BigDecimal.parse, and the counts are pinned"
     var nonempty: usize = 0;
     var parsed: usize = 0;
     var digits: usize = 0;
+    // ⛔ The alphabet-substitution loop is replayed here, not skipped. The
+    // harness's comment claims it is inert on a corpus replay; a guard that
+    // leaves the loop out cannot hold that claim up, and would keep reporting
+    // the same `digits` while a seed with a tail quietly mangled its literal.
+    var substituted: usize = 0;
+    const alphabet = "0123456789+-.eE";
     for (parse_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [256]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
         digits += len;
+        for (buf[0..len]) |*c| {
+            if (smith.boolWeighted(1, 4)) {
+                c.* = alphabet[c.* % alphabet.len];
+                substituted += 1;
+            }
+        }
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
         if (BigDecimal.parse(arena.allocator(), buf[0..len])) |_| parsed += 1 else |_| {}
@@ -1848,4 +1860,10 @@ test "corpus: every literal reaches BigDecimal.parse, and the counts are pinned"
     // 0 octets delivered — one empty string seventeen times. After:
     try testing.expectEqual(@as(usize, 10), parsed);
     try testing.expectEqual(@as(usize, 360), digits);
+    // The harness's claim, now executable: measured 2026-09-08 at 0. Every
+    // seed reaches `BigDecimal.parse` verbatim, because `testkit.fuzz.seed`
+    // leaves no tail and `boolWeighted` on an exhausted input is `false`. ⛔ A
+    // non-zero value here would mean a quarter of the corpus's own literals
+    // were being rewritten into something else before the parser saw them.
+    try testing.expectEqual(@as(usize, 0), substituted);
 }
