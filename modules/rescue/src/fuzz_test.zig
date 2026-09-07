@@ -95,8 +95,8 @@ const inj_seeds = [_][]const u8{
     // Words ABOVE the modulus, so `fromU64` has to reduce them.
     injSeed(@splat(std.math.maxInt(u64)), 7, std.math.maxInt(u64)),
     // Every element equal: the shape that catches a permutation collapsing
-    // two coordinates onto one. Delta 0 here, so the `isZero` fallback to 1 is
-    // reached deliberately rather than by exhaustion.
+    // two coordinates onto one. Delta 0 here, so the `delta == 0` fallback to
+    // 1 is reached deliberately rather than by exhaustion.
     injSeed(@splat(7), 6, 0),
 };
 
@@ -105,7 +105,7 @@ test "corpus: the injectivity seeds drive slot and delta, and the counts are pin
     // over the single all-zero input and said nothing at all. These are the
     // three numbers the collapsed input could not move: distinct slots
     // perturbed (it was 1 of 12), seeds whose DRAWN delta was already non-zero
-    // so the `isZero` fallback did not fire (0), and distinct permutation
+    // so the `delta == 0` fallback did not fire (0), and distinct permutation
     // outputs (1).
     var slots: [P128.width]bool = @splat(false);
     var drawn_delta: usize = 0;
