@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Golden matrices captured ONCE from `segno` (the reference Python encoder
-//! `reference.py` drives) and committed here so the anchor holds even where
+//! `../../tools/reference.py` drives) and committed here so the anchor holds even
 //! python3/segno is not installed -- including CI, which never has it.
 //!
 //! Each entry is the literal module grid segno produced for
@@ -11,14 +11,14 @@
 //! without ever invoking python.
 //!
 //! `.bits` is row-major, MSB-first, each row byte-aligned (see
-//! `reference.py`'s `pack_rows` for the exact packing) -- a description of
+//! `tools/reference.py`'s `pack_rows` for the exact packing) -- a description of
 //! the module grid, independent of `Matrix`'s internal bit layout.
 //!
 //! Captured with segno 1.6.6 (`pip show segno`) on Python 3, via:
 //!
-//!   cd src/testdata && python3 reference.py dump
+//!   python3 modules/qr/tools/reference.py dump
 //!
-//! Two things `reference.py` does before generating, both explained in full
+//! Two things `tools/reference.py` does before generating, both explained in
 //! there:
 //!   - `boost_error=False` on every `segno.make()` call -- segno's default
 //!     silently raises the ECC level when the chosen version has spare
@@ -32,7 +32,7 @@
 //!     capture run of this oracle actually caught, and it was segno that was
 //!     wrong, not us).
 //!
-//! Regenerate the same way after changing `reference.py`'s CASES tables --
+//! Regenerate the same way after changing `tools/reference.py`'s CASES tables --
 //! `golden_test.zig`'s count canary fails loudly if the two drift apart. Do
 //! NOT hand-edit the byte arrays below; regenerate them.
 

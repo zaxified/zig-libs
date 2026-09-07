@@ -2372,25 +2372,145 @@ fn fuzzRequest(header_block: []const u8, query: []const u8, body: *http.Server.R
     };
 }
 
+// ⚠ All three harnesses below used to open with `smith.bytes(&buf)` followed
+// by `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain -- so `len` was 0 for
+// every input a corpus can carry, and all three extractors were handed an EMPTY
+// slice while the header block sat unread in `buf`.
+//
+// ⛔ `fuzzApiKeyPresented` was the worse of the two shapes: it drew `len` and
+// then `split` from a range bounded by `len`, so with `len == 0` BOTH the
+// header block and the query string were empty and neither of the two
+// extraction paths this harness exists to compare could run. A corpus alone
+// would not have fixed it either -- a knob drawn after the byte draw reads an
+// exhausted input and returns its range minimum for ever. The split now comes
+// from the bytes themselves: a US octet (0x1F) inside the seed, which is not
+// legal in a header block or a query string, so a seed spells out where it
+// divides and `--fuzz` still drives it.
+
+/// The offset of the header-block/query split inside a drawn buffer: the first
+/// US (0x1F), or the whole buffer when there is none.
+fn fuzzSplitAt(bytes: []const u8) usize {
+    return std.mem.indexOfScalar(u8, bytes, 0x1F) orelse bytes.len;
+}
+
+/// `testkit.fuzz.seed`, aliased so the corpora below read as the header blocks
+/// and query strings they are. A corpus entry is not the frame: the length draw
+/// reads a little-endian `u32` first, so a raw header block would arrive minus
+/// its own first four octets. `testkit/src/fuzz.zig` carries the other two
+/// hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// Raw header blocks, in the format the length draw reads. `bearerToken` looks
+/// up `authorization` through `http`'s header iterator, so the corpus has to
+/// carry a header BLOCK, not a header value -- which is why the block framing
+/// shapes (no CRLF, a bare LF, an empty name, a header with no colon) belong
+/// here as much as the RFC 9110 scheme shapes do.
+const bearer_seeds = [_][]const u8{
+    seed("Authorization: Bearer abc123\r\n"), // the ordinary bearer credential
+    seed("authorization: bearer abc123\r\n"), // the scheme match is case-INSENSITIVE
+    seed("Authorization:   Bearer   abc123  \r\n"), // surrounding SP/TAB is trimmed
+    seed("Authorization: Bearer\tabc123\r\n"), // TAB after the scheme: not a space, so null
+    seed("Host: h\r\nAuthorization: Bearer tok\r\nAccept: */*\r\n"), // not the first header
+    seed("Authorization: Bearer a\r\nAuthorization: Bearer b\r\n"), // duplicated: the FIRST wins
+    seed("Authorization: Basic dXNlcjpwdw==\r\n"), // another scheme entirely
+    seed("Authorization: Bearer\r\n"), // the scheme with no credential
+    seed("Authorization: Bearer    \r\n"), // whitespace where the credential belongs
+    seed("Authorization: Bearerabc\r\n"), // no delimiter after the scheme
+    seed("Authorization: \r\n"), // an empty header value
+    seed("Authorization: Bearer \xff\xfe\xfd\r\n"), // a non-ASCII credential
+    seed("Proxy-Authorization: Bearer abc\r\n"), // the wrong header name
+    seed("Host: h\r\n"), // no Authorization header at all
+    seed("Authorization: Bearer abc123"), // no CRLF at the end of the block
+    seed("Authorization: Bearer abc123\n"), // a bare LF terminator
+    seed(": Bearer abc\r\n"), // an empty header name
+    seed("Authorization Bearer abc\r\n"), // no colon
+    seed("\r\n"), // an empty header block
+};
+
+test "fuzz bearerToken never panics" {
+    try testing.fuzz({}, fuzzBearerToken, .{ .corpus = &bearer_seeds });
+}
+
 fn fuzzBearerToken(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     var body: http.Server.RequestBody = .{ .none = .fixed("") };
     const req = fuzzRequest(buf[0..len], "", &body);
     _ = bearerToken(&req);
 }
-test "fuzz bearerToken never panics" {
-    try testing.fuzz({}, fuzzBearerToken, .{});
+
+test "corpus: every bearer seed reaches the extractor, and the tokens found are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment.
+    // `bearerToken` returns an OPTIONAL, never an error, so there is no
+    // "accepted" to count and a reach guard has to pin what it produced: the
+    // seeds that yielded a token, and the octets of credential recovered. Both
+    // are 0 for the empty header block, which is the input this harness ran on
+    // every iteration for its whole life.
+    var nonempty: usize = 0;
+    var tokens_found: usize = 0;
+    var token_octets: usize = 0;
+    for (bearer_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var body: http.Server.RequestBody = .{ .none = .fixed("") };
+        const req = fuzzRequest(buf[0..len], "", &body);
+        const tok = bearerToken(&req) orelse continue;
+        tokens_found += 1;
+        token_octets += tok.len;
+    }
+    try testing.expectEqual(bearer_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 19 seeds non-empty, 0 tokens found and 0 octets
+    // recovered before the draw was fixed.
+    try testing.expectEqual(@as(usize, 8), tokens_found);
+    try testing.expectEqual(@as(usize, 37), token_octets);
+}
+
+/// Header block + query string in one seed, divided by a US octet (0x1F) --
+/// `\x1f` below. Everything before it is the header block, everything after it
+/// is the query string; a seed with no US is all header block.
+///
+/// The point of the corpus is the PRECEDENCE rule: the header wins over the
+/// query, and an empty-after-trim value counts as absent and falls through. A
+/// seed that only ever carries one of the two sides cannot see that rule at all.
+const api_key_seeds = [_][]const u8{
+    seed("X-Api-Key: secret\r\n"), // the header form
+    seed("x-api-key: secret\r\n"), // the header lookup is case-INSENSITIVE
+    seed("Host: h\r\n\x1fapi_key=secret"), // the query form
+    seed("X-Api-Key: from-header\r\n\x1fapi_key=from-query"), // both present: the HEADER wins
+    seed("X-Api-Key:    \r\n\x1fapi_key=from-query"), // empty after trim: falls through to the query
+    seed("X-Api-Key: \t secret \t\r\n"), // SP/TAB around the header value is trimmed
+    seed("Host: h\r\n\x1ffoo=1&api_key=secret&bar=2"), // not the first query pair
+    seed("Host: h\r\n\x1fapi_key=v1&api_key=v2"), // duplicated: the FIRST wins
+    seed("Host: h\r\n\x1fapi_key=a%20b"), // taken VERBATIM: no percent-decoding
+    seed("Host: h\r\n\x1fapi_key="), // an empty query value counts as absent
+    seed("Host: h\r\n\x1fapi_key"), // a pair with no '=' is skipped
+    seed("Host: h\r\n\x1fapi_keyx=secret"), // the name compare is exact, not a prefix
+    seed("Host: h\r\n\x1fxapi_key=secret"), // ... and not a suffix either
+    seed("Host: h\r\n\x1f&&&=&=&"), // degenerate separators
+    seed("X-Api-Key: secret\r\n\x1f"), // a US with nothing after it: an empty query
+    seed("\x1fapi_key=secret"), // a US at offset 0: an empty header block
+    seed("Host: h\r\n"), // neither side carries a key
+    seed("X-Api-Key: \xff\xfe\r\n\x1fapi_key=\xfd\xfc"), // non-ASCII on both sides
+};
+
+test "fuzz apiKeyPresented never panics" {
+    try testing.fuzz({}, fuzzApiKeyPresented, .{ .corpus = &api_key_seeds });
 }
 
 fn fuzzApiKeyPresented(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const split: usize = smith.valueRangeAtMost(u16, 0, @as(u16, @intCast(len)));
+    const len: usize = smith.slice(&buf);
+    // ⛔ Not a second ranged draw: after `slice` the input is exhausted, so
+    // any further draw is its range minimum for ever. The divide is a US octet
+    // in the bytes themselves, which the fuzzer drives along with everything
+    // else.
+    const split: usize = fuzzSplitAt(buf[0..len]);
     var body: http.Server.RequestBody = .{ .none = .fixed("") };
-    const req = fuzzRequest(buf[0..split], buf[split..len], &body);
+    const req = fuzzRequest(buf[0..split], buf[@min(split + 1, len)..len], &body);
 
     var g = try Gate.init(testing.allocator, .{
         .auth_mode = .api_key,
@@ -2399,8 +2519,50 @@ fn fuzzApiKeyPresented(_: void, smith: *std.testing.Smith) !void {
     defer g.deinit();
     _ = apiKeyPresented(&g, &req);
 }
-test "fuzz apiKeyPresented never panics" {
-    try testing.fuzz({}, fuzzApiKeyPresented, .{});
+
+test "corpus: every api-key seed reaches both extraction paths, and the split is real" {
+    // ⭐ Four numbers, and the last two are the reason this guard exists.
+    // `keys_found` alone would not notice that the harness had collapsed BOTH
+    // sides into empty slices -- it would just read 0, the same as a corpus of
+    // requests carrying no key. `header_side` and `query_side` count which of
+    // the two paths produced the key, and a non-zero pair is the only evidence
+    // that the split actually divided anything: before the fix `split` was
+    // always 0 AND `len` was always 0, so the query string was `buf[0..0]` on
+    // every iteration and the query branch of `apiKeyPresented` -- half of what
+    // the function does -- had never run once.
+    var nonempty: usize = 0;
+    var keys_found: usize = 0;
+    var header_side: usize = 0;
+    var query_side: usize = 0;
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .api_key,
+        .api_key_query_param = "api_key",
+    });
+    defer g.deinit();
+    for (api_key_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const split: usize = fuzzSplitAt(buf[0..len]);
+        const header_block = buf[0..split];
+        const query = buf[@min(split + 1, len)..len];
+        var body: http.Server.RequestBody = .{ .none = .fixed("") };
+        const req = fuzzRequest(header_block, query, &body);
+        const key = apiKeyPresented(&g, &req) orelse continue;
+        keys_found += 1;
+        // Which side it came from: a slice into the header block or into the
+        // query string. Compared by ADDRESS, because both sides can legally
+        // carry the same value -- and the whole point of the precedence rule
+        // is which one is returned when they do.
+        if (@intFromPtr(key.ptr) < @intFromPtr(query.ptr)) header_side += 1 else query_side += 1;
+    }
+    try testing.expectEqual(api_key_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 18 seeds non-empty and every counter 0 before
+    // the draw was fixed.
+    try testing.expectEqual(@as(usize, 12), keys_found);
+    try testing.expectEqual(@as(usize, 6), header_side);
+    try testing.expectEqual(@as(usize, 6), query_side);
 }
 
 test "queryValue: finds a param that isn't the first pair in a multi-param query" {
@@ -2413,14 +2575,60 @@ test "queryValue: finds a param that isn't the first pair in a multi-param query
     try testing.expectEqual(@as(?[]const u8, null), queryValue("foo=1&bar=2", "api_key"));
 }
 
+/// Raw query strings, in the format the length draw reads. `queryValue` is the
+/// string-level half of the API-key extraction above and is public, so it gets
+/// its own corpus rather than borrowing the request-level one.
+const query_seeds = [_][]const u8{
+    seed("api_key=secret"), // the single pair
+    seed("foo=1&api_key=secret"), // not the first pair
+    seed("api_key=secret&foo=1"), // first of several
+    seed("foo=1&api_key=secret&bar=2"), // in the middle
+    seed("api_key=v1&api_key=v2"), // duplicated: the FIRST value wins
+    seed("api_key=a%20b"), // returned VERBATIM: no percent-decoding
+    seed("api_key=a=b=c"), // '=' inside the value: only the first splits
+    seed("api_key="), // present but empty
+    seed("api_key"), // no '=': the pair is skipped
+    seed("foo=1&bar=2"), // no such parameter
+    seed("api_keyx=1"), // an exact name compare, not a prefix
+    seed("xapi_key=1"), // ... and not a suffix
+    seed("&&&"), // separators only
+    seed("=v"), // an empty name
+    seed("api_key=\xff\xfe\xfd"), // a non-ASCII value
+    seed("api_key=" ++ ("k" ** 200)), // a value most of the buffer wide
+};
+
+test "fuzz queryValue never panics" {
+    try testing.fuzz({}, fuzzQueryValue, .{ .corpus = &query_seeds });
+}
+
 fn fuzzQueryValue(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     _ = queryValue(buf[0..len], "api_key");
 }
-test "fuzz queryValue never panics" {
-    try testing.fuzz({}, fuzzQueryValue, .{});
+
+test "corpus: every query seed reaches queryValue, and what it returned is pinned" {
+    // `queryValue` returns an optional, so the numbers are the hits and the
+    // octets returned. The octet count is the discriminating one: `api_key=`
+    // is a HIT with a zero-length value, so a corpus of empty values would
+    // score full marks on hits while never returning a single octet.
+    var nonempty: usize = 0;
+    var hits: usize = 0;
+    var value_octets: usize = 0;
+    for (query_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const v = queryValue(buf[0..len], "api_key") orelse continue;
+        hits += 1;
+        value_octets += v.len;
+    }
+    try testing.expectEqual(query_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 16 seeds non-empty, 0 hits and 0 octets before
+    // the draw was fixed.
+    try testing.expectEqual(@as(usize, 10), hits);
+    try testing.expectEqual(@as(usize, 239), value_octets);
 }
 
 // ── tests (string-level extractors — no request type) ───────────────────────

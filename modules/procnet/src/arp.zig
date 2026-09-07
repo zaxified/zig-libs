@@ -181,38 +181,80 @@ test "parseArp: device name longer than IFNAMSIZ is truncated, not dropped" {
 // hostile-input surface as any wire parser (a bind-mounted/faked `/proc`, a
 // snapshot read from a file). Allocates, so this runs under
 // `std.testing.allocator` with the result freed on every path.
+
+/// The shared script reader. See `fuzzsample.zig` for what collapsed here and
+/// why the choices now come out of the seed's own octets instead of a draw.
+const fuzzsample = @import("fuzzsample.zig");
+const seed = fuzzsample.seed;
+
+/// Scripts for the sample builder: `sampleIndex, mode, mutationCount,
+/// truncate(2)`, then `offset(2), value` per mutation. `mode` 0 asks for
+/// arbitrary bytes and a truncation at or over the sample's length means "do
+/// not truncate", so `\xff\xff` is the whole table.
+///
+/// The mutation half is what this target is for: arbitrary bytes essentially
+/// never spell a well-formed `hh:hh:hh:hh:hh:hh` MAC or a valid dotted IP, so
+/// damaging a known-good table reaches `parseMac`'s per-group bounds check
+/// — audit-found: a 7th colon group is the only thing standing between this
+/// and an OOB write — far more often than a from-scratch random blob would.
+const arp_samples = [_][]const u8{fixture};
+
+const arp_seeds = [_][]const u8{
+    seed("\x00\x01\x00\xff\xff"), // the real table, undamaged
+    seed("\x00\x01\x01\xff\xff" ++ "\x00\x2c:"), // one octet turned into a colon: a 7th MAC group
+    seed("\x00\x01\x01\xff\xff" ++ "\x00\x2cZ"), // one octet turned into a non-hex character
+    seed("\x00\x01\x04\xff\xff" ++ "\x00\x2c:\x00\x2f:\x00\x32:\x00\x35:"), // four colons injected into one MAC
+    seed("\x00\x01\x08\xff\xff" ++ "\x00\x10.\x00\x11.\x00\x12.\x00\x13.\x00\x14.\x00\x15.\x00\x16.\x00\x17."), // dots scattered through the address column
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x20\x0a\x00\x21\x0a"), // newlines cut a row in half
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x20\x00\x00\x21\x00"), // NULs inside a row
+    seed("\x00\x01\x18\xff\xff"), // the maximum mutation count, cycling over one offset
+    seed("\x00\x01\x00\x00\x28"), // the real table truncated to 40 octets
+    seed("\x00\x01\x00\x00\x01"), // truncated to a single octet
+    seed("\x00\x01\x00\x00\x00"), // truncated to nothing
+    seed("\x00\x00\x00\x00\x00\x00\x40" ++ "10.0.0.1 0x1 0x2 aa:bb:cc:dd:ee:ff * eth0"), // arbitrary mode: a hand-written row
+    seed("\x00\x00\x00\x00\x00\x00\x08" ++ "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8"), // arbitrary mode: high bytes
+    seed(""), // the empty script: exactly what the collapsed helper ran
+};
+
 test "fuzz: parseArp never panics, OOB or leaks, arbitrary or mutated-real bytes" {
-    try std.testing.fuzz({}, fuzzParseArpNeverLeaks, .{ .corpus = &.{fixture} });
+    try std.testing.fuzz({}, fuzzParseArpNeverLeaks, .{ .corpus = &arp_seeds });
 }
 
 fn fuzzParseArpNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
     var buf: [1024]u8 = undefined;
-    const text = mutateSample(smith, fixture, &buf);
+    var choice: fuzzsample.Choice = .{};
+    const text = fuzzsample.build(script[0..n], &arp_samples, &buf, &choice);
     const entries = try parseArp(testing.allocator, text);
     testing.allocator.free(entries);
 }
 
-/// One draw in five is pure arbitrary bytes; the rest starts from the real
-/// `/proc/net/arp` fixture and applies a handful of byte-level mutations —
-/// arbitrary bytes essentially never spell a well-formed `hh:hh:hh:hh:hh:hh`
-/// MAC or a valid dotted IP, so mutating a known-good table reaches
-/// `parseMac`'s per-group bounds check (audit-found: a 7th colon group is
-/// the only thing standing between this and an OOB write) far more often
-/// than a from-scratch random blob would.
-fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
-    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
-        smith.bytes(buf);
-        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
-        return buf[0..len];
+test "corpus: every arp script reaches the parser, and the entries decoded are pinned" {
+    // ⭐ `parseArp("")` SUCCEEDS — an empty table is zero entries, not an error
+    // — so "some seeds were accepted" would have read 100% while the harness
+    // parsed nothing at all, which is precisely what it did. The number an
+    // empty input cannot produce is the entries actually decoded.
+    var nonempty: usize = 0;
+    var entries_decoded: usize = 0;
+    var mutations: usize = 0;
+    for (arp_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var buf: [1024]u8 = undefined;
+        var choice: fuzzsample.Choice = .{};
+        const text = fuzzsample.build(script[0..n], &arp_samples, &buf, &choice);
+        mutations += choice.mutations;
+        const entries = parseArp(testing.allocator, text) catch continue;
+        defer testing.allocator.free(entries);
+        entries_decoded += entries.len;
     }
-    const len = @min(sample.len, buf.len);
-    @memcpy(buf[0..len], sample[0..len]);
-    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
-    var i: u8 = 0;
-    while (i < n_mutations) : (i += 1) {
-        if (len == 0) break;
-        buf[smith.index(len)] = smith.value(u8);
-    }
-    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
-    return buf[0..out_len];
+    // One seed is deliberately the empty script.
+    try testing.expectEqual(arp_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: 0 entries decoded and 0 octets mutated before the
+    // draws were restructured — every iteration parsed the empty string.
+    try testing.expectEqual(@as(usize, 37), entries_decoded);
+    try testing.expectEqual(@as(usize, 42), mutations);
 }

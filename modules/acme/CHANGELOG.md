@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **All three fuzz harnesses were replaying an EMPTY input; each now
+  has a corpus and a measured reach guard.**
+
+  `fuzzParseOrder`, `fuzzParseAuthz` and `fuzzParseCsr` opened with
+  `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes`
+  consumes `min(buf.len, in.len)` octets and a ranged draw then reads eight *more* as
+  a little-endian u64, returning the range minimum when fewer remain — so the drawn
+  length was 0 for every input a seed can carry, and `parseOrder`, `parseAuthz` and
+  `parseCsr` were each handed a zero-length slice while the response sat unread in
+  `buf`. All three now take the bytes in one `smith.slice(&buf)` draw.
+
+  ⛔ The two JSON harnesses are the case where `accepted > 0` would have been a
+  worthless guard: **every member of `OrderJson` and `AuthzJson` has a default**, so
+  `parseOrder("{}")` and `parseAuthz("{}")` both succeed. A corpus of empty objects
+  would have read 100% accepted while never reaching a URL, a status word, the
+  authorization list or a challenge. Each guard therefore pins numbers an empty or
+  defaulted body cannot produce: 10 of 15 order seeds accepted carrying 3
+  authorizations, 48 finalize octets and 7 typed statuses; 9 of 14 authz seeds
+  accepted yielding 5 http-01 challenges, 2 tls-alpn-01 challenges and 47 identifier
+  octets. Non-empty seeds went 0 → 15 and 0 → 14.
+
+  The CSR corpus is built at run time from `csrDer` — this module owns no captured
+  CSR, and a pasted one would freeze a copy of the encoder instead of tracking it —
+  so the harness and its guard build from the same place. 12 seeds, 2 accepted, 3
+  SANs recovered (0/0/0 before). `fuzzParseCsr`'s buffer went 512 → 1024: the two
+  real CSRs measure 232 and 248 octets, which 512 held, but only by about four domain
+  names, and a seed over the buffer reads back empty rather than large.
+
 - **2026-08-22** — **Breaking:** `pemBlockCount` now returns
   `error{LabelTooLong}!usize` instead of `usize`. It carried the same
   `std.debug.assert` precondition `pemDecode` shed on 2026-08-21, and asserts

@@ -650,54 +650,147 @@ test "PersistentState.deserialize rejects a log count the image cannot back" {
 //
 // These could not have been landed before the fix: each one fails on its first
 // input against the old decoders (verified by reverting the guards — see
-// SPEC.md §"Malformed messages"). `smith.bytes` + a length draw covers both the
-// short-input and the hostile-field-value cases, and the buffers are sized past
-// `max_wire` so a well-formed header with a lying count is reachable.
+// SPEC.md §"Malformed messages").
+//
+// ⛔ All five used to open with `smith.bytes(&buf)` followed by a ranged length
+// draw. `bytes` copies `min(buf.len, in.len)` octets and a ranged draw then
+// reads EIGHT more as a little-endian u64, returning the range minimum when
+// fewer remain — so `len` was 0 for every input a corpus can carry and every
+// decoder here was handed an EMPTY slice with the frame sitting unread in
+// `buf`. The paragraph that used to stand here said "`smith.bytes` + a length
+// draw covers both the short-input and the hostile-field-value cases, and the
+// buffers are sized past `max_wire` so a well-formed header with a lying count
+// is reachable". None of that was happening: only the shortest short-input case
+// ran, and the lying-count frame — the out-of-bounds write these guards exist
+// for — was never once built. One `smith.slice(&buf)` draw reads the corpus
+// entry's own length header and hands the bytes over intact.
+
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the wire frames
+/// they are — this module's encoding is little-endian fixed fields, which hex
+/// shows and an escaped byte string hides. A corpus entry is not the frame: the
+/// length draw reads a little-endian `u32` first, so a raw payload would arrive
+/// minus its own first four octets, which here means minus the tag and half the
+/// term. `testkit/src/fuzz.zig` carries the other two hazards.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seedHex;
+
+/// Payload first octets, in the format the length draw reads. `tagOf` reads
+/// exactly one byte, so the corpus is the four defined tags, the boundary
+/// values either side of them, and the empty payload.
+const tag_seeds = [_][]const u8{
+    seed("00"), // request_vote_req
+    seed("01"), // request_vote_resp
+    seed("02"), // append_entries_req
+    seed("03"), // append_entries_resp
+    seed("04"), // one past the last defined tag: InvalidEncoding
+    seed("ff"), // the high end
+    seed("0000000000000000"), // a defined tag with a full buffer behind it
+    seed("03ffffffffffffff"), // the last defined tag, likewise
+    seed(""), // the empty payload: Truncated, and what the collapsed harness ran
+};
 
 test "fuzz: tagOf never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzTagOf, .{});
+    try testing.fuzz({}, fuzzTagOf, .{ .corpus = &tag_seeds });
 }
 
 fn fuzzTagOf(_: void, smith: *std.testing.Smith) !void {
     var buf: [8]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     _ = tagOf(buf[0..len]) catch return;
 }
 
+/// Log entries, in the format the length draw reads: `term(8) kind(1)
+/// command(8)`, little-endian.
+const log_entry_seeds = [_][]const u8{
+    seed("0100000000000000" ++ "00" ++ "2a00000000000000"), // term 1, kind 0, command 42
+    seed("0000000000000000" ++ "01" ++ "0000000000000000"), // the other defined kind
+    seed("ffffffffffffffff" ++ "00" ++ "ffffffffffffffff"), // the u64 extremes in both fields
+    seed("0100000000000000" ++ "02" ++ "0000000000000000"), // the third defined kind, `config`
+    seed("0100000000000000" ++ "03" ++ "0000000000000000"), // ⭐ kind 3: one past the last defined `EntryKind`, which `@enumFromInt` would panic on
+    seed("0100000000000000" ++ "ff" ++ "0000000000000000"), // the high end of the kind octet
+    seed("0100000000000000" ++ "00" ++ "2a000000000000"), // one octet short of `wire_len`
+    seed("0100000000000000" ++ "00" ++ "2a00000000000000" ++ "ff"), // one octet past it: the tail is ignored
+    seed("00"), // a single octet
+    seed(""), // empty: what the collapsed harness ran
+};
+
 test "fuzz: LogEntry.decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzLogEntry, .{});
+    try testing.fuzz({}, fuzzLogEntry, .{ .corpus = &log_entry_seeds });
 }
 
 fn fuzzLogEntry(_: void, smith: *std.testing.Smith) !void {
     var buf: [LogEntry.wire_len * 2]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     _ = LogEntry.decode(buf[0..len]) catch return;
 }
 
+/// RequestVote frames, in the format the length draw reads. Both decoders see
+/// the same bytes, which is why a `RequestVoteResp` frame is also a truncated
+/// `RequestVoteReq` and both are worth having in one corpus.
+const request_vote_seeds = [_][]const u8{
+    seed("00" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000"), // a full RequestVoteReq: term 1, candidate 7
+    seed("00" ++ "ffffffffffffffff" ++ "ffffffff" ++ "ffffffffffffffff" ++ "ffffffffffffffff"), // every field at its maximum
+    seed("01" ++ "0100000000000000" ++ "01"), // a RequestVoteResp granting the vote
+    seed("01" ++ "0100000000000000" ++ "00"), // one refusing it
+    seed("01" ++ "0100000000000000" ++ "ff"), // ⭐ a bool octet that is neither 0 nor 1
+    seed("00" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "01000000000000"), // one octet short of `RequestVoteReq.wire_len`
+    seed("01" ++ "0100000000000000"), // one octet short of `RequestVoteResp.wire_len`
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000"), // the right shape under the WRONG tag
+    seed("00"), // the tag alone
+    seed(""), // empty: what the collapsed harness ran
+};
+
 test "fuzz: RequestVote req/resp decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzRequestVote, .{});
+    try testing.fuzz({}, fuzzRequestVote, .{ .corpus = &request_vote_seeds });
 }
 
 fn fuzzRequestVote(_: void, smith: *std.testing.Smith) !void {
     var buf: [RequestVoteReq.wire_len * 2]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     _ = RequestVoteReq.decode(buf[0..len]) catch {};
     _ = RequestVoteResp.decode(buf[0..len]) catch {};
 }
 
+/// AppendEntries frames. The header is `tag(1) term(8) leader(4) prevIdx(8)
+/// prevTerm(8) leaderCommit(8) count(2)` = 39 octets, then `count` entries of
+/// 17.
+///
+/// ⭐ The lying-count frames are the reason this target exists — a `count` the
+/// payload cannot back is the out-of-bounds write the guards were added for —
+/// and the collapsed draw meant not one of them had ever been built.
+const append_entries_seeds = [_][]const u8{
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0000"), // a heartbeat: a header with no entries
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0100" ++
+        "0400000000000000" ++ "00" ++ "2a00000000000000"), // one entry
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0200" ++
+        "0400000000000000" ++ "00" ++ "2a00000000000000" ++
+        "0500000000000000" ++ "01" ++ "2b00000000000000"), // two entries, both kinds
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0800" ++
+        ("0400000000000000" ++ "00" ++ "2a00000000000000") ** 8), // the full batch: `max_entries_per_msg`
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0900"), // ⭐ a count of 9: one past `max_entries_per_msg`, with no entries behind it
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "ffff"), // ⭐ a count of 65535
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0800" ++
+        ("0400000000000000" ++ "00" ++ "2a00000000000000") ** 3), // ⭐ a count of 8 with only 3 entries behind it: the lying count
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000000000" ++ "0100" ++
+        "0400000000000000" ++ "03" ++ "2a00000000000000"), // an entry with an UNDEFINED kind inside a well-formed batch
+    seed("02" ++ "0100000000000000" ++ "07000000" ++ "0300000000000000" ++ "0100000000000000" ++ "0200000000"), // truncated inside the header
+    seed("03" ++ "0100000000000000" ++ "01" ++ "0500000000000000"), // an AppendEntriesResp: success, match index 5
+    seed("03" ++ "0100000000000000" ++ "00" ++ "0000000000000000"), // one reporting failure
+    seed("03" ++ "0100000000000000" ++ "ff" ++ "0000000000000000"), // ⭐ a bool octet that is neither 0 nor 1
+    seed("03" ++ "0100000000000000" ++ "01"), // one octet short of `AppendEntriesResp.wire_len`
+    seed("02"), // the tag alone
+    seed(""), // empty: what the collapsed harness ran
+};
+
 test "fuzz: AppendEntries req/resp decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzAppendEntries, .{});
+    try testing.fuzz({}, fuzzAppendEntries, .{ .corpus = &append_entries_seeds });
 }
 
 fn fuzzAppendEntries(_: void, smith: *std.testing.Smith) !void {
     // Wider than `max_wire` so a full header plus a lying entry count — the
     // out-of-bounds-write case — is inside the drawn range.
     var buf: [AppendEntriesReq.max_wire + 16]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     var scratch: [max_entries_per_msg]LogEntry = undefined;
     if (AppendEntriesReq.decode(buf[0..len], &scratch)) |req| {
@@ -709,14 +802,37 @@ fn fuzzAppendEntries(_: void, smith: *std.testing.Smith) !void {
     _ = AppendEntriesResp.decode(buf[0..len]) catch {};
 }
 
+/// Persistent-state images: `currentTerm(8) votedFor(4) logLen(4)` then
+/// `logLen` entries of 17.
+///
+/// ⭐ The over-large counts are quoted from this module's own regression test
+/// ("PersistentState.deserialize: a lying entry count is refused before any
+/// allocation"): 1 000 000 entries used to allocate 24 MB and then read past the
+/// buffer, and 0xFFFFFFFF demanded ~103 GB. That test drives `deserialize`
+/// directly; the fuzz harness had never carried either frame, because its
+/// drawn length was 0.
+const persistent_state_seeds = [_][]const u8{
+    seed("0100000000000000" ++ "07000000" ++ "00000000"), // term 1, voted for 7, an empty log
+    seed("0000000000000000" ++ "ffffffff" ++ "00000000"), // `no_vote`
+    seed("0100000000000000" ++ "07000000" ++ "01000000" ++ "0400000000000000" ++ "00" ++ "2a00000000000000"), // one log entry
+    seed("0100000000000000" ++ "07000000" ++ "04000000" ++
+        ("0400000000000000" ++ "00" ++ "2a00000000000000") ** 4), // four entries: the buffer's full width
+    seed("0100000000000000" ++ "07000000" ++ "40420f00"), // ⭐ 1 000 000 entries: the 24 MB over-allocation
+    seed("0100000000000000" ++ "07000000" ++ "ffffffff"), // ⭐ 0xFFFFFFFF entries: ~103 GB demanded
+    seed("0100000000000000" ++ "07000000" ++ "02000000" ++ "0400000000000000" ++ "00" ++ "2a00000000000000"), // ⭐ a count of 2 with one entry behind it
+    seed("0100000000000000" ++ "07000000" ++ "01000000" ++ "0400000000000000" ++ "03" ++ "2a00000000000000"), // an UNDEFINED entry kind inside a valid image
+    seed("0100000000000000" ++ "07000000"), // the header one field short
+    seed("0000000000000000000000000000"), // 14 octets: one short of the header
+    seed(""), // empty: what the collapsed harness ran
+};
+
 test "fuzz: PersistentState.deserialize never panics or over-allocates" {
-    try testing.fuzz({}, fuzzPersistentState, .{});
+    try testing.fuzz({}, fuzzPersistentState, .{ .corpus = &persistent_state_seeds });
 }
 
 fn fuzzPersistentState(_: void, smith: *std.testing.Smith) !void {
     var buf: [PersistentState.header_len + 4 * LogEntry.wire_len]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     // The testing allocator is the guard against the unbounded-count bug: a
     // count the buffer cannot back must be rejected BEFORE `alloc`, so this
@@ -724,4 +840,101 @@ fn fuzzPersistentState(_: void, smith: *std.testing.Smith) !void {
     const st = PersistentState.deserialize(testing.allocator, buf[0..len]) catch return;
     defer testing.allocator.free(st.log);
     std.debug.assert(st.log.len * LogEntry.wire_len <= buf.len);
+}
+
+test "corpus: every raft seed reaches its decoder, and what each accepted is pinned" {
+    // ⭐ One guard for all five targets, because they share one failure and one
+    // measurement. `tagOf` is the only one where acceptance is discriminating
+    // on its own; for the rest the pinned second number is what the decode
+    // PRODUCED — entries walked, log entries deserialized — because a
+    // header-only frame is a perfectly legal AppendEntries heartbeat and a
+    // zero-length log is a perfectly legal persistent state. A corpus of those
+    // would score full marks on "accepted" while never entering the entry loop,
+    // which is where the out-of-bounds write these guards exist for lives.
+    //
+    // Measured 2026-09-07 — every counter below was 0 before the draws were
+    // fixed, because every decoder saw `""`: `tagOf` refuses the empty payload,
+    // and so does every other decoder here. After: 9/9/10/15/11 seeds non-empty
+    // (minus the one deliberately empty seed in each corpus), 6 tags, 5 log
+    // entries, 2 RequestVoteReq and 6 RequestVoteResp, 4 AppendEntriesReq
+    // carrying 11 entries and 12 AppendEntriesResp, 4 persistent-state images
+    // carrying 5 log entries.
+    var tag_nonempty: usize = 0;
+    var tags: usize = 0;
+    for (tag_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [8]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) tag_nonempty += 1;
+        if (tagOf(buf[0..len])) |_| tags += 1 else |_| {}
+    }
+    try testing.expectEqual(tag_seeds.len - 1, tag_nonempty);
+    try testing.expectEqual(@as(usize, 6), tags);
+
+    var entry_nonempty: usize = 0;
+    var entries: usize = 0;
+    for (log_entry_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [LogEntry.wire_len * 2]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) entry_nonempty += 1;
+        if (LogEntry.decode(buf[0..len])) |_| entries += 1 else |_| {}
+    }
+    try testing.expectEqual(log_entry_seeds.len - 1, entry_nonempty);
+    try testing.expectEqual(@as(usize, 5), entries);
+
+    var rv_nonempty: usize = 0;
+    var rv_reqs: usize = 0;
+    var rv_resps: usize = 0;
+    for (request_vote_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [RequestVoteReq.wire_len * 2]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) rv_nonempty += 1;
+        if (RequestVoteReq.decode(buf[0..len])) |_| rv_reqs += 1 else |_| {}
+        if (RequestVoteResp.decode(buf[0..len])) |_| rv_resps += 1 else |_| {}
+    }
+    try testing.expectEqual(request_vote_seeds.len - 1, rv_nonempty);
+    try testing.expectEqual(@as(usize, 2), rv_reqs);
+    try testing.expectEqual(@as(usize, 6), rv_resps);
+
+    var ae_nonempty: usize = 0;
+    var ae_reqs: usize = 0;
+    var ae_entries_walked: usize = 0;
+    var ae_resps: usize = 0;
+    for (append_entries_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [AppendEntriesReq.max_wire + 16]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) ae_nonempty += 1;
+        var scratch: [max_entries_per_msg]LogEntry = undefined;
+        if (AppendEntriesReq.decode(buf[0..len], &scratch)) |req| {
+            ae_reqs += 1;
+            ae_entries_walked += req.entries.len;
+        } else |_| {}
+        if (AppendEntriesResp.decode(buf[0..len])) |_| ae_resps += 1 else |_| {}
+    }
+    try testing.expectEqual(append_entries_seeds.len - 1, ae_nonempty);
+    try testing.expectEqual(@as(usize, 4), ae_reqs);
+    // The number a heartbeat-only corpus cannot produce.
+    try testing.expectEqual(@as(usize, 11), ae_entries_walked);
+    try testing.expectEqual(@as(usize, 12), ae_resps);
+
+    var ps_nonempty: usize = 0;
+    var ps_images: usize = 0;
+    var ps_entries: usize = 0;
+    for (persistent_state_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [PersistentState.header_len + 4 * LogEntry.wire_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) ps_nonempty += 1;
+        const st = PersistentState.deserialize(testing.allocator, buf[0..len]) catch continue;
+        defer testing.allocator.free(st.log);
+        ps_images += 1;
+        ps_entries += st.log.len;
+    }
+    try testing.expectEqual(persistent_state_seeds.len - 1, ps_nonempty);
+    try testing.expectEqual(@as(usize, 4), ps_images);
+    // Likewise: an empty log is a legal image, so this is the reach number.
+    try testing.expectEqual(@as(usize, 5), ps_entries);
 }

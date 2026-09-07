@@ -5,6 +5,38 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **All three fuzz harnesses were replaying an EMPTY input, and the
+  API-key one had never run its query branch at all.**
+
+  `fuzzBearerToken`, `fuzzApiKeyPresented` and `fuzzQueryValue` opened with
+  `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes`
+  consumes `min(buf.len, in.len)` octets and a ranged draw then reads eight *more* as
+  a little-endian u64, returning the range minimum when fewer remain — so the drawn
+  length was 0 for every input a seed can carry and each extractor was handed a
+  zero-length slice while the header block sat unread in `buf`.
+
+  ⛔ `fuzzApiKeyPresented` was worse than the other two. It drew `len` and then drew
+  `split` from a range bounded by `len`, so with `len == 0` **both** the header block
+  and the query string were empty — and `apiKeyPresented`'s query branch, half of what
+  the function does and the half the harness exists to compare against the header,
+  had never executed once. A corpus alone would not have fixed that: a knob drawn
+  after the byte draw reads an exhausted input and returns its range minimum for ever.
+  The split now comes from the bytes themselves — a US octet (0x1F), which is not
+  legal in a header block or a query string — so a seed spells out where it divides
+  and `--fuzz` still drives it.
+
+  Each harness now takes its bytes in one `smith.slice(&buf)` draw and has a corpus
+  with a guard test in the ordinary lane pinning measured numbers: 19 header blocks,
+  8 bearer tokens found, 37 credential octets; 18 combined seeds, 12 API keys found,
+  **6 from the header side and 6 from the query side**; 16 query strings, 10 hits,
+  239 value octets. Non-empty seeds went 0 → 19 / 0 → 18 / 0 → 16 and every counter
+  went from 0.
+
+  These three extractors return an optional rather than an error, so there is no
+  "accepted" to count and `accepted > 0` was never available as a guard. The octet
+  counts are the discriminating half: `api_key=` is a *hit* with a zero-length value,
+  so a corpus of empty values would score full marks on hits while returning no octets.
+
 - **2026-08-18** — Portability fix (`check-portable`): `Throttle.decide`'s two
   `@fieldParentPtr("node", ...)` recoveries of `*Entry` from the intrusive
   `std.DoublyLinkedList.Node` failed to compile on a 32-bit target — `Entry.last_ns`/

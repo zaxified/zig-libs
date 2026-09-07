@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Offline anchor: our own encoder, forced to the same (version, ecc, mode,
-//! mask) as `reference.py`'s `segno` cases, must reproduce the module grid
+//! mask) as `tools/reference.py`'s `segno` cases, must reproduce the module grid
 //! segno produced -- checked against bytes segno already produced, captured
 //! once into `testdata/golden_matrices.zig` and committed. No python3, no
 //! subprocess: these tests run everywhere, including CI, which never has
@@ -20,7 +20,7 @@
 //! `SPEC.md` used to describe exactly this kind of comparison ("672
 //! matrices... byte-identical", "320 matrices... byte-identical") with zero
 //! test code behind either number -- see the module's CHANGELOG for the
-//! 2026-08-18 entry that corrected the claim. This file, `reference.py` and
+//! 2026-08-18 entry that corrected the claim. This file, `tools/reference.py` and
 //! `testdata/golden_matrices.zig` are what make the claim real.
 
 const std = @import("std");
@@ -28,7 +28,7 @@ const testing = std.testing;
 const qr = @import("root.zig");
 const golden = @import("testdata/golden_matrices.zig");
 
-/// Pack `m`'s modules the same way `reference.py`'s `pack_rows` does:
+/// Pack `m`'s modules the same way `tools/reference.py`'s `pack_rows` does:
 /// row-major, MSB-first, each row starting a fresh byte -- a description of
 /// the module grid, not of `Matrix`'s internal bit layout, so this stays
 /// meaningful even if that layout changes.
@@ -88,7 +88,7 @@ test "golden: our encoder reproduces segno's module grid, byte-exact, no python 
 
 // ── count canary ─────────────────────────────────────────────────────────
 //
-// Guards against `reference.py`'s CASES and this file silently drifting:
+// Guards against `tools/reference.py`'s CASES and this file silently drifting:
 // 10 versions x 4 ECC levels (the "spread" set) + 8 masks (the "masks" set)
 // + 3 modes (the "modes" set) = 51. A regeneration run that silently
 // produced fewer entries than intended (e.g. an early return in `dump()`)

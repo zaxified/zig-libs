@@ -1078,10 +1078,52 @@ test "order/authz JSON parsing tolerates unknown fields, rejects junk" {
     try testing.expectError(error.MalformedResponse, parseAuthz(a, "<html>oops</html>"));
 }
 
+// ── fuzz: the CA's two JSON response decoders ──────────────────────
+//
+// ⚠ Both harnesses used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain -- so `len` was 0 for
+// every input a corpus can carry and both decoders were handed an EMPTY body
+// while the response sat unread in `buf`. One `slice` draw reads the corpus
+// entry's own length header and hands the bytes over intact.
+
+/// `testkit.fuzz.seed`, aliased so the corpora below read as the CA responses
+/// they are. A corpus entry is not the frame: the length draw reads a
+/// little-endian `u32` first, so a raw body would arrive minus its own first
+/// four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// Order responses (RFC 8555 §7.1.3), in the format the length draw reads.
+///
+/// ⚠ Every member of `OrderJson` has a default, so `parseOrder("{}")`
+/// SUCCEEDS. That is why the guard below cannot use acceptance as its measure
+/// of reach, and it is the reason a `{}` seed is in the corpus on purpose.
+const order_seeds = [_][]const u8{
+    seed("{\"status\":\"pending\",\"authorizations\":[\"https://ca/authz/1\",\"https://ca/authz/2\"],\"finalize\":\"https://ca/finalize/9\"}"), // the ordinary pending order
+    seed("{\"status\":\"valid\",\"finalize\":\"https://ca/finalize/9\",\"certificate\":\"https://ca/cert/9\"}"), // the issued order: `certificate` present
+    seed("{\"status\":\"ready\",\"authorizations\":[],\"finalize\":\"f\"}"), // ready with nothing left to validate
+    seed("{\"status\":\"invalid\",\"finalize\":\"f\"}"), // the state `pollOrder` turns into `error.OrderFailed`
+    seed("{\"status\":\"processing\",\"finalize\":\"f\",\"certificate\":null}"), // an explicit null certificate
+    seed("{\"status\":\"deactivated\",\"finalize\":\"\"}"), // a status `pollOrder` refuses as MalformedResponse
+    seed("{\"status\":\"brand-new-state\",\"finalize\":\"f\"}"), // an unregistered status maps to `.unknown`, not an error
+    seed("{\"finalize\":\"f\",\"unknownExtension\":{\"a\":[1,2]}}"), // ignore_unknown_fields, and no `status` at all
+    seed("{\"status\":\"pending\",\"authorizations\":[\"" ++ ("a" ** 200) ++ "\"],\"finalize\":\"f\"}"), // a very long authorization URL
+    seed("{}"), // ⚠ a legal order response: every member defaults
+    seed("{\"status\":42}"), // a wrong-typed member
+    seed("{\"authorizations\":\"not-a-list\"}"), // a wrong-typed list
+    seed("[1,2"), // truncated JSON
+    seed("<html>oops</html>"), // an HTML error page where JSON was promised
+    seed("null"), // valid JSON, wrong top-level type
+};
+
+test "fuzz: parseOrder never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseOrder, .{ .corpus = &order_seeds });
+}
+
 fn fuzzParseOrder(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     // The CA's order-response JSON decoder: arbitrary bytes must only ever
@@ -1089,14 +1131,67 @@ fn fuzzParseOrder(_: void, smith: *std.testing.Smith) !void {
     _ = parseOrder(arena.allocator(), buf[0..len]) catch return;
 }
 
-test "fuzz: parseOrder never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseOrder, .{});
+test "corpus: every order seed reaches parseOrder, and what it extracted is pinned" {
+    // ⛔ `accepted > 0` would be a lie here, and it is worth spelling out
+    // why: every member of `OrderJson` has a default, so `parseOrder("{}")`
+    // succeeds. A corpus of fifteen empty objects would score 15 of 15
+    // "accepted" while never once reaching a URL, a status word or the
+    // authorization list. The numbers only a real body can produce are the
+    // authorizations collected and the finalize octets; those are pinned.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var authorizations: usize = 0;
+    var finalize_octets: usize = 0;
+    var typed_statuses: usize = 0;
+    for (order_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const order = parseOrder(arena.allocator(), buf[0..len]) catch continue;
+        accepted += 1;
+        authorizations += order.authorizations.len;
+        finalize_octets += order.finalize.len;
+        if (order.status != .unknown) typed_statuses += 1;
+    }
+    try testing.expectEqual(order_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 15 seeds non-empty before the draw was fixed,
+    // and `parseOrder("")` is `error.MalformedResponse`, so every counter was 0.
+    try testing.expectEqual(@as(usize, 10), accepted);
+    try testing.expectEqual(@as(usize, 3), authorizations);
+    try testing.expectEqual(@as(usize, 48), finalize_octets);
+    try testing.expectEqual(@as(usize, 7), typed_statuses);
+}
+
+/// Authorization responses (RFC 8555 §7.1.4), in the format the length draw
+/// reads. Same warning as the orders: `parseAuthz("{}")` succeeds, so the
+/// discriminating numbers are the challenges actually matched.
+const authz_seeds = [_][]const u8{
+    seed("{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"x.example\"},\"challenges\":[{\"type\":\"dns-01\",\"url\":\"u7\",\"token\":\"ddd\"},{\"type\":\"http-01\",\"url\":\"u8\",\"token\":\"ttt\",\"status\":\"pending\"}]}"), // http-01 found past a dns-01 the client ignores
+    seed("{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"y.example\"},\"challenges\":[{\"type\":\"tls-alpn-01\",\"url\":\"u9\",\"token\":\"aaa\"}]}"), // the TLS-ALPN-01 branch
+    seed("{\"status\":\"valid\",\"identifier\":{\"type\":\"dns\",\"value\":\"z.example\"},\"challenges\":[{\"type\":\"http-01\",\"url\":\"u\",\"token\":\"t\"},{\"type\":\"tls-alpn-01\",\"url\":\"v\",\"token\":\"s\"}]}"), // both challenge types offered
+    seed("{\"status\":\"pending\",\"challenges\":[{\"type\":\"http-01\",\"url\":\"a\",\"token\":\"1\"},{\"type\":\"http-01\",\"url\":\"b\",\"token\":\"2\"}]}"), // duplicate http-01: the FIRST wins
+    seed("{\"status\":\"pending\",\"challenges\":[]}"), // no challenges at all: both stay null
+    seed("{\"status\":\"invalid\",\"identifier\":{\"type\":\"dns\",\"value\":\"bad.example\"},\"challenges\":[{\"type\":\"http-01\",\"url\":\"u\",\"token\":\"\"}]}"), // an EMPTY token from the CA
+    seed("{\"identifier\":{\"type\":\"ip\",\"value\":\"192.0.2.1\"},\"challenges\":[{\"type\":\"http-01\",\"url\":\"u\",\"token\":\"t\"}]}"), // an identifier type this client does not order
+    seed("{\"status\":\"pending\",\"challenges\":[{\"type\":\"HTTP-01\",\"url\":\"u\",\"token\":\"t\"}]}"), // the type match is case-SENSITIVE: no challenge found
+    seed("{}"), // ⚠ a legal authorization response: every member defaults
+    seed("{\"challenges\":{}}"), // a wrong-typed challenge list
+    seed("{\"challenges\":[{\"type\":42}]}"), // a wrong-typed member inside a challenge
+    seed("{\"identifier\":\"x.example\"}"), // identifier is a string, not an object
+    seed("<html>oops</html>"), // an HTML error page where JSON was promised
+    seed("[1,2"), // truncated JSON
+};
+
+test "fuzz: parseAuthz never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseAuthz, .{ .corpus = &authz_seeds });
 }
 
 fn fuzzParseAuthz(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     // The CA's authorization-response JSON decoder: same contract as
@@ -1104,8 +1199,36 @@ fn fuzzParseAuthz(_: void, smith: *std.testing.Smith) !void {
     _ = parseAuthz(arena.allocator(), buf[0..len]) catch return;
 }
 
-test "fuzz: parseAuthz never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseAuthz, .{});
+test "corpus: every authz seed reaches parseAuthz, and the challenges matched are pinned" {
+    // Same trap as the orders, same answer: `{}` is a legal authorization, so
+    // the pinned numbers are the challenges this client actually recognised and
+    // the identifier octets it read out -- neither of which an empty or default
+    // body can produce.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var http01_found: usize = 0;
+    var tls_alpn01_found: usize = 0;
+    var identifier_octets: usize = 0;
+    for (authz_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const authz = parseAuthz(arena.allocator(), buf[0..len]) catch continue;
+        accepted += 1;
+        if (authz.http01 != null) http01_found += 1;
+        if (authz.tls_alpn01 != null) tls_alpn01_found += 1;
+        identifier_octets += authz.identifier.len;
+    }
+    try testing.expectEqual(authz_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 14 seeds non-empty and every counter 0 before
+    // the draw was fixed.
+    try testing.expectEqual(@as(usize, 9), accepted);
+    try testing.expectEqual(@as(usize, 5), http01_found);
+    try testing.expectEqual(@as(usize, 2), tls_alpn01_found);
+    try testing.expectEqual(@as(usize, 47), identifier_octets);
 }
 
 test "Responder: set/lookup/remove semantics under copies" {

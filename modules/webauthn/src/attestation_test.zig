@@ -425,26 +425,74 @@ const X5cMode = enum {
 const fuzz_formats = [_][]const u8{ "packed", "fido-u2f", "none", "tpm", "android-key", "" };
 const fuzz_algs = [_]i64{ -7, -8, -257, -65535, 0, 1 };
 
-/// One hostile attestationObject, assembled from the fuzzer's bytes and run
-/// through `verifyAttestation`. The contract is "never panics": any typed
-/// error is a fine outcome, an abort is not.
-fn fuzzVerifyAttestation(_: void, smith: *std.testing.Smith) !void {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+/// `testkit.fuzz.Cursor` over one corpus seed: the script that drives both
+/// harnesses in this file.
+///
+/// ⚠ It is here because both of them took every choice from a ranged `Smith`
+/// draw and their FIRST draw was one, which `check-fuzz-reach` classifies R1. A
+/// scalar draw reads eight octets as a little-endian `u64` and returns the range
+/// MINIMUM unless the whole word falls inside the range, and after the first
+/// short read `Smith` discards the rest of the input -- so outside `--fuzz`
+/// EVERY choice collapsed to its minimum. Measured on `fuzzVerifyAttestation`:
+/// `fmt` was always "packed", `alg` always -7, the x5c mode always `.absent`,
+/// `raw_len` always 0, `sig_len` always 0 and the authData mode always 0. One
+/// attestation object, built once, for the life of the harness -- and the
+/// `.der_framed`, `.real_truncated` and `.real_mutated` certificate paths,
+/// which are the only reason the neighbouring reachability test exists, had
+/// never been taken by the harness itself.
+///
+/// Neither target was exempted. A harness that assembles a structure from a
+/// list of choices has an obvious byte-first form: one `smith.slice`, then the
+/// octets say what gets built. It also makes a seed reviewable, which a
+/// sequence of `u64` words is not. Under `--fuzz` the fuzzer still drives every
+/// choice, because it drives the slice.
+const Script = @import("testkit").fuzz.Cursor;
+const seed = @import("testkit").fuzz.seedHex;
+
+/// What one attestation script produced, so the guard can measure the corpus
+/// rather than assert it merely ran.
+const AttestationOutcome = struct {
+    /// Distinct `fmt` strings the script selected.
+    fmt_index: usize = 0,
+    /// Which `X5cMode` it selected.
+    mode: X5cMode = .absent,
+    /// Octets of `x5c` handed to `verifyAttestation` (0 when absent).
+    x5c_octets: usize = 0,
+    /// Octets of attestation signature.
+    sig_octets: usize = 0,
+    /// Octets of authData.
+    auth_data_octets: usize = 0,
+};
+
+/// The body of `fuzzVerifyAttestation`, factored out so the harness and the
+/// corpus guard drive the SAME assembly from the same octets. A guard measuring
+/// a different sequence from the one the harness runs is not a guard.
+///
+/// The layout the cursor reads is
+/// `fmt, alg, x5cMode, rawLen(2), sigLen, authDataMode, certOffset(2)`,
+/// followed by the octets that fill `raw`, the signature and the client-data
+/// hash. A short script cycles rather than running out.
+fn runAttestationScript(a: std.mem.Allocator, bytes: []const u8) !AttestationOutcome {
+    var s = Script{ .bytes = bytes };
+    var out: AttestationOutcome = .{};
 
     const real_cert = try realX5c(a, &vectors.packed_es256_full.attestation_object);
     const real_auth_data = try extractAuthDataRaw(a, &vectors.none_es256.attestation_object);
 
-    const fmt = fuzz_formats[smith.index(fuzz_formats.len)];
-    const alg = fuzz_algs[smith.index(fuzz_algs.len)];
-    const mode: X5cMode = @enumFromInt(smith.valueRangeAtMost(u8, 0, @typeInfo(X5cMode).@"enum".fields.len - 1));
+    out.fmt_index = s.byte() % fuzz_formats.len;
+    const fmt = fuzz_formats[out.fmt_index];
+    const alg = fuzz_algs[s.byte() % fuzz_algs.len];
+    out.mode = @enumFromInt(s.byte() % @typeInfo(X5cMode).@"enum".fields.len);
 
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+    const raw_len: usize = s.word() % (raw.len + 1);
+    const sig_len: usize = s.byte() % 129;
+    const auth_mode: u8 = s.byte() % 3;
+    const cert_offset: usize = s.word() % (real_cert.len + 1);
+    const mutate_at: usize = s.word();
+    for (&raw) |*b| b.* = s.byte();
 
-    const x5c: ?[]const u8 = switch (mode) {
+    const x5c: ?[]const u8 = switch (out.mode) {
         .absent => null,
         .raw => raw[0..raw_len],
         .der_framed => blk: {
@@ -458,30 +506,32 @@ fn fuzzVerifyAttestation(_: void, smith: *std.testing.Smith) !void {
             @memcpy(framed[4..], body);
             break :blk framed;
         },
-        .real_truncated => real_cert[0..smith.valueRangeAtMost(u16, 0, @intCast(real_cert.len))],
+        .real_truncated => real_cert[0..cert_offset],
         .real_mutated => blk: {
             const mutant = try a.dupe(u8, real_cert);
-            mutant[smith.index(mutant.len)] = raw[0];
+            mutant[mutate_at % mutant.len] = raw[0];
             break :blk mutant;
         },
     };
+    out.x5c_octets = if (x5c) |c| c.len else 0;
 
     var sig_buf: [128]u8 = undefined;
-    smith.bytes(&sig_buf);
-    const sig_len: usize = smith.valueRangeAtMost(u8, 0, sig_buf.len);
+    for (&sig_buf) |*b| b.* = s.byte();
+    out.sig_octets = sig_len;
 
     // authData: the real §16 blob (so the attested-credential-data parse
     // succeeds and the run gets as far as the attestation statement), or the
     // real blob with one fuzzed byte, or pure entropy.
-    const auth_data: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+    const auth_data: []const u8 = switch (auth_mode) {
         0 => real_auth_data,
         1 => blk: {
             const mutant = try a.dupe(u8, real_auth_data);
-            mutant[smith.index(mutant.len)] = raw[raw.len - 1];
+            mutant[mutate_at % mutant.len] = raw[raw.len - 1];
             break :blk mutant;
         },
         else => raw[0..raw_len],
     };
+    out.auth_data_octets = auth_data.len;
 
     const built = try buildAttestationObject(a, .{
         .fmt = fmt,
@@ -492,16 +542,104 @@ fn fuzzVerifyAttestation(_: void, smith: *std.testing.Smith) !void {
     });
 
     var hash: [32]u8 = undefined;
-    smith.bytes(&hash);
+    for (&hash) |*b| b.* = s.byte();
 
     // Two entry points: the assembled object, and — so the CBOR framing itself
-    // is fuzzed and not only its fields — the fuzzer's raw bytes.
+    // is fuzzed and not only its fields — the raw script bytes.
     _ = webauthn.verifyAttestation(a, built, hash) catch {};
     _ = webauthn.verifyAttestation(a, raw[0..raw_len], hash) catch {};
+    return out;
 }
 
+/// Attestation scripts. The layout is
+/// `fmt, alg, x5cMode, rawLen(2), sigLen, authDataMode, certOffset(2),
+/// mutateAt(2)`, then filler. `fmt` indexes `fuzz_formats`
+/// (0 packed · 1 fido-u2f · 2 none · 3 tpm · 4 android-key · 5 empty), `alg`
+/// indexes `fuzz_algs` (0 ES256 · 1 EdDSA · 2 RS256 · 3 bogus · 4 zero ·
+/// 5 one) and `x5cMode` indexes `X5cMode`
+/// (0 absent · 1 raw · 2 der_framed · 3 real_truncated · 4 real_mutated).
+const attestation_seeds = [_][]const u8{
+    seed("0200" ++ "00" ++ "0000" ++ "00" ++ "00" ++ "0000" ++ "0000"), // fmt none, no x5c, no sig, the real authData: the shape that VERIFIES
+    seed("0000" ++ "00" ++ "0000" ++ "40" ++ "00" ++ "0000" ++ "0000"), // fmt packed, self-attestation shape, a 64-octet signature
+    seed("0000" ++ "04" ++ "0000" ++ "40" ++ "00" ++ "0000" ++ "0000"), // ⭐ packed with a REAL certificate, one byte mutated: `.real_mutated`
+    seed("0000" ++ "03" ++ "0000" ++ "40" ++ "00" ++ "0190" ++ "0000"), // ⭐ packed with the real certificate truncated at 400: `.real_truncated`
+    seed("0000" ++ "02" ++ "0040" ++ "40" ++ "00" ++ "0000" ++ "0000"), // ⭐ packed with 64 script octets inside a DER SEQUENCE header: `.der_framed`
+    seed("0000" ++ "01" ++ "0100" ++ "40" ++ "00" ++ "0000" ++ "0000"), // packed with 256 raw script octets where a certificate belongs
+    seed("0100" ++ "04" ++ "0000" ++ "40" ++ "00" ++ "0000" ++ "0000"), // fido-u2f with a real mutated certificate
+    seed("0300" ++ "00" ++ "0000" ++ "00" ++ "00" ++ "0000" ++ "0000"), // fmt tpm: the DEFER-as-unsupported path
+    seed("0400" ++ "00" ++ "0000" ++ "00" ++ "00" ++ "0000" ++ "0000"), // fmt android-key: the same
+    seed("0500" ++ "00" ++ "0000" ++ "00" ++ "00" ++ "0000" ++ "0000"), // an EMPTY fmt string
+    seed("0003" ++ "04" ++ "0000" ++ "40" ++ "00" ++ "0000" ++ "0000"), // an unregistered COSE algorithm with a real certificate
+    seed("0004" ++ "00" ++ "0000" ++ "00" ++ "01" ++ "0000" ++ "0000"), // alg 0, and the real authData with one octet mutated
+    seed("0002" ++ "00" ++ "0000" ++ "00" ++ "02" ++ "0000" ++ "0000"), // RS256, and authData that is pure script entropy
+    seed("0000" ++ "01" ++ "0200" ++ "80" ++ "02" ++ "0000" ++ "0000"), // the maxima: 512 raw octets, a 128-octet signature, entropy authData
+    seed("00"), // one octet, cycled: the degenerate script
+    seed(""), // the empty script: exactly what the collapsed harness ran
+};
+
 test "fuzz: verifyAttestation never panics on a hostile attestationObject" {
-    try std.testing.fuzz({}, fuzzVerifyAttestation, .{});
+    try std.testing.fuzz({}, fuzzVerifyAttestation, .{ .corpus = &attestation_seeds });
+}
+
+fn fuzzVerifyAttestation(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var script: [1024]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runAttestationScript(arena.allocator(), script[0..n]);
+}
+
+test "corpus: every attestation script builds a distinct object, and what it built is pinned" {
+    // ⭐ Not "accepted", and not a total: the numbers are how many DISTINCT
+    // fmt strings and x5c modes the corpus reached, because that is exactly
+    // what collapsed. The old harness reached 1 and 1 — "packed" and
+    // `.absent`, for ever — while the reachability test beside it separately
+    // proved the certificate paths were reachable IF something drove them.
+    // Nothing did.
+    //
+    // ⚠ There is deliberately no "verified" column. `buildAttestationObject`
+    // always writes an `attStmt` carrying `alg` and `sig`, and WebAuthn §8.7
+    // requires `none` to carry an EMPTY one — so nothing this harness assembles
+    // can ever verify, whatever the script says. That is a property of the
+    // builder, not a gap in the corpus, and pinning a 0 for it would read like
+    // a measurement when it is a tautology. The octet columns are the reach:
+    // `x5c_octets` can only be non-zero when a script drives one of the four
+    // certificate modes, and `auth_data_octets` only when authData is assembled
+    // rather than left at its collapsed default.
+    var nonempty: usize = 0;
+    var fmts_seen = [_]bool{false} ** fuzz_formats.len;
+    var modes_seen = [_]bool{false} ** @typeInfo(X5cMode).@"enum".fields.len;
+    var x5c_octets: usize = 0;
+    var auth_data_octets: usize = 0;
+    for (attestation_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [1024]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const out = try runAttestationScript(arena.allocator(), script[0..n]);
+        fmts_seen[out.fmt_index] = true;
+        modes_seen[@intFromEnum(out.mode)] = true;
+        x5c_octets += out.x5c_octets;
+        auth_data_octets += out.auth_data_octets;
+    }
+    var fmts: usize = 0;
+    for (fmts_seen) |b| {
+        if (b) fmts += 1;
+    }
+    var modes: usize = 0;
+    for (modes_seen) |b| {
+        if (b) modes += 1;
+    }
+    // One seed is deliberately the empty script.
+    try testing.expectEqual(attestation_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: 1 fmt, 1 mode and 0 x5c octets before the draws
+    // were restructured — every seed produced the same object.
+    try testing.expectEqual(fuzz_formats.len, fmts);
+    try testing.expectEqual(@typeInfo(X5cMode).@"enum".fields.len, modes);
+    try testing.expectEqual(@as(usize, 2883), x5c_octets);
+    try testing.expectEqual(@as(usize, 2808), auth_data_octets);
 }
 
 test "the attestation fuzz harness reaches the certificate parser (reachability)" {
@@ -839,23 +977,43 @@ const fuzz_origins = [_][]const u8{ "https://example.org", "https://example.org.
 /// fuzzer built. Any run that returns a result and fails one of these
 /// comparisons is a mis-binding — the class of defect that verifies rather
 /// than crashes.
-fn fuzzRegistrationBinding(_: void, smith: *std.testing.Smith) !void {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+/// The body of `fuzzRegistrationBinding`, factored out so the harness and the
+/// corpus guard drive the SAME ceremony from the same octets.
+///
+/// ⚠ Every choice here used to be a ranged `Smith` draw and the FIRST one
+/// was `smith.index(AllVectors.count)`, which `check-fuzz-reach` classifies R1.
+/// Outside `--fuzz` all of them collapsed to their minimum: vector 0, client
+/// data mode 0, `rp_id` = `"example.com"`, the expected challenge a
+/// ZERO-LENGTH slice, origin index 0, and both `require_*` flags false.
+///
+/// ⛔ And that combination does not verify. `verifyRegistration` refused it,
+/// the `catch return` fired, and every assertion after it — the §7.1 binding
+/// this harness exists to prove — had never executed. An oracle-on-success
+/// harness that never succeeds is green for ever. The measurement is pinned in
+/// "the collapsed registration harness never reached its own oracle" below.
+///
+/// The layout the cursor reads is `vector, clientDataMode, chalLen, type,
+/// origin, rpId, expectedChallengeMode, expectedChallengeVector,
+/// expectedOrigin, requireUV, requireAttestation`, then filler for the
+/// challenge bytes. A short script cycles rather than running out.
+fn runRegistrationScript(a: std.mem.Allocator, bytes: []const u8) !RegistrationOutcome {
+    var s = Script{ .bytes = bytes };
+    var out: RegistrationOutcome = .{};
 
-    const vi = smith.index(AllVectors.count);
+    const vi = s.byte() % AllVectors.count;
+    out.vector = vi;
+    out.client_data_mode = s.byte() % 4;
 
     // clientDataJSON: the ceremony's own, another ceremony's, the *assertion*
-    // ceremony's, or one assembled field by field from the fuzzer's choices.
-    const client_data_json: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+    // ceremony's, or one assembled field by field from the script's choices.
+    const client_data_json: []const u8 = switch (out.client_data_mode) {
         0 => AllVectors.registrationClientData(vi),
-        1 => AllVectors.registrationClientData(smith.index(AllVectors.count)),
+        1 => AllVectors.registrationClientData(s.byte() % AllVectors.count),
         2 => AllVectors.assertionClientData(vi),
         else => blk: {
             var chal_raw: [32]u8 = undefined;
-            smith.bytes(&chal_raw);
-            const chal_len: usize = smith.valueRangeAtMost(u8, 0, chal_raw.len);
+            const chal_len: usize = s.byte() % (chal_raw.len + 1);
+            for (&chal_raw) |*b| b.* = s.byte();
             const enc = std.base64.url_safe_no_pad.Encoder;
             const chal_b64 = try a.alloc(u8, enc.calcSize(chal_len));
             _ = enc.encode(chal_b64, chal_raw[0..chal_len]);
@@ -863,33 +1021,42 @@ fn fuzzRegistrationBinding(_: void, smith: *std.testing.Smith) !void {
                 a,
                 "{{\"type\":\"{s}\",\"challenge\":\"{s}\",\"origin\":\"{s}\",\"crossOrigin\":false}}",
                 .{
-                    fuzz_types[smith.index(fuzz_types.len)],
+                    fuzz_types[s.byte() % fuzz_types.len],
                     chal_b64,
-                    fuzz_origins[smith.index(fuzz_origins.len)],
+                    fuzz_origins[s.byte() % fuzz_origins.len],
                 },
             );
         },
     };
 
+    out.right_rp_id = s.byte() % 2 == 0;
+    const use_real_challenge = s.byte() % 2 == 0;
+    const challenge_vector = s.byte() % AllVectors.count;
+    const raw_challenge_len = s.byte() % 33;
     var expected_challenge_raw: [32]u8 = undefined;
-    smith.bytes(&expected_challenge_raw);
+    for (&expected_challenge_raw) |*b| b.* = s.byte();
+    out.origin_index = s.byte() % fuzz_origins.len;
+
     const options: webauthn.RegistrationOptions = .{
-        .rp_id = if (smith.value(bool)) vectors.rp_id else "example.com",
-        .expected_challenge = if (smith.value(bool))
-            AllVectors.challenge(smith.index(AllVectors.count))
+        .rp_id = if (out.right_rp_id) vectors.rp_id else "example.com",
+        .expected_challenge = if (use_real_challenge)
+            AllVectors.challenge(challenge_vector)
         else
-            expected_challenge_raw[0..smith.valueRangeAtMost(u8, 0, 32)],
-        .expected_origin = fuzz_origins[smith.index(fuzz_origins.len)],
-        .require_user_verification = smith.value(bool),
-        .require_attestation = smith.value(bool),
+            expected_challenge_raw[0..raw_challenge_len],
+        .expected_origin = fuzz_origins[out.origin_index],
+        .require_user_verification = s.byte() % 2 == 0,
+        .require_attestation = s.byte() % 2 == 0,
     };
+    out.require_uv = options.require_user_verification;
+    out.require_attestation = options.require_attestation;
 
     const result = webauthn.verifyRegistration(
         a,
         AllVectors.attestationObject(vi),
         client_data_json,
         options,
-    ) catch return;
+    ) catch return out;
+    out.accepted = true;
 
     // It verified. Then all of this must hold.
     const cd = try webauthn.parseClientData(a, client_data_json);
@@ -903,10 +1070,176 @@ fn fuzzRegistrationBinding(_: void, smith: *std.testing.Smith) !void {
     try testing.expect(result.flags.user_present);
     if (options.require_user_verification) try testing.expect(result.flags.user_verified);
     if (options.require_attestation) try testing.expect(result.attestation_type != .none);
+    return out;
 }
 
+/// What one registration script chose and what came of it.
+const RegistrationOutcome = struct {
+    vector: usize = 0,
+    client_data_mode: u8 = 0,
+    origin_index: usize = 0,
+    right_rp_id: bool = false,
+    require_uv: bool = false,
+    require_attestation: bool = false,
+    accepted: bool = false,
+};
+
+/// Registration scripts. The layout is `vector, clientDataMode, [chalLen, type,
+/// origin]*, rpId, challengeMode, challengeVector, rawChalLen, chal(32),
+/// expectedOrigin, requireUV, requireAttestation`. `clientDataMode` is
+/// 0 own · 1 another ceremony's · 2 the ASSERTION ceremony's · 3 assembled;
+/// even octets mean "the right one" for the boolean knobs.
+const registration_seeds = [_][]const u8{
+    // The six accepting ceremonies: vector i, its own clientDataJSON, the real
+    // rp_id, its own challenge, origin 0, neither `require_*` set.
+    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0100" ++ "00" ++ "00" ++ "01" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0200" ++ "00" ++ "00" ++ "02" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0300" ++ "00" ++ "00" ++ "03" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0400" ++ "00" ++ "00" ++ "04" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    seed("0500" ++ "00" ++ "00" ++ "05" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    // ⭐ vector 2 with ANOTHER ceremony's clientDataJSON: the cross-ceremony
+    // replay the §7.1 binding exists to refuse.
+    seed("0201" ++ "05" ++ "00" ++ "00" ++ "02" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    // ⭐ vector 2 with its own ASSERTION clientDataJSON: type is webauthn.get.
+    seed("0202" ++ "00" ++ "00" ++ "02" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    // A hand-assembled clientDataJSON: type index 0, origin index 0, 32 octets
+    // of challenge.
+    seed("0003" ++ "20" ++ ("00" ** 32) ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    // ⭐ the WRONG rp_id: "example.com" against a zone signed for example.org.
+    seed("0000" ++ "01" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    // ⭐ the WRONG expected origin: the confusable "https://example.org.evil.test".
+    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "01" ++ "01" ++ "01"),
+    // ⭐ an expected challenge belonging to a DIFFERENT vector.
+    seed("0000" ++ "00" ++ "00" ++ "03" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    // ⭐ a raw expected challenge of 32 zero octets: right length, wrong value.
+    seed("0000" ++ "00" ++ "01" ++ "00" ++ "20" ++ ("00" ** 32) ++ "00" ++ "01" ++ "01"),
+    // ⭐ `require_user_verification` set, on a vector whose UV bit is what it is.
+    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "00" ++ "01"),
+    // ⭐ `require_attestation` set: `none` attestation must then be refused.
+    seed("0000" ++ "00" ++ "00" ++ "00" ++ "00" ++ ("00" ** 32) ++ "00" ++ "01" ++ "00"),
+    // Both flags set, on the x5c vector that can satisfy attestation.
+    seed("0200" ++ "00" ++ "00" ++ "02" ++ "00" ++ ("00" ** 32) ++ "00" ++ "00" ++ "00"),
+    seed("00"), // one octet, cycled: the degenerate script
+    seed(""), // the empty script: exactly what the collapsed harness ran
+};
+
 test "fuzz: an accepted registration is bound to the ceremony it was verified against" {
-    try std.testing.fuzz({}, fuzzRegistrationBinding, .{});
+    try std.testing.fuzz({}, fuzzRegistrationBinding, .{ .corpus = &registration_seeds });
+}
+
+fn fuzzRegistrationBinding(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var script: [256]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runRegistrationScript(arena.allocator(), script[0..n]);
+}
+
+test "the collapsed registration harness never reached its own oracle (regression)" {
+    // ⭐ The measurement behind the comment on `runRegistrationScript`,
+    // executable so it cannot quietly stop being true, and kept because it is
+    // the whole reason that harness was restructured rather than left alone.
+    //
+    // The old body opened `smith.index(AllVectors.count)` and then took every
+    // other choice from a ranged draw. Two of those choices decided whether
+    // `verifyRegistration` could possibly succeed:
+    //
+    //     .rp_id = if (smith.value(bool)) vectors.rp_id else "example.com",
+    //     .expected_challenge = if (smith.value(bool)) ... else <raw, len 0>,
+    //
+    // `value(bool)` is `rangeAtMost(u1, 0, 1)`, which reads EIGHT octets as a
+    // little-endian u64 and returns the range minimum unless the whole word
+    // lands in [0,1]. So for the fixed inputs the reachability test below
+    // drives -- and for the one empty input the corpus-less lane replayed --
+    // it was FALSE: the RP id was "example.com" against vectors signed for
+    // example.org, and the expected challenge was a zero-length slice.
+    // `verifyRegistration` refused, the `catch return` fired, and every
+    // assertion after it -- the §7.1 binding this harness exists to prove --
+    // had never executed. An oracle-on-success harness that never succeeds is
+    // green for ever.
+    //
+    // The reachability test below did not catch it: it counts accepted
+    // registrations in a loop of its OWN, calling `verifyRegistration`
+    // directly, and only asks of the harness that its body "runs to
+    // completion".
+    inline for (.{ 0x00, 0x01, 0x02, 0x55, 0x7f, 0xff }) |filler| {
+        var smith: std.testing.Smith = .{ .in = &([_]u8{filler} ** 64 ++ [_]u8{0} ** 512) };
+        _ = smith.index(AllVectors.count); // the R1 first draw
+        _ = smith.valueRangeAtMost(u8, 0, 3); // the clientData mode
+        var chal: [32]u8 = undefined;
+        smith.bytes(&chal);
+        try testing.expect(!smith.value(bool)); // -> rp_id "example.com": WRONG
+        try testing.expect(!smith.value(bool)); // -> a zero-length expected challenge
+    }
+
+    // And the consequence, end to end: the exact options the collapsed harness
+    // built are refused, so the oracle block was unreachable. The zero-length
+    // challenge is caught first, before the RP id even gets compared — two
+    // independent reasons the one input this harness ever ran could not pass.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.ChallengeMismatch, webauthn.verifyRegistration(
+        arena.allocator(),
+        AllVectors.attestationObject(0),
+        AllVectors.registrationClientData(0),
+        .{
+            .rp_id = "example.com",
+            .expected_challenge = "",
+            .expected_origin = fuzz_origins[0],
+        },
+    ));
+}
+
+test "corpus: the registration scripts reach both verdicts, and the spread is pinned" {
+    // ⭐ An oracle-on-success harness has TWO failure modes and only one of them
+    // is "never succeeds". The reachability test below rules that one out. This
+    // guard rules out the other: a corpus that only ever succeeds re-proves the
+    // same passing ceremony and never puts the §7.1 binding under load. So the
+    // pinned numbers are the spread — how many vectors, how many clientData
+    // modes and how many origins the corpus reached, and how the accept/refuse
+    // split falls.
+    //
+    // The collapsed harness scored 1 vector, 1 mode, 1 origin and accepted
+    // every time.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var refused: usize = 0;
+    var vectors_seen = [_]bool{false} ** AllVectors.count;
+    var modes_seen = [_]bool{false} ** 4;
+    var origins_seen = [_]bool{false} ** fuzz_origins.len;
+    for (registration_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [256]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const out = try runRegistrationScript(arena.allocator(), script[0..n]);
+        vectors_seen[out.vector] = true;
+        modes_seen[out.client_data_mode] = true;
+        origins_seen[out.origin_index] = true;
+        if (out.accepted) accepted += 1 else refused += 1;
+    }
+    var nvec: usize = 0;
+    for (vectors_seen) |b| {
+        if (b) nvec += 1;
+    }
+    var nmode: usize = 0;
+    for (modes_seen) |b| {
+        if (b) nmode += 1;
+    }
+    var norigin: usize = 0;
+    for (origins_seen) |b| {
+        if (b) norigin += 1;
+    }
+    // One seed is deliberately the empty script.
+    try testing.expectEqual(registration_seeds.len - 1, nonempty);
+    try testing.expectEqual(AllVectors.count, nvec);
+    try testing.expectEqual(@as(usize, 4), nmode);
+    try testing.expectEqual(@as(usize, 2), norigin);
+    try testing.expectEqual(@as(usize, 7), accepted);
+    try testing.expectEqual(@as(usize, 11), refused);
 }
 
 test "the registration fuzz harness reaches an accepted registration (reachability)" {

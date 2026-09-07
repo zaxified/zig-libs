@@ -1009,32 +1009,236 @@ test "F7: an RS256 credential key below 2048 bits is rejected, not merely small-
 // wire this collection's threat model calls out (a relying-party server
 // verifying a credential from an arbitrary client).
 
+// ⚠ Both harnesses used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain -- so `len` was 0 for
+// every input a corpus can carry and both parsers were handed an EMPTY slice
+// with the blob sitting unread in `buf`. One `slice` draw reads the corpus
+// entry's own length header and hands the bytes over intact.
+//
+// ⛔ The buffers were also too small for this module's own W3C vectors, in
+// both harnesses. `clientDataJSON` is 255 octets in four of the six vectors,
+// against a 256-octet buffer -- one field name of margin. And a registration
+// `authenticatorData` carrying attested credential data is
+// 32+1+4+16+2+32 = 87 octets of framing plus the COSE key, which is 452 octets
+// for RS256: 539 in total, more than DOUBLE the old buffer. A seed longer than
+// the buffer does not arrive truncated -- `Smith.slice` falls back to the range
+// minimum and it arrives EMPTY -- so the RS256 registration blob, the largest
+// thing this parser will ever see in production, could not have passed through
+// its own harness. 512 and 1024 now.
+
+/// `testkit.fuzz.seed`, aliased so the corpora below read as the
+/// clientDataJSON documents and authenticatorData blobs they are. A corpus
+/// entry is not the frame: the length draw reads a little-endian `u32` first,
+/// so a raw blob would arrive minus its own first four octets -- for
+/// authenticatorData, minus four octets of the RP ID hash, which no length
+/// check would ever notice. `testkit/src/fuzz.zig` carries the other two
+/// hazards.
+const seed = @import("testkit").fuzz.seed;
+const fuzz_vectors = @import("vectors.zig");
+
+/// clientDataJSON documents, in the format the length draw reads. The real ones
+/// are added at run time from the W3C §16 vectors; these are the shapes a
+/// malicious page supplies.
+const client_data_reject_seeds = [_][]const u8{
+    seed("{\"type\":\"webauthn.create\",\"challenge\":\"AAAA\",\"origin\":\"https://example.org\"}"), // the minimal accepted document
+    seed("{\"type\":\"webauthn.get\",\"challenge\":\"AAAA\",\"origin\":\"https://example.org\",\"crossOrigin\":true}"), // crossOrigin present and true
+    seed("{\"type\":\"webauthn.create\",\"challenge\":\"\",\"origin\":\"\"}"), // an EMPTY challenge is still a legal base64url string
+    seed("{\"type\":\"webauthn.create\",\"challenge\":\"AAAA\",\"origin\":\"https://example.org\",\"unknown\":[1,2]}"), // ignore_unknown_fields
+    seed("{\"challenge\":\"AAAA\",\"origin\":\"o\"}"), // `type` missing: a required member
+    seed("{\"type\":\"webauthn.create\",\"origin\":\"o\"}"), // `challenge` missing
+    seed("{\"type\":\"webauthn.create\",\"challenge\":\"AAAA\"}"), // `origin` missing
+    seed("{\"type\":42,\"challenge\":\"AAAA\",\"origin\":\"o\"}"), // `type` wrong-typed
+    seed("{\"type\":\"t\",\"challenge\":\"AAAA\",\"origin\":\"o\",\"crossOrigin\":\"yes\"}"), // crossOrigin wrong-typed
+    seed("{\"type\":\"t\",\"challenge\":\"A\",\"origin\":\"o\"}"), // a base64url length of 1: never valid
+    seed("{\"type\":\"t\",\"challenge\":\"A+/A\",\"origin\":\"o\"}"), // '+' and '/' are the STANDARD alphabet, not url-safe
+    seed("{\"type\":\"t\",\"challenge\":\"AAA=\",\"origin\":\"o\"}"), // padding, which the no-pad decoder refuses
+    seed("{\"type\":\"t\",\"challenge\":\"!!!!\",\"origin\":\"o\"}"), // outside any base64 alphabet
+    seed("[1,2,3]"), // valid JSON, not an object
+    seed("{"), // truncated JSON
+    seed("not json at all"), // not JSON
+    seed(""), // the empty document
+};
+
+/// The whole corpus: the shapes above plus every real clientDataJSON the module
+/// owns, registration and assertion.
+///
+/// ⭐ The harness and the guard below both build it from HERE -- a guard
+/// measuring a different corpus from the one the harness gets is not a guard.
+const ClientDataCorpus = struct {
+    stores: [4][4 + 512]u8 = undefined,
+    entries: [client_data_reject_seeds.len + 4][]const u8 = undefined,
+
+    fn build(self: *ClientDataCorpus) []const []const u8 {
+        @memcpy(self.entries[0..client_data_reject_seeds.len], &client_data_reject_seeds);
+        const real = [_][]const u8{
+            &fuzz_vectors.none_es256.registration_client_data_json,
+            &fuzz_vectors.none_es256.assertion_client_data_json,
+            &fuzz_vectors.packed_rs256.registration_client_data_json,
+            &fuzz_vectors.fido_u2f_es256.assertion_client_data_json,
+        };
+        for (real, 0..) |doc, i| {
+            self.entries[client_data_reject_seeds.len + i] =
+                @import("testkit").fuzz.seedInto(&self.stores[i], doc);
+        }
+        return &self.entries;
+    }
+};
+
 test "fuzz: parseClientData never panics on arbitrary JSON" {
-    try std.testing.fuzz({}, fuzzParseClientData, .{});
+    var corpus: ClientDataCorpus = .{};
+    try std.testing.fuzz({}, fuzzParseClientData, .{ .corpus = corpus.build() });
 }
 
 fn fuzzParseClientData(_: void, smith: *std.testing.Smith) !void {
-    var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [512]u8 = undefined;
+    const len: usize = smith.slice(&buf);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     _ = parseClientData(arena.allocator(), buf[0..len]) catch return;
 }
 
+test "corpus: every clientData seed reaches the parser, and the challenge octets are pinned" {
+    // ⛔ `accepted > 0` is not a guard here. `{"type":"t","challenge":"",
+    // "origin":""}` parses cleanly -- an empty challenge is a legal base64url
+    // string -- so a corpus of empty-field documents would read 100% accepted
+    // while the base64url decoder never produced a byte. `challenge_octets` is
+    // the number an empty or defaulted document cannot produce, and the
+    // base64url decode is the only place in this function that can fail after
+    // the JSON parse.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var challenge_octets: usize = 0;
+    var cross_origin_seen: usize = 0;
+    var corpus: ClientDataCorpus = .{};
+    const entries = corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const cd = parseClientData(arena.allocator(), buf[0..len]) catch continue;
+        accepted += 1;
+        challenge_octets += cd.challenge.len;
+        if (cd.cross_origin != null) cross_origin_seen += 1;
+    }
+    // One seed is deliberately the empty document.
+    try std.testing.expectEqual(entries.len - 1, nonempty);
+    // Measured 2026-09-07: 0 of 21 seeds non-empty, 0 accepted, 0 challenge
+    // octets before the draw was fixed.
+    try std.testing.expectEqual(@as(usize, 8), accepted);
+    try std.testing.expectEqual(@as(usize, 137), challenge_octets);
+    try std.testing.expectEqual(@as(usize, 5), cross_origin_seen);
+}
+
+/// authenticatorData blobs, in the format the length draw reads. Real
+/// registration blobs -- the ones carrying attested credential data and a COSE
+/// key -- are assembled at run time from the vectors below.
+const auth_data_reject_seeds = [_][]const u8{
+    seed(""), // empty
+    seed("\xCC" ** 36), // one octet short of the fixed 37-octet header
+    seed("\xCC" ** 32 ++ "\x01\x00\x00\x00\x00"), // the minimum: UP set, no attested credential data
+    seed("\xCC" ** 32 ++ "\x01\x01\x02\x03\x04"), // an asymmetric signCount, for the big-endian read
+    seed("\xCC" ** 32 ++ "\x00\x00\x00\x00\x00"), // UP clear: structurally fine, refused a layer up
+    seed("\xCC" ** 32 ++ "\x81\x00\x00\x00\x00"), // the ED flag with no extension data
+    seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00"), // the AT flag with NO attested credential data behind it
+    seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00" ++ "\x00" ** 16), // AT, an AAGUID, and nothing else
+    seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\xff\xff"), // a credential-id length of 65535
+    seed("\xCC" ** 32 ++ "\x41\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\x00\x04" ++ "\xaa\xbb\xcc\xdd"), // a 4-octet credential id and no COSE key
+    seed("\xCC" ** 32 ++ "\xc1\x00\x00\x00\x00" ++ "\x00" ** 16 ++ "\x00\x01\xaa\xa0"), // AT and ED together: the unsupported combination
+    seed("\x00" ** 300), // 300 zero octets
+};
+
+/// The whole corpus: the shapes above plus a real registration
+/// authenticatorData per COSE key type, assembled from the vectors as
+/// `rp_id_hash || flags || signCount || aaguid || credIdLen || credId ||
+/// coseKey` (WebAuthn §6.1 / §6.5.1).
+///
+/// ⭐ Assembled rather than pasted: the credential ids and COSE keys are the
+/// vectors' own, so the corpus follows them instead of freezing a copy. The
+/// RS256 entry is 539 octets and is the one that did not fit the old buffer.
+const AuthDataCorpus = struct {
+    frames: [3][1024]u8 = undefined,
+    stores: [3][4 + 1024]u8 = undefined,
+    entries: [auth_data_reject_seeds.len + 3][]const u8 = undefined,
+
+    fn build(self: *AuthDataCorpus) []const []const u8 {
+        @memcpy(self.entries[0..auth_data_reject_seeds.len], &auth_data_reject_seeds);
+        const parts = [_]struct { id: []const u8, key: []const u8 }{
+            .{ .id = &fuzz_vectors.none_es256.credential_id, .key = &fuzz_vectors.none_es256.credential_public_key },
+            .{ .id = &fuzz_vectors.packed_rs256.credential_id, .key = &fuzz_vectors.packed_rs256.credential_public_key },
+            .{ .id = &fuzz_vectors.packed_eddsa.credential_id, .key = &fuzz_vectors.packed_eddsa.credential_public_key },
+        };
+        for (parts, 0..) |part, i| {
+            const f = &self.frames[i];
+            @memset(f[0..32], 0xBF); // rp_id_hash
+            f[32] = 0x41; // UP | AT
+            @memset(f[33..37], 0);
+            @memset(f[37..53], 0x84); // aaguid
+            std.mem.writeInt(u16, f[53..55], @intCast(part.id.len), .big);
+            var n: usize = 55;
+            @memcpy(f[n..][0..part.id.len], part.id);
+            n += part.id.len;
+            @memcpy(f[n..][0..part.key.len], part.key);
+            n += part.key.len;
+            self.entries[auth_data_reject_seeds.len + i] =
+                @import("testkit").fuzz.seedInto(&self.stores[i], f[0..n]);
+        }
+        return &self.entries;
+    }
+};
+
 test "fuzz: parseAuthenticatorData never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzParseAuthenticatorData, .{});
+    var corpus: AuthDataCorpus = .{};
+    try std.testing.fuzz({}, fuzzParseAuthenticatorData, .{ .corpus = corpus.build() });
 }
 
 fn fuzzParseAuthenticatorData(_: void, smith: *std.testing.Smith) !void {
-    var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [1024]u8 = undefined;
+    const len: usize = smith.slice(&buf);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     _ = parseAuthenticatorData(arena.allocator(), buf[0..len]) catch return;
+}
+
+test "corpus: every authData seed reaches the parser, and the credentials parsed are pinned" {
+    // ⛔ `accepted > 0` would be satisfied by 37 octets of anything: a blob
+    // with the AT flag clear is a perfectly legal assertion authenticatorData
+    // and parses with `attested_credential_data == null`. So the guard pins
+    // `with_credential` and `credential_octets` -- the attested credential data
+    // and its embedded COSE key, which is where every length arithmetic in this
+    // parser lives and which no short blob can produce.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var with_credential: usize = 0;
+    var credential_octets: usize = 0;
+    var corpus: AuthDataCorpus = .{};
+    const entries = corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const ad = parseAuthenticatorData(arena.allocator(), buf[0..len]) catch continue;
+        accepted += 1;
+        const acd = ad.attested_credential_data orelse continue;
+        with_credential += 1;
+        credential_octets += acd.credential_id.len;
+    }
+    // One seed is deliberately empty.
+    try std.testing.expectEqual(entries.len - 1, nonempty);
+    // Measured 2026-09-07: 0 of 15 seeds non-empty and every counter 0 before
+    // the draw was fixed.
+    try std.testing.expectEqual(@as(usize, 7), accepted);
+    try std.testing.expectEqual(@as(usize, 3), with_credential);
+    try std.testing.expectEqual(@as(usize, 96), credential_octets);
 }
 
 test "F4: parseAuthenticatorData reads signCount big-endian, pinned byte-exact" {

@@ -6,8 +6,6 @@
 #
 # Modules absent from this file must have ZERO collapsed targets.
 
-aaa-gate 3
-acme 3
 adaptor 1
 aeadframe 1
 aescbc 1
@@ -35,6 +33,7 @@ df-elect 2
 diskusage 1
 dkg 2
 dnssec 4
+dnp3 3
 drand 1
 encoding 1
 ethfrag 1
@@ -51,7 +50,6 @@ isis-lsdb 2
 isis-spf 1
 json5 2
 jwe 2
-jwt 3
 k256 2
 l2encap 1
 l2forward 1
@@ -72,13 +70,10 @@ opcua 1
 p256 1
 pbb 1
 pping 1
-procnet 5
 protobuf 2
 psbt 1
-qr 4
 qrscan 2
 quic-crypto 1
-raft 5
 rawsock 3
 rdap 2
 rescue 1
@@ -105,7 +100,6 @@ tz 2
 uci 2
 validate 2
 voprf 1
-webauthn 4
 webhooksig 1
 whois 1
 xml 1

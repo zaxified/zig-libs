@@ -879,8 +879,9 @@ that reaches it can notice.
   `zig build check-module-purity` is the teeth. It refuses a file under `modules/<name>/src/`
   that starts a child process AND either names a foreign toolchain or `@embedFile`s foreign
   SOURCE. The spawn is the condition, not the file extension — which is why `json5`'s `.js`
-  fixtures, `ebpf`'s `.bpf.c` provenance for its `.bpf.o` binaries, and `qr`'s `reference.py`
-  are all data and none of them trips it. A module that is still on the wrong side of this says
+  fixtures and `ebpf`'s `.bpf.c` provenance for its `.bpf.o` binaries are data and neither
+  trips it. (`qr`'s `reference.py` was listed here too until 2026-09-07; it is a segno DRIVER,
+  not data, so it moved to `modules/qr/tools/` where the rule above puts it.) A module that is still on the wrong side of this says
   so in one line in its own SPEC/README, the same shape as `**Fuzz exemption:**`:
 
       **Foreign toolchain:** MIGRATION-OWED via `<path>` — <argument>

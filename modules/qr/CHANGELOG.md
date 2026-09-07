@@ -5,6 +5,53 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **All four fuzz harnesses ran one fixed input for their whole
+  lives, and the one named "survives damage" had never damaged anything.**
+
+  Every harness in `root.zig` took its choices from ranged `Smith` draws. A ranged draw
+  reads eight octets as a little-endian u64 and returns the range **minimum** when
+  fewer remain, and after the first short read `Smith` discards the rest of the input —
+  so outside `--fuzz` every knob collapsed at once. All four now read a byte script
+  off one `smith.slice` draw (through `testkit.fuzz.Cursor` where a shape is being
+  drawn) and carry a corpus with a guard test in the ordinary lane.
+
+  ⛔ **`fuzzDamage` flipped zero modules.** `flips = smith.valueRangeAtMost(u16, 0, 200)`
+  was 0 every iteration, so the harness encoded a symbol, damaged nothing, decoded it
+  and asserted the round trip held. The Berlekamp–Massey, Chien and Forney paths its
+  own comment says it exists to reach had never seen a corrupted block, and `ecc` was
+  stuck at `.low` so three of the four redundancy levels were never built. After: 18
+  scripts, **608 modules flipped, 11 symbols damaged and still read back correctly, and
+  one that could not be repaired** — so both the correction and the refusal after it
+  run. ⚠ The flip coordinates need an **odd-length** tail: with an even one the cursor
+  cycles onto the same modules and an even flip count silently cancels, which is the
+  same quiet nothing the collapsed draw was.
+
+  ⛔ **`fuzzSequence` split the empty message.** Its first draw was the message length,
+  so the text was always empty, `encodeSequence` returned one symbol, and the
+  index/total/parity assertions compared 0 against 0 and 1 against 1. A sequence target
+  that never produces a sequence proves nothing about ordering or parity. After: 13
+  scripts, **10 multi-symbol splits, 120 symbols in total** (1 symbol carrying an empty
+  message before).
+
+  ⛔ **`fuzzDecode` built one 17×17 all-light grid**, which fails the format-information
+  BCH check long before the Reed–Solomon path the harness is about. After: 4 distinct
+  grid sizes across 11 scripts.
+
+  ⛔ **`fuzzEncode`'s `BadVersion` guard was unreachable twice over.** The version knob
+  was 0 for ever *and* the code read `@intCast(@min(forced_version, 40))` under a
+  comment saying "0 and 41 exercise the guards" — the clamp turns 41 into 40, so even a
+  working draw could not have reached `BadVersion`. The clamp is gone. After: 23
+  scripts, all 4 ECC levels, 21 symbols encoded across 4 versions, 21 round trips (1
+  symbol, of the empty string, before).
+
+- **2026-09-07** — `testdata/reference.py` moved to `tools/reference.py`. It drives
+  **segno** under a Python interpreter, so it is an instrument needing a foreign
+  toolchain, and `CONVENTIONS.md` §9 puts those in `modules/<name>/tools/` rather than
+  under `src/`. Nothing imports or embeds it — `golden_matrices.zig` and
+  `decode_vectors.bin` stay where they are, since those are the committed transcript the
+  hermetic lane replays. The regeneration command in `golden_matrices.zig`'s header is
+  updated to the new path.
+
 - **2026-09-04** — **First audit.** Never audited before; landed 2026-08-23 and was
   invisible to the drift ranking, which cannot see a module with no anchor.
   **The codec itself is correct** — 2880 encoder vectors across all 40 versions x

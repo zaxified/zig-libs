@@ -154,7 +154,7 @@ untrusted input never panics and that a "successful" decode is never wrong
 ever claimed to need one until the paragraph above invented the claim.
 
 **A real external oracle, added 2026-08-18, closes part of that gap.**
-`testdata/reference.py` drives [segno](https://github.com/heuer/segno) (a
+`tools/reference.py` drives [segno](https://github.com/heuer/segno) (a
 pure-Python, independently-authored ISO/IEC 18004 encoder; version 1.6.6 at
 capture time) to produce QR matrices for a fixed (content, mode, version,
 ecc, mask) tuple, and `testdata/golden_matrices.zig` freezes the resulting
@@ -221,7 +221,7 @@ extra byte and confirmed **this module's encoder was the one matching ISO
 this module's matrix for that case to the correct message anyway, because a
 lenient decoder never validates padding content, which is exactly why a
 byte-identical golden comparison (and not a decode round-trip against a
-third tool) is what caught this at all. `reference.py` monkeypatches a
+third tool) is what caught this at all. `tools/reference.py` monkeypatches a
 one-line corrected `write_padding_bits` at generation time, documented in
 full there, so the captured vectors reflect segno's real encoding logic and
 not this one bug in it.
