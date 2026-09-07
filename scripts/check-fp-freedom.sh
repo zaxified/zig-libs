@@ -44,8 +44,17 @@ BIN="$OUT/falcon-rf"
 
 # ReleaseFast on purpose: the shipping mode, and the one where a compiler is
 # freest to rewrite the emulation back into hardware instructions.
+# ⚠ `falcon`'s TEST dependencies have to be wired here too. This step compiles
+# the module's test binary, so `build.zig`'s `test_deps` apply — and when
+# falcon's fuzz corpus started importing `testkit` (2026-09-07), a bare
+# `-Mroot=` failed with "no module named 'testkit' available within module
+# 'root'". The gate is about the shipped floating-point surface, not about the
+# dependency list, so it should follow whatever the module's tests need rather
+# than force them to stay import-free.
 zig test -femit-bin="$BIN" -OReleaseFast --test-no-exec \
-    -Mroot=modules/falcon/src/root.zig
+    --dep testkit \
+    -Mroot=modules/falcon/src/root.zig \
+    -Mtestkit=modules/testkit/src/root.zig
 
 # Scalar and AVX-encoded floating-point COMPUTE mnemonics. Moves
 # (`movsd`/`movaps`) and XOR-zeroing (`vxorps`) are data-independent and
