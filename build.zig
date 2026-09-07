@@ -270,13 +270,13 @@ const module_list = [_]Module{
     .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa" }, .test_deps = &.{"testkit"} },
     .{ .name = "dnp3", .libs = &.{"net"}, .deps = &.{"aeskw"}, .test_deps = &.{"testkit"} },
     .{ .name = "slhdsa", .libs = &.{"crypto"}, .heavy = true },
-    .{ .name = "falcon", .libs = &.{"crypto"} },
+    .{ .name = "falcon", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"} },
     .{ .name = "tlsresume", .libs = &.{"crypto"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
     .{ .name = "sandbox", .libs = &.{"os"} },
-    .{ .name = "bip340", .libs = &.{"crypto"}, .deps = &.{"k256"} },
+    .{ .name = "bip340", .libs = &.{"crypto"}, .deps = &.{"k256"}, .test_deps = &.{"testkit"} },
     .{ .name = "taproot", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
     .{ .name = "bitcointx", .libs = &.{"crypto"}, .deps = &.{"bip340"} },
     .{ .name = "psbt", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "bitcoinscript" } },
@@ -310,7 +310,7 @@ const module_list = [_]Module{
     // byte-compare against the genuine drand-Go-produced ciphertext `tlock`
     // already has frozen. The published `ibe` module never imports it --
     // `zig build check-testonly` proves that.
-    .{ .name = "ibe", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"tlock"}, .heavy = true },
+    .{ .name = "ibe", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{ "tlock", "testkit" }, .heavy = true },
     .{ .name = "bn254", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "ed448", .libs = &.{"crypto"}, .deps = &.{"entropy"} },
     .{ .name = "decaf448", .libs = &.{"crypto"}, .deps = &.{"ed448"} },
@@ -338,7 +338,7 @@ const module_list = [_]Module{
     // + run ~1.0s = 9.5s, under the >15s threshold — and a ReleaseSafe compile
     // of this module is ~46s (comptime SHAKE256 derivation + heavily unrolled
     // field code), so marking it heavy would cost 5x what it saves.
-    .{ .name = "rescue", .libs = &.{"crypto"} },
+    .{ .name = "rescue", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "tfhe", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
     .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "chachapoly", .libs = &.{"crypto"} },

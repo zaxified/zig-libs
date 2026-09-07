@@ -250,24 +250,122 @@ test "KAT: hexAlloc helper decodes variable-length messages (sanity for the sign
 // bytes, so the fuzzer spends its budget near the `r < p`/`s < n` boundary
 // and the curve-equation check rather than being rejected by the first
 // range check on almost every draw.
+// ⛔ AND THE PARAGRAPH ABOVE DESCRIBED SOMETHING THAT NEVER HAPPENED. The
+// "flipping a handful of bytes" was `smith.valueRangeAtMost(u8, 0, 6)` as
+// the harness's FIRST draw. A `Smith` ranged draw reads eight octets as a
+// little-endian `u64` and returns the range MINIMUM when fewer remain, and
+// the target had no corpus, so outside `--fuzz` the single input it ever ran
+// was empty: **zero flips, every time**. Every ordinary `zig build test`
+// verified the pristine, valid vector-0 signature — which the KAT tests two
+// screens up already assert — and not one corrupted byte ever reached the
+// `r < p` / `s < n` range checks or the curve-equation check the comment
+// says the budget is spent near. Measured 2026-09-07: 1 round, 1 input, 0
+// bytes flipped, 0 refusals from `Signature.fromBytes`.
+//
+// The flip loop is gone. A signature is 64 octets off the wire, so the
+// harness draws those 64 octets byte-first and the near-misses are a written
+// corpus instead of a flip count the ordinary lane always drew as zero.
+// Under `--fuzz` this is strictly better: the fuzzer mutates real 64-octet
+// signatures rather than replaying one unmodified vector.
+
+/// `testkit.fuzz.seedHex`, aliased so the corpus reads as the signatures it
+/// is. A corpus entry is not the signature: `Smith.slice` reads a
+/// little-endian `u32` length first, so a raw signature would arrive minus
+/// the first four octets of `r`.
+const seedHex = @import("testkit").fuzz.seedHex;
+
+/// 64-octet signatures over vector 0's `(pubkey, message)`, in the format the
+/// length draw reads. The two range checks `Signature.fromBytes` performs are
+/// `r < p` and `s < n`, so both boundaries appear here from both sides — the
+/// cases the deleted flip loop was supposed to find and never once produced.
+///
+/// ⚠ 64 octets is the buffer exactly. A seed longer than the buffer is not a
+/// large seed, it is the EMPTY one.
+const sig_seeds = [_][]const u8{
+    // The real vector-0 signature: the one input the old harness ever ran.
+    seedHex("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"),
+    // Vector 1's signature: well-formed, over the wrong message → false.
+    seedHex("6896BD60EEAE296DB48A229FF71DFE071BDE413E6D43F917DC8DCF8C78DE33418906D11AC976ABCCB20B091292BFF4EA897EFCB639EA871CFA95F6DE339E4B0A"),
+    // r = p exactly: the first thing `Fe.fromBytes` must refuse.
+    seedHex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F25F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"),
+    // r = p − 1: the largest r that is still canonical.
+    seedHex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2E25F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"),
+    // s = n exactly: the group-order boundary `Scalar.fromBytes` refuses.
+    seedHex("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA8215FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"),
+    // s = n − 1: the largest s that is still canonical.
+    seedHex("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA8215FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140"),
+    // r = 0, s = 0: canonical, and `lift_x(0)` has no even-y point.
+    seedHex("00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+    // Every octet set: r and s are both over their moduli.
+    seedHex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
+    // Vector 0 with one octet of s flipped: the near-miss the flip loop meant.
+    seedHex("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C1"),
+    // Vector 0 with one octet of r flipped.
+    seedHex("E807831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"),
+    // A 63-octet signature: short of the wire form, zero-padded by the harness.
+    seedHex("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536"),
+    seedHex(""), // zero length, which is what an empty corpus produced
+};
+
+test "fuzz: verify never panics on corrupted signature bytes" {
+    try std.testing.fuzz({}, fuzzVerify, .{ .corpus = &sig_seeds });
+}
+
 fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     const vec0 = v.vectors[0];
     const pk = bip340.XOnlyPublicKey.fromBytes(hex32(vec0.public_key) catch unreachable) catch return;
     var msg_buf: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&msg_buf, vec0.message) catch unreachable;
 
-    var bytes: [64]u8 = hex64(vec0.signature) catch unreachable;
-    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
-    var i: u8 = 0;
-    while (i < n_flips) : (i += 1) {
-        const pos = smith.index(bytes.len);
-        bytes[pos] = smith.value(u8);
-    }
+    // ⚠ ONE byte-first draw. Never a ranged draw before the bytes: see the
+    // block comment above for the four months that cost.
+    var buf: [64]u8 = undefined;
+    const n: usize = smith.slice(&buf);
+    // `fromBytes` takes exactly 64 octets, so a short draw is zero-padded the
+    // way a short wire read would have to be.
+    var bytes: [64]u8 = [_]u8{0} ** 64;
+    @memcpy(bytes[0..n], buf[0..n]);
 
     const sig = bip340.Signature.fromBytes(bytes) catch return;
     _ = bip340.verify(pk, &msg_buf, sig);
 }
 
-test "fuzz: verify never panics on corrupted signature bytes" {
-    try std.testing.fuzz({}, fuzzVerify, .{});
+test "corpus: every signature seed reaches fromBytes, and the outcomes are pinned" {
+    // ⭐ The measurement, executable. It draws exactly the way the harness
+    // does, because the defect WAS the draw.
+    //
+    // `refused` is the second number and it is the load-bearing one:
+    // `Signature.fromBytes` on 64 zero octets — the input an empty corpus
+    // produces — SUCCEEDS, because 0 is a canonical `Fe` and a canonical
+    // `Scalar`. So an "accepted > 0" guard would read 100% while the harness
+    // walked nothing. A refusal can only come from a seed that puts a value
+    // at or above `p` or `n`, which zeroes cannot do.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var refused: usize = 0;
+    var verified: usize = 0;
+    const vec0 = v.vectors[0];
+    const pk = try bip340.XOnlyPublicKey.fromBytes(try hex32(vec0.public_key));
+    var msg_buf: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&msg_buf, vec0.message);
+    for (sig_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        var bytes: [64]u8 = [_]u8{0} ** 64;
+        @memcpy(bytes[0..n], buf[0..n]);
+        const sig = bip340.Signature.fromBytes(bytes) catch {
+            refused += 1;
+            continue;
+        };
+        accepted += 1;
+        if (bip340.verify(pk, &msg_buf, sig)) verified += 1;
+    }
+    // Measured 2026-09-07. Before: 1 round, 1 input, 0 refusals, 1
+    // verification — of the pristine vector the KATs already assert.
+    try std.testing.expectEqual(sig_seeds.len - 1, nonempty); // the deliberate empty seed
+    try std.testing.expectEqual(@as(usize, 3), refused);
+    try std.testing.expectEqual(@as(usize, 9), accepted);
+    try std.testing.expectEqual(@as(usize, 1), verified);
 }

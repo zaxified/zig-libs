@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `fuzzVerify`'s corruption was one fixed octet. The flip
+  loop opened `smith.valueRangeAtMost(u8, 1, 6)` as the harness's FIRST draw and the
+  target had no corpus, so outside `--fuzz` it ran exactly one input and every draw in it
+  collapsed to a minimum: one flip, at `smith.index(len)` = position 0, to
+  `smith.value(u8)` = 0. The whole harness was "zero the first octet of a real NIST
+  signature field", once, for ever. ⚠ A previous audit had already raised that lower
+  bound from 0 to 1 and left a TEETH test pinning `n_flips >= 1` — a correct fix to the
+  wrong half, because `1` is no better than `0` when the position and the value are
+  minima too. The flip loop and its TEETH test are gone. A compressed signature field is
+  a byte string off the wire, so it is drawn with one `smith.slice`, and the corpus is
+  built at run time from the vector-0 field (the module owns no captured signature): the
+  pristine field, its first octet zeroed (the old harness's only input, kept), its last
+  octet flipped, a one-octet truncation, a same-length all-zero stream, and the empty
+  field. A corpus guard builds from the SAME place the harness does and pins 5 non-empty
+  seeds, `5 * sig_len - 1` octets reaching `verify`, and exactly 1 verification.
+
 - **2026-09-03** — Drift re-audit (717 lines since the last one). ⚠ **BREAKING:**
   `Signer.SignError` gained `TooManyRetries`. `signWithRng`'s rejection-sampling
   loop was `while (true)` with `sig_out.len == 0` as its only length check —

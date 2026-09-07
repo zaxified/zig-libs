@@ -407,45 +407,121 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     if (sig_len < 1 or sig_len > d.sm.len - 2 - falcon.nonce_length) return;
     const nonce = d.sm[2 .. 2 + falcon.nonce_length];
     const msg = d.sm[2 + falcon.nonce_length .. d.sm.len - sig_len];
-    const real_sig = d.sm[d.sm.len - sig_len ..];
 
+    // ⚠ ONE byte-first draw. What stood here was a flip loop opening with
+    // `smith.valueRangeAtMost(u8, 1, 6)` — a RANGED draw as the harness's
+    // first act. A `Smith` ranged draw reads eight octets as a little-endian
+    // `u64` and returns the range MINIMUM when fewer remain, and this target
+    // had no corpus, so outside `--fuzz` it ran exactly one input and every
+    // draw in it collapsed: one flip, at `smith.index(len)` = position 0, to
+    // `smith.value(u8)` = 0. The whole harness was "set the first octet of a
+    // real NIST signature to zero", forever, one input, and a previous audit
+    // had already raised the lower bound from 0 to 1 and left a TEETH test
+    // pinning `n_flips >= 1` — a correct fix to the wrong half. `1` is not
+    // better than `0` when every other draw is a minimum too.
+    //
+    // A compressed signature field is a byte string off the wire, so it is
+    // drawn as one and the corruptions are a written corpus below. Under
+    // `--fuzz` the fuzzer mutates real signature fields directly, which is
+    // what the flip loop was an awkward hand-rolled approximation of.
     var buf: [falcon.max_sig_field_length]u8 = undefined;
-    const len = @min(real_sig.len, buf.len);
-    @memcpy(buf[0..len], real_sig[0..len]);
-
-    // ⚠ The lower bound is 1, not 0, and that is load-bearing rather than
-    // cosmetic. Outside `--fuzz` mode `std.testing.fuzz` with an empty corpus
-    // runs EXACTLY ONE input, and on exhausted input `valueRangeAtMost` falls
-    // back to the range's LOWER bound. With a lower bound of 0 this harness
-    // therefore did precisely one thing on every ordinary `zig build test`:
-    // verify the pristine, valid NIST-KAT signature — zero bytes flipped, not
-    // one corrupted input ever reaching `compDecode`. Meanwhile `check-fuzz`
-    // counted the module as covered and the CHANGELOG recorded "no panic/OOB
-    // found". Zero flips is also the least interesting case even under a real
-    // fuzzer: an unmodified valid signature is what the KAT tests already
-    // assert.
-    const n_flips = smith.valueRangeAtMost(u8, 1, 6);
-    var i: u8 = 0;
-    while (i < n_flips) : (i += 1) {
-        const pos = smith.index(len);
-        buf[pos] = smith.value(u8);
-    }
+    const len: usize = smith.slice(&buf);
 
     pk.verify(msg, nonce[0..falcon.nonce_length], buf[0..len]) catch return;
 }
 
-test "TEETH: the verify fuzz harness corrupts at least one byte on its smoke run" {
-    // The harness above is the module's only untrusted-input fuzz target, and
-    // outside `--fuzz` it gets exactly one draw. This test pins the property
-    // that made that one draw worthless: the flip count must never be able to
-    // come out zero. It reads the same expression the harness uses, through a
-    // `Smith` with NO input left — the exact state the single smoke run is in.
-    var empty: [0]u8 = .{};
-    var smith: std.testing.Smith = .{ .in = &empty };
-    const n_flips = smith.valueRangeAtMost(u8, 1, 6);
-    try std.testing.expect(n_flips >= 1);
-}
+/// The corpus, built at run time because the only real Falcon signature this
+/// module owns is hex in `kat_vectors.zig` and has to be decoded first.
+///
+/// ⭐ The harness and the guard below both build it from HERE. A guard
+/// measuring a different corpus from the one the harness gets is not a guard.
+const Corpus = struct {
+    const cap = falcon.max_sig_field_length;
+    scratch: [cap]u8 = undefined,
+    stores: [6][4 + cap]u8 = undefined,
+    entries: [6][]const u8 = undefined,
+
+    /// `sig` is the vector-0 compressed signature field, verbatim.
+    fn build(self: *Corpus, sig: []const u8) []const []const u8 {
+        const n = @min(sig.len, cap);
+        const kit = @import("testkit").fuzz;
+
+        // 0: the pristine field — the only input that verifies.
+        self.entries[0] = kit.seedInto(&self.stores[0], sig[0..n]);
+
+        // 1: the first octet zeroed. This is the ONLY input the collapsed
+        //    harness ever ran, kept so the "before" case stays covered.
+        @memcpy(self.scratch[0..n], sig[0..n]);
+        self.scratch[0] = 0;
+        self.entries[1] = kit.seedInto(&self.stores[1], self.scratch[0..n]);
+
+        // 2: the last octet flipped — corruption in the Golomb-Rice tail
+        //    rather than in the header byte.
+        @memcpy(self.scratch[0..n], sig[0..n]);
+        self.scratch[n - 1] ^= 0xFF;
+        self.entries[2] = kit.seedInto(&self.stores[2], self.scratch[0..n]);
+
+        // 3: one octet short. `compDecode`'s canonical-encoding check is about
+        //    exactly how the bit stream ends, so truncation is its own path.
+        self.entries[3] = kit.seedInto(&self.stores[3], sig[0 .. n - 1]);
+
+        // 4: the right length, all zeroes — a well-formed length carrying a
+        //    degenerate stream.
+        @memset(self.scratch[0..n], 0);
+        self.entries[4] = kit.seedInto(&self.stores[4], self.scratch[0..n]);
+
+        // 5: the empty field, which is what an empty corpus produces.
+        self.entries[5] = kit.seedInto(&self.stores[5], self.scratch[0..0]);
+
+        return &self.entries;
+    }
+};
 
 test "fuzz: PublicKey.verify never panics on corrupted compressed signatures" {
-    try std.testing.fuzz({}, fuzzVerify, .{});
+    const gpa = std.testing.allocator;
+    const d = try Decoded.init(gpa, v.falcon512[0]);
+    defer d.deinit(gpa);
+    const sig_len = (@as(usize, d.sm[0]) << 8) | d.sm[1];
+    var corpus: Corpus = .{};
+    try std.testing.fuzz({}, fuzzVerify, .{ .corpus = corpus.build(d.sm[d.sm.len - sig_len ..]) });
+}
+
+test "corpus: every signature seed reaches verify, and the outcomes are pinned" {
+    // ⭐ The measurement, executable. It draws exactly the way the harness
+    // does, because the defect WAS the draw.
+    //
+    // `verified` is the second number: `verify` on an empty signature field
+    // is refused before any NTT runs, so a "did not panic" guard would have
+    // been satisfied by the collapsed harness. A verification can only come
+    // from the pristine field surviving the draw intact — which is precisely
+    // what the old harness, having zeroed octet 0 on every run, could not do.
+    const gpa = std.testing.allocator;
+    const d = try Decoded.init(gpa, v.falcon512[0]);
+    defer d.deinit(gpa);
+    const sig_len = (@as(usize, d.sm[0]) << 8) | d.sm[1];
+    const nonce = d.sm[2 .. 2 + falcon.nonce_length];
+    const msg = d.sm[2 + falcon.nonce_length .. d.sm.len - sig_len];
+    const pk = try falcon.PublicKey.fromBytes(d.pk_bytes[0..897]);
+
+    var corpus: Corpus = .{};
+    const seeds = corpus.build(d.sm[d.sm.len - sig_len ..]);
+
+    var nonempty: usize = 0;
+    var octets: usize = 0;
+    var verified: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [falcon.max_sig_field_length]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        octets += len;
+        if (pk.verify(msg, nonce[0..falcon.nonce_length], buf[0..len])) |_| {
+            verified += 1;
+        } else |_| {}
+    }
+    // Measured 2026-09-07. Before: 1 round, 1 input, octet 0 forced to zero,
+    // 0 verifications and 0 pristine fields ever seen by `compDecode`.
+    try std.testing.expectEqual(@as(usize, 5), nonempty); // the deliberate empty seed is the sixth
+    try std.testing.expectEqual(@as(usize, 5 * sig_len - 1), octets);
+    try std.testing.expectEqual(@as(usize, 1), verified);
 }

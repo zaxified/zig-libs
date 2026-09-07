@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `fuzzFramings` only ever ran the empty sequence. It opened
+  `smith.value(u8)` as its FIRST draw; a `Smith` scalar draw reads eight octets as a
+  little-endian `u64` and returns the range minimum when fewer remain, and the target had
+  no corpus, so `n` was 0 on every run. The harness took `spec128.hash`'s `EmptyInput`
+  branch and returned, and the property it exists to state — that the two RPO sponge
+  framings never collide — **was never once evaluated**. The comment about length 0 being
+  "deliberately in range" was true and beside the point: 0 was not merely in range, it
+  was the only value ever drawn. The elements now come from one byte-first
+  `smith.slice`, eight octets each, big-endian, so a corpus entry is a readable element
+  sequence and the fuzzer still drives every element because it drives the slice. Ten
+  seeds sweep the length, including seven / eight / nine elements around the rate
+  boundary where the two framings' padding rules diverge. ⚠ The corpus guard pins
+  ELEMENTS ABSORBED, not "no error": the empty sequence is a LEGAL refusal here, so a
+  guard counting clean returns would have been satisfied by the collapsed harness.
+  Pinned: 9 non-empty seeds, 70 elements absorbed, 9 hashes, 1 empty refusal.
+
 - **2026-08-18** — Portability fix (`check-portable`), test-only: "pow ladder agrees with
   repeated multiplication" looped `for (0..e)` where `e: u64` — a for-range bound must be
   `usize`, which fails to compile on a 32-bit target. `pow`'s real API keeps `e: u64`

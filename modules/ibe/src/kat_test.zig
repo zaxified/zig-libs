@@ -587,30 +587,153 @@ test "drand anchor: the genuine fixture is rejected under a wrong private key (F
 // the fuzzer is biased toward the `U` point's compressed-encoding
 // boundary and the FO consistency check rather than being rejected by
 // the first flag-byte check on nearly every draw.
-fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
-    var msk_bytes = [_]u8{0} ** 32;
-    msk_bytes[31] = 0x07;
-    const msk = Fr.fromBytes(msk_bytes) catch unreachable;
-    const mpk = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(msk).toAffine();
-    const id = "fuzz@example.com";
-    const d_id = ibe.extract(msk, id);
+// ⛔ AND THE BIAS DESCRIBED ABOVE NEVER EXISTED. "its bytes corrupted" was
+// `smith.valueRangeAtMost(u8, 0, 6)` as the harness's FIRST draw. A `Smith`
+// ranged draw reads eight octets as a little-endian `u64` and returns the
+// range MINIMUM when fewer remain, and this target carried no corpus, so
+// outside `--fuzz` the one input it ever ran was empty and the flip count
+// was **zero on every run**. Every ordinary `zig build test` decrypted the
+// pristine ciphertext successfully: not one corrupted octet ever reached the
+// compressed-`U` decode boundary or the FO consistency check the comment
+// says the fuzzer is biased toward.
+//
+// The flip loop is gone. A ciphertext is 160 octets off the wire, so it is
+// drawn as one, and the corruptions are a corpus built from the module's own
+// `encrypt` — the only place a real one exists.
 
-    const message = [_]u8{0xAB} ** ibe.block_bytes;
-    const sigma = [_]u8{0x11} ** ibe.block_bytes;
-    const ct = ibe.encrypt(mpk, id, message, sigma);
-    var bytes = ct.toBytes();
+/// The corpus, built at run time: this module owns no captured ciphertext,
+/// so the positive half has to come from `encrypt`, which tracks the encoder
+/// instead of freezing a paste of it.
+///
+/// ⭐ The harness and the guard below both build it from HERE. A guard
+/// measuring a different corpus from the one the harness gets is not a guard.
+const CtCorpus = struct {
+    const cap = ibe.Ciphertext.encoded_bytes; // 160
 
-    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
-    var i: u8 = 0;
-    while (i < n_flips) : (i += 1) {
-        const pos = smith.index(bytes.len);
-        bytes[pos] = smith.value(u8);
+    stores: [8][4 + cap]u8 = undefined,
+    entries: [8][]const u8 = undefined,
+
+    /// The fixed self-issued PKG context every entry is built against.
+    fn fixture() struct { d_id: g1.Affine, bytes: [cap]u8 } {
+        var msk_bytes = [_]u8{0} ** 32;
+        msk_bytes[31] = 0x07;
+        const msk = Fr.fromBytes(msk_bytes) catch unreachable;
+        const mpk = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(msk).toAffine();
+        const id = "fuzz@example.com";
+        const message = [_]u8{0xAB} ** ibe.block_bytes;
+        const sigma = [_]u8{0x11} ** ibe.block_bytes;
+        return .{
+            .d_id = ibe.extract(msk, id),
+            .bytes = ibe.encrypt(mpk, id, message, sigma).toBytes(),
+        };
     }
 
+    fn build(self: *CtCorpus, real: [cap]u8) []const []const u8 {
+        const kit = @import("testkit").fuzz;
+        var t: [cap]u8 = undefined;
+
+        // 0: the pristine ciphertext — the ONLY input the collapsed harness
+        //    ever ran, and the only one that decrypts.
+        self.entries[0] = kit.seedInto(&self.stores[0], &real);
+
+        // 1: the compression flag of `U` cleared → `fromBytesCompressed`
+        //    refuses before any curve arithmetic.
+        t = real;
+        t[0] ^= 0x80;
+        self.entries[1] = kit.seedInto(&self.stores[1], &t);
+
+        // 2: the infinity flag of `U` set, with a non-zero body behind it —
+        //    the encoding rule G2 deserialization has to enforce.
+        t = real;
+        t[0] |= 0x40;
+        self.entries[2] = kit.seedInto(&self.stores[2], &t);
+
+        // 3: one octet of `U`'s x-coordinate flipped → an x with no y, or a
+        //    point off the subgroup; either way past the flag check.
+        t = real;
+        t[1] ^= 0x01;
+        self.entries[3] = kit.seedInto(&self.stores[3], &t);
+
+        // 4: `U` intact, one octet of `V` flipped → parses, and the FO
+        //    consistency check in `decrypt` is what must reject it.
+        t = real;
+        t[96] ^= 0xFF;
+        self.entries[4] = kit.seedInto(&self.stores[4], &t);
+
+        // 5: `U` intact, the last octet of `W` flipped → the other FO half.
+        t = real;
+        t[cap - 1] ^= 0xFF;
+        self.entries[5] = kit.seedInto(&self.stores[5], &t);
+
+        // 6: 160 zero octets — a cleared compression flag, which is also what
+        //    a short or empty draw pads to.
+        t = [_]u8{0} ** cap;
+        self.entries[6] = kit.seedInto(&self.stores[6], &t);
+
+        // 7: the empty input, which is what an empty corpus produced.
+        self.entries[7] = kit.seedInto(&self.stores[7], t[0..0]);
+
+        return &self.entries;
+    }
+};
+
+fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
+    const f = CtCorpus.fixture();
+
+    // ⚠ ONE byte-first draw. Never a ranged draw before the bytes.
+    var buf: [ibe.Ciphertext.encoded_bytes]u8 = undefined;
+    const n: usize = smith.slice(&buf);
+    // `fromBytes` takes exactly `encoded_bytes`, so a short draw is
+    // zero-padded the way a short wire read would have to be.
+    var bytes: [ibe.Ciphertext.encoded_bytes]u8 = [_]u8{0} ** ibe.Ciphertext.encoded_bytes;
+    @memcpy(bytes[0..n], buf[0..n]);
+
     const corrupted = ibe.Ciphertext.fromBytes(bytes) catch return;
-    _ = ibe.decrypt(d_id, corrupted) catch return;
+    _ = ibe.decrypt(f.d_id, corrupted) catch return;
 }
 
 test "fuzz: Ciphertext.fromBytes/decrypt never panics on corrupted ciphertext bytes" {
-    try std.testing.fuzz({}, fuzzDecrypt, .{});
+    var corpus: CtCorpus = .{};
+    try std.testing.fuzz({}, fuzzDecrypt, .{ .corpus = corpus.build(CtCorpus.fixture().bytes) });
+}
+
+test "corpus: every ciphertext seed reaches fromBytes, and the outcomes are pinned" {
+    // ⭐ The measurement, executable. It draws exactly the way the harness
+    // does, because the defect WAS the draw.
+    //
+    // `refused` is the second number and it is the load-bearing one:
+    // `decrypt` on the pristine ciphertext SUCCEEDS, and that is the single
+    // input the collapsed harness ran, so a "decrypted > 0" guard would have
+    // read green while nothing was corrupted at all. A refusal — from the
+    // compressed-`U` decode or from the FO check — can only come from a seed
+    // that differs from the real ciphertext.
+    const f = CtCorpus.fixture();
+    var corpus: CtCorpus = .{};
+    const seeds = corpus.build(f.bytes);
+
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var refused_by_decode: usize = 0;
+    var decrypted: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [ibe.Ciphertext.encoded_bytes]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        var bytes: [ibe.Ciphertext.encoded_bytes]u8 = [_]u8{0} ** ibe.Ciphertext.encoded_bytes;
+        @memcpy(bytes[0..n], buf[0..n]);
+        const ct = ibe.Ciphertext.fromBytes(bytes) catch {
+            refused_by_decode += 1;
+            continue;
+        };
+        parsed += 1;
+        _ = ibe.decrypt(f.d_id, ct) catch continue;
+        decrypted += 1;
+    }
+    // Measured 2026-09-07. Before: 1 round, 1 input, 0 octets corrupted,
+    // 1 decryption of the pristine ciphertext and 0 refusals of any kind.
+    try std.testing.expectEqual(@as(usize, 7), nonempty); // the deliberate empty seed is the eighth
+    try std.testing.expectEqual(@as(usize, 4), refused_by_decode); // seeds 1, 3, 6 and 7
+    try std.testing.expectEqual(@as(usize, 4), parsed); // seeds 0, 2, 4 and 5
+    try std.testing.expectEqual(@as(usize, 1), decrypted);
 }

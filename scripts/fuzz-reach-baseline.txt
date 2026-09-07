@@ -9,7 +9,6 @@
 adaptor 1
 bbs 1
 bip32 2
-bip340 1
 bitcoinscript 2
 bitcointx 2
 blindrsa 1
@@ -25,10 +24,8 @@ decimal 2
 diskusage 1
 dkg 2
 ethfrag 1
-falcon 1
 fleetsim 1
 frost 1
-ibe 1
 jwe 2
 k256 2
 loopix 1
@@ -51,7 +48,6 @@ qrscan 2
 quic-crypto 1
 rawsock 3
 rdap 2
-rescue 1
 ripemd160 1
 saml 2
 sealedbox 1

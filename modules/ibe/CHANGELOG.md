@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `fuzzDecrypt` never corrupted a ciphertext. Its flip loop
+  opened `smith.valueRangeAtMost(u8, 0, 6)` as the harness's FIRST draw; a `Smith` ranged
+  draw reads eight octets as a little-endian `u64` and returns the range MINIMUM when
+  fewer remain, and the target had no corpus, so outside `--fuzz` the one input it ever
+  ran was empty and the flip count was **zero every time**. Every ordinary `zig build
+  test` decrypted the pristine ciphertext successfully: not one corrupted octet reached
+  the compressed-`U` decode boundary or the Fujisaki-Okamoto consistency check the
+  harness's own comment says it is biased toward. Measured 2026-09-07: 1 round, 0 octets
+  corrupted, 0 refusals of any kind. The flip loop is gone: a ciphertext is 160 octets off
+  the wire, so it is drawn with one `smith.slice`, and the corpus is built at run time
+  from this module's own `encrypt` — the pristine ciphertext, `U`'s compression flag
+  cleared, its infinity flag set over a non-zero body, one octet of `U`'s x flipped, one
+  octet of `V` flipped, the last octet of `W` flipped, 160 zeroes, and the empty input.
+  A corpus guard builds from the SAME place the harness does and pins 7 non-empty, 4
+  refused by the `U` decode, 4 parsed and 1 decrypted.
+
 - **2026-08-14** — Test-only: `kat_test.zig` gained a `testing.fuzz` harness on
   `Ciphertext.fromBytes`/`decrypt` (corrupted ciphertext bytes against a fixed
   self-issued PKG keypair) — `zig build check-fuzz` no longer names this
