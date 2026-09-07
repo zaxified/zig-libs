@@ -20,7 +20,6 @@
 
 const std = @import("std");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
-const testkit = @import("testkit");
 const builtin = @import("builtin");
 const gate = @import("gate.zig");
 const fast_core = @import("fast_core.zig");
@@ -457,7 +456,7 @@ fn leWords(comptime ws: []const u64) [ws.len * 8]u8 {
     return out;
 }
 
-/// ⛔ NOT `testkit.fuzz.seed`. That helper prepends the little-endian `u32`
+/// ⛔ NOT `fuzzSeedLocal`. That helper prepends the little-endian `u32`
 /// length `Smith.slice` reads, and this harness opens with `smith.bytes`,
 /// which reads no header at all. Written with `seed` first: the four-octet
 /// prefix shifted the whole payload, `bytes` swallowed the first 28 octets of
@@ -511,4 +510,30 @@ test "corpus: the Fe seeds drive every knob, and the counts are pinned" {
     try std.testing.expectEqual(@as(usize, 3), boundary);
     try std.testing.expectEqual(@as(usize, 2), little);
     try std.testing.expectEqual(@as(usize, 4), accepted);
+}
+
+/// ⛔ A LOCAL COPY of `testkit.fuzz.seed`, and it has to be one. Enrolling this
+/// module in `test_deps` puts it into `zig build check-testonly`, whose probe
+/// imports the PUBLISHED module and references every declaration three levels
+/// deep. That reaches `std.crypto.pcurves`'s secp256k1 scalar `sqrt`, which is a
+/// `@compileError("unimplemented")` because the group order is 1 mod 4 — so the
+/// probe cannot compile, through no fault of this module. Two of this
+/// repository's own gates contradict each other for any module with a
+/// declaration that refuses to be referenced outside a test build.
+///
+/// The anchor test below is what stops this copy drifting from
+/// `modules/testkit/src/fuzz.zig`: it drives the real `std.testing.Smith` over
+/// what this produces, exactly as testkit's own tests do.
+fn fuzzSeedLocal(comptime frame: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
+    }.bytes;
+}
+
+test "the local seed helper produces what Smith.slice reads back" {
+    const s = fuzzSeedLocal("abcdef");
+    var smith: std.testing.Smith = .{ .in = s };
+    var buf: [32]u8 = undefined;
+    const n = smith.slice(&buf);
+    try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }

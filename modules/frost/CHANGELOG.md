@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** out of `zig build
+  check-testonly` again, with local copies of `testkit.fuzz`'s seed and cursor
+  helpers instead of the shared ones. Enrolling this module via `test_deps` puts
+  it in that gate, whose probe imports the *published* module and references
+  every declaration three levels deep — which reaches `std.crypto.pcurves`'s
+  secp256k1 scalar `sqrt`, a `@compileError("unimplemented")` because the group
+  order is 1 mod 4. The probe cannot compile, through no fault of this module.
+  ⛔ Local copies are what `testkit.fuzz` exists to abolish; what keeps these from
+  drifting is that each carries an anchor test driving the real
+  `std.testing.Smith` (and, for the cursor, its wrap and range behaviour), so a
+  future Zig that changes `slice`'s framing fails here loudly rather than leaving
+  the corpus quietly seeding nothing.
+
 - **2026-09-07** — Test-only, no production change: `fuzzVerify`, the harness named "never
   panics on **corrupted** signature bytes", had never corrupted a byte. Its first draw was
   `smith.valueRangeAtMost(u8, 0, 6)` and it had no corpus, so `n_flips` was the range

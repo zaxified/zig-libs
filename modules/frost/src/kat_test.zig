@@ -48,7 +48,6 @@ const std = @import("std");
 const frost = @import("root.zig");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing
 /// and the `Cursor` the perturbation harness reads its script from.
-const testkit = @import("testkit");
 const v = @import("kat_vectors.zig");
 
 fn hexN(comptime n: usize, hex_str: []const u8) [n]u8 {
@@ -504,10 +503,10 @@ test "end-to-end (2,3) round trip: keygen -> commit -> sign -> aggregate -> veri
 const verify_seeds = [_][]const u8{
     // No flips: the pristine signature, which must verify. This is what the
     // target used to do on every single input.
-    testkit.fuzz.seed(&[_]u8{0}),
+    fuzzSeedLocal(&[_]u8{0}),
     // R's prefix octet replaced by the uncompressed marker: `Element.fromBytes`
     // refuses before `verify` is reached.
-    testkit.fuzz.seed(&[_]u8{ 1, 0, 0x04 }),
+    fuzzSeedLocal(&[_]u8{ 1, 0, 0x04 }),
     // z >= n: the scalar's top sixteen octets forced to 0xFF, which is above
     // secp256k1's `n` because `n[15]` is 0xFE. `Scalar.fromBytes` refuses.
     // ⛔ This costs SIXTEEN flips, and the old draw's cap was six. `n` is
@@ -515,27 +514,27 @@ const verify_seeds = [_][]const u8{
     // edit of six octets can raise a 32-octet scalar above it. The
     // canonical-range boundary the harness's own comment names was
     // unreachable at any flip count it could draw, even with a working draw.
-    testkit.fuzz.seed(&[_]u8{ 16, 33, 0xff, 34, 0xff, 35, 0xff, 36, 0xff, 37, 0xff, 38, 0xff, 39, 0xff, 40, 0xff, 41, 0xff, 42, 0xff, 43, 0xff, 44, 0xff, 45, 0xff, 46, 0xff, 47, 0xff, 48, 0xff }),
+    fuzzSeedLocal(&[_]u8{ 16, 33, 0xff, 34, 0xff, 35, 0xff, 36, 0xff, 37, 0xff, 38, 0xff, 39, 0xff, 40, 0xff, 41, 0xff, 42, 0xff, 43, 0xff, 44, 0xff, 45, 0xff, 46, 0xff, 47, 0xff, 48, 0xff }),
     // z's LAST octet flipped to 0x01: still canonical, so this parses and the
     // group equation is what has to reject it. The path the old harness could
     // never reach.
-    testkit.fuzz.seed(&[_]u8{ 1, 64, 0x01 }),
+    fuzzSeedLocal(&[_]u8{ 1, 64, 0x01 }),
     // One octet inside R's x-coordinate: parses when the value lands on the
     // curve, and then fails the equation.
-    testkit.fuzz.seed(&[_]u8{ 1, 16, 0x5a }),
+    fuzzSeedLocal(&[_]u8{ 1, 16, 0x5a }),
     // Six flips spread over both halves — the top of the OLD draw's range.
-    testkit.fuzz.seed(&[_]u8{ 6, 0, 0x02, 8, 0x11, 32, 0x22, 40, 0x33, 55, 0x44, 64, 0x55 }),
+    fuzzSeedLocal(&[_]u8{ 6, 0, 0x02, 8, 0x11, 32, 0x22, 40, 0x33, 55, 0x44, 64, 0x55 }),
     // An all-zero z (a valid scalar encoding, an invalid signature).
-    testkit.fuzz.seed(&[_]u8{ 4, 33, 0, 44, 0, 55, 0, 64, 0 }),
+    fuzzSeedLocal(&[_]u8{ 4, 33, 0, 44, 0, 55, 0, 64, 0 }),
     // The empty script: zero flips again, the collapsed harness exactly.
-    testkit.fuzz.seed(""),
+    fuzzSeedLocal(""),
 };
 
 fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     // ⚠ The FIRST draw is a byte draw. See `verify_seeds`.
     var script: [128]u8 = undefined;
     const script_len: usize = smith.slice(&script);
-    var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+    var cur: FuzzCursor = .{ .bytes = script[0..script_len] };
 
     const group_public_key = elementFromHex(v.group.public_key);
     const msg = hexN(4, v.group.message);
@@ -568,7 +567,7 @@ test "corpus: the verify seeds actually corrupt the signature, and the counts ar
         var script: [128]u8 = undefined;
         const script_len: usize = smith.slice(&script);
         if (script_len != 0) nonempty += 1;
-        var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+        var cur: FuzzCursor = .{ .bytes = script[0..script_len] };
         var bytes = hexN(65, v.final_signature);
         const n_flips = cur.ranged(0, 40);
         flips_total += n_flips;
@@ -593,4 +592,71 @@ test "corpus: the verify seeds actually corrupt the signature, and the counts ar
     // only inputs that verify. Everything else that parsed — five corrupted
     // signatures — reached `verify` and was refused by the group equation,
     // which is the path this harness exists for and had never taken.
+}
+
+/// ⛔ A LOCAL COPY of `testkit.fuzz.seed`, and it has to be one. Enrolling this
+/// module in `test_deps` puts it into `zig build check-testonly`, whose probe
+/// imports the PUBLISHED module and references every declaration three levels
+/// deep. That reaches `std.crypto.pcurves`'s secp256k1 scalar `sqrt`, which is a
+/// `@compileError("unimplemented")` because the group order is 1 mod 4 — so the
+/// probe cannot compile, through no fault of this module. Two of this
+/// repository's own gates contradict each other for any module with a
+/// declaration that refuses to be referenced outside a test build.
+///
+/// The anchor test below is what stops this copy drifting from
+/// `modules/testkit/src/fuzz.zig`: it drives the real `std.testing.Smith` over
+/// what this produces, exactly as testkit's own tests do.
+fn fuzzSeedLocal(comptime frame: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
+    }.bytes;
+}
+
+test "the local seed helper produces what Smith.slice reads back" {
+    const s = fuzzSeedLocal("abcdef");
+    var smith: std.testing.Smith = .{ .in = s };
+    var buf: [32]u8 = undefined;
+    const n = smith.slice(&buf);
+    try std.testing.expectEqualStrings("abcdef", buf[0..n]);
+}
+
+/// ⛔ A LOCAL COPY of `testkit.fuzz.Cursor`, for the same reason as the seed
+/// helper above: this module cannot join `test_deps` without putting itself into
+/// `check-testonly`, whose probe reaches `std.crypto.pcurves`'s secp256k1 scalar
+/// `sqrt` — a `@compileError` because the group order is 1 mod 4.
+const FuzzCursor = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    fn byte(self: *FuzzCursor) u8 {
+        if (self.bytes.len == 0) return 0;
+        const b = self.bytes[self.at % self.bytes.len];
+        self.at += 1;
+        return b;
+    }
+
+    /// Two octets, big-endian, so a seed written as hex reads in the order it
+    /// is spelled.
+    fn word(self: *FuzzCursor) u16 {
+        const hi: u16 = self.byte();
+        const lo: u16 = self.byte();
+        return (hi << 8) | lo;
+    }
+
+    /// `at_least`..`at_most` inclusive. `u32` arithmetic throughout, because
+    /// `at_most - at_least + 1` overflows a `u8` at the full-width span.
+    fn ranged(self: *FuzzCursor, at_least: u32, at_most: u32) u32 {
+        std.debug.assert(at_least <= at_most);
+        return at_least + @as(u32, self.byte()) % (at_most - at_least + 1);
+    }
+};
+
+test "the local cursor matches testkit's: it cycles, and ranged stays in range" {
+    var c: FuzzCursor = .{ .bytes = &[_]u8{ 0xAB, 0xCD } };
+    try std.testing.expectEqual(@as(u16, 0xABCD), c.word());
+    try std.testing.expectEqual(@as(u8, 0xAB), c.byte()); // wraps
+    var empty: FuzzCursor = .{ .bytes = &[_]u8{} };
+    try std.testing.expectEqual(@as(u8, 0), empty.byte());
+    var r: FuzzCursor = .{ .bytes = &[_]u8{0xFF} };
+    try std.testing.expectEqual(@as(u32, 3), r.ranged(3, 3));
 }

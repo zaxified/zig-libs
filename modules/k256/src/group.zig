@@ -28,7 +28,6 @@
 
 const std = @import("std");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
-const testkit = @import("testkit");
 const gate = @import("gate.zig");
 const field = @import("field.zig");
 const scalarmod = @import("scalar.zig");
@@ -776,7 +775,7 @@ const Sec1Corpus = struct {
     /// octet, 5 leaves the frame alone.
     fn push(self: *Sec1Corpus, frame: []const u8, tag: u64) void {
         const start = self.used;
-        var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
+        var at = start + fuzzSeedIntoLocal(self.store[start..], frame).len;
         std.mem.writeInt(u64, self.store[at..][0..8], tag, .little);
         at += 8;
         self.entries[self.n] = self.store[start..at];
@@ -880,4 +879,32 @@ test "corpus: every SEC1 seed reaches the decoder, and the counts are pinned" {
     try std.testing.expectEqual(true, tags_seen[3]);
     try std.testing.expectEqual(true, tags_seen[4]);
     try std.testing.expectEqual(true, tags_seen[5]);
+}
+
+/// ⛔ A LOCAL COPY of `testkit.fuzz.seedInto`, and it has to be one. Enrolling this
+/// module in `test_deps` puts it into `zig build check-testonly`, whose probe
+/// imports the PUBLISHED module and references every declaration three levels
+/// deep. That reaches `std.crypto.pcurves`'s secp256k1 scalar `sqrt`, which is a
+/// `@compileError("unimplemented")` because the group order is 1 mod 4 — so the
+/// probe cannot compile, through no fault of this module. Two of this
+/// repository's own gates contradict each other for any module with a
+/// declaration that refuses to be referenced outside a test build.
+///
+/// The anchor test below is what stops this copy drifting from
+/// `modules/testkit/src/fuzz.zig`: it drives the real `std.testing.Smith` over
+/// what this produces, exactly as testkit's own tests do.
+fn fuzzSeedIntoLocal(out: []u8, frame: []const u8) []const u8 {
+    std.debug.assert(out.len >= 4 + frame.len);
+    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
+    @memcpy(out[4..][0..frame.len], frame);
+    return out[0 .. 4 + frame.len];
+}
+
+test "the local seedInto helper produces what Smith.slice reads back" {
+    var storage: [32]u8 = undefined;
+    const s = fuzzSeedIntoLocal(&storage, "abcdef");
+    var smith: std.testing.Smith = .{ .in = s };
+    var buf: [32]u8 = undefined;
+    const n = smith.slice(&buf);
+    try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }

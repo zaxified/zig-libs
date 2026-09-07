@@ -19,7 +19,6 @@
 
 const std = @import("std");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
-const testkit = @import("testkit");
 const group = @import("group.zig");
 const scalarmod = @import("scalar.zig");
 
@@ -205,7 +204,7 @@ pub const isLowS = @import("ecdsa_recover.zig").isLowS;
 /// so the accepting frames come from the module's own `bip340Sign`. A seed is
 /// the 32-octet x-only pubkey and the 64-octet signature RAW (both are drawn
 /// with `smith.bytes`, which reads no length header), then the message as a
-/// `testkit.fuzz` slice seed.
+/// the local slice-seed helper.
 const Bip340Corpus = struct {
     store: [8 * (32 + 64 + 4 + 96)]u8 = undefined,
     used: usize = 0,
@@ -217,7 +216,7 @@ const Bip340Corpus = struct {
         @memcpy(self.store[start..][0..32], &pubkey);
         @memcpy(self.store[start + 32 ..][0..64], &sig);
         var at = start + 96;
-        at += testkit.fuzz.seedInto(self.store[at..], msg).len;
+        at += fuzzSeedIntoLocal(self.store[at..], msg).len;
         self.entries[self.n] = self.store[start..at];
         self.used = at;
         self.n += 1;
@@ -290,4 +289,32 @@ test "corpus: the BIP340 seeds reach the verifier, and the counts are pinned" {
     }
     try std.testing.expectEqual(@as(usize, 1), accepted);
     try std.testing.expectEqual(@as(usize, 188), msg_octets);
+}
+
+/// ⛔ A LOCAL COPY of `testkit.fuzz.seedInto`, and it has to be one. Enrolling this
+/// module in `test_deps` puts it into `zig build check-testonly`, whose probe
+/// imports the PUBLISHED module and references every declaration three levels
+/// deep. That reaches `std.crypto.pcurves`'s secp256k1 scalar `sqrt`, which is a
+/// `@compileError("unimplemented")` because the group order is 1 mod 4 — so the
+/// probe cannot compile, through no fault of this module. Two of this
+/// repository's own gates contradict each other for any module with a
+/// declaration that refuses to be referenced outside a test build.
+///
+/// The anchor test below is what stops this copy drifting from
+/// `modules/testkit/src/fuzz.zig`: it drives the real `std.testing.Smith` over
+/// what this produces, exactly as testkit's own tests do.
+fn fuzzSeedIntoLocal(out: []u8, frame: []const u8) []const u8 {
+    std.debug.assert(out.len >= 4 + frame.len);
+    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
+    @memcpy(out[4..][0..frame.len], frame);
+    return out[0 .. 4 + frame.len];
+}
+
+test "the local seedInto helper produces what Smith.slice reads back" {
+    var storage: [32]u8 = undefined;
+    const s = fuzzSeedIntoLocal(&storage, "abcdef");
+    var smith: std.testing.Smith = .{ .in = s };
+    var buf: [32]u8 = undefined;
+    const n = smith.slice(&buf);
+    try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }
