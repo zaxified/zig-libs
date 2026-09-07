@@ -24,7 +24,6 @@ diskusage 1
 ethfrag 1
 falcon 1
 fleetsim 1
-frost 1
 ibe 1
 jwe 2
 k256 2
@@ -35,7 +34,6 @@ megolm 2
 minisign 2
 modbus 2
 montint 2
-musig2 1
 netconf 3
 noise 1
 ocsp 2

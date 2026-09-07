@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** - Test-only, no production change: `fuzzPartialSigVerify`, the harness
+  named "never panics on **corrupted** partial-signature bytes", had never corrupted a byte.
+  Its first draw was `smith.valueRangeAtMost(u8, 0, 4)` and it had no corpus, so `n_flips`
+  was the range MINIMUM - **0** - on every input the ordinary lane ever ran: it verified
+  BIP327's own published valid partial signature, unmodified, every round. The perturbation
+  script now comes out of one `smith.slice` read through `testkit.fuzz.Cursor`, so the byte
+  draw is first and a seed is a readable `[flip count][position, value]...` script. And the
+  flip budget was wrong independently of the draw: the harness's comment says the mutation
+  lands "near the `s < n` boundary", but secp256k1's `n` has **fifteen leading 0xFF octets**,
+  so no edit of four octets can raise a 32-octet scalar above it -
+  `PartialSignature.fromBytes`'s range check was unreachable from here at any flip count it
+  could draw. The cap is now 32 and one seed spends sixteen flips on exactly that refusal.
+  Measured by the new `corpus:` guard: 6 non-empty scripts, **26 flips applied** (0 before),
+  6 scalars parsed, 2 verified. A note for the next author: that sixteen-flip script is 33
+  octets and was first written against a 16-octet `smith.slice` buffer, where it read back
+  EMPTY rather than truncated; the guard's `nonempty` count is what caught it.
+
 - **2026-08-14** — Test-only: `kat_test.zig` gained a `testing.fuzz` harness on
   `partialSigVerify` (corrupted partial-signature bytes against a fixed valid
   BIP327 session) — `zig build check-fuzz` no longer names this module. No
