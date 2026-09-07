@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `fuzzReader` never saw an archive. It opened
+  `smith.bytes(&buf)` and then drew the length with `smith.valueRangeAtMost`; `bytes`
+  consumes `@min(buf.len, in.len)` octets and a ranged draw reads EIGHT more as a
+  little-endian `u64`, returning the range MINIMUM when fewer remain, so the length was 0
+  for every input a corpus can carry — and the target had no corpus, so the one input it
+  ever ran was empty. Measured 2026-09-07: 1 round, 0 entries walked, 0 content octets
+  read. ⚠ The buffer was also too small for the threat model the harness's own comment
+  names: at `4 * block_size` = 2048 octets a GNU long-name archive does not fit (the 'L'
+  record, its payload block, the real header, one content block and the two-block
+  terminator are 3072), so the long-name payload could not have passed through even with
+  a corpus. The draw is now one `smith.slice`, the buffer is `8 * block_size`, and the
+  corpus is built at run time from this module's own `Writer`: a one-file archive, a
+  dir/file/symlink tree, a 137-octet path forcing the GNU 'L' record, an archive with no
+  terminator, a corrupted `chksum`, a size field claiming 8 GiB behind a valid checksum,
+  a block of 0xFF, and the empty archive. A corpus guard builds from the SAME place the
+  harness does and pins 7 non-empty, 7 entries, 4 refusals and 1556 content octets — of
+  which 1536 come from the lying-size seed reading until the stream runs out.
+
 - **2026-09-01** — Security audit: **the reader no longer honors a `size` field on an
   entry type that carries no content**, which was a content-smuggling desync. POSIX is
   explicit ("No data logical records are stored for types 1, 2, or 5"), and GNU tar

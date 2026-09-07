@@ -1538,14 +1538,197 @@ fn systemTar(gpa: Allocator, io: std.Io, cwd: std.Io.Dir, argv: []const []const 
 // entry-by-entry walk (headers + content) over fuzzed bytes the way a real
 // extractor would.
 
+// ⛔ And it never saw an archive. The harness opened `smith.bytes(&buf)` and
+// then drew the length with `smith.valueRangeAtMost`; `bytes` consumes
+// `@min(buf.len, in.len)` octets and a ranged draw then reads EIGHT more as
+// a little-endian `u64`, returning the range MINIMUM when fewer remain, so
+// the length was 0 for every input a corpus can carry. The target had no
+// corpus either, so the one input it ever ran was empty and `Reader.next`
+// answered on its first short read. Measured 2026-09-07: 1 round, 0
+// non-empty inputs, 0 entries walked, 0 content octets read.
+//
+// ⚠ AND THE BUFFER WAS TOO SMALL FOR THE THREAT MODEL IT NAMES. At
+// `4 * block_size` = 2048 octets, a GNU long-name archive does not fit: the
+// 'L' record header, its name payload block, the real header, one content
+// block and the two-block terminator are 3072 octets. So the long-name
+// payload the comment above lists as a threat could not have passed through
+// this harness even with a corpus wired up — a seed over the buffer reads
+// back EMPTY. The buffer is now `8 * block_size`, set by the largest archive
+// the module's own `Writer` produces below, not by taste.
+
+/// The corpus, built at run time from this module's own `Writer`: `tar` owns
+/// no captured archive, so freezing a paste of one would only track the
+/// encoder until someone edited it.
+///
+/// ⭐ The harness and the guard below both build it from HERE. A guard
+/// measuring a different corpus from the one the harness gets is not a guard.
+const ArchiveCorpus = struct {
+    const cap = 8 * block_size;
+
+    scratch: [cap]u8 = undefined,
+    stores: [8][4 + cap]u8 = undefined,
+    entries: [8][]const u8 = undefined,
+
+    fn build(self: *ArchiveCorpus) ![]const []const u8 {
+        const kit = @import("testkit").fuzz;
+        var n: usize = 0;
+
+        // 0: one small regular file, terminated. The archive the module's own
+        //    doc-comment example produces.
+        {
+            var w: std.Io.Writer = .fixed(&self.scratch);
+            const tw = Writer.init(&w);
+            try tw.writeEntry(.{ .path = "etc/hostname", .mode = 0o644, .mtime = 1_600_000_000 }, "router\n");
+            try tw.finish();
+            self.entries[n] = kit.seedInto(&self.stores[n], w.buffered());
+            n += 1;
+        }
+
+        // 1: a dir, a file and a symlink — three typeflags in one walk.
+        {
+            var w: std.Io.Writer = .fixed(&self.scratch);
+            const tw = Writer.init(&w);
+            try tw.writeEntry(.{ .path = "tree/", .kind = .dir, .mode = 0o755 }, "");
+            try tw.writeEntry(.{ .path = "tree/hello.txt", .mode = 0o644 }, "hello\n");
+            try tw.writeEntry(.{ .path = "tree/link", .kind = .symlink, .link_target = "hello.txt" }, "");
+            try tw.finish();
+            self.entries[n] = kit.seedInto(&self.stores[n], w.buffered());
+            n += 1;
+        }
+
+        // 2: a 137-octet path, past ustar's 100-octet `name` field, so the
+        //    writer emits a GNU 'L' record ahead of the header. ⚠ THIS is the
+        //    shape that could not fit the old 2048-octet buffer.
+        {
+            var w: std.Io.Writer = .fixed(&self.scratch);
+            const tw = Writer.init(&w);
+            try tw.writeEntry(.{ .path = "long/" ++ ("n" ** 130) ++ "/f", .mode = 0o644 }, "x");
+            try tw.finish();
+            self.entries[n] = kit.seedInto(&self.stores[n], w.buffered());
+            n += 1;
+        }
+
+        // 3: a header and its content with NO end-of-archive blocks — the
+        //    truncation a stream cut mid-transfer produces.
+        {
+            var w: std.Io.Writer = .fixed(&self.scratch);
+            const tw = Writer.init(&w);
+            try tw.writeEntry(.{ .path = "cut.txt", .mode = 0o644 }, "abcdef");
+            self.entries[n] = kit.seedInto(&self.stores[n], w.buffered());
+            n += 1;
+        }
+
+        // The two derived seeds start from a known-good one-file archive.
+        var good_buf: [cap]u8 = undefined;
+        const good_len = blk: {
+            var w: std.Io.Writer = .fixed(&self.scratch);
+            const tw = Writer.init(&w);
+            try tw.writeEntry(.{ .path = "etc/hostname", .mode = 0o644, .mtime = 1_600_000_000 }, "router\n");
+            try tw.finish();
+            const b = w.buffered();
+            @memcpy(good_buf[0..b.len], b);
+            break :blk b.len;
+        };
+
+        // 4: one octet of the `chksum` field corrupted. `verifyChecksum` is
+        //    the guard, and random bytes essentially never reach it.
+        var bad: [cap]u8 = undefined;
+        @memcpy(bad[0..good_len], good_buf[0..good_len]);
+        bad[148] ^= 0x01;
+        self.entries[n] = kit.seedInto(&self.stores[n], bad[0..good_len]);
+        n += 1;
+
+        // 5: a size field claiming 8 GiB behind a header the checksum still
+        //    accepts — the size parser against a stream that cannot deliver.
+        @memcpy(bad[0..good_len], good_buf[0..good_len]);
+        @memcpy(bad[124..135], "77777777777");
+        recomputeChecksum(bad[0..block_size]);
+        self.entries[n] = kit.seedInto(&self.stores[n], bad[0..good_len]);
+        n += 1;
+
+        // 6: one block of 0xFF — every field out of range at once.
+        @memset(self.scratch[0..block_size], 0xFF);
+        self.entries[n] = kit.seedInto(&self.stores[n], self.scratch[0..block_size]);
+        n += 1;
+
+        // 7: the empty archive, which is what an empty corpus produced.
+        self.entries[n] = kit.seedInto(&self.stores[n], self.scratch[0..0]);
+        n += 1;
+
+        std.debug.assert(n == self.entries.len);
+        return &self.entries;
+    }
+};
+
+/// Re-stamp a ustar header's checksum after a field was edited, so the seed
+/// exercises the field's own parser rather than dying at `verifyChecksum`.
+fn recomputeChecksum(block: []u8) void {
+    @memset(block[148..156], ' ');
+    var sum: u32 = 0;
+    for (block[0..block_size]) |b| sum += b;
+    _ = std.fmt.bufPrint(block[148..], "{o:0>6}\x00 ", .{sum}) catch unreachable;
+}
+
 test "fuzz: Reader.next/read never panic on an arbitrary archive" {
-    try testing.fuzz({}, fuzzReader, .{});
+    var corpus: ArchiveCorpus = .{};
+    try testing.fuzz({}, fuzzReader, .{ .corpus = try corpus.build() });
+}
+
+test "corpus: every archive seed reaches the reader, and what it walks is pinned" {
+    // ⭐ The measurement, executable. It draws exactly the way the harness
+    // does, because the defect WAS the draw.
+    //
+    // `octets` is the second number and it is the load-bearing one: an empty
+    // stream is not an error to `Reader.next` in any interesting sense — it
+    // simply ends — so a guard counting clean returns would have been
+    // satisfied by the collapsed harness. Content octets read out of an entry
+    // cannot come from an empty input at all.
+    var corpus: ArchiveCorpus = .{};
+    const seeds = try corpus.build();
+
+    var nonempty: usize = 0;
+    var entries: usize = 0;
+    var octets: usize = 0;
+    var refused: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [ArchiveCorpus.cap]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        var src: std.Io.Reader = .fixed(buf[0..len]);
+        var tr = Reader.init(testing.allocator, &src);
+        defer tr.deinit();
+        var content_buf: [256]u8 = undefined;
+        var walked: usize = 0;
+        while (walked < 16) : (walked += 1) {
+            const entry = (tr.next() catch {
+                refused += 1;
+                break;
+            }) orelse break;
+            _ = entry;
+            entries += 1;
+            while (true) {
+                const n = tr.read(&content_buf) catch {
+                    refused += 1;
+                    break;
+                };
+                if (n == 0) break;
+                octets += n;
+            }
+        }
+    }
+    // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 entries, 0 octets.
+    try testing.expectEqual(seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 7), entries);
+    try testing.expectEqual(@as(usize, 1556), octets); // 20 of real content + 1536 read against the 8 GiB size claim before the stream ran out
+    try testing.expectEqual(@as(usize, 4), refused); // the truncated archive, the bad checksum, the lying size, and the 0xFF block
 }
 
 fn fuzzReader(_: void, smith: *std.testing.Smith) !void {
-    var buf: [4 * block_size]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
+    var buf: [ArchiveCorpus.cap]u8 = undefined;
+    const len: usize = smith.slice(&buf);
 
     var src: std.Io.Reader = .fixed(buf[0..len]);
     var tr = Reader.init(testing.allocator, &src);

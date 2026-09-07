@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `fuzzArchiveInit`'s fuzzed half never ran. It opened
+  `smith.bytes(&buf)` and then drew the length with `smith.valueRangeAtMost`, which
+  returns the range MINIMUM once `bytes` has eaten the input, so the length was 0 — and
+  with no corpus the one input the target ever ran was empty. Path 1 therefore wrote a
+  ZERO-BYTE file for `Archive.init` to refuse, and path 2's mutation count
+  `smith.valueRangeAtMost(u8, 0, 24)` was likewise 0, so it walked the PRISTINE archive
+  with **not one octet mutated**, on every run. The F8 fix — "start from a real archive
+  and apply a handful of random byte mutations" — was right about the shape and bought
+  nothing, because the draw choosing the mutation count was collapsed. Both paths take
+  the same thing (the octets of a zip file), so the harness now draws them byte-first in
+  one `smith.slice` and the "mutated valid archive" idea moved into a corpus built from
+  this module's own `ArchiveWriter`: the Store+Deflate archive as written, a corrupted
+  member CRC, a corrupted deflate stream, a broken EOCD signature, a central-directory
+  offset past the end of the file, a half-truncated archive, a bare 22-octet EOCD, and
+  the empty file. ⚠ The F8 regression test used to drive the harness off 64 PRNG-filled
+  buffers — a DIFFERENT input distribution from the one the `--fuzz` target replays,
+  which is why it could not notice that the target itself ran a single empty input. It
+  now measures the corpus the harness actually gets, and pins `EntryReader` openings at 6
+  (three walkable archives, two members each).
+
 - **2026-08-18** — Portability fix (`check-portable`), test-only: a corrupted-entry test
   allocated `a.alloc(u8, lying_entry.uncompressed_size)` directly; `uncompressed_size`
   stays `u64` in production deliberately (zip64 entries can legitimately exceed a 32-bit

@@ -1448,30 +1448,152 @@ test "Archive/EntryReader: zip64 with Deflate-compressed data" {
 // walkable far more often and is what actually drives `EntryReader` on most
 // iterations.
 
-test "fuzz: Archive.init never panics on an arbitrary file" {
-    try testing.fuzz({}, fuzzArchiveInit, .{});
-}
+// ⛔ AND THE FUZZED HALF OF THAT NEVER RAN. `fuzzArchiveInit` opened
+// `smith.bytes(&buf)` and then drew the length with `smith.valueRangeAtMost`;
+// `bytes` consumes `@min(buf.len, in.len)` octets and a ranged draw then reads
+// EIGHT more as a little-endian `u64`, returning the range MINIMUM when fewer
+// remain, so the length was 0 for every input a corpus can carry. The target
+// had no corpus either, so the one input it ever ran was empty: path 1 wrote a
+// ZERO-BYTE file and `Archive.init` refused it, and path 2's mutation count
+// `smith.valueRangeAtMost(u8, 0, 24)` was likewise 0, so it walked the
+// PRISTINE archive with **not one octet mutated**, every run. Measured
+// 2026-09-07: 1 round, 0 non-empty inputs on path 1, 0 mutations on path 2.
+// The F8 fix — "start from a real archive and apply a handful of random byte
+// mutations" — was correct about the shape and bought nothing, because the
+// draw that chose the mutation count was collapsed.
+//
+// Both paths take the same thing: the octets of a zip file. So the harness
+// now draws those octets byte-first, once, and the "mutated valid archive"
+// idea moves into the corpus, where `ArchiveWriter` builds a real archive and
+// the seeds are deliberate corruptions of it rather than a mutation count the
+// ordinary lane always drew as zero. Under `--fuzz` this is strictly better:
+// the fuzzer mutates a real, walkable archive directly.
 
 var f8_entry_reader_reached: usize = 0;
+
+/// The corpus, built at run time from this module's own `ArchiveWriter`:
+/// random bytes essentially never assemble a byte-exact, walkable central
+/// directory (which is why finding F1 needed a crafted case), so the only
+/// archive that reaches `EntryReader` is one the encoder produced.
+///
+/// ⭐ The harness and the guard below both build it from HERE. A guard
+/// measuring a different corpus from the one the harness gets is not a guard.
+const ZipCorpus = struct {
+    const cap = 4096;
+
+    base: [cap]u8 = undefined,
+    stores: [8][4 + cap]u8 = undefined,
+    entries: [8][]const u8 = undefined,
+
+    fn build(self: *ZipCorpus) ![]const []const u8 {
+        const kit = @import("testkit").fuzz;
+
+        var base_writer: std.Io.Writer = .fixed(&self.base);
+        var zw = ArchiveWriter.init(testing.allocator, &base_writer);
+        defer zw.deinit();
+        try zw.addEntry("a.txt", "hello fuzz world, this member is stored verbatim", .{ .method = .store });
+        try zw.addEntry("b.txt", "hello fuzz world, this member is deflated " ** 20, .{ .method = .deflate });
+        try zw.finish();
+        const good = base_writer.buffered();
+
+        var t: [cap]u8 = undefined;
+        var n: usize = 0;
+
+        // 0: the archive as written — Store and Deflate members, both walkable.
+        self.entries[n] = kit.seedInto(&self.stores[n], good);
+        n += 1;
+
+        // 1: the CRC of the first member corrupted — the check `EntryReader`
+        //    performs after the last octet, which no refusal path reaches.
+        @memcpy(t[0..good.len], good);
+        t[14] ^= 0xFF; // local header crc-32, first octet
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..good.len]);
+        n += 1;
+
+        // 2: one octet of the deflate stream corrupted — a member that opens
+        //    and then fails mid-inflate.
+        @memcpy(t[0..good.len], good);
+        t[good.len / 2] ^= 0xFF;
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..good.len]);
+        n += 1;
+
+        // 3: the EOCD signature broken — "is this even a zip" refusal.
+        @memcpy(t[0..good.len], good);
+        t[good.len - 22] = 0x00;
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..good.len]);
+        n += 1;
+
+        // 4: the central-directory offset in the EOCD pointed past the file —
+        //    the pre-validation this module exists to do ahead of
+        //    `std.zip.Iterator`.
+        @memcpy(t[0..good.len], good);
+        std.mem.writeInt(u32, t[good.len - 6 ..][0..4], 0xFFFF_FFF0, .little);
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..good.len]);
+        n += 1;
+
+        // 5: the archive truncated to its first half — no EOCD at all.
+        self.entries[n] = kit.seedInto(&self.stores[n], good[0 .. good.len / 2]);
+        n += 1;
+
+        // 6: 22 octets that are nothing but an EOCD signature and zeroes —
+        //    the smallest thing that gets past the tail scan.
+        @memset(t[0..22], 0);
+        t[0..4].* = .{ 0x50, 0x4b, 0x05, 0x06 };
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..22]);
+        n += 1;
+
+        // 7: the empty file, which is what an empty corpus produced.
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..0]);
+        n += 1;
+
+        std.debug.assert(n == self.entries.len);
+        return &self.entries;
+    }
+};
+
+test "fuzz: Archive.init never panics on an arbitrary file" {
+    var corpus: ZipCorpus = .{};
+    try testing.fuzz({}, fuzzArchiveInit, .{ .corpus = try corpus.build() });
+}
 
 // `zig build test` (no `--fuzz=N`) never actually invokes a
 // `std.testing.fuzz` body — the "fuzz test" above is only *registered*, not
 // run, in the plain test lane, so a counter incremented from inside it can't
 // be asserted on there. `std.testing.Smith` documents itself as "intended to
-// be initialized directly", so this regression drives `fuzzArchiveInit`
-// itself, directly, off a handful of PRNG-filled inputs, as an ordinary test
-// — proving the harness's *logic* really does reach `EntryReader` (not just
-// `Archive.init`+`deinit`) without depending on the opaque `--fuzz` engine.
-test "fuzz harness (F8 regression): EntryReader is actually reached, not just Archive.init" {
+// be initialized directly", so this drives `fuzzArchiveInit` itself,
+// directly, over the corpus the harness gets — proving the harness's *logic*
+// really does reach `EntryReader` (not just `Archive.init`+`deinit`) without
+// depending on the opaque `--fuzz` engine.
+//
+// ⚠ It used to drive the harness off 64 PRNG-filled buffers instead. That was
+// the only thing in the ordinary lane exercising this code — and it measured
+// a DIFFERENT input distribution from the one the `--fuzz` target actually
+// replays, so it could not have noticed that the target itself was running a
+// single empty input. It now measures the corpus, which is the same thing the
+// harness sees.
+test "corpus: every archive seed reaches Archive.init, and EntryReader's reach is pinned" {
+    // `f8_entry_reader_reached` is the second number and it is the
+    // load-bearing one: `Archive.init` on an empty file simply fails, so a
+    // guard counting refusals would have been satisfied by the collapsed
+    // harness. An opened `EntryReader` can only come from a byte-exact,
+    // walkable central directory.
     f8_entry_reader_reached = 0;
-    var prng = std.Random.DefaultPrng.init(0xF8_F8_F8_F8);
-    var scratch: [4096]u8 = undefined;
-    for (0..64) |_| {
-        prng.random().bytes(&scratch);
-        var smith = testing.Smith{ .in = &scratch };
-        fuzzArchiveInit({}, &smith) catch {};
+    var corpus: ZipCorpus = .{};
+    const seeds = try corpus.build();
+
+    var nonempty: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [ZipCorpus.cap]u8 = undefined;
+        var probe: std.testing.Smith = .{ .in = sd };
+        if (probe.slice(&buf) != 0) nonempty += 1;
+        try fuzzArchiveInit({}, &smith);
     }
-    try testing.expect(f8_entry_reader_reached > 0);
+    // Measured 2026-09-07. Before: the target ran one empty input, path 1 got
+    // a zero-byte file and path 2 walked the pristine archive with 0 octets
+    // mutated.
+    try testing.expectEqual(seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 6), f8_entry_reader_reached); // three walkable archives, two members each
 }
 
 fn tryEntries(archive: *Archive) void {
@@ -1489,13 +1611,12 @@ fn tryEntries(archive: *Archive) void {
     }
 }
 
-// Path 1: purely-random bytes (with an EOCD signature stamped in about half
-// the cases to get past the "is this even a zip" rejection). A helper of its
-// own — not inlined into `fuzzArchiveInit` — specifically so its `catch
-// return`s bail out of *this* path only and cannot skip path 2 below (that
-// was the shape of an earlier draft's bug: `return` inside a bare `{ }`
-// block still returns the whole enclosing function in Zig).
-fn tryRandomBytesPath(bytes: []const u8) void {
+// The whole harness body, in a helper of its own — not inlined into
+// `fuzzArchiveInit` — specifically so its `catch return`s bail out of the
+// walk only and cannot skip the caller's remaining work (that was the shape
+// of an earlier draft's bug: `return` inside a bare `{ }` block still returns
+// the whole enclosing function in Zig).
+fn tryArchiveBytes(bytes: []const u8) void {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     tmp.dir.writeFile(testing.io, .{ .sub_path = "f.zip", .data = bytes }) catch return;
@@ -1508,54 +1629,15 @@ fn tryRandomBytesPath(bytes: []const u8) void {
     tryEntries(&archive);
 }
 
-// Path 2: start from a real, valid Store+Deflate archive and apply random
-// byte-level mutations, so most iterations stay walkable enough to reach
-// `EntryReader` (see the module doc comment above) — same reasoning as
-// `tryRandomBytesPath`'s doc comment for why this is its own function.
-fn tryMutatedValidPath(smith: *std.testing.Smith) void {
-    var base_buf: [4096]u8 = undefined;
-    var base_writer: std.Io.Writer = .fixed(&base_buf);
-    var zw = ArchiveWriter.init(testing.allocator, &base_writer);
-    defer zw.deinit();
-    zw.addEntry("a.txt", "hello fuzz world, this member is stored verbatim", .{ .method = .store }) catch return;
-    zw.addEntry("b.txt", "hello fuzz world, this member is deflated " ** 20, .{ .method = .deflate }) catch return;
-    zw.finish() catch return;
-    const base = base_writer.buffered();
-
-    var mbuf: [4096]u8 = undefined;
-    @memcpy(mbuf[0..base.len], base);
-    const mutated = mbuf[0..base.len];
-    const n_mut = smith.valueRangeAtMost(u8, 0, 24);
-    for (0..n_mut) |_| {
-        const idx = smith.index(mutated.len);
-        mutated[idx] = smith.value(u8);
-    }
-
-    var tmp2 = testing.tmpDir(.{});
-    defer tmp2.cleanup();
-    tmp2.dir.writeFile(testing.io, .{ .sub_path = "m.zip", .data = mutated }) catch return;
-    var f2 = tmp2.dir.openFile(testing.io, "m.zip", .{}) catch return;
-    defer f2.close(testing.io);
-
-    var archive2: Archive = undefined;
-    archive2.init(testing.io, testing.allocator, f2) catch return;
-    defer archive2.deinit();
-    tryEntries(&archive2);
-}
-
 fn fuzzArchiveInit(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const bytes = buf[0..len];
-
-    if (smith.boolWeighted(1, 1) and bytes.len >= 22) {
-        // EOCD signature "PK\x05\x06" in the last 22 bytes (no comment).
-        bytes[bytes.len - 22 ..][0..4].* = .{ 0x50, 0x4b, 0x05, 0x06 };
-    }
-
-    tryRandomBytesPath(bytes);
-    tryMutatedValidPath(smith);
+    // ⚠ ONE byte-first draw. Never `bytes` then a ranged length, and never a
+    // weighted bool before the bytes: see the block comment above for what
+    // that cost this target. The buffer is `ZipCorpus.cap`, which is set by
+    // the largest archive `ArchiveWriter` produces for the corpus — a seed
+    // longer than the buffer reads back EMPTY.
+    var buf: [ZipCorpus.cap]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    tryArchiveBytes(buf[0..len]);
 }
 
 // ── offline write-path anchor (real unzip/zipinfo capture, no subprocess) ─

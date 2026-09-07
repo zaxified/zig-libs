@@ -12,7 +12,6 @@ bip32 2
 bitcoinscript 2
 bitcointx 2
 blindrsa 1
-brotli 1
 bulletproofs 2
 cbor 2
 chachapoly 2
@@ -58,7 +57,6 @@ sntp 1
 sphinx 1
 staticfiles 1
 stun 1
-tar 1
 tenantkex 2
 timelock_envelope 1
 tlock 1
@@ -74,4 +72,3 @@ xmldsig 1
 xmlenc 1
 xmss 1
 yaml 2
-zipstream 1

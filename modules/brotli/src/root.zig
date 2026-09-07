@@ -470,63 +470,119 @@ test "encode: round-trip every input shape" {
 // (verdict FINDING, crashing input preserved); the probe was then
 // removed. The old LCG generator cannot make that claim: instrumented
 // counters put its reach into that branch at zero.
+// ⛔⛔ AND NONE OF THE ABOVE EVER RAN. The reference streams were
+// `@embedFile`d into `fuzz_seed_corpus` and the array was then indexed with
+// `smith.index(fuzz_seed_corpus.len)` — but it was never handed to
+// `std.testing.fuzz` as a `.corpus`, so outside `--fuzz` this target ran the
+// ONE input a corpus-less target gets: the empty one. Every draw in that run
+// therefore collapsed to its minimum. Traced 2026-09-07:
+//
+//   smith.index(14)                     -> 0    -> empty.compressed (1 octet)
+//   smith.boolWeighted(1, 4)            -> false
+//   smith.valueRangeAtMost(u16, 0, 1)   -> 0    -> keep = 0
+//   smith.boolWeighted(2, 1)            -> false -> no extension
+//   len == 0                                    -> no point damage
+//   decompress(allocator, buf[0..0], …)
+//
+// The whole harness — fourteen reference streams, a keep/extend/damage
+// generator, and two paragraphs of measured design justification for it —
+// decompressed the EMPTY SLICE, once, for ever. The reachability claim above
+// (a `@panic` probe in the static-dictionary branch found by a 240 s sweep)
+// was made under `--fuzz`, where the generator does run, and is not evidence
+// about the ordinary lane.
+//
+// The generator is gone, and the reference streams are now the corpus they
+// were always meant to be. That is not a loss: a fuzzer handed real streams
+// mutates them, which is exactly what the hand-rolled keep/extend/damage
+// loop was approximating, and the loop cost the ordinary lane everything.
+//
+// ⚠ The buffer was 1024 octets, and three of this module's own reference
+// streams are 10004, 50096 and 50100 — so the largest inputs the module owns
+// could not have passed through its own harness even with a corpus wired up
+// (`Smith.slice` clamps a length over the buffer and falls back to the range
+// minimum, which is 0: a seed over the buffer is not a big seed, it is the
+// EMPTY one). The buffer is now 51 200, and those three streams — the
+// incompressible one and the two long-window ones — are in the corpus.
 const fuzz_seed_corpus = [_][]const u8{
-    @embedFile("testdata/empty.compressed"),
-    @embedFile("testdata/x.compressed"),
-    @embedFile("testdata/xyzzy.compressed"),
-    @embedFile("testdata/10x10y.compressed"),
-    @embedFile("testdata/64x.compressed"),
-    @embedFile("testdata/zeros.compressed"),
-    @embedFile("testdata/backward65536.compressed"),
-    @embedFile("testdata/quickfox.compressed"),
-    @embedFile("testdata/quickfox_repeated.compressed"), // dictionary + backward refs
-    @embedFile("testdata/ukkonooa.compressed"),
-    @embedFile("testdata/zerosukkanooa.compressed"),
-    @embedFile("testdata/cp852-utf8.compressed"), // complex Huffman, context modeling
-    @embedFile("testdata/monkey.compressed"),
-    @embedFile("testdata/cp1251-utf16le.compressed"),
+    fuzzSeed(@embedFile("testdata/empty.compressed")),
+    fuzzSeed(@embedFile("testdata/x.compressed")),
+    fuzzSeed(@embedFile("testdata/xyzzy.compressed")),
+    fuzzSeed(@embedFile("testdata/10x10y.compressed")),
+    fuzzSeed(@embedFile("testdata/64x.compressed")),
+    fuzzSeed(@embedFile("testdata/zeros.compressed")),
+    fuzzSeed(@embedFile("testdata/backward65536.compressed")),
+    fuzzSeed(@embedFile("testdata/quickfox.compressed")),
+    fuzzSeed(@embedFile("testdata/quickfox_repeated.compressed")), // dictionary + backward refs
+    fuzzSeed(@embedFile("testdata/ukkonooa.compressed")),
+    fuzzSeed(@embedFile("testdata/zerosukkanooa.compressed")),
+    fuzzSeed(@embedFile("testdata/cp852-utf8.compressed")), // complex Huffman, context modeling
+    fuzzSeed(@embedFile("testdata/monkey.compressed")),
+    fuzzSeed(@embedFile("testdata/cp1251-utf16le.compressed")),
+    fuzzSeed(@embedFile("testdata/random_org_10k.bin.compressed")), // 10 004 octets: incompressible, all-literal meta-blocks
+    fuzzSeed(@embedFile("testdata/alice29.txt.compressed")), // 50 096: the long-window, static-dictionary-heavy one
+    fuzzSeed(@embedFile("testdata/compressed_file.compressed")), // 50 100: already-compressed input, the other extreme
+    // The refusals, which the reference streams cannot supply on their own.
+    fuzzSeed(""), // zero length: the ONLY input this target ran before today
+    fuzzSeed("\xff"), // a single octet that is not a valid stream header
+    fuzzSeed("\x1b\x00\x00"), // a truncated header: the window bits arrive, the meta-block does not
 };
 
+/// `testkit.fuzz.seed`, aliased so the corpus above reads as the streams it
+/// is. A corpus entry is not the stream: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw stream would arrive minus its own header.
+const fuzzSeed = @import("testkit").fuzz.seed;
+
+/// The harness's buffer. `alice29.txt.compressed` and
+/// `compressed_file.compressed` are 50 096 and 50 100 octets, and a seed
+/// longer than the buffer reads back EMPTY — so this number is set by the
+/// module's largest reference stream, not by taste.
+const fuzz_buf_len = 51200;
+
 test "fuzz: decompress never panics on arbitrary or mutated br streams" {
-    try testing.fuzz({}, fuzzDecompress, .{});
+    try testing.fuzz({}, fuzzDecompress, .{ .corpus = &fuzz_seed_corpus });
 }
 
 fn fuzzDecompress(_: void, smith: *std.testing.Smith) !void {
-    var buf: [1024]u8 = undefined;
-
-    // Every input starts as a REFERENCE STREAM and is damaged from there.
-    // There is no "pure entropy" branch, because `keep == 0` already is
-    // one: the whole point is that the fuzzer should spend its budget on
-    // inputs that get past the header and the Huffman tables, and only a
-    // stream the reference produced does that reliably.
-    const seed = fuzz_seed_corpus[smith.index(fuzz_seed_corpus.len)];
-    const seed_cap: u16 = @intCast(@min(seed.len, buf.len));
-    const keep: usize = if (smith.boolWeighted(1, 4))
-        seed_cap // 4/5: the whole stream survives, then gets point damage
-    else
-        smith.valueRangeAtMost(u16, 0, seed_cap); // a valid prefix, then fuzzer bytes
-    @memcpy(buf[0..keep], seed[0..keep]);
-    var len: usize = keep;
-
-    // Optionally continue the stream with fuzzer bytes — a hostile
-    // second meta-block behind a header the decoder already accepted.
-    if (len < buf.len and smith.boolWeighted(2, 1)) len += smith.slice(buf[len..]);
-
-    // Point damage inside the surviving part. Kept SMALL on purpose: a
-    // handful of edits leaves the stream decodable far enough to reach the
-    // command loop, the context maps and the static dictionary, whereas
-    // heavy damage is rejected in the header and tests nothing.
-    var muts: usize = 0;
-    while (muts < 8 and len > 0 and !smith.eosWeightedSimple(2, 1)) : (muts += 1) {
-        const i = smith.index(len);
-        buf[i] = switch (smith.value(enum { flip, byte, zero, ones })) {
-            .flip => buf[i] ^ (@as(u8, 1) << smith.valueRangeAtMost(u3, 0, 7)),
-            .byte => smith.value(u8),
-            .zero => 0,
-            .ones => 0xff,
-        };
-    }
+    // ⚠ ONE byte-first draw. Never `smith.index` or a weighted bool before
+    // the bytes: see the block comment above for what that cost this target.
+    var buf: [fuzz_buf_len]u8 = undefined;
+    const len: usize = smith.slice(&buf);
 
     const r = decompress(testing.allocator, buf[0..len], .{ .max_output = 1 << 20 });
     if (r) |ok| testing.allocator.free(ok) else |_| {}
+}
+
+test "corpus: every reference stream reaches the decoder, and the output is pinned" {
+    // ⭐ The measurement, executable. It draws exactly the way the harness
+    // does, because the defect WAS the draw.
+    //
+    // `octets_out` is the second number and it is the load-bearing one:
+    // `decompress("")` is not an error here in the interesting sense — the
+    // empty stream is a legal brotli stream and `empty.compressed` decodes to
+    // nothing — so a "decoded > 0" guard would say very little. Output octets
+    // cannot be produced by an empty input at all, and the number falls the
+    // moment a seed stops reaching the decoder.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var refused: usize = 0;
+    var octets_out: usize = 0;
+    for (fuzz_seed_corpus) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [fuzz_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const out = decompress(testing.allocator, buf[0..len], .{ .max_output = 1 << 20 }) catch {
+            refused += 1;
+            continue;
+        };
+        defer testing.allocator.free(out);
+        decoded += 1;
+        octets_out += out.len;
+    }
+    // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 octets out — the
+    // target decompressed `buf[0..0]` and nothing else, ever.
+    try testing.expectEqual(fuzz_seed_corpus.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 18), decoded);
+    try testing.expectEqual(@as(usize, 2), refused); // the 0xff octet and the truncated header
+    try testing.expectEqual(@as(usize, 981867), octets_out);
 }

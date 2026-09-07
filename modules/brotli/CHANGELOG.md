@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `fuzzDecompress` decompressed the EMPTY SLICE and nothing
+  else, ever. The fourteen google/brotli reference streams were `@embedFile`d into
+  `fuzz_seed_corpus` and indexed with `smith.index(...)` — but the array was **never
+  handed to `std.testing.fuzz` as a `.corpus`**, so outside `--fuzz` the target ran the
+  one input a corpus-less target gets: the empty one, whose every draw collapses to a
+  minimum. Traced 2026-09-07: `index(14)` → 0 (`empty.compressed`, 1 octet),
+  `boolWeighted(1, 4)` → false, `valueRangeAtMost(u16, 0, 1)` → 0, so `keep` = 0, no
+  extension, no point damage, `decompress(allocator, buf[0..0], …)`. The keep/extend/
+  damage generator and its two paragraphs of measured design justification never ran in
+  the ordinary lane at all; the `@panic`-probe reachability claim was made under `--fuzz`
+  and says nothing about it. The generator is gone and the reference streams are now the
+  corpus they were always meant to be — a fuzzer handed real streams mutates them, which
+  is what the generator was approximating. ⚠ The buffer was also 1024 octets while three
+  of this module's own reference streams are 10 004, 50 096 and 50 100, so the largest
+  inputs it owns could not have passed through its own harness even with the corpus wired
+  up; the buffer is now 51 200 and those three are in the corpus. A corpus guard pins
+  19 non-empty seeds, 18 decoded, 2 refused and **981 867 output octets** (0 before).
+
 - **2026-09-06** — **The module no longer ships foreign source, and its test suite no
   longer needs `python3`.** `src/reference_interop.zig` — which embedded a Python
   driver and spawned `python3 -c` from inside `test-brotli` — is gone. The live
