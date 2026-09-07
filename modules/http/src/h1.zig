@@ -1412,36 +1412,192 @@ test "ChunkedWriter: single small write is one exact chunk" {
 // transfer-coding framing of a body) before any higher layer gets to look
 // at them — exactly the "never panic on any input" contract HD1 exists for.
 
+// ⚠ All three used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so `len` was 0 for every
+// input a corpus can carry and all three parsers were handed an EMPTY block
+// while the head sat unread in `buf`. Measured on the seed
+// `"GET / HTTP/1.1\r\n\r\n"`: `buf[0] == 'G'`, `len == 0`. One `slice` draw
+// reads the corpus entry's own length header and hands the bytes over intact.
+//
+// The buffer stays at 512: the largest head literal this module owns is 74
+// octets, and neither `parse` has a size-dependent refusal (`HeadTooLarge`
+// belongs to `readHead`, which is not in these harnesses). The 16 KiB
+// densely-packed head — the worst case for the linear header scan — has its own
+// value test below, which is where a generated fixture belongs.
+
+/// `testkit.fuzz.seed`, aliased so the corpora below read as the heads and
+/// chunked streams they are. A corpus entry is not the frame: the length draw
+/// reads a little-endian `u32` first, so a raw head would arrive minus its own
+/// first four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// Request heads, in the format the length draw reads.
+///
+/// Both halves of what the value tests pin: the heads that parse (all four
+/// framing shapes, both versions, `OPTIONS *`, `Expect:`) and the ones that must
+/// be refused — the request-line shapes, the header-syntax shapes, both
+/// smuggling vectors (double Host, CL/TE), and the bare-LF terminators, which
+/// are the whole reason `stripCrlf` exists.
+const request_head_seeds = [_][]const u8{
+    seed("GET /x/y?q=1 HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n"), // the ordinary GET
+    seed("POST /submit HTTP/1.1\r\nHost: h\r\nContent-Length: 11\r\n"), // Content-Length framing
+    seed("PUT /up HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n"), // chunked wins, `has_content_length` still set
+    seed("GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n"), // the 1.0 persistence opt-in
+    seed("OPTIONS * HTTP/1.1\r\nHost: h\r\n"), // the asterisk-form target
+    seed("POST /u HTTP/1.1\r\nHost: h\r\nExpect: 100-Continue\r\nContent-Length: 1\r\n"), // Expect: 100-continue
+    seed("DELETE /d HTTP/1.1\r\nHost: h\r\nConnection: close\r\n"), // Connection: close
+    seed("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 7\r\nContent-Length: 7\r\n"), // duplicate identical lengths are tolerated
+    seed("GET / HTTP/1.1\r\nHost: h\r\nX-A: 1\r\nX-B: 2\r\n"), // several ordinary headers, for `iterate`
+    seed("GET\r\n"), // no spaces in the request line
+    seed("GET / HTTP/1.1 extra\r\n"), // a third space
+    seed("G@T / HTTP/1.1\r\n"), // '@' is not a tchar
+    seed("GET / http/1.1\r\n"), // the version name is case-sensitive
+    seed("GET / HTTP/2.0\r\n"), // UnsupportedVersion, not MalformedHead
+    seed("PRI * HTTP/2.0\r\n"), // the h2 preface arriving at an h1 parser
+    seed("GET / HTTP/1.1\r\nBad Name: x\r\n"), // whitespace before the colon
+    seed("GET / HTTP/1.1\r\nA: 1\r\n folded\r\n"), // obs-fold
+    seed("GET / HTTP/1.1\r\nX: va\x00lue\r\n"), // a NUL inside a field value
+    seed("GET /caf\xc3\xa9 HTTP/1.1\r\n"), // a non-ASCII byte in the request-target
+    seed("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n"), // two Host headers: request smuggling
+    seed("GET / HTTP/1.1\r\nHost: u@h\r\n"), // userinfo in the Host
+    seed("POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked, chunked\r\n"), // the TE.TE double-chunk vector
+    seed("POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n"), // chunked not the sole coding
+    seed("POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: +5\r\n"), // a signed Content-Length
+    seed("GET / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n"), // conflicting lengths
+    seed("GET / HTTP/1.1\nHost: h\r\n"), // a bare-LF request line
+    seed("GET / HTTP/1.1\r\nHost: h\nAccept: */*\r\n"), // a bare-LF header line
+};
+
 test "fuzz: RequestHead.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzRequestHeadParse, .{});
+    try testing.fuzz({}, fuzzRequestHeadParse, .{ .corpus = &request_head_seeds });
 }
 
 fn fuzzRequestHeadParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     _ = RequestHead.parse(buf[0..len]) catch return;
 }
 
+test "corpus: every request-head seed reaches the parser, and what it walked is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. The seed
+    // count is one number and the headers walked is the other: `parse("")` is
+    // `error.MalformedHead`, so a bare "some seeds were accepted" would already
+    // have been satisfied by a corpus of one-line request lines carrying no
+    // header block at all — and the header block is where every framing and
+    // smuggling decision in this file is made.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var headers_walked: usize = 0;
+    for (request_head_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const head = RequestHead.parse(buf[0..len]) catch continue;
+        accepted += 1;
+        var it = head.iterate();
+        while (it.next()) |_| headers_walked += 1;
+    }
+    try testing.expectEqual(request_head_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 27 seeds non-empty, 0 accepted and 0 headers
+    // walked before the draw was fixed; 27 / 11 / 24 after.
+    try testing.expectEqual(@as(usize, 11), accepted);
+    try testing.expectEqual(@as(usize, 24), headers_walked);
+}
+
+/// Response heads, in the format the length draw reads. Same split: the status
+/// lines and framing headers that parse, then every refusal the value tests
+/// pin — a client believes far more of a response than a server does of a
+/// request, so the refusals are the load-bearing half here.
+const response_head_seeds = [_][]const u8{
+    seed("HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\n"), // the ordinary response head
+    seed("HTTP/1.1 204\r\n"), // a status line with no reason phrase
+    seed("HTTP/1.0 302 Found\r\n"), // the 1.0 version flag
+    seed("HTTP/1.1 404 Not Found\r\n"), // a multi-word reason phrase
+    seed("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nServer: x\r\n"), // Content-Length framing
+    seed("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nTransfer-Encoding: gzip, Chunked\r\n"), // chunked wins over Content-Length
+    seed("HTTP/1.1 200 OK\r\nConnection: keep-alive, Close\r\n"), // a two-token Connection list
+    seed("HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\n"), // the 1.0 persistence opt-in
+    seed("HTTP/1.1 301 Moved\r\nLocation: /new\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n"), // a repeated header, for `iterate`
+    seed("HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Length: 7\r\n"), // duplicate identical lengths are tolerated
+    seed("HTTP/1.1\r\n"), // a status line too short to hold a status code
+    seed("HTTP/1.1 20 OK\r\n"), // a two-digit status
+    seed("HTTP/1.1 abc\r\n"), // a non-numeric status
+    seed("ICY 200 OK\r\n"), // the Shoutcast status line: not HTTP at all
+    seed("HTTP/2.0 200 OK\r\n"), // UnsupportedVersion
+    seed("HTTP/1.9 200 OK\r\n"), // an unknown 1.x minor
+    seed("HTTP/1.1 200 OK\r\nNoColonHere\r\n"), // a header line with no colon
+    seed("HTTP/1.1 200 OK\r\n: empty-name\r\n"), // an empty header name
+    seed("HTTP/1.1 200 OK\r\nBad Name: x\r\n"), // whitespace before the colon
+    seed("HTTP/1.1 200 OK\r\nA: 1\r\n folded\r\n"), // obs-fold
+    seed("HTTP/1.1 200 OK\r\nContent-Length: 12x\r\n"), // trailing garbage in a length
+    seed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n"), // conflicting lengths
+    seed("HTTP/1.1 200 OK\r\nContent-Length: \r\n"), // an empty length
+    seed("HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999\r\n"), // a length that overflows u64
+};
+
 test "fuzz: ResponseHead.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzResponseHeadParse, .{});
+    try testing.fuzz({}, fuzzResponseHeadParse, .{ .corpus = &response_head_seeds });
 }
 
 fn fuzzResponseHeadParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     _ = ResponseHead.parse(buf[0..len]) catch return;
 }
 
+test "corpus: every response-head seed reaches the parser, and what it walked is pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var headers_walked: usize = 0;
+    for (response_head_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const head = ResponseHead.parse(buf[0..len]) catch continue;
+        accepted += 1;
+        var it = head.iterate();
+        while (it.next()) |_| headers_walked += 1;
+    }
+    try testing.expectEqual(response_head_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 24 seeds non-empty, 0 accepted and 0 headers
+    // walked before the draw was fixed; 24 / 10 / 13 after.
+    try testing.expectEqual(@as(usize, 10), accepted);
+    try testing.expectEqual(@as(usize, 13), headers_walked);
+}
+
+/// Chunked transfer-coding streams, in the format the length draw reads. The
+/// decoded bodies stay well inside the 512-octet output buffer below, so a seed
+/// is never truncated by the sink rather than by the decoder.
+const chunked_seeds = [_][]const u8{
+    seed("4\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\n\r\n"), // the RFC's own example, three chunks
+    seed("0\r\n\r\n"), // an empty body: just the terminator
+    seed("a\r\n0123456789\r\n0\r\n\r\n"), // a lower-case hex size
+    seed("A\r\n0123456789\r\n0\r\n\r\n"), // the same size in upper case
+    seed("3;ext=1;q=\"x\"\r\nabc\r\n0\r\n\r\n"), // chunk extensions, one of them quoted
+    seed("3\r\nabc\r\n0\r\nX-Trailer: v\r\nX-More: w\r\n\r\n"), // two trailer fields
+    seed("3\r\nabc\r\n0\r\nX-Checksum: deadbeef\r\nX-Rows: 3\r\n\r\n"), // the trailers the capture test pins
+    seed("zz\r\nab\r\n0\r\n\r\n"), // a chunk size that is not hex
+    seed("\r\nab\r\n0\r\n\r\n"), // an empty chunk-size line
+    seed("3\r\nabcX\r\n0\r\n\r\n"), // a chunk not followed by CRLF
+    seed("5\r\nab"), // a chunk truncated mid-data
+    seed("3\r\nabc\r\n"), // truncated before the terminating chunk
+    seed("3\r\nabc\r\n0\r\n"), // terminating chunk with no final CRLF
+    seed("ffffffffffffffff\r\n"), // a chunk size at the u64 ceiling
+    seed("10000000000000000\r\n"), // a chunk size one hex digit past it
+    seed("1\r\na\r\n1\r\nb\r\n1\r\nc\r\n1\r\nd\r\n0\r\n\r\n"), // many one-octet chunks: the refill path
+};
+
 test "fuzz: ChunkedReader never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzChunkedReader, .{});
+    try testing.fuzz({}, fuzzChunkedReader, .{ .corpus = &chunked_seeds });
 }
 
 fn fuzzChunkedReader(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     var src: Reader = .fixed(buf[0..len]);
     var cbuf: [64]u8 = undefined;
@@ -1454,6 +1610,45 @@ fn fuzzChunkedReader(_: void, smith: *std.testing.Smith) !void {
     // (the fixed output buffer bounds `streamRemaining`'s work even if it
     // did loop).
     _ = cr.reader.streamRemaining(&w) catch {};
+}
+
+test "corpus: every chunked seed reaches the decoder, and the octets decoded are pinned" {
+    // Decoded octets rather than "no error": `streamRemaining` over an EMPTY
+    // stream returns cleanly with nothing written, so a guard that only asked
+    // whether the call succeeded would have been green on the collapsed draw
+    // it exists to catch. Octets an empty stream cannot produce is the number
+    // that falls.
+    var nonempty: usize = 0;
+    var decoded_octets: usize = 0;
+    var refused: usize = 0;
+    var trailers_seen: usize = 0;
+    for (chunked_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        var src: Reader = .fixed(buf[0..len]);
+        var cbuf: [64]u8 = undefined;
+        var trailer_buf: [64]u8 = undefined;
+        var cr: ChunkedReader = .initCapturingTrailers(&src, &cbuf, &trailer_buf);
+        var out: [512]u8 = undefined;
+        var w: Writer = .fixed(&out);
+        if (cr.reader.streamRemaining(&w)) |_| {
+            decoded_octets += w.buffered().len;
+        } else |_| {
+            refused += 1;
+            decoded_octets += w.buffered().len; // a truncated stream still decodes a prefix
+        }
+        if (cr.trailers().len != 0) trailers_seen += 1;
+    }
+    try testing.expectEqual(chunked_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 16 seeds non-empty, 0 octets decoded, 0
+    // refusals and 0 trailer blocks before the draw was fixed;
+    // 16 / 67 / 8 / 2 after.
+    try testing.expectEqual(@as(usize, 67), decoded_octets);
+    try testing.expectEqual(@as(usize, 8), refused);
+    try testing.expectEqual(@as(usize, 2), trailers_seen);
 }
 
 test "RequestHead: a head packed with minimal headers is bounded by bytes, not by a count" {

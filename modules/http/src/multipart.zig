@@ -383,15 +383,130 @@ test "malformed bodies → MalformedBody" {
 // than looping — this harness exercises that termination directly, not
 // just via an iteration cap.
 
+// ⚠ This used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so `len` was 0 on every
+// input a corpus can carry and the parser was handed an EMPTY body, which
+// refuses at the first `indexOf` without walking a single part. The whole
+// "`it.rest` strictly shrinks" argument above was therefore never exercised.
+// One `slice` draw reads the corpus entry's own length header instead.
+//
+// The 512-octet buffer is checked against the module's own largest fixture:
+// the two-part happy-path body below is 276 octets, and every other body this
+// module owns is shorter.
+
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the request bodies
+/// it is. A corpus entry is not the frame: the length draw reads a
+/// little-endian `u32` first, so a raw body would arrive minus its own first
+/// four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// `multipart/form-data` bodies against `test_boundary`, in the format the
+/// length draw reads. Undirected bytes cannot produce a delimiter line — the
+/// dash-boundary alone is 30 octets — so without these the harness never got
+/// past the first `MalformedBody` and none of the header, limit or
+/// binary-safety paths below ran at all.
+const multipart_seeds = [_][]const u8{
+    seed(db ++ crlf ++ // the two-part happy path: a text field and a file upload
+        "Content-Disposition: form-data; name=\"title\"" ++ crlf ++ crlf ++
+        "Hello, world" ++ crlf ++
+        db ++ crlf ++
+        "Content-Disposition: form-data; name=\"file\"; filename=\"report.pdf\"" ++ crlf ++
+        "Content-Type: application/pdf" ++ crlf ++ crlf ++
+        "%PDF-1.7 fake" ++ crlf ++
+        db ++ "--" ++ crlf),
+    seed(db ++ crlf ++ // a body carrying CRLF, the bare boundary text and NUL/high bytes
+        "Content-Disposition: form-data; name=\"blob\"" ++ crlf ++ crlf ++
+        "line1\r\nline2 " ++ test_boundary ++ " zz" ++ db ++ "\x00\xff tail" ++ crlf ++
+        db ++ "--" ++ crlf),
+    seed("This preamble is ignored (RFC 2046)." ++ crlf ++ // preamble, transport-padding, epilogue
+        db ++ " \t" ++ crlf ++
+        "Content-Disposition: form-data; name=\"a\"" ++ crlf ++ crlf ++
+        "1" ++ crlf ++
+        db ++ "--" ++ crlf ++
+        "Epilogue junk, also ignored."),
+    seed(db ++ crlf ++ // a ';' and spaces inside the quoted filename
+        "Content-Disposition: form-data; name=\"up\"; filename=\"we;ird name(1).txt\"" ++ crlf ++ crlf ++
+        "data" ++ crlf ++
+        db ++ "--" ++ crlf),
+    seed(db ++ crlf ++ crlf ++ "raw" ++ crlf ++ db ++ "--" ++ crlf), // no part headers at all
+    seed(db ++ crlf ++ // a repeated custom header with OWS around its value
+        "Content-Disposition: form-data; name=\"x\"" ++ crlf ++
+        "X-Custom-Meta: \t tagged value \t" ++ crlf ++
+        "X-Custom-Meta: second (ignored)" ++ crlf ++ crlf ++
+        "v" ++ crlf ++
+        db ++ "--" ++ crlf),
+    seed(db ++ crlf ++ // two parts, which is what `max_parts` counts
+        "Content-Disposition: form-data; name=\"a\"" ++ crlf ++ crlf ++ "1" ++ crlf ++
+        db ++ crlf ++
+        "Content-Disposition: form-data; name=\"b\"" ++ crlf ++ crlf ++ "2" ++ crlf ++
+        db ++ "--" ++ crlf),
+    seed(db ++ crlf ++ // an empty part body between two delimiters
+        "Content-Disposition: form-data; name=\"e\"" ++ crlf ++ crlf ++ crlf ++
+        db ++ "--" ++ crlf),
+    seed("no delimiter here"), // no opening delimiter at all
+    seed("xx" ++ db ++ crlf), // a dash-boundary neither at offset 0 nor after a CRLF
+    seed(db ++ crlf ++ // headers never terminated by a blank line
+        "Content-Disposition: form-data; name=\"a\"" ++ crlf ++
+        db ++ "--" ++ crlf),
+    seed(db ++ crlf ++ // no closing delimiter: the body runs off the end
+        "Content-Disposition: form-data; name=\"a\"" ++ crlf ++ crlf ++
+        "body with no end"),
+    seed(db ++ "junk" ++ crlf), // a delimiter line followed by neither CRLF nor "--"
+    seed(db), // the dash-boundary and nothing after it
+    seed(db ++ "--"), // the closing delimiter with no trailing CRLF
+};
+
 test "fuzz: multipart parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzMultipartParse, .{});
+    try testing.fuzz({}, fuzzMultipartParse, .{ .corpus = &multipart_seeds });
 }
 
 fn fuzzMultipartParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     var it = parse(buf[0..len], test_boundary, .{});
     while (it.next() catch return) |_| {}
+}
+
+test "corpus: every multipart seed reaches the parser, and the parts walked are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, drawing
+    // exactly the way the harness does.
+    //
+    // Parts walked is the second number and it is the one with teeth: an empty
+    // body is refused, so "some seeds errored" was true of the collapsed draw
+    // as well — it was true of EVERY input it ever ran. A part yielded, and
+    // the octets of body it carried, are things no empty input can produce.
+    var nonempty: usize = 0;
+    var parts: usize = 0;
+    var body_octets: usize = 0;
+    var named: usize = 0;
+    var refused: usize = 0;
+    for (multipart_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        var it = parse(buf[0..len], test_boundary, .{});
+        while (true) {
+            const p = it.next() catch {
+                refused += 1;
+                break;
+            } orelse break;
+            parts += 1;
+            body_octets += p.value.len;
+            if (p.name != null) named += 1;
+        }
+    }
+    try testing.expectEqual(multipart_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 15 seeds non-empty, 0 parts walked, 0 body
+    // octets, 0 named parts and 15 refusals before the draw was fixed (every
+    // input the harness ever ran was the same empty body); 15 / 10 / 117 /
+    // 9 / 6 after.
+    try testing.expectEqual(@as(usize, 10), parts);
+    try testing.expectEqual(@as(usize, 117), body_octets);
+    try testing.expectEqual(@as(usize, 9), named);
+    try testing.expectEqual(@as(usize, 6), refused);
 }

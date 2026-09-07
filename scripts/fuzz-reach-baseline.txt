@@ -51,14 +51,12 @@ frost 1
 fuzzysearch 2
 geoindex 2
 grpc 3
-http 12
 ibe 1
 icmp 1
 iec104 4
 isis 1
 isis-lsdb 2
 isis-spf 1
-jinja 5
 json5 2
 jwe 2
 jwt 3

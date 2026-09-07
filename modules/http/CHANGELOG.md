@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **All twelve fuzz harnesses were replaying an EMPTY input, and now
+  each has a corpus with a measured reach guard.** Every one of them opened with
+  `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes`
+  consumes `min(buf.len, in.len)` octets and a ranged draw then reads eight *more* as a
+  little-endian u64, returning the range minimum when fewer remain — so the drawn length
+  was 0 for every input a seed can carry, and the parser under test was handed a
+  zero-length slice while the frame sat unread in `buf` (measured with the seed
+  `"GET / HTTP/1.1\r\n\r\n"`: `buf[0] == 'G'`, `len == 0`). Outside `--fuzz` the lane
+  replays a target's corpus and then one round of `in = ""`, and none of these had a
+  corpus, so each of the twelve had executed exactly one input for its whole life.
+  Each now draws with a single `smith.slice(&buf)` and carries a corpus quoted from the
+  module's own value tests — h1 request/response heads and chunked streams, HPACK blocks
+  and Huffman strings from RFC 7541 Appendix C, whole §6 HTTP/2 frames and both sides of
+  the §3.4 handshake, media types, urlencoded bodies, multipart bodies and `Range` sets —
+  plus one `corpus:` test per harness pinning what was reached. Measured before → after,
+  non-empty seeds and the second number each guard pins: `ContentType` 0→12 seeds,
+  0→11 parameters walked; `urlencoded` 0→12, 0→18 pairs; `RequestHead.parse` 0→27,
+  0→24 headers walked; `ResponseHead.parse` 0→24, 0→13; `ChunkedReader` 0→16, 0→67
+  octets decoded; `parseFrame` 0→28, 0→197 payload octets (its header WAS drawn, but
+  `h.length` was forced to 0, so every §6 payload branch was unreachable);
+  `Connection.recv` cold 0→9 seeds / 0→4 events, warm 0→15 / 0→10; `decodeBlock` 0→27,
+  0→22 fields; the Huffman differential 0→15, 0→171 octets (it had been asserting that
+  two decoders agree on the empty string); `multipart` 0→15, 0→10 parts; `Range` 0→26,
+  0→28 specs. ⚠ Each guard pins a number an *empty* input cannot produce, not
+  "something was accepted": an empty HPACK block, an empty urlencoded body and an empty
+  multipart part list are all legal or silent here, so an acceptance count would have
+  stayed green through the whole collapse.
+
 - **2026-09-06** — **A cross-origin redirect hop no longer carries the caller's `Host` or
   `Proxy-Authorization`, and `RequestOptions.redirect_filter` is the destination gate** (A1
   G3, G4, G5). Measured over two loopback hops: `Host: vhost.internal` and

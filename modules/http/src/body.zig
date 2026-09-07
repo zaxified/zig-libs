@@ -285,30 +285,141 @@ test "urlencoded: empty buffer yields nothing" {
 // both attacker-controlled); `urlencoded` decodes an
 // `application/x-www-form-urlencoded` body in place. Both are untrusted-
 // wire parsers with no existing fuzz coverage.
+//
+// ⚠ Both harnesses used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and a ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so the length was 0 on
+// every input a corpus can carry, and both parsers were handed an empty slice
+// while the header sat unread in `buf`. One `slice` draw fixes both halves:
+// it reads the corpus entry's own length header and hands the bytes over
+// intact.
+
+/// `testkit.fuzz.seed`, aliased so the corpora below read as the header values
+/// and bodies they are. A corpus entry is not the frame: the draw reads a
+/// little-endian `u32` length first, so a raw header would arrive minus its own
+/// first four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// Media-type header values, in the format the length draw reads.
+///
+/// Every shape the value tests above pin, plus the quoting edges `multipart`
+/// depends on: a `;` inside a quoted boundary, a `\`-escape inside one, and an
+/// unterminated quote (which makes `indexOfUnquoted` run to the end of the
+/// header — the loop this harness exists to bound).
+const content_type_seeds = [_][]const u8{
+    seed("application/json"), // no parameters at all
+    seed("  text/html ; "), // leading/trailing space and a trailing empty parameter section
+    seed("  ; charset=utf-8"), // no media type before the ';' → parse returns null
+    seed("text/plain; charset=utf-8; format=Flowed"), // two token parameters
+    seed("multipart/form-data; boundary=\"a;b=c\""), // a ';' inside a quoted value must not split
+    seed("multipart/form-data; boundary=----XYZ"), // an ordinary token boundary
+    seed("a/b; x=1; flag; y=\"two\""), // a valueless parameter between two valued ones
+    seed("multipart/form-data; boundary=\"a\\\"b\""), // a '\'-escaped quote inside the value
+    seed("text/plain; charset=\"utf-8"), // unterminated quote: the scan runs to the end
+    seed("application/x-www-form-urlencoded"), // the sibling body type
+    seed("text/plain;;;=1;  ;name="), // empty names and an empty value, all skipped or empty
+    seed("application/json\t; charset=\tUTF-8\t"), // tabs are the other OWS byte
+};
 
 test "fuzz: ContentType.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzContentType, .{});
+    try testing.fuzz({}, fuzzContentType, .{ .corpus = &content_type_seeds });
 }
 
 fn fuzzContentType(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     const ct = ContentType.parse(buf[0..len]) orelse return;
     var it = ct.params();
     while (it.next()) |_| {}
 }
 
+test "corpus: every media-type seed reaches the parser, and the parameters walked are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. It draws
+    // exactly the way the harness does, because a guard measuring a different
+    // draw from the one the harness gets is not a guard — and the defect was in
+    // the draw.
+    //
+    // `params` is the second number, and it is the one that matters:
+    // `ContentType.parse("")` returns null, so a "parsed > 0" guard would have
+    // been satisfied by any seed carrying a single letter. Parameters walked
+    // cannot be produced by an empty input at all.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var params_walked: usize = 0;
+    for (content_type_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const ct = ContentType.parse(buf[0..len]) orelse continue;
+        parsed += 1;
+        var it = ct.params();
+        while (it.next()) |_| params_walked += 1;
+    }
+    try testing.expectEqual(content_type_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 12 seeds non-empty, 0 parsed and 0 parameters
+    // walked before the draw was fixed; 12 / 11 / 11 after.
+    try testing.expectEqual(@as(usize, 11), parsed); // the ";  charset" seed is the one legal refusal
+    try testing.expectEqual(@as(usize, 11), params_walked);
+}
+
+/// `application/x-www-form-urlencoded` bodies, in the format the length draw
+/// reads. Percent-decoding is done IN PLACE, so the interesting seeds are the
+/// ones where the decoded field is shorter than the encoded one, and the ones
+/// where a `%` escape is truncated at the very end of the buffer.
+const urlencoded_seeds = [_][]const u8{
+    seed("name=John+Doe&city=New%20York&flag&empty="), // the four pair shapes the value tests pin
+    seed("a%2Bb=1%2B1&&x=%41"), // %2B is a literal '+', and the empty field between && is skipped
+    seed("q=hello"), // the smallest real pair
+    seed("%"), // a percent escape truncated by the end of the body
+    seed("a=%2"), // a percent escape one octet short
+    seed("a=%zz&b=%2G"), // percent escapes whose digits are not hex
+    seed("&&&&"), // nothing but separators
+    seed("=value"), // an empty name
+    seed("a=1&a=2&a=3"), // a repeated key
+    seed("k=%00%01%ff"), // NUL and high bytes decoded in place
+    seed("+++=+++"), // '+' on both sides of the '='
+    seed("a"), // a valueless field with no '=' at all
+};
+
 test "fuzz: urlencoded never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzUrlencoded, .{});
+    try testing.fuzz({}, fuzzUrlencoded, .{ .corpus = &urlencoded_seeds });
 }
 
 fn fuzzUrlencoded(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     var it = urlencoded(buf[0..len]);
     while (it.next()) |_| {}
+}
+
+test "corpus: every urlencoded seed reaches the decoder, and the pairs yielded are pinned" {
+    // Pairs yielded rather than "it did not crash": `urlencoded("")` yields
+    // nothing and returns cleanly, so there is no error path a guard could
+    // count. The empty input yields exactly zero pairs, which is why this
+    // number is the one that falls if the draw ever collapses again.
+    var nonempty: usize = 0;
+    var pairs: usize = 0;
+    var decoded_octets: usize = 0;
+    for (urlencoded_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var it = urlencoded(buf[0..len]);
+        while (it.next()) |p| {
+            pairs += 1;
+            // The in-place decode is the part carrying a memory-safety
+            // argument, so count what it actually produced, not just calls.
+            decoded_octets += p.name.len + p.value.len;
+        }
+    }
+    try testing.expectEqual(urlencoded_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 12 seeds non-empty, 0 pairs and 0 decoded
+    // octets before the draw was fixed; 12 / 18 / 81 after.
+    try testing.expectEqual(@as(usize, 18), pairs);
+    try testing.expectEqual(@as(usize, 81), decoded_octets);
 }

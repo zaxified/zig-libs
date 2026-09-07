@@ -1730,19 +1730,110 @@ test "decoder: setMaxTableSize shrinks the live table" {
 // reassembled by `h2.zig` before being handed here) — every integer, string
 // length, Huffman code, and dynamic-table index in it is hostile input.
 
+// ⚠ Both harnesses used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so `len` was 0 on every
+// input a corpus can carry, and the decoder was handed an EMPTY block. An
+// empty HPACK block is *legal* (see "Empty block is fine" below), so this
+// collapse produced a clean success on every run and nothing about it looked
+// wrong. One `slice` draw reads the corpus entry's own length header instead.
+//
+// 512 octets is comfortably past the largest block this module owns: the
+// RFC 7541 C.5 third response is 98 octets.
+
+/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the Appendix C
+/// blocks it is quoting. A corpus entry is not the frame: the length draw reads
+/// a little-endian `u32` first, so a raw block would arrive minus its own first
+/// four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seedHex = @import("testkit").fuzz.seedHex;
+
+/// HPACK header blocks, in the format the length draw reads.
+///
+/// The RFC 7541 Appendix C worked examples this file already pins as
+/// known-answer tests, plus the refusals from "decoder: malformed inputs return
+/// clean errors". ⚠ The harness gives each block a FRESH decoder, so a block
+/// quoted from the middle of a C.3/C.4/C.5/C.6 sequence references a dynamic
+/// table that does not exist yet and is refused rather than decoded — which is
+/// itself the "index beyond the tables" hostile shape, and is why the
+/// self-contained insert-then-reference block below is in the list too.
+const decode_block_seeds = [_][]const u8{
+    seedHex("400a637573746f6d2d6b65790d637573746f6d2d686561646572"), // C.2.1 literal with incremental indexing
+    seedHex("040c2f73616d706c652f70617468"), // C.2.2 literal without indexing
+    seedHex("1008" ++ "70617373776f7264" ++ "06" ++ "736563726574"), // C.2.3 literal never indexed (password/secret)
+    seedHex("82"), // C.2.4 indexed header field (static index 2)
+    seedHex("82868441" ++ "0f7777772e6578616d706c652e636f6d"), // C.3 first request, no Huffman
+    seedHex("828684be" ++ "58086e6f2d6361636865"), // C.3 second: `be` needs the table the first block built
+    seedHex("828785bf" ++ "400a637573746f6d2d6b65790c637573746f6d2d76616c7565"), // C.3 third
+    seedHex("82868441" ++ "8cf1e3c2e5f23a6ba0ab90f4ff"), // C.4 first request, Huffman-coded authority
+    seedHex("828684be" ++ "5886a8eb10649cbf"), // C.4 second
+    seedHex("828785bf" ++ "408825a849e95ba97d7f8925a849e95bb8e8b4bf"), // C.4 third
+    seedHex("4803333032" ++ "580770726976617465" ++
+        "611d4d6f6e2c203231204f637420323031332032303a31333a323120474d54" ++
+        "6e1768747470733a2f2f7777772e6578616d706c652e636f6d"), // C.5 first response, no Huffman
+    seedHex("4803333037c1c0bf"), // C.5 second: three dynamic-table references
+    seedHex("48826402" ++ "5885aec3771a4b" ++ "6196d07abe941054d444a8200595040b8166e082a62d1bff" ++
+        "6e919d29ad171863c78f0b97c8e9ae82ae43d3"), // C.6 first response, all four values Huffman-coded
+    seedHex("4883640effc1c0bf"), // C.6 second
+    seedHex("400a637573746f6d2d6b65790d637573746f6d2d686561646572be"), // insert, then reference the new entry at index 62
+    seedHex("203f45"), // two dynamic-table size updates in one block (§6.3)
+    seedHex("80"), // index 0 is not a header field
+    seedHex("c5"), // an index past the static and (empty) dynamic tables
+    seedHex("7f2f00"), // a literal whose NAME index is past the tables
+    seedHex("ff"), // a prefix integer with no continuation octets
+    seedHex("ff8080"), // a continuation that never terminates
+    seedHex("ffffffffff0f"), // a prefix integer that overflows
+    seedHex("00056162"), // a string literal shorter than its declared length
+    seedHex("007f"), // the string length integer itself truncated
+    seedHex("0081ff0178"), // bad Huffman padding inside a string literal
+    seedHex("0084ffffffff0178"), // an explicit EOS inside a string literal
+    seedHex("8220"), // a size update after the first field is malformed
+};
+
 test "fuzz: Decoder.decodeBlock never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeBlock, .{});
+    try testing.fuzz({}, fuzzDecodeBlock, .{ .corpus = &decode_block_seeds });
 }
 
 fn fuzzDecodeBlock(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     var dec: Decoder = .init(testing.allocator, .{});
     defer dec.deinit();
     var hl = dec.decodeBlock(buf[0..len]) catch return;
     hl.deinit(testing.allocator);
+}
+
+test "corpus: every header-block seed reaches the decoder, and the fields decoded are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, drawing
+    // exactly the way the harness does.
+    //
+    // Fields decoded is the number that matters, and this file says why in its
+    // own words: "Empty block is fine" — `decodeBlock(&.{})` returns a
+    // zero-field list with no error. So "some seeds were accepted" was TRUE
+    // for the collapsed draw too, on every one of its runs. A field an empty
+    // block cannot produce is what falls if the draw ever collapses again.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var fields: usize = 0;
+    for (decode_block_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        var dec: Decoder = .init(testing.allocator, .{});
+        defer dec.deinit();
+        var hl = dec.decodeBlock(buf[0..len]) catch continue;
+        defer hl.deinit(testing.allocator);
+        accepted += 1;
+        fields += hl.fields.len;
+    }
+    try testing.expectEqual(decode_block_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 27 seeds non-empty, 0 accepted and 0 fields
+    // decoded before the draw was fixed; 27 / 10 / 22 after.
+    try testing.expectEqual(@as(usize, 10), accepted);
+    try testing.expectEqual(@as(usize, 22), fields);
 }
 
 // ── differential: the table-driven Huffman decoder vs the bit-walk ─────────
@@ -1797,13 +1888,68 @@ test "huffman: table decoder matches the bit-walk on round-trips and edges" {
     try expectHuffmanDecodersAgree(&.{0x07}); // '0' + 3 one-bits: valid
 }
 
+/// Huffman-coded strings, in the format the length draw reads.
+///
+/// Every one of these is lifted out of an Appendix C block above — the string
+/// literal's octets with its length prefix removed — so the corpus is the
+/// RFC's own coded data rather than bytes chosen to look plausible. Then the
+/// four padding edges the value test beside this one already pins: those are
+/// where the two decoders can disagree, since the table bakes the §5.2 padding
+/// rules in at comptime and the bit-walk applies them at run time.
+const huffman_seeds = [_][]const u8{
+    seedHex("f1e3c2e5f23a6ba0ab90f4ff"), // C.4: "www.example.com"
+    seedHex("a8eb10649cbf"), // C.4: "no-cache"
+    seedHex("25a849e95ba97d7f"), // C.4: "custom-key"
+    seedHex("25a849e95bb8e8b4bf"), // C.4: "custom-value"
+    seedHex("6402"), // C.6: "302"
+    seedHex("640eff"), // C.6: "307" — the 3-octet spelling, with padding
+    seedHex("aec3771a4b"), // C.6: "private"
+    seedHex("d07abe941054d444a8200595040b8166e082a62d1bff"), // C.6: "Mon, 21 Oct 2013 20:13:21 GMT"
+    seedHex("9d29ad171863c78f0b97c8e9ae82ae43d3"), // C.6: "https://www.example.com"
+    seedHex("9bd9ab"), // C.6: "gzip"
+    seedHex("94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007"), // C.6: the 55-octet set-cookie
+    seedHex("ff"), // 8 bits of EOS prefix: too much padding
+    seedHex("ffffffff"), // into the EOS code itself
+    seedHex("00"), // '0' plus three zero pad bits: bad padding
+    seedHex("07"), // '0' plus three one bits: valid
+};
+
 test "fuzz: huffman table decoder always agrees with the bit-walk" {
-    try testing.fuzz({}, fuzzHuffmanDifferential, .{});
+    try testing.fuzz({}, fuzzHuffmanDifferential, .{ .corpus = &huffman_seeds });
 }
 
 fn fuzzHuffmanDifferential(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     try expectHuffmanDecodersAgree(buf[0..len]);
+}
+
+test "corpus: every huffman seed reaches both decoders, and the octets decoded are pinned" {
+    // Octets, not calls: `huffmanDecodeAppend("")` succeeds with nothing
+    // written and the two decoders trivially agree on it, so the collapsed
+    // draw made this differential assert that two decoders produce the same
+    // empty string — for every input, for as long as it ran. Decoded octets is
+    // the number an empty input cannot produce.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var refused: usize = 0;
+    for (huffman_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        try expectHuffmanDecodersAgree(buf[0..len]);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        if (huffmanDecodeAppend(testing.allocator, &out, buf[0..len], 4096)) |_| {
+            decoded += out.items.len;
+        } else |_| refused += 1;
+    }
+    try testing.expectEqual(huffman_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 15 seeds non-empty, 0 octets decoded and 0
+    // refusals before the draw was fixed; 15 / 171 / 3 after.
+    try testing.expectEqual(@as(usize, 171), decoded);
+    try testing.expectEqual(@as(usize, 3), refused);
 }

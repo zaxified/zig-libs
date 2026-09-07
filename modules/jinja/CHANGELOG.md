@@ -5,6 +5,41 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **All five fuzz harnesses were replaying one fixed input — the empty
+  template, the empty context datum, one table entry of 32 — and now each has a corpus
+  with a measured reach guard.** Every target opened with a ranged draw
+  (`smith.indexWithHash(buf.len, 0)`, `smith.index(num_sites.len)`,
+  `smith.index(escape_sites.len)`), and a ranged draw reads eight input octets as a
+  little-endian u64 and returns the range MINIMUM unless that whole word already lies
+  inside the range. Outside `--fuzz` the lane replays a target's corpus and then one round
+  of `in = ""`; none of the five had a corpus. So: `fuzzCompileAndRender` and
+  `fuzzWhitespaceOptions` compiled the EMPTY template, every time, for their whole life —
+  and the empty template compiles and renders without error, so nothing looked wrong;
+  `fuzzCompileAndRender`'s context datum `s` (the attacker-*data* path F12 added) was
+  empty on every run as well; `fuzzNumericArgs` rendered `num_sites[0]` with the number 0
+  as an integer literal — 1 of its 96 (site × spelling) combinations, because the two
+  spelling knobs were drawn AFTER the number and a draw made on exhausted input is its own
+  minimum for ever; `fuzzAutoescapeInvariant` rendered `escape_sites[0]` with `e` empty,
+  so its oracle had nothing to judge; and `fuzzXmlattrInvariant` rendered one attribute
+  whose NAME and value were both `""` — the name being the half the F-D3 CRITICAL lived
+  in. Each now draws bytes first with `Smith.slice`, the two table indices are not drawn
+  at all (every site runs on every input, which is what a table of places is for), the
+  numeric spellings are looped rather than drawn, and the number itself is read out of the
+  seed through `testkit.fuzz.Cursor`. Corpora: 36 template/context pairs quoted from
+  `testdata/golden.json` (the reference replay's own captured Jinja2 corpus), 17
+  whitespace-control templates, 17 numbers a narrowing cast can go wrong on, 21 hostile
+  context strings, 20 attribute key/value pairs including the audit's own
+  `a onmouseover=alert(1) b`. Measured before → after: templates 0→36 non-empty and
+  0→1004463 output octets; context data 0→10; whitespace 0→17 and 0→1002072 octets;
+  numeric 1→1632 site renders; autoescape 1→672 site renders and 0→1978 escaped markup
+  octets; xmlattr keys 0→19 non-empty, values 0→19, 0→179 attribute octets. ⚠ The
+  autoescape and xmlattr **oracles are now asserted in the ordinary lane too**: a
+  `std.testing.fuzz` body never runs without `--fuzz`, so until now the only check on
+  either invariant was a sweep nobody runs. Both hold across the whole corpus. The `F12`
+  regression test was rewritten for the new draw — its length header is a little-endian
+  u32 now, not a u64 — and it additionally asserts the last drawn octet arrived, not just
+  that the length did.
+
 - **2026-09-06** — The Python oracle leaves the module. `src/reference_test.zig`
   `@embedFile`d the Jinja2 driver into module source and spawned `python3` from
   inside `zig build test-jinja`, so every consumer carried foreign source and the

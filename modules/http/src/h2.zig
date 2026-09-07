@@ -2932,36 +2932,184 @@ test "connection: a real download's WINDOW_UPDATE stream is NOT a flood — repl
 // completed handshake, so frame-type/stream-state dispatch gets exercised
 // too) for the end-to-end path.
 
+// ⚠ All three used to slice their drawn bytes to a length that came from
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. A ranged draw reads EIGHT input
+// octets as a little-endian u64 and returns the range minimum when fewer
+// remain, and `bytes` had already consumed `min(buf.len, in.len)` of them — so
+// the length was 0 on every input a corpus can carry. `parseFrame` was handed a
+// nine-octet header with an EMPTY payload every time (its `h.length` forced to
+// 0), and both `recv` harnesses were handed an empty buffer, which returns
+// immediately without touching the preface check or the frame loop. One
+// `slice` draw per harness reads the corpus entry's own length header instead.
+
+/// `testkit.fuzz.seed`, aliased so the corpora below read as the frame streams
+/// they are. A corpus entry is not the frame: the length draw reads a
+/// little-endian `u32` first, so a raw frame would arrive minus its own first
+/// four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// One §4.1 frame — the nine-octet header its own `encode` produces, followed
+/// by `payload`. Built from `FrameHeader.encode` rather than written out as
+/// bytes: the first draft of this corpus DID spell the length field by hand and
+/// got it wrong (0x11 for a 20-octet HPACK block), which the parser answers by
+/// waiting for more input — a seed that reads as a request and decides nothing.
+/// Returning an array rather than a slice is what lets `++` build a multi-frame
+/// stream out of these.
+fn frameArr(
+    comptime ft: FrameType,
+    comptime flags: u8,
+    comptime sid: u31,
+    comptime payload: []const u8,
+) [frame_header_len + payload.len]u8 {
+    return FrameHeader.encode(.{
+        .length = @intCast(payload.len),
+        .frame_type = ft,
+        .flags = flags,
+        .stream_id = sid,
+    }) ++ payload[0..payload.len].*;
+}
+
+/// The same, wrapped as a single-frame corpus entry.
+fn frameSeed(
+    comptime ft: FrameType,
+    comptime flags: u8,
+    comptime sid: u31,
+    comptime payload: []const u8,
+) []const u8 {
+    return seed(&frameArr(ft, flags, sid, payload));
+}
+
+/// A HEADERS fragment the module's own HPACK decoder accepts: the RFC 7541 C.3
+/// first request (`:method GET`, `:scheme http`, `:path /`, then a literal
+/// `:authority www.example.com`).
+const hpack_get_request = "\x82\x86\x84\x41\x0fwww.example.com";
+
+/// Whole frames, header and payload in one entry, in the format the length draw
+/// reads. Every §6 frame type, each with the payload shape its own parser
+/// walks, and beside it the malformed spelling that parser must refuse.
+const parse_frame_seeds = [_][]const u8{
+    frameSeed(.data, Flags.end_stream, 1, "hello"), // §6.1 DATA, END_STREAM
+    frameSeed(.data, Flags.padded, 1, "\x03hi\x00\x00\x00"), // padded DATA: 3 octets of padding
+    frameSeed(.data, Flags.padded, 1, "\xff"), // a pad length longer than the payload
+    frameSeed(.data, 0, 0, "x"), // DATA on stream 0 is a connection error
+    frameSeed(.headers, Flags.end_headers, 1, hpack_get_request), // §6.2 HEADERS
+    frameSeed(.headers, Flags.end_headers | Flags.priority, 1, "\x80\x00\x00\x01\x10" ++ hpack_get_request), // HEADERS carrying PRIORITY
+    frameSeed(.headers, Flags.priority, 1, "\x80\x00\x00"), // PRIORITY flag with fewer than its 5 octets
+    frameSeed(.headers, 0, 0, hpack_get_request), // HEADERS on stream 0
+    frameSeed(.priority, 0, 1, "\x00\x00\x00\x00\x10"), // §6.3 PRIORITY
+    frameSeed(.priority, 0, 1, "\x00\x00\x00\x00"), // PRIORITY one octet short
+    frameSeed(.rst_stream, 0, 1, "\x00\x00\x00\x08"), // §6.4 RST_STREAM, CANCEL
+    frameSeed(.rst_stream, 0, 1, "\x00\x00\x00"), // RST_STREAM one octet short
+    frameSeed(.settings, 0, 0, "\x00\x03\x00\x00\x00\x64\x00\x04\x00\x01\x00\x00"), // §6.5 two settings
+    frameSeed(.settings, Flags.ack, 0, ""), // a SETTINGS ACK carries no payload
+    frameSeed(.settings, Flags.ack, 0, "\x00\x03\x00\x00\x00\x64"), // an ACK that does carry one
+    frameSeed(.settings, 0, 0, "\x00\x03\x00\x00\x00"), // a length that is not a multiple of six
+    frameSeed(.settings, 0, 1, ""), // SETTINGS on a stream other than 0
+    frameSeed(.push_promise, Flags.end_headers, 1, "\x00\x00\x00\x02" ++ hpack_get_request), // §6.6 PUSH_PROMISE
+    frameSeed(.ping, 0, 0, "\x01\x02\x03\x04\x05\x06\x07\x08"), // §6.7 PING
+    frameSeed(.ping, Flags.ack, 0, "\x01\x02\x03\x04\x05\x06\x07\x08"), // a PING ACK
+    frameSeed(.ping, 0, 0, "\x01\x02\x03"), // PING with the wrong payload length
+    frameSeed(.goaway, 0, 0, "\x00\x00\x00\x03\x00\x00\x00\x01" ++ "why"), // §6.8 GOAWAY with debug data
+    frameSeed(.goaway, 0, 0, "\x00\x00\x00\x03"), // GOAWAY truncated inside its fixed part
+    frameSeed(.window_update, 0, 0, "\x00\x00\x40\x00"), // §6.9 connection-level WINDOW_UPDATE
+    frameSeed(.window_update, 0, 1, "\x00\x00\x00\x00"), // a zero increment is a protocol error
+    frameSeed(.window_update, 0, 0, "\x00\x00\x40"), // WINDOW_UPDATE one octet short
+    frameSeed(.continuation, Flags.end_headers, 1, "\x82"), // §6.10 CONTINUATION
+    frameSeed(@enumFromInt(0xff), 0, 1, "unknown"), // an unregistered type must be ignored, not refused
+};
+
 test "fuzz: parseFrame never panics on arbitrary header+payload" {
-    try testing.fuzz({}, fuzzParseFrame, .{});
+    try testing.fuzz({}, fuzzParseFrame, .{ .corpus = &parse_frame_seeds });
 }
 
 fn fuzzParseFrame(_: void, smith: *std.testing.Smith) !void {
-    var hdr_bytes: [frame_header_len]u8 = undefined;
-    smith.bytes(&hdr_bytes);
-    var payload_buf: [256]u8 = undefined;
-    smith.bytes(&payload_buf);
-    const payload_len: usize = smith.valueRangeAtMost(u16, 0, payload_buf.len);
-    const payload = payload_buf[0..payload_len];
+    var buf: [512]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    if (len < frame_header_len) return;
 
-    var h = FrameHeader.decode(&hdr_bytes);
+    var h = FrameHeader.decode(buf[0..frame_header_len]);
+    const payload = buf[frame_header_len..len];
     // `parseFrame` asserts `payload.len == h.length` (its documented
     // precondition, upheld in production by `Connection.recv` slicing
     // exactly `h.length` bytes before calling this) — uphold it here too so
     // the harness targets `parseFrame`'s own decode logic, not a
-    // self-inflicted precondition violation.
+    // self-inflicted precondition violation. For a well-formed frame in the
+    // corpus this is the length the header already declares; the assignment is
+    // what lets a mutated or truncated one still be parsed rather than trip an
+    // assert the production caller makes impossible.
     h.length = @intCast(payload.len);
     _ = parseFrame(h, payload) catch {};
 }
 
+test "corpus: every frame seed reaches parseFrame, and the frames decoded are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, drawing
+    // exactly the way the harness does.
+    //
+    // Frames decoded is the number with teeth. The collapsed draw did give
+    // `parseFrame` a nine-octet header — the seed's own first nine octets —
+    // but with an empty payload and `h.length` forced to 0, so every
+    // payload-walking branch in §6 was unreachable: no padding stripped, no
+    // settings entry read, no PING data, no GOAWAY debug data. A payload
+    // octet consumed is what no zero-length payload can produce.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var refused: usize = 0;
+    var payload_octets: usize = 0;
+    for (parse_frame_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (len < frame_header_len) continue;
+
+        var h = FrameHeader.decode(buf[0..frame_header_len]);
+        const payload = buf[frame_header_len..len];
+        h.length = @intCast(payload.len);
+        payload_octets += payload.len;
+        if (parseFrame(h, payload)) |_| {
+            decoded += 1;
+        } else |_| refused += 1;
+    }
+    try testing.expectEqual(parse_frame_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 28 seeds non-empty and 0 payload octets before
+    // the draw was fixed (every call saw an empty payload);
+    // 28 / 15 / 13 / 197 after.
+    try testing.expectEqual(@as(usize, 15), decoded);
+    try testing.expectEqual(@as(usize, 13), refused);
+    try testing.expectEqual(@as(usize, 197), payload_octets);
+}
+
+/// Byte streams a server sees before the handshake has completed, in the format
+/// the length draw reads. The §3.4 preface is 24 fixed octets, which undirected
+/// bytes cannot produce, so without these the cold-start harness could only
+/// ever exercise `error.BadPreface` — and only once, since the collapsed draw
+/// gave it an empty buffer, which returns before even that check.
+const empty_settings = frameArr(.settings, 0, 0, "");
+const cold_start_seeds = [_][]const u8{
+    seed(preface), // the bare magic: enough to clear `preface_pending`
+    seed(&(preface.* ++ empty_settings)), // the magic then an empty SETTINGS: a legal handshake
+    seed(&(preface.* ++ frameArr(.settings, 0, 0, "\x00\x03\x00\x00\x00\x64\x00\x04\x00\x01\x00\x00"))), // the handshake a real client sends
+    seed(&(preface.* ++ empty_settings ++
+        frameArr(.headers, Flags.end_headers, 1, hpack_get_request))), // handshake then a request
+    seed(preface[0 .. preface.len - 1]), // the magic one octet short: still pending, nothing decided
+    seed("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\x00"), // the magic with its last octet wrong
+    seed("GET / HTTP/1.1\r\nHost: h\r\n\r\n"), // an HTTP/1.1 request arriving at an h2 server
+    seed(&(preface.* ++ frameArr(.headers, Flags.end_headers, 1, ""))), // HEADERS before SETTINGS
+    seed(&(preface.* ++ FrameHeader.encode(.{
+        .length = max_allowed_frame_size,
+        .frame_type = .settings,
+        .flags = 0,
+        .stream_id = 0,
+    }))), // a first frame claiming the 16 MiB ceiling
+};
+
 test "fuzz: Connection.recv never panics on arbitrary bytes (pre-handshake)" {
-    try testing.fuzz({}, fuzzConnRecvColdStart, .{});
+    try testing.fuzz({}, fuzzConnRecvColdStart, .{ .corpus = &cold_start_seeds });
 }
 
 fn fuzzConnRecvColdStart(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     const gpa = testing.allocator;
     var conn: Connection = .init(gpa, .server, .{});
@@ -2973,14 +3121,42 @@ fn fuzzConnRecvColdStart(_: void, smith: *std.testing.Smith) !void {
     _ = conn.recv(buf[0..len], &out, &events) catch {};
 }
 
+/// Frame streams a server sees after a completed handshake, in the format the
+/// length draw reads. This is where frame-type and stream-state dispatch lives,
+/// and none of it ran: the collapsed draw handed `recv` an empty buffer, so the
+/// `while (… >= frame_header_len)` loop never took a single iteration.
+const request_headers = frameArr(.headers, Flags.end_headers, 1, hpack_get_request);
+const warm_seeds = [_][]const u8{
+    seed(&request_headers), // one HEADERS: opens stream 1
+    seed(&(request_headers ++ frameArr(.data, Flags.end_stream, 1, "hello"))), // HEADERS then DATA with END_STREAM
+    seed(&(frameArr(.headers, 0, 1, "\x82\x86\x84\x41") ++
+        frameArr(.continuation, Flags.end_headers, 1, "\x0fwww.example.com"))), // a header block split across CONTINUATION
+    seed(&frameArr(.ping, 0, 0, "\x01\x02\x03\x04\x05\x06\x07\x08")), // PING: must be answered with an ACK
+    seed(&frameArr(.settings, Flags.ack, 0, "")), // a SETTINGS ACK for the settings we sent
+    seed(&frameArr(.window_update, 0, 0, "\x00\x00\x40\x00")), // WINDOW_UPDATE on the connection
+    seed(&frameArr(.rst_stream, 0, 1, "\x00\x00\x00\x08")), // RST_STREAM on a stream never opened
+    seed(&frameArr(.goaway, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x00")), // GOAWAY
+    seed(&frameArr(.data, Flags.end_stream, 1, "hello")), // DATA on a stream that was never opened
+    seed(&frameArr(.data, 0, 0, "x")), // DATA on stream 0
+    seed(&(FrameHeader.encode(.{
+        .length = default_max_frame_size + 1,
+        .frame_type = .data,
+        .flags = 0,
+        .stream_id = 1,
+    }) ++ [_]u8{'x'} ** 64)), // a frame declaring one octet more than SETTINGS_MAX_FRAME_SIZE
+    seed(&(request_headers ++ request_headers)), // the same stream id opened twice
+    seed(&(frameArr(.headers, Flags.end_headers, 3, hpack_get_request) ++ request_headers)), // a stream id going backwards
+    seed(&frameArr(.headers, Flags.end_headers, 1, "\xff\xff\xff\xff\xff")), // HEADERS whose HPACK block is malformed
+    seed(request_headers[0 .. frame_header_len + 8]), // a frame body truncated mid-stream
+};
+
 test "fuzz: Connection.recv never panics on arbitrary bytes (post-handshake)" {
-    try testing.fuzz({}, fuzzConnRecvWarm, .{});
+    try testing.fuzz({}, fuzzConnRecvWarm, .{ .corpus = &warm_seeds });
 }
 
 fn fuzzConnRecvWarm(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     var conn = testServer() catch return;
     defer conn.deinit();
@@ -2990,4 +3166,65 @@ fn fuzzConnRecvWarm(_: void, smith: *std.testing.Smith) !void {
     var events: std.ArrayList(Event) = .empty;
     defer freeEvents(&events);
     _ = conn.recv(buf[0..len], &out, &events) catch {};
+}
+
+test "corpus: every recv seed reaches the connection, and the events raised are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, drawing
+    // exactly the way both `recv` harnesses do.
+    //
+    // Events raised is the second number, and it is the one an empty buffer
+    // cannot produce: `recv("")` returns cleanly, having raised nothing and
+    // decided nothing — which is what BOTH harnesses did on every input they
+    // ever ran. Bytes written back (the SETTINGS the server sends, the PING
+    // ACK, a GOAWAY) is the third, for the same reason.
+    const gpa = testing.allocator;
+    var cold_nonempty: usize = 0;
+    var cold_events: usize = 0;
+    var cold_written: usize = 0;
+    for (cold_start_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) cold_nonempty += 1;
+
+        var conn: Connection = .init(gpa, .server, .{});
+        defer conn.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        var events: std.ArrayList(Event) = .empty;
+        defer freeEvents(&events);
+        conn.recv(buf[0..len], &out, &events) catch {};
+        cold_events += events.items.len;
+        cold_written += out.items.len;
+    }
+    try testing.expectEqual(cold_start_seeds.len, cold_nonempty);
+
+    var warm_nonempty: usize = 0;
+    var warm_events: usize = 0;
+    var warm_written: usize = 0;
+    for (warm_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) warm_nonempty += 1;
+
+        var conn = testServer() catch continue;
+        defer conn.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        var events: std.ArrayList(Event) = .empty;
+        defer freeEvents(&events);
+        conn.recv(buf[0..len], &out, &events) catch {};
+        warm_events += events.items.len;
+        warm_written += out.items.len;
+    }
+    try testing.expectEqual(warm_seeds.len, warm_nonempty);
+
+    // Measured 2026-09-07: 0 non-empty seeds, 0 events and 0 octets written
+    // on both sides before the draw was fixed; 9 / 4 / 27 cold and
+    // 15 / 10 / 17 warm after.
+    try testing.expectEqual(@as(usize, 4), cold_events);
+    try testing.expectEqual(@as(usize, 27), cold_written);
+    try testing.expectEqual(@as(usize, 10), warm_events);
+    try testing.expectEqual(@as(usize, 17), warm_written);
 }
