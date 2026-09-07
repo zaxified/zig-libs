@@ -2027,90 +2027,317 @@ test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde 
 // which already had the analogous `expected_len` check). This harness
 // guards against a regression of that exact class, alongside
 // `FeldmanCommitments`/`AuxParams`'s own counted/length-prefixed fields.
+//
+// ⛔⛔ Except that it did not, and could not. All three harnesses ASSEMBLED a
+// frame out of ranged draws, and a ranged draw reads eight input octets as a
+// little-endian u64 and returns the range MINIMUM when fewer remain. With no
+// corpus the lane runs one round on `in = ""`, so every draw took its minimum
+// and each target ran exactly one input, for ever:
+//
+//   FeldmanCommitments : `00 00 00 00`     -- count = 0, ACCEPTED, 0 elements
+//   PublicKeys         : `00 00 00 00`     -- count = 0, ACCEPTED, 0 entries
+//   AuxParams          : twelve zero bytes -- three empty fields, refused
+//
+// So the `count = 0xFFFFFFFF` arm — the exact input of the ~29 TB
+// over-allocation bug this harness was WRITTEN to guard against — had never
+// been produced once. The switch that selects it is `valueRangeAtMost(u8, 0,
+// 2)`, whose minimum is the small-count arm.
+//
+// ⛔ The buffers were too small for the module's own frames as well: a real
+// two-party `PublicKeys` encoding is ~1150 octets (every entry carries a
+// `paillier.modulus_sq_bytes`-wide `g` field) against a 4 + 256 assembly
+// buffer, and a real `AuxParams` at this module's `aux_modulus_bits` is 780
+// against 3 x 64.
+//
+// All three now draw the message itself with one `smith.slice` and carry a
+// corpus: frames from this module's own encoders, and the hostile counts and
+// lying length prefixes written out as bytes, which is reproducible where a
+// draw is not.
+
+const testkit = @import("testkit");
+
+/// The corpus for the three counted/length-prefixed decoders.
+///
+/// ⭐ Each harness and its guard build it from HERE, so the guard measures the
+/// seeds the harness actually gets.
+const Corpus = struct {
+    const feld_buf_bytes = 512;
+    const pk_buf_bytes = 4096;
+    const aux_buf_bytes = 1024;
+
+    feld_store: [8][4 + feld_buf_bytes]u8 = undefined,
+    feld_entries: [8][]const u8 = undefined,
+    pk_store: [7][4 + pk_buf_bytes]u8 = undefined,
+    pk_entries: [7][]const u8 = undefined,
+    aux_store: [8][4 + aux_buf_bytes]u8 = undefined,
+    aux_entries: [8][]const u8 = undefined,
+
+    /// `bytes` with a u32-BE value written at `at`. The counted-field
+    /// mutations are all of this shape: a real frame whose ONE length or count
+    /// word lies.
+    fn withU32(scratch: []u8, bytes: []const u8, at: usize, v: u32) []const u8 {
+        @memcpy(scratch[0..bytes.len], bytes);
+        std.mem.writeInt(u32, scratch[at..][0..4], v, .big);
+        return scratch[0..bytes.len];
+    }
+
+    fn build(self: *Corpus, allocator: std.mem.Allocator) !void {
+        var scratch: [pk_buf_bytes]u8 = undefined;
+
+        // ── FeldmanCommitments: real Feldman VSS commitments from this
+        //    module's own `splitSecretKey`, at two thresholds.
+        const c2 = try splitSecretKey(allocator, testScalar(6), 2, 2, &[_]Scalar{testScalar(7)});
+        defer allocator.free(c2.shares);
+        defer allocator.free(c2.commitments.commitments);
+        const f2 = try c2.commitments.toBytesAlloc(allocator);
+        defer allocator.free(f2);
+
+        const c3 = try splitSecretKey(allocator, testScalar(9), 3, 3, &[_]Scalar{ testScalar(4), testScalar(5) });
+        defer allocator.free(c3.shares);
+        defer allocator.free(c3.commitments.commitments);
+        const f3 = try c3.commitments.toBytesAlloc(allocator);
+        defer allocator.free(f3);
+        std.debug.assert(f3.len <= feld_buf_bytes);
+
+        var i: usize = 0;
+        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], f2);
+        i += 1; // 2 real commitments
+        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], f3);
+        i += 1; // 3 real commitments
+        // ⭐ The input of the fixed over-allocation bug, which the harness that
+        //    exists to guard it had never once produced.
+        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+        i += 1;
+        // The same shape at a scale that once peaked ~1.3 GB RSS on its own.
+        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], &[_]u8{ 0x00, 0x03, 0x0d, 0x40 });
+        i += 1;
+        // count = 0: legal, ACCEPTED with zero elements. The one input this
+        // target ran for ever, kept so the guard's second number can show what
+        // it was worth.
+        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], &[_]u8{ 0, 0, 0, 0 });
+        i += 1;
+        // A real frame whose first commitment is no longer a SEC1 point.
+        self.feld_entries[i] = testkit.fuzz.seedInto(
+            &self.feld_store[i],
+            withU32(&scratch, f2, 4, 0x0400_0000),
+        );
+        i += 1;
+        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], f2[0 .. f2.len - 1]);
+        i += 1; // truncated: length no longer matches the count
+        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], "");
+        i += 1;
+        std.debug.assert(i == self.feld_entries.len);
+
+        // ── PublicKeys: a real two-party keygen. Nothing drawn produces one —
+        //    each entry carries a Paillier modulus, its generator and a full
+        //    `AuxParams` block.
+        var prng = std.Random.DefaultPrng.init(0x74686665656c64);
+        const random = prng.random();
+        const kp1 = try paillier.generate(random, paillier.min_generate_bits);
+        const kp2 = try paillier.generate(random, paillier.min_generate_bits);
+        const aux = toyAuxParams();
+        const key_shares = try keygenTrustedDealer(
+            allocator,
+            2,
+            2,
+            testScalar(11),
+            &[_]Scalar{testScalar(12)},
+            &[_]paillier.KeyPair{ kp1, kp2 },
+            &[_]AuxParams{ aux, aux },
+        );
+        defer allocator.free(key_shares);
+        defer allocator.free(key_shares[0].public_keys.entries);
+        const pk_bytes = try key_shares[0].public_keys.toBytesAlloc(allocator);
+        defer allocator.free(pk_bytes);
+        // ⚠ The check the old harness never made: the buffer has to hold the
+        // module's own frame, or the seed reads back EMPTY without a word.
+        std.debug.assert(pk_bytes.len <= pk_buf_bytes);
+
+        var p: usize = 0;
+        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], pk_bytes);
+        p += 1; // 2 real parties
+        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+        p += 1; // ⭐ the ~29 TB allocation attempt, verbatim
+        self.pk_entries[p] = testkit.fuzz.seedInto(
+            &self.pk_store[p],
+            withU32(&scratch, pk_bytes, 0, 0xFFFF_FFFF),
+        );
+        p += 1; // the same lie behind a real body
+        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], &[_]u8{ 0, 0, 0, 0 });
+        p += 1; // count = 0: legal, and all this target ever ran
+        self.pk_entries[p] = testkit.fuzz.seedInto(
+            &self.pk_store[p],
+            withU32(&scratch, pk_bytes, 8, 0xFFFF_FFF0),
+        );
+        p += 1; // the first inner length prefix lies
+        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], pk_bytes[0 .. pk_bytes.len / 2]);
+        p += 1; // truncated mid-entry
+        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], "");
+        p += 1;
+        std.debug.assert(p == self.pk_entries.len);
+
+        // ── AuxParams: a REAL ring-Pedersen triple, `h2 = h1^lambda mod Ñ`,
+        //    from this module's own generator; plus the toy triple.
+        const gen = try generateAuxParamsWithTrapdoor(allocator, random, 128);
+        defer gen.trapdoor.deinit(allocator);
+        const real_aux = try gen.params.toBytesAlloc(allocator);
+        defer allocator.free(real_aux);
+        std.debug.assert(real_aux.len <= aux_buf_bytes);
+        const toy = try aux.toBytesAlloc(allocator);
+        defer allocator.free(toy);
+
+        var a: usize = 0;
+        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], real_aux);
+        a += 1; // a real 128-bit Ñ with a genuine h1/h2 relation
+        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], toy);
+        a += 1; // the toy triple (Ñ = 187)
+        self.aux_entries[a] = testkit.fuzz.seedInto(
+            &self.aux_store[a],
+            withU32(&scratch, real_aux, 0, 0xFFFF_FFFF),
+        );
+        a += 1; // Ñ's declared length lies -- `readLenPrefixed`'s bound check
+        self.aux_entries[a] = testkit.fuzz.seedInto(
+            &self.aux_store[a],
+            withU32(&scratch, real_aux, 0, 0),
+        );
+        a += 1; // Ñ declared empty: strips to nothing, refused
+        // h1's declared length lies about a field that IS there.
+        self.aux_entries[a] = testkit.fuzz.seedInto(
+            &self.aux_store[a],
+            withU32(&scratch, real_aux, 4 + (real_aux.len - 12) / 3, 0xFFFF_FFFF),
+        );
+        a += 1;
+        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], real_aux[0 .. real_aux.len - 1]);
+        a += 1; // truncated: h2 runs off the end
+        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], &[_]u8{0} ** 12);
+        a += 1; // three empty fields -- the one input this target ran
+        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], "");
+        a += 1;
+        std.debug.assert(a == self.aux_entries.len);
+    }
+};
+
 test "fuzz: FeldmanCommitments.fromBytesAlloc never panics or over-allocates" {
-    try testing.fuzz({}, fuzzFeldmanCommitmentsFromBytesAlloc, .{});
+    var corpus: Corpus = .{};
+    try corpus.build(testing.allocator);
+    try testing.fuzz({}, fuzzFeldmanCommitmentsFromBytesAlloc, .{ .corpus = &corpus.feld_entries });
 }
 
 fn fuzzFeldmanCommitmentsFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-
-    // Bias the count toward both small-real values and the
-    // maximum-u32/near-buffer-size boundary -- the two ends of the
-    // "could this possibly be backed by real data" check.
-    const count: u32 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
-        0 => smith.valueRangeAtMost(u8, 0, 5),
-        1 => std.math.maxInt(u32),
-        else => smith.value(u32),
-    };
-    var count_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &count_buf, count, .big);
-    buf.appendSlice(allocator, &count_buf) catch return;
-
-    var tail: [128]u8 = undefined;
-    smith.bytes(&tail);
-    const tail_len: usize = smith.valueRangeAtMost(u8, 0, tail.len);
-    buf.appendSlice(allocator, tail[0..tail_len]) catch return;
-
-    const result = FeldmanCommitments.fromBytesAlloc(allocator, buf.items) catch return;
+    // ⚠ One `smith.slice`: the message IS the input, so the hostile counts are
+    // seeds rather than draws the replay lane cannot make.
+    var buf: [Corpus.feld_buf_bytes]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    const result = FeldmanCommitments.fromBytesAlloc(allocator, buf[0..len]) catch return;
     defer allocator.free(result.commitments);
 }
 
+test "corpus: the FeldmanCommitments seeds reach the decoder, counts pinned" {
+    // ⛔ `accepted` is worthless on its own here: `00 00 00 00` is a LEGAL
+    // frame carrying zero commitments, and it is the only input this target
+    // ever ran. `elements` — commitments actually decoded — is the number the
+    // collapse cannot hold up.
+    var corpus: Corpus = .{};
+    try corpus.build(testing.allocator);
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var elements: usize = 0;
+    for (corpus.feld_entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Corpus.feld_buf_bytes]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const result = FeldmanCommitments.fromBytesAlloc(testing.allocator, buf[0..len]) catch continue;
+        defer testing.allocator.free(result.commitments);
+        accepted += 1;
+        elements += result.commitments.len;
+    }
+    try testing.expectEqual(corpus.feld_entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 5), elements);
+}
+
 test "fuzz: PublicKeys.fromBytesAlloc never panics or over-allocates" {
-    try testing.fuzz({}, fuzzPublicKeysFromBytesAlloc, .{});
+    var corpus: Corpus = .{};
+    try corpus.build(testing.allocator);
+    try testing.fuzz({}, fuzzPublicKeysFromBytesAlloc, .{ .corpus = &corpus.pk_entries });
 }
 
 fn fuzzPublicKeysFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-
-    // Same three-way count bias as the FeldmanCommitments harness above --
-    // this is the exact field the fixed bug lived in.
-    const count: u32 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
-        0 => smith.valueRangeAtMost(u8, 0, 3),
-        1 => std.math.maxInt(u32),
-        else => smith.value(u32),
-    };
-    var count_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &count_buf, count, .big);
-    buf.appendSlice(allocator, &count_buf) catch return;
-
-    var tail: [256]u8 = undefined;
-    smith.bytes(&tail);
-    const tail_len: usize = smith.valueRangeAtMost(u16, 0, tail.len);
-    buf.appendSlice(allocator, tail[0..tail_len]) catch return;
-
-    const result = PublicKeys.fromBytesAlloc(allocator, buf.items) catch return;
+    // 4096 against a ~1150-octet real two-party frame; the old assembly buffer
+    // was 260, so no real frame could have gone through even had the draw
+    // worked.
+    var buf: [Corpus.pk_buf_bytes]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    const result = PublicKeys.fromBytesAlloc(allocator, buf[0..len]) catch return;
     defer allocator.free(result.entries);
 }
 
+test "corpus: the PublicKeys seeds reach the decoder, counts pinned" {
+    // Same trap as above: `00 00 00 00` is a legal zero-party frame.
+    // `parties` is what only a real body produces.
+    var corpus: Corpus = .{};
+    try corpus.build(testing.allocator);
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var parties: usize = 0;
+    for (corpus.pk_entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Corpus.pk_buf_bytes]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const result = PublicKeys.fromBytesAlloc(testing.allocator, buf[0..len]) catch continue;
+        defer testing.allocator.free(result.entries);
+        accepted += 1;
+        parties += result.entries.len;
+    }
+    try testing.expectEqual(corpus.pk_entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try testing.expectEqual(@as(usize, 2), parties);
+}
+
 test "fuzz: AuxParams.fromBytesAlloc never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzAuxParamsFromBytesAlloc, .{});
+    var corpus: Corpus = .{};
+    try corpus.build(testing.allocator);
+    try testing.fuzz({}, fuzzAuxParamsFromBytesAlloc, .{ .corpus = &corpus.aux_entries });
 }
 
 fn fuzzAuxParamsFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(testing.allocator);
+    // 1024 against the 780 octets a full `aux_modulus_bits` triple encodes to;
+    // the old assembly buffer was three fields of 64.
+    var buf: [Corpus.aux_buf_bytes]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    _ = AuxParams.fromBytesAlloc(buf[0..len]) catch return;
+}
 
-    // Three independent len-prefixed fields (n_tilde/h1/h2) -- bias each
-    // length toward small-real and near-buffer-boundary values so
-    // `readLenPrefixed`'s own bound check gets real traffic both ways.
-    var i: u8 = 0;
-    while (i < 3) : (i += 1) {
-        var field_buf: [64]u8 = undefined;
-        smith.bytes(&field_buf);
-        const field_len: usize = smith.valueRangeAtMost(u8, 0, field_buf.len);
-        var len_buf: [4]u8 = undefined;
-        const declared_len: u32 = if (smith.value(bool))
-            @intCast(field_len) // honest length
-        else
-            smith.value(u32); // lying length
-        std.mem.writeInt(u32, &len_buf, declared_len, .big);
-        buf.appendSlice(testing.allocator, &len_buf) catch return;
-        buf.appendSlice(testing.allocator, field_buf[0..field_len]) catch return;
+test "corpus: the AuxParams seeds reach the decoder, counts pinned" {
+    // The second number is the count of distinct Ñ bit-widths recovered: it
+    // moves only when a seed's own octets reach `AuxModulus.fromBytes`, which
+    // the twelve zero bytes this target ran for ever never did.
+    var corpus: Corpus = .{};
+    try corpus.build(testing.allocator);
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var widths: [8]usize = undefined;
+    var n_widths: usize = 0;
+    for (corpus.aux_entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Corpus.aux_buf_bytes]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const params = AuxParams.fromBytesAlloc(buf[0..len]) catch continue;
+        accepted += 1;
+        const bits = params.n_tilde.bits();
+        for (widths[0..n_widths]) |w| {
+            if (w == bits) break;
+        } else {
+            widths[n_widths] = bits;
+            n_widths += 1;
+        }
     }
-
-    _ = AuxParams.fromBytesAlloc(buf.items) catch return;
+    try testing.expectEqual(corpus.aux_entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try testing.expectEqual(@as(usize, 2), n_widths);
 }

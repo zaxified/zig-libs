@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — ⛔⛔ The harness written to guard the fixed ~29 TB over-allocation bug had
+  never once produced the input that caused it. All three counted/length-prefixed fuzz
+  targets ASSEMBLED their frame out of ranged draws, and a ranged draw returns the range
+  minimum when fewer than eight input octets remain. With no corpus the lane runs one round
+  on `in = ""`, so every draw took its minimum and each target ran exactly one input for
+  ever: `FeldmanCommitments.fromBytesAlloc("\x00\x00\x00\x00")` (count 0, **accepted**, zero
+  elements), the same for `PublicKeys`, and twelve zero octets for `AuxParams`. The
+  `count = 0xFFFFFFFF` arm sits behind `valueRangeAtMost(u8, 0, 2)`, whose minimum selects
+  the small-count arm instead. ⛔ The assembly buffers were also far too small for this
+  module's own frames: a real two-party `PublicKeys` encoding is 1150 octets (each entry
+  carries a `paillier.modulus_sq_bytes`-wide `g`) against 4 + 256, and a full
+  `aux_modulus_bits` `AuxParams` is 780 against three fields of 64. All three targets now
+  draw the message itself with one `smith.slice` into a buffer sized for the module's own
+  frames (512 / 4096 / 1024), and carry a corpus: real frames from `splitSecretKey`,
+  `keygenTrustedDealer` and `generateAuxParamsWithTrapdoor`, plus the hostile counts and
+  lying length prefixes written out as bytes — reproducible where a draw is not. Measured:
+  7/8, 6/7 and 7/8 non-empty seeds reach the decoder where 0 did; 3, 2 and 2 accepted,
+  carrying **5** commitments, **2** party entries and **2** distinct Ñ bit-widths. Those
+  second numbers are pinned because `00 00 00 00` is a *legal* frame for the first two
+  decoders — an accepted count would have looked healthy on the collapsed harness.
+
 - **2026-09-03** — Drift re-audit. **`mtaAliceFinalize` reduced only the LOW
   64 BYTES of the decrypted Paillier plaintext**, on the strength of a comment
   reading "α' = a·b + β' < q² + q < 2^512, so only its low 64 bytes are
