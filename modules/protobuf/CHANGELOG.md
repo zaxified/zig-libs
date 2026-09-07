@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Test-only, no production change: both fuzz targets ran one input, and
+  one of them had never executed the branch it exists to assert. `fuzzDecodeNeverPanics`
+  drew `len = smith.valueRangeAtMost(u16, 0, 4096)` **before** the bytes; a ranged `Smith`
+  draw returns the range MINIMUM unless a whole eight-octet word lands inside the range, so
+  with no corpus `len` was 0 and `input` was the EMPTY slice on every round outside
+  `--fuzz`. An empty protobuf message is legal for all four shapes, so the target had a
+  100% acceptance rate while parsing nothing. `fuzzDepthCapBoundary` was worse: both its
+  numbers were ranged draws with no corpus, so `true_len` and `max_depth` were **1 and 1**
+  every time — it built a one-node chain, decoded it under a cap of 1, and took the success
+  path. The `error.DepthExceeded` assertion this test was written for had never run once.
+  Both now draw bytes first (`smith.slice`), the depth harness reading its two numbers
+  through `testkit.fuzz.Cursor` so a seed is a readable pair. The decode corpus is the
+  module's own `conformance.wide_cases` and `repeated_cases` encoded by its own encoder
+  (arbitrary bytes essentially never spell a message: every length-delimited field needs a
+  prefix that exactly covers what follows), plus `chain3` and the five hostile frames
+  `adversarial.zig` names; each seed carries a `u64` tail so the four knobs after the byte
+  draw are alive on a corpus replay rather than pinned at `Wide` with `max_depth = 1`.
+  Measured by the two new `corpus:` guards — decode: 37 non-empty of 40 seeds, 33 accepted,
+  **450 octets handed to the parser** (0 before), all four shapes and both sides of the
+  depth cap exercised; depth boundary: 7 non-empty scripts, **2 above the cap** (0 before)
+  and a deepest chain of **200** (1 before).
+
 - **2026-09-06** — **The module no longer ships foreign source, and its test suite no
   longer needs `python3`.** `src/reference_interop.zig` (which `@embedFile`d a Python
   driver and spawned `python3 -c` from inside `test-protobuf`) and

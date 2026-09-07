@@ -240,7 +240,7 @@ const module_list = [_]Module{
     .{ .name = "yaml", .libs = &.{"format"} },
     .{ .name = "jinja", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "cbor", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
-    .{ .name = "protobuf", .libs = &.{ "format", "web" } },
+    .{ .name = "protobuf", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "grpc", .libs = &.{"web"}, .deps = &.{ "http", "protobuf" }, .test_deps = &.{"testkit"} },
     .{ .name = "webauthn", .libs = &.{"crypto"}, .deps = &.{ "cbor", "rsa", "p256", "x509" }, .test_deps = &.{"testkit"} },
     .{ .name = "zipstream", .libs = &.{"format"} },
