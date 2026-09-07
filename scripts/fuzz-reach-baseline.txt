@@ -10,7 +10,6 @@ adaptor 1
 bip32 2
 bip340 1
 bitcoinscript 2
-bitcointx 2
 blindrsa 1
 brotli 1
 bulletproofs 2
