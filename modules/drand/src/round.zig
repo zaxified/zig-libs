@@ -151,12 +151,16 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
         else => return error.MalformedJson,
     };
 
-    var sig_bytes: [96]u8 = undefined;
+    var sig_bytes: [96]u8 = [_]u8{0} ** 96; // zeroed: Round is a plain value callers copy/compare
     const sig_len = try decodeHexVar(&sig_bytes, raw.signature);
 
     var sig_g1: ?g1.Affine = null;
     if (sig_len == sig_g1_bytes) {
         const pt = g1.fromBytesCompressed(sig_bytes[0..sig_g1_bytes].*) catch return error.InvalidPoint;
+        // The identity is never a signature; `parseInfo` refuses the identity
+        // key the same way. A caller using only the parser would otherwise be
+        // handed the point at infinity from a "successful" parse.
+        if (pt.infinity) return error.InvalidPoint;
         // The subgroup check the pairing equation cannot do for us — see
         // the module doc comment. Same guard `chaininfo.parseInfo` applies
         // to the G2 public key (`PublicKeyNotInSubgroup`).
@@ -174,7 +178,7 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
 
     var previous_signature: ?Round.PreviousSignature = null;
     if (raw.previous_signature) |p| {
-        var pbuf: [96]u8 = undefined;
+        var pbuf: [96]u8 = [_]u8{0} ** 96;
         const plen = try decodeHexVar(&pbuf, p);
         previous_signature = .{ .bytes = pbuf, .len = plen };
     }
@@ -195,15 +199,30 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
 /// agnostic — see the module doc comment and `SPEC.md`); this is only a
 /// convenience for constructing the URL path. Returns the slice of `buf`
 /// written, or `error.NoSpaceLeft` if `buf` is too small.
-pub fn roundPath(buf: []u8, chain_hash_hex: []const u8, round: u64) error{NoSpaceLeft}![]const u8 {
+pub fn roundPath(buf: []u8, chain_hash_hex: []const u8, round: u64) PathError![]const u8 {
+    try checkChainHashHex(chain_hash_hex);
     return std.fmt.bufPrint(buf, "/{s}/public/{d}", .{ chain_hash_hex, round }) catch
         return error.NoSpaceLeft;
 }
 
 /// The path for the LATEST round: `/<chain_hash>/public/latest`.
-pub fn latestPath(buf: []u8, chain_hash_hex: []const u8) error{NoSpaceLeft}![]const u8 {
+pub fn latestPath(buf: []u8, chain_hash_hex: []const u8) PathError![]const u8 {
+    try checkChainHashHex(chain_hash_hex);
     return std.fmt.bufPrint(buf, "/{s}/public/latest", .{chain_hash_hex}) catch
         return error.NoSpaceLeft;
+}
+
+pub const PathError = error{
+    NoSpaceLeft,
+    /// `chain_hash_hex` is empty or contains a non-hex character. The value
+    /// is pasted into a URL path the caller's HTTP client sends, so `/`,
+    /// `?`, `#` or CR/LF in it would be path or request-line injection.
+    InvalidChainHash,
+};
+
+fn checkChainHashHex(hex: []const u8) PathError!void {
+    if (hex.len == 0) return error.InvalidChainHash;
+    for (hex) |c| if (!std.ascii.isHex(c)) return error.InvalidChainHash;
 }
 
 // ── tests ──────────────────────────────────────────────────────────────
@@ -325,6 +344,19 @@ test "roundPath / latestPath build the drand request path" {
     try testing.expectEqualStrings("/52db9ba70e0cc0f6/public/1000", p);
     const l = try latestPath(&buf, "52db9ba70e0cc0f6");
     try testing.expectEqualStrings("/52db9ba70e0cc0f6/public/latest", l);
+}
+
+test "parseRound: identity (infinity) signature → InvalidPoint, not a 'successful' parse (audit F10)" {
+    const doc = "{\"round\":1000,\"signature\":\"c0" ++ ("00" ** 47) ++ "\"}";
+    try testing.expectError(error.InvalidPoint, parseRound(testing.allocator, doc));
+}
+
+test "roundPath/latestPath refuse a chain hash that is not hex (audit F17)" {
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.InvalidChainHash, roundPath(&buf, "52db/../public", 1));
+    try testing.expectError(error.InvalidChainHash, roundPath(&buf, "52db?x=1", 1));
+    try testing.expectError(error.InvalidChainHash, latestPath(&buf, "ab\r\nX: y"));
+    try testing.expectError(error.InvalidChainHash, latestPath(&buf, ""));
 }
 
 test "roundPath: too-small buffer → NoSpaceLeft" {

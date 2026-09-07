@@ -155,10 +155,33 @@ stop) feeding crafted bytes:
 - **Wrong signature / wrong round / wrong chain key** → the pairing
   equation fails → `InvalidSignature`. Never a silent false-accept.
 - **Number overflow** (`period`/`genesis_time` past `u64`) →
-  `MalformedJson` (std.json's `error.Overflow`).
+  `MalformedJson` (std.json's `error.Overflow`); a `period` past `u32`
+  → `NumberOutOfRange` (drand hashes it as 32 bits), `period == 0` →
+  `InvalidPeriod` (no chain has one, and it would be a division by zero in
+  `expectedRound` — SIGFPE in ReleaseFast before the guard existed).
+- **Chain hash that the document does not determine** → `ChainHashMismatch`.
+  `parseInfo` recomputes drand's `chain.Info.Hash()` —
+  `SHA-256(u32be period ‖ u64be genesis ‖ pubkey ‖ groupHash ‖ beaconID
+  unless "default")`, `computeChainHash` — and refuses a `/info` whose
+  `hash` disagrees, exactly as drand's own client does. Before this a
+  document carrying quicknet's genuine hash and quicknet-t's KEY was
+  accepted, and quicknet-t rounds then verified "as quicknet" (A1 audit,
+  5/5). Pinned against three live chains; `groupHash` is thereby load-
+  bearing, not decorative.
+- **Identity signature** → `InvalidPoint` at `parseRound` (as the identity
+  key is at `parseInfo`).
+- **`roundPath`/`latestPath`** validate `chain_hash_hex` as hex
+  (`InvalidChainHash`) — it is pasted into a URL path the caller sends.
 
 A `std.testing.fuzz` harness drives arbitrary bytes through both parsers
-and the verify path, asserting no panic / OOB / hang.
+and the verify path, asserting no panic / OOB / hang. A second harness
+damages the genuine fixtures field by field (`checkFixture`, decoded
+deterministically from the fuzz bytes): the intact pair MUST verify, a
+pair with an altered key/hash/groupHash MUST fail to parse, and a pair
+with an altered signature, randomness, round or scheme MUST NOT verify.
+The empty input — the one the runner feeds without `--fuzz` — is the
+intact case, so the positive control runs on every gate run; the same
+function backs ten deterministic tests.
 
 ## Verification bar / KAT
 
@@ -200,9 +223,6 @@ Go source) and reused here.
   out of scope by design (caller-supplied bytes).
 - **Group file / DKG / distributed-key parsing** (`/group`): not parsed;
   only `/info` and `/public/<round>`.
-- **Round ↔ wall-clock time arithmetic** (`round_at(time)` from
-  `genesis_time`/`period`): the inputs are parsed and exposed, but the
-  helper itself is not shipped yet.
 
 ## Anchoring
 

@@ -59,6 +59,7 @@ const info = try drand.parseInfo(gpa, info_bytes);
 // 2. (Optional) build the round request path; YOU perform the HTTPS GET.
 var buf: [128]u8 = undefined;
 const path = try drand.roundPath(&buf, "52db9ba7...e971", 1000); // "/52db9ba7.../public/1000"
+//    (the hash must be hex — error.InvalidChainHash otherwise; it goes into a URL)
 
 // 3. Parse the round document the caller fetched from that path.
 const round = try drand.parseRound(gpa, round_bytes);
@@ -70,9 +71,12 @@ try drand.verifyRound(&info, &round);
 // never a panic, never a silent false-accept.
 ```
 
-`gpa` is used only transiently inside the parsers (an internal arena,
-freed before return); every returned value (`ChainInfo`, `Round`) owns no
-heap memory. All parsing is bounds-checked: malformed / truncated /
+`parseInfo` also checks that the document's `hash` is the chain hash its
+own contents determine (drand's `chain.Info.Hash()`, exposed as
+`computeChainHash`) — `error.ChainHashMismatch` otherwise — and refuses
+`period == 0` (`error.InvalidPeriod`). `gpa` is used only transiently
+inside the parsers (an internal arena, freed before return); every
+returned value (`ChainInfo`, `Round`) owns no heap memory. All parsing is bounds-checked: malformed / truncated /
 oversized JSON or hex yields a typed error (`ParseError` /
 `RoundParseError`), never a panic, OOB read, hang, or amplified
 allocation (documents over 64 KiB are rejected up front).
@@ -100,12 +104,16 @@ zig build test-drand -Doptimize=ReleaseFast --summary all
 zig fmt --check modules/drand/
 ```
 
-All **31** tests PASS in both Debug and ReleaseFast: the chain-info and
-round parsers (round-trip + every malformed variant), the genuine
-quicknet round-1000 verification KAT, the negative tests (flipped
-signature, wrong round, wrong chain key, tampered randomness,
-unsupported scheme), the little-endian positive-control, and the fuzz
-harness over both parsers + the verify path.
+All tests PASS in both Debug and ReleaseFast (`--summary all` prints
+the count): the chain-info and round parsers (round-trip + every
+malformed variant, incl. a forged chain hash, a non-subgroup key, an
+identity signature, period 0), the genuine quicknet round-1000
+verification KAT, the negative tests (flipped signature, wrong round,
+wrong chain key, tampered randomness in three positions, unsupported
+scheme), the little-endian positive-control, the chain-hash formula
+against three live chains, and two fuzz harnesses — one over both
+parsers, one that damages the genuine fixtures field by field with the
+intact pair as the always-run positive control.
 
 Provenance: spec/RFC-only — see [SPEC.md](SPEC.md)'s Provenance section
 (no third-party source ported; the genuine quicknet KAT bytes are the

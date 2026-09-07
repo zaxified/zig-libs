@@ -103,9 +103,10 @@ pub fn verifyRoundPoints(pubkey: g2.Affine, round: u64, sig: g1.Affine) bool {
     // has). The public key's subgroup membership is guaranteed by
     // `chaininfo.parseInfo`; a caller supplying a `g2.Affine` from
     // elsewhere must run `g2.Jacobian.fromAffine(pk).subgroupCheck()`
-    // itself — the G2 check is ~2x the cost of this one and would be paid
-    // on every beacon for a point this module's own parser has already
-    // validated. Found by the wave-2 audit (W2-32).
+    // itself — the G2 check costs about 3.4x this one (measured 3.25 ms vs
+    // 0.96 ms, ~22 % of a whole verification) and would be paid on every
+    // beacon for a point this module's own parser has already validated.
+    // Found by the wave-2 audit (W2-32).
     if (!g1.Jacobian.fromAffine(sig).subgroupCheck()) return false;
 
     const qid = ciphersuite.h1(ciphersuite.beaconId(round));
@@ -155,9 +156,17 @@ pub fn verifyRound(info: *const ChainInfo, round: *const Round) VerifyError!void
 /// and compare against the round it actually received — this module does
 /// not do that comparison itself, since "how stale is too stale" is a
 /// caller policy, not a verification fact.
+///
+/// Total: `parseInfo` refuses `period == 0` (`InvalidPeriod`), but a
+/// `ChainInfo` is a plain value anyone can build, so a zero period here
+/// answers 1 (the chain cannot have advanced) instead of dividing by zero
+/// — SIGFPE in ReleaseFast, a panic in ReleaseSafe, before this guard —
+/// and the `+ 1` saturates instead of wrapping to round 0, which exists on
+/// no chain.
 pub fn expectedRound(info: *const ChainInfo, now_unix: u64) u64 {
     if (now_unix < info.genesis_time) return 1;
-    return (now_unix - info.genesis_time) / info.period_seconds + 1;
+    if (info.period_seconds == 0) return 1;
+    return (now_unix - info.genesis_time) / info.period_seconds +| 1;
 }
 
 // ── tests ──────────────────────────────────────────────────────────────
@@ -184,19 +193,11 @@ const round_1000_json =
     \\}
 ;
 
-// A DIFFERENT chain's key: quicknet-t (testnet) master public key. A
-// mainnet round must NOT verify against it.
-const quicknet_t_info_json =
-    \\{
-    \\  "public_key": "b15b65b46fb29104f6a4b5d1e11a8da6344463973d423661bb0804846a0ecd1ef93c25057f1c0baab2ac53e56c662b66072f6d84ee791a3382bfb055afab1e6a375538d8ffc451104ac971d2dc9b168e2d3246b0be2015969cbaac298f6502da",
-    \\  "period": 3,
-    \\  "genesis_time": 1689232296,
-    \\  "hash": "cc9c398442737cbd141526600919edd69f1d6f9b4adb67e4d912fbc64341a9a5",
-    \\  "groupHash": "a81e9d63f614ccdb144b8ff149623dee7fb1d3fa64f7cbb2076b5136ad5b8f83",
-    \\  "schemeID": "bls-unchained-g1-rfc9380",
-    \\  "metadata": { "beaconID": "quicknet-t" }
-    \\}
-;
+// A DIFFERENT chain's key: quicknet-t (testnet). A mainnet round must NOT
+// verify against it. The live document lives in chaininfo.zig — an earlier
+// copy here carried a groupHash that was not this chain's, which the
+// chain-hash check now refuses (audit F8).
+const quicknet_t_info_json = chaininfo.quicknet_t_info_json;
 
 // ── THE KAT: genuine quicknet round-1000 verifies ──────────────────────
 
@@ -260,6 +261,22 @@ test "verifyRound: tampered randomness (valid signature) → RandomnessMismatch"
     try testing.expectError(error.RandomnessMismatch, verifyRound(&info, &rnd));
 }
 
+test "verifyRound: randomness is compared in FULL — a flip in the last or a middle byte is caught (audit F15)" {
+    // The test above flips the first nibble, so a comparison weakened to
+    // `digest[0..1]` still passed. These flip byte 31 and byte 15.
+    const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    const last =
+        \\{"round":1000,"randomness":"fe290beca10872ef2fb164d2aa4442de4566183ec51c56ff3cd603d930e54fde","signature":"b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39"}
+    ;
+    const r1 = try round_mod.parseRound(testing.allocator, last);
+    try testing.expectError(error.RandomnessMismatch, verifyRound(&info, &r1));
+    const middle =
+        \\{"round":1000,"randomness":"fe290beca10872ef2fb164d2aa4442df4566183ec51c56ff3cd603d930e54fdd","signature":"b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39"}
+    ;
+    const r2 = try round_mod.parseRound(testing.allocator, middle);
+    try testing.expectError(error.RandomnessMismatch, verifyRound(&info, &r2));
+}
+
 test "verifyRound: quicknet chain info against a G2 (chained-shaped) round → SchemeGroupMismatch" {
     // Gap found by mutation testing: this branch had NO discriminating
     // test — disabling it left every test green (the code still errors,
@@ -300,6 +317,15 @@ test "expectedRound: at genesis_time exactly, the round is 1" {
 test "expectedRound: before genesis_time, the round is still 1 (chain has not started)" {
     const info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
     try testing.expectEqual(@as(u64, 1), expectedRound(&info, info.genesis_time - 1000));
+}
+
+test "expectedRound is total: period 0 answers 1 and the +1 saturates (audit F2)" {
+    var info = try chaininfo.parseInfo(testing.allocator, quicknet_info_json);
+    info.period_seconds = 0; // a hand-built ChainInfo; parseInfo itself refuses this
+    try testing.expectEqual(@as(u64, 1), expectedRound(&info, 1757000000));
+    info.period_seconds = 1;
+    info.genesis_time = 0;
+    try testing.expectEqual(std.math.maxInt(u64), expectedRound(&info, std.math.maxInt(u64)));
 }
 
 test "expectedRound: round 1000's own start instant round-trips to 1000, not 999 or 1001" {
@@ -503,105 +529,159 @@ fn damageHex(smith: *std.testing.Smith, hex: []u8, original: []const u8) bool {
     return !std.mem.eql(u8, hex, original);
 }
 
-test "fuzz: verifyRound on genuine and damaged quicknet documents" {
-    try std.testing.fuzz({}, fuzzVerifyRound, .{ .corpus = drand_seeds });
+/// What one fuzz iteration does to the genuine fixtures, decoded
+/// DETERMINISTICALLY from a byte string (`fromBytes`) so that the same
+/// function backs the fuzz harness and the plain tests below. The empty
+/// string means "damage nothing" — the positive control — and that is
+/// exactly the one input the runner feeds without `--fuzz`, so the
+/// control runs on every ordinary gate run. (The previous harness drew
+/// its choices through `Smith` scalar draws, whose out-of-range words are
+/// replaced by the range MINIMUM, not discarded as its comment claimed;
+/// the audit instrumented it: in 4 delivered calls neither assertion was
+/// ever reachable.)
+const Choices = struct {
+    with_randomness: bool = true,
+    wrong_round: bool = false,
+    scheme_idx: u2 = 0,
+    ops: [4]?Op = .{ null, null, null, null },
+
+    const Op = struct { field: u3, index: u16, nibble: u8 };
+
+    /// byte 0: flags (bit0 = no randomness, bit1 = wrong round, bits 2-3 =
+    /// scheme index); then up to four 4-byte ops `[field, idx_lo, idx_hi, nibble]`.
+    fn fromBytes(b: []const u8) Choices {
+        var c: Choices = .{};
+        if (b.len == 0) return c;
+        c.with_randomness = b[0] & 1 == 0;
+        c.wrong_round = b[0] & 2 != 0;
+        c.scheme_idx = @truncate(b[0] >> 2);
+        var i: usize = 1;
+        var n: usize = 0;
+        while (i + 4 <= b.len and n < c.ops.len) : ({
+            i += 4;
+            n += 1;
+        }) {
+            c.ops[n] = .{ .field = @truncate(b[i]), .index = std.mem.readInt(u16, b[i + 1 ..][0..2], .little), .nibble = b[i + 3] };
+        }
+        return c;
+    }
+};
+
+/// Applies `ops` for `field` to `hex`; true iff the text actually changed
+/// (writing the digit already there is not damage — an unmeasured "it was
+/// damaged" flag is how a false positive gets into a security assertion).
+fn applyDamage(c: *const Choices, field: u3, hex: []u8, original: []const u8) bool {
+    for (c.ops) |maybe| {
+        const op = maybe orelse continue;
+        if (op.field != field or hex.len == 0) continue;
+        hex[op.index % hex.len] = "0123456789abcdef"[op.nibble & 0xf];
+    }
+    return !std.mem.eql(u8, hex, original);
 }
 
-fn fuzzVerifyRound(_: void, smith: *std.testing.Smith) !void {
+/// Build the two documents per `c`, parse, verify, and assert every verdict
+/// the equation determines: parse failures where a hashed/keyed field was
+/// altered, success on the intact pair, rejection of every damaged pair.
+fn checkFixture(c: Choices) !void {
     var pk: [genuine_pubkey_hex.len]u8 = genuine_pubkey_hex.*;
     var sig: [genuine_sig_hex.len]u8 = genuine_sig_hex.*;
     var rand_hex: [genuine_randomness_hex.len]u8 = genuine_randomness_hex.*;
     var hash: [genuine_hash_hex.len]u8 = genuine_hash_hex.*;
     var ghash: [genuine_group_hash_hex.len]u8 = genuine_group_hash_hex.*;
-
-    const pk_damaged = damageHex(smith, &pk, genuine_pubkey_hex);
-    const sig_damaged = damageHex(smith, &sig, genuine_sig_hex);
-    const rand_damaged = damageHex(smith, &rand_hex, genuine_randomness_hex);
-    _ = damageHex(smith, &hash, genuine_hash_hex);
-    _ = damageHex(smith, &ghash, genuine_group_hash_hex);
-
-    const scheme = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+    const pk_damaged = applyDamage(&c, 0, &pk, genuine_pubkey_hex);
+    const sig_damaged = applyDamage(&c, 1, &sig, genuine_sig_hex);
+    const rand_damaged = applyDamage(&c, 2, &rand_hex, genuine_randomness_hex);
+    const hash_damaged = applyDamage(&c, 3, &hash, genuine_hash_hex);
+    const ghash_damaged = applyDamage(&c, 4, &ghash, genuine_group_hash_hex);
+    const scheme: []const u8 = switch (c.scheme_idx) {
         0 => genuine_scheme,
         1 => "pedersen-bls-chained",
         2 => "bls-unchained-on-g1",
-        else => "",
+        3 => "",
     };
-    const round_no: u64 = if (smith.value(bool)) genuine_round else smith.value(u64);
-    const with_randomness = smith.value(bool);
-    // `period`, `genesis_time`, `hash`, `groupHash` and the beacon id are not
-    // inputs to the verification equation, so damaging them must NOT change
-    // the verdict — which is exactly why they are damaged here.
+    const round_no: u64 = if (c.wrong_round) genuine_round + 1 + @as(u64, c.scheme_idx) * 7919 else genuine_round;
+
     var info_buf: [768]u8 = undefined;
-    const info_json = std.fmt.bufPrint(
+    const info_json = try std.fmt.bufPrint(
         &info_buf,
-        "{{\"public_key\":\"{s}\",\"period\":{d},\"genesis_time\":{d}," ++
+        "{{\"public_key\":\"{s}\",\"period\":3,\"genesis_time\":1692803367," ++
             "\"hash\":\"{s}\",\"groupHash\":\"{s}\",\"schemeID\":\"{s}\"," ++
             "\"metadata\":{{\"beaconID\":\"quicknet\"}}}}",
-        .{ &pk, smith.value(u16), smith.value(u32), &hash, &ghash, scheme },
-    ) catch return;
-
+        .{ &pk, &hash, &ghash, scheme },
+    );
     var round_buf: [512]u8 = undefined;
-    const round_json = if (with_randomness)
-        std.fmt.bufPrint(
-            &round_buf,
-            "{{\"round\":{d},\"randomness\":\"{s}\",\"signature\":\"{s}\"}}",
-            .{ round_no, &rand_hex, &sig },
-        ) catch return
+    const round_json = if (c.with_randomness)
+        try std.fmt.bufPrint(&round_buf, "{{\"round\":{d},\"randomness\":\"{s}\",\"signature\":\"{s}\"}}", .{ round_no, &rand_hex, &sig })
     else
-        std.fmt.bufPrint(
-            &round_buf,
-            "{{\"round\":{d},\"signature\":\"{s}\"}}",
-            .{ round_no, &sig },
-        ) catch return;
+        try std.fmt.bufPrint(&round_buf, "{{\"round\":{d},\"signature\":\"{s}\"}}", .{ round_no, &sig });
 
+    // The key, hash and groupHash are all inputs to the chain hash, so any
+    // alteration of them must fail the parse; an untouched trio must parse
+    // regardless of the scheme label (which is not hashed).
+    const info_damaged = pk_damaged or hash_damaged or ghash_damaged;
     const info = chaininfo.parseInfo(testing.allocator, info_json) catch |e| {
-        // An undamaged key on the genuine scheme must always parse; anything
-        // else means the fixture or the parser drifted, and every "no crash"
-        // verdict from here on would have been vacuous.
-        if (!pk_damaged and std.mem.eql(u8, scheme, genuine_scheme)) return e;
+        if (!info_damaged) return e; // fixture or parser drifted
         return;
     };
+    if (info_damaged) return error.DamagedInfoParsed;
+
     const rnd = round_mod.parseRound(testing.allocator, round_json) catch |e| {
         if (!sig_damaged) return e;
-        return;
+        return; // a damaged signature may be refused at parse (usual) or reach verify (below)
     };
 
-    const crypto_intact = !pk_damaged and !sig_damaged and
-        (!with_randomness or !rand_damaged) and
-        round_no == genuine_round and std.mem.eql(u8, scheme, genuine_scheme);
-
+    const crypto_intact = !sig_damaged and (!c.with_randomness or !rand_damaged) and
+        !c.wrong_round and c.scheme_idx == 0;
     if (verifyRound(&info, &rnd)) |_| {
-        // A verdict of "genuine" for anything the equation actually covers
-        // that was altered is a forgery accepted.
         if (!crypto_intact) return error.DamagedRoundVerified;
     } else |_| {
         if (crypto_intact) return error.GenuineRoundRejected;
     }
 }
 
-/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
-/// `options.corpus` plus one empty input, and an empty input makes every draw
-/// return its range minimum — no damage at all, i.e. only the positive
-/// control. `Smith` reads one little-endian `u64` per scalar draw and discards
-/// a word outside that draw's range, so the words are kept small.
-fn drandSeed(comptime bits: u64, comptime n: usize) [n]u8 {
-    @setEvalBranchQuota(100_000);
-    var out: [n]u8 = undefined;
-    var i: usize = 0;
-    var w: u6 = 0;
-    while (i + 8 <= n) : (i += 8) {
-        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x0F, .little);
-        w +%= 1;
-    }
-    @memset(out[i..], 0);
-    return out;
+test "fixture checks, deterministic: the positive control and one damage per field (audit F3)" {
+    try checkFixture(.{}); // intact, with randomness → must verify
+    try checkFixture(.{ .with_randomness = false });
+    try checkFixture(.{ .wrong_round = true });
+    try checkFixture(.{ .scheme_idx = 1 });
+    try checkFixture(.{ .scheme_idx = 3 });
+    // One nibble in each field, at a position that changes the text.
+    try checkFixture(.{ .ops = .{ .{ .field = 1, .index = 95, .nibble = 0x8 }, null, null, null } }); // sig, last nibble
+    try checkFixture(.{ .ops = .{ .{ .field = 2, .index = 63, .nibble = 0xe }, null, null, null } }); // randomness, last nibble
+    try checkFixture(.{ .ops = .{ .{ .field = 0, .index = 191, .nibble = 0xb }, null, null, null } }); // key
+    try checkFixture(.{ .ops = .{ .{ .field = 3, .index = 0, .nibble = 0x0 }, null, null, null } }); // hash
+    try checkFixture(.{ .ops = .{ .{ .field = 4, .index = 10, .nibble = 0x1 }, null, null, null } }); // groupHash
 }
 
-const drand_seeds: []const []const u8 = &.{
-    &drandSeed(0x0000_0000_0000_0000, 256), // undamaged: the positive control
-    &drandSeed(0x9E37_79B9_7F4A_7C15, 256),
-    &drandSeed(0x0123_4567_89AB_CDEF, 256),
-    &drandSeed(0xF0E1_D2C3_B4A5_9687, 256),
+test "fuzz: verifyRound on genuine and damaged quicknet documents" {
+    try std.testing.fuzz({}, fuzzVerifyRound, .{ .corpus = &drand_seeds });
+}
+
+fn fuzzVerifyRound(_: void, smith: *std.testing.Smith) !void {
+    var raw: [24]u8 = undefined;
+    // One `smith.slice` draw; the empty input the default gate feeds decodes
+    // to "damage nothing", i.e. the positive control runs every time.
+    const n = smith.slice(&raw);
+    try checkFixture(Choices.fromBytes(raw[0..n]));
+}
+
+/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`:
+/// a little-endian u32 length, then the bytes. Static memory.
+fn fuzzSeed(comptime bytes: []const u8) []const u8 {
+    return &struct {
+        const b = std.mem.toBytes(@as(u32, @intCast(bytes.len))) ++ bytes[0..bytes.len].*;
+    }.b;
+}
+
+const drand_seeds = [_][]const u8{
+    fuzzSeed(&.{}), // intact
+    fuzzSeed(&.{0x01}), // no randomness
+    fuzzSeed(&.{0x02}), // wrong round
+    fuzzSeed(&.{0x04}), // chained scheme label
+    fuzzSeed(&.{ 0x00, 1, 95, 0, 0x8 }), // signature nibble
+    fuzzSeed(&.{ 0x00, 2, 63, 0, 0xe }), // randomness nibble
+    fuzzSeed(&.{ 0x00, 0, 191, 0, 0xb }), // key nibble
+    fuzzSeed(&.{ 0x00, 3, 5, 0, 0xf, 4, 7, 0, 0xa }), // hash + groupHash
 };
 
 test "verifyRoundPoints rejects identity operands (total-forgery guard)" {

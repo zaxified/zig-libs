@@ -78,7 +78,7 @@ const quicknet_t_info_json =
     \\  "period": 3,
     \\  "genesis_time": 1689232296,
     \\  "hash": "cc9c398442737cbd141526600919edd69f1d6f9b4adb67e4d912fbc64341a9a5",
-    \\  "groupHash": "a81e9d63f614ccdb144b8ff149623dee7fb1d3fa64f7cbb2076b5136ad5b8f83",
+    \\  "groupHash": "40d49d910472d4adb1d67f65db8332f11b4284eecf05c05c5eacd5eef7d40e2d",
     \\  "schemeID": "bls-unchained-g1-rfc9380",
     \\  "metadata": { "beaconID": "quicknet-t" }
     \\}
