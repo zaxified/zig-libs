@@ -581,22 +581,104 @@ test {
 // encoder must also tolerate. Both allocate, so this runs under
 // `std.testing.allocator` with the result freed on every path — a leak here
 // is a real finding, not a lenient no-op.
+//
+// ⚠ This harness opened with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so the length was 0 on
+// every input a corpus can carry and both codecs were handed an empty slice
+// while the bytes sat unread in `buf`. And `enc` was drawn AFTER that, from an
+// exhausted input, so `smith.index` returned 0: **every run used `.utf8` and
+// no table-driven encoding was ever selected at all**. It had no corpus either,
+// so outside `--fuzz` the target ran exactly one input for ever — the empty one
+// through the passthrough encoding, which is the single least interesting cell
+// of a 6 × N matrix.
+
+/// The encodings the harness sweeps. Swept rather than drawn: the fuzzer still
+/// drives the bytes, and every seed now visits all six — including the five
+/// table-driven ones the drawn index could never reach.
+const fuzz_encodings = [_]Encoding{ .utf8, .windows_1250, .windows_1252, .iso_8859_1, .iso_8859_2, .iso_8859_15 };
+
+/// `testkit.fuzz.seed`, aliased so the corpus reads as the byte strings it is.
+/// A corpus entry is not the input: `Smith.slice` reads a little-endian `u32`
+/// length first, so a raw string would arrive minus its own first four octets.
+const seed = @import("testkit").fuzz.seed;
+
+/// Byte strings, in the format the length draw reads. The same bytes go through
+/// BOTH directions, so each seed has to be interesting as a code-page byte
+/// string AND as (possibly malformed) UTF-8 — which is why the malformed-UTF-8
+/// edges the audit found are here verbatim: a bare lead byte at the very end of
+/// the buffer, a lead with too few continuations, and a lone continuation.
+const codec_seeds = [_][]const u8{
+    seed("plain ASCII, identical in every table"), // the passthrough path
+    seed("\x80\x81\x82\x9a\x9c\x9e\xa1\xa5\xb1\xb9"), // the 0x80..0xBF band, where the five tables disagree
+    seed("\xc0\xc1\xc2\xd0\xdd\xe0\xea\xf3\xfc\xff"), // the high band: accented letters in every table
+    seed("P\xf8\xed li\xb9 \xbelu\xbbou\xe8k\xfd k\xf9\xf2"), // Czech in windows-1250 — every byte the table remaps
+    seed("\xa4\xa6\xa8\xb4\xb8\xbc\xbd\xbe"), // the eight positions where iso-8859-15 differs from -1
+    seed("P\xc5\x99\xc3\xad li\xc5\xa1"), // well-formed multi-byte UTF-8, for the encode direction
+    seed("ab\xc2"), // a 2-byte lead with 0 continuations, at the very end (audit edge)
+    seed("ab\xe2\x82"), // a 3-byte lead with only 1 continuation (audit edge)
+    seed("\x80\x80\x80"), // continuation bytes with no lead at all
+    seed("\xf0\x9f\x92\xa9"), // a 4-byte sequence: unmappable in every 8-bit table
+    seed("\x00\x01\x7f"), // NUL and the C0/DEL controls
+    seed("\xed\xa0\x80"), // a surrogate encoded as UTF-8, which is not valid UTF-8
+};
+
 test "fuzz: decodeToUtf8 / encodeFromUtf8 never panic, OOB or leak on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzCodecNeverLeaks, .{});
+    try std.testing.fuzz({}, fuzzCodecNeverLeaks, .{ .corpus = &codec_seeds });
 }
 
 fn fuzzCodecNeverLeaks(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len = smith.slice(&buf);
     const input = buf[0..len];
 
-    const encs = [_]Encoding{ .utf8, .windows_1250, .windows_1252, .iso_8859_1, .iso_8859_2, .iso_8859_15 };
-    const enc = encs[smith.index(encs.len)];
-
     const a = std.testing.allocator;
-    const decoded = try decodeToUtf8(a, input, enc);
-    defer a.free(decoded);
-    const encoded = try encodeFromUtf8(a, input, enc);
-    defer a.free(encoded);
+    for (fuzz_encodings) |enc| {
+        const decoded = try decodeToUtf8(a, input, enc);
+        defer a.free(decoded);
+        const encoded = try encodeFromUtf8(a, input, enc);
+        defer a.free(encoded);
+    }
+}
+
+test "corpus: every seed reaches both codecs, and the octets produced are pinned" {
+    // ⭐ Octets produced is the second number, and it has to be: neither codec
+    // ever errors — they are lenient by design, an unmappable byte is emitted
+    // verbatim — so there is no acceptance to count and "it did not leak" was
+    // already true on a harness handed nothing. Decoded and encoded octets are
+    // pinned separately, and `.utf8` separately from the five table encodings,
+    // because `.utf8` is the only one the drawn `enc` ever selected: if the
+    // sweep ever collapses back to index 0 the table totals fall to match the
+    // passthrough one, which a single number would hide.
+    const a = std.testing.allocator;
+    var nonempty: usize = 0;
+    var utf8_decoded: usize = 0;
+    var table_decoded: usize = 0;
+    var table_encoded: usize = 0;
+    for (codec_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        for (fuzz_encodings) |enc| {
+            const decoded = try decodeToUtf8(a, buf[0..len], enc);
+            defer a.free(decoded);
+            const encoded = try encodeFromUtf8(a, buf[0..len], enc);
+            defer a.free(encoded);
+            if (enc == .utf8) {
+                utf8_decoded += decoded.len;
+            } else {
+                table_decoded += decoded.len;
+                table_encoded += encoded.len;
+            }
+        }
+    }
+    try std.testing.expectEqual(codec_seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw and the collapsing index,
+    // 0 seeds arrived non-empty and every run was `.utf8` over an empty slice —
+    // 0 / 0 / 0. After: 12 seeds, 208 / 879 / 550.
+    try std.testing.expectEqual(@as(usize, 208), utf8_decoded);
+    try std.testing.expectEqual(@as(usize, 879), table_decoded);
+    try std.testing.expectEqual(@as(usize, 550), table_encoded);
 }
