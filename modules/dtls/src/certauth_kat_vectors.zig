@@ -69,3 +69,25 @@ pub const evil_server_cert_der = der("testdata/certs/evil-server-cert.der");
 /// `parseLeafPublicKey`'s RSA path (`rsa.PublicKey.fromDer` bridging) parses
 /// a real X.509-embedded RSA key, not for chain verification.
 pub const rsa_cert_der = der("testdata/certs/rsa-cert.der");
+
+/// ECDSA P-384 self-signed certificate, CN=dtls-test-p384.
+/// Ed25519 self-signed certificate, CN=dtls-test-ed25519.
+///
+/// ⭐ Added 2026-09-07 for one reason, stated so it does not get "tidied away"
+/// later: `certauth.parseLeafPublicKey`'s P-384 and Ed25519 dispatch arms are
+/// the ONLY part of that function with no coverage anywhere else in the tree
+/// (its RSA and P-256 arms are re-fuzzed in `x509` and `rsa`), and its own
+/// harness says so in a comment — but there was no P-384 or Ed25519
+/// certificate in the module, so neither arm had ever run. Self-signed like
+/// `rsa_cert_der` and for the same reason: nothing here checks a signature,
+/// only the `SubjectPublicKeyInfo`, and the anchor's private key is not in the
+/// tree to sign with. Same OpenSSL 3.5.5 and the same validity window as every
+/// other fixture above:
+///
+///     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 \
+///       -nodes -keyout /dev/null -outform der -out p384-cert.der \
+///       -subj "/CN=dtls-test-p384" \
+///       -not_before 20260721184202Z -not_after 20360718184202Z
+///     openssl req -x509 -newkey ed25519 ... -subj "/CN=dtls-test-ed25519"
+pub const p384_cert_der = der("testdata/certs/p384-cert.der");
+pub const ed25519_cert_der = der("testdata/certs/ed25519-cert.der");

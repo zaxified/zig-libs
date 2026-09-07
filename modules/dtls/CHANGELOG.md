@@ -5,6 +5,49 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the twelve handshake-message
+  fuzz targets and the certificate-bridge one stop throwing their input away,
+  and two new certificate fixtures reach two dispatch arms that had never run.
+
+  Nine `messages.zig` targets opened with `smith.bytes(&buf)` followed by
+  `smith.valueRangeAtMost(u16, 0, buf.len)`, which is the range MINIMUM once
+  `bytes` has consumed the input — so `len` was 0 and every decoder was called
+  with an empty slice. The other three built a message with this file's own
+  encoders from parts that were *all* ranged draws, so the message was the same
+  one every time: an empty session id, **zero cipher suites and zero
+  extensions**. `certauth.fuzzParseLeafPublicKey` was the first shape again.
+  None of the thirteen declared a corpus, so outside `--fuzz` the runner
+  replayed exactly one input each.
+
+  Measured 2026-09-07, before → after (non-empty seeds / accepted / fields
+  walked): ClientHello **0/0/0 → 18/14/91**, ServerHello **0/0/0 → 25/23/45**,
+  Certificate **0/0/0 → 8/3/1161 DER octets**, extension blocks **0/0/0 →
+  35/32/115 extensions**, `key_share` ClientHello **0/0/0 → 10/9/3809 octets**,
+  `parseLeafPublicKey` **0/0 → 12/5 keys in 4 of the 4 supported kinds**.
+
+  Two things the collapse had been hiding:
+
+  * **The buffers were too small for this module's own traffic.** The largest
+    recorded ClientHello body is 1554 octets and the largest `key_share` 1222 —
+    the hybrid X25519MLKEM768 offer this module exists to make — against 1024-
+    and 256-octet harness buffers. A seed longer than the buffer reads back as
+    the EMPTY one, so the flagship handshake could never have passed through its
+    own harnesses even with the draw fixed. Raised to 2048.
+  * **`parseLeafPublicKey`'s P-384 and Ed25519 arms had no fixture.** Its own
+    comment says those two arms are the reason the harness exists (the RSA and
+    P-256 paths are re-fuzzed in `x509` and `rsa`), but the module owned no
+    P-384 and no Ed25519 certificate, so neither arm had ever executed.
+    `src/testdata/certs/p384-cert.der` and `ed25519-cert.der` were generated
+    with the same OpenSSL 3.5.5 and the same validity window as the existing
+    fixtures, and are exported as `p384_cert_der` / `ed25519_cert_der`.
+
+  Also fixed, and recorded because both were false when written: "then
+  SOMETIMES flip one byte" (the flip hung on a `boolWeighted` drawn after the
+  input was gone — it had never fired), and "plain random bytes at a plausible
+  length already reach their interior loops" (the length was 0). The mutation is
+  now a full-width `smith.value(u64)` carried in the seed's tail, and the corpus
+  guard pins how many seeds carry one.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the record-layer fuzz targets
   stop throwing their input away, and the module gains a corpus source built
   from the recorded wolfSSL transcript (`src/fuzz_corpus.zig`).
