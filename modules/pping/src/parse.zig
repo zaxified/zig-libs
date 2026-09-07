@@ -285,37 +285,77 @@ test "parseTcpTimestamps: fuzz — a genuine Timestamps option embedded in rando
 // sequences (kind/length pairs, NOPs, END, an occasional genuine Timestamps
 // option) rather than the "rejected at the first kind byte" case pure random
 // bytes would mostly produce.
+const fuzzseed = @import("testkit").fuzz;
+
+/// ⛔ The corpus this replaces was the two golden captures as RAW arrays:
+/// `&syn_tcp_options`, `&synack_tcp_options`. Neither reached the parser.
+/// `buildTcpOptions` opened with `smith.valueRangeAtMost(u8, 0, 5)`, which
+/// reads EIGHT octets as a little-endian `u64` and returns the range MINIMUM
+/// unless that whole word already lies in 0..5 — the SYN capture's first eight
+/// octets read as 0x0a080204d7ff0402, so the draw returned 0 and took the
+/// "pure arbitrary bytes" branch; `smith.bytes(buf)` then ate the remaining
+/// twelve octets and the ranged length after it found nothing left and
+/// returned 0. **Both real captures arrived at `parseTcpTimestamps` as the
+/// EMPTY option list.** Measured 2026-09-07: 0 of 2 seeds carried an octet,
+/// and 0 Timestamps options were found — from a corpus made of two frames
+/// whose whole point is that they contain one.
+///
+/// The seeds are now scripts. Octet 0 picks the shape: 0 means "the rest of
+/// this seed IS the option list, verbatim", which is what lets a captured
+/// frame be a seed at all; anything else means "the rest is a script that
+/// assembles TLV entries".
+const fuzz_corpus = [_][]const u8{
+    fuzzseed.seed("\x00" ++ syn_tcp_options), // ⭐ the SYN capture, verbatim
+    fuzzseed.seed("\x00" ++ synack_tcp_options), // ⭐ the SYN-ACK capture, verbatim
+    fuzzseed.seed("\x00"), // an empty option list
+    fuzzseed.seed("\x00\x08"), // a Timestamps kind byte with no length behind it
+    fuzzseed.seed("\x00\x08\x0a"), // kind and length, and none of the ten octets they promise
+    fuzzseed.seed("\x00\x08\x0a\x00\x00\x00\x01\x00\x00\x00\x02"), // a complete Timestamps option and nothing else
+    fuzzseed.seed("\x00\x01\x01\x01\x08\x0a\xff\xff\xff\xff\x00\x00\x00\x00"), // three NOPs then Timestamps
+    fuzzseed.seed("\x00\x00\x08\x0a\x00\x00\x00\x01\x00\x00\x00\x02"), // ⭐ END first: the Timestamps behind it must NOT be found
+    fuzzseed.seed("\x00\x02\xff" ++ "\xaa" ** 40), // an option claiming 255 octets inside a 43-octet list
+    fuzzseed.seed("\x00\x02\x00" ++ "\xaa" ** 8), // a length of 0, which cannot advance the walk
+    fuzzseed.seed("\x00\x02\x01" ++ "\xaa" ** 8), // a length of 1, ditto
+    fuzzseed.seed("\x01" ++ "\x08" ++ "\x02\x02\x02\x02\x02\x02\x02\x02"), // script: eight genuine Timestamps entries back to back
+    fuzzseed.seed("\x01" ++ "\x08" ++ "\x01\x01\x01\x03\x03\x03\x00\x02"), // script: NOPs, opaque options, then END
+    fuzzseed.seed("\x01" ++ "\x04" ++ "\x03\xff\xff\x03\x08\x08"), // script: opaque options with hostile kind/length octets
+};
+
 test "fuzz: parseTcpTimestamps never panics or reads OOB, arbitrary or TLV-shaped bytes" {
     try std.testing.fuzz({}, fuzzParseNeverPanics, .{ .corpus = &fuzz_corpus });
 }
 
-const fuzz_corpus = [_][]const u8{
-    &syn_tcp_options,
-    &synack_tcp_options,
-};
+const fuzz_buf_len = 64;
 
 fn fuzzParseNeverPanics(_: void, smith: *std.testing.Smith) !void {
-    var buf: [64]u8 = undefined;
-    const opts = buildTcpOptions(smith, &buf);
+    var raw: [1 + fuzz_buf_len]u8 = undefined;
+    // ⚠ ONE byte-first draw. See `fuzz_corpus` for what the ranged draws did.
+    const n: usize = smith.slice(&raw);
+    var buf: [fuzz_buf_len]u8 = undefined;
+    const opts = buildTcpOptions(raw[0..n], &buf);
     _ = parseTcpTimestamps(opts);
 }
 
-/// One draw in six is pure arbitrary bytes; the rest assemble a sequence of
-/// TLV-ish entries: END (stops the list), NOP (single byte), a genuine
-/// `kind=8 len=10` Timestamps option with random TSval/TSecr, or an opaque
-/// option with an arbitrary (possibly malformed — too short, overrunning the
-/// buffer) length byte.
-fn buildTcpOptions(smith: *std.testing.Smith, buf: []u8) []const u8 {
-    if (smith.valueRangeAtMost(u8, 0, 5) == 0) {
-        smith.bytes(buf);
-        const len = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
-        return buf[0..len];
+/// Turn one drawn seed into an option list. Octet 0 selects: 0 means the
+/// remaining octets are the list verbatim (a captured frame); anything else
+/// means they are a script assembling TLV-ish entries — END (stops the list),
+/// NOP (single byte), a genuine `kind=8 len=10` Timestamps option, or an
+/// opaque option with an arbitrary (possibly malformed — too short,
+/// overrunning the buffer) length byte.
+fn buildTcpOptions(seed: []const u8, buf: []u8) []const u8 {
+    if (seed.len == 0) return buf[0..0];
+    if (seed[0] == 0) {
+        const body = seed[1..];
+        const n = @min(body.len, buf.len);
+        @memcpy(buf[0..n], body[0..n]);
+        return buf[0..n];
     }
+    var script: fuzzseed.Cursor = .{ .bytes = seed[1..] };
     var pos: usize = 0;
-    const n_entries = smith.valueRangeAtMost(u8, 0, 8);
-    var i: u8 = 0;
+    const n_entries = script.ranged(0, 8);
+    var i: u32 = 0;
     while (i < n_entries and pos < buf.len) : (i += 1) {
-        switch (smith.valueRangeAtMost(u8, 0, 4)) {
+        switch (script.ranged(0, 4)) {
             0 => {
                 buf[pos] = 0; // End of Option List
                 pos += 1;
@@ -329,22 +369,52 @@ fn buildTcpOptions(smith: *std.testing.Smith, buf: []u8) []const u8 {
                 if (pos + 10 > buf.len) break;
                 buf[pos] = 8;
                 buf[pos + 1] = 10;
-                smith.bytes(buf[pos + 2 .. pos + 10]);
+                for (buf[pos + 2 .. pos + 10]) |*b| b.* = script.byte();
                 pos += 10;
             },
             else => {
                 if (pos + 1 >= buf.len) break;
-                buf[pos] = smith.value(u8); // kind
-                const len = smith.value(u8); // possibly malformed length
+                buf[pos] = script.byte(); // kind
+                const len = script.byte(); // possibly malformed length
                 buf[pos + 1] = len;
                 pos += 2;
                 const value_len = @min(@as(usize, if (len >= 2) len - 2 else 0), buf.len - pos);
-                if (value_len > 0) {
-                    smith.bytes(buf[pos..][0..value_len]);
-                    pos += value_len;
-                }
+                for (buf[pos..][0..value_len]) |*b| b.* = script.byte();
+                pos += value_len;
             },
         }
     }
     return buf[0..pos];
+}
+
+test "corpus: every seed reaches the parser, and the Timestamps options found are pinned" {
+    // ⭐ `parseTcpTimestamps` returns `null` for the empty list and for any
+    // list without a Timestamps option, so "it did not crash" is all the old
+    // corpus could ever have reported. The numbers the empty list cannot
+    // produce are the octets walked and the options FOUND — and one seed puts
+    // an END ahead of a genuine Timestamps option precisely so that a walk
+    // which ignores END would change this count.
+    var nonempty: usize = 0;
+    var octets: usize = 0;
+    var found: usize = 0;
+    var tsval_sum: u64 = 0;
+    for (fuzz_corpus) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [1 + fuzz_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&raw);
+        var buf: [fuzz_buf_len]u8 = undefined;
+        const opts = buildTcpOptions(raw[0..n], &buf);
+        if (opts.len != 0) nonempty += 1;
+        octets += opts.len;
+        if (parseTcpTimestamps(opts)) |ts| {
+            found += 1;
+            tsval_sum +%= ts.tsval;
+        }
+    }
+    // Measured 2026-09-07. The corpus this replaces produced 0 octets and 0
+    // Timestamps options from two frames that each contain one.
+    try std.testing.expectEqual(@as(usize, 13), nonempty);
+    try std.testing.expectEqual(@as(usize, 309), octets);
+    try std.testing.expectEqual(@as(usize, 6), found);
+    try std.testing.expectEqual(@as(u64, 7817081300), tsval_sum);
 }
