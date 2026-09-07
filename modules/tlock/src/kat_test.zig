@@ -425,32 +425,138 @@ test "drand interop: the fixture rejects under a mismatched round signature (FO 
 // point's compressed-encoding boundary and the FO consistency check
 // rather than being rejected by the first flag-byte check on nearly
 // every draw.
-fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
-    var sk_bytes = [_]u8{0} ** 32;
-    sk_bytes[31] = 0x07;
-    const sk = bls12_381.Fr.fromBytes(sk_bytes) catch unreachable;
-    const p_pub = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(sk).toAffine();
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+const seed = tkfuzz.seedHex;
 
-    const round: u64 = 12345;
-    const id = ciphersuite.beaconId(round);
-    const round_signature = g1.Jacobian.fromAffine(ciphersuite.h1(id)).scalarMul(sk).toAffine();
-
-    const message = [_]u8{0xCD} ** tlock.block_bytes;
-    const sigma = [_]u8{0x22} ** tlock.block_bytes;
-    const ct = tlock.encrypt(p_pub, round, message, sigma);
-    var bytes = ct.toBytes();
-
-    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
-    var i: u8 = 0;
-    while (i < n_flips) : (i += 1) {
-        const pos = smith.index(bytes.len);
-        bytes[pos] = smith.value(u8);
-    }
-
-    const corrupted = tlock.Ciphertext.fromBytes(bytes) catch return;
-    _ = tlock.decrypt(round_signature, corrupted) catch return;
-}
+/// Damage scripts in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// ⛔ This target is a DAMAGE harness: it does not decode a frame, it corrupts
+/// one. The script is therefore what has to come out of the byte draw, and it
+/// is read with a `testkit.fuzz.Cursor`:
+///
+///     NN            number of flips, 0..6
+///     (PPPP VV)*    per flip: position (big-endian, mod 128) and new value
+///
+/// The layout of the 128 octets being damaged is `U` (96, compressed G2) ‖
+/// `V` (16) ‖ `W` (16), so the positions below are chosen to hit the
+/// compression flag byte, the far end of `U`, and each of `V` and `W`.
+const damage_seeds = [_][]const u8{
+    seed(""), // 0 flips: the PRISTINE ciphertext — the one input the old harness ran
+    seed("01" ++ "0000" ++ "FF"), // the G2 compression flag byte, all bits set
+    seed("01" ++ "0000" ++ "00"), // the same byte cleared
+    seed("01" ++ "0001" ++ "AA"), // inside U, past the flag byte
+    seed("01" ++ "005F" ++ "AA"), // the last octet of U
+    seed("01" ++ "0060" ++ "AA"), // the first octet of V
+    seed("01" ++ "006F" ++ "01"), // the last octet of V
+    seed("01" ++ "0070" ++ "AA"), // the first octet of W
+    seed("01" ++ "007F" ++ "01"), // the last octet of W — the FO consistency check
+    seed("02" ++ "0060" ++ "11" ++ "0070" ++ "22"), // one flip in each of V and W
+    seed("06" ++ "0000" ++ "01" ++ "0010" ++ "02" ++ "0020" ++ "03" ++
+        "0060" ++ "04" ++ "0068" ++ "05" ++ "0078" ++ "06"), // the maximum, spread across U/V/W
+};
 
 test "fuzz: Ciphertext.fromBytes/decrypt never panics on corrupted ciphertext bytes" {
-    try std.testing.fuzz({}, fuzzDecrypt, .{});
+    try std.testing.fuzz({}, fuzzDecrypt, .{ .corpus = &damage_seeds });
+}
+
+/// The fixed beacon-shaped keypair and the pristine ciphertext both the
+/// harness and its guard damage. Shared so the guard cannot drift onto a
+/// different subject.
+const DamageSubject = struct {
+    round_signature: g1.Affine,
+    bytes: [tlock.Ciphertext.encoded_bytes]u8,
+
+    fn build() DamageSubject {
+        var sk_bytes = [_]u8{0} ** 32;
+        sk_bytes[31] = 0x07;
+        const sk = bls12_381.Fr.fromBytes(sk_bytes) catch unreachable;
+        const p_pub = g2.Jacobian.fromAffine(g2.Affine.generator).scalarMul(sk).toAffine();
+
+        const round: u64 = 12345;
+        const id = ciphersuite.beaconId(round);
+        const round_signature = g1.Jacobian.fromAffine(ciphersuite.h1(id)).scalarMul(sk).toAffine();
+
+        const message = [_]u8{0xCD} ** tlock.block_bytes;
+        const sigma = [_]u8{0x22} ** tlock.block_bytes;
+        return .{
+            .round_signature = round_signature,
+            .bytes = tlock.encrypt(p_pub, round, message, sigma).toBytes(),
+        };
+    }
+};
+
+/// Apply one damage script to `bytes`, returning how many flips it applied.
+fn applyDamage(script: []const u8, bytes: []u8) usize {
+    var cur: tkfuzz.Cursor = .{ .bytes = script };
+    const n_flips = cur.ranged(0, 6);
+    var i: u32 = 0;
+    while (i < n_flips) : (i += 1) {
+        bytes[cur.word() % bytes.len] = cur.byte();
+    }
+    return n_flips;
+}
+
+fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
+    const subject = DamageSubject.build();
+    var bytes = subject.bytes;
+
+    var script: [64]u8 = undefined;
+    // ⚠ The damage script comes out of ONE `smith.slice` call, and it is the
+    // FIRST draw. The flip count used to be `smith.valueRangeAtMost(u8, 0, 6)`
+    // — a ranged draw, which reads eight octets as a little-endian u64 and
+    // returns the range MINIMUM unless that whole word lands in the range. It
+    // was therefore **0 on every replay**, so the loop below never executed
+    // once and this harness handed `fromBytes` the PRISTINE ciphertext, every
+    // time, for its whole existence. A damage harness that applies no damage.
+    // Measured 2026-09-07 over the corpus above: **0 of 11 scripts flipped a
+    // byte and 1 distinct ciphertext existed before; 10 of 11 flip, 16 flips
+    // in total and 11 distinct ciphertexts after.**
+    const n: usize = smith.slice(&script);
+    _ = applyDamage(script[0..n], &bytes);
+
+    const corrupted = tlock.Ciphertext.fromBytes(bytes) catch return;
+    _ = tlock.decrypt(subject.round_signature, corrupted) catch return;
+}
+
+test "corpus: every damage script actually damages, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. The
+    // number that matters for a damage harness is not "did it decode" but
+    // "did anything change": `flips` and `distinct` are both zero and one
+    // respectively for the collapsed draw, and neither can be moved by an
+    // empty input.
+    const subject = DamageSubject.build();
+    var flips: usize = 0;
+    var distinct: usize = 0;
+    var decoded: usize = 0;
+    var decrypted: usize = 0;
+    var seen: [damage_seeds.len][tlock.Ciphertext.encoded_bytes]u8 = undefined;
+    for (damage_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [64]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var bytes = subject.bytes;
+        flips += applyDamage(script[0..n], &bytes);
+
+        var already = false;
+        for (seen[0..distinct]) |s| {
+            if (std.mem.eql(u8, &s, &bytes)) already = true;
+        }
+        if (!already) {
+            seen[distinct] = bytes;
+            distinct += 1;
+        }
+
+        const ct = tlock.Ciphertext.fromBytes(bytes) catch continue;
+        decoded += 1;
+        _ = tlock.decrypt(subject.round_signature, ct) catch continue;
+        decrypted += 1;
+    }
+    // Measured 2026-09-07: with the flip count drawn as a ranged value, 0
+    // flips and exactly 1 distinct ciphertext across the whole corpus — the
+    // pristine one, eleven times. After:
+    try std.testing.expectEqual(@as(usize, 16), flips);
+    try std.testing.expectEqual(damage_seeds.len, distinct);
+    try std.testing.expectEqual(@as(usize, 8), decoded);
+    try std.testing.expectEqual(@as(usize, 1), decrypted);
 }

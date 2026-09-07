@@ -404,49 +404,136 @@ test "verify: tampered body / wrong secret / malformed all rejected (constant-ti
 // characters and surrounding whitespace, so the hex-decode path — not just
 // the length/prefix check — actually runs.
 
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+const seed = tkfuzz.seed;
+
+/// The credential the harness verifies against: the same key/body pair as
+/// `computeHex is lowercase hex and matches a well-known HMAC-SHA256 demo
+/// vector`, so the corpus can carry a signature that is genuinely CORRECT.
+const anchor_secret = "key";
+const anchor_body = "The quick brown fox jumps over the lazy dog";
+const anchor_hex = "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8";
+
+/// Presented header values in the format `Smith.slice` reads.
+///
+/// ⚠ `presentedMac` gates on an exact length before it looks at anything else
+/// (`prefix.len + 64`), so a value that is not exactly 71 octets after
+/// trimming never reaches the prefix compare, let alone `hexToBytes`. The
+/// interesting inputs are therefore all the same length, and that length has
+/// to be spelled out rather than drawn.
+const presented_seeds = [_][]const u8{
+    seed("sha256=" ++ anchor_hex), // the CORRECT signature: verify → true
+    seed("sha256=" ++ anchor_hex[0..63] ++ "9"), // one hex digit off: decodes, compare fails
+    seed("  sha256=" ++ anchor_hex ++ " \t"), // the SP/TAB trim path, still true
+    seed("sha256=F7BC83F430538424B13298E6AA6FB143EF4D59A14946175997479DBC2D1A3CD8"), // uppercase: hexToBytes is case-insensitive
+    seed("sha256=" ++ anchor_hex[0..63] ++ "g"), // a non-hex digit: hexToBytes refuses
+    seed("sha255=" ++ anchor_hex), // right length, wrong prefix
+    seed(anchor_hex), // no prefix: wrong length for `verify`, RIGHT length for the empty-prefix call
+    seed("sha256="), // prefix only: the length gate
+    seed("sha256=" ++ anchor_hex ++ "0"), // one octet too long
+    seed("a" ** 128), // the full harness buffer
+    seed(""), // the ONE input the collapsed harness ever ran
+};
+
 test "fuzz: verify never panics on arbitrary secret/body/presented" {
-    try testing.fuzz({}, fuzzVerify, .{});
+    try testing.fuzz({}, fuzzVerify, .{ .corpus = &presented_seeds });
 }
 
 fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    var presented_buf: [128]u8 = undefined;
+    // ⚠ One `smith.slice` call, and it is the FIRST draw. This harness used to
+    // open with `smith.bytes(&secret_buf)` + a ranged length, then the same for
+    // the body, then `smith.value(bool)` to pick between a raw and a structured
+    // `presented`. Every one of those collapses outside `--fuzz`: a ranged
+    // `Smith` draw reads eight octets as a little-endian u64 and returns the
+    // range MINIMUM when fewer remain, `bool` is a 1-bit range, and `Smith`
+    // discards the rest of its input after the first short read. So the target
+    // ran exactly one input for its whole existence — secret `"\x00"`, body
+    // `""`, and a presented value of seven NUL octets followed by sixty-four
+    // `'0'`s, because `smith.index` was 0 for every character. Measured
+    // 2026-09-07 over the corpus above: **0 of 11 seeds non-empty, 0 MACs
+    // decoded and 0 signatures accepted before; 10 of 11 non-empty (one seed IS
+    // the empty header), 5 decoded and 4 accepted after.**
+    const presented_len: usize = smith.slice(&presented_buf);
+    const presented = presented_buf[0..presented_len];
+
+    // (a) Against the module's own anchor credential, so the TRUE branch of the
+    // constant-time compare is reachable at all — no random secret can ever
+    // produce a matching MAC, so before this the success path of `verify` was
+    // unreachable from the fuzzer by construction.
+    _ = verify(anchor_secret, anchor_body, presented);
+    // ⚠ …with a DIFFERENT prefix. The second call here used to be
+    // `verifyWithPrefix("sha256=", …)`, which is literally what `verify`
+    // expands to — the same call twice. The empty prefix is the case that
+    // actually differs: a bare 64-character hex value.
+    _ = verifyWithPrefix("", anchor_secret, anchor_body, presented);
+
+    // (b) Against a secret and body derived from the presented bytes.
+    // ⚠ With a `Cursor` over the drawn slice, NOT draws after it: a knob drawn
+    // after the byte draw is dead on a corpus replay, which is how the secret
+    // was one NUL octet and the body empty on every run.
+    var knobs: tkfuzz.Cursor = .{ .bytes = presented };
     var secret_buf: [32]u8 = undefined;
-    smith.bytes(&secret_buf);
-    const secret_len: usize = smith.valueRangeAtMost(u8, 1, secret_buf.len); // Verifier requires nonempty; verify() itself has no such requirement but exercising both is fine
-    const secret = secret_buf[0..secret_len];
-
+    const secret_len: usize = knobs.ranged(1, secret_buf.len); // Verifier requires nonempty
+    for (secret_buf[0..secret_len]) |*b| b.* = knobs.byte();
     var body_buf: [64]u8 = undefined;
-    smith.bytes(&body_buf);
-    const body_len: usize = smith.valueRangeAtMost(u8, 0, body_buf.len);
-    const body = body_buf[0..body_len];
+    const body_len: usize = knobs.ranged(0, body_buf.len);
+    for (body_buf[0..body_len]) |*b| b.* = knobs.byte();
+    _ = verify(secret_buf[0..secret_len], body_buf[0..body_len], presented);
+}
 
-    var presented_buf: [96]u8 = undefined;
-    const presented: []const u8 = if (smith.value(bool)) blk: {
-        // Raw random bytes at random length — the cheap length/prefix gate.
-        smith.bytes(&presented_buf);
-        const len: usize = smith.valueRangeAtMost(u8, 0, presented_buf.len);
-        break :blk presented_buf[0..len];
-    } else blk: {
-        // "sha256=" (or a random same-length prefix) + 64 mostly-hex chars,
-        // optionally padded with tabs/spaces (which presentedMac trims) —
-        // gets past the length gate into hexToBytes.
-        var w: usize = 0;
-        if (smith.value(bool)) {
-            presented_buf[0..7].* = "sha256=".*;
-            w = 7;
-        } else {
-            smith.bytes(presented_buf[0..7]);
-            w = 7;
-        }
-        const hex_alphabet = "0123456789abcdefABCDEF ghij"; // last 5: deliberately non-hex
-        for (0..signature_hex_len) |_| {
-            presented_buf[w] = hex_alphabet[smith.index(hex_alphabet.len)];
-            w += 1;
-        }
-        break :blk presented_buf[0..w];
-    };
+test "corpus: every presented value reaches presentedMac, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum) and nothing else would notice.
+    //
+    // Two numbers past `nonempty`, and both are ones the collapsed harness
+    // could not produce: `decoded` counts the values that got past the length
+    // and prefix gates into `hexToBytes` under EITHER prefix, and `accepted`
+    // counts the ones that actually verified against the anchor credential —
+    // a branch no randomly-drawn secret can reach.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var accepted: usize = 0;
+    var distinct_secrets: usize = 0;
+    var seen: [presented_seeds.len][32]u8 = undefined;
+    var seen_len: [presented_seeds.len]usize = undefined;
+    for (presented_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var presented_buf: [128]u8 = undefined;
+        const presented_len: usize = smith.slice(&presented_buf);
+        if (presented_len != 0) nonempty += 1;
+        const presented = presented_buf[0..presented_len];
 
-    _ = verify(secret, body, presented);
-    _ = verifyWithPrefix("sha256=", secret, body, presented);
+        if (presentedMac("sha256=", presented) != null or presentedMac("", presented) != null) decoded += 1;
+        if (verify(anchor_secret, anchor_body, presented)) accepted += 1;
+        if (verifyWithPrefix("", anchor_secret, anchor_body, presented)) accepted += 1;
+
+        // The Cursor-derived secret must actually vary with the seed —
+        // otherwise the knob is as dead as the draw it replaced.
+        var knobs: tkfuzz.Cursor = .{ .bytes = presented };
+        var secret_buf: [32]u8 = undefined;
+        const secret_len: usize = knobs.ranged(1, secret_buf.len);
+        for (secret_buf[0..secret_len]) |*b| b.* = knobs.byte();
+        var already = false;
+        for (seen[0..distinct_secrets], seen_len[0..distinct_secrets]) |s, l| {
+            if (l == secret_len and std.mem.eql(u8, s[0..l], secret_buf[0..secret_len])) already = true;
+        }
+        if (!already) {
+            seen[distinct_secrets] = secret_buf;
+            seen_len[distinct_secrets] = secret_len;
+            distinct_secrets += 1;
+        }
+    }
+    // One seed IS the empty header value, a legal member of a refusal corpus.
+    try testing.expectEqual(presented_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draws, 0 non-empty, 0 decoded,
+    // 0 accepted and exactly 1 distinct secret (a single NUL octet) across the
+    // whole corpus. After:
+    try testing.expectEqual(@as(usize, 5), decoded);
+    try testing.expectEqual(@as(usize, 4), accepted);
+    try testing.expectEqual(@as(usize, 8), distinct_secrets);
 }
 
 test "computeHex is lowercase hex and matches a well-known HMAC-SHA256 demo vector" {

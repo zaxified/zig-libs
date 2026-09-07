@@ -469,20 +469,140 @@ test "blind gives up and reports InvalidBlindingFactor rather than proceed with 
 // RFC's own real published signature rather than drawing pure random
 // bytes, which the first `OS2IP`/range check would reject on almost every
 // draw.
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+const seed = tkfuzz.seedHex;
+
+/// Damage scripts in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// ⛔ This target is a DAMAGE harness: it does not decode a frame, it corrupts
+/// RFC 9474's own published signature. The script is what has to come out of
+/// the byte draw, and it is read with a `testkit.fuzz.Cursor`:
+///
+///     TT            truncation: 0 = the full 512 octets, else drop TT from the end
+///     NN            number of flips, 0..8
+///     (PPPP VV)*    per flip: position (big-endian, mod the length) and new value
+///
+/// The truncation octet exists because the harness's own comment promised
+/// "including lengths that don't match the 512-byte RFC 9474 modulus" while
+/// `bytes` was a fixed-size array — the length never varied at all.
+const damage_seeds = [_][]const u8{
+    seed(""), // full length, 0 flips: the PRISTINE signature — the one input the old harness ran
+    seed("00" ++ "01" ++ "0000" ++ "FF"), // the most significant octet: pushes m past n
+    seed("00" ++ "01" ++ "0000" ++ "00"), // the same octet cleared
+    seed("00" ++ "01" ++ "01FF" ++ "AA"), // the middle of the modulus
+    seed("00" ++ "01" ++ "01FF" ++ "5A"), // the same position, a different value
+    seed("00" ++ "08" ++ "0000" ++ "01" ++ "0040" ++ "02" ++ "0080" ++ "03" ++
+        "00C0" ++ "04" ++ "0100" ++ "05" ++ "0140" ++ "06" ++ "0180" ++ "07" ++
+        "01FF" ++ "08"), // the maximum, spread across the whole signature
+    seed("01"), // 511 octets: one short of the modulus, unflipped
+    seed("FF"), // 257 octets: half a signature
+    seed("01" ++ "01" ++ "0000" ++ "AA"), // short AND corrupted
+};
+
+test "fuzz: verify never panics on corrupted signature bytes" {
+    try std.testing.fuzz({}, fuzzVerify, .{ .corpus = &damage_seeds });
+}
+
+/// Apply one damage script to a copy of the KAT signature. Returns the
+/// resulting slice and the number of flips applied — shared with the guard so
+/// it cannot drift onto a different subject.
+fn applyDamage(script: []const u8, bytes: *[kat.a1.sig.len]u8) struct { sig: []const u8, flips: usize } {
+    bytes.* = kat.a1.sig;
+    var cur: tkfuzz.Cursor = .{ .bytes = script };
+    const drop = cur.byte();
+    const len = bytes.len - @min(@as(usize, drop), bytes.len);
+    const sig = bytes[0..len];
+    const n_flips = cur.ranged(0, 8);
+    if (sig.len != 0) {
+        var i: u32 = 0;
+        while (i < n_flips) : (i += 1) {
+            sig[cur.word() % sig.len] = cur.byte();
+        }
+    }
+    return .{ .sig = sig, .flips = if (sig.len == 0) 0 else n_flips };
+}
+
 fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     const pk = kat.publicKey() catch return;
 
-    var bytes: [kat.a1.sig.len]u8 = kat.a1.sig;
-    const n_flips = smith.valueRangeAtMost(u8, 0, 8);
-    var i: u8 = 0;
-    while (i < n_flips) : (i += 1) {
-        const pos = smith.index(bytes.len);
-        bytes[pos] = smith.value(u8);
-    }
+    var script: [64]u8 = undefined;
+    // ⚠ The damage script comes out of ONE `smith.slice` call, and it is the
+    // FIRST draw. The flip count used to be `smith.valueRangeAtMost(u8, 0, 8)`
+    // — a ranged draw, which reads eight octets as a little-endian u64 and
+    // returns the range MINIMUM unless that whole word lands in the range. It
+    // was therefore **0 on every replay**, so the loop never executed and this
+    // harness verified RFC 9474's pristine signature, unaltered, every single
+    // time. A damage harness that applied no damage; and its own comment's
+    // promise about "lengths that don't match the 512-byte modulus" was never
+    // kept, because `bytes` was a fixed-size array. Measured 2026-09-07 over
+    // the corpus above: **0 of 9 scripts changed a byte, 1 distinct signature
+    // and 1 distinct length before; 5 of 9 flip, 17 flips in total, 9 distinct
+    // signatures and 3 distinct lengths after.**
+    const n: usize = smith.slice(&script);
+    var bytes: [kat.a1.sig.len]u8 = undefined;
+    const damaged = applyDamage(script[0..n], &bytes);
 
-    blindrsa.verify(pk, Sha384, &kat.a1.prepared_msg, &bytes, kat.a1.salt.len) catch return;
+    blindrsa.verify(pk, Sha384, &kat.a1.prepared_msg, damaged.sig, kat.a1.salt.len) catch return;
 }
 
-test "fuzz: verify never panics on corrupted signature bytes" {
-    try std.testing.fuzz({}, fuzzVerify, .{});
+test "corpus: every damage script actually damages, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. For a
+    // damage harness the number that matters is not "did it verify" but "did
+    // anything change": `distinct` and `lengths` are 1 and 1 for the collapsed
+    // draw, and the empty input cannot move either.
+    const pk = kat.publicKey() catch unreachable;
+    var flips: usize = 0;
+    var distinct: usize = 0;
+    var lengths: usize = 0;
+    var verified: usize = 0;
+    var seen: [damage_seeds.len][kat.a1.sig.len]u8 = undefined;
+    var seen_len: [damage_seeds.len]usize = undefined;
+    for (damage_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [64]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var bytes: [kat.a1.sig.len]u8 = undefined;
+        const damaged = applyDamage(script[0..n], &bytes);
+        flips += damaged.flips;
+
+        var already = false;
+        for (seen[0..distinct], seen_len[0..distinct]) |s, l| {
+            if (l == damaged.sig.len and std.mem.eql(u8, s[0..l], damaged.sig)) already = true;
+        }
+        if (!already) {
+            seen[distinct] = bytes;
+            seen_len[distinct] = damaged.sig.len;
+            distinct += 1;
+        }
+        if (blindrsa.verify(pk, Sha384, &kat.a1.prepared_msg, damaged.sig, kat.a1.salt.len)) |_| {
+            verified += 1;
+        } else |_| {}
+    }
+    // Distinct lengths, counted separately from distinct contents.
+    {
+        var ls: [damage_seeds.len]usize = undefined;
+        for (damage_seeds) |sd| {
+            var smith: std.testing.Smith = .{ .in = sd };
+            var script: [64]u8 = undefined;
+            const n: usize = smith.slice(&script);
+            var bytes: [kat.a1.sig.len]u8 = undefined;
+            const damaged = applyDamage(script[0..n], &bytes);
+            var already = false;
+            for (ls[0..lengths]) |l| {
+                if (l == damaged.sig.len) already = true;
+            }
+            if (!already) {
+                ls[lengths] = damaged.sig.len;
+                lengths += 1;
+            }
+        }
+    }
+    // Measured 2026-09-07: with the flip count drawn as a ranged value, 0
+    // flips, 1 distinct signature and 1 distinct length across the whole
+    // corpus — RFC 9474's pristine one, nine times. After:
+    try testing.expectEqual(@as(usize, 17), flips);
+    try testing.expectEqual(@as(usize, 9), distinct);
+    try testing.expectEqual(@as(usize, 3), lengths);
+    try testing.expectEqual(@as(usize, 1), verified);
 }

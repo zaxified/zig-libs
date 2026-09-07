@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — `fuzzVerify` is a damage harness that applied no damage, and its own
+  comment's promise about signature length was never kept. The flip count came from
+  `smith.valueRangeAtMost(u8, 0, 8)`, a ranged draw, which returns the range MINIMUM unless
+  the eight octets it reads as a little-endian `u64` land inside the range — so it was 0 on
+  every replay and `verify` was handed RFC 9474's pristine Appendix A.1 signature, unaltered,
+  every time; and the comment's "including lengths that don't match the 512-byte RFC 9474
+  modulus" could never happen, because `bytes` was a fixed-size array. The damage script now
+  comes out of one `smith.slice` call as the first draw and is read with `testkit.fuzz.Cursor`
+  (a truncation octet, a flip count, then position/value pairs), with a nine-script corpus.
+  Measured: **0 flips, 1 distinct signature and 1 distinct length before; 17 flips, 9 distinct
+  signatures and 3 distinct lengths after, of which 1 still verifies.**
 - **2026-08-23** — **Breaking:** `prepareRandomize` returns
   `error{OutputTooSmall}![]const u8` instead of `[]const u8`; `blind`,
   `blindWithFactor`, `blindSign`, and `finalize` each gained an
