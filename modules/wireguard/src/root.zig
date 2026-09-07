@@ -58,6 +58,9 @@ const linux = std.os.linux;
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const netaddr = @import("netaddr");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const native_endian = builtin.cpu.arch.endian();
 
 /// The generic-netlink plumbing (genlmsghdr + nlctrl family resolve + a
@@ -1478,19 +1481,277 @@ test "errnoToError maps kernel NLMSG_ERROR codes" {
     try testing.expectEqual(error.Unexpected, errnoToError(std.math.minInt(i32)));
 }
 
+/// `WG_CMD_GET_DEVICE` reply payloads for `fuzzParser`, laid out the way its
+/// draws read them: a `testkit.fuzz` slice seed (u32 length + payload) and
+/// then a SECOND slice seed carrying the sockaddr handed to `parseEndpoint`.
+///
+/// ⭐ Built at run time by the value tests' own fixture builders rather than
+/// quoted as hex. A WireGuard reply is a genlmsghdr followed by netlink TLVs,
+/// whose lengths and scalars are HOST byte order — and `parseEndpoint` reads
+/// `sa_family` and `sin6_scope_id` natively but the port big-endian, so a hex
+/// corpus would be a little-endian one and the counts pinned below would be
+/// false on a big-endian target instead of failing there.
+///
+/// ⛔ The endpoint slice is its own seed and not a prefix of the payload. The
+/// harness used to call `parseEndpoint(raw[0..@min(len, 28)])` — the first 28
+/// octets of a genetlink payload, i.e. the genlmsghdr and the start of the
+/// first TLV. Those can never be a sockaddr: `sa_family` would have to be the
+/// command byte plus the version byte, so the two `data.len == N and family ==
+/// AF.*` gates could not both hold and the function returned `BadLength`
+/// before reading a single address octet — every round, even under `--fuzz`.
+const ParserCorpus = struct {
+    scratch: [16384]u8 = undefined,
+    store: [16384]u8 = undefined,
+    used: usize = 0,
+    entries: [11][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ParserCorpus, payload: []const u8, endpoint: []const u8) void {
+        const a = testkit.fuzz.seedInto(self.store[self.used..], payload);
+        const b = testkit.fuzz.seedInto(self.store[self.used + a.len ..], endpoint);
+        self.entries[self.n] = self.store[self.used..][0 .. a.len + b.len];
+        self.used += a.len + b.len;
+        self.n += 1;
+    }
+
+    fn build(self: *ParserCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        const sa_in = blk: {
+            var raw: [16]u8 = @splat(0);
+            std.mem.writeInt(u16, raw[0..2], AF.INET, native_endian);
+            std.mem.writeInt(u16, raw[2..4], 51820, .big);
+            raw[4..8].* = .{ 192, 0, 2, 1 };
+            break :blk raw;
+        };
+        const sa_in6 = blk: {
+            var raw: [28]u8 = @splat(0);
+            std.mem.writeInt(u16, raw[0..2], AF.INET6, native_endian);
+            std.mem.writeInt(u16, raw[2..4], 51820, .big);
+            raw[8..24].* = [_]u8{0xfd} ++ [_]u8{0} ** 14 ++ [_]u8{1};
+            std.mem.writeInt(u32, raw[24..28], 3, native_endian);
+            break :blk raw;
+        };
+
+        // A full device: both keys, port, fwmark, and a peer carrying an
+        // endpoint, a PSK, counters, a handshake time and two allowed IPs.
+        var full: std.ArrayList(u8) = .empty;
+        try GetFixture.deviceHeader(gpa, &full, 7);
+        try attrRaw(gpa, &full, WGDEVICE_A.PUBLIC_KEY, &patternKey(0x01));
+        try attrRaw(gpa, &full, WGDEVICE_A.PRIVATE_KEY, &patternKey(0x02));
+        try attrU16(gpa, &full, WGDEVICE_A.LISTEN_PORT, 51820);
+        try codec.appendAttrU32(gpa, &full, WGDEVICE_A.FWMARK, 0x2a);
+        {
+            const peers = try nestBegin(gpa, &full, WGDEVICE_A.PEERS);
+            const entry = try nestBegin(gpa, &full, 0);
+            try attrRaw(gpa, &full, WGPEER_A.PUBLIC_KEY, &patternKey(0x40));
+            try attrRaw(gpa, &full, WGPEER_A.PRESHARED_KEY, &patternKey(0xc0));
+            try appendEndpoint(gpa, &full, .{ .v4 = .{ .addr = .{ 192, 0, 2, 1 }, .port = 1234 } });
+            try attrU16(gpa, &full, WGPEER_A.PERSISTENT_KEEPALIVE_INTERVAL, 15);
+            try GetFixture.timespecAttr(gpa, &full, 1700000000, 123);
+            try GetFixture.u64Attr(gpa, &full, WGPEER_A.RX_BYTES, 1000);
+            try GetFixture.u64Attr(gpa, &full, WGPEER_A.TX_BYTES, 2000);
+            try codec.appendAttrU32(gpa, &full, WGPEER_A.PROTOCOL_VERSION, 1);
+            const ips = try nestBegin(gpa, &full, WGPEER_A.ALLOWEDIPS);
+            try appendAllowedIp(gpa, &full, AllowedIp.v4(.{ 10, 0, 0, 0 }, 24));
+            try appendAllowedIp(gpa, &full, AllowedIp.v6([_]u8{0xfd} ++ [_]u8{0} ** 15, 64));
+            try nestEnd(&full, ips);
+            try nestEnd(&full, entry);
+            try nestEnd(&full, peers);
+        }
+        // ⭐ Fed TWICE by the harness, which is the merge path: the same
+        // payload arriving again must extend the peer, not duplicate it.
+        self.push(full.items, &sa_in);
+
+        // A peer with an IPv6 endpoint and no allowed IPs at all.
+        var v6: std.ArrayList(u8) = .empty;
+        try GetFixture.deviceHeader(gpa, &v6, 8);
+        {
+            const peers = try nestBegin(gpa, &v6, WGDEVICE_A.PEERS);
+            const entry = try nestBegin(gpa, &v6, 0);
+            try attrRaw(gpa, &v6, WGPEER_A.PUBLIC_KEY, &patternKey(0x80));
+            try appendEndpoint(gpa, &v6, .{ .v6 = .{
+                .addr = [_]u8{0xfd} ++ [_]u8{0} ** 14 ++ [_]u8{1},
+                .port = 1234,
+                .scope_id = 3,
+            } });
+            try nestEnd(&v6, entry);
+            try nestEnd(&v6, peers);
+        }
+        self.push(v6.items, &sa_in6);
+
+        // A bare genlmsghdr: no attributes, which is a legal reply and the
+        // shape a reach guard must not count as work.
+        var bare: std.ArrayList(u8) = .empty;
+        try genl.appendHeader(gpa, &bare, WG_CMD.GET_DEVICE, WG_GENL_VERSION);
+        self.push(bare.items, &.{});
+
+        // ── the refusals, one per typed error the parser can raise ─────────
+        // A key attribute with three octets.
+        var bad_key: std.ArrayList(u8) = .empty;
+        try genl.appendHeader(gpa, &bad_key, WG_CMD.GET_DEVICE, WG_GENL_VERSION);
+        try attrRaw(gpa, &bad_key, WGDEVICE_A.PRIVATE_KEY, &.{ 1, 2, 3 });
+        self.push(bad_key.items, &.{});
+
+        // An interface name at exactly `ifnamsiz`, which is one too many.
+        var long_name: std.ArrayList(u8) = .empty;
+        try genl.appendHeader(gpa, &long_name, WG_CMD.GET_DEVICE, WG_GENL_VERSION);
+        try codec.appendAttrString(gpa, &long_name, WGDEVICE_A.IFNAME, "n" ** ifnamsiz);
+        self.push(long_name.items, &.{});
+
+        // An attribute declaring 200 octets over a four-octet payload.
+        {
+            var raw: [genl.header_len + 4]u8 = @splat(0);
+            raw[1] = WG_GENL_VERSION;
+            std.mem.writeInt(u16, raw[4..6], 200, native_endian);
+            std.mem.writeInt(u16, raw[6..8], WGDEVICE_A.IFNAME, native_endian);
+            self.push(&raw, &.{});
+        }
+
+        // An allowed IP whose family contradicts its address length.
+        var bad_ip: std.ArrayList(u8) = .empty;
+        try genl.appendHeader(gpa, &bad_ip, WG_CMD.GET_DEVICE, WG_GENL_VERSION);
+        {
+            const peers = try nestBegin(gpa, &bad_ip, WGDEVICE_A.PEERS);
+            const entry = try nestBegin(gpa, &bad_ip, 0);
+            try attrRaw(gpa, &bad_ip, WGPEER_A.PUBLIC_KEY, &patternKey(1));
+            const ips = try nestBegin(gpa, &bad_ip, WGPEER_A.ALLOWEDIPS);
+            const ip_entry = try nestBegin(gpa, &bad_ip, 0);
+            try attrU16(gpa, &bad_ip, WGALLOWEDIP_A.FAMILY, AF.INET);
+            try attrRaw(gpa, &bad_ip, WGALLOWEDIP_A.IPADDR, &([_]u8{0} ** 16));
+            try attrU8(gpa, &bad_ip, WGALLOWEDIP_A.CIDR_MASK, 24);
+            try nestEnd(&bad_ip, ip_entry);
+            try nestEnd(&bad_ip, ips);
+            try nestEnd(&bad_ip, entry);
+            try nestEnd(&bad_ip, peers);
+        }
+        self.push(bad_ip.items, &.{});
+
+        // Two octets: shorter than a genlmsghdr.
+        self.push(&.{ 0, 1 }, &.{});
+        // Nothing at all, on both slices.
+        self.push(&.{}, &.{});
+
+        // ── endpoints the payload half cannot reach ────────────────────────
+        // A sockaddr with the right length and the wrong family, and one that
+        // is neither 16 nor 28 octets — the two arms of `parseEndpoint`'s
+        // refusal, which the old prefix-of-the-payload call never got past.
+        {
+            var wrong_family: [16]u8 = @splat(0);
+            wrong_family[0] = 99;
+            self.push(bare.items, &wrong_family);
+        }
+        // ⭐ The right family at the WRONG length: 12 octets claiming AF_INET.
+        // Only the `data.len == 16` half of the gate refuses it — loosen that
+        // to `>= 8` and this decodes into an endpoint made of padding, with no
+        // out-of-bounds read to give the mistake away.
+        {
+            var short_v4: [12]u8 = @splat(0);
+            std.mem.writeInt(u16, short_v4[0..2], AF.INET, native_endian);
+            self.push(bare.items, &short_v4);
+        }
+
+        return self.entries[0..self.n];
+    }
+};
+
+/// What one seed yielded. Shared by the fuzz target and its corpus guard so
+/// the guard drives the SAME walk.
+const ParserTally = struct {
+    fed: usize = 0,
+    peers: usize = 0,
+    allowed_ips: usize = 0,
+    endpoints: usize = 0,
+    keys: usize = 0,
+};
+
+fn walkParser(payload: []const u8, endpoint: []const u8) ParserTally {
+    var t: ParserTally = .{};
+    var parser: DeviceParser = .init(testing.allocator);
+    defer parser.deinit();
+    if (parser.feed(payload)) |_| t.fed += 1 else |_| {}
+    // Feeding twice exercises the merge path: the same peer arriving again
+    // must extend the existing entry rather than being appended.
+    if (parser.feed(payload)) |_| t.fed += 1 else |_| {}
+    if (parser.finish()) |dev_const| {
+        var dev = dev_const;
+        defer dev.deinit(testing.allocator);
+        t.peers = dev.peers.len;
+        for (dev.peers) |p| {
+            t.allowed_ips += p.allowed_ips.len;
+            if (p.endpoint != null) t.endpoints += 1;
+        }
+        if (dev.public_key != null) t.keys += 1;
+        if (dev.private_key != null) t.keys += 1;
+    } else |_| {}
+    if (parseEndpoint(endpoint)) |_| t.endpoints += 1 else |_| {}
+    return t;
+}
+
 test "fuzz: device parser never crashes on arbitrary payloads" {
-    try testing.fuzz({}, fuzzParser, .{});
+    var corpus: ParserCorpus = .{};
+    try testing.fuzz({}, fuzzParser, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParser(_: void, smith: *std.testing.Smith) !void {
-    var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
-    var parser: DeviceParser = .init(testing.allocator);
-    defer parser.deinit();
-    parser.feed(raw[0..len]) catch {};
-    parser.feed(raw[0..len]) catch {}; // feeding twice exercises the merge path
-    _ = parseEndpoint(raw[0..@min(len, 28)]) catch {};
+    var raw: [1024]u8 = undefined;
+    var ep: [64]u8 = undefined;
+    // ⚠ One `smith.slice` call per value, never `smith.bytes` followed by a
+    // ranged length. `bytes` takes `@min(raw.len, in.len)` octets and the
+    // ranged draw then finds fewer than the eight it needs and returns the
+    // range MINIMUM, so `len` was 0 for every seed and `feed` was handed an
+    // EMPTY payload with the reply sitting unread in `raw`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 11 seeds non-empty,
+    // 0 payloads fed, 0 peers and 0 allowed IPs decoded before; 10 of 11
+    // non-empty (one seed IS the empty payload), 10 feeds accepted, 2 peers
+    // (each payload fed twice and MERGED, not duplicated), 4 allowed IPs, 4
+    // endpoints and 2 device keys, after.** `feed("")` fails at `splitPayload`, so the TLV walk, the
+    // peer nest and the merge path had never run.
+    const len: usize = smith.slice(&raw);
+    const ep_len: usize = smith.slice(&ep);
+    std.mem.doNotOptimizeAway(walkParser(raw[0..len], ep[0..ep_len]));
+}
+
+test "corpus: every parser seed reaches feed, and the decoded counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkParser`. `nonempty`
+    // is the reach claim and the only check that catches a seed grown past the
+    // harness's buffer, which `Smith.slice` reads back as the EMPTY one.
+    //
+    // ⛔ `fed` cannot be the guard on its own: a bare genlmsghdr with no
+    // attributes is a legal WireGuard reply, so `feed` succeeds and `finish`
+    // hands back a device with no peers — one of the seeds above is exactly
+    // that. `peers`, `allowed_ips`, `endpoints` and `keys` count work the
+    // empty payload cannot do.
+    //
+    // ⭐ `peers` is also the merge assertion: the corpus feeds each payload
+    // TWICE, so a parser that appended instead of merging would double it.
+    var corpus: ParserCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var total: ParserTally = .{};
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [1024]u8 = undefined;
+        var ep: [64]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        const ep_len: usize = smith.slice(&ep);
+        if (len != 0) nonempty += 1;
+        const t = walkParser(raw[0..len], ep[0..ep_len]);
+        total.fed += t.fed;
+        total.peers += t.peers;
+        total.allowed_ips += t.allowed_ips;
+        total.endpoints += t.endpoints;
+        total.keys += t.keys;
+    }
+    try testing.expectEqual(entries.len - 1, nonempty); // one seed IS the empty payload
+    try testing.expectEqual(@as(usize, 10), total.fed);
+    try testing.expectEqual(@as(usize, 2), total.peers);
+    try testing.expectEqual(@as(usize, 4), total.allowed_ips);
+    try testing.expectEqual(@as(usize, 4), total.endpoints);
+    try testing.expectEqual(@as(usize, 2), total.keys);
 }
 
 // ── integration tests (real kernel) ─────────────────────────────────────────

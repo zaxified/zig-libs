@@ -57,6 +57,9 @@
 
 const std = @import("std");
 const nl = @import("nl.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const types = @import("types.zig");
 
 const Family = types.Family;
@@ -1236,14 +1239,192 @@ test "expression decoding survives a truncated or hostile stream" {
     try testing.expectEqual(@as(?ExprView, null), try it3.next());
 }
 
+/// `NFTA_RULE_EXPRESSIONS` nest bodies for `fuzzExprWalk`, in the format
+/// `Smith.slice` reads (see `testkit.fuzz`): a little-endian u32 length, then
+/// the nest body.
+///
+/// ⭐ Built at run time by this file's own `Program` and `appendExpr` rather
+/// than quoted as hex. An nftables expression is a tree of netlink TLVs whose
+/// `nla_len`/`nla_type` are HOST byte order (the register values inside are
+/// big-endian, the framing is not), so a hex corpus would be a little-endian
+/// one and the counts pinned below would be false on a big-endian target
+/// instead of failing there.
+const ExprCorpus = struct {
+    scratch: [16384]u8 = undefined,
+    store: [16384]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ExprCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    /// Every expression a `Program` produced, appended into one nest body —
+    /// which is exactly what `ExprIterator` is handed at run time.
+    fn pushProgram(self: *ExprCorpus, gpa: std.mem.Allocator, p: *Program) !void {
+        const exprs = try p.finish();
+        var list: std.ArrayList(u8) = .empty;
+        for (exprs) |e| try appendExpr(gpa, &list, e);
+        self.push(list.items);
+    }
+
+    fn build(self: *ExprCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A filter rule: meta l4proto dependency, a payload compare, a
+        // counter, and an immediate verdict — the four expression shapes the
+        // walker's inner loop and `decodeVerdict` both have to handle.
+        {
+            var p = Program.init(gpa, .inet);
+            _ = p.tcpDport(22).counter().drop();
+            try self.pushProgram(gpa, &p);
+        }
+        // A verdict that names a chain: `decodeVerdict`'s other arm, the one
+        // that returns a borrowed string rather than only a code.
+        {
+            var p = Program.init(gpa, .inet);
+            _ = p.ipDaddr(.{ 10, 0, 0, 1 }).jump("mychain");
+            try self.pushProgram(gpa, &p);
+        }
+        // A masked compare and a set lookup: the two expressions carrying a
+        // value wide enough for the inner attribute walk to have work to do.
+        {
+            var p = Program.init(gpa, .inet);
+            _ = p.ipSaddrPrefix(.{ 192, 168, 0, 0 }, 16)
+                .payloadLookup(.nh, 12, 4, "badhosts", null, false)
+                .accept();
+            try self.pushProgram(gpa, &p);
+        }
+        // A limit and a log: expressions whose data is scalars only.
+        {
+            var p = Program.init(gpa, .inet);
+            _ = p.limit(.{ .rate = 10, .unit = .kbytes, .per = .second, .burst = 5 })
+                .log(.{ .prefix = "drop: " })
+                .drop();
+            try self.pushProgram(gpa, &p);
+        }
+
+        // ── the walker's own bounds, from this file's hostile-stream test ──
+        // A declared nest length running past the buffer.
+        self.push(&.{ 0xff, 0x00, 0x01, 0x80, 0x00, 0x00 });
+        // A zero-length TLV, which must not loop.
+        self.push(&.{ 0x00, 0x00, 0x01, 0x80 });
+        // A well-formed elem whose inner attributes are empty: skipped
+        // (`view.name.len == 0`), not fatal — the `continue` branch, which no
+        // program-built seed can reach.
+        self.push(&.{ 0x04, 0x00, 0x01, 0x80 });
+        // An elem carrying a NAME but a DATA nest that runs off the end.
+        self.push(&.{
+            0x14, 0x00, 0x01, 0x80, // elem, 20 octets
+            0x0b, 0x00, 0x01, 0x00,
+            'p',  'a',  'y',  'l',
+            'o',  'a',  'd',  0x00,
+            0xff, 0x00, 0x02, 0x80, // DATA declaring 255
+        });
+        // An elem whose NAME is there and whose DATA is empty: the name is
+        // returned and `decodeVerdict` gets nothing to walk.
+        self.push(&.{
+            0x10, 0x00, 0x01, 0x80,
+            0x0b, 0x00, 0x01, 0x00,
+            'c',  'o',  'u',  'n',
+            't',  'e',  'r',  0x00,
+        });
+        // Nothing at all: a rule with no expressions is legal.
+        self.push(&.{});
+
+        return self.entries[0..self.n];
+    }
+};
+
+/// What one nest body yielded. Shared by the fuzz target and its corpus guard
+/// so the guard drives the SAME walk.
+const ExprTally = struct {
+    exprs: usize = 0,
+    inner: usize = 0,
+    verdicts: usize = 0,
+};
+
+fn walkExprs(buf: []const u8) !ExprTally {
+    var t: ExprTally = .{};
+    var steps: usize = 0;
+    var it: ExprIterator = .{ .attrs = .{ .buf = buf } };
+    while (it.next() catch null) |v| {
+        steps += 1;
+        try testing.expect(steps <= buf.len / 4 + 1);
+        t.exprs += 1;
+        if (decodeVerdict(v.data) catch null) |_| t.verdicts += 1;
+        var inner = v.attrs();
+        var isteps: usize = 0;
+        while (inner.next() catch null) |a| {
+            isteps += 1;
+            try testing.expect(isteps <= v.data.len / 4 + 1);
+            t.inner += 1;
+            _ = a.asBe32() catch {};
+            _ = a.asString();
+        }
+    }
+    return t;
+}
+
 test "fuzz: the expression walker never crashes, loops or over-reads" {
-    try testing.fuzz({}, fuzzExprWalk, .{});
+    var corpus: ExprCorpus = .{};
+    try testing.fuzz({}, fuzzExprWalk, .{ .corpus = try corpus.build() });
+}
+
+test "corpus: every expression seed reaches the walker, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkExprs`. `nonempty`
+    // is the reach claim and the only check that catches a seed grown past the
+    // harness's buffer, which `Smith.slice` reads back as the EMPTY one.
+    //
+    // ⛔ There is no acceptance number to pin here, deliberately: an empty
+    // nest is a legal `NFTA_RULE_EXPRESSIONS` body — a rule may carry no
+    // expressions — so "the walk completed" is true of every seed including
+    // the empty one. `exprs`, `inner` and `verdicts` count work the empty
+    // input cannot do.
+    var corpus: ExprCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var total: ExprTally = .{};
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [2048]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const t = try walkExprs(raw[0..len]);
+        total.exprs += t.exprs;
+        total.inner += t.inner;
+        total.verdicts += t.verdicts;
+    }
+    try testing.expectEqual(entries.len - 1, nonempty); // one seed IS the empty nest
+    try testing.expectEqual(@as(usize, 22), total.exprs);
+    try testing.expectEqual(@as(usize, 56), total.inner);
+    try testing.expectEqual(@as(usize, 4), total.verdicts);
 }
 
 fn fuzzExprWalk(_: void, smith: *std.testing.Smith) !void {
-    var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // 2048, not 512: a `Program` with a set lookup and a masked compare in it
+    // already runs past 512, and a seed longer than the buffer is not a big
+    // seed — `Smith.slice` reads it back as the EMPTY one.
+    var raw: [2048]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and the iterator was handed an EMPTY nest.
+    //
+    // ⛔ And that looked HEALTHY: an empty `NFTA_RULE_EXPRESSIONS` nest is a
+    // legal rule body, so the walk "completed" every round while the loop it
+    // is made of never executed. Measured 2026-09-07 over the corpus above:
+    // **0 of 10 seeds non-empty, 0 expressions walked, 0 inner attributes read
+    // and 0 verdicts decoded before; 9 of 10 non-empty (one seed IS the empty
+    // nest), 22 expressions walked, 56 inner attributes read and 4 verdicts
+    // decoded, after.**
+    const len: usize = smith.slice(&raw);
     const buf = raw[0..len];
 
     var steps: usize = 0;

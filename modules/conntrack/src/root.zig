@@ -1021,8 +1021,92 @@ test "awaitFlow errors out instead of looping forever on a never-matching reply"
     try testing.expectEqual(t.script.len, t.pos);
 }
 
+/// Dump scripts for `fuzzDumpEngine`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the octets a
+/// `testkit.fuzz.Cursor` reads the scenario out of.
+///
+/// The layout, in the order `runDumpEngine` reads it:
+///
+/// ```text
+/// [0]      the errno the NLMSG_ERROR datagram carries, negated
+/// [1]      how many datagrams the script has, 1..16
+/// [2..]    one selector per datagram: 0 = three flows, 1 = DUMP_INTR,
+///          2 = DONE, 3 = NLMSG_ERROR, 4 = junk
+/// [+1]     for a junk datagram, how many junk octets it carries
+/// ```
+///
+/// ⛔ A script is not decoration here. The target's own comment says the W2-07
+/// double free "needed four consecutive `NLM_F_DUMP_INTR`" — a sequence a
+/// scripted unit test only reaches if somebody already suspects it. It opened
+/// with `smith.value(u8)`, so outside `--fuzz` every draw was its minimum, in
+/// order: errno 0, a ONE-datagram script, and selector 0 — a single reply with
+/// no `NLMSG_DONE` behind it, which runs the transport off the end of its
+/// script and errors out before the retry budget, the errdefer or the
+/// ownership of the collected flows is touched at all. **One datagram, one
+/// round, for ever.** Four consecutive INTRs is now seed three.
+const dump_scripts = [_][]const u8{
+    // A clean dump: three flows, then DONE.
+    testkit.fuzz.seedHex("0102" ++ "0002"),
+    // Two reply datagrams before the DONE — the collect-and-extend path.
+    testkit.fuzz.seedHex("0103" ++ "000002"),
+    // ⭐ Four consecutive DUMP_INTRs, then a clean dump. This is the shape the
+    // W2-07 double free needed, spelled out rather than hoped for.
+    testkit.fuzz.seedHex("0107" ++ "01010101" ++ "0002"),
+    // Enough INTRs to exhaust the retry budget.
+    testkit.fuzz.seedHex("010c" ++ "010101010101010101010101"),
+    // An NLMSG_ERROR carrying -EPERM, and one carrying -EINVAL.
+    testkit.fuzz.seedHex("0101" ++ "03"),
+    testkit.fuzz.seedHex("1601" ++ "03"),
+    // An error AFTER flows have been collected: the errdefer path, which is
+    // the one that has to free what was gathered.
+    testkit.fuzz.seedHex("0102" ++ "0003"),
+    // Junk of two different lengths, then a DONE.
+    testkit.fuzz.seedHex("0103" ++ "0440" ++ "02"),
+    testkit.fuzz.seedHex("0102" ++ "0400" ++ "02"),
+    // A bare DONE: an empty dump, which is legal.
+    testkit.fuzz.seedHex("0101" ++ "02"),
+    // Flows with no terminator: the transport runs off the end of its script,
+    // which is what the collapsed harness ran every single round.
+    testkit.fuzz.seedHex("0101" ++ "00"),
+};
+
 test "fuzz: the dump engine survives any interleaving of dump replies" {
-    try testing.fuzz({}, fuzzDumpEngine, .{});
+    try testing.fuzz({}, fuzzDumpEngine, .{ .corpus = &dump_scripts });
+}
+
+test "corpus: every dump script drives the engine, and the collected count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `runDumpEngine`.
+    //
+    // ⛔ There is no acceptance number to pin: `dumpOver` returning an error is
+    // the expected outcome for most of these, and returning an empty slice is
+    // the expected outcome for a bare DONE. `flows` — the total number of
+    // conntrack entries actually decoded and handed back — is what the
+    // collapsed harness could never produce, because its one-datagram script
+    // had no terminator and the engine errored out before collecting
+    // anything. `intr` pins that the DUMP_INTR retry path really is entered.
+    var flows: usize = 0;
+    var intr: usize = 0;
+    var completed: usize = 0;
+    for (dump_scripts) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script_bytes: [512]u8 = undefined;
+        const script_len: usize = smith.slice(&script_bytes);
+        const r = try runDumpEngine(script_bytes[0..script_len]);
+        flows += r.flows;
+        intr += r.intrs;
+        if (r.completed) completed += 1;
+    }
+    try testing.expectEqual(@as(usize, 9), flows);
+    try testing.expectEqual(@as(usize, 25), intr);
+    try testing.expectEqual(@as(usize, 4), completed);
+
+    // The "before" measurement, executable: the empty script is exactly the
+    // collapsed harness — every `Cursor` read is 0, which is every `Smith`
+    // ranged draw's minimum — and it collects nothing.
+    const before = try runDumpEngine(&.{});
+    try testing.expectEqual(@as(usize, 0), before.flows);
+    try testing.expect(!before.completed);
 }
 
 /// The dump *engine* had no fuzz reach at all — `wire.zig`'s harness stops at
@@ -1034,6 +1118,31 @@ test "fuzz: the dump engine survives any interleaving of dump replies" {
 /// consecutive `NLM_F_DUMP_INTR`, which is exactly the kind of sequence a
 /// scripted unit test only reaches if somebody already suspects it.)
 fn fuzzDumpEngine(_: void, smith: *std.testing.Smith) !void {
+    var script_bytes: [512]u8 = undefined;
+    // ⚠ The draw is here rather than inside `runDumpEngine` on purpose:
+    // `check-fuzz-reach` reads the target's own body, so a harness that draws
+    // through a helper is reported as making no `Smith` draw at all.
+    const script_len: usize = smith.slice(&script_bytes);
+    std.mem.doNotOptimizeAway(try runDumpEngine(script_bytes[0..script_len]));
+}
+
+/// One run of the dump engine over a scripted interleaving, returning what it
+/// collected. Shared by the fuzz target and its corpus guard so the guard
+/// drives the SAME engine.
+///
+/// ⚠ Every choice is read out of ONE `smith.slice`, through a
+/// `testkit.fuzz.Cursor` — see `dump_scripts` for the layout and for what the
+/// old `smith.value(u8)` opening cost. A `Smith` scalar draw reads eight input
+/// octets as a little-endian u64 and returns the range MINIMUM unless the
+/// whole word falls inside the range, and after the first short read `Smith`
+/// discards the rest of the input, so every later draw was its minimum too.
+fn runDumpEngine(script_bytes: []const u8) !struct {
+    flows: usize,
+    intrs: usize,
+    completed: bool,
+} {
+    var c: testkit.fuzz.Cursor = .{ .bytes = script_bytes };
+
     const id = goldenDumpIdentity();
     const intr = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR);
     const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
@@ -1043,26 +1152,35 @@ fn fuzzDumpEngine(_: void, smith: *std.testing.Smith) !void {
     std.mem.writeInt(u16, failed[4..6], codec.NLMSG_ERROR, native_endian);
     std.mem.writeInt(u32, failed[8..12], id.seq, native_endian);
     std.mem.writeInt(u32, failed[12..16], id.pid, native_endian);
-    std.mem.writeInt(i32, failed[16..20], -@as(i32, smith.value(u8)), native_endian);
+    std.mem.writeInt(i32, failed[16..20], -@as(i32, c.byte()), native_endian);
 
-    var junk: [128]u8 = undefined;
-    smith.bytes(&junk);
+    var junk: [128]u8 = @splat(0);
 
     var script: [16][]const u8 = undefined;
-    const n = smith.valueRangeAtMost(u8, 1, script.len);
+    const n: usize = c.ranged(1, script.len);
+    var intrs: usize = 0;
     for (script[0..n]) |*d| {
-        d.* = switch (smith.value(u8) % 5) {
+        d.* = switch (c.ranged(0, 4)) {
             0 => &goldens.dump_reply_three_flows,
-            1 => &intr,
+            1 => blk: {
+                intrs += 1;
+                break :blk &intr;
+            },
             2 => &done,
             3 => &failed,
-            else => junk[0..smith.valueRangeAtMost(u8, 0, junk.len)],
+            else => blk: {
+                const jn: usize = c.ranged(0, junk.len);
+                for (junk[0..jn]) |*b| b.* = c.byte();
+                break :blk junk[0..jn];
+            },
         };
     }
 
     var t: ScriptedTransport = .{ .script = script[0..n], .pid = id.pid, .seq = id.seq };
-    const flows = dumpOver(testing.allocator, &t, .unspec) catch return;
-    testing.allocator.free(flows);
+    const flows = dumpOver(testing.allocator, &t, .unspec) catch
+        return .{ .flows = 0, .intrs = intrs, .completed = false };
+    defer testing.allocator.free(flows);
+    return .{ .flows = flows.len, .intrs = intrs, .completed = true };
 }
 
 // ── live tests (real kernel; skip cleanly when they cannot run) ─────────────

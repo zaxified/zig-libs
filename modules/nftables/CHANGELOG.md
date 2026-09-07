@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Both fuzz targets walked an empty attribute list. Each opened with
+  `smith.bytes(&raw)` and then drew its length with `valueRangeAtMost`, which reads eight input
+  octets as a little-endian u64 and returns the range minimum when fewer remain — so the length
+  was 0 on every seed and the walkers were handed `""`. In `expr.fuzzExprWalk` that read as
+  perfect health: an empty `NFTA_RULE_EXPRESSIONS` nest is a legal rule body, so the walk
+  "completed" every round while the loop it is made of never executed once, and the
+  `steps <= buf.len / 4 + 1` bound the target is built around was never evaluated.
+  `wire.fuzzDecoders` was refused at `payload.len < nfgenmsg_len`, so neither the expression
+  iterator nor the set-element iterator ran. Both now draw with one `smith.slice(&buf)` at 2048
+  octets (a rule with real expressions and a set-element reply both run past the old 512, so a
+  corpus of them would have read back EMPTY), carry corpora built by this module's own `Program`,
+  `appendExpr` and attribute writers, and are pinned by guards counting expressions walked, inner
+  attributes read, verdicts decoded, objects named, handles read and set elements yielded — a
+  bare `nfgenmsg` is a legal reply that ALL FIVE decoders accept while returning structs of
+  defaults, so an acceptance count is silent about whether anything was walked. Verified by
+  mutation: `parseNfgenmsg`'s length gate and `ExprIterator`'s "not an expression element" skip
+  are both caught.
+
 - **2026-09-04** — **Four consistency tests and three live socket tests
   reported PASS where they meant SKIP.** `zig test` counts a bare `return;` as a
   pass, so a host that cannot open a `NETLINK_NETFILTER` socket saw

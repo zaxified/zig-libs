@@ -1069,30 +1069,176 @@ const SynthElf = struct {
 // directly with no file I/O at all, which is the real boundary and the
 // target below.
 
+/// A real clang-built BPF object, for the corpus below. `object.zig` embeds
+/// the same file; this module is the layer under it, and the point of having
+/// it here is that the synthetic fixture is 1 KiB of hand-written headers
+/// while this is 4 KiB of what a compiler actually emits.
+const fx_real_elf = @embedFile("testdata/xdp_pass.bpf.o");
+
+/// ELF images for `fuzzOpenImage`, laid out the way its draws read them: a
+/// `testkit.fuzz` slice seed (u32 length + image), then two eight-octet
+/// little-endian words carrying the section index and the entry index the
+/// accessor walk is asked about.
+///
+/// ⭐ Built at run time from this file's own `SynthElf` fixture and the real
+/// object above rather than quoted as hex: an ELF header is a run of
+/// native-width offsets, so a hex corpus would be a 64-bit little-endian one.
+///
+/// ⛔ The two index words are not decoration. `fuzzWalkAccessors` takes a
+/// section index and an UNBOUNDED entry index, and the doc comment on it
+/// explains at length why the entry index must be unbounded — that domain is
+/// where the overflow lived. Both used to be drawn AFTER the input was spent,
+/// so `i` was 0 (the null section, whose `sh_size` is 0 and whose accessors
+/// return immediately) and `n` was 0 (the one index whose product with any
+/// `sh_entsize` cannot overflow). The harness's own comment says the
+/// unbounded index "is the point"; it had never once been unbounded.
+const ElfCorpus = struct {
+    store: [131072]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    sections: [10]u32 = undefined,
+    indices: [10]u32 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ElfCorpus, image: []const u8, section: u32, index: u32) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], image);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], section, .little);
+        std.mem.writeInt(u64, self.store[self.used + head.len + 8 ..][0..8], index, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 16];
+        self.sections[self.n] = section;
+        self.indices[self.n] = index;
+        self.used += head.len + 16;
+        self.n += 1;
+    }
+
+    fn build(self: *ElfCorpus, gpa: std.mem.Allocator) ![]const []const u8 {
+        const synth = try SynthElf.build(gpa);
+        defer gpa.free(synth);
+
+        // The synthetic image, asked about its symtab (section 2, 5 symbols)
+        // and its relocation section (3), at both an in-range index and the
+        // unbounded one the accessors' arithmetic must survive.
+        self.push(synth, 2, 1);
+        self.push(synth, 2, std.math.maxInt(u32));
+        self.push(synth, 3, std.math.maxInt(u32));
+
+        // ⭐ The hostile shape, pre-built rather than hoped for. `sh_entsize`
+        // is a u64 the format never bounds from above; `1 << 62` times any
+        // index above 3 exceeds `maxInt(u64)`, which is the product the reject
+        // path must reach without ever forming. A fuzzer flipping bytes at
+        // random in a 1 KiB image lands on those eight octets essentially
+        // never, so it goes in the corpus.
+        const huge = try gpa.dupe(u8, synth);
+        defer gpa.free(huge);
+        SynthElf.wr(u64, huge, SynthElf.shdr_off + 2 * SHDR_SIZE + shdr_entsize, 1 << 62);
+        SynthElf.wr(u64, huge, SynthElf.shdr_off + 3 * SHDR_SIZE + shdr_entsize, 1 << 62);
+        self.push(huge, 2, std.math.maxInt(u32));
+        self.push(huge, 3, 4); // the smallest index whose product wraps
+
+        // A real clang-built object: a section table nobody hand-wrote.
+        self.push(fx_real_elf, 1, 0);
+        self.push(fx_real_elf, 0xffff, std.math.maxInt(u32)); // a section past the end
+
+        // Truncations at the boundaries `openImage` checks in order: shorter
+        // than the four-octet magic, an `e_ident` with no `e_shoff` behind it,
+        // and a section table running off the end of the file.
+        self.push(synth[0..2], 0, 0);
+        self.push(synth[0..48], 0, 0);
+        self.push(synth[0..@min(synth.len, SynthElf.shdr_off + SHDR_SIZE)], 1, 0);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: openImage never panics on a truncated/mutated synthetic ELF image" {
-    try testing.fuzz({}, fuzzOpenImage, .{});
+    var corpus: ElfCorpus = .{};
+    try testing.fuzz({}, fuzzOpenImage, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+test "corpus: every ELF seed reaches openImage, and the walked counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one — and this corpus contains a
+    // 4 KiB real object, so at the old 256-octet idiom it would have been the
+    // empty seed even if the draw had worked.
+    //
+    // ⛔ `opened` is not the second number: an image can open with a section
+    // table nobody walks. `walked` counts accessor calls actually made, and
+    // `unbounded` counts the rounds where the entry index really was above
+    // what any count check would allow — the domain this harness's own doc
+    // comment says is the point of it, and which it never entered.
+    var corpus: ElfCorpus = .{};
+    const gpa = testing.allocator;
+    const entries = try corpus.build(gpa);
+    var nonempty: usize = 0;
+    var opened: usize = 0;
+    var walked: usize = 0;
+    var unbounded: usize = 0;
+    var words: usize = 0;
+    for (entries, corpus.sections[0..corpus.n], corpus.indices[0..corpus.n]) |sd, want_sec, want_idx| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [16384]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const sec: u32 = @truncate(smith.value(u64));
+        const idx: u32 = @truncate(smith.value(u64));
+        if (sec == want_sec and idx == want_idx) words += 1;
+        var image = openImage(gpa, buf[0..len], false) catch continue;
+        defer image.deinit();
+        opened += 1;
+        if (image.sections.len > 0) {
+            const i: usize = sec % image.sections.len;
+            fuzzWalkAccessors(&image, i, idx);
+            walked += 1;
+            if (image.symbolCount(i) catch null) |cnt| {
+                if (idx >= cnt) unbounded += 1;
+            }
+        }
+        std.mem.doNotOptimizeAway(image.symtabIndex());
+        std.mem.doNotOptimizeAway(image.findSection("license"));
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(entries.len, words);
+    try testing.expectEqual(@as(usize, 7), opened);
+    try testing.expectEqual(@as(usize, 7), walked);
+    try testing.expectEqual(@as(usize, 5), unbounded);
 }
 
 fn fuzzOpenImage(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
-    const seed = SynthElf.build(gpa) catch return;
-    defer gpa.free(seed);
+    // 16384, not a synthetic 1 KiB: the corpus carries a real 4 KiB clang
+    // object, and a seed longer than the buffer is not a big seed —
+    // `Smith.slice` reads it back as the EMPTY one.
+    var buf: [16384]u8 = undefined;
+    // ⚠ The image is drawn as BYTES now, in one `smith.slice` call. It used to
+    // be built here: `SynthElf.build()` truncated to
+    // `valueRangeAtMost(u32, 0, seed.len)` and then byte-flipped
+    // `valueRangeAtMost(u8, 0, 12)` times. A ranged draw reads eight input
+    // octets as a little-endian u64 and returns the range MINIMUM unless the
+    // whole word lies inside the range, so outside `--fuzz` BOTH collapsed:
+    // **length 0 and zero flips**. The one input this target ever ran was the
+    // empty slice, which `openImage` refuses at the magic.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 10 seeds non-empty,
+    // 0 images opened and 0 accessor walks before; 10 of 10 non-empty, 7
+    // opened, 7 accessor walks and 5 of them in the unbounded-index domain
+    // this harness exists for, after.**
+    const len: usize = smith.slice(&buf);
+    // ⚠ Both index words travel in the seed's tail. They used to be
+    // `smith.index(image.sections.len)` and `smith.value(u32)`, drawn after
+    // the input was spent — so the section was 0 (the null section) and the
+    // entry index was 0, which is the one value whose product with any
+    // `sh_entsize` cannot overflow. See `fuzzWalkAccessors`, whose whole doc
+    // comment is about that index needing to be unbounded.
+    const sec: u32 = @truncate(smith.value(u64));
+    const idx: u32 = @truncate(smith.value(u64));
 
-    const len: u32 = smith.valueRangeAtMost(u32, 0, @intCast(seed.len));
-    const mutant = gpa.dupe(u8, seed[0..len]) catch return;
-    defer gpa.free(mutant);
-
-    const n_flips: u8 = smith.valueRangeAtMost(u8, 0, 12);
-    var k: u8 = 0;
-    while (k < n_flips and mutant.len > 0) : (k += 1) {
-        mutant[smith.index(mutant.len)] = smith.value(u8);
-    }
-
-    var image = openImage(gpa, mutant, false) catch return;
+    var image = openImage(gpa, buf[0..len], false) catch return;
     defer image.deinit();
 
     if (image.sections.len > 0) {
-        fuzzWalkAccessors(&image, smith.index(image.sections.len), smith.value(u32));
+        fuzzWalkAccessors(&image, sec % image.sections.len, idx);
     }
     _ = image.symtabIndex();
     _ = image.findSection("license");

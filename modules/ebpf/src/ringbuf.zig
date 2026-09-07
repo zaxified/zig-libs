@@ -1099,7 +1099,8 @@ test "MapInfo mirrors the kernel's bpf_map_info prefix layout" {
 }
 
 test "fuzz: record walk over hostile mmap-region bytes never panics or reads out of bounds" {
-    try testing.fuzz({}, fuzzRingbufWalk, .{});
+    var corpus: RingCorpus = .{};
+    try testing.fuzz({}, fuzzRingbufWalk, .{ .corpus = try corpus.build() });
 }
 
 /// Drives the real `Reader.next()`/`advance()` over a hand-built region whose
@@ -1116,7 +1117,29 @@ test "fuzz: record walk over hostile mmap-region bytes never panics or reads out
 /// loop bounded, rather than fuzzing toward an unrelated "huge backlog"
 /// hang that a real mmap'd ring could never actually present.
 fn fuzzRingbufWalk(_: void, smith: *std.testing.Smith) !void {
-    const ring_size: usize = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+    std.mem.doNotOptimizeAway(try walkRing(smith));
+}
+
+/// One round of the ring walk, returning how many records came back. Shared by
+/// the fuzz target and its corpus guard so the guard drives the SAME walk.
+///
+/// ⚠ Every choice this function makes is read out of ONE `smith.slice`, through
+/// a `testkit.fuzz.Cursor`. It used to open with `valueRangeAtMost(u8, 0, 3)`
+/// and go on to `boolWeighted`, `value(u32)` and two more ranged draws. A
+/// `Smith` scalar draw reads eight input octets as a little-endian u64 and
+/// returns the range MINIMUM unless the whole word falls inside the range, and
+/// after the first short read `Smith` discards the rest of the input — so
+/// outside `--fuzz` EVERY draw was its minimum, in order: ring_size 64, an
+/// all-zero data region, both copies aliased, consumer_pos 0, producer_pos 0.
+/// `next()` returns null on the first line of the loop when `prod == cons`,
+/// so **the one input this target ever ran walked zero records**, and the
+/// bounds assertion the whole harness is built around was never evaluated.
+fn walkRing(smith: *std.testing.Smith) !usize {
+    var script: [4096]u8 = undefined;
+    const script_len: usize = smith.slice(&script);
+    var c: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+
+    const ring_size: usize = switch (c.ranged(0, 3)) {
         0 => 64,
         1 => 128,
         2 => 256,
@@ -1138,29 +1161,34 @@ fn fuzzRingbufWalk(_: void, smith: *std.testing.Smith) !void {
     // produces); occasionally let them disagree, covering the case of a
     // genuinely corrupted second copy too.
     var buf: [512]u8 = undefined;
-    smith.bytes(buf[0..ring_size]);
+    for (buf[0..ring_size]) |*b| b.* = c.byte();
     @memcpy(data[page..][0..ring_size], buf[0..ring_size]);
-    if (smith.boolWeighted(9, 10)) {
+    if (c.ranged(0, 9) != 0) {
         @memcpy(data[page + ring_size ..][0..ring_size], buf[0..ring_size]);
     } else {
         var buf2: [512]u8 = undefined;
-        smith.bytes(buf2[0..ring_size]);
+        for (buf2[0..ring_size]) |*b| b.* = c.byte();
         @memcpy(data[page + ring_size ..][0..ring_size], buf2[0..ring_size]);
     }
 
     // consumer_pos: an arbitrary 8-aligned absolute position, far from zero
     // most of the time (a long-lived ring), occasionally perturbed off the
     // 8-byte granule to also exercise the InconsistentPositions rejection.
-    var consumer_start: u64 = @as(u64, smith.value(u32)) * 8;
-    if (smith.boolWeighted(1, 8)) consumer_start +|= @as(u64, smith.valueRangeAtMost(u8, 1, 7));
+    var consumer_start: u64 = (@as(u64, c.word()) << 16 | @as(u64, c.word())) * 8;
+    // ⚠ Both octets are read unconditionally. Reading the nudge only inside
+    // the `if` would move every later draw by one position depending on a
+    // choice made above it, so a script would mean two different things.
+    const misaligned = c.ranged(0, 7) == 0;
+    const nudge: u64 = c.ranged(1, 7);
+    if (misaligned) consumer_start +|= nudge;
 
     // producer_pos: consumer_start plus/minus a bounded delta (bounded so a
     // hostile CONTENT pattern cannot turn into an effectively-unbounded
     // internal loop — see the doc comment above), using saturating
     // arithmetic so a subtraction near zero cannot wrap around into a huge
     // value instead of the intended "producer behind consumer" case.
-    const delta: u64 = @as(u64, smith.valueRangeAtMost(u32, 0, @intCast(ring_size * 4)));
-    const producer_pos = if (smith.boolWeighted(9, 10))
+    const delta: u64 = c.ranged(0, @intCast(ring_size * 4));
+    const producer_pos = if (c.ranged(0, 9) != 0)
         consumer_start +| delta
     else
         consumer_start -| delta;
@@ -1183,6 +1211,7 @@ fn fuzzRingbufWalk(_: void, smith: *std.testing.Smith) !void {
     // Bounded independently of the position math above: even if every
     // assumption elsewhere in this function were wrong, this loop itself
     // cannot run away.
+    var records: usize = 0;
     var iterations: usize = 0;
     while (iterations < 4096) : (iterations += 1) {
         // Every decode failure is one of the module's own typed
@@ -1195,8 +1224,176 @@ fn fuzzRingbufWalk(_: void, smith: *std.testing.Smith) !void {
         // if the bounds checks above this were ever wrong.
         try testing.expect(@intFromPtr(r.data.ptr) >= @intFromPtr(data.ptr));
         try testing.expect(@intFromPtr(r.data.ptr) + r.data.len <= @intFromPtr(data.ptr) + data.len);
+        records += 1;
         rb.advance();
     }
+    return records;
+}
+
+/// Ring scripts for `fuzzRingbufWalk`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the octets a
+/// `testkit.fuzz.Cursor` reads the ring's shape and contents out of.
+///
+/// The layout a script has to produce, in the order `walkRing` reads it:
+///
+/// ```text
+/// [0]      ring size selector, 0..3 → 64 / 128 / 256 / 512
+/// [1..]    ring_size octets of DATA — record headers and payloads
+/// [+1]     aliasing selector: 0 = let the two copies disagree, which reads
+///          another ring_size octets and moves everything below by that much
+/// [+4]     consumer_pos, in 8-octet granules, big-endian
+/// [+1]     misalignment selector: 0 = nudge consumer_pos off the granule
+/// [+1]        the nudge, 1..7 (only read when the selector fires)
+/// [+1]     producer delta, 0..ring_size*4
+/// [+1]     direction selector: 0 = producer BEHIND consumer
+/// ```
+///
+/// A record header is a little-endian u32 length with `BUSY`/`DISCARD` in its
+/// top two bits, followed by the payload, padded to the 8-octet granule.
+const RingCorpus = struct {
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *RingCorpus, script: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], script);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    /// A script for a 64-octet ring: selector, 64 data octets, then the tail
+    /// the position draws read. `records` is written into the data area by
+    /// the caller through `data`.
+    fn makeScript(
+        out: []u8,
+        data: *const [64]u8,
+        alias: u8,
+        consumer_granules: u32,
+        misalign: u8,
+        delta: u8,
+        direction: u8,
+    ) []const u8 {
+        out[0] = 0; // ring_size = 64
+        @memcpy(out[1..][0..64], data);
+        out[65] = alias;
+        // consumer_pos: two big-endian `word()` reads make a u32.
+        std.mem.writeInt(u32, out[66..70], consumer_granules, .big);
+        out[70] = misalign;
+        out[71] = 1; // the nudge, read only when `misalign` is 0
+        out[72] = delta;
+        out[73] = direction;
+        return out[0..74];
+    }
+
+    /// One committed record: a little-endian header length with the given
+    /// flag bits, then `payload`, padded to the granule.
+    fn record(data: []u8, at: usize, len: u32, flags: u32, fill: u8) usize {
+        std.mem.writeInt(u32, data[at..][0..4], len | flags, .little);
+        std.mem.writeInt(u32, data[at + 4 ..][0..4], 0, .little);
+        @memset(data[at + BPF_RINGBUF_HDR_SZ ..][0..len], fill);
+        return recordStride(len);
+    }
+
+    fn build(self: *RingCorpus) ![]const []const u8 {
+        var out: [128]u8 = undefined;
+        var data: [64]u8 = @splat(0);
+
+        // Two committed records back to back, then nothing: the ordinary
+        // shape, and the only one that makes `next()` return anything.
+        @memset(&data, 0);
+        var at: usize = 0;
+        at += record(&data, at, 8, 0, 0xAA);
+        at += record(&data, at, 16, 0, 0xBB);
+        self.push(makeScript(&out, &data, 9, 0, 9, @intCast(at), 9));
+
+        // A DISCARD record in front of a committed one: the discard-skipping
+        // loop inside a single `next()` call.
+        @memset(&data, 0);
+        at = 0;
+        at += record(&data, at, 8, BPF_RINGBUF_DISCARD_BIT, 0xCC);
+        at += record(&data, at, 8, 0, 0xDD);
+        self.push(makeScript(&out, &data, 9, 0, 9, @intCast(at), 9));
+
+        // A BUSY record: `next()` must stop, not skip forward.
+        @memset(&data, 0);
+        at = 0;
+        at += record(&data, at, 8, BPF_RINGBUF_BUSY_BIT, 0xEE);
+        self.push(makeScript(&out, &data, 9, 0, 9, @intCast(at), 9));
+
+        // A header claiming more than the whole ring: `CorruptRecord`.
+        @memset(&data, 0);
+        std.mem.writeInt(u32, data[0..4], BPF_RINGBUF_LEN_MASK, .little);
+        self.push(makeScript(&out, &data, 9, 0, 9, 64, 9));
+
+        // A header claiming more than the producer published: `CorruptRecord`
+        // through the second bound, not the first.
+        @memset(&data, 0);
+        _ = record(&data, 0, 48, 0, 0xFF);
+        self.push(makeScript(&out, &data, 9, 0, 9, 16, 9));
+
+        // consumer_pos off the 8-octet granule: `InconsistentPositions`.
+        @memset(&data, 0);
+        _ = record(&data, 0, 8, 0, 0x11);
+        self.push(makeScript(&out, &data, 9, 1, 0, 16, 9));
+
+        // producer BEHIND consumer: the other `InconsistentPositions`.
+        @memset(&data, 0);
+        _ = record(&data, 0, 8, 0, 0x22);
+        self.push(makeScript(&out, &data, 9, 1000, 9, 32, 0));
+
+        // A long-lived ring walked from a position far from zero, so the
+        // `& mask` wrap is what selects which octets are the header:
+        // 0x10003 granules is 524312, which lands at offset 24.
+        @memset(&data, 0x5A);
+        std.mem.writeInt(u32, data[24..28], 8, .little);
+        self.push(makeScript(&out, &data, 9, 0x0001_0003, 9, 64, 9));
+
+        // The two mapped copies DISAGREE — a genuinely corrupted second copy,
+        // which a consistent kernel aliasing never produces. ⚠ This branch
+        // reads another `ring_size` octets, so every draw after it moves by 64
+        // and the tail below is read from the script CYCLED, not from the
+        // fields `makeScript` wrote. That is deliberate and harmless: what
+        // this seed is for is the second `@memcpy`, not a particular position.
+        @memset(&data, 0);
+        _ = record(&data, 0, 8, 0, 0x33);
+        self.push(makeScript(&out, &data, 0, 0, 9, 16, 9));
+
+        return self.entries[0..self.n];
+    }
+};
+
+test "corpus: every ring script drives the walk, and the record count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkRing`.
+    //
+    // ⛔ There is no acceptance number to pin here and that is the point: a
+    // ring walk that returns nothing "succeeds" — `next()` returning null is
+    // the normal end of a drain — so anything phrased as "did it complete"
+    // reads 8 of 8 on the all-zero region the collapsed harness built. Records
+    // returned is the number the empty script cannot produce: with every draw
+    // at its minimum, `producer_pos == consumer_pos == 0` and the walk exits on
+    // the first line of the loop.
+    var corpus: RingCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var records: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        records += try walkRing(&smith);
+        var probe: std.testing.Smith = .{ .in = sd };
+        var buf: [4096]u8 = undefined;
+        if (probe.slice(&buf) != 0) nonempty += 1;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), records);
+
+    // The "before" measurement, executable: the empty script is exactly the
+    // collapsed harness — every `Cursor` read is 0, which is every `Smith`
+    // ranged draw's minimum — and it walks nothing.
+    var empty: std.testing.Smith = .{ .in = testkit.fuzz.seed("") };
+    try testing.expectEqual(@as(usize, 0), try walkRing(&empty));
 }
 
 test "LIVE: mmap a real ringbuf map and consume a record end-to-end" {

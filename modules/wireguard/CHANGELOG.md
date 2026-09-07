@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Both fuzz targets ran one fixed input. Each opened with `smith.bytes(&buf)`
+  and then drew its length with `valueRangeAtMost`, which reads eight input octets as a
+  little-endian u64 and returns the range minimum when fewer remain — so the length was 0 on
+  every seed. `DeviceParser.feed("")` fails at `splitPayload`, and `RecvSession.open("")` fails
+  at `msg.len < overhead` on the first line of `parseHeader`, so the TLV walk, the peer nest, the
+  merge path, `WrongReceiver`, `MessageLimitReached`, `SessionExpired`, `Replayed` and the AEAD
+  were all unreachable — and `fuzzOpen`'s `orr.len + overhead == msg.len` assertion had never
+  been evaluated. `root.fuzzParser` also called `parseEndpoint(raw[0..@min(len, 28)])`: the first
+  28 octets of a *genetlink payload*, where `sa_family` would have to be the command byte plus
+  the version byte, so that call returned `BadLength` before reading an address octet every round
+  — even under `--fuzz`. The endpoint now travels as its own slice seed. Both targets draw with
+  `smith.slice`, carry corpora built by the module's own encoders (the transport corpus is sealed
+  by a real `SendSession` against the harness's key — a hex corpus could not authenticate, so it
+  would have tested the refusal path and reported full reach), and are pinned by guards counting
+  peers, allowed IPs, endpoints, keys, opened messages and plaintext octets. Verified by
+  mutation: five loosened checks are now caught, including `parseEndpoint`'s `data.len == 16`
+  weakened to `>= 8`, which needed a seed that is the right family at the wrong length.
+
 - **2026-09-02** — **BREAKING: `BuildError` gains `AttrTooLong`.** This module carried its own
   local copy of `nestEnd` with the same defect the shared one had (a bare `@intCast` of the nest
   size into a `u16` — silent truncation in ReleaseFast). No shipped path is known to reach it,

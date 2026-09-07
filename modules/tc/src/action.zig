@@ -51,6 +51,10 @@ const Psched = ratespec.Psched;
 const RateSpec = ratespec.RateSpec;
 const LinkLayer = ratespec.LinkLayer;
 
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
+
 const handle_mod = @import("handle.zig");
 const Handle = handle_mod.Handle;
 
@@ -1482,22 +1486,263 @@ test "police burst uses the full 64-bit rate, the table the clamped one" {
     try testing.expectEqual(@as(u32, 38), ps.calcXmitTime(std.math.maxInt(u32), 10 * 1024));
 }
 
+/// Action entry bodies, whole `TCA_ACT_TAB` nests and `RTM_*ACTION` payloads
+/// for `fuzzParseAction`, laid out the way its draws read them: a
+/// `testkit.fuzz` slice seed (u32 length + frame) and then an eight-octet
+/// little-endian word carrying the ordinal handed to `parseAction`.
+///
+/// ⭐ Built at run time by this file's own encoders rather than quoted as hex:
+/// an action attribute is a netlink TLV whose length and scalars are HOST byte
+/// order, so a hex corpus would be a little-endian one and the counts pinned
+/// below would be false on a big-endian target instead of failing there.
+///
+/// ⛔ The ordinal is not decoration. `parseAction`'s first parameter is the
+/// entry's 1-based position in the list, and it used to be drawn with
+/// `smith.value(u16)` — a draw made AFTER the byte draw had eaten the seed, so
+/// it was **0 on every seed**, which is `TCA_ACT_UNSPEC`, the one ordinal the
+/// kernel will not accept. It travels in the seed now.
+const ActionCorpus = struct {
+    scratch: [16384]u8 = undefined,
+    store: [16384]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    orders: [12]u16 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ActionCorpus, frame: []const u8, order: u16) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], order, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.orders[self.n] = order;
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    /// One level in from `appendActionList`'s output: the outer nest's data
+    /// is the list `parseActionList` takes.
+    fn listBody(list: *std.ArrayList(u8)) ![]const u8 {
+        var it: codec.AttrIterator = .{ .buf = list.items };
+        return ((try it.next()) orelse return error.BadLength).data;
+    }
+
+    /// Two levels in: the first ordinal entry's data, which is what
+    /// `parseAction` takes.
+    fn entryBody(list: *std.ArrayList(u8)) ![]const u8 {
+        var it: codec.AttrIterator = .{ .buf = try listBody(list) };
+        return ((try it.next()) orelse return error.BadLength).data;
+    }
+
+    fn build(self: *ActionCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+        const ps = ratespec.golden_psched;
+
+        // ── one entry per kind, as `parseAction` receives it ───────────────
+        var gact: std.ArrayList(u8) = .empty;
+        try appendActionList(gpa, &gact, 1, &.{.{ .gact = .{
+            .action = .shot,
+            .index = 7,
+            .random = .{ .ptype = .netrand, .pval = 4, .paction = .ok },
+            .cookie = "abcdefgh",
+        } }}, ps);
+        self.push(try entryBody(&gact), 1);
+
+        var mirred: std.ArrayList(u8) = .empty;
+        try appendActionList(gpa, &mirred, 1, &.{.{ .mirred = .{
+            .eaction = .egress_redir,
+            .ifindex = 3,
+            .index = 11,
+        } }}, ps);
+        self.push(try entryBody(&mirred), 1);
+
+        // police is the one kind whose options are not a `tc_gen` prologue,
+        // and the only one carrying rate tables and RATE64/PEAKRATE64.
+        var police: std.ArrayList(u8) = .empty;
+        try appendActionList(gpa, &police, 1, &.{.{ .police = .{
+            .rate = 5_000_000_000,
+            .burst = 10 * 1024,
+            .peakrate = 10_000_000_000,
+            .mtu = 1500,
+            .exceed = .shot,
+            .notexceed = .ok,
+        } }}, ps);
+        self.push(try entryBody(&police), 1);
+
+        var vlan: std.ArrayList(u8) = .empty;
+        try appendActionList(gpa, &vlan, 1, &.{.{ .vlan = .{
+            .v_action = .push,
+            .id = 42,
+            .proto = 0x8100,
+            .prio = 5,
+        } }}, ps);
+        self.push(try entryBody(&vlan), 2);
+
+        var skbedit: std.ArrayList(u8) = .empty;
+        try appendActionList(gpa, &skbedit, 1, &.{.{ .skbedit = .{
+            .priority = Handle.init(1, 0x10),
+            .mark = 0xdead,
+            .ptype = PACKET.HOST,
+        } }}, ps);
+        self.push(try entryBody(&skbedit), 3);
+
+        // ── a whole list nest, longer than `max_actions_decoded` ───────────
+        // The cap is 4 and this sends 6, so `total` and `len` disagree — the
+        // one seed that proves the bound is a cap and not a truncation bug.
+        var six: std.ArrayList(u8) = .empty;
+        try appendActionList(gpa, &six, 1, &.{
+            .{ .vlan = .{ .v_action = .pop } },
+            .{ .skbedit = .{ .mark = 1 } },
+            .{ .vlan = .{ .v_action = .push, .id = 2 } },
+            .{ .mirred = .{ .eaction = .egress_mirror, .ifindex = 4 } },
+            .{ .skbedit = .{ .mark = 5 } },
+            .{ .gact = .{ .action = .ok } },
+        }, ps);
+        self.push(try listBody(&six), 6);
+
+        // ── an `RTM_NEWACTION` payload, which is what `actionsOf` takes ────
+        var tab: std.ArrayList(u8) = .empty;
+        try codec.appendPadded(gpa, &tab, &[_]u8{ 0, 0, 0, 0 }); // struct tcamsg
+        try appendActionList(gpa, &tab, TCA_ROOT.TAB, &.{
+            .{ .gact = .{ .action = .shot } },
+            .{ .mirred = .{ .eaction = .ingress_redir, .ifindex = 9 } },
+        }, ps);
+        self.push(tab.items, 1);
+
+        // ── a dumped action's statistics ───────────────────────────────────
+        var stats: std.ArrayList(u8) = .empty;
+        {
+            var basic: [16]u8 = @splat(0);
+            std.mem.writeInt(u64, basic[0..8], 123_456, native_endian);
+            std.mem.writeInt(u32, basic[8..12], 789, native_endian);
+            try codec.appendAttr(gpa, &stats, TCA_STATS.BASIC, &basic);
+            var queue: [20]u8 = @splat(0);
+            std.mem.writeInt(u32, queue[8..12], 5, native_endian);
+            std.mem.writeInt(u32, queue[16..20], 6, native_endian);
+            try codec.appendAttr(gpa, &stats, TCA_STATS.QUEUE, &queue);
+            var pkt64: [8]u8 = @splat(0);
+            std.mem.writeInt(u64, &pkt64, 1_000_000, native_endian);
+            try codec.appendAttr(gpa, &stats, TCA_STATS.PKT64, &pkt64);
+        }
+        self.push(stats.items, 1);
+
+        // ── attributes that arrive with the WRONG length ───────────────────
+        // Every `if (a.data.len >= N)` in `parseStats` and `parseAction` is a
+        // bound a well-formed dump cannot exercise.
+        var short: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &short, TCA_STATS.BASIC, &[_]u8{0} ** 8);
+        try codec.appendAttr(gpa, &short, TCA_STATS.QUEUE, &[_]u8{0} ** 12);
+        try codec.appendAttr(gpa, &short, TCA_STATS.PKT64, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &short, TCA_ACT.INDEX, &[_]u8{0} ** 2);
+        self.push(short.items, 1);
+
+        // A cookie twice `max_cookie_len`: the `@min` in `parseAction` is the
+        // only thing between a 32-octet attribute and a 16-octet buffer.
+        var big_cookie: std.ArrayList(u8) = .empty;
+        try codec.appendAttrString(gpa, &big_cookie, TCA_ACT.KIND, kind_gact);
+        try codec.appendAttr(gpa, &big_cookie, TCA_ACT.COOKIE, &[_]u8{0xAA} ** (max_cookie_len * 2));
+        self.push(big_cookie.items, 4);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A KIND string one octet past `kind_max`, which `copyKind` refuses.
+        var long_kind: std.ArrayList(u8) = .empty;
+        try codec.appendAttrString(gpa, &long_kind, TCA_ACT.KIND, "0123456789abcdefg");
+        self.push(long_kind.items, 1);
+        // An attribute header declaring 0x40 octets over a 2-octet buffer,
+        // and a payload shorter than `struct tcamsg`.
+        self.push(&[_]u8{ 0x40, 0x00 }, 1);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: action parsers never crash on arbitrary payloads" {
-    try testing.fuzz({}, fuzzParseAction, .{});
+    var corpus: ActionCorpus = .{};
+    try testing.fuzz({}, fuzzParseAction, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParseAction(_: void, smith: *std.testing.Smith) !void {
-    var raw: [256]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // 4096, not 256: a police action carries two 1 KiB rate tables, and a seed
+    // longer than the buffer is not a big seed — `Smith.slice` reads it back
+    // as the EMPTY one. The one action kind with a loop worth fuzzing could
+    // not have passed through this module's own harness at 256.
+    var raw: [4096]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all four parsers were handed an EMPTY
+    // slice with the action sitting unread in `raw`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 12 seeds non-empty,
+    // 0 kinds read, 0 list entries walked and 0 statistics counters decoded
+    // before; 12 of 12 non-empty, 7 kinds, 6 list entries, 8 statistics
+    // counters and 2 actions iterated out of an RTM_NEWACTION after.**
+    // `parseAction`, `parseActionList` and `parseStats` all SUCCEED on the
+    // empty slice — an action with no attributes is a legal (if useless)
+    // entry — so an acceptance count called this harness healthy while it
+    // walked nothing.
+    const len: usize = smith.slice(&raw);
     const buf = raw[0..len];
-    if (parseAction(smith.value(u16), buf)) |_| {} else |_| {}
-    if (parseActionList(buf)) |_| {} else |_| {}
-    if (parseStats(buf)) |_| {} else |_| {}
+    // ⚠ `value(u64)` truncated, not `value(u16)`: a `u16` draw reads eight
+    // input octets as a little-endian u64 and only survives if the whole word
+    // fits in 16 bits, so the ordinal was 0 — `TCA_ACT_UNSPEC` — for every
+    // seed. The ordinal travels in the seed's tail now.
+    const order: u16 = @truncate(smith.value(u64));
+    if (parseAction(order, buf)) |a| std.mem.doNotOptimizeAway(a.kind().len) else |_| {}
+    if (parseActionList(buf)) |l| std.mem.doNotOptimizeAway(l.total) else |_| {}
+    if (parseStats(buf)) |s| std.mem.doNotOptimizeAway(s.packets) else |_| {}
     if (actionsOf(buf)) |maybe| {
         if (maybe) |it_const| {
             var it = it_const;
             while (it.next() catch null) |_| {}
         }
     } else |_| {}
+}
+
+test "corpus: every action seed reaches the parsers, and the decoded counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. `kinds`, `walked`
+    // and `counters` are the numbers an empty payload cannot produce, and
+    // `orders` pins that the ordinal arrived as written — without it the
+    // `parseAction` half quietly goes back to asking about `TCA_ACT_UNSPEC`.
+    var corpus: ActionCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var kinds: usize = 0;
+    var walked: usize = 0;
+    var counters: usize = 0;
+    var orders: usize = 0;
+    var iterated: usize = 0;
+    for (entries, corpus.orders[0..corpus.n]) |sd, want_order| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [4096]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const buf = raw[0..len];
+        const order: u16 = @truncate(smith.value(u64));
+        if (order == want_order) orders += 1;
+        if (parseAction(order, buf)) |a| {
+            if (a.kind().len != 0) kinds += 1;
+        } else |_| {}
+        if (parseActionList(buf)) |l| walked += l.total else |_| {}
+        if (parseStats(buf)) |s| {
+            if (s.bytes != 0) counters += 1;
+            if (s.packets != 0) counters += 1;
+            if (s.drops != 0) counters += 1;
+            if (s.overlimits != 0) counters += 1;
+        } else |_| {}
+        if (actionsOf(buf)) |maybe| {
+            if (maybe) |it_const| {
+                var it = it_const;
+                while (it.next() catch null) |_| iterated += 1;
+            }
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(entries.len, orders);
+    try testing.expectEqual(@as(usize, 7), kinds);
+    try testing.expectEqual(@as(usize, 6), walked);
+    try testing.expectEqual(@as(usize, 8), counters);
+    try testing.expectEqual(@as(usize, 2), iterated);
 }

@@ -23,6 +23,10 @@ const LinkLayer = ratespec.LinkLayer;
 const handle_mod = @import("handle.zig");
 const Handle = handle_mod.Handle;
 
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
+
 // ── attribute-type constants (kernel UAPI) ──────────────────────────────────
 
 /// Qdisc/class attribute types (linux/rtnetlink.h `TCA_*`) — attributes on
@@ -1425,14 +1429,282 @@ test "QdiscSpec.kind covers every modelled kind" {
     try testing.expect((QdiscSpec{ .fq_codel = .{} }).carriesOptions());
 }
 
+/// `TCA_OPTIONS` bodies and whole `struct tcmsg` payloads for
+/// `fuzzParseOptions`, in the format `Smith.slice` reads (see `testkit.fuzz`):
+/// a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by this file's own encoders rather than quoted as hex.
+/// Every tc option is a netlink TLV whose `nla_len`/`nla_type` and whose
+/// scalars are in HOST byte order, so a hex corpus would be a little-endian
+/// one and the counts pinned below would silently be false on a big-endian
+/// target instead of failing there.
+///
+/// ⛔ The buffer had to grow with it. An htb *class* options nest carries two
+/// 1 KiB rate tables (`RTAB`/`CTAB`), so the shortest complete one this module
+/// can emit is over 2 KiB against the harness's old 256-octet buffer — and a
+/// seed longer than the buffer is not a big seed, `Smith.slice` reads it back
+/// as the EMPTY one. The one option payload with a loop long enough to matter
+/// could never have passed through this module's own harness.
+const OptionsCorpus = struct {
+    scratch: [16384]u8 = undefined,
+    store: [16384]u8 = undefined,
+    used: usize = 0,
+    entries: [19][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *OptionsCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    /// A `struct tcmsg` fixed header, which is what `parseQdisc` and
+    /// `parseClass` take in front of the attribute list. Written here rather
+    /// than borrowed from `message.appendTcmsg` because `message.zig` imports
+    /// this file, and the dependency only goes that way.
+    fn tcmsg(
+        gpa: std.mem.Allocator,
+        list: *std.ArrayList(u8),
+        ifindex: u32,
+        h: Handle,
+        parent: Handle,
+    ) !void {
+        var hdr: [tcmsg_len]u8 = @splat(0);
+        std.mem.writeInt(i32, hdr[4..8], @bitCast(ifindex), native_endian);
+        std.mem.writeInt(u32, hdr[8..12], h.raw, native_endian);
+        std.mem.writeInt(u32, hdr[12..16], parent.raw, native_endian);
+        try codec.appendPadded(gpa, list, &hdr);
+    }
+
+    fn build(self: *OptionsCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+        const ps = ratespec.golden_psched;
+
+        // ── option bodies, one per kind ────────────────────────────────────
+        // netem with every extended attribute the parser knows: CORR,
+        // REORDER, CORRUPT, RATE, LATENCY64, JITTER64.
+        var netem: std.ArrayList(u8) = .empty;
+        try appendNetemOptions(.{
+            .limit = 2000,
+            .delay_ns = 100_000_000,
+            .jitter_ns = 10_000_000,
+            .delay_correlation_pct = 25,
+            .loss_pct = 1.5,
+            .loss_correlation_pct = 10,
+            .duplicate_pct = 0.5,
+            .duplicate_correlation_pct = 5,
+            .reorder_pct = 2,
+            .reorder_correlation_pct = 50,
+            .reorder_gap = 5,
+            .corrupt_pct = 0.1,
+            .corrupt_correlation_pct = 3,
+            .rate_bytes_per_sec = 125_000,
+        }, gpa, &netem);
+        self.push(netem.items);
+
+        // htb at the qdisc level: INIT + DIRECT_QLEN + the OFFLOAD flag.
+        var htb: std.ArrayList(u8) = .empty;
+        try appendHtbOptions(.{
+            .rate2quantum = 10,
+            .defcls = 0x10,
+            .direct_qlen = 1000,
+            .offload = true,
+        }, gpa, &htb);
+        self.push(htb.items);
+
+        // htb at the class level: the two 1 KiB rate tables and the
+        // RATE64/CEIL64 companions a >= 2^32 rate forces.
+        var htb_class: std.ArrayList(u8) = .empty;
+        try appendHtbClassOptions(.{
+            .rate = 5_000_000_000,
+            .ceil = 10_000_000_000,
+            .prio = 3,
+            .quantum = 3000,
+        }, gpa, &htb_class, ps);
+        self.push(htb_class.items);
+
+        // tbf with a peak bucket: two ratespecs, BURST and PBURST.
+        var tbf: std.ArrayList(u8) = .empty;
+        try appendTbfOptions(.{
+            .rate = 1_250_000,
+            .burst = 10240,
+            .latency_us = 50_000,
+            .peakrate = 2_500_000,
+            .mtu = 1500,
+        }, gpa, &tbf, ps);
+        self.push(tbf.items);
+
+        // fq_codel with every knob present.
+        var fq: std.ArrayList(u8) = .empty;
+        try appendFqCodelOptions(.{
+            .limit = 10240,
+            .flows = 1024,
+            .quantum = 1514,
+            .interval_us = 100_000,
+            .target_us = 5000,
+            .ecn = true,
+            .ce_threshold_us = 1000,
+            .memory_limit = 32 << 20,
+            .drop_batch = 64,
+        }, gpa, &fq);
+        self.push(fq.items);
+
+        // cake with every knob present — the widest attribute list here.
+        var cake: std.ArrayList(u8) = .empty;
+        try appendCakeOptions(.{
+            .bandwidth = 12_500_000,
+            .diffserv = .diffserv4,
+            .atm = .ptm,
+            .flow_mode = .triple_isolate,
+            .overhead = 18,
+            .mpu = 64,
+            .rtt_us = 100_000,
+            .target_us = 5000,
+            .autorate_ingress = false,
+            .memlimit = 4 << 20,
+            .fwmark = 0xff,
+            .nat = true,
+            .wash = true,
+            .split_gso = false,
+            .ack_filter = .aggressive,
+            .ingress = false,
+        }, gpa, &cake);
+        self.push(cake.items);
+
+        // ── whole tcmsg payloads, which is what a dump hands `parseQdisc` ──
+        var q_netem: std.ArrayList(u8) = .empty;
+        try tcmsg(gpa, &q_netem, 2, Handle.init(1, 0), Handle.root);
+        try codec.appendAttrString(gpa, &q_netem, TCA.KIND, kind_netem);
+        try codec.appendAttr(gpa, &q_netem, TCA.OPTIONS, netem.items);
+        self.push(q_netem.items);
+
+        var q_cake: std.ArrayList(u8) = .empty;
+        try tcmsg(gpa, &q_cake, 2, Handle.init(0x8001, 0), Handle.root);
+        try codec.appendAttrString(gpa, &q_cake, TCA.KIND, kind_cake);
+        try codec.appendAttr(gpa, &q_cake, TCA.OPTIONS, cake.items);
+        self.push(q_cake.items);
+
+        // An RTM_NEWTCLASS payload: the same shape, read by `parseClass`.
+        var c_htb: std.ArrayList(u8) = .empty;
+        try tcmsg(gpa, &c_htb, 2, Handle.init(1, 0x10), Handle.init(1, 0));
+        try codec.appendAttrString(gpa, &c_htb, TCA.KIND, kind_htb);
+        try codec.appendAttr(gpa, &c_htb, TCA.OPTIONS, htb_class.items);
+        self.push(c_htb.items);
+
+        // A qdisc naming a kind this module does not model: the KIND is
+        // copied, the OPTIONS nest is left unparsed.
+        var q_sfq: std.ArrayList(u8) = .empty;
+        try tcmsg(gpa, &q_sfq, 3, Handle.init(2, 0), Handle.root);
+        try codec.appendAttrString(gpa, &q_sfq, TCA.KIND, "sfq");
+        try codec.appendAttr(gpa, &q_sfq, TCA.OPTIONS, &[_]u8{ 1, 2, 3, 4 });
+        self.push(q_sfq.items);
+
+        // ── attributes that arrive with the WRONG length ───────────────────
+        // ⭐ These are the seeds the mutation testing asked for. Every
+        // `if (a.data.len == N)` in the five option parsers is a bound that a
+        // well-formed capture can never exercise: weaken it to `>= 4` and the
+        // read runs off the end of `a.data`. Seven such mutations survived a
+        // green suite before this corpus existed, three of them writing out of
+        // bounds, because the harness handed every parser an empty slice and
+        // no test ever put a short attribute in front of one.
+        var netem_short: std.ArrayList(u8) = .empty;
+        try netem_short.appendSlice(gpa, &([_]u8{0} ** tc_netem_qopt_len));
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.CORR, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.REORDER, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.CORRUPT, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.RATE, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.LATENCY64, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &netem_short, TCA_NETEM.JITTER64, &[_]u8{0} ** 4);
+        self.push(netem_short.items);
+
+        // htb, both levels. RATE64/CEIL64 come before the short PARMS, which
+        // ends the class walk with `BadLength`.
+        var htb_short: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.INIT, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.DIRECT_QLEN, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.RATE64, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.CEIL64, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &htb_short, TCA_HTB.PARMS, &[_]u8{0} ** 4);
+        self.push(htb_short.items);
+
+        var tbf_short: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.RATE64, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.PRATE64, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.BURST, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.PBURST, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &tbf_short, TCA_TBF.PARMS, &[_]u8{0} ** 4);
+        self.push(tbf_short.items);
+
+        var cake_short: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.BASE_RATE64, &[_]u8{0} ** 4);
+        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.OVERHEAD, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.DIFFSERV_MODE, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.MPU, &[_]u8{0} ** 8);
+        try codec.appendAttr(gpa, &cake_short, TCA_CAKE.RAW, &.{});
+        self.push(cake_short.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A payload one octet short of `struct tcmsg`.
+        self.push(&([_]u8{0} ** (tcmsg_len - 1)));
+        // A KIND string one octet past `kind_max`, which `copyKind` refuses.
+        var long_kind: std.ArrayList(u8) = .empty;
+        try tcmsg(gpa, &long_kind, 2, Handle.unspec, Handle.root);
+        try codec.appendAttrString(gpa, &long_kind, TCA.KIND, "0123456789abcdefg");
+        self.push(long_kind.items);
+        // An attribute header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 });
+        // A netem qopt one octet short of `tc_netem_qopt_len`.
+        self.push(&([_]u8{0} ** (tc_netem_qopt_len - 1)));
+        // A complete netem qopt followed by a TLV running off the end.
+        self.push(&([_]u8{0} ** tc_netem_qopt_len ++ [_]u8{ 0x40, 0x00, 0x03, 0x00, 0x01 }));
+
+        return self.entries[0..self.n];
+    }
+};
+
+/// How many of a `*Wire` struct's optional fields came back present.
+///
+/// ⭐ This is the **second number** every corpus guard in this module pins, and
+/// it exists because the first one cannot do the job alone: an empty attribute
+/// list is a legal `TCA_OPTIONS` body for five of the eight parsers here, so
+/// they succeed on the empty slice a collapsed harness hands them and return a
+/// struct of all-null. An acceptance count therefore reads as full marks while
+/// nothing walks a single TLV; a count of fields that only exist after the walk
+/// ran cannot. `pub` because `filter.zig` and `action.zig` pin the same number.
+pub fn optionalsSet(v: anytype) usize {
+    var n: usize = 0;
+    inline for (@typeInfo(@TypeOf(v)).@"struct".fields) |f| {
+        if (@typeInfo(f.type) == .optional) {
+            if (@field(v, f.name) != null) n += 1;
+        }
+    }
+    return n;
+}
+
 test "fuzz: option parsers never crash on arbitrary payloads" {
-    try testing.fuzz({}, fuzzParseOptions, .{});
+    var corpus: OptionsCorpus = .{};
+    try testing.fuzz({}, fuzzParseOptions, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParseOptions(_: void, smith: *std.testing.Smith) !void {
-    var raw: [256]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⛔ 4096, not 256. See `OptionsCorpus`: an htb class options nest is over
+    // 2 KiB of rate tables, and a seed longer than the buffer reads back EMPTY.
+    var raw: [4096]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all eight parsers were handed an EMPTY
+    // slice with the payload sitting unread in `raw`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 19 seeds non-empty,
+    // 0 netem options parsed, 0 qdisc kinds read and 0 optional cake/fq_codel/
+    // tbf/htb fields decoded before; 19 of 19 non-empty, 8 netem, 8 kinds and
+    // 65 optionals after.** And **5 of the 8 parsers *succeeded* on that empty
+    // slice** — an empty attribute list is a legal options body — so an
+    // acceptance count said the harness was healthy while it walked nothing.
+    const len: usize = smith.slice(&raw);
     const buf = raw[0..len];
     if (parseNetemOptions(buf)) |_| {} else |_| {}
     if (parseHtbOptions(buf)) |_| {} else |_| {}
@@ -1440,6 +1712,50 @@ fn fuzzParseOptions(_: void, smith: *std.testing.Smith) !void {
     if (parseTbfOptions(buf)) |_| {} else |_| {}
     if (parseFqCodelOptions(buf)) |_| {} else |_| {}
     if (parseCakeOptions(buf)) |_| {} else |_| {}
-    if (parseQdisc(buf)) |_| {} else |_| {}
-    if (parseClass(buf)) |_| {} else |_| {}
+    if (parseQdisc(buf)) |q| std.mem.doNotOptimizeAway(q.kind().len) else |_| {}
+    if (parseClass(buf)) |c| std.mem.doNotOptimizeAway(c.kind().len) else |_| {}
+}
+
+test "corpus: every option seed reaches the parsers, and the decoded counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently.
+    //
+    // ⛔ The other three numbers are the ones an empty payload cannot produce.
+    // "Parsers that succeeded" is not among them: `parseHtbOptions`,
+    // `parseHtbClassOptions`, `parseTbfOptions`, `parseFqCodelOptions`,
+    // `parseCakeOptions` and `parseClass`'s attribute walk all accept an empty
+    // attribute list, so a collapsed harness scores six accepts a round while
+    // never entering a TLV loop. `netem` needs 24 octets of fixed header,
+    // `kinds` needs a KIND attribute actually copied out, and `optionals`
+    // counts fields that only exist if the walk ran.
+    var corpus: OptionsCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var netem: usize = 0;
+    var kinds: usize = 0;
+    var optionals: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [4096]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const buf = raw[0..len];
+        if (parseNetemOptions(buf)) |_| netem += 1 else |_| {}
+        if (parseFqCodelOptions(buf)) |w| optionals += optionalsSet(w) else |_| {}
+        if (parseCakeOptions(buf)) |w| optionals += optionalsSet(w) else |_| {}
+        if (parseTbfOptions(buf)) |w| optionals += optionalsSet(w) else |_| {}
+        if (parseHtbOptions(buf)) |w| optionals += optionalsSet(w) else |_| {}
+        if (parseQdisc(buf)) |q| {
+            if (q.kind().len != 0) kinds += 1;
+        } else |_| {}
+        if (parseClass(buf)) |c| {
+            if (c.kind().len != 0) kinds += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 8), netem);
+    try testing.expectEqual(@as(usize, 8), kinds);
+    try testing.expectEqual(@as(usize, 65), optionals);
 }

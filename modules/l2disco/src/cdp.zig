@@ -39,6 +39,9 @@
 
 const std = @import("std");
 const netaddr = @import("netaddr");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const ParseError = error{
     /// Shorter than the 4-byte CDP header.
@@ -599,21 +602,156 @@ test "CDP garbage sweep: no panics on random input" {
 // walker past the checksum gate is actually reached, plus once with default
 // options so the checksum path itself is exercised too.
 
+/// CDP frames for `fuzzCdpParse`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Hex (and the golden frame above it), not built at run time: every field
+/// in a CDP frame is big-endian, so these bytes are the same on every host.
+///
+/// ⛔ Half of these exist because the TLV walker has bounds a well-formed
+/// frame cannot reach. `kat_frame` alone drives the happy path of every
+/// accessor and not one of the eight refusals below it.
+const cdp_seeds = [_][]const u8{
+    // The golden CDPv2 frame, checksum and all.
+    testkit.fuzz.seed(&kat_frame),
+    // The same with the checksum word corrupted: `BadChecksum` under default
+    // options, and a full TLV walk with verification off. It is the one seed
+    // that makes the two `Frame.parse` calls in the harness disagree.
+    testkit.fuzz.seed(&([_]u8{ 0x02, 0xb4, 0xff, 0xff } ++ kat_frame[4..].*)),
+    // A header with no TLVs behind it: legal, and every optional stays null.
+    testkit.fuzz.seedHex("02b40000"),
+
+    // ── the TLV walker's own bounds ────────────────────────────────────────
+    // A TLV whose declared total is under the 4-octet header: `BadTlvLength`.
+    testkit.fuzz.seedHex("02b40000" ++ "00010003" ++ "41"),
+    // A TLV declaring more than the region holds: `TruncatedTlv`.
+    testkit.fuzz.seedHex("02b40000" ++ "0001ffff" ++ "6c61622d737731"),
+    // Two octets of TLV header where four are needed: `TruncatedTlv` on the
+    // OTHER branch (`pos + 4 > buf.len`, not `pos + total`).
+    testkit.fuzz.seedHex("02b40000" ++ "0001"),
+    // ⭐ A TLV declaring exactly TWO octets more than the region holds. The
+    // 0xffff seed above is caught by any bound at all; this one is caught
+    // only by the exact `pos + total > buf.len`, and it is what an
+    // off-by-a-few in that check would slice past the end of.
+    testkit.fuzz.seedHex("02b40000" ++ "0001000a" ++ "6c6162"),
+    // Capabilities with 3 octets, native VLAN with 1, duplex with 2 — the
+    // three exact-length checks, one seed each so a survivor is nameable.
+    testkit.fuzz.seedHex("02b40000" ++ "00040007" ++ "000028"),
+    testkit.fuzz.seedHex("02b40000" ++ "000a0005" ++ "0a"),
+    testkit.fuzz.seedHex("02b40000" ++ "000b0006" ++ "0001"),
+
+    // ── the address walker's bounds ────────────────────────────────────────
+    // Two entries: an IPv4 NLPID address and an IPv6 802.2/SNAP one, so both
+    // arms of `Address.ip` decode.
+    testkit.fuzz.seedHex("02b40000" ++ "0002002d" ++ "00000002" ++
+        "0101cc0004c0a80a02" ++
+        "020800000000000086dd0010" ++ "20" ** 16),
+    // A count of 0xffffffff over one entry's worth of bytes: the iterator
+    // must run out of buffer, not out of patience.
+    testkit.fuzz.seedHex("02b40000" ++ "00020011" ++ "ffffffff" ++ "0101cc0004c0a80a02"),
+    // An address length running past the end of the TLV.
+    testkit.fuzz.seedHex("02b40000" ++ "00020011" ++ "00000001" ++ "0101ccffffc0a80a02"),
+    // An Addresses TLV whose value is under the 4-octet count.
+    testkit.fuzz.seedHex("02b40000" ++ "00020006" ++ "0000"),
+    // ⭐ An entry whose protocol bytes end exactly at the end of the block,
+    // leaving no room for the two-octet address length. Only the `+ 2` in
+    // `pos + plen + 2 > buf.len` stands between this and a read past the end.
+    testkit.fuzz.seedHex("02b40000" ++ "0002000c" ++ "00000001" ++ "0102" ++ "cccc"),
+
+    // ── the refusals ───────────────────────────────────────────────────────
+    testkit.fuzz.seed(""),
+    testkit.fuzz.seedHex("02b400"),
+};
+
 test "fuzz: CDP Frame.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzCdpParse, .{});
+    try testing.fuzz({}, fuzzCdpParse, .{ .corpus = &cdp_seeds });
+}
+
+/// What one frame yielded. Shared by the fuzz target and its corpus guard so
+/// the guard drives the SAME walk.
+const CdpTally = struct {
+    parsed: usize = 0,
+    fields: usize = 0,
+    tlvs: usize = 0,
+    addresses: usize = 0,
+    checksum_ok: usize = 0,
+};
+
+fn walkCdp(bytes: []const u8) CdpTally {
+    var t: CdpTally = .{};
+    if (Frame.parse(bytes, .{ .verify_checksum = false })) |f| {
+        t.parsed = 1;
+        inline for (.{
+            f.device_id != null,   f.port_id != null,    f.software_version != null,
+            f.platform != null,    f.vtp_domain != null, f.capabilities != null,
+            f.native_vlan != null, f.duplex != null,     f.addresses_raw != null,
+        }) |present| {
+            if (present) t.fields += 1;
+        }
+        var tit = f.tlvIterator();
+        while (tit.next() catch null) |_| t.tlvs += 1;
+        if (f.addressIterator() catch null) |it_opt| {
+            var it = it_opt;
+            while (it.next() catch null) |a| {
+                t.addresses += 1;
+                std.mem.doNotOptimizeAway(a.ip());
+                if (t.addresses > 64) break;
+            }
+        }
+    } else |_| {}
+    if (Frame.parse(bytes, .{})) |_| t.checksum_ok = 1 else |_| {}
+    return t;
 }
 
 fn fuzzCdpParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const bytes = buf[0..len];
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `Frame.parse` was handed an EMPTY
+    // slice with the frame sitting unread in `buf`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 17 seeds non-empty,
+    // 0 frames parsed, 0 TLVs walked and 0 addresses decoded before; 16 of 17
+    // non-empty (one seed IS the empty frame), 8 parsed, 23 TLVs walked and 5
+    // addresses decoded, after.** The empty slice is refused at `bytes.len < header_len`,
+    // so neither the TLV walker nor the address walker — the whole reason this
+    // target exists — had ever run once.
+    const len: usize = smith.slice(&buf);
+    std.mem.doNotOptimizeAway(walkCdp(buf[0..len]));
+}
 
-    if (Frame.parse(bytes, .{ .verify_checksum = false })) |f| {
-        if (f.addressIterator() catch null) |it_opt| {
-            var it = it_opt;
-            while (it.next() catch null) |_| {}
-        }
-    } else |_| {}
-    _ = Frame.parse(bytes, .{}) catch {};
+test "corpus: every CDP seed reaches the walkers, and the decoded counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkCdp`. `nonempty` is
+    // the reach claim and the only check that catches a seed grown past the
+    // harness's buffer, which `Smith.slice` reads back as the EMPTY one.
+    //
+    // ⛔ `parsed` is not enough on its own: a four-octet header with no TLVs
+    // behind it is a legal CDP frame, so a frame can parse with every field
+    // null and both iterators empty. `fields`, `tlvs` and `addresses` count
+    // work the empty input cannot do; `checksum_ok` pins that the second
+    // `Frame.parse` call — the one with verification ON — really does disagree
+    // with the first on at least one seed, which is the only thing that makes
+    // having both calls worth anything.
+    var nonempty: usize = 0;
+    var total: CdpTally = .{};
+    for (cdp_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const t = walkCdp(buf[0..len]);
+        total.parsed += t.parsed;
+        total.fields += t.fields;
+        total.tlvs += t.tlvs;
+        total.addresses += t.addresses;
+        total.checksum_ok += t.checksum_ok;
+    }
+    try testing.expectEqual(cdp_seeds.len - 1, nonempty); // one seed IS the empty frame
+    try testing.expectEqual(@as(usize, 8), total.parsed);
+    try testing.expectEqual(@as(usize, 23), total.fields);
+    try testing.expectEqual(@as(usize, 23), total.tlvs);
+    try testing.expectEqual(@as(usize, 5), total.addresses);
+    try testing.expectEqual(@as(usize, 1), total.checksum_ok);
 }

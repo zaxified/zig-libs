@@ -25,7 +25,6 @@ cbor 2
 chachapoly 2
 coap 1
 coconut 1
-conntrack 2
 cookies 1
 cors 1
 csvstream 2
@@ -37,7 +36,6 @@ diskusage 1
 dkg 2
 dnssec 4
 drand 1
-ebpf 5
 encoding 1
 ethfrag 1
 falcon 1
@@ -55,7 +53,6 @@ json5 2
 jwe 2
 jwt 3
 k256 2
-l2disco 4
 l2encap 1
 l2forward 1
 linkheader 1
@@ -68,7 +65,6 @@ modbus 2
 montint 2
 musig2 1
 netconf 3
-nftables 2
 noise 1
 ocsp 2
 ocspcache 2
@@ -98,7 +94,6 @@ sphinx 1
 staticfiles 1
 stun 1
 tar 1
-tc 4
 tenantkex 2
 timelock_envelope 1
 tlock 1
@@ -113,7 +108,6 @@ voprf 1
 webauthn 4
 webhooksig 1
 whois 1
-wireguard 2
 xml 1
 xmldsig 1
 xmlenc 1

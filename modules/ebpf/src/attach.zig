@@ -2490,15 +2490,91 @@ test "LIVE: cgroup attach + detach in a throwaway cgroup" {
 // sysfs" per its own doc comment — so it is fuzzed here for the same reason
 // its existing edge-case tests exist.
 
+/// `format/*` file contents for `fuzzParseConfigShift`, in the format
+/// `Smith.slice` reads (see `testkit.fuzz`): a little-endian u32 length, then
+/// the bytes. Real sysfs text, the shapes this parser must fall back on, and
+/// the ones that reach `parseInt` with something it has to refuse.
+const config_shift_seeds = [_][]const u8{
+    // The two files this module actually reads, verbatim off a live kernel.
+    testkit.fuzz.seed("config:0\n"),
+    testkit.fuzz.seed("config:32-63\n"),
+    // Accepted, but through the other branches: no newline, and the maximum
+    // a `u6` can hold.
+    testkit.fuzz.seed("config:3"),
+    testkit.fuzz.seed("config:63"),
+    // Trimming: the parser strips " \t\r\n" from BOTH ends before matching.
+    testkit.fuzz.seed("  config:7  \r\n"),
+    // Falls back to `default`, one per reason.
+    testkit.fuzz.seed(""), //           nothing at all
+    testkit.fuzz.seed("garbage\n"), //  no `config:` prefix
+    testkit.fuzz.seed("config1:4"), //  prefix present but not at the start
+    testkit.fuzz.seed("config:"), //    prefix and nothing behind it
+    testkit.fuzz.seed("config:999"), // parses, does not fit a u6
+    testkit.fuzz.seed("config:-"), //   the separator with no first number
+    testkit.fuzz.seed("config:1-2-3"), // more than one separator
+    testkit.fuzz.seed("config:+7"), //  a sign `parseInt` accepts for signed
+    // Not text at all: a NUL inside the digits, and high bytes.
+    testkit.fuzz.seed("config:1\x002"),
+    testkit.fuzz.seed("config:\xff\xfe\xfd"),
+    // Longer than any real value, and longer than the 64-octet buffer
+    // `configShift` reads sysfs into — so it must still only fall back.
+    testkit.fuzz.seed("config:" ++ "9" ** 40),
+};
+
 test "fuzz: parseConfigShift never panics on arbitrary sysfs-file bytes" {
-    try testing.fuzz({}, fuzzParseConfigShift, .{});
+    try testing.fuzz({}, fuzzParseConfigShift, .{ .corpus = &config_shift_seeds });
+}
+
+test "corpus: every config-shift seed reaches the parser, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently.
+    //
+    // ⛔ The second number is the one the empty input cannot produce.
+    // `parseConfigShift` is total — it never fails, it falls back — so "did it
+    // return" is 17 of 17 whether or not a single octet arrived. `parsed`
+    // counts the seeds that came back with something OTHER than the sentinel
+    // default, which only a seed that actually reached `parseInt` can do.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    for (config_shift_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        // 63 as the sentinel: every seed here that parses yields something
+        // else, and "config:63" is checked separately below so the sentinel
+        // cannot hide a real hit.
+        if (parseConfigShift(buf[0..len], 63) != 63) parsed += 1;
+        std.mem.doNotOptimizeAway(parseConfigShift(buf[0..len], 0));
+    }
+    try testing.expectEqual(config_shift_seeds.len - 1, nonempty); // one seed IS the empty file
+    try testing.expectEqual(@as(usize, 6), parsed);
+    try testing.expectEqual(@as(u6, 63), parseConfigShift("config:63", 0));
 }
 
 fn fuzzParseConfigShift(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-    const default: u6 = smith.value(u6);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and the parser was handed an EMPTY slice
+    // with the file's bytes sitting unread in `buf`.
+    //
+    // ⛔ And it looked HEALTHIER that way: this parser cannot fail — it falls
+    // back to `default` — so the collapse showed up as a hundred percent of
+    // rounds "returning fine" while `std.mem.startsWith` refused `""` before
+    // any of the grammar ran. Measured 2026-09-07 over the corpus above:
+    // **0 of 17 seeds non-empty and 0 parsed before; 16 of 17 non-empty (one
+    // seed IS the empty file) and 6 parsed after.**
+    const len: usize = smith.slice(&buf);
+    // ⚠ `value(u64)` reduced, not `value(u6)`: a narrow draw reads eight input
+    // octets as a little-endian u64 and only survives if the whole word fits
+    // the type, so the fallback value was 0 on every seed — and 0 is the one
+    // value that cannot tell "fell back" apart from "parsed config:0", which
+    // is the first line of the very file this parser exists to read.
+    const default: u6 = @truncate(smith.value(u64));
     // The u6 return type already makes "out of range" unrepresentable; the
     // property under test is that arbitrary bytes (short reads, embedded
     // NULs, non-ASCII, digit strings far longer than any real shift value,
