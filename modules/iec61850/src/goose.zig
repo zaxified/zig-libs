@@ -638,8 +638,83 @@ test "the encoder derives numDatSetEntries from the values it is given" {
     try testing.expectEqual(@as(u32, 3), back.conf_rev);
 }
 
+const testkit = @import("testkit");
+/// `testkit.fuzz.seedHex`, aliased so the literals below read as the frames
+/// they are. A corpus entry is not the frame: `Smith.slice` reads a
+/// little-endian `u32` length first, so a raw frame would arrive minus its own
+/// first four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = testkit.fuzz.seedHex;
+
+/// The literal half of `fuzzDecode`'s corpus: the refusals `Frame.decode` and
+/// `Pdu.decode` name. Neither the frames nor the PDUs are here — those are the
+/// captured ones and they are built at run time below.
+const decode_seeds = [_][]const u8{
+    seed("6100"), // an empty GOOSE PDU: every mandatory member missing
+    seed("61068201F48201F4"), // DuplicateField: two [1] timeAllowedToLive
+    seed("3000"), // NotGoose / a universal SEQUENCE where application 1 is required
+    seed("010CCD01000102000000000188B803E8"), // a frame header that stops at the length
+    seed("00000000000000000000"), // ShortFrame: ten zero octets
+    seed("00"), // one octet
+};
+
+/// The whole corpus: the literals above, both captured frames, and the PDU
+/// peeled off the first of them. `Pdu.decode` is called on the raw slice as
+/// well as on `f.pdu`, so it needs an entry that IS a PDU; and the re-encode
+/// identity at the end of the harness is unreachable without one that is a
+/// whole frame.
+///
+/// ⭐ The fuzz harness and the corpus guard below both build the corpus from
+/// HERE. A guard measuring a different corpus from the one the harness gets is
+/// not a guard.
+const Corpus = struct {
+    frame: [512]u8 = undefined,
+    frame_sq3: [512]u8 = undefined,
+    frame_store: [4 + 512]u8 = undefined,
+    sq3_store: [4 + 512]u8 = undefined,
+    pdu_store: [4 + 512]u8 = undefined,
+    entries: [decode_seeds.len + 3][]const u8 = undefined,
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        const bytes = unhex(captured_frame_hex, &self.frame);
+        const sq3 = unhex(captured_frame_sq3_hex, &self.frame_sq3);
+        const f = try Frame.decode(bytes);
+        @memcpy(self.entries[0..decode_seeds.len], &decode_seeds);
+        self.entries[decode_seeds.len + 0] = testkit.fuzz.seedInto(&self.frame_store, bytes);
+        self.entries[decode_seeds.len + 1] = testkit.fuzz.seedInto(&self.sq3_store, sq3);
+        self.entries[decode_seeds.len + 2] = testkit.fuzz.seedInto(&self.pdu_store, f.pdu);
+        return &self.entries;
+    }
+};
+
 test "fuzz: goose frame and PDU decode never panic" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    var corpus: Corpus = .{};
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
+}
+
+test "corpus: every seed reaches the decoders, and the accepted counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so these pin the numbers rather than asserting they are > 0.
+    var nonempty: usize = 0;
+    var pdus: usize = 0;
+    var frames: usize = 0;
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (Pdu.decode(buf[0..len])) |_| pdus += 1 else |_| {}
+        if (Frame.decode(buf[0..len])) |_| frames += 1 else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 1), pdus);
+    try testing.expectEqual(@as(usize, 2), frames);
 }
 
 // ── a structure-aware harness for the PDU body ─────────────────────────────
@@ -857,8 +932,15 @@ fn fuzzStructuredGoose(_: void, smith: *std.testing.Smith) !void {
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and both decoders were handed an empty
+    // slice with the seed sitting unread in the buffer. That is the second half
+    // of what the comment below records: `fuzzStructuredGoose` exists because
+    // random octets do not build a GOOSE frame — but this harness was not even
+    // getting random octets, it was getting nothing.
+    const len: usize = smith.slice(&buf);
     _ = Pdu.decode(buf[0..len]) catch {};
     const f = Frame.decode(buf[0..len]) catch return;
     try testing.expect(f.total_len <= len);

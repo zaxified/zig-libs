@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`mms`, `mmsdata`, `report`, `goose` and `sv`: five more
+  decoders that were only ever handed the empty slice.** Same collapse:
+  `smith.bytes(&buf)` followed by a ranged length draw, which returns the range
+  MINIMUM when fewer than eight octets remain. Each now draws with one
+  `smith.slice` and carries a corpus. `sv`, `goose` and `report` build the
+  positive half at run time — from `captured_frame_hex`, `captured_frame_sq3_hex`
+  and the two `captured_report` PDUs — because those exist in this module only as
+  captures or as encoder output, and the harness and its guard build the corpus
+  from the same place. Measured, all zero before: `mms.fuzzDecode` 24 of 24
+  non-empty, **19 decoded (8 requests, 5 responses)**; `report.fuzzReport` 8 of 8,
+  **2 reports and 1 RCB**; `goose.fuzzDecode` 9 of 9, **1 PDU and 2 frames**;
+  `sv.fuzzDecode` 10 of 10, **1 ASDU, 1 savPdu, 1 frame**. The arm counts are
+  pinned separately because each harness branches on them: a corpus of confirmed
+  requests only would leave both response arms as dead as the collapse left them.
+
 - **2026-09-07** — **`ber`, `mmsdata` and `acsi`: four more harnesses that threw
   their input away, and a round-trip assertion that was false.** `ber.fuzzDecode`,
   `ber.fuzzIterate`, `mmsdata.fuzzData` and `acsi.fuzzParse` all opened

@@ -1800,14 +1800,64 @@ test "a reject PDU is surfaced rather than parsed as a response" {
     try testing.expectEqual(@as(u32, 1), pdu.reject.reject_reason_class);
 }
 
+/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the PDUs it is.
+/// A corpus entry is not the PDU: `Smith.slice` reads a little-endian `u32`
+/// length first, so a raw PDU would arrive minus its own first four octets.
+/// `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seedHex;
+
+/// MMS PDUs, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// Every one is a captured or rebuilt PDU from the value tests above, chosen so
+/// that the branch table in `fuzzDecode` is entered on all three of its arms —
+/// confirmed request, confirmed response and unconfirmed — plus the shapes
+/// `decode` refuses. Uniform random octets reach past the outer application tag
+/// only when the first octet happens to be one of nine and its length agrees
+/// with what follows.
+const decode_seeds = [_][]const u8{
+    // confirmed-request: the captured Read, Write, GetNameList and file services
+    seed("A038020101A433A131A02F302DA02BA1291A1173696D706C65494F47656E65726963494F1A144747494F31244D5824416E496E31246D61672466"),
+    seed("A04B020102A546A031302FA02DA12B1A1173696D706C65494F47656E65726963494F1A164747494F31244443244E616D506C742476656E646F72A0118A0F6C696269656336313835302E636F6D"),
+    seed("A00E020101A109A003800109A1028000"), // GetNameList, VMD scope
+    seed("A02E020103A429800101A124A122A1201A1173696D706C65494F47656E65726963494F1A0B4C4C4E30244576656E7473"), // named-variable-list read
+    seed("A006020101BF4D00"), // FileDirectory: the long-form service tag
+    seed("A019020101BF4813A00E190C4945444D4F44454C2E434944810100"), // FileOpen
+    seed("A0070201079F490103"), // FileRead: a bare Integer32 body
+    seed("A005020101A200"), // Identify
+    // confirmed-response
+    seed("A10E020101A409A1078705083D2A5155"), // the measured float
+    seed("A107020102A5028100"), // Write response, one success
+    seed("A11D020101A118A0131A1173696D706C65494F47656E65726963494F810100"), // GetNameList response
+    seed("A139020103A434A024A122A1201A1173696D706C65494F47656E65726963494F1A0B4C4C4E30244576656E7473A10C830100830100830100830100"), // four booleans
+    seed("A10A02010EA405A10380010A"), // an AccessResult failure, object-non-existent
+    // the rest of the CHOICE
+    seed("A20A800101A205A0038B0107"), // confirmed-error: errorClass file, code 7
+    seed("A406800105810101"), // reject: invoke id 5, reason class 1
+    seed("A826800300FDE881010582010583010AA416800101810305F100820C03EE1C00000408000079EF18"), // initiate-request
+    seed("A926800300FDE881010582010583010AA416800101810305F100820C03EE1C000000000000000118"), // initiate-response
+    seed("AB00"), // conclude-request
+    seed("AC00"), // conclude-response
+    // refusals
+    seed("3000"), // UnknownPdu: a universal SEQUENCE
+    seed("BF7F00"), // UnknownPdu: a long-form tag
+    seed("A003020101"), // MissingField: a confirmed request with no service
+    seed("A0020500"), // UnexpectedTag: an invoke id that is not an INTEGER
+    seed("00"), // one octet
+};
+
 test "fuzz: mms decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `decode` was handed an empty slice with
+    // the seed sitting unread in the buffer — every arm of the switch below was
+    // unreachable.
+    const len: usize = smith.slice(&buf);
     const pdu = decode(buf[0..len]) catch return;
     switch (pdu) {
         .confirmed_request => |r| {
@@ -1848,4 +1898,40 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         },
         else => {},
     }
+}
+
+test "corpus: every seed reaches the decoder, and what it decodes to is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so this pins the numbers rather than asserting they are > 0.
+    //
+    // The three arm counts are pinned separately because `fuzzDecode` branches
+    // on them: a corpus of confirmed requests only would leave both of the
+    // response arms as dead as they were when `len` was always 0.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var requests: usize = 0;
+    var responses: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decode(buf[0..len])) |pdu| {
+            accepted += 1;
+            switch (pdu) {
+                .confirmed_request => requests += 1,
+                .confirmed_response => responses += 1,
+                else => {},
+            }
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 19), accepted);
+    try testing.expectEqual(@as(usize, 8), requests);
+    try testing.expectEqual(@as(usize, 5), responses);
 }
