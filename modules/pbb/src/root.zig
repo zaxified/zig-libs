@@ -849,7 +849,7 @@ test "fuzz: decode never panics/OOBs on hostile bytes and stays within input bou
     // absurd lengths — and asserts only: never panics, and any successful
     // decode's customer slice is strictly within the input. Under a plain `zig
     // build test` this runs once as a smoke test (same convention as l2encap).
-    try testing.fuzz({}, fuzzDecode, .{});
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 // ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/dissect.py) ───────────
@@ -1033,25 +1033,72 @@ const fuzz_max_frame: usize = min_frame_len + b_tag_len + 9000;
 /// an iteration would buy nothing and cost the fuzzer most of its throughput.
 const fuzz_drawn: usize = min_frame_len + b_tag_len + 64;
 
+/// `testkit.fuzz`: `seedHex` for the corpus and `Cursor` for the size class and
+/// the tag bias. A corpus entry is not the frame — `Smith.slice` reads a
+/// little-endian u32 length first, so a raw frame would arrive minus the first
+/// four octets of its B-DA.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seedHex;
+
+/// 802.1ah frames, in the format `Smith.slice` reads: the module's own goldens
+/// (both hand-assembled and the Wireshark-anchored one), plus the truncations
+/// and wrong-EtherType shapes `decode` has to refuse.
+///
+/// Uniform random octets spell 0x88E7 at offset 12 — or 0x88A8 there and 0x88E7
+/// at 16 — with probability ~2^-16, which is what the old bias block existed to
+/// work around and never once ran.
+const decode_seeds = [_][]const u8{
+    // The B-Tag golden: B-DA/B-SA, 0x88A8 B-Tag (PCP=3 VID=100), 0x88E7 I-TAG
+    // (PCP=5 UCA=1 I-SID=0x000123), C-DA/C-SA, four octets of customer data.
+    seed("1000000000BB" ++ "1000000000AA" ++ "88A8" ++ "6064" ++ "88E7" ++ "A8000123" ++ "001122334455" ++ "00AABBCCDDEE" ++ "0800DEAD"),
+    // The untagged golden: no B-Tag, I-TAG straight after the B-MACs, and a
+    // customer_data of exactly zero octets — the `min_frame_len` edge.
+    seed("020000000001" ++ "020000000002" ++ "88E7" ++ "0000ABCD" ++ "FFFFFFFFFFFF" ++ "0A0B0C0D0E0F"),
+    // The Wireshark-anchored capture, customer C-VLAN and IPv4 payload intact.
+    seed("001B21000001" ++ "001B21000002" ++ "88A8" ++ "50C8" ++ "88E7" ++ "90001000" ++ "005056000001" ++ "005056000002" ++
+        "8100000A0800" ++ "4500001C0001" ++ "000040FD65E2" ++ "0A0000010A00" ++ "00024142434445464748"),
+    // A B-Tag whose TPID is right but with nothing behind it: the second
+    // EtherType read has to be bounds-checked, not assumed.
+    seed("1000000000BB" ++ "1000000000AA" ++ "88A8" ++ "6064"),
+    // 0x8100 at offset 12: a plain C-VLAN tag where a B-Tag or I-TAG belongs.
+    seed("1000000000BB" ++ "1000000000AA" ++ "8100" ++ "6064" ++ "88E7" ++ "A8000123" ++ "001122334455" ++ "00AABBCCDDEE"),
+    // One octet short of `min_frame_len` on an otherwise valid untagged frame.
+    seed("020000000001" ++ "020000000002" ++ "88E7" ++ "0000ABCD" ++ "FFFFFFFFFFFF" ++ "0A0B0C0D0E"),
+    seed("DEADBEEF"), // four octets, far short of any header
+    seed(""), // the empty frame
+};
+
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_max_frame]u8 = undefined;
-    smith.bytes(buf[0..fuzz_drawn]);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(out.len, in.len)` octets and every ranged
+    // draw after it finds fewer than the eight it needs and returns the range
+    // MINIMUM — so the size class was always 0, `len` was always 0 inside it,
+    // and `decode` was handed an empty slice on every input a seed can carry.
+    // The bias block below hung on a `smith.value(bool)` drawn in the same
+    // exhausted state, so it never ran either: nothing ever planted an
+    // EtherType, and random octets spell one at ~2^-16.
+    const drawn: usize = smith.slice(buf[0..fuzz_drawn]);
+    var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..drawn] };
+
     // A size class rather than one uniform draw: uniform over the whole range
     // would almost never land near `min_frame_len`, where the truncations are.
-    const len: usize = switch (smith.valueRangeAtMost(u8, 0, 5)) {
-        0 => smith.valueRangeAtMost(u16, 0, @intCast(fuzz_drawn)),
+    const len: usize = @min(switch (cur.ranged(0, 5)) {
+        0 => drawn, // exactly what the seed carried
         1 => min_frame_len + 1500,
         2 => min_frame_len + b_tag_len + 1500,
         3 => fuzz_max_frame, // jumbo
-        4 => smith.valueRangeAtMost(u16, 0, @intCast(fuzz_max_frame)),
-        else => smith.valueRangeAtMost(u16, @intCast(min_frame_len), @intCast(fuzz_max_frame)),
-    };
-    @memset(buf[fuzz_drawn..], smith.value(u8));
+        4 => cur.word(),
+        else => min_frame_len + cur.word(),
+    }, buf.len);
+    @memset(buf[drawn..], cur.byte());
 
     // Bias toward the deeper paths: sometimes plant a valid tag region so the
-    // fuzzer reaches the I-TCI/C-DA/C-SA parsing instead of bailing early.
-    if (len >= b_mac_len + 2 and smith.value(bool)) {
-        const et: u16 = if (smith.value(bool)) itag_ethertype else b_tpid;
+    // search reaches the I-TCI/C-DA/C-SA parsing instead of bailing early. Left
+    // as an option rather than made unconditional, because a seed that already
+    // carries a real EtherType must be able to reach `decode` unaltered.
+    if (len >= b_mac_len + 2 and cur.byte() & 1 == 1) {
+        const et: u16 = if (cur.byte() & 1 == 1) itag_ethertype else b_tpid;
         std.mem.writeInt(u16, buf[b_mac_len..][0..2], et, .big);
         if (et == b_tpid and len >= b_mac_len + b_tag_len + 2)
             std.mem.writeInt(u16, buf[b_mac_len + b_tag_len ..][0..2], itag_ethertype, .big);
@@ -1065,4 +1112,28 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     try testing.expect(@intFromPtr(dec.customer_data.ptr) >= @intFromPtr(&buf));
     try testing.expect(@intFromPtr(dec.customer_data.ptr) + dec.customer_data.len <=
         @intFromPtr(&buf) + len);
+}
+
+test "corpus: every seed reaches the decoder, and the counts are pinned" {
+    // Three numbers. `nonempty` is the reach claim. `decoded` says the corpus
+    // is not refusals only. `b_tagged` is the one neither an empty frame nor a
+    // minimum-length one can produce: the B-Tag is optional, so a corpus of
+    // untagged frames would decode perfectly and never enter the branch that
+    // has to distinguish 0x88A8 from 0x88E7 at the same offset.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var b_tagged: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [fuzz_drawn]u8 = undefined;
+        const drawn: usize = smith.slice(&buf);
+        if (drawn != 0) nonempty += 1;
+        if (decode(buf[0..drawn])) |dec| {
+            decoded += 1;
+            if (dec.fields.hasBTag()) b_tagged += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len - 1, nonempty); // the empty frame is deliberate
+    try testing.expectEqual(@as(usize, 3), decoded);
+    try testing.expectEqual(@as(usize, 2), b_tagged);
 }

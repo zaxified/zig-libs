@@ -1609,11 +1609,76 @@ const FuzzOp = enum {
     forward_core,
 };
 
+/// `testkit.fuzz`: `seedHex` for the op scripts and `Cursor` to read them.
+///
+/// ⚠ `check-fuzz-reach` called this target R1 because its first draw was
+/// `smith.valueRangeAtMost(u16, 0, 300)`, and the consequence was total: a
+/// ranged `Smith` draw reads eight octets as a little-endian u64 and returns
+/// the range MINIMUM unless the whole word lands inside the range, and after
+/// the first short read `Smith` discards the rest of the input. With no corpus
+/// at all, the one input this harness ever ran was empty — so `n_ops` was **0**
+/// and the loop body, i.e. the entire harness, never executed once. The caps it
+/// claims to press on, the `CoreIngressWasRelayed` invariant that is "F1's whole
+/// point", the quarantine interaction: none of it ran, ever.
+///
+/// The choices now come out of a `testkit.fuzz.Cursor` over one `smith.slice`
+/// draw, so a seed is a readable op script and the fuzzer still drives every
+/// choice under `--fuzz`, because it drives the slice.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seedHex;
+
+/// Op scripts. Each op consumes five octets: op selector, I-SID index, PE index,
+/// MAC index, and a time advance. A short script cycles rather than running out.
+const op_seeds = [_][]const u8{
+    // Fill one I-SID past every cap: four members and four MACs into I-SID 1,
+    // then forward from the access side.
+    seed("03" ++ "00" ++ "00" ++ "00" ++ "00" ++ "03" ++ "00" ++ "01" ++ "00" ++ "00" ++
+        "03" ++ "00" ++ "02" ++ "00" ++ "00" ++ "03" ++ "00" ++ "03" ++ "00" ++ "00" ++
+        "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "01" ++ "01" ++ "00" ++
+        "00" ++ "00" ++ "02" ++ "02" ++ "00" ++ "00" ++ "00" ++ "03" ++ "03" ++ "00" ++
+        "08" ++ "00" ++ "00" ++ "00" ++ "00" ++ "08" ++ "00" ++ "00" ++ "04" ++ "00"),
+    // Four I-SIDs against `max_isids` = 3, then a core-ingress forward on each:
+    // the split-horizon invariant, on a table that refused one of the adds.
+    seed("05" ++ "00" ++ "00" ++ "00" ++ "00" ++ "05" ++ "01" ++ "00" ++ "00" ++ "00" ++
+        "05" ++ "02" ++ "00" ++ "00" ++ "00" ++ "05" ++ "03" ++ "00" ++ "00" ++ "00" ++
+        "03" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++
+        "09" ++ "00" ++ "00" ++ "00" ++ "00" ++ "09" ++ "01" ++ "01" ++ "01" ++ "00" ++
+        "09" ++ "02" ++ "02" ++ "02" ++ "00" ++ "09" ++ "03" ++ "03" ++ "04" ++ "00"),
+    // The MAC-move / quarantine path: one MAC relearned from four different PEs
+    // inside the move window, then forwarded.
+    seed("03" ++ "00" ++ "00" ++ "00" ++ "00" ++ "03" ++ "00" ++ "01" ++ "00" ++ "00" ++
+        "03" ++ "00" ++ "02" ++ "00" ++ "00" ++
+        "00" ++ "00" ++ "00" ++ "00" ++ "01" ++ "00" ++ "00" ++ "01" ++ "00" ++ "01" ++
+        "00" ++ "00" ++ "02" ++ "00" ++ "01" ++ "00" ++ "00" ++ "00" ++ "00" ++ "01" ++
+        "00" ++ "00" ++ "01" ++ "00" ++ "01" ++ "08" ++ "00" ++ "00" ++ "00" ++ "01"),
+    // Aging and removal: learn, advance time past `aging_ticks`, tick, then
+    // remove the members and the I-SID under a forward.
+    seed("03" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++
+        "01" ++ "00" ++ "01" ++ "01" ++ "00" ++ "07" ++ "00" ++ "00" ++ "00" ++ "0A" ++
+        "07" ++ "00" ++ "00" ++ "00" ++ "0A" ++ "07" ++ "00" ++ "00" ++ "00" ++ "0A" ++
+        "02" ++ "00" ++ "00" ++ "00" ++ "00" ++ "04" ++ "00" ++ "00" ++ "00" ++ "00" ++
+        "06" ++ "00" ++ "00" ++ "00" ++ "00" ++ "08" ++ "00" ++ "00" ++ "00" ++ "00"),
+    // The degenerate script: every choice at its cursor minimum. This is
+    // EXACTLY what the collapsed harness ran — kept so the "before" stays
+    // executable rather than remembered.
+    seed(""),
+};
+
 test "fuzz: a random op stream never breaks a cap, never leaks, and a core frame never relays" {
-    try std.testing.fuzz({}, fuzzOps, .{});
+    try std.testing.fuzz({}, fuzzOps, .{ .corpus = &op_seeds });
 }
 
 fn fuzzOps(_: void, smith: *std.testing.Smith) !void {
+    var script: [256]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..n] };
+    _ = try driveOps(&cur);
+}
+
+/// The op stream itself, returned as the number of ops actually executed so a
+/// guard can pin it. Shared with the corpus guard below, so the guard drives the
+/// same code the harness does.
+fn driveOps(cur: *testkit.fuzz.Cursor) !usize {
     const gpa = testing.allocator;
     // Small caps and a small pool of IDs so a bounded op stream actually
     // presses on `TooManyIsids`/`TooManyMembers`/`FdbFull`/quarantine, not
@@ -1641,15 +1706,20 @@ fn fuzzOps(_: void, smith: *std.testing.Smith) !void {
     var out: [opts.max_pes_per_isid]PeId = undefined;
     var now: Time = 0;
 
-    const n_ops = smith.valueRangeAtMost(u16, 0, 300);
-    var i: u16 = 0;
+    // One op per five script octets, capped at 300 as before. An empty script
+    // yields zero ops, which is what the collapsed harness ran.
+    const n_ops: usize = @min(cur.bytes.len / 5, 300);
+    var executed: usize = 0;
+    var i: usize = 0;
     while (i < n_ops) : (i += 1) {
-        const isid = isid_pool[smith.index(isid_pool.len)];
-        const pe = pe_pool[smith.index(pe_pool.len)];
-        const mac = mac_pool[smith.index(mac_pool.len)];
-        now += smith.valueRangeAtMost(Time, 0, 10);
+        const op: FuzzOp = @enumFromInt(cur.ranged(0, @typeInfo(FuzzOp).@"enum".fields.len - 1));
+        const isid = isid_pool[cur.ranged(0, isid_pool.len - 1)];
+        const pe = pe_pool[cur.ranged(0, pe_pool.len - 1)];
+        const mac = mac_pool[cur.ranged(0, mac_pool.len - 1)];
+        now += cur.ranged(0, 10);
+        executed += 1;
 
-        switch (smith.value(FuzzOp)) {
+        switch (op) {
             .learn => _ = t.learn(isid, mac, pe, now) catch {},
             .learn_static => t.learnStatic(isid, mac, pe, now) catch {},
             .forget => _ = t.forget(isid, mac),
@@ -1678,6 +1748,33 @@ fn fuzzOps(_: void, smith: *std.testing.Smith) !void {
             if (t.fdbCount(check_isid) > opts.max_macs_per_isid) return error.FdbOverCap;
         }
     }
+    return executed;
+}
+
+test "corpus: every op script actually runs its ops, and the totals are pinned" {
+    // Two numbers, from the same `driveOps` the harness runs. `ops` is the
+    // reach claim and the discriminating one at once: the collapsed harness
+    // executed **zero** ops on the single empty input it ever ran, and returned
+    // cleanly, so "the fuzz target passed" said nothing whatsoever about the
+    // caps, the quarantine, or the core-ingress invariant. `scripts` pins that
+    // every non-degenerate seed contributes.
+    var ops: usize = 0;
+    var scripts: usize = 0;
+    for (op_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [256]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..n] };
+        const executed = try driveOps(&cur);
+        ops += executed;
+        if (executed != 0) scripts += 1;
+    }
+    try testing.expectEqual(@as(usize, 39), ops);
+    try testing.expectEqual(op_seeds.len - 1, scripts); // the degenerate script is deliberate
+
+    // The "before", executable rather than written in a comment.
+    var empty: testkit.fuzz.Cursor = .{ .bytes = "" };
+    try testing.expectEqual(@as(usize, 0), try driveOps(&empty));
 }
 
 test "external anchor: our MAC-move defaults are RFC 7432 §15.1's stated N and M" {

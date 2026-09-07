@@ -129,13 +129,20 @@ test "top-level decode dispatches by PDU type" {
 
 // ── fuzz target: the mandatory bounds-safety core ────────────────────────────
 
+/// `testkit.fuzz`: `seedHex` for the corpus below and `Cursor` for the bias's
+/// own two choices. A corpus entry is not the PDU — `Smith.slice` reads a
+/// little-endian u32 length first, so a raw frame would arrive minus its own
+/// discriminator and common header.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seedHex;
+
 test "fuzz: PDU/TLV decode never panics/OOBs/over-allocates on hostile bytes" {
     // Fuzzing is built into the toolchain (`zig build test --fuzz`); under a
     // plain `zig build test` this runs once as a smoke test (same convention as
     // l2encap / icmp). The decoder reads straight off an untrusted link, so this
     // drives arbitrary bytes and asserts only: never panics, every walk
     // terminates, and any value slice lies strictly within the input.
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 /// `sub` must lie entirely inside `input`. Checked as an offset and a length,
@@ -291,9 +298,18 @@ const modeled_shapes = [_]struct { type_byte: u8, fixed_len: u8, len_off: usize 
 /// fuzzer spends its draws on the body and the TLV region instead of on the
 /// header's equality checks. Everything past the fixed header — including the
 /// TLVs — stays whatever the fuzzer drew.
-fn biasToModeledPdu(buf: []u8, len: usize, smith: *std.testing.Smith) void {
-    const s = modeled_shapes[smith.valueRangeAtMost(u8, 0, modeled_shapes.len - 1)];
-    if (len < s.fixed_len) return;
+///
+/// ⚠ Driven by a `testkit.fuzz.Cursor` over the drawn bytes, not by further
+/// `Smith` draws. Both of the draws this used to make came AFTER
+/// `smith.bytes(&buf)` had eaten the input, so both returned their range
+/// minimum: the shape was always `modeled_shapes[0]` and the PDU Length was
+/// always `fixed_len` — an empty TLV region, in the harness whose whole purpose
+/// is walking the TLV region. Reading them out of the seed instead makes the
+/// choice reproducible from the seed, and under `--fuzz` the fuzzer still drives
+/// it because it drives the slice.
+fn biasToModeledPdu(buf: []u8, len: usize, cur: *testkit.fuzz.Cursor) bool {
+    const s = modeled_shapes[cur.ranged(0, modeled_shapes.len - 1)];
+    if (len < s.fixed_len) return false;
     buf[0] = header.discriminator;
     buf[1] = s.fixed_len; // Length Indicator — an equality, not a bound
     buf[2] = header.version;
@@ -302,33 +318,64 @@ fn biasToModeledPdu(buf: []u8, len: usize, smith: *std.testing.Smith) void {
     buf[5] = header.version;
     // PDU Length must land in [fixed_len, len]; a random u16 essentially never
     // does, which is the single load-bearing field the old bias omitted.
-    const pdu_len: u16 = smith.valueRangeAtMost(u16, s.fixed_len, @intCast(len));
+    const pdu_len: u16 = @intCast(cur.ranged(s.fixed_len, @intCast(len)));
     std.mem.writeInt(u16, buf[s.len_off..][0..2], pdu_len, .big);
+    return true;
 }
 
+/// Real IS-IS PDUs, in the format `Smith.slice` reads.
+///
+/// Every one is a capture-shaped frame from `goldens.zig` — the module's own
+/// reference PDUs — plus the refusals `decode` names. The largest is 66 octets,
+/// comfortably inside the 512-octet buffer (checked: a seed over the buffer
+/// reads back EMPTY, not truncated).
+///
+/// Uniform random octets have to spell `0x83` in byte 0, a Length Indicator
+/// that EQUALS the shape's fixed length in byte 1, and a PDU Length inside
+/// `[fixed_len, len]` — the module's own TEETH test records that two million
+/// coverage-guided runs crossed that never, which is why the goldens are here
+/// rather than left to the search.
+const decode_seeds = [_][]const u8{
+    seed("831401061101000303000000000001001E0025018101CC0104034900010606001B213C9DF8"), // L1 LAN IIH
+    seed("831B010612010003003C04B00000000000010000000000010000010104034900018101CC89046E6F646590100000030C0000001122330010C0000064"), // L1 LSP with SPB MT-Capability sub-TLVs
+    seed("831B01060F01000303000000000001001B002C40000000000001020104034900018101CC0606001B213C9DF8"), // P2P IIH
+    seed("83210106180100030033000000000001000000000000000000FFFFFFFFFFFFFFFF091004AE0000000000010000000000051234"), // L1 CSNP with an LSP-entry TLV
+    seed("831101061A010003002300000000000100091004AE0000000000010000000000051234"), // L1 PSNP
+    seed("831B010612010003004204B0000000000002000000000001000001010403490001020C000A8080800000000000030016110000000000030000000A06FA040A000001"), // LSP with extended IS reachability + sub-TLVs
+    seed("831B010612010003003C04B0000000000003000000000001000001901F0000011B80000000000000010000000080000010ABCD01C000000001010020"), // LSP with an SPB Instance / SPBM Service ID
+    seed("83210106190100030033000000000001000000000000000000FFFFFFFFFFFFFFFF091004AE0000000000010000000000051234"), // L2 CSNP
+    seed("831101061B010003002300000000000100091004AE0000000000010000000000051234"), // L2 PSNP
+    seed("DEADBEEF99"), // not an IS-IS PDU at all: the discriminator bail-out
+    seed("83"), // one octet: shorter than the common header
+    seed("831401061101000303000000000001001E0025"), // an IIH header with the TLV region cut off
+    seed(""), // the empty buffer
+};
+
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
-    const input = buf[0..len];
+    var buf: [512]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 on every input a seed can carry, and `walkTlvs` and
+    // `decode` were both handed an empty slice. Everything the TEETH test below
+    // proves about `biasToModeledPdu` was true and unreachable at the same time:
+    // the `smith.value(bool)` guarding it was drawn AFTER the exhausted input,
+    // so it was false and the bias never ran once outside `--fuzz`.
+    const len: usize = smith.slice(&buf);
+    driveInput(buf[0..len]);
 
-    // Bias toward valid-looking headers so deeper paths are exercised, not just
-    // the discriminator bail-out.
-    //
-    // ⚠ This block used to set bytes 0, 2 and 5 only, and it reached a decoded
-    // PDU body EXACTLY NEVER. Bytes 1 (Length Indicator), 3 (ID Length) and 4
-    // (PDU type + reserved bits) stayed random, so `checkCommon` refused every
-    // draw, and even past it the PDU-Length field is a random u16 that must
-    // land in `[fixed_len, len]`. Coverage feedback offers no gradient toward a
-    // 16-bit equality, so the search never crossed it: two million
-    // coverage-guided runs, zero bodies. Everything below `decode` — every
-    // fixed-offset body read, `tlvRegion`, and the whole `checksum.zig` surface
-    // added since — was unfuzzed while `check-fuzz` reported this module
-    // covered.
-    if (len >= 8 and smith.value(bool)) {
-        biasToModeledPdu(&buf, len, smith);
-    }
+    // The bias, as a second arm rather than a coin flip: a copy of the same
+    // bytes with a modeled header stamped over the front, so the corpus
+    // exercises the body decoders and the raw seed exercises the refusals.
+    var biased: [512]u8 = undefined;
+    @memcpy(biased[0..len], buf[0..len]);
+    var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..len] };
+    if (len >= 8) _ = biasToModeledPdu(biased[0..len], len, &cur);
+    driveInput(biased[0..len]);
+}
 
+/// Everything the harness asserts about one buffer of untrusted octets.
+fn driveInput(input: []const u8) void {
     // The raw TLV walk over the whole buffer must always be safe.
     walkTlvs(input, input);
 
@@ -352,6 +399,54 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         _ = pdu.checkLspChecksum(input) catch {};
     }
     walkTlvs(region, input);
+}
+
+test "corpus: every seed reaches the decoder, and the counts are pinned" {
+    // Four numbers. `nonempty` is the reach claim. `decoded` says the corpus is
+    // not refusals only. `tlv_bytes` is the one an empty input cannot produce
+    // and neither can a header-only PDU: `decode` accepts a PDU whose TLV region
+    // is empty, so counting acceptances alone would report health over a corpus
+    // that never entered `walkTlvs` on a body — which is the entire harness.
+    // `biased_stamped` is the fourth: how many seeds the bias arm actually
+    // stamps a modeled header over. It was **0** for the whole life of this
+    // harness — the `smith.value(bool)` gating the bias was drawn after the
+    // input had been consumed, so it was false every time.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var tlv_bytes: usize = 0;
+    var biased_stamped: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decode(buf[0..len])) |p| {
+            if (p != .other) {
+                decoded += 1;
+                tlv_bytes += switch (p) {
+                    .lan_hello => |x| x.tlv_bytes.len,
+                    .p2p_hello => |x| x.tlv_bytes.len,
+                    .lsp => |x| x.tlv_bytes.len,
+                    .csnp => |x| x.tlv_bytes.len,
+                    .psnp => |x| x.tlv_bytes.len,
+                    .other => 0,
+                };
+            }
+        } else |_| {}
+
+        var biased: [512]u8 = undefined;
+        @memcpy(biased[0..len], buf[0..len]);
+        var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..len] };
+        if (len >= 8 and biasToModeledPdu(biased[0..len], len, &cur)) {
+            biased_stamped += 1;
+            // A stamped header is a header `decode` accepts, by construction.
+            _ = try decode(biased[0..len]);
+        }
+    }
+    try std.testing.expectEqual(decode_seeds.len - 1, nonempty); // the empty seed is deliberate
+    try std.testing.expectEqual(@as(usize, 9), decoded);
+    try std.testing.expectEqual(@as(usize, 211), tlv_bytes);
+    try std.testing.expectEqual(@as(usize, 9), biased_stamped);
 }
 
 test "TEETH: the fuzz bias actually reaches a decoded PDU body" {
@@ -381,11 +476,11 @@ test "TEETH: the fuzz bias actually reaches a decoded PDU body" {
         var buf: [128]u8 = undefined;
         rand.bytes(&buf);
         const len: usize = rand.intRangeAtMost(usize, 8, buf.len);
-        // Fresh, generously sized input for the bias's own two draws only.
-        var seed: [64]u8 = undefined;
-        rand.bytes(&seed);
-        var smith: std.testing.Smith = .{ .in = &seed };
-        biasToModeledPdu(&buf, len, &smith);
+        // Fresh, generously sized script for the bias's own two choices only.
+        var script: [64]u8 = undefined;
+        rand.bytes(&script);
+        var cur: testkit.fuzz.Cursor = .{ .bytes = &script };
+        _ = biasToModeledPdu(&buf, len, &cur);
         const p = decode(buf[0..len]) catch continue;
         if (p != .other) seen += 1;
     }

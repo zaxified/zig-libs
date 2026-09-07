@@ -1658,11 +1658,45 @@ test "the two-way-check toggle is not a field of the public Options struct" {
 // clamp — the harness panics in seconds on an input carrying a zero-metric
 // extended-IS-reachability entry.
 
-fn fuzzComputeOverLsdb(_: void, smith: *testing.Smith) anyerror!void {
-    const gpa = testing.allocator;
-    var input_buf: [256]u8 = undefined;
-    smith.bytes(&input_buf);
-    const input: []const u8 = input_buf[0..smith.valueRangeAtMost(u16, 0, input_buf.len)];
+/// `testkit.fuzz.seedHex`. A corpus entry is not the TLV region: `Smith.slice`
+/// reads a little-endian u32 length first, so a raw region would arrive minus
+/// its own first TLV header.
+const seed = @import("testkit").fuzz.seedHex;
+
+/// One Extended IS Reachability (#22) TLV naming `nbr` with `metric`, as the
+/// hex the module's own `addExtendedIsReach` emits: code, length, a 7-octet
+/// neighbour id (system id + pseudonode octet), a 24-bit metric, and a
+/// zero sub-TLV length.
+fn extReach(comptime nbr: []const u8, comptime metric: []const u8) []const u8 {
+    return "160B" ++ "0000000000" ++ nbr ++ "00" ++ metric ++ "00";
+}
+
+/// LSP TLV regions, in the format `Smith.slice` reads.
+///
+/// The harness stamps the SAME region into two LSPs (originators 0xA and 0xB),
+/// so a region naming BOTH of them is what makes the two-way check succeed —
+/// a region naming only its neighbour is asymmetric by construction here. That
+/// is why the first seed carries two TLVs.
+///
+/// Uniform random octets essentially never spell TLV #22 with a length that is
+/// a multiple of 11 and agrees with the region, so without these the SPF ran
+/// over a graph with no edges at all.
+const spf_seeds = [_][]const u8{
+    seed(extReach("0A", "00000A") ++ extReach("0B", "00000A")), // a two-way A↔B link, metric 10
+    seed(extReach("0A", "000001") ++ extReach("0B", "FFFFFE") ++ extReach("0C", "000005")), // three neighbours, one at the metric ceiling's edge
+    seed(extReach("0A", "FFFFFF") ++ extReach("0B", "FFFFFF")), // max_link_metric: excluded outright (RFC 5305 §3)
+    seed(extReach("0B", "00000A")), // names only 0xB: no two-way pair, so no route
+    seed("160C" ++ "0000000000" ++ "0A" ++ "00" ++ "00000A" ++ "0000"), // a length one octet past the 11-octet record
+    seed("16FF" ++ "0000000000" ++ "0A" ++ "00" ++ "00000A" ++ "00"), // a TLV length that lies about the region
+    seed("831B010614010003001B0384AABBCCDDEEFF0703800000070000D7"), // a whole LSP as the region: the front door, not the traversal
+    seed("DEADBEEF"), // four octets that are not a TLV
+    seed(""), // the empty region
+};
+
+/// Everything the harness does with one buffer of untrusted octets. Shared with
+/// the corpus guard below, so the guard measures the harness's own corpus and
+/// not a paraphrase of it.
+fn driveSpf(gpa: std.mem.Allocator, input: []const u8) !usize {
     const local = sysId(0xA);
     var db = lsdb.Lsdb.init(gpa, cfgFor(local));
     defer db.deinit();
@@ -1691,19 +1725,65 @@ fn fuzzComputeOverLsdb(_: void, smith: *testing.Smith) anyerror!void {
     }
 
     // Both entry points, including the one with the extra failure mode.
+    var routes: usize = 0;
     var rt = compute(gpa, &db, local, 0) catch |e| switch (e) {
-        error.OutOfMemory => return,
+        error.OutOfMemory => return 0,
     };
+    routes = rt.routes.len;
     rt.deinit();
 
     var rt2 = computeWith(gpa, &db, local, 0, .{ .reject_asymmetric = true }) catch |e| switch (e) {
-        error.OutOfMemory, error.AsymmetricMetric, error.NodeIdTooLarge => return,
+        error.OutOfMemory, error.AsymmetricMetric, error.NodeIdTooLarge => return routes,
     };
     rt2.deinit();
+    return routes;
+}
+
+fn fuzzComputeOverLsdb(_: void, smith: *testing.Smith) anyerror!void {
+    var input_buf: [512]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so the region was ZERO octets long on every input a seed can carry. Both
+    // LSPs were built with an empty TLV region, the graph had no edges, and the
+    // SPF this harness exists to fuzz ran over nothing. The buffer is also
+    // raised 256 → 512, to match the region size the module's own
+    // `insertReachLsp` fixtures build into.
+    const len: usize = smith.slice(&input_buf);
+    _ = try driveSpf(testing.allocator, input_buf[0..len]);
 }
 
 test "fuzz: SPF over an LSDB fed arbitrary bytes never panics" {
-    try testing.fuzz({}, fuzzComputeOverLsdb, .{});
+    try testing.fuzz({}, fuzzComputeOverLsdb, .{ .corpus = &spf_seeds });
+}
+
+test "corpus: every SPF seed reaches the graph builder, and the route count is pinned" {
+    // Two numbers, built from the same `driveSpf` the harness runs. `nonempty`
+    // is the reach claim; `routes` is the one an empty region cannot produce.
+    // It has to be here: `compute` over an LSDB holding two LSPs with EMPTY TLV
+    // regions returns successfully every time — no error, no panic — so a guard
+    // that only asked whether the harness came back clean would have scored full
+    // marks while the shortest-path search had no edges to search.
+    var nonempty: usize = 0;
+    var routes: usize = 0;
+    var with_edges: usize = 0;
+    for (spf_seeds) |sd| {
+        var smith: testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const n = try driveSpf(testing.allocator, buf[0..len]);
+        routes += n;
+        if (n > 1) with_edges += 1; // more than the local self route
+    }
+    try testing.expectEqual(spf_seeds.len - 1, nonempty); // the empty region is deliberate
+    try testing.expectEqual(@as(usize, 8), routes);
+    try testing.expectEqual(@as(usize, 2), with_edges);
+
+    // The "before", executable rather than written in a comment: what the
+    // collapsed draw produced for EVERY seed, since it handed `driveSpf` a
+    // zero-length region no matter what the seed said.
+    try testing.expectEqual(@as(usize, 1), try driveSpf(testing.allocator, ""));
 }
 
 test "TEETH: an LSP whose Remaining Lifetime has aged to zero is excluded from SPF" {
