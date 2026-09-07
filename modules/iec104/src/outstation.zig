@@ -659,6 +659,11 @@ pub const Server = struct {
 
 const testing = std.testing;
 
+/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the ASDUs it
+/// is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// u32 length first (see `testkit/src/fuzz.zig`).
+const seed = @import("testkit").fuzz.seedHex;
+
 /// Collects reply ASDUs so a test can inspect them.
 pub const CollectSink = struct {
     buf: [8192]u8 = undefined,
@@ -1252,16 +1257,75 @@ test "outstation: hostile ASDUs produce typed errors, never a crash" {
     try testing.expectError(error.ImpossibleTime, o.handle(&hex("670106002f00000000cb9c120317001a"), s.sink()));
 }
 
+/// Requests for the outstation, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`). Every one is lifted from a value test above, so each names
+/// a command the outstation actually answers rather than a shape.
+///
+/// Uniform random octets reach `handle`'s command paths essentially never: the
+/// type id, the object count, the cause of transmission and the common address
+/// (47 here) all have to agree before a request is even dispatched.
+const handle_seeds = [_][]const u8{
+    seed("640106002f0000000014"), // C_IC_NA_1 general interrogation
+    seed("650106002f0000000005"), // C_CI_NA_1 counter interrogation
+    seed("2d0106002f002d010001"), // C_SC_NA_1 single command, direct execute
+    seed("2d0106002f002d010081"), // the same with the select bit set
+    seed("2d0108002f002d010001"), // select, cause = deactivation
+    seed("2e0108002f002e010002"), // C_DC_NA_1 double command
+    seed("c80106002f0000000000"), // an unmodelled type id: 200
+    seed("010106002f0065000001"), // M_SP_NA_1 arriving at an outstation
+    seed("640163002f0000000014"), // interrogation with an unexpected cause
+    seed("64010600630000000014"), // the right request at the WRONG common address (99)
+    seed("2d0106002f00e7030001"), // a command for an address the outstation does not own
+    seed("6401"), // ShortAsdu
+    seed("640206002f0000000014"), // ObjectCountMismatch: count says two, body holds one
+    seed("640006002f00"), // ZeroObjectCount
+    seed("670106002f00000000cb9c120317001a"), // C_CS_NA_1 with an impossible CP56Time2a
+};
+
 test "fuzz: the outstation never panics on arbitrary ASDU bytes" {
-    try std.testing.fuzz({}, fuzzHandle, .{});
+    try std.testing.fuzz({}, fuzzHandle, .{ .corpus = &handle_seeds });
 }
 
 fn fuzzHandle(_: void, smith: *std.testing.Smith) !void {
     var buf: [apci.max_asdu_len]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every seed and `handle` was called with an empty ASDU,
+    // which it refuses on its first line. The whole request dispatcher, the
+    // select/execute state machine and every reply path were unreachable from
+    // this harness. Measured 2026-09-07 over the corpus above: **0 of 15 seeds
+    // non-empty, 0 handled and 0 replies emitted before; 15 of 15 non-empty,
+    // 11 handled and 19 replies after.**
+    const len: usize = smith.slice(&buf);
     var points = demoPoints();
     var o = try Outstation.init(.{ .common_address = 47 }, &points);
     var s = CollectSink{};
     o.handle(buf[0..len], s.sink()) catch return;
+}
+
+test "corpus: every outstation seed reaches handle, and the replies are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `replies` is the second number and the one
+    // that matters here: `handle("")` returning an error looks like a working
+    // harness, and `handled` alone would still be satisfied by a corpus of
+    // requests the outstation accepts and answers with nothing.
+    var nonempty: usize = 0;
+    var handled: usize = 0;
+    var replies: usize = 0;
+    for (handle_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [apci.max_asdu_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var points = demoPoints();
+        var o = try Outstation.init(.{ .common_address = 47 }, &points);
+        var s = CollectSink{};
+        o.handle(buf[0..len], s.sink()) catch continue;
+        handled += 1;
+        replies += s.count;
+    }
+    try testing.expectEqual(handle_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 11), handled);
+    try testing.expectEqual(@as(usize, 19), replies);
 }
