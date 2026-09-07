@@ -1709,9 +1709,9 @@ fn fuzzClassify(_: void, smith: *std.testing.Smith) !void {
     _ = classify(info) catch return;
 }
 
-/// A byte cursor over one corpus seed, which is what drives `fuzzPoint`.
+/// `testkit.fuzz.Cursor` over one corpus seed, which is what drives `fuzzPoint`.
 ///
-/// ⚠ This exists because `fuzzPoint` used to take every choice from a ranged
+/// ⚠ It is here because `fuzzPoint` used to take every choice from a ranged
 /// `Smith` draw, and its FIRST draw was one — `check-fuzz-reach` classifies
 /// that R1. A scalar draw reads eight octets as a little-endian `u64` and
 /// returns the range MINIMUM unless the whole word falls inside the range, so
@@ -1721,32 +1721,7 @@ fn fuzzClassify(_: void, smith: *std.testing.Smith) !void {
 /// because a state machine driven by a byte script has an obvious byte-first
 /// form: one `smith.slice`, then the octets say what happens. It also makes a
 /// seed reviewable, which a sequence of `u64` words is not.
-///
-/// A short script cycles rather than running out, so a four-octet seed is a
-/// repeating pattern instead of 28 rounds of the range minimum.
-const Script = struct {
-    bytes: []const u8,
-    at: usize = 0,
-
-    fn byte(self: *Script) u8 {
-        if (self.bytes.len == 0) return 0;
-        const b = self.bytes[self.at % self.bytes.len];
-        self.at += 1;
-        return b;
-    }
-
-    fn word(self: *Script) u16 {
-        const hi: u16 = self.byte();
-        const lo: u16 = self.byte();
-        return (hi << 8) | lo;
-    }
-
-    /// `at_least`..`at_most` inclusive. `u32` arithmetic so a full-width span
-    /// does not overflow the way `at_most - at_least + 1` does in `u8`.
-    fn ranged(self: *Script, at_least: u32, at_most: u32) u32 {
-        return at_least + @as(u32, self.byte()) % (at_most - at_least + 1);
-    }
-};
+const Script = @import("testkit").fuzz.Cursor;
 
 /// What a script did to the point, so the guard below can measure a corpus
 /// rather than assert it merely ran.

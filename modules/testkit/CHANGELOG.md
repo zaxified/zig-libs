@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`fuzz.Cursor`: how a *structured* harness reads a corpus
+  seed.** `seed`/`seedHex`/`seedInto` serve a harness that decodes a frame;
+  `check-fuzz-reach`'s R1 class is the other kind — state machines and
+  generators, where every choice comes from `smith.valueRangeAtMost` and there
+  is no byte string to be faithful to. Outside `--fuzz` those collapse
+  completely: a scalar draw returns the range MINIMUM unless its whole
+  eight-octet word falls inside the range, and after the first short read
+  `Smith` discards the rest of the input, so every later draw is the minimum
+  too. Measured on `iec61850/control.fuzzPoint`: the one input it ever ran gave
+  `ctl_model = status_only`, both timeouts 0 and branch 0 for all 32 rounds —
+  0 accepted outcomes, 32 identical refusals. `Cursor` reads those choices out
+  of one `smith.slice` instead, which satisfies the gate honestly and makes a
+  seed a reviewable script. A short script cycles rather than running out, and
+  the **empty** script reads as all zeroes, which reproduces the collapsed
+  harness exactly — so a corpus guard can pin the "before" number instead of
+  claiming it.
+
 - **2026-09-07** — **`fuzz.seed` / `fuzz.seedHex` / `fuzz.seedInto`.** A
   `std.testing.fuzz` corpus entry is not the frame you want the harness to see:
   `Smith.slice` reads a little-endian `u32` length first, so a raw frame arrives

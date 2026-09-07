@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`reporting`: the last two R1 harnesses, restructured rather
+  than exempted.** `fuzzRcbWrite` opened with the buffered/unbuffered choice and
+  `fuzzReassemble` with the data-set member count. A ranged first draw returns
+  the range MINIMUM outside `--fuzz`, and once one draw comes up short `Smith`
+  **discards the rest of the input**, so every later choice collapsed too.
+  `fuzzReassemble` was the worse of the two: one member of one octet against a
+  zero PDU budget, and every round's drop decision 0 — meaning every segment
+  dropped, so the reassembler under test was **never handed a segment at all**.
+  That is pinned in the guard rather than asserted: the empty script reproduces
+  the old draws exactly and scores **1 segment emitted, 0 pushed**. The eight
+  seeded scripts score **11 emitted, 6 pushed, 4 reports completed**.
+  `fuzzRcbWrite` now reads the block kind off the seed's first octet and the
+  attribute index off its length: 14 of 14 seeds non-empty, **12 decoded, 2 ok,
+  5 denied, 5 invalid** — where the collapse produced an empty slice and no
+  write at all.
+
 - **2026-09-07** — **`logging`, `scl`, `server` and `settinggroups`: six more
   harnesses fed, and one of them could never have taken this module's own
   reference document.** All six had the `smith.bytes` + ranged-length collapse
