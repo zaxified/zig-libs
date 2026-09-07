@@ -1323,14 +1323,103 @@ test "garbage frames never panic" {
 // this drives the same boundary (plus the PDU response parsers) through
 // `std.testing.fuzz` for corpus-guided coverage instead of a fixed seed.
 
+// ⚠ And it never decoded one. The harness opened `smith.bytes(&buf)` and
+// then drew the length with `smith.valueRangeAtMost`; `bytes` consumes
+// `@min(buf.len, in.len)` octets and a ranged draw reads EIGHT more as a
+// little-endian `u64`, returning the range MINIMUM when fewer remain, so the
+// length was 0 for every input a corpus can carry — and the target had no
+// corpus, so the one input it ever ran was empty. Both `decodeAdu`s answered
+// `error.ShortFrame` on their first line and all four PDU response parsers
+// were handed a zero-length slice. Measured 2026-09-07: 1 round, 0 frames
+// decoded, 0 registers or bits parsed. The "corpus-guided coverage" this
+// target was added for needed a corpus, and there was none.
+
+/// `testkit.fuzz.seedHex`, aliased so the corpus reads as the wire frames it
+/// is — hex, because that is how a Modbus capture is quoted. A corpus entry
+/// is not the frame: `Smith.slice` reads a little-endian `u32` length first.
+const seedHex = @import("testkit").fuzz.seedHex;
+
+/// Real Modbus frames, in the format the length draw reads. Random bytes
+/// essentially never satisfy the MBAP length field (`len_field + 6 ==
+/// frame.len`) or an RTU CRC-16, so without these seeds neither decoder gets
+/// past its first check — which is what the "not just the parse itself" claim
+/// above needed and did not have.
+const adu_seeds = [_][]const u8{
+    // ── MBAP/TCP requests: the length field agrees, so the decode succeeds ──
+    seedHex("00010000000605030000000a"), // read holding registers, 10 of them
+    seedHex("00020000000605010000000a"), // read coils
+    seedHex("0003000000060506ffc00042"), // write single register, at the 16-bit wrap boundary
+    seedHex("0004000000090510ffc000010200ff"), // write multiple registers
+    seedHex("0005000000020507"), // read exception status: the shortest legal TCP ADU
+    seedHex("00070000000d0517ffc00001ffc0000102000f"), // read/write multiple (0x17)
+    seedHex("00010001000605030000000a"), // protocol id 0x0001 → ProtocolIdMismatch
+    seedHex("00010000000705030000000a"), // length field one too large → LengthMismatch
+    // ── RTU frames: the CRC-16 is the gate ──
+    seedHex("05030000000ac449"), // read holding registers, CRC correct
+    seedHex("0506ffc000423857"), // write single register, CRC correct
+    seedHex("0583028130"), // an exception reply (fc | 0x80), CRC correct
+    seedHex("05030000000ac44a"), // the same frame with the CRC low octet wrong → BadCrc
+    // ── PDU responses, which the four parsers below are the real target of ──
+    seedHex("03fa000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9"), // ⭐ read-holding response sized for the harness's own [125]u16 out slice: byte count 250
+    seedHex("0108ff0fff0fff0fff0f"), // ⭐ read-coils response sized for the harness's own [64]bool: byte count 8
+    seedHex("03140000000000000000000000000000000000000000"), // a byte count of 20 against a 125-register out slice → MalformedResponse
+    seedHex("0102ff0f"), // the same mismatch on the bit parser
+    seedHex("0600010002"), // write-single echo matching the (1, 2) the parser is told to expect
+    seedHex("1000010002"), // write-multiple echo, same
+    seedHex("8302"), // an exception PDU: fc 0x03 | 0x80, code 0x02
+    seedHex(""), // zero length: the ONLY input this target ever ran
+};
+
 test "fuzz: tcp/rtu decodeAdu and PDU response parsers never panic" {
-    try testing.fuzz({}, fuzzDecodeAdu, .{});
+    try testing.fuzz({}, fuzzDecodeAdu, .{ .corpus = &adu_seeds });
+}
+
+test "corpus: every frame seed reaches both decoders, and what decodes is pinned" {
+    // ⭐ The measurement, executable. `pdu_octets` is the second number and it
+    // is the load-bearing one: an empty frame is refused by everything here,
+    // so "it did not panic" was satisfied by the collapsed harness on its
+    // single run. PDU octets carved out of a framed ADU cannot come from an
+    // empty input.
+    var nonempty: usize = 0;
+    var tcp_ok: usize = 0;
+    var rtu_ok: usize = 0;
+    var pdu_octets: usize = 0;
+    var responses: usize = 0;
+    for (adu_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [300]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const bytes = buf[0..len];
+
+        if (tcp.decodeAdu(bytes)) |f| {
+            tcp_ok += 1;
+            pdu_octets += f.pdu.len;
+        } else |_| {}
+        if (rtu.decodeAdu(bytes)) |f| {
+            rtu_ok += 1;
+            pdu_octets += f.pdu.len;
+        } else |_| {}
+
+        var regs: [125]u16 = undefined;
+        var bits: [64]bool = undefined;
+        if (pdu.parseReadRegistersResponse(bytes, .read_holding_registers, &regs)) |_| responses += 1 else |_| {}
+        if (pdu.parseReadBitsResponse(bytes, .read_coils, &bits)) |_| responses += 1 else |_| {}
+        if (pdu.parseWriteSingleResponse(bytes, .write_single_register, 1, 2)) |_| responses += 1 else |_| {}
+        if (pdu.parseWriteMultipleResponse(bytes, .write_multiple_registers, 1, 2)) |_| responses += 1 else |_| {}
+    }
+    // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 frames decoded.
+    try testing.expectEqual(adu_seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 6), tcp_ok);
+    try testing.expectEqual(@as(usize, 3), rtu_ok);
+    try testing.expectEqual(@as(usize, 48), pdu_octets);
+    try testing.expectEqual(@as(usize, 4), responses); // the two correctly-sized read responses plus the two write echoes
 }
 
 fn fuzzDecodeAdu(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
     var buf: [300]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
 
     _ = tcp.decodeAdu(bytes) catch {};

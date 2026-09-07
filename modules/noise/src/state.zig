@@ -1312,10 +1312,86 @@ test "HandshakeState: identity-point remote static key is rejected (invalid-poin
     try testing.expectError(error.DhFailed, ini.writeMessage(random, "", &m));
 }
 
+// ⚠ And it never read a message. The harness opened `smith.bytes(&msg)` and
+// then drew the length with `smith.valueRangeAtMost`; `bytes` consumes
+// `@min(msg.len, in.len)` octets and a ranged draw reads EIGHT more as a
+// little-endian `u64`, returning the range MINIMUM when fewer remain, so the
+// length was 0 for every input a corpus can carry — and the target had no
+// corpus, so the one input it ever ran was empty. `readMessage("")` fails on
+// the `e` token's length check before a single byte of transcript is mixed.
+// Measured 2026-09-07: 1 round, 0 non-empty inputs, 0 payload octets
+// recovered, 0 handshake messages accepted.
+
+/// The corpus, built at run time: the only genuine NN message-1 this module
+/// owns comes out of its own `writeMessage`, and a hand-pasted 32-octet
+/// ephemeral would be a fabricated anchor rather than one the encoder
+/// produces.
+///
+/// ⭐ The harness and the guard below both build it from HERE.
+const ReadCorpus = struct {
+    const cap = 256;
+
+    stores: [7][4 + cap]u8 = undefined,
+    entries: [7][]const u8 = undefined,
+
+    fn build(self: *ReadCorpus) ![]const []const u8 {
+        const kit = @import("testkit").fuzz;
+        const S = TestSuite;
+        var prng = std.Random.DefaultPrng.init(0x0f0f_1234);
+
+        // A real NN message 1, from an initiator initialized exactly the way
+        // the harness's responder is: `e || payload`, no AEAD yet, which is
+        // why the responder accepts it without knowing the initiator.
+        var ini: S.HandshakeState = .{};
+        ini.initialize(patterns.NN, true, "", null, null, null, null, &.{});
+        var m: [cap]u8 = undefined;
+        const step = try ini.writeMessage(prng.random(), "hello noise", &m);
+        const real = m[0..step.len];
+
+        var t: [cap]u8 = undefined;
+        var n: usize = 0;
+
+        // 0: the genuine message, payload and all.
+        self.entries[n] = kit.seedInto(&self.stores[n], real);
+        n += 1;
+        // 1: the same ephemeral with an EMPTY payload — the shortest message
+        //    the responder accepts, which is `DHLEN` octets exactly.
+        self.entries[n] = kit.seedInto(&self.stores[n], real[0..S.DHLEN]);
+        n += 1;
+        // 2: one octet short of `DHLEN` — the `e` token's length refusal.
+        self.entries[n] = kit.seedInto(&self.stores[n], real[0 .. S.DHLEN - 1]);
+        n += 1;
+        // 3: the ephemeral replaced by the all-zero point. NN message 1 has no
+        //    DH token, so this is accepted here and only bites later — which
+        //    is the interesting half.
+        @memcpy(t[0..real.len], real);
+        @memset(t[0..S.DHLEN], 0);
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..real.len]);
+        n += 1;
+        // 4: the ephemeral with every octet set.
+        @memcpy(t[0..real.len], real);
+        @memset(t[0..S.DHLEN], 0xFF);
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..real.len]);
+        n += 1;
+        // 5: a 256-octet message — the buffer exactly, and `out` is the same
+        //    size, so this is where an off-by-one in the payload copy shows.
+        @memcpy(t[0..real.len], real);
+        @memset(t[real.len..cap], 'p');
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..cap]);
+        n += 1;
+        // 6: the empty message, which is what an empty corpus produced.
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..0]);
+        n += 1;
+
+        std.debug.assert(n == self.entries.len);
+        return &self.entries;
+    }
+};
+
 fn fuzzReadMessage(_: void, smith: *std.testing.Smith) !void {
-    var msg: [256]u8 = undefined;
-    smith.bytes(&msg);
-    const len: usize = smith.valueRangeAtMost(u16, 0, msg.len);
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
+    var msg: [ReadCorpus.cap]u8 = undefined;
+    const len: usize = smith.slice(&msg);
     const S = TestSuite;
     var rsp: S.HandshakeState = .{};
     rsp.initialize(patterns.NN, false, "", null, null, null, null, &.{});
@@ -1327,5 +1403,37 @@ fn fuzzReadMessage(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: HandshakeState.readMessage never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzReadMessage, .{});
+    var corpus: ReadCorpus = .{};
+    try testing.fuzz({}, fuzzReadMessage, .{ .corpus = try corpus.build() });
+}
+
+test "corpus: every handshake seed reaches readMessage, and the payload recovered is pinned" {
+    // ⭐ The measurement, executable. `payload_octets` is the second number
+    // and it is the load-bearing one: a message of exactly `DHLEN` octets is
+    // ACCEPTED with a zero-length payload, so "accepted > 0" would say nothing
+    // about whether any payload ever crossed the boundary. Payload octets
+    // copied into `out` cannot come from an empty input.
+    var corpus: ReadCorpus = .{};
+    const seeds = try corpus.build();
+
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var payload_octets: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var msg: [ReadCorpus.cap]u8 = undefined;
+        const len: usize = smith.slice(&msg);
+        if (len != 0) nonempty += 1;
+        const S = TestSuite;
+        var rsp: S.HandshakeState = .{};
+        rsp.initialize(patterns.NN, false, "", null, null, null, null, &.{});
+        var out: [256]u8 = undefined;
+        const step = rsp.readMessage(msg[0..len], &out) catch continue;
+        accepted += 1;
+        payload_octets += step.len;
+    }
+    // Measured 2026-09-07. Before: 1 round, `readMessage("")`, 0 accepted.
+    try testing.expectEqual(seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 5), accepted); // all but the DHLEN-1 truncation and the empty seed
+    try testing.expectEqual(@as(usize, 257), payload_octets); // 11 + 0 + 11 + 11 + 224
 }

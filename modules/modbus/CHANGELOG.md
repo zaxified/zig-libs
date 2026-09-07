@@ -5,6 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: neither fuzz target ever handled a frame. `fuzzDecodeAdu`
+  opened `smith.bytes(&buf)` and then drew the length with `smith.valueRangeAtMost`;
+  `bytes` consumes `@min(buf.len, in.len)` octets and a ranged draw reads EIGHT more as a
+  little-endian `u64`, returning the range MINIMUM when fewer remain, so the length was 0
+  — and with no corpus the one input it ever ran was empty, so both `decodeAdu`s answered
+  `ShortFrame` on their first line and all four PDU response parsers got a zero-length
+  slice. `fuzzServer` was worse: its FIRST draw was `smith.value(bool)`, the framing
+  choice, so the `.tcp` arm was **never once constructed**, `len` was 0, the "half the
+  budget goes to PDUs that start with a real function code" branch never ran (its gate is
+  `len > 0`), and `handlePdu("")` was the whole target. Measured 2026-09-07: 1 round
+  each, 0 frames decoded, 0 function codes dispatched. Both now draw byte-first with one
+  `smith.slice`. `fuzzServer` has no knobs left at all — every input runs through BOTH
+  framings, which is more coverage than the coin flip could give, and the function codes
+  are written down in a corpus of 19 request PDUs instead of drawn after the bytes were
+  eaten. `fuzzDecodeAdu` carries 20 real frames: MBAP requests whose length field agrees
+  (and two where it does not), RTU frames with a correct CRC-16 (and one without), and
+  response PDUs sized to the harness's own `[125]u16` / `[64]bool` out slices — ⚠ the
+  smaller response seeds written first were refused with `MalformedResponse`, because
+  those parsers demand `payload[0] == 2 * out.len`. ⚠ The server guard pins reply octets,
+  not "it answered": `handlePdu("")` returns a legal two-octet exception reply, so the
+  harness's own `reply.len >= 2` assertion was true throughout. Pinned: 6 TCP / 3 RTU
+  decodes over 48 PDU octets and 4 response parses; 512 reply octets and 12 exception
+  replies across both framings.
+
 - **2026-09-02** — **Audit (drift campaign): 2 MEDIUM, 2 LOW.** ⭐ No live memory-safety or
   wrong-answer defect was reachable from the wire: every wire-driven index, byte count and
   quantity in `server.zig` is bounded correctly, and coil packing was checked against an

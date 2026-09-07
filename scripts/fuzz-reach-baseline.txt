@@ -31,11 +31,9 @@ mcp 2
 mcp-http 1
 megolm 2
 minisign 2
-modbus 2
 montint 2
 musig2 1
 netconf 3
-noise 1
 ocsp 2
 ocspcache 2
 opcua 1

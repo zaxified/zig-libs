@@ -1525,18 +1525,119 @@ test "fuzz: structurally valid requests with wire-controlled fields never panic"
 // reach and that writes to a process image — would never be explored by the
 // coverage-guided sweep.
 
+// ⚠ And it never handled a PDU. `fuzzServer` opened `smith.value(bool)` — the
+// framing choice — as its FIRST draw. A `Smith` scalar draw reads eight octets
+// as a little-endian `u64` and returns the range minimum when fewer remain,
+// and the target had no corpus, so outside `--fuzz` the one input it ever ran
+// was empty: the framing was always `.rtu`, `smith.bytes` then a ranged length
+// gave `len` = 0, the "half the budget goes to PDUs that start with a real
+// function code" branch never ran (its gate is `len > 0`), and
+// `handlePdu("")` was the entire target. Measured 2026-09-07: 1 round, 0
+// octets, 0 function codes dispatched, the `.tcp` arm never once constructed.
+//
+// Both knobs are gone. The framing is no longer drawn at all — every input
+// now runs through BOTH framings, which is more coverage than the coin flip
+// could give and removes a choice the ordinary lane always lost. The function
+// code comes from the corpus, where it is written down and reviewable, rather
+// than from `smith.index` after the bytes were consumed.
+
+/// `testkit.fuzz.seedHex`, aliased so the corpus reads as the request PDUs it
+/// is. A corpus entry is not the PDU: `Smith.slice` reads a little-endian
+/// `u32` length first.
+const seedHexServer = @import("testkit").fuzz.seedHex;
+
+/// Request PDUs, in the format the length draw reads — one per function code
+/// the dispatch table knows, aimed at the address ranges this server is
+/// configured with (coils at 0, discrete inputs at 10, holding registers at
+/// 0xFFC0 so `addr + quantity` wraps a narrow type, input registers at 1000).
+const server_seeds = [_][]const u8{
+    seedHexServer("010000000a"), // read coils, in range
+    seedHexServer("02000a000a"), // read discrete inputs, at their base
+    seedHexServer("03ffc00010"), // read holding registers, the whole 64 at the wrap boundary
+    seedHexServer("03ffc00040"), // ⭐ addr + quantity wraps 16 bits exactly
+    seedHexServer("03ffff0002"), // and one that runs off the end of the address space
+    seedHexServer("0403e80010"), // read input registers
+    seedHexServer("050000ff00"), // write single coil, the ON encoding
+    seedHexServer("0500001234"), // write single coil with an illegal value
+    seedHexServer("06ffc00042"), // write single register
+    seedHexServer("07"), // read exception status: a PDU with no data at all
+    seedHexServer("08000000ff"), // diagnostics, echo sub-function
+    seedHexServer("0f000000080102"), // write multiple coils
+    seedHexServer("10ffc000010200ff"), // write multiple registers
+    seedHexServer("11"), // report slave id
+    seedHexServer("17ffc00001ffc0000102000f"), // read/write multiple registers
+    seedHexServer("6300"), // an unknown function code → IllegalFunction
+    seedHexServer("03ffc0"), // a truncated request: the length checks
+    seedHexServer("03"), // a bare function code
+    seedHexServer(""), // zero length: the ONLY input this target ever ran
+};
+
 test "fuzz: the server never panics and always answers or stays silent" {
-    try testing.fuzz({}, fuzzServer, .{});
+    try testing.fuzz({}, fuzzServer, .{ .corpus = &server_seeds });
+}
+
+test "corpus: every request seed reaches the dispatch table, and the replies are pinned" {
+    // ⭐ The measurement, executable. `reply_octets` is the second number and
+    // it is the load-bearing one: `handlePdu("")` returns a two-octet
+    // exception reply, so "it answered" and "reply.len >= 2" were both TRUE
+    // for the collapsed harness on every run. Reply octets summed over real
+    // requests cannot be produced by an empty PDU.
+    var nonempty: usize = 0;
+    var reply_octets: usize = 0;
+    var exceptions: usize = 0;
+    for (server_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var frame: [300]u8 = undefined;
+        const len: usize = smith.slice(&frame);
+        if (len != 0) nonempty += 1;
+        for ([_]mb.Framing{ .tcp, .rtu }) |framing| {
+            var coils = [_]bool{false} ** 64;
+            var discretes = [_]bool{false} ** 64;
+            var holdings = [_]u16{0} ** 64;
+            var inputs = [_]u16{0} ** 64;
+            var server = Server.init(.{
+                .unit_id = 5,
+                .framing = framing,
+                .exception_status = 0x11,
+                .slave_id = "fuzz",
+            }, .{
+                .coils = .{ .base = 0, .values = &coils },
+                .discrete_inputs = .{ .base = 10, .values = &discretes },
+                .holding_registers = .{ .base = 0xFFC0, .values = &holdings },
+                .input_registers = .{ .base = 1000, .values = &inputs },
+            });
+            var pdu_out: [mb.max_pdu_len]u8 = undefined;
+            const reply = try server.handlePdu(frame[0..len], &pdu_out);
+            reply_octets += reply.len;
+            if (reply[0] & 0x80 != 0) exceptions += 1;
+        }
+    }
+    // Measured 2026-09-07. Before: 1 round, `handlePdu("")`, `.rtu` only.
+    try testing.expectEqual(server_seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 512), reply_octets);
+    try testing.expectEqual(@as(usize, 12), exceptions);
 }
 
 fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ ONE byte-first draw, and no knobs at all: see the block comment above
+    // for what the two that were here cost this target.
+    var frame: [300]u8 = undefined;
+    const len: usize = smith.slice(&frame);
+    const bytes = frame[0..len];
+
+    // Both framings on every input, rather than a coin flip the ordinary lane
+    // always lost.
+    for ([_]mb.Framing{ .tcp, .rtu }) |framing| try fuzzServerOnce(framing, bytes);
+}
+
+fn fuzzServerOnce(framing: mb.Framing, bytes: []const u8) !void {
     var coils = [_]bool{false} ** 64;
     var discretes = [_]bool{false} ** 64;
     var holdings = [_]u16{0} ** 64;
     var inputs = [_]u16{0} ** 64;
     var server = Server.init(.{
         .unit_id = 5,
-        .framing = if (smith.value(bool)) .tcp else .rtu,
+        .framing = framing,
         .exception_status = 0x11,
         .slave_id = "fuzz",
     }, .{
@@ -1548,23 +1649,10 @@ fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
         .input_registers = .{ .base = 1000, .values = &inputs },
     });
 
-    var frame: [300]u8 = undefined;
-    smith.bytes(&frame);
-    const len: usize = smith.valueRangeAtMost(u16, 0, frame.len);
-    const bytes = frame[0..len];
-
-    // Half the budget goes to PDUs that start with a real function code, so
-    // the fuzzer spends its time inside the handlers rather than bouncing off
-    // the dispatch table.
-    if (len > 0 and smith.value(bool)) {
-        const fcs = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0F, 0x10, 0x11, 0x17 };
-        frame[0] = fcs[smith.index(fcs.len)];
-    }
-
     var pdu_out: [mb.max_pdu_len]u8 = undefined;
     const reply = try server.handlePdu(bytes, &pdu_out);
     try testing.expect(reply.len >= 2 and reply.len <= mb.max_pdu_len);
-    if (len > 0) {
+    if (bytes.len > 0) {
         try testing.expect(reply[0] == bytes[0] or reply[0] == bytes[0] | 0x80);
     }
 
