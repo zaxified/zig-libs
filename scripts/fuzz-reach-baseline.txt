@@ -49,7 +49,6 @@ psbt 1
 qrscan 2
 quic-crypto 1
 rawsock 3
-rdap 2
 rescue 1
 ripemd160 1
 saml 2
