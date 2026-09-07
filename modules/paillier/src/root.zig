@@ -1732,11 +1732,51 @@ test "smoke: module compiles and constants are sane" {
 // BEFORE `Modulus.fromBytes`/`Fe.fromBytes` ever run -- unlike the
 // sibling k256/p256/bls12_381 group modules' fixed-size-array `fromBytes`,
 // these take variable-length `[]const u8` directly, so the length-bound
-// check itself is in-scope here. `smith.bytes` biased toward lengths at/
-// over the `modulus_bytes`/`modulus_sq_bytes` boundary, mixed with leading
-// zero runs (exercises `stripLeadingZeros`) and fully random content.
+// check itself is in-scope here.
+//
+// ⚠ Every field draw used to go through `fuzzedFieldBytes`, which opened with
+// `smith.bytes(buf)` and then took its length from a ranged draw. A ranged
+// draw reads eight input octets as a little-endian u64 and returns the range
+// MINIMUM when fewer remain, and `bytes` had already eaten the input — so the
+// length was 0 for EVERY field on every input. With no corpus either, the
+// three targets ran exactly one call each, for ever: `PublicKey.fromBytes("",
+// null)`, `SecretKey.fromBytes("", "", "")`, `Ciphertext.fromBytes(pk, "")`.
+// The first two are refused by the `n_bytes.len == 0` check on the first line,
+// so neither `Modulus.fromBytes` nor `stripLeadingZeros`' interesting cases
+// were ever reached.
+//
+// ⛔ Two of the biases the old helper existed for were dead for a second,
+// independent reason: they hung on knobs drawn AFTER the byte draw, so the
+// input was exhausted and `smith.value(bool)` was false every time. The
+// leading-zero run never happened once, and — in `fuzzPublicKeyFromBytes` —
+// `g_bytes` was `null` on every single run, so the explicit-generator branch
+// of `PublicKey.fromBytes` had never executed. No corpus could have fixed
+// that one; the harness had to change shape.
+//
+// Both biases are now carried by the SEED, which is reproducible where a knob
+// is not: the boundary lengths are seeds of exactly those lengths (computed by
+// the same `boundaryLen` the old knob used), a leading-zero run is a seed with
+// leading zeros, and an empty `g` frame means "standard generator".
+
+const testkit = @import("testkit");
+
+/// Several length-prefixed frames back to back, which is what a multi-field
+/// harness draws: `Smith.slice` reads a little-endian u32 length and then the
+/// bytes, and consecutive draws walk one seed in order. A `SecretKey` seed is
+/// therefore three frames — `n ‖ lambda ‖ mu`.
+fn seedFields(out: []u8, frames: []const []const u8) []const u8 {
+    var at: usize = 0;
+    for (frames) |f| {
+        _ = testkit.fuzz.seedInto(out[at..], f);
+        at += 4 + f.len;
+    }
+    return out[0..at];
+}
+
 test "fuzz: PublicKey.fromBytes never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzPublicKeyFromBytes, .{});
+    var corpus: Corpus = .{};
+    try corpus.build();
+    try testing.fuzz({}, fuzzPublicKeyFromBytes, .{ .corpus = corpus.public_seeds() });
 }
 
 // ⚠ This helper is the HARNESS, and it was the thing that crashed -- twice --
@@ -1753,18 +1793,11 @@ test "fuzz: PublicKey.fromBytes never panics on arbitrary bytes" {
 // fuzz coverage while the sweep records a FINDING -- worse than a red test,
 // because it looks like the library was exercised and found wanting.
 fn fuzzedFieldBytes(smith: *std.testing.Smith, buf: []u8) []const u8 {
-    smith.bytes(buf);
-    // Occasionally force a run of leading zeros (stripLeadingZeros path).
-    if (smith.value(bool)) {
-        const n_zeros: usize = @min(buf.len, smith.valueRangeAtMost(u16, 0, 512));
-        @memset(buf[0..n_zeros], 0);
-    }
-    // Bias length toward at/over the modulus_bytes boundary as well as
-    // fully random.
-    const len: usize = if (smith.value(bool))
-        boundaryLen(buf.len, smith.valueRangeAtMost(u8, 0, 8))
-    else
-        @min(buf.len, smith.valueRangeAtMost(u16, 0, 65535));
+    // ⚠ One `smith.slice`, never `smith.bytes` followed by a ranged length.
+    // The two length biases this helper used to compute itself now live in the
+    // corpus (see `Corpus` below), where they are reproducible from the seed
+    // instead of coming out of a draw the replay lane cannot make.
+    const len: usize = smith.slice(buf);
     return buf[0..len];
 }
 
@@ -1774,6 +1807,10 @@ fn fuzzedFieldBytes(smith: *std.testing.Smith, buf: []u8) []const u8 {
 /// reliably reach it: restoring the overflow left the harness test green,
 /// which made it a toothless test rather than a redundant fix. Exhaustive over
 /// `r` below instead -- eight values, no randomness, no ambiguity.
+///
+/// Still live: the harness no longer computes a length, but `Corpus` uses this
+/// to size the seeds that straddle the `modulus_bytes` bound, so the same
+/// arithmetic is still exercised and still guarded.
 fn boundaryLen(buf_len: usize, r: u8) usize {
     // `modulus_bytes - 4` is 252 at 2048 bits, so `+ r` overflowed when this
     // was u8 arithmetic. Widen BEFORE adding; `@min` afterwards cannot undo an
@@ -1799,7 +1836,7 @@ test "fuzzedFieldBytes stays in bounds for the largest buffer it is given" {
     // range bounds -- so a harness helper needs a test like any other code.
     //
     // `Smith{ .in = null }` only works under `builtin.fuzz`; outside it the
-    // byte source must be supplied, or `smith.bytes` hits `unreachable`. That
+    // byte source must be supplied, or `smith.slice` hits `unreachable`. That
     // cost a red test before this comment existed.
     var seed: [4096]u8 = undefined;
     for (&seed, 0..) |*b, k| b.* = @truncate(k *% 131 +% 7);
@@ -1812,18 +1849,206 @@ test "fuzzedFieldBytes stays in bounds for the largest buffer it is given" {
     }
 }
 
+/// The corpus for all three byte-loaders.
+///
+/// ⛔ Arbitrary bytes are not the problem here — every one of these parsers
+/// takes raw big-endian integers, so a drawn buffer IS a plausible `n`. What
+/// no draw produces is the STRUCTURE: a `lambda` canonical mod `n²` beside a
+/// `mu` canonical mod `n` for the same `n`, or a ciphertext below `n²`. Those
+/// come from a real key this module generates (512 bits, the size its own
+/// every-run keygen test uses) rather than from literals.
+///
+/// ⭐ Each harness and its guard build the corpus from HERE, so the guard
+/// measures the same seeds the harness gets.
+const Corpus = struct {
+    /// A run of leading zeros in front of the real `n`: the `stripLeadingZeros`
+    /// path, which the old harness gated on a knob drawn after the byte draw
+    /// and therefore never once executed.
+    const zero_run = 8;
+
+    n: [modulus_bytes]u8 = undefined,
+    n_len: usize = 0,
+    padded_n: [zero_run + modulus_bytes]u8 = undefined,
+    lambda: [modulus_sq_bytes]u8 = undefined,
+    mu: [modulus_bytes]u8 = undefined,
+    g: [modulus_sq_bytes]u8 = undefined,
+    ct: [modulus_sq_bytes]u8 = undefined,
+    /// `0xff` repeated: an odd, full-width value `Modulus.fromBytes` accepts,
+    /// used for the seeds that straddle the `modulus_bytes` length bound.
+    ff: [modulus_bytes + 16]u8 = @splat(0xff),
+
+    pub_store: [17][4 + modulus_bytes + 16 + 4 + modulus_sq_bytes + 16]u8 = undefined,
+    pub_entries: [17][]const u8 = undefined,
+    sec_store: [12][4 + modulus_bytes + 16 + 4 + modulus_sq_bytes + 16 + 4 + modulus_bytes + 16]u8 = undefined,
+    sec_entries: [12][]const u8 = undefined,
+    ct_store: [8][4 + modulus_sq_bytes + 16]u8 = undefined,
+    ct_entries: [8][]const u8 = undefined,
+
+    fn build(self: *Corpus) !void {
+        // A real 512-bit key: `n`, its `g`, and the `lambda`/`mu` pair. These
+        // are the only structurally valid triples in the corpus, and nothing
+        // drawn from bytes would ever be one.
+        var prng = std.Random.DefaultPrng.init(0x66757a7a); // "fuzz"
+        const random = prng.random();
+        const kp = try generate(random, 512);
+        self.n_len = kp.public.nByteLen();
+        try kp.public.nToBytes(self.n[0..self.n_len]);
+        try kp.public.gToBytes(&self.g);
+        try kp.secret.lambdaToBytes(&self.lambda);
+        try kp.secret.muToBytes(&self.mu);
+        @memset(self.padded_n[0..zero_run], 0);
+        @memcpy(self.padded_n[zero_run..][0..self.n_len], self.n[0..self.n_len]);
+
+        const m = try Fe.fromPrimitive(u64, kp.public.n_sq, 0xdeadbeef12345678);
+        const c = try encryptRandom(kp.public, m, random);
+        try c.toBytes(&self.ct);
+
+        const real_n = self.n[0..self.n_len];
+        const padded = self.padded_n[0 .. zero_run + self.n_len];
+
+        // ── PublicKey: `n ‖ g`, where an EMPTY g frame means "standard
+        //    generator g = n+1". The old harness chose that with a bool drawn
+        //    after the byte draw, so `g` was null on every run and the
+        //    explicit-generator branch had never executed.
+        var p: usize = 0;
+        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ real_n, "" });
+        p += 1; // real key, standard g
+        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ real_n, &self.g });
+        p += 1; // real key, its own explicit g
+        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ padded, "" });
+        p += 1; // stripLeadingZeros
+        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ &kat_n, "" });
+        p += 1; // the toy KAT modulus
+        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ &kat_n, &kat_g });
+        p += 1; // toy, explicit g
+        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ real_n, &self.ff });
+        p += 1; // g far above n², refused
+        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ &[_]u8{0} ** 8, "" });
+        p += 1; // all-zero n strips to empty, refused
+        // The length bound, straddled: `boundaryLen` gives 252..260, and
+        // `modulus_bytes` is 256, so the first five are accepted and the last
+        // four refused. This is the bias the dead knob was written for, now
+        // reproducible from a seed.
+        for (0..9) |r| {
+            const len = boundaryLen(self.ff.len, @intCast(r));
+            self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ self.ff[0..len], "" });
+            p += 1;
+        }
+        // The one input this target actually ran, for ever.
+        self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ "", "" });
+        p += 1;
+        std.debug.assert(p == self.pub_entries.len);
+
+        // ── SecretKey: `n ‖ lambda ‖ mu`.
+        var s: usize = 0;
+        self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ real_n, &self.lambda, &self.mu });
+        s += 1; // the real triple
+        self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ padded, &self.lambda, &self.mu });
+        s += 1; // stripLeadingZeros on n
+        self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ &kat_n, &kat_lambda, &kat_mu });
+        s += 1; // the toy KAT triple
+        self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ real_n, &self.lambda, &self.ff });
+        s += 1; // mu far above n, non-canonical
+        self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ real_n, &self.ff, &self.mu });
+        s += 1; // lambda far above n²
+        self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ real_n, "", "" });
+        s += 1; // both secrets empty
+        self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ "", &self.lambda, &self.mu });
+        s += 1; // empty n, refused on the first line
+        for (0..4) |k| {
+            const len = boundaryLen(self.ff.len, @intCast(k * 3));
+            self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ self.ff[0..len], &self.lambda, &self.mu });
+            s += 1;
+        }
+        self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ "", "", "" });
+        s += 1; // the one input this target actually ran
+        std.debug.assert(s == self.sec_entries.len);
+
+        // ── Ciphertext, against the toy KAT key (n² = 34969) the harness
+        //    fixes, so the seeds are about the ciphertext and not the key.
+        var c_i: usize = 0;
+        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{&[_]u8{ 0x88, 0x98 }});
+        c_i += 1; // n²-1 = 34968, the largest canonical value
+        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{&[_]u8{ 0x88, 0x99 }});
+        c_i += 1; // n² exactly: non-canonical, refused
+        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{&[_]u8{ 0x00, 0x00, 0x00, 0x2a }});
+        c_i += 1; // 42 behind three leading zeros
+        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{&[_]u8{0x01}});
+        c_i += 1; // 1
+        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{&self.ct});
+        c_i += 1; // a REAL ciphertext, far above n²_toy — refused, but only
+        //          after `stripLeadingZeros` and the full `Fe.fromBytes` walk
+        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &self.ff_frame());
+        c_i += 1; // 272 octets of 0xff
+        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{&[_]u8{0} ** 16});
+        c_i += 1; // all zeros: strips to empty
+        self.ct_entries[c_i] = seedFields(&self.ct_store[c_i], &.{""});
+        c_i += 1; // the one input this target actually ran
+        std.debug.assert(c_i == self.ct_entries.len);
+    }
+
+    fn ff_frame(self: *const Corpus) [1][]const u8 {
+        return .{&self.ff};
+    }
+
+    fn public_seeds(self: *const Corpus) []const []const u8 {
+        return &self.pub_entries;
+    }
+    fn secret_seeds(self: *const Corpus) []const []const u8 {
+        return &self.sec_entries;
+    }
+    fn ciphertext_seeds(self: *const Corpus) []const []const u8 {
+        return &self.ct_entries;
+    }
+};
+
 fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     var n_buf: [modulus_bytes + 16]u8 = undefined;
     const n_bytes = fuzzedFieldBytes(smith, &n_buf);
 
     var g_buf: [modulus_sq_bytes + 16]u8 = undefined;
-    const g_bytes: ?[]const u8 = if (smith.value(bool)) fuzzedFieldBytes(smith, &g_buf) else null;
+    // ⛔ This used to be `if (smith.value(bool)) … else null`, with the bool
+    // drawn AFTER the byte draw — so on every replay the input was exhausted,
+    // the bool was false, and `PublicKey.fromBytes`'s explicit-generator
+    // branch had never run. The choice belongs to the SEED: an empty second
+    // frame means the standard generator `g = n+1`.
+    const g_frame = fuzzedFieldBytes(smith, &g_buf);
+    const g_bytes: ?[]const u8 = if (g_frame.len == 0) null else g_frame;
 
     _ = PublicKey.fromBytes(n_bytes, g_bytes) catch return;
 }
 
+test "corpus: the PublicKey seeds reach the parser, and the counts are pinned" {
+    // The second number is `explicit_g`: keys accepted through the branch that
+    // takes `g` from the input. It was structurally 0 — not "rarely reached",
+    // but never once — because the branch hung on a knob the replay lane
+    // cannot draw. An accepted count could not have said so.
+    var corpus: Corpus = .{};
+    try corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var explicit_g: usize = 0;
+    for (corpus.public_seeds()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var n_buf: [modulus_bytes + 16]u8 = undefined;
+        const n_bytes = fuzzedFieldBytes(&smith, &n_buf);
+        var g_buf: [modulus_sq_bytes + 16]u8 = undefined;
+        const g_frame = fuzzedFieldBytes(&smith, &g_buf);
+        if (n_bytes.len != 0) nonempty += 1;
+        const g_bytes: ?[]const u8 = if (g_frame.len == 0) null else g_frame;
+        _ = PublicKey.fromBytes(n_bytes, g_bytes) catch continue;
+        accepted += 1;
+        if (g_bytes != null) explicit_g += 1;
+    }
+    try testing.expectEqual(corpus.public_seeds().len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 10), accepted);
+    try testing.expectEqual(@as(usize, 2), explicit_g);
+}
+
 test "fuzz: SecretKey.fromBytes never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzSecretKeyFromBytes, .{});
+    var corpus: Corpus = .{};
+    try corpus.build();
+    try testing.fuzz({}, fuzzSecretKeyFromBytes, .{ .corpus = corpus.secret_seeds() });
 }
 
 fn fuzzSecretKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
@@ -1838,8 +2063,47 @@ fn fuzzSecretKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     sk.deinit();
 }
 
+test "corpus: the SecretKey seeds reach the parser, and the counts are pinned" {
+    // The second number is the count of DISTINCT `n` bit-lengths that came
+    // back out. It only moves when a seed's own octets reach `Modulus.fromBytes`
+    // — the empty input, which is all this target ever ran, produces none.
+    var corpus: Corpus = .{};
+    try corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var widths: [8]usize = undefined;
+    var n_widths: usize = 0;
+    for (corpus.secret_seeds()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var n_buf: [modulus_bytes + 16]u8 = undefined;
+        const n_bytes = fuzzedFieldBytes(&smith, &n_buf);
+        var lambda_buf: [modulus_sq_bytes + 16]u8 = undefined;
+        const lambda_bytes = fuzzedFieldBytes(&smith, &lambda_buf);
+        var mu_buf: [modulus_bytes + 16]u8 = undefined;
+        const mu_bytes = fuzzedFieldBytes(&smith, &mu_buf);
+        if (n_bytes.len != 0) nonempty += 1;
+        var sk = SecretKey.fromBytes(n_bytes, lambda_bytes, mu_bytes) catch continue;
+        defer sk.deinit();
+        accepted += 1;
+        const bits = sk.n.bits();
+        for (widths[0..n_widths]) |w| {
+            if (w == bits) break;
+        } else {
+            widths[n_widths] = bits;
+            n_widths += 1;
+        }
+    }
+    // Two seeds carry an empty `n`: the one that is empty only in `n`, and the
+    // all-empty seed this target used to run for ever.
+    try testing.expectEqual(corpus.secret_seeds().len - 2, nonempty);
+    try testing.expectEqual(@as(usize, 6), accepted);
+    try testing.expectEqual(@as(usize, 4), n_widths);
+}
+
 test "fuzz: Ciphertext.fromBytes never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzCiphertextFromBytes, .{});
+    var corpus: Corpus = .{};
+    try corpus.build();
+    try testing.fuzz({}, fuzzCiphertextFromBytes, .{ .corpus = corpus.ciphertext_seeds() });
 }
 
 fn fuzzCiphertextFromBytes(_: void, smith: *std.testing.Smith) !void {
@@ -1851,4 +2115,31 @@ fn fuzzCiphertextFromBytes(_: void, smith: *std.testing.Smith) !void {
     var buf: [modulus_sq_bytes + 16]u8 = undefined;
     const bytes = fuzzedFieldBytes(smith, &buf);
     _ = Ciphertext.fromBytes(pk, bytes) catch return;
+}
+
+test "corpus: the Ciphertext seeds reach the parser, and the counts are pinned" {
+    // ⛔ `accepted` is not the number to watch: `stripLeadingZeros("")` is
+    // `""` and `Fe.fromBytes` reads that as zero, so the empty input this
+    // target ran for ever is ACCEPTED. `nonzero` is what the empty input
+    // cannot produce.
+    var corpus: Corpus = .{};
+    try corpus.build();
+    const pk = try PublicKey.fromBytes(&kat_n, null);
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var nonzero: usize = 0;
+    for (corpus.ciphertext_seeds()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [modulus_sq_bytes + 16]u8 = undefined;
+        const bytes = fuzzedFieldBytes(&smith, &buf);
+        if (bytes.len != 0) nonempty += 1;
+        const ct = Ciphertext.fromBytes(pk, bytes) catch continue;
+        accepted += 1;
+        var out: [modulus_sq_bytes]u8 = undefined;
+        try ct.toBytes(&out);
+        if (!std.mem.allEqual(u8, &out, 0)) nonzero += 1;
+    }
+    try testing.expectEqual(corpus.ciphertext_seeds().len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 3), nonzero);
 }
