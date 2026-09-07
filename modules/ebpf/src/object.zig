@@ -2554,3 +2554,215 @@ test "LIVE: .rodata is created, seeded and frozen" {
     // Frozen: a userspace write must now fail.
     try testing.expectError(error.PermissionDenied, BPF.map_update_elem(fd, &key, &value, 0));
 }
+
+// ── fuzz: the module's documented untrusted-input entry point ───────────────
+//
+// ⭐ There was no fuzz target in this file at all until 2026-09-07, and
+// `check-fuzz-reach` never said so: that gate judges the DRAW of the targets
+// that exist, and a parser with no harness is invisible to it. `open()` is
+// this module's documented untrusted-input entry point ("Parse an object
+// already in memory"), it needs no privilege, and it is where the CRITICAL
+// two tests up lived — a symbol whose `st_size` came straight off the wire,
+// summed into a bound that wrapped, and reached a `@memcpy` of 2^64-8 bytes:
+// an out-of-bounds WRITE in ReleaseFast. `elfsym.fuzzOpenImage` stops one
+// layer below this, at the section table; nothing fuzzed the symbol walk,
+// the map-definition decode or the relocation walk that sit on top of it.
+
+/// Whole `.o` images for `fuzzOpenObject`, in the format `Smith.slice` reads
+/// (see `testkit.fuzz`): a little-endian u32 length, then the object.
+///
+/// The seven fixtures are real clang output; the hostile variants are built
+/// here by the same patches the `hostile:` tests above apply, because the
+/// fields they poison — one `st_size` inside a symbol table, one `sh_size` in
+/// a section header — are eight octets in a 4 KiB file that random mutation
+/// reaches essentially never.
+const ObjectCorpus = struct {
+    store: [262144]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ObjectCorpus, img: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], img);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *ObjectCorpus, gpa: std.mem.Allocator) ![]const []const u8 {
+        // Every real object this module owns: a bare XDP program, a hash map,
+        // `.rodata`, a ringbuf map, a legacy map definition, CO-RE
+        // relocations, and two programs in one file.
+        self.push(fx_xdp_pass);
+        self.push(fx_kprobe_hash);
+        self.push(fx_rodata_const);
+        self.push(fx_ringbuf_map);
+        self.push(fx_legacy_map);
+        self.push(fx_core_reloc);
+        self.push(fx_two_progs);
+
+        // ⭐ The CRITICAL, as a seed: `st_value = 8` with
+        // `st_size = 0xFFFF_FFFF_FFFF_FFF8`, a multiple of 8 so the alignment
+        // check passes, whose sum with the offset wraps to 0.
+        const overflow = try gpa.dupe(u8, fx_xdp_pass);
+        defer gpa.free(overflow);
+        patchSymbolSizes(overflow, 8, 0xFFFF_FFFF_FFFF_FFF8);
+        self.push(overflow);
+
+        // ⭐ A symbol size that is a multiple of FOUR but not eight, and
+        // small enough to stay inside its section — so the alignment check is
+        // the ONLY thing in front of it. What follows if it passes is an
+        // `alloc` of `size / 8` instructions and a `@memcpy` of `size` octets:
+        // 8 bytes allocated, 12 written. Weakening `% 8` to `% 4` survives any
+        // corpus whose sizes are odd, or big enough that the range check
+        // catches them first — both of which the obvious seed is.
+        const misaligned = try gpa.dupe(u8, fx_xdp_pass);
+        defer gpa.free(misaligned);
+        patchSymbolSizes(misaligned, 0, 12);
+        self.push(misaligned);
+
+        // The neighbouring refusal: an instruction section whose `sh_size` is
+        // not a multiple of 8.
+        const unaligned = try gpa.dupe(u8, fx_xdp_pass);
+        defer gpa.free(unaligned);
+        if (patchXdpSectionSize(gpa, unaligned, 0x11)) {
+            self.push(unaligned);
+        } else |_| {}
+
+        // Truncated to half: the section table survives the header but the
+        // data it points at does not.
+        self.push(fx_xdp_pass[0 .. fx_xdp_pass.len / 2]);
+
+        return self.entries[0..self.n];
+    }
+
+    /// Set every `STT_FUNC` symbol's `st_value` to `value` and its `st_size`
+    /// to `size`, in place. The same walk the `hostile:` test does.
+    fn patchSymbolSizes(img: []u8, value: u64, size: u64) void {
+        const shoff = std.mem.readInt(u64, img[40..48], .little);
+        const shent = std.mem.readInt(u16, img[58..60], .little);
+        const shnum = std.mem.readInt(u16, img[60..62], .little);
+        var i: u16 = 0;
+        while (i < shnum) : (i += 1) {
+            const at: usize = @intCast(shoff + @as(u64, i) * shent);
+            if (std.mem.readInt(u32, img[at + 4 ..][0..4], .little) != 2) continue; // SHT_SYMTAB
+            const sym_off = std.mem.readInt(u64, img[at + 24 ..][0..8], .little);
+            const sym_size = std.mem.readInt(u64, img[at + 32 ..][0..8], .little);
+            const sym_ent = std.mem.readInt(u64, img[at + 56 ..][0..8], .little);
+            if (sym_ent == 0) return;
+            var j: u64 = 0;
+            while (j < sym_size / sym_ent) : (j += 1) {
+                const so: usize = @intCast(sym_off + j * sym_ent);
+                if (img[so + 4] & 0xf != 2) continue; // STT_FUNC
+                std.mem.writeInt(u64, img[so + 8 ..][0..8], value, .little);
+                std.mem.writeInt(u64, img[so + 16 ..][0..8], size, .little);
+            }
+            return;
+        }
+    }
+
+    fn patchXdpSectionSize(gpa: std.mem.Allocator, img: []u8, size: u64) !void {
+        var image = try elfsym.openImage(gpa, img, false);
+        defer image.deinit();
+        const xdp = image.findSection("xdp") orelse return error.NoXdpSection;
+        const shoff = std.mem.readInt(u64, img[40..48], .little);
+        const shent = std.mem.readInt(u16, img[58..60], .little);
+        const at: usize = @intCast(shoff + @as(u64, xdp) * shent + 32);
+        std.mem.writeInt(u64, img[at..][0..8], size, .little);
+    }
+};
+
+/// What one object yielded. Shared by the fuzz target and its corpus guard so
+/// the guard drives the SAME walk.
+const ObjectTally = struct {
+    programs: usize = 0,
+    maps: usize = 0,
+    insns: usize = 0,
+    relos: usize = 0,
+};
+
+fn walkObject(gpa: std.mem.Allocator, bytes: []const u8, opts: OpenOptions) ?ObjectTally {
+    var obj = open(gpa, bytes, opts) catch return null;
+    defer obj.deinit();
+    var t: ObjectTally = .{};
+    t.programs = obj.programs.len;
+    t.maps = obj.maps.len;
+    for (obj.programs) |*p| {
+        t.insns += p.insns.len;
+        t.relos += p.relos.len;
+        // The pure half of loading: resolve every map reference and apply
+        // whatever CO-RE relocations the object carries against its own BTF.
+        relocateProgram(p, obj.maps) catch {};
+        if (obj.btf) |*b| _ = applyCoreRelos(p, b, b) catch {};
+    }
+    fixupDatasecs(&obj) catch {};
+    std.mem.doNotOptimizeAway(obj.license.len);
+    std.mem.doNotOptimizeAway(obj.kern_version);
+    std.mem.doNotOptimizeAway(obj.unknown_sections.len);
+    return t;
+}
+
+test "fuzz: open never panics on a hostile BPF object" {
+    var corpus: ObjectCorpus = .{};
+    try testing.fuzz({}, fuzzOpenObject, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+fn fuzzOpenObject(_: void, smith: *std.testing.Smith) !void {
+    // 32768: the largest fixture here is 5.8 KiB and a fuzzer may grow it. A
+    // seed longer than the buffer is not a big seed — `Smith.slice` reads it
+    // back as the EMPTY one, silently, which is how a corpus of real objects
+    // would have turned into a corpus of nothing.
+    var buf: [32768]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    // `require_bpf_machine` travels in the seed's tail rather than being a
+    // draw made after the input is spent, which would pin it to `false`
+    // forever — it is the one option `open` has and it gates a refusal.
+    const strict = smith.value(u64) & 1 != 0;
+    std.mem.doNotOptimizeAway(walkObject(testing.allocator, buf[0..len], .{
+        .require_bpf_machine = strict,
+    }));
+}
+
+test "corpus: every object seed reaches open, and the parsed counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkObject`.
+    //
+    // ⛔ `opened` alone would not be a guard: an ELF with no BPF sections in
+    // it opens fine and yields nothing, so a corpus of empty objects would
+    // score full marks. `programs`, `maps`, `insns` and `relos` count work the
+    // empty input cannot do — and `insns` in particular is the number that
+    // walks through the range arithmetic the CRITICAL lived in.
+    var corpus: ObjectCorpus = .{};
+    const gpa = testing.allocator;
+    const entries = try corpus.build(gpa);
+    var nonempty: usize = 0;
+    var opened: usize = 0;
+    var total: ObjectTally = .{};
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [32768]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (walkObject(gpa, buf[0..len], .{})) |t| {
+            opened += 1;
+            total.programs += t.programs;
+            total.maps += t.maps;
+            total.insns += t.insns;
+            total.relos += t.relos;
+        }
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 7), opened);
+    try testing.expectEqual(@as(usize, 9), total.programs);
+    try testing.expectEqual(@as(usize, 5), total.maps);
+    try testing.expectEqual(@as(usize, 81), total.insns);
+    try testing.expectEqual(@as(usize, 7), total.relos);
+
+    // ⭐ Non-vacuity, and the point of the whole target: the seed carrying the
+    // wrapping `st_size` really does reach the range check and is refused
+    // there. Before the fix this exact input was an out-of-bounds `@memcpy`.
+    const overflow = try gpa.dupe(u8, fx_xdp_pass);
+    defer gpa.free(overflow);
+    ObjectCorpus.patchSymbolSizes(overflow, 8, 0xFFFF_FFFF_FFFF_FFF8);
+    try testing.expectError(error.MalformedElf, open(gpa, overflow, .{}));
+}

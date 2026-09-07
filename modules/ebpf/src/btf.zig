@@ -1519,33 +1519,159 @@ const Synth = struct {
 // walk and every per-kind accessor instead of bouncing off `NotBtf` on the
 // first two magic bytes, then truncate and/or flip bytes.
 
+/// `.BTF` blobs for `fuzzParse`, laid out the way its draws read them: a
+/// `testkit.fuzz` slice seed (u32 length + blob) and then an eight-octet
+/// little-endian word carrying the type id the accessors are asked about.
+///
+/// ⭐ Built at run time from this file's own `Synth` fixture rather than
+/// quoted as hex: a BTF header is a run of native-endian u32 offset/length
+/// pairs, so a hex corpus would be a little-endian one and the counts pinned
+/// below would be false on a big-endian target instead of failing there.
+///
+/// ⛔ The id word is not decoration. `byId`, `resolve` and `sizeOf` all take a
+/// type id, and it used to be drawn with `smith.value(u32)` — a draw made
+/// after the input was already spent, so it read **0 on every seed**. Id 0 is
+/// the void pseudo-type: `byId(0)` returns null before any accessor runs, so
+/// `member`, `param`, `varSecInfo`, `str`, `resolve` and `sizeOf` — the six
+/// functions this harness exists to exercise — were never called at all.
+const BtfCorpus = struct {
+    store: [65536]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    ids: [10]u32 = undefined,
+    n: usize = 0,
+
+    fn push(self: *BtfCorpus, blob: []const u8, id: u32) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], blob);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], id, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.ids[self.n] = id;
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    fn build(self: *BtfCorpus, gpa: std.mem.Allocator) ![]const []const u8 {
+        const good = try Synth.good(gpa);
+        defer gpa.free(good);
+
+        // The complete blob, asked about four different ids: a composite
+        // (whose `member` walk runs), an int (`sizeOf`/`resolve` both land),
+        // the last type it emits, and one past the end (`byId`'s bound).
+        self.push(good, 4);
+        self.push(good, 1);
+        self.push(good, 20);
+        self.push(good, 0xffff_ffff);
+
+        // Truncations at the boundaries `parse` checks in order: shorter than
+        // the 8-octet magic probe, a header with no type section behind it,
+        // and half a type section.
+        self.push(good[0..4], 1);
+        self.push(good[0..@min(good.len, 24)], 1);
+        self.push(good[0 .. good.len / 2], 4);
+
+        // Header fields poisoned one at a time, in a copy of the good blob.
+        // These are the fields this file's own doc says must be checked in
+        // u64 so they cannot wrap; a byte flipped at random in a blob this
+        // size reaches them roughly never.
+        const poisoned = try gpa.dupe(u8, good);
+        defer gpa.free(poisoned);
+        if (poisoned.len >= 24) {
+            std.mem.writeInt(u32, poisoned[16..20], 0xffff_fff8, native_endian); // type_len
+            self.push(poisoned, 4);
+            @memcpy(poisoned, good);
+            std.mem.writeInt(u32, poisoned[20..24], 0xffff_fff8, native_endian); // str_off
+            self.push(poisoned, 4);
+            @memcpy(poisoned, good);
+            poisoned[0] = 0; // a wrong magic with a whole blob behind it
+            self.push(poisoned, 4);
+        }
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: parse never panics on a truncated/mutated synthetic BTF blob" {
-    try testing.fuzz({}, fuzzParse, .{});
+    var corpus: BtfCorpus = .{};
+    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+test "corpus: every BTF seed reaches the parser, and the accessor counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently.
+    //
+    // ⛔ `accessors` is the second number, and it is the one that matters
+    // here: `parsed` alone would not have noticed the collapsed id, because
+    // the blob can parse perfectly while `byId(0)` returns null and the six
+    // accessors this harness exists to drive are never entered. `ids` pins
+    // that the id word arrived as written.
+    var corpus: BtfCorpus = .{};
+    const gpa = testing.allocator;
+    const entries = try corpus.build(gpa);
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var accessors: usize = 0;
+    var ids: usize = 0;
+    for (entries, corpus.ids[0..corpus.n]) |sd, want_id| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [8192]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const id: u32 = @truncate(smith.value(u64));
+        if (id == want_id) ids += 1;
+        var b = parse(gpa, buf[0..len], .{}) catch continue;
+        defer b.deinit();
+        parsed += 1;
+        if (b.byId(id) catch null) |t| {
+            var i: u16 = 0;
+            while (i < t.vlen and i < 64) : (i += 1) {
+                _ = b.member(t, i) catch {};
+                _ = b.param(t, i) catch {};
+                _ = b.varSecInfo(t, i) catch {};
+                accessors += 3;
+            }
+            _ = b.str(t.name_off);
+            _ = b.resolve(id) catch {};
+            _ = b.sizeOf(id) catch {};
+            accessors += 3;
+        }
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(entries.len, ids);
+    try testing.expectEqual(@as(usize, 4), parsed);
+    try testing.expectEqual(@as(usize, 21), accessors);
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
-    const seed = Synth.good(gpa) catch return;
-    defer gpa.free(seed);
+    var buf: [8192]u8 = undefined;
+    // ⚠ The blob is drawn as BYTES now, in one `smith.slice` call. It used to
+    // be built here: `Synth.good()` truncated to
+    // `valueRangeAtMost(u32, 0, seed.len)` and then byte-flipped
+    // `valueRangeAtMost(u8, 0, 16)` times. A ranged draw reads eight input
+    // octets as a little-endian u64 and returns the range MINIMUM unless the
+    // whole word lies inside the range, so outside `--fuzz` BOTH collapsed:
+    // **length 0 and zero flips**. The one input this target ever ran was the
+    // empty slice, which `parse` refuses on its first line (`bytes.len < 8`),
+    // and everything below was unreachable.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 10 seeds non-empty,
+    // 0 parsed and 0 accessor calls before; 10 of 10 non-empty, 4 parsed and
+    // 21 accessor calls after.**
+    const len: usize = smith.slice(&buf);
+    // ⚠ `value(u64)` truncated, not `value(u32)` — see `BtfCorpus`: a `u32`
+    // draw survives only if the whole eight-octet word fits in 32 bits, so the
+    // id was 0, the void pseudo-type, on every seed.
+    const id: u32 = @truncate(smith.value(u64));
 
-    const len: u32 = smith.valueRangeAtMost(u32, 0, @intCast(seed.len));
-    const mutant = gpa.dupe(u8, seed[0..len]) catch return;
-    defer gpa.free(mutant);
-
-    const n_flips: u8 = smith.valueRangeAtMost(u8, 0, 16);
-    var k: u8 = 0;
-    while (k < n_flips and mutant.len > 0) : (k += 1) {
-        mutant[smith.index(mutant.len)] = smith.value(u8);
-    }
-
-    var b = parse(gpa, mutant, .{}) catch return;
+    var b = parse(gpa, buf[0..len], .{}) catch return;
     defer b.deinit();
 
     // Walk the deferred-validation surface the module doc calls out: `byId`
     // on a fuzzer-chosen id (very possibly out of range after mutation), and
     // every per-kind accessor the doc says must reject a bad `vlen`/
     // `name_off` cleanly rather than read out of bounds.
-    const id: u32 = smith.value(u32);
     if (b.byId(id) catch null) |t| {
         var i: u16 = 0;
         while (i < t.vlen and i < 64) : (i += 1) {

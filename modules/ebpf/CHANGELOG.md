@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — All five fuzz targets were replaying one fixed input, and the module's most
+  dangerous parser had no target at all. `btf.parse`, `btfext.parseExt` and `elfsym.openImage`
+  built a synthetic blob and then drew both a truncation length and a byte-flip count with
+  `valueRangeAtMost`; a ranged draw reads eight input octets as a little-endian u64 and returns
+  the range minimum when fewer remain, so outside `--fuzz` the length was 0 and the flip count 0
+  — the one input each ever ran was the empty slice, refused at the magic. `attach`'s
+  `parseConfigShift` had the `bytes`-then-ranged-length shape (and cannot fail, so the collapse
+  read as 100% healthy). `ringbuf` opened with a ranged draw and every later knob was its minimum
+  too: a 64-octet all-zero ring with `producer_pos == consumer_pos == 0`, which walks **zero
+  records**, so the bounds assertion the harness is built around was never evaluated. Each target
+  now draws bytes first — `smith.slice`, or `testkit.fuzz.Cursor` for the ring's shape — carries a
+  corpus, and is pinned by a guard counting work done rather than acceptance. Knobs that were
+  drawn after the byte draw and were therefore 0 on every seed now travel in the seed's tail:
+  `btf`'s type id (0 is the void pseudo-type, so `byId` returned null and the six accessors the
+  harness exists to drive were never called), and `elfsym`'s section index and entry index — the
+  latter is the unbounded domain whose own doc comment says being unbounded "is the point", and it
+  had never once been unbounded.
+
+- **2026-09-07** — **`object.zig` had no fuzz target**, and `check-fuzz-reach` could not say so:
+  that gate judges the draw of the targets that exist, so a parser with no harness is invisible
+  to it. `open()` is this module's documented untrusted-input entry point, needs no privilege,
+  and is where the 2026-09-05 CRITICAL lived — a symbol's raw `st_size` summed into a bound that
+  wrapped, reaching a `@memcpy` of 2^64-8 bytes (an out-of-bounds WRITE in ReleaseFast).
+  `elfsym`'s target stops one layer below, at the section table. `fuzzOpenObject` now drives
+  `open` over the seven real clang objects this module owns plus hostile variants built by the
+  same patches the `hostile:` tests apply, and walks `relocateProgram`, `applyCoreRelos` and
+  `fixupDatasecs` on what comes back. Verified by mutation: reverting the range check to its
+  pre-fix `r.off + size > data.len` is caught, and so is weakening the instruction-section
+  alignment check from `% 8` to `% 4`.
+
 - **2026-09-04** — **Two live tests reported PASS where they meant SKIP**, and
   printed unconditionally while doing it (breaking the "a passing test stays
   silent" rule the driver enforces): the tracepoint legacy-path attach and

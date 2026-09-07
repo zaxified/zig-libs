@@ -913,59 +913,181 @@ const SynthExt = struct {
 // bouncing off `NotBtfExt` on the first two bytes, then truncate and/or
 // flip bytes.
 
-test "fuzz: parseExt never panics on a truncated/mutated synthetic .BTF.ext blob" {
-    try testing.fuzz({}, fuzzParseExt, .{});
-}
+/// `.BTF.ext` blobs for `fuzzParseExt`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the blob.
+///
+/// ⭐ Built at run time from this file's own `SynthExt` fixture rather than
+/// quoted as hex: the header and every `{sec_name_off, num_info}` group are
+/// native-endian u32s, so a hex corpus would be a little-endian one and the
+/// counts pinned below would be false on a big-endian target instead of
+/// failing there.
+const ExtCorpus = struct {
+    store: [32768]u8 = undefined,
+    used: usize = 0,
+    entries: [9][]const u8 = undefined,
+    n: usize = 0,
 
-fn fuzzParseExt(_: void, smith: *std.testing.Smith) !void {
-    const gpa = testing.allocator;
-    const func = SynthExt.section(gpa, 8, 1, &.{ 0, 7, 16, 9 }) catch return; // 2 FuncInfo
-    defer gpa.free(func);
-    const line = SynthExt.section(gpa, 16, 1, &.{ 0, 2, 3, (5 << 10) | 4 }) catch return; // 1 LineInfo
-    defer gpa.free(line);
-    const core = SynthExt.section(gpa, 16, 1, &.{ 8, 4, 11, 0, 24, 4, 15, 5 }) catch return; // 2 CoreRelo
-    defer gpa.free(core);
-    const seed = SynthExt.build(gpa, func, line, core, header_size_full) catch return;
-    defer gpa.free(seed);
-
-    const len: u32 = smith.valueRangeAtMost(u32, 0, @intCast(seed.len));
-    const mutant = gpa.dupe(u8, seed[0..len]) catch return;
-    defer gpa.free(mutant);
-
-    const n_flips: u8 = smith.valueRangeAtMost(u8, 0, 16);
-    var k: u8 = 0;
-    while (k < n_flips and mutant.len > 0) : (k += 1) {
-        mutant[smith.index(mutant.len)] = smith.value(u8);
+    fn push(self: *ExtCorpus, blob: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], blob);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
     }
 
-    const ext = parseExt(mutant) catch return;
-    _ = ext.hdr.hasCoreRelos();
+    fn build(self: *ExtCorpus, gpa: std.mem.Allocator) ![]const []const u8 {
+        const func = try SynthExt.section(gpa, 8, 1, &.{ 0, 7, 16, 9 }); // 2 FuncInfo
+        defer gpa.free(func);
+        const line = try SynthExt.section(gpa, 16, 1, &.{ 0, 2, 3, (5 << 10) | 4 }); // 1 LineInfo
+        defer gpa.free(line);
+        const core = try SynthExt.section(gpa, 16, 1, &.{ 8, 4, 11, 0, 24, 4, 15, 5 }); // 2 CoreRelo
+        defer gpa.free(core);
+
+        // The complete three-sub-section blob, and the short-header form a
+        // pre-CO-RE producer emits (`hasCoreRelos()` false).
+        const full = try SynthExt.build(gpa, func, line, core, header_size_full);
+        defer gpa.free(full);
+        self.push(full);
+        const short = try SynthExt.build(gpa, func, line, &.{}, header_size_min);
+        defer gpa.free(short);
+        self.push(short);
+
+        // An empty blob with a valid header: zero groups everywhere, which is
+        // legal and is exactly the shape a reach guard must not count as work.
+        const bare = try SynthExt.build(gpa, &.{}, &.{}, &.{}, header_size_full);
+        defer gpa.free(bare);
+        self.push(bare);
+
+        // Truncations at the boundaries `parseExt` checks in order: shorter
+        // than the magic probe, a header with nothing behind it, and half a
+        // sub-section (a group whose records run off the end).
+        self.push(full[0..2]);
+        self.push(full[0..@min(full.len, header_size_full)]);
+        self.push(full[0 .. full.len / 2]);
+
+        // Header fields poisoned one at a time. The module doc says the
+        // offset/length pairs are checked in u64 so a `0xffffffff` cannot
+        // wrap; a byte flipped at random reaches those four words rarely.
+        const poisoned = try gpa.dupe(u8, full);
+        defer gpa.free(poisoned);
+        std.mem.writeInt(u32, poisoned[8..12], 0xffff_fff8, native_endian);
+        self.push(poisoned);
+        @memcpy(poisoned, full);
+        std.mem.writeInt(u32, poisoned[12..16], 0xffff_fff8, native_endian);
+        self.push(poisoned);
+        @memcpy(poisoned, full);
+        poisoned[0] = 0; // a wrong magic with a whole blob behind it
+        self.push(poisoned);
+
+        return self.entries[0..self.n];
+    }
+};
+
+/// What one blob produced. Shared by the fuzz target and its corpus guard so
+/// the guard measures the same walk.
+const ExtTally = struct {
+    groups: u32 = 0,
+    records: u32 = 0,
+};
+
+fn walkExt(blob: []const u8) ?ExtTally {
+    const ext = parseExt(blob) catch return null;
+    var t: ExtTally = .{};
+    std.mem.doNotOptimizeAway(ext.hdr.hasCoreRelos());
 
     // `parseExt` validates every group eagerly (`SectionIter.next` "cannot
     // fail"), so walking every iterator to exhaustion and decoding every
     // record is exactly the deferred-looking-but-actually-immediate surface
     // worth exercising here.
     var fit = ext.funcInfos();
-    var fi_groups: u32 = 0;
-    while (fit.next()) |s| : (fi_groups += 1) {
-        if (fi_groups > 64) break;
+    while (fit.next()) |s| {
+        t.groups += 1;
+        if (t.groups > 64) break;
         var i: u32 = 0;
-        while (i < s.count and i < 64) : (i += 1) _ = s.funcInfo(i);
+        while (i < s.count and i < 64) : (i += 1) {
+            std.mem.doNotOptimizeAway(s.funcInfo(i));
+            t.records += 1;
+        }
     }
     var lit = ext.lineInfos();
     var li_groups: u32 = 0;
     while (lit.next()) |s| : (li_groups += 1) {
+        t.groups += 1;
         if (li_groups > 64) break;
         var i: u32 = 0;
-        while (i < s.count and i < 64) : (i += 1) _ = s.lineInfo(i);
+        while (i < s.count and i < 64) : (i += 1) {
+            std.mem.doNotOptimizeAway(s.lineInfo(i));
+            t.records += 1;
+        }
     }
     var cit = ext.coreRelos();
     var cr_groups: u32 = 0;
     while (cit.next()) |s| : (cr_groups += 1) {
+        t.groups += 1;
         if (cr_groups > 64) break;
         var i: u32 = 0;
-        while (i < s.count and i < 64) : (i += 1) _ = s.coreRelo(i);
+        while (i < s.count and i < 64) : (i += 1) {
+            std.mem.doNotOptimizeAway(s.coreRelo(i));
+            t.records += 1;
+        }
     }
+    return t;
+}
+
+test "fuzz: parseExt never panics on a truncated/mutated synthetic .BTF.ext blob" {
+    var corpus: ExtCorpus = .{};
+    try testing.fuzz({}, fuzzParseExt, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+test "corpus: every .BTF.ext seed reaches the parser, and the walked counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkExt`. `nonempty` is
+    // the reach claim and the only check that catches a seed grown past the
+    // harness's buffer, which `Smith.slice` reads back as the EMPTY one.
+    //
+    // ⛔ `parsed` is deliberately not the only number. One of the seeds above
+    // is a valid header with zero groups in it — a legal `.BTF.ext` — so a
+    // blob can parse without a single group being walked or a single record
+    // decoded. `groups` and `records` are what the empty input cannot fake.
+    var corpus: ExtCorpus = .{};
+    const entries = try corpus.build(testing.allocator);
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var groups: u32 = 0;
+    var records: u32 = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [8192]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (walkExt(buf[0..len])) |t| {
+            parsed += 1;
+            groups += t.groups;
+            records += t.records;
+        }
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), parsed);
+    try testing.expectEqual(@as(u32, 5), groups);
+    try testing.expectEqual(@as(u32, 8), records);
+}
+
+fn fuzzParseExt(_: void, smith: *std.testing.Smith) !void {
+    var buf: [8192]u8 = undefined;
+    // ⚠ The blob is drawn as BYTES now, in one `smith.slice` call. It used to
+    // be built here: `SynthExt.build(...)` truncated to
+    // `valueRangeAtMost(u32, 0, seed.len)` and then byte-flipped
+    // `valueRangeAtMost(u8, 0, 16)` times. A ranged draw reads eight input
+    // octets as a little-endian u64 and returns the range MINIMUM unless the
+    // whole word lies inside the range, so outside `--fuzz` BOTH collapsed:
+    // **length 0 and zero flips**. The one input this target ever ran was the
+    // empty slice, which `parseExt` refuses at the magic, so the group walk
+    // and every record accessor below were unreachable.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 9 seeds non-empty,
+    // 0 parsed, 0 groups walked and 0 records decoded before; 9 of 9
+    // non-empty, 3 parsed, 5 groups and 8 records after.**
+    const len: usize = smith.slice(&buf);
+    std.mem.doNotOptimizeAway(walkExt(buf[0..len]));
 }
 
 test "synthetic .BTF.ext: sections, groups and forward-compatible records" {
