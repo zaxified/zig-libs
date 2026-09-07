@@ -654,6 +654,58 @@ def verdicts(judged):
     return judged
 
 
+
+# ---------------------------------------------------------------------------
+# The ratchet.
+#
+# ⭐ WHY THIS EXISTS AND `--advisory` IS NOT ENOUGH. 356 of 474 targets collapsed
+# when this gate landed, so it cannot fail the build yet — but a gate that never
+# fails protects nothing, and the burn-down is being done a module at a time over
+# many sessions. Without a ratchet, a module fixed in week one silently regresses
+# in week three and the only signal is a count in an advisory report nobody reads.
+#
+# The baseline is per MODULE, not a single total. A total would let one module
+# regress while another improves and still look green — the classic shape of a
+# number that describes two different quantities at once.
+#
+# `--update-baseline` refuses to record a regression. Lowering the bar is a
+# decision, not a maintenance step, and it must be made by editing the file and
+# saying why in the commit.
+BASELINE = Path("scripts/fuzz-reach-baseline.txt")
+
+
+def read_baseline():
+    if not BASELINE.exists():
+        return None
+    out = {}
+    for line in BASELINE.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, n = line.rsplit(None, 1)
+        out[name] = int(n)
+    return out
+
+
+def write_baseline(counts, old):
+    lines = [
+        "# check-fuzz-reach: the per-module ceiling on collapsed fuzz targets.",
+        "#",
+        "# A module may not exceed its number here. Lowering a number is what the",
+        "# burn-down does (`--update-baseline`); raising one is a decision that has",
+        "# to be made by hand, in a commit that says why.",
+        "#",
+        "# Modules absent from this file must have ZERO collapsed targets.",
+        "",
+    ]
+    for name in sorted(counts):
+        if counts[name]:
+            was = old.get(name) if old else None
+            note = f"  # was {was}" if was is not None and was != counts[name] else ""
+            lines.append(f"{name} {counts[name]}{note}")
+    BASELINE.write_text("\n".join(lines) + "\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=True, description=__doc__.split("\n")[0])
     ap.add_argument("--list", action="store_true",
@@ -661,6 +713,12 @@ def main() -> int:
     ap.add_argument("--advisory", action="store_true",
                     help="report and exit 0 (for wiring the gate before the burn-down is done)")
     ap.add_argument("--module", help="restrict to one module")
+    ap.add_argument("--ratchet", action="store_true",
+                    help="fail only where a module got WORSE than the committed "
+                         "baseline; the burn-down's own gate")
+    ap.add_argument("--update-baseline", action="store_true",
+                    help="rewrite the baseline from the current counts (only ever "
+                         "downwards; refuses to record a regression)")
     args = ap.parse_args()
 
     if not Path("modules").is_dir():
@@ -701,6 +759,60 @@ def main() -> int:
                               f"stale — that target reaches its input now; delete the line")
 
     weak = [t for t in judged if t["weak_only"]]
+
+    counts = {}
+    for t in flagged:
+        counts[t["module"]] = counts.get(t["module"], 0) + 1
+
+    if args.update_baseline:
+        old = read_baseline()
+        first = old is None
+        old = old or {}
+        # The first run records the world as it is; there is nothing to regress
+        # against yet. Every run after that may only lower a ceiling.
+        worse = [] if first else sorted(
+            m for m, n in counts.items() if n > old.get(m, 0))
+        if worse:
+            print("check-fuzz-reach: refusing to record a regression in "
+                  + ", ".join(f"{m} ({old.get(m, 0)} → {counts[m]})" for m in worse))
+            print("Raising a ceiling is a decision. Edit "
+                  f"{BASELINE} by hand and say why in the commit.")
+            return 1
+        write_baseline(counts, old)
+        improved = sorted(m for m in old if old[m] > counts.get(m, 0))
+        print(f"check-fuzz-reach: baseline updated — {len(improved)} module(s) "
+              f"lowered, {sum(counts.values())} collapsed targets remain")
+        for m in improved:
+            print(f"  {m}: {old[m]} → {counts.get(m, 0)}")
+        return 0
+
+    if args.ratchet:
+        base = read_baseline()
+        if base is None:
+            print(f"check-fuzz-reach: no baseline at {BASELINE}; run "
+                  f"--update-baseline once to create it")
+            return 1
+        worse = sorted((m, base.get(m, 0), n) for m, n in counts.items()
+                       if n > base.get(m, 0))
+        total = sum(counts.values())
+        if not worse:
+            stale = sorted(m for m in base if base[m] > counts.get(m, 0))
+            print(f"check-fuzz-reach: {total} collapsed targets, none above the "
+                  f"baseline ({len(base)} module(s) tracked)")
+            if stale:
+                print(f"  {len(stale)} module(s) are now BELOW their baseline; run "
+                      f"--update-baseline to lock the improvement in:")
+                for m in stale:
+                    print(f"    {m}: {base[m]} → {counts.get(m, 0)}")
+            return 0
+        print("check-fuzz-reach: collapsed fuzz targets went UP:")
+        for m, was, now in worse:
+            print(f"  {m}: {was} → {now}")
+        print()
+        print("A harness whose draw collapses replays every seed as one fixed")
+        print("input. Run `./scripts/check-fuzz-reach.py --list --module <m>` to")
+        print("see which target, and `modules/testkit/src/fuzz.zig` for the fix.")
+        return 1
 
     if args.list:
         by_module = {}

@@ -371,9 +371,17 @@ harness_smoke() {
     # harness that opens with one -- or that slices its drawn bytes to a length
     # that came from one -- replays every corpus seed, and every crash `--fuzz`
     # minimises into a seed, as the same fixed input. 416 of 474 targets did at
-    # landing; `--advisory` prints that burn-down without failing, and comes off
-    # when it reaches zero. It still FAILS on a malformed or stale exemption.
-    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --advisory
+    # landing. `--advisory` printed that burn-down without failing anything --
+    # but a gate that never fails protects nothing, and the burn-down is being
+    # done a module at a time over many sessions, so a module fixed in week one
+    # could regress in week three with no signal at all. `--ratchet` compares
+    # against `scripts/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
+    # only where a module got worse, names the modules that have improved since
+    # the file was written, and comes off entirely when the baseline is empty.
+    # The ceiling is per module rather than one total on purpose -- a total lets
+    # one module regress while another improves and still reads green.
+    # It still FAILS on a malformed or stale exemption.
+    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet
 
     # `run-examples` builds and runs each example in the LANE's optimize mode,
     # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
@@ -1392,9 +1400,17 @@ cmd_changed() {
     # harness that opens with one -- or that slices its drawn bytes to a length
     # that came from one -- replays every corpus seed, and every crash `--fuzz`
     # minimises into a seed, as the same fixed input. 416 of 474 targets did at
-    # landing; `--advisory` prints that burn-down without failing, and comes off
-    # when it reaches zero. It still FAILS on a malformed or stale exemption.
-    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --advisory
+    # landing. `--advisory` printed that burn-down without failing anything --
+    # but a gate that never fails protects nothing, and the burn-down is being
+    # done a module at a time over many sessions, so a module fixed in week one
+    # could regress in week three with no signal at all. `--ratchet` compares
+    # against `scripts/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
+    # only where a module got worse, names the modules that have improved since
+    # the file was written, and comes off entirely when the baseline is empty.
+    # The ceiling is per module rather than one total on purpose -- a total lets
+    # one module regress while another improves and still reads green.
+    # It still FAILS on a malformed or stale exemption.
+    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet
 
     # `run-examples` builds and runs each example in the LANE's optimize mode,
     # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
@@ -1555,9 +1571,17 @@ phase_checks() {
     # harness that opens with one -- or that slices its drawn bytes to a length
     # that came from one -- replays every corpus seed, and every crash `--fuzz`
     # minimises into a seed, as the same fixed input. 416 of 474 targets did at
-    # landing; `--advisory` prints that burn-down without failing, and comes off
-    # when it reaches zero. It still FAILS on a malformed or stale exemption.
-    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --advisory
+    # landing. `--advisory` printed that burn-down without failing anything --
+    # but a gate that never fails protects nothing, and the burn-down is being
+    # done a module at a time over many sessions, so a module fixed in week one
+    # could regress in week three with no signal at all. `--ratchet` compares
+    # against `scripts/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
+    # only where a module got worse, names the modules that have improved since
+    # the file was written, and comes off entirely when the baseline is empty.
+    # The ceiling is per module rather than one total on purpose -- a total lets
+    # one module regress while another improves and still reads green.
+    # It still FAILS on a malformed or stale exemption.
+    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet
 
     # `run-examples` builds and runs each example in the LANE's optimize mode,
     # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
