@@ -58,8 +58,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   had never run**. The target had executed exactly one scenario for its whole
   life: split = 1, an empty continuation of a zero-length message.
 
-  Measured before → after: `fuzzReassemble` **1 script, 3 octets stitched → 9
-  scripts, 405 octets stitched, 30 declared-vs-present mismatches refused**;
+  Measured before → after: `fuzzReassemble` **1 script, 3 octets stitched → 10
+  scripts, 408 octets stitched, 31 declared-vs-present mismatches refused**;
   `fuzzHandleFlight` **1 script, 0 truthful continuations → 8 scripts, 4
   truthful, 360 octets of real ClientHello body delivered**. Both keep the
   collapsed run as an executable "before" line in their corpus guards.
@@ -80,7 +80,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
   Measured 2026-09-07, before → after (non-empty seeds / accepted / fields
   walked): ClientHello **0/0/0 → 18/14/91**, ServerHello **0/0/0 → 25/23/45**,
-  Certificate **0/0/0 → 8/3/1161 DER octets**, extension blocks **0/0/0 →
+  Certificate **0/0/0 → 9/4/1161 DER octets**, extension blocks **0/0/0 →
   35/32/115 extensions**, `key_share` ClientHello **0/0/0 → 10/9/3809 octets**,
   `parseLeafPublicKey` **0/0 → 13/5 keys in 4 of the 4 supported kinds**.
 

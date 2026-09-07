@@ -806,11 +806,16 @@ fn runReassembleScript(bytes: []const u8) !ReassembleOutcome {
 /// fragOff fragLen <body>`, six rounds, then `present dir delta <probe>`, then
 /// `total split <message> inOrder`.
 const reassemble_seeds = [_][]const u8{
-    // A four-octet header message delivered honestly, then the same
-    // `message_seq` again with a CONTRADICTING total length: the "nothing
-    // committed yet, so re-latch" path and then the genuine conflict.
+    // ⭐ The re-latch path: a fragment that declares a 32-octet message and
+    // carries NO bytes latches the header and commits nothing, and the real
+    // 4-octet message that follows on the same `message_seq` must be able to
+    // replace it. Before that arm existed, one spoofed empty fragment wedged
+    // the slot for good — see `feed`'s own comment.
+    seed("00" ++ "16" ++ "20" ++ "01" ++ "00" ++ "00" ++
+        "04" ++ "16" ++ "04" ++ "01" ++ "00" ++ "04" ++ "41424344"),
+    // ...and the genuine conflict it must NOT be confused with: once bytes are
+    // committed, a contradicting total length is `InconsistentLength`.
     seed("04" ++ "16" ++ "04" ++ "01" ++ "00" ++ "04" ++ "41424344" ++
-        "00" ++ "16" ++ "20" ++ "01" ++ "00" ++ "00" ++
         "04" ++ "16" ++ "20" ++ "01" ++ "00" ++ "04" ++ "45464748"),
     // A fragment declaring one byte MORE than it carries, at a non-zero
     // offset, then the same fragment delivered honestly.
@@ -878,11 +883,11 @@ test "corpus: every reassembly seed drives the state machine, and the counts are
         stitched += o.stitched;
     }
     try testing.expectEqual(reassemble_seeds.len, nonempty);
-    try testing.expectEqual(@as(usize, 14), fed);
-    try testing.expectEqual(@as(usize, 19), refused);
-    try testing.expectEqual(@as(usize, 30), mismatched);
-    try testing.expectEqual(@as(usize, 20), completed);
-    try testing.expectEqual(@as(usize, 405), stitched);
+    try testing.expectEqual(@as(usize, 19), fed);
+    try testing.expectEqual(@as(usize, 20), refused);
+    try testing.expectEqual(@as(usize, 31), mismatched);
+    try testing.expectEqual(@as(usize, 26), completed);
+    try testing.expectEqual(@as(usize, 408), stitched);
 
     // ⭐ And what the collapse produced, kept as a measurement rather than a
     // story. An empty script makes every `Script` read return 0, which is
