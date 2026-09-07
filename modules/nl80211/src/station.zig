@@ -24,6 +24,9 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const genl = @import("genetlink");
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const Error = codec.Error;
 
@@ -351,14 +354,119 @@ test "parse: an empty station is valid (all fields absent)" {
     try testing.expectEqual(@as(?RateInfo, null), s.tx_bitrate);
 }
 
+/// GET_STATION reply attribute lists and bare RATE_INFO nests for `fuzzParse`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by `codec`'s own encoders, the way the value tests
+/// above build theirs, rather than quoted as hex: an nl80211 attribute is a
+/// netlink TLV, whose length and scalars are HOST byte order, so a hex corpus
+/// would be a little-endian one and the counts pinned below would be false on
+/// a big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // The captured VHT rate-info nest, fed bare: `parseRateInfo` takes a
+        // nest body, so this seed is what reaches its half of the harness.
+        const vht_rate = [_]u8{
+            0x08, 0x00, 0x05, 0x00, 0xd0, 0x03, 0x00, 0x00, // BITRATE32 = 976
+            0x06, 0x00, 0x01, 0x00, 0xd0, 0x03, 0x00, 0x00, // BITRATE = 976
+            0x04, 0x00, 0x08, 0x00, // 80 MHz (flag)
+            0x05, 0x00, 0x06, 0x00, 0x02, 0x00, 0x00, 0x00, // VHT_MCS = 2
+            0x05, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, // VHT_NSS = 1
+            0x04, 0x00, 0x04, 0x00, // SHORT_GI (flag)
+        };
+        self.push(&vht_rate);
+
+        // P-18: BITRATE32 large enough that `b * 100` overflows a u32. This is
+        // the seed the accessor call in the harness exists for.
+        var overflow: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &overflow, uapi.RATE_INFO.BITRATE32, 42_949_673);
+        self.push(overflow.items);
+
+        // A whole station: 64-bit counters, signed signal bytes, and both
+        // bitrate nests, so the accessors run on a station rather than on a
+        // bare nest.
+        var full: std.ArrayList(u8) = .empty;
+        {
+            var info: std.ArrayList(u8) = .empty;
+            try codec.appendAttr(gpa, &info, uapi.STA_INFO.RX_BYTES64, &.{ 0x32, 0xe0, 0x84, 0xe5, 0x07, 0, 0, 0 });
+            try codec.appendAttrU32(gpa, &info, uapi.STA_INFO.RX_BYTES, 0xe584_e032);
+            try codec.appendAttrU8(gpa, &info, uapi.STA_INFO.SIGNAL, 0xaf); // -81
+            try codec.appendAttrU8(gpa, &info, uapi.STA_INFO.SIGNAL_AVG, 0xb0); // -80
+            try codec.appendAttr(gpa, &info, uapi.STA_INFO.TX_BITRATE, &vht_rate);
+            try codec.appendAttr(gpa, &info, uapi.STA_INFO.RX_BITRATE, &vht_rate);
+            try wrapNest(gpa, &full, uapi.ATTR.STA_INFO, info.items);
+        }
+        self.push(full.items);
+
+        // An empty STA_INFO nest: a legal station with every field absent.
+        var empty_nest: std.ArrayList(u8) = .empty;
+        try wrapNest(gpa, &empty_nest, uapi.ATTR.STA_INFO, &.{});
+        self.push(empty_nest.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A STA_INFO whose inner TLV is truncated.
+        var truncated: std.ArrayList(u8) = .empty;
+        try wrapNest(gpa, &truncated, uapi.ATTR.STA_INFO, &.{ 0x40, 0x00, 0x02, 0x00, 0x01 });
+        self.push(truncated.items);
+        // RX_BYTES64 four octets wide.
+        var narrow: std.ArrayList(u8) = .empty;
+        {
+            var info: std.ArrayList(u8) = .empty;
+            try codec.appendAttrU32(gpa, &info, uapi.STA_INFO.RX_BYTES64, 7);
+            try wrapNest(gpa, &narrow, uapi.ATTR.STA_INFO, info.items);
+        }
+        self.push(narrow.items);
+        // A TX_BITRATE nest that lies about its own length.
+        var lying: std.ArrayList(u8) = .empty;
+        {
+            var info: std.ArrayList(u8) = .empty;
+            try codec.appendAttr(gpa, &info, uapi.STA_INFO.TX_BITRATE, &.{ 0xff, 0x00, 0x01, 0x00 });
+            try wrapNest(gpa, &lying, uapi.ATTR.STA_INFO, info.items);
+        }
+        self.push(lying.items);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: station parse never crashes" {
-    try testing.fuzz({}, fuzzParse, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and both `parse` and `parseRateInfo` were handed an empty attribute list, with
+    // the reply sitting unread in `raw`.
+    //
+    // ⛔ And it looked HEALTHIER that way: a station with no
+    // attributes at all is a legal reply — the test above says so in as many
+    // words — so both parsers succeeded on the empty slice every round.
+    // Measured 2026-09-07 over the corpus above: **0 of 7 seeds non-empty, 7
+    // of 7 "parsed" and 0 bitrates reached before; 7 of 7 non-empty, 3 parsed
+    // and 3 bitrates after.** The bitrate count is the one that matters:
+    // `kilobitsPerSecond` is where the P-18 overflow panic lived, and the
+    // collapsed harness could not reach it at all.
+    const len: usize = smith.slice(&raw);
     // Also exercise the accessors, not just the parse — `kilobitsPerSecond`
     // (P-18) is where the previous integer-overflow panic lived, and a
     // fuzz harness that only calls `parse`/`parseRateInfo` walks right past
@@ -372,6 +480,43 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         std.mem.doNotOptimizeAway(&r);
         std.mem.doNotOptimizeAway(r.kilobitsPerSecond());
     } else |_| {}
+}
+
+test "corpus: every station seed reaches the parsers, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here, so "parsed" alone counts a harness that walks nothing as a
+    // success.
+    //
+    // `bitrates` is that second number here, and it is pinned because it is
+    // the only thing that says `kilobitsPerSecond` — the accessor P-18 was
+    // about — was executed on decoded wire data at all.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var bitrates: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        if (parse(raw[0..len])) |s| {
+            parsed += 1;
+            if (s.tx_bitrate) |r| {
+                if (r.kilobitsPerSecond() != null) bitrates += 1;
+            }
+        } else |_| {}
+        if (parseRateInfo(raw[0..len])) |r| {
+            if (r.kilobitsPerSecond() != null) bitrates += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), parsed);
+    try testing.expectEqual(@as(usize, 3), bitrates);
 }
 
 // P-18: `BITRATE32 >= 42_949_673` made `b * 100` overflow a `u32` and abort

@@ -5,6 +5,37 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **all seven fuzz harnesses fetched their input and threw it away — and the
+  collapse made them look perfect.** Each opened `smith.bytes(&raw)` and then sliced the buffer
+  to `smith.valueRangeAtMost(u16, 0, raw.len)`; a `Smith` ranged draw reads eight input octets
+  as a little-endian u64 and returns the range MINIMUM unless that word already lies inside the
+  range, so the length was 0 for every seed and every parser here ran on an empty attribute
+  list. ⛔ And an empty list is a **legal** reply everywhere in this module — every field of an
+  interface, a station, a regulatory domain, a BSS or an event is optional — so measured with
+  the old draws in place against the new corpora: `iface` 6 of 6 "parsed", `station` 7 of 7,
+  `reg` 6 of 6, `scan` 6 of 6 nests, `client` 7 of 7 events, `wiphy` 7 of 7 messages fed
+  cleanly, `ie` no failures at all. A clean sheet across the module, with **0 elements walked,
+  0 regulatory rules decoded, 0 wiphys produced, 0 bitrates reached and 0 group ids found.**
+  All seven now draw with one `smith.slice(&raw)` and carry a corpus. After: `iface` 3 parsed
+  of which 3 carry an iftype; `station` 3 parsed and 3 bitrates through
+  `RateInfo.kilobitsPerSecond`; `reg` 3 parsed and 1 rule; `scan` 3 nests and 1 BSS through the
+  ATTR.BSS wrapper; `wiphy` 5 messages fed and 4 radios produced; `client` 4 events parsed, 2
+  ending a scan and 1 mcast group id; `ie` 40 elements walked and 3 RSN/WPA1 elements decoded.
+  Each harness carries a corpus guard pinning both numbers — "parsed" alone cannot tell a real
+  reply from the empty one, which is exactly how this hid.
+- **2026-09-07** — two knob draws with the same defect, both of which decided a security-
+  relevant answer. `client.fuzzEvent` drew the genl command with
+  `valueRangeAtMost(u8, 0, 255)`, so `cmd` was **0 on every round** and `Event.endsScan()`,
+  `isScanComplete()` and `isScanAborted()` were false for every input the harness ever built.
+  `ie.fuzzIes` passed `smith.value(u16)` as the frequency to `Summary.security(freq)` — a
+  16-bit draw, likewise always its minimum — so the band that decides WEP-vs-open on an
+  unprotected BSS was **0 MHz**, which is not a channel. Both are full-width `smith.value(u64)`
+  draws now and both travel in the seed.
+- **2026-09-07** — the nl80211 corpora are built at run time by `codec`'s own encoders rather
+  than quoted as hex, because an nl80211 attribute is a netlink TLV and its length and scalars
+  are HOST byte order. `ie.zig` is the exception and quotes its beacons verbatim: an 802.11
+  information element is `id | len | body` octets, the same on every host.
+
 - **2026-09-03** — Drift re-audit (last audited `d163578`, ~723 lines since). Four fixes,
   four mutations, four red.
   - ⛔ **The dump loop ignored `NLM_F_DUMP_INTR`.** The kernel sets it when its tables

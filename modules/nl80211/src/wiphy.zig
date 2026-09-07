@@ -32,6 +32,9 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const genl = @import("genetlink");
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const Error = codec.Error || error{OutOfMemory};
 
@@ -595,17 +598,158 @@ test "finish on an empty parser returns an empty list" {
     try testing.expectEqual(@as(usize, 0), list.len);
 }
 
+/// GET_WIPHY split-dump messages for `fuzzFeed`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by `codec`'s own encoders, the way the value tests
+/// above build theirs, rather than quoted as hex: an nl80211 attribute is a
+/// netlink TLV, whose length and scalars are HOST byte order, so a hex corpus
+/// would be a little-endian one and the counts pinned below would be false on
+/// a big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // Identity plus scan limits: the first message of a split dump.
+        var identity: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &identity, uapi.ATTR.WIPHY, 0);
+        try codec.appendAttrString(gpa, &identity, uapi.ATTR.WIPHY_NAME, "phy0");
+        try codec.appendAttrU8(gpa, &identity, uapi.ATTR.MAX_NUM_SCAN_SSIDS, 20);
+        try codec.appendAttrU16(gpa, &identity, uapi.ATTR.MAX_SCAN_IE_LEN, 413);
+        self.push(identity.items);
+
+        // Ciphers and supported iftypes.
+        var caps: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &caps, uapi.ATTR.WIPHY, 0);
+        try codec.appendAttrString(gpa, &caps, uapi.ATTR.WIPHY_NAME, "phy0");
+        try codec.appendAttr(gpa, &caps, uapi.ATTR.CIPHER_SUITES, &.{
+            0x01, 0xac, 0x0f, 0x00, // WEP40
+            0x04, 0xac, 0x0f, 0x00, // CCMP
+        });
+        {
+            const off = try codec.nestBegin(gpa, &caps, uapi.ATTR.SUPPORTED_IFTYPES);
+            try codec.appendAttr(gpa, &caps, @intFromEnum(uapi.Iftype.station), &.{});
+            try codec.appendAttr(gpa, &caps, @intFromEnum(uapi.Iftype.ap), &.{});
+            try codec.nestEnd(&caps, off);
+        }
+        self.push(caps.items);
+
+        // One band with two channels — the nest-inside-nest-inside-nest shape
+        // that is the whole reason this parser exists.
+        var band: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &band, uapi.ATTR.WIPHY, 0);
+        {
+            const bands = try codec.nestBegin(gpa, &band, uapi.ATTR.WIPHY_BANDS);
+            const band0 = try codec.nestBegin(gpa, &band, 0);
+            const freqs = try codec.nestBegin(gpa, &band, uapi.BAND_ATTR.FREQS);
+            for ([_]struct { idx: u16, mhz: u32 }{
+                .{ .idx = 0, .mhz = 2412 },
+                .{ .idx = 1, .mhz = 2417 },
+            }) |ch| {
+                const entry = try codec.nestBegin(gpa, &band, ch.idx);
+                try codec.appendAttrU32(gpa, &band, uapi.FREQUENCY_ATTR.FREQ, ch.mhz);
+                try codec.appendAttrU32(gpa, &band, uapi.FREQUENCY_ATTR.MAX_TX_POWER, 2000);
+                try codec.nestEnd(&band, entry);
+            }
+            try codec.nestEnd(&band, freqs);
+            try codec.nestEnd(&band, band0);
+            try codec.nestEnd(&band, bands);
+        }
+        self.push(band.items);
+
+        // ── the shapes the merge rules exist for ───────────────────────────
+        // A message with no wiphy index at all: dropped, not misattributed.
+        var anonymous: std.ArrayList(u8) = .empty;
+        try codec.appendAttrString(gpa, &anonymous, uapi.ATTR.WIPHY_NAME, "phyX");
+        self.push(anonymous.items);
+        // A second radio.
+        var phy1: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &phy1, uapi.ATTR.WIPHY, 1);
+        try codec.appendAttrString(gpa, &phy1, uapi.ATTR.WIPHY_NAME, "phy1");
+        self.push(phy1.items);
+        // A TLV header declaring 0x40 octets over a 2-octet buffer, and a
+        // WIPHY index that is not four octets wide.
+        self.push(&[_]u8{ 0x40, 0x00 });
+        var narrow: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU16(gpa, &narrow, uapi.ATTR.WIPHY, 0);
+        self.push(narrow.items);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: the wiphy parser never crashes and never leaks" {
-    try testing.fuzz({}, fuzzFeed, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzFeed, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzFeed(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `Parser.feed` was handed an empty attribute list, with
+    // the reply sitting unread in `raw`.
+    //
+    // ⛔ And it looked HEALTHIER that way: feeding an empty
+    // message is legal and `finish()` then returns an empty list, so the
+    // harness completed cleanly every round. Measured 2026-09-07 over the
+    // corpus above: **0 of 7 seeds non-empty and 0 wiphys produced before; 7
+    // of 7 non-empty and 4 wiphys after.** The wiphy count is the number that
+    // says a message was ever attributed to a radio.
+    const len: usize = smith.slice(&raw);
     var p: Parser = .init(testing.allocator);
     defer p.deinit();
     p.feed(raw[0..len]) catch return;
     const list = p.finish() catch return;
     freeAll(testing.allocator, list);
+}
+
+test "corpus: every wiphy seed reaches the parser, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here, so "parsed" alone counts a harness that walks nothing as a
+    // success.
+    //
+    // ⚠ One seed is one message and one `Parser`, which is what the harness
+    // does — the merge of a radio split across several messages is covered by
+    // the value tests above, not here.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var fed: usize = 0;
+    var wiphys: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        var p: Parser = .init(testing.allocator);
+        defer p.deinit();
+        p.feed(raw[0..len]) catch continue;
+        fed += 1;
+        const list = p.finish() catch continue;
+        wiphys += list.len;
+        freeAll(testing.allocator, list);
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 5), fed);
+    try testing.expectEqual(@as(usize, 4), wiphys);
 }

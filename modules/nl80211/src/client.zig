@@ -47,6 +47,9 @@ const codec = netlink.codec;
 const genl = @import("genetlink");
 
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const iface = @import("iface.zig");
 const station_mod = @import("station.zig");
 const wiphy_mod = @import("wiphy.zig");
@@ -1151,11 +1154,139 @@ test "awaitAck errors out instead of looping forever on a never-matching reply" 
     try testing.expectError(error.TooManyMessages, awaitAckStep(&cl, seq));
 }
 
+/// Event attribute lists for `fuzzEvent`, laid out the way its draws read
+/// them: a `testkit.fuzz` slice seed (u32 length + bytes) and then an
+/// eight-octet little-endian word carrying the genl command byte.
+///
+/// ⭐ Built at run time by `codec`'s own encoders rather than quoted as hex: an
+/// nl80211 attribute is a netlink TLV, whose length and scalars are HOST byte
+/// order, so a hex corpus would be a little-endian one and the counts pinned
+/// below would be false on a big-endian target instead of failing there.
+///
+/// ⛔ The command word is not decoration. `cmd` is what every predicate on
+/// `Event` reads — `isScanComplete`, `endsScan`, `isScanAborted` — and it used
+/// to be drawn with `valueRangeAtMost(u8, 0, 255)`, the range minimum, i.e.
+/// **0 for every seed**, which is not an nl80211 command at all.
+const Corpus = struct {
+    scratch: [4096]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8, cmd: u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], cmd, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // The fields a scan/MLME event carries, under three commands: a scan
+        // completion, an abort, and one that ends no scan at all.
+        var scan_ev: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &scan_ev, uapi.ATTR.WIPHY, 0);
+        try codec.appendAttrU32(gpa, &scan_ev, uapi.ATTR.IFINDEX, 3);
+        try codec.appendAttr(gpa, &scan_ev, uapi.ATTR.WDEV, &.{ 1, 0, 0, 0, 0, 0, 0, 0 });
+        self.push(scan_ev.items, uapi.CMD.NEW_SCAN_RESULTS);
+        self.push(scan_ev.items, uapi.CMD.SCAN_ABORTED);
+        self.push(scan_ev.items, uapi.CMD.REG_CHANGE);
+
+        // A connect outcome: a status code and a BSSID.
+        var connect: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &connect, uapi.ATTR.IFINDEX, 3);
+        try codec.appendAttr(gpa, &connect, uapi.ATTR.MAC, &.{ 0x02, 0, 0, 0xaa, 0xbb, 0xcc });
+        try codec.appendAttrU16(gpa, &connect, uapi.ATTR.STATUS_CODE, 0);
+        self.push(connect.items, uapi.CMD.CONNECT);
+
+        // An nlctrl reply carrying the mcast groups — the other half of the
+        // harness, which `findMcastGroupId` walks.
+        var groups: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU16(gpa, &groups, uapi.CTRL_ATTR.FAMILY_ID, 41);
+        {
+            const outer = try codec.nestBegin(gpa, &groups, uapi.CTRL_ATTR.MCAST_GROUPS);
+            for ([_]struct { n: []const u8, id: u32 }{
+                .{ .n = "config", .id = 22 },
+                .{ .n = uapi.mcast_group.scan, .id = 23 },
+                .{ .n = "mlme", .id = 25 },
+            }, 1..) |g, idx| {
+                const one = try codec.nestBegin(gpa, &groups, @intCast(idx));
+                try codec.appendAttrString(gpa, &groups, uapi.CTRL_ATTR_MCAST_GRP.NAME, g.n);
+                try codec.appendAttrU32(gpa, &groups, uapi.CTRL_ATTR_MCAST_GRP.ID, g.id);
+                try codec.nestEnd(&groups, one);
+            }
+            try codec.nestEnd(&groups, outer);
+        }
+        self.push(groups.items, uapi.CMD.NEW_SCAN_RESULTS);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A TLV header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 }, uapi.CMD.CONNECT);
+        // WDEV with the wrong width.
+        self.push(&[_]u8{ 0x08, 0x00, 0x99, 0x00, 1, 0, 0, 0 }, uapi.CMD.CONNECT);
+
+        return self.entries[0..self.n];
+    }
+};
+
 fn fuzzEvent(_: void, smith: *std.testing.Smith) !void {
     var raw: [256]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
-    const cmd = smith.valueRangeAtMost(u8, 0, 255);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and both `parseEvent` and
+    // `findMcastGroupId` were handed an empty attribute list. `cmd` had the
+    // same defect and the same cause; it is a full-width `value(u64)` now,
+    // carried in the seed.
+    //
+    // ⛔ And it looked HEALTHIER that way: an event with no attributes is a
+    // legal event, so `parseEvent` succeeded every round. Measured 2026-09-07
+    // over the corpus above: **0 of 7 seeds non-empty, 7 of 7 events "parsed",
+    // 0 of them ending a scan and 0 group ids found before; 7 of 7 non-empty,
+    // 4 parsed, 2 ending a scan and 1 group id after.**
+    const len: usize = smith.slice(&raw);
+    const cmd: u8 = @truncate(smith.value(u64));
     if (parseEvent(cmd, raw[0..len])) |e| std.mem.doNotOptimizeAway(&e) else |_| {}
     if (findMcastGroupId(raw[0..len], "scan")) |g| std.mem.doNotOptimizeAway(&g) else |_| {}
+}
+
+test "corpus: every event seed reaches both parsers, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here, so "parsed" alone counts a harness that walks nothing as a
+    // success.
+    //
+    // `ends_scan` is the number that proves the command byte arrived: it is
+    // false for `cmd == 0`, which is what the collapsed draw produced.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var ends_scan: usize = 0;
+    var groups: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [256]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        const cmd: u8 = @truncate(smith.value(u64));
+        if (len != 0) nonempty += 1;
+        if (parseEvent(cmd, raw[0..len])) |e| {
+            parsed += 1;
+            if (e.endsScan()) ends_scan += 1;
+        } else |_| {}
+        if (findMcastGroupId(raw[0..len], "scan")) |g| {
+            if (g != null) groups += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), parsed);
+    try testing.expectEqual(@as(usize, 2), ends_scan);
+    try testing.expectEqual(@as(usize, 1), groups);
 }

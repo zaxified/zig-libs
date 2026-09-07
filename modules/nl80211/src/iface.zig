@@ -16,6 +16,9 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const genl = @import("genetlink");
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const Error = codec.Error;
 
@@ -202,13 +205,122 @@ test "parse: an empty attribute list is a valid, empty interface" {
     try testing.expectEqual(uapi.Iftype.unspecified, i.iftype);
 }
 
+/// GET_INTERFACE reply attribute lists for `fuzzParse`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by `codec`'s own encoders, the way the value tests
+/// above build theirs, rather than quoted as hex: an nl80211 attribute is a
+/// netlink TLV, whose length and scalars are HOST byte order, so a hex corpus
+/// would be a little-endian one and the counts pinned below would be false on
+/// a big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [4096]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A station interface with an association, in the shape the kernel
+        // emits (the real capture is exercised byte-for-byte in goldens.zig).
+        var sta: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &sta, uapi.ATTR.IFINDEX, 3);
+        try codec.appendAttrString(gpa, &sta, uapi.ATTR.IFNAME, "wlan0");
+        try codec.appendAttrU32(gpa, &sta, uapi.ATTR.WIPHY, 0);
+        try codec.appendAttrU32(gpa, &sta, uapi.ATTR.IFTYPE, 2);
+        try codec.appendAttr(gpa, &sta, uapi.ATTR.WDEV, &.{ 1, 0, 0, 0, 0, 0, 0, 0 });
+        try codec.appendAttr(gpa, &sta, uapi.ATTR.MAC, &.{ 0x02, 0, 0, 0x11, 0x22, 0x33 });
+        try codec.appendAttr(gpa, &sta, uapi.ATTR.SSID, "example-net");
+        try codec.appendAttrU32(gpa, &sta, uapi.ATTR.WIPHY_FREQ, 5500);
+        try codec.appendAttrU32(gpa, &sta, uapi.ATTR.CHANNEL_WIDTH, 3);
+        try codec.appendAttrU32(gpa, &sta, uapi.ATTR.CENTER_FREQ1, 5530);
+        self.push(sta.items);
+
+        // A P2P device: a wdev, no ifindex and no name.
+        var p2p: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &p2p, uapi.ATTR.WIPHY, 0);
+        try codec.appendAttrU32(gpa, &p2p, uapi.ATTR.IFTYPE, 10);
+        try codec.appendAttr(gpa, &p2p, uapi.ATTR.WDEV, &.{ 2, 0, 0, 0, 0, 0, 0, 0 });
+        self.push(p2p.items);
+
+        // An AP with a name and nothing else.
+        var ap: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &ap, uapi.ATTR.IFINDEX, 4);
+        try codec.appendAttrString(gpa, &ap, uapi.ATTR.IFNAME, "wlan1");
+        try codec.appendAttrU32(gpa, &ap, uapi.ATTR.IFTYPE, 3);
+        self.push(ap.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A TLV header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 });
+        // MAC of the wrong width, and a WDEV that is not eight octets.
+        var bad_mac: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &bad_mac, uapi.ATTR.MAC, &.{ 1, 2, 3 });
+        self.push(bad_mac.items);
+        var bad_wdev: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &bad_wdev, uapi.ATTR.WDEV, 1);
+        self.push(bad_wdev.items);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: interface parse never crashes" {
-    try testing.fuzz({}, fuzzParse, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var raw: [256]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an empty attribute list, with
+    // the reply sitting unread in `raw`.
+    //
+    // ⛔ And it looked HEALTHIER that way: an interface with no
+    // attributes at all is a legal reply — every field is optional — so
+    // `parse("")` succeeds. Measured 2026-09-07 over the corpus above: **0 of
+    // 6 seeds non-empty and 6 of 6 "parsed" before; 6 of 6 non-empty, 3 parsed
+    // and 3 of them carrying an iftype after.**
+    const len: usize = smith.slice(&raw);
     if (parse(raw[0..len])) |i| std.mem.doNotOptimizeAway(&i) else |_| {}
+}
+
+test "corpus: every interface seed reaches the parser, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here, so "parsed" alone counts a harness that walks nothing as a
+    // success.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var typed: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [256]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        if (parse(raw[0..len])) |i| {
+            parsed += 1;
+            if (i.iftype != .unspecified) typed += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), parsed);
+    try testing.expectEqual(@as(usize, 3), typed);
 }

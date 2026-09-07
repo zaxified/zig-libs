@@ -21,6 +21,9 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const genl = @import("genetlink");
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const ParseError = codec.Error || error{OutOfMemory};
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
@@ -319,16 +322,146 @@ test "parse: malformed regulatory replies error out without leaking rules" {
     try testing.expectError(error.Truncated, parse(gpa, msg3.items));
 }
 
+/// GET_REG reply attribute lists for `fuzzParse`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by `codec`'s own encoders, the way the value tests
+/// above build theirs, rather than quoted as hex: an nl80211 attribute is a
+/// netlink TLV, whose length and scalars are HOST byte order, so a hex corpus
+/// would be a little-endian one and the counts pinned below would be false on
+/// a big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // DE with one DFS rule: the shape the kHz→MHz conversion works on.
+        var de: std.ArrayList(u8) = .empty;
+        {
+            var rules: std.ArrayList(u8) = .empty;
+            const one = try codec.nestBegin(gpa, &rules, 1);
+            try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.REG_RULE_FLAGS, uapi.RRF.DFS);
+            try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.FREQ_RANGE_START, 5_250_000);
+            try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.FREQ_RANGE_END, 5_330_000);
+            try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.FREQ_RANGE_MAX_BW, 80_000);
+            try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.POWER_RULE_MAX_EIRP, 2000);
+            try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.DFS_CAC_TIME, 60_000);
+            try codec.nestEnd(&rules, one);
+
+            try codec.appendAttrString(gpa, &de, uapi.ATTR.REG_ALPHA2, "DE");
+            try codec.appendAttrU8(gpa, &de, uapi.ATTR.DFS_REGION, 2); // ETSI
+            const nest = try codec.nestBegin(gpa, &de, uapi.ATTR.REG_RULES);
+            try de.appendSlice(gpa, rules.items);
+            try codec.nestEnd(&de, nest);
+        }
+        self.push(de.items);
+
+        // The world domain: an alpha2 and no rules at all.
+        var world: std.ArrayList(u8) = .empty;
+        try codec.appendAttrString(gpa, &world, uapi.ATTR.REG_ALPHA2, "00");
+        self.push(world.items);
+
+        // An empty REG_RULES nest.
+        var empty_rules: std.ArrayList(u8) = .empty;
+        try codec.appendAttrString(gpa, &empty_rules, uapi.ATTR.REG_ALPHA2, "US");
+        {
+            const nest = try codec.nestBegin(gpa, &empty_rules, uapi.ATTR.REG_RULES);
+            try codec.nestEnd(&empty_rules, nest);
+        }
+        self.push(empty_rules.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // An alpha2 of the wrong length.
+        var bad_alpha: std.ArrayList(u8) = .empty;
+        try codec.appendAttrString(gpa, &bad_alpha, uapi.ATTR.REG_ALPHA2, "USA");
+        self.push(bad_alpha.items);
+        // A TLV header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 });
+        // A rules nest whose inner TLV is truncated — the shape that must not
+        // leak the rules allocated before it.
+        var leaky: std.ArrayList(u8) = .empty;
+        try codec.appendAttrString(gpa, &leaky, uapi.ATTR.REG_ALPHA2, "DE");
+        {
+            var rules: std.ArrayList(u8) = .empty;
+            const one = try codec.nestBegin(gpa, &rules, 1);
+            try codec.appendAttrU32(gpa, &rules, uapi.REG_RULE_ATTR.FREQ_RANGE_START, 5_250_000);
+            try codec.nestEnd(&rules, one);
+            try rules.appendSlice(gpa, &.{ 0x40, 0x00, 0x02, 0x00, 0x01 });
+            const nest = try codec.nestBegin(gpa, &leaky, uapi.ATTR.REG_RULES);
+            try leaky.appendSlice(gpa, rules.items);
+            try codec.nestEnd(&leaky, nest);
+        }
+        self.push(leaky.items);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: regulatory parse never crashes or leaks" {
-    try testing.fuzz({}, fuzzParse, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an empty attribute list, with
+    // the reply sitting unread in `raw`.
+    //
+    // ⛔ And it looked HEALTHIER that way: a reply with no
+    // attributes is a legal (empty) domain, so `parse("")` succeeded every
+    // round. Measured 2026-09-07 over the corpus above: **0 of 6 seeds
+    // non-empty, 6 of 6 "parsed" and 0 rules decoded before; 6 of 6 non-empty,
+    // 3 parsed and 1 rule after.** The rule count is the number that says the
+    // REG_RULES nest walk — everything this file is about — ran at all.
+    const len: usize = smith.slice(&raw);
     if (parse(testing.allocator, raw[0..len])) |d| {
         var dd = d;
         dd.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "corpus: every regulatory seed reaches the parser, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here, so "parsed" alone counts a harness that walks nothing as a
+    // success.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var rules: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        if (parse(testing.allocator, raw[0..len])) |d| {
+            parsed += 1;
+            var dd = d;
+            rules += dd.rules.len;
+            dd.deinit(testing.allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), parsed);
+    try testing.expectEqual(@as(usize, 1), rules);
 }

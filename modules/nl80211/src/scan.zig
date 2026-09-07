@@ -38,6 +38,9 @@ const netlink = @import("netlink");
 const codec = netlink.codec;
 const genl = @import("genetlink");
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const ie = @import("ie.zig");
 
 pub const BuildError = error{ OutOfMemory, InvalidRequest };
@@ -414,14 +417,95 @@ test "parseBss: elements() falls back to the beacon IEs" {
     try testing.expectEqualStrings("hi", b.ssid());
 }
 
+/// GET_SCAN reply attribute lists and bare BSS nests for `fuzzParse`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Built at run time by `codec`'s own encoders, the way the value tests
+/// above build theirs, rather than quoted as hex: an nl80211 attribute is a
+/// netlink TLV, whose length and scalars are HOST byte order, so a hex corpus
+/// would be a little-endian one and the counts pinned below would be false on
+/// a big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A whole BSS nest inside an ATTR.BSS wrapper: what `parseBss` takes.
+        var nest: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &nest, uapi.BSS.BSSID, &.{ 0x02, 0, 0, 0xaa, 0xbb, 0xcc });
+        try codec.appendAttrU32(gpa, &nest, uapi.BSS.FREQUENCY, 5500);
+        try codec.appendAttrU32(gpa, &nest, uapi.BSS.SIGNAL_MBM, @bitCast(@as(i32, -8100)));
+        try codec.appendAttrU16(gpa, &nest, uapi.BSS.CAPABILITY, 0x1111);
+        try codec.appendAttrU16(gpa, &nest, uapi.BSS.BEACON_INTERVAL, 100);
+        try codec.appendAttrU32(gpa, &nest, uapi.BSS.STATUS, 1);
+        try codec.appendAttrU32(gpa, &nest, uapi.BSS.SEEN_MS_AGO, 10240);
+        try codec.appendAttr(gpa, &nest, uapi.BSS.INFORMATION_ELEMENTS, &.{ 0, 3, 'a', 'p', '1', 3, 1, 6 });
+        var wrapped: std.ArrayList(u8) = .empty;
+        {
+            const off = try codec.nestBegin(gpa, &wrapped, uapi.ATTR.BSS);
+            try wrapped.appendSlice(gpa, nest.items);
+            try codec.nestEnd(&wrapped, off);
+        }
+        self.push(wrapped.items);
+        // The same nest bare, which is what `parseBssNest` takes.
+        self.push(nest.items);
+
+        // Beacon IEs only: the fallback path in `elements()`.
+        var beacon: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &beacon, uapi.BSS.BEACON_IES, &.{ 0, 2, 'h', 'i' });
+        self.push(beacon.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // The IE attribute twice: the second must not orphan the first copy.
+        var twice: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &twice, uapi.BSS.INFORMATION_ELEMENTS, &.{ 0, 1, 'a' });
+        try codec.appendAttr(gpa, &twice, uapi.BSS.INFORMATION_ELEMENTS, &.{ 0, 1, 'b' });
+        self.push(twice.items);
+        // A BSSID of the wrong width, after an IE copy has already been made.
+        var after_copy: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &after_copy, uapi.BSS.INFORMATION_ELEMENTS, &.{ 0, 1, 'a' });
+        try codec.appendAttr(gpa, &after_copy, uapi.BSS.BSSID, &.{ 1, 2, 3 });
+        self.push(after_copy.items);
+        // A truncated TLV inside the nest.
+        self.push(&[_]u8{ 0x40, 0x00, 0x01, 0x00, 0xff });
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: BSS parsing never crashes or leaks" {
-    try testing.fuzz({}, fuzzParse, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and both `parseBss` and `parseBssNest` were handed an empty attribute list, with
+    // the reply sitting unread in `raw`.
+    //
+    // ⛔ And it looked HEALTHIER that way: an empty nest is a
+    // legal BSS with every field absent, so `parseBssNest("")` succeeded every
+    // round. Measured 2026-09-07 over the corpus above: **0 of 6 seeds
+    // non-empty, 6 of 6 nests "parsed" and 0 BSSes found through the ATTR.BSS
+    // wrapper before; 6 of 6 non-empty, 3 nests parsed and 1 BSS found
+    // after.**
+    const len: usize = smith.slice(&raw);
     if (parseBss(testing.allocator, raw[0..len])) |maybe| {
         if (maybe) |bss| {
             var b = bss;
@@ -432,4 +516,40 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
         var b = bss;
         b.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "corpus: every scan seed reaches both parsers, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here, so "parsed" alone counts a harness that walks nothing as a
+    // success.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var nests: usize = 0;
+    var found: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        if (parseBss(testing.allocator, raw[0..len])) |maybe| {
+            if (maybe) |bss| {
+                found += 1;
+                var b = bss;
+                b.deinit(testing.allocator);
+            }
+        } else |_| {}
+        if (parseBssNest(testing.allocator, raw[0..len])) |bss| {
+            nests += 1;
+            var b = bss;
+            b.deinit(testing.allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), nests);
+    try testing.expectEqual(@as(usize, 1), found);
 }

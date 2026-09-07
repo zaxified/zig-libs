@@ -35,6 +35,9 @@
 
 const std = @import("std");
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const Error = error{
     /// An element header or body runs past the end of the stream.
@@ -888,14 +891,98 @@ test "summarize: a malformed RSN does not sink the rest of the beacon" {
     try testing.expectEqual(@as(?u8, 1), s.ds_channel); // parsing continued
 }
 
+/// 802.11 information-element streams for `fuzzIes`, laid out the way its
+/// draws read them: a `testkit.fuzz` slice seed (u32 length + bytes) and then
+/// an eight-octet little-endian word carrying the frequency handed to
+/// `Summary.security`.
+///
+/// ⚠ Unlike the netlink corpora elsewhere in this module, these need no
+/// encoder and no endian caveat: an IE stream is `id | len | body` octets,
+/// the same on every host. The value tests above are quoted verbatim.
+///
+/// ⛔ The frequency word is not decoration. `security(freq)` uses the band to
+/// decide between WEP and open on a BSS with no RSN, and the frequency used to
+/// come from `smith.value(u16)` — a 16-bit draw, therefore the range minimum,
+/// i.e. **0 for every seed**, which is not a channel.
+const IeSeed = struct { ies: []const u8, freq_mhz: u64 };
+
+const ie_seeds = [_]IeSeed{
+    // The honest WPA2-PSK beacon: SSID, rates, RSN with CCMP + PSK.
+    .{ .ies = &wpa2_psk_beacon, .freq_mhz = 2412 },
+    // The same beacon with a truncating vendor element spliced in front of
+    // the RSN — the downgrade this file's `security` contract exists for.
+    .{ .ies = wpa2_psk_beacon[0..9] ++ truncating_element ++ wpa2_psk_beacon[9..], .freq_mhz = 2412 },
+    // Truncation AFTER the RSN: the verdict must survive it.
+    .{ .ies = &(wpa2_psk_beacon ++ truncating_element), .freq_mhz = 5500 },
+    // An open BSS with nothing but an SSID and the same truncating element.
+    .{ .ies = &([_]u8{ 0, 3, 'a', 'b', 'c' } ++ truncating_element), .freq_mhz = 2412 },
+    // A WPA1 vendor element: OUI 00:50:f2, type 1, TKIP group + PSK AKM.
+    .{
+        .ies = &[_]u8{
+            0,   3,  'a',  'b',  'c',
+            221, 22, 0x00, 0x50, 0xf2,
+            0x01, 0x01, 0x00, // vendor type 1, WPA version 1
+            0x00, 0x50, 0xf2, 0x02, // group cipher TKIP
+            0x01, 0x00, 0x00, 0x50, 0xf2, 0x02, // 1 pairwise: TKIP
+            0x01, 0x00, 0x00, 0x50, 0xf2, 0x02, // 1 AKM: PSK
+        },
+        .freq_mhz = 2412,
+    },
+    // A malformed RSN that must not sink the rest of the beacon.
+    .{
+        .ies = &[_]u8{
+            0, 3, 'x', 'y', 'z',
+            48, 8, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0xff, 0xff, // lying count
+            3,  1, 1,
+        },
+        .freq_mhz = 5180,
+    },
+    // Zero-length elements: legal, and they must still advance the walk.
+    .{ .ies = &([_]u8{ 0, 0, 1, 0, 3, 0 } ** 8), .freq_mhz = 2437 },
+    // An extension element at the very end with no extension id, and an
+    // element declaring 200 octets over a four-octet stream.
+    .{ .ies = &[_]u8{ 255, 0 }, .freq_mhz = 5745 },
+    .{ .ies = &[_]u8{ 0, 200, 'a', 'b' }, .freq_mhz = 2412 },
+    // A valid element followed by a dangling header byte.
+    .{ .ies = &[_]u8{ 0, 1, 'x', 3 }, .freq_mhz = 2412 },
+};
+
+const IeCorpus = struct {
+    store: [4096]u8 = undefined,
+    entries: [ie_seeds.len][]const u8 = undefined,
+
+    fn build(self: *IeCorpus) []const []const u8 {
+        var used: usize = 0;
+        for (&self.entries, ie_seeds) |*out, sd| {
+            const head = testkit.fuzz.seedInto(self.store[used..], sd.ies);
+            std.mem.writeInt(u64, self.store[used + head.len ..][0..8], sd.freq_mhz, .little);
+            out.* = self.store[used..][0 .. head.len + 8];
+            used += head.len + 8;
+        }
+        return &self.entries;
+    }
+};
+
 test "fuzz: the IE walk never crashes on arbitrary bytes" {
-    try testing.fuzz({}, fuzzIes, .{});
+    var corpus: IeCorpus = .{};
+    try testing.fuzz({}, fuzzIes, .{ .corpus = corpus.build() });
 }
 
 fn fuzzIes(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and the whole walk below ran on an empty
+    // stream, with the beacon sitting unread in `raw`.
+    //
+    // ⛔ And it looked HEALTHIER that way: an empty IE stream is a legal one —
+    // the iterator yields nothing and `summarize` returns an all-absent
+    // Summary — so nothing ever failed. Measured 2026-09-07 over the corpus
+    // above: **0 of 10 seeds non-empty, 0 elements walked and 0 RSN or WPA1
+    // elements found before; 10 of 10 non-empty, 40 elements walked and 3
+    // found after.**
+    const len: usize = smith.slice(&raw);
     const buf = raw[0..len];
 
     var it: Iterator = .{ .buf = buf };
@@ -906,7 +993,10 @@ fn fuzzIes(_: void, smith: *std.testing.Smith) !void {
     std.mem.doNotOptimizeAway(&s);
     // The accessor, not just the parse — F1's fuzz gap was exactly a harness
     // that reached the struct and walked past the method that reads it.
-    std.mem.doNotOptimizeAway(&s.security(smith.value(u16)));
+    // ⚠ `value(u64)`, not `value(u16)`: a 16-bit draw is the range minimum for
+    // all but 1 in 2^48 seeds, so the band this verdict depends on was 0 —
+    // not a channel — on every replayed round.
+    std.mem.doNotOptimizeAway(&s.security(@as(u16, @truncate(smith.value(u64)))));
     // A truncated walk must never be classified as "no protection".
     if (s.truncated and s.rsn == null) std.debug.assert(s.security(0) == .unknown);
     if (parseRsn(buf)) |r| std.mem.doNotOptimizeAway(&r) else |_| {}
@@ -914,4 +1004,39 @@ fn fuzzIes(_: void, smith: *std.testing.Smith) !void {
     _ = find(buf, EID.SSID);
     _ = findExtension(buf, EXT_EID.HE_CAPABILITY);
     _ = findVendor(buf, oui_microsoft, vendor_type_wpa);
+}
+
+test "corpus: every IE seed reaches the walk, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over
+    // the SAME corpus the harness gets. `nonempty` is the reach claim and the
+    // only check that catches a seed grown past the 512-octet buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently.
+    //
+    // `elements` and `protected` are what "parsed without error" cannot say:
+    // the empty stream is a legal IE stream, so a collapsed harness walks zero
+    // elements and reports no failure at all. `freqs` pins that the frequency
+    // word — the band `security()` reads — arrived as written.
+    var corpus: IeCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var elements: usize = 0;
+    var protected: usize = 0;
+    var freqs: usize = 0;
+    for (entries, ie_seeds) |sd, spec| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        const freq: u16 = @truncate(smith.value(u64));
+        if (len != 0) nonempty += 1;
+        if (freq == @as(u16, @truncate(spec.freq_mhz))) freqs += 1;
+        const buf = raw[0..len];
+        var it: Iterator = .{ .buf = buf };
+        while (it.next() catch null) |_| elements += 1;
+        const s = summarize(buf);
+        if (s.rsn != null or s.wpa1 != null) protected += 1;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(entries.len, freqs);
+    try testing.expectEqual(@as(usize, 40), elements);
+    try testing.expectEqual(@as(usize, 3), protected);
 }
