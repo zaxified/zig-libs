@@ -517,6 +517,41 @@ test "stripBom composes with LineIterator: BOM-prefixed buffer yields a clean fi
 // surface (arbitrary CSV bytes) — must never panic, loop forever, or read
 // out of bounds, only yield records/fields or drop silently.
 
+/// `testkit.fuzz.seed`, aliased so the corpora below read as the CSV they are.
+/// A corpus entry is not the record: `Smith.slice` reads a little-endian `u32`
+/// length first, so a raw buffer would arrive minus its own first four octets.
+const seed = @import("testkit").fuzz.seed;
+
+/// The quoting characters both harnesses sweep. `quote` used to come from
+/// `smith.value(u8)` drawn AFTER the byte draw, which on a corpus replay is
+/// always 0 — the "no quoting at all" setting — so the entire quoted-field
+/// branch (and with it the `LazyQuotes` rule the F1 fix above is about) was
+/// unreachable from any seed. Swept rather than drawn: the fuzzer still drives
+/// the bytes, and every seed now visits both settings.
+const fuzz_quotes = [_]u8{ '"', 0 };
+
+/// The field separators `fuzzSplitFields` sweeps, for the same reason:
+/// `delimiter` was also drawn after the bytes and was therefore always 0, so
+/// no seed could ever produce more than one field.
+const fuzz_delims = [_]u8{ ',', ';', '\t' };
+
+/// Multi-record buffers, in the format the length draw reads. The shapes the
+/// value tests pin: both terminators, a bare CR, a quoted field spanning a
+/// newline, an unterminated quote (the scan runs to the end of the buffer —
+/// the loop this harness bounds), and a leading BOM.
+const line_seeds = [_][]const u8{
+    seed("name,age\nalice,30\nbob,31\n"), // the ordinary LF-terminated document
+    seed("name,age\r\nalice,30\r\n"), // CRLF
+    seed("a,b\rc,d\n"), // a bare CR inside the buffer
+    seed("\"multi\nline\",x\nnext,y\n"), // a newline inside a quoted field
+    seed("\"unterminated,x\ny\n"), // an unterminated quote: the scan runs to the end
+    seed("\xEF\xBB\xBFname,age\nalice,30\n"), // a leading BOM, unstripped
+    seed("a\n\nb\n"), // an empty record between two records
+    seed("no trailing terminator"), // the final record with no terminator at all
+    seed("\n\r\n\r"), // terminators only
+    seed("\"\"\"\",\"a\"\"b\"\n"), // doubled quotes, both as a whole field and inside one
+};
+
 test "fuzz: LineIterator never panics or loops on arbitrary bytes" {
     // `std.testing.fuzz`, spelled out rather than through this file's `t`
     // alias: `zig build check-fuzz` greps the SOURCE TEXT for the literal
@@ -524,43 +559,144 @@ test "fuzz: LineIterator never panics or loops on arbitrary bytes" {
     // harness's original form — was structurally invisible to the gate
     // despite genuinely running, which is why this module was flagged as
     // uncovered even though it already had two working harnesses.
-    try std.testing.fuzz({}, fuzzLineIterator, .{});
+    try std.testing.fuzz({}, fuzzLineIterator, .{ .corpus = &line_seeds });
 }
 
 fn fuzzLineIterator(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ This used to be `smith.bytes(&buf)` followed by
+    // `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` consumes
+    // `min(buf.len, in.len)` octets and the ranged draw then reads eight MORE
+    // as a little-endian u64, returning the range minimum when fewer remain —
+    // so `len` was 0 on every input a seed can carry, `it.next()` returned null
+    // at once, and the `steps <= len + 1` assertion below had never executed.
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const quote: u8 = smith.value(u8);
+    const len: usize = smith.slice(&buf);
 
-    var it = LineIterator.init(buf[0..len], quote, 0);
-    // Every record consumes at least one byte plus its terminator, so the
-    // number of records is bounded by the input length.
-    var steps: usize = 0;
-    while (it.next()) |_| {
-        steps += 1;
-        try t.expect(steps <= len + 1);
+    for (fuzz_quotes) |quote| {
+        var it = LineIterator.init(buf[0..len], quote, 0);
+        // Every record consumes at least one byte plus its terminator, so the
+        // number of records is bounded by the input length.
+        var steps: usize = 0;
+        while (it.next()) |_| {
+            steps += 1;
+            try t.expect(steps <= len + 1);
+        }
     }
 }
+
+test "corpus: every line seed reaches the iterator, and the records yielded are pinned" {
+    // Records yielded is the second number: `LineIterator.init("")` is legal
+    // and simply yields nothing, so "it did not error" was already true while
+    // the harness was seeing an empty buffer.
+    //
+    // ⚠ The record count is the SAME under both quote settings, and that is not
+    // an accident of these seeds — `next` treats '\n' as ending the record even
+    // inside an open quote (see the comment in `next`), so quoting cannot change
+    // how a buffer splits, only whether the split is reported as unbalanced.
+    // Writing this guard is what established that; the first draft asserted the
+    // two counts would differ, and it was wrong. `unbalanced` is therefore the
+    // number that separates the two settings, and it is the one the drawn knob
+    // could never reach: with `quote == 0` it is 0 for every input there is.
+    var nonempty: usize = 0;
+    var records: usize = 0;
+    var unbalanced_quoted: usize = 0;
+    var unbalanced_raw: usize = 0;
+    for (line_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        for (fuzz_quotes, [_]*usize{ &unbalanced_quoted, &unbalanced_raw }) |quote, counter| {
+            var it = LineIterator.init(buf[0..len], quote, 0);
+            while (it.next()) |rec| {
+                if (quote == fuzz_quotes[0]) records += 1;
+                if (rec.unbalanced_quote) counter.* += 1;
+            }
+        }
+    }
+    try t.expectEqual(line_seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 of 10 seeds arrived
+    // non-empty, 0 records were yielded and `unbalanced_quote` was never once
+    // set. After: 10 seeds / 17 records / 3 unbalanced with quoting on, 0 with
+    // quoting off — which is exactly the branch the drawn knob had disabled.
+    try t.expectEqual(@as(usize, 17), records);
+    try t.expectEqual(@as(usize, 3), unbalanced_quoted);
+    try t.expectEqual(@as(usize, 0), unbalanced_raw);
+}
+
+/// Single records, in the format the length draw reads: the `LazyQuotes`
+/// shapes the "a field ends only at a delimiter" test pins, plus the escape
+/// and allocation edges (a doubled quote forces the alloc path) and a record
+/// with more fields than the 64-slot buffer can hold.
+const field_seeds = [_][]const u8{
+    seed("a,b,c"), // three plain fields
+    seed("\"a\",b"), // an ordinary quoted field
+    seed("\"a\"b"), // LazyQuotes: a lone quote followed by a non-delimiter
+    seed("\"a,b\"c,d"), // …the same, with a delimiter inside the quoted run
+    seed("\"a\"\"b\",c"), // a doubled quote: this is the seed that allocates
+    seed("\"\"a"), // an empty quoted field immediately followed by data
+    seed("a;b;c"), // the ';' delimiter of the sweep
+    seed("a\tb\tc"), // the '\t' delimiter of the sweep
+    seed(",,,"), // empty fields only
+    seed("\"unterminated"), // the closing quote never arrives
+    seed("a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z,+,/,=,!"), // 66 fields against a 64-slot buffer
+};
 
 test "fuzz: splitFields never panics on arbitrary bytes" {
     // See the sibling harness above for why this is spelled out rather than
     // through the `t` alias.
-    try std.testing.fuzz({}, fuzzSplitFields, .{});
+    try std.testing.fuzz({}, fuzzSplitFields, .{ .corpus = &field_seeds });
 }
 
 fn fuzzSplitFields(_: void, smith: *std.testing.Smith) !void {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
 
+    // ⚠ Same collapse as the sibling: the length was 0 and both `delimiter`
+    // and `quote` were drawn after the bytes, so every seed reached
+    // `splitFields` as an empty record with delimiter 0 and quoting disabled.
     var line_buf: [256]u8 = undefined;
-    smith.bytes(&line_buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, line_buf.len);
-    const delimiter: u8 = smith.value(u8);
-    const quote: u8 = smith.value(u8);
+    const len: usize = smith.slice(&line_buf);
 
     var fields_buf: [64][]const u8 = undefined;
-    _ = splitFields(line_buf[0..len], &fields_buf, delimiter, quote, arena.allocator()) catch return;
+    for (fuzz_delims) |delimiter| {
+        for (fuzz_quotes) |quote| {
+            _ = splitFields(line_buf[0..len], &fields_buf, delimiter, quote, arena.allocator()) catch continue;
+        }
+    }
+}
+
+test "corpus: every field seed reaches splitFields, and the fields split are pinned" {
+    // Fields split is the second number: `splitFields("")` returns an empty
+    // slice without erroring, so an "it did not error" guard reads 100% on a
+    // harness seeing nothing. The count below cannot be produced by an empty
+    // record, and it also cannot be produced with `quote == 0`, which is what
+    // the drawn knob always was.
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var nonempty: usize = 0;
+    var fields: usize = 0;
+    var errors: usize = 0;
+    var fields_buf: [64][]const u8 = undefined;
+    for (field_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var line_buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&line_buf);
+        if (len != 0) nonempty += 1;
+        for (fuzz_delims) |delimiter| {
+            for (fuzz_quotes) |quote| {
+                const out = splitFields(line_buf[0..len], &fields_buf, delimiter, quote, arena.allocator()) catch {
+                    errors += 1;
+                    continue;
+                };
+                fields += out.len;
+            }
+        }
+    }
+    try t.expectEqual(field_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 11 seeds non-empty and 0 fields split before.
+    try t.expectEqual(@as(usize, 86), fields);
+    try t.expectEqual(@as(usize, 2), errors); // the 66-field seed against the 64-slot buffer, both quote settings
 }
 
 test "a field ends only at a delimiter or at end of record" {

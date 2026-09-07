@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Both fuzz harnesses were replaying an EMPTY record with
+  quoting DISABLED, and now sweep the knobs over a seeded corpus.** Each opened
+  with `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`;
+  `bytes` consumes `min(buf.len, in.len)` octets and the ranged draw then reads
+  eight *more* as a little-endian u64, returning the range minimum when fewer
+  remain — so the drawn length was 0 for every input a seed can carry.
+  `fuzzLineIterator`'s `steps <= len + 1` bound had therefore never executed once:
+  with `len == 0` the first `next()` returns null. Worse, `quote` (and, in
+  `fuzzSplitFields`, `delimiter`) were drawn AFTER the bytes and so were always 0
+  — `quote == 0` means "no quoting at all", so the entire quoted-field scan, the
+  `LazyQuotes` rule of the 2026-09-02 F1 fix, the doubled-quote unescape and its
+  allocation path, and `unbalanced_quote` were unreachable from any input the
+  harness could ever be handed. Now one `smith.slice(&buf)` draw plus an explicit
+  sweep over `quote ∈ {'"', 0}` and `delimiter ∈ {',', ';', '\t'}`, with a
+  10-seed record corpus and an 11-seed field corpus. Measured 2026-09-07:
+  0 records, 0 fields and 0 `unbalanced_quote` flags before; 17 records,
+  3 unbalanced flags (0 with quoting off), 86 fields and 2 `FieldBufferTooSmall`
+  refusals after.
 - **2026-09-02** — Drift re-audit (W2, window `0575340..HEAD`). Nine findings, all fixed.
   Oracles: Python 3 `csv` and Go `encoding/csv` with `LazyQuotes=true` (the model this module's
   own docs name), over ~21 700 random reader inputs and ~6 000 writer rows.

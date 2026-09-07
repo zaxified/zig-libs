@@ -615,14 +615,79 @@ test "RFC 8288 §3.5: a comma-joined value carries two links, same as two header
 }
 
 // ── fuzz: untrusted `Link` header parsing never panics ──────────────────────
+//
+// ⚠ This harness used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so `len` was 0 for every
+// input a corpus can carry, and `parse` was handed an empty slice while the
+// header sat unread in `buf`. It also had no corpus at all, so outside `--fuzz`
+// it ran exactly one input for ever: the empty one. One `slice` draw closes the
+// first half, the corpus below the second.
+
+/// `testkit.fuzz.seed`, aliased so the corpus reads as the header values it is.
+/// A corpus entry is not the frame: `Smith.slice` reads a little-endian `u32`
+/// length first, so a raw header would arrive minus its own first four octets.
+const seed = @import("testkit").fuzz.seed;
+
+/// `Link` header values, in the format the length draw reads. Every shape the
+/// value tests above pin: the quoting edges (a `,` and a `;` inside a quoted
+/// param, a `\`-escaped quote), the desync candidates (unknown params carrying
+/// separators, a stray empty param name, a repeated param), and the three ways
+/// a segment is malformed (no brackets, no rel, an unterminated bracket — which
+/// makes the URI scan run to the end of the header, the loop this bounds).
+const parse_seeds = [_][]const u8{
+    seed("<https://api/x?page=2>; rel=\"next\""), // the smallest complete link
+    seed("<u1>; rel=\"next\"; title=\"Page 2\"; type=\"application/json\", <u2>; rel=\"prev\"; hreflang=\"en\""), // two links, all four modeled params
+    seed("<u>; rel=next; type=text/html"), // token (unquoted) param values
+    seed("  <u>  ;  rel = \"next\" ,  <v> ; rel=\"prev\"  "), // OWS everywhere the grammar allows it
+    seed("<https://api/x?ids=1,2,3>; rel=\"next\""), // a ',' inside the URI must not split the value
+    seed("<u>; rel=\"next\"; title=\"a\\\"b\""), // a '\'-escaped quote inside a quoted value
+    seed("<u>; rel=\"next\"; title=\"a, b; c\", <v>; rel=\"prev\""), // ',' and ';' inside a quoted value
+    seed("<u>; foo=bar; rel=\"next\"; baz=\"x, y\"; media=screen"), // unknown params carrying separators
+    seed("<u>;;rel=\"next\";title=\"T\""), // a stray empty param name between the URI and the params
+    seed("<u>; REL=\"next\"; Title=\"T\""), // param names are case-insensitive
+    seed("<u>; rel=\"next\"; rel=\"prev\"; title=\"A\"; title=\"B\""), // first occurrence wins
+    seed("garbage, <u>; title=\"no rel\", <v>; rel=\"next\""), // two malformed segments before a good one
+    seed("<https://api/x; rel=\"next\""), // unterminated '<': the URI scan runs to the end
+    seed("   \t ,,,"), // whitespace and empty segments only — yields nothing
+    seed("<http://example.com/TheBook/chapter2>; rel=\"previous\"; title=\"previous chapter\""), // RFC 8288 §3.5
+    seed("</terms>; rel=\"copyright\"; anchor=\"#foo\""), // RFC 8288 §3.5, an unmodeled param
+};
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     var it = parse(buf[0..len]);
     while (it.next()) |_| {}
 }
 test "fuzz parse never panics" {
-    try testing.fuzz({}, fuzzParse, .{});
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
+}
+
+test "corpus: every seed reaches the parser, and the links yielded are pinned" {
+    // Links yielded is the second number, and it is the one that matters here:
+    // `parse("")` is legal — it yields nothing and returns cleanly — so there is
+    // no error path a guard could count, and "it did not crash" was already true
+    // when the harness was seeing nothing at all. An empty input yields exactly
+    // zero links, so this count is what falls if the draw ever collapses again.
+    var nonempty: usize = 0;
+    var links: usize = 0;
+    var with_title: usize = 0;
+    for (parse_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var it = parse(buf[0..len]);
+        while (it.next()) |l| {
+            links += 1;
+            if (l.title != null) with_title += 1;
+        }
+    }
+    try testing.expectEqual(parse_seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 of 16 seeds arrived
+    // non-empty and 0 links were yielded. After: 16 / 17 / 7.
+    try testing.expectEqual(@as(usize, 17), links);
+    try testing.expectEqual(@as(usize, 7), with_title);
 }
