@@ -27,6 +27,8 @@
 //! GLV paths are differentially pinned to (and the non-gated fallback).
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 const gate = @import("gate.zig");
 const field = @import("field.zig");
 const scalarmod = @import("scalar.zig");
@@ -757,25 +759,125 @@ test "recoverY / lift_x matches std" {
 // valid encodings (identity/compressed/uncompressed) plus fully random
 // bytes for the invalid-tag/short-input path.
 
+/// ⛔ A secp256k1 point in the form `fromSec1` accepts is not reachable from
+/// arbitrary bytes — the x-coordinate has to have a square `y` — so the
+/// accepted frames come from the module's own `toCompressedSec1` /
+/// `toUncompressedSec1`. Each seed is the encoding as a `testkit.fuzz` slice
+/// seed followed by the `u64` word the tag knob after it reads; without that
+/// word the knob is dead on a corpus replay and would rewrite `buf[0]` to 0 on
+/// every seed, turning each of them into the identity encoding.
+const Sec1Corpus = struct {
+    store: [10 * (4 + 65 + 8)]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    /// `tag`: 0..3 rewrite `buf[0]` to `0`/`2`/`3`/`4`, 4 draws an arbitrary
+    /// octet, 5 leaves the frame alone.
+    fn push(self: *Sec1Corpus, frame: []const u8, tag: u64) void {
+        const start = self.used;
+        var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
+        std.mem.writeInt(u64, self.store[at..][0..8], tag, .little);
+        at += 8;
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *Sec1Corpus) []const []const u8 {
+        const g = Secp256k1.basePoint;
+        const g2 = g.dbl();
+        const comp = g.toCompressedSec1();
+        const uncomp = g.toUncompressedSec1();
+        self.push(&comp, 5); // 02/03 ‖ x — the base point, untouched
+        self.push(&uncomp, 5); // 04 ‖ x ‖ y
+        self.push(&g2.toCompressedSec1(), 5); // 2·G, a DIFFERENT point
+        self.push(&[_]u8{0}, 5); // the one-octet identity encoding
+        // The tag rewritten to each of the four valid values over a body that
+        // does not match it — the disagreement path.
+        self.push(&uncomp, 1); // 04-length body relabelled compressed
+        self.push(&comp, 3); // 33-octet body relabelled uncompressed
+        var bad_x = comp;
+        bad_x[1] ^= 0x01; // an x with no square y: `recoverY` must refuse
+        self.push(&bad_x, 5);
+        self.push(comp[0..16], 5); // truncated mid-x
+        self.push(&uncomp, 4); // an arbitrary tag octet
+        self.push("", 5); // and the input this target used to run for ever
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: fromSec1 never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzFromSec1, .{});
+    var corpus: Sec1Corpus = .{};
+    try std.testing.fuzz({}, fuzzFromSec1, .{ .corpus = corpus.build() });
 }
 
 fn fuzzFromSec1(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input this target ever ran outside
+    // `--fuzz` (a ranged draw needs eight octets and `bytes` had eaten them),
+    // so `fromSec1` was handed a zero-length slice every round and returned
+    // `InvalidEncoding` off its length check with the point unread in `buf`.
     var buf: [65]u8 = undefined;
-    smith.bytes(&buf);
-    const tag: u8 = switch (smith.valueRangeAtMost(u8, 0, 4)) {
+    const len: usize = smith.slice(&buf);
+    if (len != 0) buf[0] = switch (smith.valueRangeAtMost(u8, 0, 5)) {
         0 => 0,
         1 => 2,
         2 => 3,
         3 => 4,
-        else => smith.value(u8),
+        4 => smith.value(u8),
+        // Leave the frame's own tag alone — what a seeded real encoding needs.
+        else => buf[0],
     };
-    buf[0] = tag;
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-    if (len == 0) {
-        _ = Secp256k1.fromSec1(&.{}) catch return;
-        return;
-    }
     _ = Secp256k1.fromSec1(buf[0..len]) catch {};
+}
+
+test "corpus: every SEC1 seed reaches the decoder, and the counts are pinned" {
+    var corpus: Sec1Corpus = .{};
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The number the collapsed draw could not produce, and that
+    // `accepted > 0` could not have held up: DISTINCT points decoded. The
+    // one-octet identity encoding is legal and decodes while carrying no
+    // coordinate at all, so acceptance alone says nothing about reach.
+    var seen: [4][33]u8 = undefined;
+    var distinct: usize = 0;
+    var tags_seen: [6]bool = @splat(false);
+    for (corpus.build()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [65]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (len != 0) {
+            const which = smith.valueRangeAtMost(u8, 0, 5);
+            tags_seen[which] = true;
+            buf[0] = switch (which) {
+                0 => 0,
+                1 => 2,
+                2 => 3,
+                3 => 4,
+                4 => smith.value(u8),
+                else => buf[0],
+            };
+        }
+        const p = Secp256k1.fromSec1(buf[0..len]) catch continue;
+        accepted += 1;
+        const enc = p.toCompressedSec1();
+        var already = false;
+        for (seen[0..distinct]) |prev| {
+            if (std.mem.eql(u8, &prev, &enc)) already = true;
+        }
+        if (!already) {
+            seen[distinct] = enc;
+            distinct += 1;
+        }
+    }
+    try std.testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
+    try std.testing.expectEqual(@as(usize, 4), accepted);
+    try std.testing.expectEqual(@as(usize, 3), distinct);
+    // The tag knob is alive on a corpus replay, not pinned at 0.
+    try std.testing.expectEqual(true, tags_seen[1]);
+    try std.testing.expectEqual(true, tags_seen[3]);
+    try std.testing.expectEqual(true, tags_seen[4]);
+    try std.testing.expectEqual(true, tags_seen[5]);
 }

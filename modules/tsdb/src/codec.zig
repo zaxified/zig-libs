@@ -26,6 +26,8 @@
 //!    (`minInt → 0`, `maxInt → maxInt`), restoring the identity.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 
 const Allocator = std.mem.Allocator;
 
@@ -499,23 +501,143 @@ test "value codec round trip incl. non-finite samples" {
 fn fuzzParseCanonical(_: void, smith: *std.testing.Smith) !void {
     const gpa = std.testing.allocator;
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input this target ever ran outside
+    // `--fuzz` (a ranged draw needs eight octets and `bytes` had eaten them),
+    // so `parseCanonical` was handed a zero-length slice every round and
+    // failed at `takeLenPrefixed` with the descriptor unread in `buf`.
+    const len: usize = smith.slice(&buf);
     var d = parseCanonical(gpa, buf[0..len]) catch return;
     d.deinit(gpa);
 }
 
+/// ⛔ Built from `canonicalize`, the module's own encoder: a canonical
+/// descriptor is a nest of length-prefixed components, and arbitrary octets
+/// essentially never spell one (the `count` and every prefix have to agree
+/// with the bytes that follow, and the trailing-byte check has to come out
+/// exact). The refusals are hand-built, because those a draw CAN produce.
+const CanonCorpus = struct {
+    store: [12 * (4 + 256)]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *CanonCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn encoded(gpa: Allocator, name: []const u8, labels: []const Label) []const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        canonicalize(gpa, &out, name, labels) catch unreachable;
+        return out.items;
+    }
+
+    fn build(self: *CanonCorpus, gpa: Allocator) []const []const u8 {
+        const two = encoded(gpa, "http_requests_total", &.{
+            .{ .name = "method", .value = "GET" },
+            .{ .name = "status", .value = "200" },
+        });
+        self.push(two); // two labels, sorted
+        self.push(encoded(gpa, "up", &.{})); // count = 0: header only
+        self.push(encoded(gpa, "", &.{.{ .name = "", .value = "" }})); // empty components
+        // ⛔ The finding this decoder's shape invites: `count` drives
+        // `gpa.alloc(Label, count)`. Here it claims 65535 labels over a frame
+        // that carries two — the allocation must not be committed to.
+        const lying = gpa.dupe(u8, two) catch unreachable;
+        const count_at = 2 + "http_requests_total".len;
+        std.mem.writeInt(u16, lying[count_at..][0..2], 0xffff, .big);
+        self.push(lying);
+        const count_off = gpa.dupe(u8, two) catch unreachable;
+        std.mem.writeInt(u16, count_off[count_at..][0..2], 1, .big); // one label short: trailing bytes
+        self.push(count_off);
+        self.push(two[0 .. two.len - 1]); // truncated inside the last value
+        self.push(two[0..1]); // a length prefix with nothing behind it
+        var trailing = gpa.alloc(u8, two.len + 1) catch unreachable;
+        @memcpy(trailing[0..two.len], two);
+        trailing[two.len] = 0xff; // one octet past a complete descriptor
+        self.push(trailing);
+        self.push(""); // and the input this target used to run for ever
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: parseCanonical never panics or leaks on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseCanonical, .{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var corpus: CanonCorpus = .{};
+    try testing.fuzz({}, fuzzParseCanonical, .{ .corpus = corpus.build(arena.allocator()) });
 }
+
+test "corpus: every canonical seed reaches the parser, and the counts are pinned" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var corpus: CanonCorpus = .{};
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The number the empty replay cannot produce, and that `accepted > 0`
+    // could not have held up: labels actually decoded. The `count = 0`
+    // descriptor is accepted while walking no label at all.
+    var labels: usize = 0;
+    for (corpus.build(arena.allocator())) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var d = parseCanonical(gpa, buf[0..len]) catch continue;
+        defer d.deinit(gpa);
+        accepted += 1;
+        labels += d.labels.len;
+    }
+    try testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 3), labels);
+}
+
+/// A point key is exactly `point_key_len` octets and a fixed tag; the only
+/// interesting inputs are that length and the ones around it.
+const point_key_seeds = [_][]const u8{
+    testkit.fuzz.seed(&pointKey(1, 0)), // a real key at the epoch
+    testkit.fuzz.seed(&pointKey(0xdead_beef_dead_beef, std.math.minInt(Timestamp))),
+    testkit.fuzz.seed(&pointKey(7, std.math.maxInt(Timestamp))),
+    testkit.fuzz.seed(&(pointKey(1, 0) ++ [_]u8{0})), // one octet too long
+    testkit.fuzz.seed(pointKey(1, 0)[0 .. point_key_len - 1]), // one too short
+    testkit.fuzz.seed(&([_]u8{0xff} ++ pointKey(1, 0)[1..].*)), // the wrong tag
+    testkit.fuzz.seed(""), // and the input this target used to run for ever
+};
 
 fn fuzzDecodePointKey(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ Same as above: this target's length draw was 0 on every input, so
+    // `decodePointKey` never saw a key of the one length it accepts.
+    const len: usize = smith.slice(&buf);
     _ = decodePointKey(buf[0..len]);
 }
 
 test "fuzz: decodePointKey never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodePointKey, .{});
+    try testing.fuzz({}, fuzzDecodePointKey, .{ .corpus = &point_key_seeds });
+}
+
+test "corpus: the point-key seeds reach the decoder, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    // The round trip is the second number: a decoded key must carry back the
+    // series and timestamp its own octets encode, which an all-zero replay
+    // (or any wrong-length seed) cannot demonstrate.
+    var round_tripped: usize = 0;
+    for (point_key_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const ref = decodePointKey(buf[0..len]) orelse continue;
+        decoded += 1;
+        if (std.mem.eql(u8, buf[0..len], &pointKey(ref.series, ref.ts))) round_tripped += 1;
+    }
+    try testing.expectEqual(point_key_seeds.len - 1, nonempty); // all but the empty seed
+    try testing.expectEqual(@as(usize, 3), decoded);
+    try testing.expectEqual(@as(usize, 3), round_tripped);
 }

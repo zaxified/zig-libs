@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** - Test-only, no production change: `fuzzOpen`'s mutation arm - the only one
+  that ever hands `Env.open` a real envelope, and therefore the only one that can reach
+  `open`'s body at all - had never executed. Its first draw was `smith.value(u8) & 1`, a
+  bounded draw that returns its range minimum unless a whole eight-octet word lands inside
+  the range, and the target had no corpus; so `mode` was 0 on every input the ordinary lane
+  ever ran, its own length draw was 0 too, and the single call the harness ever made was
+  `Env.open("")`. The harness's own oracle - "a successful open is only possible for a
+  byte-identical copy of the base envelope; assert it really is the original plaintext" -
+  had never been evaluated. The byte draw now comes first and the flip script is read out of
+  it through `testkit.fuzz.Cursor`. Measured by the new `corpus:` guard: 3 raw-arm and **5
+  mutation-arm** runs, **11 flips applied**, and **1 successful open** which is what makes
+  that plaintext assertion a live one - all three were 0 before.
+
 - **2026-08-13** — Test-only: `security_test.zig` gained "entropy seam: generate
   draws all three fields afresh, and two seals differ". **Neither BREAKING
   nor BEHAVIOURAL** — no production code changed; this adds the coverage

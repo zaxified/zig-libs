@@ -38,6 +38,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const hash256 = @import("hash256.zig");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
+/// Test-only: the two reference transactions the fuzz corpus is cut from.
+const kat_vectors = @import("tx_kat_vectors.zig");
 
 // ── CompactSize (Bitcoin's varint) ──────────────────────────────────────────
 
@@ -766,29 +770,154 @@ test "deserializePartial reports the exact byte count consumed (no forced whole-
 // -- with fully random bytes the rest, so the multi-byte 0xfd/0xfe/0xff
 // CompactSize forms and the marker/flag/witness disambiguation also get
 // hit.
+/// ⚠ 256 was too small for the module's OWN reference transactions: the
+/// smaller of the two `tx_kat_vectors` fixtures is 275 octets and the largest
+/// row of `tx_wire_vectors` (Bitcoin Core's `tx_valid.json`/`tx_invalid.json`)
+/// is 1911. A seed longer than the buffer does not arrive truncated, it reads
+/// back EMPTY -- `Smith.slice` checks the declared length against
+/// `rangeAtMost(0, buf.len)` and falls back to the range minimum -- so at 256
+/// not one real Bitcoin transaction this module owns could ever have passed
+/// through its own decoder harness.
+pub const fuzz_tx_buf_len = 2048;
+
+/// A corpus entry for a `smith.slice` harness whose later draws are knobs:
+/// `testkit.fuzz.seedInto` frames the transaction, and `tail` supplies the
+/// little-endian `u64` words the ranged draws after it read. ⛔ Without the
+/// tail every knob is dead on a corpus replay -- `Smith` returns the range
+/// MINIMUM once the input is short, so `which` would be 0 on every seed and
+/// the branch that leaves a real frame alone would never run.
+fn TxCorpus(comptime cap: usize, comptime store_len: usize) type {
+    return struct {
+        store: [store_len]u8 = undefined,
+        used: usize = 0,
+        entries: [cap][]const u8 = undefined,
+        n: usize = 0,
+
+        fn push(self: *@This(), frame: []const u8, tail: []const u64) void {
+            const start = self.used;
+            var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
+            for (tail) |w| {
+                std.mem.writeInt(u64, self.store[at..][0..8], w, .little);
+                at += 8;
+            }
+            self.entries[self.n] = self.store[start..at];
+            self.used = at;
+            self.n += 1;
+        }
+    };
+}
+
+/// Comptime hex, so the wire fixtures can be spelled the way the vectors file
+/// spells them.
+fn hexBytes(comptime h: []const u8) [h.len / 2]u8 {
+    @setEvalBranchQuota(@max(1000, 60 * h.len));
+    var out: [h.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
+    return out;
+}
+
+const kat_legacy = hexBytes(kat_vectors.legacy_raw_tx_hex);
+const kat_segwit = hexBytes(kat_vectors.segwit_raw_tx_hex);
+
+/// Test-only: `root.zig`'s decode->sighash harness is cut from the same two
+/// reference transactions, and cannot import `tx_kat_vectors` through a path
+/// that would make it a production dependency of `tx.zig`'s consumers.
+pub const fuzz_kat_legacy = kat_legacy;
+pub const fuzz_kat_segwit = kat_segwit;
+
+/// `which == 3` leaves the frame untouched; the other three are the original
+/// bias, which only matters for arbitrary bytes.
+const DeserCorpus = TxCorpus(8, 8 * (4 + fuzz_tx_buf_len + 8));
+
+fn buildDeserCorpus(self: *DeserCorpus) []const []const u8 {
+    self.push(&kat_legacy, &.{3}); // the 275-octet legacy KAT, untouched
+    self.push(&kat_segwit, &.{3}); // the 343-octet BIP144 KAT, marker + witness
+    self.push(kat_legacy[0..100], &.{3}); // truncated mid-scriptSig
+    self.push(&kat_legacy, &.{ 0, 2 }); // vin count rewritten to 2: one input short
+    self.push(&kat_legacy, &.{1}); // vin count rewritten to the segwit marker
+    self.push(kat_segwit[0..5], &.{3}); // version + marker and nothing after
+    self.push(&[_]u8{ 0x01, 0x00, 0x00 }, &.{3}); // shorter than the version field
+    self.push("", &.{3}); // and the input this target used to run for ever
+    return self.entries[0..self.n];
+}
+
 test "fuzz: deserializePartial never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDeserializePartial, .{});
+    var corpus: DeserCorpus = .{};
+    try testing.fuzz({}, fuzzDeserializePartial, .{ .corpus = buildDeserCorpus(&corpus) });
 }
 
 fn fuzzDeserializePartial(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
-    var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
+    var buf: [fuzz_tx_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length. The
+    // latter drew `len == 0` on every input this target ever ran outside
+    // `--fuzz`: a ranged draw reads eight octets as a little-endian u64 and
+    // returns the range MINIMUM when fewer than eight remain, and `bytes` had
+    // already eaten them. With no corpus either, the one input was `""` -- so
+    // `deserializePartial` had never decoded a transaction here.
+    const len: usize = smith.slice(&buf);
 
     // Bias the byte right after the 4-byte version field (where a
     // CompactSize vin-count, or the 0x00 segwit marker, is read) toward
-    // small counts / the marker byte / random -- three-way split so all
-    // three code paths (legacy-small-count, segwit-marker, arbitrary
-    // multi-byte-form) get real traffic.
-    if (buf.len > 4) {
-        buf[4] = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+    // small counts / the marker byte / random -- so that ARBITRARY bytes
+    // reach the three code paths instead of dying on the vin-count
+    // truncation check. `else` leaves the frame alone, which is what a seed
+    // carrying a real transaction needs; the knob is readable because every
+    // seed carries a `u64` tail word for it.
+    if (len > 4) {
+        buf[4] = switch (smith.valueRangeAtMost(u8, 0, 3)) {
             0 => smith.valueRangeAtMost(u8, 0, 4), // small vin count
             1 => 0x00, // segwit marker
-            else => smith.value(u8),
+            2 => smith.value(u8),
+            else => buf[4],
         };
     }
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
 
     var r = deserializePartial(allocator, buf[0..len]) catch return;
     defer r.tx.deinit(allocator);
+}
+
+test "corpus: deserializePartial seeds reach the decoder, and the counts are pinned" {
+    const allocator = testing.allocator;
+    var corpus: DeserCorpus = .{};
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The number an empty input cannot produce, and that `accepted > 0`
+    // would not have held up: total inputs walked out of the decoded
+    // transactions. It only moves when a seed's own octets reach the vin loop.
+    var vin_total: usize = 0;
+    var witness_seen: usize = 0;
+    var which_seen: [4]bool = @splat(false);
+    for (buildDeserCorpus(&corpus)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [fuzz_tx_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        // Mirrors the harness exactly, `if (len > 4)` included: a guard that
+        // draws where the harness does not is measuring a different corpus.
+        if (len > 4) {
+            const which = smith.valueRangeAtMost(u8, 0, 3);
+            which_seen[which] = true;
+            buf[4] = switch (which) {
+                0 => smith.valueRangeAtMost(u8, 0, 4),
+                1 => 0x00,
+                2 => smith.value(u8),
+                else => buf[4],
+            };
+        }
+        var r = deserializePartial(allocator, buf[0..len]) catch continue;
+        defer r.tx.deinit(allocator);
+        accepted += 1;
+        vin_total += r.tx.vin.len;
+        if (r.tx.has_witness) witness_seen += 1;
+    }
+    try testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try testing.expectEqual(@as(usize, 3), vin_total);
+    try testing.expectEqual(@as(usize, 1), witness_seen);
+    // The knob is alive on a corpus replay, which is the half a seed alone
+    // cannot fix: three of its four branches actually ran.
+    try testing.expectEqual(true, which_seen[0]);
+    try testing.expectEqual(true, which_seen[1]);
+    try testing.expectEqual(true, which_seen[3]);
 }

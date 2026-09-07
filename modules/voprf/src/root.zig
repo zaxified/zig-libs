@@ -921,26 +921,177 @@ test "deserializeScalar enforces canonicity" {
 // width encoding), plus the identity/all-0xff edge cases already unit-tested
 // above are folded in via biased byte fills.
 
+/// The frames both corpora are cut from.
+///
+/// ⛔ A ristretto255 element in the form `Element.fromBytes` accepts is not
+/// reachable from arbitrary bytes — the encoding has to survive RFC 9496
+/// Decode, which rejects most 32-octet strings outright — so the accepted
+/// frames come from the module's own `toBytes`. The refusals are literals,
+/// because those a draw CAN produce.
+const Fixtures = struct {
+    /// The ristretto255 base point, and `2·G`, so the corpus carries two
+    /// distinct accepted elements rather than one repeated.
+    g: [Ne]u8 = undefined,
+    g2: [Ne]u8 = undefined,
+    /// A real `Proof`: two canonical scalars, `c ‖ s`.
+    proof: [Proof.encoded_length]u8 = undefined,
+
+    fn build(self: *Fixtures) void {
+        self.g = Element.generator.toBytes();
+        const two = Element{ .p = Element.generator.p.add(Element.generator.p) };
+        self.g2 = two.toBytes();
+        const c = deserializeScalar([_]u8{2} ++ [_]u8{0} ** 31) catch unreachable;
+        const s = deserializeScalar([_]u8{3} ++ [_]u8{0} ** 31) catch unreachable;
+        self.proof = (Proof{ .c = c, .s = s }).toBytes();
+    }
+};
+
+/// ⚠ A `smith.bytes(&buf)` harness reads its corpus entry RAW — no `u32`
+/// length header — so these are the 32/64-octet frames themselves, each
+/// followed by the `u64` word the mode knob after the byte draw reads.
+/// ⛔ Without that word the knob is dead on a corpus replay: it would be 0
+/// (`memset` to zero) on every seed, and every element frame would be
+/// overwritten before `fromBytes` saw it.
+const ElementCorpus = struct {
+    store: [7][Ne + 8]u8 = undefined,
+    entries: [7][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ElementCorpus, frame: [Ne]u8, mode: u64) void {
+        @memcpy(self.store[self.n][0..Ne], &frame);
+        std.mem.writeInt(u64, self.store[self.n][Ne..][0..8], mode, .little);
+        self.entries[self.n] = &self.store[self.n];
+        self.n += 1;
+    }
+
+    fn build(self: *ElementCorpus, fx: *const Fixtures) []const []const u8 {
+        self.push(fx.g, 2); // the base point, untouched
+        self.push(fx.g2, 2); // 2·G — a DIFFERENT accepted element
+        var t = fx.g;
+        t[31] ^= 0x80; // the high bit RFC 9496 Decode requires to be clear
+        self.push(t, 2);
+        t = fx.g;
+        t[0] ^= 0x01; // one octet inside the field element: not a valid encoding
+        self.push(t, 2);
+        self.push(@splat(0), 0); // mode 0 — the canonical identity, rejected
+        self.push(@splat(0), 1); // mode 1 — all-0xff, non-canonical junk
+        self.push(@splat(0), 2); // the all-zero buffer straight through
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: Element.fromBytes never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzElementFromBytes, .{});
+    var fx: Fixtures = .{};
+    fx.build();
+    var corpus: ElementCorpus = .{};
+    try std.testing.fuzz({}, fuzzElementFromBytes, .{ .corpus = corpus.build(&fx) });
 }
 
 fn fuzzElementFromBytes(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ The byte draw comes FIRST. It used to come last, behind
+    // `smith.valueRangeAtMost(u8, 0, 2)` — a ranged draw, which returns the
+    // range MINIMUM unless a whole eight-octet word lands inside it — so with
+    // no corpus the mode was 0 on every input this target ever ran outside
+    // `--fuzz`, and the only thing it ever decoded was the all-zero identity
+    // encoding. The `smith.bytes` branch had never executed.
     var buf: [Ne]u8 = undefined;
+    smith.bytes(&buf);
     switch (smith.valueRangeAtMost(u8, 0, 2)) {
         0 => @memset(&buf, 0), // canonical identity encoding
         1 => @memset(&buf, 0xff), // non-canonical junk
-        else => smith.bytes(&buf),
+        else => {}, // the drawn (or seeded) octets, untouched
     }
     _ = Element.fromBytes(buf) catch {};
 }
 
+const ProofCorpus = struct {
+    store: [6][Proof.encoded_length]u8 = undefined,
+    entries: [6][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ProofCorpus, frame: [Proof.encoded_length]u8) void {
+        self.store[self.n] = frame;
+        self.entries[self.n] = &self.store[self.n];
+        self.n += 1;
+    }
+
+    fn build(self: *ProofCorpus, fx: *const Fixtures) []const []const u8 {
+        self.push(fx.proof); // two canonical scalars
+        var t = fx.proof;
+        t[31] = 0xff; // c's top octet: the three high bits must be clear
+        self.push(t);
+        t = fx.proof;
+        t[63] = 0xff; // the same in s
+        self.push(t);
+        self.push(@splat(0)); // c = s = 0, canonical, so this is accepted
+        self.push(@splat(0xff)); // both non-canonical
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: Proof.fromBytes never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzProofFromBytes, .{});
+    var fx: Fixtures = .{};
+    fx.build();
+    var corpus: ProofCorpus = .{};
+    try std.testing.fuzz({}, fuzzProofFromBytes, .{ .corpus = corpus.build(&fx) });
 }
 
 fn fuzzProofFromBytes(_: void, smith: *std.testing.Smith) !void {
     var buf: [Proof.encoded_length]u8 = undefined;
     smith.bytes(&buf);
     _ = Proof.fromBytes(buf) catch {};
+}
+
+test "corpus: the element and proof seeds reach their decoders, and the counts are pinned" {
+    var fx: Fixtures = .{};
+    fx.build();
+
+    var el_corpus: ElementCorpus = .{};
+    var el_accepted: usize = 0;
+    // ⛔ The number the collapsed harness could not produce: DISTINCT elements
+    // decoded. It only ever saw the all-zero identity encoding, which is
+    // refused, so this was 0 — and an `accepted > 0` guard would have been
+    // satisfied by a single repeated base point.
+    var seen: [4][Ne]u8 = undefined;
+    var distinct: usize = 0;
+    var modes_seen: [3]bool = @splat(false);
+    for (el_corpus.build(&fx)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Ne]u8 = undefined;
+        smith.bytes(&buf);
+        const mode = smith.valueRangeAtMost(u8, 0, 2);
+        modes_seen[mode] = true;
+        switch (mode) {
+            0 => @memset(&buf, 0),
+            1 => @memset(&buf, 0xff),
+            else => {},
+        }
+        const e = Element.fromBytes(buf) catch continue;
+        el_accepted += 1;
+        const enc = e.toBytes();
+        var already = false;
+        for (seen[0..distinct]) |prev| {
+            if (std.mem.eql(u8, &prev, &enc)) already = true;
+        }
+        if (!already) {
+            seen[distinct] = enc;
+            distinct += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), el_accepted);
+    try std.testing.expectEqual(@as(usize, 2), distinct);
+    // All three mode branches ran — the knob is alive on a corpus replay,
+    // which no number of element seeds alone could have achieved.
+    for (modes_seen) |m| try std.testing.expect(m);
+
+    var pf_corpus: ProofCorpus = .{};
+    var pf_accepted: usize = 0;
+    for (pf_corpus.build(&fx)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Proof.encoded_length]u8 = undefined;
+        smith.bytes(&buf);
+        _ = Proof.fromBytes(buf) catch continue;
+        pf_accepted += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), pf_accepted);
 }

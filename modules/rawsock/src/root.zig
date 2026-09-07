@@ -39,6 +39,9 @@
 //! ```
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing
+/// and the `Cursor` the two shape harnesses read their scripts from.
+const testkit = @import("testkit");
 const builtin = @import("builtin");
 const netaddr = @import("netaddr");
 
@@ -849,62 +852,211 @@ test "golden: real-capture fixture count + size canary — 3 real veth-pair capt
 // input for a MAC address, and an ARP reply body (classic ARP-spoofing
 // territory). None require a socket, so the harness drives them offline.
 
+/// The two real captured frames this module already anchors its golden tests
+/// to, plus the shapes around `eth_hdr_len`.
+const eth_seeds = [_][]const u8{
+    testkit.fuzz.seed(&ip_echo_request_frame), // 98 octets, a real capture
+    testkit.fuzz.seed(&arp_reply_frame), // 42 octets, the same exchange
+    testkit.fuzz.seed(ip_echo_request_frame[0..eth_hdr_len]), // exactly the header
+    testkit.fuzz.seed(ip_echo_request_frame[0 .. eth_hdr_len - 1]), // one octet short
+    testkit.fuzz.seed(""), // the input this target used to run for ever
+};
+
 test "fuzz: EthHeader.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzEthHeaderParse, .{});
+    try testing.fuzz({}, fuzzEthHeaderParse, .{ .corpus = &eth_seeds });
 }
 
 fn fuzzEthHeaderParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input this target ever ran outside
+    // `--fuzz` (a ranged draw needs eight octets and `bytes` had eaten them),
+    // so `parse` returned null off its `frame.len < 14` check every round.
+    const len: usize = smith.slice(&buf);
     if (EthHeader.parse(buf[0..len])) |h| {
         var out: [eth_hdr_len]u8 = undefined;
         h.write(&out);
     }
 }
 
+test "corpus: the Ethernet seeds reach the parser, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    // The round trip is the number an empty replay cannot produce: a parsed
+    // header must rewrite to the same fourteen octets it came from.
+    var rewrote: usize = 0;
+    for (eth_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const h = EthHeader.parse(buf[0..len]) orelse continue;
+        parsed += 1;
+        var out: [eth_hdr_len]u8 = undefined;
+        h.write(&out);
+        if (std.mem.eql(u8, &out, buf[0..eth_hdr_len])) rewrote += 1;
+    }
+    try testing.expectEqual(eth_seeds.len - 1, nonempty); // all but the empty seed
+    try testing.expectEqual(@as(usize, 3), parsed);
+    try testing.expectEqual(@as(usize, 3), rewrote);
+}
+
+/// ⛔ The measurement: this target's FIRST draw was `smith.value(bool)`, and it
+/// had no corpus — so the input was already exhausted and the draw returned
+/// FALSE on every round the ordinary lane ever ran. Only the `else` arm ran,
+/// the "structurally-correct skeleton" the comment below is about; and inside
+/// it every `smith.index` was 0 too, so the text built was always the same
+/// `"00:00:00:00:00:00"`. The raw-bytes arm — the length/separator gate — had
+/// never executed at all, and the skeleton arm produced exactly one string.
+///
+/// The byte draw now comes first and the shape choices are read out of it
+/// through `testkit.fuzz.Cursor`, so a seed is a script anyone can read.
+const hwaddr_seeds = [_][]const u8{
+    // Mode `raw`: the drawn octets go straight to `parseHwaddr`.
+    hwSeed("aa:bb:cc:dd:ee:ff", 1),
+    hwSeed("AA-BB-CC-DD-EE-FF", 1),
+    hwSeed("aa:bb:cc:dd:ee:f", 1), // one octet short of `hwaddr_text_len`
+    hwSeed("aa:bb:cc:dd:ee:fff", 1), // one too long
+    hwSeed("aa:bb:cc:dd:ee.ff", 1), // a separator that is neither ':' nor '-'
+    hwSeed("aa:bb:cc:dd:ee:fg", 1), // 'g' is not a hex digit
+    hwSeed("", 1),
+    // Mode `skeleton`: the octets are indices into `hex_digits`, twelve of
+    // them, and the first picks the separator. `x`/`y`/`z`/space sit at
+    // indices 22..25 and are the deliberately-invalid digits.
+    hwSeed(&[_]u8{0} ++ [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }, 0),
+    hwSeed(&[_]u8{1} ++ [_]u8{ 16, 17, 18, 19, 20, 21, 16, 17, 18, 19, 20, 21 }, 0), // '-', uppercase
+    hwSeed(&[_]u8{0} ++ [_]u8{ 22, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }, 0), // a leading 'x'
+    hwSeed(&[_]u8{0} ++ [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 25 }, 0), // a trailing space
+    hwSeed("", 0), // the empty script: separator ':' and all-zero digits
+};
+
+/// The script, then the `u64` word the mode knob after the byte draw reads
+/// (`1` = raw, `0` = skeleton). ⛔ Without that word the knob is dead on a
+/// corpus replay and every seed would take the same arm.
+fn hwSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, script.len)) ++ script[0..script.len].* ++
+            std.mem.toBytes(mode);
+    }.bytes;
+}
+
+const hw_hex_digits = "0123456789abcdefABCDEFxyz "; // last four: deliberately invalid
+
 test "fuzz: parseHwaddr never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzParseHwaddr, .{});
+    try testing.fuzz({}, fuzzParseHwaddr, .{ .corpus = &hwaddr_seeds });
 }
 
 fn fuzzParseHwaddr(_: void, smith: *std.testing.Smith) !void {
-    // Two shapes: raw random bytes (exercises the length/separator gate),
-    // and a structurally-correct "xx:xx:xx:xx:xx:xx" skeleton with random
-    // hex digits, separator and case — this is the only way to reach the
-    // per-octet `charToDigit` calls instead of bailing out at the length or
-    // separator check on the first try.
+    // ⚠ The byte draw is FIRST. See `hwaddr_seeds`.
+    var buf: [64]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    // Two shapes: the drawn octets verbatim (exercises the length/separator
+    // gate), and a structurally-correct "xx:xx:xx:xx:xx:xx" skeleton whose hex
+    // digits, separator and case come from the same octets — the only way to
+    // reach the per-octet `charToDigit` calls instead of bailing out at the
+    // length or separator check on the first try.
     if (smith.value(bool)) {
-        var buf: [64]u8 = undefined;
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
         _ = parseHwaddr(buf[0..len]);
     } else {
-        const sep: u8 = if (smith.value(bool)) ':' else '-';
+        var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..len] };
+        const sep: u8 = if (cur.byte() & 1 == 0) ':' else '-';
         var text: [hwaddr_text_len]u8 = undefined;
-        const hex_digits = "0123456789abcdefABCDEFxyz "; // last three: deliberately invalid
         for (0..hwaddr_len) |i| {
-            text[i * 3] = hex_digits[smith.index(hex_digits.len)];
-            text[i * 3 + 1] = hex_digits[smith.index(hex_digits.len)];
+            text[i * 3] = hw_hex_digits[cur.byte() % hw_hex_digits.len];
+            text[i * 3 + 1] = hw_hex_digits[cur.byte() % hw_hex_digits.len];
             if (i != hwaddr_len - 1) text[i * 3 + 2] = sep;
         }
         _ = parseHwaddr(&text);
     }
 }
 
+test "corpus: the hwaddr seeds drive both shapes, and the counts are pinned" {
+    var raw_arm: usize = 0;
+    var skeleton_arm: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The number the collapsed draw could not produce: DISTINCT addresses
+    // parsed. Both arms used to build the same `"00:00:00:00:00:00"`, so this
+    // was 1 at best; and the raw arm never ran at all.
+    var seen: [8][hwaddr_len]u8 = undefined;
+    var distinct: usize = 0;
+    for (hwaddr_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        var got: ?[hwaddr_len]u8 = null;
+        if (smith.value(bool)) {
+            raw_arm += 1;
+            got = parseHwaddr(buf[0..len]);
+        } else {
+            skeleton_arm += 1;
+            var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..len] };
+            const sep: u8 = if (cur.byte() & 1 == 0) ':' else '-';
+            var text: [hwaddr_text_len]u8 = undefined;
+            for (0..hwaddr_len) |i| {
+                text[i * 3] = hw_hex_digits[cur.byte() % hw_hex_digits.len];
+                text[i * 3 + 1] = hw_hex_digits[cur.byte() % hw_hex_digits.len];
+                if (i != hwaddr_len - 1) text[i * 3 + 2] = sep;
+            }
+            got = parseHwaddr(&text);
+        }
+        const mac = got orelse continue;
+        accepted += 1;
+        var already = false;
+        for (seen[0..distinct]) |prev| {
+            if (std.mem.eql(u8, &prev, &mac)) already = true;
+        }
+        if (!already) {
+            seen[distinct] = mac;
+            distinct += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 7), raw_arm);
+    try testing.expectEqual(@as(usize, 5), skeleton_arm);
+    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 4), distinct);
+}
+
+/// ⛔ Same measurement as `fuzzParseHwaddr`, and worse: the FIRST draw was
+/// `smith.value(bool)`, false on every input, so only the raw-bytes arm ran
+/// and its own length draw was 0 — `arp.parseReply("")` every round. The
+/// `else` arm, which starts from a REAL ARP reply and mutates it so the sender
+/// IP/MAC extraction actually runs, had never executed once.
+///
+/// Script layout for the mutate arm: `[0]` mutation count (`b % 7`), then per
+/// mutation a position octet and a replacement octet.
+const arp_seeds = [_][]const u8{
+    arpSeed(&arp_reply_frame, 1), // mode raw: the real captured reply
+    arpSeed(arp_reply_frame[0..21], 1), // truncated before `oper`
+    arpSeed(&[_]u8{ 0xff, 0xff }, 1), // far too short for the ethertype gate
+    arpSeed("", 1),
+    arpSeed(&[_]u8{0}, 0), // mode mutate: no mutations, the pristine reply
+    arpSeed(&[_]u8{ 1, 12, 0x08 }, 0), // one octet inside the ethertype
+    arpSeed(&[_]u8{ 1, 21, 0x01 }, 0), // `oper` back to request
+    arpSeed(&[_]u8{ 6, 22, 0x11, 28, 0x22, 30, 0x33, 32, 0x44, 38, 0x55, 41, 0x66 }, 0), // sender IP/MAC
+    arpSeed("", 0), // the empty script: zero mutations
+};
+
+fn arpSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, script.len)) ++ script[0..script.len].* ++
+            std.mem.toBytes(mode);
+    }.bytes;
+}
+
 test "fuzz: arp.parseReply never panics on arbitrary or structurally ARP-shaped frames" {
-    try testing.fuzz({}, fuzzArpParseReply, .{});
+    try testing.fuzz({}, fuzzArpParseReply, .{ .corpus = &arp_seeds });
 }
 
 fn fuzzArpParseReply(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ The byte draw is FIRST. See `arp_seeds`.
     var buf: [128]u8 = undefined;
+    const len: usize = smith.slice(&buf);
 
-    // Half the time: raw random bytes at random length (the length/ethertype
-    // gate). The other half: start from a real ARP reply frame and mutate
-    // random bytes — gets past the ethertype/oper checks so the sender
-    // IP/MAC extraction actually runs on hostile data.
+    // Two shapes: the drawn octets verbatim (the length/ethertype gate), and a
+    // real ARP reply frame with octets from the same draw written over it —
+    // gets past the ethertype/oper checks so the sender IP/MAC extraction
+    // actually runs on hostile data.
     if (smith.value(bool)) {
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
         _ = arp.parseReply(buf[0..len]);
     } else {
         var reply = arp.buildRequest(
@@ -913,12 +1065,55 @@ fn fuzzArpParseReply(_: void, smith: *std.testing.Smith) !void {
             .{ 192, 0, 2, 2 },
         );
         std.mem.writeInt(u16, reply[20..22], 0x0002, .big); // oper = reply
-        const n_mutations = smith.valueRangeAtMost(u8, 0, 6);
-        for (0..n_mutations) |_| {
-            reply[smith.index(reply.len)] = smith.value(u8);
+        var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..len] };
+        const n_mutations = cur.ranged(0, 6);
+        var i: u32 = 0;
+        while (i < n_mutations) : (i += 1) {
+            const pos = cur.ranged(0, @intCast(reply.len - 1));
+            reply[pos] = cur.byte();
         }
         _ = arp.parseReply(&reply);
     }
+}
+
+test "corpus: the ARP seeds drive both shapes, and the counts are pinned" {
+    var raw_arm: usize = 0;
+    var mutate_arm: usize = 0;
+    var mutations: usize = 0;
+    var parsed: usize = 0;
+    for (arp_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [128]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (smith.value(bool)) {
+            raw_arm += 1;
+            if (arp.parseReply(buf[0..len]) != null) parsed += 1;
+        } else {
+            mutate_arm += 1;
+            var reply = arp.buildRequest(
+                .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff },
+                .{ 192, 0, 2, 1 },
+                .{ 192, 0, 2, 2 },
+            );
+            std.mem.writeInt(u16, reply[20..22], 0x0002, .big);
+            var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..len] };
+            const n = cur.ranged(0, 6);
+            mutations += n;
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                const pos = cur.ranged(0, @intCast(reply.len - 1));
+                reply[pos] = cur.byte();
+            }
+            if (arp.parseReply(&reply) != null) parsed += 1;
+        }
+    }
+    // ⛔ `mutate_arm` and `mutations` were both **0** for every input this
+    // target had ever run, and `parsed` was 0 too — `parseReply("")` was the
+    // only call it ever made.
+    try testing.expectEqual(@as(usize, 4), raw_arm);
+    try testing.expectEqual(@as(usize, 5), mutate_arm);
+    try testing.expectEqual(@as(usize, 8), mutations);
+    try testing.expectEqual(@as(usize, 5), parsed);
 }
 
 // ── tests: socket path (gated on CAP_NET_RAW / a netns) ───────────────────────

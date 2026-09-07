@@ -17,6 +17,8 @@
 //! a real, deterministic timelock round-trip — no beacon fetch, no DKG.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 const tlock = @import("tlock");
 const hqc = @import("hqc");
 const chachapoly = @import("chachapoly");
@@ -383,22 +385,34 @@ fn fuzzOpen(ctx: *const FuzzCtx, smith: *std.testing.Smith) anyerror!void {
     // typed error or (only for an unmutated copy) the exact plaintext.
     var buf: [Env.overhead + 64]u8 = undefined;
 
+    // ⚠ The byte draw comes FIRST. It used to sit behind `smith.value(u8) & 1`
+    // — a bounded draw, which returns its range minimum unless a whole
+    // eight-octet word lands inside the range — so with no corpus `mode` was 0
+    // on every input this target ever ran outside `--fuzz`, its own length
+    // draw was 0 too, and the single input was `Env.open("")`. The mutation
+    // arm, the only one that ever reaches a real envelope and therefore the
+    // only one that can reach `open`'s body at all, had never executed.
+    const drawn: usize = smith.slice(&buf);
     const mode = smith.value(u8) & 1;
     const input: []u8 = blk: {
         if (mode == 0) {
-            // Random-length random bytes.
-            const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
-            smith.bytes(buf[0..len]);
-            break :blk buf[0..len];
+            // The drawn octets verbatim.
+            break :blk buf[0..drawn];
         } else {
+            // The flip script has to be copied out before the envelope is
+            // written over `buf`.
+            var script: [32]u8 = undefined;
+            const script_len = @min(drawn, script.len);
+            @memcpy(script[0..script_len], buf[0..script_len]);
             // Copy the valid envelope, then flip a bounded number of bytes.
             const n = @min(ctx.base.len, buf.len);
             @memcpy(buf[0..n], ctx.base[0..n]);
-            const flips = smith.valueRangeAtMost(u8, 0, 8);
-            var i: usize = 0;
+            var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+            const flips = cur.ranged(0, 8);
+            var i: u32 = 0;
             while (i < flips) : (i += 1) {
-                const at: usize = smith.valueRangeAtMost(u32, 0, @intCast(n - 1));
-                buf[at] ^= smith.value(u8);
+                const at: usize = cur.ranged(0, @intCast(n - 1));
+                buf[at] ^= cur.byte();
             }
             break :blk buf[0..n];
         }
@@ -421,5 +435,87 @@ test "fuzz: open never panics / OOBs / hangs on arbitrary or mutated input" {
     defer testing.allocator.free(base);
 
     const ctx = FuzzCtx{ .dk = kp.dk, .sig = round1000Signature(), .base = base };
-    try std.testing.fuzz(&ctx, fuzzOpen, .{});
+    try std.testing.fuzz(&ctx, fuzzOpen, .{ .corpus = &open_seeds });
+}
+
+/// A seed is the flip script (or, in mode 0, the raw input) as a
+/// `testkit.fuzz` slice seed, then the `u64` word `mode` reads: `1` selects
+/// the mutation arm, `0` the raw arm. ⛔ Without that word the mode knob is
+/// dead on a corpus replay and every seed takes the raw arm — which is
+/// exactly the state this target was in.
+const open_seeds = [_][]const u8{
+    // The mutation arm with ZERO flips: a byte-identical copy of the real
+    // envelope, so `open` runs to completion and the harness's own
+    // "the plaintext must come back verbatim" oracle actually fires. That
+    // assertion had never been evaluated.
+    openSeed(&[_]u8{0}, 1),
+    // One flip in the KEM ciphertext, one in the AEAD tag, one in the header.
+    openSeed(&[_]u8{ 1, 40, 0x01 }, 1),
+    openSeed(&[_]u8{ 1, 250, 0x80 }, 1),
+    openSeed(&[_]u8{ 1, 0, 0xff }, 1),
+    // The top of the flip range, spread across the envelope.
+    openSeed(&[_]u8{ 8, 3, 0x11, 20, 0x22, 60, 0x33, 100, 0x44, 130, 0x55, 170, 0x66, 200, 0x77, 230, 0x88 }, 1),
+    // The raw arm: bytes that are not an envelope at all, at a few lengths.
+    openSeed("not an envelope", 0),
+    openSeed(&[_]u8{0} ** 64, 0),
+    openSeed("", 0), // and the input this target used to run for ever
+};
+
+fn openSeed(comptime script: []const u8, comptime mode: u64) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, script.len)) ++ script[0..script.len].* ++
+            std.mem.toBytes(mode);
+    }.bytes;
+}
+
+test "corpus: the open seeds drive both arms, and the counts are pinned" {
+    const kp = recipientKeypair(0x0C);
+    const base = try Env.seal(testing.allocator, plaintext, kp.ek, quicknetPubkey(), seal_round, fixedRandomness());
+    defer testing.allocator.free(base);
+    const ctx = FuzzCtx{ .dk = kp.dk, .sig = round1000Signature(), .base = base };
+
+    var raw_arm: usize = 0;
+    var mutate_arm: usize = 0;
+    var flips_total: usize = 0;
+    var opened: usize = 0;
+    for (open_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Env.overhead + 64]u8 = undefined;
+        const drawn: usize = smith.slice(&buf);
+        const mode = smith.value(u8) & 1;
+        const input: []u8 = blk: {
+            if (mode == 0) {
+                raw_arm += 1;
+                break :blk buf[0..drawn];
+            }
+            mutate_arm += 1;
+            var script: [32]u8 = undefined;
+            const script_len = @min(drawn, script.len);
+            @memcpy(script[0..script_len], buf[0..script_len]);
+            const n = @min(ctx.base.len, buf.len);
+            @memcpy(buf[0..n], ctx.base[0..n]);
+            var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+            const flips = cur.ranged(0, 8);
+            flips_total += flips;
+            var i: u32 = 0;
+            while (i < flips) : (i += 1) {
+                const at: usize = cur.ranged(0, @intCast(n - 1));
+                buf[at] ^= cur.byte();
+            }
+            break :blk buf[0..n];
+        };
+        if (Env.open(testing.allocator, input, ctx.dk, ctx.sig)) |pt| {
+            defer testing.allocator.free(pt);
+            opened += 1;
+            try testing.expectEqualSlices(u8, plaintext, pt);
+        } else |_| {}
+    }
+    // ⛔ `mutate_arm`, `flips_total` and `opened` were all **0** for every
+    // input this target had ever run: the one call it made was `open("")`.
+    // `opened == 1` is the zero-flip seed, and it is what makes the harness's
+    // "the plaintext must come back verbatim" oracle a live assertion.
+    try testing.expectEqual(@as(usize, 3), raw_arm);
+    try testing.expectEqual(@as(usize, 5), mutate_arm);
+    try testing.expectEqual(@as(usize, 11), flips_total);
+    try testing.expectEqual(@as(usize, 1), opened);
 }

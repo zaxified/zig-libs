@@ -47,6 +47,9 @@
 //! entry needed). RFC 9052 for the COSE layer in `cose.zig`.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing
+/// and the `Cursor` the generator harness below reads its script from.
+const testkit = @import("testkit");
 const Allocator = std.mem.Allocator;
 
 pub const meta = .{
@@ -729,71 +732,127 @@ test "decode does not leak on error paths with a non-arena allocator" {
 // is why the harness lives in this file rather than beside the other one), and
 // a generator that emits nesting on purpose.
 test "fuzz: decode releases every allocation it made, whatever the input" {
-    try std.testing.fuzz({}, fuzzDecodeNoLeak, .{ .corpus = cbor_seeds });
+    try std.testing.fuzz({}, fuzzDecodeNoLeak, .{ .corpus = &cbor_seeds });
 }
 
+/// ⚠ The FIRST draw is the byte draw, deliberately. This harness generates a
+/// shape rather than parsing a frame, and it used to open with
+/// `smith.valueRangeAtMost(u8, 0, 4)` inside `buildNested` — a ranged draw,
+/// which returns the range MINIMUM unless a whole eight-octet word happens to
+/// land inside the range. Its five seeds each opened with a `u64` word chosen
+/// to hit a mode, so the modes were reachable; but nothing else about the
+/// shape was reviewable, every later knob was another `u64` word masked to
+/// `& 0x7F`, and any word that fell out of range silently discarded the REST
+/// of the seed. Reading the choices out of one `smith.slice` fixes both: the
+/// gate is satisfied honestly, and a seed is now a short script anyone can
+/// read against the layout below.
+///
+/// Script layout (`testkit.fuzz.Cursor`, cycling, all-zero when empty):
+///   [0] mode: 0 = the rest of the script IS the CBOR input;
+///             1..4 = a nesting run of `81`/`9f`/`a1`/`c1`
+///   [1] depth cap: `max_depth = 1 + b % 96`
+///   mode 0: [2..] the CBOR bytes verbatim
+///   mode 1..4: [2] run length, [3..] the tail after the run
 fn fuzzDecodeNoLeak(_: void, smith: *std.testing.Smith) !void {
-    var buf: [4096]u8 = undefined;
-    const input = buildNested(smith, &buf);
-    const a = std.testing.allocator;
+    var script: [4096]u8 = undefined;
+    const script_len: usize = smith.slice(&script);
+    var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+
+    const mode = cur.ranged(0, 4);
     // The depth cap is drawn too, so the boundary is approached from both
     // sides rather than only from far below a fixed 64.
-    const opts = DecodeOptions{ .max_depth = smith.valueRangeAtMost(u32, 1, 96) };
+    const opts = DecodeOptions{ .max_depth = cur.ranged(1, 96) };
+
+    var buf: [4096]u8 = undefined;
+    const input = buildNested(mode, &cur, script[0..script_len], &buf);
+
+    const a = std.testing.allocator;
     const v = decode(a, input, opts) catch return;
     freeValue(a, v);
 }
 
-/// Either arbitrary octets, or a run of container headers with an arbitrary
-/// tail — `81` (array(1)), `9f` (indefinite array), `a1` (map(1)) and `c1`
-/// (tag), the four openers whose bodies allocate and therefore have something
-/// to leak when the item inside them turns out to be malformed.
-fn buildNested(smith: *std.testing.Smith, buf: []u8) []const u8 {
-    const opener: u8 = switch (smith.valueRangeAtMost(u8, 0, 4)) {
-        0 => {
-            smith.bytes(buf);
-            return buf[0..smith.valueRangeAtMost(u16, 0, @intCast(buf.len))];
-        },
+/// Either the script's own remaining octets as CBOR, or a run of container
+/// headers with an arbitrary tail — `81` (array(1)), `9f` (indefinite array),
+/// `a1` (map(1)) and `c1` (tag), the four openers whose bodies allocate and
+/// therefore have something to leak when the item inside them turns out to be
+/// malformed.
+fn buildNested(mode: u32, cur: *testkit.fuzz.Cursor, script: []const u8, buf: []u8) []const u8 {
+    const opener: u8 = switch (mode) {
+        0 => return script[@min(cur.at, script.len)..],
         1 => 0x81,
         2 => 0x9f,
         3 => 0xa1,
         else => 0xc1,
     };
-    const depth: usize = smith.valueRangeAtMost(u16, 0, 200);
-    var n: usize = @min(depth, buf.len);
+    // A one-octet run length reaches 255, comfortably past both the default
+    // `max_depth` of 64 and the drawn cap's ceiling of 96.
+    var n: usize = @min(@as(usize, cur.byte()), buf.len);
     @memset(buf[0..n], opener);
-    var tail: [96]u8 = undefined;
-    smith.bytes(&tail);
-    const tail_len = @min(@as(usize, smith.valueRangeAtMost(u8, 0, tail.len)), buf.len - n);
-    @memcpy(buf[n..][0..tail_len], tail[0..tail_len]);
+    const rest = script[@min(cur.at, script.len)..];
+    const tail_len = @min(rest.len, buf.len - n);
+    @memcpy(buf[n..][0..tail_len], rest[0..tail_len]);
     n += tail_len;
     return buf[0..n];
 }
 
-/// See `iec61850/src/goose.zig` for the reasoning: without `--fuzz` the runner
-/// feeds only `options.corpus` plus one empty input, and an empty input makes
-/// every draw return its range minimum — mode 0, length 0, nothing decoded.
-/// `Smith` reads one little-endian `u64` per scalar draw and discards any word
-/// that falls outside that draw's range, so the words are kept small.
-fn cborSeed(comptime first_word: u64, comptime bits: u64, comptime n: usize) [n]u8 {
-    @setEvalBranchQuota(100_000);
-    var out: [n]u8 = undefined;
-    std.mem.writeInt(u64, out[0..8], first_word, .little);
-    var i: usize = 8;
-    var w: u6 = 0;
-    while (i + 8 <= n) : (i += 8) {
-        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x7F, .little);
-        w +%= 1;
-    }
-    return out;
-}
-
-const cbor_seeds: []const []const u8 = &.{
-    &cborSeed(1, 0x9E37_79B9_7F4A_7C15, 256), // array(1) nesting
-    &cborSeed(2, 0x0123_4567_89AB_CDEF, 256), // indefinite arrays
-    &cborSeed(3, 0xF0E1_D2C3_B4A5_9687, 256), // map(1) nesting
-    &cborSeed(4, 0x6C62_1F4D_3A98_5E27, 256), // tag nesting
-    &cborSeed(0, 0xD5B8_0E93_C741_A26F, 256), // arbitrary octets
+/// Without `--fuzz` the runner feeds only `options.corpus` plus one empty
+/// input, and an empty script is every choice at its minimum: mode 0, depth
+/// cap 1, nothing decoded. Each seed below is the script, not the CBOR.
+const cbor_seeds = [_][]const u8{
+    // mode 0: the script after the two header octets IS the CBOR. `a2 …` is
+    // the map from the public-free test — text, array, byte string, and a tag
+    // with a heap-allocated inner value, i.e. one value of every owning shape.
+    testkit.fuzz.seed(&[_]u8{ 0, 64 } ++
+        [_]u8{ 0xa2, 0x61, 'a', 0x82, 0x01, 0x42, 0x01, 0x02, 0x02, 0xd8, 0x18, 0x63, 't', 'x', 't' }),
+    // mode 0, depth cap 1 against a two-level tree: the depth guard fires
+    // after the outer array has already allocated, which is the unwind path.
+    testkit.fuzz.seed(&[_]u8{ 0, 0, 0x81, 0x81, 0x01 }),
+    // 32 `81` openers, then `01` — inside the default cap, decodes.
+    testkit.fuzz.seed(&[_]u8{ 1, 64, 32, 0x01 }),
+    // 120 `9f` openers and nothing to close them: over `max_depth = 96`, and
+    // the unwind has 96 half-built indefinite arrays to release.
+    testkit.fuzz.seed(&[_]u8{ 2, 95, 120 }),
+    // 200 `a1` openers with a `break` tail: map nesting past every cap.
+    testkit.fuzz.seed(&[_]u8{ 3, 64, 200, 0xff }),
+    // 40 tag openers over an integer: tags allocate their inner value.
+    testkit.fuzz.seed(&[_]u8{ 4, 64, 40, 0x01 }),
+    // mode 4 with a run past the cap, so the tag chain unwinds too.
+    testkit.fuzz.seed(&[_]u8{ 4, 30, 200, 0x01 }),
+    // The empty script: mode 0, cap 1, empty input — the one input this
+    // target's predecessor could ever have run on a collapsed draw.
+    testkit.fuzz.seed(""),
 };
+
+test "corpus: every seed drives the generator, and the counts are pinned" {
+    const a = std.testing.allocator;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The numbers an empty script cannot produce, and that `accepted > 0`
+    // could not have held up: the total number of octets actually handed to
+    // `decode`, and how many distinct modes ran. Reach, not legality.
+    var input_octets: usize = 0;
+    var modes_seen: [5]bool = @splat(false);
+    for (cbor_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [4096]u8 = undefined;
+        const script_len: usize = smith.slice(&script);
+        if (script_len != 0) nonempty += 1;
+        var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+        const mode = cur.ranged(0, 4);
+        modes_seen[mode] = true;
+        const opts = DecodeOptions{ .max_depth = cur.ranged(1, 96) };
+        var buf: [4096]u8 = undefined;
+        const input = buildNested(mode, &cur, script[0..script_len], &buf);
+        input_octets += input.len;
+        const v = decode(a, input, opts) catch continue;
+        accepted += 1;
+        freeValue(a, v);
+    }
+    try std.testing.expectEqual(cbor_seeds.len - 1, nonempty); // all but the empty seed
+    try std.testing.expectEqual(@as(usize, 3), accepted);
+    try std.testing.expectEqual(@as(usize, 614), input_octets);
+    for (modes_seen) |m| try std.testing.expect(m);
+}
 
 test "smoke: encode/decode round-trip a small map" {
     const a = std.testing.allocator;

@@ -28,6 +28,8 @@
 //! (mirrors vodozemac's `InboundGroupSession::import` doc comment).
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 const ratchet_mod = @import("ratchet.zig");
 
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -285,25 +287,152 @@ fn testIo() std.Io.Threaded {
 // rejects a bad Ed25519 signature — i.e. past the length gate, the
 // version byte, the big-endian index read and the public-key parse — a
 // 60 s `scripts/fuzz-sweep.sh` run found it. Probe then removed.
+/// ⛔ The reachability note above was measured under `--fuzz`. The ORDINARY
+/// lane replays `options.corpus` plus one empty input, and this target had no
+/// corpus — so the very first draw, `smith.value(enum { … })`, returned the
+/// first variant on every round, `len` was always `export_len`, and the
+/// `smith.slice` after it read a zero-length input and zero-filled 165 octets.
+/// The whole length sweep the comment above is about — `share_len`, the
+/// off-by-ones, the arbitrary lengths — had never happened, and the bytes
+/// handed to both decoders were the same all-zero buffer every time.
+///
+/// The byte draw now comes FIRST, into the full buffer, and `len` selects how
+/// much of it is used afterwards. The seed's own octets therefore survive
+/// whichever length branch is taken. A seed is the key material as a
+/// `testkit.fuzz` slice seed, then the `u64` words the knobs read:
+/// `[length_mode, (near: base_is_export, delta, plus) | (any: len),
+/// version_mode, (any: version), b64_corrupt, (corrupt: position, value)]`.
+const SessionKeyCorpus = struct {
+    store: [10 * (4 + 320 + 8 * 8)]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *SessionKeyCorpus, frame: []const u8, words: []const u64) void {
+        const start = self.used;
+        var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
+        for (words) |w| {
+            std.mem.writeInt(u64, self.store[at..][0..8], w, .little);
+            at += 8;
+        }
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *SessionKeyCorpus, io: std.Io) []const []const u8 {
+        const kp = Ed25519.KeyPair.generate(io);
+        var inner = ExportedSessionKey{
+            .ratchet_index = 0x01020304,
+            .ratchet = [_]u8{0x77} ** ratchet_mod.ratchet_len,
+            .signing_key = kp.public_key.toBytes(),
+        };
+        const exported = inner.encode();
+        var signed_part: [signed_part_len]u8 = undefined;
+        inner.encodeSignedPart(share_version, &signed_part);
+        const sig = kp.sign(&signed_part, null) catch unreachable;
+        const shared = (SessionKey{ .inner = inner, .signature = sig.toBytes() }).encode();
+
+        // ⛔ `.exact_export`/`.exact_share` are word 0 and 1; the version knob
+        // `1` is `.exp` and `0` is `.share`. Both are picked to MATCH the
+        // frame, so the seeds actually decode rather than being rewritten at
+        // offset 0 into something the version gate refuses.
+        self.push(&exported, &.{ 0, 1, 0 }); // a real 165-octet export
+        self.push(&shared, &.{ 1, 0, 0 }); // a real 229-octet share, self-verifying
+        var tampered = shared;
+        tampered[share_len - 1] ^= 0x01; // one octet in the Ed25519 signature
+        self.push(&tampered, &.{ 1, 0, 0 });
+        var bad_ratchet = shared;
+        bad_ratchet[10] ^= 0x01; // one octet in the ratchet: signature no longer covers it
+        self.push(&bad_ratchet, &.{ 1, 0, 0 });
+        self.push(&exported, &.{ 1, 0, 0 }); // 165 octets read as a 229-octet share
+        // `.near`: `export_len` +/- a delta, the off-by-ones around the gate.
+        self.push(&exported, &.{ 2, 1, 1, 1, 1, 0 }); // 166
+        self.push(&exported, &.{ 2, 1, 1, 0, 1, 0 }); // 164
+        // `.any`: an arbitrary length, and the version byte drawn arbitrarily.
+        self.push(&shared, &.{ 3, 300, 2, 0xff, 0 });
+        // A real export with its base64 wrapper corrupted at offset 0.
+        self.push(&exported, &.{ 0, 1, 1, 0, 0xff });
+        self.push("", &.{}); // and the input this target used to run for ever
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: session-key decoders never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzSessionKeyDecode, .{});
+    var threaded = testIo();
+    defer threaded.deinit();
+    var corpus: SessionKeyCorpus = .{};
+    try testing.fuzz({}, fuzzSessionKeyDecode, .{ .corpus = corpus.build(threaded.io()) });
+}
+
+test "corpus: the session-key seeds drive the length sweep, and the counts are pinned" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    var corpus: SessionKeyCorpus = .{};
+    var lengths: [4]bool = @splat(false);
+    var exports: usize = 0;
+    var shares: usize = 0;
+    var len_total: usize = 0;
+    for (corpus.build(threaded.io())) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [320]u8 = undefined;
+        _ = smith.slice(&buf);
+        const mode = smith.value(u64) % 4;
+        lengths[@intCast(mode)] = true;
+        const len: usize = switch (mode) {
+            0 => export_len,
+            1 => share_len,
+            2 => blk: {
+                const base: usize = if (smith.value(u64) % 2 == 1) export_len else share_len;
+                const delta: usize = @intCast(smith.value(u64) % 5);
+                break :blk if (smith.value(u64) % 2 == 1) base + delta else base -| delta;
+            },
+            else => @intCast(smith.value(u64) % (buf.len + 1)),
+        };
+        len_total += len;
+        if (len > 0) {
+            buf[0] = switch (smith.value(enum { share, exp, any })) {
+                .share => share_version,
+                .exp => export_version,
+                .any => smith.value(u8),
+            };
+        }
+        if (ExportedSessionKey.decode(buf[0..len])) |_| exports += 1 else |_| {}
+        if (SessionKey.decode(buf[0..len])) |_| shares += 1 else |_| {}
+    }
+    // ⛔ Before this, `mode` was always `.exact_export` and `len` always 165 —
+    // `len_total` would have been 10 * 165 = 1650 with all-zero content, and
+    // neither decoder would ever have accepted anything (the all-zero
+    // `signing_key` is not a canonical Ed25519 point).
+    for (lengths) |l| try testing.expect(l);
+    try testing.expectEqual(@as(usize, 2), exports);
+    try testing.expectEqual(@as(usize, 1), shares);
+    try testing.expectEqual(@as(usize, 2041), len_total);
 }
 
 fn fuzzSessionKeyDecode(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
 
+    // ⚠ The byte draw comes FIRST, into the WHOLE buffer, and the length is
+    // chosen after it. It used to sit behind the length switch, which meant
+    // that outside `--fuzz` the switch collapsed to its first variant and the
+    // slice read an already-exhausted input.
     var buf: [320]u8 = undefined;
-    const len: usize = switch (smith.value(enum { exact_export, exact_share, near, any })) {
-        .exact_export => export_len,
-        .exact_share => share_len,
-        .near => blk: {
-            const base: usize = if (smith.value(bool)) export_len else share_len;
-            const delta = smith.valueRangeAtMost(u8, 0, 4);
-            break :blk if (smith.value(bool)) base + delta else base -| delta;
+    _ = smith.slice(&buf);
+    // The length knobs are `value(u64)` reduced here, never bounded draws: a
+    // bounded draw returns its range minimum unless a whole eight-octet word
+    // lands inside the range, which is how this switch used to collapse onto
+    // `.exact_export` on every input (`check-fuzz-reach`'s own option 2).
+    const len: usize = switch (smith.value(u64) % 4) {
+        0 => export_len,
+        1 => share_len,
+        2 => blk: {
+            const base: usize = if (smith.value(u64) % 2 == 1) export_len else share_len;
+            const delta: usize = @intCast(smith.value(u64) % 5);
+            break :blk if (smith.value(u64) % 2 == 1) base + delta else base -| delta;
         },
-        .any => smith.valueRangeAtMost(u16, 0, buf.len),
+        else => @intCast(smith.value(u64) % (buf.len + 1)),
     };
-    _ = smith.slice(buf[0..len]);
     // The version byte gates everything after the length check, so make it
     // the right one most of the time.
     if (len > 0) {

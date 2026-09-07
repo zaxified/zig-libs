@@ -10,6 +10,8 @@
 
 const std = @import("std");
 const tecdsa = @import("threshold_ecdsa");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 
 pub const Scalar = tecdsa.Scalar;
 pub const Element = tecdsa.Element;
@@ -281,10 +283,82 @@ test "PedersenBroadcast / FeldmanBroadcast codecs round-trip" {
 
 // ── fuzz: untrusted inter-party wire decoders never panic/OOB ─────────────
 
+/// 512 holds `t = 15` commitments (`8 + t*33`), comfortably over any threshold
+/// this module's own tests or examples build. ⚠ Checked deliberately: a seed
+/// longer than the buffer does not arrive truncated, it reads back EMPTY.
+const broadcast_buf_len = 512;
+
+/// The broadcast frames the corpus is cut from.
+///
+/// ⛔ These cannot be literals. A `secp256k1` point in the form
+/// `Element.fromBytes` accepts is structurally unreachable from arbitrary
+/// bytes — the compressed encoding has to land on the curve — so a drawn
+/// buffer produces refusals and only the module's own encoder produces
+/// acceptances. `commitments[0]` is the base point, then successive doublings.
+const BroadcastCorpus = struct {
+    store: [10 * (4 + broadcast_buf_len)]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *BroadcastCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *BroadcastCorpus, a: std.mem.Allocator) []const []const u8 {
+        var commits: [8]Element = undefined;
+        var p = tecdsa.Secp256k1.basePoint;
+        for (&commits) |*c| {
+            c.* = Element.fromPoint(p) catch unreachable;
+            p = p.dbl();
+        }
+        const three: PedersenBroadcast = .{ .dealer = 2, .commitments = commits[0..3] };
+        const enc3 = three.toBytesAlloc(a) catch unreachable;
+        self.push(enc3); // t = 3, the shape the round-trip test above uses
+        const eight: PedersenBroadcast = .{ .dealer = 0xffff_ffff, .commitments = &commits };
+        const enc8 = eight.toBytesAlloc(a) catch unreachable;
+        self.push(enc8); // t = 8, and the largest dealer index a u32 holds
+        const zero: PedersenBroadcast = .{ .dealer = 1, .commitments = commits[0..0] };
+        self.push(zero.toBytesAlloc(a) catch unreachable); // t = 0: header only
+        // ⛔ The finding this decoder's own comment is about: `t` is
+        // attacker-controlled and the length check has to fire before the
+        // `alloc`. `t` here claims 2^32-1 commitments over 107 octets.
+        var lying = a.dupe(u8, enc3) catch unreachable;
+        std.mem.writeInt(u32, lying[4..8], 0xffff_ffff, .big);
+        self.push(lying);
+        // `t` one too large, and one too small: both are length mismatches.
+        var off_by_one = a.dupe(u8, enc3) catch unreachable;
+        std.mem.writeInt(u32, off_by_one[4..8], 4, .big);
+        self.push(off_by_one);
+        var short = a.dupe(u8, enc3) catch unreachable;
+        std.mem.writeInt(u32, short[4..8], 2, .big);
+        self.push(short);
+        // A correct length whose third commitment is not a curve point.
+        // ⚠ The prefix octet, not a coordinate octet: flipping a bit inside x
+        // lands on the curve about half the time, and the first version of
+        // this seed DID decode — the guard caught it by disagreeing with the
+        // accepted count pinned for it. `0x04` is the uncompressed marker,
+        // which a 33-octet compressed field can never carry.
+        var bad_point = a.dupe(u8, enc3) catch unreachable;
+        bad_point[8 + 2 * Ne] = 0x04;
+        self.push(bad_point);
+        self.push(enc3[0..7]); // one octet short of the 8-octet header
+        self.push(""); // and the input these targets used to run for ever
+        return self.entries[0..self.n];
+    }
+};
+
 fn fuzzPedersenBroadcastDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [broadcast_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input the ordinary lane ever ran (a
+    // ranged draw needs eight octets and `bytes` had eaten them), so this
+    // target returned `InvalidEncoding` off the `bytes.len < 8` check every
+    // round, with the broadcast sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
     // The `t` count (bytes[4..8]) is attacker-controlled; the decoder must
     // reject any length mismatch (`bytes.len != 8 + t*Ne`) BEFORE
     // allocating — never panic/OOB regardless of the claimed `t`.
@@ -292,18 +366,52 @@ fn fuzzPedersenBroadcastDecode(_: void, smith: *std.testing.Smith) !void {
     defer pb.deinit(std.testing.allocator);
 }
 test "fuzz PedersenBroadcast.fromBytesAlloc never panics" {
-    try std.testing.fuzz({}, fuzzPedersenBroadcastDecode, .{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var corpus: BroadcastCorpus = .{};
+    try std.testing.fuzz({}, fuzzPedersenBroadcastDecode, .{ .corpus = corpus.build(arena.allocator()) });
 }
 
 fn fuzzFeldmanBroadcastDecode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [broadcast_buf_len]u8 = undefined;
+    // ⚠ Same as above: this target's length draw was 0 on every input.
+    const len: usize = smith.slice(&buf);
     const fb = FeldmanBroadcast.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch return;
     defer fb.deinit(std.testing.allocator);
 }
 test "fuzz FeldmanBroadcast.fromBytesAlloc never panics" {
-    try std.testing.fuzz({}, fuzzFeldmanBroadcastDecode, .{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var corpus: BroadcastCorpus = .{};
+    // The two frames are byte-identical on the wire (`FeldmanBroadcast`
+    // delegates to `PedersenBroadcast`), so the same corpus is the right one.
+    try std.testing.fuzz({}, fuzzFeldmanBroadcastDecode, .{ .corpus = corpus.build(arena.allocator()) });
+}
+
+test "corpus: every broadcast seed reaches the decoder, and the counts are pinned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var corpus: BroadcastCorpus = .{};
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The number the empty replay cannot produce, and that `accepted > 0`
+    // could not have held up: commitments actually decoded off the wire. The
+    // header-only `t = 0` frame is accepted while decoding no point at all,
+    // which is exactly the "legality is not reach" trap.
+    var commitments: usize = 0;
+    for (corpus.build(arena.allocator())) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [broadcast_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const pb = PedersenBroadcast.fromBytesAlloc(std.testing.allocator, buf[0..len]) catch continue;
+        defer pb.deinit(std.testing.allocator);
+        accepted += 1;
+        commitments += pb.commitments.len;
+    }
+    try std.testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
+    try std.testing.expectEqual(@as(usize, 3), accepted);
+    try std.testing.expectEqual(@as(usize, 11), commitments);
 }
 
 fn fuzzShareMsgDecode(_: void, smith: *std.testing.Smith) !void {

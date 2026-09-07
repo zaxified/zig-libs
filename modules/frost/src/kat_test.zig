@@ -46,6 +46,9 @@
 
 const std = @import("std");
 const frost = @import("root.zig");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing
+/// and the `Cursor` the perturbation harness reads its script from.
+const testkit = @import("testkit");
 const v = @import("kat_vectors.zig");
 
 fn hexN(comptime n: usize, hex_str: []const u8) [n]u8 {
@@ -481,16 +484,68 @@ test "end-to-end (2,3) round trip: keygen -> commit -> sign -> aggregate -> veri
 // near the `Element`/`Scalar` canonical-range boundary and the group
 // equation rather than being rejected by the first parse check on nearly
 // every draw.
+/// ⛔ The measurement that made this rewrite necessary: the FIRST draw was
+/// `smith.valueRangeAtMost(u8, 0, 6)` and there was no corpus, so `n_flips`
+/// was the range MINIMUM — **0** — on every input this target ever ran outside
+/// `--fuzz`. It verified the pristine RFC 9591 signature, unmodified, every
+/// round. A harness named "never panics on corrupted signature bytes" had
+/// never corrupted a byte.
+///
+/// The perturbation script now comes out of one `smith.slice`, so the byte
+/// draw is first and a seed reads against the layout: `[0]` flip count
+/// (`b % 41`), then per flip a position octet (`b % 65`) and a replacement
+/// octet. `Signature` is `SerializeElement(R)` ‖ `SerializeScalar(z)`, so
+/// octets 0..32 are the compressed point and 33..64 the scalar.
+///
+/// ⚠ The script buffer is 128: the sixteen-flip seed below is 33 octets, and
+/// a seed longer than the buffer reads back EMPTY rather than truncated. The
+/// same seed in `musig2` was written against a 16-octet buffer first and the
+/// guard's `nonempty` count caught it.
+const verify_seeds = [_][]const u8{
+    // No flips: the pristine signature, which must verify. This is what the
+    // target used to do on every single input.
+    testkit.fuzz.seed(&[_]u8{0}),
+    // R's prefix octet replaced by the uncompressed marker: `Element.fromBytes`
+    // refuses before `verify` is reached.
+    testkit.fuzz.seed(&[_]u8{ 1, 0, 0x04 }),
+    // z >= n: the scalar's top sixteen octets forced to 0xFF, which is above
+    // secp256k1's `n` because `n[15]` is 0xFE. `Scalar.fromBytes` refuses.
+    // ⛔ This costs SIXTEEN flips, and the old draw's cap was six. `n` is
+    // `FFFFFFFF...FFFFFFFE BAAEDCE6...` — fifteen leading 0xFF octets — so no
+    // edit of six octets can raise a 32-octet scalar above it. The
+    // canonical-range boundary the harness's own comment names was
+    // unreachable at any flip count it could draw, even with a working draw.
+    testkit.fuzz.seed(&[_]u8{ 16, 33, 0xff, 34, 0xff, 35, 0xff, 36, 0xff, 37, 0xff, 38, 0xff, 39, 0xff, 40, 0xff, 41, 0xff, 42, 0xff, 43, 0xff, 44, 0xff, 45, 0xff, 46, 0xff, 47, 0xff, 48, 0xff }),
+    // z's LAST octet flipped to 0x01: still canonical, so this parses and the
+    // group equation is what has to reject it. The path the old harness could
+    // never reach.
+    testkit.fuzz.seed(&[_]u8{ 1, 64, 0x01 }),
+    // One octet inside R's x-coordinate: parses when the value lands on the
+    // curve, and then fails the equation.
+    testkit.fuzz.seed(&[_]u8{ 1, 16, 0x5a }),
+    // Six flips spread over both halves — the top of the OLD draw's range.
+    testkit.fuzz.seed(&[_]u8{ 6, 0, 0x02, 8, 0x11, 32, 0x22, 40, 0x33, 55, 0x44, 64, 0x55 }),
+    // An all-zero z (a valid scalar encoding, an invalid signature).
+    testkit.fuzz.seed(&[_]u8{ 4, 33, 0, 44, 0, 55, 0, 64, 0 }),
+    // The empty script: zero flips again, the collapsed harness exactly.
+    testkit.fuzz.seed(""),
+};
+
 fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ The FIRST draw is a byte draw. See `verify_seeds`.
+    var script: [128]u8 = undefined;
+    const script_len: usize = smith.slice(&script);
+    var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+
     const group_public_key = elementFromHex(v.group.public_key);
     const msg = hexN(4, v.group.message);
 
     var bytes = hexN(65, v.final_signature);
-    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
-    var i: u8 = 0;
+    const n_flips = cur.ranged(0, 40);
+    var i: u32 = 0;
     while (i < n_flips) : (i += 1) {
-        const pos = smith.index(bytes.len);
-        bytes[pos] = smith.value(u8);
+        const pos = cur.ranged(0, bytes.len - 1);
+        bytes[pos] = cur.byte();
     }
 
     const sig = frost.Signature.fromBytes(bytes) catch return;
@@ -498,5 +553,44 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: verify never panics on corrupted signature bytes" {
-    try std.testing.fuzz({}, fuzzVerify, .{});
+    try std.testing.fuzz({}, fuzzVerify, .{ .corpus = &verify_seeds });
+}
+
+test "corpus: the verify seeds actually corrupt the signature, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var flips_total: usize = 0;
+    var parsed: usize = 0;
+    var verified: usize = 0;
+    const group_public_key = elementFromHex(v.group.public_key);
+    const msg = hexN(4, v.group.message);
+    for (verify_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [128]u8 = undefined;
+        const script_len: usize = smith.slice(&script);
+        if (script_len != 0) nonempty += 1;
+        var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+        var bytes = hexN(65, v.final_signature);
+        const n_flips = cur.ranged(0, 40);
+        flips_total += n_flips;
+        var i: u32 = 0;
+        while (i < n_flips) : (i += 1) {
+            const pos = cur.ranged(0, bytes.len - 1);
+            bytes[pos] = cur.byte();
+        }
+        const sig = frost.Signature.fromBytes(bytes) catch continue;
+        parsed += 1;
+        if (frost.verify(&msg, sig, group_public_key)) verified += 1;
+    }
+    try std.testing.expectEqual(verify_seeds.len - 1, nonempty); // all but the empty script
+    // ⛔ `flips_total` is the number the collapsed draw could not produce: it
+    // was **0** for every input this target had ever run. `parsed > verified`
+    // is the other half — a corrupted signature that gets past `fromBytes` and
+    // is refused by the group equation, the path the harness exists for.
+    try std.testing.expectEqual(@as(usize, 29), flips_total);
+    try std.testing.expectEqual(@as(usize, 6), parsed);
+    try std.testing.expectEqual(@as(usize, 2), verified);
+    // The two no-flip scripts (the explicit one and the empty one) are the
+    // only inputs that verify. Everything else that parsed — five corrupted
+    // signatures — reached `verify` and was refused by the group equation,
+    // which is the path this harness exists for and had never taken.
 }

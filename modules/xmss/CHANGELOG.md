@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** - Test-only, no production change: `fuzzVerify` had never looked at a
+  signature's content. It opened `smith.bytes(&sig_buf)` and then drew
+  `smith.valueRangeAtMost(u16, 0, signature_length)`; a ranged `Smith` draw returns the
+  range MINIMUM when fewer than eight octets remain, and `bytes` had already eaten them - so
+  `len` was **0** on every input the ordinary lane ever ran and `verify` returned false off
+  its `sig.len != signature_length` guard every round. The `idx`/`r`/`sig_ots`/`auth` parse
+  the harness's own comment is entirely about had never run. Now one
+  `smith.slice(&sig_buf)`, seeded from the module's own `keyGen` + `sign` (an XMSS
+  signature that verifies is not reachable from arbitrary bytes) plus corruptions of the
+  leaf index, the randomizer `r`, the top authentication-path node, the message and the
+  public root. Measured by the new `corpus:` guard: **6 seeds at exactly
+  `signature_length`** and so past the guard and into the WOTS+/authentication-path
+  reconstruction (0 before), 1 accepted.
+
 - **2026-09-03** — Drift re-audit (window `b199192..HEAD`, +1237/-37, `src/root.zig` +620). ⚠ **This
   changelog had no entry for the drift at all** — the BDS rewrite, the `SigningKey` handle,
   `zeroize()` and both fuzz harnesses were absent, including `SecretKey`'s layout going from the

@@ -366,12 +366,43 @@ test "fuzz PublicKey.toPoint never panics" {
     try std.testing.fuzz({}, fuzzPublicKeyToPoint, .{});
 }
 
+/// ⛔ `Two.decrypt` accepts exactly the lengths `16 + 16k`, and `cipher_len`
+/// came from a ranged draw taken after `smith.bytes` had eaten the input — so
+/// it was **0** on every input this target ever ran outside `--fuzz`, and
+/// `decryptedLength(0)` returned `InvalidLength` before a single AES round.
+/// The harness had never decrypted anything.
+///
+/// A seed is the 64-octet shared secret RAW (drawn with `smith.bytes`, which
+/// reads no length header), then the ciphertext framed the way `Smith.slice`
+/// reads it: a little-endian `u32` length, then the octets. (Spelled out here
+/// rather than via `testkit.fuzz.seed`, because the two halves have to be one
+/// comptime-concatenated array with a static lifetime.)
+const decrypt_seeds = [_][]const u8{
+    // IV + exactly one block: the shortest input `decryptedLength` accepts.
+    twoSeed(32),
+    twoSeed(48), // IV + two blocks
+    twoSeed(16), // IV and no blocks: a legal zero-length plaintext
+    twoSeed(256), // the buffer's full width, 15 blocks
+    twoSeed(15), // one octet short of the IV
+    twoSeed(33), // IV + one block + one octet: not a whole number of blocks
+    twoSeed(0), // and the input this target used to run for ever
+};
+
+/// The key is 64 zero octets: `Two.decrypt` keys AES from `key[32..64]`, and
+/// which key is used decides nothing about the length gate under test.
+fn twoSeed(comptime cipher_len: usize) []const u8 {
+    return &struct {
+        const bytes = [_]u8{0} ** Two.shared_secret_length ++
+            std.mem.toBytes(@as(u32, cipher_len)) ++ [_]u8{0xA5} ** cipher_len;
+    }.bytes;
+}
+
 fn fuzzTwoDecrypt(_: void, smith: *std.testing.Smith) !void {
     var key_buf: [Two.shared_secret_length]u8 = undefined;
     smith.bytes(&key_buf);
     var cipher_buf: [256]u8 = undefined;
-    smith.bytes(&cipher_buf);
-    const cipher_len: usize = smith.valueRangeAtMost(u16, 0, cipher_buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    const cipher_len: usize = smith.slice(&cipher_buf);
     const ciphertext = cipher_buf[0..cipher_len];
     // Two.decrypt takes ciphertext.len from the wire; a malformed length
     // (< iv_length, or not a whole number of blocks past the IV) must
@@ -381,5 +412,30 @@ fn fuzzTwoDecrypt(_: void, smith: *std.testing.Smith) !void {
     Two.decrypt(key_buf, dst[0..plaintext_len], ciphertext) catch return;
 }
 test "fuzz Two.decrypt never panics" {
-    try std.testing.fuzz({}, fuzzTwoDecrypt, .{});
+    try std.testing.fuzz({}, fuzzTwoDecrypt, .{ .corpus = &decrypt_seeds });
+}
+
+test "corpus: the decrypt seeds reach the cipher, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var accepted_length: usize = 0;
+    // The number the collapsed draw could not produce: plaintext octets that
+    // actually came out of AES. `decryptedLength(16)` is a legal 0, so a count
+    // of accepted LENGTHS alone would not distinguish "decrypted nothing".
+    var plaintext_octets: usize = 0;
+    for (decrypt_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var key_buf: [Two.shared_secret_length]u8 = undefined;
+        smith.bytes(&key_buf);
+        var cipher_buf: [256]u8 = undefined;
+        const cipher_len: usize = smith.slice(&cipher_buf);
+        if (cipher_len != 0) nonempty += 1;
+        const plaintext_len = Two.decryptedLength(cipher_len) catch continue;
+        accepted_length += 1;
+        var dst: [256]u8 = undefined;
+        Two.decrypt(key_buf, dst[0..plaintext_len], cipher_buf[0..cipher_len]) catch continue;
+        plaintext_octets += plaintext_len;
+    }
+    try std.testing.expectEqual(decrypt_seeds.len - 1, nonempty); // all but the empty seed
+    try std.testing.expectEqual(@as(usize, 4), accepted_length);
+    try std.testing.expectEqual(@as(usize, 288), plaintext_octets);
 }

@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** - Test-only, no production change: both fuzz targets ran one input, and
+  the metadata one could not have run its own reference document even with a working draw.
+  `fuzzDecodeFields` and `fuzzParseIdpMetadata` each opened `smith.bytes(&buf)` and then
+  drew a length with `smith.valueRangeAtMost`; a ranged `Smith` draw reads eight octets as
+  a little-endian `u64` and returns the range MINIMUM when fewer than eight remain, and
+  `bytes` had already eaten them - so `len` was **0** every round and all three decoders
+  were handed `""`. Separately, `fuzzParseIdpMetadata`'s buffer was **512 octets** while
+  the module's only complete IdP metadata document (the one in `test "parseIdpMetadata:
+  endpoints + signing cert DER"`) is **718** - and a seed longer than the buffer reads back
+  EMPTY rather than truncated, so that document could never have passed through its own
+  harness. Buffer raised to 2048, both targets draw with `smith.slice`, and both gained a
+  corpus. Measured by the two new `corpus:` guards - binding fields: 6 non-empty seeds, 5
+  POST decodes, **1 Redirect decode**, 182 XML octets recovered; IdP metadata: 5 non-empty,
+  1 parsed, **1 SSO endpoint and 1 signing cert**, which is the 718-octet document getting
+  through. The endpoint and cert counts are pinned rather than a parse count because an
+  empty `<md:EntityDescriptor/>` would parse to an empty `Metadata`. The Redirect seed was
+  added after the first draft measured `redirect_ok == 0` - a corpus of refusals only
+  exercises the refusal path.
+
 - **2026-09-03** — Drift re-audit (last audited `d163578`, ~721 lines since). ⭐ **No
   authentication-bypass path.** The XSW defence was re-probed rather than taken on trust,
   including against the C reference: `xmlsec1 --verify` reports a classic wrapping forgery —

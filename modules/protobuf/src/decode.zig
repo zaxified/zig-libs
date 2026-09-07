@@ -408,17 +408,95 @@ fn readValue(
 // merge path both get adversarial input too, not just the scalar loop.
 const ct = @import("codec_test.zig");
 const encode_mod = @import("encode.zig");
+const conformance = @import("conformance.zig");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing
+/// and the `Cursor` the depth-boundary harness reads its script from.
+const testkit = @import("testkit");
+
+/// One corpus entry: the message as a `testkit.fuzz` slice seed, then the
+/// `u64` words the four knobs after it read.
+///
+/// ⛔ Both halves matter. The old draw order was `len` FIRST (a ranged draw,
+/// which returns the range minimum unless a whole eight-octet word lands in
+/// range) and `bytes` into `buf[0..len]` after it — so with no corpus, `len`
+/// was 0 and `input` was the EMPTY slice on every round this target ever ran
+/// outside `--fuzz`. An empty protobuf message is *legal*: it decodes to the
+/// all-defaults value for every one of the four shapes. So the target had a
+/// 100% acceptance rate while parsing nothing at all, which is exactly why the
+/// guard below pins fields walked and not `accepted > 0`.
+///
+/// And the knobs are drawn AFTER the byte draw, so on a corpus replay they are
+/// dead unless the seed leaves a tail: `max_depth` would be 1, both booleans
+/// false, and the shape word 0 — meaning `Repeated`, `Keeps` and `Chain` would
+/// never be selected however many message seeds were added.
+const DecodeCorpus = struct {
+    const cap = conformance.wide_cases.len + conformance.repeated_cases.len + 12;
+    store: [cap * (4 + 512 + 4 * 8)]u8 = undefined,
+    used: usize = 0,
+    entries: [cap][]const u8 = undefined,
+    n: usize = 0,
+
+    /// `shape`: 0 `Wide`, 1 `Repeated`, 2 `Keeps`, 3 `Chain`.
+    fn push(self: *DecodeCorpus, frame: []const u8, max_depth: u64, copy: u64, reject: u64, shape: u64) void {
+        const start = self.used;
+        var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
+        for ([_]u64{ max_depth, copy, reject, shape }) |w| {
+            std.mem.writeInt(u64, self.store[at..][0..8], w, .little);
+            at += 8;
+        }
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *DecodeCorpus, a: std.mem.Allocator) []const []const u8 {
+        // ⛔ A protobuf message an arbitrary byte draw would produce is
+        // essentially never a message: every length-delimited field needs a
+        // prefix that exactly covers what follows it. The accepted frames
+        // therefore come from the module's OWN encoder, over the same case
+        // tables `conformance.zig` checks byte-exactly.
+        for (conformance.wide_cases) |c| {
+            const bytes = encode_mod.encodeAlloc(a, c.value, .{}) catch unreachable;
+            self.push(bytes, 64, 1, 0, 0);
+        }
+        for (conformance.repeated_cases) |c| {
+            const bytes = encode_mod.encodeAlloc(a, c.value, .{}) catch unreachable;
+            self.push(bytes, 64, 1, 0, 1);
+        }
+        const chain = encode_mod.encodeAlloc(a, conformance.chain3, .{ .max_depth = 255 }) catch unreachable;
+        self.push(chain, 64, 0, 0, 3); // Chain, and `copy_strings = false`
+        self.push(chain, 2, 0, 0, 3); // the same, under a cap the chain exceeds
+        // Unknown fields, read as `Keeps` — the capture path — and once with
+        // `reject_unknown_fields`, the branch that turns capture into refusal.
+        const widest = encode_mod.encodeAlloc(a, conformance.wide_cases[17].value, .{}) catch unreachable;
+        self.push(widest, 64, 1, 0, 2);
+        self.push(widest, 64, 1, 1, 2);
+        // The hostile frames `adversarial.zig` names, so the corpus is not
+        // "accepted messages only".
+        self.push(&[_]u8{ 0x7a, 0xff, 0xff, 0xff, 0xff, 0x0f }, 64, 1, 0, 0); // string length past the buffer
+        self.push(&[_]u8{ 0x8a, 0x01, 0xff, 0xff, 0xff, 0xff, 0x07, 0x08 }, 64, 1, 0, 0); // submessage length lies
+        self.push(&[_]u8{ 0x0a, 0x80, 0x80, 0x40, 0x01, 0x02 }, 64, 1, 0, 1); // packed field length lies
+        self.push(&[_]u8{ 0x9a, 0x06, 0xff, 0xff, 0xff, 0xff, 0x0f }, 64, 1, 0, 2); // unknown-field length lies
+        self.push(&[_]u8{ 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01 }, 64, 1, 0, 2); // varint overflow
+        self.push("", 64, 1, 0, 0); // the input this target used to run for ever
+        return self.entries[0..self.n];
+    }
+};
 
 test "fuzz: decode never panics or leaks, across every message shape the schema exposes" {
-    try std.testing.fuzz({}, fuzzDecodeNeverPanics, .{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var corpus: DecodeCorpus = .{};
+    try std.testing.fuzz({}, fuzzDecodeNeverPanics, .{ .corpus = corpus.build(arena.allocator()) });
 }
 
 fn fuzzDecodeNeverPanics(_: void, smith: *std.testing.Smith) !void {
-    // Length drawn first so every mutated byte lands inside `input`, not
-    // scattered across a fixed 4096-byte draw a small `len` would discard.
+    // ⚠ One `smith.slice` call, the FIRST draw. The old order drew `len` from
+    // a ranged draw before the bytes, which returns the range MINIMUM unless a
+    // whole eight-octet word lands inside it — so `input` was empty on every
+    // round outside `--fuzz`.
     var buf: [4096]u8 = undefined;
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
-    smith.bytes(buf[0..len]);
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
 
     const options: Options = .{
@@ -440,6 +518,72 @@ fn fuzzOne(comptime T: type, input: []const u8, options: Options) !void {
     defer d.deinit();
 }
 
+test "corpus: every decode seed reaches the parser, and the counts are pinned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var corpus: DecodeCorpus = .{};
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The number the EMPTY input cannot produce. `decode` of `""` succeeds
+    // for all four shapes — an empty protobuf message is legal — so an
+    // `accepted > 0` guard would have read 100% over a corpus that reached
+    // nothing. `octets` is the total length actually handed to the parser.
+    var octets: usize = 0;
+    var shapes_seen: [4]bool = @splat(false);
+    var depths_seen: [2]bool = @splat(false); // the drawn cap, split at 32
+    for (corpus.build(arena.allocator())) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [4096]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        octets += len;
+        const options: Options = .{
+            .max_depth = smith.valueRangeAtMost(u8, 1, 96),
+            .copy_strings = smith.value(bool),
+            .reject_unknown_fields = smith.value(bool),
+        };
+        depths_seen[if (options.max_depth < 32) 0 else 1] = true;
+        const shape = smith.valueRangeAtMost(u2, 0, 3);
+        shapes_seen[shape] = true;
+        const ok = switch (shape) {
+            0 => blk: {
+                var d = decode(ct.Wide, std.testing.allocator, buf[0..len], options) catch break :blk false;
+                d.deinit();
+                break :blk true;
+            },
+            1 => blk: {
+                var d = decode(ct.Repeated, std.testing.allocator, buf[0..len], options) catch break :blk false;
+                d.deinit();
+                break :blk true;
+            },
+            2 => blk: {
+                var d = decode(ct.Keeps, std.testing.allocator, buf[0..len], options) catch break :blk false;
+                d.deinit();
+                break :blk true;
+            },
+            3 => blk: {
+                var d = decode(ct.Chain, std.testing.allocator, buf[0..len], options) catch break :blk false;
+                d.deinit();
+                break :blk true;
+            },
+        };
+        if (ok) accepted += 1;
+    }
+    // ⚠ 37 of 40, not 39 of 40. Three seeds carry zero octets: the deliberate
+    // `""` at the end, and the two case-table rows named "empty"/"rep_empty",
+    // whose encodings ARE the empty message. That is the trap this module
+    // sits in — an empty protobuf is legal and decodes for every shape, so
+    // the numbers below are about reach, not about legality.
+    try std.testing.expectEqual(@as(usize, 37), nonempty);
+    try std.testing.expectEqual(@as(usize, 33), accepted);
+    try std.testing.expectEqual(@as(usize, 450), octets);
+    // The knobs are alive on a corpus replay: all four shapes and both sides
+    // of the depth cap ran, where a tail-less seed would have pinned every
+    // one of them at `Wide` with `max_depth = 1`.
+    for (shapes_seen) |s| try std.testing.expect(s);
+    for (depths_seen) |d| try std.testing.expect(d);
+}
+
 // ── fuzz: the depth cap holds at exactly the boundary the input picks ──────
 //
 // Pure random bytes essentially never spell a genuinely nested submessage
@@ -459,13 +603,38 @@ fn fuzzOne(comptime T: type, input: []const u8, options: Options) !void {
 // below does not compare encode's and decode's counters against each other,
 // it compares decode's outcome against the caller-known true nesting depth
 // `n`, which is independent of either implementation.)
+/// ⛔ The measurement that made this rewrite necessary: BOTH draws were ranged
+/// and there was no corpus, so `true_len` and `max_depth` were the range
+/// minimum — **1 and 1** — on every input this target ever ran outside
+/// `--fuzz`. It built a one-node chain, decoded it under a cap of 1, and took
+/// the success path. The `error.DepthExceeded` branch this test exists to
+/// assert had never executed once, and the boundary was only ever approached
+/// from the safe side.
+///
+/// The harness now reads its two numbers from one `smith.slice`, so the byte
+/// draw comes first and a seed is a readable pair. `Cursor.ranged(1, 200)` is
+/// `1 + b % 200`, so the script octet is the value minus one.
+const depth_seeds = [_][]const u8{
+    testkit.fuzz.seed(&[_]u8{ 0, 0 }), // 1 / 1 — what this target used to be
+    testkit.fuzz.seed(&[_]u8{ 63, 63 }), // 64 / 64 — exactly at the cap
+    testkit.fuzz.seed(&[_]u8{ 64, 63 }), // 65 / 64 — one over: DepthExceeded
+    testkit.fuzz.seed(&[_]u8{ 62, 63 }), // 63 / 64 — one under
+    testkit.fuzz.seed(&[_]u8{ 199, 0 }), // 200 / 1 — far over
+    testkit.fuzz.seed(&[_]u8{ 0, 199 }), // 1 / 200 — far under
+    testkit.fuzz.seed(&[_]u8{ 199, 199 }), // 200 / 200 — the deepest legal chain
+    testkit.fuzz.seed(""), // the empty script: 1 / 1 again
+};
+
 test "fuzz: the nesting-depth cap fires at exactly the boundary the input asks for" {
-    try std.testing.fuzz({}, fuzzDepthCapBoundary, .{});
+    try std.testing.fuzz({}, fuzzDepthCapBoundary, .{ .corpus = &depth_seeds });
 }
 
 fn fuzzDepthCapBoundary(_: void, smith: *std.testing.Smith) !void {
-    const true_len = smith.valueRangeAtMost(u8, 1, 200);
-    const max_depth = smith.valueRangeAtMost(u8, 1, 200);
+    var script: [16]u8 = undefined;
+    const script_len: usize = smith.slice(&script);
+    var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+    const true_len: u8 = @intCast(cur.ranged(1, 200));
+    const max_depth: u8 = @intCast(cur.ranged(1, 200));
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -499,7 +668,32 @@ fn fuzzDepthCapBoundary(_: void, smith: *std.testing.Smith) !void {
 
     try std.testing.expect(true_len <= max_depth);
     var got: usize = 1;
-    var cur: ?*const ct.Chain = d.value.next;
-    while (cur) |c| : (got += 1) cur = c.next;
+    var walk: ?*const ct.Chain = d.value.next;
+    while (walk) |c| : (got += 1) walk = c.next;
     try std.testing.expectEqual(@as(usize, true_len), got);
+}
+
+test "corpus: the depth seeds drive both sides of the boundary, and the counts are pinned" {
+    var nonempty: usize = 0;
+    // ⛔ The two numbers that matter here, neither of which the collapsed draw
+    // could produce: how many seeds land ABOVE the cap (the `DepthExceeded`
+    // branch, which had never executed) and how deep the deepest chain got.
+    // With `true_len = max_depth = 1` for every input, `over` was 0 and
+    // `deepest` was 1.
+    var over: usize = 0;
+    var deepest: usize = 0;
+    for (depth_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [16]u8 = undefined;
+        const script_len: usize = smith.slice(&script);
+        if (script_len != 0) nonempty += 1;
+        var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+        const true_len: u8 = @intCast(cur.ranged(1, 200));
+        const max_depth: u8 = @intCast(cur.ranged(1, 200));
+        if (true_len > max_depth) over += 1;
+        deepest = @max(deepest, @as(usize, true_len));
+    }
+    try std.testing.expectEqual(depth_seeds.len - 1, nonempty); // all but the empty script
+    try std.testing.expectEqual(@as(usize, 2), over);
+    try std.testing.expectEqual(@as(usize, 200), deepest);
 }

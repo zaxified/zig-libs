@@ -19,6 +19,8 @@
 //! direct `k256.Fe.op(...) == std.Fe.op(...)` comparison via `toBytes`.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 const builtin = @import("builtin");
 const gate = @import("gate.zig");
 const fast_core = @import("fast_core.zig");
@@ -413,8 +415,63 @@ test "algebraic identities: a·a⁻¹ = 1, a − a = 0, (a·b) = (b·a)" {
 // rejection this loader has, so the harness biases toward the boundary
 // (values at/near `p`) as well as fully random 32-byte strings.
 
+/// ⛔ The four knobs below are all drawn AFTER the byte draw, and this target
+/// had no corpus — so outside `--fuzz` the input was exhausted by
+/// `smith.bytes` and every `smith.value(bool)` returned FALSE. The
+/// boundary bias the comment above is entirely about had **never executed**:
+/// `p`, `p-1` and `p+1` were never handed to `rejectNonCanonical`, and the
+/// little-endian branch was never taken either. One all-zero big-endian string
+/// was the only input this harness ever ran.
+///
+/// ⚠ A `smith.bytes(&s)` harness reads its corpus entry RAW — no length
+/// header — so a seed is the 32 octets themselves followed by the `u64` words
+/// the knobs read (`1` is `true`, `0` is `false`).
+///
+/// ⚠ How MANY words a seed needs is not fixed: the second and third are read
+/// only inside the branches the first and second open. The word lists below
+/// are therefore per-seed, not a uniform four.
+const fe_seeds = [_][]const u8{
+    // Ordinary value, no boundary override: [bias=0, endian=big].
+    rawSeed(&([_]u8{0} ** 31 ++ [_]u8{1} ++ leWords(&.{ 0, 1 }))),
+    // The same, read little-endian: [bias=0, endian=little].
+    rawSeed(&([_]u8{0} ** 31 ++ [_]u8{1} ++ leWords(&.{ 0, 0 }))),
+    // `p` exactly, which `rejectNonCanonical` refuses:
+    // [bias=1, offset=0, endian=big]. The byte payload is overwritten by the
+    // bias branch, so its content does not matter here.
+    rawSeed(&([_]u8{0} ** 32 ++ leWords(&.{ 1, 0, 1 }))),
+    // `p - 1`, the largest canonical element: [bias=1, offset=1, plus=0]
+    // (`+%= 0xff`), then endian=big.
+    rawSeed(&([_]u8{0} ** 32 ++ leWords(&.{ 1, 1, 0, 1 }))),
+    // `p + 1`, refused: [bias=1, offset=1, plus=1], then endian=big.
+    rawSeed(&([_]u8{0} ** 32 ++ leWords(&.{ 1, 1, 1, 1 }))),
+    // All-0xff: above `p` in either endianness.
+    rawSeed(&([_]u8{0xff} ** 32 ++ leWords(&.{ 0, 1 }))),
+    // The all-zero, big-endian, no-bias input this target used to run for ever.
+    rawSeed(&([_]u8{0} ** 32 ++ leWords(&.{ 0, 0 }))),
+};
+
+/// The `u64` tail a `smith.bytes` seed needs so the knobs after it are alive.
+fn leWords(comptime ws: []const u64) [ws.len * 8]u8 {
+    var out: [ws.len * 8]u8 = undefined;
+    for (ws, 0..) |w, i| std.mem.writeInt(u64, out[i * 8 ..][0..8], w, .little);
+    return out;
+}
+
+/// ⛔ NOT `testkit.fuzz.seed`. That helper prepends the little-endian `u32`
+/// length `Smith.slice` reads, and this harness opens with `smith.bytes`,
+/// which reads no header at all. Written with `seed` first: the four-octet
+/// prefix shifted the whole payload, `bytes` swallowed the first 28 octets of
+/// the word tail, and every knob still read `false` — `boundary` stayed at 0
+/// and the guard said so. The static `struct {}` namespace is what gives the
+/// returned slice a lifetime (a `const` local is not promoted).
+fn rawSeed(comptime frame: []const u8) []const u8 {
+    return &struct {
+        const bytes = frame[0..frame.len].*;
+    }.bytes;
+}
+
 test "fuzz: Fe.fromBytes never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzFeFromBytes, .{});
+    try std.testing.fuzz({}, fuzzFeFromBytes, .{ .corpus = &fe_seeds });
 }
 
 fn fuzzFeFromBytes(_: void, smith: *std.testing.Smith) !void {
@@ -427,4 +484,31 @@ fn fuzzFeFromBytes(_: void, smith: *std.testing.Smith) !void {
     }
     const endian: std.builtin.Endian = if (smith.value(bool)) .big else .little;
     _ = Fe.fromBytes(s, endian) catch {};
+}
+
+test "corpus: the Fe seeds drive every knob, and the counts are pinned" {
+    var accepted: usize = 0;
+    var boundary: usize = 0;
+    var little: usize = 0;
+    for (fe_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var s: [Fe.encoded_length]u8 = undefined;
+        smith.bytes(&s);
+        if (smith.value(bool)) {
+            boundary += 1;
+            s = std.mem.toBytes(std.mem.nativeToBig(u256, field_order));
+            if (smith.value(bool)) s[Fe.encoded_length - 1] +%= if (smith.value(bool)) 1 else 0xff;
+        }
+        const endian: std.builtin.Endian = if (smith.value(bool)) .big else .little;
+        if (endian == .little) little += 1;
+        _ = Fe.fromBytes(s, endian) catch continue;
+        accepted += 1;
+    }
+    // ⛔ `boundary` and `little` were both **0** for every input this target
+    // had ever run — the branch the harness's comment is about, and the
+    // little-endian loader, had never executed. Those, not `accepted`, are
+    // what this guard exists to hold.
+    try std.testing.expectEqual(@as(usize, 3), boundary);
+    try std.testing.expectEqual(@as(usize, 2), little);
+    try std.testing.expectEqual(@as(usize, 4), accepted);
 }

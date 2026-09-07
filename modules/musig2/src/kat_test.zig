@@ -32,6 +32,9 @@
 
 const std = @import("std");
 const musig2 = @import("root.zig");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing
+/// and the `Cursor` the perturbation harness reads its script from.
+const testkit = @import("testkit");
 const bip340 = @import("bip340");
 const v = @import("kat_vectors.zig");
 
@@ -663,7 +666,56 @@ test "end-to-end: 3 signers with an x-only (Taproot-style) tweak — aggregate v
 // flipping a handful of bytes, so the fuzzer lands near the `s < n`
 // boundary and the group equation rather than being rejected by the
 // first range check on nearly every draw.
+/// ⛔ The measurement that made this rewrite necessary: the first draw was
+/// `smith.valueRangeAtMost(u8, 0, 4)` and there was no corpus, so `n_flips`
+/// was the range MINIMUM — **0** — on every input this target ever ran outside
+/// `--fuzz`. It verified the vector's own published, valid partial signature,
+/// unmodified, every round: a harness named "never panics on corrupted
+/// partial-signature bytes" had never corrupted a byte, and the `s < n`
+/// boundary and group equation its own comment names were never approached.
+///
+/// ⛔ And the flip BUDGET was wrong even for a working draw. The comment above
+/// this harness says the mutation lands "near the `s < n` boundary", but
+/// secp256k1's `n` is `FFFFFFFF…FFFFFFFE BAAEDCE6…` — **fifteen leading 0xFF
+/// octets**. No edit of four octets can raise a 32-octet scalar above it, so
+/// `PartialSignature.fromBytes`'s range check could not have been made to fire
+/// from this harness at any flip count it was able to draw. The cap is now 32,
+/// and one seed spends sixteen flips on exactly that refusal.
+///
+/// The perturbation script comes out of one `smith.slice`, so the byte draw is
+/// first. Layout: `[0]` flip count (`b % 33`), then per flip a position octet
+/// (`b % 32`) and a replacement octet. A `PartialSignature` is one 32-octet
+/// big-endian scalar, so position 0 is its most significant octet.
+///
+/// ⚠ The script buffer is 128, not 16: the sixteen-flip seed below is 33
+/// octets, and a seed longer than the buffer does not arrive truncated, it
+/// reads back EMPTY. Written at 16 first; the guard's `nonempty` count caught
+/// it, which is what that count is for.
+const psig_seeds = [_][]const u8{
+    testkit.fuzz.seed(&[_]u8{0}), // no flips — what the target used to do
+    // `s >= n`: the top sixteen octets forced to 0xFF, which is above `n`
+    // because `n[15]` is 0xFE. Refused by `fromBytes`'s own range check —
+    // the boundary this harness's comment claims and could not reach.
+    testkit.fuzz.seed(&[_]u8{ 16, 0, 0xff, 1, 0xff, 2, 0xff, 3, 0xff, 4, 0xff, 5, 0xff, 6, 0xff, 7, 0xff, 8, 0xff, 9, 0xff, 10, 0xff, 11, 0xff, 12, 0xff, 13, 0xff, 14, 0xff, 15, 0xff }),
+    // The bottom octet flipped to 0: still `< n`, so this parses and the
+    // group equation is what has to reject it — the path a zero-flip harness
+    // could never reach.
+    testkit.fuzz.seed(&[_]u8{ 1, 31, 0x00 }),
+    // The all-zero scalar: a legal encoding, an invalid partial signature.
+    testkit.fuzz.seed(&[_]u8{ 4, 0, 0, 8, 0, 16, 0, 31, 0 }),
+    // One octet in the middle.
+    testkit.fuzz.seed(&[_]u8{ 1, 15, 0x5a }),
+    // Four flips, the top of the OLD draw's range.
+    testkit.fuzz.seed(&[_]u8{ 4, 1, 0x11, 9, 0x22, 20, 0x33, 30, 0x44 }),
+    testkit.fuzz.seed(""), // the empty script: zero flips again
+};
+
 fn fuzzPartialSigVerify(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ The FIRST draw is a byte draw. See `psig_seeds`.
+    var script: [128]u8 = undefined;
+    const script_len: usize = smith.slice(&script);
+    var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+
     const gpa = std.testing.allocator;
     const case = v.sign_verify.valid_test_cases[0];
 
@@ -683,11 +735,11 @@ fn fuzzPartialSigVerify(_: void, smith: *std.testing.Smith) !void {
     defer gpa.free(msg);
 
     var bytes = hexN(32, case.expected);
-    const n_flips = smith.valueRangeAtMost(u8, 0, 4);
-    var i: u8 = 0;
+    const n_flips = cur.ranged(0, 32);
+    var i: u32 = 0;
     while (i < n_flips) : (i += 1) {
-        const pos = smith.index(bytes.len);
-        bytes[pos] = smith.value(u8);
+        const pos = cur.ranged(0, bytes.len - 1);
+        bytes[pos] = cur.byte();
     }
 
     const psig = musig2.PartialSignature.fromBytes(bytes) catch return;
@@ -695,5 +747,56 @@ fn fuzzPartialSigVerify(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: partialSigVerify never panics on corrupted partial-signature bytes" {
-    try std.testing.fuzz({}, fuzzPartialSigVerify, .{});
+    try std.testing.fuzz({}, fuzzPartialSigVerify, .{ .corpus = &psig_seeds });
+}
+
+test "corpus: the psig seeds actually corrupt the signature, and the counts are pinned" {
+    const gpa = std.testing.allocator;
+    const case = v.sign_verify.valid_test_cases[0];
+
+    var pk_buf: [8]musig2.PlainPublicKey = undefined;
+    for (case.key_indices, 0..) |idx, i| {
+        pk_buf[i] = try musig2.PlainPublicKey.fromBytes(hexN(33, v.sign_verify.pubkeys[idx]));
+    }
+    const pks = pk_buf[0..case.key_indices.len];
+    var pn_buf: [8]musig2.PubNonce = undefined;
+    for (case.nonce_indices, 0..) |idx, i| {
+        pn_buf[i] = try musig2.PubNonce.fromBytes(hexN(66, v.sign_verify.pnonces[idx]));
+    }
+    const pns = pn_buf[0..case.nonce_indices.len];
+    const msg = try hexAlloc(gpa, v.sign_verify.msgs[case.msg_index]);
+    defer gpa.free(msg);
+
+    var nonempty: usize = 0;
+    var flips_total: usize = 0;
+    var parsed: usize = 0;
+    var verified: usize = 0;
+    for (psig_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [128]u8 = undefined;
+        const script_len: usize = smith.slice(&script);
+        if (script_len != 0) nonempty += 1;
+        var cur: testkit.fuzz.Cursor = .{ .bytes = script[0..script_len] };
+        var bytes = hexN(32, case.expected);
+        const n_flips = cur.ranged(0, 32);
+        flips_total += n_flips;
+        var i: u32 = 0;
+        while (i < n_flips) : (i += 1) {
+            const pos = cur.ranged(0, bytes.len - 1);
+            bytes[pos] = cur.byte();
+        }
+        const psig = musig2.PartialSignature.fromBytes(bytes) catch continue;
+        parsed += 1;
+        if (musig2.partialSigVerify(psig, pns, pks, &.{}, msg, case.signer_index)) |_| {
+            verified += 1;
+        } else |_| {}
+    }
+    try std.testing.expectEqual(psig_seeds.len - 1, nonempty); // all but the empty script
+    // ⛔ `flips_total` is the number the collapsed draw could not produce: it
+    // was **0** for every input this target had ever run. The gap between
+    // `parsed` and `verified` is the other half — corrupted scalars that get
+    // past the `s < n` check and are refused by the group equation.
+    try std.testing.expectEqual(@as(usize, 26), flips_total);
+    try std.testing.expectEqual(@as(usize, 6), parsed); // the s >= n seed is the one refused
+    try std.testing.expectEqual(@as(usize, 2), verified);
 }

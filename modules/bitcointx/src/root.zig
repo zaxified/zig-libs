@@ -35,6 +35,8 @@
 //!   for provenance) and the tests that check byte-exactness against them.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -142,7 +144,8 @@ test "root re-exports resolve to the same types/values as tx.zig" {
 // that is the invariant a validator's whole O(n) vs O(n²) choice rests on, and
 // it is checked on every input that decodes.
 test "fuzz: every decoded transaction through legacy/BIP143/BIP341 sighash" {
-    try std.testing.fuzz({}, fuzzSighash, .{ .corpus = sighash_seeds });
+    var corpus: SighashCorpus = .{};
+    try std.testing.fuzz({}, fuzzSighash, .{ .corpus = corpus.build() });
 }
 
 /// F11 (2026-08-11 re-audit): a same-shape clone of `t` with an
@@ -175,25 +178,39 @@ fn cloneVinVout(allocator: std.mem.Allocator, t: Transaction) !ClonedVinVout {
 
 fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
     const a = std.testing.allocator;
-    var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    // The same three-way bias `tx.zig`'s harness uses on the octet after the
-    // version field, so transactions actually decode instead of the fuzzer
-    // spending its budget on the CompactSize bail-out.
-    buf[4] = switch (smith.valueRangeAtMost(u8, 0, 2)) {
-        0 => smith.valueRangeAtMost(u8, 0, 4),
-        1 => 0x00,
-        else => smith.value(u8),
-    };
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ Two `smith.slice` calls, never `bytes` followed by a ranged length.
+    // Measured on the four 512-octet seeds this target used to carry: `len`
+    // came out of `valueRangeAtMost(u16, 0, 256)` reading the tail words
+    // `sighashSeed` writes, which are `& 0x03` — so the LONGEST transaction
+    // this harness ever decoded was **3 octets**, shorter than the `version`
+    // field, and `deserializePartial` bailed out before the first CompactSize
+    // on every input for as long as the target existed. `script` was the same
+    // shape and always empty.
+    //
+    // ⚠ And 256 was too small anyway: see `tx.fuzz_tx_buf_len` — the module's
+    // own smallest reference transaction is 275 octets, so not one of them
+    // could have passed through here even with a working length draw.
+    var buf: [tx.fuzz_tx_buf_len]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    // The same bias `tx.zig`'s harness uses on the octet after the version
+    // field, so ARBITRARY bytes decode instead of the fuzzer spending its
+    // budget on the CompactSize bail-out. `else` leaves a seeded frame alone.
+    if (len > 4) {
+        buf[4] = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+            0 => smith.valueRangeAtMost(u8, 0, 4),
+            1 => 0x00,
+            2 => smith.value(u8),
+            else => buf[4],
+        };
+    }
 
     var r = deserializePartial(a, buf[0..len]) catch return;
     defer r.tx.deinit(a);
     const t = r.tx;
 
     var script_buf: [96]u8 = undefined;
-    smith.bytes(&script_buf);
-    const script = script_buf[0..smith.valueRangeAtMost(u8, 0, script_buf.len)];
+    const script_len: usize = smith.slice(&script_buf);
+    const script = script_buf[0..script_len];
     // Deliberately drawn past `vin.len`: `InputIndexOutOfRange` is a gate all
     // three implement separately, and an out-of-range index is exactly what a
     // hostile witness stack supplies.
@@ -275,36 +292,132 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
-/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
-/// `options.corpus` plus one empty input, and an empty input makes every draw
-/// return its range minimum — a zero-length buffer that decodes to nothing.
-/// The first `smith.bytes` draw takes raw octets, so the seed's head is a
-/// transaction prefix; the words after it are kept small because `Smith`
-/// discards any word outside a draw's declared range.
-fn sighashSeed(comptime head: []const u8, comptime bits: u64, comptime n: usize) [n]u8 {
-    @setEvalBranchQuota(100_000);
-    var out: [n]u8 = undefined;
-    for (out[0..256], 0..) |*b, i| b.* = head[i % head.len];
-    var i: usize = 256;
-    var w: u6 = 0;
-    while (i + 8 <= n) : (i += 8) {
-        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x03, .little);
-        w +%= 1;
-    }
-    return out;
-}
+/// Without `--fuzz` the runner feeds only `options.corpus` plus one empty
+/// input, and an empty input makes every draw return its range minimum.
+///
+/// ⛔ The four 512-octet seeds this target used to carry did NOT fix that.
+/// They were built by a helper that wrote `(bits >> w) & 0x03` into every
+/// trailing `u64` word — including the word the length draw read — so
+/// `len = valueRangeAtMost(u16, 0, 256)` was **at most 3 octets**, shorter
+/// than the four-octet `version` field. The transaction prefix in each seed's
+/// head was never decoded, the `script` draw was the same shape and always
+/// empty, and the three sighash functions this harness exists to exercise had
+/// never run on a transaction. That is the measurement this rewrite replaces.
+///
+/// A seed here is: the transaction as a `testkit.fuzz` slice seed, then the
+/// `which` word for the version-byte bias, then the script as a second slice
+/// seed, then the `u64` words the knobs after it read. ⚠ Every word must fall
+/// inside its draw's declared range or `Smith` discards the REST of the input,
+/// so `1` is used throughout: it is in range for `bool`, for
+/// `valueRangeAtMost(u8, 0, 5)`, for `value(i64)` and for the `valid_ht`
+/// index, and `true` is the branch that reaches the precomputed-mismatch
+/// assertions.
+const SighashCorpus = struct {
+    store: [8 * (4 + tx.fuzz_tx_buf_len + 8 + 4 + 96 + 32 * 8)]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
 
-const sighash_seeds: []const []const u8 = &.{
-    // version 2, one input, one output, small scripts — a shape that decodes.
-    &sighashSeed(&[_]u8{
-        0x02, 0x00, 0x00, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33,
-        0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
-        0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x00,
-        0x00, 0x00, 0x00, 0x02, 0x51, 0x52, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x10,
-        0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x51, 0x51, 0x00, 0x00,
-        0x00, 0x00,
-    }, 0x9E37_79B9_7F4A_7C15, 512),
-    &sighashSeed(&[_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 }, 0x0123_4567_89AB_CDEF, 512),
-    &sighashSeed(&[_]u8{ 0x01, 0x00, 0x00, 0x00, 0x02 }, 0xF0E1_D2C3_B4A5_9687, 512),
-    &sighashSeed(&[_]u8{0xFF}, 0xFFFF_FFFF_FFFF_FFFF, 512),
+    fn push(self: *SighashCorpus, frame: []const u8, which: u64, script: []const u8, tail: []const u64) void {
+        const start = self.used;
+        var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
+        if (frame.len > 4) {
+            std.mem.writeInt(u64, self.store[at..][0..8], which, .little);
+            at += 8;
+        }
+        at += testkit.fuzz.seedInto(self.store[at..], script).len;
+        for (tail) |w| {
+            std.mem.writeInt(u64, self.store[at..][0..8], w, .little);
+            at += 8;
+        }
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *SighashCorpus) []const []const u8 {
+        // `1` repeated: idx = 1, amount = 1, structured hash types, and every
+        // `value(bool)` true, so the precomputed-mismatch branches all run.
+        const ones = [_]u64{1} ** 24;
+        // idx = 0 with a SIGHASH_SINGLE base (2) and no ANYONECANPAY —
+        // the legacy SIGHASH_SINGLE bug path.
+        const single = [_]u64{ 0, 1, 1, 2, 0 } ++ [_]u64{1} ** 19;
+        // ⛔ 3 = "leave the frame's own version byte alone". The other values
+        // are the arbitrary-bytes bias, which would corrupt a real fixture.
+        self.push(&tx.fuzz_kat_legacy, 3, &p2pkh_script, &ones);
+        self.push(&tx.fuzz_kat_legacy, 3, &p2pkh_script, &single);
+        self.push(&tx.fuzz_kat_segwit, 3, &p2pkh_script, &ones);
+        self.push(&tx.fuzz_kat_segwit, 3, &[_]u8{}, &ones); // empty script
+        const rewritten = [_]u64{2} ++ [_]u64{1} ** 23;
+        self.push(&tx.fuzz_kat_legacy, 0, &p2pkh_script, &rewritten); // vin count rewritten
+        self.push(tx.fuzz_kat_legacy[0..40], 3, &p2pkh_script, &ones); // truncated
+        self.push("", 3, &[_]u8{}, &ones); // the input this target used to run for ever
+        return self.entries[0..self.n];
+    }
 };
+
+/// A standard 25-octet P2PKH `scriptPubKey`, the `scriptCode` a real signer
+/// hands these functions. The old harness's script was always empty.
+const p2pkh_script = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x42} ** 20 ++ [_]u8{ 0x88, 0xac };
+
+test "corpus: sighash seeds reach the decoder, and the counts are pinned" {
+    const a = std.testing.allocator;
+    var corpus: SighashCorpus = .{};
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    // ⛔ The numbers the empty input cannot produce, and that a bare
+    // "decoded > 0" would not have held up: inputs walked out of the decoded
+    // transactions, and — the point of this target — sighash digests actually
+    // computed. Both were 0 for every input this harness ever ran.
+    var vin_total: usize = 0;
+    var legacy_digests: usize = 0;
+    var bip143_digests: usize = 0;
+    var bip341_digests: usize = 0;
+    var script_octets: usize = 0;
+    for (corpus.build()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [tx.fuzz_tx_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (len > 4) {
+            buf[4] = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+                0 => smith.valueRangeAtMost(u8, 0, 4),
+                1 => 0x00,
+                2 => smith.value(u8),
+                else => buf[4],
+            };
+        }
+        var r = deserializePartial(a, buf[0..len]) catch continue;
+        defer r.tx.deinit(a);
+        decoded += 1;
+        vin_total += r.tx.vin.len;
+        var script_buf: [96]u8 = undefined;
+        const script = script_buf[0..smith.slice(&script_buf)];
+        script_octets += script.len;
+        const idx: usize = smith.valueRangeAtMost(u8, 0, 5);
+        const amount = smith.value(i64);
+        const ht32: u32 = if (smith.value(bool))
+            @as(u32, smith.valueRangeAtMost(u8, 0, 3)) | (if (smith.value(bool)) @as(u32, 0x80) else 0)
+        else
+            smith.value(u32);
+        if (legacy.sighash(a, r.tx, idx, script, ht32)) |_| legacy_digests += 1 else |_| {}
+        if (bip143.sighash(a, r.tx, idx, script, amount, ht32)) |_| bip143_digests += 1 else |_| {}
+        var spent: [8]TxOut = undefined;
+        if (r.tx.vin.len <= spent.len) {
+            for (spent[0..r.tx.vin.len]) |*o| o.* = .{ .value = amount, .script_pubkey = script };
+            if (bip341.sighash(a, r.tx, idx, 0x01, spent[0..r.tx.vin.len])) |_| bip341_digests += 1 else |_| {}
+        }
+    }
+    try std.testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
+    try std.testing.expectEqual(@as(usize, 4), decoded);
+    try std.testing.expectEqual(@as(usize, 6), vin_total);
+    try std.testing.expectEqual(@as(usize, 75), script_octets);
+    // ⛔ These three were **0** for every input this target ever ran, because
+    // the length draw capped the transaction at 3 octets. One of the four
+    // decoded transactions is refused by all three algorithms on purpose
+    // (`idx = 1` against a one-input transaction — `InputIndexOutOfRange` is a
+    // gate all three implement separately), hence 3 and not 4.
+    try std.testing.expectEqual(@as(usize, 3), legacy_digests);
+    try std.testing.expectEqual(@as(usize, 3), bip143_digests);
+    try std.testing.expectEqual(@as(usize, 3), bip341_digests);
+}

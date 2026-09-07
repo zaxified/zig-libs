@@ -18,6 +18,8 @@
 //! for `std.crypto.sign` if desired; for now it proves the primitives.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 const group = @import("group.zig");
 const scalarmod = @import("scalar.zig");
 
@@ -199,8 +201,58 @@ pub const isLowS = @import("ecdsa_recover.zig").isLowS;
 // of them. `msg` is also fuzzed independently since it participates in the
 // challenge hash.
 
+/// ⛔ A BIP340 signature that verifies is not reachable from arbitrary bytes,
+/// so the accepting frames come from the module's own `bip340Sign`. A seed is
+/// the 32-octet x-only pubkey and the 64-octet signature RAW (both are drawn
+/// with `smith.bytes`, which reads no length header), then the message as a
+/// `testkit.fuzz` slice seed.
+const Bip340Corpus = struct {
+    store: [8 * (32 + 64 + 4 + 96)]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Bip340Corpus, pubkey: [32]u8, sig: [64]u8, msg: []const u8) void {
+        const start = self.used;
+        @memcpy(self.store[start..][0..32], &pubkey);
+        @memcpy(self.store[start + 32 ..][0..64], &sig);
+        var at = start + 96;
+        at += testkit.fuzz.seedInto(self.store[at..], msg).len;
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *Bip340Corpus) []const []const u8 {
+        const sk = [_]u8{0} ** 31 ++ [_]u8{1};
+        const pk = Secp256k1.basePoint.affineCoordinates().x.toBytes(.big);
+        const msg = [_]u8{0xAB} ** 32;
+        const sig = bip340Sign(sk, &msg, [_]u8{0} ** 32) catch unreachable;
+        self.push(pk, sig, &msg); // a real signature over a real key
+        var flipped = sig;
+        flipped[63] ^= 0x01; // one octet in `s`: still parses, fails the equation
+        self.push(pk, flipped, &msg);
+        var bad_r = sig;
+        @memset(bad_r[0..32], 0xff); // `r >= p`: refused by `Fe.fromBytes`
+        self.push(pk, bad_r, &msg);
+        var bad_s = sig;
+        @memset(bad_s[32..], 0xff); // `s >= n`: refused by `Scalar.fromBytes`
+        self.push(pk, bad_s, &msg);
+        var bad_pk = pk;
+        bad_pk[31] ^= 0x01; // an x-only key with no even-y point
+        self.push(bad_pk, sig, &msg);
+        // The right signature over the WRONG message — the challenge-hash
+        // path, which needs a non-empty message to differ at all.
+        self.push(pk, sig, "a different message entirely");
+        self.push(pk, sig, ""); // an empty message is legal for BIP340
+        self.push(@splat(0), @splat(0), ""); // the all-zero input this used to run
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: bip340Verify never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzBip340Verify, .{});
+    var corpus: Bip340Corpus = .{};
+    try std.testing.fuzz({}, fuzzBip340Verify, .{ .corpus = corpus.build() });
 }
 
 fn fuzzBip340Verify(_: void, smith: *std.testing.Smith) !void {
@@ -209,8 +261,33 @@ fn fuzzBip340Verify(_: void, smith: *std.testing.Smith) !void {
     var sig: [64]u8 = undefined;
     smith.bytes(&sig);
     var msg_buf: [96]u8 = undefined;
-    smith.bytes(&msg_buf);
-    const msg_len: usize = smith.valueRangeAtMost(u8, 0, msg_buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `msg_len == 0` on every input this target ever ran outside
+    // `--fuzz`, so the message — which participates in the challenge hash, and
+    // which this harness's own comment says is "fuzzed independently" — was
+    // the empty string every round.
+    const msg_len: usize = smith.slice(&msg_buf);
 
     _ = bip340Verify(pubkey, msg_buf[0..msg_len], sig);
+}
+
+test "corpus: the BIP340 seeds reach the verifier, and the counts are pinned" {
+    var corpus: Bip340Corpus = .{};
+    var accepted: usize = 0;
+    // ⛔ The number the collapsed draw could not produce: message octets that
+    // actually entered the challenge hash. It was 0 on every input.
+    var msg_octets: usize = 0;
+    for (corpus.build()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var pubkey: [32]u8 = undefined;
+        smith.bytes(&pubkey);
+        var sig: [64]u8 = undefined;
+        smith.bytes(&sig);
+        var msg_buf: [96]u8 = undefined;
+        const msg_len: usize = smith.slice(&msg_buf);
+        msg_octets += msg_len;
+        if (bip340Verify(pubkey, msg_buf[0..msg_len], sig)) accepted += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), accepted);
+    try std.testing.expectEqual(@as(usize, 188), msg_octets);
 }

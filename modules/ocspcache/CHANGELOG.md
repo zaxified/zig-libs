@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** - Test-only, no production change: both fuzz targets replayed a single
+  input, and in `fuzzRefresh` that pinned every branch it selects. Each opened
+  `smith.bytes(&raw)` and then drew `raw_len` from a ranged draw, which returns the range
+  MINIMUM when fewer than eight octets remain - so `raw_len` was **0** on every input the
+  ordinary lane ever ran and every "fuzzed bytes" argument was the empty slice. Every knob
+  drawn after it was its own minimum too: in `fuzzAia` the accessLocation tag was always
+  index 0, the mutation count 0 and the truncation always the zero-length cut; in
+  `fuzzRefresh` the body mode was always 0, so the mutate, truncate and arbitrary-bytes
+  responder bodies had **never been produced**, the status came from a false
+  `smith.value(bool)` and was always 0, the fetch method was always GET, and `now` was
+  always the capture's own timestamp. Both now draw with one `smith.slice(&raw)` and carry
+  a corpus whose seeds each supply the `u64` words their own branches read. Measured by the
+  two new `corpus:` guards - AIA: 7 non-empty seeds, 1 resolved URL, **8 mutations applied**
+  and all five accessLocation tags exercised, truncations totalling 14875 octets; refresh:
+  **all four body modes and all three `now` modes**, 3 non-200 statuses and 2 POST fetches.
+  A note for the next author: the AIA guard was first written with a mutation loop that did
+  not mirror the harness's own `@min(draw, raw_len)`, so it consumed a different word
+  stream and reported a truncation total less than half the real one.
+
 - **2026-09-03** — Drift re-audit. **The responder no longer chooses where the
   fetch goes.** `httpFetch` left `http.Client`'s `follow_redirects` at its
   DEFAULT of `true` (up to 10 hops), and `isHttpUrl` screens the AIA URI once

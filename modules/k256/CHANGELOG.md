@@ -5,6 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** - Test-only, no production change: all three fuzz targets ran one input,
+  and two of them had branches that had never executed. `fuzzFromSec1` and
+  `fuzzBip340Verify` each opened `smith.bytes(...)` and then drew a length with
+  `smith.valueRangeAtMost`; a ranged `Smith` draw reads eight octets as a little-endian
+  `u64` and returns the range MINIMUM when fewer than eight remain, and `bytes` had already
+  eaten them - so `fromSec1` was handed a zero-length slice every round with the point
+  unread in `buf`, and `bip340Verify`'s message, which participates in the challenge hash
+  and which the harness's own comment says is "fuzzed independently", was the empty string
+  every round. Both now draw with `smith.slice`. `fuzzFeFromBytes` was the sharper one: its
+  four knobs are all drawn AFTER `smith.bytes`, so with the input exhausted every
+  `smith.value(bool)` returned false - the `p` / `p-1` / `p+1` boundary bias the harness's
+  comment is entirely about had **never run once**, and neither had the little-endian
+  loader. Corpora added for all three, built from the module's own
+  `toCompressedSec1`/`toUncompressedSec1`/`bip340Sign` (a secp256k1 point or a verifying
+  Schnorr signature is not reachable from arbitrary bytes), each seed carrying the `u64`
+  tail its knobs read. Measured by the three new `corpus:` guards - SEC1: 9 non-empty
+  seeds, 4 accepted, **3 distinct points**, four of the six tag branches exercised; BIP340:
+  1 signature accepted and **188 message octets entering the challenge hash** (0 before);
+  `Fe.fromBytes`: **3 boundary inputs and 2 little-endian loads** (0 and 0 before), 4
+  accepted. A note for the next author: the `Fe` seeds were first written with
+  `testkit.fuzz.seed`, which prepends the `u32` length `Smith.slice` reads - but that
+  harness opens with `smith.bytes`, which reads no header, so the prefix shifted the whole
+  payload and every knob still read false. The guard's `boundary` count is what caught it.
+
 - **2026-08-13** — Neither BREAKING nor BEHAVIOURAL: **no shipped code path changed**,
   and every number the module publishes about itself is the same as before. What
   changed is the evidence. (a) A test with teeth for the deterministic nonce:

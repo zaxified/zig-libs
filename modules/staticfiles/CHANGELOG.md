@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** - Test-only, no production change: `fuzzSanitizePath`'s own comment said
+  "Length drawn BEFORE the bytes it bounds: every mutated byte the fuzzer spends then lands
+  inside the slice", and that was not true when it was written. A ranged `Smith` draw
+  returns the range MINIMUM unless a whole eight-octet word already lies inside the range,
+  so `raw_len` was **0** on every input the ordinary lane ever ran: `smith.bytes` got a
+  zero-length slice and `sanitizePath` was called on `""` every round. The traversal-safety
+  contract this harness exists to check had never been evaluated on a path. It now draws
+  with one `smith.slice(&raw_buf)`, and carries a corpus: the clean paths and every
+  traversal/injection vector the value tests above pin (encoded `../`, encoded backslash,
+  NUL truncation, truncated percent), each with the `u64` word `allow_dotfiles` reads -
+  without which that knob is dead on a corpus replay and the `allow_dotfiles = true` half,
+  which is a different contract, would never run. Measured by the new `corpus:` guard: 19
+  non-empty seeds, 10 accepted, **14 path segments walked**, and 2 seeds under
+  `allow_dotfiles`. Segments rather than acceptance, because `sanitizePath("")` succeeds -
+  the empty path is the root - so an acceptance count reads as a pass over a corpus that
+  reached nothing.
+
 - **2026-08-18** — `Handler.sendFile` is now `pub` (was `fn`, internal-only). A caller
   who already holds a resolved/opened file — e.g. it called `resolveFile` itself to
   compose an app-specific 404 page before falling back to the static handler — can
