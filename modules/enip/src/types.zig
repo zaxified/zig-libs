@@ -649,25 +649,13 @@ test "a write of a structure carries its handle" {
     try testing.expectError(error.MissingStructureHandle, WriteTagRequest.decode(&[_]u8{ 0xA0, 0x02, 0x34, 0x12, 0x01 }));
 }
 
-/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`, from
-/// the hex of the frame. `Smith.slice` reads a little-endian u32 length before
-/// it copies anything, so a frame that is to arrive verbatim carries that
-/// header; a raw frame would lose its own first four octets to the length read.
-///
-/// ⚠ The array has to be static. A `const` local in this function is NOT
-/// promoted and the returned slice dangles — with the RIGHT length and garbage
-/// behind it, which is the hardest shape to notice (measured 2026-09-06).
-fn fuzzSeed(comptime h: []const u8) []const u8 {
-    return &struct {
-        const f = blk: {
-            @setEvalBranchQuota(40_000);
-            var out: [h.len / 2]u8 = undefined;
-            for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, h[i * 2 ..][0..2], 16) catch unreachable;
-            break :blk out;
-        };
-        const bytes = std.mem.toBytes(@as(u32, @intCast(f.len))) ++ f;
-    }.bytes;
-}
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. Was a local copy in every file that needed it — 33 across 12
+/// modules — each with its own note about the same trap (the array has to be
+/// container-level or the returned slice dangles with the RIGHT length and
+/// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
+/// real `std.testing.Smith` over what it produces.
+const fuzzSeed = @import("testkit").fuzz.seedHex;
 
 /// Tag payloads: a two-octet type code and its value, which is what `TagData`
 /// and `WriteTagRequest` both read, plus the bare values `decodeValue` takes.
