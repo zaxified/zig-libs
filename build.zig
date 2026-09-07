@@ -217,7 +217,7 @@ const module_list = [_]Module{
     .{ .name = "xml", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256" } },
     .{ .name = "saml", .libs = &.{"web"}, .deps = &.{ "xmldsig", "xml", "xmlenc", "rsa", "x509", "datefmt" }, .heavy = true, .test_deps = &.{"testkit"} },
-    .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw" }, .heavy = true },
+    .{ .name = "xmlenc", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "aescbc", "aeskw" }, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "aescbc", .libs = &.{ "web", "crypto" }, .test_deps = &.{"testkit"} },
     .{ .name = "aeskw", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
     .{ .name = "jwe", .libs = &.{"web"}, .deps = &.{ "rsa", "p256", "aescbc", "aeskw" }, .test_deps = &.{"testkit"} },

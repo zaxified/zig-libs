@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: `fuzzDecryptData` built ONE document, the same
+  way, for ever.** It had no corpus, so the ordinary test lane runs exactly one
+  round of `in = ""` and every `Smith` draw on an exhausted input returns its
+  minimum. `smith.bytes(&raw)` consumed nothing, `raw_len` was 0, and all
+  eleven knobs after it collapsed: `content_alg` and `key_alg` were both index
+  0 of six, `digest_alg`/`mgf_alg`/`oaep_params` were all null,
+  `cipher_reference` and `omit_key_info` were false, `allow_weak_rsa15` was
+  false, and the KEK was 16 zero octets. The unstructured direction underneath
+  — whose comment says it exists "so the XML framing itself is fuzzed and not
+  only the fields inside a fixed template" — was handed the **empty string**.
+  Measured 2026-09-07: **1 document, 1 of 6 content algorithms, 1 of 6 key
+  algorithms, 0 octets of unstructured XML.** The knobs now come out of one
+  `smith.slice`: a 16-octet script prefix read through `testkit.fuzz.Cursor`,
+  then the payload the base64 fields are cut from. Measured after: **6 of 6
+  content algorithms, 5 of 6 key algorithms, 12 distinct documents, and 1357
+  octets down the unstructured path.** ⭐ Acceptance is not pinned and cannot
+  be: none of these payloads is a real ciphertext, so the guard pins the
+  algorithm SPREAD and the document count instead — the three numbers that
+  were all 1.
+
 - **2026-09-03** — Drift re-audit (last audited `d163578`, ~737 lines since). Five fixes,
   seven mutations, seven red.
   - **The constant-time v1.5 unpadding was defeated by its own caller.**

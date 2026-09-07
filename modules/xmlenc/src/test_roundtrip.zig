@@ -966,27 +966,106 @@ fn fuzzDecryptDoc(alloc: std.mem.Allocator, doc_src: []const u8, sk: rsa.SecretK
 /// XML-text-safe alphabet: base64's own characters plus whitespace and a few
 /// non-base64 bytes, so the decoder's reject path is exercised too, without
 /// `<`/`&` turning every iteration into an `xml.parse` failure.
+const fuzzseed = @import("testkit").fuzz;
+
 const b64ish = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/= \n\t!*.";
 
 fn toB64ish(buf: []u8) void {
     for (buf) |*c| c.* = b64ish[c.* % b64ish.len];
 }
 
-fn fuzzDecryptData(_: void, smith: *std.testing.Smith) !void {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+/// A 16-octet script prefix, then the payload every text field is built from.
+const xmlenc_script_len = 16;
+const xmlenc_payload_len = 512;
 
-    const kp = try fuzzKeyPair();
-    const k = (kp.public_key.n.bits() + 7) / 8; // exact RSA block length
+/// ⛔ This harness had no corpus, so the ordinary test lane ran exactly one
+/// round of `in = ""` and every draw returned its minimum. `smith.bytes(&raw)`
+/// consumed nothing, `raw_len` was 0, and every knob after it collapsed:
+/// `content_alg` and `key_alg` were both index 0, `digest_alg`/`mgf_alg`/
+/// `oaep_params` were all null, `cipher_reference` and `omit_key_info` were
+/// false, `allow_weak_rsa15` was false and `kek_len` was 16 zero octets. **One
+/// document, built the same way for ever** — and the unstructured direction
+/// underneath it, the one whose comment says it exists "so the XML framing
+/// itself is fuzzed", was handed the EMPTY string. Measured 2026-09-07: 1
+/// document, 1 of the 6 content algorithms, 1 of the 6 key algorithms, and 0
+/// octets of unstructured XML.
+///
+/// The knobs now come out of one `smith.slice`: the first 16 octets are a
+/// script and the rest is the payload the base64 fields are cut from.
+const XmlEncScript = struct {
+    content_alg: usize,
+    key_alg: usize,
+    digest: ?usize,
+    mgf: ?usize,
+    oaep_params: bool,
+    key_text_kind: u32,
+    content_text_kind: u32,
+    cipher_reference: bool,
+    omit_key_info: bool,
+    allow_weak_rsa15: bool,
+    kek_kind: u32,
 
-    var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+    fn read(script_bytes: []const u8) XmlEncScript {
+        var c: fuzzseed.Cursor = .{ .bytes = script_bytes };
+        return .{
+            .content_alg = c.ranged(0, fuzz_content_algs.len - 1),
+            .key_alg = c.ranged(0, fuzz_key_algs.len - 1),
+            .digest = blk: {
+                const b = c.byte();
+                break :blk if (b & 1 == 0) null else @as(usize, b % fuzz_digest_algs.len);
+            },
+            .mgf = blk: {
+                const b = c.byte();
+                break :blk if (b & 1 == 0) null else @as(usize, b % fuzz_mgf_algs.len);
+            },
+            .oaep_params = c.byte() & 1 == 1,
+            .key_text_kind = c.ranged(0, 3),
+            .content_text_kind = c.ranged(0, 2),
+            .cipher_reference = c.byte() & 1 == 1,
+            .omit_key_info = c.byte() & 1 == 1,
+            .allow_weak_rsa15 = c.byte() & 1 == 1,
+            .kek_kind = c.ranged(0, 2),
+        };
+    }
+};
+
+const xmlenc_seeds = [_][]const u8{
+    fuzzseed.seed(""), // the empty seed: every knob at its minimum, which is exactly what this target ran
+    fuzzseed.seed("\x00\x00" ++ "\x00" ** 14), // the same, spelled out
+    fuzzseed.seed("\x00\x00\x01\x01\x01\x00\x00\x01\x01\x01\x00" ++ "\x00" ** 5 ++ "AAAABBBBCCCCDDDD"), // ⭐ digest, MGF and OAEP params all present
+    fuzzseed.seed("\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01" ++ "\x00" ** 5 ++ "\xaa" ** 200), // aes256-cbc + rsa-oaep, a 32-octet KEK
+    fuzzseed.seed("\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "\x5a" ** 300), // ⭐ aes256-gcm, the exact RSA block for the key text
+    fuzzseed.seed("\x02\x04\x00\x00\x00\x01\x01\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "\x11" ** 64), // ⭐ kw-aes256: the symmetric key-wrap arm, not the RSA one
+    fuzzseed.seed("\x04\x02\x00\x00\x00\x00\x00\x00\x00\x01\x02" ++ "\x00" ** 5 ++ "\x22" ** 128), // ⭐ aes192-cbc and rsa-1_5 with `allow_weak_rsa15` set
+    fuzzseed.seed("\x05\x05\x00\x00\x00\x03\x02\x00\x00\x00\x00" ++ "\x00" ** 5), // ⭐ both algorithms unrecognised, both cipher texts empty
+    fuzzseed.seed("\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00" ++ "\x00" ** 5 ++ "\x33" ** 32), // ⭐ `cipher_reference`: a CipherReference instead of a CipherValue
+    fuzzseed.seed("\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00" ++ "\x00" ** 5 ++ "\x44" ** 32), // ⭐ `omit_key_info`: no EncryptedKey at all
+    fuzzseed.seed("\x03\x00\x00\x00\x00\x02\x01\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "<EncryptedData>not really</EncryptedData>"), // the b64ish texts, and XML in the payload
+    fuzzseed.seed("\x01\x01\x00\x00\x00\x02\x01\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "<?xml version=\"1.0\"?><a><b/></a>"), // ⭐ the unstructured direction gets a real XML document
+    fuzzseed.seed("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 5 ++ "\xff" ** 512), // the payload filling the buffer
+};
+
+test "fuzz: decryptData never panics on a hostile EncryptedData" {
+    try std.testing.fuzz({}, fuzzDecryptData, .{ .corpus = &xmlenc_seeds });
+}
+
+/// Assemble the document and the options one seed describes. Shared with the
+/// corpus guard, so the guard measures the documents the harness builds.
+fn buildFuzzCase(
+    a: std.mem.Allocator,
+    seed: []const u8,
+    k: usize,
+    kek: *[32]u8,
+) !struct { []const u8, []const u8, xmlenc.Options } {
+    var raw: [xmlenc_payload_len]u8 = @splat(0);
+    const payload = if (seed.len > xmlenc_script_len) seed[xmlenc_script_len..] else seed[0..0];
+    const raw_len = @min(payload.len, raw.len);
+    @memcpy(raw[0..raw_len], payload[0..raw_len]);
+    const sc = XmlEncScript.read(if (seed.len < xmlenc_script_len) seed else seed[0..xmlenc_script_len]);
 
     // The wrapped-CEK text. Length `k` is the only one `rsaRawPrivate`
     // accepts, so give the fuzzer that shape explicitly as well as free rein.
-    const key_text: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+    const key_text: []const u8 = switch (sc.key_text_kind) {
         0 => try b64(a, raw[0..k]), // exact RSA block: reaches the private op
         1 => try b64(a, raw[0..@min(raw_len, 40)]), // AES-KW-ish blob
         2 => blk: {
@@ -997,7 +1076,7 @@ fn fuzzDecryptData(_: void, smith: *std.testing.Smith) !void {
         else => "",
     };
 
-    const content_text: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+    const content_text: []const u8 = switch (sc.content_text_kind) {
         0 => try b64(a, raw[0..raw_len]),
         1 => blk: {
             const t = try a.dupe(u8, raw[0..raw_len]);
@@ -1008,40 +1087,109 @@ fn fuzzDecryptData(_: void, smith: *std.testing.Smith) !void {
     };
 
     const shape: EncShape = .{
-        .content_alg = fuzz_content_algs[smith.index(fuzz_content_algs.len)],
-        .key_alg = fuzz_key_algs[smith.index(fuzz_key_algs.len)],
-        .digest_alg = if (smith.value(bool)) fuzz_digest_algs[smith.index(fuzz_digest_algs.len)] else null,
-        .mgf_alg = if (smith.value(bool)) fuzz_mgf_algs[smith.index(fuzz_mgf_algs.len)] else null,
-        .oaep_params = if (smith.value(bool)) content_text else null,
+        .content_alg = fuzz_content_algs[sc.content_alg],
+        .key_alg = fuzz_key_algs[sc.key_alg],
+        .digest_alg = if (sc.digest) |i| fuzz_digest_algs[i] else null,
+        .mgf_alg = if (sc.mgf) |i| fuzz_mgf_algs[i] else null,
+        .oaep_params = if (sc.oaep_params) content_text else null,
         .key_cipher_text = key_text,
         .content_cipher_text = content_text,
-        .cipher_reference = smith.value(bool),
-        .omit_key_info = smith.value(bool),
+        .cipher_reference = sc.cipher_reference,
+        .omit_key_info = sc.omit_key_info,
     };
 
-    var kek: [32]u8 = undefined;
-    smith.bytes(&kek);
-    const kek_len: usize = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+    @memcpy(kek[0..@min(raw_len, 32)], raw[0..@min(raw_len, 32)]);
+    const kek_len: usize = switch (sc.kek_kind) {
         0 => 16,
         1 => 32,
         else => 0,
     };
     const options: xmlenc.Options = .{
-        .allow_weak_rsa15 = smith.value(bool),
+        .allow_weak_rsa15 = sc.allow_weak_rsa15,
         .kek = if (kek_len == 0) null else kek[0..kek_len],
         .max_ciphertext_len = 4 << 20,
     };
 
     const doc_src = try buildFuzzDoc(a, shape);
-    try fuzzDecryptDoc(a, doc_src, kp.secret_key, options);
+    const unstructured = try a.dupe(u8, raw[0..raw_len]);
+    return .{ doc_src, unstructured, options };
+}
+
+fn fuzzDecryptData(_: void, smith: *std.testing.Smith) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const kp = try fuzzKeyPair();
+    const k = (kp.public_key.n.bits() + 7) / 8; // exact RSA block length
+
+    // ⚠ ONE byte-first draw. See `xmlenc_seeds` for what the eleven knobs
+    // after `smith.bytes(&raw)` were worth with no corpus at all.
+    var seed_buf: [xmlenc_script_len + xmlenc_payload_len]u8 = undefined;
+    const n: usize = smith.slice(&seed_buf);
+    var kek: [32]u8 = @splat(0);
+    const case = try buildFuzzCase(a, seed_buf[0..n], k, &kek);
+
+    try fuzzDecryptDoc(a, case[0], kp.secret_key, case[2]);
 
     // Also the unstructured direction, so the XML framing itself is fuzzed and
     // not only the fields inside a fixed template.
-    try fuzzDecryptDoc(a, raw[0..raw_len], kp.secret_key, options);
+    try fuzzDecryptDoc(a, case[1], kp.secret_key, case[2]);
 }
 
-test "fuzz: decryptData never panics on a hostile EncryptedData" {
-    try std.testing.fuzz({}, fuzzDecryptData, .{});
+test "corpus: every seed builds a distinct document, and the algorithm spread is pinned" {
+    // ⭐ Nothing in this corpus is expected to decrypt — the payloads are not
+    // real ciphertexts — so acceptance says nothing at all here. What is
+    // pinned is the SPREAD: how many of the six content algorithms and six key
+    // algorithms the corpus actually selects, and how many distinct documents
+    // it builds. All three were 1 before.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const kp = try fuzzKeyPair();
+    const k = (kp.public_key.n.bits() + 7) / 8;
+
+    var content_seen = [_]bool{false} ** fuzz_content_algs.len;
+    var key_seen = [_]bool{false} ** fuzz_key_algs.len;
+    var docs: std.ArrayList([]const u8) = .empty;
+    var unstructured_octets: usize = 0;
+    var with_kek: usize = 0;
+    for (xmlenc_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var seed_buf: [xmlenc_script_len + xmlenc_payload_len]u8 = undefined;
+        const n: usize = smith.slice(&seed_buf);
+        const seed = seed_buf[0..n];
+        const sc = XmlEncScript.read(if (n < xmlenc_script_len) seed else seed[0..xmlenc_script_len]);
+        content_seen[sc.content_alg] = true;
+        key_seen[sc.key_alg] = true;
+
+        var kek: [32]u8 = @splat(0);
+        const case = try buildFuzzCase(a, seed, k, &kek);
+        if (case[2].kek != null) with_kek += 1;
+        unstructured_octets += case[1].len;
+        var already = false;
+        for (docs.items) |d| {
+            if (std.mem.eql(u8, d, case[0])) already = true;
+        }
+        if (!already) try docs.append(a, case[0]);
+    }
+
+    var content_n: usize = 0;
+    for (content_seen) |v| {
+        if (v) content_n += 1;
+    }
+    var key_n: usize = 0;
+    for (key_seen) |v| {
+        if (v) key_n += 1;
+    }
+    // Measured 2026-09-07. Before: 1 content algorithm, 1 key algorithm, 1
+    // document, 0 octets of unstructured XML.
+    try std.testing.expectEqual(@as(usize, 6), content_n);
+    try std.testing.expectEqual(@as(usize, 5), key_n);
+    try std.testing.expectEqual(@as(usize, 12), docs.items.len);
+    try std.testing.expectEqual(@as(usize, 1357), unstructured_octets);
+    try std.testing.expectEqual(@as(usize, 12), with_kek);
 }
 
 test "the xmlenc fuzz harness reaches decryptData's crypto path (reachability)" {
