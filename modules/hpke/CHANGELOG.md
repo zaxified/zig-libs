@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — The four `decap`/`authDecap` fuzz harnesses now carry a
+  corpus, and a guard test pins what it reaches. They had none, so each ran
+  exactly ONE input: the empty one. `fuzzedSec1Bytes` opens with
+  `smith.bytes`, which memsets an exhausted input to zero, and the tag
+  selector behind it is a ranged draw, which returns its range MINIMUM when
+  fewer than eight octets remain — so `enc[0]` was rewritten to `0x00` on
+  every round and `fromSec1` refused on its first octet. Measured: 1 distinct
+  tag octet, 0 points decoded, 0 shared secrets — `mul`,
+  `affineCoordinates` and `extractAndExpand`, the code these targets exist to
+  run on peer-supplied bytes, had never executed under them. The corpus feeds
+  each draw the point octets plus the knob's own little-endian words; now 5
+  distinct tag octets, 3 accepted and 2 distinct shared secrets per target,
+  pinned as exact counts. Test-only; no API or wire change.
+
+  ⚠ Recorded while measuring: selectors 1 and 2 (tags `0x02`/`0x03`) can
+  never yield an accepted point in these harnesses, because `enc`/`pkS` are
+  `[Npk]u8` arrays and `fromSec1` therefore always sees 65 (or 97) octets and
+  refuses a compressed tag on length. They still walk the tag/length
+  disagreement path, so they are kept rather than removed.
+
 - **2026-08-14** — Provenance corrected: README and `NOTICE` both claimed no
   third-party implementation had been consulted as a design reference, while
   `src/schedule.zig:99`, `:1024` and `SPEC.md` all cite `jedisct1/zig-hpke`

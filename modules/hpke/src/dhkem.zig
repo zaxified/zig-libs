@@ -822,8 +822,167 @@ test "DHKEM P-384 AuthEncap/AuthDecap: self-consistency round trip + wrong-pkS d
 // decode step at all — every bitstring is a valid input — so there is no
 // analogous parser to fuzz there.)
 
+// ⚠ These four harnesses draw with `smith.bytes`, so a corpus entry is read
+// RAW — no `u32` length header, unlike a `smith.slice` harness. One
+// `fuzzedSec1Bytes` draw on the wire is therefore: `Npk` octets for the
+// point, then the eight-octet little-endian word the tag selector
+// (`valueRangeAtMost(u8, 0, 4)`) reads, and — for selector 4 only — eight
+// more for the `smith.value(u8)` fallback behind it. `Sec1Corpus` writes
+// exactly that.
+//
+// ⛔ Why the corpus exists at all: a ranged `Smith` draw returns the range
+// MINIMUM when fewer than eight octets remain, and these four targets had NO
+// corpus, so each ran exactly ONE input — an all-zero buffer with selector 0,
+// i.e. `enc[0] = 0x00`. `fromSec1` refuses that on its first octet, so
+// `decap`/`authDecap` returned `DeserializeError` every round and `mul`,
+// `affineCoordinates` and `extractAndExpand` — the code these targets exist
+// to run on peer-supplied bytes — had never executed under them. The
+// tag-biasing recipe the comment above describes had likewise only ever
+// selected 0: one distinct tag octet across the whole corpus, never 0x04.
+//
+// ⚠ Selectors 1 and 2 (tags 0x02/0x03) cannot ever produce an accepted
+// point here and that is not a corpus defect: `enc`/`pkS` are `[Npk]u8`
+// arrays, so `fromSec1` always sees 65 (or 97) octets and refuses a
+// compressed tag on length. They are kept because the tag/length
+// disagreement is itself a path worth walking.
+fn Sec1Corpus(comptime N: usize, comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+
+        /// Two draws of `N` octets plus two eight-octet knob words each — the
+        /// widest entry `authDecap`'s two `fuzzedSec1Bytes` calls can need.
+        store: [cap][2 * (N + 16)]u8 = undefined,
+        entries: [cap][]const u8 = undefined,
+        used: usize = 0,
+        n: usize = 0,
+
+        /// Append the octets of ONE `fuzzedSec1Bytes` call to the entry
+        /// currently being built.
+        fn draw(self: *Self, point: *const [N]u8, choice: u64, raw_tag: u64) void {
+            const s = &self.store[self.n];
+            @memcpy(s[self.used..][0..N], point);
+            self.used += N;
+            std.mem.writeInt(u64, s[self.used..][0..8], choice, .little);
+            self.used += 8;
+            if (choice == 4) {
+                std.mem.writeInt(u64, s[self.used..][0..8], raw_tag, .little);
+                self.used += 8;
+            }
+        }
+
+        /// Close the entry being built. Called with nothing drawn it yields
+        /// the EMPTY seed — the single input these targets used to run.
+        fn commit(self: *Self) void {
+            self.entries[self.n] = self.store[self.n][0..self.used];
+            self.used = 0;
+            self.n += 1;
+        }
+
+        fn single(self: *Self, point: *const [N]u8, choice: u64, raw_tag: u64) void {
+            self.draw(point, choice, raw_tag);
+            self.commit();
+        }
+    };
+}
+
+const P256Corpus = Sec1Corpus(P256Kem.Npk, 16);
+const P384Corpus = Sec1Corpus(P384Kem.Npk, 16);
+
+/// Built from the module's own curve code rather than transcribed hex, so the
+/// accepted seeds really are points `toUncompressedSec1` produces.
+fn p256DecapSeeds(c: *P256Corpus) []const []const u8 {
+    const g = P256.basePoint.toUncompressedSec1();
+    const g2 = P256.basePoint.dbl().toUncompressedSec1();
+    var off_curve = g;
+    off_curve[64] ^= 0x01; // Y perturbed: a well-formed encoding of no point
+    c.single(&g, 3, 0); // selector 3 -> tag 0x04 over a real point
+    c.single(&g2, 3, 0); // 2*G, a DIFFERENT accepted point
+    c.single(&g, 0, 0); // tag 0x00
+    c.single(&g, 1, 0); // tag 0x02 over a 65-octet body: tag/length disagreement
+    c.single(&g, 2, 0); // tag 0x03, likewise
+    c.single(&g, 4, 0x04); // the arbitrary-tag branch, landing back on 0x04
+    c.single(&g, 4, 0x99); // ...and on a tag no SEC1 encoding uses
+    c.single(&off_curve, 3, 0); // 0x04 over coordinates that are not on the curve
+    c.commit(); // the empty input this target used to run for ever
+    return c.entries[0..c.n];
+}
+
+fn p256AuthDecapSeeds(c: *P256Corpus) []const []const u8 {
+    const g = P256.basePoint.toUncompressedSec1();
+    const g2 = P256.basePoint.dbl().toUncompressedSec1();
+    c.draw(&g, 3, 0);
+    c.draw(&g2, 3, 0);
+    c.commit(); // both halves decode: the only path that reaches the second `mul`
+    c.draw(&g, 3, 0);
+    c.draw(&g2, 0, 0);
+    c.commit(); // `enc` decodes, `pkS` does not: the SECOND `fromSec1`'s refusal
+    c.draw(&g, 0, 0);
+    c.draw(&g2, 3, 0);
+    c.commit(); // `enc` refused first, so `pkS` is never decoded at all
+    c.draw(&g2, 3, 0);
+    c.draw(&g, 3, 0);
+    c.commit(); // the same two points swapped: a DIFFERENT shared secret
+    c.draw(&g, 4, 0x04);
+    c.draw(&g2, 4, 0x04);
+    c.commit(); // the arbitrary-tag branch on both halves
+    c.draw(&g, 1, 0);
+    c.draw(&g2, 2, 0);
+    c.commit(); // tags 0x02/0x03: the tag/length disagreement in both halves
+    c.draw(&g, 4, 0x99);
+    c.draw(&g2, 4, 0x99);
+    c.commit(); // ...and a tag no SEC1 encoding uses
+    c.commit(); // the empty input this target used to run for ever
+    return c.entries[0..c.n];
+}
+
+fn p384DecapSeeds(c: *P384Corpus) []const []const u8 {
+    const g = P384.basePoint.toUncompressedSec1();
+    const g2 = P384.basePoint.dbl().toUncompressedSec1();
+    var off_curve = g;
+    off_curve[96] ^= 0x01;
+    c.single(&g, 3, 0);
+    c.single(&g2, 3, 0);
+    c.single(&g, 0, 0);
+    c.single(&g, 1, 0);
+    c.single(&g, 2, 0);
+    c.single(&g, 4, 0x04);
+    c.single(&g, 4, 0x99);
+    c.single(&off_curve, 3, 0);
+    c.commit();
+    return c.entries[0..c.n];
+}
+
+fn p384AuthDecapSeeds(c: *P384Corpus) []const []const u8 {
+    const g = P384.basePoint.toUncompressedSec1();
+    const g2 = P384.basePoint.dbl().toUncompressedSec1();
+    c.draw(&g, 3, 0);
+    c.draw(&g2, 3, 0);
+    c.commit();
+    c.draw(&g, 3, 0);
+    c.draw(&g2, 0, 0);
+    c.commit();
+    c.draw(&g, 0, 0);
+    c.draw(&g2, 3, 0);
+    c.commit();
+    c.draw(&g2, 3, 0);
+    c.draw(&g, 3, 0);
+    c.commit();
+    c.draw(&g, 4, 0x04);
+    c.draw(&g2, 4, 0x04);
+    c.commit();
+    c.draw(&g, 1, 0);
+    c.draw(&g2, 2, 0);
+    c.commit();
+    c.draw(&g, 4, 0x99);
+    c.draw(&g2, 4, 0x99);
+    c.commit();
+    c.commit();
+    return c.entries[0..c.n];
+}
+
 test "fuzz: P256Kem.decap never panics on arbitrary enc bytes" {
-    try testing.fuzz({}, fuzzP256Decap, .{});
+    var corpus: P256Corpus = .{};
+    try testing.fuzz({}, fuzzP256Decap, .{ .corpus = p256DecapSeeds(&corpus) });
 }
 
 // Generic over the SEC1-encoded width (comptime N) so P384Kem's fuzz
@@ -848,7 +1007,8 @@ fn fuzzP256Decap(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: P256Kem.authDecap never panics on arbitrary enc/pkS bytes" {
-    try testing.fuzz({}, fuzzP256AuthDecap, .{});
+    var corpus: P256Corpus = .{};
+    try testing.fuzz({}, fuzzP256AuthDecap, .{ .corpus = p256AuthDecapSeeds(&corpus) });
 }
 
 fn fuzzP256AuthDecap(_: void, smith: *std.testing.Smith) !void {
@@ -866,7 +1026,8 @@ fn fuzzP256AuthDecap(_: void, smith: *std.testing.Smith) !void {
 // `fromSec1` is the analogous rejecting-decode step X25519Kem lacks.
 
 test "fuzz: P384Kem.decap never panics on arbitrary enc bytes" {
-    try testing.fuzz({}, fuzzP384Decap, .{});
+    var corpus: P384Corpus = .{};
+    try testing.fuzz({}, fuzzP384Decap, .{ .corpus = p384DecapSeeds(&corpus) });
 }
 
 fn fuzzP384Decap(_: void, smith: *std.testing.Smith) !void {
@@ -877,7 +1038,8 @@ fn fuzzP384Decap(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: P384Kem.authDecap never panics on arbitrary enc/pkS bytes" {
-    try testing.fuzz({}, fuzzP384AuthDecap, .{});
+    var corpus: P384Corpus = .{};
+    try testing.fuzz({}, fuzzP384AuthDecap, .{ .corpus = p384AuthDecapSeeds(&corpus) });
 }
 
 fn fuzzP384AuthDecap(_: void, smith: *std.testing.Smith) !void {
@@ -887,6 +1049,121 @@ fn fuzzP384AuthDecap(_: void, smith: *std.testing.Smith) !void {
     var pkS: P384Kem.PublicKey = undefined;
     fuzzedSec1Bytes(P384Kem.Npk, smith, &pkS);
     _ = P384Kem.authDecap(enc, skR, pkS) catch {};
+}
+
+/// Counts one corpus's worth of `fuzzedSec1Bytes` draws through the real
+/// `Smith`, so the guard below measures the harness's own function rather
+/// than a paraphrase of it.
+fn Sec1Tally(comptime Kem: type, comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        /// Distinct tag octets the selector produced. ⛔ NOT `accepted > 0`:
+        /// this is the number the collapsed input could not have moved past
+        /// 1, whatever the seeds were.
+        tags: [256]bool = @splat(false),
+        accepted: usize = 0,
+        /// Distinct shared secrets. Acceptance alone would be satisfied by
+        /// one point repeated; a second secret means a second point really
+        /// went through `mul` and `extractAndExpand`.
+        seen: [cap][Kem.Nsecret]u8 = undefined,
+        distinct: usize = 0,
+
+        fn distinctTags(self: *const Self) usize {
+            var n: usize = 0;
+            for (self.tags) |t| {
+                if (t) n += 1;
+            }
+            return n;
+        }
+
+        fn record(self: *Self, ss: [Kem.Nsecret]u8) void {
+            self.accepted += 1;
+            for (self.seen[0..self.distinct]) |prev| {
+                if (std.mem.eql(u8, &prev, &ss)) return;
+            }
+            self.seen[self.distinct] = ss;
+            self.distinct += 1;
+        }
+    };
+}
+
+test "corpus: the P-256 enc/pkS seeds reach decap, and the counts are pinned" {
+    var decap_corpus: P256Corpus = .{};
+    var d: Sec1Tally(P256Kem, 16) = .{};
+    const skR = P256Kem.deriveKeyPair("hpke fuzz decap receiver");
+
+    // The "before" state, executable rather than asserted in prose: with no
+    // corpus these targets ran exactly one input, the empty one, and this is
+    // what it produced — tag 0x00 and a refusal off `fromSec1`'s first octet.
+    // 1 distinct tag, 0 accepted, 0 distinct shared secrets, for ever.
+    {
+        var smith: std.testing.Smith = .{ .in = "" };
+        var enc: P256Kem.EncappedKey = undefined;
+        fuzzedSec1Bytes(P256Kem.Npk, &smith, &enc);
+        try testing.expectEqual(@as(u8, 0), enc[0]);
+        try testing.expectError(error.DeserializeError, P256Kem.decap(enc, skR));
+    }
+
+    for (p256DecapSeeds(&decap_corpus)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var enc: P256Kem.EncappedKey = undefined;
+        fuzzedSec1Bytes(P256Kem.Npk, &smith, &enc);
+        d.tags[enc[0]] = true;
+        d.record(P256Kem.decap(enc, skR) catch continue);
+    }
+    try testing.expectEqual(@as(usize, 5), d.distinctTags()); // 0x00 0x02 0x03 0x04 0x99
+    try testing.expectEqual(@as(usize, 3), d.accepted);
+    try testing.expectEqual(@as(usize, 2), d.distinct); // G and 2*G
+
+    var auth_corpus: P256Corpus = .{};
+    var a: Sec1Tally(P256Kem, 16) = .{};
+    const authR = P256Kem.deriveKeyPair("hpke fuzz auth-decap receiver");
+    for (p256AuthDecapSeeds(&auth_corpus)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var enc: P256Kem.EncappedKey = undefined;
+        fuzzedSec1Bytes(P256Kem.Npk, &smith, &enc);
+        var pkS: P256Kem.PublicKey = undefined;
+        fuzzedSec1Bytes(P256Kem.Npk, &smith, &pkS);
+        a.tags[enc[0]] = true;
+        a.tags[pkS[0]] = true;
+        a.record(P256Kem.authDecap(enc, authR, pkS) catch continue);
+    }
+    try testing.expectEqual(@as(usize, 5), a.distinctTags());
+    try testing.expectEqual(@as(usize, 3), a.accepted);
+    try testing.expectEqual(@as(usize, 2), a.distinct); // (G, 2G) and the swap
+}
+
+test "corpus: the P-384 enc/pkS seeds reach decap, and the counts are pinned" {
+    var decap_corpus: P384Corpus = .{};
+    var d: Sec1Tally(P384Kem, 16) = .{};
+    const skR = P384Kem.deriveKeyPair("hpke fuzz p384 decap receiver");
+    for (p384DecapSeeds(&decap_corpus)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var enc: P384Kem.EncappedKey = undefined;
+        fuzzedSec1Bytes(P384Kem.Npk, &smith, &enc);
+        d.tags[enc[0]] = true;
+        d.record(P384Kem.decap(enc, skR) catch continue);
+    }
+    try testing.expectEqual(@as(usize, 5), d.distinctTags()); // 0x00 0x02 0x03 0x04 0x99
+    try testing.expectEqual(@as(usize, 3), d.accepted);
+    try testing.expectEqual(@as(usize, 2), d.distinct); // G and 2*G
+
+    var auth_corpus: P384Corpus = .{};
+    var a: Sec1Tally(P384Kem, 16) = .{};
+    const authR = P384Kem.deriveKeyPair("hpke fuzz p384 auth-decap receiver");
+    for (p384AuthDecapSeeds(&auth_corpus)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var enc: P384Kem.EncappedKey = undefined;
+        fuzzedSec1Bytes(P384Kem.Npk, &smith, &enc);
+        var pkS: P384Kem.PublicKey = undefined;
+        fuzzedSec1Bytes(P384Kem.Npk, &smith, &pkS);
+        a.tags[enc[0]] = true;
+        a.tags[pkS[0]] = true;
+        a.record(P384Kem.authDecap(enc, authR, pkS) catch continue);
+    }
+    try testing.expectEqual(@as(usize, 5), a.distinctTags());
+    try testing.expectEqual(@as(usize, 3), a.accepted);
+    try testing.expectEqual(@as(usize, 2), a.distinct); // (G, 2G) and the swap
 }
 
 // `P384Kem` has no RFC 9180 Appendix A vector (see SPEC.md item 16), so every
