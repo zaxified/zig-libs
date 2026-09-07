@@ -25,3 +25,7 @@ zig-pkg/
 example-apps/*/.zig-cache/
 example-apps/*/zig-out/
 example-apps/*/zig-pkg/
+
+# Python bytecode from scripts/*.py
+__pycache__/
+*.pyc
