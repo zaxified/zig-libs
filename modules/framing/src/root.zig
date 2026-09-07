@@ -285,18 +285,87 @@ test "readFrame enforces max_frame even when the buffer is larger" {
 // pipe — the 4-byte length prefix is exactly attacker-controlled before any
 // bound has been checked.
 
+// ⛔ This harness used to fetch the stream and then throw it away:
+// `smith.bytes(&buf)` copies `min(buf.len, in.len)` octets, and the
+// `valueRangeAtMost(u16, 0, buf.len)` right after it reads EIGHT more as a
+// little-endian u64 and returns the range MINIMUM when fewer remain — so `len`
+// was 0 for every input a corpus can carry, and `readFrame` was handed an
+// EMPTY reader on every iteration, failing at `takeArray(4)` before it had
+// looked at a length prefix at all. It carried no corpus either, so that empty
+// stream was the only input it ever ran: the 4-byte header this module exists
+// to bound-check had never been decoded once inside the harness.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+
+/// Whole streams, in the format the length draw reads. The interesting
+/// variable is the announced `u32` against `buf.len` and `max_frame`, so the
+/// corpus is a ladder over the header with the payload deliberately short,
+/// truthful and lying.
+const frame_seeds = [_][]const u8{
+    seed("\x04\x00\x00\x00abcd"), // a truthful 4-octet frame
+    seed("\x00\x00\x00\x00"), // the zero-length frame: legal, empty payload
+    seed("\x80\x00\x00\x00" ++ "x" ** 128), // exactly `out.len`: the boundary that must pass
+    seed("\x81\x00\x00\x00" ++ "x" ** 129), // ⭐ one past `out.len`: FrameTooLarge
+    seed("\xff\xff\xff\xff" ++ "abcd"), // 4 GiB announced, 4 octets present: refused before allocating
+    seed("\x00\x00\x10\x00"), // exactly `default_max_frame`, no payload: too large for `out`, allocatable
+    seed("\x01\x00\x10\x00"), // one past `default_max_frame`: refused by the cap itself
+    seed("\x08\x00\x00\x00" ++ "abc"), // a truthful header with the payload cut short: ReadFailed
+    seed("\x04\x00\x00\x00abcd" ++ "\x03\x00\x00\x00xyz"), // two frames back to back; only the first is read
+    seed("\x02\x00\x00\x00\x0a\x00"), // a payload that is NUL and newline: not a delimiter here
+    seed("\xff\x00"), // a header cut in half
+    seed(""), // the empty stream: what the collapsed harness ran, every time
+};
+
 test "fuzz: readFrame never panics on an arbitrary stream" {
-    try std.testing.fuzz({}, fuzzReadFrame, .{});
+    try std.testing.fuzz({}, fuzzReadFrame, .{ .corpus = &frame_seeds });
 }
 
 fn fuzzReadFrame(_: void, smith: *std.testing.Smith) !void {
-    var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [512]u8 = undefined;
+    const len: usize = smith.slice(&buf);
 
     var r: std.Io.Reader = .fixed(buf[0..len]);
     var out: [128]u8 = undefined;
-    _ = readFrame(&r, &out, .{}) catch return;
+    _ = readFrame(&r, &out, .{}) catch {};
+
+    // The allocating twin bounds the SAME attacker-chosen `u32` without a
+    // caller buffer to clamp it, so it takes a different branch on exactly the
+    // frames that matter (an announced 4 GiB is refused, not attempted).
+    var r2: std.Io.Reader = .fixed(buf[0..len]);
+    const owned = readFrameAlloc(&r2, std.testing.allocator, .{}) catch return;
+    std.testing.allocator.free(owned);
+}
+
+test "corpus: every stream seed reaches the header decode, and the payload octets are pinned" {
+    // ⭐ Not `accepted > 0`: the zero-length frame is a LEGAL frame here, so a
+    // guard counting successes would read healthy on a corpus that never moved
+    // a payload octet. The number the empty stream cannot produce is the
+    // payload actually delivered, and the count refused for being too large.
+    var nonempty: usize = 0;
+    var frames: usize = 0;
+    var payload_octets: usize = 0;
+    var too_large: usize = 0;
+    for (frame_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var r: std.Io.Reader = .fixed(buf[0..len]);
+        var out: [128]u8 = undefined;
+        if (readFrame(&r, &out, .{})) |p| {
+            frames += 1;
+            payload_octets += p.len;
+        } else |e| {
+            if (e == error.FrameTooLarge) too_large += 1;
+        }
+    }
+    // One seed is deliberately the empty stream.
+    try std.testing.expectEqual(frame_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: 0 frames, 0 payload octets and 0 refusals before the
+    // draw was fixed — every iteration ran out of input inside `takeArray(4)`.
+    try std.testing.expectEqual(@as(usize, 5), frames);
+    try std.testing.expectEqual(@as(usize, 138), payload_octets);
+    try std.testing.expectEqual(@as(usize, 4), too_large);
 }
 
 // ── tests: EnvelopeCodec(T), on a domain-free test-only union ───────────────

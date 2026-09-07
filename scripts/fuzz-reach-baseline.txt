@@ -32,12 +32,10 @@ decimal 2
 df-elect 2
 diskusage 1
 dkg 2
-drand 1
 encoding 1
 ethfrag 1
 falcon 1
 fleetsim 1
-framing 1
 frost 1
 fuzzysearch 2
 geoindex 2
@@ -99,7 +97,6 @@ uci 2
 validate 2
 voprf 1
 webhooksig 1
-whois 1
 xml 1
 xmldsig 1
 xmlenc 1
