@@ -9,6 +9,8 @@ const cbor = @import("root.zig");
 const Value = cbor.Value;
 const MapEntry = cbor.MapEntry;
 const kat = @import("kat_vectors.zig");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 
 fn hexDecode(a: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try a.alloc(u8, hex.len / 2);
@@ -405,14 +407,113 @@ test "boundary: indefinite text-string chunk, len == remaining / remaining + 1" 
 /// had to live where `freeValue` is in scope.
 fn fuzzDecodeNeverPanics(_: void, smith: *std.testing.Smith) !void {
     var buf: [4096]u8 = undefined;
-    smith.bytes(&buf);
-    const len = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input this target ever ran outside
+    // `--fuzz` (a ranged draw reads eight octets as a little-endian u64 and
+    // returns the range MINIMUM when fewer than eight remain, and `bytes` had
+    // already eaten them). With no corpus either, the one input for ever was
+    // the zero-length slice.
+    const len: usize = smith.slice(&buf);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     _ = cbor.decode(arena.allocator(), buf[0..len], .{}) catch return;
 }
+
+/// The corpus is RFC 8949 Appendix A itself — every vector this module already
+/// checks byte-exactly — plus the malformed frames the tests above name.
+///
+/// ⛔ It is built at run time from `kat.vectors`, and the guard below builds it
+/// from the same call, because a guard measuring a different corpus is not a
+/// guard.
+const DecodeCorpus = struct {
+    /// Every Appendix A vector, plus the refusals, plus the empty input.
+    const cap = kat.vectors.len + 16;
+    store: [cap * (4 + 64)]u8 = undefined,
+    used: usize = 0,
+    entries: [cap][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *DecodeCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn pushHex(self: *DecodeCorpus, h: []const u8) void {
+        var raw: [64]u8 = undefined;
+        const frame = std.fmt.hexToBytes(raw[0 .. h.len / 2], h) catch unreachable;
+        self.push(frame);
+    }
+
+    fn build(self: *DecodeCorpus) []const []const u8 {
+        // The 81 Appendix A vectors: every major type, every argument width,
+        // both indefinite-length forms, tags, floats and the simple values.
+        for (kat.vectors) |v| self.pushHex(v.hex);
+        // The refusals the value tests above are about, so the corpus is not
+        // "accepted frames only".
+        self.pushHex("9BFFFFFFFFFFFFFFFF"); // array claiming 2^64-1 elements
+        self.pushHex("5BFFFFFFFFFFFFFFFF"); // byte string claiming 2^64-1 octets
+        self.pushHex("01FF"); // trailing `break` after a complete item
+        self.pushHex("1C"); // reserved additional-information value
+        self.pushHex("FF"); // a bare `break`
+        self.pushHex("5F6161FF"); // text chunk inside an indefinite BYTE string
+        self.pushHex("5900030102"); // declared 3 octets, 2 present
+        self.pushHex("5F41"); // indefinite byte string cut inside a chunk head
+        self.pushHex("7F61"); // ditto, text
+        self.pushHex("5F5FFFFF"); // an indefinite string nested in an indefinite string
+        self.pushHex("41AA02"); // a complete item with trailing garbage after it
+        self.pushHex("824161AA81"); // array whose second element is a truncated array
+        self.push("");
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: decode never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzDecodeNeverPanics, .{});
+    var corpus: DecodeCorpus = .{};
+    try std.testing.fuzz({}, fuzzDecodeNeverPanics, .{ .corpus = corpus.build() });
+}
+
+test "corpus: every decode seed reaches the decoder, and the counts are pinned" {
+    var corpus: DecodeCorpus = .{};
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ `accepted` alone is not reach here: `decode` of the one-octet vector
+    // `00` succeeds, and so would a corpus that had collapsed to it. `nodes`
+    // is the number the collapse cannot hold up — every item in every decoded
+    // tree, which only moves when a seed's own octets are walked.
+    var nodes: usize = 0;
+    for (corpus.build()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [4096]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const v = cbor.decode(arena.allocator(), buf[0..len], .{}) catch continue;
+        accepted += 1;
+        nodes += countNodes(v);
+    }
+    try testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
+    try testing.expectEqual(@as(usize, 81), accepted);
+    try testing.expectEqual(@as(usize, 215), nodes);
+}
+
+fn countNodes(v: Value) usize {
+    return switch (v) {
+        .array => |items| blk: {
+            var n: usize = 1;
+            for (items) |it| n += countNodes(it);
+            break :blk n;
+        },
+        .map => |entries| blk: {
+            var n: usize = 1;
+            for (entries) |e| n += countNodes(e.key) + countNodes(e.value);
+            break :blk n;
+        },
+        .tag => |t| 1 + countNodes(t.value.*),
+        else => 1,
+    };
 }
 
 // ── the free path is part of the public API ────────────────────────────────

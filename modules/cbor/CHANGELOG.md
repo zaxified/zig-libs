@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Test-only, no production change: both fuzz targets ran one input.
+  `kat_test.fuzzDecodeNeverPanics` opened `smith.bytes(&buf)` and then drew its length
+  with `smith.valueRangeAtMost(u16, 0, 4096)`; a ranged `Smith` draw reads eight octets as
+  a little-endian `u64` and returns the range MINIMUM when fewer than eight remain, and
+  `bytes` had already eaten them — so `len` was **0** on every round the ordinary lane ever
+  ran, and with no corpus the one input for ever was the zero-length slice. Now one
+  `smith.slice(&buf)`, seeded with all 81 RFC 8949 Appendix A vectors (built from
+  `kat_vectors.vectors`, the same call the guard uses) plus the twelve malformed frames
+  the hostile-input tests name. `root.fuzzDecodeNoLeak` was the other shape: its first
+  draw was `valueRangeAtMost(u8, 0, 4)` inside `buildNested`, and its five seeds were
+  opaque runs of `u64` words masked `& 0x7F` — any word out of range silently discarded
+  the rest of the seed. It now reads its choices from one `smith.slice` through
+  `testkit.fuzz.Cursor`, so the byte draw comes first and a seed is a short readable
+  script (`[0]` mode, `[1]` depth cap, then either the CBOR itself or a nesting run
+  length and its tail). Measured by the two new `corpus:` guards: decode 93 non-empty
+  seeds / 81 accepted / **215 tree nodes walked**; generator 7 non-empty / 3 accepted /
+  614 octets handed to `decode` / all five modes exercised. ⛔ The node and octet counts
+  are pinned rather than `accepted > 0` on purpose — `decode` of the one-octet vector
+  `00` succeeds, so an `accepted > 0` guard would read ~100% over a corpus that had
+  collapsed onto it.
+
 - **2026-09-02** — `cose.checkLabels` is now `pub`. RFC 9052 §3's label-uniqueness MUST (and the
   `max_map_entries` cap) applied only to the key types `parseKey` handles, so a caller that parses
   a COSE map itself silently lost both: `webauthn`'s RFC 8230 RSA arm returns before `parseKey`

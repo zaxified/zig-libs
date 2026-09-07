@@ -13,7 +13,6 @@ bitcoinscript 2
 blindrsa 1
 brotli 1
 bulletproofs 2
-cbor 2
 chachapoly 2
 coconut 1
 cookies 1
