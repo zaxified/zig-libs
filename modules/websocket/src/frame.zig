@@ -685,14 +685,57 @@ test "decodeCloseBody: accepts every RFC 6455 §7.4.1 legal close code" {
 // repeatedly parse-and-advance over a fuzzed buffer, so multi-frame streams
 // (and `.need_more` retries) are exercised, not just a single header.
 
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the frames
+/// they are. A corpus entry is not the frame: `Smith.slice` reads a
+/// little-endian u32 length first (see `testkit/src/fuzz.zig`).
+const seed = @import("testkit").fuzz.seedHex;
+
+/// Frames for the **server** role, in the format `Smith.slice` reads.
+///
+/// ⚠ Server role means every frame the parser accepts must be MASKED; the
+/// unmasked RFC §5.7 vectors above are refusals here, not positives. Uniform
+/// random octets clear the RSV bits, a defined opcode, the mask bit and a
+/// minimal length encoding together with probability well under 2^-8 per
+/// frame, and never twice in a row — so without these the multi-frame loop
+/// this harness exists for could not run even if it were fed anything.
+const frame_seeds = [_][]const u8{
+    seed("818537FA213D7F9F4D5158"), // RFC §5.7 masked text "Hello"
+    seed("818537FA213D7F9F4D5158" ++ "818537FA213D7F9F4D5158"), // two frames: the loop's second pass
+    seed("89FD01020304" ++ ("797A7B7C" ** 31) ++ "79"), // masked ping, the 125-octet control ceiling
+    seed("888500000000" ++ "03E8627965"), // masked close, code 1000 + "bye"
+    seed("82FE00C800000000" ++ ("AA" ** 200)), // masked binary, 200 octets via the 16-bit form
+    seed("818537FA213D7F9F4D5158" ++ "8185"), // one whole frame, then a truncated header
+    seed("81"), // need_more: one octet
+    seed("81850102"), // need_more: two of the four mask octets
+    seed("81054865"), // UnmaskedClientFrame — the §5.7 vector is illegal server-side
+    seed("C1850102030400000000"), // ReservedRsvBits, masked so it is not the mask check
+    seed("838500000000"), // ReservedOpcode: 0x3
+    seed("098000000000"), // FragmentedControlFrame: ping with FIN unset
+    seed("88FE007E00000000"), // ControlFrameTooLarge: close declaring 126
+    seed("82FE000500000000" ++ "0102030405"), // InvalidPayloadLength: non-minimal 16-bit form
+    seed("82FF000000000000000500000000"), // InvalidPayloadLength: non-minimal 64-bit form
+    seed("82FF800000000000000000000000"), // InvalidPayloadLength: the §5.2 MSB set
+    seed("82FF000000000002000000000000"), // FrameTooLarge: 131072 against the harness's 65536
+    seed("00" ** 256), // a full buffer of zeroes: continuation, unmasked
+};
+
 test "fuzz: parseFrame never panics on arbitrary bytes, server role" {
-    try testing.fuzz({}, fuzzParseFrameServer, .{});
+    try testing.fuzz({}, fuzzParseFrameServer, .{ .corpus = &frame_seeds });
 }
 
 fn fuzzParseFrameServer(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM.
+    // And `len` here is not merely the end of the slice — it is the bound of
+    // the loop, so `while (off < len)` never ran a single pass and
+    // `parseFrame` was **never called at all**, while the comment above
+    // promises multi-frame streams and `.need_more` retries. `check-fuzz-reach`
+    // only learned to see that shape on 2026-09-07. Measured over the corpus
+    // above: **0 of 18 seeds reached `parseFrame` and 0 frames were parsed
+    // before, 18 of 18 and 7 frames after.**
+    const len: usize = smith.slice(&buf);
 
     var off: usize = 0;
     var iterations: usize = 0;
@@ -705,13 +748,107 @@ fn fuzzParseFrameServer(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+test "corpus: every frame seed reaches parseFrame, and the frames parsed are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the 256-octet buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. `parsed` is the
+    // second number: this harness's whole point is the parse-and-advance loop,
+    // and reaching `parseFrame` once with a refusal would satisfy `nonempty`
+    // while the loop still never took a second pass.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    for (frame_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var off: usize = 0;
+        var iterations: usize = 0;
+        while (off < len and iterations < 64) : (iterations += 1) {
+            const result = parseFrame(buf[off..len], .server, 1 << 16) catch break;
+            switch (result) {
+                .need_more => break,
+                .frame => |f| {
+                    parsed += 1;
+                    off += f.consumed;
+                },
+            }
+        }
+    }
+    try testing.expectEqual(frame_seeds.len, nonempty);
+    // 1 + 2 + 1 + 1 + 1 + 1: the five single accepted frames plus the second
+    // pass of the back-to-back pair. The truncated-tail seed contributes its
+    // first frame and then a `need_more`, which is the retry path.
+    try testing.expectEqual(@as(usize, 7), parsed);
+}
+
+/// Close-frame payloads, in the format `Smith.slice` reads. §7.4.1's illegal
+/// codes and the IANA-registered legal ones the module was once wrong about.
+const close_seeds = [_][]const u8{
+    seed("03E8627965"), // 1000 + "bye", the round-trip vector
+    seed("03E8"), // 1000, no reason
+    seed("03E9"), // 1001
+    seed("03F3"), // 1011, the last code §7.4.1 itself names
+    seed("03F4"), // 1012 — registered after §7.4.1 was written
+    seed("03F6"), // 1014 — the one two of three foreign peers accept
+    seed("0BB8"), // 3000, the library range
+    seed("1387"), // 4999, the private-use ceiling
+    seed("03E8" ++ ("61" ** 123)), // 125 octets: the control-frame payload ceiling
+    seed("03E8" ++ "C3A9E282AC"), // a multi-byte UTF-8 reason
+    seed(""), // the empty body: LEGAL, and the reason `accepted` is not a guard
+    seed("03"), // InvalidPayloadLength: one octet
+    seed("03E8FFFE"), // InvalidUtf8
+    seed("0000"), // InvalidCloseCode: 0
+    seed("03EC"), // InvalidCloseCode: 1004
+    seed("03EE"), // InvalidCloseCode: 1006
+    seed("03F7"), // InvalidCloseCode: 1015
+    seed("07D0"), // InvalidCloseCode: 2000, the unassigned remainder
+    seed("FFFF"), // InvalidCloseCode: 65535
+};
+
 test "fuzz: decodeCloseBody never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeCloseBody, .{});
+    try testing.fuzz({}, fuzzDecodeCloseBody, .{ .corpus = &close_seeds });
 }
 
 fn fuzzDecodeCloseBody(_: void, smith: *std.testing.Smith) !void {
     var buf: [128]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call — see `fuzzParseFrameServer` above for why
+    // `bytes` plus a ranged length is always the empty slice.
+    //
+    // ⛔ And here the collapse looked HEALTHY: `decodeCloseBody("")` SUCCEEDS
+    // by design (§5.5.1, "empty payload → no code"), so the harness returned a
+    // `CloseInfo` on every round while never reading a close code, a reason or
+    // a UTF-8 octet. Measured 2026-09-07 over the corpus above: **0 of 19
+    // seeds non-empty, 19 of 19 "accepted" and 0 close codes read before; 18 of
+    // 19 non-empty (the empty body is a deliberate seed), 10 accepted and 9
+    // codes read after.**
+    const len: usize = smith.slice(&buf);
     _ = decodeCloseBody(buf[0..len]) catch return;
+}
+
+test "corpus: every close-body seed reaches the decoder, and the codes read are pinned" {
+    // ⭐ `accepted` alone would be worse than useless here — it was 19 of 19
+    // while the harness decoded nothing, because the empty body is legal. The
+    // number that an empty input cannot produce is the count of seeds that
+    // yield an actual close code, and the reason octets validated behind it.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var codes: usize = 0;
+    var reason_bytes: usize = 0;
+    for (close_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [128]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const got = decodeCloseBody(buf[0..len]) catch continue;
+        accepted += 1;
+        if (got.code != null) codes += 1;
+        reason_bytes += got.reason.len;
+    }
+    // One short of the corpus length: the empty body is a seed on purpose.
+    try testing.expectEqual(close_seeds.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 11), accepted);
+    try testing.expectEqual(@as(usize, 10), codes);
+    try testing.expectEqual(@as(usize, 131), reason_bytes);
 }

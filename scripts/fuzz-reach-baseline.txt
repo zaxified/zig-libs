@@ -73,7 +73,6 @@ minisign 2
 mls 3
 modbus 2
 montint 2
-mqtt 1
 musig2 1
 netconf 3
 nftables 2
@@ -123,7 +122,6 @@ validate 2
 voprf 1
 webauthn 4
 webhooksig 1
-websocket 2
 whois 1
 wireguard 2
 x509 2

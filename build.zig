@@ -103,7 +103,7 @@ const module_list = [_]Module{
     // concurrency invariants can only be exercised by real threads.
     // `zig build check-testonly` proves the published module never needs it.
     .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{ "netaddr", "datefmt" }, .test_deps = &.{ "testkit", "workerpool" } },
-    .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"} },
+    .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
     .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "brotli", .libs = &.{"web"} },
@@ -203,7 +203,7 @@ const module_list = [_]Module{
     .{ .name = "bacnet", .libs = &.{"net"}, .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"} },
     .{ .name = "whois", .libs = &.{"net"}, .deps = &.{"netaddr"} },
     .{ .name = "uci", .libs = &.{"os"} },
-    .{ .name = "mqtt", .libs = &.{"net"} },
+    .{ .name = "mqtt", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "snmp", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" } },
     .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
