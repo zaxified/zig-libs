@@ -79,6 +79,9 @@ const std = @import("std");
 const fss = @import("fss");
 const db_mod = @import("db.zig");
 const pir_mod = @import("pir.zig");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 const Database = db_mod.Database;
 const Error = db_mod.Error;
@@ -1375,15 +1378,195 @@ test "SELF: exhaustive length sweep over the verified untrusted boundaries" {
 
 const FuzzVer = Verified(6, 4, 4);
 
+/// Eight octets of little-endian tail, for the `smith.value(u64)` knobs the
+/// harnesses read after their slices — see `pir.zig`'s `seedTail`.
+fn seedTail(store: []u8, at: usize, v: u64) usize {
+    std.mem.writeInt(u64, store[at..][0..8], v, .little);
+    return at + 8;
+}
+
+/// One honest `FuzzVer` run, at the geometry the fuzz corpora use: a 6-bit
+/// domain, 4-octet words, 4 octets of tag slack, 8 records of 6 octets.
+///
+/// ⛔ Everything positive in the two corpora below has to come from here.
+/// A verified answer bundle is four buffers whose ring sums have to satisfy
+/// `Σt = m·Σv` word by word plus the presence word; no literal can be written
+/// that passes that, and the odds of drawing one are 2^-64 per seed. Without
+/// it a corpus can only ever exercise the refusals.
+const FuzzRun = struct {
+    db_bytes: [48]u8 = undefined,
+    q: FuzzVer.Query = undefined,
+    v: [2][8]u8 = undefined, // 2 value words × 4 octets
+    t: [2][24]u8 = undefined, // 3 tag words × 8 octets
+    share: [FuzzVer.share_len]u8 = undefined,
+
+    const record_len: usize = 6;
+    const index: usize = 5;
+
+    fn build(self: *FuzzRun, tag: u64) void {
+        fillDb(&self.db_bytes, record_len);
+        const database = Database.init(&self.db_bytes, record_len) catch unreachable;
+        self.q = FuzzVer.query(
+            index,
+            detMac(FuzzVer.tag_word_len, tag),
+            detSeed(tag *% 4 + 0),
+            detSeed(tag *% 4 + 1),
+            detSeed(tag *% 4 + 2),
+            detSeed(tag *% 4 + 3),
+        ) catch unreachable;
+        FuzzVer.shareToBytes(self.q.shares[0], &self.share);
+        for (0..2) |p| {
+            var va: [2]FuzzVer.Word = undefined;
+            var ta: [3]FuzzVer.TagWord = undefined;
+            FuzzVer.answer(@intCast(p), self.q.shares[p], database, &va, &ta) catch unreachable;
+            FuzzVer.Value.answerToBytes(&va, &self.v[p]) catch unreachable;
+            FuzzVer.tagAnswerToBytes(&ta, &self.t[p]) catch unreachable;
+        }
+    }
+};
+
+const VerShareCorpus = struct {
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [6][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *VerShareCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *VerShareCorpus) []const []const u8 {
+        var run: FuzzRun = .{};
+        run.build(2718);
+        var a = run.share;
+        self.push(&a);
+        var b: [FuzzVer.share_len]u8 = undefined;
+        FuzzVer.shareToBytes(run.q.shares[1], &b);
+        self.push(&b);
+        // One octet off inside the TAG half of the bundle — the half a
+        // value-only corpus would never touch, and the half `m` is hidden in.
+        a[FuzzVer.share_len - 4] ^= 0x08;
+        self.push(&a);
+        // ⛔ Truncated to the VALUE half's length: the bundle is value key ‖
+        // tag key with no separator, so this is the confusion the single
+        // accepted length has to catch.
+        self.push(b[0..FuzzVer.Value.share_len]);
+        self.push(&[_]u8{0} ** FuzzVer.share_len);
+        self.push("");
+        return self.entries[0..self.n];
+    }
+};
+
 fn fuzzVerShareFromBytes(_: void, smith: *std.testing.Smith) !void {
     var buf: [FuzzVer.share_len + 8]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    _ = FuzzVer.shareFromBytes(buf[0..len]) catch return;
+    // ⚠ One `smith.slice` call, never `bytes` + a ranged length: the latter
+    // gave `len == 0` on every input and `shareFromBytes` accepts exactly one
+    // length, so this target had returned `ShareLengthMismatch` every round it
+    // ever ran, with the bundle sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
+    const share = FuzzVer.shareFromBytes(buf[0..len]) catch return;
+    var out: [FuzzVer.share_len]u8 = undefined;
+    FuzzVer.shareToBytes(share, &out);
+    std.mem.doNotOptimizeAway(&out);
 }
 test "fuzz verified shareFromBytes never panics" {
-    try std.testing.fuzz({}, fuzzVerShareFromBytes, .{});
+    var corpus: VerShareCorpus = .{};
+    try std.testing.fuzz({}, fuzzVerShareFromBytes, .{ .corpus = corpus.build() });
 }
+
+test "corpus: every verified share seed reaches the parser, and the counts are pinned" {
+    var corpus: VerShareCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var seen: [6][FuzzVer.share_len]u8 = undefined;
+    var distinct: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [FuzzVer.share_len + 8]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const share = FuzzVer.shareFromBytes(buf[0..len]) catch continue;
+        accepted += 1;
+        var out: [FuzzVer.share_len]u8 = undefined;
+        FuzzVer.shareToBytes(share, &out);
+        var known = false;
+        for (seen[0..distinct]) |prev| {
+            if (std.mem.eql(u8, &prev, &out)) known = true;
+        }
+        if (!known) {
+            seen[distinct] = out;
+            distinct += 1;
+        }
+    }
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 4), accepted);
+    try testing.expectEqual(@as(usize, 4), distinct);
+}
+
+/// ⛔ A target `check-fuzz-reach` does NOT name and that was dead all the same.
+/// Its first draw is a faithful `smith.bytes` into a fixed-size buffer, the
+/// shape the gate calls healthy — but `bytes` consumes `@min(share_len,
+/// in.len)` octets, so with no corpus the input was exhausted right there and
+/// every later draw returned its minimum: `db_bytes` all zero, `record_len` 1,
+/// `record_count` 1, `party` 0. One 1-octet record, server 0, an all-zero
+/// bundle, on every round for ever. Reported as a gate gap, not fixed quietly.
+///
+/// Seed layout: `share_len` raw octets (no header — `bytes` reads none), then
+/// a slice seed for the database, then record_len, record_count and party as
+/// eight-octet little-endian words.
+const VerAnswerCorpus = struct {
+    store: [8192]u8 = undefined,
+    scratch: [96]u8 = undefined,
+    used: usize = 0,
+    entries: [5][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(
+        self: *VerAnswerCorpus,
+        key: []const u8,
+        db_len: usize,
+        record_len: u64,
+        record_count: u64,
+        party: u64,
+    ) void {
+        const start = self.used;
+        @memcpy(self.store[start..][0..key.len], key);
+        var at = start + key.len;
+        at += testkit.fuzz.seedInto(self.store[at..], self.scratch[0..db_len]).len;
+        // ⚠ The harness reads these as `1 + value % N`, so what goes into the
+        // seed is one less than the geometry the entry means. Written out
+        // rather than inlined: the first version of this corpus passed the
+        // geometry straight through and every seed silently described a
+        // DIFFERENT database than its comment claimed.
+        at = seedTail(&self.store, at, record_len - 1);
+        at = seedTail(&self.store, at, record_count - 1);
+        at = seedTail(&self.store, at, party);
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *VerAnswerCorpus) []const []const u8 {
+        for (&self.scratch, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+        var run: FuzzRun = .{};
+        run.build(9090);
+        var a: [FuzzVer.share_len]u8 = undefined;
+        var b: [FuzzVer.share_len]u8 = undefined;
+        FuzzVer.shareToBytes(run.q.shares[0], &a);
+        FuzzVer.shareToBytes(run.q.shares[1], &b);
+        self.push(&a, 48, 6, 8, 0);
+        self.push(&b, 48, 6, 8, 1); // the party-1 half, never run before
+        self.push(&a, 40, 5, 8, 0); // record_len not a whole word
+        self.push(&b, 96, 12, 8, 1); // the widest geometry that fits
+        // The geometry the collapsed harness ran, kept rather than replaced.
+        self.push(&[_]u8{0} ** FuzzVer.share_len, 1, 1, 1, 0);
+        return self.entries[0..self.n];
+    }
+};
 
 fn fuzzVerAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     // The whole verified server path on a hostile bundle: parse, then compute
@@ -1393,11 +1576,13 @@ fn fuzzVerAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     const share = FuzzVer.shareFromBytes(&key_buf) catch return;
 
     var db_bytes: [96]u8 = undefined;
-    smith.bytes(&db_bytes);
-    const record_len: usize = smith.valueRangeAtMost(u8, 1, 12);
-    const record_count: usize = smith.valueRangeAtMost(u8, 1, 8);
-    const database = Database.init(db_bytes[0 .. record_len * record_count], record_len) catch return;
-    const party: u1 = @truncate(smith.valueRangeAtMost(u8, 0, 1));
+    const db_len: usize = smith.slice(&db_bytes);
+    // ⚠ `value(u64)` and a `%`, never a ranged draw: see `VerAnswerCorpus`.
+    const record_len: usize = @intCast(1 + smith.value(u64) % 12);
+    const record_count: usize = @intCast(1 + smith.value(u64) % 8);
+    const used = @min(db_len, record_len * record_count);
+    const database = Database.init(db_bytes[0..used], record_len) catch return;
+    const party: u1 = @truncate(smith.value(u64));
 
     var va: [3]FuzzVer.Word = undefined;
     var ta: [4]FuzzVer.TagWord = undefined;
@@ -1408,8 +1593,116 @@ fn fuzzVerAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     try FuzzVer.tagAnswerToBytes(ta[0 .. per + 1], wire[0 .. (per + 1) * FuzzVer.tag_word_len]);
 }
 test "fuzz verified answer over a hostile share never panics" {
-    try std.testing.fuzz({}, fuzzVerAnswerHostileShare, .{});
+    var corpus: VerAnswerCorpus = .{};
+    try std.testing.fuzz({}, fuzzVerAnswerHostileShare, .{ .corpus = corpus.build() });
 }
+
+test "corpus: the verified hostile-share seeds reach both parties, counts pinned" {
+    // `party1` is the second number: with the collapsed draws `party` was 0 on
+    // every round, so one of the two servers' arithmetic — in BOTH the value
+    // and the tag channel — had never been executed by this harness.
+    var corpus: VerAnswerCorpus = .{};
+    const entries = corpus.build();
+    var answered: usize = 0;
+    var party1: usize = 0;
+    var records: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var key_buf: [FuzzVer.share_len]u8 = undefined;
+        smith.bytes(&key_buf);
+        const share = FuzzVer.shareFromBytes(&key_buf) catch continue;
+        var db_bytes: [96]u8 = undefined;
+        const db_len: usize = smith.slice(&db_bytes);
+        const record_len: usize = @intCast(1 + smith.value(u64) % 12);
+        const record_count: usize = @intCast(1 + smith.value(u64) % 8);
+        const used = @min(db_len, record_len * record_count);
+        const database = Database.init(db_bytes[0..used], record_len) catch continue;
+        const party: u1 = @truncate(smith.value(u64));
+        if (party == 1) party1 += 1;
+        var va: [3]FuzzVer.Word = undefined;
+        var ta: [4]FuzzVer.TagWord = undefined;
+        const per = FuzzVer.Value.answerWords(record_len);
+        try FuzzVer.answer(party, share, database, va[0..per], ta[0 .. per + 1]);
+        answered += 1;
+        records += database.count();
+    }
+    try testing.expectEqual(entries.len, answered);
+    try testing.expectEqual(@as(usize, 2), party1);
+    try testing.expectEqual(@as(usize, 33), records);
+}
+
+/// Seeds for `fuzzVerReconstruct`: four `testkit.fuzz` slice seeds (v0, v1,
+/// t0, t1) and then two eight-octet little-endian words, `record_len` and the
+/// client's MAC scalar `m`.
+///
+/// ⛔ Only a real run can produce a bundle that VERIFIES, and without one this
+/// target could only ever have exercised the length checks. It could not even
+/// do that: with `bytes` + ranged lengths every draw was the range minimum, so
+/// all four buffers were length 0, `record_len` was 0 and `m` was 1 — and
+/// `record_len` 0 still needs a presence word, `t_need = 8`, so the target
+/// returned `AnswerLengthMismatch` on the first check on every round it ever
+/// ran. The integrity comparison this whole layer exists for had never
+/// executed.
+const VerReconCorpus = struct {
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [7][]const u8 = undefined,
+    n: usize = 0,
+    run: FuzzRun = .{},
+
+    fn push(
+        self: *VerReconCorpus,
+        v0: []const u8,
+        v1: []const u8,
+        t0: []const u8,
+        t1: []const u8,
+        rl: u64,
+        m: u64,
+    ) void {
+        const start = self.used;
+        var at = start + testkit.fuzz.seedInto(self.store[start..], v0).len;
+        at += testkit.fuzz.seedInto(self.store[at..], v1).len;
+        at += testkit.fuzz.seedInto(self.store[at..], t0).len;
+        at += testkit.fuzz.seedInto(self.store[at..], t1).len;
+        at = seedTail(&self.store, at, rl);
+        at = seedTail(&self.store, at, m);
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *VerReconCorpus) []const []const u8 {
+        self.run.build(4321);
+        const r = &self.run;
+        const m: u64 = r.q.secret.m;
+        const rl = FuzzRun.record_len;
+        // The honest bundle: verifies, and reconstructs the database's record.
+        self.push(&r.v[0], &r.v[1], &r.t[0], &r.t[1], rl, m);
+        // ⭐ The three forgeries the tag channel exists to catch, none of which
+        // any length check can see. Each must come back `AnswerRejected`.
+        var vt = r.v[0]; // a tampered VALUE answer
+        vt[2] ^= 0x10;
+        self.push(&vt, &r.v[1], &r.t[0], &r.t[1], rl, m);
+        var tt = r.t[0]; // a tampered TAG answer
+        tt[9] ^= 0x01;
+        self.push(&r.v[0], &r.v[1], &tt, &r.t[1], rl, m);
+        // The right bundle under the wrong secret — a client that kept `m`
+        // from another query, or a wiped one.
+        self.push(&r.v[0], &r.v[1], &r.t[0], &r.t[1], rl, m ^ 0x2);
+        // The length refusals: a tag answer one octet short, and the
+        // presence-word-only case.
+        self.push(&r.v[0], &r.v[1], &r.t[0], r.t[1][0..23], rl, m);
+        // ⛔ The all-zero input the collapsed harness ran on every round: it
+        // does NOT succeed here, it fails the tag length check, which is why
+        // "accepted" was never the number to look at for this target.
+        self.push("", "", "", "", 0, 1);
+        // The widest geometry: 24-octet records, 6 value words, 7 tag words.
+        const wide_v = [_]u8{0x33} ** 24;
+        const wide_t = [_]u8{0x77} ** 56;
+        self.push(&wide_v, &wide_v, &wide_t, &wide_t, 24, 0xdead_beef_dead_beef);
+        return self.entries[0..self.n];
+    }
+};
 
 fn fuzzVerReconstruct(_: void, smith: *std.testing.Smith) !void {
     // Four independently attacker-chosen buffers with attacker-chosen lengths
@@ -1419,15 +1712,13 @@ fn fuzzVerReconstruct(_: void, smith: *std.testing.Smith) !void {
     var v1: [64]u8 = undefined;
     var t0: [96]u8 = undefined;
     var t1: [96]u8 = undefined;
-    smith.bytes(&v0);
-    smith.bytes(&v1);
-    smith.bytes(&t0);
-    smith.bytes(&t1);
-    const lv0: usize = smith.valueRangeAtMost(u8, 0, v0.len);
-    const lv1: usize = smith.valueRangeAtMost(u8, 0, v1.len);
-    const lt0: usize = smith.valueRangeAtMost(u8, 0, t0.len);
-    const lt1: usize = smith.valueRangeAtMost(u8, 0, t1.len);
-    const record_len: usize = smith.valueRangeAtMost(u8, 0, 24);
+    // ⚠ Four `smith.slice` calls, then the two knobs as full-width `value`
+    // draws — never `bytes` followed by ranged lengths. See `VerReconCorpus`.
+    const lv0: usize = smith.slice(&v0);
+    const lv1: usize = smith.slice(&v1);
+    const lt0: usize = smith.slice(&t0);
+    const lt1: usize = smith.slice(&t1);
+    const record_len: usize = @intCast(smith.value(u64) % 25);
     const m: FuzzVer.TagWord = smith.value(FuzzVer.TagWord) | 1;
     var rec: [24]u8 = undefined;
 
@@ -1441,7 +1732,57 @@ fn fuzzVerReconstruct(_: void, smith: *std.testing.Smith) !void {
     ) catch return;
 }
 test "fuzz verified reconstruct never panics" {
-    try std.testing.fuzz({}, fuzzVerReconstruct, .{});
+    var corpus: VerReconCorpus = .{};
+    try std.testing.fuzz({}, fuzzVerReconstruct, .{ .corpus = corpus.build() });
+}
+
+test "corpus: the verified reconstruct seeds carry real bundles, counts pinned" {
+    // ⛔ `verified` alone is not the reach number and neither is "accepted":
+    // the second number is `rejected`, the count of seeds that got PAST both
+    // length checks and were turned away by the integrity comparison itself.
+    // No degenerate input can produce it — the empty bundle dies at the tag
+    // length check — so it is the one that says the tag channel ran.
+    var corpus: VerReconCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var verified: usize = 0;
+    var rejected: usize = 0;
+    var honest_ok: usize = 0;
+    const want = corpus.run.db_bytes[FuzzRun.index * FuzzRun.record_len ..][0..FuzzRun.record_len];
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var v0: [64]u8 = undefined;
+        var v1: [64]u8 = undefined;
+        var t0: [96]u8 = undefined;
+        var t1: [96]u8 = undefined;
+        const lv0: usize = smith.slice(&v0);
+        const lv1: usize = smith.slice(&v1);
+        const lt0: usize = smith.slice(&t0);
+        const lt1: usize = smith.slice(&t1);
+        if (lv0 != 0 and lt0 != 0) nonempty += 1;
+        const record_len: usize = @intCast(smith.value(u64) % 25);
+        const m: FuzzVer.TagWord = smith.value(FuzzVer.TagWord) | 1;
+        var rec: [24]u8 = undefined;
+        FuzzVer.reconstructFromBytes(
+            .{ .m = m },
+            v0[0..lv0],
+            v1[0..lv1],
+            t0[0..lt0],
+            t1[0..lt1],
+            rec[0..record_len],
+        ) catch |err| {
+            if (err == error.AnswerRejected) rejected += 1;
+            continue;
+        };
+        verified += 1;
+        if (record_len == FuzzRun.record_len and std.mem.eql(u8, rec[0..record_len], want)) {
+            honest_ok += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 6), nonempty);
+    try testing.expectEqual(@as(usize, 1), verified);
+    try testing.expectEqual(@as(usize, 4), rejected);
+    try testing.expectEqual(@as(usize, 1), honest_ok);
 }
 
 test "Query.wipe destroys the client MAC secret, and a wiped Secret rejects" {

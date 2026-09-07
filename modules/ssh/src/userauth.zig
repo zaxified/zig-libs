@@ -57,6 +57,9 @@ const std = @import("std");
 const transport = @import("transport.zig");
 const messages = @import("messages.zig");
 const server_mod = @import("server.zig");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 const Cursor = messages.Cursor;
 
@@ -879,38 +882,132 @@ fn framePackets(out: []u8, payloads: []const []const u8) ![]const u8 {
 // The module's transport-layer fuzz targets never reach this code, and this
 // is the one decoder in the module that runs for a peer who has proved
 // nothing at all — so it is the highest-value fuzz entry in the file.
+/// ⛔ What this harness used to do, and why none of it happened. First draw
+/// `valueRangeAtMost(u8, 1, 4)` — the minimum, **1** — so one message. The type
+/// came from `boolWeighted(4, 1)`, false at the minimum, so the `else` arm's
+/// `valueRangeAtMost(u8, 0, 255)` gave **0**, not `SSH_MSG_USERAUTH_REQUEST`.
+/// The `boolWeighted(1, 1)` that was to build "a structurally plausible
+/// request — the shape that actually reaches `servePublickey`'s
+/// blob/signature decoding" was false as well, and the body length was 0. With
+/// no corpus, the target replayed one input for ever: a single packet whose
+/// whole payload is the octet `0x00`. Neither of the two shapes the comment
+/// promises had ever been built, and `servePublickey` — called "the highest-
+/// value fuzz entry in the file" three lines above — had never been entered.
+///
+/// ⭐ The seed is now a LIST of userauth payloads, each a `testkit.fuzz` slice
+/// seed, ended by a zero-length one; the first draw is bytes, so the reach gate
+/// is satisfied honestly, and the positive entries are written with this
+/// module's own `messages.writeString`, because a USERAUTH_REQUEST is five
+/// chained length-prefixed fields and arbitrary bytes are not one.
+const UserauthCorpus = struct {
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [7][]const u8 = undefined,
+    counts: [7]usize = undefined,
+    n: usize = 0,
+
+    fn push(self: *UserauthCorpus, payloads: []const []const u8) void {
+        const start = self.used;
+        var at = start;
+        for (payloads) |p| at += testkit.fuzz.seedInto(self.store[at..], p).len;
+        at += testkit.fuzz.seedInto(self.store[at..], "").len; // the terminator
+        self.entries[self.n] = self.store[start..at];
+        self.counts[self.n] = payloads.len;
+        self.used = at;
+        self.n += 1;
+    }
+
+    /// A USERAUTH_REQUEST header: type, user, service, method. `rest` is
+    /// whatever the method-specific parser is then handed.
+    fn request(buf: []u8, user: []const u8, method: []const u8, rest: []const u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST)) catch unreachable;
+        messages.writeString(&w, user) catch unreachable;
+        messages.writeString(&w, connection_service) catch unreachable;
+        messages.writeString(&w, method) catch unreachable;
+        w.writeAll(rest) catch unreachable;
+        return w.buffered();
+    }
+
+    /// The `publickey` tail: a boolean, an algorithm name and a key blob —
+    /// and, when the boolean is set, a signature. Both shapes matter:
+    /// `false` is the "query" probe every real client sends first.
+    fn publickeyTail(buf: []u8, signed: bool, algo: []const u8, blob: []const u8, sig: []const u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeByte(if (signed) 1 else 0) catch unreachable;
+        messages.writeString(&w, algo) catch unreachable;
+        messages.writeString(&w, blob) catch unreachable;
+        if (signed) messages.writeString(&w, sig) catch unreachable;
+        return w.buffered();
+    }
+
+    /// An `ssh-ed25519` public-key blob: the algorithm name and 32 octets.
+    fn ed25519Blob(buf: []u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        messages.writeString(&w, "ssh-ed25519") catch unreachable;
+        var key: [32]u8 = undefined;
+        for (&key, 0..) |*b, i| b.* = @truncate(i *% 7 +% 1);
+        messages.writeString(&w, &key) catch unreachable;
+        return w.buffered();
+    }
+
+    fn build(self: *UserauthCorpus) []const []const u8 {
+        var blob_buf: [128]u8 = undefined;
+        const blob = ed25519Blob(&blob_buf);
+
+        var tail1: [256]u8 = undefined;
+        const query = publickeyTail(&tail1, false, "ssh-ed25519", blob, "");
+        var tail2: [512]u8 = undefined;
+        const signed = publickeyTail(&tail2, true, "ssh-ed25519", blob, &([_]u8{0x5a} ** 83));
+
+        var r1: [512]u8 = undefined;
+        var r2: [768]u8 = undefined;
+        var r3: [256]u8 = undefined;
+        var r4: [256]u8 = undefined;
+        // ⭐ The publickey probe, then the signed request: the exact two
+        // messages a real client sends, and the path into `servePublickey`.
+        self.push(&.{ request(&r1, "alice", "publickey", query), request(&r2, "alice", "publickey", signed) });
+        // The password method.
+        var pw: [64]u8 = undefined;
+        var pww: std.Io.Writer = .fixed(&pw);
+        pww.writeByte(0) catch unreachable;
+        messages.writeString(&pww, "hunter2") catch unreachable;
+        self.push(&.{request(&r3, "bob", "password", pww.buffered())});
+        // `none`, which a client sends to learn the method list.
+        self.push(&.{request(&r4, "carol", "none", "")});
+        // A publickey request whose tail is cut off after the boolean.
+        var r5: [256]u8 = undefined;
+        self.push(&.{request(&r5, "alice", "publickey", &[_]u8{1})});
+        // A user string announcing 4 GiB — the oversize-string refusal.
+        var r6: [64]u8 = undefined;
+        var w6: std.Io.Writer = .fixed(&r6);
+        w6.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST)) catch unreachable;
+        w6.writeAll(&[_]u8{ 0xff, 0xff, 0xff, 0xff }) catch unreachable;
+        w6.writeAll("junk") catch unreachable;
+        self.push(&.{w6.buffered()});
+        // The single `0x00` payload the target replayed on every round.
+        self.push(&.{&[_]u8{0}});
+        self.push(&.{});
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: serveUserauth never panics on an arbitrary userauth message stream" {
-    try std.testing.fuzz({}, fuzzServeUserauth, .{});
+    var corpus: UserauthCorpus = .{};
+    try std.testing.fuzz({}, fuzzServeUserauth, .{ .corpus = corpus.build() });
 }
 
 fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
     var payload_store: [4][256]u8 = undefined;
     var payloads: [4][]const u8 = undefined;
-    const n: usize = smith.valueRangeAtMost(u8, 1, @intCast(payloads.len));
-    for (0..n) |i| {
-        var w: std.Io.Writer = .fixed(&payload_store[i]);
-        // Mostly SSH_MSG_USERAUTH_REQUEST (50), so the budget is spent inside
-        // the request parser rather than on the dispatch table.
-        const mt: u8 = if (smith.boolWeighted(4, 1))
-            @intFromEnum(messages.MessageType.SSH_MSG_USERAUTH_REQUEST)
-        else
-            smith.valueRangeAtMost(u8, 0, 255);
-        w.writeByte(mt) catch return;
-
-        // Half the time build a *structurally plausible* request — the shape
-        // that actually reaches `servePublickey`'s blob/signature decoding —
-        // and half the time raw bytes.
-        if (smith.boolWeighted(1, 1)) {
-            messages.writeString(&w, "alice") catch return;
-            messages.writeString(&w, connection_service) catch return;
-            const method: []const u8 = if (smith.boolWeighted(2, 1)) "publickey" else "password";
-            messages.writeString(&w, method) catch return;
-        }
-        var body: [200]u8 = undefined;
-        const present: usize = smith.valueRangeAtMost(u8, 0, 160);
-        smith.bytes(body[0..present]);
-        w.writeAll(body[0..present]) catch return;
-        payloads[i] = w.buffered();
+    // ⚠ Bytes first, and the message COUNT out of the bytes: a zero-length
+    // payload ends the list. See `UserauthCorpus` for what the ranged draws
+    // this replaced were actually producing.
+    var n: usize = 0;
+    while (n < payloads.len) : (n += 1) {
+        const len: usize = smith.slice(&payload_store[n]);
+        if (len == 0) break;
+        payloads[n] = payload_store[n][0..len];
     }
 
     var wire: [4096]u8 = undefined;
@@ -936,6 +1033,61 @@ fn fuzzServeUserauth(_: void, smith: *std.testing.Smith) !void {
     }) catch return;
     // A success must never carry a user name longer than the declared bound.
     std.debug.assert(res.user().len <= max_user_len);
+}
+
+test "corpus: the serveUserauth seeds deliver real requests, and the counts are pinned" {
+    // ⛔ Two numbers beyond the message count. `reply_octets` is what the
+    // server WROTE back — a stream it can parse produces FAILURE/PK_OK/SUCCESS
+    // packets and an unparseable one produces none, so it is the number that
+    // says the RFC 4252 parser ran. `authenticated` pins how many streams got
+    // all the way to a decision. Both were 0 before: the one input this target
+    // ever ran was a single `0x00` payload, which is not a userauth message.
+    var corpus: UserauthCorpus = .{};
+    const entries = corpus.build();
+    var delivered: usize = 0;
+    var reply_octets: usize = 0;
+    var authenticated: usize = 0;
+    for (entries, corpus.counts[0..corpus.n]) |sd, want| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var payload_store: [4][256]u8 = undefined;
+        var payloads: [4][]const u8 = undefined;
+        var n: usize = 0;
+        while (n < payloads.len) : (n += 1) {
+            const len: usize = smith.slice(&payload_store[n]);
+            if (len == 0) break;
+            payloads[n] = payload_store[n][0..len];
+        }
+        try std.testing.expectEqual(want, n);
+        delivered += n;
+        var wire: [4096]u8 = undefined;
+        const framed = framePackets(&wire, payloads[0..n]) catch continue;
+        var r: std.Io.Reader = .fixed(framed);
+        var sink_buf: [8192]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        tr.session_id = transport.SessionId.from("fuzz-session-id");
+        const res = serveUserauth(&tr, std.testing.allocator, .{
+            .authorized_key = .{ .checkFn = struct {
+                fn f(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+                    return true;
+                }
+            }.f },
+            .password = .{ .checkFn = struct {
+                fn f(_: *anyopaque, _: []const u8, _: []const u8) bool {
+                    return true;
+                }
+            }.f },
+        }) catch {
+            reply_octets += sink.buffered().len;
+            continue;
+        };
+        std.debug.assert(res.user().len <= max_user_len);
+        authenticated += 1;
+        reply_octets += sink.buffered().len;
+    }
+    try std.testing.expectEqual(@as(usize, 7), delivered);
+    try std.testing.expectEqual(@as(usize, 1), authenticated);
+    try std.testing.expectEqual(@as(usize, 232), reply_octets);
 }
 
 test "serveUserauth: an oversize peer string is a typed error, not a panic" {

@@ -86,7 +86,6 @@ opcua 1
 p256 1
 paillier 3
 pbb 1
-pir 7
 pping 1
 procnet 5
 protobuf 2
@@ -99,7 +98,6 @@ rawsock 3
 rdap 2
 rescue 1
 ripemd160 1
-rsa 6
 saml 2
 sealedbox 1
 sessions 2
@@ -109,7 +107,6 @@ snmp 3
 sntp 1
 spake2plus 1
 sphinx 1
-ssh 6
 staticfiles 1
 stun 1
 tar 1

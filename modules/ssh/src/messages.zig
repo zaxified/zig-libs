@@ -9,6 +9,9 @@
 //! `server.zig`, `userauth.zig` and `connection.zig` instead.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 /// SSH message numbers: the RFC 4253 §12 transport-layer set (+ RFC 8731
 /// naming), the RFC 4252 §6 userauth set (50-60), and the RFC 4254 §9
@@ -411,61 +414,134 @@ test "writeNameList/readNameList round-trip: empty list" {
 // a sign-pad-stripping step on top and is the one that parses an
 // attacker-supplied *big-integer* length during unauthenticated key
 // exchange (DH/RSA host-key blobs). Both run before authentication, off a
-// raw socket. Keep the declared length mostly plausible (small, or right at
-// the `max_wire_string_len` boundary) so the fuzzer spends its budget in
-// the allocate-and-read path rather than bouncing off the cap on every call.
+// raw socket.
+//
+// ⛔ Both harnesses used to SYNTHESIZE the frame: draw a declared length, write
+// a header, draw a body. Every one of those draws was ranged and therefore the
+// range MINIMUM on every input — `Smith` reads eight octets as a little-endian
+// u64 and falls back to the minimum when the word is out of range — and with no
+// corpus there was only ever one input. So `readString` was handed
+// `00 00 00 00` on every round it had ever run, and `readMpint` the same. The
+// comments above them described biases that had never fired even once:
+//   - "the max_wire_string_len boundary where the StringTooLarge cap kicks in":
+//     `boolWeighted(1, 4)` is false at the minimum, so that branch never ran
+//     and the cap was never reached;
+//   - "the actual bytes present may be fewer than `len` announces (truncated
+//     wire)": `present` was 0 and so was `len`, so they always agreed;
+//   - "bias toward the sign-pad-stripping branch": `len` was 0, so `raw.len > 1`
+//     was false and the strip never happened.
+//
+// ⭐ The frame is now drawn WHOLE, in one `smith.slice`, and handed to the
+// reader as-is. That is what these functions actually parse — a length header
+// and a body from the same octet stream — so a mutation can desynchronize the
+// two the way a hostile peer does, and the corpus below can say in one line
+// each what the old draws claimed to reach and did not.
+
+const readstring_seeds = [_][]const u8{
+    testkit.fuzz.seedHex("00000000"), // the empty string: what the target ran
+    testkit.fuzz.seed("\x00\x00\x00\x05hello"), // a 5-octet string
+    testkit.fuzz.seed("\x00\x00\x00\x05hel"), // truncated body: EndOfStream
+    testkit.fuzz.seedHex("00100000"), // len == max_wire_string_len exactly:
+    //                                   allocates, then finds no body
+    testkit.fuzz.seedHex("00100001"), // one past it: StringTooLarge
+    testkit.fuzz.seedHex("ffffffff"), // 4 GiB announced: StringTooLarge
+    testkit.fuzz.seedHex("0000"), // header truncated: EndOfStream
+    testkit.fuzz.seed("\x00\x00\x02\xbc" ++ ("A" ** 700)), // the widest body
+    testkit.fuzz.seed(""),
+};
 
 test "fuzz: readString never panics on arbitrary length-prefixed bytes" {
-    try std.testing.fuzz({}, fuzzReadString, .{});
+    try std.testing.fuzz({}, fuzzReadString, .{ .corpus = &readstring_seeds });
 }
 
 fn fuzzReadString(_: void, smith: *std.testing.Smith) !void {
+    // 768: the widest seed above is 704 octets, and a seed longer than the
+    // buffer reads back as the EMPTY one rather than as a big one.
     var wire: [768]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&wire);
-
-    // Bias the declared length toward the interesting edges: small values,
-    // and the max_wire_string_len boundary (+/- a couple bytes) where the
-    // StringTooLarge cap kicks in.
-    const len: u32 = if (smith.boolWeighted(1, 4))
-        max_wire_string_len -% 2 +% smith.valueRangeAtMost(u32, 0, 4)
-    else
-        smith.valueRangeAtMost(u32, 0, 700);
-    var hdr: [4]u8 = undefined;
-    std.mem.writeInt(u32, &hdr, len, .big);
-    w.writeAll(&hdr) catch return;
-
-    // The actual bytes present may be fewer than `len` announces (truncated
-    // wire) — that must surface as a read error, never an OOB read.
-    var body: [700]u8 = undefined;
-    const present: u16 = smith.valueRangeAtMost(u16, 0, body.len);
-    smith.bytes(body[0..present]);
-    w.writeAll(body[0..present]) catch return;
-
-    var r: std.Io.Reader = .fixed(w.buffered());
+    const n: usize = smith.slice(&wire);
+    var r: std.Io.Reader = .fixed(wire[0..n]);
     const s = readString(std.testing.allocator, &r) catch return;
     std.testing.allocator.free(s);
 }
 
+test "corpus: every readString seed reaches the reader, and the counts are pinned" {
+    // `octets` is the second number: `readString` returns an EMPTY slice for
+    // the all-zero header, which is a legal string, so an "accepted" count
+    // alone reads the collapsed input as a success.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var octets: usize = 0;
+    var too_large: usize = 0;
+    for (readstring_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var wire: [768]u8 = undefined;
+        const n: usize = smith.slice(&wire);
+        if (n != 0) nonempty += 1;
+        var r: std.Io.Reader = .fixed(wire[0..n]);
+        const s = readString(std.testing.allocator, &r) catch |err| {
+            if (err == error.StringTooLarge) too_large += 1;
+            continue;
+        };
+        defer std.testing.allocator.free(s);
+        accepted += 1;
+        octets += s.len;
+    }
+    try std.testing.expectEqual(readstring_seeds.len - 1, nonempty);
+    try std.testing.expectEqual(@as(usize, 3), accepted);
+    try std.testing.expectEqual(@as(usize, 705), octets);
+    try std.testing.expectEqual(@as(usize, 2), too_large);
+}
+
+const readmpint_seeds = [_][]const u8{
+    testkit.fuzz.seedHex("00000000"), // the empty mpint: what the target ran
+    testkit.fuzz.seedHex("0000000107"), // one octet, nothing to strip
+    testkit.fuzz.seedHex("000000020080"), // the RFC 4251 §5 sign pad: strips to 0x80
+    testkit.fuzz.seedHex("0000000300000f"), // two leading zeros, only one stripped
+    testkit.fuzz.seedHex("000000020001"), // a redundant pad on a small value
+    testkit.fuzz.seedHex("0000006000") ++ "", // 96 announced, 1 present: EndOfStream
+    testkit.fuzz.seed("\x00\x00\x00\x60" ++ ("\x00" ++ ("Z" ** 95))), // widest, padded
+    testkit.fuzz.seedHex("00100001"), // StringTooLarge, through readString
+    testkit.fuzz.seed(""),
+};
+
 test "fuzz: readMpint never panics on arbitrary length-prefixed bytes" {
-    try std.testing.fuzz({}, fuzzReadMpint, .{});
+    try std.testing.fuzz({}, fuzzReadMpint, .{ .corpus = &readmpint_seeds });
 }
 
 fn fuzzReadMpint(_: void, smith: *std.testing.Smith) !void {
     var wire: [128]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&wire);
-
-    const len: u32 = smith.valueRangeAtMost(u32, 0, 96);
-    var hdr: [4]u8 = undefined;
-    std.mem.writeInt(u32, &hdr, len, .big);
-    w.writeAll(&hdr) catch return;
-
-    var body: [96]u8 = undefined;
-    smith.bytes(body[0..len]);
-    // Bias toward the sign-pad-stripping branch (`raw.len > 1 and raw[0] == 0`).
-    if (len > 1 and smith.boolWeighted(1, 2)) body[0] = 0;
-    w.writeAll(body[0..len]) catch return;
-
-    var r: std.Io.Reader = .fixed(w.buffered());
+    const n: usize = smith.slice(&wire);
+    var r: std.Io.Reader = .fixed(wire[0..n]);
     const m = readMpint(std.testing.allocator, &r) catch return;
     std.testing.allocator.free(m);
+}
+
+test "corpus: every readMpint seed reaches the reader, and the counts are pinned" {
+    // ⭐ `stripped` is the second number and the one the collapse could never
+    // produce: it counts the seeds whose leading zero octet was actually
+    // removed. `readMpint`'s only behaviour beyond `readString` is that strip,
+    // and with the old draws `len` was 0 on every round, so `raw.len > 1` was
+    // false and the branch this function exists for had never executed.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var octets: usize = 0;
+    var stripped: usize = 0;
+    for (readmpint_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var wire: [128]u8 = undefined;
+        const n: usize = smith.slice(&wire);
+        if (n != 0) nonempty += 1;
+        var r: std.Io.Reader = .fixed(wire[0..n]);
+        const m = readMpint(std.testing.allocator, &r) catch continue;
+        defer std.testing.allocator.free(m);
+        accepted += 1;
+        octets += m.len;
+        // The declared length is the frame's own first four octets; a shorter
+        // result means the sign pad was removed.
+        if (n >= 4 and m.len < std.mem.readInt(u32, wire[0..4], .big)) stripped += 1;
+    }
+    try std.testing.expectEqual(readmpint_seeds.len - 1, nonempty);
+    try std.testing.expectEqual(@as(usize, 6), accepted);
+    try std.testing.expectEqual(@as(usize, 100), octets);
+    try std.testing.expectEqual(@as(usize, 4), stripped);
 }

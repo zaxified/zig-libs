@@ -22,6 +22,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const messages = @import("messages.zig");
 const rsa = @import("rsa");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
@@ -2395,36 +2398,148 @@ test "KEXINIT encode/decode round-trip" {
 // exercises the full decode chain and its errdefer unwind, not just the
 // first length prefix.
 
+/// The KEXINIT bodies `fuzzKexInitDecode` replays.
+///
+/// ⛔ The harness used to SYNTHESIZE the body: a cookie, then eleven
+/// `valueRangeAtMost(u32, 0, 96)` name-list lengths, then a `boolWeighted`
+/// flag. Every one of those is the range MINIMUM after the first short read,
+/// so the eleven lengths were 0, the flag was false, and with no corpus the
+/// target replayed one body for ever: sixteen zero octets, eleven empty
+/// name-lists, `false`, four zero octets. `readListOwned`'s errdefer unwind —
+/// the reason the comment above says "not just the first length prefix" — had
+/// never run, because nothing after the first list ever failed.
+///
+/// ⭐ The body is now drawn whole with one `smith.slice`, and the positive
+/// seeds come out of `KexInit.encode` itself: a KEXINIT is eleven chained
+/// length-prefixed name-lists and arbitrary bytes do not make one.
+const KexInitCorpus = struct {
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *KexInitCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    /// `KexInit.encode` writes the message-type octet first; `decode` is
+    /// called on what follows it, so the body starts at index 1.
+    fn encoded(out: []u8, follows: bool) []const u8 {
+        const kex = [_][]const u8{ "mlkem768x25519-sha256", "curve25519-sha256" };
+        const host = [_][]const u8{ "ssh-ed25519", "rsa-sha2-256" };
+        const enc = [_][]const u8{"chacha20-poly1305@openssh.com"};
+        const mac = [_][]const u8{"hmac-sha2-256"};
+        const comp = [_][]const u8{"none"};
+        const empty: []const []const u8 = &.{};
+        var cookie: [16]u8 = undefined;
+        for (&cookie, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
+        const src: KexInit = .{
+            .cookie = cookie,
+            .kex_algorithms = &kex,
+            .server_host_key_algorithms = &host,
+            .encryption_algorithms_client_to_server = &enc,
+            .encryption_algorithms_server_to_client = &enc,
+            .mac_algorithms_client_to_server = &mac,
+            .mac_algorithms_server_to_client = &mac,
+            .compression_algorithms_client_to_server = &comp,
+            .compression_algorithms_server_to_client = &comp,
+            .languages_client_to_server = empty,
+            .languages_server_to_client = empty,
+            .first_kex_packet_follows = follows,
+            .reserved = 0,
+        };
+        var w: std.Io.Writer = .fixed(out);
+        src.encode(&w) catch unreachable;
+        return w.buffered()[1..];
+    }
+
+    fn build(self: *KexInitCorpus) []const []const u8 {
+        var scratch: [1024]u8 = undefined;
+        const body = encoded(&scratch, false);
+        self.push(body);
+        var scratch2: [1024]u8 = undefined;
+        self.push(encoded(&scratch2, true)); // first_kex_packet_follows set
+        // ⭐ The SEVENTH name-list's length raised past what remains. This is
+        // the seed the old harness's comment claimed to reach and could not:
+        // six lists are allocated and owned before the failure, so it is the
+        // errdefer unwind, not the happy path, that has to free them.
+        var truncated: [1024]u8 = undefined;
+        @memcpy(truncated[0..body.len], body);
+        const seventh = nthListOffset(body, 6);
+        std.mem.writeInt(u32, truncated[seventh..][0..4], 0xffff, .big);
+        self.push(truncated[0..body.len]);
+        // A name-list announcing more than `max_wire_string_len`.
+        var too_big: [1024]u8 = undefined;
+        @memcpy(too_big[0..body.len], body);
+        std.mem.writeInt(u32, too_big[16..][0..4], messages.max_wire_string_len + 1, .big);
+        self.push(too_big[0..body.len]);
+        // Cut short inside the first name-list, and cut short in the cookie.
+        self.push(body[0..30]);
+        self.push(body[0..8]);
+        // The body the target used to replay: cookie, eleven empty lists,
+        // false, four reserved octets. Kept, rather than merely replaced.
+        self.push(&([_]u8{0} ** 16 ++ [_]u8{0} ** 44 ++ [_]u8{0} ** 5));
+        self.push("");
+        return self.entries[0..self.n];
+    }
+};
+
+/// Byte offset of name-list `n` (0-based) in a KEXINIT body: the 16-octet
+/// cookie, then `n` length-prefixed lists.
+fn nthListOffset(body: []const u8, n: usize) usize {
+    var at: usize = 16;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        at += 4 + std.mem.readInt(u32, body[at..][0..4], .big);
+    }
+    return at;
+}
+
 test "fuzz: KexInit.decode never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzKexInitDecode, .{});
+    var corpus: KexInitCorpus = .{};
+    try std.testing.fuzz({}, fuzzKexInitDecode, .{ .corpus = corpus.build() });
 }
 
 fn fuzzKexInitDecode(_: void, smith: *std.testing.Smith) !void {
     var wire: [2048]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&wire);
-
-    var cookie: [16]u8 = undefined;
-    smith.bytes(&cookie);
-    w.writeAll(&cookie) catch return;
-
-    var i: usize = 0;
-    while (i < 11) : (i += 1) {
-        const len: u32 = smith.valueRangeAtMost(u32, 0, 96);
-        var hdr: [4]u8 = undefined;
-        std.mem.writeInt(u32, &hdr, len, .big);
-        w.writeAll(&hdr) catch return;
-        var namebuf: [96]u8 = undefined;
-        smith.bytes(namebuf[0..len]);
-        w.writeAll(namebuf[0..len]) catch return;
-    }
-    w.writeByte(if (smith.boolWeighted(1, 1)) 1 else 0) catch return;
-    var rbuf: [4]u8 = undefined;
-    smith.bytes(&rbuf);
-    w.writeAll(&rbuf) catch return;
-
-    var r: std.Io.Reader = .fixed(w.buffered());
+    const n: usize = smith.slice(&wire);
+    var r: std.Io.Reader = .fixed(wire[0..n]);
     var got = KexInit.decode(std.testing.allocator, &r) catch return;
     got.deinit(std.testing.allocator);
+}
+
+test "corpus: every KEXINIT seed reaches the decoder, and the counts are pinned" {
+    // ⛔ `accepted` is not the reach number here: eleven EMPTY name-lists are a
+    // structurally legal KEXINIT, so the one body the collapsed target ever
+    // replayed decoded successfully and a "did it accept?" guard would have
+    // scored it 1 of 1. `names` — the algorithm names actually recovered — is
+    // what only a real encoding can produce.
+    var corpus: KexInitCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var names: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var wire: [2048]u8 = undefined;
+        const n: usize = smith.slice(&wire);
+        if (n != 0) nonempty += 1;
+        var r: std.Io.Reader = .fixed(wire[0..n]);
+        var got = KexInit.decode(std.testing.allocator, &r) catch continue;
+        defer got.deinit(std.testing.allocator);
+        accepted += 1;
+        names += got.kex_algorithms.len + got.server_host_key_algorithms.len +
+            got.encryption_algorithms_client_to_server.len +
+            got.mac_algorithms_client_to_server.len +
+            got.compression_algorithms_client_to_server.len +
+            got.languages_client_to_server.len;
+    }
+    try std.testing.expectEqual(entries.len - 1, nonempty);
+    try std.testing.expectEqual(@as(usize, 3), accepted);
+    try std.testing.expectEqual(@as(usize, 14), names);
 }
 
 test "negotiation picks first client algorithm the server also lists" {
@@ -2464,30 +2579,103 @@ test "packet codec round-trip: none" {
 // `PacketTooLarge` on every call), while still occasionally corrupting the
 // length field to hit the mismatched-length/truncated-body paths.
 
+/// ⛔ The old harness's first draw was `valueRangeAtMost(u32, 0, 250)` for the
+/// body length — the range minimum, i.e. **0** — so the frame it built was the
+/// four octets `00 00 00 00` and nothing else, on every round it ever ran. The
+/// `boolWeighted(1, 4)` "attacker lies about the length" branch was false at
+/// the minimum and never executed once, so the padding-length and
+/// payload-slicing arithmetic the comment above is about was never reached.
+///
+/// ⭐ The frame is now drawn whole and the positive seeds come out of
+/// `writePacket`, the module's own framer: a valid binary packet is a length,
+/// a padding length and a block-aligned body, and arbitrary bytes are not one.
+const PacketCorpus = struct {
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *PacketCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn framed(out: []u8, payload: []const u8) []const u8 {
+        var w: std.Io.Writer = .fixed(out);
+        var cipher: CipherState = .none;
+        writePacket(&w, &cipher, payload) catch unreachable;
+        return w.buffered();
+    }
+
+    fn build(self: *PacketCorpus) []const []const u8 {
+        var scratch: [512]u8 = undefined;
+        const one = framed(&scratch, "hello ssh binary packet protocol");
+        self.push(one);
+        var scratch2: [512]u8 = undefined;
+        self.push(framed(&scratch2, "")); // a zero-length payload: all padding
+        var scratch3: [512]u8 = undefined;
+        self.push(framed(&scratch3, &([_]u8{0x41} ** 200))); // the widest that fits
+        // A valid frame whose declared packet_length is one too large: the
+        // body then runs out mid-payload.
+        var lying: [512]u8 = undefined;
+        @memcpy(lying[0..one.len], one);
+        std.mem.writeInt(u32, lying[0..4], std.mem.readInt(u32, one[0..4], .big) + 1, .big);
+        self.push(lying[0..one.len]);
+        // A padding length larger than the packet: the slicing arithmetic's
+        // own bound.
+        var bad_pad: [512]u8 = undefined;
+        @memcpy(bad_pad[0..one.len], one);
+        bad_pad[4] = 0xff;
+        self.push(bad_pad[0..one.len]);
+        // 4 GiB announced — over the frame cap.
+        self.push(&[_]u8{ 0xff, 0xff, 0xff, 0xff, 0x04 });
+        // The four octets the target used to replay, and the empty input.
+        self.push(&[_]u8{ 0, 0, 0, 0 });
+        self.push("");
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: readPacket (cipher .none) never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzReadPacketNone, .{});
+    var corpus: PacketCorpus = .{};
+    try std.testing.fuzz({}, fuzzReadPacketNone, .{ .corpus = corpus.build() });
 }
 
 fn fuzzReadPacketNone(_: void, smith: *std.testing.Smith) !void {
     var wire: [300]u8 = undefined;
-    const body_len: u32 = smith.valueRangeAtMost(u32, 0, 250);
-    var hdr: [4]u8 = undefined;
-    std.mem.writeInt(u32, &hdr, body_len, .big);
-    @memcpy(wire[0..4], &hdr);
-    smith.bytes(wire[4 .. 4 + body_len]);
-
-    // Occasionally declare a length unrelated to what's actually in the
-    // buffer (attacker lies about the length; buffer may be shorter, or the
-    // declared length may exceed max_wire_string_len).
-    if (smith.boolWeighted(1, 4)) {
-        const bogus = smith.value(u32);
-        std.mem.writeInt(u32, wire[0..4], bogus, .big);
-    }
-
-    var r: std.Io.Reader = .fixed(wire[0 .. 4 + body_len]);
+    const n: usize = smith.slice(&wire);
+    var r: std.Io.Reader = .fixed(wire[0..n]);
     var cipher: CipherState = .none;
     var buf: [256]u8 = undefined;
     _ = readPacket(&r, &cipher, &buf) catch return;
+}
+
+test "corpus: every readPacket seed reaches the framer, and the counts are pinned" {
+    // `payload_octets` is the second number: a packet with a zero-length
+    // payload is a legal frame, so counting accepts alone would not notice a
+    // corpus in which no payload octet ever came back out.
+    var corpus: PacketCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var payload_octets: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var wire: [300]u8 = undefined;
+        const n: usize = smith.slice(&wire);
+        if (n != 0) nonempty += 1;
+        var r: std.Io.Reader = .fixed(wire[0..n]);
+        var cipher: CipherState = .none;
+        var buf: [256]u8 = undefined;
+        const pkt = readPacket(&r, &cipher, &buf) catch continue;
+        accepted += 1;
+        payload_octets += pkt.payload.len;
+    }
+    try std.testing.expectEqual(entries.len - 1, nonempty);
+    try std.testing.expectEqual(@as(usize, 3), accepted);
+    try std.testing.expectEqual(@as(usize, 232), payload_octets);
 }
 
 test "packet codec round-trip: chacha20-poly1305@openssh (fixed keys)" {

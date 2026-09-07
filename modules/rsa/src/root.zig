@@ -88,6 +88,10 @@ const montint = @import("montint");
 /// for callers that need the KDF stand-alone.
 pub const openssh = @import("openssh.zig");
 
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
+
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
@@ -4502,75 +4506,486 @@ test "bench: montint vs ff (opt-in via RSA_BENCH)" {
 }
 
 // ── fuzz: every untrusted-wire key parser must reject, never panic ─────────
+//
+// ⚠ Every harness below used to open with
+//
+//     smith.bytes(&buf);
+//     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+//
+// which is the collapsing idiom: `bytes` consumes `@min(buf.len, in.len)`
+// octets and the ranged draw then finds fewer than the eight it reads as a
+// little-endian u64, so it returns the range MINIMUM — zero. The seed reached
+// `buf` and was thrown away, and with no corpus at all the six targets ran
+// exactly one input each, for ever: `fromDer("")`, `fromPem("")`,
+// `fromOpenSSH("", "")`. Six parsers of externally supplied key material, and
+// not one octet of a key had ever gone through any of them here.
+//
+// ⛔ Arbitrary bytes cannot fix that on their own. A DER `RSAPrivateKey` is a
+// nine-INTEGER SEQUENCE whose primes have to multiply back to the modulus and
+// whose `e` has to be invertible mod λ(n); the chance of drawing one is nil.
+// The interesting frames are therefore PERTURBATIONS of a real encoding, and
+// the real encodings this module owns are the `kat2048_der`/`kat2048_pem`/
+// `openssh_fixture_*` fixtures above. Roughly half of every corpus below is a
+// fixture one octet off — the shape that reaches past the outer TLV and into
+// the arithmetic.
+
+/// `frame` with one octet XORed. The corpus building block: a real encoding
+/// with a single byte changed still parses as ASN.1, so it reaches the key
+/// arithmetic instead of dying at the first tag the way random bytes do.
+fn perturbed(comptime frame: []const u8, comptime at: usize, comptime mask: u8) []const u8 {
+    return &struct {
+        const bytes = blk: {
+            var out = frame[0..frame.len].*;
+            out[at] ^= mask;
+            break :blk out;
+        };
+    }.bytes;
+}
+
+/// A running record of which moduli actually came back out of a corpus.
+///
+/// ⛔ The reason the guards below pin this and not just an "accepted" count:
+/// `accepted` says a frame was legal, not that the SEED decided which one. Two
+/// seeds carrying the same fixture score the same as ten, and a corpus that
+/// silently collapsed to one frame — a seed grown past the harness's buffer
+/// reads back EMPTY, without a word — keeps whatever count the remaining seeds
+/// happen to make. `n` is the number the collapse cannot hold up: it only
+/// moves when a seed's own OCTETS reach the modulus.
+const ModuliSeen = struct {
+    seen: [8][max_modulus_len]u8 = undefined,
+    lens: [8]usize = undefined,
+    n: usize = 0,
+
+    fn add(self: *ModuliSeen, m: Modulus) !void {
+        const k = byteLen(m.bits());
+        var buf: [max_modulus_len]u8 = undefined;
+        try m.toBytes(buf[0..k], .big);
+        for (self.seen[0..self.n], self.lens[0..self.n]) |*prev, plen| {
+            if (plen == k and std.mem.eql(u8, prev[0..k], buf[0..k])) return;
+        }
+        if (self.n == self.seen.len) return error.TooManyModuli;
+        @memcpy(self.seen[self.n][0..k], buf[0..k]);
+        self.lens[self.n] = k;
+        self.n += 1;
+    }
+};
+
+// ── PublicKey.fromDer ────────────────────────────────────────────────────────
+
+// `pub_pkcs1` is `30 82 01 0a | 02 82 01 01 | 00 <256 octets of n> |
+// 02 03 01 00 01`, so n occupies indices 9..264 and `pub_spki` carries the
+// same blob 24 octets in (SEQUENCE header 4 + AlgorithmIdentifier 15 +
+// BIT STRING header 5).
+const pubder_seeds = [_][]const u8{
+    testkit.fuzz.seed(&kat2048_der.pub_spki), // X.509 SubjectPublicKeyInfo
+    testkit.fuzz.seed(&kat2048_der.pub_pkcs1), // bare PKCS#1 RSAPublicKey
+    // n with one octet changed in the middle: still odd, still 2048 bits, so
+    // this is a DIFFERENT key that parses — the seed's own content decides
+    // what comes out, which is what the distinct-moduli count is counting.
+    testkit.fuzz.seed(perturbed(&kat2048_der.pub_spki, 124, 0x55)),
+    // n's LOW octet flipped: n is now even, which `Modulus.fromBytes` refuses.
+    testkit.fuzz.seed(perturbed(&kat2048_der.pub_pkcs1, 264, 0x01)),
+    // e's low octet cleared: e = 65536, even, refused by `fromBytes`.
+    testkit.fuzz.seed(perturbed(&kat2048_der.pub_pkcs1, 269, 0x01)),
+    // The outer SEQUENCE length claims one octet more than the frame has.
+    testkit.fuzz.seed(perturbed(&kat2048_der.pub_pkcs1, 3, 0x01)),
+    // A truncated SPKI: header intact, key material cut off mid-modulus.
+    testkit.fuzz.seed(kat2048_der.pub_spki[0..64]),
+    // Not DER at all, and the input the target used to run for ever.
+    testkit.fuzz.seed("\x30\x82\xff\xff"),
+    testkit.fuzz.seed(""),
+};
 
 fn fuzzPublicKeyFromDer(_: void, smith: *std.testing.Smith) !void {
+    // 1024 against a 294-octet SPKI, the largest public encoding a 2048-bit
+    // key makes; a 4096-bit SPKI is still only ~550.
     var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     const pk = PublicKey.fromDer(buf[0..len]) catch return;
-    _ = pk;
+    std.mem.doNotOptimizeAway(pk.n.bits());
 }
 
 test "fuzz: PublicKey.fromDer never panics" {
-    try testing.fuzz({}, fuzzPublicKeyFromDer, .{});
+    try testing.fuzz({}, fuzzPublicKeyFromDer, .{ .corpus = &pubder_seeds });
 }
 
+test "corpus: PublicKey.fromDer seeds reach the parser, counts pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var moduli: ModuliSeen = .{};
+    for (pubder_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const pk = PublicKey.fromDer(buf[0..len]) catch continue;
+        accepted += 1;
+        try moduli.add(pk.n);
+    }
+    try testing.expectEqual(pubder_seeds.len - 1, nonempty); // the empty seed
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 2), moduli.n);
+}
+
+// ── SecretKey.fromDer (bare PKCS#1 RSAPrivateKey) ────────────────────────────
+
+// `priv_pkcs1` is a nine-INTEGER SEQUENCE; the offsets below were read off the
+// fixture itself: version 6, n 11..267, e 270..272, d 277..532, p 536..664,
+// q 668..796, dP 800..927, dQ 931..1058, qInv 1062..1190.
+const secder_seeds = [_][]const u8{
+    testkit.fuzz.seed(&kat2048_der.priv_pkcs1), // the real 2048-bit key
+    // version 1 = multi-prime (`otherPrimeInfos`), which this parser refuses
+    // rather than misreading as a two-prime key.
+    testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 6, 0x01)),
+    // ⭐ One octet changed inside p, and one inside q. These two are not
+    // symmetric, and that asymmetry is the point:
+    //   - a corrupted **p** is REFUSED (`InvalidPrivateKey`). qInv is derived
+    //     by Fermat inversion q^(p-2) mod p, which is only an inverse when p
+    //     is prime, so the `qInv·q ≡ 1 (mod p)` self-check fails. That check
+    //     carries the comment "catches a non-prime p sneaking past" and,
+    //     before this corpus, nothing in the module ever handed it a
+    //     non-prime p — the branch was written and never executed;
+    //   - a corrupted **q** goes through, to a different modulus, because p
+    //     is still prime and the derivation is sound over a composite q.
+    testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 600, 0x03)),
+    testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 700, 0x03)),
+    // ⭐ One octet changed inside dP. This one must come out as the SAME key:
+    // `fromDer` takes only p, q and e and re-derives n/d/dP/dQ/qInv rather
+    // than trusting the on-disk copies, so a corrupted CRT exponent is
+    // discarded, not used. Measured here rather than asserted in prose.
+    testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 900, 0x03)),
+    // Outer length one octet too long.
+    testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs1, 3, 0x01)),
+    // Truncated mid-modulus.
+    testkit.fuzz.seed(kat2048_der.priv_pkcs1[0..300]),
+    // A PKCS#8 wrapper handed to the bare-PKCS#1 parser: the confusion this
+    // function exists to refuse.
+    testkit.fuzz.seed(&kat2048_der.priv_pkcs8),
+    testkit.fuzz.seed(""),
+};
+
 fn fuzzSecretKeyFromDer(_: void, smith: *std.testing.Smith) !void {
-    var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const sk = SecretKey.fromDer(buf[0..len]) catch return;
-    _ = sk;
+    // ⛔ 2048 because the module's own 2048-bit PKCS#1 private key is 1191
+    // octets. With the old 1024-octet buffer no real private key could ever
+    // have passed through this harness: `Smith.slice` checks the declared
+    // length against `rangeAtMost(0, buf.len)` and falls back to the range
+    // minimum, so an over-long seed reads back as the EMPTY one.
+    var buf: [2048]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    var sk = SecretKey.fromDer(buf[0..len]) catch return;
+    defer sk.deinit();
+    std.mem.doNotOptimizeAway(sk.n.bits());
 }
 
 test "fuzz: SecretKey.fromDer never panics" {
-    try testing.fuzz({}, fuzzSecretKeyFromDer, .{});
+    try testing.fuzz({}, fuzzSecretKeyFromDer, .{ .corpus = &secder_seeds });
 }
 
+test "corpus: SecretKey.fromDer seeds reach the parser, counts pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var moduli: ModuliSeen = .{};
+    for (secder_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [2048]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var sk = SecretKey.fromDer(buf[0..len]) catch continue;
+        defer sk.deinit();
+        accepted += 1;
+        try moduli.add(sk.n);
+    }
+    // Measured 2026-09-07: 0 non-empty / 0 accepted / 0 distinct before,
+    // 8 / 3 / 2 after. The `accepted` and `distinct` gap is the p-perturbation
+    // being refused by the non-prime-p self-check and the dP-perturbation
+    // coming back as the same key.
+    try testing.expectEqual(secder_seeds.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 2), moduli.n);
+}
+
+// ── fromPkcs8 (PrivateKeyInfo wrapper) ───────────────────────────────────────
+
+// `priv_pkcs8` is `30 82 04 bd | 02 01 00 | 30 0d <rsaEncryption AlgId> |
+// 04 82 04 a7 <the priv_pkcs1 blob>`, so the inner key starts at index 26 and
+// the algorithm OID's last octet is index 24.
+const pkcs8_seeds = [_][]const u8{
+    testkit.fuzz.seed(&kat2048_der.priv_pkcs8), // the real PKCS#8 key
+    // The algorithm OID's final octet changed: a well-formed PrivateKeyInfo
+    // for something that is not rsaEncryption, which must be refused before
+    // the inner blob is looked at.
+    testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs8, 24, 0x02)),
+    // One octet inside the wrapped p.
+    testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs8, 726, 0x03)),
+    // The OCTET STRING length one octet short of its content.
+    testkit.fuzz.seed(perturbed(&kat2048_der.priv_pkcs8, 25, 0x01)),
+    // Truncated inside the wrapper.
+    testkit.fuzz.seed(kat2048_der.priv_pkcs8[0..40]),
+    // A bare PKCS#1 key with no wrapper: the confusion this function refuses.
+    testkit.fuzz.seed(&kat2048_der.priv_pkcs1),
+    testkit.fuzz.seed(""),
+};
+
 fn fuzzFromPkcs8(_: void, smith: *std.testing.Smith) !void {
-    var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const sk = fromPkcs8(buf[0..len]) catch return;
-    _ = sk;
+    // ⛔ 2048: the PKCS#8 form of the module's own 2048-bit key is 1217
+    // octets, so 1024 could not carry it (see `fuzzSecretKeyFromDer`).
+    var buf: [2048]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    var sk = fromPkcs8(buf[0..len]) catch return;
+    defer sk.deinit();
+    std.mem.doNotOptimizeAway(sk.n.bits());
 }
 
 test "fuzz: fromPkcs8 never panics" {
-    try testing.fuzz({}, fuzzFromPkcs8, .{});
+    try testing.fuzz({}, fuzzFromPkcs8, .{ .corpus = &pkcs8_seeds });
 }
 
+test "corpus: fromPkcs8 seeds reach the parser, counts pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var moduli: ModuliSeen = .{};
+    for (pkcs8_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [2048]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var sk = fromPkcs8(buf[0..len]) catch continue;
+        defer sk.deinit();
+        accepted += 1;
+        try moduli.add(sk.n);
+    }
+    try testing.expectEqual(pkcs8_seeds.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try testing.expectEqual(@as(usize, 2), moduli.n);
+}
+
+// ── PublicKey.fromPem ────────────────────────────────────────────────────────
+
+const pubpem_seeds = [_][]const u8{
+    testkit.fuzz.seed(kat2048_pem.pub_spki), // -----BEGIN PUBLIC KEY-----
+    testkit.fuzz.seed(kat2048_pem.pub_pkcs1), // -----BEGIN RSA PUBLIC KEY-----
+    // A base64 octet changed inside the body: the block still decodes, so this
+    // lands in `fromDer` with a modulus one bit-group off.
+    testkit.fuzz.seed(perturbed(kat2048_pem.pub_spki, 120, 0x04)),
+    // A private-key label, which `fromPem` must refuse rather than route.
+    // ⚠ Deliberately a stub and not the real `kat2048_pem.priv_pkcs8`: that
+    // one is 1705 octets against this harness's 1024-octet buffer, so it would
+    // read back EMPTY and quietly become a second copy of the empty seed. The
+    // guard's `nonempty` count is what caught it.
+    testkit.fuzz.seed("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"),
+    // Base64 with a character outside the alphabet.
+    testkit.fuzz.seed("-----BEGIN PUBLIC KEY-----\n!!!!not base64!!!!\n-----END PUBLIC KEY-----\n"),
+    // A BEGIN with no END.
+    testkit.fuzz.seed("-----BEGIN PUBLIC KEY-----\nAAAA"),
+    // A label longer than `max_pem_label_len`.
+    testkit.fuzz.seed("-----BEGIN AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-----\nAAAA\n-----END\n"),
+    testkit.fuzz.seed(""),
+};
+
 fn fuzzPublicKeyFromPem(_: void, smith: *std.testing.Smith) !void {
+    // 1024 against a 452-octet PEM public key; the PRIVATE forms are ~1700 and
+    // belong to `fuzzSecretKeyFromPem`, which sizes its buffer for them.
     var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     const pk = PublicKey.fromPem(buf[0..len]) catch return;
-    _ = pk;
+    std.mem.doNotOptimizeAway(pk.n.bits());
 }
 
 test "fuzz: PublicKey.fromPem never panics" {
-    try testing.fuzz({}, fuzzPublicKeyFromPem, .{});
+    try testing.fuzz({}, fuzzPublicKeyFromPem, .{ .corpus = &pubpem_seeds });
 }
 
+test "corpus: PublicKey.fromPem seeds reach the parser, counts pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var moduli: ModuliSeen = .{};
+    for (pubpem_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const pk = PublicKey.fromPem(buf[0..len]) catch continue;
+        accepted += 1;
+        try moduli.add(pk.n);
+    }
+    try testing.expectEqual(pubpem_seeds.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 2), moduli.n);
+}
+
+// ── SecretKey.fromPem ────────────────────────────────────────────────────────
+
+const secpem_seeds = [_][]const u8{
+    testkit.fuzz.seed(kat2048_pem.priv_pkcs1), // -----BEGIN RSA PRIVATE KEY-----
+    testkit.fuzz.seed(kat2048_pem.priv_pkcs8), // -----BEGIN PRIVATE KEY-----
+    // A base64 octet changed inside the PKCS#1 body, at the text offset that
+    // lands in **p** (DER octet ~567), so it reaches the non-prime-p refusal
+    // through the PEM route as well. ⚠ The obvious offset 700 lands in `d`,
+    // which `fromDer` re-derives and therefore ignores, so that seed parsed to
+    // the very same key — a perturbation has to be aimed at a field the parser
+    // actually consumes or it is just a second copy of the fixture.
+    testkit.fuzz.seed(perturbed(kat2048_pem.priv_pkcs1, 800, 0x04)),
+    // The two labels this function refuses by name rather than by content:
+    // PKCS#8 encryption is out of scope and OpenSSH belongs to `fromOpenSSH`.
+    testkit.fuzz.seed("-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n"),
+    testkit.fuzz.seed(openssh_fixture_plain),
+    // A public-key block where a private one is expected.
+    testkit.fuzz.seed(kat2048_pem.pub_spki),
+    // Truncated: BEGIN line and part of the body, no END.
+    testkit.fuzz.seed(kat2048_pem.priv_pkcs8[0..200]),
+    testkit.fuzz.seed(""),
+};
+
 fn fuzzSecretKeyFromPem(_: void, smith: *std.testing.Smith) !void {
-    var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const sk = SecretKey.fromPem(buf[0..len]) catch return;
-    _ = sk;
+    // ⛔ 2048: the module's own PKCS#8 PEM private key is 1705 octets and the
+    // PKCS#1 one 1676. With the old 1024-octet buffer neither could pass — a
+    // seed longer than the buffer reads back EMPTY, silently.
+    var buf: [2048]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    var sk = SecretKey.fromPem(buf[0..len]) catch return;
+    defer sk.deinit();
+    std.mem.doNotOptimizeAway(sk.n.bits());
 }
 
 test "fuzz: SecretKey.fromPem never panics" {
-    try testing.fuzz({}, fuzzSecretKeyFromPem, .{});
+    try testing.fuzz({}, fuzzSecretKeyFromPem, .{ .corpus = &secpem_seeds });
 }
 
+test "corpus: SecretKey.fromPem seeds reach the parser, counts pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var moduli: ModuliSeen = .{};
+    for (secpem_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [2048]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var sk = SecretKey.fromPem(buf[0..len]) catch continue;
+        defer sk.deinit();
+        accepted += 1;
+        try moduli.add(sk.n);
+    }
+    try testing.expectEqual(secpem_seeds.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try testing.expectEqual(@as(usize, 1), moduli.n);
+}
+
+// ── fromOpenSSH ──────────────────────────────────────────────────────────────
+
+/// An OpenSSH corpus entry: the armoured text, then a SECOND length-prefixed
+/// field carrying the passphrase.
+///
+/// ⛔ The passphrase is not decoration and it cannot be a knob drawn after the
+/// bytes. `fromOpenSSH(text, "")` — what this harness used to hardcode — stops
+/// at the `bcrypt` KDF for every encrypted key, so the aes256-ctr/aes256-cbc
+/// halves of the parser, which are the part with a from-scratch Blowfish under
+/// them, were unreachable from the harness by construction. Carrying it in the
+/// seed keeps the draw byte-first (the gate's requirement) AND leaves the
+/// fuzzer driving it.
+fn opensshSeed(store: []u8, text: []const u8, passphrase: []const u8) []const u8 {
+    const head = testkit.fuzz.seedInto(store, text);
+    const tail = testkit.fuzz.seedInto(store[head.len..], passphrase);
+    return store[0 .. head.len + tail.len];
+}
+
+const OpensshCorpus = struct {
+    store: [16384]u8 = undefined,
+    used: usize = 0,
+    entries: [9][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *OpensshCorpus, text: []const u8, passphrase: []const u8) void {
+        const sd = opensshSeed(self.store[self.used..], text, passphrase);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *OpensshCorpus) []const []const u8 {
+        // The unencrypted key, which needs no passphrase.
+        self.push(openssh_fixture_plain, "");
+        // aes256-ctr and aes256-cbc with the passphrase ssh-keygen was given:
+        // bcrypt-pbkdf, then the cipher, then the decrypted private section.
+        self.push(openssh_fixture_ctr, "hunter2");
+        self.push(openssh_fixture_cbc, "hunter2");
+        // The same key with the WRONG passphrase: the KDF and the cipher still
+        // run, and the check-int mismatch is what has to catch it.
+        self.push(openssh_fixture_ctr, "hunter3");
+        // ⭐ Three one-octet perturbations aimed at three different fields of
+        // the decoded container, which is how this corpus says what the parser
+        // trusts. Offsets read off the fixture: the public blob spans binary
+        // octets 43..321 and the private section 326..1293, with n at 349..605,
+        // d at 617..872 and p at 1009..1137.
+        //   - inside the PUBLIC copy of the modulus (~269): must still parse,
+        //     to the same key — the blob is documented as skipped;
+        self.push(perturbed(openssh_fixture_plain, 400, 0x04), "");
+        //   - inside the private `d` (~861): must still parse, to the same
+        //     key — `d` is re-derived from p/q/e and never trusted;
+        self.push(perturbed(openssh_fixture_plain, 1200, 0x04), "");
+        //   - inside the private `n` (~500): must be REFUSED, by the one
+        //     cross-check `parsePrivateSection` performs (n on disk == p*q).
+        self.push(perturbed(openssh_fixture_plain, 711, 0x04), "");
+        // A PKCS#8 PEM block, i.e. the right armour and the wrong label.
+        self.push(kat2048_pem.priv_pkcs8, "");
+        // The input this target ran, and only ran, before it had a corpus.
+        self.push("", "");
+        return self.entries[0..self.n];
+    }
+};
+
 fn fuzzFromOpenSSH(_: void, smith: *std.testing.Smith) !void {
-    var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const sk = fromOpenSSH(buf[0..len], "") catch return;
-    _ = sk;
+    // ⛔ 2560: the module's own OpenSSH fixtures are 1824–1877 octets, so the
+    // old 1024-octet buffer could not carry one — an over-long seed reads back
+    // as the EMPTY one and says nothing about it.
+    var buf: [2560]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    var pass: [64]u8 = undefined;
+    const plen: usize = smith.slice(&pass);
+    var sk = fromOpenSSH(buf[0..len], pass[0..plen]) catch return;
+    defer sk.deinit();
+    std.mem.doNotOptimizeAway(sk.n.bits());
 }
 
 test "fuzz: fromOpenSSH never panics" {
-    try testing.fuzz({}, fuzzFromOpenSSH, .{});
+    var corpus: OpensshCorpus = .{};
+    try testing.fuzz({}, fuzzFromOpenSSH, .{ .corpus = corpus.build() });
+}
+
+test "corpus: fromOpenSSH seeds reach the parser, counts pinned" {
+    // ⭐ Built from the SAME place the harness builds it; a guard measuring a
+    // different corpus is not a guard.
+    var corpus: OpensshCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var with_pass: usize = 0;
+    var accepted: usize = 0;
+    var moduli: ModuliSeen = .{};
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [2560]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var pass: [64]u8 = undefined;
+        const plen: usize = smith.slice(&pass);
+        if (plen != 0) with_pass += 1;
+        var sk = fromOpenSSH(buf[0..len], pass[0..plen]) catch continue;
+        defer sk.deinit();
+        accepted += 1;
+        try moduli.add(sk.n);
+    }
+    // `with_pass` is the second number the collapse cannot produce: it counts
+    // the seeds that carry a passphrase at all, and before this the harness
+    // passed `""` on every round, so the bcrypt/AES half of `fromOpenSSH` was
+    // structurally out of reach.
+    //
+    // Measured 2026-09-07: 0 non-empty / 0 with a passphrase / 0 accepted
+    // before — the target's only ever input was `fromOpenSSH("", "")` — and
+    // 8 / 3 / 5 after. `distinct` stays 1 on purpose: every perturbation that
+    // WOULD change the modulus is caught by the `n == p*q` cross-check, so the
+    // five accepted seeds are five routes to the same key (plain, aes256-ctr,
+    // aes256-cbc, and the two fields the format lets the file lie about).
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 3), with_pass);
+    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 1), moduli.n);
 }

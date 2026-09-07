@@ -21,6 +21,9 @@
 //! size no matter which index was queried.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 /// Every error this module can return. All but one are length/size
 /// disagreements or out-of-range parameters; the exception is
@@ -172,13 +175,66 @@ test "SELF: wordsPerRecord rounds up and cannot overflow" {
     );
 }
 
+/// Seeds for `fuzzDatabaseInit`, laid out the way its draws read them: a
+/// `testkit.fuzz` slice seed carrying the database bytes, then an eight-octet
+/// little-endian word carrying `record_len`.
+///
+/// ⛔ Built here rather than quoted as a literal because nothing about the
+/// database CONTENT matters to `init` — only its length, against a
+/// `record_len` chosen independently of it. The corpus is therefore a list of
+/// geometries, and a geometry cannot be written as a byte string.
+const DbCorpus = struct {
+    scratch: [256]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [9][]const u8 = undefined,
+    record_lens: [9]usize = undefined,
+    n: usize = 0,
+
+    fn push(self: *DbCorpus, bytes_len: usize, record_len: usize) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], self.scratch[0..bytes_len]);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], record_len, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.record_lens[self.n] = record_len;
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    fn build(self: *DbCorpus) []const []const u8 {
+        for (&self.scratch, 0..) |*b, i| b.* = @truncate(i);
+        // Accepted geometries, chosen so `count()` differs across them — the
+        // number the guard pins, and the one an empty input cannot make.
+        self.push(64, 8); // 8 records
+        self.push(12, 4); // the geometry the value test above uses
+        self.push(255, 1); // 255 one-octet records
+        self.push(256, 256); // a single record filling the buffer
+        self.push(240, 16); // 15 records
+        // Refusals, one per branch of `init`.
+        self.push(12, 5); // RaggedDatabase
+        self.push(0, 4); // EmptyDatabase
+        self.push(12, 0); // ZeroRecordLen — and see the harness's comment:
+        //                   this is the ONE input the target used to run
+        self.push(16, 1 << 20); // record_len far past the buffer: RaggedDatabase
+        return self.entries[0..self.n];
+    }
+};
+
 fn fuzzDatabaseInit(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length: `bytes` eats `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM.
+    const len: usize = smith.slice(&buf);
     // record_len is fully attacker-chosen, INCLUDING 0 (the division-by-zero
     // shape) and values far larger than the buffer.
-    const record_len: usize = smith.valueRangeAtMost(u32, 0, 1 << 20);
+    //
+    // ⛔ `smith.value(u64)` and a `%`, not `valueRangeAtMost(u32, 0, 1 << 20)`.
+    // A ranged draw placed after the byte draw is the range minimum on every
+    // replay, so `record_len` was **0 every time** — `Database.init` returned
+    // `ZeroRecordLen` before it looked at anything else, and `count`, `record`,
+    // `domainBitsFor` and `wordsPerRecord` below it had never once executed in
+    // this harness. Measured 2026-09-07: 0 of 9 seeds accepted before, 5 after.
+    const record_len: usize = @intCast(smith.value(u64) % ((1 << 20) + 1));
     const db = Database.init(buf[0..len], record_len) catch return;
     // Every accessor must be total on a Database that init accepted.
     const n = db.count();
@@ -187,13 +243,91 @@ fn fuzzDatabaseInit(_: void, smith: *std.testing.Smith) !void {
     _ = wordsPerRecord(db.record_len, 4);
 }
 test "fuzz Database.init never panics" {
-    try std.testing.fuzz({}, fuzzDatabaseInit, .{});
+    var corpus: DbCorpus = .{};
+    try std.testing.fuzz({}, fuzzDatabaseInit, .{ .corpus = corpus.build() });
+}
+
+test "corpus: every Database.init seed reaches init, and the counts are pinned" {
+    // ⭐ Built from the SAME place the harness builds it. `records` is the
+    // second number, the one `accepted` cannot stand in for: `init` refuses
+    // every degenerate input here, but a corpus that silently collapsed to the
+    // empty seed would still report a consistent-looking `accepted` of 0 — and
+    // `records` is what only a seed's own declared geometry can move.
+    var corpus: DbCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var records: usize = 0;
+    var lens_ok: usize = 0;
+    for (entries, corpus.record_lens[0..corpus.n]) |sd, want_rl| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const record_len: usize = @intCast(smith.value(u64) % ((1 << 20) + 1));
+        if (record_len == want_rl) lens_ok += 1;
+        const db = Database.init(buf[0..len], record_len) catch continue;
+        accepted += 1;
+        records += db.count();
+    }
+    try std.testing.expectEqual(entries.len - 1, nonempty); // the 0-byte seed
+    try std.testing.expectEqual(entries.len, lens_ok);
+    try std.testing.expectEqual(@as(usize, 5), accepted);
+    try std.testing.expectEqual(@as(usize, 282), records);
 }
 
 fn fuzzDomainBitsFor(_: void, smith: *std.testing.Smith) !void {
     const count: usize = smith.value(usize);
     _ = domainBitsFor(count) catch return;
 }
+
+/// `smith.value(usize)` reads eight octets straight off the input with no
+/// length header, so a seed here is exactly those eight octets — no
+/// `testkit.fuzz.seed` wrapper, which would be read as a length and shift
+/// everything by four.
+///
+/// ⚠ The draw was never the problem for this target (a full-width `value` is
+/// faithful); the CORPUS was. With none, the lane ran one input for ever — the
+/// empty one, i.e. `domainBitsFor(0)`, the single argument that returns before
+/// the loop is entered.
+/// ⚠ `usize`, not `u64`: `value(usize)` reads `@sizeOf(usize)` octets, so a
+/// `u64` seed would be four octets of tail on a 32-bit target and the pinned
+/// counts below would be false there rather than failing.
+fn dbfSeed(comptime count: usize) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(usize, count));
+    }.bytes;
+}
+
+const dbf_seeds = [_][]const u8{
+    dbfSeed(0), // EmptyDatabase — the only input this target used to run
+    dbfSeed(1), // the 1-bit floor
+    dbfSeed(2),
+    dbfSeed(3), // the first count that rounds up
+    dbfSeed(256),
+    dbfSeed(257),
+    dbfSeed(1 << 31), // the largest addressable domain
+    dbfSeed((1 << 31) + 1), // DatabaseTooLarge, one past it
+    dbfSeed(std.math.maxInt(usize)),
+};
+
 test "fuzz domainBitsFor never panics" {
-    try std.testing.fuzz({}, fuzzDomainBitsFor, .{});
+    try std.testing.fuzz({}, fuzzDomainBitsFor, .{ .corpus = &dbf_seeds });
+}
+
+test "corpus: every domainBitsFor seed arrives as written, and the sum is pinned" {
+    // The second number is the sum of the domains actually returned: an empty
+    // input produces `EmptyDatabase` and contributes nothing, so a sum of 0
+    // would mean the corpus never arrived.
+    var accepted: usize = 0;
+    var bits_total: usize = 0;
+    for (dbf_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        const count: usize = smith.value(usize);
+        const bits = domainBitsFor(count) catch continue;
+        accepted += 1;
+        bits_total += bits;
+    }
+    try std.testing.expectEqual(@as(usize, 6), accepted);
+    try std.testing.expectEqual(@as(usize, 52), bits_total);
 }
