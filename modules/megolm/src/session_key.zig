@@ -369,7 +369,9 @@ test "corpus: the session-key seeds drive the length sweep, and the counts are p
     var threaded = testIo();
     defer threaded.deinit();
     var corpus: SessionKeyCorpus = .{};
-    var lengths: [4]bool = @splat(false);
+    var lengths = [_]usize{0} ** 4;
+    var versions = [_]usize{0} ** 3;
+    var b64_corrupted: usize = 0;
     var exports: usize = 0;
     var shares: usize = 0;
     var len_total: usize = 0;
@@ -378,7 +380,7 @@ test "corpus: the session-key seeds drive the length sweep, and the counts are p
         var buf: [320]u8 = undefined;
         _ = smith.slice(&buf);
         const mode = smith.value(u64) % 4;
-        lengths[@intCast(mode)] = true;
+        lengths[@intCast(mode)] += 1;
         const len: usize = switch (mode) {
             0 => export_len,
             1 => share_len,
@@ -391,7 +393,9 @@ test "corpus: the session-key seeds drive the length sweep, and the counts are p
         };
         len_total += len;
         if (len > 0) {
-            buf[0] = switch (smith.value(enum { share, exp, any })) {
+            const which = smith.value(enum { share, exp, any });
+            versions[@intFromEnum(which)] += 1;
+            buf[0] = switch (which) {
                 .share => share_version,
                 .exp => export_version,
                 .any => smith.value(u8),
@@ -399,12 +403,29 @@ test "corpus: the session-key seeds drive the length sweep, and the counts are p
         }
         if (ExportedSessionKey.decode(buf[0..len])) |_| exports += 1 else |_| {}
         if (SessionKey.decode(buf[0..len])) |_| shares += 1 else |_| {}
+        // ⚠ The last three knobs, drawn after everything above. Mirrored here
+        // rather than left unmeasured: `boolWeighted(3, 1)` is the one that
+        // decides whether `base64Decode`'s own reject path is ever entered.
+        const b64 = try base64Encode(testing.allocator, buf[0..len]);
+        defer testing.allocator.free(b64);
+        if (b64.len > 0 and smith.boolWeighted(3, 1)) {
+            b64[smith.index(b64.len)] = smith.value(u8);
+            b64_corrupted += 1;
+        }
+        _ = ExportedSessionKey.fromBase64(testing.allocator, b64) catch {};
+        _ = SessionKey.fromBase64(testing.allocator, b64) catch {};
     }
     // ⛔ Before this, `mode` was always `.exact_export` and `len` always 165 —
     // `len_total` would have been 10 * 165 = 1650 with all-zero content, and
     // neither decoder would ever have accepted anything (the all-zero
     // `signing_key` is not a canonical Ed25519 point).
-    for (lengths) |l| try testing.expect(l);
+    // ⛔ Pinned as histograms, not `expect(seen)`. A boolean cannot tell an
+    // arm that ran once from one that ran nine times, and it cannot notice a
+    // seed moving from one arm to another — which is exactly the failure a
+    // corpus guard is here to catch. Measured 2026-09-08.
+    try testing.expectEqualSlices(usize, &[_]usize{ 3, 4, 2, 1 }, &lengths);
+    try testing.expectEqualSlices(usize, &[_]usize{ 5, 4, 1 }, &versions);
+    try testing.expectEqual(@as(usize, 1), b64_corrupted);
     try testing.expectEqual(@as(usize, 2), exports);
     try testing.expectEqual(@as(usize, 1), shares);
     try testing.expectEqual(@as(usize, 2041), len_total);

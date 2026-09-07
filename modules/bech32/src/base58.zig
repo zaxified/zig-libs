@@ -452,15 +452,48 @@ test "p2wpkhWitnessProgram is exactly hash160(pubkey)" {
 // pastes in — text with no structural guarantee (leading '1's, out-of-
 // alphabet characters, and the checksum are all attacker/user chosen).
 
+/// A corpus entry in the format `Smith.slice` actually reads — a little-endian
+/// `u32` length, then the string — followed by one `u64` word per octet the
+/// charset knob in `fuzzDecode` reads afterwards (`1` bends that octet into
+/// the alphabet, `0` leaves it alone, and once the words run out every
+/// remaining draw is the weight minimum, i.e. `false`).
+///
+/// ⛔ Two defects were measured here on 2026-09-08, and both were silent.
+/// (1) The corpus was a list of BARE string literals. `Smith.slice` reads a
+/// little-endian `u32` length before the bytes, so `p2pkh_vector_address`
+/// reached `decode` as `"Z9tcN4rm9KBzDn7KprQz87SZ26SAMH"` — every seed arrived
+/// minus its own first four octets, and `checkDecode` therefore **accepted
+/// nothing at all**: the checksum path this harness names in its own title
+/// had never run on a valid envelope (measured: 2 of 4 seeds decoded, 43
+/// payload octets, 0 checksums verified).
+/// (2) With the seed consumed by the byte draw, `boolWeighted(1, 3)` returned
+/// its weight minimum: the loop ran 406 times over the whole corpus and bent
+/// **0** octets, so the charset-bending branch had never executed once.
+fn bendSeed(comptime raw: []const u8, comptime bends: []const u64) []const u8 {
+    return &struct {
+        const words = blk: {
+            var w: [bends.len * 8]u8 = undefined;
+            for (bends, 0..) |b, i| std.mem.writeInt(u64, w[i * 8 ..][0..8], b, .little);
+            break :blk w;
+        };
+        const bytes = std.mem.toBytes(@as(u32, raw.len)) ++ raw[0..raw.len].* ++ words;
+    }.bytes;
+}
+
+const decode_seeds = [_][]const u8{
+    bendSeed(p2pkh_vector_address, &.{}), // the module's real P2PKH address
+    bendSeed(&([_]u8{'1'} ** max_encoded_len), &.{}), // the 180-'1' boundary input
+    bendSeed(&([_]u8{'1'} ** (max_encoded_len + 1)), &.{}), // InputTooLong, one over
+    bendSeed("1111111111111111111114oLvT2", &.{}), // leading-zero run + checksum
+    // The charset knob, one word per octet: eight octets that are NOT in the
+    // alphabet, every one of them bent — the pair a tail-less seed cannot
+    // produce, and the only input that reaches the bending branch at all.
+    bendSeed(&[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 }, &([_]u64{1} ** 8)),
+    bendSeed("", &.{}), // and the input a corpus-less target runs for ever
+};
+
 test "fuzz: decode/checkDecode never panic on arbitrary text" {
-    // Seeds: a real address, the 180-'1' boundary input and a near-miss
-    // of it — without a corpus the harness saw one empty string.
-    try testing.fuzz({}, fuzzDecode, .{ .corpus = &.{
-        p2pkh_vector_address,
-        &([_]u8{'1'} ** max_encoded_len),
-        &([_]u8{'1'} ** (max_encoded_len + 1)),
-        "1111111111111111111114oLvT2",
-    } });
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
@@ -474,4 +507,47 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var out: [max_payload_len]u8 = undefined;
     _ = decode(buf[0..len], &out) catch return;
     _ = checkDecode(buf[0..len], &out) catch return;
+}
+
+test "corpus: every base58 seed reaches the decoder, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment.
+    //
+    // ⛔ Not `decoded > 0`: `decode("")` succeeds — the empty string is a legal
+    // (empty) payload — so an acceptance guard would have read as a pass over
+    // the corpus that reached nothing. `payload_octets` is the number the
+    // empty input cannot move, and `bent` is the one the tail-less corpus
+    // cannot move.
+    var nonempty: usize = 0;
+    var bent: usize = 0;
+    var decoded: usize = 0;
+    var payload_octets: usize = 0;
+    var check_decoded: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [max_encoded_len + 8]u8 = undefined;
+        const len = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        for (buf[0..len]) |*c| {
+            if (smith.boolWeighted(1, 3)) {
+                c.* = alphabet[c.* % alphabet.len];
+                bent += 1;
+            }
+        }
+        var out: [max_payload_len]u8 = undefined;
+        if (decode(buf[0..len], &out)) |p| {
+            decoded += 1;
+            payload_octets += p.len;
+        } else |_| {}
+        if (checkDecode(buf[0..len], &out)) |_| {
+            check_decoded += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len - 1, nonempty); // all but the empty string
+    // Measured 2026-09-08. Before: every seed four octets short of the string
+    // it was written as — 2 decoded, 43 payload octets, 0 bent, 0 checksums
+    // verified. After:
+    try testing.expectEqual(@as(usize, 8), bent);
+    try testing.expectEqual(@as(usize, 4), decoded);
+    try testing.expectEqual(@as(usize, 56), payload_octets);
+    try testing.expectEqual(@as(usize, 2), check_decoded);
 }

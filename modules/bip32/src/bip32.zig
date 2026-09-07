@@ -699,28 +699,53 @@ const path_seeds = [_][]const u8{
     pathSeed("m/0/"), // InvalidPathSegment: trailing slash
     pathSeed("/m/0"), // InvalidPathSegment: leading slash
     pathSeed("m" ++ "/0" ** 33), // PathTooDeep: 33 segments against max_path_depth = 32
+    // The charset knob, one `u64` word per octet it is meant to decide.
+    // ⛔ Measured 2026-09-08: over the fifteen seeds above, `boolWeighted(1, 4)`
+    // was drawn 159 times and returned `true` **zero** times, because the byte
+    // draw leaves nothing behind and an exhausted `Smith` returns the weight
+    // minimum. The alphabet-bending loop had never executed its body. These
+    // two seeds are the only inputs in the ordinary lane that reach it.
+    bentPathSeed(&[_]u8{ 14, 10, 0, 11, 10, 1 }, &([_]u64{1} ** 6)), // -> "m/0'/1"
+    bentPathSeed("X/0", &.{1}), // only the FIRST octet bent: 'X' -> '8', rest verbatim
     pathSeed(""), // the ONE input the collapsed harness ever ran
 };
+
+/// `pathSeed` plus a tail of `u64` words for the per-octet charset knob in
+/// `fuzzParsePath` (`1` bends that octet into `path_alphabet`, `0` leaves it
+/// alone; once the words run out every remaining draw is the weight minimum).
+fn bentPathSeed(comptime raw: []const u8, comptime bends: []const u64) []const u8 {
+    return &struct {
+        const words = blk: {
+            var w: [bends.len * 8]u8 = undefined;
+            for (bends, 0..) |b, i| std.mem.writeInt(u64, w[i * 8 ..][0..8], b, .little);
+            break :blk w;
+        };
+        const bytes = std.mem.toBytes(@as(u32, raw.len)) ++ raw[0..raw.len].* ++ words;
+    }.bytes;
+}
 
 test "fuzz: parsePath never panics on arbitrary text" {
     try testing.fuzz({}, fuzzParsePath, .{ .corpus = &path_seeds });
 }
 
+const path_alphabet = "0123456789/'hHmM";
+
 fn fuzzParsePath(_: void, smith: *std.testing.Smith) !void {
-    const alphabet = "0123456789/'hHmM";
     var buf: [96]u8 = undefined;
     // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
     // length — same defect and same measurement as `fuzzParseExtended` above.
     // Measured 2026-09-07 over the corpus above: **0 of 15 seeds non-empty and
     // 0 paths parsed before, 14 of 15 non-empty and 5 parsed after.**
     const len: usize = smith.slice(&buf);
-    // ⚠ A `--fuzz`-only aid: on a corpus replay `Smith` is already drained by
-    // the draw above, so `boolWeighted` is false throughout and every seed
-    // reaches `parsePath` verbatim — which is what a corpus of real paths
-    // wants. Under `--fuzz` the fuzzer still biases raw bytes toward the
-    // path alphabet.
+    // ⚠ Under `--fuzz` this biases raw bytes toward the path alphabet. On a
+    // corpus replay `Smith` is drained by the draw above, so the knob is the
+    // weight minimum — `false` — unless the seed carries a `u64` word per
+    // octet after the frame. That is deliberate: a seed that IS a real path
+    // wants to reach `parsePath` verbatim, and the two `bentPathSeed` entries
+    // are there so the loop body is not dead in the ordinary lane. Measured
+    // 2026-09-08: 0 bent octets in 159 draws before, 7 in 168 after.
     for (buf[0..len]) |*c| {
-        if (smith.boolWeighted(1, 4)) c.* = alphabet[c.* % alphabet.len];
+        if (smith.boolWeighted(1, 4)) c.* = path_alphabet[c.* % path_alphabet.len];
     }
     var out: [max_path_depth]u32 = undefined;
     _ = parsePath(buf[0..len], &out) catch return;
@@ -736,11 +761,20 @@ test "corpus: every path reaches parsePath, and the counts are pinned" {
     var parsed: usize = 0;
     var levels: usize = 0;
     var hardened: usize = 0;
+    var bent: usize = 0;
+    var bend_draws: usize = 0;
     for (path_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [96]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
+        for (buf[0..len]) |*c| {
+            bend_draws += 1;
+            if (smith.boolWeighted(1, 4)) {
+                c.* = path_alphabet[c.* % path_alphabet.len];
+                bent += 1;
+            }
+        }
         var out: [max_path_depth]u32 = undefined;
         if (parsePath(buf[0..len], &out)) |p| {
             parsed += 1;
@@ -754,7 +788,13 @@ test "corpus: every path reaches parsePath, and the counts are pinned" {
     try testing.expectEqual(path_seeds.len - 1, nonempty);
     // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 parsed,
     // 0 levels and 0 hardened indices — one empty string fifteen times.
-    try testing.expectEqual(@as(usize, 5), parsed);
-    try testing.expectEqual(@as(usize, 14), levels);
-    try testing.expectEqual(@as(usize, 8), hardened);
+    try testing.expectEqual(@as(usize, 7), parsed);
+    try testing.expectEqual(@as(usize, 18), levels);
+    try testing.expectEqual(@as(usize, 9), hardened);
+    // ⛔ The knob after the byte draw. Measured 2026-09-08: 0 of 159 draws
+    // returned `true` before the two `bentPathSeed` entries were added, so the
+    // alphabet-bending branch was dead in the ordinary lane. Pinned as a pair
+    // — `bend_draws` moves if a seed is shortened, `bent` if a tail is lost.
+    try testing.expectEqual(@as(usize, 168), bend_draws);
+    try testing.expectEqual(@as(usize, 7), bent);
 }

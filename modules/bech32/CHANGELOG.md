@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **All three fuzz corpora were being read four octets short, so not one
+  published test vector in them had ever been decoded.** A `std.testing.fuzz` corpus entry is
+  not the frame: `Smith.slice` reads a little-endian `u32` length before the bytes, and all
+  three corpora here were bare string literals. Measured: `"a12uel5l"` reached `bech32.decode`
+  as `"el5l"`, `"bc1qw508d6..."` reached `decodeSegwit` without its `bc1` prefix, and
+  `p2pkh_vector_address` reached `base58.decode` without its version byte. `bech32.decode`
+  accepted **0 of 3** seeds, `decodeSegwit` **0 of 3**, and `base58.checkDecode` **0 of 4** —
+  the checksum arithmetic each harness exists to reach was never entered. The seeds now go
+  through a `bendSeed` builder that writes the length header. Each corpus also carries a tail
+  of `u64` words for the per-octet charset knob after the byte draw, which returned its weight
+  minimum on every replay: measured **0 bent octets in 687 draws** across the three targets,
+  i.e. the charset-bending branch had never executed. New corpus-guard tests pin the measured
+  counts (accepted, data symbols/payload octets, bent octets) rather than asserting `> 0`; the
+  three refusal vectors the value tests pin (`MixedCase`, `DataTooShort`, `InvalidDataChar`)
+  and a testnet HRP mismatch joined the corpora. No behaviour change outside tests.
+
 - **2026-09-06** — **`base58` wipes its scratch buffers, and the guards the 2026-09-06 audit
   found untested now have teeth.** Findings A1 H1/H2/M2/M3/M4/L3.
   - **H2 (zeroization):** `encode`'s base-58 digit buffer, `decode`'s byte buffer and both

@@ -196,7 +196,44 @@ const decode_seeds = [_][]const u8{
     seedHex("00" ** 80 ++ "01"), // TooManyItems: 1 transaction claimed, 0 octets behind it
     seedHex("00" ** 80 ++ "01" ++ "41" ** 100), // one claimed tx over 100 junk octets
     seedHex("00" ** 40), // Truncated: the hostile test's cut-off header
+    // The two knobs drawn AFTER the byte draw, one `u64` word each: `1`
+    // enables the bias, then the CompactSize octet the bias writes.
+    // ⛔ Measured 2026-09-08 over the six seeds above: `smith.value(bool)`
+    // returned `true` **0 times** — `Smith.slice` leaves the seed exhausted
+    // and an exhausted draw is the weight minimum — so the bias this harness
+    // documents at length had still never been applied to a single octet.
+    // The first seed is the genesis block with its `01` transaction count
+    // replaced by a multi-octet `0xfd` prefix: it is refused as it stands and
+    // ACCEPTED once the bias rewrites offset 80, which is the only way the
+    // corpus can show the branch does something.
+    biasedSeed(&genesis_bad_count, &.{ 1, 1 }),
+    biasedSeed(&([_]u8{0} ** 80 ++ [_]u8{0xff}), &.{ 1, 0 }), // bias to a legal empty block
+    biasedSeed(&([_]u8{0} ** 80 ++ [_]u8{0x00}), &.{ 0, 0 }), // the knob explicitly OFF
 };
+
+/// The genesis block with its transaction count (the octet right after the
+/// 80-octet header) replaced by `0xfd` — the two-octet CompactSize prefix,
+/// which truncates immediately. `fuzzDecodeBlock`'s bias is the only thing
+/// that can turn it back into a decodable block.
+const genesis_bad_count = blk: {
+    var b = genesis_raw;
+    b[block_header.HEADER_LEN] = 0xfd;
+    break :blk b;
+};
+
+/// `seed` plus a tail of `u64` words for the knobs `fuzzDecodeBlock` draws
+/// after the byte draw. Without the tail those draws return their range
+/// minimum on every replay, which for `value(bool)` is `false`.
+fn biasedSeed(comptime frame: []const u8, comptime words: []const u64) []const u8 {
+    return &struct {
+        const tail = wblk: {
+            var w: [words.len * 8]u8 = undefined;
+            for (words, 0..) |x, i| std.mem.writeInt(u64, w[i * 8 ..][0..8], x, .little);
+            break :wblk w;
+        };
+        const bytes = std.mem.toBytes(@as(u32, frame.len)) ++ frame[0..frame.len].* ++ tail;
+    }.bytes;
+}
 
 test "fuzz: decodeBlock never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzDecodeBlock, .{ .corpus = &decode_seeds });
@@ -242,19 +279,33 @@ test "corpus: every block seed reaches the decoder, and the accepted count is pi
     const allocator = testing.allocator;
     var nonempty: usize = 0;
     var accepted: usize = 0;
+    var txns: usize = 0;
+    var biased: usize = 0;
     for (decode_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [512]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
+        // The same two knobs the harness draws, in the same order.
+        if (len > block_header.HEADER_LEN and smith.value(bool)) {
+            buf[block_header.HEADER_LEN] = smith.valueRangeAtMost(u8, 0, 3);
+            biased += 1;
+        }
         if (decodeBlock(allocator, buf[0..len])) |b| {
             accepted += 1;
             var blk = b;
+            txns += blk.txns.len;
             blk.deinit(allocator);
         } else |_| {}
     }
     try testing.expectEqual(decode_seeds.len, nonempty);
     // Measured 2026-09-07: 0 of 6 seeds non-empty and 0 accepted before the
     // draw was fixed, 6 of 6 non-empty and 2 accepted after.
-    try testing.expectEqual(@as(usize, 2), accepted);
+    // Measured 2026-09-08: the bias knob fired on 0 of those 6. It now fires
+    // on 2 of 9, and `txns` is the number that says the bias did something —
+    // `genesis_bad_count` only reaches a transaction because offset 80 was
+    // rewritten. `accepted` alone cannot see that: an empty block is legal.
+    try testing.expectEqual(@as(usize, 2), biased);
+    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 2), txns);
 }

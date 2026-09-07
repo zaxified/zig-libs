@@ -479,7 +479,41 @@ const decode_seeds = [_][]const u8{
     seedHex("f9beb4d9"), // Truncated: shorter than HEADER_LEN
     seedHex("f9beb4d9" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e3"), // BadChecksum: last checksum octet flipped
     seedHex("f9beb4d9" ++ "76657261636b000000000000" ++ "01000000" ++ "5df6e0e2" ++ "00"), // BadChecksum: a payload the checksum does not cover
+    // The two knobs drawn AFTER the byte draw, one `u64` word each: `1`
+    // enables the magic stamp, then the index into `nets`.
+    // ⛔ Measured 2026-09-08 over the fourteen seeds above: `smith.value(bool)`
+    // returned `true` **0 times**. `Smith.slice` leaves the seed exhausted and
+    // an exhausted draw is the weight minimum, so the stamp had never been
+    // applied to a single envelope. Each of these three is the SAME
+    // magic-less verack, refused by all four networks as it stands and
+    // accepted by exactly one once the stamp runs — which is what makes the
+    // branch visible in the ordinary lane rather than only under `--fuzz`.
+    stampedSeed("00000000" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e2", &.{ 1, 0 }), // -> mainnet
+    stampedSeed("00000000" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e2", &.{ 1, 2 }), // -> regtest
+    stampedSeed("00000000" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e2", &.{ 1, 3 }), // -> signet
+    stampedSeed("f9beb4d9" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e2", &.{ 0, 0 }), // the knob explicitly OFF
 };
+
+/// `seedHex` plus a tail of `u64` words for the knobs `fuzzDecodeMessage`
+/// draws after the byte draw. Without the tail those draws return their range
+/// minimum on every replay, which for `value(bool)` is `false`.
+fn stampedSeed(comptime h: []const u8, comptime words: []const u64) []const u8 {
+    return &struct {
+        const frame = fblk: {
+            if (h.len % 2 != 0) @compileError("odd-length hex seed: " ++ h);
+            @setEvalBranchQuota(@max(1000, 40 * h.len));
+            var out: [h.len / 2]u8 = undefined;
+            _ = std.fmt.hexToBytes(&out, h) catch @compileError("bad hex seed: " ++ h);
+            break :fblk out;
+        };
+        const tail = wblk: {
+            var w: [words.len * 8]u8 = undefined;
+            for (words, 0..) |x, i| std.mem.writeInt(u64, w[i * 8 ..][0..8], x, .little);
+            break :wblk w;
+        };
+        const bytes = std.mem.toBytes(@as(u32, frame.len)) ++ frame ++ tail;
+    }.bytes;
+}
 
 test "fuzz: decodeMessage never panics on arbitrary bytes" {
     try testing.fuzz({}, fuzzDecodeMessage, .{ .corpus = &decode_seeds });
@@ -527,15 +561,27 @@ test "corpus: every envelope seed reaches decodeMessage, and the accepted count 
     // networks: a seed counts once if ANY network takes it.
     var nonempty: usize = 0;
     var accepted: usize = 0;
+    var stamped: usize = 0;
+    var stamped_accepted: usize = 0;
     const nets = [_]Network{ .mainnet, .testnet3, .regtest, .signet };
     for (decode_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [512]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
+        const bytes = buf[0..len];
+        // The same two knobs the harness draws, in the same order.
+        var was_stamped = false;
+        if (bytes.len >= 4 and smith.value(bool)) {
+            const idx = smith.valueRangeAtMost(u8, 0, nets.len - 1);
+            @memcpy(bytes[0..4], &magic(nets[idx]));
+            stamped += 1;
+            was_stamped = true;
+        }
         for (nets) |n| {
-            if (decodeMessage(buf[0..len], n)) |_| {
+            if (decodeMessage(bytes, n)) |_| {
                 accepted += 1;
+                if (was_stamped) stamped_accepted += 1;
                 break;
             } else |_| {}
         }
@@ -544,5 +590,11 @@ test "corpus: every envelope seed reaches decodeMessage, and the accepted count 
     // 6 = the two mainnet frames + the back-to-back pair + one verack each on
     // testnet3, regtest and signet. Measured 2026-09-07: 0 of 14 seeds
     // non-empty and 0 accepted before the draw was fixed, 14 of 14 and 6 after.
-    try testing.expectEqual(@as(usize, 6), accepted);
+    // Measured 2026-09-08: the magic stamp fired on 0 of those 14. It fires on
+    // 3 of 18 now, and `stamped_accepted` is the number that says the stamp
+    // did something — those three seeds carry an all-zero magic no network
+    // takes, so they can only be accepted because the branch rewrote it.
+    try testing.expectEqual(@as(usize, 3), stamped);
+    try testing.expectEqual(@as(usize, 3), stamped_accepted);
+    try testing.expectEqual(@as(usize, 10), accepted);
 }

@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — `fuzzParsePath`'s alphabet-bending loop had never executed its body outside
+  `--fuzz`. The knob is drawn AFTER the byte draw, and `Smith.slice` leaves the seed exhausted,
+  so `boolWeighted(1, 4)` returned its weight minimum: measured **0 `true` in 159 draws** across
+  the fifteen path seeds. Two seeds now carry a `u64` word per octet the knob decides (a fully
+  bent one that becomes `m/0'/1`, and one where only the first octet is bent), taking the corpus
+  to 7 parsed paths / 18 levels / 9 hardened indices and 7 bent octets in 168 draws — all pinned
+  in the corpus guard as exact counts, `bend_draws` beside `bent` so a shortened seed is noticed
+  as well as a lost tail. Tests only.
+
 - **2026-09-07** — Both fuzz targets had only ever parsed the empty string. `fuzzParseExtended`
   and `fuzzParsePath` each drew their text with `smith.bytes(&buf)` and then took a length from
   `smith.valueRangeAtMost(u8, 0, buf.len)`; a ranged `Smith` draw reads eight octets as a
