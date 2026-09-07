@@ -547,10 +547,61 @@ test "decode rejects a ciphertext length claiming more bytes than remain (trunca
 /// decides whether to keep those octets or rebuild a structured frame over
 /// them. A seed is the frame as a `testkit.fuzz` slice seed, then the `u64`
 /// words the knobs read — `1` selects the unstructured arm, `0` the generator.
+/// Writes the octets `messageRound`'s generator arm reads, in the order it
+/// draws them.
+/// ⚠ The widths are not uniform and that is the whole point: a scalar draw
+/// takes EIGHT octets, an `eos` draw takes ONE, and a `slice` draw takes a
+/// `u32` length and then its bytes. A tail written as `u64` words alone goes
+/// out of phase at the first `eos` and every draw after it collapses.
+const TailWriter = struct {
+    buf: [1024]u8 = undefined,
+    n: usize = 0,
+
+    fn word(self: *TailWriter, v: u64) void {
+        std.mem.writeInt(u64, self.buf[self.n..][0..8], v, .little);
+        self.n += 8;
+    }
+
+    /// One `eos` draw that says "keep going", then a whole payload field:
+    /// the tag discriminant, both arbitrary-tag draws, the tag varint's
+    /// padding, and — for the two tags that have a value — the width knob,
+    /// the value and its padding.
+    fn field(self: *TailWriter, kind: u64, tag: u64, narrow: u64, v: u64) void {
+        self.buf[self.n] = 0; // eos: keep going
+        self.n += 1;
+        self.word(kind);
+        self.word(if (kind == 2) tag else 0); // narrow_tag
+        self.word(if (kind == 3) tag else 0); // wide_tag
+        self.word(0); // padding on the tag varint
+        if (tag == 0x08 or tag == 0x12) {
+            self.word(narrow);
+            self.word(v);
+            self.word(0); // padding on the value varint
+        }
+    }
+
+    /// A `smith.slice` draw: the `u32` length, then the bytes.
+    fn bytes(self: *TailWriter, b: []const u8) void {
+        std.mem.writeInt(u32, self.buf[self.n..][0..4], @intCast(b.len), .little);
+        self.n += 4;
+        @memcpy(self.buf[self.n..][0..b.len], b);
+        self.n += b.len;
+    }
+
+    fn stop(self: *TailWriter) void {
+        self.buf[self.n] = 1; // eos: stop
+        self.n += 1;
+    }
+
+    fn slice(self: *TailWriter) []const u8 {
+        return self.buf[0..self.n];
+    }
+};
+
 const MessageCorpus = struct {
-    store: [8 * (4 + 512 + 16 * 8)]u8 = undefined,
+    store: [10 * (4 + 512 + 48 * 8)]u8 = undefined,
     used: usize = 0,
-    entries: [8][]const u8 = undefined,
+    entries: [10][]const u8 = undefined,
     n: usize = 0,
 
     fn push(self: *MessageCorpus, frame: []const u8, words: []const u64) void {
@@ -560,6 +611,24 @@ const MessageCorpus = struct {
             std.mem.writeInt(u64, self.store[at..][0..8], w, .little);
             at += 8;
         }
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    /// The same, with the tail written octet by octet.
+    /// ⛔ Why the generator arm needs this and `push` is not enough: the loop
+    /// condition is `smith.eosWeightedSimple`, and an eos draw consumes ONE
+    /// octet, not eight. After the first field every later `u64` word in a
+    /// `push` tail is read four octets out of phase, which is why the whole
+    /// generator produced exactly ONE field on every seed (measured
+    /// 2026-09-08: `fields = 1`, `tag_kinds = {1, 0, 0, 0}` over the entire
+    /// corpus — the `0x12` ciphertext branch had never run).
+    fn pushRaw(self: *MessageCorpus, frame: []const u8, tail: []const u8) void {
+        const start = self.used;
+        var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
+        @memcpy(self.store[at..][0..tail.len], tail);
+        at += tail.len;
         self.entries[self.n] = self.store[start..at];
         self.used = at;
         self.n += 1;
@@ -588,6 +657,37 @@ const MessageCorpus = struct {
         // The generator arm (word `0`): a real version byte, then an index
         // field and a ciphertext field, then the suffix.
         self.push("", &.{ 0, 1, 0, 0, 0, 0, 0, 0 });
+
+        // ⛔ …except it did not. Measured 2026-09-08, the seed above wrote
+        // exactly ONE field and then ran out: the `eos` draw that opens each
+        // loop iteration eats a single octet, so every `u64` word after it is
+        // read out of phase and collapses to its range minimum. `tag_kinds`
+        // was `{1, 0, 0, 0}` over the whole corpus — the `0x12` CIPHERTEXT
+        // branch, the arbitrary-tag branches and the wide-length knob had
+        // never run at all. These two seeds write the tail octet by octet.
+        var t: TailWriter = .{};
+        t.word(0); // unstructured? no -> the generator
+        t.word(0); // arbitrary version byte? no -> a real one
+        t.field(0, 0x08, 1, 42); // index = 42, narrow (u32) form
+        t.field(1, 0x12, 1, 8); // a ciphertext field, narrow claimed length
+        t.bytes("megolmct"); // ...and the 8 octets it claims
+        t.stop();
+        t.bytes(&([_]u8{0} ** suffix_len)); // the 72-octet MAC + signature
+        self.pushRaw("", t.slice());
+
+        var u: TailWriter = .{};
+        u.word(0);
+        u.word(1); // arbitrary version byte
+        u.word(0x99); // ...this one
+        u.field(0, 0x08, 0, 0x1_0000_0000); // wide index: VarintTooLong
+        u.field(1, 0x12, 0, 0x1_0000_0000); // wide claimed length
+        u.bytes("");
+        u.field(2, 0x20, 0, 0); // tag_kind 2: an arbitrary NARROW tag
+        u.field(3, 0x12_3456, 0, 0); // tag_kind 3: an arbitrary WIDE tag
+        u.stop();
+        u.bytes(&([_]u8{0} ** suffix_len));
+        self.pushRaw("", u.slice());
+
         self.push("", &.{}); // and the input this target used to run for ever
         return self.entries[0..self.n];
     }
@@ -604,33 +704,36 @@ test "corpus: the message seeds drive both arms, and the counts are pinned" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var corpus: MessageCorpus = .{};
-    var unstructured: usize = 0;
-    var decoded: usize = 0;
-    var ciphertext_octets: usize = 0;
+    // ⭐ Driven through `messageRound`, the same function the fuzzer calls, so
+    // the byte-identity oracle and every knob are the harness's own and cannot
+    // drift out of order from a hand-copied replay.
+    var knobs: MessageKnobs = .{};
     for (corpus.build(arena.allocator())) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
-        var buf: [512]u8 = undefined;
-        const n: usize = smith.slice(&buf);
-        if (smith.boolWeighted(1, 7)) unstructured += 1;
-        if (Message.decode(testing.allocator, buf[0..n])) |m| {
-            var mm = m;
-            defer mm.deinit(testing.allocator);
-            decoded += 1;
-            ciphertext_octets += mm.ciphertext.len;
-            // The same byte-identity oracle the harness asserts, over the
-            // seeds that actually reach it — including the non-canonical one.
-            const re = try mm.encode(testing.allocator);
-            defer testing.allocator.free(re);
-            try testing.expectEqualSlices(u8, buf[0..n], re);
-        } else |_| {}
+        try messageRound(&smith, &knobs);
     }
     // ⛔ `unstructured` was **0** for every input this target ever ran outside
     // `--fuzz`: the whole arm was unreachable in the ordinary lane. And
     // `decoded`/`ciphertext_octets` say the seeds are frames, not shapes that
     // die at the length gate.
-    try testing.expectEqual(@as(usize, 6), unstructured);
-    try testing.expectEqual(@as(usize, 3), decoded);
-    try testing.expectEqual(@as(usize, 48), ciphertext_octets);
+    try testing.expectEqual(@as(usize, 6), knobs.unstructured);
+    try testing.expectEqual(@as(usize, 4), knobs.decoded);
+    try testing.expectEqual(@as(usize, 56), knobs.ciphertext_octets);
+    // The knobs INSIDE the generator arm, measured 2026-09-08. Before the two
+    // `TailWriter` seeds: `fields = 1`, `tag_kinds = {1, 0, 0, 0}`,
+    // `wide_length = 0`, `arbitrary_version = 1`, `decoded = 3`,
+    // `ciphertext_octets = 48` — the generator emitted a single index field on
+    // every seed and the `0x12` ciphertext branch had never run. Pinned as a
+    // histogram, not a total: a total cannot tell "all four tag kinds ran"
+    // from "one ran four times", which is the whole question about a
+    // discriminant knob.
+    try testing.expectEqual(@as(usize, 2), knobs.arbitrary_version);
+    try testing.expectEqual(@as(usize, 7), knobs.fields);
+    try testing.expectEqualSlices(usize, &[_]usize{ 3, 2, 1, 1 }, &knobs.tag_kinds);
+    try testing.expectEqual(@as(usize, 2), knobs.wide_index);
+    try testing.expectEqual(@as(usize, 1), knobs.wide_length);
+    try testing.expectEqual(@as(usize, 1), knobs.b64_corrupted);
+    try testing.expectEqual(@as(usize, 3), knobs.from_b64);
 }
 
 /// Writes `v` as LEB128 using exactly `pad` extra continuation bytes — a
@@ -657,7 +760,32 @@ fn fuzzWriteVarintPadded(buf: []u8, v: u64, pad: usize) usize {
     return i;
 }
 
+/// What one round of `messageRound` chose, so the corpus guard can pin the
+/// knobs the harness draws AFTER its byte draw instead of replaying a
+/// look-alike of them. ⛔ Every field here is a knob that returns its weight
+/// minimum once the input is exhausted; a corpus without a tail pins them all
+/// to one value and the branches behind them never run.
+const MessageKnobs = struct {
+    unstructured: usize = 0,
+    arbitrary_version: usize = 0,
+    fields: usize = 0,
+    tag_kinds: [4]usize = @splat(0),
+    wide_index: usize = 0,
+    wide_length: usize = 0,
+    b64_corrupted: usize = 0,
+    decoded: usize = 0,
+    ciphertext_octets: usize = 0,
+    from_b64: usize = 0,
+};
+
 fn fuzzMessageDecode(_: void, smith: *std.testing.Smith) !void {
+    var knobs: MessageKnobs = .{};
+    return messageRound(smith, &knobs);
+}
+
+/// One fuzz iteration, factored out so the guard drives the SAME draws the
+/// fuzzer does rather than a copy that can drift out of order.
+fn messageRound(smith: *std.testing.Smith, knobs: *MessageKnobs) !void {
     const allocator = testing.allocator;
 
     var buf: [512]u8 = undefined;
@@ -670,8 +798,12 @@ fn fuzzMessageDecode(_: void, smith: *std.testing.Smith) !void {
     if (smith.boolWeighted(1, 7)) {
         // Minority: the drawn octets ARE the message, so the length/version
         // gates and the "not even a frame" shapes get their own coverage.
+        knobs.unstructured += 1;
     } else {
-        buf[0] = if (smith.boolWeighted(1, 9)) smith.value(u8) else version;
+        buf[0] = if (smith.boolWeighted(1, 9)) blk: {
+            knobs.arbitrary_version += 1;
+            break :blk smith.value(u8);
+        } else version;
         n = 1;
         // Payload: a tag/value stream the decoder has to walk.
         while (n + 16 < buf.len - suffix_len and !smith.eosWeightedSimple(4, 1)) {
@@ -687,7 +819,9 @@ fn fuzzMessageDecode(_: void, smith: *std.testing.Smith) !void {
             // collapsing call, so an inline `smith.value(u8)` in an ARM reads
             // to it as a collapsing discriminant. Separating them keeps the
             // gate reading the discriminant it is actually about.
+            knobs.fields += 1;
             const tag_kind = smith.value(u64) % 4;
+            knobs.tag_kinds[@intCast(tag_kind)] += 1;
             const narrow_tag: u64 = smith.value(u8);
             const wide_tag: u64 = smith.value(u64);
             const tag: u64 = switch (tag_kind) {
@@ -701,14 +835,19 @@ fn fuzzMessageDecode(_: void, smith: *std.testing.Smith) !void {
                 0x08 => {
                     // A u32-overflowing index must be `VarintTooLong`, and a
                     // non-minimal one is the malleability shape.
-                    const v: u64 = if (smith.boolWeighted(2, 1)) smith.value(u32) else smith.value(u64);
+                    const v: u64 = if (smith.boolWeighted(2, 1)) smith.value(u32) else blk: {
+                        knobs.wide_index += 1;
+                        break :blk smith.value(u64);
+                    };
                     n += fuzzWriteVarintPadded(buf[n..], v, smith.valueRangeAtMost(u8, 0, 9));
                 },
                 0x12 => {
                     const claimed: u64 = if (smith.boolWeighted(4, 1))
                         smith.valueRangeAtMost(u8, 0, 32)
-                    else
-                        smith.value(u64);
+                    else blk: {
+                        knobs.wide_length += 1;
+                        break :blk smith.value(u64);
+                    };
                     n += fuzzWriteVarintPadded(buf[n..], claimed, smith.valueRangeAtMost(u8, 0, 3));
                     const room = buf.len - suffix_len - n;
                     const want: usize = @min(@as(usize, @intCast(@min(claimed, 32))), room);
@@ -728,6 +867,8 @@ fn fuzzMessageDecode(_: void, smith: *std.testing.Smith) !void {
     if (Message.decode(allocator, buf[0..n])) |msg| {
         var m = msg;
         defer m.deinit(allocator);
+        knobs.decoded += 1;
+        knobs.ciphertext_octets += m.ciphertext.len;
         // ORACLE (W2-33), not just "does not crash": whatever `decode`
         // accepts, `encode` must reproduce BYTE-IDENTICALLY. That is the
         // property a dedup/replay cache keyed on the wire bytes depends
@@ -745,9 +886,13 @@ fn fuzzMessageDecode(_: void, smith: *std.testing.Smith) !void {
     // alphabet so `base64Decode`'s own reject paths are reached.
     const b64 = try base64Encode(allocator, buf[0..n]);
     defer allocator.free(b64);
-    if (b64.len > 0 and smith.boolWeighted(3, 1)) b64[smith.index(b64.len)] = smith.value(u8);
+    if (b64.len > 0 and smith.boolWeighted(3, 1)) {
+        b64[smith.index(b64.len)] = smith.value(u8);
+        knobs.b64_corrupted += 1;
+    }
     if (Message.fromBase64(allocator, b64)) |msg| {
         var m = msg;
+        knobs.from_b64 += 1;
         m.deinit(allocator);
     } else |_| {}
 }

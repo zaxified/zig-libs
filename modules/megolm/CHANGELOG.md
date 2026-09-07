@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Test-only, no production change: `fuzzMessageDecode`'s payload generator
+  emitted exactly **one** field on every seed, and the field it emitted was always the same one.
+  Measured 2026-09-08 over the whole corpus: `fields = 1`, `tag_kinds = {1, 0, 0, 0}`,
+  `wide_length = 0` — the `0x12` **ciphertext** branch, both arbitrary-tag branches and the
+  wide-claimed-length knob had never executed. The cause is that the loop condition is an `eos`
+  draw, which consumes ONE octet where a scalar draw consumes eight, so every `u64` word in a
+  word-only tail is read out of phase from the first field onward. A new `TailWriter` writes the
+  tail at the widths each draw actually reads (word / octet / `u32`-prefixed slice) and two
+  seeds now drive the generator: one that builds a **complete, decodable** message (version,
+  index, an 8-octet ciphertext field, the 72-octet suffix — it round-trips byte-identically
+  through the harness's own oracle), one that walks the refusal shapes. After:
+  `fields = 7`, `tag_kinds = {3, 2, 1, 1}`, `wide_length = 1`, decoded 3 → 4.
+  The harness body moved into `messageRound`, which the guard now drives directly, so the guard
+  measures the knobs inside the harness instead of a hand-copied replay of its draw order.
+  `session_key`'s five knobs measured ALIVE and varying (length modes 3/4/2/1, version modes
+  5/4/1, base64 corruption 1 of 10); its guard's `expect(seen)` booleans are replaced by the
+  measured histograms, and it now replays the three base64 knobs it used to stop short of.
+
 - **2026-09-07** — Test-only, no production change: both fuzz targets carried a
   "reachability was verified rather than assumed" note, and both notes were measured under
   `scripts/fuzz-sweep.sh` - i.e. under `--fuzz`. The ORDINARY lane replays
