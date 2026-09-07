@@ -99,7 +99,6 @@ sealedbox 1
 sessions 2
 signal 2
 slhdsa 1
-snmp 3
 sntp 1
 spake2plus 1
 sphinx 1

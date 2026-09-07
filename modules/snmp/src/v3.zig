@@ -325,6 +325,7 @@ fn prependEnvelope(
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 const Oid = @import("oid.zig").Oid;
 
 test "MsgFlags round-trip across all 8 bit combinations" {
@@ -495,15 +496,145 @@ test "decodeScopedPdu on a hand-built ScopedPDU SEQUENCE content" {
 // plaintext ScopedPDU or an `.encrypted` blob are all attacker-controlled
 // BER before any authentication has been checked.
 
+/// SNMPv3 datagrams, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// ⭐ The accepted half is built at run time by this file's own `encode` and
+/// `encodeEncrypted`: the envelope is four nested BER levels and the msgData
+/// CHOICE is decided by a flag octet three levels up, so hand-written hex
+/// would be a transcription of the encoder rather than an independent vector.
+const V3Corpus = struct {
+    scratch: [512]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [16][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *V3Corpus, frame: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    fn build(self: *V3Corpus) ![]const []const u8 {
+        const vbs = try sampleTrapVarbinds();
+        // Plaintext, reportable, with a context name — the round-trip shape.
+        self.push(try encode(&self.scratch, .{
+            .msg_id = 123456,
+            .flags = .{ .reportable = true },
+            .security_parameters = "usm-blob",
+            .context_engine_id = "\x80\x00\x1f\x88\x80",
+            .context_name = "ctx",
+            .pdu = .{ .type = .trap_v2, .request_id = 1, .varbinds = &vbs },
+        }));
+        // noAuthNoPriv discovery: every flag clear, no security parameters.
+        self.push(try encode(&self.scratch, .{
+            .msg_id = 1,
+            .context_engine_id = "",
+            .pdu = .{ .type = .get_request, .request_id = 1 },
+        }));
+        // authNoPriv with a plaintext ScopedPDU.
+        self.push(try encode(&self.scratch, .{
+            .msg_id = 2,
+            .flags = .{ .auth = true, .reportable = true },
+            .security_parameters = "usm-blob",
+            .context_engine_id = "\x80\x00\x1f\x88\x80",
+            .pdu = .{ .type = .response, .request_id = 2, .varbinds = &vbs },
+        }));
+        // authPriv: msgData is an encryptedPDU OCTET STRING, surfaced verbatim.
+        self.push(try encodeEncrypted(&self.scratch, .{
+            .msg_id = 3,
+            .flags = .{ .auth = true, .priv = true },
+            .security_parameters = "usm-blob",
+            .encrypted_pdu = "\xDE\xAD\xBE\xEF" ** 8,
+        }));
+
+        // ── refusals, each named by the error it raises ─────────────────────
+        // privFlag without authFlag: RFC 3412 §7.2 step 5 discards this
+        // BEFORE anything is decrypted.
+        self.push(try encode(&self.scratch, .{
+            .msg_id = 7,
+            .flags = .{ .priv = true },
+            .security_parameters = "usm-blob",
+            .context_engine_id = "\x80\x00\x1f\x88\x80",
+            .pdu = .{ .type = .trap_v2, .request_id = 1, .varbinds = &vbs },
+        }));
+        // privFlag set but a PLAINTEXT ScopedPDU behind it, and the mirror:
+        // privFlag clear with an encryptedPDU. Both are SecurityLevelMismatch,
+        // and both used to be accepted silently.
+        self.push(try encodeEncrypted(&self.scratch, .{
+            .msg_id = 8,
+            .flags = .{ .auth = true },
+            .security_parameters = "usm-blob",
+            .encrypted_pdu = "\xDE\xAD\xBE\xEF",
+        }));
+        // A security model that is not USM (3).
+        self.push(try encode(&self.scratch, .{
+            .msg_id = 9,
+            .security_model = 2,
+            .context_engine_id = "",
+            .pdu = .{ .type = .get_request, .request_id = 1 },
+        }));
+        // NotV3: an SNMPv2c datagram offered to the v3 decoder.
+        self.push(&[_]u8{ 0x30, 0x06, 0x02, 0x01, 0x01, 0x04, 0x01, 'x' });
+        self.push(&[_]u8{ 0x30, 0x02, 0x02, 0x01 }); // a truncated version INTEGER
+        self.push(&[_]u8{0x30}); // a SEQUENCE tag with no length
+        self.push(&.{}); // the empty datagram
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecode, .{});
+    var corpus: V3Corpus = .{};
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every seed and `decode` was handed `buf[0..0]`, which
+    // fails on the first `expect(sequence)`. Every check the paragraph above
+    // names — the flag octet, the security model, the msgData CHOICE — was
+    // unreachable from this harness. Measured 2026-09-07 over the corpus
+    // above: **0 of 11 seeds non-empty and 0 decoded before; 10 of 11
+    // non-empty (the empty datagram is a deliberate seed) and 4 decoded
+    // after.**
+    const len: usize = smith.slice(&buf);
     _ = decode(buf[0..len]) catch return;
+}
+
+test "corpus: every v3 seed reaches decode, and the msgData shapes are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `decoded` alone would be satisfied by a
+    // corpus of plaintext envelopes, so the second number splits the msgData
+    // CHOICE: `encrypted` counts the datagrams that came out as an
+    // encryptedPDU, which is the branch that decides whether attacker bytes
+    // reach the decryptor or the PDU parser.
+    var corpus: V3Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var plaintext: usize = 0;
+    var encrypted: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const m = decode(buf[0..len]) catch continue;
+        decoded += 1;
+        switch (m.data) {
+            .plaintext => plaintext += 1,
+            .encrypted => encrypted += 1,
+        }
+    }
+    // One short of the corpus length: the empty datagram is a seed on purpose.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 4), decoded);
+    try testing.expectEqual(@as(usize, 3), plaintext);
+    try testing.expectEqual(@as(usize, 1), encrypted);
 }
 
 test "RFC 3412 §7.2 step 5: privFlag without authFlag is discarded before anything is decrypted" {

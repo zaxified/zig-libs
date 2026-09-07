@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: all three harnesses (`message.fuzzDecode`, `usm.fuzzParse`,
+  `v3.fuzzDecode`) ran on the empty datagram, for ever. Each opened with `smith.bytes(&buf)`
+  followed by `smith.valueRangeAtMost(u16, 0, buf.len)`; a ranged draw reads eight octets as a
+  little-endian u64 and returns the range MINIMUM when fewer than eight remain, and `bytes` had
+  already consumed the seed — so `len` was **0 on every input** and each decoder failed on its
+  first `expect(sequence)`. Nothing behind that line was reachable: in `message` the varbind
+  walk (which is LAZY, so a message decoding says nothing about it); in `usm` the two INTEGER
+  range checks the 2026-09-02 audit added, whose absence turned one spoofed datagram into a
+  permanent denial; in `v3` the flag octet, the security model and the msgData CHOICE that
+  decides whether attacker bytes reach the decryptor. All three now draw with one
+  `smith.slice(&buf)` and carry a corpus built by this module's own `encode` (the accepted
+  half) plus hand-written BER for the refusals, with a guard pinning two measured numbers.
+  Before → after: `message.fuzzDecode` 0/12 seeds non-empty, 0 decoded, 0 varbinds walked →
+  11/12 (one is the empty datagram on purpose), 8 decoded, 9 varbinds and 1 iterator refusal;
+  `usm.fuzzParse` 0/11 and 0 parsed → 10/11 and 4 parsed, 36 HMAC octets seen;
+  `v3.fuzzDecode` 0/11 and 0 decoded → 10/11 and 4 decoded, 3 plaintext and 1 encryptedPDU.
+
 - **2026-09-02** — **Audit (drift campaign): 1 HIGH, 4 LOW fixed.**
   **HIGH — `msgFlags.privFlag` did not select the ScopedPduData branch; the msgData TLV *tag*
   did.** RFC 3412 §7.2 step 5 makes the flag the selector, and the previous audit's fix checked

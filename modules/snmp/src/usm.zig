@@ -463,6 +463,7 @@ pub fn sign(
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 fn expectRoundTrip(params: UsmSecurityParameters) !void {
     var buf: [128]u8 = undefined;
@@ -988,15 +989,142 @@ test "computeDigest: deterministic; equals plain HMAC when the region is already
 // datagram *before* the HMAC in `auth_params` has been checked — i.e. on
 // fully unauthenticated, attacker-controlled BER.
 
+/// `msgSecurityParameters` blobs, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`).
+///
+/// ⭐ The accepted half is built at run time by this file's own `encode`: the
+/// structure is a six-field BER SEQUENCE, and the two fields that matter for
+/// security — `engine_boots` and `engine_time` — are INTEGERs whose *range*
+/// check is the subject of the audit finding above, so writing them as hex
+/// would mean hand-encoding the boundary of a 32-bit integer three times.
+const UsmCorpus = struct {
+    scratch: [256]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [16][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *UsmCorpus, frame: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    fn build(self: *UsmCorpus) ![]const []const u8 {
+        // The discovery request: everything empty but the engine id.
+        self.push(try encode(&self.scratch, .{
+            .engine_id = "",
+            .engine_boots = 0,
+            .engine_time = 0,
+            .user_name = "",
+            .auth_params = "",
+            .priv_params = "",
+        }));
+        // An authenticated, privacy-enabled parameter block: a 12-octet HMAC
+        // prefix and an 8-octet privacy salt.
+        self.push(try encode(&self.scratch, .{
+            .engine_id = "\x80\x00\x1f\x88\x04",
+            .engine_boots = 3,
+            .engine_time = 12345,
+            .user_name = "authPrivUser",
+            .auth_params = "\x00" ** 12,
+            .priv_params = "\x01\x02\x03\x04\x05\x06\x07\x08",
+        }));
+        // engineBoots exactly at the RFC 3414 §2.2 ceiling — the value the
+        // "always out of window" escape hatch is written against.
+        self.push(try encode(&self.scratch, .{
+            .engine_id = "\x80\x00\x1f\x88\x04",
+            .engine_boots = std.math.maxInt(i32),
+            .engine_time = std.math.maxInt(i32),
+            .user_name = "u",
+            .auth_params = "",
+            .priv_params = "",
+        }));
+        // ... and one above it, which must be refused. A spoofed,
+        // unauthenticated Report carrying this used to seed the client's clock
+        // permanently (audit 2026-09-02).
+        self.push(try encode(&self.scratch, .{
+            .engine_id = "\x80\x00\x1f\x88\x04",
+            .engine_boots = std.math.maxInt(u32),
+            .engine_time = 1,
+            .user_name = "u",
+            .auth_params = "",
+            .priv_params = "",
+        }));
+        // A 32-octet engine id and a long user name: the maximum lengths a
+        // real agent produces.
+        self.push(try encode(&self.scratch, .{
+            .engine_id = "\xAA" ** 32,
+            .engine_boots = 1,
+            .engine_time = 1,
+            .user_name = "a" ** 32,
+            .auth_params = "\xFF" ** 24,
+            .priv_params = "\x00" ** 8,
+        }));
+
+        // ── refusals ───────────────────────────────────────────────────────
+        self.push(&[_]u8{}); // the empty blob
+        self.push(&[_]u8{0x30}); // a SEQUENCE tag with no length
+        self.push(&[_]u8{ 0x30, 0x00 }); // an EMPTY sequence: six fields short
+        self.push(&[_]u8{ 0x30, 0x02, 0x04, 0x00 }); // engineID only
+        // A negative engineBoots: INTEGER -1, which `std.math.cast(u32, …)`
+        // must refuse rather than wrap.
+        self.push(&[_]u8{ 0x30, 0x08, 0x04, 0x00, 0x02, 0x01, 0xFF, 0x02, 0x01, 0x00 });
+        // Trailing data after a well-formed SEQUENCE.
+        self.push(&[_]u8{ 0x30, 0x02, 0x04, 0x00, 0xFF });
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParse, .{});
+    var corpus: UsmCorpus = .{};
+    try testing.fuzz({}, fuzzParse, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every seed and `parse` was handed `buf[0..0]`, which
+    // fails on the first `expect(sequence)`. Measured 2026-09-07 over the
+    // corpus above: **0 of 11 seeds non-empty and 0 parsed before; 10 of 11
+    // non-empty (the empty blob is a deliberate seed) and 4 parsed after.**
+    const len: usize = smith.slice(&buf);
     _ = parse(buf[0..len]) catch return;
+}
+
+test "corpus: every USM seed reaches parse, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `boots_sum` is the second number: this
+    // blob's whole security value is the two INTEGERs, and `parsed` alone
+    // cannot tell a corpus that reads them from one that stops at the engine
+    // id. It is also what pins that the seed at the `maxInt(i32)` ceiling gets
+    // through while the one above it does not.
+    var corpus: UsmCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var boots_sum: u64 = 0;
+    var auth_octets: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const p = parse(buf[0..len]) catch continue;
+        parsed += 1;
+        boots_sum += p.engine_boots;
+        auth_octets += p.auth_params.len;
+    }
+    // One short of the corpus length: the empty blob is a seed on purpose.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 4), parsed);
+    // 0 + 3 + 2147483647 + 1: the over-ceiling seed is refused and contributes
+    // nothing, which is the point of having it.
+    try testing.expectEqual(@as(u64, 0 + 3 + std.math.maxInt(i32) + 1), boots_sum);
+    try testing.expectEqual(@as(usize, 36), auth_octets);
 }
 
 test "engineBoots/engineTime outside INTEGER (0..2147483647) are refused on the wire" {
