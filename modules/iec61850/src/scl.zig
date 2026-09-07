@@ -2247,14 +2247,65 @@ test "an IED the file does not contain is a typed error" {
     try testing.expectError(error.UnresolvedFcda, resolve(&s, testing.allocator, "OTHERIED"));
 }
 
+const testkit = @import("testkit");
+/// `testkit.fuzz.seed`, aliased so the corpora below read as the documents they
+/// are. A corpus entry is not the document: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw document would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = testkit.fuzz.seed;
+
+/// The harness's buffer, at 8 kB rather than the 1 kB it used to be.
+///
+/// ⚠ This is a finding about the harness, not a preference. `sample` — this
+/// module's own reference document, and the only complete SCL it has — is 4065
+/// octets, and `Smith.slice` reads a seed longer than the buffer back as the
+/// EMPTY one, silently. At 1024 the reference document could not have passed
+/// through this harness at all; it would have looked like a seed and behaved
+/// like no seed. The same shape emptied three harnesses elsewhere in this tree.
+const scl_input_len: usize = 8192;
+
+/// SCL documents, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// `parse` refuses anything whose root is not `<SCL>` in the 2003 namespace, so
+/// uniform random octets never reach the resolver — which is the half of this
+/// harness worth exercising.
+const scl_seeds = [_][]const u8{
+    seed(sample), // the module's own reference document: two LNs, a control object, an RCB, a GSE
+    // The smallest document `resolve` accepts: one IED, one LN, one DO, one DA.
+    seed("<SCL xmlns=\"http://www.iec.ch/61850/2003/SCL\"><IED name=\"I\"><AccessPoint name=\"A\"><Server>" ++
+        "<LDevice inst=\"LD\"><LN lnClass=\"GGIO\" lnType=\"T1\" inst=\"1\"/></LDevice>" ++
+        "</Server></AccessPoint></IED><DataTypeTemplates>" ++
+        "<LNodeType id=\"T1\" lnClass=\"GGIO\"><DO name=\"X\" type=\"D1\"/></LNodeType>" ++
+        "<DOType id=\"D1\"><DA name=\"v\" bType=\"BOOLEAN\" fc=\"ST\"/></DOType>" ++
+        "</DataTypeTemplates></SCL>"),
+    // UnresolvedType: the `DOType` the `LNodeType` names is not there.
+    seed("<SCL xmlns=\"http://www.iec.ch/61850/2003/SCL\"><IED name=\"I\"><AccessPoint name=\"A\"><Server>" ++
+        "<LDevice inst=\"LD\"><LN lnClass=\"GGIO\" lnType=\"T1\" inst=\"1\"/></LDevice>" ++
+        "</Server></AccessPoint></IED><DataTypeTemplates>" ++
+        "<LNodeType id=\"T1\" lnClass=\"GGIO\"><DO name=\"X\" type=\"NOPE\"/></LNodeType>" ++
+        "</DataTypeTemplates></SCL>"),
+    // An SCL root with nothing in it at all.
+    seed("<SCL xmlns=\"http://www.iec.ch/61850/2003/SCL\"/>"),
+    seed("<Envelope xmlns=\"urn:x\"/>"), // NotScl
+    // DoctypeForbidden — the XXE the xml sibling's hardening refuses.
+    seed("<!DOCTYPE SCL [<!ENTITY x SYSTEM \"file:///etc/passwd\">]>\n" ++
+        "<SCL xmlns=\"http://www.iec.ch/61850/2003/SCL\"><Header id=\"&x;\"/></SCL>"),
+    seed("<SCL"), // an unterminated start tag
+    seed("<"), // one octet
+};
+
 test "fuzz: SCL parsing and resolution never panic" {
-    try std.testing.fuzz({}, fuzzScl, .{});
+    try std.testing.fuzz({}, fuzzScl, .{ .corpus = &scl_seeds });
 }
 
 fn fuzzScl(_: void, smith: *std.testing.Smith) !void {
-    var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [scl_input_len]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an empty string —
+    // which fails, so the resolver below was unreachable.
+    const len: usize = smith.slice(&buf);
     var s = parse(testing.allocator, buf[0..len], .{ .allow_unknown_btype = true }) catch return;
     defer s.deinit();
     for (s.ieds) |i| {
@@ -2268,14 +2319,32 @@ fn fuzzScl(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+/// Octets for the type id that gets spliced into the skeleton four times over.
+///
+/// The harness maps each octet onto an XML name character before use, so what a
+/// seed selects is a **length** and a pattern, not a literal id; the comments
+/// name the length, which is the axis that matters (an empty id, a one-character
+/// id, and one longer than any real `lnType`).
+const fragment_seeds = [_][]const u8{
+    seed("T1"), // the two-character id the value tests use
+    seed("a"), // one character
+    seed(""), // the empty id: four empty `id=""` attributes
+    seed("GGIO1_stVal_type"), // an ordinary-looking type id
+    seed("." ** 200), // 200 octets, all mapping to the same class of character
+    seed("\x00\x01\x02\x03" ** 50), // 200 octets cycling all four character classes
+    seed("\xff" ** 256), // the whole buffer: 256 octets, the longest a seed can be
+};
+
 test "fuzz: a hostile SCL fragment glued into a valid skeleton never panics" {
-    try std.testing.fuzz({}, fuzzFragment, .{});
+    try std.testing.fuzz({}, fuzzFragment, .{ .corpus = &fragment_seeds });
 }
 
 fn fuzzFragment(_: void, smith: *std.testing.Smith) !void {
     var frag: [256]u8 = undefined;
-    smith.bytes(&frag);
-    const n: usize = smith.valueRangeAtMost(u8, 0, 200);
+    // ⚠ Same collapse as `fuzzScl`: `n` was 0 for every seed, so the id spliced
+    // into the skeleton was always the empty string and this harness rendered
+    // exactly one document, for ever.
+    const n: usize = smith.slice(&frag);
     // Keep it XML-legal: only name characters, so the parser gets past the
     // lexer and the *resolver* is what is being exercised.
     for (frag[0..n]) |*c| {
@@ -2305,4 +2374,72 @@ fn fuzzFragment(_: void, smith: *std.testing.Smith) !void {
     defer s.deinit();
     var m = resolve(&s, testing.allocator, "I") catch return;
     defer m.deinit();
+}
+
+test "corpus: every SCL seed reaches the parser, and the accepted counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum) —
+    // which is precisely why `scl_input_len` is 8192 and not 1024, because
+    // `sample` is 4065 octets — and a corpus where nothing is accepted is a
+    // corpus that only exercises the refusal path. Acceptance is not reach —
+    // `bacnet/service` once scored 19 of 19 because decoding "" is legal there.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var resolved: usize = 0;
+    for (scl_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [scl_input_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var s = parse(testing.allocator, buf[0..len], .{ .allow_unknown_btype = true }) catch continue;
+        defer s.deinit();
+        parsed += 1;
+        for (s.ieds) |i| {
+            var m = resolve(&s, testing.allocator, i.name) catch continue;
+            defer m.deinit();
+            resolved += 1;
+        }
+    }
+    try testing.expectEqual(scl_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), parsed);
+    try testing.expectEqual(@as(usize, 2), resolved);
+
+    // The fragment corpus is measured by how many of the rendered skeletons the
+    // parser accepts: the harness's whole point is that the id is spliced in
+    // four times, so an id that breaks the document breaks all four.
+    var frag_nonempty: usize = 0;
+    var rendered_ok: usize = 0;
+    for (fragment_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var frag: [256]u8 = undefined;
+        const n: usize = smith.slice(&frag);
+        if (n != 0) frag_nonempty += 1;
+        for (frag[0..n]) |*c| {
+            c.* = switch (c.* % 4) {
+                0 => 'a' + (c.* % 26),
+                1 => 'A' + (c.* % 26),
+                2 => '0' + (c.* % 10),
+                else => '_',
+            };
+        }
+        const id = frag[0..n];
+        const rendered = try std.fmt.allocPrint(
+            testing.allocator,
+            "<SCL xmlns=\"http://www.iec.ch/61850/2003/SCL\"><IED name=\"I\"><AccessPoint name=\"A\"><Server>" ++
+                "<LDevice inst=\"LD\"><LN lnClass=\"GGIO\" lnType=\"{s}\" inst=\"1\"/></LDevice>" ++
+                "</Server></AccessPoint></IED><DataTypeTemplates>" ++
+                "<LNodeType id=\"{s}\" lnClass=\"GGIO\"><DO name=\"X\" type=\"{s}\"/></LNodeType>" ++
+                "<DOType id=\"{s}\"><DA name=\"v\" bType=\"BOOLEAN\" fc=\"ST\"/></DOType>" ++
+                "</DataTypeTemplates></SCL>",
+            .{ id, id, id, id },
+        );
+        defer testing.allocator.free(rendered);
+        var s = parse(testing.allocator, rendered, .{}) catch continue;
+        defer s.deinit();
+        rendered_ok += 1;
+    }
+    // One seed is the empty id on purpose, and it reads back as the empty slice.
+    try testing.expectEqual(fragment_seeds.len - 1, frag_nonempty);
+    try testing.expectEqual(@as(usize, 7), rendered_ok);
 }

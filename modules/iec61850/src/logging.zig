@@ -1393,14 +1393,82 @@ test "the integrity period writes one entry a period" {
     try testing.expect(try lcb.tick(h.src.source(), 1000));
 }
 
+const testkit = @import("testkit");
+/// `testkit.fuzz.seedHex`, aliased so the literals below read as the bodies
+/// they are. A corpus entry is not the body: `Smith.slice` reads a
+/// little-endian `u32` length first, so a raw body would arrive minus its own
+/// first four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = testkit.fuzz.seedHex;
+
+/// The literal half of `fuzzJournal`'s corpus: the shapes each of its four
+/// decoders refuses. The accepted bodies are built below, because every one of
+/// them is a *service body* and this module keeps its captures as whole PDUs or
+/// produces them from its own encoders.
+const journal_seeds = [_][]const u8{
+    seed("A000"), // an empty journal name
+    seed("A1221A11"), // a name whose length runs off the end
+    seed("A200"), // the wrong outer tag for every one of the four
+    seed("00"), // one octet
+};
+
+/// The whole corpus: the literals above, the two oracle bodies, and a
+/// `GetJournalStatus` request and response built by this module's own encoders
+/// and unwrapped by `mms.decode` — which is the only way to get the *body* a
+/// decoder here takes.
+///
+/// ⭐ The fuzz harness and the corpus guard below both build it from HERE. A
+/// guard measuring a different corpus from the one the harness gets is not a
+/// guard.
+const JournalCorpus = struct {
+    req_out: [128]u8 = undefined,
+    resp_out: [128]u8 = undefined,
+    oracle_req: [4 + oracle_read_journal_request.len]u8 = undefined,
+    oracle_resp: [4 + oracle_read_journal_response.len]u8 = undefined,
+    status_req: [4 + 128]u8 = undefined,
+    status_resp: [4 + 128]u8 = undefined,
+    entries: [journal_seeds.len + 4][]const u8 = undefined,
+
+    fn build(self: *JournalCorpus) ![]const []const u8 {
+        @memcpy(self.entries[0..journal_seeds.len], &journal_seeds);
+        self.entries[journal_seeds.len + 0] =
+            testkit.fuzz.seedInto(&self.oracle_req, &oracle_read_journal_request);
+        self.entries[journal_seeds.len + 1] =
+            testkit.fuzz.seedInto(&self.oracle_resp, &oracle_read_journal_response);
+        const req = try encodeGetJournalStatus(9, .{ .domain_specific = .{
+            .domain = "TESTLD",
+            .item = "LLN0$EventLog",
+        } }, &self.req_out);
+        self.entries[journal_seeds.len + 2] = testkit.fuzz.seedInto(
+            &self.status_req,
+            (try mms.decode(req)).confirmed_request.body,
+        );
+        const resp = try encodeGetJournalStatusResponse(
+            9,
+            .{ .current_entries = 4, .limit_entries = 16 },
+            &self.resp_out,
+        );
+        self.entries[journal_seeds.len + 3] = testkit.fuzz.seedInto(
+            &self.status_resp,
+            (try mms.decode(resp)).confirmed_response.body,
+        );
+        return &self.entries;
+    }
+};
+
 test "fuzz: journal decoding never panics" {
-    try std.testing.fuzz({}, fuzzJournal, .{});
+    var corpus: JournalCorpus = .{};
+    try std.testing.fuzz({}, fuzzJournal, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzJournal(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all four decoders were handed an empty
+    // slice with the seed sitting unread in the buffer — the entry walk below
+    // was unreachable.
+    const len: usize = smith.slice(&buf);
     _ = decodeReadJournal(buf[0..len]) catch {};
     if (decodeReadJournalResponse(buf[0..len])) |r| {
         var it = r.entries;
@@ -1411,6 +1479,45 @@ fn fuzzJournal(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
     _ = decodeGetJournalStatus(buf[0..len]) catch {};
     _ = decodeGetJournalStatusResponse(buf[0..len]) catch {};
+}
+
+test "corpus: every journal seed reaches its decoder, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so these pin the numbers rather than asserting they are > 0.
+    //
+    // `entries` is the one that matters: the walk over a response's entries and
+    // their variables is the deepest thing the harness does, and it runs only
+    // if a seed is a `ReadJournal` **response**.
+    var nonempty: usize = 0;
+    var requests: usize = 0;
+    var responses: usize = 0;
+    var entries_seen: usize = 0;
+    var status: usize = 0;
+    var corpus: JournalCorpus = .{};
+    const entries = try corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeReadJournal(buf[0..len])) |_| requests += 1 else |_| {}
+        if (decodeReadJournalResponse(buf[0..len])) |r| {
+            responses += 1;
+            var it = r.entries;
+            while (it.next() catch null) |_| entries_seen += 1;
+        } else |_| {}
+        if (decodeGetJournalStatus(buf[0..len])) |_| status += 1 else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 1), requests);
+    try testing.expectEqual(@as(usize, 4), responses);
+    try testing.expectEqual(@as(usize, 1), entries_seen);
+    try testing.expectEqual(@as(usize, 6), status);
 }
 
 // ── listOfVariables filtering ───────────────────────────────────────────────
@@ -1620,14 +1727,73 @@ test "the deletion services round trip through their own codecs" {
     try testing.expectError(error.MissingField, decodeInitializeJournal(&.{}));
 }
 
+/// The literal half of `fuzzDeletion`'s corpus.
+const deletion_seeds = [_][]const u8{
+    seed("A000"), // an empty journal name
+    seed("A1221A11"), // a name whose length runs off the end
+    seed("020D"), // a bare INTEGER header, which is what the response is
+    seed("00"), // one octet
+};
+
+/// The whole corpus: the literals above plus an `InitializeJournal` request, a
+/// `DeleteJournal` request and an `InitializeJournalResponse`, all built by this
+/// module's own encoders and unwrapped by `mms.decode` to the *body* these
+/// decoders take. There is no captured literal for any of them.
+///
+/// ⚠ The harness's buffer is 128 octets and `Smith.slice` reads a seed longer
+/// than the buffer back as the EMPTY one, silently — which is why the guard
+/// asserts every seed is non-empty rather than assuming it.
+///
+/// ⭐ The fuzz harness and the corpus guard below both build it from HERE.
+const DeletionCorpus = struct {
+    out: [256]u8 = undefined,
+    init_store: [4 + 128]u8 = undefined,
+    del_store: [4 + 128]u8 = undefined,
+    resp_store: [4 + 128]u8 = undefined,
+    entries: [deletion_seeds.len + 3][]const u8 = undefined,
+
+    const name = mms.ObjectName{
+        .domain_specific = .{ .domain = "TESTLD", .item = "LLN0$EventLog" },
+    };
+
+    fn build(self: *DeletionCorpus) ![]const []const u8 {
+        @memcpy(self.entries[0..deletion_seeds.len], &deletion_seeds);
+        var id: [entry_id_len]u8 = undefined;
+        std.mem.writeInt(u64, &id, 42, .big);
+        const limit = Limit{
+            .limiting_time = reporting.binaryTimeFromMillis(1_700_000_000_000),
+            .limiting_entry = &id,
+        };
+        const init_pdu = try encodeInitializeJournal(7, name, limit, &self.out);
+        self.entries[deletion_seeds.len + 0] = testkit.fuzz.seedInto(
+            &self.init_store,
+            (try mms.decode(init_pdu)).confirmed_request.body,
+        );
+        const del_pdu = try encodeDeleteJournal(8, name, &self.out);
+        self.entries[deletion_seeds.len + 1] = testkit.fuzz.seedInto(
+            &self.del_store,
+            (try mms.decode(del_pdu)).confirmed_request.body,
+        );
+        const resp_pdu = try encodeInitializeJournalResponse(7, 13, &self.out);
+        self.entries[deletion_seeds.len + 2] = testkit.fuzz.seedInto(
+            &self.resp_store,
+            (try mms.decode(resp_pdu)).confirmed_response.body,
+        );
+        return &self.entries;
+    }
+};
+
 test "fuzz: the deletion services never panic on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzDeletion, .{});
+    var corpus: DeletionCorpus = .{};
+    try std.testing.fuzz({}, fuzzDeletion, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDeletion(_: void, smith: *std.testing.Smith) !void {
     var input: [128]u8 = undefined;
-    smith.bytes(&input);
-    const len: usize = smith.valueRangeAtMost(u8, 0, input.len);
+    // ⚠ Same collapse as `fuzzJournal`: `len` was 0 for every seed, so
+    // `decodeInitializeJournal` always failed and the block below it — which
+    // fills a log and runs `initializeJournal` against it — never ran once.
+    const len: usize = smith.slice(&input);
     const body = input[0..len];
     if (decodeInitializeJournal(body)) |q| {
         var h: Harness = .{};
@@ -1638,4 +1804,30 @@ fn fuzzDeletion(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
     _ = decodeDeleteJournal(body) catch {};
     _ = decodeInitializeJournalResponse(body) catch {};
+}
+
+test "corpus: every deletion seed reaches its decoder, and the counts are pinned" {
+    // ⭐ See the note on the journal guard above. `inits` is the one that
+    // matters: everything after `decodeInitializeJournal` in the harness — the
+    // filled log, the actual `initializeJournal` call — is unreachable without
+    // at least one seed it accepts.
+    var nonempty: usize = 0;
+    var inits: usize = 0;
+    var deletes: usize = 0;
+    var init_resps: usize = 0;
+    var corpus: DeletionCorpus = .{};
+    const entries = try corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [128]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeInitializeJournal(buf[0..len])) |_| inits += 1 else |_| {}
+        if (decodeDeleteJournal(buf[0..len])) |_| deletes += 1 else |_| {}
+        if (decodeInitializeJournalResponse(buf[0..len])) |_| init_resps += 1 else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 1), inits);
+    try testing.expectEqual(@as(usize, 4), deletes);
+    try testing.expectEqual(@as(usize, 1), init_resps);
 }

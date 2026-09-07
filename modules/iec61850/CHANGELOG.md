@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`logging`, `scl`, `server` and `settinggroups`: six more
+  harnesses fed, and one of them could never have taken this module's own
+  reference document.** All six had the `smith.bytes` + ranged-length collapse
+  and now draw with one `smith.slice`.
+  ⭐ `scl.fuzzScl`'s buffer was 1024 octets and `scl.sample` — the only complete
+  SCL document this module has — is **4065**. `Smith.slice` reads a seed longer
+  than the buffer back as the EMPTY one, silently, so the reference document
+  could not have passed through the harness at all. The buffer is now 8192 and
+  the guard asserts every seed reads back non-empty, which is what makes that
+  visible instead of silent. `server.fuzzServer` has the same hazard from the
+  other side: its corpus is the captured frame table, and the 6675-octet
+  `GetNameList` reply is filtered out at comptime rather than left to look like
+  a seed.
+  ⚠ `settinggroups.fuzzSgcb` chose its attribute with a **second** scalar draw,
+  which is exhausted by the time it runs and returns the range minimum, so every
+  seed would have gone to `NumOfSG` — read-only, so `denied`, twelve times. The
+  attribute index now comes from the seed's own length.
+  Measured, all zero before: `fuzzJournal` 8 of 8 seeds non-empty, **1 request,
+  4 responses, 1 entry walked, 6 status names**; `fuzzDeletion` 7 of 7, **1
+  InitializeJournal, 4 DeleteJournal, 1 response**; `fuzzScl` 8 of 8, **4 parsed
+  and 2 resolved**; `fuzzFragment` 6 of 7 non-empty (one empty id on purpose),
+  **7 rendered documents parsed**; `fuzzServer` 29 of 29, **3 frames handled
+  without a typed error, 2 answered**; `fuzzSgcb` 12 of 12, **8 decoded, 1 ok,
+  1 denied, 6 invalid**.
+
 - ⭐ **2026-09-07** — **BUGFIX: a direct operate left the finished client's
   identity on the point.** `Point.operate`'s non-enhanced success path set
   `state` and `select_deadline_ms` by hand and left `owner` and `ctl_num`

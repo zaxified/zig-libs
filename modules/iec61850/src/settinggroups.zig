@@ -666,24 +666,98 @@ test "the SGCB write path maps every service onto its attribute" {
     try testing.expectEqual(WriteOutcome.unknown, cb.writeAttribute("Nope", nine, 1, 0));
 }
 
+/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the values it
+/// is. A corpus entry is not the value: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw TLV would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seedHex;
+
+/// SGCB attribute values, in the format `Smith.slice` reads.
+///
+/// The five attributes take three different `Data` alternatives between them —
+/// `NumOfSG`/`ActSG`/`EditSG` are unsigned, `CnfEdit` is a boolean, `LActTm` a
+/// binary time — so a corpus of one shape reaches `WriteOutcome.invalid` on
+/// four of the five and nothing else.
+///
+/// ⚠ Which attribute a seed is written to comes from the seed's own **length**,
+/// not from a second `Smith` draw. A second draw is exhausted by the time it
+/// runs (`slice` consumed the whole seed) and returns the range minimum, so
+/// every seed would have gone to `NumOfSG` — which is read-only, so the corpus
+/// would have measured `denied` twelve times and nothing else. The comment on
+/// each seed names the attribute its length selects.
+const sgcb_seeds = [_][]const u8{
+    seed("860101"), // len 3 → CnfEdit: an unsigned where a boolean belongs
+    seed("860102"), // len 3 → CnfEdit, same
+    seed("86010209"), // len 4 → LActTm
+    seed("8601"), // len 2 → EditSG: a header with no content
+    seed("830101"), // len 3 → CnfEdit: boolean TRUE, the confirm
+    seed("830100"), // len 3 → CnfEdit: boolean FALSE
+    seed("8C0601E9C1113CB8"), // len 8 → NumOfSG: a binary time
+    seed("86"), // len 1 → ActSG: one octet
+    seed("8703083D2A5155"), // len 7 → NumOfSG: a float
+    seed("A200"), // len 2 → EditSG: a structure
+    seed("8601FF"), // len 3 → CnfEdit
+    seed("00"), // len 1 → ActSG
+};
+
 test "fuzz: an arbitrary SGCB write never panics" {
-    try std.testing.fuzz({}, fuzzSgcb, .{});
+    try std.testing.fuzz({}, fuzzSgcb, .{ .corpus = &sgcb_seeds });
 }
 
 fn fuzzSgcb(_: void, smith: *std.testing.Smith) !void {
     var fx: Fixture = .{};
     var cb = fx.init() catch return;
     var input: [64]u8 = undefined;
-    smith.bytes(&input);
-    const len: usize = smith.valueRangeAtMost(u8, 0, input.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `Data.decode` was handed an empty slice
+    // with the seed sitting unread in the buffer — nothing below it ran.
+    const len: usize = smith.slice(&input);
     const d = mmsdata.Data.decode(input[0..len]) catch return;
     d.validate() catch return;
-    const which: usize = smith.valueRangeAtMost(u8, 0, sgcb_attributes.len - 1);
-    _ = cb.writeAttribute(sgcb_attributes[which], d, 1, 0);
+    _ = cb.writeAttribute(sgcb_attributes[len % sgcb_attributes.len], d, 1, 0);
     _ = cb.setEditValue(0, 1, input[0..len]) catch {};
     _ = cb.confirmEdit(1) catch {};
     _ = cb.activeValue(0) catch {};
     _ = cb.editValue(0) catch {};
+}
+
+test "corpus: every SGCB seed reaches the block, and the outcomes are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so these pin the numbers rather than asserting they are > 0.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var ok: usize = 0;
+    var denied: usize = 0;
+    var invalid: usize = 0;
+    for (sgcb_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var input: [64]u8 = undefined;
+        const len: usize = smith.slice(&input);
+        if (len != 0) nonempty += 1;
+        var fx: Fixture = .{};
+        var cb = try fx.init();
+        const d = mmsdata.Data.decode(input[0..len]) catch continue;
+        d.validate() catch continue;
+        decoded += 1;
+        switch (cb.writeAttribute(sgcb_attributes[len % sgcb_attributes.len], d, 1, 0)) {
+            .ok => ok += 1,
+            .denied => denied += 1,
+            .invalid => invalid += 1,
+            else => {},
+        }
+    }
+    try testing.expectEqual(sgcb_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 8), decoded);
+    try testing.expectEqual(@as(usize, 1), ok);
+    try testing.expectEqual(@as(usize, 1), denied);
+    try testing.expectEqual(@as(usize, 6), invalid);
 }
 
 // ── the edit reservation and its timeout ────────────────────────────────────

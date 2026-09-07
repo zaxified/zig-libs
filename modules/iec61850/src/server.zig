@@ -2090,22 +2090,129 @@ test "an ordinary report is still routed to the report handler, not the control 
     c.disconnect();
 }
 
+const testkit = @import("testkit");
+const goldens = @import("goldens.zig");
+
+/// `testkit.fuzz.seedHex`, aliased so the literals below read as the frames
+/// they are. A corpus entry is not the frame: `Smith.slice` reads a
+/// little-endian `u32` length first, so a raw frame would arrive minus its own
+/// first four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = testkit.fuzz.seedHex;
+
+/// The harness's input buffer. Named because the corpus filter below depends on
+/// it and getting the two out of step is silent.
+const server_input_len: usize = 1024;
+
+/// The captured frames from `goldens.zig` that fit `server_input_len`.
+///
+/// ⚠ The filter is not tidiness. `Smith.slice` clamps a declared length against
+/// `rangeAtMost(0, buf.len)` and falls back to the range MINIMUM when it does
+/// not fit, so the 6675-octet `GetNameList` reply handed to a 1024-octet buffer
+/// is not a large seed — it is the EMPTY one, silently. Filtering keeps that
+/// out of the corpus instead of letting it look like a seed.
+const server_golden_hex = blk: {
+    @setEvalBranchQuota(20_000);
+    var out: [goldens.table.len][]const u8 = undefined;
+    var n: usize = 0;
+    for (goldens.table) |g| {
+        if (g.hex.len / 2 <= server_input_len) {
+            out[n] = g.hex;
+            n += 1;
+        }
+    }
+    const kept = out[0..n].*;
+    break :blk kept;
+};
+
+/// The literal half: frames that never reach a decoder at all, so the responder's
+/// early refusals are exercised too.
+const server_seeds = [_][]const u8{
+    seed("0300000702F080"), // a COTP data TPDU with an empty payload
+    seed("030000040000"), // a TPKT length that cannot hold its own header
+    seed("0300"), // two octets
+    seed("00"), // one octet
+};
+
+/// The whole corpus. `Server.handle` takes a complete TPKT frame, and this
+/// module has no literal for one — the frames live in `goldens.zig` as hex, so
+/// they are decoded at run time.
+///
+/// ⭐ The fuzz harness and the corpus guard below both build it from HERE. A
+/// guard measuring a different corpus from the one the harness gets is not a
+/// guard.
+const ServerCorpus = struct {
+    frames: [server_golden_hex.len][server_input_len]u8 = undefined,
+    stores: [server_golden_hex.len][4 + server_input_len]u8 = undefined,
+    entries: [server_golden_hex.len + server_seeds.len][]const u8 = undefined,
+
+    fn build(self: *ServerCorpus) []const []const u8 {
+        @memcpy(self.entries[0..server_seeds.len], &server_seeds);
+        for (server_golden_hex, 0..) |hex, i| {
+            const bytes = goldens.decodeHex(hex, &self.frames[i]);
+            self.entries[server_seeds.len + i] = testkit.fuzz.seedInto(&self.stores[i], bytes);
+        }
+        return &self.entries;
+    }
+};
+
 test "fuzz: the server never panics on arbitrary packets" {
-    try std.testing.fuzz({}, fuzzServer, .{});
+    var corpus: ServerCorpus = .{};
+    try std.testing.fuzz({}, fuzzServer, .{ .corpus = corpus.build() });
 }
 
 fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
     var fx: Fixture = .{};
     const model = fx.init() catch return;
     var srv = Server.init(.{}, model);
-    var input: [1024]u8 = undefined;
-    smith.bytes(&input);
-    const len: usize = smith.valueRangeAtMost(u16, 0, input.len);
+    var input: [server_input_len]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `handle` was called twice with an empty
+    // slice, the seed sitting unread in the buffer. A responder harness that
+    // never hands the responder a packet is not a responder harness.
+    const len: usize = smith.slice(&input);
     var out: [8192]u8 = undefined;
     _ = srv.handle(input[0..len], &out) catch {};
     // And again once associated, so the MMS path is reached too.
     srv.associated = true;
     _ = srv.handle(input[0..len], &out) catch {};
+}
+
+test "corpus: every server seed reaches handle, and the answered count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum) —
+    // which is exactly what `server_golden_hex` filters against, and this is
+    // what proves the filter works — and a corpus where nothing is answered is
+    // a corpus that only exercises the refusal path.
+    var nonempty: usize = 0;
+    var answered: usize = 0;
+    var accepted: usize = 0;
+    var corpus: ServerCorpus = .{};
+    const entries = corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var input: [server_input_len]u8 = undefined;
+        const len: usize = smith.slice(&input);
+        if (len != 0) nonempty += 1;
+        var fx: Fixture = .{};
+        const model = try fx.init();
+        var srv = Server.init(.{}, model);
+        srv.associated = true;
+        var out: [8192]u8 = undefined;
+        if (srv.handle(input[0..len], &out)) |reply| {
+            accepted += 1;
+            if (reply != null) answered += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    // `accepted` is the frames the responder got all the way through without a
+    // typed error; `answered` is the subset it had a reply for. Most of the
+    // captured table is traffic in the other direction, which a responder reads
+    // and has nothing to say about, so the two numbers are far apart on purpose.
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 2), answered);
 }
 
 // ── reporting, logging and setting groups, client against server ────────────
