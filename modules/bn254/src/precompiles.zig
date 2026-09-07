@@ -507,37 +507,203 @@ test "ecPairing: raw 32-byte ABI encoding matches the official Expected hex dire
 }
 
 // ── fuzz harnesses (untrusted calldata decoders) ────────────────────────
+//
+// ⚠ All three harnesses used to open with
+//
+//     smith.bytes(&buf);
+//     const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+//
+// which reads the input and then throws it away: `bytes` consumes
+// `@min(buf.len, in.len)` octets and the ranged draw then finds fewer than the
+// eight it reads as a little-endian u64, so `len` was the range MINIMUM — 0 —
+// on every input. With no corpus either, each target ran exactly one input
+// for ever: `ecAdd("")`, `ecMul("")`, `ecPairing("")`.
+//
+// ⛔ And all three of those SUCCEED. EIP-196 right-pads short calldata, so
+// `ecAdd("")` decodes `p = q = O` and returns 64 zero octets, and EIP-197's
+// empty product is `true` — so a guard asserting "something was accepted"
+// would have passed here while the harness walked no curve arithmetic at all.
+// That is why each guard below pins a SECOND number the empty input cannot
+// produce: a result that is not the point at infinity, or a `false`.
+//
+// ⛔ The `ecPairing` buffer was also too small for this module's own fixtures.
+// `ten_point_match_1`..`_3` are 1920 octets and the buffer held 416, and a
+// seed longer than the buffer reads back EMPTY (`Smith.slice` falls back to
+// the range minimum) — so the largest calldata the module owns could never
+// have passed through the harness meant to fuzz it, silently.
+
+const testkit = @import("testkit");
+
+/// `hex` with one hex DIGIT changed. A real vector one nibble off is still
+/// well-formed calldata of the right length, so it reaches the field and
+/// curve checks rather than dying on a length rule the way random bytes do.
+/// The replacement is always a valid hex digit, so `seedHex` cannot be handed
+/// a malformed literal.
+fn nibbled(comptime hex: []const u8, comptime at: usize) []const u8 {
+    return &struct {
+        const s = blk: {
+            var out = hex[0..hex.len].*;
+            out[at] = if (out[at] == 'f') '0' else 'f';
+            break :blk out;
+        };
+    }.s;
+}
+
+// ── ecAdd ────────────────────────────────────────────────────────────────
+
+/// Every official `ecAdd` vector (they already cover empty, short-padded,
+/// exact and over-long calldata) plus the shapes that must be REFUSED —
+/// which no official vector carries, since go-ethereum's table is a
+/// success table.
+const ecadd_seeds = blk: {
+    @setEvalBranchQuota(1 << 20);
+    var out: [add_vectors.len + 3][]const u8 = undefined;
+    for (add_vectors, 0..) |v, i| out[i] = testkit.fuzz.seedHex(v.input);
+    // `chfast1` with one nibble of p.x changed: a well-formed field element
+    // that is not on the curve -> error.NotOnCurve.
+    out[add_vectors.len + 0] = testkit.fuzz.seedHex(nibbled(add_vectors[0].input, 20));
+    // A coordinate at 2^256-1, far above the field modulus p
+    // -> error.InvalidFieldElement.
+    out[add_vectors.len + 1] = testkit.fuzz.seedHex("ff" ** 128);
+    // 65 octets: past the first point, mid-way through the second, so the
+    // right-pad rule has to finish the frame.
+    out[add_vectors.len + 2] = testkit.fuzz.seedHex("11" ** 65);
+    break :blk out;
+};
 
 test "fuzz: ecAdd never crashes on arbitrary calldata" {
-    try std.testing.fuzz({}, fuzzEcAdd, .{});
+    try std.testing.fuzz({}, fuzzEcAdd, .{ .corpus = &ecadd_seeds });
 }
 
 fn fuzzEcAdd(_: void, smith: *std.testing.Smith) !void {
+    // 256 against a 192-octet longest official vector.
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
+    const len: usize = smith.slice(&buf);
     _ = ecAdd(buf[0..len]) catch return;
 }
 
+test "corpus: the ecAdd seeds reach the decoder, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var points: usize = 0; // results that are NOT the point at infinity
+    for (ecadd_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const out = ecAdd(buf[0..len]) catch continue;
+        accepted += 1;
+        if (!std.mem.allEqual(u8, &out, 0)) points += 1;
+    }
+    // `cdetrio4`'s input is the empty string — the one input this target used
+    // to run, now one seed among many rather than the whole corpus.
+    try std.testing.expectEqual(ecadd_seeds.len - 1, nonempty);
+    try std.testing.expectEqual(@as(usize, 16), accepted);
+    try std.testing.expectEqual(@as(usize, 10), points);
+}
+
+// ── ecMul ────────────────────────────────────────────────────────────────
+
+const ecmul_seeds = blk: {
+    @setEvalBranchQuota(1 << 20);
+    var out: [mul_vectors.len + 4][]const u8 = undefined;
+    for (mul_vectors, 0..) |v, i| out[i] = testkit.fuzz.seedHex(v.input);
+    // `chfast1` with one nibble of p.x changed -> error.NotOnCurve.
+    out[mul_vectors.len + 0] = testkit.fuzz.seedHex(nibbled(mul_vectors[0].input, 20));
+    // A coordinate above the field modulus -> error.InvalidFieldElement.
+    out[mul_vectors.len + 1] = testkit.fuzz.seedHex("ff" ** 96);
+    // Only the point, no scalar: the right-pad rule supplies s = 0, so the
+    // result is the point at infinity — accepted, and it must NOT count
+    // towards `points`.
+    out[mul_vectors.len + 2] = testkit.fuzz.seedHex(mul_vectors[0].input[0 .. 64 * 2]);
+    // Empty calldata: p = O, s = 0. The one input this target used to run.
+    out[mul_vectors.len + 3] = testkit.fuzz.seed("");
+    break :blk out;
+};
+
 test "fuzz: ecMul never crashes on arbitrary calldata" {
-    try std.testing.fuzz({}, fuzzEcMul, .{});
+    try std.testing.fuzz({}, fuzzEcMul, .{ .corpus = &ecmul_seeds });
 }
 
 fn fuzzEcMul(_: void, smith: *std.testing.Smith) !void {
+    // 256 against a 96-octet longest official vector.
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    const len: usize = smith.slice(&buf);
     _ = ecMul(buf[0..len]) catch return;
 }
 
-test "fuzz: ecPairing never crashes on arbitrary calldata" {
-    try std.testing.fuzz({}, fuzzEcPairing, .{});
+test "corpus: the ecMul seeds reach the decoder, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var points: usize = 0;
+    for (ecmul_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const out = ecMul(buf[0..len]) catch continue;
+        accepted += 1;
+        if (!std.mem.allEqual(u8, &out, 0)) points += 1;
+    }
+    try std.testing.expectEqual(ecmul_seeds.len - 1, nonempty);
+    try std.testing.expectEqual(@as(usize, 21), accepted);
+    try std.testing.expectEqual(@as(usize, 18), points);
 }
 
+// ── ecPairing ────────────────────────────────────────────────────────────
+
+const ecpairing_seeds = blk: {
+    @setEvalBranchQuota(1 << 22);
+    var out: [pairing_vectors.len + 3][]const u8 = undefined;
+    for (pairing_vectors, 0..) |v, i| out[i] = testkit.fuzz.seedHex(v.input);
+    // `jeff1` with one nibble of the first G2 coordinate changed: the pair is
+    // still 192 octets, so it gets past the length rule and into the on-curve
+    // and — the security-critical one — the G2 subgroup check.
+    out[pairing_vectors.len + 0] = testkit.fuzz.seedHex(nibbled(pairing_vectors[0].input, 300));
+    // 191 octets: not a multiple of 192 -> error.BadLength.
+    out[pairing_vectors.len + 1] = testkit.fuzz.seedHex(pairing_vectors[0].input[0 .. 191 * 2]);
+    // One pair of coordinates all above the field modulus.
+    out[pairing_vectors.len + 2] = testkit.fuzz.seedHex("ff" ** 192);
+    break :blk out;
+};
+
+test "fuzz: ecPairing never crashes on arbitrary calldata" {
+    try std.testing.fuzz({}, fuzzEcPairing, .{ .corpus = &ecpairing_seeds });
+}
+
+/// The `ecPairing` buffer. ⛔ It used to be `2 * pair_encoded_bytes + 32` =
+/// 416 octets, and `ten_point_match_1`..`_3` — this module's own largest
+/// official vectors — are 1920. A seed over the buffer reads back EMPTY, so
+/// those three could never have reached the harness. 10 pairs plus 32 keeps
+/// the off-multiple lengths reachable as well.
+const ecpairing_buf_bytes = 10 * pair_encoded_bytes + 32;
+
 fn fuzzEcPairing(_: void, smith: *std.testing.Smith) !void {
-    // Cover 0, 1, and 2 pairs (192 bytes each) plus off-multiple lengths.
-    var buf: [2 * pair_encoded_bytes + 32]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    var buf: [ecpairing_buf_bytes]u8 = undefined;
+    const len: usize = smith.slice(&buf);
     _ = ecPairing(std.testing.allocator, buf[0..len]) catch return;
+}
+
+test "corpus: the ecPairing seeds reach the decoder, and the counts are pinned" {
+    // ⛔ `accepted` alone is worthless here: EIP-197's empty product is `true`,
+    // so `ecPairingCheck("")` succeeds without decoding a single point — which
+    // is exactly what this target did on every run before the corpus. `falses`
+    // is the number only a batch of REAL points can produce.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var falses: usize = 0;
+    for (ecpairing_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [ecpairing_buf_bytes]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const ok = ecPairingCheck(std.testing.allocator, buf[0..len]) catch continue;
+        accepted += 1;
+        if (!ok) falses += 1;
+    }
+    // `empty_data`'s input is the empty string.
+    try std.testing.expectEqual(ecpairing_seeds.len - 1, nonempty);
+    try std.testing.expectEqual(@as(usize, 14), accepted);
+    try std.testing.expectEqual(@as(usize, 2), falses);
 }

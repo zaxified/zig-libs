@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — The three precompile fuzz targets ran exactly one input each, for ever.
+  Each drew `smith.bytes(&buf)` and then a ranged length, which returns the range minimum
+  when fewer than eight input octets remain, so the length was 0 on every input; with no
+  corpus the lane replayed `ecAdd("")`, `ecMul("")`, `ecPairing("")`. ⛔ All three of those
+  **succeed** — EIP-196 right-pads short calldata so empty input decodes `p = q = O`, and
+  EIP-197's empty product is `true` — so no crash and no "nothing accepted" could ever have
+  reported it. ⛔ The `ecPairing` buffer was also 416 octets against this module's own
+  1920-octet `ten_point_match_*` vectors, and a seed longer than the buffer reads back
+  EMPTY: the largest calldata bn254 owns could not have passed through the harness meant to
+  fuzz it. The draw is now one `smith.slice(&buf)`, the `ecPairing` buffer is
+  `10 * pair_encoded_bytes + 32`, and each target's corpus is the full official
+  go-ethereum vector table plus the refusals that table has none of (a nibble off a real
+  point, a coordinate above the field modulus, an off-multiple length). Measured: 18/19,
+  22/23 and 16/17 non-empty seeds reach the decoder where 0 did; 16, 21 and 14 accepted,
+  of which **10** and **18** results are not the point at infinity and **2** pairing checks
+  return `false`. Those second numbers are pinned precisely because the empty input cannot
+  produce them, and an accepted count here would have been satisfied by it.
+
 - **2026-09-03** — Drift re-audit. **`bn254` is now on the constant-time
   gate.** `1892c814` replaced `Fp`'s `std.crypto.ff` backend with ~450 lines
   of hand-written constant-time Montgomery arithmetic and the module was not

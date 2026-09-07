@@ -311,7 +311,7 @@ const module_list = [_]Module{
     // already has frozen. The published `ibe` module never imports it --
     // `zig build check-testonly` proves that.
     .{ .name = "ibe", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"tlock"}, .heavy = true },
-    .{ .name = "bn254", .libs = &.{"crypto"}, .heavy = true },
+    .{ .name = "bn254", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "ed448", .libs = &.{"crypto"}, .deps = &.{"entropy"} },
     .{ .name = "decaf448", .libs = &.{"crypto"}, .deps = &.{"ed448"} },
     .{ .name = "paillier", .libs = &.{"crypto"}, .deps = &.{"montint"}, .heavy = true },
