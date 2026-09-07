@@ -22,7 +22,6 @@ blobmsg 2
 bn254 3
 bolt8 3
 brotli 1
-btcp2p 11
 bulletproofs 2
 cbor 2
 chachapoly 2
@@ -60,7 +59,6 @@ ibe 1
 icmp 1
 iec104 4
 iec61850 21
-imap 5
 isis 1
 isis-lsdb 2
 isis-spf 1
@@ -115,7 +113,6 @@ sealedbox 1
 sessions 2
 signal 2
 slhdsa 1
-smtp 7
 snmp 3
 sntp 1
 spake2plus 1
