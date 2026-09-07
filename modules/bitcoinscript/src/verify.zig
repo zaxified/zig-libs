@@ -460,18 +460,51 @@ test "DoS: oversized scriptPubKey rejected before any execution" {
 // undefined-opcode byte; flags and the witness stack are randomized too,
 // so the P2SH/segwit-v0/taproot sub-paths of `verifyScript` above get a
 // turn as well.
+const fuzzseed = @import("testkit").fuzz;
+
+/// ⛔ This target had NO corpus, so the ordinary test lane ran exactly one
+/// round of `in = ""` and every `Smith` draw returned its minimum. That made
+/// `head_len` 0, `total` 0, `n_witness` 0 and every one of `ScriptFlags`'
+/// twenty booleans `false`: **`verifyScript(a, "", "", &.{}, .{}, ctx)`, one
+/// input, for ever.** Two audit fixes are recorded in the comments below —
+/// `inline for` over the flag struct so no field is left undrawn, and the
+/// long-script builder that walks the 201-opcode / 1000-element / 10 000-octet
+/// limits from both sides — and **neither had ever executed a single time**,
+/// because both live behind draws that had already collapsed. Measured
+/// 2026-09-07: 1 input, 0 script octets, 0 witness items, 0 flags set.
+///
+/// The choices now come out of ONE `smith.slice`, read as an octet script
+/// through `testkit.fuzz.Cursor`, in the order `fuzzVerifyScript` documents.
+const verify_script_len = 512;
+
+const verify_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // the empty script: what this target ran, for ever
+    fuzzseed.seedHex("04" ++ "0151" ++ "0152" ++ "0187" ++ "0100" ++ "00" ++ "00" ++ "04" ++ "0151" ++ "0187" ++ "0100" ++ "0100" ++ "00" ++ "00" ++ "00"), // ⭐ OP_1 OP_2 OP_EQUAL in the sig, a short pubkey
+    fuzzseed.seedHex("02" ++ "0176" ++ "01a9" ++ "00" ++ "00" ++ "02" ++ "0188" ++ "01ac" ++ "00" ++ "00" ++ "00"), // OP_DUP OP_HASH160 / OP_EQUALVERIFY OP_CHECKSIG: the P2PKH shape
+    fuzzseed.seedHex("00" ++ "01" ++ "01" ++ "00" ++ "01" ++ "01" ++ "00" ++ "00"), // ⭐ `total` case 1: 200 filler opcodes, just under the 201 limit
+    fuzzseed.seedHex("00" ++ "01" ++ "02" ++ "00" ++ "01" ++ "02" ++ "00" ++ "00"), // ⭐ case 2: 202, just over
+    fuzzseed.seedHex("00" ++ "01" ++ "03" ++ "00" ++ "01" ++ "03" ++ "00" ++ "00"), // ⭐ case 3: 1001 `OP_1` pushes, crossing the 1000-element stack bound
+    fuzzseed.seedHex("00" ++ "01" ++ "04" ++ "00" ++ "01" ++ "04" ++ "00" ++ "00"), // ⭐ case 4: 10 000 octets, the max_script_size boundary
+    fuzzseed.seedHex("00" ++ "01" ++ "05" ++ "ff" ++ "ff" ++ "00" ++ "01" ++ "05" ++ "ff" ++ "ff" ++ "00" ++ "00"), // case 5: a drawn length up to 10 001
+    fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "01" ++ "10" ++ "01" ++ "5a"), // ⭐ one witness item, 519 octets: just under the 520 push limit
+    fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "01" ++ "10" ++ "02" ++ "5a"), // ⭐ one witness item, 521 octets: just over
+    fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "04" ++ "08" ++ "00" ++ "08" ++ "00" ++ "08" ++ "00" ++ "08" ++ "00"), // the full four-item witness stack
+    fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "ff" ** 24), // ⭐ every ScriptFlags boolean set
+    fuzzseed.seedHex("00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "aa" ** 24), // an alternating flag pattern
+    fuzzseed.seedHex("08" ++ "01a9" ++ "0114" ++ "0100" ** 6 ++ "00" ++ "00" ++ "00" ++ "00" ++ "00"), // a P2SH-ish redeem prefix
+};
+
 test "fuzz: verifyScript never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzVerifyScript, .{});
+    try testing.fuzz({}, fuzzVerifyScript, .{ .corpus = &verify_seeds });
 }
 
-fn fuzzScriptBytes(smith: *std.testing.Smith, buf: []u8) []u8 {
+fn fuzzScriptBytes(script: *fuzzseed.Cursor, buf: []u8) []u8 {
     for (buf) |*b| {
         // Real opcodes (incl. push-data forms) 5-in-6 of the time; fully
         // random (incl. bytes past 0xba) the rest.
-        b.* = if (smith.valueRangeAtMost(u8, 0, 5) != 0) smith.valueRangeAtMost(u8, 0, 0xba) else smith.value(u8);
+        b.* = if (script.ranged(0, 5) != 0) @intCast(script.ranged(0, 0xba)) else script.byte();
     }
-    const len: usize = smith.valueRangeAtMost(u8, 0, @intCast(buf.len));
-    return buf[0..len];
+    return buf;
 }
 
 /// W2 A3 (F6) recorded two structural caps on this harness. The first was the
@@ -481,10 +514,10 @@ fn fuzzScriptBytes(smith: *std.testing.Smith, buf: []u8) []u8 {
 /// locktime-verify gates were never on. `inline for` over the struct closes
 /// that permanently — a flag added later is drawn without anyone remembering
 /// to come back here.
-fn fuzzFlags(smith: *std.testing.Smith) ScriptFlags {
+fn fuzzFlags(script: *fuzzseed.Cursor) ScriptFlags {
     var sf: ScriptFlags = .{};
     inline for (@typeInfo(ScriptFlags).@"struct".fields) |f| {
-        if (f.type == bool) @field(sf, f.name) = smith.value(bool);
+        if (f.type == bool) @field(sf, f.name) = script.byte() & 1 == 1;
     }
     return sf;
 }
@@ -497,24 +530,70 @@ fn fuzzFlags(smith: *std.testing.Smith) ScriptFlags {
 /// fuzzer-chosen head followed by a run of one repeated opcode: that is what
 /// actually walks the opcode counter and the stack-depth counter up to their
 /// limits, and `OP_1`-style pushes cross the 1000-element bound.
-fn fuzzLongScript(smith: *std.testing.Smith, buf: []u8) []u8 {
-    const head_len: usize = @min(buf.len, smith.valueRangeAtMost(u8, 0, 64));
-    _ = fuzzScriptBytes(smith, buf[0..head_len]);
-    const filler: u8 = if (smith.value(bool))
-        smith.valueRangeAtMost(u8, 0x51, 0x60) // OP_1..OP_16: one stack element each
+fn fuzzLongScript(script: *fuzzseed.Cursor, buf: []u8) []u8 {
+    const head_len: usize = @min(buf.len, script.ranged(0, 64));
+    _ = fuzzScriptBytes(script, buf[0..head_len]);
+    const filler: u8 = if (script.byte() & 1 == 1)
+        @intCast(script.ranged(0x51, 0x60)) // OP_1..OP_16: one stack element each
     else
-        smith.valueRangeAtMost(u8, 0, 0xba);
+        @intCast(script.ranged(0, 0xba));
     // Both sides of every limit: just under, just over, and far over.
-    const total: usize = @min(buf.len, switch (smith.valueRangeAtMost(u8, 0, 5)) {
+    const total: usize = @min(buf.len, switch (script.ranged(0, 5)) {
         0 => head_len,
         1 => 200,
         2 => 202,
         3 => 1001,
         4 => 10_000,
-        else => smith.valueRangeAtMost(u16, 0, 10_001),
+        else => @as(usize, script.word()) % 10_002,
     });
     if (total > head_len) @memset(buf[head_len..total], filler);
     return buf[0..@max(total, head_len)];
+}
+
+/// Everything one seed decides, assembled from the script. Shared with the
+/// corpus guard so the guard measures what the harness builds.
+const VerifyCase = struct {
+    script_sig: []u8,
+    script_pubkey: []u8,
+    witness: [][]const u8,
+    flags: ScriptFlags,
+};
+
+fn buildVerifyCase(
+    seed: []const u8,
+    sig_buf: *[10_001]u8,
+    pubkey_buf: *[10_001]u8,
+    witness_bufs: *[4][600]u8,
+    witness_items: *[4][]const u8,
+) VerifyCase {
+    var script: fuzzseed.Cursor = .{ .bytes = seed };
+    const script_sig = fuzzLongScript(&script, sig_buf);
+    const script_pubkey = fuzzLongScript(&script, pubkey_buf);
+
+    const n_witness = script.ranged(0, 4);
+    var i: u32 = 0;
+    while (i < n_witness) : (i += 1) {
+        // Up to 600 so the 520-octet per-element limit is reachable from both
+        // sides; the drawn prefix stays short and the rest is one repeated
+        // octet, for the same throughput reason as the scripts above.
+        const drawn: usize = script.ranged(0, 64);
+        for (witness_bufs[i][0..drawn]) |*b| b.* = script.byte();
+        const wlen: usize = @max(drawn, switch (script.ranged(0, 3)) {
+            0 => drawn,
+            1 => 519,
+            2 => 521,
+            else => @as(usize, script.word()) % 601,
+        });
+        if (wlen > drawn) @memset(witness_bufs[i][drawn..wlen], script.byte());
+        witness_items[i] = witness_bufs[i][0..wlen];
+    }
+
+    return .{
+        .script_sig = script_sig,
+        .script_pubkey = script_pubkey,
+        .witness = witness_items[0..n_witness],
+        .flags = fuzzFlags(&script),
+    };
 }
 
 fn fuzzVerifyScript(_: void, smith: *std.testing.Smith) !void {
@@ -522,32 +601,68 @@ fn fuzzVerifyScript(_: void, smith: *std.testing.Smith) !void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var sig_buf: [10_001]u8 = undefined;
-    const script_sig = fuzzLongScript(smith, &sig_buf);
-    var pubkey_buf: [10_001]u8 = undefined;
-    const script_pubkey = fuzzLongScript(smith, &pubkey_buf);
+    // ⚠ ONE byte-first draw. See `verify_seeds` for what the chain of ranged
+    // draws was worth with no corpus at all.
+    var seed_buf: [verify_script_len]u8 = undefined;
+    const n: usize = smith.slice(&seed_buf);
 
-    const n_witness = smith.valueRangeAtMost(u8, 0, 4);
+    var sig_buf: [10_001]u8 = undefined;
+    var pubkey_buf: [10_001]u8 = undefined;
     var witness_bufs: [4][600]u8 = undefined;
     var witness_items: [4][]const u8 = undefined;
-    var i: u8 = 0;
-    while (i < n_witness) : (i += 1) {
-        // Up to 600 so the 520-octet per-element limit is reachable from both
-        // sides; the drawn prefix stays short and the rest is one repeated
-        // octet, for the same throughput reason as the scripts above.
-        const drawn: usize = smith.valueRangeAtMost(u8, 0, 64);
-        smith.bytes(witness_bufs[i][0..drawn]);
-        const wlen: usize = @max(drawn, switch (smith.valueRangeAtMost(u8, 0, 3)) {
-            0 => drawn,
-            1 => 519,
-            2 => 521,
-            else => smith.valueRangeAtMost(u16, 0, 600),
-        });
-        if (wlen > drawn) @memset(witness_bufs[i][drawn..wlen], smith.value(u8));
-        witness_items[i] = witness_bufs[i][0..wlen];
+    const c = buildVerifyCase(seed_buf[0..n], &sig_buf, &pubkey_buf, &witness_bufs, &witness_items);
+
+    verifyScript(a, c.script_sig, c.script_pubkey, c.witness, c.flags, dummyCtx()) catch return;
+}
+
+test "corpus: every seed builds a case, and the limits the corpus crosses are pinned" {
+    // ⭐ `verifyScript` refusing is the normal outcome and says nothing, so
+    // acceptance is not the reach signal. What is pinned is whether the corpus
+    // actually gets NEAR the consensus limits the long-script builder was
+    // added for — the 201-opcode, 1000-element and 10 000-octet bounds, and the
+    // 520-octet witness push — because none of them had ever been approached.
+    var nonempty: usize = 0;
+    var script_octets: usize = 0;
+    var witness_items_total: usize = 0;
+    var flags_set: usize = 0;
+    var over_200: usize = 0;
+    var over_10k: usize = 0;
+    var witness_over_520: usize = 0;
+    for (verify_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var seed_buf: [verify_script_len]u8 = undefined;
+        const n: usize = smith.slice(&seed_buf);
+        if (n != 0) nonempty += 1;
+
+        var sig_buf: [10_001]u8 = undefined;
+        var pubkey_buf: [10_001]u8 = undefined;
+        var witness_bufs: [4][600]u8 = undefined;
+        var witness_items: [4][]const u8 = undefined;
+        const c = buildVerifyCase(seed_buf[0..n], &sig_buf, &pubkey_buf, &witness_bufs, &witness_items);
+
+        script_octets += c.script_sig.len + c.script_pubkey.len;
+        witness_items_total += c.witness.len;
+        for (c.witness) |w| {
+            if (w.len > 520) witness_over_520 += 1;
+        }
+        if (c.script_sig.len > 200 or c.script_pubkey.len > 200) over_200 += 1;
+        if (c.script_sig.len >= 10_000 or c.script_pubkey.len >= 10_000) over_10k += 1;
+        inline for (@typeInfo(ScriptFlags).@"struct".fields) |f| {
+            if (f.type == bool and @field(c.flags, f.name)) flags_set += 1;
+        }
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        verifyScript(arena.allocator(), c.script_sig, c.script_pubkey, c.witness, c.flags, dummyCtx()) catch {};
     }
-
-    const sf = fuzzFlags(smith);
-
-    verifyScript(a, script_sig, script_pubkey, witness_items[0..n_witness], sf, dummyCtx()) catch return;
+    // One seed is deliberately empty.
+    try testing.expectEqual(verify_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draws were restructured every one of
+    // these was 0: one input, two empty scripts, no witness, no flag set.
+    try testing.expectEqual(@as(usize, 39141), script_octets);
+    try testing.expectEqual(@as(usize, 18), witness_items_total);
+    try testing.expectEqual(@as(usize, 102), flags_set);
+    try testing.expectEqual(@as(usize, 8), over_200);
+    try testing.expectEqual(@as(usize, 3), over_10k);
+    try testing.expectEqual(@as(usize, 1), witness_over_520);
 }
