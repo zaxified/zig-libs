@@ -506,7 +506,6 @@ test "corpus: every record seed reaches its decoder, and the counts are pinned" 
         if (d.hdr.cid != null) with_cid += 1;
         if (d.hdr.length != null) with_length += 1;
     }
-    std.debug.print("\nUNIFIED entries={d} nonempty={d} decoded={d} consumed={d} cid={d} len={d}\n", .{ unified.len, nonempty, decoded, consumed, with_cid, with_length });
     try testing.expectEqual(unified.len, nonempty);
     try testing.expectEqual(@as(usize, 85), decoded);
     try testing.expectEqual(@as(usize, 399), consumed);
@@ -527,7 +526,6 @@ test "corpus: every record seed reaches its decoder, and the counts are pinned" 
         if (h.content_type == 22) handshake_records += 1;
         declared += h.length;
     }
-    std.debug.print("PLAIN entries={d} nonempty={d} decoded={d} hs={d} declared={d} dropU={d} dropP={d}\n", .{ corpus.plaintext.n, p_nonempty, p_decoded, handshake_records, declared, corpus.unified.dropped, corpus.plaintext.dropped });
     try testing.expectEqual(corpus.plaintext.n, p_nonempty);
     try testing.expectEqual(@as(usize, 21), p_decoded);
     try testing.expectEqual(@as(usize, 21), handshake_records);
