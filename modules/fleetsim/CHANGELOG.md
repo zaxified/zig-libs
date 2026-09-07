@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: the six-adapter dispatch fuzz target built no
+  fleet, added no node and submitted no frame — it returned before allocating
+  anything, on every run it has ever made.** `fuzzSmith` drew
+  `smith.bytes(&buf)` and then `smith.valueRangeAtMost(u16, 0, buf.len)`;
+  `bytes` consumes `@min(buf.len, in.len)` octets, so the ranged draw found
+  fewer than the eight it reads as a little-endian `u64` and returned the range
+  MINIMUM. `len` was 0 for every input the ordinary test lane can carry, and
+  `fuzzDispatch`'s first line is `if (input.len == 0) return;`. Measured
+  2026-09-07: **1 input, 0 octets, 0 chunks, 0 submissions.** ⭐ The invariant
+  the harness asserts — every in-flight slot back in the pool once the queue
+  has drained — holds *trivially* when nothing was ever submitted, which is
+  exactly how the target reported success while doing nothing. The seven inputs
+  that already existed as a separate deterministic test the fuzz lane could not
+  see are now the target's corpus too (grown to 11: a chunk head cycling
+  through all six adapters, a length octet claiming more than remains, and a
+  Modbus request behind a length octet so it arrives as one frame). Measured
+  after: **11 of 11 seeds non-empty over 208 octets, 89 chunks cut and 89
+  submitted.** `master_goldens.zig` is untouched — its bytes are a
+  provenanced pymodbus recording and not a fuzz corpus.
+
 - **2026-09-01** — Security audit.
   **One silent TCP connection wedged the whole `serveTcpMulti` loop.** `fds` is built from the
   peers active BEFORE the accept pass; the read loop walked the peers active AFTER it with a

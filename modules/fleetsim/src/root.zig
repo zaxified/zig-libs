@@ -679,14 +679,61 @@ test "hostile: garbage aimed at every adapter is answered or ignored, never fata
 
 // ── fuzz ────────────────────────────────────────────────────────────────────
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// ⛔ `fuzzSmith` drew `smith.bytes(&buf)` and then
+/// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` consumes
+/// `@min(buf.len, in.len)` octets, so the ranged draw found fewer than the
+/// eight it reads as a little-endian `u64` and returned the range MINIMUM:
+/// `len` was 0 for every input the ordinary test lane can carry, and
+/// `fuzzDispatch`'s very first line is `if (input.len == 0) return;`. **The
+/// target built no fleet, added no node and submitted no frame — it returned
+/// before allocating anything, on every run it has ever made.** Measured
+/// 2026-09-07: 1 input, 0 octets, 0 chunks submitted, 0 outbound frames.
+///
+/// The inputs below already existed as a separate deterministic test that the
+/// fuzz lane could not see. They are now the target's corpus as well, so the
+/// same bytes drive both, and the deterministic test replays the list directly.
+const dispatch_inputs = [_][]const u8{
+    &.{0x00}, // one octet: seeds the fleet and submits a single empty-ish chunk
+    &.{ 0x05, 0x64, 0x05, 0xC0, 0x01, 0x00, 0x00, 0x04, 0xE9, 0x21 }, // a DNP3 link header
+    &.{ 0x68, 0x04, 0x07, 0x00, 0x00, 0x00 }, // an IEC 104 APDU
+    &.{ 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02 }, // a Modbus/TCP read-holding-registers request
+    &.{ 0x03, 0x00, 0x00, 0x16, 0x11, 0xE0 }, // a TPKT/COTP connect request
+    &[_]u8{0xFF} ** 64, // ⭐ every chunk 256 octets long, so the whole input is one chunk
+    &[_]u8{0x00} ** 64, // ⭐ every chunk 1 octet long, so the input is 64 dispatches
+    &.{ 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x05 }, // ⭐ the chunk head cycles through all six adapters
+    &.{ 0x0B, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02 }, // a Modbus request behind a length octet, so it arrives as one frame
+    &.{ 0xFF, 0x05, 0x64, 0x05, 0xC0, 0x01, 0x00, 0x00, 0x04, 0xE9, 0x21 }, // ⭐ a length octet claiming more than remains: the clamp
+    &.{ 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02 }, // uniform 3-octet chunks
+};
+
+const dispatch_seeds = blk: {
+    var out: [dispatch_inputs.len][]const u8 = undefined;
+    for (dispatch_inputs, 0..) |inp, i| out[i] = fuzzseed.seed(inp);
+    break :blk out;
+};
+
 fn fuzzSmith(_: void, smith: *std.testing.Smith) anyerror!void {
     var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ ONE `smith.slice`. See `dispatch_inputs` for what the ranged length
+    // after `smith.bytes` did to this target.
+    const len: usize = smith.slice(&buf);
     return fuzzDispatch({}, buf[0..len]);
 }
 
+/// What one dispatch actually did, so a corpus guard can pin reach rather than
+/// "it did not crash" — the old target never even entered the loop.
+const DispatchStats = struct {
+    chunks: usize = 0,
+    submitted: usize = 0,
+    outbound: usize = 0,
+};
+
+var dispatch_stats: DispatchStats = .{};
+
 fn fuzzDispatch(_: void, input: []const u8) anyerror!void {
+    dispatch_stats = .{};
     if (input.len == 0) return;
     var f = try Fleet.init(testing.allocator, .{
         .seed = input[0],
@@ -788,35 +835,59 @@ fn fuzzDispatch(_: void, input: []const u8) anyerror!void {
         const chunk_len = @min(@as(usize, input[pos]) + 1, input.len - pos);
         const chunk = input[pos..][0..chunk_len];
         const id = ids[chunk[0] % ids.len];
-        _ = f.submitStream(id, chunk, t) catch |e| switch (e) {
+        dispatch_stats.chunks += 1;
+        if (f.submitStream(id, chunk, t)) |_| {
+            dispatch_stats.submitted += 1;
+        } else |e| switch (e) {
             error.UnknownNode, error.FrameTooLarge => {},
             else => return e,
-        };
+        }
         _ = try f.advance(t);
         t += 1 + @as(Time, chunk[chunk_len - 1]);
         pos += chunk_len;
     }
     _ = try f.advance(t + 5000);
+    dispatch_stats.outbound = f.outbound().len;
     // The invariant that must hold no matter what came in: every in-flight
     // slot is back in the pool once the queue has drained.
     try testing.expectEqual(f.opts.inflight_capacity, f.free_count);
 }
 
 test "fuzz: frame dispatch across six adapters survives arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzSmith, .{});
+    try std.testing.fuzz({}, fuzzSmith, .{ .corpus = &dispatch_seeds });
 }
 
 test "fuzz: the seed corpus (deterministic, runs in CI)" {
-    const corpus = [_][]const u8{
-        &.{0x00},
-        &.{ 0x05, 0x64, 0x05, 0xC0, 0x01, 0x00, 0x00, 0x04, 0xE9, 0x21 },
-        &.{ 0x68, 0x04, 0x07, 0x00, 0x00, 0x00 },
-        &.{ 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x02 },
-        &.{ 0x03, 0x00, 0x00, 0x16, 0x11, 0xE0 },
-        &[_]u8{0xFF} ** 64,
-        &[_]u8{0x00} ** 64,
-    };
-    for (corpus) |c| try fuzzDispatch({}, c);
+    for (dispatch_inputs) |c| try fuzzDispatch({}, c);
+}
+
+test "corpus: every seed reaches the dispatch loop, and the chunks submitted are pinned" {
+    // ⭐ There is no "accepted" to count here — `submitStream` swallowing a
+    // malformed frame is a legal outcome — and the invariant `fuzzDispatch`
+    // asserts (`free_count` back to capacity) holds trivially when nothing was
+    // ever submitted, which is precisely how this target passed while doing
+    // nothing. The numbers that say the loop ran are the chunks cut from the
+    // input and the ones the fleet accepted.
+    var nonempty: usize = 0;
+    var octets: usize = 0;
+    var chunks: usize = 0;
+    var submitted: usize = 0;
+    for (dispatch_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        octets += len;
+        try fuzzDispatch({}, buf[0..len]);
+        chunks += dispatch_stats.chunks;
+        submitted += dispatch_stats.submitted;
+    }
+    // Measured 2026-09-07. Before the draw was restructured every one of these
+    // was 0: `fuzzDispatch` returned on its `input.len == 0` line.
+    try testing.expectEqual(@as(usize, 11), nonempty);
+    try testing.expectEqual(@as(usize, 208), octets);
+    try testing.expectEqual(@as(usize, 89), chunks);
+    try testing.expectEqual(@as(usize, 89), submitted);
 }
 
 // ── scale ───────────────────────────────────────────────────────────────────

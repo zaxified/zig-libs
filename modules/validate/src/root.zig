@@ -3207,91 +3207,244 @@ const fuzz_schema = [_]Rule{
     } },
 };
 
+const fuzzseed = @import("testkit").fuzz;
+
+// ⛔ Neither of these two targets had a corpus, so outside `--fuzz` the runner
+// gave each ONE input: `in = ""`. Every draw then returned its minimum.
+// `fuzzValidateJson`'s opening `smith.value(bool)` was false, every per-field
+// `smith.value(bool)` was false too, and the body it built was `"{}"` — so
+// the type gate, the format and pattern checks, the min_len/max_len bounds and
+// the nested object/array walk, which the comment above lists as the whole
+// reason the shape generator exists, had never run once. `fuzzValidateFormat`
+// was worse: `smith.value(Format)` gave `.email` for ever and the string was
+// empty, so **eleven of the twelve formats had never been called at all**.
+// Measured 2026-09-07: 1 body, 1 format, 0 non-empty strings.
+
+const json_buf_len = 512;
+const format_buf_len = 128;
+
+/// Octet 0 selects: `0x00` means the rest of the seed IS the body, verbatim;
+/// anything else means the rest is a script assembling an object from the
+/// schema's own field names.
+const json_seeds = [_][]const u8{
+    fuzzseed.seed("\x00" ++ "{}"), // the empty object: what this target ran for ever
+    fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"meta\":{\"id\":1}}"), // ⭐ the minimum that satisfies both required rules
+    fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"age\":42,\"email\":\"a@b.co\",\"code\":\"ID-7\",\"tags\":[\"x\"],\"meta\":{\"id\":1,\"active\":true}}"), // ⭐ every rule satisfied
+    fuzzseed.seed("\x00" ++ "{\"name\":\"\",\"meta\":{\"id\":1}}"), // ⭐ `min_len` 1 violated by the empty string
+    fuzzseed.seed("\x00" ++ "{\"name\":\"" ++ "x" ** 40 ++ "\",\"meta\":{\"id\":1}}"), // `max_len` 32 exceeded
+    fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"age\":151,\"meta\":{\"id\":1}}"), // ⭐ `max` 150 exceeded by one
+    fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"age\":-1,\"meta\":{\"id\":1}}"), // `min` 0 violated
+    fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"email\":\"not-an-email\",\"meta\":{\"id\":1}}"), // ⭐ the `.email` format check
+    fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"code\":\"XX-7\",\"meta\":{\"id\":1}}"), // ⭐ the `ID-` prefix pattern
+    fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"tags\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\"],\"meta\":{\"id\":1}}"), // the array `max_len` of 5
+    fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"tags\":[1,2],\"meta\":{\"id\":1}}"), // ⭐ items of the wrong kind inside the array
+    fuzzseed.seed("\x00" ++ "{\"name\":\"ok\",\"meta\":{\"active\":true}}"), // the nested required `id` missing
+    fuzzseed.seed("\x00" ++ "{\"name\":123,\"meta\":{\"id\":\"x\"}}"), // both kinds wrong: the type gate at two depths
+    fuzzseed.seed("\x00" ++ "[1,2,3]"), // JSON, but not an object
+    fuzzseed.seed("\x00" ++ "{not json"), // not JSON at all
+    fuzzseed.seed("\x00"), // the empty body
+    fuzzseed.seed("\x01" ++ "\x3f\x01\x00\x02\x03\x04\x05"), // script: all six fields, one value kind each
+    fuzzseed.seed("\x01" ++ "\x21\x01\x05"), // script: `name` and `meta` only, with the nested-object value
+};
+
+/// Octet 0 picks the `Format`, octet 1 picks arbitrary vs near-miss, the rest
+/// is the string.
+const format_seeds = [_][]const u8{
+    fuzzseed.seed("\x00\x00" ++ "user@example.com"), // ⭐ email, valid
+    fuzzseed.seed("\x00\x00" ++ "user@@example.com"), // email, two at-signs
+    fuzzseed.seed("\x00\x00" ++ "@example.com"), // email with an empty local part
+    fuzzseed.seed("\x01\x00" ++ "https://example.com/a?b=c#d"), // ⭐ uri
+    fuzzseed.seed("\x02\x00" ++ "/a/b?c"), // uri_reference
+    fuzzseed.seed("\x03\x00" ++ "f81d4fae-7dec-11d0-a765-00a0c91e6bf6"), // ⭐ uuid
+    fuzzseed.seed("\x03\x00" ++ "f81d4fae7dec11d0a76500a0c91e6bf6"), // uuid without its dashes
+    fuzzseed.seed("\x04\x00" ++ "192.168.0.1"), // ⭐ ipv4
+    fuzzseed.seed("\x04\x00" ++ "256.1.1.1"), // ipv4 with an octet out of range
+    fuzzseed.seed("\x05\x00" ++ "2001:db8::1"), // ⭐ ipv6
+    fuzzseed.seed("\x06\x00" ++ "host.example.com"), // hostname
+    fuzzseed.seed("\x07\x00" ++ "2026-09-07"), // ⭐ date
+    fuzzseed.seed("\x07\x00" ++ "2026-02-30"), // a date that does not exist
+    fuzzseed.seed("\x08\x00" ++ "23:59:60Z"), // ⭐ time, with a leap second
+    fuzzseed.seed("\x09\x00" ++ "2026-09-07T12:00:00Z"), // ⭐ date_time
+    fuzzseed.seed("\x0a\x00" ++ "P3Y6M4DT12H30M5S"), // ⭐ duration
+    fuzzseed.seed("\x0b\x00" ++ "/foo/0/a~1b~0c"), // ⭐ json_pointer with both escapes
+    fuzzseed.seed("\x0b\x00" ++ "/foo/~2"), // an escape that does not exist
+    fuzzseed.seed("\x00\x01" ++ "\x01\x02\x03\x04\x05"), // near-miss alphabet, email
+    fuzzseed.seed("\x05\x01" ++ "\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11"), // near-miss alphabet, ipv6
+    fuzzseed.seed("\x0b\x01" ++ "\x11\x12\x13"), // near-miss alphabet, json_pointer
+    fuzzseed.seed(""), // the empty seed: `.email` and the empty string, which is what this target ran
+};
+
 test "fuzz: validateJson never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzValidateJson, .{});
+    try testing.fuzz({}, fuzzValidateJson, .{ .corpus = &json_seeds });
+}
+
+/// Turn a drawn seed into a request body. Shared with the corpus guard so the
+/// guard measures the same bodies the harness builds.
+fn buildJsonBody(seed: []const u8, buf: []u8) []const u8 {
+    if (seed.len == 0) return buf[0..0];
+    if (seed[0] == 0) {
+        const body = seed[1..];
+        const n = @min(body.len, buf.len);
+        @memcpy(buf[0..n], body[0..n]);
+        return buf[0..n];
+    }
+    // Shape-matching skeleton: an object with (some of) the schema's keys,
+    // varied-typed values, so the field-level validators (type gate, format,
+    // pattern, min_len/max_len, nested object/array) run instead of
+    // json_invalid. Octet 1 of the script is a bitmask over the six fields;
+    // one octet per included field then picks its value kind.
+    var script: fuzzseed.Cursor = .{ .bytes = seed[1..] };
+    const present = script.byte();
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeByte('{') catch return buf[0..0];
+    const fields = [_][]const u8{ "name", "age", "email", "code", "tags", "meta" };
+    var first = true;
+    for (fields, 0..) |f, i| {
+        if (present & (@as(u8, 1) << @intCast(i)) == 0) continue;
+        if (!first) w.writeByte(',') catch return w.buffered();
+        first = false;
+        w.print("\"{s}\":", .{f}) catch return w.buffered();
+        switch (script.ranged(0, 5)) {
+            0 => w.print("{d}", .{@as(i32, @bitCast((@as(u32, script.word()) << 16) | @as(u32, script.word())))}) catch return w.buffered(),
+            1 => {
+                const n = script.ranged(0, 24);
+                w.writeByte('"') catch return w.buffered();
+                var j: u32 = 0;
+                while (j < n) : (j += 1) {
+                    // Keep it valid-ish JSON string content (skip the two
+                    // bytes that would need escaping); this is a shape
+                    // generator, not a JSON-string fuzzer.
+                    const c = script.byte();
+                    if (c == '"' or c == '\\') continue;
+                    w.writeByte(c) catch return w.buffered();
+                }
+                w.writeByte('"') catch return w.buffered();
+            },
+            2 => w.writeAll(if (script.byte() & 1 == 1) "true" else "false") catch return w.buffered(),
+            3 => w.writeAll("null") catch return w.buffered(),
+            4 => {
+                w.writeByte('[') catch return w.buffered();
+                const n_items = script.ranged(0, 4);
+                var k: u32 = 0;
+                while (k < n_items) : (k += 1) {
+                    if (k != 0) w.writeByte(',') catch return w.buffered();
+                    w.print("\"t{d}\"", .{script.byte()}) catch return w.buffered();
+                }
+                w.writeByte(']') catch return w.buffered();
+            },
+            else => w.writeAll("{\"id\":1,\"active\":true}") catch return w.buffered(),
+        }
+    }
+    w.writeByte('}') catch return w.buffered();
+    return w.buffered();
 }
 
 fn fuzzValidateJson(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-
-    const body: []const u8 = if (smith.value(bool)) blk: {
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-        break :blk buf[0..len];
-    } else blk: {
-        // Shape-matching skeleton: an object with (some of) the schema's
-        // keys, random-typed values, so the fuzzer reaches the field-level
-        // validators (type gate, format, pattern, min_len/max_len, nested
-        // object/array) instead of json_invalid.
-        var w: std.Io.Writer = .fixed(&buf);
-        w.writeByte('{') catch return;
-        const fields = [_][]const u8{ "name", "age", "email", "code", "tags", "meta" };
-        var first = true;
-        for (fields) |f| {
-            if (!smith.value(bool)) continue;
-            if (!first) w.writeByte(',') catch return;
-            first = false;
-            w.print("\"{s}\":", .{f}) catch return;
-            switch (smith.valueRangeAtMost(u8, 0, 5)) {
-                0 => w.print("{d}", .{smith.value(i32)}) catch return,
-                1 => {
-                    var s: [24]u8 = undefined;
-                    smith.bytes(&s);
-                    const n: usize = smith.valueRangeAtMost(u8, 0, s.len);
-                    w.writeByte('"') catch return;
-                    for (s[0..n]) |c| {
-                        // Keep it valid-ish JSON string content (skip the
-                        // two bytes that would need escaping); this is a
-                        // shape generator, not a JSON-string fuzzer.
-                        if (c == '"' or c == '\\') continue;
-                        w.writeByte(c) catch return;
-                    }
-                    w.writeByte('"') catch return;
-                },
-                2 => w.writeAll(if (smith.value(bool)) "true" else "false") catch return,
-                3 => w.writeAll("null") catch return,
-                4 => {
-                    w.writeByte('[') catch return;
-                    const n_items = smith.valueRangeAtMost(u8, 0, 4);
-                    for (0..n_items) |i| {
-                        if (i != 0) w.writeByte(',') catch return;
-                        w.print("\"t{d}\"", .{smith.value(u8)}) catch return;
-                    }
-                    w.writeByte(']') catch return;
-                },
-                else => w.writeAll("{\"id\":1,\"active\":true}") catch return,
-            }
-        }
-        w.writeByte('}') catch return;
-        break :blk w.buffered();
-    };
+    // ⚠ ONE byte-first draw. See the note above the corpus for what the
+    // `smith.value(bool)` chain did with no corpus at all.
+    var raw: [1 + json_buf_len]u8 = undefined;
+    const n: usize = smith.slice(&raw);
+    var buf: [json_buf_len]u8 = undefined;
+    const body = buildJsonBody(raw[0..n], &buf);
 
     var r = validateJson(testing.allocator, body, &fuzz_schema) catch return;
     defer r.deinit();
 }
 
+test "corpus: every body reaches validateJson, and the violations reported are pinned" {
+    // ⭐ Acceptance is the wrong number twice over: `{}` is refused (two
+    // required rules), and a body that satisfies every rule is refused by
+    // nothing — so a corpus stuck on either extreme reads as a clean pass.
+    // What is pinned is the total number of VIOLATIONS reported, which counts
+    // how many distinct rules the corpus actually reached.
+    var nonempty: usize = 0;
+    var octets: usize = 0;
+    var valid: usize = 0;
+    var violations: usize = 0;
+    for (json_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [1 + json_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&raw);
+        var buf: [json_buf_len]u8 = undefined;
+        const body = buildJsonBody(raw[0..n], &buf);
+        if (body.len != 0) nonempty += 1;
+        octets += body.len;
+        var r = validateJson(testing.allocator, body, &fuzz_schema) catch continue;
+        defer r.deinit();
+        if (r.ok()) valid += 1;
+        violations += r.errors.len;
+    }
+    // Measured 2026-09-07. The single body this target used to build was
+    // `"{}"`, which reports exactly the two missing required fields.
+    try testing.expectEqual(@as(usize, 17), nonempty);
+    try testing.expectEqual(@as(usize, 692), octets);
+    try testing.expectEqual(@as(usize, 2), valid);
+    try testing.expectEqual(@as(usize, 23), violations);
+}
+
 test "fuzz: validateFormat never panics on any Format + arbitrary/near-miss strings" {
-    try testing.fuzz({}, fuzzValidateFormat, .{});
+    try testing.fuzz({}, fuzzValidateFormat, .{ .corpus = &format_seeds });
+}
+
+/// Octet 0 picks the format, octet 1 picks the string mode (0 = the rest is
+/// the string verbatim, anything else = build it from the near-miss
+/// alphabet), and the rest is the payload.
+fn buildFormatCase(seed: []const u8, buf: []u8) struct { Format, []const u8 } {
+    const formats = std.enums.values(Format);
+    if (seed.len == 0) return .{ formats[0], buf[0..0] };
+    const format = formats[seed[0] % formats.len];
+    if (seed.len == 1) return .{ format, buf[0..0] };
+    const payload = seed[2..];
+    if (seed[1] == 0) {
+        const n = @min(payload.len, buf.len);
+        @memcpy(buf[0..n], payload[0..n]);
+        return .{ format, buf[0..n] };
+    }
+    // Near-miss: a string built from an alphabet that includes the separators
+    // each format's grammar hinges on, so the deeper per-character walk (not
+    // just a length/emptiness bail-out) actually runs.
+    const alphabet = "abcAZ09@.:-_[]%/T+ \t";
+    var script: fuzzseed.Cursor = .{ .bytes = payload };
+    const n = @min(@as(usize, script.ranged(0, @intCast(buf.len))), buf.len);
+    for (buf[0..n]) |*b| b.* = alphabet[script.ranged(0, alphabet.len - 1)];
+    return .{ format, buf[0..n] };
 }
 
 fn fuzzValidateFormat(_: void, smith: *std.testing.Smith) !void {
-    const format = smith.value(Format);
-    var buf: [128]u8 = undefined;
+    // ⚠ ONE byte-first draw. `smith.value(Format)` used to come first, which
+    // meant `.email` on every input the ordinary lane can carry — eleven of
+    // the twelve formats were never called.
+    var raw: [2 + format_buf_len]u8 = undefined;
+    const n: usize = smith.slice(&raw);
+    var buf: [format_buf_len]u8 = undefined;
+    const case = buildFormatCase(raw[0..n], &buf);
+    _ = validateFormat(case[0], case[1]);
+}
 
-    if (smith.value(bool)) {
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-        _ = validateFormat(format, buf[0..len]);
-        return;
+test "corpus: every Format is exercised, and the strings each accepts are pinned" {
+    // ⭐ The number that was 1 before, and the only one that says this target
+    // is no longer stuck on `.email`: how many DISTINCT formats the corpus
+    // selects. Twelve of twelve, and the accepted count beside it so a corpus
+    // of refusals only would be visible.
+    const formats = std.enums.values(Format);
+    var seen = [_]bool{false} ** 12;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (format_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [2 + format_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&raw);
+        var buf: [format_buf_len]u8 = undefined;
+        const case = buildFormatCase(raw[0..n], &buf);
+        seen[@intFromEnum(case[0])] = true;
+        if (case[1].len != 0) nonempty += 1;
+        if (validateFormat(case[0], case[1])) accepted += 1;
     }
-
-    // Near-miss: a random string built from an alphabet that includes the
-    // separators each format's grammar hinges on, so the deeper per-
-    // character walk (not just a length/emptiness bail-out) actually runs.
-    const alphabet = "abcAZ09@.:-_[]%/T+ \t";
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-    for (0..len) |i| buf[i] = alphabet[smith.index(alphabet.len)];
-    _ = validateFormat(format, buf[0..len]);
+    try testing.expectEqual(@as(usize, 12), formats.len);
+    for (seen) |v| try testing.expect(v);
+    // Measured 2026-09-07. Before: 1 format, 0 non-empty strings, 0 accepted.
+    try testing.expectEqual(@as(usize, 21), nonempty);
+    try testing.expectEqual(@as(usize, 12), accepted);
 }
 
 // ── external anchor: json-schema-org/JSON-Schema-Test-Suite (format) ───────

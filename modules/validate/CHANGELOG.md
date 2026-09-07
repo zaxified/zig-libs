@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: neither fuzz target had a corpus, so each ran
+  exactly ONE input for ever, and `fuzzValidateFormat`'s was `.email` with the
+  empty string.** Outside `--fuzz` the runner feeds `options.corpus` plus one
+  round of `in = ""`, and every `Smith` draw on an exhausted input returns its
+  minimum. So `fuzzValidateJson`'s opening `smith.value(bool)` was false, every
+  per-field `smith.value(bool)` was false too, and the body it assembled was
+  `"{}"` — the type gate, the format and pattern checks, the min_len/max_len
+  bounds and the nested object/array walk, which the harness's own comment
+  lists as the whole reason the shape generator exists, had never run.
+  `fuzzValidateFormat` was worse: `smith.value(Format)` returned the first enum
+  value on every input, so **eleven of the twelve formats had never been called
+  at all**. Both now draw once with `smith.slice` and read their choices from
+  the drawn octets through `testkit.fuzz.Cursor`, with seeds whose first octet
+  selects "the rest is the body/string verbatim" or "the rest is a script".
+  Measured 2026-09-07: **JSON target 1 body and 2 violations before; 17 bodies
+  over 692 octets, 2 of them valid, 23 violations after. Format target 1 format
+  and 0 non-empty strings before; all 12 formats, 21 non-empty strings and 12
+  accepted after.** ⭐ The JSON guard pins the violation COUNT rather than
+  acceptance, because acceptance is wrong at both ends here — `{}` is refused
+  for two missing required fields, and a fully valid body is refused by nothing,
+  so a corpus stuck at either extreme reads as a clean pass.
+
 - **2026-09-02** — **Audit (drift campaign): 4 MEDIUM, 3 LOW.** No memory-safety defect and no
   mode difference anywhere; every finding is about a rule that did not do what it says.
   **MEDIUM, BEHAVIOURAL — `kind = .any` no longer voids every constraint.** `.any` is the

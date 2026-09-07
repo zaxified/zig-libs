@@ -36,6 +36,7 @@ const v = @import("kat_vectors.zig");
 const k256 = @import("k256");
 const Secp256k1 = k256.Secp256k1;
 const Scalar = Secp256k1.scalar.Scalar;
+const fuzzseed = @import("testkit").fuzz;
 
 fn hexN(comptime n: usize, hex_str: []const u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -326,17 +327,96 @@ fn fuzzPreVerify(_: void, smith: *std.testing.Smith) !void {
     bytes[32..64].* = hexN(32, vec0.s_prime);
     bytes[64] = @intFromBool(vec0.needs_negation);
 
-    const n_flips = smith.valueRangeAtMost(u8, 0, 6);
-    var i: u8 = 0;
-    while (i < n_flips) : (i += 1) {
-        const pos = smith.index(bytes.len);
-        bytes[pos] = smith.value(u8);
-    }
+    // ⚠ ONE byte-first draw, read as a flip script. This used to open with
+    // `n_flips = smith.valueRangeAtMost(u8, 0, 6)`, and a ranged `Smith` draw
+    // reads eight octets as a little-endian `u64` and returns the range
+    // MINIMUM unless that whole word already lies inside the range — so with
+    // no corpus, on the single `in = ""` round the lane runs, `n_flips` was 0
+    // and the harness verified vector 0's PRISTINE pre-signature, unmodified,
+    // for ever. The word "corrupted" in this target's own name had never been
+    // true of a single input it ran. Measured 2026-09-07: 1 input, 0 flips,
+    // 0 refusals from `fromBytes`.
+    var script_buf: [32]u8 = undefined;
+    const n: usize = smith.slice(&script_buf);
+    applyFlips(script_buf[0..n], &bytes);
 
     const presig = adaptor.PreSignature.fromBytes(bytes) catch return;
     _ = adaptor.preVerify(px, vec0.msg, t_point, presig);
 }
 
+/// Octet 0 is the flip count (0..6), then two octets per flip: an offset into
+/// the 65-octet encoding and the byte to write.
+fn applyFlips(script: []const u8, bytes: []u8) void {
+    if (script.len == 0) return;
+    const n_flips = script[0] % 7;
+    var i: usize = 0;
+    while (i < n_flips) : (i += 1) {
+        const at = 1 + i * 2;
+        if (at + 1 >= script.len) return;
+        bytes[script[at] % bytes.len] = script[at + 1];
+    }
+}
+
+/// The three fields of the wire encoding sit at fixed offsets — `r` at 0..32,
+/// `s_prime` at 32..64, the negation flag at 64 — so a seed names which one it
+/// damages.
+const presig_seeds = [_][]const u8{
+    fuzzseed.seed(""), // the pristine vector: exactly what this target ran, for ever
+    fuzzseed.seed("\x00"), // the same, said explicitly
+    fuzzseed.seed("\x01\x00\xff"), // ⭐ the first octet of `r`
+    fuzzseed.seed("\x01\x1f\x00"), // the last octet of `r`
+    fuzzseed.seed("\x01\x20\xff"), // ⭐ the first octet of `s_prime`
+    fuzzseed.seed("\x01\x3f\x01"), // the last octet of `s_prime`
+    fuzzseed.seed("\x01\x40\x01"), // ⭐ the negation flag flipped to 1
+    fuzzseed.seed("\x01\x40\x02"), // ⭐ the flag set to a value that is neither 0 nor 1
+    fuzzseed.seed("\x01\x40\xff"), // the flag at the far end of its octet
+    fuzzseed.seed("\x02\x00\xff\x20\xff"), // both scalars damaged at once
+    fuzzseed.seed("\x06" ++ "\x00\xff\x08\xff\x10\xff\x20\xff\x28\xff\x40\x01"), // the maximum flip count
+    fuzzseed.seed("\xff" ++ "\x00\x00\x20\x00"), // a flip count past the ceiling, wrapped
+    fuzzseed.seed("\x02" ++ "\x00\xff\x01\xff\x02\xff\x03\xff"), // ⭐ more flip payload than the count consumes
+};
+
 test "fuzz: preVerify never panics on corrupted pre-signature bytes" {
-    try std.testing.fuzz({}, fuzzPreVerify, .{});
+    try std.testing.fuzz({}, fuzzPreVerify, .{ .corpus = &presig_seeds });
+}
+
+test "corpus: every seed reaches preVerify or its decoder, and both verdicts are pinned" {
+    // ⭐ `accepted > 0` would have read 100% on the OLD harness, because the
+    // one input it ran was the untouched vector and it verifies. The numbers
+    // that say the corpus damages anything are the `fromBytes` refusals and
+    // the pre-signatures that decode but do NOT verify — neither of which the
+    // pristine encoding can produce.
+    const vec0 = v.vectors[0];
+    const px = try bip340.XOnlyPublicKey.fromBytes(hexN(32, vec0.px));
+    const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec0.adaptor_point));
+
+    var decode_refusals: usize = 0;
+    var verified: usize = 0;
+    var rejected: usize = 0;
+    var distinct: usize = 0;
+    for (presig_seeds) |sd| {
+        var pristine: [65]u8 = undefined;
+        pristine[0..32].* = hexN(32, vec0.r);
+        pristine[32..64].* = hexN(32, vec0.s_prime);
+        pristine[64] = @intFromBool(vec0.needs_negation);
+        var bytes = pristine;
+
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script_buf: [32]u8 = undefined;
+        const n: usize = smith.slice(&script_buf);
+        applyFlips(script_buf[0..n], &bytes);
+        if (!std.mem.eql(u8, &bytes, &pristine)) distinct += 1;
+
+        const presig = adaptor.PreSignature.fromBytes(bytes) catch {
+            decode_refusals += 1;
+            continue;
+        };
+        if (adaptor.preVerify(px, vec0.msg, t_point, presig)) verified += 1 else rejected += 1;
+    }
+    // Measured 2026-09-07. Before: 0 damaged encodings, 0 decode refusals, 0
+    // rejections — one input, and it verified.
+    try std.testing.expectEqual(@as(usize, 11), distinct);
+    try std.testing.expectEqual(@as(usize, 2), decode_refusals);
+    try std.testing.expectEqual(@as(usize, 2), verified);
+    try std.testing.expectEqual(@as(usize, 9), rejected);
 }

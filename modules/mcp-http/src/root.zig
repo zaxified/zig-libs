@@ -2169,106 +2169,167 @@ test "oracle: tools/call \"work\" (real client bytes) reproduces the real progre
 // panic, run out of bounds, or leak the `.allocated_string`/`.allocated_number`
 // it frees on every branch. `handleMessageFrom` itself lives in `mcp`, whose
 // own decode surface is that module's obligation, not this one's.
+const fuzzseed = @import("testkit").fuzz;
+
+/// ⛔ Every string in the corpus this replaces — twelve real JSON-RPC bodies,
+/// including the `initialize` request the scanners exist to recognise —
+/// reached `isInitialize` as the EMPTY body. `buildJsonRpcish` opened with
+/// `smith.valueRangeAtMost(u8, 0, 5)`, which reads EIGHT octets as a
+/// little-endian `u64` and returns the range MINIMUM unless that whole word
+/// already lies in 0..5. `{"jsonrpc` is nowhere near, so every seed took the
+/// "pure arbitrary bytes" branch, `smith.bytes(&raw)` ate the rest of the
+/// body, and the ranged length after it found nothing left and returned 0.
+/// Measured 2026-09-07: **0 of 12 seeds carried an octet, and neither scanner
+/// ever got past `object_begin`.**
+///
+/// Seeds are scripts now. Octet 0 selects: `0x00` means "the rest of this seed
+/// IS the body, verbatim" — which is what lets a real JSON-RPC message be a
+/// seed — and anything else means "the rest is a script assembling a JSON
+/// object" from the keys the scanners branch on.
 const jsonrpc_corpus = [_][]const u8{
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}",
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
-    "{\"a\":{\"nested\":[1,2,{\"x\":3}]},\"b\":[1,[2,3],{}],\"c\":null,\"d\":true,\"method\":\"initialize\"}",
-    "{\"method\":\"in\\u0069tialize\"}",
-    "{\"jsonrpc\":\"2.0\",\"id\":1}",
-    "not json",
-    "[1,2,3]",
-    "{",
-    "{}",
-    "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}",
-    "{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-1,\"message\":\"x\"}}",
-    "{\"method\":\"" ++ "x" ** 100 ++ "\"}",
+    fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}"), // ⭐ the request both scanners exist for
+    fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"),
+    fuzzseed.seed("\x00" ++ "{\"a\":{\"nested\":[1,2,{\"x\":3}]},\"b\":[1,[2,3],{}],\"c\":null,\"d\":true,\"method\":\"initialize\"}"), // the key that matters, behind nesting
+    fuzzseed.seed("\x00" ++ "{\"method\":\"in\\u0069tialize\"}"), // ⭐ the escape that forces `.allocated_string`
+    fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":1}"),
+    fuzzseed.seed("\x00" ++ "not json"),
+    fuzzseed.seed("\x00" ++ "[1,2,3]"), // an array, not an object
+    fuzzseed.seed("\x00" ++ "{"), // truncated at `object_begin`
+    fuzzseed.seed("\x00" ++ "{}"), // ⭐ the empty object: legal JSON, no keys — the shape an `accepted > 0` guard would score
+    fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{}}"), // ⭐ a correlatable response
+    fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-1,\"message\":\"x\"}}"), // the error form of one
+    fuzzseed.seed("\x00" ++ "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"result\":null}"), // a string id
+    fuzzseed.seed("\x00" ++ "{\"method\":\"" ++ "x" ** 100 ++ "\"}"), // a method name past `max_field_len`
+    fuzzseed.seed("\x00" ++ "{\"method\":\"initialize\",\"method\":\"tools/list\"}"), // ⭐ the key twice: which one wins is a real decision
+    fuzzseed.seed("\x00"), // the empty body
+    fuzzseed.seed("\x01" ++ "\x03\x00\x00\x01\x01\x02\x02"), // script: an object of three fields
+    fuzzseed.seed("\x01" ++ "\x02\x02\x04\x01\x03\x05"), // script: nested object and array values
+    fuzzseed.seed("\x01" ++ "\x01\x00\x01\x01\x01"), // script: a long string, forcing the allocating scanner path
 };
 
 test "fuzz: isInitialize / correlatableResponse never panic, OOB or leak on arbitrary JSON-RPC-shaped bytes" {
     try std.testing.fuzz({}, fuzzPreParseNeverLeaks, .{ .corpus = &jsonrpc_corpus });
 }
 
+const jsonrpc_buf_len = 2048;
+
 fn fuzzPreParseNeverLeaks(_: void, smith: *std.testing.Smith) !void {
-    var buf: [2048]u8 = undefined;
-    const body = buildJsonRpcish(smith, &buf);
+    var raw: [1 + jsonrpc_buf_len]u8 = undefined;
+    // ⚠ ONE byte-first draw. See `jsonrpc_corpus` for what the ranged draws
+    // did to twelve real JSON-RPC bodies.
+    const n: usize = smith.slice(&raw);
+    var buf: [jsonrpc_buf_len]u8 = undefined;
+    const body = buildJsonRpcish(raw[0..n], &buf);
     const gpa = std.testing.allocator;
     _ = isInitialize(gpa, body);
     _ = correlatableResponse(gpa, body);
 }
 
-/// One draw in six is pure arbitrary bytes; the rest are a JSON object built
-/// from the field names the two scanners actually branch on (`method`,
-/// `id`, `result`, `error`, plus one filler key), with scalar/nested/long/
-/// escaped values — arbitrary bytes essentially never spell a well-formed
-/// JSON object, so without this the scan loop past `object_begin` would
-/// almost never run.
-fn buildJsonRpcish(smith: *std.testing.Smith, buf: []u8) []const u8 {
-    if (smith.valueRangeAtMost(u8, 0, 5) == 0) {
-        var raw: [2048]u8 = undefined;
-        smith.bytes(&raw);
-        const len = smith.valueRangeAtMost(u16, 0, @intCast(raw.len));
-        @memcpy(buf[0..len], raw[0..len]);
-        return buf[0..len];
+/// Octet 0 selects: `0x00` means the remaining octets are the body verbatim;
+/// anything else means they are a script assembling a JSON object from the
+/// field names the two scanners actually branch on (`method`, `id`, `result`,
+/// `error`, plus filler keys), with scalar/nested/long/escaped values —
+/// arbitrary bytes essentially never spell a well-formed JSON object, so
+/// without the script the scan loop past `object_begin` would almost never
+/// run.
+fn buildJsonRpcish(seed: []const u8, buf: []u8) []const u8 {
+    if (seed.len == 0) return buf[0..0];
+    if (seed[0] == 0) {
+        const body = seed[1..];
+        const n = @min(body.len, buf.len);
+        @memcpy(buf[0..n], body[0..n]);
+        return buf[0..n];
     }
+    var script: fuzzseed.Cursor = .{ .bytes = seed[1..] };
     var w: std.Io.Writer = .fixed(buf);
-    writeJsonObject(smith, &w, 3);
+    writeJsonObject(&script, &w, 3);
     return w.buffered();
 }
 
-fn writeJsonObject(smith: *std.testing.Smith, w: *std.Io.Writer, depth_left: u8) void {
+test "corpus: every body reaches both scanners, and what they recognise is pinned" {
+    // ⭐ `{}` is legal JSON with no keys, so "the scanner returned without an
+    // error" would have read green on a corpus that walked nothing. The
+    // numbers the empty body cannot produce are the `initialize` requests
+    // RECOGNISED and the responses found CORRELATABLE — the two decisions
+    // these scanners exist to make.
+    const gpa = std.testing.allocator;
+    var nonempty: usize = 0;
+    var octets: usize = 0;
+    var initializes: usize = 0;
+    var correlatable: usize = 0;
+    for (jsonrpc_corpus) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [1 + jsonrpc_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&raw);
+        var buf: [jsonrpc_buf_len]u8 = undefined;
+        const body = buildJsonRpcish(raw[0..n], &buf);
+        if (body.len != 0) nonempty += 1;
+        octets += body.len;
+        if (isInitialize(gpa, body)) initializes += 1;
+        if (correlatableResponse(gpa, body)) correlatable += 1;
+    }
+    // Measured 2026-09-07. The corpus this replaces handed the scanners 0
+    // octets, from twelve real JSON-RPC bodies.
+    try testing.expectEqual(@as(usize, 17), nonempty);
+    try testing.expectEqual(@as(usize, 1129), octets);
+    try testing.expectEqual(@as(usize, 3), initializes);
+    try testing.expectEqual(@as(usize, 2), correlatable);
+}
+
+fn writeJsonObject(script: *fuzzseed.Cursor, w: *std.Io.Writer, depth_left: u8) void {
     w.writeByte('{') catch return;
-    const n = smith.valueRangeAtMost(u8, 0, 3);
-    var k: u8 = 0;
+    const n = script.ranged(0, 3);
+    var k: u32 = 0;
     while (k < n) : (k += 1) {
         if (k != 0) w.writeByte(',') catch return;
-        writeJsonField(smith, w, depth_left);
+        writeJsonField(script, w, depth_left);
     }
     w.writeByte('}') catch {};
 }
 
-fn writeJsonArray(smith: *std.testing.Smith, w: *std.Io.Writer, depth_left: u8) void {
+fn writeJsonArray(script: *fuzzseed.Cursor, w: *std.Io.Writer, depth_left: u8) void {
     w.writeByte('[') catch return;
-    const n = smith.valueRangeAtMost(u8, 0, 3);
-    var k: u8 = 0;
+    const n = script.ranged(0, 3);
+    var k: u32 = 0;
     while (k < n) : (k += 1) {
         if (k != 0) w.writeByte(',') catch return;
-        writeJsonValue(smith, w, depth_left);
+        writeJsonValue(script, w, depth_left);
     }
     w.writeByte(']') catch {};
 }
 
-fn writeJsonField(smith: *std.testing.Smith, w: *std.Io.Writer, depth_left: u8) void {
+fn writeJsonField(script: *fuzzseed.Cursor, w: *std.Io.Writer, depth_left: u8) void {
     const keys = [_][]const u8{ "method", "id", "result", "error", "jsonrpc", "params", "x" };
-    w.print("\"{s}\":", .{keys[smith.index(keys.len)]}) catch return;
-    writeJsonValue(smith, w, depth_left);
+    w.print("\"{s}\":", .{keys[script.ranged(0, keys.len - 1)]}) catch return;
+    writeJsonValue(script, w, depth_left);
 }
 
-fn writeJsonValue(smith: *std.testing.Smith, w: *std.Io.Writer, depth_left: u8) void {
-    const kind: u8 = if (depth_left == 0) smith.valueRangeAtMost(u8, 0, 3) else smith.valueRangeAtMost(u8, 0, 5);
+fn writeJsonValue(script: *fuzzseed.Cursor, w: *std.Io.Writer, depth_left: u8) void {
+    const kind = if (depth_left == 0) script.ranged(0, 3) else script.ranged(0, 5);
     switch (kind) {
         0 => w.writeAll("\"initialize\"") catch {},
-        1 => writeJsonString(smith, w),
-        2 => w.print("{d}", .{smith.value(i32)}) catch {},
-        3 => w.writeAll(switch (smith.index(3)) {
+        1 => writeJsonString(script, w),
+        2 => w.print("{d}", .{@as(i32, @bitCast((@as(u32, script.word()) << 16) | @as(u32, script.word())))}) catch {},
+        3 => w.writeAll(switch (script.ranged(0, 2)) {
             0 => "null",
             1 => "true",
             else => "false",
         }) catch {},
-        4 => writeJsonObject(smith, w, depth_left - 1),
-        else => writeJsonArray(smith, w, depth_left - 1),
+        4 => writeJsonObject(script, w, depth_left - 1),
+        else => writeJsonArray(script, w, depth_left - 1),
     }
 }
 
 /// A short plain string, a long one (past `max_field_len`, forcing the
 /// `.allocated_string` path both scanners must free), or one containing a
 /// `\u` escape (same forced-allocation path via a different route).
-fn writeJsonString(smith: *std.testing.Smith, w: *std.Io.Writer) void {
-    const long = smith.value(bool);
-    const len = if (long) smith.valueRangeAtMost(u8, 60, 120) else smith.valueRangeAtMost(u8, 0, 8);
+fn writeJsonString(script: *fuzzseed.Cursor, w: *std.Io.Writer) void {
+    const long = script.byte() & 1 == 1;
+    const len = if (long) script.ranged(60, 120) else script.ranged(0, 8);
     w.writeByte('"') catch return;
-    var j: u8 = 0;
+    var j: u32 = 0;
     while (j < len) : (j += 1) {
-        switch (smith.index(3)) {
+        switch (script.ranged(0, 2)) {
             0 => w.writeByte('a') catch return,
             1 => w.writeAll("\\u0069") catch return,
             else => w.writeByte('x') catch return,

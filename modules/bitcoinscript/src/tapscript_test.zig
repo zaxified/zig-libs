@@ -304,8 +304,46 @@ test "e2e tapscript: exceeding the sigops/validation-weight budget fails closed"
 // This harness builds the commitment for whatever leaf script the fuzzer
 // chose, using the same `buildSingleLeaf` the tests above use, so the script
 // under evaluation is attacker-chosen while the framing around it is real.
+const fuzzseed = @import("testkit").fuzz;
+
+/// ⛔ The seeds this replaces were built by `tapscriptSeed(bits, 512)`, which
+/// wrote one little-endian `u64` per draw with every word masked to
+/// `& 0x0F`. That kept each word inside its draw's range, so the harness did
+/// run — but it capped **every** choice at 15: the leaf script was never
+/// longer than 15 octets against a 256-octet buffer, `n_stack` and the stack
+/// item lengths were bounded the same way, and any range this harness later
+/// widens past 15 would silently collapse to its minimum with the suite still
+/// green. Measured 2026-09-07 over the old seeds: max leaf script 15 octets,
+/// 0 of 4 seeds reaching a 16-octet script.
+///
+/// The choices now come out of ONE `smith.slice` read as an octet script, so
+/// a seed is reviewable and no draw is hostage to a hand-chosen word.
+/// Layout: script length (2 octets), then two octets per script byte, then the
+/// internal-key selector, the stack-item count, each item's length, the
+/// control-block damage flag (and, if set, its offset and XOR mask), and one
+/// octet per `discourage_*` flag.
+const tapscript_script_len = 1024;
+
+const tapscript_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // the empty script: an empty leaf and an empty stack, the collapsed case
+    fuzzseed.seedHex("0001" ++ "0151" ++ "00" ++ "00" ++ "00"), // ⭐ a one-opcode leaf: OP_1
+    fuzzseed.seedHex("0003" ++ "0151" ++ "0151" ++ "0193" ++ "00" ++ "00" ++ "00"), // OP_1 OP_1 OP_BOOLAND
+    fuzzseed.seedHex("0002" ++ "01ba" ++ "0151" ++ "00" ++ "00" ++ "00"), // ⭐ OP_CHECKSIGADD (0xba), the BIP342 opcode this target exists for
+    fuzzseed.seedHex("0001" ++ "01ba" ++ "00" ++ "02" ++ "40" ++ "40" ++ "00" ++ "00"), // ⭐ CHECKSIGADD with two 64-octet stack items under it
+    fuzzseed.seedHex("0004" ++ "0150" ++ "0163" ++ "0151" ++ "0168" ++ "00" ++ "01" ++ "01" ++ "00" ++ "00"), // OP_0 OP_IF OP_1 OP_ENDIF: the `minimalif` shape
+    fuzzseed.seedHex("00ff" ++ "0151" ** 8 ++ "00" ++ "00" ++ "00"), // ⭐ a 255-octet leaf, filling the buffer — no old seed could ask for more than 15
+    fuzzseed.seedHex("0080" ++ "0151" ** 4 ++ "00" ++ "00" ++ "00"), // a 128-octet leaf
+    fuzzseed.seedHex("0002" ++ "05fe" ++ "0151" ++ "00" ++ "00" ++ "00"), // ⭐ an OP_SUCCESSx byte (0xfe), which the pre-scan must catch
+    fuzzseed.seedHex("0002" ++ "05ff" ++ "05ff" ++ "00" ++ "00" ++ "00"), // two bytes past the defined opcode range
+    fuzzseed.seedHex("0001" ++ "0151" ++ "07" ++ "00" ++ "00"), // a different internal key
+    fuzzseed.seedHex("0001" ++ "0151" ++ "00" ++ "03" ++ "48" ++ "48" ++ "48" ++ "00" ++ "00"), // the full three-item stack, each 72 octets
+    fuzzseed.seedHex("0001" ++ "0151" ++ "00" ++ "00" ++ "01" ++ "00" ++ "ff"), // ⭐ the control block damaged at octet 0
+    fuzzseed.seedHex("0001" ++ "0151" ++ "00" ++ "00" ++ "01" ++ "20" ++ "01"), // ⭐ damaged at its last octet
+    fuzzseed.seedHex("0002" ++ "01ba" ++ "0151" ++ "00" ++ "00" ++ "00" ++ "ff" ** 8), // every `discourage_*` policy on
+};
+
 test "fuzz: tapscript leaf evaluation, with the commitment built for the leaf" {
-    try std.testing.fuzz({}, fuzzTapscriptLeaf, .{ .corpus = tapscript_seeds });
+    try std.testing.fuzz({}, fuzzTapscriptLeaf, .{ .corpus = &tapscript_seeds });
 }
 
 fn fuzzTapscriptLeaf(_: void, smith: *std.testing.Smith) !void {
@@ -313,43 +351,53 @@ fn fuzzTapscriptLeaf(_: void, smith: *std.testing.Smith) !void {
     defer arena.deinit();
     const a = arena.allocator();
 
+    // ⚠ ONE byte-first draw. See `tapscript_seeds` for the cap the old
+    // `u64`-word seeds put on every choice here.
+    var seed_buf: [tapscript_script_len]u8 = undefined;
+    const seed_len: usize = smith.slice(&seed_buf);
+    var script_cursor: fuzzseed.Cursor = .{ .bytes = seed_buf[0..seed_len] };
+
     // A leaf script the fuzzer chooses, biased toward real opcodes so the
     // dispatch table is exercised instead of dying on the first undefined one.
     var script_buf: [256]u8 = undefined;
-    const script_len: usize = smith.valueRangeAtMost(u8, 0, script_buf.len - 1);
+    const script_len: usize = @as(usize, script_cursor.word()) % script_buf.len;
     for (script_buf[0..script_len]) |*b| {
-        b.* = if (smith.valueRangeAtMost(u8, 0, 5) != 0)
-            smith.valueRangeAtMost(u8, 0, 0xba)
+        b.* = if (script_cursor.ranged(0, 5) != 0)
+            @intCast(script_cursor.ranged(0, 0xba))
         else
-            smith.value(u8);
+            script_cursor.byte();
     }
     const script = script_buf[0..script_len];
 
-    const internal = keypair(smith.value(u8)) catch return;
+    const internal = keypair(script_cursor.byte()) catch return;
     const s = buildSingleLeaf(a, internal.x, script) catch return;
 
     // The initial stack: what a spender puts under the script, plus the two
     // trailing items BIP341 requires (script, control block).
     var stack_bufs: [3][72]u8 = undefined;
     var witness: [5][]const u8 = undefined;
-    const n_stack = smith.valueRangeAtMost(u8, 0, 3);
-    var i: u8 = 0;
+    const n_stack = script_cursor.ranged(0, 3);
+    var i: u32 = 0;
     while (i < n_stack) : (i += 1) {
-        smith.bytes(&stack_bufs[i]);
-        witness[i] = stack_bufs[i][0..smith.valueRangeAtMost(u8, 0, stack_bufs[i].len)];
+        const item_len: usize = script_cursor.ranged(0, stack_bufs[i].len);
+        for (stack_bufs[i][0..item_len]) |*b| b.* = script_cursor.byte();
+        witness[i] = stack_bufs[i][0..item_len];
     }
     witness[n_stack] = script;
     // A control block the fuzzer may damage: an intact one commits (so the
     // leaf runs), a damaged one must be refused rather than mis-evaluated.
     var cb: [33]u8 = s.control_block;
-    const cb_damaged = smith.value(bool);
-    if (cb_damaged) cb[smith.index(cb.len)] ^= smith.valueRangeAtMost(u8, 1, 255);
+    const cb_damaged = script_cursor.byte() & 1 == 1;
+    if (cb_damaged) {
+        const at = script_cursor.ranged(0, cb.len - 1);
+        cb[at] ^= @intCast(script_cursor.ranged(1, 255));
+    }
     witness[n_stack + 1] = &cb;
 
     var f = consensus_taproot;
     inline for (@typeInfo(ScriptFlags).@"struct".fields) |fld| {
         if (fld.type == bool and comptime std.mem.startsWith(u8, fld.name, "discourage_"))
-            @field(f, fld.name) = smith.value(bool);
+            @field(f, fld.name) = script_cursor.byte() & 1 == 1;
     }
 
     const r = verify.verifyScript(a, &.{}, &s.script_pubkey, witness[0 .. n_stack + 2], f, s.ctx);
@@ -367,25 +415,49 @@ fn fuzzTapscriptLeaf(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
-/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
-/// `options.corpus` plus one empty input, and an empty input makes every draw
-/// return its range minimum — an empty leaf script and an empty stack.
-fn tapscriptSeed(comptime bits: u64, comptime n: usize) [n]u8 {
-    @setEvalBranchQuota(100_000);
-    var out: [n]u8 = undefined;
-    var i: usize = 0;
-    var w: u6 = 0;
-    while (i + 8 <= n) : (i += 8) {
-        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0x0F, .little);
-        w +%= 1;
-    }
-    @memset(out[i..], 0);
-    return out;
-}
+test "corpus: every tapscript seed builds a leaf, and the leaf sizes reached are pinned" {
+    // ⭐ The number the old `u64`-word seeds could never move: the LONGEST
+    // leaf script the corpus builds. Every one of their words was masked to
+    // `& 0x0F`, so no seed could ask for a script over 15 octets against a
+    // 256-octet buffer. The undamaged-control-block count is pinned beside it,
+    // because that is the subset on which the harness's own
+    // `TaprootCommitmentMismatch` assertion is ARMED.
+    var nonempty: usize = 0;
+    var longest: usize = 0;
+    var total_script: usize = 0;
+    var armed: usize = 0;
+    var stack_items: usize = 0;
+    for (tapscript_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var seed_buf: [tapscript_script_len]u8 = undefined;
+        const seed_len: usize = smith.slice(&seed_buf);
+        if (seed_len != 0) nonempty += 1;
+        var c: fuzzseed.Cursor = .{ .bytes = seed_buf[0..seed_len] };
 
-const tapscript_seeds: []const []const u8 = &.{
-    &tapscriptSeed(0x9E37_79B9_7F4A_7C15, 512),
-    &tapscriptSeed(0x0123_4567_89AB_CDEF, 512),
-    &tapscriptSeed(0xF0E1_D2C3_B4A5_9687, 512),
-    &tapscriptSeed(0x6C62_1F4D_3A98_5E27, 512),
-};
+        var script_buf: [256]u8 = undefined;
+        const script_len: usize = @as(usize, c.word()) % script_buf.len;
+        for (script_buf[0..script_len]) |*b| {
+            b.* = if (c.ranged(0, 5) != 0) @intCast(c.ranged(0, 0xba)) else c.byte();
+        }
+        longest = @max(longest, script_len);
+        total_script += script_len;
+        _ = c.byte(); // the internal-key selector
+        const n_stack = c.ranged(0, 3);
+        stack_items += n_stack;
+        var i: u32 = 0;
+        while (i < n_stack) : (i += 1) {
+            const item_len: usize = c.ranged(0, 72);
+            var j: usize = 0;
+            while (j < item_len) : (j += 1) _ = c.byte();
+        }
+        if (c.byte() & 1 == 0) armed += 1;
+    }
+    // One seed is deliberately the empty script.
+    try testing.expectEqual(tapscript_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. The old four seeds reached a longest leaf of 15
+    // octets; nothing in them could ask for more.
+    try testing.expectEqual(@as(usize, 255), longest);
+    try testing.expectEqual(@as(usize, 404), total_script);
+    try testing.expectEqual(@as(usize, 7), stack_items);
+    try testing.expectEqual(@as(usize, 11), armed);
+}

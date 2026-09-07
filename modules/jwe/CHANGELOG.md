@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: both fuzz harnesses had already been "fixed"
+  once, and both fixes bought nothing, for the same reason.**
+  (a) `header.fuzzParse` carried a comment recording the earlier repair —
+  "build a syntactically valid header and let the fuzzer choose its member
+  VALUES instead" — but every knob that repair added was a
+  `smith.value(bool)` drawn AFTER `smith.bytes(&raw)`. `bytes` consumes
+  `@min(buf.len, in.len)` octets, so on the one input the ordinary test lane
+  runs, `n` was 0 and every `bool` was false: the header actually parsed was
+  `{"alg":"PBES2-HS256+A128KW","enc":"A128GCM"}` with **no optional members at
+  all**, so `optionalBase64`, `optionalUint` and `optionalEpk` — named in that
+  same comment as the paths where the parse errors live — were still never
+  entered. Measured 2026-09-07: 0 of 1 inputs carried a `p2c`, `p2s`, `kid` or
+  `epk`. Now one `smith.slice` draw whose first octet is a bitmask over the
+  optional members, with a 15-seed corpus. After: **14 of 15 seeds non-empty,
+  15 headers parsed, 4 with `p2c`, 4 with `p2s`, 2 with `kid`, 2 with `epk`,
+  and 1 blob parsed as a header in its own right.**
+  (b) `root.fuzzDecryptCompact` carried the same shape of record — the
+  measured "0 of 200,000 uniform-random inputs got past
+  `MalformedToken`/`InvalidBase64`" that motivated corrupting a genuine token
+  instead — and then made `n_flips` its FIRST ranged draw. So on the one input
+  the lane runs, `n_flips` was 1, `smith.index(token.len)` was 0 and
+  `smith.value(u8)` was 0: **one input for ever, the genuine token with its
+  first octet zeroed, refused by `InvalidBase64` before `header.parse`.** The
+  flips now come from one `smith.slice` read as a script, with a **16-bit**
+  offset — a one-octet offset could not reach the authentication tag of a
+  ~180-octet token at all. After: **10 of 11 seeds non-empty, 11 distinct
+  damaged tokens, 8 refused at the framing and 3 reaching the header parse and
+  key unwrap, where that count had always been 0.** The guard also pins
+  `accepted == 0`: a damaged token that authenticated would be the defect.
+
 - **2026-09-03** — Drift re-audit (706 lines since the last one). ⚠ **BREAKING**
   in three ways: `DecryptError` gained `WorkFactorTooHigh`; `header.ParseError`
   gained `UnsupportedCrit`; and several decrypt failures that previously

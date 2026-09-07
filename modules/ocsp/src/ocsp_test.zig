@@ -1192,15 +1192,164 @@ test "parseResponse: malformed / truncated input never panics" {
 // attacker-in-the-middle substitutes) — untrusted DER, no signature checked
 // yet at this layer.
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// The buffer was 512. A response carrying its own responder certificate —
+/// which is what a real responder returns, and what `fuzzVerify` builds — does
+/// not fit that, and a seed longer than the buffer reads back EMPTY rather
+/// than truncated, so **no delegated OCSP response could ever have passed
+/// through this harness**. The corpus guard below asserts the fixture is over
+/// 512 octets so this cannot quietly stop being true. 4096 is `fuzzVerify`'s
+/// own `rbuf` size, i.e. the largest response this module builds for itself.
+const parse_buf_len = 4096;
+
+/// Hostile DER. These are the same shapes as the "malformed / truncated input
+/// never panics" value test above, plus the length-form edges a `parseResponse`
+/// caller meets on the wire; the ACCEPTING seed is built at run time in the
+/// test below, because no hand-written string spells a complete OCSPResponse.
+const parse_static_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // the empty slice: exactly what the collapsed draw ran, for ever
+    fuzzseed.seedHex("30"), // a SEQUENCE tag with no length
+    fuzzseed.seedHex("3080"), // indefinite length, which DER forbids
+    fuzzseed.seedHex("30050a0100ffff"), // trailing garbage after a complete element
+    fuzzseed.seedHex("30030a01"), // a truncated ENUMERATED
+    fuzzseed.seedHex("020100"), // an INTEGER where a SEQUENCE belongs
+    fuzzseed.seedHex("30840000ffff"), // a 4-octet long-form length claiming 65535 octets
+    fuzzseed.seedHex("300a0a010030050603551d13"), // status 0 then a nested OID, not the basic-response wrapper
+    fuzzseed.seedHex("30060a0101a00100"), // a non-zero responseStatus with a body behind it
+    fuzzseed.seedHex("ff" ** 64), // no DER structure at all
+};
+
 test "fuzz: parseResponse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseResponse, .{});
+    const gpa = testing.allocator;
+    var c: ParseCorpus = .{};
+    const built = try c.build(gpa);
+    defer c.deinit(gpa);
+    try testing.fuzz({}, fuzzParseResponse, .{ .corpus = built });
 }
 
 fn fuzzParseResponse(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [parse_buf_len]u8 = undefined;
+    // One `smith.slice`, never `bytes` then a ranged draw. `bytes` consumes
+    // `@min(buf.len, in.len)` octets, so the ranged length that followed found
+    // fewer than the eight it reads as a little-endian `u64` and returned the
+    // range MINIMUM: `len` was 0 for every input this lane can carry, and
+    // `parseResponse` was handed the empty slice for ever.
+    const len: usize = smith.slice(&buf);
     _ = ocsp.parseResponse(buf[0..len]) catch return;
+}
+
+/// The static seeds plus a genuine response and that response with one octet
+/// of its `tbsResponseData` flipped — built at run time because the fixture
+/// comes out of this module's own DER writer and an RSA key it generates.
+const ParseCorpus = struct {
+    /// The response with an embedded responder certificate — what a real
+    /// responder actually returns, and the one that does not fit the buffer
+    /// this harness used to have.
+    delegated: []u8 = &.{},
+    /// The same without embedded certificates, for the short-response shape.
+    plain: []u8 = &.{},
+    stores: [3][]u8 = .{ &.{}, &.{}, &.{} },
+    seeds: [parse_static_seeds.len + 3][]const u8 = undefined,
+
+    fn build(self: *ParseCorpus, gpa: std.mem.Allocator) ![]const []const u8 {
+        var fx = try makeRsaFixture(gpa);
+        defer fx.deinit(gpa);
+        const issuer = try extractBits(fx.issuer_der);
+        const subject = try extractBits(fx.subject_der);
+
+        self.plain = try buildResponse(gpa, .{
+            .issuer = issuer,
+            .subject_serial = subject.serial,
+            .responder_by_name = issuer.subject_name,
+            .sign_rsa = fx.kp.secret_key,
+        });
+
+        var prng = std.Random.DefaultPrng.init(0xf0e1d2c3);
+        const dkp = try rsa.generate(prng.random(), 1024, 65537);
+        const delegate_self = try rsa.selfSignedCert(gpa, dkp.secret_key, dkp.public_key, Sha256, .{
+            .common_name = "fuzz delegated responder",
+            .serial = 9,
+            .not_before = "200101000000Z",
+            .not_after = "400101000000Z",
+            .is_ca = false,
+        });
+        defer gpa.free(delegate_self);
+        const dbits = try extractBits(delegate_self);
+        const delegate_cert = try buildDelegateCert(
+            gpa,
+            fx.kp.secret_key,
+            issuer.subject_name,
+            try spkiOf(delegate_self),
+            dbits.subject_name,
+            .ocsp_signing,
+        );
+        defer gpa.free(delegate_cert);
+        self.delegated = try buildResponse(gpa, .{
+            .issuer = issuer,
+            .subject_serial = subject.serial,
+            .responder_by_name = dbits.subject_name,
+            .certs = delegate_cert,
+            .sign_rsa = dkp.secret_key,
+        });
+
+        for (parse_static_seeds, 0..) |sd, i| self.seeds[i] = sd;
+        const frames = [_][]const u8{ self.plain, self.delegated, self.delegated };
+        for (frames, 0..) |frame, k| {
+            self.stores[k] = try gpa.alloc(u8, 4 + frame.len);
+            self.seeds[parse_static_seeds.len + k] = fuzzseed.seedInto(self.stores[k], frame);
+        }
+        // The third is the delegated response with one octet of it flipped.
+        self.stores[2][4 + self.delegated.len / 2] ^= 0x01;
+        return &self.seeds;
+    }
+
+    fn deinit(self: *ParseCorpus, gpa: std.mem.Allocator) void {
+        gpa.free(self.plain);
+        gpa.free(self.delegated);
+        for (self.stores) |st| gpa.free(st);
+    }
+};
+
+test "corpus: every parseResponse seed reaches the parser, and what it decodes is pinned" {
+    // The number that matters is not "did anything parse" but whether the
+    // corpus can carry a REAL response at all: at the old 512-octet buffer it
+    // could not, because a seed longer than the buffer reads back empty rather
+    // than truncated, and this module's own fixture is over 1500 octets.
+    const gpa = testing.allocator;
+    var c: ParseCorpus = .{};
+    const seeds = try c.build(gpa);
+    defer c.deinit(gpa);
+
+    var nonempty: usize = 0;
+    var octets: usize = 0;
+    var accepted: usize = 0;
+    var with_basic: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [parse_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        octets += len;
+        const parsed = ocsp.parseResponse(buf[0..len]) catch continue;
+        accepted += 1;
+        if (parsed.basic != null) with_basic += 1;
+    }
+    // One seed is deliberately the empty slice.
+    try testing.expectEqual(seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draw was restructured every round parsed
+    // the empty slice: 0 non-empty, 0 octets, 0 accepted.
+    try testing.expectEqual(@as(usize, 2172), octets);
+    try testing.expectEqual(@as(usize, 4), accepted);
+    // The number the degenerate input cannot produce: a decoded BasicOCSPResponse.
+    try testing.expectEqual(@as(usize, 3), with_basic);
+    // And the point of the buffer change: the response a real responder
+    // returns — the one carrying its own certificate — does NOT fit the 512
+    // octets this harness used to have, and a seed over the buffer reads back
+    // EMPTY, not truncated. So the accepting path was unreachable for the only
+    // response shape that matters.
+    try testing.expect(c.delegated.len > 512);
+    try testing.expect(c.delegated.len <= parse_buf_len);
 }
 
 // ── fuzz: the parsers behind `verify`, which the harness above cannot reach ──
@@ -1297,25 +1446,48 @@ test "fuzz: verify's certificate and delegate parsers on damaged input" {
         .certs_start = @intFromPtr(certs_slice.ptr) - @intFromPtr(resp_der.ptr),
         .certs_end = (@intFromPtr(certs_slice.ptr) - @intFromPtr(resp_der.ptr)) + certs_slice.len,
     };
-    try testing.fuzz(&ctx, fuzzVerify, .{ .corpus = verify_seeds });
+    try verifyCorpusGuard(&ctx);
+    try testing.fuzz(&ctx, fuzzVerify, .{ .corpus = &verify_seeds });
 }
 
 /// Flips between one and four octets, then reports whether the buffer actually
 /// differs from the original — two flips of the same octet can cancel, and an
 /// "it was mutated" flag that is not measured is how a false positive gets
 /// into a security assertion.
-fn damage(smith: *std.testing.Smith, buf: []u8, original: []const u8) bool {
+fn damage(script: *fuzzseed.Cursor, buf: []u8, original: []const u8) bool {
     if (buf.len == 0) return false;
-    const n = smith.valueRangeAtMost(u8, 1, 4);
+    const n = script.ranged(1, 4);
     var k: usize = 0;
     while (k < n) : (k += 1) {
-        const at = smith.index(buf.len);
-        buf[at] ^= smith.valueRangeAtMost(u8, 1, 255);
+        // A 16-bit offset, not an octet: `resp` is over 1500 octets, so an
+        // offset drawn from ONE octet could only ever damage the first 256 —
+        // the whole `tbsResponseData` past that, and the signature over it,
+        // would have been out of reach of the assertion below.
+        const at = script.word() % buf.len;
+        buf[at] ^= @intCast(script.ranged(1, 255));
     }
     return !std.mem.eql(u8, buf, original);
 }
 
+/// How many octets of script `fuzzVerify` will read. Big enough for mode 4 to
+/// fill both certificate buffers from the seed rather than from a cycle.
+const verify_script_len = 2560;
+
 fn fuzzVerify(ctx: *const VerifyFuzzCtx, smith: *std.testing.Smith) !void {
+    // One byte-first draw, read as a SCRIPT. It used to be a chain of ranged
+    // `Smith` draws opening with `smith.valueRangeAtMost(u8, 0, 4)` for the
+    // mode, with a `verifySeed(mode, bits, n)` helper writing each choice as
+    // its own little-endian `u64` word. That worked — the words were sized to
+    // fall inside their ranges — but it made every seed an opaque list of
+    // 64-bit words, and any range this harness later widens past a word that
+    // was hand-chosen for the old one silently collapses that draw to its
+    // minimum with the suite still green. `Cursor` reads the choices out of
+    // the seed's own octets instead, so a seed is a reviewable script and the
+    // gate is satisfied by the same change.
+    var script_buf: [verify_script_len]u8 = undefined;
+    const script_len: usize = smith.slice(&script_buf);
+    var script: fuzzseed.Cursor = .{ .bytes = script_buf[0..script_len] };
+
     var rbuf: [4096]u8 = undefined;
     var ibuf: [2048]u8 = undefined;
     var sbuf: [2048]u8 = undefined;
@@ -1328,20 +1500,25 @@ fn fuzzVerify(ctx: *const VerifyFuzzCtx, smith: *std.testing.Smith) !void {
     var iss: []const u8 = ibuf[0..ctx.issuer.len];
     var subj: []const u8 = sbuf[0..ctx.subject.len];
 
-    const mode = smith.valueRangeAtMost(u8, 0, 4);
+    // Script layout: one octet of mode, then whatever that mode reads.
+    const mode = script.ranged(0, 4);
     var response_damaged = false;
     switch (mode) {
         0 => {}, // untouched — the positive control
-        1 => response_damaged = damage(smith, resp, ctx.response),
-        2 => _ = damage(smith, ibuf[0..ctx.issuer.len], ctx.issuer),
-        3 => _ = damage(smith, sbuf[0..ctx.subject.len], ctx.subject),
+        1 => response_damaged = damage(&script, resp, ctx.response),
+        2 => _ = damage(&script, ibuf[0..ctx.issuer.len], ctx.issuer),
+        3 => _ = damage(&script, sbuf[0..ctx.subject.len], ctx.subject),
         else => {
             // Arbitrary octets where a certificate is expected: the direct
-            // route into `parseCert`'s structure walk.
-            smith.bytes(&ibuf);
-            smith.bytes(&sbuf);
-            iss = ibuf[0..smith.valueRangeAtMost(u16, 0, 1024)];
-            subj = sbuf[0..smith.valueRangeAtMost(u16, 0, 1024)];
+            // route into `parseCert`'s structure walk. Lengths first, then the
+            // bytes, so a short script cycles into them instead of leaving the
+            // buffers at whatever the last round wrote.
+            const iss_len: usize = script.word() % 1025;
+            const subj_len: usize = script.word() % 1025;
+            for (ibuf[0..iss_len]) |*b| b.* = script.byte();
+            for (sbuf[0..subj_len]) |*b| b.* = script.byte();
+            iss = ibuf[0..iss_len];
+            subj = sbuf[0..subj_len];
         },
     }
 
@@ -1354,8 +1531,8 @@ fn fuzzVerify(ctx: *const VerifyFuzzCtx, smith: *std.testing.Smith) !void {
     // 287 coverage-guided runs, on a real defect. The other modes keep the
     // random clock, which is what exercises the freshness logic itself.
     const opts: ocsp.VerifyOptions = if (mode == 0 or mode == 1) defaultOpts() else .{
-        .now_unix = smith.value(i32),
-        .max_age_seconds = smith.value(u16),
+        .now_unix = @as(i64, @as(i32, @bitCast((@as(u32, script.word()) << 16) | @as(u32, script.word())))),
+        .max_age_seconds = script.word(),
         .expected_nonce = null,
     };
 
@@ -1402,30 +1579,68 @@ fn damageOnlyInside(ctx: *const VerifyFuzzCtx, damaged: []const u8) bool {
     return true;
 }
 
-/// See `iec61850/src/goose.zig`: without `--fuzz` the runner feeds only
-/// `options.corpus` plus one empty input, and an empty input makes every draw
-/// return its range minimum — mode 0 forever. `Smith` reads one little-endian
-/// `u64` per scalar draw and discards a word outside that draw's range, so the
-/// words are kept small; the leading word selects the mode.
-fn verifySeed(comptime mode: u64, comptime bits: u64, comptime n: usize) [n]u8 {
-    @setEvalBranchQuota(100_000);
-    var out: [n]u8 = undefined;
-    std.mem.writeInt(u64, out[0..8], mode, .little);
-    var i: usize = 8;
-    var w: u6 = 0;
-    while (i + 8 <= n) : (i += 8) {
-        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 0xFF, .little);
-        w +%= 1;
+/// ⭐ The lesson this module already paid for, made permanent. `fuzzVerify`'s
+/// `DamagedResponseAccepted` assertion — "a response altered anywhere outside
+/// its embedded certificates must not verify" — is only ARMED on the rounds
+/// where `mode == 1` AND `damage` actually changed an octet. It was once dead
+/// for a different reason (a randomized `now_unix` refused nearly every
+/// damaged response on freshness first, so the assertion was never reached),
+/// and the fix was to pin the clock for that mode. Nothing pinned the OTHER
+/// half: how many rounds arm it at all. A corpus that drifts to mode 0, or
+/// whose flips cancel, would leave "no crashes" reported for ever again — so
+/// the count of armed rounds is measured here, deterministically.
+fn verifyCorpusGuard(ctx: *const VerifyFuzzCtx) !void {
+    var modes = [_]usize{0} ** 5;
+    var armed: usize = 0;
+    var nonempty: usize = 0;
+    var script_octets: usize = 0;
+    for (verify_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script_buf: [verify_script_len]u8 = undefined;
+        const n: usize = smith.slice(&script_buf);
+        if (n != 0) nonempty += 1;
+        script_octets += n;
+        var script: fuzzseed.Cursor = .{ .bytes = script_buf[0..n] };
+        const mode = script.ranged(0, 4);
+        modes[mode] += 1;
+        if (mode != 1) continue;
+        var rbuf: [4096]u8 = undefined;
+        @memcpy(rbuf[0..ctx.response.len], ctx.response);
+        if (damage(&script, rbuf[0..ctx.response.len], ctx.response)) armed += 1;
     }
-    return out;
+    // Every seed carries a script; none of them is the empty one, because an
+    // empty script IS mode 0 and mode 0 is already spelled out.
+    try testing.expectEqual(verify_seeds.len, nonempty);
+    // Measured 2026-09-07.
+    try testing.expectEqual(@as(usize, 157), script_octets);
+    // All five modes are selected, which the old u64-word seeds also achieved
+    // — the number that was never pinned is the next one.
+    for (modes) |m| try testing.expect(m > 0);
+    // ⭐ The rounds on which `DamagedResponseAccepted` is live. One mode-1 seed
+    // flips the same octet twice on purpose, so it is NOT armed, which is what
+    // makes this a measurement of `damage`'s return value and not of the seed
+    // count.
+    try testing.expectEqual(@as(usize, 5), armed);
 }
 
-const verify_seeds: []const []const u8 = &.{
-    &verifySeed(0, 0x9E37_79B9_7F4A_7C15, 128), // the positive control
-    &verifySeed(1, 0x0123_4567_89AB_CDEF, 128), // damage the response
-    &verifySeed(2, 0xF0E1_D2C3_B4A5_9687, 128), // damage the issuer cert
-    &verifySeed(3, 0x6C62_1F4D_3A98_5E27, 128), // damage the subject cert
-    &verifySeed(4, 0xD5B8_0E93_C741_A26F, 128), // arbitrary octets as certs
+/// Without `--fuzz` the runner feeds only `options.corpus` plus one empty
+/// input, and an empty script makes every `Cursor` read return its range
+/// minimum — mode 0 for ever. Each seed is a plain octet script: the first
+/// octet picks the mode, and the rest is read by that mode in the order
+/// `fuzzVerify` documents.
+const verify_seeds = [_][]const u8{
+    fuzzseed.seedHex("00"), // the positive control: nothing is damaged
+    fuzzseed.seedHex("01" ++ "01" ++ "0000" ++ "7f"), // damage the response's FIRST octet — the outer SEQUENCE tag
+    fuzzseed.seedHex("01" ++ "01" ++ "0004" ++ "01"), // one bit inside the length of the outer wrapper
+    fuzzseed.seedHex("01" ++ "01" ++ "0140" ++ "ff"), // ⭐ offset 320: past what a one-octet offset could ever have reached
+    fuzzseed.seedHex("01" ++ "04" ++ "0032" ++ "11" ++ "0190" ++ "22" ++ "02bc" ++ "44" ++ "0400" ++ "88"), // four flips spread across the response
+    fuzzseed.seedHex("01" ++ "02" ++ "0080" ++ "01" ++ "0080" ++ "01"), // ⭐ two flips of the SAME octet: they cancel, and `damage` must report false
+    fuzzseed.seedHex("02" ++ "01" ++ "0010" ++ "5a" ++ "0000" ++ "0000" ++ "0e10"), // damage the issuer cert, then a clock and a max_age
+    fuzzseed.seedHex("03" ++ "02" ++ "0020" ++ "7f" ++ "0100" ++ "01" ++ "ffff" ++ "ffff" ++ "ffff"), // damage the subject cert, with the clock at its far end
+    fuzzseed.seedHex("04" ++ "0000" ++ "0000" ++ "0000" ++ "0000" ++ "0000"), // ⭐ mode 4 with BOTH certificates empty
+    fuzzseed.seedHex("04" ++ "0001" ++ "0001" ++ "30" ++ "30" ++ "0000" ++ "0000" ++ "0000"), // a single octet each
+    fuzzseed.seedHex("04" ++ "0400" ++ "0400" ++ "30820100" ** 4 ++ "0000" ++ "0000" ++ "0e10"), // 1024 octets each, opening like a certificate and then cycling
+    fuzzseed.seedHex("04" ++ "03e8" ++ "0064" ++ "ff" ** 32 ++ "0000" ++ "0000" ++ "0000"), // no DER structure at all where a certificate belongs
 };
 
 /// Extract the SubjectPublicKeyInfo TLV bytes from a certificate.

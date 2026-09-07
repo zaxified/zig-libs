@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: all twelve real JSON-RPC bodies in the fuzz
+  corpus reached the pre-parse scanners as the EMPTY body**, including the
+  `initialize` request the scanners exist to recognise. `buildJsonRpcish`
+  opened with `smith.valueRangeAtMost(u8, 0, 5)` to choose between "arbitrary
+  bytes" and "assemble a JSON object". A ranged `Smith` draw reads EIGHT
+  octets as a little-endian `u64` and returns the range MINIMUM unless that
+  whole word already lies inside the range — `{"jsonrpc` is nowhere near 0..5
+  — so every seed took the arbitrary-bytes branch, `smith.bytes(&raw)` ate the
+  rest of the body, and the ranged length after it found nothing left and
+  returned 0. Measured 2026-09-07: **0 of 12 seeds carried an octet, and
+  neither scanner ever got past `object_begin`** — so the hand-written scan
+  loop, the whole reason this target exists, had never run. One `smith.slice`
+  draw now, read as a script whose first octet selects "the rest is the body
+  verbatim" or "the rest assembles a JSON object" through
+  `testkit.fuzz.Cursor`. Corpus 12 → 18, adding a string `id`, the `method`
+  key repeated, and the empty object. Measured after: **17 of 18 seeds
+  non-empty over 1129 octets, 3 `initialize` requests recognised and 2
+  correlatable responses found.** ⭐ The guard pins those two decisions rather
+  than "the scanner returned without an error": `{}` is legal JSON with no
+  keys, so an error-free return would have read green on a corpus that walked
+  nothing.
+
 - **2026-09-02** — Follow-on from the `mcp` drift re-audit: `mcp.Server` now keeps handshake state
   **per peer**, and a peer handle is this transport's session tag — so the server has to be told
   when a session ends or its peer table only grows, and past `Server.max_peers` it starts refusing

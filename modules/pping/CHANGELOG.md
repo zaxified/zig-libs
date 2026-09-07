@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: neither golden capture in the fuzz corpus ever
+  reached the parser.** `fuzz_corpus` held the two real loopback handshakes as
+  raw arrays (`&syn_tcp_options`, `&synack_tcp_options`), and
+  `buildTcpOptions` opened with `smith.valueRangeAtMost(u8, 0, 5)`. A ranged
+  `Smith` draw reads EIGHT octets as a little-endian `u64` and returns the
+  range MINIMUM unless that whole word already lies inside the range — the SYN
+  capture's first eight octets read as 0x0a080204d7ff0402, so the draw
+  returned 0, took the "pure arbitrary bytes" branch, `smith.bytes(buf)` ate
+  the remaining twelve octets, and the ranged length after it found nothing
+  left and returned 0. **Both captures arrived at `parseTcpTimestamps` as the
+  EMPTY option list** — from a corpus whose entire point is that each frame
+  contains a Timestamps option. Measured 2026-09-07: **0 of 2 seeds carried an
+  octet and 0 Timestamps options were found.** The harness now makes one
+  `smith.slice` draw and reads the seed as a script whose first octet selects
+  "the rest is the option list verbatim" (so a capture can be a seed at all)
+  or "the rest assembles TLV entries" through `testkit.fuzz.Cursor`. Corpus
+  2 → 14, including an END ahead of a genuine Timestamps option, a length of
+  0 and of 1 (neither can advance the walk), and an option claiming 255 octets
+  inside a 43-octet list. Measured after: **13 of 14 seeds non-empty, 309
+  octets walked, 6 Timestamps options found.** The guard pins the sum of the
+  TSvals recovered, which neither an empty list nor a mis-walked one produces.
+
 - **2026-08-14** — `zig build check-fuzz` coverage: a `testing.fuzz` harness on
   `parse.parseTcpTimestamps` (the TCP-options TLV decode entry point), TLV-shaped so
   most draws are well-formed-ish option sequences (END/NOP/genuine Timestamps/opaque

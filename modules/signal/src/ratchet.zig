@@ -995,20 +995,106 @@ test "replay of a consumed in-order message is not decryptable" {
     );
 }
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// `Header.fromBytes` is an EXACT-length gate at `encoded_length` (40), so a
+/// corpus of short strings only ever reaches `error.InvalidHeader`. These
+/// seeds are 40 octets unless they are deliberately testing the gate itself.
+const header_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // the empty slice: exactly what the collapsed draw ran, for ever
+    fuzzseed.seedHex("00" ** 40), // all zeroes: a valid header naming dh = 0, pn = 0, n = 0
+    fuzzseed.seedHex("ff" ** 40), // ⭐ pn and n both 0xffffffff — the far end of `skipMessageKeys`'s arithmetic
+    fuzzseed.seedHex("00" ** 32 ++ "00000000" ++ "01000000"), // n = 1, little-endian
+    fuzzseed.seedHex("00" ** 32 ++ "01000000" ++ "00000000"), // pn = 1, n = 0
+    fuzzseed.seedHex("00" ** 32 ++ "e8030000" ++ "e8030000"), // ⭐ pn = n = 1000 = `max_skip` exactly
+    fuzzseed.seedHex("00" ** 32 ++ "e9030000" ++ "e9030000"), // ⭐ 1001: one past `max_skip`
+    fuzzseed.seedHex("09" ** 32 ++ "ffffffff" ++ "00000000"), // pn saturated, n zero
+    fuzzseed.seedHex("00" ** 39), // 39 octets: one short of the gate
+    fuzzseed.seedHex("00" ** 41), // 41 octets: one over
+    fuzzseed.seedHex("00" ** 48), // the whole buffer, well over the gate
+    fuzzseed.seedHex("2a"), // a single octet
+};
+
 test "fuzz: Header.fromBytes never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzHeaderFromBytes, .{});
+    try testing.fuzz({}, fuzzHeaderFromBytes, .{ .corpus = &header_seeds });
 }
 
 fn fuzzHeaderFromBytes(_: void, smith: *std.testing.Smith) !void {
     var buf: [Header.encoded_length + 8]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice`, never `bytes` then a ranged draw. `bytes` consumes
+    // `@min(buf.len, in.len)` octets, so the ranged length that followed found
+    // fewer than the eight it reads as a little-endian `u64` and returned the
+    // range MINIMUM: `len` was 0 for every input this lane can carry, and
+    // `fromBytes` refused it on the `bytes.len != encoded_length` line without
+    // reading an octet. Measured 2026-09-07 over the corpus: 0 of 12 seeds
+    // arrived non-empty and 0 headers decoded before; 11 and 8 after.
+    const len: usize = smith.slice(&buf);
     const h = Header.fromBytes(buf[0..len]) catch return;
     _ = h;
 }
 
+test "corpus: every header seed reaches fromBytes, and the fields decoded are pinned" {
+    // ⭐ `accepted > 0` would be a weak guard here and a pinned count is not
+    // much better on its own: an all-zero 40-octet buffer is a perfectly legal
+    // header, so a corpus that decoded nothing but zeroes would still score
+    // full marks. The number the degenerate input cannot produce is the sum of
+    // the `pn`/`n` counters actually read out of the octets.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var counter_sum: u64 = 0;
+    var over_max_skip: usize = 0;
+    for (header_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Header.encoded_length + 8]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const h = Header.fromBytes(buf[0..len]) catch continue;
+        decoded += 1;
+        counter_sum += @as(u64, h.pn) + @as(u64, h.n);
+        if (h.n > max_skip) over_max_skip += 1;
+    }
+    // One seed is deliberately the empty slice.
+    try testing.expectEqual(header_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draw was restructured all four were 0 —
+    // the only input this target ever handed `fromBytes` was the empty slice.
+    try testing.expectEqual(@as(usize, 7), decoded);
+    try testing.expectEqual(@as(u64, 12884905889), counter_sum);
+    try testing.expectEqual(@as(usize, 2), over_max_skip);
+}
+
+/// The whole wire message: the 40-octet header followed by the ciphertext.
+/// One draw covers both, because two `smith.bytes` calls plus a ranged length
+/// meant the ciphertext length was always 0 (see `fuzzDecrypt`).
+const decrypt_buf_len = Header.encoded_length + 256;
+
+/// `header ‖ ciphertext`. `Smith.slice` memsets the tail of the buffer to
+/// zero, so a seed shorter than 40 octets still yields a well-formed header —
+/// which is what makes the short seeds here about `decrypt` and not about
+/// `Header.fromBytes`.
+/// ⭐ The X25519 base point. An all-zero `dh` is a low-order point, so
+/// `dhRatchet` refuses it with `error.IdentityElement` before the skip
+/// counters are ever consulted — a corpus of zero headers cannot reach
+/// `skipMessageKeys` at all, which is exactly what the measurement showed.
+const base_point_hex = "09" ++ "00" ** 31;
+
+const decrypt_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // exactly what the collapsed draws ran: a zero header and an empty ciphertext
+    fuzzseed.seedHex("00" ** 40 ++ "00" ** 16), // a bare 16-octet Poly1305 tag, zero plaintext length
+    fuzzseed.seedHex("00" ** 40 ++ "ff" ** 16), // the same length, all-ones tag
+    fuzzseed.seedHex("00" ** 40 ++ "00" ** 15), // ⭐ one octet SHORT of a tag: the truncation branch of `aeadOpen`
+    fuzzseed.seedHex("00" ** 32 ++ "00000000" ++ "01000000" ++ "41" ** 32), // n = 1: one key skipped before the open
+    fuzzseed.seedHex(base_point_hex ++ "00000000" ++ "e8030000" ++ "41" ** 32), // ⭐ n = 1000 = `max_skip`: the largest skip that is allowed
+    fuzzseed.seedHex(base_point_hex ++ "00000000" ++ "e9030000" ++ "41" ** 32), // ⭐ n = 1001: one past `max_skip` → `TooManySkippedMessages`
+    fuzzseed.seedHex("00" ** 32 ++ "ffffffff" ++ "ffffffff" ++ "41" ** 32), // both counters saturated
+    fuzzseed.seedHex(base_point_hex ++ "00000000" ++ "00000000" ++ "41" ** 32), // ⭐ a usable `dh`: the DH ratchet actually steps, instead of failing on an identity element
+    fuzzseed.seedHex(base_point_hex ++ "01000000" ++ "02000000" ++ "41" ** 32), // a ratchet step that also skips in the previous chain
+    fuzzseed.seedHex("00" ** 40 ++ "41" ** 256), // the ciphertext filling the buffer
+    fuzzseed.seedHex("00" ** 40), // header only: a zero-length ciphertext, which cannot even hold a tag
+    fuzzseed.seedHex("ff" ** 40 ++ "00" ** 16), // an all-ones header
+};
+
 test "fuzz: decrypt (wire header+ciphertext) never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecrypt, .{});
+    try testing.fuzz({}, fuzzDecrypt, .{ .corpus = &decrypt_seeds });
 }
 
 fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
@@ -1025,23 +1111,86 @@ fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
     defer alice.deinit(alloc);
     defer bob.deinit(alloc);
 
-    // `Header.fromBytes` requires exactly `encoded_length` bytes, so build
-    // one from arbitrary content directly rather than round-tripping
-    // through `fromBytes` (that path is covered by the harness above).
-    var header_bytes: [Header.encoded_length]u8 = undefined;
-    smith.bytes(&header_bytes);
-    const header = Header.fromBytes(&header_bytes) catch return;
-
-    var ct_buf: [256]u8 = undefined;
-    smith.bytes(&ct_buf);
-    const ct_len: usize = smith.valueRangeAtMost(u16, 0, ct_buf.len);
+    // ⚠ ONE draw for the whole wire message. It used to be three:
+    // `smith.bytes(&header_bytes)`, then `smith.bytes(&ct_buf)`, then
+    // `ct_len = smith.valueRangeAtMost(u16, 0, ct_buf.len)`. `bytes` consumes
+    // `@min(buf.len, in.len)` octets, so by the time the ranged draw ran the
+    // input was gone and it returned the range MINIMUM: **`ct_len` was 0 for
+    // every input this lane can carry**, and `aeadOpen` — named in the comment
+    // this replaces as the thing arbitrary ciphertext drives — was handed an
+    // empty slice on every round, which it refuses for being shorter than the
+    // 16-octet tag. `Smith.slice` memsets the tail, so the leading 40 octets
+    // are always a well-formed header and the remainder is the ciphertext.
+    // Measured 2026-09-07 over the corpus: 0 of 13 seeds carried a ciphertext
+    // octet before, 11 after, and the `TooManySkippedMessages` guard had never
+    // been reached.
+    var raw: [decrypt_buf_len]u8 = undefined;
+    const n: usize = smith.slice(&raw);
+    const header = Header.fromBytes(raw[0..Header.encoded_length]) catch return;
+    const ct = raw[Header.encoded_length..@max(n, Header.encoded_length)];
 
     // Arbitrary header.pn/header.n drive `skipMessageKeys`/`dhRatchet`;
     // arbitrary ciphertext drives `aeadOpen`. Every failure mode here must
     // be a typed `DecryptError`, never a panic/OOB — `self` (bob) is left
     // untouched on any error per `decrypt`'s transactional-commit doc.
-    const pt = bob.decrypt(alloc, header, ct_buf[0..ct_len], io) catch return;
+    const pt = bob.decrypt(alloc, header, ct, io) catch return;
     alloc.free(pt);
+}
+
+test "corpus: every decrypt seed reaches decrypt, and the refusals it draws are pinned" {
+    // ⭐ There is no accepting path to pin here and that is not a gap: a
+    // frozen seed CANNOT produce a decryptable message, because `seedSession`
+    // generates fresh X25519 keypairs on every round, so no ciphertext
+    // written down today authenticates against tomorrow's session. What the
+    // guard pins instead is that the corpus reaches distinct REFUSALS — the
+    // empty-ciphertext round the collapsed harness ran could only ever produce
+    // `MessageAuthenticationFailed`, so a second error kind is proof the
+    // harness walked somewhere new.
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = testing.allocator;
+
+    const s = try seedSession(io);
+    var alice = s.alice;
+    var bob = s.bob;
+    defer alice.deinit(alloc);
+    defer bob.deinit(alloc);
+
+    var nonempty: usize = 0;
+    var ct_octets: usize = 0;
+    var too_many_skipped: usize = 0;
+    var auth_failed: usize = 0;
+    var accepted: usize = 0;
+    for (decrypt_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [decrypt_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&raw);
+        if (n != 0) nonempty += 1;
+        const header = try Header.fromBytes(raw[0..Header.encoded_length]);
+        const ct = raw[Header.encoded_length..@max(n, Header.encoded_length)];
+        ct_octets += ct.len;
+        if (bob.decrypt(alloc, header, ct, io)) |pt| {
+            accepted += 1;
+            alloc.free(pt);
+        } else |e| switch (e) {
+            error.TooManySkippedMessages => too_many_skipped += 1,
+            error.MessageAuthenticationFailed => auth_failed += 1,
+            else => {},
+        }
+    }
+    // One seed is deliberately empty.
+    try testing.expectEqual(decrypt_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draws were restructured `ct_octets` was
+    // 0 across the whole corpus, `TooManySkippedMessages` had never fired, and
+    // `aeadOpen` was handed an empty slice every round — so the only refusal
+    // this target had ever produced was the "shorter than the 16-octet tag"
+    // one.
+    try testing.expectEqual(@as(usize, 511), ct_octets);
+    try testing.expectEqual(@as(usize, 1), too_many_skipped);
+    try testing.expectEqual(@as(usize, 2), auth_failed);
+    // No frozen seed can authenticate against a freshly generated session.
+    try testing.expectEqual(@as(usize, 0), accepted);
 }
 
 // ── EXTERNAL interop: libsignal-captured KDF vectors ────────────────────

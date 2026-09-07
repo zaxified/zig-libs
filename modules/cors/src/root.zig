@@ -651,6 +651,7 @@ fn assertValueClean(v: []const u8) void {
 // ── tests (offline — through http.Server.serveStream, no socket) ────────────
 
 const testing = std.testing;
+const fuzzseed = @import("testkit").fuzz;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 
@@ -1807,9 +1808,17 @@ test "applyPreflight: a direct caller breaking the ACRM contract gets a failed p
 // ── fuzz: the pure gates never panic on hostile header bytes ────────────────
 
 fn fuzzGates(_: void, smith: *std.testing.Smith) !void {
-    var buf: [96]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [gate_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice`, never `bytes` then a ranged draw. `bytes` consumes
+    // `@min(buf.len, in.len)` octets, so the ranged length that followed it
+    // read fewer than the eight it needs as a little-endian `u64` and returned
+    // the range MINIMUM — `len` was 0 for every input this lane can carry, and
+    // all three gates were only ever handed the empty string. That is the one
+    // input the gates agree on trivially: `requestedHeadersAllowed("")` is
+    // `true` by the "no header named, nothing to refuse" path and never
+    // reaches the comma split at all. Measured 2026-09-07: 0 of 14 seeds
+    // arrived non-empty before, 14 of 14 after.
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
 
     // Policies live on the stack — the gates allocate nothing.
@@ -1870,8 +1879,79 @@ test "the pure gates are total: .reflect answers instead of reading a dead union
     try testing.expect(c.requestedHeadersAllowed(""));
     try testing.expect(c.requestedHeadersAllowed("x-anything, whatever"));
 }
+/// 96 octets against the longest value any of the three gates is handed in
+/// this module's own wire tests — the 61-octet
+/// `Access-Control-Request-Headers: content-type, authorization\r\n` line,
+/// whose *value* is 27 — with room for a comma list naming both allowed
+/// headers several times over.
+const gate_buf_len = 96;
+
+/// What the three gates are handed on the wire: an `Origin`, an
+/// `Access-Control-Request-Method` token, an `Access-Control-Request-Headers`
+/// list. Every seed goes to all three, so most of them are a refusal for two
+/// gates and the interesting input for the third.
+const gate_seeds = [_][]const u8{
+    fuzzseed.seed(""), // the empty string: exactly what the collapsed draw ran, for ever
+    fuzzseed.seed("https://app.example"), // the listed origin — the only granting one
+    fuzzseed.seed("https://APP.example"), // origin matching is byte-exact, unlike the other two gates
+    fuzzseed.seed("null"), // the second listed origin: the opaque one browsers send
+    fuzzseed.seed("https://evil.example"), // an unlisted origin
+    fuzzseed.seed("OPTIONS"), // the preflight vehicle: always allowed, whatever the method list says
+    fuzzseed.seed("options"), // ⭐ the same through `eqlIgnoreCase`, which origin matching does not use
+    fuzzseed.seed("GET"), // a listed method token
+    fuzzseed.seed("TRACE"), // an unlisted method token
+    fuzzseed.seed("content-type, authorization"), // both listed headers, lowercased as a browser sends them
+    fuzzseed.seed("Content-Type,\tAuthorization ,, "), // OWS, a tab, and the empty items the split has to skip
+    fuzzseed.seed("Content-Type, X-Not-Allowed"), // ⭐ one allowed, one not: the refusal must win
+    fuzzseed.seed(",,,   ,\t,"), // separators only — every item empty, so nothing is refused
+    fuzzseed.seed("\x00\xff\r\n:\x7f " ++ "A" ** 80), // non-token bytes and a value filling the buffer
+};
+
 test "fuzz: allowOriginValue/methodTokenAllowed/requestedHeadersAllowed never panic" {
-    try testing.fuzz({}, fuzzGates, .{});
+    try testing.fuzz({}, fuzzGates, .{ .corpus = &gate_seeds });
+}
+
+test "corpus: every gate seed reaches all three gates, and their verdicts are pinned" {
+    // ⭐ An `accepted > 0` guard is meaningless here: `requestedHeadersAllowed`
+    // answers `true` for the empty string and `true` for ANY string under the
+    // default `.reflect` policy, so "something was allowed" would have read
+    // 100% while the harness walked one empty slice for ever. The numbers the
+    // empty input cannot produce are the origins GRANTED and the header lists
+    // REFUSED — `allowOriginValue("")` is null against the list, and
+    // `requestedHeadersAllowed("")` never reaches the comma split.
+    const listed: Cors = .{
+        .gpa = testing.failing_allocator,
+        .options = .{
+            .allowed_origins = .{ .list = &.{ "https://app.example", "null" } },
+            .allowed_headers = .{ .list = &.{ "Content-Type", "Authorization" } },
+        },
+        .allow_methods_value = "",
+        .allow_headers_value = "",
+        .expose_headers_value = "",
+    };
+
+    var nonempty: usize = 0;
+    var origins_granted: usize = 0;
+    var methods_allowed: usize = 0;
+    var headers_refused: usize = 0;
+    for (gate_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [gate_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const bytes = buf[0..len];
+        if (listed.allowOriginValue(bytes) != null) origins_granted += 1;
+        if (listed.methodTokenAllowed(bytes)) methods_allowed += 1;
+        if (!listed.requestedHeadersAllowed(bytes)) headers_refused += 1;
+    }
+    // One seed is deliberately the empty string.
+    try testing.expectEqual(gate_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draw was restructured every round ran
+    // the empty string: 0 origins granted, 0 methods allowed, 0 header lists
+    // refused — the refusal branch of `requestedHeadersAllowed` had never run.
+    try testing.expectEqual(@as(usize, 2), origins_granted);
+    try testing.expectEqual(@as(usize, 3), methods_allowed);
+    try testing.expectEqual(@as(usize, 10), headers_refused);
 }
 
 // ── tests (static posture) ──────────────────────────────────────────────────

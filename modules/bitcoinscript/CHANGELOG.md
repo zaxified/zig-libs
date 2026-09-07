@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only, two harnesses, and two recorded audit fixes
+  that had never executed.** (a) `verify.fuzzVerifyScript` had NO corpus, so
+  the ordinary test lane ran exactly one round of `in = ""` and every `Smith`
+  draw returned its minimum: `head_len` 0, `total` 0, `n_witness` 0, and all
+  twenty `ScriptFlags` booleans `false` —
+  `verifyScript(a, "", "", &.{}, .{}, ctx)`, one input, for ever. **Both fixes
+  the comments there record — the `inline for` over the flag struct "so a flag
+  added later is drawn without anyone remembering to come back here", and the
+  long-script builder that walks the 201-opcode / 1000-element / 10 000-octet
+  limits from both sides — sat behind draws that had already collapsed, and
+  neither had ever run.** Measured 2026-09-07: 1 input, 0 script octets, 0
+  witness items, 0 flags set. (b) `tapscript_test.fuzzTapscriptLeaf` had a
+  corpus, built by `tapscriptSeed(bits, 512)` writing one little-endian `u64`
+  per draw with every word masked to `& 0x0F`. That kept each word inside its
+  range so the harness did run — but it capped **every** choice at 15: the
+  leaf script was never longer than 15 octets against a 256-octet buffer, and
+  any range later widened past 15 would collapse silently with the suite
+  green. Both now read their choices from one `smith.slice` through
+  `testkit.fuzz.Cursor`, so a seed is a reviewable octet script.
+  Measured after: **verifyScript — 13 of 14 seeds non-empty, 39 141 script
+  octets, 18 witness items, 102 flag booleans set, 8 seeds over 200 opcodes, 3
+  at the 10 000-octet limit and 1 witness element past the 520-octet push
+  bound, every one of which was 0 before. Tapscript — longest leaf 15 → 255
+  octets, 404 leaf octets, 7 stack items, and 11 of 15 seeds on which the
+  harness's own `TaprootCommitmentMismatch` assertion is armed.**
+
 - **2026-09-02** — **Audit (drift campaign): 1 HIGH fixed, 2 LOW recorded.**
   **HIGH — the condition stack was scanned on every instruction, so a tapscript leaf was
   quadratic in its own length.** `allExecuting` walked a `bool` list end to end for each opcode,

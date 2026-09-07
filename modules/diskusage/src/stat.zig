@@ -892,44 +892,87 @@ test "FileStat.id: same inode on different devices is a different identity" {
 // `ReleaseFast`, where `assert` compiles away. Neither is "return an
 // error", and a public function that hands caller bytes to the kernel must
 // do the latter. `lstatPath` and `scan.scanAt` now check first.
-fn fuzzCorpusEntry(comptime payload: []const u8) [8 + payload.len]u8 {
-    // Matches `fuzzLstatPath`'s own draw order below: an 8-byte
-    // little-endian length header (what `Smith.valueRangeAtMost(u16, ...)`
-    // reads back during corpus replay), then the path bytes verbatim (what
-    // `Smith.bytes` copies through unchanged — every byte value is in-range
-    // for an unweighted `u8` draw). Building entries this way, instead of
-    // hand-picked magic bytes, keeps them self-documenting and ties the
-    // length header to the payload's actual length rather than a
-    // hand-maintained constant that can drift from it.
-    var out: [8 + payload.len]u8 = undefined;
-    std.mem.writeInt(u64, out[0..8], payload.len, .little);
-    @memcpy(out[8..], payload);
-    return out;
-}
+const fuzzseed = @import("testkit").fuzz;
 
 const fuzz_path_buf_len = 8192;
 
-// PATH_MAX is 4096 on Linux; this corpus entry deliberately exceeds it.
-const fuzz_embedded_nul = fuzzCorpusEntry("a\x00b");
-const fuzz_non_utf8 = fuzzCorpusEntry(&[_]u8{ 0xff, 0xfe, 0x80, 0x01, '/', 0xc0 });
-const fuzz_all_slashes = fuzzCorpusEntry("/" ** 300);
-const fuzz_past_path_max = fuzzCorpusEntry("/" ** 5000);
-const fuzz_empty = fuzzCorpusEntry("");
+// The corpus this replaces was hand-built by a local `fuzzCorpusEntry`
+// helper that prefixed each payload with its length as a little-endian
+// **u64**, which is exactly what `Smith.valueRangeAtMost` reads. Measured
+// 2026-09-07 before the change: **4 of the 5 seeds arrived non-empty,
+// carrying 5309 octets** - so unlike every other target in this burn-down
+// this one was NOT running the empty string. What was wrong with it is
+// subtler and worse: the header only worked because 5000 and 300 happen to
+// fall inside `rangeAtMost(0, fuzz_path_buf_len)`. Shrink
+// `fuzz_path_buf_len` below 5000 and `fuzz_past_path_max` - the entry that
+// exists to exceed PATH_MAX - silently becomes the EMPTY path, with every
+// test still green. The seeds now use `testkit.fuzz.seed` and the harness one
+// `smith.slice`, where an over-long length is clamped to the buffer rather
+// than collapsing to zero.
+//
+// PATH_MAX is 4096 on Linux; the 5000-separator seed deliberately exceeds it.
+const fuzz_seeds = [_][]const u8{
+    fuzzseed.seed("a\x00b"), // the embedded NUL this harness was written to catch
+    fuzzseed.seed("\x00"), // a NUL and nothing else
+    fuzzseed.seed("/etc/\x00passwd"), // a NUL after a plausible prefix: the silent-truncation shape
+    fuzzseed.seed(&[_]u8{ 0xff, 0xfe, 0x80, 0x01, '/', 0xc0 }), // not UTF-8; the kernel takes bytes, not text
+    fuzzseed.seed("/" ** 300), // many separators, well inside PATH_MAX
+    fuzzseed.seed("/" ** 5000), // past PATH_MAX: the entry the old length header could have silently emptied
+    fuzzseed.seed("a" ** fuzz_path_buf_len), // exactly the buffer - one octet more and the seed reads back EMPTY
+    fuzzseed.seed(""), // the empty path
+    fuzzseed.seed("/"), // a path that really exists: the ACCEPTING branch, which no other seed reaches
+    fuzzseed.seed("/proc/self"), // a real symlink - `lstatPath` must not follow it
+    fuzzseed.seed("/nonexistent-9d3f1a"), // a well-formed path that is simply not there
+    fuzzseed.seed(".."), // relative, and above the working directory
+};
 
 test "fuzz: lstatPath never panics or truncates silently on arbitrary path bytes" {
-    try testing.fuzz({}, fuzzLstatPath, .{ .corpus = &.{
-        &fuzz_embedded_nul,
-        &fuzz_non_utf8,
-        &fuzz_all_slashes,
-        &fuzz_past_path_max,
-        &fuzz_empty,
-    } });
+    try testing.fuzz({}, fuzzLstatPath, .{ .corpus = &fuzz_seeds });
+}
+
+test "corpus: every seed reaches lstatPath, and what it resolves is pinned" {
+    // Neither "did it error" nor "did it succeed" is the number here: most of
+    // these paths legitimately do not exist. What is pinned is the octets that
+    // reach the kernel, the seeds that resolve to a real inode, and the
+    // `InvalidPath` refusals - the last being the only claim this harness
+    // asserts, and the one `StatError.InvalidPath` was added for.
+    const backend = detect();
+    var nonempty: usize = 0;
+    var octets: usize = 0;
+    var invalid_path: usize = 0;
+    var resolved: usize = 0;
+    for (fuzz_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [fuzz_path_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        octets += len;
+        if (lstatPath(backend, buf[0..len])) |_| {
+            resolved += 1;
+        } else |e| {
+            if (e == error.InvalidPath) invalid_path += 1;
+        }
+    }
+    // One seed is deliberately the empty path.
+    try testing.expectEqual(fuzz_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. The corpus this replaces reached 4 non-empty seeds
+    // and 5309 octets, resolved 0 real inodes and refused 1 embedded NUL.
+    // The four that resolve are "/", "/proc/self", "..", and the 300-separator
+    // seed, which the kernel collapses to "/" - the 5000-separator one is
+    // ENAMETOOLONG, which is the point of it.
+    try testing.expectEqual(@as(usize, 13546), octets);
+    try testing.expectEqual(@as(usize, 3), invalid_path);
+    try testing.expectEqual(@as(usize, 4), resolved);
 }
 
 fn fuzzLstatPath(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_path_buf_len]u8 = undefined;
-    const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
-    smith.bytes(buf[0..len]);
+    // One `smith.slice`, never a ranged length followed by `bytes`. The ranged
+    // draw reads eight octets as a little-endian `u64` and returns the range
+    // MINIMUM unless that whole word already falls inside the range, so the
+    // length was hostage to `fuzz_path_buf_len` - see the corpus comment above
+    // for the measurement.
+    const len: usize = smith.slice(&buf);
     const path = buf[0..len];
 
     const backend = detect();

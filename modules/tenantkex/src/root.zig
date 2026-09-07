@@ -713,39 +713,184 @@ test "Initiator/Responder.wipe destroys the copied long-term static secret key" 
 // neither of which parses — so this is a thin harness by design, not an
 // attempt to duplicate `noise`'s own coverage.
 
-fn fuzzReadMessage1(_: void, smith: *std.testing.Smith) !void {
-    var msg: [256]u8 = undefined;
-    smith.bytes(&msg);
-    const len: usize = smith.valueRangeAtMost(u16, 0, msg.len);
+const fuzzseed = @import("testkit").fuzz;
+
+const wire_buf_len = 256;
+/// The msg1 the harness's own responder expects: e(32) ‖ encrypted-s(32+16)
+/// ‖ payload-tag(16), for an empty payload.
+const msg1_len = message1Len(0);
+/// e(32) ‖ payload-tag(16), for an empty payload.
+const msg2_len = message2Len(0);
+
+/// ⭐ Every seed below is a REFUSAL, and that is not enough on its own — a
+/// corpus of refusals only exercises the refusal path. The accepting seed for
+/// each target is built at run time by `Msg1Corpus`/`Msg2Corpus` from this
+/// module's own writer, driven by the SAME deterministic PRNG the harness
+/// uses, which is what makes a genuine handshake message reproducible as a
+/// corpus entry at all.
+const msg1_static_seeds = [_][]const u8{
+    fuzzseed.seed(""), // the empty message: exactly what the collapsed draw ran, for ever
+    fuzzseed.seed(&[_]u8{0} ** (msg1_len - 1)), // one octet short of a well-formed msg1
+    fuzzseed.seed(&[_]u8{0} ** msg1_len), // ⭐ the right length, all zeroes: reaches the DH and fails the tag
+    fuzzseed.seed(&[_]u8{0xff} ** msg1_len), // the right length, all ones
+    fuzzseed.seed(&[_]u8{0} ** (msg1_len + 1)), // one octet over
+    fuzzseed.seed(&[_]u8{0} ** wire_buf_len), // the whole buffer
+    fuzzseed.seed(&[_]u8{0} ** 32), // just an ephemeral, nothing behind it
+};
+
+const msg2_static_seeds = [_][]const u8{
+    fuzzseed.seed(""), // the empty message
+    fuzzseed.seed(&[_]u8{0} ** (msg2_len - 1)), // one octet short
+    fuzzseed.seed(&[_]u8{0} ** msg2_len), // the right length, all zeroes
+    fuzzseed.seed(&[_]u8{0xff} ** msg2_len), // the right length, all ones
+    fuzzseed.seed(&[_]u8{0} ** (msg2_len + 1)), // one octet over
+    fuzzseed.seed(&[_]u8{0} ** wire_buf_len), // the whole buffer
+};
+
+/// The msg1 an Initiator with the test static keys and `testRandom(0x1111)`
+/// actually writes. Deterministic, so it can be a corpus entry.
+fn genuineMessage1(out: []u8) []const u8 {
+    var ini = Initiator.init(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
+    var prng = testRandom(0x1111);
+    const n = ini.writeMessage1(prng.random(), "", out[0..msg1_len]) catch unreachable;
+    return out[0..n];
+}
+
+/// The msg2 a Responder writes after reading the msg1 that
+/// `fuzzReadMessage2`'s own initiator sends — same statics, same
+/// `testRandom(0x9999)`, same empty payload. That is what makes it decrypt
+/// inside the harness rather than merely look like a message.
+fn genuineMessage2(out: []u8) []const u8 {
+    var ini = Initiator.init(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
+    var prng_i = testRandom(0x9999);
+    var m1: [wire_buf_len]u8 = undefined;
+    const n1 = ini.writeMessage1(prng_i.random(), "", m1[0..msg1_len]) catch unreachable;
 
     var rsp = Responder.init(kp(resp_static_priv), demo_ctx);
-    var payload_out: [256]u8 = undefined;
+    var payload: [wire_buf_len]u8 = undefined;
+    _ = rsp.readMessage1(m1[0..n1], &payload) catch unreachable;
+
+    var prng_r = testRandom(0x2222);
+    const fin = rsp.writeMessage2(prng_r.random(), "", out[0..msg2_len]) catch unreachable;
+    return out[0..fin.len];
+}
+
+/// Static seeds plus the genuine message and the same message with one octet
+/// of its authenticated tail flipped — a negative case over a REAL frame
+/// rather than over noise, which is the only kind that gets past the DH.
+fn Corpus(comptime n_static: usize, comptime frame_len: usize) type {
+    return struct {
+        const Self = @This();
+        frames: [2][frame_len]u8 = undefined,
+        stores: [2][4 + frame_len]u8 = undefined,
+        seeds: [n_static + 2][]const u8 = undefined,
+
+        fn build(
+            self: *Self,
+            static: []const []const u8,
+            genuine: *const fn ([]u8) []const u8,
+        ) []const []const u8 {
+            for (static, 0..) |sd, i| self.seeds[i] = sd;
+            const g = genuine(&self.frames[0]);
+            self.seeds[n_static] = fuzzseed.seedInto(&self.stores[0], g);
+            @memcpy(self.frames[1][0..g.len], g);
+            self.frames[1][g.len - 1] ^= 0x01; // the last tag octet
+            self.seeds[n_static + 1] = fuzzseed.seedInto(&self.stores[1], self.frames[1][0..g.len]);
+            return &self.seeds;
+        }
+    };
+}
+
+const Msg1Corpus = Corpus(msg1_static_seeds.len, msg1_len);
+const Msg2Corpus = Corpus(msg2_static_seeds.len, msg2_len);
+
+fn fuzzReadMessage1(_: void, smith: *std.testing.Smith) !void {
+    var msg: [wire_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice`, never `bytes` then a ranged draw. `bytes` consumes
+    // `@min(buf.len, in.len)` octets, so the ranged length that followed found
+    // fewer than the eight it reads as a little-endian `u64` and returned the
+    // range MINIMUM: `len` was 0 for every input this lane can carry, and the
+    // responder was handed the empty message on every round. Measured
+    // 2026-09-07: 0 of 9 seeds arrived non-empty and 0 handshakes were read
+    // before; 8 and 1 after.
+    const len: usize = smith.slice(&msg);
+
+    var rsp = Responder.init(kp(resp_static_priv), demo_ctx);
+    var payload_out: [wire_buf_len]u8 = undefined;
     // Arbitrary bytes must only ever yield a typed error (short message /
     // bad auth tag) or a successful decode, never a panic or OOB write.
     _ = rsp.readMessage1(msg[0..len], &payload_out) catch return;
 }
 
 test "fuzz: Responder.readMessage1 never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzReadMessage1, .{});
+    var corpus: Msg1Corpus = .{};
+    try testing.fuzz({}, fuzzReadMessage1, .{ .corpus = corpus.build(&msg1_static_seeds, genuineMessage1) });
 }
 
 fn fuzzReadMessage2(_: void, smith: *std.testing.Smith) !void {
-    var msg: [256]u8 = undefined;
-    smith.bytes(&msg);
-    const len: usize = smith.valueRangeAtMost(u16, 0, msg.len);
+    var msg: [wire_buf_len]u8 = undefined;
+    // ⚠ See `fuzzReadMessage1`: `bytes` + a ranged length meant `len` was 0.
+    const len: usize = smith.slice(&msg);
 
     // A real Initiator that has genuinely sent msg1, so readMessage2 is
     // reached in the state where it actually does work (WrongState from
     // `.start` would make this a no-op fuzz target).
     var ini = Initiator.init(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
     var prng = testRandom(0x9999);
-    var m1: [256]u8 = undefined;
-    _ = ini.writeMessage1(prng.random(), "", m1[0..message1Len(0)]) catch return;
+    var m1: [wire_buf_len]u8 = undefined;
+    _ = ini.writeMessage1(prng.random(), "", m1[0..msg1_len]) catch return;
 
-    var payload_out: [256]u8 = undefined;
+    var payload_out: [wire_buf_len]u8 = undefined;
     _ = ini.readMessage2(msg[0..len], &payload_out) catch return;
 }
 
 test "fuzz: Initiator.readMessage2 never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzReadMessage2, .{});
+    var corpus: Msg2Corpus = .{};
+    try testing.fuzz({}, fuzzReadMessage2, .{ .corpus = corpus.build(&msg2_static_seeds, genuineMessage2) });
+}
+
+test "corpus: both handshake targets read their seeds, and what each accepts is pinned" {
+    // ⭐ The number to pin is the ACCEPTED one here, and pinning it at exactly
+    // 1 is the point: without the run-time genuine seed the corpus would be
+    // refusals only, which exercises one path and calls it coverage. The
+    // one-octet-flipped twin of that same message pins the other side — a
+    // frame that gets all the way through the DH and then fails the tag.
+    var c1: Msg1Corpus = .{};
+    const seeds1 = c1.build(&msg1_static_seeds, genuineMessage1);
+    var nonempty1: usize = 0;
+    var accepted1: usize = 0;
+    for (seeds1) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var msg: [wire_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&msg);
+        if (len != 0) nonempty1 += 1;
+        var rsp = Responder.init(kp(resp_static_priv), demo_ctx);
+        var payload_out: [wire_buf_len]u8 = undefined;
+        if (rsp.readMessage1(msg[0..len], &payload_out)) |_| accepted1 += 1 else |_| {}
+    }
+
+    var c2: Msg2Corpus = .{};
+    const seeds2 = c2.build(&msg2_static_seeds, genuineMessage2);
+    var nonempty2: usize = 0;
+    var accepted2: usize = 0;
+    for (seeds2) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var msg: [wire_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&msg);
+        if (len != 0) nonempty2 += 1;
+        var ini = Initiator.init(kp(init_static_priv), kp(resp_static_priv).public_key, demo_ctx);
+        var prng = testRandom(0x9999);
+        var m1: [wire_buf_len]u8 = undefined;
+        _ = try ini.writeMessage1(prng.random(), "", m1[0..msg1_len]);
+        var payload_out: [wire_buf_len]u8 = undefined;
+        if (ini.readMessage2(msg[0..len], &payload_out)) |_| accepted2 += 1 else |_| {}
+    }
+
+    // One seed in each corpus is deliberately the empty message.
+    try testing.expectEqual(seeds1.len - 1, nonempty1);
+    try testing.expectEqual(seeds2.len - 1, nonempty2);
+    // Measured 2026-09-07. Before the draws were restructured both targets ran
+    // the empty message for ever: 0 non-empty, 0 accepted.
+    try testing.expectEqual(@as(usize, 1), accepted1);
+    try testing.expectEqual(@as(usize, 1), accepted2);
 }
