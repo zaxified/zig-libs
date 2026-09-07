@@ -70,7 +70,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   without a typed error, 2 answered**; `fuzzSgcb` 12 of 12, **8 decoded, 1 ok,
   1 denied, 6 invalid**.
 
-- ⭐ **2026-09-07** — **BUGFIX: a direct operate left the finished client's
+- **2026-09-07** — ⭐ **BUGFIX: a direct operate left the finished client's
   identity on the point.** `Point.operate`'s non-enhanced success path set
   `state` and `select_deadline_ms` by hand and left `owner` and `ctl_num`
   holding the command it had just executed, so a `direct-with-normal-security`
@@ -130,7 +130,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   22 of 22 and **15 decoded, 14 validated**; `acsi.fuzzParse` 22 of 22 and
   **4 ACSI / 4 MMS** references parsed. Before the fix every one of those
   numbers was 0, because every seed read back as the empty slice.
-- ⭐ **2026-09-07** — **`ber.fuzzDecode` asserted something untrue about BER.**
+- **2026-09-07** — ⭐ **`ber.fuzzDecode` asserted something untrue about BER.**
   Seeding it exposed it: the harness required a definite-length element to
   re-encode to exactly the octets it arrived in, but `decodeLength` accepts the
   **non-minimal** long form — X.690 mandates minimal length octets in DER
