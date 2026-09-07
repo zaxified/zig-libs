@@ -414,12 +414,26 @@ def walk(f: File, body: str, carriers: set, depth: int, seen: frozenset, via: st
         # A method ON a carrier that is not a `Smith` method is the wrapper
         # case: `d.below(n)` where `d` holds the Smith. Follow it by name.
         pre = body[:m.start()].rstrip()
+        qualifier = None
         if pre.endswith("."):
             recv = re.search(r"(\w+)\.$", pre)
-            if recv and recv.group(1) in carriers and name not in ALL_METHODS:
-                events.append((m.start(), "call", (name, carriers[recv.group(1)])))
-            continue
-        # A free helper only matters if it is handed something carrying a Smith.
+            if recv and recv.group(1) in carriers:
+                if name not in ALL_METHODS:
+                    events.append((m.start(), "call", (name, carriers[recv.group(1)])))
+                # A real `Smith` method is DRAW_RE's business, not a call.
+                continue
+            # ⛔ A QUALIFIED call whose receiver is not a carrier used to be
+            # dropped here, so `NumericScript.read(smith)` was invisible and the
+            # target came back as *"makes no `Smith` draw at all"* — a FALSE R1
+            # over a helper whose first statement is `smith.slice(&buf)`.
+            # Reported by an agent who proved it by renaming the identical body
+            # to a free function and watching the same target read as reaching.
+            # An over-report is not harmless: it pushes an author to restructure
+            # working code, or to write an exemption for a harness that has no
+            # defect. The receiver is carried through as the owner so
+            # `resolve` prefers the definition inside that struct.
+            qualifier = recv.group(1) if recv else None
+        # A helper only matters if it is handed something carrying a Smith.
         owner = None
         for c, ty in carriers.items():
             if re.search(r"[&\s(,]\s*" + re.escape(c) + r"\b", " " + args):
@@ -427,7 +441,7 @@ def walk(f: File, body: str, carriers: set, depth: int, seen: frozenset, via: st
                 break
         else:
             continue
-        events.append((m.start(), "call", (name, owner)))
+        events.append((m.start(), "call", (name, qualifier or owner)))
     events.sort(key=lambda e: e[0])
 
     for off, kind, payload in events:
