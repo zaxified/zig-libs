@@ -319,7 +319,7 @@ const module_list = [_]Module{
     .{ .name = "dkg", .libs = &.{"crypto"}, .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true },
     .{ .name = "vdf", .libs = &.{"crypto"}, .deps = &.{"montint"} },
     .{ .name = "signal", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "ct25519", "entropy" } },
-    .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{"hpke"} },
+    .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{"hpke"}, .test_deps = &.{"testkit"} },
     .{ .name = "megolm", .libs = &.{"crypto"}, .deps = &.{ "aescbc", "entropy" } },
     .{ .name = "ebpf", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
     .{ .name = "xdp-classifier", .libs = &.{"net"}, .deps = &.{"ebpf"} },

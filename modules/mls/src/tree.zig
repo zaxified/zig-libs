@@ -1060,15 +1060,144 @@ test "§7.1: a peer-supplied unmerged leaf index outside the tree is refused at 
 }
 
 // ── fuzz: the untrusted-wire tree decoders never panic/OOB ────────────────
+//
+// ⚠ Both harnesses used to open with
+//
+//     smith.bytes(&buf);
+//     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+//
+// which reads the input and throws it away: `bytes` consumes
+// `@min(buf.len, in.len)` octets and the ranged draw then finds fewer than the
+// eight it reads as a little-endian u64, so `len` was the range MINIMUM — 0 —
+// for every input. With no corpus either, each target ran exactly one round
+// for ever: `LeafNode.decode("")`, which is `error.BufferTooShort` at the
+// first field, and `RatchetTree.decode("")`, which is the same at the outer
+// vector. The `unmerged_leaves` bound in `validateUnmergedLeaves` — the
+// attacker-chosen array subscript that reaches `treekem.resolution` — had
+// never been reached from either harness.
+
+const testkit = @import("testkit");
+const testing = std.testing;
+
+/// A leaf this module's own encoder produces. Arbitrary bytes do not reach the
+/// leaf fields: a `LeafNode` is eight nested length-prefixed structures, two of
+/// them enum-discriminated, so the positive half of both corpora below is
+/// BUILT rather than quoted.
+fn fuzzLeaf(source: LeafNodeSource, identity: []const u8) LeafNode {
+    return .{
+        .encryption_key = &[_]u8{0xa0} ** 32,
+        .signature_key = &[_]u8{0xa1} ** 32,
+        .credential = .{ .basic = identity },
+        .capabilities = .{
+            .versions = &.{1},
+            .cipher_suites = &.{1},
+            .extensions = &.{},
+            .proposals = &.{},
+            .credentials = &.{1},
+        },
+        .leaf_node_source = source,
+        .lifetime = if (source == .key_package) .{ .not_before = 0, .not_after = 1 } else null,
+        .parent_hash = if (source == .commit) &[_]u8{0xb0} ** 32 else null,
+        .extensions = &.{},
+        .signature = &[_]u8{0xa2} ** 64,
+    };
+}
+
+/// The `RatchetTree.decode` corpus.
+///
+/// ⭐ Built at run time from this module's own encoder, and the harness and the
+/// guard below both build it from HERE — a guard measuring a different corpus
+/// from the one the harness gets is not a guard.
+///
+/// ⛔ Note the FIRST entry: a zero-length `ratchet_tree<V>` is a legal frame
+/// and `decode` accepts it, with zero nodes. That is exactly why the guard
+/// pins a second number — an accepted count would have counted this seed the
+/// same as a tree with three real nodes in it.
+const TreeCorpus = struct {
+    stores: [6][4 + 1024]u8 = undefined,
+    entries: [6][]const u8 = undefined,
+
+    fn build(self: *TreeCorpus, gpa: std.mem.Allocator) ![]const []const u8 {
+        var body: [1024]u8 = undefined;
+        var frame: [1024]u8 = undefined;
+
+        // 0. The empty vector: legal, accepted, and it walks nothing.
+        self.entries[0] = testkit.fuzz.seedInto(&self.stores[0], &[_]u8{0x00});
+
+        // 1. A real 3-leaf tree through `RatchetTree.encode`: leaves 0 and 2
+        //    present with different credentials, leaf 1 blank (the shape a
+        //    Remove leaves behind), both parents present.
+        const parent: ParentNode = .{
+            .encryption_key = &[_]u8{0x20} ** 32,
+            .parent_hash = &[_]u8{0x21} ** 32,
+            .unmerged_leaves = &.{2},
+        };
+        var nodes = [_]?Node{
+            .{ .leaf = fuzzLeaf(.key_package, "leaf-zero") },
+            .{ .parent = parent },
+            null,
+            .{ .parent = parent },
+            .{ .leaf = fuzzLeaf(.commit, "leaf-two") },
+        };
+        const t: RatchetTree = .{ .allocator = gpa, .nodes = &nodes };
+        const encoded = try t.encode(gpa);
+        defer gpa.free(encoded);
+        self.entries[1] = testkit.fuzz.seedInto(&self.stores[1], encoded);
+
+        // 2. The same tree with one octet of `leaf-two`'s encryption key
+        //    changed: still a well-formed tree, a DIFFERENT one. This is the
+        //    shape that reaches past the outer framing and into the fields.
+        var mutated: [1024]u8 = undefined;
+        @memcpy(mutated[0..encoded.len], encoded);
+        mutated[encoded.len / 2] ^= 0x40;
+        self.entries[2] = testkit.fuzz.seedInto(&self.stores[2], mutated[0..encoded.len]);
+
+        // 3. ⭐ The hostile tree from the §7.1 test above: a parent claiming
+        //    leaf 0x7FFFFFFF, i.e. node index 0xFFFFFFFE. `validateUnmergedLeaves`
+        //    must refuse it — this is the array subscript a `Welcome` used to
+        //    control, and no fuzz input had ever reached the check.
+        var bw = codec.Writer.init(&body);
+        try bw.writePresence(false);
+        try bw.writePresence(true);
+        try bw.writeU8(@intFromEnum(NodeType.parent));
+        try bw.writeVector(&.{});
+        try bw.writeVector(&.{});
+        try wire.encodeU32Vec(&bw, &[_]u32{0x7FFF_FFFF});
+        try bw.writePresence(false);
+        var w = codec.Writer.init(&frame);
+        try w.writeVector(bw.finish());
+        self.entries[3] = testkit.fuzz.seedInto(&self.stores[3], w.finish());
+
+        // 4. The same shape with an in-range but DUPLICATED entry: §7.1's
+        //    ordering MUST, which the §7.9.2 set comparison leans on.
+        var bw2 = codec.Writer.init(&body);
+        try bw2.writePresence(false);
+        try bw2.writePresence(true);
+        try bw2.writeU8(@intFromEnum(NodeType.parent));
+        try bw2.writeVector(&.{});
+        try bw2.writeVector(&.{});
+        try wire.encodeU32Vec(&bw2, &[_]u32{ 1, 1 });
+        try bw2.writePresence(false);
+        var w2 = codec.Writer.init(&frame);
+        try w2.writeVector(bw2.finish());
+        self.entries[4] = testkit.fuzz.seedInto(&self.stores[4], w2.finish());
+
+        // 5. The one input this target actually ran, for ever, before the
+        //    corpus: the empty slice, refused at the outer vector.
+        self.entries[5] = testkit.fuzz.seedInto(&self.stores[5], &.{});
+        return &self.entries;
+    }
+};
 
 test "fuzz: RatchetTree.decode never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzRatchetTreeDecode, .{});
+    var corpus: TreeCorpus = .{};
+    try std.testing.fuzz({}, fuzzRatchetTreeDecode, .{ .corpus = try corpus.build(std.testing.allocator) });
 }
 
 fn fuzzRatchetTreeDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
+    const len: usize = smith.slice(&buf);
     var r = codec.Reader.init(buf[0..len]);
     // Recursively exercises Node/LeafNode/ParentNode/Credential/
     // Capabilities/Lifetime/Extension decode — the whole tree wire surface.
@@ -1076,15 +1205,114 @@ fn fuzzRatchetTreeDecode(_: void, smith: *std.testing.Smith) !void {
     rt.deinit();
 }
 
+test "corpus: the RatchetTree seeds reach the decoder, and the counts are pinned" {
+    // ⛔ `nonempty` and `accepted` are not enough here and the corpus proves
+    // it: a zero-length `ratchet_tree<V>` is LEGAL, so `accepted` counts a
+    // seed that walks not one node. `populated` — non-blank nodes actually
+    // decoded — is the number the collapse cannot hold up. It was 0 before,
+    // because the single input this target ever ran was the empty slice.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var populated: usize = 0;
+    var corpus: TreeCorpus = .{};
+    const entries = try corpus.build(testing.allocator);
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var r = codec.Reader.init(buf[0..len]);
+        var rt = RatchetTree.decode(testing.allocator, &r) catch continue;
+        defer rt.deinit();
+        accepted += 1;
+        for (rt.nodes) |m| if (m != null) {
+            populated += 1;
+        };
+    }
+    try testing.expectEqual(entries.len - 1, nonempty); // all but the empty seed
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 8), populated);
+}
+
+/// The `LeafNode.decode` corpus: three real leaves — one per `LeafNodeSource`
+/// that carries a select field — plus the refusals.
+const LeafCorpus = struct {
+    stores: [7][4 + 512]u8 = undefined,
+    entries: [7][]const u8 = undefined,
+
+    fn build(self: *LeafCorpus) ![]const []const u8 {
+        var frame: [512]u8 = undefined;
+        const sources = [_]LeafNodeSource{ .key_package, .update, .commit };
+        const names = [_][]const u8{ "kp-leaf", "update-leaf", "commit-leaf" };
+        // 0..2: one leaf per source, so the `select (leaf_node_source)` field
+        // — a Lifetime, nothing, or a parent hash — is decided by the SEED.
+        for (sources, names, 0..) |src, name, i| {
+            var w = codec.Writer.init(&frame);
+            try fuzzLeaf(src, name).encode(&w);
+            self.entries[i] = testkit.fuzz.seedInto(&self.stores[i], w.finish());
+        }
+        // 3. The key_package leaf with its source octet rewritten to `commit`:
+        //    the Lifetime octets are then read as a parent-hash vector, which
+        //    is the field-confusion shape a source byte can force.
+        var w3 = codec.Writer.init(&frame);
+        try fuzzLeaf(.key_package, "kp-leaf").encode(&w3);
+        const kp = w3.finish();
+        var confused: [512]u8 = undefined;
+        @memcpy(confused[0..kp.len], kp);
+        // The source octet sits after both keys, the credential and the
+        // capabilities; found by search rather than by arithmetic so this does
+        // not silently move when a field above it grows.
+        const src_at = std.mem.indexOf(u8, kp, &[_]u8{@intFromEnum(LeafNodeSource.key_package)}) orelse
+            return error.SourceOctetNotFound;
+        confused[src_at] = @intFromEnum(LeafNodeSource.commit);
+        self.entries[3] = testkit.fuzz.seedInto(&self.stores[3], confused[0..kp.len]);
+        // 4. A truncated leaf: the header is intact, the tail is cut off.
+        self.entries[4] = testkit.fuzz.seedInto(&self.stores[4], kp[0 .. kp.len / 2]);
+        // 5. A credential type nobody has registered, at the front.
+        self.entries[5] = testkit.fuzz.seedInto(&self.stores[5], &[_]u8{ 0x01, 0xFF, 0x01, 0xFF });
+        // 6. The one input this target actually ran, for ever.
+        self.entries[6] = testkit.fuzz.seedInto(&self.stores[6], &.{});
+        return &self.entries;
+    }
+};
+
 test "fuzz: LeafNode.decode never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzLeafNodeDecode, .{});
+    var corpus: LeafCorpus = .{};
+    try std.testing.fuzz({}, fuzzLeafNodeDecode, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzLeafNodeDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
+    const len: usize = smith.slice(&buf);
     var r = codec.Reader.init(buf[0..len]);
     const leaf = LeafNode.decode(std.testing.allocator, &r) catch return;
     leaf.deinit(std.testing.allocator);
+}
+
+test "corpus: the LeafNode seeds reach the decoder, and the counts are pinned" {
+    // The second number is `sources`: how many distinct `leaf_node_source`
+    // discriminants a seed's own octets produced. It is the one an accepted
+    // count cannot fake — a corpus that collapsed to a single frame, or to
+    // none, scores 1 or 0 here whatever `accepted` says.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var sources = std.AutoHashMap(LeafNodeSource, void).init(testing.allocator);
+    defer sources.deinit();
+    var corpus: LeafCorpus = .{};
+    const entries = try corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var r = codec.Reader.init(buf[0..len]);
+        const leaf = LeafNode.decode(testing.allocator, &r) catch continue;
+        defer leaf.deinit(testing.allocator);
+        accepted += 1;
+        try sources.put(leaf.leaf_node_source, {});
+    }
+    try testing.expectEqual(entries.len - 1, nonempty); // all but the empty seed
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 3), sources.count());
 }

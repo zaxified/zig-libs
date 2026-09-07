@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — The three untrusted-wire fuzz targets — `MLSMessage.decode`,
+  `RatchetTree.decode` and `LeafNode.decode` — had never seen a message, a tree or a leaf.
+  Each drew `smith.bytes(&buf)` and then a ranged length, which returns the range minimum
+  when fewer than eight input octets remain, so the length was 0 on every input; with no
+  corpus, the lane ran exactly one round per target: `decode("")`. The draw is now one
+  `smith.slice(&buf)` and each target carries a corpus built by this module's own encoder.
+  ⭐ The `MLSMessage` harness also carried a comment claiming "three iterations in four get
+  a well-formed 4-byte header written over the front". That branch had never executed once,
+  for two independent reasons: it was guarded by `len >= 4` with `len == 0`, and the knob
+  beside it was a ranged draw made after the input was exhausted, so it was 0 and the
+  `!= 0` test was false. The stamp is now a documented `--fuzz`-only amplifier that cannot
+  claim a rate, and the real headers come from the corpus. Measured: 13/13, 5/5 and 6/6
+  non-empty seeds reach their decoder where 0 did; `MLSMessage` accepts 5 of 14 seeds
+  covering all **5** §17.2 wire formats, `RatchetTree` accepts 3 of 6 carrying **8**
+  non-blank nodes, `LeafNode` accepts 3 of 7 covering **3** distinct `leaf_node_source`
+  discriminants. The second number is pinned in each guard because a zero-length
+  `ratchet_tree<V>` is a *legal* frame — an accepted count alone would score a seed that
+  walks no node the same as a tree with three real ones. ⭐ The corpus also puts the §7.1
+  `unmerged_leaves` bound (`validateUnmergedLeaves`, the attacker-chosen array subscript a
+  hostile `Welcome` reaches) inside the fuzz target for the first time.
+
 - **2026-09-06** — **`NOTICE` rests the `src/data/` vectors on the IETF Trust's
   written grant instead of on merger doctrine, and becomes a third-party
   attribution.** The 15 JSON files come from the MLS working group's interop

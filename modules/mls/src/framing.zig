@@ -1483,28 +1483,194 @@ test "MLSMessage: every §17.2 wire format decodes; an unregistered value is Mal
 }
 
 // ── fuzz: the outermost untrusted-wire decoder never panics/OOB ───────────
+//
+// ⚠ This harness used to open with
+//
+//     smith.bytes(&buf);
+//     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+//
+// which reads the input and throws it away: `bytes` consumes
+// `@min(buf.len, in.len)` octets and the ranged draw then finds fewer than the
+// eight it reads as a little-endian u64, so `len` was the range MINIMUM — 0 —
+// on every input, and with no corpus the lane ran exactly one round:
+// `MLSMessage.decode("")`.
+//
+// ⛔ And the header stamp below carried a comment claiming "three iterations
+// in four get a well-formed 4-byte header written over the front". That branch
+// had never executed once, for TWO independent reasons: `len` was 0 so
+// `len >= 4` was false, and by that point the input is exhausted anyway, so
+// `smith.valueRangeAtMost(u8, 0, 3)` returns its range minimum — 0 — and
+// `!= 0` is false. It is now written so it cannot claim a frequency it does
+// not have, and the real headers come from the corpus instead.
+
+const testkit = @import("testkit");
+
+/// Malformed frames worth replaying verbatim: one truncated header per §17.2
+/// wire format (each must die INSIDE its own sub-decoder, not at the switch),
+/// plus the two refusals `MLSMessage.decode` owns itself.
+const message_literal_seeds = [_][]const u8{
+    testkit.fuzz.seedHex("00010001"), // mls10 + mls_public_message, no body
+    testkit.fuzz.seedHex("00010002"), // mls10 + mls_private_message, no body
+    testkit.fuzz.seedHex("00010003"), // mls10 + mls_welcome, no body
+    testkit.fuzz.seedHex("00010004"), // mls10 + mls_group_info, no body
+    testkit.fuzz.seedHex("00010005"), // mls10 + mls_key_package, no body
+    testkit.fuzz.seedHex("00020004"), // version 2 -> UnsupportedProtocolVersion
+    testkit.fuzz.seedHex("0001ffff"), // unregistered wire format -> Malformed
+    testkit.fuzz.seedHex("0001"), // truncated right after the version
+    testkit.fuzz.seed(""), // the one input this target used to run, for ever
+};
+
+/// The positive half: one COMPLETE message per §17.2 wire format, built by
+/// this module's own `MLSMessage.encode` at run time.
+///
+/// ⛔ Why it cannot be a literal corpus of arbitrary bytes. `MLSMessage.decode`
+/// reads `ProtocolVersion` (one legal value out of 65 536) and then
+/// `WireFormat` (five out of 65 536), so about one random input in 13 000 gets
+/// past the first four octets — and each of the five bodies is a nested
+/// length-prefixed structure on top of that. Drawn bytes reach the five
+/// sub-decoders this harness exists to cover essentially never.
+///
+/// ⭐ The harness and the guard below both build the corpus from HERE. A guard
+/// that measured a different corpus from the one the harness gets is not a
+/// guard.
+const MessageCorpus = struct {
+    frames: [5][512]u8 = undefined,
+    stores: [5][4 + 512]u8 = undefined,
+    entries: [5 + message_literal_seeds.len][]const u8 = undefined,
+
+    fn build(self: *MessageCorpus) ![]const []const u8 {
+        const leaf: tree.LeafNode = .{
+            .encryption_key = &[_]u8{0xa0} ** 32,
+            .signature_key = &[_]u8{0xa1} ** 32,
+            .credential = .{ .basic = "fuzz-signer" },
+            .capabilities = .{
+                .versions = &.{1},
+                .cipher_suites = &.{1},
+                .extensions = &.{},
+                .proposals = &.{},
+                .credentials = &.{1},
+            },
+            .leaf_node_source = .key_package,
+            .lifetime = .{ .not_before = 0, .not_after = 1 },
+            .extensions = &.{},
+            .signature = &[_]u8{0xa2} ** 64,
+        };
+        const msgs = [5]MLSMessage{
+            .{
+                .public_message = .{
+                    // `external`, not `member`: a member sender would additionally
+                    // require a `membership_tag` (§6.2), and the point of this seed
+                    // is the FramedContent walk, not the tag.
+                    .content = .{
+                        .group_id = "fuzz-group",
+                        .epoch = 7,
+                        .sender = .{ .external = 3 },
+                        .body = .{ .application = "hello" },
+                    },
+                    .auth = .{ .signature = &[_]u8{0xDD} ** 64 },
+                },
+            },
+            .{ .private_message = .{
+                .group_id = "fuzz-group",
+                .epoch = 7,
+                .content_type = .proposal,
+                .encrypted_sender_data = &[_]u8{0x11} ** 8,
+                .ciphertext = &[_]u8{0x22} ** 32,
+            } },
+            .{ .key_package = .{
+                .cipher_suite = @enumFromInt(1),
+                .init_key = &[_]u8{0xb0} ** 32,
+                .leaf_node = leaf,
+                .signature = &[_]u8{0xb1} ** 64,
+            } },
+            .{ .welcome = .{
+                .cipher_suite = @enumFromInt(1),
+                .secrets = &.{},
+                .encrypted_group_info = &[_]u8{0xEE} ** 48,
+            } },
+            .{ .group_info = .{
+                .group_context = .{
+                    .version = .mls10,
+                    .cipher_suite = @enumFromInt(1),
+                    .group_id = "fuzz-group",
+                    .epoch = 7,
+                    .tree_hash = &[_]u8{0xAA} ** 32,
+                    .confirmed_transcript_hash = &[_]u8{0xBB} ** 32,
+                },
+                .confirmation_tag = &[_]u8{0xCC} ** 32,
+                .signer = 0,
+                .signature = &[_]u8{0xDD} ** 64,
+            } },
+        };
+        for (msgs, 0..) |m, i| {
+            var w = codec.Writer.init(&self.frames[i]);
+            try m.encode(&w);
+            self.entries[i] = testkit.fuzz.seedInto(&self.stores[i], w.finish());
+        }
+        @memcpy(self.entries[5..], &message_literal_seeds);
+        return &self.entries;
+    }
+};
+
+/// The draw one fuzz iteration makes, factored out so the guard below measures
+/// the SAME input the harness is handed rather than a look-alike.
+fn fuzzMessageInput(smith: *std.testing.Smith, buf: *[2048]u8) []const u8 {
+    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
+    const len: usize = smith.slice(buf);
+    // A `--fuzz`-only amplifier: the two fields the decoder reads FIRST are the
+    // two it is strictest about, so left to chance a drawn input reaches the
+    // sub-decoders about once in 13 000. Stamping a legal header over the front
+    // fixes that — but ONLY under `--fuzz`, where there is input left to draw
+    // the knob from. On a corpus replay the seed has been consumed, `value(u8)`
+    // is 0, and nothing is stamped, which is correct: every seed above already
+    // carries the header it means to carry. Nothing here may claim a rate.
+    if (len >= 4) {
+        const knob = smith.value(u8);
+        if (knob & 3 != 0) {
+            std.mem.writeInt(u16, buf[0..2], @intFromEnum(keyschedule.ProtocolVersion.mls10), .big);
+            std.mem.writeInt(u16, buf[2..4], 1 + @as(u16, knob >> 5) % 5, .big);
+        }
+    }
+    return buf[0..len];
+}
 
 test "fuzz: MLSMessage.decode never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzMlsMessageDecode, .{});
+    var corpus: MessageCorpus = .{};
+    try std.testing.fuzz({}, fuzzMlsMessageDecode, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzMlsMessageDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [2048]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    // Three iterations in four get a well-formed 4-byte header written over
-    // the front, because the two fields the decoder reads FIRST are the two
-    // it is strictest about: `ProtocolVersion` admits exactly one of 65 536
-    // values and `WireFormat` five of them. Left to chance, roughly one
-    // input in 13 000 would get past them, and the five sub-decoders this
-    // harness exists to cover would see essentially nothing. The remaining
-    // quarter is left untouched so the two rejections themselves stay
-    // fuzzed.
-    if (len >= 4 and smith.valueRangeAtMost(u8, 0, 3) != 0) {
-        std.mem.writeInt(u16, buf[0..2], @intFromEnum(keyschedule.ProtocolVersion.mls10), .big);
-        std.mem.writeInt(u16, buf[2..4], smith.valueRangeAtMost(u16, 1, 5), .big);
+    _ = fuzzDecodeOnce(std.testing.allocator, fuzzMessageInput(smith, &buf)) catch return;
+}
+
+test "corpus: the MLSMessage seeds reach the decoder, and the counts are pinned" {
+    // ⭐ The measurement, executable instead of asserted in a comment.
+    //
+    // ⛔ The second number is the one that matters. `accepted` says a frame was
+    // legal, not that the SEED decided which arm ran — a corpus that silently
+    // collapsed to one frame (a seed grown past the buffer reads back EMPTY,
+    // without a word) scores the same accepted count as one that did not. The
+    // number of DISTINCT wire formats decoded is what the collapse cannot hold
+    // up: before the draw was fixed it was 0, because the single input this
+    // target ever ran was the empty slice.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var formats = std.EnumSet(WireFormat).initEmpty();
+    var corpus: MessageCorpus = .{};
+    const entries = try corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [2048]u8 = undefined;
+        const input = fuzzMessageInput(&smith, &buf);
+        if (input.len != 0) nonempty += 1;
+        const wf = fuzzDecodeOnce(testing.allocator, input) catch continue;
+        accepted += 1;
+        formats.insert(wf);
     }
-    _ = fuzzDecodeOnce(std.testing.allocator, buf[0..len]) catch return;
+    try testing.expectEqual(entries.len - 1, nonempty); // all but seed("")
+    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 5), formats.count());
 }
 
 /// The body of one fuzz iteration, named so the reachability test below can
