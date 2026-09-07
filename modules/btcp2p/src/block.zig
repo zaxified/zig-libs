@@ -97,48 +97,62 @@ pub fn serializeBlock(allocator: Allocator, blk: Block) Allocator.Error![]u8 {
 
 const testing = std.testing;
 
+/// `testkit.fuzz`, for the corpus at the bottom of this file. A corpus entry
+/// is not the frame: `Smith.slice` reads a little-endian `u32` length first,
+/// so a raw frame would arrive minus its own first four octets.
+/// `testkit/src/fuzz.zig` carries the other two hazards.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+const seedHex = testkit.fuzz.seedHex;
+
 // ── externally anchored: the genesis block's full raw bytes
 // (en.bitcoin.it/wiki/Genesis_block "Raw block data", fetched directly)
 // -- exercises decodeBlock's header + coinbase-tx reuse of bitcointx
 // end to end against a real, published block. ───────────────────────────
-test "external: genesis block decodes byte-exact against the wiki's published raw hex" {
-    const raw = [_]u8{
-        0x01, 0x00, 0x00, 0x00, // version
-    } ++ ([_]u8{0} ** 32) // prev_block
-    ++ [_]u8{
-        0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e,
-        0x67, 0x76, 0x8f, 0x61, 0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32,
-        0x3a, 0x9f, 0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a, // merkle_root
-        0x29, 0xab, 0x5f, 0x49, // timestamp
-        0xff, 0xff, 0x00, 0x1d, // bits
-        0x1d, 0xac, 0x2b, 0x7c, // nonce
-        0x01, // 1 transaction
-        // -- coinbase transaction --
-        0x01, 0x00, 0x00, 0x00, // tx version
-        0x01, // 1 input
-    } ++ ([_]u8{0} ** 32) // null prevout hash
-    ++ [_]u8{ 0xff, 0xff, 0xff, 0xff } // prevout index
-    ++ [_]u8{0x4d} // scriptSig length = 77
-    ++ [_]u8{
-        0x04, 0xff, 0xff, 0x00, 0x1d, 0x01, 0x04, 0x45, 0x54, 0x68, 0x65, 0x20, 0x54, 0x69, 0x6d, 0x65,
-        0x73, 0x20, 0x30, 0x33, 0x2f, 0x4a, 0x61, 0x6e, 0x2f, 0x32, 0x30, 0x30, 0x39, 0x20, 0x43, 0x68,
-        0x61, 0x6e, 0x63, 0x65, 0x6c, 0x6c, 0x6f, 0x72, 0x20, 0x6f, 0x6e, 0x20, 0x62, 0x72, 0x69, 0x6e,
-        0x6b, 0x20, 0x6f, 0x66, 0x20, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x20, 0x62, 0x61, 0x69, 0x6c,
-        0x6f, 0x75, 0x74, 0x20, 0x66, 0x6f, 0x72, 0x20, 0x62, 0x61, 0x6e, 0x6b, 0x73,
-    } // scriptSig ("The Times 03/Jan/2009 Chancellor on brink of second bailout for banks")
-    ++ [_]u8{ 0xff, 0xff, 0xff, 0xff } // sequence
-    ++ [_]u8{0x01} // 1 output
-    ++ [_]u8{ 0x00, 0xf2, 0x05, 0x2a, 0x01, 0x00, 0x00, 0x00 } // value = 50 BTC
-    ++ [_]u8{0x43} // pk_script length = 67
-    ++ [_]u8{
-        0x41, 0x04, 0x67, 0x8a, 0xfd, 0xb0, 0xfe, 0x55, 0x48, 0x27, 0x19, 0x67, 0xf1, 0xa6, 0x71, 0x30,
-        0xb7, 0x10, 0x5c, 0xd6, 0xa8, 0x28, 0xe0, 0x39, 0x09, 0xa6, 0x79, 0x62, 0xe0, 0xea, 0x1f, 0x61,
-        0xde, 0xb6, 0x49, 0xf6, 0xbc, 0x3f, 0x4c, 0xef, 0x38, 0xc4, 0xf3, 0x55, 0x04, 0xe5, 0x1e, 0xc1,
-        0x12, 0xde, 0x5c, 0x38, 0x4d, 0xf7, 0xba, 0x0b, 0x8d, 0x57, 0x8a, 0x4c, 0x70, 0x2b, 0x6b, 0xf1,
-        0x1d, 0x5f, 0xac,
-    } // pk_script
-    ++ [_]u8{ 0x00, 0x00, 0x00, 0x00 }; // lock_time
 
+/// The genesis block's 285 published octets. Container-level so the fuzz
+/// corpus below seeds the SAME bytes this test anchors — and because this is
+/// the ONLY complete, valid `block` payload anywhere in the module: without
+/// it the harness's corpus could not contain a single accepted block.
+const genesis_raw = [_]u8{
+    0x01, 0x00, 0x00, 0x00, // version
+} ++ ([_]u8{0} ** 32) // prev_block
+++ [_]u8{
+    0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e,
+    0x67, 0x76, 0x8f, 0x61, 0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32,
+    0x3a, 0x9f, 0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a, // merkle_root
+    0x29, 0xab, 0x5f, 0x49, // timestamp
+    0xff, 0xff, 0x00, 0x1d, // bits
+    0x1d, 0xac, 0x2b, 0x7c, // nonce
+    0x01, // 1 transaction
+    // -- coinbase transaction --
+    0x01, 0x00, 0x00, 0x00, // tx version
+    0x01, // 1 input
+} ++ ([_]u8{0} ** 32) // null prevout hash
+++ [_]u8{ 0xff, 0xff, 0xff, 0xff } // prevout index
+++ [_]u8{0x4d} // scriptSig length = 77
+++ [_]u8{
+    0x04, 0xff, 0xff, 0x00, 0x1d, 0x01, 0x04, 0x45, 0x54, 0x68, 0x65, 0x20, 0x54, 0x69, 0x6d, 0x65,
+    0x73, 0x20, 0x30, 0x33, 0x2f, 0x4a, 0x61, 0x6e, 0x2f, 0x32, 0x30, 0x30, 0x39, 0x20, 0x43, 0x68,
+    0x61, 0x6e, 0x63, 0x65, 0x6c, 0x6c, 0x6f, 0x72, 0x20, 0x6f, 0x6e, 0x20, 0x62, 0x72, 0x69, 0x6e,
+    0x6b, 0x20, 0x6f, 0x66, 0x20, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x20, 0x62, 0x61, 0x69, 0x6c,
+    0x6f, 0x75, 0x74, 0x20, 0x66, 0x6f, 0x72, 0x20, 0x62, 0x61, 0x6e, 0x6b, 0x73,
+} // scriptSig ("The Times 03/Jan/2009 Chancellor on brink of second bailout for banks")
+++ [_]u8{ 0xff, 0xff, 0xff, 0xff } // sequence
+++ [_]u8{0x01} // 1 output
+++ [_]u8{ 0x00, 0xf2, 0x05, 0x2a, 0x01, 0x00, 0x00, 0x00 } // value = 50 BTC
+++ [_]u8{0x43} // pk_script length = 67
+++ [_]u8{
+    0x41, 0x04, 0x67, 0x8a, 0xfd, 0xb0, 0xfe, 0x55, 0x48, 0x27, 0x19, 0x67, 0xf1, 0xa6, 0x71, 0x30,
+    0xb7, 0x10, 0x5c, 0xd6, 0xa8, 0x28, 0xe0, 0x39, 0x09, 0xa6, 0x79, 0x62, 0xe0, 0xea, 0x1f, 0x61,
+    0xde, 0xb6, 0x49, 0xf6, 0xbc, 0x3f, 0x4c, 0xef, 0x38, 0xc4, 0xf3, 0x55, 0x04, 0xe5, 0x1e, 0xc1,
+    0x12, 0xde, 0x5c, 0x38, 0x4d, 0xf7, 0xba, 0x0b, 0x8d, 0x57, 0x8a, 0x4c, 0x70, 0x2b, 0x6b, 0xf1,
+    0x1d, 0x5f, 0xac,
+} // pk_script
+++ [_]u8{ 0x00, 0x00, 0x00, 0x00 }; // lock_time
+
+test "external: genesis block decodes byte-exact against the wiki's published raw hex" {
+    const raw = genesis_raw;
     const allocator = testing.allocator;
     var blk = try decodeBlock(allocator, &raw);
     defer blk.deinit(allocator);
@@ -168,23 +182,79 @@ test "hostile: decodeBlock on a truncated header fails closed" {
     try testing.expectError(error.Truncated, decodeBlock(allocator, &[_]u8{0} ** 40));
 }
 
+/// `block` payloads, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// A `block` is an 80-octet header, a CompactSize transaction count, and that
+/// many complete `bitcointx` transactions back to back — a shape uniform
+/// random octets reach the second transaction of essentially never. The
+/// genesis block is the module's only complete one, so it carries the whole
+/// positive half by itself; the rest pin the count guard and the header cut.
+const decode_seeds = [_][]const u8{
+    seed(&genesis_raw), // the published genesis block: header + its coinbase tx
+    seedHex("00" ** 80 ++ "00"), // a header with txn_count = 0: a legal empty block
+    seedHex("00" ** 80 ++ "feffffffff"), // TooManyItems: the hostile test's 0xffffffff count
+    seedHex("00" ** 80 ++ "01"), // TooManyItems: 1 transaction claimed, 0 octets behind it
+    seedHex("00" ** 80 ++ "01" ++ "41" ** 100), // one claimed tx over 100 junk octets
+    seedHex("00" ** 40), // Truncated: the hostile test's cut-off header
+};
+
 test "fuzz: decodeBlock never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeBlock, .{});
+    try testing.fuzz({}, fuzzDecodeBlock, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecodeBlock(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    // Bias the byte right after the 80-byte header (the txn_count
-    // CompactSize) toward small counts half the time -- otherwise a
-    // uniformly random byte there is >50% a multi-byte 0xfd/0xfe/0xff
-    // CompactSize prefix that almost always truncates immediately,
-    // rarely reaching the actual per-tx `deserializePartial` loop.
-    if (buf.len > block_header.HEADER_LEN and smith.value(bool)) {
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `decodeBlock` saw `buf[0..0]` every
+    // single time, with the seed sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
+
+    // Bias the octet right after the 80-octet header (the txn_count
+    // CompactSize) toward small counts -- otherwise a uniformly random octet
+    // there is >50% a multi-octet 0xfd/0xfe/0xff CompactSize prefix that almost
+    // always truncates immediately, rarely reaching the per-tx
+    // `deserializePartial` loop.
+    // ⚠ Two things were wrong here and both were invisible: the guard tested
+    // `buf.len` (a compile-time 512, so always true) where it meant the DRAWN
+    // length, and the comment claimed the bias applied "half the time" when in
+    // fact `value(bool)` came after a `bytes` call that had already eaten the
+    // input, so it was the weight minimum -- false -- on every execution. The
+    // bias had never once been applied. It is now bounded by `len`, so it can
+    // only ever rewrite an octet the decoder will actually read.
+    if (len > block_header.HEADER_LEN and smith.value(bool)) {
         buf[block_header.HEADER_LEN] = smith.valueRangeAtMost(u8, 0, 3);
     }
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+
     var blk = decodeBlock(allocator, buf[0..len]) catch return;
     defer blk.deinit(allocator);
+}
+
+test "corpus: every block seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach, so this pins the number rather than asserting it is > 0.
+    const allocator = testing.allocator;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeBlock(allocator, buf[0..len])) |b| {
+            accepted += 1;
+            var blk = b;
+            blk.deinit(allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 6 seeds non-empty and 0 accepted before the
+    // draw was fixed, 6 of 6 non-empty and 2 accepted after.
+    try testing.expectEqual(@as(usize, 2), accepted);
 }

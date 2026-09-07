@@ -112,21 +112,34 @@ pub fn decodeEmpty(bytes: []const u8) error{UnexpectedPayload}!void {
 
 const testing = std.testing;
 
+/// `testkit.fuzz`, for the corpus at the bottom of this file. A corpus entry
+/// is not the frame: `Smith.slice` reads a little-endian `u32` length first,
+/// so a raw frame would arrive minus its own first four octets.
+/// `testkit/src/fuzz.zig` carries the other two hazards.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+const seedHex = testkit.fuzz.seedHex;
+
 // ── externally anchored: the wiki's own "modern (60002) protocol
 // version" hex dump, field-by-field ───────────────────────────────────
+
+/// The wiki's 60002 `version` PAYLOAD (envelope stripped -- see
+/// envelope.zig's test for the full wire form of this exact message).
+/// Container-level so the fuzz corpus below seeds the SAME octets this test
+/// anchors, rather than a re-transcription of them.
+const wiki_version_payload = [_]u8{
+    0x62, 0xea, 0x00, 0x00, // version = 60002
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // services = 1 (NODE_NETWORK)
+    0x11, 0xb2, 0xd0, 0x50, 0x00, 0x00, 0x00, 0x00, // timestamp
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // addr_recv
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // addr_from
+    0x3b, 0x2e, 0xb3, 0x5d, 0x8c, 0xe6, 0x17, 0x65, // nonce
+    0x0f, 0x2f, 0x53, 0x61, 0x74, 0x6f, 0x73, 0x68, 0x69, 0x3a, 0x30, 0x2e, 0x37, 0x2e, 0x32, 0x2f, // "/Satoshi:0.7.2/" (var_str)
+    0xc0, 0x3e, 0x03, 0x00, // start_height
+};
+
 test "external: decodeVersion matches the wiki's published field breakdown byte-exact" {
-    // Payload only (envelope stripped -- see envelope.zig's test for the
-    // full wire form of this exact message).
-    const payload = [_]u8{
-        0x62, 0xea, 0x00, 0x00, // version = 60002
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // services = 1 (NODE_NETWORK)
-        0x11, 0xb2, 0xd0, 0x50, 0x00, 0x00, 0x00, 0x00, // timestamp
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // addr_recv
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // addr_from
-        0x3b, 0x2e, 0xb3, 0x5d, 0x8c, 0xe6, 0x17, 0x65, // nonce
-        0x0f, 0x2f, 0x53, 0x61, 0x74, 0x6f, 0x73, 0x68, 0x69, 0x3a, 0x30, 0x2e, 0x37, 0x2e, 0x32, 0x2f, // "/Satoshi:0.7.2/" (var_str)
-        0xc0, 0x3e, 0x03, 0x00, // start_height
-    };
+    const payload = wiki_version_payload;
     var v = try decodeVersion(&payload);
     defer v.deinit(testing.allocator);
     try testing.expectEqual(@as(i32, 60002), v.version);
@@ -216,16 +229,71 @@ test "hostile: decodeVersion with a user_agent length prefix exceeding remaining
     try testing.expectError(error.Truncated, decodeVersion(w.list.items));
 }
 
+/// `version` payloads, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// The fixed prefix is 80 octets (version + services + timestamp + two
+/// `net_addr`s + nonce) before the first variable-length field, so a random
+/// draw shorter than that never reaches `varBytes` at all, and one longer than
+/// it lands in `SubversionTooLong` only if the CompactSize it happens to hit
+/// says more than 256 with the octets to back it. Both boundaries are here
+/// explicitly.
+const version_seeds = [_][]const u8{
+    seed(&wiki_version_payload), // the wiki's 60002 payload: no relay octet (pre-BIP37)
+    seed(&(wiki_version_payload ++ [_]u8{0x01})), // the same with BIP37's relay = true appended
+    seedHex("00" ** 80 ++ "00" ++ "00000000"), // an empty user_agent
+    seedHex("00" ** 80 ++ "fd0001" ++ "61" ** 256 ++ "00000000"), // a user_agent exactly at max_subversion_length
+    seedHex("00" ** 80 ++ "fd0101" ++ "61" ** 257 ++ "00000000"), // SubversionTooLong: one octet over
+    seedHex("00" ** 80 ++ "fdff00"), // Truncated: claims 255 user_agent octets, none follow
+    seedHex("62ea0000" ++ "0100000000000000"), // Truncated: cut mid addr_recv, the hostile test's payload
+};
+
 test "fuzz: decodeVersion never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeVersion, .{});
+    try testing.fuzz({}, fuzzDecodeVersion, .{ .corpus = &version_seeds });
 }
 
 fn fuzzDecodeVersion(_: void, smith: *std.testing.Smith) !void {
-    var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ 512, not the 256 this harness carried before. `max_subversion_length`
+    // is 256, so the shortest `version` message that can reach
+    // `error.SubversionTooLong` is 80 + 3 + 257 + 4 = 344 octets -- and a seed
+    // longer than the buffer is not a big seed, it reads back EMPTY
+    // (`Smith.slice` falls back to the range minimum). With a 256-octet buffer
+    // this harness could not have reached that refusal, nor even a legal
+    // maximum-length user_agent, no matter what it was fed.
+    var buf: [512]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `decodeVersion` saw `buf[0..0]` every
+    // single time, with the seed sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
     var v = decodeVersion(buf[0..len]) catch return;
     v.deinit(testing.allocator);
+}
+
+test "corpus: every version seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else -- and it is exactly what the two
+    // 34x-octet seeds above would have done against the old 256-octet buffer;
+    // and a corpus where nothing is accepted is a corpus that only exercises
+    // the refusal path. Acceptance is not reach, so this pins the number
+    // rather than asserting it is > 0.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (version_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeVersion(buf[0..len])) |_| {
+            accepted += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(version_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 7 seeds non-empty and 0 accepted before the
+    // draw was fixed, 7 of 7 non-empty and 4 accepted after.
+    try testing.expectEqual(@as(usize, 4), accepted);
 }
 
 test "external anchor: max_subversion_length is Bitcoin Core's MAX_SUBVERSION_LENGTH" {

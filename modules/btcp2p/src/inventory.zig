@@ -237,6 +237,41 @@ pub fn serializeHeaders(allocator: Allocator, h: Headers) Allocator.Error![]u8 {
 
 const testing = std.testing;
 
+/// `testkit.fuzz`, for the corpora at the bottom of this file. A corpus entry
+/// is not the frame: `Smith.slice` reads a little-endian `u32` length first,
+/// so a raw frame would arrive minus its own first four octets.
+/// `testkit/src/fuzz.zig` carries the other two hazards.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+const seedHex = testkit.fuzz.seedHex;
+
+/// The exact `inv` payload octets sharkd was shown in the anchor test below
+/// (i.e. after magic/command/length/checksum). Container-level so the fuzz
+/// corpus seeds the SAME bytes an independent decoder has read, rather than a
+/// re-transcription of them.
+const dissected_inv_payload = [_]u8{
+    0x02, // CompactSize count = 2
+    0x01, 0x00, 0x00, 0x00, // type = MSG_TX (LE)
+    0xd3, 0xad, 0x1b, 0x0b,
+    0x2e, 0x8f, 0x6a, 0x7c,
+    0x4d, 0x5e, 0x6f, 0x70,
+    0x81, 0x92, 0xa3, 0xb4,
+    0xc5, 0xd6, 0xe7, 0xf8,
+    0x09, 0x1a, 0x2b, 0x3c,
+    0x4d, 0x5e, 0x6f, 0x70,
+    0x81, 0x92, 0x03, 0x04,
+    0x02, 0x00, 0x00, 0x00, // type = MSG_BLOCK (LE)
+    // the mainnet genesis block hash, wire (internal) byte order
+    0x6f, 0xe2, 0x8c, 0x0a,
+    0xb6, 0xf1, 0xb3, 0x72,
+    0xc1, 0xa6, 0xa2, 0x46,
+    0xae, 0x63, 0xf7, 0x4f,
+    0x93, 0x1e, 0x83, 0x65,
+    0xe1, 0x5a, 0x08, 0x9c,
+    0x68, 0xd6, 0x19, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};
+
 test "external anchor: Wireshark's bitcoin dissector reads our inv payload field-for-field" {
     // Audit F4. `inv`/`getdata`/`notfound` is the highest-volume message on the
     // network and had NO oracle that could fail independently of whoever wrote
@@ -275,28 +310,7 @@ test "external anchor: Wireshark's bitcoin dissector reads our inv payload field
 
     // The exact payload bytes sharkd was shown (the `inv` message payload,
     // i.e. after magic/command/length/checksum).
-    const wire = [_]u8{
-        0x02, // CompactSize count = 2
-        0x01, 0x00, 0x00, 0x00, // type = MSG_TX (LE)
-        0xd3, 0xad, 0x1b, 0x0b,
-        0x2e, 0x8f, 0x6a, 0x7c,
-        0x4d, 0x5e, 0x6f, 0x70,
-        0x81, 0x92, 0xa3, 0xb4,
-        0xc5, 0xd6, 0xe7, 0xf8,
-        0x09, 0x1a, 0x2b, 0x3c,
-        0x4d, 0x5e, 0x6f, 0x70,
-        0x81, 0x92, 0x03, 0x04,
-        0x02, 0x00, 0x00, 0x00, // type = MSG_BLOCK (LE)
-        // the mainnet genesis block hash, wire (internal) byte order
-        0x6f, 0xe2, 0x8c, 0x0a,
-        0xb6, 0xf1, 0xb3, 0x72,
-        0xc1, 0xa6, 0xa2, 0x46,
-        0xae, 0x63, 0xf7, 0x4f,
-        0x93, 0x1e, 0x83, 0x65,
-        0xe1, 0x5a, 0x08, 0x9c,
-        0x68, 0xd6, 0x19, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    };
+    const wire = dissected_inv_payload;
 
     // 1. Our decoder agrees with the dissector's reading of these bytes.
     var list = try decodeInventoryList(allocator, &wire);
@@ -421,43 +435,159 @@ test "hostile: Headers rejects a count with insufficient bytes behind it" {
     try testing.expectError(error.TooManyItems, decodeHeaders(allocator, w.list.items));
 }
 
+/// `inv`/`getdata`/`notfound` payloads, in the format `Smith.slice` reads.
+///
+/// Every entry is a fixed 36 octets behind one CompactSize count, so both
+/// count guards (`MAX_INV_ENTRIES` and the remaining-bytes bound) and the
+/// per-entry `Truncated` are reachable only by choosing the count deliberately.
+const inventory_seeds = [_][]const u8{
+    seed(&dissected_inv_payload), // the two-entry inv Wireshark read for us
+    seedHex("00"), // count 0: the empty list, byte-exact from the round-trip test
+    seedHex("01" ++ "01000000" ++ "42" ** 32), // one MSG_TX entry
+    seedHex("fd51c3"), // TooManyItems: 50001, one over MAX_INV_ENTRIES
+    seedHex("fde803"), // TooManyItems: 1000 under the cap, no octets behind it
+    seedHex("01" ++ "01000000" ++ "42" ** 31), // TooManyItems: one octet short of a single entry
+    seedHex("fd"), // a CompactSize prefix with no octets behind it
+};
+
 test "fuzz: decodeInventoryList never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzInventoryList, .{});
+    try testing.fuzz({}, fuzzInventoryList, .{ .corpus = &inventory_seeds });
 }
 
 fn fuzzInventoryList(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and the decoder saw `buf[0..0]` every
+    // single time, with the seed sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
     var list = decodeInventoryList(allocator, buf[0..len]) catch return;
     defer list.deinit(allocator);
 }
 
+test "corpus: every inventory seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach, so this pins the number rather than asserting it is > 0.
+    const allocator = testing.allocator;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (inventory_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeInventoryList(allocator, buf[0..len])) |l| {
+            accepted += 1;
+            var list = l;
+            list.deinit(allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(inventory_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 7 seeds non-empty and 0 accepted before the
+    // draw was fixed, 7 of 7 non-empty and 3 accepted after.
+    try testing.expectEqual(@as(usize, 3), accepted);
+}
+
+/// `getblocks`/`getheaders` payloads, in the format `Smith.slice` reads.
+///
+/// The trailing `hash_stop` is what makes this shape awkward for an undirected
+/// draw: a locator is only well-formed if 32 octets remain AFTER the hash list
+/// the count announced, so the accepted seeds have to be built to that rule.
+const locator_seeds = [_][]const u8{
+    seedHex("7f110100" ++ "00" ++ "00" ** 32), // protocol 70015, no locator hashes, zero hash_stop
+    seedHex("7f110100" ++ "02" ++ "11" ** 32 ++ "22" ** 32 ++ "00" ** 32), // the round-trip test's two hashes
+    seedHex("01000000" ++ "fdf401"), // TooManyItems: 500 hashes claimed, none follow
+    seedHex("7f110100" ++ "00" ++ "00" ** 31), // Truncated: hash_stop one octet short
+    seedHex("7f1101"), // Truncated: not even the version field
+};
+
 test "fuzz: decodeBlockLocator never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzBlockLocator, .{});
+    try testing.fuzz({}, fuzzBlockLocator, .{ .corpus = &locator_seeds });
 }
 
 fn fuzzBlockLocator(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ Same defect as `fuzzInventoryList` above: `len` was 0 for every seed.
+    const len: usize = smith.slice(&buf);
     var loc = decodeBlockLocator(allocator, buf[0..len]) catch return;
     defer loc.deinit(allocator);
 }
 
+test "corpus: every locator seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ See `fuzzInventoryList`'s guard above for what this measures.
+    const allocator = testing.allocator;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (locator_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeBlockLocator(allocator, buf[0..len])) |l| {
+            accepted += 1;
+            var loc = l;
+            loc.deinit(allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(locator_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 5 seeds non-empty and 0 accepted before the
+    // draw was fixed, 5 of 5 non-empty and 2 accepted after.
+    try testing.expectEqual(@as(usize, 2), accepted);
+}
+
+/// `headers` payloads, in the format `Smith.slice` reads.
+///
+/// Each entry is an 80-octet header plus its own CompactSize `txn_count`, so
+/// nothing shorter than 82 octets can produce even one entry.
+const headers_seeds = [_][]const u8{
+    seedHex("01" ++ "00" ** 80 ++ "00"), // one header, txn_count 0 -- what a real `headers` carries
+    seedHex("02" ++ "00" ** 80 ++ "00" ++ "ff" ** 80 ++ "00"), // two entries
+    seedHex("00"), // count 0: an empty headers message
+    seedHex("fe40420f00"), // TooManyItems: the hostile test's 1000000 count
+    seedHex("01" ++ "00" ** 80), // Truncated: a header with its txn_count missing
+    seedHex("01" ++ "00" ** 79), // TooManyItems: one octet short of a single entry
+};
+
 test "fuzz: decodeHeaders never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzHeaders, .{});
+    try testing.fuzz({}, fuzzHeaders, .{ .corpus = &headers_seeds });
 }
 
 fn fuzzHeaders(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ Same defect as `fuzzInventoryList` above: `len` was 0 for every seed.
+    const len: usize = smith.slice(&buf);
     var h = decodeHeaders(allocator, buf[0..len]) catch return;
     defer h.deinit(allocator);
+}
+
+test "corpus: every headers seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ See `fuzzInventoryList`'s guard above for what this measures.
+    const allocator = testing.allocator;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (headers_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeHeaders(allocator, buf[0..len])) |x| {
+            accepted += 1;
+            var h = x;
+            h.deinit(allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(headers_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 6 seeds non-empty and 0 accepted before the
+    // draw was fixed, 6 of 6 non-empty and 3 accepted after.
+    try testing.expectEqual(@as(usize, 3), accepted);
 }
 
 test "external anchor: the inventory type numbers are the protocol's, not ours" {

@@ -195,6 +195,12 @@ pub const Writer = struct {
 
 const testing = std.testing;
 
+/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the frames it
+/// is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw frame would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seedHex = @import("testkit").fuzz.seedHex;
+
 test "Reader: fixed-width little-endian reads" {
     const bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09 };
     var r: Reader = .{ .bytes = &bytes };
@@ -253,15 +259,68 @@ test "Writer/Reader round-trip: le ints, compactSize, varBytes" {
 // through `compactSize`/`varBytes`; this harness drives them directly
 // over arbitrary bytes (per-message fuzz harnesses cover the fixed-field
 // framing around them).
+
+/// `var_str` bodies, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// One seed per branch of `bitcointx.decodeCompactSize` — the 1-, 3-, 5- and
+/// 9-octet forms — in both its accepted and its `NonMinimal`/`Truncated`
+/// shapes, plus the `takeBytes` refusal that follows a well-formed length.
+/// A CompactSize prefix is only one octet wide for values under 0xfd, so an
+/// undirected byte stream lands in the 0xfd/0xfe/0xff branches 1 time in 85
+/// and almost always truncates there without ever reaching `takeBytes`.
+const varbytes_seeds = [_][]const u8{
+    seedHex("00"), // the empty var_str: length 0, nothing follows
+    seedHex("0568656c6c6f"), // "hello", the round-trip test's own var_str
+    seedHex("fc" ++ ("41" ** 252)), // 252 'A's: the widest 1-octet length
+    seedHex("fdfd00" ++ ("41" ** 253)), // 253 'A's: the narrowest legal 3-octet length
+    seedHex("fd0001"), // Truncated: claims 256 octets, none follow
+    seedHex("fd0a00"), // NonMinimal: 10 does not need the 3-octet form
+    seedHex("fe01000000"), // NonMinimal: 1 in the 5-octet form
+    seedHex("fe00000100"), // Truncated: 65536 octets claimed
+    seedHex("ff0000000000000000"), // NonMinimal: 0 in the 9-octet form
+    seedHex("ff"), // Truncated: a 9-octet prefix with 1 octet present
+    seedHex("fd"), // Truncated: a 3-octet prefix with 1 octet present
+    seedHex("0568656c"), // Truncated: declares 5, delivers 3
+};
+
 test "fuzz: compactSize + varBytes never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzCompactSizeAndVarBytes, .{});
+    try testing.fuzz({}, fuzzCompactSizeAndVarBytes, .{ .corpus = &varbytes_seeds });
 }
 
 fn fuzzCompactSizeAndVarBytes(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and the reader was handed an empty slice
+    // with the seed sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
 
     var r: Reader = .{ .bytes = buf[0..len] };
     _ = r.varBytes() catch return;
+}
+
+test "corpus: every var_str seed reaches the reader, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach, so this pins the number rather than asserting it is > 0.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (varbytes_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var r: Reader = .{ .bytes = buf[0..len] };
+        if (r.varBytes()) |_| {
+            accepted += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(varbytes_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 12 non-empty and 0 accepted before the draw
+    // was fixed, 12 of 12 and 4 after.
+    try testing.expectEqual(@as(usize, 4), accepted);
 }

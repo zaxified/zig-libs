@@ -160,6 +160,14 @@ pub fn serializeReject(allocator: Allocator, rej: Reject) Allocator.Error![]u8 {
 
 const testing = std.testing;
 
+/// `testkit.fuzz`, for the corpora at the bottom of this file. A corpus entry
+/// is not the frame: `Smith.slice` reads a little-endian `u32` length first,
+/// so a raw frame would arrive minus its own first four octets.
+/// `testkit/src/fuzz.zig` carries the other two hazards.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+const seedHex = testkit.fuzz.seedHex;
+
 test "Ping/Pong: round-trip" {
     const allocator = testing.allocator;
     const ping_bytes = try serializePing(allocator, .{ .nonce = 0x0102030405060708 });
@@ -179,15 +187,21 @@ test "hostile: decodePing on fewer than 8 bytes fails closed" {
 }
 
 // ── externally anchored: wiki's "Hexdump example of addr message" ───────
+
+/// The wiki's "Hexdump example of addr message". Container-level so the fuzz
+/// corpus below seeds the SAME octets this test anchors, rather than a
+/// re-transcription of them.
+const wiki_addr_payload = [_]u8{
+    0x01, // 1 address in this message
+    0xe2, 0x15, 0x10, 0x4d, // time
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // services
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xff, 0xff, 0x0a, 0x00, 0x00, 0x01,
+    0x20, 0x8d, // port
+};
+
 test "external: Addr decodes the wiki's own worked example byte-exact" {
-    const payload = [_]u8{
-        0x01, // 1 address in this message
-        0xe2, 0x15, 0x10, 0x4d, // time
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // services
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0xff, 0xff, 0x0a, 0x00, 0x00, 0x01,
-        0x20, 0x8d, // port
-    };
+    const payload = wiki_addr_payload;
     const allocator = testing.allocator;
     var addr = try decodeAddr(allocator, &payload);
     defer addr.deinit(allocator);
@@ -271,26 +285,111 @@ test "hostile: decodeAddr/decodeReject never panic on truncated buffers" {
     try testing.expectError(error.TooManyItems, decodeAddr(allocator, &.{0x01}));
 }
 
+/// One `addr` entry: the wiki payload above with its count octet removed.
+const wiki_addr_entry = wiki_addr_payload[1..].*;
+
+/// `addr` payloads, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// Both of `decodeAddr`'s independent count guards -- the wiki's own
+/// `MAX_ADDR_ENTRIES` ceiling and the remaining-bytes bound -- and the two
+/// shapes that get past them.
+const addr_seeds = [_][]const u8{
+    seed(&wiki_addr_payload), // the wiki's single-entry addr message
+    seed(&([_]u8{0x02} ++ wiki_addr_entry ++ wiki_addr_entry)), // the same entry twice
+    seedHex("00"), // count 0: an empty address list is legal
+    seedHex("01"), // TooManyItems: 1 entry claimed, 0 octets behind it
+    seedHex("fde903"), // TooManyItems: 1001, one over MAX_ADDR_ENTRIES
+    seedHex("fd8403"), // TooManyItems: 900, under the cap but with nothing behind it
+    seedHex("fd"), // a CompactSize prefix with no octets behind it
+};
+
 test "fuzz: decodeAddr never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzAddr, .{});
+    try testing.fuzz({}, fuzzAddr, .{ .corpus = &addr_seeds });
 }
 
 fn fuzzAddr(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `decodeAddr` saw `buf[0..0]` every
+    // single time, with the seed sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
     var a = decodeAddr(allocator, buf[0..len]) catch return;
     defer a.deinit(allocator);
 }
 
+test "corpus: every addr seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach, so this pins the number rather than asserting it is > 0.
+    const allocator = testing.allocator;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (addr_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeAddr(allocator, buf[0..len])) |a| {
+            accepted += 1;
+            var addr = a;
+            addr.deinit(allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(addr_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 7 seeds non-empty and 0 accepted before the
+    // draw was fixed, 7 of 7 non-empty and 3 accepted after.
+    try testing.expectEqual(@as(usize, 3), accepted);
+}
+
+/// `reject` payloads, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// `reject` is two `var_str`s around an opaque ccode octet with "the rest of
+/// the payload" behind them, so the interesting cases are the length prefixes:
+/// both empty, both populated, and each one claiming more than follows.
+const reject_seeds = [_][]const u8{
+    seed("\x02tx\x41\x1boutput below dust threshold" ++ ("\xcd" ** 32)), // the round-trip test's reject, data = a txid
+    seed("\x02tx\x41\x1boutput below dust threshold"), // the same with no trailing data
+    seed("\x05block\x99\x07unknown"), // an undocumented ccode, kept opaque rather than refused
+    seedHex("000000"), // both var_strs empty, ccode 0
+    seedHex("00"), // Truncated: an empty message and no ccode octet
+    seedHex("0000"), // Truncated: no reason var_str
+    seedHex("027478"), // Truncated: message "tx", then nothing
+    seedHex("fd0001"), // Truncated: a message claiming 256 octets
+};
+
 test "fuzz: decodeReject never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzReject, .{});
+    try testing.fuzz({}, fuzzReject, .{ .corpus = &reject_seeds });
 }
 
 fn fuzzReject(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ Same defect as `fuzzAddr` above: `len` was 0 for every seed.
+    const len: usize = smith.slice(&buf);
     _ = decodeReject(buf[0..len]) catch return;
+}
+
+test "corpus: every reject seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ See `fuzzAddr`'s guard above for what this measures and why the count
+    // is pinned rather than asserted positive.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (reject_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodeReject(buf[0..len])) |_| {
+            accepted += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(reject_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 8 seeds non-empty and 0 accepted before the
+    // draw was fixed, 8 of 8 non-empty and 4 accepted after.
+    try testing.expectEqual(@as(usize, 4), accepted);
 }
