@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **All three fuzz harnesses were replaying an EMPTY input; each now
+  has a corpus and a measured reach guard.**
+
+  `fuzzParse`, `fuzzParseJwks` and `fuzzParseTokenResponse` all opened with
+  `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes`
+  consumes `min(buf.len, in.len)` octets and a ranged draw then reads eight *more* as
+  a little-endian u64, returning the range minimum when fewer remain — so the drawn
+  length was 0 for every input a seed can carry, and `parse`, `parseJwksSource` and
+  `parseTokenResponse` were each handed a zero-length slice while the token sat unread
+  in `buf` (measured on `rfc7519_example_token`: `buf[0] == 'e'`, `len == 0`). All
+  three now take the bytes in one `smith.slice(&buf)` draw, and all three have a
+  corpus: 27 compact tokens, 28 JWK Sets, 13 token-endpoint bodies.
+
+  Each corpus has a guard test that runs in the ordinary lane and pins numbers that
+  were measured, not guessed: 27/28/13 seeds non-empty (0 before), 7 tokens accepted
+  carrying 102 signature octets and 16 typed registered claims, 21 key-set documents
+  accepted yielding 7 usable keys and 14 recorded skip reasons, 4 token responses
+  accepted with 5 typed optional members. Acceptance alone would not have been reach —
+  an unsecured JWT has a legitimately empty signature, `{"keys":[]}` is a legal key
+  set, and a two-member token response parses — so each guard pins a second number the
+  empty input cannot produce.
+
+  ⭐ The `.network` column of the JWKS guard came out **1 against 7**: every symmetric
+  seed the module's own value tests supply is refused as `oct_from_network`, so the
+  second trust source — the reason `fuzzParseJwks` calls `parseJwksSource` twice —
+  converted nothing until an EC key was added to the corpus.
+
 - **2026-09-01** — **Security audit: the ML-DSA signature-length guard was blind, and
   a published private key was served happily.**
 

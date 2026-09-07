@@ -3601,16 +3601,111 @@ test "malformed: segment count, empty segments" {
     try testing.expectError(error.MalformedToken, parse(gpa, "."));
 }
 
+// ── fuzz: the three untrusted-wire parsers ────────────────────────────
+//
+// ⚠ All three of this module's harnesses used to open with `smith.bytes(&buf)`
+// followed by `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies
+// `min(buf.len, in.len)` octets and the ranged draw then reads EIGHT more as a
+// little-endian u64, returning the range minimum when fewer remain — so `len`
+// was 0 for every input a corpus can carry, and `parse`, `parseJwksSource` and
+// `parseTokenResponse` were each handed an EMPTY slice while the token sat
+// unread in `buf`. Measured on `rfc7519_example_token`: `buf[0] == 'e'`,
+// `len == 0`. One `slice` draw reads the corpus entry's own length header and
+// hands the bytes over intact.
+
+/// `testkit.fuzz.seed`, aliased so the corpora below read as the tokens, key
+/// sets and token-endpoint bodies they are. A corpus entry is not the frame:
+/// the length draw reads a little-endian `u32` first, so a raw token would
+/// arrive minus its own first four octets — `"eyJ0"` gone, which is exactly the
+/// prefix every JWT starts with and so the least visible corruption possible.
+/// `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// Compact-serialization tokens, in the format the length draw reads.
+///
+/// Both halves of what the value tests pin: the tokens that parse (the RFC
+/// example, the unsecured `alg:none` form, every registered claim, both `aud`
+/// shapes, the i64 extremes) and the ones `parse` must refuse — the
+/// segment-count and empty-segment shapes, the base64url alphabet and padding
+/// rules, the header type errors, and `crit`, which is the one header rule
+/// `parse` itself enforces.
+const parse_seeds = [_][]const u8{
+    seed(rfc7519_example_token), // RFC 7519 §3.1 / RFC 7515 §A.1
+    seed("eyJhbGciOiJub25lIn0.eyJpc3MiOiJqb2UifQ."), // unsecured JWT: empty signature segment
+    seed("eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjEwMDB9.dGVzdC1zaWduYXR1cmU"), // {"alg":"HS256"} / {"exp":1000}
+    seed("eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwic3ViIjoidTEiLCJhdWQiOiJhcGk6Ly9zdmMiLCJleHAiOjIwMDAsIm5iZiI6MTAwLCJpYXQiOjUwLCJqdGkiOiJpZC0xIn0.dGVzdC1zaWduYXR1cmU"), // every registered claim + kid
+    seed("eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLCJhdWQiOlsiYSIsImIiXX0.dGVzdC1zaWduYXR1cmU"), // the array form of `aud`
+    seed("eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjkyMjMzNzIwMzY4NTQ3NzU4MDcsIm5iZiI6LTkyMjMzNzIwMzY4NTQ3NzU4MDh9.dGVzdC1zaWduYXR1cmU"), // the i64 extremes
+    seed("eyJhbGciOiJIUzk5OSJ9.eyJpc3MiOiJqb2UifQ.dGVzdC1zaWduYXR1cmU"), // an unregistered alg name: `.unknown`, not an error
+    seed("eyJhbGciOiJIUzI1NiIsImNyaXQiOltdfQ.eyJpc3MiOiJqb2UifQ.dGVzdC1zaWduYXR1cmU"), // crit MUST NOT be empty
+    seed("eyJhbGciOiJIUzI1NiIsImNyaXQiOlsiaHR0cDovL2V4YW1wbGUuaW52YWxpZC9VTkRFRklORUQiXSwiaHR0cDovL2V4YW1wbGUuaW52YWxpZC9VTkRFRklORUQiOnRydWV9.eyJpc3MiOiJqb2UifQ.dGVzdC1zaWduYXR1cmU"), // an understood-by-nobody crit header
+    seed("eyJ0eXAiOiJKV1QifQ.eyJpc3MiOiJqb2UifQ.dGVzdC1zaWduYXR1cmU"), // no `alg` member at all
+    seed("WzEsMiwzXQ.eyJpc3MiOiJqb2UifQ.dGVzdC1zaWduYXR1cmU"), // header is valid JSON but not an object
+    seed("bm90IGpzb24gYXQgYWxs.eyJpc3MiOiJqb2UifQ.dGVzdC1zaWduYXR1cmU"), // header decodes but is not JSON
+    seed("eyJhbGciOiJIUzI1NiJ9.WzEsMiwzXQ.dGVzdC1zaWduYXR1cmU"), // payload is not an object
+    seed("eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOjQyfQ.dGVzdC1zaWduYXR1cmU"), // `aud` is neither string nor array
+    seed("eyJhbGciOiJIUzI1NiJ9"), // one segment
+    seed("eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UifQ"), // two segments
+    seed("eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UifQ.c2ln.extra"), // four segments
+    seed(".eyJpc3MiOiJqb2UifQ.c2ln"), // empty header segment
+    seed("eyJhbGciOiJIUzI1NiJ9..c2ln"), // empty payload segment
+    seed("e!Jh.eyJpc3MiOiJqb2UifQ.c2ln"), // outside the URL-safe alphabet
+    seed("eyJh+GciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UifQ.c2ln"), // '+' belongs to the STANDARD alphabet
+    seed("eyJhbGciOiJIUzI1NiJ9=.eyJpc3MiOiJqb2UifQ.c2ln"), // padding is forbidden in compact form
+    seed("eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UifQ.c"), // len % 4 == 1 is never a valid base64 length
+    seed("eyJhbGciOiJIUzI1NiJ9.\x00\x00\x00\x00.c2ln"), // NULs inside a segment
+    seed("."), // the shortest thing with a dot in it
+    seed("\xff\xfe\xfd.\xfc\xfb.\xfa"), // high bytes in all three segments
+    seed("\xf0\x9f\x94\x91.\xf0\x9f\x94\x92.\xf0\x9f\x94\x93"), // 🔑.🔒.🔓
+};
+
 test "fuzz: parse never panics on arbitrary compact-JWT bytes" {
-    try testing.fuzz({}, fuzzParse, .{});
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     var parsed = parse(testing.allocator, buf[0..len]) catch return;
     parsed.deinit();
+}
+
+test "corpus: every token seed reaches parse, and what it decoded is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Four
+    // numbers, because acceptance alone would not be reach: the seed count, the
+    // tokens accepted, the signature octets `parse` actually decoded, and the
+    // registered claims it typed. The last two are the discriminating half —
+    // an unsecured JWT has a legitimately EMPTY signature and no claims at all,
+    // so a corpus of `alg:none` fragments would score full marks on
+    // "accepted" while never once exercising base64url decode or the claim
+    // type-checks, which is where every refusal in this parser lives.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var signature_octets: usize = 0;
+    var registered_claims: usize = 0;
+    for (parse_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var parsed = parse(testing.allocator, buf[0..len]) catch continue;
+        defer parsed.deinit();
+        accepted += 1;
+        signature_octets += parsed.signature.len;
+        if (parsed.claims.iss != null) registered_claims += 1;
+        if (parsed.claims.sub != null) registered_claims += 1;
+        if (parsed.claims.exp != null) registered_claims += 1;
+        if (parsed.claims.nbf != null) registered_claims += 1;
+        if (parsed.claims.iat != null) registered_claims += 1;
+        if (parsed.claims.jti != null) registered_claims += 1;
+        if (parsed.claims.aud != .none) registered_claims += 1; // `Audience` is a tagged union with a void `.none`
+    }
+    try testing.expectEqual(parse_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 27 seeds non-empty, 0 accepted, 0 signature
+    // octets and 0 registered claims before the draw was fixed.
+    try testing.expectEqual(@as(usize, 7), accepted);
+    try testing.expectEqual(@as(usize, 102), signature_octets);
+    try testing.expectEqual(@as(usize, 16), registered_claims);
 }
 
 test "malformed: bad base64url" {
@@ -5389,14 +5484,52 @@ test "JWKS: garbage documents → typed errors; empty set resolves nothing" {
     try testing.expectError(error.NoMatchingKey, verifyWithJwks(&parsed, empty));
 }
 
+/// JWK Sets, in the format the length draw reads.
+///
+/// The buffer is 1024 and the longest entry here is 268 octets, so every one
+/// passes through whole. Both halves again: sets that yield a usable key (each
+/// `kty` this module converts, plus `kid`/`use`/`alg` selection metadata), sets
+/// that are well-formed but yield none, the per-JWK skip reasons — which are
+/// the interesting ones, because a skip is silent by design — and the
+/// document-level refusals.
+const jwks_seeds = [_][]const u8{
+    seed("{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"a3\",\"use\":\"sig\",\"x\":\"" ++ rfc7515_a3_x_b64 ++ "\",\"y\":\"" ++ rfc7515_a3_y_b64 ++ "\"}]}"), // the RFC 7515 §A.3 verification key: the one seed both trust sources accept
+    seed("{\"keys\":[{\"kty\":\"oct\",\"k\":\"c2VjcmV0\",\"kid\":\"good\"}]}"), // one usable symmetric key — usable from `.local` ONLY
+    seed("{\"keys\":[{\"kty\":\"oct\",\"k\":\"c2VjcmV0\",\"kid\":\"a\",\"use\":\"sig\",\"alg\":\"HS256\"}]}"), // all three selection members
+    seed("{\"keys\":[{\"kty\":\"oct\",\"k\":\"c2VjcmV0\",\"use\":\"enc\"}]}"), // `use:enc` is never selected for verification
+    seed("{\"keys\":[{\"kty\":\"oct\",\"k\":\"YQ\",\"kid\":\"a\"},{\"kty\":\"oct\",\"k\":\"Yg\",\"kid\":\"b\"}]}"), // two keys, for kid selection
+    seed("{\"keys\":[]}"), // well-formed and useless: everything resolves to NoMatchingKey
+    seed("{\"keys\":[42]}"), // not_an_object
+    seed("{\"keys\":[{}]}"), // missing_kty
+    seed("{\"keys\":[{\"kty\":42}]}"), // invalid_member: kty wrong type
+    seed("{\"keys\":[{\"kty\":\"oct\"}]}"), // missing_member: no `k`
+    seed("{\"keys\":[{\"kty\":\"oct\",\"k\":\"!!!\"}]}"), // invalid_base64
+    seed("{\"keys\":[{\"kty\":\"oct\",\"k\":\"\"}]}"), // an empty secret is unusable
+    seed("{\"keys\":[{\"kty\":\"oct\",\"k\":\"c2VjcmV0\",\"kid\":42}]}"), // invalid_member: kid wrong type
+    seed("{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\"}]}"), // missing_member: no x/y
+    seed("{\"keys\":[{\"kty\":\"EC\",\"x\":\"AA\",\"y\":\"AA\"}]}"), // missing_crv
+    seed("{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"y\":\"AAAAAAAAAAAAAAAAAAAAAA\"}]}"), // invalid_key: 16-byte coordinates
+    seed("{\"keys\":[{\"kty\":\"RSA\",\"n\":\"AQAB\",\"e\":\"AQAB\"}]}"), // invalid_key: a two-octet modulus
+    seed("{\"keys\":[{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"__________________________________________8\"}]}"), // invalid_key: non-canonical Ed25519
+    seed("{\"keys\":[{\"kty\":\"AKP\",\"alg\":\"ML-DSA-44\",\"pub\":\"AA\"}]}"), // invalid_key: a truncated ML-DSA key
+    seed("{\"keys\":[{\"kty\":\"oct\",\"k\":\"c2VjcmV0\",\"d\":\"c2VjcmV0\"}]}"), // a PRIVATE member: the `.network` source refuses what `.local` allows
+    seed("{\"keys\":[{\"kty\":\"unheard-of\"}]}"), // an unknown key type
+    seed("{}"), // NotAJwks: no `keys`
+    seed("[]"), // NotAJwks: not an object
+    seed("42"), // NotAJwks: not even a container
+    seed("{\"keys\":42}"), // NotAJwks: `keys` is not an array
+    seed("{\"keys\":{}}"), // NotAJwks: `keys` is an object
+    seed("{\"keys\":[}"), // InvalidJson
+    seed("not json"), // InvalidJson
+};
+
 test "fuzz: parseJwks never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseJwks, .{});
+    try testing.fuzz({}, fuzzParseJwks, .{ .corpus = &jwks_seeds });
 }
 
 fn fuzzParseJwks(_: void, smith: *std.testing.Smith) !void {
     var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     // Individual malformed JWKs are skipped (never a set-wide error), and
     // per parseJwks's own doc comment "Arbitrary bytes never panic" — this
     // is the fuzz harness proving that claim for both `.local` and
@@ -5418,6 +5551,54 @@ fn fuzzParseJwks(_: void, smith: *std.testing.Smith) !void {
         var network = ok;
         network.deinit();
     } else |_| {}
+}
+
+test "corpus: every JWKS seed reaches the parser, and the keys and skips are pinned" {
+    // ⭐ Three numbers, and `accepted` is deliberately NOT one of them on its
+    // own: `{"keys":[]}` is a perfectly legal set, so "the document parsed" is
+    // satisfied by a corpus that never converts a single key. The two that
+    // cannot be produced by an empty or trivial input are the usable keys
+    // yielded and the per-JWK skip reasons recorded — and the skip count is
+    // the one that matters most, because a skipped JWK is silent by design.
+    // The `.network` column is separate because it has refusal branches
+    // `.local` never takes, which is the whole reason the harness calls both.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var keys_local: usize = 0;
+    var skipped_local: usize = 0;
+    var keys_network: usize = 0;
+    for (jwks_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (parseJwksSource(testing.allocator, buf[0..len], .local)) |ok| {
+            var set = ok;
+            defer set.deinit();
+            accepted += 1;
+            keys_local += set.keys.len;
+            skipped_local += set.skipped.len;
+        } else |_| {}
+        if (parseJwksSource(testing.allocator, buf[0..len], .network)) |ok| {
+            var set = ok;
+            defer set.deinit();
+            keys_network += set.keys.len;
+        } else |_| {}
+    }
+    try testing.expectEqual(jwks_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 28 seeds non-empty and every counter 0 before
+    // the draw was fixed — `parseJwks("")` is `error.InvalidJson`, so even the
+    // document count was zero.
+    try testing.expectEqual(@as(usize, 21), accepted);
+    try testing.expectEqual(@as(usize, 7), keys_local);
+    try testing.expectEqual(@as(usize, 14), skipped_local);
+    // ⭐ 1 against 7, and the gap is the point: every symmetric seed above is
+    // usable from `.local` and refused as `oct_from_network`, so the only key
+    // that survives a network fetch is the EC one. A corpus of `oct` JWKs —
+    // which is what the module's own value tests mostly carry — would have left
+    // the `.network` branch converting nothing at all while the harness looked
+    // like it exercised both trust sources.
+    try testing.expectEqual(@as(usize, 1), keys_network);
 }
 
 test "parseVerifyJwks: end-to-end against a multi-key set" {
@@ -6922,8 +7103,28 @@ test "buildTokenRequest: body round-trips through http.body.urlencoded (compatib
     try testing.expectEqual(@as(?http.body.FormPair, null), it.next());
 }
 
+/// Token-endpoint bodies, in the format the length draw reads. The structured
+/// sweep below covers the member/value matrix; these are the DOCUMENT shapes it
+/// cannot reach — the required-member refusals, the container-level type
+/// errors, and the bodies a broken OP actually sends.
+const token_response_seeds = [_][]const u8{
+    seed("{\"access_token\":\"at-1\",\"token_type\":\"Bearer\",\"id_token\":\"idt-1\",\"expires_in\":3600,\"refresh_token\":\"rt-1\",\"scope\":\"openid profile\"}"), // the full response
+    seed("{\"access_token\":\"at-2\",\"token_type\":\"bearer\"}"), // required members only: the optionals stay null
+    seed("{\"token_type\":\"Bearer\",\"access_token\":\"at\",\"unknown_ext\":{\"a\":[1,2]}}"), // an unknown member is ignored, not an error
+    seed("{\"access_token\":\"at\",\"token_type\":\"Bearer\",\"expires_in\":0}"), // a zero lifetime is a value, not an absence
+    seed("{\"token_type\":\"Bearer\"}"), // MissingAccessToken
+    seed("{\"access_token\":\"at\"}"), // MissingTokenType
+    seed("{\"access_token\":\"at\",\"token_type\":\"Bearer\",\"expires_in\":\"not-a-number\"}"), // InvalidField
+    seed("{\"access_token\":42,\"token_type\":\"Bearer\"}"), // a wrong-typed REQUIRED member
+    seed("{\"access_token\":\"at\",\"token_type\":\"Bearer\",\"expires_in\":12345678901234567890}"), // a lifetime that does not fit an i64
+    seed("{\"error\":\"invalid_grant\"}"), // the RFC 6749 §5.2 error body, which is not a token response
+    seed("[1,2,3]"), // NotAnObject
+    seed("]][not json"), // InvalidJson
+    seed("{}"), // an empty object still misses both required members
+};
+
 test "fuzz: parseTokenResponse never panics on arbitrary or near-valid token bodies" {
-    try testing.fuzz({}, fuzzParseTokenResponse, .{});
+    try testing.fuzz({}, fuzzParseTokenResponse, .{ .corpus = &token_response_seeds });
 }
 
 /// Adversarial JSON values a hostile or broken OP could put in a
@@ -6967,8 +7168,7 @@ const token_response_members = [_][]const u8{
 fn fuzzParseTokenResponse(_: void, smith: *std.testing.Smith) !void {
     var buf: [1024]u8 = undefined;
     {
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+        const len: usize = smith.slice(&buf);
         // NB: a typed error here must NOT abandon the iteration — nearly every
         // random byte string is a parse error, and an early `return` would
         // silently skip the structured sweep below (the skip-as-pass shape).
@@ -6999,6 +7199,35 @@ fn fuzzParseTokenResponse(_: void, smith: *std.testing.Smith) !void {
             resp.deinit();
         }
     }
+}
+
+test "corpus: every token-response seed reaches the parser, and the members typed are pinned" {
+    // ⭐ `accepted` is not the discriminating number here either — a body with
+    // just the two required members parses, so a corpus of minimal bodies would
+    // read 100% while never once reaching the optional-member extraction, which
+    // is where `InvalidField` and the i64 range check live. `optionals_typed`
+    // is the number an empty or minimal input cannot produce.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var optionals_typed: usize = 0;
+    for (token_response_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var resp = parseTokenResponse(testing.allocator, buf[0..len]) catch continue;
+        defer resp.deinit();
+        accepted += 1;
+        if (resp.id_token != null) optionals_typed += 1;
+        if (resp.expires_in != null) optionals_typed += 1;
+        if (resp.refresh_token != null) optionals_typed += 1;
+        if (resp.scope != null) optionals_typed += 1;
+    }
+    try testing.expectEqual(token_response_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 13 seeds non-empty, 0 accepted and 0 optionals
+    // typed before the draw was fixed.
+    try testing.expectEqual(@as(usize, 4), accepted);
+    try testing.expectEqual(@as(usize, 5), optionals_typed);
 }
 
 test "parseTokenResponse: full response, missing-required and wrong-typed-optional errors" {
