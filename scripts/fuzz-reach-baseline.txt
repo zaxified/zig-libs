@@ -123,7 +123,6 @@ webauthn 4
 webhooksig 1
 websocket 2
 whois 1
-wireguard 2
 x509 2
 xml 1
 xmldsig 1

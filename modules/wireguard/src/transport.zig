@@ -78,6 +78,9 @@
 
 const std = @import("std");
 const noise = @import("noise.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 // Note: `pub const meta` is declared once, canonically, in `root.zig` (per
 // CONVENTIONS.md §4) — submodule files like this one do not repeat it. This
@@ -1423,18 +1426,149 @@ test "seal rejects a plaintext that cannot fit one UDP datagram" {
 
 // ── fuzz: open over arbitrary bytes never panics ───────────────────────────
 
-fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
-    var buf: [160]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+/// The key and receiver index `fuzzOpen`'s session is built with. The corpus
+/// has to seal against exactly these or nothing it produces can ever
+/// authenticate — which is the whole difference between fuzzing the decrypt
+/// and fuzzing the four checks in front of it.
+const fuzz_key: [32]u8 = @splat(0x5A);
+const fuzz_index: u32 = 0;
+
+/// Transport messages for `fuzzOpen`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the message.
+///
+/// ⭐ Built at run time by this file's own `SendSession` rather than quoted as
+/// hex, because a hex literal cannot be an authentic one: the tag is over a
+/// key, and a corpus of messages that all fail authentication exercises the
+/// refusal path and nothing else. Two of these open successfully.
+const OpenCorpus = struct {
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [9][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *OpenCorpus, msg: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], msg);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *OpenCorpus) []const []const u8 {
+        var s = SendSession.init(fuzz_key, fuzz_index, t0);
+        var sealed: [128]u8 = undefined;
+
+        // Two authentic messages, counters 0 and 1 — the second is what makes
+        // the replay window advance rather than just being consulted.
+        const first_len = (s.seal(&sealed, "twelve bytes", t0) catch unreachable).len;
+        var first: [128]u8 = undefined;
+        @memcpy(first[0..first_len], sealed[0..first_len]);
+        self.push(first[0..first_len]);
+        const second_len = (s.seal(&sealed, "a second packet, longer", t0) catch unreachable).len;
+        self.push(sealed[0..second_len]);
+        // ⭐ And the FIRST one again: `open` is called on a fresh session per
+        // round, so this is not a replay here — but under `--fuzz` the mutator
+        // now has two authentic messages with the same counter to work from.
+        self.push(first[0..first_len]);
+
+        // A one-octet flip in the tag, the ciphertext and the header: the
+        // three places `AuthenticationFailed` has to come from, and the only
+        // seeds that reach the AEAD at all.
+        for ([_]usize{ first_len - 1, header_len, 8 }) |off| {
+            var bad: [128]u8 = undefined;
+            @memcpy(bad[0..first_len], first[0..first_len]);
+            bad[off] +%= 1;
+            self.push(bad[0..first_len]);
+        }
+
+        // ── the checks in front of the AEAD ────────────────────────────────
+        // A receiver index that is not ours: `WrongReceiver`, the first gate.
+        {
+            var wrong: [128]u8 = undefined;
+            @memcpy(wrong[0..first_len], first[0..first_len]);
+            std.mem.writeInt(u32, wrong[4..8], fuzz_index +% 1, .little);
+            self.push(wrong[0..first_len]);
+        }
+        // A counter at `reject_after_messages`: `MessageLimitReached`.
+        {
+            var over: [128]u8 = undefined;
+            @memcpy(over[0..first_len], first[0..first_len]);
+            std.mem.writeInt(u64, over[8..16], reject_after_messages, .little);
+            self.push(over[0..first_len]);
+        }
+        // One octet short of `overhead`: `Truncated`, the header gate.
+        self.push(first[0 .. overhead - 1]);
+
+        return self.entries[0..self.n];
+    }
+};
+
+/// What one message yielded. Shared by the fuzz target and its corpus guard so
+/// the guard drives the SAME call.
+const OpenTally = struct {
+    opened: usize = 0,
+    plaintext: usize = 0,
+};
+
+fn walkOpen(msg: []const u8) !OpenTally {
     var out: [160]u8 = undefined;
-    var r = RecvSession.init(@splat(0x5A), 0, t0);
+    var r = RecvSession.init(fuzz_key, fuzz_index, t0);
     // Arbitrary bytes must only ever yield a typed error or a plaintext length
     // <= input — never a panic, an OOB read, or an allocation.
-    const orr = r.open(&out, buf[0..len], t0) catch return;
-    try testing.expect(orr.len + overhead == len);
+    const orr = r.open(&out, msg, t0) catch return .{};
+    try testing.expect(orr.len + overhead == msg.len);
+    return .{ .opened = 1, .plaintext = orr.len };
+}
+
+fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
+    var buf: [160]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `open` was handed an EMPTY message
+    // with the packet sitting unread in `buf`.
+    //
+    // ⛔ The empty message fails at `msg.len < overhead` — the very first line
+    // of `parseHeader` — so `WrongReceiver`, `MessageLimitReached`,
+    // `SessionExpired`, `BufferTooSmall`, `Replayed` and the AEAD itself were
+    // ALL unreachable, and the `orr.len + overhead == msg.len` assertion this
+    // target is built around had never once been evaluated. Measured
+    // 2026-09-07 over the corpus above: **0 of 9 seeds non-empty and 0 opened
+    // before; 9 of 9 non-empty, 3 opened and 64 octets of plaintext, after.**
+    const len: usize = smith.slice(&buf);
+    std.mem.doNotOptimizeAway(try walkOpen(buf[0..len]));
 }
 
 test "fuzz: RecvSession.open never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzOpen, .{});
+    var corpus: OpenCorpus = .{};
+    try testing.fuzz({}, fuzzOpen, .{ .corpus = corpus.build() });
+}
+
+test "corpus: every transport seed reaches open, and the opened count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkOpen`. `nonempty` is
+    // the reach claim and the only check that catches a seed grown past the
+    // harness's buffer, which `Smith.slice` reads back as the EMPTY one.
+    //
+    // ⛔ `opened` is the number that matters, and it is why the corpus is
+    // built by `SendSession` instead of written out as hex: a message that
+    // does not authenticate can never get past the AEAD, so a hex corpus
+    // would test the refusal path and report a perfectly healthy "every seed
+    // reached the parser". `plaintext` pins that what came back out is the
+    // padded length the sender put in.
+    var corpus: OpenCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var total: OpenTally = .{};
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [160]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const t = try walkOpen(buf[0..len]);
+        total.opened += t.opened;
+        total.plaintext += t.plaintext;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), total.opened);
+    try testing.expectEqual(@as(usize, 64), total.plaintext);
 }
