@@ -1642,13 +1642,7 @@ const MessageCorpus = struct {
 
 /// The draw one fuzz iteration makes, factored out so the guard below measures
 /// the SAME input the harness is handed rather than a look-alike.
-/// ⚠ A NAMED return type, not an anonymous `struct { … }` in the signature:
-/// `scripts/check-fuzz-reach.py` finds a helper's body by matching braces from
-/// its signature, and a brace inside the return type sends it to the wrong
-/// one — the target then reads as making no `Smith` draw at all (a false R1).
-const MessageDraw = struct { input: []const u8, stamped: bool };
-
-fn fuzzMessageInput(smith: *std.testing.Smith, buf: *[2048]u8) MessageDraw {
+fn fuzzMessageInput(smith: *std.testing.Smith, buf: *[2048]u8) struct { input: []const u8, stamped: bool } {
     // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
     const len: usize = smith.slice(buf);
     // A `--fuzz`-only amplifier: the two fields the decoder reads FIRST are the

@@ -277,6 +277,29 @@ def split_args(arglist: str):
 COMMENT_RE = re.compile(r"\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|//[^\n]*")
 
 
+# A return type can carry braces of its own: `fn f(...) struct { a: u8 } { ... }`.
+# Taking the first `{` after the parameter list then hands back the TYPE as the
+# function body, and a harness whose draw helper returns an anonymous struct
+# reads as making no `Smith` draw at all -- a collapse the gate invents. Found
+# by an agent that hit it in `mls/framing.zig` and reported it instead of only
+# working around it (the workaround was to name the type).
+TYPE_OPENER_RE = re.compile(r"\b(?:struct|union|enum|opaque|error)\s*(?:\([^)]*\)\s*)?$")
+
+
+def body_brace(src: str, paren_end: int) -> int:
+    """The `{` that opens the function body, skipping any the return type owns."""
+    at = paren_end
+    while True:
+        brace = src.find("{", at)
+        if brace < 0:
+            return -1
+        if not TYPE_OPENER_RE.search(src[paren_end:brace]):
+            return brace
+        at = match_paren(src, brace)  # step over the type's own body
+        if at <= brace:
+            return -1
+
+
 def strip_comments(src: str) -> str:
     """Blank out `//` comments, preserving offsets so line numbers survive.
 
@@ -305,7 +328,7 @@ class File:
         self.fn_defs = {}
         for m in FN_RE.finditer(self.src):
             paren_end = match_paren(self.src, m.end() - 1)
-            brace = self.src.find("{", paren_end)
+            brace = body_brace(self.src, paren_end)
             if brace < 0:
                 continue
             end = match_paren(self.src, brace)
@@ -601,6 +624,32 @@ def truncation_hits(body_texts):
                         f"`{n}` comes from a bounded draw and is therefore the range "
                         f"minimum, and it is a `switch` discriminant — every seed "
                         f"takes the same branch")
+            # ⛔ The inline spelling `switch (smith.valueRangeAtMost(u8, 0, 3))`
+            # is deliberately NOT added here, and the reason is the rule's own
+            # premise rather than an oversight. Both forms above start from
+            # `collapsing`, which `LEN_BINDING_RE` builds from a BINDING, so an
+            # inline draw binds nothing and is invisible to them. An agent found
+            # that asymmetry in `kvtree/fuzzRecover` (hoisting the draw into a
+            # name made the gate fire on semantics that had not changed) and it
+            # was implemented -- whereupon it flagged 11 targets in 7 modules,
+            # and every one of the 11 had been MEASURED live that same day.
+            #
+            # What the measurement showed is that this rule is a corpus-dependent
+            # claim wearing the clothes of a shape rule. Its premise -- "the seed
+            # is consumed by then, so the discriminant is always 0" -- was true
+            # of the whole tree when it was written, because no corpus left a
+            # tail behind the byte draw. Corpora that do leave one now exist, and
+            # for those the premise is simply false: `voprf` pins `modes_seen`
+            # all three true, `protobuf` pins all four `shapes_seen`. A gate
+            # cannot read the corpus; the pinned corpus guard is the proof, and
+            # it outranks the shape.
+            #
+            # So the inline form stays where the evidence puts it: on the
+            # post-byte-knob WORKLIST, which asks the corpus question instead of
+            # asserting the answer. The named form above keeps its hard verdict
+            # only because the tree currently holds no counterexample to it --
+            # the first target that pins a named discriminant as varying is the
+            # signal to move that one to the worklist too.
     return sorted(set(hits))
 
 
