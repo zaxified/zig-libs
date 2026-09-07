@@ -126,7 +126,7 @@ const module_list = [_]Module{
     .{ .name = "cookies", .libs = &.{"format"}, .deps = &.{"http"} },
     .{ .name = "idempotency", .libs = &.{"web"}, .deps = &.{ "router", "http", "ramcache" } },
     .{ .name = "webhooksig", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
-    .{ .name = "tracecontext", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "tracecontext", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
     // Importable as @import("aaa-gate") — hyphen OK, like security-headers.
     .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
     .{ .name = "resilience", .libs = &.{ "web", "net" } },
