@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- ⭐ **2026-09-07** — **BUGFIX: a direct operate left the finished client's
+  identity on the point.** `Point.operate`'s non-enhanced success path set
+  `state` and `select_deadline_ms` by hand and left `owner` and `ctl_num`
+  holding the command it had just executed, so a `direct-with-normal-security`
+  object came to rest `unselected` while still naming an owner — the state
+  `reset()` exists to avoid. It now calls `reset()`. `fuzzPoint` **asserts
+  exactly this invariant** and had never caught it: its first draw was a ranged
+  one, which returns the range minimum outside `--fuzz`, so `ctl_model` was
+  always `status_only` and every command was refused before it reached the
+  path. The assertion fired on the first seeded run. Pinned as a value test.
+- **2026-09-07** — **`control`: three more harnesses fed.** `fuzzControl` and
+  `fuzzClassify` had the `smith.bytes` + ranged-length collapse and now draw
+  with one `smith.slice`, over corpora lifted out of `controlgoldens.zig` — the
+  captured `Oper`, `LastApplError` and `CommandTermination+` structures a real
+  IED exchanged with a real client, peeled out of the frames layer by layer.
+  `fuzzPoint` was the R1 shape and was **restructured rather than exempted**: it
+  now reads one `smith.slice` and drives the state machine from a byte script
+  (`ctlModel, sboTimeout, execTimeout`, then `advance, ctlNum, op, client` per
+  round), which makes a seed reviewable and every branch reachable. Measured,
+  all zero before: `fuzzControl` 15 of 15 seeds non-empty, **4 commands and 1
+  LastApplError** decoded; `fuzzClassify` 7 of 7, **4 reports, 4 classified**;
+  `fuzzPoint` 9 of 9 scripts, **66 accepted and 102 rejected outcomes** over 288
+  rounds. The collapse is pinned in the same guard: an empty script reproduces
+  the old draws exactly (every read returns the range minimum), and it scores
+  **0 accepted, 32 rejected** — one input, `status_only`, `not_supported` 32
+  times, which is everything the target ever executed.
+
 - **2026-09-07** — **`mms`, `mmsdata`, `report`, `goose` and `sv`: five more
   decoders that were only ever handed the empty slice.** Same collapse:
   `smith.bytes(&buf)` followed by a ranged length draw, which returns the range

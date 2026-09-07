@@ -928,8 +928,15 @@ pub const Point = struct {
                 now_ms + self.execution_timeout_ms;
             return .{ .accepted = .{ .terminate = true } };
         }
-        self.state = .unselected;
-        self.select_deadline_ms = 0;
+        // ⭐ `reset`, not a hand-clear of two of the five fields. This path used
+        // to set `state` and `select_deadline_ms` and leave `owner` and
+        // `ctl_num` holding the finished command's values, so a
+        // direct-with-normal-security point came to rest `unselected` while
+        // still naming an owner. `fuzzPoint` asserts exactly that this cannot
+        // happen — and never caught it, because its draws collapsed to the
+        // range minimum and `ctl_model` was therefore always `status_only`,
+        // where every command is refused before it gets here.
+        self.reset();
         return .{ .accepted = .{} };
     }
 
@@ -1575,14 +1582,73 @@ test "controlName injects CO and the control attribute" {
     try testing.expectError(error.NotAControlObject, controlName("LD/GGIO1", .CO, "Oper", &buf));
 }
 
+test "a direct operate leaves no owner behind on the point it just finished" {
+    // ⭐ Found by seeding `fuzzPoint`. The non-enhanced success path in
+    // `operate` set `state` and `select_deadline_ms` but not `owner` or
+    // `ctl_num`, so the point rested `unselected` while still naming the client
+    // that operated it — the state `release()` and `reset()` exist to avoid.
+    var p = Point{
+        .item = "GGIO1$CO$SPCSO1",
+        .domain = "LD",
+        .ctl_model = .direct_with_normal_security,
+    };
+    const cmd = Command{
+        .ctl_val = &[_]u8{ 0x83, 0x01, 0x01 },
+        .ctl_num = 7,
+        .t = mmsdata.UtcTime.fromMillis(1000, null),
+    };
+    try testing.expect(p.operate(2, cmd, 1000) == .accepted);
+    try testing.expectEqual(PointState.unselected, p.state);
+    try testing.expectEqual(@as(u32, 0), p.owner);
+    try testing.expectEqual(@as(u8, 0), p.ctl_num);
+    try testing.expectEqual(@as(u64, 0), p.select_deadline_ms);
+    try testing.expectEqual(@as(u64, 0), p.execution_deadline_ms);
+}
+
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the structures
+/// they are. A corpus entry is not the structure: `Smith.slice` reads a
+/// little-endian `u32` length first, so a raw TLV would arrive minus its own
+/// first four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seedHex;
+
+/// Control structures, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// Every `Oper` and `LastApplError` here is lifted out of `controlgoldens.zig`
+/// — the MMS `Data` a real IED exchanged with a real client — by peeling TPKT,
+/// COTP, session and presentation off the captured frame. Uniform random octets
+/// build an eight-member `structure` whose members have the right alternatives
+/// essentially never, so without these `Command.decode` refuses on the first
+/// member and the re-encode identity below is unreachable.
+const control_seeds = [_][]const u8{
+    seed("A21E830101A205850103890086010191086A620591620C490083010084020600"), // the captured Oper, direct-with-normal-security
+    seed("A21E830101A205850100890086010191086A620591624DD20083010084020600"), // the Oper of the sbo-with-normal-security sequence
+    seed("A227830101A20D85010289087A69672D6C696273860200C891086553F1000000000A83010084020600"), // an Oper carrying a full `origin`
+    seed("A226830101A20D85010289087A69672D6C69627386010191086553F1000000000A83010084020600"), // the CommandTermination+ echoed back to us
+    seed("A2418A2673696D706C65494F47656E65726963494F2F4747494F3124434F24535043534F34244F706572850100A20D85010289087A69672D6C696273860200C8850112"), // the captured LastApplError, Object-not-selected
+    seed("850101"), // CtlModel: direct-with-normal-security
+    seed("850104"), // CtlModel: sbo-with-enhanced-security
+    seed("850105"), // an integer past the last defined CtlModel
+    seed("84020680"), // a TrgOps-shaped bit string
+    seed("84020640"), // …and the other one from the value tests
+    seed("830101"), // a bare boolean, not a structure at all
+    seed("A200"), // an empty structure
+    seed("A203830101"), // a structure with only `ctlVal`
+    seed("A2"), // a constructed header with no length octet
+    seed("00"), // one octet
+};
+
 test "fuzz: control structures decode to a typed error or a valid value" {
-    try std.testing.fuzz({}, fuzzControl, .{});
+    try std.testing.fuzz({}, fuzzControl, .{ .corpus = &control_seeds });
 }
 
 fn fuzzControl(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `Data.decode` was handed an empty slice
+    // with the seed sitting unread in the buffer.
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
     const d = mmsdata.Data.decode(bytes) catch return;
     d.validate() catch return;
@@ -1613,50 +1679,235 @@ fn fuzzControl(_: void, smith: *std.testing.Smith) !void {
     _ = CtlModel.fromData(d) catch {};
 }
 
+/// `InformationReport` **bodies** — what `mms.decodeInformationReport` takes,
+/// which is the content of the `[3] unconfirmed-PDU`, not the PDU. All three
+/// are the captured indications from `controlgoldens.zig`, peeled the same way.
+const classify_seeds = [_][]const u8{
+    // CommandTermination+ for a direct-with-enhanced-security Oper.
+    seed("A02F302DA02BA1291A1173696D706C65494F47656E65726963494F1A144747494F3124434F24535043534F33244F706572A020A21E830101A205850100890086010191086A620591624DD20083010084020600"),
+    // The same for sbo-with-enhanced-security.
+    seed("A02F302DA02BA1291A1173696D706C65494F47656E65726963494F1A144747494F3124434F24535043534F34244F706572A020A21E830101A205850100890086010191086A620592649BA50083010084020600"),
+    // CommandTermination+ the real IED sent to us, echoing our own `origin`.
+    seed("A02F302DA02BA1291A1173696D706C65494F47656E65726963494F1A144747494F3124434F24535043534F33244F706572A028A226830101A20D85010289087A69672D6C69627386010191086553F1000000000A83010084020600"),
+    // The two-variable report: `LastApplError` first, then the control object.
+    seed("A0133011A00F800D4C6173744170706C4572726F72A043A2418A2673696D706C65494F47656E65726963494F2F4747494F3124434F24535043534F34244F706572850100A20D85010289087A69672D6C696273860200C8850112"),
+    seed("A0133011A00F800D4C6173744170706C4572726F72"), // a spec with no access results at all
+    seed("A02F"), // a header that names octets that are not there
+    seed("00"), // one octet
+};
+
 test "fuzz: classifying an unsolicited report never panics" {
-    try std.testing.fuzz({}, fuzzClassify, .{});
+    try std.testing.fuzz({}, fuzzClassify, .{ .corpus = &classify_seeds });
 }
 
 fn fuzzClassify(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ Same collapse as `fuzzControl` above: `len` was 0 for every seed, so
+    // `decodeInformationReport` always failed and `classify` was never called.
+    const len: usize = smith.slice(&buf);
     const info = mms.decodeInformationReport(buf[0..len]) catch return;
     _ = classify(info) catch return;
 }
 
-test "fuzz: the server-side point never panics and never wedges" {
-    try std.testing.fuzz({}, fuzzPoint, .{});
-}
+/// A byte cursor over one corpus seed, which is what drives `fuzzPoint`.
+///
+/// ⚠ This exists because `fuzzPoint` used to take every choice from a ranged
+/// `Smith` draw, and its FIRST draw was one — `check-fuzz-reach` classifies
+/// that R1. A scalar draw reads eight octets as a little-endian `u64` and
+/// returns the range MINIMUM unless the whole word falls inside the range, so
+/// outside `--fuzz` every choice collapsed: `ctl_model` was always
+/// `status_only`, both timeouts 0, every advance 0, and every round took branch
+/// 0 — the harness ran the same three lines 32 times. It was not exempted,
+/// because a state machine driven by a byte script has an obvious byte-first
+/// form: one `smith.slice`, then the octets say what happens. It also makes a
+/// seed reviewable, which a sequence of `u64` words is not.
+///
+/// A short script cycles rather than running out, so a four-octet seed is a
+/// repeating pattern instead of 28 rounds of the range minimum.
+const Script = struct {
+    bytes: []const u8,
+    at: usize = 0,
 
-fn fuzzPoint(_: void, smith: *std.testing.Smith) !void {
+    fn byte(self: *Script) u8 {
+        if (self.bytes.len == 0) return 0;
+        const b = self.bytes[self.at % self.bytes.len];
+        self.at += 1;
+        return b;
+    }
+
+    fn word(self: *Script) u16 {
+        const hi: u16 = self.byte();
+        const lo: u16 = self.byte();
+        return (hi << 8) | lo;
+    }
+
+    /// `at_least`..`at_most` inclusive. `u32` arithmetic so a full-width span
+    /// does not overflow the way `at_most - at_least + 1` does in `u8`.
+    fn ranged(self: *Script, at_least: u32, at_most: u32) u32 {
+        return at_least + @as(u32, self.byte()) % (at_most - at_least + 1);
+    }
+};
+
+/// What a script did to the point, so the guard below can measure a corpus
+/// rather than assert it merely ran.
+const PointOutcome = struct {
+    accepted: usize = 0,
+    rejected: usize = 0,
+    selects: usize = 0,
+    operates: usize = 0,
+};
+
+/// The body of `fuzzPoint`, factored out so the harness and the corpus guard
+/// drive the SAME state machine from the same octets. A guard measuring a
+/// different sequence from the one the harness runs is not a guard.
+fn runPointScript(bytes: []const u8) !PointOutcome {
+    var s = Script{ .bytes = bytes };
     var p = Point{
         .item = "GGIO1$CO$SPCSO1",
         .domain = "LD",
-        .ctl_model = try CtlModel.fromInt(smith.valueRangeAtMost(u8, 0, 4)),
-        .sbo_timeout_ms = smith.valueRangeAtMost(u16, 0, 5000),
-        .execution_timeout_ms = smith.valueRangeAtMost(u16, 0, 5000),
+        .ctl_model = try CtlModel.fromInt(@intCast(s.ranged(0, 4))),
+        .sbo_timeout_ms = s.word() % 5001,
+        .execution_timeout_ms = s.word() % 5001,
     };
+    var out: PointOutcome = .{};
     var now: u64 = 0;
     var i: usize = 0;
     while (i < 32) : (i += 1) {
-        now += smith.valueRangeAtMost(u16, 0, 2000);
+        now += s.word() % 2001;
         const cmd = Command{
             .ctl_val = &[_]u8{ 0x83, 0x01, 0x01 },
-            .ctl_num = smith.valueRangeAtMost(u8, 0, 255),
+            .ctl_num = @intCast(s.ranged(0, 255)),
             .t = mmsdata.UtcTime.fromMillis(now, null),
         };
-        switch (smith.valueRangeAtMost(u8, 0, 4)) {
-            0 => _ = p.select(smith.valueRangeAtMost(u8, 1, 3), null, now),
-            1 => _ = p.select(smith.valueRangeAtMost(u8, 1, 3), cmd, now),
-            2 => _ = p.operate(smith.valueRangeAtMost(u8, 1, 3), cmd, now),
-            3 => _ = p.cancel(smith.valueRangeAtMost(u8, 1, 3), cmd, now),
-            else => _ = p.tick(now),
-        }
+        const op = s.ranged(0, 4);
+        const who: u32 = s.ranged(1, 3);
+        const outcome: ?Outcome = switch (op) {
+            0 => p.select(who, null, now),
+            1 => p.select(who, cmd, now),
+            2 => p.operate(who, cmd, now),
+            3 => p.cancel(who, cmd, now),
+            else => blk: {
+                _ = p.tick(now);
+                break :blk null;
+            },
+        };
+        if (outcome) |o| switch (o) {
+            .accepted => out.accepted += 1,
+            .rejected => out.rejected += 1,
+        };
+        if (op == 0 or op == 1) out.selects += 1;
+        if (op == 2) out.operates += 1;
         // An unselected point never holds an owner or a deadline.
         if (p.state == .unselected) {
             try testing.expectEqual(@as(u32, 0), p.owner);
             try testing.expectEqual(@as(u64, 0), p.select_deadline_ms);
         }
     }
+    return out;
+}
+
+/// Command scripts. The layout the cursor reads is
+/// `ctlModel, sboTimeout(2), execTimeout(2)`, then per round
+/// `advance(2), ctlNum, op, client` where `op` is
+/// 0 select(SBO) · 1 select(SBOw) · 2 operate · 3 cancel · 4 tick.
+const point_seeds = [_][]const u8{
+    // direct-with-normal-security, operate straight away, same client.
+    seed("01" ++ "1388" ++ "1388" ++ "0064" ++ "07" ++ "02" ++ "01"),
+    // sbo-with-normal-security: select with SBO, then operate, same client.
+    seed("02" ++ "1388" ++ "1388" ++ "000A" ++ "07" ++ "00" ++ "01" ++ "000A" ++ "07" ++ "02" ++ "01"),
+    // sbo-with-enhanced-security: SBOw select, then operate, same client.
+    seed("04" ++ "1388" ++ "1388" ++ "000A" ++ "07" ++ "01" ++ "01" ++ "000A" ++ "07" ++ "02" ++ "01"),
+    // Client 1 selects, client 2 operates — the hijack the owner check exists for.
+    seed("02" ++ "1388" ++ "1388" ++ "000A" ++ "07" ++ "00" ++ "01" ++ "000A" ++ "07" ++ "02" ++ "02"),
+    // A one-millisecond select window, then a 2000 ms advance: the select expires.
+    seed("02" ++ "0001" ++ "1388" ++ "0000" ++ "07" ++ "00" ++ "01" ++ "07D0" ++ "07" ++ "02" ++ "01"),
+    // Cancel without a select, over and over.
+    seed("02" ++ "1388" ++ "1388" ++ "0000" ++ "07" ++ "03" ++ "01"),
+    // status-only: every command must be refused with `not_supported`.
+    seed("00" ++ "1388" ++ "1388" ++ "0000" ++ "07" ++ "02" ++ "01"),
+    // Nothing but ticks.
+    seed("03" ++ "1388" ++ "1388" ++ "0064" ++ "07" ++ "04" ++ "01"),
+    seed("00"), // one octet, cycled: the degenerate script
+};
+
+test "fuzz: the server-side point never panics and never wedges" {
+    try std.testing.fuzz({}, fuzzPoint, .{ .corpus = &point_seeds });
+}
+
+fn fuzzPoint(_: void, smith: *std.testing.Smith) !void {
+    var script: [256]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runPointScript(script[0..n]);
+}
+
+test "corpus: every control seed reaches its decoder, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so these pin the numbers rather than asserting they are > 0.
+    var nonempty: usize = 0;
+    var commands: usize = 0;
+    var errors: usize = 0;
+    for (control_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const d = mmsdata.Data.decode(buf[0..len]) catch continue;
+        if (Command.decode(d)) |_| commands += 1 else |_| {}
+        if (LastApplError.decode(d)) |_| errors += 1 else |_| {}
+    }
+    try testing.expectEqual(control_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), commands);
+    try testing.expectEqual(@as(usize, 1), errors);
+
+    var cl_nonempty: usize = 0;
+    var reports: usize = 0;
+    var notifications: usize = 0;
+    for (classify_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) cl_nonempty += 1;
+        const info = mms.decodeInformationReport(buf[0..len]) catch continue;
+        reports += 1;
+        if (classify(info)) |n| {
+            if (n != null) notifications += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(classify_seeds.len, cl_nonempty);
+    try testing.expectEqual(@as(usize, 4), reports);
+    try testing.expectEqual(@as(usize, 4), notifications);
+
+    // The point scripts are measured by what the state machine DID, not by
+    // whether they parsed: a script that is refused 288 times out of 288 is a
+    // corpus that never gets past `select`, which is what the collapsed draw
+    // produced (`status_only`, so `not_supported` for every command).
+    var pt_nonempty: usize = 0;
+    var accepted: usize = 0;
+    var rejected: usize = 0;
+    for (point_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [256]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) pt_nonempty += 1;
+        const o = try runPointScript(script[0..n]);
+        accepted += o.accepted;
+        rejected += o.rejected;
+    }
+    try testing.expectEqual(point_seeds.len, pt_nonempty);
+    try testing.expectEqual(@as(usize, 66), accepted);
+    try testing.expectEqual(@as(usize, 102), rejected);
+
+    // ⭐ And what the collapse produced, kept as a measurement rather than a
+    // story. An empty script makes every `Script` read return 0, which is
+    // exactly what the old ranged draws returned outside `--fuzz` — the range
+    // minimum for each — and the empty input was the ONLY input a target with
+    // no corpus ever executed. So this line is the old harness, in full.
+    const collapsed = try runPointScript(&.{});
+    try testing.expectEqual(@as(usize, 0), collapsed.accepted);
+    try testing.expectEqual(@as(usize, 32), collapsed.rejected);
 }
