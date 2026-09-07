@@ -262,14 +262,30 @@ matching. See SPEC.md.
   each asserted to produce the right `Bad…` status. Certificate parsing is
   fuzzed and prefix/mutation-swept: hostile DER is a typed error, never a
   panic.
-- Live (skips loudly if `podman`/`python3`+`asyncua`/the port is unavailable):
-  **open62541's stock `tutorial_client_firststeps`, `client_subscription_loop`,
-  `client` and `client_encryption` binaries driving this server**, **Python
-  `asyncua` driving it at Basic256Sha256 SignAndEncrypt** (browse, read, write,
-  call, subscribe) plus Sign with an encrypted username token and a run that
-  forces SecurityToken renewals mid-stream, this module's client driving a real
-  open62541 server at Basic256Sha256, and this module's client driving this
-  server over a loopback socket.
+- **Replayed third-party interop, hermetic** (`src/asyncua_replay.zig`): the
+  whole recorded Python `asyncua` exchange, replayed byte for byte with **no
+  interpreter, no `asyncua`, no child process and no socket** — seven
+  connections at `SecurityPolicy#None`, Basic256Sha256/Sign (with an RSA-OAEP-
+  encrypted username token) and Basic256Sha256/SignAndEncrypt, covering Hello,
+  OpenSecureChannel, GetEndpoints, CreateSession, ActivateSession, Browse, Read,
+  Write, Call, CreateSubscription, Publish and two mid-stream SecurityToken
+  renewals. What makes it replayable is what the module already had: the server
+  draws every random byte from a caller-supplied `std.Random` and takes time as
+  a parameter, so a seed plus a `start_time` plus the recorded `t=` fixes every
+  nonce, key, certificate and timestamp. The recording is
+  `src/testdata/asyncua_transcript.txt`; it is **taken**, not written, by
+  `zig build interop-opcua -- --capture`, and only that live program can find a
+  NEW divergence.
+- Live (skips loudly if `podman`/the port is unavailable): **open62541's stock
+  `tutorial_client_firststeps`, `client_subscription_loop`, `client` and
+  `client_encryption` binaries driving this server**, this module's client
+  driving a real open62541 server at Basic256Sha256, and this module's client
+  driving this server over a loopback socket. A container running a third-party
+  *server* is a live PEER, which is a different question from a foreign
+  toolchain — `live` in `build.zig`'s `module_list` is where it is answered.
+- Live, outside the module (`zig build interop-opcua`, needs a Python with
+  `asyncua` + `cryptography`): `tools/asyncua_driver.py` driving this server for
+  real. It is a pre-release check; the replay above is the per-commit one.
 - Goldens: captured open62541 bytes for the `#None` traffic; **self-derived,
   fully deterministic** goldens for the Basic256Sha256 asymmetric handshake
   and for signed / signed-and-encrypted MSG chunks; and, cut from a real
@@ -280,28 +296,3 @@ matching. See SPEC.md.
   byte-identically; self-derived ones are labelled as such. Key derivation has
   a KAT whose expected bytes come from an independent implementation of
   P-SHA256.
-
-## Foreign toolchain
-
-**Foreign toolchain:** MIGRATION-OWED via `src/server_interop.zig` — that file
-carries a ~190-line Python `asyncua` driver as an inline `\\` literal and runs
-it with `python3 -c`, so `test-opcua` reaches for an interpreter the module has
-no business needing.
-
-This is the seventh instance of the shape six modules were separated from on
-2026-09-06 (`f3dbf38d`, `f42cc67a`), and it was missed for a mechanical reason:
-the other six kept their driver in a file that could be *moved*, while this one
-is a string constant inside a Zig source file, so no `git mv` made it visible.
-The rule is the same for it — an anchor against a foreign implementation is an
-EXTERNAL test and belongs in `tools/interop.zig`, with the exchange captured
-into a transcript the module's own tests replay hermetically.
-
-Nothing here approves that. `zig build check-module-purity` reads this line only
-so a known, named debt does not have to be paid for by switching the gate off,
-and the line **expires by itself**: the gate fails on a declaration whose file
-has stopped spawning, so the migration that fixes this deletes this section.
-
-Scope, so the debt is not read as larger than it is. The `podman`/open62541 half
-of that file spawns a container running a third-party *server* and is not what
-this line covers — a live peer is a different question from a foreign toolchain,
-and `live` in `build.zig`'s `module_list` is where it is answered.

@@ -5,6 +5,53 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — The Python `asyncua` interop left the module. It had been a
+  ~190-line driver script held as an inline `\\` string literal in
+  `src/server_interop.zig` and run with `python3 -c`, so `zig build test-opcua`
+  reached for an interpreter and a third-party package the module has no
+  business needing, and the anchor skipped — loudly, but skipped — wherever
+  either was absent. That is the seventh instance of the shape six modules were
+  separated from on 2026-09-06 (`f3dbf38d`, `f42cc67a`); it was missed because
+  the other six kept their driver in a FILE, which could be `git mv`'d and was
+  therefore visible in the diff, while a string constant moves nowhere.
+  `zig build check-module-purity` (`33f26907`) is what named it.
+  - The script is now `tools/asyncua_driver.py`, run **from its own path** —
+    never embedded, never inlined — by `tools/interop.zig`
+    (`zig build interop-opcua`, compiled on every lane by
+    `zig build check-interop`).
+  - `zig build interop-opcua -- --capture` records the whole exchange into
+    `src/testdata/asyncua_transcript.txt`, and the new `src/asyncua_replay.zig`
+    replays it **byte for byte with no interpreter, no asyncua, no child process
+    and no socket**: seven connections at #None / Basic256Sha256 Sign (encrypted
+    username token) / SignAndEncrypt, covering Hello, OpenSecureChannel,
+    GetEndpoints, CreateSession, ActivateSession, Browse, Read, Write, Call,
+    CreateSubscription, Publish and two mid-stream SecurityToken renewals.
+  - Nothing was weakened to make that replayable. The seams were already there:
+    `Server.init` takes the `std.Random` it draws from, and `feed`/`tick` take
+    time as a parameter, so a recorded seed plus `start_time` plus each `t=`
+    fixes the RSA key pair, the certificate, every nonce, token id and
+    timestamp. The transcript header carries all of it, plus the asyncua and
+    Python versions, the date and the exact command.
+  - Coverage went UP, not down. The live test compared ten stdout markers, the
+    driver's exit status and a connection count — twelve facts. The replay
+    requires every one of the server's 1 734 recorded answers to match exactly
+    (which pins Browse, Read, Write, Call and the DataChangeNotification through
+    their ciphertext), re-derives each connection's SecurityPolicy/SecurityMode,
+    walks the opc.tcp framing of both directions, decodes the endpoint list off
+    the unsecured leg and requires our own certificate on the secured
+    endpoints, and checks the value asyncua wrote is still in the address space.
+    Proved not blind by mutation: a single flipped transcript byte, a dropped
+    renewal leg, a falsified SecurityMode and a one-value change to
+    `Config.max_chunk_count` each turn it red.
+  - What the replay CANNOT do is stated in its own header and in SPEC.md: it
+    cannot find a NEW divergence, it cannot tell "we broke interop" from "we
+    changed valid bytes", and it cannot re-check anything that was not bytes on
+    the wire (asyncua's own assertions and its exit status are kept in the file
+    as `#` notes for that reason).
+  - Unchanged and deliberately not folded in: the `podman`/open62541 tests still
+    run a container. A third-party *server* is a live PEER, not a foreign
+    toolchain, and `live` in `build.zig`'s `module_list` is where that question
+    is answered.
 - **2026-09-02** — Security audit: a plaintext `UserNameIdentityToken` is now
   refused unless the client named a `UserTokenPolicy` this server advertises
   **and** that policy is `#None`. The refusal used to be nested inside

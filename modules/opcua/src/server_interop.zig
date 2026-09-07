@@ -303,9 +303,10 @@ const Driver = struct {
     /// ⭐ WHY THIS EXISTS. `idle_stop_ms` infers that the client is done from a
     /// gap between connections, and every live client here reconnects at least
     /// once mid-run: open62541's `client` example dials `GetEndpoints`, hangs
-    /// up, and dials the endpoint it was told about; the asyncua driver makes
-    /// FOUR separate connections, the last of which is the token renewal. The
-    /// gap between them is a property of the machine, not of the protocol.
+    /// up, and dials the endpoint it was told about. (asyncua does the same
+    /// thing seven times over, which is what `tools/interop.zig` records; it no
+    /// longer runs from here.) The gap between them is a property of the
+    /// machine, not of the protocol.
     ///
     /// Under seven of eight cores of load on 2026-08-15 those gaps outgrew the
     /// 1.5-2 s windows, so the server stopped listening mid-conversation and
@@ -695,21 +696,6 @@ const LogMarkerPeer = struct {
     }
 };
 
-/// `Driver.PeerAlive` for a client the test itself runs and waits on: a flag
-/// the waiting thread sets when the process has actually exited.
-const FlagPeer = struct {
-    done: std.atomic.Value(bool) = .init(false),
-
-    fn alive(ctx: *anyopaque) bool {
-        const self: *FlagPeer = @ptrCast(@alignCast(ctx));
-        return !self.done.load(.acquire);
-    }
-
-    fn peerAlive(self: *FlagPeer) Driver.PeerAlive {
-        return .{ .ctx = @ptrCast(self), .call = alive };
-    }
-};
-
 const LiveClient = struct {
     driver: Driver,
     logs: []u8,
@@ -889,10 +875,8 @@ test "LIVE open62541 -> our server: the `client` example browses, reads, writes,
 
 const LoopbackCtx = struct {
     driver: *Driver,
+    /// Raised by the serving thread to tell the test it has stopped.
     done: std.atomic.Value(bool) = .init(false),
-    /// Raised by whoever waits on the client process. `done` above runs the
-    /// other way — the serving thread telling the test it has stopped.
-    client: FlagPeer = .{},
 };
 
 fn loopbackServeThread(ctx: *LoopbackCtx) void {
@@ -1777,150 +1761,34 @@ test "golden (self-derived): the server's GetEndpoints / Read / Publish response
 
 // ── LIVE Basic256Sha256: a real third-party client against our server ───────
 //
-// The oracle here is **Python `asyncua`** (LGPL-3.0), used purely as a black
-// box: no asyncua source is read, built or linked — the test runs a stock
-// interpreter with the driver script below and asserts on its *stdout*. It is
-// the natural second opinion to open62541: a wholly independent stack, written
-// in a different language, with its own reading of OPC 10000-6 §6.7.
+// ⭐ THE LIVE HALF OF THIS LEFT THE MODULE ON 2026-09-07, and what replaced it
+// is `asyncua_replay.zig` beside this file.
 //
-// The script generates its own throwaway 2048-bit RSA key pair and
-// self-signed certificate (via `cryptography`, in a temp dir it makes and
-// owns) — **no certificate or private key ships in this repository**, and the
-// server's own key pair is likewise generated in-process by `Driver.initWith`.
+// The oracle is Python `asyncua` (LGPL-3.0), a wholly independent stack with
+// its own reading of OPC 10000-6 §6.7 — the natural second opinion to
+// open62541. Until that date its ~190-line driver script sat HERE, as an
+// inline `\\` string literal run with `python3 -c`, so this module's own tests
+// reached for an interpreter and a third-party package they had no business
+// needing, and skipped wherever either was absent. It was the seventh instance
+// of the shape six modules were separated from on 2026-09-06 (`f3dbf38d`,
+// `f42cc67a`), missed for a mechanical reason: the other six kept their driver
+// in a FILE, which could be `git mv`'d and was therefore visible in the diff,
+// while a string constant moves nowhere.
 //
-// Skips loudly when the interpreter or `asyncua` is unavailable. Set
-// `OPCUA_PYTHON` to point at a specific interpreter (e.g. a virtualenv).
-
-const asyncua_script =
-    \\import asyncio, datetime, os, sys, tempfile
-    \\from asyncua import Client, ua
-    \\from cryptography import x509
-    \\from cryptography.x509.oid import NameOID
-    \\from cryptography.hazmat.primitives import hashes, serialization
-    \\from cryptography.hazmat.primitives.asymmetric import rsa as crsa
-    \\
-    \\URL = "opc.tcp://localhost:4841"
-    \\ANSWER = ua.NodeId("the.answer", 1)
-    \\METHOD = ua.NodeId(62541, 1)
-    \\
-    \\def make_cert(d):
-    \\    key = crsa.generate_private_key(public_exponent=65537, key_size=2048)
-    \\    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "asyncua interop client")])
-    \\    now = datetime.datetime.now(datetime.timezone.utc)
-    \\    cert = (x509.CertificateBuilder()
-    \\            .subject_name(name).issuer_name(name)
-    \\            .public_key(key.public_key())
-    \\            .serial_number(x509.random_serial_number())
-    \\            .not_valid_before(now - datetime.timedelta(days=1))
-    \\            .not_valid_after(now + datetime.timedelta(days=365))
-    \\            .add_extension(x509.SubjectAlternativeName(
-    \\                [x509.UniformResourceIdentifier("urn:zig-libs:opcua:asyncua-client")]), critical=False)
-    \\            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-    \\            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=True,
-    \\                                         key_encipherment=True, data_encipherment=True,
-    \\                                         key_agreement=False, key_cert_sign=False, crl_sign=False,
-    \\                                         encipher_only=False, decipher_only=False), critical=True)
-    \\            .sign(key, hashes.SHA256()))
-    \\    cp = os.path.join(d, "client.der")
-    \\    kp = os.path.join(d, "client.pem")
-    \\    with open(cp, "wb") as f:
-    \\        f.write(cert.public_bytes(serialization.Encoding.DER))
-    \\    with open(kp, "wb") as f:
-    \\        f.write(key.private_bytes(serialization.Encoding.PEM,
-    \\                                  serialization.PrivateFormat.PKCS8,
-    \\                                  serialization.NoEncryption()))
-    \\    return cp, kp
-    \\
-    \\class Handler:
-    \\    def __init__(self):
-    \\        self.count = 0
-    \\    def datachange_notification(self, node, val, data):
-    \\        self.count += 1
-    \\
-    \\async def secure_client(cp, kp, mode, user=None, password=None, timeout_ms=None):
-    \\    c = Client(url=URL)
-    \\    if timeout_ms is not None:
-    \\        c.secure_channel_timeout = timeout_ms
-    \\    await c.set_security_string("Basic256Sha256,%s,%s,%s" % (mode, cp, kp))
-    \\    if user is not None:
-    \\        c.set_user(user)
-    \\        c.set_password(password)
-    \\    return c
-    \\
-    \\async def main():
-    \\    d = tempfile.mkdtemp(prefix="ziglibs-opcua-")
-    \\    cp, kp = make_cert(d)
-    \\
-    \\    eps = await Client(url=URL).connect_and_get_server_endpoints()
-    \\    modes = sorted({"%s|%s" % (e.SecurityPolicyUri.rsplit("#", 1)[-1], e.SecurityMode.name) for e in eps})
-    \\    print("ZIGLIBS-OK-ENDPOINTS", len(eps), ",".join(modes), flush=True)
-    \\    for e in eps:
-    \\        if e.SecurityMode != ua.MessageSecurityMode.None_:
-    \\            assert e.ServerCertificate, "secure endpoint without a ServerCertificate"
-    \\
-    \\    # ---- SignAndEncrypt, anonymous: browse / read / write / call / subscribe
-    \\    c = await secure_client(cp, kp, "SignAndEncrypt")
-    \\    async with c:
-    \\        print("ZIGLIBS-OK-CONNECT SignAndEncrypt", flush=True)
-    \\        children = await c.nodes.objects.get_children()
-    \\        names = [ (await ch.read_browse_name()).Name for ch in children ]
-    \\        assert "the.answer" in names, names
-    \\        print("ZIGLIBS-OK-BROWSE", len(children), flush=True)
-    \\
-    \\        node = c.get_node(ANSWER)
-    \\        v = await node.read_value()
-    \\        print("ZIGLIBS-OK-READ", v, flush=True)
-    \\
-    \\        await node.write_value(ua.DataValue(ua.Variant(31337, ua.VariantType.Int32)))
-    \\        back = await node.read_value()
-    \\        assert back == 31337, back
-    \\        print("ZIGLIBS-OK-WRITE", back, flush=True)
-    \\
-    \\        out = await c.nodes.objects.call_method(METHOD, ua.Variant("ping", ua.VariantType.String))
-    \\        print("ZIGLIBS-OK-CALL", out, flush=True)
-    \\
-    \\        h = Handler()
-    \\        sub = await c.create_subscription(200, h)
-    \\        await sub.subscribe_data_change(node)
-    \\        await asyncio.sleep(2.0)
-    \\        await sub.delete()
-    \\        assert h.count >= 1, h.count
-    \\        print("ZIGLIBS-OK-SUBSCRIPTION", h.count, flush=True)
-    \\
-    \\    # ---- Sign only, with a Basic256Sha256-encrypted UserNameIdentityToken
-    \\    c = await secure_client(cp, kp, "Sign", user="user1", password="password")
-    \\    async with c:
-    \\        v = await c.get_node(ANSWER).read_value()
-    \\        print("ZIGLIBS-OK-SIGN-USERNAME", v, flush=True)
-    \\
-    \\    # ---- SecurityToken renewal: a 10 s channel lifetime held for ~30 s makes
-    \\    #      asyncua renew at least twice while requests keep flowing.
-    \\    #
-    \\    #      The margin is deliberately wide. It was a 4 s lifetime held for
-    \\    #      ~10 s until 2026-08-14, which is a real property proved on an idle
-    \\    #      machine and a coin flip on a busy one: inside a full 215-module
-    \\    #      lane the token expired before the renewal was served and the
-    \\    #      server answered BadSecureChannelTokenUnknown, while the same test
-    \\    #      passed on its own in every optimize mode. A live test that fails
-    \\    #      under load teaches people to re-run the gate, which costs more
-    \\    #      than the seconds this widening spends.
-    \\    c = await secure_client(cp, kp, "SignAndEncrypt", timeout_ms=10000)
-    \\    async with c:
-    \\        node = c.get_node(ANSWER)
-    \\        reads = 0
-    \\        for _ in range(30):
-    \\            await node.read_value()
-    \\            reads += 1
-    \\            await asyncio.sleep(1.0)
-    \\        print("ZIGLIBS-OK-RENEWAL", reads, flush=True)
-    \\
-    \\    print("ZIGLIBS-ALL-DONE", flush=True)
-    \\
-    \\asyncio.run(main())
-;
+// The exchange now runs from `../tools/interop.zig` + `../tools/asyncua_driver.py`
+// (`zig build interop-opcua`), and what it records —
+// `testdata/asyncua_transcript.txt` — is replayed byte-for-byte by
+// `asyncua_replay.zig`, in the lane that runs everywhere. Only the live program
+// can find a NEW divergence; only the replay runs without asyncua installed.
+//
+// The `podman`/open62541 tests above and below are a different question and
+// stay: a container running a third-party SERVER is a live PEER, not a foreign
+// toolchain, and `live` in `build.zig`'s `module_list` is where that is
+// answered.
 
 /// Spawn `argv` and collect its output. `runPodman`'s generalisation — the
-/// Python driver is not a container, but the plumbing is the same.
+/// `openssl` invocations below stage a throwaway key pair for the open62541
+/// container rather than running in one, but the plumbing is the same.
 fn runProcess(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !PodmanResult {
     var child = std.process.spawn(io, .{
         .argv = argv,
@@ -1948,126 +1816,6 @@ fn runProcess(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) !Pod
         .stdout = stdout,
         .stderr = stderr,
     };
-}
-
-/// The interpreter to drive `asyncua` with: `$OPCUA_PYTHON` if set (point it
-/// at a virtualenv), otherwise whatever `python3` resolves to.
-fn pythonInterpreter() []const u8 {
-    return testkit.getEnv("OPCUA_PYTHON") orelse "python3";
-}
-
-test "LIVE asyncua -> our server: Basic256Sha256 SignAndEncrypt browse/read/write/call/subscribe, Sign + encrypted username, token renewal" {
-    const gpa = testing.allocator;
-    if (builtin.os.tag != .linux) {
-        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE asyncua interop needs Linux.\n", .{});
-        return error.SkipZigTest;
-    }
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const python = pythonInterpreter();
-    {
-        var probe = runProcess(gpa, io, &.{ python, "-c", "import asyncua, cryptography" }) catch {
-            if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE asyncua interop: no usable `{s}` (set OPCUA_PYTHON).\n", .{python});
-            return error.SkipZigTest;
-        };
-        defer probe.deinit(gpa);
-        if (probe.exit_code != 0) {
-            if (verboseSkip()) std.debug.print(
-                "\nSKIPPED: LIVE asyncua interop: `{s}` lacks the `asyncua`/`cryptography` packages (set OPCUA_PYTHON to a venv that has them).\n",
-                .{python},
-            );
-            return error.SkipZigTest;
-        }
-    }
-
-    var driver: Driver = undefined;
-    driver.initWith(gpa, io, .{
-        .secure = true,
-        .port = live_secure_port,
-        .endpoint_url = live_secure_endpoint_url,
-    }) catch |err| {
-        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE asyncua interop cannot bind loopback:{d} ({t}).\n", .{ live_secure_port, err });
-        return error.SkipZigTest;
-    };
-    defer driver.deinit();
-    // A short SecurityToken floor so the renewal leg of the script actually
-    // forces renewals inside a test-sized window (the product default is 60 s).
-    driver.srv.config.security.?.min_token_lifetime_ms = 2_000;
-
-    var ctx: LoopbackCtx = .{ .driver = &driver };
-    const thread = std.Thread.spawn(.{}, secureServeThread, .{&ctx}) catch {
-        if (verboseSkip()) std.debug.print("\nSKIPPED: LIVE asyncua interop cannot spawn a thread.\n", .{});
-        return error.SkipZigTest;
-    };
-
-    var result = runProcess(gpa, io, &.{ python, "-c", asyncua_script }) catch |err| {
-        ctx.client.done.store(true, .release);
-        thread.join();
-        return err;
-    };
-    defer result.deinit(gpa);
-    // ⚠ RAISED HERE AND NOWHERE EARLIER. `runProcess` returns only once the
-    // client process has exited, so this is the first instant at which "the
-    // peer is finished" is a fact rather than a guess — and it is what lets the
-    // serving thread ride out the gaps between the client's four connections
-    // however long a loaded machine makes them.
-    ctx.client.done.store(true, .release);
-    thread.join();
-    driver.dumpCapture("asyncua-basic256sha256");
-
-    if (driver.connections == 0) {
-        if (verboseSkip()) std.debug.print(
-            "\nSKIPPED: LIVE asyncua interop: nothing ever connected to loopback:{d} (port held by another process?).\nstderr: {s}\n",
-            .{ live_secure_port, result.stderr },
-        );
-        return error.SkipZigTest;
-    }
-
-    const logs = result.stdout;
-    const expectations = [_][]const u8{
-        "ZIGLIBS-OK-ENDPOINTS 3 Basic256Sha256|Sign,Basic256Sha256|SignAndEncrypt,None|None_",
-        "ZIGLIBS-OK-CONNECT SignAndEncrypt", // the asymmetric handshake + key derivation agreed
-        "ZIGLIBS-OK-BROWSE", // Browse over signed+encrypted chunks
-        "ZIGLIBS-OK-READ", // Read
-        "ZIGLIBS-OK-WRITE 31337", // Write, read back through the same channel
-        "ZIGLIBS-OK-CALL", // Call
-        "ZIGLIBS-OK-SUBSCRIPTION", // CreateSubscription + Publish
-        "ZIGLIBS-OK-SIGN-USERNAME", // Sign mode + RSA-OAEP-encrypted UserNameIdentityToken
-        "ZIGLIBS-OK-RENEWAL 30", // 30 reads across ~30 s with a 10 s token: at least two renewals happened mid-stream
-        "ZIGLIBS-ALL-DONE",
-    };
-    for (expectations) |needle| {
-        if (std.mem.indexOf(u8, logs, needle) == null) {
-            std.debug.print("\nasyncua driver output missing \"{s}\":\nstdout:\n{s}\nstderr:\n{s}\n", .{ needle, logs, result.stderr });
-            return error.TestUnexpectedResult;
-        }
-    }
-    try testing.expectEqual(@as(?u8, 0), result.exit_code);
-    // Four separate connections: endpoint discovery, SignAndEncrypt, Sign,
-    // and the renewal run.
-    try testing.expect(driver.connections >= 4);
-}
-
-fn secureServeThread(ctx: *LoopbackCtx) void {
-    // `vary_value = false`: the write/read-back assertion in the driver script
-    // would race a server that keeps bumping the same node.
-    //
-    // ⭐ The asyncua driver makes FOUR separate connections — endpoint
-    // discovery, SignAndEncrypt, Sign, and the token renewal — and the pauses
-    // between them belong to the machine, not to the protocol. On a loaded host
-    // they outgrew the 3 s idle window, this thread stopped serving before the
-    // renewal run, and the test failed for missing `ZIGLIBS-OK-RENEWAL`. The
-    // flag below is set by the thread that WAITS on the python process, so the
-    // server now outlives its client by construction rather than by luck.
-    ctx.driver.serve(.{
-        .deadline_ms = 120_000,
-        .idle_stop_ms = 3_000,
-        .vary_value = false,
-        .peer_alive = ctx.client.peerAlive(),
-    }) catch {};
-    ctx.done.store(true, .release);
 }
 
 // ── LIVE Basic256Sha256: open62541's stock encrypted client ─────────────────
@@ -2251,8 +1999,8 @@ test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 S
 // the encoder and *opened* by the decoder back to the exact input.
 //
 // The third-party cross-check that these bytes are also *correct* — not just
-// stable — is the live interop above: open62541 and asyncua both speak this
-// framing back to us.
+// stable — is the interop above: open62541 speaks this framing back to us live,
+// and asyncua did too, in the exchange `asyncua_replay.zig` now replays.
 
 /// The nonce pair every symmetric golden derives its keys from. Fixed
 /// constants, not secrets.

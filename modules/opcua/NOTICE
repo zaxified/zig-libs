@@ -36,3 +36,9 @@ Additional black-box oracles used to validate the server's security: Python
 `asyncua` (**LGPL-3.0**) and open62541's stock binaries — both driven as
 processes whose stdout is the assertion, with no source read, built or linked —
 plus `openssl` as a CLI staging a throwaway test key pair.
+
+Since 2026-09-07 the `asyncua` oracle is driven only from OUTSIDE the module, by
+`tools/interop.zig` + `tools/asyncua_driver.py` (`zig build interop-opcua`).
+Neither the interpreter nor the package is needed to build or test this module:
+what ships under `src/` is `testdata/asyncua_transcript.txt`, a recording of the
+bytes that exchange put on the wire, and no asyncua code is contained in it.

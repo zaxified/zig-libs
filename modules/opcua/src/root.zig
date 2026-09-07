@@ -94,6 +94,7 @@ test {
     _ = nodestore;
     _ = server;
     _ = @import("server_interop.zig");
+    _ = @import("asyncua_replay.zig");
 }
 
 // ── F2: Secure Channel (SecurityPolicy#None) ────────────────────────────────

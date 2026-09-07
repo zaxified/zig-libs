@@ -236,21 +236,63 @@ whether a state machine in `root` (client) or `server` (server) uses it.
     login, Browse of the Objects folder, Read/Write of a String NodeId,
     subscription, method Call) run from `docker.io/open62541/open62541` with
     `--network host`; their stdout is the assertion;
-  - *their client → our server, secured*: Python **`asyncua` 2.0.1** (LGPL-3.0,
-    used as a black box — a stock interpreter running a driver script, its
-    stdout is the assertion) generates its own throwaway RSA-2048 certificate
-    and connects at **Basic256Sha256 / SignAndEncrypt**, then browses the
-    Objects folder, reads and writes `ns=1;s=the.answer`, calls a method and
-    receives subscription notifications; it reconnects at **Sign** with a
-    Basic256Sha256-encrypted `UserNameIdentityToken`; and it runs a third
-    connection with a 4 s SecurityToken while reading every 500 ms for 10 s,
-    which forces real mid-stream renewals across the overlap window. Plus
-    open62541's stock `client_encryption`, which picks our SignAndEncrypt
-    endpoint out of `GetEndpoints` on its own;
+  - *their client → our server, secured*: open62541's stock `client_encryption`,
+    which picks our SignAndEncrypt endpoint out of `GetEndpoints` on its own.
+    (The Python `asyncua` half of this used to live here; since 2026-09-07 it is
+    `zig build interop-opcua`, outside the module — see the next bullet.)
   - *our client → their server*: the pre-existing live tests against a real
     `server_ctt`, including Basic256Sha256 Sign and SignAndEncrypt;
   - *our client → our server*: over a real loopback socket, with the server
     driven from a second thread.
+- **Replayed third-party interop, hermetic** (`src/asyncua_replay.zig` over
+  `src/testdata/asyncua_transcript.txt`): the whole recorded Python **`asyncua`
+  2.0.1** exchange, re-executed with **no interpreter, no `asyncua`, no child
+  process and no socket**. asyncua generates its own throwaway RSA-2048
+  certificate and makes seven connections — GetEndpoints at
+  `SecurityPolicy#None` before each secured session, one session at
+  **Basic256Sha256 / SignAndEncrypt** (browse the Objects folder, read and write
+  `ns=1;s=the.answer`, call a method, receive subscription notifications), one
+  at **Sign** with a Basic256Sha256-encrypted `UserNameIdentityToken`, and one
+  holding a 10 s SecurityToken while reading every second for 30 s, which forces
+  real mid-stream renewals across the overlap window. The replay feeds every
+  recorded client datagram back in at its recorded `t=` and requires this server
+  to answer with **exactly the recorded bytes**, then re-derives each
+  connection's SecurityPolicy/SecurityMode, walks the opc.tcp framing of both
+  directions (no `ERR` anywhere, ≥3 `OPN` on the renewal channel), decodes the
+  `GetEndpointsResponse` off the unsecured leg and requires our three endpoints
+  with our own certificate on the secured two, and checks `the.answer` ended at
+  the value asyncua wrote.
+
+  **What makes it replayable** is what the module already had, and nothing was
+  weakened or stubbed to get it: `Server.init` takes the `std.Random` it draws
+  from (one seeded `DefaultCsprng` produces the RSA key pair, the certificate,
+  every nonce, every token id and every AuthenticationToken, in a fixed draw
+  order), and `feed`/`tick` take `now_ms` as a parameter with
+  `wall_clock_epoch` fixing the wall clock's zero. Seed, `start_time` and every
+  `t=` are in the transcript.
+
+  **What the replay cannot carry, and must not be read as covering:**
+  - It cannot discover a NEW divergence. The peer's bytes are frozen at one
+    asyncua release; a change a newer asyncua would refuse passes here.
+  - It cannot tell "we broke interop" from "we changed valid bytes". A
+    different nonce draw or a reordered endpoint list fails it without any real
+    peer having refused anything. A red replay is a summons to re-run
+    `zig build interop-opcua`, not a verdict.
+  - It cannot prove asyncua ACCEPTS what we send — only that we still send what
+    asyncua accepted, which coincide only while the recording is current.
+  - It cannot check what was never bytes on the wire: asyncua's own assertions
+    (it found `the.answer` in the browse, its write read back as 31337, the
+    method echoed, its subscription handler fired, 30 reads survived the
+    renewals) and its exit status were checked when the transcript was taken and
+    are kept in the file as `#` notes because nothing here can re-check them.
+    What IS re-checked is that this server still produces the very bytes those
+    assertions were made about.
+- **Live, outside the module** (`zig build interop-opcua`, needs a Python with
+  `asyncua` + `cryptography`; `-- --capture` rewrites the transcript):
+  `tools/asyncua_driver.py` driving this server for real. It is the only half
+  that can find a new divergence, and it is a pre-release check — the replay is
+  the per-commit one. `zig build check-interop` compiles it on every lane so the
+  instrument cannot rot unnoticed.
 - **Basic256Sha256 goldens** — two families, both in `server_interop.zig`:
   - **Self-derived**, labelled as such: a full asymmetric `OpenSecureChannel`
     message (791 bytes, from a fixed key seed and a fixed OAEP seed, so the
