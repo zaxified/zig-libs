@@ -343,7 +343,7 @@ const module_list = [_]Module{
     .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "chachapoly", .libs = &.{"crypto"} },
     .{ .name = "k256", .libs = &.{"crypto"} },
-    .{ .name = "p256", .libs = &.{ "crypto", "web" }, .test_deps = &.{"testkit"} },
+    .{ .name = "p256", .libs = &.{ "crypto", "web" } },
     .{ .name = "ripemd160", .libs = &.{"crypto"} },
     .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"} },
     .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" } },

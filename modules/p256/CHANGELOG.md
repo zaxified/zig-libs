@@ -18,7 +18,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   x = 1, `NonCanonical` via x = p, an off-curve `(x, y)`, tag 5, and three length errors).
   A corpus guard draws exactly as the harness does and pins 13 non-empty, 6 accepted and
   5 on-curve non-identity points, so a future collapse of the draw fails a test rather
-  than passing quietly.
+  than passing quietly. ⛔ The seed helper is a nine-line COPY of
+  `testkit.fuzz.seedHex` rather than an import, and that is deliberate: putting `testkit`
+  in p256's `test_deps` enrols the module in `zig build check-testonly`, whose 3-deep
+  public-decl walk reaches `P256.scalar` (std's P-256 scalar field) and forces `sqrt`,
+  which is `@compileError("unimplemented")` in `std/crypto/pcurves/common.zig:280`
+  because the group order is 1 mod 4. Measured 2026-09-07 on an unmodified p256 tree with
+  only the `test_deps` line added: `check-testonly` goes from 3 failing probes to 4. The
+  copy carries its own `Smith`-driven anchor test so it cannot silently drift from the
+  shared helper's framing; delete it when p256 stops re-exporting that scalar field.
 
 - **2026-09-06** — Licensing: added `NOTICE` (kind `third-party attribution`). No code
   changed and no behaviour changed — the module has shipped 725 Apache-2.0 Wycheproof

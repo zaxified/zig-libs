@@ -875,11 +875,51 @@ test "SEC1 round-trip (compressed + uncompressed) matches std" {
 // / uncompressed), so the harness biases toward each valid tag with random
 // payload bytes, plus fully random bytes for the tag-rejection path.
 
-/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the SEC1
-/// encodings it is. A corpus entry is not the encoding: `Smith.slice` reads a
-/// little-endian `u32` length first, so a raw point would arrive minus its own
-/// first four octets — which for SEC1 is the tag and three octets of `x`.
-const seedHex = @import("testkit").fuzz.seedHex;
+/// A corpus entry carrying the SEC1 encoding spelled by `h`. A corpus entry is
+/// NOT the encoding: `Smith.slice` reads a little-endian `u32` length first, so
+/// a raw point would arrive minus its own first four octets — which for SEC1 is
+/// the tag and three octets of `x`.
+///
+/// ⛔ This is `testkit.fuzz.seedHex`, copied. `testkit` is the right home for
+/// it and every other module in this burn-down imports it from there — but
+/// putting it in `p256`'s `test_deps` enrols the module in
+/// `zig build check-testonly`, and p256's probe does not compile: the gate's
+/// 3-deep public-decl walk reaches `P256.scalar` (std's P-256 scalar field) and
+/// forces `sqrt`, which is `@compileError("unimplemented")` in
+/// `std/crypto/pcurves/common.zig:280` because the group order is 1 mod 4.
+/// Measured 2026-09-07 on an UNMODIFIED p256 tree with only the `test_deps`
+/// line added: `check-testonly` goes from 3 failing probes to 4. So the choice
+/// was a nine-line copy here or a new red probe in a shared gate, and the copy
+/// is the smaller debt. Delete it the day p256's published surface stops
+/// re-exporting a scalar field std cannot take a square root in.
+fn seedHex(comptime h: []const u8) []const u8 {
+    return &struct {
+        const frame = blk: {
+            if (h.len % 2 != 0) @compileError("odd-length hex seed: " ++ h);
+            @setEvalBranchQuota(@max(1000, 40 * h.len));
+            var out: [h.len / 2]u8 = undefined;
+            _ = std.fmt.hexToBytes(&out, h) catch @compileError("bad hex seed: " ++ h);
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame;
+    }.bytes;
+}
+
+test "seedHex matches testkit.fuzz.seedHex's framing, which is what Smith.slice reads" {
+    // The copy above has to stay byte-identical to the shared helper, and the
+    // only thing that makes that testable without importing it is driving the
+    // real `std.testing.Smith` over the produced seed — the same anchor
+    // `testkit/src/fuzz.zig` carries for the original.
+    const s = seedHex("6f0016000100a5a5");
+    var smith: std.testing.Smith = .{ .in = s };
+    var buf: [64]u8 = undefined;
+    const n = smith.slice(&buf);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x6f, 0x00, 0x16, 0x00, 0x01, 0x00, 0xa5, 0xa5 },
+        buf[0..n],
+    );
+}
 
 /// Real SEC1 encodings, one per decode path and one per typed refusal.
 ///
