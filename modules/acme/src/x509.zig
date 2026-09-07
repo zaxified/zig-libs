@@ -17,6 +17,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Test-only: the corpus format `Smith.slice` actually reads. A corpus entry is
+/// not the frame — the length draw reads a little-endian `u32` first, so a raw
+/// CSR would arrive minus its own first four octets, which for DER means minus
+/// its outer tag. `testkit/src/fuzz.zig` carries the other two hazards.
+const testkit = @import("testkit");
+const seedHex = testkit.fuzz.seedHex;
+
 pub const Es256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
 // ── DER encoding (bottom-up, arena-backed) ──────────────────────────────────
@@ -1083,10 +1090,84 @@ test "certNotAfter: openssl fixture parses to the known epoch" {
     try testing.expectError(error.MalformedCertificate, certNotAfter(testing.allocator, cut));
 }
 
+// ── fuzz: the CSR DER decoder ──────────────────────────────────────────
+//
+// ⚠ This harness used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain -- so `len` was 0 for
+// every input a corpus can carry and `parseCsr` was handed an EMPTY slice while
+// the DER sat unread in `buf`. One `slice` draw reads the corpus entry's own
+// length header and hands the bytes over intact.
+
+/// The DER shapes `parseCsr` must refuse, in the format the length draw reads.
+/// Hand-written because they are structural: a CSR that stops being a
+/// SEQUENCE, one with trailing garbage, one whose version is not 0. Everything
+/// `parseCsr` ACCEPTS is built by `csrDer` below instead -- there is no
+/// captured CSR in this module and a pasted one would freeze a copy of the
+/// encoder rather than track it.
+const csr_reject_seeds = [_][]const u8{
+    seedHex("3000"), // an empty SEQUENCE: nothing inside to read
+    seedHex("300602010030008000"), // version 0, empty subject, then a wrong tag
+    seedHex("3006020101300000"), // version 1: UnsupportedCsr, not Malformed
+    seedHex("31060201003000"), // a SET where the outer SEQUENCE belongs
+    seedHex("30"), // a bare tag with no length
+    seedHex("308501010101"), // a 5-octet length: refused by readElem
+    seedHex("0500"), // ASN.1 NULL: the wrong type entirely
+    seedHex("00"), // one octet
+};
+
+/// The whole corpus: the refusals above, plus the CSRs this decoder ACCEPTS,
+/// which only `csrDer` can produce. Built at run time so the corpus follows the
+/// encoder.
+///
+/// ⭐ The fuzz harness and the corpus guard below both build it from HERE. A
+/// guard measuring a different corpus from the one the harness gets is not a
+/// guard.
+const CsrCorpus = struct {
+    one_store: [4 + 1024]u8 = undefined,
+    two_store: [4 + 1024]u8 = undefined,
+    tampered_store: [4 + 1024]u8 = undefined,
+    truncated_store: [4 + 1024]u8 = undefined,
+    entries: [csr_reject_seeds.len + 4][]const u8 = undefined,
+
+    fn build(self: *CsrCorpus, gpa: Allocator) ![]const []const u8 {
+        @memcpy(self.entries[0..csr_reject_seeds.len], &csr_reject_seeds);
+
+        const one = try csrDer(gpa, testKeyPair(42), &.{"example.com"});
+        defer gpa.free(one);
+        const two = try csrDer(gpa, testKeyPair(43), &.{ "example.com", "www.example.com" });
+        defer gpa.free(two);
+
+        self.entries[csr_reject_seeds.len + 0] = testkit.fuzz.seedInto(&self.one_store, one);
+        self.entries[csr_reject_seeds.len + 1] = testkit.fuzz.seedInto(&self.two_store, two);
+
+        // A structurally perfect CSR whose SAN was edited: the one shape that
+        // reaches the signature check and fails it. No hand-written literal can
+        // stand in for this -- it has to be a real CSR to get that far.
+        var tampered: [1024]u8 = undefined;
+        @memcpy(tampered[0..one.len], one);
+        const at = std.mem.indexOf(u8, tampered[0..one.len], "example").?;
+        tampered[at] ^= 0x01;
+        self.entries[csr_reject_seeds.len + 2] =
+            testkit.fuzz.seedInto(&self.tampered_store, tampered[0..one.len]);
+
+        // Truncated mid-signature: structure walks, then runs off the end.
+        self.entries[csr_reject_seeds.len + 3] =
+            testkit.fuzz.seedInto(&self.truncated_store, one[0 .. one.len - 9]);
+
+        return &self.entries;
+    }
+};
+
+test "fuzz: parseCsr never panics on arbitrary bytes" {
+    var corpus: CsrCorpus = .{};
+    try testing.fuzz({}, fuzzParseCsr, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
 fn fuzzParseCsr(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [1024]u8 = undefined;
+    const len: usize = smith.slice(&buf);
     // The CSR DER decoder (parse-back oracle side of csrDer/the mock CA's
     // finalize path): arbitrary bytes must only ever yield a typed error,
     // never a panic/OOB — and any success must be freed.
@@ -1094,6 +1175,37 @@ fn fuzzParseCsr(_: void, smith: *std.testing.Smith) !void {
     parsed.deinit();
 }
 
-test "fuzz: parseCsr never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseCsr, .{});
+test "corpus: every CSR seed reaches parseCsr, and the SANs recovered are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. The
+    // buffer went 512 → 1024 with it: the two CSRs here measure 232 and 248
+    // octets, so 512 held them, but the margin was about four more domain
+    // names wide and a seed over the buffer reads back EMPTY rather than
+    // large — silently, which is how three harnesses elsewhere in this tree
+    // ended up unable to pass their own module's largest fixture.
+    //
+    // `sans_recovered` is the second number, and it is the one that matters:
+    // `parseCsr` refuses the empty input, so acceptance alone looks
+    // discriminating -- but a corpus of version-0/empty-subject stubs could
+    // still be "accepted" by a future, laxer decoder while recovering no name
+    // at all, and the SAN list is the entire product of this parser.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var sans_recovered: usize = 0;
+    var corpus: CsrCorpus = .{};
+    const entries = try corpus.build(testing.allocator);
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var parsed = parseCsr(testing.allocator, buf[0..len]) catch continue;
+        defer parsed.deinit();
+        accepted += 1;
+        sans_recovered += parsed.sans.len;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    // Measured 2026-09-07: 0 of 12 seeds non-empty, 0 accepted and 0 SANs
+    // recovered before the draw was fixed.
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try testing.expectEqual(@as(usize, 3), sans_recovered);
 }
