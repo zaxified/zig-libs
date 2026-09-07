@@ -57,7 +57,6 @@ iec104 4
 isis 1
 isis-lsdb 2
 isis-spf 1
-jinja 5
 json5 2
 jwe 2
 jwt 3
