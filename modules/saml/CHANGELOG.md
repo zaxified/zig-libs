@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Test-only, no production change: `fuzzParseIdpMetadata`'s corpus comment
+  said the per-octet substitution words were what "one seed here deliberately does not"
+  omit. That was false when it was written — every seed used a bare `testkit.fuzz.seed`,
+  which appends nothing, so the `boolWeighted(1, 3)` draw was `false` on every octet of
+  every seed and the substitution loop had made **0 substitutions** across the whole corpus.
+  A new `seedSubst` builder writes the per-octet words, one seed uses it, and the corpus
+  guard now replays the substitution loop (it did not before, so it was measuring a
+  different computation from the harness) and pins the count at **6**, all on that one seed.
+  The five document seeds still arrive verbatim, which is what a corpus of real documents
+  wants; the pin is what would notice them acquiring a tail and being mangled into
+  something the parser refuses.
+
+
 - **2026-09-07** — Test-only, no production change: both fuzz targets ran one input, and
   the metadata one could not have run its own reference document even with a working draw.
   `fuzzDecodeFields` and `fuzzParseIdpMetadata` each opened `smith.bytes(&buf)` and then

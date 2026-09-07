@@ -3326,17 +3326,40 @@ const idp_metadata =
     "<md:SingleSignOnService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\" Location=\"https://idp.example.org/sso\"/>" ++
     "</md:IDPSSODescriptor></md:EntityDescriptor>";
 
+/// `testkit.fuzz.seed` plus the per-octet words the substitution loop below
+/// reads, so that loop actually EXECUTES on a corpus replay. Bit `i` of `mask`
+/// (repeating every 64 octets) decides whether octet `i` is substituted;
+/// `boolWeighted` accepts only the words 0 and 1, any other value being outside
+/// the two weights and falling back to `false`.
+fn seedSubst(comptime frame: []const u8, comptime mask: u64) []const u8 {
+    return &struct {
+        const tail = blk: {
+            var t: [8 * frame.len]u8 = @splat(0);
+            for (0..frame.len) |i| std.mem.writeInt(u64, t[i * 8 ..][0..8], (mask >> @intCast(i % 64)) & 1, .little);
+            break :blk t;
+        };
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].* ++ tail;
+    }.bytes;
+}
+
 /// Each seed is the document, then the per-octet `boolWeighted(1, 3)` words the
 /// alphabet-substitution loop reads. ⛔ Those words are drawn AFTER the byte
 /// draw, so on a corpus replay they are all `false` unless the seed leaves a
 /// tail — which is what a real document wants (no substitution at all), and
 /// what one seed here deliberately does not.
+///
+/// ⛔ That last clause was FALSE when it was written: every seed used a bare
+/// `testkit.fuzz.seed`, which appends nothing, so the substitution loop had
+/// never executed a single substitution on a replay. The `seedSubst` entry
+/// below makes the sentence true, and the corpus guard pins the count both
+/// ways — 0 substitutions on the five document seeds, so they arrive
+/// unmangled, and a measured non-zero count on the one that asks for them.
 const idp_seeds = [_][]const u8{
     testkit.fuzz.seed(idp_metadata), // the module's own 718-octet document
     testkit.fuzz.seed(idp_metadata[0..400]), // truncated mid-KeyDescriptor
     testkit.fuzz.seed("<md:EntityDescriptor/>"), // well-formed, nothing in it
     testkit.fuzz.seed("<md:EntityDescriptor><md:IDPSSODescriptor>"), // unclosed
-    testkit.fuzz.seed("<<<<>>>>&;!?"), // the alphabet's own punctuation, no structure
+    seedSubst("<<<<>>>>&;!?", 0x0AAA), // the alphabet's own punctuation, and the ONE seed that drives the substitution loop
     testkit.fuzz.seed(""), // the input this target used to run for ever
 };
 
@@ -3367,13 +3390,19 @@ test "corpus: the IdP metadata seeds reach the parser, and the counts are pinned
     // an empty `Metadata`, so acceptance says nothing. Endpoints and certs do.
     var endpoints: usize = 0;
     var certs: usize = 0;
+    // ⛔ The substitution loop is replayed here, not skipped: a guard that
+    // measures a different computation from the harness is not a guard.
+    var substituted: usize = 0;
     for (idp_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [idp_metadata_buf_len]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
         for (buf[0..len]) |*c| {
-            if (smith.boolWeighted(1, 3)) c.* = idp_alphabet[c.* % idp_alphabet.len];
+            if (smith.boolWeighted(1, 3)) {
+                c.* = idp_alphabet[c.* % idp_alphabet.len];
+                substituted += 1;
+            }
         }
         var m = parseIdpMetadata(testing.allocator, buf[0..len]) catch continue;
         defer m.deinit();
@@ -3390,6 +3419,14 @@ test "corpus: the IdP metadata seeds reach the parser, and the counts are pinned
     // empty `Metadata` if the parser accepted it.
     try testing.expectEqual(@as(usize, 1), endpoints);
     try testing.expectEqual(@as(usize, 1), certs);
+    // Measured 2026-09-08: 0 before — the substitution loop had never made a
+    // single substitution on a replay, because every seed used a bare
+    // `testkit.fuzz.seed`, which appends nothing. 6 now, all of them on the one
+    // seed built by `seedSubst`; the five document seeds still arrive verbatim,
+    // which is what a corpus of real documents wants. ⛔ Not `> 0`: the count
+    // is what notices the five document seeds acquiring a tail and being
+    // silently mangled into something the parser refuses.
+    try testing.expectEqual(@as(usize, 6), substituted);
 }
 
 test "decodePostField: base64 wrapped in whitespace decodes (browsers and IdPs both wrap it)" {
