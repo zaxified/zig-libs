@@ -18,6 +18,14 @@
 const std = @import("std");
 const wire = @import("wire.zig");
 
+/// Test-only. `testkit.fuzz.seed` is the corpus format `Smith.slice` actually
+/// reads: it prefixes a little-endian `u32` length, so a raw RDATA handed to a
+/// harness arrives minus its own first four octets. `testkit/src/fuzz.zig`
+/// carries the other two hazards; `vectors` is where the real records live.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+const vectors = @import("oracle_vectors.zig");
+
 pub const ParseError = error{
     Truncated,
     BadRecord,
@@ -512,14 +520,93 @@ test "parseNsec3Param: a salt length that overflows u8 arithmetic is rejected, n
 // `parseTypeBitMap` (via `parseNsec`/`parseNsec3`), so one harness covers the
 // whole file's parsing surface, not just the top-level entry points.
 
+// ⚠ This harness used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain -- so `len` was 0 for
+// every input a corpus can carry and all seven parsers were handed an EMPTY
+// slice while the RDATA sat unread in `buf`.
+//
+// ⛔ The buffer went 256 -> 512 with the fix, and that is not cosmetic: this
+// module's own oracle vectors carry a 264-octet DNSKEY RDATA and a 283-octet
+// RRSIG RDATA, both over the old 256. A seed longer than the buffer does not
+// arrive truncated -- `Smith.slice` falls back to the range minimum and it
+// arrives EMPTY -- so the largest real records the module owns could never have
+// passed through their own harness even after the length draw was fixed.
+
+/// The RDATA shapes these parsers must refuse, in the format the length draw
+/// reads. Everything they ACCEPT is real `ldns-signzone` output and comes from
+/// `oracle_vectors` at run time instead.
+const rdata_reject_seeds = [_][]const u8{
+    seed(""), // the empty RDATA: every parser's shortest refusal
+    seed("\x01\x00\x03"), // a DNSKEY one octet short of its algorithm field
+    seed("\x01\x00\x03\x08"), // a DNSKEY header with no key material
+    seed("\x00\x06\x08\x01\x00\x00\x0e\x10"), // an RRSIG truncated inside its fixed header
+    seed("\x00\x06\x08\x01\x00\x00\x0e\x10\x6b\x36\xec\x80\x69\x55\xb9\x00\x9c\x91"), // an RRSIG whose signer name runs off the end
+    seed("\x00\x06\x08\x01\x00\x00\x0e\x10\x6b\x36\xec\x80\x69\x55\xb9\x00\x9c\x91\xc0\x0c"), // a COMPRESSION POINTER where RFC 4034 §6.2 forbids one
+    seed("\x9c\x91\x08\x02"), // a DS with a zero-length digest
+    seed("\x00\x00\x01"), // a type bit map window with a length and no octets
+    seed("\x00\x21" ++ ("\xff" ** 33)), // a bit-map window claiming 33 octets: over the 32 maximum
+    seed("\x00\x01\x40\x00\x01\x40"), // two windows with a NON-INCREASING window number
+    seed("\x01\x00\x00\x0a\x02\xaa"), // an NSEC3PARAM whose salt is one octet short
+    seed("\x01\x00\x00\x0a\x02\xaa\xbb\x14"), // an NSEC3 whose next-hashed-owner runs off the end
+    seed("\x01" ++ ("\xff" ** 40)), // a long run of 0xff through every parser at once
+    seed(("\x00" ** 300)), // 300 zero octets: over the OLD 256 buffer, on purpose
+};
+
+/// The whole corpus: the refusals above, plus the real DNSKEY, RRSIG, DS and
+/// NSEC3 RDATA the oracle vectors carry.
+///
+/// ⭐ The harness and the guard below both build it from HERE. A guard
+/// measuring a different corpus from the one the harness gets is not a guard --
+/// and this corpus reaches 0 acceptances without the built half, because none
+/// of the literals above is a well-formed record.
+const RdataCorpus = struct {
+    stores: [9][4 + 512]u8 = undefined,
+    entries: [rdata_reject_seeds.len + 9][]const u8 = undefined,
+
+    fn build(self: *RdataCorpus) []const []const u8 {
+        @memcpy(self.entries[0..rdata_reject_seeds.len], &rdata_reject_seeds);
+        var n: usize = rdata_reject_seeds.len;
+        // A DNSKEY and an RRSIG per algorithm family: the RSA pair is the one
+        // that does not fit a 256-octet buffer, and the ECDSA/Ed25519 ones are
+        // what a modern zone actually serves.
+        for ([_]u8{ 8, 13, 15 }) |alg| {
+            const v = for (vectors.verify_vecs) |vec| {
+                if (vec.alg == alg) break vec;
+            } else unreachable;
+            self.entries[n] = testkit.fuzz.seedInto(&self.stores[n - rdata_reject_seeds.len], v.key_rdata);
+            n += 1;
+            self.entries[n] = testkit.fuzz.seedInto(&self.stores[n - rdata_reject_seeds.len], v.rrsig_rdata);
+            n += 1;
+        }
+        self.entries[n] = testkit.fuzz.seedInto(&self.stores[n - rdata_reject_seeds.len], vectors.ds_vecs[0].ds_rdata);
+        n += 1;
+        self.entries[n] = testkit.fuzz.seedInto(&self.stores[n - rdata_reject_seeds.len], vectors.nsec3[0].rdata);
+        n += 1;
+        // ⭐ A real NSEC RDATA. Without it the guard below measured 0 for
+        // `parseNsec`: none of the hand-written refusals is a well-formed NSEC,
+        // and NSEC is the one record type whose RDATA is a NAME followed by a
+        // type bit map, so it is also the only seed that drives
+        // `wire.decodeUncompressedName` through this file.
+        const nsec_vec = for (vectors.verify_vecs) |vec| {
+            if (vec.ty == rr_type.nsec) break vec;
+        } else unreachable;
+        self.entries[n] = testkit.fuzz.seedInto(&self.stores[n - rdata_reject_seeds.len], nsec_vec.records[0]);
+        n += 1;
+        std.debug.assert(n == self.entries.len);
+        return &self.entries;
+    }
+};
+
 test "fuzz: RDATA parsers never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzRdata, .{});
+    var corpus: RdataCorpus = .{};
+    try testing.fuzz({}, fuzzRdata, .{ .corpus = corpus.build() });
 }
 
 fn fuzzRdata(_: void, smith: *std.testing.Smith) !void {
-    var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [512]u8 = undefined;
+    const len: usize = smith.slice(&buf);
     const rdata = buf[0..len];
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -533,5 +620,69 @@ fn fuzzRdata(_: void, smith: *std.testing.Smith) !void {
     _ = parseNsec(gpa, rdata) catch {};
     _ = parseNsec3(rdata) catch {};
     _ = parseNsec3Param(rdata) catch {};
-    _ = keyTag(rdata, smith.value(u8));
+    // ⛔ Not `smith.value(u8)`: a knob drawn AFTER the byte draw reads an
+    // exhausted input and returns the weight minimum, which is 0 -- and
+    // algorithm 0 is the one `keyTag` special-cases nowhere. Sweeping the
+    // registered numbers instead costs seven cheap calls and does not depend on
+    // input that is no longer there.
+    for ([_]u8{ 0, algorithm.rsasha1, algorithm.rsasha256, algorithm.ecdsap256sha256, algorithm.ed25519, 200, 255 }) |alg| {
+        _ = keyTag(rdata, alg);
+    }
+}
+
+test "corpus: every RDATA seed reaches the parsers, and what each accepted is pinned" {
+    // ⭐ Seven parsers, one buffer, and a per-parser count -- because a
+    // single "accepted" total would hide the shape that actually happens here:
+    // `parseTypeBitMap("")` succeeds (an empty bit map is a legal, empty type
+    // set), so a corpus of empty RDATA would already have a non-zero accepted
+    // total while every other parser refused everything. The numbers pinned are
+    // per parser, and the DNSKEY/RRSIG/DS/NSEC3 columns are the ones no empty
+    // or truncated input can produce.
+    var nonempty: usize = 0;
+    var dnskey: usize = 0;
+    var rrsig: usize = 0;
+    var ds: usize = 0;
+    var bitmap: usize = 0;
+    var nsec: usize = 0;
+    var nsec3: usize = 0;
+    var nsec3param: usize = 0;
+    var corpus: RdataCorpus = .{};
+    const entries = corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const raw = buf[0..len];
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const gpa = arena.allocator();
+
+        if (parseDnskey(raw)) |_| dnskey += 1 else |_| {}
+        if (parseRrsig(gpa, raw)) |_| rrsig += 1 else |_| {}
+        if (parseDs(raw)) |_| ds += 1 else |_| {}
+        if (parseTypeBitMap(raw)) |_| bitmap += 1 else |_| {}
+        if (parseNsec(gpa, raw)) |_| nsec += 1 else |_| {}
+        if (parseNsec3(raw)) |_| nsec3 += 1 else |_| {}
+        if (parseNsec3Param(raw)) |_| nsec3param += 1 else |_| {}
+    }
+    // One seed is deliberately the empty RDATA, so it is `len - 1`, not `len`.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    // Measured 2026-09-07: 0 of 22 seeds non-empty before the draw was fixed,
+    // and every parser saw only the empty slice.
+    //
+    // ⚠ Read the DNSKEY and DS columns as what they are: `parseDnskey` needs
+    // only 4 octets and `parseDs` only 4, so 20 of 23 seeds satisfy both and
+    // neither number says much on its own. The four that DO say something are
+    // RRSIG, NSEC, NSEC3 and NSEC3PARAM — each of which needs a real record —
+    // and `parseNsec` measured 0 until a genuine NSEC RDATA was pulled out of
+    // the oracle vectors, because no hand-written refusal is a well-formed one.
+    try testing.expectEqual(@as(usize, 20), dnskey);
+    try testing.expectEqual(@as(usize, 4), rrsig);
+    try testing.expectEqual(@as(usize, 20), ds);
+    try testing.expectEqual(@as(usize, 2), bitmap);
+    try testing.expectEqual(@as(usize, 1), nsec);
+    try testing.expectEqual(@as(usize, 1), nsec3);
+    try testing.expectEqual(@as(usize, 1), nsec3param);
 }

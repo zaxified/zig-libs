@@ -17,6 +17,15 @@ const std = @import("std");
 const rdata = @import("rdata.zig");
 const wire = @import("wire.zig");
 
+/// Test-only. `testkit.fuzz.seed` is the corpus format `Smith.slice` actually
+/// reads: it prefixes a little-endian `u32` length, so a raw owner label handed
+/// to a harness arrives minus its own first four characters.
+/// `testkit/src/fuzz.zig` carries the other two hazards; `vectors` is where the
+/// real `ldns-signzone -n` labels live.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+const vectors = @import("oracle_vectors.zig");
+
 // ── base32hex (RFC 4648 §7) ─────────────────────────────────────────────────
 
 const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
@@ -493,22 +502,80 @@ test "proveDenial: over-limit NSEC3 iterations downgrade to insecure (RFC 9276, 
 // reached with a fuzzed label length/content, not just a single regression
 // value.
 
-test "fuzz: proveDenial never panics on a hostile owner-hash label" {
-    try testing.fuzz({}, fuzzProveDenial, .{});
+// ⚠ This harness used to open with `smith.bytes(&label_buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, label_buf.len)`. `bytes` copies
+// `min(buf.len, in.len)` octets and the ranged draw then reads EIGHT more as a
+// little-endian u64, returning the range minimum when fewer remain -- so
+// `label_len` was 0 for every input a corpus can carry, and `proveDenial` ran
+// against a single NSEC3 record with a ZERO-LENGTH owner label, for ever.
+//
+// ⛔ The alphabet fixup below it was dead for the same reason, one step
+// worse. `smith.boolWeighted(1, 3)` came after the byte draw, so it read an
+// exhausted input and returned false every time -- and its own comment says it
+// exists "to actually reach `decode` (arbitrary bytes mostly just bounce off
+// `decodeChar`'s `else`)". The mapping that was there to make the base32hex
+// decoder reachable had never run once, on top of a label that was empty
+// anyway. Both halves of the thing this harness is named after were off.
+//
+// A knob drawn after the byte draw cannot be revived by a corpus, so there is
+// no knob now: every seed is run BOTH ways -- verbatim, and with each octet
+// folded into the base32hex alphabet -- which is strictly more than the
+// weighted coin ever offered and does not depend on input that is gone.
+
+/// Owner-hash labels, in the format the length draw reads. The real ones come
+/// from `oracle_vectors` at run time; these are the shapes a hostile responder
+/// supplies.
+const label_reject_seeds = [_][]const u8{
+    seed(""), // the empty label: what the collapsed harness ran for ever
+    seed("0"), // one base32hex character
+    seed("0123456789ABCDEFGHIJKLMNOPQRSTUV"), // 32 in-alphabet characters: the right LENGTH for a SHA-1 hash
+    seed("0123456789abcdefghijklmnopqrstuv"), // the same, lowercase
+    seed("0123456789ABCDEFGHIJKLMNOPQRSTU"), // one character short
+    seed("0123456789ABCDEFGHIJKLMNOPQRSTUVW"), // one character long
+    seed("0123456789ABCDEFGHIJKLMNOPQRSTU="), // padding, which base32hex here does not take
+    seed("!@#$%^&*()"), // entirely outside the alphabet
+    seed("0123456789ABCDEFGHIJKLMNOPQRST\xff\xfe"), // in-alphabet with two high bytes at the end
+    seed("A" ** 63), // a label at the DNS maximum
+    seed("A" ** 64), // one over the DNS maximum
+    seed("A" ** 200), // ⭐ far over `decodeOwnerHash`'s fixed [64]u8 scratch buffer: the shape of the fixed regression above
+    seed("\x00" ** 32), // 32 NULs
+};
+
+/// The whole corpus: the shapes above, plus the real owner labels
+/// `ldns-signzone -n` produced for this module's oracle zones.
+///
+/// ⭐ The harness and the guard below both build it from HERE. A guard
+/// measuring a different corpus from the one the harness gets is not a guard.
+const LabelCorpus = struct {
+    stores: [4][4 + 256]u8 = undefined,
+    entries: [label_reject_seeds.len + 4][]const u8 = undefined,
+
+    fn build(self: *LabelCorpus) []const []const u8 {
+        @memcpy(self.entries[0..label_reject_seeds.len], &label_reject_seeds);
+        self.entries[label_reject_seeds.len + 0] =
+            testkit.fuzz.seedInto(&self.stores[0], vectors.nsec3[0].label);
+        self.entries[label_reject_seeds.len + 1] =
+            testkit.fuzz.seedInto(&self.stores[1], vectors.nsec3[vectors.nsec3.len - 1].label);
+        self.entries[label_reject_seeds.len + 2] =
+            testkit.fuzz.seedInto(&self.stores[2], vectors.nsec3opt[0].label);
+        self.entries[label_reject_seeds.len + 3] =
+            testkit.fuzz.seedInto(&self.stores[3], vectors.nsec3opt[vectors.nsec3opt.len - 1].label);
+        return &self.entries;
+    }
+};
+
+/// The base32hex alphabet fold, applied to a whole label. Kept as a function so
+/// the harness and its guard cannot drift apart on it.
+fn foldToBase32Hex(bytes: []u8) void {
+    for (bytes) |*c| c.* = "0123456789ABCDEFGHIJKLMNOPQRSTUV"[c.* % 32];
 }
 
-fn fuzzProveDenial(_: void, smith: *std.testing.Smith) !void {
-    var label_buf: [256]u8 = undefined;
-    smith.bytes(&label_buf);
-    const label_len: usize = smith.valueRangeAtMost(u16, 0, label_buf.len);
-    // Keep the alphabet in-range often enough to actually reach `decode`
-    // (arbitrary bytes mostly just bounce off `decodeChar`'s `else`).
-    for (label_buf[0..label_len]) |*c| {
-        if (smith.boolWeighted(1, 3)) c.* = "0123456789ABCDEFGHIJKLMNOPQRSTUV"[c.* % 32];
-    }
-
-    const record: Nsec3Record = .{
-        .owner_hash_label = label_buf[0..label_len],
+/// One NSEC3 record carrying `label`, with the degenerate RDATA the original
+/// harness used: SHA-1, no salt, no iterations, an all-zero next-hashed-owner
+/// and an empty type bit map.
+fn labelRecord(label: []const u8) Nsec3Record {
+    return .{
+        .owner_hash_label = label,
         .rdata = .{
             .hash_algorithm = hash_algorithm_sha1,
             .flags = 0,
@@ -518,6 +585,71 @@ fn fuzzProveDenial(_: void, smith: *std.testing.Smith) !void {
             .types = .{ .raw = "" },
         },
     };
-    const set: Nsec3Set = .{ .records = &[_]Nsec3Record{record} };
-    _ = proveDenial("www.example", 1, set, "", 0);
+}
+
+test "fuzz: proveDenial never panics on a hostile owner-hash label" {
+    var corpus: LabelCorpus = .{};
+    try testing.fuzz({}, fuzzProveDenial, .{ .corpus = corpus.build() });
+}
+
+fn fuzzProveDenial(_: void, smith: *std.testing.Smith) !void {
+    var label_buf: [256]u8 = undefined;
+    const label_len: usize = smith.slice(&label_buf);
+
+    // Verbatim first, then folded into the alphabet — both, every seed, rather
+    // than a coin that reads an exhausted input.
+    {
+        const set: Nsec3Set = .{ .records = &[_]Nsec3Record{labelRecord(label_buf[0..label_len])} };
+        _ = proveDenial("www.example", 1, set, "", 0);
+        var out: [sha1_digest_len]u8 = undefined;
+        _ = decodeOwnerHash(label_buf[0..label_len], &out);
+    }
+    var folded: [256]u8 = undefined;
+    @memcpy(folded[0..label_len], label_buf[0..label_len]);
+    foldToBase32Hex(folded[0..label_len]);
+    {
+        const set: Nsec3Set = .{ .records = &[_]Nsec3Record{labelRecord(folded[0..label_len])} };
+        _ = proveDenial("www.example", 1, set, "", 0);
+        var out: [sha1_digest_len]u8 = undefined;
+        _ = decodeOwnerHash(folded[0..label_len], &out);
+    }
+}
+
+test "corpus: every label seed reaches decodeOwnerHash, and the hashes decoded are pinned" {
+    // ⭐ `proveDenial` returns an ENUM, never an error, so there is no
+    // "accepted" to count at all — every input "succeeds" at returning
+    // `.bogus`, which is exactly the sort of number that reads 100% while the
+    // harness walks nothing. The number that cannot be faked is how many labels
+    // `decodeOwnerHash` actually turned into a 20-octet SHA-1 digest: that is
+    // the base32hex path the dead alphabet fold was supposed to reach.
+    //
+    // Counted twice, verbatim and folded, because the harness runs both and a
+    // guard measuring one of the two would be guarding a different harness.
+    var nonempty: usize = 0;
+    var decoded_verbatim: usize = 0;
+    var decoded_folded: usize = 0;
+    var corpus: LabelCorpus = .{};
+    const entries = corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var label_buf: [256]u8 = undefined;
+        const label_len: usize = smith.slice(&label_buf);
+        if (label_len != 0) nonempty += 1;
+        var out: [sha1_digest_len]u8 = undefined;
+        if (decodeOwnerHash(label_buf[0..label_len], &out) != null) decoded_verbatim += 1;
+        var folded: [256]u8 = undefined;
+        @memcpy(folded[0..label_len], label_buf[0..label_len]);
+        foldToBase32Hex(folded[0..label_len]);
+        if (decodeOwnerHash(folded[0..label_len], &out) != null) decoded_folded += 1;
+    }
+    // One seed is deliberately the empty label.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    // Measured 2026-09-07: 0 of 17 seeds non-empty and 0 hashes decoded before
+    // the draw was fixed — `label_len` was 0 and the alphabet fold, which the
+    // original comment says exists so `decode` is reached at all, never ran.
+    try testing.expectEqual(@as(usize, 6), decoded_verbatim);
+    // ⭐ 10 against 6: folding into the alphabet turns four more seeds into a
+    // real digest, which is the size of what the dead `boolWeighted` knob was
+    // supposed to be buying and never bought once.
+    try testing.expectEqual(@as(usize, 10), decoded_folded);
 }
