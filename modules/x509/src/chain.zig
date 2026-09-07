@@ -1292,15 +1292,94 @@ pub fn verifyPssLink(subject_der: CertDer, issuer_pub_key: rsa.PublicKey, now_se
 // It is still exercised mainly through the higher-level chain tests.
 const testing = std.testing;
 
+// ⚠ This harness used to open with
+//
+//     smith.bytes(&buf);
+//     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+//
+// which reads the input and throws it away: `bytes` consumes
+// `@min(buf.len, in.len)` octets and the ranged draw then finds fewer than the
+// eight it reads as a little-endian u64, so `len` was 0 on every input. With
+// no corpus the lane ran exactly one round: `parsePssParams("")`, refused at
+// the first tag. Not one `RSASSA-PSS-params` structure had ever gone through
+// it, which for a four-field all-OPTIONAL-with-DEFAULTS grammar is the whole
+// point of the function.
+const testkit = @import("testkit");
+
+/// RFC 4055 §3.1 `RSASSA-PSS-params`, the encodings this module's own tests
+/// build. Arbitrary bytes reach none of these: every field is a context tag
+/// wrapping a nested AlgorithmIdentifier whose OID has to match.
+const pss_seeds = [_][]const u8{
+    // All fields omitted: the defaults (sha1, MGF1-sha1, salt 20).
+    testkit.fuzz.seedHex("3000"),
+    // openssl's own sha256 / MGF1-sha256 / saltLength 32 encoding.
+    testkit.fuzz.seedHex(
+        "3030a00d300b0609608648016503040201" ++
+            "a11a301806092a864886f70d010108300b0609608648016503040201" ++
+            "a203020120",
+    ),
+    // sha384 / MGF1-sha384, saltLength left to its default of 20.
+    testkit.fuzz.seedHex(
+        "302ba00d300b0609608648016503040202" ++
+            "a11a301806092a864886f70d010108300b0609608648016503040202",
+    ),
+    // saltLength alone: every other field defaults.
+    testkit.fuzz.seedHex("3005a203020140"),
+    // hashAlgorithm sha256 with an MGF1 inner hash of sha1 — the mismatch this
+    // module documents as `error.UnsupportedPssParams` rather than verifying.
+    testkit.fuzz.seedHex(
+        "3027a00d300b0609608648016503040201" ++
+            "a116301406092a864886f70d010108300706052b0e03021a",
+    ),
+    // trailerField = 2, which RFC 4055 does not define.
+    testkit.fuzz.seedHex("3005a303020102"),
+    // The outer SEQUENCE claims one octet more than it has.
+    testkit.fuzz.seedHex("3006a203020120"),
+    // An ASN.1 NULL where a SEQUENCE belongs — the shape a certificate that
+    // says PSS but carries RSA-PKCS#1 parameters presents.
+    testkit.fuzz.seedHex("0500"),
+    // The one input this target actually ran, for ever.
+    testkit.fuzz.seed(""),
+};
+
 test "fuzz: parsePssParams never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzPssParams, .{});
+    try testing.fuzz({}, fuzzPssParams, .{ .corpus = &pss_seeds });
 }
 
 fn fuzzPssParams(_: void, smith: *std.testing.Smith) !void {
+    // 256 against a 60-octet longest real encoding.
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
+    const len: usize = smith.slice(&buf);
     _ = parsePssParams(buf[0..len]) catch {};
+}
+
+test "corpus: the parsePssParams seeds reach the parser, counts pinned" {
+    // The second number is how many DISTINCT salt lengths came back. Every
+    // field of this structure has a DEFAULT, so a parse that walked nothing
+    // still returns `salt_len = 20` — an accepted count cannot tell a seed
+    // that carried an explicit `saltLength` from one that carried nothing.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var salts: [8]usize = undefined;
+    var n_salts: usize = 0;
+    for (pss_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const p = parsePssParams(buf[0..len]) catch continue;
+        accepted += 1;
+        for (salts[0..n_salts]) |s| {
+            if (s == p.salt_len) break;
+        } else {
+            salts[n_salts] = p.salt_len;
+            n_salts += 1;
+        }
+    }
+    try testing.expectEqual(pss_seeds.len - 1, nonempty); // all but seed("")
+    try testing.expectEqual(@as(usize, 4), accepted);
+    try testing.expectEqual(@as(usize, 3), n_salts);
 }
 
 test {

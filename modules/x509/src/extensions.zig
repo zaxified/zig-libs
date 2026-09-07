@@ -679,14 +679,88 @@ test "nameConstraints: permitted dNSName subtree" {
 // exactly what makes it a self-contained, fuzz-safe target: no std parser
 // sits in front of it.
 
+// ⚠ This harness used to open with
+//
+//     smith.bytes(&buf);
+//     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+//
+// which reads the input and throws it away: `bytes` consumes
+// `@min(buf.len, in.len)` octets and the ranged draw then finds fewer than the
+// eight it reads as a little-endian u64, so `len` was 0 on every input. With
+// no corpus, the lane ran exactly one round for ever, on the EMPTY slice —
+// `findExtensions` fails at the outer tag, and every parser in Shape 2 was
+// handed `""`. Not one certificate and not one extension value had ever
+// reached this file's DER walk under fuzz.
+//
+// ⛔ The buffer was 768 octets and this module's own certificate fixtures run
+// to 920 (`inter_pss`). Shape 1 treats the whole buffer as a certificate, so
+// no real certificate could have gone through it even with the draw fixed — a
+// seed longer than the buffer reads back EMPTY, silently.
+const testkit = @import("testkit");
+const fixtures = @import("fixtures_test.zig");
+
+/// The buffer, sized against this module's largest own certificate fixture
+/// (920 octets) rather than against a round number.
+const fuzz_buf_bytes = 1024;
+
+/// Bare `extnValue` contents — the shape Shape 2 feeds each parser directly.
+/// These are what the extension parsers actually receive in production, and
+/// none of them is reachable from drawn bytes: each is a tagged, nested,
+/// length-prefixed structure.
+const extension_value_seeds = [_][]const u8{
+    testkit.fuzz.seedHex("30060101ff020100"), // basicConstraints CA=TRUE, pathLen 0
+    testkit.fuzz.seedHex("3000"), // basicConstraints, all defaults
+    testkit.fuzz.seedHex("030205a0"), // keyUsage: digitalSignature|keyEncipherment
+    testkit.fuzz.seedHex("03020780"), // keyUsage: one bit, seven unused
+    testkit.fuzz.seedHex("30140603551d25"), // a truncated extKeyUsage SEQUENCE
+    testkit.fuzz.seedHex("301406082b06010505070301"), // extKeyUsage serverAuth
+    testkit.fuzz.seedHex("301406082b06010505070302"), // extKeyUsage clientAuth
+    testkit.fuzz.seedHex("0414000102030405060708090a0b0c0d0e0f10111213"), // SKI, 20 octets
+    testkit.fuzz.seedHex("3016801400010203040506708090a0b0c0d0e0f1011121"), // AKI keyIdentifier
+    testkit.fuzz.seedHex("300ca00a3008820663612e636f6d"), // nameConstraints, permitted dNSName
+    testkit.fuzz.seedHex("300ca10a3008820663612e636f6d"), // nameConstraints, excluded dNSName
+    testkit.fuzz.seedHex("300aa0083006820463612e"), // a subtree whose inner length lies
+    testkit.fuzz.seedHex("0101ff"), // a bare BOOLEAN where a SEQUENCE belongs
+    testkit.fuzz.seed(""), // the one input this target ran, for ever
+};
+
+/// The whole corpus: the values above, plus every certificate this module owns
+/// as a byte literal. Shape 1 walks the certificate all the way to the
+/// extensions block, which is the part no `extnValue` seed can reach.
+const CertCorpus = struct {
+    const certs = [_][]const u8{
+        &fixtures.leaf_rsa,
+        &fixtures.inter_rsa,
+        &fixtures.root_rsa,
+        &fixtures.leaf_ec256,
+        &fixtures.leaf_ed,
+        &fixtures.inter_pss, // 920 octets: the largest, and the buffer's reason
+        &fixtures.leaf_pl,
+        &fixtures.leaf_si,
+    };
+
+    stores: [certs.len][4 + fuzz_buf_bytes]u8 = undefined,
+    entries: [certs.len + extension_value_seeds.len][]const u8 = undefined,
+
+    fn build(self: *CertCorpus) []const []const u8 {
+        for (certs, 0..) |c, i| {
+            std.debug.assert(c.len <= fuzz_buf_bytes);
+            self.entries[i] = testkit.fuzz.seedInto(&self.stores[i], c);
+        }
+        @memcpy(self.entries[certs.len..], &extension_value_seeds);
+        return &self.entries;
+    }
+};
+
 test "fuzz: findExtensions + all extension-value parsers never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzExtensions, .{});
+    var corpus: CertCorpus = .{};
+    try testing.fuzz({}, fuzzExtensions, .{ .corpus = corpus.build() });
 }
 
 fn fuzzExtensions(_: void, smith: *std.testing.Smith) !void {
-    var buf: [768]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [fuzz_buf_bytes]u8 = undefined;
+    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
 
     // Shape 1: the whole buffer as a "certificate" — exercises
@@ -736,4 +810,43 @@ fn fuzzExtensions(_: void, smith: *std.testing.Smith) !void {
             while (sit.next() catch null) |_| {}
         }
     }
+}
+
+test "corpus: the extension seeds reach the DER walk, and the counts are pinned" {
+    // ⛔ The number that matters is `walked` — extension ENTRIES yielded by
+    // `iterate` after `findExtensions` reached the block. `findExtensions`
+    // returning `null` is a legal answer (a certificate with no extensions),
+    // so "it did not error" says nothing; and the one input this target ran
+    // for ever, the empty slice, produces exactly zero of these.
+    var corpus: CertCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var with_extensions: usize = 0;
+    var walked: usize = 0;
+    var parsed_values: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [fuzz_buf_bytes]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const cert: Certificate = .{ .buffer = buf[0..len], .index = 0 };
+        if (findExtensions(cert) catch null) |ext_slice| {
+            with_extensions += 1;
+            var it = iterate(ext_slice, cert);
+            while (it.next() catch null) |_| walked += 1;
+        }
+        // And the bare-`extnValue` shape: how many of the seeds are a value
+        // one of the parsers accepts outright.
+        if (parseBasicConstraints(buf[0..len])) |_| {
+            parsed_values += 1;
+        } else |_| if (parseKeyUsage(buf[0..len])) |_| {
+            parsed_values += 1;
+        } else |_| if (parseSubjectKeyIdentifier(buf[0..len])) |_| {
+            parsed_values += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len - 1, nonempty); // all but seed("")
+    try testing.expectEqual(@as(usize, 8), with_extensions);
+    try testing.expectEqual(@as(usize, 35), walked);
+    try testing.expectEqual(@as(usize, 15), parsed_values);
 }

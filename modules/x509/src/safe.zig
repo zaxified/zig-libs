@@ -880,39 +880,180 @@ test "spkiOf: a BIT STRING with unused bits is rejected rather than silently tru
     try testing.expectError(error.MalformedSubjectPublicKeyInfo, spkiOf(mutant));
 }
 
-test "fuzz: arbitrary bytes through spkiOf never panic" {
-    try testing.fuzz({}, struct {
-        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
-            var buf: [1024]u8 = undefined;
-            smith.bytes(&buf);
-            const n: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-            if (spkiOf(buf[0..n])) |spki| {
-                _ = spki.namedCurveOid();
-                _ = spki.algorithmIs(&oid_rsa_encryption);
-                _ = rsa.PublicKey.fromDer(spki.der) catch {};
-                _ = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(spki.key_bits) catch {};
-            } else |_| {}
+// ── fuzz ────────────────────────────────────────────────────────────────────
+//
+// ⚠ Both harnesses below used to open with
+//
+//     smith.bytes(&buf);
+//     const n: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+//
+// which reads the input and throws it away: `bytes` consumes
+// `@min(buf.len, in.len)` octets and the ranged draw then finds fewer than the
+// eight it reads as a little-endian u64, so `n` was the range MINIMUM — 0 — on
+// every input. With no corpus the lane ran one round each, for ever, on the
+// EMPTY slice: `spkiOf("")` and `validate("")`, both `error.Empty` before a
+// single header is decoded. This module exists to stand between untrusted DER
+// and `std.crypto.Certificate.parse`, and no certificate had ever gone through
+// either target.
+//
+// ⛔ Both were also written as inline `struct { fn … }` literals, which is why
+// `scripts/check-fuzz-reach.py` reported them UNJUDGED rather than collapsed:
+// it matches a named target function. Same defect, invisible to the gate.
+// They are named functions now, so the gate can see them.
+//
+// ⛔ And the buffers were 1024 against a `max_certificate_len` of 8192. A seed
+// longer than the buffer reads back EMPTY, so no certificate over 1 KB could
+// pass through — including every post-quantum certificate in `data/` (4 to 8
+// KB) and, structurally, any certificate at all in the 1 KB…8 KB range that
+// `safeCertificate` is specified to accept. The `n <= max_certificate_len`
+// branch below was therefore also constant-true, so the over-length refusal
+// had never run either. Both buffers are now `max_certificate_len +
+// parse_slack`, which makes both sides of that branch reachable.
+
+const fuzz_buf_bytes = max_certificate_len + parse_slack;
+const testkit = @import("testkit");
+
+/// Certificates this module owns, as seeds. The byte-literal fixtures span
+/// RSA/PSS/EC/Ed25519 and 356…920 octets; the two `@embedFile`d PQ
+/// certificates take the corpus past 4 KB and up to the `max_certificate_len`
+/// boundary, which no seed could previously reach.
+const CertCorpus = struct {
+    const mldsa44_leaf = @embedFile("data/leaf_mldsa44.der"); // 4064
+    const slh_inter = @embedFile("data/inter_slh_sha2_128s.der"); // 8186
+    const certs = [_][]const u8{
+        &fixtures.leaf_rsa,
+        &fixtures.inter_rsa,
+        &fixtures.root_rsa,
+        &fixtures.leaf_pss,
+        &fixtures.leaf_ec256,
+        &fixtures.leaf_ec384,
+        &fixtures.leaf_ed,
+        &fixtures.leaf_rsa_tampered, // signature bytes changed; still parses
+        mldsa44_leaf,
+        slh_inter, // 8186 of a max_certificate_len of 8192
+    };
+
+    /// The refusals, which no fixture carries: a truncated header, a length
+    /// that overruns, a non-SEQUENCE, and the empty input both targets ran for
+    /// ever.
+    const literals = [_][]const u8{
+        testkit.fuzz.seedHex("30"),
+        testkit.fuzz.seedHex("3082ffff"),
+        testkit.fuzz.seedHex("0500"),
+        testkit.fuzz.seedHex("308200023000"),
+        testkit.fuzz.seed(""),
+    };
+
+    stores: [certs.len][4 + fuzz_buf_bytes]u8 = undefined,
+    /// One more entry: the largest fixture with its outer length octet moved
+    /// on by one, so validation fails deep rather than at the first header.
+    mutant: [fuzz_buf_bytes]u8 = undefined,
+    mutant_store: [4 + fuzz_buf_bytes]u8 = undefined,
+    entries: [certs.len + 1 + literals.len][]const u8 = undefined,
+
+    fn build(self: *CertCorpus) []const []const u8 {
+        for (certs, 0..) |c, i| {
+            std.debug.assert(c.len <= fuzz_buf_bytes);
+            self.entries[i] = testkit.fuzz.seedInto(&self.stores[i], c);
         }
-    }.run, .{});
+        @memcpy(self.mutant[0..fixtures.leaf_rsa.len], &fixtures.leaf_rsa);
+        self.mutant[3] +%= 1; // the outer SEQUENCE's low length octet
+        self.entries[certs.len] =
+            testkit.fuzz.seedInto(&self.mutant_store, self.mutant[0..fixtures.leaf_rsa.len]);
+        @memcpy(self.entries[certs.len + 1 ..], &literals);
+        return &self.entries;
+    }
+};
+
+fn fuzzSpkiOf(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [fuzz_buf_bytes]u8 = undefined;
+    // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
+    const n: usize = smith.slice(&buf);
+    if (spkiOf(buf[0..n])) |spki| {
+        _ = spki.namedCurveOid();
+        _ = spki.algorithmIs(&oid_rsa_encryption);
+        _ = rsa.PublicKey.fromDer(spki.der) catch {};
+        _ = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(spki.key_bits) catch {};
+    } else |_| {}
+}
+
+test "fuzz: arbitrary bytes through spkiOf never panic" {
+    var corpus: CertCorpus = .{};
+    try testing.fuzz({}, fuzzSpkiOf, .{ .corpus = corpus.build() });
+}
+
+test "corpus: the spkiOf seeds reach the parser, and the counts are pinned" {
+    // The second number is `keys`: SPKIs from which a usable RSA or P-256
+    // public key actually came back. `spkiOf` succeeding only says the DER
+    // walk found a SubjectPublicKeyInfo-shaped field; `keys` says a seed's own
+    // octets reached a key decoder, which the empty input never did.
+    var corpus: CertCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var keys: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [fuzz_buf_bytes]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        const spki = spkiOf(buf[0..n]) catch continue;
+        accepted += 1;
+        if (rsa.PublicKey.fromDer(spki.der)) |_| {
+            keys += 1;
+        } else |_| if (std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(spki.key_bits)) |_| {
+            keys += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len - 1, nonempty); // all but seed("")
+    try testing.expectEqual(@as(usize, 10), accepted);
+    try testing.expectEqual(@as(usize, 6), keys);
+}
+
+fn fuzzValidateAndSafeParse(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [fuzz_buf_bytes]u8 = undefined;
+    const n: usize = smith.slice(&buf);
+    const input = buf[0..n];
+    // The validator must be total on arbitrary bytes.
+    validate(input) catch {};
+    validateCertificate(input) catch {};
+    // And the safe parser: validate → pad → parse, never a crash. The buffer
+    // is `max_certificate_len + parse_slack`, so this branch is a real test
+    // rather than the constant-true it was against a 1024-octet buffer.
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    if (n <= max_certificate_len) {
+        if (safeCertificate(input, &scratch)) |cert| {
+            if (cert.parse()) |_| {} else |_| {}
+        } else |_| {}
+    }
 }
 
 test "fuzz: arbitrary bytes through the validator and the safe parser never panic" {
-    try testing.fuzz({}, struct {
-        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
-            var buf: [1024]u8 = undefined;
-            smith.bytes(&buf);
-            const n: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-            const input = buf[0..n];
-            // The validator must be total on arbitrary bytes.
-            validate(input) catch {};
-            validateCertificate(input) catch {};
-            // And the safe parser: validate → pad → parse, never a crash.
-            var scratch: [max_certificate_len + parse_slack]u8 = undefined;
-            if (n <= max_certificate_len) {
-                if (safeCertificate(input, &scratch)) |cert| {
-                    if (cert.parse()) |_| {} else |_| {}
-                } else |_| {}
-            }
-        }
-    }.run, .{});
+    var corpus: CertCorpus = .{};
+    try testing.fuzz({}, fuzzValidateAndSafeParse, .{ .corpus = corpus.build() });
+}
+
+test "corpus: the validator seeds reach safeCertificate, and the counts are pinned" {
+    // `parsed` — certificates that came out the far end of
+    // `safeCertificate` + `std.crypto.Certificate.parse` — is the number this
+    // module exists for. It was 0: the one input the target ran was `""`.
+    var corpus: CertCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var validated: usize = 0;
+    var parsed: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [fuzz_buf_bytes]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        if (validateCertificate(buf[0..n])) |_| validated += 1 else |_| {}
+        var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+        const cert = safeCertificate(buf[0..n], &scratch) catch continue;
+        _ = cert.parse() catch continue;
+        parsed += 1;
+    }
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 11), validated);
+    try testing.expectEqual(@as(usize, 8), parsed);
 }

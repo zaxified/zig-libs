@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — All **four** fuzz targets in this module had run exactly one input each,
+  for ever, and that input was the empty slice. Each drew `smith.bytes(&buf)` and then a
+  ranged length, which returns the range minimum when fewer than eight input octets remain,
+  so the length was 0; with no corpus the lane replays one round on `in = ""`. So
+  `parsePssParams("")`, `findExtensions` on an empty buffer, `spkiOf("")` and `validate("")`
+  were the entire fuzz coverage of this module — the one that exists to stand between
+  untrusted DER and `std.crypto.Certificate.parse`. ⛔ Two of the four (in `safe.zig`) were
+  written as inline `struct { fn … }` literals, which is why `check-fuzz-reach` reported
+  them UNJUDGED rather than collapsed; they are named functions now so the gate can judge
+  them. ⛔ Three buffers were also too small for this module's own artifacts:
+  `fuzzExtensions` held 768 octets against a 920-octet `inter_pss` fixture — Shape 1 treats
+  the whole buffer as a certificate, so no real certificate could have gone through it — and
+  both `safe.zig` targets held 1024 against a `max_certificate_len` of 8192, which put every
+  post-quantum certificate in `data/` (4–8 KB) out of reach and made the
+  `n <= max_certificate_len` branch constant-true, so the over-length refusal had never run.
+  Every target now draws with one `smith.slice` into a buffer sized against the module's own
+  largest artifact, and carries a corpus: the RFC 4055 PSS parameter encodings this module's
+  tests build, the byte-literal certificate fixtures, bare `extnValue` contents, and two
+  `@embedFile`d PQ certificates (4064 and 8186 octets). Measured, before → after in
+  non-empty seeds reaching the parser: 0 → 8/9, 0 → 21/22, 0 → 15/16, 0 → 15/16. Accepted
+  and the second pinned number: PSS 4 accepted over **3** distinct salt lengths (every field
+  of that structure has a DEFAULT, so a parse that walked nothing still returns
+  `salt_len = 20`); extensions 8 certificates with an extensions block, **35** extension
+  entries walked and 15 `extnValue`s parsed; `spkiOf` 10 accepted yielding **6** usable RSA
+  or P-256 public keys; the validator 11 accepted with **8** certificates coming out of
+  `safeCertificate` + `Certificate.parse`.
+
 - **2026-09-01** — **Security audit: the DER guard did not guard, in three
   separate ways.** `safe.zig` advertised `safeCertificate` as returning a
   certificate "safe to hand to `std.crypto.Certificate.parse` without any risk

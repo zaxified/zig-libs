@@ -264,7 +264,7 @@ const module_list = [_]Module{
     .{ .name = "stun", .libs = &.{"net"}, .deps = &.{"netaddr"} },
     .{ .name = "opcua", .libs = &.{"net"}, .deps = &.{ "rsa", "x509" }, .test_deps = &.{"testkit"}, .heavy = true, .live = true },
     .{ .name = "noise", .libs = &.{"crypto"}, .deps = &.{"chachapoly"} },
-    .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa" } },
+    .{ .name = "x509", .libs = &.{ "crypto", "net" }, .deps = &.{ "rsa", "slhdsa" }, .test_deps = &.{"testkit"} },
     .{ .name = "ocsp", .libs = &.{"crypto"}, .deps = &.{ "x509", "rsa", "p256" }, .heavy = true },
     .{ .name = "ocspcache", .libs = &.{"crypto"}, .deps = &.{ "ocsp", "http", "x509" } },
     .{ .name = "dnssec", .libs = &.{"net"}, .deps = &.{ "dns", "rsa" } },
