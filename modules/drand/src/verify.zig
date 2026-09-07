@@ -665,13 +665,13 @@ fn fuzzVerifyRound(_: void, smith: *std.testing.Smith) !void {
     try checkFixture(Choices.fromBytes(raw[0..n]));
 }
 
-/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`:
-/// a little-endian u32 length, then the bytes. Static memory.
-fn fuzzSeed(comptime bytes: []const u8) []const u8 {
-    return &struct {
-        const b = std.mem.toBytes(@as(u32, @intCast(bytes.len))) ++ bytes[0..bytes.len].*;
-    }.b;
-}
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. Was a local copy in every file that needed it -- 33 across 12
+/// modules in three shapes -- each with its own note about the same trap (the
+/// array has to be container-level or the returned slice dangles with the RIGHT
+/// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
+/// that drive the real `std.testing.Smith` over what it produces.
+const fuzzSeed = @import("testkit").fuzz.seed;
 
 const drand_seeds = [_][]const u8{
     fuzzSeed(&.{}), // intact

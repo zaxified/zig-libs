@@ -654,16 +654,13 @@ test "a valid small array round trips through skipValue" {
     try testing.expectEqual(w, try valueLen(buf[0..w]));
 }
 
-/// Writes `frame` into `out` behind the little-endian u32 length header that
-/// `Smith.slice` reads before it copies anything, and returns the seed. Built
-/// at run time rather than as a hex literal because the corpus below comes out
-/// of this module's own encoders — a hand-written stream would be a guess about
-/// the format the encoder defines.
-fn fuzzSeedInto(out: []u8, frame: []const u8) []const u8 {
-    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
-    @memcpy(out[4..][0..frame.len], frame);
-    return out[0 .. 4 + frame.len];
-}
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. Was a local copy in every file that needed it -- 33 across 12
+/// modules in three shapes -- each with its own note about the same trap (the
+/// array has to be container-level or the returned slice dangles with the RIGHT
+/// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
+/// that drive the real `std.testing.Smith` over what it produces.
+const fuzzSeedInto = @import("testkit").fuzz.seedInto;
 
 test "fuzz: value walker never panics or hangs" {
     var raw: [6][256]u8 = undefined;

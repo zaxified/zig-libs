@@ -1521,14 +1521,13 @@ test "F6: build's tag scratch buffer is sized per sealer, not always rsa.max_mod
     try testing.expectEqual(@as(usize, 10), r.tag.len);
 }
 
-/// Writes `frame` into `out` behind the little-endian u32 length header that
-/// `Smith.slice` reads before it copies anything, and returns the seed. Built
-/// at run time because the corpus below comes from this module's own encoders.
-fn fuzzSeedInto(out: []u8, frame: []const u8) []const u8 {
-    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
-    @memcpy(out[4..][0..frame.len], frame);
-    return out[0 .. 4 + frame.len];
-}
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. Was a local copy in every file that needed it -- 33 across 12
+/// modules in three shapes -- each with its own note about the same trap (the
+/// array has to be container-level or the returned slice dangles with the RIGHT
+/// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
+/// that drive the real `std.testing.Smith` over what it produces.
+const fuzzSeedInto = @import("testkit").fuzz.seedInto;
 
 /// A seed followed by the eight octets the `profile` draw reads, so the corpus
 /// chooses the header profile — which the collapsed `value(bool)` could not.

@@ -1377,15 +1377,13 @@ test "ReplayWindow: a jump at/beyond window_size clears the old mask entirely" {
     try std.testing.expect(!rw.check(0)); // far outside the window now
 }
 
-/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`:
-/// `Smith.slice` reads a little-endian u32 length and then that many
-/// bytes, so a wire value that is to arrive verbatim carries that header.
-/// The array has to live in static memory — a `const` local would dangle.
-fn fuzzSeed(comptime wire: []const u8) []const u8 {
-    return &struct {
-        const bytes = std.mem.toBytes(@as(u32, @intCast(wire.len))) ++ wire[0..wire.len].*;
-    }.bytes;
-}
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. Was a local copy in every file that needed it -- 33 across 12
+/// modules in three shapes -- each with its own note about the same trap (the
+/// array has to be container-level or the returned slice dangles with the RIGHT
+/// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
+/// that drive the real `std.testing.Smith` over what it produces.
+const fuzzSeed = @import("testkit").fuzz.seed;
 
 /// Real §6.1 option values: Appendix C.4-C.8's five published ones, then
 /// the edges the decoder dispatches on (both flag bits with a non-empty

@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
+  `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
+  helper existed **33 times across 12 modules in three shapes**, each carrying its
+  own note about the same trap (the returned array has to be container-level or
+  the slice dangles with the right length and garbage behind it). Proved
+  byte-identical to the copies it replaces before they were deleted, and the
+  comparison test was itself broken on purpose first to show it was not vacuous.
+  `testkit` added to this module's `test_deps`; test-only, nothing a consumer
+  imports changed.
+
 - **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** every one of this module's 15
   fuzz harnesses was replaying a single empty input. Fourteen drew their frame
   as `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(...)`, and a

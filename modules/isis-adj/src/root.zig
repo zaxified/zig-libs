@@ -318,14 +318,13 @@ test "golden P2P Hello with 11-octet TLV240 (Wireshark-anchored): rxHelloBytes d
 
 // ── fuzz: hostile IIH bytes must never panic and never corrupt the FSM ───────
 
-/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`:
-/// `Smith.slice` reads a little-endian u32 length and then that many bytes,
-/// so a PDU that is to arrive verbatim carries that header. Static memory.
-fn fuzzSeed(comptime pdu: []const u8) []const u8 {
-    return &struct {
-        const bytes = std.mem.toBytes(@as(u32, @intCast(pdu.len))) ++ pdu[0..pdu.len].*;
-    }.bytes;
-}
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. Was a local copy in every file that needed it -- 33 across 12
+/// modules in three shapes -- each with its own note about the same trap (the
+/// array has to be container-level or the returned slice dangles with the RIGHT
+/// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
+/// that drive the real `std.testing.Smith` over what it produces.
+const fuzzSeed = @import("testkit").fuzz.seed;
 
 /// The three Wireshark-anchored hellos (Down/5, Init/15 echoing B, Init/11
 /// bare system-id) plus the two shapes the FSM must refuse: a neighbour block

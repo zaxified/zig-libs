@@ -344,19 +344,13 @@ test "parseItem is the one-call form" {
     try testing.expectEqual(@as(u24, 160), it.address);
 }
 
-/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`.
-/// `Smith.slice` reads a little-endian u32 length before it copies anything,
-/// so the text carries that header; without it the first four characters would
-/// be eaten as the length and the rest delivered shifted.
-///
-/// ⚠ The array has to be static. A `const` local in this function is NOT
-/// promoted and the returned slice dangles with the RIGHT length and garbage
-/// behind it (measured 2026-09-06).
-fn fuzzSeed(comptime s: []const u8) []const u8 {
-    return &struct {
-        const bytes = std.mem.toBytes(@as(u32, @intCast(s.len))) ++ s[0..s.len].*;
-    }.bytes;
-}
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. Was a local copy in every file that needed it -- 33 across 12
+/// modules in three shapes -- each with its own note about the same trap (the
+/// array has to be container-level or the returned slice dangles with the RIGHT
+/// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
+/// that drive the real `std.testing.Smith` over what it produces.
+const fuzzSeed = @import("testkit").fuzz.seed;
 
 /// Real STEP 7 address literals, one per area and transport size the parser
 /// knows, in both notations, plus the malformed shapes its tests pin.

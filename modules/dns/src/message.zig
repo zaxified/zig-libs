@@ -1098,15 +1098,13 @@ test "decode: empty and header-only packets" {
     try testing.expectEqual(@as(usize, 0), msg.questions.len);
 }
 
-/// A `Smith` seed for a harness whose first draw is `smith.slice(&buf)`:
-/// `Smith.slice` reads a little-endian u32 length and then that many bytes,
-/// so a packet that is to arrive verbatim carries that header. Static
-/// memory — a `const` local would dangle.
-fn fuzzSeed(comptime packet: []const u8) []const u8 {
-    return &struct {
-        const bytes = std.mem.toBytes(@as(u32, @intCast(packet.len))) ++ packet[0..packet.len].*;
-    }.bytes;
-}
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. Was a local copy in every file that needed it -- 33 across 12
+/// modules in three shapes -- each with its own note about the same trap (the
+/// array has to be container-level or the returned slice dangles with the RIGHT
+/// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
+/// that drive the real `std.testing.Smith` over what it produces.
+const fuzzSeed = @import("testkit").fuzz.seed;
 
 /// The six live captures in `goldens.zig` (compression, a CNAME chain, MX,
 /// TXT, an NXDOMAIN with a mid-name-compressed SOA) plus the shapes the

@@ -1014,14 +1014,13 @@ test "signed token: structurally broken tokens are typed errors" {
     try testing.expectError(error.MalformedToken, SignedToken.parse(input));
 }
 
-/// Writes `frame` into `out` behind the little-endian u32 length header that
-/// `Smith.slice` reads before it copies anything, and returns the seed. Built
-/// at run time because the corpus below comes from this module's own encoders.
-fn fuzzSeedInto(out: []u8, frame: []const u8) []const u8 {
-    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
-    @memcpy(out[4..][0..frame.len], frame);
-    return out[0 .. 4 + frame.len];
-}
+/// The corpus-entry format `Smith.slice` reads: a little-endian u32 length,
+/// then the frame. Was a local copy in every file that needed it -- 33 across 12
+/// modules in three shapes -- each with its own note about the same trap (the
+/// array has to be container-level or the returned slice dangles with the RIGHT
+/// length and garbage behind it). It lives in `testkit.fuzz` now, with tests
+/// that drive the real `std.testing.Smith` over what it produces.
+const fuzzSeedInto = @import("testkit").fuzz.seedInto;
 
 /// One seed per ACSE shape `findAuthFields` walks: the sample AARQ, the same
 /// with authentication fields spliced in, an AARE, and the truncations. Each is

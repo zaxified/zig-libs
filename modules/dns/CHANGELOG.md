@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
+  `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
+  helper existed **33 times across 12 modules in three shapes**, each carrying its
+  own note about the same trap (the returned array has to be container-level or
+  the slice dangles with the right length and garbage behind it). Proved
+  byte-identical to the copies it replaces before they were deleted, and the
+  comparison test was itself broken on purpose first to show it was not vacuous.
+  `testkit` added to this module's `test_deps`; test-only, nothing a consumer
+  imports changed.
+
 - **2026-09-06** — A1 security audit, the four HIGH findings fixed. **Consumer-visible
   behaviour change (stricter acceptance, no new error values):** `Resolver` now refuses a
   reply that does not echo exactly our question — one question, our name (ASCII
