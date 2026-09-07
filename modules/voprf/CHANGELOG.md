@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: `fuzzElementFromBytes` had never
+- **2026-09-07** — Test-only, no production change: `fuzzElementFromBytes` had never
   executed its own byte draw. The mode selector `smith.valueRangeAtMost(u8, 0, 2)` came
   BEFORE `smith.bytes(&buf)`, and a ranged `Smith` draw returns the range MINIMUM unless a
   whole eight-octet word lands inside the range - so with no corpus the mode was 0 on every

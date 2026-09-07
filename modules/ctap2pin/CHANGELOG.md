@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: `fuzzTwoDecrypt` had never decrypted
+- **2026-09-07** — Test-only, no production change: `fuzzTwoDecrypt` had never decrypted
   anything. `cipher_len` came from `smith.valueRangeAtMost(u16, 0, 256)` drawn after
   `smith.bytes` had eaten the input; a ranged `Smith` draw returns the range MINIMUM when
   fewer than eight octets remain, so it was **0** on every input the ordinary lane ever ran,

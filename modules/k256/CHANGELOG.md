@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: all three fuzz targets ran one input,
+- **2026-09-07** — Test-only, no production change: all three fuzz targets ran one input,
   and two of them had branches that had never executed. `fuzzFromSec1` and
   `fuzzBip340Verify` each opened `smith.bytes(...)` and then drew a length with
   `smith.valueRangeAtMost`; a ranged `Smith` draw reads eight octets as a little-endian

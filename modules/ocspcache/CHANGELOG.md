@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: both fuzz targets replayed a single
+- **2026-09-07** — Test-only, no production change: both fuzz targets replayed a single
   input, and in `fuzzRefresh` that pinned every branch it selects. Each opened
   `smith.bytes(&raw)` and then drew `raw_len` from a ranged draw, which returns the range
   MINIMUM when fewer than eight octets remain - so `raw_len` was **0** on every input the

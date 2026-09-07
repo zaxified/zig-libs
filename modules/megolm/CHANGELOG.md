@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: both fuzz targets carried a
+- **2026-09-07** — Test-only, no production change: both fuzz targets carried a
   "reachability was verified rather than assumed" note, and both notes were measured under
   `scripts/fuzz-sweep.sh` - i.e. under `--fuzz`. The ORDINARY lane replays
   `options.corpus` plus one empty input, and neither target had a corpus, so with the input

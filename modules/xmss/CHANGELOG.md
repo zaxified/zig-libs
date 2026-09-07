@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: `fuzzVerify` had never looked at a
+- **2026-09-07** — Test-only, no production change: `fuzzVerify` had never looked at a
   signature's content. It opened `smith.bytes(&sig_buf)` and then drew
   `smith.valueRangeAtMost(u16, 0, signature_length)`; a ranged `Smith` draw returns the
   range MINIMUM when fewer than eight octets remain, and `bytes` had already eaten them - so

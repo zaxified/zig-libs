@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: both fuzz targets ran one input, and
+- **2026-09-07** — Test-only, no production change: both fuzz targets ran one input, and
   the metadata one could not have run its own reference document even with a working draw.
   `fuzzDecodeFields` and `fuzzParseIdpMetadata` each opened `smith.bytes(&buf)` and then
   drew a length with `smith.valueRangeAtMost`; a ranged `Smith` draw reads eight octets as

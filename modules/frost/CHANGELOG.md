@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: `fuzzVerify`, the harness named "never
+- **2026-09-07** — Test-only, no production change: `fuzzVerify`, the harness named "never
   panics on **corrupted** signature bytes", had never corrupted a byte. Its first draw was
   `smith.valueRangeAtMost(u8, 0, 6)` and it had no corpus, so `n_flips` was the range
   MINIMUM - **0** - on every input the ordinary lane ever ran: it verified the pristine

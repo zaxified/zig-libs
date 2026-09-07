@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: `fuzzSanitizePath`'s own comment said
+- **2026-09-07** — Test-only, no production change: `fuzzSanitizePath`'s own comment said
   "Length drawn BEFORE the bytes it bounds: every mutated byte the fuzzer spends then lands
   inside the slice", and that was not true when it was written. A ranged `Smith` draw
   returns the range MINIMUM unless a whole eight-octet word already lies inside the range,

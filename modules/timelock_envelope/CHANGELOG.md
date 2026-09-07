@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: `fuzzOpen`'s mutation arm - the only one
+- **2026-09-07** — Test-only, no production change: `fuzzOpen`'s mutation arm - the only one
   that ever hands `Env.open` a real envelope, and therefore the only one that can reach
   `open`'s body at all - had never executed. Its first draw was `smith.value(u8) & 1`, a
   bounded draw that returns its range minimum unless a whole eight-octet word lands inside

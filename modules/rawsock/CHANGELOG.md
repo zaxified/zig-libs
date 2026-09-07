@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-07** - Test-only, no production change: two of the three fuzz targets had an
+- **2026-09-07** — Test-only, no production change: two of the three fuzz targets had an
   entire arm that had never executed. `fuzzParseHwaddr` and `fuzzArpParseReply` both open
   with `smith.value(bool)` and neither had a corpus, so outside `--fuzz` the input was
   already exhausted and the draw returned FALSE every round. In `parseHwaddr` that meant
