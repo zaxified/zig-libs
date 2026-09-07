@@ -26,7 +26,6 @@ falcon 1
 fleetsim 1
 ibe 1
 jwe 2
-k256 2
 loopix 1
 mcp 2
 mcp-http 1
@@ -68,7 +67,6 @@ tsdb 2
 tz 2
 uci 2
 validate 2
-voprf 1
 webhooksig 1
 xmldsig 1
 xmlenc 1
