@@ -316,7 +316,7 @@ const module_list = [_]Module{
     .{ .name = "decaf448", .libs = &.{"crypto"}, .deps = &.{"ed448"} },
     .{ .name = "paillier", .libs = &.{"crypto"}, .deps = &.{"montint"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "threshold_ecdsa", .libs = &.{"crypto"}, .deps = &.{ "paillier", "montint" }, .test_deps = &.{"testkit"}, .heavy = true },
-    .{ .name = "dkg", .libs = &.{"crypto"}, .deps = &.{ "threshold_ecdsa", "paillier" }, .heavy = true },
+    .{ .name = "dkg", .libs = &.{"crypto"}, .deps = &.{ "threshold_ecdsa", "paillier" }, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "vdf", .libs = &.{"crypto"}, .deps = &.{"montint"} },
     .{ .name = "signal", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "ct25519", "entropy" }, .test_deps = &.{"testkit"} },
     .{ .name = "mls", .libs = &.{"crypto"}, .deps = &.{"hpke"}, .test_deps = &.{"testkit"} },
