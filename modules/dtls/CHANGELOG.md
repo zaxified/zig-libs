@@ -5,6 +5,137 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **BEHAVIOURAL, not breaking — remote crash fixed:**
+  `messages.decodeCertificate` panicked with `integer overflow` on a peer's
+  `Certificate` message whose `certificate_request_context` is 255 octets long.
+
+  `certificate_request_context` is a `<0..2^8-1>` field (RFC 8446 §4.4.2), so
+  255 is a value a conforming peer may send. The decoder wrote
+  `var i: usize = 1 + ctx_len` — and `ctx_len` is a `u8` while the `usize` is
+  only the RESULT type, so peer-type resolution did the addition in `u8`.
+  A 259-octet body with `ctx_len == 255` therefore **panicked in Debug and
+  ReleaseSafe**, and in ReleaseFast wrapped to `i = 0`, after which the
+  context-length octet was re-read as the top of the 24-bit `certificate_list`
+  length. The bounds check on the line above it is written correctly
+  (`@as(usize, ctx_len)`); only this one was not.
+
+  Reachable from `Connection.zig`'s handshake path on a peer's `Certificate`
+  message — i.e. a malicious server can crash a client, and in mutual-auth mode
+  a malicious client can crash a server, **before either has authenticated the
+  other**, which is the point of that message. Consumers running ReleaseSafe
+  see a process abort turn into an ordinary decode; nothing that used to succeed
+  behaves differently.
+
+  Found by `zig build --fuzz` in **328 runs**, on the day
+  `fuzzDecodeCertificate` was first given a corpus and a byte-first draw. The
+  target had been in the tree since the module was written and had never decoded
+  a `Certificate` body at all: its length draw collapsed to 0, so it called
+  `decodeCertificate("")` once and stopped. The crashing shape is now both a
+  named regression test and a corpus seed.
+
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the module's last two fuzz
+  targets stop drawing their whole scenario from collapsing draws, and `dtls`
+  reaches zero on `scripts/check-fuzz-reach.py` (17 → 0).
+
+  `handshake.fuzzReassemble` and `Connection.fuzzHandleFlight` both draw a
+  SHAPE rather than a frame, and both took every choice from
+  `smith.valueRangeAtMost` — starting with the first. A ranged draw reads eight
+  octets as a little-endian `u64` and returns the range MINIMUM unless the whole
+  word lands inside the range, and after one short read `Smith` discards the
+  rest of the input. Neither was exempted: a state machine driven by a byte
+  script has a byte-first form, so both now take one `smith.slice` and read
+  their choices out of it with `testkit.fuzz.Cursor`. `fuzzReassemble`'s
+  hand-written corpus of 8-octet little-endian words, and the
+  `CorpusItem`/`corpusBytes`/`stormFragment` apparatus that built it, are gone;
+  the seeds are now hex scripts that read as the scenario they are.
+
+  ⭐ What the collapse was hiding in `fuzzHandleFlight`: its second-fragment
+  branch is commented *"Half the time, feed the TRUE remaining bytes at the TRUE
+  offset, so the completing path is reached too and not only the rejecting
+  one"*. That `smith.boolWeighted(1, 1)` was drawn after the input was
+  exhausted, so it was `false` every time — **the completing path, which is the
+  half of the accumulate/snapshot transaction the target was written to cover,
+  had never run**. The target had executed exactly one scenario for its whole
+  life: split = 1, an empty continuation of a zero-length message.
+
+  Measured before → after: `fuzzReassemble` **1 script, 3 octets stitched → 10
+  scripts, 408 octets stitched, 31 declared-vs-present mismatches refused**;
+  `fuzzHandleFlight` **1 script, 0 truthful continuations → 8 scripts, 4
+  truthful, 360 octets of real ClientHello body delivered**. Both keep the
+  collapsed run as an executable "before" line in their corpus guards.
+
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the twelve handshake-message
+  fuzz targets and the certificate-bridge one stop throwing their input away,
+  and two new certificate fixtures reach two dispatch arms that had never run.
+
+  Nine `messages.zig` targets opened with `smith.bytes(&buf)` followed by
+  `smith.valueRangeAtMost(u16, 0, buf.len)`, which is the range MINIMUM once
+  `bytes` has consumed the input — so `len` was 0 and every decoder was called
+  with an empty slice. The other three built a message with this file's own
+  encoders from parts that were *all* ranged draws, so the message was the same
+  one every time: an empty session id, **zero cipher suites and zero
+  extensions**. `certauth.fuzzParseLeafPublicKey` was the first shape again.
+  None of the thirteen declared a corpus, so outside `--fuzz` the runner
+  replayed exactly one input each.
+
+  Measured 2026-09-07, before → after (non-empty seeds / accepted / fields
+  walked): ClientHello **0/0/0 → 18/14/91**, ServerHello **0/0/0 → 25/23/45**,
+  Certificate **0/0/0 → 9/4/1161 DER octets**, extension blocks **0/0/0 →
+  35/32/115 extensions**, `key_share` ClientHello **0/0/0 → 10/9/3809 octets**,
+  `parseLeafPublicKey` **0/0 → 13/5 keys in 4 of the 4 supported kinds**.
+
+  Two things the collapse had been hiding:
+
+  * **The buffers were too small for this module's own traffic.** The largest
+    recorded ClientHello body is 1554 octets and the largest `key_share` 1222 —
+    the hybrid X25519MLKEM768 offer this module exists to make — against 1024-
+    and 256-octet harness buffers. A seed longer than the buffer reads back as
+    the EMPTY one, so the flagship handshake could never have passed through its
+    own harnesses even with the draw fixed. Raised to 2048.
+  * **`parseLeafPublicKey`'s P-384 and Ed25519 arms had no fixture.** Its own
+    comment says those two arms are the reason the harness exists (the RSA and
+    P-256 paths are re-fuzzed in `x509` and `rsa`), but the module owned no
+    P-384 and no Ed25519 certificate, so neither arm had ever executed.
+    `src/testdata/certs/p384-cert.der` and `ed25519-cert.der` were generated
+    with the same OpenSSL 3.5.5 and the same validity window as the existing
+    fixtures, and are exported as `p384_cert_der` / `ed25519_cert_der`.
+
+  Also fixed, and recorded because both were false when written: "then
+  SOMETIMES flip one byte" (the flip hung on a `boolWeighted` drawn after the
+  input was gone — it had never fired), and "plain random bytes at a plausible
+  length already reach their interior loops" (the length was 0). The mutation is
+  now a full-width `smith.value(u64)` carried in the seed's tail, and the corpus
+  guard pins how many seeds carry one.
+
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the record-layer fuzz targets
+  stop throwing their input away, and the module gains a corpus source built
+  from the recorded wolfSSL transcript (`src/fuzz_corpus.zig`).
+
+  `fuzzDecodeUnified` and `fuzzDecodePlaintext` both opened with
+  `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u8, 0, buf.len)`.
+  `Smith.bytes` consumes `@min(buf.len, in.len)` octets, so the ranged draw
+  found fewer than the eight it reads as a little-endian `u64` and returned the
+  range MINIMUM: `len` was **0 for every input**, and both decoders were handed
+  an empty slice. Neither target declared a corpus either, so outside `--fuzz`
+  the runner replayed exactly one input each — the empty one. Measured
+  2026-09-07: **1 input each, 0 non-empty and 0 headers decoded before; 92 and
+  22 seeds, all non-empty, 85 and 21 headers decoded after.**
+
+  Two knobs went the same way, both drawn after the byte draw and therefore
+  after the input was exhausted: the `boolWeighted(1, 6)` that was supposed to
+  bias byte 0 into the valid fixed-bit pattern had **never executed once**, and
+  the negotiated CID length was 0 on every call — so `decodeUnified`'s entire
+  `has_cid` arm, `error.UnsupportedCidLength` included, was unreachable from its
+  own harness. Both now come out of one full-width `smith.value(u64)` carried in
+  the seed's tail, and the corpus guard pins 4 headers decoded WITH a CID.
+
+  `src/fuzz_corpus.zig` reads the 120 recorded datagrams out of
+  `src/testdata/wolfssl_transcript.txt` and hands them over in the framing
+  `Smith.slice` reads. Nothing under `src/` is changed for a consumer; the file
+  is test-only, and it re-introduces the `testkit` test dependency dropped on
+  2026-09-06 (nothing under `src/` imported it *then*; `testkit.fuzz`'s seed
+  helpers are what this needs, rather than a 34th private copy of them).
+
 - **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** `dtls` stops declaring itself
   `live` and stops declaring a `testkit` test dependency. Both went stale earlier
   the same day, when the wolfSSL peer moved to `tools/interop.zig`: `live` means

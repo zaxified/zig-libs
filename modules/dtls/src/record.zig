@@ -243,6 +243,7 @@ pub fn reconstructSequenceNumber(largest_seen: u48, seq_len: SeqNumLen, wire_low
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const fuzz_corpus = @import("fuzz_corpus.zig");
 
 test "unified header: hand-built golden bytes, no CID, short seq, with length" {
     // epoch_low=1, seq_len=.short (S=0), length present (L=1), no CID (C=0):
@@ -347,34 +348,192 @@ test "reconstructSequenceNumber: clamps at the 48-bit ceiling" {
 // any DTLS implementation) touches on a received UDP datagram — from an
 // unauthenticated, potentially hostile peer, before any handshake state
 // exists. `decodeUnified` is gated by a 3-bit fixed pattern in byte 0, so
-// pure random bytes fail that check almost every time; bias byte 0 toward
-// the valid pattern most of the time so the fuzzer reaches the CID/
-// sequence-number/length-field arithmetic instead of only ever hitting
-// `error.InvalidHeader`. `decodePlaintext` has no such gate (only a length
-// check), so plain random bytes at a plausible length already exercise it.
+// pure random bytes fail that check almost every time.
+//
+// ⛔ Both harnesses used to open with
+//
+//     smith.bytes(&buf);
+//     const len = smith.valueRangeAtMost(u8, 0, buf.len);
+//
+// and `bytes` takes `@min(buf.len, in.len)` octets, leaving the ranged draw
+// with fewer than the eight it reads as a little-endian `u64` — so it returned
+// the range MINIMUM and `len` was 0 on every input. Both decoders were handed
+// an empty slice, for ever, and outside `--fuzz` the runner replays only the
+// declared corpus plus one empty input, so "for ever" was literally one call
+// each. Measured 2026-09-07: **1 input, 0 non-empty and 0 headers decoded
+// before; 92 and 22 seeds, all non-empty, 85 and 21 headers decoded after** —
+// see the guard at the bottom of this file, which is where those numbers come
+// from and where they stay honest.
+//
+// The knobs went the same way. `boolWeighted(1, 6)` (bias byte 0 into the
+// fixed pattern) and `valueRangeAtMost(u8, 0, 4)` (the negotiated CID length)
+// are both drawn AFTER the byte draw, which has consumed the input, so the
+// bias branch had never executed once and `cid_len` was 0 on every call — the
+// CID arm of `decodeUnified`, and with it `error.UnsupportedCidLength`, was
+// unreachable from this harness. They now come out of one full-width
+// `smith.value(u64)`, which is faithful (`Smith` splits a 64-bit scalar into
+// one chunk whose weights span the whole range), carried in the seed's tail.
+
+/// Recorded datagrams, in the format `Smith.slice` reads, with the knob word
+/// the draws after the slice read out of the tail.
+///
+/// ⭐ Built from `testdata/wolfssl_transcript.txt` rather than hand-written:
+/// these are the octets a real wolfSSL 5.9.1 put on a socket, and the module
+/// already fails loudly (`wolfssl_replay.zig`) if they stop being what it
+/// speaks. A hand-edited header would have been refused by the fixed-bit gate
+/// or the length check and the corpus would have measured the refusal path.
+const RecordCorpus = struct {
+    unified: fuzz_corpus.Store(8192, 128) = .{},
+    plaintext: fuzz_corpus.Store(8192, 128) = .{},
+
+    /// `knobs`: the low octet is the negotiated CID length, bit 8 forces byte 0
+    /// into the fixed pattern. A seed with no tail reads 0 for both, which is
+    /// the right default for a recorded record — it already carries the
+    /// pattern, and the connection it came from negotiated no CID.
+    const cid_len_2 = 0x02;
+    const force_pattern = 0x100;
+
+    fn build(self: *RecordCorpus) []const []const u8 {
+        var dg: [fuzz_corpus.max_datagram]u8 = undefined;
+        var it: fuzz_corpus.DatagramIterator = .{};
+        while (it.next(&dg)) |d| {
+            if (d.len == 0) continue;
+            // One record's worth of leading octets is all a header decoder
+            // reads; the rest of the datagram is a body neither function looks
+            // at. 24 octets covers the longest header (1 + 2 CID + 2 seq + 2
+            // length) with room to spare.
+            const head = d[0..@min(d.len, 24)];
+            if (head[0] & fixed_mask == fixed_value) {
+                self.unified.pushUnique(head, null);
+            } else {
+                self.plaintext.pushUnique(head, null);
+            }
+        }
+
+        // ⭐ The CID arm, which no recording can supply: this module has never
+        // negotiated a connection ID with wolfSSL, so every recorded record has
+        // C=0 and the whole `has_cid` branch — including
+        // `error.UnsupportedCidLength` — was outside the corpus. These come
+        // from the file's OWN encoder, so they track `encodeUnified` instead of
+        // freezing a paste of its output.
+        var enc: [16]u8 = undefined;
+        const cid = [_]u8{ 0xAA, 0xBB };
+        for ([_]SeqNumLen{ .short, .long }) |sl| {
+            for ([_]?u16{ null, 0x0010 }) |len| {
+                const h = encodeUnified(.{
+                    .epoch_low = 3,
+                    .seq_len = sl,
+                    .seq_wire = 0x1234,
+                    .cid = &cid,
+                    .length = len,
+                }, &enc) catch continue;
+                self.unified.push(h, cid_len_2);
+                // The same header with NO CID negotiated: the refusal.
+                self.unified.push(h, null);
+            }
+        }
+
+        // The shapes neither a recording nor the encoder produces.
+        self.unified.push(&.{0x00}, null); // wrong fixed pattern
+        self.unified.push(&.{0x24}, null); // L=1, the two length octets missing
+        self.unified.push(&.{ 0x30, 0xAA }, cid_len_2); // C=1, CID truncated
+        self.unified.push(&.{ 0x2F, 0xFF, 0xFF, 0xFF, 0xFF }, force_pattern | cid_len_2);
+        self.plaintext.push(&.{ 22, 0xFE, 0xFD, 0, 0, 0, 0, 0, 0, 0, 1, 0x00 }, null); // 12 octets: one short
+        return self.unified.corpus();
+    }
+};
 
 test "fuzz: decodeUnified never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeUnified, .{});
+    var corpus: RecordCorpus = .{};
+    try testing.fuzz({}, fuzzDecodeUnified, .{ .corpus = corpus.build() });
 }
 
 fn fuzzDecodeUnified(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length — see the note above this section for the measurement.
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-    if (len > 0 and smith.boolWeighted(1, 6)) {
+    const len: usize = smith.slice(&buf);
+    const knobs = smith.value(u64); // full width: faithful, unlike a ranged draw
+    if (len > 0 and knobs & RecordCorpus.force_pattern != 0) {
         buf[0] = (buf[0] & ~fixed_mask) | fixed_value;
     }
-    const cid_len: usize = smith.valueRangeAtMost(u8, 0, 4);
-    _ = decodeUnified(buf[0..len], cid_len) catch return;
+    _ = decodeUnified(buf[0..len], @as(usize, @truncate(knobs)) % 5) catch return;
 }
 
 test "fuzz: decodePlaintext never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodePlaintext, .{});
+    var corpus: RecordCorpus = .{};
+    _ = corpus.build();
+    try testing.fuzz({}, fuzzDecodePlaintext, .{ .corpus = corpus.plaintext.corpus() });
 }
 
 fn fuzzDecodePlaintext(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     _ = decodePlaintext(buf[0..len]) catch return;
+}
+
+test "corpus: every record seed reaches its decoder, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpora the harnesses get. `nonempty` is the reach claim and the
+    // only check that notices a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently.
+    //
+    // The second numbers are what the first cannot say. `decodeUnified`
+    // ACCEPTS the single octet 0x20 — a one-byte datagram is a legal
+    // "epoch 0, 1-octet sequence number, no CID, no length" header — so a
+    // "decoded" count alone would score a harness that walks nothing as a
+    // success. `consumed` is the octets the header walk actually crossed, and
+    // `with_cid` is the arm the collapsed `cid_len` draw made unreachable.
+    var corpus: RecordCorpus = .{};
+    const unified = corpus.build();
+
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var consumed: usize = 0;
+    var with_cid: usize = 0;
+    var with_length: usize = 0;
+    for (unified) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const knobs = smith.value(u64);
+        if (len > 0 and knobs & RecordCorpus.force_pattern != 0) {
+            buf[0] = (buf[0] & ~fixed_mask) | fixed_value;
+        }
+        const d = decodeUnified(buf[0..len], @as(usize, @truncate(knobs)) % 5) catch continue;
+        decoded += 1;
+        consumed += d.consumed;
+        if (d.hdr.cid != null) with_cid += 1;
+        if (d.hdr.length != null) with_length += 1;
+    }
+    try testing.expectEqual(unified.len, nonempty);
+    try testing.expectEqual(@as(usize, 85), decoded);
+    try testing.expectEqual(@as(usize, 399), consumed);
+    try testing.expectEqual(@as(usize, 4), with_cid);
+    try testing.expectEqual(@as(usize, 83), with_length);
+
+    var p_nonempty: usize = 0;
+    var p_decoded: usize = 0;
+    var handshake_records: usize = 0;
+    var declared: usize = 0;
+    for (corpus.plaintext.corpus()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) p_nonempty += 1;
+        const h = decodePlaintext(buf[0..len]) catch continue;
+        p_decoded += 1;
+        if (h.content_type == 22) handshake_records += 1;
+        declared += h.length;
+    }
+    try testing.expectEqual(corpus.plaintext.n, p_nonempty);
+    try testing.expectEqual(@as(usize, 21), p_decoded);
+    try testing.expectEqual(@as(usize, 21), handshake_records);
+    try testing.expectEqual(@as(usize, 9783), declared);
+
+    // Nothing was dropped for capacity: a dropped frame is a corpus entry that
+    // silently does not exist.
+    try testing.expectEqual(@as(usize, 0), corpus.unified.dropped);
+    try testing.expectEqual(@as(usize, 0), corpus.plaintext.dropped);
 }

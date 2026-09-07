@@ -161,6 +161,7 @@ pub fn verifyLeafAgainstAnchor(
 
 const testing = std.testing;
 const kat = @import("certauth_kat_vectors.zig");
+const fuzz_corpus = @import("fuzz_corpus.zig");
 
 test "parseLeafPublicKey: ECDSA P-256 leaf (real X.509 DER from OpenSSL)" {
     const pk = try parseLeafPublicKey(&kat.server_cert_der);
@@ -284,13 +285,107 @@ test "verifyLeafAgainstAnchor: a tampered leaf signature is rejected" {
 // only this function reaches — hence a harness at this level rather than
 // skipping it entirely.
 
+// ⛔ And it had never reached either of them. The harness opened with
+// `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`:
+// `bytes` takes `@min(buf.len, in.len)` octets, so the ranged draw found fewer
+// than the eight it reads as a little-endian `u64` and returned the range
+// MINIMUM. `len` was 0 for every input and `parseLeafPublicKey` was called with
+// an empty slice — which `x509.spkiOf` refuses at its first bounds check, three
+// call frames before the dispatch this file is about. With no corpus declared
+// the runner replays exactly one input, so that was the whole of it: **1 call,
+// 0 non-empty, 0 keys parsed.**
+//
+// ⭐ The second half of the same finding: the module owned no P-384 and no
+// Ed25519 certificate, so even a fixed draw could not have reached those two
+// arms — the paragraph above was describing coverage that did not exist. Two
+// self-signed fixtures were generated for them (see `certauth_kat_vectors.zig`)
+// and the guard below pins that all four key kinds now come out.
+
+/// Certificates in the format `Smith.slice` reads. Real DER throughout: the
+/// module's own OpenSSL-generated fixtures, plus the truncations and
+/// structurally-broken shapes the tests above already name as the inputs that
+/// used to crash std's parser.
+const CertCorpus = struct {
+    store: fuzz_corpus.Store(8192, 32) = .{},
+
+    fn build(self: *CertCorpus) []const []const u8 {
+        for ([_][]const u8{
+            &kat.server_cert_der, // ECDSA P-256
+            &kat.rsa_cert_der, // RSA-2048
+            &kat.p384_cert_der, // ECDSA P-384
+            &kat.ed25519_cert_der, // Ed25519
+            &kat.anchor_cert_der,
+        }) |c| self.store.push(c, null);
+
+        // A structurally intact certificate naming a curve we do not support:
+        // `UnsupportedPublicKeyAlgorithm`, not `MalformedCertificate`.
+        var corrupted = kat.server_cert_der;
+        const p256_curve_oid = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+        if (std.mem.indexOf(u8, &corrupted, &p256_curve_oid)) |idx| {
+            corrupted[idx + p256_curve_oid.len - 1] ^= 0x01;
+            self.store.push(&corrupted, null);
+        }
+        // Truncations of a real certificate — the shape that used to reach an
+        // unguarded `bytes[i]` inside std's ASN.1 walker.
+        self.store.push(kat.server_cert_der[0..64], null);
+        self.store.push(kat.server_cert_der[0 .. kat.server_cert_der.len - 3], null);
+        self.store.push(kat.rsa_cert_der[0..200], null);
+        // The adversarial literals from the test above.
+        self.store.push(&.{}, null);
+        self.store.push(&.{0x30}, null);
+        self.store.push(&.{ 0x30, 0x82, 0xff, 0xff }, null);
+        self.store.push(&.{ 0x30, 0x03, 0x02, 0x01, 0x00 }, null);
+        self.store.push(&.{ 0x02, 0x01, 0x00 }, null); // INTEGER, not a SEQUENCE
+        return self.store.corpus();
+    }
+};
+
 test "fuzz: parseLeafPublicKey never panics on arbitrary DER" {
-    try testing.fuzz({}, fuzzParseLeafPublicKey, .{});
+    var corpus: CertCorpus = .{};
+    try testing.fuzz({}, fuzzParseLeafPublicKey, .{ .corpus = corpus.build() });
 }
 
 fn fuzzParseLeafPublicKey(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length — see the note above. 1024 octets is measured against the largest
+    // certificate the module owns (the 789-octet RSA-2048 one): a seed longer
+    // than the buffer reads back EMPTY, so the buffer is what decides whether a
+    // real certificate can pass through the harness at all.
     var buf: [1024]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     _ = parseLeafPublicKey(buf[0..len]) catch return;
+}
+
+test "corpus: every certificate seed reaches the parser, and the key kinds are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim — and the only
+    // thing that notices a fixture grown past the 1024-octet buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. (One seed IS the
+    // empty certificate, deliberately, so the pin is `len - 1`.)
+    //
+    // `kinds` is the number the first cannot give: `parsed` alone would count a
+    // corpus that only ever produced P-256 keys as a full success, and the two
+    // arms this harness exists for (P-384, Ed25519) would still never run.
+    var corpus: CertCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var kinds = std.EnumSet(std.meta.Tag(certverify.PublicKey)).initEmpty();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const pk = parseLeafPublicKey(buf[0..len]) catch continue;
+        parsed += 1;
+        kinds.insert(pk);
+    }
+    try testing.expectEqual(@as(usize, 0), corpus.store.dropped);
+    // The corpus size is pinned too: a seed quietly deleted would otherwise
+    // move `nonempty` and the assertion below would still hold.
+    try testing.expectEqual(@as(usize, 14), entries.len);
+    // One seed is the empty certificate, deliberately.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 5), parsed);
+    try testing.expectEqual(@as(usize, 4), kinds.count());
 }

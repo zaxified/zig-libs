@@ -40,7 +40,6 @@ dkg 2
 dnp3 3
 dnssec 4
 drand 1
-dtls 17
 ebpf 5
 encoding 1
 ethfrag 1
