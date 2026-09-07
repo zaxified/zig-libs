@@ -5,6 +5,40 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Three recovery defects, found by the first corpus that ever
+  reached this module's fuzz harnesses.** Both targets opened with
+  `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`;
+  `bytes` consumes `min(buf.len, in.len)` octets and the ranged draw then reads
+  eight *more* as a little-endian u64, returning the range minimum when fewer
+  remain — so the drawn length was 0 for every input a seed can carry, and with no
+  corpus either each target replayed one empty document for ever. That mattered
+  more here than elsewhere: `fuzzPreprocessAnnotated` exists for a differential
+  ORACLE — the two entry points must agree on whether the result parses — and on
+  the empty input they trivially agree, so the oracle had never once compared two
+  outputs that could differ. Given a 22-seed corpus it failed immediately, three
+  times:
+  - **`preprocess` did not close containers the input left open.** `preprocess("{a b")`
+    emitted `{"$err_trace_1": "a b --> missing colon after key at line 1"` with no
+    `}`, so the recovery entry it had just built sat in a document `std.json`
+    cannot read. `preprocessAnnotated` has auto-closed at EOF all along. ⭐ `{a b`
+    is this module's OWN audit-F1 crash reproducer and its test only asserted that
+    the string `$err_trace` appears in the output — never that the output parses.
+    `preprocess` now auto-closes, and the test now parses its result.
+  - **`preprocessAnnotated` closed an unterminated string at EOF even outside an
+    object**, where there is nowhere to record a diagnostic: `"unterminated` came
+    out as the valid document `"unterminated"`, with no error anywhere. That is
+    exactly the failure the W2 re-audit's F2 fix removed from the NEWLINE branch
+    ("with nowhere to report, the honest move is not to recover") — the EOF branch
+    kept it. Now guarded the same way.
+  - **`preprocess` closed an unterminated SINGLE-quoted string unconditionally**:
+    `'unterminated` became the valid `"unterminated"`, while the double-quoted
+    branch six lines above left `"unterminated` open. Same class, same fix; the
+    two string kinds had also disagreed with each other.
+  Harnesses now draw with one `smith.slice(&buf)` and share a 22-seed corpus, so
+  the oracle compares both entry points on the same input. Guard pins octets
+  emitted and documents rewritten rather than acceptance, because `preprocess("")`
+  succeeds: measured 0 / 0 / 0 before; 22 seeds, 646 octets, 18 rewritten,
+  4 carrying a diagnostic after.
 - **2026-09-02** — Drift re-audit (W2, window `0575340..HEAD`). Ten findings, all fixed:
 
   - **CRITICAL, silent corruption of valid input:** the bare-identifier branch fired on the `e`
