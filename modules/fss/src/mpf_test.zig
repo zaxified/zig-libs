@@ -814,6 +814,161 @@ test "SELF: a single key's evaluations do not spike at the shared points (heuris
 
 const FuzzMpf = Mpf(8, 4, 3);
 
+// ── fuzz corpora ──────────────────────────────────────────────────────────
+//
+// ⚠ Both fuzz targets below draw with `smith.bytes` and scalar draws, never
+// `smith.slice`, so a corpus entry is read RAW — there is no `u32` length
+// header. A seed is exactly the octets the draws consume, in draw order:
+// `bytes` takes `@min(buf.len, in.len)` of them, and each scalar draw takes a
+// further eight as a little-endian `u64`.
+//
+// ⛔ Why these corpora exist. `std.testing.fuzz` with no corpus replays
+// exactly ONE input, the empty one, and over an exhausted input `bytes`
+// memsets to zero while every scalar draw returns its range minimum. Measured
+// on both targets before this change, and both had a dead body rather than a
+// dead knob:
+//
+//   * `fuzzKeyFromBytes` drew `count = 0`, so `evalEachFullWith` emitted
+//     NOTHING and the `if (x < count)` comparison — the interleaved walk
+//     against the naive per-point path, which is the whole reason the target
+//     exists — never executed once. `party` was likewise always 0.
+//   * `fuzzGenSeeds` drew eight byte-identical all-zero seeds, which
+//     `requireDistinctSeeds` refuses, so `genWithSeeds` returned an error and
+//     the harness took its `catch return` on every run. `evalAll` and
+//     `firstMismatch` below it had never run at all.
+//
+// ⛔ No `testkit` import, and it is not an oversight: `fss` has no `test_deps`
+// entry, and adding one enrols the module in `zig build check-testonly`. These
+// builders are local for that reason, and the guard tests drive the real
+// `std.testing.Smith` over what they produce, which is what stops them
+// drifting from `modules/testkit/src/fuzz.zig`'s claims about the format.
+
+const key_seed_len = FuzzMpf.Key.serialized_len + 16;
+
+const KeyCorpus = struct {
+    store: [7][key_seed_len]u8 = undefined,
+    entries: [7][]const u8 = undefined,
+    n: usize = 0,
+
+    /// The key octets `smith.bytes` reads, then the `party` word, then the
+    /// `count` word. ⚠ `party` is `valueRangeAtMost(u8, 0, 1)` and `count` is
+    /// `valueRangeAtMost(u16, 0, domain_size)`: a `Smith` ranged draw returns
+    /// the range MINIMUM for any word OUTSIDE the range rather than folding
+    /// it, so these words have to be in range exactly.
+    fn push(self: *KeyCorpus, key: *const [FuzzMpf.Key.serialized_len]u8, party: u64, count: u64) void {
+        const s = &self.store[self.n];
+        @memcpy(s[0..FuzzMpf.Key.serialized_len], key);
+        std.mem.writeInt(u64, s[FuzzMpf.Key.serialized_len..][0..8], party, .little);
+        std.mem.writeInt(u64, s[FuzzMpf.Key.serialized_len + 8 ..][0..8], count, .little);
+        self.entries[self.n] = s;
+        self.n += 1;
+    }
+
+    fn build(self: *KeyCorpus) []const []const u8 {
+        const dom = FuzzMpf.domain_size;
+        // A key `Gen` really produced, so the corpus is not "arbitrary bytes
+        // only" — the walk has to agree on real key material too.
+        const seeds = detSeeds(FuzzMpf.points, 0xF0FF);
+        var alphas: [FuzzMpf.points]FuzzMpf.Index = undefined;
+        var betas: [FuzzMpf.points]FuzzMpf.Elem = undefined;
+        for (0..FuzzMpf.points) |j| {
+            alphas[j] = @intCast(j * 37 % dom);
+            betas[j] = @intCast(j + 1);
+        }
+        const keys = FuzzMpf.genWithSeeds(alphas, betas, seeds[0], seeds[1]) catch unreachable;
+        var real0: [FuzzMpf.Key.serialized_len]u8 = undefined;
+        keys[0].toBytes(&real0);
+        var real1: [FuzzMpf.Key.serialized_len]u8 = undefined;
+        keys[1].toBytes(&real1);
+
+        const zero: [FuzzMpf.Key.serialized_len]u8 = @splat(0);
+        const ones: [FuzzMpf.Key.serialized_len]u8 = @splat(0xFF);
+        var patterned: [FuzzMpf.Key.serialized_len]u8 = undefined;
+        for (&patterned, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+
+        self.push(&zero, 0, 0); // the input this target used to run for ever
+        self.push(&real0, 0, dom); // a real key, party 0, the whole domain
+        self.push(&real1, 1, dom); // the other share, party 1
+        self.push(&real0, 1, 1); // a one-point prefix: the walk's shortest run
+        self.push(&ones, 0, dom); // every control-bit CW octet 0xFF: the
+        // encoding's truncate-to-low-bit path, which
+        // is what the re-encoding check is about
+        self.push(&patterned, 1, dom / 2); // arbitrary bytes, a partial prefix
+        self.push(&zero, 1, dom); // the all-zero key over the whole domain
+        return self.entries[0..self.n];
+    }
+};
+
+const GenMpf = Mpf(6, 4, 4);
+const gen_seed_len = 8 * prg_mod.seed_len + 8 * 8;
+
+const GenCorpus = struct {
+    store: [6][gen_seed_len]u8 = undefined,
+    entries: [6][]const u8 = undefined,
+    n: usize = 0,
+
+    /// Eight 16-octet root seeds (`s0` then `s1`, four each), then four
+    /// `alpha` words and four `beta` words. ⚠ `alpha` is `value(u8)`
+    /// truncated, so its word must be 0..255; `beta` is `value(u32)`, so its
+    /// word must fit 32 bits. A word outside the draw's range reads back as
+    /// the range minimum, i.e. 0.
+    fn push(
+        self: *GenCorpus,
+        s0: [4]prg_mod.Seed,
+        s1: [4]prg_mod.Seed,
+        alphas: [4]u64,
+        betas: [4]u64,
+    ) void {
+        const s = &self.store[self.n];
+        var at: usize = 0;
+        for (s0) |sd| {
+            @memcpy(s[at..][0..prg_mod.seed_len], &sd);
+            at += prg_mod.seed_len;
+        }
+        for (s1) |sd| {
+            @memcpy(s[at..][0..prg_mod.seed_len], &sd);
+            at += prg_mod.seed_len;
+        }
+        for (alphas) |a| {
+            std.mem.writeInt(u64, s[at..][0..8], a, .little);
+            at += 8;
+        }
+        for (betas) |b| {
+            std.mem.writeInt(u64, s[at..][0..8], b, .little);
+            at += 8;
+        }
+        std.debug.assert(at == gen_seed_len);
+        self.entries[self.n] = s;
+        self.n += 1;
+    }
+
+    fn build(self: *GenCorpus) []const []const u8 {
+        const a = detSeeds(4, 0x51D0);
+        const b = detSeeds(4, 0x9E37);
+        const zeros: [4]prg_mod.Seed = @splat(@splat(0));
+        var collide = a[1];
+        collide[2] = a[0][2]; // one pair made byte-identical, the rest are not
+
+        self.push(zeros, zeros, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }); // the input
+        // this target used to run for ever: eight identical seeds, refused
+        self.push(a[0], a[1], .{ 0, 1, 2, 3 }, .{ 1, 2, 3, 4 }); // accepted
+        self.push(b[0], b[1], .{ 63, 17, 5, 42 }, .{
+            0xFFFF_FFFF,
+            0x8000_0000,
+            1,
+            0x7FFF_FFFF,
+        }); // the top of the domain and of the group
+        self.push(a[0], a[1], .{ 7, 7, 9, 11 }, .{ 5, 6, 7, 8 }); // a REPEATED
+        // point: a multiset, not an error (see `genWithSeeds`' doc comment) —
+        // the shared value there is the sum, and `firstMismatch` checks it
+        self.push(a[0], collide, .{ 0, 1, 2, 3 }, .{ 1, 2, 3, 4 }); // ONE
+        // colliding seed pair among four: the distinctness guard must refuse
+        // this too, not only the all-identical case
+        self.push(b[0], b[1], .{ 0, 1, 2, 3 }, .{ 0, 0, 0, 0 }); // beta = 0
+        return self.entries[0..self.n];
+    }
+};
+
 fn fuzzKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     // `fromBytes` takes a fixed-size array pointer, so there is no length for
     // an attacker to lie about — which is precisely why the interesting fuzz
@@ -886,7 +1041,8 @@ fn fuzzKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     }
 }
 test "fuzz Mpf key decode + evaluate never panics" {
-    try std.testing.fuzz({}, fuzzKeyFromBytes, .{});
+    var corpus: KeyCorpus = .{};
+    try std.testing.fuzz({}, fuzzKeyFromBytes, .{ .corpus = corpus.build() });
 }
 
 fn fuzzGenSeeds(_: void, smith: *std.testing.Smith) !void {
@@ -914,5 +1070,107 @@ fn fuzzGenSeeds(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqual(@as(?usize, null), M.firstMismatch(&e0, &e1, alphas, betas));
 }
 test "fuzz Mpf gen over arbitrary seeds never panics" {
-    try std.testing.fuzz({}, fuzzGenSeeds, .{});
+    var corpus: GenCorpus = .{};
+    try std.testing.fuzz({}, fuzzGenSeeds, .{ .corpus = corpus.build() });
+}
+
+test "corpus: the key seeds drive party and count, and the counts are pinned" {
+    // Measured 2026-09-08. ⛔ The load-bearing number is `emitted_total`, not
+    // "it did not panic": `count` was 0 on the single input this target ever
+    // ran, so `evalEachFullWith` emitted NOTHING and the interleaved walk was
+    // never once compared against the naive per-point path — which is the
+    // entire reason this target exists. Before: 0 emissions, 1 party, 0 keys
+    // whose canonical re-encoding differed from the input bytes.
+    var corpus: KeyCorpus = .{};
+    var parties: [2]bool = @splat(false);
+    var emitted_total: usize = 0;
+    var rewritten: usize = 0;
+    for (corpus.build()) |sd| {
+        // The harness itself, over the real `Smith`.
+        var sm: std.testing.Smith = .{ .in = sd };
+        try fuzzKeyFromBytes({}, &sm);
+
+        // …and the same draw sequence again, to count what it produced.
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [FuzzMpf.Key.serialized_len]u8 = undefined;
+        smith.bytes(&buf);
+        const key = FuzzMpf.Key.fromBytes(&buf);
+        const party: u1 = @truncate(smith.valueRangeAtMost(u8, 0, 1));
+        parties[party] = true;
+        const count: usize = smith.valueRangeAtMost(u16, 0, FuzzMpf.domain_size);
+        var fast: [FuzzMpf.domain_size * 3]FuzzMpf.Elem = undefined;
+        var fast_xs: [FuzzMpf.domain_size]usize = undefined;
+        var emitted: usize = 0;
+        const Sink = EachSink(FuzzMpf);
+        FuzzMpf.evalEachFullWith(
+            party,
+            key,
+            count,
+            Sink{ .vals = &fast, .xs = &fast_xs, .n = &emitted },
+            Sink.emit,
+        );
+        emitted_total += emitted;
+        var out: [FuzzMpf.Key.serialized_len]u8 = undefined;
+        key.toBytes(&out);
+        if (!std.mem.eql(u8, &buf, &out)) rewritten += 1;
+    }
+    // 0 + 256 + 256 + 1 + 256 + 128 + 256, the corpus's `count` words summed.
+    try testing.expectEqual(@as(usize, 1153), emitted_total);
+    try testing.expectEqual(@as(usize, 2), countTrue(&parties));
+    // The all-0xFF key and the patterned one: every other seed is already
+    // canonical, so `toBytes` reproduces it octet for octet.
+    try testing.expectEqual(@as(usize, 2), rewritten);
+}
+
+test "corpus: the Gen seeds get past the distinctness guard, and the counts are pinned" {
+    // Measured 2026-09-08. ⛔ `accepted` is the load-bearing number here and
+    // it was **0**: the single input this target ever ran was eight
+    // byte-identical all-zero root seeds, which `requireDistinctSeeds`
+    // refuses, so the harness took its `catch return` every time and
+    // `evalAll`/`firstMismatch` — everything below `genWithSeeds` — had never
+    // executed. `nonzero_points` is the second number, and no refused seed can
+    // move it.
+    var corpus: GenCorpus = .{};
+    var accepted: usize = 0;
+    var refused: usize = 0;
+    var nonzero_points: usize = 0;
+    for (corpus.build()) |sd| {
+        var sm: std.testing.Smith = .{ .in = sd };
+        try fuzzGenSeeds({}, &sm);
+
+        var smith: std.testing.Smith = .{ .in = sd };
+        var s0: [4]prg_mod.Seed = undefined;
+        var s1: [4]prg_mod.Seed = undefined;
+        for (&s0) |*s| smith.bytes(s);
+        for (&s1) |*s| smith.bytes(s);
+        var alphas: [4]GenMpf.Index = undefined;
+        var betas: [4]GenMpf.Elem = undefined;
+        for (&alphas) |*a| a.* = @truncate(smith.value(u8));
+        for (&betas) |*b| b.* = smith.value(u32);
+        const keys = GenMpf.genWithSeeds(alphas, betas, s0, s1) catch {
+            refused += 1;
+            continue;
+        };
+        accepted += 1;
+        var e0: [GenMpf.domain_size]GenMpf.Elem = undefined;
+        var e1: [GenMpf.domain_size]GenMpf.Elem = undefined;
+        GenMpf.evalAll(0, keys[0], &e0);
+        GenMpf.evalAll(1, keys[1], &e1);
+        for (e0, e1) |x, y| {
+            if (x +% y != 0) nonzero_points += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), accepted);
+    // The all-identical seeds, and the one seed pair deliberately collided.
+    try testing.expectEqual(@as(usize, 2), refused);
+    // 4 + 4 + 3 (alphas 7 and 7 share one point) + 0 (every beta zero).
+    try testing.expectEqual(@as(usize, 11), nonzero_points);
+}
+
+fn countTrue(flags: []const bool) usize {
+    var n: usize = 0;
+    for (flags) |f| {
+        if (f) n += 1;
+    }
+    return n;
 }

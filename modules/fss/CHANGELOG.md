@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Both `Mpf` fuzz targets now carry a corpus, and two guard
+  tests pin what it reaches. Neither had one, so `std.testing.fuzz` replayed
+  exactly one input each — the empty one — and in both cases the harness BODY
+  was dead, not merely a knob:
+
+  * `fuzzKeyFromBytes` drew `count = 0`, so `evalEachFullWith` emitted nothing
+    and the interleaved walk was never once compared against the naive
+    per-point path, which is the whole reason the target exists. `party` was
+    always 0. Measured after: 1153 emissions across the corpus, both parties,
+    2 keys whose canonical re-encoding differs from the input bytes.
+  * `fuzzGenSeeds` drew eight byte-identical all-zero root seeds, which
+    `requireDistinctSeeds` refuses, so the harness took its `catch return` on
+    every run and `evalAll`/`firstMismatch` below it had never executed at
+    all. Measured after: 4 accepted, 2 refused (the all-identical seeds and
+    one deliberately collided pair), 11 domain points where the reconstructed
+    multi-point function is non-zero.
+
+  The seed builders are local rather than `testkit`'s, because `fss` has no
+  `test_deps` entry and adding one would enrol the module in
+  `check-testonly`; the guards drive the real `std.testing.Smith` over what
+  they produce, which is what keeps the format claim honest. Test-only; no API
+  or wire change.
+
 - **2026-08-11** — Security audit: one finding fixed (part of the collection-wide audit;
   the root changelog records no further detail than this). Verified against an
   independent Python re-derivation of the same BGI16 construction — a genuine
