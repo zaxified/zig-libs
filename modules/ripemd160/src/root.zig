@@ -432,34 +432,119 @@ test "block_length / digest_length" {
 // *consistently* (e.g. a shared bug in `compress`) would still be invisible
 // to this oracle; the KATs above are what pin `compress` itself against an
 // external reference.
+const fuzzseed = @import("testkit").fuzz;
+
+/// Two full blocks plus a padding block, and comfortably over the longest
+/// message this module quotes (the 80-octet numeric KAT). 4096 was the old
+/// size and nothing needs it: no seed can exceed the buffer without reading
+/// back EMPTY, and the arithmetic `update` has to get right is the 64-octet
+/// block boundary, not a large total.
+const stream_buf_len = 256;
+
+/// Messages, chosen for where they sit relative to `block_length` (64) and to
+/// the 9 octets `final` needs for the 0x80 marker and the little-endian bit
+/// length. The chunk sizes are read out of each message's OWN octets (see
+/// `fuzzStreamingMatchesOneShot`), so a seed is both the message and the
+/// split script and there is no second draw to go dead on a replay.
+const stream_seeds = [_][]const u8{
+    fuzzseed.seed(""), // the empty message: exactly what the collapsed draw ran, for ever
+    fuzzseed.seed("a"), // one octet: `update` fills the partial buffer and never compresses
+    fuzzseed.seed("abc"), // the KAT above
+    fuzzseed.seed("message digest"), // the KAT above
+    fuzzseed.seed("abcdefghijklmnopqrstuvwxyz"), // the KAT above
+    fuzzseed.seed("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"), // 62 octets: one short of a block
+    fuzzseed.seed("1234567890" ** 8), // the 80-octet KAT: one full block plus a 16-octet remainder
+    fuzzseed.seed("x" ** 55), // ⭐ 55: the last length whose padding still fits in the same block
+    fuzzseed.seed("x" ** 56), // ⭐ 56: the first length that forces a SECOND padding block
+    fuzzseed.seed("x" ** 63), // one octet short of a block
+    fuzzseed.seed("x" ** 64), // exactly one block: the loop consumes it and the remainder is empty
+    fuzzseed.seed("x" ** 65), // a block plus one
+    fuzzseed.seed("\x00" ** 128), // two whole blocks of zeroes
+    fuzzseed.seed("\xff\x00\x80\x7f" ** 48), // 192 octets, three blocks, high bytes
+    fuzzseed.seed("Q" ** 200), // over two blocks with a 72-octet remainder, and 200 > 97 so the split loop runs at least three times
+};
+
 test "fuzz: streaming update matches one-shot hash, at every split the input picks" {
-    try testing.fuzz({}, fuzzStreamingMatchesOneShot, .{});
+    try testing.fuzz({}, fuzzStreamingMatchesOneShot, .{ .corpus = &stream_seeds });
 }
 
 fn fuzzStreamingMatchesOneShot(_: void, smith: *testing.Smith) !void {
-    // Length drawn first so every mutated byte lands inside `data`, not
-    // scattered across a fixed 4096-byte draw a small `len` would discard.
-    var msg: [4096]u8 = undefined;
-    const len = smith.valueRangeAtMost(u16, 0, msg.len);
-    smith.bytes(msg[0..len]);
-    const data = msg[0..len];
+    var msg: [stream_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice`, and the chunk sizes come out of the drawn bytes
+    // rather than out of a second draw. The old shape was
+    // `len = smith.valueRangeAtMost(u16, 0, msg.len)` followed by
+    // `smith.bytes(msg[0..len])`, under a comment claiming the length came
+    // first "so every mutated byte lands inside `data`". A ranged draw reads
+    // eight octets as a little-endian `u64` and returns the range MINIMUM
+    // unless that whole word falls inside the range, so `len` was 0 on every
+    // input the ordinary test lane can carry. The consequence was not a weak
+    // harness but a vacuous one: with `data` empty the split loop below never
+    // executed, `chunk` was never drawn, and the differential compared
+    // `hash("")` against an `init`/`final` pair that had called `update` zero
+    // times. **The buffer arithmetic this target exists for had never run.**
+    // Measured 2026-09-07 over the corpus: 0 of 15 seeds arrived non-empty
+    // before and 0 `update` calls were made; 14 of 15 and 168 after, over 1009
+    // octets, 12 of the 14 split across more than one call.
+    const n = smith.slice(&msg);
+    const data = msg[0..n];
 
     var one_shot: [Ripemd160.digest_length]u8 = undefined;
     Ripemd160.hash(data, &one_shot, .{});
 
-    // Feed `data` through `update` in fuzzer-chosen chunk sizes (1..97 bytes,
-    // deliberately not a divisor of the 64-byte block so both the
-    // straddling-a-boundary and the landing-exactly-on-one shapes occur).
+    // Feed `data` through `update` in chunk sizes read from the message's own
+    // octets (1..97 bytes, deliberately not a divisor of the 64-byte block so
+    // both the straddling-a-boundary and the landing-exactly-on-one shapes
+    // occur). A `Cursor` cycles rather than running out, so the splits stay
+    // driven by the input however long the message is — and under `--fuzz`
+    // the fuzzer still drives them, because it drives the slice.
+    var script: fuzzseed.Cursor = .{ .bytes = data };
     var d = Ripemd160.init(.{});
     var off: usize = 0;
     while (off < data.len) {
-        const chunk = smith.valueRangeAtMost(u8, 1, 97);
-        const n = @min(chunk, data.len - off);
-        d.update(data[off..][0..n]);
-        off += n;
+        const chunk = script.ranged(1, 97);
+        const c = @min(chunk, data.len - off);
+        d.update(data[off..][0..c]);
+        off += c;
     }
     var streamed: [Ripemd160.digest_length]u8 = undefined;
     d.final(&streamed);
 
     try testing.expectEqualSlices(u8, &one_shot, &streamed);
+}
+
+test "corpus: every seed reaches update, and the split the harness performs is pinned" {
+    // ⭐ There is no "accepted" here — a hash accepts everything — so the
+    // numbers that say the harness walked something are the `update` calls it
+    // makes and the block boundaries it crosses. Both are 0 for the empty
+    // message, which is the single input this target ran before.
+    var nonempty: usize = 0;
+    var updates: usize = 0;
+    var octets: usize = 0;
+    var multi_chunk: usize = 0;
+    for (stream_seeds) |sd| {
+        var smith: testing.Smith = .{ .in = sd };
+        var msg: [stream_buf_len]u8 = undefined;
+        const n = smith.slice(&msg);
+        if (n != 0) nonempty += 1;
+        octets += n;
+
+        const data = msg[0..n];
+        var script: fuzzseed.Cursor = .{ .bytes = data };
+        var calls: usize = 0;
+        var off: usize = 0;
+        while (off < data.len) {
+            const c = @min(script.ranged(1, 97), data.len - off);
+            off += c;
+            calls += 1;
+        }
+        updates += calls;
+        if (calls > 1) multi_chunk += 1;
+    }
+    // One seed is deliberately the empty message.
+    try testing.expectEqual(stream_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. Before the draw was restructured all four were 0:
+    // the only message the target ever hashed was the empty one.
+    try testing.expectEqual(@as(usize, 1009), octets);
+    try testing.expectEqual(@as(usize, 168), updates);
+    try testing.expectEqual(@as(usize, 12), multi_chunk);
 }

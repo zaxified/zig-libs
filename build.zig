@@ -344,7 +344,7 @@ const module_list = [_]Module{
     .{ .name = "chachapoly", .libs = &.{"crypto"} },
     .{ .name = "k256", .libs = &.{"crypto"} },
     .{ .name = "p256", .libs = &.{ "crypto", "web" } },
-    .{ .name = "ripemd160", .libs = &.{"crypto"} },
+    .{ .name = "ripemd160", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "bech32", .libs = &.{"crypto"}, .deps = &.{"ripemd160"} },
     .{ .name = "bip32", .libs = &.{"crypto"}, .deps = &.{ "k256", "ripemd160", "bech32" } },
     // Scaffold more here (copy modules/_template) — see CONVENTIONS.md
