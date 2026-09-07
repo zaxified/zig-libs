@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Test-only, no production change: the scalar knobs the three fuzz
+  harnesses draw after their byte frame were measured across their corpora for the first
+  time. `command.fuzzBuilders` was the one with a hole — `quoted_utf8` came out **true on 5
+  of 5 seeds** and `literal_plus` **true on 5 of 5**, so both were constants. A knob stuck
+  on `true` is as dead as one stuck on `false`: the modified UTF-7 mailbox spelling (which
+  is a different output, not a variation of one) and every path that only exists when
+  LITERAL+ is off had never been fuzzed. Two seeds carrying the complementary bits bring
+  both to 5 of 7, and the corpus guard now pins all five knobs (5, 5, 5, 3, 3) alongside
+  the argument octets, which rise 480 -> 672. `fetch.fuzzEncode`'s six knobs and
+  `search.fuzzEncode`'s four bools measured alive already (4, 4, 3, 3, 4, 4 and 4, 4, 3, 4)
+  and are now pinned rather than left implicit. `search`'s third draw is not a bool but
+  `Criteria.larger`, a `u32`, and the seed builder wrote 0 or 1 into every word: measured
+  maximum **1** across the whole corpus, so `LARGER` never rendered more than one digit.
+  `shapedSeedLarger` gives two seeds a real width, pinned at `maxInt(u32)`.
+
 - **2026-09-07** — **All five fuzz harnesses now receive their input; none of
   them did before**, including the two that had already been fixed once for
   exactly this and the one that already carried a deliberately shaped corpus.

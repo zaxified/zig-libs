@@ -638,6 +638,25 @@ fn shapedSeed(comptime frame: []const u8, comptime bits: u64) []const u8 {
     }.bytes;
 }
 
+/// `shapedSeed` with an explicit word for the THIRD scalar draw, which is not
+/// a bool but `Criteria.larger`, a `u32`.
+///
+/// ⛔ `shapedSeed` writes 0 or 1 into every word, so `larger` was pinned to
+/// {0, 1} on every seed: measured maximum 1 across the whole corpus. `LARGER`
+/// therefore never had more than a single digit to render and the encoder's
+/// u32 decimal path was never asked for a wide number.
+fn shapedSeedLarger(comptime frame: []const u8, comptime bits: u64, comptime larger: u32) []const u8 {
+    return &struct {
+        const tail = blk: {
+            var t: [8 * 8]u8 = @splat(0);
+            for (0..8) |i| std.mem.writeInt(u64, t[i * 8 ..][0..8], (bits >> @intCast(i)) & 1, .little);
+            std.mem.writeInt(u64, t[2 * 8 ..][0..8], larger, .little);
+            break :blk t;
+        };
+        const bytes = std.mem.toBytes(@as(u32, frame.len)) ++ frame[0..frame.len].* ++ tail;
+    }.bytes;
+}
+
 /// SEARCH arguments: `seq_set`, `uid_set` and the flag key, NUL-separated.
 ///
 /// A sequence set is a grammar (`1:*`, `2,4:7`, decimal numbers under u32) and
@@ -645,9 +664,9 @@ fn shapedSeed(comptime frame: []const u8, comptime bits: u64) []const u8 {
 /// only ever demonstrated the refusal — and, with the collapsed draws, not even
 /// that, because all three fields were empty.
 const search_seeds = [_][]const u8{
-    shapedSeed("1:*,2,4:7,9,11:13\x001:429496729,7,9:11\x00\\Seen", 0xFF), // well-formed sets and a system flag
+    shapedSeedLarger("1:*,2,4:7,9,11:13\x001:429496729,7,9:11\x00\\Seen", 0xFF, std.math.maxInt(u32)), // well-formed sets, a system flag, the widest LARGER
     shapedSeed("*\x001\x00$Forwarded", 0x00), // the minimal sets, and a keyword flag
-    shapedSeed("1:2\x003:4\x00NonJunk", 0xAA), // plain ranges and a bare keyword
+    shapedSeedLarger("1:2\x003:4\x00NonJunk", 0xAA, 1_000_000), // plain ranges, a bare keyword, a seven-digit LARGER
     shapedSeed("1:*\x004294967296\x00\\Seen", 0xF0), // refused: a uid past u32
     shapedSeed("1 2\x001\x00\\Seen", 0x55), // refused: a space in the sequence set
     shapedSeed("1\x001\x00Junk\r\nT9 LOGOUT", 0x0F), // refused: a CRLF in the flag
@@ -715,6 +734,11 @@ test "corpus: every SEARCH seed reaches the encoder, and the counts are pinned" 
     var nonempty: usize = 0;
     var arg_octets: usize = 0;
     var encoded: usize = 0;
+    var k_seq: usize = 0;
+    var k_uidset: usize = 0;
+    var k_uidcmd: usize = 0;
+    var k_count: usize = 0;
+    var larger_max: u32 = 0;
     for (search_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var raw: [96]u8 = undefined;
@@ -726,6 +750,11 @@ test "corpus: every SEARCH seed reaches the encoder, and the counts are pinned" 
         const uid = f[1];
         const flag_key = f[2];
         arg_octets += seq.len + uid.len + flag_key.len;
+        if (smith.value(bool)) k_seq += 1;
+        if (smith.value(bool)) k_uidset += 1;
+        larger_max = @max(larger_max, smith.value(u32));
+        if (smith.value(bool)) k_uidcmd += 1;
+        if (smith.value(bool)) k_count += 1;
 
         var buf: [1024]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
@@ -743,4 +772,16 @@ test "corpus: every SEARCH seed reaches the encoder, and the counts are pinned" 
     // 4 of 7: the three refusals are a uid past u32, a space in the sequence
     // set, and a CRLF in the flag key.
     try testing.expectEqual(@as(usize, 4), encoded);
+    // The four bool knobs drawn after the frame. Measured 2026-09-08: all four
+    // already take both values across this corpus, because `shapedSeed` writes
+    // a whole eight-octet word per draw. Pinned so they cannot quietly freeze.
+    try testing.expectEqual(@as(usize, 4), k_seq);
+    try testing.expectEqual(@as(usize, 4), k_uidset);
+    try testing.expectEqual(@as(usize, 3), k_uidcmd);
+    try testing.expectEqual(@as(usize, 4), k_count);
+    // ⛔ The third draw is NOT a bool: `Criteria.larger` is a `u32`, and
+    // `shapedSeed` puts 0 or 1 in every word — measured maximum 1 across the
+    // whole corpus, so `LARGER` never rendered more than one digit.
+    // `shapedSeedLarger` gives two seeds a real width.
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), larger_max);
 }

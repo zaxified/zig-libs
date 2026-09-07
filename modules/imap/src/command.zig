@@ -746,6 +746,15 @@ const cmd_seeds: []const []const u8 = &.{
     &cmdSeed("\x00\xC3\xA9&-INBOX\r\n", 0xF0E1_D2C3_B4A5_9687, 512),
     &cmdSeed("abc\rdef\nghi", 0xFFFF_FFFF_FFFF_FFFF, 512),
     &cmdSeed("\\Seen \\*\r\n\x00", 0x6C62_1F4D_3A98_5E27, 512),
+    // ⛔ The five seeds above all carry bit 0 and bit 2 set, so `quoted_utf8`
+    // and `literal_plus` were TRUE on every one of them: measured 5 of 5 each.
+    // A knob stuck on `true` is as dead as one stuck on `false` — the modified
+    // UTF-7 mailbox encoding (the `quoted_utf8 = false` spelling, which is a
+    // different output entirely) and the synchronising / LITERAL- paths that
+    // only exist when LITERAL+ is off had never been fuzzed. These two carry
+    // the complementary bits.
+    &cmdSeed("{}\\\"\r\n\x00A1", 0x2468_ACE0_1357_9BD0, 512),
+    &cmdSeed("\xC3\xA9&INBOX\x00\r\n", 0x5A5A_5A5A_5A5A_5A0A, 512),
 };
 
 test "fuzz: no command builder can put a second command line on the wire" {
@@ -882,6 +891,11 @@ test "corpus: every command seed reaches the builders, and the argument octets a
     // really read; it was 5 × 1 per seed before, and 0 without a corpus.
     var nonempty: usize = 0;
     var arg_octets: usize = 0;
+    var quoted_utf8: usize = 0;
+    var literal_minus: usize = 0;
+    var literal_plus: usize = 0;
+    var no_sync_cb: usize = 0;
+    var read_only: usize = 0;
     for (cmd_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var raw: [arg_bytes]u8 = undefined;
@@ -890,10 +904,26 @@ test "corpus: every command seed reaches the builders, and the argument octets a
         const in = raw[0..n];
         arg_octets += field(in, 0, 16).len + field(in, 16, 24).len +
             field(in, 40, 24).len + field(in, 64, 16).len + field(in, 80, 16).len;
+        // The five scalar knobs, replayed in the harness's own draw order.
+        if (smith.value(bool)) quoted_utf8 += 1;
+        if (smith.value(bool)) literal_minus += 1;
+        if (smith.value(bool)) literal_plus += 1;
+        if (smith.value(bool)) no_sync_cb += 1;
+        if (smith.value(bool)) read_only += 1;
     }
     try testing.expectEqual(cmd_seeds.len, nonempty);
     // Measured 2026-09-07: 5 of 5 seeds non-empty both before and after (this
     // corpus was shaped for the old `bytes` draw too), but 5 argument octets
-    // in total before and 999 after.
-    try testing.expectEqual(@as(usize, 480), arg_octets);
+    // in total before and 480 after; 672 since the corpus grew to seven seeds.
+    try testing.expectEqual(@as(usize, 672), arg_octets);
+    // The scalar knobs, pinned as counts and not as `> 0`. Measured 2026-09-08
+    // over the five original seeds: `quoted_utf8` 5 of 5 and `literal_plus` 5
+    // of 5 — CONSTANT, so the modified UTF-7 mailbox spelling and the
+    // synchronising / LITERAL- paths were never fuzzed at all. The two seeds
+    // carrying the complementary bits bring both to 5 of 7.
+    try testing.expectEqual(@as(usize, 5), quoted_utf8);
+    try testing.expectEqual(@as(usize, 5), literal_minus);
+    try testing.expectEqual(@as(usize, 5), literal_plus);
+    try testing.expectEqual(@as(usize, 3), no_sync_cb);
+    try testing.expectEqual(@as(usize, 3), read_only);
 }

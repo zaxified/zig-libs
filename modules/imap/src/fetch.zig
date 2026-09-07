@@ -1057,6 +1057,12 @@ test "corpus: every FETCH seed reaches the encoder, and the counts are pinned" {
     var nonempty: usize = 0;
     var arg_octets: usize = 0;
     var encoded: usize = 0;
+    var k_tag: usize = 0;
+    var k_uid: usize = 0;
+    var k_flags: usize = 0;
+    var k_bs: usize = 0;
+    var k_peek: usize = 0;
+    var k_changed: usize = 0;
     for (fetch_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var raw: [96]u8 = undefined;
@@ -1067,6 +1073,12 @@ test "corpus: every FETCH seed reaches the encoder, and the counts are pinned" {
         const seq = f[0];
         const sec = f[1];
         arg_octets += seq.len + sec.len;
+        if (smith.value(bool)) k_tag += 1;
+        if (smith.value(bool)) k_uid += 1;
+        if (smith.value(bool)) k_flags += 1;
+        if (smith.value(bool)) k_bs += 1;
+        if (smith.value(bool)) k_peek += 1;
+        if (smith.value(bool)) k_changed += 1;
 
         var buf: [1024]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
@@ -1083,4 +1095,16 @@ test "corpus: every FETCH seed reaches the encoder, and the counts are pinned" {
     // 4 of 7: the three refusals are a CRLF in the section, a sequence number
     // past u32, and a space in the sequence set.
     try testing.expectEqual(@as(usize, 4), encoded);
+    // The six scalar knobs drawn after the frame. Measured 2026-09-08: every
+    // one of them already takes both values across this corpus — `shapedSeed`
+    // writes a whole eight-octet word per draw, so the input is not exhausted
+    // by the time they run. Pinned as counts rather than left implicit, so a
+    // seed losing its tail (or a draw being added ahead of them) goes red
+    // instead of silently freezing all six on `false`.
+    try testing.expectEqual(@as(usize, 4), k_tag);
+    try testing.expectEqual(@as(usize, 4), k_uid);
+    try testing.expectEqual(@as(usize, 3), k_flags);
+    try testing.expectEqual(@as(usize, 3), k_bs);
+    try testing.expectEqual(@as(usize, 4), k_peek);
+    try testing.expectEqual(@as(usize, 4), k_changed);
 }
