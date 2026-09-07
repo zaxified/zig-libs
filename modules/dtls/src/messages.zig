@@ -1543,6 +1543,11 @@ fn buildClientHelloCorpus(s: *Corpus) []const []const u8 {
     // The same recorded body with one octet flipped, at the three offsets that
     // decide how the rest is read: the session-id length, the legacy cookie
     // length, and the first octet of the cipher-suite list length.
+    //
+    // The transcript cannot be empty (`fuzz_corpus.zig` pins what it yields),
+    // but reading `frames[0]` out of an empty store would be undefined rather
+    // than a smaller corpus, which is the failure nobody notices.
+    std.debug.assert(s.n != 0);
     const first = s.frames[0];
     for ([_]u64{ 34, 35, 36 }) |at| s.push(first, flipAt(at));
 
@@ -1582,6 +1587,7 @@ fn fuzzDecodeClientHello(_: void, smith: *std.testing.Smith) !void {
 
 fn buildServerHelloCorpus(s: *Corpus) []const []const u8 {
     fuzz_corpus.collectHandshakeBodies(s, @intFromEnum(HandshakeType.server_hello), null);
+    std.debug.assert(s.n != 0);
     const first = s.frames[0];
     for ([_]u64{ 34, 35, 37 }) |at| s.push(first, flipAt(at)); // sid len, cipher suite, compression
     var wire: [256]u8 = undefined;
