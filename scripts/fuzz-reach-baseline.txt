@@ -34,7 +34,6 @@ csvstream 2
 ctap2pin 1
 dataset 1
 decimal 2
-devlink 7
 df-elect 2
 diskusage 1
 dkg 2
@@ -45,13 +44,11 @@ dtls 17
 ebpf 5
 encoding 1
 ethfrag 1
-ethtool 4
 falcon 1
 fleetsim 1
 framing 1
 frost 1
 fuzzysearch 2
-genetlink 2
 geoindex 2
 grpc 3
 http 12
@@ -84,9 +81,7 @@ montint 2
 mqtt 1
 musig2 1
 netconf 3
-netlink 5
 nftables 2
-nl80211 7
 noise 1
 ocsp 2
 ocspcache 2
