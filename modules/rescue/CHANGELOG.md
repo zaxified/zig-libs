@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — `fuzzInjective` now carries a corpus, and a guard test pins
+  what it reaches. It had none, so `std.testing.fuzz` replayed exactly one
+  input, the empty one: every draw this harness makes is a scalar one, and a
+  scalar draw over an exhausted input returns its range minimum, so the state
+  was all-zero, `slot` was 0 and `delta` was 0 rewritten to 1 — on every run
+  for ever. One state pair out of a 12-element permutation, with the
+  injectivity claim only ever made about the FIRST coordinate; the other
+  eleven slots were never perturbed. Seeds are word scripts (no `u32` header:
+  the harness never calls `slice`); measured after: 6 of 12 distinct slots, 6
+  of 8 seeds with a non-zero drawn delta, 5 distinct permutation outputs,
+  pinned as exact counts. Test-only; no API change.
+
 - **2026-09-07** — Fuzz reach: `fuzzFramings` only ever ran the empty sequence. It opened
   `smith.value(u8)` as its FIRST draw; a `Smith` scalar draw reads eight octets as a
   little-endian `u64` and returns the range minimum when fewer remain, and the target had
