@@ -63,7 +63,6 @@ slhdsa 1
 spake2plus 1
 sphinx 1
 staticfiles 1
-stun 1
 tar 1
 tenantkex 2
 timelock_envelope 1
