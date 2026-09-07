@@ -5,6 +5,141 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — ⭐ **`goose.fuzzStructuredGoose` had a corpus, and it chose
+  0-or-1 for every decision it made.** The seed generator emitted one
+  little-endian `u64` per draw carrying only a single bit. That was built on the
+  right insight — `Smith` discards a scalar word outside the draw's declared
+  range and returns the range minimum — with the wrong step size, and the
+  arithmetic consequences were total: `gocb_len` (range 1…40) and `go_id_len`
+  (1…26) were **constantly 1**, because 0 is out of range and 1 is the only
+  other value a bit carries; `n_vals` was 0 or 1 of a possible 8; the MMS type
+  switch was 0 or 1 of 0…6, so **five of the seven alternatives were
+  unreachable**, including the `octetString` case with its own nested
+  `smith.bytes`; and every `stNum`, `sqNum`, `confRev` and `timeAllowedToLive`
+  was 0 or 1. The harness's own comment says it lets the fuzzer choose "the
+  names, the replay counters, the timestamp, the flags, the VLAN tag, how many
+  data-set entries and of which MMS types".
+  It now draws one `smith.slice` and reads every choice off a
+  `testkit.fuzz.Cursor`, so a choice octet is an octet. Measured over the same
+  six patterns: **all seven MMS alternatives reached** (was two), `n_vals` up to
+  **8** (was 1), `gocb_ref` up to **27** octets and `go_id` up to **23** (both
+  were 1), a VLAN tag on 4 scripts and Ethernet padding on 6. The corpus keeps
+  one four-octet script on purpose, shorter than the name pool, which reproduces
+  the collapse exactly and is pinned beside the coverage.
+  With this, `check-fuzz-reach` reports **no collapsed target in `iec61850`**:
+  27 at the start of the burn-down, 0 now.
+
+- **2026-09-07** — **`reporting`: the last two R1 harnesses, restructured rather
+  than exempted.** `fuzzRcbWrite` opened with the buffered/unbuffered choice and
+  `fuzzReassemble` with the data-set member count. A ranged first draw returns
+  the range MINIMUM outside `--fuzz`, and once one draw comes up short `Smith`
+  **discards the rest of the input**, so every later choice collapsed too.
+  `fuzzReassemble` was the worse of the two: one member of one octet against a
+  zero PDU budget, and every round's drop decision 0 — meaning every segment
+  dropped, so the reassembler under test was **never handed a segment at all**.
+  That is pinned in the guard rather than asserted: the empty script reproduces
+  the old draws exactly and scores **1 segment emitted, 0 pushed**. The eight
+  seeded scripts score **11 emitted, 6 pushed, 4 reports completed**.
+  `fuzzRcbWrite` now reads the block kind off the seed's first octet and the
+  attribute index off its length: 14 of 14 seeds non-empty, **12 decoded, 2 ok,
+  5 denied, 5 invalid** — where the collapse produced an empty slice and no
+  write at all.
+
+- **2026-09-07** — **`logging`, `scl`, `server` and `settinggroups`: six more
+  harnesses fed, and one of them could never have taken this module's own
+  reference document.** All six had the `smith.bytes` + ranged-length collapse
+  and now draw with one `smith.slice`.
+  ⭐ `scl.fuzzScl`'s buffer was 1024 octets and `scl.sample` — the only complete
+  SCL document this module has — is **4065**. `Smith.slice` reads a seed longer
+  than the buffer back as the EMPTY one, silently, so the reference document
+  could not have passed through the harness at all. The buffer is now 8192 and
+  the guard asserts every seed reads back non-empty, which is what makes that
+  visible instead of silent. `server.fuzzServer` has the same hazard from the
+  other side: its corpus is the captured frame table, and the 6675-octet
+  `GetNameList` reply is filtered out at comptime rather than left to look like
+  a seed.
+  ⚠ `settinggroups.fuzzSgcb` chose its attribute with a **second** scalar draw,
+  which is exhausted by the time it runs and returns the range minimum, so every
+  seed would have gone to `NumOfSG` — read-only, so `denied`, twelve times. The
+  attribute index now comes from the seed's own length.
+  Measured, all zero before: `fuzzJournal` 8 of 8 seeds non-empty, **1 request,
+  4 responses, 1 entry walked, 6 status names**; `fuzzDeletion` 7 of 7, **1
+  InitializeJournal, 4 DeleteJournal, 1 response**; `fuzzScl` 8 of 8, **4 parsed
+  and 2 resolved**; `fuzzFragment` 6 of 7 non-empty (one empty id on purpose),
+  **7 rendered documents parsed**; `fuzzServer` 29 of 29, **3 frames handled
+  without a typed error, 2 answered**; `fuzzSgcb` 12 of 12, **8 decoded, 1 ok,
+  1 denied, 6 invalid**.
+
+- **2026-09-07** — ⭐ **BUGFIX: a direct operate left the finished client's
+  identity on the point.** `Point.operate`'s non-enhanced success path set
+  `state` and `select_deadline_ms` by hand and left `owner` and `ctl_num`
+  holding the command it had just executed, so a `direct-with-normal-security`
+  object came to rest `unselected` while still naming an owner — the state
+  `reset()` exists to avoid. It now calls `reset()`. `fuzzPoint` **asserts
+  exactly this invariant** and had never caught it: its first draw was a ranged
+  one, which returns the range minimum outside `--fuzz`, so `ctl_model` was
+  always `status_only` and every command was refused before it reached the
+  path. The assertion fired on the first seeded run. Pinned as a value test.
+- **2026-09-07** — **`control`: three more harnesses fed.** `fuzzControl` and
+  `fuzzClassify` had the `smith.bytes` + ranged-length collapse and now draw
+  with one `smith.slice`, over corpora lifted out of `controlgoldens.zig` — the
+  captured `Oper`, `LastApplError` and `CommandTermination+` structures a real
+  IED exchanged with a real client, peeled out of the frames layer by layer.
+  `fuzzPoint` was the R1 shape and was **restructured rather than exempted**: it
+  now reads one `smith.slice` and drives the state machine from a byte script
+  (`ctlModel, sboTimeout, execTimeout`, then `advance, ctlNum, op, client` per
+  round), which makes a seed reviewable and every branch reachable. Measured,
+  all zero before: `fuzzControl` 15 of 15 seeds non-empty, **4 commands and 1
+  LastApplError** decoded; `fuzzClassify` 7 of 7, **4 reports, 4 classified**;
+  `fuzzPoint` 9 of 9 scripts, **66 accepted and 102 rejected outcomes** over 288
+  rounds. The collapse is pinned in the same guard: an empty script reproduces
+  the old draws exactly (every read returns the range minimum), and it scores
+  **0 accepted, 32 rejected** — one input, `status_only`, `not_supported` 32
+  times, which is everything the target ever executed.
+
+- **2026-09-07** — **`mms`, `mmsdata`, `report`, `goose` and `sv`: five more
+  decoders that were only ever handed the empty slice.** Same collapse:
+  `smith.bytes(&buf)` followed by a ranged length draw, which returns the range
+  MINIMUM when fewer than eight octets remain. Each now draws with one
+  `smith.slice` and carries a corpus. `sv`, `goose` and `report` build the
+  positive half at run time — from `captured_frame_hex`, `captured_frame_sq3_hex`
+  and the two `captured_report` PDUs — because those exist in this module only as
+  captures or as encoder output, and the harness and its guard build the corpus
+  from the same place. Measured, all zero before: `mms.fuzzDecode` 24 of 24
+  non-empty, **19 decoded (8 requests, 5 responses)**; `report.fuzzReport` 8 of 8,
+  **2 reports and 1 RCB**; `goose.fuzzDecode` 9 of 9, **1 PDU and 2 frames**;
+  `sv.fuzzDecode` 10 of 10, **1 ASDU, 1 savPdu, 1 frame**. The arm counts are
+  pinned separately because each harness branches on them: a corpus of confirmed
+  requests only would leave both response arms as dead as the collapse left them.
+
+- **2026-09-07** — **`ber`, `mmsdata` and `acsi`: four more harnesses that threw
+  their input away, and a round-trip assertion that was false.** `ber.fuzzDecode`,
+  `ber.fuzzIterate`, `mmsdata.fuzzData` and `acsi.fuzzParse` all opened
+  `smith.bytes(&buf)` and then drew the length with a ranged draw, which returns
+  the range MINIMUM when fewer than eight octets remain — the length was **0 for
+  every seed**. `ber.fuzzTagLength` was the other shape: its first draw was
+  `smith.value(u32)`, so all but 1 in 2^32 input words collapsed the tag number
+  to 0, and it never decoded octets a peer could send at all — it only ran
+  encode-then-decode on its own output. It now draws the octets first and runs
+  the codecs in wire order (identifier, then length), feeding the encode
+  direction from those same octets so one seed drives the whole body.
+  Each now carries a corpus taken from this file's own value tests. Measured:
+  `ber.fuzzDecode` 19 of 19 seeds non-empty and **9 decoded**; `ber.fuzzIterate`
+  9 of 9 and **10 members yielded**; `ber.fuzzTagLength` 14 of 15 non-empty (one
+  empty seed on purpose) and **10 tags / 6 lengths** decoded; `mmsdata.fuzzData`
+  22 of 22 and **15 decoded, 14 validated**; `acsi.fuzzParse` 22 of 22 and
+  **4 ACSI / 4 MMS** references parsed. Before the fix every one of those
+  numbers was 0, because every seed read back as the empty slice.
+- **2026-09-07** — ⭐ **`ber.fuzzDecode` asserted something untrue about BER.**
+  Seeding it exposed it: the harness required a definite-length element to
+  re-encode to exactly the octets it arrived in, but `decodeLength` accepts the
+  **non-minimal** long form — X.690 mandates minimal length octets in DER
+  (§10.1), not in BER — so `04 81 03 'a' 'b' 'c'` decodes here and re-encodes as
+  the four-octet `04 03 'a' 'b' 'c'`. The assertion had never executed, because
+  the length draw above it was always 0. It is now guarded on the incoming
+  encoding being minimal, and `a non-minimal long-form length decodes, and does
+  not re-encode to its own octets` pins the behaviour as a value test.
+
 - **2026-09-07** — **Six fuzz harnesses now receive their input; they did not
   before.** `tpkt.fuzzDecode`, `tpkt.fuzzFramer`, `cotp.fuzzDecode`,
   `session.fuzzDecode`, `presentation.fuzzDecode` and `acse.fuzzDecode` all

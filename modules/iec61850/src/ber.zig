@@ -707,6 +707,12 @@ pub const Writer = struct {
 
 const testing = std.testing;
 
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the octets they
+/// are. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw frame would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seedHex;
+
 test "short-form tags round trip" {
     var out: [8]u8 = undefined;
     for ([_]Tag{
@@ -996,20 +1002,63 @@ test "expect surfaces the wrong tag rather than mis-parsing" {
     _ = try expect(&bytes, Tag.ctxc(1));
 }
 
+/// BER elements, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// Lifted from the value tests above: both length forms, both nestings of the
+/// indefinite form, the long-form tag, and one frame for each refusal `decode`
+/// names. Uniform random octets survive `decode` only when the length octets
+/// happen to agree with what follows, so without these the harness proves
+/// little beyond that `Truncated` fires on noise.
+const decode_seeds = [_][]const u8{
+    seed("30080201010201020500"), // the SEQUENCE the iterator test walks
+    seed("A008020105040361626364"), // the element the backwards writer builds
+    seed("A0800201050000"), // indefinite length with its end-of-contents
+    seed("A080A18002010700000000"), // nested indefinite lengths
+    seed("BF4800"), // the long-form tag, context 72
+    seed("A103020107"), // a context-1 constructed element
+    seed("020105"), // a bare INTEGER
+    seed("A281C8" ++ ("AA" ** 200)), // the long-form length the writer emits at 200 octets
+    seed("048103616263"), // a NON-MINIMAL long-form length: legal BER, 81 03 for 3
+    seed("30100102"), // Overrun: a definite length past the buffer
+    seed("0482FFFF00"), // Overrun: 65535 declared over five octets
+    seed("A08002010500"), // MissingEoc: one octet of the terminator
+    seed("A080"), // MissingEoc: nothing at all
+    seed("04800000"), // BadLength: a primitive using the indefinite form
+    seed("FF"), // BadLength: the reserved first length octet
+    seed("82"), // Truncated: a length that names octets that are not there
+    seed("BF"), // Truncated: a long-form tag with no continuation
+    seed("BFFFFFFFFFFF7F"), // a long-form tag number that overflows a u32
+    seed("00"), // one octet: a universal EOC tag with no length
+};
+
 test "fuzz: ber decode never panics and re-encodes consistently" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const n: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `n` was 0 for every seed and `decode` was handed an empty slice with
+    // the seed sitting unread in the buffer.
+    const n: usize = smith.slice(&buf);
     const e = decode(buf[0..n]) catch return;
     try testing.expect(e.total_len <= n);
     try testing.expect(e.content.len <= e.total_len);
-    // A definite-length element must re-encode to exactly the octets it came
-    // from; an indefinite one legitimately re-encodes shorter.
-    if (!e.indefinite) {
+    // A definite-length element re-encodes to exactly the octets it came from
+    // **when those octets were minimal**; an indefinite one legitimately
+    // re-encodes shorter.
+    //
+    // ⚠ The minimality guard is not decoration. `decodeLength` accepts the
+    // non-minimal long form — X.690 §8.1.3 requires minimal length octets in
+    // DER (§10.1), not in BER — so `04 81 03 'a' 'b' 'c'` decodes here and
+    // re-encodes as the four-octet `04 03 'a' 'b' 'c'`. The byte-exact
+    // assertion below was therefore false for input this module's own decoder
+    // accepts, and it had never run: `n` was always 0, so `decode` always
+    // failed and the whole block was unreachable. The seed that shows it is
+    // `048103616263` in the corpus above.
+    if (!e.indefinite and e.total_len == e.tag.encodedLen() + lengthLen(e.content.len) + e.content.len) {
         var out: [1024]u8 = undefined;
         var w = Writer.init(&out);
         const m = w.mark();
@@ -1019,14 +1068,52 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+test "a non-minimal long-form length decodes, and does not re-encode to its own octets" {
+    // ⭐ Found while seeding `fuzzDecode`. X.690 requires minimal length octets
+    // in DER (§10.1) but not in BER, and `decodeLength` follows BER, so this
+    // element is legal input here — and the byte-exact re-encode assertion in
+    // `fuzzDecode` was false for it. That assertion had never executed: the
+    // harness's length draw collapsed to 0, so `decode` always failed.
+    const nonminimal = [_]u8{ 0x04, 0x81, 0x03, 'a', 'b', 'c' };
+    const e = try decode(&nonminimal);
+    try testing.expectEqual(@as(usize, 6), e.total_len);
+    try testing.expectEqualSlices(u8, "abc", e.content);
+    // The writer always emits the minimal form, so it is one octet shorter.
+    var out: [16]u8 = undefined;
+    var w = Writer.init(&out);
+    const m = w.mark();
+    try w.bytes(e.content);
+    try w.header(e.tag, m);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x04, 0x03, 'a', 'b', 'c' }, w.done());
+}
+
+/// Constructed bodies for `Iterator`, in the format `Smith.slice` reads.
+///
+/// The iterator is handed a *body* — the content octets of a constructed
+/// element, not the element — so these are member sequences rather than whole
+/// TLVs, plus the truncations that make `next` refuse rather than spin.
+const iterate_seeds = [_][]const u8{
+    seed("0201010201020500"), // the three members of the iterator value test
+    seed("020105040361626364"), // an INTEGER then an OCTET STRING
+    seed("A103020107" ++ "020105"), // a constructed member followed by a primitive
+    seed("300802"), // Overrun: a member that names more than is present
+    seed("A080020105"), // a member using the indefinite form with no terminator
+    seed("BF480002010500"), // a long-form tag member, then an INTEGER, then an EOC
+    seed("0000"), // a bare end-of-contents pair
+    seed("00"), // one octet
+    seed("FF"), // BadLength as the very first member
+};
+
 test "fuzz: iterating arbitrary constructed bodies terminates" {
-    try std.testing.fuzz({}, fuzzIterate, .{});
+    try std.testing.fuzz({}, fuzzIterate, .{ .corpus = &iterate_seeds });
 }
 
 fn fuzzIterate(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const n: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ Same collapse as `fuzzDecode` above: `smith.bytes` followed by a ranged
+    // length gave `n == 0` for every seed, so the iterator was always
+    // initialised over an empty body and stopped on its first `next`.
+    const n: usize = smith.slice(&buf);
     var it = Iterator.init(buf[0..n]);
     var guard: usize = 0;
     while (true) {
@@ -1040,23 +1127,130 @@ fn fuzzIterate(_: void, smith: *std.testing.Smith) !void {
     }
 }
 
+/// Identifier and length octets, in the format `Smith.slice` reads. These are
+/// headers, not elements: nothing follows them.
+const taglength_seeds = [_][]const u8{
+    seed("3081C8"), // a SEQUENCE with a long-form length of 200
+    seed("A281C8"), // the header the long-form-length writer emits
+    seed("BF4800"), // the long-form tag, context 72, length 0
+    seed("BF8001"), // a long-form tag with a leading zero group
+    seed("BFFFFFFFFFFF7F"), // a tag number that overflows a u32
+    seed("BF1E"), // a long-form tag with no continuation octet
+    seed("0489" ++ "0102030405060708"), // eight length octets: the widest `decodeLength` takes
+    seed("0489010203040506070809"), // nine: BadLength
+    seed("04FF"), // BadLength: the reserved first length octet
+    seed("0480"), // the indefinite form
+    seed("0482"), // Truncated: two length octets promised, none present
+    seed("047F"), // the largest short-form length
+    seed("0400"), // the shortest legal header
+    seed("BF"), // Truncated: a long-form tag and nothing else
+    seed(""), // the empty header: Truncated from both codecs
+};
+
 test "fuzz: tag and length codecs round trip" {
-    try std.testing.fuzz({}, fuzzTagLength, .{});
+    try std.testing.fuzz({}, fuzzTagLength, .{ .corpus = &taglength_seeds });
 }
 
 fn fuzzTagLength(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ This harness used to open `smith.value(u32)`, which `check-fuzz-reach`
+    // classifies R1: a scalar draw reads eight octets as a little-endian u64
+    // and returns the range MINIMUM unless the whole word falls inside the
+    // draw's range, so all but 1 in 2^32 words collapsed the tag number to 0 —
+    // and the harness had no byte string to be faithful to at all, because it
+    // only ever ran encode-then-decode. It now draws the octets FIRST and runs
+    // the codecs in the direction a peer actually drives them (decode), then
+    // feeds the encode direction from those same octets rather than from
+    // further draws, so one seed drives the whole body.
+    var buf: [16]u8 = undefined;
+    const n: usize = smith.slice(&buf);
+    const in = buf[0..n];
     var out: [16]u8 = undefined;
-    const number: u32 = smith.value(u32);
-    const t = Tag{
-        .class = @enumFromInt(smith.value(u2)),
-        .constructed = smith.value(bool),
-        .number = number,
-    };
-    const n = try encodeTag(t, &out);
-    const back = try decodeTag(out[0..n]);
-    try testing.expect(t.eql(back.tag));
 
-    const v: usize = smith.value(u32);
+    // (a) decode → encode → decode, on octets a peer could have sent, in wire
+    // order: the identifier octets, then the length octets that follow them.
+    if (decodeTag(in)) |d| {
+        const m = try encodeTag(d.tag, &out);
+        try testing.expect(d.tag.eql((try decodeTag(out[0..m])).tag));
+        try testing.expectEqual(d.tag.encodedLen(), m);
+        if (decodeLength(in[d.len..])) |l| switch (l.length) {
+            .definite => |v| {
+                const k = try encodeLength(v, &out);
+                try testing.expectEqual(v, (try decodeLength(out[0..k])).length.definite);
+                try testing.expectEqual(lengthLen(v), k);
+            },
+            .indefinite => {},
+        } else |_| {}
+    } else |_| {}
+
+    // (b) encode → decode, with the tag number and the length taken from the
+    // same octets, so a corpus entry reaches this half too.
+    var word: [8]u8 = @splat(0);
+    @memcpy(word[0..@min(word.len, in.len)], in[0..@min(word.len, in.len)]);
+    const t = Tag{
+        .class = @enumFromInt(@as(u2, @truncate(word[0] >> 6))),
+        .constructed = (word[0] & 0x20) != 0,
+        .number = std.mem.readInt(u32, word[0..4], .little),
+    };
+    const tn = try encodeTag(t, &out);
+    try testing.expect(t.eql((try decodeTag(out[0..tn])).tag));
+
+    const v: usize = std.mem.readInt(u32, word[4..8], .little);
     const ln = try encodeLength(v, &out);
     try testing.expectEqual(v, (try decodeLength(out[0..ln])).length.definite);
+}
+
+test "corpus: every seed reaches its decoder, and the accepted counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so these pin the numbers rather than asserting they are > 0.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        if (decode(buf[0..n])) |_| accepted += 1 else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 9), accepted);
+
+    // The iterator corpus is measured by how many members it yields, because
+    // an `Iterator` over an empty body "succeeds" by stopping immediately —
+    // which is the shape of a corpus that reaches nothing.
+    var members: usize = 0;
+    var it_nonempty: usize = 0;
+    for (iterate_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) it_nonempty += 1;
+        var it = Iterator.init(buf[0..n]);
+        while (it.next() catch null) |_| members += 1;
+    }
+    try testing.expectEqual(iterate_seeds.len, it_nonempty);
+    try testing.expectEqual(@as(usize, 10), members);
+
+    // The tag/length corpus carries one empty seed on purpose (both codecs
+    // refuse it), so its non-empty count is one below the corpus size.
+    var tl_nonempty: usize = 0;
+    var tags: usize = 0;
+    var lengths: usize = 0;
+    for (taglength_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [16]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) tl_nonempty += 1;
+        if (decodeTag(buf[0..n])) |d| {
+            tags += 1;
+            if (decodeLength(buf[0..n][d.len..])) |_| lengths += 1 else |_| {}
+        } else |_| {}
+    }
+    try testing.expectEqual(taglength_seeds.len - 1, tl_nonempty);
+    try testing.expectEqual(@as(usize, 10), tags);
+    try testing.expectEqual(@as(usize, 6), lengths);
 }

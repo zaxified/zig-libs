@@ -91,6 +91,59 @@ pub fn seedInto(out: []u8, frame: []const u8) []const u8 {
     return out[0 .. 4 + frame.len];
 }
 
+/// A byte cursor over one corpus seed, for a harness that draws a **shape**
+/// rather than a frame.
+///
+/// ## Why a harness would want this
+///
+/// `check-fuzz-reach` calls a target `R1` when its first draw is a ranged one.
+/// Those are the state-machine and generator harnesses: nothing about them is a
+/// byte string, so there is no frame to be faithful to, and every choice they
+/// make comes from `smith.valueRangeAtMost`. Outside `--fuzz` that is fatal —
+/// a scalar draw reads eight octets as a little-endian `u64` and returns the
+/// range MINIMUM unless the whole word falls inside the range, and after the
+/// first short read `Smith` **discards the rest of the input**, so every later
+/// draw is the minimum too. Measured on `iec61850/control.fuzzPoint`: the one
+/// input it ever ran produced `ctl_model = status_only`, both timeouts 0, and
+/// branch 0 for all 32 rounds — 0 accepted outcomes and 32 identical refusals.
+///
+/// Reading the choices out of one `smith.slice` instead fixes both halves at
+/// once: the draw is byte-first, so the gate is satisfied honestly, and a seed
+/// becomes a reviewable script rather than a sequence of `u64` words nobody can
+/// read. Under `--fuzz` the fuzzer still drives every choice, because it drives
+/// the slice.
+///
+/// A short script **cycles** rather than running out, so a four-octet seed is a
+/// repeating pattern instead of N rounds of the range minimum. An empty script
+/// reads as all zeroes, which reproduces the collapsed harness exactly — useful
+/// as the "before" measurement in a corpus guard.
+pub const Cursor = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    pub fn byte(self: *Cursor) u8 {
+        if (self.bytes.len == 0) return 0;
+        const b = self.bytes[self.at % self.bytes.len];
+        self.at += 1;
+        return b;
+    }
+
+    /// Two octets, big-endian, so a seed written as hex reads in the order it
+    /// is spelled.
+    pub fn word(self: *Cursor) u16 {
+        const hi: u16 = self.byte();
+        const lo: u16 = self.byte();
+        return (hi << 8) | lo;
+    }
+
+    /// `at_least`..`at_most` inclusive. `u32` arithmetic throughout, because
+    /// `at_most - at_least + 1` overflows a `u8` at the full-width span.
+    pub fn ranged(self: *Cursor, at_least: u32, at_most: u32) u32 {
+        std.debug.assert(at_least <= at_most);
+        return at_least + @as(u32, self.byte()) % (at_most - at_least + 1);
+    }
+};
+
 // ── the anchor: what Smith reads back ────────────────────────────────────────
 //
 // These are not round-trips of this file against itself. Each drives the real
@@ -166,6 +219,33 @@ test "hazard 3: the collapsing idiom throws the seed away after reading it" {
     const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     try std.testing.expectEqual(@as(u8, 'G'), buf[0]);
     try std.testing.expectEqual(@as(usize, 0), len);
+}
+
+test "Cursor: a script drives the choices, and a short one cycles" {
+    var c = Cursor{ .bytes = &.{ 0x01, 0x02, 0x03 } };
+    try std.testing.expectEqual(@as(u8, 1), c.byte());
+    try std.testing.expectEqual(@as(u16, 0x0203), c.word());
+    // Cycled, not exhausted: the fourth read is the first octet again.
+    try std.testing.expectEqual(@as(u8, 1), c.byte());
+    try std.testing.expectEqual(@as(u32, 2), c.ranged(0, 4)); // 2 % 5
+    try std.testing.expectEqual(@as(u32, 4), c.ranged(1, 4)); // 1 + 3 % 4
+}
+
+test "Cursor: the empty script is the collapsed harness, exactly" {
+    // The point of this one: it is the "before" measurement a corpus guard
+    // pins. Every read returns the range minimum, which is what a ranged
+    // `Smith` draw returned for the one empty input a corpus-less target ran.
+    var c = Cursor{ .bytes = &.{} };
+    try std.testing.expectEqual(@as(u8, 0), c.byte());
+    try std.testing.expectEqual(@as(u16, 0), c.word());
+    try std.testing.expectEqual(@as(u32, 0), c.ranged(0, 4));
+    try std.testing.expectEqual(@as(u32, 1), c.ranged(1, 8));
+    try std.testing.expectEqual(@as(u32, 7), c.ranged(7, 7));
+}
+
+test "Cursor: a full-width span does not overflow the way a u8 would" {
+    var c = Cursor{ .bytes = &.{0xFF} };
+    try std.testing.expectEqual(@as(u32, 255), c.ranged(0, 255));
 }
 
 test "a seed survives being handed to a second draw" {

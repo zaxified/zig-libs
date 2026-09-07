@@ -1809,25 +1809,106 @@ test "binary time round trips through the decoder" {
     try testing.expectEqual(t.days_since_1984.?, back.days_since_1984.?);
 }
 
+const testkit = @import("testkit");
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the values they
+/// are. A corpus entry is not the value: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw TLV would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = testkit.fuzz.seedHex;
+
+/// RCB attribute values, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// The RCB's attributes take four different `Data` alternatives between them —
+/// `RptID`/`DatSet` are visible strings, `RptEna`/`GI`/`Resv`/`PurgeBuf`
+/// booleans, `SqNum`/`ConfRev`/`BufTm`/`IntgPd` unsigned, `TrgOps`/`OptFlds`
+/// bit strings — so a corpus of one shape reaches `invalid` on most of them and
+/// nothing else.
+/// ⚠ The block kind comes from the seed's first octet (the `Data` tag) and the
+/// attribute index from the seed's **length** — not from further scalar draws,
+/// which are exhausted by the time they run and return the range minimum. Each
+/// comment names the attribute its length selects and the outcome it produces.
+const rcb_seeds = [_][]const u8{
+    seed("8A09525054316162636465"), // URCB RptID, a visible string
+    seed("8403067A80"), // URCB OptFlds, the captured bit string
+    seed("8406020C0000000000"), // URCB TrgOps, a bit string
+    seed("860400000003"), // URCB BufTm, unsigned 3
+    seed("86050000000001"), // URCB SqNum, unsigned
+    seed("860203E8"), // URCB ConfRev, unsigned: read-only
+    seed("8402020C"), // URCB ConfRev, a bit string: read-only and the wrong type
+    seed("860101"), // URCB DatSet, an unsigned where a visible string belongs
+    seed("8A12544553544C442F4C4C4E30244576656E7473"), // URCB IntgPd, a visible string
+    seed("A200"), // URCB Resv, an empty structure
+    seed("830101"), // BRCB ConfRev, a boolean
+    seed("830100"), // BRCB ConfRev, boolean FALSE
+    seed("8601"), // a truncated header: never decodes
+    seed("00"), // one octet: never decodes
+};
+
 test "fuzz: an arbitrary write to an RCB attribute never panics" {
-    try std.testing.fuzz({}, fuzzRcbWrite, .{});
+    try std.testing.fuzz({}, fuzzRcbWrite, .{ .corpus = &rcb_seeds });
 }
 
 fn fuzzRcbWrite(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ This harness used to open `smith.valueRangeAtMost(u8, 0, 1)` — the
+    // buffered/unbuffered choice — which `check-fuzz-reach` classifies R1: a
+    // ranged first draw returns the range MINIMUM outside `--fuzz`, so the
+    // block was always unbuffered, and the byte draw after it collapsed too
+    // (`bytes` then a ranged length), so `len` was 0 and `Data.decode` was
+    // handed an empty slice for every seed. It was restructured rather than
+    // exempted: the octets come first, and the two structural choices are read
+    // off them — the block kind from the seed's length, the attribute index
+    // from its first octet, which is the `Data` tag and so varies with the
+    // alternative the seed carries.
+    var input: [128]u8 = undefined;
+    const len: usize = smith.slice(&input);
     var h: Harness = .{};
     h.src.init() catch return;
-    var cb = h.block(if (smith.valueRangeAtMost(u8, 0, 1) == 1) .buffered else .unbuffered);
-    var input: [128]u8 = undefined;
-    smith.bytes(&input);
-    const len: usize = smith.valueRangeAtMost(u8, 0, input.len);
     const d = mmsdata.Data.decode(input[0..len]) catch return;
     d.validate() catch return;
+    var cb = h.block(if (input[0] & 1 == 1) .buffered else .unbuffered);
     const names = cb.attributes();
-    const which: usize = smith.valueRangeAtMost(u8, 0, @intCast(names.len - 1));
-    _ = cb.writeAttribute(names[which], d, 1, 0);
+    _ = cb.writeAttribute(names[len % names.len], d, 1, 0);
     _ = cb.tick(h.src.source(), 1000) catch {};
     var w = ber.Writer.init(&h.out);
     _ = cb.emitNext(h.src.source(), &w) catch {};
+}
+
+test "corpus: every RCB seed reaches the block, and the outcomes are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so these pin the numbers rather than asserting they are > 0.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var ok: usize = 0;
+    var denied: usize = 0;
+    var invalid: usize = 0;
+    for (rcb_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var input: [128]u8 = undefined;
+        const len: usize = smith.slice(&input);
+        if (len != 0) nonempty += 1;
+        var h: Harness = .{};
+        try h.src.init();
+        const d = mmsdata.Data.decode(input[0..len]) catch continue;
+        d.validate() catch continue;
+        decoded += 1;
+        var cb = h.block(if (input[0] & 1 == 1) .buffered else .unbuffered);
+        switch (cb.writeAttribute(cb.attributes()[len % cb.attributes().len], d, 1, 0)) {
+            .ok => ok += 1,
+            .denied => denied += 1,
+            .invalid => invalid += 1,
+            else => {},
+        }
+    }
+    try testing.expectEqual(rcb_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 12), decoded);
+    try testing.expectEqual(@as(usize, 2), ok);
+    try testing.expectEqual(@as(usize, 5), denied);
+    try testing.expectEqual(@as(usize, 5), invalid);
 }
 
 // ── report segmentation ─────────────────────────────────────────────────────
@@ -2506,19 +2587,34 @@ test "golden: the reservation attributes are the octets a client reads" {
     );
 }
 
-test "fuzz: an arbitrary segment sequence never panics and never hangs" {
-    try std.testing.fuzz({}, fuzzReassemble, .{});
-}
+/// What a segment script did, so the corpus guard can measure a corpus rather
+/// than assert it merely ran.
+const ReassembleOutcome = struct {
+    /// Segments the control block produced.
+    emitted: usize = 0,
+    /// …of which the script did not drop and the reassembler accepted.
+    pushed: usize = 0,
+    /// …and how many of those completed a report.
+    completed: usize = 0,
+};
 
-fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
+/// The body of `fuzzReassemble`, factored out so the harness and the corpus
+/// guard drive the SAME sequence from the same octets. A guard measuring a
+/// different sequence from the one the harness runs is not a guard.
+///
+/// The script layout the cursor reads is `members, payload, budget(2)`, then one
+/// octet per round deciding whether that segment is dropped.
+fn runReassembleScript(bytes: []const u8) !ReassembleOutcome {
+    var c = testkit.fuzz.Cursor{ .bytes = bytes };
     var h: SegHarness = .{};
-    h.src.members = smith.valueRangeAtMost(u8, 1, 8);
-    h.src.payload = smith.valueRangeAtMost(u8, 1, 64);
-    h.src.init() catch return;
-    var cb = h.block(smith.valueRangeAtMost(u16, 0, 400));
+    h.src.members = @intCast(c.ranged(1, 8));
+    h.src.payload = @intCast(c.ranged(1, 64));
+    h.src.init() catch return .{};
+    var cb = h.block(c.word() % 401);
     cb.enable(1, 0);
-    _ = cb.sweep(h.src.source(), .general_interrogation, 1000) catch return;
+    _ = cb.sweep(h.src.source(), .general_interrogation, 1000) catch return .{};
 
+    var out: ReassembleOutcome = .{};
     var slots: [16]report.AssembledEntry = undefined;
     var arena: [512]u8 = undefined;
     var re = report.Reassembler.init(&slots, &arena);
@@ -2527,17 +2623,96 @@ fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
         var w = ber.Writer.init(&h.out);
         const more = cb.emitNext(h.src.source(), &w) catch break;
         if (!more) break;
-        // Randomly drop segments, so the reassembler sees skips as well as
-        // ordered runs.
-        if (smith.valueRangeAtMost(u8, 0, 3) == 0) continue;
+        out.emitted += 1;
+        // Drop segments on the script's say-so, so the reassembler sees skips
+        // as well as ordered runs.
+        if (c.ranged(0, 3) == 0) continue;
         const pdu = mms.decode(w.done()) catch continue;
         var r: report.Report = undefined;
         report.decodeInformationReport(&r, pdu.unconfirmed.body) catch continue;
-        _ = re.push(r) catch {
+        if (re.push(r)) |done| {
+            out.pushed += 1;
+            if (done != null) out.completed += 1;
+        } else |_| {
             re.reset();
             continue;
-        };
+        }
     }
+    return out;
+}
+
+/// Segment scripts: `members, payload, budget(2)`, then one octet per round
+/// where a value of 0 mod 4 drops that segment.
+const reassemble_seeds = [_][]const u8{
+    // Six members of 40 octets against a 400-octet budget — the shape the value
+    // tests use — with nothing dropped.
+    seed("06" ++ "28" ++ "0190" ++ "01"),
+    // The same, dropping every fourth segment.
+    seed("06" ++ "28" ++ "0190" ++ "01010104"),
+    // The same, dropping every segment: the reassembler sees a skip every time.
+    seed("06" ++ "28" ++ "0190" ++ "00"),
+    // One member, one octet, an unbounded budget: nothing is ever segmented.
+    seed("01" ++ "01" ++ "0000" ++ "01"),
+    // Eight members of 64 octets against the smallest budget the block accepts.
+    seed("08" ++ "40" ++ "0001" ++ "01"),
+    // Eight members of 64 against a budget that splits them two or three at a time.
+    seed("08" ++ "40" ++ "00C8" ++ "0102"),
+    // An alternating drop pattern, which is the one that produces out-of-order
+    // SubSeqNums rather than a clean truncation.
+    seed("06" ++ "28" ++ "0190" ++ "0004"),
+    seed("00"), // the degenerate script: every read is the range minimum
+};
+
+test "fuzz: an arbitrary segment sequence never panics and never hangs" {
+    try std.testing.fuzz({}, fuzzReassemble, .{ .corpus = &reassemble_seeds });
+}
+
+fn fuzzReassemble(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ This harness used to open `smith.valueRangeAtMost(u8, 1, 8)` — the
+    // member count — which `check-fuzz-reach` classifies R1: a ranged first
+    // draw returns the range MINIMUM outside `--fuzz`, and once one draw comes
+    // up short `Smith` discards the rest of the input, so EVERY choice
+    // collapsed. One member of one octet against a zero budget, and every
+    // round's drop decision 0, meaning every segment dropped: the reassembler
+    // under test was never handed a segment at all. There is no frame here to
+    // be faithful to, so it was restructured rather than exempted — one
+    // `smith.slice`, and the octets are the script.
+    var script: [64]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runReassembleScript(script[0..n]);
+}
+
+test "corpus: every segment script drives the reassembler, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. The
+    // numbers that matter here are `pushed` and `completed`: a script that
+    // emits segments and pushes none is a corpus that never reaches the code
+    // under test, which is precisely what the collapse produced.
+    var nonempty: usize = 0;
+    var emitted: usize = 0;
+    var pushed: usize = 0;
+    var completed: usize = 0;
+    for (reassemble_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [64]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        const o = try runReassembleScript(script[0..n]);
+        emitted += o.emitted;
+        pushed += o.pushed;
+        completed += o.completed;
+    }
+    try testing.expectEqual(reassemble_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 11), emitted);
+    try testing.expectEqual(@as(usize, 6), pushed);
+    try testing.expectEqual(@as(usize, 4), completed);
+
+    // ⭐ And what the collapse produced, kept as a measurement rather than a
+    // story. An empty script makes every cursor read return 0, which is exactly
+    // what the old ranged draws returned outside `--fuzz` — and the empty input
+    // was the ONLY input a target with no corpus ever executed.
+    const collapsed = try runReassembleScript(&.{});
+    try testing.expectEqual(@as(usize, 1), collapsed.emitted);
+    try testing.expectEqual(@as(usize, 0), collapsed.pushed);
 }
 
 test "writing back the DatSet a client just read is a no-op, not a ConfRev bump" {

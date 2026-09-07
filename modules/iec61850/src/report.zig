@@ -1016,20 +1016,107 @@ test "an RCB structure that stops early is refused" {
     try testing.expectError(error.TruncatedReport, Rcb.decode(try mmsdata.Data.decode(&short), .unbuffered));
 }
 
+const testkit = @import("testkit");
+/// `testkit.fuzz.seedHex`, aliased so the literals below read as the structures
+/// they are. A corpus entry is not the structure: `Smith.slice` reads a
+/// little-endian `u32` length first, so a raw TLV would arrive minus its own
+/// first four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = testkit.fuzz.seedHex;
+
+/// The literal half of the corpus. `fuzzReport` runs three decoders over the
+/// same slice — `decodeInformationReport`, `mmsdata.Data.decode` and
+/// `Rcb.decode` on both variants — so it carries an RCB structure as well as
+/// the shapes each of them refuses.
+const report_seeds = [_][]const u8{
+    // The URCB a real IED returned for `LLN0$RP$EventsRCB01`.
+    seed("A2478A074576656E7473318301008301008A1D73696D706C65494F47656E65726963494F2F4C4C4E30244576656E74738601018403067A808601328601008402020C860203E8830100"),
+    seed("A20E8A03616263830100830100860101"), // WrongDataType: an RCB that stops early
+    seed("A2058A03616263"), // TruncatedReport: too few members entirely
+    seed("A200"), // an empty structure
+    seed("A064"), // an InformationReport header with no body
+    seed("00"), // one octet
+};
+
+/// The whole corpus: the literals above plus the two captured reports. Those
+/// are whole `unconfirmed` PDUs and `decodeInformationReport` wants the service
+/// *body*, so the bodies are peeled off by `mms.decode` at run time rather than
+/// pasted — a paste would freeze a second copy of the capture and would drift
+/// the moment the PDU wrapper changed.
+///
+/// ⭐ The fuzz harness and the corpus guard below both build the corpus from
+/// HERE. A guard measuring a different corpus from the one the harness gets is
+/// not a guard.
+const Corpus = struct {
+    first_store: [4 + captured_report.len]u8 = undefined,
+    integ_store: [4 + captured_report_integrity.len]u8 = undefined,
+    entries: [report_seeds.len + 2][]const u8 = undefined,
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        @memcpy(self.entries[0..report_seeds.len], &report_seeds);
+        self.entries[report_seeds.len + 0] = testkit.fuzz.seedInto(
+            &self.first_store,
+            (try mms.decode(&captured_report)).unconfirmed.body,
+        );
+        self.entries[report_seeds.len + 1] = testkit.fuzz.seedInto(
+            &self.integ_store,
+            (try mms.decode(&captured_report_integrity)).unconfirmed.body,
+        );
+        return &self.entries;
+    }
+};
+
 test "fuzz: report decode never panics" {
-    try std.testing.fuzz({}, fuzzReport, .{});
+    var corpus: Corpus = .{};
+    try std.testing.fuzz({}, fuzzReport, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzReport(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all three decoders were handed an empty
+    // slice with the seed sitting unread in the buffer.
+    const len: usize = smith.slice(&buf);
     var r: Report = undefined;
     decodeInformationReport(&r, buf[0..len]) catch {};
     const d = mmsdata.Data.decode(buf[0..len]) catch return;
     d.validate() catch return;
     _ = Rcb.decode(d, .unbuffered) catch {};
     _ = Rcb.decode(d, .buffered) catch {};
+}
+
+test "corpus: every seed reaches the decoders, and the accepted counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so these pin the numbers rather than asserting they are > 0.
+    //
+    // Both counts are pinned because the harness has two independent halves and
+    // a corpus of RCB structures alone would leave `decodeInformationReport` as
+    // dead as it was when `len` was always 0.
+    var nonempty: usize = 0;
+    var reports: usize = 0;
+    var rcbs: usize = 0;
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var r: Report = undefined;
+        if (decodeInformationReport(&r, buf[0..len])) |_| reports += 1 else |_| {}
+        if (mmsdata.Data.decode(buf[0..len])) |d| {
+            if (Rcb.decode(d, .unbuffered)) |_| rcbs += 1 else |_| {}
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 2), reports);
+    try testing.expectEqual(@as(usize, 1), rcbs);
 }
 
 // ── reassembly ──────────────────────────────────────────────────────────────

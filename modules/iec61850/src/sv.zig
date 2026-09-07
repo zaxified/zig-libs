@@ -438,14 +438,65 @@ test "an SV frame carries a VLAN tag the same way GOOSE does" {
     try testing.expectEqualSlices(u8, pdu_copy, back.pdu);
 }
 
+const testkit = @import("testkit");
+/// `testkit.fuzz.seedHex`, aliased so the literals below read as the frames
+/// they are. A corpus entry is not the frame: `Smith.slice` reads a
+/// little-endian `u32` length first, so a raw frame would arrive minus its own
+/// first four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = testkit.fuzz.seedHex;
+
+/// The literal half of the corpus: one well-formed ASDU and the refusals the
+/// value tests above name. `decodeFrame`, `SavPdu.decode` and `Asdu.decode` all
+/// see the same slice, so it carries all three levels.
+const decode_seeds = [_][]const u8{
+    seed("300F800161820200018304000000018700"), // a minimal well-formed ASDU
+    seed("300A80016182030000018700"), // LengthMismatch: a three-octet smpCnt
+    seed("3009800161830200018700"), // LengthMismatch: a two-octet confRev
+    seed("30028700"), // MissingField: an ASDU with no svID
+    seed("300D80016182020001820200028700"), // DuplicateField: two [2] smpCnt
+    seed("00000000000000000000"), // ShortFrame / NotGoose: ten zero octets
+    seed("6000"), // an empty savPdu
+    seed("00"), // one octet
+};
+
+/// The whole corpus: the literals above plus the captured publisher's frame at
+/// all three levels it is decoded at. Those exist only as `captured_frame_hex`
+/// and as what `decodeFrame` peels off it, so they are built at run time rather
+/// than pasted — a paste would freeze a second copy of the golden.
+///
+/// ⭐ The fuzz harness and the corpus guard below both build the corpus from
+/// HERE. A guard measuring a different corpus from the one the harness gets is
+/// not a guard.
+const Corpus = struct {
+    frame: [512]u8 = undefined,
+    frame_store: [4 + 512]u8 = undefined,
+    pdu_store: [4 + 512]u8 = undefined,
+    entries: [decode_seeds.len + 2][]const u8 = undefined,
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        const bytes = unhex(captured_frame_hex, &self.frame);
+        const f = try decodeFrame(bytes);
+        @memcpy(self.entries[0..decode_seeds.len], &decode_seeds);
+        self.entries[decode_seeds.len + 0] = testkit.fuzz.seedInto(&self.frame_store, bytes);
+        self.entries[decode_seeds.len + 1] = testkit.fuzz.seedInto(&self.pdu_store, f.pdu);
+        return &self.entries;
+    }
+};
+
 test "fuzz: sv decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    var corpus: Corpus = .{};
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all three decoders were handed an empty
+    // slice with the seed sitting unread in the buffer — the re-encode identity
+    // at the end of this function was unreachable.
+    const len: usize = smith.slice(&buf);
     _ = Asdu.decode(buf[0..len]) catch {};
     _ = SavPdu.decode(buf[0..len]) catch {};
     const f = decodeFrame(buf[0..len]) catch return;
@@ -453,4 +504,37 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var out: [1024]u8 = undefined;
     const again = SavPdu.encode(p.list(), &out) catch return;
     try testing.expectEqualSlices(u8, f.pdu, again);
+}
+
+test "corpus: every seed reaches the decoders, and the accepted counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach — `bacnet/service` once scored 19 of 19 because decoding "" is
+    // legal there — so these pin the numbers rather than asserting they are > 0.
+    //
+    // `frames` is the one that matters most: everything after `decodeFrame` in
+    // the harness — the PDU decode, the re-encode identity — is unreachable
+    // unless at least one seed is a whole Ethernet frame.
+    var nonempty: usize = 0;
+    var asdus: usize = 0;
+    var pdus: usize = 0;
+    var frames: usize = 0;
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (Asdu.decode(buf[0..len])) |_| asdus += 1 else |_| {}
+        if (SavPdu.decode(buf[0..len])) |_| pdus += 1 else |_| {}
+        if (decodeFrame(buf[0..len])) |_| frames += 1 else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 1), asdus);
+    try testing.expectEqual(@as(usize, 1), pdus);
+    try testing.expectEqual(@as(usize, 1), frames);
 }
