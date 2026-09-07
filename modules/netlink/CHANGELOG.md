@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **The netns bridge integration test failed on any host with
+  the tunnel modules loaded, and the module was fine.** `upAllButLoopback`
+  identified the kernel-named veth peer positionally, resting on an assumption it
+  stated in prose: *"a fresh netns holds exactly `lo`, the bridge, the port and
+  the peer"*. It does not. The kernel auto-creates `sit0`, `gre0`, `gretap0` and
+  `erspan0` in EVERY new namespace when those modules are loaded — measured on a
+  7.0 kernel: `unshare -rn ip link show` lists **five** devices, not one. So the
+  walk found four candidates, its own `TestAmbiguousVethPeer` guard fired, and the
+  suite went red over the host's module list. ⭐ The guard was right to exist and
+  right to fire; the assumption behind it was the defect. Two of the four
+  auto-created devices are `ARPHRD_ETHER` with an all-zero MAC, so no property of
+  a single link tells them from a veth end — what separates them is *when* they
+  appeared, so the namespace is now snapshotted before anything is created and
+  the peer is the one new device that is neither bridge nor port. Confirmed
+  causal: emptying the snapshot reproduces the old failure exactly. Test-only.
+
 - **2026-09-07** — **the five fuzz harnesses fetched their input and threw it away.** Each
   opened `smith.bytes(&buf)` and then sliced the buffer to
   `smith.valueRangeAtMost(u16, 0, buf.len)`. A `Smith` ranged draw reads eight input octets as

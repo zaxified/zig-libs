@@ -4142,22 +4142,61 @@ fn monotonicNanos() i128 {
     return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
 }
 
-/// Admin-up every non-loopback device in the namespace and return the index of
-/// the veth peer — the one device that is neither the bridge nor the port. Its
-/// name is chosen by the kernel, so it can only be identified positionally.
+/// The devices the namespace already held before this test created anything.
 ///
-/// "The one device" is an assumption about the namespace, so it is checked
-/// rather than assumed: a fresh netns holds exactly `lo`, the bridge, the port
-/// and the peer. If a second candidate ever appeared, the old code silently
-/// kept the last one it walked past, and the "deleting one end takes the peer
-/// with it" check at the end of the round-trip would then have been asserting
-/// something about the wrong device.
-fn upAllButLoopback(nl: *Socket, br_index: u32, port_index: u32) !?u32 {
+/// ⛔ **A fresh netns is not empty**, which is what the previous version of the
+/// code below assumed in prose: *"a fresh netns holds exactly `lo`, the bridge,
+/// the port and the peer"*. When the tunnel modules are loaded, the kernel
+/// auto-creates `sit0`, `gre0`, `gretap0` and `erspan0` in EVERY new namespace.
+/// Measured on a 7.0 kernel, 2026-09-07: `unshare -rn ip link show` lists
+/// **five** devices, not one — so `upAllButLoopback` found four candidates for
+/// "the veth peer", its own guard fired, and this integration test failed with
+/// `TestAmbiguousVethPeer` on a host where nothing was wrong with the module.
+///
+/// The guard was right to exist and right to fire — the assumption behind it was
+/// the defect. Two of the four are `ARPHRD_ETHER` with an all-zero MAC, so no
+/// property of a single link separates them from a veth end; what does separate
+/// them is WHEN they appeared. Hence a snapshot rather than a filter.
+const NetnsPreexisting = struct {
+    idx: [16]u32 = @splat(0),
+    len: usize = 0,
+
+    fn capture(nl: *Socket) !NetnsPreexisting {
+        var out: NetnsPreexisting = .{};
+        const ls = try nl.links();
+        defer std.heap.page_allocator.free(ls); // global-alloc-ok: fork()'d child of a netns integration test
+        for (ls) |l| {
+            if (out.len == out.idx.len) return error.TestTooManyPreexistingLinks;
+            out.idx[out.len] = l.index;
+            out.len += 1;
+        }
+        return out;
+    }
+
+    fn holds(self: *const NetnsPreexisting, index: u32) bool {
+        return std.mem.indexOfScalar(u32, self.idx[0..self.len], index) != null;
+    }
+};
+
+/// Admin-up the bridge, the port and the veth peer, and return the peer's index.
+///
+/// The peer is the one device that is neither the bridge nor the port and was
+/// not already in the namespace — its name is kernel-generated, so it cannot be
+/// looked up, and (see `NetnsPreexisting`) it cannot be told apart from an
+/// auto-created tunnel device by any property of the link itself.
+///
+/// The "exactly one candidate" check is kept: if a second new device ever
+/// appeared, the old code silently kept the last one it walked past, and the
+/// "deleting one end takes the peer with it" check at the end of the round-trip
+/// would then have been asserting something about the wrong device.
+fn upAllButLoopback(nl: *Socket, pre: *const NetnsPreexisting, br_index: u32, port_index: u32) !?u32 {
     const ls = try nl.links();
     defer std.heap.page_allocator.free(ls); // global-alloc-ok: called only from the fork()'d child of a netns bridge integration test
     var peer: ?u32 = null;
     for (ls) |l| {
         if (l.flags & IFF.LOOPBACK != 0) continue;
+        const is_ours = l.index == br_index or l.index == port_index or !pre.holds(l.index);
+        if (!is_ours) continue;
         try nl.linkUp(l.index);
         if (l.index != br_index and l.index != port_index) {
             if (peer != null) return error.TestAmbiguousVethPeer;
@@ -4185,6 +4224,12 @@ fn netnsBridgeRoundTrip() !bool {
 fn netnsBridgeRoundTripOn(nl: *Socket) !bool {
     const gpa = std.heap.page_allocator; // global-alloc-ok: called only from netnsBridgeRoundTrip, the fork()'d child of a netns integration test
 
+    // ⛔ Snapshot BEFORE creating anything: a fresh netns already holds the
+    // kernel's auto-created tunnel devices on any host with those modules
+    // loaded. See `NetnsPreexisting`.
+    netnsStep("capturePreexisting");
+    const pre = try NetnsPreexisting.capture(nl);
+
     // 1. Bridge with VLAN filtering on, plus a veth pair to enslave.
     netnsStep("bridgeAdd");
     nl.bridgeAdd(.{
@@ -4210,7 +4255,7 @@ fn netnsBridgeRoundTripOn(nl: *Socket) !bool {
     // kernel answers ENETDOWN to a FORWARDING state change. The peer's name is
     // kernel-generated, so bring every non-loopback device up.
     netnsStep("upAllButLoopback");
-    const peer = try upAllButLoopback(nl, br.index, port.index);
+    const peer = try upAllButLoopback(nl, &pre, br.index, port.index);
     // …and admin-up is only half of it: the operational state the bridge
     // actually checks is published asynchronously. See `waitOperUp`.
     netnsStep("waitOperUp(port)");
