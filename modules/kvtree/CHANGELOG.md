@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** `fuzzRecover` had **no seed
+  corpus at all**, so outside `--fuzz` it ran exactly one input — the empty one
+  — and every one of its fifteen knobs was its own range minimum. Traced
+  through: both meta slots were stamped `{txn_id 0, root 0, free_root 0,
+  free_count 0, high_water 0}` and `candidateValid` rejected each at
+  `pageIdOk(0, 0)`, its FIRST bounds check. The tree walk never took a step,
+  `leafViewSafe`/`branchViewSafe` were never called, the freelist chain walk and
+  both cycle guards never ran, and `recover` returned `error.Unrecoverable` on
+  the only input the ordinary lane has ever given it. A short seed could not
+  have fixed it either: the harness opens with `smith.bytes` over a 24 576-octet
+  page image, and `Smith.bytes` consumes `@min(out.len, in.len)`, so anything
+  shorter is swallowed whole and leaves the knobs nothing.
+
+  Ten corpus entries are now built at run time — a full page image plus the knob
+  words — and a corpus-guard test pins what they reach: 12 meta slots stamped,
+  data pages stamped 25 random / 10 leaf / 1 branch / 4 freelist, **3 of 10
+  seeds recovered** (txn_ids 5, 9 and 7, pinned by their sum so one seed cannot
+  mask another), 1 of them adopted through a branch root and 1 with a walked and
+  totalled freelist chain. The seven refusals are the ones the walk exists for:
+  a chain count one over `Freelist.capacity`, a `next` pointing at its own page,
+  a `high_water` past the end of the file, a root below `first_data_page`, a
+  `free_count` of 2^64-1 against an empty freelist, both meta slots left as raw
+  fill, and a leaf page over `0xff` fill whose `count` reads 65 535 — the exact
+  shape `leafViewSafe` was added to reject, asserted directly in the guard.
+
 - **2026-08-25** — **Fixed: the store grew for ever under a steady write load.** Chain
   storage for the freelist was allocated from `Pager.growOne` only, never from the
   freelist itself — a simplification taken to dodge the chicken-and-egg of a freelist
