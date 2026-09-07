@@ -51,7 +51,6 @@ frost 1
 fuzzysearch 2
 geoindex 2
 grpc 3
-http 12
 ibe 1
 icmp 1
 iec104 4

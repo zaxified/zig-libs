@@ -679,17 +679,99 @@ test "TooManyRanges via a small out buffer" {
 // pathological header always terminates in a typed error rather than
 // looping.
 
+// ⚠ This used to open with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so `len` was 0 on every
+// input a corpus can carry and `parse` was handed an EMPTY header, which is
+// `error.InvalidUnit` before `Iterator.next` is reached even once. The
+// termination property this harness exists to exercise therefore never ran.
+// One `slice` draw reads the corpus entry's own length header instead.
+
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the `Range` header
+/// values it is. A corpus entry is not the frame: the length draw reads a
+/// little-endian `u32` first, so a raw header would arrive minus its own first
+/// four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// `Range` header values, in the format the length draw reads. Both halves the
+/// value tests pin: the sets that parse (all three spec shapes, OWS, elided
+/// commas, a case-insensitive unit) and every refusal — a bad unit, an inverted
+/// range, the overflow ceiling and `TooManyRanges`, which is the only one that
+/// needs a long header.
+const range_seeds = [_][]const u8{
+    seed("bytes=0-499"), // one absolute range
+    seed("bytes=500-"), // an open-ended range
+    seed("bytes=-500"), // a suffix range
+    seed("bytes=-0"), // a zero-length suffix: well-formed
+    seed("  bytes = 0-499, 500-999 ,\t-100  "), // three specs with OWS everywhere
+    seed("bytes=0-0,,1-1"), // a stray comma between specs
+    seed("bytes=, 0-1 ,"), // leading and trailing commas
+    seed("BYTES=0-1"), // the unit is case-insensitive
+    seed("bytes=0-18446744073709551615"), // the largest position that still fits u64
+    seed("bytes=0-0,1-1,2-2,3-3,4-4,5-5,6-6,7-7,8-8,9-9,10-10,11-11,12-12,13-13,14-14,15-15"), // exactly `default_max_ranges`
+    seed("bytes=0-0,1-1,2-2,3-3,4-4,5-5,6-6,7-7,8-8,9-9,10-10,11-11,12-12,13-13,14-14,15-15,16-16"), // one more: TooManyRanges
+    seed("items=0-1"), // a unit that is not "bytes"
+    seed("bytes 0-499"), // no '=' after the unit
+    seed("=0-1"), // no unit at all
+    seed("bytes=500-499"), // first > last
+    seed("bytes=abc"), // not a range at all
+    seed("bytes=-"), // a bare dash
+    seed("bytes=1-2-3"), // three positions
+    seed("bytes="), // an empty set
+    seed("bytes=,,"), // nothing but commas
+    seed("bytes=1a-2"), // trailing garbage on a position
+    seed("bytes=0-499, oops"), // one good spec then a bad one
+    seed("bytes=+1-2"), // a signed position
+    seed("bytes=1_0-20"), // a digit separator
+    seed("bytes=0-99999999999999999999999"), // a last position that overflows u64
+    seed("bytes=-99999999999999999999999"), // a suffix length that overflows u64
+};
+
 test "fuzz: Range header parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzRangeParse, .{});
+    try testing.fuzz({}, fuzzRangeParse, .{ .corpus = &range_seeds });
 }
 
 fn fuzzRangeParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
     var out: [default_max_ranges]ByteRangeSpec = undefined;
     _ = parse(buf[0..len], &out) catch return;
+}
+
+test "corpus: every Range seed reaches the parser, and the specs decoded are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, drawing
+    // exactly the way the harness does.
+    //
+    // Specs decoded is the second number. `parse("")` is `error.InvalidUnit`,
+    // so "some seeds were refused" was already true of the collapsed draw —
+    // true of the ONE input it ever ran. A spec written into `out` is
+    // something no empty header can produce.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var specs_decoded: usize = 0;
+    var suffixes: usize = 0;
+    for (range_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        var out: [default_max_ranges]ByteRangeSpec = undefined;
+        const specs = parse(buf[0..len], &out) catch continue;
+        accepted += 1;
+        specs_decoded += specs.len;
+        for (specs) |s| {
+            if (s == .suffix) suffixes += 1;
+        }
+    }
+    try testing.expectEqual(range_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 26 seeds non-empty, 0 accepted, 0 specs and 0
+    // suffix specs before the draw was fixed; 26 / 10 / 28 / 3 after.
+    try testing.expectEqual(@as(usize, 10), accepted);
+    try testing.expectEqual(@as(usize, 28), specs_decoded);
+    try testing.expectEqual(@as(usize, 3), suffixes);
 }
 
 test "iterator streams specs and terminates" {
