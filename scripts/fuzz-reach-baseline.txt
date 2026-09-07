@@ -63,12 +63,10 @@ timelock_envelope 1
 tlsresume 2
 tracecontext 1
 tsdb 2
-tz 2
 uci 2
 validate 2
 voprf 1
 xmldsig 1
 xmlenc 1
 xmss 1
-yaml 2
 zipstream 1
