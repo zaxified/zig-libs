@@ -302,7 +302,7 @@ const module_list = [_]Module{
     .{ .name = "otp", .libs = &.{"crypto"} },
     .{ .name = "ctap2pin", .libs = &.{"crypto"}, .deps = &.{"p256"} },
     .{ .name = "bls12_381", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
-    .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" } },
+    .{ .name = "bbs", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" }, .test_deps = &.{"testkit"} },
     .{ .name = "coconut", .libs = &.{"crypto"}, .deps = &.{"bls12_381"}, .heavy = true },
     .{ .name = "tlock", .libs = &.{"crypto"}, .deps = &.{ "bls12_381", "entropy" } },
     // `tlock` is a TEST-only dep: `ibe/src/kat_test.zig` drives `ibe`'s own

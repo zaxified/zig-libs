@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Test-only, no production change: all three fuzz targets were
+  replaying a single input. `fuzzProofFromBytes` opened `smith.bytes(&buf)` and then
+  drew its length with `smith.valueRangeAtMost(u32, 0, 352)`; a ranged `Smith` draw
+  reads eight octets as a little-endian `u64` and returns the range MINIMUM when fewer
+  than eight remain, and `bytes` had already eaten them — so `len` was **0** on every
+  round the ordinary lane ever ran, and `Proof.fromBytes` returned
+  `InvalidProofEncoding` off the length check with the proof sitting unread in `buf`.
+  Replaced with one `smith.slice(&buf)`. The other half was the corpus: none of the
+  three targets had one, so outside `--fuzz` each executed exactly one input for ever
+  (the all-zero buffer). A `bls12_381` point in the form these decoders accept is
+  structurally unreachable from arbitrary bytes — a compressed G1/G2 string has to land
+  on the curve AND in the prime-order subgroup — so the seeds come out of the module's
+  own `sign`/`proofGen` with the draft's mocked scalars, plus targeted perturbations.
+  Measured by the three new `corpus:` guards: Signature 5 non-zero seeds / 1 accepted,
+  PublicKey 4 / 2 accepted / 2 distinct keys (the y-sign flip decodes to -P), Proof 9
+  non-empty of 10 / 3 accepted / 4 `m_hat` scalars decoded. The `m_hat` and distinct-key
+  counts are pinned deliberately: `accepted > 0` would survive a corpus that collapsed
+  onto one frame, those numbers would not.
+
 - **2026-08-18** — Portability fix (`check-portable`): `createGeneratorsWithSeed`'s
   generator-index loop counter `i` was `u64`, used both to index `out[i - 1]` and to
   serialize `I2OSP(i, 8)` into the wire format — the array index fails to compile on a

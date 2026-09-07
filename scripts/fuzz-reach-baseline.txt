@@ -7,7 +7,6 @@
 # Modules absent from this file must have ZERO collapsed targets.
 
 adaptor 1
-bbs 1
 bip32 2
 bip340 1
 bitcoinscript 2

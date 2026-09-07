@@ -785,6 +785,9 @@ pub fn proofVerify(
 // ── tests (REAL, ungated — Signature/Proof codec only) ───────────────────
 
 const testing = std.testing;
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// framing helpers.
+const testkit = @import("testkit");
 
 test "Signature.encoded_bytes is 80 (48 G1 compressed + 32 Fr)" {
     try testing.expectEqual(@as(usize, 80), Signature.encoded_bytes);
@@ -1047,8 +1050,85 @@ test "RNG seam: calculateRandomScalars really draws entropy, and round-trips thr
 
 // ── fuzz harnesses (untrusted-wire decoders) ────────────────────────────
 
+/// The one signature/public key/proof triple every corpus below is cut from.
+///
+/// ⛔ These are not literals because none of them can be: a `bls12_381` point
+/// in the form the decoders accept is structurally unreachable from arbitrary
+/// bytes — a compressed G1 octet string has to land on the curve AND in the
+/// prime-order subgroup, and `Fr.fromBytes` refuses anything `>= r`. Drawn
+/// bytes produce refusals; only the module's own encoders produce acceptances.
+/// So the fixtures come out of `sign` and `proofGen` with the draft's own
+/// mocked scalars, which makes them deterministic and reviewable.
+const Fixtures = struct {
+    sig: [Signature.encoded_bytes]u8 = undefined,
+    pk: [PublicKey.encoded_bytes]u8 = undefined,
+    /// U = 0, so `Proof.encodedLen(0)` = 192 octets — the floor exactly.
+    proof_u0: [Proof.encodedLen(0)]u8 = undefined,
+    /// Three messages, one disclosed: U = 2, 256 octets.
+    proof_u2: [Proof.encodedLen(2)]u8 = undefined,
+
+    fn build(self: *Fixtures) void {
+        var sk_bytes = [_]u8{0} ** 32;
+        sk_bytes[31] = 1;
+        const sk = SecretKey.fromBytes(sk_bytes) catch unreachable;
+        const pk = keys.skToPk(sk);
+        self.pk = pk.toBytes();
+
+        const one = [_][]const u8{"only message"};
+        self.sig = sign(testing.allocator, sk, pk, "header", &one) catch unreachable;
+
+        const rs0 = cs.mockedRandomScalars(3, "corpus");
+        const p0 = proofGen(testing.allocator, pk, self.sig, "header", "", &one, &.{0}, &rs0) catch unreachable;
+        defer testing.allocator.free(p0);
+        @memcpy(&self.proof_u0, p0);
+
+        const three = [_][]const u8{ "m0", "m1", "m2" };
+        const sig3 = sign(testing.allocator, sk, pk, "header", &three) catch unreachable;
+        const rs2 = cs.mockedRandomScalars(5, "corpus");
+        const p2 = proofGen(testing.allocator, pk, sig3, "header", "", &three, &.{0}, &rs2) catch unreachable;
+        defer testing.allocator.free(p2);
+        @memcpy(&self.proof_u2, p2);
+    }
+};
+
+/// ⚠ A `smith.bytes(&buf)` harness reads its corpus entry RAW — there is no
+/// `u32` length header in front of it, so these are the frames themselves and
+/// NOT `testkit.fuzz.seed` wrappers. (`Proof` below is the other case.)
+const SigCorpus = struct {
+    store: [6][Signature.encoded_bytes]u8 = undefined,
+    entries: [6][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *SigCorpus, frame: [Signature.encoded_bytes]u8) void {
+        self.store[self.n] = frame;
+        self.entries[self.n] = &self.store[self.n];
+        self.n += 1;
+    }
+
+    fn build(self: *SigCorpus, fx: *const Fixtures) []const []const u8 {
+        self.push(fx.sig); // the real signature: A ‖ e
+        var t = fx.sig;
+        t[0] ^= 0x01; // A's leading octet: flags/sign bits mangled
+        self.push(t);
+        t = fx.sig;
+        t[40] ^= 0x40; // one octet inside A: off the curve
+        self.push(t);
+        t = fx.sig;
+        @memset(t[G1.compressed_bytes..], 0); // e = 0, refused as a scalar
+        self.push(t);
+        t = fx.sig;
+        @memset(t[G1.compressed_bytes..], 0xff); // e >= r
+        self.push(t);
+        self.push(@splat(0)); // the all-zero buffer, the only input this ever ran
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: Signature.fromBytes never crashes on arbitrary bytes" {
-    try testing.fuzz({}, fuzzSignatureFromBytes, .{});
+    var fx: Fixtures = .{};
+    fx.build();
+    var corpus: SigCorpus = .{};
+    try testing.fuzz({}, fuzzSignatureFromBytes, .{ .corpus = corpus.build(&fx) });
 }
 
 fn fuzzSignatureFromBytes(_: void, smith: *std.testing.Smith) !void {
@@ -1058,8 +1138,66 @@ fn fuzzSignatureFromBytes(_: void, smith: *std.testing.Smith) !void {
     _ = sig.toBytes();
 }
 
+test "corpus: Signature seeds reach the decoder, and the accepted count is pinned" {
+    var fx: Fixtures = .{};
+    fx.build();
+    var corpus: SigCorpus = .{};
+    var nonzero: usize = 0;
+    var accepted: usize = 0;
+    for (corpus.build(&fx)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Signature.encoded_bytes]u8 = undefined;
+        smith.bytes(&buf);
+        if (!std.mem.allEqual(u8, &buf, 0)) nonzero += 1;
+        const sig = Signature.fromBytes(buf) catch continue;
+        accepted += 1;
+        std.mem.doNotOptimizeAway(sig.toBytes());
+    }
+    // ⛔ Not `accepted > 0`: `nonzero` is the number the all-zero replay
+    // cannot hold up, and it only moves when a seed's own octets land in
+    // `buf`. Both measured, not guessed.
+    try testing.expectEqual(@as(usize, 5), nonzero);
+    try testing.expectEqual(@as(usize, 1), accepted);
+}
+
+const PkCorpus = struct {
+    store: [5][PublicKey.encoded_bytes]u8 = undefined,
+    entries: [5][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *PkCorpus, frame: [PublicKey.encoded_bytes]u8) void {
+        self.store[self.n] = frame;
+        self.entries[self.n] = &self.store[self.n];
+        self.n += 1;
+    }
+
+    fn build(self: *PkCorpus, fx: *const Fixtures) []const []const u8 {
+        self.push(fx.pk); // the real compressed G2 point
+        var t = fx.pk;
+        // ⚠ 0x20 is the y-SIGN flag, not the infinity flag (0x40): this decodes
+        // to -P, a DIFFERENT valid key. Deliberate — it is the seed that proves
+        // the corpus entry's own octets decided what came out, the way `rsa`'s
+        // perturbed-modulus seed does. Written as "infinity flag" first and
+        // pinned at 1 accepted; the guard measured 2 and said so.
+        t[0] ^= 0x20;
+        self.push(t);
+        t = fx.pk;
+        t[48] ^= 0x01; // one octet in the second field element: off the curve
+        self.push(t);
+        t = fx.pk;
+        t[0] = 0xc0; // the canonical compressed identity, which `fromBytes` refuses
+        @memset(t[1..], 0);
+        self.push(t);
+        self.push(@splat(0)); // the all-zero buffer, the only input this ever ran
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: PublicKey.fromBytes never crashes on arbitrary bytes" {
-    try testing.fuzz({}, fuzzPublicKeyFromBytes, .{});
+    var fx: Fixtures = .{};
+    fx.build();
+    var corpus: PkCorpus = .{};
+    try testing.fuzz({}, fuzzPublicKeyFromBytes, .{ .corpus = corpus.build(&fx) });
 }
 
 fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
@@ -1069,21 +1207,121 @@ fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     _ = pk.toBytes();
 }
 
+test "corpus: PublicKey seeds reach the decoder, and the accepted count is pinned" {
+    var fx: Fixtures = .{};
+    fx.build();
+    var corpus: PkCorpus = .{};
+    var nonzero: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The number the all-zero replay cannot produce, and that a corpus
+    // collapsed onto one entry cannot hold up: two DISTINCT keys came back,
+    // P and -P, so the seeds' own octets reached `G2.fromBytesCompressed`.
+    var first: ?[PublicKey.encoded_bytes]u8 = null;
+    var distinct: usize = 0;
+    for (corpus.build(&fx)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [PublicKey.encoded_bytes]u8 = undefined;
+        smith.bytes(&buf);
+        if (!std.mem.allEqual(u8, &buf, 0)) nonzero += 1;
+        const pk = PublicKey.fromBytes(buf) catch continue;
+        accepted += 1;
+        const enc = pk.toBytes();
+        if (first) |f| {
+            if (!std.mem.eql(u8, &f, &enc)) distinct += 1;
+        } else {
+            first = enc;
+            distinct += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), nonzero);
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try testing.expectEqual(@as(usize, 2), distinct);
+}
+
+/// The `Proof` buffer, and the reason it is this size: `Proof.encodedLen(8)`.
+/// ⚠ Checked against the largest proof the module itself can produce that has
+/// to fit — a seed longer than the buffer reads back EMPTY, silently.
+const proof_buf_len = Proof.encodedLen(8);
+
+const ProofCorpus = struct {
+    store: [10 * (4 + proof_buf_len)]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ProofCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *ProofCorpus, fx: *const Fixtures) []const []const u8 {
+        self.push(&fx.proof_u0); // U = 0: the floor length exactly
+        self.push(&fx.proof_u2); // U = 2: the m_hat loop runs twice
+        var t2 = fx.proof_u2;
+        t2[2 * G1.compressed_bytes + 4 * Fr.encoded_bytes] ^= 0x01; // one octet inside m_hat_1
+        self.push(&t2);
+        var t0 = fx.proof_u0;
+        @memset(t0[2 * G1.compressed_bytes ..][0..Fr.encoded_bytes], 0); // r2_hat = 0
+        self.push(&t0);
+        t0 = fx.proof_u0;
+        @memset(t0[t0.len - Fr.encoded_bytes ..], 0xff); // c >= r
+        self.push(&t0);
+        t0 = fx.proof_u0;
+        t0[G1.compressed_bytes] ^= 0x08; // Bbar off the curve / out of the subgroup
+        self.push(&t0);
+        self.push(fx.proof_u0[0 .. fx.proof_u0.len - 1]); // one octet under the floor
+        self.push(fx.proof_u2[0 .. fx.proof_u2.len - 1]); // over the floor, bad remainder
+        self.push(&[_]u8{0} ** Proof.encodedLen(0)); // all-zero at a legal length
+        self.push(""); // and the input this target used to run for ever
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: Proof.fromBytes never crashes on arbitrary bytes" {
-    try testing.fuzz({}, fuzzProofFromBytes, .{});
+    var fx: Fixtures = .{};
+    fx.build();
+    var corpus: ProofCorpus = .{};
+    try testing.fuzz({}, fuzzProofFromBytes, .{ .corpus = corpus.build(&fx) });
 }
 
 fn fuzzProofFromBytes(_: void, smith: *std.testing.Smith) !void {
-    // Cover both a "floor-only" length (U=0) and a length with a few
-    // undisclosed scalars, plus arbitrary (possibly misaligned) lengths —
-    // exercises both the remainder-rejection path and the point/scalar
-    // structural checks.
-    var buf: [2 * G1.compressed_bytes + 8 * Fr.encoded_bytes]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input the ordinary lane ever ran (a
+    // ranged draw needs eight octets and `bytes` had eaten them), so this
+    // target had returned `InvalidProofEncoding` on the length check every
+    // round, with the proof sitting unread in `buf`.
+    var buf: [proof_buf_len]u8 = undefined;
+    const len: usize = smith.slice(&buf);
     const proof = Proof.fromBytes(testing.allocator, buf[0..len]) catch return;
     defer proof.deinit(testing.allocator);
     if (proof.toBytes(testing.allocator)) |out| testing.allocator.free(out) else |_| {}
+}
+
+test "corpus: Proof seeds reach the decoder, and the counts are pinned" {
+    var fx: Fixtures = .{};
+    fx.build();
+    var corpus: ProofCorpus = .{};
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The second number, which an empty input cannot produce: the total
+    // number of `m_hat` scalars actually decoded. `accepted` alone would not
+    // notice a corpus that collapsed to the U = 0 proof.
+    var m_hat_total: usize = 0;
+    for (corpus.build(&fx)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [proof_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const proof = Proof.fromBytes(testing.allocator, buf[0..len]) catch continue;
+        defer proof.deinit(testing.allocator);
+        accepted += 1;
+        m_hat_total += proof.m_hat.len;
+    }
+    try testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 4), m_hat_total);
 }
 
 // ── F4: computeB MSM crossover — differential oracle + bench ────────────
