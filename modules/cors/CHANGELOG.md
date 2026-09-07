@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: `fuzzGates` handed all three pure gates the
+  empty string on every run.** It opened with `smith.bytes(&buf)` and then drew
+  the length with `smith.valueRangeAtMost(u16, 0, buf.len)`; `bytes` consumes
+  `@min(buf.len, in.len)` octets, so the ranged draw found fewer than the eight
+  it reads as a little-endian `u64` and returned the range MINIMUM. `len` was 0
+  for every input the ordinary test lane can carry. That is the *worst*
+  possible single input here: `requestedHeadersAllowed("")` returns `true`
+  through the "no header named" path without ever reaching the comma split, so
+  the refusal branch this gate exists for had never executed. The harness now
+  draws with one `smith.slice(&buf)` over a 14-seed corpus of real `Origin`,
+  `Access-Control-Request-Method` and `Access-Control-Request-Headers` values.
+  Measured 2026-09-07: **0 of 14 seeds arrived non-empty before, 14 of 14
+  after; 0 origins granted before, 2 after; 0 method tokens allowed, now 3; 0
+  header lists refused, now 10.** ⭐ An `accepted > 0` guard would have read
+  green throughout — under the DEFAULT `.reflect` policy
+  `requestedHeadersAllowed` answers `true` for any input at all — so the new
+  corpus guard pins origins granted, methods allowed and header lists refused,
+  none of which the empty input can produce.
+
 - **2026-08-18** — New opt-in `Options.allow_unconditional_wildcard` (default `false`, unchanged
   behavior) — a named, deliberate deviation from spec-correct CORS for one migration shape: an
   existing API that has always answered every `OPTIONS` with 204 and put

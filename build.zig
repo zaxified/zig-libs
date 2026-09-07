@@ -116,7 +116,7 @@ const module_list = [_]Module{
     // Importable as @import("security-headers") — module names are plain
     // strings, the hyphen is fine (cf. the community's "known-folders").
     .{ .name = "security-headers", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
-    .{ .name = "cors", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
+    .{ .name = "cors", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
     .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" } },
     .{ .name = "openapi", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
