@@ -1261,6 +1261,9 @@ const fuzz_field_max = 32;
 ///
 /// Trailing draws may be omitted — `Smith` pads a short input with zeroes
 /// instead of failing — so a corpus entry only spells out what it cares about.
+/// ⛔ But "omitted" is not "free": an omitted numeric is not a random numeric,
+/// it is the range MINIMUM for ever. `fuzzCaseNumeric` writes the tail for the
+/// entries that need one, and the corpus guard pins how many carry it.
 /// `fuzzCase` writes that encoding and the "corpus really reaches the fields"
 /// test below pins the decode, so a change to this order goes red instead of
 /// silently degenerating the corpus back to nothing.
@@ -1327,6 +1330,39 @@ fn fuzzCase(comptime flags: u8, comptime fields: [10][]const u8) []const u8 {
     }
 }
 
+/// `fuzzCase` plus the five numeric words `fuzzEntry` draws AFTER the fields.
+///
+/// ⛔ Without this tail the numerics are dead on a corpus replay. `Smith`
+/// reads eight octets per `value` draw and falls back to the weight minimum
+/// when fewer remain, and every corpus entry used to stop at the last field
+/// payload — so `status`, `request_bytes`, `response_bytes` and `latency_ns`
+/// were **0 on every seed** and `timestamp_ns` was never negative. Measured
+/// before this tail existed: 0 of 7 seeds carried a nonzero status, 0 of 7 a
+/// negative timestamp, 0 of 7 a nonzero latency.
+///
+/// ⚠ `status` is a `u16`: its eight octets are read as one little-endian u64
+/// and checked against the type's own weight range, so a value above 65535
+/// comes back as 0 rather than truncated. The signed `timestamp_ns` is drawn
+/// as its full 64-bit pattern, so a negative value is written as its bitcast.
+fn fuzzCaseNumeric(
+    comptime flags: u8,
+    comptime fields: [10][]const u8,
+    comptime timestamp_ns: i64,
+    comptime status: u16,
+    comptime request_bytes: u64,
+    comptime response_bytes: u64,
+    comptime latency_ns: u64,
+) []const u8 {
+    comptime {
+        return fuzzCase(flags, fields) ++
+            std.mem.toBytes(@as(u64, @bitCast(timestamp_ns))) ++
+            std.mem.toBytes(@as(u64, status)) ++
+            std.mem.toBytes(request_bytes) ++
+            std.mem.toBytes(response_bytes) ++
+            std.mem.toBytes(latency_ns);
+    }
+}
+
 /// All eight slots present.
 const all_fields: u8 = 0xFF;
 
@@ -1338,19 +1374,22 @@ const all_fields: u8 = 0xFF;
 const fuzz_corpus = [_][]const u8{
     // Lone surrogates, truncated leads, bare continuations — one per slot, so
     // no single slot carries the whole burden.
-    fuzzCase(all_fields, .{ "\xff", "\x80", "GET", "/\xed\xa0\x80", "HTTP/1.1", "curl\xc3", "\xe2\x82", "\xf0\x9f\x98", "\xed\xa0", "\xc2" }),
+    fuzzCaseNumeric(all_fields, .{ "\xff", "\x80", "GET", "/\xed\xa0\x80", "HTTP/1.1", "curl\xc3", "\xe2\x82", "\xf0\x9f\x98", "\xed\xa0", "\xc2" }, 1734000000000000000, 200, 512, 4096, 1500000),
     // Overlongs and out-of-range leads, with two realistic fields alongside so
     // the record is not uniformly hostile.
-    fuzzCase(all_fields, .{ "22/Jul/2026:10:00:00 +0000", "192.0.2.1:54321", "\xc0\xaf", "\xe0\x80\xaf", "\xf4\x90\x80\x80", "a\xffb", "\x80\x80\x80", "\xf5\xf6\xf7", "\xf5", "\x80\xbf" }),
+    fuzzCaseNumeric(all_fields, .{ "22/Jul/2026:10:00:00 +0000", "192.0.2.1:54321", "\xc0\xaf", "\xe0\x80\xaf", "\xf4\x90\x80\x80", "a\xffb", "\x80\x80\x80", "\xf5\xf6\xf7", "\xf5", "\x80\xbf" }, -1, 65535, std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u64)),
     // Ill-formed bytes AND the injection payload in the same record: the two
     // defences have to hold at once, not one at a time.
     fuzzCase(all_fields, .{ "\"\r\n", "\\\xff", "\x00\x1f\x7f", "\xff\"\r\n{\"a\":1}", "\xf0", "\xed\xbf\xbf", "\xc2", "\xe2\x82\xac", "\"\r\n\xff", "\xe0\x80" }),
     // Every field at the pool maximum, all ill-formed: the widest expansion the
     // output buffer has to absorb (3 bytes of U+FFFD per input byte).
-    fuzzCase(all_fields, .{ "\xff" ** 32, "\x80" ** 32, "\xed\xa0\x80" ** 10, "\xc0" ** 32, "\xf5" ** 32, "\xfe" ** 32, "\xe2\x82" ** 16, "\xf0\x9f\x98" ** 10, "\xc0" ** 32, "\xed\xa0\x80" ** 10 }),
+    fuzzCaseNumeric(all_fields, .{ "\xff" ** 32, "\x80" ** 32, "\xed\xa0\x80" ** 10, "\xc0" ** 32, "\xf5" ** 32, "\xfe" ** 32, "\xe2\x82" ** 16, "\xf0\x9f\x98" ** 10, "\xc0" ** 32, "\xed\xa0\x80" ** 10 }, std.math.minInt(i64), 599, std.math.maxInt(u64), std.math.maxInt(u64), std.math.maxInt(u64)),
     // Well-formed control: all-valid UTF-8 across the whole of Table 3-7, so a
     // sweep cannot pass by sanitizing everything into U+FFFD.
-    fuzzCase(all_fields, .{ "22/Jul/2026:10:00:00 +0000", "[2001:db8::1]:443", "GET", "/\u{00e9}\u{20ac}\u{1f600}", "HTTP/1.1", "curl/8.0 \u{fffd}", "https://example.org/", "req-1", "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7" }),
+    fuzzCaseNumeric(all_fields, .{ "22/Jul/2026:10:00:00 +0000", "[2001:db8::1]:443", "GET", "/\u{00e9}\u{20ac}\u{1f600}", "HTTP/1.1", "curl/8.0 \u{fffd}", "https://example.org/", "req-1", "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7" }, 1, 404, 0, 1, 999999999),
+    // ⭐ The three entries below keep NO numeric tail on purpose: the
+    // all-minimum record — status 0, no byte counters, timestamp 0 — is a real
+    // shape and used to be the ONLY one the corpus could produce.
     // No optionals at all: the `null` rendering path, with the three required
     // string fields still ill-formed.
     fuzzCase(0x00, .{ "", "", "\xff", "\xed\xa0\x80", "\xe2\x82", "", "", "", "", "" }),
@@ -1421,6 +1460,39 @@ test "fuzz corpus: the written inputs really reach the fields that matter" {
         };
     }
     try testing.expect(any_all_valid);
+}
+
+test "corpus: the numeric tail is alive, and the drawn values are pinned" {
+    var pool: [10 * fuzz_field_max]u8 = undefined;
+    var nonzero_status: usize = 0;
+    var negative_ts: usize = 0;
+    var nonzero_latency: usize = 0;
+    var widest_json: usize = 0;
+    for (fuzz_corpus) |input| {
+        var s: std.testing.Smith = .{ .in = input };
+        const e = fuzzEntry(&s, &pool);
+        if (e.status != 0) nonzero_status += 1;
+        if (e.timestamp_ns < 0) negative_ts += 1;
+        if (e.latency_ns) |l| {
+            if (l != 0) nonzero_latency += 1;
+        }
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeJsonLines(e, &w);
+        widest_json = @max(widest_json, w.buffered().len);
+    }
+    // Measured, not guessed. Before the numeric tail existed all three counts
+    // were 0 and the widest line was 937 octets: the numerics were the range
+    // minimum on every seed, so `status` never left 200's column, the three
+    // byte counters were never anything but 0 and `{d}` never had to render a
+    // sign. ⛔ Not `> 0` — a pinned count notices a seed losing its tail.
+    try testing.expectEqual(@as(usize, 4), nonzero_status);
+    try testing.expectEqual(@as(usize, 2), negative_ts);
+    try testing.expectEqual(@as(usize, 4), nonzero_latency);
+    // The second number the empty input cannot produce: the widest JSON record
+    // the corpus renders. It is also the standing check that the harness's
+    // 4096-octet output buffer really does absorb the worst case.
+    try testing.expectEqual(@as(usize, 1015), widest_json);
 }
 
 test "fuzz: JSON Lines always parses, whatever bytes the fields carry" {
