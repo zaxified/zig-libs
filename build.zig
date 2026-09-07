@@ -286,7 +286,7 @@ const module_list = [_]Module{
     .{ .name = "lninvoice", .libs = &.{"crypto"}, .deps = &.{ "bech32", "k256", "lnwire", "bip340" } },
     .{ .name = "musig2", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
     .{ .name = "sphinx", .libs = &.{ "crypto", "net" }, .deps = &.{"k256"} },
-    .{ .name = "bolt8", .libs = &.{"crypto"}, .deps = &.{ "noise", "k256" } },
+    .{ .name = "bolt8", .libs = &.{"crypto"}, .deps = &.{ "noise", "k256" }, .test_deps = &.{"testkit"} },
     .{ .name = "bolt3", .libs = &.{"crypto"}, .deps = &.{"k256"} },
     .{ .name = "hpke", .libs = &.{"crypto"}, .deps = &.{ "p256", "chachapoly", "entropy" } },
     .{ .name = "adaptor", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },

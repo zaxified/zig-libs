@@ -20,7 +20,6 @@ bitcointx 2
 blindrsa 1
 blobmsg 2
 bn254 3
-bolt8 3
 brotli 1
 bulletproofs 2
 cbor 2
