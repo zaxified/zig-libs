@@ -1748,6 +1748,9 @@ test "corpus: the verified reconstruct seeds carry real bundles, counts pinned" 
     var verified: usize = 0;
     var rejected: usize = 0;
     var honest_ok: usize = 0;
+    var record_len_nonzero: usize = 0;
+    var m_beyond_min: usize = 0;
+    var widest_record: usize = 0;
     const want = corpus.run.db_bytes[FuzzRun.index * FuzzRun.record_len ..][0..FuzzRun.record_len];
     for (entries) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
@@ -1762,6 +1765,13 @@ test "corpus: the verified reconstruct seeds carry real bundles, counts pinned" 
         if (lv0 != 0 and lt0 != 0) nonempty += 1;
         const record_len: usize = @intCast(smith.value(u64) % 25);
         const m: FuzzVer.TagWord = smith.value(FuzzVer.TagWord) | 1;
+        // The two knobs drawn after the four frames. `seedTail` writes a whole
+        // eight-octet word for each, so they are not exhausted -- but that is a
+        // property of the corpus builder, so it is measured here rather than
+        // assumed.
+        if (record_len != 0) record_len_nonzero += 1;
+        if (m != 1) m_beyond_min += 1;
+        widest_record = @max(widest_record, record_len);
         var rec: [24]u8 = undefined;
         FuzzVer.reconstructFromBytes(
             .{ .m = m },
@@ -1783,6 +1793,15 @@ test "corpus: the verified reconstruct seeds carry real bundles, counts pinned" 
     try testing.expectEqual(@as(usize, 1), verified);
     try testing.expectEqual(@as(usize, 4), rejected);
     try testing.expectEqual(@as(usize, 1), honest_ok);
+    // The two knobs, measured 2026-09-08 and already alive: `seedTail` writes
+    // a full eight-octet word for each, so 6 of the 7 seeds ask for a non-zero
+    // record length and 6 carry a secret other than the `| 1` minimum. Pinned
+    // as counts so a seed losing its tail — which would collapse every bundle
+    // to `record_len = 0` and `m = 1`, and quietly turn the whole corpus into
+    // the degenerate case — goes red.
+    try testing.expectEqual(@as(usize, 6), record_len_nonzero);
+    try testing.expectEqual(@as(usize, 6), m_beyond_min);
+    try testing.expectEqual(@as(usize, 24), widest_record);
 }
 
 test "Query.wipe destroys the client MAC secret, and a wiped Secret rejects" {

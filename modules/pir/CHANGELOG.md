@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Test-only, no production change: `fuzzVerReconstruct` draws two knobs
+  after its four answer frames — the record length and the client MAC secret `m` — and
+  nothing pinned them. Measured across the seven built seeds: **6 of 7 carry a non-zero
+  record length and 6 of 7 a secret other than the `| 1` minimum**, with the widest record
+  at 24 octets, so `VerReconCorpus.seedTail` was already doing its job. The corpus guard
+  now pins all three, because a seed losing its tail would collapse every bundle to
+  `record_len = 0` and `m = 1` — the degenerate case — while `verified`, `rejected` and
+  `honest_ok` would not necessarily say so.
+
+
 - **2026-09-07** — Test-only, neither BREAKING nor BEHAVIOURAL. All eleven fuzz
   targets were replaying one fixed input. Seven drew `smith.bytes(&buf)` and then
   `smith.valueRangeAtMost(...)` for the length; `bytes` consumes
