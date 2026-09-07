@@ -1761,19 +1761,91 @@ test "decTest: power.decTest (integer exponents)" {
 // exactly the shape this arena-backed parser has to reject or accept
 // without a fixed-width assumption tripping it up.
 
+/// `testkit.fuzz.seed`: a corpus entry is NOT the literal. `Smith.slice` reads
+/// a little-endian `u32` length first, so a raw literal loses four octets.
+const seed = @import("testkit").fuzz.seed;
+
+/// Literals in the format `Smith.slice` reads (see `testkit.fuzz`), lifted
+/// from `parse + format roundtrip`, `parse rejects`, the exponent-range tests
+/// and `arbitrary precision exceeds the fixed-scale Decimal's i128 range`.
+///
+/// The point of this parser is that it is unbounded in significand width, so
+/// the corpus carries the long ones deliberately: the 81-character
+/// 40-nines-dot-40-ones literal, and a 200-digit run. Both fit the 256-octet
+/// buffer — ⚠ a seed over it reads back EMPTY, not truncated.
+const parse_seeds = [_][]const u8{
+    seed("0"),
+    seed("123"),
+    seed("-123.456"),
+    seed("0.001"),
+    seed("1.50"), // trailing zeros preserved, unlike the fixed-scale Decimal
+    seed("2.08e9"),
+    seed("1.23e-4"),
+    seed("1E1000000"), // an exponent a fixed-scale decimal cannot hold
+    seed("9" ** 40 ++ "." ++ "1" ** 40), // 81 characters, far past i128
+    seed("9" ** 200), // a hostile digit run, which is what this parser is for
+    seed(""), // InvalidCharacter — and the ONE input the collapsed harness ran
+    seed("abc"), // InvalidCharacter
+    seed("1.2.3"), // InvalidCharacter
+    seed("1e"), // InvalidCharacter
+    seed("--1"), // InvalidCharacter
+    seed("."), // InvalidCharacter
+    seed("1e99999999999999999999"), // Overflow: the exponent itself
+};
+
 test "fuzz: parse never panics on arbitrary text" {
-    try testing.fuzz({}, fuzzParse, .{});
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     const alphabet = "0123456789+-.eE";
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every input and `BigDecimal.parse` was handed "",
+    // refusing at once, with the literal sitting unread in `buf`. Measured
+    // 2026-09-07 over the corpus above: **0 of 17 seeds non-empty and 0 parsed
+    // before, 16 of 17 non-empty (one seed IS the empty literal) and 10 parsed
+    // after.**
+    const len: usize = smith.slice(&buf);
+    // ⚠ A `--fuzz`-only aid: on a corpus replay `Smith` is already drained, so
+    // `boolWeighted` is false throughout and every seed reaches `parse`
+    // verbatim — which is what a corpus of real literals wants.
     for (buf[0..len]) |*c| {
         if (smith.boolWeighted(1, 4)) c.* = alphabet[c.* % alphabet.len];
     }
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     _ = BigDecimal.parse(arena.allocator(), buf[0..len]) catch return;
+}
+
+test "corpus: every literal reaches BigDecimal.parse, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. It is
+    // also the only thing that would notice a seed growing past the harness
+    // buffer — such a seed reads back EMPTY, silently.
+    //
+    // `digits` (total octets delivered) is pinned beside `parsed` because it
+    // is the number the empty input provably cannot move, and because it
+    // notices a seed being shortened as well as dropped — the long significand
+    // literals are the whole point of this parser.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var digits: usize = 0;
+    for (parse_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        digits += len;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        if (BigDecimal.parse(arena.allocator(), buf[0..len])) |_| parsed += 1 else |_| {}
+    }
+    // One seed IS the empty literal, a legal member of a refusal corpus.
+    try testing.expectEqual(parse_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 parsed and
+    // 0 octets delivered — one empty string seventeen times. After:
+    try testing.expectEqual(@as(usize, 10), parsed);
+    try testing.expectEqual(@as(usize, 360), digits);
 }

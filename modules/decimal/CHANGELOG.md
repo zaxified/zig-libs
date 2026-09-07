@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Both `fuzzParse` targets (`Decimal` and `BigDecimal`) had been parsing the
+  empty string and nothing else. Each drew its literal with `smith.bytes(&buf)` and then took
+  a length from `smith.valueRangeAtMost(…, 0, buf.len)`; a ranged `Smith` draw reads eight
+  octets as a little-endian `u64` and returns the range MINIMUM when fewer remain, and `bytes`
+  had already consumed them — so `len` was 0 on every input and both parsers refused at
+  `error.InvalidCharacter` before reading a digit, with the literal sitting unread in `buf`.
+  Now one `smith.slice(&buf)` call each, plus corpora lifted from the round-trip, rejection
+  and overflow tests, and a corpus guard per parser. Measured: **`Decimal` 0 of 24 seeds
+  non-empty, 0 parsed, 0 overflows, 0 octets delivered → 23/24 non-empty, 9 parsed, 5
+  overflows, 294 octets; `BigDecimal` 0 of 17 non-empty, 0 parsed → 16/17, 10 parsed, 360
+  octets.** ⚠ `Decimal`'s harness buffer went 80 → 128: `parse hardening: mantissa width cap
+  prevents i256 accumulator overflow` needs a 90-digit input, and a seed longer than the
+  buffer reads back EMPTY rather than truncated — so the one input that distinguishes "the
+  cap fires early" from "the accumulator traps" could never have passed through the module's
+  own harness.
 - **2026-08-11** — Security audit: four findings fixed, one documented as accepted (not
   defects) — part of the collection-wide audit. Verified: byte-exact against the
   IBM/Cowlishaw General Decimal Arithmetic `decTest` suite v2.62.

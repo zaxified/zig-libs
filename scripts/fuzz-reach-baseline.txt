@@ -21,7 +21,6 @@ coconut 1
 cookies 1
 cors 1
 ctap2pin 1
-decimal 2
 df-elect 2
 diskusage 1
 dkg 2
