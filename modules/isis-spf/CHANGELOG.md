@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`fuzzComputeOverLsdb` built both of its LSPs with a ZERO-octet
+  TLV region, so the SPF it exists to fuzz ran over a graph with no edges.**
+
+  It opened with `smith.bytes(&input_buf)` followed by an inline
+  `smith.valueRangeAtMost(u16, 0, input_buf.len)` slice. `bytes` consumes
+  `min(buf.len, in.len)` octets and a ranged draw then reads eight *more* as a
+  little-endian u64, returning the range minimum when fewer remain — so the region
+  length was 0 for every input a seed can carry. Both stages the comment describes
+  were nullified at once: the front door got `insert("")`, and the traversal stamped
+  an empty region into two well-formed LSPs. Neither the Extended IS Reachability
+  extraction nor the two-way check nor the shortest-path search ever saw an edge.
+  The harness came back clean every time, which is exactly why nothing noticed.
+
+  One `smith.slice` draw, the buffer raised 256 → 512 to match the region size the
+  module's own `insertReachLsp` fixtures build, and a nine-entry corpus of #22 TLV
+  regions written as the hex `addExtendedIsReach` emits. ⭐ The corpus had to be
+  designed around a property of the harness: it stamps the *same* region into both
+  originators (0xA and 0xB), so a region naming only the neighbour is asymmetric by
+  construction and yields nothing — only a region naming **both** produces a two-way
+  link. That is now stated in the corpus rather than left to be rediscovered.
+
+  Measured 2026-09-07: `driveSpf("")` — the collapsed harness, pinned as an
+  executable "before" — returns **1 route**, the local self route, and did so for
+  all nine seeds. After: **8 routes across the corpus, 2 seeds producing more than
+  the self route**, and the rest exercising refusals (a lying TLV length and a
+  metric at `max_link_metric` now reach the paths that reject them). The
+  route count is the discriminating number: `compute` over two LSPs with empty
+  regions succeeds every time, so "the harness returned cleanly" was never evidence
+  of anything.
+
 - **2026-09-03** — Drift re-audit (last audited `d163578`, ~719 lines since). Two fixes,
   two mutations, two red.
   - ⛔ **Expired LSPs were routed over.** `computeInternal` takes `now`, forwards it to

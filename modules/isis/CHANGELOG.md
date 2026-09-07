@@ -5,6 +5,38 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`fuzzDecode` walked an EMPTY buffer, and the header bias its
+  own TEETH test defends had never executed outside `--fuzz`.**
+
+  Two defects, one cause. The harness opened with `smith.bytes(&buf)` followed by
+  `smith.valueRangeAtMost(u8, 0, buf.len)`: `bytes` consumes `min(buf.len, in.len)`
+  octets and a ranged draw then reads eight *more* as a little-endian u64, returning
+  the range minimum when fewer remain — so `len` was 0 for every input a seed can
+  carry, and both `walkTlvs` and `decode` were handed an empty slice.
+
+  ⭐ The second is the one the earlier audit could not have seen. `biasToModeledPdu`
+  was gated on `smith.value(bool)` **drawn after** that byte draw, and both of the
+  bias's own draws came after it too. With the input exhausted every one of them
+  returns its range minimum: the gate was `false`, so the bias never ran at all in
+  the ordinary lane; and had it run, the shape would always have been
+  `modeled_shapes[0]` and the PDU Length always `fixed_len` — an empty TLV region, in
+  the harness whose entire purpose is walking the TLV region. The module's own TEETH
+  test proves the bias works, and it was right; the harness simply never called it.
+
+  Now: one `smith.slice(&buf)` draw, the buffer raised 128 → 512 (the largest golden
+  PDU is 66 octets, so nothing was being silently emptied, but a real LSP is not
+  128), the bias driven by a `testkit.fuzz.Cursor` over the seed's own bytes instead
+  of by exhausted `Smith` draws, and run as a second arm rather than a coin flip —
+  the raw seed exercises the refusals, the stamped copy exercises the bodies. A
+  13-entry corpus of the module's own golden capture frames plus the refusals.
+
+  Measured 2026-09-07, before → after: **0 of 13 seeds non-empty → 12 of 13** (the
+  empty buffer is a seed on purpose), 0 PDUs decoded → 9, **0 octets of TLV region
+  walked → 211**, and **0 bias stamps → 9**. The TLV-region column is the
+  discriminating one: `decode` accepts a PDU whose TLV region is empty, so counting
+  acceptances would have reported health over a corpus that never entered `walkTlvs`
+  on a body.
+
 - **2026-09-03** — Drift re-audit (714 lines since the last one). ⚠ **BREAKING:**
   `checksum.compute` now returns `error{ChecksumFieldOutOfRange}!u16` instead of
   `u16`, and `pdu.DecodeError` gained `ChecksumFieldOutOfRange`. Its only
