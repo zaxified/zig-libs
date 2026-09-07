@@ -118,7 +118,7 @@ const module_list = [_]Module{
     .{ .name = "security-headers", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "cors", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
     .{ .name = "metrics", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
-    .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" } },
+    .{ .name = "validate", .libs = &.{"web"}, .deps = &.{ "router", "http", "netaddr" }, .test_deps = &.{"testkit"} },
     .{ .name = "openapi", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "health", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
     .{ .name = "requestid", .libs = &.{"web"}, .deps = &.{ "router", "http" } },
