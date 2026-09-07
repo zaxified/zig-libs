@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** - Test-only, no production change: both fuzz targets carried a
+  "reachability was verified rather than assumed" note, and both notes were measured under
+  `scripts/fuzz-sweep.sh` - i.e. under `--fuzz`. The ORDINARY lane replays
+  `options.corpus` plus one empty input, and neither target had a corpus, so with the input
+  exhausted every draw returned its range minimum. In `message.fuzzMessageDecode` the first
+  draw was `smith.boolWeighted(1, 7)`, so the unstructured arm - which is where
+  `smith.slice(&buf)` lived - had **never run outside `--fuzz`**: no octet of any input ever
+  reached `decode`, and the structured arm built one deterministic frame. In
+  `session_key.fuzzSessionKeyDecode` the first draw was
+  `smith.value(enum { exact_export, exact_share, near, any })`, so `len` was always
+  `export_len` and the `smith.slice` after it read an already-exhausted input; the whole
+  length sweep its comment describes - `share_len`, the off-by-ones, the arbitrary lengths -
+  had never happened. Both now draw bytes FIRST and unconditionally, and both branch knobs
+  are `smith.value(u64)` reduced here rather than bounded draws (`check-fuzz-reach`'s own
+  option 2), so a corpus replay drives them. Corpora built from `dummyMessage`,
+  `nonMinimalIndexEncoding` and a real signed `SessionKey`. Measured by the two new
+  `corpus:` guards - messages: **6 unstructured-arm runs** (0 before), 3 frames decoded, 48
+  ciphertext octets, each re-encoding byte-identically (the W2-33 oracle, now over a
+  deliberately non-canonical frame); session keys: **all four length modes exercised**,
+  1953 -> 2041 octets of length swept, 2 exports and 1 share accepted (0 before - the
+  all-zero `signing_key` the collapsed harness always produced is not a canonical Ed25519
+  point).
+
 - **2026-09-06** — **`NOTICE` corrected: this module carries an Apache-2.0 condition.**
   It was headed `provenance note` and called the implementation "clean-room ...
   no libolm C or vodozemac Rust source was copied, ported, or transliterated",

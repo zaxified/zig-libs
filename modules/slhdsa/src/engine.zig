@@ -11,6 +11,8 @@
 //! implemented. All twelve FIPS 205 parameter sets instantiate.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 const params = @import("params.zig");
 const address = @import("address.zig");
 
@@ -759,16 +761,86 @@ test "key serialization round-trips" {
 
 // ── fuzz harness (untrusted-wire decoder) ───────────────────────────────
 
+/// ⛔ An SLH-DSA signature that verifies is not reachable from arbitrary
+/// bytes, so the accepting frame comes from the module's own `sign`. The
+/// corpus is built at run time — the same call the guard below makes, because
+/// a guard measuring a different corpus is not a guard.
+const VerifyCorpus = struct {
+    const cap = 8;
+    const frame_len = TestScheme.signature_length + 32;
+    store: [cap * (4 + frame_len)]u8 = undefined,
+    used: usize = 0,
+    entries: [cap][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *VerifyCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *VerifyCorpus, sk: TestScheme.SecretKey) []const []const u8 {
+        var sig: [TestScheme.signature_length]u8 = undefined;
+        TestScheme.sign(&sig, "fuzz msg", sk, "", null) catch unreachable;
+        self.push(&sig); // the signature that verifies
+        var t = sig;
+        t[0] ^= 0x01; // one octet in the randomizer R
+        self.push(&t);
+        t = sig;
+        t[TestScheme.signature_length - 1] ^= 0x01; // one octet in the last HT layer
+        self.push(&t);
+        t = sig;
+        @memset(t[64..128], 0); // a whole FORS block zeroed
+        self.push(&t);
+        self.push(sig[0 .. TestScheme.signature_length - 1]); // one octet short
+        var over: [TestScheme.signature_length + 1]u8 = undefined;
+        @memcpy(over[0..TestScheme.signature_length], &sig);
+        over[TestScheme.signature_length] = 0xff;
+        self.push(&over); // one octet long
+        self.push(""); // and the input this target used to run for ever
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: verify never crashes on an arbitrary-length signature" {
     const kp = TestScheme.keyGenFromSeed(testSeed(1), testSeed(2), testSeed(3));
-    try std.testing.fuzz(kp.pk, fuzzVerify, .{});
+    var corpus: VerifyCorpus = .{};
+    try std.testing.fuzz(kp.pk, fuzzVerify, .{ .corpus = corpus.build(kp.sk) });
 }
 
 fn fuzzVerify(pk: TestScheme.PublicKey, smith: *std.testing.Smith) !void {
     // A bit past signature_length so both "wrong length -> false" and the
     // full structural-parse path get exercised.
     var buf: [TestScheme.signature_length + 32]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u32, 0, @intCast(buf.len));
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input this target ever ran outside
+    // `--fuzz` (a ranged draw needs eight octets and `bytes` had eaten them),
+    // so `verify` returned false off its `sig.len != signature_length` guard
+    // every round and the structural-parse path the comment above is about was
+    // never entered.
+    const len: usize = smith.slice(&buf);
     _ = TestScheme.verify(buf[0..len], "fuzz msg", pk, "");
+}
+
+test "corpus: the verify seeds reach the structural parse, and the counts are pinned" {
+    const kp = TestScheme.keyGenFromSeed(testSeed(1), testSeed(2), testSeed(3));
+    var corpus: VerifyCorpus = .{};
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ The number the collapsed draw could not produce: seeds that got PAST
+    // the length guard and into the FORS/hypertree reconstruction. It was 0 —
+    // `verify` never once looked at a signature's content.
+    var full_length: usize = 0;
+    for (corpus.build(kp.sk)) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [TestScheme.signature_length + 32]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (len == TestScheme.signature_length) full_length += 1;
+        if (TestScheme.verify(buf[0..len], "fuzz msg", kp.pk, "")) accepted += 1;
+    }
+    try std.testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
+    try std.testing.expectEqual(@as(usize, 4), full_length);
+    try std.testing.expectEqual(@as(usize, 1), accepted);
 }

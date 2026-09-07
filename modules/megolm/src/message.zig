@@ -60,6 +60,8 @@
 //! needs; the fuzz harness asserts exactly that.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 
 /// The spec's message-format version byte. This module implements ONLY
 /// this (8-byte truncated MAC) variant — see SPEC.md for the newer
@@ -532,8 +534,103 @@ test "decode rejects a ciphertext length claiming more bytes than remain (trunca
 // `@panic` on `decode`'s SUCCESS return, a 60 s `scripts/fuzz-sweep.sh`
 // run found it — so the harness really does drive the tag loop to
 // completion, not just its early rejects. Probe then removed.
+/// ⛔ The half `--fuzz` hid. The reachability note above was measured under
+/// `scripts/fuzz-sweep.sh`, which drives the generator properly — but the
+/// ORDINARY lane replays `options.corpus` plus one empty input, and this
+/// target had no corpus. With the input exhausted, `smith.boolWeighted(1, 7)`
+/// returns its first weight, so the unstructured arm — `n = smith.slice(&buf)`,
+/// the length/version gates and the "not even a frame" shapes it exists for —
+/// had **never run outside `--fuzz`**, and the structured arm built exactly
+/// one deterministic frame. `zig build test-megolm` was exercising one input.
+///
+/// The byte draw now comes FIRST and unconditionally; the branch afterwards
+/// decides whether to keep those octets or rebuild a structured frame over
+/// them. A seed is the frame as a `testkit.fuzz` slice seed, then the `u64`
+/// words the knobs read — `1` selects the unstructured arm, `0` the generator.
+const MessageCorpus = struct {
+    store: [8 * (4 + 512 + 16 * 8)]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *MessageCorpus, frame: []const u8, words: []const u64) void {
+        const start = self.used;
+        var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
+        for (words) |w| {
+            std.mem.writeInt(u64, self.store[at..][0..8], w, .little);
+            at += 8;
+        }
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *MessageCorpus, a: std.mem.Allocator) []const []const u8 {
+        var msg = dummyMessage(a) catch unreachable;
+        defer msg.deinit(a);
+        const raw = msg.encode(a) catch unreachable;
+        const noncanon = nonMinimalIndexEncoding(a, 42, msg.ciphertext, msg.mac, msg.signature) catch unreachable;
+
+        // The unstructured arm (word `1`), which had never run at all. The
+        // trailing `0` is the base64-corruption knob: leave the wrapper alone.
+        self.push(raw, &.{ 1, 0 }); // a real, canonical frame
+        self.push(noncanon, &.{ 1, 0 }); // structurally legal, NOT canonical:
+        // this is the input the `decode -> encode` byte-identity oracle exists
+        // for, and the one a canonical re-encoding would break.
+        self.push(raw[0 .. raw.len - 1], &.{ 1, 0 }); // one octet short of the suffix
+        self.push(raw[0..1], &.{ 1, 0 }); // the version byte alone: MessageTooShort
+        var wrong_version = a.dupe(u8, raw) catch unreachable;
+        wrong_version[0] = 0x02;
+        self.push(wrong_version, &.{ 1, 0 }); // UnsupportedVersion
+        // The same real frame, but with the base64 wrapper corrupted at
+        // offset 0 — `base64Decode`'s own reject path.
+        self.push(raw, &.{ 1, 1, 0, 0xff });
+        // The generator arm (word `0`): a real version byte, then an index
+        // field and a ciphertext field, then the suffix.
+        self.push("", &.{ 0, 1, 0, 0, 0, 0, 0, 0 });
+        self.push("", &.{}); // and the input this target used to run for ever
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: Message.decode / fromBase64 never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzMessageDecode, .{});
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var corpus: MessageCorpus = .{};
+    try testing.fuzz({}, fuzzMessageDecode, .{ .corpus = corpus.build(arena.allocator()) });
+}
+
+test "corpus: the message seeds drive both arms, and the counts are pinned" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var corpus: MessageCorpus = .{};
+    var unstructured: usize = 0;
+    var decoded: usize = 0;
+    var ciphertext_octets: usize = 0;
+    for (corpus.build(arena.allocator())) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (smith.boolWeighted(1, 7)) unstructured += 1;
+        if (Message.decode(testing.allocator, buf[0..n])) |m| {
+            var mm = m;
+            defer mm.deinit(testing.allocator);
+            decoded += 1;
+            ciphertext_octets += mm.ciphertext.len;
+            // The same byte-identity oracle the harness asserts, over the
+            // seeds that actually reach it — including the non-canonical one.
+            const re = try mm.encode(testing.allocator);
+            defer testing.allocator.free(re);
+            try testing.expectEqualSlices(u8, buf[0..n], re);
+        } else |_| {}
+    }
+    // ⛔ `unstructured` was **0** for every input this target ever ran outside
+    // `--fuzz`: the whole arm was unreachable in the ordinary lane. And
+    // `decoded`/`ciphertext_octets` say the seeds are frames, not shapes that
+    // die at the length gate.
+    try testing.expectEqual(@as(usize, 6), unstructured);
+    try testing.expectEqual(@as(usize, 3), decoded);
+    try testing.expectEqual(@as(usize, 48), ciphertext_octets);
 }
 
 /// Writes `v` as LEB128 using exactly `pad` extra continuation bytes — a
@@ -564,22 +661,40 @@ fn fuzzMessageDecode(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
 
     var buf: [512]u8 = undefined;
-    var n: usize = 0;
+    // The byte draw comes FIRST and unconditionally. It used to sit inside
+    // the `boolWeighted(1, 7)` arm, which meant that outside `--fuzz` -- where
+    // the input is exhausted and the draw returns its first weight -- the arm
+    // never ran and no octet of any seed ever reached `decode`.
+    var n: usize = smith.slice(&buf);
 
     if (smith.boolWeighted(1, 7)) {
-        // Minority: unstructured bytes, so the length/version gates and the
-        // "not even a frame" shapes get their own coverage.
-        n = smith.slice(&buf);
+        // Minority: the drawn octets ARE the message, so the length/version
+        // gates and the "not even a frame" shapes get their own coverage.
     } else {
         buf[0] = if (smith.boolWeighted(1, 9)) smith.value(u8) else version;
         n = 1;
         // Payload: a tag/value stream the decoder has to walk.
         while (n + 16 < buf.len - suffix_len and !smith.eosWeightedSimple(4, 1)) {
-            const tag: u64 = switch (smith.value(enum { index, ciphertext, unknown, wide })) {
-                .index => 0x08,
-                .ciphertext => 0x12,
-                .unknown => smith.value(u8),
-                .wide => smith.value(u64),
+            // The field tag decides which branch of the payload generator
+            // runs, so the DISCRIMINANT must not be a bounded draw: a bounded
+            // draw returns its range minimum unless a whole eight-octet word
+            // lands inside the range, which would pin every seed on `0x08`.
+            // `value(u64)` has full-range weights, so every input word
+            // survives and the reduction happens here (the gate's own option
+            // 2). The two arbitrary tag values are drawn into their own
+            // bindings rather than inline: `check-fuzz-reach`'s R2(c) rule
+            // scans the whole `const … = switch …;` initializer for a
+            // collapsing call, so an inline `smith.value(u8)` in an ARM reads
+            // to it as a collapsing discriminant. Separating them keeps the
+            // gate reading the discriminant it is actually about.
+            const tag_kind = smith.value(u64) % 4;
+            const narrow_tag: u64 = smith.value(u8);
+            const wide_tag: u64 = smith.value(u64);
+            const tag: u64 = switch (tag_kind) {
+                0 => 0x08,
+                1 => 0x12,
+                2 => narrow_tag,
+                else => wide_tag,
             };
             n += fuzzWriteVarintPadded(buf[n..], tag, smith.valueRangeAtMost(u8, 0, 3));
             switch (tag) {

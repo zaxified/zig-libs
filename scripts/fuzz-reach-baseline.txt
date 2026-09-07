@@ -28,7 +28,6 @@ jwe 2
 loopix 1
 mcp 2
 mcp-http 1
-megolm 2
 minisign 2
 modbus 2
 montint 2
@@ -47,14 +46,12 @@ ripemd160 1
 sealedbox 1
 sessions 2
 signal 2
-slhdsa 1
 sntp 1
 spake2plus 1
 sphinx 1
 stun 1
 tar 1
 tenantkex 2
-timelock_envelope 1
 tlock 1
 tlsresume 2
 tracecontext 1
@@ -64,6 +61,5 @@ validate 2
 webhooksig 1
 xmldsig 1
 xmlenc 1
-xmss 1
 yaml 2
 zipstream 1

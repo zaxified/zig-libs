@@ -65,6 +65,8 @@
 //! chains standardize on SP 800-208 stateful HBS).
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const meta = .{
@@ -1260,8 +1262,63 @@ fn fuzzPublicKeyFromBytes(_: void, smith: *std.testing.Smith) !void {
     _ = X.PublicKey.fromBytes(&bytes) catch return;
 }
 
+/// ⛔ An XMSS signature that verifies is not reachable from arbitrary bytes,
+/// so the accepting frame comes from the module's own `keyGen` + `sign`. A
+/// seed is the public key and the 64-octet message RAW (both are drawn with
+/// `smith.bytes`, which reads no length header), then the signature as a
+/// `testkit.fuzz` slice seed.
+const XmssCorpus = struct {
+    const X = XmssSha2_10_256;
+    const head = X.public_key_length + 64;
+    const cap = 8;
+    store: [cap * (head + 4 + X.signature_length)]u8 = undefined,
+    used: usize = 0,
+    entries: [cap][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *XmssCorpus, pk: [X.public_key_length]u8, msg: [64]u8, sig: []const u8) void {
+        const start = self.used;
+        @memcpy(self.store[start..][0..X.public_key_length], &pk);
+        @memcpy(self.store[start + X.public_key_length ..][0..64], &msg);
+        var at = start + head;
+        at += testkit.fuzz.seedInto(self.store[at..], sig).len;
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *XmssCorpus) []const []const u8 {
+        var kp = X.keyGen([_]u8{1} ** n, [_]u8{2} ** n, [_]u8{3} ** n);
+        const pk = kp.pk.toBytes();
+        const msg = [_]u8{0xA7} ** 64;
+        var sig: [X.signature_length]u8 = undefined;
+        X.sign(&kp.sk, &sig, &msg) catch unreachable;
+
+        self.push(pk, msg, &sig); // the signature that verifies
+        var t = sig;
+        t[3] ^= 0x01; // the leaf index: points at a different WOTS+ key
+        self.push(pk, msg, &t);
+        t = sig;
+        t[4] ^= 0x01; // one octet of the randomizer `r`
+        self.push(pk, msg, &t);
+        t = sig;
+        t[X.signature_length - 1] ^= 0x01; // the top authentication-path node
+        self.push(pk, msg, &t);
+        var other_msg = msg;
+        other_msg[0] ^= 0x01;
+        self.push(pk, other_msg, &sig); // the right signature, the wrong message
+        var bad_pk = pk;
+        bad_pk[X.public_key_length - 1] ^= 0x01; // a different root
+        self.push(bad_pk, msg, &sig);
+        self.push(pk, msg, sig[0 .. X.signature_length - 1]); // one octet short
+        self.push(pk, msg, ""); // and the input this target used to run for ever
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: verify (the wire signature parser) never panics on arbitrary pk/msg/sig bytes" {
-    try std.testing.fuzz({}, fuzzVerify, .{});
+    var corpus: XmssCorpus = .{};
+    try std.testing.fuzz({}, fuzzVerify, .{ .corpus = corpus.build() });
 }
 
 fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
@@ -1280,12 +1337,42 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) !void {
     smith.bytes(&msg);
 
     var sig_buf: [X.signature_length]u8 = undefined;
-    smith.bytes(&sig_buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, sig_buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input this target ever ran outside
+    // `--fuzz` (a ranged draw needs eight octets and `bytes` had eaten them),
+    // so `verify` returned false off its `sig.len != signature_length` guard
+    // every round — the `idx`/`r`/`sig_ots`/`auth` parse this harness's own
+    // comment is about had never run.
+    const len: usize = smith.slice(&sig_buf);
     // `verify` parses `idx`/`r`/`sig_ots`/`auth` straight out of `sig` with
     // no bounds checks beyond the `sig.len != signature_length` guard — it
     // must never panic/OOB regardless of length or content.
     _ = X.verify(pk, &msg, sig_buf[0..len]);
+}
+
+test "corpus: the XMSS seeds reach the signature parser, and the counts are pinned" {
+    const X = XmssSha2_10_256;
+    var corpus: XmssCorpus = .{};
+    var accepted: usize = 0;
+    // ⛔ The number the collapsed draw could not produce: seeds that got past
+    // the length guard and into the WOTS+/authentication-path reconstruction.
+    // It was 0 — `verify` never once looked at a signature's content.
+    var full_length: usize = 0;
+    for (corpus.build()) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var pk_bytes: [X.public_key_length]u8 = undefined;
+        smith.bytes(&pk_bytes);
+        std.mem.writeInt(u32, pk_bytes[0..4], X.oid, .big);
+        const pk = X.PublicKey.fromBytes(&pk_bytes) catch continue;
+        var msg: [64]u8 = undefined;
+        smith.bytes(&msg);
+        var sig_buf: [X.signature_length]u8 = undefined;
+        const len: usize = smith.slice(&sig_buf);
+        if (len == X.signature_length) full_length += 1;
+        if (X.verify(pk, &msg, sig_buf[0..len])) accepted += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), full_length);
+    try std.testing.expectEqual(@as(usize, 1), accepted);
 }
 
 test {
