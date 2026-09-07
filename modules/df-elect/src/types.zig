@@ -245,31 +245,133 @@ test "tagOf and the frame decoders reject short and undefined input" {
 }
 
 // ── fuzz: both decoders are total over arbitrary bytes ──────────────────────
+//
+// ⚠ Both targets used to open `smith.bytes(&buf)` and then draw the length
+// with `smith.valueRangeAtMost`. `bytes` consumes `@min(buf.len, in.len)`
+// octets and a ranged draw then reads EIGHT more as a little-endian `u64`,
+// returning the range MINIMUM when fewer remain — so the length was 0 on
+// every input a corpus can carry. Neither target had a corpus either, so the
+// one input each ever ran was empty and both decoders were handed a
+// zero-length slice: `error.Truncated` on the first line, 26 octets of drawn
+// frame sitting unread in `buf`. One `slice` draw closes the first half and
+// the corpora below close the second.
+
+/// `testkit.fuzz.seedHex`, aliased so the corpora read as the little-endian
+/// wire frames they are. A corpus entry is not the frame: `Smith.slice` reads
+/// a little-endian `u32` length first, so a raw frame would arrive minus its
+/// own tag and three octets of `origin`.
+const seedHex = @import("testkit").fuzz.seedHex;
+
+/// Tag octets, in the format the length draw reads. `tagOf` reads exactly one
+/// octet, so the interesting seeds are the two defined tags, the boundary
+/// above them, and a full frame (the shape every real caller hands it).
+const tag_seeds = [_][]const u8{
+    seedHex("00"), // MsgTag.hello
+    seedHex("01"), // MsgTag.bum
+    seedHex("02"), // the first undefined tag: the "invalid enum value" panic this decoder exists to prevent
+    seedHex("ff"), // the top of the byte range
+    seedHex("000700000001000000030000"), // a Hello frame: what a dispatch site actually passes
+    seedHex("010700000001000000ffffffff"), // a BUM frame with the `no_ingress` sentinel
+    seedHex(""), // zero length → Truncated; the ONLY input this target ran before today
+};
 
 test "fuzz: tagOf never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzTagOf, .{});
+    try testing.fuzz({}, fuzzTagOf, .{ .corpus = &tag_seeds });
 }
 
 fn fuzzTagOf(_: void, smith: *std.testing.Smith) !void {
-    var buf: [8]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
+    var buf: [Hello.wire_len]u8 = undefined;
+    const len: usize = smith.slice(&buf);
     _ = tagOf(buf[0..len]) catch return;
 }
 
+test "corpus: every tag seed reaches tagOf, and the tags resolved are pinned" {
+    // `hellos` and `bums` are the second numbers: `tagOf("")` returns
+    // `error.Truncated`, so an "it did not panic" guard would have been
+    // satisfied by the collapsed harness. A resolved tag cannot come from an
+    // empty slice at all.
+    var nonempty: usize = 0;
+    var hellos: usize = 0;
+    var bums: usize = 0;
+    var invalid: usize = 0;
+    for (tag_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Hello.wire_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const t = tagOf(buf[0..len]) catch |e| {
+            if (e == error.InvalidEncoding) invalid += 1;
+            continue;
+        };
+        switch (t) {
+            .hello => hellos += 1,
+            .bum => bums += 1,
+        }
+    }
+    // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 tags resolved.
+    try testing.expectEqual(tag_seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 2), hellos);
+    try testing.expectEqual(@as(usize, 2), bums);
+    try testing.expectEqual(@as(usize, 2), invalid);
+}
+
+/// Whole frames, in the format the length draw reads. The buffer is
+/// `Hello.wire_len * 2` = 26 octets and the longest seed here is 26, which is
+/// the point: a seed longer than the buffer is not a large seed, it is the
+/// EMPTY one.
+const frame_seeds = [_][]const u8{
+    seedHex("000700000001000000030000"), // Hello, one octet short of `wire_len` → Truncated
+    seedHex("00070000000100000003000000"), // Hello{ origin = 7, seq = 1, segment = 3 }
+    seedHex("010700000001000000ffffffff"), // BumFrame{ origin = 7, seq = 1, ingress = no_ingress }
+    seedHex("01070000000100000003000000"), // BumFrame with a real segment id
+    seedHex("00ffffffffffffffffffffffff"), // Hello with every field saturated
+    seedHex("0007000000010000000300000001070000000200000003000000"), // two frames back to back: 26 octets, the buffer exactly
+    seedHex("7f070000000100000003000000"), // a tag that is neither: both decoders must refuse
+    seedHex("00"), // a lone tag octet
+    seedHex(""), // zero length; the collapsed harness's only input
+};
+
 test "fuzz: Hello/BumFrame decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzFrames, .{});
+    try testing.fuzz({}, fuzzFrames, .{ .corpus = &frame_seeds });
 }
 
 fn fuzzFrames(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One byte-first draw. Never `bytes` then a ranged length.
     var buf: [Hello.wire_len * 2]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     _ = Hello.decode(buf[0..len]) catch {};
     if (BumFrame.decode(buf[0..len])) |f| {
         // `id()` is called on every decoded frame by the delivery checker.
         std.mem.doNotOptimizeAway(f.id());
     } else |_| {}
+}
+
+test "corpus: every frame seed reaches both decoders, and what decodes is pinned" {
+    // `ids` is the second number and it is the load-bearing one: it is a sum
+    // over successfully decoded BUM frames, and an empty slice — the single
+    // input this target ran for its whole life — produces `error.Truncated`
+    // before any field is read, so it cannot contribute to it.
+    var nonempty: usize = 0;
+    var hellos: usize = 0;
+    var bums: usize = 0;
+    var ids: u64 = 0;
+    for (frame_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Hello.wire_len * 2]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (Hello.decode(buf[0..len])) |_| hellos += 1 else |_| {}
+        if (BumFrame.decode(buf[0..len])) |f| {
+            bums += 1;
+            ids +%= f.id();
+        } else |_| {}
+    }
+    // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 decoded, id sum 0.
+    try testing.expectEqual(frame_seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 3), hellos);
+    try testing.expectEqual(@as(usize, 2), bums);
+    try testing.expectEqual(@as(u64, 0x0000_0007_0000_0001 * 2), ids);
 }
 
 test "decode refuses the sibling message: identical layouts must not cross-decode" {

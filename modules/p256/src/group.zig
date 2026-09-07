@@ -875,25 +875,86 @@ test "SEC1 round-trip (compressed + uncompressed) matches std" {
 // / uncompressed), so the harness biases toward each valid tag with random
 // payload bytes, plus fully random bytes for the tag-rejection path.
 
+/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the SEC1
+/// encodings it is. A corpus entry is not the encoding: `Smith.slice` reads a
+/// little-endian `u32` length first, so a raw point would arrive minus its own
+/// first four octets — which for SEC1 is the tag and three octets of `x`.
+const seedHex = @import("testkit").fuzz.seedHex;
+
+/// Real SEC1 encodings, one per decode path and one per typed refusal.
+///
+/// ⚠ 65 octets is the longest entry here and the harness's buffer is exactly
+/// 65, which is deliberate: a seed longer than the buffer is not a big seed,
+/// it is the EMPTY one (`Smith.slice` falls back to the range minimum). The
+/// uncompressed form is the largest encoding `fromSec1` accepts, so the buffer
+/// cannot be shortened without making the only 65-octet path unreachable.
+const sec1_seeds = [_][]const u8{
+    // ── the three accepting paths ──
+    seedHex("00"), // the identity element: tag 0 with an empty body
+    seedHex("036b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"), // G compressed (y odd → tag 3)
+    seedHex("026b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"), // the same x, tag 2 → −G, the other recoverY branch
+    seedHex("047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1"), // 2G uncompressed: the 65-octet path
+    seedHex("046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"), // G uncompressed
+    seedHex("037cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978"), // 2G compressed
+    // ── the refusals, one per error the signature declares ──
+    seedHex("030000000000000000000000000000000000000000000000000000000000000001"), // x = 1: x³−3x+b is a non-residue → NotSquare
+    seedHex("03ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"), // x = p exactly → NonCanonical
+    seedHex("046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2966b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"), // y := x, a well-formed pair that is not on the curve
+    seedHex("056b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"), // tag 5 is not a SEC1 tag
+    seedHex("0000"), // tag 0 with a body: the identity is exactly one octet
+    seedHex("036b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2"), // compressed, one octet short
+    seedHex("04"), // a bare uncompressed tag with no coordinates
+    seedHex(""), // the zero-length encoding
+};
+
 test "fuzz: fromSec1 never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzFromSec1, .{});
+    try std.testing.fuzz({}, fuzzFromSec1, .{ .corpus = &sec1_seeds });
 }
 
 fn fuzzFromSec1(_: void, smith: *std.testing.Smith) !void {
     var buf: [65]u8 = undefined;
-    smith.bytes(&buf);
-    const tag: u8 = switch (smith.valueRangeAtMost(u8, 0, 4)) {
-        0 => 0,
-        1 => 2,
-        2 => 3,
-        3 => 4,
-        else => smith.value(u8), // fully arbitrary, including invalid tags
-    };
-    buf[0] = tag;
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-    if (len == 0) {
-        _ = P256.fromSec1(&.{}) catch return;
-        return;
-    }
+    // ⚠ `smith.slice` in ONE call, never `bytes` and then a ranged length.
+    // What stood here did both, and also chose the tag from a ranged draw
+    // AFTER `bytes` had eaten the input. A `Smith` ranged draw reads eight
+    // octets as a little-endian `u64` and returns the range MINIMUM when
+    // fewer remain, so outside `--fuzz` the tag was always 0 and `len` was
+    // always 0 — every run of this target called `fromSec1(&.{})` and
+    // returned on the `s.len < 1` line. The whole SEC1 decoder, three paths
+    // and four typed refusals, was reached by nothing.
+    const len: usize = smith.slice(&buf);
     _ = P256.fromSec1(buf[0..len]) catch {};
+}
+
+test "corpus: every SEC1 seed reaches fromSec1, and the points decoded are pinned" {
+    // ⭐ The measurement, executable rather than asserted in prose. It draws
+    // exactly the way the harness does, because the defect WAS the draw.
+    //
+    // `on_curve` is the second number and it is the one that matters: an
+    // empty input cannot produce a point at all, so it cannot inflate this
+    // count the way "did not crash" would be satisfied by anything.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var on_curve: usize = 0;
+    var non_identity: usize = 0;
+    for (sec1_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [65]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const pt = P256.fromSec1(buf[0..len]) catch continue;
+        accepted += 1;
+        pt.rejectIdentity() catch continue;
+        non_identity += 1;
+        // Re-encoding and decoding again is the cheap on-curve confirmation:
+        // `fromSec1` of a compressed form only admits points that satisfy the
+        // curve equation, so a round trip that survives is one.
+        _ = P256.fromSec1(&pt.toCompressedSec1()) catch continue;
+        on_curve += 1;
+    }
+    // Measured 2026-09-07. Before the draw was fixed: 1 round, 0 non-empty,
+    // 0 accepted, 0 on-curve — the target only ever ran `fromSec1("")`.
+    try std.testing.expectEqual(sec1_seeds.len - 1, nonempty); // the deliberate empty encoding
+    try std.testing.expectEqual(@as(usize, 6), accepted);
+    try std.testing.expectEqual(@as(usize, 5), non_identity);
+    try std.testing.expectEqual(@as(usize, 5), on_curve);
 }

@@ -1083,22 +1083,66 @@ test "mPoint/nPoint parse the RFC 9383 §4 P-256 constants and land on-curve, no
 // the identity/canonical guards behind the parse are on the fuzzed path
 // too. Costs stay bounded: a share that does not parse returns before any
 // scalar multiplication happens.
+//
+// ⛔ AND THE PARAGRAPH ABOVE WAS FALSE THE DAY IT WAS WRITTEN. The "half
+// the draws" gate was `smith.value(bool)`, the harness's FIRST draw. A
+// `Smith` scalar draw reads eight octets as a little-endian `u64` and
+// returns the range minimum when fewer remain, and the target carried no
+// corpus, so outside `--fuzz` the one input it ever ran was empty: the
+// bool was **false on every run**, the perturbation branch has never
+// executed once, and `smith.bytes` over an empty input memsets the share
+// to zero. Every run of this target decoded 65 zero octets — tag 0 with a
+// 64-octet body, `error.InvalidEncoding` on `fromSec1`'s second line. The
+// fix for the SHAPE (2026-09-01) bought nothing because the DRAW was still
+// collapsed; both halves have to be closed.
+//
+// So the branch is gone. The share comes from ONE byte-first draw, and the
+// real encodings and their near-misses are a written corpus instead of a
+// coin flip the ordinary lane never wins. Under `--fuzz` this is strictly
+// better than the coin flip was: the fuzzer mutates real 65-octet
+// encodings rather than reaching the perturbation path one time in two.
+
+/// `testkit.fuzz.seedHex`, aliased so the corpus reads as the SEC1 shares
+/// it is. A corpus entry is not the share: `Smith.slice` reads a
+/// little-endian `u32` length first.
+const seedHex = @import("testkit").fuzz.seedHex;
+
+/// Peer-supplied shares, in the format the length draw reads. `M` and `N`
+/// uncompressed are the two points this protocol actually puts on the wire;
+/// the rest are the near-misses the deleted perturbation branch was meant to
+/// produce and never did.
+///
+/// ⚠ Every entry is at most `share_length` = 65 octets, which is the
+/// harness's buffer exactly. A seed longer than the buffer is not a large
+/// seed, it is the EMPTY one.
+const share_seeds = [_][]const u8{
+    // ── the encodings a real peer sends ──
+    seedHex("04886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f5ff355163e43ce224e0b0e65ff02ac8e5c7be09419c785e0ca547d55a12e2d20"), // M uncompressed
+    seedHex("04d8bbd6c639c62937b04d997f38c3770719c629d7014d49a24b4f98baa1292b4907d60aa6bfade45008a636337f5168c64d9bd36034808cd564490b1e656edbe7"), // N uncompressed
+    seedHex("046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"), // the generator, a third on-curve share
+    // ── one octet off a real encoding: what the coin flip was for ──
+    seedHex("04886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f5ff355163e43ce224e0b0e65ff02ac8e5c7be09419c785e0ca547d55a12e2d21"), // M with the last octet of y flipped → not on the curve
+    seedHex("05886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f5ff355163e43ce224e0b0e65ff02ac8e5c7be09419c785e0ca547d55a12e2d20"), // M with the tag flipped to a non-SEC1 one
+    seedHex("00886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f5ff355163e43ce224e0b0e65ff02ac8e5c7be09419c785e0ca547d55a12e2d20"), // tag 0 (identity) with a 64-octet body
+    seedHex("04ffffffff00000001000000000000000000000000ffffffffffffffffffffffff4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"), // x = p exactly → NonCanonical, ahead of the curve check
+    // ── the compressed form the module can never receive, kept as the
+    //    reachability check on that claim: `[share_length]u8` pads it to 65 ──
+    seedHex("02886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f"), // M compressed: 33 octets, zero-padded to 65 → refused
+    // ── the degenerate inputs ──
+    seedHex(""), // zero length: the share is all zeroes, which is what the collapsed harness ran every time
+    seedHex("04"), // a bare uncompressed tag
+};
 
 fn fuzzShareDecode(_: void, smith: *std.testing.Smith) !void {
-    var share: [share_length]u8 = undefined;
-    if (smith.value(bool)) {
-        // Perturb a genuine uncompressed encoding: reachable valid input,
-        // and every near-miss around it.
-        share = mPoint().toUncompressedSec1();
-        var i: usize = 0;
-        const flips = smith.valueRangeAtMost(u8, 0, 4);
-        while (i < flips) : (i += 1) {
-            const at = smith.valueRangeAtMost(u8, 0, share_length - 1);
-            share[at] ^= smith.value(u8);
-        }
-    } else {
-        smith.bytes(&share);
-    }
+    // ⚠ ONE byte-first draw. Never `value`/`valueRangeAtMost` before the
+    // bytes, and never `bytes` followed by a ranged length — see the block
+    // comment above for what that cost this target.
+    var buf: [share_length]u8 = undefined;
+    const n: usize = smith.slice(&buf);
+    // The entry points take `[share_length]u8`, so a short draw is padded
+    // exactly the way a short wire read would have to be handled.
+    var share: [share_length]u8 = [_]u8{0} ** share_length;
+    @memcpy(share[0..n], buf[0..n]);
 
     // The bare decode boundary.
     if (P256.fromSec1(&share)) |point| {
@@ -1124,7 +1168,36 @@ fn fuzzShareDecode(_: void, smith: *std.testing.Smith) !void {
     } else |_| {}
 }
 test "fuzz the share-decode boundary and the entry point behind it" {
-    try std.testing.fuzz({}, fuzzShareDecode, .{});
+    try std.testing.fuzz({}, fuzzShareDecode, .{ .corpus = &share_seeds });
+}
+
+test "corpus: every share seed reaches fromSec1, and the points parsed are pinned" {
+    // ⭐ The measurement, executable. It draws exactly the way the harness
+    // does, because the defect WAS the draw.
+    //
+    // `on_curve` is the second number: 65 zero octets — the ONLY input this
+    // target ever ran before today — cannot produce a point at all, so this
+    // count is about reach rather than about not crashing.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var on_curve: usize = 0;
+    for (share_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [share_length]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        var share: [share_length]u8 = [_]u8{0} ** share_length;
+        @memcpy(share[0..n], buf[0..n]);
+        const point = P256.fromSec1(&share) catch continue;
+        parsed += 1;
+        point.rejectIdentity() catch continue;
+        on_curve += 1;
+    }
+    // Measured 2026-09-07. Before: 1 round, 1 input, all 65 octets zero, 0
+    // parsed. After: 9 of 10 non-empty, 3 parsed, 3 on the curve.
+    try std.testing.expectEqual(share_seeds.len - 1, nonempty); // the deliberate empty seed
+    try std.testing.expectEqual(@as(usize, 3), parsed);
+    try std.testing.expectEqual(@as(usize, 3), on_curve);
 }
 
 // The module doc comment and SPEC.md both state that EVERY scalar

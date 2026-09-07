@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `fuzzShareDecode`'s "half the draws come from a REAL
+  encoding" branch had never executed once. The branch gate was `smith.value(bool)`, the
+  harness's FIRST draw; a `Smith` scalar draw reads eight octets as a little-endian `u64`
+  and returns the range minimum when fewer remain, and the target carried no corpus, so
+  outside `--fuzz` the one input it ever ran was empty, the bool was always false, and
+  `smith.bytes` over an empty input left the share all zeroes. Every run decoded 65 zero
+  octets — tag 0 with a 64-octet body, `error.InvalidEncoding` — so neither `M` nor `N`
+  nor any near-miss ever reached `fromSec1`, and `proverFinish` returned before any scalar
+  multiplication. The 2026-09-01 fix for the harness's SHAPE (buffer pinned at
+  `share_length`, no more 33-octet compressed draws) bought nothing while the DRAW was
+  still collapsed. The coin flip is gone: the share now comes from one byte-first
+  `smith.slice`, and the real encodings are a written corpus of 10 seeds — `M`, `N` and
+  `G` uncompressed, `M` with a flipped y-octet, a flipped tag, an identity tag over a
+  64-octet body, x = p, the unreachable compressed form, a bare tag and the empty share.
+  A corpus guard pins 9 non-empty, 3 parsed and 3 on-curve.
+
 - **2026-09-01** — Security audit. `verifierConfirm`'s documented gate did not hold:
   `VerifierConfirmResult` withheld the `k_shared` FIELD while returning `tt` and `k_main`,
   and each of those is a one-call pre-image of `K_shared` through this module's own public
