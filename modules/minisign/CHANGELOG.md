@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Both fuzz targets ran one fixed input for their whole existence.
+  `fuzzParseSignatureFile` built its `.minisig` from `smith.bytes` + ranged lengths and
+  `smith.value(bool)` knobs; a ranged `Smith` draw returns the range MINIMUM when fewer than
+  eight octets remain and `bool` is a 1-bit range, so the file was always the same: an empty
+  untrusted comment, an empty signature line, an empty trusted comment, an empty
+  global-signature line, no final newline. It died at the first length check, and the
+  algorithm-tag, base64 and printable-comment checks the harness's own comment names were
+  never reached. `fuzzIsPrintableComment` was handed a zero-length buffer every time — a
+  hand-rolled UTF-8 validator whose entire risk is an off-by-one at the END of the buffer,
+  given no end to walk to. Both now open with one `smith.slice` call; the signature target
+  runs the drawn bytes verbatim as a `.minisig` AND as a script for the skeleton generator,
+  whose knobs moved to a `testkit.fuzz.Cursor`. ⚠ The corpus uses the reference
+  **signature** fixtures only — `kat_vectors.zig` also holds fixture secret keys, and a fuzz
+  corpus is not the place to widen their blast radius. Measured: **signature files 1 distinct
+  file, 0 real files parsed and 1 distinct generated skeleton → 10 files, 3 parsed, 9
+  skeletons; comments 13 empty buffers → 12 of 13 seeds non-empty, 6 accepted, 7 rejected,
+  138 octets walked.**
+
 - **2026-08-22** — Streaming API + a real `-G`/`-S`/`-V`/`-R`/`-C` CLI example, replacing the
   illustrative buffer-only demo. **New public API**: `signDigest`/`verifyDigest`/
   `signFileDigest`/`verifyFileDigest` sign/verify a **precomputed** BLAKE2b-512 digest

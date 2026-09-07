@@ -14,14 +14,12 @@ bitcointx 2
 brotli 1
 bulletproofs 2
 cbor 2
-chachapoly 2
 cookies 1
 cors 1
 ctap2pin 1
 df-elect 2
 diskusage 1
 dkg 2
-ethfrag 1
 falcon 1
 fleetsim 1
 frost 1
@@ -31,7 +29,6 @@ k256 2
 mcp 2
 mcp-http 1
 megolm 2
-minisign 2
 modbus 2
 montint 2
 musig2 1

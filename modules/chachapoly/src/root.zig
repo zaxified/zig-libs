@@ -1368,29 +1368,172 @@ test "counter space boundary: the last non-wrapping block is accepted (audit F1)
 // (`error.AuthenticationFailed`); the harness proves that path stays
 // side-channel-safe-shaped (zeroes `m`) and never panics, for every length.
 
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const tkfuzz = @import("testkit").fuzz;
+
+/// The AEAD open call takes five separate byte strings, and `Smith.slice`
+/// draws one — so the harness packs them, and the corpus is written in the
+/// same layout:
+///
+///     nonce(12) ‖ key(32) ‖ tag(16) ‖ ad_len(1) ‖ ad(ad_len) ‖ ciphertext
+///
+/// Everything past the drawn length reads as zero, so a short seed is a
+/// well-defined short seed rather than garbage.
+const aead_header_len = ChaCha20Poly1305.nonce_length + ChaCha20Poly1305.key_length +
+    ChaCha20Poly1305.tag_length + 1;
+const aead_max_ad = 64;
+const aead_max_ct = 128;
+const aead_buf_len = aead_header_len + aead_max_ad + aead_max_ct;
+
+const AeadOpenInput = struct {
+    nonce: [ChaCha20Poly1305.nonce_length]u8,
+    key: [ChaCha20Poly1305.key_length]u8,
+    tag: [ChaCha20Poly1305.tag_length]u8,
+    ad: []const u8,
+    ct: []const u8,
+};
+
+/// Unpack one drawn slice into the five arguments `decrypt` takes.
+fn unpackAeadInput(buf: *const [aead_buf_len]u8, n: usize) AeadOpenInput {
+    var off: usize = 0;
+    const nonce: [ChaCha20Poly1305.nonce_length]u8 = buf[off..][0..ChaCha20Poly1305.nonce_length].*;
+    off += ChaCha20Poly1305.nonce_length;
+    const key: [ChaCha20Poly1305.key_length]u8 = buf[off..][0..ChaCha20Poly1305.key_length].*;
+    off += ChaCha20Poly1305.key_length;
+    const tag: [ChaCha20Poly1305.tag_length]u8 = buf[off..][0..ChaCha20Poly1305.tag_length].*;
+    off += ChaCha20Poly1305.tag_length;
+    const ad_len: usize = @min(buf[off], aead_max_ad);
+    off += 1;
+    const body = if (n > aead_header_len) n - aead_header_len else 0;
+    const ad = buf[off..][0..@min(ad_len, body)];
+    const ct_len = @min(body -| ad.len, aead_max_ct);
+    return .{ .nonce = nonce, .key = key, .tag = tag, .ad = ad, .ct = buf[off + ad.len ..][0..ct_len] };
+}
+
+/// The corpus both the harness and its guard replay. One seed has to be a
+/// genuine sealed message — no random tuple ever authenticates, so without it
+/// the success branch of `decrypt`, and every line after it, is unreachable.
+const AeadCorpus = struct {
+    stores: [7][4 + aead_buf_len]u8 = undefined,
+    slots: [7][]const u8 = undefined,
+
+    fn build(self: *AeadCorpus) []const []const u8 {
+        const key = [_]u8{0x42} ** ChaCha20Poly1305.key_length;
+        const nonce = [_]u8{0x24} ** ChaCha20Poly1305.nonce_length;
+        const ad = "additional data";
+        const msg = "the quick brown fox jumps over the lazy dog";
+
+        var ct: [msg.len]u8 = undefined;
+        var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
+        ChaCha20Poly1305.encrypt(&ct, &tag, msg, ad, nonce, key);
+
+        var packed_buf: [aead_buf_len]u8 = @splat(0);
+        var off: usize = 0;
+        @memcpy(packed_buf[off..][0..nonce.len], &nonce);
+        off += nonce.len;
+        @memcpy(packed_buf[off..][0..key.len], &key);
+        off += key.len;
+        @memcpy(packed_buf[off..][0..tag.len], &tag);
+        off += tag.len;
+        packed_buf[off] = ad.len;
+        off += 1;
+        @memcpy(packed_buf[off..][0..ad.len], ad);
+        off += ad.len;
+        @memcpy(packed_buf[off..][0..ct.len], &ct);
+        const sealed_len = off + ct.len;
+
+        var mutant: [aead_buf_len]u8 = undefined;
+        // 0: the genuine sealed message. Authenticates.
+        self.slots[0] = tkfuzz.seedInto(&self.stores[0], packed_buf[0..sealed_len]);
+        // 1: one flipped ciphertext octet.
+        @memcpy(mutant[0..sealed_len], packed_buf[0..sealed_len]);
+        mutant[sealed_len - 1] ^= 0x01;
+        self.slots[1] = tkfuzz.seedInto(&self.stores[1], mutant[0..sealed_len]);
+        // 2: one flipped tag octet.
+        @memcpy(mutant[0..sealed_len], packed_buf[0..sealed_len]);
+        mutant[ChaCha20Poly1305.nonce_length + ChaCha20Poly1305.key_length] ^= 0x01;
+        self.slots[2] = tkfuzz.seedInto(&self.stores[2], mutant[0..sealed_len]);
+        // 3: one flipped AAD octet — the AAD is authenticated but not encrypted.
+        @memcpy(mutant[0..sealed_len], packed_buf[0..sealed_len]);
+        mutant[aead_header_len] ^= 0x01;
+        self.slots[3] = tkfuzz.seedInto(&self.stores[3], mutant[0..sealed_len]);
+        // 4: the same message with the AAD length zeroed, so the AAD moves
+        // into the ciphertext — a length disagreement, not a byte flip.
+        @memcpy(mutant[0..sealed_len], packed_buf[0..sealed_len]);
+        mutant[ChaCha20Poly1305.nonce_length + ChaCha20Poly1305.key_length + ChaCha20Poly1305.tag_length] = 0;
+        self.slots[4] = tkfuzz.seedInto(&self.stores[4], mutant[0..sealed_len]);
+        // 5: header only — an empty ciphertext and an empty AAD.
+        self.slots[5] = tkfuzz.seedInto(&self.stores[5], packed_buf[0..aead_header_len]);
+        // 6: the empty input, the ONE tuple the collapsed harness ever ran.
+        self.slots[6] = tkfuzz.seedInto(&self.stores[6], "");
+        return &self.slots;
+    }
+};
+
 test "fuzz: decrypt never panics on arbitrary ciphertext/tag/AAD/nonce/key" {
-    try testing.fuzz({}, fuzzDecrypt, .{});
+    var corpus: AeadCorpus = .{};
+    try testing.fuzz({}, fuzzDecrypt, .{ .corpus = corpus.build() });
 }
 
 fn fuzzDecrypt(_: void, smith: *std.testing.Smith) !void {
-    var c: [128]u8 = undefined;
-    smith.bytes(&c);
-    const len: usize = smith.valueRangeAtMost(u8, 0, c.len);
+    var buf: [aead_buf_len]u8 = @splat(0);
+    // ⚠ ONE `smith.slice` call, and it is the FIRST draw; the five arguments
+    // are carved out of it (see `unpackAeadInput`). It used to be five
+    // `smith.bytes` calls with two ranged lengths interleaved: a ranged
+    // `Smith` draw reads eight octets as a little-endian u64 and returns the
+    // range MINIMUM when fewer remain, and the `bytes` calls had already eaten
+    // them — so `len` and `ad_len` were both 0 and `nonce`/`key`/`tag` were
+    // all-zero. The target opened a ZERO-LENGTH ciphertext with an all-zero
+    // key, nonce, tag and AAD, once, for ever.
+    //
+    // The corpus is what makes the success branch reachable at all: no random
+    // tuple authenticates, so before this every input in this target's history
+    // took `error.AuthenticationFailed`. Measured 2026-09-07 over the corpus
+    // above: **1 distinct tuple, 0 ciphertext octets, 0 AAD octets and 0
+    // successful opens before; 7 tuples, 230 ciphertext octets, 60 AAD octets
+    // and 1 open after.**
+    const n: usize = smith.slice(&buf);
+    const in = unpackAeadInput(&buf, n);
 
-    var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
-    smith.bytes(&tag);
+    var m: [aead_max_ct]u8 = undefined;
+    ChaCha20Poly1305.decrypt(m[0..in.ct.len], in.ct, in.tag, in.ad, in.nonce, in.key) catch {};
+}
 
-    var ad: [64]u8 = undefined;
-    smith.bytes(&ad);
-    const ad_len: usize = smith.valueRangeAtMost(u8, 0, ad.len);
-
-    var nonce: [ChaCha20Poly1305.nonce_length]u8 = undefined;
-    smith.bytes(&nonce);
-    var key: [ChaCha20Poly1305.key_length]u8 = undefined;
-    smith.bytes(&key);
-
-    var m: [128]u8 = undefined;
-    ChaCha20Poly1305.decrypt(m[0..len], c[0..len], tag, ad[0..ad_len], nonce, key) catch {};
+test "corpus: every AEAD tuple reaches decrypt, and the opened count is pinned" {
+    // ⭐ Built from `AeadCorpus.build`, the same call the harness makes.
+    //
+    // ⚠ `opened` is the number that matters and the one a random-input harness
+    // can never move: the tag makes every octet load-bearing, so the module's
+    // own comment is right that random bytes reach the authentication-failure
+    // path — and wrong that this is enough, because they reach ONLY it. The
+    // ciphertext and AAD octet counts are pinned beside it so a shortened seed
+    // is caught too.
+    var corpus: AeadCorpus = .{};
+    const seeds = corpus.build();
+    var ct_octets: usize = 0;
+    var ad_octets: usize = 0;
+    var opened: usize = 0;
+    var failed: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [aead_buf_len]u8 = @splat(0);
+        const n: usize = smith.slice(&buf);
+        const in = unpackAeadInput(&buf, n);
+        ct_octets += in.ct.len;
+        ad_octets += in.ad.len;
+        var m: [aead_max_ct]u8 = undefined;
+        if (ChaCha20Poly1305.decrypt(m[0..in.ct.len], in.ct, in.tag, in.ad, in.nonce, in.key)) |_| {
+            opened += 1;
+        } else |_| {
+            failed += 1;
+        }
+    }
+    // Measured 2026-09-07: with the collapsing draws, 1 distinct tuple (all
+    // zeros, empty ciphertext, empty AAD), 0 ciphertext octets and 0 opens.
+    try testing.expectEqual(@as(usize, 230), ct_octets);
+    try testing.expectEqual(@as(usize, 60), ad_octets);
+    try testing.expectEqual(@as(usize, 1), opened);
+    try testing.expectEqual(@as(usize, 6), failed);
 }
 
 test "the 32-bit counter anti-wrap rule is arithmetic anyone can check, in every build" {
