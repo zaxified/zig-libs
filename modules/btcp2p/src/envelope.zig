@@ -235,21 +235,33 @@ pub fn encodeMessage(allocator: Allocator, network: Network, command_name: []con
 
 const testing = std.testing;
 
+/// `testkit.fuzz`, for the corpus at the bottom of this file. A corpus entry
+/// is NOT the frame: `Smith.slice` reads a little-endian `u32` length first,
+/// so a raw envelope would arrive minus its own first four octets (which for
+/// a Bitcoin message is exactly the magic). `testkit/src/fuzz.zig` carries
+/// the other two hazards.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+const seedHex = testkit.fuzz.seedHex;
+
 // ── externally anchored: Bitcoin wiki's own annotated hex dumps ──────────
 // (en.bitcoin.it/wiki/Protocol_documentation, fetched directly -- not
 // hand-transcribed from memory) -- the checksum bytes and magic bytes are
 // exactly as published, not self-derived.
 
+/// "Hexdump of the verack message": magic + "verack" command (NUL padded to
+/// 12) + zero-length payload + its published checksum (sha256d of the empty
+/// string, first 4 bytes). Container-level so the fuzz corpus below seeds the
+/// SAME octets this test anchors, rather than a re-transcription of them.
+const verack_wire = [_]u8{
+    0xf9, 0xbe, 0xb4, 0xd9, // magic (mainnet)
+    0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // "verack"
+    0x00, 0x00, 0x00, 0x00, // length = 0
+    0x5d, 0xf6, 0xe0, 0xe2, // checksum (published)
+};
+
 test "external: verack envelope byte-exact against the wiki's published hex dump" {
-    // "Hexdump of the verack message": magic + "verack" command (NUL
-    // padded to 12) + zero-length payload + its published checksum
-    // (sha256d of the empty string, first 4 bytes).
-    const wire = [_]u8{
-        0xf9, 0xbe, 0xb4, 0xd9, // magic (mainnet)
-        0x76, 0x65, 0x72, 0x61, 0x63, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // "verack"
-        0x00, 0x00, 0x00, 0x00, // length = 0
-        0x5d, 0xf6, 0xe0, 0xe2, // checksum (published)
-    };
+    const wire = verack_wire;
     const decoded = try decodeMessage(&wire, .mainnet);
     try testing.expectEqualStrings("verack", decoded.message.commandName());
     try testing.expectEqual(@as(usize, 0), decoded.message.payload.len);
@@ -262,23 +274,25 @@ test "external: verack envelope byte-exact against the wiki's published hex dump
     try testing.expectEqualSlices(u8, &.{ 0x5d, 0xf6, 0xe0, 0xe2 }, empty_digest[0..4]);
 }
 
+/// "And here's a modern (60002) protocol version client advertising
+/// itself..." -- the wiki's second version-message example, the first to
+/// include a real checksum. Payload bytes themselves are exercised
+/// byte-field-by-field in handshake.zig's tests; the test below is only about
+/// the envelope (magic/length/checksum). Container-level for the same reason
+/// as `verack_wire`.
+const version_wire = [_]u8{
+    0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x64, 0x00, 0x00, 0x00, 0x35, 0x8d, 0x49, 0x32, 0x62, 0xea, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x11, 0xb2, 0xd0, 0x50, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x3b, 0x2e, 0xb3, 0x5d, 0x8c, 0xe6, 0x17, 0x65, 0x0f, 0x2f, 0x53, 0x61, 0x74, 0x6f, 0x73, 0x68,
+    0x69, 0x3a, 0x30, 0x2e, 0x37, 0x2e, 0x32, 0x2f, 0xc0, 0x3e, 0x03, 0x00,
+};
+
 test "external: version message envelope (protocol 60002, wiki's modern example) checksum verifies" {
-    // "And here's a modern (60002) protocol version client advertising
-    // itself..." -- the wiki's second version-message example, the first
-    // to include a real checksum. Payload bytes themselves are exercised
-    // byte-field-by-field in handshake.zig's tests; this test is only
-    // about the envelope (magic/length/checksum), so the payload is
-    // reproduced but not further decoded here.
-    const wire = [_]u8{
-        0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x64, 0x00, 0x00, 0x00, 0x35, 0x8d, 0x49, 0x32, 0x62, 0xea, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x11, 0xb2, 0xd0, 0x50, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x3b, 0x2e, 0xb3, 0x5d, 0x8c, 0xe6, 0x17, 0x65, 0x0f, 0x2f, 0x53, 0x61, 0x74, 0x6f, 0x73, 0x68,
-        0x69, 0x3a, 0x30, 0x2e, 0x37, 0x2e, 0x32, 0x2f, 0xc0, 0x3e, 0x03, 0x00,
-    };
+    const wire = version_wire;
     const decoded = try decodeMessage(&wire, .mainnet);
     try testing.expectEqualStrings("version", decoded.message.commandName());
     try testing.expectEqual(@as(usize, 100), decoded.message.payload.len);
@@ -440,21 +454,57 @@ test "EncodeError.CommandTooLong: a command name over 12 bytes is rejected" {
 // ── fuzz: decodeMessage never panics on an arbitrary byte stream ─────────
 //
 // This is the untrusted-input boundary for the entire module (see module
-// doc comment): every byte a peer ever sends reaches `decodeMessage`
-// first. Half the time the harness stamps in a real magic (so the parser
-// actually reaches the length/checksum logic instead of always bailing
-// on `BadMagic`); the rest is fully arbitrary.
+// doc comment): every byte a peer ever sends reaches `decodeMessage` first.
+
+/// Complete envelopes, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// ⭐ This module is the reason a corpus is not optional here. An envelope has
+/// to clear a 4-byte magic, a `IsCommandValid()`-shaped 12-byte command AND a
+/// 4-byte `sha256d` prefix over its own payload before `decodeMessage` returns
+/// anything: uniform random octets reach the checksum comparison with
+/// probability ~2^-32 and pass it with ~2^-32 more. No amount of undirected
+/// fuzzing gets past the gate; only real frames do, and the wiki publishes two.
+const decode_seeds = [_][]const u8{
+    seed(&verack_wire), // the wiki's published verack envelope
+    seed(&version_wire), // the wiki's 60002 version envelope, 124 octets
+    seed(&(verack_wire ++ verack_wire)), // two messages back to back: `consumed` must stop at the first
+    seedHex("0b110907" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e2"), // the same verack on testnet3
+    seedHex("fabfb5da" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e2"), // and on regtest
+    seedHex("0a03cf40" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e2"), // and on signet
+    seedHex("00000000" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e2"), // BadMagic on all four
+    seedHex("f9beb4d9" ++ "76657261636b000000000058" ++ "00000000" ++ "5df6e0e2"), // InvalidCommand: junk past the NUL padding
+    seedHex("f9beb4d9" ++ "01657261636b000000000000" ++ "00000000" ++ "5df6e0e2"), // InvalidCommand: a control byte before it
+    seedHex("f9beb4d9" ++ "76657261636b000000000000" ++ "01093d00" ++ "00000000"), // PayloadTooLarge: MAX_PAYLOAD_LENGTH + 1
+    seedHex("f9beb4d9" ++ "76657261636b000000000000" ++ "e8030000" ++ "00000000"), // Truncated: claims 1000 octets, none follow
+    seedHex("f9beb4d9"), // Truncated: shorter than HEADER_LEN
+    seedHex("f9beb4d9" ++ "76657261636b000000000000" ++ "00000000" ++ "5df6e0e3"), // BadChecksum: last checksum octet flipped
+    seedHex("f9beb4d9" ++ "76657261636b000000000000" ++ "01000000" ++ "5df6e0e2" ++ "00"), // BadChecksum: a payload the checksum does not cover
+};
+
 test "fuzz: decodeMessage never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeMessage, .{});
+    try testing.fuzz({}, fuzzDecodeMessage, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecodeMessage(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `decodeMessage` saw `buf[0..0]` every
+    // single time, with the seed sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
 
     const nets = [_]Network{ .mainnet, .testnet3, .regtest, .signet };
+    // Stamping a real magic over the first four octets is a `--fuzz` aid: it
+    // gets the mutation engine past `BadMagic` to the length/checksum logic.
+    // ⚠ The comment that used to sit here claimed it happened "half the time",
+    // and that was never true — with `len` collapsed to 0 the `bytes.len >= 4`
+    // guard was false on every single execution, so this branch had never run
+    // once. Over the corpus it still does not run (each seed leaves the input
+    // exhausted, and `value(bool)` on an exhausted input is the weight minimum,
+    // i.e. `false`) — which is what we want, since every seed carries the magic
+    // it means to test.
     if (bytes.len >= 4 and smith.value(bool)) {
         const idx = smith.valueRangeAtMost(u8, 0, nets.len - 1);
         @memcpy(bytes[0..4], &magic(nets[idx]));
@@ -463,4 +513,36 @@ fn fuzzDecodeMessage(_: void, smith: *std.testing.Smith) !void {
     for (nets) |n| {
         _ = decodeMessage(bytes, n) catch {};
     }
+}
+
+test "corpus: every envelope seed reaches decodeMessage, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach, so this pins the number rather than asserting it is > 0.
+    //
+    // `accepted` mirrors the harness, which offers each frame to all four
+    // networks: a seed counts once if ANY network takes it.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    const nets = [_]Network{ .mainnet, .testnet3, .regtest, .signet };
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        for (nets) |n| {
+            if (decodeMessage(buf[0..len], n)) |_| {
+                accepted += 1;
+                break;
+            } else |_| {}
+        }
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    // 6 = the two mainnet frames + the back-to-back pair + one verack each on
+    // testnet3, regtest and signet. Measured 2026-09-07: 0 of 14 seeds
+    // non-empty and 0 accepted before the draw was fixed, 14 of 14 and 6 after.
+    try testing.expectEqual(@as(usize, 6), accepted);
 }

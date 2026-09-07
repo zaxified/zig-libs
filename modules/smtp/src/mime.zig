@@ -930,15 +930,55 @@ test "checkLineLengths finds the offending line" {
     try checkLineLengths("A" ** 998, 998);
 }
 
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the header values
+/// it is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw value would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// Header values, in the format `Smith.slice` reads. The harness hands each
+/// one to `writeUnstructured`, to an address list's display name, and to the
+/// quoted-printable encoder.
+///
+/// The three branches that decide what this module does are all
+/// content-dependent: pure ASCII is emitted verbatim, non-ASCII forces an
+/// RFC 2047 encoded word (Q or B, whichever is shorter), and a CR/LF/NUL is a
+/// header-injection refusal. Uniform random octets land in the non-ASCII
+/// branch almost always and in the other two almost never, so a corpus is what
+/// makes the folding and the injection guard reachable at all.
+const header_seeds = [_][]const u8{
+    seed("hello"), // plain ASCII, short enough not to fold
+    seed("Hello wörld"), // one non-ASCII octet: the Q-encoded word is shorter
+    seed("ěščřžýáíé"), // all non-ASCII: the B-encoded word is shorter
+    seed("žluťoučký kůň"), // the P-19 reproducer's text
+    seed("Příliš žluťoučký kůň úpěl ďábelské ódy"), // long enough to fold across encoded words
+    seed("=?utf-8?B?bm90IHJlYWxseQ==?="), // a value that already looks like an encoded word
+    seed("Alice Example"), // a display name needing no quoting
+    seed("Example, Dr. A"), // a display name whose comma forces quoting
+    seed("Say \"hi\""), // a display name with a quote to escape
+    seed("Bůh"), // a non-ASCII display name
+    seed("hi\r\nBcc: victim@example.net"), // ControlCharacterInHeader: the injection attempt
+    seed("hi\nX: y"), // ControlCharacterInHeader: a bare LF
+    seed("hi\x00"), // ControlCharacterInHeader: a NUL
+    seed("A" ** 300), // exactly the harness buffer: one unfoldable token
+    seed(" " ** 100), // nothing but fold points
+    seed("=" ** 100), // every octet quoted-printable must escape
+    seed("ř" ** 100), // 200 octets of two-octet UTF-8: the QP soft-break path
+};
+
 test "fuzz: arbitrary header text never crashes and never emits a bare CR/LF" {
-    try testing.fuzz({}, fuzzHeaders, .{});
+    try testing.fuzz({}, fuzzHeaders, .{ .corpus = &header_seeds });
 }
 
 fn fuzzHeaders(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
     var raw: [300]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and every renderer was called with an empty
+    // value, with the seed sitting unread in `raw`.
+    const len = smith.slice(&raw);
     const value = raw[0..len];
 
     if (renderHeader(gpa, writeUnstructured, .{ "Subject", value, Options{} })) |out| {
@@ -961,4 +1001,38 @@ fn fuzzHeaders(_: void, smith: *std.testing.Smith) !void {
     try writeQuotedPrintable(&aw.writer, value);
     var it = std.mem.splitSequence(u8, aw.written(), "\r\n");
     while (it.next()) |l| std.debug.assert(l.len <= 76);
+}
+
+test "corpus: every header seed reaches the renderers, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum), which is silent everywhere else.
+    //
+    // ⚠ "Accepted" alone would be a bad guard here for the reason
+    // `bacnet/service` was: rendering `Subject: ` with an empty value succeeds,
+    // so the collapsed harness's single execution looked healthy. The second
+    // count is the one that says the encoder did work: how many seeds produced
+    // an RFC 2047 encoded word. It goes to zero the moment the non-ASCII path
+    // stops being taken.
+    const gpa = testing.allocator;
+    var nonempty: usize = 0;
+    var rendered: usize = 0;
+    var encoded_words: usize = 0;
+    for (header_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [300]u8 = undefined;
+        const len = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const value = raw[0..len];
+        if (renderHeader(gpa, writeUnstructured, .{ "Subject", value, Options{} })) |out| {
+            defer gpa.free(out);
+            rendered += 1;
+            if (std.mem.indexOf(u8, out, "=?utf-8?") != null) encoded_words += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(header_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 17 seeds non-empty before the draw was fixed
+    // and every renderer saw the empty value; 17 of 17 after.
+    try testing.expectEqual(@as(usize, 14), rendered);
+    try testing.expectEqual(@as(usize, 7), encoded_words);
 }

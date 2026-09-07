@@ -5,6 +5,44 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **All five fuzz harnesses now receive their input; none of
+  them did before**, including the two that had already been fixed once for
+  exactly this and the one that already carried a deliberately shaped corpus.
+  - `utf7.fuzzDecode`, `fetch.fuzzEncode`, `search.fuzzEncode` and
+    `command.fuzzBuilders` opened `smith.bytes(&raw)` and then cut their
+    arguments with ranged draws. `bytes` takes `@min(raw.len, in.len)` octets,
+    so each ranged draw found fewer than the eight it needs and returned the
+    range MINIMUM — every argument was empty and the drawn octets sat unread.
+  - `response.fuzzResponse` drew the length FIRST, which fixed the ordering
+    (audit `imap` F8) and introduced a worse problem: a weighted draw reads
+    eight octets as a little-endian u64 and falls back to `weights[0].min` —
+    zero — unless that u64 lands inside a declared range, which a written seed
+    never does. It now draws with `smith.sliceWeighted`, which keeps the same
+    short-input weighting for `--fuzz` and reads a corpus entry's own length,
+    so a real response frame arrives intact.
+  ⭐ **`command.fuzzBuilders`'s corpus was deliberately shaped and was still
+  nearly empty.** Its own comment said the little-endian u64s behind the 96
+  shaped octets fed "each scalar draw", meaning the four `Options` bools and
+  `select`'s — but the harness took FIVE `valueRangeAtMost` length draws first,
+  and those consumed the first five u64s, each carrying 0 or 1. So `tag`,
+  `user`, `pass`, `name` and `flag` were **at most one octet long**, every bool
+  was shifted five slots from the value intended for it, and the shaped octets
+  went unread. Measured over that corpus: **18 argument octets in total across
+  all five seeds**, out of 480 shaped. It is 480 now, and the fields are cut
+  from the drawn length so no length draw is left to eat the tail.
+  ⭐ **A corpus of refusals only is a finding, not a result.** `fetch`'s corpus
+  was first written with fixed-width fields padded to their 48-octet slots and
+  scored **0 of 6 accepted** — because no padding of a sequence set is still a
+  sequence set. Both `fetch` and `search` now split the drawn octets at NUL
+  separators (never valid in a sequence set, a section or a flag) with an
+  equal-parts fallback for a mutation-engine draw, so a corpus entry carries
+  arguments at their natural sizes: 4 of 7 accepted in each.
+  ⭐ The five corpus guards pin what the collapse was hiding. For `utf7` and
+  `response` that is an accepted/parsed count (10 of 20 names decoded, 31
+  responses read); for the three encoders it is the total ARGUMENT LENGTH, not
+  an accepted count — every one of those builders accepts the empty string, so
+  "accepted" would have read ~100% while every argument was empty, the same
+  shape that let `bacnet/service` score 19 of 19.
 - **2026-08-11** — Security audit: the write path had no CR/LF discipline, so a
   caller-supplied argument containing a CRLF could inject a second IMAP command into an
   authenticated session; fixed, along with missing STARTTLS handling and five further

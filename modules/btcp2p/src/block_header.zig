@@ -67,21 +67,35 @@ pub const BlockHeader = struct {
 
 const testing = std.testing;
 
+/// `testkit.fuzz`, for the corpus at the bottom of this file. A corpus entry
+/// is not the frame: `Smith.slice` reads a little-endian `u32` length first,
+/// so a raw frame would arrive minus its own first four octets.
+/// `testkit/src/fuzz.zig` carries the other two hazards.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seed;
+const seedHex = testkit.fuzz.seedHex;
+
 // ── externally anchored: the genesis block, whose bytes + resulting hash
 // are exact and public (en.bitcoin.it/wiki/Genesis_block, "Raw block
 // data" -- fetched directly, not hand-transcribed) ─────────────────────
+
+/// The genesis block's 80-octet header, exactly as published. Container-level
+/// so the fuzz corpus below seeds the SAME octets this test anchors, rather
+/// than a re-transcription of them.
+const genesis_header = [_]u8{
+    0x01, 0x00, 0x00, 0x00, // version
+} ++ ([_]u8{0} ** 32) // prev_block: all zero
+++ [_]u8{
+    0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e,
+    0x67, 0x76, 0x8f, 0x61, 0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32,
+    0x3a, 0x9f, 0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a, // merkle_root
+    0x29, 0xab, 0x5f, 0x49, // timestamp
+    0xff, 0xff, 0x00, 0x1d, // bits
+    0x1d, 0xac, 0x2b, 0x7c, // nonce
+};
+
 test "external: genesis block header decodes + hashes to the well-known genesis hash" {
-    const header_bytes = [_]u8{
-        0x01, 0x00, 0x00, 0x00, // version
-    } ++ ([_]u8{0} ** 32) // prev_block: all zero
-    ++ [_]u8{
-        0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e,
-        0x67, 0x76, 0x8f, 0x61, 0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32,
-        0x3a, 0x9f, 0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a, // merkle_root
-        0x29, 0xab, 0x5f, 0x49, // timestamp
-        0xff, 0xff, 0x00, 0x1d, // bits
-        0x1d, 0xac, 0x2b, 0x7c, // nonce
-    };
+    const header_bytes = genesis_header;
     var r: Reader = .{ .bytes = &header_bytes };
     const header = try BlockHeader.decode(&r);
     try testing.expectEqual(@as(i32, 1), header.version);
@@ -135,15 +149,61 @@ test "hostile: BlockHeader.decode on a truncated (79-byte) buffer fails closed" 
     try testing.expectError(error.Truncated, BlockHeader.decode(&r));
 }
 
+/// 80-octet headers, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// `BlockHeader.decode` is six fixed-width reads with a single failure mode
+/// (`Truncated`), so the whole question is whether the harness ever hands it
+/// 80 octets — and with the collapsing draw it handed it 0, every time, which
+/// also meant `blockHash()` (the expensive half of this harness) was never
+/// once reached.
+const decode_seeds = [_][]const u8{
+    seed(&genesis_header), // the genesis header, whose hash is public
+    seedHex("ff" ** 80), // every field at its maximum, including a negative version
+    seedHex("00" ** 80), // every field zero
+    seedHex("00" ** 96), // a full buffer: 16 octets of trailing junk
+    seedHex("00" ** 79), // Truncated: one octet short, the hostile test's case
+    seedHex("01000000"), // Truncated: a version field and nothing else
+};
+
 test "fuzz: BlockHeader.decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzBlockHeaderDecode, .{});
+    try testing.fuzz({}, fuzzBlockHeaderDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzBlockHeaderDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [96]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `decode` saw `buf[0..0]` every single
+    // time, with the seed sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
     var r: Reader = .{ .bytes = buf[0..len] };
     const header = BlockHeader.decode(&r) catch return;
     _ = header.blockHash();
+}
+
+test "corpus: every header seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach, so this pins the number rather than asserting it is > 0.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [96]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var r: Reader = .{ .bytes = buf[0..len] };
+        if (BlockHeader.decode(&r)) |h| {
+            accepted += 1;
+            _ = h.blockHash();
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 6 seeds non-empty and 0 accepted before the
+    // draw was fixed, 6 of 6 non-empty and 4 accepted after.
+    try testing.expectEqual(@as(usize, 4), accepted);
 }

@@ -681,27 +681,86 @@ test "FETCH, SEARCH and ESEARCH now come back parsed, not as raw text" {
 // argument above still mostly holds; a minority draw enough bytes to clear
 // the 64 KiB line budget and exercise the refusal itself.
 
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the response
+/// streams it is. A corpus entry is not the frame: the length draw reads a
+/// little-endian `u32` first, so a raw stream would arrive minus its own first
+/// four octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// The length weighting, hoisted so `fuzzResponse` and its corpus guard cannot
+/// drift apart. Heavily weighted toward short inputs (grammar-dense) but able
+/// to reach past `max_line` (64 KiB) so `error.LineTooLong` is exercised.
+const len_weights: []const std.testing.Smith.Weight = &.{
+    .rangeAtMost(u32, 0, 512, 8),
+    .rangeAtMost(u32, 513, 80 * 1024, 1),
+};
+
+/// Any octet, at equal weight — the `Smith.bytes` default, spelled out because
+/// `sliceWeighted` takes the byte weighting explicitly.
+const byte_weights: []const std.testing.Smith.Weight = &.{.rangeAtMost(u8, 0, 255, 1)};
+
+/// Server response streams, in the format the length draw reads.
+///
+/// Every shape the value tests above pin: the RFC 3501 SELECT sequence, both
+/// CAPABILITY forms, continuation requests, a response code with a nested
+/// parenthesised list, VANISHED, the FETCH/SEARCH/ESEARCH trio, and the two
+/// refusals (an unknown status condition, a truncated final line). IMAP is a
+/// keyword grammar — `* <n> EXISTS CRLF`, `<tag> OK [<code>] <text> CRLF` —
+/// and `fuzzResponse` returns on the FIRST error, so an undirected byte stream
+/// dies inside its first atom and never reaches the multi-line state the
+/// harness's own comment says is the point of the loop.
+const response_seeds = [_][]const u8{
+    seed("* 172 EXISTS\r\n" ++
+        "* OK [UIDVALIDITY 3857529045] UIDs valid\r\n" ++
+        "* OK [UIDNEXT 4392] Predicted next UID\r\n" ++
+        "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n" ++
+        "* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\r\n" ++
+        "* LIST () \"/\" INBOX\r\n" ++
+        "A142 OK [READ-WRITE] SELECT completed\r\n"), // the RFC 3501 §6.3.1 SELECT exchange
+    seed("* CAPABILITY IMAP4rev2 STARTTLS AUTH=GSSAPI LOGINDISABLED\r\n" ++
+        "abcd OK CAPABILITY completed\r\n"), // untagged data then its tagged status
+    seed("* CAPABILITY imap4rev2 starttls IdLe\r\n"), // capability names are case-insensitive
+    seed("* OK [CAPABILITY IMAP4rev2 STARTTLS] IMAP4rev2 Service Ready\r\n" ++
+        "* BYE Autologout; idle for too long\r\n"), // a greeting carrying a response code, then BYE
+    seed("+ Ready for additional command text\r\n+ \r\n+\r\n"), // all three continuation-request spellings
+    seed("A003 NO [TRYCREATE] No such mailbox\r\n"), // a tagged NO with a response code
+    seed("A001 OK\r\n* OK\r\n"), // status lines with no text at all
+    seed("* FLAGS ( \\Seen \\Draft)\r\n"), // a leading space inside the flag list
+    seed("A001 OK [FUTUREEXTENSION 1 2 (3 4)] done\r\n"), // an unknown response code with a nested list
+    seed("* 42 VANISHED (EARLIER) 41:42\r\nA1 OK done\r\n"), // QRESYNC VANISHED with a UID range
+    seed("* FLAGS (\\Seen $Forwarded NonJunk)\r\n"), // keyword flags beside system flags
+    seed("A001 PREAUTH ok\r\n"), // PREAUTH as a tagged status
+    seed("* 23 EXISTS\r\n* 5 RECENT\r\n* 44 EXPUNGE\r\n"), // three numeric untagged responses in a row
+    seed("* 12 FETCH (UID 4827313 FLAGS (\\Seen))\r\n" ++
+        "* SEARCH 2 84 882\r\n" ++
+        "* ESEARCH (TAG \"A282\") MIN 2 COUNT 3\r\n"), // the FETCH / SEARCH / ESEARCH parsers
+    seed("* 1 FETCH (BODY[] {4294967295}\r\n"), // a literal claiming 4 GiB: refused before it is allocated
+    seed("A001 MAYBE something\r\n"), // an unknown status condition
+    seed("* 172 EXISTS\r\n* 173 EXISTS\r\n* AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), // a final line with no CRLF
+};
+
 test "fuzz: response parsing never panics on arbitrary server bytes" {
-    try testing.fuzz({}, fuzzResponse, .{});
+    try testing.fuzz({}, fuzzResponse, .{ .corpus = &response_seeds });
 }
 
 fn fuzzResponse(_: void, smith: *std.testing.Smith) !void {
     var buf: [80 * 1024]u8 = undefined;
-    // Draw the LENGTH FIRST. `Smith.bytes` consumes `min(out.len, in.len)`
-    // bytes of the corpus and leaves the rest of `out` at the default value,
-    // so filling an 80 KiB buffer up front drains `in` completely and every
-    // subsequent draw — including this one — degenerates to its default. That
-    // is why the first version of this harness never reached `LineTooLong`
-    // despite the raised window: the weighting was being read off an empty
-    // corpus.
+    // ⚠ ONE draw, and it is the bytes. This used to be a `valueWeighted` length
+    // followed by `smith.bytes(buf[0..len])`, which fixed the ordering problem
+    // the F8 note below describes but created a worse one: a weighted draw
+    // reads EIGHT octets as a little-endian u64 and falls back to
+    // `weights[0].min` — zero — unless that u64 happens to land inside a
+    // declared range. So `len` was 0 for every seed a human would write, and
+    // the parser was handed an empty stream while the seed sat unread.
+    // `sliceWeighted` keeps the same weighting for `--fuzz` AND reads a corpus
+    // entry's own length, so a real response frame arrives intact.
     //
-    // Heavily weighted toward short inputs (grammar-dense) but able to reach
-    // past `max_line` (64 KiB) so `error.LineTooLong` is actually exercised.
-    const len: usize = smith.valueWeighted(u32, &.{
-        std.testing.Smith.Weight.rangeAtMost(u32, 0, 512, 8),
-        std.testing.Smith.Weight.rangeAtMost(u32, 513, buf.len, 1),
-    });
-    smith.bytes(buf[0..len]);
+    // (The original ordering bug, for the record: `Smith.bytes` consumes
+    // `min(out.len, in.len)` octets, so filling an 80 KiB buffer up front
+    // drained `in` completely and every subsequent draw degenerated to its
+    // default. That is why the FIRST version of this harness never reached
+    // `LineTooLong` despite the raised window — audit `imap` F8.)
+    const len: usize = smith.sliceWeighted(&buf, len_weights, byte_weights);
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -741,27 +800,69 @@ test "fuzz harness (F8 regression): LineTooLong is actually reachable from fuzzR
     // one way the harness could have looked green while never reaching the
     // refusal:
     //
-    //   1. A corpus-backed `Smith` reads each weighted draw as a little-endian
-    //      u64 and falls back to `weights[0].min` unless that u64 lands inside
-    //      a declared range. Random bytes therefore draw 0 almost always, so
-    //      random corpora can never take the long branch — at any iteration
-    //      count. The length is written explicitly.
+    //   1. The length has to be written explicitly. It used to be a weighted
+    //      u64 draw, which a corpus-backed `Smith` reads as eight little-endian
+    //      octets and falls back to `weights[0].min` unless that u64 lands
+    //      inside a declared range — random bytes therefore drew 0 almost
+    //      always. It is now `sliceWeighted`, whose length header is a
+    //      little-endian **u32** and which is contained by the weights for any
+    //      value up to the buffer size; that is `testkit.fuzz`'s seed format,
+    //      and it is why this test writes four octets rather than eight.
     //   2. `fuzzResponse` returns on the FIRST error of any kind, so the
     //      payload must be free of CRLF *and* of any byte that ends an atom:
     //      the parser would reject on grammar long before the line budget is
     //      consulted.
-    //   3. `Smith.bytes` copies `min(out.len, in.len)` and pads the rest with
-    //      the default byte — which is one of those atom-ending bytes. So the
-    //      corpus must be long enough to fill the whole drawn length itself.
+    //   3. The draw copies `min(out_len, in_len)` and pads the rest with the
+    //      byte weighting's minimum — which is one of those atom-ending bytes.
+    //      So the corpus must be long enough to fill the whole drawn length.
     const gpa = testing.allocator;
-    const draw_len: u64 = 70_000; // > wire.Options{}.max_line (64 KiB)
-    const scratch = try gpa.alloc(u8, 8 + draw_len);
+    const draw_len: u32 = 70_000; // > wire.Options{}.max_line (64 KiB)
+    const scratch = try gpa.alloc(u8, 4 + draw_len);
     defer gpa.free(scratch);
     @memset(scratch, 'A');
-    std.mem.writeInt(u64, scratch[0..8], draw_len, .little);
+    std.mem.writeInt(u32, scratch[0..4], draw_len, .little);
 
     f8_line_too_long_reached = 0;
     var smith = std.testing.Smith{ .in = scratch };
     fuzzResponse({}, &smith) catch {};
     try testing.expect(f8_line_too_long_reached > 0);
+}
+
+test "corpus: every response seed reaches the reader, and the parsed count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (the length draw falls back to the range
+    // minimum), which is silent everywhere else; and a corpus where nothing is
+    // accepted is a corpus that only exercises the refusal path. Acceptance is
+    // not reach, so this pins the number rather than asserting it is > 0.
+    //
+    // It draws through `sliceWeighted` with the SAME weights the harness uses,
+    // because a guard measuring a different draw from the one the harness gets
+    // is not a guard — and the whole defect here was in the draw.
+    //
+    // `parsed` counts responses, not seeds: it is the number of `Reader.next`
+    // calls that returned one across the whole corpus, which is what falls if
+    // a grammar branch stops being taken.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    for (response_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [80 * 1024]u8 = undefined;
+        const len: usize = smith.sliceWeighted(&buf, len_weights, byte_weights);
+        if (len != 0) nonempty += 1;
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var r = std.Io.Reader.fixed(buf[0..len]);
+        var rd = Reader.init(arena.allocator(), &r, .{});
+        var guard: usize = 0;
+        while (guard < 64) : (guard += 1) {
+            _ = rd.next() catch break;
+            parsed += 1;
+        }
+    }
+    try testing.expectEqual(response_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 17 seeds non-empty and 0 responses parsed
+    // before the draw was fixed, 17 of 17 non-empty and 999 parsed after.
+    try testing.expectEqual(@as(usize, 31), parsed);
 }

@@ -927,8 +927,76 @@ test "encode: a seq_set cannot smuggle a second command onto the wire" {
     try testing.expectEqualStrings("", w.buffered());
 }
 
+/// The drawn octets, split into `n` argument fields at NUL separators — or into
+/// `n` equal parts when the draw contains no NUL, which is what a mutation
+/// engine will usually hand it.
+///
+/// ⚠ Not `n` more ranged draws, which is what this was. Each of those reads
+/// eight octets as a little-endian u64 and returns the range MINIMUM — zero —
+/// when fewer than eight remain, so every field was empty for every seed.
+/// ⚠ A fixed-offset partition was the other candidate and it is worse for a
+/// corpus: a 48-octet slot can only be filled with 48 octets, and no padding of
+/// a sequence set is still a sequence set. That was measured, not assumed —
+/// the padded version of this corpus scored **0 of 6 accepted**, which is a
+/// corpus that exercises the refusal path and nothing else. A NUL is never
+/// valid in a sequence set or a section, so spending it as the separator costs
+/// no coverage.
+fn fields(comptime n: usize, in: []const u8) [n][]const u8 {
+    var out: [n][]const u8 = @splat(in[0..0]);
+    if (std.mem.indexOfScalar(u8, in, 0) != null) {
+        var it = std.mem.splitScalar(u8, in, 0);
+        var i: usize = 0;
+        while (it.next()) |part| : (i += 1) {
+            if (i >= n) break;
+            out[i] = part;
+        }
+    } else {
+        const w = in.len / n;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const start = i * w;
+            out[i] = in[start..if (i == n - 1) in.len else start + w];
+        }
+    }
+    return out;
+}
+
+/// A shaped corpus entry: `frame` for the single `slice` draw, then one
+/// little-endian `u64` per scalar draw carrying the low bits of `bits` (any
+/// other value falls outside a `bool`'s range and is discarded).
+///
+/// ⚠ `testkit.fuzz.seed` is not used because these entries carry that tail
+/// behind the frame; the `u32` length header is the same format.
+fn shapedSeed(comptime frame: []const u8, comptime bits: u64) []const u8 {
+    return &struct {
+        const tail = blk: {
+            var t: [8 * 8]u8 = @splat(0);
+            for (0..8) |i| std.mem.writeInt(u64, t[i * 8 ..][0..8], (bits >> @intCast(i)) & 1, .little);
+            break :blk t;
+        };
+        const bytes = std.mem.toBytes(@as(u32, frame.len)) ++ frame[0..frame.len].* ++ tail;
+    }.bytes;
+}
+
+/// FETCH arguments: the sequence set and the body section, NUL-separated.
+///
+/// A section specifier is a small grammar (`HEADER`, `TEXT`,
+/// `HEADER.FIELDS (…)`, `1.2.MIME`) and a sequence set is another; uniform
+/// octets are neither, so an undirected harness only ever demonstrated the
+/// refusal — and, with the collapsed draws, not even that, because both fields
+/// were empty.
+const fetch_seeds = [_][]const u8{
+    shapedSeed("1:*,2,4:7,9,11:13\x00HEADER.FIELDS (FROM SUBJECT DATE)", 0xFF), // a real set and a real section
+    shapedSeed("1\x00TEXT", 0x00), // the minimal pair
+    shapedSeed("*\x001.2.MIME", 0xF0), // a part-number section
+    shapedSeed("1:100\x00", 0xAA), // an empty section: the whole body
+    shapedSeed("1:2\x00HEADER\r\nT9 LOGOUT", 0x0F), // refused: a CRLF in the section
+    shapedSeed("4294967296\x00BODY[]", 0x55), // refused: a sequence number past u32
+    shapedSeed("1 2\x00HEADER", 0x33), // refused: a space in the sequence set
+};
+
 test "fuzz: no FETCH argument can put a second command line on the wire" {
-    try testing.fuzz({}, fuzzEncode, .{});
+    try testing.fuzz({}, fuzzEncode, .{ .corpus = &fetch_seeds });
 }
 
 /// `fetch.encode` never calls `string`, so it never emits a literal: every byte
@@ -937,11 +1005,19 @@ test "fuzz: no FETCH argument can put a second command line on the wire" {
 /// anywhere before it. The shape is `smtp/src/command.zig`'s `fuzzCommands`.
 fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
     var raw: [96]u8 = undefined;
-    smith.bytes(&raw);
-    // From 0: the empty seq_set and the empty section are both interesting, and
-    // a harness that cannot draw them cannot reach half of this grammar.
-    const seq = raw[0..smith.valueRangeAtMost(u8, 0, 48)];
-    const sec = raw[48..][0..smith.valueRangeAtMost(u8, 0, 48)];
+    // ⚠ One `smith.slice` call, and the fields are cut from what it returned.
+    // This used to be `smith.bytes(&raw)` followed by two ranged length draws;
+    // `bytes` takes `@min(raw.len, in.len)` octets and each ranged draw then
+    // finds fewer than the eight it needs and returns the range MINIMUM, so
+    // `seq` and `sec` were BOTH empty for every seed while the drawn octets sat
+    // unread in `raw`. The old comment beside those draws said "the empty
+    // seq_set and the empty section are both interesting" — they were the only
+    // thing this harness had ever produced.
+    const n = smith.slice(&raw);
+    const in = raw[0..n];
+    const f = fields(2, in);
+    const seq = f[0];
+    const sec = f[1];
     const tag = if (smith.value(bool)) "T1" else seq;
 
     var buf: [1024]u8 = undefined;
@@ -966,4 +1042,45 @@ fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
         // A refusal must also be a clean refusal: nothing half-written.
         std.debug.assert(w.buffered().len == 0);
     }
+}
+
+test "corpus: every FETCH seed reaches the encoder, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum), which is silent everywhere else.
+    //
+    // The argument octets are the number that catches the defect: two empty
+    // fields per seed before, 96 per seed now. "Encoded" alone would not have —
+    // `encode` with an empty sequence set and an empty section succeeds, so the
+    // collapsed harness's single execution looked healthy, the same shape that
+    // let `bacnet/service` score 19 of 19.
+    var nonempty: usize = 0;
+    var arg_octets: usize = 0;
+    var encoded: usize = 0;
+    for (fetch_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [96]u8 = undefined;
+        const n = smith.slice(&raw);
+        if (n != 0) nonempty += 1;
+        const in = raw[0..n];
+        const f = fields(2, in);
+        const seq = f[0];
+        const sec = f[1];
+        arg_octets += seq.len + sec.len;
+
+        var buf: [1024]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        var e = command.Encoder.init(std.testing.allocator, &w, .{});
+        const req: Request = .{ .sections = &.{sec} };
+        if (encode(&e, "T1", seq, false, req)) |_| {
+            encoded += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(fetch_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 argument octets before the draw was fixed (both
+    // fields empty on every seed, whatever the corpus said), 114 after.
+    try testing.expectEqual(@as(usize, 114), arg_octets);
+    // 4 of 7: the three refusals are a CRLF in the section, a sequence number
+    // past u32, and a space in the sequence set.
+    try testing.expectEqual(@as(usize, 4), encoded);
 }
