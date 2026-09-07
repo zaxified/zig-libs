@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Test-only, no production change: the knobs both fuzz targets draw after
+  their byte draw are alive, but three of them were **constant**, so the branches behind them
+  had never executed in the ordinary lane. Measured 2026-09-08.
+  - `fuzzSighash`'s two hash-type knobs were `true` on **4 of 4** decoded seeds — every tail in
+    the corpus was built out of `1`s — so `smith.value(u32)` and the arbitrary `smith.value(u8)`
+    arms never ran, while the comment beside them claimed "half the draws ... half are
+    arbitrary". Two seeds now select the arbitrary arms; the false rate claim is gone.
+  - The version-byte bias switch was **1 / 0 / 0 / 5** in `fuzzSighash` and **1 / 1 / 0 / 4** in
+    `fuzzDeserializePartial`: the arm that writes an arbitrary octet had never been selected in
+    either, and the arm that writes the **segwit marker** had never been selected in
+    `fuzzSighash` at all. Both corpora gain seeds for the missing arms.
+  - `SighashCorpus.push` gained a `which_arg` word. Arms 0 and 2 draw a SECOND word before the
+    script slice, and without it arm 0 read the script seed's own `u32` length header as its
+    eight octets — so the `which = 0` seed's script came back cut out of the middle of itself.
+  - Both corpus guards now replay the harness's full draw order and pin the knob outcomes as
+    histograms rather than booleans (a boolean cannot tell "arm 2 never ran" from "arm 2 was
+    not asserted"). `fuzzSighash`: 6 decoded / 9 inputs / 5 digests per algorithm, was 4 / 6 / 3.
+    `fuzzDeserializePartial`: unchanged at 2 accepted / 3 inputs / 1 witness.
+
 - **2026-09-07** — Test-only, no production change: neither fuzz target had ever decoded
   a transaction. `fuzzSighash` carried four hand-written 512-octet seeds, but the helper
   that built them wrote `(bits >> w) & 0x03` into every trailing `u64` word — including

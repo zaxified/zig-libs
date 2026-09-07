@@ -217,9 +217,16 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
     const idx: usize = smith.valueRangeAtMost(u8, 0, 5);
     const amount = smith.value(i64);
 
-    // Half the draws are a well-formed hash type (base 0..3, optional
-    // ANYONECANPAY), half are arbitrary — the SIGHASH_SINGLE bug and the
-    // unknown-base fallthrough are both only reachable from the first half.
+    // A well-formed hash type (base 0..3, optional ANYONECANPAY) or an
+    // arbitrary one: the SIGHASH_SINGLE bug needs the first, the unknown-base
+    // fallthrough the second.
+    // ⚠ The comment here used to say "half the draws ... half are arbitrary".
+    // Under `--fuzz` that is the fuzzer's business, not a fact about the code;
+    // over the corpus it was simply false — measured 2026-09-08, this knob was
+    // `true` on 4 of 4 decoded seeds, because every tail in the corpus was
+    // built out of `1`s, so `smith.value(u32)` had never been reached. The
+    // corpus now carries two seeds whose tail selects the arbitrary arm, and
+    // the guard below pins the split instead of a comment asserting a rate.
     const ht32: u32 = if (smith.value(bool))
         @as(u32, smith.valueRangeAtMost(u8, 0, 3)) | (if (smith.value(bool)) @as(u32, 0x80) else 0)
     else
@@ -313,17 +320,35 @@ fn fuzzSighash(_: void, smith: *std.testing.Smith) !void {
 /// index, and `true` is the branch that reaches the precomputed-mismatch
 /// assertions.
 const SighashCorpus = struct {
-    store: [8 * (4 + tx.fuzz_tx_buf_len + 8 + 4 + 96 + 32 * 8)]u8 = undefined,
+    store: [12 * (4 + tx.fuzz_tx_buf_len + 16 + 4 + 96 + 32 * 8)]u8 = undefined,
     used: usize = 0,
-    entries: [8][]const u8 = undefined,
+    entries: [12][]const u8 = undefined,
     n: usize = 0,
 
-    fn push(self: *SighashCorpus, frame: []const u8, which: u64, script: []const u8, tail: []const u64) void {
+    /// `which_arg` is the word arms 0 and 2 of the version-byte switch draw
+    /// AFTER `which` and BEFORE the script slice.
+    /// ⛔ Measured 2026-09-08: without it, arm 0's `valueRangeAtMost(u8, 0, 4)`
+    /// read the script seed's own `u32` length header as its eight octets, and
+    /// the script slice that followed then read a length out of the middle of
+    /// the script. Passing `null` for an arm that draws nothing (1 and 3) is
+    /// what keeps the two cases apart.
+    fn push(
+        self: *SighashCorpus,
+        frame: []const u8,
+        which: u64,
+        which_arg: ?u64,
+        script: []const u8,
+        tail: []const u64,
+    ) void {
         const start = self.used;
         var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
         if (frame.len > 4) {
             std.mem.writeInt(u64, self.store[at..][0..8], which, .little);
             at += 8;
+            if (which_arg) |w| {
+                std.mem.writeInt(u64, self.store[at..][0..8], w, .little);
+                at += 8;
+            }
         }
         at += testkit.fuzz.seedInto(self.store[at..], script).len;
         for (tail) |w| {
@@ -342,16 +367,33 @@ const SighashCorpus = struct {
         // idx = 0 with a SIGHASH_SINGLE base (2) and no ANYONECANPAY —
         // the legacy SIGHASH_SINGLE bug path.
         const single = [_]u64{ 0, 1, 1, 2, 0 } ++ [_]u64{1} ** 19;
+        // ⛔ The two `value(bool)` knobs that choose between a WELL-FORMED and
+        // an ARBITRARY hash type were `true` on 4 of 4 decoded seeds when this
+        // was measured on 2026-09-08 — every tail in the corpus was built out
+        // of `1`s — so `smith.value(u32)` and the arbitrary `smith.value(u8)`
+        // arms had never run, and the harness comment beside them claimed
+        // "half the draws". `0` selects the arbitrary arm; the trailing zeroes
+        // keep every later knob in range whatever the transaction's `vin.len`
+        // turns out to be, so this tail is valid for both KATs.
+        const arbitrary = [_]u64{ 0, 1, 0, 0xdeadbeef } ++ [_]u64{0} ** 20;
         // ⛔ 3 = "leave the frame's own version byte alone". The other values
         // are the arbitrary-bytes bias, which would corrupt a real fixture.
-        self.push(&tx.fuzz_kat_legacy, 3, &p2pkh_script, &ones);
-        self.push(&tx.fuzz_kat_legacy, 3, &p2pkh_script, &single);
-        self.push(&tx.fuzz_kat_segwit, 3, &p2pkh_script, &ones);
-        self.push(&tx.fuzz_kat_segwit, 3, &[_]u8{}, &ones); // empty script
+        self.push(&tx.fuzz_kat_legacy, 3, null, &p2pkh_script, &ones);
+        self.push(&tx.fuzz_kat_legacy, 3, null, &p2pkh_script, &single);
+        self.push(&tx.fuzz_kat_segwit, 3, null, &p2pkh_script, &ones);
+        self.push(&tx.fuzz_kat_segwit, 3, null, &[_]u8{}, &ones); // empty script
         const rewritten = [_]u64{2} ++ [_]u64{1} ** 23;
-        self.push(&tx.fuzz_kat_legacy, 0, &p2pkh_script, &rewritten); // vin count rewritten
-        self.push(tx.fuzz_kat_legacy[0..40], 3, &p2pkh_script, &ones); // truncated
-        self.push("", 3, &[_]u8{}, &ones); // the input this target used to run for ever
+        self.push(&tx.fuzz_kat_legacy, 0, 2, &p2pkh_script, &rewritten); // vin count rewritten
+        // ⛔ Arms 1 and 2 of the same switch had never been selected either:
+        // the `which` histogram was 1 / 0 / 0 / 5. Arm 1 writes `0x00`, which
+        // is the SEGWIT MARKER — the path `tx.zig`'s own comment says the bias
+        // exists to reach — and arm 2 writes an arbitrary octet.
+        self.push(&tx.fuzz_kat_legacy, 1, null, &p2pkh_script, &ones);
+        self.push(&tx.fuzz_kat_legacy, 2, 0xfd, &p2pkh_script, &ones);
+        self.push(&tx.fuzz_kat_legacy, 3, null, &p2pkh_script, &arbitrary);
+        self.push(&tx.fuzz_kat_segwit, 3, null, &p2pkh_script, &arbitrary);
+        self.push(tx.fuzz_kat_legacy[0..40], 3, null, &p2pkh_script, &ones); // truncated
+        self.push("", 3, null, &[_]u8{}, &ones); // the input this target used to run for ever
         return self.entries[0..self.n];
     }
 };
@@ -374,13 +416,27 @@ test "corpus: sighash seeds reach the decoder, and the counts are pinned" {
     var bip143_digests: usize = 0;
     var bip341_digests: usize = 0;
     var script_octets: usize = 0;
+    // ⛔ The knobs drawn AFTER the two byte draws. Every one of them reads a
+    // tail word, so they are alive — but "alive" is not "varying", and two of
+    // them were CONSTANT: `structured_ht32` and `structured_ht8` were 4 of 4
+    // when this was first measured, so the two `smith.value(u32)` /
+    // `smith.value(u8)` arbitrary arms had never run. `which_hist` was
+    // 1 / 0 / 0 / 5 for the same reason. Pinned as histograms rather than
+    // totals: a total cannot tell "both arms ran" from "one arm ran twice".
+    var which_hist = [_]usize{0} ** 4;
+    var structured_ht32: usize = 0;
+    var anyonecanpay: usize = 0;
+    var structured_ht8: usize = 0;
+    var clone_assertions: usize = 0;
     for (corpus.build()) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [tx.fuzz_tx_buf_len]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
         if (len > 4) {
-            buf[4] = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+            const which = smith.valueRangeAtMost(u8, 0, 3);
+            which_hist[which] += 1;
+            buf[4] = switch (which) {
                 0 => smith.valueRangeAtMost(u8, 0, 4),
                 1 => 0x00,
                 2 => smith.value(u8),
@@ -396,28 +452,52 @@ test "corpus: sighash seeds reach the decoder, and the counts are pinned" {
         script_octets += script.len;
         const idx: usize = smith.valueRangeAtMost(u8, 0, 5);
         const amount = smith.value(i64);
-        const ht32: u32 = if (smith.value(bool))
-            @as(u32, smith.valueRangeAtMost(u8, 0, 3)) | (if (smith.value(bool)) @as(u32, 0x80) else 0)
-        else
-            smith.value(u32);
+        const ht32: u32 = if (smith.value(bool)) blk: {
+            structured_ht32 += 1;
+            const base = @as(u32, smith.valueRangeAtMost(u8, 0, 3));
+            const acp: u32 = if (smith.value(bool)) 0x80 else 0;
+            if (acp != 0) anyonecanpay += 1;
+            break :blk base | acp;
+        } else smith.value(u32);
         if (legacy.sighash(a, r.tx, idx, script, ht32)) |_| legacy_digests += 1 else |_| {}
-        if (bip143.sighash(a, r.tx, idx, script, amount, ht32)) |_| bip143_digests += 1 else |_| {}
+        // ⚠ From here the draw order must match `fuzzSighash` exactly, or the
+        // knobs after it are measured against words they never read.
+        if (bip143.sighash(a, r.tx, idx, script, amount, ht32)) |_| {
+            bip143_digests += 1;
+            if (smith.value(bool)) clone_assertions += 1;
+        } else |_| {}
         var spent: [8]TxOut = undefined;
         if (r.tx.vin.len <= spent.len) {
-            for (spent[0..r.tx.vin.len]) |*o| o.* = .{ .value = amount, .script_pubkey = script };
-            if (bip341.sighash(a, r.tx, idx, 0x01, spent[0..r.tx.vin.len])) |_| bip341_digests += 1 else |_| {}
+            for (spent[0..r.tx.vin.len]) |*o| o.* = .{ .value = smith.value(i64), .script_pubkey = script };
+            const valid_ht = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83 };
+            const ht8: u8 = if (smith.value(bool)) blk: {
+                structured_ht8 += 1;
+                break :blk valid_ht[smith.valueRangeAtMost(u8, 0, valid_ht.len - 1)];
+            } else smith.value(u8);
+            if (bip341.sighash(a, r.tx, idx, ht8, spent[0..r.tx.vin.len])) |_| {
+                bip341_digests += 1;
+                if (smith.value(bool)) clone_assertions += 1;
+                if (smith.value(bool)) clone_assertions += 1;
+            } else |_| {}
         }
     }
     try std.testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
-    try std.testing.expectEqual(@as(usize, 4), decoded);
-    try std.testing.expectEqual(@as(usize, 6), vin_total);
-    try std.testing.expectEqual(@as(usize, 75), script_octets);
+    try std.testing.expectEqual(@as(usize, 6), decoded);
+    try std.testing.expectEqual(@as(usize, 9), vin_total);
+    try std.testing.expectEqual(@as(usize, 125), script_octets);
     // ⛔ These three were **0** for every input this target ever ran, because
-    // the length draw capped the transaction at 3 octets. One of the four
-    // decoded transactions is refused by all three algorithms on purpose
-    // (`idx = 1` against a one-input transaction — `InputIndexOutOfRange` is a
-    // gate all three implement separately), hence 3 and not 4.
-    try std.testing.expectEqual(@as(usize, 3), legacy_digests);
-    try std.testing.expectEqual(@as(usize, 3), bip143_digests);
-    try std.testing.expectEqual(@as(usize, 3), bip341_digests);
+    // the length draw capped the transaction at 3 octets. They were 3 / 3 / 3
+    // over the seven-seed corpus of 2026-09-07; the two `arbitrary` seeds
+    // added on 2026-09-08 decode too, hence 5.
+    try std.testing.expectEqual(@as(usize, 5), legacy_digests);
+    try std.testing.expectEqual(@as(usize, 5), bip143_digests);
+    try std.testing.expectEqual(@as(usize, 5), bip341_digests);
+    // Measured 2026-09-08. Before the two `arbitrary` seeds and the arm-1/arm-2
+    // seeds: which = {1, 0, 0, 5}, structured_ht32 = 4 of 4, structured_ht8 =
+    // 4 of 4, anyonecanpay = 3, clone assertions = 9. After:
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 1, 7 }, &which_hist);
+    try std.testing.expectEqual(@as(usize, 4), structured_ht32);
+    try std.testing.expectEqual(@as(usize, 3), anyonecanpay);
+    try std.testing.expectEqual(@as(usize, 4), structured_ht8);
+    try std.testing.expectEqual(@as(usize, 9), clone_assertions);
 }

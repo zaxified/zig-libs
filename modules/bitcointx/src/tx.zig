@@ -827,7 +827,7 @@ pub const fuzz_kat_segwit = kat_segwit;
 
 /// `which == 3` leaves the frame untouched; the other three are the original
 /// bias, which only matters for arbitrary bytes.
-const DeserCorpus = TxCorpus(8, 8 * (4 + fuzz_tx_buf_len + 8));
+const DeserCorpus = TxCorpus(10, 10 * (4 + fuzz_tx_buf_len + 16));
 
 fn buildDeserCorpus(self: *DeserCorpus) []const []const u8 {
     self.push(&kat_legacy, &.{3}); // the 275-octet legacy KAT, untouched
@@ -835,6 +835,14 @@ fn buildDeserCorpus(self: *DeserCorpus) []const []const u8 {
     self.push(kat_legacy[0..100], &.{3}); // truncated mid-scriptSig
     self.push(&kat_legacy, &.{ 0, 2 }); // vin count rewritten to 2: one input short
     self.push(&kat_legacy, &.{1}); // vin count rewritten to the segwit marker
+    // ⛔ Arm 2 — the one that writes an ARBITRARY octet — had never been
+    // selected: measured 2026-09-08, the `which` histogram over the eight
+    // seeds above was 1 / 1 / **0** / 4, and the guard below only asserted
+    // that arms 0, 1 and 3 had been seen. `0xfd` is the CompactSize prefix
+    // that claims a two-octet count, so the vin count is then read from the
+    // two octets of a real transaction that follow it.
+    self.push(&kat_legacy, &.{ 2, 0xfd });
+    self.push(&kat_segwit, &.{ 2, 0xff }); // and the eight-octet CompactSize prefix
     self.push(kat_segwit[0..5], &.{3}); // version + marker and nothing after
     self.push(&[_]u8{ 0x01, 0x00, 0x00 }, &.{3}); // shorter than the version field
     self.push("", &.{3}); // and the input this target used to run for ever
@@ -887,7 +895,7 @@ test "corpus: deserializePartial seeds reach the decoder, and the counts are pin
     // transactions. It only moves when a seed's own octets reach the vin loop.
     var vin_total: usize = 0;
     var witness_seen: usize = 0;
-    var which_seen: [4]bool = @splat(false);
+    var which_hist = [_]usize{0} ** 4;
     for (buildDeserCorpus(&corpus)) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [fuzz_tx_buf_len]u8 = undefined;
@@ -897,7 +905,7 @@ test "corpus: deserializePartial seeds reach the decoder, and the counts are pin
         // draws where the harness does not is measuring a different corpus.
         if (len > 4) {
             const which = smith.valueRangeAtMost(u8, 0, 3);
-            which_seen[which] = true;
+            which_hist[which] += 1;
             buf[4] = switch (which) {
                 0 => smith.valueRangeAtMost(u8, 0, 4),
                 1 => 0x00,
@@ -916,8 +924,9 @@ test "corpus: deserializePartial seeds reach the decoder, and the counts are pin
     try testing.expectEqual(@as(usize, 3), vin_total);
     try testing.expectEqual(@as(usize, 1), witness_seen);
     // The knob is alive on a corpus replay, which is the half a seed alone
-    // cannot fix: three of its four branches actually ran.
-    try testing.expectEqual(true, which_seen[0]);
-    try testing.expectEqual(true, which_seen[1]);
-    try testing.expectEqual(true, which_seen[3]);
+    // cannot fix. ⛔ But "alive" is not "varying": measured 2026-09-08 the
+    // histogram was 1 / 1 / **0** / 4, and the three booleans that used to
+    // stand here could not say so — a boolean cannot distinguish "arm 2 never
+    // ran" from "arm 2 was not asserted". Pinned as counts, all four arms.
+    try testing.expectEqualSlices(usize, &[_]usize{ 1, 1, 2, 4 }, &which_hist);
 }
