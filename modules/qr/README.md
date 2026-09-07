@@ -141,5 +141,5 @@ ISO/IEC 18004. Verification, including the external encoder oracle, is in
 oracle only, never read as a design reference — no NOTICE entry needed. Test
 data: `src/testdata/golden_matrices.zig` is captured, byte-for-byte, from
 that oracle running on this machine (not reproduced from any upstream test
-corpus); `src/testdata/reference.py` is this repo's own script (`SPDX-License-Identifier:
+corpus); `tools/reference.py` is this repo's own script (`SPDX-License-Identifier:
 MIT`) that drives it and reproduces none of `segno`'s own source.

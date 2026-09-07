@@ -1511,29 +1511,169 @@ test "finder patterns land where every decoder looks for them" {
 // property is that no input produces a panic, an overflow or a truncated
 // symbol: either a typed error, or a matrix whose size agrees with its version.
 
-test "fuzz: encode never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzEncode, .{});
-}
+// ⚠ Every harness in this file collapsed to a single fixed input, and the
+// four of them collapsed in three different ways.
+//
+// `fuzzEncode` opened with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`: `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain -- so `len` was 0 and the
+// text was empty. Every knob after it was drawn from an exhausted input too:
+// `ecc` was always `.low`, `version` always null and `mask` always 0. The
+// comment "0 and 41 exercise the guards" described a version draw that was 0
+// every time and 41 never.
+//
+// The fix that works for all four is the same one: take the seed in ONE
+// `smith.slice` draw and read the choices out of the octets, so a knob cannot
+// be drawn from input that is no longer there. It also makes a seed a
+// reviewable script instead of a sequence of `u64` words.
 
-fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const ecc: Ecc = @enumFromInt(smith.valueRangeAtMost(u8, 0, 3));
-    const forced_version = smith.valueRangeAtMost(u8, 0, 41); // 0 and 41 exercise the guards
+/// `testkit.fuzz.Cursor` over one corpus seed. See `testkit/src/fuzz.zig` for
+/// why a shape-drawing harness wants this rather than a ranged draw.
+const Script = @import("testkit").fuzz.Cursor;
+const seed = @import("testkit").fuzz.seed;
+const seedHex = @import("testkit").fuzz.seedHex;
+
+/// What one encode script produced, so the guard measures the corpus rather
+/// than asserting it ran.
+const EncodeOutcome = struct {
+    ecc: Ecc = .low,
+    encoded: bool = false,
+    /// The symbol's version, 0 when nothing was encoded.
+    version: u6 = 0,
+    /// Whether the text round-tripped back out of `decode`.
+    round_tripped: bool = false,
+};
+
+/// The body of `fuzzEncode`, factored out so the harness and the corpus guard
+/// drive the SAME encode from the same octets.
+///
+/// The seed layout is `ecc, version, mask, text...`: `ecc` selects the level
+/// (mod 4), `version` is 0 for "let the encoder choose" and 1..40 to force one
+/// (41 and up exercise `BadVersion`), `mask` is 8 for "let the encoder choose"
+/// and 0..7 to force one, and everything after the third octet is the text.
+fn runEncodeScript(bytes: []const u8) !EncodeOutcome {
+    var out: EncodeOutcome = .{};
+    const ecc_byte: u8 = if (bytes.len > 0) bytes[0] else 0;
+    const version_byte: u8 = if (bytes.len > 1) bytes[1] else 0;
+    const mask_byte: u8 = if (bytes.len > 2) bytes[2] else 8;
+    const text: []const u8 = if (bytes.len > 3) bytes[3..] else "";
+
+    out.ecc = @enumFromInt(ecc_byte % 4);
+    // ⭐ `% 42` and NOT `@min(.., 40)`. The old harness wrote
+    // `@intCast(@min(forced_version, 40))` under a comment saying "0 and 41
+    // exercise the guards" — but the clamp turns 41 into 40, so `BadVersion`
+    // was unreachable from this harness whatever the draw returned. Two
+    // separate reasons the same guard never ran.
+    const forced_version: u8 = version_byte % 42; // 0 = auto, 1..40 valid, 41 = BadVersion
 
     var m: Matrix = undefined;
-    encode(&m, buf[0..len], .{
-        .ecc = ecc,
-        .version = if (forced_version == 0) null else @intCast(@min(forced_version, 40)),
-        .mask = if (smith.valueRangeAtMost(u8, 0, 8) == 8) null else @intCast(smith.valueRangeAtMost(u8, 0, 7)),
-    }) catch return;
+    encode(&m, text, .{
+        .ecc = out.ecc,
+        .version = if (forced_version == 0) null else @intCast(forced_version),
+        .mask = if (mask_byte % 9 == 8) null else @intCast(mask_byte % 8),
+    }) catch return out;
 
     // A returned symbol must be internally consistent — a size that disagrees
     // with the version means the placement walked a grid of the wrong shape,
     // which is exactly the failure a panic-only harness would let through.
     try std.testing.expectEqual(sideFor(m.version), m.size);
     try std.testing.expect(m.isDark(0, 0)); // top-left finder survived
+    out.encoded = true;
+    out.version = m.version;
+
+    // And the symbol must read back as what went in. A matrix that is
+    // self-consistent but decodes to something else is the silent-corruption
+    // failure this module's TEETH section is about.
+    var decoded: [4096]u8 = undefined;
+    if (decode(&m, &decoded)) |got| {
+        try std.testing.expectEqualStrings(text, got);
+        out.round_tripped = true;
+    } else |_| {}
+    return out;
+}
+
+/// Encode scripts: `ecc, version, mask, text...`. The three leading octets are
+/// spelled in hex so the knobs read as the choices they are, and the text
+/// follows verbatim.
+const encode_seeds = [_][]const u8{
+    seed("\x00\x00\x08" ++ "HELLO WORLD"), // low / auto version / auto mask, alphanumeric
+    seed("\x01\x00\x08" ++ "HELLO WORLD"), // the same at medium
+    seed("\x02\x00\x08" ++ "HELLO WORLD"), // quartile
+    seed("\x03\x00\x08" ++ "HELLO WORLD"), // high
+    seed("\x00\x00\x08" ++ "0123456789012345"), // the numeric mode
+    seed("\x00\x00\x08" ++ "https://example.com/path?q=1"), // byte mode, a URL
+    seed("\x00\x00\x08" ++ "P\xc5\x99\xc3\xadli\xc5\xa1 \xc5\xbelu\xc5\xa5ou\xc4\x8dk\xc3\xbd k\xc5\xaf\xc5\x88"), // multi-byte UTF-8
+    seed("\x00\x01\x08" ++ "A"), // version 1 forced: the smallest symbol
+    seed("\x00\x28\x08" ++ "A"), // version 40 forced: the largest
+    seed("\x00\x29\x08" ++ "A"), // ⭐ version 41: `BadVersion`, which the old harness's own comment claimed to exercise and never did
+    seed("\x00\x01\x08" ++ ("A" ** 60)), // too long for the forced version: `TooLong`
+    seed("\x00\x00\x00" ++ "MASK ZERO"), // every mask forced, 0 through 7
+    seed("\x00\x00\x01" ++ "MASK ONE"),
+    seed("\x00\x00\x02" ++ "MASK TWO"),
+    seed("\x00\x00\x03" ++ "MASK THREE"),
+    seed("\x00\x00\x04" ++ "MASK FOUR"),
+    seed("\x00\x00\x05" ++ "MASK FIVE"),
+    seed("\x00\x00\x06" ++ "MASK SIX"),
+    seed("\x00\x00\x07" ++ "MASK SEVEN"),
+    seed("\x03\x00\x08" ++ ("A" ** 480)), // high ECC and a long message: near the capacity ceiling
+    seed("\x00\x00\x08" ++ "\x00\x01\x02\xfd\xfe\xff"), // control and high bytes
+    seed("\x00\x00\x08"), // the knobs with an EMPTY text
+    seed(""), // the empty script: exactly what the collapsed harness ran
+};
+
+test "fuzz: encode never panics on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzEncode, .{ .corpus = &encode_seeds });
+}
+
+fn fuzzEncode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    _ = try runEncodeScript(buf[0..len]);
+}
+
+test "corpus: every encode seed reaches the encoder, and the symbols built are pinned" {
+    // ⭐ Three numbers, and none of them is "accepted". `encode("")` SUCCEEDS —
+    // an empty byte segment is a legal QR payload — so "some seeds encoded"
+    // would have been satisfied by the single empty input the collapsed harness
+    // ran, and read as a pass. The numbers that only real text can produce are
+    // the distinct ECC levels reached, the distinct versions built, and the
+    // seeds that decoded back to exactly what went in.
+    var nonempty: usize = 0;
+    var encoded: usize = 0;
+    var round_tripped: usize = 0;
+    var ecc_seen = [_]bool{false} ** 4;
+    var versions_seen = [_]bool{false} ** 41;
+    for (encode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const out = try runEncodeScript(buf[0..len]);
+        ecc_seen[@intFromEnum(out.ecc)] = true;
+        if (out.encoded) {
+            encoded += 1;
+            versions_seen[out.version] = true;
+        }
+        if (out.round_tripped) round_tripped += 1;
+    }
+    var eccs: usize = 0;
+    for (ecc_seen) |b| {
+        if (b) eccs += 1;
+    }
+    var versions: usize = 0;
+    for (versions_seen, 0..) |b, v| {
+        if (b and v != 0) versions += 1;
+    }
+    // One seed is deliberately the empty script.
+    try std.testing.expectEqual(encode_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: 1 seed of 1 non-empty, 1 ECC level, 1 version and
+    // 1 round trip before the draws were fixed — and that one symbol was the
+    // encoding of the EMPTY string.
+    try std.testing.expectEqual(@as(usize, 4), eccs);
+    try std.testing.expectEqual(@as(usize, 21), encoded);
+    try std.testing.expectEqual(@as(usize, 4), versions);
+    try std.testing.expectEqual(@as(usize, 21), round_tripped);
 }
 
 test "round trip: every mode, every level, across the version range" {
@@ -1715,49 +1855,215 @@ test "decode rejects a malformed symbol rather than guessing" {
     try t.expectError(DecodeError.BufferTooSmall, decode(&m, &tiny));
 }
 
-test "fuzz: decode never panics on an arbitrary grid" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
-}
-
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+/// The body of `fuzzDecode`. The seed layout is `sizeIndex, grid...`: the first
+/// octet picks the side (17 + 4*n, clamped to `max_size`) and the rest fills the
+/// module bits, cycling if the script is shorter than the grid.
+///
+/// ⚠ The old body drew the size with `smith.valueRangeAtMost(u8, 0, 42)` as
+/// its FIRST draw and then filled every bit with another ranged draw, so
+/// outside `--fuzz` it built a 17x17 grid of entirely light modules -- one
+/// fixed input, every iteration, for the life of the harness. The Reed-Solomon
+/// path the comment below is about was never entered: an all-light grid fails
+/// the format-information BCH check long before it.
+fn runDecodeScript(bytes: []const u8) bool {
     // A scanner builds this matrix from an image, so every field of it is
     // attacker-influenced — including a size and a format that never came from
     // an encoder. The Reed-Solomon path is the part that matters here: a
     // corrupted locator must end in an error, not an out-of-range index.
+    var s = Script{ .bytes = bytes };
     var m: Matrix = .{};
-    m.size = @as(u16, 17) + 4 * @as(u16, smith.valueRangeAtMost(u8, 0, 42));
+    m.size = @as(u16, 17) + 4 * @as(u16, @intCast(s.ranged(0, 42)));
     if (m.size > max_size) m.size = max_size;
-    for (0..m.bits.len) |i| m.bits[i] = smith.valueRangeAtMost(u8, 0, 255);
+    for (0..m.bits.len) |i| m.bits[i] = s.byte();
 
     var out: [4096]u8 = undefined;
-    _ = decode(&m, &out) catch return;
+    if (decode(&m, &out)) |_| return true else |_| return false;
 }
 
-test "fuzz: decode survives damage to a real symbol" {
-    try std.testing.fuzz({}, fuzzDamage, .{});
+/// Grid scripts. The first octet is the size index; the rest is the module
+/// pattern, cycled to fill the grid.
+const decode_seeds = [_][]const u8{
+    seedHex("00" ++ "00"), // the all-light 17×17 grid: exactly what the collapsed harness ran
+    seedHex("00" ++ "ff"), // the all-dark 17×17 grid
+    seedHex("00" ++ "55"), // a 17×17 checkerboard
+    seedHex("00" ++ "0f0f3333"), // a repeating pattern with the period of a byte boundary
+    seedHex("01" ++ "55"), // version 2 (21×21)
+    seedHex("0a" ++ "55"), // a mid-range version
+    seedHex("28" ++ "55"), // version 41's index: clamped to `max_size`
+    seedHex("2a" ++ "ff"), // the index maximum: also clamped
+    seedHex("2a" ++ "0123456789abcdef"), // the largest grid with a long pattern
+    seedHex("00"), // the size index alone: the grid cycles a single zero octet
+    seedHex(""), // the empty script
+};
+
+test "fuzz: decode never panics on an arbitrary grid" {
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
-fn fuzzDamage(_: void, smith: *std.testing.Smith) !void {
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = runDecodeScript(script[0..n]);
+}
+
+/// What one damage script did to a real symbol.
+const DamageOutcome = struct {
+    ecc: Ecc = .low,
+    /// Modules actually flipped.
+    flips: usize = 0,
+    /// Whether `decode` recovered the message anyway.
+    recovered: bool = false,
+};
+
+/// The body of `fuzzDamage`. The seed layout is `ecc, flipCount(2)`, then two
+/// octets per flip giving the x and y of the module to invert.
+///
+/// ⛔ The old body drew `flips = smith.valueRangeAtMost(u16, 0, 200)` from an
+/// exhausted input, so it was **0**: the harness encoded a symbol, flipped
+/// nothing, decoded it and asserted it round-tripped. A test named "decode
+/// survives damage to a real symbol" that never damaged anything -- and the
+/// Berlekamp-Massey, Chien and Forney paths its own comment says it exists to
+/// reach had never seen a single corrupted block. `ecc` was stuck at `.low`
+/// for the same reason, so three of the four redundancy levels were never
+/// built either.
+fn runDamageScript(bytes: []const u8) !DamageOutcome {
     // Random noise rarely reaches the interesting branches; a valid symbol with
     // modules flipped does, because the format still decodes and the corrupted
     // blocks then exercise Berlekamp-Massey, Chien and Forney for real.
-    var m: Matrix = undefined;
-    encode(&m, "FUZZ TARGET 12345", .{
-        .ecc = @enumFromInt(smith.valueRangeAtMost(u8, 0, 3)),
-    }) catch return;
+    var s = Script{ .bytes = bytes };
+    var out: DamageOutcome = .{};
+    out.ecc = @enumFromInt(s.byte() % 4);
 
-    const flips = smith.valueRangeAtMost(u16, 0, 200);
+    var m: Matrix = undefined;
+    encode(&m, "FUZZ TARGET 12345", .{ .ecc = out.ecc }) catch return out;
+
+    const flips = s.word() % 201;
+    out.flips = flips;
     for (0..flips) |_| {
-        const x = smith.valueRangeAtMost(u16, 0, m.size - 1);
-        const y = smith.valueRangeAtMost(u16, 0, m.size - 1);
+        const x: u16 = @intCast(s.byte() % m.size);
+        const y: u16 = @intCast(s.byte() % m.size);
         m.setDark(x, y, !m.isDark(x, y));
     }
 
-    var out: [4096]u8 = undefined;
-    const got = decode(&m, &out) catch return;
+    var buf: [4096]u8 = undefined;
+    const got = decode(&m, &buf) catch return out;
     // If it claims success, the message must be the one that was encoded —
     // a decoder that returns confident nonsense is worse than one that refuses.
     try std.testing.expectEqualStrings("FUZZ TARGET 12345", got);
+    out.recovered = true;
+    return out;
+}
+
+/// Damage scripts: `ecc, flipCount(2)`, then `x, y` per flip. The flip
+/// coordinates cycle, so a short script hits a repeating set of modules — which
+/// is what makes a two-flip script reproducible rather than a lottery.
+const damage_seeds = [_][]const u8{
+    seedHex("00" ++ "0000"), // low ECC, undamaged: the round trip must hold
+    seedHex("01" ++ "0000"), // medium, undamaged
+    seedHex("02" ++ "0000"), // quartile, undamaged
+    seedHex("03" ++ "0000"), // high, undamaged
+    seedHex("00" ++ "0001" ++ "0a0a"), // ⭐ ONE flipped module at low ECC: the first real damage this harness has ever seen
+    seedHex("03" ++ "0001" ++ "0a0a"), // one flip at high ECC
+    seedHex("00" ++ "0004" ++ "0a0a0b0b0c0c0d0d"), // four flips in the data region
+    seedHex("03" ++ "0004" ++ "0a0a0b0b0c0c0d0d"), // the same at high ECC, which should recover more
+    seedHex("00" ++ "0010" ++ "0a0b"), // 16 flips cycling over two coordinates
+    seedHex("03" ++ "0010" ++ "0a0b0c0d0e0f1011"), // 16 flips spread out, high ECC
+    seedHex("00" ++ "0040" ++ "0102030405060708"), // 64 flips: past what low ECC can repair
+    seedHex("03" ++ "00c8" ++ "0102030405060708"), // the 200-flip maximum
+    seedHex("00" ++ "0002" ++ "00000000"), // both flips on the SAME module: a net no-op
+    // ⚠ A 61-octet (ODD-length) coordinate tail, so the x/y pairing shifts on
+    // every cycle instead of hitting the same modules again and again. With an
+    // even-length tail a high flip count silently CANCELS -- flipping one module
+    // twice is a no-op -- and a "200 flips" seed damages nothing, which is the
+    // same class of quiet nothing the collapsed draw was.
+    seedHex("00" ++ "0032" ++ "7160d26a7ee0833f7754b392bf077abe1c3d111e035a36cac03a0f842f336dac5270a517fb8e3194e0cf5a736fa1028ab239bdb72f2d03e321ff995d50"), // 50 scattered flips at low ECC
+    seedHex("03" ++ "0032" ++ "7160d26a7ee0833f7754b392bf077abe1c3d111e035a36cac03a0f842f336dac5270a517fb8e3194e0cf5a736fa1028ab239bdb72f2d03e321ff995d50"), // the same 50 at high ECC, which repairs more
+    seedHex("00" ++ "00c8" ++ "7160d26a7ee0833f7754b392bf077abe1c3d111e035a36cac03a0f842f336dac5270a517fb8e3194e0cf5a736fa1028ab239bdb72f2d03e321ff995d50"), // 200 scattered flips at low ECC: past any repair
+    seedHex("00"), // one octet: the ecc byte alone, flips cycle to 0
+    seedHex(""), // the empty script: exactly what the collapsed harness ran
+};
+
+test "fuzz: decode survives damage to a real symbol" {
+    try std.testing.fuzz({}, fuzzDamage, .{ .corpus = &damage_seeds });
+}
+
+fn fuzzDamage(_: void, smith: *std.testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runDamageScript(script[0..n]);
+}
+
+test "corpus: the grid and damage scripts reach the decoder, and what they did is pinned" {
+    // ⭐ Two guards in one, because the two harnesses share a failure: both
+    // asserted something about a symbol they never varied.
+    //
+    // For the grid scripts the pinned number is the distinct SIZES built. A
+    // decode that succeeds is not the interesting outcome here — an arbitrary
+    // grid essentially never decodes — so "accepted" would be 0 for any corpus
+    // and says nothing. What the collapsed harness could not do was try a
+    // second grid shape at all.
+    var grid_nonempty: usize = 0;
+    var sizes_seen = [_]bool{false} ** (max_size + 1);
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) grid_nonempty += 1;
+        var s = Script{ .bytes = script[0..n] };
+        var side: u16 = @as(u16, 17) + 4 * @as(u16, @intCast(s.ranged(0, 42)));
+        if (side > max_size) side = max_size;
+        sizes_seen[side] = true;
+        _ = runDecodeScript(script[0..n]);
+    }
+    var sizes: usize = 0;
+    for (sizes_seen) |b| {
+        if (b) sizes += 1;
+    }
+    try std.testing.expectEqual(decode_seeds.len - 1, grid_nonempty);
+    // Measured 2026-09-07: 1 size (17), one all-light grid, before the draws
+    // were fixed.
+    try std.testing.expectEqual(@as(usize, 4), sizes);
+
+    // For the damage scripts the pinned numbers are the modules actually
+    // flipped and the symbols recovered despite them. `flips` was 0 for the
+    // life of the harness, so the Reed-Solomon correction the whole target is
+    // named after had never run on a corrupted block.
+    var damage_nonempty: usize = 0;
+    var total_flips: usize = 0;
+    var recovered: usize = 0;
+    var damaged_and_recovered: usize = 0;
+    var ecc_seen = [_]bool{false} ** 4;
+    for (damage_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) damage_nonempty += 1;
+        const out = try runDamageScript(script[0..n]);
+        ecc_seen[@intFromEnum(out.ecc)] = true;
+        total_flips += out.flips;
+        if (out.recovered) {
+            recovered += 1;
+            if (out.flips != 0) damaged_and_recovered += 1;
+        }
+    }
+    var eccs: usize = 0;
+    for (ecc_seen) |b| {
+        if (b) eccs += 1;
+    }
+    try std.testing.expectEqual(damage_seeds.len - 1, damage_nonempty);
+    // Measured 2026-09-07: 1 ECC level, 0 flips, and every "recovery" was of an
+    // undamaged symbol.
+    try std.testing.expectEqual(@as(usize, 4), eccs);
+    try std.testing.expectEqual(@as(usize, 608), total_flips);
+    // 17 of 18: the 200-flip low-ECC script is the ONE that cannot be repaired,
+    // so both the correction path and the refusal after it are exercised. A
+    // corpus where everything recovers proves only half of what this harness
+    // claims.
+    try std.testing.expectEqual(@as(usize, 17), recovered);
+    // The one that matters: symbols that were actually damaged and still read
+    // back correctly. This is the Reed-Solomon correction working, and it was
+    // 0 before.
+    try std.testing.expectEqual(@as(usize, 11), damaged_and_recovered);
 }
 
 test "input that cannot fit is refused rather than truncated" {
@@ -1874,20 +2180,32 @@ test "the header costs capacity, and the accounting says so" {
     try t.expectEqual(@as(usize, 2), seq.len);
 }
 
-test "fuzz: a sequence survives the round trip whatever the message" {
-    try std.testing.fuzz({}, fuzzSequence, .{});
-}
+/// What one sequence script produced.
+const SequenceOutcome = struct {
+    ecc: Ecc = .low,
+    text_len: usize = 0,
+    /// Symbols the split produced, 0 when `encodeSequence` refused.
+    symbols: usize = 0,
+};
 
-fn fuzzSequence(_: void, smith: *std.testing.Smith) !void {
-    var message: [600]u8 = undefined;
-    const len = smith.valueRangeAtMost(u16, 0, message.len);
-    for (0..len) |i| message[i] = smith.valueRangeAtMost(u8, 0, 255);
-    const text = message[0..len];
+/// The body of `fuzzSequence`. The seed layout is `ecc, text...`.
+///
+/// ⛔ The old body drew the message length FIRST, from a ranged draw, so
+/// outside `--fuzz` it was 0: the harness split an EMPTY message, got one
+/// symbol back, and asserted the round trip on nothing. `ecc` was stuck at
+/// `.low` for the same reason. The whole point of the target -- that a message
+/// too long for one symbol comes back in order and with the right parity --
+/// requires a message longer than one symbol's capacity, and it never had one.
+fn runSequenceScript(bytes: []const u8) !SequenceOutcome {
+    var out: SequenceOutcome = .{};
+    const ecc_byte: u8 = if (bytes.len > 0) bytes[0] else 0;
+    const text: []const u8 = if (bytes.len > 1) bytes[1..] else "";
+    out.ecc = @enumFromInt(ecc_byte % 4);
+    out.text_len = text.len;
 
     var symbols: [16]Matrix = undefined;
-    const seq = encodeSequence(&symbols, text, .{
-        .ecc = @enumFromInt(smith.valueRangeAtMost(u8, 0, 3)),
-    }) catch return;
+    const seq = encodeSequence(&symbols, text, .{ .ecc = out.ecc }) catch return out;
+    out.symbols = seq.len;
 
     var joined: [600]u8 = undefined;
     var n: usize = 0;
@@ -1905,6 +2223,72 @@ fn fuzzSequence(_: void, smith: *std.testing.Smith) !void {
         n += part.data.len;
     }
     try std.testing.expectEqualSlices(u8, text, joined[0..n]);
+    return out;
+}
+
+/// Sequence scripts: `ecc, text...`.
+const sequence_seeds = [_][]const u8{
+    seed("\x00" ++ "SHORT"), // one symbol: the degenerate sequence, header still present
+    seed("\x00" ++ ("A" ** 100)), // still one symbol at low ECC
+    seed("\x00" ++ ("A" ** 400)), // ⭐ several symbols: the split this target exists for
+    seed("\x01" ++ ("A" ** 400)), // the same message at medium
+    seed("\x02" ++ ("A" ** 400)), // quartile: more symbols again
+    seed("\x03" ++ ("A" ** 400)), // high: the most symbols
+    seed("\x03" ++ ("N" ** 599)), // the longest message that fits the 600-octet buffer
+    seed("\x00" ++ "0123456789" ** 40), // numeric mode across a split
+    seed("\x00" ++ "HELLO WORLD $%*+-./: " ** 15), // alphanumeric across a split
+    seed("\x00" ++ "\x00\xff" ** 150), // bytes that force byte mode across a split
+    seed("\x00" ++ "P\xc5\x99\xc3\xadli\xc5\xa1 \xc5\xbelu\xc5\xa5ou\xc4\x8dk\xc3\xbd " ** 12), // multi-byte UTF-8 split mid-codepoint
+    seed("\x00"), // the ecc byte with an EMPTY message
+    seed(""), // the empty script: exactly what the collapsed harness ran
+};
+
+test "fuzz: a sequence survives the round trip whatever the message" {
+    try std.testing.fuzz({}, fuzzSequence, .{ .corpus = &sequence_seeds });
+}
+
+fn fuzzSequence(_: void, smith: *std.testing.Smith) !void {
+    var script: [601]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runSequenceScript(script[0..n]);
+}
+
+test "corpus: the sequence scripts really split, and the symbol counts are pinned" {
+    // ⭐ The number that matters is `multi_symbol`: sequences that came back
+    // as MORE THAN ONE symbol. `encodeSequence("")` succeeds and returns one
+    // symbol, so "some sequences encoded" -- and even the whole round-trip
+    // assertion -- was satisfied by the empty message the collapsed harness ran
+    // every iteration, with the index/total/parity checks comparing 0 against 0
+    // and 1 against 1. A sequence target that never produces a sequence proves
+    // nothing about ordering or parity.
+    var nonempty: usize = 0;
+    var encoded: usize = 0;
+    var multi_symbol: usize = 0;
+    var total_symbols: usize = 0;
+    var ecc_seen = [_]bool{false} ** 4;
+    for (sequence_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [601]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        const out = try runSequenceScript(script[0..n]);
+        ecc_seen[@intFromEnum(out.ecc)] = true;
+        if (out.symbols != 0) encoded += 1;
+        if (out.symbols > 1) multi_symbol += 1;
+        total_symbols += out.symbols;
+    }
+    var eccs: usize = 0;
+    for (ecc_seen) |b| {
+        if (b) eccs += 1;
+    }
+    // One seed is deliberately the empty script.
+    try std.testing.expectEqual(sequence_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: 1 ECC level, 1 sequence of 1 symbol carrying an
+    // EMPTY message, and 0 multi-symbol splits before the draws were fixed.
+    try std.testing.expectEqual(@as(usize, 4), eccs);
+    try std.testing.expectEqual(@as(usize, 13), encoded);
+    try std.testing.expectEqual(@as(usize, 10), multi_symbol);
+    try std.testing.expectEqual(@as(usize, 120), total_symbols);
 }
 
 // ── TEETH: the decoder's refusal guards, none of which had a test ───────────
