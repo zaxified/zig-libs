@@ -531,6 +531,14 @@ test "corpus: every decode seed reaches the parser, and the counts are pinned" {
     var octets: usize = 0;
     var shapes_seen: [4]bool = @splat(false);
     var depths_seen: [2]bool = @splat(false); // the drawn cap, split at 32
+    // ⛔ Two of this target's four knobs had no number at all: the guard drew
+    // `copy_strings` and `reject_unknown_fields` to stay in step with the
+    // harness's word stream and then dropped them on the floor, so the seeds
+    // that turn the string-copy path and the unknown-field REFUSAL branch on
+    // were pinned by nothing. Both are the range minimum — `false` — on a
+    // tail-less seed, which is `copies = 0` and `rejects = 0`.
+    var copies: usize = 0;
+    var rejects: usize = 0;
     for (corpus.build(arena.allocator())) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [4096]u8 = undefined;
@@ -543,6 +551,8 @@ test "corpus: every decode seed reaches the parser, and the counts are pinned" {
             .reject_unknown_fields = smith.value(bool),
         };
         depths_seen[if (options.max_depth < 32) 0 else 1] = true;
+        if (options.copy_strings) copies += 1;
+        if (options.reject_unknown_fields) rejects += 1;
         const shape = smith.valueRangeAtMost(u2, 0, 3);
         shapes_seen[shape] = true;
         const ok = switch (shape) {
@@ -582,6 +592,8 @@ test "corpus: every decode seed reaches the parser, and the counts are pinned" {
     // one of them at `Wide` with `max_depth = 1`.
     for (shapes_seen) |s| try std.testing.expect(s);
     for (depths_seen) |d| try std.testing.expect(d);
+    try std.testing.expectEqual(@as(usize, 38), copies);
+    try std.testing.expectEqual(@as(usize, 1), rejects);
 }
 
 // ── fuzz: the depth cap holds at exactly the boundary the input picks ──────

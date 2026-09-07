@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** two of `fuzzDecodeNeverPanics`'s
+  four knobs had no number on them. The corpus guard drew `copy_strings` and
+  `reject_unknown_fields` to stay in step with the harness's word stream and
+  then dropped them, so nothing pinned the seeds that turn the string-copy path
+  and the unknown-field REFUSAL branch on — both are `false` on a tail-less
+  seed. Measured and pinned: **38 of 40 seeds decode with `copy_strings`, 1
+  with `reject_unknown_fields`.**
+
 - **2026-09-07** — Test-only, no production change: both fuzz targets ran one input, and
   one of them had never executed the branch it exists to assert. `fuzzDecodeNeverPanics`
   drew `len = smith.valueRangeAtMost(u16, 0, 4096)` **before** the bytes; a ranged `Smith`
