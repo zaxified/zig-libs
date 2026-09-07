@@ -61,8 +61,6 @@ l2disco 4
 l2encap 1
 l2forward 1
 linkheader 1
-lninvoice 3
-lnwire 4
 loopix 1
 mcp 2
 mcp-http 1

@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: all three harnesses are R1 — their FIRST draw was a scalar one —
+  and all three ran a single fixed input for their whole life. A scalar `Smith` draw reads eight
+  octets as a little-endian u64 and returns the range MINIMUM unless the whole word falls inside
+  the range, and after the first short read `Smith` discards the rest of the input, so outside
+  `--fuzz` every choice collapsed: `bech32_raw.fuzzDecode` called `decode("")`;
+  `bolt11.fuzzDecode` built `lnbc` with a data part of **0 quintets**; `bolt12.fuzzBolt12`'s
+  record loop ended before its first iteration, so the stream was empty, the HRP was `hrps[0]`
+  and the string damage never ran. None was exempted — a generator driven by a byte script has
+  an obvious byte-first form. All three now draw one `smith.slice` and read their choices with
+  `testkit.fuzz.Cursor`, over corpora of reviewable scripts with guards pinning measured numbers.
+- **2026-09-07** — ⛔ `bolt11.fuzzDecode`'s data buffer was `[200]u5`, and **200 is below every
+  real invoice this module owns**: measured over the BOLT#11 vectors in `bolt11.zig`, the
+  shortest is 206 quintets, the donation invoice is 293 and the longest is 751. So no invoice
+  this module can decode could ever have been built by its own fuzz harness — the same shape as
+  a 1024-octet buffer against a 4065-octet reference document. Raised to 800.
+- **2026-09-07** — ⛔ Two corpora scored **0 accepted** on their first draft, which is a finding
+  rather than a result, and the guards caught both. A bech32 string ends in a checksum and a
+  BOLT#11 invoice in a 104-quintet signature over a preimage that includes the HRP, so no
+  character or quintet sequence written by hand is one the decoder takes. Both corpora now
+  contain scripts that SPELL a real string — one from this module's own `encode`, one the
+  BOLT#11 donation invoice — character for character, and the guards pin that the spelling
+  reproduces its source. Before → after: `bech32_raw` one empty string → 10 scripts, 206
+  characters, 3 decoded, 10 HRP octets; `bolt11` one empty data part → 9 scripts, 1842 quintets,
+  all 4 HRP shapes, 1 real invoice decoded; `bolt12` one empty stream → 9 scripts, 276 stream
+  octets, 16 TLV records parsed, 5 merkle roots.
+
 - **2026-09-03** — Drift re-audit (last audited `d163578`, ~771 lines since). ⭐ **Nothing
   in the shipped code was broken** — every guard mutated is correct today. What was wrong is
   that a large share of them had no test that would notice if they stopped being, so this

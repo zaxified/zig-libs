@@ -296,6 +296,7 @@ pub fn encodeNoChecksum(allocator: Allocator, hrp: []const u8, data: []const u5)
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 test "encode then decode round-trips, no length cap" {
     const allocator = testing.allocator;
@@ -422,31 +423,206 @@ test "stripContinuation: a '+' between two genuine bech32 characters is still st
 // with fully-random byte splices the rest, so the HRP-range/mixed-case/
 // out-of-charset paths get exercised on their own, not only via a
 // well-formed encoder round-trip.
-test "fuzz: decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecode, .{});
-}
+/// `testkit.fuzz.Cursor` over one corpus seed, which is what drives
+/// `fuzzDecode`.
+///
+/// ⚠ Every choice here used to come from a scalar `Smith` draw, the FIRST of
+/// them `valueRangeAtMost(u8, 0, buf.len)` — `check-fuzz-reach` classifies
+/// that R1, and correctly: a scalar draw reads eight octets as a little-endian
+/// u64 and returns the range MINIMUM unless the whole word falls inside the
+/// range, so on the one input an ordinary `zig build test-*` run gets, `len`
+/// was **0** and `decode` was called with `""`. The character bias, the
+/// case-flip, all of it ran zero times. Reading the choices out of ONE
+/// `smith.slice` fixes both halves: the draw is byte-first, and a seed becomes
+/// the invoice string it represents rather than a list of u64 words.
+const Script = @import("testkit").fuzz.Cursor;
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
-    var buf: [128]u8 = undefined;
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-    for (buf[0..len]) |*c| {
-        if (smith.value(bool)) {
+/// The body of `fuzzDecode`, factored out so the harness and the corpus guard
+/// build the SAME string from the same octets. Returns the built string in
+/// `out`.
+///
+/// The layout the cursor reads is `length`, then per character `form` and the
+/// character itself (`form` odd = a bech32 charset symbol or the separator,
+/// even = the octet raw), then `flipCase` and a position. A short script
+/// cycles.
+fn buildString(script: []const u8, out: *[128]u8) []u8 {
+    var s = Script{ .bytes = script };
+    const len: usize = s.ranged(0, out.len);
+    for (out[0..len]) |*c| {
+        if (s.byte() & 1 != 0) {
             // Bias toward the 32-symbol bech32 charset plus the '1'
             // separator -- what a real (possibly-corrupted) invoice
             // string is actually made of.
             const alphabet = charset ++ "1";
-            c.* = alphabet[smith.valueRangeAtMost(u8, 0, alphabet.len - 1)];
+            c.* = alphabet[s.ranged(0, alphabet.len - 1)];
         } else {
-            c.* = smith.value(u8);
+            c.* = s.byte();
         }
     }
     // Occasionally flip ASCII-letter case on a byte, to reach MixedCase.
-    if (len > 0 and smith.value(bool)) {
-        const i: usize = smith.valueRangeAtMost(u8, 0, @intCast(len - 1));
-        if (std.ascii.isAlphabetic(buf[i])) buf[i] = if (std.ascii.isUpper(buf[i])) std.ascii.toLower(buf[i]) else std.ascii.toUpper(buf[i]);
+    if (len > 0 and s.byte() & 1 != 0) {
+        const i: usize = s.ranged(0, @intCast(len - 1));
+        if (std.ascii.isAlphabetic(out[i])) out[i] = if (std.ascii.isUpper(out[i])) std.ascii.toLower(out[i]) else std.ascii.toUpper(out[i]);
+    }
+    return out[0..len];
+}
+
+/// Scripts for `buildString`, in the format `Smith.slice` reads.
+///
+/// ⭐ Built at run time, and the reason is the whole point of this corpus: a
+/// bech32 string ends in a 6-symbol checksum over everything before it, so a
+/// script whose character choices are picked by hand produces a string that
+/// `decode` refuses at the checksum, always. The first draft of this corpus
+/// was eight such scripts and scored **0 accepted** — which the guard caught,
+/// and which is a finding rather than a result. `spell` therefore takes a
+/// string this module's own `encode` produced and emits the script that
+/// reproduces it character for character, so the harness reaches the payload
+/// behind the checksum rather than only the refusal in front of it.
+const StringCorpus = struct {
+    store: [16 * 1024]u8 = undefined,
+    used: usize = 0,
+    /// ⚠ The strings are COPIED here rather than borrowed: the encoder's
+    /// output is freed before `build` returns, and `texts` pointing at it is a
+    /// use-after-free that reads back as a segfault in the guard's `eql`.
+    text_store: [4 * 1024]u8 = undefined,
+    text_used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    texts: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    /// Emit the script that makes `buildString` reproduce `text`, optionally
+    /// with the case flip armed at `flip_at`.
+    fn spell(self: *StringCorpus, text: []const u8, flip_at: ?u8) void {
+        var script: [1 + 2 * 128 + 2]u8 = undefined;
+        var k: usize = 0;
+        script[k] = @intCast(text.len);
+        k += 1;
+        for (text) |c| {
+            const alphabet = charset ++ "1";
+            if (std.mem.indexOfScalar(u8, alphabet, c)) |idx| {
+                script[k] = 0x01; // form: draw from the charset
+                script[k + 1] = @intCast(idx);
+            } else {
+                script[k] = 0x00; // form: the octet, raw
+                script[k + 1] = c;
+            }
+            k += 2;
+        }
+        if (flip_at) |at| {
+            script[k] = 0x01;
+            script[k + 1] = at;
+            k += 2;
+        } else {
+            script[k] = 0x00;
+            k += 1;
+        }
+        const head = testkit.fuzz.seedInto(self.store[self.used..], script[0..k]);
+        self.entries[self.n] = head;
+        @memcpy(self.text_store[self.text_used..][0..text.len], text);
+        self.texts[self.n] = self.text_store[self.text_used..][0..text.len];
+        self.text_used += text.len;
+        self.used += head.len;
+        self.n += 1;
     }
 
-    var dec = decode(allocator, buf[0..len]) catch return;
+    fn build(self: *StringCorpus, allocator: Allocator) ![]const []const u8 {
+        // Two real, checksum-valid strings out of this module's own encoder:
+        // a short data part and a 100-quintet one.
+        const short = try encode(allocator, "lnbc", &[_]u5{ 1, 2, 3, 4, 5, 6, 7, 8 });
+        defer allocator.free(short);
+        self.spell(short, null);
+        // The same string with one letter's case flipped: `MixedCase`.
+        self.spell(short, 5);
+
+        var quintets: [100]u5 = undefined;
+        for (&quintets, 0..) |*q, i| q.* = @intCast(i % 32);
+        const long = try encode(allocator, "lntb", &quintets);
+        defer allocator.free(long);
+        self.spell(long, null);
+
+        // An empty data part is still six checksum symbols.
+        const bare = try encode(allocator, "ln", &.{});
+        defer allocator.free(bare);
+        self.spell(bare, null);
+
+        // ── strings the decoder must refuse ────────────────────────────────
+        // One data symbol corrupted: the checksum no longer holds.
+        {
+            var bent: [128]u8 = undefined;
+            @memcpy(bent[0..short.len], short);
+            bent[short.len - 1] = if (bent[short.len - 1] == 'q') 'p' else 'q';
+            self.spell(bent[0..short.len], null);
+        }
+        self.spell("", null); // the empty string — what the collapsed draw produced
+        self.spell("q", null); // one character: no separator, no checksum
+        self.spell("lnbc1", null); // a separator with nothing behind it
+        self.spell("1111111111", null); // nothing but separators
+        self.spell("lnbc1qqqqqq\x80\xff", null); // out-of-charset octets
+        return self.entries[0..self.n];
+    }
+};
+
+test "fuzz: decode never panics on arbitrary bytes" {
+    var corpus: StringCorpus = .{};
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build(testing.allocator) });
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    // ⚠ One `smith.slice`, then the octets say what happens — see `Script`.
+    // Measured 2026-09-07 over the corpus below: **one input, the EMPTY
+    // string, before; 10 scripts, 206 characters and 3 strings decoded after.**
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var buf: [128]u8 = undefined;
+    const text = buildString(script[0..n], &buf);
+
+    var dec = decode(allocator, text) catch return;
     defer dec.deinit(allocator);
+}
+
+test "corpus: every string script builds a string, and what decode made of it is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets and through the SAME `buildString`.
+    //
+    // `chars` is the reach claim in the form that fits a harness whose seed is
+    // a SCRIPT rather than the string: "non-empty seed" would only say the
+    // script arrived, and the thing the collapse destroyed was the LENGTH.
+    // `hrp_octets` is the second number, and it is what the empty string
+    // cannot produce — a decode that succeeds still says nothing about whether
+    // a human-readable part was ever read.
+    var corpus: StringCorpus = .{};
+    const entries = try corpus.build(testing.allocator);
+    var spelled: usize = 0;
+    var chars: usize = 0;
+    var decoded: usize = 0;
+    var hrp_octets: usize = 0;
+    for (entries, corpus.texts[0..corpus.n]) |sd, want| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var buf: [128]u8 = undefined;
+        const text = buildString(script[0..n], &buf);
+        // The script reproduced the string it was written from, character for
+        // character. Without this the corpus could be spelling anything.
+        if (std.mem.eql(u8, text, want)) spelled += 1;
+        chars += text.len;
+        var dec = decode(testing.allocator, text) catch continue;
+        defer dec.deinit(testing.allocator);
+        decoded += 1;
+        hrp_octets += dec.hrp.len;
+    }
+    // One short: the case-flipped seed deliberately does not reproduce its
+    // source string.
+    try testing.expectEqual(entries.len - 1, spelled);
+    try testing.expectEqual(@as(usize, 206), chars);
+    try testing.expectEqual(@as(usize, 3), decoded);
+    // 4 + 4 + 2: the two `lnbc`/`lntb` strings and the bare `ln` one. The
+    // case-flipped seed is `MixedCase` and contributes none.
+    try testing.expectEqual(@as(usize, 10), hrp_octets);
+
+    // The "before" measurement, executable: the empty script is exactly what
+    // the collapsed harness ran, and it builds the empty string.
+    var zero: [128]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), buildString(&.{}, &zero).len);
 }

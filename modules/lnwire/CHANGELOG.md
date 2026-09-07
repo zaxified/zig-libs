@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: all four harnesses ran on one fixed input. `bolt2`'s opened with
+  `smith.bytes(&buf)` and a ranged length, so `len` was **0 on every input** and
+  `decodeOpenChannel` never got past the two-octet type frame — the "field reader chain" its own
+  comment claimed to reach was never entered, and the line that stamped `OPEN_CHANNEL_TYPE` into
+  `buf[0..2]` was writing into a buffer the decoder saw no octet of. `bolt7`'s and `message.zig`'s
+  carried a PARTIAL fix that looked complete: the length was written `buf.len - valueRangeAtMost(…)`
+  precisely so the exhausted-input fallback would be the FULL buffer, and the comment explained
+  why. That was right, and it bought less than it looks — `Smith.bytes` fills the tail with the
+  weight minimum, so with no corpus the one input each ever ran was a buffer of ZERO octets under
+  a hand-stamped type. All three now draw one `smith.slice` and carry a corpus built by this
+  module's own serializers; the hand-stamped type biases are gone with them, because a seed
+  carrying the wrong type is the `WrongType` case and worth having. `message.zig`'s `want` also
+  hung on a `value(bool)` drawn after the bytes (always `false`), and now travels in the seed.
+  Before → after: `bolt2` 0/9 non-empty, 0 decoded → 9/9, 3 decoded, 2 TLV records; `bolt7` 1/9,
+  0 decoded → 9/9, 4 decoded, 268 id octets; `message` 1/12, 1 framed, 0 records → 11/12, 9
+  framed, 4 records.
+- **2026-09-07** — `tlv.fuzzParseStream` moved off scalar draws onto `testkit.fuzz.Cursor`. Its
+  first draw was `valueRangeAtMost(u8, 1, 12)`, so on the one input an ordinary run gets EVERY
+  choice was its minimum: one record, type 0, length 0, no value, no tail — a two-octet stream.
+  The lower bound of 1 rather than 0 was a deliberate mitigation and the comment said so; it
+  bought exactly one empty record. The choices now come out of one `smith.slice` as a byte
+  script. Measured: **one 2-octet stream on every input before; 8 scripts building 132 octets, 3
+  streams parsed and 5 records yielded after**, with the "before" figure pinned executably by the
+  guard's last two lines. ⚠ Writing the corpus found a property of the script format worth
+  recording: type 254 is not reachable through a one-octet type field — `% 253` maps 0xFE to 1,
+  and raw 0xFE is the five-octet BigSize prefix — so a seed that looked like it carried 254 was
+  silently a duplicate type 1. The pinned counts caught that too.
+
 - **2026-09-03** — Drift re-audit (704 lines since the last one). ⚠ **BREAKING:**
   twelve `serialize*` functions return `message.WriteError![]u8` instead of
   `Allocator.Error![]u8`, and `message.WriteError` is new

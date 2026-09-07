@@ -594,6 +594,7 @@ pub fn serializeClosingSigned(allocator: Allocator, msg: ClosingSigned) Allocato
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 fn fillPattern(comptime n: usize, seed: u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -947,19 +948,167 @@ test "hostile: any message decoder rejects the wrong 2-byte type" {
 // whole "many fixed fields + trailing tlv_stream" BOLT#2 family this file
 // implements (`accept_channel`/`channel_ready`/`update_add_htlc`/etc. all
 // share the same `Reader`-then-`decodeExtension` shape).
+/// `open_channel` messages, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`).
+///
+/// ⭐ Built at run time by this file's own `serializeOpenChannel`. A BOLT#2
+/// `open_channel` is 321 octets of fixed fields — a 2-octet type, two 32-octet
+/// hashes, six u64s, a u32 and two u16s, then SIX 33-octet curve points —
+/// before the trailing `tlv_stream` even starts. Nothing shorter than that
+/// reaches `channel_flags`, and no hand-written literal is reviewable at that
+/// length, so the encoder writes them and the refusals are cut from a real one.
+const OpenChannelCorpus = struct {
+    store: [10 * (4 + 400)]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *OpenChannelCorpus, bytes: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], bytes);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    fn base() OpenChannel {
+        return .{
+            .chain_hash = fillPattern(32, 1),
+            .temporary_channel_id = fillPattern(32, 2),
+            .funding_satoshis = 100_000,
+            .push_msat = 0,
+            .dust_limit_satoshis = 354,
+            .max_htlc_value_in_flight_msat = 1_000_000_000,
+            .channel_reserve_satoshis = 1000,
+            .htlc_minimum_msat = 1,
+            .feerate_per_kw = 253,
+            .to_self_delay = 144,
+            .max_accepted_htlcs = 483,
+            .funding_pubkey = fillPattern(33, 3),
+            .revocation_basepoint = fillPattern(33, 4),
+            .payment_basepoint = fillPattern(33, 5),
+            .delayed_payment_basepoint = fillPattern(33, 6),
+            .htlc_basepoint = fillPattern(33, 7),
+            .first_per_commitment_point = fillPattern(33, 8),
+            .channel_flags = 1,
+        };
+    }
+
+    fn build(self: *OpenChannelCorpus, allocator: Allocator) ![]const []const u8 {
+        // No extension: the shortest message the decoder accepts.
+        const plain = try serializeOpenChannel(allocator, base());
+        defer allocator.free(plain);
+        self.push(plain);
+
+        // With the two TLVs a real peer sends: a zero-length
+        // upfront_shutdown_script and a channel_type bitmap.
+        var with_tlv = base();
+        with_tlv.extension = .{ .records = @constCast(&[_]message.tlv.RawRecord{
+            .{ .type = 0, .value = &.{} },
+            .{ .type = 1, .value = &.{0x08} },
+        }) };
+        const tlv_bytes = try serializeOpenChannel(allocator, with_tlv);
+        defer allocator.free(tlv_bytes);
+        self.push(tlv_bytes);
+
+        // An UNKNOWN ODD TLV type, which BOLT#1's "it's ok to be odd" rule
+        // says must be tolerated. ⚠ It is tolerated by being DISCARDED, so
+        // this seed decodes and contributes no record — which is why the
+        // guard below pins 2 records over three accepted messages rather than
+        // the 3 a reader would guess.
+        var odd = base();
+        odd.extension = .{ .records = @constCast(&[_]message.tlv.RawRecord{
+            .{ .type = 255, .value = &.{ 0xAA, 0xBB, 0xCC } },
+        }) };
+        const odd_bytes = try serializeOpenChannel(allocator, odd);
+        defer allocator.free(odd_bytes);
+        self.push(odd_bytes);
+
+        // The mirror: an unknown EVEN type, which the same rule says must be
+        // refused (`UnknownEvenType`).
+        var even = base();
+        even.extension = .{ .records = @constCast(&[_]message.tlv.RawRecord{
+            .{ .type = 254, .value = &.{0x01} },
+        }) };
+        const even_bytes = try serializeOpenChannel(allocator, even);
+        defer allocator.free(even_bytes);
+        self.push(even_bytes);
+
+        // ── refusals, each cut or bent from the message above ───────────────
+        self.push(plain[0 .. plain.len - 1]); // Truncated: one octet short
+        self.push(plain[0..200]); // Truncated: partway through the points
+        self.push(plain[0..2]); // Truncated: the type frame and nothing else
+        {
+            // WrongType: the same 321 octets under another message's type.
+            var wrong: [400]u8 = undefined;
+            @memcpy(wrong[0..plain.len], plain);
+            std.mem.writeInt(u16, wrong[0..2], OPEN_CHANNEL_TYPE + 1, .big);
+            self.push(wrong[0..plain.len]);
+        }
+        {
+            // A trailing tlv_stream whose record length runs past the end.
+            var overrun: [400]u8 = undefined;
+            @memcpy(overrun[0..plain.len], plain);
+            overrun[plain.len] = 0x02; // type 2
+            overrun[plain.len + 1] = 0x7f; // length 127, with nothing behind it
+            self.push(overrun[0 .. plain.len + 2]);
+        }
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: decodeOpenChannel never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeOpenChannel, .{});
+    var corpus: OpenChannelCorpus = .{};
+    try testing.fuzz({}, fuzzDecodeOpenChannel, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
 fn fuzzDecodeOpenChannel(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [400]u8 = undefined;
-    smith.bytes(&buf);
-    // Force the 2-byte type frame so the fuzzer reaches the actual field
-    // reader chain most of the time, rather than dying on `WrongType`.
-    std.mem.writeInt(u16, buf[0..2], OPEN_CHANNEL_TYPE, .big);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every seed and `decodeOpenChannel` was handed
+    // `buf[0..0]`, which fails on the two-octet type frame. The "field reader
+    // chain" the comment below claimed to reach was never entered.
+    //
+    // ⛔ And the line that forced `OPEN_CHANNEL_TYPE` into `buf[0..2]` was
+    // stamping a type into a buffer the decoder never saw one octet of. It is
+    // gone: a corpus of real messages carries its own type, and a seed that
+    // does not is the `WrongType` case, which is worth having.
+    // Measured 2026-09-07 over the corpus above: **0 of 9 seeds non-empty and
+    // 0 decoded before, 9 of 9 non-empty and 3 decoded after.**
+    const len: usize = smith.slice(&buf);
 
     var m = decodeOpenChannel(allocator, buf[0..len]) catch return;
     defer m.deinit(allocator);
+}
+
+test "corpus: every open_channel seed reaches the decoder, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the 400-octet buffer — `Smith.slice`
+    // reads that back as the EMPTY seed, silently, and an `open_channel` is 321
+    // octets before its extension, so that ceiling is close. `tlv_records` is
+    // the second number: the trailing `tlv_stream` is the half of this message
+    // that is variable-length and therefore attacker-shaped, and `decoded`
+    // alone would count a corpus of extension-less messages as complete.
+    var corpus: OpenChannelCorpus = .{};
+    const allocator = testing.allocator;
+    const entries = try corpus.build(allocator);
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var tlv_records: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [400]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var m = decodeOpenChannel(allocator, buf[0..len]) catch continue;
+        defer m.deinit(allocator);
+        decoded += 1;
+        tlv_records += m.extension.records.len;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), decoded);
+    try testing.expectEqual(@as(usize, 2), tlv_records);
 }

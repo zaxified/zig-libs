@@ -655,6 +655,7 @@ pub fn encode(allocator: Allocator, params: EncodeParams, sign_input: SignInput)
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 fn hexToBytes(comptime n: usize, hex: []const u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -1160,7 +1161,8 @@ test "BOLT#11 KAT: donation invoice ENCODE byte-exact against the spec's own lnb
 // `TruncatedTaggedField`/fixed-length-field/signature-recovery territory
 // instead of bouncing off `InvalidChecksum` every time.
 test "fuzz: decode never panics on arbitrary attacker-supplied invoice strings" {
-    try testing.fuzz({}, fuzzDecode, .{});
+    var corpus: InvoiceCorpus = .{};
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
 test "hostile: an out-of-range recovery id (4) is a typed error, not an @intCast panic" {
@@ -1212,47 +1214,234 @@ test "hostile: an amount digit run past u128 capacity is rejected before it can 
     );
 }
 
-fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+/// `testkit.fuzz.Cursor` over one corpus seed, which is what drives
+/// `fuzzDecode`.
+///
+/// ⚠ Every choice here used to come from a scalar `Smith` draw, the FIRST of
+/// them `valueRangeAtMost(u8, 0, net_prefixes.len - 1)` — `check-fuzz-reach`
+/// classifies that R1. A scalar draw reads eight octets as a little-endian u64
+/// and returns the range MINIMUM unless the whole word falls inside the range,
+/// so on the one input an ordinary `zig build test-*` run gets EVERY choice
+/// was its minimum: HRP `lnbc` with no amount, and a data part of length
+/// **0** — one invoice, `InvoiceTooShort`, for ever. Reading the choices out
+/// of ONE `smith.slice` fixes both halves: the draw is byte-first, and a seed
+/// is a script rather than a list of u64 words.
+const Script = @import("testkit").fuzz.Cursor;
+
+const fuzz_net_prefixes = [_][]const u8{ "bc", "tb", "tbs", "bcrt" };
+
+/// The body of `fuzzDecode`, factored out so the harness and the corpus guard
+/// build the SAME invoice from the same octets. Returns the encoded invoice
+/// string, allocated.
+///
+/// The layout the cursor reads is `netIdx, amountPresent, digitCount` then
+/// that many `digit` octets, `multiplierPresent, multiplierIdx`, then
+/// `dataLong, dataLen(2 octets)` and `dataLen` quintet octets. A short script
+/// cycles.
+fn buildInvoice(allocator: Allocator, script: []const u8) ![]u8 {
+    var s = Script{ .bytes = script };
 
     var hrp_buf: [16]u8 = undefined;
     var hrp_len: usize = 0;
-    const net_prefixes = [_][]const u8{ "bc", "tb", "tbs", "bcrt" };
-    const net = net_prefixes[smith.valueRangeAtMost(u8, 0, net_prefixes.len - 1)];
+    const net = fuzz_net_prefixes[s.ranged(0, fuzz_net_prefixes.len - 1)];
     @memcpy(hrp_buf[0..2], "ln");
     hrp_len = 2;
     @memcpy(hrp_buf[hrp_len..][0..net.len], net);
     hrp_len += net.len;
-    if (smith.value(bool)) {
-        const digits = "0123456789";
-        const n_digits = smith.valueRangeAtMost(u8, 0, 5);
-        var i: u8 = 0;
-        while (i < n_digits) : (i += 1) {
-            hrp_buf[hrp_len] = digits[smith.valueRangeAtMost(u8, 0, 9)];
-            hrp_len += 1;
-        }
-        if (n_digits > 0 and smith.value(bool)) {
-            const mults = "munp";
-            hrp_buf[hrp_len] = mults[smith.valueRangeAtMost(u8, 0, 3)];
+    // ⚠ Every knob is read unconditionally, even the ones this shape will not
+    // use, so a seed's octets always mean the same thing. A cursor whose
+    // offsets depend on earlier choices is a script nobody can review.
+    const amount_present = s.byte() & 1 != 0;
+    const n_digits = s.ranged(0, 5);
+    var digit_buf: [5]u8 = undefined;
+    for (&digit_buf) |*d| d.* = "0123456789"[s.ranged(0, 9)];
+    const mult_present = s.byte() & 1 != 0;
+    const mult = "munp"[s.ranged(0, 3)];
+    if (amount_present) {
+        @memcpy(hrp_buf[hrp_len..][0..n_digits], digit_buf[0..n_digits]);
+        hrp_len += n_digits;
+        if (n_digits > 0 and mult_present) {
+            hrp_buf[hrp_len] = mult;
             hrp_len += 1;
         }
     }
 
-    // Data part: random quintets, biased toward >= 7+104 (timestamp +
-    // signature) so the tagged-field loop actually runs most of the time;
-    // occasionally shorter, to exercise `InvoiceTooShort` too.
-    var data_buf: [200]u5 = undefined;
-    const data_len: usize = if (smith.value(bool))
-        smith.valueRangeAtMost(u16, 111, data_buf.len)
-    else
-        smith.valueRangeAtMost(u16, 0, data_buf.len);
-    for (data_buf[0..data_len]) |*q| q.* = @intCast(smith.valueRangeAtMost(u8, 0, 31));
+    // Data part: quintets, biased toward >= 7+104 (timestamp + signature) so
+    // the tagged-field loop actually runs most of the time; occasionally
+    // shorter, to exercise `InvoiceTooShort` too.
+    //
+    // ⛔ This was `[200]u5`, and 200 is below EVERY real invoice this module
+    // owns. Measured over the BOLT#11 vectors in this file: the shortest is
+    // 206 quintets (`lnbc2500u`, the "$3 coffee" vector's minimal form), the
+    // donation invoice is 293, and the longest is 751. So no invoice this
+    // module can decode could ever have been built by its own fuzz harness —
+    // the same shape as `scl.fuzzScl`, whose 1024-octet buffer could not carry
+    // the module's own 4065-octet reference document. 800 fits the longest.
+    var data_buf: [800]u5 = undefined;
+    const long = s.byte() & 1 != 0;
+    const raw_len: usize = s.word() % (data_buf.len + 1);
+    const data_len: usize = if (long) @max(raw_len, 111) else raw_len;
+    for (data_buf[0..data_len]) |*q| q.* = @intCast(s.ranged(0, 31));
 
-    const invoice = bech32raw.encode(allocator, hrp_buf[0..hrp_len], data_buf[0..data_len]) catch return;
+    return bech32raw.encode(allocator, hrp_buf[0..hrp_len], data_buf[0..data_len]);
+}
+
+/// Invoice scripts, in the format `Smith.slice` reads.
+///
+/// The octet layout `buildInvoice` reads is `netIdx, amountPresent,
+/// digitCount, d0..d4, multPresent, multIdx, dataLong, dataLenHi, dataLenLo`,
+/// then one octet per quintet.
+///
+/// ⭐ `spell` exists because a corpus of shape scripts alone scored **0
+/// accepted** — measured, and a finding rather than a result. A BOLT#11
+/// invoice ends in a 104-quintet signature over a preimage that includes the
+/// HRP, so no quintet sequence anyone writes by hand is one `decode` will
+/// take. `spell` therefore emits the script that reproduces a REAL invoice
+/// this file already owns, quintet for quintet, so the harness reaches the
+/// tagged-field walk and the signature recovery behind it rather than only the
+/// refusals in front.
+const InvoiceCorpus = struct {
+    store: [8 * 1024]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn pushHex(self: *InvoiceCorpus, comptime h: []const u8) void {
+        var script: [h.len / 2]u8 = undefined;
+        _ = std.fmt.hexToBytes(&script, h) catch unreachable;
+        self.push(&script);
+    }
+
+    fn push(self: *InvoiceCorpus, script: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], script);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    /// Emit the script that makes `buildInvoice` reproduce `invoice`.
+    fn spell(self: *InvoiceCorpus, allocator: Allocator, invoice: []const u8) !void {
+        var raw = try bech32raw.decode(allocator, invoice);
+        defer raw.deinit(allocator);
+        var script: [16 + 800]u8 = undefined;
+        var k: usize = 0;
+        // The HRP: `ln` + the network prefix, no amount. Every invoice spelled
+        // here is an `lnbc` one, which is `netIdx` 0.
+        script[k] = 0; // netIdx
+        script[k + 1] = 0; // amountPresent = false
+        script[k + 2] = 0; // digitCount
+        @memset(script[k + 3 ..][0..5], 0); // the five digit octets
+        script[k + 8] = 0; // multPresent
+        script[k + 9] = 0; // multIdx
+        script[k + 10] = 0; // dataLong = false, so the length is used verbatim
+        k += 11;
+        std.mem.writeInt(u16, script[k..][0..2], @intCast(raw.data.len), .big);
+        k += 2;
+        for (raw.data) |q| {
+            script[k] = @intFromEnum(@as(enum(u5) { _ }, @enumFromInt(q)));
+            k += 1;
+        }
+        self.push(script[0..k]);
+    }
+
+    fn build(self: *InvoiceCorpus, allocator: Allocator) ![]const []const u8 {
+        // BOLT#11's own worked example, spelled quintet for quintet. 293
+        // quintets — one and a half times the buffer this harness used to have.
+        try self.spell(allocator, donation_invoice);
+
+        // lnbc, no amount, 111 quintets: the shortest data part that carries a
+        // timestamp and a signature, so the tagged-field loop runs.
+        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "01" ++ "0000" ++ ("01" ** 32));
+        // lntb with a `2500u` amount and a long data part.
+        self.pushHex("01" ++ "01" ++ "04" ++ "0205000000" ++ "01" ++ "01" ++ "01" ++ "00C8" ++ ("07" ** 32));
+        // lntbs, amount digits but NO multiplier — the bare-satoshi HRP form.
+        self.pushHex("02" ++ "01" ++ "03" ++ "0102030000" ++ "00" ++ "00" ++ "01" ++ "0080" ++ ("1F" ** 32));
+        // lnbcrt, the longest HRP this harness can build, with a `p` multiplier.
+        self.pushHex("03" ++ "01" ++ "05" ++ "0908070605" ++ "01" ++ "03" ++ "01" ++ "00C8" ++ ("00" ** 32));
+        // A data part of exactly 110 quintets: one short of the timestamp +
+        // signature floor, so `InvoiceTooShort` fires.
+        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "00" ++ "006E" ++ ("01" ** 32));
+        // A data part of 0: the shape the collapsed draw produced on every input.
+        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "00" ++ "0000");
+        // The full 800 quintets — the whole raised buffer, so the ceiling is
+        // exercised rather than merely raised.
+        self.pushHex("00" ++ "00" ++ "00" ++ "0000000000" ++ "00" ++ "00" ++ "01" ++ "0320" ++ ("15" ** 32));
+        // A one-octet script, cycled: the degenerate case.
+        self.pushHex("00");
+        return self.entries[0..self.n];
+    }
+};
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    // ⚠ One `smith.slice`, then the octets say what happens — see `Script`.
+    // Measured 2026-09-07 over the corpus above: **one invoice with an EMPTY
+    // data part on every input before; 9 scripts, 1842 quintets, all 4 HRP
+    // shapes and 1 real invoice decoded after.**
+    var script: [1024]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    const invoice = buildInvoice(allocator, script[0..n]) catch return;
     defer allocator.free(invoice);
 
     var inv = decode(allocator, invoice) catch return;
     defer inv.deinit(allocator);
+}
+
+test "corpus: every invoice script builds an invoice, and the data parts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets and through the SAME `buildInvoice`.
+    //
+    // `quintets` is the reach claim in the form that fits a harness whose seed
+    // is a SCRIPT: what the collapse destroyed was the data-part LENGTH, and
+    // an empty data part is `InvoiceTooShort` before a single tagged field is
+    // read. `hrps` pins that the four HRP shapes are all reached, which the
+    // first draw being the range minimum made impossible.
+    const allocator = testing.allocator;
+    var corpus: InvoiceCorpus = .{};
+    const entries = try corpus.build(allocator);
+    var quintets: usize = 0;
+    var hrps: usize = 0;
+    var decoded: usize = 0;
+    var seen: [fuzz_net_prefixes.len]bool = @splat(false);
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [1024]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        const invoice = try buildInvoice(allocator, script[0..n]);
+        defer allocator.free(invoice);
+        var raw = try bech32raw.decode(allocator, invoice);
+        defer raw.deinit(allocator);
+        quintets += raw.data.len;
+        for (fuzz_net_prefixes, 0..) |pfx, i| {
+            if (std.mem.startsWith(u8, raw.hrp, "ln") and
+                std.mem.startsWith(u8, raw.hrp[2..], pfx) and !seen[i])
+            {
+                seen[i] = true;
+                hrps += 1;
+            }
+        }
+        var inv = decode(allocator, invoice) catch continue;
+        defer inv.deinit(allocator);
+        decoded += 1;
+    }
+    try testing.expectEqual(@as(usize, 1842), quintets);
+    try testing.expectEqual(@as(usize, 4), hrps);
+    // 1: BOLT#11's donation invoice, spelled quintet for quintet. It is the
+    // only accepted seed and it has to be — an invoice ends in a 104-quintet
+    // signature over a preimage that includes the HRP, so no hand-written
+    // quintet sequence is one `decode` will take. A corpus without it scores
+    // 0 accepted, which is what the first draft of this one did.
+    try testing.expectEqual(@as(usize, 1), decoded);
+
+    // The "before" measurement, executable: the empty script is exactly what
+    // the collapsed harness ran — HRP `lnbc` with no amount, and a data part
+    // of zero quintets.
+    const zero = try buildInvoice(allocator, &.{});
+    defer allocator.free(zero);
+    var zero_raw = try bech32raw.decode(allocator, zero);
+    defer zero_raw.deinit(allocator);
+    try testing.expectEqualStrings("lnbc", zero_raw.hrp);
+    try testing.expectEqual(@as(usize, 0), zero_raw.data.len);
 }
 
 // ── external anchor for the HRP amount multipliers ───────────────────────
