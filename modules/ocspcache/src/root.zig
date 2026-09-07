@@ -1093,6 +1093,108 @@ fn buildAia(alloc: std.mem.Allocator, oid: []const u8, loc_tag: u8, loc: []const
 
 const fuzz_loc_tags = [_]u8{ 0x86, 0xa4, 0x82, 0x30, 0x04 };
 
+/// Test-only: the captured production certificate/response the harnesses below
+/// mutate. Imported here as well as inside each harness so the corpora can be
+/// sized against it at comptime.
+const fuzz_goldens = @import("goldens.zig");
+
+/// A corpus entry: the fuzzed octets framed the way `Smith.slice` reads them
+/// (a little-endian `u32` length, then the octets), followed by the `u64` words
+/// the knobs after the byte draw read.
+///
+/// ⛔ Both halves were broken. `raw_len` came from a ranged draw taken after
+/// `smith.bytes` had eaten the input, so it was **0** on every input either
+/// target ever ran outside `--fuzz` — every "fuzzed bytes" argument was the
+/// empty slice. And every knob after it was its own range minimum, which for
+/// `fuzzRefresh` meant the body mode was always 0 (the pristine golden
+/// response), the status always came from `smith.value(bool) == false` → 0,
+/// and `now` was always `goldens.now_unix`: three of the four body shapes and
+/// both of the other `now` values had never been produced.
+///
+/// ⚠ How many words a seed needs depends on the branches it takes — the
+/// mutation loop and the two `else` arms each read more. The lists below are
+/// per-seed for that reason.
+fn ocspSeed(comptime raw: []const u8, comptime words: []const u64) []const u8 {
+    return &struct {
+        const tail = blk: {
+            var out: [words.len * 8]u8 = undefined;
+            for (words, 0..) |w, i| std.mem.writeInt(u64, out[i * 8 ..][0..8], w, .little);
+            break :blk out;
+        };
+        const bytes = std.mem.toBytes(@as(u32, raw.len)) ++ raw[0..raw.len].* ++ tail;
+    }.bytes;
+}
+
+const leaf_len = fuzz_goldens.godaddy_leaf_der.len;
+const resp_len = fuzz_goldens.godaddy_response_der.len;
+
+/// Words: `[oid_is_genuine, loc_tag_index, mutation_count, positions…, cut]`.
+const aia_seeds = [_][]const u8{
+    // The genuine id-ad-ocsp OID and the URI tag around a real URL: the branch
+    // `parseAiaOcspUrl` resolves. No mutation; the truncation walk takes the
+    // whole certificate.
+    ocspSeed("http://ocsp.example.org/", &.{ 1, 0, 0, leaf_len }),
+    // A fuzzed OID instead — the non-matching-OID branch.
+    ocspSeed("http://ocsp.example.org/", &.{ 0, 0, 0, leaf_len }),
+    // The other four accessLocation tags, one seed each, so the tag table is
+    // not pinned at index 0 the way a knob-after-bytes draw pins it.
+    ocspSeed("http://ocsp.example.org/", &.{ 1, 1, 0, leaf_len }),
+    ocspSeed("http://ocsp.example.org/", &.{ 1, 2, 0, leaf_len }),
+    ocspSeed("http://ocsp.example.org/", &.{ 1, 3, 0, leaf_len }),
+    ocspSeed("http://ocsp.example.org/", &.{ 1, 4, 0, leaf_len }),
+    // Eight octets written over the real certificate, spread across it, then
+    // the full-length walk — the `discoverResponderUrl` path on hostile DER.
+    ocspSeed(&[_]u8{ 0xff, 0x00, 0x30, 0x86, 0x06, 0x2b, 0x01, 0x05 }, &.{ 1, 0, 8, 3, 40, 200, 700, 1200, 1500, 1700, 1749, leaf_len }),
+    // Truncations of the real certificate: mid-TBS, mid-extension, and one
+    // octet in. Every one must be a typed error, never a walk off the end.
+    ocspSeed("", &.{ 1, 0, 0, 1 }),
+    ocspSeed("", &.{ 1, 0, 0, leaf_len / 2 }),
+    ocspSeed("", &.{ 1, 0, 0, leaf_len - 1 }),
+    // And the input this target used to run for ever.
+    ocspSeed("", &.{}),
+};
+
+test "corpus: the AIA seeds drive every knob, and the counts are pinned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var nonempty: usize = 0;
+    var urls: usize = 0;
+    var tags_seen: [fuzz_loc_tags.len]bool = @splat(false);
+    var mutations: usize = 0;
+    var cut_total: usize = 0;
+    for (aia_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [256]u8 = undefined;
+        const raw_len: usize = smith.slice(&raw);
+        if (raw_len != 0) nonempty += 1;
+        const oid: []const u8 = if (smith.value(bool)) &oid_ad_ocsp else raw[0..@min(raw_len, 16)];
+        const tag_idx = smith.index(fuzz_loc_tags.len);
+        tags_seen[tag_idx] = true;
+        const value = try buildAia(arena.allocator(), oid, fuzz_loc_tags[tag_idx], raw[0..raw_len]);
+        if (parseAiaOcspUrl(value) catch null) |_| urls += 1;
+        // Mirrors the harness's own draw order exactly, `@min` included: a
+        // guard that consumes a different word stream is measuring a
+        // different corpus. (Written the other way round first, which is how
+        // `cut_total` came out at less than half its real value.)
+        const n = @min(smith.valueRangeAtMost(u8, 0, 8), raw_len);
+        mutations += n;
+        var i: usize = 0;
+        while (i < n) : (i += 1) _ = smith.index(leaf_len);
+        cut_total += smith.valueRangeAtMost(u16, 0, @intCast(leaf_len));
+    }
+    // ⛔ Every one of these was its range minimum before: `raw_len` 0, so no
+    // AIA ever carried a URL, `tags_seen` only ever index 0, `mutations` 0,
+    // and every truncation was the same zero-length cut.
+    try testing.expectEqual(@as(usize, 7), nonempty);
+    // ⚠ 1, not 5: only the URI tag (`0x86`, index 0) with the genuine OID
+    // resolves to a URL. The other four tag seeds and the fuzzed-OID seed are
+    // the refusal side, and the mutation seed's own octets are not a URL.
+    try testing.expectEqual(@as(usize, 1), urls);
+    try testing.expectEqual(@as(usize, 8), mutations);
+    try testing.expectEqual(@as(usize, 14875), cut_total);
+    for (tags_seen) |t| try testing.expect(t);
+}
+
 fn fuzzAia(_: void, smith: *std.testing.Smith) !void {
     const goldens = @import("goldens.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1100,8 +1202,8 @@ fn fuzzAia(_: void, smith: *std.testing.Smith) !void {
     const a = arena.allocator();
 
     var raw: [256]u8 = undefined;
-    smith.bytes(&raw);
-    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    const raw_len: usize = smith.slice(&raw);
 
     // 1. Structured: a real AccessDescription around fuzzed bytes. The OID is
     //    either the genuine id-ad-ocsp (so the URI branch is taken) or fuzzed.
@@ -1126,7 +1228,7 @@ fn fuzzAia(_: void, smith: *std.testing.Smith) !void {
 }
 
 test "fuzz: the AIA responder-URL walk never panics" {
-    try std.testing.fuzz({}, fuzzAia, .{});
+    try std.testing.fuzz({}, fuzzAia, .{ .corpus = &aia_seeds });
 }
 
 fn fuzzRefresh(_: void, smith: *std.testing.Smith) !void {
@@ -1136,8 +1238,8 @@ fn fuzzRefresh(_: void, smith: *std.testing.Smith) !void {
     const a = arena.allocator();
 
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length.
+    const raw_len: usize = smith.slice(&raw);
 
     // The responder's answer: the real captured response, mutated or truncated
     // (so `ocsp.parseResponse` and `ocsp.verify` are actually reached), or
@@ -1178,8 +1280,72 @@ fn fuzzRefresh(_: void, smith: *std.testing.Smith) !void {
     cache.refresh(raw[0..raw_len], &goldens.godaddy_issuer_der, now) catch {};
 }
 
+/// Words: `[body_mode, (mode 1: mutation_count, positions…) | (mode 2: cut),
+/// status_is_200, (else: status), method_is_post, now_mode, (mode 2: now)]`.
+const refresh_seeds = [_][]const u8{
+    // The pristine captured response, HTTP 200, GET, at the capture's own
+    // `now` — the one combination the collapsed draw already produced, kept so
+    // the guard can show it is no longer the ONLY one.
+    ocspSeed("", &.{ 0, 1, 0, 0 }),
+    // Eight octets written over the response, 200, POST, one second past
+    // `nextUpdate`: `ocsp.parseResponse` and `ocsp.verify` on hostile DER,
+    // and the staleness branch.
+    ocspSeed(&[_]u8{ 0x30, 0x82, 0xff, 0x00, 0x0a, 0x01, 0x06, 0x09 }, &.{ 1, 8, 2, 5, 40, 120, 300, 600, 900, 1200, 1, 1, 1 }),
+    // The response truncated at half its length, 200, GET, an arbitrary `now`.
+    ocspSeed("", &.{ 2, resp_len / 2, 1, 0, 2, 1234567 }),
+    // Arbitrary bytes as the body, HTTP 500, GET.
+    ocspSeed("not an OCSP response at all", &.{ 3, 0, 500, 0, 0 }),
+    // The pristine response behind a 404 — the transport-status branch.
+    ocspSeed("", &.{ 0, 0, 404, 1, 1 }),
+    // And the input this target used to run for ever.
+    ocspSeed("", &.{}),
+};
+
+test "corpus: the refresh seeds drive every knob, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var body_modes: [4]bool = @splat(false);
+    var now_modes: [3]bool = @splat(false);
+    var non_200: usize = 0;
+    var post: usize = 0;
+    for (refresh_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const raw_len: usize = smith.slice(&raw);
+        if (raw_len != 0) nonempty += 1;
+        const body_mode = smith.valueRangeAtMost(u8, 0, 3);
+        body_modes[body_mode] = true;
+        switch (body_mode) {
+            1 => {
+                const n = @min(smith.valueRangeAtMost(u8, 0, 8), raw_len);
+                var i: usize = 0;
+                while (i < n) : (i += 1) _ = smith.index(resp_len);
+            },
+            2 => _ = smith.valueRangeAtMost(u16, 0, @intCast(resp_len)),
+            else => {},
+        }
+        if (!smith.value(bool)) {
+            non_200 += 1;
+            _ = smith.valueRangeAtMost(u16, 0, 599);
+        }
+        if (smith.value(bool)) post += 1;
+        const now_mode = smith.valueRangeAtMost(u8, 0, 2);
+        now_modes[now_mode] = true;
+        if (now_mode == 2) _ = smith.value(i32);
+    }
+    try testing.expectEqual(@as(usize, 2), nonempty);
+    try testing.expectEqual(@as(usize, 3), non_200);
+    try testing.expectEqual(@as(usize, 2), post);
+    // ⛔ Every one of these was pinned before: `body_mode` was always 0 (the
+    // pristine response — so the mutate, truncate and arbitrary-bytes arms had
+    // never run), `smith.value(bool)` was always false so the status was
+    // always `valueRangeAtMost(u16, 0, 599)`'s minimum 0 and the method always
+    // GET, and `now_mode` was always 0.
+    for (body_modes) |b| try testing.expect(b);
+    for (now_modes) |n| try testing.expect(n);
+}
+
 test "fuzz: Cache.refresh never panics on a hostile responder body" {
-    try std.testing.fuzz({}, fuzzRefresh, .{});
+    try std.testing.fuzz({}, fuzzRefresh, .{ .corpus = &refresh_seeds });
 }
 
 test "the ocspcache fuzz harnesses reach the AIA walk and ocsp.verify (reachability)" {

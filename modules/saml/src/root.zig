@@ -116,6 +116,8 @@
 //! every failure is a typed error.
 
 const std = @import("std");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
+const testkit = @import("testkit");
 const xml = @import("xml");
 const xmldsig = @import("xmldsig");
 const xmlenc = @import("xmlenc");
@@ -3238,35 +3240,156 @@ test "parseIdpMetadata: endpoints + signing cert DER (untrusted)" {
 // module's own doc calls out as untrusted (certs come back as raw DER,
 // "never parsed here" — this file just has to survive hostile XML shape).
 
+/// A base64 POST-binding field carrying a real `<samlp:Response/>`, plus the
+/// refusals. Written at comptime because `decodePostField` accepts nothing a
+/// byte draw is likely to produce.
+const field_seeds = [_][]const u8{
+    testkit.fuzz.seed("PHNhbWxwOlJlc3BvbnNlIHhtbG5zOnNhbWxwPSJ1cm46b2FzaXM6bmFtZXM6dGM6U0FNTDoyLjA6cHJvdG9jb2wiLz4="),
+    // The same, line-wrapped the way an IdP emits it and a browser forwards
+    // it — the leniency `base64DecodeLenient` exists for.
+    testkit.fuzz.seed("PHNhbWxwOlJlc3BvbnNlIHhtbG5zOnNhbWxwPSJ1cm46b2FzaXM6\r\nbmFtZXM6dGM6U0FNTDoyLjA6cHJvdG9jb2wiLz4=\n"),
+    // ⛔ A corpus of refusals only exercises the refusal path, so the Redirect
+    // binding gets a real one too: base64(raw-DEFLATE("<samlp:AuthnRequest
+    // ID=\"_x\"/>")), the exact encoding the round-trip test above builds.
+    // Written after the guard measured `redirect_ok == 0` over the first draft.
+    testkit.fuzz.seed("sylOzM0psHIsLcnIC0otLE0tLlHwdLFViq9Q0rcDAA=="),
+    testkit.fuzz.seed("!!!not-base64!!!"), // the typed-error case the tests above pin
+    testkit.fuzz.seed("PHNhbWxwOlJlc3BvbnNl"), // valid base64, not a complete document
+    testkit.fuzz.seed("A"), // one base64 character: an impossible length
+    testkit.fuzz.seed("===="), // padding only
+    testkit.fuzz.seed(""), // the input these targets used to run for ever
+};
+
 test "fuzz: decodePostField/decodeRedirectField never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeFields, .{});
+    try testing.fuzz({}, fuzzDecodeFields, .{ .corpus = &field_seeds });
 }
 
 fn fuzzDecodeFields(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `bytes` followed by a ranged length: the
+    // latter drew `len == 0` on every input this target ever ran outside
+    // `--fuzz` (a ranged draw needs eight octets and `bytes` had eaten them),
+    // so both decoders were handed `""` every round.
+    const len: usize = smith.slice(&buf);
     const field = buf[0..len];
 
     if (decodePostField(testing.allocator, field)) |d| testing.allocator.free(d) else |_| {}
     if (decodeRedirectField(testing.allocator, field)) |d| testing.allocator.free(d) else |_| {}
 }
 
-test "fuzz: parseIdpMetadata never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseIdpMetadata, .{});
+test "corpus: the binding-field seeds reach both decoders, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var post_ok: usize = 0;
+    var redirect_ok: usize = 0;
+    // The number an empty replay cannot produce: decoded XML octets.
+    var octets: usize = 0;
+    for (field_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decodePostField(testing.allocator, buf[0..len])) |d| {
+            defer testing.allocator.free(d);
+            post_ok += 1;
+            octets += d.len;
+        } else |_| {}
+        if (decodeRedirectField(testing.allocator, buf[0..len])) |d| {
+            testing.allocator.free(d);
+            redirect_ok += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(field_seeds.len - 1, nonempty); // all but the empty field
+    try testing.expectEqual(@as(usize, 5), post_ok);
+    try testing.expectEqual(@as(usize, 1), redirect_ok);
+    try testing.expectEqual(@as(usize, 182), octets);
 }
 
+/// ⛔ 512 was too small for the module's OWN reference document: the metadata
+/// in `test "parseIdpMetadata: endpoints + signing cert DER (untrusted)"` is
+/// **718 octets**. A seed longer than the buffer does not arrive truncated, it
+/// reads back EMPTY (`Smith.slice` checks the declared length against
+/// `rangeAtMost(0, buf.len)` and falls back to the range minimum), so the only
+/// complete IdP metadata this module owns could never have passed through its
+/// own harness. Raised to 2048.
+const idp_metadata_buf_len = 2048;
+
+const idp_metadata =
+    "<md:EntityDescriptor xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\"" ++
+    " xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" entityID=\"https://idp.example.org/saml\">" ++
+    "<md:IDPSSODescriptor protocolSupportEnumeration=\"urn:oasis:names:tc:SAML:2.0:protocol\">" ++
+    "<md:KeyDescriptor use=\"signing\"><ds:KeyInfo><ds:X509Data>" ++
+    "<ds:X509Certificate>SGVsbG8=</ds:X509Certificate>" ++
+    "</ds:X509Data></ds:KeyInfo></md:KeyDescriptor>" ++
+    "<md:KeyDescriptor use=\"encryption\"><ds:KeyInfo><ds:X509Data>" ++
+    "<ds:X509Certificate>d29ybGQ=</ds:X509Certificate>" ++
+    "</ds:X509Data></ds:KeyInfo></md:KeyDescriptor>" ++
+    "<md:SingleSignOnService Binding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\" Location=\"https://idp.example.org/sso\"/>" ++
+    "</md:IDPSSODescriptor></md:EntityDescriptor>";
+
+/// Each seed is the document, then the per-octet `boolWeighted(1, 3)` words the
+/// alphabet-substitution loop reads. ⛔ Those words are drawn AFTER the byte
+/// draw, so on a corpus replay they are all `false` unless the seed leaves a
+/// tail — which is what a real document wants (no substitution at all), and
+/// what one seed here deliberately does not.
+const idp_seeds = [_][]const u8{
+    testkit.fuzz.seed(idp_metadata), // the module's own 718-octet document
+    testkit.fuzz.seed(idp_metadata[0..400]), // truncated mid-KeyDescriptor
+    testkit.fuzz.seed("<md:EntityDescriptor/>"), // well-formed, nothing in it
+    testkit.fuzz.seed("<md:EntityDescriptor><md:IDPSSODescriptor>"), // unclosed
+    testkit.fuzz.seed("<<<<>>>>&;!?"), // the alphabet's own punctuation, no structure
+    testkit.fuzz.seed(""), // the input this target used to run for ever
+};
+
+test "fuzz: parseIdpMetadata never panics on arbitrary bytes" {
+    try testing.fuzz({}, fuzzParseIdpMetadata, .{ .corpus = &idp_seeds });
+}
+
+const idp_alphabet = "<>/=\"'&;! ?abcmdsEntityDescriptorIDPSSOKeyInfoX509CertificateSingleSignOnServiceBinding0123\n\t";
+
 fn fuzzParseIdpMetadata(_: void, smith: *std.testing.Smith) !void {
-    const alphabet = "<>/=\"'&;! ?abcmdsEntityDescriptorIDPSSOKeyInfoX509CertificateSingleSignOnServiceBinding0123\n\t";
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    var buf: [idp_metadata_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice` call. See `idp_metadata_buf_len` for the other half
+    // of what was wrong here.
+    const len: usize = smith.slice(&buf);
     for (buf[0..len]) |*c| {
-        if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
+        if (smith.boolWeighted(1, 3)) c.* = idp_alphabet[c.* % idp_alphabet.len];
     }
 
     var m = parseIdpMetadata(testing.allocator, buf[0..len]) catch return;
     m.deinit();
+}
+
+test "corpus: the IdP metadata seeds reach the parser, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    // ⛔ The numbers an empty replay cannot produce, and that a bare
+    // `parsed > 0` could not have held up: `<md:EntityDescriptor/>` parses to
+    // an empty `Metadata`, so acceptance says nothing. Endpoints and certs do.
+    var endpoints: usize = 0;
+    var certs: usize = 0;
+    for (idp_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [idp_metadata_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        for (buf[0..len]) |*c| {
+            if (smith.boolWeighted(1, 3)) c.* = idp_alphabet[c.* % idp_alphabet.len];
+        }
+        var m = parseIdpMetadata(testing.allocator, buf[0..len]) catch continue;
+        defer m.deinit();
+        parsed += 1;
+        endpoints += m.sso_endpoints.len;
+        certs += m.signing_certs_der.len;
+    }
+    try testing.expectEqual(idp_seeds.len - 1, nonempty); // all but the empty seed
+    try testing.expectEqual(@as(usize, 1), parsed);
+    // ⛔ These two are the point. Both are 1 because ONE seed carries the
+    // module's own 718-octet reference document — the document that could not
+    // fit the old 512-octet buffer and so read back EMPTY. `parsed` alone
+    // would not have held that up: `<md:EntityDescriptor/>` would parse to an
+    // empty `Metadata` if the parser accepted it.
+    try testing.expectEqual(@as(usize, 1), endpoints);
+    try testing.expectEqual(@as(usize, 1), certs);
 }
 
 test "decodePostField: base64 wrapped in whitespace decodes (browsers and IdPs both wrap it)" {
