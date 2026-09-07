@@ -886,7 +886,23 @@ pub fn decodeCertificate(buf: []const u8, entries_out: []CertificateEntry) Messa
     const ctx_len = buf[0];
     if (buf.len < 1 + @as(usize, ctx_len) + 3) return error.BufferTooShort;
     const context = buf[1..][0..ctx_len];
-    var i: usize = 1 + ctx_len;
+    // ⛔ `@as(usize, ctx_len)`, not `1 + ctx_len`. `ctx_len` is a `u8` and `1`
+    // is a `comptime_int`, so peer-type resolution made the addition `u8`
+    // arithmetic — the `usize` on the left is a result type, not an operand
+    // type — and `certificate_request_context` is a `<0..2^8-1>` field, so the
+    // legal value 255 overflowed. A peer's `Certificate` message with a
+    // 255-octet context and 259 octets in total therefore PANICKED in Debug and
+    // ReleaseSafe (`integer overflow`, i.e. a remote crash-DoS reachable from a
+    // server this client has not yet authenticated) and wrapped to `i = 0` in
+    // ReleaseFast, where the length octet was then re-read as the top of the
+    // 24-bit `certificate_list` length. The check one line up is written
+    // correctly; only this one was not.
+    //
+    // Found by `--fuzz` in 328 runs on the day this file's harnesses were
+    // seeded — the target had been in the tree since the module was written and
+    // had never executed a `Certificate` body at all, because its length draw
+    // collapsed to 0.
+    var i: usize = 1 + @as(usize, ctx_len);
 
     const list_len: usize = readU24(buf[i..][0..3]);
     i += 3;
@@ -1277,6 +1293,32 @@ test "Certificate decode: internally inconsistent cert_data length is a typed er
     try testing.expectError(error.Malformed, decodeCertificate(corrupted[0..enc.len], &entries_out));
 }
 
+test "Certificate decode: a 255-octet certificate_request_context is legal, not an integer overflow" {
+    // ⛔ Regression. `certificate_request_context` is `<0..2^8-1>` (RFC 8446
+    // §4.4.2), so 255 is a value a conforming peer may send — and
+    // `var i: usize = 1 + ctx_len` did that addition in `u8`, because the
+    // `usize` is the RESULT type and `ctx_len` is still a `u8`. 255 + 1
+    // panicked with `integer overflow` in Debug and ReleaseSafe (a remote
+    // crash-DoS: a client reaches this on the `Certificate` of a server it has
+    // not authenticated yet) and wrapped to 0 in ReleaseFast, where the
+    // context-length octet was then re-read as the top of the 24-bit
+    // `certificate_list` length.
+    //
+    // Found by `--fuzz` in 328 runs, on the day `fuzzDecodeCertificate` was
+    // first given a corpus and a byte-first draw; before that its length draw
+    // collapsed to 0 and the target had never decoded a `Certificate` at all.
+    var msg: [1 + 255 + 3]u8 = @splat(0);
+    msg[0] = 255; // the maximum legal context length
+    var entries_out: [4]CertificateEntry = undefined;
+    const dec = try decodeCertificate(&msg, &entries_out);
+    try testing.expectEqual(@as(usize, 255), dec.certificate_request_context.len);
+    try testing.expectEqual(@as(usize, 0), dec.entries.len);
+
+    // One octet short of the same message stays a typed error, which is what
+    // the (correctly written) length check above the overflow already did.
+    try testing.expectError(error.BufferTooShort, decodeCertificate(msg[0 .. msg.len - 1], &entries_out));
+}
+
 test "CertificateVerify round-trip (opaque algorithm + signature)" {
     const sig = [_]u8{0x77} ** 64; // opaque; real value is certverify.sign's output
     var buf: [128]u8 = undefined;
@@ -1589,6 +1631,12 @@ fn buildCertificateCorpus(s: *Corpus) []const []const u8 {
     else |_| {}
     // RFC 8446 §4.4.2's "no certificate" answer: an empty certificate_list.
     if (encodeCertificate(&.{}, &.{}, &wire)) |enc| s.push(enc, null) else |_| {}
+    // ⭐ The crash `--fuzz` found here in 328 runs, kept as a seed: a
+    // 255-octet `certificate_request_context`, the maximum the field allows,
+    // which made `1 + ctx_len` overflow a `u8`. See the regression test above.
+    var max_ctx: [1 + 255 + 3]u8 = @splat(0);
+    max_ctx[0] = 255;
+    s.push(&max_ctx, null);
     s.push(&.{}, null);
     s.push(&.{ 0x00, 0x00, 0x00, 0x05 }, null); // list declared, nothing present
     s.push(&.{ 0x00, 0x00, 0x00, 0x06, 0xFF, 0xFF, 0xFF, 0x00, 0x00 }, null); // cert_data over the list
@@ -1961,7 +2009,7 @@ test "corpus: every message seed reaches its decoder, and the counts are pinned"
         r.accepted += 1;
         for (dec.entries) |e| r.walked += e.cert_data.len;
     }
-    try expectReach(r, .{ .entries = 9, .accepted = 3, .walked = 1161, .mutated = 3 });
+    try expectReach(r, .{ .entries = 10, .accepted = 4, .walked = 1161, .mutated = 3 });
     try testing.expectEqual(@as(usize, 0), cert.dropped);
 
     // ── extension blocks: extensions parsed out of them.

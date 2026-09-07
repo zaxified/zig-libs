@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **BEHAVIOURAL, not breaking — remote crash fixed:**
+  `messages.decodeCertificate` panicked with `integer overflow` on a peer's
+  `Certificate` message whose `certificate_request_context` is 255 octets long.
+
+  `certificate_request_context` is a `<0..2^8-1>` field (RFC 8446 §4.4.2), so
+  255 is a value a conforming peer may send. The decoder wrote
+  `var i: usize = 1 + ctx_len` — and `ctx_len` is a `u8` while the `usize` is
+  only the RESULT type, so peer-type resolution did the addition in `u8`.
+  A 259-octet body with `ctx_len == 255` therefore **panicked in Debug and
+  ReleaseSafe**, and in ReleaseFast wrapped to `i = 0`, after which the
+  context-length octet was re-read as the top of the 24-bit `certificate_list`
+  length. The bounds check on the line above it is written correctly
+  (`@as(usize, ctx_len)`); only this one was not.
+
+  Reachable from `Connection.zig`'s handshake path on a peer's `Certificate`
+  message — i.e. a malicious server can crash a client, and in mutual-auth mode
+  a malicious client can crash a server, **before either has authenticated the
+  other**, which is the point of that message. Consumers running ReleaseSafe
+  see a process abort turn into an ordinary decode; nothing that used to succeed
+  behaves differently.
+
+  Found by `zig build --fuzz` in **328 runs**, on the day
+  `fuzzDecodeCertificate` was first given a corpus and a byte-first draw. The
+  target had been in the tree since the module was written and had never decoded
+  a `Certificate` body at all: its length draw collapsed to 0, so it called
+  `decodeCertificate("")` once and stopped. The crashing shape is now both a
+  named regression test and a corpus seed.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the module's last two fuzz
   targets stop drawing their whole scenario from collapsing draws, and `dtls`
   reaches zero on `scripts/check-fuzz-reach.py` (17 → 0).
