@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Both injectivity fuzz targets now carry a corpus, and a
+  guard test pins what it reaches. They had none, so `std.testing.fuzz`
+  replayed exactly one input, the empty one: `smith.bytes` memsets an
+  exhausted input to zero and a scalar draw returns its range minimum, so
+  every run of `fuzzInjective` and `fuzzBlsInjective` used the state
+  `(0, 0, 0)` with `slot = 0` and a `delta` of 0 rewritten to 1. One state
+  pair, for ever — and slots 1 and 2 were never perturbed, which are exactly
+  where a wrong MDS row or an S-box applied to the wrong element would show,
+  the defect class the harness exists for. Seeds now spell out three
+  big-endian elements, the `slot` word and a `delta`; measured after: 3
+  distinct slots, 6 of 8 seeds with a non-zero drawn delta, 5 distinct
+  permutation outputs, pinned as exact counts. Test-only; no API change.
+
 - **2026-09-06** — The sympy oracle leaves the module. `src/reference_interop.zig`
   `@embedFile`d a 285-line Python driver into module source and spawned `python3`
   from inside `zig build test-poseidon`, so every consumer carried foreign source
