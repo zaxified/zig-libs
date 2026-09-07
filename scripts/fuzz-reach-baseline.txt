@@ -59,7 +59,6 @@ json5 2
 jwe 2
 jwt 3
 k256 2
-l2disco 4
 l2encap 1
 l2forward 1
 linkheader 1

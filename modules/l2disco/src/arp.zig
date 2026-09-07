@@ -20,6 +20,9 @@
 
 const std = @import("std");
 const netaddr = @import("netaddr");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const Mac = @import("mac.zig").Mac;
 
 pub const ParseError = error{
@@ -356,14 +359,99 @@ test "ARP garbage sweep: no panics on random input" {
 // PRNG sweep above predates the `Smith` harness convention this collection
 // standardises on; this drives the same boundary through `std.testing.fuzz`.
 
+/// ARP packets for `fuzzArpParse`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Hex, not built at run time: every field in an ARP packet is big-endian
+/// or a raw octet string, so these bytes are the same on every host — unlike
+/// the netlink families in this collection, where a hex corpus would silently
+/// be a little-endian one.
+const arp_seeds = [_][]const u8{
+    // Request: who has 192.168.1.1, tell 192.168.1.100 (00:1b:21:3c:9d:f8).
+    testkit.fuzz.seedHex("0001080006040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a80101"),
+    // Reply: 192.168.1.1 is at a4:5e:60:d4:2b:11.
+    testkit.fuzz.seedHex("0001080006040002" ++ "a45e60d42b11" ++ "c0a80101" ++ "001b213c9df8" ++ "c0a80164"),
+    // Gratuitous: sender and target protocol addresses equal.
+    testkit.fuzz.seedHex("0001080006040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a80164"),
+    // Probe: sender protocol address all zero (RFC 5227).
+    testkit.fuzz.seedHex("0001080006040001" ++ "001b213c9df8" ++ "00000000" ++ "000000000000" ++ "c0a801c8"),
+    // The same request padded to Ethernet's 46-octet minimum payload — the
+    // trailing octets must be ignored, not parsed.
+    testkit.fuzz.seedHex("0001080006040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a80101" ++ "00" ** 18),
+
+    // ── generic `Packet`, refused by `EthIpv4` ─────────────────────────────
+    // htype 6 (IEEE 802) instead of 1.
+    testkit.fuzz.seedHex("0006080006040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a80101"),
+    // ptype 0x86dd (IPv6) instead of 0x0800.
+    testkit.fuzz.seedHex("000186dd06040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a80101"),
+    // hlen 14 / plen 8: a legal generic ARP whose address fields are 44
+    // octets, so `Packet` slices four of them and `EthIpv4` says no.
+    testkit.fuzz.seedHex("0001080e0e080001" ++ "aa" ** 14 ++ "bb" ** 8 ++ "cc" ** 14 ++ "dd" ** 8),
+
+    // ── the refusals ───────────────────────────────────────────────────────
+    // Nothing at all, and one octet short of the fixed header.
+    testkit.fuzz.seed(""),
+    testkit.fuzz.seedHex("00010800060400"),
+    // The header is complete and hlen/plen are 0xff, so the four address
+    // fields would need 1020 octets. `need` must be computed before the
+    // slicing, not during it.
+    testkit.fuzz.seedHex("00010800ffff0001" ++ "00" ** 8),
+    // hlen/plen declaring exactly one octet more than the frame carries.
+    testkit.fuzz.seedHex("0001080006040001" ++ "001b213c9df8" ++ "c0a80164" ++ "000000000000" ++ "c0a801"),
+};
+
 test "fuzz: ARP parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzArpParse, .{});
+    try testing.fuzz({}, fuzzArpParse, .{ .corpus = &arp_seeds });
 }
 
 fn fuzzArpParse(_: void, smith: *std.testing.Smith) !void {
-    var buf: [64]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
+    // 128, not 64: the hlen 14 / plen 8 seed is 52 octets and a generic ARP
+    // packet may legally be far larger. A seed longer than the buffer is not
+    // a big seed — `Smith.slice` reads it back as the EMPTY one.
+    var buf: [128]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and both parsers were handed an EMPTY
+    // slice with the frame sitting unread in `buf`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 12 seeds non-empty,
+    // 0 packets parsed and 0 address octets sliced before; 11 of 12 non-empty
+    // (one seed IS the empty frame), 8 packets, 5 of them Ethernet+IPv4, and
+    // 184 address octets sliced, after.**
+    const len: usize = smith.slice(&buf);
     _ = Packet.parse(buf[0..len]) catch {};
     _ = EthIpv4.parse(buf[0..len]) catch {};
+}
+
+test "corpus: every ARP seed reaches the parsers, and the sliced counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently.
+    //
+    // `octets` is the second number: it is the total length of the four
+    // address fields `Packet.parse` sliced out, so it counts the arithmetic
+    // that decides where those slices start and end — the only part of this
+    // parser that can be wrong. A packet count alone would not move if
+    // `hlen`/`plen` were misread.
+    var nonempty: usize = 0;
+    var packets: usize = 0;
+    var eth: usize = 0;
+    var octets: usize = 0;
+    for (arp_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [128]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (Packet.parse(buf[0..len])) |p| {
+            packets += 1;
+            octets += p.sha.len + p.spa.len + p.tha.len + p.tpa.len;
+        } else |_| {}
+        if (EthIpv4.parse(buf[0..len])) |_| eth += 1 else |_| {}
+    }
+    try testing.expectEqual(arp_seeds.len - 1, nonempty); // one seed IS the empty frame
+    try testing.expectEqual(@as(usize, 8), packets);
+    try testing.expectEqual(@as(usize, 5), eth);
+    try testing.expectEqual(@as(usize, 184), octets);
 }

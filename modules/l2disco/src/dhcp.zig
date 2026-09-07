@@ -25,6 +25,9 @@
 
 const std = @import("std");
 const netaddr = @import("netaddr");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const Mac = @import("mac.zig").Mac;
 
 pub const ParseError = error{
@@ -659,16 +662,200 @@ test "DHCP garbage sweep: no panics on random input" {
 // the option walker past the cookie gate is actually reached by `Smith`'s
 // otherwise-uniform bytes, not just the 4-byte cookie check.
 
+/// DHCP datagrams for `fuzzDhcpParse`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the datagram.
+///
+/// ⭐ Built at run time from this file's two golden messages rather than
+/// quoted as hex — a DHCP datagram is 240 octets of header before the first
+/// option, and a hex literal of that is not a thing anyone reviews.
+///
+/// ⛔ The old harness stamped the magic cookie into its buffer "in about half
+/// the cases … so the option walker past the cookie gate is actually reached".
+/// It never was, twice over: `smith.boolWeighted(1, 1)` came after the input
+/// was spent, and the length was 0 anyway, so `len >= header_len + 4` was
+/// false on every seed and the stamp never happened at all. A comment
+/// describing a bias the code had never once taken.
+const DhcpCorpus = struct {
+    store: [16384]u8 = undefined,
+    used: usize = 0,
+    entries: [15][]const u8 = undefined,
+    n: usize = 0,
+
+    /// The fixed header plus the cookie, which is where every seed starts.
+    const prefix_len = header_len + magic_cookie.len;
+
+    fn push(self: *DhcpCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    /// The golden DISCOVER's header and cookie with `tail` as the options
+    /// field — so every seed below differs only in the part being tested.
+    fn withOptions(self: *DhcpCorpus, tail: []const u8) void {
+        var frame: [prefix_len + 256]u8 = undefined;
+        frame[0..prefix_len].* = kat_discover[0..prefix_len].*;
+        @memcpy(frame[prefix_len..][0..tail.len], tail);
+        self.push(frame[0 .. prefix_len + tail.len]);
+    }
+
+    fn build(self: *DhcpCorpus) []const []const u8 {
+        // The two golden messages: a DISCOVER and the ACK for the same
+        // transaction, which between them carry every typed option.
+        self.push(&kat_discover);
+        self.push(&kat_ack);
+
+        // Header and cookie, no options at all. Legal, and every typed field
+        // stays null — the shape a reach guard must not count as work.
+        self.withOptions(&.{});
+        // Pad octets, then End, then trailing bytes the walker must not read.
+        self.withOptions(&.{ 0, 0, 0, 255, 0xde, 0xad });
+
+        // ── the option walker's bounds ─────────────────────────────────────
+        // A code with no length octet behind it (`pos + 2 > buf.len`).
+        self.withOptions(&.{53});
+        // A length octet declaring more than remains (`pos + 2 + len`).
+        self.withOptions(&.{ 53, 255, 1 });
+
+        // ── the per-option length checks ───────────────────────────────────
+        // `one()`: message type with two octets.
+        self.withOptions(&.{ 53, 2, 1, 0, 255 });
+        // `four()`: requested IP with three.
+        self.withOptions(&.{ 50, 3, 192, 168, 0, 255 });
+        // `ip4List()`: a router list of six octets, and a DNS list of zero.
+        self.withOptions(&.{ 3, 6, 192, 168, 0, 1, 10, 0, 255 });
+        self.withOptions(&.{ 6, 0, 255 });
+        // A router list of three addresses — the `Ip4List` walk with more
+        // than one entry in it.
+        self.withOptions(&.{ 3, 12, 192, 168, 0, 1, 192, 168, 0, 2, 10, 0, 0, 1, 255 });
+
+        // ── option overloading (RFC 2132 §9.3) ─────────────────────────────
+        // Overload = 3 (both), with real options planted in `sname` and
+        // `file`. `snameOptionIterator`/`fileOptionIterator` are public API
+        // and nothing but this seed drives them from the fuzz side.
+        {
+            var frame: [prefix_len + 8]u8 = undefined;
+            frame[0..prefix_len].* = kat_discover[0..prefix_len].*;
+            // sname is bytes 44..108, file is 108..236.
+            @memcpy(frame[44..][0..8], &[_]u8{ 12, 3, 'a', 'b', 'c', 255, 0, 0 });
+            @memcpy(frame[108..][0..8], &[_]u8{ 67, 3, 'p', 'x', 'e', 255, 0, 0 });
+            @memcpy(frame[prefix_len..][0..8], &[_]u8{ 52, 1, 3, 53, 1, 1, 255, 0 });
+            self.push(frame[0 .. prefix_len + 8]);
+        }
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // The cookie is wrong.
+        {
+            var frame: [prefix_len]u8 = kat_discover[0..prefix_len].*;
+            frame[header_len] ^= 0xff;
+            self.push(&frame);
+        }
+        // One octet short of header + cookie.
+        self.push(kat_discover[0 .. prefix_len - 1]);
+        // Nothing at all.
+        self.push(&.{});
+
+        return self.entries[0..self.n];
+    }
+};
+
+/// What one datagram yielded. Shared by the fuzz target and its corpus guard
+/// so the guard drives the SAME walk.
+const DhcpTally = struct {
+    parsed: usize = 0,
+    typed: usize = 0,
+    options: usize = 0,
+    overloaded: usize = 0,
+    ips: usize = 0,
+};
+
+fn walkDhcp(bytes: []const u8) DhcpTally {
+    var t: DhcpTally = .{};
+    const m = Message.parse(bytes) catch return t;
+    t.parsed = 1;
+    inline for (.{
+        m.message_type != null,       m.requested_ip != null, m.server_id != null,
+        m.lease_time_s != null,       m.subnet_mask != null,  m.routers != null,
+        m.dns_servers != null,        m.domain_name != null,  m.host_name != null,
+        m.param_request_list != null, m.client_id != null,    m.overload != null,
+    }) |present| {
+        if (present) t.typed += 1;
+    }
+    if (m.routers) |l| t.ips += l.count();
+    if (m.dns_servers) |l| t.ips += l.count();
+    var it = m.optionIterator();
+    while (it.next() catch null) |_| t.options += 1;
+    if (m.overload != null) {
+        var sit = m.snameOptionIterator();
+        while (sit.next() catch null) |_| t.overloaded += 1;
+        var fit = m.fileOptionIterator();
+        while (fit.next() catch null) |_| t.overloaded += 1;
+    }
+    std.mem.doNotOptimizeAway(m.broadcastFlag());
+    std.mem.doNotOptimizeAway(m.clientMac());
+    std.mem.doNotOptimizeAway(m.yourIp());
+    std.mem.doNotOptimizeAway(m.serverIdIp());
+    return t;
+}
+
 test "fuzz: DHCP Message.parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDhcpParse, .{});
+    var corpus: DhcpCorpus = .{};
+    try testing.fuzz({}, fuzzDhcpParse, .{ .corpus = corpus.build() });
 }
 
 fn fuzzDhcpParse(_: void, smith: *std.testing.Smith) !void {
-    var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    if (smith.boolWeighted(1, 1) and len >= header_len + 4) {
-        buf[header_len..][0..4].* = magic_cookie;
+    // 1024, not 512: `bootp_min_len` is 300 and a DHCP datagram carrying a
+    // full parameter list runs well past that. A seed longer than the buffer
+    // is not a big seed — `Smith.slice` reads it back as the EMPTY one.
+    var buf: [1024]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `Message.parse` was handed an EMPTY
+    // slice with the datagram sitting unread in `buf`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 15 seeds non-empty,
+    // 0 messages parsed and 0 options walked before; 14 of 15 non-empty (one
+    // seed IS the empty datagram), 6 parsed, 15 options walked, 15 typed
+    // fields decoded, 6 addresses listed and 2 overloaded options read,
+    // after.** The empty slice is refused at `bytes.len < 240`, so the option
+    // walker this target exists for had never run.
+    const len: usize = smith.slice(&buf);
+    std.mem.doNotOptimizeAway(walkDhcp(buf[0..len]));
+}
+
+test "corpus: every DHCP seed reaches the option walker, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkDhcp`. `nonempty` is
+    // the reach claim and the only check that catches a seed grown past the
+    // harness's buffer, which `Smith.slice` reads back as the EMPTY one.
+    //
+    // ⛔ `parsed` cannot be the guard: a 240-octet header with the cookie and
+    // no options at all is a legal DHCP datagram, so a message parses with
+    // every typed field null and the walker never entering its loop — and one
+    // of the seeds above is exactly that, on purpose. `options`, `typed`,
+    // `ips` and `overloaded` count work the empty input cannot do.
+    var corpus: DhcpCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var total: DhcpTally = .{};
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [1024]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const t = walkDhcp(buf[0..len]);
+        total.parsed += t.parsed;
+        total.typed += t.typed;
+        total.options += t.options;
+        total.overloaded += t.overloaded;
+        total.ips += t.ips;
     }
-    _ = Message.parse(buf[0..len]) catch {};
+    try testing.expectEqual(entries.len - 1, nonempty); // one seed IS the empty datagram
+    try testing.expectEqual(@as(usize, 6), total.parsed);
+    try testing.expectEqual(@as(usize, 15), total.typed);
+    try testing.expectEqual(@as(usize, 15), total.options);
+    try testing.expectEqual(@as(usize, 2), total.overloaded);
+    try testing.expectEqual(@as(usize, 6), total.ips);
 }

@@ -31,6 +31,9 @@
 
 const std = @import("std");
 const netaddr = @import("netaddr");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const Mac = @import("mac.zig").Mac;
 
 pub const ParseError = error{
@@ -947,20 +950,188 @@ test "LLDP garbage sweep: no panics on random input" {
 // predates the `Smith` harness convention this collection standardises on;
 // this drives the same boundary through `std.testing.fuzz`.
 
+/// LLDPDUs for `fuzzLldpParse`, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`): a little-endian u32 length, then the frame.
+///
+/// ⭐ Hex (and the golden frame above), not built at run time: an LLDP TLV
+/// header is a big-endian 7-bit type and 9-bit length, so these bytes are the
+/// same on every host. The `0x02, 0x07` at the start of `kat` is
+/// `(1 << 9) | 7` — Chassis ID, 7 octets.
+const lldp_seeds = [_][]const u8{
+    // The golden LLDPDU: every mandatory TLV, four optionals, one org TLV.
+    testkit.fuzz.seed(&kat),
+    // The mandatory three and End, nothing else: a legal LLDPDU with every
+    // optional null and both iterators empty of anything interesting.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++ "0000"),
+
+    // ⭐ System Capabilities with three octets instead of four. This is the
+    // ONE seed on which `tolerant_optionals` changes the answer — strict
+    // returns `BadTlvLength`, tolerant returns an LLDPDU with
+    // `skipped_optionals == 1`. Without it, passing the option is decoration.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "0e03" ++ "001400" ++ "0a07" ++ "6c61622d737731" ++ "0000"),
+    // The same for a Management Address whose internal lengths do not add up.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "1004" ++ "05010203" ++ "0000"),
+    // ⭐ `addr_str_len` EQUAL to the value length: the address slice would end
+    // one octet past the value. Only the `1 +` in `1 + addr_str_len >
+    // value.len` refuses it.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "1005" ++ "0501c0a80a" ++ "0000"),
+    // ⭐ The address block is complete but the six octets of interface
+    // subtype + number + OID length behind it are not — `pos + 6 > value.len`
+    // is the only thing in front of a read past the end.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "1008" ++ "0501c0a80a02" ++ "0200" ++ "0000"),
+
+    // ── the mandatory-TLV gate ─────────────────────────────────────────────
+    // Chassis ID and Port ID but no TTL.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "0000"),
+    // Port ID first: the ORDER is mandatory, not just the presence.
+    testkit.fuzz.seedHex("0406" ++ "054769302f31" ++ "0207" ++ "04001b213c9df8" ++ "06020078" ++ "0000"),
+    // A Chassis ID whose value is one octet — subtype and nothing else.
+    testkit.fuzz.seedHex("0201" ++ "04" ++ "0406" ++ "054769302f31" ++ "06020078" ++ "0000"),
+    // A TTL TLV with three octets instead of two.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "0603000078" ++ "0000"),
+
+    // ── the TLV walker's own bounds ────────────────────────────────────────
+    // A TLV declaring 0x1ff octets over a frame that has none of them.
+    testkit.fuzz.seedHex("03ff" ++ "04001b21"),
+    // One octet where a two-octet TLV header is needed.
+    testkit.fuzz.seedHex("02"),
+
+    // ── the iterators, which the typed fields do not reach ─────────────────
+    // Two Management Address TLVs (IPv4 then IPv6): the typed field holds
+    // only the first, so the iterator is the only way to the second.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "100c" ++ "0501c0a80a02" ++ "0200000001" ++ "00" ++
+        "1018" ++ "1102" ++ "20" ** 16 ++ "0200000002" ++ "00" ++ "0000"),
+    // Three org-specific TLVs: 802.1 port VLAN, 802.3 MAC/PHY, and an OUI
+    // this codec does not know — so `decode()` returns a value, a value and
+    // null, in that order.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe06" ++ "0080c201000a" ++
+        "fe09" ++ "00120f01" ++ "0301000010" ++
+        "fe05" ++ "aabbcc01" ++ "ff" ++ "0000"),
+    // An org TLV whose value is under the 4-octet OUI+subtype minimum.
+    testkit.fuzz.seedHex("0207" ++ "04001b213c9df8" ++ "0406" ++ "054769302f31" ++ "06020078" ++
+        "fe03" ++ "0080c2" ++ "0000"),
+
+    // Nothing at all.
+    testkit.fuzz.seed(""),
+};
+
+/// What one LLDPDU yielded. Shared by the fuzz target and its corpus guard so
+/// the guard drives the SAME walk.
+const LldpTally = struct {
+    strict: usize = 0,
+    tolerant: usize = 0,
+    skipped: usize = 0,
+    optionals: usize = 0,
+    tlvs: usize = 0,
+    orgs: usize = 0,
+    decoded: usize = 0,
+    addresses: usize = 0,
+};
+
+fn walkLldp(bytes: []const u8, tolerant: bool) LldpTally {
+    var t: LldpTally = .{};
+    if (Lldpdu.parse(bytes, .{ .tolerant_optionals = true })) |_| t.tolerant = 1 else |_| {}
+    const du = Lldpdu.parse(bytes, .{ .tolerant_optionals = tolerant }) catch return t;
+    t.strict = 1;
+    t.skipped = du.skipped_optionals;
+    inline for (.{
+        du.port_description != null,   du.system_name != null,
+        du.system_description != null, du.capabilities != null,
+        du.management_address != null,
+    }) |present| {
+        if (present) t.optionals += 1;
+    }
+    var it = du.tlvIterator();
+    while (it.next() catch null) |_| t.tlvs += 1;
+    var org = du.orgIterator();
+    while (org.next() catch null) |o| {
+        t.orgs += 1;
+        if (o.decode() != null) t.decoded += 1;
+    }
+    var ma = du.managementAddressIterator();
+    while (ma.next() catch null) |a| {
+        t.addresses += 1;
+        std.mem.doNotOptimizeAway(a.ip());
+    }
+    return t;
+}
+
 test "fuzz: LLDPDU parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzLldpParse, .{});
+    try testing.fuzz({}, fuzzLldpParse, .{ .corpus = &lldp_seeds });
 }
 
 fn fuzzLldpParse(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an EMPTY slice.
+    // The empty slice fails at the first mandatory TLV, so the `catch return`
+    // one line down took every round and the three iterators — the whole
+    // reason this target exists — had NEVER executed.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 16 seeds non-empty,
+    // 0 LLDPDUs parsed, 0 TLVs walked, 0 org TLVs decoded and 0 management
+    // addresses read before; 15 of 16 non-empty (one seed IS the empty
+    // frame), 5 parsed strictly, 9 tolerantly (the four that differ are the
+    // malformed-optional seeds), 51 TLVs walked, 4 org TLVs of which 3
+    // decode, and 3 management addresses, after.**
+    const len: usize = smith.slice(&buf);
+    // ⚠ `tolerant_optionals` travels in the seed's tail. Drawn here it would
+    // be `false` forever, and one whole documented branch of this parser —
+    // "skip the malformed optional and keep the neighbour record" — would
+    // never run. `walkLldp` drives both settings on every seed anyway, so the
+    // draw picks which of the two the deeper walk uses.
+    const tolerant = smith.value(u64) & 1 != 0;
+    std.mem.doNotOptimizeAway(walkLldp(buf[0..len], tolerant));
+}
 
-    const du = Lldpdu.parse(buf[0..len], .{}) catch return;
-    var it = du.tlvIterator();
-    while (it.next() catch null) |_| {}
-    var org = du.orgIterator();
-    while (org.next() catch null) |o| _ = o.decode();
-    var ma = du.managementAddressIterator();
-    while (ma.next() catch null) |_| {}
+test "corpus: every LLDP seed reaches the iterators, and the walked counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkLldp`. `nonempty` is
+    // the reach claim and the only check that catches a seed grown past the
+    // harness's buffer, which `Smith.slice` reads back as the EMPTY one.
+    //
+    // ⛔ A parse count is not the guard: an LLDPDU carrying only its three
+    // mandatory TLVs parses cleanly with every optional null and every
+    // iterator empty, and one seed above is exactly that. `tlvs`, `orgs`,
+    // `decoded` and `addresses` count work the empty input cannot do.
+    //
+    // ⭐ `skipped` is the one that pins the `tolerant_optionals` branch: it can
+    // only be non-zero if a seed carried a malformed OPTIONAL TLV *and* the
+    // tolerant setting was actually passed. `strict != tolerant` on at least
+    // one seed is what makes the option worth drawing at all.
+    var nonempty: usize = 0;
+    var total: LldpTally = .{};
+    for (lldp_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const t = walkLldp(buf[0..len], true);
+        total.tolerant += t.tolerant;
+        total.skipped += t.skipped;
+        total.optionals += t.optionals;
+        total.tlvs += t.tlvs;
+        total.orgs += t.orgs;
+        total.decoded += t.decoded;
+        total.addresses += t.addresses;
+        // The same seed under the strict setting, so the two are comparable.
+        total.strict += walkLldp(buf[0..len], false).strict;
+    }
+    try testing.expectEqual(lldp_seeds.len - 1, nonempty); // one seed IS the empty frame
+    try testing.expectEqual(@as(usize, 5), total.strict);
+    try testing.expectEqual(@as(usize, 9), total.tolerant);
+    try testing.expectEqual(@as(usize, 4), total.skipped);
+    try testing.expectEqual(@as(usize, 5), total.optionals);
+    try testing.expectEqual(@as(usize, 51), total.tlvs);
+    try testing.expectEqual(@as(usize, 4), total.orgs);
+    try testing.expectEqual(@as(usize, 3), total.decoded);
+    try testing.expectEqual(@as(usize, 3), total.addresses);
 }

@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — All four fuzz targets parsed an EMPTY frame. Each opened with
+  `smith.bytes(&buf)` and then drew its length with `valueRangeAtMost`, which reads eight input
+  octets as a little-endian u64 and returns the range minimum when fewer remain — so the length
+  was 0 on every seed and every parser was handed `""` with the frame sitting unread in `buf`.
+  For `lldp` that meant the `catch return` one line down took every round and the three
+  iterators the target exists for had never executed at all. The `dhcp` harness stamped the magic
+  cookie "in about half the cases … so the option walker past the cookie gate is actually
+  reached"; it never was, twice over — the `boolWeighted` draw came after the input was spent and
+  the `len >= header_len + 4` guard was false anyway, so the stamp never happened once. Each
+  target now draws with one `smith.slice(&buf)`, carries a corpus of real frames plus the
+  refusals a well-formed frame cannot reach, and is pinned by a guard counting work done —
+  address octets sliced, TLVs walked, options decoded, management addresses read — because a
+  four-octet CDP header, a 240-octet DHCP header with no options, and an LLDPDU carrying only its
+  three mandatory TLVs are all legal, so an acceptance count reads as health while nothing walks.
+  Two knobs that could only ever be their default now travel in the seed's tail: `cdp`'s
+  `verify_checksum` (one seed makes the two settings disagree) and `lldp`'s `tolerant_optionals`
+  (four do). Buffers were raised where the module's own largest frame did not fit. Verified by
+  mutation: nine loosened bounds across the four parsers are now caught, five of them only after
+  seeds were added that miss the limit by one or two octets rather than by thousands.
+
 - **2026-08-18** — **BREAKING:** `lldp.Lldpdu.parse` now takes a second parameter,
   `opts: lldp.ParseOptions` (existing call sites become `Lldpdu.parse(bytes, .{})`), matching the
   `cdp.Frame.parse(bytes, opts)` shape already in this module. Adds `ParseOptions.tolerant_optionals`
