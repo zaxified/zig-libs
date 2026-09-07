@@ -281,7 +281,7 @@ const module_list = [_]Module{
     .{ .name = "bitcointx", .libs = &.{"crypto"}, .deps = &.{"bip340"} },
     .{ .name = "psbt", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "bitcoinscript" } },
     .{ .name = "bitcoinscript", .libs = &.{"crypto"}, .deps = &.{ "bitcointx", "k256", "bip340", "ripemd160" } },
-    .{ .name = "btcp2p", .libs = &.{"crypto"}, .deps = &.{"bitcointx"} },
+    .{ .name = "btcp2p", .libs = &.{"crypto"}, .deps = &.{"bitcointx"}, .test_deps = &.{"testkit"} },
     .{ .name = "lnwire", .libs = &.{"crypto"} },
     .{ .name = "lninvoice", .libs = &.{"crypto"}, .deps = &.{ "bech32", "k256", "lnwire", "bip340" } },
     .{ .name = "musig2", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" } },
