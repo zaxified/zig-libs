@@ -548,6 +548,45 @@ def truncation_hits(body_texts):
                         f"`{fed[0]}` — the body never executes, so no drawn byte "
                         f"ever reaches the code under test")
                     break
+        # ── (c) the selector: it governs WHICH path runs, not how many bytes ──
+        #
+        # Found by an agent, and MEASURED rather than argued: it restored the
+        # collapsed selector into an otherwise-fixed harness and the gate stayed
+        # completely silent (`27 judged, 27 reach their input, 0 collapse`).
+        #
+        # `settinggroups.fuzzSgcb` drew `which` AFTER the byte draw and used it
+        # as `sgcb_attributes[which]`. The seed is consumed by then, so `which`
+        # is always 0 — every seed wrote to `NumOfSG`, which is read-only, and
+        # the corpus would have measured "denied" twelve times having touched
+        # nothing else. The gate listed that target for its buffer slicing only,
+        # so fixing that half alone would have cleared it from the list with the
+        # real hole intact.
+        #
+        # Neither other rule can see it: R1 inspects only the FIRST draw, and
+        # every R2 form requires the collapsing binding to bound the extent of
+        # drawn bytes. This one indexes a table of alternatives instead.
+        if filled:
+            for n in sorted(collapsing):
+                m = re.search(r"\b(\w+)\s*\[\s*" + re.escape(n) + r"\s*\]", text)
+                sw = re.search(r"\bswitch\s*\(\s*" + re.escape(n) + r"\s*\)", text)
+                # ⚠ Not a defect when the SAME table is also iterated whole:
+                # `btcp2p/fuzzDecodeMessage` picks a network magic to stamp and
+                # then calls the decoder `for (nets) |n|` against all four
+                # regardless, so a pinned `idx` costs no coverage. That was the
+                # only instance in the tree when this rule landed, and it is a
+                # false positive — kept as the rule's own lookalike control.
+                iterated = m and re.search(
+                    r"\bfor\s*\(\s*" + re.escape(m.group(1)) + r"\s*\)", text)
+                if m and m.group(1) not in filled and not iterated:
+                    hits.append(
+                        f"`{n}` comes from a bounded draw and is therefore the range "
+                        f"minimum, and it selects which alternative runs "
+                        f"(`{m.group(1)}[{n}]`) — every seed takes the same branch")
+                elif sw:
+                    hits.append(
+                        f"`{n}` comes from a bounded draw and is therefore the range "
+                        f"minimum, and it is a `switch` discriminant — every seed "
+                        f"takes the same branch")
     return sorted(set(hits))
 
 
