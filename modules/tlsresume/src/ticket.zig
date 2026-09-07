@@ -316,57 +316,198 @@ test "encode: BufferTooSmall on an undersized destination" {
 // random values/lengths (including ones that overrun the buffer), so the
 // per-field bounds checks and the extension-nest loop actually run.
 
+// ⛔ AND THE UNSTRUCTURED HALF NEVER RAN, NOR DID ANY OF THE STRUCTURED
+// HALF'S FIELD VALUES. The branch gate was `smith.value(bool)`, the harness's
+// FIRST draw. A `Smith` scalar draw reads eight octets as a little-endian
+// `u64` and returns the range minimum when fewer remain, and the target
+// carried no corpus, so outside `--fuzz` the single input it ever ran was
+// empty: the bool was false every time, so it always took the structured
+// half — and inside it every field draw collapsed too. lifetime 0, age_add 0,
+// nonce_len 0, ticket_len 0, ext_total_len 0, and the trailing-garbage bool
+// false. The whole target was a 13-octet all-zero ticket, decoded
+// successfully, once, for ever. The per-field bounds checks and the
+// extension-nest loop the comment above says the structured half exists for
+// were never entered. Measured 2026-09-07: 1 round, 0 nonce octets, 0 ticket
+// octets, 0 extensions parsed.
+//
+// The branch and the generator are gone. `decode` takes a byte slice, so the
+// harness draws one, and the shapes are a corpus built from this module's own
+// `encode` plus the length lies that no encoder will produce.
+
+/// The corpus, built at run time from `NewSessionTicket.encode`.
+///
+/// ⭐ The harness and the guard below both build it from HERE.
+const TicketCorpus = struct {
+    const cap = 512;
+
+    stores: [10][4 + cap]u8 = undefined,
+    entries: [10][]const u8 = undefined,
+
+    fn build(self: *TicketCorpus) ![]const []const u8 {
+        const kit = @import("testkit").fuzz;
+        var scratch: [cap]u8 = undefined;
+        var t: [cap]u8 = undefined;
+        var n: usize = 0;
+
+        // 0: the all-zero minimum — the ONLY input this target ever ran.
+        const minimal = try (NewSessionTicket{
+            .ticket_lifetime = 0,
+            .ticket_age_add = 0,
+            .ticket_nonce = "",
+            .ticket = "",
+        }).encode(&scratch);
+        self.entries[n] = kit.seedInto(&self.stores[n], minimal);
+        n += 1;
+
+        // 1: a realistic ticket with a nonce and a body.
+        const plain_len = blk: {
+            const e = try (NewSessionTicket{
+                .ticket_lifetime = 7200,
+                .ticket_age_add = 0xDEAD_BEEF,
+                .ticket_nonce = "\x00\x01",
+                .ticket = "opaque-ticket-bytes",
+            }).encode(&scratch);
+            @memcpy(t[0..e.len], e);
+            break :blk e.len;
+        };
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..plain_len]);
+        n += 1;
+        var plain: [cap]u8 = undefined;
+        @memcpy(plain[0..plain_len], t[0..plain_len]);
+
+        // 2: with two extensions, so the extension-nest loop actually runs.
+        const exts = [_]Extension{
+            .{ .ext_type = 42, .data = "\x00\x00\x40\x00" }, // early_data, 16 KiB
+            .{ .ext_type = 0xFFFF, .data = "xy" },
+        };
+        const we_len = blk: {
+            const e = try (NewSessionTicket{
+                .ticket_lifetime = 300,
+                .ticket_age_add = 1,
+                .ticket_nonce = "n",
+                .ticket = "tkt",
+                .extensions = &exts,
+            }).encode(&scratch);
+            @memcpy(t[0..e.len], e);
+            break :blk e.len;
+        };
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..we_len]);
+        n += 1;
+        var with_exts: [cap]u8 = undefined;
+        @memcpy(with_exts[0..we_len], t[0..we_len]);
+
+        // 3: eight extensions — `ext_buf` is `[8]Extension`, so this is the
+        //    boundary at which the caller's buffer is exactly full.
+        const many = [_]Extension{.{ .ext_type = 1, .data = "z" }} ** 8;
+        {
+            const e = try (NewSessionTicket{
+                .ticket_lifetime = 1,
+                .ticket_age_add = 1,
+                .ticket_nonce = "",
+                .ticket = "t",
+                .extensions = &many,
+            }).encode(&scratch);
+            self.entries[n] = kit.seedInto(&self.stores[n], e);
+            n += 1;
+        }
+
+        // 4: nine — one past it.
+        const too_many = [_]Extension{.{ .ext_type = 1, .data = "z" }} ** 9;
+        {
+            const e = try (NewSessionTicket{
+                .ticket_lifetime = 1,
+                .ticket_age_add = 1,
+                .ticket_nonce = "",
+                .ticket = "t",
+                .extensions = &too_many,
+            }).encode(&scratch);
+            self.entries[n] = kit.seedInto(&self.stores[n], e);
+            n += 1;
+        }
+
+        // 5: ⭐ the nonce-length octet raised to 255 with nothing behind it —
+        //    the per-field bounds check the deleted generator existed for.
+        @memcpy(t[0..we_len], with_exts[0..we_len]);
+        t[8] = 0xFF;
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..we_len]);
+        n += 1;
+
+        // 6: the ticket-length field claiming 0xFFFF.
+        @memcpy(t[0..we_len], with_exts[0..we_len]);
+        std.mem.writeInt(u16, t[10..12], 0xFFFF, .big);
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..we_len]);
+        n += 1;
+
+        // 7: one trailing octet past a well-formed ticket — must be REJECTED,
+        //    not ignored.
+        @memcpy(t[0..plain_len], plain[0..plain_len]);
+        t[plain_len] = 0x2a;
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0 .. plain_len + 1]);
+        n += 1;
+
+        // 8: twelve zero octets — one short of the fixed prefix.
+        @memset(t[0..12], 0);
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..12]);
+        n += 1;
+
+        // 9: the empty message.
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..0]);
+        n += 1;
+
+        std.debug.assert(n == self.entries.len);
+        return &self.entries;
+    }
+};
+
 test "fuzz: NewSessionTicket.decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzTicketDecode, .{});
+    var corpus: TicketCorpus = .{};
+    try testing.fuzz({}, fuzzTicketDecode, .{ .corpus = try corpus.build() });
+}
+
+test "corpus: every ticket seed reaches decode, and the extensions parsed are pinned" {
+    // ⭐ The measurement, executable. `exts_parsed` is the second number and
+    // it is the load-bearing one: the all-zero 13-octet ticket decodes
+    // SUCCESSFULLY — it is a legal `NewSessionTicket` with no nonce, no body
+    // and no extensions, and it is precisely what the collapsed harness built
+    // and decoded on every run — so an "accepted > 0" guard would have read
+    // green over it. An extension parsed into `ext_buf` cannot come from it.
+    var corpus: TicketCorpus = .{};
+    const seeds = try corpus.build();
+
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var refused: usize = 0;
+    var body_octets: usize = 0;
+    var exts_parsed: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [TicketCorpus.cap]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var ext_buf: [8]Extension = undefined;
+        const nst = NewSessionTicket.decode(buf[0..len], &ext_buf) catch {
+            refused += 1;
+            continue;
+        };
+        accepted += 1;
+        body_octets += nst.ticket_nonce.len + nst.ticket.len;
+        exts_parsed += nst.extensions.len;
+    }
+    // Measured 2026-09-07. Before: 1 round, one 13-octet all-zero ticket,
+    // 0 body octets, 0 extensions.
+    try testing.expectEqual(seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 7), refused);
+    try testing.expectEqual(@as(usize, 26), body_octets);
+    try testing.expectEqual(@as(usize, 10), exts_parsed); // 2 from the two-extension seed and 8 from the ext_buf-full one
 }
 
 fn fuzzTicketDecode(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One byte-first draw, and no branch: see the block comment above.
     var ext_buf: [8]Extension = undefined;
-
-    if (smith.value(bool)) {
-        var buf: [512]u8 = undefined;
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-        _ = NewSessionTicket.decode(buf[0..len], &ext_buf) catch {};
-        return;
-    }
-
-    var buf: [512]u8 = undefined;
-    var w: usize = 0;
-    std.mem.writeInt(u32, buf[w..][0..4], smith.value(u32), .big);
-    w += 4;
-    std.mem.writeInt(u32, buf[w..][0..4], smith.value(u32), .big);
-    w += 4;
-    // nonce_len: bias toward small values (in range) but allow the full u8
-    // domain (including ones that overrun the remaining buffer).
-    const nonce_len = smith.value(u8);
-    buf[w] = nonce_len;
-    w += 1;
-    if (w + nonce_len > buf.len) return;
-    smith.bytes(buf[w..][0..nonce_len]);
-    w += nonce_len;
-
-    const ticket_len = smith.value(u16);
-    if (w + 2 + @as(usize, ticket_len) > buf.len) return;
-    std.mem.writeInt(u16, buf[w..][0..2], ticket_len, .big);
-    w += 2;
-    smith.bytes(buf[w..][0..ticket_len]);
-    w += ticket_len;
-
-    const ext_total_len = smith.value(u16);
-    if (w + 2 + @as(usize, ext_total_len) > buf.len) return;
-    std.mem.writeInt(u16, buf[w..][0..2], ext_total_len, .big);
-    w += 2;
-    smith.bytes(buf[w..][0..ext_total_len]); // arbitrary extension bytes
-    w += ext_total_len;
-
-    // Occasionally append trailing garbage (must be rejected, not ignored).
-    if (smith.value(bool) and w < buf.len) {
-        buf[w] = smith.value(u8);
-        w += 1;
-    }
-
-    _ = NewSessionTicket.decode(buf[0..w], &ext_buf) catch {};
+    var buf: [TicketCorpus.cap]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    _ = NewSessionTicket.decode(buf[0..len], &ext_buf) catch {};
 }
 
 test "maxEarlyDataSize: null when no early_data extension is present" {

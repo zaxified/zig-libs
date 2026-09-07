@@ -290,39 +290,152 @@ test "SessionState: truncated input is a typed Malformed error" {
 // a real `serialize`d record with the nonce length byte independently
 // mutated, to drive the "nonce runs past the buffer" bounds check specifically.
 
+// ⛔ AND THE UNSTRUCTURED HALF NEVER RAN — NOR DID THE MUTATION. The branch
+// gate was `smith.value(bool)`, the harness's FIRST draw. A `Smith` scalar
+// draw reads eight octets as a little-endian `u64` and returns the range
+// minimum when fewer remain, and the target carried no corpus, so outside
+// `--fuzz` the single input it ever ran was empty: the bool was false every
+// time, so it always took the structured half, and inside it `nonce_len` was
+// 0, `issued_at_ms` was 0, `ticket_age_add` was 0, and the second
+// `smith.value(bool)` guarding the nonce-length mutation was ALSO false. The
+// whole target was: serialize a record with an empty nonce and all-zero
+// timestamps, then parse it back successfully. Measured 2026-09-07: 1 round,
+// 1 record, 0 mutations, 0 refusals — the `bytes.len < r + nonce_len + 8 + 4`
+// bounds check the comment above says the structured half exists for was
+// never once evaluated against a disagreeing length.
+//
+// The branch and the generator are gone. `parse` takes a byte slice, so the
+// harness draws one, and the shapes are a corpus built from this module's own
+// `serialize`.
+
+/// The corpus, built at run time: the only real record shape is what
+/// `serialize` writes, and a hand-pasted copy would drift from it silently.
+///
+/// ⭐ The harness and the guard below both build it from HERE.
+const StateCorpus = struct {
+    const cap = 128;
+    const S = SessionState(32);
+
+    stores: [9][4 + cap]u8 = undefined,
+    entries: [9][]const u8 = undefined,
+
+    fn build(self: *StateCorpus) ![]const []const u8 {
+        const kit = @import("testkit").fuzz;
+        var scratch: [cap]u8 = undefined;
+        var t: [cap]u8 = undefined;
+        var n: usize = 0;
+
+        // 0: a record with an empty nonce — the ONLY input this target ever
+        //    ran, kept so the "before" case stays covered.
+        const empty_nonce = try (S{
+            .resumption_master_secret = [_]u8{0xAB} ** 32,
+            .ticket_nonce = "",
+            .issued_at_ms = 0,
+            .ticket_age_add = 0,
+        }).serialize(&scratch);
+        self.entries[n] = kit.seedInto(&self.stores[n], empty_nonce);
+        n += 1;
+
+        // 1: a realistic record: an 8-octet nonce and non-zero timestamps.
+        const full = try (S{
+            .resumption_master_secret = [_]u8{0xAB} ** 32,
+            .ticket_nonce = "\x01\x02\x03\x04\x05\x06\x07\x08",
+            .issued_at_ms = 1_700_000_000_000,
+            .ticket_age_add = 0xDEAD_BEEF,
+        }).serialize(&scratch);
+        const full_len = full.len;
+        @memcpy(t[0..full_len], full);
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..full_len]);
+        n += 1;
+
+        // 2: ⭐ the nonce-length octet raised to 255 with nothing behind it —
+        //    the `bytes.len < r + nonce_len + 8 + 4` refusal the deleted
+        //    mutation branch existed for and never produced.
+        @memcpy(t[0..full_len], full);
+        t[32] = 0xFF;
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..full_len]);
+        n += 1;
+
+        // 3: the nonce-length octet lowered to 0 — a claimed length SHORTER
+        //    than what follows, which `parse` accepts and reads past.
+        @memcpy(t[0..full_len], full);
+        t[32] = 0;
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..full_len]);
+        n += 1;
+
+        // 4: the nonce-length octet one too large for the room left.
+        @memcpy(t[0..full_len], full);
+        t[32] = 9;
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..full_len]);
+        n += 1;
+
+        // 5: the record truncated by one octet — the age_add field cut short.
+        self.entries[n] = kit.seedInto(&self.stores[n], full[0 .. full_len - 1]);
+        n += 1;
+
+        // 6: 33 octets — the shortest input that gets past `bytes.len <
+        //    rms_len + 1` and is then refused by the second check.
+        @memset(t[0..33], 0);
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..33]);
+        n += 1;
+
+        // 7: 32 octets — one short of that first check.
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..32]);
+        n += 1;
+
+        // 8: the empty record.
+        self.entries[n] = kit.seedInto(&self.stores[n], t[0..0]);
+        n += 1;
+
+        std.debug.assert(n == self.entries.len);
+        return &self.entries;
+    }
+};
+
 test "fuzz: SessionState(32).parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzSessionStateParse, .{});
+    var corpus: StateCorpus = .{};
+    try testing.fuzz({}, fuzzSessionStateParse, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzSessionStateParse(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One byte-first draw, and no branch: see the block comment above.
     const S = SessionState(32);
-    var buf: [128]u8 = undefined;
+    var buf: [StateCorpus.cap]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    _ = S.parse(buf[0..len]) catch {};
+}
 
-    if (smith.value(bool)) {
-        smith.bytes(&buf);
-        const len: usize = smith.valueRangeAtMost(u8, 0, buf.len);
-        _ = S.parse(buf[0..len]) catch {};
-        return;
+test "corpus: every record seed reaches parse, and the nonce octets recovered are pinned" {
+    // ⭐ The measurement, executable. `nonce_octets` is the second number and
+    // it is the load-bearing one: a record with an EMPTY nonce parses
+    // successfully — that is exactly what the collapsed harness produced and
+    // parsed on every run — so an "accepted > 0" guard would have read green
+    // over it. Nonce octets recovered cannot come from that record.
+    var corpus: StateCorpus = .{};
+    const seeds = try corpus.build();
+
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var refused: usize = 0;
+    var nonce_octets: usize = 0;
+    for (seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [StateCorpus.cap]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const s = SessionState(32).parse(buf[0..len]) catch {
+            refused += 1;
+            continue;
+        };
+        accepted += 1;
+        nonce_octets += s.ticket_nonce.len;
     }
-
-    var nonce: [8]u8 = undefined;
-    smith.bytes(&nonce);
-    const nonce_len: usize = smith.valueRangeAtMost(u8, 0, nonce.len);
-    const s = S{
-        .resumption_master_secret = [_]u8{0xAB} ** 32,
-        .ticket_nonce = nonce[0..nonce_len],
-        .issued_at_ms = smith.value(i64),
-        .ticket_age_add = smith.value(u32),
-    };
-    const wire = s.serialize(&buf) catch return;
-    // Independently mutate the nonce-length byte (index 32) so the parser
-    // sees a claimed length that disagrees with what actually follows it —
-    // exactly the shape the bounds check at `bytes.len < r + nonce_len + 8 + 4`
-    // exists to catch.
-    var mutated: [128]u8 = undefined;
-    @memcpy(mutated[0..wire.len], wire);
-    if (smith.value(bool)) mutated[32] = smith.value(u8);
-    _ = S.parse(mutated[0..wire.len]) catch {};
+    // Measured 2026-09-07. Before: 1 round, 1 record, 0 refusals, 0 nonce
+    // octets — the nonce was always empty.
+    try testing.expectEqual(seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 6), refused);
+    try testing.expectEqual(@as(usize, 8), nonce_octets); // only the realistic record's 8-octet nonce survives
 }
 
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;

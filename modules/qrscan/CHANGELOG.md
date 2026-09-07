@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: an earlier audit fix to `fuzzScan` was correct and bought
+  nothing. That fix reordered the harness so the geometry is drawn BEFORE the 16 384
+  pixels — with a measurement in its own comment (`w=1 h=1 stride=1 px[0]=0` beforehand) —
+  but left every draw a ranged one. A ranged `Smith` draw returns the range MINIMUM when
+  fewer than eight octets remain, and with no corpus that is every run, so the harness
+  went from a 1x1 all-zero image to a **21x21 all-zero image with a 1-octet stride**:
+  `scan` still refuses it at its first line, the `catch return` still fires, and both
+  assertions the harness exists for still never execute. Re-measured 2026-09-07: 21 octets
+  handed to `scan`, 0 light pixels. `fuzzDamaged` was the same: `blobs` was its first
+  draw, so it was 0 and the PRISTINE symbol was scanned on every run — the "noise on top
+  of a genuine symbol" it is named for never existed. Both targets draw a SHAPE rather
+  than a byte string, so both now read every choice out of one byte-first `smith.slice`
+  through `testkit.fuzz.Cursor`, with written scripts as corpora — including, in each, the
+  EMPTY script, which reproduces the collapsed harness exactly. The damage generator moved
+  into `damage()` so the guard measures the same damage the harness applies. ⚠ Both guards
+  pin a number the collapsed input cannot make: light pixels (the all-black image has
+  none) and blobs written (the pristine symbol scans successfully, so counting successful
+  scans would have read 1 of 1). Pinned: 8 shapes / 27 347 octets / 9967 light pixels, and
+  131 blobs across 7 scripts.
+
 - **2026-09-04** — **First audit.** This module had never been audited; it landed
   2026-08-23 and the collection's drift ranking could not see it, because a module
   with no ledger has no anchor to measure drift from.

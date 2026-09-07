@@ -40,7 +40,6 @@ opcua 1
 pping 1
 protobuf 2
 psbt 1
-qrscan 2
 quic-crypto 1
 rawsock 3
 rdap 2
@@ -56,7 +55,6 @@ stun 1
 tenantkex 2
 timelock_envelope 1
 tlock 1
-tlsresume 2
 tracecontext 1
 tsdb 2
 tz 2

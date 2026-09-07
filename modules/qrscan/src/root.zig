@@ -2297,13 +2297,77 @@ test "a grid that points at the horizon is refused, not indexed with" {
 
 // ── fuzz: the image is entirely attacker-chosen ─────────────────────────────
 
-test "fuzz: scan never panics on an arbitrary image" {
-    try std.testing.fuzz({}, fuzzScan, .{});
-}
-
 /// Floor for the dimensions `fuzzScan` draws. Named, not written out twice, so
 /// a test can assert against the value the harness actually uses.
 const fuzz_min_dim: u32 = 21;
+
+/// `testkit.fuzz.seed`/`Cursor`. Both harnesses below draw a SHAPE, not a byte
+/// string — an image is dimensions, a stride and 20 480 pixels, and there is
+/// no frame to be faithful to. `Cursor` reads every choice out of ONE
+/// byte-first `smith.slice`, which makes the draw honest and makes a seed a
+/// readable script; a short script CYCLES rather than running out, so a
+/// four-octet seed is a repeating pixel pattern instead of an all-zero image.
+/// Under `--fuzz` the fuzzer still drives every choice, because it drives the
+/// slice.
+const kit = @import("testkit").fuzz;
+
+/// Scripts for `fuzzScan`: dimensions, stride, then pixels, in that order.
+const scan_scripts = [_][]const u8{
+    // ⛔ The empty script reproduces the collapsed harness EXACTLY: every read
+    //    is 0, so w = h = 21, stride = 1, and every pixel is 0 — a 21x21
+    //    all-black image with a 1-octet stride, which is what this target ran
+    //    on every `zig build test-qrscan` for its whole life.
+    kit.seed(""),
+    kit.seed("\x00\x00\x00\xff"), // the minimum geometry with WHITE pixels instead of black
+    kit.seed("\x6b\x6b\x6b\x00\xff"), // a mid-size square, a stride near the width, alternating pixels
+    kit.seed("\xff\xff\xff\x00\x00\xff\xff"), // the largest dimensions and the largest stride
+    kit.seed("\x00\xff\x01\x80"), // ⭐ a stride of 2 under a width of 21: the narrow-stride heap over-read the harness's own comment says it could not previously represent
+    kit.seed("\xff\x00\xff\x00\x00\x00\xff\xff\xff\x00"), // a wide, short image
+    kit.seed("\x00\xff\x00\x11\x22\x33\x44\x55\x66\x77"), // a tall, narrow image with a stride below its width
+    kit.seed("\x40\x40\x40" ++ "\x00\x00\x00\x00\xff\xff\xff\xff"), // eight-pixel bars, which is what a finder pattern's run lengths look like
+};
+
+test "fuzz: scan never panics on an arbitrary image" {
+    try std.testing.fuzz({}, fuzzScan, .{ .corpus = &scan_scripts });
+}
+
+test "corpus: every scan script produces a distinct image, and the light pixels are pinned" {
+    // ⭐ The measurement, executable. `light` is the second number and it is
+    // the load-bearing one: the collapsed harness's image was ALL ZERO, so it
+    // could not produce a single light pixel — and `scan` refuses a 21x21
+    // all-black image at its first line, which means "it did not panic" was
+    // true throughout and said nothing.
+    var nonempty: usize = 0;
+    var shapes: usize = 0;
+    var octets: usize = 0;
+    var light: usize = 0;
+    for (scan_scripts) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [64]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var c = kit.Cursor{ .bytes = script[0..n] };
+        const w = c.ranged(fuzz_min_dim, 128);
+        const h = c.ranged(fuzz_min_dim, 128);
+        const stride = c.ranged(1, 160);
+        var pixels: [128 * 160]u8 = undefined;
+        for (&pixels) |*p| p.* = c.byte();
+        if (@as(usize, stride) * h > pixels.len) continue;
+        shapes += 1;
+        const used = @as(usize, stride) * h;
+        octets += used;
+        for (pixels[0..used]) |p| {
+            if (p >= 128) light += 1;
+        }
+        _ = w;
+    }
+    // Measured 2026-09-07. Before: 1 round, w = h = 21, stride = 1, 21 octets,
+    // 0 light pixels.
+    try std.testing.expectEqual(scan_scripts.len - 1, nonempty); // the deliberate empty script
+    try std.testing.expectEqual(@as(usize, 8), shapes); // every script's stride*h fits
+    try std.testing.expectEqual(@as(usize, 27347), octets);
+    try std.testing.expectEqual(@as(usize, 9967), light); // 0 before: the collapsed image was entirely black
+}
 
 fn fuzzScan(_: void, smith: *std.testing.Smith) !void {
     // Dimensions, stride and every pixel come from outside. The interesting
@@ -2323,15 +2387,34 @@ fn fuzzScan(_: void, smith: *std.testing.Smith) !void {
     //
     // It also made coverage-guided runs crawl, at 2.3 runs/s, because
     // 16,384 of every input's decisions went into pixels.
-    const w = smith.valueRangeAtMost(u32, fuzz_min_dim, 128);
-    const h = smith.valueRangeAtMost(u32, fuzz_min_dim, 128);
+    //
+    // ⛔ AND THAT FIX BOUGHT NOTHING, because it corrected the ORDER while
+    // leaving every draw a collapsing one. Geometry first still means
+    // `valueRangeAtMost(u32, 21, 128)` first, and a ranged `Smith` draw
+    // returns the range MINIMUM when fewer than eight octets remain — which,
+    // with no corpus, is every time. The harness went from a 1x1 all-zero
+    // image to a 21x21 all-zero image with a 1-octet stride: `scan` still
+    // refuses it, the `catch return` still fires, and both assertions below
+    // still never execute. Re-measured 2026-09-07: `w=21 h=21 stride=1`,
+    // 21 octets handed to `scan`, 0 light pixels, 0 assertions reached.
+    //
+    // The fix for the DRAW is `testkit.fuzz.Cursor`: one byte-first
+    // `smith.slice`, then every choice read out of it. A short script cycles,
+    // so a four-octet seed is a repeating pixel pattern rather than 20 480
+    // zeroes, and the corpus above is a set of readable geometry scripts.
+    var script: [64]u8 = undefined;
+    const script_len: usize = smith.slice(&script);
+    var c = kit.Cursor{ .bytes = script[0..script_len] };
+
+    const w = c.ranged(fuzz_min_dim, 128);
+    const h = c.ranged(fuzz_min_dim, 128);
     // Strides BELOW the width are drawn too. The old form was `w + extra`,
     // which made a narrow stride unrepresentable — and a narrow stride was a
     // heap over-read that this harness therefore could not have found.
-    const stride = smith.valueRangeAtMost(u32, 1, 160);
+    const stride = c.ranged(1, 160);
 
     var pixels: [128 * 160]u8 = undefined;
-    for (0..pixels.len) |i| pixels[i] = smith.valueRangeAtMost(u8, 0, 255);
+    for (&pixels) |*p| p.* = c.byte();
     if (@as(usize, stride) * h > pixels.len) return;
 
     var scratch: [scratchSize(128, 128)]u8 = undefined;
@@ -2343,29 +2426,99 @@ fn fuzzScan(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqual(@as(u16, 0), (found.matrix.size - 17) % 4);
 }
 
+/// Scripts for `fuzzDamaged`: a blob count, then (x, y, value) triples. The
+/// coordinates are drawn as fractions of the image, so a script does not have
+/// to know the rendered side length.
+const damage_scripts = [_][]const u8{
+    // ⛔ The empty script reproduces the collapsed harness exactly: `blobs`
+    //    reads 0, so the PRISTINE symbol was scanned on every run and not one
+    //    octet of damage was ever applied.
+    kit.seed(""),
+    kit.seed("\x01\x80\x80\xff"), // one blob, dead centre, white
+    kit.seed("\x08\x10\x10\x00\x20\x20\xff\x30\x30\x00\x40\x40\xff"), // eight blobs across the top-left finder
+    kit.seed("\x3c" ++ "\x11\x22\x00" ** 4), // the maximum 60 blobs, cycling through four positions
+    kit.seed("\x0a\x00\x00\xff\x00\x08\xff\x08\x00\xff"), // ten blobs whitening the top-left finder's corner
+    kit.seed("\x14\xf0\xf0\x00\xf8\xf8\x00"), // twenty blobs in the bottom-right, where no finder is
+    kit.seed("\x20\x80\x10\x7f\x10\x80\x7f"), // mid-grey blobs, which sit right on the binarisation threshold
+};
+
 test "fuzz: a real symbol with the image damaged around it" {
-    try std.testing.fuzz({}, fuzzDamaged, .{});
+    try std.testing.fuzz({}, fuzzDamaged, .{ .corpus = &damage_scripts });
 }
 
 fn fuzzDamaged(_: void, smith: *std.testing.Smith) !void {
     // Noise on top of a genuine symbol reaches the parts random pixels never do:
     // candidate merging, the triple search, and sampling with slightly wrong
     // finder centres.
+    //
+    // ⚠ Except that it did not, because `blobs` was the harness's FIRST draw
+    // and a ranged `Smith` draw returns the range MINIMUM when fewer than
+    // eight octets remain. With no corpus this target ran one empty input, so
+    // `blobs` was 0 and the PRISTINE symbol was scanned on every run — the
+    // "noise on top of a genuine symbol" never existed. Measured 2026-09-07:
+    // 1 round, 0 blobs, 0 pixels damaged. One byte-first `smith.slice` plus a
+    // `Cursor` fixes it, and the scripts above are readable damage patterns.
     var m: qr.Matrix = undefined;
     qr.encode(&m, "FUZZ", .{}) catch return;
 
     var pixels: [400 * 400]u8 = undefined;
     const img = render(&m, 4, &pixels);
 
-    const blobs = smith.valueRangeAtMost(u16, 0, 60);
-    for (0..blobs) |_| {
-        const x = smith.valueRangeAtMost(u32, 0, img.width - 1);
-        const y = smith.valueRangeAtMost(u32, 0, img.height - 1);
-        pixels[y * img.width + x] = smith.valueRangeAtMost(u8, 0, 255);
-    }
+    var script: [64]u8 = undefined;
+    const script_len: usize = smith.slice(&script);
+    var c = kit.Cursor{ .bytes = script[0..script_len] };
+    _ = damage(&c, pixels[0 .. @as(usize, img.width) * img.height], img.width);
 
     var scratch: [scratchSize(400, 400)]u8 = undefined;
     _ = scan(img, &scratch) catch return;
+}
+
+/// Apply the script's damage to `pixels` and return how many octets it wrote.
+/// Lifted out of the harness so the corpus guard measures the SAME damage the
+/// harness applies — a guard measuring a different generator is not a guard.
+fn damage(c: *kit.Cursor, pixels: []u8, width: u32) usize {
+    const blobs = c.ranged(0, 60);
+    var written: usize = 0;
+    for (0..blobs) |_| {
+        // Fractions of the image, so a script need not know the side length.
+        const x = @as(usize, c.byte()) * (width - 1) / 255;
+        const y = @as(usize, c.byte()) * (width - 1) / 255;
+        pixels[y * width + x] = c.byte();
+        written += 1;
+    }
+    return written;
+}
+
+test "corpus: every damage script writes the blobs it says, and the scans that still find a symbol are pinned" {
+    // ⭐ The measurement, executable. `blobs` is the second number and it is
+    // the load-bearing one: the pristine symbol scans SUCCESSFULLY, which is
+    // exactly what the collapsed harness did on every run, so a guard counting
+    // successful scans would have read 1 of 1 while no damage was ever
+    // applied. Octets written cannot be produced by an empty script.
+    var nonempty: usize = 0;
+    var blobs: usize = 0;
+    var found: usize = 0;
+    var m: qr.Matrix = undefined;
+    try qr.encode(&m, "FUZZ", .{});
+    for (damage_scripts) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [64]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var c = kit.Cursor{ .bytes = script[0..n] };
+
+        var pixels: [400 * 400]u8 = undefined;
+        const img = render(&m, 4, &pixels);
+        blobs += damage(&c, pixels[0 .. @as(usize, img.width) * img.height], img.width);
+
+        var scratch: [scratchSize(400, 400)]u8 = undefined;
+        if (scan(img, &scratch)) |_| found += 1 else |_| {}
+    }
+    // Measured 2026-09-07. Before: 1 round, 0 blobs, 1 scan of a pristine
+    // symbol.
+    try std.testing.expectEqual(damage_scripts.len - 1, nonempty); // the deliberate empty script
+    try std.testing.expectEqual(@as(usize, 131), blobs);
+    try std.testing.expectEqual(@as(usize, 7), found); // the damage is sparse enough that every script still scans — `blobs` above is the number that moves
 }
 
 test "lumaFromRgba uses the standard weights" {
