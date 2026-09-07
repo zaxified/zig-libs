@@ -19,6 +19,9 @@ const std = @import("std");
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const header = @import("header.zig");
 
 // ── RINGS ──────────────────────────────────────────────────────────────────
@@ -638,17 +641,167 @@ test "malformed parameter replies are typed errors, never a panic" {
     try testing.expectError(error.Truncated, parseRings(&.{ 0x40, 0x00, 0x02, 0x00 }));
 }
 
+/// RINGS / CHANNELS / COALESCE / PAUSE reply attribute lists for
+/// `fuzzParams`, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// ⭐ Built at run time by this file's own encoders rather than quoted as hex:
+/// these are netlink TLVs, whose lengths and scalars are HOST byte order, so a
+/// hex corpus would be a little-endian one and the counts pinned below would
+/// be false on a big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [4096]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A RINGS reply with a device header, two u32 knobs and a u8 boolean.
+        var rings: std.ArrayList(u8) = .empty;
+        try header.append(gpa, &rings, uapi.RINGS.HEADER, .{ .target = .byIndex(2) });
+        try codec.appendAttrU32(gpa, &rings, uapi.RINGS.RX_MAX, 4096);
+        try codec.appendAttrU32(gpa, &rings, uapi.RINGS.RX, 256);
+        try codec.appendAttrU8(gpa, &rings, uapi.RINGS.TX_PUSH, 0);
+        self.push(rings.items);
+
+        // CHANNELS through its own encoder.
+        var channels: std.ArrayList(u8) = .empty;
+        try appendChannelsSet(gpa, &channels, .{ .combined_count = 4, .rx_count = 1 });
+        self.push(channels.items);
+
+        // COALESCE: u32 knobs and u8 booleans together.
+        var coalesce: std.ArrayList(u8) = .empty;
+        try appendCoalesceSet(gpa, &coalesce, .{
+            .rx_usecs = 3,
+            .tx_max_frames = 16,
+            .use_adaptive_rx = true,
+            .use_cqe_mode_tx = false,
+        });
+        self.push(coalesce.items);
+
+        // PAUSE with the optional statistics nest, and without it.
+        var pause_stats: std.ArrayList(u8) = .empty;
+        try appendPauseSet(gpa, &pause_stats, .{ .autoneg = true, .rx = true, .tx = false });
+        try codec.appendAttrU32(gpa, &pause_stats, uapi.PAUSE.STATS_SRC, @intFromEnum(uapi.StatsSrc.pmac));
+        {
+            const nest = try codec.nestBegin(gpa, &pause_stats, uapi.PAUSE.STATS);
+            var v: [8]u8 = undefined;
+            std.mem.writeInt(u64, &v, 42, native_endian);
+            try codec.appendAttr(gpa, &pause_stats, uapi.PAUSE_STAT.TX_FRAMES, &v);
+            try codec.nestEnd(&pause_stats, nest);
+        }
+        self.push(pause_stats.items);
+        var pause_bare: std.ArrayList(u8) = .empty;
+        try appendPauseSet(gpa, &pause_bare, .{ .autoneg = true });
+        self.push(pause_bare.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A u32 field carrying one byte, and a u8 field carrying four.
+        self.push(&[_]u8{ 0x05, 0x00, 0x02, 0x00, 1, 0, 0, 0 });
+        self.push(&[_]u8{ 0x08, 0x00, 0x02, 0x00, 1, 0, 0, 0 });
+        // A four-octet "u64" counter inside the PAUSE_STATS nest.
+        self.push(&[_]u8{
+            0x0c, 0x00, 0x05, 0x80, // PAUSE_STATS nest
+            0x08, 0x00, 0x02, 0x00, 1, 0, 0, 0, // TX_FRAMES, only four octets
+        });
+        // A truncated TLV.
+        self.push(&[_]u8{ 0x40, 0x00, 0x02, 0x00 });
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: parameter decoders never crash" {
-    try testing.fuzz({}, fuzzParams, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzParams, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParams(_: void, smith: *std.testing.Smith) !void {
     var raw: [256]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all four decoders were handed an empty
+    // attribute list with the reply sitting unread in `raw`.
+    //
+    // ⛔ And it looked HEALTHIER that way: every field of every one of these
+    // replies is optional — "absent attributes stay null (n/a)" is the test
+    // above — so all four decoders SUCCEEDED on the empty slice every round.
+    // Measured 2026-09-07 over the corpus above: **0 of 9 seeds non-empty, 36
+    // of 36 (seed, decoder) pairs "decoded" and 0 fields recovered before; 9
+    // of 9 non-empty, 15 pairs decoded and 22 fields after.** The pair count
+    // went DOWN, which is the point: the empty reply is accepted by all four
+    // decoders and a real one is not.
+    const len: usize = smith.slice(&raw);
     const buf = raw[0..len];
     if (parseRings(buf)) |v| std.mem.doNotOptimizeAway(&v) else |_| {}
     if (parseChannels(buf)) |v| std.mem.doNotOptimizeAway(&v) else |_| {}
     if (parseCoalesce(buf)) |v| std.mem.doNotOptimizeAway(&v) else |_| {}
     if (parsePause(buf)) |v| std.mem.doNotOptimizeAway(&v) else |_| {}
+}
+
+test "corpus: every parameter seed reaches all four decoders, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here — this file has a test called "empty bitset decodes to an empty
+    // set, not an error" — so "parsed" alone counts a harness that walks
+    // nothing as a complete success.
+    //
+    // `fields` is that second number here: it counts the optional fields the
+    // four decoders actually recovered, which is 0 for the empty reply they
+    // all accept.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var fields: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [256]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const buf = raw[0..len];
+        if (parseRings(buf)) |v| {
+            decoded += 1;
+            if (v.rx != null) fields += 1;
+            if (v.rx_max != null) fields += 1;
+            if (v.tx_push != null) fields += 1;
+        } else |_| {}
+        if (parseChannels(buf)) |v| {
+            decoded += 1;
+            if (v.combined_count != null) fields += 1;
+            if (v.rx_count != null) fields += 1;
+        } else |_| {}
+        if (parseCoalesce(buf)) |v| {
+            decoded += 1;
+            if (v.rx_usecs != null) fields += 1;
+            if (v.tx_max_frames != null) fields += 1;
+            if (v.use_adaptive_rx != null) fields += 1;
+            if (v.use_cqe_mode_tx != null) fields += 1;
+        } else |_| {}
+        if (parsePause(buf)) |v| {
+            decoded += 1;
+            if (v.autoneg != null) fields += 1;
+            if (v.rx != null) fields += 1;
+            if (v.tx != null) fields += 1;
+            if (v.stats_src != null) fields += 1;
+            if (v.stats != null) fields += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 15), decoded);
+    try testing.expectEqual(@as(usize, 22), fields);
 }

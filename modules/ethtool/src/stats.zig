@@ -37,6 +37,9 @@ const std = @import("std");
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const header = @import("header.zig");
 const bitset = @import("bitset.zig");
 const params = @import("params.zig");
@@ -609,14 +612,167 @@ test "STRSET selector encodes one nest per requested set" {
     try testing.expectEqual(@as(usize, 2), n);
 }
 
+/// STATS_GET and STRSET_GET reply attribute lists for `fuzzStats`, in the
+/// format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// ⭐ Built at run time by this file's own encoders rather than quoted as hex:
+/// these are trees of netlink TLVs, whose lengths and scalars are HOST byte
+/// order, so a hex corpus would be a little-endian one and the counts pinned
+/// below would be false on a big-endian target instead of failing there.
+const Corpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // One eth-mac group with two counters, keyed by attribute type.
+        var eth_mac: std.ArrayList(u8) = .empty;
+        {
+            const grp = try codec.nestBegin(gpa, &eth_mac, uapi.STATS.GRP);
+            try codec.appendAttrU32(gpa, &eth_mac, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.eth_mac));
+            try codec.appendAttrU32(gpa, &eth_mac, uapi.STATS_GRP.SS_ID, @intFromEnum(uapi.StringSetId.stats_eth_mac));
+            for ([_]struct { id: u16, v: u64 }{ .{ .id = 0, .v = 1234 }, .{ .id = 3, .v = 5678 } }) |s| {
+                const one = try codec.nestBegin(gpa, &eth_mac, uapi.STATS_GRP.STAT);
+                try appendU64(gpa, &eth_mac, s.id, s.v);
+                try codec.nestEnd(&eth_mac, one);
+            }
+            try codec.nestEnd(&eth_mac, grp);
+        }
+        self.push(eth_mac.items);
+
+        // The rmon histograms, rx and tx, including an open-ended bucket.
+        var rmon: std.ArrayList(u8) = .empty;
+        {
+            const grp = try codec.nestBegin(gpa, &rmon, uapi.STATS.GRP);
+            try codec.appendAttrU32(gpa, &rmon, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.rmon));
+            for ([_]HistBucket{
+                .{ .low = 64, .hi = 64, .value = 10 },
+                .{ .low = 65, .hi = 127, .value = 20 },
+                .{ .low = 1024, .hi = 0, .value = 30 },
+            }) |b| {
+                const one = try codec.nestBegin(gpa, &rmon, uapi.STATS_GRP.HIST_RX);
+                try codec.appendAttrU32(gpa, &rmon, uapi.STATS_GRP.HIST_BKT_LOW, b.low);
+                try codec.appendAttrU32(gpa, &rmon, uapi.STATS_GRP.HIST_BKT_HI, b.hi);
+                try appendU64(gpa, &rmon, uapi.STATS_GRP.HIST_VAL, b.value);
+                try codec.nestEnd(&rmon, one);
+            }
+            {
+                const one = try codec.nestBegin(gpa, &rmon, uapi.STATS_GRP.HIST_TX);
+                try codec.appendAttrU32(gpa, &rmon, uapi.STATS_GRP.HIST_BKT_LOW, 64);
+                try appendU64(gpa, &rmon, uapi.STATS_GRP.HIST_VAL, 7);
+                try codec.nestEnd(&rmon, one);
+            }
+            try codec.nestEnd(&rmon, grp);
+        }
+        self.push(rmon.items);
+
+        // A group with no counters: a normal reply, not an error.
+        var empty_group: std.ArrayList(u8) = .empty;
+        {
+            const grp = try codec.nestBegin(gpa, &empty_group, uapi.STATS.GRP);
+            try codec.appendAttrU32(gpa, &empty_group, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.eth_ctrl));
+            try codec.appendAttrU32(gpa, &empty_group, uapi.STATS_GRP.SS_ID, 19);
+            try codec.nestEnd(&empty_group, grp);
+        }
+        self.push(empty_group.items);
+
+        // A string set with two indexed strings.
+        var strset: std.ArrayList(u8) = .empty;
+        {
+            const sets = try codec.nestBegin(gpa, &strset, uapi.STRSET.STRINGSETS);
+            const one = try codec.nestBegin(gpa, &strset, uapi.STRINGSETS.STRINGSET);
+            try codec.appendAttrU32(gpa, &strset, uapi.STRINGSET.ID, @intFromEnum(uapi.StringSetId.stats_std));
+            try codec.appendAttrU32(gpa, &strset, uapi.STRINGSET.COUNT, 2);
+            const strings = try codec.nestBegin(gpa, &strset, uapi.STRINGSET.STRINGS);
+            for ([_][]const u8{ "eth-phy", "eth-mac" }, 0..) |s, i| {
+                const str = try codec.nestBegin(gpa, &strset, uapi.STRINGS.STRING);
+                try codec.appendAttrU32(gpa, &strset, uapi.STRING.INDEX, @intCast(i));
+                try codec.appendAttrString(gpa, &strset, uapi.STRING.VALUE, s);
+                try codec.nestEnd(&strset, str);
+            }
+            try codec.nestEnd(&strset, strings);
+            try codec.nestEnd(&strset, one);
+            try codec.nestEnd(&strset, sets);
+        }
+        self.push(strset.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A string with a value but no index: refused, never mis-aligned.
+        var no_index: std.ArrayList(u8) = .empty;
+        {
+            const sets = try codec.nestBegin(gpa, &no_index, uapi.STRSET.STRINGSETS);
+            const one = try codec.nestBegin(gpa, &no_index, uapi.STRINGSETS.STRINGSET);
+            const strings = try codec.nestBegin(gpa, &no_index, uapi.STRINGSET.STRINGS);
+            const str = try codec.nestBegin(gpa, &no_index, uapi.STRINGS.STRING);
+            try codec.appendAttrString(gpa, &no_index, uapi.STRING.VALUE, "no-index");
+            try codec.nestEnd(&no_index, str);
+            try codec.nestEnd(&no_index, strings);
+            try codec.nestEnd(&no_index, one);
+            try codec.nestEnd(&no_index, sets);
+        }
+        self.push(no_index.items);
+
+        // An absurd COUNT that must not become an allocation.
+        var absurd: std.ArrayList(u8) = .empty;
+        {
+            const sets = try codec.nestBegin(gpa, &absurd, uapi.STRSET.STRINGSETS);
+            const one = try codec.nestBegin(gpa, &absurd, uapi.STRINGSETS.STRINGSET);
+            try codec.appendAttrU32(gpa, &absurd, uapi.STRINGSET.COUNT, 0xffff_ffff);
+            try codec.nestEnd(&absurd, one);
+            try codec.nestEnd(&absurd, sets);
+        }
+        self.push(absurd.items);
+
+        // A counter that is not eight octets, and a truncated TLV.
+        var narrow: std.ArrayList(u8) = .empty;
+        {
+            const grp = try codec.nestBegin(gpa, &narrow, uapi.STATS.GRP);
+            try codec.appendAttrU32(gpa, &narrow, uapi.STATS_GRP.ID, @intFromEnum(uapi.StatsGroup.eth_mac));
+            const one = try codec.nestBegin(gpa, &narrow, uapi.STATS_GRP.STAT);
+            try codec.appendAttrU32(gpa, &narrow, 0, 1234);
+            try codec.nestEnd(&narrow, one);
+            try codec.nestEnd(&narrow, grp);
+        }
+        self.push(narrow.items);
+        self.push(&[_]u8{ 0x40, 0x00, 0x02, 0x00 });
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: statistics and string-set decoding never crash or leak" {
-    try testing.fuzz({}, fuzzStats, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzStats, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzStats(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and both decoders were handed an empty
+    // attribute list with the reply sitting unread in `raw`.
+    //
+    // ⛔ And it looked HEALTHIER that way: a reply with no groups and no
+    // string sets is a legal one, so both decoders SUCCEEDED on the empty
+    // slice every round while allocating nothing and walking nothing.
+    // Measured 2026-09-07 over the corpus above: **0 of 8 seeds non-empty, 8
+    // of 8 stats replies and 8 of 8 string-set replies "decoded", 0 groups and
+    // 0 strings recovered before; 8 of 8 non-empty, 3 and 5 decoded, 3 groups
+    // and 2 strings after.**
+    const len: usize = smith.slice(&raw);
     const buf = raw[0..len];
     if (parse(testing.allocator, buf)) |s| {
         var v = s;
@@ -626,4 +782,49 @@ fn fuzzStats(_: void, smith: *std.testing.Smith) !void {
         var v = s;
         v.deinit(testing.allocator);
     } else |_| {}
+}
+
+test "corpus: every stats seed reaches both decoders, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here — this file has a test called "empty bitset decodes to an empty
+    // set, not an error" — so "parsed" alone counts a harness that walks
+    // nothing as a complete success.
+    //
+    // `groups` and `strings` are those second numbers: both are 0 for the
+    // empty reply the two decoders accept.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var stats_ok: usize = 0;
+    var strset_ok: usize = 0;
+    var groups: usize = 0;
+    var strings: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const buf = raw[0..len];
+        if (parse(testing.allocator, buf)) |s| {
+            stats_ok += 1;
+            var v = s;
+            groups += v.groups.len;
+            v.deinit(testing.allocator);
+        } else |_| {}
+        if (parseStringSets(testing.allocator, buf)) |s| {
+            strset_ok += 1;
+            var v = s;
+            for (v.sets) |one| strings += one.entries.len;
+            v.deinit(testing.allocator);
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), stats_ok);
+    try testing.expectEqual(@as(usize, 5), strset_ok);
+    try testing.expectEqual(@as(usize, 3), groups);
+    try testing.expectEqual(@as(usize, 2), strings);
 }

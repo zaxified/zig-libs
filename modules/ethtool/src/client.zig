@@ -43,6 +43,9 @@ const codec = netlink.codec;
 const genl = @import("genetlink");
 
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 const header = @import("header.zig");
 const bitset = @import("bitset.zig");
 const link = @import("link.zig");
@@ -1209,20 +1212,145 @@ test "waitForNotification errors out instead of looping forever on foreign traff
     );
 }
 
+/// Notification attribute lists for `fuzzNotification`, laid out the way its
+/// draws read them: a `testkit.fuzz` slice seed (u32 length + bytes) and then
+/// an eight-octet little-endian word carrying the ethtool command byte.
+///
+/// ⭐ Built at run time by this module's own encoders rather than quoted as
+/// hex: these are netlink TLVs, whose lengths and scalars are HOST byte order,
+/// so a hex corpus would be a little-endian one and the counts pinned below
+/// would be false on a big-endian target instead of failing there.
+///
+/// ⛔ The command word is not decoration. `cmd` is the only thing
+/// `Notification.isNotification()` reads, and it used to be drawn with
+/// `valueRangeAtMost(u8, 0, 255)` — the range minimum, i.e. **0 for every
+/// seed**, which is not an ethtool reply command at all.
+const Corpus = struct {
+    scratch: [4096]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *Corpus, frame: []const u8, cmd: u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], cmd, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A RINGS notification: a device header plus a payload the ordinary
+        // typed parser can decode afterwards.
+        var rings: std.ArrayList(u8) = .empty;
+        try header.append(gpa, &rings, uapi.RINGS.HEADER, .{ .target = .byIndex(2) });
+        try codec.appendAttrU32(gpa, &rings, uapi.RINGS.RX, 512);
+        self.push(rings.items, uapi.REPLY.RINGS_NTF);
+        // The same bytes under a GET reply command: not a notification.
+        self.push(rings.items, uapi.REPLY.RINGS_GET);
+
+        // A message with no header nest at all: no device.
+        var headerless: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &headerless, 99, 1);
+        self.push(headerless.items, uapi.REPLY.LINKSTATE_GET);
+
+        // An nlctrl reply carrying the mcast groups — the other half of the
+        // harness, which `findMcastGroupId` walks.
+        var groups: std.ArrayList(u8) = .empty;
+        {
+            const outer = try codec.nestBegin(gpa, &groups, genl.CTRL_ATTR_MCAST_GROUPS);
+            for ([_]struct { n: []const u8, id: u32 }{
+                .{ .n = "monitor", .id = 17 },
+                .{ .n = "other", .id = 18 },
+            }, 1..) |g, idx| {
+                const one = try codec.nestBegin(gpa, &groups, @intCast(idx));
+                try codec.appendAttrString(gpa, &groups, genl.CTRL_ATTR_MCAST_GRP_NAME, g.n);
+                try codec.appendAttrU32(gpa, &groups, genl.CTRL_ATTR_MCAST_GRP_ID, g.id);
+                try codec.nestEnd(&groups, one);
+            }
+            try codec.nestEnd(&groups, outer);
+        }
+        self.push(groups.items, uapi.REPLY.RINGS_NTF);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A TLV header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 }, uapi.REPLY.RINGS_NTF);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: notification parsing never crashes" {
-    try testing.fuzz({}, fuzzNotification, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzNotification, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzNotification(_: void, smith: *std.testing.Smith) !void {
     var raw_buf: [256]u8 = undefined;
-    smith.bytes(&raw_buf);
-    const len = smith.valueRangeAtMost(u16, 0, raw_buf.len);
-    const cmd = smith.valueRangeAtMost(u8, 0, 255);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw_buf.len, in.len)` octets and the ranged
+    // draw then finds fewer than the eight it needs and returns the range
+    // MINIMUM, so `len` was 0 for every seed and both `parseNotification` and
+    // `findMcastGroupId` were handed an empty attribute list. `cmd` had the
+    // same defect and the same cause; it is a full-width `value(u64)` now,
+    // carried in the seed.
+    //
+    // ⛔ And it looked HEALTHIER that way: a notification with no attributes
+    // is a legal one, so `parseNotification` SUCCEEDED every round. Measured
+    // 2026-09-07 over the corpus above: **0 of 5 seeds non-empty, 5 of 5
+    // "parsed", 0 recognised as notifications and 0 group ids found before; 5
+    // of 5 non-empty, 4 parsed, 2 recognised and 1 group id after.**
+    const len: usize = smith.slice(&raw_buf);
+    const cmd: u8 = @truncate(smith.value(u64));
     if (parseNotification(testing.allocator, cmd, raw_buf[0..len])) |n| {
         var v = n;
         v.deinit(testing.allocator);
     } else |_| {}
     if (findMcastGroupId(raw_buf[0..len], "monitor")) |g| std.mem.doNotOptimizeAway(&g) else |_| {}
+}
+
+test "corpus: every notification seed reaches both parsers, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here — this file has a test called "empty bitset decodes to an empty
+    // set, not an error" — so "parsed" alone counts a harness that walks
+    // nothing as a complete success.
+    //
+    // `notifications` is the number that proves the command byte arrived: it
+    // is false for `cmd == 0`, which is what the collapsed draw produced.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var notifications: usize = 0;
+    var groups: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw_buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&raw_buf);
+        const cmd: u8 = @truncate(smith.value(u64));
+        if (len != 0) nonempty += 1;
+        if (parseNotification(testing.allocator, cmd, raw_buf[0..len])) |n| {
+            parsed += 1;
+            var v = n;
+            if (v.isNotification()) notifications += 1;
+            v.deinit(testing.allocator);
+        } else |_| {}
+        if (findMcastGroupId(raw_buf[0..len], "monitor")) |g| {
+            if (g != null) groups += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), parsed);
+    try testing.expectEqual(@as(usize, 2), notifications);
+    try testing.expectEqual(@as(usize, 1), groups);
 }
 
 // W2 re-audit 2026-09-02 (`ethtool` F6): the C-10 check was wired into

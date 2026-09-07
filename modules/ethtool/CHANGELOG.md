@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **all four fuzz harnesses fetched their input and threw it away — and the
+  collapse made them look perfect.** Each opened `smith.bytes(&raw)` and then sliced the buffer
+  to `smith.valueRangeAtMost(u16, 0, raw.len)`; a `Smith` ranged draw reads eight input octets
+  as a little-endian u64 and returns the range MINIMUM unless that word already lies inside the
+  range, so the length was 0 for every seed and every decoder ran on an empty attribute list.
+  ⛔ And an empty list is a **legal** reply throughout this module — `bitset.zig` even has a
+  test called "empty bitset decodes to an empty set, not an error", and `params.zig` has
+  "absent attributes stay null (n/a), they do not become zero". Measured with the old draws in
+  place against the new corpora: `fuzzBitset` 10 of 10 "parsed", `fuzzParams` **36 of 36**
+  (seed, decoder) pairs decoded, `fuzzStats` 8 of 8 twice over, `fuzzNotification` 5 of 5 — a
+  clean sheet, with **0 bits set, 0 fields recovered, 0 statistics groups, 0 strings and 0
+  mcast group ids.** All four now draw with one `smith.slice` call and carry a corpus built at
+  run time by this module's own encoders (an ethtool attribute is a netlink TLV, whose length
+  and scalars are HOST byte order). After: `fuzzBitset` 5 parsed and 11 bits set; `fuzzParams`
+  15 pairs decoded and 22 fields recovered — the pair count went *down*, which is the point;
+  `fuzzStats` 3 stats and 5 string-set replies, 3 groups and 2 strings; `fuzzNotification` 4
+  parsed, 2 recognised as notifications and 1 group id. Each harness carries a corpus guard
+  pinning both numbers.
+- **2026-09-07** — two knob draws with the same defect. `client.fuzzNotification` drew the
+  ethtool reply command with `valueRangeAtMost(u8, 0, 255)`, so `cmd` was **0 on every round**
+  and `Notification.isNotification()` was false for every input the harness ever built.
+  `bitset.fuzzBitset` drew its bit index with `valueRangeAtMost(u32, 0, 100_000)`, so `isSet`,
+  `inMask` and `nameOf` were asked about **bit 0** every time — the one index that reaches no
+  bounds arithmetic in any of the three. Both are full-width `smith.value(u64)` draws now and
+  both travel in the seed.
+
 - **2026-09-02** — Drift re-audit (W2, window `d163578..HEAD`). Six findings, all fixed:
 
   - **Breaking (error set):** the bitset encoders (`appendCompact`, `appendNameList`,

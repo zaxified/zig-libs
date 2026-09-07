@@ -66,6 +66,9 @@ const std = @import("std");
 const netlink = @import("netlink");
 const codec = netlink.codec;
 const uapi = @import("uapi.zig");
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 pub const Error = codec.Error || error{OutOfMemory};
 
@@ -704,23 +707,188 @@ test "empty bitset decodes to an empty set, not an error" {
     try testing.expectEqual(Bitset.Encoding.compact, bs.encoding());
 }
 
+/// `ETHTOOL_A_*_BITSET` nest bodies for `fuzzBitset`, laid out the way its
+/// draws read them: a `testkit.fuzz` slice seed (u32 length + bytes) and then
+/// an eight-octet little-endian word carrying the bit index to probe.
+///
+/// ⭐ Built at run time by this file's own encoders rather than quoted as hex:
+/// a bitset is a tree of netlink TLVs, whose lengths and scalars are HOST byte
+/// order, so a hex corpus would be a little-endian one and the counts pinned
+/// below would be false on a big-endian target instead of failing there.
+///
+/// ⛔ The probe word is not decoration. `isSet`, `inMask` and `nameOf` all take
+/// a bit index, and it used to be drawn with `valueRangeAtMost(u32, 0, 100_000)`
+/// — the range minimum, i.e. **bit 0 on every seed**. Bit 0 of the first word
+/// is the one index that needs no arithmetic to reach; every bounds check in
+/// those three accessors was untested by this harness.
+const BitsetCorpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    probes: [10]u32 = undefined,
+    n: usize = 0,
+
+    fn push(self: *BitsetCorpus, frame: []const u8, probe: u32) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], probe, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.probes[self.n] = probe;
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    /// The nest BODY, which is what `parse` takes — one level in from what
+    /// `appendCompact` and friends emit.
+    fn body(list: *std.ArrayList(u8)) ![]const u8 {
+        var it: codec.AttrIterator = .{ .buf = list.items };
+        return ((try it.next()) orelse return error.BadLength).data;
+    }
+
+    fn build(self: *BitsetCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // Compact, value + mask, 64 bits. Probed at 63 — the last bit of the
+        // second word, which bit 0 can never stand in for.
+        var compact: std.ArrayList(u8) = .empty;
+        try appendCompact(gpa, &compact, 3, 64, &[_]u32{ 0b1011, 0x8000_0001 }, &[_]u32{ 0xffff_ffff, 0x8000_000f });
+        self.push(try body(&compact), 63);
+
+        // Compact, NOMASK. Probed past SIZE, where `inMask` must say no.
+        var nomask: std.ArrayList(u8) = .empty;
+        try appendCompact(gpa, &nomask, 4, 32, &[_]u32{0b0101}, null);
+        self.push(try body(&nomask), 32);
+
+        // Verbose, name-keyed list (the `--groups` shape).
+        var names: std.ArrayList(u8) = .empty;
+        try appendNameList(gpa, &names, 3, &.{ "eth-mac", "rmon" });
+        self.push(try body(&names), 1);
+
+        // Verbose, name-keyed values (the `-K` shape).
+        var named_values: std.ArrayList(u8) = .empty;
+        try appendNamedValues(gpa, &named_values, 3, &.{
+            .{ .name = "tx-tcp-segmentation", .on = false },
+            .{ .name = "rx-checksum", .on = true },
+        });
+        self.push(try body(&named_values), 0);
+
+        // Verbose, index-keyed values.
+        var indexed: std.ArrayList(u8) = .empty;
+        try appendIndexedValues(gpa, &indexed, 3, &.{
+            .{ .index = uapi.LINK_MODE.@"1000baseT_Full", .on = true },
+            .{ .index = uapi.LINK_MODE.@"100baseT_Full", .on = false },
+        });
+        self.push(try body(&indexed), uapi.LINK_MODE.@"1000baseT_Full");
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // SIZE says 64 bits but VALUE carries one word.
+        var contradiction: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &contradiction, uapi.BITSET.SIZE, 64);
+        try appendWords(gpa, &contradiction, uapi.BITSET.VALUE, &.{0});
+        self.push(contradiction.items, 0);
+        // NOMASK together with a MASK.
+        var both: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &both, uapi.BITSET.NOMASK, &.{});
+        try appendWords(gpa, &both, uapi.BITSET.MASK, &.{0});
+        self.push(both.items, 0);
+        // An absurd SIZE that must not become an allocation.
+        var absurd: std.ArrayList(u8) = .empty;
+        try codec.appendAttrU32(gpa, &absurd, uapi.BITSET.SIZE, 0xffff_ffff);
+        self.push(absurd.items, 0);
+        // A truncated TLV in the nest, and a bit index past the ceiling.
+        self.push(&[_]u8{ 0x40, 0x00, 0x03, 0x00, 0x01 }, 0);
+        var past_ceiling: std.ArrayList(u8) = .empty;
+        {
+            const bits = try codec.nestBegin(gpa, &past_ceiling, uapi.BITSET.BITS);
+            const bit = try codec.nestBegin(gpa, &past_ceiling, uapi.BITSET_BITS.BIT);
+            try codec.appendAttrU32(gpa, &past_ceiling, uapi.BITSET_BIT.INDEX, max_bits);
+            try codec.nestEnd(&past_ceiling, bit);
+            try codec.nestEnd(&past_ceiling, bits);
+        }
+        self.push(past_ceiling.items, max_bits);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: bitset decoding never crashes or over-reads" {
-    try testing.fuzz({}, fuzzBitset, .{});
+    var corpus: BitsetCorpus = .{};
+    try testing.fuzz({}, fuzzBitset, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzBitset(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an empty nest with
+    // the bitset sitting unread in `raw`.
+    //
+    // ⛔ And it looked HEALTHIER that way. The test twenty lines up says it in
+    // as many words: "empty bitset decodes to an empty set, not an error". So
+    // `parse("")` SUCCEEDED every round and the harness ran all six accessors
+    // on an empty `Bitset`. Measured 2026-09-07 over the corpus above: **0 of
+    // 10 seeds non-empty, 10 of 10 "parsed" and 0 bits set before; 10 of 10
+    // non-empty, 5 parsed and 11 bits set after.**
+    const len: usize = smith.slice(&raw);
     var bs = parse(testing.allocator, raw[0..len]) catch return;
     defer bs.deinit(testing.allocator);
-    const probe = smith.valueRangeAtMost(u32, 0, 100_000);
+    // ⚠ `value(u64)` and a `%`, not `valueRangeAtMost(u32, 0, 100_000)`: a
+    // ranged draw is the range minimum, so this probed bit 0 for every seed —
+    // the one index that reaches no bounds arithmetic in `isSet`, `inMask` or
+    // `nameOf`. The probe now travels in the seed. (Five of the ten seeds here
+    // probe bit 0 legitimately, which is why the guard pins the probe against
+    // what was written rather than merely against zero.)
+    const probe: u32 = @intCast(smith.value(u64) % 100_001);
     std.mem.doNotOptimizeAway(bs.isSet(probe));
     std.mem.doNotOptimizeAway(bs.inMask(probe));
     std.mem.doNotOptimizeAway(bs.count());
     _ = bs.nameOf(probe);
     _ = bs.byName("x");
     _ = bs.isSetByName("x");
+}
+
+test "corpus: every bitset seed reaches the parser, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. The second number
+    // is what the first cannot say: an empty attribute list is a legal reply
+    // here — this file has a test called "empty bitset decodes to an empty
+    // set, not an error" — so "parsed" alone counts a harness that walks
+    // nothing as a complete success.
+    //
+    // `probes` pins that the probe word arrived as written — without it the
+    // accessor half of the harness silently goes back to asking about bit 0.
+    var corpus: BitsetCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var set_bits: usize = 0;
+    var probes: usize = 0;
+    for (entries, corpus.probes[0..corpus.n]) |sd, want_probe| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        var bs = parse(testing.allocator, raw[0..len]) catch {
+            _ = smith.value(u64);
+            continue;
+        };
+        defer bs.deinit(testing.allocator);
+        parsed += 1;
+        const probe: u32 = @intCast(smith.value(u64) % 100_001);
+        if (probe == want_probe) probes += 1;
+        set_bits += bs.count();
+        std.mem.doNotOptimizeAway(bs.isSet(probe));
+        std.mem.doNotOptimizeAway(bs.inMask(probe));
+        _ = bs.nameOf(probe);
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 5), parsed);
+    try testing.expectEqual(@as(usize, 5), probes);
+    try testing.expectEqual(@as(usize, 11), set_bits);
 }
 
 // A nest whose payload does not fit the 16-bit `nla_len` used to be closed
