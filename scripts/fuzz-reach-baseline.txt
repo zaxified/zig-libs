@@ -109,7 +109,6 @@ snmp 3
 sntp 1
 spake2plus 1
 sphinx 1
-ssh 6
 staticfiles 1
 stun 1
 tar 1

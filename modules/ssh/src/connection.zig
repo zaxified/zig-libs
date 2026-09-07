@@ -31,6 +31,9 @@
 const std = @import("std");
 const transport = @import("transport.zig");
 const messages = @import("messages.zig");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 const Cursor = messages.Cursor;
 
@@ -1943,29 +1946,116 @@ fn channelOpenPayload(buf: []u8, sender: u32, window: u32, max_packet: u32) ![]c
 // layer is already trusted by the time they arrive) into the server loop,
 // which is where a peer's bytes are turned into channel ids, window
 // arithmetic and length-prefixed payloads.
+/// ⛔ What this harness used to do, and why none of it happened. Its first draw
+/// was `valueRangeAtMost(u8, 1, 6)` — the range minimum, **1** — so it built one
+/// message; the type came from `boolWeighted(4, 1)`, false at the minimum, so
+/// the `else` arm's `valueRangeAtMost(u8, 0, 255)` gave **0**; and the body
+/// length was 0 too. With no corpus the target therefore replayed exactly one
+/// input for ever: a single packet whose whole payload is the octet `0x00`.
+/// Message type 0 is not in 90..100, so it fell straight through to
+/// `else => ProtocolError` — and the comment above, which says this harness
+/// exists because "the entire §5/§6 message layer had zero fuzz coverage",
+/// was describing the state it left behind rather than the one it created.
+///
+/// ⭐ The seed is now a LIST of channel-message payloads, each a
+/// `testkit.fuzz` slice seed, terminated by a zero-length one. The first draw
+/// is bytes, so the reach gate is satisfied honestly; the number of messages
+/// and their contents both come out of the seed; and the positive entries are
+/// built by this file's own `channelOpenPayload` and the RFC 4254 writers,
+/// because a channel message is a type octet plus length-prefixed fields and
+/// arbitrary bytes are not one.
+const SessionCorpus = struct {
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [7][]const u8 = undefined,
+    counts: [7]usize = undefined,
+    n: usize = 0,
+
+    fn push(self: *SessionCorpus, payloads: []const []const u8) void {
+        const start = self.used;
+        var at = start;
+        for (payloads) |p| at += testkit.fuzz.seedInto(self.store[at..], p).len;
+        at += testkit.fuzz.seedInto(self.store[at..], "").len; // the terminator
+        self.entries[self.n] = self.store[start..at];
+        self.counts[self.n] = payloads.len;
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn dataPayload(buf: []u8, recipient: u32, body: []const u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_DATA)) catch unreachable;
+        writeU32(&w, recipient) catch unreachable;
+        messages.writeString(&w, body) catch unreachable;
+        return w.buffered();
+    }
+
+    fn execPayload(buf: []u8, recipient: u32, command: []const u8) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_REQUEST)) catch unreachable;
+        writeU32(&w, recipient) catch unreachable;
+        messages.writeString(&w, "exec") catch unreachable;
+        w.writeByte(1) catch unreachable; // want_reply
+        messages.writeString(&w, command) catch unreachable;
+        return w.buffered();
+    }
+
+    fn onePayload(buf: []u8, mt: messages.MessageType, recipient: u32) []const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        w.writeByte(@intFromEnum(mt)) catch unreachable;
+        writeU32(&w, recipient) catch unreachable;
+        return w.buffered();
+    }
+
+    fn build(self: *SessionCorpus) []const []const u8 {
+        var b1: [64]u8 = undefined;
+        const open = channelOpenPayload(&b1, 7, 64, 128) catch unreachable;
+        var b2: [128]u8 = undefined;
+        const exec_req = execPayload(&b2, 0, "hello");
+        var b3: [64]u8 = undefined;
+        const eof = onePayload(&b3, .SSH_MSG_CHANNEL_EOF, 0);
+        var b4: [64]u8 = undefined;
+        const close = onePayload(&b4, .SSH_MSG_CHANNEL_CLOSE, 0);
+        var b5: [128]u8 = undefined;
+        const data = dataPayload(&b5, 0, "stdin bytes");
+        var b6: [128]u8 = undefined;
+        const overrun = dataPayload(&b6, 0, &([_]u8{0x41} ** 100));
+
+        // A complete, well-formed session: open, stdin, exec, eof, close.
+        self.push(&.{ open, data, exec_req, eof, close });
+        // Open and nothing else: the server must confirm and then meet EOF.
+        self.push(&.{open});
+        // ⭐ 100 octets of CHANNEL_DATA against the 64-octet window this
+        // harness advertises — the flow-control arithmetic the old draws could
+        // not reach, since they never produced a CHANNEL_DATA at all.
+        self.push(&.{ open, overrun });
+        // Channel messages for a channel that was never opened.
+        self.push(&.{ data, close });
+        // A CHANNEL_OPEN truncated to its type octet.
+        self.push(&.{open[0..1]});
+        // The single `0x00` payload the target replayed on every round.
+        self.push(&.{&[_]u8{0}});
+        self.push(&.{});
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: serveSession never panics on an arbitrary channel message stream" {
-    try std.testing.fuzz({}, fuzzServeSession, .{});
+    var corpus: SessionCorpus = .{};
+    try std.testing.fuzz({}, fuzzServeSession, .{ .corpus = corpus.build() });
 }
 
 fn fuzzServeSession(_: void, smith: *std.testing.Smith) !void {
     var payload_store: [6][192]u8 = undefined;
     var payloads: [6][]const u8 = undefined;
-    const n: usize = smith.valueRangeAtMost(u8, 1, @intCast(payloads.len));
-    for (0..n) |i| {
-        var w: std.Io.Writer = .fixed(&payload_store[i]);
-        // Bias the message type into the channel range (90..100) so the
-        // budget is spent inside RFC 4254 handling rather than bouncing off
-        // the `else => ProtocolError` arm.
-        const mt: u8 = if (smith.boolWeighted(4, 1))
-            smith.valueRangeAtMost(u8, 90, 100)
-        else
-            smith.valueRangeAtMost(u8, 0, 255);
-        w.writeByte(mt) catch return;
-        var body: [160]u8 = undefined;
-        const present: usize = smith.valueRangeAtMost(u8, 0, @intCast(body.len));
-        smith.bytes(body[0..present]);
-        w.writeAll(body[0..present]) catch return;
-        payloads[i] = w.buffered();
+    // ⚠ Bytes first, and the message COUNT out of the bytes: a zero-length
+    // payload ends the list. See `SessionCorpus` for what the ranged draws
+    // this replaced were actually producing.
+    var n: usize = 0;
+    while (n < payloads.len) : (n += 1) {
+        const len: usize = smith.slice(&payload_store[n]);
+        if (len == 0) break;
+        payloads[n] = payload_store[n][0..len];
     }
 
     var wire: [4096]u8 = undefined;
@@ -1984,6 +2074,47 @@ fn fuzzServeSession(_: void, smith: *std.testing.Smith) !void {
         .max_packet_size = 128,
         .max_input = 4096,
     }) catch return;
+}
+
+test "corpus: the serveSession seeds deliver real channel messages, counts pinned" {
+    // ⛔ Two numbers, neither of which the collapsed input could move.
+    // `delivered` is how many messages the seeds actually carried — it was 1
+    // on every round before, and one that never reached the channel layer.
+    // `reply_octets` is what the server WROTE back: a stream the server
+    // answers produces packets, and an unparseable one produces none, so it
+    // is the number that says the RFC 4254 handling ran at all.
+    var corpus: SessionCorpus = .{};
+    const entries = corpus.build();
+    var delivered: usize = 0;
+    var reply_octets: usize = 0;
+    for (entries, corpus.counts[0..corpus.n]) |sd, want| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var payload_store: [6][192]u8 = undefined;
+        var payloads: [6][]const u8 = undefined;
+        var n: usize = 0;
+        while (n < payloads.len) : (n += 1) {
+            const len: usize = smith.slice(&payload_store[n]);
+            if (len == 0) break;
+            payloads[n] = payload_store[n][0..len];
+        }
+        try std.testing.expectEqual(want, n);
+        delivered += n;
+        var wire: [4096]u8 = undefined;
+        const framed = framePackets(&wire, payloads[0..n]) catch continue;
+        var r: std.Io.Reader = .fixed(framed);
+        var sink_buf: [8192]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&sink_buf);
+        var tr = transport.Transport.init(&r, &sink);
+        serveSession(&tr, std.testing.allocator, .{
+            .exec = fuzz_label.handler(),
+            .window_size = 64,
+            .max_packet_size = 128,
+            .max_input = 4096,
+        }) catch {};
+        reply_octets += sink.buffered().len;
+    }
+    try std.testing.expectEqual(@as(usize, 12), delivered);
+    try std.testing.expectEqual(@as(usize, 280), reply_octets);
 }
 
 test "serveSession REJECT: a peer that overruns the advertised window" {

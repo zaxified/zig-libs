@@ -5,6 +5,45 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Test-only, neither BREAKING nor BEHAVIOURAL. All six fuzz
+  targets SYNTHESIZED their wire input from ranged `Smith` draws — a declared
+  length here, a message count there, a `boolWeighted` bias in between. A ranged
+  draw reads eight octets as a little-endian `u64` and returns the range MINIMUM
+  when the word does not land in range, and after the first short read `Smith`
+  discards the rest of the input, so every one of those draws was its minimum;
+  and no target had a corpus, so each replayed one input for ever. ⛔ Every
+  "bias" the comments described had therefore never fired once, and the comments
+  said so without anyone noticing: `readString` never reached the
+  `max_wire_string_len` boundary or the truncated-body case (declared length and
+  bytes present were both 0, so they always agreed); `readMpint` never took the
+  sign-pad-stripping branch it exists for (`raw.len > 1` was false);
+  `KexInit.decode` was handed eleven EMPTY name-lists, so `readListOwned`'s
+  errdefer unwind never ran; `readPacket` was handed the four octets
+  `00 00 00 00` and never reached the padding-length or payload-slicing
+  arithmetic; and both server loops — `serveSession` and `serveUserauth` — were
+  handed a single packet whose entire payload is the octet `0x00`, so the
+  channel range 90..100 and `SSH_MSG_USERAUTH_REQUEST` were never produced, and
+  `servePublickey`, which the harness's own comment calls "the highest-value
+  fuzz entry in the file", had never been entered. Every target now draws its
+  frame WHOLE with `smith.slice` — for the two server loops as a LIST of
+  length-prefixed payloads terminated by a zero-length one, so the message count
+  comes out of the seed's own octets too — and every corpus is built by this
+  module's own writers (`KexInit.encode`, `transport.writePacket`,
+  `channelOpenPayload`, `messages.writeString`), because a KEXINIT is eleven
+  chained name-lists and a USERAUTH_REQUEST five chained strings, and arbitrary
+  bytes are neither. Each target has a `corpus:` guard pinning the measured
+  counts plus a second number the degenerate input cannot produce — octets
+  returned, algorithm names recovered, payload octets framed, sign pads actually
+  stripped, and for the two server loops the octets the server WROTE BACK.
+  Measured 1 replayed input and 0 of every second number before; after:
+  `readString` 8 non-empty seeds / 3 accepted / 705 octets / 2 `StringTooLarge`;
+  `readMpint` 8 / 6 / 100 octets / **4 sign pads stripped**; `KexInit.decode`
+  7 / 3 accepted / 14 algorithm names; `readPacket` 7 / 3 / 232 payload octets;
+  `serveSession` 12 channel messages delivered / 280 octets of server replies;
+  `serveUserauth` 7 requests delivered / 1 authenticated / 232 octets of
+  replies. Verified: `zig build test-ssh --summary all` 128/128; `zig build
+  test-netconf` (the consumer) 73 pass, 2 skip; `check-fuzz-reach` ssh 6
+  collapsed → 0.
 - **2026-08-22** — RFC 8308 extension negotiation, both roles. Fixes a real
   interoperability defect: a real OpenSSH client would not authenticate with an
   RSA user key against this server at all. BREAKING in one small place —
