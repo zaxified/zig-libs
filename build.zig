@@ -272,7 +272,7 @@ const module_list = [_]Module{
     .{ .name = "slhdsa", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "falcon", .libs = &.{"crypto"} },
     .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true },
-    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" } },
+    .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"} },
     .{ .name = "tlsresume", .libs = &.{"crypto"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{"chachapoly"} },
     .{ .name = "sandbox", .libs = &.{"os"} },

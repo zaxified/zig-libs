@@ -5,6 +5,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the record-layer fuzz targets
+  stop throwing their input away, and the module gains a corpus source built
+  from the recorded wolfSSL transcript (`src/fuzz_corpus.zig`).
+
+  `fuzzDecodeUnified` and `fuzzDecodePlaintext` both opened with
+  `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u8, 0, buf.len)`.
+  `Smith.bytes` consumes `@min(buf.len, in.len)` octets, so the ranged draw
+  found fewer than the eight it reads as a little-endian `u64` and returned the
+  range MINIMUM: `len` was **0 for every input**, and both decoders were handed
+  an empty slice. Neither target declared a corpus either, so outside `--fuzz`
+  the runner replayed exactly one input each — the empty one. Measured
+  2026-09-07: **0 of 30 / 0 of 15 seeds non-empty and 0 headers decoded before;
+  92 of 92 and 22 of 22 non-empty, 85 and 21 decoded after.**
+
+  Two knobs went the same way, both drawn after the byte draw and therefore
+  after the input was exhausted: the `boolWeighted(1, 6)` that was supposed to
+  bias byte 0 into the valid fixed-bit pattern had **never executed once**, and
+  the negotiated CID length was 0 on every call — so `decodeUnified`'s entire
+  `has_cid` arm, `error.UnsupportedCidLength` included, was unreachable from its
+  own harness. Both now come out of one full-width `smith.value(u64)` carried in
+  the seed's tail, and the corpus guard pins 4 headers decoded WITH a CID.
+
+  `src/fuzz_corpus.zig` reads the 120 recorded datagrams out of
+  `src/testdata/wolfssl_transcript.txt` and hands them over in the framing
+  `Smith.slice` reads. Nothing under `src/` is changed for a consumer; the file
+  is test-only, and it re-introduces the `testkit` test dependency dropped on
+  2026-09-06 (nothing under `src/` imported it *then*; `testkit.fuzz`'s seed
+  helpers are what this needs, rather than a 34th private copy of them).
+
 - **2026-09-06** — **NO CONSUMER-VISIBLE CHANGE:** `dtls` stops declaring itself
   `live` and stops declaring a `testkit` test dependency. Both went stale earlier
   the same day, when the wolfSSL peer moved to `tools/interop.zig`: `live` means
