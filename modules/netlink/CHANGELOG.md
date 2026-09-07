@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **the five fuzz harnesses fetched their input and threw it away.** Each
+  opened `smith.bytes(&buf)` and then sliced the buffer to
+  `smith.valueRangeAtMost(u16, 0, buf.len)`. A `Smith` ranged draw reads eight input octets as
+  a little-endian u64 and returns the range MINIMUM unless that u64 already lies inside the
+  range, so the length was 0 for every seed and every decoder, walker and builder here ran on
+  an empty slice with the seed sitting unread in the buffer. All five now draw with one
+  `smith.slice(&buf)` call, and all five have a corpus — the walkers' and the typed parsers'
+  built at run time by `codec`'s own encoders (netlink lengths and scalars are HOST byte
+  order, so a hex corpus would be a little-endian one), the bridge parsers' quoted from the
+  captures in the value tests. Measured, per harness, over its own corpus: `codec.fuzzWalkers`
+  0 → 12 of 12 seeds non-empty and 0 → 9 messages / 12 attributes walked; `root.fuzzParsers`
+  0 → 9 of 9 and 0 → 10 of 36 (seed, parser) pairs parsed; `root.fuzzBuilders` 1 → 5 of 5 and
+  1 → 15 of 20 builds accepted; `bridge.fuzzParsers` 0 → 14 of 14 and 0 → 11 records;
+  `bridge.fuzzBuilders` 0 → 5 of 5 and 5 → 13 of 25 builds accepted. Each harness now carries
+  a corpus guard that pins those numbers.
+- **2026-09-07** — two defects the collapse was hiding, both found by writing the guard.
+  `codec.fuzzWalkers` drew its fixed-header skip with `valueRangeAtMost(u16, 0, 32)`, i.e.
+  **always 0** — and every rtnetlink payload opens with an ifinfomsg/ifaddrmsg/rtmsg/ndmsg
+  before its TLVs, so `Message.attrs(0)` stopped on that header's leading zero octets with
+  `error.BadLength` and the attribute walker saw **0 attributes across the whole corpus** even
+  after the buffer draw was fixed; the skip now comes from a full-width `smith.value(u64)` and
+  is carried in each seed. `bridge.fuzzBuilders` gated every optional field on
+  `smith.value(bool)`, a 1-bit draw that is likewise always its minimum — `false` — so `.mac`,
+  `.dst` and every optional knob were null on every replayed seed and the mac buffer could not
+  have reached `buildBridgeAddRequest` even with a perfect corpus; they are drawn with
+  `smith.eos()` now, which reads one octet per decision.
+
 - **2026-09-02** — **BREAKING: `codec.nestEnd` returns `error{AttrTooLong}!void`** (audit,
   drift campaign). It used to return `void` and close a nest with a bare
   `@intCast(list.items.len - off)` into the `nlattr`'s `u16` length — so a nest grown past

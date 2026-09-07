@@ -1084,15 +1084,199 @@ test "classifyDumpMessage triages a multi-part reply" {
     try testing.expectEqualSlices(u8, &.{0xaa}, rec.record.payload);
 }
 
+/// Netlink datagrams for `fuzzWalkers`, in the format its draws read: a
+/// little-endian u32 length and the frame (`testkit.fuzz.seedInto`), then an
+/// eight-octet little-endian word for the fixed-header skip.
+///
+/// ⭐ Built at run time by this file's OWN encoders instead of quoted as hex.
+/// Every length and every scalar in a netlink message is **host** byte order,
+/// so a hex corpus would be a little-endian one, and on a big-endian target
+/// every seed would decode to `error.BadLength` while the pinned count below
+/// went on claiming they were parsed. `appendHeader`/`appendAttr` emit what the
+/// kernel would emit on whatever host runs the test.
+///
+/// ⛔ The skip word is not decoration. Every rtnetlink payload opens with a
+/// FIXED family header — ifinfomsg, ifaddrmsg, rtmsg, ndmsg — and only then
+/// carries TLVs, so `Message.attrs(0)` reads that header's leading zero octets
+/// as an attribute of declared length 0 and stops with `error.BadLength` on the
+/// first step. The old harness drew the skip with `valueRangeAtMost`, which is
+/// the range minimum, i.e. **always 0**: measured here, the first corpus that
+/// reached the message walker still walked **0 attributes** across all eleven
+/// seeds. Carrying the skip in the seed is what opens the attribute path.
+const Corpus = struct {
+    /// Backing store for the built frames; a FixedBufferAllocator over it, so
+    /// nothing here needs freeing and no seed can outlive its bytes.
+    scratch: [4096]u8 = undefined,
+    /// Backing store for the seeds themselves (4 + frame.len + 8 each).
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [15][]const u8 = undefined,
+    n: usize = 0,
+
+    /// `frame` plus the fixed-header length the harness should skip past.
+    fn push(self: *Corpus, frame: []const u8, skip: u64) void {
+        const head = @import("testkit").fuzz.seedInto(self.store[self.used..], frame);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], skip, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    /// One netlink message: 16-byte header, `payload`, no trailing pad.
+    fn message(
+        gpa: std.mem.Allocator,
+        list: *std.ArrayList(u8),
+        msg_type: u16,
+        flags: u16,
+        payload: []const u8,
+    ) !void {
+        const off = try appendHeader(gpa, list, msg_type, flags, 42, 1000);
+        try list.appendSlice(gpa, payload);
+        finishHeader(list, off);
+    }
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // ── frames the walkers accept ──────────────────────────────────────
+        //
+        // An RTM_NEWLINK record: ifinfomsg (16 zero octets, walked past with
+        // the fuzzed `skip`) then a string, a u32, and a nested attribute.
+        var link: std.ArrayList(u8) = .empty;
+        {
+            var attrs: std.ArrayList(u8) = .empty;
+            try appendPadded(gpa, &attrs, &[_]u8{0} ** 16);
+            try appendAttrString(gpa, &attrs, 3, "lo"); // IFLA_IFNAME
+            try appendAttrU32(gpa, &attrs, 4, 65536); // IFLA_MTU
+            const nest = try nestBegin(gpa, &attrs, 18); // IFLA_LINKINFO
+            try appendAttrString(gpa, &attrs, 1, "bridge");
+            try nestEnd(&attrs, nest);
+            try message(gpa, &link, 16, NLM_F_MULTI, attrs.items);
+        }
+        self.push(link.items, 16); // ifinfomsg
+
+        // Two records back to back — the shape one `recvmsg` actually returns,
+        // and the only one that exercises the iterator's advance.
+        var pair: std.ArrayList(u8) = .empty;
+        try pair.appendSlice(gpa, link.items);
+        try pair.appendNTimes(gpa, 0, alignUp(link.items.len) - link.items.len);
+        try pair.appendSlice(gpa, link.items);
+        self.push(pair.items, 16);
+
+        // NLMSG_DONE, the bare header that ends every dump.
+        var done: std.ArrayList(u8) = .empty;
+        try message(gpa, &done, NLMSG_DONE, NLM_F_MULTI, &.{});
+        self.push(done.items, 0);
+
+        // NLMSG_ERROR with ext-ACK TLVs: errno, the echoed request header, then
+        // NLMSGERR_ATTR_MSG. This is the only route into `errorAttrs` /
+        // `errorMessage`, and it is the one with the arithmetic in it.
+        var ack: std.ArrayList(u8) = .empty;
+        {
+            var body: std.ArrayList(u8) = .empty;
+            var errno: [4]u8 = undefined;
+            std.mem.writeInt(i32, &errno, -22, native_endian);
+            try body.appendSlice(gpa, &errno);
+            var echoed: [header_len]u8 = @splat(0);
+            std.mem.writeInt(u32, echoed[0..4], header_len, native_endian);
+            try body.appendSlice(gpa, &echoed);
+            try appendAttrString(gpa, &body, NLMSGERR_ATTR.MSG, "Invalid argument");
+            try message(gpa, &ack, NLMSG_ERROR, NLM_F_ACK_TLVS | NLM_F_CAPPED, body.items);
+        }
+        self.push(ack.items, 0);
+
+        // The same without NLM_F_CAPPED, so `errorAttrs` takes the branch that
+        // trusts the echoed message's own length field.
+        var ack_uncapped: std.ArrayList(u8) = .empty;
+        {
+            var body: std.ArrayList(u8) = .empty;
+            try body.appendNTimes(gpa, 0, 4);
+            var echoed: [header_len]u8 = @splat(0);
+            std.mem.writeInt(u32, echoed[0..4], header_len, native_endian);
+            try body.appendSlice(gpa, &echoed);
+            try appendAttrString(gpa, &body, NLMSGERR_ATTR.MSG, "denied");
+            try message(gpa, &ack_uncapped, NLMSG_ERROR, NLM_F_ACK_TLVS, body.items);
+        }
+        self.push(ack_uncapped.items, 0);
+
+        // ── frames the walkers must refuse without over-reading ────────────
+        //
+        // A declared length below the 16-byte header.
+        var bad_len: [header_len]u8 = @splat(0);
+        std.mem.writeInt(u32, bad_len[0..4], 8, native_endian);
+        self.push(&bad_len, 0);
+
+        // A declared length past the end of the datagram.
+        var overrun: [header_len]u8 = @splat(0);
+        std.mem.writeInt(u32, overrun[0..4], 4096, native_endian);
+        self.push(&overrun, 0);
+
+        // Fifteen octets: one short of a header.
+        self.push(&[_]u8{0} ** 15, 0);
+
+        // A well-formed header whose attribute declares 200 octets of payload.
+        var attr_overrun: std.ArrayList(u8) = .empty;
+        {
+            var payload: [8]u8 = @splat(0);
+            std.mem.writeInt(u16, payload[0..2], 200, native_endian);
+            std.mem.writeInt(u16, payload[2..4], 4, native_endian);
+            try message(gpa, &attr_overrun, 16, 0, &payload);
+        }
+        self.push(attr_overrun.items, 0);
+
+        // An attribute whose declared length is below its own 4-octet header —
+        // the shape that would make a naive walker loop for ever.
+        var attr_zero: std.ArrayList(u8) = .empty;
+        {
+            var payload: [4]u8 = @splat(0);
+            std.mem.writeInt(u16, payload[2..4], 4, native_endian);
+            try message(gpa, &attr_zero, 16, 0, &payload);
+        }
+        self.push(attr_zero.items, 0);
+
+        // Raw TLVs with no message around them: the bare `AttrIterator` walk at
+        // the bottom of the harness is the only thing that sees these.
+        var bare: std.ArrayList(u8) = .empty;
+        try appendAttrU32(gpa, &bare, 1, 0xdeadbeef);
+        try appendAttrU16(gpa, &bare, 2, 7);
+        try appendAttrU8(gpa, &bare, 3, 1);
+        self.push(bare.items, 0);
+
+        // A message whose payload is TLVs from its first octet — the shape a
+        // family with no fixed header sends — so the skip-0 path walks
+        // attributes rather than only refusing them.
+        var tlv_msg: std.ArrayList(u8) = .empty;
+        try message(gpa, &tlv_msg, 16, 0, bare.items);
+        self.push(tlv_msg.items, 0);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: message + attribute walkers never crash, loop, or read OOB" {
-    try testing.fuzz({}, fuzzWalkers, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzWalkers, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzWalkers(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and both walkers were handed an empty
+    // buffer with the datagram sitting unread in `raw`. Measured 2026-09-07
+    // over the corpus above: **0 of 12 seeds non-empty and 0 messages walked
+    // before, 12 of 12 non-empty and 9 messages / 12 attributes after.**
+    const len: usize = smith.slice(&raw);
     const buf = raw[0..len];
+    // The fixed family-header length to walk past before the TLVs start.
+    // ⚠ `value(u64)` and a `%`, not `valueRangeAtMost(u16, 0, 32)`: a ranged
+    // draw is the range minimum, so this was 0 for every seed and every
+    // rtnetlink payload stalled on its own ifinfomsg — 0 attributes walked
+    // across the whole corpus even after the buffer draw was fixed. A 64-bit
+    // `value` has full-range weights, so every input word survives it.
+    const skip: usize = @intCast(smith.value(u64) % 33);
 
     // Message walk: each step consumes >= 4 bytes, so bound the step count.
     var steps: usize = 0;
@@ -1110,8 +1294,7 @@ fn fuzzWalkers(_: void, smith: *std.testing.Smith) !void {
                 try testing.expect(esteps <= m.payload.len / 4 + 1);
             }
         }
-        // Walk the payload as attributes with a fuzzed fixed-header skip.
-        const skip = smith.valueRangeAtMost(u16, 0, 32);
+        // Walk the payload as attributes past the fixed family header.
         var ait = m.attrs(skip) catch continue;
         var asteps: usize = 0;
         while (ait.next() catch null) |a| {
@@ -1135,4 +1318,43 @@ fn fuzzWalkers(_: void, smith: *std.testing.Smith) !void {
         var nit = a.nested();
         while (nit.next() catch null) |_| {}
     }
+}
+
+test "corpus: every walker seed reaches the iterators, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, and
+    // built from the SAME `Corpus` the harness gets — a guard measuring a
+    // different corpus is not a guard.
+    //
+    // Three numbers, not one. `nonempty` is the reach claim. `messages` says
+    // the datagrams actually parse; a corpus of refusals only would still
+    // score 12 non-empty and exercise nothing but the error path. `attrs` is
+    // the one that caught the second defect — with `attrs(0)` it came out
+    // **0 across the whole corpus**, because an rtnetlink payload opens with a
+    // fixed family header and not with a TLV. It has to be here: acceptance at
+    // the message layer is not reach at the attribute layer.
+    //
+    // The draw sequence below is the harness's, verbatim, so the skip word in
+    // each seed is read the same way here as there.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+
+    var nonempty: usize = 0;
+    var messages: usize = 0;
+    var attrs: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        const skip: usize = @intCast(smith.value(u64) % 33);
+        if (len != 0) nonempty += 1;
+        var mit: MessageIterator = .{ .buf = raw[0..len] };
+        while (mit.next() catch null) |m| {
+            messages += 1;
+            var ait = m.attrs(skip) catch continue;
+            while (ait.next() catch null) |_| attrs += 1;
+        }
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 9), messages);
+    try testing.expectEqual(@as(usize, 12), attrs);
 }

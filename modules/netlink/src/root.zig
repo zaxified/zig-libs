@@ -2969,41 +2969,174 @@ test "writeErrorFromCode maps the write-path errnos" {
     try testing.expectEqual(error.Unexpected, writeErrorFromCode(std.math.minInt(i32)));
 }
 
+/// Address bytes plus the six knobs `fuzzBuilders` draws after them, in the
+/// exact order it draws them. The layout is the draw sequence: a
+/// `testkit.fuzz` slice seed (u32 length + bytes), then one little-endian u64
+/// per knob.
+///
+/// ⚠ A knob word only survives if it lies inside the range its draw asks for —
+/// `valueRangeAtMost` returns the range MINIMUM otherwise. `prefix` is drawn
+/// as `u8`, so a word above 255 there reads back as 0.
+const BuilderSeed = struct {
+    addr: []const u8,
+    prefix: u64,
+    ifindex: u64,
+    table: u64,
+    mtu: u64,
+    flags: u64,
+    flags_mask: u64,
+};
+
+const builder_seeds = [_]BuilderSeed{
+    // An IPv4 host address on ifindex 2, main table, a 1500-byte MTU.
+    .{ .addr = &.{ 192, 168, 1, 10 }, .prefix = 24, .ifindex = 2, .table = 254, .mtu = 1500, .flags = IFF.UP, .flags_mask = IFF.UP },
+    // IPv6, /64, jumbo MTU.
+    .{ .addr = &[_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{1}, .prefix = 64, .ifindex = 3, .table = 254, .mtu = 9000, .flags = 0, .flags_mask = 0 },
+    // A 6-byte MAC: too short for an address, the right length for `mac`.
+    .{ .addr = &.{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 }, .prefix = 0, .ifindex = 1, .table = 0, .mtu = 68, .flags = 0, .flags_mask = 0xffffffff },
+    // 0.0.0.0 with a prefix past any family's. (The *empty* address needs no
+    // seed: the test runner replays one round of `in = ""` after the corpus,
+    // and that is exactly it — a seed for it would only spend the one check
+    // that catches a seed too long for the buffer, which reads back empty too.)
+    .{ .addr = &.{ 0, 0, 0, 0 }, .prefix = 255, .ifindex = 0, .table = 0, .mtu = 0, .flags = 0, .flags_mask = 0 },
+    // 16 octets with a /32 prefix — an IPv6-length address claiming an IPv4
+    // prefix, the mismatch a builder has to refuse rather than truncate.
+    .{ .addr = &[_]u8{0xff} ** 16, .prefix = 32, .ifindex = 0xffffffff, .table = 0xffffffff, .mtu = 0xffffffff, .flags = 0xffffffff, .flags_mask = 0 },
+};
+
+/// Serialise `builder_seeds` into the byte strings `Smith` reads.
+const BuilderCorpus = struct {
+    store: [builder_seeds.len * (4 + 16 + 6 * 8)]u8 = undefined,
+    entries: [builder_seeds.len][]const u8 = undefined,
+
+    fn build(self: *BuilderCorpus) []const []const u8 {
+        var used: usize = 0;
+        for (&self.entries, builder_seeds) |*out, sd| {
+            const head = testkit.fuzz.seedInto(self.store[used..], sd.addr);
+            var at = used + head.len;
+            for ([_]u64{ sd.prefix, sd.ifindex, sd.table, sd.mtu, sd.flags, sd.flags_mask }) |w| {
+                std.mem.writeInt(u64, self.store[at..][0..8], w, .little);
+                at += 8;
+            }
+            out.* = self.store[used..at];
+            used = at;
+        }
+        return &self.entries;
+    }
+};
+
 test "fuzz: request builders never crash on arbitrary spec bytes" {
-    try testing.fuzz({}, fuzzBuilders, .{});
+    var corpus: BuilderCorpus = .{};
+    var run: BuilderRun = .{};
+    try testing.fuzz(&run, fuzzBuilders, .{ .corpus = corpus.build() });
 }
 
-fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
-    var addr: [16]u8 = undefined;
-    smith.bytes(&addr);
-    const alen = smith.valueRangeAtMost(u8, 0, 16);
-    const a = addr[0..alen];
-    const prefix = smith.valueRangeAtMost(u8, 0, 255);
-    const ifindex = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32));
+fn fuzzBuilders(run: *BuilderRun, smith: *std.testing.Smith) !void {
+    run.* = .{};
+    try driveBuilders(smith, run);
+}
+
+/// What one pass of `driveBuilders` drew and what came of it. The harness
+/// discards it; the corpus guard below reads it.
+const BuilderRun = struct {
+    addr: [16]u8 = undefined,
+    addr_len: usize = 0,
+    prefix: u8 = 0,
+    ifindex: u32 = 0,
+    /// How many of the four builders returned a request rather than an error.
+    accepted: usize = 0,
+};
+
+/// ⭐ The harness body, factored out so the corpus guard below drives the SAME
+/// draw sequence rather than a paraphrase of it. A guard that measures a
+/// different sequence from the one the fuzzer runs is not a guard.
+fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(addr.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `alen` was 0 for every seed: every builder below was called with an
+    // EMPTY address, an empty gateway and an empty link-layer address, with the
+    // drawn octets sitting unread in `addr`. Measured 2026-09-07 over the
+    // corpus above, toggling only this draw: **1 of 5 seeds non-empty and 1 of
+    // 20 builds accepted before, 5 of 5 non-empty and 15 of 20 accepted
+    // after.** (The 1 is not luck the fix removed: `valueRangeAtMost(u8, 0, 16)`
+    // returns the drawn word when it happens to land in 0..16, and for one seed
+    // the eight octets after the address did.)
+    run.addr_len = smith.slice(&run.addr);
+    const a = run.addr[0..run.addr_len];
+    run.prefix = smith.valueRangeAtMost(u8, 0, 255);
+    run.ifindex = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32));
+    const prefix = run.prefix;
+    const ifindex = run.ifindex;
     const gpa = testing.allocator;
 
     if (buildAddressRequest(gpa, 1, RTM_NEWADDR, 0, .{
         .ifindex = ifindex,
         .local = a,
         .prefixlen = prefix,
-    })) |req| gpa.free(req) else |_| {}
+    })) |req| {
+        run.accepted += 1;
+        gpa.free(req);
+    } else |_| {}
     if (buildRouteRequest(gpa, 1, RTM_NEWROUTE, 0, .{
         .dst = a,
         .dst_prefixlen = prefix,
         .oif = ifindex,
         .table = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32)),
-    })) |req| gpa.free(req) else |_| {}
+    })) |req| {
+        run.accepted += 1;
+        gpa.free(req);
+    } else |_| {}
     if (buildNeighborRequest(gpa, 1, RTM_NEWNEIGH, 0, .{
         .ifindex = ifindex,
         .dst = a,
         .lladdr = a,
-    })) |req| gpa.free(req) else |_| {}
+    })) |req| {
+        run.accepted += 1;
+        gpa.free(req);
+    } else |_| {}
     if (buildLinkSetRequest(gpa, 1, ifindex, .{
         .mtu = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32)),
         .mac = a,
         .flags = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32)),
         .flags_mask = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32)),
-    })) |req| gpa.free(req) else |_| {}
+    })) |req| {
+        run.accepted += 1;
+        gpa.free(req);
+    } else |_| {}
+}
+
+test "corpus: every builder seed reaches the builders, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus and the SAME draw sequence the harness gets. `nonempty` is
+    // the reach claim — and the only thing that notices a seed grown past the
+    // 16-octet buffer, which `Smith.slice` reads back as the EMPTY one,
+    // silently. `accepted` is pinned, not asserted `> 0`: a corpus every
+    // builder refuses would exercise nothing but the refusal path, and a later
+    // edit that changes what builds has to come and change this number.
+    //
+    // `knobs` is the third: it checks the words after the address arrived as
+    // written, and would notice a draw being inserted or reordered ahead of
+    // them — after which every knob in this file would silently be its range
+    // minimum again while the address kept arriving intact.
+    var corpus: BuilderCorpus = .{};
+    const entries = corpus.build();
+
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var knobs: usize = 0;
+    for (entries, builder_seeds) |sd, spec| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var run: BuilderRun = .{};
+        try driveBuilders(&smith, &run);
+        if (run.addr_len != 0) nonempty += 1;
+        try testing.expectEqualSlices(u8, spec.addr, run.addr[0..run.addr_len]);
+        if (run.prefix == spec.prefix and run.ifindex == spec.ifindex) knobs += 1;
+        accepted += run.accepted;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(entries.len, knobs);
+    try testing.expectEqual(@as(usize, 15), accepted);
 }
 
 test "wire constants agree with std.os.linux" {
@@ -3034,19 +3167,179 @@ test "wire constants agree with std.os.linux" {
     try testing.expectEqual(@as(u16, 18), ifla_linkinfo);
 }
 
+/// RTM_NEW* payloads (fixed family header + rtattrs, the nlmsghdr already
+/// stripped) for `fuzzParsers`, in the format `Smith.slice` reads.
+///
+/// ⭐ Built at run time by `codec`'s own encoders, exactly as the value tests
+/// above build theirs, rather than quoted as hex: every length and every
+/// scalar in an rtattr is **host** byte order, so a hex corpus would be a
+/// little-endian one and the pinned counts below would be false on a
+/// big-endian target instead of failing there.
+const ParserCorpus = struct {
+    scratch: [4096]u8 = undefined,
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [9][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ParserCorpus, frame: []const u8) void {
+        const s = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = s;
+        self.used += s.len;
+        self.n += 1;
+    }
+
+    fn build(self: *ParserCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+
+        // A loopback link: ifinfomsg + IFLA_IFNAME/MTU/ADDRESS.
+        {
+            var f: [ifinfomsg_len]u8 = @splat(0);
+            std.mem.writeInt(u16, f[2..4], 772, native_endian); // ARPHRD_LOOPBACK
+            std.mem.writeInt(i32, f[4..8], 1, native_endian);
+            std.mem.writeInt(u32, f[8..12], IFF.UP | IFF.LOOPBACK | IFF.RUNNING, native_endian);
+            var list: std.ArrayList(u8) = .empty;
+            try codec.appendPadded(gpa, &list, &f);
+            try codec.appendAttrString(gpa, &list, ifla_ifname, "lo");
+            try codec.appendAttrU32(gpa, &list, ifla_mtu, 65536);
+            try codec.appendAttr(gpa, &list, ifla_address, &(.{0} ** 6));
+            try codec.appendAttrU32(gpa, &list, 999, 1); // unknown attr — ignored
+            self.push(list.items);
+        }
+        // An IPv4 address with IFA_LOCAL, IFA_ADDRESS (peer) and IFA_LABEL.
+        {
+            var f: [ifaddrmsg_len]u8 = @splat(0);
+            f[0] = AF.INET;
+            f[1] = 8;
+            f[3] = RT_SCOPE.HOST;
+            std.mem.writeInt(u32, f[4..8], 1, native_endian);
+            var list: std.ArrayList(u8) = .empty;
+            try codec.appendPadded(gpa, &list, &f);
+            try codec.appendAttr(gpa, &list, ifa_address, &.{ 10, 0, 0, 2 });
+            try codec.appendAttr(gpa, &list, ifa_local, &.{ 127, 0, 0, 1 });
+            try codec.appendAttrString(gpa, &list, ifa_label, "lo");
+            self.push(list.items);
+        }
+        // An IPv6 address with IFA_ADDRESS only, and the same fixed header with
+        // no address attribute at all — the entry a caller must skip.
+        {
+            var f: [ifaddrmsg_len]u8 = @splat(0);
+            f[0] = AF.INET6;
+            f[1] = 128;
+            var list: std.ArrayList(u8) = .empty;
+            try codec.appendPadded(gpa, &list, &f);
+            try codec.appendAttr(gpa, &list, ifa_address, &([_]u8{0} ** 15 ++ [_]u8{1}));
+            self.push(list.items);
+            self.push(&f);
+        }
+        // A default route with a gateway, and the RTA_TABLE override.
+        {
+            var f: [rtmsg_len]u8 = @splat(0);
+            f[0] = AF.INET;
+            f[4] = @intCast(RT_TABLE.COMPAT);
+            f[5] = 3; // RTPROT_BOOT
+            f[7] = RTN.UNICAST;
+            var list: std.ArrayList(u8) = .empty;
+            try codec.appendPadded(gpa, &list, &f);
+            try codec.appendAttr(gpa, &list, RTA.GATEWAY, &.{ 192, 168, 1, 1 });
+            try codec.appendAttrU32(gpa, &list, RTA.OIF, 2);
+            try codec.appendAttrU32(gpa, &list, RTA.PRIORITY, 100);
+            try codec.appendAttrU32(gpa, &list, RTA.TABLE, RT_TABLE.MAIN);
+            self.push(list.items);
+        }
+        // A reachable neighbour with both a destination and a link-layer addr.
+        {
+            var f: [ndmsg_len]u8 = @splat(0);
+            f[0] = AF.INET;
+            std.mem.writeInt(i32, f[4..8], 2, native_endian);
+            std.mem.writeInt(u16, f[8..10], NUD.REACHABLE, native_endian);
+            var list: std.ArrayList(u8) = .empty;
+            try codec.appendPadded(gpa, &list, &f);
+            try codec.appendAttr(gpa, &list, NDA.DST, &.{ 192, 168, 1, 254 });
+            try codec.appendAttr(gpa, &list, NDA.LLADDR, &.{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 });
+            self.push(list.items);
+        }
+        // ── the refusals ───────────────────────────────────────────────────
+        // Eight octets: shorter than every fixed header here but ndmsg's.
+        self.push(&[_]u8{0} ** 8);
+        // An attribute whose declared length overruns the payload.
+        {
+            var bad: [ifinfomsg_len + 4]u8 = @splat(0);
+            std.mem.writeInt(u16, bad[ifinfomsg_len..][0..2], 200, native_endian);
+            std.mem.writeInt(u16, bad[ifinfomsg_len + 2 ..][0..2], ifla_mtu, native_endian);
+            self.push(&bad);
+        }
+        // IFLA_MTU with the wrong scalar width.
+        {
+            var short: [ifinfomsg_len + 8]u8 = @splat(0);
+            std.mem.writeInt(u16, short[ifinfomsg_len..][0..2], 6, native_endian);
+            std.mem.writeInt(u16, short[ifinfomsg_len + 2 ..][0..2], ifla_mtu, native_endian);
+            self.push(&short);
+        }
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: typed parsers never crash on arbitrary payloads" {
-    try testing.fuzz({}, fuzzParsers, .{});
+    var corpus: ParserCorpus = .{};
+    try testing.fuzz({}, fuzzParsers, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
     var raw: [256]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all four parsers were handed an empty
+    // payload with the message sitting unread in `raw`. Measured 2026-09-07
+    // over the corpus above: **0 of 9 seeds non-empty and 0 of 36 (seed,
+    // parser) pairs parsed before, 9 of 9 non-empty and 10 of 36 after.**
+    const len: usize = smith.slice(&raw);
     const payload = raw[0..len];
     if (parseLink(payload)) |_| {} else |_| {}
     if (parseAddress(payload)) |_| {} else |_| {}
     if (parseRoute(payload)) |_| {} else |_| {}
     if (parseNeighbor(payload)) |_| {} else |_| {}
+}
+
+test "corpus: every parser seed reaches the parsers, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than in a comment, over the SAME
+    // corpus the harness gets. `nonempty` is the reach claim and the only check
+    // that catches a seed grown past the 256-octet buffer (`Smith.slice` reads
+    // that back as the empty one). `parsed` counts the payloads a parser turned
+    // into a record — pinned, not `> 0`: acceptance is not reach, and a corpus
+    // of nothing but refusals would exercise nothing but the refusal path.
+    //
+    // Four parsers over one payload, so the number is per (seed, parser) pair
+    // out of 9 x 4 = 36 — an rtnetlink payload is legal input to more than one
+    // of them, and pinning the total notices any of the four changing.
+    var corpus: ParserCorpus = .{};
+    const entries = try corpus.build();
+
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [256]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const payload = raw[0..len];
+        if (parseLink(payload)) |v| {
+            if (v != null) parsed += 1;
+        } else |_| {}
+        if (parseAddress(payload)) |v| {
+            if (v != null) parsed += 1;
+        } else |_| {}
+        if (parseRoute(payload)) |v| {
+            if (v != null) parsed += 1;
+        } else |_| {}
+        if (parseNeighbor(payload)) |v| {
+            if (v != null) parsed += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 10), parsed);
 }
 
 // ── reply-engine regression tests (scripted transport, no kernel) ──────────

@@ -41,6 +41,9 @@ const native_endian = builtin.cpu.arch.endian();
 
 const codec = @import("codec.zig");
 const root = @import("root.zig");
+// Test-only (`build.zig`'s `test_deps`): the fuzz corpus seed helpers, in the
+// format `std.testing.Smith` actually reads. See `testkit/src/fuzz.zig`.
+const testkit = @import("testkit");
 
 // ── kernel UAPI constants ───────────────────────────────────────────────────
 
@@ -1934,79 +1937,291 @@ test "wire constants agree with the kernel UAPI" {
     try testing.expectEqual(@as(u16, 4094), info.vid);
 }
 
+/// An interface name and a link-layer address for `fuzzBuilders`, laid out the
+/// way its draws read them: two `testkit.fuzz` slice seeds back to back (u32
+/// length + bytes, twice).
+const BuilderSeed = struct { name: []const u8, mac: []const u8 };
+
+const builder_seeds = [_]BuilderSeed{
+    // The ordinary case: a legal IFNAMSIZ name and a six-octet MAC.
+    .{ .name = "br0", .mac = &.{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 } },
+    // A name of exactly IFNAMSIZ-1 and the all-ones broadcast address.
+    .{ .name = "abcdefghijklmno", .mac = &[_]u8{0xff} ** 6 },
+    // A name one octet too long for IFNAMSIZ, and a MAC that is not six
+    // octets — both are refusals the builders owe an error rather than a
+    // truncated request.
+    .{ .name = "abcdefghijklmnop", .mac = &.{ 0x01, 0x02, 0x03 } },
+    // A name with an embedded NUL and an infiniband-length (20-octet) address.
+    .{ .name = "br\x000", .mac = &[_]u8{0xaa} ** 20 },
+    // The longest of each that still fits the harness's buffers. ⚠ A seed
+    // longer than the buffer is not a big seed, it is the EMPTY one:
+    // `Smith.slice` falls back to the range minimum. 24 and 40 are the caps.
+    .{ .name = &[_]u8{'x'} ** 24, .mac = &[_]u8{0x5a} ** 40 },
+};
+
+const BuilderCorpus = struct {
+    store: [builder_seeds.len * (4 + 24 + 4 + 40)]u8 = undefined,
+    entries: [builder_seeds.len][]const u8 = undefined,
+
+    fn build(self: *BuilderCorpus) []const []const u8 {
+        var used: usize = 0;
+        for (&self.entries, builder_seeds) |*out, sd| {
+            const a = testkit.fuzz.seedInto(self.store[used..], sd.name);
+            const b = testkit.fuzz.seedInto(self.store[used + a.len ..], sd.mac);
+            out.* = self.store[used..][0 .. a.len + b.len];
+            used += a.len + b.len;
+        }
+        return &self.entries;
+    }
+};
+
 test "fuzz: bridge builders never crash on arbitrary spec bytes" {
-    try std.testing.fuzz({}, fuzzBuilders, .{});
+    var corpus: BuilderCorpus = .{};
+    var run: BuilderRun = .{};
+    try std.testing.fuzz(&run, fuzzBuilders, .{ .corpus = corpus.build() });
 }
 
-fn fuzzBuilders(_: void, smith: *std.testing.Smith) !void {
-    const gpa = testing.allocator;
-    var name_buf: [24]u8 = undefined;
-    smith.bytes(&name_buf);
-    const name_len = smith.valueRangeAtMost(u8, 0, name_buf.len);
-    var mac_buf: [40]u8 = undefined;
-    smith.bytes(&mac_buf);
-    const mac_len = smith.valueRangeAtMost(u8, 0, mac_buf.len);
+fn fuzzBuilders(run: *BuilderRun, smith: *std.testing.Smith) !void {
+    run.* = .{};
+    try driveBuilders(smith, run);
+}
 
+/// What one pass of `driveBuilders` drew and what came of it. The harness
+/// throws it away; the corpus guard below reads it.
+const BuilderRun = struct {
+    name_buf: [24]u8 = undefined,
+    mac_buf: [40]u8 = undefined,
+    name_len: usize = 0,
+    mac_len: usize = 0,
+    /// How many of the five builders returned a request rather than an error.
+    accepted: usize = 0,
+
+    fn name(self: *const BuilderRun) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    fn mac(self: *const BuilderRun) []const u8 {
+        return self.mac_buf[0..self.mac_len];
+    }
+};
+
+/// ⭐ The harness body, factored out so the corpus guard below drives the
+/// SAME draw sequence rather than a paraphrase of it. A guard that measures a
+/// different sequence from the one the fuzzer runs is not a guard.
+fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
+    const gpa = testing.allocator;
+    // ⚠ One `smith.slice` call per buffer, never `smith.bytes` followed by a
+    // ranged length. `bytes` takes `@min(buf.len, in.len)` octets and the
+    // ranged draw then finds fewer than the eight it needs and returns the
+    // range MINIMUM, so both lengths were 0 for every seed: every builder here
+    // was called with an empty name and an empty link-layer address, with the
+    // drawn octets sitting unread in the buffers.
+    run.name_len = smith.slice(&run.name_buf);
+    run.mac_len = smith.slice(&run.mac_buf);
+    const name = run.name();
+    const mac = run.mac();
+
+    // ⛔ The optional fields below used to be gated on `smith.value(bool)`,
+    // which is a 1-bit `valueWeighted` draw: outside `--fuzz` it is the range
+    // minimum, i.e. **false, always**. So `.mac`, `.dst` and every optional
+    // knob were null on every replayed seed — the mac buffer could not have
+    // reached `buildBridgeAddRequest` even after the length draw was fixed.
+    // `eos` reads ONE input byte and returns `byte != 0`, and returns `true`
+    // once the input runs out, so a seed decides which options are present and
+    // the tail of the corpus turns them all on. Measured 2026-09-07 over the
+    // corpus above, toggling only these two things: **0 of 5 seeds with a
+    // non-empty name and mac and 5 of 25 builds accepted before, 5 of 5
+    // non-empty and 13 of 25 accepted after.**
     if (buildBridgeAddRequest(gpa, smith.value(u32), smith.value(u16), .{
-        .name = name_buf[0..name_len],
-        .forward_delay = if (smith.value(bool)) smith.value(u32) else null,
-        .ageing_time = if (smith.value(bool)) smith.value(u32) else null,
-        .stp_state = if (smith.value(bool)) smith.value(u32) else null,
-        .priority = if (smith.value(bool)) smith.value(u16) else null,
-        .vlan_filtering = if (smith.value(bool)) smith.value(bool) else null,
-        .vlan_protocol = if (smith.value(bool)) smith.value(u16) else null,
-        .mac = if (smith.value(bool)) mac_buf[0..mac_len] else null,
-    })) |req| gpa.free(req) else |_| {}
+        .name = name,
+        .forward_delay = if (smith.eos()) smith.value(u32) else null,
+        .ageing_time = if (smith.eos()) smith.value(u32) else null,
+        .stp_state = if (smith.eos()) smith.value(u32) else null,
+        .priority = if (smith.eos()) smith.value(u16) else null,
+        .vlan_filtering = if (smith.eos()) smith.eos() else null,
+        .vlan_protocol = if (smith.eos()) smith.value(u16) else null,
+        .mac = if (smith.eos()) mac else null,
+    })) |req| {
+        run.accepted += 1;
+        gpa.free(req);
+    } else |_| {}
 
     if (buildFdbRequest(gpa, smith.value(u32), smith.value(u16), smith.value(u16), .{
         .ifindex = smith.value(u32),
-        .lladdr = mac_buf[0..mac_len],
-        .dst = if (smith.value(bool)) name_buf[0..name_len] else null,
-        .vlan = if (smith.value(bool)) smith.value(u16) else null,
-        .port = if (smith.value(bool)) smith.value(u16) else null,
-        .vni = if (smith.value(bool)) smith.value(u32) else null,
-        .master = if (smith.value(bool)) smith.value(u32) else null,
+        .lladdr = mac,
+        .dst = if (smith.eos()) name else null,
+        .vlan = if (smith.eos()) smith.value(u16) else null,
+        .port = if (smith.eos()) smith.value(u16) else null,
+        .vni = if (smith.eos()) smith.value(u32) else null,
+        .master = if (smith.eos()) smith.value(u32) else null,
         .state = smith.value(u16),
         .flags = smith.value(u8),
         .ntype = smith.value(u8),
-    })) |req| gpa.free(req) else |_| {}
+    })) |req| {
+        run.accepted += 1;
+        gpa.free(req);
+    } else |_| {}
 
     if (buildVlanRequest(gpa, smith.value(u32), smith.value(u16), smith.value(u32), .{
         .vid = smith.value(u16),
-        .vid_end = if (smith.value(bool)) smith.value(u16) else null,
-        .pvid = smith.value(bool),
-        .untagged = smith.value(bool),
-        .self = smith.value(bool),
-        .master = smith.value(bool),
-    })) |req| gpa.free(req) else |_| {}
+        .vid_end = if (smith.eos()) smith.value(u16) else null,
+        .pvid = smith.eos(),
+        .untagged = smith.eos(),
+        .self = smith.eos(),
+        .master = smith.eos(),
+    })) |req| {
+        run.accepted += 1;
+        gpa.free(req);
+    } else |_| {}
 
     if (buildBrportRequest(gpa, smith.value(u32), smith.value(u32), .{
-        .state = if (smith.value(bool)) smith.value(u8) else null,
-        .learning = if (smith.value(bool)) smith.value(bool) else null,
-        .unicast_flood = if (smith.value(bool)) smith.value(bool) else null,
-        .isolated = if (smith.value(bool)) smith.value(bool) else null,
-        .priority = if (smith.value(bool)) smith.value(u16) else null,
-        .cost = if (smith.value(bool)) smith.value(u32) else null,
-    })) |req| gpa.free(req) else |_| {}
+        .state = if (smith.eos()) smith.value(u8) else null,
+        .learning = if (smith.eos()) smith.eos() else null,
+        .unicast_flood = if (smith.eos()) smith.eos() else null,
+        .isolated = if (smith.eos()) smith.eos() else null,
+        .priority = if (smith.eos()) smith.value(u16) else null,
+        .cost = if (smith.eos()) smith.value(u32) else null,
+    })) |req| {
+        run.accepted += 1;
+        gpa.free(req);
+    } else |_| {}
 
     if (buildFdbDumpRequest(gpa, smith.value(u32), .{
-        .ifindex = if (smith.value(bool)) smith.value(u32) else null,
-        .master = if (smith.value(bool)) smith.value(u32) else null,
-    })) |req| gpa.free(req) else |_| {}
+        .ifindex = if (smith.eos()) smith.value(u32) else null,
+        .master = if (smith.eos()) smith.value(u32) else null,
+    })) |req| {
+        run.accepted += 1;
+        gpa.free(req);
+    } else |_| {}
 }
 
+test "corpus: every builder seed reaches the builders, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than in a comment, over the SAME
+    // corpus and the SAME draw sequence the harness gets. `nonempty` is the
+    // reach claim and the only check that would catch a seed grown past its
+    // 24/40-octet buffer, which `Smith.slice` reads back as the empty one,
+    // silently. `accepted` is pinned rather than asserted `> 0`: a corpus every
+    // builder refuses tests only the refusal path, and an edit that changes
+    // what builds has to come here and say so.
+    var corpus: BuilderCorpus = .{};
+    const entries = corpus.build();
+
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (entries, builder_seeds) |sd, spec| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var run: BuilderRun = .{};
+        try driveBuilders(&smith, &run);
+        if (run.name_len != 0 and run.mac_len != 0) nonempty += 1;
+        try testing.expectEqualSlices(u8, spec.name, run.name());
+        try testing.expectEqualSlices(u8, spec.mac, run.mac());
+        accepted += run.accepted;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 13), accepted);
+}
+
+/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the frames it
+/// is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// u32 length first, so a raw frame handed to it arrives minus its first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = testkit.fuzz.seedHex;
+
+/// RTM_NEWNEIGH / RTM_NEWLINK payloads (the nlmsghdr already stripped) for
+/// `fuzzParsers`, quoted from the captures in the value tests above.
+///
+/// ⚠ Little-endian, like every literal frame in this file: netlink lengths and
+/// scalars are HOST byte order, so these are the frames a little-endian kernel
+/// emits. The guard below skips on a big-endian host for the same reason the
+/// value tests do; the harness still replays them there, where they exercise
+/// the refusal paths instead.
+const parser_seeds = [_][]const u8{
+    // A learned VLAN-200 FDB entry on port 4 of bridge 5, with NDA_CACHEINFO.
+    seed("0700000004000000800000000A000200FEBFC21D1F8E0000080009000500000008000F00" ++
+        "000000001400030000000000C5010000C50100000000000006000500C8000000"),
+    // An NTF_SELF entry, and the same with AF_INET — not ours, decoded as null.
+    seed("0700000004000000800002000A0002003333000000010000"),
+    seed("0200000004000000800002000A0002003333000000010000"),
+    // A VXLAN-style entry carrying NDA_DST and NDA_VNI.
+    seed("0700000009000000C00012000A000200020000000001000008000100C0000201080007006" ++
+        "4000000"),
+    // `bridge vlan show` for veth0: PVID 1 plus VLAN 30.
+    seed("070001000400000003100000000000000A000300766574683000000008000A0006000000" ++
+        "14001A0008000200060001000800020004001E00"),
+    // IFLA_AF_SPEC with a RANGE_BEGIN/RANGE_END pair that collapses to one
+    // entry, plus a single untagged VID.
+    seed("07000000070000000000000000000000" ++
+        "1C001A000800020008006400080002001000C8000800020004002C01"),
+    // A dangling RANGE_BEGIN: degrades to a single-VID entry.
+    seed("070000000500000000000000000000000C001A000800020008006400"),
+    // A RANGE_END below its pending RANGE_BEGIN — the range must not invert.
+    seed("0700000005000000000000000000000014001A00080002000800C8000800020010006400"),
+    // Two octets: a truncated ifinfomsg.
+    seed("0700"),
+    // A bridge_vlan_info of two octets instead of four.
+    seed("070000000500000000000000000000000A001A000600020008000000"),
+    // An IFLA_AF_SPEC whose declared length runs past the buffer.
+    seed("07000000050000000000000000000000FF001A0008000200"),
+    // A nest length of zero — the shape that would spin a naive walker.
+    seed("0700000005000000000000000000000000001A00"),
+    // A real link-dump reply with IFLA_PROTINFO: state, priority, cost and
+    // three booleans.
+    seed("0700010004000000031000000000000008000A000600000034000C80" ++
+        "05000100030000000600020020000000080003000200000005000800" ++
+        "0000000005000900010000000500210001000000"),
+    // A plain (non-port) interface: no IFLA_PROTINFO at all.
+    seed("00000100020000000310000000000000"),
+};
+
 test "fuzz: bridge parsers never crash on arbitrary payloads" {
-    try std.testing.fuzz({}, fuzzParsers, .{});
+    try std.testing.fuzz({}, fuzzParsers, .{ .corpus = &parser_seeds });
 }
 
 fn fuzzParsers(_: void, smith: *std.testing.Smith) !void {
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all three parsers were handed an empty
+    // payload with the capture sitting unread in `raw`. Measured 2026-09-07
+    // over the corpus above: **0 of 14 seeds non-empty and 0 records parsed
+    // before, 14 of 14 non-empty and 11 records after.**
+    const len: usize = smith.slice(&raw);
     const payload = raw[0..len];
     if (parseFdb(payload)) |_| {} else |_| {}
     if (parseBrport(payload)) |_| {} else |_| {}
     var out: std.ArrayList(VlanEntry) = .empty;
     defer out.deinit(testing.allocator);
     if (parseVlans(testing.allocator, &out, payload)) |_| {} else |_| {}
+}
+
+test "corpus: every parser seed reaches the parsers, and the record count is pinned" {
+    // ⭐ The measurement, executable rather than in a comment. `nonempty` is
+    // the reach claim — and the only check that catches a seed grown past the
+    // 512-octet buffer, which `Smith.slice` reads back as the empty one.
+    // `records` counts what the three parsers actually produced, pinned rather
+    // than asserted `> 0`: acceptance is not reach, and a corpus of refusals
+    // only would score 14 non-empty while testing nothing but the error path.
+    if (native_endian != .little) return error.SkipZigTest; // the seeds are LE
+    var nonempty: usize = 0;
+    var records: usize = 0;
+    for (parser_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const payload = raw[0..len];
+        if (parseFdb(payload)) |v| {
+            if (v != null) records += 1;
+        } else |_| {}
+        if (parseBrport(payload)) |v| {
+            if (v != null) records += 1;
+        } else |_| {}
+        var out: std.ArrayList(VlanEntry) = .empty;
+        defer out.deinit(testing.allocator);
+        if (parseVlans(testing.allocator, &out, payload)) |_| {
+            records += out.items.len;
+        } else |_| {}
+    }
+    try testing.expectEqual(parser_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 11), records);
 }
