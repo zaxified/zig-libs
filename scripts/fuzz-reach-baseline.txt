@@ -101,7 +101,6 @@ rawsock 3
 rdap 2
 rescue 1
 ripemd160 1
-rsa 6
 saml 2
 sealedbox 1
 sessions 2
