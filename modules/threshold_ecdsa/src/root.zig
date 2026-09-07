@@ -2054,8 +2054,6 @@ test "generateAuxParamsWithTrapdoor: retains p̃/q̃/lambda; p̃*q̃ == n_tilde 
 // lying length prefixes written out as bytes, which is reproducible where a
 // draw is not.
 
-const testkit = @import("testkit");
-
 /// The corpus for the three counted/length-prefixed decoders.
 ///
 /// ⭐ Each harness and its guard build it from HERE, so the guard measures the
@@ -2100,31 +2098,31 @@ const Corpus = struct {
         std.debug.assert(f3.len <= feld_buf_bytes);
 
         var i: usize = 0;
-        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], f2);
+        self.feld_entries[i] = fuzzSeedIntoLocal(&self.feld_store[i], f2);
         i += 1; // 2 real commitments
-        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], f3);
+        self.feld_entries[i] = fuzzSeedIntoLocal(&self.feld_store[i], f3);
         i += 1; // 3 real commitments
         // ⭐ The input of the fixed over-allocation bug, which the harness that
         //    exists to guard it had never once produced.
-        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+        self.feld_entries[i] = fuzzSeedIntoLocal(&self.feld_store[i], &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
         i += 1;
         // The same shape at a scale that once peaked ~1.3 GB RSS on its own.
-        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], &[_]u8{ 0x00, 0x03, 0x0d, 0x40 });
+        self.feld_entries[i] = fuzzSeedIntoLocal(&self.feld_store[i], &[_]u8{ 0x00, 0x03, 0x0d, 0x40 });
         i += 1;
         // count = 0: legal, ACCEPTED with zero elements. The one input this
         // target ran for ever, kept so the guard's second number can show what
         // it was worth.
-        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], &[_]u8{ 0, 0, 0, 0 });
+        self.feld_entries[i] = fuzzSeedIntoLocal(&self.feld_store[i], &[_]u8{ 0, 0, 0, 0 });
         i += 1;
         // A real frame whose first commitment is no longer a SEC1 point.
-        self.feld_entries[i] = testkit.fuzz.seedInto(
+        self.feld_entries[i] = fuzzSeedIntoLocal(
             &self.feld_store[i],
             withU32(&scratch, f2, 4, 0x0400_0000),
         );
         i += 1;
-        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], f2[0 .. f2.len - 1]);
+        self.feld_entries[i] = fuzzSeedIntoLocal(&self.feld_store[i], f2[0 .. f2.len - 1]);
         i += 1; // truncated: length no longer matches the count
-        self.feld_entries[i] = testkit.fuzz.seedInto(&self.feld_store[i], "");
+        self.feld_entries[i] = fuzzSeedIntoLocal(&self.feld_store[i], "");
         i += 1;
         std.debug.assert(i == self.feld_entries.len);
 
@@ -2154,25 +2152,25 @@ const Corpus = struct {
         std.debug.assert(pk_bytes.len <= pk_buf_bytes);
 
         var p: usize = 0;
-        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], pk_bytes);
+        self.pk_entries[p] = fuzzSeedIntoLocal(&self.pk_store[p], pk_bytes);
         p += 1; // 2 real parties
-        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+        self.pk_entries[p] = fuzzSeedIntoLocal(&self.pk_store[p], &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
         p += 1; // ⭐ the ~29 TB allocation attempt, verbatim
-        self.pk_entries[p] = testkit.fuzz.seedInto(
+        self.pk_entries[p] = fuzzSeedIntoLocal(
             &self.pk_store[p],
             withU32(&scratch, pk_bytes, 0, 0xFFFF_FFFF),
         );
         p += 1; // the same lie behind a real body
-        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], &[_]u8{ 0, 0, 0, 0 });
+        self.pk_entries[p] = fuzzSeedIntoLocal(&self.pk_store[p], &[_]u8{ 0, 0, 0, 0 });
         p += 1; // count = 0: legal, and all this target ever ran
-        self.pk_entries[p] = testkit.fuzz.seedInto(
+        self.pk_entries[p] = fuzzSeedIntoLocal(
             &self.pk_store[p],
             withU32(&scratch, pk_bytes, 8, 0xFFFF_FFF0),
         );
         p += 1; // the first inner length prefix lies
-        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], pk_bytes[0 .. pk_bytes.len / 2]);
+        self.pk_entries[p] = fuzzSeedIntoLocal(&self.pk_store[p], pk_bytes[0 .. pk_bytes.len / 2]);
         p += 1; // truncated mid-entry
-        self.pk_entries[p] = testkit.fuzz.seedInto(&self.pk_store[p], "");
+        self.pk_entries[p] = fuzzSeedIntoLocal(&self.pk_store[p], "");
         p += 1;
         std.debug.assert(p == self.pk_entries.len);
 
@@ -2187,31 +2185,31 @@ const Corpus = struct {
         defer allocator.free(toy);
 
         var a: usize = 0;
-        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], real_aux);
+        self.aux_entries[a] = fuzzSeedIntoLocal(&self.aux_store[a], real_aux);
         a += 1; // a real 128-bit Ñ with a genuine h1/h2 relation
-        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], toy);
+        self.aux_entries[a] = fuzzSeedIntoLocal(&self.aux_store[a], toy);
         a += 1; // the toy triple (Ñ = 187)
-        self.aux_entries[a] = testkit.fuzz.seedInto(
+        self.aux_entries[a] = fuzzSeedIntoLocal(
             &self.aux_store[a],
             withU32(&scratch, real_aux, 0, 0xFFFF_FFFF),
         );
         a += 1; // Ñ's declared length lies -- `readLenPrefixed`'s bound check
-        self.aux_entries[a] = testkit.fuzz.seedInto(
+        self.aux_entries[a] = fuzzSeedIntoLocal(
             &self.aux_store[a],
             withU32(&scratch, real_aux, 0, 0),
         );
         a += 1; // Ñ declared empty: strips to nothing, refused
         // h1's declared length lies about a field that IS there.
-        self.aux_entries[a] = testkit.fuzz.seedInto(
+        self.aux_entries[a] = fuzzSeedIntoLocal(
             &self.aux_store[a],
             withU32(&scratch, real_aux, 4 + (real_aux.len - 12) / 3, 0xFFFF_FFFF),
         );
         a += 1;
-        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], real_aux[0 .. real_aux.len - 1]);
+        self.aux_entries[a] = fuzzSeedIntoLocal(&self.aux_store[a], real_aux[0 .. real_aux.len - 1]);
         a += 1; // truncated: h2 runs off the end
-        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], &[_]u8{0} ** 12);
+        self.aux_entries[a] = fuzzSeedIntoLocal(&self.aux_store[a], &[_]u8{0} ** 12);
         a += 1; // three empty fields -- the one input this target ran
-        self.aux_entries[a] = testkit.fuzz.seedInto(&self.aux_store[a], "");
+        self.aux_entries[a] = fuzzSeedIntoLocal(&self.aux_store[a], "");
         a += 1;
         std.debug.assert(a == self.aux_entries.len);
     }
@@ -2340,4 +2338,29 @@ test "corpus: the AuxParams seeds reach the decoder, counts pinned" {
     try testing.expectEqual(corpus.aux_entries.len - 1, nonempty);
     try testing.expectEqual(@as(usize, 2), accepted);
     try testing.expectEqual(@as(usize, 2), n_widths);
+}
+
+/// ⛔ A LOCAL COPY of `testkit.fuzz.seedInto`, and it has to be one — see the
+/// note on `check-testonly` below. Enrolling this module in `test_deps` puts it
+/// into that gate, whose probe imports the PUBLISHED module and references every
+/// declaration three levels deep, and this module deliberately guards a
+/// test-only function with a `@compileError` that fires outside a test build.
+/// The two gates contradict each other.
+///
+/// The anchor test underneath stops this copy drifting from
+/// `modules/testkit/src/fuzz.zig`.
+fn fuzzSeedIntoLocal(out: []u8, frame: []const u8) []const u8 {
+    std.debug.assert(out.len >= 4 + frame.len);
+    std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
+    @memcpy(out[4..][0..frame.len], frame);
+    return out[0 .. 4 + frame.len];
+}
+
+test "the local seedInto helper produces what Smith.slice reads back" {
+    var storage: [32]u8 = undefined;
+    const s = fuzzSeedIntoLocal(&storage, "abcdef");
+    var smith: std.testing.Smith = .{ .in = s };
+    var buf: [32]u8 = undefined;
+    const n = smith.slice(&buf);
+    try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }

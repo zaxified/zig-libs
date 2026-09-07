@@ -185,8 +185,6 @@ test "Act3: 'transport-responder act3 short read test' — 65 bytes fails ShortR
 // under fuzz, and the Appendix A vectors sitting in `kat_vectors.zig` were
 // unreachable from them.
 
-const testkit = @import("testkit");
-
 /// `frame` with one octet XORed. A published act with a single byte changed is
 /// still a well-shaped act, so it reaches the fields; arbitrary bytes almost
 /// always die on the version octet instead.
@@ -229,26 +227,26 @@ fn Distinct(comptime n: usize) type {
 
 const act1_seeds = [_][]const u8{
     // "transport-responder successful handshake" act1, verbatim.
-    testkit.fuzz.seed(kv.act1_bytes),
+    fuzzSeedLocal(kv.act1_bytes),
     // One octet inside `e.pub`: a DIFFERENT ephemeral key that still parses,
     // which is what the distinct-key count below is counting.
-    testkit.fuzz.seed(perturbed(kv.act1_bytes, 5, 0x01)),
+    fuzzSeedLocal(perturbed(kv.act1_bytes, 5, 0x01)),
     // "transport-responder act1 bad MAC test". The framing must still accept
     // it — the tag is not this file's business (the crypto is handshake.zig).
-    testkit.fuzz.seed(kv.act1_bad_mac),
+    fuzzSeedLocal(kv.act1_bad_mac),
     // "transport-responder act1 bad version test": leading 0x01 -> BadVersion.
-    testkit.fuzz.seed(perturbed(kv.act1_bytes, 0, 0x01)),
+    fuzzSeedLocal(perturbed(kv.act1_bytes, 0, 0x01)),
     // "transport-responder act1 short read test": 49 octets -> ShortRead.
-    testkit.fuzz.seed(kv.act1_bytes[0 .. act1_len - 1]),
+    fuzzSeedLocal(kv.act1_bytes[0 .. act1_len - 1]),
     // A full act with 32 octets of trailing garbage, filling the buffer: the
     // parser must ignore the tail rather than read into it.
-    testkit.fuzz.seed(&(kv.act1_bytes.* ++ [_]u8{0xAB} ** 32)),
+    fuzzSeedLocal(&(kv.act1_bytes.* ++ [_]u8{0xAB} ** 32)),
     // Version 0 with every field zero — a third distinct ephemeral key, and
     // the shape the all-zero fuzz round would have produced had the length
     // draw not collapsed to 0 before it.
-    testkit.fuzz.seed(&[_]u8{0x00} ** act1_len),
+    fuzzSeedLocal(&[_]u8{0x00} ** act1_len),
     // The one input this target actually ran, for ever, before the corpus.
-    testkit.fuzz.seed(""),
+    fuzzSeedLocal(""),
 };
 
 fn fuzzAct1Decode(_: void, smith: *std.testing.Smith) !void {
@@ -288,20 +286,20 @@ test "corpus: Act1 seeds reach the parser, counts pinned" {
 
 const act2_seeds = [_][]const u8{
     // "transport-initiator successful handshake" act2, verbatim.
-    testkit.fuzz.seed(kv.act2_bytes),
+    fuzzSeedLocal(kv.act2_bytes),
     // One octet inside `e.pub`: a different ephemeral key that still parses.
-    testkit.fuzz.seed(perturbed(kv.act2_bytes, 5, 0x01)),
+    fuzzSeedLocal(perturbed(kv.act2_bytes, 5, 0x01)),
     // "transport-initiator act2 bad MAC test" — accepted by the framing.
-    testkit.fuzz.seed(kv.act2_bad_mac),
+    fuzzSeedLocal(kv.act2_bad_mac),
     // "transport-initiator act2 bad version test": 0x01 -> BadVersion.
-    testkit.fuzz.seed(perturbed(kv.act2_bytes, 0, 0x01)),
+    fuzzSeedLocal(perturbed(kv.act2_bytes, 0, 0x01)),
     // "transport-initiator act2 short read test": 49 octets -> ShortRead.
-    testkit.fuzz.seed(kv.act2_bytes[0 .. act2_len - 1]),
+    fuzzSeedLocal(kv.act2_bytes[0 .. act2_len - 1]),
     // Trailing octets past the act, filling the buffer.
-    testkit.fuzz.seed(&(kv.act2_bytes.* ++ [_]u8{0xAB} ** 32)),
+    fuzzSeedLocal(&(kv.act2_bytes.* ++ [_]u8{0xAB} ** 32)),
     // All-zero act: version 0, a third distinct key.
-    testkit.fuzz.seed(&[_]u8{0x00} ** act2_len),
-    testkit.fuzz.seed(""),
+    fuzzSeedLocal(&[_]u8{0x00} ** act2_len),
+    fuzzSeedLocal(""),
 };
 
 fn fuzzAct2Decode(_: void, smith: *std.testing.Smith) !void {
@@ -336,24 +334,24 @@ test "corpus: Act2 seeds reach the parser, counts pinned" {
 
 const act3_seeds = [_][]const u8{
     // "transport-responder successful handshake" act3, verbatim.
-    testkit.fuzz.seed(kv.act3_bytes),
+    fuzzSeedLocal(kv.act3_bytes),
     // "transport-responder act3 bad ciphertext test": an octet of `c` changed
     // — a different encrypted static key, still a well-shaped act.
-    testkit.fuzz.seed(kv.act3_bad_ciphertext),
+    fuzzSeedLocal(kv.act3_bad_ciphertext),
     // "transport-responder act3 bad MAC test": the last octet of `t` changed,
     // so `c` is unchanged — accepted, and it adds NO distinct `c`.
-    testkit.fuzz.seed(kv.act3_bad_tag),
+    fuzzSeedLocal(kv.act3_bad_tag),
     // "transport-responder act3 bad rs test": a third distinct `c`.
-    testkit.fuzz.seed(kv.act3_bad_rs_message),
+    fuzzSeedLocal(kv.act3_bad_rs_message),
     // "transport-responder act3 bad version test": 0x01 -> BadVersion.
-    testkit.fuzz.seed(perturbed(kv.act3_bytes, 0, 0x01)),
+    fuzzSeedLocal(perturbed(kv.act3_bytes, 0, 0x01)),
     // "transport-responder act3 short read test": 65 octets -> ShortRead.
-    testkit.fuzz.seed(kv.act3_bytes[0 .. act3_len - 1]),
+    fuzzSeedLocal(kv.act3_bytes[0 .. act3_len - 1]),
     // Trailing octets past the act, filling the buffer.
-    testkit.fuzz.seed(&(kv.act3_bytes.* ++ [_]u8{0xAB} ** 32)),
+    fuzzSeedLocal(&(kv.act3_bytes.* ++ [_]u8{0xAB} ** 32)),
     // All-zero act: version 0, a fourth distinct `c`.
-    testkit.fuzz.seed(&[_]u8{0x00} ** act3_len),
-    testkit.fuzz.seed(""),
+    fuzzSeedLocal(&[_]u8{0x00} ** act3_len),
+    fuzzSeedLocal(""),
 };
 
 fn fuzzAct3Decode(_: void, smith: *std.testing.Smith) !void {
@@ -382,4 +380,30 @@ test "corpus: Act3 seeds reach the parser, counts pinned" {
     try testing.expectEqual(act3_seeds.len - 1, nonempty);
     try testing.expectEqual(@as(usize, 6), accepted);
     try testing.expectEqual(@as(usize, 4), ciphertexts.count);
+}
+
+/// ⛔ A LOCAL COPY of `testkit.fuzz.seed`, and it has to be one. Enrolling this
+/// module in `test_deps` puts it into `zig build check-testonly`, whose probe
+/// imports the PUBLISHED module and references every declaration three levels
+/// deep — and this module deliberately guards a test-only function with a
+/// `@compileError` that fires outside a test build. The two gates contradict
+/// each other: `check-testonly` proves the test dep is not needed by the
+/// published module by touching decls that refuse to be touched.
+///
+/// So the nine lines below stay here rather than the module joining `test_deps`.
+/// The anchor test underneath is what stops this copy drifting from
+/// `modules/testkit/src/fuzz.zig`: it drives the real `std.testing.Smith` over
+/// what this produces, exactly as testkit's own tests do.
+fn fuzzSeedLocal(comptime frame: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
+    }.bytes;
+}
+
+test "the local seed helper produces what Smith.slice reads back" {
+    const s = fuzzSeedLocal("abcdef");
+    var smith: std.testing.Smith = .{ .in = s };
+    var buf: [32]u8 = undefined;
+    const n = smith.slice(&buf);
+    try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }

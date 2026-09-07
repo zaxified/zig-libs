@@ -1475,10 +1475,10 @@ test "both entry points reject an unterminated string OUTSIDE an object" {
 // whole point is the differential oracle below, and on the empty input both
 // entry points trivially agree, so the oracle could never have disagreed.
 
-/// `testkit.fuzz.seed`, aliased so the corpus reads as the JSON5 it is. A
+/// `fuzzSeedLocal`, aliased so the corpus reads as the JSON5 it is. A
 /// corpus entry is not the document: `Smith.slice` reads a little-endian `u32`
 /// length first, so raw source would arrive minus its own first four octets.
-const seed = @import("testkit").fuzz.seed;
+const seed = fuzzSeedLocal;
 
 /// JSON5 documents, in the format the length draw reads. Shared by both
 /// harnesses, because the differential oracle only means something if both
@@ -1764,4 +1764,30 @@ test "a diagnostic key cannot be shadowed by one the input chose" {
         defer parsed.deinit();
         try std.testing.expect(parsed.value.object.get("$err____1") != null);
     }
+}
+
+/// ⛔ A LOCAL COPY of `testkit.fuzz.seed`, and it has to be one. Enrolling this
+/// module in `test_deps` puts it into `zig build check-testonly`, whose probe
+/// imports the PUBLISHED module and references every declaration three levels
+/// deep — and this module deliberately guards a test-only function with a
+/// `@compileError` that fires outside a test build. The two gates contradict
+/// each other: `check-testonly` proves the test dep is not needed by the
+/// published module by touching decls that refuse to be touched.
+///
+/// So the nine lines below stay here rather than the module joining `test_deps`.
+/// The anchor test underneath is what stops this copy drifting from
+/// `modules/testkit/src/fuzz.zig`: it drives the real `std.testing.Smith` over
+/// what this produces, exactly as testkit's own tests do.
+fn fuzzSeedLocal(comptime frame: []const u8) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
+    }.bytes;
+}
+
+test "the local seed helper produces what Smith.slice reads back" {
+    const s = fuzzSeedLocal("abcdef");
+    var smith: std.testing.Smith = .{ .in = s };
+    var buf: [32]u8 = undefined;
+    const n = smith.slice(&buf);
+    try std.testing.expectEqualStrings("abcdef", buf[0..n]);
 }

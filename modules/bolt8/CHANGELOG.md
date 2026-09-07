@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** this module is out of
+  `zig build check-testonly` again, and its fuzz corpus uses a nine-line local
+  copy of `testkit.fuzz`'s seed helper rather than the shared one. Enrolling it
+  via `test_deps` puts it in that gate, whose probe imports the *published*
+  module and references every declaration three levels deep — and this module
+  deliberately guards a test-only function with a `@compileError` that fires
+  outside a test build, so the probe touches a decl that exists to refuse being
+  touched. The two gates contradict each other for any module shaped this way.
+  ⛔ A local copy is the thing `testkit.fuzz` was created to abolish (33 of them
+  across 12 modules). What stops this one drifting is its anchor test, which
+  drives the real `std.testing.Smith` over what the helper produces — the same
+  shape as testkit's own tests, so a future Zig that changes `slice`'s framing
+  fails here loudly instead of leaving the corpus quietly seeding nothing.
+
 - **2026-09-07** — The three `act.zig` fuzz targets had never parsed an act. Each drew
   `smith.bytes(&buf)` and then a ranged length, which returns the range minimum when
   fewer than eight input octets remain — so the length was 0 on every input, and with no
