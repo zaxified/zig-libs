@@ -381,6 +381,10 @@ test "corpus: every certificate seed reaches the parser, and the key kinds are p
         kinds.insert(pk);
     }
     try testing.expectEqual(@as(usize, 0), corpus.store.dropped);
+    // The corpus size is pinned too: a seed quietly deleted would otherwise
+    // move `nonempty` and the assertion below would still hold.
+    try testing.expectEqual(@as(usize, 14), entries.len);
+    // One seed is the empty certificate, deliberately.
     try testing.expectEqual(entries.len - 1, nonempty);
     try testing.expectEqual(@as(usize, 5), parsed);
     try testing.expectEqual(@as(usize, 4), kinds.count());

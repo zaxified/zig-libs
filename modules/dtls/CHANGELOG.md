@@ -54,7 +54,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   walked): ClientHello **0/0/0 → 18/14/91**, ServerHello **0/0/0 → 25/23/45**,
   Certificate **0/0/0 → 8/3/1161 DER octets**, extension blocks **0/0/0 →
   35/32/115 extensions**, `key_share` ClientHello **0/0/0 → 10/9/3809 octets**,
-  `parseLeafPublicKey` **0/0 → 12/5 keys in 4 of the 4 supported kinds**.
+  `parseLeafPublicKey` **0/0 → 13/5 keys in 4 of the 4 supported kinds**.
 
   Two things the collapse had been hiding:
 
@@ -90,8 +90,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   range MINIMUM: `len` was **0 for every input**, and both decoders were handed
   an empty slice. Neither target declared a corpus either, so outside `--fuzz`
   the runner replayed exactly one input each — the empty one. Measured
-  2026-09-07: **0 of 30 / 0 of 15 seeds non-empty and 0 headers decoded before;
-  92 of 92 and 22 of 22 non-empty, 85 and 21 decoded after.**
+  2026-09-07: **1 input each, 0 non-empty and 0 headers decoded before; 92 and
+  22 seeds, all non-empty, 85 and 21 headers decoded after.**
 
   Two knobs went the same way, both drawn after the byte draw and therefore
   after the input was exhausted: the `boolWeighted(1, 6)` that was supposed to
