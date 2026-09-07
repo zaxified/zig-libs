@@ -5,6 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — ⭐ **`goose.fuzzStructuredGoose` had a corpus, and it chose
+  0-or-1 for every decision it made.** The seed generator emitted one
+  little-endian `u64` per draw carrying only a single bit. That was built on the
+  right insight — `Smith` discards a scalar word outside the draw's declared
+  range and returns the range minimum — with the wrong step size, and the
+  arithmetic consequences were total: `gocb_len` (range 1…40) and `go_id_len`
+  (1…26) were **constantly 1**, because 0 is out of range and 1 is the only
+  other value a bit carries; `n_vals` was 0 or 1 of a possible 8; the MMS type
+  switch was 0 or 1 of 0…6, so **five of the seven alternatives were
+  unreachable**, including the `octetString` case with its own nested
+  `smith.bytes`; and every `stNum`, `sqNum`, `confRev` and `timeAllowedToLive`
+  was 0 or 1. The harness's own comment says it lets the fuzzer choose "the
+  names, the replay counters, the timestamp, the flags, the VLAN tag, how many
+  data-set entries and of which MMS types".
+  It now draws one `smith.slice` and reads every choice off a
+  `testkit.fuzz.Cursor`, so a choice octet is an octet. Measured over the same
+  six patterns: **all seven MMS alternatives reached** (was two), `n_vals` up to
+  **8** (was 1), `gocb_ref` up to **27** octets and `go_id` up to **23** (both
+  were 1), a VLAN tag on 4 scripts and Ethernet padding on 6. The corpus keeps
+  one four-octet script on purpose, shorter than the name pool, which reproduces
+  the collapse exactly and is pinned beside the coverage.
+  With this, `check-fuzz-reach` reports **no collapsed target in `iec61850`**:
+  27 at the start of the burn-down, 0 now.
+
 - **2026-09-07** — **`reporting`: the last two R1 harnesses, restructured rather
   than exempted.** `fuzzRcbWrite` opened with the buffered/unbuffered choice and
   `fuzzReassemble` with the data-set member count. A ranged first draw returns

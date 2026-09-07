@@ -734,45 +734,70 @@ test "corpus: every seed reaches the decoders, and the accepted counts are pinne
 // tag, how many data-set entries and of which MMS types, and how much Ethernet
 // padding follows. Everything it emits is by construction decodable, so the
 // deep assertions run on every iteration rather than never.
-/// Seeds so that the harness runs on something other than the empty input when
-/// the suite is built **without** `--fuzz`: the test runner then feeds only
-/// `options.corpus` plus one empty smoke input, and an empty input makes every
-/// draw return its range minimum — which is how a harness ends up passing
-/// while distinguishing nothing at all.
-///
-/// The shape of a seed is not free-form. `Smith` reads one little-endian `u64`
-/// per scalar draw and **discards it for the range minimum if it does not fall
-/// inside that draw's declared range**, so a seed of random bytes puts every
-/// `bool` out of range and collapses back to the all-default input. Hence:
-/// `names_len` raw octets for the single `smith.bytes` draw, then one word per
-/// scalar draw carrying only 0 or 1, taken from a bit pattern. Six patterns,
-/// because a periodic one makes two draws an even distance apart always agree.
-const goose_seed_names_len = 96;
+/// The 96-octet pool the harness slices its three VisibleStrings out of:
+/// `gocb_ref` at 0, `dat_set` at 40, `go_id` at 70.
+const goose_names_len = 96;
 
-fn gooseSeed(comptime bits: u64, comptime n: usize) [n]u8 {
+/// One script: the name pool, then the choice octets.
+///
+/// ⚠ This generator replaces one that emitted a little-endian `u64` **per draw**
+/// carrying only 0 or 1. That was written against the right insight — `Smith`
+/// discards a scalar word that falls outside the draw's declared range and
+/// returns the range minimum — but the wrong step size, and the arithmetic
+/// consequences were total: `gocb_len` (range 1…40) and `go_id_len` (1…26) were
+/// **constantly 1**, because 0 is out of range and 1 is the only other value a
+/// bit can carry; `n_vals` was 0 or 1 out of 0…8; the MMS type switch was 0 or 1
+/// out of 0…6, so **five of the seven alternatives were unreachable**, the
+/// `octetString` case's own `smith.bytes` among them; and every `smith.value(u32)`
+/// counter — `stNum`, `sqNum`, `confRev`, `timeAllowedToLive` — was 0 or 1. A
+/// harness whose comment says it lets the fuzzer choose "the names, the replay
+/// counters, the timestamp, the flags, the VLAN tag, how many data-set entries
+/// and of which MMS types" chose 0-or-1 for every one of them.
+///
+/// The harness now reads its choices off a `testkit.fuzz.Cursor` instead of from
+/// `Smith` scalars, so a choice octet is just an octet and this generator emits
+/// plain pseudo-random bytes. Hand-writing the choice half is not on offer — the
+/// harness makes about sixty of them — so what matters is that the corpus COVERS
+/// the space, and the guard below measures that rather than asserting it.
+fn gooseScript(comptime bits: u64, comptime n: usize) [n]u8 {
     @setEvalBranchQuota(100_000);
     var out: [n]u8 = undefined;
     var x: u32 = @truncate(bits ^ (bits >> 32));
-    for (out[0..goose_seed_names_len]) |*b| {
+    for (&out) |*b| {
         x = x *% 1664525 +% 1013904223;
         b.* = @truncate(x >> 24);
-    }
-    var i: usize = goose_seed_names_len;
-    var w: u6 = 0;
-    while (i + 8 <= n) : (i += 8) {
-        std.mem.writeInt(u64, out[i..][0..8], (bits >> w) & 1, .little);
-        w +%= 1;
     }
     return out;
 }
 
 const goose_seeds: []const []const u8 = &.{
-    &gooseSeed(0xFFFF_FFFF_FFFF_FFFF, 640),
-    &gooseSeed(0x9E37_79B9_7F4A_7C15, 640),
-    &gooseSeed(0x0123_4567_89AB_CDEF, 640),
-    &gooseSeed(0xF0E1_D2C3_B4A5_9687, 640),
-    &gooseSeed(0x6C62_1F4D_3A98_5E27, 640),
-    &gooseSeed(0xD5B8_0E93_C741_A26F, 640),
+    seed_raw(&gooseScript(0xFFFF_FFFF_FFFF_FFFF, 256)),
+    seed_raw(&gooseScript(0x9E37_79B9_7F4A_7C15, 256)),
+    seed_raw(&gooseScript(0x0123_4567_89AB_CDEF, 256)),
+    seed_raw(&gooseScript(0xF0E1_D2C3_B4A5_9687, 256)),
+    seed_raw(&gooseScript(0x6C62_1F4D_3A98_5E27, 256)),
+    seed_raw(&gooseScript(0xD5B8_0E93_C741_A26F, 256)),
+    // A script shorter than the name pool: the pool is zero-filled past it and
+    // the cursor has nothing left, so every choice is the range minimum. This is
+    // the collapsed harness, kept in the corpus on purpose.
+    seed_raw("\x41\x42\x43\x44"),
+};
+
+/// `testkit.fuzz.seed`, for the scripts above. Named apart from `seed` (the hex
+/// form, used by `fuzzDecode`'s corpus) because both are wanted in this file.
+const seed_raw = testkit.fuzz.seed;
+
+/// What one script built, so the corpus guard can measure the corpus rather
+/// than assert that it ran.
+const GooseShape = struct {
+    gocb_len: usize = 0,
+    dat_set_len: usize = 0,
+    go_id_len: usize = 0,
+    n_vals: usize = 0,
+    /// Bit `i` set means MMS alternative `i` of the seven was emitted.
+    types: u8 = 0,
+    vlan: bool = false,
+    pad: usize = 0,
 };
 
 test "fuzz: a publisher-shaped GOOSE frame round-trips through decode and encode" {
@@ -780,37 +805,66 @@ test "fuzz: a publisher-shaped GOOSE frame round-trips through decode and encode
 }
 
 fn fuzzStructuredGoose(_: void, smith: *std.testing.Smith) !void {
-    // The three VisibleStrings. `go_id` is kept non-empty on purpose: an absent
-    // one decodes as `gocb_ref` (ASN.1 DEFAULT), which is a legitimate
-    // asymmetry between decode and encode and not what this harness is testing.
-    var names: [96]u8 = undefined;
-    smith.bytes(&names);
-    const gocb_len = smith.valueRangeAtMost(u8, 1, 40);
-    const dat_set_len = smith.valueRangeAtMost(u8, 0, 30);
-    const go_id_len = smith.valueRangeAtMost(u8, 1, 26);
+    // ⚠ One `smith.slice`, and the octets are the script. This harness used to
+    // open `smith.bytes(&names)` and then take every structural choice from a
+    // ranged `Smith` draw; `check-fuzz-reach` named three of those and the
+    // generator above records what the arithmetic did to the rest.
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runStructuredGoose(script[0..n]);
+}
+
+/// The body of `fuzzStructuredGoose`, factored out so the harness and the corpus
+/// guard drive the SAME publisher from the same octets. A guard measuring a
+/// different corpus from the one the harness gets is not a guard.
+///
+/// The script is a 96-octet name pool followed by the choice octets.
+fn runStructuredGoose(script: []const u8) !GooseShape {
+    var shape: GooseShape = .{};
+
+    // The three VisibleStrings, sliced out of the pool. `go_id` is kept
+    // non-empty on purpose: an absent one decodes as `gocb_ref` (ASN.1
+    // DEFAULT), which is a legitimate asymmetry between decode and encode and
+    // not what this harness is testing.
+    var names: [goose_names_len]u8 = @splat(0);
+    const from_script = @min(goose_names_len, script.len);
+    @memcpy(names[0..from_script], script[0..from_script]);
+    var c = testkit.fuzz.Cursor{
+        .bytes = if (script.len > goose_names_len) script[goose_names_len..] else &.{},
+    };
+
+    const gocb_len: usize = c.ranged(1, 40);
+    const dat_set_len: usize = c.ranged(0, 30);
+    const go_id_len: usize = c.ranged(1, 26);
     const gocb_ref = names[0..gocb_len];
     const dat_set = names[40..][0..dat_set_len];
     const go_id = names[70..][0..go_id_len];
+    shape.gocb_len = gocb_len;
+    shape.dat_set_len = dat_set_len;
+    shape.go_id_len = go_id_len;
 
     // The data-set entries, each a complete `Data` TLV built by the module's
     // own emitters, so `allData` is well-formed and `validate()` accepts it.
     var vstore: [8][40]u8 = undefined;
     var vals: [8][]const u8 = undefined;
-    const n_vals = smith.valueRangeAtMost(u8, 0, vstore.len);
+    const n_vals: usize = c.ranged(0, vstore.len);
+    shape.n_vals = n_vals;
     var i: usize = 0;
     while (i < n_vals) : (i += 1) {
         var vw = ber.Writer.init(&vstore[i]);
-        switch (smith.valueRangeAtMost(u8, 0, 6)) {
-            0 => try mmsdata.Emit.boolean(&vw, smith.value(bool)),
-            1 => try mmsdata.Emit.integer(&vw, smith.value(i32)),
-            2 => try mmsdata.Emit.unsigned(&vw, smith.value(u32)),
-            3 => try mmsdata.Emit.bitString(&vw, smith.value(u16), smith.valueRangeAtMost(u8, 0, 16)),
+        const kind = c.ranged(0, 6);
+        shape.types |= @as(u8, 1) << @intCast(kind);
+        switch (kind) {
+            0 => try mmsdata.Emit.boolean(&vw, scriptBool(&c)),
+            1 => try mmsdata.Emit.integer(&vw, @as(i32, @bitCast(scriptU32(&c)))),
+            2 => try mmsdata.Emit.unsigned(&vw, scriptU32(&c)),
+            3 => try mmsdata.Emit.bitString(&vw, c.word(), @intCast(c.ranged(0, 16))),
             4 => {
                 var s: [8]u8 = undefined;
-                smith.bytes(&s);
-                try mmsdata.Emit.octetString(&vw, s[0..smith.valueRangeAtMost(u8, 0, 8)]);
+                for (&s) |*b| b.* = c.byte();
+                try mmsdata.Emit.octetString(&vw, s[0..c.ranged(0, 8)]);
             },
-            5 => try mmsdata.Emit.utcTime(&vw, mmsdata.UtcTime.fromMillis(smith.value(u32), null)),
+            5 => try mmsdata.Emit.utcTime(&vw, mmsdata.UtcTime.fromMillis(scriptU32(&c), null)),
             else => try mmsdata.Emit.float(&vw, 1.5),
         }
         vals[i] = vw.done();
@@ -818,24 +872,24 @@ fn fuzzStructuredGoose(_: void, smith: *std.testing.Smith) !void {
 
     const p = Pdu{
         .gocb_ref = gocb_ref,
-        .time_allowed_to_live_ms = smith.value(u32),
+        .time_allowed_to_live_ms = scriptU32(&c),
         .dat_set = dat_set,
         .go_id = go_id,
         .t = .{
-            .seconds = smith.value(u32),
-            .fraction = smith.value(u24),
-            .leap_seconds_known = smith.value(bool),
-            .clock_failure = smith.value(bool),
-            .clock_not_synchronized = smith.value(bool),
-            .accuracy = if (smith.value(bool)) null else smith.valueRangeAtMost(u5, 0, 24),
+            .seconds = scriptU32(&c),
+            .fraction = @truncate(scriptU32(&c)),
+            .leap_seconds_known = scriptBool(&c),
+            .clock_failure = scriptBool(&c),
+            .clock_not_synchronized = scriptBool(&c),
+            .accuracy = if (scriptBool(&c)) null else @intCast(c.ranged(0, 24)),
         },
-        .st_num = smith.value(u32),
-        .sq_num = smith.value(u32),
-        .test_mode = smith.value(bool),
-        .conf_rev = smith.value(u32),
-        .nds_com = smith.value(bool),
+        .st_num = scriptU32(&c),
+        .sq_num = scriptU32(&c),
+        .test_mode = scriptBool(&c),
+        .conf_rev = scriptU32(&c),
+        .nds_com = scriptBool(&c),
         // Deliberately not derived: `encode` must ignore it and count entries.
-        .num_dat_set_entries = smith.value(u32),
+        .num_dat_set_entries = scriptU32(&c),
         .all_data = &.{},
     };
 
@@ -843,28 +897,30 @@ fn fuzzStructuredGoose(_: void, smith: *std.testing.Smith) !void {
     const pdu = try p.encode(vals[0..n_vals], &pbuf);
 
     const f = Frame{
-        .dst = if (smith.value(bool))
-            [_]u8{ 0x01, 0x0C, 0xCD, 0x01, 0x00, smith.value(u8) }
+        .dst = if (scriptBool(&c))
+            [_]u8{ 0x01, 0x0C, 0xCD, 0x01, 0x00, c.byte() }
         else
-            [_]u8{ smith.value(u8), 0, 0, 0, 0, 1 },
+            [_]u8{ c.byte(), 0, 0, 0, 0, 1 },
         .src = [_]u8{ 0x02, 0, 0, 0, 0, 1 },
-        .vlan = if (smith.value(bool)) null else .{
-            .priority = smith.value(u3),
-            .dei = smith.value(bool),
-            .id = smith.value(u12),
+        .vlan = if (scriptBool(&c)) null else .{
+            .priority = @truncate(c.byte()),
+            .dei = scriptBool(&c),
+            .id = @truncate(c.word()),
         },
-        .appid = smith.value(u16),
-        .reserved1 = smith.value(u16),
-        .reserved2 = smith.value(u16),
+        .appid = c.word(),
+        .reserved1 = c.word(),
+        .reserved2 = c.word(),
         .pdu = &.{},
         .total_len = 0,
     };
+    shape.vlan = f.vlan != null;
     var fbuf: [1024]u8 = undefined;
     const frame = try f.encode(pdu, &fbuf);
     const frame_len = frame.len;
     // Ethernet pads a short frame to 60 octets; `Length` is the only end marker.
-    const pad = smith.valueRangeAtMost(u8, 0, 60);
-    @memset(fbuf[frame_len..][0..pad], smith.value(u8));
+    const pad: usize = c.ranged(0, 60);
+    shape.pad = pad;
+    @memset(fbuf[frame_len..][0..pad], c.byte());
     const on_the_wire = fbuf[0 .. frame_len + pad];
 
     const back = try Frame.decode(on_the_wire);
@@ -887,8 +943,8 @@ fn fuzzStructuredGoose(_: void, smith: *std.testing.Smith) !void {
     try testing.expectEqual(p.conf_rev, q.conf_rev);
     try testing.expectEqual(p.test_mode, q.test_mode);
     try testing.expectEqual(p.nds_com, q.nds_com);
-    try testing.expectEqual(@as(u32, n_vals), q.num_dat_set_entries);
-    try testing.expectEqual(@as(usize, n_vals), try q.valueCount());
+    try testing.expectEqual(@as(u32, @intCast(n_vals)), q.num_dat_set_entries);
+    try testing.expectEqual(n_vals, try q.valueCount());
     try testing.expectEqual(p.t.seconds, q.t.seconds);
     try testing.expectEqual(p.t.fraction, q.t.fraction);
     try testing.expectEqual(p.t.accuracy, q.t.accuracy);
@@ -902,7 +958,7 @@ fn fuzzStructuredGoose(_: void, smith: *std.testing.Smith) !void {
         try testing.expectEqualSlices(u8, vals[m], d.raw);
         seen[m] = d.raw;
     }
-    try testing.expectEqual(@as(usize, n_vals), m);
+    try testing.expectEqual(n_vals, m);
     var again: [768]u8 = undefined;
     try testing.expectEqualSlices(u8, pdu, try q.encode(seen[0..m], &again));
     var frame_again: [1024]u8 = undefined;
@@ -912,22 +968,80 @@ fn fuzzStructuredGoose(_: void, smith: *std.testing.Smith) !void {
     // is asserted about the *result* — the point is that the decoders are
     // reached with an input that got past framing, which is where the earlier
     // harness could not go.
-    const flips = smith.valueRangeAtMost(u8, 1, 6);
+    const flips = c.ranged(1, 6);
     var k: usize = 0;
     while (k < flips) : (k += 1) {
-        const at = smith.index(on_the_wire.len);
-        on_the_wire[at] ^= smith.value(u8);
+        const at = c.ranged(0, @intCast(on_the_wire.len - 1));
+        on_the_wire[at] ^= c.byte();
     }
-    const bad = Frame.decode(on_the_wire) catch return;
+    const bad = Frame.decode(on_the_wire) catch return shape;
     if (bad.total_len > on_the_wire.len) return error.FrameLongerThanInput;
     if (bad.pdu.len > on_the_wire.len) return error.PduLongerThanInput;
-    const bp = Pdu.decode(bad.pdu) catch return;
+    const bp = Pdu.decode(bad.pdu) catch return shape;
     var bit = bp.values();
     var guard: usize = 0;
     while (guard < 256) : (guard += 1) {
         const d = (bit.next() catch break) orelse break;
         if (d.raw.len > bad.pdu.len) return error.ValueLongerThanPdu;
     }
+    return shape;
+}
+
+fn scriptBool(c: *testkit.fuzz.Cursor) bool {
+    return c.byte() & 1 == 1;
+}
+
+fn scriptU32(c: *testkit.fuzz.Cursor) u32 {
+    const hi: u32 = c.word();
+    const lo: u32 = c.word();
+    return (hi << 16) | lo;
+}
+
+test "corpus: the publisher scripts cover the shape space, and the coverage is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. This
+    // guard is not about acceptance — every frame this harness builds is
+    // decodable by construction — it is about **coverage**, because that is
+    // what the old corpus lost. Its seeds carried one `u64` per draw holding
+    // only 0 or 1, which made `gocb_len` and `go_id_len` the constant 1, capped
+    // `n_vals` at 1 of a possible 8, and left five of the seven MMS
+    // alternatives unreachable. Those are the numbers pinned here.
+    var types: u8 = 0;
+    var max_vals: usize = 0;
+    var max_gocb: usize = 0;
+    var max_go_id: usize = 0;
+    var vlan_seen: usize = 0;
+    var pad_seen: usize = 0;
+    for (goose_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        const shape = try runStructuredGoose(script[0..n]);
+        types |= shape.types;
+        max_vals = @max(max_vals, shape.n_vals);
+        max_gocb = @max(max_gocb, shape.gocb_len);
+        max_go_id = @max(max_go_id, shape.go_id_len);
+        if (shape.vlan) vlan_seen += 1;
+        if (shape.pad != 0) pad_seen += 1;
+    }
+    // All seven MMS alternatives, which is `0b111_1111`.
+    try testing.expectEqual(@as(u8, 0x7F), types);
+    try testing.expectEqual(@as(usize, 8), max_vals);
+    try testing.expectEqual(@as(usize, 27), max_gocb);
+    try testing.expectEqual(@as(usize, 23), max_go_id);
+    try testing.expectEqual(@as(usize, 4), vlan_seen);
+    try testing.expectEqual(@as(usize, 6), pad_seen);
+
+    // ⭐ And the collapse, kept as a measurement rather than a story: the last
+    // corpus entry is a four-octet script, shorter than the name pool, so the
+    // cursor is empty and every choice is the range minimum — which is what the
+    // old ranged draws returned. One data-set entry of zero, both name lengths
+    // pinned at their minimum, no VLAN tag, no padding.
+    const collapsed = try runStructuredGoose(&.{});
+    try testing.expectEqual(@as(usize, 0), collapsed.n_vals);
+    try testing.expectEqual(@as(u8, 0), collapsed.types);
+    try testing.expectEqual(@as(usize, 1), collapsed.gocb_len);
+    try testing.expectEqual(@as(usize, 1), collapsed.go_id_len);
+    try testing.expectEqual(@as(usize, 0), collapsed.pad);
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
