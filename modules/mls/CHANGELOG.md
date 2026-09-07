@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — `fuzzMessageInput`'s header stamp had never executed, for a third
+  independent reason. The knob is drawn AFTER the byte draw, `Smith.slice` leaves the seed
+  exhausted, and an exhausted `value(u8)` is the weight minimum — measured **0 of 14 seeds**
+  stamped. The corpus gains one seed that can only decode because the branch ran: the complete
+  `public_message` frame with its version and wire-format octets zeroed, plus the word `1`
+  (`1 & 3 != 0` enables the stamp, `1 >> 5` selects `mls_public_message`). `fuzzMessageInput`
+  now returns whether it stamped, so the guard pins `stamped` and `stamped_accepted` as exact
+  counts from the same call the harness makes; `accepted` goes 5 → 6 and the five wire formats
+  are unchanged. Tests only.
+
 - **2026-09-07** — The three untrusted-wire fuzz targets — `MLSMessage.decode`,
   `RatchetTree.decode` and `LeafNode.decode` — had never seen a message, a tree or a leaf.
   Each drew `smith.bytes(&buf)` and then a ranged length, which returns the range minimum

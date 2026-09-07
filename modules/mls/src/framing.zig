@@ -1536,7 +1536,11 @@ const message_literal_seeds = [_][]const u8{
 const MessageCorpus = struct {
     frames: [5][512]u8 = undefined,
     stores: [5][4 + 512]u8 = undefined,
-    entries: [5 + message_literal_seeds.len][]const u8 = undefined,
+    /// The header-stamp seed: the public_message frame with its first four
+    /// octets zeroed, plus the `u64` word the knob reads. See `build`.
+    headerless: [512]u8 = undefined,
+    stamp_store: [4 + 512 + 8]u8 = undefined,
+    entries: [5 + message_literal_seeds.len + 1][]const u8 = undefined,
 
     fn build(self: *MessageCorpus) ![]const []const u8 {
         const leaf: tree.LeafNode = .{
@@ -1602,36 +1606,65 @@ const MessageCorpus = struct {
                 .signature = &[_]u8{0xDD} ** 64,
             } },
         };
+        var public_len: usize = 0;
         for (msgs, 0..) |m, i| {
             var w = codec.Writer.init(&self.frames[i]);
             try m.encode(&w);
-            self.entries[i] = testkit.fuzz.seedInto(&self.stores[i], w.finish());
+            const frame = w.finish();
+            if (i == 0) public_len = frame.len;
+            self.entries[i] = testkit.fuzz.seedInto(&self.stores[i], frame);
         }
-        @memcpy(self.entries[5..], &message_literal_seeds);
+        @memcpy(self.entries[5..][0..message_literal_seeds.len], &message_literal_seeds);
+
+        // ⛔ The knob `fuzzMessageInput` draws after the byte draw. Measured
+        // 2026-09-08 over the fourteen seeds above: it returned **0** on every
+        // one of them — `Smith.slice` leaves the seed exhausted and an
+        // exhausted `value(u8)` is the weight minimum — so `knob & 3 != 0` was
+        // false and the header stamp had never executed, for the third
+        // independent reason in a row (see the note above the corpus).
+        //
+        // This seed is the complete public_message frame with its version and
+        // wire-format octets ZEROED, followed by the word `1`: `1 & 3 != 0`
+        // enables the stamp and `1 >> 5 == 0` selects wire format
+        // `1 + 0 % 5 = mls_public_message`, which is the format the body
+        // behind those four octets actually is. It is refused as it stands
+        // (version 0 is not mls10) and decodes only because the stamp ran —
+        // the only input in the ordinary lane that can show the branch does
+        // anything.
+        @memcpy(self.headerless[0..public_len], self.frames[0][0..public_len]);
+        @memset(self.headerless[0..4], 0);
+        const framed = testkit.fuzz.seedInto(&self.stamp_store, self.headerless[0..public_len]);
+        std.mem.writeInt(u64, self.stamp_store[framed.len..][0..8], 1, .little);
+        self.entries[self.entries.len - 1] = self.stamp_store[0 .. framed.len + 8];
         return &self.entries;
     }
 };
 
 /// The draw one fuzz iteration makes, factored out so the guard below measures
 /// the SAME input the harness is handed rather than a look-alike.
-fn fuzzMessageInput(smith: *std.testing.Smith, buf: *[2048]u8) []const u8 {
+fn fuzzMessageInput(smith: *std.testing.Smith, buf: *[2048]u8) struct { input: []const u8, stamped: bool } {
     // ⚠ One `smith.slice`, never `bytes` followed by a ranged length.
     const len: usize = smith.slice(buf);
     // A `--fuzz`-only amplifier: the two fields the decoder reads FIRST are the
     // two it is strictest about, so left to chance a drawn input reaches the
     // sub-decoders about once in 13 000. Stamping a legal header over the front
-    // fixes that — but ONLY under `--fuzz`, where there is input left to draw
-    // the knob from. On a corpus replay the seed has been consumed, `value(u8)`
-    // is 0, and nothing is stamped, which is correct: every seed above already
-    // carries the header it means to carry. Nothing here may claim a rate.
+    // fixes that — but ONLY where the knob has octets to read. On a corpus
+    // replay the seed has been consumed by the draw above, so `value(u8)` is 0
+    // and nothing is stamped, which is what all but one of the seeds want:
+    // they already carry the header they mean to carry. The exception is the
+    // `stamp_store` seed, which appends the word the knob reads precisely so
+    // this branch is not dead in the ordinary lane. Nothing here may claim a
+    // rate — `stamped` is returned so the guard can pin the count instead.
+    var stamped = false;
     if (len >= 4) {
         const knob = smith.value(u8);
         if (knob & 3 != 0) {
             std.mem.writeInt(u16, buf[0..2], @intFromEnum(keyschedule.ProtocolVersion.mls10), .big);
             std.mem.writeInt(u16, buf[2..4], 1 + @as(u16, knob >> 5) % 5, .big);
+            stamped = true;
         }
     }
-    return buf[0..len];
+    return .{ .input = buf[0..len], .stamped = stamped };
 }
 
 test "fuzz: MLSMessage.decode never panics on arbitrary bytes" {
@@ -1641,7 +1674,7 @@ test "fuzz: MLSMessage.decode never panics on arbitrary bytes" {
 
 fn fuzzMlsMessageDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [2048]u8 = undefined;
-    _ = fuzzDecodeOnce(std.testing.allocator, fuzzMessageInput(smith, &buf)) catch return;
+    _ = fuzzDecodeOnce(std.testing.allocator, fuzzMessageInput(smith, &buf).input) catch return;
 }
 
 test "corpus: the MLSMessage seeds reach the decoder, and the counts are pinned" {
@@ -1656,21 +1689,32 @@ test "corpus: the MLSMessage seeds reach the decoder, and the counts are pinned"
     // target ever ran was the empty slice.
     var nonempty: usize = 0;
     var accepted: usize = 0;
+    var stamped: usize = 0;
+    var stamped_accepted: usize = 0;
     var formats = std.EnumSet(WireFormat).initEmpty();
     var corpus: MessageCorpus = .{};
     const entries = try corpus.build();
     for (entries) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [2048]u8 = undefined;
-        const input = fuzzMessageInput(&smith, &buf);
-        if (input.len != 0) nonempty += 1;
-        const wf = fuzzDecodeOnce(testing.allocator, input) catch continue;
+        const drawn = fuzzMessageInput(&smith, &buf);
+        if (drawn.input.len != 0) nonempty += 1;
+        if (drawn.stamped) stamped += 1;
+        const wf = fuzzDecodeOnce(testing.allocator, drawn.input) catch continue;
         accepted += 1;
+        if (drawn.stamped) stamped_accepted += 1;
         formats.insert(wf);
     }
     try testing.expectEqual(entries.len - 1, nonempty); // all but seed("")
-    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 6), accepted);
     try testing.expectEqual(@as(usize, 5), formats.count());
+    // ⛔ The knob drawn AFTER the byte draw. Measured 2026-09-08: the stamp
+    // fired on 0 of the 14 seeds that carry no tail, so the branch was dead in
+    // the ordinary lane. `stamped_accepted` is the number that says it did
+    // something — that seed's first four octets are zeroed, so version 0 is
+    // refused unless the stamp rewrote them.
+    try testing.expectEqual(@as(usize, 1), stamped);
+    try testing.expectEqual(@as(usize, 1), stamped_accepted);
 }
 
 /// The body of one fuzz iteration, named so the reachability test below can
