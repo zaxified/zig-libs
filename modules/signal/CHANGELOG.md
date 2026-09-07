@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **Test-only: both ratchet fuzz harnesses ran one degenerate
+  input for ever, and the second one's ciphertext was ALWAYS empty.**
+  `fuzzHeaderFromBytes` drew `smith.bytes(&buf)` then
+  `smith.valueRangeAtMost(u16, 0, buf.len)`; `bytes` consumes
+  `@min(buf.len, in.len)` octets, so the ranged draw found fewer than the
+  eight it reads as a little-endian `u64` and returned the range MINIMUM.
+  `len` was 0 for every input the ordinary lane can carry and
+  `Header.fromBytes` refused it at its exact-length gate without reading an
+  octet. `fuzzDecrypt` had the same defect one layer down: three draws, of
+  which only the first (`header_bytes`) got any input, so **`ct_len` was 0 on
+  every round and `aeadOpen` — named in the harness's own comment as the thing
+  "arbitrary ciphertext drives" — was handed an empty slice for ever**. Both
+  now draw once with `smith.slice`, `fuzzDecrypt` treating the seed as
+  `header ‖ ciphertext` (`Smith.slice` memsets the tail, so the leading 40
+  octets are always a well-formed header). Measured 2026-09-07: **header
+  target 0 of 12 seeds non-empty and 0 headers decoded before, 11 and 7 after;
+  decrypt target 0 ciphertext octets across the corpus before, 511 after, with
+  `TooManySkippedMessages` reached for the first time.** ⭐ The measurement
+  also showed why a corpus of zero-filled headers buys nothing here: an
+  all-zero `dh` is a low-order point, so `dhRatchet` refuses it with
+  `error.IdentityElement` **before** the skip counters are consulted, and
+  `skipMessageKeys` cannot be reached at all. The seeds that exercise it carry
+  the X25519 base point. ⭐ The guard pins `accepted == 0` deliberately: a
+  frozen seed cannot authenticate against a session whose keypairs
+  `seedSession` generates fresh on every round, so acceptance is not
+  available as a reach signal and the distinct refusals are pinned instead.
+
 - **2026-09-01** — **Security audit: the post-quantum half of the handshake was
   the only part drawn from a source permitted to degrade.** `CONVENTIONS.md`
   §2.2 requires anything that becomes a key or ephemeral key material to come
