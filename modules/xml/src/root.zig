@@ -2082,21 +2082,117 @@ test "unsupported: XML 1.1 version rejected" {
 // entity state machines instead of bouncing off "doesn't even start with
 // `<`" on the first byte.
 
+// ⚠ This harness opened with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so `len` was 0 on every
+// input a corpus can carry and `parse` was handed an empty document. The
+// biasing loop above is inside `buf[0..len]`, so with `len == 0` it never ran
+// either: the paragraph promising a byte pool biased toward XML syntax was
+// describing code that had never executed. It also had no corpus, so outside
+// `--fuzz` the target ran exactly one input for ever — `parse("")`, which is
+// rejected on the first byte.
+//
+// The biasing stays, because under `--fuzz` it is doing real work, but it is
+// now inert on a corpus replay by construction: `boolWeighted` after an
+// exhausted input returns false, so a seed reaches `parse` verbatim. The guard
+// below pins that, because a biasing loop that DID fire would silently corrupt
+// every seed into something the parser rejects.
+
+/// `testkit.fuzz.seed`, aliased so the corpus reads as the documents it is. A
+/// corpus entry is not the document: `Smith.slice` reads a little-endian `u32`
+/// length first, so raw source would arrive minus its own first four octets.
+const seed = @import("testkit").fuzz.seed;
+
+/// XML documents, in the format the length draw reads: the constructs the value
+/// tests above pin, and the refusals this module exists to make — the duplicate
+/// `ID` signature-wrapping guard, invalid UTF-8, a non-UTF-8 encoding
+/// declaration, XML 1.1, and the structural bounds.
+const parse_seeds = [_][]const u8{
+    seed("<a/>"), // the smallest well-formed document
+    seed("<?xml version=\"1.0\" encoding=\"UTF-8\"?><r><a x=\"1\"/><b>text</b></r>"), // prolog, attributes, text
+    seed("<r><![CDATA[<not><markup/>]]></r>"), // a CDATA section carrying markup characters
+    seed("<r>&amp;&lt;&gt;&quot;&apos;&#65;&#x41;</r>"), // every predefined entity plus both numeric forms
+    seed("<r xmlns:h=\"urn:h\" xmlns=\"urn:d\"><h:a/><b/></r>"), // namespace declarations, prefixed and default
+    seed("<r><!-- comment --><?pi data?><a/></r>"), // comments and processing instructions
+    seed("<r>\xc3\xa1\xc4\x8d\xc5\xbe</r>"), // multi-byte UTF-8 in content
+    seed("<r><a ID=\"x\"/><b ID=\"x\"/></r>"), // duplicate ID → the signature-wrapping refusal
+    seed("<a>\xff\xfe</a>"), // invalid UTF-8 → InvalidCharacter
+    seed("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a/>"), // → UnsupportedEncoding
+    seed("<?xml version=\"1.1\"?><a/>"), // → UnsupportedVersion
+    seed("<a><b></a>"), // mismatched end tag
+    seed("<a"), // truncated inside the start tag
+    seed("<a b=\"unterminated"), // truncated inside an attribute value
+    seed("<r>&nosuch;</r>"), // an entity reference that is not defined
+    seed("not markup at all"), // no '<' anywhere
+};
+
 test "fuzz: parse never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParse, .{});
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_seeds });
 }
 
+const fuzz_alphabet = "<>/=\"'&;! ?abcCDATA0123\n\t";
+
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
-    const alphabet = "<>/=\"'&;! ?abcCDATA0123\n\t";
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     for (buf[0..len]) |*c| {
-        if (smith.boolWeighted(1, 3)) c.* = alphabet[c.* % alphabet.len];
+        if (smith.boolWeighted(1, 3)) c.* = fuzz_alphabet[c.* % fuzz_alphabet.len];
     }
 
     var doc = parse(testing.allocator, buf[0..len], .{}) catch return;
-    doc.deinit();
+    defer doc.deinit();
+    var walked: usize = 0;
+    countElements(doc.root, &walked);
+}
+
+fn countElements(el: *const Element, n: *usize) void {
+    n.* += 1;
+    for (el.children) |c| switch (c.content) {
+        .element => |child| countElements(child, n),
+        else => {},
+    };
+}
+
+test "corpus: every seed reaches the parser unmangled, and the elements built are pinned" {
+    // ⭐ Three numbers, and only the last two are about reach.
+    //
+    // `mangled` guards the biasing loop: it must be 0 on a replay, otherwise the
+    // corpus is not the corpus — a seed would arrive with a quarter of its bytes
+    // replaced and every document would be a syntax error, which is precisely
+    // the kind of silent nothing this whole exercise is about.
+    //
+    // Elements built is the number that matters. `parse("")` is an error here,
+    // so acceptance is not degenerate the way it is in a lenient parser — but an
+    // accepted document can still be a bare `<a/>`, so element count is what
+    // separates "the parser ran" from "the parser ran on something".
+    var nonempty: usize = 0;
+    var mangled: usize = 0;
+    var accepted: usize = 0;
+    var elements: usize = 0;
+    for (parse_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        for (buf[0..len]) |*c| {
+            if (smith.boolWeighted(1, 3)) {
+                c.* = fuzz_alphabet[c.* % fuzz_alphabet.len];
+                mangled += 1;
+            }
+        }
+        var doc = parse(testing.allocator, buf[0..len], .{}) catch continue;
+        defer doc.deinit();
+        accepted += 1;
+        countElements(doc.root, &elements);
+    }
+    try testing.expectEqual(parse_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 0), mangled);
+    // Measured 2026-09-07: with the collapsing draw, 0 of 16 seeds arrived
+    // non-empty, 0 were accepted and 0 elements were built. After: 16 / 7 / 12,
+    // and `mangled` measured 0 — the biasing loop is confirmed inert on a replay.
+    try testing.expectEqual(@as(usize, 7), accepted);
+    try testing.expectEqual(@as(usize, 12), elements);
 }
 
 // ── vendored W3C XML Conformance Test Suite (xmlconf) ────────────────────────

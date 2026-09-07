@@ -1176,8 +1176,95 @@ test "deserialize: a wire-supplied count larger than the input can supply is rej
     try testing.expectEqual(@as(usize, 0), built.rows.len);
 }
 
+// ── fuzz: `deserialize` is the untrusted-input surface ─────────────────────
+//
+// ⚠ This harness opened with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so the length was 0 on
+// every input a corpus can carry and `deserialize` was handed an empty slice,
+// which fails on the very first `u32v()`. It also had no corpus, so outside
+// `--fuzz` it ran that one empty input for ever: the `ncol`/`nrow` bounds above
+// (both found by an actual fuzz sweep, one of them a 32 GB OOM) had no
+// regression coverage from this target at all.
+
+const testkit = @import("testkit");
+
+/// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the wire images
+/// it is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw image would arrive minus its own first four
+/// octets.
+const seed = testkit.fuzz.seedHex;
+
+/// Malformed images, in the format the length draw reads. Every refusal the
+/// value tests above pin, expressed at the wire level: the two count-bound
+/// rejections, a truncated header, an out-of-range type tag, and an unknown
+/// value tag.
+const malformed_seeds = [_][]const u8{
+    seed(""), // no `ncol` field at all
+    seed("01"), // `ncol` truncated mid-field
+    seed("ffffffff"), // ncol = 4294967295 with nothing behind it — the OOM bound
+    seed("0100000000000000" ++ "01" ++ "ffffffff"), // one column, then nrow = 4294967295
+    seed("0100000000000000" ++ "ff" ++ "00000000"), // type tag 255 is not a `ColumnType`
+    seed("0100000000000000" ++ "01" ++ "01000000" ++ "07"), // one row whose value tag is 7
+    seed("0100000000000000" ++ "01" ++ "01000000" ++ "01" ++ "0102"), // an `int` cell truncated to 2 octets
+    seed("01000000" ++ "ffffffff" ++ "00"), // a column name claiming 4 GB
+    seed("0100000000000000" ++ "02" ++ "01000000" ++ "03" ++ "ffffffff"), // a `text` cell claiming 4 GB
+    seed("00000000" ++ "ffffffff"), // zero columns, nrow = 4294967295 (the `@max(1, ncol)` case)
+};
+
+/// The whole corpus: the malformed images above, plus every image this module
+/// ACCEPTS — and those have no captured form here, they are what `serialize`
+/// produces. So the positive half is built by the module's own encoder at run
+/// time rather than freezing a paste of it.
+///
+/// ⭐ The harness and the guard below both build it from HERE. A guard
+/// measuring a different corpus from the one the harness gets is not a guard,
+/// and this corpus scores 0 accepted without the built images: ten seeds, every
+/// one of which `deserialize` refuses by construction.
+const Corpus = struct {
+    scratch: [4096]u8 = undefined,
+    store: [3][4 + 256]u8 = undefined,
+    entries: [malformed_seeds.len + 3][]const u8 = undefined,
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const a = fba.allocator();
+        @memcpy(self.entries[0..malformed_seeds.len], &malformed_seeds);
+
+        // Empty but well-formed: no columns, no rows. Legal, and the shortest
+        // image `serialize` can emit.
+        const empty = try serialize(a, .{ .columns = &.{}, .rows = &.{} });
+        self.entries[malformed_seeds.len + 0] = testkit.fuzz.seedInto(&self.store[0], empty);
+
+        // Every column type and every value tag, including the appended
+        // `decimal` tag 5 — the one whose ordinal the comment in `serialize`
+        // warns must never renumber.
+        const cols = [_]Column{
+            .{ .name = "i", .type = .int },
+            .{ .name = "f", .type = .float },
+            .{ .name = "t", .type = .text },
+            .{ .name = "b", .type = .bool },
+            .{ .name = "d", .type = .date },
+            .{ .name = "m", .type = .decimal },
+        };
+        const r0 = [_]Value{ .{ .int = -1 }, .{ .float = 1.5 }, .{ .text = "hi" }, .{ .bool = true }, .{ .text = "2026-09-07" }, .{ .decimal = 12345 } };
+        const r1 = [_]Value{ .null, .null, .{ .text = "" }, .{ .bool = false }, .null, .{ .decimal = -1 } };
+        const rows = [_][]const Value{ &r0, &r1 };
+        const full = try serialize(a, .{ .columns = &cols, .rows = &rows });
+        self.entries[malformed_seeds.len + 1] = testkit.fuzz.seedInto(&self.store[1], full);
+
+        // The same image with its last octet removed: a well-formed prefix that
+        // must fail on the DATA rather than on a count, which is the case the
+        // "must not reject a legitimate document" test above is about.
+        self.entries[malformed_seeds.len + 2] = testkit.fuzz.seedInto(&self.store[2], full[0 .. full.len - 1]);
+        return &self.entries;
+    }
+};
+
 test "fuzz: deserialize never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDeserialize, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzDeserialize, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDeserialize(_: void, smith: *std.testing.Smith) !void {
@@ -1185,8 +1272,42 @@ fn fuzzDeserialize(_: void, smith: *std.testing.Smith) !void {
     defer arena.deinit();
 
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     const d = deserialize(arena.allocator(), buf[0..len]) catch return;
-    _ = d;
+    // Walk what came back: an image that decodes must also be traversable, and
+    // the old harness discarded the result without touching a single cell.
+    for (d.rows) |row| for (row) |v| {
+        _ = v.asFloat();
+    };
+}
+
+test "corpus: every seed reaches deserialize, and the cells decoded are pinned" {
+    // ⭐ Cells decoded is the second number, and it is the one that matters:
+    // `deserialize("")` is not legal here (it fails on the first `u32v`), but
+    // the empty well-formed image IS accepted and carries no cells — so an
+    // "accepted > 0" guard would read green on a corpus that decodes nothing.
+    // A cell count cannot be produced by any input the collapsed draw could
+    // deliver.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var cells: usize = 0;
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const d = deserialize(arena.allocator(), buf[0..len]) catch continue;
+        accepted += 1;
+        for (d.rows) |row| cells += row.len;
+    }
+    // The first seed is deliberately the empty image, so it is `len - 1`.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw every seed arrived empty,
+    // 0 were accepted and 0 cells were decoded. After: 2 accepted, 12 cells.
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try testing.expectEqual(@as(usize, 12), cells);
 }

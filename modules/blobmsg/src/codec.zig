@@ -982,14 +982,151 @@ test "encode limits: oversized name and attr are rejected" {
     try testing.expect(out.items.len == 0); // nothing partial appended
 }
 
+// ⚠ Both harnesses below opened with `smith.bytes(&raw)` followed by
+// `smith.valueRangeAtMost(u16, 0, raw.len)`. `bytes` copies `min(raw.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so `len` was 0 for every
+// input a corpus can carry and both walkers were handed an empty buffer, on
+// which `next()` returns null immediately. Neither had a corpus, so outside
+// `--fuzz` each ran that one empty input for ever: the `steps <= buf.len/4 + 1`
+// bounds below had never executed once, and `decodeToJson` was called only on
+// nothing.
+
+const testkit = @import("testkit");
+
+/// The walker harness's buffer.
+///
+/// ⛔ It was 512, and the module's OWN largest captured ubusd reply body is
+/// **1988 octets** (`captured_data_devstatus`; `captured_data_board` is 528 and
+/// `captured_data_ifstatus` 780). A seed longer than the buffer does not arrive
+/// truncated — `Smith.slice` checks the declared length against
+/// `rangeAtMost(0, buf.len)` and falls back to the range MINIMUM, so it arrives
+/// EMPTY, silently. Not one of the four real daemon replies this module froze
+/// from a live OpenWRT run could ever have passed through its own fuzz harness.
+/// Raised to fit the largest of them, which is the direction that keeps the
+/// fixture: shrinking the seed would have hidden the finding.
+const fuzz_buf_len = 2048;
+
+/// `testkit.fuzz.seedHex`, aliased so the corpus reads as the attr images it
+/// is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw image would arrive minus its own first four
+/// octets.
+const seed = testkit.fuzz.seedHex;
+
+/// Malformed attr streams, in the format the length draw reads — every typed
+/// refusal the walker tests above pin, verbatim from them.
+const malformed_seeds = [_][]const u8{
+    seed(""), // nothing at all
+    seed("830000"), // header cut short → Truncated
+    seed("83000020aabb"), // declared length runs past the buffer → Truncated
+    seed("83000003aabbccdd"), // length below the 4-octet header → BadLength
+    seed("00000000"), // zero length: must not loop forever → BadLength
+    seed("030000040200"), // a valid attr followed by garbage
+    seed("8300000500"), // blobmsg data shorter than its namelen → Truncated
+    seed("8300000800ff6100"), // namelen pointing past the attr's data → Truncated
+    seed("ffffffff" ++ "ffffffff"), // every bit set: the widest length claim there is
+};
+
+/// The whole corpus: the refusals above, plus the images this module ACCEPTS.
+/// Those have no captured form as a bare attr stream, so they come from the
+/// module's own encoder at run time — and, crucially, from the REAL ubusd
+/// capture at the bottom of this file, which is the only material here that is
+/// not derived from this module's own output.
+///
+/// ⭐ The harness and the guard below build it from the SAME place: a guard
+/// measuring a different corpus from the one the harness gets is not a guard.
+const Corpus = struct {
+    store: [4][4 + fuzz_buf_len]u8 = undefined,
+    scratch: [1024]u8 = undefined,
+    entries: [malformed_seeds.len + 4][]const u8 = undefined,
+
+    fn build(self: *Corpus) ![]const []const u8 {
+        @memcpy(self.entries[0..malformed_seeds.len], &malformed_seeds);
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const a = fba.allocator();
+
+        // One field of every scalar shape, plus a nested TABLE and ARRAY — the
+        // typed walk's whole switch in a single image.
+        var flat: std.ArrayList(u8) = .empty;
+        try appendString(a, &flat, "s", "hi");
+        try appendInt32(a, &flat, "n", -1);
+        var inner: std.ArrayList(u8) = .empty;
+        try appendInt32(a, &inner, "v", 1);
+        var nested: std.ArrayList(u8) = .empty;
+        try appendString(a, &nested, "s", "hi");
+        try appendTable(a, &nested, "t", inner.items);
+        self.entries[malformed_seeds.len + 0] = testkit.fuzz.seedInto(&self.store[0], flat.items);
+        self.entries[malformed_seeds.len + 1] = testkit.fuzz.seedInto(&self.store[1], nested.items);
+
+        // The final attr with its pad stripped — the "walker accepts a final
+        // unpadded attr" case, which is one octet away from a Truncated.
+        self.entries[malformed_seeds.len + 2] =
+            testkit.fuzz.seedInto(&self.store[2], flat.items[0 .. flat.items.len - 1]);
+
+        // A real ubusd reply body, from the OpenWRT capture below: the only
+        // seed here whose bytes this module did not produce. It is 1988 octets,
+        // which is why `fuzz_buf_len` had to be raised — see there.
+        const top_len = std.mem.readInt(u32, captured_data_devstatus[msghdr_len..][0..4], .big) & LEN_MASK;
+        const payload = captured_data_devstatus[msghdr_len + 4 .. msghdr_len + top_len];
+        self.entries[malformed_seeds.len + 3] = testkit.fuzz.seedInto(&self.store[3], payload);
+        return &self.entries;
+    }
+};
+
 test "fuzz: walkers + JSON decoder never crash, loop, or read OOB" {
-    try testing.fuzz({}, fuzzCodec, .{});
+    var corpus: Corpus = .{};
+    try testing.fuzz({}, fuzzCodec, .{ .corpus = try corpus.build() });
+}
+
+test "corpus: every seed reaches the walkers, and the attrs walked are pinned" {
+    // ⭐ Attrs walked is the second number. `AttrIterator` over an empty buffer
+    // returns null without erroring, so "it did not crash" was already true
+    // while the harness saw nothing at all — and so would "no error occurred"
+    // be. A walked count cannot be produced by the empty input the collapsed
+    // draw delivered.
+    var corpus: Corpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var attrs: usize = 0;
+    var fields: usize = 0;
+    var refusals: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [fuzz_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        // ⚠ `while (it.next() catch break)` compiles, and `break` there leaves
+        // the enclosing FOR, not the while — this loop was written that way
+        // first and silently measured 2 of the 13 seeds. The break belongs in
+        // the body.
+        var it: AttrIterator = .{ .buf = raw[0..len] };
+        while (true) {
+            const a = it.next() catch {
+                refusals += 1;
+                break;
+            };
+            if (a == null) break;
+            attrs += 1;
+        }
+        var fit = FieldIterator.init(raw[0..len]);
+        while (true) {
+            const f = fit.next() catch break;
+            if (f == null) break;
+            fields += 1;
+        }
+    }
+    // The first seed is deliberately the empty image, so it is `len - 1`.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw every seed arrived empty —
+    // 0 attrs, 0 fields, 0 refusals. After: 10 attrs / 5 fields / 7 refusals.
+    try testing.expectEqual(@as(usize, 10), attrs);
+    try testing.expectEqual(@as(usize, 5), fields);
+    try testing.expectEqual(@as(usize, 7), refusals);
 }
 
 fn fuzzCodec(_: void, smith: *std.testing.Smith) !void {
-    var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    var raw: [fuzz_buf_len]u8 = undefined;
+    const len = smith.slice(&raw);
     const buf = raw[0..len];
 
     // Raw walk: each step consumes >= 4 bytes, so bound the step count.
@@ -1026,21 +1163,76 @@ fn fuzzCodec(_: void, smith: *std.testing.Smith) !void {
 // JSON args must never panic/OOB while being parsed and re-encoded onto the
 // wire, only yield bytes or a typed `std.json`/`EncodeError`.
 
+/// `testkit.fuzz.seed`, for the JSON corpus — text, so it reads as itself.
+const seedText = testkit.fuzz.seed;
+
+/// JSON args, in the format the length draw reads. Every value kind
+/// `encodeArgs` maps onto the wire, the two shapes it refuses (a non-object
+/// root, an oversized nesting depth), and the text that `std.json` itself
+/// rejects before `encodeArgs` is reached at all.
+const encode_seeds = [_][]const u8{
+    seedText("{}"), // the empty object: legal, and encodes to nothing
+    seedText("{\"s\":\"hi\",\"n\":-1,\"b\":true,\"z\":null}"), // string, int, bool, null
+    seedText("{\"big\":9223372036854775807,\"neg\":-9223372036854775808}"), // the i64 edges
+    seedText("{\"f\":1.5,\"e\":1e300}"), // doubles, including one no int can hold
+    seedText("{\"t\":{\"a\":1,\"b\":{\"c\":2}}}"), // nested tables
+    seedText("{\"a\":[1,\"two\",{\"x\":3},[4]]}"), // an array of every element kind
+    seedText("[1,2,3]"), // a non-object root: encodeArgs refuses
+    seedText("\"bare string\""), // …and so is a bare scalar root
+    seedText("{\"k\":"), // truncated: std.json refuses before encodeArgs runs
+    seedText("not json at all"), // not JSON in the first place
+    seedText("{\"\":\"\"}"), // an empty name and an empty value
+    seedText("{" ++ ("\"a\":{" ** 70) ++ "1" ++ ("}" ** 70) ++ "}"), // 70 levels: the TooDeep cap
+};
+
 test "fuzz: encodeArgs never crashes on arbitrary JSON-shaped text" {
-    try testing.fuzz({}, fuzzEncodeArgs, .{});
+    try testing.fuzz({}, fuzzEncodeArgs, .{ .corpus = &encode_seeds });
 }
 
 fn fuzzEncodeArgs(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    const len = smith.slice(&raw);
 
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, raw[0..len], .{}) catch return;
     defer parsed.deinit();
 
     const buf = encodeArgs(gpa, parsed.value) catch return;
     defer gpa.free(buf);
+}
+
+test "corpus: every JSON seed reaches encodeArgs, and the octets encoded are pinned" {
+    // ⭐ Octets encoded is the second number. `std.json.parseFromSlice("")`
+    // FAILS, so this harness's `catch return` swallowed every single input it
+    // was ever given and the target was a complete no-op — an "it did not
+    // crash" guard would have been satisfied by a harness that ran zero
+    // statements past the first `catch`. Parsed and encoded are counted
+    // separately because the corpus deliberately contains inputs that clear the
+    // first stage and are refused by the second.
+    const gpa = testing.allocator;
+    var nonempty: usize = 0;
+    var parsed_ok: usize = 0;
+    var encoded_ok: usize = 0;
+    var octets: usize = 0;
+    for (encode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        var parsed = std.json.parseFromSlice(std.json.Value, gpa, raw[0..len], .{}) catch continue;
+        defer parsed.deinit();
+        parsed_ok += 1;
+        const buf = encodeArgs(gpa, parsed.value) catch continue;
+        defer gpa.free(buf);
+        encoded_ok += 1;
+        octets += buf.len;
+    }
+    try testing.expectEqual(encode_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 / 0 / 0 / 0 before — every seed arrived empty and
+    // `std.json` rejected it. After: 12 non-empty / 9 parsed / 6 encoded / 196 octets.
+    try testing.expectEqual(@as(usize, 9), parsed_ok);
+    try testing.expectEqual(@as(usize, 6), encoded_ok);
+    try testing.expectEqual(@as(usize, 196), octets);
 }
 
 // ── real-daemon capture (OpenWRT 25.12.4 VM lane) ───────────────────────────

@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`fuzzDeserialize` was replaying an EMPTY image, and now has
+  a 13-entry corpus with a measured reach guard.** It opened with
+  `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`;
+  `bytes` consumes `min(buf.len, in.len)` octets and the ranged draw then reads
+  eight *more* as a little-endian u64, returning the range minimum when fewer
+  remain — so the drawn length was 0 for every input a seed can carry and
+  `deserialize` failed on its very first `u32v()`. With no corpus either, the
+  target ran that one empty input for ever, which means the `ncol`/`nrow` count
+  bounds (both found by an actual fuzz sweep, one of them a 32 GB `total-vm` OOM
+  kill) had no regression coverage from it at all. Now one `smith.slice(&buf)`
+  draw, a corpus of ten malformed wire images (both count bounds, a bad type tag,
+  an unknown value tag, two 4 GB length claims) plus three built by `serialize`
+  itself at run time — the empty image, one carrying every column type and every
+  value tag including the appended `decimal` tag 5, and that image truncated by a
+  byte. The harness also now walks the decoded rows instead of discarding the
+  result. Guard pins cells decoded rather than "accepted > 0", because the empty
+  image is accepted and carries no cells: measured 0 accepted / 0 cells before,
+  2 accepted / 12 cells after.
 - **2026-09-03** — Two unguarded `@intFromFloat` conversions on public API, found
   while auditing `jsonshape` (its `.int`/`.decimal` columns route here). New
   `Value.floatToInt`, and both sites go through it.

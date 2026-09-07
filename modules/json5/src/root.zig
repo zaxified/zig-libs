@@ -76,12 +76,22 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                 } else if (sc == '"') {
                     try out.appendSlice(alloc, "\\\""); // escape " inside
                 } else if (sc == '\'') {
+                    try out.append(alloc, '"'); // the closing quote, only when the input has one
                     break;
                 } else {
                     try out.append(alloc, sc);
                 }
             }
-            try out.append(alloc, '"');
+            // ⛔ The closing `"` used to be appended UNCONDITIONALLY here, so a
+            // single-quoted string the input never closed came out CLOSED:
+            // `'unterminated` became the valid document `"unterminated"`. A
+            // must-reject input turned silently into an accepted one — the same
+            // failure the W2 F2 fix removed from `preprocessAnnotated`'s newline
+            // branch, in the entry point that fix used as its reference for being
+            // correct. The double-quoted branch above never closed an unterminated
+            // string, so the two string kinds also disagreed with each other
+            // (found 2026-09-07, by the first corpus that ever reached this
+            // module's fuzz harnesses).
             continue;
         }
 
@@ -275,6 +285,27 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
                 }
             },
         }
+    }
+
+    // EOF recovery: auto-close containers the input left open, exactly as
+    // `preprocessAnnotated` has always done at its own end.
+    //
+    // ⛔ This entry point did NOT, and the asymmetry made the two disagree on
+    // whether the result parses — the one thing `fuzzPreprocessAnnotated`'s
+    // oracle exists to rule out. `preprocess("{a b")` emitted
+    // `{"$err_trace_1": "a b --> missing colon after key at line 1"` with no
+    // closing brace, so the recovery entry it had just gone to the trouble of
+    // building was stranded in a document `std.json` cannot read, while
+    // `preprocessAnnotated` on the same input produced valid JSON. `{a b` is
+    // this module's OWN audit-F1 crash reproducer, quoted from the test below,
+    // and the test only checked that `$err_trace` appears in the output — never
+    // that the output parses. The oracle that would have caught it was written
+    // during the W2 re-audit (`json5` F2) and had never executed on a single
+    // input, because the harness's length draw collapsed to 0 (2026-09-07).
+    while (nest.items.len > 0) {
+        removeTrailingComma(&out);
+        try out.append(alloc, if (nest.items[nest.items.len - 1] == '{') @as(u8, '}') else @as(u8, ']'));
+        _ = nest.pop();
     }
 
     return out.toOwnedSlice(alloc);
@@ -695,11 +726,24 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                 }
             }
             if (!closed) {
+                // ⛔ The closing quote used to be appended UNCONDITIONALLY, and
+                // the `isInObject` guard only covered the diagnostic. Outside an
+                // object that turned a must-reject document into a valid one
+                // with nothing recorded: `"unterminated` came out as
+                // `"unterminated"`, which `std.json` accepts, while `preprocess`
+                // on the same input rejects — the two entry points disagreeing
+                // on whether the document parses, which is the one thing
+                // `fuzzPreprocessAnnotated`'s oracle exists to rule out.
+                //
+                // This is the identical shape as the newline branch above, and
+                // the identical reasoning: with nowhere to put the diagnostic,
+                // the honest move is not to recover (W2 re-audit 2026-09-02,
+                // `json5` F2 — applied there and missed here; found 2026-09-07
+                // by the first corpus that ever reached this harness).
+                if (!isInObject(nest.items)) continue;
                 try out.append(alloc, '"');
-                if (isInObject(nest.items)) {
-                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
-                    try pending_value_errs.append(alloc, msg);
-                }
+                const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
+                try pending_value_errs.append(alloc, msg);
             }
             continue;
         }
@@ -744,11 +788,24 @@ pub fn preprocessAnnotated(alloc: std.mem.Allocator, input: []const u8) !Annotat
                 }
             }
             if (!closed) {
+                // ⛔ The closing quote used to be appended UNCONDITIONALLY, and
+                // the `isInObject` guard only covered the diagnostic. Outside an
+                // object that turned a must-reject document into a valid one
+                // with nothing recorded: `"unterminated` came out as
+                // `"unterminated"`, which `std.json` accepts, while `preprocess`
+                // on the same input rejects — the two entry points disagreeing
+                // on whether the document parses, which is the one thing
+                // `fuzzPreprocessAnnotated`'s oracle exists to rule out.
+                //
+                // This is the identical shape as the newline branch above, and
+                // the identical reasoning: with nowhere to put the diagnostic,
+                // the honest move is not to recover (W2 re-audit 2026-09-02,
+                // `json5` F2 — applied there and missed here; found 2026-09-07
+                // by the first corpus that ever reached this harness).
+                if (!isInObject(nest.items)) continue;
                 try out.append(alloc, '"');
-                if (isInObject(nest.items)) {
-                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
-                    try pending_value_errs.append(alloc, msg);
-                }
+                const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
+                try pending_value_errs.append(alloc, msg);
             }
             continue;
         }
@@ -1367,34 +1424,153 @@ test "preprocess: unquoted key with no colon before EOF does not slice OOB (audi
     const out = try preprocess(alloc, "{a b");
     defer alloc.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "$err_trace") != null);
+    // ⭐ And the output has to PARSE. This assertion is the one the test was
+    // missing: the recovery entry above was being emitted into a document with
+    // no closing brace, so `std.json` could not read it and the diagnostic the
+    // recovery had just built was stranded. Checking only that `$err_trace`
+    // appears in the output is checking that a string is present, not that the
+    // recovery worked (found 2026-09-07).
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, out, .{});
+    parsed.deinit();
+}
+
+test "both entry points reject an unterminated string OUTSIDE an object" {
+    // ⭐ `preprocessAnnotated` used to close the string unconditionally at EOF,
+    // so `"unterminated` became the valid document `"unterminated"` — a
+    // must-reject input turned silently into an accepted one, with no
+    // diagnostic anywhere, because outside an object there is no sibling key to
+    // put one in. That is exactly the failure the W2 F2 fix eliminated for the
+    // NEWLINE branch; the EOF branch kept it. `preprocess` rejected the same
+    // input all along, so the two disagreed.
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "\"unterminated", "'unterminated" }) |src| {
+        const plain = try preprocess(alloc, src);
+        defer alloc.free(plain);
+        const r = try preprocessAnnotated(alloc, src);
+        defer alloc.free(r.out);
+        try std.testing.expect(!jsonParses(alloc, plain));
+        try std.testing.expect(!jsonParses(alloc, r.out));
+    }
+    // Inside an object the diagnostic HAS somewhere to go, so recovery is still
+    // the right move and both sides still agree — the guard is about where the
+    // error can be reported, not about EOF.
+    const src = "{a: \"no closing";
+    const r = try preprocessAnnotated(alloc, src);
+    defer alloc.free(r.out);
+    try std.testing.expect(jsonParses(alloc, r.out));
 }
 
 // ── fuzz: both preprocessors are the untrusted-input decode surface ─────────
 // (arbitrary UTF-8/bytes, not necessarily well-formed JSON5) — must never
 // panic or read/write out of bounds, only return a slice or a typed error.
 
+//
+// ⚠ Both opened with `smith.bytes(&buf)` followed by
+// `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes` copies `min(buf.len,
+// in.len)` octets and the ranged draw then reads EIGHT more as a little-endian
+// u64, returning the range minimum when fewer remain — so `len` was 0 on every
+// input a corpus can carry and both preprocessors were handed an empty
+// document. Neither had a corpus, so outside `--fuzz` each ran that one empty
+// input for ever. In `fuzzPreprocessAnnotated` that is worse than it looks: its
+// whole point is the differential oracle below, and on the empty input both
+// entry points trivially agree, so the oracle could never have disagreed.
+
+/// `testkit.fuzz.seed`, aliased so the corpus reads as the JSON5 it is. A
+/// corpus entry is not the document: `Smith.slice` reads a little-endian `u32`
+/// length first, so raw source would arrive minus its own first four octets.
+const seed = @import("testkit").fuzz.seed;
+
+/// JSON5 documents, in the format the length draw reads. Shared by both
+/// harnesses, because the differential oracle only means something if both
+/// entry points see the same input. Every construct the value tests pin, the
+/// audit's own crash reproducer, and the two shapes that make the diagnostic
+/// key collide with real input.
+const preprocess_seeds = [_][]const u8{
+    seed("{ // comment\n\"a\": 1 }"), // a line comment
+    seed("{/* hi */\"a\":1}"), // a block comment
+    seed("{foo: 1}"), // an unquoted key
+    seed("{a: 1, b: 2, c: 3}"), // several unquoted keys
+    seed("{a: {b: {c: 1}}}"), // nested objects, all unquoted
+    seed("{\"a\": 1,}"), // a trailing comma in an object
+    seed("[1, 2, 3,]"), // a trailing comma in an array
+    seed("{'hello'}"), // single-quoted string
+    seed("{\"a\": \"val // not a comment\"}"), // a comment marker inside a string
+    seed("{a: true, b: false, c: null}"), // the three keywords must stay keywords
+    seed("{a: 1.2e3, b: 2e-23}"), // exponents: part of the number, not bare identifiers
+    seed("[0e0, -0E+0, 1e+2]"), // the exponent sign and zero edges
+    seed("{a b"), // the audit F1 CRIT reproducer: unquoted key, no colon, EOF
+    seed("{a /*c*/: 1, b: 2}"), // a comment between the key and its colon
+    seed("{a\n: 1, b: 2}"), // a newline between the key and its colon
+    seed("{x y: 1, \"$err_trace_1\": \"all fine\"}"), // input choosing a diagnostic key name
+    seed("{x y: 1, \"$err_1\": \"a\", \"$err__1\": \"b\", \"$err___1\": \"c\"}"), // …and the shadowing escalation
+    seed("// hi\n{a:1, /* inline */ b: 2\n// tail\n}"), // comments in every position
+    seed("{"), // truncated at the opening brace
+    seed("\"unterminated"), // an unterminated double-quoted string
+    seed("'unterminated"), // …and the single-quoted one, which is a different branch
+    seed("\xff\xfe not utf-8"), // bytes that are not text at all
+};
+
 test "fuzz: preprocess never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzPreprocess, .{});
+    try std.testing.fuzz({}, fuzzPreprocess, .{ .corpus = &preprocess_seeds });
 }
 
 fn fuzzPreprocess(_: void, smith: *std.testing.Smith) !void {
     const alloc = std.testing.allocator;
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     const out = preprocess(alloc, buf[0..len]) catch return;
     alloc.free(out);
 }
 
+test "corpus: every seed reaches both entry points, and the rewriting they do is pinned" {
+    // ⭐ Octets emitted is the second number, and acceptance would have been a
+    // bad one: `preprocess("")` succeeds and returns an empty string, so an
+    // "accepted > 0" guard reads 100% on a harness that sees nothing. Octets
+    // out, and the count of documents the rewrite actually CHANGED, cannot be
+    // produced by the empty input at all.
+    //
+    // The last number is the one the annotated harness exists for: how many
+    // seeds carry a `$err` diagnostic. On the empty input that is zero, so the
+    // differential oracle in `fuzzPreprocessAnnotated` had never once compared
+    // two outputs that could differ.
+    const alloc = std.testing.allocator;
+    var nonempty: usize = 0;
+    var octets: usize = 0;
+    var rewritten: usize = 0;
+    var with_diagnostic: usize = 0;
+    for (preprocess_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const plain = preprocess(alloc, buf[0..len]) catch continue;
+        defer alloc.free(plain);
+        octets += plain.len;
+        if (!std.mem.eql(u8, plain, buf[0..len])) rewritten += 1;
+        const r = preprocessAnnotated(alloc, buf[0..len]) catch continue;
+        defer alloc.free(r.out);
+        if (std.mem.indexOf(u8, r.out, "$err") != null) with_diagnostic += 1;
+        // The harness's own oracle, run over the corpus: the two entry points
+        // must agree on whether the result is parseable JSON.
+        try std.testing.expectEqual(jsonParses(alloc, plain), jsonParses(alloc, r.out));
+    }
+    try std.testing.expectEqual(preprocess_seeds.len, nonempty);
+    // Measured 2026-09-07: with the collapsing draw every seed arrived empty —
+    // 0 octets out, 0 documents rewritten, 0 diagnostics. After: 22 seeds,
+    // 646 octets, 18 rewritten, 4 carrying a diagnostic.
+    try std.testing.expectEqual(@as(usize, 646), octets);
+    try std.testing.expectEqual(@as(usize, 18), rewritten);
+    try std.testing.expectEqual(@as(usize, 4), with_diagnostic);
+}
+
 test "fuzz: preprocessAnnotated never panics on arbitrary bytes" {
-    try std.testing.fuzz({}, fuzzPreprocessAnnotated, .{});
+    try std.testing.fuzz({}, fuzzPreprocessAnnotated, .{ .corpus = &preprocess_seeds });
 }
 
 fn fuzzPreprocessAnnotated(_: void, smith: *std.testing.Smith) !void {
     const alloc = std.testing.allocator;
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
     const input = buf[0..len];
     const r = preprocessAnnotated(alloc, input) catch return;
     defer alloc.free(r.out);

@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`fuzzCodecNeverLeaks` ran one input for ever: the empty
+  string through `.utf8`.** It opened with `smith.bytes(&buf)` followed by
+  `smith.valueRangeAtMost(u16, 0, buf.len)`; `bytes` consumes
+  `min(buf.len, in.len)` octets and the ranged draw then reads eight *more* as a
+  little-endian u64, returning the range minimum when fewer remain — so the drawn
+  length was 0 for every input a seed can carry. Worse, `enc` was drawn AFTER the
+  bytes, from an input the byte draw had already exhausted, so `smith.index`
+  returned 0 on every run: **the encoding selected was always `.utf8`, the
+  passthrough, and none of the five table-driven code pages was ever exercised by
+  this target.** With no corpus either, the whole harness was a single cell of a
+  6 × N matrix, and the emptiest one. Now one `smith.slice(&buf)` draw plus an
+  explicit sweep over all six encodings, and a 12-seed corpus: the 0x80..0xBF band
+  where the tables disagree, the eight positions separating iso-8859-15 from -1,
+  Czech windows-1250 text, and the malformed-UTF-8 edges the audit found (a bare
+  lead byte at the end of the buffer, a lead with too few continuations, a lone
+  continuation, a UTF-8-encoded surrogate). The guard pins octets produced rather
+  than acceptance, because neither codec ever errors: measured 0 / 0 / 0 before;
+  208 UTF-8-decoded, 879 table-decoded and 550 table-encoded octets after.
 - **2026-09-02** — Drift re-audit (window `7a9317f..HEAD`, +1334/-11 over 13 files, the first
   re-audit at Opus tier). The table-driven layer that landed since is **genuine**: all five
   vendored normative files are byte-identical to upstream fetched today, and the module agrees

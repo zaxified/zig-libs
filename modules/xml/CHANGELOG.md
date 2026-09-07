@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`fuzzParse` ran one input for ever, and its byte-biasing
+  loop had never executed.** It opened with `smith.bytes(&buf)` followed by
+  `smith.valueRangeAtMost(u16, 0, buf.len)`; `bytes` consumes
+  `min(buf.len, in.len)` octets and the ranged draw then reads eight *more* as a
+  little-endian u64, returning the range minimum when fewer remain — so the drawn
+  length was 0 for every input a seed can carry. The loop that remaps bytes onto
+  XML's own syntax alphabet iterates `buf[0..len]`, so with `len == 0` it never
+  ran either: the paragraph above the harness promising a byte pool biased toward
+  `<>/="'&;` was describing code that had not executed. With no corpus the target
+  replayed `parse("")`, which is rejected on the first byte. Now one
+  `smith.slice(&buf)` draw and a 16-document corpus (prolog, CDATA, every
+  predefined entity and both numeric forms, namespace declarations, comments and
+  PIs, multi-byte UTF-8, plus the duplicate-`ID` signature-wrapping refusal,
+  invalid UTF-8, a non-UTF-8 encoding declaration, XML 1.1 and four truncations).
+  The biasing stays for `--fuzz` and the guard pins that it is inert on a replay,
+  because a biasing loop that DID fire would corrupt every seed into a syntax
+  error. Measured 0 accepted / 0 elements before; 16 seeds, 0 mangled bytes,
+  7 accepted, 12 elements built after.
 - **2026-09-03** — **`Options.max_elements` (default `1 << 20`) and
   `error.TooManyElements`: a bound on BREADTH.** `max_depth` bounded nesting and said
   nothing about how wide a document may be, and a flat document is the cheap shape —
