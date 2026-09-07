@@ -4500,12 +4500,58 @@ fn splitSourceFromEpoch0(record_bytes: []const u8) !SplitSource {
 // Every iteration proves it REACHES the stitching path rather than bouncing
 // off an early error: a genuine first half of a real ClientHello must come
 // back as `need_more_data` before the fuzzed continuation is fed in.
+//
+// ── ⚠ why the choices come out of ONE byte string ─────────────────────────
+//
+// Until 2026-09-07 they came out of ranged `Smith` draws, the FIRST of them
+// included — `smith.valueRangeAtMost(u16, 1, src.body_len - 1)`, which
+// `check-fuzz-reach` classifies R1. A ranged draw reads eight octets as a
+// little-endian `u64` and returns the range MINIMUM unless the whole word lands
+// inside the range, and after one short read `Smith` DISCARDS the rest of the
+// input. With no corpus declared the runner replays exactly one input, the
+// empty one, so this target had run exactly ONE scenario for its whole life:
+//
+//     split = 1, body_len = 0, off = 0, total_len = 0, msg_type = 0, seq = 0
+//
+// — a one-octet first fragment followed by a zero-length fragment of a
+// zero-length message. And the comment on the branch below said "Half the time,
+// feed the TRUE remaining bytes at the TRUE offset, so the completing path is
+// reached too and not only the rejecting one": `truthful` hung on
+// `smith.boolWeighted(1, 1)` drawn after the input was gone, so it was `false`
+// every time and **the completing path was never reached at all** — the exact
+// half of the transaction the harness was written to cover.
+//
+// The choices now come from one `smith.slice`, read as a script:
+//
+//     split · truthful(bit 0) · bodyLen · <bodyLen octets> ·
+//     off · totalLen · msgType · seq
+//
+// A short script CYCLES rather than running out; the EMPTY script reproduces
+// the collapsed scenario above exactly, and the guard pins that too.
 
-test "fuzz: handleFlight survives arbitrary continuations of a half-delivered flight" {
-    try testing.fuzz({}, fuzzHandleFlight, .{});
-}
+const FlightScript = @import("testkit").fuzz.Cursor;
+const flight_seed = @import("testkit").fuzz.seedHex;
 
-fn fuzzHandleFlight(_: void, smith: *std.testing.Smith) !void {
+/// What a script did to the server's accumulate/snapshot transaction.
+const FlightOutcome = struct {
+    /// The continuation carried the TRUE remaining bytes at the TRUE offset,
+    /// so the message could complete. Zero for every run this target ever made
+    /// before it was seeded.
+    truthful: bool = false,
+    /// The continuation was framed well enough to be handed to `handleFlight`
+    /// at all (`decodeHeader` rejects `offset + length > total` before
+    /// reassembly sees it).
+    delivered: bool = false,
+    /// `handleFlight` returned rather than raising a typed error.
+    accepted: bool = false,
+    /// Octets of the ClientHello body the continuation carried.
+    payload: usize = 0,
+};
+
+/// The body of `fuzzHandleFlight`, factored out so the harness and the corpus
+/// guard drive the SAME transaction from the same octets.
+fn runFlightScript(bytes: []const u8) !FlightOutcome {
+    var s = FlightScript{ .bytes = bytes };
     const psk_identity = "device-042";
     const psk = "a-shared-pre-shared-key";
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
@@ -4518,11 +4564,12 @@ fn fuzzHandleFlight(_: void, smith: *std.testing.Smith) !void {
     var out: [1500]u8 = undefined;
     const ch = try client.startHandshake(rnd, 0, &buf1);
     const src = try splitSourceFromEpoch0(ch);
+    var result: FlightOutcome = .{};
 
     // (1) A REAL first fragment, split at a peer-chosen point. This must
     // leave the server buffering — i.e. the accumulate/snapshot transaction
     // is live for the fuzzed datagram that follows.
-    const split: usize = smith.valueRangeAtMost(u16, 1, @intCast(src.body_len - 1));
+    const split: usize = s.ranged(1, @intCast(src.body_len - 1));
     var frag_buf: [1500]u8 = undefined;
     var rec_buf: [1500]u8 = undefined;
     const head = handBuiltHandshakeFragment(src.msg_type, src.total_len, src.message_seq, 0, src.slice()[0..split], &frag_buf);
@@ -4535,24 +4582,107 @@ fn fuzzHandleFlight(_: void, smith: *std.testing.Smith) !void {
     // the end, a body that disagrees with `fragment_length`). Some of these
     // complete the message, most are typed errors; none may panic, corrupt
     // the buffer, or leave the connection half-advanced.
+    const truthful = (s.byte() & 1 == 1) and src.body_len > split;
+    result.truthful = truthful;
     var body: [256]u8 = undefined;
-    const body_len: usize = smith.valueRangeAtMost(u8, 0, 255);
-    smith.bytes(body[0..body_len]);
-    // Half the time, feed the TRUE remaining bytes at the TRUE offset, so
-    // the completing path is reached too and not only the rejecting one.
-    const truthful = smith.boolWeighted(1, 1) and src.body_len > split;
-    const off: u24 = if (truthful) @intCast(split) else smith.valueRangeAtMost(u16, 0, @intCast(src.total_len + 8));
+    const body_len: usize = s.ranged(0, 255);
+    for (body[0..body_len]) |*b| b.* = s.byte();
+    const off: u24 = if (truthful) @intCast(split) else @intCast(s.ranged(0, @intCast(src.total_len + 8)));
     const payload = if (truthful) src.slice()[split..] else body[0..body_len];
-    const total_len: u24 = if (truthful) src.total_len else smith.valueRangeAtMost(u16, 0, @intCast(src.total_len + 8));
-    const msg_type: u8 = if (truthful) src.msg_type else smith.value(u8);
-    const seq: u16 = if (truthful) src.message_seq else smith.valueRangeAtMost(u16, 0, 2);
+    const total_len: u24 = if (truthful) src.total_len else @intCast(s.ranged(0, @intCast(src.total_len + 8)));
+    const msg_type: u8 = if (truthful) src.msg_type else s.byte();
+    const seq: u16 = if (truthful) src.message_seq else @intCast(s.ranged(0, 2));
 
     var frag_buf2: [1500]u8 = undefined;
     var rec_buf2: [1500]u8 = undefined;
-    if (@as(u64, off) + payload.len > total_len) return; // decodeHeader would reject the frame before reassembly sees it
+    // `decodeHeader` would reject the frame before reassembly sees it.
+    if (@as(u64, off) + payload.len > total_len) return result;
+    result.delivered = true;
+    result.payload = payload.len;
     const tail = handBuiltHandshakeFragment(msg_type, total_len, seq, off, payload, &frag_buf2);
     const datagram = handBuiltPlaintextRecord(1, tail, &rec_buf2);
-    _ = server.handleFlight(datagram, rnd, 0, &out) catch return;
+    _ = server.handleFlight(datagram, rnd, 0, &out) catch return result;
+    result.accepted = true;
+    return result;
+}
+
+/// Continuation scripts. Layout: `split · truthful · bodyLen · <body> · off ·
+/// totalLen · msgType · seq`, cycled if short.
+const flight_seeds = [_][]const u8{
+    // ⭐ The completing path, which the collapsed draw never reached: split
+    // the real ClientHello somewhere inside it and deliver the TRUE remainder.
+    // `split` is `1 + octet % (body_len - 1)`, so these three are an early
+    // split, the split-at-1 extreme the old draw pinned, and a late one.
+    flight_seed("28" ++ "01"),
+    flight_seed("00" ++ "01"),
+    flight_seed("ff" ++ "01"),
+    // A contradicting continuation: honest offset and total, wrong msg_type.
+    flight_seed("28" ++ "00" ++ "04" ++ "41424344" ++ "28" ++ "99" ++ "0b" ++ "00"),
+    // An offset past the declared total: refused before reassembly.
+    flight_seed("28" ++ "00" ++ "04" ++ "41424344" ++ "a0" ++ "10" ++ "01" ++ "00"),
+    // A zero-length continuation of a zero-length message — the one scenario
+    // the collapsed harness ever ran, kept as a seed so it stays covered.
+    flight_seed("01" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00" ++ "00"),
+    // A different `message_seq`, which restarts reassembly.
+    flight_seed("28" ++ "00" ++ "08" ++ "4142434445464748" ++ "00" ++ "08" ++ "01" ++ "02"),
+    flight_seed("ff"), // one octet, cycled
+};
+
+test "fuzz: handleFlight survives arbitrary continuations of a half-delivered flight" {
+    try testing.fuzz({}, fuzzHandleFlight, .{ .corpus = &flight_seeds });
+}
+
+fn fuzzHandleFlight(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One `smith.slice` call, and it is the FIRST draw — see the note above.
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runFlightScript(script[0..n]);
+}
+
+test "corpus: every flight seed reaches the stitching transaction, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim.
+    //
+    // `truthful` is the number reach cannot give, and the one that names what
+    // the collapse was hiding: it is how many scripts deliver the TRUE
+    // remainder of the real ClientHello, i.e. how many reach the path where the
+    // message COMPLETES inside `handleFlight` — the half of the transaction
+    // this target exists for, and which ran zero times for as long as the
+    // branch hung on a `boolWeighted` drawn after the input was gone.
+    var nonempty: usize = 0;
+    var truthful: usize = 0;
+    var delivered: usize = 0;
+    var accepted: usize = 0;
+    var payload: usize = 0;
+    for (flight_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        const o = try runFlightScript(script[0..n]);
+        if (o.truthful) truthful += 1;
+        if (o.delivered) delivered += 1;
+        if (o.accepted) accepted += 1;
+        payload += o.payload;
+    }
+    try testing.expectEqual(flight_seeds.len, nonempty);
+    // ⭐ 4 of 8 scripts deliver the true remainder — the completing path. It
+    // ran ZERO times before, for as long as `truthful` hung on a
+    // `boolWeighted` drawn after the input was exhausted.
+    try testing.expectEqual(@as(usize, 4), truthful);
+    try testing.expectEqual(@as(usize, 8), delivered);
+    try testing.expectEqual(@as(usize, 4), accepted);
+    // Octets of ClientHello body the continuations carried. The collapsed
+    // harness carried 0.
+    try testing.expectEqual(@as(usize, 360), payload);
+
+    // ⭐ And the collapsed harness, in full: an empty script makes every
+    // `FlightScript` read return 0, which is exactly what the ranged draws
+    // returned outside `--fuzz`. One octet delivered, nothing truthful.
+    const collapsed = try runFlightScript(&.{});
+    try testing.expect(!collapsed.truthful);
+    try testing.expect(collapsed.delivered);
+    try testing.expectEqual(@as(usize, 0), collapsed.payload);
 }
 
 test "reassembly: a ClientHello split across two datagrams, delivered OUT OF ORDER" {

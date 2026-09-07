@@ -5,6 +5,37 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the module's last two fuzz
+  targets stop drawing their whole scenario from collapsing draws, and `dtls`
+  reaches zero on `scripts/check-fuzz-reach.py` (17 → 0).
+
+  `handshake.fuzzReassemble` and `Connection.fuzzHandleFlight` both draw a
+  SHAPE rather than a frame, and both took every choice from
+  `smith.valueRangeAtMost` — starting with the first. A ranged draw reads eight
+  octets as a little-endian `u64` and returns the range MINIMUM unless the whole
+  word lands inside the range, and after one short read `Smith` discards the
+  rest of the input. Neither was exempted: a state machine driven by a byte
+  script has a byte-first form, so both now take one `smith.slice` and read
+  their choices out of it with `testkit.fuzz.Cursor`. `fuzzReassemble`'s
+  hand-written corpus of 8-octet little-endian words, and the
+  `CorpusItem`/`corpusBytes`/`stormFragment` apparatus that built it, are gone;
+  the seeds are now hex scripts that read as the scenario they are.
+
+  ⭐ What the collapse was hiding in `fuzzHandleFlight`: its second-fragment
+  branch is commented *"Half the time, feed the TRUE remaining bytes at the TRUE
+  offset, so the completing path is reached too and not only the rejecting
+  one"*. That `smith.boolWeighted(1, 1)` was drawn after the input was
+  exhausted, so it was `false` every time — **the completing path, which is the
+  half of the accumulate/snapshot transaction the target was written to cover,
+  had never run**. The target had executed exactly one scenario for its whole
+  life: split = 1, an empty continuation of a zero-length message.
+
+  Measured before → after: `fuzzReassemble` **1 script, 3 octets stitched → 9
+  scripts, 405 octets stitched, 30 declared-vs-present mismatches refused**;
+  `fuzzHandleFlight` **1 script, 0 truthful continuations → 8 scripts, 4
+  truthful, 360 octets of real ClientHello body delivered**. Both keep the
+  collapsed run as an executable "before" line in their corpus guards.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the twelve handshake-message
   fuzz targets and the certificate-bridge one stop throwing their input away,
   and two new certificate fixtures reach two dispatch arms that had never run.
