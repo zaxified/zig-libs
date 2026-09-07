@@ -1937,30 +1937,249 @@ test "wire constants agree with the kernel UAPI" {
     try testing.expectEqual(@as(u16, 4094), info.vid);
 }
 
-/// An interface name and a link-layer address for `fuzzBuilders`, laid out the
-/// way its draws read them: two `testkit.fuzz` slice seeds back to back (u32
-/// length + bytes, twice).
-const BuilderSeed = struct { name: []const u8, mac: []const u8 };
+/// One corpus entry for `fuzzBuilders`, spelled as the VALUES its draws read
+/// rather than as octets.
+///
+/// The interface name and the link-layer address are the two `smith.slice`
+/// draws; everything after them is one of the **31 knobs** the harness draws
+/// behind the bytes — the largest such tail in the repository. No hand-written
+/// hex is reviewable at that length, so `BuilderCorpus.build` serialises this
+/// struct in the exact order `driveBuilders` draws it, and `driveBuilders`
+/// records what it actually drew back into a struct of this same type. The
+/// corpus guard then compares the two with one `expectEqualDeep`, which is the
+/// only check that notices a draw inserted, removed or reordered — after which
+/// every knob downstream of it silently reads the wrong word.
+///
+/// ⛔ What the tail bought, measured over this corpus: **`buildFdbRequest` and
+/// `buildVlanRequest` had never once returned a request.** Both open with
+/// `checkVid`, `vlan_id_min` is 1, and with no tail every knob after the byte
+/// draws is its range minimum — so `vid` was 0 and `error.InvalidVlanId` was
+/// the answer on every seed, for the whole corpus. Per builder: 3/0/0/5/5
+/// before, and the counts pinned in the guard below after.
+///
+/// ⚠ A `u64` word only survives a `value(T)` draw if it fits `T`; a word that
+/// does not falls back to the weight minimum, which is 0. `eos` is different
+/// and reads exactly ONE octet, `true` for anything non-zero — and returns
+/// `true` when the input has run out, which is why a seed has to carry its
+/// whole tail: a short one turns every remaining option ON with the value 0.
+const BuilderSeed = struct {
+    name: []const u8 = "",
+    mac: []const u8 = "",
+
+    // buildBridgeAddRequest
+    br_seq: u32 = 0,
+    br_flags: u16 = 0,
+    forward_delay: ?u32 = null,
+    ageing_time: ?u32 = null,
+    stp_state: ?u32 = null,
+    br_priority: ?u16 = null,
+    vlan_filtering: ?bool = null,
+    vlan_protocol: ?u16 = null,
+    br_mac: bool = false,
+
+    // buildFdbRequest
+    fdb_seq: u32 = 0,
+    fdb_type: u16 = 0,
+    fdb_flags: u16 = 0,
+    fdb_ifindex: u32 = 0,
+    fdb_dst: bool = false,
+    fdb_vlan: ?u16 = null,
+    fdb_port: ?u16 = null,
+    fdb_vni: ?u32 = null,
+    fdb_master: ?u32 = null,
+    fdb_state: u16 = 0,
+    fdb_nflags: u8 = 0,
+    fdb_ntype: u8 = 0,
+
+    // buildVlanRequest
+    vlan_seq: u32 = 0,
+    vlan_type: u16 = 0,
+    vlan_ifindex: u32 = 0,
+    vid: u16 = 0,
+    vid_end: ?u16 = null,
+    pvid: bool = false,
+    untagged: bool = false,
+    vlan_self: bool = false,
+    vlan_master: bool = false,
+
+    // buildBrportRequest
+    bp_seq: u32 = 0,
+    bp_ifindex: u32 = 0,
+    bp_state: ?u8 = null,
+    bp_learning: ?bool = null,
+    bp_unicast_flood: ?bool = null,
+    bp_isolated: ?bool = null,
+    bp_priority: ?u16 = null,
+    bp_cost: ?u32 = null,
+
+    // buildFdbDumpRequest
+    dump_seq: u32 = 0,
+    dump_ifindex: ?u32 = null,
+    dump_master: ?u32 = null,
+};
 
 const builder_seeds = [_]BuilderSeed{
-    // The ordinary case: a legal IFNAMSIZ name and a six-octet MAC.
-    .{ .name = "br0", .mac = &.{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 } },
-    // A name of exactly IFNAMSIZ-1 and the all-ones broadcast address.
-    .{ .name = "abcdefghijklmno", .mac = &[_]u8{0xff} ** 6 },
-    // A name one octet too long for IFNAMSIZ, and a MAC that is not six
-    // octets — both are refusals the builders owe an error rather than a
-    // truncated request.
-    .{ .name = "abcdefghijklmnop", .mac = &.{ 0x01, 0x02, 0x03 } },
+    // The ordinary case: a legal IFNAMSIZ name and a six-octet MAC, a bridge
+    // carrying every IFLA_BR option, a VLAN 10 FDB entry, and `vid 10 pvid
+    // untagged` — the request the module's own golden test pins.
+    .{
+        .name = "br0",
+        .mac = &.{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 },
+        .br_seq = 1,
+        .br_flags = 0x0405,
+        .forward_delay = 100,
+        .ageing_time = 20_000,
+        .stp_state = 1,
+        .br_priority = 4096,
+        .vlan_filtering = true,
+        .vlan_protocol = 0x88a8,
+        .br_mac = true,
+        .fdb_seq = 2,
+        .fdb_type = root.RTM_NEWNEIGH,
+        .fdb_flags = 0x0501,
+        .fdb_ifindex = 7,
+        .fdb_dst = false,
+        .fdb_vlan = 10,
+        .fdb_port = 4789,
+        .fdb_vni = 100,
+        .fdb_master = 3,
+        .fdb_state = 0x0002,
+        .fdb_nflags = 0x02,
+        .fdb_ntype = 0,
+        .vlan_seq = 3,
+        .vlan_type = RTM_SETLINK,
+        .vlan_ifindex = 7,
+        .vid = 10,
+        .pvid = true,
+        .untagged = true,
+        .bp_seq = 4,
+        .bp_ifindex = 7,
+        .bp_state = 3,
+        .bp_learning = false,
+        .bp_unicast_flood = false,
+        .bp_isolated = true,
+        .bp_priority = 8,
+        .bp_cost = 100,
+        .dump_seq = 5,
+        .dump_ifindex = 7,
+        .dump_master = 3,
+    },
+    // A name of exactly IFNAMSIZ-1 and the all-ones broadcast address, with a
+    // VLAN RANGE (`vid 100-200`) and the `self` flag — the two branches of
+    // `buildVlanRequest` the single-VID seed above does not take. Every
+    // optional the other seeds set is left absent here, which is the other
+    // half of `hasBridgeOptions`/`hasBrportOptions`: a bridge request with no
+    // IFLA_INFO_DATA nest at all, and a brport request with nothing to change
+    // (`error.NothingToChange`).
+    .{
+        .name = "abcdefghijklmno",
+        .mac = &[_]u8{0xff} ** 6,
+        .br_seq = 0xffff_ffff,
+        .br_flags = 0xffff,
+        .fdb_seq = 11,
+        .fdb_type = root.RTM_DELNEIGH,
+        .fdb_ifindex = 0xffff_ffff,
+        .fdb_dst = true, // a 15-octet "address": neither 4 nor 16
+        .fdb_state = 0xffff,
+        .fdb_nflags = 0xff,
+        .fdb_ntype = 0xff,
+        .vlan_seq = 12,
+        .vlan_type = RTM_SETLINK,
+        .vlan_ifindex = 2,
+        .vid = 100,
+        .vid_end = 200,
+        .vlan_self = true,
+        .dump_seq = 13,
+    },
+    // A name one octet too long for IFNAMSIZ, and a MAC that is not six octets
+    // — both are refusals the builders owe an error rather than a truncated
+    // request. The VLAN knobs carry the range refusals: `vid_end` BELOW `vid`,
+    // which is `error.InvalidVlanRange`.
+    .{
+        .name = "abcdefghijklmnop",
+        .mac = &.{ 0x01, 0x02, 0x03 },
+        .stp_state = 2,
+        .vlan_filtering = false,
+        .br_mac = true,
+        .fdb_vlan = 4094, // the top legal VID
+        .fdb_port = 65535,
+        .vid = 200,
+        .vid_end = 100, // end < vid
+        .bp_state = 255,
+        .bp_learning = true,
+        .bp_cost = 0xffff_ffff,
+        .dump_master = 0xdead_beef,
+    },
     // A name with an embedded NUL and an infiniband-length (20-octet) address.
-    .{ .name = "br\x000", .mac = &[_]u8{0xaa} ** 20 },
+    // The VLAN knobs here are the OUT-OF-RANGE vid (`checkVid` rejects 4095)
+    // and, on the FDB side, vid 0 — the value every seed used to carry.
+    .{
+        .name = "br\x000",
+        .mac = &[_]u8{0xaa} ** 20,
+        .ageing_time = 0,
+        .br_priority = 0,
+        .fdb_vlan = 0, // below `vlan_id_min`
+        .vid = 4095, // above `vlan_id_max`
+        .pvid = true,
+        .vlan_self = true,
+        .vlan_master = true, // and `self` + `master` together
+        .bp_isolated = false,
+        .bp_priority = 65535,
+    },
     // The longest of each that still fits the harness's buffers. ⚠ A seed
     // longer than the buffer is not a big seed, it is the EMPTY one:
     // `Smith.slice` falls back to the range minimum. 24 and 40 are the caps.
-    .{ .name = &[_]u8{'x'} ** 24, .mac = &[_]u8{0x5a} ** 40 },
+    // A legal single VID with `pvid` and a `vid_end` EQUAL to it, which is the
+    // one range `buildVlanRequest` lets a PVID have.
+    .{
+        .name = &[_]u8{'x'} ** 24,
+        .mac = &[_]u8{0x5a} ** 40,
+        .forward_delay = 1,
+        .vlan_protocol = 0x8100,
+        .fdb_vlan = 4094,
+        .fdb_vni = 0xffff_ffff,
+        .vid = 4094,
+        .vid_end = 4094,
+        .pvid = true,
+        .untagged = true,
+        .bp_unicast_flood = true,
+        .bp_priority = 1,
+    },
 };
 
+/// Serialise one seed's knob tail. `word` is the eight octets a `value(T)` draw
+/// reads as a little-endian `u64`; `flag` is the single octet an `eos` draw
+/// reads. The ORDER here is the contract with `driveBuilders`, and the guard's
+/// `expectEqualDeep` is what enforces it.
+const TailWriter = struct {
+    buf: []u8,
+    at: usize = 0,
+
+    fn word(self: *TailWriter, v: u64) void {
+        std.mem.writeInt(u64, self.buf[self.at..][0..8], v, .little);
+        self.at += 8;
+    }
+    fn flag(self: *TailWriter, v: bool) void {
+        self.buf[self.at] = @intFromBool(v);
+        self.at += 1;
+    }
+    /// An `eos` gate, then the value it lets through when it is present.
+    fn optWord(self: *TailWriter, v: anytype) void {
+        self.flag(v != null);
+        if (v) |x| self.word(x);
+    }
+    /// The same, for an option whose value is itself an `eos` draw.
+    fn optFlag(self: *TailWriter, v: ?bool) void {
+        self.flag(v != null);
+        if (v) |x| self.flag(x);
+    }
+};
+
+/// 31 words plus 29 gate octets is the longest tail a seed can need.
+const builder_tail_cap = 31 * 8 + 29;
+
 const BuilderCorpus = struct {
-    store: [builder_seeds.len * (4 + 24 + 4 + 40)]u8 = undefined,
+    store: [builder_seeds.len * (4 + 24 + 4 + 40 + builder_tail_cap)]u8 = undefined,
     entries: [builder_seeds.len][]const u8 = undefined,
 
     fn build(self: *BuilderCorpus) []const []const u8 {
@@ -1968,8 +2187,57 @@ const BuilderCorpus = struct {
         for (&self.entries, builder_seeds) |*out, sd| {
             const a = testkit.fuzz.seedInto(self.store[used..], sd.name);
             const b = testkit.fuzz.seedInto(self.store[used + a.len ..], sd.mac);
-            out.* = self.store[used..][0 .. a.len + b.len];
-            used += a.len + b.len;
+            var w: TailWriter = .{ .buf = self.store[used + a.len + b.len ..] };
+
+            w.word(sd.br_seq);
+            w.word(sd.br_flags);
+            w.optWord(sd.forward_delay);
+            w.optWord(sd.ageing_time);
+            w.optWord(sd.stp_state);
+            w.optWord(sd.br_priority);
+            w.optFlag(sd.vlan_filtering);
+            w.optWord(sd.vlan_protocol);
+            w.flag(sd.br_mac);
+
+            w.word(sd.fdb_seq);
+            w.word(sd.fdb_type);
+            w.word(sd.fdb_flags);
+            w.word(sd.fdb_ifindex);
+            w.flag(sd.fdb_dst);
+            w.optWord(sd.fdb_vlan);
+            w.optWord(sd.fdb_port);
+            w.optWord(sd.fdb_vni);
+            w.optWord(sd.fdb_master);
+            w.word(sd.fdb_state);
+            w.word(sd.fdb_nflags);
+            w.word(sd.fdb_ntype);
+
+            w.word(sd.vlan_seq);
+            w.word(sd.vlan_type);
+            w.word(sd.vlan_ifindex);
+            w.word(sd.vid);
+            w.optWord(sd.vid_end);
+            w.flag(sd.pvid);
+            w.flag(sd.untagged);
+            w.flag(sd.vlan_self);
+            w.flag(sd.vlan_master);
+
+            w.word(sd.bp_seq);
+            w.word(sd.bp_ifindex);
+            w.optWord(sd.bp_state);
+            w.optFlag(sd.bp_learning);
+            w.optFlag(sd.bp_unicast_flood);
+            w.optFlag(sd.bp_isolated);
+            w.optWord(sd.bp_priority);
+            w.optWord(sd.bp_cost);
+
+            w.word(sd.dump_seq);
+            w.optWord(sd.dump_ifindex);
+            w.optWord(sd.dump_master);
+
+            const total = a.len + b.len + w.at;
+            out.* = self.store[used..][0..total];
+            used += total;
         }
         return &self.entries;
     }
@@ -1993,6 +2261,11 @@ const BuilderRun = struct {
     mac_buf: [40]u8 = undefined,
     name_len: usize = 0,
     mac_len: usize = 0,
+    /// Every knob the pass drew, in a struct of the same type the seed is
+    /// written in — so the guard can compare the whole schedule at once.
+    drawn: BuilderSeed = .{},
+    /// Which of the five builders returned a request rather than an error.
+    built: [5]bool = @splat(false),
     /// How many of the five builders returned a request rather than an error.
     accepted: usize = 0,
 
@@ -2019,6 +2292,8 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
     run.mac_len = smith.slice(&run.mac_buf);
     const name = run.name();
     const mac = run.mac();
+    run.drawn.name = name;
+    run.drawn.mac = mac;
 
     // ⛔ The optional fields below used to be gated on `smith.value(bool)`,
     // which is a 1-bit `valueWeighted` draw: outside `--fuzz` it is the range
@@ -2031,65 +2306,122 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
     // corpus above, toggling only these two things: **0 of 5 seeds with a
     // non-empty name and mac and 5 of 25 builds accepted before, 5 of 5
     // non-empty and 13 of 25 accepted after.**
-    if (buildBridgeAddRequest(gpa, smith.value(u32), smith.value(u16), .{
+    //
+    // ⛔ And 13 of 25 was still not the end of it. Turning an option ON does
+    // not choose its VALUE: the seeds carried no octets past the two slice
+    // draws, so all 31 knobs here were still their own minimum — every option
+    // present, every value 0. `vlan_id_min` is 1, and both `buildFdbRequest`
+    // and `buildVlanRequest` open with `checkVid`, so those two builders
+    // answered `error.InvalidVlanId` on **every seed in the corpus** and had
+    // never once returned a request: 3/0/0/5/5 per builder. Each draw is now
+    // recorded into `run.drawn` as it is taken, which costs nothing at run
+    // time and lets the guard below compare the whole 31-knob schedule against
+    // the seed that produced it.
+    run.drawn.br_seq = smith.value(u32);
+    run.drawn.br_flags = smith.value(u16);
+    run.drawn.forward_delay = if (smith.eos()) smith.value(u32) else null;
+    run.drawn.ageing_time = if (smith.eos()) smith.value(u32) else null;
+    run.drawn.stp_state = if (smith.eos()) smith.value(u32) else null;
+    run.drawn.br_priority = if (smith.eos()) smith.value(u16) else null;
+    run.drawn.vlan_filtering = if (smith.eos()) smith.eos() else null;
+    run.drawn.vlan_protocol = if (smith.eos()) smith.value(u16) else null;
+    run.drawn.br_mac = smith.eos();
+    if (buildBridgeAddRequest(gpa, run.drawn.br_seq, run.drawn.br_flags, .{
         .name = name,
-        .forward_delay = if (smith.eos()) smith.value(u32) else null,
-        .ageing_time = if (smith.eos()) smith.value(u32) else null,
-        .stp_state = if (smith.eos()) smith.value(u32) else null,
-        .priority = if (smith.eos()) smith.value(u16) else null,
-        .vlan_filtering = if (smith.eos()) smith.eos() else null,
-        .vlan_protocol = if (smith.eos()) smith.value(u16) else null,
-        .mac = if (smith.eos()) mac else null,
+        .forward_delay = run.drawn.forward_delay,
+        .ageing_time = run.drawn.ageing_time,
+        .stp_state = run.drawn.stp_state,
+        .priority = run.drawn.br_priority,
+        .vlan_filtering = run.drawn.vlan_filtering,
+        .vlan_protocol = run.drawn.vlan_protocol,
+        .mac = if (run.drawn.br_mac) mac else null,
     })) |req| {
         run.accepted += 1;
+        run.built[0] = true;
         gpa.free(req);
     } else |_| {}
 
-    if (buildFdbRequest(gpa, smith.value(u32), smith.value(u16), smith.value(u16), .{
-        .ifindex = smith.value(u32),
+    run.drawn.fdb_seq = smith.value(u32);
+    run.drawn.fdb_type = smith.value(u16);
+    run.drawn.fdb_flags = smith.value(u16);
+    run.drawn.fdb_ifindex = smith.value(u32);
+    run.drawn.fdb_dst = smith.eos();
+    run.drawn.fdb_vlan = if (smith.eos()) smith.value(u16) else null;
+    run.drawn.fdb_port = if (smith.eos()) smith.value(u16) else null;
+    run.drawn.fdb_vni = if (smith.eos()) smith.value(u32) else null;
+    run.drawn.fdb_master = if (smith.eos()) smith.value(u32) else null;
+    run.drawn.fdb_state = smith.value(u16);
+    run.drawn.fdb_nflags = smith.value(u8);
+    run.drawn.fdb_ntype = smith.value(u8);
+    if (buildFdbRequest(gpa, run.drawn.fdb_seq, run.drawn.fdb_type, run.drawn.fdb_flags, .{
+        .ifindex = run.drawn.fdb_ifindex,
         .lladdr = mac,
-        .dst = if (smith.eos()) name else null,
-        .vlan = if (smith.eos()) smith.value(u16) else null,
-        .port = if (smith.eos()) smith.value(u16) else null,
-        .vni = if (smith.eos()) smith.value(u32) else null,
-        .master = if (smith.eos()) smith.value(u32) else null,
-        .state = smith.value(u16),
-        .flags = smith.value(u8),
-        .ntype = smith.value(u8),
+        .dst = if (run.drawn.fdb_dst) name else null,
+        .vlan = run.drawn.fdb_vlan,
+        .port = run.drawn.fdb_port,
+        .vni = run.drawn.fdb_vni,
+        .master = run.drawn.fdb_master,
+        .state = run.drawn.fdb_state,
+        .flags = run.drawn.fdb_nflags,
+        .ntype = run.drawn.fdb_ntype,
     })) |req| {
         run.accepted += 1;
+        run.built[1] = true;
         gpa.free(req);
     } else |_| {}
 
-    if (buildVlanRequest(gpa, smith.value(u32), smith.value(u16), smith.value(u32), .{
-        .vid = smith.value(u16),
-        .vid_end = if (smith.eos()) smith.value(u16) else null,
-        .pvid = smith.eos(),
-        .untagged = smith.eos(),
-        .self = smith.eos(),
-        .master = smith.eos(),
+    run.drawn.vlan_seq = smith.value(u32);
+    run.drawn.vlan_type = smith.value(u16);
+    run.drawn.vlan_ifindex = smith.value(u32);
+    run.drawn.vid = smith.value(u16);
+    run.drawn.vid_end = if (smith.eos()) smith.value(u16) else null;
+    run.drawn.pvid = smith.eos();
+    run.drawn.untagged = smith.eos();
+    run.drawn.vlan_self = smith.eos();
+    run.drawn.vlan_master = smith.eos();
+    if (buildVlanRequest(gpa, run.drawn.vlan_seq, run.drawn.vlan_type, run.drawn.vlan_ifindex, .{
+        .vid = run.drawn.vid,
+        .vid_end = run.drawn.vid_end,
+        .pvid = run.drawn.pvid,
+        .untagged = run.drawn.untagged,
+        .self = run.drawn.vlan_self,
+        .master = run.drawn.vlan_master,
     })) |req| {
         run.accepted += 1;
+        run.built[2] = true;
         gpa.free(req);
     } else |_| {}
 
-    if (buildBrportRequest(gpa, smith.value(u32), smith.value(u32), .{
-        .state = if (smith.eos()) smith.value(u8) else null,
-        .learning = if (smith.eos()) smith.eos() else null,
-        .unicast_flood = if (smith.eos()) smith.eos() else null,
-        .isolated = if (smith.eos()) smith.eos() else null,
-        .priority = if (smith.eos()) smith.value(u16) else null,
-        .cost = if (smith.eos()) smith.value(u32) else null,
+    run.drawn.bp_seq = smith.value(u32);
+    run.drawn.bp_ifindex = smith.value(u32);
+    run.drawn.bp_state = if (smith.eos()) smith.value(u8) else null;
+    run.drawn.bp_learning = if (smith.eos()) smith.eos() else null;
+    run.drawn.bp_unicast_flood = if (smith.eos()) smith.eos() else null;
+    run.drawn.bp_isolated = if (smith.eos()) smith.eos() else null;
+    run.drawn.bp_priority = if (smith.eos()) smith.value(u16) else null;
+    run.drawn.bp_cost = if (smith.eos()) smith.value(u32) else null;
+    if (buildBrportRequest(gpa, run.drawn.bp_seq, run.drawn.bp_ifindex, .{
+        .state = run.drawn.bp_state,
+        .learning = run.drawn.bp_learning,
+        .unicast_flood = run.drawn.bp_unicast_flood,
+        .isolated = run.drawn.bp_isolated,
+        .priority = run.drawn.bp_priority,
+        .cost = run.drawn.bp_cost,
     })) |req| {
         run.accepted += 1;
+        run.built[3] = true;
         gpa.free(req);
     } else |_| {}
 
-    if (buildFdbDumpRequest(gpa, smith.value(u32), .{
-        .ifindex = if (smith.eos()) smith.value(u32) else null,
-        .master = if (smith.eos()) smith.value(u32) else null,
+    run.drawn.dump_seq = smith.value(u32);
+    run.drawn.dump_ifindex = if (smith.eos()) smith.value(u32) else null;
+    run.drawn.dump_master = if (smith.eos()) smith.value(u32) else null;
+    if (buildFdbDumpRequest(gpa, run.drawn.dump_seq, .{
+        .ifindex = run.drawn.dump_ifindex,
+        .master = run.drawn.dump_master,
     })) |req| {
         run.accepted += 1;
+        run.built[4] = true;
         gpa.free(req);
     } else |_| {}
 }
@@ -2099,25 +2431,35 @@ test "corpus: every builder seed reaches the builders, and the counts are pinned
     // corpus and the SAME draw sequence the harness gets. `nonempty` is the
     // reach claim and the only check that would catch a seed grown past its
     // 24/40-octet buffer, which `Smith.slice` reads back as the empty one,
-    // silently. `accepted` is pinned rather than asserted `> 0`: a corpus every
-    // builder refuses tests only the refusal path, and an edit that changes
-    // what builds has to come here and say so.
+    // silently.
+    //
+    // ⭐ `expectEqualDeep(spec, run.drawn)` is the one that matters for the 31
+    // knobs behind the byte draws. It is not a paraphrase of the schedule: it
+    // is the schedule, read back out of a real `Smith` after the real harness
+    // body drew it, so a draw inserted, removed or reordered fails here rather
+    // than silently shifting every later knob onto the wrong word. Pinning
+    // `accepted` alone would not: 13 of 25 was the number this corpus produced
+    // while two of the five builders had never returned a request at all.
     var corpus: BuilderCorpus = .{};
     const entries = corpus.build();
 
     var nonempty: usize = 0;
     var accepted: usize = 0;
+    var built: [5]usize = @splat(0);
     for (entries, builder_seeds) |sd, spec| {
         var smith: std.testing.Smith = .{ .in = sd };
         var run: BuilderRun = .{};
         try driveBuilders(&smith, &run);
         if (run.name_len != 0 and run.mac_len != 0) nonempty += 1;
-        try testing.expectEqualSlices(u8, spec.name, run.name());
-        try testing.expectEqualSlices(u8, spec.mac, run.mac());
+        try testing.expectEqualDeep(spec, run.drawn);
+        for (&built, run.built) |*acc, b| acc.* += @intFromBool(b);
         accepted += run.accepted;
     }
     try testing.expectEqual(entries.len, nonempty);
-    try testing.expectEqual(@as(usize, 13), accepted);
+    // Per builder: bridge-add, FDB, VLAN, brport, FDB-dump. The two zeros this
+    // replaces were `buildFdbRequest` and `buildVlanRequest`.
+    try testing.expectEqual([5]usize{ 3, 2, 3, 4, 5 }, built);
+    try testing.expectEqual(@as(usize, 17), accepted);
 }
 
 /// `testkit.fuzz.seedHex`, aliased so the corpus below reads as the frames it

@@ -3043,6 +3043,19 @@ const BuilderRun = struct {
     addr_len: usize = 0,
     prefix: u8 = 0,
     ifindex: u32 = 0,
+    /// The four knobs drawn inside the builder calls rather than ahead of
+    /// them. They reach no validation — they are attribute payload — but they
+    /// are knobs behind the byte draw all the same, and the guard pins them so
+    /// a draw inserted ahead of them cannot silently shift the whole tail.
+    table: u32 = 0,
+    mtu: u32 = 0,
+    flags: u32 = 0,
+    flags_mask: u32 = 0,
+    /// Which of the four builders returned a request rather than an error.
+    /// ⛔ Pinning only the TOTAL hides a builder that never builds at all:
+    /// `bridge.zig`'s sibling harness scored 13 of 25 while two of its five
+    /// builders had never once returned a request.
+    built: [4]bool = @splat(false),
     /// How many of the four builders returned a request rather than an error.
     accepted: usize = 0,
 };
@@ -3076,15 +3089,18 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
         .prefixlen = prefix,
     })) |req| {
         run.accepted += 1;
+        run.built[0] = true;
         gpa.free(req);
     } else |_| {}
+    run.table = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32));
     if (buildRouteRequest(gpa, 1, RTM_NEWROUTE, 0, .{
         .dst = a,
         .dst_prefixlen = prefix,
         .oif = ifindex,
-        .table = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32)),
+        .table = run.table,
     })) |req| {
         run.accepted += 1;
+        run.built[1] = true;
         gpa.free(req);
     } else |_| {}
     if (buildNeighborRequest(gpa, 1, RTM_NEWNEIGH, 0, .{
@@ -3093,15 +3109,24 @@ fn driveBuilders(smith: *std.testing.Smith, run: *BuilderRun) !void {
         .lladdr = a,
     })) |req| {
         run.accepted += 1;
+        run.built[2] = true;
         gpa.free(req);
     } else |_| {}
+    run.mtu = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32));
     if (buildLinkSetRequest(gpa, 1, ifindex, .{
-        .mtu = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32)),
+        .mtu = run.mtu,
         .mac = a,
-        .flags = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32)),
-        .flags_mask = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32)),
+        .flags = blk: {
+            run.flags = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32));
+            break :blk run.flags;
+        },
+        .flags_mask = blk: {
+            run.flags_mask = smith.valueRangeAtMost(u32, 0, std.math.maxInt(u32));
+            break :blk run.flags_mask;
+        },
     })) |req| {
         run.accepted += 1;
+        run.built[3] = true;
         gpa.free(req);
     } else |_| {}
 }
@@ -3125,17 +3150,24 @@ test "corpus: every builder seed reaches the builders, and the counts are pinned
     var nonempty: usize = 0;
     var accepted: usize = 0;
     var knobs: usize = 0;
+    var built: [4]usize = @splat(0);
     for (entries, builder_seeds) |sd, spec| {
         var smith: std.testing.Smith = .{ .in = sd };
         var run: BuilderRun = .{};
         try driveBuilders(&smith, &run);
         if (run.addr_len != 0) nonempty += 1;
         try testing.expectEqualSlices(u8, spec.addr, run.addr[0..run.addr_len]);
-        if (run.prefix == spec.prefix and run.ifindex == spec.ifindex) knobs += 1;
+        if (run.prefix == spec.prefix and run.ifindex == spec.ifindex and
+            run.table == spec.table and run.mtu == spec.mtu and
+            run.flags == spec.flags and run.flags_mask == spec.flags_mask) knobs += 1;
+        for (&built, run.built) |*acc, b| acc.* += @intFromBool(b);
         accepted += run.accepted;
     }
     try testing.expectEqual(entries.len, nonempty);
     try testing.expectEqual(entries.len, knobs);
+    // Per builder: address, route, neighbour, link-set. Pinned separately
+    // because a total cannot show a builder that never builds.
+    try testing.expectEqual([4]usize{ 3, 3, 4, 5 }, built);
     try testing.expectEqual(@as(usize, 15), accepted);
 }
 
