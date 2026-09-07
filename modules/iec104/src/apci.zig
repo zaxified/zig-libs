@@ -334,6 +334,12 @@ pub const Framer = struct {
 
 const testing = std.testing;
 
+/// `testkit.fuzz.seedHex`, aliased so the corpora below read as the APDUs they
+/// are. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// u32 length first, so a raw frame would arrive minus its own first four
+/// octets. See `testkit/src/fuzz.zig` for the two other hazards.
+const seed = @import("testkit").fuzz.seedHex;
+
 test "U-format round-trip for all six functions" {
     const cases = [_]struct { f: UFunction, hex: []const u8 }{
         .{ .f = .startdt_act, .hex = "680407000000" },
@@ -472,14 +478,49 @@ test "framer rejects a bad start byte and an over-long length octet" {
     try testing.expectError(error.LengthTooLarge, g.next());
 }
 
+/// APDUs, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// Lifted from the value tests above plus every refusal `decode` names.
+/// Uniform random octets clear a `0x68` start byte and a self-consistent
+/// length octet with probability ~2^-9 per draw, and the I/S/U discrimination
+/// then sits behind three more reserved-octet checks — so without these the
+/// harness proves only that the start-byte check rejects noise.
+const decode_seeds = [_][]const u8{
+    seed("680407000000"), // U-format STARTDT act
+    seed("680483000000"), // U-format TESTFR con
+    seed("680401001200"), // S-format, N(R) = 9
+    seed("680E02000400" ++ "640106002F0000000014"), // I-format with the value test's ASDU
+    seed("68FD00000000" ++ ("5A" ** 249)), // the longest legal APDU: length octet 253
+    seed("680407000000" ++ "680483000000"), // two frames: the tail must be left alone
+    seed("68"), // ShortApdu
+    seed("690407000000"), // BadStartByte
+    seed("680307000000"), // LengthTooSmall: length octet 3
+    seed("6804070000"), // TruncatedApdu: five octets of a six-octet frame
+    seed("68040F000000"), // BadUFunction: two function bits set
+    seed("680403000000"), // BadUFunction: the format bits and nothing else
+    seed("680407010000"), // ReservedBitsSet: U-format with a dirty control octet 2
+    seed("680507000000FF"), // ReservedBitsSet: U-format carrying a body
+    seed("680501000000FF"), // ReservedBitsSet: S-format carrying a body
+    seed("680401020000"), // ReservedBitsSet: S-format with a dirty control octet 2
+    seed("680500000100FF"), // ReservedBitsSet: I-format with the N(R) marker bit set
+    seed("680400000000"), // ReservedBitsSet: I-format with no ASDU (F7)
+    seed("68FE" ++ ("00" ** 254)), // LengthTooLarge, with the octets really present
+};
+
 test "fuzz: apci decode never panics" {
-    try std.testing.fuzz({}, fuzzDecode, .{});
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [max_apdu_len + 8]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every seed and `decode` was handed `buf[0..0]` every
+    // time, with the frame sitting unread in `buf`. Measured 2026-09-07 over
+    // the corpus above: **0 of 19 non-empty and 0 decoded before, 19 of 19
+    // non-empty and 6 decoded after.**
+    const len: usize = smith.slice(&buf);
     const apdu = decode(buf[0..len]) catch return;
     // Anything that decodes must re-encode to the very same octets.
     var round: [max_apdu_len]u8 = undefined;
@@ -487,14 +528,58 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     try testing.expectEqualSlices(u8, buf[0..apdu.len], again);
 }
 
+test "corpus: every APDU seed reaches the decoder, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer — `Smith.slice`
+    // reads that back as the EMPTY seed, silently. `accepted` is pinned rather
+    // than asserted `> 0`: a corpus of refusals only exercises the refusal
+    // path, and a later edit that quietly stops a frame decoding shows up here.
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [max_apdu_len + 8]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        if (decode(buf[0..len])) |_| accepted += 1 else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len, nonempty);
+    // 6 = two U-format, one S-format, the value test's I-format, the 253-octet
+    // I-format, and the first of the two back-to-back frames.
+    try testing.expectEqual(@as(usize, 6), accepted);
+}
+
+/// Streams for the framer: frames back to back, a frame split across the
+/// 255-octet feed chunk, streams that stop mid-header, and the two refusals
+/// `next` can raise before a whole frame is present.
+const framer_seeds = [_][]const u8{
+    seed("680407000000" ++ "680483000000" ++ "680401001200"), // three frames in one feed
+    seed("68040700"), // stops four octets into the header
+    seed("68"), // one octet
+    // 30 octets of U-format frames, then the 253-length I-format APDU: 285
+    // octets in all, so the 255-octet chunk cuts the last frame in half.
+    seed(("680407000000" ** 5) ++ "68FD00000000" ++ ("5A" ** 249)),
+    seed("68FF07000000"), // LengthTooLarge, raised before the frame completes
+    seed("000407000000"), // BadStartByte
+    seed("680407000000" ++ "6804"), // one whole frame, then a partial header
+    seed("68" ** 400), // self-consistent by accident: 0x68 is also a legal length
+};
+
 test "fuzz: framer never panics or hangs on arbitrary stream bytes" {
-    try std.testing.fuzz({}, fuzzFramer, .{});
+    try std.testing.fuzz({}, fuzzFramer, .{ .corpus = &framer_seeds });
 }
 
 fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
     var input: [512]u8 = undefined;
-    smith.bytes(&input);
-    const len: usize = smith.valueRangeAtMost(u16, 0, input.len);
+    // ⚠ Same defect as `fuzzDecode` above, and worse: `len` never touched the
+    // buffer at all — it was the bound of the loop that feeds it. `len` was 0,
+    // so `while (off < len)` never ran and this harness fed the framer
+    // NOTHING, while its name promised a framer that never hangs.
+    // `check-fuzz-reach` only learned to see that shape on 2026-09-07.
+    // Measured over the corpus above: **0 of 8 seeds reached `feed` and 0
+    // frames were yielded before, 8 of 8 and 13 frames after.**
+    const len: usize = smith.slice(&input);
     var storage: [max_apdu_len * 2]u8 = undefined;
     var f = Framer.init(&storage);
     var off: usize = 0;
@@ -512,6 +597,40 @@ fn fuzzFramer(_: void, smith: *std.testing.Smith) !void {
             if (got == null) break;
         }
     }
+}
+
+test "corpus: every stream seed reaches feed, and the frames yielded are pinned" {
+    // ⭐ Same shape as the decode guard, with the second number chosen for what
+    // the collapse hid: `nonempty` alone would have been satisfied by a stream
+    // that `feed` accepts and `next` never completes, and that is exactly what
+    // this harness did for its whole life — it fed nothing at all. `frames` is
+    // the number an empty input cannot produce.
+    var nonempty: usize = 0;
+    var frames: usize = 0;
+    for (framer_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var input: [512]u8 = undefined;
+        const len: usize = smith.slice(&input);
+        if (len != 0) nonempty += 1;
+        var storage: [max_apdu_len * 2]u8 = undefined;
+        var f = Framer.init(&storage);
+        var off: usize = 0;
+        stream: while (off < len) {
+            const chunk = @min(len - off, max_apdu_len);
+            f.feed(input[off..][0..chunk]) catch break :stream;
+            off += chunk;
+            while (true) {
+                const got = f.next() catch break :stream;
+                if (got == null) break;
+                frames += 1;
+            }
+        }
+    }
+    try testing.expectEqual(framer_seeds.len, nonempty);
+    // 3 + 0 + 0 + 6 + 0 + 0 + 1 + 3: the last one is the accidental stream of
+    // 0x68 octets, where the start byte doubles as a legal length octet (106),
+    // so three whole I-format APDUs come out of 400 octets of it.
+    try testing.expectEqual(@as(usize, 13), frames);
 }
 
 test "an I-format APDU with no ASDU is refused by the framer, not by the state machine" {

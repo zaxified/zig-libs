@@ -256,6 +256,7 @@ pub fn decodeFrame(frame: []const u8, user_data_out: []u8) DecodeError!DecodedFr
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 test "CRC-16/DNP catalog check value" {
     // reveng CRC catalogue "CRC-16/DNP": check("123456789") = 0xEA82.
@@ -402,17 +403,124 @@ test "decode: user_data_out too small" {
     try testing.expectError(error.BufferTooSmall, decodeFrame(frame, &tiny));
 }
 
+/// Link frames, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// ⭐ Built at run time by this file's own `encodeFrame`: every frame carries a
+/// CRC-16/DNP over the header and one more over each 16-octet block, so a
+/// hand-written frame is a `BadHeaderCrc` and nothing else. That is exactly why
+/// random octets never reached the block loop this harness exists for — a
+/// uniform 10-octet header clears `crc16` with probability 2^-16, and then
+/// every block CRC has to clear too.
+const FrameCorpus = struct {
+    scratch: [512]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [16][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *FrameCorpus, frame: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    /// Encode into `scratch` and hand the slice back for mutation before it is
+    /// pushed, so the CRC failures below are one flipped octet away from a
+    /// frame that decodes — a refusal a random buffer cannot reach.
+    fn encoded(self: *FrameCorpus, user: []const u8) ![]u8 {
+        return encodeFrame(.{ .dir = true, .prm = true, .function = 4 }, 1, 1, user, &self.scratch);
+    }
+
+    fn build(self: *FrameCorpus) ![]const []const u8 {
+        // ── frames the decoder accepts ──────────────────────────────────────
+        self.push(try self.encoded("hello")); // one partial block
+        self.push(try self.encoded("")); // no user data: header block only
+        self.push(try self.encoded("0123456789ABCDEF")); // exactly one full block
+        self.push(try self.encoded("0123456789ABCDEF!")); // one octet into block two
+        self.push(try self.encoded(&[_]u8{0x5A} ** max_user_data_len)); // 250: sixteen blocks
+
+        // ── refusals, each one octet away from the frame above it ───────────
+        {
+            const f = try self.encoded("hello");
+            f[9] ^= 0xFF; // BadHeaderCrc
+            self.push(f);
+        }
+        {
+            const f = try self.encoded("hello");
+            f[f.len - 1] ^= 0xFF; // BadBlockCrc
+            self.push(f);
+        }
+        {
+            const f = try self.encoded("0123456789ABCDEF!");
+            self.push(f[0 .. f.len - 3]); // TruncatedBlock: the last block is short
+        }
+        {
+            const f = try self.encoded("hello");
+            f[2] = 4; // BadLengthField: below the five-octet minimum
+            self.push(f);
+        }
+        {
+            const f = try self.encoded("hello");
+            f[0] = 0x00; // BadStartBytes
+            self.push(f);
+        }
+        self.push(&[_]u8{ 0x05, 0x64, 0x05, 0xC4, 0x01 }); // ShortFrame: five octets
+        self.push(&[_]u8{0x00} ** 512); // a full buffer of zeroes
+        self.push(&.{}); // the empty frame
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: decodeFrame never crashes on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeFrame, .{});
+    var corpus: FrameCorpus = .{};
+    try testing.fuzz({}, fuzzDecodeFrame, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDecodeFrame(_: void, smith: *std.testing.Smith) !void {
     var frame: [512]u8 = undefined;
-    smith.bytes(&frame);
-    const len: usize = smith.valueRangeAtMost(u16, 0, frame.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(frame.len, in.len)` octets and the ranged
+    // draw then finds fewer than the eight it needs and returns the range
+    // MINIMUM — so `len` was 0 for every seed and `decodeFrame` was handed
+    // `frame[0..0]`, which is `ShortFrame` on the first line. The CRC block
+    // loop named in the comment below — the "block runs past end" surface this
+    // harness exists for — was never entered once. Measured 2026-09-07 over
+    // the corpus above: **0 of 13 seeds non-empty, 0 frames decoded and 0 user
+    // octets recovered before; 12 of 13 non-empty (the empty frame is a
+    // deliberate seed), 5 decoded and 289 user octets after.**
+    const len: usize = smith.slice(&frame);
     // The link-layer decoder is the primary untrusted-wire surface (CRC block
     // chunking — the classic "block runs past end" attack): it must never
     // panic/OOB on arbitrary bytes, only return a typed error or a frame.
     var out: [256]u8 = undefined;
     _ = decodeFrame(frame[0..len], &out) catch {};
+}
+
+test "corpus: every link seed reaches decodeFrame, and the user octets are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `user_octets` is the second number and the
+    // one that matters here: a frame with no user data decodes perfectly well
+    // without the block loop running at all, so `decoded` alone would count a
+    // corpus that never chunks anything as a complete success.
+    var corpus: FrameCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var user_octets: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var frame: [512]u8 = undefined;
+        const len: usize = smith.slice(&frame);
+        if (len != 0) nonempty += 1;
+        var out: [256]u8 = undefined;
+        const d = decodeFrame(frame[0..len], &out) catch continue;
+        decoded += 1;
+        user_octets += d.user_data_len;
+    }
+    // One short of the corpus length: the empty frame is a seed on purpose.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 5), decoded);
+    // 5 + 0 + 16 + 17 + 250.
+    try testing.expectEqual(@as(usize, 288), user_octets);
 }

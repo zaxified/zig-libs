@@ -506,6 +506,7 @@ pub fn serializeReplyChannelRange(allocator: Allocator, msg: ReplyChannelRange) 
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 const eq_kat = @import("bolt7_extended_queries_kat_vectors.zig");
 const au_kat = @import("bolt7_announcement_update_kat_vectors.zig");
 
@@ -1379,33 +1380,148 @@ test "hostile: reply_channel_range with an encoded_short_ids length prefix excee
 // and `channel_announcement`'s `features` field's shape, so this one
 // harness stands in for that whole sub-family.
 test "fuzz: decodeQueryShortChannelIds never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecodeQueryShortChannelIds, .{});
+    var corpus: QueryCorpus = .{};
+    try testing.fuzz({}, fuzzDecodeQueryShortChannelIds, .{ .corpus = try corpus.build(testing.allocator) });
 }
+
+/// `query_short_channel_ids` messages, in the format `Smith.slice` reads.
+///
+/// ⭐ Built at run time by this file's own `serializeQueryShortChannelIds`:
+/// the shape is a 2-octet type, a 32-octet chain_hash and then a u16-prefixed
+/// blob, so a hand-written seed is 34 octets of preamble before the one field
+/// that matters, and the truncation cases are that prefix disagreeing with
+/// what follows — which is only meaningful against a message that is otherwise
+/// correct.
+const QueryCorpus = struct {
+    store: [10 * (4 + 256)]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *QueryCorpus, bytes: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], bytes);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    fn build(self: *QueryCorpus, allocator: Allocator) ![]const []const u8 {
+        // encoding_type 0 (uncompressed) plus three 8-octet short channel ids.
+        const ids = [_]u8{0} ++ ([_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 } ** 3);
+        const full = try serializeQueryShortChannelIds(allocator, .{
+            .chain_hash = fillPattern(32, 1),
+            .encoded_short_ids = &ids,
+        });
+        defer allocator.free(full);
+        self.push(full);
+
+        // An empty encoded_short_ids: a legal message that walks no id.
+        const empty_ids = try serializeQueryShortChannelIds(allocator, .{
+            .chain_hash = fillPattern(32, 1),
+            .encoded_short_ids = &.{},
+        });
+        defer allocator.free(empty_ids);
+        self.push(empty_ids);
+
+        // The same with a trailing tlv_stream (query_flags is TLV type 1).
+        const with_tlv = try serializeQueryShortChannelIds(allocator, .{
+            .chain_hash = fillPattern(32, 1),
+            .encoded_short_ids = &ids,
+            .extension = .{ .records = @constCast(&[_]message.tlv.RawRecord{
+                .{ .type = 1, .value = &.{ 0x00, 0x01 } },
+            }) },
+        });
+        defer allocator.free(with_tlv);
+        self.push(with_tlv);
+
+        // The largest blob this harness's 256-octet buffer can carry: 218
+        // octets of ids, so the seed is 256 exactly. ⚠ One more and
+        // `Smith.slice` reads the whole seed back as EMPTY.
+        const big_ids = [_]u8{0} ++ ([_]u8{0xAB} ** 217);
+        const big = try serializeQueryShortChannelIds(allocator, .{
+            .chain_hash = fillPattern(32, 1),
+            .encoded_short_ids = &big_ids,
+        });
+        defer allocator.free(big);
+        self.push(big);
+
+        // ── refusals ───────────────────────────────────────────────────────
+        self.push(full[0 .. full.len - 1]); // Truncated: one octet short
+        self.push(full[0..36]); // the length prefix with no blob behind it
+        self.push(full[0..2]); // the type frame and nothing else
+        {
+            // A length prefix that claims far more than the message carries.
+            var lying: [256]u8 = undefined;
+            @memcpy(lying[0..full.len], full);
+            std.mem.writeInt(u16, lying[34..36], 0xFFFF, .big);
+            self.push(lying[0..full.len]);
+        }
+        {
+            // WrongType.
+            var wrong: [256]u8 = undefined;
+            @memcpy(wrong[0..full.len], full);
+            std.mem.writeInt(u16, wrong[0..2], QUERY_SHORT_CHANNEL_IDS_TYPE + 1, .big);
+            self.push(wrong[0..full.len]);
+        }
+        return self.entries[0..self.n];
+    }
+};
 
 fn fuzzDecodeQueryShortChannelIds(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    std.mem.writeInt(u16, buf[0..2], QUERY_SHORT_CHANNEL_IDS_TYPE, .big);
-    // Bias the encoded_short_ids length prefix (bytes[34..36], right after
-    // the 2-byte type + 32-byte chain_hash) toward both near-buffer-size
-    // values (exercise the truncation path) and fully random ones.
-    if (smith.value(bool)) {
-        const near: u16 = @intCast(buf.len - 36 + smith.valueRangeAtMost(u8, 0, 4));
-        std.mem.writeInt(u16, buf[34..36], near, .big);
-    }
-    // ⚠ Written as `valueRangeAtMost(u16, 0, buf.len)` this drew ZERO on the
-    // one input an ordinary `zig build test-*` run gets: outside `--fuzz` an
-    // empty corpus is exactly one input, and `Smith.valueRangeAtMost` falls
-    // back to the range's LOWER bound once the input is exhausted. So the
-    // harness's single smoke run fed an EMPTY buffer to the decoder, which
-    // bails at the first length check — while `check-fuzz` counted the module
-    // covered. Subtracting instead makes the exhausted-input fallback the FULL
-    // buffer, which is the interesting end of the range.
-    const len: usize = buf.len - smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+    // ⚠ One `smith.slice` call. What was here before was a partial fix, and
+    // it is worth naming because it looked complete: the length was written as
+    // `buf.len - valueRangeAtMost(...)` precisely so that the exhausted-input
+    // fallback would be the FULL buffer rather than an empty one — the comment
+    // explaining that is quoted in this module's CHANGELOG. It worked, and it
+    // bought less than it appears to, because `bytes` fills the tail with the
+    // weight minimum: with no corpus the ONE input this harness ever ran was
+    // 256 zero octets under a stamped type. The two hand-stamped biases —
+    // forcing `QUERY_SHORT_CHANNEL_IDS_TYPE` into `buf[0..2]` and a
+    // near-buffer-size value into the length prefix — are what a corpus of
+    // real messages does honestly, and they are gone with it: a seed that
+    // carries the wrong type is the `WrongType` case, which is worth having.
+    // Measured 2026-09-07 over the corpus above: **1 of 9 seeds non-empty
+    // (the all-zero buffer) and 0 decoded before; 9 of 9 non-empty and 4
+    // decoded after.**
+    const len: usize = smith.slice(&buf);
 
     var m = decodeQueryShortChannelIds(allocator, buf[0..len]) catch return;
     defer m.deinit(allocator);
+}
+
+test "corpus: every query seed reaches the decoder, and the id octets are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `id_octets` is the second number: a
+    // `query_short_channel_ids` with an EMPTY blob is a legal message that
+    // decodes perfectly and walks nothing, so `decoded` alone would count a
+    // corpus that never reads a short channel id as a complete success. It is
+    // also the check that catches a seed grown past the 256-octet buffer,
+    // which `Smith.slice` reads back as EMPTY and nothing else would notice.
+    var corpus: QueryCorpus = .{};
+    const allocator = testing.allocator;
+    const entries = try corpus.build(allocator);
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var id_octets: usize = 0;
+    var tlv_records: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var m = decodeQueryShortChannelIds(allocator, buf[0..len]) catch continue;
+        defer m.deinit(allocator);
+        decoded += 1;
+        id_octets += m.encoded_short_ids.len;
+        tlv_records += m.extension.records.len;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 4), decoded);
+    // 25 + 0 + 25 + 218.
+    try testing.expectEqual(@as(usize, 268), id_octets);
+    try testing.expectEqual(@as(usize, 1), tlv_records);
 }
 
 test "TEETH: a channel_announcement with unordered node ids is refused (BOLT#7 MUST ignore)" {

@@ -2095,6 +2095,7 @@ pub const Session = struct {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 /// A small outstation used by most tests below.
 const Fixture = struct {
@@ -4111,13 +4112,27 @@ const Xorshift = struct {
     }
 };
 
-/// The same interface backed by the fuzzer, so `std.testing.fuzz` explores the
-/// identical shape space with coverage feedback instead of a fixed seed.
-const SmithDrawer = struct {
-    smith: *testing.Smith,
+/// The same interface backed by `testkit.fuzz.Cursor`, so `std.testing.fuzz`
+/// explores the identical shape space with coverage feedback instead of a
+/// fixed seed.
+///
+/// ⚠ This used to be a `SmithDrawer` wrapping `smith.index(n)`, and
+/// `check-fuzz-reach` classifies that R1 for a reason: `index` reads eight
+/// octets as a little-endian u64 and returns the range MINIMUM unless the
+/// whole word falls below `n`, so for `n` of 4 or 16 or 256 every draw was
+/// **0**, and after the first short read `Smith` discards the rest of the
+/// input. Outside `--fuzz` that made `drawRequest` a constant function: one
+/// fragment, drawn from the first entry of every hostile table, for ever —
+/// and the two shapes F4 and F5 came from (`full_width_range`,
+/// `index_past_u16`) were unreachable, which is exactly what the in-tree
+/// `Xorshift` loops assert must not happen. Reading the choices out of ONE
+/// `smith.slice` fixes both halves at once: the draw is byte-first, and under
+/// `--fuzz` the fuzzer still drives every choice because it drives the slice.
+const CursorDrawer = struct {
+    cursor: testkit.fuzz.Cursor,
 
-    fn below(self: *SmithDrawer, n: usize) usize {
-        return self.smith.index(n);
+    fn below(self: *CursorDrawer, n: usize) usize {
+        return self.cursor.ranged(0, @intCast(n - 1));
     }
 };
 
@@ -4301,11 +4316,74 @@ test "fuzz: structured frames through a Session never panic" {
     try testing.expect(shapes.index_past_u16);
 }
 
-test "fuzz: Outstation.handle over structured fragments" {
-    try testing.fuzz({}, fuzzStructuredHandle, .{});
-}
+/// Request scripts for the two structured harnesses. Each octet is one
+/// `drawRequest` choice, in the order `drawRequest` asks for them; a short
+/// script cycles rather than running out.
+///
+/// The scripts are GENERATED rather than hand-written, and that is a deliberate
+/// limit on what this corpus claims: `drawRequest` makes on the order of a
+/// hundred choices per fragment across seven hostile tables, so an octet here
+/// is not reviewable the way a protocol frame is. What makes it a corpus
+/// rather than noise is the GUARD below, which pins that these scripts reach
+/// the two shapes the F4 and F5 findings came from — `full_width_range` and
+/// `index_past_u16` — the same two the in-tree `Xorshift` loops assert, and
+/// that frames get past both of the Session's address filters. A script set
+/// that stops reaching them fails a named test.
+const ScriptCorpus = struct {
+    store: [10 * (4 + 512)]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
 
-fn fuzzStructuredHandle(_: void, smith: *testing.Smith) !void {
+    fn push(self: *ScriptCorpus, script: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], script);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    fn build(self: *ScriptCorpus) []const []const u8 {
+        // ⭐ Two CHOSEN scripts, and they are the reason this is a corpus. The
+        // eight generated ones below reach `full_width_range` between them but
+        // never `index_past_u16` — measured, not assumed: 8 x 32 fragments is
+        // 256 draws against a conjunction of six table choices, and the
+        // in-tree `Xorshift` loop needs 20 000 to hit it. A corpus that cannot
+        // reach the shape a CRITICAL finding came from is worth nothing there,
+        // so the shape is written down.
+        //
+        // The layout is `drawRequest`'s draw order, one octet each:
+        //   seq, FIR, FIN, CON, UNS, functionIdx, headerCount-1,
+        //   objectIdx, prefixIdx, rangeIdx, startIdx, stopIdx, bodyLenIdx,
+        //   then the object body. `Cursor.ranged` is `byte % n`, and the
+        //   script cycles, so a 35-octet script draws the same fragment 32
+        //   times over — which is what makes it reviewable.
+        //
+        // g12v1 (CROB), no prefix, range code 2 (32-bit start/stop),
+        // start = 0x1_0000 and stop = 0x1_0001 (both past the u16 index
+        // space), 22 body octets — two whole CROBs, which is `index_past_u16`.
+        self.push(&[_]u8{ 0, 1, 1, 1, 1, 3, 0, 0, 0, 2, 8, 9, 5 } ++ [_]u8{0xAA} ** 22);
+        // The same header with start = 0 and stop = 0xFFFF_FFFF: the whole u32
+        // space in one range, which is `full_width_range` (the F4 overflow).
+        self.push(&[_]u8{ 0, 1, 1, 1, 1, 4, 0, 0, 0, 2, 0, 13, 5 } ++ [_]u8{0xBB} ** 22);
+
+        const starts = [_]u32{
+            0x9E37_79B9, 0x2B7E_1516, 0x0123_4567, 0xF0E1_D2C3,
+            0x6C62_1F4D, 0x51E7_A3C9, 0xDEAD_BEEF, 0x0000_0001,
+        };
+        for (starts) |start| {
+            var script: [512]u8 = undefined;
+            var x = Xorshift{ .state = start };
+            for (&script) |*b| b.* = @intCast(x.below(256));
+            self.push(&script);
+        }
+        return self.entries[0..self.n];
+    }
+};
+
+/// The body of `fuzzStructuredHandle`, factored out so the harness and the
+/// corpus guard drive the SAME script through the same station. A guard
+/// measuring a different sequence from the one the harness runs is not a guard.
+fn runHandleScript(script: []const u8, shapes: *DrawnShapes) !void {
     var fix = Fixture{};
     var station = fix.station(.{
         .select_timeout_ms = 1000,
@@ -4314,23 +4392,40 @@ fn fuzzStructuredHandle(_: void, smith: *testing.Smith) !void {
     });
     var out: [2048]u8 = undefined;
     var buf: [200]u8 = undefined;
-    var d = SmithDrawer{ .smith = smith };
-    var shapes = DrawnShapes{};
+    var d = CursorDrawer{ .cursor = .{ .bytes = script } };
 
     // Several fragments against one station, so state built by an earlier
     // fragment (an armed SELECT, an unconfirmed series) is reachable.
     var i: usize = 0;
-    while (i < 32 and !smith.eos()) : (i += 1) {
-        const fragment = drawRequest(&d, &buf, &shapes);
+    while (i < 32) : (i += 1) {
+        const fragment = drawRequest(&d, &buf, shapes);
         try checkDrawnFragment(&station, fragment, i * 7, &out);
     }
 }
 
-test "fuzz: Session.feedFrame over structured frames" {
-    try testing.fuzz({}, fuzzStructuredSession, .{});
+test "fuzz: Outstation.handle over structured fragments" {
+    var corpus: ScriptCorpus = .{};
+    try testing.fuzz({}, fuzzStructuredHandle, .{ .corpus = corpus.build() });
 }
 
-fn fuzzStructuredSession(_: void, smith: *testing.Smith) !void {
+fn fuzzStructuredHandle(_: void, smith: *testing.Smith) !void {
+    // ⚠ One `smith.slice`, then the octets say what happens — see
+    // `CursorDrawer` for the R1 collapse this replaces. The `!smith.eos()`
+    // loop guard went with it: a cursor cycles rather than running out, so all
+    // 32 fragments are always drawn, where before an exhausted input ended the
+    // loop early. Measured 2026-09-07: **one constant fragment on every input
+    // before, reaching neither named shape; 10 scripts and both shapes after
+    // — pinned executably by the corpus guard's non-vacuity arm.**
+    var script: [1024]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var shapes = DrawnShapes{};
+    try runHandleScript(script[0..n], &shapes);
+}
+
+/// The body of `fuzzStructuredSession`, factored out for the same reason as
+/// `runHandleScript`. Returns how many drawn frames passed both address
+/// filters, which is the number the guard pins.
+fn runSessionScript(script: []const u8, shapes: *DrawnShapes) !usize {
     var fix = Fixture{};
     var station = fix.station(.{ .address = 10, .master_address = 1, .allow_restart = true });
     var rx: [1024]u8 = undefined;
@@ -4341,31 +4436,98 @@ fn fuzzStructuredSession(_: void, smith: *testing.Smith) !void {
     var buf: [200]u8 = undefined;
     var user: [link.max_user_data_len]u8 = undefined;
     var frame_buf: [512]u8 = undefined;
-    var d = SmithDrawer{ .smith = smith };
-    var shapes = DrawnShapes{};
+    var d = CursorDrawer{ .cursor = .{ .bytes = script } };
 
     const dests = [_]u16{ 10, 11, 999, 0xFFFC, 0xFFFD, 0xFFFE, 0xFFFF };
     const link_functions = [_]u4{ 0, 1, 2, 3, 4, 9 };
 
+    var accepted: usize = 0;
     var i: usize = 0;
-    while (i < 32 and !smith.eos()) : (i += 1) {
-        const fragment = drawRequest(&d, &buf, &shapes);
+    while (i < 32) : (i += 1) {
+        const fragment = drawRequest(&d, &buf, shapes);
         user[0] = 0xC0 | @as(u8, @intCast(d.below(64)));
         const carried = @min(fragment.len, user.len - 1);
         @memcpy(user[1..][0..carried], fragment[0..carried]);
+        const dest = dests[d.below(dests.len)];
+        const src: u16 = @intCast(d.below(4));
         const frame = link.encodeFrame(
             .{
                 .dir = true,
                 .prm = d.below(8) != 0,
                 .function = link_functions[d.below(link_functions.len)],
             },
-            dests[d.below(dests.len)],
-            @intCast(d.below(4)),
+            dest,
+            src,
             user[0 .. 1 + carried],
             &frame_buf,
-        ) catch return;
+        ) catch continue;
+        // Both filters have to be satisfied for a frame to reach the
+        // outstation, so both belong in the number the guard pins.
+        if ((dest == 10 or isBroadcast(dest)) and src == 1) accepted += 1;
         _ = session.feedFrame(frame, i * 3, &out) catch {};
     }
+    return accepted;
+}
+
+test "fuzz: Session.feedFrame over structured frames" {
+    var corpus: ScriptCorpus = .{};
+    try testing.fuzz({}, fuzzStructuredSession, .{ .corpus = corpus.build() });
+}
+
+fn fuzzStructuredSession(_: void, smith: *testing.Smith) !void {
+    // ⚠ Same R1 collapse as `fuzzStructuredHandle` — see `CursorDrawer`. Here
+    // it was worse: with every draw at its minimum the destination was always
+    // `dests[0]` and the source always 0, so every frame was dropped by the
+    // master-address filter and the outstation behind it never saw one.
+    var script: [1024]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    var shapes = DrawnShapes{};
+    _ = try runSessionScript(script[0..n], &shapes);
+}
+
+test "corpus: every request script reaches both named shapes and gets past the filters" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus both harnesses get. The second numbers are chosen for what
+    // the collapse hid rather than for reach alone:
+    //   `full_width_range` / `index_past_u16` — the two shapes the F4 and F5
+    //     findings came from. With every draw at its range minimum neither was
+    //     reachable, and the in-tree `Xorshift` loops assert both because a
+    //     harness that cannot reach them is testing nothing that matters.
+    //   `accepted` — frames that passed BOTH of the Session's address filters.
+    //     A collapsed drawer sent every frame to `dests[0]` from source 0, so
+    //     the outstation behind the filters was never fed at all; `nonempty`
+    //     alone could never have said so.
+    var corpus: ScriptCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var handle_shapes = DrawnShapes{};
+    var session_shapes = DrawnShapes{};
+    var accepted: usize = 0;
+    for (entries) |sd| {
+        var smith: testing.Smith = .{ .in = sd };
+        var script: [1024]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        try runHandleScript(script[0..n], &handle_shapes);
+        accepted += try runSessionScript(script[0..n], &session_shapes);
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expect(handle_shapes.full_width_range);
+    try testing.expect(handle_shapes.index_past_u16);
+    try testing.expect(session_shapes.full_width_range);
+    try testing.expect(session_shapes.index_past_u16);
+    try testing.expectEqual(@as(usize, 32), accepted);
+
+    // Non-vacuity, and the "before" measurement: the all-zero script is what
+    // the collapsed harness ran on every single input. It reaches neither
+    // shape and puts no frame past the filters — without this the two
+    // `expect`s above could be passing on something the corpus did not buy.
+    var zero_shapes = DrawnShapes{};
+    try runHandleScript(&.{}, &zero_shapes);
+    const zero_accepted = try runSessionScript(&.{}, &zero_shapes);
+    try testing.expect(!zero_shapes.full_width_range);
+    try testing.expect(!zero_shapes.index_past_u16);
+    try testing.expectEqual(@as(usize, 0), zero_accepted);
 }
 
 test "fuzz: random request fragments never panic and always resolve" {

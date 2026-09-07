@@ -231,6 +231,7 @@ pub fn encodeExtension(w: *Writer, allocator: Allocator, ext: Extension) Allocat
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 test "Reader: fixed-width big-endian reads" {
     const bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09 };
@@ -340,36 +341,156 @@ test "hostile: an unknown even TLV type in the extension fails closed" {
 // individual `takeBytes`/`bytesU16` truncation behavior is already
 // covered by the hostile tests above; this harness instead drives the two
 // public entry points end to end over arbitrary bytes.
+/// Framed messages paired with the type the caller asks for, in the format
+/// `Smith` reads: `slice` framing for the octets, then an eight-octet word
+/// that carries the `want` choice.
+///
+/// The tail word's low bit says "ask for the type the message actually
+/// carries"; otherwise the type comes from the word itself. ⚠ It has to travel
+/// in the seed: `want` used to hang on a `smith.value(bool)` drawn AFTER the
+/// bytes, i.e. after the input was exhausted, so it was `false` on every
+/// replay and the payload-`Reader` path the comment claims to reach half the
+/// time was reached only by the coincidence that an all-zero buffer frames as
+/// type 0 and `value(u16)` of an exhausted input is also 0.
+const FrameCorpus = struct {
+    scratch: [512]u8 = undefined,
+    store: [12 * (4 + 512 + 8)]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    matches: [12]bool = undefined,
+    n: usize = 0,
+
+    fn push(self: *FrameCorpus, bytes: []const u8, match_type: bool) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], bytes);
+        const word: u64 = if (match_type) 1 else 0xDEAD_0000;
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], word, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.matches[self.n] = match_type;
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    /// A 2-octet type frame followed by a tlv_stream built from `records`.
+    fn framed(self: *FrameCorpus, allocator: Allocator, msg_type: u16, records: []const tlv.RawRecord) ![]const u8 {
+        var w: Writer = .{};
+        defer w.deinit(allocator);
+        try w.putU16be(allocator, msg_type);
+        try encodeExtension(&w, allocator, .{ .records = @constCast(records) });
+        @memcpy(self.scratch[0..w.list.items.len], w.list.items);
+        return self.scratch[0..w.list.items.len];
+    }
+
+    fn build(self: *FrameCorpus, allocator: Allocator) ![]const []const u8 {
+        // Every known type, in the strictly-increasing order BOLT#1 requires.
+        self.push(try self.framed(allocator, 33, &.{
+            .{ .type = 0, .value = &.{} },
+            .{ .type = 1, .value = &.{0x08} },
+            .{ .type = 3, .value = &[_]u8{0xAA} ** 32 },
+            .{ .type = 254, .value = &.{ 1, 2, 3 } },
+        }), true);
+        // A frame with no extension at all: the whole message is its type.
+        self.push(try self.framed(allocator, 16, &.{}), true);
+        // One record, asked for under the WRONG type: the `WrongType` path.
+        self.push(try self.framed(allocator, 16, &.{.{ .type = 1, .value = &.{0x01} }}), false);
+        // An unknown ODD type in the stream, which must be tolerated and
+        // discarded, and an unknown EVEN one, which must be refused.
+        self.push(try self.framed(allocator, 33, &.{.{ .type = 255, .value = &.{0x01} }}), true);
+        self.push(try self.framed(allocator, 33, &.{.{ .type = 100, .value = &.{0x01} }}), true);
+
+        // ── hand-built streams no encoder will produce ──────────────────────
+        // Records out of order: `NotStrictlyIncreasing`.
+        self.push(&[_]u8{ 0x00, 0x21, 0x03, 0x00, 0x01, 0x00 }, true);
+        // The same type twice, which is the same refusal.
+        self.push(&[_]u8{ 0x00, 0x21, 0x01, 0x00, 0x01, 0x00 }, true);
+        // A record length that runs past the end.
+        self.push(&[_]u8{ 0x00, 0x21, 0x00, 0x7F }, true);
+        // A type BigSize with no length behind it.
+        self.push(&[_]u8{ 0x00, 0x21, 0x01 }, true);
+        // A multi-byte BigSize truncated inside its own prefix.
+        self.push(&[_]u8{ 0x00, 0x21, 0xFF, 0x01, 0x02 }, true);
+        // One octet: not even a type frame.
+        self.push(&[_]u8{0x00}, true);
+        self.push(&.{}, true); // the empty message
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: openFrame + decodeExtension never panic on arbitrary bytes" {
-    try testing.fuzz({}, fuzzFrameAndExtension, .{});
+    var corpus: FrameCorpus = .{};
+    try testing.fuzz({}, fuzzFrameAndExtension, .{ .corpus = try corpus.build(testing.allocator) });
 }
 
 fn fuzzFrameAndExtension(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    // ⚠ Written as `valueRangeAtMost(u16, 0, buf.len)` this drew ZERO on the
-    // one input an ordinary `zig build test-*` run gets: outside `--fuzz` an
-    // empty corpus is exactly one input, and `Smith.valueRangeAtMost` falls
-    // back to the range's LOWER bound once the input is exhausted. So the
-    // harness's single smoke run fed an EMPTY buffer to the decoder, which
-    // bails at the first length check — while `check-fuzz` counted the module
-    // covered. Subtracting instead makes the exhausted-input fallback the FULL
-    // buffer, which is the interesting end of the range.
-    const len: usize = buf.len - smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
+    // ⚠ One `smith.slice` call. What was here before was a partial fix, and it
+    // is worth naming because it looked complete: the length was written as
+    // `buf.len - valueRangeAtMost(...)` precisely so the exhausted-input
+    // fallback would be the FULL buffer rather than an empty one. That was
+    // right, and it bought less than it appears to — `bytes` fills the tail
+    // with the weight minimum, so with no corpus the ONE input this harness
+    // ever ran was 512 zero octets. Measured 2026-09-07 over the corpus
+    // above: **1 of 12 seeds non-empty (that all-zero buffer), 1 framed and 0
+    // TLV records read before; 11 of 12 non-empty (the empty message is a
+    // deliberate seed), 9 framed and 4 records after.**
+    const len: usize = smith.slice(&buf);
     const bytes = buf[0..len];
 
-    // Bias `want` toward the type actually encoded at the front of `bytes`
-    // half the time (reaches the payload-Reader path instead of always
-    // bailing out on `error.WrongType`), fully random the other half.
-    const want: u16 = if (bytes.len >= 2 and smith.value(bool))
+    // ⚠ `value(u64)` and a bit test, not `value(bool)`: a bool drawn after the
+    // bytes is `false` on every replay, so `want` was always the second
+    // branch. The choice travels in the seed now — see `FrameCorpus`.
+    const w = smith.value(u64);
+    const want: u16 = if (bytes.len >= 2 and w & 1 != 0)
         std.mem.readInt(u16, bytes[0..2], .big)
     else
-        smith.value(u16);
+        @truncate(w >> 16);
 
     var r = openFrame(bytes, want) catch return;
     var ext = decodeExtension(allocator, r.rest(), &.{ 0, 1, 3, 254 }) catch return;
     defer ext.deinit(allocator);
+}
+
+test "corpus: every frame seed reaches openFrame, and the records read are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. Three numbers, because `nonempty` cannot
+    // see either of the two ways this harness was blind: `matched` pins that
+    // the `want` word arrived as written (without it every seed goes back to
+    // one branch), and `records` is what an empty message cannot produce —
+    // `framed` alone is satisfied by a message whose extension is empty, which
+    // half a real corpus is.
+    var corpus: FrameCorpus = .{};
+    const allocator = testing.allocator;
+    const entries = try corpus.build(allocator);
+    var nonempty: usize = 0;
+    var matched: usize = 0;
+    var framed_ok: usize = 0;
+    var records: usize = 0;
+    for (entries, corpus.matches[0..corpus.n]) |sd, want_match| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const bytes = buf[0..len];
+        const w = smith.value(u64);
+        if ((w & 1 != 0) == want_match) matched += 1;
+        const want: u16 = if (bytes.len >= 2 and w & 1 != 0)
+            std.mem.readInt(u16, bytes[0..2], .big)
+        else
+            @truncate(w >> 16);
+        var r = openFrame(bytes, want) catch continue;
+        framed_ok += 1;
+        var ext = decodeExtension(allocator, r.rest(), &.{ 0, 1, 3, 254 }) catch continue;
+        defer ext.deinit(allocator);
+        records += ext.records.len;
+    }
+    // One short of the corpus length: the empty message is a seed on purpose.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(entries.len, matched);
+    try testing.expectEqual(@as(usize, 9), framed_ok);
+    // 4, all from the first seed: types 0, 1, 3 and 254. The unknown-odd seed
+    // decodes and contributes none, because tolerating an odd type means
+    // DISCARDING it.
+    try testing.expectEqual(@as(usize, 4), records);
 }
 
 test "TEETH: a field too long for its u16 prefix is REFUSED, not truncated" {

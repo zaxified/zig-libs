@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: both `frame.zig` harnesses ran on an empty input, and one of
+  them never called the parser at all. Each opened with `smith.bytes(&buf)` followed by a
+  ranged length draw; a ranged draw reads eight octets as a little-endian u64 and returns the
+  range MINIMUM when fewer than eight remain, and `bytes` had already eaten the seed, so `len`
+  was **0 on every input**. In `fuzzParseFrameServer` that `len` is the bound of the
+  parse-and-advance loop, so `parseFrame` was **never invoked** — while the comment above it
+  promised multi-frame streams and `.need_more` retries. In `fuzzDecodeCloseBody` the collapse
+  looked healthy instead: `decodeCloseBody("")` succeeds by design (§5.5.1), so the harness
+  returned a `CloseInfo` on all 19 rounds without ever reading a close code. Both now draw with
+  one `smith.slice(&buf)` and carry a commented corpus with a guard pinning measured numbers.
+  Measured 2026-09-07, before → after: `fuzzParseFrameServer` 0/18 seeds reaching `parseFrame`
+  and 0 frames parsed → 18/18 and 7; `fuzzDecodeCloseBody` 19/19 "accepted" with 0 close codes
+  read → 11 accepted, 10 codes and 131 reason octets validated.
+
 - **2026-08-06** — Security audit: six findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Byte-exact against RFC
   6455 §5.7's published test vectors.

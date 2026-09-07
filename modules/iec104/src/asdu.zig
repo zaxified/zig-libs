@@ -901,6 +901,7 @@ pub fn buildSingle(
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 test "params validate and derive header length" {
     try default_params.validate();
@@ -1321,19 +1322,111 @@ test "127 objects is the ceiling a 7-bit count can express" {
     try testing.expectEqual(@as(u7, 127), (try decode(out, default_params)).count());
 }
 
+/// The three `Params` widths, packed one per octet of a little-endian word so
+/// they can travel in a corpus seed's tail.
+///
+/// ⛔ They used to be three `valueRangeAtMost` draws taken AFTER the byte draw,
+/// i.e. after the input was exhausted — so every replay ran `Params{1, 1, 2}`
+/// with `ioa_size` and `ca_size` at their minima. This module's own profile is
+/// 3/2/2 (`default_params`), which means no frame this file encodes could be
+/// decoded by its own fuzz harness: the header length alone disagreed.
+fn paramsFromWord(w: u64) Params {
+    return .{
+        .ioa_size = @as(u8, @truncate(w)) % 3 + 1,
+        .ca_size = @as(u8, @truncate(w >> 8)) % 2 + 1,
+        .cot_size = @as(u8, @truncate(w >> 16)) % 2 + 1,
+    };
+}
+
+fn wordForParams(p: Params) u64 {
+    return @as(u64, p.ioa_size - 1) |
+        (@as(u64, p.ca_size - 1) << 8) |
+        (@as(u64, p.cot_size - 1) << 16);
+}
+
+/// ASDUs paired with the `Params` they were encoded under, in the format
+/// `Smith` reads: `slice` framing for the frame, then an eight-octet word for
+/// the widths.
+///
+/// ⭐ Built at run time from this file's own `Builder`/`buildSingle` rather
+/// than quoted: an ASDU is a header whose field WIDTHS are a system parameter,
+/// so a frame and the `Params` that read it are one object and a hex corpus
+/// would have to restate the encoder's layout by hand.
+const AsduCorpus = struct {
+    store: [4096]u8 = undefined,
+    scratch: [1024]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    params: [12]Params = undefined,
+    n: usize = 0,
+
+    fn push(self: *AsduCorpus, frame: []const u8, p: Params) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], wordForParams(p), .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.params[self.n] = p;
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    fn pushHex(self: *AsduCorpus, comptime h: []const u8, p: Params) void {
+        var frame: [h.len / 2]u8 = undefined;
+        _ = std.fmt.hexToBytes(&frame, h) catch unreachable;
+        self.push(&frame, p);
+    }
+
+    fn build(self: *AsduCorpus) ![]const []const u8 {
+        const compact = Params{ .ioa_size = 1, .ca_size = 1, .cot_size = 1 };
+        const wide_ioa = Params{ .ioa_size = 2, .ca_size = 2, .cot_size = 1 };
+
+        // ── frames the decoder accepts ──────────────────────────────────────
+        // A C_IC_NA_1 interrogation command, the 104 profile.
+        self.pushHex("640106002f0000000014", default_params);
+        // The two alternative sizings, from "alternative address sizings".
+        self.pushHex("010103070901", compact);
+        self.pushHex("0101033412efbe00", wide_ioa);
+        // SQ = 0, two objects with their own addresses.
+        self.pushHex("01020300010064000001c8000080", default_params);
+        // SQ = 1 at the address ceiling: accepted, and its neighbour below is
+        // the `AddressOutOfRange` refusal (F3).
+        self.pushHex("648206002f00feffff1414", default_params);
+        self.pushHex("648206002f00ffffff1414", default_params);
+        // 127 objects, the ceiling a 7-bit count can express, built here
+        // because no test quotes 136 octets as a literal.
+        var b = try Builder.init(&self.scratch, default_params, .m_sp_na_1, .{}, 1, true);
+        var i: u32 = 0;
+        while (i < 127) : (i += 1) try b.add(i, .{ .siq = .{} }, .none);
+        self.push(try b.finish(), default_params);
+
+        // ── refusals, each named by the error it raises ─────────────────────
+        self.pushHex("6401", default_params); // ShortAsdu
+        self.pushHex("640206002f0000000014", default_params); // ObjectCountMismatch
+        self.pushHex("640006002f00", default_params); // ZeroObjectCount
+        self.pushHex("c80106002f0000000000", default_params); // UnsupportedTypeId: 200
+        // Decodes, then fails inside the ITERATOR: month 13 in a CP56Time2a.
+        self.pushHex("670106002f00000000cb9c120317001a", default_params);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: ASDU decode and object iteration never panic" {
-    try std.testing.fuzz({}, fuzzAsdu, .{});
+    var corpus: AsduCorpus = .{};
+    try std.testing.fuzz({}, fuzzAsdu, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzAsdu(_: void, smith: *std.testing.Smith) !void {
     var buf: [253]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    const p = Params{
-        .ioa_size = smith.valueRangeAtMost(u8, 1, 3),
-        .ca_size = smith.valueRangeAtMost(u8, 1, 2),
-        .cot_size = smith.valueRangeAtMost(u8, 1, 2),
-    };
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every seed and `decode` was handed `buf[0..0]`, with
+    // the frame sitting unread in `buf`. Measured 2026-09-07 over the corpus
+    // above: **0 of 12 seeds non-empty, 0 decoded and 0 objects walked before;
+    // 12 of 12 non-empty, 7 decoded and 134 objects walked after.**
+    const len: usize = smith.slice(&buf);
+    // ⚠ `value(u64)` and a `%`, not three ranged draws: see `paramsFromWord`.
+    const p = paramsFromWord(smith.value(u64));
     const a = decode(buf[0..len], p) catch return;
     var it = a.objects();
     var seen: usize = 0;
@@ -1341,6 +1434,44 @@ fn fuzzAsdu(_: void, smith: *std.testing.Smith) !void {
         seen += 1;
         try testing.expect(seen <= std.math.maxInt(u7));
     }
+}
+
+test "corpus: every ASDU seed reaches the decoder with the widths it was encoded under" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. Three numbers, because `nonempty` alone
+    // cannot see either of the two ways this harness was blind:
+    //   `widths`  — the `Params` word arrived as written. Without it the frames
+    //               are read under 1/1/2 again and every one of them is a
+    //               header-length refusal, which looks like a working corpus.
+    //   `objects` — what an empty input cannot produce. `decoded` alone would
+    //               not do: the iterator is where the element sizing is
+    //               actually exercised, and a decode that yields nothing walks
+    //               no element at all.
+    var corpus: AsduCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var widths: usize = 0;
+    var decoded: usize = 0;
+    var objects: usize = 0;
+    for (entries, corpus.params[0..corpus.n]) |sd, want| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [253]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const p = paramsFromWord(smith.value(u64));
+        if (std.meta.eql(p, want)) widths += 1;
+        const a = decode(buf[0..len], p) catch continue;
+        decoded += 1;
+        var it = a.objects();
+        while (it.next() catch continue) |_| objects += 1;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(entries.len, widths);
+    try testing.expectEqual(@as(usize, 7), decoded);
+    // 127 (the SQ = 1 builder frame) + 1 + 1 + 1 + 2 + 2. The clock-sync frame
+    // decodes and then raises `ImpossibleTime` on its first object, so it
+    // contributes none — which is the iterator error path this corpus buys.
+    try testing.expectEqual(@as(usize, 134), objects);
 }
 
 test "SQ=1 cannot synthesise an address past the configured ceiling" {

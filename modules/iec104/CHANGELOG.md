@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: all four harnesses drew their input and then threw it away.
+  Each opened with `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`;
+  a ranged draw reads eight octets as a little-endian u64 and returns the range MINIMUM when
+  fewer than eight remain, and `bytes` had already eaten the seed — so `len` was **0 on every
+  input**, for ever. `apci.fuzzDecode`, `asdu.fuzzAsdu` and `outstation.fuzzHandle` were called
+  with an empty slice; `apci.fuzzFramer` was worse still, because there `len` bounds the
+  `while (off < len)` that feeds the framer, so the framer was handed **nothing at all** while
+  the test's name promised it never hangs. All four now draw with one `smith.slice(&buf)` and
+  carry a corpus of real frames, each seed commented with what it is, plus a corpus guard that
+  pins two measured numbers rather than asserting `> 0`. Measured 2026-09-07, before → after:
+  `apci.fuzzDecode` 0/19 seeds non-empty and 0 decoded → 19/19 and 6; `apci.fuzzFramer` 0/8
+  reaching `feed` and 0 frames yielded → 8/8 and 13; `asdu.fuzzAsdu` 0/12 and 0 objects walked
+  → 12/12 and 134; `outstation.fuzzHandle` 0/15 and 0 replies emitted → 15/15 and 19.
+  ⛔ `asdu.fuzzAsdu` also drew its three `Params` widths *after* the bytes, i.e. after the input
+  was exhausted, so it always ran 1/1/2 — no ASDU this module encodes (`default_params` is
+  3/2/2) could be decoded by its own fuzz harness, the header lengths disagreed. The widths now
+  travel in the seed as a `value(u64)` word and the guard pins that they arrive as written.
+
 - **2026-09-02** — Drift re-audit (W2, window `d163578..HEAD`). Nine findings, seven fixed:
 
   - **HIGH, remote stall:** `TcpTransport`'s read timeout bounded only the fully-idle case. It

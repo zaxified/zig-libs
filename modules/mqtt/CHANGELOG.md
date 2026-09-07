@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `packet.fuzzDecode` never called `decode`. It opened with
+  `smith.bytes(&buf)` and then `smith.valueRangeAtMost(u16, 0, buf.len)`; a ranged draw reads
+  eight octets as a little-endian u64 and returns the range MINIMUM when fewer than eight
+  remain, and `bytes` had already consumed the seed — so `len` was **0 on every input**, and
+  `len` here is the bound of `while (off < len)`, the reader loop. The body never executed. The
+  harness's own comment claims it "advances over a stream the way a real reader loop would";
+  the aim canary beside it (`fuzzDecode's stream walk is reachable and correct`) was the only
+  thing keeping that claim honest, and it walks its own bytes rather than the harness's. The
+  draw is now one `smith.slice(&buf)`, and the corpus is built by this module's own encoders:
+  eight real streams (including the four-packet canary stream and its one-octet-short form,
+  CONNECT with will/username/password, a QoS-2 PUBLISH) plus ten named refusals. Measured
+  2026-09-07: **0 of 18 seeds reached `decode` and 0 packets were walked before, 18 of 18 and
+  18 packets after.** A corpus guard pins both numbers.
+
 - **2026-09-03** — Drift re-audit (window `e5594e8..HEAD`, +1174/-36 over 9 files). Six findings.
 
   - **CRITICAL, one 261-byte packet.** `handleSubscribe` re-ran the whole retained-store walk once

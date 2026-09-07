@@ -742,6 +742,7 @@ fn decodePublish(r: *BodyReader, flags: u4) DecodeError!Publish {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 test "remaining length: boundary values encode/decode exactly" {
     const cases = [_]struct { value: u32, bytes: []const u8 }{
@@ -1141,14 +1142,119 @@ test "decode: 1000-iteration garbage sweep never panics" {
 // boundary through `std.testing.fuzz`, and advances over a stream the way a
 // real reader loop would so back-to-back packets are exercised too.
 
+/// Streams of control packets, in the format `Smith.slice` reads (see
+/// `testkit.fuzz`).
+///
+/// ⭐ Built at run time by this file's own encoders rather than quoted: the
+/// comment above says the harness "advances over a stream the way a real reader
+/// loop would", and only real back-to-back packets make that true. Uniform
+/// random octets are malformed at packet ONE with overwhelming probability —
+/// the type nibble, the flags nibble, the remaining-length varint and every
+/// length-prefixed sub-field all have to agree — so the multi-packet path had
+/// no chance of being reached even by a harness that was fed something.
+const StreamCorpus = struct {
+    scratch: [512]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [20][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *StreamCorpus, frame: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    fn pushHex(self: *StreamCorpus, comptime h: []const u8) void {
+        var frame: [h.len / 2]u8 = undefined;
+        _ = std.fmt.hexToBytes(&frame, h) catch unreachable;
+        self.push(&frame);
+    }
+
+    fn build(self: *StreamCorpus) ![]const []const u8 {
+        // ── streams the reader loop walks ───────────────────────────────────
+        // The four-packet stream the aim canary below already uses.
+        var n: usize = 0;
+        n += (try encodePingreq(self.scratch[n..])).len;
+        n += (try encodePublish(self.scratch[n..], .{ .topic = "a/b", .payload = "hi", .qos = .at_most_once })).len;
+        n += (try encodeSubscribe(self.scratch[n..], 7, &.{.{ .filter = "a/#", .qos = .at_least_once }})).len;
+        n += (try encodePingresp(self.scratch[n..])).len;
+        self.push(self.scratch[0..n]);
+        // The same stream one octet short: the `need more data` outcome.
+        self.push(self.scratch[0 .. n - 1]);
+
+        // The four QoS-2 acknowledgements back to back.
+        n = 0;
+        n += (try encodePuback(self.scratch[n..], 1)).len;
+        n += (try encodePubrec(self.scratch[n..], 2)).len;
+        n += (try encodePubrel(self.scratch[n..], 3)).len;
+        n += (try encodePubcomp(self.scratch[n..], 4)).len;
+        self.push(self.scratch[0..n]);
+
+        n = 0;
+        n += (try encodeSuback(self.scratch[n..], 7, &.{ 0, 1, 2, suback_failure })).len;
+        n += (try encodeUnsuback(self.scratch[n..], 8)).len;
+        n += (try encodeDisconnect(self.scratch[n..])).len;
+        self.push(self.scratch[0..n]);
+
+        // ── single packets with the fields a stream of pings never reaches ──
+        // CONNECT with every optional sub-field present: will, username and
+        // password are three more length-prefixed reads inside the payload.
+        self.push(try encodeConnect(&self.scratch, .{
+            .client_id = "zig-client",
+            .clean_session = true,
+            .keep_alive_s = 60,
+            .will = .{ .topic = "a/will", .message = "bye", .qos = .at_least_once, .retain = true },
+            .username = "user",
+            .password = "pw",
+        }));
+        self.push(try encodeConnack(&self.scratch, .{ .session_present = true, .return_code = .accepted }));
+        // PUBLISH at QoS 2, so the packet id is on the wire.
+        self.push(try encodePublish(&self.scratch, .{
+            .topic = "sensors/temp",
+            .payload = "21.5",
+            .qos = .exactly_once,
+            .retain = true,
+            .dup = true,
+            .packet_id = 0x1234,
+        }));
+        self.push(try encodeUnsubscribe(&self.scratch, 9, &.{ "a/#", "b/+" }));
+
+        // ── refusals, each named by the error it raises ─────────────────────
+        self.pushHex("0000"); // UnknownPacketType: type 0
+        self.pushHex("F000"); // UnknownPacketType: type 15
+        self.pushHex("6000"); // InvalidFlags: PUBREL without the mandatory 0x2
+        self.pushHex("30FFFFFFFF"); // MalformedRemainingLength: a fifth varint octet
+        self.pushHex("2003000000"); // MalformedPacket: CONNACK with a trailing octet
+        self.pushHex("20020006"); // MalformedPacket: CONNACK return code 6
+        self.pushHex("20020200"); // MalformedPacket: reserved bits in the CONNACK flags
+        self.pushHex("82020007"); // ProtocolViolation: SUBSCRIBE with no filters
+        self.pushHex("30050002FFFE41"); // InvalidUtf8: a PUBLISH topic that is not UTF-8
+        self.pushHex("00" ** 256); // a full buffer of zeroes
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecode, .{});
+    var corpus: StreamCorpus = .{};
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [256]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM.
+    // And `len` here is not merely the end of the slice — it is the bound of
+    // the loop, so `while (off < len)` never ran a single pass and `decode`
+    // was **never called at all**, while the paragraph above promises a reader
+    // loop over back-to-back packets. `check-fuzz-reach` only learned to see
+    // that shape on 2026-09-07. Measured over the corpus above: **0 of 18
+    // seeds reached `decode` and 0 packets were walked before, 18 of 18 and 18
+    // packets after.**
+    const len: usize = smith.slice(&buf);
 
     var off: usize = 0;
     var iterations: usize = 0;
@@ -1157,6 +1263,36 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
         const d = decoded orelse return; // need more data
         off += d.consumed;
     }
+}
+
+test "corpus: every stream seed reaches decode, and the packets walked are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets — built from the same `build()`, because a
+    // guard measuring a different corpus is not a guard. `nonempty` is the
+    // reach claim and the only check that catches a seed grown past the
+    // 256-octet buffer, which `Smith.slice` reads back as the EMPTY one,
+    // silently. `walked` is the number an empty input cannot produce, and it
+    // is specifically the multi-packet advance this harness exists for.
+    var corpus: StreamCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var walked: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        var off: usize = 0;
+        var iterations: usize = 0;
+        while (off < len and iterations < 64) : (iterations += 1) {
+            const decoded = decode(buf[off..len]) catch break;
+            const d = decoded orelse break;
+            off += d.consumed;
+            walked += 1;
+        }
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 18), walked);
 }
 
 /// Aim canary for `fuzzDecode`, and the reason it needs one: the harness above

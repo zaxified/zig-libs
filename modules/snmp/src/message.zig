@@ -358,6 +358,7 @@ pub fn encodePdu(e: *ber.Encoder, pdu: EncodePdu) EncodeError!void {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testkit = @import("testkit");
 
 test "v2c GetRequest for two OIDs: exact bytes" {
     // GetRequest(request-id 1, community "public") for sysDescr.0 and
@@ -719,14 +720,123 @@ test "garbage and truncation sweep: decode never panics" {
 // collection standardises on; this drives the same boundary through
 // `std.testing.fuzz` for corpus-guided coverage.
 
+/// Datagrams, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// ⭐ The accepted half is built at run time by this file's own `encode`
+/// rather than quoted: an SNMP message is nested BER, so every literal would
+/// have to restate four levels of tag/length by hand, and the refusals below
+/// are exactly the cases where doing that is the point.
+///
+/// Uniform random octets reach the varbind walk essentially never — the sweep
+/// test above runs 256 of them and the comment beside it says "in the unlikely
+/// event it parses". A SEQUENCE header, an INTEGER version in 0..1, an OCTET
+/// STRING community and a context PDU tag all have to line up first.
+const MessageCorpus = struct {
+    scratch: [512]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [16][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *MessageCorpus, frame: []const u8) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = head;
+        self.used += head.len;
+        self.n += 1;
+    }
+
+    fn build(self: *MessageCorpus) ![]const []const u8 {
+        // A GetRequest with one varbind — the shape every truncation and
+        // bit-flip sweep above is built from.
+        self.push(try encode(&self.scratch, .v2c, "public", .{
+            .type = .get_request,
+            .request_id = 42,
+            .varbinds = &.{.{ .name = try Oid.parse("1.3.6.1.2.1.1.1.0"), .value = .null }},
+        }));
+        // A SetRequest carrying one of each scalar type: the varbind walk has
+        // to size four different value encodings.
+        self.push(try encode(&self.scratch, .v2c, "private", .{
+            .type = .set_request,
+            .request_id = 77,
+            .varbinds = &.{
+                .{ .name = try Oid.parse("1.3.6.1.2.1.1.6.0"), .value = .{ .octet_string = "rack 4" } },
+                .{ .name = try Oid.parse("1.3.6.1.2.1.4.1.0"), .value = .{ .integer = 2 } },
+                .{ .name = try Oid.parse("1.3.6.1.2.1.4.20.1.1"), .value = .{ .ip_address = .{ 10, 0, 0, 1 } } },
+                .{ .name = try Oid.parse("1.3.6.1.2.1.31.1.1.1.6.1"), .value = .{ .counter64 = 1 << 40 } },
+            },
+        }));
+        // v1 with an error-status and an error-index.
+        self.push(try encode(&self.scratch, .v1, "private", .{
+            .type = .response,
+            .request_id = 7,
+            .error_status = 2,
+            .error_index = 1,
+            .varbinds = &.{.{ .name = try Oid.parse("1.3.6.1.2.1.99.1.0"), .value = .null }},
+        }));
+        // A v2c exception value inside an otherwise clean response.
+        self.push(try encode(&self.scratch, .v2c, "public", .{
+            .type = .response,
+            .request_id = 8,
+            .varbinds = &.{.{ .name = try Oid.parse("1.3.6.1.2.1.99.1.0"), .value = .no_such_instance }},
+        }));
+        // An error-status the enum does not name, and no varbinds at all.
+        self.push(try encode(&self.scratch, .v2c, "public", .{
+            .type = .response,
+            .request_id = 9,
+            .error_status = 200,
+        }));
+        // Report-PDU, context tag [8].
+        self.push(try encode(&self.scratch, .v2c, "public", .{
+            .type = .report,
+            .request_id = 4242,
+            .varbinds = &.{.{ .name = try Oid.parse("1.3.6.1.6.3.15.1.1.4.0"), .value = .{ .counter32 = 1 } }},
+        }));
+        // A GetBulkRequest, whose non-repeaters/max-repetitions occupy the
+        // error-status and error-index slots.
+        self.push(try encode(&self.scratch, .v2c, "public", .{
+            .type = .get_bulk_request,
+            .request_id = 11,
+            .error_status = 1, // GetBulkRequest reuses this slot as non-repeaters
+            .error_index = 10, // ... and this one as max-repetitions
+            .varbinds = &.{.{ .name = try Oid.parse("1.3.6.1.2.1.2.2.1.2"), .value = .null }},
+        }));
+
+        // ── refusals, each named by the error it raises ─────────────────────
+        self.push(&[_]u8{ 0x30, 0x06, 0x02, 0x01, 0x03, 0x04, 0x01, 'x' }); // UnsupportedVersion: v3
+        self.push(&[_]u8{ 0x30, 0x0a, 0x02, 0x01, 0x01, 0x04, 0x03, 'p', 'u', 'b', 0xa9, 0x00 }); // UnknownPduType: context 9
+        self.push(&[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x00, 0xff }); // TrailingData
+        // Decodes, then the ITERATOR refuses: an INTEGER where a varbind
+        // SEQUENCE must be. The only seed here that reaches the lazy walk's
+        // error path rather than its success path.
+        self.push(&[_]u8{
+            0x30, 0x18, 0x02, 0x01, 0x01, 0x04, 0x03, 'p',  'u',
+            'b',  0xa2, 0x0e, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00,
+            0x02, 0x01, 0x00, 0x30, 0x03, 0x02, 0x01, 0x05,
+        });
+        self.push(&[_]u8{0x30}); // a SEQUENCE tag with no length
+        self.push(&.{}); // the empty datagram
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: decode never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzDecode, .{});
+    var corpus: MessageCorpus = .{};
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `len` was 0 for every seed and `decode` was handed `buf[0..0]`, which
+    // fails on its first line. The varbind walk below, which is the whole
+    // reason this harness exists (the walk is LAZY, so decode succeeding says
+    // nothing about it), was unreachable. Measured 2026-09-07 over the corpus
+    // above: **0 of 12 seeds non-empty, 0 decoded and 0 varbinds walked
+    // before; 12 of 12 non-empty (one is the empty datagram on purpose), 8
+    // decoded and 9 varbinds walked after.**
+    const len: usize = smith.slice(&buf);
 
     const msg = decode(buf[0..len]) catch return;
     switch (msg.pdu) {
@@ -735,6 +845,47 @@ fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
             while (it.next() catch null) |_| {}
         },
     }
+}
+
+test "corpus: every datagram seed reaches decode, and the varbinds walked are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, built from the same `build()`. `varbinds`
+    // is the second number and the one that matters: the varbind walk is LAZY,
+    // so a message that decodes has not yet had a single varbind parsed, and
+    // `decoded` alone would count a corpus that never enters the iterator as a
+    // complete success.
+    var corpus: MessageCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var varbinds: usize = 0;
+    var walk_errors: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const msg = decode(buf[0..len]) catch continue;
+        decoded += 1;
+        switch (msg.pdu) {
+            inline else => |p| {
+                var it = p.varbinds.iterator();
+                while (true) {
+                    const vb = it.next() catch {
+                        walk_errors += 1;
+                        break;
+                    };
+                    if (vb == null) break;
+                    varbinds += 1;
+                }
+            },
+        }
+    }
+    // One short of the corpus length: the empty datagram is a seed on purpose.
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 8), decoded);
+    try testing.expectEqual(@as(usize, 9), varbinds);
+    try testing.expectEqual(@as(usize, 1), walk_errors);
 }
 
 test "Report-PDU [8] encodes and decodes as a BasicPdu (RFC 3416 §3)" {

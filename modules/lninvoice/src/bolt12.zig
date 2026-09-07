@@ -715,6 +715,7 @@ pub fn encodeSignedInvoice(
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const seed = @import("testkit").fuzz.seedHex;
 const offers_kat = @import("bolt12_offers_kat_vectors.zig");
 const format_string_kat = @import("bolt12_format_string_kat_vectors.zig");
 
@@ -1820,10 +1821,6 @@ test "BOLT#12: wrong prefix rejected for lnr / lni decoders" {
 // (ascending types, no unknown-even) all cleared — a 90 s
 // `scripts/fuzz-sweep.sh` run found it. Probe then removed. `merkleRoot`
 // needs no such check: the harness hands it raw bytes directly.
-test "fuzz: BOLT#12 decoders and merkleRoot never panic on arbitrary input" {
-    try testing.fuzz({}, fuzzBolt12, .{});
-}
-
 /// Minimal BigSize (BOLT#1) writer — the harness's own, so a bug in the
 /// module's encoder cannot quietly stop the harness reaching the parser.
 fn fuzzPutBigSize(buf: []u8, v: u64) usize {
@@ -1845,14 +1842,53 @@ fn fuzzPutBigSize(buf: []u8, v: u64) usize {
     }
 }
 
-fn fuzzBolt12(_: void, smith: *std.testing.Smith) !void {
-    const allocator = testing.allocator;
+/// `testkit.fuzz.Cursor` over one corpus seed, which is what drives
+/// `fuzzBolt12`.
+///
+/// ⚠ Every choice here used to come from a scalar `Smith` draw, the FIRST of
+/// them `smith.boolWeighted(1, 7)` — `check-fuzz-reach` classifies that R1. A
+/// weighted draw reads eight octets as a little-endian u64 and returns the
+/// range MINIMUM unless the whole word falls inside the range, so on the one
+/// input an ordinary `zig build test-*` run gets EVERY choice was its minimum:
+/// the record loop's `eosWeightedSimple` ended it before the first record, so
+/// the stream was **empty**, `hrp` was `hrps[0]`, and the string damage never
+/// ran. The comment above records that a 90 s `--fuzz` sweep found a real bug
+/// through this harness — under `--fuzz` the draws are live — but the ordinary
+/// lane exercised one empty offer, for ever. Reading the choices out of ONE
+/// `smith.slice` fixes both halves: the draw is byte-first, and a seed is a
+/// script rather than a list of u64 words.
+const Script = @import("testkit").fuzz.Cursor;
+
+/// What a script produced, so the guard below can measure the corpus rather
+/// than assert it merely ran.
+const Bolt12Outcome = struct {
+    stream_len: usize = 0,
+    records: usize = 0,
+    merkle_ok: bool = false,
+    offers: usize = 0,
+    ireqs: usize = 0,
+    invoices: usize = 0,
+};
+
+/// The body of `fuzzBolt12`, factored out so the harness and the corpus guard
+/// drive the SAME script. A guard measuring a different sequence from the one
+/// the harness runs is not a guard.
+///
+/// The octet layout is `pureEntropy`, then per record `typeForm, typeA, typeB,
+/// lengthForm, lengthA, lengthB` and up to 64 value octets, with a `stop`
+/// octet ending the loop; then `hrpIdx`, `damage`, and per mutation a
+/// `position` and a `kind`. A short script cycles.
+fn runBolt12Script(allocator: Allocator, script: []const u8) !Bolt12Outcome {
+    var sc = Script{ .bytes = script };
+    var out: Bolt12Outcome = .{};
 
     // ── 1. the raw TLV stream ────────────────────────────────────────────
     var tlv: [512]u8 = undefined;
     var n: usize = 0;
-    if (smith.boolWeighted(1, 7)) {
-        n = smith.slice(&tlv); // pure entropy, the minority case
+    if (sc.byte() & 7 == 0) {
+        // Pure entropy, the minority case.
+        n = @min(sc.ranged(0, tlv.len), tlv.len);
+        for (tlv[0..n]) |*b| b.* = sc.byte();
     } else {
         // BOLT#1 requires STRICTLY ASCENDING types, and rejects an unknown
         // EVEN one — so a stream of independently-drawn types is thrown out
@@ -1862,23 +1898,22 @@ fn fuzzBolt12(_: void, smith: *std.testing.Smith) !void {
         // walk and into the per-record semantics.
         var offer_idx: usize = 0;
         var first_offer = true;
-        while (n + 32 < tlv.len and !smith.eosWeightedSimple(3, 1)) {
-            const t: u64 = if (smith.boolWeighted(1, 2)) blk: {
-                const step: usize = if (first_offer)
-                    smith.valueRangeAtMost(u8, 0, 3)
-                else
-                    smith.valueRangeAtMost(u8, 1, 3);
+        var rounds: usize = 0;
+        while (n + 32 < tlv.len and rounds < 24) : (rounds += 1) {
+            if (sc.byte() & 3 == 0) break; // the end-of-stream draw
+            const t: u64 = if (sc.byte() % 3 != 0) blk: {
+                const step: usize = if (first_offer) sc.ranged(0, 3) else sc.ranged(1, 3);
                 first_offer = false;
                 offer_idx = @min(offer_idx + step, known_offer_types.len - 1);
                 break :blk known_offer_types[offer_idx];
-            } else switch (smith.value(enum { ireq, invoice, sig_range, tiny, huge })) {
+            } else switch (sc.ranged(0, 4)) {
                 // The invoice_request / invoice number spaces, spanning the
                 // 240..1000 signature exclusion on both sides.
-                .ireq => smith.valueRangeAtMost(u16, 0, 250),
-                .invoice => smith.valueRangeAtMost(u16, 160, 260),
-                .sig_range => smith.valueRangeAtMost(u16, 235, 1005),
-                .tiny => smith.value(u8),
-                .huge => smith.value(u64),
+                0 => sc.word() % 251,
+                1 => 160 + sc.word() % 101,
+                2 => 235 + sc.word() % 771,
+                3 => sc.byte(),
+                else => sc.word(),
             };
             var hdr: [9]u8 = undefined;
             const tl = fuzzPutBigSize(&hdr, t);
@@ -1889,63 +1924,161 @@ fn fuzzBolt12(_: void, smith: *std.testing.Smith) !void {
             // The declared length is deliberately allowed to disagree with
             // what follows: `parseTlvStream`/`merkleRoot` must fail closed
             // on an over-claim rather than slice past the buffer.
-            const claimed: u64 = if (smith.boolWeighted(6, 1))
-                smith.valueRangeAtMost(u8, 0, 40)
-            else
-                smith.value(u64);
+            const claimed: u64 = if (sc.byte() % 7 != 0) sc.ranged(0, 40) else sc.word();
             const ll = fuzzPutBigSize(&hdr, claimed);
             if (n + ll >= tlv.len) break;
             @memcpy(tlv[n..][0..ll], hdr[0..ll]);
             n += ll;
 
             const want: usize = @min(@as(usize, @intCast(@min(claimed, 64))), tlv.len - n);
-            n += smith.slice(tlv[n..][0..want]);
+            for (tlv[n..][0..want]) |*b| b.* = sc.byte();
+            n += want;
         }
     }
     const stream = tlv[0..n];
+    out.stream_len = n;
+    if (lnwire.parseTlvStream(allocator, stream, &known_offer_types)) |parsed| {
+        var pr = parsed;
+        out.records = pr.records.len;
+        pr.deinit(allocator);
+    } else |_| {}
 
     // ── 2. merkleRoot, straight over the raw bytes ───────────────────────
-    _ = merkleRoot(allocator, stream) catch {};
+    if (merkleRoot(allocator, stream)) |_| {
+        out.merkle_ok = true;
+    } else |_| {}
 
     // ── 3. the same bytes inside each string envelope ────────────────────
     const quintets = try bitpack.bytesToQuintets(allocator, stream);
     defer allocator.free(quintets);
 
     const hrps = [_][]const u8{ "lno", "lnr", "lni", "ln", "lnbc" };
-    const hrp = hrps[smith.index(hrps.len)];
-    const encoded = bech32raw.encodeNoChecksum(allocator, hrp, quintets) catch return;
+    const hrp = hrps[sc.ranged(0, hrps.len - 1)];
+    const encoded = bech32raw.encodeNoChecksum(allocator, hrp, quintets) catch return out;
     defer allocator.free(encoded);
 
     // Optional string-level damage: uppercase runs, `+` continuations and
     // out-of-charset bytes all have their own paths in `stripContinuation`
     // / `decodeNoChecksum`.
     var str_buf: [1024]u8 = undefined;
-    var s: []const u8 = encoded;
-    if (encoded.len <= str_buf.len and encoded.len > 0 and smith.boolWeighted(2, 1)) {
+    var str: []const u8 = encoded;
+    if (encoded.len <= str_buf.len and encoded.len > 0 and sc.byte() % 3 != 0) {
         @memcpy(str_buf[0..encoded.len], encoded);
         var muts: usize = 0;
-        while (muts < 8 and !smith.eosWeightedSimple(3, 1)) : (muts += 1) {
-            const i = smith.index(encoded.len);
-            str_buf[i] = switch (smith.value(enum { plus, space, upper, byte })) {
-                .plus => '+',
-                .space => ' ',
-                .upper => std.ascii.toUpper(str_buf[i]),
-                .byte => smith.value(u8),
+        while (muts < 8) : (muts += 1) {
+            if (sc.byte() & 3 == 0) break;
+            const i = sc.ranged(0, @intCast(encoded.len - 1));
+            str_buf[i] = switch (sc.ranged(0, 3)) {
+                0 => '+',
+                1 => ' ',
+                2 => std.ascii.toUpper(str_buf[i]),
+                else => sc.byte(),
             };
         }
-        s = str_buf[0..encoded.len];
+        str = str_buf[0..encoded.len];
     }
 
-    if (decodeOffer(allocator, s)) |off| {
+    if (decodeOffer(allocator, str)) |off| {
         var o = off;
         o.deinit(allocator);
+        out.offers += 1;
     } else |_| {}
-    if (decodeInvoiceRequest(allocator, s)) |ireq| {
+    if (decodeInvoiceRequest(allocator, str)) |ireq| {
         var r = ireq;
         r.deinit(allocator);
+        out.ireqs += 1;
     } else |_| {}
-    if (decodeInvoice(allocator, s)) |inv| {
+    if (decodeInvoice(allocator, str)) |inv| {
         var v = inv;
         v.deinit(allocator);
+        out.invoices += 1;
     } else |_| {}
+    return out;
+}
+
+/// Scripts for `runBolt12Script`, in the format `Smith.slice` reads.
+///
+/// One record costs exactly six octets — `stop, typeForm, typeStep,
+/// lengthForm, length, value` — so a record group is written `0101010101AA`
+/// and a `00` in the `stop` position ends the loop. That six-octet regularity
+/// is the whole reason these are reviewable, and it is also what the FIRST
+/// draft of this corpus got wrong: eleven-octet groups desynchronised the
+/// cursor, `typeStep` was read out of a value octet, and the offer-type index
+/// saturated at the top of `known_offer_types` so every stream died on
+/// `NotStrictlyIncreasing` with **0 records parsed**. The guard caught it.
+const bolt12_seeds = [_][]const u8{
+    // Four records walking `known_offer_types` upward (indices 1, 3, 5, 7),
+    // `lno` as the HRP, no string damage: the shape that reaches
+    // `decodeOffer`'s per-record semantics rather than the TLV walk in front.
+    seed("01" ++ ("0101010101AA" ** 4) ++ "00" ++ "00" ++ "00"),
+    // The same records with the string damaged: a `+` continuation at 0 and an
+    // uppercase run at 5, both of which have their own path in
+    // `stripContinuation` / `decodeNoChecksum`.
+    seed("01" ++ ("0101010101AA" ** 4) ++ "00" ++ "00" ++ "01" ++
+        "01" ++ "00" ++ "00" ++ "01" ++ "05" ++ "02" ++ "00"),
+    // The same records under `lni`, so `decodeInvoice`'s envelope opens.
+    seed("01" ++ ("0101010101AA" ** 4) ++ "00" ++ "02" ++ "00"),
+    // ... and under `lnr`, the invoice_request envelope.
+    seed("01" ++ ("0101010101AA" ** 4) ++ "00" ++ "01" ++ "00"),
+    // One record whose declared length is 65535 against 64 octets that follow:
+    // the over-claim `parseTlvStream` and `merkleRoot` must fail closed on.
+    seed("01" ++ "01" ++ "01" ++ "01" ++ "00" ++ "FFFF" ++ ("AA" ** 64) ++ "00" ++ "00" ++ "00"),
+    // Types drawn from the number spaces rather than the offer list — the
+    // 235..1005 signature exclusion, which no `known_offer_types` walk visits.
+    seed("01" ++ ("01" ++ "00" ++ "02" ++ "0080" ++ "01" ++ "04" ++ "AAAAAAAA") ** 3 ++ "00" ++ "00" ++ "00"),
+    // Pure entropy, the minority arm the first octet selects: 64 octets.
+    seed("00" ++ "40" ++ ("5A" ** 64) ++ "00" ++ "00"),
+    // Pure entropy of length 0 — the EMPTY stream, and exactly what the
+    // collapsed harness produced on every input for its whole life.
+    seed("00" ++ "00" ++ "00" ++ "00"),
+    // A one-octet script, cycled: records until the offer-type index
+    // saturates, then `NotStrictlyIncreasing`.
+    seed("01"),
+};
+
+test "fuzz: BOLT#12 decoders and merkleRoot never panic on arbitrary input" {
+    try testing.fuzz({}, fuzzBolt12, .{ .corpus = &bolt12_seeds });
+}
+
+fn fuzzBolt12(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One `smith.slice`, then the octets say what happens — see `Script`.
+    var script: [1024]u8 = undefined;
+    const n: usize = smith.slice(&script);
+    _ = try runBolt12Script(testing.allocator, script[0..n]);
+}
+
+test "corpus: every BOLT#12 script builds a stream, and what the parsers made of it is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets and through the SAME `runBolt12Script`.
+    //
+    // `stream_octets` is the reach claim in the form that fits a harness whose
+    // seed is a SCRIPT: what the collapse destroyed was the record loop, which
+    // ended before its first iteration, so the stream was EMPTY. `records` is
+    // the second number and the one an empty stream cannot produce — it is
+    // also the probe the comment above this harness records having used by
+    // hand ("two or more records") and then removed.
+    const allocator = testing.allocator;
+    var stream_octets: usize = 0;
+    var records: usize = 0;
+    var merkle_ok: usize = 0;
+    for (bolt12_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [1024]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        const out = try runBolt12Script(allocator, script[0..n]);
+        stream_octets += out.stream_len;
+        records += out.records;
+        if (out.merkle_ok) merkle_ok += 1;
+    }
+    try testing.expectEqual(@as(usize, 276), stream_octets);
+    // 16 = four records each from the four `lno`/`lnr`/`lni` script variants.
+    // It was 0 while the record groups were mis-sized — see `bolt12_seeds`.
+    try testing.expectEqual(@as(usize, 16), records);
+    try testing.expectEqual(@as(usize, 5), merkle_ok);
+
+    // The "before" measurement, executable: the empty script is exactly what
+    // the collapsed harness ran, and it produces the empty stream.
+    const zero = try runBolt12Script(allocator, &.{});
+    try testing.expectEqual(@as(usize, 0), zero.stream_len);
+    try testing.expectEqual(@as(usize, 0), zero.records);
 }

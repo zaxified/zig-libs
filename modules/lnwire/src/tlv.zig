@@ -246,6 +246,7 @@ pub fn appendStream(list: *std.ArrayList(u8), allocator: Allocator, records: []c
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const seed = @import("testkit").fuzz.seedHex;
 
 /// Decodes a hex string (no `0x`, no separators, even length -- possibly
 /// empty) into freshly allocated bytes. Test-only: lets the BOLT#1
@@ -642,43 +643,163 @@ test "hostile: truncated integer wider than the target type is rejected" {
 // spliced in -- this is what actually drives the parser past the first
 // record and into the ordering/known-type logic the hostile-input tests
 // above target by hand.
+/// `testkit.fuzz.Cursor` over one corpus seed, which is what drives
+/// `fuzzParseStream`.
+///
+/// ⚠ Every choice here used to come from a scalar `Smith` draw, the first of
+/// them `valueRangeAtMost(u8, 1, 12)` — `check-fuzz-reach` classifies that R1.
+/// A scalar draw reads eight octets as a little-endian u64 and returns the
+/// range MINIMUM unless the whole word falls inside the range, and after the
+/// first short read `Smith` discards the rest of the input, so on the one
+/// input an ordinary run gets EVERY choice was its minimum: one record, type
+/// 0, length 0, no value and no tail. The lower bound of 1 (rather than 0) was
+/// a deliberate mitigation and the comment said so — it bought exactly one
+/// empty record. Reading the choices out of ONE `smith.slice` fixes both
+/// halves: the draw is byte-first, and a seed is a script rather than a
+/// sequence of u64 words nobody can read. Under `--fuzz` the fuzzer still
+/// drives every choice, because it drives the slice.
+const Script = @import("testkit").fuzz.Cursor;
+
+/// The body of `fuzzParseStream`, factored out so the harness and the corpus
+/// guard build the SAME stream from the same octets. A guard measuring a
+/// different sequence from the one the harness runs is not a guard.
+///
+/// The layout the cursor reads is `recordCount-1`, then per record
+/// `typeForm, type, lengthForm, length` followed by sixteen value octets (of
+/// which the first `length` are used), and after the last record `tailLength`
+/// and thirty-two tail octets. The two `*Form` octets pick between a small
+/// single-byte BigSize and a raw octet, so the multi-byte 0xfd/0xfe/0xff
+/// truncation and non-minimal paths stay reachable. A short script cycles.
+fn buildStream(allocator: Allocator, script: []const u8, out: *std.ArrayList(u8)) !u8 {
+    var s = Script{ .bytes = script };
+    const n_records: u8 = @intCast(1 + s.ranged(0, 11));
+    var i: u8 = 0;
+    while (i < n_records) : (i += 1) {
+        const t: u8 = if (s.byte() & 1 != 0) @intCast(s.ranged(0, 0xfc)) else s.byte();
+        try out.append(allocator, t);
+        const len: u8 = if (s.byte() & 1 != 0) @intCast(s.ranged(0, 16)) else s.byte();
+        try out.append(allocator, len);
+        var vbuf: [16]u8 = undefined;
+        for (&vbuf) |*b| b.* = s.byte();
+        try out.appendSlice(allocator, vbuf[0..@min(len, vbuf.len)]);
+    }
+    // A tail of octets unconstrained by the record-shaped loop above — catches
+    // anything the biased construction structurally cannot produce.
+    const tail_len: usize = s.ranged(0, 32);
+    var tail: [32]u8 = undefined;
+    for (&tail) |*b| b.* = s.byte();
+    try out.appendSlice(allocator, tail[0..tail_len]);
+    return n_records;
+}
+
+/// Scripts for `buildStream`. Short ones cycle, so a four-octet script is a
+/// repeating record pattern rather than N rounds of a range minimum.
+const stream_seeds = [_][]const u8{
+    // Twelve records, all typeForm=1/type=0/length=0: strictly-NON-increasing,
+    // so `NotStrictlyIncreasing` fires on record two. Tail length 0.
+    seed("0B" ++ "01" ++ "00" ++ "01" ++ "00" ++ ("00" ** 16) ++ "00"),
+    // Four records with ASCENDING known types 0, 1, 2, 3 — four of the five
+    // `known_types` this harness parses against, so this is the one stream
+    // that actually fills `parsed.records`.
+    // ⚠ Type 254 is NOT reachable through this script's type octet, and that
+    // is a property of the format rather than an oversight: `typeForm = 1`
+    // reduces the octet with `% 253`, so 0xFE arrives as 1; and `typeForm = 0`
+    // writes the octet raw, where 0xFE is the FIVE-octet BigSize prefix, not
+    // the value 254. A seed that looked like it carried 254 would silently be
+    // a duplicate type 1 and fail `NotStrictlyIncreasing` — which is exactly
+    // what the first draft of this corpus did, and what the pinned counts
+    // caught.
+    seed("03" ++
+        "01" ++ "00" ++ "01" ++ "03" ++ "AABBCC" ++ ("00" ** 13) ++
+        "01" ++ "01" ++ "01" ++ "03" ++ "DDEEFF" ++ ("00" ** 13) ++
+        "01" ++ "02" ++ "01" ++ "03" ++ "112233" ++ ("00" ** 13) ++
+        "01" ++ "03" ++ "01" ++ "00" ++ ("00" ** 16) ++
+        "00"),
+    // One record of type 4: unknown and EVEN, which BOLT#1 says must be
+    // refused with `UnknownEvenType`.
+    seed("00" ++ "01" ++ "04" ++ "01" ++ "01" ++ "AA" ++ ("00" ** 15) ++ "00"),
+    // One record of type 5: unknown and ODD, which must be tolerated by being
+    // discarded — so this stream parses and yields NO record.
+    seed("00" ++ "01" ++ "05" ++ "01" ++ "01" ++ "AA" ++ ("00" ** 15) ++ "00"),
+    // One known record followed by a 32-octet tail of 0xFF: the tail is not a
+    // record, so this is the truncation path behind a valid prefix.
+    seed("00" ++ "01" ++ "00" ++ "01" ++ "02" ++ "AABB" ++ ("00" ** 14) ++ "20" ++ ("FF" ** 32)),
+    // typeForm=0, so the type octet lands raw: 0xFF is the nine-octet BigSize
+    // form and there are not nine octets behind it.
+    seed("00" ++ "00" ++ "FF" ++ "01" ++ "00" ++ ("00" ** 16) ++ "00"),
+    // Both forms raw: every octet lands verbatim, which is the uniform noise
+    // the bias in the old harness existed to steer away from.
+    seed("00" ++ "00" ++ "FD" ++ "00" ++ "00" ++ ("00" ** 16) ++ "20" ++ ("5A" ** 32)),
+    // A one-octet script, cycled: the degenerate case, and exactly what the
+    // collapsed harness produced on every input for its whole life.
+    seed("00"),
+};
+
 test "fuzz: parseStream never panics on arbitrary bytes" {
-    try testing.fuzz({}, fuzzParseStream, .{});
+    try testing.fuzz({}, fuzzParseStream, .{ .corpus = &stream_seeds });
 }
 
 fn fuzzParseStream(_: void, smith: *std.testing.Smith) !void {
     const allocator = testing.allocator;
+    // ⚠ One `smith.slice`, then the octets say what happens — see `Script`
+    // above for the R1 collapse this replaces. Measured 2026-09-07 over the
+    // corpus below: **one two-octet stream (a single empty type-0 record) on
+    // every input before; 8 scripts building 132 octets, 3 streams parsed and
+    // 5 records yielded after.** The "before" figure is pinned executably by
+    // the corpus guard's last two lines.
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-
-    // Lower bound 1, not 0: on the single smoke run `valueRangeAtMost` falls
-    // back to its LOWER bound, and zero records is an empty stream — the one
-    // input that exercises nothing. See `message.zig`'s note.
-    const n_records = smith.valueRangeAtMost(u8, 1, 12);
-    var i: u8 = 0;
-    while (i < n_records) : (i += 1) {
-        // Bias the type/length BigSize prefixes toward small single-byte
-        // forms (0..0xfc) most of the time -- the multi-byte 0xfd/0xfe/0xff
-        // forms are already exhaustively covered by `decodeBigSize`'s own
-        // vector tests; occasionally emit a raw random byte instead so the
-        // 0xfd/0xfe/0xff truncation/non-minimal paths still get exercised.
-        const t: u8 = if (smith.value(bool)) smith.valueRangeAtMost(u8, 0, 0xfc) else smith.value(u8);
-        buf.append(allocator, t) catch return;
-        const len: u8 = if (smith.value(bool)) smith.valueRangeAtMost(u8, 0, 16) else smith.value(u8);
-        buf.append(allocator, len) catch return;
-        var vbuf: [16]u8 = undefined;
-        smith.bytes(&vbuf);
-        buf.appendSlice(allocator, vbuf[0..@min(len, vbuf.len)]) catch return;
-    }
-    // Splice in a tail of fully-random bytes too, unconstrained by the
-    // record-shaped loop above -- catches anything the biased construction
-    // above structurally can't produce.
-    var tail: [32]u8 = undefined;
-    smith.bytes(&tail);
-    const tail_len: usize = smith.valueRangeAtMost(u8, 0, tail.len);
-    buf.appendSlice(allocator, tail[0..tail_len]) catch return;
+    _ = buildStream(allocator, script[0..n], &buf) catch return;
 
     const known_types = [_]u64{ 0, 1, 2, 3, 254 };
     var parsed = parseStream(allocator, buf.items, &known_types) catch return;
     defer parsed.deinit(allocator);
+}
+
+test "corpus: every stream script builds a distinct stream, and the records are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets and through the SAME `buildStream`.
+    //
+    // `stream_octets` is the reach claim in the form that fits this harness:
+    // the seed is a SCRIPT, not the stream, so "non-empty" would only say the
+    // script arrived — what matters is that it built a stream longer than the
+    // one empty record the collapsed draw produced. `records` is the second
+    // number, and it is what an all-minimum script cannot produce: a stream of
+    // type-0 records is `NotStrictlyIncreasing` from the second one onward, so
+    // reaching the parser is not the same as getting a record out of it.
+    const allocator = testing.allocator;
+    var stream_octets: usize = 0;
+    var parsed_ok: usize = 0;
+    var records: usize = 0;
+    const known_types = [_]u64{ 0, 1, 2, 3, 254 };
+    for (stream_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        _ = try buildStream(allocator, script[0..n], &buf);
+        stream_octets += buf.items.len;
+        var parsed = parseStream(allocator, buf.items, &known_types) catch continue;
+        defer parsed.deinit(allocator);
+        parsed_ok += 1;
+        records += parsed.records.len;
+    }
+    try testing.expectEqual(@as(usize, 132), stream_octets);
+    try testing.expectEqual(@as(usize, 3), parsed_ok);
+    // 4 from the ascending-types stream + 1 from the degenerate one-octet
+    // script (a single type-0 record). The unknown-odd stream parses and
+    // yields none, because tolerating an odd type means DISCARDING it.
+    try testing.expectEqual(@as(usize, 5), records);
+
+    // The "before" measurement, executable: the empty script is exactly what
+    // the collapsed harness ran, and the mitigation it carried (a lower bound
+    // of 1 record rather than 0) bought one empty type-0 record and nothing
+    // else.
+    var zero: std.ArrayList(u8) = .empty;
+    defer zero.deinit(allocator);
+    try testing.expectEqual(@as(u8, 1), try buildStream(allocator, &.{}, &zero));
+    try testing.expectEqualSlices(u8, &.{ 0, 0 }, zero.items);
 }
