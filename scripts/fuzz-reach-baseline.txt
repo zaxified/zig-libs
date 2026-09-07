@@ -55,7 +55,6 @@ http 12
 ibe 1
 icmp 1
 iec104 4
-iec61850 21
 isis 1
 isis-lsdb 2
 isis-spf 1
