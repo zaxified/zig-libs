@@ -175,7 +175,7 @@ const module_list = [_]Module{
     .{ .name = "shardstore", .libs = &.{"net"}, .deps = &.{"kvtree"} },
     .{ .name = "writebehind", .libs = &.{"net"}, .deps = &.{ "ramcache", "workerpool", "jobqueue", "kvtree" } },
     .{ .name = "pagecache", .libs = &.{"net"}, .deps = &.{ "kvtree", "ramcache" } },
-    .{ .name = "tsdb", .libs = &.{"storage"}, .deps = &.{"kvtree"} },
+    .{ .name = "tsdb", .libs = &.{"storage"}, .deps = &.{"kvtree"}, .test_deps = &.{"testkit"} },
     .{ .name = "entropy", .libs = &.{ "crypto", "web" } },
     .{ .name = "hashdigest", .libs = &.{ "crypto", "storage" } },
     .{ .name = "sealedbox", .libs = &.{"crypto"} },

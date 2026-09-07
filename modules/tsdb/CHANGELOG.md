@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** - Test-only, no production change: both fuzz targets ran one input.
+  `fuzzParseCanonical` and `fuzzDecodePointKey` each opened `smith.bytes(&buf)` and then
+  drew a length with `smith.valueRangeAtMost`; a ranged `Smith` draw reads eight octets as
+  a little-endian `u64` and returns the range MINIMUM when fewer than eight remain, and
+  `bytes` had already eaten them - so `len` was **0** every round, `parseCanonical` failed
+  at its first `takeLenPrefixed`, and `decodePointKey` never saw a key of the one length it
+  accepts. Neither had a corpus either. Both now draw with one `smith.slice(&buf)`. The
+  descriptor corpus is built from `canonicalize`, the module's own encoder (a canonical
+  descriptor is a nest of length prefixes that all have to agree with the bytes behind
+  them, which arbitrary octets essentially never spell), and includes the frame this
+  decoder's shape invites: a `count` claiming 65535 labels over a two-label frame, which
+  must not be committed to by `gpa.alloc(Label, count)`. Measured by the two new `corpus:`
+  guards: descriptors 8 non-empty seeds, 3 accepted, **3 labels decoded**; point keys 6
+  non-empty, 3 decoded, **3 round-tripping** back to their own series and timestamp. The
+  label count is pinned rather than `accepted > 0` because a `count = 0` descriptor is
+  accepted while walking no label at all.
+
 - **2026-08-18** — Portability fix (`check-portable`): same defect and fix as
   `kvtree`'s 2026-08-18 entry — two crash-injection tests mixed a `usize` `crash_at`
   directly with the splitmix64-style `0x9e3779b97f4a7c15` constant feeding

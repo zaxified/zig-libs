@@ -17,7 +17,6 @@ chachapoly 2
 coconut 1
 cookies 1
 cors 1
-ctap2pin 1
 decimal 2
 df-elect 2
 diskusage 1
@@ -55,7 +54,6 @@ slhdsa 1
 sntp 1
 spake2plus 1
 sphinx 1
-staticfiles 1
 stun 1
 tar 1
 tenantkex 2
@@ -63,7 +61,6 @@ timelock_envelope 1
 tlock 1
 tlsresume 2
 tracecontext 1
-tsdb 2
 tz 2
 uci 2
 validate 2

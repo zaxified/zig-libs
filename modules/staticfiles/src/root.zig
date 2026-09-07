@@ -890,18 +890,65 @@ test "sanitizePath: absolute-looking input cannot escape" {
 // claim from the output and checks it holds, which would catch e.g. a
 // `..` that survived because it arrived alongside an unrelated encoding
 // quirk the hand-picked vectors did not happen to combine.
+/// ⛔ The comment that was false when it was written: "Length drawn BEFORE the
+/// bytes it bounds: every mutated byte the fuzzer spends then lands inside the
+/// slice". A ranged `Smith` draw returns the range MINIMUM unless a whole
+/// eight-octet word already lies inside the range, so `raw_len` was **0** on
+/// every input this target ever ran outside `--fuzz` — `smith.bytes` was
+/// handed a zero-length slice, and `sanitizePath` was called on `""` every
+/// round. The traversal contract this harness exists to check had never been
+/// evaluated on a path.
+///
+/// A seed is the request path as a `testkit.fuzz` slice seed, then the `u64`
+/// word `allow_dotfiles` reads (`1` is true). ⛔ Without that word the knob is
+/// dead on a corpus replay and the `allow_dotfiles = true` half of the
+/// contract — which is a DIFFERENT contract, since a leading dot stops being a
+/// refusal — would never run.
+const path_seeds = [_][]const u8{
+    // The clean paths the value tests above normalize.
+    pathSeed("/index.html", 0),
+    pathSeed("/sub/dir/file.txt", 0),
+    pathSeed("/", 0),
+    pathSeed("//a//b/", 0),
+    pathSeed("/a/./b", 0),
+    pathSeed("/a%2Fb.txt", 0), // %2F decodes to a real separator
+    pathSeed("/hello%20world.txt", 0),
+    // Every traversal/injection vector the table above pins, so the corpus is
+    // not "accepted paths only" — these are the shapes the contract is about.
+    pathSeed("/../etc/passwd", 0),
+    pathSeed("/a/../../b", 0),
+    pathSeed("/..%2f..%2fetc%2fpasswd", 0), // encoded ../
+    pathSeed("/%2e%2e/x", 0), // encoded ..
+    pathSeed("/foo%00.png", 0), // NUL truncation
+    pathSeed("/..\\..\\x", 0), // backslash
+    pathSeed("/%2e%2e%5cx", 0), // encoded backslash
+    pathSeed("/%ZZ", 0), // bad percent-encoding
+    pathSeed("/a%2", 0), // truncated percent
+    // The dotfile knob, both ways round the SAME input — the pair a
+    // tail-less seed could not have produced.
+    pathSeed("/.env", 0),
+    pathSeed("/.env", 1),
+    pathSeed("/....//x", 0),
+    pathSeed("/....//x", 1),
+    pathSeed("", 0), // and the input this target used to run for ever
+};
+
+fn pathSeed(comptime raw: []const u8, comptime allow_dotfiles: u64) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, raw.len)) ++ raw[0..raw.len].* ++
+            std.mem.toBytes(allow_dotfiles);
+    }.bytes;
+}
+
 test "fuzz: sanitizePath's traversal-safety contract holds for arbitrary bytes" {
-    try testing.fuzz({}, fuzzSanitizePath, .{});
+    try testing.fuzz({}, fuzzSanitizePath, .{ .corpus = &path_seeds });
 }
 
 fn fuzzSanitizePath(_: void, smith: *testing.Smith) !void {
-    // Length drawn BEFORE the bytes it bounds: every mutated byte the
-    // fuzzer spends then lands inside the slice actually passed to
-    // `sanitizePath`, instead of diluting mutations across a fixed 4096-byte
-    // draw most of which gets discarded by a length picked afterward.
+    // ⚠ One `smith.slice` call: bytes and length in a single draw, so every
+    // mutated byte really does land inside the slice `sanitizePath` sees.
     var raw_buf: [4096]u8 = undefined;
-    const raw_len = smith.valueRangeAtMost(u16, 0, raw_buf.len);
-    smith.bytes(raw_buf[0..raw_len]);
+    const raw_len: usize = smith.slice(&raw_buf);
     const raw = raw_buf[0..raw_len];
     const allow_dotfiles = smith.value(bool);
 
@@ -921,6 +968,38 @@ fn fuzzSanitizePath(_: void, smith: *testing.Smith) !void {
         if (!allow_dotfiles) try testing.expect(seg[0] != '.');
         for (seg) |c| try testing.expect(c != 0 and c != '\\');
     }
+}
+
+test "corpus: every path seed reaches sanitizePath, and the counts are pinned" {
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    // ⛔ Not `accepted > 0`: `sanitizePath("")` succeeds — the empty path IS
+    // the root, per the module's own doc comment — so an acceptance guard
+    // would have read as a pass over the collapsed corpus that reached
+    // nothing. `segments` only moves when a seed's own octets are walked.
+    var segments: usize = 0;
+    var dotfiles_allowed: usize = 0;
+    for (path_seeds) |sd| {
+        var smith: testing.Smith = .{ .in = sd };
+        var raw_buf: [4096]u8 = undefined;
+        const raw_len: usize = smith.slice(&raw_buf);
+        if (raw_len != 0) nonempty += 1;
+        const allow_dotfiles = smith.value(bool);
+        if (allow_dotfiles) dotfiles_allowed += 1;
+        var out: [max_path_bytes]u8 = undefined;
+        const clean = sanitizePath(raw_buf[0..raw_len], &out, .{ .allow_dotfiles = allow_dotfiles }) catch continue;
+        accepted += 1;
+        if (clean.len == 0) continue;
+        var it = mem.splitScalar(u8, clean, '/');
+        while (it.next()) |_| segments += 1;
+    }
+    try testing.expectEqual(path_seeds.len - 1, nonempty); // all but the empty path
+    try testing.expectEqual(@as(usize, 10), accepted);
+    try testing.expectEqual(@as(usize, 14), segments);
+    // The knob is alive on a corpus replay: two seeds run with dotfiles
+    // allowed, which is a different contract (a leading dot stops being a
+    // refusal) and which no tail-less seed could have reached.
+    try testing.expectEqual(@as(usize, 2), dotfiles_allowed);
 }
 
 // ── filesystem / serving tests ────────────────────────────────────────────────
