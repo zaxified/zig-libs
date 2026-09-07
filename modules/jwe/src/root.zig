@@ -1032,8 +1032,36 @@ test "malformed compact tokens are rejected, never panic on arbitrary bytes" {
     try std.testing.expectError(error.InvalidBase64, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, "not!base64.a.b.c.d", .{}));
 }
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// A flip script: octet 0 is the flip COUNT (1..24 after clamping), then three
+/// octets per flip — a 16-bit offset into the token and the byte to write.
+///
+/// ⛔ The knobs used to be ranged `Smith` draws, and `n_flips` was the FIRST
+/// of them. A ranged draw reads eight octets as a little-endian `u64` and
+/// returns the range MINIMUM unless that whole word falls inside the range, so
+/// on the one input the ordinary test lane runs, `n_flips` was 1,
+/// `smith.index(token.len)` was 0 and `smith.value(u8)` was 0: **this target
+/// ran exactly one input for ever — the genuine token with its first octet
+/// zeroed, which `InvalidBase64` refuses before `header.parse`.** The offset
+/// draw was the worse half: `smith.index` over a token of ~180 octets is
+/// coverage-guided under `--fuzz` but pinned to 0 outside it.
+const token_seeds = [_][]const u8{
+    fuzzseed.seedHex(""), // the empty script: one flip at offset 0 to 0x00, which is what this target ran
+    fuzzseed.seedHex("01" ++ "0000" ++ "41"), // the header segment's first octet
+    fuzzseed.seedHex("01" ++ "0005" ++ "2e"), // ⭐ a '.' spliced into the header: a sixth segment
+    fuzzseed.seedHex("01" ++ "000a" ++ "21"), // '!' in the header: not base64url
+    fuzzseed.seedHex("01" ++ "0028" ++ "41"), // ⭐ inside the encrypted key, past the header
+    fuzzseed.seedHex("01" ++ "0050" ++ "ff"), // deeper still: the IV or ciphertext
+    fuzzseed.seedHex("01" ++ "00b0" ++ "00"), // ⭐ near the end: the authentication tag
+    fuzzseed.seedHex("04" ++ "0000" ++ "61" ++ "0001" ++ "62" ++ "0002" ++ "63" ++ "0003" ++ "64"), // four flips across the header
+    fuzzseed.seedHex("18" ++ "00045a" ** 24), // the maximum flip count, all in the header
+    fuzzseed.seedHex("ff" ++ "003030" ** 8), // a flip count past the ceiling, clamped
+    fuzzseed.seedHex("03" ++ "0002" ++ "7b" ++ "0003" ++ "22" ++ "0004" ++ "61"), // '{', '"', 'a' — pushing the header toward JSON-ish
+};
+
 test "fuzz: decryptCompact never panics on arbitrary compact tokens" {
-    try std.testing.fuzz({}, fuzzDecryptCompact, .{});
+    try std.testing.fuzz({}, fuzzDecryptCompact, .{ .corpus = &token_seeds });
 }
 
 fn fuzzDecryptCompact(_: void, smith: *std.testing.Smith) !void {
@@ -1048,7 +1076,8 @@ fn fuzzDecryptCompact(_: void, smith: *std.testing.Smith) !void {
     // alg dispatch, every key-unwrap arm) was never reached, while
     // `check-fuzz` reported the module covered. Worse, outside `--fuzz` the
     // empty corpus gives exactly one input and `valueRangeAtMost` falls back
-    // to its LOWER bound, so the one input was `len = 0`.
+    // to its LOWER bound, so the one input was `len = 0`. (The replacement
+    // then had the same disease one level down — see `token_seeds`.)
     //
     // Start from a genuine token and corrupt it instead, so the framing is
     // valid by construction and the draws are spent on what happens past it.
@@ -1058,17 +1087,75 @@ fn fuzzDecryptCompact(_: void, smith: *std.testing.Smith) !void {
     if (token.len > buf.len) return;
     @memcpy(buf[0..token.len], token);
 
-    // At least one flip: zero flips is the valid token, which the round-trip
-    // tests already cover.
-    const n_flips = smith.valueRangeAtMost(u8, 1, 24);
-    var i: u8 = 0;
-    while (i < n_flips) : (i += 1) {
-        const pos = smith.index(token.len);
-        buf[pos] = smith.value(u8);
-    }
+    // ⚠ ONE byte-first draw, read as a flip script. See `token_seeds` for what
+    // the ranged draws were worth on a corpus replay.
+    var script_buf: [128]u8 = undefined;
+    const script_len: usize = smith.slice(&script_buf);
+    var script: fuzzseed.Cursor = .{ .bytes = script_buf[0..script_len] };
+    applyFlips(&script, buf[0..token.len]);
 
     const pt = decryptCompact(gpa, .{ .symmetric = &key }, buf[0..token.len], .{}) catch return;
     gpa.free(pt);
+}
+
+/// At least one flip: zero flips is the valid token, which the round-trip
+/// tests already cover. The offset is 16-bit, because a compact token here is
+/// about 180 octets and a one-octet offset could never have reached the tag.
+fn applyFlips(script: *fuzzseed.Cursor, buf: []u8) void {
+    if (buf.len == 0) return;
+    const n_flips = 1 + script.byte() % 24;
+    var i: u8 = 0;
+    while (i < n_flips) : (i += 1) {
+        const pos = script.word() % buf.len;
+        buf[pos] = script.byte();
+    }
+}
+
+test "corpus: every token seed reaches decryptCompact, and how far each gets is pinned" {
+    // ⭐ Nothing here may ever decrypt — a damaged token that authenticates
+    // would be the defect — so "accepted" is not the reach signal. What is
+    // pinned is how far each damaged token gets: `MalformedToken` and
+    // `InvalidBase64` are refusals at the FRAMING, and anything else means the
+    // input got past framing into the header parse and the key unwrap, which
+    // is the surface this target exists for.
+    const gpa = std.testing.allocator;
+    const key = [_]u8{0x2b} ** 16;
+    const token = try encryptCompact(gpa, .A128KW, .A128GCM, .{ .symmetric = &key }, "fuzz", "", seededForTest(), .{});
+    defer gpa.free(token);
+
+    var nonempty: usize = 0;
+    var framing_refusals: usize = 0;
+    var past_framing: usize = 0;
+    var accepted: usize = 0;
+    var distinct_tokens: usize = 0;
+    for (token_seeds) |sd| {
+        var buf: [512]u8 = undefined;
+        @memcpy(buf[0..token.len], token);
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script_buf: [128]u8 = undefined;
+        const n: usize = smith.slice(&script_buf);
+        if (n != 0) nonempty += 1;
+        var script: fuzzseed.Cursor = .{ .bytes = script_buf[0..n] };
+        applyFlips(&script, buf[0..token.len]);
+        if (!std.mem.eql(u8, buf[0..token.len], token)) distinct_tokens += 1;
+        if (decryptCompact(gpa, .{ .symmetric = &key }, buf[0..token.len], .{})) |pt| {
+            accepted += 1;
+            gpa.free(pt);
+        } else |e| switch (e) {
+            error.MalformedToken, error.InvalidBase64 => framing_refusals += 1,
+            else => past_framing += 1,
+        }
+    }
+    // One seed is deliberately the empty script.
+    try std.testing.expectEqual(token_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. The single input this target used to run was one
+    // flip at offset 0 to 0x00 — `InvalidBase64`, a framing refusal, so
+    // `past_framing` was 0 for every run it ever made.
+    try std.testing.expectEqual(@as(usize, 11), distinct_tokens);
+    try std.testing.expectEqual(@as(usize, 8), framing_refusals);
+    try std.testing.expectEqual(@as(usize, 3), past_framing);
+    // A damaged token must never authenticate.
+    try std.testing.expectEqual(@as(usize, 0), accepted);
 }
 
 test "TEETH: the decrypt fuzz harness reaches the header parser" {

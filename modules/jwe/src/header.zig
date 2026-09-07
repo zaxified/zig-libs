@@ -420,8 +420,95 @@ test "parse maps unknown alg/enc names to .unknown, not an error" {
     try std.testing.expectEqual(Enc.unknown, parsed.enc);
 }
 
+const fuzzseed = @import("testkit").fuzz;
+
+/// One octet of flags, then the member payload.
+const header_fuzz_buf_len = 1 + 64;
+
+/// ⛔ The comment this replaces recorded a previous fix — "build a
+/// syntactically valid header and let the fuzzer choose its member VALUES
+/// instead" — and that fix bought nothing, because every knob it added was a
+/// `smith.value(bool)` drawn AFTER `smith.bytes(&raw)`. `bytes` consumes
+/// `@min(buf.len, in.len)` octets, so on the one input the ordinary test lane
+/// runs, `n` was 0 and every `bool` was false. The header actually parsed was
+/// `{"alg":"PBES2-HS256+A128KW","enc":"A128GCM"}` with **no optional members
+/// at all** — so `optionalBase64`, `optionalUint` and `optionalEpk`, named in
+/// that same comment as "the paths where the parse errors actually live",
+/// were still never entered. Measured 2026-09-07: 0 of 1 inputs carried a
+/// `p2s`, a `p2c`, a `kid` or an `epk`.
+///
+/// Octet 0 is a bitmask over the optional members; the rest is the payload
+/// they are built from, and also the non-JSON blob handed to `parse` directly.
+const HeaderFlags = struct {
+    const pbes2: u8 = 0x01;
+    const p2c: u8 = 0x02;
+    const p2s: u8 = 0x04;
+    const kid: u8 = 0x08;
+    const epk: u8 = 0x10;
+};
+
+const header_seeds = [_][]const u8{
+    fuzzseed.seed(""), // the empty seed: no flags and no payload, which is what the old harness ran for ever
+    fuzzseed.seed("\x00"), // A128KW, no optional members
+    fuzzseed.seed("\x01"), // the PBES2 alg name, no optional members
+    fuzzseed.seed("\x02" ++ "\x00\x00\x27\x10"), // ⭐ p2c = 10000, a plausible iteration count
+    fuzzseed.seed("\x02" ++ "\xff\xff\xff\xff"), // ⭐ p2c = 4294967295: the `optionalUint` ceiling
+    fuzzseed.seed("\x04" ++ "\x00" ** 8), // ⭐ an 8-octet p2s, the conventional PBES2 salt size
+    fuzzseed.seed("\x04" ++ "\xab" ** 64), // a 64-octet p2s
+    fuzzseed.seed("\x08" ++ "identity-key-1"), // a kid
+    fuzzseed.seed("\x10"), // ⭐ an epk, the `optionalEpk` path
+    fuzzseed.seed("\x1f" ++ "\x00\x00\x00\x01" ++ "salt-and-kid"), // every optional member at once, PBES2 alg
+    fuzzseed.seed("\x06" ++ "\x00\x00\x00\x00" ++ "\x01\x02\x03\x04"), // ⭐ p2c = 0 alongside a p2s
+    fuzzseed.seed("\x00" ++ "{not json"), // the blob half: `parse` is also called on the payload directly
+    fuzzseed.seed("\x00" ++ "[1,2,3]"), // JSON, but not an object
+    fuzzseed.seed("\x00" ++ "{\"alg\":\"dir\",\"enc\":\"A128GCM\"}"), // ⭐ a complete header as the blob
+    fuzzseed.seed("\x00" ++ "\xff\xfe\x00\x80"), // bytes that are not text at all
+};
+
 test "fuzz: parse never panics on arbitrary header JSON bytes" {
-    try std.testing.fuzz({}, fuzzParse, .{});
+    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &header_seeds });
+}
+
+/// Lowercase hex of up to `out.len / 2` payload octets. Hand-rolled because
+/// `std.fmt.bytesToHex` sizes its result from a comptime length, and the
+/// payload's length comes out of the seed.
+fn hexOf(payload: []const u8, out: []u8) []const u8 {
+    const digits = "0123456789abcdef";
+    const n = @min(payload.len, out.len / 2);
+    for (payload[0..n], 0..) |b, i| {
+        out[i * 2] = digits[b >> 4];
+        out[i * 2 + 1] = digits[b & 0x0f];
+    }
+    return out[0 .. n * 2];
+}
+
+/// Assemble the header the flags describe, into `out`, and return it. Shared
+/// with the corpus guard, so the guard measures the same headers the harness
+/// builds rather than a second construction of its own.
+fn buildHeaderJson(a: std.mem.Allocator, seed: []const u8) ?[]const u8 {
+    var json: std.ArrayList(u8) = .empty;
+    const flags: u8 = if (seed.len > 0) seed[0] else 0;
+    const payload = if (seed.len > 1) seed[1..] else seed[0..0];
+
+    json.print(a, "{{\"alg\":\"{s}\",\"enc\":\"{s}\"", .{
+        if (flags & HeaderFlags.pbes2 != 0) "PBES2-HS256+A128KW" else "A128KW",
+        "A128GCM",
+    }) catch return null;
+    if (flags & HeaderFlags.p2c != 0) {
+        var v: u32 = 0;
+        for (payload[0..@min(payload.len, 4)]) |b| v = (v << 8) | b;
+        json.print(a, ",\"p2c\":{d}", .{v}) catch return null;
+    }
+    var hex_buf: [64]u8 = undefined;
+    const hex = hexOf(payload, &hex_buf);
+    if (flags & HeaderFlags.p2s != 0)
+        json.print(a, ",\"p2s\":\"{s}\"", .{hex}) catch return null;
+    if (flags & HeaderFlags.kid != 0)
+        json.print(a, ",\"kid\":\"{s}\"", .{hex}) catch return null;
+    if (flags & HeaderFlags.epk != 0)
+        json.appendSlice(a, ",\"epk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"AA\",\"y\":\"AA\"}") catch return null;
+    json.append(a, '}') catch return null;
+    return json.items;
 }
 
 fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
@@ -429,35 +516,65 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // ⚠ This drew uniform-random bytes, which are not JSON: every draw bounced
-    // off `InvalidJson` and the member-by-member decoding below it — the
-    // `optionalBase64`/`optionalUint`/`optionalEpk` paths where the parse
-    // errors actually live — was never entered. And outside `--fuzz` the empty
-    // corpus gives ONE input, with `valueRangeAtMost` falling back to its lower
-    // bound, so that one input was the empty string.
-    //
-    // Build a syntactically valid header and let the fuzzer choose its member
-    // VALUES instead, which is where hostile input goes in practice.
-    var json: std.ArrayList(u8) = .empty;
-    var raw: [64]u8 = undefined;
-    smith.bytes(&raw);
-    const n = smith.valueRangeAtMost(u8, 0, raw.len);
-    const blob = raw[0..n];
+    // ⚠ ONE byte-first draw, and every knob read out of the drawn octets.
+    // See `header_seeds` for what the `smith.value(bool)` knobs after
+    // `smith.bytes` were worth on a corpus replay.
+    var raw: [header_fuzz_buf_len]u8 = undefined;
+    const n: usize = smith.slice(&raw);
+    const seed = raw[0..n];
 
-    json.print(a, "{{\"alg\":\"{s}\",\"enc\":\"{s}\"", .{
-        if (smith.value(bool)) "A128KW" else "PBES2-HS256+A128KW",
-        "A128GCM",
-    }) catch return;
-    if (smith.value(bool)) json.print(a, ",\"p2c\":{d}", .{smith.value(u32)}) catch return;
-    if (smith.value(bool)) json.print(a, ",\"p2s\":\"{s}\"", .{std.fmt.bytesToHex(raw, .lower)[0 .. n * 2]}) catch return;
-    if (smith.value(bool)) json.print(a, ",\"kid\":\"{s}\"", .{std.fmt.bytesToHex(raw, .lower)[0 .. n * 2]}) catch return;
-    if (smith.value(bool)) json.appendSlice(a, ",\"epk\":{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"AA\",\"y\":\"AA\"}") catch return;
-    json.append(a, '}') catch return;
-
-    _ = parse(a, json.items) catch return;
+    if (buildHeaderJson(a, seed)) |json| _ = parse(a, json) catch {};
     // The raw-bytes case still gets a share of the draws — it is what proves
     // the parser survives non-JSON at all.
-    _ = parse(a, blob) catch return;
+    _ = parse(a, if (n > 1) seed[1..] else seed[0..0]) catch return;
+}
+
+test "corpus: every header seed reaches the parser, and the optional members decoded are pinned" {
+    // ⭐ `accepted > 0` is worthless here: the assembled header ALWAYS carries
+    // a valid `alg` and `enc`, so it always parses, which is exactly how the
+    // previous fix looked green while decoding no optional member at all. The
+    // numbers pinned are the members that reached `optionalUint`,
+    // `optionalBase64` and `optionalEpk`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var nonempty: usize = 0;
+    var parsed_headers: usize = 0;
+    var with_p2c: usize = 0;
+    var with_p2s: usize = 0;
+    var with_kid: usize = 0;
+    var with_epk: usize = 0;
+    var blob_parsed: usize = 0;
+    for (header_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [header_fuzz_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&raw);
+        if (n != 0) nonempty += 1;
+        const seed = raw[0..n];
+
+        if (buildHeaderJson(a, seed)) |json| {
+            if (parse(a, json)) |h| {
+                parsed_headers += 1;
+                if (h.p2c != null) with_p2c += 1;
+                if (h.p2s != null) with_p2s += 1;
+                if (h.kid != null) with_kid += 1;
+                if (h.epk != null) with_epk += 1;
+            } else |_| {}
+        }
+        const blob = if (n > 1) seed[1..] else seed[0..0];
+        if (parse(a, blob)) |_| blob_parsed += 1 else |_| {}
+    }
+    // One seed is deliberately empty.
+    try std.testing.expectEqual(header_seeds.len - 1, nonempty);
+    // Measured 2026-09-07. The one input the old harness ran produced a
+    // header with 0 of each optional member, and parsed 0 blobs.
+    try std.testing.expectEqual(@as(usize, 15), parsed_headers);
+    try std.testing.expectEqual(@as(usize, 4), with_p2c);
+    try std.testing.expectEqual(@as(usize, 4), with_p2s);
+    try std.testing.expectEqual(@as(usize, 2), with_kid);
+    try std.testing.expectEqual(@as(usize, 2), with_epk);
+    try std.testing.expectEqual(@as(usize, 1), blob_parsed);
 }
 
 test "TEETH: any crit header is refused (RFC 7516 s5.2 step 5)" {
