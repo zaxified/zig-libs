@@ -5,6 +5,46 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Test-only, neither BREAKING nor BEHAVIOURAL. All eleven fuzz
+  targets were replaying one fixed input. Seven drew `smith.bytes(&buf)` and then
+  `smith.valueRangeAtMost(...)` for the length; `bytes` consumes
+  `@min(buf.len, in.len)` octets, so the ranged draw found fewer than the eight it
+  reads as a little-endian `u64` and returned the range minimum — zero — and no
+  target had a corpus, so each ran exactly one input for ever. Consequences that
+  had been invisible: `shareFromBytes` accepts **exactly one** length
+  (`share_len`), so all three share parsers had returned `ShareLengthMismatch` on
+  every round they had ever run; `Database.init` was always handed `record_len`
+  0 and returned `ZeroRecordLen`, so `count`, `record`, `domainBitsFor` and
+  `wordsPerRecord` under it had never executed; and `reconstructFromBytes`
+  *accepts* the all-zero geometry (0 words against two 0-length buffers), so
+  those targets reported a successful reconstruction of nothing on every round —
+  a guard asking only "did it accept?" would have scored them 100%. Every draw
+  now takes the bytes first via `smith.slice`, and every knob after them is a
+  full-width `smith.value(u64)` reduced with `%`, carried in the seed's tail.
+  ⭐ Three targets — `fuzzAnswerHostileShare`, `fuzzMultiAnswerHostileShare`,
+  `fuzzVerAnswerHostileShare` — are NOT named by `check-fuzz-reach` (their first
+  draw is a faithful `bytes` into a fixed-size key buffer, the shape the gate
+  calls healthy) and were dead all the same: that draw exhausted the input, so
+  the database was all-zero and `record_len`/`record_count`/`party` were 1/1/0
+  for ever, meaning **party 1's half of the two-party arithmetic had never run in
+  any harness**. Reported upstream as a gate gap and fixed here too. Positive
+  seeds are produced by running the protocol (`query` → `answer` →
+  `answerToBytes`), because an answer pair that reconstructs a known record, and
+  a verified bundle that satisfies `Σt = m·Σv`, cannot be written as literals —
+  the odds of drawing one are 2^-64 per seed. Each target has a `corpus:` guard
+  pinning the measured counts plus a second number the degenerate input cannot
+  produce: records walked, distinct shares parsed, record octets reconstructed,
+  seeds that ran as party 1, and — for the verified client — the count of
+  bundles turned away by the integrity comparison rather than by a length check.
+  Measured: `Database.init` 0 of 9 seeds accepted before / 5 and 282 records
+  after; `domainBitsFor` 1 input before / 9 seeds, 6 accepted, 52 domain bits
+  after; the three share parsers 0 accepted before / 4 accepted and 4 distinct
+  shares each after; `reconstruct` 5 accepted, 77 record octets, 1 honest
+  round-trip; multi-index `reconstruct` 4 accepted, 132 octets, 1 honest;
+  verified `reconstruct` 1 verified, **4 rejected by the tag channel** and 1
+  honest round-trip, against 0 of anything before; the three hostile-share paths
+  41/33/33 records over 2 party-1 seeds each. Verified: `zig build test-pir
+  --summary all` 109 pass, 1 skip; `check-fuzz-reach` pir 7 collapsed → 0.
 - **2026-09-03** — Drift re-audit. `PirWith`/`VerifiedWith` are now **exported
   from `root.zig`**: they existed since 2026-08-07 and `SPEC.md`
   "Constant-time PRG selection" and `README.md` both instruct a caller on a

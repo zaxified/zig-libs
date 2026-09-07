@@ -88,7 +88,6 @@ opcua 1
 p256 1
 paillier 3
 pbb 1
-pir 7
 pping 1
 procnet 5
 protobuf 2

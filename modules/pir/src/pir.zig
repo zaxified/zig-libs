@@ -65,6 +65,9 @@
 const std = @import("std");
 const fss = @import("fss");
 const db_mod = @import("db.zig");
+/// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+/// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
 
 const Database = db_mod.Database;
 const Error = db_mod.Error;
@@ -2222,15 +2225,190 @@ test "SELF: what must NOT be built — an existence precheck makes presence obse
 
 const FuzzPir = Pir(8, 4);
 
+/// Eight octets of little-endian tail, for the `smith.value(u64)` knobs a
+/// harness reads after its slices.
+///
+/// ⛔ Every knob in this file's harnesses used to be a `valueRangeAtMost`
+/// placed AFTER the byte draws, which is the range minimum on every replay:
+/// `record_len` 0, `record_count` 1 (or 0), `party` 0, `m` 1. So the database
+/// geometry, the server identity and the MAC scalar were constants, and one
+/// half of the two-party arithmetic — party 1 — had never run in a harness.
+/// The knobs now travel in the seed, which keeps the byte draw first (what
+/// `check-fuzz-reach` requires) and still lets `--fuzz` drive them.
+fn seedTail(store: []u8, at: usize, v: u64) usize {
+    std.mem.writeInt(u64, store[at..][0..8], v, .little);
+    return at + 8;
+}
+
+/// A deterministic share, serialized, for the share-parsing corpora: the only
+/// way to get one is out of this module's own `query`, since a DPF key is
+/// pseudo-random output and no literal could be written by hand.
+fn realShare(party: u1, index: usize, tag: u64) [FuzzPir.share_len]u8 {
+    const seeds = detSeeds(tag);
+    const shares = FuzzPir.query(index, seeds[0], seeds[1]) catch unreachable;
+    var buf: [FuzzPir.share_len]u8 = undefined;
+    FuzzPir.shareToBytes(shares[party], &buf);
+    return buf;
+}
+
+const ShareCorpus = struct {
+    store: [2048]u8 = undefined,
+    used: usize = 0,
+    entries: [7][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *ShareCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *ShareCorpus) []const []const u8 {
+        var a = realShare(0, 3, 9001); // a real share, party 0
+        self.push(&a);
+        var b = realShare(1, 3, 9001); // its party-1 sibling
+        self.push(&b);
+        // A real share one octet off. `shareFromBytes` accepts it by design —
+        // "a well-formed-length input that is not a real DPF key parses fine"
+        // — so this is the seed that proves the CONTENT arrives, not just the
+        // length: it parses to a share that is not either of the two above.
+        a[FuzzPir.share_len / 2] ^= 0x40;
+        self.push(&a);
+        // The two length refusals, one octet either side of `share_len`.
+        self.push(b[0 .. FuzzPir.share_len - 1]);
+        var over: [FuzzPir.share_len + 1]u8 = undefined;
+        @memcpy(over[0..FuzzPir.share_len], &b);
+        over[FuzzPir.share_len] = 0xff;
+        self.push(&over);
+        // An all-zero share of the right length: a legal parse over degenerate
+        // key material, which is a different thing from a legal parse over no
+        // material at all.
+        self.push(&[_]u8{0} ** FuzzPir.share_len);
+        // The one input this target ever ran before it had a corpus.
+        self.push("");
+        return self.entries[0..self.n];
+    }
+};
+
 fn fuzzShareFromBytes(_: void, smith: *std.testing.Smith) !void {
     var buf: [FuzzPir.share_len + 8]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    _ = FuzzPir.shareFromBytes(buf[0..len]) catch return;
+    // ⚠ One `smith.slice` call. `smith.bytes` followed by a ranged length gave
+    // `len == 0` on every input, and `shareFromBytes` accepts exactly one
+    // length — `share_len` — so this target had returned
+    // `ShareLengthMismatch` on every round it had ever run, with the share
+    // sitting unread in `buf`.
+    const len: usize = smith.slice(&buf);
+    const share = FuzzPir.shareFromBytes(buf[0..len]) catch return;
+    var out: [FuzzPir.share_len]u8 = undefined;
+    FuzzPir.shareToBytes(share, &out);
+    std.mem.doNotOptimizeAway(&out);
 }
 test "fuzz shareFromBytes never panics" {
-    try std.testing.fuzz({}, fuzzShareFromBytes, .{});
+    var corpus: ShareCorpus = .{};
+    try std.testing.fuzz({}, fuzzShareFromBytes, .{ .corpus = corpus.build() });
 }
+
+test "corpus: every share seed reaches shareFromBytes, and the counts are pinned" {
+    // ⭐ `distinct` is the second number. `accepted` alone would not notice a
+    // corpus that had collapsed to one frame, or one whose seeds all carry the
+    // same share; `distinct` counts the shares that came back out and only
+    // moves when a seed's own octets reach the parser.
+    var corpus: ShareCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var seen: [7][FuzzPir.share_len]u8 = undefined;
+    var distinct: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [FuzzPir.share_len + 8]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const share = FuzzPir.shareFromBytes(buf[0..len]) catch continue;
+        accepted += 1;
+        var out: [FuzzPir.share_len]u8 = undefined;
+        FuzzPir.shareToBytes(share, &out);
+        var known = false;
+        for (seen[0..distinct]) |prev| {
+            if (std.mem.eql(u8, &prev, &out)) known = true;
+        }
+        if (!known) {
+            seen[distinct] = out;
+            distinct += 1;
+        }
+    }
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 4), accepted);
+    try testing.expectEqual(@as(usize, 4), distinct);
+}
+
+/// ⛔ `fuzzAnswerHostileShare` is NOT one of the targets `check-fuzz-reach`
+/// names — its first draw is a faithful `smith.bytes` into a fixed-size buffer,
+/// which is the shape the gate calls healthy. It was dead all the same, and for
+/// the reason the gate does not model: `bytes` consumes `@min(share_len,
+/// in.len)` octets, so with no corpus the input was exhausted at that point and
+/// **every draw after it returned its minimum** — `db_bytes` all zero,
+/// `record_len` 1, `record_count` 1, `party` 0. One 1-byte record, one server,
+/// an all-zero share, for ever. Reported as a gate gap, not fixed quietly.
+///
+/// The seed layout the draws now read: `share_len` raw octets (no header —
+/// `bytes` has none), then a `testkit.fuzz` slice seed for the database, then
+/// three eight-octet little-endian words: record_len, record_count, party.
+const AnswerCorpus = struct {
+    store: [4096]u8 = undefined,
+    scratch: [128]u8 = undefined,
+    used: usize = 0,
+    entries: [6][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(
+        self: *AnswerCorpus,
+        key: []const u8,
+        db_len: usize,
+        record_len: u64,
+        record_count: u64,
+        party: u64,
+    ) void {
+        const start = self.used;
+        @memcpy(self.store[start..][0..key.len], key);
+        var at = start + key.len;
+        const sd = testkit.fuzz.seedInto(self.store[at..], self.scratch[0..db_len]);
+        at += sd.len;
+        // ⚠ The harness reads these as `1 + value % N`, so what goes into the
+        // seed is one less than the geometry the entry means. Written out
+        // rather than inlined: the first version of this corpus passed the
+        // geometry straight through and every seed silently described a
+        // DIFFERENT database than its comment claimed.
+        at = seedTail(&self.store, at, record_len - 1);
+        at = seedTail(&self.store, at, record_count - 1);
+        at = seedTail(&self.store, at, party);
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *AnswerCorpus) []const []const u8 {
+        for (&self.scratch, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+        const a = realShare(0, 5, 4242);
+        const b = realShare(1, 5, 4242);
+        // The honest pair over an 8-record, 8-octet database — both parties,
+        // so the `party == 1` half of the two-party arithmetic runs at all.
+        self.push(&a, 64, 8, 8, 0);
+        self.push(&b, 64, 8, 8, 1);
+        // A record length that is not a whole number of words (4-octet words),
+        // which is where the zero-padded last word lives.
+        self.push(&a, 40, 5, 8, 0);
+        // The widest geometry the buffers allow, and the narrowest.
+        self.push(&b, 128, 16, 8, 1);
+        self.push(&a, 8, 1, 8, 0);
+        // An all-zero share over the geometry the collapsed harness used to
+        // run: one 1-octet record, party 0. Kept so the old behaviour stays
+        // covered rather than merely replaced.
+        self.push(&[_]u8{0} ** FuzzPir.share_len, 1, 1, 1, 0);
+        return self.entries[0..self.n];
+    }
+};
 
 fn fuzzAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     // The full server-side path on a hostile share: parse, then compute an
@@ -2241,34 +2419,155 @@ fn fuzzAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     const share = FuzzPir.shareFromBytes(&key_buf) catch return;
 
     var db_bytes: [128]u8 = undefined;
-    smith.bytes(&db_bytes);
-    const record_len: usize = smith.valueRangeAtMost(u8, 1, 16);
-    const record_count: usize = smith.valueRangeAtMost(u8, 1, 8);
-    const used = record_len * record_count;
+    const db_len: usize = smith.slice(&db_bytes);
+    // ⚠ `value(u64)` and a `%`, never a ranged draw here: see `AnswerCorpus`.
+    const record_len: usize = @intCast(1 + smith.value(u64) % 16);
+    const record_count: usize = @intCast(1 + smith.value(u64) % 8);
+    const used = @min(db_len, record_len * record_count);
     const database = Database.init(db_bytes[0..used], record_len) catch return;
 
     var out: [16]FuzzPir.Word = undefined;
     const n_words = FuzzPir.answerWords(record_len);
-    const party: u1 = @truncate(smith.valueRangeAtMost(u8, 0, 1));
+    const party: u1 = @truncate(smith.value(u64));
     try FuzzPir.answer(party, share, database, out[0..n_words]);
 
     var wire: [64]u8 = undefined;
     try FuzzPir.answerToBytes(out[0..n_words], wire[0 .. n_words * 4]);
 }
 test "fuzz answer over a hostile share never panics" {
-    try std.testing.fuzz({}, fuzzAnswerHostileShare, .{});
+    var corpus: AnswerCorpus = .{};
+    try std.testing.fuzz({}, fuzzAnswerHostileShare, .{ .corpus = corpus.build() });
 }
+
+test "corpus: the hostile-share answer seeds reach both parties, counts pinned" {
+    // The second number here is `party1`: with the collapsed draws every knob
+    // was its minimum, so `party` was 0 on every round and half the protocol's
+    // arithmetic had never been executed by this harness. It is not derivable
+    // from `answered`, which is why it is the one worth pinning.
+    var corpus: AnswerCorpus = .{};
+    const entries = corpus.build();
+    var parsed: usize = 0;
+    var answered: usize = 0;
+    var party1: usize = 0;
+    var records: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var key_buf: [FuzzPir.share_len]u8 = undefined;
+        smith.bytes(&key_buf);
+        const share = FuzzPir.shareFromBytes(&key_buf) catch continue;
+        parsed += 1;
+        var db_bytes: [128]u8 = undefined;
+        const db_len: usize = smith.slice(&db_bytes);
+        const record_len: usize = @intCast(1 + smith.value(u64) % 16);
+        const record_count: usize = @intCast(1 + smith.value(u64) % 8);
+        const used = @min(db_len, record_len * record_count);
+        const database = Database.init(db_bytes[0..used], record_len) catch continue;
+        var out: [16]FuzzPir.Word = undefined;
+        const n_words = FuzzPir.answerWords(record_len);
+        const party: u1 = @truncate(smith.value(u64));
+        if (party == 1) party1 += 1;
+        try FuzzPir.answer(party, share, database, out[0..n_words]);
+        answered += 1;
+        records += database.count();
+    }
+    try testing.expectEqual(entries.len, parsed);
+    try testing.expectEqual(entries.len, answered);
+    try testing.expectEqual(@as(usize, 2), party1);
+    try testing.expectEqual(@as(usize, 41), records);
+}
+
+/// Seeds for `fuzzReconstruct`: two `testkit.fuzz` slice seeds (the two
+/// servers' serialized answers) and then an eight-octet little-endian
+/// `record_len`.
+///
+/// ⛔ The positive seeds are produced by running the protocol — `query`,
+/// `answer` for both parties, `answerToBytes` — because a pair of answer
+/// buffers that RECONSTRUCTS a known record cannot be written by hand: each is
+/// pseudo-random and only their ring sum is meaningful. Arbitrary bytes of the
+/// right length reconstruct *something*, which is why the guard checks the
+/// honest pair against the database record rather than only counting accepts.
+const ReconCorpus = struct {
+    store: [4096]u8 = undefined,
+    // 60, not 64: `Database.init` refuses a length that is not a whole
+    // multiple of `record_len`, and 64 % 6 != 0.
+    db_bytes: [60]u8 = undefined,
+    used: usize = 0,
+    entries: [8][]const u8 = undefined,
+    n: usize = 0,
+
+    const record_len: usize = 6;
+    const index: usize = 5;
+
+    fn push(self: *ReconCorpus, a0: []const u8, a1: []const u8, rl: u64) void {
+        const start = self.used;
+        var at = start + testkit.fuzz.seedInto(self.store[start..], a0).len;
+        at += testkit.fuzz.seedInto(self.store[at..], a1).len;
+        at = seedTail(&self.store, at, rl);
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    /// The honest answer pair, serialized. `record_len` 6 is deliberately not
+    /// a whole number of 4-octet words: the answer is 2 words = 8 octets, so
+    /// the zero-padded tail word is part of every positive seed.
+    fn honest(self: *ReconCorpus) [2][8]u8 {
+        fillDb(&self.db_bytes, record_len);
+        const database = Database.init(&self.db_bytes, record_len) catch unreachable;
+        const seeds = detSeeds(31337);
+        const shares = FuzzPir.query(index, seeds[0], seeds[1]) catch unreachable;
+        var wire: [2][8]u8 = undefined;
+        for (0..2) |p| {
+            var words: [2]FuzzPir.Word = undefined;
+            FuzzPir.answer(@intCast(p), shares[p], database, &words) catch unreachable;
+            FuzzPir.answerToBytes(&words, &wire[p]) catch unreachable;
+        }
+        return wire;
+    }
+
+    fn build(self: *ReconCorpus) []const []const u8 {
+        var w = self.honest();
+        self.push(&w[0], &w[1], record_len); // reconstructs database record 5
+        // The same pair with one octet of server 0's answer changed: still the
+        // right lengths, so it reconstructs — to the WRONG record. The client
+        // has no way to tell, which is exactly what `verify.zig` exists for,
+        // and this seed is what makes that reachable here.
+        var tampered = w[0];
+        tampered[3] ^= 0x80;
+        self.push(&tampered, &w[1], record_len);
+        // Server 1's answer one octet short: AnswerLengthMismatch.
+        self.push(&w[0], w[1][0..7], record_len);
+        // The honest pair with the record length misdeclared as 9, which needs
+        // three words: the geometry, not the buffer, decides the length.
+        self.push(&w[0], &w[1], 9);
+        // A full-width geometry: 64-octet records, 16 words each side.
+        const wide = [_]u8{0xa5} ** 64;
+        self.push(&wide, &wide, 64);
+        // record_len 1 — one word, three octets of padding in it.
+        self.push(&[_]u8{ 1, 2, 3, 4 }, &[_]u8{ 5, 6, 7, 8 }, 1);
+        // ⛔ record_len 0 with two empty buffers. This one SUCCEEDS —
+        // `answerWords(0)` is 0, so every length check compares 0 with 0 — and
+        // it is exactly the input the collapsed harness ran on every round.
+        // A guard that only asked "did it accept?" would have scored this
+        // target 1 of 1 while it walked nothing.
+        self.push("", "", 0);
+        self.push("", "", 4); // and the same buffers against a real geometry
+        return self.entries[0..self.n];
+    }
+};
 
 fn fuzzReconstruct(_: void, smith: *std.testing.Smith) !void {
     // The client's side: two independently attacker-chosen answer buffers of
     // attacker-chosen length, plus an independently chosen record length.
     var b0: [96]u8 = undefined;
     var b1: [96]u8 = undefined;
-    smith.bytes(&b0);
-    smith.bytes(&b1);
-    const l0: usize = smith.valueRangeAtMost(u8, 0, b0.len);
-    const l1: usize = smith.valueRangeAtMost(u8, 0, b1.len);
-    const record_len: usize = smith.valueRangeAtMost(u8, 0, 64);
+    // ⚠ Two `smith.slice` calls. `bytes` + a ranged length gave `l0 = l1 = 0`
+    // and `record_len = 0` on every input, and `reconstructFromBytes` ACCEPTS
+    // that — 0 words against two 0-length buffers — so the target reported a
+    // successful reconstruction of nothing, for ever.
+    const l0: usize = smith.slice(&b0);
+    const l1: usize = smith.slice(&b1);
+    const record_len: usize = @intCast(smith.value(u64) % 65);
     var rec: [64]u8 = undefined;
 
     FuzzPir.reconstructFromBytes(b0[0..l0], b1[0..l1], rec[0..record_len]) catch return;
@@ -2281,20 +2580,193 @@ fn fuzzReconstruct(_: void, smith: *std.testing.Smith) !void {
     try FuzzPir.reconstruct(w0[0..n_words], w1[0..n_words], rec[0..record_len]);
 }
 test "fuzz reconstruct never panics" {
-    try std.testing.fuzz({}, fuzzReconstruct, .{});
+    var corpus: ReconCorpus = .{};
+    try std.testing.fuzz({}, fuzzReconstruct, .{ .corpus = corpus.build() });
+}
+
+test "corpus: the reconstruct seeds carry real answers, and the counts are pinned" {
+    // ⛔ `accepted` is NOT the reach number for this target — the all-zero
+    // input is a legal reconstruction of a zero-length record, so a collapsed
+    // corpus scores 100%. `octets` (record octets actually written) and
+    // `honest_ok` (the one pair that reconstructs the database's own record)
+    // are what only a real answer pair can produce.
+    var corpus: ReconCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var octets: usize = 0;
+    var honest_ok: usize = 0;
+    const want = corpus.db_bytes[ReconCorpus.index * ReconCorpus.record_len ..][0..ReconCorpus.record_len];
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var b0: [96]u8 = undefined;
+        var b1: [96]u8 = undefined;
+        const l0: usize = smith.slice(&b0);
+        const l1: usize = smith.slice(&b1);
+        if (l0 != 0) nonempty += 1;
+        const record_len: usize = @intCast(smith.value(u64) % 65);
+        var rec: [64]u8 = undefined;
+        FuzzPir.reconstructFromBytes(b0[0..l0], b1[0..l1], rec[0..record_len]) catch continue;
+        accepted += 1;
+        octets += record_len;
+        if (record_len == ReconCorpus.record_len and std.mem.eql(u8, rec[0..record_len], want)) {
+            honest_ok += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 6), nonempty);
+    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 77), octets);
+    try testing.expectEqual(@as(usize, 1), honest_ok);
 }
 
 const FuzzMulti = FuzzPir.Multi(3);
 
+/// A deterministic multi-index share, serialized. As in the single-index case,
+/// the only source of a real one is the module's own `query`.
+fn realMultiShare(party: u1, indices: [3]usize, tag: u64) [FuzzMulti.share_len]u8 {
+    var s0: [3]FuzzMulti.Seed = undefined;
+    var s1: [3]FuzzMulti.Seed = undefined;
+    for (0..3) |j| {
+        const pair = detSeeds(tag *% 1_000_003 +% @as(u64, j));
+        s0[j] = pair[0];
+        s1[j] = pair[1];
+    }
+    const shares = FuzzMulti.query(indices, s0, s1) catch unreachable;
+    var buf: [FuzzMulti.share_len]u8 = undefined;
+    FuzzMulti.shareToBytes(shares[party], &buf);
+    return buf;
+}
+
+const MultiShareCorpus = struct {
+    store: [4096]u8 = undefined,
+    used: usize = 0,
+    entries: [6][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *MultiShareCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = self.store[self.used..][0..sd.len];
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *MultiShareCorpus) []const []const u8 {
+        var a = realMultiShare(0, .{ 1, 7, 200 }, 5150);
+        self.push(&a);
+        const b = realMultiShare(1, .{ 1, 7, 200 }, 5150);
+        self.push(&b);
+        // One octet off inside the SECOND sub-key: `k` is this server's own
+        // compile-time parameter and is never read from the bytes, so the
+        // parse still succeeds — with different key material.
+        a[FuzzMulti.share_len / 3 + 4] ^= 0x11;
+        self.push(&a);
+        // ⛔ Truncated to the SINGLE-index share length: the one confusion a
+        // codec with no count field has to refuse by length alone.
+        self.push(b[0..FuzzPir.share_len]);
+        self.push(&[_]u8{0} ** FuzzMulti.share_len);
+        self.push("");
+        return self.entries[0..self.n];
+    }
+};
+
 fn fuzzMultiShareFromBytes(_: void, smith: *std.testing.Smith) !void {
     var buf: [FuzzMulti.share_len + 8]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-    _ = FuzzMulti.shareFromBytes(buf[0..len]) catch return;
+    // ⚠ One `smith.slice` call — see `fuzzShareFromBytes`. `len` was 0 on
+    // every round, so the only length this parser accepts had never been
+    // presented to it.
+    const len: usize = smith.slice(&buf);
+    const share = FuzzMulti.shareFromBytes(buf[0..len]) catch return;
+    var out: [FuzzMulti.share_len]u8 = undefined;
+    FuzzMulti.shareToBytes(share, &out);
+    std.mem.doNotOptimizeAway(&out);
 }
 test "fuzz multi-index shareFromBytes never panics" {
-    try std.testing.fuzz({}, fuzzMultiShareFromBytes, .{});
+    var corpus: MultiShareCorpus = .{};
+    try std.testing.fuzz({}, fuzzMultiShareFromBytes, .{ .corpus = corpus.build() });
 }
+
+test "corpus: every multi-index share seed reaches the parser, counts pinned" {
+    var corpus: MultiShareCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var seen: [6][FuzzMulti.share_len]u8 = undefined;
+    var distinct: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [FuzzMulti.share_len + 8]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const share = FuzzMulti.shareFromBytes(buf[0..len]) catch continue;
+        accepted += 1;
+        var out: [FuzzMulti.share_len]u8 = undefined;
+        FuzzMulti.shareToBytes(share, &out);
+        var known = false;
+        for (seen[0..distinct]) |prev| {
+            if (std.mem.eql(u8, &prev, &out)) known = true;
+        }
+        if (!known) {
+            seen[distinct] = out;
+            distinct += 1;
+        }
+    }
+    try testing.expectEqual(entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 4), accepted);
+    try testing.expectEqual(@as(usize, 4), distinct);
+}
+
+/// ⛔ Another target `check-fuzz-reach` does not name and that was dead all the
+/// same — same shape as `AnswerCorpus`: a faithful `smith.bytes` into the
+/// fixed-size key buffer exhausts the input, so `db_bytes` was all zero and
+/// `record_len`/`record_count`/`party` were 1/1/0 on every round.
+const MultiAnswerCorpus = struct {
+    store: [8192]u8 = undefined,
+    scratch: [128]u8 = undefined,
+    used: usize = 0,
+    entries: [5][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(
+        self: *MultiAnswerCorpus,
+        key: []const u8,
+        db_len: usize,
+        record_len: u64,
+        record_count: u64,
+        party: u64,
+    ) void {
+        const start = self.used;
+        @memcpy(self.store[start..][0..key.len], key);
+        var at = start + key.len;
+        at += testkit.fuzz.seedInto(self.store[at..], self.scratch[0..db_len]).len;
+        // ⚠ The harness reads these as `1 + value % N`, so what goes into the
+        // seed is one less than the geometry the entry means. Written out
+        // rather than inlined: the first version of this corpus passed the
+        // geometry straight through and every seed silently described a
+        // DIFFERENT database than its comment claimed.
+        at = seedTail(&self.store, at, record_len - 1);
+        at = seedTail(&self.store, at, record_count - 1);
+        at = seedTail(&self.store, at, party);
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    fn build(self: *MultiAnswerCorpus) []const []const u8 {
+        for (&self.scratch, 0..) |*b, i| b.* = @truncate(i *% 17 +% 3);
+        const a = realMultiShare(0, .{ 0, 3, 6 }, 606);
+        const b = realMultiShare(1, .{ 0, 3, 6 }, 606);
+        self.push(&a, 64, 8, 8, 0);
+        self.push(&b, 64, 8, 8, 1); // the party-1 half, never run before
+        // record_len 5: not a whole 4-octet word, so the answer's last word
+        // is the zero-padded one.
+        self.push(&a, 40, 5, 8, 0);
+        self.push(&b, 128, 16, 8, 1);
+        // The geometry the collapsed harness ran: one 1-octet record, party 0,
+        // over an all-zero share.
+        self.push(&[_]u8{0} ** FuzzMulti.share_len, 1, 1, 1, 0);
+        return self.entries[0..self.n];
+    }
+};
 
 fn fuzzMultiAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     // The whole multi-index server path on a hostile share: parse k sub-keys
@@ -2307,11 +2779,12 @@ fn fuzzMultiAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     const share = FuzzMulti.shareFromBytes(&key_buf) catch return;
 
     var db_bytes: [128]u8 = undefined;
-    smith.bytes(&db_bytes);
-    const record_len: usize = smith.valueRangeAtMost(u8, 1, 16);
-    const record_count: usize = smith.valueRangeAtMost(u8, 1, 8);
-    const database = Database.init(db_bytes[0 .. record_len * record_count], record_len) catch return;
-    const party: u1 = @truncate(smith.valueRangeAtMost(u8, 0, 1));
+    const db_len: usize = smith.slice(&db_bytes);
+    const record_len: usize = @intCast(1 + smith.value(u64) % 16);
+    const record_count: usize = @intCast(1 + smith.value(u64) % 8);
+    const used = @min(db_len, record_len * record_count);
+    const database = Database.init(db_bytes[0..used], record_len) catch return;
+    const party: u1 = @truncate(smith.value(u64));
 
     var out: [3 * 16]FuzzMulti.Word = undefined;
     const n_words = try FuzzMulti.answerWords(record_len);
@@ -2325,8 +2798,109 @@ fn fuzzMultiAnswerHostileShare(_: void, smith: *std.testing.Smith) !void {
     try FuzzPir.answerToBytes(out[0..n_words], wire[0 .. n_words * 4]);
 }
 test "fuzz multi-index answer over a hostile share never panics" {
-    try std.testing.fuzz({}, fuzzMultiAnswerHostileShare, .{});
+    var corpus: MultiAnswerCorpus = .{};
+    try std.testing.fuzz({}, fuzzMultiAnswerHostileShare, .{ .corpus = corpus.build() });
 }
+
+test "corpus: the multi-index hostile-share seeds reach both parties, counts pinned" {
+    var corpus: MultiAnswerCorpus = .{};
+    const entries = corpus.build();
+    var answered: usize = 0;
+    var party1: usize = 0;
+    var records: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var key_buf: [FuzzMulti.share_len]u8 = undefined;
+        smith.bytes(&key_buf);
+        const share = FuzzMulti.shareFromBytes(&key_buf) catch continue;
+        var db_bytes: [128]u8 = undefined;
+        const db_len: usize = smith.slice(&db_bytes);
+        const record_len: usize = @intCast(1 + smith.value(u64) % 16);
+        const record_count: usize = @intCast(1 + smith.value(u64) % 8);
+        const used = @min(db_len, record_len * record_count);
+        const database = Database.init(db_bytes[0..used], record_len) catch continue;
+        const party: u1 = @truncate(smith.value(u64));
+        if (party == 1) party1 += 1;
+        var out: [3 * 16]FuzzMulti.Word = undefined;
+        const n_words = try FuzzMulti.answerWords(record_len);
+        try FuzzMulti.answer(party, share, database, out[0..n_words]);
+        answered += 1;
+        records += database.count();
+    }
+    try testing.expectEqual(entries.len, answered);
+    try testing.expectEqual(@as(usize, 2), party1);
+    try testing.expectEqual(@as(usize, 33), records);
+}
+
+/// Seeds for `fuzzMultiReconstruct`: two slice seeds and then TWO eight-octet
+/// little-endian words — `record_len` and `out_len`. The positive ones come out
+/// of a real `query`/`answer` round, for the same reason as `ReconCorpus`.
+const MultiReconCorpus = struct {
+    store: [8192]u8 = undefined,
+    db_bytes: [60]u8 = undefined, // see ReconCorpus: 64 % 6 != 0
+    used: usize = 0,
+    entries: [7][]const u8 = undefined,
+    n: usize = 0,
+
+    const record_len: usize = 6;
+    const indices = [3]usize{ 2, 5, 9 };
+
+    fn push(self: *MultiReconCorpus, a0: []const u8, a1: []const u8, rl: u64, ol: u64) void {
+        const start = self.used;
+        var at = start + testkit.fuzz.seedInto(self.store[start..], a0).len;
+        at += testkit.fuzz.seedInto(self.store[at..], a1).len;
+        at = seedTail(&self.store, at, rl);
+        at = seedTail(&self.store, at, ol);
+        self.entries[self.n] = self.store[start..at];
+        self.used = at;
+        self.n += 1;
+    }
+
+    /// The honest k-block answer pair: 3 blocks × 2 words × 4 octets = 24.
+    fn honest(self: *MultiReconCorpus) [2][24]u8 {
+        fillDb(&self.db_bytes, record_len);
+        const database = Database.init(&self.db_bytes, record_len) catch unreachable;
+        var s0: [3]FuzzMulti.Seed = undefined;
+        var s1: [3]FuzzMulti.Seed = undefined;
+        for (0..3) |j| {
+            const pair = detSeeds(818_181 +% @as(u64, j));
+            s0[j] = pair[0];
+            s1[j] = pair[1];
+        }
+        const shares = FuzzMulti.query(indices, s0, s1) catch unreachable;
+        var wire: [2][24]u8 = undefined;
+        for (0..2) |p| {
+            var words: [6]FuzzMulti.Word = undefined;
+            FuzzMulti.answer(@intCast(p), shares[p], database, &words) catch unreachable;
+            FuzzPir.answerToBytes(&words, &wire[p]) catch unreachable;
+        }
+        return wire;
+    }
+
+    fn build(self: *MultiReconCorpus) []const []const u8 {
+        var w = self.honest();
+        self.push(&w[0], &w[1], record_len, 3 * record_len); // the k records
+        // One octet of server 0's block 2 changed: right lengths, wrong
+        // records, accepted — the base protocol has no integrity check.
+        var tampered = w[0];
+        tampered[10] ^= 0x20;
+        self.push(&tampered, &w[1], record_len, 3 * record_len);
+        // `records_out` sized for one record instead of k: RecordsLengthMismatch.
+        self.push(&w[0], &w[1], record_len, record_len);
+        // Server 1's answer one block short: AnswerLengthMismatch.
+        self.push(&w[0], w[1][0..16], record_len, 3 * record_len);
+        // The widest geometry the buffers allow: 32-octet records, 3×8 words.
+        const wide = [_]u8{0x5a} ** 96;
+        self.push(&wide, &wide, 32, 96);
+        // ⛔ The all-zero geometry, which SUCCEEDS: `answerWords(0)` is 0 and
+        // `k * 0` is 0, so every length check compares 0 with 0. This is the
+        // input the collapsed harness ran on every round, and a guard that
+        // only counted accepts would have called it a pass.
+        self.push("", "", 0, 0);
+        self.push("", "", 4, 12); // the same buffers against a real geometry
+        return self.entries[0..self.n];
+    }
+};
 
 fn fuzzMultiReconstruct(_: void, smith: *std.testing.Smith) !void {
     // Two attacker-chosen answer buffers of attacker-chosen length, an
@@ -2335,12 +2909,14 @@ fn fuzzMultiReconstruct(_: void, smith: *std.testing.Smith) !void {
     // off the end of a buffer.
     var b0: [192]u8 = undefined;
     var b1: [192]u8 = undefined;
-    smith.bytes(&b0);
-    smith.bytes(&b1);
-    const l0: usize = smith.valueRangeAtMost(u8, 0, b0.len);
-    const l1: usize = smith.valueRangeAtMost(u8, 0, b1.len);
-    const record_len: usize = smith.valueRangeAtMost(u8, 0, 32);
-    const out_len: usize = smith.valueRangeAtMost(u8, 0, 96);
+    // ⚠ Slices, then two `value(u64)` knobs — see `fuzzReconstruct`. All four
+    // quantities used to be the range minimum, i.e. 0/0/0/0, and that is a
+    // geometry `reconstructFromBytes` ACCEPTS, so the assertions below held
+    // vacuously on every round the target had ever run.
+    const l0: usize = smith.slice(&b0);
+    const l1: usize = smith.slice(&b1);
+    const record_len: usize = @intCast(smith.value(u64) % 33);
+    const out_len: usize = @intCast(smith.value(u64) % 97);
     var rec: [96]u8 = undefined;
 
     FuzzMulti.reconstructFromBytes(b0[0..l0], b1[0..l1], record_len, rec[0..out_len]) catch return;
@@ -2351,5 +2927,41 @@ fn fuzzMultiReconstruct(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqual(3 * record_len, out_len);
 }
 test "fuzz multi-index reconstruct never panics" {
-    try std.testing.fuzz({}, fuzzMultiReconstruct, .{});
+    var corpus: MultiReconCorpus = .{};
+    try std.testing.fuzz({}, fuzzMultiReconstruct, .{ .corpus = corpus.build() });
+}
+
+test "corpus: the multi-index reconstruct seeds carry real answers, counts pinned" {
+    var corpus: MultiReconCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var octets: usize = 0;
+    var honest_ok: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var b0: [192]u8 = undefined;
+        var b1: [192]u8 = undefined;
+        const l0: usize = smith.slice(&b0);
+        const l1: usize = smith.slice(&b1);
+        if (l0 != 0) nonempty += 1;
+        const record_len: usize = @intCast(smith.value(u64) % 33);
+        const out_len: usize = @intCast(smith.value(u64) % 97);
+        var rec: [96]u8 = undefined;
+        FuzzMulti.reconstructFromBytes(b0[0..l0], b1[0..l1], record_len, rec[0..out_len]) catch continue;
+        accepted += 1;
+        octets += out_len;
+        if (record_len == MultiReconCorpus.record_len and out_len == 3 * record_len) {
+            var all = true;
+            for (MultiReconCorpus.indices, 0..) |idx, j| {
+                const want = corpus.db_bytes[idx * record_len ..][0..record_len];
+                if (!std.mem.eql(u8, rec[j * record_len ..][0..record_len], want)) all = false;
+            }
+            if (all) honest_ok += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 5), nonempty);
+    try testing.expectEqual(@as(usize, 4), accepted);
+    try testing.expectEqual(@as(usize, 132), octets);
+    try testing.expectEqual(@as(usize, 1), honest_ok);
 }

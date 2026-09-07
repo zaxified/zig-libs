@@ -325,7 +325,7 @@ const module_list = [_]Module{
     .{ .name = "xdp-classifier", .libs = &.{"net"}, .deps = &.{"ebpf"} },
     .{ .name = "ecvrf", .libs = &.{"crypto"}, .deps = &.{"ct25519"} },
     .{ .name = "fss", .libs = &.{"crypto"} },
-    .{ .name = "pir", .libs = &.{"crypto"}, .deps = &.{"fss"} },
+    .{ .name = "pir", .libs = &.{"crypto"}, .deps = &.{"fss"}, .test_deps = &.{"testkit"} },
     .{ .name = "bfv", .libs = &.{"crypto"}, .deps = &.{"entropy"} },
     .{ .name = "groth16", .libs = &.{"crypto"}, .deps = &.{"bn254"} },
     // Not heavy: the parameter derivation + all 30 tests run in 5s under
