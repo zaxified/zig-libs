@@ -488,6 +488,8 @@ fn fuzzFeFromBytes(_: void, smith: *std.testing.Smith) !void {
 test "corpus: the Fe seeds drive every knob, and the counts are pinned" {
     var accepted: usize = 0;
     var boundary: usize = 0;
+    var offset: usize = 0;
+    var plus_one: usize = 0;
     var little: usize = 0;
     for (fe_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
@@ -496,7 +498,12 @@ test "corpus: the Fe seeds drive every knob, and the counts are pinned" {
         if (smith.value(bool)) {
             boundary += 1;
             s = std.mem.toBytes(std.mem.nativeToBig(u256, field_order));
-            if (smith.value(bool)) s[Fe.encoded_length - 1] +%= if (smith.value(bool)) 1 else 0xff;
+            if (smith.value(bool)) {
+                offset += 1;
+                const plus = smith.value(bool);
+                if (plus) plus_one += 1;
+                s[Fe.encoded_length - 1] +%= if (plus) 1 else 0xff;
+            }
         }
         const endian: std.builtin.Endian = if (smith.value(bool)) .big else .little;
         if (endian == .little) little += 1;
@@ -510,6 +517,13 @@ test "corpus: the Fe seeds drive every knob, and the counts are pinned" {
     try std.testing.expectEqual(@as(usize, 3), boundary);
     try std.testing.expectEqual(@as(usize, 2), little);
     try std.testing.expectEqual(@as(usize, 4), accepted);
+    // The two knobs INSIDE the boundary branch, pinned separately rather than
+    // left to be inferred from `accepted`: without them a seed list that
+    // stopped exercising `p - 1` and `p + 1` — the two values the whole bias
+    // exists to produce — could keep every number above unchanged by trading
+    // one refusal for another.
+    try std.testing.expectEqual(@as(usize, 2), offset); // the `p - 1` and `p + 1` seeds
+    try std.testing.expectEqual(@as(usize, 1), plus_one); // of which one adds 1, one 0xff
 }
 
 /// ⛔ A LOCAL COPY of `testkit.fuzz.seed`, and it has to be one. Enrolling this

@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — Test-only follow-up to the 2026-09-07 entry below, which
+  fixed one knob per harness and left a second one dead. `fuzzFromSec1`'s tag
+  selector has a `4 =>` branch that draws an ARBITRARY octet with
+  `smith.value(u8)`, and no seed carried the word that draw reads — so it read
+  an exhausted input and returned the range minimum, `0x00`, on every replay.
+  The seed labelled "an arbitrary tag octet" was therefore byte-identical in
+  effect to the `tag == 0` seed beside it, while the guard test recorded the
+  branch as taken, because `tags_seen[4]` says the branch RAN and says nothing
+  about what it drew. Two seeds now carry that word (`0x99`, and `0x02` over a
+  body that matches it), and the guard pins the number of distinct octets the
+  branch actually wrote. `fuzzFeFromBytes`'s two inner boundary knobs
+  (`offset`, `plus`) were already alive but only pinned indirectly through
+  `accepted`; they are now counted and pinned in their own right. No API,
+  wire or production change.
+
 - **2026-09-07** — Test-only, no production change: all three fuzz targets ran one input,
   and two of them had branches that had never executed. `fuzzFromSec1` and
   `fuzzBip340Verify` each opened `smith.bytes(...)` and then drew a length with

@@ -766,18 +766,33 @@ test "recoverY / lift_x matches std" {
 /// word the knob is dead on a corpus replay and would rewrite `buf[0]` to 0 on
 /// every seed, turning each of them into the identity encoding.
 const Sec1Corpus = struct {
-    store: [10 * (4 + 65 + 8)]u8 = undefined,
+    store: [11 * (4 + 65 + 16)]u8 = undefined,
     used: usize = 0,
-    entries: [10][]const u8 = undefined,
+    entries: [11][]const u8 = undefined,
     n: usize = 0,
 
     /// `tag`: 0..3 rewrite `buf[0]` to `0`/`2`/`3`/`4`, 4 draws an arbitrary
     /// octet, 5 leaves the frame alone.
     fn push(self: *Sec1Corpus, frame: []const u8, tag: u64) void {
+        self.pushWith(frame, tag, null);
+    }
+
+    /// ⛔ `tag == 4` opens a SECOND knob — `smith.value(u8)`, which decides
+    /// the arbitrary octet `buf[0]` becomes — and a seed that stops after the
+    /// tag word leaves it reading an exhausted input, i.e. the range minimum,
+    /// i.e. `0x00`. Measured 2026-09-08: the seed labelled "an arbitrary tag
+    /// octet" produced `0x00` on every replay, indistinguishable from the
+    /// `tag == 0` seed beside it, while the guard below still recorded the
+    /// branch as taken. `octet` is the word that knob reads.
+    fn pushWith(self: *Sec1Corpus, frame: []const u8, tag: u64, octet: ?u64) void {
         const start = self.used;
         var at = start + fuzzSeedIntoLocal(self.store[start..], frame).len;
         std.mem.writeInt(u64, self.store[at..][0..8], tag, .little);
         at += 8;
+        if (octet) |o| {
+            std.mem.writeInt(u64, self.store[at..][0..8], o, .little);
+            at += 8;
+        }
         self.entries[self.n] = self.store[start..at];
         self.used = at;
         self.n += 1;
@@ -800,7 +815,10 @@ const Sec1Corpus = struct {
         bad_x[1] ^= 0x01; // an x with no square y: `recoverY` must refuse
         self.push(&bad_x, 5);
         self.push(comp[0..16], 5); // truncated mid-x
-        self.push(&uncomp, 4); // an arbitrary tag octet
+        self.pushWith(&uncomp, 4, 0x99); // an arbitrary tag octet, really drawn
+        self.pushWith(&comp, 4, 0x02); // ...and one that lands back on a VALID
+        // tag over a body that matches it: the arbitrary-octet branch is not
+        // only a refusal path
         self.push("", 5); // and the input this target used to run for ever
         return self.entries[0..self.n];
     }
@@ -831,6 +849,14 @@ fn fuzzFromSec1(_: void, smith: *std.testing.Smith) !void {
     _ = Secp256k1.fromSec1(buf[0..len]) catch {};
 }
 
+fn distinctOctets(flags: []const bool) usize {
+    var n: usize = 0;
+    for (flags) |f| {
+        if (f) n += 1;
+    }
+    return n;
+}
+
 test "corpus: every SEC1 seed reaches the decoder, and the counts are pinned" {
     var corpus: Sec1Corpus = .{};
     var nonempty: usize = 0;
@@ -842,6 +868,7 @@ test "corpus: every SEC1 seed reaches the decoder, and the counts are pinned" {
     var seen: [4][33]u8 = undefined;
     var distinct: usize = 0;
     var tags_seen: [6]bool = @splat(false);
+    var octets: [256]bool = @splat(false);
     for (corpus.build()) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var buf: [65]u8 = undefined;
@@ -858,6 +885,7 @@ test "corpus: every SEC1 seed reaches the decoder, and the counts are pinned" {
                 4 => smith.value(u8),
                 else => buf[0],
             };
+            if (which == 4) octets[buf[0]] = true;
         }
         const p = Secp256k1.fromSec1(buf[0..len]) catch continue;
         accepted += 1;
@@ -872,13 +900,33 @@ test "corpus: every SEC1 seed reaches the decoder, and the counts are pinned" {
         }
     }
     try std.testing.expectEqual(corpus.n - 1, nonempty); // all but the empty seed
-    try std.testing.expectEqual(@as(usize, 4), accepted);
+    try std.testing.expectEqual(@as(usize, 5), accepted);
     try std.testing.expectEqual(@as(usize, 3), distinct);
     // The tag knob is alive on a corpus replay, not pinned at 0.
     try std.testing.expectEqual(true, tags_seen[1]);
     try std.testing.expectEqual(true, tags_seen[3]);
     try std.testing.expectEqual(true, tags_seen[4]);
     try std.testing.expectEqual(true, tags_seen[5]);
+    // ⛔ And the SECOND knob, behind `which == 4`. `tags_seen[4]` above says
+    // the branch was TAKEN; it says nothing about what the branch drew, and
+    // until 2026-09-08 the answer was `0x00` on every seed because no seed
+    // carried the word `smith.value(u8)` reads. Distinct octets actually
+    // written into `buf[0]` is the number that notices.
+    try std.testing.expectEqual(@as(usize, 2), distinctOctets(&octets)); // 0x99 and 0x02
+
+    // The "before" state, executable rather than asserted in prose: a seed
+    // that stops after the tag word leaves `smith.value(u8)` reading an
+    // exhausted input, and a `Smith` scalar draw over one returns its range
+    // minimum. So the "arbitrary tag octet" seed drew 0x00 — 1 distinct
+    // octet, and the same rewrite the `tag == 0` seed beside it performs.
+    var before: Sec1Corpus = .{};
+    const g_uncomp = Secp256k1.basePoint.toUncompressedSec1();
+    before.push(&g_uncomp, 4);
+    var bsmith: std.testing.Smith = .{ .in = before.entries[0] };
+    var bbuf: [65]u8 = undefined;
+    try std.testing.expectEqual(@as(u32, 65), bsmith.slice(&bbuf));
+    try std.testing.expectEqual(@as(u8, 4), bsmith.valueRangeAtMost(u8, 0, 5));
+    try std.testing.expectEqual(@as(u8, 0), bsmith.value(u8));
 }
 
 /// ⛔ A LOCAL COPY of `testkit.fuzz.seedInto`, and it has to be one. Enrolling this
