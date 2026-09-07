@@ -30,6 +30,10 @@ const TCA = qdisc.TCA;
 const ratespec = @import("ratespec.zig");
 const Psched = ratespec.Psched;
 
+// Test-only (`build.zig`'s `test_deps`, never `deps`): the fuzz corpus seed
+// helpers, in the format `std.testing.Smith` actually reads.
+const testkit = @import("testkit");
+
 const action = @import("action.zig");
 const ActionSpec = action.ActionSpec;
 const ActionList = action.ActionList;
@@ -785,19 +789,237 @@ test "u32 rejects an oversized key list" {
     try testing.expectError(error.TooManyKeys, appendU32Options(.{ .keys = many }, gpa, &list, test_ps));
 }
 
+/// Classifier `TCA_OPTIONS` bodies and whole `RTM_NEWTFILTER` payloads for
+/// `fuzzParseFilter`, laid out the way its draws read them: a `testkit.fuzz`
+/// slice seed (u32 length + frame) and then an eight-octet little-endian word
+/// carrying the `tcmsg.info` value handed to `parseInfo`.
+///
+/// ⭐ Built at run time by this file's own encoders rather than quoted as hex:
+/// a classifier option is a netlink TLV whose length and scalars are HOST byte
+/// order, so a hex corpus would be a little-endian one and the counts pinned
+/// below would be false on a big-endian target instead of failing there.
+///
+/// ⛔ The `info` word is not decoration. `parseInfo` splits a `tcmsg.info`
+/// into a priority and an ethertype, and it used to be fed
+/// `smith.value(u32)` — a draw made AFTER the byte draw had eaten the seed,
+/// so it read **0 on every seed** and the one input this target ever ran
+/// asked for prio 0 / ethertype 0. It travels in the seed now.
+const FilterCorpus = struct {
+    scratch: [8192]u8 = undefined,
+    store: [8192]u8 = undefined,
+    used: usize = 0,
+    entries: [12][]const u8 = undefined,
+    infos: [12]u32 = undefined,
+    n: usize = 0,
+
+    fn push(self: *FilterCorpus, frame: []const u8, info: u32) void {
+        const head = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        std.mem.writeInt(u64, self.store[self.used + head.len ..][0..8], info, .little);
+        self.entries[self.n] = self.store[self.used..][0 .. head.len + 8];
+        self.infos[self.n] = info;
+        self.used += head.len + 8;
+        self.n += 1;
+    }
+
+    /// A `struct tcmsg` header, which is what `parseFilter` takes in front of
+    /// the attribute list. Written here rather than borrowed from
+    /// `message.appendTcmsg` because `message.zig` imports this file.
+    fn tcmsg(
+        gpa: std.mem.Allocator,
+        list: *std.ArrayList(u8),
+        ifindex: u32,
+        h: Handle,
+        parent: Handle,
+        info: u32,
+    ) !void {
+        var hdr: [qdisc.tcmsg_len]u8 = @splat(0);
+        std.mem.writeInt(i32, hdr[4..8], @bitCast(ifindex), native_endian);
+        std.mem.writeInt(u32, hdr[8..12], h.raw, native_endian);
+        std.mem.writeInt(u32, hdr[12..16], parent.raw, native_endian);
+        std.mem.writeInt(u32, hdr[16..20], info, native_endian);
+        try codec.appendPadded(gpa, list, &hdr);
+    }
+
+    fn build(self: *FilterCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+        const info_http = makeInfo(10, ETH_P.IP);
+
+        // ── option bodies ──────────────────────────────────────────────────
+        // A u32 selector with two keys, a classid and an action list — the
+        // three parts of `parseU32Options` that a bare selector never reaches.
+        var u32_opts: std.ArrayList(u8) = .empty;
+        try appendU32Options(.{
+            .classid = Handle.init(1, 0x10),
+            .keys = &.{
+                U32Key.ipv4Dst(.{ 10, 0, 0, 1 }, 32),
+                U32Key.word(0xff00_0000, 0x0000_0006, 8),
+            },
+            .actions = &.{.{ .gact = .{ .action = .shot } }},
+        }, gpa, &u32_opts, test_ps);
+        self.push(u32_opts.items, info_http);
+
+        // flower, IPv4, with ports and an action.
+        var fl4: std.ArrayList(u8) = .empty;
+        try appendFlowerOptions(.{
+            .eth_type = ETH_P.IP,
+            .ip_proto = IPPROTO.TCP,
+            .ipv4_src = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 },
+            .ipv4_dst = .{ .addr = .{ 192, 168, 1, 1 }, .prefix_len = 32 },
+            .src_port = 12345,
+            .dst_port = 80,
+            .classid = Handle.init(1, 0x20),
+            .flags = 1,
+            .actions = &.{.{ .gact = .{ .action = .shot } }},
+        }, gpa, &fl4, test_ps);
+        self.push(fl4.items, info_http);
+
+        // flower, IPv6 — the only path that reads a 16-octet key.
+        var fl6: std.ArrayList(u8) = .empty;
+        try appendFlowerOptions(.{
+            .eth_type = ETH_P.IPV6,
+            .ip_proto = IPPROTO.UDP,
+            .ipv6_src = .{ .addr = @splat(0x20), .prefix_len = 64 },
+            .ipv6_dst = .{ .addr = @splat(0xfe), .prefix_len = 128 },
+            .src_port = 53,
+            .dst_port = 53,
+        }, gpa, &fl6, test_ps);
+        self.push(fl6.items, makeInfo(1, ETH_P.IPV6));
+
+        // ── whole tcmsg payloads, which is what a dump hands `parseFilter` ──
+        var f_u32: std.ArrayList(u8) = .empty;
+        try tcmsg(gpa, &f_u32, 2, Handle.fromRaw(0x800_0800), Handle.init(1, 0), info_http);
+        try codec.appendAttrString(gpa, &f_u32, TCA.KIND, "u32");
+        try codec.appendAttr(gpa, &f_u32, TCA.OPTIONS, u32_opts.items);
+        self.push(f_u32.items, info_http);
+
+        var f_flower: std.ArrayList(u8) = .empty;
+        try tcmsg(gpa, &f_flower, 2, Handle.fromRaw(1), Handle.clsact, info_http);
+        try codec.appendAttrString(gpa, &f_flower, TCA.KIND, "flower");
+        try codec.appendAttr(gpa, &f_flower, TCA.OPTIONS, fl4.items);
+        self.push(f_flower.items, info_http);
+
+        // A classifier this module does not model: KIND is copied, OPTIONS is
+        // left alone and `actionAttrId` returns null.
+        var f_matchall: std.ArrayList(u8) = .empty;
+        try tcmsg(gpa, &f_matchall, 2, Handle.fromRaw(1), Handle.clsact, info_http);
+        try codec.appendAttrString(gpa, &f_matchall, TCA.KIND, "matchall");
+        try codec.appendAttr(gpa, &f_matchall, TCA.OPTIONS, &[_]u8{ 8, 0, 1, 0, 1, 0, 0, 0 });
+        self.push(f_matchall.items, info_http);
+
+        // ── attributes that arrive with the WRONG length ───────────────────
+        // Every `if (a.data.len == N)` here is a bound only a malformed reply
+        // reaches; a well-formed capture cannot exercise one.
+        var u32_short: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &u32_short, TCA_U32.CLASSID, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &u32_short, TCA_U32.SEL, &[_]u8{0} ** 8);
+        self.push(u32_short.items, 0xffff_ffff);
+
+        // A selector whose declared `nkeys` is 8 but whose payload holds one
+        // and a half — the `off + tc_u32_key_len <= a.data.len` loop bound.
+        var u32_partial: std.ArrayList(u8) = .empty;
+        {
+            var sel: [tc_u32_sel_len + tc_u32_key_len + 8]u8 = @splat(0);
+            sel[0] = TC_U32.TERMINAL;
+            sel[2] = 8; // nkeys the kernel claims
+            try codec.appendAttr(gpa, &u32_partial, TCA_U32.SEL, &sel);
+        }
+        self.push(u32_partial.items, 0);
+
+        var flower_short: std.ArrayList(u8) = .empty;
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_ETH_TYPE, &[_]u8{0} ** 1);
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_IP_PROTO, &.{});
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_IPV4_SRC, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_IPV6_SRC, &[_]u8{0} ** 8);
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.KEY_TCP_SRC, &[_]u8{0} ** 1);
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.FLAGS, &[_]u8{0} ** 2);
+        try codec.appendAttr(gpa, &flower_short, TCA_FLOWER.CLASSID, &[_]u8{0} ** 3);
+        self.push(flower_short.items, 0x0800_0001);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A payload one octet short of `struct tcmsg`.
+        self.push(&([_]u8{0} ** (qdisc.tcmsg_len - 1)), 0);
+        // A KIND string one octet past `qdisc.kind_max`.
+        var long_kind: std.ArrayList(u8) = .empty;
+        try tcmsg(gpa, &long_kind, 2, Handle.unspec, Handle.clsact, 0);
+        try codec.appendAttrString(gpa, &long_kind, TCA.KIND, "0123456789abcdefg");
+        self.push(long_kind.items, 0);
+        // An attribute header declaring 0x40 octets over a 2-octet buffer.
+        self.push(&[_]u8{ 0x40, 0x00 }, 0);
+
+        return self.entries[0..self.n];
+    }
+};
+
 test "fuzz: filter parsers never crash on arbitrary payloads" {
-    try testing.fuzz({}, fuzzParseFilter, .{});
+    var corpus: FilterCorpus = .{};
+    try testing.fuzz({}, fuzzParseFilter, .{ .corpus = try corpus.build() });
 }
 
 fn fuzzParseFilter(_: void, smith: *std.testing.Smith) !void {
-    var raw: [256]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // 1024, not 256: a u32 selector carrying the kernel's maximum key count is
+    // 16 + 128*16 octets, and a seed longer than the buffer is not a big seed
+    // — `Smith.slice` reads it back as the EMPTY one.
+    var raw: [1024]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and all three parsers were handed an EMPTY
+    // slice with the filter sitting unread in `raw`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 12 seeds non-empty,
+    // 0 u32 keys decoded, 0 flower fields decoded and 0 kinds read before;
+    // 12 of 12 non-empty, 3 keys, 18 flower fields and 3 kinds after.**
+    // `parseU32Options` and `parseFlowerOptions` both SUCCEED on the empty
+    // slice — an empty options body is a legal classifier reply — so an
+    // acceptance count called this harness healthy while it walked nothing.
+    const len: usize = smith.slice(&raw);
     const buf = raw[0..len];
     if (parseU32Options(buf)) |_| {} else |_| {}
     if (parseFlowerOptions(buf)) |_| {} else |_| {}
-    if (parseFilter(buf)) |_| {} else |_| {}
-    _ = parseInfo(smith.value(u32));
+    if (parseFilter(buf)) |f| std.mem.doNotOptimizeAway(f.kind().len) else |_| {}
+    // ⚠ `value(u64)` truncated, not `value(u32)`: a `u32` draw reads eight
+    // input octets as a little-endian u64 and only survives if the whole word
+    // fits in 32 bits, so it was 0 for every seed. The word travels in the
+    // seed's tail now.
+    _ = parseInfo(@truncate(smith.value(u64)));
+}
+
+test "corpus: every filter seed reaches the parsers, and the decoded counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets. `nonempty` is the reach claim and the only
+    // check that catches a seed grown past the harness's buffer, which
+    // `Smith.slice` reads back as the EMPTY one, silently. `keys`, `flower`
+    // and `kinds` are the numbers an empty options body cannot produce, and
+    // `infos` pins that the `tcmsg.info` word arrived as written — without it
+    // the `parseInfo` half of the harness silently goes back to asking about 0.
+    var corpus: FilterCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var keys: usize = 0;
+    var flower: usize = 0;
+    var kinds: usize = 0;
+    var infos: usize = 0;
+    for (entries, corpus.infos[0..corpus.n]) |sd, want_info| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [1024]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const buf = raw[0..len];
+        if (parseU32Options(buf)) |w| keys += w.keys_len else |_| {}
+        if (parseFlowerOptions(buf)) |w| flower += qdisc.optionalsSet(w) else |_| {}
+        if (parseFilter(buf)) |f| {
+            if (f.kind().len != 0) kinds += 1;
+        } else |_| {}
+        const info: u32 = @truncate(smith.value(u64));
+        if (info == want_info) infos += 1;
+        std.mem.doNotOptimizeAway(parseInfo(info));
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 3), keys);
+    try testing.expectEqual(@as(usize, 18), flower);
+    try testing.expectEqual(@as(usize, 3), kinds);
+    try testing.expectEqual(entries.len, infos);
 }
 
 test "the v2 entry points keep working unchanged (source compatibility)" {

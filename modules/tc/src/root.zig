@@ -802,15 +802,280 @@ test "errno mapping is netlink's (the tc-local copy is gone)" {
     try testing.expectEqual(error.Unexpected, netlink.writeErrorFromCode(std.math.minInt(i32)));
 }
 
-test "fuzz: parseQdisc never crashes on arbitrary payloads" {
-    try testing.fuzz({}, fuzzParseQdisc, .{});
+/// The sequence number every message in `DumpCorpus` carries, and the port id
+/// `classifyDumpMessage` is asked to match it against. A message built here
+/// has `pid == 0`, so 0 is the identity that makes the triage return `.record`
+/// rather than `.skip`.
+const dump_seq: u32 = 0x1234_5678;
+const dump_portid: u32 = 0;
+
+/// Whole `RTM_GET*` **reply datagrams** for `fuzzDumpParse`, in the format
+/// `Smith.slice` reads (see `testkit.fuzz`): a little-endian u32 length, then
+/// the frame.
+///
+/// ⭐ This target used to be `parseQdisc` on a bare payload, which is what
+/// `qdisc.fuzzParseOptions` already does. What was untested is the half of
+/// `Socket.dump` above the syscall: the `nlmsghdr` framing, the multi-part
+/// triage, and the decision to hand a payload to a parser at all. That is what
+/// runs here, over datagrams this module's own builders produce — netlink
+/// messages are length-prefixed and 4-byte aligned, so a hand-edited literal
+/// is refused at the header and a hex corpus would be a little-endian one.
+const DumpCorpus = struct {
+    scratch: [32768]u8 = undefined,
+    store: [32768]u8 = undefined,
+    used: usize = 0,
+    entries: [10][]const u8 = undefined,
+    n: usize = 0,
+
+    fn push(self: *DumpCorpus, frame: []const u8) void {
+        const sd = testkit.fuzz.seedInto(self.store[self.used..], frame);
+        self.entries[self.n] = sd;
+        self.used += sd.len;
+        self.n += 1;
+    }
+
+    fn build(self: *DumpCorpus) ![]const []const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(&self.scratch);
+        const gpa = fba.allocator();
+        const ps = ratespec.golden_psched;
+
+        // A two-message qdisc dump followed by NLMSG_DONE — the ordinary
+        // shape, and the only one that exercises "record, record, done".
+        var qd: std.ArrayList(u8) = .empty;
+        {
+            const a = try message.buildQdiscSet(gpa, dump_seq, .add, .{
+                .ifindex = 2,
+                .handle = Handle.init(1, 0),
+                .parent = Handle.root,
+            }, .{ .netem = .{ .delay_ns = 50_000_000, .loss_pct = 1 } }, ps);
+            try qd.appendSlice(gpa, a);
+            const b = try message.buildQdiscSet(gpa, dump_seq, .add, .{
+                .ifindex = 2,
+                .handle = Handle.init(0x8001, 0),
+                .parent = Handle.init(1, 1),
+            }, .{ .fq_codel = .{ .limit = 10240, .target_us = 5000 } }, ps);
+            try qd.appendSlice(gpa, b);
+            try appendControl(gpa, &qd, codec.NLMSG_DONE, &.{});
+        }
+        self.push(qd.items);
+
+        // A class dump: htb, so the datagram carries the two 1 KiB rate
+        // tables — the largest frame this module can produce, and the reason
+        // the harness's buffer is 8192 and not 256.
+        var cd: std.ArrayList(u8) = .empty;
+        {
+            const a = try message.buildClassSet(gpa, dump_seq, .add, .{
+                .ifindex = 2,
+                .handle = Handle.init(1, 0x10),
+                .parent = Handle.init(1, 0),
+            }, .{ .htb = .{ .rate = 5_000_000_000, .ceil = 10_000_000_000, .prio = 1 } }, ps);
+            try cd.appendSlice(gpa, a);
+            try appendControl(gpa, &cd, codec.NLMSG_DONE, &.{});
+        }
+        self.push(cd.items);
+
+        // A filter dump: u32 with an action list, then flower.
+        var fd: std.ArrayList(u8) = .empty;
+        {
+            const a = try message.buildFilterSetWith(gpa, dump_seq, .add, .{
+                .ifindex = 2,
+                .parent = Handle.init(1, 0),
+                .prio = 10,
+                .eth_type = filter.ETH_P.IP,
+            }, .{ .u32 = .{
+                .classid = Handle.init(1, 0x10),
+                .keys = &.{filter.U32Key.ipv4Dst(.{ 10, 0, 0, 1 }, 32)},
+                .actions = &.{.{ .gact = .{ .action = .shot } }},
+            } }, ps);
+            try fd.appendSlice(gpa, a);
+            const b = try message.buildFilterSetWith(gpa, dump_seq, .add, .{
+                .ifindex = 2,
+                .parent = Handle.clsact,
+                .prio = 1,
+                .eth_type = filter.ETH_P.IPV6,
+            }, .{ .flower = .{
+                .eth_type = filter.ETH_P.IPV6,
+                .ip_proto = filter.IPPROTO.UDP,
+                .dst_port = 53,
+            } }, ps);
+            try fd.appendSlice(gpa, b);
+            try appendControl(gpa, &fd, codec.NLMSG_DONE, &.{});
+        }
+        self.push(fd.items);
+
+        // ── the triage branches a healthy dump never reaches ───────────────
+        // NLMSG_ERROR carrying -EPERM: `.failed`.
+        var err: std.ArrayList(u8) = .empty;
+        {
+            var body: [4]u8 = undefined;
+            std.mem.writeInt(i32, &body, -@as(i32, @intFromEnum(linux.E.PERM)), native_endian);
+            try appendControl(gpa, &err, codec.NLMSG_ERROR, &body);
+        }
+        self.push(err.items);
+
+        // NLMSG_ERROR with a payload too short to hold an errno: `.malformed`.
+        var short_err: std.ArrayList(u8) = .empty;
+        try appendControl(gpa, &short_err, codec.NLMSG_ERROR, &[_]u8{ 0, 0 });
+        self.push(short_err.items);
+
+        // NLMSG_OVERRUN and NLMSG_NOOP: `.overrun` and `.skip`.
+        var overrun: std.ArrayList(u8) = .empty;
+        try appendControl(gpa, &overrun, codec.NLMSG_OVERRUN, &.{});
+        try appendControl(gpa, &overrun, codec.NLMSG_NOOP, &.{});
+        self.push(overrun.items);
+
+        // A record whose seq is somebody else's: `.skip`, the self-healing
+        // path after an aborted earlier dump.
+        var stale: std.ArrayList(u8) = .empty;
+        {
+            const a = try message.buildQdiscSet(gpa, dump_seq +% 1, .add, .{
+                .ifindex = 2,
+                .handle = Handle.init(1, 0),
+                .parent = Handle.root,
+            }, .{ .mq = .{} }, ps);
+            try stale.appendSlice(gpa, a);
+        }
+        self.push(stale.items);
+
+        // A record flagged NLM_F_DUMP_INTR: `.restart`.
+        var intr: std.ArrayList(u8) = .empty;
+        {
+            const hdr = try codec.appendHeader(
+                gpa,
+                &intr,
+                RTM_NEWQDISC,
+                codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR,
+                dump_seq,
+                0,
+            );
+            try message.appendTcmsg(gpa, &intr, 2, Handle.init(1, 0), Handle.root, 0);
+            codec.finishHeader(&intr, hdr);
+        }
+        self.push(intr.items);
+
+        // ── the refusals ───────────────────────────────────────────────────
+        // A header claiming 0x40 octets over a 10-octet datagram, which is
+        // where `MessageIterator` must stop instead of reading on.
+        self.push(&[_]u8{ 0x40, 0x00, 0x00, 0x00, 0x24, 0x00, 0x02, 0x00, 0x00, 0x00 });
+        // A whole message header with no payload behind it: the tcmsg is
+        // missing, so the parser refuses what the framer accepted.
+        var headless: std.ArrayList(u8) = .empty;
+        {
+            const hdr = try codec.appendHeader(gpa, &headless, RTM_NEWQDISC, codec.NLM_F_MULTI, dump_seq, 0);
+            codec.finishHeader(&headless, hdr);
+        }
+        self.push(headless.items);
+
+        return self.entries[0..self.n];
+    }
+
+    fn appendControl(
+        gpa: std.mem.Allocator,
+        list: *std.ArrayList(u8),
+        msg_type: u16,
+        body: []const u8,
+    ) !void {
+        const hdr = try codec.appendHeader(gpa, list, msg_type, codec.NLM_F_MULTI, dump_seq, 0);
+        if (body.len != 0) try codec.appendPadded(gpa, list, body);
+        codec.finishHeader(list, hdr);
+    }
+};
+
+/// What one datagram produced: the numbers a corpus guard can pin, and the
+/// numbers the collapsed harness could never move off zero.
+const DumpTally = struct {
+    messages: usize = 0,
+    records: usize = 0,
+    kinds: usize = 0,
+    controls: usize = 0,
+};
+
+/// The pure half of `Socket.dump`: frame, triage, parse. Shared by the fuzz
+/// target and its corpus guard so the guard measures the same walk.
+fn walkDump(dgram: []const u8) DumpTally {
+    var t: DumpTally = .{};
+    var it: codec.MessageIterator = .{ .buf = dgram };
+    while (it.next() catch return t) |m| {
+        t.messages += 1;
+        switch (codec.classifyDumpMessage(m, dump_portid, dump_seq)) {
+            .record => |rec| {
+                t.records += 1;
+                switch (rec.type) {
+                    RTM_NEWQDISC => if (parseQdisc(rec.payload)) |q| {
+                        if (q.kind().len != 0) t.kinds += 1;
+                    } else |_| {},
+                    RTM_NEWTCLASS => if (qdisc.parseClass(rec.payload)) |c| {
+                        if (c.kind().len != 0) t.kinds += 1;
+                    } else |_| {},
+                    RTM_NEWTFILTER => if (filter.parseFilter(rec.payload)) |f| {
+                        if (f.kind().len != 0) t.kinds += 1;
+                    } else |_| {},
+                    else => {},
+                }
+            },
+            .skip => {},
+            else => t.controls += 1,
+        }
+    }
+    return t;
 }
 
-fn fuzzParseQdisc(_: void, smith: *std.testing.Smith) !void {
-    var raw: [256]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
-    if (parseQdisc(raw[0..len])) |_| {} else |_| {}
+test "fuzz: a dump datagram never crashes the framer, the triage or the parsers" {
+    var corpus: DumpCorpus = .{};
+    try testing.fuzz({}, fuzzDumpParse, .{ .corpus = try corpus.build() });
+}
+
+fn fuzzDumpParse(_: void, smith: *std.testing.Smith) !void {
+    // 8192, not 256: an htb class reply carries two 1 KiB rate tables, so the
+    // largest datagram this module can produce is over 2 KiB — and a seed
+    // longer than the buffer is not a big seed, `Smith.slice` reads it back as
+    // the EMPTY one.
+    var raw: [8192]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and the target parsed an EMPTY slice with
+    // the reply sitting unread in `raw`.
+    //
+    // ⛔ Measured 2026-09-07 over the corpus above: **0 of 10 seeds non-empty,
+    // 0 messages framed, 0 records classified and 0 kinds read before; 10 of
+    // 10 non-empty, 15 messages framed, 6 records, 5 kinds and 7 control
+    // verdicts (done / failed / malformed / overrun / restart) after.**
+    const len: usize = smith.slice(&raw);
+    std.mem.doNotOptimizeAway(walkDump(raw[0..len]));
+}
+
+test "corpus: every dump seed reaches the framer, and the walked counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment, over the
+    // SAME corpus the harness gets, through the SAME `walkDump`. `nonempty` is
+    // the reach claim and the only check that catches a seed grown past the
+    // harness's buffer, which `Smith.slice` reads back as the EMPTY one.
+    //
+    // ⛔ There is no acceptance count here on purpose. An empty datagram is a
+    // legal netlink reply — `MessageIterator` yields nothing and the walk
+    // "succeeds" — so anything phrased as "did it parse" reads 10 of 10 while
+    // the framer never runs. `messages`, `records`, `kinds` and `controls` are
+    // counts of work done, which the empty datagram cannot fake.
+    var corpus: DumpCorpus = .{};
+    const entries = try corpus.build();
+    var nonempty: usize = 0;
+    var total: DumpTally = .{};
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [8192]u8 = undefined;
+        const len: usize = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const t = walkDump(raw[0..len]);
+        total.messages += t.messages;
+        total.records += t.records;
+        total.kinds += t.kinds;
+        total.controls += t.controls;
+    }
+    try testing.expectEqual(entries.len, nonempty);
+    try testing.expectEqual(@as(usize, 15), total.messages);
+    try testing.expectEqual(@as(usize, 6), total.records);
+    try testing.expectEqual(@as(usize, 5), total.kinds);
+    try testing.expectEqual(@as(usize, 7), total.controls);
 }
 
 // ── integration tests (real kernel, live netns round-trip) ──────────────────

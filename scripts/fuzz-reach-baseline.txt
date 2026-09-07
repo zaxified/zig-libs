@@ -109,7 +109,6 @@ sphinx 1
 staticfiles 1
 stun 1
 tar 1
-tc 4
 tenantkex 2
 threshold_ecdsa 3
 timelock_envelope 1
