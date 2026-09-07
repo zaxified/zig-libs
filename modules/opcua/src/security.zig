@@ -1774,16 +1774,132 @@ test "hostile certificates: truncation, tampering and garbage are typed errors, 
     try testing.expectError(error.InvalidCertificate, certificatePublicKey(huge));
 }
 
+/// `testkit.fuzz` — see that module for why a corpus entry is not the frame.
+const fuzz_seed = @import("testkit").fuzz;
+
+/// The DER shapes the hostile-certificate test hand-builds, as corpus seeds.
+/// Everything here is a refusal; the two ACCEPTED inputs are a real
+/// certificate and an OPN header, and neither can be a literal — see
+/// `buildCertificateCorpus`.
+const static_certificate_seeds = [_][]const u8{
+    fuzz_seed.seed(""),
+    fuzz_seed.seed(&.{0x30}),
+    fuzz_seed.seed(&.{ 0x30, 0x82 }), // long form, length bytes missing
+    fuzz_seed.seed(&.{ 0x30, 0x84, 0xff, 0xff, 0xff, 0xff }), // 4 GB SEQUENCE
+    fuzz_seed.seed(&.{ 0x30, 0x80, 0x00, 0x00 }), // BER indefinite length
+    fuzz_seed.seed(&.{ 0x30, 0x02, 0x30, 0x00 }), // SEQUENCE { SEQUENCE {} }
+    fuzz_seed.seed(&.{ 0x30, 0x03, 0x30, 0x01, 0x00 }), // child claims a byte it does not tile
+    fuzz_seed.seed("not a certificate"),
+    // A well-formed OPN chunk body for `viewAsymmetricHeader`: SecureChannelId,
+    // then the SecurityPolicyUri, a two-octet SenderCertificate and a null
+    // (-1) ReceiverCertificateThumbprint. Without this the header scanner in
+    // this target only ever saw inputs shorter than its own 4-octet minimum.
+    fuzz_seed.seed(&[_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x07, 0x00, 0x00, 0x00 } ++ "http://".* ++
+        [_]u8{ 0x02, 0x00, 0x00, 0x00, 0xAA, 0xBB } ++
+        [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF }),
+    // The same, with a SenderCertificate length that runs past the body: the
+    // scanner must return null rather than slice off the end.
+    fuzz_seed.seed(&[_]u8{ 0x01, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0x00, 0x00, 0x00, 0x00 } ++
+        [_]u8{ 0xF0, 0xFF, 0xFF, 0x7F }),
+};
+
+/// The harness buffer, and therefore the largest certificate the corpus can
+/// carry. ⚠ A seed longer than this reads back EMPTY rather than long —
+/// `Smith.slice` falls back to the range minimum — so `buildCertificateCorpus`
+/// asserts the real certificate fits instead of letting it vanish.
+const certificate_fuzz_buf_len = 1024;
+
+/// The corpus `fuzzCertificateParsers` replays, built where the harness's own
+/// test builds it so the guard below cannot drift onto a different corpus.
+/// `stores` and `out` are caller-owned and must outlive the returned slices.
+fn buildCertificateCorpus(
+    certificate_der: []const u8,
+    stores: *[2][4 + certificate_fuzz_buf_len]u8,
+    out: *[2 + static_certificate_seeds.len][]const u8,
+) ![]const []const u8 {
+    try testing.expect(certificate_der.len <= certificate_fuzz_buf_len);
+    out[0] = fuzz_seed.seedInto(&stores[0], certificate_der);
+    out[1] = fuzz_seed.seedInto(&stores[1], certificate_der[0 .. certificate_der.len / 2]);
+    @memcpy(out[2..], &static_certificate_seeds);
+    return out;
+}
+
+/// The credentials both the harness and its guard build their corpus from.
+/// Deterministic PRNG, 512-bit modulus: this is a fixture, not a key.
+fn certificateCorpusCredentials(allocator: std.mem.Allocator) !ClientCredentials {
+    var prng = std.Random.DefaultCsprng.init([_]u8{0x5A} ** 32);
+    return ClientCredentials.generateSelfSigned(allocator, prng.random(), .{
+        .modulus_bits = 512,
+        .common_name = "fuzz-corpus",
+        .not_before = "260101000000Z",
+        .not_after = "270101000000Z",
+        .application_uri = "urn:zig-libs:opcua:fuzz-corpus",
+    });
+}
+
 test "fuzz: arbitrary bytes through the certificate parsers" {
-    try std.testing.fuzz({}, struct {
-        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
-            var buf: [1024]u8 = undefined;
-            smith.bytes(&buf);
-            const n: usize = smith.valueRangeAtMost(u16, 0, buf.len);
-            if (certificatePublicKey(buf[0..n])) |_| {} else |_| {}
-            if (certificateValidity(buf[0..n])) |_| {} else |_| {}
-            // Chunk-shaped input into the header scanner, same contract.
-            _ = viewAsymmetricHeader(buf[0..n]);
-        }
-    }.run, .{});
+    // ⚠ This was an inline `struct { fn … } .run` target, which is the one
+    // shape `check-fuzz-reach` reports as UNJUDGED rather than judging — it
+    // was the last unjudged target in the tree, and it carried exactly the
+    // defect the gate names in its named-function neighbours. Named, so the
+    // gate can see it.
+    var creds = try certificateCorpusCredentials(testing.allocator);
+    defer creds.deinit(testing.allocator);
+    var stores: [2][4 + certificate_fuzz_buf_len]u8 = undefined;
+    var slots: [2 + static_certificate_seeds.len][]const u8 = undefined;
+    const corpus = try buildCertificateCorpus(creds.certificate_der, &stores, &slots);
+    try std.testing.fuzz({}, fuzzCertificateParsers, .{ .corpus = corpus });
+}
+
+fn fuzzCertificateParsers(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [certificate_fuzz_buf_len]u8 = undefined;
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(buf.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM —
+    // so `n` was 0 for every input and all three functions below were called
+    // with the empty slice, for ever. Measured 2026-09-07 over the corpus
+    // above: **0 of 12 seeds non-empty, 0 certificates parsed and 0 headers
+    // scanned before; 11 of 12 non-empty (one seed IS the empty certificate),
+    // 1 parsed and 1 OPN header scanned after.**
+    const n: usize = smith.slice(&buf);
+    if (certificatePublicKey(buf[0..n])) |_| {} else |_| {}
+    if (certificateValidity(buf[0..n])) |_| {} else |_| {}
+    // Chunk-shaped input into the header scanner, same contract.
+    _ = viewAsymmetricHeader(buf[0..n]);
+}
+
+test "corpus: every certificate seed reaches the parsers, and the counts are pinned" {
+    // ⭐ Built from `buildCertificateCorpus`, the same call the harness makes:
+    // a guard that measures a different corpus is not a guard.
+    //
+    // Two numbers, not one. `parsed` alone would be weak — but `viewed` is the
+    // count of OPN bodies the header scanner accepted, and the empty input can
+    // never produce one (it returns null below four octets), so `viewed` is
+    // about reach rather than about legality.
+    var creds = try certificateCorpusCredentials(testing.allocator);
+    defer creds.deinit(testing.allocator);
+    var stores: [2][4 + certificate_fuzz_buf_len]u8 = undefined;
+    var slots: [2 + static_certificate_seeds.len][]const u8 = undefined;
+    const corpus = try buildCertificateCorpus(creds.certificate_der, &stores, &slots);
+
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var viewed: usize = 0;
+    for (corpus) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [certificate_fuzz_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        if (certificatePublicKey(buf[0..n])) |_| parsed += 1 else |_| {}
+        if (viewAsymmetricHeader(buf[0..n]) != null) viewed += 1;
+    }
+    // One seed IS the empty certificate — a legal member of a refusal corpus —
+    // so the reach assertion is against the rest.
+    try testing.expectEqual(corpus.len - 1, nonempty);
+    // Measured 2026-09-07: with the collapsing draw, 0 non-empty, 0 parsed and
+    // 0 viewed; the parsers saw one empty slice twelve times. After:
+    try testing.expectEqual(@as(usize, 1), parsed);
+    try testing.expectEqual(@as(usize, 1), viewed);
 }

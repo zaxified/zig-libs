@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Both fuzz targets had been running one fixed input for their whole
+  existence. `security`'s certificate target was written as an inline
+  `struct { fn run … }.run` — the one shape `check-fuzz-reach` reports as UNJUDGED rather
+  than judging, and it carried exactly the defect the gate names elsewhere: `smith.bytes(&buf)`
+  followed by `smith.valueRangeAtMost(u16, 0, 1024)`, whose ranged draw returns the range
+  MINIMUM because `bytes` has already eaten the octets it needs, so `certificatePublicKey`,
+  `certificateValidity` and `viewAsymmetricHeader` were each called with the empty slice and
+  nothing else. `server`'s `fuzzConnection` was worse: its first draw was `smith.value(bool)`,
+  which is a 1-bit range, so `rig.connect()` had **never run once** outside `--fuzz` and the
+  service layer the target names was unreachable, while all four of its per-round lengths were
+  0 — it fed the connection state machine nothing, four times, from a cold rig. Both are now
+  byte-first `smith.slice` draws with a real corpus and a corpus guard; the connection knob
+  moved INTO the drawn script (first octet), because a knob drawn after the byte draw is dead
+  on a replay. Measured: **certificates 0 of 12 seeds non-empty, 0 parsed, 0 OPN headers
+  scanned → 11 of 12 non-empty, 1 parsed, 1 scanned; connection 0 of 8 scripts fed a byte and
+  0 replies → 8 of 8 fed, 6 replies, 4 from a live session.** No behavior change.
 - **2026-09-07** — The Python `asyncua` interop left the module. It had been a
   ~190-line driver script held as an inline `\\` string literal in
   `src/server_interop.zig` and run with `python3 -c`, so `zig build test-opcua`

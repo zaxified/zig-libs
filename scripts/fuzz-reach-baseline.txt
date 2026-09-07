@@ -44,7 +44,6 @@ netconf 3
 noise 1
 ocsp 2
 ocspcache 2
-opcua 1
 p256 1
 pping 1
 protobuf 2
