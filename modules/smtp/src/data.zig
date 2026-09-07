@@ -442,8 +442,40 @@ test "round-trip property: unstuff(stuff(x)) == x for CRLF-canonical x" {
     }
 }
 
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the bodies it is.
+/// A corpus entry is not the frame: `Smith.slice` reads a little-endian `u32`
+/// length first, so a raw body would arrive minus its own first four octets.
+/// `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// DATA bodies and wire streams, in the format `Smith.slice` reads.
+///
+/// The bodies from the round-trip property test above, the three framing lies
+/// (`bare LF`, `bare CR`, data after the terminator), and — the reason this
+/// corpus exists — the four line-length cases either side of the 1000-octet
+/// `max_line` the harness configures, with and without the transparency dot
+/// that the wave-2 F2 finding was about.
+const dot_seeds = [_][]const u8{
+    seed(".\r\n"), // a single dot line
+    seed("..\r\n"), // a doubled dot: data, not a terminator
+    seed(".\r\n.\r\n.\r\n"), // three of them
+    seed("\r\n\r\n\r\n"), // empty lines only
+    seed("Subject: x\r\n\r\n.\r\nbody\r\n"), // a header block with a dot line inside the body
+    seed("." ** 50 ++ "\r\n"), // 50 dots: only the leading one doubles
+    seed("..\r\n.\r\n"), // wire form: "..\r\n" decodes to ".\r\n", then the terminator
+    seed(".\r\n" ++ "more"), // DataAfterTerminator on the receive side
+    seed("body\n.\n"), // BareLineFeed unless allow_bare_lf
+    seed("a\rb\r\n.\r\n"), // BareCarriageReturn: a framing lie in either mode
+    seed("AAAA\r\nBBBB\r\n.\r\n"), // two short lines and a terminator
+    seed("no trailing newline"), // the stuffer must add the final CRLF itself
+    seed("A" ** 1000 ++ "\r\n"), // exactly max_line on the wire: accepted
+    seed("A" ** 1001 ++ "\r\n"), // LineTooLong: one octet over
+    seed("." ++ "A" ** 998 ++ "\r\n"), // 999 source octets doubling to exactly max_line
+    seed("." ++ "A" ** 999 ++ "\r\n"), // LineTooLong: the doubled dot is what puts it over
+};
+
 test "fuzz: stuffing then un-stuffing is the identity, and neither crashes" {
-    try testing.fuzz({}, fuzzDots, .{});
+    try testing.fuzz({}, fuzzDots, .{ .corpus = &dot_seeds });
 }
 
 fn fuzzDots(_: void, smith: *std.testing.Smith) !void {
@@ -453,14 +485,25 @@ fn fuzzDots(_: void, smith: *std.testing.Smith) !void {
     // so this harness could never exercise the line-length boundary where
     // the stuffer/unstuffer asymmetry lived. 1100 comfortably clears it
     // (worst case a single all-dots line, doubled, still exceeds 1000).
+    // ⚠ And that fix bought NOTHING on its own: the length below was drawn
+    // with `smith.valueRangeAtMost` after a `smith.bytes` that had already
+    // consumed the input, so it was 0 and the harness fed the stuffer an EMPTY
+    // body no matter how large this buffer was. The boundary the F2 note is
+    // about is reached only now, and only because the corpus contains the four
+    // seeds that sit either side of it.
     var raw: [1100]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length -- see above.
+    const len = smith.slice(&raw);
     const input = raw[0..len];
 
     // 1. Arbitrary bytes through the un-stuffer must never crash.
-    {
-        var u: Unstuffer = .init(gpa, .{ .max_line = 64, .max_body = 4096, .allow_bare_lf = smith.value(bool) });
+    // ⚠ `allow_bare_lf` used to be one more draw off the same Smith, taken
+    // AFTER the length. Every draw after a `slice` that consumed the whole
+    // seed returns the weight minimum -- `false` for a bool -- so the lenient
+    // mode would never be entered on a corpus replay. Both are simply tried.
+    for ([_]bool{ false, true }) |bare_lf| {
+        var u: Unstuffer = .init(gpa, .{ .max_line = 64, .max_body = 4096, .allow_bare_lf = bare_lf });
         defer u.deinit();
         _ = u.feed(input) catch {};
     }
@@ -481,6 +524,43 @@ fn fuzzDots(_: void, smith: *std.testing.Smith) !void {
         std.debug.print("round-trip mismatch\n", .{});
         return error.RoundTripFailed;
     }
+}
+
+test "corpus: every dot seed reaches the stuffer, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum), which is silent everywhere else.
+    //
+    // Two counts, because the two halves of the harness disagree on purpose:
+    // the stuffer at `max_line = 1000` takes the long lines, the receiving
+    // `Unstuffer` at `max_line = 64` does not. A single "accepted" would also
+    // be a poor guard here for the reason `bacnet/service` was: `stuffAlloc("")`
+    // succeeds, so the collapsed harness's one and only execution "passed".
+    const gpa = testing.allocator;
+    var nonempty: usize = 0;
+    var stuff_ok: usize = 0;
+    var unstuff_terminated: usize = 0;
+    for (dot_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [1100]u8 = undefined;
+        const len = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const input = raw[0..len];
+        if (stuffAlloc(gpa, input, .{ .max_line = 1000 })) |wire| {
+            gpa.free(wire);
+            stuff_ok += 1;
+        } else |_| {}
+        var u: Unstuffer = .init(gpa, .{ .max_line = 64, .max_body = 4096 });
+        defer u.deinit();
+        if (u.feed(input)) |done| {
+            if (done) unstuff_terminated += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(dot_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 16 seeds non-empty before the draw was fixed
+    // and the stuffer only ever saw the empty body; 16 of 16 after.
+    try testing.expectEqual(@as(usize, 14), stuff_ok);
+    try testing.expectEqual(@as(usize, 3), unstuff_terminated);
 }
 
 /// The CRLF canonicalisation `Stuffer` applies, computed independently so the

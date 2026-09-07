@@ -352,18 +352,87 @@ test "capability count and line length are bounded" {
     try testing.expectEqual(@as(usize, 16), c.lines[0].len);
 }
 
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the EHLO texts it
+/// is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw text would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// LF-joined EHLO reply texts, in the format `Smith.slice` reads.
+///
+/// Every keyword shape the tests above pin: the full Postfix/Exim greeting,
+/// the case-insensitive and unknown-keyword handling, all four `SIZE` forms,
+/// both `AUTH` spellings, a greeting-only reply, and the two limits the
+/// harness's own config makes reachable (`max_lines = 32`, `max_line = 64`).
+const caps_seeds = [_][]const u8{
+    seed("mail.example.com Hello client.example.org [192.0.2.1]\n" ++
+        "SIZE 35882577\n8BITMIME\nPIPELINING\nSTARTTLS\n" ++
+        "AUTH PLAIN LOGIN CRAM-MD5\nENHANCEDSTATUSCODES\nSMTPUTF8\n" ++
+        "CHUNKING\nDSN"), // the Postfix/Exim-shaped greeting the anchor test uses
+    seed("srv\nstarttls\nPiPeLiNiNg\nX-VENDOR-THING param1 param2\nWEIRD!KEYWORD"), // case folding, vendor params, a syntactically invalid keyword
+    seed("srv\nSIZE"), // SIZE advertised with no parameter
+    seed("srv\nSIZE 0"), // SIZE 0: advertised, no maximum
+    seed("srv\nSIZE not-a-number"), // a SIZE parameter that is not a number
+    seed("srv\nSIZE 99999999999999999999999999"), // a SIZE parameter that overflows u64
+    seed("srv\nAUTH=LOGIN PLAIN"), // the legacy AUTH= form
+    seed("srv\nAUTH GSSAPI CRAM-MD5 XOAUTH2"), // only mechanisms this module cannot perform
+    seed("mail.example.com at your service"), // a greeting and no capabilities at all
+    seed("srv\nX-LONG " ++ "A" ** 100), // a line past max_line: truncated, not refused
+    seed("srv" ++ "\nX-CAP" ** 40), // TooManyCapabilities: 40 lines past max_lines of 32
+    seed("srv\n\n\n\n"), // empty capability lines
+    seed("\n\n"), // nothing but separators: the domain is empty
+};
+
 test "fuzz: arbitrary EHLO text never crashes or leaks" {
-    try testing.fuzz({}, fuzzCaps, .{});
+    try testing.fuzz({}, fuzzCaps, .{ .corpus = &caps_seeds });
 }
 
 fn fuzzCaps(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and `parse` was handed an empty text with
+    // the seed sitting unread in `raw`.
+    const len = smith.slice(&raw);
     var caps = parse(gpa, raw[0..len], .{ .max_lines = 32, .max_line = 64 }) catch return;
     defer caps.deinit();
     _ = caps.has("STARTTLS");
     _ = caps.params("SIZE");
     _ = caps.sizeExceeded(1234);
+}
+
+test "corpus: every EHLO seed reaches the parser, and what it parsed is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum), which is silent everywhere else.
+    //
+    // ⚠ "Accepted" is nearly worthless as a measure HERE and the number is kept
+    // only so a future refusal is noticed: `parse` accepts the empty string and
+    // accepts arbitrary unknown keywords by design, so a corpus of pure noise
+    // would score almost 100% "accepted" while reaching nothing -- exactly how
+    // `bacnet/service` once scored 19 of 19. The number that actually says the
+    // parser did work is the second one: how many capability LINES it
+    // recognised across the whole corpus, which drops the moment a keyword
+    // stops being split out.
+    const gpa = testing.allocator;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    var total_lines: usize = 0;
+    for (caps_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        var caps = parse(gpa, raw[0..len], .{ .max_lines = 32, .max_line = 64 }) catch continue;
+        defer caps.deinit();
+        accepted += 1;
+        total_lines += caps.lines.len;
+    }
+    try testing.expectEqual(caps_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 13 seeds non-empty, 0 accepted and 0 capability
+    // lines before the draw was fixed; 13 of 13 non-empty after.
+    try testing.expectEqual(@as(usize, 12), accepted);
+    try testing.expectEqual(@as(usize, 20), total_lines);
 }

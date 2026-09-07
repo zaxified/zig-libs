@@ -525,16 +525,56 @@ test "addressLiteral formats what ehlo accepts" {
     _ = try ehlo(&buf, v6, .{});
 }
 
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the arguments it
+/// is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw argument would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// Command arguments, in the format `Smith.slice` reads. The harness hands
+/// each one to every builder, so a single string plays domain and mailbox by
+/// turns -- which is the point: `ehlo` accepts what `rcpt` refuses.
+///
+/// A mailbox is a grammar (dot-atom or quoted string, `@`, then a domain or an
+/// address literal, under three separate length ceilings) and a domain is
+/// another one; uniform random octets satisfy neither, so before this the
+/// harness could only ever demonstrate `InvalidAddress` / `InvalidDomain`.
+/// These are the strings the value tests above already chose as the boundary.
+const command_seeds = [_][]const u8{
+    seed("client.example.org"), // a plain domain: EHLO/HELO take it, MAIL/RCPT do not
+    seed("localhost"), // a single label is legal syntax
+    seed("[192.0.2.1]"), // an IPv4 address literal
+    seed("[IPv6:2001:db8::1]"), // an IPv6 address literal
+    seed("sender@example.com"), // a plain mailbox
+    seed("!#$%&'*+-/=?^_`{|}~@example.com"), // every atext special in a local part
+    seed("\"quoted local part\"@example.com"), // a quoted local part
+    seed("postmaster@[192.0.2.1]"), // a mailbox at an address literal
+    seed("poštovní@example.com"), // NonAsciiAddress unless SMTPUTF8 is on
+    seed("a@example.com>\r\nRCPT TO:<victim@example.net"), // the command-injection attempt
+    seed("host\r\nQUIT"), // ControlCharacterInArgument: CRLF
+    seed("a\x00b@example.com"), // ControlCharacterInArgument: NUL
+    seed("not a domain"), // InvalidDomain: a space
+    seed("-leading-hyphen.example"), // InvalidDomain: a label may not start with '-'
+    seed("[300.1.1.1]"), // InvalidDomain: not a valid address literal
+    seed("double..dot@example.com"), // InvalidAddress: an empty dot-atom component
+    seed("a" ** 65 ++ "@example.com"), // PathTooLong: a 65-octet local part
+    seed("a" ** 64 ++ ".example"), // InvalidDomain: a 64-octet label, one past RFC 1035's cap
+    seed("x" ** 300), // exactly the harness buffer, and past the command-line ceiling
+};
+
 test "fuzz: no argument makes a builder emit a control character or overrun" {
-    try testing.fuzz({}, fuzzCommands, .{});
+    try testing.fuzz({}, fuzzCommands, .{ .corpus = &command_seeds });
 }
 
 fn fuzzCommands(_: void, smith: *std.testing.Smith) !void {
     var raw: [300]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and every builder was called with an empty
+    // argument, with the seed sitting unread in `raw`.
+    const len = smith.slice(&raw);
     const arg = raw[0..len];
-    const utf8 = smith.value(bool);
 
     var buf: [1024]u8 = undefined;
     inline for (.{ ehlo, helo }) |f| {
@@ -543,14 +583,63 @@ fn fuzzCommands(_: void, smith: *std.testing.Smith) !void {
             std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\n') == null);
         } else |_| {}
     }
-    if (mail(&buf, arg, .{ .smtputf8 = utf8 }, .{})) |line| {
-        std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\r') == null);
-    } else |_| {}
-    if (rcpt(&buf, arg, .{}, .{}, utf8)) |line| {
-        std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\r') == null);
-        std.debug.assert(line.len <= 512);
-    } else |_| {}
+    // ⚠ `smtputf8` used to be one more draw off the same Smith, taken AFTER the
+    // length. Every draw after a `slice` that consumed the whole seed returns
+    // the weight minimum -- `false` for a bool -- so the SMTPUTF8 branch would
+    // never be taken on a corpus replay and the non-ASCII mailbox above could
+    // not be reached. Both values are simply tried, the way the `reply` and
+    // `data` harnesses already handle `allow_bare_lf`.
+    for ([_]bool{ false, true }) |utf8| {
+        if (mail(&buf, arg, .{ .smtputf8 = utf8 }, .{})) |line| {
+            std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\r') == null);
+        } else |_| {}
+        if (rcpt(&buf, arg, .{}, .{}, utf8)) |line| {
+            std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\r') == null);
+            std.debug.assert(line.len <= 512);
+        } else |_| {}
+    }
     if (auth(&buf, "PLAIN", arg, .{})) |line| {
         std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\n') == null);
     } else |_| {}
+}
+
+test "corpus: every command seed reaches the builders, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum), which is silent everywhere else.
+    //
+    // Three counts rather than one "accepted", because the builders disagree
+    // on purpose: a bare domain is an EHLO argument and not a mailbox, and the
+    // non-ASCII mailbox is a RCPT argument only with SMTPUTF8 on. A single
+    // number would hide the whole point of the corpus.
+    var nonempty: usize = 0;
+    var ehlo_ok: usize = 0;
+    var rcpt_ascii_ok: usize = 0;
+    var rcpt_utf8_ok: usize = 0;
+    for (command_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [300]u8 = undefined;
+        const len = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        const arg = raw[0..len];
+        var buf: [1024]u8 = undefined;
+        if (ehlo(&buf, arg, .{})) |_| {
+            ehlo_ok += 1;
+        } else |_| {}
+        if (rcpt(&buf, arg, .{}, .{}, false)) |_| {
+            rcpt_ascii_ok += 1;
+        } else |_| {}
+        if (rcpt(&buf, arg, .{}, .{}, true)) |_| {
+            rcpt_utf8_ok += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(command_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 19 seeds non-empty before the draw was fixed
+    // and every builder saw the empty string; 19 of 19 after.
+    try testing.expectEqual(@as(usize, 4), ehlo_ok);
+    try testing.expectEqual(@as(usize, 4), rcpt_ascii_ok);
+    // 5 against 4: the one extra is `poštovní@example.com`, reachable only
+    // with SMTPUTF8 on -- and unreachable at all until the `smtputf8` draw
+    // above stopped collapsing to `false`.
+    try testing.expectEqual(@as(usize, 5), rcpt_utf8_ok);
 }

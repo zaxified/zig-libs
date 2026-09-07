@@ -858,15 +858,54 @@ test "a very long line in a 7bit-looking body forces an encoding that fits" {
     try mime.checkLineLengths(out, 998);
 }
 
+/// A corpus entry carrying `blob`, plus a 24-octet tail for the three draws
+/// the harness takes AFTER the blob: the subject/body split point, the PRNG
+/// seed, and the date.
+///
+/// ⚠ `testkit.fuzz.seed` would be wrong here and silently so. A seed whose
+/// frame ends exactly where `Smith.slice` stops leaves the input EXHAUSTED,
+/// and every draw after that returns its weight minimum -- so `split` would be
+/// 0 for every seed in the corpus and the subject would always be empty, in a
+/// harness whose whole point is "any body AND subject". The eight octets after
+/// the frame are what `valueRangeAtMost` reads as a little-endian u64; the
+/// sixteen after those feed `value(u64)` and `value(i32)`.
+fn seedSplit(comptime blob: []const u8, comptime split: u64) []const u8 {
+    return &struct {
+        const bytes = std.mem.toBytes(@as(u32, @intCast(blob.len))) ++
+            blob[0..blob.len].* ++
+            std.mem.toBytes(split) ++
+            [_]u8{0} ** 16;
+    }.bytes;
+}
+
+/// Subject-plus-body blobs, in the format `Smith.slice` reads, each with the
+/// split point that decides how much of it becomes the Subject header.
+const render_seeds = [_][]const u8{
+    seedSplit("Hello, worldThis is the body text.", 12), // an ordinary ASCII message
+    seedSplit("žluťoučký kůňpříliš dlouhý text", 15), // a non-ASCII subject: forces an RFC 2047 encoded word
+    seedSplit("A" ** 400, 200), // exactly the harness buffer, split down the middle
+    seedSplit("A" ** 400, 0), // the same with no subject at all
+    seedSplit("Subject line\r\n\r\nBody text\r\n", 12), // a subject with CRLF right behind it in the body
+    seedSplit("\r\n" ** 50, 20), // nothing but line breaks
+    seedSplit("=" ** 200, 100), // every octet quoted-printable must escape
+    seedSplit("." ** 100, 40), // leading dots, which the transport layer will stuff
+    seedSplit("\x00" ** 32, 16), // NULs: the subject must be refused, not smuggled
+    seedSplit(" " ** 200, 100), // nothing but fold points
+};
+
 test "fuzz: any body and subject renders to a document that respects the limits" {
-    try testing.fuzz({}, fuzzRender, .{});
+    try testing.fuzz({}, fuzzRender, .{ .corpus = &render_seeds });
 }
 
 fn fuzzRender(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
     var raw: [400]u8 = undefined;
-    smith.bytes(&raw);
-    const n = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `n` was 0 for every seed and `render` was handed an empty subject AND
+    // an empty body, with the seed sitting unread in `raw`.
+    const n = smith.slice(&raw);
     const blob = raw[0..n];
     const split = if (blob.len == 0) 0 else smith.valueRangeAtMost(u16, 0, @intCast(blob.len));
 
@@ -890,4 +929,51 @@ fn fuzzRender(_: void, smith: *std.testing.Smith) !void {
     const e = std.mem.indexOfScalarPos(u8, out, s, '"').?;
     const boundary = out[s..e];
     std.debug.assert(std.mem.count(u8, out, boundary) == 4);
+}
+
+test "corpus: every render seed reaches the renderer, and the counts are pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. A seed
+    // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls
+    // back to the range minimum), which is silent everywhere else.
+    //
+    // The second count is the one that guards `seedSplit`'s tail: it is how
+    // many seeds actually put something in the Subject. Written with a plain
+    // `testkit.fuzz.seed` it would be 0 -- the split draw would find no input
+    // left and return its range minimum -- and nothing else in the suite would
+    // notice that half of "any body and subject" had gone missing.
+    const gpa = testing.allocator;
+    var nonempty: usize = 0;
+    var rendered: usize = 0;
+    var subject_nonempty: usize = 0;
+    for (render_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [400]u8 = undefined;
+        const n = smith.slice(&raw);
+        if (n != 0) nonempty += 1;
+        const blob = raw[0..n];
+        const split = if (blob.len == 0) 0 else smith.valueRangeAtMost(u16, 0, @intCast(blob.len));
+        if (split != 0) subject_nonempty += 1;
+        var prng = fixedRandom(smith.value(u64));
+        const m = Message{
+            .from = .{ .addr = "a@example.com" },
+            .to = &.{.{ .addr = "b@example.net" }},
+            .subject = blob[0..split],
+            .date = .{ .unix = smith.value(i32) },
+            .message_id = "id@example.com",
+            .body = .{ .multipart = .{ .parts = &.{
+                .{ .text = .{ .body = blob[split..] } },
+                .{ .attachment = .{ .filename = "f.bin", .data = blob } },
+            } } },
+        };
+        if (render(gpa, m, prng.random(), .{})) |out| {
+            gpa.free(out);
+            rendered += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(render_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 10 seeds non-empty before the draw was fixed
+    // and `render` only ever saw an empty subject and an empty body; 10 of 10
+    // after.
+    try testing.expectEqual(@as(usize, 8), rendered);
+    try testing.expectEqual(@as(usize, 9), subject_nonempty);
 }

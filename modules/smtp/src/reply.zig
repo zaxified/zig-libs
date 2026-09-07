@@ -532,15 +532,55 @@ test "bare LF is accepted only when explicitly opted into" {
     try testing.expectEqualStrings("lenient", r.text);
 }
 
+/// `testkit.fuzz.seed`, aliased so the corpus below reads as the reply streams
+/// it is. A corpus entry is not the frame: `Smith.slice` reads a little-endian
+/// `u32` length first, so a raw stream would arrive minus its own first four
+/// octets. `testkit/src/fuzz.zig` carries the other two hazards.
+const seed = @import("testkit").fuzz.seed;
+
+/// Reply streams, in the format `Smith.slice` reads (see `testkit.fuzz`).
+///
+/// Every accepted reply and every typed refusal named in the tests above, plus
+/// the three limits the harness's own `Parser` config makes reachable
+/// (`max_line = 256`, `max_lines = 16`). A reply is three digits, a separator
+/// and CRLF: uniform random octets produce that shape with probability under
+/// 2^-40 per line, so without these seeds the harness only ever proved that
+/// `InvalidReplyCode` fires.
+const reply_seeds = [_][]const u8{
+    seed("220 mail.example.com ESMTP ready\r\n"), // the single-line greeting
+    seed("250-mail.example.com greets client.example.org\r\n" ++
+        "250-PIPELINING\r\n250-SIZE 35882577\r\n250-8BITMIME\r\n" ++
+        "250-STARTTLS\r\n250-ENHANCEDSTATUSCODES\r\n250 SMTPUTF8\r\n"), // the RFC 5321 §4.1.1.1 EHLO reply: 7 lines, ONE reply
+    seed("250-x\r\n250\r\n"), // a code with no text is a legal last line
+    seed("250 ok\r\n354 go ahead\r\n250 queued\r\n"), // three replies in one read, not merged
+    seed("550 5.1.1 <a@example.com>: unknown\r\n451 4.7.1 greylisted\r\n250 2.0.0 Ok\r\n"), // enhanced status codes
+    seed("no code here\r\n"), // InvalidReplyCode
+    seed("2x0 non-digit\r\n"), // InvalidReplyCode
+    seed("099 first digit 0\r\n"), // InvalidReplyCode
+    seed("700 first digit 7\r\n"), // InvalidReplyCode
+    seed("25\r\n"), // MalformedReply: too short to carry a code
+    seed("250x bad separator\r\n"), // MalformedReply
+    seed("250\tbad separator\r\n"), // MalformedReply
+    seed("250-first\r\n251 different code\r\n"), // ReplyCodeMismatch
+    seed("220 bare lf\n"), // BareLineFeed -- accepted only under allow_bare_lf
+    seed("220 bare\rcr\r\n"), // BareCarriageReturn, in both modes
+    seed("250 " ++ "A" ** 300 ++ "\r\n"), // ReplyLineTooLong: over the harness's max_line of 256
+    seed("250-x\r\n" ** 17), // ReplyTooLong: one continuation past max_lines
+};
+
 test "fuzz: no reply stream can crash, hang or leak the parser" {
-    try testing.fuzz({}, fuzzReply, .{});
+    try testing.fuzz({}, fuzzReply, .{ .corpus = &reply_seeds });
 }
 
 fn fuzzReply(_: void, smith: *std.testing.Smith) !void {
     const gpa = testing.allocator;
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const len = smith.valueRangeAtMost(u16, 0, raw.len);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(raw.len, in.len)` octets and the ranged draw
+    // then finds fewer than the eight it needs and returns the range MINIMUM,
+    // so `len` was 0 for every seed and the parser was fed an empty slice with
+    // the seed sitting unread in `raw`.
+    const len = smith.slice(&raw);
     const input = raw[0..len];
     for ([_]bool{ false, true }) |bare_lf| {
         var p: Parser = .init(gpa, .{ .max_line = 256, .max_lines = 16, .max_text = 1024, .max_pending = 4096 }, .{ .allow_bare_lf = bare_lf });
@@ -556,4 +596,39 @@ fn fuzzReply(_: void, smith: *std.testing.Smith) !void {
             if (rr.enhanced) |e| std.debug.assert(e.class == rr.code / 100);
         }
     }
+}
+
+test "corpus: every reply seed reaches the parser, and the accepted count is pinned" {
+    // ⭐ The measurement, executable rather than written in a comment. Two
+    // things it holds that no other test does: a seed longer than the harness's
+    // buffer reads back EMPTY (`Smith.slice` falls back to the range minimum),
+    // which is silent everywhere else; and a corpus where nothing is accepted
+    // is a corpus that only exercises the refusal path. Acceptance is not
+    // reach, so this pins the number rather than asserting it is > 0.
+    //
+    // `accepted` mirrors the harness, which runs each stream under both
+    // `allow_bare_lf` settings: a seed counts once if either yields a reply.
+    const gpa = testing.allocator;
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (reply_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var raw: [512]u8 = undefined;
+        const len = smith.slice(&raw);
+        if (len != 0) nonempty += 1;
+        for ([_]bool{ false, true }) |bare_lf| {
+            var p: Parser = .init(gpa, .{ .max_line = 256, .max_lines = 16, .max_text = 1024, .max_pending = 4096 }, .{ .allow_bare_lf = bare_lf });
+            defer p.deinit();
+            p.feed(raw[0..len]) catch continue;
+            const r = p.next() catch continue;
+            if (r != null) {
+                accepted += 1;
+                break;
+            }
+        }
+    }
+    try testing.expectEqual(reply_seeds.len, nonempty);
+    // Measured 2026-09-07: 0 of 17 seeds non-empty and 0 accepted before the
+    // draw was fixed, 17 of 17 non-empty and 999 accepted after.
+    try testing.expectEqual(@as(usize, 6), accepted);
 }
