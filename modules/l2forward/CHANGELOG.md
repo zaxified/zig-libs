@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **`fuzzOps` executed ZERO operations, for the entire life of the
+  harness.**
+
+  Its first draw was `smith.valueRangeAtMost(u16, 0, 300)` for the op count. A ranged
+  `Smith` draw reads eight input octets as a little-endian u64 and returns the range
+  **minimum** unless that whole word already lies inside the range — and the target
+  had no corpus, so outside `--fuzz` the runner replays one empty input. `n_ops` was
+  therefore 0 and the loop body never ran: not one `learn`, not one cap check, not
+  one `forward`. Everything the harness's comment claims — that it "presses on
+  `TooManyIsids`/`TooManyMembers`/`FdbFull`/quarantine, not just the happy path", and
+  that the `CoreIngressWasRelayed` check is "F1's whole point" — was true of code
+  that never executed, and the target passed on every run because there was nothing
+  in it to fail.
+
+  The op stream now reads its choices from a `testkit.fuzz.Cursor` over one
+  `smith.slice` draw — five octets per op (selector, I-SID, PE, MAC, time advance) —
+  so a seed is a readable script, and under `--fuzz` the fuzzer still drives every
+  choice because it drives the slice. Four scripts: filling one I-SID past every cap;
+  four I-SIDs against `max_isids` = 3 followed by a core-ingress forward on each; a
+  MAC relearned from four PEs inside the move window (the quarantine path); and
+  learn → age → tick → remove.
+
+  Measured 2026-09-07: **0 operations before, 39 after.** The degenerate empty script
+  is kept as the last corpus entry and pinned at 0, so the "before" stays executable
+  rather than remembered.
+
 - **2026-09-03** — Drift re-audit (window `d163578..HEAD`, +944/-209 in `src/root.zig` — a rewrite
   of most of the module, not drift). The previous entry recorded only "seven findings fixed, one
   documented" and said nothing about the F1 `Ingress`/`local_only` rewrite, F3 (`UnknownIsid`), F5

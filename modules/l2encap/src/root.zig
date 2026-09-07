@@ -649,7 +649,7 @@ test "fuzz: decode never panics/OOBs on hostile bytes and stays within input bou
     // tunnel, so this drives arbitrary bytes — truncated, wrong-version,
     // reserved-bit-dirty, bit-flipped — and asserts only: never panics, and any
     // successful decode's payload is a subslice strictly within the input.
-    try testing.fuzz({}, fuzzDecode, .{});
+    try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
 /// The largest frame this decoder can be handed on a real tunnel: a 9000-octet
@@ -667,34 +667,92 @@ const fuzz_max_frame: usize = header_len + 9000;
 /// the length, not the content.
 const fuzz_drawn: usize = header_len + 64;
 
+/// `testkit.fuzz`: `seedHex` for the corpus and `Cursor` for the size class and
+/// the split-horizon id. A corpus entry is not the frame — `Smith.slice` reads
+/// a little-endian u32 length first, so a raw frame would arrive minus its own
+/// version, flags and the top two octets of the I-SID.
+const testkit = @import("testkit");
+const seed = testkit.fuzz.seedHex;
+
+/// Header regions, in the format `Smith.slice` reads. Only the first
+/// `fuzz_drawn` octets are ever drawn (see above), so a seed is a header plus a
+/// little payload; the size class then decides how much opaque tail is appended.
+///
+/// Uniform random octets clear the version byte with probability 1/256 and the
+/// seven reserved flag bits with probability 1/128, so ~1 draw in 32 768 got
+/// past `decode`'s second line. These are the frames on the other side of it.
+const decode_seeds = [_][]const u8{
+    seed("01" ++ "00" ++ "000007" ++ "40" ++ "0003" ++ "6f7061717565206672616d65"), // unicast, I-SID 7, TTL 64, ingress PE 3
+    seed("01" ++ "01" ++ "FFFFFF" ++ "01" ++ "FFFF" ++ "AABBCCDD"), // BUM, max I-SID, TTL 1, max ingress PE
+    seed("01" ++ "00" ++ "000000" ++ "00" ++ "0000"), // TTL 0: the frame `decrementTtl` must refuse
+    seed("01" ++ "02" ++ "000001" ++ "40" ++ "0001"), // InvalidHeader: a reserved flag bit set
+    seed("02" ++ "00" ++ "000001" ++ "40" ++ "0001"), // UnsupportedVersion: a v2 header
+    seed("00" ++ "00" ++ "000000" ++ "00" ++ "0000"), // the all-zero buffer, rejected as version 0
+    seed("010000000740"), // Truncated: six octets, two short of the header
+    seed(""), // the empty frame
+};
+
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_max_frame]u8 = undefined;
-    smith.bytes(buf[0..fuzz_drawn]);
+    // ⚠ One `smith.slice` call, never `smith.bytes` followed by a ranged
+    // length. `bytes` takes `@min(out.len, in.len)` octets and every ranged
+    // draw after it finds fewer than the eight it needs and returns the range
+    // MINIMUM — so the size class was always 0, `len` was always 0 inside it,
+    // and `decode` was handed an empty slice on every input a seed can carry.
+    // The `smith.value(bool)` that forces a valid version byte was false for
+    // the same reason, so even a full-length draw would have died at the
+    // version check. Measured 2026-09-07 over the corpus below: 0 of 8 seeds
+    // decoded before, 3 of 8 after.
+    const drawn: usize = smith.slice(buf[0..fuzz_drawn]);
+    var cur: testkit.fuzz.Cursor = .{ .bytes = buf[0..drawn] };
+
     // A size class rather than a uniform draw: a uniform length over the whole
     // range would almost never land on the header boundary, which is where the
-    // interesting truncations are, and a `u8` draw never leaves it.
-    const len: usize = switch (smith.valueRangeAtMost(u8, 0, 5)) {
-        0 => smith.valueRangeAtMost(u8, 0, @intCast(fuzz_drawn)),
+    // interesting truncations are.
+    const len: usize = switch (cur.ranged(0, 5)) {
+        0 => drawn, // exactly what the seed carried
         1 => 1500, // ordinary Ethernet MTU behind the header
         2 => header_len + 1500,
         3 => fuzz_max_frame, // jumbo
-        4 => smith.valueRangeAtMost(u16, 0, @intCast(fuzz_max_frame)),
-        else => smith.valueRangeAtMost(u16, header_len, @intCast(fuzz_max_frame)),
+        4 => cur.word(),
+        else => header_len + cur.word(),
     };
-    @memset(buf[fuzz_drawn..], smith.value(u8));
+    const clamped = @min(len, buf.len);
+    @memset(buf[drawn..], cur.byte());
 
-    // Half the time, force a valid version byte so the deeper flag/field paths
-    // are reached instead of always bailing at the version check.
-    if (len >= 1 and smith.value(bool)) buf[0] = version_current;
-
-    const dec = decode(buf[0..len]) catch return; // any typed error is fine
+    const dec = decode(buf[0..clamped]) catch return; // any typed error is fine
     // If it decoded, the header must have fit and the payload is exactly the
     // remainder — never larger than, or outside, the input.
-    try testing.expect(len >= header_len);
-    try testing.expect(dec.payload.len == len - header_len);
+    try testing.expect(clamped >= header_len);
+    try testing.expect(dec.payload.len == clamped - header_len);
     try testing.expect(dec.payload.ptr == buf[header_len..].ptr);
 
     // The decision helpers must also never panic on decoded-from-hostile fields.
     _ = decrementTtl(dec.fields) catch {};
-    _ = droppedBySplitHorizon(dec.fields, smith.value(u16));
+    _ = droppedBySplitHorizon(dec.fields, cur.word());
+}
+
+test "corpus: every seed reaches the decoder, and the counts are pinned" {
+    // Three numbers. `nonempty` is the reach claim. `decoded` says the corpus
+    // is not refusals only. `bum` is the one an empty frame cannot produce: the
+    // BUM bit and the ingress-PE id are what `droppedBySplitHorizon` decides
+    // on, and the all-zero header — the only thing the collapsed harness ever
+    // produced — is rejected outright as version 0, so nothing downstream of
+    // the version check had ever been reached at all.
+    var nonempty: usize = 0;
+    var decoded: usize = 0;
+    var bum: usize = 0;
+    for (decode_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [fuzz_drawn]u8 = undefined;
+        const drawn: usize = smith.slice(&buf);
+        if (drawn != 0) nonempty += 1;
+        if (decode(buf[0..drawn])) |dec| {
+            decoded += 1;
+            if (dec.fields.bum) bum += 1;
+        } else |_| {}
+    }
+    try testing.expectEqual(decode_seeds.len - 1, nonempty); // the empty frame is deliberate
+    try testing.expectEqual(@as(usize, 3), decoded);
+    try testing.expectEqual(@as(usize, 1), bum);
 }
