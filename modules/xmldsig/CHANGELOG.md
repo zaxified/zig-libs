@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: `fuzzVerifySignature` ran one fixed document, forever. Its
+  FIRST draw was `smith.value(bool)` (`allow_weak_sha1`), and a `Smith` scalar or ranged
+  draw returns the range minimum when fewer than eight octets remain; with no corpus the
+  single input it ever ran was empty, so all ~20 of its choices collapsed —
+  `allow_weak_sha1` false, `id_attr` null, all three algorithm picks index 0, both
+  transforms absent, no second reference, no KeyInfo cert, every buffer all-zero. ⚠ Mode 2
+  is the sharp one: its whole point is "a genuinely VALID signed document with a
+  fuzzer-chosen byte range overwritten", and `n = @min(smith.valueRangeAtMost(u8, 0, 32),
+  …)` was **0**, so it verified the PRISTINE document and reached the digest and signature
+  comparisons with nothing changed. The neighbouring reachability test asserts that path
+  IS reached — correctly — and cannot see that nothing was ever mutated on it. Mode 3 got
+  `raw_len` = 0 and verified the empty string. Measured 2026-09-07: 1 round, 0 octets
+  mutated, 0 unstructured octets. The harness draws a SHAPE, not a byte string, so it now
+  reads every choice out of one byte-first `smith.slice` through `testkit.fuzz.Cursor`,
+  over eight scripts of which the first is the EMPTY one, reproducing the collapsed
+  harness exactly. The mutation moved into `mutateDoc` so the guard measures the same
+  generator the harness runs. ⚠ The guard pins octets overwritten, not "verify was
+  reached": Pinned: 4 scripts with `allow_weak_sha1` on, 120 unstructured octets, 33
+  octets mutated — all three were 0.
+
 - **2026-09-03** — Drift re-audit. **The `<ds:Reference>` loop is bounded, in
   both directions.** It ran with no cap on the reference COUNT and allocated
   every reference's canonical form from the `verify` arena, which is released

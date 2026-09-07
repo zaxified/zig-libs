@@ -1823,7 +1823,70 @@ fn toDsB64ish(buf: []u8) void {
     for (buf) |*c| c.* = ds_b64ish[c.* % ds_b64ish.len];
 }
 
+/// `testkit.fuzz`. This harness draws a SHAPE — three algorithm URIs, four
+/// booleans, two length classes and three byte buffers — not a byte string,
+/// so there is no frame to be faithful to. `Cursor` reads every choice out of
+/// ONE byte-first `smith.slice`, which makes the draw honest and makes a seed
+/// a readable script; a short script CYCLES rather than running out.
+const kit = @import("testkit").fuzz;
+
+/// Overwrite a script-chosen range of `doc` and return how many octets were
+/// written. Lifted out of the harness so the corpus guard measures the SAME
+/// mutation the harness applies — a guard measuring a different generator is
+/// not a guard, and this generator wrote **zero octets on every run** before
+/// today.
+fn mutateDoc(c: *kit.Cursor, doc: []u8) usize {
+    const off: usize = c.ranged(0, @intCast(doc.len - 1));
+    const n = @min(@as(usize, c.ranged(0, 32)), doc.len - off);
+    var patch: [32]u8 = undefined;
+    for (patch[0..n]) |*b| b.* = c.byte();
+    toDsB64ish(patch[0..n]);
+    @memcpy(doc[off..][0..n], patch[0..n]);
+    return n;
+}
+
+/// Scripts for `fuzzVerifySignature`. Byte 0 is `allow_weak_sha1`, byte 1 the
+/// `id_attr` choice, byte 2 the unstructured length, then the raw octets, then
+/// mode 1's buffers and algorithm picks, then mode 2's mutation.
+const verify_scripts = [_][]const u8{
+    // ⛔ The empty script reproduces the collapsed harness EXACTLY: every read
+    //    is 0, so `allow_weak_sha1` is false, `id_attr` is null, all three
+    //    algorithm picks are index 0, both transforms are absent, mode 2
+    //    mutates ZERO octets and mode 3 verifies the empty string.
+    kit.seed(""),
+    kit.seed("\x01\x01\x20"), // weak SHA-1 allowed, an `ID` attribute, 32 unstructured octets
+    kit.seed("\x00\x01\x00\x01\x01\x01\x01\x01\x01"), // the second algorithm of each list, both transforms present
+    kit.seed("\x01\x00\x08\x3c\x3f\x78\x6d\x6c\x20\x3e\x00\x02\x02\x02\x01"), // an unstructured prefix that looks like an XML declaration
+    kit.seed("\x00\x00\x00\x02\x01\x00\x03\x03\x03\x01\x02\x01\x02\x01\x01"), // the third algorithm of each list, a second reference, a KeyInfo cert
+    kit.seed("\xff\xff\x40" ++ "\x3c\x2f\x3e\x20" ** 4), // every flag on, 64 unstructured octets of angle brackets
+    kit.seed("\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1f"), // mode 2 with the largest mutation the generator can write
+    kit.seed("\x01\x01\x10\xab\xcd\xef\x01\x02\x02\x00\x01\x02\x00\x01\x02\x00\x10\x10"), // a mid-document mutation
+};
+
 fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ ONE byte-first draw, then a `Cursor` over it. What stood here
+    // opened `smith.value(bool)` and drew every one of its ~20 choices
+    // from `smith` directly. A `Smith` scalar or ranged draw reads eight
+    // octets as a little-endian `u64` and returns the range MINIMUM when
+    // fewer remain, and this target carried no corpus, so outside `--fuzz`
+    // the single input it ever ran was empty and EVERY choice collapsed:
+    // `allow_weak_sha1` false, `id_attr` null, all three algorithm picks
+    // index 0, both transforms absent, no second reference, no KeyInfo
+    // cert, and every buffer all-zero. Mode 1 built ONE fixed document.
+    // Mode 2 drew `n = @min(0, …)` = **0 mutated octets**, so it verified
+    // the PRISTINE valid document — the "fuzzer-chosen byte range
+    // overwritten" never happened once. Mode 3 got `raw_len` = 0 and
+    // verified the empty string. Measured 2026-09-07: 1 round, 1 assembled
+    // document, 0 mutated octets, 0 unstructured octets.
+    //
+    // A `Cursor` reads all of it out of one byte-first `smith.slice`: the
+    // draw is honest and a seed becomes a readable script. A short script
+    // CYCLES, so even a four-octet seed produces varied algorithm picks
+    // and a repeating byte pattern rather than 512 zeroes.
+    var script: [96]u8 = undefined;
+    const script_len: usize = smith.slice(&script);
+    var c = kit.Cursor{ .bytes = script[0..script_len] };
+
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1831,25 +1894,25 @@ fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
     const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
     const options: Options = .{
         .key = .{ .rsa = pk },
-        .allow_weak_sha1 = smith.value(bool),
-        .id_attr = if (smith.value(bool)) "ID" else null,
+        .allow_weak_sha1 = c.byte() & 1 == 1,
+        .id_attr = if (c.byte() & 1 == 1) "ID" else null,
     };
 
     var raw: [512]u8 = undefined;
-    smith.bytes(&raw);
-    const raw_len: usize = smith.valueRangeAtMost(u16, 0, raw.len);
+    const raw_len: usize = c.ranged(0, raw.len);
+    for (raw[0..raw_len]) |*b| b.* = c.byte();
 
     // Mode 1 — a signature assembled around the fuzzed bytes.
     {
         var digest_buf: [64]u8 = undefined;
-        smith.bytes(&digest_buf);
+        for (&digest_buf) |*b| b.* = c.byte();
         var sig_buf: [256]u8 = undefined; // exactly one RSA-2048 signature
-        smith.bytes(&sig_buf);
+        for (&sig_buf) |*b| b.* = c.byte();
         var text_buf: [64]u8 = undefined;
-        smith.bytes(&text_buf);
+        for (&text_buf) |*b| b.* = c.byte();
         toDsB64ish(&text_buf);
 
-        const digest_value: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        const digest_value: []const u8 = switch (c.ranged(0, 2)) {
             0 => try b64Encode(a, digest_buf[0..32]),
             1 => blk: {
                 const t = try a.dupe(u8, digest_buf[0..]);
@@ -1858,7 +1921,7 @@ fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
             },
             else => "",
         };
-        const signature_value: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        const signature_value: []const u8 = switch (c.ranged(0, 2)) {
             0 => try b64Encode(a, sig_buf[0..]), // right length: reaches the RSA op
             1 => blk: {
                 const t = try a.dupe(u8, sig_buf[0..64]);
@@ -1869,17 +1932,17 @@ fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
         };
 
         const src = try buildFuzzSignature(a, .{
-            .c14n_alg = fuzz_c14n_algs[smith.index(fuzz_c14n_algs.len)],
-            .sig_alg = fuzz_sig_algs[smith.index(fuzz_sig_algs.len)],
-            .digest_alg = fuzz_digest_algs[smith.index(fuzz_digest_algs.len)],
-            .transform1 = if (smith.value(bool)) fuzz_transform_algs[smith.index(fuzz_transform_algs.len)] else null,
-            .transform2 = if (smith.value(bool)) fuzz_transform_algs[smith.index(fuzz_transform_algs.len)] else null,
-            .ref_uri = fuzz_ref_uris[smith.index(fuzz_ref_uris.len)],
+            .c14n_alg = fuzz_c14n_algs[c.ranged(0, fuzz_c14n_algs.len - 1)],
+            .sig_alg = fuzz_sig_algs[c.ranged(0, fuzz_sig_algs.len - 1)],
+            .digest_alg = fuzz_digest_algs[c.ranged(0, fuzz_digest_algs.len - 1)],
+            .transform1 = if (c.byte() & 1 == 1) fuzz_transform_algs[c.ranged(0, fuzz_transform_algs.len - 1)] else null,
+            .transform2 = if (c.byte() & 1 == 1) fuzz_transform_algs[c.ranged(0, fuzz_transform_algs.len - 1)] else null,
+            .ref_uri = fuzz_ref_uris[c.ranged(0, fuzz_ref_uris.len - 1)],
             .digest_value = digest_value,
             .signature_value = signature_value,
             .content = &text_buf,
-            .key_info_cert = if (smith.value(bool)) digest_value else null,
-            .second_reference = smith.value(bool),
+            .key_info_cert = if (c.byte() & 1 == 1) digest_value else null,
+            .second_reference = c.byte() & 1 == 1,
         });
         try fuzzVerifyDoc(a, src, options);
     }
@@ -1891,12 +1954,8 @@ fn fuzzVerifySignature(_: void, smith: *std.testing.Smith) !void {
     {
         const base = try fuzzSignedDoc();
         const mutant = try a.dupe(u8, base);
-        const off = smith.index(mutant.len);
-        const n = @min(smith.valueRangeAtMost(u8, 0, 32), mutant.len - off);
-        var patch: [32]u8 = undefined;
-        smith.bytes(&patch);
-        toDsB64ish(patch[0..n]);
-        @memcpy(mutant[off..][0..n], patch[0..n]);
+        const n = mutateDoc(&c, mutant);
+        _ = n;
         try fuzzVerifyDoc(a, mutant, options);
     }
 
@@ -1912,7 +1971,64 @@ fn b64Encode(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
 }
 
 test "fuzz: verify never panics on a hostile ds:Signature" {
-    try std.testing.fuzz({}, fuzzVerifySignature, .{});
+    try std.testing.fuzz({}, fuzzVerifySignature, .{ .corpus = &verify_scripts });
+}
+
+test "corpus: every verify script drives a distinct shape, and the octets it writes are pinned" {
+    // ⭐ The measurement, executable. It reads the script exactly the way the
+    // harness does, because the defect WAS the draw.
+    //
+    // `mutated` is the second number and it is the load-bearing one: mode 2's
+    // whole point is "a genuinely VALID signed document with a fuzzer-chosen
+    // byte range overwritten", and with the collapsed draw `n` was
+    // `@min(0, …)` = 0 on every run — so it verified the PRISTINE document
+    // and reached the digest and signature comparisons with nothing changed.
+    // The neighbouring reachability test asserts that path is reached; it
+    // cannot see that nothing was ever mutated on it. Octets overwritten
+    // cannot be produced by an empty script.
+    const a = testing.allocator;
+    var nonempty: usize = 0;
+    var mutated: usize = 0;
+    var unstructured: usize = 0;
+    var weak_sha1: usize = 0;
+    for (verify_scripts) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [96]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var c = kit.Cursor{ .bytes = script[0..n] };
+
+        if (c.byte() & 1 == 1) weak_sha1 += 1;
+        _ = c.byte(); // id_attr
+        const raw_len: usize = c.ranged(0, 512);
+        unstructured += raw_len;
+        for (0..raw_len) |_| _ = c.byte();
+
+        // Mode 1's buffers and picks, consumed in the harness's order so the
+        // cursor arrives at mode 2 in the same place.
+        for (0..64 + 256 + 64) |_| _ = c.byte();
+        _ = c.ranged(0, 2);
+        _ = c.ranged(0, 2);
+        _ = c.ranged(0, fuzz_c14n_algs.len - 1);
+        _ = c.ranged(0, fuzz_sig_algs.len - 1);
+        _ = c.ranged(0, fuzz_digest_algs.len - 1);
+        if (c.byte() & 1 == 1) _ = c.ranged(0, fuzz_transform_algs.len - 1);
+        if (c.byte() & 1 == 1) _ = c.ranged(0, fuzz_transform_algs.len - 1);
+        _ = c.ranged(0, fuzz_ref_uris.len - 1);
+        _ = c.byte(); // key_info_cert
+        _ = c.byte(); // second_reference
+
+        const base = try fuzzSignedDoc();
+        const mutant = try a.dupe(u8, base);
+        defer a.free(mutant);
+        mutated += mutateDoc(&c, mutant);
+    }
+    // Measured 2026-09-07. Before: 1 round, 0 octets mutated, 0 unstructured
+    // octets, `allow_weak_sha1` false.
+    try testing.expectEqual(verify_scripts.len - 1, nonempty); // the deliberate empty script
+    try testing.expectEqual(@as(usize, 4), weak_sha1); // 0 before: the flag was false on every run
+    try testing.expectEqual(@as(usize, 120), unstructured);
+    try testing.expectEqual(@as(usize, 33), mutated); // 0 before: mode 2 verified the pristine document on every run
 }
 
 test "the xmldsig fuzz harness reaches verify's digest and signature checks (reachability)" {

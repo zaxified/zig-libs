@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — Fuzz reach: neither fuzz target reached what it names. `fuzzHandleMessage`
+  opened `smith.bytes(&buf)` and then drew the length with `smith.valueRangeAtMost`;
+  `bytes` consumes `@min(buf.len, in.len)` octets and a ranged draw reads EIGHT more as a
+  little-endian `u64`, returning the range MINIMUM when fewer remain, so the length was 0
+  — and with no corpus the one input it ever ran was empty. `handleMessage("")` is a
+  -32700 parse error and not one dispatch branch was entered; the peer id was
+  `smith.value(u64)` drawn AFTER the bytes, so the `handleMessageFrom` arm the comment
+  calls out as "the peer arm the harness above never exercised" was itself always called
+  with peer 0. `fuzzClientResponse` opened `smith.index(2)`, so all four of its fuzzed
+  rounds were `.sampling` on peer 0 carrying byte-identical answers, and its miss-path
+  round used id 0 and peer 0 — a peer that IS armed, so it was not the miss it is named
+  for. ⚠ Its hand-written aim canary kept passing throughout, which is why the target
+  looked healthy: it asserts three correlating answers that do not depend on the fuzzer at
+  all. ⭐ And reaching `tools/call` for the first time crashed immediately:
+  `testServer(null)` leaves the registered `echo` tool's `ctx` null while `echoHandler`
+  opens with `ctx.?`, so the fixture the harness chose could not survive the
+  param-validation path its own comment says it exists to reach. The harness now passes a
+  live `TestApp`. `fuzzHandleMessage` draws byte-first with one `smith.slice` over 19
+  written JSON-RPC lines (one per dispatch branch, plus the malformed shapes) and runs
+  both peers on every input instead of drawing one. `fuzzClientResponse` draws a SHAPE, so
+  it reads every choice — kind, peer and the whole JSON tree — out of one byte-first slice
+  through `testkit.fuzz.Cursor`, over eight scripts of which the first is the EMPTY one,
+  reproducing the collapsed harness exactly. Guards pin 1661 reply octets / 9 error
+  replies, and 8 distinct response lines over 470 octets (1 distinct before).
+
 - **2026-09-02** — Drift re-audit (window `15486ba..HEAD`, +1219 lines). Five findings, all fixed:
 
   - **HIGH, cross-session capability grant:** `client_capabilities`, `negotiated_version` and

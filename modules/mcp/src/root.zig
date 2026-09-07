@@ -5936,23 +5936,111 @@ test "notifications/cancelled: field shape matches the spec's example (basic/uti
 // registered tool so `tools/call`'s param-validation path is reachable too,
 // not only the outer parse-error branches.
 
+// ⚠ And it never dispatched one. The harness opened `smith.bytes(&buf)` and
+// then drew the length with `smith.valueRangeAtMost`; `bytes` consumes
+// `@min(buf.len, in.len)` octets and a ranged draw reads EIGHT more as a
+// little-endian `u64`, returning the range MINIMUM when fewer remain, so the
+// length was 0 for every input a corpus can carry — and the target had no
+// corpus, so the one input it ever ran was empty. `handleMessage("")` is a
+// -32700 parse error and not one dispatch branch was entered. The peer id was
+// `smith.value(u64)` drawn AFTER the bytes, so it was 0 as well, which means
+// the `handleMessageFrom` arm the comment calls out as "the peer arm the
+// harness above never exercised" was itself always called with peer 0.
+// Measured 2026-09-07: 1 round, 0 non-empty inputs, 0 methods dispatched.
+
+/// `testkit.fuzz.seed`, aliased so the corpus reads as the JSON-RPC lines it
+/// is. A corpus entry is not the line: `Smith.slice` reads a little-endian
+/// `u32` length first.
+const seed = @import("testkit").fuzz.seed;
+
+/// JSON-RPC lines, in the format the length draw reads — one per dispatch
+/// branch, because that is what the harness's own comment says it is for and
+/// what random bytes cannot reach (a well-formed `"method":"tools/call"` out
+/// of noise is not a thing that happens).
+const message_seeds = [_][]const u8{
+    seed("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"f\",\"version\":\"1\"}}}"),
+    seed("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"),
+    seed("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"),
+    seed("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"hi\"}}}"),
+    seed("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"}}"), // arguments missing → the param-validation path
+    seed("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"nosuchtool\",\"arguments\":{}}}"),
+    seed("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/list\"}"),
+    seed("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/read\",\"params\":{\"uri\":\"file:///nope\"}}"),
+    seed("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"prompts/list\"}"),
+    seed("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"prompts/get\",\"params\":{\"name\":\"p\"}}"),
+    seed("{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"ping\"}"),
+    seed("{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"no/such/method\"}"), // -32601
+    seed("{\"jsonrpc\":\"1.0\",\"id\":12,\"method\":\"ping\"}"), // the wrong protocol version
+    seed("{\"jsonrpc\":\"2.0\",\"id\":13}"), // no method at all → -32600
+    seed("{\"jsonrpc\":\"2.0\",\"id\":{\"a\":1},\"method\":\"ping\"}"), // an id of a shape the spec forbids
+    seed("[{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"ping\"}]"), // a batch, which this server does not accept
+    seed("{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"ping\""), // truncated → -32700
+    seed("not json at all"),
+    seed(""), // zero length: the ONLY input this target ever ran
+};
+
 test "fuzz: handleMessage never panics on an arbitrary JSON-RPC line" {
-    try testing.fuzz({}, fuzzHandleMessage, .{});
+    try testing.fuzz({}, fuzzHandleMessage, .{ .corpus = &message_seeds });
 }
 
 fn fuzzHandleMessage(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ One byte-first draw, and no knob after it: the peer id is no longer
+    // drawn at all, because a draw after the bytes is dead on a corpus replay.
+    // Both peers run on every input instead, which is more than the single
+    // drawn value could give.
     var buf: [512]u8 = undefined;
-    smith.bytes(&buf);
-    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
+    const len: usize = smith.slice(&buf);
 
-    var s = testServer(null);
+    // ⭐ A LIVE `TestApp`, not `null`. `testServer(null)` leaves the registered
+    // `echo` tool's `ctx` null and `echoHandler` opens with `ctx.?`, so the
+    // first `tools/call` for `echo` panics on "attempt to use null value".
+    // The harness's own comment says it drives "a server with a real
+    // registered tool so `tools/call`'s param-validation path is reachable
+    // too" — and with a null ctx that path could not be survived, let alone
+    // reached. Nothing noticed, because the collapsed draw meant the target
+    // only ever ran `handleMessage("")`; the panic fired on the FIRST seeded
+    // run.
+    var app: TestApp = .{};
+    var s = testServer(&app);
     defer s.deinit();
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     s.handleMessage(buf[0..len], &aw.writer) catch return;
     // The peer arm of the same entry point: `handleMessageFrom` with a
-    // non-zero peer, which the harness above never exercised.
-    s.handleMessageFrom(buf[0..len], &aw.writer, smith.value(u64)) catch return;
+    // non-zero peer, which `handleMessage` does not reach.
+    s.handleMessageFrom(buf[0..len], &aw.writer, 7) catch return;
+}
+
+test "corpus: every JSON-RPC seed reaches the dispatcher, and the replies are pinned" {
+    // ⭐ The measurement, executable. `reply_octets` is the second number and
+    // it is the load-bearing one: `handleMessage("")` does not fail — it
+    // writes a -32700 parse-error reply and returns cleanly — so a guard
+    // counting clean returns, or even replies produced, would have been
+    // satisfied by the collapsed harness on every run. Reply octets summed
+    // over real methods cannot come from an empty line.
+    var nonempty: usize = 0;
+    var reply_octets: usize = 0;
+    var errors: usize = 0;
+    for (message_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        var app: TestApp = .{}; // live ctx — see the harness above
+        var s = testServer(&app);
+        defer s.deinit();
+        var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer aw.deinit();
+        s.handleMessage(buf[0..len], &aw.writer) catch continue;
+        const out = aw.written();
+        reply_octets += out.len;
+        if (std.mem.indexOf(u8, out, "\"error\":") != null) errors += 1;
+    }
+    // Measured 2026-09-07. Before: 1 round, `handleMessage("")`, one -32700.
+    try testing.expectEqual(message_seeds.len - 1, nonempty); // the deliberate empty seed
+    try testing.expectEqual(@as(usize, 1661), reply_octets);
+    try testing.expectEqual(@as(usize, 9), errors);
 }
 
 // ── fuzz: the inbound RESPONSE path (re-audit 2026-08-11, F4) ───────────────
@@ -6061,31 +6149,30 @@ const fuzz_vocab = [_][]const u8{
 /// and on the tag decisions the parsers make, not on UTF-8 validity.
 const fuzz_key_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-/.:\\\"{}[]";
 
-fn fuzzJsonString(smith: *std.testing.Smith, w: *std.Io.Writer) std.Io.Writer.Error!void {
+fn fuzzJsonString(c: *kit.Cursor, w: *std.Io.Writer) std.Io.Writer.Error!void {
     // Mostly a spec token, otherwise fuzzer text (see `fuzz_key_alphabet`).
-    const pick = smith.index(fuzz_vocab.len + 1);
+    const pick = c.ranged(0, fuzz_vocab.len);
     if (pick < fuzz_vocab.len) {
         try std.json.Stringify.encodeJsonString(fuzz_vocab[pick], .{}, w);
         return;
     }
-    var raw: [32]u8 = undefined;
-    const n = smith.slice(&raw);
+    const n = c.ranged(0, 32);
     var mapped: [32]u8 = undefined;
-    for (raw[0..n], 0..) |b, i| mapped[i] = fuzz_key_alphabet[b % fuzz_key_alphabet.len];
+    for (mapped[0..n]) |*m| m.* = fuzz_key_alphabet[c.byte() % fuzz_key_alphabet.len];
     try std.json.Stringify.encodeJsonString(mapped[0..n], .{}, w);
 }
 
-fn fuzzJsonValue(smith: *std.testing.Smith, w: *std.Io.Writer, depth: u8) std.Io.Writer.Error!void {
-    switch (smith.index(if (depth == 0) 6 else 8)) {
-        0 => try fuzzJsonString(smith, w),
-        1 => try w.print("{d}", .{smith.value(i32)}),
+fn fuzzJsonValue(c: *kit.Cursor, w: *std.Io.Writer, depth: u8) std.Io.Writer.Error!void {
+    switch (c.ranged(0, if (depth == 0) 5 else 7)) {
+        0 => try fuzzJsonString(c, w),
+        1 => try w.print("{d}", .{@as(i32, @bitCast((@as(u32, c.word()) << 16) | c.word()))}),
         2 => try w.writeAll("true"),
         3 => try w.writeAll("false"),
         4 => try w.writeAll("null"),
-        5 => try w.print("{d}.5", .{smith.value(i16)}),
+        5 => try w.print("{d}.5", .{@as(i16, @bitCast(c.word()))}),
         6 => {
             try w.writeByte('{');
-            const n = smith.index(4);
+            const n = c.ranged(0, 3);
             // Keys must be UNIQUE: `std.json`'s default
             // `duplicate_field_behavior` is `.@"error"`, so a repeated key
             // makes the whole line a -32700 parse error and it never reaches
@@ -6096,7 +6183,7 @@ fn fuzzJsonValue(smith: *std.testing.Smith, w: *std.Io.Writer, depth: u8) std.Io
             var used: [4]usize = @splat(fuzz_vocab.len);
             var emitted: usize = 0;
             for (0..n) |i| {
-                const pick = smith.index(fuzz_vocab.len + 1);
+                const pick = c.ranged(0, fuzz_vocab.len);
                 if (pick < fuzz_vocab.len) {
                     var dup = false;
                     for (used[0..emitted]) |u| {
@@ -6110,27 +6197,26 @@ fn fuzzJsonValue(smith: *std.testing.Smith, w: *std.Io.Writer, depth: u8) std.Io
                 if (pick < fuzz_vocab.len) {
                     try std.json.Stringify.encodeJsonString(fuzz_vocab[pick], .{}, w);
                 } else {
-                    var raw: [12]u8 = undefined;
-                    const m = smith.slice(&raw);
+                    const m = c.ranged(0, 12);
                     var kbuf: [32]u8 = undefined;
                     var key_len: usize = (std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable).len;
-                    for (raw[0..m]) |b| {
-                        kbuf[key_len] = fuzz_key_alphabet[b % fuzz_key_alphabet.len];
+                    for (0..m) |_| {
+                        kbuf[key_len] = fuzz_key_alphabet[c.byte() % fuzz_key_alphabet.len];
                         key_len += 1;
                     }
                     try std.json.Stringify.encodeJsonString(kbuf[0..key_len], .{}, w);
                 }
                 try w.writeByte(':');
-                try fuzzJsonValue(smith, w, depth - 1);
+                try fuzzJsonValue(c, w, depth - 1);
             }
             try w.writeByte('}');
         },
         else => {
             try w.writeByte('[');
-            const n = smith.index(4);
+            const n = c.ranged(0, 3);
             for (0..n) |i| {
                 if (i != 0) try w.writeByte(',');
-                try fuzzJsonValue(smith, w, depth - 1);
+                try fuzzJsonValue(c, w, depth - 1);
             }
             try w.writeByte(']');
         },
@@ -6139,35 +6225,112 @@ fn fuzzJsonValue(smith: *std.testing.Smith, w: *std.Io.Writer, depth: u8) std.Io
 
 /// `{"jsonrpc":"2.0","id":<id>,"result":<fuzz>}` or the `"error"` twin — the
 /// exact two shapes `deliverResponse` decodes.
-fn buildFuzzResponse(smith: *std.testing.Smith, w: *std.Io.Writer, id: u64) std.Io.Writer.Error!void {
+fn buildFuzzResponse(c: *kit.Cursor, w: *std.Io.Writer, id: u64) std.Io.Writer.Error!void {
     try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},", .{id});
-    if (smith.index(4) == 0) {
+    if (c.ranged(0, 3) == 0) {
         try w.writeAll("\"error\":");
         // Mostly the spec's error-object shape, sometimes an arbitrary value,
         // so both the `e == .object` arm and its else are exercised.
-        if (smith.index(4) != 0) {
+        if (c.ranged(0, 3) != 0) {
             try w.writeAll("{\"code\":");
-            try fuzzJsonValue(smith, w, 0);
+            try fuzzJsonValue(c, w, 0);
             try w.writeAll(",\"message\":");
-            try fuzzJsonValue(smith, w, 0);
+            try fuzzJsonValue(c, w, 0);
             try w.writeAll(",\"data\":");
-            try fuzzJsonValue(smith, w, 1);
+            try fuzzJsonValue(c, w, 1);
             try w.writeByte('}');
         } else {
-            try fuzzJsonValue(smith, w, 2);
+            try fuzzJsonValue(c, w, 2);
         }
     } else {
         try w.writeAll("\"result\":");
-        try fuzzJsonValue(smith, w, 2);
+        try fuzzJsonValue(c, w, 2);
     }
     try w.writeByte('}');
 }
 
+/// `testkit.fuzz.Cursor`. This harness draws a SHAPE — which request kind,
+/// which peer, and the JSON tree of the answer — not a byte string, so there
+/// is no frame to be faithful to. `Cursor` reads every choice out of ONE
+/// byte-first `smith.slice`, which makes the draw honest and makes a seed a
+/// readable script; a short script CYCLES rather than running out. Under
+/// `--fuzz` the fuzzer still drives every choice, because it drives the slice.
+const kit = @import("testkit").fuzz;
+
+/// Scripts for the fuzzed rounds: kind, peer, then the JSON tree.
+const response_scripts = [_][]const u8{
+    // ⛔ The empty script reproduces the collapsed harness EXACTLY: every read
+    //    is 0, so all four rounds were `.sampling` on peer 0 carrying
+    //    `"result":<the first vocab string>` — four identical answers.
+    seed(""),
+    seed("\x01\x02\x04"), // elicitation on peer 2, a null result
+    seed("\x00\x01\x06\x02\x00\x01\x02"), // sampling on peer 1, an object result with two keys
+    seed("\x01\x00\x07\x03\x00\x02\x04"), // elicitation on peer 0, an array result
+    seed("\x00\x02\x00\x00"), // the `"error"` twin: `c.ranged(0, 3)` reads 0, so the error arm runs
+    seed("\x00\x00\x01\x7f\xff\x7f\xff"), // a large integer result
+    seed("\x01\x01\x05\x80\x00"), // a fractional result
+    seed("\x00\x02\x06\x03\x0e\x0e\x0e"), // an object whose keys all come from the fuzzer alphabet, not the vocab
+};
+
+test "corpus: every response script builds a distinct line, and the octets are pinned" {
+    // ⭐ The measurement, executable. It drives `buildFuzzResponse` through a
+    // `Cursor` exactly the way the harness does.
+    //
+    // `distinct` is the second number and it is the load-bearing one: the
+    // harness's per-round `before + 1 == probe.calls` assertion was TRUE on
+    // every collapsed run — all four rounds did reach the handler — while the
+    // four answers were byte-identical. Reaching the handler was never the
+    // question; carrying different payloads there was.
+    var octets: usize = 0;
+    var distinct: usize = 0;
+    var seen: [response_scripts.len][256]u8 = undefined;
+    var seen_len: [response_scripts.len]usize = undefined;
+    for (response_scripts, 0..) |sd, si| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [64]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        var c = kit.Cursor{ .bytes = script[0..n] };
+
+        var line: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer line.deinit();
+        try buildFuzzResponse(&c, &line.writer, 1);
+        const out = line.written();
+        octets += out.len;
+
+        var dup = false;
+        for (0..si) |j| {
+            if (std.mem.eql(u8, seen[j][0..seen_len[j]], out)) dup = true;
+        }
+        if (!dup) distinct += 1;
+        seen_len[si] = @min(out.len, 256);
+        @memcpy(seen[si][0..seen_len[si]], out[0..seen_len[si]]);
+    }
+    // Measured 2026-09-07. Before: the four fuzzed rounds built ONE distinct
+    // line, repeated.
+    try testing.expectEqual(@as(usize, 8), distinct); // all eight scripts, none repeating another
+    try testing.expectEqual(@as(usize, 470), octets);
+}
+
 test "fuzz: an arbitrary client RESPONSE never panics and always reaches the parsers" {
-    try testing.fuzz({}, fuzzClientResponse, .{});
+    try testing.fuzz({}, fuzzClientResponse, .{ .corpus = &response_scripts });
 }
 
 fn fuzzClientResponse(_: void, smith: *std.testing.Smith) !void {
+    // ⚠ ONE byte-first draw, then a `Cursor` over it. What stood here drew
+    // every choice from `smith` directly, opening with `smith.index(2)`. A
+    // `Smith` ranged draw returns the range MINIMUM when fewer than eight
+    // octets remain, and this target carried no corpus, so outside `--fuzz`
+    // the single input it ever ran was empty and EVERY choice collapsed: all
+    // four "fuzzed rounds" were `.sampling` on peer 0 carrying the same
+    // `"result"` value, and the miss-path round used id 0 and peer 0 — which
+    // is a peer that IS armed, so even that was not the miss it is named for.
+    // The aim canary below is hand-written and did keep working, which is why
+    // this target looked healthy: it asserted three correlating answers that
+    // do not depend on the fuzzer at all. Measured 2026-09-07: 1 round,
+    // 4 identical fuzzed answers, 1 distinct JSON shape.
+    var script: [64]u8 = undefined;
+    const script_len: usize = smith.slice(&script);
+    var c = kit.Cursor{ .bytes = script[0..script_len] };
     var s = try serverWithCaps("{\"sampling\":{},\"elicitation\":{\"form\":{},\"url\":{}}}");
     defer s.deinit();
     // Every peer this harness arms a request for must have handshaken:
@@ -6219,11 +6382,11 @@ fn fuzzClientResponse(_: void, smith: *std.testing.Smith) !void {
     // ── the fuzzed rounds: arbitrary result/error payloads on a correlating
     // id + peer, so every one of them MUST reach the handler.
     for (0..4) |_| {
-        const kind: RequestKind = if (smith.index(2) == 0) .sampling else .elicitation;
-        const peer: u64 = smith.index(3);
+        const kind: RequestKind = if (c.ranged(0, 1) == 0) .sampling else .elicitation;
+        const peer: u64 = c.ranged(0, 2);
         const id = try armPending(&s, &probe, kind, peer);
         line.clearRetainingCapacity();
-        try buildFuzzResponse(smith, &line.writer, id);
+        try buildFuzzResponse(&c, &line.writer, id);
         const before = probe.calls;
         try deliverFuzzLine(&s, line.written(), peer);
         try testing.expectEqual(before + 1, probe.calls);
@@ -6236,7 +6399,7 @@ fn fuzzClientResponse(_: void, smith: *std.testing.Smith) !void {
     {
         _ = try armPending(&s, &probe, .sampling, 1);
         line.clearRetainingCapacity();
-        try buildFuzzResponse(smith, &line.writer, smith.value(u64));
-        try deliverFuzzLine(&s, line.written(), smith.value(u64));
+        try buildFuzzResponse(&c, &line.writer, c.word());
+        try deliverFuzzLine(&s, line.written(), c.word());
     }
 }

@@ -27,7 +27,6 @@ frost 1
 jwe 2
 k256 2
 loopix 1
-mcp 2
 mcp-http 1
 megolm 2
 minisign 2
@@ -61,7 +60,6 @@ tz 2
 validate 2
 voprf 1
 webhooksig 1
-xmldsig 1
 xmlenc 1
 xmss 1
 yaml 2
