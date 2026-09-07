@@ -38,7 +38,6 @@ ocspcache 2
 p256 1
 pping 1
 protobuf 2
-psbt 1
 qrscan 2
 quic-crypto 1
 rawsock 3
