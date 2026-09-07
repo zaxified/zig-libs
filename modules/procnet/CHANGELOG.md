@@ -5,6 +5,47 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-07** — **All five fuzz harnesses parsed the empty string, every iteration,
+  for their whole lives — and one earlier audit fix aimed at exactly this bought
+  nothing.**
+
+  Each parser had its own copy of a `mutateSample` helper, and all five opened with
+  `if (smith.valueRangeAtMost(u8, 0, 4) == 0)`. A `Smith` ranged draw reads eight
+  octets as a little-endian u64 and returns the range **minimum** unless that word
+  already lies inside the range, and after the first short read `Smith` discards the
+  rest of the input. So the test was always 0, the *"one draw in five is pure arbitrary
+  bytes"* branch was taken every time, and the length drawn after `smith.bytes(buf)`
+  was 0. The real `/proc` fixtures in the corpora — `arp.txt`, `route.txt`,
+  `nf_conntrack.txt`, four socket tables — were never parsed once.
+
+  ⛔ **`process.zig`'s sample index was a previous audit's fix, and it bought nothing.**
+  The comment beside it read *"Was `proc_stat_corpus[0]`, so the two paren-heavy
+  samples this harness exists for — `((sd-pam))` and `my weird) name` — were never
+  mutation seeds … (W2 re-audit 2026-09-02, `procnet` F10)."* The replacement,
+  `smith.index(proc_stat_corpus.len)`, is a ranged draw too and returned 0 for every
+  input a corpus can carry: the index was 0 before the fix and 0 after it, and the two
+  samples the fix was written for stayed unreached.
+
+  ⛔ **`sockets.zig` had the same draw**, so four of its five fixtures — **both IPv6
+  tables and both big-endian MIPS ones** — were never selected. Every address family
+  and byte order `parseLocalAddr` has a separate branch for went unexercised.
+
+  The five copies of `mutateSample` are replaced by one `src/fuzzsample.zig`, driven by
+  a byte script read off a single `smith.slice` draw through `testkit.fuzz.Cursor`. A
+  knob cannot be drawn after the bytes because there are no draws after the bytes: the
+  seed's own octets say which sample, how to damage it and how far to truncate it.
+  Each parser has a corpus and a guard test in the ordinary lane.
+
+  Measured before → after (every "before" is 0, because every harness parsed `""`):
+  ARP 37 entries decoded / 42 octets mutated · conntrack 30 flows, 37 rows walked /
+  36 mutated · routes 37 rows / 42 mutated · `/proc/<pid>/stat` **all 5 samples
+  selected**, 9 lines parsed / 25 mutated · sockets **all 5 fixtures selected**, 45 TCP
+  and 45 UDP entries / 34 mutated.
+
+  None of the guards uses `accepted > 0`: `parseArp("")`, `parseRoutes("")` and
+  `parseConntrack("")` all **succeed** with zero entries, so an acceptance count would
+  have read 100% on precisely the input these harnesses were stuck on.
+
 - **2026-09-02** — **Truncation is reported instead of being invisible, and `/proc` is treated as
   untrusted input.** Eight findings from the drift re-audit (`952ec657`), each pinned by a test
   that goes red when the fix is reverted. `readSockets` returned a bare `[]SocketEntry`, which

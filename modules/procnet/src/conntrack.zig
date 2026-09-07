@@ -203,39 +203,83 @@ test "parseConntrack: malformed lines count toward total but are skipped" {
 // module, unlike the others' fixed column order. Allocates, so this runs
 // under `std.testing.allocator` with the result freed on every path (via
 // `ConntrackResult.deinit`, the module's own free path).
+/// The shared script reader. See `fuzzsample.zig` for what collapsed here and
+/// why the choices now come out of the seed's own octets instead of a draw.
+const fuzzsample = @import("fuzzsample.zig");
+const seed = fuzzsample.seed;
+
+/// Scripts for the sample builder: `sampleIndex, mode, mutationCount,
+/// truncate(2)`, then `offset(2), value` per mutation. `mode` 0 asks for
+/// arbitrary bytes and a truncation at or over the sample's length means "do
+/// not truncate", so `\xff\xff` is the whole table.
+///
+/// The mutation half is what this target is for: arbitrary bytes essentially
+/// never spell a `key=value` token the free-form `kvField` scan recognizes, so
+/// damaging a known-good table reaches the src/dst/sport/dport decode logic far
+/// more often than a from-scratch random blob would.
+const conntrack_samples = [_][]const u8{fixture};
+
+const conntrack_seeds = [_][]const u8{
+    seed("\x00\x01\x00\xff\xff"), // the real table, undamaged
+    seed("\x00\x01\x01\xff\xff" ++ "\x00\x30="), // an extra '=' inside a key=value token
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x30=\x00\x31="), // two of them, adjacent
+    seed("\x00\x01\x01\xff\xff" ++ "\x00\x30\x20"), // a space splitting a token in half
+    seed("\x00\x01\x04\xff\xff" ++ "\x00\x28.\x00\x2a.\x00\x2c.\x00\x2e."), // dots through an address value
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x20\x0a\x00\x21\x0a"), // newlines cut a row in half
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x20\x00\x00\x21\x00"), // NULs inside a row
+    seed("\x00\x01\x18\xff\xff"), // the maximum mutation count
+    seed("\x00\x01\x00\x00\x40"), // truncated to 64 octets, mid-row
+    seed("\x00\x01\x00\x00\x01"), // truncated to a single octet
+    seed("\x00\x01\x00\x00\x00"), // truncated to nothing
+    seed("\x00\x00\x00\x00\x00\x00\x20" ++ "src=1.2.3.4 dst=5.6.7.8 sport=1 "), // arbitrary mode: a hand-written line
+    seed("\x00\x00\x00\x00\x00\x00\x08" ++ "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8"), // arbitrary mode: high bytes
+    seed(""), // the empty script: exactly what the collapsed helper ran
+};
+
 test "fuzz: parseConntrack never panics, OOB or leaks, arbitrary or mutated-real bytes" {
-    try std.testing.fuzz({}, fuzzParseConntrackNeverLeaks, .{ .corpus = &.{fixture} });
+    try std.testing.fuzz({}, fuzzParseConntrackNeverLeaks, .{ .corpus = &conntrack_seeds });
 }
 
 fn fuzzParseConntrackNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
     var buf: [1024]u8 = undefined;
-    const text = mutateSample(smith, fixture, &buf);
+    var choice: fuzzsample.Choice = .{};
+    const text = fuzzsample.build(script[0..n], &conntrack_samples, &buf, &choice);
     var result = try parseConntrack(testing.allocator, text, 50);
     result.deinit(testing.allocator);
 }
 
-/// One draw in five is pure arbitrary bytes; the rest starts from the real
-/// `/proc/net/nf_conntrack` fixture and applies a handful of byte-level
-/// mutations — arbitrary bytes essentially never spell a `key=value` token
-/// the free-form `kvField` scan recognizes, so mutating a known-good table
-/// reaches the src/dst/sport/dport decode logic far more often than a
-/// from-scratch random blob would.
-fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
-    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
-        smith.bytes(buf);
-        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
-        return buf[0..len];
+test "corpus: every conntrack script reaches the parser, and the flows decoded are pinned" {
+    // ⭐ `parseConntrack("")` succeeds with zero flows, so acceptance says
+    // nothing. The numbers an empty input cannot produce are the flows decoded
+    // and the rows the parser walked — and the two differ, because a row that
+    // is skipped still counts toward `total`.
+    var nonempty: usize = 0;
+    var flows: usize = 0;
+    var rows: usize = 0;
+    var mutations: usize = 0;
+    for (conntrack_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var buf: [1024]u8 = undefined;
+        var choice: fuzzsample.Choice = .{};
+        const text = fuzzsample.build(script[0..n], &conntrack_samples, &buf, &choice);
+        mutations += choice.mutations;
+        var result = parseConntrack(testing.allocator, text, 50) catch continue;
+        defer result.deinit(testing.allocator);
+        flows += result.flows.len;
+        rows += result.total;
     }
-    const len = @min(sample.len, buf.len);
-    @memcpy(buf[0..len], sample[0..len]);
-    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
-    var i: u8 = 0;
-    while (i < n_mutations) : (i += 1) {
-        if (len == 0) break;
-        buf[smith.index(len)] = smith.value(u8);
-    }
-    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
-    return buf[0..out_len];
+    // One seed is deliberately the empty script.
+    try testing.expectEqual(conntrack_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: 0 flows and 0 mutations before the draws were
+    // restructured — every iteration parsed the empty string.
+    try testing.expectEqual(@as(usize, 30), flows);
+    try testing.expectEqual(@as(usize, 37), rows);
+    try testing.expectEqual(@as(usize, 36), mutations);
 }
 
 test "a capped read says so, instead of reporting a short total as the true one" {

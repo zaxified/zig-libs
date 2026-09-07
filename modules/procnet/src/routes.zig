@@ -361,37 +361,76 @@ test "parseRoutes: interface name longer than IFNAMSIZ is truncated, not dropped
 // snapshot read from a file). Allocates (`ArrayList` + `copyClamped` into a
 // fixed buffer), so this runs under `std.testing.allocator` with the result
 // freed on every path — a leak on a skipped-row error path is a real finding.
+/// The shared script reader. See `fuzzsample.zig` for what collapsed here and
+/// why the choices now come out of the seed's own octets instead of a draw.
+const fuzzsample = @import("fuzzsample.zig");
+const seed = fuzzsample.seed;
+
+/// Scripts for the sample builder: `sampleIndex, mode, mutationCount,
+/// truncate(2)`, then `offset(2), value` per mutation. `mode` 0 asks for
+/// arbitrary bytes and a truncation at or over the sample's length means "do
+/// not truncate", so `\xff\xff` is the whole table.
+///
+/// The mutation half is what this target is for: arbitrary bytes essentially
+/// never spell the right column count with 8-hex-char addresses, so damaging a
+/// known-good table reaches the row decode logic — the little-endian hex and
+/// the contiguous-mask check — far more often than a random blob would.
+const routes_samples = [_][]const u8{fixture};
+
+const routes_seeds = [_][]const u8{
+    seed("\x00\x01\x00\xff\xff"), // the real table, undamaged
+    seed("\x00\x01\x01\xff\xff" ++ "\x00\x30Z"), // a non-hex character in an address column
+    seed("\x00\x01\x01\xff\xff" ++ "\x00\x30\x09"), // a TAB where a hex digit belongs
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x30\x20\x00\x31\x20"), // two spaces: a column count that no longer matches
+    seed("\x00\x01\x08\xff\xff" ++ "\x00\x38F\x00\x39F\x00\x3aF\x00\x3bF\x00\x3cF\x00\x3dF\x00\x3eF\x00\x3fF"), // ⭐ an all-ones mask column: the non-contiguous check
+    seed("\x00\x01\x04\xff\xff" ++ "\x00\x38F\x00\x39\x30\x00\x3aF\x00\x3b\x30"), // ⭐ an alternating mask: non-contiguous, which must be refused
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x20\x0a\x00\x21\x0a"), // newlines cut a row in half
+    seed("\x00\x01\x18\xff\xff"), // the maximum mutation count
+    seed("\x00\x01\x00\x00\x30"), // truncated to 48 octets, mid-row
+    seed("\x00\x01\x00\x00\x01"), // truncated to a single octet
+    seed("\x00\x01\x00\x00\x00"), // truncated to nothing
+    seed("\x00\x00\x00\x00\x00\x00\x37" ++ "eth0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"), // arbitrary mode: a hand-written default route
+    seed("\x00\x00\x00\x00\x00\x00\x08" ++ "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8"), // arbitrary mode: high bytes
+    seed(""), // the empty script: exactly what the collapsed helper ran
+};
+
 test "fuzz: parseRoutes never panics, OOB or leaks, arbitrary or mutated-real bytes" {
-    try std.testing.fuzz({}, fuzzParseRoutesNeverLeaks, .{ .corpus = &.{fixture} });
+    try std.testing.fuzz({}, fuzzParseRoutesNeverLeaks, .{ .corpus = &routes_seeds });
 }
 
 fn fuzzParseRoutesNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
     var buf: [1024]u8 = undefined;
-    const text = mutateSample(smith, fixture, &buf);
+    var choice: fuzzsample.Choice = .{};
+    const text = fuzzsample.build(script[0..n], &routes_samples, &buf, &choice);
     const entries = try parseRoutes(testing.allocator, text);
     testing.allocator.free(entries);
 }
 
-/// One draw in five is pure arbitrary bytes; the rest starts from the real
-/// `/proc/net/route` fixture and applies a handful of byte-level mutations —
-/// arbitrary bytes essentially never spell the right column count with
-/// 8-hex-char addresses, so mutating a known-good table reaches the row
-/// decode logic (the little-endian hex, the contiguous-mask check) far more
-/// often than a from-scratch random blob would.
-fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
-    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
-        smith.bytes(buf);
-        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
-        return buf[0..len];
+test "corpus: every routes script reaches the parser, and the rows decoded are pinned" {
+    // ⭐ `parseRoutes("")` succeeds with zero rows, so acceptance says nothing.
+    // The number an empty input cannot produce is the rows decoded.
+    var nonempty: usize = 0;
+    var rows: usize = 0;
+    var mutations: usize = 0;
+    for (routes_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var buf: [1024]u8 = undefined;
+        var choice: fuzzsample.Choice = .{};
+        const text = fuzzsample.build(script[0..n], &routes_samples, &buf, &choice);
+        mutations += choice.mutations;
+        const entries = parseRoutes(testing.allocator, text) catch continue;
+        defer testing.allocator.free(entries);
+        rows += entries.len;
     }
-    const len = @min(sample.len, buf.len);
-    @memcpy(buf[0..len], sample[0..len]);
-    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
-    var i: u8 = 0;
-    while (i < n_mutations) : (i += 1) {
-        if (len == 0) break;
-        buf[smith.index(len)] = smith.value(u8);
-    }
-    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
-    return buf[0..out_len];
+    // One seed is deliberately the empty script.
+    try testing.expectEqual(routes_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: 0 rows and 0 mutations before the draws were
+    // restructured — every iteration parsed the empty string.
+    try testing.expectEqual(@as(usize, 37), rows);
+    try testing.expectEqual(@as(usize, 42), mutations);
 }

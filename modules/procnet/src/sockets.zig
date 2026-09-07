@@ -669,14 +669,56 @@ test "parseTcp: malformed rows are skipped, not fatal" {
 // runs under `std.testing.allocator` with the result freed on every path.
 const socket_corpus = [_][]const u8{ tcp_fixture, tcp6_fixture, udp_fixture, udp6_fixture, tcp_be_fixture };
 
+/// The shared script reader. See `fuzzsample.zig` for what collapsed here and
+/// why the choices now come out of the seed's own octets instead of a draw.
+const fuzzsample = @import("fuzzsample.zig");
+const seed = fuzzsample.seed;
+
+/// Scripts for the sample builder: `sampleIndex, mode, mutationCount,
+/// truncate(2)`, then `offset(2), value` per mutation. `mode` 0 asks for
+/// arbitrary bytes and a truncation at or over the sample's length means "do
+/// not truncate", so `\xff\xff` is the whole table.
+///
+/// ⛔ The sample index was `smith.index(socket_corpus.len)` — a ranged draw,
+/// which returns 0 for every input a corpus can carry. Four of the five
+/// fixtures, INCLUDING both IPv6 tables and both big-endian MIPS ones, were
+/// never selected: the harness only ever saw `tcp_fixture`, and then only as an
+/// empty string, because the length draw after `smith.bytes` collapsed too.
+///
+/// The mutation half is what this target is for: arbitrary bytes essentially
+/// never spell an `addr:port` column with the exact 8- or 32-hex-char address
+/// length both of `parseLocalAddr`'s branches require, so damaging a known-good
+/// table reaches that decode logic far more often than a random blob would.
+const socket_seeds = [_][]const u8{
+    seed("\x00\x01\x00\xff\xff"), // sample 0: the IPv4 TCP table, undamaged
+    seed("\x01\x01\x00\xff\xff"), // ⭐ sample 1: the IPv6 TCP table, never selected before
+    seed("\x02\x01\x00\xff\xff"), // ⭐ sample 2: the IPv4 UDP table
+    seed("\x03\x01\x00\xff\xff"), // ⭐ sample 3: the IPv6 UDP table
+    seed("\x04\x01\x00\xff\xff"), // ⭐ sample 4: the big-endian MIPS table
+    seed("\x00\x01\x01\xff\xff" ++ "\x00\x50Z"), // a non-hex character inside an address column
+    seed("\x01\x01\x01\xff\xff" ++ "\x00\x50Z"), // the same against a 32-hex-char IPv6 address
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x4e:\x00\x4f:"), // extra colons in the addr:port column
+    seed("\x01\x01\x02\xff\xff" ++ "\x00\x4e:\x00\x4f:"), // the same on the IPv6 table
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x40\x20\x00\x41\x20"), // spaces where a column boundary is not expected
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x40\x0a\x00\x41\x0a"), // newlines cut a row in half
+    seed("\x04\x01\x18\xff\xff"), // the maximum mutation count, on the big-endian table
+    seed("\x01\x01\x00\x00\x60"), // the IPv6 table truncated mid-address
+    seed("\x00\x01\x00\x00\x01"), // truncated to a single octet
+    seed("\x00\x01\x00\x00\x00"), // truncated to nothing
+    seed("\x00\x00\x00\x00\x00\x00\x08" ++ "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8"), // arbitrary mode: high bytes
+    seed(""), // the empty script: exactly what the collapsed helper ran
+};
+
 test "fuzz: parseTcp/parseUdp never panic, OOB or leak, arbitrary or mutated-real bytes" {
-    try std.testing.fuzz({}, fuzzParseSocketsNeverLeaks, .{ .corpus = &socket_corpus });
+    try std.testing.fuzz({}, fuzzParseSocketsNeverLeaks, .{ .corpus = &socket_seeds });
 }
 
 fn fuzzParseSocketsNeverLeaks(_: void, smith: *std.testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
     var buf: [1024]u8 = undefined;
-    const sample = socket_corpus[smith.index(socket_corpus.len)];
-    const text = mutateSample(smith, sample, &buf);
+    var choice: fuzzsample.Choice = .{};
+    const text = fuzzsample.build(script[0..n], &socket_corpus, &buf, &choice);
 
     const tcp_entries = try parseTcp(testing.allocator, text);
     testing.allocator.free(tcp_entries);
@@ -684,29 +726,50 @@ fn fuzzParseSocketsNeverLeaks(_: void, smith: *std.testing.Smith) !void {
     testing.allocator.free(udp_entries);
 }
 
-/// One draw in five is pure arbitrary bytes; the rest starts from a real
-/// `/proc/net/{tcp,tcp6,udp,udp6}` fixture and applies a handful of
-/// byte-level mutations — arbitrary bytes essentially never spell an
-/// `addr:port` column with the exact 8- or 32-hex-char address length both
-/// `parseLocalAddr`'s v4/v6 branches require, so mutating a known-good table
-/// reaches that decode logic far more often than a from-scratch random blob
-/// would.
-fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
-    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
-        smith.bytes(buf);
-        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
-        return buf[0..len];
+test "corpus: every socket script reaches both parsers, and the sockets decoded are pinned" {
+    // ⭐ Two numbers that the collapsed harness could not produce. `samples`
+    // is how many of the five fixtures the corpus actually selects — it was
+    // 1, and the four it skipped are the two IPv6 tables and the two
+    // big-endian MIPS ones, which is to say every address family and byte
+    // order this parser has a separate branch for. `tcp + udp` is the sockets
+    // decoded: `parseTcp("")` succeeds with zero entries, so acceptance alone
+    // would have read 100% on the empty string the harness actually ran.
+    var nonempty: usize = 0;
+    var tcp: usize = 0;
+    var udp: usize = 0;
+    var mutations: usize = 0;
+    var samples_seen = [_]bool{false} ** socket_corpus.len;
+    for (socket_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var buf: [1024]u8 = undefined;
+        var choice: fuzzsample.Choice = .{};
+        const text = fuzzsample.build(script[0..n], &socket_corpus, &buf, &choice);
+        samples_seen[choice.sample] = true;
+        mutations += choice.mutations;
+        if (parseTcp(testing.allocator, text)) |e| {
+            defer testing.allocator.free(e);
+            tcp += e.len;
+        } else |_| {}
+        if (parseUdp(testing.allocator, text)) |e| {
+            defer testing.allocator.free(e);
+            udp += e.len;
+        } else |_| {}
     }
-    const len = @min(sample.len, buf.len);
-    @memcpy(buf[0..len], sample[0..len]);
-    const n_mutations = smith.valueRangeAtMost(u8, 0, 24);
-    var i: u8 = 0;
-    while (i < n_mutations) : (i += 1) {
-        if (len == 0) break;
-        buf[smith.index(len)] = smith.value(u8);
+    var samples: usize = 0;
+    for (samples_seen) |b| {
+        if (b) samples += 1;
     }
-    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
-    return buf[0..out_len];
+    // One seed is deliberately the empty script.
+    try testing.expectEqual(socket_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: 1 sample, 0 TCP entries, 0 UDP entries and 0 octets
+    // mutated before the draws were restructured.
+    try testing.expectEqual(socket_corpus.len, samples);
+    try testing.expectEqual(@as(usize, 45), tcp);
+    try testing.expectEqual(@as(usize, 45), udp);
+    try testing.expectEqual(@as(usize, 34), mutations);
 }
 
 test "hexWord accepts eight HEX DIGITS, not eight characters" {

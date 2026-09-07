@@ -589,40 +589,98 @@ const proc_stat_corpus = [_][]const u8{
     "no-parens-here S 1 1",
 };
 
+/// The shared script reader. See `fuzzsample.zig` for what collapsed here and
+/// why the choices now come out of the seed's own octets instead of a draw.
+const fuzzsample = @import("fuzzsample.zig");
+const seed = fuzzsample.seed;
+
+/// Scripts for the sample builder: `sampleIndex, mode, mutationCount,
+/// truncate(2)`, then `offset(2), value` per mutation. `mode` 0 asks for
+/// arbitrary bytes and a truncation at or over the sample's length means "do
+/// not truncate", so `\xff\xff` is the whole sample.
+///
+/// ⛔ The sample index here was itself a collapsed draw, and it was a PREVIOUS
+/// audit's fix. The comment it carried read: *"Was `proc_stat_corpus[0]`, so
+/// the two paren-heavy samples this harness exists for — `((sd-pam))` and
+/// `my weird) name` — were never mutation seeds. `sockets.zig` draws its seed;
+/// this did not (W2 re-audit 2026-09-02, `procnet` F10)."* Replacing the
+/// constant `0` with `smith.index(proc_stat_corpus.len)` bought nothing:
+/// `index` is a ranged draw, it returned 0 on every input a corpus can carry,
+/// and the two samples the fix was written for stayed unreached. The index now
+/// comes from the seed's first octet, and the corpus below spells out which
+/// sample each script selects.
+///
+/// The mutation half is what this target is for: arbitrary bytes essentially
+/// never spell a balanced `(...)` around a plausible `comm`, so damaging a
+/// known-good sample reaches the field-counting loop past `comm` far more often
+/// than a from-scratch random string would.
+const proc_stat_seeds = [_][]const u8{
+    seed("\x00\x01\x00\xff\xff"), // sample 0, undamaged: the ordinary systemd line
+    seed("\x01\x01\x00\xff\xff"), // ⭐ sample 1: `((sd-pam))`, one of the two the earlier fix was written for
+    seed("\x02\x01\x00\xff\xff"), // ⭐ sample 2: `my weird) name`, the other one
+    seed("\x03\x01\x00\xff\xff"), // sample 3: the empty line
+    seed("\x04\x01\x00\xff\xff"), // sample 4: no parens at all
+    seed("\x01\x01\x01\xff\xff" ++ "\x00\x07)"), // an extra ')' inside the nested-paren comm
+    seed("\x02\x01\x01\xff\xff" ++ "\x00\x03("), // an extra '(' before the comm closes
+    seed("\x00\x01\x02\xff\xff" ++ "\x00\x02(\x00\x0b("), // two more opening parens
+    seed("\x00\x01\x01\xff\xff" ++ "\x00\x0b\x20"), // a space inside the comm
+    seed("\x00\x01\x04\xff\xff" ++ "\x00\x14Z\x00\x16Z\x00\x18Z\x00\x1aZ"), // letters where the numeric fields belong
+    seed("\x00\x01\x10\xff\xff"), // the maximum mutation count
+    seed("\x00\x01\x00\x00\x0c"), // truncated INSIDE the comm parens
+    seed("\x00\x01\x00\x00\x01"), // truncated to a single octet
+    seed("\x00\x01\x00\x00\x00"), // truncated to nothing
+    seed("\x00\x00\x00\x00\x00\x00\x0e" ++ "7 () R 1 1 1 0"), // arbitrary mode: an EMPTY comm
+    seed("\x00\x00\x00\x00\x00\x00\x08" ++ "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8"), // arbitrary mode: high bytes
+    seed(""), // the empty script: exactly what the collapsed helper ran
+};
+
 test "fuzz: parseProcStat never panics, arbitrary or mutated-real bytes" {
-    try std.testing.fuzz({}, fuzzParseProcStatNeverPanics, .{ .corpus = &proc_stat_corpus });
+    try std.testing.fuzz({}, fuzzParseProcStatNeverPanics, .{ .corpus = &proc_stat_seeds });
 }
 
 fn fuzzParseProcStatNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var script: [512]u8 = undefined;
+    const n: usize = smith.slice(&script);
     var buf: [256]u8 = undefined;
-    // Was `proc_stat_corpus[0]`, so the two paren-heavy samples this harness
-    // exists for — `((sd-pam))` and `my weird) name` — were never mutation
-    // seeds. `sockets.zig` draws its seed; this did not
-    // (W2 re-audit 2026-09-02, `procnet` F10).
-    const line = mutateSample(smith, proc_stat_corpus[smith.index(proc_stat_corpus.len)], &buf);
+    var choice: fuzzsample.Choice = .{};
+    const line = fuzzsample.build(script[0..n], &proc_stat_corpus, &buf, &choice);
     _ = parseProcStat(line);
 }
 
-/// One draw in five is pure arbitrary bytes; the rest starts from a real
-/// `/proc/<pid>/stat` line and applies a handful of byte-level mutations —
-/// arbitrary bytes essentially never spell a balanced `(...)` around a
-/// plausible `comm`, so mutating a known-good sample reaches the parser's
-/// interior (the field-counting loop past `comm`) far more often than a
-/// from-scratch random string would.
-fn mutateSample(smith: *std.testing.Smith, sample: []const u8, buf: []u8) []const u8 {
-    if (smith.valueRangeAtMost(u8, 0, 4) == 0) {
-        smith.bytes(buf);
-        const len = smith.valueRangeAtMost(u16, 0, @intCast(buf.len));
-        return buf[0..len];
+test "corpus: every stat script reaches the parser, and the samples selected are pinned" {
+    // ⭐ The number that matters is how many DISTINCT samples the corpus
+    // selected, because that is exactly what the previous audit's fix claimed
+    // to buy and did not: `smith.index(proc_stat_corpus.len)` returned 0 for
+    // every input, so `((sd-pam))` and `my weird) name` — the two lines this
+    // harness exists for — were never mutation seeds even after the fix.
+    //
+    // `parsed` is the second number. `parseProcStat("")` returns null rather
+    // than a value, so it is not the empty input that produces it.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var mutations: usize = 0;
+    var samples_seen = [_]bool{false} ** proc_stat_corpus.len;
+    for (proc_stat_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var script: [512]u8 = undefined;
+        const n: usize = smith.slice(&script);
+        if (n != 0) nonempty += 1;
+        var buf: [256]u8 = undefined;
+        var choice: fuzzsample.Choice = .{};
+        const line = fuzzsample.build(script[0..n], &proc_stat_corpus, &buf, &choice);
+        samples_seen[choice.sample] = true;
+        mutations += choice.mutations;
+        if (parseProcStat(line) != null) parsed += 1;
     }
-    const len = @min(sample.len, buf.len);
-    @memcpy(buf[0..len], sample[0..len]);
-    const n_mutations = smith.valueRangeAtMost(u8, 0, 16);
-    var i: u8 = 0;
-    while (i < n_mutations) : (i += 1) {
-        if (len == 0) break;
-        buf[smith.index(len)] = smith.value(u8);
+    var samples: usize = 0;
+    for (samples_seen) |b| {
+        if (b) samples += 1;
     }
-    const out_len = smith.valueRangeAtMost(u16, 0, @intCast(len));
-    return buf[0..out_len];
+    // One seed is deliberately the empty script.
+    try testing.expectEqual(proc_stat_seeds.len - 1, nonempty);
+    // Measured 2026-09-07: 1 sample, 0 lines parsed and 0 octets mutated
+    // before the draws were restructured.
+    try testing.expectEqual(proc_stat_corpus.len, samples);
+    try testing.expectEqual(@as(usize, 9), parsed);
+    try testing.expectEqual(@as(usize, 25), mutations);
 }
