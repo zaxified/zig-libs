@@ -1344,16 +1344,50 @@ const node_seeds = [_][]const u8{
 };
 
 test "fuzz: a node survives arbitrary frames in every state" {
-    try std.testing.fuzz({}, fuzzNode, .{ .corpus = &node_seeds });
+    var run: NodeRun = .{};
+    try std.testing.fuzz(&run, fuzzNode, .{ .corpus = &node_seeds });
 }
 
-fn fuzzNode(_: void, smith: *std.testing.Smith) !void {
+/// What one pass of `driveNode` drew and what came of it. The harness throws it
+/// away; the corpus guard below reads it.
+///
+/// ⭐ It exists because the numbers in the comment inside `driveNode` were a
+/// one-off measurement left in prose, where nothing re-evaluates them. The two
+/// knobs this file was flagged for — the starting state and the clock step —
+/// are both alive only because the seeds carry the words they read; an extra
+/// draw inserted ahead of them, or a seed grown past the 256-octet frame
+/// buffer, puts every one of them back on its range minimum silently.
+const NodeRun = struct {
+    /// The starting state the state knob selected, 0..3.
+    state: u8 = 0,
+    /// Frames handed to `onMessage` (always eight per pass).
+    frames: usize = 0,
+    /// …of which carried at least one octet.
+    nonempty: usize = 0,
+    /// …of which `sc.decode` accepted as a BVLC-SC message.
+    decodable: usize = 0,
+    /// Total milliseconds the clock advanced across the pass.
+    clock: u64 = 0,
+    /// Frames the node emitted, all of which had to decode.
+    emitted: usize = 0,
+};
+
+fn fuzzNode(run: *NodeRun, smith: *std.testing.Smith) !void {
+    run.* = .{};
+    try driveNode(smith, run);
+}
+
+/// ⭐ The harness body, factored out so the corpus guard below drives the SAME
+/// draw sequence rather than a paraphrase of it. A guard that measures a
+/// different sequence from the one the fuzzer runs is not a guard.
+fn driveNode(smith: *std.testing.Smith, run: *NodeRun) !void {
     var prng = std.Random.DefaultPrng.init(smith.value(u64));
     var node = testNode(&prng);
     var accept_buf: [64]u8 = undefined;
 
     // Land in a random state.
-    switch (smith.valueRangeAtMost(u8, 0, 3)) {
+    run.state = smith.valueRangeAtMost(u8, 0, 3);
+    switch (run.state) {
         0 => {},
         1 => _ = node.start(0),
         2 => {
@@ -1387,12 +1421,51 @@ fn fuzzNode(_: void, smith: *std.testing.Smith) !void {
         // is narrow enough to contain the word it reads. With no corpus — what
         // this harness had — it is one state, one empty frame, t=0.
         const len: usize = smith.slice(&buf);
+        run.frames += 1;
+        if (len != 0) run.nonempty += 1;
+        if (sc.decode(buf[0..len])) |_| {
+            run.decodable += 1;
+        } else |_| {}
         _ = node.onMessage(now, buf[0..len]) catch {};
         _ = node.poll(now) catch {};
         while (node.nextOutgoing()) |frame| {
             // Everything the node emits must be a decodable BVLC-SC message.
             _ = try sc.decode(frame);
+            run.emitted += 1;
         }
-        now += smith.valueRangeAtMost(u32, 0, 400_000);
+        const step = smith.valueRangeAtMost(u32, 0, 400_000);
+        run.clock += step;
+        now += step;
     }
+}
+
+test "corpus: the node seeds drive every knob, and the counts are pinned" {
+    // ⭐ The measurement in `driveNode`'s comment, executable rather than in
+    // prose, over the SAME corpus and the SAME draw sequence the harness gets.
+    //
+    // ⛔ Not `nonempty > 0`. `nonempty`, `decodable` and `clock` were all 0
+    // before the seeds carried the words the draws read: eight empty frames at
+    // t = 0, so no timer in the node could ever expire. `states_seen` is the
+    // one knob that was NOT dead — `valueRangeAtMost(u8, 0, 3)` is narrow
+    // enough to contain the word it reads — and it is pinned here so that stays
+    // visible rather than being asserted from the source of `Smith`.
+    var states_seen: [4]bool = @splat(false);
+    var totals: NodeRun = .{};
+    for (node_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var run: NodeRun = .{};
+        try driveNode(&smith, &run);
+        states_seen[run.state] = true;
+        totals.frames += run.frames;
+        totals.nonempty += run.nonempty;
+        totals.decodable += run.decodable;
+        totals.clock += run.clock;
+        totals.emitted += run.emitted;
+    }
+    for (states_seen) |s| try testing.expect(s);
+    try testing.expectEqual(@as(usize, 32), totals.frames);
+    try testing.expectEqual(@as(usize, 32), totals.nonempty);
+    try testing.expectEqual(@as(usize, 24), totals.decodable);
+    try testing.expectEqual(@as(u64, 3_680_004), totals.clock);
+    try testing.expectEqual(@as(usize, 4), totals.emitted);
 }

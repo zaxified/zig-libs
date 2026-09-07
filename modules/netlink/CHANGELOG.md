@@ -5,6 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** `bridge.fuzzBuilders` draws
+  **31 knobs behind its two byte draws**, the longest such tail in the
+  repository, and its corpus carried no octets past the name and the MAC. So
+  every one of those knobs was its own minimum — `eos` returns `true` on an
+  exhausted input, so every option was PRESENT with the value 0. `vlan_id_min`
+  is 1 and both `buildFdbRequest` and `buildVlanRequest` open with `checkVid`,
+  so those two builders answered `error.InvalidVlanId` on **every seed in the
+  corpus** and had never once returned a request. Measured per builder:
+  3/0/0/5/5 before, 3/2/3/4/5 after (13 of 25 accepted before, 17 of 25 after)
+  — the previously pinned total of 13 could not show the two zeros, which is
+  why the guard now pins the five builders separately.
+
+  A seed is now written as the VALUES its 31 draws read, in a struct of the
+  same type the harness records what it drew into, so the corpus guard compares
+  the whole schedule with one `expectEqualDeep` — a draw inserted, removed or
+  reordered fails there instead of silently shifting every later knob onto the
+  wrong word. The seeds cover the VID range refusals (`vid_end` below `vid`, a
+  VID above `vlan_id_max`, `self` and `master` together, a PVID with a range),
+  a bridge request with no IFLA_INFO_DATA nest and a brport request with
+  nothing to change.
+
+  `root.fuzzBuilders`'s guard now pins its four builders separately too
+  (3/3/4/5) and checks all six of its knobs, not just `prefix` and `ifindex`.
+
 - **2026-09-07** — **The netns bridge integration test failed on any host with
   the tunnel modules loaded, and the module was fine.** `upAllButLoopback`
   identified the kernel-named veth peer positionally, resting on an assumption it

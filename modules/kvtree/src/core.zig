@@ -605,11 +605,154 @@ test "reclaimGate: equal-txn reader is safe, strictly-older reader blocks" {
 
 const kv = @import("kv");
 
-test "fuzz: recover never panics on arbitrary on-disk page bytes" {
-    try testing.fuzz({}, fuzzRecover, .{});
+/// How many pages `fuzzRecover` lays down. Hoisted out of the harness because
+/// a corpus entry's SIZE is a function of it — see `RecoverSeed`.
+const recover_pages: PageId = 6;
+
+/// One corpus entry for `fuzzRecover`, in the layout its draws read.
+///
+/// ⛔ This target had **no corpus at all**, so the only input it ever ran
+/// outside `--fuzz` was the empty one, and every knob after the byte draw was
+/// its own range minimum. Traced through: both meta slots were stamped with
+/// `{txn_id 0, root 0, free_root 0, free_count 0, high_water 0}`, and
+/// `candidateValid` rejected each at `pageIdOk(0, 0)` — its FIRST bounds check.
+/// So the tree walk never took a single step, `leafViewSafe`/`branchViewSafe`
+/// were never called, the freelist chain walk and both cycle guards never ran,
+/// and `recover` returned `error.Unrecoverable` on the one input the ordinary
+/// lane has ever given it. Everything the comments below describe as "under
+/// test" was reachable only under `--fuzz`.
+///
+/// ⛔ And a short seed cannot fix that. The harness opens with
+/// `smith.bytes(&raw)` over a `recover_pages * page_size` buffer — 24 576
+/// octets — and `Smith.bytes` consumes `@min(out.len, in.len)`. A seed shorter
+/// than that is swallowed whole by the first draw and leaves nothing for the
+/// fifteen knobs behind it, however carefully it is written. A corpus entry
+/// here is therefore a full page image PLUS the knob words, which is why it is
+/// built at run time into an arena rather than spelled out as a literal.
+const RecoverSeed = struct {
+    /// What the page image is filled with before the knobs stamp over it. Meta
+    /// slots are `@memset` by `Meta.encode`, so this only reaches the data
+    /// pages — and `0xff` there is the point of one seed below: a page stamped
+    /// with the leaf kind byte over `0xff` fill declares a count of 65 535,
+    /// which is exactly the shape `format.leafViewSafe` was added to reject.
+    fill: u8,
+    /// The knob words, little-endian `u64`, in the order the harness draws
+    /// them. A word only survives a ranged draw if it lies inside that draw's
+    /// range; otherwise the draw returns the range MINIMUM, so these are the
+    /// values themselves and not indices into anything.
+    ///
+    /// Per meta slot (ids 0 and 1): `kind`, and if `kind != 3` also `txn_id`,
+    /// `root`, `free_root`, `count_arm`, `free_count`, `high_water`.
+    /// Per data page (ids 2..5): `shape`; then for shape 2 (branch)
+    /// `count`, `leftmost`, `count` × `child`; for shape 3 (freelist)
+    /// `size_arm`, `n`, `next`, `@min(n, capacity)` × `entry`.
+    words: []const u64,
+};
+
+/// The 340 entry words the over-capacity freelist page still draws.
+/// `candidateValid` rejects that page on its declared count before reading a
+/// single entry, but the HARNESS writes `@min(n, capacity)` of them, so a seed
+/// that omits these would run off its own end and silently zero every draw
+/// after it.
+const over_capacity_entries = [_]u64{2} ** Freelist.capacity;
+
+const recover_seeds = [_]RecoverSeed{
+    // 1. A meta that is adopted: root 2 is a leaf, no freelist. The first seed
+    //    that makes `recover` return a Meta rather than `Unrecoverable`, and
+    //    the first that reaches `leafViewSafe`. Slot 1 is left as raw fill, so
+    //    the "one slot is not a meta page" branch runs too.
+    .{ .fill = 0x00, .words = &.{ 0, 5, 2, 0, 0, 0, 3, 3, 1, 0, 0, 0 } },
+    // 2. The tree walk DESCENDS: root 2 is a branch with two separators,
+    //    leftmost 3 and right children 4 and 5, all three of them leaves. Four
+    //    pages are visited against a `high_water` of 6. Slot 1 holds a
+    //    structurally valid meta with a lower txn_id, which loses the ordering
+    //    contest — the pair the "slot position NEVER decides" comment is about.
+    .{ .fill = 0x00, .words = &.{ 0, 9, 2, 0, 0, 0, 6, 0, 1, 0, 0, 0, 0, 6, 2, 2, 3, 4, 5, 1, 1, 1 } },
+    // 3. The freelist CHAIN is walked and totalled: free_root 3 holds three
+    //    entries and chains to 4, which holds two and ends the chain, and the
+    //    meta's free_count is the 5 that makes `total == m.free_count` hold.
+    //    The accept path through the freelist, which no shorter seed reaches.
+    .{ .fill = 0x00, .words = &.{ 0, 7, 2, 3, 0, 5, 6, 3, 1, 3, 0, 3, 4, 2, 2, 2, 3, 0, 2, 0, 3, 3, 0 } },
+    // 4. The chain's count field one over `Freelist.capacity` — the rejection
+    //    that field's check exists for. Put on the LAST page so the entry words
+    //    below are the tail of the seed.
+    .{ .fill = 0x00, .words = &([_]u64{ 0, 4, 2, 5, 0, 0, 6, 3, 1, 0, 0, 3, 3, 341, 0 } ++ over_capacity_entries) },
+    // 5. A freelist `next` pointing back at its own page: the cycle guard has
+    //    to reject it rather than walk for ever.
+    .{ .fill = 0x00, .words = &.{ 0, 6, 2, 3, 0, 5, 6, 3, 1, 3, 0, 1, 3, 2, 0, 0 } },
+    // 6. The higher txn_id is tried FIRST even though it sits in slot 1, and it
+    //    is rejected for a root below `first_data_page`; slot 0 is then tried
+    //    and rejected because its free_count (the `value(u64)` arm, drawn here
+    //    at 2^64-1) cannot match an empty freelist. Both candidates refused.
+    .{ .fill = 0x00, .words = &.{ 0, 2, 2, 0, 1, 0xffff_ffff_ffff_ffff, 6, 0, 11, 0, 0, 0, 0, 6, 1, 0, 0, 0 } },
+    // 7. `high_water` past the real end of the file — rejected by
+    //    `candidateValid`'s very first check, before any page is read.
+    .{ .fill = 0x00, .words = &.{ 0, 3, 2, 0, 0, 0, 7, 3, 1, 0, 0, 0 } },
+    // 8. Both meta slots left as raw fill: `Meta.decode` refuses both and
+    //    `recover` returns `Unrecoverable` without a walk. The "no fourth
+    //    state exists" argument's (b) case, on both slots at once.
+    .{ .fill = 0x00, .words = &.{ 3, 3, 0, 0, 0, 0 } },
+    // 9. ⭐ A leaf page stamped over `0xff` fill: its `count` reads as 65 535,
+    //    so its slot directory alone is 131 078 octets inside a 4 096-octet
+    //    page. `leafViewSafe` must reject it. That is the exact page recovery
+    //    used to adopt on the kind byte alone, after which the first search
+    //    probe read off the end of the caller's page buffer.
+    .{ .fill = 0xff, .words = &.{ 0, 5, 2, 0, 0, 0, 3, 3, 1, 0, 0, 0 } },
+    // 10. And the input this target ran for ever: no words at all, so every
+    //     knob is its range minimum. Kept so the guard can show it is no
+    //     longer the only one.
+    .{ .fill = 0x00, .words = &.{} },
+};
+
+/// Serialise `recover_seeds` into the byte strings `Smith` reads. Each entry is
+/// `recover_pages * page_size` octets for the `smith.bytes` draw, then eight
+/// octets per knob word.
+fn buildRecoverCorpus(a: Allocator, seeds: []const RecoverSeed) ![]const []const u8 {
+    const image_len = @as(usize, recover_pages) * page_size;
+    const entries = try a.alloc([]const u8, seeds.len);
+    for (entries, seeds) |*out, sd| {
+        const buf = try a.alloc(u8, image_len + sd.words.len * 8);
+        @memset(buf[0..image_len], sd.fill);
+        for (sd.words, 0..) |w, i| {
+            std.mem.writeInt(u64, buf[image_len + i * 8 ..][0..8], w, .little);
+        }
+        out.* = buf;
+    }
+    return entries;
 }
 
-fn fuzzRecover(_: void, smith: *std.testing.Smith) !void {
+/// What one pass of `driveRecover` stamped and what `recover` made of it. The
+/// harness throws it away; the corpus guard below reads it.
+const RecoverRun = struct {
+    /// Meta slots stamped as structurally valid records (0..2). The rest were
+    /// left as raw fill and `Meta.decode` has to refuse them.
+    metas_stamped: usize = 0,
+    /// Data pages stamped as each shape: random, leaf, branch, freelist.
+    shapes: [4]usize = @splat(0),
+    /// The meta `recover` adopted, if any.
+    adopted: ?Meta = null,
+    /// The kind byte of the adopted meta's root page — the evidence that the
+    /// tree walk really descended into a branch rather than stopping at a leaf.
+    root_kind: ?u8 = null,
+};
+
+test "fuzz: recover never panics on arbitrary on-disk page bytes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const corpus = try buildRecoverCorpus(arena.allocator(), &recover_seeds);
+    var run: RecoverRun = .{};
+    try testing.fuzz(&run, fuzzRecover, .{ .corpus = corpus });
+}
+
+fn fuzzRecover(run: *RecoverRun, smith: *std.testing.Smith) !void {
+    run.* = .{};
+    try driveRecover(smith, run);
+}
+
+/// ⭐ The harness body, factored out so the corpus guard below drives the SAME
+/// draw sequence rather than a paraphrase of it. A guard that measures a
+/// different sequence from the one the fuzzer runs is not a guard.
+fn driveRecover(smith: *std.testing.Smith, run: *RecoverRun) !void {
     const gpa = testing.allocator;
 
     var sim = kv.SimStorage.init(gpa);
@@ -620,7 +763,7 @@ fn fuzzRecover(_: void, smith: *std.testing.Smith) !void {
     // Lay down a handful of arbitrary pages: slots 0/1 are the meta pages
     // `recover` chooses between; the rest are candidate tree/freelist pages
     // a torn/hostile meta might point at.
-    const num_pages = 6;
+    const num_pages = recover_pages;
     var raw: [num_pages * page_size]u8 = undefined;
     smith.bytes(&raw);
     var id: PageId = 0;
@@ -640,13 +783,20 @@ fn fuzzRecover(_: void, smith: *std.testing.Smith) !void {
         // high_water. One slot in four is left random to keep covering the
         // reject path and the "both slots invalid" branch.
         //
-        // The sense of the test matters: an un-fuzzed run (plain
-        // `zig build test-kvtree`, no `--fuzz`) drives the body ONCE with an
-        // all-zero smith, so the zero draw must be the one that stamps a
-        // valid meta. Written as `!= 0` it would do the opposite and the
-        // gate would exercise nothing but the reject path again. The reject
-        // path is separately and deterministically covered by `format.zig`'s
-        // "meta rejects foreign / wrong-version pages" and CRC tests.
+        // The sense of the test matters: an un-fuzzed run drives the body once
+        // per corpus seed and then ONCE MORE with an all-zero smith, so the
+        // zero draw must be the one that stamps a valid meta. Written as
+        // `!= 0` it would do the opposite and the empty round would exercise
+        // nothing but the reject path. The reject path is separately and
+        // deterministically covered by `format.zig`'s "meta rejects foreign /
+        // wrong-version pages" and CRC tests.
+        //
+        // ⛔ That sentence used to end "drives the body ONCE", which was the
+        // whole problem: one input, and it was not enough. Getting the sense
+        // of this draw right made the empty round stamp two metas, and then
+        // `candidateValid` rejected both at `pageIdOk(0, 0)`, its first bounds
+        // check, so nothing below this line was ever reached anyway. See
+        // `RecoverSeed`.
         if (id < 2 and smith.valueRangeAtMost(u8, 0, 3) != 3) {
             const m: Meta = .{
                 .txn_id = smith.value(u64),
@@ -664,6 +814,7 @@ fn fuzzRecover(_: void, smith: *std.testing.Smith) !void {
                 .high_water = smith.valueRangeAtMost(u64, 0, num_pages + 1),
             };
             m.encode(&page);
+            run.metas_stamped += 1;
         } else if (id >= format.first_data_page) {
             // Same argument one level down. `candidateValid` only descends
             // into a page whose first byte is a leaf/branch kind, and only
@@ -674,10 +825,22 @@ fn fuzzRecover(_: void, smith: *std.testing.Smith) !void {
             // every one of them via the trivial root-is-a-leaf case, and no
             // run ever descended through a branch). Stamp a plausible SHAPE
             // and keep the contents fuzzed.
+            // ⚠ The draw stays INLINE in the `switch`. Bound to a name and
+            // switched on afterwards it is the same code, but
+            // `check-fuzz-reach` then reads it as an R2 branch selector and
+            // fails the ratchet — while the inline form it cannot see is the
+            // one this file had all along. The counting therefore happens per
+            // arm. (Reported: the gate's R2(c) rule misses a ranged draw used
+            // directly as a `switch` operand, which is the commoner spelling.)
             switch (smith.valueRangeAtMost(u8, 0, 3)) {
-                0 => {}, // leave fully random — hostile/garbage page
-                1 => page[0] = @intFromEnum(format.NodeKind.leaf),
+                // leave fully random — hostile/garbage page
+                0 => run.shapes[0] += 1,
+                1 => {
+                    run.shapes[1] += 1;
+                    page[0] = @intFromEnum(format.NodeKind.leaf);
+                },
                 2 => {
+                    run.shapes[2] += 1;
                     // A branch whose geometry passes `branchViewSafe` so the
                     // walk descends, but whose child ids are fuzzed.
                     const count = smith.valueRangeAtMost(u16, 0, 4);
@@ -703,6 +866,7 @@ fn fuzzRecover(_: void, smith: *std.testing.Smith) !void {
                     }
                 },
                 else => {
+                    run.shapes[3] += 1;
                     // A freelist chain page: a count that is sometimes over
                     // capacity (rejection), a `next` that can point back into
                     // the chain (cycle guard) and fuzzed entry ids.
@@ -739,5 +903,66 @@ fn fuzzRecover(_: void, smith: *std.testing.Smith) !void {
     }
     p.high_water = num_pages;
 
-    _ = recover(gpa, &p) catch return;
+    // ⭐ The result is recorded rather than discarded. `recover` returning a
+    // Meta at all is the number the empty input cannot produce — it was
+    // `error.Unrecoverable` on the one input this target used to run — and the
+    // kind byte of the adopted root is the evidence that the walk descended
+    // through a branch rather than stopping at the trivial root-is-a-leaf case.
+    const m = recover(gpa, &p) catch return;
+    run.adopted = m;
+    var root_page: [page_size]u8 = undefined;
+    p.readPage(m.root, &root_page) catch return;
+    run.root_kind = root_page[0];
+}
+
+test "corpus: the recover seeds drive every knob, and the counts are pinned" {
+    // ⛔ Before the corpus below existed this target had no seeds at all, so
+    // `testing.fuzz` ran it exactly once, on `in = ""`. Every one of these
+    // numbers was therefore fixed: both metas stamped with all-zero fields,
+    // all four data pages left random, `adopted` null, `root_kind` null. And
+    // an `adopted > 0` guard would not have been enough either — what makes
+    // this corpus worth its size is `branch_roots` and `freelists_walked`, the
+    // two paths the header calls "the deeper half of what is under test".
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const corpus = try buildRecoverCorpus(arena.allocator(), &recover_seeds);
+
+    var metas_stamped: usize = 0;
+    var shapes: [4]usize = @splat(0);
+    var adopted: usize = 0;
+    var branch_roots: usize = 0;
+    var freelists_walked: usize = 0;
+    var txn_total: u64 = 0;
+    for (corpus) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var run: RecoverRun = .{};
+        try driveRecover(&smith, &run);
+        metas_stamped += run.metas_stamped;
+        for (&shapes, run.shapes) |*acc, n| acc.* += n;
+        const m = run.adopted orelse continue;
+        adopted += 1;
+        txn_total += m.txn_id;
+        if (m.free_root != 0) freelists_walked += 1;
+        if (run.root_kind == @intFromEnum(format.NodeKind.branch)) branch_roots += 1;
+    }
+    try testing.expectEqual(@as(usize, 12), metas_stamped);
+    // random, leaf, branch, freelist — all four shapes stamped at least once,
+    // over 10 seeds x 4 data pages. Before the corpus there was ONE run, and
+    // its four data pages were all shape 0.
+    try testing.expectEqual([4]usize{ 25, 10, 1, 4 }, shapes);
+    // 3 of 10 seeds recover; the other 7 are the refusals named above. The txn
+    // sum pins WHICH three, so a seed that stops being adopted cannot be
+    // masked by another one starting to be.
+    try testing.expectEqual(@as(usize, 3), adopted);
+    try testing.expectEqual(@as(u64, 5 + 9 + 7), txn_total);
+    try testing.expectEqual(@as(usize, 1), branch_roots);
+    try testing.expectEqual(@as(usize, 1), freelists_walked);
+
+    // Seed 9's page, spelled out: the claim that `leafViewSafe` is what
+    // refuses it, rather than something earlier in the walk. A count of 65 535
+    // needs a 131 078-octet slot directory inside a 4 096-octet page.
+    var poisoned: [page_size]u8 = @splat(0xff);
+    poisoned[0] = @intFromEnum(format.NodeKind.leaf);
+    try testing.expectEqual(@as(u16, 0xffff), std.mem.readInt(u16, poisoned[2..4], .little));
+    try testing.expect(format.leafViewSafe(&poisoned) == null);
 }

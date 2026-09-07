@@ -968,10 +968,43 @@ const hub_seeds = [_][]const u8{
 };
 
 test "fuzz: a hub survives arbitrary frames from an admitted node" {
-    try std.testing.fuzz({}, fuzzHub, .{ .corpus = &hub_seeds });
+    var run: HubRun = .{};
+    try std.testing.fuzz(&run, fuzzHub, .{ .corpus = &hub_seeds });
 }
 
-fn fuzzHub(_: void, smith: *std.testing.Smith) !void {
+/// What one pass of `driveHub` drew and what came of it. The harness throws it
+/// away; the corpus guard below reads it.
+///
+/// ⭐ It exists because the numbers in the comment inside `driveHub` were
+/// written by a one-off measurement and then left in prose, where nothing
+/// re-evaluates them. A knob that is alive today because of a seed can be
+/// killed tomorrow by a seed edit, an extra draw, or a reordered one, and the
+/// harness would go on passing while replaying eight empty frames.
+const HubRun = struct {
+    /// Frames handed to `onMessage` (always eight per pass).
+    frames: usize = 0,
+    /// …of which carried at least one octet.
+    nonempty: usize = 0,
+    /// …of which `sc.decode` accepted as a BVLC-SC message.
+    decodable: usize = 0,
+    /// How often the second admitted connection was addressed — the
+    /// `smith.value(bool)` knob. Zero means the hub only ever saw one peer.
+    to_b: usize = 0,
+    /// Total milliseconds the clock advanced across the pass.
+    clock: u64 = 0,
+    /// Messages the hub emitted, all of which had to decode.
+    emitted: usize = 0,
+};
+
+fn fuzzHub(run: *HubRun, smith: *std.testing.Smith) !void {
+    run.* = .{};
+    try driveHub(smith, run);
+}
+
+/// ⭐ The harness body, factored out so the corpus guard below drives the SAME
+/// draw sequence rather than a paraphrase of it. A guard that measures a
+/// different sequence from the one the fuzzer runs is not a guard.
+fn driveHub(smith: *std.testing.Smith, run: *HubRun) !void {
     var prng = std.Random.DefaultPrng.init(smith.value(u64));
     var hub = testHub(&prng);
     var cbuf: [64]u8 = undefined;
@@ -993,12 +1026,28 @@ fn fuzzHub(_: void, smith: *std.testing.Smith) !void {
         // later draw in this loop — the connection choice, the clock step —
         // was its own minimum too. Measured on 2026-09-06 over `hub_seeds`
         // (3 seeds x 8 iterations = 24 frames): **0 of 24 non-empty, 0
-        // decodable, connection `b` never once addressed, and the clock never
-        // leaving 0 ms before; 24 of 24 non-empty, 18 decodable as BVLC-SC,
-        // `b` addressed 16 times, and the clock advancing 2 760 003 ms — past
-        // both the 10 s connect wait and the 300 s heartbeat timeout — after.**
+        // decodable, and the clock never leaving 0 ms before; 24 of 24
+        // non-empty, 18 decodable as BVLC-SC, and the clock advancing
+        // 2 760 003 ms — past both the 10 s connect wait and the 300 s
+        // heartbeat timeout — after.**
+        //
+        // ⛔ The sentence that used to stand here also claimed connection `b`
+        // was "never once addressed" before and "addressed 16 times" after.
+        // Both halves were backwards, and re-measuring is what found it: the
+        // draw is `if (value(bool)) a else b`, and a collapsed draw is FALSE,
+        // so `b` was the connection that got all 24 frames and `a` was the one
+        // that had never been addressed. After the seeds: `a` 16, `b` 8. The
+        // gain here is that BOTH peers are now driven, not that `b` is. That is
+        // what `HubRun.to_b` pins, so the claim cannot drift back into prose.
         const len: usize = smith.slice(&buf);
-        const which: ConnId = if (smith.value(bool)) a else b;
+        run.frames += 1;
+        if (len != 0) run.nonempty += 1;
+        if (sc.decode(buf[0..len])) |_| {
+            run.decodable += 1;
+        } else |_| {}
+        const pick_a = smith.value(bool);
+        if (!pick_a) run.to_b += 1;
+        const which: ConnId = if (pick_a) a else b;
         _ = hub.onMessage(now, which, buf[0..len]) catch {};
         _ = hub.poll(now) catch {};
         while (hub.nextOutgoing()) |o| {
@@ -1006,7 +1055,40 @@ fn fuzzHub(_: void, smith: *std.testing.Smith) !void {
             // must be aimed at a slot that exists.
             _ = try sc.decode(o.bytes);
             try testing.expect(o.conn < 8);
+            run.emitted += 1;
         }
-        now += smith.valueRangeAtMost(u32, 0, 400_000);
+        const step = smith.valueRangeAtMost(u32, 0, 400_000);
+        run.clock += step;
+        now += step;
     }
+}
+
+test "corpus: the hub seeds drive every knob, and the counts are pinned" {
+    // ⭐ The measurement in `driveHub`'s comment, executable rather than in
+    // prose, over the SAME corpus and the SAME draw sequence the harness gets.
+    //
+    // ⛔ Not `nonempty > 0`. Every one of these was its own range minimum
+    // before the seeds carried a tail — `nonempty` 0, `decodable` 0, `to_b` 0
+    // (so the hub's second peer was never addressed and the two-node paths
+    // never ran) and `clock` 0 (so neither the 10 s connect wait nor the 300 s
+    // heartbeat timeout could ever expire). A pinned number notices the day one
+    // of them goes back.
+    var totals: HubRun = .{};
+    for (hub_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var run: HubRun = .{};
+        try driveHub(&smith, &run);
+        totals.frames += run.frames;
+        totals.nonempty += run.nonempty;
+        totals.decodable += run.decodable;
+        totals.to_b += run.to_b;
+        totals.clock += run.clock;
+        totals.emitted += run.emitted;
+    }
+    try testing.expectEqual(@as(usize, 24), totals.frames);
+    try testing.expectEqual(@as(usize, 24), totals.nonempty);
+    try testing.expectEqual(@as(usize, 18), totals.decodable);
+    try testing.expectEqual(@as(usize, 8), totals.to_b);
+    try testing.expectEqual(@as(u64, 2_760_003), totals.clock);
+    try testing.expectEqual(@as(usize, 10), totals.emitted);
 }

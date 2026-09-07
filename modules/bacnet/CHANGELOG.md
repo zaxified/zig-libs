@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** the BACnet/SC hub and node
+  fuzz harnesses recorded what their seeds bought in a source comment, which
+  nothing re-evaluates. Both bodies are now factored into `driveHub`/`driveNode`
+  taking a `HubRun`/`NodeRun` of counters, and a corpus-guard test replays the
+  real `std.testing.Smith` over the same corpus and pins the numbers: hub 24 of
+  24 frames non-empty, 18 decodable, the second peer addressed 8 times, the
+  clock advancing 2 760 003 ms; node 32 of 32 non-empty, 24 decodable, all four
+  starting states reached, the clock advancing 3 680 004 ms. Re-measuring found
+  the recorded prose was **backwards** about the hub's connection knob: the draw
+  is `if (value(bool)) a else b` and a collapsed draw is `false`, so before the
+  seeds every one of the 24 frames went to `b` and `a` was the peer that had
+  never been addressed — not the other way round. The comment is corrected and
+  the claim is now a pinned count instead of a sentence.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` copies in
   this module's fuzz files are now `testkit.fuzz.seed` / `seedHex`. The helper
   existed **33 times across 12 modules in three shapes**, each carrying its own
