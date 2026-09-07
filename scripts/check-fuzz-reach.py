@@ -509,6 +509,45 @@ def truncation_hits(body_texts):
                 hits.append(
                     f"`{buf}` is filled with real input bytes and then sliced by an inline "
                     f"`{m.group(1)}` draw, which is the range minimum")
+        # ── The two forms the literal `buf[0..n]` shape missed ──────────────
+        #
+        # Both were found by reading, not by the gate. `enip/fuzzFramer` carries
+        # a written note that it had the identical defect and was NOT flagged,
+        # because the collapsing length reached the buffer one level down. The
+        # rule is not "the buffer is sliced by `n` from zero"; it is **the
+        # extent of the drawn bytes is governed by a collapsing binding**, and
+        # that governance has two other spellings in this tree.
+        for buf in sorted(filled):
+            # (a) a non-zero start: `buf[off..len]`, `parseFrame(buf[off..len])`
+            #     in `websocket/fuzzParseFrameServer` and `mqtt/fuzzDecode`.
+            #     `len` is 0, so the `while (off < len)` around it never runs.
+            for n in sorted(collapsing):
+                m = re.search(r"\b" + re.escape(buf) + r"\s*\[\s*(\w+)\s*\.\.\s*" +
+                              re.escape(n) + r"\s*\]", text)
+                if m and m.group(1) != "0":
+                    hits.append(
+                        f"`{buf}` is filled with real input bytes and then sliced as "
+                        f"`{buf}[{m.group(1)}..{n}]`, and `{n}` comes from a bounded draw "
+                        f"and is therefore the range minimum — an empty slice for every seed")
+        # (b) the length never touches the buffer at all: it is the LOOP BOUND
+        #     that decides whether the buffer is fed. `iec104` and `iec61850`'s
+        #     framers, and `grpc/fuzzDeframerNeverPanics`:
+        #         while (off < len) { f.feed(input[off..][0..chunk]) ... }
+        #     `len` is 0, the loop body never executes, and the framer under
+        #     test is handed nothing whatsoever.
+        for n in sorted(collapsing):
+            for m in re.finditer(r"\b(?:while|for|if)\s*\([^)]*?<=?\s*" +
+                                 re.escape(n) + r"\b", text):
+                tail = text[m.end():]
+                fed = [b for b in sorted(filled)
+                       if re.search(r"\b" + re.escape(b) + r"\s*\[", tail)]
+                if fed:
+                    hits.append(
+                        f"`{n}` comes from a bounded draw and is therefore the range "
+                        f"minimum, and it is the bound of the loop that feeds "
+                        f"`{fed[0]}` — the body never executes, so no drawn byte "
+                        f"ever reaches the code under test")
+                    break
     return sorted(set(hits))
 
 
