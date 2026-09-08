@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **Docs: the "no per-operation setup cost is paid" claim now
+  says whose precondition that is.** It holds for a caller that reuses a key and
+  not for one that builds a fresh key per operation, which is exactly what
+  certificate path validation does — measured, ~500 us to build a 2048-bit
+  public key against 36 us to verify with it. `SPEC.md` gains a "Performance
+  posture" section with the split (~185 us of `std.crypto.ff` Montgomery
+  constants the hot path never uses, ~315 us of `montint` setup), the OpenSSL
+  comparison (this module's verify is 2.1x OpenSSL and needs no work; std's is
+  22.3x), and why neither remaining optimisation was taken.
+  NO CONSUMER-VISIBLE CHANGE (documentation only).
+
 - **2026-09-07** — Test-only, neither BREAKING nor BEHAVIOURAL. All six key-parsing
   fuzz targets (`PublicKey.fromDer`/`fromPem`, `SecretKey.fromDer`/`fromPem`,
   `fromPkcs8`, `fromOpenSSH`) drew their input with `smith.bytes(&buf)` followed by

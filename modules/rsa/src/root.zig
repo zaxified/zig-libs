@@ -51,6 +51,16 @@
 //! constants are precomputed ONCE per key at construction and carried on the
 //! key (`MontParams`), so no per-operation setup cost is paid.
 //!
+//! ⚠ That last clause is a claim about the CALLER, and it is worth reading as
+//! one. It holds for a consumer that builds a key and reuses it — `qap` builds
+//! its `SecretKey` when its certificate store loads and then only signs;
+//! `iec62351`'s GOOSE verifier carries a built `PublicKey` and verifies per
+//! frame. It does NOT hold for certificate path validation, which builds a
+//! fresh key per chain link: there the setup IS the per-operation cost, and it
+//! dwarfs the operation (measured 2026-09-08: ~500 us to build a 2048-bit
+//! public key, 36 us to verify with it). `SPEC.md` § "Performance posture" has
+//! the split, the two ways to shrink it, and why neither was taken.
+//!
 //! SECURITY (internal audit F2/F3): the CRT private op
 //! (`privateOpCrt`) now carries both fault- and side-channel countermeasures.
 //! F3 (Bellcore/BDL): every CRT private op re-encrypts the recovered `m` and

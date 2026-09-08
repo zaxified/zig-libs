@@ -456,6 +456,13 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64) VerifyCha
         return verifySlhDsaLink(subject_der, issuer_der, now_sec);
     }
 
+    // ⚠ PKCS#1 v1.5 deliberately does NOT come through this module's own `rsa`,
+    // even though `rsa.verifyPkcs1v15` does the same verification in 36 us
+    // against std's 388 us. Path validation builds a key per link and no key
+    // repeats inside a chain, so nothing caches, and cold the comparison
+    // reverses: `rsa.PublicKey.fromDer` + verify is ~535 us per link. Measured
+    // 2026-09-08; `fromDer` has to fall below 352 us before switching pays.
+    // See SPEC.md § "Performance" and `modules/rsa/SPEC.md`.
     if (Certificate.AlgorithmCategory.map.get(subject_shape.sig_alg_oid) == .rsassa_pss) {
         const issuer_shape = try parseShape(.{ .buffer = issuer_der, .index = 0 });
         const issuer_pub_key = try rsa.PublicKey.fromDer(issuer_shape.spki);

@@ -85,6 +85,55 @@ byte-exact vector (the shipped OpenSSL OAEP KATs are all equal-hash) — it is c
 constructed round-trip test, which proves internal consistency but not agreement with an external
 implementation for that specific configuration.
 
+## Performance posture — measured 2026-09-08, and deliberately not chased further
+
+Numbers are ReleaseFast on one desktop; treat them as ratios. OpenSSL 3.5.5 on the
+same host is the reference (`openssl speed`).
+
+| operation | this module | OpenSSL | ratio |
+|---|---:|---:|---:|
+| RSA-2048 `verifyPkcs1v15`, key already built | **36 µs** | 17.4 µs | **2.1×** |
+| `PublicKey.fromDer` (builds the key) | **~500 µs** | — | — |
+
+**The modexp is fine and needs no work.** 2.1× OpenSSL on portable Zig without assembly
+is a good number, and it is recorded here so a future audit does not start optimising
+something already measured good. For contrast, `std.crypto.Certificate.Parsed.verify`
+does the same verification in **388 µs** — 10.8× slower than this module.
+
+**Key construction, not the modexp, is where the time goes**, and it splits in two:
+
+- **~185 µs — `std.crypto.ff.Modulus.fromBytes`**, which computes its own Montgomery
+  constants. The hot path never uses them: the modexp goes through `montint`. The `ff`
+  types are kept for serialization, validation and the `powPublic` fallback.
+- **~315 µs — `montParamsFromModulus`**, dominated by the 64·L doublings that derive
+  `R mod m`. (The other half, `R² mod m`, stopped being 64·L more doublings on
+  2026-09-08 — see `montint`'s changelog. That alone took `fromDer` from 813 µs to
+  ~500 µs.)
+
+### Why neither is being chased
+
+⭐ **Both hot consumers hold a WARM key, so they never pay this.** `qap` builds its
+`SecretKey` once when its certificate store loads and then only signs; `iec62351`'s GOOSE
+verifier carries an already-built `PublicKey` and verifies per frame. The setup cost
+lands only on **cold, one-shot** users — `x509` chain validation, `dtls` handshakes, and
+the token/document modules (`jwt`, `jwe`, `saml`, `xmldsig`, `xmlenc`, `ssh`, `ocsp`,
+`dnssec`, `webauthn`, `blindrsa`) — and none of them is throughput-bound on it today.
+
+Two routes exist and both were measured, not guessed:
+
+1. Skip the `ff` Montgomery constants the hot path does not use (~185 µs). Touches the
+   public field `PublicKey.n`, which 13 modules can reach.
+2. Give `montint` a constructor taking the modulus bit length as an explicitly PUBLIC
+   input, so `R mod m` can start near the modulus instead of at 1 (~315 µs). The cheap
+   form makes the doubling count depend on the modulus size — a secret for a general
+   caller, though not for RSA — so it needs a new contract in a module shared with
+   `paillier`, `threshold_ecdsa` and `vdf`.
+
+**Owner decision, 2026-09-08: neither is done here.** They are optimisations without a
+consumer that feels them, and the consumer who would (`qap`) is expected to solve its own
+performance question first and push the result back. This section exists so that arrives
+as a measurement rather than a rediscovery.
+
 ## Backlog / deferred
 
 - The OAEP decoupled-hash (digest≠MGF1) configuration has no external KAT — see "Verification"

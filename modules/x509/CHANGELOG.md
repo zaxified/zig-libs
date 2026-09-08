@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **Docs: say why the PKCS#1 v1.5 path calls `std.crypto`
+  rather than this repository's `rsa`.** It reads backwards — `rsa` verifies the
+  same signature in 36 us against std's 388 us — but path validation builds a
+  key per link and no key repeats inside a chain, so cold the comparison
+  reverses to ~535 us against 388 us. `fromDer` must drop below 352 us before
+  switching pays. `SPEC.md` gains a "Performance" section with the chain
+  numbers, the decomposition showing a chain verify is its signatures and
+  nothing else, and the measurement that `safeCertificate` is 0.04% of one, so
+  optimising the guard buys nothing.
+  NO CONSUMER-VISIBLE CHANGE (documentation only).
+
 - **2026-09-07** — All **four** fuzz targets in this module had run exactly one input each,
   for ever, and that input was the empty slice. Each drew `smith.bytes(&buf)` and then a
   ranged length, which returns the range minimum when fewer than eight input octets remain,

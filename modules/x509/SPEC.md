@@ -205,6 +205,48 @@ coverage — every-prefix and every-single-byte-mutation sweeps of a real
 fixture certificate, a `std.testing.fuzz` walk, explicit hostile shapes, and
 a regression test pinned to the reproduced std hazard.
 
+## Performance — and why the PKCS#1 v1.5 path calls `std.crypto`
+
+Measured 2026-09-08, ReleaseFast, one desktop; OpenSSL 3.5.5 on the same host as the
+reference. **A chain verification is its signatures and nothing else.**
+
+| | µs |
+|---|---:|
+| `verifyChain`, 2 links, RSA PKCS#1 v1.5 | ~810 |
+| same chain with the first link's signature broken (one verify, then stop) | ~400 |
+| **difference — one RSA-2048 verification** | **~405** |
+| `verifyChain`, RSA-PSS | ~1230 |
+| `verifyChain`, ECDSA P-256 | ~1450 |
+
+Path building, DER parsing, extension walking and name constraints are all in the noise
+behind that. ⭐ So is the safety guard: `safeCertificate` costs **334 ns**, which is
+**0.04 %** of a chain verification. Optimising the guard would buy nothing measurable —
+recorded here so nobody tries.
+
+### The dispatch is deliberate
+
+`verifyLink` sends RSASSA-PSS through this repository's `rsa` module and lets PKCS#1 v1.5
+fall through to `std.crypto.Certificate.Parsed.verify`. That looks backwards, because on
+the same signature `rsa.verifyPkcs1v15` takes **36 µs** against std's **388 µs**.
+
+It is not backwards, because path validation builds a fresh key per link and **no key
+repeats inside one chain**, so nothing can be cached. The comparison that decides it is
+therefore per link, cold:
+
+| per link, cold key | µs |
+|---|---:|
+| `std…Parsed.verify` (today) | **388** |
+| `rsa.PublicKey.fromDer` + `rsa.verifyPkcs1v15` | **~535** |
+
+**Switching would make this module slower.** `rsa.PublicKey.fromDer` has to fall below
+**352 µs** first; it is at ~500 µs, and the `montint` R² ladder that landed the same day
+took it from 813 µs to there without reaching the threshold. The two remaining routes and
+the reason neither was taken are in `modules/rsa/SPEC.md` § "Performance posture".
+
+So today's choice is a **decision, not an oversight**: revisit it when `fromDer` drops
+below 352 µs, at which point this is a two-line change and a chain verification falls to
+roughly a quarter of its current cost.
+
 ## Threat model / out of scope
 
 Both `extensions.zig` and `chain.zig` parse attacker-controlled bytes (a
