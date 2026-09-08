@@ -1113,12 +1113,43 @@ capability_check() {
 # ── subcommands ──────────────────────────────────────────────────────────
 
 cmd_changed() {
-    local base_ref="${1:-}"
+    # ⛔ FLAGS AND THE BASE REF ARE SEPARATED BY SHAPE, not by position, and
+    # until 2026-09-08 they were not separated at all. `base_ref` was `$1` and
+    # nothing ever called `set_extra_args`, so this subcommand had two silent
+    # failures, both measured with a probe test asserting `builtin.mode`:
+    #
+    #   test.sh changed <base> -Doptimize=ReleaseFast
+    #       -> the flag lands in `${@:2}`, which only the unresolvable-base
+    #          branch below ever passed on. EXTRA_ZIG_ARGS stayed empty and the
+    #          run compiled DEBUG while the caller believed it had asked for
+    #          ReleaseFast. `PROBE: mode=Debug`. A CI lane written this way
+    #          would report green having measured the Debug lane twice.
+    #
+    #   test.sh changed -Doptimize=ReleaseFast
+    #       -> the flag was taken as the BASE REF and forwarded as a positional
+    #          argument to check-changelog-entry.py, which died on
+    #          "unrecognized arguments".
+    #
+    # A `-`-prefixed argument is a flag wherever it appears; the first bare one
+    # is the base ref. Audit finding R14 item 4.
+    local base_ref=""
+    local -a changed_extra=()
+    local _a
+    for _a in "$@"; do
+        if [[ "$_a" == -* ]]; then
+            changed_extra+=("$_a")
+        elif [[ -z "$base_ref" ]]; then
+            base_ref="$_a"
+        else
+            changed_extra+=("$_a")
+        fi
+    done
+    set_extra_args ${changed_extra[@]+"${changed_extra[@]}"}
     local files
     if ! files="$(changed_files "$base_ref")"; then
         echo "changed: base ref '$base_ref' does not resolve here — cannot compute a narrower set," >&2
         echo "         so running everything rather than reporting nothing to do." >&2
-        cmd_all "${@:2}"
+        cmd_all ${changed_extra[@]+"${changed_extra[@]}"}
         return
     fi
     files="$(printf '%s\n' "$files" | sort -u)"
@@ -1235,7 +1266,9 @@ cmd_changed() {
             echo "changed: the harness or a CI lane definition changed, and this is CI."
             echo "  What narrows the module set is what moved, so it cannot narrow itself."
             echo "  Escalating to the full gate rather than to a smoke set — see cmd_changed."
-            cmd_all
+            # ⚠ The mode goes WITH the escalation. Without it a ReleaseFast lane
+            # that escalates silently becomes a second Debug lane.
+            cmd_all ${changed_extra[@]+"${changed_extra[@]}"}
             return
         fi
         harness_smoke
@@ -1255,7 +1288,7 @@ cmd_changed() {
             fi
         else
             echo "changed: no graph snapshot to compare against -> nothing to narrow with -> running ALL modules"
-            cmd_all
+            cmd_all ${changed_extra[@]+"${changed_extra[@]}"}
             return
         fi
     fi
