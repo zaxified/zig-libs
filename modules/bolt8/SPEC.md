@@ -252,6 +252,73 @@ re-enabled; the module now carries **zero skips**:
 `HandshakeResult`s round-trip a `"hello"` (initiator's first frame ==
 the published message-0 vector, responder decrypts it back).
 
+## Constant-time
+
+Measured, since 2026-09-08. Before that the ledger recorded this module's
+constant-time verdict as **"PASS (inherited)"** — derived from reading, never
+instrumented — while the module holds the node's long-term static private key,
+the ephemeral keys, `temp_k*` and both transport keys (audit finding F10).
+
+The instrument is committed: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig),
+driven by [`../../scripts/ctgrind.sh`](../../scripts/ctgrind.sh). It marks the
+secret `MAKE_MEM_UNDEFINED`, forces a volatile reload so the optimizer cannot
+keep a defined register copy, and drives it through the real entry points.
+
+```sh
+scripts/ctgrind.sh bolt8
+```
+
+Zig 0.16.0, valgrind 3.26.0, x86_64 (i7-7920HQ), `ReleaseFast`, 2026-09-08.
+`in-file` = memcheck error CONTEXTS whose stack names this module's own files
+**or the files it delegates to** (see below), not error counts:
+
+| target | what is tainted | contexts | in-file | untainted control | no-`-fvalgrind` trap |
+|---|---|---:|---:|---:|---:|
+| `dh` | static private scalar | 3 | **1** | 0 | 0 |
+| `keygen` | the 32-byte seed | 5 | **3** | 0 | 0 |
+| `act3` | responder ephemeral + `temp_k2` | 8 | **6** | 0 | 0 |
+| `transport` | both transport keys + both chaining keys | 5 | **3** | 0 | 0 |
+
+The control and trap rows are what make the numbers mean anything: untainted,
+every target reports 0, so the counts are taint-caused and not ambient noise;
+and built without `-fvalgrind` every run reports 0 regardless, because
+`std.valgrind.doClientRequest` returns early unless `builtin.valgrind_support`
+— a clean run built without the switch is a silent no-op, not a result.
+
+**Why the pattern names `k256`'s and std's files too.** This module DELEGATES
+its scalar multiplication to `k256` and its AEAD to std's ChaCha20-Poly1305.
+Their constant-time property IS this module's property for every byte that
+flows through them, so attributing those contexts to someone else and calling
+them not our problem would be the same evasion as widening a pattern until a
+count goes away.
+
+**Every non-zero is accounted for, and none of them is a leak:**
+
+| context | verdict |
+|---|---|
+| `rejectIdentity` at the end of k256's ladder (`group.zig:278`), via `dh.zig:122` | Branch on "the product was the identity element", reachable only for `k ≡ 0 mod n`. The same class `k256`'s own table already accounts for. |
+| scalar canonicality (`common.zig:75` via `scalar.zig:87`), `if (d.isZero())` (`dh.zig:80`), `rejectIdentity` in `combMulBaseWithTable` (`group.zig:347`) | The three invalid-secret rejections of `generateDeterministic`. Each branches on the validity of a key that would be discarded anyway. `dh.zig:80` is in this module's own code. |
+| `if (!verify)` in std's `decrypt` (`chacha20.zig:713`), twice in `act3` and twice in `transport` | Branching on the ANSWER is the API; the comparison that produced it is std's constant-time one. Present because the AEAD key is tainted, so the answer is tainted too. |
+| `fromSec1` (`group.zig:116/123/124`), `fromBytes` (`field.zig:162`), `sqrt` (`field.zig:306`), one `mul` — all in `act3` | Decompressing the peer's static key. `rs` is a PUBLIC key, but it arrives by decryption under a tainted key, so memcheck cannot know that. An artefact of the taint model, stated rather than patched around. |
+| `if (c.len != out.len + 16)` (`transport.zig:149`) | The length came from `recvLength`, i.e. from a decryption under a tainted key. A BOLT#8 message length is a public property of the frame. |
+
+**Teeth, measured 2026-09-08.** A secret-dependent early return in `dh()` (an
+OR-fold over the key bytes and a compare, the exact defect class) moves `dh`
+from **1 in-file to 2** and `act3` from **6 to 7**, and `--check` fails; the
+source digest fires on the same edit. Reverted; `cmp` against a pre-mutation
+copy confirmed byte-identical.
+
+**There is no `act1` row, on purpose.** The initiator's Act One never touches
+the static key — it draws its ephemeral inside — so the taint has no path into
+it and the row would read 0 for a reason that has nothing to do with constant
+time. A row that cannot fail is not evidence, and next to four that can it
+would be read as one.
+
+**Limits, so the claim is exactly as wide as the evidence.** memcheck sees
+branches and addresses, not cache timing: this says nothing about
+cache-timing side channels. The harness taints five places and runs 600
+messages across a key rotation; a secret path it does not drive is not covered.
+
 ## Verification
 
 - KAT oracle: the official BOLT#8 "Appendix A: Transport Test Vectors",

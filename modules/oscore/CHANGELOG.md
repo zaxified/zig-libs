@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — `SPEC.md`'s constant-time sentence has an instrument behind it now:
+  `src/ctgrind_harness.zig`, driven by `scripts/ctgrind.sh`. The module was outside that
+  table while making an explicit constant-time claim (audit F8). ReleaseFast: `derive` 0
+  in-file contexts of 4, `protect` 0 of 2, `unprotect` 1 of 3 — std's `if (!valid)` at
+  `aes_ccm.zig:152`, after the constant-time compare that produced it. ⚠ The two zeros are
+  zeros WITH A WITNESS: the earlier probe reported 0 in-file out of a total of 0, which is
+  what a harness that never calls the module reports too, so this one prints the derived
+  keys and the ciphertext. Teeth: an OR-fold over the Sender Key at the top of `protect`
+  moves that row to 1 and fails the gate.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
   `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
   helper existed **33 times across 12 modules in three shapes**, each carrying its

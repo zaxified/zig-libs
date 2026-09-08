@@ -260,6 +260,36 @@ always correct.
   CBOR encoders handle only PUBLIC data (sequence numbers, IDs, option
   bytes) and have no constant-time obligation.
 
+  **Measured since 2026-09-08**, instead of asserted. The instrument is
+  committed: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
+  `scripts/ctgrind.sh oscore`. Zig 0.16.0, valgrind 3.26.0, x86_64,
+  `ReleaseFast`:
+
+  | target | tainted | contexts | in-file | untainted control | no-`-fvalgrind` trap |
+  |---|---|---:|---:|---:|---:|
+  | `derive` | master secret | 4 | **0** | 0 | 0 |
+  | `protect` | derived Sender Key | 2 | **0** | 0 | 0 |
+  | `unprotect` | derived Recipient Key | 3 | **1** | 0 | 0 |
+
+  ⚠ **The two zeros are zeros with a witness.** The probe that first took this
+  measurement (audit F8) reported `derive` and `protect` as 0 in-file out of a
+  total of **0**, and that is not a result — a total of zero is what a harness
+  that never reaches the module reports too. This harness prints the derived
+  keys and the ciphertext through `std.debug.print`, which is not
+  constant-time by design, so the totals of 4 and 2 show the taint arriving and
+  the in-file zero means "no branch found".
+
+  The single `unprotect` context is std's `if (!valid)` at `aes_ccm.zig:152`,
+  two lines after the `crypto.timing_safe.eql` that produced `valid`. Branching
+  on the answer is the API; the comparison is the constant-time one. It appears
+  only here because only `unprotect` verifies a tag.
+
+  **Teeth, measured 2026-09-08.** An OR-fold over the Sender Key and a compare,
+  injected at the top of `protect`, moves that row from **0 in-file to 1** and
+  fails `--check`. Reverted; `cmp` confirmed byte-identical.
+
+  **Limit:** memcheck sees branches and addresses, not cache timing.
+
 ## The six crypto cores (all implemented)
 
 The six crypto cores in `root.zig` are all real — no `@panic`/TODO stub

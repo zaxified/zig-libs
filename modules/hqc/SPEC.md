@@ -86,12 +86,59 @@ below). See [README.md](README.md) for purpose and API.
   likewise branch-free (bit extraction + shift, no `if` on the bit's
   value). The fixed-weight samplers' duplicate-rejection scans
   (`prng.zig`) are full linear scans with no early exit, matching the
-  reference's `vect_generate_random_support{1,2}` access pattern. **What
-  is NOT claimed**: no dudect/ctgrind or other machine-checked
-  side-channel verification has been run (same caveat this repo's
-  `falcon` carries for its Gaussian sampler) — the structure matches the
-  reference's, but that structural match itself hasn't been
-  instrument-verified.
+  reference's `vect_generate_random_support{1,2}` access pattern.
+
+  ⛔⛔ **AND THE COMPILER UNDOES IT. The structural match above is real and
+  it is not enough — measured 2026-09-08.** The caveat that used to stand
+  here said no machine-checked verification had been run. It has been now,
+  and it does not agree with the paragraph above it.
+  [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig) is committed and
+  `scripts/ctgrind.sh hqc` drives it; `scripts/ctgrind-expected.tsv`
+  carries the four rows as a **recorded defect**, which is what this
+  repository does with a non-zero nobody can account for.
+
+  | target | tainted | contexts | in-file | untainted control | no-`-fvalgrind` trap |
+  |---|---|---:|---:|---:|---:|
+  | `decaps` | `dk_pke ‖ sigma` | 54 | **52** | 0 | 0 |
+  | `keygen` | the seed | 28 | **26** | 0 | 0 |
+  | `encaps` | `m` (the FO secret) | 35 | **33** | 0 | 0 |
+  | `sampler` | the sampler seed | 7 | **2** | 0 | 0 |
+
+  Attribution on `decaps`: `prng.zig:289` **38×**, `gf256.zig:114` 4×,
+  `prng.zig:268` 3×, `gf256.zig:113` 3×, `reedsolomon` 2× (inlined, no line
+  info), `prng.zig:216` and `:223` 1× each.
+
+  The 38 are `writeSupportToVector`: `val |= btab & mask`, a masked select
+  with **no `if` in the source**. LLVM recognises the identity and rewrites
+  it back into a branch that loads `bit_tab[k]` only on the taken path.
+  Adjudicated in the disassembly as real `je`/`jne`/`jb`, not the known
+  `cmov` false positive. `gf256.zig:113` (`if (a == 0 or b == 0)`) and
+  `:114` (`if (s >= 255) s -= 255`) are branches on secret field elements
+  in the GF(256) multiply; `prng.zig:216/223/268` are the rejection loop's
+  own comparisons.
+
+  ⚠ **It is WORSE in the mode a cautious consumer deploys.** Measured on
+  `decaps`: ReleaseFast 52, **ReleaseSafe 130**, Debug 38, ReleaseSmall 18.
+  The extra ReleaseSafe contexts are in `reedmuller.decodeSymbol`, where the
+  overflow checks on `expanded[…] += …` and the butterfly become branches on
+  secret-derived data. Only ReleaseFast is pinned, because a second mode
+  doubles the rows for a claim of the same shape.
+
+  ⭐ **A candidate fix is measured and cheap, and is NOT applied here.**
+  Laundering the mask through an `asm volatile ("" : "+r" (mask))` barrier
+  in `writeSupportToVector` takes `decaps` from **52 in-file contexts to
+  14**, `keygen` from 26 to 4 and `encaps` from 33 to 6 — one line removing
+  38 of the 52. It is left for the fix campaign rather than slipped in with
+  the instrument: it changes crypto code and owes its own KAT and
+  performance evidence. `sampler` stays at 2 either way, because that target
+  drives the rejection loop and never reaches the scatter.
+
+  ⚠ **Honest bound.** memcheck says "Conditional jump **or move**"; these
+  were adjudicated as real jumps. Whether a key is *practically* extractable
+  from them was not measured — that is different and far more expensive
+  work. The finding is "the stated property does not hold and nothing was
+  testing it", not "the key is out". And memcheck sees branches and
+  addresses, not cache timing.
 - **PRNG/XOF** (`prng.zig`): two independent SHAKE256 instantiations
   (spec Table 1, §3.1), distinguished only by a trailing domain-separator
   byte absorbed after the payload:

@@ -135,7 +135,15 @@ if [[ ${#ALL_MODULES[@]} -eq 0 ]]; then
 fi
 
 declare -A TARGETS=(
+    # ⚠ `act1` is deliberately NOT a target. The initiator's Act One never
+    # touches the static key -- it draws its ephemeral inside -- so the taint
+    # has no path into it and the row would read 0 for a reason that has
+    # nothing to do with constant time. A row that cannot fail is not
+    # evidence; see modules/bolt8/src/ctgrind_harness.zig.
+    [bolt8]="dh keygen act3 transport"
     [chachapoly]="poly1305 aead"
+    [hqc]="decaps keygen encaps sampler"
+    [oscore]="derive protect unprotect"
     [ct25519]="ct25519 std"
     [decaf448]="scalarmul"
     [bn254]="field scalarmul"
@@ -145,7 +153,10 @@ declare -A TARGETS=(
     [montint]="small portable asmcore"
 )
 declare -A MODES=(
+    [bolt8]="ReleaseFast"
     [chachapoly]="ReleaseFast ReleaseSafe"
+    [hqc]="ReleaseFast"
+    [oscore]="ReleaseFast"
     [ct25519]="ReleaseFast"
     [decaf448]="ReleaseFast"
     [bn254]="ReleaseFast"
@@ -156,7 +167,33 @@ declare -A MODES=(
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
+    # bolt8 delegates its scalar multiplication to `k256` and its AEAD to std's
+    # ChaCha20-Poly1305, so those files are named here for the same reason
+    # chachapoly/aead names std's: their constant-time property IS this
+    # module's property for every byte that flows through them, and attributing
+    # the contexts to someone else would be the evasion this gate exists to
+    # refuse. Every expected non-zero is itemised in modules/bolt8/SPEC.md.
+    [bolt8/dh]='dh[.]zig|group[.]zig|field[.]zig|common[.]zig|fast_core[.]zig'
+    [bolt8/keygen]='dh[.]zig|group[.]zig|field[.]zig|common[.]zig|fast_core[.]zig'
+    [bolt8/act3]='act[.]zig|handshake[.]zig|dh[.]zig|group[.]zig|field[.]zig|common[.]zig|fast_core[.]zig|chacha20[.]zig|poly1305[.]zig'
+    [bolt8/transport]='transport[.]zig|chacha20[.]zig|poly1305[.]zig'
     [chachapoly/poly1305]='poly1305[.]zig'
+    # oscore's own code is one file (`root.zig`), and the claim SPEC.md makes is
+    # that the key material is routed ONLY through std's constant-time HMAC/
+    # AES-CCM. Both sides of that sentence have to be in the pattern, or the
+    # half that matters most -- what std does with our key -- lands in `unattr`
+    # and the row fails for the wrong reason.
+    # ⛔ hqc's rows are a RECORDED DEFECT, not a clean claim -- see the harness.
+    # The pattern is the module's own files only: the branches LLVM reintroduces
+    # are in hqc's code, so there is nothing to delegate and nothing to blame on
+    # std. `prng.zig` carries the fixed-weight sampler and the scatter.
+    [hqc/decaps]='prng[.]zig|gf256[.]zig|gf2x[.]zig|reedsolomon[.]zig|reedmuller[.]zig|pke[.]zig|kem[.]zig|code[.]zig'
+    [hqc/keygen]='prng[.]zig|gf256[.]zig|gf2x[.]zig|reedsolomon[.]zig|reedmuller[.]zig|pke[.]zig|kem[.]zig|code[.]zig'
+    [hqc/encaps]='prng[.]zig|gf256[.]zig|gf2x[.]zig|reedsolomon[.]zig|reedmuller[.]zig|pke[.]zig|kem[.]zig|code[.]zig'
+    [hqc/sampler]='prng[.]zig'
+    [oscore/derive]='root[.]zig|hmac[.]zig|hkdf[.]zig|sha2[.]zig'
+    [oscore/protect]='root[.]zig|aes_ccm[.]zig|aes[.]zig|aes_gcm[.]zig|modes[.]zig'
+    [oscore/unprotect]='root[.]zig|aes_ccm[.]zig|aes[.]zig|aes_gcm[.]zig|modes[.]zig'
     # The AEAD's own claim: the tag comparison and the cipher/MAC glue in
     # `root.zig`. Added 2026-09-02 -- the module was listed with the poly1305
     # target alone, so `SPEC.md`'s constant-time sentence about the tag
@@ -204,6 +241,17 @@ declare -A PATTERN=(
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 declare -A LABEL=(
+    [bolt8/dh]='bolt8 dh+k256'
+    [bolt8/keygen]='bolt8 dh+k256'
+    [bolt8/act3]='bolt8 hs+k256+std'
+    [bolt8/transport]='bolt8 transport+std'
+    [hqc/decaps]='hqc src (DEFECT)'
+    [hqc/keygen]='hqc src (DEFECT)'
+    [hqc/encaps]='hqc src (DEFECT)'
+    [hqc/sampler]='hqc prng (DEFECT)'
+    [oscore/derive]='oscore+std hkdf'
+    [oscore/protect]='oscore+std ccm'
+    [oscore/unprotect]='oscore+std ccm'
     [bn254/field]='bn254 fp.zig'
     [bn254/scalarmul]='bn254 g1+fp+scalar'
     [chachapoly/poly1305]='poly1305.zig'
@@ -268,9 +316,17 @@ if [[ "$DO_UPDATE_DIGESTS" == "1" ]]; then
     tmp="$(mktemp)"
     while IFS= read -r ln; do
         if [[ "$ln" =~ ^# || -z "$ln" ]]; then printf '%s\n' "$ln" >>"$tmp"; continue; fi
-        IFS=$'\t' read -r m mo t tm inf _ <<<"$ln"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "$mo" "$t" "$tm" "$inf" \
-            "$(src_digest "$m" "${PATTERN[$m/$t]:-}")" >>"$tmp"
+        # ⛔ THE SEVENTH COLUMN IS CARRIED THROUGH, and it was not until
+        # 2026-09-08. This rewriter was written when the row had six fields;
+        # the output pin was added the same day and this loop was not updated,
+        # so it printed six and silently TRUNCATED every row's `out_sha`.
+        # Measured when it happened: one `--update-digests` blanked the output
+        # pin of 20 of the 24 rows, and the only reason it was caught is that
+        # `--check` refuses an empty pin instead of treating it as "not pinned
+        # yet". A re-pin of one column must not destroy the other.
+        IFS=$'\t' read -r m mo t tm inf _ eout <<<"$ln"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "$mo" "$t" "$tm" "$inf" \
+            "$(src_digest "$m" "${PATTERN[$m/$t]:-}")" "$eout" >>"$tmp"
     done <"$EXPECTED_FILE"
     mv "$tmp" "$EXPECTED_FILE"
     echo "ctgrind: source digests rewritten in $EXPECTED_FILE"

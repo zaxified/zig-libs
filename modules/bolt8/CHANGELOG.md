@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — The module is measured under ctgrind now, instead of inheriting a
+  verdict. `src/ctgrind_harness.zig` is committed and `scripts/ctgrind.sh` drives it; until
+  today `bolt8` was outside that table and its ledger read "PASS (inherited)" — derived from
+  reading, never instrumented — while the module holds the node's long-term static private
+  key, the ephemeral keys, `temp_k*` and both transport keys (audit F10). Four targets, all
+  `ReleaseFast`: `dh` 1 in-file context, `keygen` 3, `act3` 6, `transport` 3, with the
+  untainted control and the no-`-fvalgrind` trap at 0 for every one. No secret-dependent
+  branch was found: every non-zero is an invalid-key rejection, std's tag-check branch on a
+  public answer, or the taint model reaching a value that is legitimately public — itemised
+  one by one in `SPEC.md`. Teeth: a secret-dependent early return in `dh()` moves `dh` to 2
+  and `act3` to 7 and fails the gate. `act1` deliberately has no row, because Act One never
+  touches the static key and its zero would say nothing.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** this module is out of
   `zig build check-testonly` again, and its fuzz corpus uses a nine-line local
   copy of `testkit.fuzz`'s seed helper rather than the shared one. Enrolling it
