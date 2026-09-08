@@ -103,4 +103,4 @@ method). Test-vector cross-check only, not a design reference: the modmul/modexp
 KATs at 256/512/2048/4096 bits were independently recomputed with CPython's
 arbitrary-precision integers (`(a*b)%m`, `pow(a,e,m)`) — the same black-box
 oracle method the `vdf` module uses — numerically identical to OpenSSL
-`BN_mod_mul`/`BN_mod_exp`. No source ported.
+`BN_mod_mul`/`BN_mod_exp`. No source ported. DATA: the KATs in `src/kat_vectors.zig` are CPython's answers (`(a*b)%m`, `pow(a,e,m)`) on moduli and operands we generated from a stated seed — a black-box oracle's output on our own input, exempt per root `NOTICE` §0. No third-party vector file is reproduced.

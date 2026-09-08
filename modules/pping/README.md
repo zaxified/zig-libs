@@ -75,7 +75,7 @@ BEHAVIOR ONLY, described in its public documentation and papers, studied as a
 module is an independent Zig implementation of a published measurement technique
 (a technique is not a copyrightable work), and it deliberately shares no code
 with, and derives nothing from, that GPL codebase. The wire format is RFC 7323,
-a public spec.
+a public spec. DATA: the scenarios in `src/kat.zig` are hand-built `Observation` sequences with hand-computed expected `RttSample`s, written for this module. Nothing is taken from Pollere's pping, which was studied as a technique only; there is no vendored corpus.
 
 ## Anchoring
 

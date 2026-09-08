@@ -1,0 +1,74 @@
+jwt — third-party attribution
+====================================================================
+
+This file carries a CONDITION, added 2026-09-09. `src/rfc9964_vectors.zig`
+reproduces the JOSE examples published in RFC 9964 Appendix A.1 verbatim.
+Redistributing this module — alone, or as part of zig-libs — must keep this
+file with it.
+
+WHY THIS FILE DID NOT EXIST UNTIL NOW. `README.md`'s `Provenance:` statement
+answers a different question — it lists the eleven RFCs this module implements
+clean-room — and says nothing about the vectors the module also ships. The gate
+written for exactly this shape could not see them: `check-catalog`'s data-file
+claim looked for a committed file that is neither Zig source nor documentation,
+and these examples live in a `.zig` file, so no witness was found and the check
+never ran. That hole was closed on 2026-09-09; this file is one of the four
+records it forced.
+
+No code changed, and none needs to. The examples are unaltered.
+
+WHAT WAS TAKEN
+--------------
+
+  - `src/rfc9964_vectors.zig` — the ML-DSA JOSE examples of RFC 9964
+    Appendix A.1, verbatim. They are self-checking in a way hex KATs are not:
+    a transcription error makes ML-DSA verification fail, so the test that
+    consumes them is also the test that they were copied correctly.
+
+THE GRANT THIS RESTS ON
+-----------------------
+
+Not the merger doctrine. RFC examples of this kind are Code Components in the
+sense of the IETF Trust Legal Provisions (BCP 78) — the Trust's list names
+"tables of values" explicitly — and TLP 5.0 §4.c grants them under the Revised
+BSD License. A written grant is available at no cost, so this module takes it
+rather than arguing that published example values are uncopyrightable. That is
+the same choice `modules/mls/NOTICE` made on 2026-09-08 and the one
+`modules/ctap2pin/NOTICE` already cited.
+
+Reproduced as the Revised BSD License requires:
+
+    Copyright (c) 2026 IETF Trust and the persons identified as the
+    authors of RFC 9964. All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    3. Neither the name of Internet Society, IETF or IETF Trust, nor the
+       names of specific contributors, may be used to endorse or promote
+       products derived from this software without specific prior written
+       permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+    IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+    THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+    PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+    CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The condition this adds is "keep the notice", plus the no-endorsement clause.
+It imposes no restriction on how this collection is used and does not change
+the library's own MIT terms.

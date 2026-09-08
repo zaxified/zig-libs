@@ -2859,10 +2859,19 @@ fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
                 // a provenance line that talked only about the script language.
                 //
                 // So: if a module ships a committed file that is neither Zig
-                // source nor documentation, its provenance statement must
-                // ADDRESS data, or the module must carry its own NOTICE. This
-                // does not decide whether the data is clean -- it only refuses
-                // to let the question go unasked.
+                // source nor documentation -- OR a `.zig` file that says by its
+                // name or its own header that it holds data rather than logic
+                // -- its provenance statement must ADDRESS data, or the module
+                // must carry its own NOTICE. This does not decide whether the
+                // data is clean -- it only refuses to let the question go
+                // unasked.
+                //
+                // The second half of that sentence was added 2026-09-09, and
+                // it is the half that mattered: until then a generator that
+                // wrote its corpus out as `.zig` took the module out of this
+                // check entirely. `p256` shipped 358 315 B of Apache-2.0
+                // Wycheproof vectors with no attribution and a green gate for
+                // exactly that reason.
                 //
                 // LIMIT, stated so nobody mistakes this for more than it is: a
                 // module that HAS a `modules/<m>/NOTICE` is exempt, because a
@@ -2871,18 +2880,35 @@ fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
                 // "nobody ever wrote anything" hole, not the "what was written
                 // is incomplete" one -- the latter needs a reader, not a check.
                 if (!fileExists(b, io, b.fmt("modules/{s}/NOTICE", .{m.name}))) {
-                    if (firstDataFile(b, io, b.fmt("modules/{s}", .{m.name}), 0)) |witness| {
+                    const mod_dir = b.fmt("modules/{s}", .{m.name});
+                    // Two witnesses, not one. The first is data that stayed in
+                    // its own format; the second is data that went through a
+                    // generator and came out `.zig` -- see `firstDataZigFile`
+                    // for why the second had to be added and what it still
+                    // cannot see.
+                    if (firstDataFile(b, io, mod_dir, 0) orelse
+                        firstDataZigFile(b, io, mod_dir, 0)) |witness|
+                    {
+                        // "generated data" was added 2026-09-09 with the
+                        // second witness. `modules/tz`'s note is the best data
+                        // statement in the collection -- it names the tool, the
+                        // upstream release, what was extracted and what was not,
+                        // and quotes IANA's public-domain declaration -- and the
+                        // list did not recognise a single word of it. A gate
+                        // that fails the model answer is measuring its own
+                        // vocabulary, not the tree.
                         const covers_data = containsAnyIgnoreCase(claim, &.{
-                            "test data", "testdata",    "test vector", "vectors",
-                            "corpus",    "corpora",     "fixture",     "golden",
-                            "capture",   "litmus",      "data only",   "no source code",
-                            "no data",   "own tooling",
+                            "test data", "testdata",    "test vector",    "vectors",
+                            "corpus",    "corpora",     "fixture",        "golden",
+                            "capture",   "litmus",      "data only",      "no source code",
+                            "no data",   "own tooling", "generated data",
                         });
                         if (!covers_data) {
                             std.log.err(
                                 "modules/{s} ships committed data ({s}) but its Provenance statement " ++
                                     "speaks only about source — say where the DATA came from (generated " ++
-                                    "by our own tooling / captured from this machine / reproduced from " ++
+                                    "by our own tooling / captured from this machine / observed from a " ++
+                                    "third-party binary run as a black-box oracle / reproduced from " ++
                                     "<upstream>, in which case it needs modules/{s}/NOTICE). Reproduced " ++
                                     "third-party test data owes attribution exactly like ported code does.",
                                 .{ m.name, witness, m.name },
@@ -2992,7 +3018,10 @@ fn firstDataFile(b: *std.Build, io: std.Io, dir_path: []const u8, depth: u8) ?[]
     while (it.next(io) catch return best) |e| {
         const path = b.fmt("{s}/{s}", .{ dir_path, e.name });
         const candidate = switch (e.kind) {
-            .directory => firstDataFile(b, io, path, depth + 1) orelse continue,
+            .directory => blk: {
+                if (isBuildScratchDir(e.name)) continue;
+                break :blk firstDataFile(b, io, path, depth + 1) orelse continue;
+            },
             .file => blk: {
                 if (std.mem.endsWith(u8, e.name, ".zig")) continue;
                 if (std.mem.endsWith(u8, e.name, ".md")) continue;
@@ -3004,6 +3033,148 @@ fn firstDataFile(b: *std.Build, io: std.Io, dir_path: []const u8, depth: u8) ?[]
         if (best == null or std.mem.lessThan(u8, candidate, best.?)) best = candidate;
     }
     return best;
+}
+
+/// Untracked build scratch. `firstDataFile` walks the working tree, not the
+/// index, so without this a stray `.zig-cache/o/<hash>/x.bin` under a module
+/// would be reported as "committed data" -- a witness that vanishes the moment
+/// someone clears their cache, i.e. a gate whose verdict depends on whether you
+/// built recently. `modules/http/sizeprobe/.zig-cache` is a real instance.
+fn isBuildScratchDir(name: []const u8) bool {
+    for ([_][]const u8{ ".zig-cache", "zig-out", "zig-pkg", ".git" }) |d| {
+        if (std.mem.eql(u8, name, d)) return true;
+    }
+    return false;
+}
+
+/// The SECOND witness: reproduced third-party data that went through a
+/// generator and landed wearing a `.zig` extension.
+///
+/// WHY THIS EXISTS. `firstDataFile` above looks for a committed file that is
+/// neither Zig source nor documentation. That rule was written after
+/// `bitcoinscript` shipped ~2000 rows of Bitcoin Core's `script_tests.json`
+/// verbatim, and it works -- for data that stayed in its own format. It is
+/// blind to the far more common shape in this collection: a script reads an
+/// upstream corpus and emits `src/<name>_vectors.zig`, after which the module
+/// has zero non-`.zig`/`.md` files, `firstDataFile` returns null, and claim 6
+/// never runs at all. `modules/p256` is the worked example -- 358 315 B of
+/// Apache-2.0 Wycheproof vectors, no attribution anywhere in the module, and a
+/// green gate the whole time, because the vectors were `.zig`. Measured
+/// 2026-09-09 across the tree: 83 modules carry a data-shaped `.zig` and no
+/// non-`.zig` file at all, so for a third of the collection the check that
+/// exists for exactly this question was answering a different one.
+///
+/// WHAT COUNTS AS A WITNESS, and why it is two rules rather than one:
+///
+///   1. A `.zig` whose BASENAME says what it holds -- `*vector*`, `*golden*`,
+///      `*corpus*`, `*kat*`, `*testdata*`. This is the naming the collection
+///      already uses; it is not a convention invented here.
+///   2. Any `.zig` whose first bytes declare itself GENERATED. A generator's
+///      output is exactly the case rule 1 was written for, and some of it is
+///      named for its subject rather than its shape (`tz_data.zig`).
+///
+/// `*_test.zig` is deliberately EXCLUDED from rule 1: a file named
+/// `kat_test.zig` holds the assertions, and its sibling `kat_vectors.zig`
+/// holds the data. Flagging the test as well would make the gate's diagnostic
+/// name the wrong file, and a gate that points at the wrong file teaches people
+/// to write a sentence that satisfies it rather than one that is true.
+///
+/// LIMIT, stated so nobody mistakes this for more than it is: a module that
+/// freezes third-party oracle output INSIDE a test file, under a name matching
+/// neither rule, is still invisible here. `modules/cookies` is that case --
+/// CPython `http.cookies` output frozen in `golden_test.zig`. This closes the
+/// generated-data hole; it does not close "data can live anywhere".
+fn firstDataZigFile(b: *std.Build, io: std.Io, dir_path: []const u8, depth: u8) ?[]const u8 {
+    if (depth > 6) return null;
+    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var best: ?[]const u8 = null;
+    var it = dir.iterate();
+    while (it.next(io) catch return best) |e| {
+        const path = b.fmt("{s}/{s}", .{ dir_path, e.name });
+        const candidate = switch (e.kind) {
+            .directory => blk: {
+                if (isBuildScratchDir(e.name)) continue;
+                break :blk firstDataZigFile(b, io, path, depth + 1) orelse continue;
+            },
+            .file => blk: {
+                if (!std.mem.endsWith(u8, e.name, ".zig")) continue;
+                if (namesItsPayload(e.name)) break :blk path;
+                if (declaresItselfGenerated(b, io, path)) break :blk path;
+                continue;
+            },
+            else => continue,
+        };
+        if (best == null or std.mem.lessThan(u8, candidate, best.?)) best = candidate;
+    }
+    return best;
+}
+
+fn namesItsPayload(name: []const u8) bool {
+    if (std.mem.endsWith(u8, name, "_test.zig")) return false;
+    for ([_][]const u8{ "vector", "golden", "corpus", "kat", "testdata" }) |needle| {
+        if (std.ascii.indexOfIgnoreCase(name, needle) != null) return true;
+    }
+    return false;
+}
+
+/// Only the head of the file: a generator's banner is the first thing it
+/// writes, and reading whole `.zig` files here would make the gate pay for
+/// every source file in the collection to answer a question about a handful.
+///
+/// ⛔ NOT `readFileAlloc(..., .limited(2048))`. That is what this was written
+/// as, and it made the whole arm DEAD: `.limited()` does not truncate, it
+/// returns `error.StreamTooLong` when the file reaches the limit, so every
+/// generated file large enough to matter -- which is all of them -- failed the
+/// read and reported "not generated". `modules/tz/src/tz_data.zig` is 1 024 634
+/// bytes and carries `// GENERATED by scripts/tz-gen` on its second line; it
+/// was missed. Caught by probing the arm rather than by trusting that a green
+/// gate meant a working one.
+fn declaresItselfGenerated(b: *std.Build, io: std.Io, path: []const u8) bool {
+    var file = b.build_root.handle.openFile(io, path, .{}) catch return false;
+    defer file.close(io);
+    var head: [2048]u8 = undefined;
+    const n = file.readPositionalAll(io, &head, 0) catch return false;
+
+    // A BANNER, not a mention. Searching the head for the word "generated"
+    // matched files that merely TALK about generation in a doc comment --
+    // `tz/src/root.zig` describing its sibling, `groth16/src/domain.zig` on
+    // roots of unity -- and named them as the module's data. A gate whose
+    // diagnostic points at the wrong file teaches people to write a sentence
+    // that satisfies it rather than one that is true, so the match has to be
+    // the banner a generator emits and not a word inside a paragraph.
+    //
+    // ⭐ THE DISCRIMINATOR IS THE CAPITAL LETTER, and it is not a trick: a
+    // banner opens a sentence, so its first word is capitalised; a line that
+    // BEGINS with lowercase "generated" is the middle of a hard-wrapped one.
+    // Measured over every `.zig` in the tree, this is exactly the split.
+    //
+    //   kept   `// GENERATED by scripts/tz-gen`            (tz_data.zig)
+    //          `// GENERATED DATA -- every number below`   (rescue)
+    //          `//! GENERATED -- do not hand-edit`         (grpc capture)
+    //          `// Generated by scripts/gen-p256-...`      (p256, both files)
+    //          `//! Generated vector list over ...`        (csvstream, json5, xml)
+    //   dropped `//! generated eBPF program (...)`         (xdp-classifier)
+    //           `//! generated with OpenSSL 3.5.5`         (dtls -- still caught
+    //                                                       by its filename)
+    //
+    // Four lines of window, not five: every real banner above sits on line 2-3,
+    // after at most an SPDX line and a blank.
+    var lines = std.mem.splitScalar(u8, head[0..n], '\n');
+    var seen: u8 = 0;
+    while (lines.next()) |raw| : (seen += 1) {
+        if (seen >= 4) break;
+        var line = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, "//")) continue;
+        line = std.mem.trimStart(u8, line[2..], "!/ \t");
+        if (std.mem.startsWith(u8, line, "GENERATED")) return true;
+        if (std.mem.startsWith(u8, line, "Generated ")) return true;
+        if (std.mem.startsWith(u8, line, "Automatically generated")) return true;
+        if (std.ascii.indexOfIgnoreCase(line, "DO NOT EDIT") != null) return true;
+        if (std.ascii.indexOfIgnoreCase(line, "do not hand-edit") != null) return true;
+    }
+    return false;
 }
 
 /// A module's anchor grade, read from the one line that states it. Both the gate

@@ -198,4 +198,4 @@ zero-lifetime purge, or a differing checksum, against an ACTIVE stored copy is
 authors) as a behavior reference for the correct reading of the ISO clause. No
 FRR source was ported or adapted; the code, tests and structure are the
 authors' own and the rule is ISO's. (The sibling `isis` codec + `isis-adj` FSM
-are pure spec-only clean-room and need no record at all.) License: MIT.
+are pure spec-only clean-room and need no record at all.) License: MIT. DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from the spec clauses above and cross-checked against a third-party dissector's reading. They are this module's own construction, not bytes taken from anyone's corpus — and in particular nothing here comes from FRRouting, which was read for one behavioural question only.

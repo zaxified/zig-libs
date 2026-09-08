@@ -49,7 +49,7 @@ deduplication, §4.8 transmission parameters) and the §5 request/response model
 (token/message-id correlation §5.3, piggybacked/separate responses §5.2), plus
 RFC 7959 (block-wise transfer — Block1/Block2 options) and RFC 7641 (Observe).
 No third-party CoAP source (libcoap, aiocoap, Californium, …) consulted or
-copied.
+copied. DATA: `src/external_goldens.zig` holds datagrams captured once off the wire from independent CoAP implementations run as black-box peers, frozen so the test needs no subprocess. That is observed behaviour on our own exchanges, exempt per root `NOTICE` §0; no upstream test corpus is reproduced.
 
 ## Typed options (`coap.options`)
 

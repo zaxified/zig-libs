@@ -185,3 +185,4 @@ core-independent and prove the harness has teeth on their own.
 Provenance: clean-room from the BGI16 paper (ACM CCS 2016); no third-party
 source ported or studied. Per `CONVENTIONS.md §5` this needs no `NOTICE` entry
 — see [SPEC.md](SPEC.md) for the citation and the verification methodology.
+ DATA: the known-answer vectors in `src/kat_vectors.zig` were produced by our own independent Python re-derivation of the BGI16 construction, written for this purpose; they are this module's own numbers computed twice by two independent implementations, not a third-party corpus.

@@ -136,3 +136,4 @@ and `std.testing.allocator` leak checks. Green in Debug and ReleaseFast;
 Provenance: pure spec-only clean-room from ISO/IEC 10589 §7.3.15/.16 (a public
 spec); no third-party implementation consulted or ported. Like `isis`/`isis-adj`
 it carries no `/NOTICE` entry. License: MIT.
+ DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from the spec clauses above and cross-checked against a third-party dissector's reading. They are this module's own construction, not bytes taken from anyone's corpus.

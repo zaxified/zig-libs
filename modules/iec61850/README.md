@@ -455,3 +455,4 @@ Provenance: clean-room from the published ISO 8073 / RFC 1006 / ISO 8327 / ISO
 8823 / ISO 8650 / ISO 9506 / IEC 61850-8-1 layouts. No third-party source was
 consulted as a design reference; a third-party stack was built and run as a
 black-box test oracle and as a live peer only. See SPEC.md and `/NOTICE`.
+ DATA: `src/goldens.zig` and `src/controlgoldens.zig` hold frames captured through a TPKT-aware proxy from real IEC 61850 traffic — partly between two third-party endpoints, partly with this module as one peer. Observed behaviour, exempt per root `NOTICE` §0; no upstream test corpus is reproduced.

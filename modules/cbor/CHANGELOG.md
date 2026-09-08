@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code
+  changed. `README.md` said the RFCs are public specifications and no NOTICE entry was
+  needed — an answer about this module's CODE, applied to vectors it never mentioned.
+  `src/kat_vectors.zig` (RFC 8949 Appendix A) and `src/cose_kat_vectors.zig` (RFC 9052
+  Appendix C) rest on the IETF Trust's written grant, TLP 5.0 §4.c Revised BSD,
+  reproduced in the new file. Also recorded: the community repository `cbor/test-vectors`
+  publishes no licence and served only to cross-check the transcription — nothing was
+  taken from it.
 - **2026-09-07** — Test-only, no production change: both fuzz targets ran one input.
   `kat_test.fuzzDecodeNeverPanics` opened `smith.bytes(&buf)` and then drew its length
   with `smith.valueRangeAtMost(u16, 0, 4096)`; a ranged `Smith` draw reads eight octets as

@@ -269,4 +269,4 @@ used as black-box test oracles and `bacpypes3` as a live peer — which alone
 needs no record — BUT `bacpypes3`'s `primitivedata.Tag.encode` was read while
 probing the API, which makes it a consulted design reference for `src/tag.zig`
 and is declared here per `CONVENTIONS.md` §5. Nothing was ported and no other
-`bacpypes3` source was read. See SPEC.md.
+`bacpypes3` source was read. See SPEC.md. DATA: the goldens in `src/goldens.zig` and `src/sc_goldens.zig` are octets emitted by `bacpypes3` driven as a black-box oracle — the program's observable output on service objects we built — which root `NOTICE` §0 exempts, capture included. No third-party corpus is vendored.

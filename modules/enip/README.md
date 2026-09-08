@@ -244,3 +244,4 @@ reference for one thing: the `ConnectionParameters` reserved-bit layout in
 `epan/dissectors/packet-cip.c` was the only available statement of which
 bits are defined. Nothing was copied, and a design reference carries no
 licence condition — GPL-2.0 included. See SPEC.md and `/NOTICE`.
+ DATA: `src/goldens.zig` holds frames captured through a recording proxy from real traffic between third-party EtherNet/IP stacks acting as our peers, frozen offline. Observed behaviour, exempt per root `NOTICE` §0; no upstream corpus or fixture file is reproduced.

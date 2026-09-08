@@ -121,3 +121,4 @@ including the raw escape hatch, per-TLV bounds-safety unit tests, and the
 Provenance: clean-room from the public specifications above; no third-party
 IS-IS implementation or dissector (frrouting, Wireshark, tcpdump) source was
 ported or studied. See `/NOTICE` (no entry required — public specs). License: MIT.
+ DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from ISO/IEC 10589 and RFC 6329 and then cross-checked by dissecting them with `sharkd`. They are this module's own construction validated against a third-party dissector's verdict, not bytes taken from anyone's corpus.

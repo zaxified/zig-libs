@@ -240,3 +240,4 @@ No third-party *source* was consulted as a design reference; a third-party stack
 was used as a black-box test oracle and a live peer for classic S7comm, and
 `rawshark` as a black-box envelope check for S7CommPlus. See SPEC.md and
 `/NOTICE`.
+ DATA: `src/goldens.zig` and `src/s7plus_goldens.zig` hold frames captured through a TPKT-aware proxy from real traffic between third-party S7 stacks acting as our peers. Observed behaviour, exempt per root `NOTICE` §0; no upstream corpus is reproduced.

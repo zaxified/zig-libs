@@ -108,7 +108,7 @@ have, and `ethtool`'s `max_error_message` took `.len` of a *type*.
 
 Provenance: original work of the zig-libs authors (MIT); a thin layer over
 `std.testing`. No third-party source consulted or copied, so no `NOTICE` entry
-is required (root [`NOTICE`](../../NOTICE) §0).
+is required (root [`NOTICE`](../../NOTICE) §0). DATA: none. `src/golden.zig` is named for what it compares, not for what it holds — it is a diffing helper with no vendored bytes at all, and this module ships no test data, no fixture and no corpus of any kind. (The catalog gate's data-file check matches on the filename and so names this file; the answer is that there is nothing there.)
 
 ## Anchoring
 

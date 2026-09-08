@@ -1,0 +1,108 @@
+bip32 — third-party attribution
+====================================================================
+
+This file carries a CONDITION, added 2026-09-09. `src/bip32_vectors.zig` and
+`src/bip39_vectors.zig` reproduce third-party test vectors under two different
+licences. Redistributing this module — alone, or as part of zig-libs — must
+keep this file with it.
+
+⛔ THIS FILE WAS ALREADY BEING POINTED AT. Both vector files carry the line
+"see NOTICE / SPEC.md for provenance" in their own headers, and
+`modules/bip32/NOTICE` did not exist — a pointer to nothing, in the one file a
+reader consults to answer "what do I owe?". `README.md`'s `Provenance:`
+statement made it worse by answering a narrower question and sounding like the
+whole one: "no `NOTICE` entry required for the BIP-39/BIP-32 algorithms
+themselves". True of the algorithms, silent about the vectors.
+
+The gate written for exactly this shape could not see the vectors:
+`check-catalog`'s data-file claim looked for a committed file that is neither
+Zig source nor documentation, and these went through transcription into `.zig`,
+so no witness was found and the check never ran. That hole was closed on
+2026-09-09; this file is one of the four records it forced.
+
+No code changed, and none needs to. The vectors are unaltered, and the
+condition has been in force since they were committed.
+
+## BIP-32 — `src/bip32_vectors.zig`
+
+  https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki
+  Author: Pieter Wuille <pieter.wuille@gmail.com>
+  Licensed under the 2-clause BSD license, per the BIP's own header
+  (`License: BSD-2-Clause`) and its "Copyright" section.
+
+Test vectors 1-5 of the BIP's "Test Vectors" section, machine-transcribed
+verbatim (fetched 2026-08-08). The vectors are part of the BIP text that
+licence covers.
+
+As with `modules/psbt`, BIP-32 publishes no copyright LINE of its own and the
+`bitcoin/bips` repository carries no `LICENSE` file (verified 2026-09-09: HTTP
+404). The rightsholder is the BIP's named author, and the absence of an
+upstream copyright line is recorded rather than used as a reason to reproduce
+nothing.
+
+    Copyright (c) Pieter Wuille <pieter.wuille@gmail.com>, author of BIP-32
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+    1. Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+    IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+    THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+    PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+    CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## BIP-39 — `src/bip39_vectors.zig`
+
+The vectors are the widely-used "Trezor" English set, and they come from an
+implementation repository, not from the BIP: `trezor/python-mnemonic`'s
+`vectors.json`, `english` section — entropy, mnemonic, and the 64-byte seed
+derived with the fixed passphrase "TREZOR" this set standardizes on.
+
+  https://github.com/trezor/python-mnemonic
+  Copyright (c) 2013-2016 Pavol Rusnak
+  Licensed under the MIT License (verified 2026-09-09), reproduced below as
+  MIT requires. BIP-39 itself is also MIT (`License: MIT` in its header,
+  authors Marek Palatinus, Pavol Rusnak, Aaron Voisine and Sean Bowe), so
+  both possible readings of where these values originate land on the same
+  terms.
+
+    The MIT License (MIT)
+
+    Copyright (c) 2013-2016 Pavol Rusnak
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+Implementation vs. test-data distinction: the BIP-32 derivation and the BIP-39
+mnemonic/seed code in this module are its own clean-room work from the public
+specifications, which needs no attribution per root `NOTICE` §0. What is
+reproduced, and only here, is the published VECTOR DATA.

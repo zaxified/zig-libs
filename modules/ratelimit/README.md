@@ -16,7 +16,7 @@ zero globals.
 
 Provenance: clean-room (token-bucket + keyed store). Design references only, no
 source consulted or copied: `golang.org/x/time/rate` (BSD-3-Clause, The Go
-Authors) and nginx `limit_req` (BSD-2-Clause).
+Authors) and nginx `limit_req` (BSD-2-Clause). DATA: `src/xrate_vectors.zig` is a trace we recorded by driving `golang.org/x/time/rate` as a black-box oracle over a request sequence we chose, then freezing its answers. That is the library's observable behaviour on our input, exempt per root `NOTICE` §0 — not a copy of its test corpus, of which none is reproduced.
 
 ## Layers
 

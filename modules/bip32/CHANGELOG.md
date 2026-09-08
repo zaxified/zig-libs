@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code
+  changed. `src/bip32_vectors.zig` and `src/bip39_vectors.zig` had both carried "see
+  NOTICE / SPEC.md for provenance" in their own headers while `modules/bip32/NOTICE` did
+  not exist — a pointer to nothing. The vectors are BIP-32's own (BSD-2-Clause, author
+  Pieter Wuille) and the Trezor English BIP-39 set from `trezor/python-mnemonic` (MIT,
+  Copyright 2013-2016 Pavol Rusnak); both licence texts are now reproduced. The
+  condition has been in force since the vectors were committed.
 - **2026-09-08** — `fuzzParsePath`'s alphabet-bending loop had never executed its body outside
   `--fuzz`. The knob is drawn AFTER the byte draw, and `Smith.slice` leaves the seed exhausted,
   so `boolWeighted(1, 4)` returned its weight minimum: measured **0 `true` in 159 draws** across

@@ -106,3 +106,4 @@ if (try cache.getStapled(handshake_gpa, my_leaf_cert_der, now_unix)) |ocsp_respo
 
 Provenance: clean-room from RFC 6960 §4.2.2 and RFC 5280 §4.2.2.1 (both
 public IETF specifications). See `SPEC.md`.
+ DATA: `src/goldens.zig` holds a real leaf certificate, its issuer, and the OCSP response a real CA responder returned for them, captured live once and frozen. Those are a public responder's answers to requests we sent — observed behaviour, exempt per root `NOTICE` §0 — not any project's test corpus.

@@ -31,7 +31,7 @@ copyrightable interface code), relying on the same Linux-syscall-note exception
 as `netlink`/`genetlink`/`ethtool`/`nl80211`/`wireguard`. iproute2's `devlink`
 (GPL-2.0) was run ONLY as a black-box test oracle under `strace`, its request
 bytes diffed against this module's — no iproute2 source consulted, studied or
-ported.
+ported. DATA: `src/goldens.zig` holds request bytes captured under `strace` from the real `devlink` binary, plus the kernel replies it received — the program's observable output on arguments we chose, exempt per root `NOTICE` §0. No iproute2 test corpus is vendored.
 
 ## Most machines have no devlink device
 

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code
+  changed. `src/rfc9964_vectors.zig` reproduces RFC 9964 Appendix A.1's JOSE examples
+  verbatim, which the module's `Provenance:` statement never mentioned — it lists the
+  eleven RFCs the code implements. The record rests on the IETF Trust's written grant,
+  TLP 5.0 §4.c Revised BSD, reproduced in the new file.
 - **2026-09-07** — **All three fuzz harnesses were replaying an EMPTY input; each now
   has a corpus and a measured reach guard.**
 

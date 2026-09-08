@@ -11,7 +11,7 @@ message); the recipient cannot identify the sender.
   **Allocation:** none in the buffer API; `*Alloc` variants allocate the result.
 
 Provenance: original work of the zig-libs authors (MIT); the construction is
-the public NaCl `crypto_box_seal` standard, so no NOTICE entry.
+the public NaCl `crypto_box_seal` standard, so no NOTICE entry. DATA: `src/kat_vectors.zig`'s expected outputs were computed by calling real libsodium through PyNaCl on an ephemeral key we pinned — libsodium's observable answers to our own inputs, exempt per root `NOTICE` §0. Nothing is copied from libsodium's test suite, which publishes no fixed `crypto_box_seal` vector to copy.
 
 ## API
 

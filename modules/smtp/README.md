@@ -231,3 +231,4 @@ Provenance: clean-room from RFC 5321 / 5322 / 1869 / 1870 / 2045 / 2046 / 2047 /
 2920 / 3207 / 3461 / 3463 / 4616 / 4954 / 6152 / 6531. No third-party source was ported or
 studied, so there is no `/NOTICE` entry — `aiosmtpd`, `swaks` and Python's `email` module
 were used only as black-box oracles.
+ DATA: `src/live_golden.zig` holds both directions of a live session against a third-party SMTP server, recorded verbatim by a proxy. The server half is that program's observable output on our own session; the client half is this module's. Exempt per root `NOTICE` §0; no upstream corpus is reproduced.

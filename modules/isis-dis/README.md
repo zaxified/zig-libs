@@ -142,7 +142,7 @@ RED. Green in Debug and ReleaseFast; `zig fmt` clean.
 
 Provenance: clean-room from ISO/IEC 10589 §8.4.5; no third-party IS-IS
 implementation (frrouting, IOS, Junos) was ported or studied. See `/NOTICE`
-(no entry required — public spec). License: MIT.
+(no entry required — public spec). License: MIT. DATA: the goldens in `src/goldens.zig` are hand-assembled field by field from the spec clauses above and cross-checked against a third-party dissector's reading. They are this module's own construction, not bytes taken from anyone's corpus.
 
 ## Anchored (2026-08-05) — FRR, capture-and-freeze
 

@@ -153,6 +153,9 @@ were consulted for structure/behavior only, no source copied. Validation KATs
 are cross-checked against `ldns` (`ldns-signzone`/`ldns-verify-zone`,
 **BSD-3-Clause**) as an independent oracle — used to generate/verify test zones
 only, not consulted as source.
+
+DATA: `src/oracle_vectors.zig` holds signatures produced by running `ldns-signzone` over zones we wrote, each independently checked with `ldns-verify-zone`. Those are the tool's observable output on our input — a black-box oracle capture, exempt per root `NOTICE` §0 — not any part of ldns's own test corpus.
+
 ## Tests
 
 `zig build test-dnssec` — all tests run offline. The mechanical unit
