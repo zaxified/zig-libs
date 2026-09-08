@@ -85,9 +85,27 @@ Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
   scalars through it buys nothing and costs speed.
 - **No secrets are held.** The module allocates nothing, keeps no state and
   has no RNG; the only secret-derived values are the caller's scalar (a
-  by-value parameter) and the running `q`, both of which die with the frame.
-  There is nothing for `secureZero` to own here — zeroization is the
-  caller's, on the scalar it supplied.
+  by-value parameter) and the running `q`.
+  ⛔ **This paragraph used to end "there is nothing for `secureZero` to own
+  here — zeroization is the caller's, on the scalar it supplied", and that
+  assigned the duty to the side that cannot discharge it.** A caller can wipe
+  its own variable; it can neither see nor reach the copy the ABI makes on
+  `mul`'s frame. Measured 2026-09-06 with a painted-stack probe carrying its
+  own controls: after `mulRistretto`/`mulBase` returned, the 32-byte scalar was
+  still readable in the dead frame (SECRET = 1) while the probe's positive
+  control also fired (POS = 1, so the probe was not blind) — and `ecvrf` had
+  independently found three surviving copies of its nonce `x` for the same
+  reason, from which its key was algebraically recoverable, and recorded that
+  the fix "is not possible in this module — it is `ct25519`'s contract".
+  Since 2026-09-08 every entry point that takes the scalar by value
+  (`mul`, `mulBase`, `mulRistretto`, `mulRistrettoBase`) copies it into a local
+  and `defer`s `std.crypto.secureZero` on that copy. Re-measured with the same
+  probe: **SECRET = 0 with POS still 1**, and the mirror control that drives a
+  PUBLIC needle through the same call went 1 → 0 as well, which is the right
+  outcome — the mechanism was "argument passed by value", not "secret".
+  Constant time is unaffected: the ctgrind targets still report 2 contexts
+  (`ct25519`) and 3 (`std`), the documented baseline, so the wipe added no
+  secret-dependent branch and was not optimised away.
 
 ## Verification
 

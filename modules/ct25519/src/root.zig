@@ -176,11 +176,13 @@ fn pcSelect(pc: *const [16]Edwards25519, slot: u4) Edwards25519 {
 /// std's `mulPublic`/`mulDoubleBasePublic` when `s` is public and speed
 /// matters — those are variable-time by design and correct there.
 pub fn mul(p: Edwards25519, s: [32]u8) Edwards25519 {
+    var sc = s;
+    defer std.crypto.secureZero(u8, &sc);
     const pc = if (p.is_base) base_pc else precompute(p);
     var q = Edwards25519.identityElement;
     var pos: usize = 252;
     while (true) : (pos -= 4) {
-        const slot: u4 = @truncate(s[pos >> 3] >> @as(u3, @truncate(pos)));
+        const slot: u4 = @truncate(sc[pos >> 3] >> @as(u3, @truncate(pos)));
         q = q.add(pcSelect(&pc, slot));
         if (pos == 0) break;
         q = q.dbl().dbl().dbl().dbl();
@@ -192,7 +194,9 @@ pub fn mul(p: Edwards25519, s: [32]u8) Edwards25519 {
 /// comptime table, spelled out so callers do not have to rely on
 /// `basePoint.is_base` being set.
 pub fn mulBase(s: [32]u8) Edwards25519 {
-    return mul(Edwards25519.basePoint, s);
+    var sc = s;
+    defer std.crypto.secureZero(u8, &sc);
+    return mul(Edwards25519.basePoint, sc);
 }
 
 /// `s * p` over Ristretto255 — `mul` on the underlying Edwards25519 point.
@@ -202,12 +206,16 @@ pub fn mulBase(s: [32]u8) Edwards25519 {
 /// reject and the product is the neutral element iff `s ≡ 0 (mod L)` for a
 /// non-identity `p`.
 pub fn mulRistretto(p: Ristretto255, s: [32]u8) Ristretto255 {
-    return .{ .p = mul(p.p, s) };
+    var sc = s;
+    defer std.crypto.secureZero(u8, &sc);
+    return .{ .p = mul(p.p, sc) };
 }
 
 /// `s * B` over Ristretto255 against the ristretto255 base point.
 pub fn mulRistrettoBase(s: [32]u8) Ristretto255 {
-    return mulRistretto(Ristretto255.basePoint, s);
+    var sc = s;
+    defer std.crypto.secureZero(u8, &sc);
+    return mulRistretto(Ristretto255.basePoint, sc);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
