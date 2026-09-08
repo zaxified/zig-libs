@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `src/xmlconf_vectors.zig` carried two NOTICE pointers and both were
+  wrong. `../../NOTICE` resolves to `modules/NOTICE`, which has never existed; and the second
+  one described the root file as "the root-level attribution index", which it stopped being on
+  2026-09-06. `../NOTICE` is now the whole answer. No code or data changed.
 - **2026-09-07** — **`fuzzParse` ran one input for ever, and its byte-biasing
   loop had never executed.** It opened with `smith.bytes(&buf)` followed by
   `smith.valueRangeAtMost(u16, 0, buf.len)`; `bytes` consumes

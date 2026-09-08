@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: the `NOTICE` pointer in ``src/json_schema_format_test.zig` and `src/json_schema_format_vectors.zig`` resolved to `modules/NOTICE`,
+  a path that has never existed in this repository. Now ``../NOTICE``. No code or data
+  changed. `zig build check-catalog` gained a check that resolves every relative NOTICE
+  link under `modules/**`, so this cannot come back silently.
 - **2026-09-07** — **Test-only: neither fuzz target had a corpus, so each ran
   exactly ONE input for ever, and `fuzzValidateFormat`'s was `.email` with the
   empty string.** Outside `--fuzz` the runner feeds `options.corpus` plus one

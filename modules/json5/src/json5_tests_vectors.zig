@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Generated vector list over the vendored json5/json5-tests corpus (see ../../NOTICE
+//! Generated vector list over the vendored json5/json5-tests corpus (see ../NOTICE
 //! for provenance). One entry per fixture file; DO NOT hand-edit the `content` field --
 //! regenerate from testdata/json5-tests/ if the corpus is ever re-vendored.
 //!

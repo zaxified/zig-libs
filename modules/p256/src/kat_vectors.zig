@@ -2,7 +2,7 @@
 //! Official ECDSA-P256/SHA-256 test vectors transcribed from RFC 6979
 //! Appendix A.2.5 ("Deterministic ECDSA", curve NIST P-256, hash SHA-256) — a
 //! public IETF specification artifact, not copied from any implementation's test
-//! suite (see `../../NOTICE`). These are the EXTERNAL anchor for p256's
+//! suite (see `../NOTICE`). These are the EXTERNAL anchor for p256's
 //! end-to-end verify: each `(r, s)` is the RFC-published signature of `message`
 //! under the RFC-published key, so accepting it exercises p256's whole
 //! field/group/scalar stack against a reference produced independently of both

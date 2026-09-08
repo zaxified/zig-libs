@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `SPEC.md`'s pointer to the W3C corpus provenance was `../NOTICE`,
+  which from the module directory resolves to `modules/NOTICE` — a path that has never existed.
+  It means this module's own `NOTICE`. Found by the new link-resolution check in
+  `zig build check-catalog`.
 - **2026-09-09** — Licensing correction, no code change. `NOTICE` said the transcribed
   W3C conformance cases "add no condition beyond MIT's own"; the W3C 3-clause BSD
   License's third clause — no use of the W3C or contributor names to endorse derived

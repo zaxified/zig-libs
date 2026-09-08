@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: the `NOTICE` pointer in ``src/normative_test.zig`, `src/normative_vectors.zig` and `src/root.zig`` resolved to `modules/NOTICE`,
+  a path that has never existed in this repository. Now ``../NOTICE``. No code or data
+  changed. `zig build check-catalog` gained a check that resolves every relative NOTICE
+  link under `modules/**`, so this cannot come back silently.
 - **2026-09-09** — Licensing correction, no code change. Two defects in `NOTICE`. First,
   it said the vendored tables "add no condition beyond MIT's own"; neither source is MIT,
   and CC-BY 4.0 §3(a)(1)(B) — indicate whether the material was modified — has no MIT

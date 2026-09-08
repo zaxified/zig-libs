@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: the `NOTICE` pointer in ``src/root.zig`` resolved to `modules/NOTICE`,
+  a path that has never existed in this repository. Now ``../../../NOTICE``. No code or data
+  changed. `zig build check-catalog` gained a check that resolves every relative NOTICE
+  link under `modules/**`, so this cannot come back silently.
 - **2026-08-18** — Documentation only, no behavior change: moved the RFC 3550 smoothed-jitter
   formula (`J += (|D| - J)/16`) and the "`mean_ns` is an f64 Welford running mean, not a
   truncating integer divide" caveat from a SPEC.md/API-section detail to a callout at the top

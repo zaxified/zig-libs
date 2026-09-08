@@ -50,7 +50,7 @@ duplicated-traceparent rejection, multi-instance `tracestate` combining + OWS ha
 parse/write round-trip, invalid inputs rejected (bad version, length, delimiter, uppercase hex,
 all-zero ids), `childOf` plus id uniqueness/non-zero generation. PLUS a vendored W3C `trace-context`
 conformance corpus (`src/w3c_vectors.zig` + `src/w3c_conformance_test.zig`; provenance in
-`../NOTICE`): 73 hand-transcribed request/verdict vectors from the suite's `test/test.py`, 58 driven
+this module's `NOTICE`): 73 hand-transcribed request/verdict vectors from the suite's `test/test.py`, 58 driven
 both must-accept and must-reject through this module's own middleware, 15 excluded with a recorded
 reason apiece (a count canary fails loudly on unreclassified drift). Run: `zig build
 test-tracecontext`.

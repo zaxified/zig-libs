@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: the `NOTICE` pointer in ``src/kat_vectors.zig`` resolved to `modules/NOTICE`,
+  a path that has never existed in this repository. Now ``../NOTICE``. No code or data
+  changed. `zig build check-catalog` gained a check that resolves every relative NOTICE
+  link under `modules/**`, so this cannot come back silently.
 - **2026-09-07** — Fuzz reach: `fuzzFromSec1` never decoded a point. It opened
   `smith.bytes(&buf)`, then chose the SEC1 tag from `smith.valueRangeAtMost(u8, 0, 4)`
   and the length from `smith.valueRangeAtMost(u8, 0, 65)`. A `Smith` ranged draw reads

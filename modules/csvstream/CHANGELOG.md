@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: the `NOTICE` pointer in ``src/csv_spectrum_vectors.zig`` resolved to `modules/NOTICE`,
+  a path that has never existed in this repository. Now ``../NOTICE``. No code or data
+  changed. `zig build check-catalog` gained a check that resolves every relative NOTICE
+  link under `modules/**`, so this cannot come back silently.
 - **2026-09-09** — Licensing correction, no code change. `NOTICE` concluded that because
   csv-spectrum commits no `LICENSE` file "there is no license TEXT to reproduce". That
   inference was wrong: `BSD-2-Clause` in `package.json` is an SPDX identifier naming a

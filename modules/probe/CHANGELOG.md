@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: the `NOTICE` pointer in ``src/root.zig`` resolved to `modules/NOTICE`,
+  a path that has never existed in this repository. Now ``../../../NOTICE``. No code or data
+  changed. `zig build check-catalog` gained a check that resolves every relative NOTICE
+  link under `modules/**`, so this cannot come back silently.
 - **2026-09-02** — Drift re-audit (W2, window `becadd6..HEAD`). Eight findings, all fixed:
 
   - **HIGH, false negative in the default path:** `PosixConnector` connected to the **first**

@@ -2262,6 +2262,7 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
     checkLibs(readme, b, &failed);
     checkNonGoals(readme, b, &failed);
     try checkProvenance(b, io, &failed);
+    try checkNoticeLinksResolve(b, io, &failed);
     try checkAnchors(b, io, &failed);
 
     if (failed) return step.fail("catalog drift — see errors above", .{});
@@ -2768,6 +2769,123 @@ fn unreleasedSection(text: []const u8) ?[]const u8 {
 ///     silently passed a build that did not compile (`build.zig:657: error:`
 ///     does not start the line with `error:`), so two mutations "survived"
 ///     against a binary that was never built.
+/// Every relative pointer to a NOTICE inside `modules/**` must resolve to a file
+/// that exists.
+///
+/// WHY THIS IS A GATE AND NOT A STYLE NOTE. From `modules/<m>/src/x.zig`,
+/// `../../NOTICE` is `modules/NOTICE` -- a path that has never existed in this
+/// repository. Seventeen files across fourteen modules pointed there, and one of
+/// them was `k256/src/kat_vectors.zig`, whose only statement about where its
+/// BIP340 vectors came from was that dead link; the module had no NOTICE either,
+/// so the pointer was dead twice over and nothing said so. A pointer to nothing
+/// is worse than silence: the reader cannot tell "attributed elsewhere" from
+/// "nobody wrote it". The same tree already used both correct forms --
+/// `../NOTICE` for the module's own, `../../../NOTICE` for the root -- and
+/// `csvstream/src/csv_spectrum_vectors.zig` carried a correct one and a broken
+/// one in the same file, which rules out reading the broken form as a
+/// convention.
+///
+/// LIMIT: this resolves pointers, it does not read what they point AT. A link
+/// to a NOTICE that exists but does not cover the file's data still passes --
+/// that is the data claim's job, above.
+fn checkNoticeLinksResolve(b: *std.Build, io: std.Io, failed: *bool) !void {
+    for (module_list) |m| {
+        scanNoticeLinks(b, io, b.fmt("modules/{s}", .{m.name}), 0, failed);
+    }
+}
+
+fn scanNoticeLinks(b: *std.Build, io: std.Io, dir_path: []const u8, depth: u8, failed: *bool) void {
+    if (depth > 6) return;
+    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch return) |e| {
+        const path = b.fmt("{s}/{s}", .{ dir_path, e.name });
+        switch (e.kind) {
+            .directory => {
+                if (isBuildScratchDir(e.name)) continue;
+                scanNoticeLinks(b, io, path, depth + 1, failed);
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, e.name, ".zig") and
+                    !std.mem.endsWith(u8, e.name, ".md")) continue;
+                // CHANGELOG.md is excluded, and the reason is not squeamishness:
+                // an entry that RECORDS a broken-path fix has to quote the broken
+                // path, and this gate cannot tell a link from a quotation of one.
+                // `tracecontext/CHANGELOG.md` is exactly that -- it documents the
+                // 2026-09-09 repair and names both the wrong form and the right
+                // one. Changelogs are history rather than pointers a reader
+                // follows for a licence answer, so the trade is worth taking; a
+                // genuinely broken link inside a changelog does get past this.
+                if (std.mem.eql(u8, e.name, "CHANGELOG.md")) continue;
+                const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch continue;
+                checkNoticeLinksIn(b, io, path, dir_path, src, failed);
+            },
+            else => continue,
+        }
+    }
+}
+
+/// Walks BACKWARDS from each "NOTICE" over the `./` and `../` segments in front
+/// of it, so the depth is read off the text rather than guessed from a list of
+/// shapes the gate happens to know.
+fn checkNoticeLinksIn(
+    b: *std.Build,
+    io: std.Io,
+    file_path: []const u8,
+    dir_path: []const u8,
+    src: []const u8,
+    failed: *bool,
+) void {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, "NOTICE")) |hit| {
+        i = hit + "NOTICE".len;
+        var start = hit;
+        while (start >= 3 and std.mem.eql(u8, src[start - 3 .. start], "../")) start -= 3;
+        if (start == hit) continue; // no `../` in front: not a relative link
+        const link = src[start..i];
+
+        // Resolve `dir_path/link` by popping one component per `../`.
+        var ups: usize = 0;
+        var k: usize = start;
+        while (k + 3 <= hit) : (k += 3) ups += 1;
+        // ⛔ The first version of this loop `break`-ed when it ran out of
+        // components, which silently DISCARDED the surplus `../` and let
+        // `../../../../NOTICE` resolve to the root file. Caught by probing a
+        // depth other than the one the finding was about: a resolver that
+        // clamps at the root cannot see a link that climbs past it.
+        var base = dir_path;
+        var popped: usize = 0;
+        var escaped = false;
+        while (popped < ups) : (popped += 1) {
+            if (base.len == 0) {
+                escaped = true;
+                break;
+            }
+            const slash = std.mem.lastIndexOfScalar(u8, base, '/') orelse {
+                base = "";
+                continue;
+            };
+            base = base[0..slash];
+        }
+        const resolved = if (escaped)
+            b.fmt("<above the repository root>/NOTICE", .{})
+        else if (base.len == 0)
+            "NOTICE"
+        else
+            b.fmt("{s}/NOTICE", .{base});
+        if (!escaped and fileExists(b, io, resolved)) continue;
+        std.log.err(
+            "{s} points at `{s}`, which resolves to `{s}` — a file that does not exist. " ++
+                "From modules/<m>/src/, the module's own notice is `../NOTICE` and the root one " ++
+                "is `../../../NOTICE`; `../../NOTICE` is `modules/NOTICE` and there is no such file.",
+            .{ file_path, link, resolved },
+        );
+        failed.* = true;
+    }
+}
+
 fn checkProvenance(b: *std.Build, io: std.Io, failed: *bool) !void {
     const notice = try b.build_root.handle.readFileAlloc(io, "NOTICE", b.allocator, .limited(4 * 1024 * 1024));
     checkModuleCitations(notice, "NOTICE", failed);

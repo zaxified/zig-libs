@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code changed,
+  but a source comment was corrected. This module reproduces two bodies of published values and
+  had a record for neither: BIP340's own test vectors (`src/kat_vectors.zig`, BSD-2-Clause,
+  author Pieter Wuille) and BOLT#11's first worked example (`src/ecdsa_recover.zig`'s
+  `spec_privkey`/`spec_node_id`/`spec_hash`/`spec_r`/`spec_s`, `lightning/bolts`, CC-BY 4.0).
+  The only statement about the first was a `see ../../NOTICE` that resolved to a file which has
+  never existed. ⛔ The second was described in-source as "a test oracle under NOTICE policy §0";
+  it is not — §0's carve-out is for a program that was RUN, and it says explicitly that numbers
+  read out of an upstream source file are reproduced data. That reading also put this module on
+  the opposite side of `lnwire`'s and `lninvoice`'s answer about the identical upstream. Both
+  licences are now reproduced or linked as their terms require, and the comment says so.
 - **2026-09-08** — Test-only follow-up to the 2026-09-07 entry below, which
   fixed one knob per harness and left a second one dead. `fuzzFromSec1`'s tag
   selector has a `4 =>` branch that draws an ARBITRARY octet with

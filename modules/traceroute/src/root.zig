@@ -81,7 +81,7 @@
 //! method (a public technique: Van Jacobson's TTL-stepping applied to ICMP
 //! Echo) and RFC 792 (ICMP message formats, via the sibling `icmp` codec).
 //! No traceroute, mtr or other third-party source consulted or copied —
-//! behavior only. See ../../NOTICE.
+//! behavior only. See ../../../NOTICE.
 
 const std = @import("std");
 const builtin = @import("builtin");

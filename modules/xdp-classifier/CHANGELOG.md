@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: the `NOTICE` pointer in ``src/root.zig`` resolved to `modules/NOTICE`,
+  a path that has never existed in this repository. Now ``../../../NOTICE``. No code or data
+  changed. `zig build check-catalog` gained a check that resolves every relative NOTICE
+  link under `modules/**`, so this cannot come back silently.
 - **2026-07-19** — Security audit: one finding fixed (part of the collection-wide audit;
   the root changelog records no further detail than this). Verified: The real anchor is
   the CAP_BPF load-verify test (`classifier.zig:544`) that builds the program with live

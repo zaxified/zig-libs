@@ -28,7 +28,7 @@
 //! Tene's HdrHistogram design (logarithmic bucketing with linear sub-buckets,
 //! bounded relative error); clean-room from the published design — no
 //! HdrHistogram source (C/Java/Rust) consulted or copied. No third-party
-//! source copied — see ../../NOTICE.
+//! source copied — see ../../../NOTICE.
 
 const std = @import("std");
 

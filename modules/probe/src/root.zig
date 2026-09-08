@@ -70,7 +70,7 @@
 //! Provenance: clean-room — a TCP-connect reachability probe is a standard,
 //! decades-old technique (nmap's `-sT` connect scan; fping's parallel
 //! host sweep). Models behavior only; no nmap, fping or other third-party
-//! source consulted or copied. See ../../NOTICE.
+//! source consulted or copied. See ../../../NOTICE.
 
 const std = @import("std");
 const builtin = @import("builtin");

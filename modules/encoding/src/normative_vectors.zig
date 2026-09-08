@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Parsers for the vendored normative single-byte code-page tables (see
-//! ../../NOTICE for provenance). Two source formats are vendored, because the
+//! ../NOTICE for provenance). Two source formats are vendored, because the
 //! two publishers use different layouts:
 //!
 //!   - WHATWG `index-*.txt` (windows-1250, windows-1252, iso-8859-2,

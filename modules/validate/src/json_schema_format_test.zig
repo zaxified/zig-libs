@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Drives `validate.validateFormat` through the vendored
 //! json-schema-org/JSON-Schema-Test-Suite `optional/format/*.json` corpus
-//! (json_schema_format_vectors.zig; provenance: ../../NOTICE).
+//! (json_schema_format_vectors.zig; provenance: ../NOTICE).
 //!
 //! Each vendored file is a JSON array of "groups": `{description, schema:
 //! {format}, tests: [{description, data, valid}, ...]}`. Per JSON Schema

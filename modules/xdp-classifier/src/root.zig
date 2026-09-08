@@ -28,7 +28,7 @@
 //! downstream `tc`/CAKE queueing stage) and the BPF ISA / verifier-behavior
 //! documentation the sibling `ebpf` module already cites. Clean-room from
 //! the public LibreQoS architecture description and kernel UAPI/verifier
-//! docs — no LibreQoS or libbpf source ported; see `../../NOTICE` if a
+//! docs — no LibreQoS or libbpf source ported; see `../../../NOTICE` if a
 //! specific design reference needs recording.
 
 const std = @import("std");

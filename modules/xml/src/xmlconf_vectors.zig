@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! Generated vector list over a LICENSE-FILTERED SLICE of the W3C XML
 //! Conformance Test Suite (xmlconf, see ../NOTICE for the full provenance and
-//! license accounting, and ../../NOTICE for the root-level attribution index).
+//! license accounting). The second pointer this line used to carry -- to the
+//! root NOTICE "attribution index" -- is gone: it named `modules/NOTICE`, which
+//! has never existed, and the root file stopped being an index of modules on
+//! 2026-09-06. `../NOTICE` is now the whole answer.
 //! The xmltest sub-suite (James Clark) is excluded entirely: its own license
 //! permits redistribution only as the unmodified xmltest.zip, not as this kind
 //! of extracted subset -- see NOTICE. One entry per vendored fixture file; DO

@@ -56,7 +56,7 @@
 //! Provenance: models the Pollere pping technique (Kathleen Nichols,
 //! <https://github.com/pollere/pping>) and RFC 7323 (TCP Extensions for
 //! High Performance) §3's Timestamps option. Clean-room from the published
-//! technique/spec — no pping source consulted or copied; see ../../NOTICE.
+//! technique/spec — no pping source consulted or copied; see ../../../NOTICE.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

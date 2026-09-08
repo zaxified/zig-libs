@@ -76,7 +76,7 @@
 //! and concurrency caps. Round-robin, smooth weighted round-robin (the
 //! nginx algorithm), least-connections and EWMA latency balancing are
 //! public, decades-old techniques. No third-party source consulted or
-//! copied. See ../../NOTICE.
+//! copied. See ../../../NOTICE.
 
 const std = @import("std");
 const resilience = @import("resilience");

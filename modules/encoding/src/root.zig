@@ -560,7 +560,7 @@ test "encode: a valid multi-byte lead truncated at buffer end passes through, no
 test {
     // Exhaustive cross-check of all five high-tables against vendored
     // normative sources (WHATWG index-*.txt / Unicode.org 8859-1.TXT) — see
-    // normative_test.zig and ../../NOTICE.
+    // normative_test.zig and ../NOTICE.
     _ = @import("normative_vectors.zig");
     _ = @import("normative_test.zig");
 }

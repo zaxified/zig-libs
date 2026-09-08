@@ -2,7 +2,7 @@
 //! The official BIP340 test vectors, transcribed verbatim (hex case preserved as
 //! published) from `bip-0340/test-vectors.csv` in the `bitcoin/bips` repository
 //! — a public BIP specification artifact, not copied from any implementation's
-//! test suite (see `../../NOTICE`). These are the EXTERNAL anchor for k256's
+//! test suite (see `../NOTICE`). These are the EXTERNAL anchor for k256's
 //! end-to-end sign/verify: the 8 secret-key rows must sign to the exact
 //! published signature (proving k256's whole field/group/scalar stack), and the
 //! 11 verify-only rows (10 of them `FALSE`) catch R.y-parity, r/s-range, and

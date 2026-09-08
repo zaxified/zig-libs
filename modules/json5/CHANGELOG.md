@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: the `NOTICE` pointer in ``src/json5_tests_vectors.zig`` resolved to `modules/NOTICE`,
+  a path that has never existed in this repository. Now ``../NOTICE``. No code or data
+  changed. `zig build check-catalog` gained a check that resolves every relative NOTICE
+  link under `modules/**`, so this cannot come back silently.
 - **2026-09-07** — **Three recovery defects, found by the first corpus that ever
   reached this module's fuzz harnesses.** Both targets opened with
   `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`;

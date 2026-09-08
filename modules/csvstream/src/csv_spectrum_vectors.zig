@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Generated vector list over the vendored maxogden/csv-spectrum corpus (see
-//! ../../NOTICE for provenance). One entry per `csvs/<name>.csv` +
+//! ../NOTICE for provenance). One entry per `csvs/<name>.csv` +
 //! `json/<name>.json` pair, matched by basename -- that pairing convention is
 //! taken from the corpus's own `index.js` (`path.basename(csvs[i].name,
 //! path.extname(csvs[i].name))`), not assumed. DO NOT hand-edit `csv`/`json`

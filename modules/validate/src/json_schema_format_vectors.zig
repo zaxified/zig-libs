@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Vendored corpus list over json-schema-org/JSON-Schema-Test-Suite's
-//! `tests/draft2020-12/optional/format/` directory (see ../../NOTICE for
+//! `tests/draft2020-12/optional/format/` directory (see ../NOTICE for
 //! provenance). One entry per fixture file whose `format` value is one this
 //! module's `Format` enum implements.
 //!

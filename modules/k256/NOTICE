@@ -1,0 +1,108 @@
+k256 — third-party attribution
+====================================================================
+
+This file carries a CONDITION, added 2026-09-09. This module reproduces
+published values from two upstreams under two different licences.
+Redistributing this module — alone, or as part of zig-libs — must keep this
+file with it.
+
+⛔ WHY IT DID NOT EXIST UNTIL NOW, AND WHY THAT WAS TWO FAILURES AT ONCE.
+`src/kat_vectors.zig:5` said "see `../../NOTICE`" — which from this module's
+`src/` directory resolves one level above the module, to a path that has never
+existed in this repository. So the one pointer a
+reader had led nowhere, and the file it should have led to had not been written.
+`README.md`'s `Provenance:` statement answers for the module's CODE (clean-room
+secp256k1 + BIP340, libsecp256k1 studied for technique shape) and says nothing
+about either body of reproduced values.
+
+No code changed in this revision. Both conditions have been in force since the
+values were committed.
+
+## `bitcoin/bips` — BIP340's own test vectors
+
+  https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv
+  Author: Pieter Wuille <pieter.wuille@gmail.com>
+  Licensed under the 2-clause BSD license (`License: BSD-2-Clause` in the BIP's
+  own header).
+
+`src/kat_vectors.zig` transcribes them verbatim, hex case preserved as
+published: 8 secret-key rows that must sign to the exact published signature,
+and 11 verify-only rows.
+
+⚠ BIP340 carries a SECOND header the sibling BIPs do not: `License-Code:
+BSD-2-Clause OR MIT OR CC0-1.0`, an OR-choice that would let a redistributor of
+the BIP's *code* elect CC0 and owe nothing. Whether a CSV of test vectors is the
+BIP's "text" (covered by `License:`) or its "code" (covered by `License-Code:`)
+is not something this file needs to decide, because it takes the stricter
+reading: BSD-2-Clause, reproduced below. Electing the loosest available term to
+avoid writing a notice would be choosing the answer first.
+
+As with `modules/psbt` and `modules/bip32`, the BIP publishes no copyright LINE
+of its own and `bitcoin/bips` carries no `LICENSE` file (verified 2026-09-09:
+HTTP 404). The rightsholder is the BIP's named author, and the absence is
+recorded rather than filled in with an invented attribution.
+
+    Copyright (c) Pieter Wuille <pieter.wuille@gmail.com>, author of BIP340
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+    1. Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+    IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+    THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+    PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+    CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## `lightning/bolts` — BOLT#11's own worked example
+
+  https://github.com/lightning/bolts
+  Licensed under CC-BY 4.0: http://creativecommons.org/licenses/by/4.0/
+  (stated in the repository's own README.md; there is no separate LICENSE
+  file). The same upstream and the same terms the siblings
+  `modules/lnwire/NOTICE` and `modules/lninvoice/NOTICE` already record; those
+  two pin commit `35e79db504560b9d3494a0ed07bf1e8379c3663a`, and this module
+  takes the same published example.
+
+`src/ecdsa_recover.zig`'s `spec_privkey`, `spec_node_id`, `spec_hash`,
+`spec_r`/`spec_s`/`spec_recid` are BOLT#11's first worked example ("Please make
+a donation of any amount…"): the private key and node id printed literally in
+the specification, the SHA-256 of its signing preimage, and the 65 signature
+bytes carried by the `lnbc1pvjluez…` string the spec prints. They are the
+repository's only offline secp256k1 RFC-6979 anchor — RFC 6979's own Appendix
+A.2 covers DSA and the NIST curves only.
+
+⛔ CORRECTED 2026-09-09: `ecdsa_recover.zig` described these as "a test oracle
+under NOTICE policy §0". They are not. §0's oracle carve-out is for the
+observable behaviour of a program that was RUN; these are values printed in a
+specification document, which §0 separates out explicitly ("numbers read out of
+an upstream source file by a script are reproduced data, not oracle output").
+Reading them as oracle output also put this module on the opposite side of its
+own siblings' answer about the identical upstream — `lnwire` and `lninvoice`
+record `lightning/bolts` as CC-BY 4.0 and attribute it. It is attributed here
+too, and the source comment has been corrected to match.
+
+CC-BY 4.0 asks for attribution to the licensor, a link to the licence, and an
+indication of whether the material was modified. The first two are above. As to
+the third: NOT MODIFIED. Every value is the published one, hex-decoded from the
+form the specification prints — a change of encoding, not of content. CC-BY 4.0
+is not reproduced in full here because it does not ask to be: §3(a)(1)(C) is
+satisfied by "a URI or hyperlink to this Public License".
+
+Implementation vs. reproduced-value distinction: the field, group, scalar and
+signature code in this module is its own clean-room work from the public
+secp256k1 parameters and BIP340, which needs no attribution per root `NOTICE`
+§0. What is reproduced, and only here, is published VECTOR AND EXAMPLE DATA.

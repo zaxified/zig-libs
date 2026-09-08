@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Exhaustive cross-check of the five code-page high-tables (0x80-0xFF)
-//! against externally-vendored normative sources (see ../../NOTICE for
+//! against externally-vendored normative sources (see ../NOTICE for
 //! provenance: WHATWG `index-*.txt` for windows-1250/1252, iso-8859-2/15;
 //! Unicode.org `8859-1.TXT` for iso-8859-1).
 //!

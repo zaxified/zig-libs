@@ -301,8 +301,18 @@ test "recoverPubkey: r=0 and s=0 are rejected (error.InvalidScalar), not silentl
 // PROVENANCE, precisely. These four constants are the BOLT#11
 // specification's own first worked example ("Please make a donation of any
 // amount…"), from `lightning/bolts` — the spec repository, not any
-// implementation's test suite (a test oracle under NOTICE policy §0, same
-// class as `kat_vectors.zig`'s `bip-0340/test-vectors.csv`):
+// implementation's test suite. They are ATTRIBUTED, under CC-BY 4.0: see
+// `../NOTICE`.
+//
+// ⛔ CORRECTED 2026-09-09. This comment used to call them "a test oracle under
+// NOTICE policy §0". They are not. §0's oracle carve-out is for the observable
+// behaviour of a program that was RUN, and it says in as many words that
+// "numbers read out of an upstream source file by a script are reproduced data,
+// not oracle output". Reading them as oracle output also put this module on the
+// opposite side of its own siblings' answer about the identical upstream —
+// `lnwire` and `lninvoice` both record `lightning/bolts` as CC-BY 4.0. The
+// same correction applies to `kat_vectors.zig`'s BIP340 rows, which are
+// BSD-2-Clause and likewise attributed in `../NOTICE`:
 //
 //   * `spec_privkey` and `spec_node_id` are printed literally in BOLT#11's
 //     worked-example preamble.

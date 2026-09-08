@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `SPEC.md`'s pointer to the goosestalker attribution was `../NOTICE`,
+  which from the module directory resolves to `modules/NOTICE` — a path that has never existed.
+  It means this module's own `NOTICE`. Found by the new link-resolution check in
+  `zig build check-catalog`, not by the audit pass that fixed the `src/` links.
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
   `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
   helper existed **33 times across 12 modules in three shapes**, each carrying its

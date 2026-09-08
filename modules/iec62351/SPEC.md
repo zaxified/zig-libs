@@ -415,7 +415,7 @@ interoperability is claimed.** What was available was used, as a black box:
 61850-8-1 GOOSE frames — a GE F650 relay and two IEDs from a mock four-bus
 substation, all captured from genuine devices, none of them this module's own
 output — were vendored instead (`cutaway-security/goosestalker`, MIT; see
-`../NOTICE`) and driven through `parse`/`verify` in
+this module's `NOTICE`) and driven through `parse`/`verify` in
 `src/goose_capture_test.zig`. Since `goose.zig` never parses the `goosePdu`
 (the layering decision above), what a real frame can anchor is exactly the
 header: EtherType, APPID, `Length`, `Reserved 1`/`Reserved 2`, and the

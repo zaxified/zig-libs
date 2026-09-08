@@ -24,7 +24,7 @@
 //! however this module also names design references (API/behavior SHAPE
 //! only, no source copied): cacophony (Haskell, BSD-2-Clause), noise-c
 //! (github.com/rweather/noise-c, BSD-2-Clause), snow (Rust, Apache-2.0 OR
-//! MIT). See `../../NOTICE` and `README.md`'s "Provenance" section.
+//! MIT). See `../../../NOTICE` and `README.md`'s "Provenance" section.
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
