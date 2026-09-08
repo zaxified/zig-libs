@@ -27,6 +27,37 @@
 #            std's `rejectIdentity` context that ct25519's negative control
 #            needs only to EXIST.
 #
+# `out_sha` — the SEVENTH column, added 2026-09-08. A digest of the VALUE lines
+# the harness itself printed on this row's claim run.
+#
+# ⛔ Why. The ct25519 audit (C1) mutated the HARNESS, not the module: the branch
+# stopped calling `mulRistrettoBase` and assigned the secret straight to the
+# output. The table came out identical to the baseline — 2 / 0 / 2 / 0 — and
+# `--check` was GREEN. Every row claiming "in-file 0" has that hole, because a
+# harness that never reaches the module also produces zero in-file contexts:
+# "no secret-dependent branch" and "the module was not called" are the SAME
+# measurement. That is 8 rows across 6 modules.
+#
+# What separates them is the value the harness prints, which every harness
+# already did (`pk=`, `sig=`, `x=`, `create[N]=`, `cmov=`, `r=`/`s=`) — nothing
+# needed a new print, only a pin. Verified on the deployed bypass: the counts
+# stay 2/0/2/0 and pass, and ONLY this column fails.
+#
+# The two pins are complementary and neither subsumes the other. The source
+# digest sees an edit to the analysed module; the output digest sees the harness
+# failing to reach it. The bypass lives in the harness, which is not in any
+# row's pattern, so the source digest does not move for it.
+#
+# Rewritten by `--update-outputs`, which RUNS the measurement (the value cannot
+# come from anywhere else) — a separate verb from `--update-digests` for the
+# same reason: re-pinning must be typed on purpose.
+#
+# Equal digests across rows are expected in two places and both are legitimate:
+# chachapoly's three modes compute the same tag, and ct25519's two targets
+# compute the same point by different routes. Each row still reads its OWN log
+# (`log_<module>_<mode>_<vg>_<target>_<taint>.txt`), so no row can be scored on
+# another's output.
+#
 # `src_sha` — the SIXTH column, added 2026-09-08. A 16-hex-digit sha256 over
 # the module's OWN sources named by this row's `PATTERN`, concatenated in
 # sorted order.
@@ -70,11 +101,11 @@
 # re-running the harness.
 #
 # module	mode	target	total_min	in_file
-bn254	ReleaseFast	field	1	1	27af92a0c130f0a6
-bn254	ReleaseFast	scalarmul	1	5	7024133dc4a2a90a
-chachapoly	ReleaseFast	poly1305	1	0	f3f338165286691b
-chachapoly	ReleaseSafe	poly1305	1	>=1	f3f338165286691b
-chachapoly	Debug	poly1305	1	>=1	f3f338165286691b
+bn254	ReleaseFast	field	1	1	27af92a0c130f0a6	831aa25b5c3d2f05
+bn254	ReleaseFast	scalarmul	1	5	7024133dc4a2a90a	1bba83824af4d763
+chachapoly	ReleaseFast	poly1305	1	0	f3f338165286691b	ff3ba8f00b851bdf
+chachapoly	ReleaseSafe	poly1305	1	>=1	f3f338165286691b	ff3ba8f00b851bdf
+chachapoly	Debug	poly1305	1	>=1	f3f338165286691b	ff3ba8f00b851bdf
 # The AEAD's own claim (added 2026-09-02). SPEC.md and root.zig state that the
 # tag is compared in constant time, and until this row existed the module was
 # measured with the `poly1305` target ALONE -- the harness never touched
@@ -102,26 +133,26 @@ chachapoly	Debug	poly1305	1	>=1	f3f338165286691b
 # the `poly1305` target's Debug row too, which this line did not touch, so it
 # predates the `aead` target. Measured 2026-09-02; the ReleaseFast rows -- the
 # ones every claim in SPEC.md is about -- attribute cleanly.
-chachapoly	ReleaseFast	aead	1	4	b08b7e78d8c87360
-chachapoly	ReleaseSafe	aead	1	>=1	b08b7e78d8c87360
-chachapoly	Debug	aead	1	>=1	b08b7e78d8c87360
-ct25519	ReleaseFast	ct25519	1	0	47a4096a4ea6b856
-ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC
-decaf448	ReleaseFast	scalarmul	1	0	e664aa6778fea0b1
-ecvrf	ReleaseFast	prove	1	3	ef792ba15f66f0bd
-ed448	ReleaseFast	full	1	3	dbefc4ae560d8288
-ed448	ReleaseFast	ladder	1	0	dc6585ac248e91ee
+chachapoly	ReleaseFast	aead	1	4	b08b7e78d8c87360	870a36cbebbc4588
+chachapoly	ReleaseSafe	aead	1	>=1	b08b7e78d8c87360	870a36cbebbc4588
+chachapoly	Debug	aead	1	>=1	b08b7e78d8c87360	870a36cbebbc4588
+ct25519	ReleaseFast	ct25519	1	0	47a4096a4ea6b856	4e5e08fafcda58f8
+ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
+decaf448	ReleaseFast	scalarmul	1	0	e664aa6778fea0b1	77a1bd1038ca1053
+ecvrf	ReleaseFast	prove	1	3	ef792ba15f66f0bd	f676793e0800a787
+ed448	ReleaseFast	full	1	3	dbefc4ae560d8288	5853bb35135afb85
+ed448	ReleaseFast	ladder	1	0	dc6585ac248e91ee	43db8426e0d6c6e7
 # k256 — the field layer is clean; every group/sign/ecdsa context is a
 # `rejectIdentity`, an input/output validation, or (in `ecdsa` alone) the RFC
 # 6979 §3.2 nonce-retry rejection, itemised line by line in
 # `modules/k256/SPEC.md` and documented at the source in `ecdsa_recover.zig`.
 # `ecdsa` was added 2026-08-13: `ecdsa_recover.sign` is a shipped secret path
 # with an in-repo consumer (`lninvoice`) and had no target at all.
-k256	ReleaseFast	field	1	0	2642e053d442bcc0
-k256	ReleaseFast	mul	1	2	5f54a05906a76759
-k256	ReleaseFast	comb	1	1	5f54a05906a76759
-k256	ReleaseFast	sign	1	11	e951ae5b872d185a
-k256	ReleaseFast	ecdsa	1	10	0f0337cd425a3ba6
+k256	ReleaseFast	field	1	0	2642e053d442bcc0	4f13cccddea81376
+k256	ReleaseFast	mul	1	2	5f54a05906a76759	729cb9458ddf4051
+k256	ReleaseFast	comb	1	1	5f54a05906a76759	2ac21fe395f35487
+k256	ReleaseFast	sign	1	11	e951ae5b872d185a	bb06c2ed85209b8d
+k256	ReleaseFast	ecdsa	1	10	0f0337cd425a3ba6	8ff4812d21149442
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
@@ -131,6 +162,6 @@ k256	ReleaseFast	ecdsa	1	10	0f0337cd425a3ba6
 # structural rewrite alone did NOT fix it (7 → 7, 5 → 5) — see
 # `modules/montint/SPEC.md` § "Constant-time contract" for that table. Any
 # non-zero appearing here again is a regression, not a new validation.
-montint	ReleaseFast	small	1	0	045eb3a8ac23bebb
-montint	ReleaseFast	portable	1	0	045eb3a8ac23bebb
-montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb
+montint	ReleaseFast	small	1	0	045eb3a8ac23bebb	4e9f8c0b1ac8efe3
+montint	ReleaseFast	portable	1	0	045eb3a8ac23bebb	5c44fe7ce913f8f6
+montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb	51c0595ca47bd7cc

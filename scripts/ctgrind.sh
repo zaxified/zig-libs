@@ -195,6 +195,7 @@ SHOW_STACKS=0
 DO_CHECK=0
 PATTERN_OVERRIDE=""
 DO_UPDATE_DIGESTS=0
+DO_UPDATE_OUTPUTS=0
 MODULES=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -206,6 +207,11 @@ while [[ $# -gt 0 ]]; do
         # ones", so it must be typed on purpose and land in a diff, never be a
         # side effect of a green run.
         --update-digests) DO_UPDATE_DIGESTS=1; shift ;;
+        # The output pin's counterpart. Unlike --update-digests this RUNS the
+        # measurement, because the value can only come from a run. Same reason
+        # for being a separate verb: re-pinning says "I looked at what the
+        # harness printed and it is right", and that must be typed on purpose.
+        --update-outputs) DO_CHECK=1; DO_UPDATE_OUTPUTS=1; shift ;;
         --pattern) PATTERN_OVERRIDE="${2:?--pattern needs a regex}"; shift 2 ;;
         -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) echo "ctgrind: unknown flag $1" >&2; exit 2 ;;
@@ -444,6 +450,39 @@ done
 #     this is the rule that makes the in-file numbers mean anything, so it
 #     must not be something a module can record its way out of.
 
+
+# ── output pin ──────────────────────────────────────────────────────────────
+#
+# ⛔ WHY. The ct25519 audit (C1) mutated the HARNESS, not the module: the
+# `.ct25519` branch stopped calling `mulRistrettoBase` and assigned the secret
+# straight to the output. The table came out byte-identical to the baseline —
+# `total 2 / in-file 0 / witness 2 / unattr 0` — and `--check` was GREEN. Every
+# row whose claim is "in-file 0" has that hole, because a harness that never
+# reaches the module also produces zero in-file contexts. That is 8 rows across
+# 6 modules today.
+#
+# The counts cannot close it: "the module was not called" and "the module has no
+# secret-dependent branch" are the same measurement. What separates them is the
+# VALUE the harness prints, which every harness already does (`pk=`, `sig=`,
+# `x=`, `create[N]=`, `cmov=`, …) — no harness needed changing, only pinning.
+#
+# Metadata lines are excluded by requiring a long hex value: `valgrind_support=`
+# is not hex, and `L=32` / `lanes=4` are far too short to be a curve point or a
+# tag. The threshold is 32 hex digits = 16 bytes, below any output here.
+out_digest() {
+    local log="$1"
+    [[ -f "$log" ]] || { echo "NO-LOG"; return; }
+    local vals
+    # Unanchored on purpose: k256's ecdsa target prints three values on ONE
+    # line (`r={x} s={x} recid={d}`), and an anchored match silently found
+    # nothing there — the pin reported NO-OUTPUT, which is the right failure
+    # but the wrong reason. `recid=3` and `L=32` stay excluded by the 32-digit
+    # floor, and `valgrind_support=true` is not hex.
+    vals="$(grep -aoE '[A-Za-z_][A-Za-z0-9_]*(\[[0-9]+\])?=[0-9a-f]{32,}' "$log" || true)"
+    if [[ -z "$vals" ]]; then echo "NO-OUTPUT"; return; fi
+    printf '%s\n' "$vals" | sha256sum | cut -c1-16
+}
+
 # ── source pin ──────────────────────────────────────────────────────────────
 #
 # ⛔ WHY THIS EXISTS, and why the obvious fix does not. The 2026-09-01 k256
@@ -489,7 +528,8 @@ src_digest() {
 
 echo
 fail=0
-while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc; do
+declare -A NEW_OUT=()
+while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc eout; do
     [[ "$em" =~ ^# ]] && continue
     [[ -z "$em" ]] && continue
     line=$(awk -F'\t' -v m="$em" -v mo="$emode" -v t="$etarget" \
@@ -498,7 +538,7 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc; do
         # Not measured in this invocation (a module subset was requested).
         continue
     fi
-    IFS=$'\t' read -r _ _ _ _ _ total in_file _ _ _ _ _ _ <<<"$line"
+    IFS=$'\t' read -r _ _ _ _ _ total in_file _ _ _ _ rowlog _ <<<"$line"
     # `N` pins an exact count; `>=N` / `<=N` pin only the direction. Exact is
     # for the numbers a SPEC.md states as a fact about the module (ed448's
     # three `Fe.invert` validations, ecvrf's three try-and-increment
@@ -541,7 +581,41 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc; do
             fail=1
         fi
     fi
+    # Output pin — see "output pin" above. This is the check that separates
+    # "the module has no secret-dependent branch" from "the harness never
+    # called the module", which the context counts render identical.
+    if [[ "$DO_UPDATE_OUTPUTS" == "1" ]]; then
+        NEW_OUT["$em/$emode/$etarget"]="$(out_digest "$rowlog")"
+    elif [[ -z "${eout:-}" ]]; then
+        echo "FAIL $em/$emode/$etarget: no output digest in ctgrind-expected.tsv — run --update-outputs" >&2
+        fail=1
+    else
+        actual_out="$(out_digest "$rowlog")"
+        if [[ "$actual_out" == "NO-OUTPUT" || "$actual_out" == "NO-LOG" ]]; then
+            echo "FAIL $em/$emode/$etarget: the harness printed no value this pin could read ($actual_out)." >&2
+            echo "     A harness that prints nothing cannot show it reached the module; see 'output pin'." >&2
+            fail=1
+        elif [[ "$actual_out" != "$eout" ]]; then
+            echo "FAIL $em/$emode/$etarget: the harness's printed result changed (digest $actual_out, pinned $eout)." >&2
+            echo "     Either the module now computes something else, or the harness stopped reaching it — the" >&2
+            echo "     context counts cannot tell those apart, which is why this pin exists." >&2
+            fail=1
+        fi
+    fi
 done <"$EXPECTED_FILE"
+
+if [[ "$DO_UPDATE_OUTPUTS" == "1" ]]; then
+    tmp="$(mktemp)"
+    while IFS= read -r ln; do
+        if [[ "$ln" =~ ^# || -z "$ln" ]]; then printf '%s\n' "$ln" >>"$tmp"; continue; fi
+        IFS=$'\t' read -r m mo t tm inf sd od <<<"$ln"
+        nd="${NEW_OUT[$m/$mo/$t]:-${od:-}}"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "$mo" "$t" "$tm" "$inf" "$sd" "$nd" >>"$tmp"
+    done <"$EXPECTED_FILE"
+    mv "$tmp" "$EXPECTED_FILE"
+    echo "ctgrind: output digests rewritten in $EXPECTED_FILE"
+    exit 0
+fi
 
 while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _ aun aacc _ alog apat; do
     if [[ "$ataint" == "no" && "$atotal" != "0" ]]; then
