@@ -184,6 +184,7 @@ build.zig      # single root build — registers every module by name + a test s
 build.zig.zon  # one package manifest for the whole collection
 CHANGELOG.md   # per-release changes, grouped by module
 CONVENTIONS.md # naming + `meta` tag vocabulary + provenance/SPDX + versioning rules
+SURVEY-PLAYBOOK.md # how a module is surveyed against other implementations before it ships an example
 modules/<name>/src/root.zig  # `// SPDX-License-Identifier: MIT`, `pub const meta`, API, tests
 modules/<name>/README.md     # what it is + a Provenance line
 modules/<name>/SPEC.md       # wire format, limits, anchoring, what is deliberately not done
