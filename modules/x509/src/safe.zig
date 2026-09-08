@@ -1057,3 +1057,68 @@ test "corpus: the validator seeds reach safeCertificate, and the counts are pinn
     try testing.expectEqual(@as(usize, 11), validated);
     try testing.expectEqual(@as(usize, 8), parsed);
 }
+
+// ── Coupling to std's walk: the differential these guards need ──────────────
+//
+// `requireStdDescentPoints` is a mirror of `std.crypto.Certificate.parse`'s
+// descent points, and the file says so: a coupling, deliberate. What it did
+// NOT have was a measurement of the coupling. The corpus test above pins that
+// eight seeds reach `parse`; eight shapes cannot tell you whether the mirror
+// is complete.
+//
+// These two tests are that measurement, added by the 2026-09-08 audit:
+// the first drives guard-accepted MUTANTS of a real certificate into std's
+// parser in bulk, the second attacks the exact axis the mirror exists for.
+
+test "differential: guard-accepted mutants reach std's parser and none of them panic" {
+    const fx = @import("fixtures_test.zig");
+    const base = fx.leaf_rsa;
+    var prng = std.Random.DefaultPrng.init(0xA1);
+    const rnd = prng.random();
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    var buf: [fuzz_buf_bytes]u8 = undefined;
+
+    var validated: usize = 0;
+    var guarded: usize = 0;
+    var parsed: usize = 0;
+    const reps = 20_000;
+    for (0..reps) |_| {
+        @memcpy(buf[0..base.len], &base);
+        const nmut = 1 + rnd.uintLessThan(usize, 3);
+        for (0..nmut) |_| buf[rnd.uintLessThan(usize, base.len)] = rnd.int(u8);
+        const input = buf[0..base.len];
+        if (validateCertificate(input)) |_| validated += 1 else |_| {}
+        const cert = safeCertificate(input, &scratch) catch continue;
+        guarded += 1;
+        _ = cert.parse() catch continue;
+        parsed += 1;
+    }
+    // ⚠ Pin the NUMBERS, not "some". A harness that stops producing
+    // guard-accepted input degrades silently into a constant-true test, and
+    // that is the failure this module already had once (the target that ran
+    // one input, and it was the empty slice). The seed is fixed, so these are
+    // exact. Roughly 80 % of 1-3 byte mutations still satisfy the guard, which
+    // is what makes this a real differential rather than a rejection counter.
+    try testing.expectEqual(@as(usize, 16_700), validated);
+    try testing.expectEqual(@as(usize, 15_814), guarded);
+    try testing.expectEqual(@as(usize, 13_822), parsed);
+}
+
+test "the guard rejects a primitive at every position std descends into" {
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    // The nine-byte shape from the 2026-09-01 finding, plus three variants:
+    // a 32-bit length, a non-SEQUENCE outer tag, and a nested one.
+    const shapes = [_][]const u8{
+        &[_]u8{ 0x30, 0x07, 0x04, 0x05, 0x30, 0x83, 0x01, 0x00, 0x00 },
+        &[_]u8{ 0x30, 0x07, 0x04, 0x05, 0x30, 0x84, 0xff, 0xff, 0xff },
+        &[_]u8{ 0x30, 0x05, 0x02, 0x03, 0x30, 0x82, 0xff },
+    };
+    for (shapes) |sh| {
+        try testing.expectError(error.PrimitiveWhereStdDescends, safeCertificate(sh, &scratch));
+    }
+    // Positive control: the guard must NOT reject everything. A real
+    // certificate still goes through, and so does std's parse.
+    const fx = @import("fixtures_test.zig");
+    const ok = try safeCertificate(&fx.leaf_rsa, &scratch);
+    _ = try ok.parse();
+}
