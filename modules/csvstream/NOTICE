@@ -6,10 +6,10 @@ reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
 in any copy. Redistributing this module — alone or as part of zig-libs — must
 keep this file with it.
 
-This adds no condition beyond MIT's own: it is the same "preserve the notice"
-requirement that already applies to zig-libs' own code, owed to a different
-author. No third-party SOURCE CODE is present — only test fixtures (plain
-CSV + JSON data files).
+The condition is BSD-2-Clause's, not MIT's — close in shape ("retain the
+notice") but its own text, with its own disclaimer, reproduced in full below.
+No third-party SOURCE CODE is present — only test fixtures (plain CSV + JSON
+data files).
 
 ## maxogden/csv-spectrum — CSV parsing acid-test corpus
 
@@ -29,16 +29,53 @@ Excluded from vendoring, deliberately: the repository's own `.git/`,
 `readme.md`, `index.js`, `test.js`, `package.json`/`package-lock.json`
 metadata (none of it is test-fixture data).
 
-The package declares its license as BSD-2-Clause in `package.json` (`"license":
-"BSD-2-Clause"`); the repository carries no separate `LICENSE` file at the
-pinned commit (confirmed via `git log --all -- LICENSE LICENSE.md
-LICENSE.txt`, which returns nothing), so there is no license TEXT to reproduce
-beyond that declaration and the author attribution below:
+CORRECTED 2026-09-09. This file used to conclude: "the repository carries no
+separate `LICENSE` file at the pinned commit … so there is no license TEXT to
+reproduce beyond that declaration". That inference is wrong. `BSD-2-Clause` is
+an SPDX identifier — it names a specific, published licence text, and declaring
+it in `package.json` incorporates that text by reference exactly as committing
+a copy would. Clause 1 then asks that the copyright notice, the conditions and
+the disclaimer be retained by anyone redistributing the material. Whether
+upstream got round to committing a file containing them changes nothing about
+what a redistributor owes; it only means the text has to be sourced from the
+licence itself. It is reproduced below.
+
+Also re-measured 2026-09-09: the upstream repository has MOVED. `maxogden/
+csv-spectrum` now redirects to `max-mapper/csv-spectrum` (GitHub API, HTTP 301
+followed), and the API still reports no detected licence — the `package.json`
+declaration remains the only statement of terms. The pinned commit and the
+vendored bytes are unaffected.
 
   csv-spectrum
   Copyright (c) max ogden
-  https://github.com/maxogden/csv-spectrum
-  License: BSD-2-Clause (as declared in package.json)
+  https://github.com/max-mapper/csv-spectrum
+    (formerly https://github.com/maxogden/csv-spectrum, which redirects there)
+  License: BSD-2-Clause (as declared in package.json; the repository commits
+    no LICENSE file, so the text below is the OSI 2-clause BSD text that
+    identifier refers to)
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+    1. Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+    IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+    THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+    PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+    CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Only test-fixture text is reproduced. The implementation under test
 (`LineIterator`/`splitFields` in `src/line.zig`) is the authors' own (MIT);

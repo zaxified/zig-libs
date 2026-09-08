@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing correction, no code change. `NOTICE` said the reproduced
+  OWASP example header lines "add no condition beyond MIT's own" and pointed the reader
+  at upstream's `LICENSE.txt` — not a file in this tree. Apache-2.0 §4(a) is now
+  discharged by reproducing the License in full. §4(b) records that the lines are
+  byte-for-byte unmodified (which is the point of the anchor); §4(d) records that
+  upstream ships no `NOTICE` (HTTP 404, re-verified 2026-09-09). The file also now says
+  explicitly that it does NOT rest on the argument that five one-line header values are
+  too short to protect — that argument may be right, but it is not the one this
+  repository's own rule makes.
 - **2026-08-12** — **BREAKING** `SecurityHeaders.init` now returns `InitError!SecurityHeaders`
   instead of `SecurityHeaders`. Every call site needs a `try` (or equivalent
   error handling) added; there were no in-repo consumers outside this

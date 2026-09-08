@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing correction, no code change. `NOTICE` said the vendored
+  tcpdump captures "add no condition beyond MIT's own"; tcpdump is 3-clause BSD and its
+  third clause — no use of the authors' names to endorse derived products — has no MIT
+  counterpart. Now stated. Also recorded: an earlier audit pass read the missing
+  copyright line above the reproduced clauses as a defect in this file. It is not —
+  `the-tcpdump-group/tcpdump`'s own `LICENSE` is a 19-line file with no copyright notice
+  at all (re-verified 2026-09-09), and this module reproduces captures, not the C sources
+  that do carry Regents-of-UC notices. Inventing a line upstream does not publish would
+  be inventing an attribution.
 - **2026-09-07** — All four fuzz targets parsed an EMPTY frame. Each opened with
   `smith.bytes(&buf)` and then drew its length with `valueRangeAtMost`, which reads eight input
   octets as a little-endian u64 and returns the range minimum when fewer remain — so the length

@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing correction, no code change. Two defects in `NOTICE`. First,
+  it said the vendored tables "add no condition beyond MIT's own"; neither source is MIT,
+  and CC-BY 4.0 §3(a)(1)(B) — indicate whether the material was modified — has no MIT
+  counterpart. It is now discharged: the four `index-*.txt` files are byte-for-byte
+  unmodified, and the file says so. Second, and worse, the Unicode License v3 permission
+  notice was quoted with FOUR ellipses cut into it, while the clause being abridged is
+  the one requiring "this copyright and permission notice appear with all copies". It is
+  now reproduced verbatim and in full from https://www.unicode.org/license.txt.
 - **2026-09-07** — **`fuzzCodecNeverLeaks` ran one input for ever: the empty
   string through `.utf8`.** It opened with `smith.bytes(&buf)` followed by
   `smith.valueRangeAtMost(u16, 0, buf.len)`; `bytes` consumes

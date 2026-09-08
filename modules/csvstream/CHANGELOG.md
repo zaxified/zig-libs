@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing correction, no code change. `NOTICE` concluded that because
+  csv-spectrum commits no `LICENSE` file "there is no license TEXT to reproduce". That
+  inference was wrong: `BSD-2-Clause` in `package.json` is an SPDX identifier naming a
+  published text, and its clause 1 binds a redistributor whether or not upstream
+  committed a copy. The text is now reproduced. Also re-measured: the upstream repository
+  has MOVED — `maxogden/csv-spectrum` redirects to `max-mapper/csv-spectrum` — and the
+  URL in `NOTICE` now says so. Pinned commit and vendored bytes unaffected.
 - **2026-09-07** — **Both fuzz harnesses were replaying an EMPTY record with
   quoting DISABLED, and now sweep the knobs over a seeded corpus.** Each opened
   with `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`;

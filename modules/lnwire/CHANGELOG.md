@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing correction, no code change. `NOTICE` already elected the MIT
+  arm of `lightningdevkit/rust-lightning`'s dual licence, but the MIT text it elected was
+  nowhere in the file — and MIT asks for exactly that ("this permission notice shall be
+  included in all copies"). The sibling `modules/lninvoice/NOTICE` had it right and this
+  one did not. The text is now reproduced, the election is written out with its reason
+  (Apache-2.0 §4(a)/(b) attach conditions root `NOTICE`'s promise does not carry), and
+  upstream's `LICENSE-MIT` is recorded as carrying no copyright line of its own, so none
+  is invented here.
 - **2026-09-07** — Fuzz reach: all four harnesses ran on one fixed input. `bolt2`'s opened with
   `smith.bytes(&buf)` and a ranged length, so `len` was **0 on every input** and
   `decodeOpenChannel` never got past the two-octet type frame — the "field reader chain" its own

@@ -7,6 +7,14 @@ license (BSD-2-Clause), whose attribution must be preserved in any copy.
 Redistributing this module — alone or as part of zig-libs — must keep this
 file with it.
 
+CORRECTED 2026-09-09. Until this revision this file NAMED BSD-2-Clause and
+reproduced none of it — not the two clauses, not the disclaimer, not a
+copyright line. Naming a licence is not discharging it: clause 1 asks that the
+copyright notice, "this list of conditions" and "the following disclaimer" be
+retained by whoever redistributes the material, and a reader who received only
+zig-libs had none of the three. The text is now reproduced below. No data
+changed; the condition has been in force since the vectors were committed.
+
 No third-party SOURCE CODE is present anywhere in this module — only test
 vectors. `root.zig`/`finalize.zig`'s wire-format codec (`parse`/`serialize`/
 `combine`/`finalize`/`extract`) is clean-room from the public BIP174
@@ -46,6 +54,43 @@ from the section (never computed from this module's own output — see
     Drives `finalize_test.zig`'s "BIP174 official Finalizer/Extractor worked
     example" tests.
 
+BSD-2-Clause, reproduced per its clause 1
+-----------------------------------------
+
+BIP174 declares `License: BSD-2-Clause` in its preamble and repeats it in its
+own "Copyright" section; it publishes no copyright LINE of its own, and the
+`bitcoin/bips` repository carries no `LICENSE` file (verified 2026-09-09: HTTP
+404). The rightsholder is therefore the BIP's named author, and what follows is
+the OSI 2-clause BSD text that the SPDX identifier in the preamble refers to.
+The absence of an upstream copyright line is recorded, not used as a reason to
+reproduce nothing — the conditions and the disclaimer travel regardless of
+whether upstream committed a file containing them.
+
+    Copyright (c) Ava Chow <me@achow101.com>, author of BIP174
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+    1. Redistributions of source code must retain the above copyright notice,
+       this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+    IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+    THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+    PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+    CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 Implementation vs. test-data distinction: the PSBT wire-format CODEC and the
 Input Finalizer/Transaction Extractor logic in `root.zig`/`finalize.zig` are
 this module's own clean-room work from the public spec text — that needs no
@@ -66,9 +111,14 @@ Core project's PSBT RPC functional-test data file (fetched 2026-08 from
   Distributed under the MIT software license, see
   https://opensource.org/licenses/MIT
 
-This adds no condition beyond MIT's own — the same "preserve the notice"
-requirement already owed to BIP174's author above, owed here to a different
-author. No third-party SOURCE CODE is present — only test-case DATA (base64
+That is the same "preserve the notice" requirement zig-libs' own MIT code
+already carries, owed here to a different author — but MIT asks for the
+permission notice as well as the copyright line ("The above copyright notice
+and this permission notice shall be included in all copies"), and until
+2026-09-09 only the copyright line was here. The MIT text is reproduced at the
+end of this file.
+
+No third-party SOURCE CODE is present — only test-case DATA (base64
 PSBTs, converted to hex to match this module's existing hex convention; see
 `core_kat_vectors.zig`'s own doc comment for exactly which of the JSON's
 `invalid`/`invalid_with_msg`/`valid`/`finalizer`/`extractor` arrays are
@@ -88,3 +138,24 @@ actually be `0`, per BIP174 §"Version 0") — now fixed in `root.zig`, with
 Core's own vector as the external oracle. See `core_kat_test.zig`'s doc
 comment for the full account, including which of Core's vectors are BIP370/
 BIP371/MuSig2 content this module deliberately doesn't validate (not a bug).
+
+MIT License, reproduced for the Bitcoin Core material above
+-----------------------------------------------------------
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.

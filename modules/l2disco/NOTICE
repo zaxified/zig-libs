@@ -7,9 +7,26 @@ not source code) whose copyright notice must be preserved in any copy.
 Redistributing this module — alone or as part of zig-libs — must keep this
 file with it.
 
-This adds no condition beyond MIT's own: it is the same "preserve the notice"
-requirement that already applies to zig-libs' own code, owed to a different
-project. No third-party SOURCE CODE is present — only fifteen raw frames
+CORRECTED 2026-09-09. This file used to say the material "adds no condition
+beyond MIT's own". That is not quite true and the difference is one clause:
+tcpdump's licence is 3-clause BSD, and clause 3 — the names of the authors may
+not be used to endorse or promote derived products — is a restriction MIT does
+not impose. It is a mild one and nothing here trades on the tcpdump name, but
+this file exists to state what is owed, so it now states that. The clauses and
+disclaimer were already reproduced below and remain unchanged.
+
+⭐ WHY NO COPYRIGHT LINE APPEARS ABOVE THOSE CLAUSES, since clause 1 asks that
+one be retained: upstream publishes none. `the-tcpdump-group/tcpdump`'s
+`LICENSE` is a 19-line file that opens with "License: BSD" and goes straight
+into the three clauses (re-verified by download 2026-09-09). The per-file
+copyright notices in tcpdump's C sources name the Regents of the University of
+California, but this module reproduces no source — only capture files from
+`tests/`, which carry no notices of their own. Reproducing a copyright line
+that upstream does not publish would be inventing an attribution, so the gap is
+recorded here instead. An earlier audit pass read this absence as a defect in
+THIS file; it is upstream's file, faithfully copied.
+
+No third-party SOURCE CODE is present — only fifteen raw frames
 (real LLDP/CDP/ARP/DHCP traffic and dissector test fixtures), reproduced as
 byte-literal test fixtures in `src/capture_test.zig`.
 

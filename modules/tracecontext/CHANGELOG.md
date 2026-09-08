@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing correction, no code change. `NOTICE` said the transcribed
+  W3C conformance cases "add no condition beyond MIT's own"; the W3C 3-clause BSD
+  License's third clause — no use of the W3C or contributor names to endorse derived
+  products — has no MIT counterpart. Now stated. Also recorded: an earlier audit pass
+  read the prose "copyright the W3C" as standing in for a missing copyright notice. There
+  is no notice to stand in for — `w3c/trace-context`'s `LICENSE.md` is six lines naming
+  two licences with no copyright line, and `test/test.py` carries none either (both
+  re-verified 2026-09-09). The licensors are the repository's contributors, none of them
+  named upstream, and this file now says exactly that instead of naming W3C as the
+  copyright holder.
 - **2026-09-09** — `src/w3c_vectors.zig`'s SPDX header pointed at `../../NOTICE`, which is
   `modules/NOTICE`, not this module's. Line 3 of the same file already had `../NOTICE` right.
   One character; it was the only SPDX header in the repository naming a foreign licence, so

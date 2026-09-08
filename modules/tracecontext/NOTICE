@@ -6,9 +6,26 @@ reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
 in any copy. Redistributing this module — alone or as part of zig-libs — must
 keep this file with it.
 
-This adds no condition beyond MIT's own: it is the same "preserve the notice"
-requirement that already applies to zig-libs' own code, owed to a different
-author. No third-party SOURCE CODE is present — only test-case data (request
+CORRECTED 2026-09-09. This file used to say the material "adds no condition
+beyond MIT's own". The W3C 3-clause BSD License, reproduced in full below, adds
+one MIT does not have: its third clause forbids using the W3C name or its
+contributors' names to endorse or promote derived products. Nothing here does,
+but this file exists to state what is owed, so it now states it.
+
+⭐ WHY NO COPYRIGHT LINE APPEARS WITH THOSE CLAUSES, since clause 1 asks that
+"the original copyright notice" be retained: upstream publishes none for the
+tests. `w3c/trace-context`'s `LICENSE.md` is six lines naming two licences and
+carrying no copyright notice, and `test/test.py` — the file this module
+transcribes from — opens straight into imports with no notice either (both
+re-verified by download 2026-09-09). The W3C copyright that does exist covers
+the Trace Context *Recommendation*, a Report under the W3C Software and
+Document License, and this module reproduces no Report text. Writing a
+copyright line that upstream does not publish would be inventing an
+attribution, so the gap is recorded here instead. An earlier audit pass read
+this absence as prose standing in for a notice; there is no notice to stand in
+for.
+
+No third-party SOURCE CODE is present — only test-case data (request
 header name/value pairs and their pass/fail verdicts), hand-transcribed from
 third-party test methods since the upstream corpus is Python source, not a
 static data file.
@@ -75,8 +92,10 @@ The suite's own terms (`LICENSE.md` at the pinned commit):
     W3C 3-clause BSD License (https://www.w3.org/Consortium/Legal/2008/03-bsd-license.html).
 
 `test/test.py` is a TEST, so the second license applies: the W3C 3-clause BSD
-License (in effect since 2008-08-20, derived from the OSI 3-clause BSD),
-copyright the W3C and its contributors:
+License (in effect since 2008-08-20, derived from the OSI 3-clause BSD). Per
+`LICENSE.md` above, the licensors are the repository's CONTRIBUTORS — the file
+says "licensed by contributors", not by W3C — and none of them is named in a
+copyright notice anywhere upstream. The licence text:
 
     Redistribution and use in source and binary forms, with or without
     modification, are permitted provided that the following conditions are

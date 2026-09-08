@@ -6,10 +6,25 @@ reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
 in any copy. Redistributing this module — alone or as part of zig-libs — must
 keep this file with it.
 
-This adds no condition beyond MIT's own: it is the same "preserve the notice"
-requirement that already applies to zig-libs' own code, owed to different
-authors. No third-party SOURCE CODE is present — only normative conformance
-tables used exclusively to drive tests.
+CORRECTED 2026-09-09. This file used to say the material "adds no condition
+beyond MIT's own". Neither of its two sources is MIT and neither condition is
+MIT's:
+
+  - CC-BY 4.0 (WHATWG) asks for attribution to the licensor, a link to the
+    licence, and — §3(a)(1)(B) — an indication of whether the material was
+    MODIFIED. That last one has no MIT counterpart. It is discharged below:
+    the four index tables are vendored byte-for-byte, unmodified.
+  - The Unicode License v3 grants its permission "provided that either (a)
+    this copyright and permission notice appear with all copies of the Data
+    Files … or (b) this copyright and permission notice appear in associated
+    Documentation". Until this revision that notice appeared here with FOUR
+    ellipses cut into it — an abridged notice is not the notice, and the one
+    clause the licence actually attaches was the thing being abridged. It is
+    now reproduced verbatim and in full, from https://www.unicode.org/license.txt
+    as fetched 2026-09-09.
+
+No data changed in this revision. No third-party SOURCE CODE is present —
+only normative conformance tables used exclusively to drive tests.
 
 ## WHATWG Encoding Standard — `index-*.txt` normative index tables
 
@@ -31,6 +46,16 @@ repository):
     into source code, such portions in the source code are licensed under
     the BSD 3-Clause License instead.
 
+CC-BY 4.0 in full: https://creativecommons.org/licenses/by/4.0/legalcode
+(the licence is not reproduced here — it is ~7 000 words and, unlike the BSD
+and MIT texts elsewhere in this file, it requires a URI rather than a copy:
+§3(a)(1)(C) is satisfied by "a URI or hyperlink to this Public License").
+
+INDICATION OF MODIFICATIONS, per CC-BY 4.0 §3(a)(1)(B): none. The four
+`index-*.txt` files are vendored byte-for-byte as published, headers included.
+Nothing was reformatted, filtered or re-encoded — which is also why the
+`Date:` line in each file's own header is the version pin cited above.
+
 ## Unicode.org — `8859-1.TXT`
 
 `src/testdata/8859-1.TXT` is vendored verbatim from
@@ -50,14 +75,49 @@ The file's own header:
     # © 2015 Unicode®, Inc.
     # For terms of use, see http://www.unicode.org/terms_of_use.html
 
-Under the Unicode License v3 (https://www.unicode.org/license.txt):
+Under the Unicode License v3, reproduced verbatim and in full from
+https://www.unicode.org/license.txt (fetched 2026-09-09) because clause (a)
+asks that this very notice appear with all copies of the Data Files:
+
+    UNICODE LICENSE V3
+
+    COPYRIGHT AND PERMISSION NOTICE
+
+    Copyright © 1991-2026 Unicode, Inc.
+
+    NOTICE TO USER: Carefully read the following legal agreement. BY
+    DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+    SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+    TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+    DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
 
     Permission is hereby granted, free of charge, to any person obtaining a
-    copy of data files and any associated documentation (the "Data Files") ...
-    to deal in the Data Files ... without restriction ... provided that
-    either (a) this copyright and permission notice appear with all copies
-    of the Data Files ... or (b) this copyright and permission notice appear
-    in associated Documentation.
+    copy of data files and any associated documentation (the "Data Files") or
+    software and any associated documentation (the "Software") to deal in the
+    Data Files or Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, and/or sell
+    copies of the Data Files or Software, and to permit persons to whom the
+    Data Files or Software are furnished to do so, provided that either (a)
+    this copyright and permission notice appear with all copies of the Data
+    Files or Software, or (b) this copyright and permission notice appear in
+    associated Documentation.
+
+    THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+    KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+    THIRD PARTY RIGHTS.
+
+    IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+    BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+    OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+    WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+    FILES OR SOFTWARE.
+
+    Except as contained in this notice, the name of a copyright holder shall
+    not be used in advertising or otherwise to promote the sale, use or other
+    dealings in these Data Files or Software without prior written
+    authorization of the copyright holder.
 
 Only conformance DATA is reproduced from either source — no WHATWG or
 Unicode.org source code is present in this module. The implementation under

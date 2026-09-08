@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Licensing correction, no code change. `NOTICE` named BSD-2-Clause for
+  the BIP174 worked-example data and reproduced none of it: no clauses, no disclaimer, no
+  copyright line. All three are now present. Recorded rather than papered over: BIP174
+  publishes no copyright line of its own and `bitcoin/bips` carries no `LICENSE` file
+  (HTTP 404, verified 2026-09-09), so the rightsholder is named as the BIP's author and
+  the absence is stated instead of an attribution being invented. The Bitcoin Core
+  section's MIT text was likewise cited by copyright line only; MIT asks for the
+  permission notice too, and it is now reproduced.
 - **2026-09-07** — ⛔ `fuzzParse` never got past its own `parse` call. Every choice its
   generator made came from `smith` directly — the input/output counts, the record counts, the
   keytypes, the keydata and value lengths, `finalize_them`, the witness-stack bytes — and all
