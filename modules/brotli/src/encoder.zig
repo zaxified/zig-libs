@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Brotli encoder (RFC 7932): LZ77 backward references + a per-meta-block
 //! Huffman (prefix) code for literals, insert-and-copy commands and distances,
 //! with a **store-mode fallback** that bounds the worst case.

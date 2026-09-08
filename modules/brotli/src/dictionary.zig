@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! RFC 7932 Appendix A — the normative Brotli static dictionary.
 //!
 //! `data` is the 122_784-byte word list, embedded verbatim from the RFC 7932

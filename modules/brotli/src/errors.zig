@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Typed error set for the Brotli codec. Malformed input is always reported as
 //! one of these errors — the decoder never panics on hostile input.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Canonical + simple prefix-code tables for RFC 7932.
 //!
 //! Codes are read least-significant-bit first, so the canonical (MSB-first)

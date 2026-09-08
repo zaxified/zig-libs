@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Pure-Zig Brotli decompressor (RFC 7932). Uses the growing output buffer as
 //! flat LZ77 history; static-dictionary references resolve against the embedded
 //! RFC 7932 Appendix A/B tables. Malformed input always yields a typed error.

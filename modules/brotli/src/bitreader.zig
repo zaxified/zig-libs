@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Least-significant-bit-first bit reader over an in-memory Brotli stream.
 
 const std = @import("std");

@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — `src/root.zig` gets its SPDX header (MIT). It was one of the two modules
+  of 231 whose root file lacked one; the other was `brotli`, fixed in the same pass.
+
 - **2026-07-18** — Security audit: no findings. Verified: Byte-exact vs BOLT#3 Appendix
   E (`derivePublicKey`/`derivePrivateKey`/
   `deriveRevocationPublicKey`/`deriveRevocationPrivateKey`, `root.zig:150-168`) and

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! bolt3 — Lightning BOLT#3 key derivation (the "Appendix E: Key Derivation"
 //! crypto pocket). This pass covers ONLY the secp256k1 public/secret-key and
 //! revocation-key derivations that BOLT#3 defines; the surrounding commitment-

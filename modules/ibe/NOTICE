@@ -66,6 +66,12 @@ provenance chain of its own. The published `ibe` module contains none
 of this — it is test data only, and `zig build check-testonly` proves
 the `tlock` import never reaches the module a consumer imports.
 
+The drand upstreams these constants trace back to are dual-licensed
+Apache-2.0 OR MIT, and `modules/tlock/NOTICE` — the authoritative
+record for them — states the election this repository makes: MIT.
+Repeated here only so a reader of this file does not have to go and
+find out whether a choice was ever made.
+
 Why the bytes are copied rather than imported: `tlock`'s constants are
 private to its own test file, and `modules/tlock/` is shared with
 other consumers, so exporting them would mean changing a module this

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause (W3C 3-clause test-suite license — see ../../NOTICE)
+// SPDX-License-Identifier: BSD-3-Clause (W3C 3-clause test-suite license — see ../NOTICE)
 //! Hand-transcribed conformance vectors from the W3C `trace-context` test
 //! suite (see ../NOTICE for provenance), pinned at commit
 //! `acab820be9db7b3433668baa5cdd43f57f4c4be0` (`main`, 2026-06-29),

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Normative constant tables for RFC 7932 decoding: the context-model lookup
 //! table (Appendix C style, from google/brotli context.c), the block-length
 //! prefix ranges, the command (insert-and-copy) lookup table, and the code

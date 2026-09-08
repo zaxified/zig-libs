@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! RFC 7932 Appendix B — the normative Brotli word-transform table.
 //!
 //! Data transcribed verbatim from RFC 7932 Appendix B (identical to

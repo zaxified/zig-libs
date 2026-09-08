@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! brotli — pure-Zig Brotli (RFC 7932) decompressor + minimal encoder.
 //!
 //! Decoder: byte-exact RFC 7932 decompression (bit stream, meta-blocks,

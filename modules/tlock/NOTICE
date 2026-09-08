@@ -57,6 +57,16 @@ another language"). All four repositories are Apache-2.0 or dual
 Apache-2.0/MIT licensed; no GPL/LGPL/AGPL source was consulted or
 copied anywhere in this module.
 
+LICENSE ELECTION — MIT, not Apache-2.0. The dual-licensed upstreams above offer
+Apache-2.0 OR MIT, and which applies is the recipient's choice; this repository
+elects MIT, the same election `rescue` and `lnwire` make for the same reason.
+Apache-2.0 is deliberately not elected: its §4 attaches conditions this
+repository's notice pattern does not implement — §4(a) requires that every
+recipient be GIVEN a copy of the licence and §4(b) that modified files carry
+prominent notices of change. Stating the election matters even where nothing
+was copied: without it the module stands formally under BOTH sets of terms, and
+the Apache branch's conditions would then be unmet.
+
 **Academic reference**: Boneh, D. and Franklin, M., "Identity-Based
 Encryption from the Weil Pairing", CRYPTO 2001 (the "FullIdent"
 construction, §4.2) — a public academic paper, not a copyrightable

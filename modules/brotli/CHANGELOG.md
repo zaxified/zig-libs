@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — The nine source files without an SPDX header have one: MIT, matching the
+  two that already did. 229 of 231 modules carry the header on `root.zig`, and this was one
+  of the two that did not — awkwardly, the module that carries an attribution CONDITION for
+  its vendored `src/testdata/` corpus. The condition is unchanged and still lives in NOTICE;
+  what changed is that each source file now states its own terms.
+
 - **2026-09-07** — Fuzz reach: `fuzzDecompress` decompressed the EMPTY SLICE and nothing
   else, ever. The fourteen google/brotli reference streams were `@embedFile`d into
   `fuzz_seed_corpus` and indexed with `smith.index(...)` — but the array was **never

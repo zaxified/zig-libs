@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — `src/w3c_vectors.zig`'s SPDX header pointed at `../../NOTICE`, which is
+  `modules/NOTICE`, not this module's. Line 3 of the same file already had `../NOTICE` right.
+  One character; it was the only SPDX header in the repository naming a foreign licence, so
+  the one that most needed to resolve.
+
 - **2026-09-07** — **Test-only: all five real `traceparent` headers in the fuzz
   corpus arrived at the parser as the empty string.** `buildTraceparent` opened
   with `smith.valueRangeAtMost(u8, 0, 7)` to choose between "arbitrary bytes"

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — LICENSE ELECTION stated: MIT. The drand upstreams this module models are
+  dual-licensed Apache-2.0 OR MIT and the NOTICE named the dual licensing without ever saying
+  which branch this repository takes — so the module formally stood under BOTH, and the
+  Apache branch's §4(a)/§4(b) conditions were unmet. The same election `rescue` and `lnwire`
+  already make, for the same reason.
+
 - **2026-09-07** — `fuzzDecrypt` is a damage harness that applied no damage. Its flip count
   came from `smith.valueRangeAtMost(u8, 0, 6)`, a ranged draw, which reads eight octets as a
   little-endian `u64` and returns the range MINIMUM unless that whole word lands inside the
