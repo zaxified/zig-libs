@@ -105,7 +105,7 @@ real test binaries in them (not by reading docs):
 
 | Module | Platform | Status |
 |---|---|---|
-| `tc` | debian (default) **or openwrt** | both execution-verified, **130/130 on each** since the action-table bug this lane found was fixed (see "A real bug this lane found"). openwrt needs `provision.sh` first; that's the only reason debian stays the default |
+| `tc` | debian (default) **or openwrt** | both execution-verified since the action-table bug this lane found was fixed (see "A real bug this lane found"). **debian re-measured 2026-09-09: 137/137, zero skips**; the 130/130 this row used to claim for both was from an earlier revision of the module and openwrt was not re-run then either — take the openwrt figure as "verified, count unrecorded". openwrt needs `provision.sh` first; that's the only reason debian stays the default |
 | `nftables` | openwrt | execution-verified (73 tests incl. live round-trip) |
 | `conntrack` | openwrt | execution-verified (28 tests) |
 | `ebpf` | debian | execution-verified, **137/137**. Six live attach tests (kprobe, uprobe, tracepoint, raw tracepoint, cgroup link) need `CAP_BPF` + `CAP_PERFMON` and skip on any normal host; OpenWRT's kernel has no BPF tooling at all, so this one is debian-only |
