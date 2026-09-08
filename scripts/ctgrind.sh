@@ -194,17 +194,49 @@ declare -A LABEL=(
 SHOW_STACKS=0
 DO_CHECK=0
 PATTERN_OVERRIDE=""
+DO_UPDATE_DIGESTS=0
 MODULES=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stacks) SHOW_STACKS=1; shift ;;
         --check) DO_CHECK=1; shift ;;
+        # Rewrites ctgrind-expected.tsv's source-digest column WITHOUT running
+        # anything. Deliberately separate from --check: re-pinning is the act
+        # of saying "I re-read these contexts and they are still the documented
+        # ones", so it must be typed on purpose and land in a diff, never be a
+        # side effect of a green run.
+        --update-digests) DO_UPDATE_DIGESTS=1; shift ;;
         --pattern) PATTERN_OVERRIDE="${2:?--pattern needs a regex}"; shift 2 ;;
         -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) echo "ctgrind: unknown flag $1" >&2; exit 2 ;;
         *) MODULES+=("$1"); shift ;;
     esac
 done
+if [[ "$DO_UPDATE_DIGESTS" == "1" ]]; then
+    src_digest() {
+        local module="$1" pattern="$2"
+        local dir="$REPO_ROOT/modules/$module/src"
+        [[ -d "$dir" ]] || { echo "NO-SRC"; return; }
+        local names; names="$(printf '%s' "$pattern" | sed 's/\[\.\]/./g' | tr '|' '\n')"
+        local files=() n
+        while IFS= read -r n; do
+            [[ -n "$n" && -f "$dir/$n" ]] && files+=("$dir/$n")
+        done <<<"$names"
+        if [[ ${#files[@]} -eq 0 ]]; then echo "NO-OWN-SRC"; return; fi
+        printf '%s\n' "${files[@]}" | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16
+    }
+    tmp="$(mktemp)"
+    while IFS= read -r ln; do
+        if [[ "$ln" =~ ^# || -z "$ln" ]]; then printf '%s\n' "$ln" >>"$tmp"; continue; fi
+        IFS=$'\t' read -r m mo t tm inf _ <<<"$ln"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$m" "$mo" "$t" "$tm" "$inf" \
+            "$(src_digest "$m" "${PATTERN[$m/$t]:-}")" >>"$tmp"
+    done <"$EXPECTED_FILE"
+    mv "$tmp" "$EXPECTED_FILE"
+    echo "ctgrind: source digests rewritten in $EXPECTED_FILE"
+    exit 0
+fi
+
 if [[ ${#MODULES[@]} -eq 0 ]]; then MODULES=("${ALL_MODULES[@]}"); fi
 # ALL_MODULES is derived from the tree now, so a harness added without a recipe
 # here shows up on its own -- and would otherwise be "measured" with no targets,
@@ -411,9 +443,53 @@ done
 #     Unconditional and not expressible in ctgrind-expected.tsv on purpose:
 #     this is the rule that makes the in-file numbers mean anything, so it
 #     must not be something a module can record its way out of.
+
+# ── source pin ──────────────────────────────────────────────────────────────
+#
+# ⛔ WHY THIS EXISTS, and why the obvious fix does not. The 2026-09-01 k256
+# audit (G1) showed the in-file COUNT cannot see a leak that REPLACES an
+# expected one: substituting `ecdsa_recover.zig:136`'s `s.isZero()` guard with
+# a loop whose trip count is `privkey[31] & 7` leaks 3 key bits per signature
+# and reports `total 15 / in-file 10 / witness 5 / unattr 0` — the baseline,
+# exactly. The audit proposed pinning the LOCATIONS instead, one `file:line`
+# set per row.
+#
+# Measured 2026-09-08 before building that: it would not work either. The
+# substitution edits the line IN PLACE, so the file's numbering is unchanged
+# and the stack line set is identical. Nor does the error COUNT help — both
+# runs report `139 errors from 15 contexts`. The two memcheck logs are
+# byte-identical apart from the pid. Nothing derived from the measurement can
+# separate them, because memcheck's taint is binary and both branches are on
+# key-derived values.
+#
+# So the pin has to be on the ARTEFACT instead: the digest of the sources whose
+# contexts a row counts. Editing any of them turns the row red until someone
+# re-measures and re-justifies. That is coarse — a comment change trips it —
+# and coarse is the point: "the code that was analysed is the code that ships"
+# is the property the counts silently assumed and never checked.
+#
+# Only the MODULE'S OWN files are hashed. A pattern may also name std files
+# (`ct25519/std`, `chachapoly/aead`), which live outside the tree and move with
+# the toolchain; the count bounds already carry those.
+src_digest() {
+    local module="$1" pattern="$2"
+    local dir="$REPO_ROOT/modules/$module/src"
+    [[ -d "$dir" ]] || { echo "NO-SRC"; return; }
+    # `pattern` is a regex over basenames with `[.]` escapes: turn it back into
+    # a plain alternation and take each name that exists in the module.
+    local names; names="$(printf '%s' "$pattern" | sed 's/\[\.\]/./g' | tr '|' '\n')"
+    local files=()
+    local n
+    while IFS= read -r n; do
+        [[ -n "$n" && -f "$dir/$n" ]] && files+=("$dir/$n")
+    done <<<"$names"
+    if [[ ${#files[@]} -eq 0 ]]; then echo "NO-OWN-SRC"; return; fi
+    printf '%s\n' "${files[@]}" | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16
+}
+
 echo
 fail=0
-while IFS=$'\t' read -r em emode etarget etotal_min ein_file; do
+while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc; do
     [[ "$em" =~ ^# ]] && continue
     [[ -z "$em" ]] && continue
     line=$(awk -F'\t' -v m="$em" -v mo="$emode" -v t="$etarget" \
@@ -444,6 +520,26 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file; do
     if [[ "$total" -lt "$etotal_min" ]]; then
         echo "FAIL $em/$emode/$etarget: total contexts $total < required minimum $etotal_min (propagation witness did not fire)" >&2
         fail=1
+    fi
+    # Source pin. Absent column = not yet pinned; say so rather than pass.
+    if [[ -z "${esrc:-}" ]]; then
+        echo "FAIL $em/$emode/$etarget: no source digest in ctgrind-expected.tsv — run --update-digests" >&2
+        fail=1
+    else
+        actual_src="$(src_digest "$em" "${PATTERN[$em/$etarget]:-}")"
+        # A row whose pattern names only std files has nothing of the module's
+        # own to pin. Say it out loud on every run: a pin that matches because
+        # both sides are the same placeholder is a gate that scans nothing, and
+        # a gate that scans nothing also exits zero.
+        if [[ "$actual_src" == "NO-OWN-SRC" || "$actual_src" == "NO-SRC" ]]; then
+            echo "NOTE $em/$emode/$etarget: no source pin — the pattern names no file of this module (its counts are bounds only)."
+        fi
+        if [[ "$actual_src" != "$esrc" ]]; then
+            echo "FAIL $em/$emode/$etarget: the sources this row counts changed (digest $actual_src, pinned $esrc)." >&2
+            echo "     The counts above cannot see a leak that REPLACES an expected one — measured, see 'source pin' in this script." >&2
+            echo "     Re-read the contexts, satisfy yourself they are still the documented ones, then --update-digests." >&2
+            fail=1
+        fi
     fi
 done <"$EXPECTED_FILE"
 
