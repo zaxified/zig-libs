@@ -6,7 +6,7 @@ Configuration Interface) file format — `config` / `option` / `list`.
 - No maintained pure-Zig UCI codec exists; this retires
   shelling out to the `uci` binary for callers that manage OpenWRT-style
   device config.
-- **Model after:** OpenWRT UCI file format / libuci.
+- **Model after:** OpenWRT UCI file format.
 - **Why:** OpenWRT-style device config is commonly read/written by shelling
   out to `uci`; doing it natively removes an exec dependency and gives typed
   access + errors.
@@ -17,13 +17,13 @@ Configuration Interface) file format — `config` / `option` / `list`.
 
 Provenance: original work of the zig-libs authors (MIT); clean-room from the
 documented OpenWRT UCI (Unified Configuration Interface) file format (OpenWRT
-wiki/docs) — libuci (LGPL-2.1) is referenced for the format only, no libuci
-source was consulted or copied; the file format is the documented interface.
-`root.zig`'s "real uci capture" tests freeze raw config bytes and the real `uci`
-binary's own `export`/`show` stdout for them, run once inside the `scripts/vm/`
-OpenWRT VM, exercising it purely as a black-box test oracle (root `NOTICE` §0 —
-no libuci/uci source consulted, needing no attribution); see SPEC.md for the
-findings.
+wiki/docs) — the file format is the documented interface. Every behavioural
+claim is settled by RUNNING the real `uci` binary: `root.zig`'s "real uci
+capture" and "addressing
+probe" sections freeze raw config bytes together with that binary's own
+`export`/`show`/`get` stdout, taken inside the `scripts/vm/` OpenWRT VM and
+replayed by tests — a black-box oracle, which root `NOTICE` §0 records as owing
+no attribution. See SPEC.md for the findings.
 
 ## API
 
@@ -54,10 +54,10 @@ while (it.next()) |sec| { ... }
 // the type (unlike `section`, which needs both).
 _ = pkg.sectionByName("lan");                   // ?*const Section
 
-// Resolve `@type[N]` positional addressing, incl. libuci's negative-index-
+// Resolve `@type[N]` positional addressing, incl. the negative-index-
 // from-the-end form (`-1` = last matching section of that type). Anonymous
 // and named sections of `type` both count, in file order. Out-of-range
-// (either direction) returns null, matching libuci's own "not found".
+// (either direction) returns null — the real binary's own "not found".
 _ = pkg.nth("rule", 0);                         // ?*const Section, first
 _ = pkg.nth("rule", -1);                        // ?*const Section, last
 

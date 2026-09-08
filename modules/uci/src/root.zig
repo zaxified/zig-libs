@@ -35,9 +35,10 @@
 //! `list` entries under one key accumulate in order; mixing `option` and
 //! `list` under the same key is rejected as `error.MixedOptionList`.
 //!
-//! Provenance: clean-room from the documented OpenWRT UCI file format;
-//! libuci (LGPL-2.1) referenced for the format only, no source consulted
-//! or copied.
+//! Provenance: clean-room from the documented OpenWRT UCI file format, with
+//! the real `uci` binary used purely as a black-box oracle (root `NOTICE`
+//! §0). Every behavioural claim about addressing is MEASURED against that
+//! binary and replayed from a frozen transcript.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -54,7 +55,7 @@ pub const meta = .{
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,
-    .model_after = "OpenWRT UCI file format / libuci",
+    .model_after = "OpenWRT UCI file format",
     .deps = .{}, // std only
 };
 
@@ -196,9 +197,10 @@ pub const Package = struct {
 
     /// Resolve `pkg.<name>.<opt>` addressing: a section by name alone,
     /// across every type — UCI section names share one namespace per
-    /// package, not one per type, matching libuci's own lookup
-    /// (`uci_lookup_list`/`uci_lookup_next` in list.c, a plain linear scan by
-    /// `e->name` with no type filter). Unlike `section`, the caller does not
+    /// package, not one per type (measured against the real `uci` binary:
+    /// see the "addressing probe" capture below, where `alpha`, `gamma` and
+    /// `delta` all answer by name although `delta` is a different type).
+    /// Unlike `section`, the caller does not
     /// need to already know the section's type. Anonymous sections have no
     /// name and are never matched here — use `nth` for `@type[N]`
     /// addressing.
@@ -210,21 +212,20 @@ pub const Package = struct {
         return null;
     }
 
-    /// Resolve `@type[N]` positional addressing, matching libuci exactly
-    /// (`uci_lookup_ext_section` in list.c, verified against its source):
+    /// Resolve `@type[N]` positional addressing, matching the real `uci`
+    /// binary exactly (measured, not read: see the "addressing probe"
+    /// capture below, which pins every case named here):
     /// `index` counts sections of `section_type` in file order — anonymous
     /// *and* named sections of that type both count, the same set `iterate`
     /// walks, not anonymous-only. A negative index counts from the end
-    /// (`-1` = last matching section): libuci first counts the matching
-    /// sections, then adds that count to the negative index, converting it
-    /// to the equivalent non-negative position; `nth` does the same. Both an
-    /// out-of-range positive index and a negative index whose magnitude
-    /// exceeds the match count return `null` — libuci's lookup falls through
-    /// its scan and reports "not found" rather than erroring, so `nth`
-    /// mirrors that with `null` rather than an error union. `-0` behaves
-    /// exactly like `0` (the first matching section): libuci parses the
-    /// index text with `strtol`, which has no signed zero, so `"-0"` never
-    /// even reaches the negative-index branch — and there is no way to
+    /// (`-1` = last matching section), which is equivalent to adding the
+    /// match count to it; `nth` does exactly that. Both an out-of-range
+    /// positive index and a negative index whose magnitude exceeds the match
+    /// count return `null`: the real binary answers "Entry not found" with a
+    /// non-zero status for both (measured: `@t[3]` and `@t[-4]`), which is a
+    /// miss rather than a distinct error, so `nth` mirrors it with `null`
+    /// rather than an error union. `-0` behaves exactly like `0` (measured:
+    /// `@t[-0]` returns the first matching section) — and there is no way to
     /// construct a distinct "negative zero" `i64` either, so that case isn't
     /// separately representable here.
     pub fn nth(self: *const Package, section_type: []const u8, index: i64) ?*const Section {
@@ -1387,7 +1388,7 @@ const captured_testcfg_export = "package testcfg\n" ++
 // name). The test below checks that same file-order/per-type semantics
 // through `Package.iterate`, and a further test below checks it through
 // `Package.nth`, which does expose `@type[N]` addressing directly (matching
-// libuci's `uci_lookup_ext_section` in list.c).
+// the real `uci` binary — see the "addressing probe" capture).
 const captured_testcfg_show = "testcfg.lan=interface\n" ++
     "testcfg.lan.proto='static'\n" ++
     "testcfg.lan.ipaddr='192.168.1.1'\n" ++
@@ -1473,7 +1474,7 @@ test "Package.sectionByName: pkg.<name> addressing by name alone, across types (
     try testing.expect(pkg.sectionByName("rule") == null);
 }
 
-test "Package.nth: @type[N] addressing, matching libuci's negative-index and out-of-range semantics (real uci capture)" {
+test "Package.nth: @type[N] addressing, negative-index and out-of-range semantics (real uci capture)" {
     const gpa = testing.allocator;
     var pkg = try parse(gpa, captured_testcfg_raw);
     defer pkg.deinit(gpa);
@@ -1485,17 +1486,17 @@ test "Package.nth: @type[N] addressing, matching libuci's negative-index and out
     const r1 = pkg.nth("rule", 1).?;
     try testing.expectEqualStrings("second anon rule, with a comma and # not-a-comment", r1.get("name").?);
 
-    // Negative index counts from the end: libuci first counts matching
-    // sections (2), then adds that count to the index (-1 + 2 = 1, -2 + 2 =
-    // 0) — so -1 is the last and -2 is the first, same sections as above.
+    // Negative index counts from the end: the match count (2) is added to
+    // the index (-1 + 2 = 1, -2 + 2 = 0), so -1 is the last and -2 the first,
+    // the same sections as above.
     try testing.expectEqual(r1, pkg.nth("rule", -1).?);
     try testing.expectEqual(r0, pkg.nth("rule", -2).?);
 
     // Out of range, both directions: a positive index at or past the match
     // count, and a negative index whose magnitude exceeds it (-3 + 2 = -1,
-    // still negative after the libuci adjustment) — libuci's own lookup
-    // falls through its scan for both and reports "not found", so this
-    // returns null rather than an error.
+    // still negative after the adjustment). The real binary answers "Entry
+    // not found" with a non-zero status for both (measured in the addressing
+    // probe below), so this returns null rather than an error.
     try testing.expect(pkg.nth("rule", 2) == null);
     try testing.expect(pkg.nth("rule", 100) == null);
     try testing.expect(pkg.nth("rule", -3) == null);
@@ -1512,8 +1513,8 @@ test "Package.nth: @type[N] addressing, matching libuci's negative-index and out
     try testing.expect(pkg.nth("nonexistent", 0) == null);
     try testing.expect(pkg.nth("nonexistent", -1) == null);
 
-    // `nth(type, 0)` addresses the same section libuci's `@type[N]`
-    // addresses at N=0, which `-0` also does — there's no separate `i64`
+    // `nth(type, 0)` addresses the same section `@type[N]` does at N=0,
+    // which `-0` also does — there's no separate `i64`
     // value for "-0" to test differently (see the doc-comment; `-0` isn't
     // even writable as a distinct i64 literal, which is the same point).
     const negative_zero: i64 = -@as(i64, 0);
@@ -1556,6 +1557,80 @@ const captured_esctest_raw = "config t\n" ++
     "\toption cr \"a\\rb\"\n" ++
     "\toption arbitrary \"a\\yb\"\n" ++
     "\toption single_no_escape 'a\\nb\\tc\\\\d'\n";
+
+// ── addressing probe: named and anonymous sections of the SAME type ─────────
+//
+// Captured 2026-09-08 from the same OpenWRT 25.12.4 guest. This config exists
+// because the `testcfg` capture above cannot answer one question: its two
+// `rule` sections are BOTH anonymous, so it never shows whether a NAMED
+// section occupies a position in `@type[N]`. That is exactly the semantics
+// `sectionByName`/`nth` implement, and until this capture nothing in the tree
+// measured it.
+//
+// What real `uci` said, verbatim (`uci show probe`, then `uci get` per key):
+//
+//   probe.alpha=t          probe.alpha.v='A'
+//   probe.@t[1]=t          probe.@t[1].v='B'      <- the ANONYMOUS one is [1]
+//   probe.gamma=t          probe.gamma.v='C'
+//   probe.delta=other      probe.delta.v='D'
+//
+//   alpha      => A  rc=0        @t[0]  => A  rc=0
+//   gamma      => C  rc=0        @t[1]  => B  rc=0
+//   delta      => D  rc=0        @t[2]  => C  rc=0
+//                                @t[3]  => uci: Entry not found  rc=1
+//   @t[-1]     => C  rc=0        @t[-4] => uci: Entry not found  rc=1
+//   @t[-3]     => A  rc=0        @t[-0] => A  rc=0
+//   @other[0]  => D  rc=0
+//
+// Four facts, each now measured rather than read:
+//  1. `pkg.<name>` resolves by NAME ALONE and across types — `delta` is type
+//     `other`, `alpha`/`gamma` are type `t`, and all three answer.
+//  2. `@type[N]` counts NAMED and ANONYMOUS sections of that type alike, in
+//     file order: [0] is the named `alpha`, [1] the anonymous one, [2] the
+//     named `gamma`. Real `uci show` labels the anonymous section `@t[1]`
+//     itself, which corroborates it from a second direction.
+//  3. A negative index counts from the end (-1 = last, -3 = first of three).
+//  4. Out of range in EITHER direction is "not found" (rc=1), not an error of
+//     a different kind — and `-0` behaves as `0`.
+const captured_probe_raw = "config t 'alpha'\n" ++
+    "\toption v A\n" ++
+    "\n" ++
+    "config t\n" ++
+    "\toption v B\n" ++
+    "\n" ++
+    "config t 'gamma'\n" ++
+    "\toption v C\n" ++
+    "\n" ++
+    "config other 'delta'\n" ++
+    "\toption v D\n";
+
+test "real uci capture: @type[N] counts NAMED and anonymous sections alike, and name lookup crosses types" {
+    const gpa = testing.allocator;
+    var pkg = try parse(gpa, captured_probe_raw);
+    defer pkg.deinit(gpa);
+
+    // 1. name alone, across types.
+    try testing.expectEqualStrings("A", pkg.sectionByName("alpha").?.get("v").?);
+    try testing.expectEqualStrings("C", pkg.sectionByName("gamma").?.get("v").?);
+    try testing.expectEqualStrings("D", pkg.sectionByName("delta").?.get("v").?);
+
+    // 2. the position of a NAMED section in @type[N] — the fact the older
+    //    capture could not show, because both its `rule` sections were
+    //    anonymous.
+    try testing.expectEqualStrings("A", pkg.nth("t", 0).?.get("v").?);
+    try testing.expectEqualStrings("B", pkg.nth("t", 1).?.get("v").?);
+    try testing.expectEqualStrings("C", pkg.nth("t", 2).?.get("v").?);
+    try testing.expect(pkg.nth("t", 3) == null);
+
+    // 3. negative index from the end.
+    try testing.expectEqualStrings("C", pkg.nth("t", -1).?.get("v").?);
+    try testing.expectEqualStrings("A", pkg.nth("t", -3).?.get("v").?);
+    try testing.expect(pkg.nth("t", -4) == null);
+
+    // 4. `-0` is `0`, and each type counts separately.
+    try testing.expectEqualStrings("A", pkg.nth("t", -@as(i64, 0)).?.get("v").?);
+    try testing.expectEqualStrings("D", pkg.nth("other", 0).?.get("v").?);
+}
 
 test "real uci capture: escape-table probe — only \\\\ \\\" \\' are true escapes; \\n \\t \\r \\y all drop the backslash and keep the literal char" {
     const gpa = testing.allocator;

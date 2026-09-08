@@ -58,7 +58,7 @@ pub fn main() !void {
 
     // `@type[N]` positional addressing — the two anonymous wifi-iface
     // sections are addressed the same way `uci show wireless.@wifi-iface[1]`
-    // does on a real device: first by positive index, then by libuci's
+    // does on a real device: first by positive index, then by the
     // negative-from-the-end form.
     const first_iface = pkg.nth("wifi-iface", 0).?;
     const last_iface = pkg.nth("wifi-iface", -1).?;

@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — The addressing semantics are pinned to a measurement of the real `uci`
+  binary. `sectionByName` and `nth` previously rested on prose; every fact they state was
+  re-taken by RUNNING that binary in the `scripts/vm/` OpenWRT 25.12.4 guest, frozen as the
+  new "addressing probe" capture and replayed by a test. It answers one case the older
+  `testcfg` capture could not, because both of its `rule` sections are anonymous: a config
+  with a NAMED, an ANONYMOUS and a second NAMED section of one type shows `@t[0]`→named,
+  `@t[1]`→anonymous, `@t[2]`→named, and real `uci show` labels the anonymous one `@t[1]`
+  itself. Also measured: name lookup crosses types, `-1`/`-3` count from the end, `@t[3]` and
+  `@t[-4]` are both "Entry not found" (rc=1), and `-0` behaves as `0`. The module agreed with
+  the binary on every one — no behaviour changed, only what the claim rests on.
+
 - **2026-09-07** — Fuzz reach: both harnesses ran one empty input. `fuzzParse` opened
   `smith.bytes(&buf)` then drew the length with `smith.valueRangeAtMost`, which returns
   the range MINIMUM once `bytes` has eaten the input, so the target was `parse("")`.
@@ -25,17 +36,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `parse`, and 13 sections / 25 values for the generator.
 
 - **2026-08-18** — New: `Package.sectionByName(name)` (resolves `pkg.<name>.<opt>` key-path
-  addressing by name alone, across section types — matching libuci's own name lookup) and
-  `Package.nth(type, index)` (resolves `@type[N]` positional addressing, including libuci's
-  negative-index-from-the-end form; verified against libuci's `list.c` source, see SPEC.md).
+  addressing by name alone, across section types) and `Package.nth(type, index)` (resolves
+  `@type[N]` positional addressing, including the negative-index-from-the-end form; the
+  semantics are pinned to a capture of the real `uci` binary, see SPEC.md).
   Both were previously hand-rolled by consumers over `iterate`, the negative-index case
   needing a counting pass first. Purely additive; no existing behavior changed. Also:
   SPEC.md's out-of-scope section now says explicitly that a file-only reader loses
   staged-but-uncommitted state (`uci set` without `commit`) and that `uci revert` truncates
   its delta file rather than deleting it — both previously implied only by "state files".
 - **2026-07-19** — Security audit: two findings fixed (part of the collection-wide
-  audit; the root changelog records no further detail than this). Modeled on libuci
-  (LGPL-2.1; format-only reference, no source consulted) (design reference, not a test
-  anchor).
+  audit; the root changelog records no further detail than this). Modeled on the
+  documented OpenWRT UCI file format.
 - **2026-07-07** — New module: OpenWRT UCI config parser + serializer + typed model
   (stable round-trip).

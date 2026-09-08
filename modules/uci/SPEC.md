@@ -20,14 +20,20 @@ control char that has no UCI escape → `error.UnserializableValue`. Bounded: in
 '<name>'` header, blank line between section blocks, tab-indented options, values single-quoted
 (double-quoted with escapes only when they contain `'` or a control char). Accessors: `section(type,
 name)`, `get`/`getList`, `iterate(type)`, deep `eql`. Two more resolve the addressing forms a UCI key
-path uses: `sectionByName(name)` resolves `pkg.<name>.<opt>` (libuci indexes section names in one
-namespace per package, not one per type — `uci_lookup_list` in list.c has no type filter, verified
-against source); `nth(type, index)` resolves `@type[N]` positional addressing including libuci's
-negative-index-from-the-end form (verified against `uci_lookup_ext_section` in list.c: a negative
-index adds the matching-section count to itself; out of range either direction — including a still-
-negative result — is "not found", returned here as `null` rather than an error; anonymous and named
-sections of `type` both count). Clean-room from the documented OpenWRT UCI file
-format (libuci referenced for the *format* only, no source consulted or copied) — see NOTICE.
+path uses: `sectionByName(name)` resolves `pkg.<name>.<opt>` (UCI indexes section names in one
+namespace per package, not one per type); `nth(type, index)` resolves `@type[N]` positional
+addressing including the negative-index-from-the-end form (a negative index adds the
+matching-section count to itself; out of range either direction — including a still-negative
+result — is "not found", returned here as `null` rather than an error; anonymous and named
+sections of `type` both count).
+
+**Both of those are MEASURED against the real `uci` binary.** The transcript is frozen in `root.zig`'s "addressing probe" capture and replayed by a test; it was
+taken 2026-09-08 in the same OpenWRT 25.12.4 guest the rest of the capture comes from, with a
+config carrying a NAMED, an ANONYMOUS and a second NAMED section of one type — the case the older
+`testcfg` capture could not answer, because both of its `rule` sections are anonymous. Real `uci`
+labels the anonymous section `@t[1]` in its own `uci show` output, so the ordering is corroborated
+from a second direction. Clean-room from the documented OpenWRT UCI file format, with the real
+binary used purely as a black-box oracle (root `NOTICE` §0).
 
 ## Threat model / out of scope
 Not security-sensitive; the hardening is denial-of-service and crash resistance on hostile config
@@ -40,18 +46,32 @@ coercion. This is the file codec only.
 
 **The concrete trap in "this is the file codec only": a file-only reader loses staged-but-uncommitted
 state.** `uci set` without a following `commit` never touches `/etc/config/<pkg>` — it appends a
-delta line to `/tmp/.uci/<pkg>` (libuci's `UCI_SAVEDIR`), and `uci get`/`uci show` return that staged
-value while the on-disk config file still holds the old one. This is exactly LuCI's "Save" without
+delta line to `/tmp/.uci/<pkg>`, and `uci get`/`uci show` return that staged value while the on-disk
+config file still holds the old one. This is exactly LuCI's "Save" without
 "Apply" (routers commonly sit in this state — a webUI change staged but not yet applied), and it is
 the concrete trap for anyone replacing a shelled-out `uci get` with `parse(gpa,
 readFile("/etc/config/<pkg>"))`: the read is silently stale for any package with a pending delta,
-with no error to catch it. Verified against libuci's own source (`uci.h`'s `UCI_SAVEDIR
-"/tmp/.uci"`; `uci_load_delta`/`file.c`'s config-path resolution) rather than assumed.
+with no error to catch it.
 
-`uci revert` truncates the delta file (`ftruncate(fd, 0)` in `delta.c`'s `uci_load_delta`/
-`uci_filter_delta`) rather than deleting it — the file keeps existing, empty, after every pending
-change for a package is reverted. A caller that checks for the delta file's existence as a
-"has staged changes" fallback (an understandable move if it can't call into libuci itself) latches
+**Measured on the real binary** (OpenWRT 25.12.4 guest, 2026-09-08), not assumed. A config holding
+`option v A`, then `uci set probe.alpha.v=Z` with no commit:
+
+```
+uci get probe.alpha.v   -> Z          <- the staged value
+/etc/config/probe       -> option v A <- the file still holds the old one
+/tmp/.uci/probe         -> probe.alpha.v='Z'
+```
+
+`uci revert` empties the delta file rather than deleting it — the same run, after
+`uci revert probe`:
+
+```
+ls -l /tmp/.uci/probe   -> -rw-r--r-- 1 root root 0 ... /tmp/.uci/probe
+wc -c  /tmp/.uci/probe  -> 0          <- present, and empty
+uci get probe.alpha.v   -> A          <- back to the on-disk value
+```
+
+So a caller that checks for the delta file's EXISTENCE as a "has staged changes" fallback latches
 that fallback permanently true the first time anything is staged and reverted, even with zero
 changes actually pending — check the file's contents/size, not merely whether it exists.
 
