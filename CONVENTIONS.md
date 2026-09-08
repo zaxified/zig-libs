@@ -606,6 +606,18 @@ lane proves something the others cannot:
 | `-Doptimize=ReleaseFast` | the code is free of undefined behaviour that the safety checks would otherwise mask, and of anything that only holds because of them |
 | `-Doptimize=ReleaseSafe` | the combination the other two never form — optimisations *and* safety checks armed. Not a formality: it is the lane that caught the only real defect of 2026-08-12 (a use-after-scope) while Debug and ReleaseFast both passed it by luck (`f88a102`). Integrators build in all three, so all three must pass |
 
+**⛔ Nothing measured under valgrind may be a Debug build.** Debug is the only mode
+whose default backend is Zig 0.16's self-hosted x86_64 one, and valgrind's DWARF reader
+cannot parse the `.debug_line` it emits — measured 2026-09-08 on a ten-line program with
+no inline asm and no `std.valgrind` call: 35 159 `Badly formed extended line op` warnings
+with `-fno-llvm`, **0** with `-fllvm`, and the release modes break identically when forced
+`-fno-llvm` (48 395 / 37 369), so it is the backend and not the mode. The cost is not lost
+attribution but WRONG attribution: on the same harness, `ReleaseFast` and `ReleaseSafe`
+resolve 100 % of frames to `(file:line)` and Debug resolves 42.4 %, of which 51 of 60 carry
+the wrong line. This is why `scripts/ctgrind.sh` measures no module in Debug. Details, and
+the two blind oracles that make this easy to misdiagnose, in `scripts/README.md`
+§ "Constant-time harnesses (ctgrind)".
+
 **A note worth passing to integrators** (belongs in module docs where a parser is
 exposed, not enforced here): every parser that touches bytes it did not produce is
 held to a "never panic on arbitrary input" threat model, backed by **440 fuzz

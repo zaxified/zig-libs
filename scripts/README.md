@@ -350,6 +350,39 @@ printer as a propagation witness.
 Needs `valgrind` on PATH. Not part of `zig build test`: a memcheck context
 count is valgrind's own verdict, not something a Zig test can assert on.
 
+**⛔ Nothing measured under valgrind may be a Debug build — this is a repo-wide
+rule, not a ctgrind detail.** Zig 0.16 compiles Debug with the self-hosted
+x86_64 backend (Debug is the only optimize mode where that backend is the
+default), and valgrind's DWARF reader cannot parse the `.debug_line` it emits.
+Measured 2026-09-08 on a ten-line program with **no inline asm and no
+`std.valgrind` call at all**: `-fno-llvm` 35 159 `Badly formed extended line op`
+warnings, `-fllvm` **0**. It is a property of the backend and not of the mode —
+forced with `-fno-llvm` the release modes break identically (ReleaseSafe 48 395,
+ReleaseFast 37 369) and are clean only because LLVM is their default.
+
+What it costs a measurement, same harness and target, frames carrying
+`(file:line)`: `ReleaseFast` 36/36 · `ReleaseSafe` 2054/2054 · `Debug`
+**904/2130 (42.4 %)** — and of the Debug frames that do resolve, **51 of 60
+carry the wrong line number** (checked against `llvm-symbolizer`; the file is
+right 60 of 60). So a Debug run under valgrind does not merely lose attribution,
+it reports attribution that is wrong, and a context whose pattern-bearing frames
+all lost their line info lands in `unattr` and fails a row for a reason that has
+nothing to do with the code. `chachapoly` carried such a row from 2026-09-02
+(recorded KNOWN RED) until 2026-09-08, when the same expectation passed on the
+same tree; it is gone now, and `chachapoly`'s `ReleaseSafe` row makes the same
+point.
+
+⚠ **Do not diagnose this by counting warnings on a quiet run.** Valgrind reads
+line information LAZILY — only when it first has to symbolize a frame — so a
+binary that reports no errors never opens the table and prints **0 warnings
+however broken it is**. Force symbolization first (`-lc` plus a deliberately
+leaked `std.c.malloc` and `--leak-check=full`), or the zero means nothing. Two
+other readers are no help here either: binutils `addr2line` and `eu-addr2line`
+cannot read Zig's tables at all, and `llvm-dwarfdump --verify --debug-line`
+reports **0 errors** on a binary valgrind cannot parse — the table is not
+invalid, valgrind's DWARF2-era reader just does not handle what the self-hosted
+backend emits. `llvm-symbolizer` is the oracle that works.
+
 **Every (mode, target) triple is three rows, never one.** The claim, an
 UNTAINTED negative control, and a build without `-fvalgrind`. The last one is
 not decoration: `std.valgrind.doClientRequest` opens with

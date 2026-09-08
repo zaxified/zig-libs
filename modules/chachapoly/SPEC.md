@@ -166,8 +166,8 @@ only. Tag verification uses `std.crypto.timing_safe.eql`, and a failed `decrypt`
 **This holds in `ReleaseFast`, which is what ships — and only there.** The
 lane-parallel MAC uses *checked* `*` / `+` rather than `*%` / `+%` on purpose,
 so that a deferred-carry bounds mistake panics instead of silently forging a
-tag; in `Debug` / `ReleaseSafe` the compiler turns each of those into an
-overflow branch on a secret-derived value.
+tag; in `ReleaseSafe` (and in `Debug`, which arms the same checks) the compiler
+turns each of those into an overflow branch on a secret-derived value.
 
 **The measurement, in full, so the claim is exactly as wide as the evidence.**
 Since 2026-08-11 it is a **committed program**, not numbers a reader has to take
@@ -190,18 +190,32 @@ counts:
 |---|---|---|---|---|---|
 | `ReleaseFast` | yes | yes | **4** | **0** | 99 |
 | `ReleaseSafe` | yes | yes | **214** | **210** | 99 |
-| `Debug`       | yes | yes | **285** | **281** | 99 |
 | `ReleaseFast` | yes | **no** — negative control | 0 | 0 | 0 |
 | `ReleaseSafe` | yes | **no** — negative control | 0 | 0 | 0 |
-| `Debug`       | yes | **no** — negative control | 0 | 0 | 0 |
 | `ReleaseFast` | **no** | yes — trap | 0 | 0 | 0 |
 | `ReleaseSafe` | **no** | yes — trap | 0 | 0 | 0 |
-| `Debug`       | **no** | yes — trap | 0 | 0 | 0 |
 
 (An earlier hand-run of the same experiment recorded 3 / 280 / 294 across the
-first three rows. Same shape, same conclusion; the small differences are the
+three claim rows of the time — `ReleaseFast`, `ReleaseSafe` and the `Debug` row
+since removed. Same shape, same conclusion; the small differences are the
 committed harness's slightly different message set, and these are the numbers
 that can now be re-taken.)
+
+**`Debug` is not in that table any more, and the reason is the compiler.** It
+carried three rows until 2026-09-08 (285 contexts, 281 in-file) as a second copy
+of the `ReleaseSafe` positive control. Zig 0.16 builds Debug with the
+self-hosted x86_64 backend — the only mode where that backend is the default —
+and valgrind's DWARF reader cannot parse the `.debug_line` it emits. Measured on
+this harness, frames carrying `(file:line)`: `ReleaseFast` 36/36, `ReleaseSafe`
+2054/2054, `Debug` **904/2130**; and of the Debug frames that do resolve, **51
+of 60 carry the wrong line number** (checked against `llvm-symbolizer`; the file
+is right 60 of 60). A context whose pattern-bearing frames all lost their line
+info cannot be attributed by any pattern, so the row failed or passed depending
+on the build rather than on this module — it was recorded as KNOWN RED on
+2026-09-02 and passed unchanged on 2026-09-08. The `ReleaseSafe` row makes
+exactly the same point through exactly the same checked operators, nothing
+consumes this module in Debug, and `CONVENTIONS.md` §7.1 had already narrowed
+the Debug CI lane to compile-only for the same kind of reason.
 
 Three things make the `ReleaseFast` zero mean something. First, the trap rows:
 **without `-fvalgrind` every run reads 0 regardless**, because
@@ -214,8 +228,8 @@ the *tag*, raised inside the harness's own hex formatter, which is the proof
 that taint travelled key → tag through the entire MAC and that the MAC left no
 branch behind on the way.
 
-**Teeth, measured 2026-08-11.** The `ReleaseSafe`/`Debug` rows are already a
-positive control no optimizer can delete — 210 and 281 contexts *inside*
+**Teeth, measured 2026-08-11.** The `ReleaseSafe` row is already a
+positive control no optimizer can delete — 210 contexts *inside*
 `poly1305.zig` prove the taint reaches the MAC's arithmetic. For the
 `ReleaseFast` row specifically, injecting a secret-dependent early return
 (`var z: u8 = 0; for (key) |b| z |= b; if (z == 0) { @memset(out, 0); return; }`

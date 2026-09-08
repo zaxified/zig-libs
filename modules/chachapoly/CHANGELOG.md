@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — The three `Debug` rows are gone from the constant-time table in
+  `SPEC.md` and from `scripts/ctgrind-expected.tsv`. They were a second copy of the
+  `ReleaseSafe` positive control (281 in-file contexts against its 210, the same checked
+  operators for the same reason), and they were not a measurement: Zig 0.16 compiles Debug
+  with the self-hosted x86_64 backend, whose `.debug_line` valgrind's DWARF reader cannot
+  parse. Measured on this harness, frames carrying `(file:line)`: `ReleaseFast` 36/36,
+  `ReleaseSafe` 2054/2054, **`Debug` 904/2130**, and 51 of 60 resolved Debug frames carry
+  the wrong line number (checked against `llvm-symbolizer`; the file is right 60 of 60). A
+  context whose pattern-bearing frames all lost their line info is unattributable by any
+  pattern, so the `aead` Debug row stood recorded as KNOWN RED from 2026-09-02 and then
+  passed unchanged on 2026-09-08 — the verdict was moving with the build, not with this
+  module. Nothing consumes this module in Debug and no claim in `SPEC.md` rested on those
+  rows. The repo-wide rule is now in `CONVENTIONS.md` §7.1 and `scripts/README.md`.
+
 - **2026-09-07** — Both fuzz targets ran one fixed input for their whole existence.
   `poly1305.fuzzAgainstStd` drew the key, then the message, then a ranged length; a ranged
   `Smith` draw reads eight octets as a little-endian `u64` and returns the range MINIMUM when

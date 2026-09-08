@@ -76,11 +76,45 @@ EXPECTED_FILE="$SCRIPT_DIR/ctgrind-expected.tsv"
 # MODES    — optimize modes worth measuring. ReleaseFast only, except
 #            `chachapoly`, whose whole claim is that the property holds at
 #            ReleaseFast and measurably NOT below it (its lane-parallel MAC
-#            uses checked `*`/`+`, which Debug/ReleaseSafe lower to overflow
+#            uses checked `*`/`+`, which ReleaseSafe lowers to overflow
 #            branches on secret-derived values). Everywhere else those same
 #            safety checks merely flood the report — `ct25519` measured 89 956
 #            errors from 1000 contexts at ReleaseSafe, valgrind's own
 #            --error-limit cutoff — so the claim is stated for ReleaseFast.
+#
+#            ⛔ DEBUG IS NOT MEASURABLE HERE, and the reason is the compiler,
+#            not this script. Zig 0.16 builds Debug with the self-hosted
+#            x86_64 backend (Debug is the only mode where that backend is the
+#            default), and valgrind's DWARF reader cannot parse the
+#            `.debug_line` it emits: 35 159 `Badly formed extended line op`
+#            warnings on a ten-line program with no inline asm and no
+#            `std.valgrind` call at all, and 0 for the same program built
+#            `-fllvm`. It is a property of the BACKEND, not of the mode —
+#            forced with `-fno-llvm` the release modes break identically
+#            (ReleaseSafe 48 395, ReleaseFast 37 369) and are clean only
+#            because LLVM is their default.
+#
+#            What that does to a measurement, per mode, same harness and
+#            target, frames carrying `(file:line)`:
+#              ReleaseFast 36/36 (100 %) · ReleaseSafe 2054/2054 (100 %) ·
+#              Debug 904/2130 (42.4 %)
+#            and of the Debug frames that DO resolve, 51 of 60 carry the WRONG
+#            line (checked against llvm-symbolizer; the file is right 60/60).
+#            A context all of whose pattern-bearing frames lost their line info
+#            is unattributable by ANY pattern, so it lands in `unattr` and the
+#            row fails — for a reason that has nothing to do with the module.
+#            That is why the `aead` Debug row sat in ctgrind-expected.tsv as
+#            KNOWN RED from 2026-09-02 and then passed on 2026-09-08 with the
+#            same expectation: the verdict moves with the build, not the code.
+#
+#            ⭐ Removed rather than worked around with `-fllvm`, because the
+#            row bought nothing that survives its own removal: the SPEC calls
+#            ReleaseSafe and Debug ONE positive control (210 and 281 contexts
+#            inside `poly1305.zig`, same checked operators, same reason), and
+#            nothing in this collection is consumed in Debug — CONVENTIONS §7.1
+#            already narrowed the Debug CI lane to compile-only in 2026-08-15,
+#            on the measurement that Debug proves nothing ReleaseSafe does not.
+#            This row was the last place anything was RUN in Debug.
 # PATTERN  — regex selecting the frames whose file the claim is ABOUT. The
 #            `--pattern` flag overrides it, which is how any attribution in a
 #            SPEC.md can be re-checked rather than believed.
@@ -111,7 +145,7 @@ declare -A TARGETS=(
     [montint]="small portable asmcore"
 )
 declare -A MODES=(
-    [chachapoly]="ReleaseFast ReleaseSafe Debug"
+    [chachapoly]="ReleaseFast ReleaseSafe"
     [ct25519]="ReleaseFast"
     [decaf448]="ReleaseFast"
     [bn254]="ReleaseFast"
