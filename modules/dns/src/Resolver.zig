@@ -922,6 +922,67 @@ test "decodeResponse: the echoed question must be OUR question — name, type, c
     m2.deinit();
 }
 
+// ── the hermetic half of the loopback question-check anchor (audit F20) ──────
+//
+// The frames below are not hand-written: `modules/dns/tools/interop.zig` binds
+// a real UDP socket on 127.0.0.1, serves each of them to a real `query()` from
+// a real second thread, checks the verdict there, and commits the exact bytes
+// that travelled. So the frames carry what a hand-built vector cannot — that
+// the wire path really does hand `decodeResponse` this question — while the
+// per-commit lane pays no socket, no thread and no timeout for it.
+//
+// ⭐ WHY THAT MATTERS, MEASURED. Until 2026-09-08 this assertion lived in
+// `test "query: a reply whose question is not ours is not the answer, over
+// loopback"`, which drove the same exchange over a socket and then read the
+// stub's `served` counter — from THIS thread, while the stub thread was still
+// runnable, because the joining `await` was a `defer` and ran after the
+// assertions. It failed twice in the wild (three concurrent agents on
+// 2026-09-07, `scripts/test.sh all` on 2026-09-08), always as `expected 1,
+// found 0`: the resolver had received the datagram and rejected it correctly
+// every time, and only the measurement was wrong. Reproduced on 8 cores with
+// 32 busy loops: 10 failures in 20 runs. This replacement has nothing to
+// schedule and nothing to lose a race with; under that same load it passed
+// 30 of 30, and the whole 70-test suite 10 of 10.
+test "decodeResponse: the replies `interop-dns` captured off a real socket — hostile refused, honest accepted" {
+    var r: Resolver = .{
+        .io = undefined, // decodeResponse performs no I/O
+        .gpa = testing.allocator,
+        .options = .{},
+        .http_client = null,
+        .conf = null,
+        .conf_text = null,
+    };
+
+    const wrong_question: []const u8 = @embedFile("testdata/reply_wrong_question.bin");
+    const no_question: []const u8 = @embedFile("testdata/reply_no_question.bin");
+    const honest: []const u8 = @embedFile("testdata/reply_honest.bin");
+
+    // The expected id is read OUT of each frame (the recorder normalises it,
+    // because `query` rolls a fresh id per datagram — audit F9). Taking it from
+    // the frame is deliberate: it makes the id check pass by construction, so
+    // what these three cases measure is the QUESTION check alone. The id/QR
+    // check has its own test above.
+    for ([_][]const u8{ wrong_question, no_question }) |frame| {
+        const id = std.mem.readInt(u16, frame[0..2], .big);
+        try testing.expectError(error.MalformedResponse, r.decodeResponse(frame, id, "example.com", .a));
+    }
+
+    // ⭐ Positive control, without which the two lines above stay green against
+    // a `decodeResponse` that refuses everything and against a fixture that has
+    // decayed into garbage: the honest capture decodes, and the off-bailiwick
+    // record it also carries is dropped one layer up rather than here.
+    const honest_id = std.mem.readInt(u16, honest[0..2], .big);
+    var msg = try r.decodeResponse(honest, honest_id, "example.com", .a);
+    defer msg.deinit();
+    try testing.expectEqual(@as(usize, 2), msg.answers.len);
+
+    var list: std.ArrayList(netaddr.Ip) = .empty;
+    defer list.deinit(testing.allocator);
+    try collectAddresses(testing.allocator, &list, &msg, "example.com");
+    try testing.expectEqual(@as(usize, 1), list.items.len);
+    try testing.expect(list.items[0].eql(netaddr.parseIp("192.0.2.1").?)); // never 203.0.113.66
+}
+
 test "collectAddresses: only the queried owner and its CNAME chain count (bailiwick)" {
     // A reply to `example.com A` whose answer section carries an A record
     // for `victim.test`: `lookupIp` used to return that address. With a
@@ -1218,13 +1279,13 @@ const UdpStub = struct {
     const Script = enum {
         /// Question echoed correctly; answer = victim.test A 203.0.113.66 + example.com A 192.0.2.1.
         off_bailiwick_plus_honest,
-        /// Question section says attacker.example TXT; answer = example.com A 192.0.2.1.
-        wrong_question,
-        /// No question section; answer = example.com A 192.0.2.1.
-        no_question,
         /// Header only with the TC bit set: the resolver must go to TCP.
         truncated,
     };
+    // The two lying-question scripts this stub also used to carry
+    // (`wrong_question`, `no_question`) moved to
+    // `modules/dns/tools/interop.zig` with the test that drove them; their
+    // frames are replayed hermetically from `src/testdata/` instead.
 
     fn run(st: *UdpStub) void {
         st.serveOne() catch |err| std.debug.print("UdpStub: {t}\n", .{err});
@@ -1241,8 +1302,6 @@ const UdpStub = struct {
         var out: [512]u8 = undefined;
         const resp = switch (st.script) {
             .off_bailiwick_plus_honest => stubResponse(&out, q, 0x8180, question_echo, a_victim ++ a_example, 2),
-            .wrong_question => stubResponse(&out, q, 0x8180, "\x08attacker\x07example\x00\x00\x10\x00\x01", "\x07example\x03com\x00" ++ a_example[2..], 1),
-            .no_question => stubResponse(&out, q, 0x8180, "", "\x07example\x03com\x00" ++ a_example[2..], 1),
             .truncated => stubResponse(&out, q, 0x8380, question_echo, "", 0),
         };
         try st.sock.send(st.io, &incoming.from, resp);
@@ -1292,23 +1351,21 @@ test "lookupIp: an answer record the question never asked about is ignored (bail
     try testing.expect(ips[0].eql(netaddr.parseIp("192.0.2.1").?)); // never 203.0.113.66
 }
 
-test "query: a reply whose question is not ours is not the answer, over loopback" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    inline for (.{ UdpStub.Script.wrong_question, UdpStub.Script.no_question }) |script| {
-        var stub = bindUdpStub(io, script) catch return error.SkipZigTest;
-        defer stub.sock.close(io);
-        var stub_fut = try io.concurrent(UdpStub.run, .{&stub});
-        defer stub_fut.await(io);
-
-        var r = try udpStubResolver(io, &stub, 1);
-        defer r.deinit();
-        try testing.expectError(error.MalformedResponse, r.query("example.com", .a));
-        try testing.expectEqual(@as(usize, 1), stub.served);
-    }
-}
+// ⭐ THE QUESTION-CHECK EXCHANGE OVER A SOCKET LIVES IN
+// `modules/dns/tools/interop.zig`, not here (audit F20, 2026-09-08).
+//
+// It used to be `test "query: a reply whose question is not ours is not the
+// answer, over loopback"` in this file. What it asserted about PARSING is now
+// the replay of that program's captures, next to the other `decodeResponse`
+// tests above — unable to fail under load, because it schedules nothing. What
+// genuinely needs a socket and a second thread stays a PROGRAM: `zig build
+// interop-dns` runs it, `zig build check-interop` compiles it, and
+// `scripts/test.sh interop` reaches it pre-release. That program's header
+// argues the placement (§9 names a foreign toolchain; a thread the gate itself
+// starves is the same class of dependency on an environment `test-dns` must not
+// require) and records why adding `dns` to the serial `live` set would not have
+// fixed the failure: it was an unsynchronised cross-thread read, not a starved
+// scheduler, and a serial lane only hides a race.
 
 /// A TCP listener that accepts the connection and never answers — the
 /// shape that held the resolver until the OS gave up (measured 45-60 s in
@@ -1381,8 +1438,17 @@ test "query: the TC-bit path into a silent TCP server is bounded too (default tr
         io.futexWake(u32, &silent.stop.raw, 1);
         tcp_fut.await(io);
     }
+    // ⛔ `udp_joined` exists so `stub.served` is read AFTER the stub thread has
+    // finished, never beside it. The sibling test that read that counter with
+    // only a `defer`-ed `await` behind it failed 10 runs in 20 under load
+    // (audit F20): the stub had sent the datagram — which is why the resolver's
+    // verdict was right — and was preempted before `served += 1` retired. This
+    // test happened to survive that only because the resolver spends its 300 ms
+    // TCP budget after the UDP reply, which is luck of timing, not
+    // synchronisation. The `defer` still covers the paths that return early.
     var udp_fut = try io.concurrent(UdpStub.run, .{&stub});
-    defer udp_fut.await(io);
+    var udp_joined = false;
+    defer if (!udp_joined) udp_fut.await(io);
 
     var r = Resolver.init(io, testing.allocator, .{
         .servers = &loopback_servers,
@@ -1396,6 +1462,8 @@ test "query: the TC-bit path into a silent TCP server is bounded too (default tr
     const start = std.Io.Clock.Timestamp.now(io, .awake);
     try testing.expectError(error.Timeout, r.query("example.com", .a));
     const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    udp_fut.await(io); // bounded: the stub's own receive deadline is 5 s
+    udp_joined = true;
     try testing.expectEqual(@as(usize, 1), stub.served); // UDP answered with TC
     try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
 }

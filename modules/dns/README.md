@@ -28,6 +28,8 @@ derivation was a bookkeeping error.
 | `src/config.zig` | `/etc/resolv.conf` + `/etc/hosts` parsing, Go-`nameList` search expansion. Pure string logic, fixture-tested. |
 | `src/Resolver.zig` | Blocking client: UDP (TC bit → TCP retry), TCP (2-byte length prefix), DoH POST/GET (`application/dns-message`), DoH-JSON (`application/dns-json`). |
 | `src/root.zig` | Vocabulary re-exports + netaddr bridges (`reverseName`, `recordIp`). |
+| `src/testdata/reply_*.bin` | Three replies captured off a real loopback socket by `tools/interop.zig`: one lying about the question, one with no question section, one honest. Replayed hermetically by `Resolver.zig`. |
+| `tools/interop.zig` | The live half of that anchor: a hostile UDP server on 127.0.0.1 answering a real `query()` from a real second thread. `zig build interop-dns` (no peer, no network); `-- --capture` re-takes the frames. Never compiled into `test-dns`. |
 
 ## Usage
 

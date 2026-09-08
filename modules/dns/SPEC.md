@@ -56,9 +56,18 @@ hosts fixtures and search-list ordering; reverse-name goldens incl. the RFC 3596
 response-correlation rule (wrong name / no question / two questions / wrong type / wrong class
 refused, case and root dot accepted); the bailiwick rule on a five-record answer with an
 out-of-order CNAME chain, a loop and an over-long chain; DoH-JSON URL encoding against parameter
-and request-line injection; and loopback stubs — a UDP server that lies about the question or
-slips in an off-bailiwick record, and a TCP server that accepts and never answers (reached both
-via `transport = .tcp` and via a TC-bit UDP reply), each bounded by `timeout_ms`.
+and request-line injection; a replay of the three replies `zig build interop-dns` captured off a
+real loopback socket (`src/testdata/reply_*.bin` — lying question, no question, honest); and
+loopback stubs — a UDP server that slips in an off-bailiwick record, and a TCP server that accepts
+and never answers (reached both via `transport = .tcp` and via a TC-bit UDP reply), each bounded by
+`timeout_ms`.
+
+The exchange that proves the question check ON A SOCKET is a separate program,
+`tools/interop.zig` (`zig build interop-dns`; compiled by `check-interop`, run by
+`scripts/test.sh interop`). It needs no peer — the hostile server is the program itself, on
+127.0.0.1 — but it needs a second thread scheduled inside a timeout, which is precisely what a
+loaded gate cannot promise: as a test in `src/` it failed 10 runs in 20 under 32-way load
+(audit F20). `-- --capture` re-takes the frames.
 
 ⚠ The 7 `live:` tests (UDP, TCP, DoH POST/GET, DoH-JSON, PTR of 8.8.8.8, lookupIp) **query
 public resolvers when the network is up** — they skip via `error.SkipZigTest` only when it is not.

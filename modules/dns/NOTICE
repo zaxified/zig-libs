@@ -29,4 +29,11 @@ stock RFC 1035 query — protocol structure (dictated by the RFC) plus facts
 (IP addresses, TTLs, already-published hostnames), not copyrightable
 expression. No root NOTICE change accompanies this addition.
 
+`modules/dns/src/testdata/reply_*.bin` (added 2026-09-08) are three DNS
+replies produced by this repository's own tooling: `modules/dns/tools/
+interop.zig` serves them to this module's own resolver over a loopback UDP
+socket and commits the exact bytes that travelled. Nothing was captured from
+a third party and no external server was contacted; attribution: NONE
+required.
+
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.

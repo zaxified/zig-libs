@@ -889,6 +889,21 @@ that reaches it can notice.
   There is deliberately no spelling that approves one, and the line expires by itself: the gate
   fails on a declaration whose file has stopped spawning, so the migration that fixes the module
   also deletes the line. `modules/opcua` is the only module carrying it today.
+- **A foreign toolchain is the commonest reason to be in `tools/`, not the only one**
+  (added 2026-09-08, with `dns` as the measured precedent). What the bullet above actually
+  separates is an instrument that needs an ENVIRONMENT `test-<name>` must not require, from
+  one that is pure Zig over bytes — and a second thread that has to be scheduled inside a
+  timeout is such an environment, because the gate itself is what takes it away.
+  `modules/dns/tools/interop.zig` needs no peer at all: it is a hostile UDP server on
+  127.0.0.1, and it lives there because the test that used to do the same thing inside
+  `src/` failed 10 runs in 20 under 32 busy loops on 8 cores. That is mechanically fine —
+  `check-interop` compiles every such program with no peer present and `interop-<name>` runs
+  it — but the step's own description says "against a real foreign peer", so a program with
+  no peer says so in its header. The frames it captures are replayed by the module's own
+  tests, exactly as for a foreign anchor: the VALUE runs in the lane that runs everywhere,
+  the TAKING is a pre-release step.
+  ⚠ This is not a licence to move a flaky test out of reach. It applies when the hermetic
+  half — the thing that would have caught the defect — actually stays behind in `src/`.
 - **An instrument that serves SEVERAL modules lives in `scripts/`** — or in a `tools/`
   directory beside it, if one is ever created for instruments that are not shell entry
   points. `scripts/` is already the documented home for repo-wide checks, and

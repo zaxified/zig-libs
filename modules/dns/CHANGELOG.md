@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** the question-check anchor is split into a
+  hermetic half and a live one (audit F20). `test "query: a reply whose question is not ours is
+  not the answer, over loopback"` bound a UDP socket, spawned a stub on a second thread and then
+  read that stub's `served` counter — from the test thread, while the stub was still runnable,
+  because the joining `await` was a `defer`. It failed twice in the wild, always as
+  `expected 1, found 0`, and reproduced here at **10 failures in 20 runs** on 8 cores under 32 busy
+  loops. ⭐ The resolver was right every time: `found 0` on the counter means the datagram HAD been
+  received and rejected, so what failed was the measurement, not `dns`. What the test asserted about
+  parsing is now the test "decodeResponse: the replies interop-dns captured off a real socket",
+  replaying `src/testdata/reply_wrong_question.bin`, `reply_no_question.bin` and — as the positive
+  control — `reply_honest.bin`; it schedules nothing and passed 30 of 30 under the same load, as did
+  the whole 70-test suite 10 of 10. What genuinely needs a socket is now the program
+  `tools/interop.zig` (`zig build interop-dns`, no peer and no network; `-- --capture` re-takes the
+  frames), compiled by `check-interop` and run by `scripts/test.sh interop`. The same
+  read-before-join was fixed in the surviving TC-bit test, which had only ever been saved by the
+  300 ms the resolver spends in the TCP path afterwards. `dns` was deliberately NOT added to the
+  serial `live` set: an unsynchronised cross-thread read is not a scheduling accident, so serialising
+  the module's other 69 tests would have bought a quieter race rather than a fixed one.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
   `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
   helper existed **33 times across 12 modules in three shapes**, each carrying its
