@@ -1,4 +1,20 @@
 // SPDX-License-Identifier: MIT
+//
+// PORTED FILE — Revised BSD notice, retained per clause 1.
+//
+// The node-relationship functions below are a line-for-line port of the Python
+// listing RFC 9420 publishes in Appendix C. The IETF Trust licenses the code
+// inside its documents as "Code Components" under the Revised BSD License
+// (BCP 78 / Trust Legal Provisions 5.0 §4.c), so its notice travels with this
+// source file:
+//
+//   Copyright (c) 2023 IETF Trust and the persons identified as the authors
+//   of RFC 9420. All rights reserved.
+//
+// The three conditions and the full warranty disclaimer are reproduced in
+// `modules/mls/NOTICE`, item 2, which ships with this module. The condition is
+// "keep the notice" and nothing else; this file and this collection remain MIT.
+//
 //! mls.treemath — MLS's array-based binary tree math (RFC 9420 Appendix
 //! C): the pure-integer-arithmetic node relationships (`left`/`right`/
 //! `parent`/`sibling`, `root`, `direct_path`, `copath`, `is_leaf`,

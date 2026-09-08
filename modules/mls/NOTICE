@@ -36,13 +36,63 @@ Provenance
    (not merely a description implemented independently — the RFC's own
    text frames this as runnable reference code, and this module
    translates it line-for-line into Zig, preserving the same variable
-   names/structure where Zig syntax allows). Still public-specification
-   text under the same merger-doctrine reasoning as item 1 (an RFC's
-   own algorithm listing is part of the specification, not a separate
-   third-party implementation), but called out explicitly here because
-   the relationship is "port", not "clean-room from prose" — matching
-   the standard this repo's `CONVENTIONS.md` §5 sets for when a design
-   reference (even a public-spec one) is worth naming precisely.
+   names/structure where Zig syntax allows).
+
+   ⭐ THIS ENTRY NO LONGER RESTS ON THE MERGER DOCTRINE, changed
+   2026-09-08. It used to: item 1's reasoning ("an RFC's own algorithm
+   listing is part of the specification") was carried over to the port,
+   and that is the weakest place to run it — the argument is thinnest
+   exactly where a line-for-line translation is admitted, and there is a
+   WRITTEN GRANT available that costs nothing to accept. The IETF Trust
+   claims copyright in the code inside its documents and licenses it:
+   the Trust Legal Provisions (BCP 78) define "Code Components" — the
+   list includes classical programming code, and Appendix C is a Python
+   listing introduced as "The following python code demonstrates the
+   tree computations" — and TLP 5.0 §4.c grants them under the Revised
+   BSD License. So the author of the licence disagrees with the merger
+   reading, and the repository now takes the conservative side here.
+   This also settles a disagreement inside the repository itself:
+   `modules/ctap2pin/NOTICE` already cites RFC 5869/5903/4231 code
+   "under the Simplified BSD terms of the Trust Legal Provisions".
+
+   Reproduced as the Revised BSD License requires:
+
+     Copyright (c) 2023 IETF Trust and the persons identified as the
+     authors of RFC 9420. All rights reserved.
+
+     Redistribution and use in source and binary forms, with or without
+     modification, are permitted provided that the following conditions
+     are met:
+
+     1. Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+
+     2. Redistributions in binary form must reproduce the above
+        copyright notice, this list of conditions and the following
+        disclaimer in the documentation and/or other materials provided
+        with the distribution.
+
+     3. Neither the name of Internet Society, IETF or IETF Trust, nor
+        the names of specific contributors, may be used to endorse or
+        promote products derived from this software without specific
+        prior written permission.
+
+     THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+     "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+     LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+     FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+     COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+     INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+     (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+     SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+     HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+     STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+     OF THE POSSIBILITY OF SUCH DAMAGE.
+
+   The condition this adds is "keep the notice" and nothing else. It is
+   permissive, imposes no restriction on how this collection is used,
+   and does not change the library's own MIT terms.
 
 IETF Trust grant — verified 2026-09-06
 --------------------------------------

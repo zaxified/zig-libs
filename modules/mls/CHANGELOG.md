@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — `treemath.zig`'s port of RFC 9420 Appendix C now carries the IETF
+  Trust's own copyright notice instead of resting on the merger doctrine. The file has always
+  said openly that it translates the RFC's Python listing line for line; what changed is what
+  that rests on. The IETF Trust claims copyright in the code inside its documents and grants
+  it under the Revised BSD License (BCP 78 / TLP 5.0 §4.c defines "Code Components", and
+  Appendix C is introduced as "The following python code demonstrates the tree
+  computations") — so the author of the licence disagrees with the merger reading, and the
+  weakest place to run that reading is an admitted line-for-line port. `modules/mls/NOTICE`
+  item 2 reproduces the three conditions and the disclaimer; the source file carries the
+  copyright line, as clause 1 asks. The condition is "keep the notice" and nothing else: no
+  restriction on use, and the collection stays MIT. This also removes a disagreement inside
+  the repository — `modules/ctap2pin/NOTICE` already cited RFC code under the same Trust
+  terms.
+
 - **2026-09-08** — `fuzzMessageInput`'s header stamp had never executed, for a third
   independent reason. The knob is drawn AFTER the byte draw, `Smith.slice` leaves the seed
   exhausted, and an exhausted `value(u8)` is the weight minimum — measured **0 of 14 seeds**
