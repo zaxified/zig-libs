@@ -1640,6 +1640,39 @@ cmd_checks() {
 # is `zig build interop-<m> -- --capture`, which a human runs after reading the
 # mismatch. So this leaves a clean tree and goes red on divergence -- a lane
 # that silently rewrote its own anchor would be a lane that can never fail.
+cmd_ctgrind() {
+    # PRE-RELEASE ONLY. Runs the constant-time measurement itself -- the thing
+    # `zig build check-ctgrind` deliberately does NOT do.
+    #
+    # ⛔ WHY THIS LANE EXISTS. Until 2026-09-08 nothing in any lane ran
+    # `scripts/ctgrind.sh --check`. `check-ctgrind` in build.zig compiles the
+    # harnesses as a rot guard and says so ("leaving the measurement itself out
+    # of the critical path"), which is right for a gate that must pass on a host
+    # with no valgrind -- but it left 20 pinned constant-time claims across 8
+    # crypto modules verified by NOTHING. A compile is not a measurement: a
+    # harness can build perfectly and report a leak, and for a week nobody would
+    # know. Audit finding R14 item 1.
+    #
+    # Tag/dispatch only, like `interop`, for the same reason: it needs a peer
+    # (valgrind) that `scripts/ci-environment.sh ctgrind` installs, and it costs
+    # minutes rather than seconds -- measured 310 s warm for all 8 modules and
+    # all 20 rows on an i7-7920HQ.
+    #
+    # ⚠ Missing valgrind FAILS here, it does not skip. `ctgrind.sh` exits 2 with
+    # its own message; a lane whose only purpose is the measurement must not
+    # report green for not having taken it.
+    set_extra_args "$@"
+    echo "ctgrind: taking the constant-time measurement for every module with a harness."
+    echo "  ⚠ needs valgrind (scripts/ci-environment.sh ctgrind); this is NOT check-ctgrind,"
+    echo "    which only compiles the harnesses and runs no measurement at all."
+    # ⚠ `ZL_STEP_STDERR_IS_OUTPUT`: the control table is the point of the run and
+    # `ctgrind.sh` narrates its builds on stderr, so the ordinary rule (exit 0
+    # with anything on stderr is a failure) would reject a green measurement.
+    # Exit status still decides -- and `--check` exits 1 on any failed row.
+    ZL_STEP_STDERR_IS_OUTPUT=1 step "ctgrind" scripts/ctgrind.sh --check
+    summary
+}
+
 cmd_interop() {
     set_extra_args "$@"
     capability_check
@@ -1949,6 +1982,19 @@ Usage: scripts/test.sh [subcommand] [args]
                         can find that something new we send provokes a
                         different reaction, or that the peer moved. Needs
                         `scripts/ci-environment.sh interop`.
+  ctgrind               PRE-RELEASE ONLY — take the constant-time measurement.
+                        Runs `scripts/ctgrind.sh --check`: every committed
+                        `modules/<m>/src/ctgrind_harness.zig` under
+                        `valgrind --tool=memcheck`, compared against the 20
+                        pinned rows of scripts/ctgrind-expected.tsv. This is
+                        NOT `zig build check-ctgrind`, which only COMPILES the
+                        harnesses as a rot guard and takes no measurement — a
+                        harness can build perfectly and report a leak. Until
+                        2026-09-08 no lane ran this at all, so those 20 claims
+                        were verified by nothing. Needs
+                        `scripts/ci-environment.sh ctgrind` (valgrind), and
+                        FAILS rather than skips without it. 310 s warm for all
+                        8 modules.
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.
@@ -1996,6 +2042,7 @@ main() {
         modules) cmd_modules "${rest[@]:-}" ;;
         examples) cmd_examples "${rest[@]:-}" ;;
         interop) cmd_interop "${rest[@]:-}" ;;
+        ctgrind) cmd_ctgrind "${rest[@]:-}" ;;
         time) cmd_time "${rest[@]:-}" ;;
         vm) cmd_vm "${rest[@]:-}" ;;
         -h|--help|help) usage ;;

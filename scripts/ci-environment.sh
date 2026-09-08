@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Close the environment gaps `scripts/test.sh` reports, on a hosted runner.
 #
-# Usage: scripts/ci-environment.sh [tests|interop|all]     (default: tests)
+# Usage: scripts/ci-environment.sh [tests|interop|ctgrind|all]   (default: tests)
 #
 # ⭐ TWO ROLES SINCE 2026-09-06, AND THE SPLIT IS THE POINT OF THIS HEADER.
 # Until that day one list served every lane, and it was written when every one
@@ -64,9 +64,9 @@ set -u
 
 ROLE="${1:-tests}"
 case "$ROLE" in
-    tests | interop | all) ;;
+    tests | interop | ctgrind | all) ;;
     *)
-        echo "ci-environment.sh: unknown role '$ROLE' (want tests, interop or all)" >&2
+        echo "ci-environment.sh: unknown role '$ROLE' (want tests, interop, ctgrind or all)" >&2
         exit 1
         ;;
 esac
@@ -216,5 +216,21 @@ PY
 python3 -m venv "$HOME/.cache/zig-libs-grpc" >/dev/null 2>&1 || true
 "$HOME/.cache/zig-libs-grpc/bin/pip" -q install grpcio protobuf >/dev/null 2>&1 \
     && echo "grpc venv: OK" || echo "grpc venv: install failed"
+echo "::endgroup::"
+fi
+
+if want ctgrind; then
+echo "::group::valgrind"
+# The ONLY thing the ctgrind lane needs, and the lane is red without it rather
+# than green-and-empty: `scripts/ctgrind.sh` exits 2 when valgrind is not on
+# PATH ("install it or run this on a host that has it — no auto-install"), so a
+# failed install here cannot be mistaken for a passing measurement.
+#
+# ⚠ No `|| true`. For the `tests` role a failed install costs a SKIP and the
+# capability report names it; here the lane's entire purpose is the run, so a
+# silent partial install would be the "gate that scans nothing" shape again.
+sudo apt-get update -qq
+sudo apt-get install "${APT_QUIET[@]}" valgrind
+valgrind --version
 echo "::endgroup::"
 fi

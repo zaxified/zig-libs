@@ -1399,9 +1399,29 @@ pub fn build(b: *std.Build) void {
         }
 
         // The rot guard compiles at Debug (fastest) with `-fvalgrind` forced
-        // on, so the guard builds the same configuration the real run uses --
-        // a harness that compiles only with the switch off would otherwise
-        // pass the guard and fail the moment anyone ran it.
+        // on. The switch matches what the real run uses -- a harness that
+        // compiles only with the switch off would otherwise pass the guard and
+        // fail the moment anyone ran it.
+        //
+        // ⚠ THE MODE DOES NOT MATCH, and since 2026-09-08 it cannot: nothing is
+        // measured in Debug any more (ctgrind-expected.tsv is 18 ReleaseFast +
+        // 2 ReleaseSafe, 0 Debug) because valgrind cannot read the
+        // `.debug_line` Zig's self-hosted backend emits, and that backend is
+        // the default for Debug alone. See `scripts/ctgrind.sh` § MODES. Debug
+        // stays here because this guard is a COMPILE and Debug is the cheapest
+        // mode to compile in; Zig's semantic analysis is mode-independent
+        // except for explicit comptime branches on `builtin.mode`, and no
+        // harness has one (checked 2026-09-08). What compiles the harnesses in
+        // the modes they are actually measured in is the `ctgrind` lane, which
+        // builds them as part of taking the measurement.
+        //
+        // ⛔ AND THIS GUARD IS NOT THE MEASUREMENT, which is the whole of audit
+        // finding R14 item 1. It compiles; it asserts nothing about a single
+        // context count. A harness can build perfectly and report a leak. Until
+        // 2026-09-08 no lane ran `scripts/ctgrind.sh --check` at all, so the 20
+        // pinned rows were verified by nothing; `scripts/test.sh ctgrind` and
+        // the CI lane of the same name exist to close that, and this step stays
+        // exactly what it always was -- a rot guard that needs no valgrind.
         //
         // It is NOT what makes the taint calls visible to the guard, and the
         // tempting version of this comment ("the client-request bodies are

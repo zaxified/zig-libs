@@ -540,6 +540,30 @@ jobs:
           # reasoning `skip_live` uses for opcua's emulated container.
           lanes+=('{"name":"interop ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"interop","cachekey":"interop","cache":false,"runner":"ubuntu-26.04","peers":"interop","tc":false,"timeout":30,"skip_live":""}')
 
+          # ⭐ THE CONSTANT-TIME MEASUREMENT, added 2026-09-08 (audit R14/1).
+          # `check-ctgrind` in the `checks` lane only COMPILES the harnesses --
+          # it says so, and that is right for a lane that must pass on a host
+          # with no valgrind. But it meant nothing in this workflow ever ran
+          # `scripts/ctgrind.sh --check`, so 20 pinned constant-time rows across
+          # 8 crypto modules were verified by nothing at all. A harness can
+          # build perfectly and report a leak.
+          #
+          # ⚠ NO `args`, and that is deliberate: the optimize mode of each row
+          # is the CLAIM, fixed per (module, target) in ctgrind.sh's MODES
+          # table (18 rows ReleaseFast, 2 ReleaseSafe). A lane passing
+          # `-Doptimize=` would silently move the measurement off the mode the
+          # SPEC states it in.
+          #
+          # ⚠ amd64 ONLY, like interop: every row's pattern and count was taken
+          # on x86_64, and `k256`/`montint` measure inline asm cores that exist
+          # only there. An arm64 row would need its own pins, not a re-run.
+          #
+          # `cache:false` and `timeout:30` follow interop: it builds 8 harnesses
+          # in two modes with and without `-fvalgrind`, then runs 60 memcheck
+          # processes. Measured 310 s warm for the full check on an i7-7920HQ;
+          # 30 minutes is the "this is stuck" line, not the expected cost.
+          lanes+=('{"name":"ctgrind amd64","args":"","cmd":"ctgrind","cachekey":"ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":30,"skip_live":""}')
+
           sel=$(printf '%s\n' "${lanes[@]}" | jq -s -c --arg want "$WANT" \
             '[ .[] | select($want == "all" or .name == $want) ]')
           n=$(printf '%s' "$sel" | jq 'length')

@@ -277,7 +277,11 @@ if [[ "$DO_UPDATE_DIGESTS" == "1" ]]; then
     exit 0
 fi
 
-if [[ ${#MODULES[@]} -eq 0 ]]; then MODULES=("${ALL_MODULES[@]}"); fi
+# Whether a SUBSET was named on the command line. `--check` needs the
+# distinction: an expected row with no measurement is legitimate when the caller
+# asked for other modules, and is a FAILURE otherwise -- see the accounting loop.
+SUBSET_REQUESTED=0
+if [[ ${#MODULES[@]} -eq 0 ]]; then MODULES=("${ALL_MODULES[@]}"); else SUBSET_REQUESTED=1; fi
 # ALL_MODULES is derived from the tree now, so a harness added without a recipe
 # here shows up on its own -- and would otherwise be "measured" with no targets,
 # i.e. silently not measured at all. Both the named and the default (= every
@@ -569,7 +573,24 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc eout; do
     line=$(awk -F'\t' -v m="$em" -v mo="$emode" -v t="$etarget" \
         '$1==m && $2==mo && $3=="true" && $4=="yes" && $5==t { print }' "$ACTUAL")
     if [[ -z "$line" ]]; then
-        # Not measured in this invocation (a module subset was requested).
+        # ⛔ AN EXPECTED ROW THAT WAS NOT MEASURED IS A FAILURE, unless the
+        # caller asked for other modules. Until 2026-09-08 this was an
+        # unconditional `continue`, and the hole it left is the one this whole
+        # gate exists to close: `ALL_MODULES` is derived from the tree
+        # (`module-graph` column 5, whose source is the harness file existing),
+        # so DELETING or renaming `modules/<m>/src/ctgrind_harness.zig` drops
+        # the module out of the run, every one of its expected rows is skipped,
+        # and `--check` prints OK. Measured by hiding `ecvrf`'s harness: 7
+        # modules measured instead of 8, `ecvrf` absent from the table, exit 0.
+        # A module's constant-time claim stopped being verified and nothing
+        # said so — the same shape as a gate that scans nothing and passes.
+        local_wanted=0
+        for _wm in "${MODULES[@]}"; do [[ "$_wm" == "$em" ]] && local_wanted=1; done
+        if [[ $SUBSET_REQUESTED -eq 1 && $local_wanted -eq 0 ]]; then
+            continue
+        fi
+        echo "FAIL $em/$emode/$etarget: this row is pinned in ctgrind-expected.tsv but was NEVER MEASURED. Either modules/$em/src/ctgrind_harness.zig is gone (so module-graph no longer reports the module) or ctgrind.sh has no TARGETS/MODES entry for this row. A pinned claim nobody measures is worse than no claim: remove the row on purpose, or restore the harness." >&2
+        fail=1
         continue
     fi
     IFS=$'\t' read -r _ _ _ _ _ total in_file _ _ _ _ rowlog _ <<<"$line"

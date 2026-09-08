@@ -350,6 +350,29 @@ printer as a propagation witness.
 Needs `valgrind` on PATH. Not part of `zig build test`: a memcheck context
 count is valgrind's own verdict, not something a Zig test can assert on.
 
+**⭐ Who runs it: `scripts/test.sh ctgrind`, and the CI lane of the same name.**
+Tag/dispatch only, like `interop`, and it needs
+`scripts/ci-environment.sh ctgrind` to install valgrind. It FAILS rather than
+skips without it — a lane whose only purpose is the measurement must not report
+green for not having taken it. Measured 310 s warm for all 8 modules and all 20
+rows.
+
+⛔ **`zig build check-ctgrind` is NOT this.** It compiles every harness as a rot
+guard and takes no measurement, deliberately, so that `zig build test` passes on
+a host with no valgrind. That is right — but until 2026-09-08 it was the *only*
+ctgrind thing in any lane, so 20 pinned constant-time rows across 8 crypto
+modules were verified by nothing at all. A harness can build perfectly and
+report a leak, and nobody would have known. Audit finding R14 item 1.
+
+⚠ **An expected row that was not measured now FAILS a full `--check`.** It used
+to be skipped unconditionally, which was correct for a named subset
+(`ctgrind.sh chachapoly --check`) and a hole everywhere else: the module list is
+derived from the tree, so deleting or renaming
+`modules/<m>/src/ctgrind_harness.zig` dropped the module out of the run and
+every one of its pinned rows with it, and `--check` printed OK. Measured by
+hiding `ecvrf`'s harness — 7 modules instead of 8, `ecvrf` absent from the
+table, exit 0. A pinned claim nobody measures is worse than no claim.
+
 **⛔ Nothing measured under valgrind may be a Debug build — this is a repo-wide
 rule, not a ctgrind detail.** Zig 0.16 compiles Debug with the self-hosted
 x86_64 backend (Debug is the only optimize mode where that backend is the
