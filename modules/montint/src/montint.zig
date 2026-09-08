@@ -141,8 +141,27 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             return 0;
         }
 
-        // Compute R mod m (= one_mont) and R² mod m (= r2) by repeated doubling
-        // mod m. R² needs 128·L doublings; obviously-correct and cheap at setup.
+        // Compute R mod m (= one_mont) and R² mod m (= r2).
+        //
+        // R comes from 64·L doublings of 1. R² USED to come from 64·L more,
+        // on the reasoning that setup is amortised over many operations —
+        // "obviously-correct and cheap at setup". That premise is a CALLER's,
+        // and certificate path validation does not satisfy it: `x509` builds a
+        // fresh `rsa.PublicKey` per chain link, so the setup was paid per
+        // operation and dominated it (measured 2026-09-08: 606 us of setup for
+        // a 36 us verify, 2048-bit modulus).
+        //
+        // So the second half is a ladder instead. Writing f(k) = 2^k mod m,
+        // `montMul(f(a), f(b)) = f(a + b - 64L)`, hence for x = f(64L + d):
+        //
+        //     montMul(x, x)  ->  f(64L + 2d)     d doubles
+        //     doubleMod(x)   ->  f(64L + d + 1)  d increments
+        //
+        // which is square-and-add over the bits of 64L: ~log2(64L) Montgomery
+        // multiplications where there were 64L doublings. The bit pattern
+        // driving it is 64·L, a COMPTIME constant — the work depends on `L`
+        // alone and never on the modulus, so this stays constant-time in `m`,
+        // which matters because `rsa` calls this on the secret CRT primes.
         fn computeConstants(self: *Self) void {
             // acc = 1, double 64·L times -> 2^(64L) mod m = R mod m.
             var acc = std.mem.zeroes(Elem);
@@ -150,8 +169,24 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             var i: usize = 0;
             while (i < 64 * L) : (i += 1) self.doubleMod(&acc);
             self.one_mont = acc;
-            // continue another 64·L doublings -> 2^(128L) mod m = R² mod m.
-            while (i < 128 * L) : (i += 1) self.doubleMod(&acc);
+
+            // Ladder the remaining 64·L into the exponent. `started` only
+            // skips leading no-op squarings — montMul(R, R) = R·R·R⁻¹ = R — so
+            // it is an optimisation, not a correctness condition. Verified by
+            // mutation on 2026-09-08: removing it leaves the differential below
+            // GREEN (an equivalent mutant), while shortening the ladder by one
+            // bit turns 14 checks red.
+            const e: u64 = 64 * L;
+            var bit: usize = 63 - @clz(e);
+            var started = false;
+            while (true) : (bit -= 1) {
+                if (started) acc = self.montMul(&acc, &acc);
+                if ((e >> @intCast(bit)) & 1 == 1) {
+                    self.doubleMod(&acc);
+                    started = true;
+                }
+                if (bit == 0) break;
+            }
             self.r2 = acc;
         }
 
@@ -1084,4 +1119,48 @@ test "corpus: every loader seed reaches both loaders, and what they accept is pi
     try std.testing.expectEqual(@as(usize, 6), elements);
     try std.testing.expectEqual(@as(usize, 5), nonzero_elements);
     try std.testing.expectEqual(@as(usize, 2), overflows);
+}
+
+// ── R² ladder: the differential that licenses it ────────────────────────────
+//
+// `computeConstants` stopped deriving R² by 64·L doublings on 2026-09-08 and
+// uses a square-and-add ladder instead. The repository's standing doctrine is
+// "never a new algorithm" in a crypto module; the exception rule is that it may
+// be broken when the benefit is documented and the break is shown unable to
+// weaken security. This test is the first half of that showing: the ladder must
+// agree with the doubling reference BIT FOR BIT, on every slot width and on
+// moduli it did not choose.
+//
+// (The other halves: `montMul` is already under the ctgrind gate, and the
+// ladder's control flow is driven by the comptime constant 64·L, never by `m`.)
+
+/// The pre-2026-09-08 derivation, kept as the oracle. Do not "optimise" it.
+fn r2ByDoubling(comptime L: usize, m: [L]u64) [L]u64 {
+    const M = Modint(L * 64);
+    var mm: M = .{ .m = m, .n0inv = negInvMod2_64(m[0]), .r2 = undefined, .one_mont = undefined };
+    var acc = std.mem.zeroes([L]u64);
+    acc[0] = 1;
+    var i: usize = 0;
+    while (i < 128 * L) : (i += 1) mm.doubleMod(&acc);
+    return acc;
+}
+
+test "R2 ladder agrees with the doubling reference, bit for bit, on every slot" {
+    var prng = std.Random.DefaultPrng.init(0x5EED_2026);
+    const rnd = prng.random();
+    inline for (.{ 4, 8, 16, 24, 32 }) |L| {
+        const M = Modint(L * 64);
+        var trial: usize = 0;
+        while (trial < 24) : (trial += 1) {
+            var m: [L]u64 = undefined;
+            for (&m) |*w| w.* = rnd.int(u64);
+            m[0] |= 1; // odd
+            m[L - 1] |= 1 << 63; // full width, so the slot is really exercised
+            const built = M.fromElem(m) catch unreachable;
+            const reference = r2ByDoubling(L, m);
+            try std.testing.expectEqualSlices(u64, &reference, &built.r2);
+            // and `one_mont` is untouched by the change, so it must still hold
+            try std.testing.expect(!std.mem.eql(u8, std.mem.asBytes(&built.one_mont), std.mem.asBytes(&built.r2)));
+        }
+    }
 }

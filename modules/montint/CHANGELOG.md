@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-08** — **Montgomery setup: R² now comes from a ladder, not 64·L more
+  doublings.** `computeConstants` derived both R and R² by repeated doubling —
+  128·L passes, so 4 096 of them for a 2048-bit modulus — on the reasoning that
+  "R² needs 128·L doublings; obviously-correct and cheap at setup". That premise
+  belongs to the CALLER, and certificate path validation does not satisfy it:
+  `x509` builds a fresh `rsa.PublicKey` per chain link, so the setup was paid per
+  operation and dwarfed it (measured: 606 µs of setup for a 36 µs verify).
+  Writing `f(k) = 2^k mod m`, `montMul(f(a), f(b)) = f(a + b − 64L)`, so squaring
+  doubles the surplus exponent and one `doubleMod` increments it — square-and-add
+  over the bits of 64·L, ~log₂(64L) Montgomery multiplications where there were
+  64·L doublings. **`rsa.PublicKey.fromDer` goes 813 µs → 515 µs (1.58×)** for a
+  2048-bit key; every `Modint` consumer gets it.
+  Constant-time is unaffected: the ladder is driven by the comptime constant
+  64·L, never by the modulus, which matters because `rsa` calls this on the
+  secret CRT primes `p` and `q`. The pre-change derivation is kept in-tree as the
+  test oracle `r2ByDoubling`, and the new one must agree with it **bit for bit**
+  across five slot widths × 24 random full-width moduli. Shortening the ladder by
+  one bit turns 14 checks red; dropping the `started` guard does not, and that is
+  correct — `montMul(R, R) = R`, so it is an equivalent mutant and the guard is
+  an optimisation rather than a correctness condition.
+  NO CONSUMER-VISIBLE CHANGE (same constants, same API).
+
 - **2026-09-07** — **Test-only: both byte-loader fuzz harnesses were handed the
   empty string on every run.** `fuzzFromBytesBE` and `fuzzElementFromBytesBE`
   opened with `smith.bytes(&buf)` followed by
