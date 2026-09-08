@@ -16,10 +16,9 @@ projects import zig-libs.
 0. POLICY — what each relationship to third-party work requires
 ====================================================================
 
-A public specification or RFC is not itself a copyrightable work (merger
-doctrine: a protocol/format it describes has essentially one correct
-expression, and facts/ideas are not protected) — implementing one, however
-closely, is not "derived from" anyone's code. Accordingly:
+What creates an obligation is third-party source or third-party data travelling
+with this code — not the act of implementing a published specification from its
+prose. Accordingly:
 
   - A module that is pure clean-room-from-a-public-spec/RFC, with NO
     third-party source code ported and NO third-party implementation studied as
