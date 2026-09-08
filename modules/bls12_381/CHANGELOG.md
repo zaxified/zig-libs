@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — `NOTICE` becomes a third-party attribution instead of a provenance note,
+  for the 807 177-byte `data/trusted_setup.txt` and the KZG vectors reproduced from
+  `ethereum/c-kzg-4844` (Apache-2.0). The existing argument that ceremony output is
+  public-domain data is not withdrawn and may well be right — but the file arrives from an
+  Apache-2.0 repository whose LICENSE is what a recipient finds, and one copy of a permissive
+  licence is cheaper than the argument. Apache-2.0 reproduced in full per §4(a); §4(b) records
+  that the setup file is byte-identical to upstream and unmodified.
+
 - **2026-08-18** — Portability fix (`check-portable`), three sites:
   - `computeRootsOfUnity`'s `std.debug.assert(order <= (@as(usize, 1) << 32))` failed to
     compile on a 32-bit target: the `32` shift doesn't fit `Log2Int(usize)` (`u5`) there.

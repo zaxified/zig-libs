@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — `NOTICE` becomes a third-party attribution instead of a provenance note.
+  `src/kat_vectors.zig` reproduces eleven Apache-2.0 fixture files from
+  `mattrglobal/pairing_crypto` verbatim, and the old file argued they were "data, not source
+  code subject to a nontrivial license obligation beyond attribution" — attribution IS the
+  obligation. Sharper than "numbers": six entries carry the upstream suite's own English case
+  names ("valid multi-message signature, multiple messages revealed proof"), which are
+  authored prose, not a fact with one correct expression. Apache-2.0 is now reproduced in
+  full per §4(a), with a §4(b) statement of what changed (JSON values to Zig declarations).
+  §4(d) does not fire: the upstream ships no NOTICE.
+
 - **2026-09-07** — Test-only, no production change: all three fuzz targets were
   replaying a single input. `fuzzProofFromBytes` opened `smith.bytes(&buf)` and then
   drew its length with `smith.valueRangeAtMost(u32, 0, 352)`; a ranged `Smith` draw

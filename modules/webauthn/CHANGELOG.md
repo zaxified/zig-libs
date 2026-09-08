@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — The module has a `NOTICE` for the first time, and it carries a condition.
+  `src/vectors.zig` reproduces W3C WebAuthn Level 3 §16's test vectors verbatim — the same
+  rights holder `modules/tracecontext` already carries a full attribution for, while this
+  module had nothing. ⚠ It is a DIFFERENT W3C licence: tracecontext's vectors come from the
+  `w3c/trace-context` test suite, whose own LICENSE.md puts tests under the W3C 3-clause BSD
+  and Reports under the W3C Software and Document License. These vectors are read out of the
+  specification document, which is a Report — so the Software and Document License is what
+  applies, and its notice is retained here.
+
 - **2026-09-07** — **All four fuzz harnesses ran one fixed input for their whole
   lives, and one of them never reached its own oracle.**
 

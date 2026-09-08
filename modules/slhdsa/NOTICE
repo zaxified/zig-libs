@@ -1,0 +1,55 @@
+slhdsa — provenance note
+========================
+
+This file carries NO condition. It exists because the module reproduces
+third-party test data verbatim and the repository's rule (root `NOTICE` §0) is
+that reproduced data is recorded where it lives — even when, as here, the
+record turns out to owe nothing.
+
+Until 2026-09-09 this module had no NOTICE at all, while `src/kat_vectors.zig`
+carried NIST's vectors for all twelve SLH-DSA parameter sets. The provenance
+was written in that file's own doc comment, which is the right place for it,
+but a reader asking "what does this module owe?" had nothing to open.
+
+Test vectors
+------------
+
+`src/kat_vectors.zig` reproduces the official NIST ACVP known-answer vectors
+for FIPS 205 (SLH-DSA), retrieved 2026-07-11 from
+`github.com/usnistgov/ACVP-Server`:
+
+  - `gen-val/json-files/SLH-DSA-keyGen-FIPS205/internalProjection.json`
+  - `gen-val/json-files/SLH-DSA-sigGen-FIPS205/internalProjection.json`
+
+The hex is copied verbatim (lowercased) out of that JSON; each entry's own
+doc comment names its exact `tgId`/`tcId`, so any value here can be traced to
+one upstream case. Per parameter set: one keyGen case and one sigGen case
+(internal interface, deterministic); SLH-DSA-SHA2-128f additionally carries a
+pure external deterministic case with a 110-byte context and a hedged internal
+case.
+
+Licence position
+----------------
+
+These are the validation vectors of a U.S. federal standard, produced and
+published by NIST — a work of the United States Government, not subject to
+copyright protection in the United States (17 U.S.C. §105). This repository
+already takes that position for NIST material elsewhere:
+`modules/ctap2pin/NOTICE` records NIST SP 800-38A's appendix vectors as "a
+U.S. Government work, public domain".
+
+⚠ Stated rather than assumed silently: the ACVP-Server repository's own
+top-level licence file was NOT re-fetched for this pass, so this rests on the
+authorship of the material rather than on a re-read of that file. If that
+repository states terms of its own that reach these vectors, they belong here.
+
+**Copyleft:** NONE-SHIPPED — the only third-party material here is a U.S.
+Government work carrying no licence conditions at all, and no GPL/LGPL/AGPL
+source or data is present in this module.
+
+Specification
+-------------
+
+  - FIPS 205, "Stateless Hash-Based Digital Signature Standard" (NIST,
+    August 2024) — the specification every algorithm here implements. Also a
+    U.S. Government work.

@@ -1,0 +1,67 @@
+webauthn — third-party attribution
+==================================
+
+This file carries a CONDITION, added 2026-09-09. `src/vectors.zig` reproduces
+the W3C Web Authentication Level 3 specification's own §16 "Test Vectors"
+verbatim, and the W3C licence those come under asks that its notice travel with
+them.
+
+Until this revision the module had no NOTICE at all — while reproducing the
+material of the same rights holder that `modules/tracecontext` carries a full
+attribution for. Two modules, one W3C, opposite treatments; this is the one
+that had nothing.
+
+⚠ AND IT IS A DIFFERENT W3C LICENCE FROM `tracecontext`'s, which is the reason
+this file does not simply copy that one. `tracecontext`'s vectors come from the
+`w3c/trace-context` TEST SUITE, and that repository's own `LICENSE.md` splits
+the two cases: "All Reports in this Repository are licensed by contributors
+under the W3C Software and Document License … All tests in this Repository are
+licensed by contributors to be distributed under the W3C 3-clause BSD License."
+The vectors here are not from a test suite — they are read out of the
+specification document itself, which is a Report. So the applicable grant is
+the **W3C Software and Document License**, not the 3-clause BSD.
+
+Test vectors
+------------
+
+`src/vectors.zig` reproduces the byte-exact vectors of W3C Web Authentication
+(WebAuthn) Level 3, §16 "Test Vectors"
+(https://www.w3.org/TR/webauthn-3/#sctn-test-vectors — non-normative, but the
+specification's own official conformance vectors). Fetched 2026-07-21 from
+https://www.w3.org/TR/webauthn-3/ and extracted mechanically by an offline
+Python script (HTML tag-strip plus a regex over the `name = h'…'` CDDL literals
+the spec uses, plus a byte-level scan to pull each registration vector's
+`credentialPublicKey` out of its own `authData`, which the prose does not give
+as a separate named literal).
+
+The extraction is mechanical on purpose: an earlier hand-copy of these vectors
+put one signature substring into the wrong test case, and regenerating straight
+from the spec text makes that class of error impossible.
+
+W3C notice, retained
+--------------------
+
+  Copyright © World Wide Web Consortium. All Rights Reserved. This work is
+  distributed under the W3C Software and Document License
+  (https://www.w3.org/copyright/software-license/).
+
+The licence's conditions on redistribution are that the copyright notice and
+the licence reference travel with the material, and that any modification be
+identified as such. This module reproduces the vectors' VALUES as Zig byte-array
+declarations rather than the specification's HTML/CDDL text; nothing of the
+document's prose is reproduced, and no vector's bytes are altered.
+
+⚠ Stated rather than left implicit: the copyright line above carries no year.
+The specification's own status section names one, and it was not re-fetched for
+this pass — the notice is reproduced in the form the licence requires, and the
+year belongs here once someone re-reads the document header.
+
+**Copyleft:** NONE-SHIPPED — the W3C Software and Document License is
+permissive: it asks that the notice travel with the material and imposes no
+reciprocity, and no GPL/LGPL/AGPL source or data is present in this module.
+
+Specification
+-------------
+
+  - W3C Web Authentication (WebAuthn) Level 3 — the specification every
+    structure and verification step in this module implements.

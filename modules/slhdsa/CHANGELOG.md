@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — The module has a `NOTICE` for the first time. `src/kat_vectors.zig` carries
+  NIST's ACVP known-answer vectors for all twelve SLH-DSA parameter sets, and the provenance
+  was recorded only in that file's doc comment — right place for it, but a reader asking "what
+  does this module owe?" had nothing to open. It owes nothing: these are the validation
+  vectors of a U.S. federal standard, a work of the United States Government not subject to
+  copyright there (17 U.S.C. §105), the same position `modules/ctap2pin/NOTICE` already takes
+  for NIST SP 800-38A. Recorded as a provenance note, with the one thing not re-verified in
+  this pass (the ACVP-Server repository's own licence file) stated rather than assumed.
+
 - **2026-09-07** — Test-only, no production change: `fuzzVerify` had never looked at a
   signature's content. It opened `smith.bytes(&buf)` and then drew
   `smith.valueRangeAtMost(u32, 0, signature_length + 32)`; a ranged `Smith` draw reads eight
