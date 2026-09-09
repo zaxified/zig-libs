@@ -151,6 +151,16 @@ declare -A TARGETS=(
     [ed448]="full ladder"
     [k256]="field mul comb sign ecdsa"
     [montint]="small portable asmcore"
+    # ── added 2026-09-09, A1 R2's first four ────────────────────────────────
+    [p256]="comb sign"
+    [rsa]="crt noncrt"
+    [slhdsa]="seed prf"
+    # ⚠ `falcon` is here against its own SPEC.md, which argued it should NOT
+    # have a row because the red would only measure the sampler's deliberate
+    # reject loop. The measurement says otherwise: 16 of 133 contexts are the
+    # sampler and 112 are `fpr.zig`, which the same SPEC calls branchless.
+    # See modules/falcon/SPEC.md, rewritten in the same commit.
+    [falcon]="sign"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -164,6 +174,10 @@ declare -A MODES=(
     [ed448]="ReleaseFast"
     [k256]="ReleaseFast"
     [montint]="ReleaseFast"
+    [p256]="ReleaseFast"
+    [rsa]="ReleaseFast"
+    [slhdsa]="ReleaseFast"
+    [falcon]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -238,9 +252,28 @@ declare -A PATTERN=(
     [montint/small]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [montint/portable]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
     [montint/asmcore]='montint[.]zig|limbs[.]zig|asm_core[.]zig'
+    # ── added 2026-09-09 ───────────────────────────────────────────────────
+    [p256/comb]='group[.]zig|field[.]zig|fast_core[.]zig'
+    # `sign` names std's ecdsa/common/scalar for the same reason chachapoly's
+    # pattern names std's AEAD: the shipped ES256 surface is std's generic
+    # signer over THIS module's group, so attributing that arithmetic to
+    # someone else would be the evasion this gate exists to refuse.
+    [p256/sign]='ecdsa[.]zig|common[.]zig|scalar[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [rsa/crt]='root[.]zig|ff[.]zig'
+    [rsa/noncrt]='root[.]zig|ff[.]zig'
+    [slhdsa/seed]='engine[.]zig|address[.]zig'
+    [slhdsa/prf]='engine[.]zig|address[.]zig'
+    [falcon/sign]='fpr[.]zig|gaussian[.]zig|sign[.]zig|codec[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 declare -A LABEL=(
+    [p256/comb]='p256 combMulBase'
+    [p256/sign]='p256 sign+std ecdsa'
+    [rsa/crt]='rsa CRT p/q+std ff'
+    [rsa/noncrt]='rsa non-CRT d+std ff'
+    [slhdsa/seed]='slhdsa SK.seed'
+    [slhdsa/prf]='slhdsa SK.prf'
+    [falcon/sign]='falcon sign (fpr+sampler)'
     [bolt8/dh]='bolt8 dh+k256'
     [bolt8/keygen]='bolt8 dh+k256'
     [bolt8/act3]='bolt8 hs+k256+std'

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, taking `SK.seed` and `SK.prf` separately through `SlhDsaSha2_128f.sign()`. Measured ReleaseFast: **4 in-file contexts for `seed`, 8 for `prf`**, untainted control 0 and no-`-fvalgrind` trap 0 in every row. ⭐ Non-zero, and it does NOT contradict `SPEC.md:69-72`'s "chain lengths derive from the public digest" carve-out: every context is a branch over a WOTS+ chain length (`engine.zig:296`) or an auth-path index parity bit (`engine.zig:424`, `:539`), i.e. over values a verifier recomputes from the published signature. A binary taint cannot tell those apart from a branch on a secret byte, which is why the per-line attribution — not the total — is what this row is for.
+
 - **2026-09-09** — The module has a `NOTICE` for the first time. `src/kat_vectors.zig` carries
   NIST's ACVP known-answer vectors for all twelve SLH-DSA parameter sets, and the provenance
   was recorded only in that file's doc comment — right place for it, but a reader asking "what

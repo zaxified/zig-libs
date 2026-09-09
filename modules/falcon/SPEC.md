@@ -115,20 +115,42 @@ below for the signer/keygen internals and the constant-time caveat). See
   **Remaining gate**: no machine-checked side-channel verification
   (dudect/ctgrind/binsec) has been run on the compiled artifact — an
   out-of-toolchain dudect run before production signing remains the honest
-  ask. **Why this module has no in-repo ctgrind harness, and should not get
-  one.** The repo does now have a valgrind lane — `scripts/ctgrind.sh`,
-  `zig build check-ctgrind` and `scripts/ctgrind-expected.tsv` — so "there is
-  no lane" is no longer the reason. The reason is the sampler itself.
-  `gaussian0` is branchless over the full RCDT table, but `sampler`'s reject
-  loop iterates a *value-dependent* number of times and `berExp` keeps one
+  ask. **This module HAS an in-repo ctgrind harness since 2026-09-09, and the
+  argument that it should not is recorded here because measuring it is what
+  refuted it.** The paragraph this replaces said: `sampler`'s reject loop
+  iterates a *value-dependent* number of times and `berExp` keeps one
   data-dependent early break, both copied deliberately from the reference
-  (see `src/gaussian.zig`'s header): the constant-time argument there is
-  Bernoulli decorrelation, not a fixed trip count. ctgrind measures exactly
-  what those two constructs do — branch on tainted data — so an in-repo row
-  for `falcon` would be a permanent red that measures the reference design
-  rather than a defect, and pinning it green would require excluding the one
-  primitive the whole gate exists to watch. A red that measures nothing is
-  worse than no row. Keygen (`ntru.zig`) likewise preserves the
+  (see `src/gaussian.zig`'s header) where the constant-time argument is
+  Bernoulli decorrelation rather than a fixed trip count — so a row for
+  `falcon` would be "a permanent red that measures the reference design
+  rather than a defect", and "a red that measures nothing is worse than no
+  row."
+
+  ⭐ THE MEASUREMENT SAYS THE RED IS NOT THE SAMPLER. Tainting the NTRU
+  trapdoor `sk.tree.{f,g,big_f,big_g}` through `signRandomized`, ReleaseFast,
+  valgrind 3.26: **133 in-file contexts, of which the sampler is 16** —
+  `gaussian.zig:208` (`berExp`'s early break, 8) and `gaussian.zig:228`
+  (the reject loop, 8), exactly the two this paragraph predicted and
+  defended. The other **112 are in `fpr.zig`**: `pack` 62, `half` 42,
+  `add` 8 — the "branchless integer emulation of binary64" this same SPEC
+  describes above as having "no data-dependent branch, table index, or
+  variable-latency FP instruction". The remainder is `sign.zig:140` (the
+  norm-bound retry, 1) and `codec.zig:189/204/211` (compression branching on
+  `s2` coefficients, 4).
+
+  So the row is not a permanent red measuring the reference design. It is
+  84% a claim this file makes elsewhere and had no instrument for. Whether
+  those 112 are a real leak or an artifact of how LLVM lowers the masking
+  selects at ReleaseFast is the open question — and it is a question nobody
+  could have asked without the row. `scripts/check-fp-freedom.sh`, the gate
+  this module already had, cannot see it: it `objdump`s for hardware FP
+  instructions (`divsd`, `sqrtsd`), and this leaks through conditional
+  jumps with no FP instruction anywhere.
+
+  The expected row is pinned as a BOUND (`<=133`), not an exact count, for
+  the reason `ctgrind-expected.tsv` gives: only the direction is
+  load-bearing, and the number moves with a toolchain change for reasons
+  that say nothing about this module. Keygen (`ntru.zig`) likewise preserves the
   reference's structure and now shares the integer `fpr`; it runs once per
   key, so its side-channel exposure is far smaller than the signer's.
 - Verification and public-key handling touch public data only, so no

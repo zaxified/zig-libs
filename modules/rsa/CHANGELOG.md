@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, tainting the CRT private parameters (`p`, `q`, `dp`, `dq`, `qinv` and their Montgomery params) through `rsadpCrt`, and `d` through `rsadp`. Measured ReleaseFast: **213 in-file contexts for `crt`, 2 for `noncrt`**, untainted control 0 and no-`-fvalgrind` trap 0 in every row. ⭐ About 104 of the 213 are not this module's arithmetic at all but `std.crypto.ff` — `Modulus.reduce`'s length-dependent `memcpy` (86) and `Fe.shrink`'s leading-zero strip (29) — reached from `reduceWide` and `Fe.fromBytes`. `SPEC.md:64` says "never branches on secret data", under "Threat model / out of scope", while `SPEC.md:59` already speaks of "a residual leak in the constant-time claim" that blinding exists to decorrelate; this row is the first instrument for either sentence, not a refutation of them. ⚠ Four contexts (`montPowSecret`, `if (s == mp.L)`) are likely a granularity artifact — `L` is a limb count fixed by key SIZE, not by `p`/`q`'s value — and were left tainted and written down rather than carved out.
+
 - **2026-09-08** — **Docs: the "no per-operation setup cost is paid" claim now
   says whose precondition that is.** It holds for a caller that reuses a key and
   not for one that builds a fresh key per operation, which is exactly what

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, so this module's `SPEC.md` § "Constant-time contract" has an instrument for the first time. Targets `comb` (a tainted scalar through `combMulBase`) and `sign` (a tainted seed through `generateDeterministic` + `sign`); `mulPublic`/`mulDoubleBasePublic` are deliberately untainted, being documented variable-time on public inputs. Measured ReleaseFast: **1 in-file context for `comb`, 9 for `sign`**, untainted control 0 and no-`-fvalgrind` trap 0 in every row. All ten are negligible-probability degenerate checks — `combMulBaseFastWithTable`'s `rejectIdentity` (`group.zig:512`), five scalar-canonicality checks in std's `common.zig:75`, and `isZero` on the output `r`/`s` — the same class `k256`'s harness already measured and accepted. ⭐ The PATTERN names std's `ecdsa.zig`/`common.zig`/`scalar.zig` on purpose: the shipped ES256 surface is std's generic signer over THIS module's group (`src/sign.zig` is, in its own words, a verification-harness surface), and attributing that arithmetic to someone else is exactly the evasion `scripts/ctgrind.sh` exists to refuse.
+
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/kat_vectors.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

@@ -278,9 +278,9 @@ ed448	ReleaseFast	ladder	1	0	dc6585ac248e91ee	43db8426e0d6c6e7
 # was NOT measured; that is different and much more expensive work. The claim
 # is "the module's stated property does not hold and nothing was testing it",
 # not "the key is out".
-hqc	ReleaseFast	decaps	1	14	bc317361f873da09	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	4	bc317361f873da09	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	6	bc317361f873da09	e91a390cf03fd6ad
+hqc	ReleaseFast	decaps	1	14	7f5013197dbadfab	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	7f5013197dbadfab	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	6	7f5013197dbadfab	e91a390cf03fd6ad
 hqc	ReleaseFast	sampler	1	2	2a6058d658bd6789	b93fa60c89578576
 k256	ReleaseFast	field	1	0	2642e053d442bcc0	4f13cccddea81376
 k256	ReleaseFast	mul	1	2	5f54a05906a76759	729cb9458ddf4051
@@ -299,3 +299,10 @@ k256	ReleaseFast	ecdsa	1	10	59cc96a03b882aad	8ff4812d21149442
 montint	ReleaseFast	small	1	0	045eb3a8ac23bebb	4e9f8c0b1ac8efe3
 montint	ReleaseFast	portable	1	0	045eb3a8ac23bebb	5c44fe7ce913f8f6
 montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb	51c0595ca47bd7cc
+p256	ReleaseFast	comb	1	1	ce6df2820f2d9b31	9d70061e0f0133d9
+p256	ReleaseFast	sign	1	<=9	4cffcaece7902b39	af4baed5c5134f3f
+rsa	ReleaseFast	crt	1	<=213	a8ee40a272fd1872	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	2	a8ee40a272fd1872	d4057b00f9df7b56
+slhdsa	ReleaseFast	seed	1	4	6848022d967ef676	e0fdde7f5c62a2d6
+slhdsa	ReleaseFast	prf	1	8	6848022d967ef676	e0fdde7f5c62a2d6
+falcon	ReleaseFast	sign	1	<=133	d6b62d587b79541c	3f5a6dbb61a76d9d

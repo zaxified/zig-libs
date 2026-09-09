@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, tainting the NTRU trapdoor `sk.tree.{f,g,big_f,big_g}` through `signRandomized`. ⛔⛔ This reverses `SPEC.md`'s standing decision that the module should NOT have such a row, and the measurement is what reversed it. That argument was entirely about the sampler — `berExp`'s early break and the reject loop's value-dependent trip count, both deliberate reference design — so a row would be "a permanent red that measures the reference design rather than a defect". Measured ReleaseFast: **133 in-file contexts, of which the sampler is 16** (`gaussian.zig:208`, `:228`). The other **112 are `fpr.zig`** — `pack` 62, `half` 42, `add` 8 — which the same SPEC.md describes as a "branchless integer emulation of binary64" with "no data-dependent branch". ⚠ Not claimed: that those 112 are a real leak; claimed: the sentence finally has an instrument, and `check-fp-freedom.sh` could never have seen it (it objdumps for hardware FP instructions, and nothing here executes one). The row is pinned as a bound (`<=133`), since only the direction is load-bearing.
+
 - **2026-09-07** — Fuzz reach: `fuzzVerify`'s corruption was one fixed octet. The flip
   loop opened `smith.valueRangeAtMost(u8, 1, 6)` as the harness's FIRST draw and the
   target had no corpus, so outside `--fuzz` it ran exactly one input and every draw in it
