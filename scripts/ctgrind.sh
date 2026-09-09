@@ -10,6 +10,13 @@
 #     scripts/ctgrind.sh --pattern 'root[.]zig' ecvrf
 #                                           # …re-attribute the in-file column
 #     scripts/ctgrind.sh --check            # compare against the expected table
+#     scripts/ctgrind.sh -j 4 --check       # …at 4 parallel runs instead of nproc
+#
+# Runs go through a pool one memcheck process wide per job (valgrind serialises
+# threads inside a process, so a single run can never use a second core). The
+# table prints a `secs` column and a per-module total, so how long this takes is
+# recorded rather than rediscovered. Counts do not depend on the job count; the
+# times do, which is why the summary names it.
 #
 # Needs `valgrind` on PATH; builds go through `scripts/capped`. Not part of
 # `zig build test` — memcheck's context count is valgrind's own verdict, not
@@ -363,47 +370,6 @@ declare -A PATTERN=(
     [ibe/decrypt]='ibe[.]zig|ciphersuite[.]zig|pairing[.]zig|fp[.]zig|fp2[.]zig|fp6[.]zig|fp12[.]zig|g1[.]zig|g2[.]zig|scalar[.]zig|sha2[.]zig'
     [ibe/fp12pow]='ibe[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig'
     # ── round 4, 2026-09-09 ────────────────────────────────────────────────
-    [spake2plus/w0w1]='spake2plus computeW0W1+std wide-reduce'
-    [spake2plus/computel]='spake2plus computeL (w1*P)+p256 comb'
-    [spake2plus/proverstart]='spake2plus proverStart+p256'
-    [spake2plus/verifierstart]='spake2plus verifierStart+p256'
-    [spake2plus/proverfinish]='spake2plus proverFinish+confirm MAC'
-    [spake2plus/verifierfinish]='spake2plus verifierFinish+confirm MAC'
-    [bbs/sign]='bbs sign SK+bls12_381'
-    [bbs/proofgen]='bbs proofGen undisclosed msgs+bls12_381'
-    [coconut/authority_sign]='coconut authority key share+bls12_381'
-    [coconut/user_issue]='coconut user attributes (local commit)'
-    [coconut/user_show]='coconut proveCredential (attrs+blinding)'
-    [hpke/x25519_decap]='hpke X25519 decap (skR)+std'
-    [hpke/x25519_authdecap]='hpke X25519 authDecap+std'
-    [hpke/p256_decap]='hpke P-256 decap (skR)+p256'
-    [hpke/p256_authdecap]='hpke P-256 authDecap+p256'
-    [hpke/p384_decap]='hpke P-384 decap (skR)+std p384'
-    [hpke/p384_authdecap]='hpke P-384 authDecap+std p384'
-    [hpke/open]='hpke Context.open+chachapoly'
-    [signal/sign]='signal xeddsa sign+ct25519'
-    [signal/ratchet]='signal DH-ratchet root/chain KDF'
-    [sphinx/construct]='sphinx construct (session_key)+k256'
-    [sphinx/process]='sphinx process (relay privkey)+k256'
-    [bolt3/derive]='bolt3 derivePrivateKey+k256'
-    [bolt3/revocation]='bolt3 deriveRevocationPrivateKey+k256'
-    [bolt3/shachain]='bolt3 perCommitmentSecret (seed; index public)'
-    [bolt3/shachain_index]='bolt3 perCommitmentSecret (index tainted; CONTROL)'
-    [ctap2pin/ecdh]='ctap2pin ecdhZ (platform scalar)+p256'
-    [ctap2pin/one]='ctap2pin One.encapsulate+p256'
-    [ctap2pin/two]='ctap2pin Two.encapsulate+p256+hkdf'
-    [ctap2pin/token]='ctap2pin pinUvAuthToken HMAC'
-    [fss/gen]='fss genWithSeeds (alpha,seeds)'
-    [fss/eval]='fss eval (key) -- DEFECT dpf.zig:326'
-    [bfv/keygen]='bfv keyGen samplers+ring'
-    [bfv/encrypt]='bfv encrypt (plaintext) -- DEFECT bfv.zig:686'
-    [bfv/decrypt]='bfv decrypt (sk)+CRT reconstruct'
-    [tfhe/keygen]='tfhe lwe/glwe keyGen samplers'
-    [tfhe/encrypt]='tfhe encrypt (plaintext)'
-    [tfhe/decrypt]='tfhe decrypt (key) -- DEFECT ntt.zig:93/127'
-    [tfhe/bootstrap]='tfhe blindRotate/cmux/keySwitch'
-    [dkg/coeffs]='dkg round-1 secret coefficients'
-    [dkg/combine]='dkg final combined share'
     [frost/commit]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     [frost/sign]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     # `scalar[.]zig`/`mem[.]zig` beyond bip340's pattern are EMPIRICALLY needed
@@ -529,6 +495,48 @@ declare -A LABEL=(
     [montint/small]='montint src'
     [montint/portable]='montint src'
     [montint/asmcore]='montint src'
+    # ── rounds 5-7, 2026-09-09 ─────────────────────────────────────────────
+    [spake2plus/w0w1]='spake2plus computeW0W1+std wide-reduce'
+    [spake2plus/computel]='spake2plus computeL (w1*P)+p256 comb'
+    [spake2plus/proverstart]='spake2plus proverStart+p256'
+    [spake2plus/verifierstart]='spake2plus verifierStart+p256'
+    [spake2plus/proverfinish]='spake2plus proverFinish+confirm MAC'
+    [spake2plus/verifierfinish]='spake2plus verifierFinish+confirm MAC'
+    [bbs/sign]='bbs sign SK+bls12_381'
+    [bbs/proofgen]='bbs proofGen undisclosed msgs+bls12_381'
+    [coconut/authority_sign]='coconut authority key share+bls12_381'
+    [coconut/user_issue]='coconut user attributes (local commit)'
+    [coconut/user_show]='coconut proveCredential (attrs+blinding)'
+    [hpke/x25519_decap]='hpke X25519 decap (skR)+std'
+    [hpke/x25519_authdecap]='hpke X25519 authDecap+std'
+    [hpke/p256_decap]='hpke P-256 decap (skR)+p256'
+    [hpke/p256_authdecap]='hpke P-256 authDecap+p256'
+    [hpke/p384_decap]='hpke P-384 decap (skR)+std p384'
+    [hpke/p384_authdecap]='hpke P-384 authDecap+std p384'
+    [hpke/open]='hpke Context.open+chachapoly'
+    [signal/sign]='signal xeddsa sign+ct25519'
+    [signal/ratchet]='signal DH-ratchet root/chain KDF'
+    [sphinx/construct]='sphinx construct (session_key)+k256'
+    [sphinx/process]='sphinx process (relay privkey)+k256'
+    [bolt3/derive]='bolt3 derivePrivateKey+k256'
+    [bolt3/revocation]='bolt3 deriveRevocationPrivateKey+k256'
+    [bolt3/shachain]='bolt3 perCommitmentSecret (seed; index public)'
+    [bolt3/shachain_index]='bolt3 perCommitmentSecret (index tainted; CONTROL)'
+    [ctap2pin/ecdh]='ctap2pin ecdhZ (platform scalar)+p256'
+    [ctap2pin/one]='ctap2pin One.encapsulate+p256'
+    [ctap2pin/two]='ctap2pin Two.encapsulate+p256+hkdf'
+    [ctap2pin/token]='ctap2pin pinUvAuthToken HMAC'
+    [fss/gen]='fss genWithSeeds (alpha,seeds)'
+    [fss/eval]='fss eval (key) -- DEFECT dpf.zig:326'
+    [bfv/keygen]='bfv keyGen samplers+ring'
+    [bfv/encrypt]='bfv encrypt (plaintext) -- DEFECT bfv.zig:686'
+    [bfv/decrypt]='bfv decrypt (sk)+CRT reconstruct'
+    [tfhe/keygen]='tfhe lwe/glwe keyGen samplers'
+    [tfhe/encrypt]='tfhe encrypt (plaintext)'
+    [tfhe/decrypt]='tfhe decrypt (key) -- DEFECT ntt.zig:93/127'
+    [tfhe/bootstrap]='tfhe blindRotate/cmux/keySwitch'
+    [dkg/coeffs]='dkg round-1 secret coefficients'
+    [dkg/combine]='dkg final combined share'
 )
 
 # ── arguments ──────────────────────────────────────────────────────────────
@@ -537,10 +545,15 @@ DO_CHECK=0
 PATTERN_OVERRIDE=""
 DO_UPDATE_DIGESTS=0
 DO_UPDATE_OUTPUTS=0
+# One memcheck process pins one core and cannot use a second, so the default is
+# every core. Lower it with -j when you want the machine back, or when comparing
+# the `secs` column against an earlier run made at a different width.
+JOBS="$(nproc 2>/dev/null || echo 1)"
 MODULES=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stacks) SHOW_STACKS=1; shift ;;
+        -j|--jobs) JOBS="${2:?-j needs a job count}"; shift 2 ;;
         --check) DO_CHECK=1; shift ;;
         # Rewrites ctgrind-expected.tsv's source-digest column WITHOUT running
         # anything. Deliberately separate from --check: re-pinning is the act
@@ -610,6 +623,49 @@ for m in "${MODULES[@]}"; do
     [[ -n "${TARGETS[$m]:-}" ]] || { echo "ctgrind: modules/$m/src/ctgrind_harness.zig exists but ctgrind.sh has no TARGETS entry for it — add one (plus MODES/PATTERN/WITNESS) or the harness is never driven" >&2; exit 2; }
     [[ -n "${MODES[$m]:-}" ]] || { echo "ctgrind: modules/$m/src/ctgrind_harness.zig exists but ctgrind.sh has no MODES entry for it" >&2; exit 2; }
 done
+
+# ⛔⛔ The recipe is FOUR arrays and this loop used to check two of them. A key
+# present in TARGETS but missing from LABEL does not fail here: it fails at
+# `lbl="${LABEL[$key]}"` inside the MEASUREMENT loop, under `set -u`, AFTER the
+# builds, and only for the modules the caller happened to name. Measured
+# 2026-09-09: commit c2eee166 pasted 41 LABEL entries into the PATTERN literal
+# instead of the LABEL one, so 12 of the 28 modules the campaign called closed
+# could not be measured AT ALL, and the failure looked like a crash rather than
+# a recipe gap. Check every arm of the recipe, before anything is built.
+for m in "${MODULES[@]}"; do
+    for t in ${TARGETS[$m]}; do
+        [[ -n "${PATTERN[$m/$t]:-}" ]] || { echo "ctgrind: TARGETS lists '$t' for module '$m' but there is no PATTERN[$m/$t] — every target needs the file regex its contexts are attributed by" >&2; exit 2; }
+        [[ -n "${LABEL[$m/$t]:-}" ]]   || { echo "ctgrind: TARGETS lists '$t' for module '$m' but there is no LABEL[$m/$t] — every target needs the one-line description the table prints" >&2; exit 2; }
+    done
+done
+
+# The other half of that same accident, and the half that is genuinely invisible:
+# PATTERN came out CORRECT only because the real regex for each stray key was
+# assigned later in the same literal and overwrote the label. Had the paste
+# landed after instead of before, PATTERN would hold a prose description, every
+# `in-file` count would be 0, and the run would report a clean module rather than
+# fail. A silently wrong measurement is worse than a crash, so the duplicate is
+# an error in its own right — the losing assignment is always a mistake.
+dupes="$(awk '
+    match($0, /^declare -A (TARGETS|MODES|PATTERN|LABEL)=\(/) { arr = $3; sub(/=\(.*/, "", arr); next }
+    arr != "" && /^\)/ { arr = ""; next }
+    arr != "" && match($0, /^[[:space:]]*\[[^]]+\]=/) {
+        k = substr($0, RSTART, RLENGTH)
+        sub(/^[[:space:]]*\[/, "", k); sub(/\]=$/, "", k)
+        if ((arr, k) in seen)
+            printf "  %s[%s]: line %d is overwritten by line %d\n", arr, k, seen[arr, k], NR
+        else seen[arr, k] = NR
+    }
+' "${BASH_SOURCE[0]}")"
+if [[ -n "$dupes" ]]; then
+    echo "ctgrind: the same key is assigned twice in one recipe array — the LATER assignment wins and the earlier is lost:" >&2
+    echo "$dupes" >&2
+    echo "     This is what a LABEL pasted into the PATTERN block looks like from the inside. Delete the wrong one," >&2
+    echo "     and check whether the array it was MEANT for is now missing that key." >&2
+    exit 2
+fi
+
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "ctgrind: -j needs a positive integer, got '$JOBS'" >&2; exit 2; }
 
 if ! command -v valgrind >/dev/null 2>&1; then
     echo "ctgrind: valgrind not found on PATH — install it or run this on a host that has it (no auto-install)." >&2
@@ -721,6 +777,12 @@ run_one() {
     local module="$1" mode="$2" vg="$3" target="$4" taint="$5" file_pattern="$6"
     local bin="$WORKDIR/$mode-$vg/ctgrind/ctgrind-$module"
     local log="$WORKDIR/log_${module}_${mode}_${vg}_${target}_${taint}.txt"
+    # Wall time per run, so "how long does this take" stops being a guess and
+    # becomes a column. `EPOCHREALTIME` is seconds.microseconds, and its decimal
+    # separator is the LOCALE'S -- a comma under cs_CZ -- so the class match
+    # `[.,]` is required, not defensive: `${EPOCHREALTIME/./}` silently yields a
+    # string with a comma in it here, and the subtraction below then errors.
+    local t0="${EPOCHREALTIME/[.,]/}"
     set +e
     # ⚠ `--max-stackframe` is NOT decoration. `std.Io.Threaded`'s stack
     # footprint exceeds memcheck's default 2 MB heuristic, and past it memcheck
@@ -734,6 +796,7 @@ run_one() {
         "$bin" "$target" "$taint" >"$log" 2>&1
     local rc=$?
     set -e
+    local ms=$(( ( ${EPOCHREALTIME/[.,]/} - t0 ) / 1000 ))
     local total
     total=$(grep -oE 'errors from [0-9]+ contexts' "$log" | grep -oE '[0-9]+' | head -1 || true)
     total="${total:-0}"
@@ -748,16 +811,27 @@ run_one() {
     else
         accounted=0
     fi
-    echo "${total}|${in_target}|${witness}|${unattr}|${accounted}|${rc}|${log}"
+    echo "${total}|${in_target}|${witness}|${unattr}|${accounted}|${rc}|${log}|${ms}"
 }
+
+# Milliseconds as `12.3s`, wide enough to read down a column.
+fmt_secs() { printf '%d.%01ds' "$(( $1 / 1000 ))" "$(( ($1 % 1000) / 100 ))"; }
 
 ACTUAL="$WORKDIR/actual.tsv"
 : >"$ACTUAL"
 
-printf '%-11s %-11s %-11s %-8s %-10s %-16s %8s %8s %8s %7s %5s %s\n' \
-    "module" "build" "-fvalgrind" "tainted" "target" "in" "total" "in-file" "witness" "unattr" "exit" "note"
-printf '%s\n' "------------------------------------------------------------------------------------------------------------------------"
-
+# ── the job list ───────────────────────────────────────────────────────────
+# Enumerated FIRST, then run by a pool, then replayed in this order. The order
+# is what makes the table and `actual.tsv` diffable between runs; a pool that
+# printed as results arrived would reorder rows by how fast each one happened to
+# be, and every run would differ from the last for no reason anybody could see.
+#
+# ⭐ Running these concurrently cannot change any NUMBER. memcheck's contexts are
+# a property of the instruction stream, not of wall time, and each run is its own
+# process with its own log path. What contention does change is the `secs` column
+# -- so it is comparable across rows of ONE run, and across runs only at the same
+# job count, which is why the count is printed in the summary below.
+declare -a J_M=() J_MODE=() J_TARGET=() J_VG=() J_TAINT=() J_NOTE=() J_PAT=() J_LBL=()
 for m in "${MODULES[@]}"; do
     for mode in ${MODES[$m]}; do
         for target in ${TARGETS[$m]}; do
@@ -767,26 +841,82 @@ for m in "${MODULES[@]}"; do
             [[ -n "$PATTERN_OVERRIDE" ]] && lbl="(--pattern)"
             for combo in "true yes " "true no control" "false yes trap"; do
                 read -r vg taint note <<<"$combo"
-                IFS='|' read -r total in_file witness unattr accounted rc log \
-                    < <(run_one "$m" "$mode" "$vg" "$target" "$taint" "$pat")
-                rownote="$note"
-                [[ "$accounted" == "0" ]] && rownote="$rownote UNACCOUNTED"
-                [[ "$accounted" == "2" ]] && rownote="$rownote error-limit"
-                printf '%-11s %-11s %-11s %-8s %-10s %-16s %8s %8s %8s %7s %5s %s\n' \
-                    "$m" "$mode" "$vg" "$taint" "$target" "$lbl" \
-                    "$total" "$in_file" "$witness" "$unattr" "$rc" "$rownote"
-                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-                    "$m" "$mode" "$vg" "$taint" "$target" \
-                    "$total" "$in_file" "$witness" "$unattr" "$accounted" "$rc" "$log" "$pat" >>"$ACTUAL"
-                if [[ $SHOW_STACKS -eq 1 ]]; then
-                    echo "----- $m $mode -fvalgrind=$vg taint=$taint target=$target -----"
-                    cat "$log"
-                    echo "----- end -----"
-                fi
+                J_M+=("$m");     J_MODE+=("$mode"); J_TARGET+=("$target")
+                J_VG+=("$vg");   J_TAINT+=("$taint"); J_NOTE+=("$note")
+                J_PAT+=("$pat"); J_LBL+=("$lbl")
             done
         done
     done
 done
+NJOBS=${#J_M[@]}
+
+# ── the pool ───────────────────────────────────────────────────────────────
+# valgrind serialises the threads INSIDE one process, so there is no such thing
+# as making a single run use more than one core: the only parallelism available
+# is more processes. Peak RSS is ~45 MB per memcheck run here (measured on
+# tlock), so the bound is cores, not memory.
+echo "Measuring $NJOBS runs across $JOBS parallel valgrind processes..." >&2
+wall0="${EPOCHREALTIME/[.,]/}"
+running=0
+for ((i = 0; i < NJOBS; i++)); do
+    while (( running >= JOBS )); do
+        wait -n || true
+        running=$(( running - 1 ))
+    done
+    ( run_one "${J_M[i]}" "${J_MODE[i]}" "${J_VG[i]}" "${J_TARGET[i]}" \
+              "${J_TAINT[i]}" "${J_PAT[i]}" >"$WORKDIR/res_$i" ) &
+    running=$(( running + 1 ))
+done
+wait
+wall_ms=$(( ( ${EPOCHREALTIME/[.,]/} - wall0 ) / 1000 ))
+
+# ── replay, in job order ───────────────────────────────────────────────────
+printf '%-11s %-11s %-11s %-8s %-10s %-16s %8s %8s %8s %7s %5s %8s %s\n' \
+    "module" "build" "-fvalgrind" "tainted" "target" "in" "total" "in-file" "witness" "unattr" "exit" "secs" "note"
+printf '%s\n' "------------------------------------------------------------------------------------------------------------------------"
+
+declare -A MODULE_MS=()
+cpu_ms=0
+for ((i = 0; i < NJOBS; i++)); do
+    # A pool member that died without writing its line is not a row we can
+    # invent: say which job, and fail the run.
+    if [[ ! -s "$WORKDIR/res_$i" ]]; then
+        echo "ctgrind: job $i (${J_M[i]}/${J_MODE[i]}/${J_TARGET[i]} taint=${J_TAINT[i]} -fvalgrind=${J_VG[i]}) produced no result — the worker died before reporting" >&2
+        exit 2
+    fi
+    IFS='|' read -r total in_file witness unattr accounted rc log ms <"$WORKDIR/res_$i"
+    rownote="${J_NOTE[i]}"
+    [[ "$accounted" == "0" ]] && rownote="$rownote UNACCOUNTED"
+    [[ "$accounted" == "2" ]] && rownote="$rownote error-limit"
+    printf '%-11s %-11s %-11s %-8s %-10s %-16s %8s %8s %8s %7s %5s %8s %s\n' \
+        "${J_M[i]}" "${J_MODE[i]}" "${J_VG[i]}" "${J_TAINT[i]}" "${J_TARGET[i]}" "${J_LBL[i]}" \
+        "$total" "$in_file" "$witness" "$unattr" "$rc" "$(fmt_secs "$ms")" "$rownote"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${J_M[i]}" "${J_MODE[i]}" "${J_VG[i]}" "${J_TAINT[i]}" "${J_TARGET[i]}" \
+        "$total" "$in_file" "$witness" "$unattr" "$accounted" "$rc" "$log" "${J_PAT[i]}" "$ms" >>"$ACTUAL"
+    MODULE_MS["${J_M[i]}"]=$(( ${MODULE_MS["${J_M[i]}"]:-0} + ms ))
+    cpu_ms=$(( cpu_ms + ms ))
+    if [[ $SHOW_STACKS -eq 1 ]]; then
+        echo "----- ${J_M[i]} ${J_MODE[i]} -fvalgrind=${J_VG[i]} taint=${J_TAINT[i]} target=${J_TARGET[i]} -----"
+        cat "$log"
+        echo "----- end -----"
+    fi
+done
+
+# ── time, recorded ─────────────────────────────────────────────────────────
+# Per module, most expensive first: this is the number that answers "can I wait
+# for this?", and without it the only way to find the slow module is to sit
+# through the run once.
+echo
+echo "Time by module (measurement only; the builds above are not counted):"
+# ⚠ Sort on the raw millisecond integer, never on the formatted `12.3s`: under
+# cs_CZ the decimal separator is a comma, so `sort -n` reads "12.3s" as 12 and
+# ties every row that shares a whole second. Same trap as `du | sort -h` there.
+for m in "${!MODULE_MS[@]}"; do printf '%s\t%s\n' "${MODULE_MS[$m]}" "$m"; done \
+    | sort -rn | while IFS=$'\t' read -r ms_m name; do printf '%12s %s\n' "$(fmt_secs "$ms_m")" "$name"; done
+printf 'TOTAL %s wall across %s job(s), %s of memcheck CPU time, %s runs\n' \
+    "$(fmt_secs "$wall_ms")" "$JOBS" "$(fmt_secs "$cpu_ms")" "$NJOBS"
+echo
 
 [[ $DO_CHECK -eq 0 ]] && exit 0
 
@@ -963,7 +1093,18 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc eout; do
     # "the module has no secret-dependent branch" from "the harness never
     # called the module", which the context counts render identical.
     if [[ "$DO_UPDATE_OUTPUTS" == "1" ]]; then
-        NEW_OUT["$em/$emode/$etarget"]="$(out_digest "$rowlog")"
+        # ⛔ `NO-OUTPUT`/`NO-LOG` are the absence of a value, not a value. Storing
+        # one pins a string the checker below rejects unconditionally, so the row
+        # would carry a digest AND fail forever -- a pin that looks done and
+        # measures nothing. Leave it unpinned instead: `PENDING` is the honest
+        # record of "this harness printed nothing this pin can read", and it says
+        # the work is outstanding rather than broken.
+        new_out="$(out_digest "$rowlog")"
+        if [[ "$new_out" == "NO-OUTPUT" || "$new_out" == "NO-LOG" ]]; then
+            echo "SKIP $em/$emode/$etarget: not pinning an output digest — the harness printed no value this pin can read ($new_out). It needs to print at least 32 hex digits of something derived from the secret; see out_digest." >&2
+        else
+            NEW_OUT["$em/$emode/$etarget"]="$new_out"
+        fi
     elif [[ -z "${eout:-}" ]]; then
         echo "FAIL $em/$emode/$etarget: no output digest in ctgrind-expected.tsv — run --update-outputs" >&2
         fail=1
@@ -995,7 +1136,12 @@ if [[ "$DO_UPDATE_OUTPUTS" == "1" ]]; then
     exit 0
 fi
 
-while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _ aun aacc _ alog apat; do
+# ⚠ `asecs` is not decoration here either: `actual.tsv` grew a 14th column, and
+# without a variable to land in, the LAST name in this list absorbs both field 13
+# and field 14 joined by a tab -- so `apat` would become the regex plus a number,
+# and the classify_contexts call below would search for a pattern that matches
+# nothing. A trailing column is only free when every reader is told about it.
+while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _ aun aacc _ alog apat asecs; do
     if [[ "$ataint" == "no" && "$atotal" != "0" ]]; then
         echo "FAIL $am/$amode/$atarget: untainted control reported $atotal contexts, expected 0" >&2
         fail=1
