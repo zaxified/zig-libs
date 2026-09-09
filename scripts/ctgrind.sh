@@ -206,6 +206,12 @@ declare -A TARGETS=(
     [bfv]="keygen encrypt decrypt"
     [tfhe]="keygen encrypt decrypt bootstrap"
     [dkg]="coeffs combine"
+    # ── writeback round, 2026-09-09: the sealedbox contradiction ───────────
+    # A1 `sealedbox.md` M1 said the secret-key codecs light up; the coverage
+    # pass filed the module as a thin std wrapper with nothing to measure. Both
+    # were right about different functions -- `seal`/`open` ARE pure std and are
+    # deliberately not targets. The codecs are the module's own choice.
+    [sealedbox]="hexenc hexdec b64enc b64dec"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -248,6 +254,7 @@ declare -A MODES=(
     [bfv]="ReleaseFast"
     [tfhe]="ReleaseFast"
     [dkg]="ReleaseFast"
+    [sealedbox]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -433,6 +440,17 @@ declare -A PATTERN=(
     [tfhe/bootstrap]='tfhe[.]zig|gadget[.]zig|poly[.]zig|torus[.]zig|ntt[.]zig'
     [dkg/coeffs]='protocol[.]zig|commit[.]zig|core[.]zig|root[.]zig|secp256k1[.]zig|common[.]zig|scalar[.]zig'
     [dkg/combine]='core[.]zig|root[.]zig|secp256k1[.]zig'
+    # ⛔ `fmt[.]zig` is DELIBERATELY ABSENT even though `bytesToHex`/`hexToBytes`
+    # live there and ARE the subject of the hex rows. It is also in WITNESS, and
+    # PATTERN is tested first against the WHOLE paragraph, so listing it would
+    # file this harness's own `std.debug.print` as in-file -- the trap that put
+    # 3 witness contexts into sphinx's column. Every genuine paragraph here also
+    # carries `encodeSecretKeyHex (root.zig:179)` or its siblings, so the module
+    # frame is enough; verified by re-measuring with and without.
+    [sealedbox/hexenc]='root[.]zig:[1-9]|base64[.]zig'
+    [sealedbox/hexdec]='root[.]zig:[1-9]|base64[.]zig'
+    [sealedbox/b64enc]='root[.]zig:[1-9]|base64[.]zig'
+    [sealedbox/b64dec]='root[.]zig:[1-9]|base64[.]zig'
     [adaptor/extract]='root[.]zig|common[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
     [threshold_ecdsa/nonce]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
@@ -544,6 +562,10 @@ declare -A LABEL=(
     [tfhe/bootstrap]='tfhe blindRotate/cmux/keySwitch'
     [dkg/coeffs]='dkg round-1 secret coefficients'
     [dkg/combine]='dkg final combined share'
+    [sealedbox/hexenc]='sealedbox encodeSecretKeyHex -- DEFECT 16B table, secret nibble'
+    [sealedbox/hexdec]='sealedbox parseSecretKeyHex -- DEFECT charToDigit branches'
+    [sealedbox/b64enc]='sealedbox encodeSecretKeyBase64 -- DEFECT 64B alphabet, secret 6-bit'
+    [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 -- DEFECT 256B char_to_index, secret byte'
 )
 
 # ── arguments ──────────────────────────────────────────────────────────────
@@ -584,7 +606,14 @@ if [[ "$DO_UPDATE_DIGESTS" == "1" ]]; then
         local module="$1" pattern="$2"
         local dir="$REPO_ROOT/modules/$module/src"
         [[ -d "$dir" ]] || { echo "NO-SRC"; return; }
-        local names; names="$(printf '%s' "$pattern" | sed 's/\[\.\]/./g' | tr '|' '\n')"
+        # ⛔ Strip a trailing line guard (`root[.]zig:[1-9]`) before looking the
+        # name up. Measured 2026-09-09: without this the guard silently turned
+        # the SOURCE PIN OFF -- bolt3's shachain rows have carried NO-OWN-SRC
+        # since the guard was added, so the file they count could be rewritten
+        # under them and only the count would have to be re-hit. The guard is
+        # about which FRAMES to attribute; it says nothing about which FILE the
+        # row is about.
+        local names; names="$(printf '%s' "$pattern" | sed 's/\[\.\]/./g' | tr '|' '\n' | sed 's/:\[[0-9-]*\][*+]*$//;s/:[0-9]*$//')"
         local files=() n
         while IFS= read -r n; do
             [[ -n "$n" && -f "$dir/$n" ]] && files+=("$dir/$n")
@@ -1082,7 +1111,10 @@ src_digest() {
     [[ -d "$dir" ]] || { echo "NO-SRC"; return; }
     # `pattern` is a regex over basenames with `[.]` escapes: turn it back into
     # a plain alternation and take each name that exists in the module.
-    local names; names="$(printf '%s' "$pattern" | sed 's/\[\.\]/./g' | tr '|' '\n')"
+    # See the --update-digests copy above: the trailing line guard must be
+    # stripped, or the pin is silently disabled for exactly the rows careful
+    # enough to carry one.
+    local names; names="$(printf '%s' "$pattern" | sed 's/\[\.\]/./g' | tr '|' '\n' | sed 's/:\[[0-9-]*\][*+]*$//;s/:[0-9]*$//')"
     local files=()
     local n
     while IFS= read -r n; do
