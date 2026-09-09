@@ -960,16 +960,35 @@ echo
 # Metadata lines are excluded by requiring a long hex value: `valgrind_support=`
 # is not hex, and `L=32` / `lanes=4` are far too short to be a curve point or a
 # tag. The threshold is 32 hex digits = 16 bytes, below any output here.
+# ⛔⛔ The 32-digit floor is a HEURISTIC, and 9 rows across sphinx, fss, bfv and
+# tfhe fall through it: their outputs are genuinely narrow (fss's DPF share is a
+# 32-bit group element, printed `share=3b8a3efc`) or not hex at all (bfv prints
+# limb arrays with `{any}`, i.e. decimal). Those rows had NO output pin, which is
+# exactly the hole this section opens by describing — and two of them, tfhe's
+# `keygen` and `encrypt`, claim ZERO in-file contexts, the shape that cannot tell
+# "no leak" from "never called" without one.
+#
+# Lowering the floor is not the fix: at 8 digits a public `payload_len=12345678`
+# is indistinguishable from a hex value, so the pin would sometimes bind to a
+# number that has nothing to do with the secret. Instead a harness can NAME its
+# pinnable value — `ctgrind_result=<hex>` — and that name is then unambiguous at
+# any width. The 32-digit heuristic stays as the fallback so the 96 rows already
+# pinned by it keep their digests and need no re-measurement.
 out_digest() {
     local log="$1"
     [[ -f "$log" ]] || { echo "NO-LOG"; return; }
     local vals
-    # Unanchored on purpose: k256's ecdsa target prints three values on ONE
-    # line (`r={x} s={x} recid={d}`), and an anchored match silently found
-    # nothing there — the pin reported NO-OUTPUT, which is the right failure
-    # but the wrong reason. `recid=3` and `L=32` stay excluded by the 32-digit
-    # floor, and `valgrind_support=true` is not hex.
-    vals="$(grep -aoE '[A-Za-z_][A-Za-z0-9_]*(\[[0-9]+\])?=[0-9a-f]{32,}' "$log" || true)"
+    # Preferred: the value the harness declared as its result. 8 hex digits = 4
+    # bytes, which is the narrowest real output here (fss's share).
+    vals="$(grep -aoE 'ctgrind_result(\[[0-9]+\])?=[0-9a-f]{8,}' "$log" || true)"
+    if [[ -z "$vals" ]]; then
+        # Fallback, unanchored on purpose: k256's ecdsa target prints three
+        # values on ONE line (`r={x} s={x} recid={d}`), and an anchored match
+        # silently found nothing there — the pin reported NO-OUTPUT, which is
+        # the right failure but the wrong reason. `recid=3` and `L=32` stay
+        # excluded by the 32-digit floor, `valgrind_support=true` is not hex.
+        vals="$(grep -aoE '[A-Za-z_][A-Za-z0-9_]*(\[[0-9]+\])?=[0-9a-f]{32,}' "$log" || true)"
+    fi
     if [[ -z "$vals" ]]; then echo "NO-OUTPUT"; return; fi
     printf '%s\n' "$vals" | sha256sum | cut -c1-16
 }
@@ -1101,7 +1120,11 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc eout; do
         # the work is outstanding rather than broken.
         new_out="$(out_digest "$rowlog")"
         if [[ "$new_out" == "NO-OUTPUT" || "$new_out" == "NO-LOG" ]]; then
-            echo "SKIP $em/$emode/$etarget: not pinning an output digest — the harness printed no value this pin can read ($new_out). It needs to print at least 32 hex digits of something derived from the secret; see out_digest." >&2
+            echo "SKIP $em/$emode/$etarget: not pinning an output digest — the harness printed no value this pin can read ($new_out). Print one as \`ctgrind_result={x}\` (8+ hex digits, derived from the secret); see out_digest." >&2
+        elif [[ "$eout" == "RANDOMIZED" ]]; then
+            # Declared unpinnable on purpose — do not silently replace the
+            # declaration with a digest that will not hold on the next run.
+            echo "SKIP $em/$emode/$etarget: row is declared RANDOMIZED; leaving it so." >&2
         else
             NEW_OUT["$em/$emode/$etarget"]="$new_out"
         fi
@@ -1110,7 +1133,25 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc eout; do
         fail=1
     else
         actual_out="$(out_digest "$rowlog")"
-        if [[ "$actual_out" == "NO-OUTPUT" || "$actual_out" == "NO-LOG" ]]; then
+        # ⚠ `RANDOMIZED` is for an output that CANNOT repeat, not for one nobody
+        # got round to pinning. bulletproofs' rangeproof is the case: `prove`
+        # draws alpha, s_l/s_r, rho and tau1/tau2 from getrandom(2), because a
+        # range proof that is not randomised is not a range proof. Its printed
+        # fields therefore differ every run by design.
+        #
+        # The row keeps the HALF of the pin that still works: a value must still
+        # be there. That is what separates "the module has no secret-dependent
+        # branch" from "the harness never called it" — the equality check was
+        # only ever how that was established. Deleting the row instead would
+        # give up both halves.
+        if [[ "$eout" == "RANDOMIZED" ]]; then
+            if [[ "$actual_out" == "NO-OUTPUT" || "$actual_out" == "NO-LOG" ]]; then
+                echo "FAIL $em/$emode/$etarget: declared RANDOMIZED, but the harness printed NO value at all ($actual_out) — a randomised output still has to exist, or nothing shows the module was reached." >&2
+                fail=1
+            else
+                echo "NOTE $em/$emode/$etarget: output declared RANDOMIZED — presence checked, value not compared."
+            fi
+        elif [[ "$actual_out" == "NO-OUTPUT" || "$actual_out" == "NO-LOG" ]]; then
             echo "FAIL $em/$emode/$etarget: the harness printed no value this pin could read ($actual_out)." >&2
             echo "     A harness that prints nothing cannot show it reached the module; see 'output pin'." >&2
             fail=1

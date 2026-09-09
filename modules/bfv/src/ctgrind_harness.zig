@@ -311,7 +311,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // something genuine to delegate to. Its OWN entropy is never read: every
     // `randomSecure` draw in this harness goes through `SyntheticIo`'s
     // override instead.
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     defer threaded.deinit();
     const base_io = threaded.io();
 
@@ -327,7 +327,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const kp = instance.keyGen(entropy_src.io());
             // Propagation witness: the public key is a function of the
             // (possibly tainted) s/a/e draws (`p0 = -(a*s+e)`, `p1 = a`).
-            std.debug.print("pk.p0={any} pk.p1={any}\n", .{ kp.pk.p0.limbs, kp.pk.p1.limbs });
+            // Hex, not `{any}`: the output pin reads `name=<hex>`, and `{any}` on a
+            // limb array prints a decimal list it cannot bind to. Bytes also give
+            // a fixed width, which `{x}` on an integer would not.
+            std.debug.print("ctgrind_result[0]={x} ctgrind_result[1]={x}\n", .{
+                std.mem.sliceAsBytes(kp.pk.p0.limbs[0..]),
+                std.mem.sliceAsBytes(kp.pk.p1.limbs[0..]),
+            });
         },
 
         .encrypt => {
@@ -348,7 +354,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const ct = instance.encrypt(&kp.pk, &pt_loaded, enc_src.io());
             // Propagation witness: c0 = Delta*m + p0*u + e0 carries the
             // (possibly tainted) plaintext.
-            std.debug.print("ct0={any} ct1={any}\n", .{ ct.components[0].limbs, ct.components[1].limbs });
+            std.debug.print("ctgrind_result[0]={x} ctgrind_result[1]={x}\n", .{
+                std.mem.sliceAsBytes(ct.components[0].limbs[0..]),
+                std.mem.sliceAsBytes(ct.components[1].limbs[0..]),
+            });
         },
 
         .decrypt => {
@@ -372,7 +381,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // Propagation witness: the recovered plaintext is exactly
             // Dec(Enc(pt)), so a tainted `sk` byte that reached `decrypt`'s
             // arithmetic shows up here.
-            std.debug.print("decoded={any}\n", .{decoded.coeffs});
+            std.debug.print("ctgrind_result={x}\n", .{std.mem.sliceAsBytes(decoded.coeffs[0..])});
         },
     }
 }

@@ -216,7 +216,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={}\n", .{builtin.valgrind_support});
 
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
 
     // Public generators — never tainted (see module doc comment).
     const gens = try bulletproofs.Generators.init(allocator, n);

@@ -321,7 +321,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const msg = "ctgrind frost harness message";
 
             const sig_share = try frost.round2Sign(
-                std.heap.page_allocator,
+                std.heap.page_allocator, // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
                 identifier,
                 signing_share,
                 group_public_key,

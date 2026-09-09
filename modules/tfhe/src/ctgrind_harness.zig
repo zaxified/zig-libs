@@ -320,7 +320,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // This is a one-shot diagnostic binary the process exit reclaims
     // completely; leaving the pool running to process exit is deliberate,
     // not an oversight, and sidesteps the noise instead of masking it.
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     const base_io = threaded.io();
 
     switch (target) {
@@ -335,7 +335,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var chk: T = 0;
             for (lwe_key.s) |x| chk ^= x;
             for (glwe_key.s.c) |x| chk ^= x;
-            std.debug.print("keygen checksum={x}\n", .{chk});
+            // Through `toBytes`: `T` is a u32, and `{x}` on an integer drops leading
+            // zeros, so a small checksum would print fewer hex digits than the
+            // output pin's floor and the pin would track the VALUE, not the code.
+            std.debug.print("keygen ctgrind_result={x}\n", .{std.mem.toBytes(chk)});
         },
 
         // REAL (untainted) key and REAL (untainted) mask/noise entropy;
@@ -359,7 +362,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var enc2: SyntheticIo = .{ .inner = base_io, .taint = false };
             const glwe_ct = Toy.glweEncrypt(&glwe_key, &msg_loaded, enc2.io());
 
-            std.debug.print("lwe_ct.b={x} glwe_ct.b[0]={x}\n", .{ lwe_ct.b, glwe_ct.b.c[0] });
+            std.debug.print("ctgrind_result[0]={x} ctgrind_result[1]={x}\n", .{
+                std.mem.toBytes(lwe_ct.b),
+                std.mem.toBytes(glwe_ct.b.c[0]),
+            });
         },
 
         // REAL key and REAL ciphertext, both off untainted entropy; only
@@ -386,7 +392,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             const bit = Toy.lweDecryptBit(64, &lwe_key_loaded, &lwe_ct);
             const phase = Toy.glwePhase(&glwe_key_loaded, &glwe_ct);
-            std.debug.print("bit={} phase0={x}\n", .{ bit, phase.c[0] });
+            std.debug.print("bit={} ctgrind_result={x}\n", .{ bit, std.mem.toBytes(phase.c[0]) });
         },
 
         // Taints BOTH the LWE and GLWE secret keys entering
@@ -425,7 +431,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // ciphertext itself carries the taint from bsk/ksk, through
             // blindRotate+keySwitch).
             const bit = Toy.lweDecryptBit(64, &real_lwe_key, &out);
-            std.debug.print("bootstrap bit={}\n", .{bit});
+            // ⛔ `bit` alone is ONE BIT, which no output pin can read: it cannot
+            // distinguish "bootstrap computed something else" from "the harness
+            // never ran it". The output ciphertext is the actual result of the
+            // call under test and carries the bsk/ksk taint, so print that too.
+            std.debug.print("bootstrap bit={} ctgrind_result={x}\n", .{
+                bit,
+                std.mem.sliceAsBytes(out.a[0..]),
+            });
         },
     }
 }

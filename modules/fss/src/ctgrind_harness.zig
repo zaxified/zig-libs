@@ -189,7 +189,14 @@ fn runGen(taint: Taint) void {
 
     // Propagation proof: format (tainted-if-yes) output through a
     // non-constant-time path.
-    std.debug.print("gen cw_final0={x} cw_final1={x}\n", .{ keys[0].cw_final, keys[1].cw_final });
+    // ⚠ Printed through `std.mem.toBytes`, not as `{x}` on the integer: `{x}`
+    // drops leading zeros, so a small `cw_final` would print fewer hex digits
+    // than the output pin's floor and the pin would appear and disappear with
+    // the VALUE rather than with the code. Bytes are always fixed width.
+    std.debug.print(
+        "gen ctgrind_result[0]={x} ctgrind_result[1]={x}\n",
+        .{ std.mem.toBytes(keys[0].cw_final), std.mem.toBytes(keys[1].cw_final) },
+    );
 }
 
 /// `eval` target: build a REAL key from FIXED, untainted α/seeds (setup, not
@@ -214,7 +221,7 @@ fn runEval(taint: Taint) void {
     const x: D.Index = 42;
     const share = D.eval(0, key_r, x);
 
-    std.debug.print("eval share={x}\n", .{share});
+    std.debug.print("eval ctgrind_result={x}\n", .{std.mem.toBytes(share)});
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

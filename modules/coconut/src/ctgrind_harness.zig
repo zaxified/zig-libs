@@ -366,7 +366,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={}\n", .{builtin.valgrind_support});
 
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     switch (target) {
         .authority_sign => try runAuthoritySign(allocator, taint),
         .user_issue => try runUserIssue(allocator, taint),

@@ -197,9 +197,35 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // interesting one (it decides "deliver here" vs. "forward").
             const result = try sphinx.process(node_privkey, pkt, &associated_data);
 
-            std.debug.print("payload_len={d} has_next={}\n", .{
+            // ⚠ TWO ways of reaching the payload are wrong here, both measured
+            // on 2026-09-09 rather than reasoned about:
+            //
+            //   `if (result.next_packet) |np|` — whether that optional is
+            //   present is decided by `core.zig`'s `allEqual(&frame.hmac, 0)`
+            //   on decrypted material, so unwrapping it is this harness
+            //   branching on a secret-derived tag. That is the artifact dkg's
+            //   harness was found producing, and it lands in `unattr`.
+            //
+            //   `result.payload()` — that accessor LIVES IN `core.zig`, which
+            //   this row's pattern matches, so its inlined frame is counted as
+            //   sphinx's own: in-file went 43 -> 46 for a witness the module
+            //   never executed. Same over-attribution, arrived at from the
+            //   other side.
+            //
+            // The field itself has neither problem, and it is fully written —
+            // `core.zig:468-469` memcpy's the payload and memsets the rest to
+            // zero — so printing all of it reads no uninitialised byte.
+            //
+            // ⚠ Adding this print moved the row from 43 in-file contexts to 42
+            // (witness 3 -> 5, total 46 -> 47). Nothing in `process` changed;
+            // one context was relocated by the inliner, the same
+            // codegen-sensitivity that makes an exact context count a pin on
+            // the compiler rather than on the module. That is why this row's
+            // pin is the bound `<=43` and not an equality.
+            std.debug.print("payload_len={d} has_next={} ctgrind_result={x}\n", .{
                 result.payload_len,
                 result.next_packet != null,
+                result.payload_buf,
             });
         },
     }

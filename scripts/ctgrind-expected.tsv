@@ -314,7 +314,11 @@ blindrsa	ReleaseFast	blind	1	<=477	56e9b79636971444	39331e35c8b9371e
 blindrsa	ReleaseFast	sign	1	<=218	56e9b79636971444	4d5e3740a158032d
 threshold_ecdsa	ReleaseFast	share	1	<=127	0949d91bca3d536a	4a6777ac538b5e90
 threshold_ecdsa	ReleaseFast	nonce	1	<=400	0949d91bca3d536a	31f7e323b84fd8a7
-bulletproofs	ReleaseFast	rangeproof	1	0	be699cc6b07d6979	5f7b50697f905356
+# Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
+# getrandom(2), because a range proof that is not randomised is not a range
+# proof. RANDOMIZED keeps the half of the pin that still works -- a value must
+# still be printed -- so "the harness never called the module" is still caught.
+bulletproofs	ReleaseFast	rangeproof	1	0	be699cc6b07d6979	RANDOMIZED
 bulletproofs	ReleaseFast	ipa	1	0	c357a1430d730442	2368a5d0e07e2233
 paillier	ReleaseFast	crt	1	<=331	d32845737934e772	0435e5d4ba4d462a
 paillier	ReleaseFast	noncrt	1	<=141	d32845737934e772	0435e5d4ba4d462a
@@ -353,7 +357,7 @@ hpke	ReleaseFast	open	1	1	cd2271d9a14497cf	59883c70dcd08ee6
 signal	ReleaseFast	sign	1	1	cce965f3aeb59837	b2a0053066d93a75
 signal	ReleaseFast	ratchet	1	2	0ffa3c749ddd0583	92ab00fad0ce5c41
 sphinx	ReleaseFast	construct	1	10	e6f03464d0ef9fbd	bcc017806cc2a5dd
-sphinx	ReleaseFast	process	1	<=43	e6f03464d0ef9fbd	PENDING
+sphinx	ReleaseFast	process	1	<=43	e6f03464d0ef9fbd	e7c50d755f64b027
 bolt3	ReleaseFast	derive	1	7	d4906365cc4de792	c0fc92c5fbd8fb55
 bolt3	ReleaseFast	revocation	1	10	d4906365cc4de792	bc9bf12a55a312c4
 bolt3	ReleaseFast	shachain	1	0	NO-OWN-SRC	0516122e43713a52
@@ -362,14 +366,22 @@ ctap2pin	ReleaseFast	ecdh	1	4	01668687f2e11343	4596df5a3f29ae3b
 ctap2pin	ReleaseFast	one	1	7	01668687f2e11343	12de2588e792c80e
 ctap2pin	ReleaseFast	two	1	7	01668687f2e11343	4f76909ff534c3cc
 ctap2pin	ReleaseFast	token	1	0	01668687f2e11343	076a3a6729a924b0
-fss	ReleaseFast	gen	1	0	4c5e39d39bbe05bd	PENDING
-fss	ReleaseFast	eval	1	7	4c5e39d39bbe05bd	PENDING
-bfv	ReleaseFast	keygen	1	<=29	b3ff258fd2f8dd50	PENDING
-bfv	ReleaseFast	encrypt	1	<=17	b3ff258fd2f8dd50	PENDING
-bfv	ReleaseFast	decrypt	1	<=6	b3ff258fd2f8dd50	PENDING
-tfhe	ReleaseFast	keygen	1	0	476357ebc239682e	PENDING
-tfhe	ReleaseFast	encrypt	1	0	476357ebc239682e	PENDING
-tfhe	ReleaseFast	decrypt	1	<=10	ff62a60d16b52a66	PENDING
-tfhe	ReleaseFast	bootstrap	1	<=186	c546ed4f83700e54	PENDING
+fss	ReleaseFast	gen	1	0	4c5e39d39bbe05bd	b40b02f9cf423f05
+# ⛔ DEFECT, and the bound is deliberate. `dpf.zig:326`'s xorMasked compiles to
+# `test $0x1,%r9b` / `je` on the secret `t` -- disassembled 2026-09-09, still there.
+# The audit recorded "a jump on 7 of 8 levels"; those 7 are TREE LEVELS, not
+# contexts. memcheck aggregates by ADDRESS, and in this build the level loop is
+# rolled (the `je` targets the loop tail), so all 8 levels share one address and
+# one context is the most that can ever be reported. Pinning 7 pinned the
+# compiler's unrolling decision. `>=1` pins what is actually stable: this module
+# has a secret-dependent branch here, and the day it drops to 0 something moved.
+fss	ReleaseFast	eval	1	>=1	4c5e39d39bbe05bd	da79011b1ab46d96
+bfv	ReleaseFast	keygen	1	<=29	b3ff258fd2f8dd50	85d334608120f4fc
+bfv	ReleaseFast	encrypt	1	<=17	b3ff258fd2f8dd50	e4cdbb1aa2e9c9dc
+bfv	ReleaseFast	decrypt	1	<=6	b3ff258fd2f8dd50	51de1d1011ed3c4c
+tfhe	ReleaseFast	keygen	1	0	476357ebc239682e	faee3ac1f09c123f
+tfhe	ReleaseFast	encrypt	1	0	476357ebc239682e	aca01c505d98bd94
+tfhe	ReleaseFast	decrypt	1	<=10	ff62a60d16b52a66	b6d58329e7c93b2f
+tfhe	ReleaseFast	bootstrap	1	<=186	c546ed4f83700e54	4e39213562dbdc80
 dkg	ReleaseFast	coeffs	1	<=98	3f546b9ec9ff000d	ace23d0e40b2c8f5
-dkg	ReleaseFast	combine	1	<=5	9d983ff8e2433712	50c349a6863ebae9
+dkg	ReleaseFast	combine	1	0	9d983ff8e2433712	6407896882d3491c

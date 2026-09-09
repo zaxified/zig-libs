@@ -234,7 +234,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // itself — deterministic once `aux_rand` is in hand — but required for
     // API symmetry with the sibling modules' `sign` functions, per
     // `root.zig`'s own doc comment).
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     defer threaded.deinit();
     const io = threaded.io();
 

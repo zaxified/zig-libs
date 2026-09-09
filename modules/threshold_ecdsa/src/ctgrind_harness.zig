@@ -313,7 +313,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={}\n", .{builtin.valgrind_support});
 
-    var da: std.heap.DebugAllocator(.{}) = .init;
+    var da: std.heap.DebugAllocator(.{}) = .init; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     defer _ = da.deinit();
     const allocator = da.allocator();
 

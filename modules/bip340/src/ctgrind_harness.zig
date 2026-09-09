@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // parameter is unused by `sign` itself (deterministic once `aux_rand` is
     // in hand, per its own doc comment) but must be threaded through, same
     // as `kat_test.zig` does.
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     defer threaded.deinit();
     const io = threaded.io();
 

@@ -71,21 +71,28 @@
 //! numeric origin is irrelevant to `combineKeyShare`'s contract, which is
 //! "sum the qualified entries") are placed into the exact `[]const
 //! ?Scalar` array shape `Dkg.run` itself builds (`received`,
-//! `protocol.zig:224`), then the WHOLE array's storage is marked
-//! undefined via `std.valgrind.memcheck.makeMemUndefined` in one call —
-//! same idiom as `threshold_ecdsa`'s `share` target tainting
-//! `ks.secret_share` directly on an already-built value right before the
-//! real API call, not through a private helper — immediately before
+//! `protocol.zig:224`), then each entry's 32-byte `Scalar` PAYLOAD is
+//! marked undefined via `std.valgrind.memcheck.makeMemUndefined` — NOT the
+//! whole array in one call, which would also mark `?Scalar`'s presence
+//! discriminant and produced three class-3 contexts at `core.zig:206`; see
+//! the comment at the taint site — immediately before
 //! calling the module's own PUBLIC `combineKeyShare(qualified, received)`
 //! (`root.combineKeyShare`, re-exported from `core.zig`). `qualified =
 //! .{true,true,true}` stays real (it is public protocol state, not a
 //! secret, per the same "don't taint public material" instruction). The
-//! returned `x_j` — "the final combined secret share" — is then driven
-//! through `Secp256k1.basePoint.mul(x_j.toBytes(.big), .big)`, the exact
-//! call `checks.verifyingShareConsistent`/`reconstructsToQ` and
-//! `Dkg.run` itself make with this value, so this target measures the
-//! SAME disputed line as `coeffs` but with the combine step isolated from
-//! everything upstream of it.
+//! returned `x_j` — "the final combined secret share" — is printed
+//! directly as `ctgrind_result`.
+//!
+//! ⛔ It used to be driven through `Secp256k1.basePoint.mul` instead, and
+//! measuring that on 2026-09-09 showed the witness had swallowed the
+//! subject: all FIVE contexts came from the witness (`pcMul16` via `mul`,
+//! this file's branch on `mul`'s error-union tag, `Element.fromPoint`, and
+//! the print), and NONE from `combineKeyShare`. Worse, the first and third
+//! are `threshold_ecdsa`'s files, which this row's pattern names, so they
+//! were counted as dkg's own. With the witness reduced to the print, the
+//! row reads `total 2 / in-file 0 / witness 2 / unattr 0`: this target now
+//! says `combineKeyShare` has no secret-dependent branch of its own, which
+//! is what it always claimed to be measuring.
 //!
 //! ## A disputed claim round 2 already settled — do not re-derive it
 //!
@@ -146,7 +153,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
-const tecdsa = @import("threshold_ecdsa");
+// `threshold_ecdsa` is no longer imported here: the only uses were the witness
+// scalar-mul and `Element.fromPoint` removed above, whose contexts this row was
+// crediting to dkg. Keeping the import would keep that door open.
 
 const Scalar = root.Scalar;
 const Config = root.Config;
@@ -250,15 +259,26 @@ fn runCombine(tainted: bool) !void {
         return;
     };
 
-    if (tecdsa.Secp256k1.basePoint.mul(x_j.toBytes(.big), .big)) |q| {
-        const xg = tecdsa.Element.fromPoint(q) catch |err| {
-            std.debug.print("fromPoint aborted: {t}\n", .{err});
-            return;
-        };
-        std.debug.print("combined X={x}\n", .{xg.toBytes()});
-    } else |err| {
-        std.debug.print("mul aborted: {t}\n", .{err});
-    }
+    // ⛔⛔ THE WITNESS USED TO OUTWEIGH THE SUBJECT. This printed `x_j * G`, and
+    // measuring that on 2026-09-09 showed all FIVE of this row's contexts came
+    // from the witness, none from `combineKeyShare`:
+    //
+    //   secp256k1.zig:408  pcMul16, via mul() at line 253   -> counted IN-FILE
+    //   ctgrind_harness.zig:253  `if (mul(...)) |q| else |err|`  -> UNATTRIBUTED
+    //   root.zig:215  Element.fromPoint, at line 254        -> counted IN-FILE
+    //   Writer.zig:1812/1813  printHex                      -> witness (correct)
+    //
+    // Both "in-file" contexts are threshold_ecdsa's files, matched by this row's
+    // pattern (`root[.]zig|secp256k1[.]zig`) and credited to dkg. The third was
+    // this harness branching on the error-union tag of `mul` — a tag derived
+    // from the secret scalar, i.e. the very class the taint comment above takes
+    // care to avoid, reintroduced two lines later by the witness itself.
+    //
+    // The combined share IS the output of the function under test, so printing
+    // it directly is both the stronger witness and the honest one: it keeps the
+    // propagation proof (formatting a tainted value flags Writer.zig) while the
+    // in-file column goes back to describing `combineKeyShare` alone.
+    std.debug.print("ctgrind_result={x}\n", .{x_j.toBytes(.big)});
 }
 
 // ── the harness proper ────────────────────────────────────────────────────
@@ -288,7 +308,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     switch (target) {
         .coeffs => {
-            var da: std.heap.DebugAllocator(.{}) = .init;
+            var da: std.heap.DebugAllocator(.{}) = .init; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
             defer _ = da.deinit();
             try runCoeffs(da.allocator(), tainted);
         },
@@ -317,22 +337,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
 // )
 // declare -A LABEL=(
 //     [dkg/coeffs]='dkg Round-1 secret coefficients + shares (a_ik/b_ik, s_ij/s_ij_prime) -> Q/x_j'
-//     [dkg/combine]='dkg final combined secret share (x_j = combineKeyShare) -> basePoint.mul'
+//     [dkg/combine]='dkg final combined share'
 // )
 //
-// Measured (ReleaseFast, this pass, 2026-09-09): coeffs total=98 (control=0,
-// trap=0); combine total=5 (control=0, trap=0) AFTER fixing an over-taint
-// artifact this same pass found and removed (an earlier, whole-array-taint
-// version of `combine` measured 8, 3 of which were `core.zig:206`'s `?Scalar`
-// presence-discriminant, not the secret payload — see `runCombine`'s doc
-// comment). ⚠ One of `combine`'s 5 contexts (the mul at `x_j.toBytes()`,
-// fully inlined into `runCombine` itself at ReleaseFast) attributes to
-// `ctgrind_harness.zig`, not to `secp256k1.zig` — the exact same disputed
-// rejectIdentity call as the OTHER context that DOES show `secp256k1.zig`,
-// just relocated by the inliner. Neither PATTERN above matches
-// `ctgrind_harness[.]zig` (adding it would be the k256-incident fail-open
-// this repo's classifier exists to refuse), so that ONE context lands in
-// `unattr` under `scripts/ctgrind.sh --check` and needs a human-documented
-// exception, not a pattern change — see this pass's harness report for the
-// full per-context file:line/class breakdown (a source comment is the
-// wrong place for a table the code will make stale).
+// Measured (ReleaseFast, 2026-09-09): coeffs total=98 (control=0, trap=0);
+// combine total=2, in-file=0, witness=2, unattr=0 (control=0, trap=0).
+//
+// `combine` reached that number in two corrections, both of which were the
+// harness measuring itself rather than the module:
+//
+//   1. An earlier whole-array taint marked `?Scalar`'s presence discriminant
+//      as well as the payload and measured 8, three of them `core.zig:206` —
+//      bookkeeping every real run has fixed. Fixed by tainting each payload.
+//   2. The remaining 5 were ALL witness. The witness drove `x_j` through
+//      `Secp256k1.basePoint.mul` + `Element.fromPoint`, so the row counted
+//      `pcMul16` (`secp256k1.zig:408`) and `fromPoint` (`root.zig:215`) as
+//      in-file — both threshold_ecdsa's files, matched by this row's pattern
+//      — plus this file's own branch on `mul`'s secret-derived error tag,
+//      which landed in `unattr`. `combineKeyShare` contributed none of them.
+//      Fixed by printing `x_j` directly; see `runCombine`.
+//
+// ⚠ The pattern above is deliberately left WIDER than what the row now
+// matches. It is fail-closed: a context appearing in those files again would
+// be counted rather than quietly dropped into `unattr`, and narrowing it would
+// change this row's source digest for no measurement gain.

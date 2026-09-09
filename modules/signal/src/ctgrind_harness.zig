@@ -226,16 +226,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("sig={x}\n", .{sig});
         },
         .ratchet => {
-            var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
             defer threaded.deinit();
             const io = threaded.io();
 
-            const session = try buildSession(std.heap.page_allocator, io);
+            const session = try buildSession(std.heap.page_allocator, io); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
             var alice = session.alice;
             var bob = session.bob;
 
-            var msg = try alice.encrypt(std.heap.page_allocator, "ctgrind-signal-harness-plaintext");
-            defer msg.deinit(std.heap.page_allocator);
+            var msg = try alice.encrypt(std.heap.page_allocator, "ctgrind-signal-harness-plaintext"); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
+            defer msg.deinit(std.heap.page_allocator); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
 
             // Bob's root key and his current ratchet private key -- both
             // secret, both inputs to the DH-ratchet's `rootRatchet` ->
@@ -254,8 +254,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // printed plaintext is the propagation witness -- proof the
             // taint travelled root key -> DH ratchet -> chain key ->
             // message key -> AEAD open, not just into a dead intermediate.
-            const pt = try bob.decrypt(std.heap.page_allocator, msg.header, msg.ciphertext, io);
-            defer std.heap.page_allocator.free(pt);
+            const pt = try bob.decrypt(std.heap.page_allocator, msg.header, msg.ciphertext, io); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
+            defer std.heap.page_allocator.free(pt); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
             std.debug.print("plaintext={x}\n", .{pt});
         },
     }

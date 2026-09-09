@@ -257,7 +257,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("valgrind_support={}\n", .{builtin.valgrind_support});
 
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
     const header = "ctgrind-bbs-harness-header-v1";
 
     switch (target) {
