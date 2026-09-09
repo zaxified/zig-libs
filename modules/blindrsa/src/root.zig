@@ -761,6 +761,87 @@ test "feInvert rejects a factor of n (gcd(p, n) == p != 1)" {
     try std.testing.expectError(error.NotInvertible, feInvert(pk.n, p_fe));
 }
 
+// ── B5 anchor: the masking itself, not the value it produces ───────────────
+//
+// ⛔⛔ The test below this one ("mask cancels exactly") asserts VALUE equality
+// with the direct inverse — and therefore passes EXACTLY WHEN THE MASKING IS
+// GONE. The audit proved it: mutation `m8` (`maskedInvert` replaced by
+// `return feInvert(m, x);`) and `m21b` (the mask replaced by the constant 3)
+// both SURVIVED 42/42. Textbook `feedback_property_no_value_test_can_see`:
+// the guard was built on the artefact, not on the property.
+//
+// ⚠ And ctgrind cannot cover this either — a constant mask is still
+// branch-free, so no context count moves. The property is "a FRESH, UNIFORM
+// scalar is drawn per attempt", which is about the algorithm's use of
+// randomness, and the seam that makes it observable is already there:
+// `maskedInvert` takes its `std.Random` as a parameter.
+//
+// So these two tests count draws and force the retry path. Between them:
+//   * `m8` draws nothing at all           -> both fail,
+//   * `m21b` draws nothing and never retries -> both fail,
+//   * an implementation that draws once and reuses it -> the second fails.
+
+/// A `std.Random` that hands out a scripted sequence of full-width values and
+/// counts how many draws were taken. `sampleFe` requests `modulus_len` bytes
+/// per attempt, so one draw == one masking scalar.
+const ScriptedRandom = struct {
+    values: []const []const u8,
+    draws: usize = 0,
+
+    fn fill(self: *ScriptedRandom, buf: []u8) void {
+        const v = self.values[@min(self.draws, self.values.len - 1)];
+        self.draws += 1;
+        @memset(buf, 0);
+        if (buf.len >= v.len) {
+            @memcpy(buf[buf.len - v.len ..], v);
+        } else {
+            @memcpy(buf, v[v.len - buf.len ..]);
+        }
+    }
+};
+
+test "B5: maskedInvert DRAWS a fresh scalar and RETRIES when the mask makes the product non-invertible" {
+    const pk = try kat.publicKey();
+    const r = try rsa.Fe.fromBytes(pk.n, &kat.r, .big);
+
+    // First draw is `p`, a factor of `n`: `v = r*p mod n` still shares the
+    // factor, so `feInvert` must fail and the loop must draw AGAIN. The second
+    // draw is an ordinary value that works.
+    var second = [_]u8{0} ** kat.n.len;
+    second[kat.n.len - 1] = 0x07;
+    var scripted = ScriptedRandom{ .values = &.{ &kat.p, &second } };
+    const random = std.Random.init(&scripted, ScriptedRandom.fill);
+
+    const inv = try maskedInvert(pk.n, r, random);
+
+    // Still the right answer -- masking must cancel exactly.
+    var got: [kat.a1.inv.len]u8 = undefined;
+    try inv.toBytes(&got, .big);
+    try std.testing.expectEqualSlices(u8, &kat.a1.inv, &got);
+
+    // ⛔ The load-bearing assertion. An unmasked invert answers straight from
+    // `r` and never touches the RNG; a constant mask never touches it either.
+    // Two draws means: one scalar was drawn, its product was rejected, and a
+    // SECOND, DIFFERENT one was drawn.
+    try std.testing.expectEqual(@as(usize, 2), scripted.draws);
+}
+
+test "B5: a mask that never changes cannot rescue a non-invertible product — the retry bound is real" {
+    const pk = try kat.publicKey();
+    const r = try rsa.Fe.fromBytes(pk.n, &kat.r, .big);
+
+    // Every draw is `p`, so every attempt's product keeps the shared factor.
+    // A correct implementation exhausts its four attempts and fails closed;
+    // it must not loop forever, and it must not return a wrong value.
+    var scripted = ScriptedRandom{ .values = &.{&kat.p} };
+    const random = std.Random.init(&scripted, ScriptedRandom.fill);
+
+    try std.testing.expectError(error.NotInvertible, maskedInvert(pk.n, r, random));
+    // Four attempts, four scalars. Pins the bound the loop declares, and fails
+    // for an implementation that draws once and reuses it.
+    try std.testing.expectEqual(@as(usize, 4), scripted.draws);
+}
+
 test "maskedInvert matches the direct inverse (mask cancels exactly) and rejects non-invertible input" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x33} ** 32);
     const random = csprng.random();
