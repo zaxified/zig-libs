@@ -159,7 +159,22 @@ pub fn publicKeyFromScalar(private_scalar: [32]u8) EcdhError!PublicKey {
 /// protocol-specific `kdf` step — feed the result to `One.kdf`/`Two.kdf`).
 pub fn ecdhZ(private_scalar: [32]u8, peer: PublicKey) EcdhError![32]u8 {
     P256.scalar.rejectNonCanonical(private_scalar, .big) catch return error.InvalidScalar;
-    if (std.mem.allEqual(u8, &private_scalar, 0)) return error.InvalidScalar;
+    // ⛔ NOT `std.mem.allEqual(u8, &private_scalar, 0)`, which is what this was
+    // until 2026-09-09 (audit finding L1). That is a naive byte loop with an
+    // early return: for a real scalar it stops after ~1 byte, for the all-zero
+    // one it walks all 32 — a textbook distinguisher, on the SECRET scalar.
+    //
+    // ⚠ Measured, it did not compile that way: LLVM vectorised it into a single
+    // data-independent `vptest`, twice over (here and in `sphinx`). So this was
+    // never a live leak — it was SAFE BY ACCIDENT. `std.mem.allEqual` makes no
+    // constant-time promise, nothing pins that vectorisation, and another LLVM,
+    // `ReleaseSafe` or another target quietly turns it back into the byte loop
+    // with no test able to notice.
+    //
+    // `timing_safe.eql` promises it instead, which is what the line 35 lines
+    // above already does deliberately — and `scripts/check-ct-compare.py` now
+    // pins the call so it cannot be swapped back unnoticed.
+    if (std.crypto.timing_safe.eql([32]u8, private_scalar, [_]u8{0} ** 32)) return error.InvalidScalar;
     const point = try peer.toPoint();
     const shared = point.mul(private_scalar, .big) catch return error.InvalidPublicKey;
     return shared.affineCoordinates().x.toBytes(.big);

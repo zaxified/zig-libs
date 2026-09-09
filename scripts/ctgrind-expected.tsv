@@ -379,10 +379,10 @@ bolt3	ReleaseFast	derive	1	7	d4906365cc4de792	c0fc92c5fbd8fb55
 bolt3	ReleaseFast	revocation	1	10	d4906365cc4de792	bc9bf12a55a312c4
 bolt3	ReleaseFast	shachain	1	0	d4906365cc4de792	0516122e43713a52
 bolt3	ReleaseFast	shachain_index	1	1	d4906365cc4de792	21055013990ce08a
-ctap2pin	ReleaseFast	ecdh	1	4	01668687f2e11343	4596df5a3f29ae3b
-ctap2pin	ReleaseFast	one	1	7	01668687f2e11343	12de2588e792c80e
-ctap2pin	ReleaseFast	two	1	7	01668687f2e11343	4f76909ff534c3cc
-ctap2pin	ReleaseFast	token	1	0	01668687f2e11343	076a3a6729a924b0
+ctap2pin	ReleaseFast	ecdh	1	4	bfdf0d40556cbb04	4596df5a3f29ae3b
+ctap2pin	ReleaseFast	one	1	7	bfdf0d40556cbb04	12de2588e792c80e
+ctap2pin	ReleaseFast	two	1	7	bfdf0d40556cbb04	4f76909ff534c3cc
+ctap2pin	ReleaseFast	token	1	0	bfdf0d40556cbb04	076a3a6729a924b0
 fss	ReleaseFast	gen	1	0	3a5ad9154e5aa436	b40b02f9cf423f05
 # Was `>=1` and a confirmed defect: `dpf.zig:326`'s xorMasked compiled to
 # `test $0x1,%r9b` / `je` on the secret control bit at THIS call site while
