@@ -251,8 +251,13 @@ comment.
 - §4.3 aggregated multi-value range proofs (proving several `V_1..V_m` in
   one combined proof) — a `rangeproof.zig`-local extension reusing the
   same `Generators`/`Transcript`/`ipa` machinery.
-- A Pippenger/windowed `multiScalarMul` (performance only, see
-  `scalarvec.zig`'s doc comment).
+- ⚠ **No longer out of scope — this line is stale.** A windowed Pippenger
+  MSM was added as `scalarvec.multiScalarMulVartime` and `ipa.verifyIpa`
+  uses it. It is deliberately VARIABLE-time: its inputs are the public
+  proof and the public generators, so there is no secret to protect, and
+  the constant-time path for secret scalars remains `scalarvec.mulCt`.
+  What is still absent is a windowed CONSTANT-time MSM, which is what the
+  prover would need.
 - `n > 64` bignum witness support (see the `v` is a `u64` note above).
 
 ## Anchoring

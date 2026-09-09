@@ -55,16 +55,25 @@ primitive is implemented here. The sibling `frost`/`voprf` modules'
 `root.zig` doc comments were consulted for this repo's existing
 Ristretto255-usage conventions (scalars-as-raw-`[32]u8`, `meta` tag
 shape) — no code from those modules was copied (this module has no
-sibling-module dependency, `meta.deps = .{}`).
+sibling-module dependency, `meta.deps = .{}`). ⚠ That last parenthesis is
+stale as of the ct25519 constant-time work: `meta.deps` is now
+`.{"ct25519"}` — the constant-time secret-scalar ladder behind
+`scalarvec.mulCt`. Still no code copied from a sibling.
 
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 
-**Status: scaffold.** Generators (`generators.zig`), the Fiat-Shamir
+**Status: complete.** Generators (`generators.zig`), the Fiat-Shamir
 transcript (`transcript.zig`), scalar/vector + multi-scalar-mult helpers
 (`scalarvec.zig`), and both proof structs' byte codecs
 (`ipa.InnerProductProof`, `rangeproof.RangeProof`) are implemented and
-tested for real. The two irreducible zero-knowledge cores —
-`ipa.proveIpa`/`.verifyIpa` and `rangeproof.prove`/`.verify` — are
-`@panic("TODO(fable/core): ...")` stubs with fixed final signatures and
-complete per-step doc-comment contracts, awaiting a follow-up crypto
-pass. See `SPEC.md`'s "TODO(fable) — remaining" section.
+tested for real, and so are the two zero-knowledge cores —
+`ipa.proveIpa`/`.verifyIpa` and `rangeproof.prove`/`.verify`. They are no
+longer `@panic("TODO(fable/core): ...")` stubs; the crypto pass landed and
+`gate.core_implemented` is `true`.
+
+⚠ This paragraph said "scaffold" until 2026-09-09, long after that was
+true. It is recorded rather than silently rewritten because a status line
+that under-reports is the same defect as one that over-reports: this one
+told a reader the module was unusable, while the neighbouring "Caveats"
+bullet told them the prover leaked timing it no longer leaks. Both were
+found by the same audit.
