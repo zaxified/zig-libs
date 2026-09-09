@@ -16,6 +16,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | `tag.sh` | Cuts a dated release tag, and re-runs every lane before it does. A tag asserts that every module passed every lane at that commit. |
 | `hooks/` | The commit-time formatting hook and its own self-test. A hook that always exits 0 looks exactly like "nothing was ever unformatted". |
 | `capped` | Memory-capped process wrapper. ⛔ Run fuzzing through it and nothing else — an uncapped sweep has taken this host down. |
+| `modtest` | One module's lane (or one `zig test FILE` probe) with **producer and reader both inside the cap**, output to a file, byte-budgeted. Use it instead of `capped … \| tail` — see "The cap does not reach across a pipe". |
 | `fuzz-sweep.sh` | Repo-wide fuzz run over the harnesses `zig build check-fuzz` requires. ⛔ **This is the ONLY thing in the repo that actually fuzzes** — see below. |
 | `ctgrind.sh`, `ctgrind-expected.tsv` | Constant-time verification and the per-module expectations it is judged against. Needs valgrind, so it is deliberately NOT in the gate. |
 | `dark-tests.sh` | Finds modules that DECLARE tests the test binary never ran — the failure that reads as a pass. |
@@ -260,6 +261,51 @@ For anything that bypasses the driver — a bare `zig build test-<module>` while
 iterating — use the same cap through `scripts/capped`:
 
     scripts/capped zig build test-yaml --summary all
+
+### ⛔ The cap does not reach across a pipe — use `scripts/modtest`
+
+`capped CMD | tail -20` caps `CMD` and nothing else. The reader is a child of
+the CALLING shell, and under an IDE that shell lives in the **editor's** cgroup.
+So the cap bounds the half that was never the problem, while the half that
+accumulates sits in the one scope whose death takes the editor with it.
+
+Measured here on 2026-09-10, during the A1 fix campaign. An agent hand-built a
+mutant of one module file and ran it the only way it had — neither a lane nor
+capped:
+
+    $ZIG test /tmp/…/mac_mutant.zig 2>&1 | tail -20
+
+83 seconds later `tail` held **19.4 GB** of anonymous memory (31 GB of RAM,
+512 MB of swap). The kernel fired a *global* oom-kill, took `tail`, and because
+that task was inside `app-code-*.scope`, systemd tore the whole VS Code scope
+down with it — `Failed with result 'oom-kill'`, 20.2 G peak. The editor died;
+no capped `zig` process was anywhere near its limit.
+
+Three things were wrong at once, and `modtest` closes all three:
+
+- the compiler ran **outside** the cap (`zig test FILE` is not a build lane, so
+  nobody wrapped it) → `scripts/modtest --file FILE` gives one-file probes a
+  lane of their own. ⭐ A rule agents cannot follow without a tool is a rule
+  that gets bypassed;
+- the output went **into a reader the cap could not cover** → output is
+  redirected to `.zig-cache/modtest/<name>.log` and bounded by `head -c`
+  (O(1) memory), never piped into `tail`/`cat`/`grep`;
+- `tail -N` is only bounded when the producer emits newlines; a runaway mutant
+  is not obliged to → a byte budget plus a wall-clock `timeout`, and hitting
+  either is reported as a finding rather than as a detail.
+
+      scripts/modtest yaml                     # zig build test-yaml
+      scripts/modtest yaml -Doptimize=ReleaseFast
+      scripts/modtest --file .zig-cache/probe/mutant.zig
+
+⛔ Probe files belong in `.zig-cache/probe/`, not in a scratch directory under
+`/tmp`: tmpfs is RAM, so a mutant that writes without bound fills memory whether
+or not anything reads it.
+
+Verified three ways, as a new gate must be: a deployed runaway (`while (true)
+std.debug.print`) is contained at the byte budget and reported (8 MB log, exit
+124, machine flat); a healthy lane stays green (`l2disco` 61/61, 194 B); and a
+lane that runs nothing exits **1**, not 0 (`test-nosuchmodule`).
 
 The cap needs cgroup v2 with the `memory` controller delegated to the user
 manager (any modern systemd). It is probed for, not assumed, and degrades to a

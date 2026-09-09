@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Run ONE module's test lane with everything -- producer AND reader -- inside a
+# single capped cgroup, and print a bounded tail of the output.
+#
+#     scripts/modtest yaml                    # zig build test-yaml
+#     scripts/modtest yaml -Doptimize=ReleaseFast
+#     scripts/modtest --file probe.zig        # one-off `zig test FILE` (mutants)
+#     scripts/modtest --file probe.zig -OReleaseFast
+#     LINES=200 scripts/modtest yaml          # show more of the tail
+#
+# Why this exists, and why `scripts/capped zig build test-<m> | tail -20` is NOT
+# the same thing:
+#
+#   `capped` puts the COMMAND in a memory-capped transient scope. A reader on
+#   the other side of a pipe is not in that scope -- it is a child of the
+#   caller's shell, which under an IDE is the EDITOR's own cgroup. So the cap
+#   bounds the half that was never the problem.
+#
+#   2026-09-10, measured. An agent hand-built a MUTANT of one module file and
+#   ran it the only way it had, which was neither a lane nor capped:
+#       $ZIG test /tmp/.../mac_mutant.zig 2>&1 | tail -20
+#   83 seconds later `tail` reached 19.4 GB of anonymous memory in about 110 seconds. The kernel
+#   fired a GLOBAL oom-kill (31 GB of RAM, 512 MB of swap), killed `tail`, and
+#   because that task lived inside `app-code-*.scope`, systemd tore the whole
+#   VS Code scope down with it: "Failed with result 'oom-kill'", 20.2 G memory
+#   peak. The editor died; the capped `zig` process was never even close to its
+#   limit. `tail -N` is only bounded when the producer emits newlines -- one
+#   unterminated line, or a runaway test that never stops writing, and `tail`
+#   holds all of it in RAM. Two failures stacked: a bare `zig test` outside the
+#   cap (the 15.4 GB desktop-killer shape `capped` exists for), and a reader the
+#   cap could not have covered anyway. `--file` mode below closes the first by
+#   giving one-file probes a lane of their own -- a rule agents cannot follow
+#   without a tool is a rule that gets bypassed.
+#
+#   ⛔ And put the probe file in `.zig-cache/probe/`, not in a scratch directory
+#   under `/tmp`: /tmp is tmpfs, so a mutant that writes without bound fills RAM
+#   whether or not anything reads it.
+#
+# So: no pipe into an accumulating reader, ever. Output is redirected to a file
+# on DISK (`.zig-cache/modtest/`, droppable scratch -- never `/tmp`, which is
+# tmpfs, i.e. RAM), the whole pipeline runs inside ONE capped scope, and the
+# byte budget for the log is enforced by `head -c`, which is O(1) in memory.
+#
+# Knobs (all optional):
+#   ZIGLIBS_MEM_MAX      cgroup cap for the whole lane          (default 4G)
+#   ZIGLIBS_MODTEST_LOG_MAX   byte budget for the log           (default 256M)
+#   NICE                 niceness                               (default 15)
+#   JOBS                 zig build -j                           (default 2)
+#   LINES                lines of tail printed on success       (default 40)
+#   ZIGLIBS_MODTEST_TIMEOUT   wall-clock limit for --file mode  (default 120s)
+#
+# The 4G default is deliberately lower than `capped`'s 12G: this runner is for
+# the fix campaign, where up to four agents run lanes at once on a desktop the
+# user is sitting at. 4 x 4G leaves the editor and browser their half of RAM.
+# A full `zig build test` across EVERY module peaks at 4.1 GiB, so 4G is ample
+# for one module and still an order of magnitude under a runaway.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ $# -eq 0 ]]; then
+    echo "usage: scripts/modtest MODULE [zig build args...]" >&2
+    echo "       scripts/modtest --file PATH.zig [zig test args...]" >&2
+    exit 2
+fi
+
+mode=lane
+if [[ "$1" == "--file" ]]; then
+    mode=file
+    shift
+    [[ $# -ge 1 ]] || { echo "modtest --file needs a path" >&2; exit 2; }
+    probe="$1"
+    module="$(basename "${probe%.zig}")"
+else
+    module="$1"
+    probe=""
+fi
+shift
+
+log_dir="$REPO_ROOT/.zig-cache/modtest"
+mkdir -p "$log_dir"
+log="$log_dir/$module.log"
+
+: "${ZIGLIBS_MEM_MAX:=4G}"
+: "${ZIGLIBS_MODTEST_LOG_MAX:=256M}"
+: "${NICE:=15}"
+: "${JOBS:=2}"
+: "${LINES:=40}"
+export ZIGLIBS_MEM_MAX
+
+# Everything inside ONE scope: the build, the byte-budget filter, the redirect.
+# The script re-execs ITSELF inside the scope rather than handing systemd a
+# shell one-liner: `systemd-run` expands `${...}` in the command it is given, so
+# a `${PIPESTATUS[0]}` written there dies as "invalid environment variable name"
+# before bash ever sees it.
+if [[ -z "${_ZL_MODTEST_INNER:-}" ]]; then
+    export _ZL_MODTEST_INNER=1
+    if [[ "$mode" == file ]]; then
+        exec "$SCRIPT_DIR/capped" nice -n "$NICE" "$0" --file "$probe" "$@"
+    fi
+    exec "$SCRIPT_DIR/capped" nice -n "$NICE" "$0" "$module" "$@"
+fi
+
+set -o pipefail
+if [[ "$mode" == file ]]; then
+    # One file, one binary, same cap and same byte budget, plus a wall-clock
+    # limit -- a mutant that loops forever prints forever, and a byte budget
+    # alone only bounds how much of it we KEEP, not how long it runs.
+    # (`--test-timeout` is a `zig build` flag; `zig test` rejects it.)
+    timeout "${ZIGLIBS_MODTEST_TIMEOUT:-120s}" zig test "$probe" "$@" 2>&1 \
+        | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
+else
+    zig build "test-$module" -j"$JOBS" --summary all "$@" 2>&1 \
+        | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
+fi
+# pipefail makes this the BUILD's status, not `head`'s -- a truncated log must
+# not read as a green build.
+rc=$?
+
+bytes=$(stat -c %s "$log" 2>/dev/null || echo 0)
+budget=$(numfmt --from=iec "$ZIGLIBS_MODTEST_LOG_MAX" 2>/dev/null || echo 0)
+
+echo "── modtest $module ── exit $rc, log $log ($(numfmt --to=iec "$bytes" 2>/dev/null || echo "$bytes")B)"
+
+# A lane that hits the byte budget is a finding in its own right, not a detail:
+# it is the shape that killed the editor.
+if [[ "$budget" != 0 && "$bytes" -ge "$budget" ]]; then
+    echo "⛔ OUTPUT HIT THE ${ZIGLIBS_MODTEST_LOG_MAX} BUDGET — this lane writes without bound." >&2
+    echo "   Do NOT re-run it through a pipe. Diagnose from the log head:" >&2
+    echo "   head -c 4000 $log" >&2
+fi
+
+tail -c 200000 "$log" | tail -n "$LINES"
+exit "$rc"
