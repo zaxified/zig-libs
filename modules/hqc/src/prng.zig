@@ -261,11 +261,18 @@ pub fn sampleFixedWeightBiased(
     var idx: usize = weight - 1;
     while (idx > 0) {
         idx -= 1;
-        var found = false;
+        // ⛔ `found` is derived from the secret support, so the scan being
+        // early-exit-free was only half the property: `if (found) support[idx]
+        // = idx` still branched on it, measured 2026-09-09 as 3 of `decaps`'
+        // contexts. Accumulate a mask and blend instead — same value written,
+        // no decision taken on it. The reference's access pattern is unchanged.
+        var found: u32 = 0;
+        const cur = support[idx];
         for (support[idx + 1 .. weight]) |s| {
-            if (s == support[idx]) found = true;
+            found |= @as(u32, @intFromBool(s == cur));
         }
-        if (found) support[idx] = @intCast(idx);
+        const mask: u32 = 0 -% found;
+        support[idx] = (@as(u32, @intCast(idx)) & mask) | (cur & ~mask);
     }
 }
 

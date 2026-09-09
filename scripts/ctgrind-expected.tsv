@@ -278,10 +278,21 @@ ed448	ReleaseFast	ladder	1	0	dc6585ac248e91ee	43db8426e0d6c6e7
 # was NOT measured; that is different and much more expensive work. The claim
 # is "the module's stated property does not hold and nothing was testing it",
 # not "the key is out".
-hqc	ReleaseFast	decaps	1	14	f422f2cd7d2fc4d5	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	4	f422f2cd7d2fc4d5	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	6	f422f2cd7d2fc4d5	e91a390cf03fd6ad
-hqc	ReleaseFast	sampler	1	2	2a6058d658bd6789	b93fa60c89578576
+# hqc, 2026-09-09, two fixes in one pass. `mul`/`inverse` stopped indexing the
+# exp/log tables (removing FOUR secret-indexed table loads, the only ones verified
+# anywhere in this repo, plus a branch), and the biased sampler's duplicate fixup
+# blends under a mask instead of `if (found)`. decaps 14 -> 5, encaps 6 -> 0.
+# NO context of the `Use of uninitialised value` (load-address) kind remains.
+# ⭐ encaps' 0 is only meaningful because the row carries an output pin: a harness
+# that stopped calling the module would report 0 too.
+# What is left in decaps, both by design rather than oversight: 3 in reedsolomon
+# (Berlekamp-Massey's discrepancy test, and encode via re-encryption) and 2 in
+# prng -- the rejection loop's trip count, which spec v5.0.0 §3.5 REQUIRES for
+# keygen's x/y, and decaps re-derives y from the seed on every call.
+hqc	ReleaseFast	decaps	1	5	ab5752b387f0d07e	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	ab5752b387f0d07e	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	0	ab5752b387f0d07e	e91a390cf03fd6ad
+hqc	ReleaseFast	sampler	1	2	8eeeec94620e623e	b93fa60c89578576
 k256	ReleaseFast	field	1	0	2642e053d442bcc0	4f13cccddea81376
 k256	ReleaseFast	mul	1	2	5f54a05906a76759	729cb9458ddf4051
 k256	ReleaseFast	comb	1	1	5f54a05906a76759	2ac21fe395f35487

@@ -10,13 +10,36 @@
 //! byte-identical to the reference's for the same mathematical element —
 //! there is no repacking or basis change anywhere in this module.
 //!
-//! **`mul` uses a different algorithm than the reference, but is
-//! byte-exact anyway.** The reference computes a*b via a carryless
-//! (`pclmulqdq`-emulating) polynomial multiply followed by a fixed-tap
-//! reduction (`gf_carryless_mul` + `gf_reduce`) — a performance-motivated
-//! choice for its target hardware. This module instead multiplies via the
-//! `exp`/`log` tables below (`exp[(log[a]+log[b]) mod 255]`), the textbook
-//! discrete-log approach. **These compute the identical field product**:
+//! **`mul` follows the reference's algorithm, and it is not a style choice.**
+//! The reference computes a*b via a carryless polynomial multiply followed by
+//! a fixed-tap reduction (`gf_carryless_mul` + `gf_reduce`), and so does this
+//! module. It did not until 2026-09-09: it multiplied via the `exp`/`log`
+//! tables below (`exp[(log[a]+log[b]) mod 255]`), the textbook discrete-log
+//! approach, defended in this very comment as byte-exact.
+//!
+//! ⛔⛔ **Byte-exact it was. Constant-time it was not, and no value test could
+//! have noticed.** `log[a]` indexes a 256-entry table with a SECRET byte, so
+//! the cache line touched depends on the operand — the AES T-table class.
+//! Measured under memcheck on 2026-09-09 (`ctgrind_harness.zig`, `decaps`):
+//! four contexts at the old `gf256.zig:114`, reported as `Use of uninitialised
+//! value` at the LOAD, a different and worse kind than the `Conditional jump`
+//! everything else in this module produces. It was the only verified
+//! secret-indexed lookup in the whole repository. The equivalence argument
+//! below is about the VALUE the two algorithms compute; what differed was the
+//! memory ACCESS PATTERN, which is invisible to every test that compares
+//! outputs — including the exhaustive 65536-pair one this file now carries.
+//!
+//! ⚠ The tables stay, and every remaining index into them is PUBLIC:
+//! `reedsolomon.zig:349`/`:734` index by a loop counter, and `:680`/`:683`
+//! index by `gammas_sums`, which `computeFftBetas`/`computeSubsetSums` build
+//! from compile-time constants alone — a runtime-computed constant table, not
+//! ciphertext-derived. (Checked after a grep suggested otherwise; the
+//! measurement had already said so by never flagging those lines.) They also
+//! serve as the oracle for the exhaustive equivalence test.
+//!
+//! Cost, measured over 3+6 bench runs with disjoint spreads: **decaps +7.3%,
+//! encaps +1.0%**. The old and new products are identical: **the same field
+//! product**, because
 //! GF(2^8) multiplication is uniquely determined by the field's
 //! representation (same primitive polynomial `poly`, same generator
 //! alpha=2 i.e. "x") — not by which algorithm computes it. This is
@@ -110,10 +133,22 @@ pub fn add(a: u8, b: u8) u8 {
 /// (not the reference's carryless-multiply) is used, and why the result
 /// is still byte-exact.
 pub fn mul(a: u8, b: u8) u8 {
-    if (a == 0 or b == 0) return 0;
-    var s: u16 = log[a] + log[b];
-    if (s >= 255) s -= 255;
-    return @intCast(exp[s]);
+    // Carryless multiply: eight masked shift-and-xor steps. `0 -% bit` is 0 or
+    // 0xFFFF, so both arms of "add this shifted copy or don't" always execute.
+    var acc: u16 = 0;
+    const av: u16 = a;
+    inline for (0..8) |i| {
+        const bit: u16 = (@as(u16, b) >> i) & 1;
+        acc ^= (av << i) & (0 -% bit);
+    }
+    // Reduce mod `poly`, folding bits 15..8 down one at a time. Same shape:
+    // the fold is applied under a mask rather than under an `if`.
+    inline for (0..8) |k| {
+        const shift = 15 - k;
+        const bit: u16 = (acc >> shift) & 1;
+        acc ^= (poly << (shift - 8)) & (0 -% bit);
+    }
+    return @truncate(acc);
 }
 
 /// a^2 in GF(2^8) (reference: `gf_square`, a bit-doubling-then-reduce
@@ -130,15 +165,42 @@ pub fn square(a: u8) u8 {
 /// constant-time selection rather than rely on this value being
 /// meaningful — see reedsolomon.zig's `decode` doc contract).
 pub fn inverse(a: u8) u8 {
-    if (a == 0) return 0;
-    // Want exp[(255 - log[a]) mod 255]; (510 - log[a]) mod 255 gives the
-    // same result without a separate zero-wraparound branch, since
-    // log[a] in [0,254] implies (510 - log[a]) in [256,510], always >=255.
-    const s: u16 = (510 - log[a]) % 255;
-    return @intCast(exp[s]);
+    // a^254, by square-and-multiply over a COMPILE-TIME exponent: the six
+    // `r = r^2 * a` steps take r from a^1 through a^127, and the final squaring
+    // gives a^254 = a^-1. Every step is `mul`, so this inherits its
+    // branch-free, table-free shape, and `inverse(0) == 0` still falls out
+    // mechanically (every product of 0 is 0) as the doc above promises.
+    var r = a;
+    inline for (0..6) |_| {
+        r = mul(mul(r, r), a);
+    }
+    return mul(r, r);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────
+
+test "mul/inverse are byte-exact against the exp/log tables (all 65536 pairs)" {
+    // The tables stay in this file (reedsolomon.zig indexes them at PUBLIC
+    // positions), so the algorithm `mul` used until 2026-09-09 is still
+    // available as an oracle. This is the direct equivalence proof for the
+    // switch to a carryless multiply: same field, same product, for every
+    // input pair — not a sample, and not an appeal to the field axioms.
+    const t = std.testing;
+    for (0..256) |ai| {
+        const a: u8 = @intCast(ai);
+        for (0..256) |bi| {
+            const b: u8 = @intCast(bi);
+            const want: u8 = if (a == 0 or b == 0) 0 else blk: {
+                var sm: u16 = log[a] + log[b];
+                if (sm >= 255) sm -= 255;
+                break :blk @intCast(exp[sm]);
+            };
+            try t.expectEqual(want, mul(a, b));
+        }
+        const want_inv: u8 = if (a == 0) 0 else @intCast(exp[(510 - log[a]) % 255]);
+        try t.expectEqual(want_inv, inverse(a));
+    }
+}
 
 test "exp/log round-trip (table self-consistency)" {
     const t = std.testing;

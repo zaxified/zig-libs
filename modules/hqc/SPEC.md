@@ -88,6 +88,24 @@ below). See [README.md](README.md) for purpose and API.
   (`prng.zig`) are full linear scans with no early exit, matching the
   reference's `vect_generate_random_support{1,2}` access pattern.
 
+  ⛔⛔ **That sentence is about the duplicate SCAN, and it left the louder
+  thing unsaid: the rejection LOOP's trip count.**
+  `sampleFixedWeightRejection` redraws until a 24-bit value falls below
+  the threshold, so the number of XOF draws depends on the values drawn.
+  `decaps` re-derives the long-term secret `y` from `seed_dk` on **every
+  call** (the spec fixes `|dkKEM|` at a seed-sized 2321 bytes, so a
+  compact key means re-derivation, not storage), which puts that
+  data-dependent loop on the per-decapsulation path. Measured:
+  `prng.zig:216` and `:223`, 2 of `decaps`' 8 remaining contexts.
+
+  ⚠ **This is not fixable here.** Spec §3.5 mandates the split —
+  `SampleFixedWeightVect$` (rejection, unbiased) for keygen's `x`/`y`,
+  `SampleFixedWeightVect` (biased, constant draw count) for the
+  ciphertext randomness — so sampling `y` the cheap way would produce a
+  different key from the same seed and stop being HQC v5.0.0. Removing
+  this leak is a specification question, not an implementation one. It is
+  recorded here rather than left to be rediscovered.
+
   ⛔⛔ **AND THE COMPILER UNDOES IT. The structural match above is real and
   it is not enough — measured 2026-09-08.** The caveat that used to stand
   here said no machine-checked verification had been run. It has been now,
