@@ -358,6 +358,10 @@ pub const PerfEvent = perfbuf.Event;
 pub const PerfSampleFn = perfbuf.SampleFn;
 pub const PerfLostFn = perfbuf.LostFn;
 pub const PerfBufOpenError = perfbuf.OpenError;
+/// Count of POSSIBLE CPUs — the number every per-CPU map's syscall transfer is
+/// sized by. ⛔ Not `onlineCpus`: see `perfbuf.possibleCpuCount`.
+pub const possibleCpuCount = perfbuf.possibleCpuCount;
+pub const countCpuList = perfbuf.countCpuList;
 pub const PerfBufPollError = perfbuf.PollError;
 pub const PerfBufConsumeError = perfbuf.ConsumeError;
 

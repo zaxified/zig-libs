@@ -69,6 +69,13 @@ pub const createScratchMap = maps_mod.createScratchMap;
 pub const populateRule = maps_mod.populateRule;
 pub const populateRuleSet = maps_mod.populateRuleSet;
 pub const readScratchClass = maps_mod.readScratchClass;
+/// Every possible CPU's scratch slot. ⭐ On a live classifier the packet's own
+/// CPU wrote the value, and that is usually not CPU 0 — prefer this over
+/// `readScratchClass` in a control-plane poller.
+pub const readScratchClassAll = maps_mod.readScratchClassAll;
+pub const writeScratchClassAll = maps_mod.writeScratchClassAll;
+pub const scratchTransferLen = maps_mod.scratchTransferLen;
+pub const ScratchReadError = maps_mod.ScratchReadError;
 pub const CreateMapError = maps_mod.CreateMapError;
 pub const PopulateError = maps_mod.PopulateError;
 pub const lpm_key_size = maps_mod.lpm_key_size;
@@ -76,6 +83,10 @@ pub const lpm_value_size = maps_mod.lpm_value_size;
 pub const scratch_key_size = maps_mod.scratch_key_size;
 pub const scratch_value_size = maps_mod.scratch_value_size;
 pub const scratch_max_entries = maps_mod.scratch_max_entries;
+/// Bytes `bpf(2)` moves PER CPU for the scratch map — `round_up(value_size, 8)`.
+/// The map is per-CPU, so this, not `scratch_value_size`, sizes every buffer.
+pub const scratch_percpu_stride = maps_mod.scratch_percpu_stride;
+pub const scratch_max_stack_cpus = maps_mod.scratch_max_stack_cpus;
 // CPUMAP steering (see classifier.buildCpumapSteerProgram).
 pub const CpumapVal = maps_mod.CpumapVal;
 pub const createCpuMap = maps_mod.createCpuMap;

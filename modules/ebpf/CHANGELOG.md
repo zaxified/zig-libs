@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — `possibleCpuCount()` and `countCpuList()` are added (`perfbuf.zig`, re-exported from the module root). They report `/sys/devices/system/cpu/possible`, which is the number the kernel sizes **every per-CPU map's syscall transfer** by (`round_up(value_size, 8) * num_possible_cpus()`). ⛔ Deliberately distinct from the existing `onlineCpus`: a caller that sizes a per-CPU buffer from *online* CPUs — or from `std.Thread.getCpuCount()`, which is also online — under-allocates by the difference and the kernel writes past the end. Measured under QEMU on 2026-09-09 against `xdp-classifier`, whose 4-byte buffer took 8 bytes at 1 vCPU and 32 at 4. `countCpuList` is allocation-free because the callers that need it are sizing a buffer and have no allocator to hand; it is tested against `parseCpuList` on both accepted and rejected inputs, so the two cannot drift apart.
+
 - **2026-09-09** — Docs: the seven `src/testdata/*.bpf.c` fixtures had no
   `SPDX-License-Identifier`; added (MIT — they are this repository's own BPF programs). Note
   that these files also set `_license = "GPL"`, which is a value the kernel's BPF verifier

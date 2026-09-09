@@ -610,6 +610,48 @@ pub fn onlineCpus(gpa: std.mem.Allocator) OpenError![]u32 {
     return parseCpuList(gpa, raw);
 }
 
+/// Count the machine's POSSIBLE CPUs — `/sys/devices/system/cpu/possible`.
+///
+/// ⛔ **Not the same number as `onlineCpus`, and the difference is load-bearing
+/// for every per-CPU map.** The kernel sizes a `PERCPU_*` map's syscall
+/// transfer as `round_up(value_size, 8) * num_possible_cpus()`, which is the
+/// weight of `cpu_possible_mask` — CPUs that could ever appear, including ones
+/// currently offline or hot-pluggable. A caller that sizes its buffer from
+/// *online* CPUs (or from `std.Thread.getCpuCount()`, which is also online)
+/// under-allocates by exactly that difference and the kernel writes past the
+/// end. Measured under QEMU 2026-09-09 against `xdp-classifier`: a 4-byte
+/// buffer took 8 bytes at 1 vCPU and 32 at 4.
+///
+/// Allocation-free on purpose: the callers that need this are sizing a buffer
+/// and typically have no allocator to hand.
+pub fn possibleCpuCount() OpenError!u32 {
+    var buf: [512]u8 = undefined;
+    const raw = readSmallFile("/sys/devices/system/cpu/possible", &buf) orelse
+        return error.CpuEnumerationFailed;
+    return countCpuList(raw);
+}
+
+/// Count the entries a kernel CPU-list string denotes, without materialising
+/// them. Pure, so the range/comma syntax is testable without touching sysfs.
+/// Mirrors `parseCpuList`'s accepted syntax and its rejections exactly.
+pub fn countCpuList(text: []const u8) OpenError!u32 {
+    var n: u32 = 0;
+    var it = std.mem.tokenizeAny(u8, text, ", \t\r\n");
+    while (it.next()) |part| {
+        if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
+            const lo = std.fmt.parseInt(u32, part[0..dash], 10) catch return error.CpuEnumerationFailed;
+            const hi = std.fmt.parseInt(u32, part[dash + 1 ..], 10) catch return error.CpuEnumerationFailed;
+            if (hi < lo or hi - lo > 4095) return error.CpuEnumerationFailed;
+            n += hi - lo + 1;
+        } else {
+            _ = std.fmt.parseInt(u32, part, 10) catch return error.CpuEnumerationFailed;
+            n += 1;
+        }
+    }
+    if (n == 0) return error.CpuEnumerationFailed;
+    return n;
+}
+
 /// Parse a kernel CPU-list string into an explicit list. Pure, so the
 /// range/comma syntax is testable without touching sysfs.
 pub fn parseCpuList(gpa: std.mem.Allocator, text: []const u8) OpenError![]u32 {
@@ -1190,6 +1232,38 @@ test "parseCpuList handles the kernel's range/comma syntax" {
     try testing.expectError(error.CpuEnumerationFailed, parseCpuList(gpa, "3-1"));
     try testing.expectError(error.CpuEnumerationFailed, parseCpuList(gpa, "abc"));
     try testing.expectError(error.CpuEnumerationFailed, parseCpuList(gpa, "0-"));
+}
+
+test "countCpuList agrees with parseCpuList on every accepted and rejected input" {
+    const gpa = testing.allocator;
+    // ⭐ The two parsers are checked AGAINST EACH OTHER rather than against
+    // hand-written counts: a divergence is the failure mode that matters, since
+    // one sizes buffers and the other fills them.
+    for ([_][]const u8{ "0-3\n", "0-1,4,6-7", "0", "0-0", "2-5,9" }) |text| {
+        const list = try parseCpuList(gpa, text);
+        defer gpa.free(list);
+        try testing.expectEqual(@as(u32, @intCast(list.len)), try countCpuList(text));
+    }
+    for ([_][]const u8{ "3-1", "abc", "0-" }) |text| {
+        try testing.expectError(error.CpuEnumerationFailed, countCpuList(text));
+    }
+    // ⛔ Empty is an ERROR here though `parseCpuList` returns an empty slice:
+    // a zero would size a per-CPU buffer to nothing and the kernel would still
+    // write a full stride.
+    try testing.expectError(error.CpuEnumerationFailed, countCpuList("  \n"));
+}
+
+test "possibleCpuCount is at least the online count on this machine" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const possible = possibleCpuCount() catch |e| {
+        if (verboseSkip()) std.debug.print("\nebpf perfbuf possibleCpuCount SKIPPED: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    const online = onlineCpus(testing.allocator) catch return error.SkipZigTest;
+    defer testing.allocator.free(online);
+    // The whole point of the distinction: possible >= online, never the reverse.
+    try testing.expect(possible >= online.len);
+    try testing.expect(possible >= 1);
 }
 
 test "onlineCpus reports at least one CPU on this machine" {

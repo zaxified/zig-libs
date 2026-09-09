@@ -93,7 +93,12 @@ var xdp = try ebpf.attachXdp(gpa, ifindex, prog_fd, .{ .drv_mode = true });
 defer xdp.detach() catch {};
 
 // 5. Read back a classification (e.g. from a control-plane poller).
-const class = try xdp_classifier.readScratchClass(scratch_fd);
+//    ⭐ The scratch map is a PERCPU_ARRAY: the generated program wrote the
+//    slot of the CPU that handled the packet, which is usually NOT CPU 0.
+//    `readScratchClass` returns CPU 0's slot; a poller almost always wants
+//    every slot instead.
+const per_cpu = try xdp_classifier.readScratchClassAll(gpa, scratch_fd);
+defer gpa.free(per_cpu);
 ```
 
 ### CPUMAP steering (redirect a matched flow to a chosen CPU)

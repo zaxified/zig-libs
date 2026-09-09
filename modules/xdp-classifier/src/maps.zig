@@ -10,6 +10,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const BPF = linux.BPF;
 const rules = @import("rules.zig");
+const ebpf = @import("ebpf");
 
 /// `BPF_MAP_TYPE_LPM_TRIE` key layout: native-endian `u32` prefixlen + a
 /// 4-byte IPv4 address — see `rules.LpmKey`.
@@ -21,6 +22,19 @@ pub const scratch_value_size: u32 = 4;
 /// The scratch map is always exactly one slot (key `0`) — see
 /// `classifier.ClassifierOptions.scratch_map_fd`'s doc comment.
 pub const scratch_max_entries: u32 = 1;
+
+/// Bytes the kernel transfers PER CPU for the scratch map: the value size
+/// rounded up to 8. A `PERCPU_*` map's `bpf(2)` lookup/update always moves
+/// `round_up(value_size, 8) * num_possible_cpus()` bytes — there is no
+/// single-slot form of the syscall, and the caller does not get to ask for one.
+pub const scratch_percpu_stride: u32 = (scratch_value_size + 7) & ~@as(u32, 7);
+
+/// Most CPUs `readScratchClass` will size a stack buffer for. Above this it
+/// returns `error.TooManyCpus` rather than reading into a buffer it cannot
+/// prove is big enough; `readScratchClassAll` has no such bound.
+/// 1024 × 8 B = 8 KiB of stack, which covers every machine this module has a
+/// plausible deployment on.
+pub const scratch_max_stack_cpus: u32 = 1024;
 
 /// `BPF_MAP_TYPE_CPUMAP` key layout: a native-endian `u32` CPU index. See
 /// `createCpuMap`.
@@ -147,17 +161,101 @@ pub fn populateRuleSet(lpm_map_fd: linux.fd_t, rule_set: rules.RuleSet) Populate
     for (rule_set.rules) |rule| try populateRule(lpm_map_fd, rule);
 }
 
-/// Read back the scratch map's current classification (CPU 0's slot on a
-/// PERCPU_ARRAY — see `createScratchMap`'s doc; a full per-CPU read needs
-/// `bpf_map_lookup_elem` with a `num_possible_cpus()`-sized buffer, which
-/// `std.os.linux.BPF.map_lookup_elem` already handles via its plain
-/// `value: []u8` parameter sized appropriately by the caller — this helper
-/// covers only the common single-CPU-slot case).
+pub const ScratchReadError = error{
+    /// `/sys/devices/system/cpu/possible` could not be read or parsed, so the
+    /// required buffer size is unknown. Refusing is the only safe answer: a
+    /// guess that is too small is a kernel write past the end of it.
+    CpuEnumerationFailed,
+    /// This machine has more possible CPUs than `scratch_max_stack_cpus`. Use
+    /// `readScratchClassAll`, which sizes from the heap.
+    TooManyCpus,
+};
+
+/// Bytes `bpf(2)` will transfer for one scratch-map lookup or update on this
+/// machine. ⛔ Read it fresh rather than caching: CPUs are hot-pluggable and
+/// `possible` is what the kernel sizes by.
+pub fn scratchTransferLen() ScratchReadError!usize {
+    const ncpu = ebpf.possibleCpuCount() catch return error.CpuEnumerationFailed;
+    return @as(usize, scratch_percpu_stride) * ncpu;
+}
+
+/// Read back the scratch map's current classification — CPU 0's slot.
+///
+/// ⛔⛔ **This function used to hand the kernel a 4-byte stack buffer, and that
+/// was a stack overflow, not a documentation nit.** A `PERCPU_ARRAY` lookup
+/// moves `round_up(value_size, 8) * num_possible_cpus()` bytes and
+/// `std.os.linux.BPF.map_lookup_elem` passes only `value.ptr` — the slice
+/// length never reaches `bpf(2)`, so nothing clamps the write. Measured as real
+/// root under QEMU on 2026-09-09: the kernel wrote **8 bytes at 1 vCPU and 32 at
+/// 4**, into four bytes. It scales linearly, so an ordinary 8-CPU desktop
+/// overflows by 60.
+///
+/// ⛔ The previous doc comment claimed `map_lookup_elem` "already handles" the
+/// sizing "via its plain `value: []u8` parameter", and that this helper covered
+/// "the common single-CPU-slot case". Both halves were false: the length is
+/// never transferred, and there IS no single-CPU-slot case — the syscall path
+/// for per-CPU maps always works across all of them. That comment is why the
+/// bug survived review, so it is recorded here rather than deleted.
+///
+/// Returns CPU 0's slot, which is what the single-`u32` return can express. Use
+/// `readScratchClassAll` for every CPU's value — on a live classifier the
+/// packet's own CPU wrote its slot, and that is usually not CPU 0.
 pub fn readScratchClass(scratch_map_fd: linux.fd_t) !u32 {
+    const ncpu = ebpf.possibleCpuCount() catch return error.CpuEnumerationFailed;
+    if (ncpu > scratch_max_stack_cpus) return error.TooManyCpus;
+
     var key: [4]u8 = .{ 0, 0, 0, 0 };
-    var value: [4]u8 = undefined;
-    try BPF.map_lookup_elem(scratch_map_fd, &key, &value);
-    return std.mem.readInt(u32, &value, @import("builtin").cpu.arch.endian());
+    var value: [scratch_max_stack_cpus * scratch_percpu_stride]u8 = undefined;
+    const need = @as(usize, scratch_percpu_stride) * ncpu;
+    try BPF.map_lookup_elem(scratch_map_fd, &key, value[0..need]);
+    return std.mem.readInt(u32, value[0..4], @import("builtin").cpu.arch.endian());
+}
+
+/// Every possible CPU's scratch slot, in CPU order. The value the classifier
+/// wrote lives in the slot of the CPU that handled the packet, so a
+/// control-plane poller that wants "what did we classify" wants this, not
+/// `readScratchClass`.
+///
+/// Caller owns the returned slice.
+pub fn readScratchClassAll(gpa: std.mem.Allocator, scratch_map_fd: linux.fd_t) ![]u32 {
+    const ncpu = ebpf.possibleCpuCount() catch return error.CpuEnumerationFailed;
+
+    const raw = try gpa.alloc(u8, @as(usize, scratch_percpu_stride) * ncpu);
+    defer gpa.free(raw);
+
+    var key: [4]u8 = .{ 0, 0, 0, 0 };
+    try BPF.map_lookup_elem(scratch_map_fd, &key, raw);
+
+    const out = try gpa.alloc(u32, ncpu);
+    errdefer gpa.free(out);
+    const endian = @import("builtin").cpu.arch.endian();
+    for (out, 0..) |*slot, i| {
+        const at = i * scratch_percpu_stride;
+        slot.* = std.mem.readInt(u32, raw[at..][0..4], endian);
+    }
+    return out;
+}
+
+/// Write `class` into EVERY CPU's scratch slot. ⛔ The mirror image of the read
+/// bug: a per-CPU update READS `round_up(value_size, 8) * num_possible_cpus()`
+/// bytes out of the caller's buffer, so handing it four bytes over-reads the
+/// caller's stack just as surely. This module's own round-trip test did exactly
+/// that until 2026-09-09.
+pub fn writeScratchClassAll(gpa: std.mem.Allocator, scratch_map_fd: linux.fd_t, class: u32) !void {
+    const ncpu = ebpf.possibleCpuCount() catch return error.CpuEnumerationFailed;
+
+    const raw = try gpa.alloc(u8, @as(usize, scratch_percpu_stride) * ncpu);
+    defer gpa.free(raw);
+    @memset(raw, 0);
+
+    const endian = @import("builtin").cpu.arch.endian();
+    var i: usize = 0;
+    while (i < ncpu) : (i += 1) {
+        std.mem.writeInt(u32, raw[i * scratch_percpu_stride ..][0..4], class, endian);
+    }
+
+    var key: [4]u8 = .{ 0, 0, 0, 0 };
+    try BPF.map_update_elem(scratch_map_fd, &key, raw, 0);
 }
 
 // ── CPUMAP steering (see classifier.buildCpumapSteerProgram) ────────────────
@@ -296,12 +394,39 @@ test "createScratchMap + readScratchClass round-trip (needs CAP_BPF/root)" {
     };
     defer _ = linux.close(scratch_fd);
 
-    var key: [4]u8 = .{ 0, 0, 0, 0 };
-    var value: [4]u8 = undefined;
-    std.mem.writeInt(u32, &value, 42, builtin.cpu.arch.endian());
-    try BPF.map_update_elem(scratch_fd, &key, &value, 0);
+    // ⛔ This used to pass a 4-byte `value` to `map_update_elem`. On a PERCPU
+    // map that is the same defect as the read side -- the kernel copies
+    // `round_up(value_size,8) * num_possible_cpus()` bytes OUT of this buffer,
+    // so the test that was supposed to cover the path reproduced the bug
+    // instead. And it is one of the module's root-gated skips, so nothing ever
+    // ran it to find out.
+    try writeScratchClassAll(testing.allocator, scratch_fd, 42);
 
     try testing.expectEqual(@as(u32, 42), try readScratchClass(scratch_fd));
+
+    const all = try readScratchClassAll(testing.allocator, scratch_fd);
+    defer testing.allocator.free(all);
+    try testing.expect(all.len >= 1);
+    for (all) |slot| try testing.expectEqual(@as(u32, 42), slot);
+}
+
+test "scratch transfer length is the kernel's per-CPU arithmetic, not the value size" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // ⭐ Runs WITHOUT root, unlike every other test on this path -- which is the
+    // point: the sizing bug was reachable from an unprivileged machine's
+    // arithmetic, but the only test that touched it needed CAP_BPF and skipped.
+    try testing.expectEqual(@as(u32, 8), scratch_percpu_stride);
+    try testing.expect(scratch_percpu_stride >= scratch_value_size);
+
+    const need = scratchTransferLen() catch |e| switch (e) {
+        error.CpuEnumerationFailed => return error.SkipZigTest,
+        else => return e,
+    };
+    // The whole finding in one assertion: what the kernel moves is strictly
+    // more than the 4 bytes the old caller declared, on every real machine.
+    try testing.expect(need >= scratch_percpu_stride);
+    try testing.expect(need > scratch_value_size);
+    try testing.expectEqual(@as(usize, 0), need % scratch_percpu_stride);
 }
 
 test "populateRuleSet loads every rule in a small ruleset (needs CAP_BPF/root)" {
