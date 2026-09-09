@@ -139,7 +139,9 @@ were taken from it.
 Status of this pass
 --------------------
 
-**Part 1 + Part 2 complete.** `x3dh.zig`'s four-DH + HKDF agreement
+**Part 1 + Part 2 + Part 3 complete** (A1 F7: this line named only Parts 1-2
+even after PQXDH/Part 3 landed, though the very next sentences below already
+describe it as implemented). `x3dh.zig`'s four-DH + HKDF agreement
 (`initiateUnverified`/`respond`), both wire codecs (`PreKeyBundle`,
 `InitialMessage`), the fail-closed `initiate`/`generateSignedPreKey`
 entry points, `xeddsa.zig`'s `sign`/`verify` (spec variant) AND

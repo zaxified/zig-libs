@@ -1,20 +1,25 @@
-# signal — SPEC (X3DH + XEdDSA + Double Ratchet)
+# signal — SPEC (X3DH + XEdDSA + Double Ratchet + PQXDH)
 
 X3DH (signal.org/docs/specifications/x3dh) + XEdDSA
 (signal.org/docs/specifications/xeddsa) + Double Ratchet
-(signal.org/docs/specifications/doubleratchet); see [README.md](README.md)
+(signal.org/docs/specifications/doubleratchet) + PQXDH
+(signal.org/docs/specifications/pqxdh); see [README.md](README.md)
 for purpose and API. Provenance: see [NOTICE](NOTICE).
 
-**Status: Part 1 + Part 2 complete.** `x3dh.zig`'s DH+HKDF agreement, both
-wire codecs, and `xeddsa.zig`'s `sign`/`verify` (spec variant, with the
-Montgomery->Edwards sign-0 recovery, `edwardsFromMontgomery`) PLUS
-`xeddsa.libsignal.sign`/`verify` (deployed-libsignal variant, for
-interop with real Signal), plus `ratchet.zig`'s full Double Ratchet
-(`State` + `initAlice`/`initBob`/`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`,
-the DH + symmetric-key ratchets, `max_skip`-bounded out-of-order
-handling, transactional fail-closed `decrypt`) are implemented and
-tested — green in Debug and ReleaseFast, including a libsignal
-known-answer vector pinned against BOTH XEdDSA variants; see
+**Status: Part 1 + Part 2 + Part 3 complete** (A1 F7: this line said "Part 1
++ Part 2" after PQXDH/Part 3 landed — the "PQXDH (Part 3, `pqxdh.zig`)"
+section further down this same file was already accurate). `x3dh.zig`'s
+DH+HKDF agreement, both wire codecs, and `xeddsa.zig`'s `sign`/`verify`
+(spec variant, with the Montgomery->Edwards sign-0 recovery,
+`edwardsFromMontgomery`) PLUS `xeddsa.libsignal.sign`/`verify`
+(deployed-libsignal variant, for interop with real Signal), plus
+`ratchet.zig`'s full Double Ratchet (`State` + `initAlice`/`initBob`/
+`encrypt`/`decrypt`, `KDF_RK`/`KDF_CK`, the DH + symmetric-key ratchets,
+`max_skip`-bounded out-of-order handling, transactional fail-closed
+`decrypt`), plus `pqxdh.zig`'s four-DH + ML-KEM-1024 + HKDF agreement
+(`initiateUnverified`/`respond`, fail-closed `initiate`, `generateKemPreKey`)
+are implemented and tested — green in Debug and ReleaseFast, including a
+libsignal known-answer vector pinned against BOTH XEdDSA variants; see
 "Verification" below.
 
 ## Design

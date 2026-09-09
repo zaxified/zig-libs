@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **Documentation only.** A1 fix campaign: re-verified the module against
+  its audit record (`A1/signal.md`) before touching anything. Five of the seven open
+  findings (F1 HIGH, F2/F3 MED, F4/F5 LOW) turned out to already be fixed by `f79415fd`
+  (2026-09-01, the same day as the audit, before this campaign) — closed as REFUTED with
+  before/after evidence rather than re-fixed. The sixth (F7, LOW) was real: `SPEC.md`'s
+  title/status line and `NOTICE`'s "Status of this pass" line both still said "Part 1 +
+  Part 2 complete" despite each file's own PQXDH/Part-3 section, further down the SAME
+  document, describing it as implemented. Both now say "Part 1 + Part 2 + Part 3
+  complete". `rg -n "Part 1 \+ Part 2 complete" modules/signal/`: 2 hits before, 0 after.
+  F6 (LOW, whether the full 1632-byte `Agreement.associated_data` is meant to have an
+  in-tree consumer beyond `ratchetAssociatedData()`'s 64-byte truncation) is left open
+  as a question for the user — see `A1/signal.md`'s disposition.
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **sign 1 / ratchet 2**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. SPEC.md carries two constant-time paragraphs and **neither referenced any measurement until now** — unlike `ct25519`/`chachapoly`, whose SPECs cite their own harnesses. ⭐ The Double Ratchet result is the one worth having: `rootRatchet`'s two `KDF_RK` calls, `kdfCk`, and the HKDF/HMAC-SHA256 underneath introduce **zero branches of their own** on the tainted root and chain keys; both contexts are in delegates already measured and accepted (std's X25519 ladder, chachapoly's AEAD tag check). ⭐ XEdDSA's masked sign-bit select at `xeddsa.zig:193` disassembles to `cmovns` + a 32-byte load — the compiler replaced the byte-wise AND/OR blend with a DIFFERENT, also branch-free construction. Same instruction count either way. That is the counter-example to `bls12_381`'s `ctSelect`: this lowering goes both ways, which is exactly why it has to be measured rather than argued.
 
 - **2026-09-07** — **Test-only: both ratchet fuzz harnesses ran one degenerate
