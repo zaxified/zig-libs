@@ -739,6 +739,31 @@ test "a render's total work is bounded, not just its depth and its steps" {
     try testing.expectEqual(@as(usize, 511), out.len);
 }
 
+test "F-B3: quadratic namespace-concat accumulation is bounded, not just documented" {
+    const gpa = testing.allocator;
+    // SPEC.md §8 names this shape explicitly: `{% set ns.s = ns.s ~ 'x' %}` is
+    // O(n²) *memory* here (the reference's refcounted string is O(n)) because
+    // the render arena never reclaims the discarded intermediate copies.
+    // 8192 iterations of a 1-byte-per-step accumulation allocate roughly
+    // sum(1..8192) ≈ 33.6 MiB in throwaway concat copies alone — comfortably
+    // over an 8 MiB budget, so this is the F-B3 scenario itself, not a stand-in.
+    const opts: jinja.Options = .{ .max_render_bytes = 8 << 20 };
+    const src =
+        \\{% set ns = namespace(s='') %}{% for i in range(8192) %}{% set ns.s = ns.s ~ 'x' %}{% endfor %}{{ ns.s|length }}
+    ;
+    try testing.expectError(error.RenderBudgetExceeded, renderWith(gpa, opts, src, .{ .none = {} }));
+
+    // Sanity check the shape isn't rejected outright: a small accumulation
+    // under budget still renders the accumulated length.
+    const small_opts: jinja.Options = .{ .max_render_bytes = 8 << 20 };
+    const small_src =
+        \\{% set ns = namespace(s='') %}{% for i in range(50) %}{% set ns.s = ns.s ~ 'x' %}{% endfor %}{{ ns.s|length }}
+    ;
+    const out = try renderWith(gpa, small_opts, small_src, .{ .none = {} });
+    defer gpa.free(out);
+    try testing.expectEqualStrings("50", out);
+}
+
 test "wordcount, striptags and urlencode answer what the reference answers" {
     const gpa = testing.allocator;
     // Every expectation below was read off live Jinja2 3.1.6 on this host,
