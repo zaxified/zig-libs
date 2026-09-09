@@ -25,6 +25,16 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 - **Cookie hardening (OWASP baseline):** session cookies are always `HttpOnly` and `Secure` with
   `SameSite=Lax` by default. `Secure` is dropped for a plain-HTTP dev server **only** via the
   explicit `Options.allow_insecure_cookie` escape hatch — never silently.
+  **`__Host-` name prefix (A1 finding, 2026-09-10):** the OWASP Session Management Cheat Sheet's
+  further-hardening step — a cookie named `__Host-<name>` is rejected by the browser unless it also
+  carries `Secure`, `Path=/` and *no* `Domain` attribute, closing off same-site subdomain cookie
+  injection. This module's *defaults* already satisfy all three (`cookie_domain = null`,
+  `cookie_path = "/"`, `secure = true`), so no code change is needed to adopt it — set
+  `Options.cookie_name = "__Host-session"` (and, independently, `Csrf.cookie_name =
+  "__Host-csrf_token"`) at construction. Not the default itself, because a caller running the
+  documented `allow_insecure_cookie` dev escape hatch would then ship a cookie the browser silently
+  drops (`Secure` off + `__Host-` name is invalid), turning a dev convenience into "user is
+  mysteriously never logged in" — see the pinned end-to-end test in `root.zig`.
 - **CSRF — signed double-submit (`Csrf`):** the token is `HMAC-SHA256(key, session_id)`, hex-encoded
   — bound to the session (a token for session A never verifies for B, no cross-session replay) and
   stateless (the server recomputes the expected MAC). **The comparison is

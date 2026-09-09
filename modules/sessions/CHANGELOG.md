@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 finding LOW#2 (documentation, no code change): documented and pinned
+  with an end-to-end test that the `__Host-` cookie-name prefix (OWASP Session Management
+  Cheat Sheet) is already adoptable through the existing `Options.cookie_name`/
+  `Csrf.cookie_name` fields — this module's defaults (`cookie_domain = null`, `cookie_path
+  = "/"`, `secure = true`) already meet the prefix's own requirements. Not made the
+  default: combined with the documented `allow_insecure_cookie` dev escape hatch, a
+  `__Host-`-named cookie without `Secure` is silently dropped by the browser. See
+  `SPEC.md`'s "Cookie hardening" bullet.
+
 - **2026-09-07** — Fuzz reach: neither `fuzzSessionRecordDecode` nor `fuzzCookieParse`
   reached its decoder. Both opened `smith.bytes(&buf)` and then drew the length with
   `smith.valueRangeAtMost`; `bytes` consumes `@min(buf.len, in.len)` octets and a ranged

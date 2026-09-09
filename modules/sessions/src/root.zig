@@ -1104,6 +1104,49 @@ test "Manager.save: the session id in the Set-Cookie survives writeCookie's dead
     try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
 }
 
+test "__Host- prefixed cookie name: the OWASP hardening measure the config surface already supports" {
+    // A1 sessions LOW#2: the audit found the `__Host-` cookie-name prefix
+    // (OWASP Session Management Cheat Sheet) nowhere in this module — neither
+    // documented nor exercised — even though the prefix's own requirements
+    // (`Secure`, `Path=/`, no `Domain` attribute) are this module's *defaults*
+    // already. So this is not a code gap: `cookie_name` is a caller-supplied
+    // `Options` field today. Pinned here so that claim is demonstrated end to
+    // end through the real `Manager.save` / `writeCookie` path, not left as
+    // an assertion in prose — see SPEC.md's "Cookie hardening" bullet.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try Manager.init(testing.allocator, env.store.store(), .{
+        .io = testing.io,
+        .clock = env.clk.clock(),
+        .cookie_name = "__Host-session",
+    });
+
+    var s: Session = .{};
+    const known_id = "cafebabe" ** 8;
+    @memcpy(s.id_buf[0..known_id.len], known_id);
+    s.id_len = known_id.len;
+    s.created_ns = 1;
+    s.last_seen_ns = 1;
+    s.generation = 0; // unstored ⇒ save's CAS is a create, and succeeds
+
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    m.save(&rw, &s);
+    try rw.end();
+    const wire = out.buffered();
+
+    const sc = headerValue(wire, "Set-Cookie").?;
+    try testing.expect(std.mem.startsWith(u8, sc, "__Host-session=" ++ ("cafebabe" ** 8)));
+    try testing.expect(std.mem.indexOf(u8, sc, "Secure") != null);
+    try testing.expect(std.mem.indexOf(u8, sc, "Path=/") != null);
+    // The `__Host-` contract is void the moment a Domain attribute appears.
+    try testing.expect(std.mem.indexOf(u8, sc, "Domain=") == null);
+}
+
 // ── middleware tests (offline — through http.Server.serveStream) ─────────────
 
 const App = struct {
