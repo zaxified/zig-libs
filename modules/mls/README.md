@@ -774,4 +774,4 @@ Green in Debug and ReleaseFast.
 Clean-room from RFC 9420 (public IETF specification) plus a direct port
 of Appendix C's own published reference algorithm (`treemath.zig`). KAT
 vectors are official `mlswg/mls-implementations` interop test data. See
-`NOTICE` for the exact source commit/fetch date.
+`NOTICE` for the source commit and the two IETF Trust grants that cover both.

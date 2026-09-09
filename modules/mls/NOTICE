@@ -1,603 +1,72 @@
 mls — third-party attribution
 =============================
 
-This file carries a CONDITION, added 2026-09-06: the 15 JSON files under
-`src/data/` come from the IETF MLS working group's interop repository, and the
-IETF Trust's outbound licence grants the right to redistribute them subject to
-attributing IETF and identifying what was taken. See "IETF Trust grant" below.
-This file's own first line is what marks it condition-bearing; the root NOTICE
-lists no module (policy, 2026-09-06) and answers only whether the library as a
-whole is still plain MIT.
+Everything third-party in this module comes from one place, the IETF, and two
+written grants cover all of it. Both are in BCP 78 / the IETF Trust Legal
+Provisions 5.0. Nothing here rests on an argument about what is or is not
+copyrightable; that reasoning was removed on 2026-09-09 once the grants were
+read, and it is in this file's git history if it is ever wanted back.
 
-Kept as a module-local NOTICE (same placement as the sibling `bn254`/
-`bls12_381`/`bip340`/`adaptor` modules — self-contained crypto/protocol
-modules not folded into the root `NOTICE`).
+1. THE 15 JSON FILES under `src/data/` are the MLS working group's interop
+   test vectors, taken from https://github.com/mlswg/mls-implementations at
+   commit `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` (2026-04-22). Nine are
+   redistributed in full and without modification; five keep a subset of the
+   upstream records, every retained record unmodified; `tree-operations.json`
+   holds all five of its upstream records unmodified but re-serialised, so its
+   bytes differ while its content does not.
 
-Provenance
-----------
+   These files were contributed to an IETF working group, which makes them
+   IETF Contributions (RFC 5378 §1.a), and TLP 5.0 §3.a grants anyone the
+   right to copy, publish, display and distribute them — in full under
+   §3.a(i), as unmodified portions under §3.a(iii). §3.a(iii)(x) asks for
+   attribution in return, and this paragraph is it: the material is taken from
+   IETF Contributions to the IETF MLS working group, published at the URL and
+   commit named above.
 
-1. **RFC 9420** (Messaging Layer Security,
-   https://www.rfc-editor.org/rfc/rfc9420) — the source of truth for
-   every algorithm in this module: §2.1/§2.1.2 (`codec.zig`'s
-   presentation-language + QUIC-style variable-length-integer vector
-   encoding), §5.1/§17.1 (`suite.zig`'s cipher-suite bundle and suite
-   `0x0001`'s algorithm assignment), §5.1.2/§5.1.3/§5.2/§8/§9.1
-   (`crypto.zig`'s `SignWithLabel`/`VerifyWithLabel`/`EncryptWithLabel`/
-   `DecryptWithLabel`/`RefHash`/`ExpandWithLabel`/`DeriveSecret`/
-   `DeriveTreeSecret`). A public IETF specification — not copyrightable
-   expression (merger doctrine, `CONVENTIONS.md` §5) — so no attribution
-   entry is strictly required for the spec citation alone; listed here
-   for completeness alongside item 2's stronger case.
+   The upstream repository carries no LICENSE file of its own. That does not
+   decide anything here — the grant follows from what the contributors did,
+   not from what the repository posted.
 
-2. **RFC 9420 Appendix C** ("Array-Based Trees") specifically —
-   `treemath.zig`'s `log2`/`level`/`node_width`/`root`/`left`/`right`/
-   `parent`/`sibling`/`direct_path`/`copath` are a DIRECT PORT of the
-   Python reference algorithm the RFC itself publishes in this appendix
-   (not merely a description implemented independently — the RFC's own
-   text frames this as runnable reference code, and this module
-   translates it line-for-line into Zig, preserving the same variable
-   names/structure where Zig syntax allows).
+2. `src/treemath.zig` IS A LINE-FOR-LINE PORT of the Python listing RFC 9420
+   publishes in Appendix C. TLP 5.0 §4.c licenses code inside IETF documents
+   ("Code Components") under the Revised BSD License, whose clause 1 says to
+   keep the notice, so it is kept:
 
-   ⭐ THIS ENTRY NO LONGER RESTS ON THE MERGER DOCTRINE, changed
-   2026-09-08. It used to: item 1's reasoning ("an RFC's own algorithm
-   listing is part of the specification") was carried over to the port,
-   and that is the weakest place to run it — the argument is thinnest
-   exactly where a line-for-line translation is admitted, and there is a
-   WRITTEN GRANT available that costs nothing to accept. The IETF Trust
-   claims copyright in the code inside its documents and licenses it:
-   the Trust Legal Provisions (BCP 78) define "Code Components" — the
-   list includes classical programming code, and Appendix C is a Python
-   listing introduced as "The following python code demonstrates the
-   tree computations" — and TLP 5.0 §4.c grants them under the Revised
-   BSD License. So the author of the licence disagrees with the merger
-   reading, and the repository now takes the conservative side here.
-   This also settles a disagreement inside the repository itself:
-   `modules/ctap2pin/NOTICE` already cites RFC 5869/5903/4231 code
-   "under the Simplified BSD terms of the Trust Legal Provisions".
+   Copyright (c) 2023 IETF Trust and the persons identified as the
+   authors of RFC 9420. All rights reserved.
 
-   Reproduced as the Revised BSD License requires:
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions
+   are met:
 
-     Copyright (c) 2023 IETF Trust and the persons identified as the
-     authors of RFC 9420. All rights reserved.
+   1. Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
 
-     Redistribution and use in source and binary forms, with or without
-     modification, are permitted provided that the following conditions
-     are met:
+   2. Redistributions in binary form must reproduce the above
+      copyright notice, this list of conditions and the following
+      disclaimer in the documentation and/or other materials provided
+      with the distribution.
 
-     1. Redistributions of source code must retain the above copyright
-        notice, this list of conditions and the following disclaimer.
+   3. Neither the name of Internet Society, IETF or IETF Trust, nor
+      the names of specific contributors, may be used to endorse or
+      promote products derived from this software without specific
+      prior written permission.
 
-     2. Redistributions in binary form must reproduce the above
-        copyright notice, this list of conditions and the following
-        disclaimer in the documentation and/or other materials provided
-        with the distribution.
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+   FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+   COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+   STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+   ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+   OF THE POSSIBILITY OF SUCH DAMAGE.
 
-     3. Neither the name of Internet Society, IETF or IETF Trust, nor
-        the names of specific contributors, may be used to endorse or
-        promote products derived from this software without specific
-        prior written permission.
+   The condition is "keep the notice" and nothing else. It restricts nothing
+   about how this collection is used, and this module stays MIT.
 
-     THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-     "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-     LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
-     FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
-     COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
-     INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-     (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-     SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
-     HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
-     STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-     ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
-     OF THE POSSIBILITY OF SUCH DAMAGE.
-
-   The condition this adds is "keep the notice" and nothing else. It is
-   permissive, imposes no restriction on how this collection is used,
-   and does not change the library's own MIT terms.
-
-IETF Trust grant — verified 2026-09-06
---------------------------------------
-
-Until this revision every `mlswg/mls-implementations` item below rested on
-"public conformance data, not copyrightable expression" (merger doctrine), and
-noted that the repository has no licence file. That reasoning was weaker than it
-needed to be: there is a WRITTEN GRANT, and it was checked rather than recalled.
-
-  - **BCP 78 (RFC 5378) §1.a** defines an IETF Contribution as, among other
-    things, *"written and electronic communications, made at any time or place,
-    that are addressed to: ... any IETF working group or portion thereof"*.
-    The files below were committed to the MLS working group's own GitHub
-    organisation (`github.com/mlswg`) and are the vectors that working group
-    runs its interop against.
-  - **IETF Trust Legal Provisions 5.0 §3.a** — "Licenses For Use Outside the
-    IETF Standards Process" — grants *"to each person who wishes to exercise
-    such rights ... a non-exclusive, royalty-free, worldwide right and license
-    ... i. to copy, publish, display and distribute IETF Contributions and IETF
-    Documents in full and without modification"*, and *"iii. to copy, publish,
-    display and distribute unmodified portions ... provided that (x) each such
-    portion is clearly attributed to IETF and identifies the RFC or other IETF
-    Document or IETF Contribution from which it is taken"*.
-
-What we actually ship, measured against upstream at HEAD
-`cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` on 2026-09-06 (`curl` + `cmp`, and
-`json.load` record comparison for the rest):
-
-  - **9 files byte-identical, 2 583 432 B** — `crypto-basics.json`,
-    `key-schedule.json`, `message-protection.json`, `passive-client-random.json`,
-    `psk_secret.json`, `secret-tree.json`, `transcript-hashes.json`,
-    `tree-math.json`, `welcome.json`. These are §3.a(i): in full and without
-    modification.
-  - **5 files are proper subsets of upstream records, every retained record
-    unmodified** — `messages.json` (upstream 2 685 714 B), `treekem.json`
-    (11 of 77 records), `tree-validation.json`, `passive-client-welcome.json`,
-    `passive-client-handling-commit.json`. These are §3.a(iii): unmodified
-    portions.
-  - **1 file, `tree-operations.json`, holds all 5 upstream records unmodified
-    but was re-serialised**, so its bytes differ (50 429 B vs 50 670 B) while
-    its content does not. Recorded rather than glossed: §3.d grants no licence
-    to MODIFY, and re-serialising a container is the closest thing here to one.
-    The records themselves are what §3.a(iii) speaks of, and they are untouched.
-
-**Attribution, per §3.a(iii)(x):** the material above is taken from IETF
-Contributions to the IETF MLS working group, published at
-https://github.com/mlswg/mls-implementations, at the commit named with each
-item below. §3.a(iii)(y)'s legend requirement is about reproducing a substantial
-portion — in any event more than one-fifth — of the text of an IETF RFC; no RFC
-text is reproduced in these files.
-
-⚠ Two limits stated rather than argued away. **RFC 8874 §2 requires that
-"notices on repositories MUST include citations for the IETF Note Well"**, and
-this repository carries none — no CONTRIBUTING file, no licence, and a 15-line
-README that never mentions it (checked 2026-09-06). That is a defect on the
-working group's side, not a grant we can supply for them, and it is the reason
-this file previously concluded the IETF route did not reach. The grant above
-flows from what the contributors did (contributing to a working group), not from
-whether the repository posted the notice. Second, the merger-doctrine argument is
-kept below as a fallback, not deleted: across all 15 files there are only four
-English strings and they are RFC 9420 label names, so nothing here is authored
-prose either way.
-
-3. **`mlswg/mls-implementations`** (the IETF MLS working group's
-   interop test-vector repository, no explicit OSS license file present
-   — GitHub reports no detected license,
-   https://github.com/mlswg/mls-implementations) — `kat_test.zig`'s KAT
-   source: `test-vectors/tree-math.json` and
-   `test-vectors/crypto-basics.json`, fetched directly (not
-   hand-transcribed) on 2026-07-15 from the repository's `main` branch
-   (HEAD `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a`, commit date
-   2026-04-22; the two vector files themselves were last modified by
-   commit `e4d3b074f3452a6fa3a7681ede6c963c410aafd9`, "Rename test vector
-   files", 2023-02-03 — unchanged since) and embedded verbatim as
-   `src/data/tree-math.json` / `src/data/crypto-basics.json`
-   (`@embedFile`d by `kat_test.zig`, the same `src/data/` convention
-   `bls12_381/src/data/kzg_test_vectors/` already uses for embedded KAT
-   assets). These are public NUMERIC INTEROP CONFORMANCE DATA — tree-node
-   index relationships and HKDF/Ed25519/HPKE input-output tuples, the
-   deterministic output of running RFC 9420's own algorithms — the same
-   "public conformance data, not copyrightable expression" category this
-   repo's `bn254` NOTICE documents for its own `darkforest-v0.3` vectors
-   (also fetched from a repository with no explicit license file; merger
-   doctrine, `CONVENTIONS.md` §5); listed here out of the same caution
-   that entry applies, not because the JSON files are source code or
-   creative expression. Only the two JSON DATA files were fetched — no
-   implementation source from any of the repository's per-language
-   interop targets (`build/`, `interop/`, `docker/`) was read or ported.
-
-   (Items 5, 6 and 7 below record a THIRD, FOURTH and FIFTH fetch round
-   from this same repository revision, for the Part 4 key-schedule/
-   secret-tree vectors, the Part 5 framing vectors and the Part 6 Welcome
-   vector respectively.)
-
-4. **`mlswg/mls-implementations`, Part 2 (TreeKEM) vectors** —
-   `kat_treekem_test.zig`'s KAT source: `test-vectors/tree-validation.json`,
-   `test-vectors/tree-operations.json`, `test-vectors/treekem.json`,
-   fetched directly on 2026-07-16 from the same repository's `main`
-   branch (HEAD `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` — unchanged
-   from item 3's 2026-07-15 fetch, the repo hadn't moved). Per-file
-   last-modified commits: `tree-validation.json` →
-   `9ea691fee9464aaeee9eadf9757963f1be88f5dd` (2023-02-20, "Update after
-   fixing serialization bug"), `tree-operations.json` →
-   `89134d5de0222bd99598ba5849003d2e85e63116` (2025-11-30, "Change the
-   leafnode in the update proposal to source=update"), `treekem.json` →
-   `112c2d3960a558663280a1bbb18258766fea9d0d` (2023-03-01, "Update
-   TreeKEM test vector"). Same public-conformance-data posture as item 3
-   — no explicit OSS license on the source repository, but public
-   NUMERIC interop data (encoded ratchet trees, tree hashes, UpdatePath
-   ciphertexts, path secrets), not copyrightable expression.
-   **UNLIKE item 3, filtered to cipher suite `0x0001` BEFORE embedding**
-   (`jq -c '[.[] | select(.cipher_suite==1)]'`, entry order preserved) —
-   the unfiltered upstream files are 1.3 MB / 51 KB / 1.97 MB across 7
-   cipher suites; this module only wires suite `0x0001` (`suite.zig`), so
-   embedding the other 6 suites' data verbatim (unlike Part 1's small
-   `crypto-basics.json`, filtered at test-time instead) would have meant
-   a 3.4 MB `@embedFile` + `std.json` parse of mostly-irrelevant data on
-   every test run for no conformance benefit. Filtered files embedded as
-   `src/data/tree-validation.json` (115 KB, 14 entries) /
-   `src/data/tree-operations.json` (49 KB, 5 entries) /
-   `src/data/treekem.json` (164 KB, 11 entries).
-
-5. **`mlswg/mls-implementations`, Part 4 (key schedule + secret tree)
-   vectors** — `kat_keyschedule_test.zig`'s and `kat_secrettree_test.zig`'s
-   KAT source: `test-vectors/key-schedule.json`,
-   `test-vectors/secret-tree.json`, `test-vectors/psk_secret.json`, fetched
-   directly (not hand-transcribed) on 2026-07-28 from the same repository's
-   `main` branch — HEAD still `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a`
-   (commit date 2026-04-22), UNCHANGED from item 3's 2026-07-15 and item
-   4's 2026-07-16 fetches, so all three fetch rounds pin the same upstream
-   revision. Per-file last-modified commits at that revision:
-   `key-schedule.json` → `fd51ea702fe637e48452b8118123bff118767731`
-   (2023-03-01, "Key schedule test vector with 'exported'"),
-   `secret-tree.json` → `cb8c5e6b55d52d84a480b025757d86b89d414462`
-   (2023-02-07, "Update secret tree test vector"), `psk_secret.json` →
-   `9918564bd26a9fcc81f63bb090fa5c1676003e1c` (2023-02-17, "Add PSK test
-   cases with empty lists").
-
-   **UNLIKE item 4, embedded VERBATIM — not filtered to cipher suite
-   `0x0001`.** Item 4's filtering was justified by size (3.4 MB across
-   three files); these three total ~460 KB unfiltered, comparable to the
-   already-embedded filtered Part 2 set, so the stronger provenance claim
-   (the embedded bytes are byte-identical to upstream and independently
-   re-verifiable by hash) is worth more than the parse saved. The suites
-   this module does not wire are skipped at test time instead, the same way
-   Part 1's `crypto-basics.json` is — and the skip COUNT is asserted, so
-   the vectors for suites `0x0002`-`0x0007` being present is itself pinned.
-   SHA-256 of the embedded files, as fetched:
-   `key-schedule.json` =
-   `05aa9a68bd2538ace72d8c53375984cc728ef62220ebf314df675708546d97a7`,
-   `secret-tree.json` =
-   `08f92e6272452e2c832e32d38e16cf0c4aa28967e47d3842c60bc354c6b67a94`,
-   `psk_secret.json` =
-   `2b534969dba0b65a04b7d790496af5c0ccdb472b3fc4ca25c8c82df3e8523784`.
-
-   Same public-conformance-data posture as items 3/4 — no explicit OSS
-   license on the source repository, but public NUMERIC interop data (HKDF
-   derivation chains, per-leaf AEAD keys and nonces, PSK-chain outputs),
-   not copyrightable expression. The repository's own `test-vectors.md`
-   (the vector-FORMAT specification) was read to determine field semantics
-   — specifically that `key-schedule.json`'s `exporter.label` is a plain
-   string while every neighbouring field is hex — but no implementation
-   source from any per-language interop target was read or ported.
-
-6. **`mlswg/mls-implementations`, Part 5 (message framing) vectors** —
-   `kat_framing_test.zig`'s and `kat_messages_test.zig`'s KAT source:
-   `test-vectors/message-protection.json`,
-   `test-vectors/transcript-hashes.json`, `test-vectors/messages.json`,
-   fetched directly (not hand-transcribed) on 2026-07-29 from the same
-   repository's `main` branch — HEAD still
-   `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` (commit date 2026-04-22),
-   UNCHANGED from items 3/4/5's 2026-07-15/16/28 fetches, so all four fetch
-   rounds pin the same upstream revision. Per-file last-modified commits at
-   that revision: `message-protection.json` →
-   `5b3461fdecc5c8c44ea0b40a6587da8fdb983600` (2023-02-17, "Make commit in
-   the message protection vector valid"), `transcript-hashes.json` →
-   `292f586b47ed4a282ddd7afd7c02cc41f8b8e106` (2023-03-07, "Correct
-   confirmation key sizes in transcript hashes test"), `messages.json` →
-   `413c3aa8e76a354b9a100995e272d852752d870b` (2023-03-08, "interop: Update
-   'Messages' (w/o) trailing blank nodes.").
-
-   **Two of the three are embedded VERBATIM** — `message-protection.json`
-   (30 812 bytes, all 7 cipher suites) and `transcript-hashes.json` (7 328
-   bytes, all 7 cipher suites) — same reasoning as item 5: they are small
-   enough that the stronger provenance claim (byte-identical to upstream,
-   independently re-verifiable by hash) beats the parse saved. SHA-256 as
-   fetched, and of the embedded copies:
-   `message-protection.json` =
-   `f7c1ae62ce63c3003e526d539c99f2b1444f65ee0a487d3a5667d46867526c45`,
-   `transcript-hashes.json` =
-   `58046b58fbd98519b4e60953a105f550e4b427e2b140ea67dedcb751260eecb8`.
-
-   **`messages.json` IS filtered, and this entry records exactly how,
-   because the filter is not a suite filter.** Upstream's file is 2 685 714
-   bytes: 300 entries, each carrying 17 fields, with NO `cipher_suite` key
-   at all (every entry is suite-agnostic), so item 4's
-   `select(.cipher_suite==1)` approach does not apply. ONE reduction is
-   applied instead — an ENTRY prefix, the first 20 of 300, keeping all 17
-   fields:
-
-     jq -c '.[0:20]' messages.json
-
-   The entry cut needs justifying, so: all 300 entries were decoded and
-   their structural variants counted before choosing. They are structurally
-   IDENTICAL i.i.d. samples — every entry has a `member` sender, an `add`
-   proposal in `public_message_proposal`, a Commit with one by-reference
-   `ProposalOrRef` and a 1-node `UpdatePath`, an `update` LeafNode with
-   source `update`, an `external` PSK type, a `Welcome` with one recipient,
-   a `GroupInfo` carrying a `ratchet_tree` and an `external_pub` extension,
-   and a `GroupSecrets` with its `path_secret` present and a non-empty PSK
-   list. The ONLY field that varies structurally across the file is
-   `private_message.content_type`, which takes all three values, and the
-   shortest prefix covering all three is 3 entries. 20 was taken rather
-   than 3 for margin (all three content types appear 9/5/6 times in it),
-   giving 160 830 bytes — the same order as the already-embedded filtered
-   `tree-validation.json` (115 KB), against 2.7 MB for the full file.
-   `kat_messages_test.zig` ASSERTS the coverage this reasoning rests on
-   (all three §6 content types, all five §17.2 wire formats, at least one
-   Commit with a path and at least one by-reference proposal, at least one
-   `GroupSecrets` with a `path_secret` and at least one with PSKs), so a
-   future re-filter that silently lost a variant fails the test rather than
-   passing quietly. SHA-256 of the embedded (filtered) file:
-   `694d7d5747b143042f97e5a52cb3f0fd919d722c25a509410dba0ad1df0824cb`; of
-   the unfiltered upstream file as fetched:
-   `b194abe1561995223482dbad51c180146920dc2f637e74d01e07a388308791fb`.
-
-   (This entry was REVISED for Part 6. The Part 5 filter also projected
-   away four fields — `mls_welcome`/`mls_group_info`/`ratchet_tree`/
-   `group_secrets` — because nothing in the module could drive them then;
-   `welcome.zig` now can, so the projection is gone and only the entry
-   prefix remains. The previously embedded file's SHA-256 was
-   `b9f90562025292f3849576f5a74606bc6813383261bdd67691ca3c10154cdce6`,
-   recorded here so the change is traceable rather than silent.)
-
-   Same public-conformance-data posture as items 3/4/5 — no explicit OSS
-   license on the source repository, but public NUMERIC interop data
-   (serialized message structures, AEAD ciphertexts, MAC and hash outputs),
-   not copyrightable expression. The repository's own `test-vectors.md` (the
-   vector-FORMAT specification) was read to determine each file's field
-   semantics and its stated verification procedure — specifically
-   `message-protection.json`'s "use the member with LeafIndex 1 as the
-   sender", its "Initialize a secret tree for 2 members", and its
-   requirement that protecting an application message as a `PublicMessage`
-   must FAIL — but no implementation source from any per-language interop
-   target was read or ported.
-
-7. **`mlswg/mls-implementations`, Part 6 (Welcome / joining) vector** —
-   `kat_welcome_test.zig`'s KAT source: `test-vectors/welcome.json`,
-   fetched directly (not hand-transcribed) on 2026-07-29 from the same
-   repository's `main` branch — HEAD still
-   `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` (commit date 2026-04-22),
-   UNCHANGED from items 3/4/5/6's fetches, so all five fetch rounds pin the
-   same upstream revision. Per-file last-modified commit at that revision:
-   `welcome.json` → `be09a596f7588f5be54fda58ff9381896f6b66be` (2023-03-01,
-   "Welcome test vector using ExpandWithLabel").
-
-   **Embedded VERBATIM** — 16 815 bytes, all 7 cipher suites, one entry
-   each. Far below the size at which item 4's suite filtering was worth the
-   weaker provenance claim, so the embedded bytes are byte-identical to
-   upstream and independently re-verifiable by hash. SHA-256 as fetched,
-   and of the embedded copy:
-   `06be9d5c99817ef2545e4b15b8e73fd9b604685a8e55b59ca168eda98e236502`.
-   The suites this module does not wire are skipped at test time, and the
-   skip COUNT is asserted, the same way items 5/6 handle theirs.
-
-   Same public-conformance-data posture as items 3-6 — no explicit OSS
-   license on the source repository, but public NUMERIC interop data (HPKE
-   ciphertexts, AEAD-sealed group state, a signature and a MAC), not
-   copyrightable expression. The repository's own `test-vectors.md` (the
-   vector-FORMAT specification) was read to determine field semantics and
-   its stated verification procedure — specifically that `init_priv` is a
-   serialized HPKE private key, that `key_package`/`welcome` are whole
-   `MLSMessage`s rather than bare structures, and that the key schedule is
-   to be initialized "using the decrypted `joiner_secret` and no PSKs" —
-   but no implementation source from any per-language interop target was
-   read or ported.
-
-   (The note that stood here saying the three `passive-client-*.json`
-   vectors were NOT fetched, because they need commit processing this
-   module did not have, is superseded by item 8: Part 7 supplied the
-   commit processing and all three are now embedded.)
-
-8. **`mlswg/mls-implementations`, Part 7 (passive client / group state
-   machine) vectors** — `kat_passive_test.zig`'s KAT sources:
-   `test-vectors/passive-client-welcome.json`,
-   `test-vectors/passive-client-handling-commit.json` and
-   `test-vectors/passive-client-random.json`, fetched directly (not
-   hand-transcribed) on 2026-07-29 from the same repository's `main`
-   branch — HEAD still `cfd450286d1bfd9cd2519b95c80f9771f94a5b1a` (commit
-   date 2026-04-22), UNCHANGED from items 3/4/5/6/7's fetches, so all six
-   fetch rounds pin the same upstream revision. Per-file last-modified
-   commits at that revision:
-   `passive-client-welcome.json` ->
-   `df3aa1d01fc85d0a62edbc06f26043d6e7545dac` (2023-03-03, "Fix a bug in
-   welcome passive tests"); `passive-client-handling-commit.json` and
-   `passive-client-random.json` ->
-   `183f4e8b1da0a03b3e9f9db2a5594ac6c854bf40` (2024-03-15, "Fix format of
-   EdDSA keys (#186)").
-
-   **Two are FILTERED to cipher suite `0x0001` before embedding**, the same
-   reduction item 4 applies and for the same reason (this module wires only
-   suite `0x0001`, see `suite.zig`), entry order preserved:
-
-     jq -c '[.[] | select(.cipher_suite==1)]' passive-client-welcome.json
-     jq -c '[.[] | select(.cipher_suite==1)]' passive-client-handling-commit.json
-
-   The filter keeps WHOLE entries, so no recorded session is truncated:
-   every session that survives the filter is replayed to its last Commit.
-   Sizes: `passive-client-welcome.json` 719 346 -> 65 882 bytes (56 entries
-   -> 8, one per suite per scenario); `passive-client-handling-commit.json`
-   1 285 850 -> 117 079 bytes (91 -> 13). SHA-256 of the embedded
-   (filtered) files: `passive-client-welcome.json` =
-   `c4ee72349ec1da76dccc311f41c1c1fa69bdc9971a482288c94eaba2fc5ca9b3`,
-   `passive-client-handling-commit.json` =
-   `b10273634ba091f3df08fdafb70635dde284ab47a3338ca3ac5c117eeead1a2e`; of
-   the unfiltered upstream files as fetched:
-   `92ebb04b67b1aca4290965ae363650921842ceebe275bd79a2733414078d849c` and
-   `b24949fdf857bf79d511f57504a8bdc7ce3247eb199684745e439c11b1a1da21`.
-
-   `kat_passive_test.zig` ASSERTS the coverage each filter rests on, so a
-   future re-filter that silently loses a case fails the test rather than
-   passing quietly: for `passive-client-welcome`, all four combinations of
-   (tree carried in the Welcome / tree supplied out of band) x (no PSK /
-   one external PSK), and that it records zero Commits; for
-   `passive-client-handling-commit`, epochs with no proposals, with one,
-   and with several, and that every entry injects an external PSK; and for
-   both, that every recorded message really is a `PublicMessage` (the one
-   form `group.zig` accepts — asserting it is what keeps
-   `error.PrivateHandshakeNotSupported` an honest boundary rather than an
-   untested one).
-
-   **`passive-client-random.json` is embedded VERBATIM, 1 948 393 bytes,
-   and that size is a deliberate, recorded cost.** SHA-256 as fetched and
-   as embedded (identical, which is the point):
-   `0095d863e9d316872e237fc708debcd20ba2687ee905a3e831f97dd3e578d3c1`.
-   It is the largest embedded file in this repository — larger than
-   `bls12_381`'s 807 KB `trusted_setup.txt` — so it needs a reason, and
-   "too small to bother filtering" is not it. The reason is that NO
-   reduction is available that keeps what the file is for. It is a SINGLE
-   entry, already cipher suite `0x0001`, so item 4's suite filter does not
-   apply; the only remaining axis is an epoch PREFIX, and the length of the
-   chain is precisely the property under test — the vector's value is that
-   it replays 200 consecutive Commits, each an independent chance for a
-   systematic error to surface, with no way for the state machine to
-   resynchronize. A prefix would not even save much before it started
-   costing coverage: the recorded group grows until an `UpdatePath` spans
-   seven levels (a tree of up to 128 leaves, with correspondingly deep
-   filtered direct paths and large copath resolutions), and that depth is
-   not reached until epoch 110 of 200. `kat_passive_test.zig` asserts
-   exactly that — 200 epochs replayed, maximum `UpdatePath` depth 7, both
-   path-present and path-absent Commits, both inline and by-reference
-   `ProposalOrRef`s, and at least one empty proposal list — so a future
-   attempt to shrink this file fails loudly instead of quietly removing the
-   coverage that justifies its size.
-
-   Same public-conformance-data posture as items 3-7 — no explicit OSS
-   license on the source repository, but public NUMERIC interop data
-   (serialized MLS messages, HPKE and AEAD ciphertexts, MACs and derived
-   secrets), not copyrightable expression. The repository's own
-   `test-vectors.md` (the vector-FORMAT specification) was read to
-   determine field semantics and its stated verification procedure —
-   specifically its "Passive Client Scenarios" section: that
-   `signature_priv`/`encryption_priv`/`init_priv` are to be checked against
-   the KeyPackage's public keys, that `ratchet_tree` is a hex-encoded
-   `optional<Node> ratchet_tree<V>` and is null when the tree travels in
-   the Welcome, that the client joins with the Welcome plus the
-   `external_psks`, that `initial_epoch_authenticator` is compared after
-   the join, and that for each epoch the Commit is applied "using any
-   values from `proposals` that are incorporated by reference in the
-   Commit" before comparing that epoch's `epoch_authenticator` — but no
-   implementation source from any per-language interop target was read or
-   ported. In particular, where the recorded sessions disagreed with a
-   plain reading of RFC 9420 §12.3 (see `SPEC.md`'s Part 7 note on §7.5's
-   exclusion of same-Commit Adds), the disagreement was resolved by
-   re-reading the RFC until the governing sentence was found, NOT by
-   consulting another implementation's code.
-
-No third-party MLS IMPLEMENTATION (mls-rs, OpenMLS, mlspp, or any other
-language's MLS library) was read, consulted as a design reference, or
-ported from for this module. Every algorithm was implemented directly
-from RFC 9420's own text/pseudocode (item 1/2) and verified against the
-public interop vectors (items 3/4/5/6/7/8) — the same "spec + KAT, no
-third-party source" posture this repo's `hpke`/`signal` NOTICE-free
-modules document in their own SPEC.md "no NOTICE entry" reasoning; this
-file exists only because items 3-8's vector-fetch and item 2's
-direct-port relationship warrant the same explicit-citation caution
-`bn254`/`bls12_381` apply to their own KAT sources.
-
-
-===================================================================
-Provenance chain, traced 2026-08-12
-===================================================================
-
-Everything above described `mlswg/mls-implementations` as a repository
-with no licence file, and reasoned from there. That framing was
-incomplete in a way that matters: the WG repository is a COLLECTION
-POINT, so "the collection has no licence" says nothing about where the
-bytes came from before they landed there. A corpus donated by one
-project and re-hosted by another can carry the first project's terms
-with it, and that possibility was never checked. It has been now.
-
-WHAT WAS VERIFIED. All fifteen files under `src/data/` trace byte-exact
-to `mlswg/mls-implementations` at commit
-`cfd450286d1bfd9cd2519b95c80f9771f94a5b1a`. Nine are byte-identical to
-upstream as fetched; the other six reproduce exactly by running the `jq`
-filter commands this file already documents. Nothing was silently edited
-or substituted. `passive-client-random.json` — the largest and the one
-carrying the thinnest argument below — was re-fetched and `cmp`'d
-independently: 1,948,393 bytes, identical.
-
-WHO GENERATED THEM, which is what the chain question was really about:
-
-  crypto-basics.json, treekem.json, welcome.json
-      Richard Barnes (`bifurcation`), RFC 9420 editor and author of
-      mlspp (Cisco, BSD-2-Clause).
-  tree-validation.json, tree-operations.json, secret-tree.json,
-  psk_secret.json, message-protection.json, passive-client-welcome.json,
-  passive-client-handling-commit.json, passive-client-random.json
-      Marta Mularczyk (`mulmarta`), a principal contributor to
-      awslabs/mls-rs (Apache-2.0).
-  transcript-hashes.json
-      Théophile Wallez (CISPA), generated on MLS* (Inria-Prosecco,
-      Apache-2.0) — PR #107.
-  messages.json
-      Damian Poddebniak (`duesee`), PR #82, not traceable to a named
-      implementation.
-  key-schedule.json, tree-math.json
-      Barnes (2019) with later updates from Franziskus Kiefer (Cryspen);
-      the generating tool was not established.
-
-THE POINT OF LISTING THEM. None of these files is a verbatim copy of any
-of those projects' own test suites — code search against cisco/mlspp and
-awslabs/mls-rs returns zero hits for the file contents. They are original
-contributions authored FOR the working group repository. So no
-implementation's licence travels with the bytes, and the chain is clean
-rather than laundered: there is no upstream licence we are failing to
-honour, because there is no upstream licence at all.
-
-THE IETF GRANT DOES NOT RESCUE THIS, and it is worth recording why so the
-question is not reopened hopefully. Contributions to an IETF working
-group are normally governed by BCP 78/79, under which Code Components are
-licensed under the Revised BSD Licence — which would have replaced the
-merger-doctrine reasoning with an actual grant. It does not reach here.
-RFC 8874 conditions that on the repository carrying a CONTRIBUTING notice
-citing the Note Well, and `mlswg/mls-implementations` has no CONTRIBUTING
-file, no Note Well statement and no licence file anywhere in its tree.
-The merger-doctrine argument above therefore remains the operative one.
-
-WHERE THAT ARGUMENT IS STRONG AND WHERE IT IS THIN. It is comfortable for
-the small numeric and combinatorial files: `tree-math.json` is pure index
-arithmetic that this module could regenerate from RFC 9420 Appendix C
-outright, and the key-schedule / secret-tree / transcript-hash / crypto
-vectors are values the specification dictates, where any correct
-implementation must produce the same bytes.
-
-It is thinnest for `passive-client-random.json`. At 1.9 MB it is not a
-table of spec-mandated constants but one implementation's SCENARIO DESIGN
-— a randomised 200-epoch session whose shape (an UpdatePath first
-reaching depth 7 only at epoch 110) reflects choices about coverage that
-the RFC does not dictate. Selection and arrangement of that kind is
-exactly what merger doctrine does not cover. It is also the one file this
-module could not regenerate even in principle: `group.zig` returns
-`error.PrivateHandshakeNotSupported` for encrypted Commits (lines 895 and
-2163), so the state machine cannot drive the scenario at all, and
-byte-identical reproduction would additionally need the exact PRNG seed
-of whatever tool built it.
-
-DECIDED 2026-08-12. The repository owner accepted the residual risk on that
-single file, and the reasoning is recorded here rather than left implicit.
-Two arguments cover it — merger doctrine weakly, implied licence from the
-context of publication strongly — and neither is a written grant, so a
-residue remains. It is small and, more importantly, BOUNDED: the exposure is
-one test fixture in a source repository, nothing reaches a product or a
-distributed binary, and the remedy if the question were ever raised is to
-delete one file and lose one long-run test. That is a better trade than
-paying a certain loss of 200-epoch coverage now against an uncertain claim
-that the file's own author published it to invite. The other fourteen files
-never needed a decision.
-
-THE SECOND ARGUMENT, which fits the one thin case better than the first.
-Everything above asks whether the vectors are COPYRIGHTABLE. That is only
-half the question; the other half is whether permission was granted by the
-CONTEXT OF PUBLICATION even though no licence file exists.
-
-`mls-implementations` is the IETF MLS working group's interop repository.
-Its sole purpose — stated in its own README and in the working group's
-process — is that independent implementations run these vectors against
-their own code to demonstrate conformance. The files were not left lying
-in a personal repository and discovered; they were contributed there by
-their authors specifically so that other implementations would consume
-them for exactly this use.
-
-That is the classic setting for an implied non-exclusive licence: a rights
-holder who makes a work available in a forum whose only function is that
-others use it in a particular way is understood to have permitted that use,
-notwithstanding the absence of a written grant. Running and redistributing
-the vectors as conformance data inside a conforming implementation is the
-use the publication was FOR.
-
-This matters because it inverts the strength of the two arguments across
-the corpus. For the small numeric files, merger doctrine is the strong
-argument and implied licence is merely additional. For
-`passive-client-random.json` — where merger is thin, because a 200-epoch
-randomised scenario embodies coverage choices the specification does not
-dictate — implied licence is the STRONGER of the two, because that file's
-scenario design is precisely what its author published it to have others
-exercise. Neither argument is a licence, and both are recorded here as
-reasoning rather than as permission obtained.
+Every other RFC 9420 reference in this module is the specification implemented
+from its prose, which owes nothing — see the root `NOTICE` §0.
