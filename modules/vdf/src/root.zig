@@ -88,8 +88,10 @@
 //!   `rsa`, `paillier`, and `threshold_ecdsa` each already carry a
 //!   PRIVATE (non-exported) Miller-Rabin helper of their own; none of the
 //!   three is a `pub` export this module could import, so `vdf.zig` has
-//!   its OWN — see `meta.deps` below for why that keeps `deps = .{}`
-//!   rather than `.{"rsa"}`, and `vdf.zig`'s `isProbablePrime` doc comment
+//!   its OWN — see `meta.deps` below for why that leaves `deps =
+//!   .{"montint"}` rather than `.{"rsa"}` (this module's one sibling
+//!   dependency is `montint`'s arithmetic core, not any of the three
+//!   primality-test siblings), and `vdf.zig`'s `isProbablePrime` doc comment
 //!   for the one respect in which this copy is NOT a straight port: its
 //!   Miller-Rabin witnesses are drawn DETERMINISTICALLY from the candidate
 //!   (never `std.crypto.random`), because `hashToPrime` must be a pure

@@ -85,19 +85,41 @@ factors it) can skip the delay entirely by computing `2^T mod λ(N)`. See
 [SPEC.md](SPEC.md) for the full explanation and the class-group alternative
 (no trusted setup at all, out of scope here).
 
+## `T` calibration and trust — read before picking a deployment `T`
+
+Calibrate `T` against a build FASTER than this module's own `eval`, never
+against a Debug build: measured, this `eval` undershoots an OpenSSL-class
+adversary by ~1.57×, and a Debug build undershoots ReleaseFast by another
+~15.8× — **~25× combined**. `T` is also not bounded or capped anywhere in
+this module: a caller that accepts `T` from an untrusted party must impose
+its own ceiling, since `eval`/`prove` will spin for exactly as many
+squarings as they are given. See [SPEC.md](SPEC.md)'s "`T` calibration and
+trust" section for the full numbers.
+
 ## Import graph
 
 ```
-vdf → std.crypto.ff (Modulus/Fe), std.crypto.hash.sha3 (Shake256),
-      std.crypto.hash.sha2 (Sha256), std.math.big.int (TEST-ONLY: the
-      naive-quotient reference the streaming prover is cross-checked
-      against — never on the shipped prove/verify path)
+vdf → montint (Modint: the constant-time full-radix-2^64 Montgomery
+      arithmetic eval/prove/verify's hot squarings and modexps actually run
+      on), std.crypto.ff (Modulus/Fe: element validation, byte codec, the
+      quotient-group comparisons — not the hot loop),
+      std.crypto.hash.sha3 (Shake256), std.crypto.hash.sha2 (Sha256),
+      std.math.big.int (TEST-ONLY: the naive-quotient reference the
+      streaming prover is cross-checked against — never on the shipped
+      prove/verify path)
 ```
 
-No sibling-module dependency (`meta.deps = .{}`) — see `root.zig`'s
-`meta.deps` doc comment for why, despite `rsa`/`paillier`/`threshold_ecdsa`
-each having conceptually similar pieces (a `Modulus`/`Fe` alias, a private
-Miller-Rabin helper).
+One sibling-module dependency (`meta.deps = .{"montint"}`) — see
+`root.zig`'s `meta.deps` doc comment for why that one import exists despite
+`rsa`/`paillier`/`threshold_ecdsa` each having conceptually similar pieces
+(a `Modulus`/`Fe` alias, a private Miller-Rabin helper) that this module
+does NOT import from them (none of the three export theirs).
+`montint`'s Montgomery multiply IS constant-time (see its own module doc
+comment and `scripts/ctgrind.sh`'s coverage of it) — `vdf` uses it for raw
+throughput (full 2^64-bit limbs plus an amd64 asm core, vs `std.crypto.ff`'s
+portable 63-bit-limb implementation), not to shed a constant-time
+requirement neither module needs to shed. See `group.zig`'s module doc
+comment.
 
 ## Verify
 

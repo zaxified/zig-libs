@@ -5,6 +5,46 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, non-breaking (F6/F7/F8/F5/F10; F3/F4 left open):
+  - **F8 (LOW):** `group.montPowPublic` no longer underflows on an empty
+    exponent — a `usize` `exp_be.len - 1` that panicked in Debug/ReleaseSafe
+    and, measured, reads out of bounds and crashes with SEGV in ReleaseFast
+    (worse than the audit's originally observed "silently returns 1"; see
+    `A1/vdf.md` disposition). Unreachable from this module's own two call
+    sites (`l`/`r` are always 32 bytes) but the function is `pub` and
+    re-exported via `vdf.group`. Now returns `base^0 = 1` in every mode.
+  - **F7 (LOW):** `Proof.fromBytes` added a test for a too-long buffer —
+    the existing suite only ever exercised a too-SHORT one, so a weakening
+    of the `!=` length check to `<` (silently truncate a longer buffer)
+    passed every test green.
+  - **F6 (LOW):** fixed three factual documentation errors: `README.md`
+    claimed `meta.deps = .{}` (it has been `.{"montint"}` since the
+    montint rewire); `group.zig` claimed `montint`'s Montgomery multiply
+    is non-constant-time (it IS constant-time — its own module doc comment
+    and three `scripts/ctgrind.sh` harnesses say so; the actual reason
+    `vdf` uses it is throughput from full 2^64-bit limbs + an amd64 asm
+    core, not a dropped CT requirement); `root.zig`'s Caveats section
+    still said the choice "keeps `deps = .{}`" sixty lines above the
+    `.deps = .{"montint"}` that contradicts it.
+  - **F5/F10 (MED/LOW), documentation only:** added a "`T` calibration and
+    trust" section to `SPEC.md` and `README.md` — `eval` undershoots an
+    OpenSSL-class adversary by ~1.57× and a Debug build undershoots
+    ReleaseFast by ~15.8× (measured), ~25× combined if `T` is calibrated
+    from `zig build test-vdf`'s own default (Debug) lane; and `T` is an
+    unbounded, uncapped input that a caller accepting it from an untrusted
+    party must bound itself.
+  - **Left open:** F3 (Miller-Rabin round-count strength has no behavioral
+    test — the original auditor could not construct an exploit and neither
+    could this pass; a 256-bit composite that fools a reduced round count
+    needs a targeted Arnault-style construction, out of scope for this
+    pass) and F4 (a small-prime presieve in `hashToPrime` would cut
+    `verify`'s cost ~2.5× but is a new code path in the one place
+    soundness rests on primality — needs its own differential test and
+    exceeds this pass's scope; see `A1/vdf.md`).
+
+  Tests: 45 → 47 (both new). `scripts/modtest vdf`: 47/47 in Debug,
+  ReleaseSafe, and ReleaseFast. `zig fmt --check modules/vdf/`: clean.
+
 - **2026-09-06** — **BREAKING: the VDF now works in the quotient group
   Z_N*/{±1}, as Wesolowski over an RSA group must** (A1 audit F1, with F2
   and a test for F3). `-1 = N-1` has order 2 in Z_N* and the Fiat-Shamir

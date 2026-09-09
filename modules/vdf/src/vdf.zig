@@ -691,6 +691,16 @@ test "Proof codec: rejects wrong-length input" {
     try testing.expectError(error.WrongLength, Proof.fromBytes(&short));
 }
 
+// (A1 F7) The suite above only ever exercised a SHORTER-than-`modulus_bytes`
+// buffer, so a weakening of the `!=` length check to `<` (accept a LONGER
+// buffer and silently truncate it — two distinct wire encodings for one
+// proof, a malleability the codec's single fixed-width format is supposed to
+// rule out) left every test green. This is the missing tooth.
+test "Proof codec: rejects too-long input (A1 F7)" {
+    var long: [group.modulus_bytes + 1]u8 = undefined;
+    try testing.expectError(error.WrongLength, Proof.fromBytes(&long));
+}
+
 // ── fuzz: Proof.fromBytes never panics on arbitrary bytes ────────────────
 //
 // `Proof.fromBytes` is this module's only variable-length byte-loading

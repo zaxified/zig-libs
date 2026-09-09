@@ -242,6 +242,33 @@ has provably unknown order with NO trusted setup — the construction
 Chia and most production VDF deployments actually ship) — see "Non-goals
 / follow-ups" below.
 
+## `T` calibration and trust (A1 F5, F10)
+
+**Calibrate `T` against a faster adversary than this `eval`, and never
+against a Debug build.** `eval`'s squaring loop measures **1.176 µs/squaring
+in ReleaseFast** on the reference machine — but OpenSSL 3.5.5's
+`BN_mod_exp` on the same 2048-bit modulus does one modular squaring in
+**0.730 µs**, a **1.57× (measured 1.51–1.67× across 5 interleaved pairs)**
+head start for an adversary willing to use a faster modexp than this
+module's own. `ReleaseSafe` is 2.26× slower than `ReleaseFast`, and
+**Debug is 15.81× slower** — and Debug is the lane `zig build test-vdf`
+(no flags) runs, the exact command the "Verify" section above gives first.
+Calibrating a real deployment's `T` by timing a Debug build therefore
+undershoots the intended delay by roughly **25× (1.57 × 15.81)** against an
+OpenSSL-class adversary. Always calibrate `T` against a ReleaseFast build,
+and budget headroom for a faster-than-`eval` adversary — this module's own
+sequential loop is not a proof of the fastest achievable squaring rate.
+
+**`T` is an untrusted input wherever a service accepts it from a caller.**
+`eval`/`prove` spin `while (i < t)` with no upper bound and no way to
+interrupt the loop early: a `T` taken from an untrusted party (as opposed
+to a value the deploying service picks itself) is an unbounded-computation
+/ denial-of-service surface, not a delay parameter. `verify`'s own cost is
+independent of `T` (see "Verification" below), so a large `T` costs the
+VERIFIER nothing — it is specifically `eval`/`prove`'s callers who must
+treat `T` as trusted or externally bounded. This module does not enforce
+a ceiling; a caller that takes `T` from the wire must impose one itself.
+
 ## Verification
 
 - **`eval`**: three byte-exact vectors against the RSA-2048 Factoring

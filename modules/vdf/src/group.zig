@@ -73,26 +73,26 @@ pub fn mul(m: Modulus, x: Fe, y: Fe) Fe {
 // ── montint fast-path backend (the hot modular arithmetic) ──────────────────
 //
 // `std.crypto.ff` is a portable scalar CONSTANT-TIME Montgomery implementation
-// (63-bit redundant limbs, 4-way half-limb `mulWide`) — it protects a secret
-// exponent at a ~4–8× throughput cost. A VDF has NO secret exponent: `eval`'s
-// `T` sequential squarings, `prove`'s streaming quotient, and `verify`'s
-// exponentiations all run on the PUBLIC Fiat-Shamir transcript (`N`, `x`, `y`,
-// `π`, `l`, `r`). Paying the constant-time tax here buys nothing — worse, it
-// slackens the delay calibration: an adversary with a fast (non-CT) squaring
-// finishes `~4–8×` sooner than this `eval` predicts, so any `T` calibrated
-// against the slow `eval` UNDERSHOOTS the real delay (see `audit/modules/vdf.md`
-// F2). We therefore route every squaring/multiply through the sibling `montint`
-// module's full-radix-2^64 Montgomery arithmetic — the SAME `MontParams`/limb-
-// dispatch pattern `rsa` (`603a493`) and `paillier` (`6b587a5`) already use.
+// (63-bit redundant limbs, 4-way half-limb `mulWide`) — correct everywhere but
+// slow (~8–29× OpenSSL across this repo's bignum-crypto modules; see
+// `montint`'s own module doc comment). `montint` is ALSO constant-time — its
+// module doc comment says so, and `scripts/ctgrind.sh` runs three harnesses
+// over it with zero leaked branches (`ctgrind-expected.tsv`) — but is built on
+// full 2^64-bit limbs plus an amd64 `MULX`/`ADCX`/`ADOX` asm core, which is
+// where its speed actually comes from: NOT from dropping constant-time
+// behavior (a VDF's Fiat-Shamir transcript — `N`, `x`, `y`, `π`, `l`, `r` — is
+// all public, so there would be nothing wrong with a non-CT primitive here,
+// but `montint` does not offer one and this module does not need one to be
+// fast). We therefore route every squaring/multiply through the sibling
+// `montint` module's full-radix-2^64 Montgomery arithmetic — the SAME
+// `MontParams`/limb-dispatch pattern `rsa` (`603a493`) and `paillier`
+// (`6b587a5`) already use, for the same throughput reason.
 //
 // Unlike Paillier (whose `n²` and CRT `p²`/`q²` differ in width, forcing a
 // runtime slot dispatch), a VDF operates over a SINGLE modulus `N` of a fixed
 // `modulus_bits` (2048) ceiling — so one comptime `Modint(modulus_bits)`
 // instantiation covers every case. A caller-supplied `N` of fewer bits simply
 // occupies the low limbs with leading zero limbs (correct, marginally slower).
-// `montint` exposes a fast (non-CT) Montgomery multiply as its only mul, which
-// is exactly what we want here: no slower CT path is introduced on this public
-// data — a faster `eval` TIGHTENS the honesty of the delay calibration.
 const montint = @import("montint");
 
 /// The montint Montgomery context for `N`: `L = modulus_bits/64` (32) full
@@ -158,6 +158,14 @@ pub inline fn montMulResident(mod: *const MontN, a_mont: MontFe, b_mont: MontFe)
 /// is fine (and faster) precisely because `exp` is public — the `montint`
 /// analogue of the `ff.powWithEncodedPublicExponent` calls it replaces.
 pub fn montPowPublic(m: Modulus, mod: *const MontN, base: Fe, exp_be: []const u8) Fe {
+    // A1 F8: `exp_be.len == 0` is unreachable from this module's own two call
+    // sites (`l`/`r` are always `prime_bytes`-wide) but `montPowPublic` is
+    // `pub` and re-exported via `vdf.group` — an external caller passing an
+    // empty slice must get the mathematically correct `base^0 = 1`, not a
+    // `usize` underflow on the `exp_be.len - 1` below (which panicked in
+    // Debug/ReleaseSafe and produced a mode-divergent result in ReleaseFast;
+    // see `A1/vdf.md` F8). Early-return before that subtraction ever runs.
+    if (exp_be.len == 0) return fromMont(m, mod, mod.one_mont);
     const base_mont = toMont(mod, base);
     var acc = mod.one_mont;
     var seen = false;
@@ -388,4 +396,21 @@ test "toBytes: round trip through elementFromBytes" {
     var out: [modulus_bytes]u8 = undefined;
     try toBytes(fe, &out);
     try testing.expect(std.mem.eql(u8, &five, &out));
+}
+
+// (A1 F8) `montPowPublic` with an empty exponent: `exp_be.len - 1` used to
+// underflow before ever entering the loop — a panic in Debug/ReleaseSafe, a
+// mode-divergent result in ReleaseFast (see `A1/vdf.md` F8). It is
+// unreachable from this module's own two call sites (`l`/`r` are always
+// `prime_bytes` wide) but the function is `pub` and re-exported via
+// `vdf.group`, so an external caller's empty exponent must get the
+// mathematically correct `base^0 = 1` in EVERY build mode, not UB. This test
+// is the one place in the suite that reaches `montPowPublic` with a
+// zero-length `exp_be` at all.
+test "montPowPublic: empty exponent is base^0 = 1, in every build mode (A1 F8)" {
+    const m = try Modulus.fromPrimitive(u64, 1_000_003 * 999_983);
+    const mod = montModulus(m);
+    const base = try Fe.fromPrimitive(u64, m, 12345);
+    const result = montPowPublic(m, &mod, base, &.{});
+    try testing.expect(result.eql(m.one()));
 }
