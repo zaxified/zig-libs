@@ -904,3 +904,58 @@ test "F12: the three fail-closed guards — IdTooLong, MissingPartialIv, a paylo
     }
     try std.testing.expect(!pair.server.recipient.replay_window.initialized);
 }
+
+test "F15: unprotected_message/protected_message stop being dead KAT fields" {
+    // Both fields hold the FULL RFC 7252 wire message (Appendix C's own
+    // hex dumps) and, before this test, nothing in the suite ever read
+    // them (`rg -c 'v\\.unprotected_message|v\\.protected_message'` was 0).
+    // No CoAP option codec is needed to put them to use: the Code byte,
+    // and the position of the payload marker relative to already-proven
+    // fields (`plaintext`, `option_value`, `ciphertext`), are enough to
+    // pin the full message against the narrower fields the rest of this
+    // file already verifies byte-exact.
+    var unprotected_buf: [128]u8 = undefined;
+    var protected_buf: [128]u8 = undefined;
+    var plaintext_buf: [128]u8 = undefined;
+    var option_buf: [128]u8 = undefined;
+    var ciphertext_buf: [128]u8 = undefined;
+
+    for (v.message_vectors) |vec| {
+        const unprotected = hexBytes(&unprotected_buf, vec.unprotected_message);
+        const protected = hexBytes(&protected_buf, vec.protected_message);
+        const plaintext = hexBytes(&plaintext_buf, vec.plaintext);
+        const option_value = hexBytes(&option_buf, vec.option_value);
+        const ciphertext = hexBytes(&ciphertext_buf, vec.ciphertext);
+
+        // RFC 7252: byte 0 is the header, byte 1 is the Code. RFC 8613
+        // §5.3's `plaintext` starts with that SAME Code byte — the one
+        // field the outer wire message and the AEAD plaintext always
+        // agree on regardless of which options got folded away.
+        try std.testing.expectEqual(unprotected[1], plaintext[0]);
+
+        // C.7/C.8 (the two response vectors) carry no CoAP options at
+        // all in the original message, so its own payload marker +
+        // payload is byte-identical to `plaintext`'s — a full-body
+        // check, not just the Code byte.
+        if (std.mem.indexOfScalar(u8, plaintext, 0xFF)) |marker| {
+            const tail = plaintext[marker..]; // 0xFF ++ payload
+            try std.testing.expect(std.mem.endsWith(u8, unprotected, tail));
+        }
+
+        // `protected_message`'s own tail is exactly the payload marker
+        // plus `ciphertext`, and — when the OSCORE option carries a
+        // value — the bytes immediately before that marker are exactly
+        // `option_value`. The position is derived purely from the two
+        // already-verified fields' lengths; no option TLV decoding
+        // needed.
+        try std.testing.expect(protected.len >= 1 + ciphertext.len);
+        const marker_pos = protected.len - 1 - ciphertext.len;
+        try std.testing.expectEqual(@as(u8, 0xFF), protected[marker_pos]);
+        try std.testing.expectEqualSlices(u8, ciphertext, protected[marker_pos + 1 ..]);
+        if (option_value.len > 0) {
+            try std.testing.expect(marker_pos >= option_value.len);
+            const opt_start = marker_pos - option_value.len;
+            try std.testing.expectEqualSlices(u8, option_value, protected[opt_start..marker_pos]);
+        }
+    }
+}
