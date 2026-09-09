@@ -32,7 +32,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | `check-apps.sh` | Builds every `example-apps/` project against THIS working tree, via `zig build --fork=../..`. The apps pin a released tag because that is what someone who downloads one needs; the fork overrides that pin without touching the file. It is the only check here that reaches the published API through the real package machinery, the way a consumer does. `--pinned` builds from the manifest as written instead — fetch by URL and hash, compile the exported package — which is the downloader's own path and the only thing that exercises `.paths`; it is fail-closed and refuses unless every pinned tag resolves to `HEAD`, i.e. on a tag ref and nowhere else. `--run` then executes each app's own `smoke.sh`, which starts the program and asserts on what it does — the difference between "it compiles" and "it works", and what CI runs. It does that **twice per app, in `ReleaseSafe` and in `ReleaseFast`**, because a `std.debug.assert` guard is compiled out of the latter and a fail-open one is therefore invisible in safe modes. Also refuses a directory nobody declared, a declaration whose directory is gone, an app the collection README does not list, and an app with no executable `smoke.sh`. |
 | `check-ci-cache-keys.sh` | Refuses a CI config where one lane's cache restore-key prefix can match another lane's entry. `restore-keys` matches by prefix, so distinct names are not enough — they must not be prefixes of each other. An amd64 lane restored an aarch64 tree this way and recompiled everything, green throughout. |
 | `ci-environment.sh` | Installs the peers a hosted runner lacks. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. **Takes a ROLE since 2026-09-06** — `tests` (default), `interop`, or `all` — and the split is the whole point of the file now. `tests` is what a lane that RUNS tests or examples needs: the userns and ping sysctls, the yaml-test-suite corpus, opcua's open62541 container and its asyncua venv, imap's pymap venv, and the pinned `websockets` the websocket EXAMPLE judges itself against. `interop` is what only `zig build interop-<m>` reaches: a C compiler + wolfSSL headers (dtls) and `jinja2==3.1.6`/sympy/brotli/protobuf plus a grpcio venv (the five Python-driven ones). ⛔ **The `interop` half is not deletable.** Those six modules replay committed transcripts and pass on a host with no compiler and no Python — but a transcript nobody can RE-TAKE is a frozen anchor, extendable and correctable by nobody. `dnssec` lost one exactly that way and `gen-dnssec-oracle.sh` had to be written from nothing to get it back. |
-| `check-citations.py` | Verifies the RFC/standard citations in module docs point at something real. **Manual, not a gate:** measured on `dns`, it pairs an `RFC NNNN` mention with any nearby quoted string, so a quoted SPEC.md heading reports as a mismatch. Useful with triage, not as a red/green. 2026-09-06: 933 citations, 404 VERIFIED / 487 MISMATCH / 42 UNFETCHABLE — and two of the samples read by hand are genuinely wrong quotes, not extraction noise. See "Standards citations" below. |
+| `check-citations.py` | Verifies the RFC/standard citations in module docs point at something real. **Manual, not a gate:** measured on `dns`, it pairs an `RFC NNNN` mention with any nearby quoted string, so a quoted SPEC.md heading reports as a mismatch. Useful with triage, not as a red/green. 2026-09-09: 956 citations, **400 VERIFIED / 499 MISMATCH / 47 UNFETCHABLE / 10 UNCHECKED** — and two of the samples read by hand are genuinely wrong quotes, not extraction noise. ⛔ `UNCHECKED` is new that day and the ten did not appear from nowhere: they were being reported as VERIFIED while comparing NOTHING (see "Standards citations" below). See that section for what they turned out to be. |
 | `check-uapi-consts.py` | Diffs the kernel UAPI constants modules hardcode against the headers they came from. Driven by `zig build check-uapi`, which the gate runs; it SKIPS (never fails) on a host without python3 or kernel headers. Currently 689 matched / 0 mismatched across five modules, with 263 constants unresolved — it says so rather than counting them as passes. |
 | `gen-qr-decode-vectors.py` | External DECODE oracle for `qr`: **segno** (BSD-3, independently authored) produces the module grid and this module's decoder must read segno's own bytes back out. **Keep it.** `modules/qr/SPEC.md` named this gap in its own words — the committed golden set anchors the ENCODER, and only 10 of 40 versions, so the decoder (the untrusted-input half) had no external anchor at all until 2026-09-04. Emits all 960 vectors; 160 stratified ones are committed. Needs `segno`, so it is not a gate step. |
 | `gen-dnssec-oracle.sh` | Re-takes `modules/dnssec`'s independent-oracle anchor: builds a zone, signs it once per implemented algorithm with **ldns** (not this repo), and has `ldns-verify-zone` check each result. **Keep it.** The committed `oracle_vectors.zig` credited two different scratchpad paths, neither of which is in the repo — the module's strongest anchor had no re-takeable recipe at all. It deliberately does NOT reproduce the committed vectors byte for byte (those keys are gone and DNSSEC signatures are not deterministic); it re-establishes the property they attest. Needs `ldns`, so it is not a gate step. |
@@ -505,8 +505,8 @@ someone edits one and not the other; and `--check` needs valgrind and a human
 
 `scripts/check-citations.py [module ...]` fetches the RFC/BIP/BOLT/W3C text
 behind a quoted standards citation in `modules/**` and reports each one
-VERIFIED, MISMATCH or UNFETCHABLE — a fabricated citation is worse than a
-missing one, since nothing prompts a reader to doubt it. Needs network on
+VERIFIED, MISMATCH, UNFETCHABLE or UNCHECKED — a fabricated citation is worse
+than a missing one, since nothing prompts a reader to doubt it. Needs network on
 first run; caches into `${XDG_CACHE_HOME:-~/.cache}/zig-libs-citations`, never
 into the repo.
 
@@ -515,8 +515,32 @@ reports roughly half its claims as MISMATCH — mostly ordinary prose sitting
 near a standards token, not wrong citations. Read the `file:line` before
 believing one. UNFETCHABLE is never a pass: those claims are simply unchecked.
 
-**Whole-repo run, 2026-09-06: 933 citations — 404 VERIFIED, 487 MISMATCH, 42
-UNFETCHABLE, 4.3 s warm.** Before the same day it reported **12189** of them in
+### ⛔ UNCHECKED, and why it used to be a PASS (fixed 2026-09-09)
+
+A quote is split on ellipses and `[...]` editorial insertions, and only
+fragments of four words or more are searched for — shorter runs match almost
+anything. When a quote is short, or is mostly ellipsis, nothing survives that
+filter, and `verify()` then returned **VERIFIED having compared zero characters
+against the document**. A pass by construction, in the one tool built because an
+unfounded claim is worse than a missing one.
+
+Measured A/B on the same tree the day it was fixed: **410 VERIFIED before, 400
+after, with 10 UNCHECKED**. Only MISMATCH sets a non-zero exit status; UNCHECKED
+is a gap in coverage rather than a defect in the tree, and naming it is the
+entire point.
+
+⭐ What the ten turned out to be is worth knowing, because it says more about the
+EXTRACTOR than about the citations: seven are not citations at all but code and
+prose the regex mis-picked (`` ` prefix), NOT std's ``,
+`` _ = try whois.arinIpQuery(&qbuf, ``, `` : the incomplete group ``). Three are
+genuine quotes that are mostly ellipsis and cannot be checked as written
+(`kex: ... cipher: ... MAC: ...`, `interpret ... as little-endian ... mod q`).
+That ratio is the same precision problem behind the MISMATCH count, and it is
+why tightening extraction is the step AFTER this one, not before it.
+
+**Whole-repo run, 2026-09-09: 956 citations — 400 VERIFIED, 499 MISMATCH, 47
+UNFETCHABLE, 10 UNCHECKED.** (2026-09-06, before UNCHECKED existed: 933
+citations, 404 VERIFIED, 487 MISMATCH, 42 UNFETCHABLE, 4.3 s warm.) Before the same day it reported **12189** of them in
 49.9 s, because the walk skipped `.git`, `.zig-cache` and `zig-out` but not
 `zig-pkg` — and this collection's `example-apps/` depend on this collection, so
 the tree holds twelve complete extra copies of `modules/` (a root `zig-pkg`

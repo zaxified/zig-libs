@@ -24,6 +24,13 @@ What it does:
   3. Normalises whitespace/quote-style on both sides and checks the claimed
      text is a literal substring of the real document.
 
+Verdicts: VERIFIED, MISMATCH, UNFETCHABLE (no primary source reachable) and
+UNCHECKED (the document was fetched, but the quote had no fragment of >= 4
+words left after splitting on ellipses, so nothing was compared). UNCHECKED was
+reported as VERIFIED until 2026-09-09 — 9 of 404 passes had compared nothing.
+Only MISMATCH sets a non-zero exit status; UNCHECKED is a gap in coverage, not
+a defect in the tree, and saying so is the whole point of giving it a name.
+
 Every claim ends up in exactly one bucket:
   VERIFIED     the quoted text is present in the fetched primary source.
   MISMATCH     the source fetched fine, but the quoted text (or a fragment of
@@ -361,10 +368,28 @@ def body_for(doctype, raw):
 
 
 def verify(quote, body):
+    """Verdicts: VERIFIED (every fragment found), MISMATCH (some fragment was
+    not), UNCHECKED (there was nothing long enough to look for).
+
+    ⛔ UNCHECKED USED TO BE "VERIFIED", AND THAT WAS A PASS BY CONSTRUCTION.
+    A quote is split on ellipses and `[...]` editorial insertions, and only
+    fragments of >= 4 words are searched for -- shorter runs match almost
+    anything and would turn this tool into a random-verdict generator. When a
+    quote is short, or is mostly ellipsis, NOTHING survives that filter. The
+    function then returned VERIFIED having compared exactly zero characters
+    against the document.
+
+    Measured when the defect was found: 9 of 404 "VERIFIED" citations had
+    passed no comparison at all -- among them
+    `modules/ssh/src/transport.zig:1834` and `modules/http/src/conneg.zig:25`.
+    They are not wrong; they are UNKNOWN, and a tool built because a FABRICATED
+    citation is worse than a missing one must not report unknown as confirmed.
+    That is the same shape as a skipped test reported as a pass.
+    """
     q = norm(quote).strip(" .,;:")
     parts = [p.strip() for p in re.split(r"\.\.\.|…|\[[^\]]*\]", q) if len(p.strip().split()) >= 4]
     if not parts:
-        return "VERIFIED", [], []
+        return "UNCHECKED", [], []
     hits = [p for p in parts if p in body]
     miss = [p for p in parts if p not in body]
     return ("VERIFIED" if not miss else "MISMATCH"), hits, miss
@@ -413,6 +438,9 @@ def run(module_filter, verbose, json_out):
                 print(f"  Q: {c['quote'][:170]}")
                 if c["verdict"] == "UNFETCHABLE":
                     print(f"  reason: {c['reason']}")
+                elif c["verdict"] == "UNCHECKED":
+                    print("  reason: nothing >= 4 words survived splitting on ellipses/[...] —"
+                          " the document was fetched but nothing was compared against it")
                 else:
                     print(f"  missing: {c['missing']}")
 
