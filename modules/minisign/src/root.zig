@@ -638,6 +638,14 @@ pub fn sealSecretKey(
     return raw;
 }
 
+/// `scrypt.Params.fromLimits` hardcodes block size `r = 8` (RFC 7914); its
+/// `else` branch computes `max_n = mem_limit / (r * 128)` and feeds that
+/// straight into `math.log2`, which `assert`s its argument is nonzero. Any
+/// `mem_limit` below this floor makes `max_n` truncate to 0 — see
+/// `MemLimitTooSmall` below.
+const scrypt_r = 8;
+const scrypt_min_mem_limit: u64 = scrypt_r * 128; // 1024
+
 pub const OpenSecretKeyError = error{
     UnsupportedSignatureAlgorithm,
     UnsupportedChecksumAlgorithm,
@@ -653,6 +661,18 @@ pub const OpenSecretKeyError = error{
     /// where `usize` is narrower than 64 bits; the value is a real 64-bit
     /// on-disk quantity with no reason to assume it fits 32 bits.
     MemLimitTooLarge,
+    /// `raw.mem_limit < scrypt_min_mem_limit` (1024 bytes). This is the end
+    /// of the range that is actually reachable on every host this module
+    /// targets (`.linux64`/`.windows`, both 64-bit `usize`): a file with
+    /// `mem_limit` in `[0, 1023]` used to reach `scrypt.Params.fromLimits`
+    /// unchecked, whose `else` branch divides by 1024 and hands the
+    /// resulting 0 to `math.log2`, which `assert`s its argument is nonzero
+    /// — an unconditional panic on attacker/file-controlled bytes, before
+    /// any password is checked. This is the guard `MemLimitTooLarge`'s own
+    /// doc comment describes ("silently downgraded memory-hardness") but
+    /// could not reach, because that comment's failure mode lives at this
+    /// end of the range, not the upper one. A1 audit `minisign` F1/F2.
+    MemLimitTooSmall,
 };
 
 /// Decrypt (if needed) and load a `RawSecretKey`. Pass `password = null`
@@ -663,7 +683,9 @@ pub fn openSecretKey(
     allocator: std.mem.Allocator,
     raw: RawSecretKey,
     password: ?[]const u8,
-) !KeyPair {
+) (OpenSecretKeyError || std.crypto.pwhash.KdfError ||
+    std.crypto.errors.NonCanonicalError || std.crypto.errors.EncodingError ||
+    std.crypto.errors.IdentityElementError)!KeyPair {
     if (!std.mem.eql(u8, &raw.sig_alg, &sig_alg_legacy)) return error.UnsupportedSignatureAlgorithm;
     if (!std.mem.eql(u8, &raw.chk_alg, &chk_alg_blake2b)) return error.UnsupportedChecksumAlgorithm;
 
@@ -679,6 +701,7 @@ pub fn openSecretKey(
     } else if (std.mem.eql(u8, &raw.kdf_alg, &kdf_alg_scrypt)) {
         const pw = password orelse return error.PasswordRequired;
         const mem_limit: usize = std.math.cast(usize, raw.mem_limit) orelse return error.MemLimitTooLarge;
+        if (mem_limit < scrypt_min_mem_limit) return error.MemLimitTooSmall;
         const params = std.crypto.pwhash.scrypt.Params.fromLimits(raw.ops_limit, mem_limit);
         var stream: [encrypted_block_length]u8 = undefined;
         defer std.crypto.secureZero(u8, &stream);
@@ -945,6 +968,22 @@ test "sign/verify round-trip, both algorithms, plus tamper + wrong-key-id" {
     }
 }
 
+test "KeyPair.generate: two calls produce different seeds (A1 F5 -- a fixed seed left the suite green)" {
+    // RED, confirmed 2026-08-13 and reconfirmed by the 2026-09-04 audit: the
+    // mutation `entropy.fill(io, &seed)` -> `@memset(&seed, 0x42)` in
+    // `KeyPair.generate` leaves the WHOLE suite green (32/32 at the time) --
+    // nothing compared two generated keys against EACH OTHER, only against
+    // fixture/round-trip invariants a fixed seed satisfies just as well.
+    const io = std.testing.io;
+    const kp1 = KeyPair.generate(io);
+    const kp2 = KeyPair.generate(io);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &kp1.ed25519.secret_key.toBytes(),
+        &kp2.ed25519.secret_key.toBytes(),
+    ));
+}
+
 test "signDigest/verifyDigest: byte-exact against signMessage/verifyMessage's own .prehashed path" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -1055,6 +1094,39 @@ test "openSecretKey: the mem_limit-fits-usize guard rejects what does not fit, f
     // and type-checks for a target where it actually fires.
     try std.testing.expectEqual(@as(?u32, null), std.math.cast(u32, @as(u64, std.math.maxInt(u32)) + 1));
     try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), std.math.cast(u32, @as(u64, std.math.maxInt(u32))));
+}
+
+test "openSecretKey: mem_limit below the scrypt floor is rejected, not a panic (A1 F1, ladder 0/1/4/8/1023 bytes)" {
+    // RED, confirmed directly against `std.crypto.pwhash.scrypt.Params.fromLimits`
+    // (`.zig-cache/probe/minisign_f1_red.zig`, this session): `fromLimits(32768, 0)`
+    // panics with `thread ... panic: reached unreachable code` /
+    // `math.zig:1287: assert(x != 0)`, from inside `scrypt.zig:156`'s
+    // `math.log2(max_n)`. Before this guard, `openSecretKey` handed a
+    // file-controlled `mem_limit` straight to `fromLimits` with no floor —
+    // any of the five values below reached that same panic, unauthenticated,
+    // before the password was ever checked.
+    const gpa = std.testing.allocator;
+    var raw: RawSecretKey = .{
+        .sig_alg = sig_alg_legacy,
+        .kdf_alg = kdf_alg_scrypt,
+        .chk_alg = chk_alg_blake2b,
+        .salt = std.mem.zeroes([salt_length]u8),
+        .ops_limit = 32768,
+        .mem_limit = 0,
+        .key_number = std.mem.zeroes([key_number_length]u8),
+        .secret_key = std.mem.zeroes([secret_key_length]u8),
+        .checksum = std.mem.zeroes([checksum_length]u8),
+    };
+    for ([_]u64{ 0, 1, 4, 8, 1023 }) |mem_limit| {
+        raw.mem_limit = mem_limit;
+        try std.testing.expectError(error.MemLimitTooSmall, openSecretKey(gpa, raw, "any password"));
+    }
+    // Positive control: the floor value itself must clear THIS guard — it
+    // still fails, but through the KDF's own `ln == 0` guard
+    // (`error.WeakParameters`), proving the ladder above is testing the
+    // right guard and not just any rejection.
+    raw.mem_limit = scrypt_min_mem_limit;
+    try std.testing.expectError(error.WeakParameters, openSecretKey(gpa, raw, "any password"));
 }
 
 test "openSecretKey rejects an unrecognized sig_alg/chk_alg/kdf_alg tag" {
@@ -1310,6 +1382,141 @@ test "corpus: every signature file reaches the parser, and the counts are pinned
     // ever reached the parser at all. After:
     try std.testing.expectEqual(@as(usize, 3), parsed);
     try std.testing.expectEqual(@as(usize, 9), skeletons);
+}
+
+// ── fuzz: parseSecretKeyFile / openSecretKey never panic on arbitrary bytes ──
+//
+// A1 audit `minisign` F3: neither `parseSecretKeyFile` nor `openSecretKey`
+// had a fuzz harness, and F1 (the `mem_limit` panic fixed above) lives on
+// exactly that path -- which is how F1 survived three prior audits and a
+// clean 171k-run fuzz sweep that never once drove bytes through this parser.
+// A `.key` file is the same 2-line shape as a public-key file (`untrusted
+// comment: ...` + one base64 line), so this harness follows
+// `fuzzParseSignatureFile`'s two-pass shape: pass (a) drives the parser with
+// the drawn bytes verbatim, pass (b) reads the same bytes as a script for a
+// structurally-real skeleton generator. Both passes go one step past parsing
+// and also call `openSecretKey` on whatever comes out, with a fuzzed
+// password -- so a regression of the F1 guard fails here, not only in the
+// hand-written ladder test above. `mem_limit` gets a dedicated biased draw
+// (`[0, 2047]` half the time) because a plain 8-byte random draw would all
+// but never land in the 1024-wide F1 window out of 2^64.
+//
+// ⚠ Only the SECRET-key fixtures widen this corpus's blast radius, same
+// caveat as the signature harness above about not mixing in unrelated
+// fixtures for no reason -- these ARE the secret-key fixtures, used because
+// this harness's whole subject is secret-key parsing.
+const secret_key_file_buf_len = 512;
+
+const secret_key_file_seeds = [_][]const u8{
+    fuzzSeed(kat.unencrypted_secret_key_file),
+    fuzzSeed(kat.encrypted_secret_key_file),
+    fuzzSeed(kat.unencrypted_secret_key_file[0 .. kat.unencrypted_secret_key_file.len - 1]),
+    fuzzSeed("untrusted comment: ok\nAAAA\n"), // WrongLength
+    fuzzSeed("untrusted comment: ok\n!!!!\n"), // InvalidBase64
+    fuzzSeed("wrong prefix: ok\nAAAA\n"), // MissingUntrustedCommentPrefix
+    fuzzSeed("untrusted comment: ok\n"), // one line only
+    fuzzSeed(""), // the collapsed-harness input
+};
+
+test "fuzz: parseSecretKeyFile/openSecretKey never panic on arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzParseSecretKeyFile, .{ .corpus = &secret_key_file_seeds });
+}
+
+fn fuzzParseSecretKeyFile(_: void, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    var buf: [secret_key_file_buf_len]u8 = undefined;
+    const n: usize = smith.slice(&buf);
+    const drawn = buf[0..n];
+    if (parseSecretKeyFile(drawn)) |parsed| {
+        var pw_buf: [16]u8 = undefined;
+        const pw_len: usize = @min(pw_buf.len, drawn.len);
+        @memcpy(pw_buf[0..pw_len], drawn[0..pw_len]);
+        _ = openSecretKey(allocator, parsed.key, pw_buf[0..pw_len]) catch {};
+    } else |_| {}
+
+    var cur: tkfuzz.Cursor = .{ .bytes = drawn };
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try buildFuzzSecretKeyFile(&text, allocator, &cur);
+    if (parseSecretKeyFile(text.items)) |parsed| {
+        _ = openSecretKey(allocator, parsed.key, "fuzz password") catch {};
+    } else |_| {}
+}
+
+/// The 2-line skeleton, with the comment text and the `RawSecretKey` fields
+/// driven by the script. Shared with the corpus guard so the guard cannot
+/// measure a different generator.
+fn buildFuzzSecretKeyFile(text: *std.ArrayList(u8), allocator: std.mem.Allocator, cur: *tkfuzz.Cursor) !void {
+    try text.appendSlice(allocator, untrusted_comment_prefix);
+    const comment_len: usize = cur.ranged(0, 32);
+    for (0..comment_len) |_| try text.append(allocator, cur.byte());
+    try text.append(allocator, '\n');
+
+    var raw: RawSecretKey = undefined;
+    raw.sig_alg = if (cur.byte() & 1 == 1) sig_alg_legacy else .{ cur.byte(), cur.byte() };
+    raw.kdf_alg = if (cur.byte() & 1 == 1) kdf_alg_scrypt else kdf_alg_none;
+    raw.chk_alg = if (cur.byte() & 1 == 1) chk_alg_blake2b else .{ cur.byte(), cur.byte() };
+    for (&raw.salt) |*b| b.* = cur.byte();
+    raw.ops_limit = readFuzzU64(cur);
+    // Biased toward the A1 F1 boundary (`scrypt_min_mem_limit == 1024`).
+    raw.mem_limit = if (cur.byte() & 1 == 1) @as(u64, cur.ranged(0, 2047)) else readFuzzU64(cur);
+    for (&raw.key_number) |*b| b.* = cur.byte();
+    for (&raw.secret_key) |*b| b.* = cur.byte();
+    for (&raw.checksum) |*b| b.* = cur.byte();
+
+    try text.appendSlice(allocator, &SecretKeyCodec.encode(raw.toBytes()));
+    if (cur.byte() & 1 == 1) try text.append(allocator, '\n');
+}
+
+fn readFuzzU64(cur: *tkfuzz.Cursor) u64 {
+    var b: [8]u8 = undefined;
+    for (&b) |*x| x.* = cur.byte();
+    return std.mem.readInt(u64, &b, .little);
+}
+
+test "corpus: every secret key file reaches the parser, and the counts are pinned" {
+    // ⚠ Deliberately does NOT also pin how many skeletons `openSecretKey`
+    // opens: `Ed25519.KeyPair.fromSecretKey`'s public-key recomputation
+    // check is `if (std.debug.runtime_safety)`, so that count itself
+    // changes between ReleaseSafe and ReleaseFast (measured: 0 vs. 3 opened
+    // over this corpus) for reasons that have nothing to do with this
+    // parser. `parsed`/`skeletons` below come only from `parseSecretKeyFile`
+    // and `buildFuzzSecretKeyFile`, neither of which reads that flag.
+    const allocator = std.testing.allocator;
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var skeletons: usize = 0;
+    var seen: [secret_key_file_seeds.len]std.ArrayList(u8) = undefined;
+    defer for (seen[0..skeletons]) |*s| s.deinit(allocator);
+    for (secret_key_file_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [secret_key_file_buf_len]u8 = undefined;
+        const n: usize = smith.slice(&buf);
+        if (n != 0) nonempty += 1;
+        const drawn = buf[0..n];
+        if (parseSecretKeyFile(drawn)) |_| parsed += 1 else |_| {}
+
+        var cur: tkfuzz.Cursor = .{ .bytes = drawn };
+        var text: std.ArrayList(u8) = .empty;
+        try buildFuzzSecretKeyFile(&text, allocator, &cur);
+        if (parseSecretKeyFile(text.items)) |p| {
+            _ = openSecretKey(allocator, p.key, "fuzz password") catch {};
+        } else |_| {}
+        var already = false;
+        for (seen[0..skeletons]) |s| {
+            if (std.mem.eql(u8, s.items, text.items)) already = true;
+        }
+        if (already) {
+            text.deinit(allocator);
+        } else {
+            seen[skeletons] = text;
+            skeletons += 1;
+        }
+    }
+    // One seed IS the empty file, a legal member of a refusal corpus.
+    try std.testing.expectEqual(secret_key_file_seeds.len - 1, nonempty);
+    try std.testing.expectEqual(@as(usize, 3), parsed);
+    try std.testing.expectEqual(@as(usize, 7), skeletons);
 }
 
 // ── fuzz: isPrintableComment never panics/OOB-reads on arbitrary bytes ───

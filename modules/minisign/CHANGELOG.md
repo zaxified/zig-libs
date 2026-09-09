@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit F1 (HIGH): a file-controlled `mem_limit` in `[0, 1023]`
+  bytes reached `scrypt.Params.fromLimits` unguarded and panicked via `math.log2(0)`
+  — before any password check, on a key file nobody had authenticated. Confirmed
+  directly against `std.crypto.pwhash.scrypt.Params.fromLimits(32768, 0)`: `thread
+  ... panic: reached unreachable code` from `math.zig:1287: assert(x != 0)`.
+  `openSecretKey` now rejects `mem_limit < 1024` (`scrypt_r * 128`, the same floor
+  `fromLimits`'s own arithmetic implies) with a new typed `error.MemLimitTooSmall`,
+  before ever calling `fromLimits`. This also resolves F2: the existing
+  `MemLimitTooLarge` guard's doc comment ("silently downgraded memory-hardness")
+  described exactly this failure mode but guarded the wrong end of the range (only
+  reachable on hosts where `usize` is narrower than 64 bits, which this module does
+  not target). `openSecretKey`'s return type is now the explicit
+  `(OpenSecretKeyError || std.crypto.pwhash.KdfError || ...)!KeyPair` instead of an
+  inferred `!KeyPair` (F4), and a new fuzz harness drives arbitrary bytes through
+  `parseSecretKeyFile`/`openSecretKey` together, with `mem_limit` specifically
+  biased toward this boundary (F3) — the two previous fuzz targets never touched
+  this path, which is how F1 survived three prior audits and a 171k-run clean fuzz
+  sweep. A regression test also pins that two `KeyPair.generate` calls produce
+  different seeds (F5) — the suite previously could not tell a fresh key from
+  `entropy.fill` hardcoded to a constant. P1 applies throughout (0 consumers in
+  `zig-libs`). A1 audit: `~/CML/20260901-zig-libs-audit/A1/minisign.md`.
+
 - **2026-09-07** — Both fuzz targets ran one fixed input for their whole existence.
   `fuzzParseSignatureFile` built its `.minisig` from `smith.bytes` + ranged lengths and
   `smith.value(bool)` knobs; a ranged `Smith` draw returns the range MINIMUM when fewer than
