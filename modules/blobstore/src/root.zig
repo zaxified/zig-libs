@@ -165,7 +165,7 @@ pub const Options = struct {
     /// then on. `false` is for a store created that way from the start —
     /// "never deletes, never calls `gc`" is the intended usage this option
     /// is designed around, not a runtime switch on an established store.
-    /// `Store.hasOrphanedRcSidecars` is an opt-in check for exactly this
+    /// `Store.hasAnyRcSidecar` is an opt-in check for exactly this
     /// situation — see its doc comment for why it is opt-in rather than
     /// automatic at `init`/`gc` time.
     ///
@@ -342,11 +342,22 @@ pub const Store = struct {
     /// Read a refcount sidecar; `default_if_missing` on absence *or* on any
     /// parse/read failure (a torn/corrupt sidecar is never allowed to wedge
     /// `put`/`delete`/`gc` — it is treated the same as "not tracked").
+    ///
+    /// `Dir.readFile` fills `vbuf` and hands back only what fit — it does
+    /// NOT error when the file is bigger than the buffer (A1 F5). `vbuf` is
+    /// sized well past any legitimate `casRefWrite` output (max 20 decimal
+    /// digits for a `u64`), so a read that fills it to the very last byte
+    /// means the file is at least that long and its true contents were
+    /// never fully seen; treating that truncated prefix as the value could
+    /// silently read a five-referrer blob as zero. Falling back to
+    /// `default_if_missing` there keeps the exact same safe direction this
+    /// function already uses for a read or parse failure.
     fn casRefRead(self: Store, hex: []const u8, default_if_missing: u64) u64 {
         var pbuf: [800]u8 = undefined;
         const path = self.casRefPath(&pbuf, hex) catch return default_if_missing;
-        var vbuf: [24]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
         const data = std.Io.Dir.cwd().readFile(self.io, path, &vbuf) catch return default_if_missing;
+        if (data.len == vbuf.len) return default_if_missing; // oversized/corrupt sidecar, not a truncated guess
         return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch default_if_missing;
     }
 
@@ -854,6 +865,15 @@ pub const Store = struct {
         /// temp on another process/thread. Default 10 minutes: generous for
         /// any single blob ingest, tight enough to actually reclaim crash
         /// debris in routine maintenance sweeps.
+        ///
+        /// MUST be nonzero: `reapStaleIngestTemps`'s age check is
+        /// `age_ns < stale_after_ns`, and `age_ns` is never negative for an
+        /// existing file, so `stale_after_ns = 0` disarms that guard
+        /// entirely — every ingest temp, including one another
+        /// thread/process is actively streaming into this instant, becomes
+        /// eligible for deletion on the very next `gc` (A1 F3). `gc` refuses
+        /// `stale_after_ns == 0` with `error.StaleAfterTooSmall` rather than
+        /// silently running with the guard off.
         stale_after_ns: u64 = 10 * std.time.ns_per_min,
     };
 
@@ -897,6 +917,7 @@ pub const Store = struct {
     /// collection happened. The stale-ingest-temp reap still runs: it is
     /// unrelated to refcounting.
     pub fn gc(self: Store, allocator: std.mem.Allocator, keep: []const Digest, options: GcOptions) !GcStats {
+        if (options.stale_after_ns == 0) return error.StaleAfterTooSmall;
         const lockf = try self.lockIngest();
         defer self.unlockIngest(lockf);
 
@@ -925,6 +946,15 @@ pub const Store = struct {
     /// rest of the tree. `false` also on a store with no `cas/` directory yet
     /// (nothing ever committed).
     ///
+    /// **NOT specifically "orphaned".** A store opened with the default
+    /// `Options.refcount = true` has `.rc` sidecars on every ordinary blob
+    /// the moment anything is `put` — this returns `true` for those too,
+    /// not only for abandoned ones. It answers "is there a `.rc` file
+    /// anywhere under `cas/`", full stop; the toggle-footgun use case below
+    /// is the one case where that plain existence answer happens to be the
+    /// question worth asking (A1 F4 — the old name `hasOrphanedRcSidecars`
+    /// promised more precision than the check has ever had).
+    ///
     /// **Why this is opt-in rather than automatic at `Store.init`/`gc`
     /// time.** `init`/`initOptions` currently do no CAS-tree I/O at all —
     /// every subdirectory is created lazily on first write (see the module
@@ -943,10 +973,21 @@ pub const Store = struct {
     /// pays for; a caller who has reason to suspect a toggle happened (e.g.
     /// migrating an existing store's `Options`) can call this once,
     /// explicitly, instead.
-    pub fn hasOrphanedRcSidecars(self: Store) !bool {
+    pub fn hasAnyRcSidecar(self: Store) !bool {
         var dbuf: [768]u8 = undefined;
         const casdir = try std.fmt.bufPrint(&dbuf, "{s}/cas", .{self.base});
         return self.anyRcSidecarUnder(casdir, self.fanout);
+    }
+
+    /// Old name, kept for source compatibility. A1 F4: despite what this
+    /// name promises, the check never distinguished an "orphaned" sidecar
+    /// (one on a blob nothing references any more) from one on a perfectly
+    /// live, still-referenced blob — a store run with `Options.refcount =
+    /// true` has these on every ordinary blob, and this returned `true` for
+    /// those too. `hasAnyRcSidecar` is the accurate name for exactly the
+    /// same check; see its doc comment.
+    pub fn hasOrphanedRcSidecars(self: Store) !bool {
+        return self.hasAnyRcSidecar();
     }
 
     fn anyRcSidecarUnder(self: Store, dir_path: []const u8, depth_remaining: u8) !bool {
@@ -1020,12 +1061,22 @@ pub const Store = struct {
 
     /// Read a blob's `.rc` sidecar relative to its already-open fan-out
     /// `dir`. Null means "no sidecar" (untracked/legacy), distinct from a
-    /// tracked refcount of zero.
+    /// tracked refcount of zero — `gcWalk` treats null as "still
+    /// referenced, keep", the same safe direction as `casRefRead`'s
+    /// `default_if_missing`.
+    ///
+    /// See `casRefRead`'s doc comment (A1 F5): `vbuf` is sized past any
+    /// legitimate refcount text, so a read that fills it completely means
+    /// the sidecar is longer than expected and its truncated prefix is
+    /// never parsed as if it were the whole value — a truncated "00…005"
+    /// read as "00…0" would otherwise make a still-referenced blob look
+    /// collectible.
     fn readRcInDir(self: Store, dir: std.Io.Dir, hex: []const u8) ?u64 {
         var rcbuf: [80]u8 = undefined;
         const rc_name = std.fmt.bufPrint(&rcbuf, "{s}.rc", .{hex}) catch return null;
-        var vbuf: [24]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
         const data = dir.readFile(self.io, rc_name, &vbuf) catch return null;
+        if (data.len == vbuf.len) return null; // oversized/corrupt sidecar, not a truncated guess
         return std.fmt.parseInt(u64, std.mem.trim(u8, data, " \t\r\n"), 10) catch null;
     }
 
@@ -1424,6 +1475,77 @@ test "gc: sweeps a zero-refcount orphan, keeps a live one AND an explicit keep" 
     try t.expectEqual(@as(u64, 0), stats2.blobs_removed);
 }
 
+test "F3: gc refuses stale_after_ns=0 instead of silently disarming the live-ingest guard" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // What a `stale_after_ns = 0` guard failure actually does: the private
+    // sweep, called directly (bypassing `gc`'s guard), reaps a temp that
+    // was created an instant ago — `age_ns < 0 or age_ns_u64 < 0` is never
+    // true for an existing file, so nothing survives it.
+    var tbuf1: [768]u8 = undefined;
+    const live_temp = try store.casCreateTemp("just-started-streaming", &tbuf1);
+    live_temp.file.close(io);
+    try std.Io.Dir.cwd().access(io, live_temp.tmp, .{}); // CONTROL: it exists
+    const reaped_unguarded = try store.reapStaleIngestTemps(0);
+    try t.expectEqual(@as(u64, 1), reaped_unguarded);
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, live_temp.tmp, .{}));
+
+    // `gc`, the only public entry point, refuses the same options outright
+    // instead of running with the guard disarmed — nothing touched.
+    var tbuf2: [768]u8 = undefined;
+    const live_temp2 = try store.casCreateTemp("also-just-started", &tbuf2);
+    live_temp2.file.close(io);
+    try t.expectError(error.StaleAfterTooSmall, store.gc(gpa, &.{}, .{ .stale_after_ns = 0 }));
+    try std.Io.Dir.cwd().access(io, live_temp2.tmp, .{}); // still there
+
+    // Positive control: the DEFAULT options (10 minutes) are accepted and
+    // correctly leave a temp this young untouched.
+    const stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.temps_removed);
+    try std.Io.Dir.cwd().access(io, live_temp2.tmp, .{});
+}
+
+test "F5: an oversized refcount sidecar is never misread as a truncated smaller number" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // A genuinely-referenced blob: two puts of the same content dedup to
+    // one blob at refcount 2.
+    const d1 = try store.putBytes("shared content, referenced twice");
+    _ = try store.putBytes("shared content, referenced twice");
+    try t.expectEqual(@as(u64, 2), store.casRefRead(&d1.hex, 0));
+
+    // Corrupt the sidecar on disk: far more bytes than any legitimate
+    // `casRefWrite` output, with the real digit trailing after a run of
+    // zeros. A reader with too small a buffer sees only the truncated
+    // all-zero PREFIX and, without this fix, would misparse it as the
+    // valid (but wrong) refcount 0.
+    var pbuf: [768]u8 = undefined;
+    const rc_path = try store.casRefPath(&pbuf, &d1.hex);
+    const oversized = ("0" ** 40) ++ "2";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = rc_path, .data = oversized });
+
+    // casRefRead falls back to default_if_missing rather than returning a
+    // truncated-prefix guess.
+    try t.expectEqual(@as(u64, 99), store.casRefRead(&d1.hex, 99));
+
+    // gcWalk reads the same sidecar via readRcInDir: it must land on
+    // "untracked/keep" (null), never on a truncated "0" that would make a
+    // still-referenced blob look collectible.
+    const stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 0), stats.blobs_removed);
+    try t.expect(store.has(d1));
+}
+
 test "refcount: survives repeated puts of the same content, only collectible at zero" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1629,20 +1751,25 @@ test "Options.refcount = false: gc's CAS sweep is a documented no-op; casDelete 
     try t.expect(store.has(d)); // untouched by the refused call
 }
 
-test "hasOrphanedRcSidecars: false on a fresh store, false under normal refcount=true use" {
+test "hasAnyRcSidecar: false on a fresh store, TRUE under ordinary refcount=true use (A1 F4: not actually orphan-specific)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buf: [256]u8 = undefined;
     const store = try testStore(&tmp, &base_buf);
 
     // no cas/ directory at all yet.
-    try t.expect(!(try store.hasOrphanedRcSidecars()));
+    try t.expect(!(try store.hasAnyRcSidecar()));
+    try t.expect(!(try store.hasOrphanedRcSidecars())); // old name, same answer
 
-    // a live, referenced blob is not "orphaned" in the sense this checks —
-    // hasOrphanedRcSidecars only answers "is there a .rc file on disk", which
-    // is expected and fine under normal refcount = true use.
+    // A live, referenced blob is not "orphaned" in any everyday sense, and
+    // this must still report true for it — hasAnyRcSidecar only answers
+    // "is there a .rc file on disk", which is expected and fine under
+    // normal refcount = true use. (The old name `hasOrphanedRcSidecars`
+    // used to make that sound like a bug; it never was one — see F4's
+    // dispositions.)
     _ = try store.putBytes("normal refcounted blob");
-    try t.expect(try store.hasOrphanedRcSidecars());
+    try t.expect(try store.hasAnyRcSidecar());
+    try t.expect(try store.hasOrphanedRcSidecars()); // old name still an alias
 }
 
 test "hasOrphanedRcSidecars: catches the Options.refcount toggle footgun documented on the option" {

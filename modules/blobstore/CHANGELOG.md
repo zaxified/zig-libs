@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **Three A1 findings, no consumer in the repo (P1: hardening
+  free).** `gc(.{ .stale_after_ns = 0 })` now returns `error.StaleAfterTooSmall`
+  instead of silently disarming the only guard that keeps a sweep from
+  reaping a temp another `put` is streaming into right now — `age_ns <
+  stale_after_ns` with `stale_after_ns = 0` is never true, so every ingest
+  temp, live or not, used to qualify (F3). `casRefRead`/`readRcInDir`'s
+  refcount-sidecar reads now detect a file too big for their buffer instead
+  of silently parsing its truncated prefix: measured to be worse than the
+  original LOW write-up expected — a sidecar corrupted to `"000...0002"`
+  (41 bytes) made `casRefRead` return `0` for a real refcount of 2, and made
+  `gc` **physically delete a still-referenced blob** (F5; both directions
+  reproduced by reverting the buffer to its old `[24]u8` size — see
+  `A1/blobstore.md`'s 2026-09-10 disposition). `hasOrphanedRcSidecars`
+  gained an accurately-named twin, `hasAnyRcSidecar` — the old name promised
+  it detects abandoned sidecars specifically; it always matched any `.rc`
+  file, including ones on perfectly live blobs under ordinary `refcount =
+  true` use (F4). The old name is kept as a forwarding alias, so nothing
+  that already calls it breaks.
 - **2026-09-03** — **Every rename is now durable, not just the streaming `put`
   path's temp.** Measured on the module's own test suite with `strace`, both
   arms in one session: **85 renames / 35 fsyncs before, 85 / 205 after** — the
