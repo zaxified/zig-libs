@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 F-C/F-F re-audited, not fixed: both were already
+  addressed in `f83009e6` (SPEC.md "The quarantine's cost is the operator's
+  to weigh" / "a live quarantine also survives ageing/tick", and the "MAC
+  hijack" test), just not credited as fixed by that commit's own named list.
+  Verified both properties still hold and added one more regression: two
+  full hijack-then-quarantine cycles back to back cost the *same* fixed
+  `max_mac_moves` frames each, with the FDB slot count never leaving 1 —
+  the "indefinitely" in SPEC.md's own wording, measured rather than merely
+  claimed. RED (temporarily dropped the quarantine-outlives-ageing guard in
+  `isExpired`): both this new test and the pre-existing "MAC hijack" test
+  fail (`fdbCount` 0 where 1 is expected) — 2 failing, 33/35 passing. GREEN
+  (guard restored): 0 failing, 35/35 passing.
+
 - **2026-09-07** — **`fuzzOps` executed ZERO operations, for the entire life of the
   harness.**
 

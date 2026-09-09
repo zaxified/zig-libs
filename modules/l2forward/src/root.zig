@@ -1230,6 +1230,74 @@ test "MAC hijack: a move is reported and counted, and a flapping MAC is quaranti
     try testing.expectEqual(@as(?PeId, 2), t.lookup(1, victim, 60));
 }
 
+// A1 l2forward F-C/F-F: SPEC.md ("The quarantine's cost is the operator's to
+// weigh", "a live quarantine also survives ageing/tick") already names both
+// properties these findings describe -- flood amplification during a
+// quarantine, and the FDB slot it occupies surviving `aging_ticks` for the
+// full window -- and the test above pins one cycle of each. What neither
+// pinned explicitly is the word "indefinitely": that the attacker can drive
+// a SECOND full cycle back-to-back at the same per-window frame cost, with
+// no cumulative discount or penalty and no extra entry. This is that measure,
+// not a different behaviour: two full hijack-then-quarantine cycles, same
+// `max_mac_moves`/`mac_move_window` cost each time, one FDB slot throughout.
+test "quarantine cost is flat and repeatable: two cycles cost the same N frames each (A1 F-C/F-F)" {
+    var t = Table.init(testing.allocator, .{
+        .max_isids = 64,
+        .max_pes_per_isid = 16,
+        .max_macs_per_isid = 8,
+        .aging_ticks = 10,
+        .max_mac_moves = 3,
+        .mac_move_window = 50,
+    });
+    defer t.deinit();
+    try t.addMember(1, 2); // victim
+    try t.addMember(1, 9); // attacker
+    try t.addMember(1, 77); // a third, uninvolved member -- it eats the flood too
+    var buf: [16]PeId = undefined;
+    const victim = macOf(0x42);
+
+    // Cycle 1: exactly `max_mac_moves` (3) frames from the attacker's PE bring
+    // the MAC under quarantine. `.moved, .moved, .duplicate_detected` is the
+    // fixed cost -- not decreasing, not increasing.
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(1, victim, 2, 0));
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, victim, 9, 1));
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, victim, 2, 2));
+    try testing.expectEqual(LearnOutcome.duplicate_detected, try t.learn(1, victim, 9, 3));
+    try testing.expect(t.isQuarantined(1, victim));
+    // While quarantined: every member floods, including the uninvolved one --
+    // this is the amplification F-C names (2-way here, N-way at N members).
+    try testing.expectEqualSlices(PeId, &.{ 2, 9, 77 }, (try t.forward(1, victim, .access, 3, &buf)).flood);
+    // The slot survives past `aging_ticks` (10) while quarantined -- F-F.
+    t.tick(20);
+    try testing.expectEqual(@as(usize, 1), t.fdbCount(1));
+    try testing.expect(t.isQuarantined(1, victim));
+
+    // The window (50, opened at t=3) lapses; the MAC self-heals, exactly the
+    // same as cycle 1's own test above.
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(1, victim, 2, 54));
+    try testing.expect(!t.isQuarantined(1, victim));
+
+    // Cycle 2, immediately: the SAME three frames reproduce the SAME outcome
+    // sequence and the SAME flood set. No backoff, no rising cost, no second
+    // entry -- `fdbCount` never left 1 across either cycle.
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, victim, 9, 55));
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, victim, 2, 56));
+    try testing.expectEqual(LearnOutcome.duplicate_detected, try t.learn(1, victim, 9, 57));
+    try testing.expect(t.isQuarantined(1, victim));
+    try testing.expectEqualSlices(PeId, &.{ 2, 9, 77 }, (try t.forward(1, victim, .access, 57, &buf)).flood);
+    try testing.expectEqual(@as(usize, 1), t.fdbCount(1));
+
+    // A third cycle costs the same again -- this is the "indefinitely" in
+    // SPEC.md's own words, not a two-cycle coincidence.
+    t.tick(104); // t=104: past cycle 2's window (opened at 57, lapses at 107)... still quarantined
+    try testing.expect(t.isQuarantined(1, victim));
+    try testing.expectEqual(LearnOutcome.learned, try t.learn(1, victim, 2, 108));
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, victim, 9, 109));
+    try testing.expectEqual(LearnOutcome.moved, try t.learn(1, victim, 2, 110));
+    try testing.expectEqual(LearnOutcome.duplicate_detected, try t.learn(1, victim, 9, 111));
+    try testing.expectEqual(@as(usize, 1), t.fdbCount(1));
+}
+
 // Regression (audit F3 / P-10): the module documents tenant state as
 // "control-plane state the caller owns", but `learn` called `getOrCreateIsid`
 // unconditionally, so a data-plane frame carrying an I-SID nobody configured
