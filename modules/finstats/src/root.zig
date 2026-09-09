@@ -42,7 +42,14 @@ pub const Error = error{ NoSuchColumn, OutOfMemory };
 /// is indistinguishable from a real answer at the call site, so a windowed
 /// series with an unmodelled opening balance came back as a confident `10.0`
 /// (i.e. +1000 %). See `Opening` for the usual cause.
-pub const XirrError = Error || error{XirrNoRoot};
+/// `EmptyWindow`: the series has zero rows. `xirr`/`xirrPrecise` used to
+/// return a confident `0.0` for this — the same "non-answer that looks like
+/// an answer" shape `XirrNoRoot` exists to prevent, and an empty date-range
+/// window is a more common shape than the one-row window `XirrNoRoot`
+/// already catches. A `0.0` at the call site is indistinguishable from a
+/// genuine 0% IRR; this module has zero consumers in the repo, so the new
+/// error variant breaks nothing that exists today.
+pub const XirrError = Error || error{ XirrNoRoot, EmptyWindow };
 
 /// The rate-space search interval every IRR here works in: `[-0.99, 10]`, i.e.
 /// −99 % to +1000 % a year. Deliberately not wider — a genuine +1000 % IRR
@@ -286,8 +293,12 @@ fn bracketHasRoot(items: []const Cashflow, base: i64, lo: f64, hi: f64) bool {
 /// — most often a windowed series that needs `spec.opening` set. The bracket is
 /// deliberately not widened: a genuine +1000 % IRR exists on a small position,
 /// so what is wanted is detection, not more room.
+///
+/// Returns `error.EmptyWindow` for a zero-row series — used to return a
+/// confident `0.0`, the same "non-answer that looks like an answer" shape
+/// `XirrNoRoot` exists to prevent.
 pub fn xirr(a: std.mem.Allocator, d: Dataset, spec: XirrSpec) XirrError!f64 {
-    if (d.rows.len == 0) return 0;
+    if (d.rows.len == 0) return error.EmptyWindow;
     const idx: ColIdx = .{
         .date = try mustIndex(d, spec.date_col),
         .flow = try mustIndex(d, spec.flow_col),
@@ -496,6 +507,11 @@ pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Da
     var hi: f64 = -std.math.inf(f64);
     for (d.rows) |r| {
         const v = r[vi].asFloat() orelse continue;
+        // NaN survives `asFloat()` (it IS a float) and would otherwise
+        // silently widen nothing (`@min`/`@max` with NaN pick the other
+        // operand here, so this loop was already NaN-safe) — excluded here
+        // too so both loops agree on which rows exist.
+        if (std.math.isNan(v)) continue;
         lo = @min(lo, v);
         hi = @max(hi, v);
     }
@@ -506,6 +522,11 @@ pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Da
     @memset(counts, 0);
     for (d.rows) |r| {
         const v = r[vi].asFloat() orelse continue;
+        // Without this, `@intFromFloat(@floor(NaN))` landed in the `b < 0`
+        // clamp below and NaN was silently counted in bucket 0 —
+        // indistinguishable from a genuine minimum-value row. Reachable
+        // from this module's own `annualize`, NaN for a >100% drawdown.
+        if (std.math.isNan(v)) continue;
         var b: i64 = @intFromFloat(@floor((v - lo) / span * @as(f64, @floatFromInt(bins))));
         if (b >= @as(i64, @intCast(bins))) b = @intCast(bins - 1);
         if (b < 0) b = 0;
@@ -953,8 +974,10 @@ pub const XirrPreciseSpec = struct {
 /// whenever Newton fails to converge: derivative underflow, a step landing
 /// outside the bracket, a NaN, or exhausting `max_newton_iter` without
 /// meeting `tol`.
+///
+/// Returns `error.EmptyWindow` for a zero-row series — see `xirr`.
 pub fn xirrPrecise(a: std.mem.Allocator, d: Dataset, spec: XirrPreciseSpec) XirrError!f64 {
-    if (d.rows.len == 0) return 0;
+    if (d.rows.len == 0) return error.EmptyWindow;
     const idx: ColIdx = .{
         .date = try mustIndex(d, spec.date_col),
         .flow = try mustIndex(d, spec.flow_col),
@@ -1662,6 +1685,51 @@ test "xirr: a one-row window has NO unique rate — every rate is a root, so non
     }));
 }
 
+test "xirr: an empty window is a detectable EmptyWindow, not a confident 0.0" {
+    // A1 finding (MEDIUM): `d.rows.len == 0` returned success with `0.0` --
+    // the same "non-answer that looks like an answer" shape the
+    // XirrNoRoot fix above closed. `xirrNode`'s own doc comment already
+    // argues the opposite: "Propagates error.XirrNoRoot rather than
+    // emitting a number -- a widget showing '-' is the point; a bracket
+    // bound in a KPI card looks like data." An empty date-range window (a
+    // day with zero rows) is more common than one that selects exactly one
+    // row, and a caller reading `0.0` as "no return" cannot tell it apart
+    // from a genuine 0% IRR.
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{
+        .{ .name = "d", .type = .date },
+        .{ .name = "flow", .type = .float },
+        .{ .name = "v", .type = .float },
+    };
+    const rows = [_][]const Value{};
+    const d: Dataset = .{ .columns = &cols, .rows = &rows };
+    try testing.expectError(error.EmptyWindow, xirr(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .none,
+    }));
+    try testing.expectError(error.EmptyWindow, xirrPrecise(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .none,
+    }));
+    try testing.expectError(error.EmptyWindow, xirrNode(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .none,
+    }));
+    try testing.expectError(error.EmptyWindow, xirrPreciseNode(f.a(), d, .{
+        .date_col = "d",
+        .flow_col = "flow",
+        .value_col = "v",
+        .opening = .none,
+    }));
+}
+
 test "xirr: the two `opening` conventions differ when row 0 carries a flow (pins which one skips it)" {
     var f = Fix.init();
     defer f.deinit();
@@ -2069,6 +2137,28 @@ test "quantile linear interp + histogram" {
     for (0..h.rows.len) |i| total += h.cell(i, "count").?.int;
     try testing.expectEqual(@as(i64, 4), total);
     try testing.expectEqual(@as(i64, 1), h.cell(4, "count").?.int); // the 10 lands in last bin
+}
+
+test "histogram excludes NaN rows instead of silently binning them at 0" {
+    // A1 finding (LOW): a NaN survives `asFloat()` (it IS a float, just an
+    // exceptional one), and `@intFromFloat(@floor(NaN))` -- measured NOT to
+    // panic here even in Debug -- lands in the `b < 0` clamp and was
+    // silently counted in bucket 0, indistinguishable from a genuine
+    // minimum-value row. Reachable from this module's own `annualize`,
+    // which is NaN for a position down more than 100%.
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{.{ .name = "v", .type = .float }};
+    const rows = [_][]const Value{
+        &.{.{ .float = 0 }}, &.{.{ .float = std.math.nan(f64) }},
+        &.{.{ .float = 1 }}, &.{.{ .float = 10 }},
+    };
+    const h = try histogram(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .value_col = "v", .bins = 5 });
+    var total: i64 = 0;
+    for (0..h.rows.len) |i| total += h.cell(i, "count").?.int;
+    // Only the three finite rows land in a bucket -- the NaN row is
+    // excluded entirely, not silently folded into bucket 0.
+    try testing.expectEqual(@as(i64, 3), total);
 }
 
 test "quantile: unsorted-slice wrapper sorts a COPY and matches quantileSorted (mutation guard)" {

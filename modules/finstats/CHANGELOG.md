@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit close-out, 3 findings. (1) `monteCarlo`'s
+  scratch-buffer leak on a mid-loop allocation failure was already fixed by
+  `91d2744d` (2026-09-01) — verified structurally (the `defer` now runs
+  inside the allocation loop, tracked by `made`, instead of after it) and
+  confirmed green in the current suite. (2) NEW: `histogram` no longer
+  silently bins NaN into bucket 0 — both the min/max pass and the counting
+  pass now skip NaN rows entirely, so a NaN value (reachable from this
+  module's own `annualize`, which is NaN for a position down more than
+  100%) is excluded rather than counted as if it were the minimum. Measured:
+  RED (4 counted, including the NaN row) → GREEN (3). (3) NEW: `xirr` /
+  `xirrPrecise` (and both node wrappers, via `try`) now return the new
+  `error.EmptyWindow` for a zero-row series instead of a confident `0.0` —
+  the same "non-answer that looks like an answer" shape the 2026-08-24
+  `XirrNoRoot` fix closed for a one-row window, and the shape `xirrNode`'s
+  own doc comment already argues against ("a widget showing '–' is the
+  point; a bracket bound in a KPI card looks like data"). Additive to
+  `XirrError`; module has 0 consumers in the repo (P1). Measured: RED
+  (`expected error.EmptyWindow, found 0`) → GREEN, `zig build test-finstats`
+  38/38.
 - **2026-08-24** — **`xirr` / `xirrPrecise` returned `10.0` for a one-row window. Fixed:
   constant NPV across the bracket is now `error.XirrNoRoot`.** The sign-change check added
   on 2026-08-23 could not see this one. When every cashflow lands on the same date — which
