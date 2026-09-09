@@ -201,6 +201,20 @@ const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
 /// ceiling against a malfunctioning driver, not an attacker-facing bound.
 const max_await_messages: u32 = 65536;
 
+/// Same ceiling, for one pass of the multi-part dump reply (`dumpOver`,
+/// `dumpEachOver`). **A1 audit finding**: the `Socket.dump`/`dumpEach` split
+/// (`dumpOver`/`dumpEachOver`) carried the old unbounded reply loop forward —
+/// unlike its sibling `awaitFlow`, which got `max_await_messages` in the same
+/// W2 pass. `DumpError` already inherits `netlink.DumpError`'s
+/// `error.TooManyMessages` (so the type signature advertised a bound neither
+/// engine could ever produce); this constant is what makes it real. Reset per
+/// dump *attempt* — a `NLM_F_DUMP_INTR` restart gets a fresh budget, same as
+/// `dumpOver`'s own `max_dump_attempts` already resets the attempt counter's
+/// neighbors. Same rationale as `max_await_messages`: a robustness ceiling
+/// against a kernel that never sends `NLMSG_DONE`, not an attacker-facing
+/// bound (the kernel is the only verified sender on this socket).
+const max_dump_messages: u32 = 65536;
+
 // ── socket ──────────────────────────────────────────────────────────────────
 
 /// A blocking `NETLINK_NETFILTER` socket. One instance per thread/loop; no
@@ -539,8 +553,11 @@ fn dumpOver(gpa: std.mem.Allocator, transport: anytype, family: Family) DumpErro
         const req = wire.buildDumpRequest(seq, family);
         try transport.send(&req);
 
+        var msgs: u32 = 0;
         while (true) {
+            if (msgs >= max_dump_messages) return error.TooManyMessages;
             const dgram = try transport.recvDatagram();
+            msgs += 1;
             var it: codec.MessageIterator = .{ .buf = dgram };
             while (it.next() catch return error.MalformedReply) |m| {
                 switch (netlink.classifyDumpMessage(m, transport.portId(), seq)) {
@@ -600,8 +617,11 @@ fn dumpEachOver(
     const req = wire.buildDumpRequest(seq, family);
     try transport.send(&req);
 
+    var msgs: u32 = 0;
     while (true) {
+        if (msgs >= max_dump_messages) return error.TooManyMessages;
         const dgram = try transport.recvDatagram();
+        msgs += 1;
         var it: codec.MessageIterator = .{ .buf = dgram };
         while (it.next() catch return error.MalformedReply) |m| {
             switch (netlink.classifyDumpMessage(m, transport.portId(), seq)) {
@@ -738,10 +758,17 @@ test "group masks match the kernel's 1-based nfnetlink_groups enum" {
 /// otherwise untested.
 const ScriptedTransport = struct {
     /// The datagrams the engine will "receive", in order.
-    script: []const []const u8,
+    script: []const []const u8 = &.{},
+    /// Once `script` runs out, this is returned forever instead of
+    /// `error.RecvFailed` — lets a test drive an endless reply stream (the
+    /// A1 `max_dump_messages` budget tests) without materializing a
+    /// 65536-entry array.
+    filler: ?[]const u8 = null,
     pos: usize = 0,
     /// How many dump requests the engine sent — i.e. attempts made.
     requests: usize = 0,
+    /// How many datagrams the engine consumed via `recvDatagram`.
+    recvs: usize = 0,
     /// The identity the canned datagrams carry, so `classifyDumpMessage` matches
     /// them instead of skipping them as stale.
     pid: u32,
@@ -758,11 +785,15 @@ const ScriptedTransport = struct {
         self.requests += 1;
     }
     fn recvDatagram(self: *ScriptedTransport) RecvError![]const u8 {
-        // Running off the end means the engine asked for more than the scenario
-        // scripted — a test bug, surfaced as an error rather than a hang.
-        if (self.pos == self.script.len) return error.RecvFailed;
-        defer self.pos += 1;
-        return self.script[self.pos];
+        self.recvs += 1;
+        if (self.pos < self.script.len) {
+            defer self.pos += 1;
+            return self.script[self.pos];
+        }
+        // Running off the end with no filler means the engine asked for more
+        // than the scenario scripted — a test bug, surfaced as an error
+        // rather than a hang.
+        return self.filler orelse error.RecvFailed;
     }
 };
 
@@ -930,6 +961,62 @@ test "dump engine: a kernel error reply is mapped and stops the dump" {
     // The flows collected before the error are released by the engine's
     // errdefer; std.testing.allocator fails the test if they are not.
     try testing.expectError(error.AccessDenied, dumpOver(testing.allocator, &t, .unspec));
+}
+
+// ── A1 audit finding: dumpOver/dumpEachOver must not spin forever ──────────
+// `dumpOver`/`dumpEachOver` carried the old unbounded reply loop forward when
+// they were factored out of `Socket.dump` — unlike the sibling `awaitFlow`
+// (C-06, F6), which got `max_await_messages` in the same W2 pass. `DumpError`
+// already declared `error.TooManyMessages` (inherited from `netlink.DumpError`),
+// which advertised a bound neither engine could ever hit — a kernel that
+// answers every message matched-but-unrecognized (`NLMSG_NOOP`, `.skip`
+// forever) and never sends `NLMSG_DONE` spun both loops with no upper bound.
+
+/// A matched `NLMSG_NOOP`: `classifyDumpMessage` returns `.skip` for it
+/// forever (never `.done`, `.restart` or an error), so a transport whose
+/// `filler` is this datagram reproduces "the kernel never sends NLMSG_DONE".
+fn noopDatagram(pid: u32, seq: u32) [codec.header_len]u8 {
+    var b: [codec.header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, b[0..4], codec.header_len, native_endian);
+    std.mem.writeInt(u16, b[4..6], codec.NLMSG_NOOP, native_endian);
+    std.mem.writeInt(u16, b[6..8], codec.NLM_F_MULTI, native_endian);
+    std.mem.writeInt(u32, b[8..12], seq, native_endian);
+    std.mem.writeInt(u32, b[12..16], pid, native_endian);
+    return b;
+}
+
+test "A1: dumpOver gives up instead of spinning when NLMSG_DONE never arrives" {
+    const noop = noopDatagram(7, 42);
+    var t: ScriptedTransport = .{ .filler = &noop, .pid = 7, .seq = 42 };
+    try testing.expectError(error.TooManyMessages, dumpOver(testing.allocator, &t, .unspec));
+    try testing.expectEqual(@as(usize, max_dump_messages), t.recvs);
+    // One request, not a retry storm: the budget ends the attempt outright
+    // (an endless reply stream is not `NLM_F_DUMP_INTR`, so it never reaches
+    // the `attempt < max_dump_attempts` retry either).
+    try testing.expectEqual(@as(usize, 1), t.requests);
+}
+
+test "A1: dumpEachOver gives up instead of spinning when NLMSG_DONE never arrives" {
+    const noop = noopDatagram(7, 42);
+    var t: ScriptedTransport = .{ .filler = &noop, .pid = 7, .seq = 42 };
+    var v: CollectingVisitor = .{};
+    defer v.deinit();
+    try testing.expectError(
+        error.TooManyMessages,
+        dumpEachOver(&t, .unspec, &v, CollectingVisitor.visit),
+    );
+    try testing.expectEqual(@as(usize, max_dump_messages), t.recvs);
+    try testing.expectEqual(@as(usize, 1), t.requests);
+    try testing.expectEqual(@as(usize, 0), v.calls); // nothing to visit — every reply was a NOOP
+}
+
+test "A1: the dump budget is the delivered magnitude, not just any value" {
+    // Pinned literally, per `feedback_cap_bounds_the_wrong_quantity` and the
+    // sibling pin in `netlink`'s own test of the same shape: asserting
+    // `t.recvs == max_dump_messages` alone would follow the constant wherever
+    // it goes and stay green through a shrink that silently breaks a large
+    // legitimate dump, or a grow that quietly re-opens this spin.
+    try testing.expectEqual(@as(u32, 65536), max_dump_messages);
 }
 
 // ── EINVAL vs subsystem absent: remapped paths vs the one left ambiguous ───

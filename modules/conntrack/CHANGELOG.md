@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 audit, two findings.** (A1) `dumpOver`/`dumpEachOver` carried the old
+  unbounded multi-part reply loop forward when they were factored out of `Socket.dump` — unlike
+  the sibling `awaitFlow` (C-06, F6), which got a message budget in the same pass. `DumpError`
+  already declared `error.TooManyMessages` (inherited from `netlink.DumpError`), advertising a
+  bound neither engine could ever produce; a kernel that never sends `NLMSG_DONE` spun both loops
+  forever. New `max_dump_messages` (65536, same ceiling as `max_await_messages`, reset per dump
+  attempt) makes it real. (A5) `decodeFlow` cross-checked a tuple's own src/dst family (F5) but
+  never `orig` against `reply`, nor either against the message's own `nfgen_family` — both now
+  rejected with the existing `error.AddressFamilyMismatch`. Not breaking: both errors already
+  existed in their respective error sets.
 - **2026-09-07** — Both fuzz targets ran one fixed input. `wire.fuzzDecode` opened with
   `smith.bytes(&raw)` and a ranged length, which returns the range minimum when fewer than eight
   input octets remain, so the length was 0 on every seed and all four of its readings — flow

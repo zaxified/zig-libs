@@ -542,6 +542,25 @@ pub fn decodeFlow(payload: []const u8) DecodeError!Flow {
         },
         else => {},
     };
+    // A5 audit finding: `decodeTuple` (F5, above) only cross-checks a SINGLE
+    // tuple's own src/dst family against each other. Nothing checked `orig`
+    // against `reply`, or either against the message's own `nfgen_family`
+    // (`hdr.family`) — a caller that branches on `flow.family` (the
+    // documented per-entry family) could be handed a `reply` tuple of the
+    // OTHER family and never know, because nothing here ever compared them.
+    // A single ctnetlink entry is one connection: orig and reply are always
+    // the same family, and `hdr.family` (when it is a known AF_INET/AF_INET6,
+    // not some future value this decoder otherwise passes through unchecked
+    // per its own doc comment above) names that family too.
+    if (out.orig.family() != .unspec and out.reply.family() != .unspec and
+        out.orig.family() != out.reply.family())
+        return error.AddressFamilyMismatch;
+    if (out.family == .ipv4 or out.family == .ipv6) {
+        if (out.orig.family() != .unspec and out.orig.family() != out.family)
+            return error.AddressFamilyMismatch;
+        if (out.reply.family() != .unspec and out.reply.family() != out.family)
+            return error.AddressFamilyMismatch;
+    }
     return out;
 }
 
@@ -1264,6 +1283,83 @@ test "F5: decodeTuple rejects a mixed-family tuple that appendTuple already refu
     try codec.nestEnd(&flow_list, ip_off2);
     try codec.nestEnd(&flow_list, t_off);
     try testing.expectError(error.AddressFamilyMismatch, decodeFlow(flow_list.items));
+}
+
+/// Append a complete, single-family `CTA_TUPLE_*` nest: IP (src/dst) + PROTO
+/// (num only — enough to make `Tuple.isComplete()` true, which is all these
+/// cross-check tests need).
+fn appendTupleAttr(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    attr_type: u16,
+    v6: bool,
+    addr_byte: u8,
+) !void {
+    const off = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | attr_type);
+    {
+        const ip_off = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | CTA_TUPLE.IP);
+        if (v6) {
+            try codec.appendAttr(gpa, list, CTA_IP.V6_SRC, &(@as([16]u8, @splat(addr_byte))));
+            try codec.appendAttr(gpa, list, CTA_IP.V6_DST, &(@as([16]u8, @splat(addr_byte + 1))));
+        } else {
+            try codec.appendAttr(gpa, list, CTA_IP.V4_SRC, &.{ addr_byte, 0, 0, 1 });
+            try codec.appendAttr(gpa, list, CTA_IP.V4_DST, &.{ addr_byte, 0, 0, 2 });
+        }
+        try codec.nestEnd(list, ip_off);
+    }
+    {
+        const proto_off = try codec.nestBegin(gpa, list, codec.NLA_F_NESTED | CTA_TUPLE.PROTO);
+        try codec.appendAttr(gpa, list, CTA_PROTO.NUM, &.{IPPROTO.UDP});
+        try codec.nestEnd(list, proto_off);
+    }
+    try codec.nestEnd(list, off);
+}
+
+test "A5: decodeFlow rejects an orig/reply pair of different address families" {
+    // `decodeTuple`'s F5 cross-check only ever compared a tuple's OWN src and
+    // dst. Nothing compared `orig` against `reply` — the ledger's A5 finding:
+    // the disposition that claimed this was covered pointed at
+    // `appendTuple`'s `isComplete` guard (the BUILD side), not decode. A
+    // single ctnetlink entry is one connection: orig and reply must be the
+    // same family, and a caller branching on `flow.family` could otherwise
+    // get a `reply` tuple secretly of the other one.
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendNfgenmsg(gpa, &list, .unspec, 0); // hdr family unset — isolates orig-vs-reply
+    try appendTupleAttr(gpa, &list, CTA.TUPLE_ORIG, false, 10); // v4
+    try appendTupleAttr(gpa, &list, CTA.TUPLE_REPLY, true, 20); // v6
+    try testing.expectError(error.AddressFamilyMismatch, decodeFlow(list.items));
+}
+
+test "A5: decodeFlow rejects a tuple family that disagrees with nfgen_family" {
+    // `Flow.family` is documented as "`nfgen_family` of the carrying
+    // message" — a caller reads it to decide how to interpret the entry, but
+    // nothing checked it agreed with the actual tuples decoded from the same
+    // message.
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendNfgenmsg(gpa, &list, .ipv4, 0); // hdr says v4…
+    try appendTupleAttr(gpa, &list, CTA.TUPLE_ORIG, true, 30); // …orig is v6
+    try testing.expectError(error.AddressFamilyMismatch, decodeFlow(list.items));
+}
+
+test "A5: TEETH — a same-family orig/reply/nfgen_family entry still decodes (positive control)" {
+    // Must survive: this is the shape every real capture in goldens.zig has
+    // (and those goldens exercise decodeFlow directly, below and in the
+    // dump-reply tests), so a mutation that over-rejects would be caught here
+    // just as reliably as an under-rejection is caught by the two tests above.
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try appendNfgenmsg(gpa, &list, .ipv4, 0);
+    try appendTupleAttr(gpa, &list, CTA.TUPLE_ORIG, false, 40);
+    try appendTupleAttr(gpa, &list, CTA.TUPLE_REPLY, false, 40);
+    const f = try decodeFlow(list.items);
+    try testing.expectEqual(Family.ipv4, f.family);
+    try testing.expectEqual(Family.ipv4, f.orig.family());
+    try testing.expectEqual(Family.ipv4, f.reply.family());
 }
 
 test "decoder rejects wrong-sized scalars, not unknown attributes" {
