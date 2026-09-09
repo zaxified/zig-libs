@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **sign 47 / proofgen 134**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. Neither `SPEC.md` nor `README.md` makes a constant-time claim, so this is a first measurement, not evidence for a sentence — stated rather than filled by inventing one. ⭐ Attributing each context to its topmost pattern-matching frame, **zero of the 181 have their leaf inside `bbs.zig`/`ciphersuite.zig`/`keys.zig`** — this module's code only ever appears as a caller. Every real branch is in `bls12_381`'s `scalar.zig`/`fp.zig` or `std.crypto.ff`, all disassembled as real `je`/`jne` rather than assumed. This is where `bls12_381`'s `ctSelect` was first disassembled to `bt`/`jae` — see that module's entry. `proofgen` taints the undisclosed messages, which is the property selective disclosure exists to protect.
+
 - **2026-09-09** — `NOTICE` becomes a third-party attribution instead of a provenance note.
   `src/kat_vectors.zig` reproduces eleven Apache-2.0 fixture files from
   `mattrglobal/pairing_crypto` verbatim, and the old file argued they were "data, not source

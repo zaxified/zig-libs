@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **blind 477 / sign 218**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. 457 of the 477 are the extended-Euclid modular inverse, which `SPEC.md:188` already names as "the ONE inherently non-constant-time piece" and defends by masking — so this is the first MEASUREMENT of an admitted caveat, not a new finding. ⭐ The two `Modulus.mul` calls SPEC calls constant-time measured ZERO. ⛔⛔ Instrument defect found here and recorded in `scripts/ctgrind.sh`: `modules/blindrsa/src/root.zig` and `modules/rsa/src/root.zig` are different files with the SAME BASENAME, both appear in every stack, and the classifier matches regex text over the whole paragraph — so `root[.]zig` cannot tell them apart and this row's in-file column is "this module plus rsa". The author's first pass mis-attributed several lines that way and corrected it by reading valgrind's qualified symbol names.
+
 - **2026-09-07** — `fuzzVerify` is a damage harness that applied no damage, and its own
   comment's promise about signature length was never kept. The flip count came from
   `smith.valueRangeAtMost(u8, 0, 8)`, a ranged draw, which returns the range MINIMUM unless

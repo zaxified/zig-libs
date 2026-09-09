@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **extract 3 / decrypt 14 / fp12pow 2**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ The audit's `ibe` F4 lead is CONFIRMED to exist and answered in the module's favour: `fp12Pow`'s windowed loop and `fp12CtSelect`/`fp6CtSelect` produce zero of their own; the only two contexts are the exponent's byte conversion, the known `std.crypto.ff` substrate. ⚠ A gap this module's own reasoning does not cover: `decrypt` computes `u_check = r_check·G2gen` and serialises it (`ibe.zig:498-499`) through `toBytesCompressed` → `isLexicographicallyLargest`, whose own doc comment in `fp.zig` says it is "called only on the PUBLIC `y` coordinate". Here it runs on an internal value that is never disclosed. `ibe.zig`'s comment justifies only the final `mem.eql`, and says nothing about the path above it.
+
 - **2026-09-09** — Records that the drand upstreams behind section 5's constants are dual
   Apache-2.0/MIT and that this repository elects MIT, pointing at `modules/tlock/NOTICE` as
   the authoritative record. Nothing changed about the constants; a reader of this file no

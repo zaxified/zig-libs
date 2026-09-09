@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **keygen 29 / encrypt 17 / decrypt 6**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⛔⛔ Two class-1 findings, both disassembled. `sampleTernary`'s is_neg select at `bfv.zig:655` carries its own doc comment saying "arithmetic mask, no branch" and compiles to `test %rcx,%rcx` + `je` — this is the noise sampler, the classic side channel in this family. ⭐⭐ And `modarith.csub` (`modarith.zig:58`): walking the ENTIRE disassembly of the binary shows it compiled to `cmov` at roughly 98 call sites and to `cmp`/`jb` at **exactly one**, `bfv.zig:686` in `scaledPlaintext`. One leaf function, ninety-nine call sites, one jump — the sharpest evidence in this campaign that "the source is branchless" says nothing about the binary. ⚠ Deliberately left open: `reconstruct`'s `if (acc >= q_product)` compiles to `cmov`/`sbb` and is not flagged, but the agent recorded it as "not disproven, not proven safe" because V-bit propagation through the wide `mulx`/`adc` Barrett chain was not verified bit for bit.
+
 - **2026-08-13** — The production entry points can now actually be compiled by a
   consumer. **BEHAVIOURAL, not BREAKING.** Since the 2026-08-12 entry below,
   `keyGen`, `encrypt` and `genRelinKey` each had a body that called its

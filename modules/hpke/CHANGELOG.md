@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **x25519_decap 1 / x25519_authdecap 2 / p256_decap 2 / p256_authdecap 4 / p384_decap 2 / p384_authdecap 4 / open 1**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. All three DHKEMs the module implements, `decap` and `authDecap` for each, plus `Context.open`. Neither `SPEC.md` nor `README.md` contains a constant-time claim; none was added. **Every context is class 2 and every one was disassembled** rather than assumed: the X25519 low-order-point check (`curve25519.zig:77`), P-256's and P-384's `rejectIdentity`, and the AEAD tag-verify branch — all checks the RFCs require and whose outcome the return value already discloses. ⭐ Notable: `p256`'s own harness explicitly declines to target the variable-base `P256.mul` path because "nothing in this module's own shipped API calls it with a secret scalar", and names an ECDH-style caller as the case that would belong elsewhere. DHKEM(P-256) is exactly that caller, so `group.zig:422`'s `mulCtWindowed` is measured here for the first time.
+
 - **2026-09-08** — The four `decap`/`authDecap` fuzz harnesses now carry a
   corpus, and a guard test pins what it reaches. They had none, so each ran
   exactly ONE input: the empty one. `fuzzedSec1Bytes` opens with

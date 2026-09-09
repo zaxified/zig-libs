@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **presign 90 / adapt 2 / extract 3**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. 74 of `presign`'s 90 are the mandatory step-9 self-check calling `preVerify`, which `SPEC.md` itself documents as appropriate variable-time on public data — the same self-verify shape as `bip340` and `musig2`. The 16 direct contexts are accepted classes (`isZero` nonce rejection, `rejectIdentity`, scalar canonicality). ⚠ ONE CONTEXT IS DELIBERATELY LEFT UNRESOLVED: `root.zig:338`, the masked-select loop SPEC calls constant-time, produced one "Use of uninitialised value of size 8" (not "Conditional jump"). The source has no branch there, so the likely explanation is LLVM vectorising the byte loop and memcheck checking the 8-byte load conservatively — but that is a guess, no disassembly was run, and this claim is not closed until someone does one.
+
 - **2026-09-07** — **Test-only: the "corrupted pre-signature" fuzz target had
   never corrupted anything.** `fuzzPreVerify` opened with
   `n_flips = smith.valueRangeAtMost(u8, 0, 6)`, and a ranged `Smith` draw reads

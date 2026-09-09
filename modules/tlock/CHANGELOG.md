@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **fp12pow 8 / decrypt 11**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ The audit's `tlock` F3 lead is CONFIRMED to exist and then answered in the module's favour: `fp12Pow`'s hand-written 4-bit windowed exponentiation and its `fp12CtSelect` full-table scan produce **ZERO contexts of their own**. Everything non-zero is inherited `bls12_381`/`std.crypto.ff` substrate or this module's own already-documented "fine to leak" comparisons. ⚠ The `decrypt` target is measured but means little: a `round_signature` is drand's published per-round threshold signature, public by the time `decrypt` can run, so this is not a defect — recorded so a reader does not conclude otherwise. Its contexts do show that `bls12_381`'s `pairing.zig` branches on what it is given, and that file carries no constant-time claim anywhere in the repository.
+
 - **2026-09-09** — LICENSE ELECTION stated: MIT. The drand upstreams this module models are
   dual-licensed Apache-2.0 OR MIT and the NOTICE named the dual licensing without ever saying
   which branch this repository takes — so the module formally stood under BOTH, and the

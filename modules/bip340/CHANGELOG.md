@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **sign 80**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ 63 of the 80 come from the MANDATORY step-10 self-verify re-running the deliberately variable-time `verify` on the signature about to be returned; the real secret path (steps 1–9) is 15, none of it a class-1 leak. **The step-7 masked parity select measured ZERO contexts**, confirming SPEC.md's "no branch on `R.y`'s parity" for the first time. ⚠ One line is disputed and left open: `root.zig:165`'s even-Y normalisation in `KeyPair.fromSecretKey` is a plain `if`/`else`, not a masked select. This module's harness classified it as branching on the public key's parity; `taproot`'s agent classified it as a real leak and brought an experimental control (a second secret with an even-Y point dropped its count 12→11, because `neg` and its canonicality check appear only on the negating branch). BIP-340 public keys are x-only, so the parity is not published and `d`/`n−d` give the same `P` — "it's public" is false as stated. Recorded in `~/CML/20260901-zig-libs-audit/CTGRIND-OPEN-QUESTIONS.md`, not decided.
+
 - **2026-09-07** — Fuzz reach: `fuzzVerify` never corrupted a signature. Its flip loop
   opened `smith.valueRangeAtMost(u8, 0, 6)` as the harness's FIRST draw; a `Smith` ranged
   draw reads eight octets as a little-endian `u64` and returns the range MINIMUM when

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **commit 8 / sign 5**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ SPEC.md's "this module introduces no additional branches on secret scalars in its REAL code" is CONFIRMED: the `sign` target shows zero contexts in curve arithmetic — the whole signature-share equation (`root.zig:1018-1020`) is clean, and all five contexts are std's scalar-canonicality check at the "turn secret bytes into a Scalar" API boundary, disassembled to a real `jne` rather than assumed. `commit`'s eight split 4 `rejectIdentity`-shaped (two k256's, two this module's own redundant re-check) and 4 canonicality. ⚠ Not adjusted for single-process over-taint.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** out of `zig build
   check-testonly` again, with local copies of `testkit.fuzz`'s seed and cursor
   helpers instead of the shared ones. Enrolling this module via `test_deps` puts

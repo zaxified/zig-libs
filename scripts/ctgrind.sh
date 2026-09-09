@@ -161,6 +161,43 @@ declare -A TARGETS=(
     # sampler and 112 are `fpr.zig`, which the same SPEC calls branchless.
     # See modules/falcon/SPEC.md, rewritten in the same commit.
     [falcon]="sign"
+    # ── round 2, 2026-09-09 ────────────────────────────────────────────────
+    [bls12_381]="field g1_scalarmul g2_scalarmul"
+    [bip340]="sign"
+    [blindrsa]="blind sign"
+    # ⚠ COST: each threshold_ecdsa row runs the full t=n=2 GG20 protocol with
+    # two real 2048-bit Paillier keys -- ~5 s native, 2-9 MINUTES under
+    # memcheck. Six rows. It is by far the heaviest entry in this table; know
+    # that before putting `--check` on a timer.
+    [threshold_ecdsa]="share nonce"
+    # ── round 3, 2026-09-09 ────────────────────────────────────────────────
+    [bulletproofs]="rangeproof ipa"
+    [paillier]="crt noncrt mul addm"
+    [tlock]="fp12pow decrypt"
+    [ibe]="extract decrypt fp12pow"
+    # ── round 4, 2026-09-09: the secp256k1 signing family ──────────────────
+    # ⭐ All three of bip340/musig2/adaptor spend ~79% of their contexts in a
+    # MANDATORY SELF-VERIFY that re-runs a documented variable-time equation on
+    # the signature about to be returned. bip340 63/80, musig2 81/103, adaptor
+    # 74/90. That ratio is a property of the family, not of any one module, and
+    # it is why these rows are pinned as bounds.
+    [frost]="commit sign"
+    [musig2]="sign"
+    [taproot]="secret"
+    [adaptor]="presign adapt extract"
+    # ── rounds 5-7, 2026-09-09: the queue completes at 28 ──────────────────
+    [spake2plus]="w0w1 computel proverstart verifierstart proverfinish verifierfinish"
+    [bbs]="sign proofgen"
+    [coconut]="authority_sign user_issue user_show"
+    [hpke]="x25519_decap x25519_authdecap p256_decap p256_authdecap p384_decap p384_authdecap open"
+    [signal]="sign ratchet"
+    [sphinx]="construct process"
+    [bolt3]="derive revocation shachain shachain_index"
+    [ctap2pin]="ecdh one two token"
+    [fss]="gen eval"
+    [bfv]="keygen encrypt decrypt"
+    [tfhe]="keygen encrypt decrypt bootstrap"
+    [dkg]="coeffs combine"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -178,6 +215,30 @@ declare -A MODES=(
     [rsa]="ReleaseFast"
     [slhdsa]="ReleaseFast"
     [falcon]="ReleaseFast"
+    [bls12_381]="ReleaseFast"
+    [bip340]="ReleaseFast"
+    [blindrsa]="ReleaseFast"
+    [threshold_ecdsa]="ReleaseFast"
+    [bulletproofs]="ReleaseFast"
+    [paillier]="ReleaseFast"
+    [tlock]="ReleaseFast"
+    [ibe]="ReleaseFast"
+    [frost]="ReleaseFast"
+    [musig2]="ReleaseFast"
+    [taproot]="ReleaseFast"
+    [adaptor]="ReleaseFast"
+    [spake2plus]="ReleaseFast"
+    [bbs]="ReleaseFast"
+    [coconut]="ReleaseFast"
+    [hpke]="ReleaseFast"
+    [signal]="ReleaseFast"
+    [sphinx]="ReleaseFast"
+    [bolt3]="ReleaseFast"
+    [ctap2pin]="ReleaseFast"
+    [fss]="ReleaseFast"
+    [bfv]="ReleaseFast"
+    [tfhe]="ReleaseFast"
+    [dkg]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -264,9 +325,174 @@ declare -A PATTERN=(
     [slhdsa/seed]='engine[.]zig|address[.]zig'
     [slhdsa/prf]='engine[.]zig|address[.]zig'
     [falcon/sign]='fpr[.]zig|gaussian[.]zig|sign[.]zig|codec[.]zig'
+    # ── round 2, 2026-09-09 ────────────────────────────────────────────────
+    [bls12_381/field]='fp[.]zig'
+    [bls12_381/g1_scalarmul]='g1[.]zig|fp[.]zig|scalar[.]zig'
+    [bls12_381/g2_scalarmul]='g2[.]zig|fp2[.]zig|fp[.]zig|scalar[.]zig'
+    [bip340/sign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
+    # ⛔⛔ THIS PATTERN CANNOT TELL TWO FILES APART, and the harness's author
+    # found it the hard way. `modules/blindrsa/src/root.zig` and
+    # `modules/rsa/src/root.zig` are different files with the same BASENAME,
+    # both appear in every stack here, and this classifier matches regex text
+    # against the whole paragraph -- so `root[.]zig` buckets rsa's
+    # `bigModInverse` as blindrsa's own code. The first pass mis-attributed
+    # several lines that way and was corrected by reading valgrind's QUALIFIED
+    # SYMBOL names (`root.bigModInverse` vs `blindSign`) instead. The in-file
+    # column for these two rows is therefore "this module plus rsa", not "this
+    # module" -- stated here rather than papered over, because the same trap
+    # waits for every module whose dependency also has a root.zig.
+    [blindrsa/blind]='root[.]zig|ff[.]zig'
+    [blindrsa/sign]='root[.]zig|ff[.]zig'
+    # `root[.]zig` here matches this module's own AND paillier's, deliberately
+    # -- every hit was traced individually by the harness's author.
+    [threshold_ecdsa/share]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    # ── round 3, 2026-09-09 ────────────────────────────────────────────────
+    [bulletproofs/rangeproof]='rangeproof[.]zig|ipa[.]zig|scalarvec[.]zig|generators[.]zig|transcript[.]zig|root[.]zig'
+    [bulletproofs/ipa]='ipa[.]zig|scalarvec[.]zig|transcript[.]zig|root[.]zig'
+    # ⚠ `root[.]zig` alone would have MISSED over half of paillier's crt total:
+    # std's schoolbook big-int division under `divFloor` lives in int.zig, and
+    # the Montgomery machinery in ff.zig. Naming only the module's own file is
+    # the shape of under-measurement this gate exists to refuse.
+    [paillier/crt]='root[.]zig|ff[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [paillier/noncrt]='root[.]zig|ff[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [paillier/mul]='root[.]zig|ff[.]zig'
+    [paillier/addm]='root[.]zig|ff[.]zig'
+    [tlock/fp12pow]='tlock[.]zig|ciphersuite[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|scalar[.]zig'
+    [tlock/decrypt]='tlock[.]zig|ciphersuite[.]zig|pairing[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|g1[.]zig|scalar[.]zig|mem[.]zig'
+    [ibe/extract]='ibe[.]zig|g1[.]zig|fp[.]zig|scalar[.]zig'
+    [ibe/decrypt]='ibe[.]zig|ciphersuite[.]zig|pairing[.]zig|fp[.]zig|fp2[.]zig|fp6[.]zig|fp12[.]zig|g1[.]zig|g2[.]zig|scalar[.]zig|sha2[.]zig'
+    [ibe/fp12pow]='ibe[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig'
+    # ── round 4, 2026-09-09 ────────────────────────────────────────────────
+    [spake2plus/w0w1]='spake2plus computeW0W1+std wide-reduce'
+    [spake2plus/computel]='spake2plus computeL (w1*P)+p256 comb'
+    [spake2plus/proverstart]='spake2plus proverStart+p256'
+    [spake2plus/verifierstart]='spake2plus verifierStart+p256'
+    [spake2plus/proverfinish]='spake2plus proverFinish+confirm MAC'
+    [spake2plus/verifierfinish]='spake2plus verifierFinish+confirm MAC'
+    [bbs/sign]='bbs sign SK+bls12_381'
+    [bbs/proofgen]='bbs proofGen undisclosed msgs+bls12_381'
+    [coconut/authority_sign]='coconut authority key share+bls12_381'
+    [coconut/user_issue]='coconut user attributes (local commit)'
+    [coconut/user_show]='coconut proveCredential (attrs+blinding)'
+    [hpke/x25519_decap]='hpke X25519 decap (skR)+std'
+    [hpke/x25519_authdecap]='hpke X25519 authDecap+std'
+    [hpke/p256_decap]='hpke P-256 decap (skR)+p256'
+    [hpke/p256_authdecap]='hpke P-256 authDecap+p256'
+    [hpke/p384_decap]='hpke P-384 decap (skR)+std p384'
+    [hpke/p384_authdecap]='hpke P-384 authDecap+std p384'
+    [hpke/open]='hpke Context.open+chachapoly'
+    [signal/sign]='signal xeddsa sign+ct25519'
+    [signal/ratchet]='signal DH-ratchet root/chain KDF'
+    [sphinx/construct]='sphinx construct (session_key)+k256'
+    [sphinx/process]='sphinx process (relay privkey)+k256'
+    [bolt3/derive]='bolt3 derivePrivateKey+k256'
+    [bolt3/revocation]='bolt3 deriveRevocationPrivateKey+k256'
+    [bolt3/shachain]='bolt3 perCommitmentSecret (seed; index public)'
+    [bolt3/shachain_index]='bolt3 perCommitmentSecret (index tainted; CONTROL)'
+    [ctap2pin/ecdh]='ctap2pin ecdhZ (platform scalar)+p256'
+    [ctap2pin/one]='ctap2pin One.encapsulate+p256'
+    [ctap2pin/two]='ctap2pin Two.encapsulate+p256+hkdf'
+    [ctap2pin/token]='ctap2pin pinUvAuthToken HMAC'
+    [fss/gen]='fss genWithSeeds (alpha,seeds)'
+    [fss/eval]='fss eval (key) -- DEFECT dpf.zig:326'
+    [bfv/keygen]='bfv keyGen samplers+ring'
+    [bfv/encrypt]='bfv encrypt (plaintext) -- DEFECT bfv.zig:686'
+    [bfv/decrypt]='bfv decrypt (sk)+CRT reconstruct'
+    [tfhe/keygen]='tfhe lwe/glwe keyGen samplers'
+    [tfhe/encrypt]='tfhe encrypt (plaintext)'
+    [tfhe/decrypt]='tfhe decrypt (key) -- DEFECT ntt.zig:93/127'
+    [tfhe/bootstrap]='tfhe blindRotate/cmux/keySwitch'
+    [dkg/coeffs]='dkg round-1 secret coefficients'
+    [dkg/combine]='dkg final combined share'
+    [frost/commit]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [frost/sign]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    # `scalar[.]zig`/`mem[.]zig` beyond bip340's pattern are EMPIRICALLY needed
+    # (GLV splitScalar, findPubkeyIndex's mem.eql) -- without them those
+    # contexts fall into `unattr`, which is always a --check failure.
+    [musig2/sign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig|scalar[.]zig|mem[.]zig'
+    [taproot/secret]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
+    [adaptor/presign]='root[.]zig|hash[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
+    [adaptor/adapt]='root[.]zig|common[.]zig'
+    # ── rounds 5-7, 2026-09-09 ─────────────────────────────────────────────
+    [spake2plus/w0w1]='root[.]zig|common[.]zig'
+    [spake2plus/computel]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [spake2plus/proverstart]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [spake2plus/verifierstart]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [spake2plus/proverfinish]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|sha2[.]zig|hmac[.]zig|hkdf[.]zig|timing_safe[.]zig'
+    [spake2plus/verifierfinish]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|sha2[.]zig|hmac[.]zig|hkdf[.]zig|timing_safe[.]zig'
+    [bbs/sign]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig'
+    [bbs/proofgen]='bbs[.]zig|ciphersuite[.]zig|keys[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig'
+    [coconut/authority_sign]='credential[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig'
+    [coconut/user_issue]='params[.]zig|fp[.]zig|g1[.]zig|scalar[.]zig|hash_to_curve[.]zig'
+    [coconut/user_show]='credential[.]zig|g1[.]zig|g2[.]zig|fp[.]zig|fp2[.]zig|scalar[.]zig'
+    [hpke/x25519_decap]='dhkem[.]zig|suite[.]zig|x25519[.]zig|curve25519[.]zig|field[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [hpke/x25519_authdecap]='dhkem[.]zig|suite[.]zig|x25519[.]zig|curve25519[.]zig|field[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [hpke/p256_decap]='dhkem[.]zig|suite[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [hpke/p256_authdecap]='dhkem[.]zig|suite[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [hpke/p384_decap]='dhkem[.]zig|suite[.]zig|p384[.]zig|field[.]zig|common[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [hpke/p384_authdecap]='dhkem[.]zig|suite[.]zig|p384[.]zig|field[.]zig|common[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig'
+    [hpke/open]='schedule[.]zig|root[.]zig|chacha20[.]zig|poly1305[.]zig'
+    [signal/sign]='xeddsa[.]zig|root[.]zig|scalar[.]zig'
+    [signal/ratchet]='ratchet[.]zig|x3dh[.]zig|x25519[.]zig|curve25519[.]zig|scalar[.]zig|hkdf[.]zig|hmac[.]zig|sha2[.]zig|root[.]zig|chacha20[.]zig|poly1305[.]zig'
+    [sphinx/construct]='core[.]zig|keyderive[.]zig|hopframe[.]zig|bigsize[.]zig|group[.]zig|field[.]zig|scalar[.]zig|common[.]zig'
+    [sphinx/process]='core[.]zig|keyderive[.]zig|hopframe[.]zig|bigsize[.]zig|group[.]zig|field[.]zig|common[.]zig'
+    [bolt3/derive]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
+    [bolt3/revocation]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig'
+    # ⛔⛔ `:[1-9]` IS LOad-BEARING, not tidiness. A fully-inlined callee gets
+    # its merged frame reported at `root.zig:0` -- never a real source line --
+    # and this classifier matches PATTERN anywhere in the paragraph, BEFORE
+    # WITNESS. Bare `root[.]zig` therefore filed two genuine propagation
+    # witnesses as in-file and reported 2 where the honest count is 0. It lies
+    # in the other direction too: it can launder a foreign leak into this
+    # module's column. See CTGRIND-OPEN-QUESTIONS.md.
+    [bolt3/shachain]='root[.]zig:[1-9]'
+    [bolt3/shachain_index]='root[.]zig:[1-9]'
+    [ctap2pin/ecdh]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig|scalar[.]zig'
+    [ctap2pin/one]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig|scalar[.]zig|sha2[.]zig'
+    [ctap2pin/two]='root[.]zig|group[.]zig|field[.]zig|fast_core[.]zig|common[.]zig|scalar[.]zig|hkdf[.]zig|sha2[.]zig'
+    [ctap2pin/token]='root[.]zig|hmac[.]zig|sha2[.]zig'
+    [fss/gen]='dpf[.]zig|group[.]zig'
+    [fss/eval]='dpf[.]zig|group[.]zig'
+    [bfv/keygen]='bfv[.]zig|modarith[.]zig|ntt[.]zig|ring[.]zig|Random[.]zig'
+    [bfv/encrypt]='bfv[.]zig|modarith[.]zig|ntt[.]zig|ring[.]zig'
+    [bfv/decrypt]='bfv[.]zig|modarith[.]zig|ntt[.]zig|ring[.]zig|udivmod[.]zig'
+    [tfhe/keygen]='tfhe[.]zig'
+    [tfhe/encrypt]='tfhe[.]zig'
+    [tfhe/decrypt]='tfhe[.]zig|torus[.]zig|poly[.]zig|ntt[.]zig'
+    [tfhe/bootstrap]='tfhe[.]zig|gadget[.]zig|poly[.]zig|torus[.]zig|ntt[.]zig'
+    [dkg/coeffs]='protocol[.]zig|commit[.]zig|core[.]zig|root[.]zig|secp256k1[.]zig|common[.]zig|scalar[.]zig'
+    [dkg/combine]='core[.]zig|root[.]zig|secp256k1[.]zig'
+    [adaptor/extract]='root[.]zig|common[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    [threshold_ecdsa/nonce]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 declare -A LABEL=(
+    [frost/commit]='frost round1Commit+k256'
+    [frost/sign]='frost round2Sign+k256'
+    [musig2/sign]='musig2 sign (d,k1,k2)+bip340+k256'
+    [taproot/secret]='taproot tweakSecretKey+bip340+k256'
+    [adaptor/presign]='adaptor preSign (sk+nonce)+bip340+k256'
+    [adaptor/adapt]='adaptor adapt (t)'
+    [adaptor/extract]='adaptor extract (t out)+k256'
+    [bulletproofs/rangeproof]='bulletproofs prove (v,gamma)+ct25519'
+    [bulletproofs/ipa]='bulletproofs ipa witness+ct25519'
+    [paillier/crt]='paillier decrypt CRT+std bigint'
+    [paillier/noncrt]='paillier decrypt non-CRT+std bigint'
+    [paillier/mul]='paillier mulPlaintext (k)'
+    [paillier/addm]='paillier addPlaintext (m)'
+    [tlock/fp12pow]='tlock encrypt r->fp12Pow (F3)'
+    [tlock/decrypt]='tlock decrypt+bls12_381 pairing'
+    [ibe/extract]='ibe extract (msk -> G1)'
+    [ibe/decrypt]='ibe decrypt (d_id -> pairing+FO)'
+    [ibe/fp12pow]='ibe fp12Pow (Gt windowed, F4)'
+    [bls12_381/field]='bls12_381 fp.zig'
+    [bls12_381/g1_scalarmul]='bls12_381 g1+fp+scalar'
+    [bls12_381/g2_scalarmul]='bls12_381 g2+fp2+fp+scalar'
+    [bip340/sign]='bip340 sign+k256+std'
+    [blindrsa/blind]='blindrsa blind (r, masked inv)+rsa'
+    [blindrsa/sign]='blindrsa blindSign (sk)+rsa+std ff'
+    [threshold_ecdsa/share]='thr_ecdsa share x_i+paillier'
+    [threshold_ecdsa/nonce]='thr_ecdsa nonce k_i/gamma+paillier'
     [p256/comb]='p256 combMulBase'
     [p256/sign]='p256 sign+std ecdsa'
     [rsa/crt]='rsa CRT p/q+std ff'
@@ -496,7 +722,15 @@ run_one() {
     local bin="$WORKDIR/$mode-$vg/ctgrind/ctgrind-$module"
     local log="$WORKDIR/log_${module}_${mode}_${vg}_${target}_${taint}.txt"
     set +e
+    # ⚠ `--max-stackframe` is NOT decoration. `std.Io.Threaded`'s stack
+    # footprint exceeds memcheck's default 2 MB heuristic, and past it memcheck
+    # prints "client switching stacks?" and then floods with bogus
+    # "Invalid read/write" errors -- ~7000 of them on every `tfhe` row, drowning
+    # the real signal. Found 2026-09-09 by tfhe's harness author, who had to
+    # diagnose it before any of that module's numbers meant anything. Raising a
+    # heuristic threshold cannot hide a real error, so it is set globally.
     valgrind --tool=memcheck --error-exitcode=99 --num-callers=20 \
+        --max-stackframe=16777216 \
         "$bin" "$target" "$taint" >"$log" 2>&1
     local rc=$?
     set -e

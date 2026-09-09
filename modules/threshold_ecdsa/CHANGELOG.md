@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **share 127 / nonce 400**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. Settles a disputed audit claim by measurement: `signing.zig:267`'s `Secp256k1.basePoint.mul(nonce) catch continue` does fire, but `k256`'s own `mul`/`combMulBase` end in `try q.rejectIdentity()` identically (`k256/src/group.zig:278`, `:347`), so routing through `k256` would remove nothing — the class was never fixed for secp256k1, only for Edwards/Ristretto, and it fires at p≈2⁻²⁵⁶. ⭐ Two things nobody was looking for: `paillier.decrypt`'s L-function does a variable-time big-integer division on `k_i`-derived data on EVERY run (audit item A5 had only theorised it), and `zkproofs.zig:345`'s `mulAddBytes` ripple-carry loop has a trip count that depends on the RAW secret witness, before the blinding that makes the published response safe — no document in this module mentions it. ⚠ These numbers are NOT adjusted for single-process over-taint (see `dkg`'s entry); a share of them is public commitment data that only looks secret because one process built it.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** this module is out of
   `zig build check-testonly` again, and its fuzz corpus uses a nine-line local
   copy of `testkit.fuzz`'s seed helper rather than the shared one. Enrolling it

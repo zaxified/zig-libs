@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **authority_sign 69 / user_issue 3 / user_show 51**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. No constant-time claim exists in `SPEC.md` or `README.md`; nothing was added. Three targets split by which party holds the secret (authority key share, user attributes at local commitment, user attributes plus blinding at proof showing). ⭐ Independently reproduced `bls12_381`'s `ctSelect` finding with the identical disassembled sequence `bt %esi,%edx; jae` — the second witness that turned it from one measurement's surprise into a settled result. ⭐ This agent also added the campaign's third context class: **over-taint artifact** — `ff.zig`'s `conditionalAdd`/`conditionalSub`/`limbsCmpLt` are real `je`/`jne` but branch on a limb COUNT or a Montgomery-form FLAG, not on the secret's value, and light up only because the harness taints the whole opaque `Fe` struct including its metadata (as `bls12_381`'s own harness also does). ⚠ Not adjusted for single-process over-taint either.
+
 - **2026-09-07** — `fuzzShowProofDecode` had only ever decoded the empty slice. It drew its
   bytes with `smith.bytes(&buf)` and then took a length from
   `smith.valueRangeAtMost(u16, 0, 1024)`; a ranged `Smith` draw reads eight octets as a

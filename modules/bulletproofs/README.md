@@ -65,11 +65,13 @@ construction time, before any commitment is built.
   degrades). `verify`/`verifyIpa`/`commit`/`deltaYZ`/`proveIpa` (witness
   passed in) and both byte codecs are platform-independent; only the
   internal-entropy `prove` path is gated.
-- **Not constant-time.** `scalarvec.multiScalarMul` skips zero scalars, so
-  forming commitment `A` takes time dependent on the committed value's bit
-  pattern (a mild prover-side timing side-channel). The proof's PRIVACY
-  rests on its zero-knowledge property, not on constant-time proving, so
-  the ZK guarantee is unaffected — noted for host threat-modelling.
+- **Constant-time on the prover's secrets, measured.** This bullet used to
+  say the opposite — that `multiScalarMul` skipped zero scalars and leaked the
+  committed value's bit pattern. Audit finding F2 fixed that; the doc did not
+  catch up until 2026-09-09. Every term now goes through `mulCt`
+  unconditionally, including zero, and `src/ctgrind_harness.zig` measures
+  **0 in-file contexts** with `v` and `gamma` tainted through `prove`. ⚠ The
+  blinding `prove` draws internally is outside that measurement. See SPEC.md.
 - **Not wire-compatible with dalek / any other Bulletproofs
   implementation** — this module's Fiat-Shamir transcript is its own
   SHA-512 chain (see below); verification is property/soundness-based, not

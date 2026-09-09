@@ -218,14 +218,33 @@ comment.
   `.linux` (not `.any`) — the honest tag for the most-restrictive
   reachable path. Porting `fillRandom` to a POSIX/Windows entropy call
   would lift the restriction.
-- **Not constant-time.** `scalarvec.multiScalarMul` skips zero scalars (a
-  `catch continue` on std's "result is the identity element" error), so
-  the time to form commitment `A` — built over the secret bit-vectors
-  `a_L`/`a_R` — depends on the committed value's bit pattern (a mild
-  prover-side timing side-channel). A range proof's PRIVACY rests on the
-  proof's zero-knowledge property (the proof reveals nothing about `v`),
-  not on constant-time proving, so this does not weaken the ZK guarantee;
-  it is recorded here for honest threat-modelling of the prover host.
+- **Constant-time on the prover's secrets — MEASURED 2026-09-09, and this
+  bullet used to say the opposite.** It read "Not constant-time:
+  `scalarvec.multiScalarMul` skips zero scalars (a `catch continue` on std's
+  'result is the identity element' error), so the time to form commitment `A`
+  … depends on the committed value's bit pattern". That was true when it was
+  written and stopped being true when audit finding F2 was fixed: the current
+  `multiScalarMul` puts every term through `mulCt` unconditionally,
+  "including zero" (`src/scalarvec.zig:135-150`), and the `catch continue`
+  survives only in comments describing the shape it replaced.
+
+  ⭐ THE STALENESS RAN IN THE UNUSUAL DIRECTION — the code got better and the
+  document did not catch up, so this file was advertising a side channel the
+  module no longer has. `src/ctgrind_harness.zig` is the instrument that
+  settles it: tainting `v` and `gamma` through the real `prove` entry point,
+  and a synthetic witness through `proveIpa`, ReleaseFast under valgrind,
+  gives **0 in-file contexts in both targets** — nothing in `rangeproof.zig`,
+  `ipa.zig`, `scalarvec.zig`, `generators.zig`, `transcript.zig`, or the
+  `ct25519` delegate they bottom out in. Untainted control and
+  no-`-fvalgrind` trap rows are both 0, so the zero is a measurement rather
+  than a silent no-op.
+
+  ⚠ What is NOT claimed: `prove` draws its own blinding (`alpha`, `rho`,
+  `s_L`, `s_R`, `tau1`, `tau2`) from `getrandom(2)` internally, and the
+  harness cannot taint those without editing the module. They are outside the
+  measurement, not proven by it. And a range proof's PRIVACY never rested on
+  this anyway — it rests on the zero-knowledge property — so the bullet
+  remains a threat-modelling note about the prover host, now a positive one.
 
 ## Out of scope (future extensions)
 

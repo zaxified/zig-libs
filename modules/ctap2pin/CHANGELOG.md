@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **ecdh 4 / one 7 / two 7 / token 0**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. First evidence for `SPEC.md`'s two claims ("`mul(scalar, .big)` is the constant-time scalar-mult", "both `verify`s compare MACs in constant time and fail closed") — the `token` target's clean **0** backs the second. ⭐ Confirms an audit lead and REFINES it: `root.zig:162`'s `if (std.mem.allEqual(u8, &private_scalar, 0))` does branch on raw secret-key bytes, but the implied mechanism — a byte-count-dependent early-exit scan — is refuted at the compiled level: LLVM emits one `vmovdqu`+`vptest` over all 32 bytes and a single `je`, so only the branch direction depends on the secret, the same shape as the other negligible-probability checks. The second independent sighting of `allEqual` being vectorised (see `sphinx`). ⚠ The secret here is a PIN, whose entropy is tiny, so this module's checks deserve more caution than the same shapes on a 256-bit key.
+
 - **2026-09-07** — Test-only, no production change: `fuzzTwoDecrypt` had never decrypted
   anything. `cipher_len` came from `smith.valueRangeAtMost(u16, 0, 256)` drawn after
   `smith.bytes` had eaten the input; a ranged `Smith` draw returns the range MINIMUM when
