@@ -23,6 +23,29 @@ const month_abbr = [_][]const u8{
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 };
 
+/// Printable US-ASCII (33‥126); anything else — CR/LF, space, tab, and every
+/// other control byte — maps to `-`. RFC 3164 has no in-band framing of its
+/// own (unlike RFC 6587's octet-counted TCP), so a receiver that frames BSD
+/// lines on `\n` would otherwise let an untrusted HOSTNAME or PID forge a
+/// second record. Mirrors `message.zig`'s `writeField` sanitization for the
+/// RFC 5424 header fields — same "non-printable bytes in header fields map
+/// to `-`" bound SPEC.md already states, now held for BOTH encoders.
+fn writeSanitized(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    for (s) |b| try w.writeByte(if (b >= 33 and b <= 126) b else '-');
+}
+
+/// TAG per RFC 3164 §5.3: alphanumeric only, truncated to `max_tag`. Also
+/// closes the narrower ambiguity where a printable-but-non-alnum byte (a
+/// space, or the `:` delimiter itself) inside TAG shifts where a receiver
+/// believes CONTENT begins (RFC 3164 §4.1.3).
+fn writeTag(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    const tag = s[0..@min(s.len, max_tag)];
+    for (tag) |b| switch (b) {
+        'A'...'Z', 'a'...'z', '0'...'9' => try w.writeByte(b),
+        else => try w.writeByte('-'),
+    };
+}
+
 /// A legacy BSD syslog message.
 pub const Message = struct {
     facility: Facility = .user,
@@ -48,15 +71,15 @@ pub const Message = struct {
             } else |_| {}
         }
 
-        try w.writeAll(self.hostname);
+        try writeSanitized(w, self.hostname);
         try w.writeByte(' ');
 
-        // TAG (truncated), then optional [PID], then ": " and the message text.
-        const tag = self.tag[0..@min(self.tag.len, max_tag)];
-        try w.writeAll(tag);
+        // TAG (alnum-filtered + truncated), then optional [PID], then ": "
+        // and the message text.
+        try writeTag(w, self.tag);
         if (self.pid) |pid| {
             try w.writeByte('[');
-            try w.writeAll(pid);
+            try writeSanitized(w, pid);
             try w.writeByte(']');
         }
         try w.writeAll(": ");
@@ -124,6 +147,40 @@ test "day 10 (the space-pad boundary) is NOT space-padded" {
         "<13>Jul 10 12:34:56 host app: hi",
         try bufPrint(&msg, &buf),
     );
+}
+
+test "RFC 3164 line: hostname/tag/pid strip non-printable/non-alnum bytes so an untrusted field cannot forge a second record" {
+    const msg = Message{
+        .facility = .user,
+        .severity = .notice,
+        .hostname = "evil\nhost",
+        .tag = "cron job:x",
+        .pid = "1\n2",
+        .msg = "ok",
+    };
+    var buf: [256]u8 = undefined;
+    const out = try bufPrint(&msg, &buf);
+    // No raw control byte anywhere before MSG: a receiver that frames on
+    // '\n' cannot see this one line as two (RFC 3164 §4.1.3 record forgery).
+    try t.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+    // TAG keeps only alnum bytes (RFC 3164 §5.3) — a space or the ':'
+    // delimiter itself does not survive, so it can't shift where a
+    // receiver believes CONTENT begins.
+    try t.expect(std.mem.indexOf(u8, out, "cron") != null);
+    try t.expect(std.mem.indexOf(u8, out, "job:x") == null);
+}
+
+test "RFC 3164 line: MSG is passed through raw (deliberate — matches the RFC 5424 encoder and the external rsyslogd anchor)" {
+    const msg = Message{
+        .facility = .user,
+        .severity = .notice,
+        .hostname = "host",
+        .tag = "app",
+        .msg = "line one\nline two", // MSG framing is the caller's/transport's job, not this encoder's
+    };
+    var buf: [128]u8 = undefined;
+    const out = try bufPrint(&msg, &buf);
+    try t.expect(std.mem.indexOf(u8, out, "line one\nline two") != null);
 }
 
 test "TAG longer than 32 bytes is truncated" {

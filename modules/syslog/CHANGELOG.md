@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit fix (P1: 0 consumers in the repo). `bsd.Message.format`
+  wrote HOSTNAME/TAG/PID verbatim, so an untrusted field containing `\n` could
+  forge a second RFC 3164 record for a receiver that frames on newline (RFC 3164
+  has no in-band framing of its own), and a space or `:` inside TAG could shift
+  where a receiver believes CONTENT begins. HOSTNAME and PID now map every byte
+  outside printable US-ASCII (33‥126) to `-` — the same bound `message.zig`'s
+  `writeField` already holds for the RFC 5424 header fields, and the one
+  SPEC.md's "non-printable bytes in header fields" already claimed for the whole
+  module. TAG additionally restricts to alphanumeric only (RFC 3164 §5.3, already
+  documented on `max_tag` but not previously enforced). MSG stays untouched,
+  deliberately — matches the RFC 5424 encoder and the external rsyslogd anchor
+  ("MSG passed through raw").
 - **2026-08-22** — `TcpEmitter.send` now returns the explicit `TcpEmitter.SendError`
   (`NoSpaceLeft`, `WriteFailed`, `Canceled`) instead of an inferred `!void`, and
   recovers `Canceled` from the concrete `std.Io.net.Stream.Writer`'s out-of-band

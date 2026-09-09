@@ -23,7 +23,11 @@ Not a security boundary; this is a formatter/emitter, not a parser of untrusted 
 formats caller-supplied structured data, escaping the three characters that would otherwise break the
 SD-PARAM grammar). Failure modes it bounds: header-field overflow (truncated to the RFC limit rather
 than corrupting the wire shape), non-printable bytes in header fields (mapped to `-` rather than
-emitted raw), and oversized UDP payloads (truncated with a marker rather than silently dropped or
+emitted raw — held by BOTH encoders: RFC 5424's HOSTNAME/APP-NAME/PROCID/MSGID via `writeField`, and
+RFC 3164's HOSTNAME/TAG/PID via `bsd.writeSanitized`/`writeTag`, the latter additionally alnum-only
+per RFC 3164 §5.3 — so an untrusted field cannot forge a second record on either wire shape; MSG is
+deliberately passed through raw on both, matching the external rsyslogd anchor below), and oversized
+UDP payloads (truncated with a marker rather than silently dropped or
 fragmented unpredictably). Out of scope: parser/receiver side (RFC 5424 and RFC 3164 message
 *parsing* — this module only encodes), TLS transport (RFC 5425 — left as a BYO-TLS seam), reliable
 delivery (reconnect/retry/backpressure policy for TCP is the caller's), full RFC 3164 parsing
