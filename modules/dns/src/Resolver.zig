@@ -1132,123 +1132,24 @@ test "toNetAddress maps netaddr.Ip to std.Io.net.IpAddress" {
     try testing.expectEqual(@as(u16, 853), v6.ip6.port);
 }
 
-// ── tests (live network — gracefully skipped when unavailable) ──────────────
-
-fn skipLive(err: anyerror) error{SkipZigTest} {
-    std.debug.print("live dns test skipped: {s}\n", .{@errorName(err)});
-    return error.SkipZigTest;
-}
-
-test "live: resolve example.com A over UDP" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var r = Resolver.init(io, testing.allocator, .{ .timeout_ms = 3000 });
-    defer r.deinit();
-
-    var msg = r.resolve("example.com", .a) catch |err| return skipLive(err);
-    defer msg.deinit();
-    if (msg.rcode() != .no_error) return skipLive(error.UnexpectedRcode);
-    var found = false;
-    for (msg.answers) |rec| {
-        if (rec.data == .a) found = true;
-    }
-    try testing.expect(found);
-}
-
-test "live: resolve example.com A over TCP" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var r = Resolver.init(io, testing.allocator, .{ .transport = .tcp, .timeout_ms = 4000 });
-    defer r.deinit();
-
-    var msg = r.resolve("example.com", .a) catch |err| return skipLive(err);
-    defer msg.deinit();
-    if (msg.rcode() != .no_error) return skipLive(error.UnexpectedRcode);
-    try testing.expect(msg.answers.len > 0);
-}
-
-test "live: lookupIp collects A + AAAA" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var r = Resolver.init(io, testing.allocator, .{ .timeout_ms = 3000 });
-    defer r.deinit();
-
-    const ips = r.lookupIp("example.com") catch |err| return skipLive(err);
-    defer testing.allocator.free(ips);
-    if (ips.len == 0) return skipLive(error.NoAddresses);
-}
-
-test "live: reverse PTR of 8.8.8.8" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var r = Resolver.init(io, testing.allocator, .{ .timeout_ms = 3000 });
-    defer r.deinit();
-
-    const names = r.reverse(netaddr.parseIp("8.8.8.8").?) catch |err| return skipLive(err);
-    defer r.freeNames(names);
-    if (names.len == 0) return skipLive(error.NoPtrRecords);
-    try testing.expect(std.mem.indexOf(u8, names[0], "dns.google") != null);
-}
-
-test "live: DoH POST via dns.google (proves the http dep)" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var r = Resolver.init(io, testing.allocator, .{
-        .doh_url = "https://dns.google/dns-query",
-        .timeout_ms = 8000,
-    });
-    defer r.deinit();
-
-    var msg = r.query("example.com", .a) catch |err| return skipLive(err);
-    defer msg.deinit();
-    if (msg.rcode() != .no_error) return skipLive(error.UnexpectedRcode);
-    try testing.expect(msg.answers.len > 0);
-}
-
-test "live: DoH GET via cloudflare-dns.com" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var r = Resolver.init(io, testing.allocator, .{
-        .doh_url = "https://cloudflare-dns.com/dns-query",
-        .doh_method = .get,
-        .timeout_ms = 8000,
-    });
-    defer r.deinit();
-
-    var msg = r.query("example.com", .a) catch |err| return skipLive(err);
-    defer msg.deinit();
-    if (msg.rcode() != .no_error) return skipLive(error.UnexpectedRcode);
-    try testing.expect(msg.answers.len > 0);
-}
-
-test "live: DoH-JSON via dns.google/resolve" {
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var r = Resolver.init(io, testing.allocator, .{
-        .doh_url = "https://dns.google/resolve",
-        .timeout_ms = 8000,
-    });
-    defer r.deinit();
-
-    const parsed = r.queryJson("example.com", .a) catch |err| return skipLive(err);
-    defer parsed.deinit();
-    try testing.expectEqual(@as(u32, 0), parsed.value.Status);
-    try testing.expect(parsed.value.Answer.len > 0);
-}
+// ── live-network tests: MOVED OUT 2026-09-09 ──────────────────────
+//
+// Seven `test "live: …"` used to sit here — recursive UDP/TCP, reverse PTR,
+// and the three DoH shapes — each ending `catch |err| return skipLive(err)`,
+// and `skipLive` narrated the skip with `std.debug.print`, i.e. to stderr.
+// The gate driver treats stderr on an exit-0 step as a failure, so a slow
+// resolver turned `test-dns` red and took a 217-module run with it, with
+// nothing in this module changed.
+//
+// Silencing the print was the wrong fix and so was keeping the skip: a test
+// that reports success for a run in which it did nothing is the defect, not
+// the noise it makes. They are now `modules/dns/tools/live.zig`, run by
+// `zig build live-dns` and COMPILED by `zig build check-interop` so they
+// cannot rot — the shape `dtls` took on 2026-09-06 and this module's own
+// hostile-loopback anchor took on 2026-09-07.
+//
+// Nothing here reaches the network any more. Everything below is loopback or
+// bytes.
 
 // ── tests (loopback stubs, offline) ──────────────────────────────────────────
 
@@ -1487,10 +1388,12 @@ test "tcpExchange: a canceled blocking read surfaces Canceled, not NetworkFailed
 
     // Port 0: an ephemeral port cannot collide with a parallel test run.
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var listener = addr.listen(io, .{ .reuse_address = true }) catch {
-        std.debug.print("live dns test skipped: loopback listen failed\n", .{});
-        return error.SkipZigTest;
-    };
+    // Not a skip. Binding an ephemeral loopback port is something every
+    // machine that can run this suite can do; if it fails, the environment is
+    // broken and the right report is a failure, not a pass. The skip that used
+    // to be here also printed to stderr, which the gate driver turns into a
+    // FAIL anyway -- so it never actually bought the tolerance it looked like.
+    var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.socket.close(io);
 
     var r = Resolver.init(io, testing.allocator, .{

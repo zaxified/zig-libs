@@ -916,6 +916,18 @@ that reaches it can notice.
   the TAKING is a pre-release step.
   ⚠ This is not a licence to move a flaky test out of reach. It applies when the hermetic
   half — the thing that would have caught the defect — actually stays behind in `src/`.
+- **A test that needs the REAL INTERNET is `modules/<name>/tools/live.zig`** (added
+  2026-09-09, `dns` again the case). `zig build live-<name>` runs it, `zig build
+  check-interop` compiles it, and NO lane runs it — which is the point. Such a test has
+  only two honest outcomes in a gate, and both are wrong: it fails when a resolver is
+  slow, or it skips, and a skip is a test reporting success for a run in which it did
+  nothing. `dns` had seven, each `catch |err| return skipLive(err)` with the skip narrated
+  by `std.debug.print` — stderr, which `scripts/test-lib.sh` turns into a FAIL — so one
+  slow lookup was a red run across 217 modules.
+  ⚠ Deliberately NOT the same file as `interop.zig`, and the difference is the promise:
+  an interop program asserts it needs no network, a live program asserts it needs one.
+  Folding them would make `scripts/test.sh interop` require the internet, which is the
+  thing that lane must never do.
 - **An instrument that serves SEVERAL modules lives in `scripts/`** — or in a `tools/`
   directory beside it, if one is ever created for instruments that are not shell entry
   points. `scripts/` is already the documented home for repo-wide checks, and

@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** the seven `test "live: …"` leave the module and
+  become the program `tools/live.zig` (`zig build live-dns`). They talked to real resolvers —
+  recursive UDP and TCP, reverse PTR of `8.8.8.8`, and the three DoH shapes against `dns.google` and
+  `cloudflare-dns.com` — and each ended `catch |err| return skipLive(err)`, where `skipLive` printed
+  `live dns test skipped: <error>` with `std.debug.print`, i.e. to stderr. `scripts/test-lib.sh`
+  treats stderr on an exit-0 step as a failure ("OK-but-stderr -> treated as FAIL"), so a slow DNS
+  server turned `test-dns` red and took a 217-module run with it, with nothing in this module
+  changed. ⭐ Silencing the print would have been the wrong fix and so would keeping the skip: a
+  test that reports success for a run in which it did nothing is the defect, not the noise it makes.
+  This is the third module to take the shape `Module.live`'s doc comment describes — `dtls` on
+  2026-09-06, this module's own hostile-loopback anchor on 2026-09-07 — the anchor's VALUE replays
+  hermetically in the lane that runs everywhere, the anchor's TAKING is a program. Nothing is lost:
+  `zig build live-dns` runs all seven and reports which of the module or the network is suspected
+  (7/7 green when this was written), and `zig build check-interop` compiles it so it cannot rot
+  unnoticed. `test-dns` is now 63 tests, none of which reaches the network. Also here: the loopback
+  listen in `test "tcpExchange: a canceled blocking read surfaces Canceled"` no longer skips with a
+  stderr print — an ephemeral loopback bind that fails is a broken environment, and the honest
+  report is a failure.
+
 - **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** the question-check anchor is split into a
   hermetic half and a live one (audit F20). `test "query: a reply whose question is not ours is
   not the answer, over loopback"` bound a UDP socket, spawned a stub on a second thread and then

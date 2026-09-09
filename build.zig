@@ -444,6 +444,13 @@ pub fn build(b: *std.Build) void {
     // Aggregates for the interop programs created inside the loop below.
     const interop_all = b.step("interop", "Run every module's interop program (needs the foreign peers)");
     const check_interop = b.step("check-interop", "Compile every interop program -- rot guard, runs no peer");
+    // `live-<m>` is a SECOND kind of tools program, added 2026-09-09 for `dns`:
+    // one that genuinely needs the internet. It is deliberately not folded into
+    // `interop-<m>`, because every interop program promises the opposite --
+    // "needs no peer and no network" is what lets `scripts/test.sh interop` run
+    // them everywhere. Both are compiled by `check-interop`; only `interop` is
+    // run by a lane.
+    const live_all = b.step("live", "Run every module's live-network program (NEEDS the internet)");
 
     // Pass 2: wire deps + register a test build per module.
     for (module_list) |m| {
@@ -556,6 +563,40 @@ pub fn build(b: *std.Build) void {
             // without anyone hearing, and this repository has lost an anchor
             // that way before.
             check_interop.dependOn(&interop_exe.step);
+        }
+
+        // The live-network program, discovered by existence exactly like the
+        // interop one. Its checks USED to be `test "live: …"` inside the
+        // module; see `modules/dns/tools/live.zig`'s header for why a network
+        // test that skips is worse than no test at all, and why the skip's
+        // stderr narration was turning a slow resolver into a 217-module FAIL.
+        if (moduleHasLive(b, m.name)) {
+            const live_mod = b.createModule(.{
+                .root_source_file = b.path(b.fmt("modules/{s}/tools/live.zig", .{m.name})),
+                .target = target,
+                .optimize = if (m.heavy) heavy_optimize else optimize,
+            });
+            live_mod.addImport(m.name, mod);
+            for (m.deps) |dep| live_mod.addImport(dep, mods.get(dep).?);
+            for (m.test_deps) |dep| live_mod.addImport(dep, mods.get(dep).?);
+
+            const live_exe = b.addExecutable(.{
+                .name = b.fmt("live-{s}", .{m.name}),
+                .root_module = live_mod,
+            });
+            const live_run = b.addRunArtifact(live_exe);
+            if (b.args) |args| live_run.addArgs(args);
+            const live_one = b.step(
+                b.fmt("live-{s}", .{m.name}),
+                b.fmt("Run the {s} live-network checks against real servers (NEEDS the internet)", .{m.name}),
+            );
+            live_one.dependOn(&live_run.step);
+            live_all.dependOn(&live_run.step);
+
+            // Same rot guard, and it is the whole reason this is wired at all:
+            // an instrument nothing builds is one that stops building without
+            // anyone hearing.
+            check_interop.dependOn(&live_exe.step);
         }
 
         // `check-pubfn-reach`: compile a second root over the SAME module graph
@@ -1612,6 +1653,16 @@ fn ownFilesModule(b: *std.Build, name: []const u8) *std.Build.Module {
     const opts = b.addOptions();
     opts.addOption([]const []const u8, "names", moduleFileNamespaces(b, b.graph.io, name));
     return opts.createModule();
+}
+
+/// Whether a module carries a LIVE-NETWORK program — `modules/<name>/tools/live.zig`.
+///
+/// Separate from `moduleHasInterop` and separate on purpose: an interop program
+/// asserts it needs no network, a live program asserts it needs one. A module
+/// may have either, both, or neither.
+fn moduleHasLive(b: *std.Build, name: []const u8) bool {
+    const path = b.fmt("modules/{s}/tools/live.zig", .{name});
+    return if (b.build_root.handle.access(b.graph.io, path, .{})) |_| true else |_| false;
 }
 
 /// Whether a module carries an interop PROGRAM — `modules/<name>/tools/interop.zig`.
