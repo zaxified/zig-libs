@@ -212,7 +212,7 @@ pub const Reader = struct {
             }
             try verifyChecksum(&block);
 
-            const h = parseHeader(&block);
+            const h = try parseHeader(&block);
             // Reject a size so large that `h.size + content_pad` (used below
             // for pax/GNU-long skip-and-discard) could overflow u64. No real
             // archive needs a size this close to maxInt(u64); a header that
@@ -344,7 +344,7 @@ const Hdr = struct {
     typeflag: u8,
 };
 
-fn parseHeader(block: *const [block_size]u8) Hdr {
+fn parseHeader(block: *const [block_size]u8) error{BadHeader}!Hdr {
     // The ustar `prefix` field only exists under the POSIX magic
     // ("ustar\0"); GNU magic ("ustar  \0") reuses those bytes for
     // atime/ctime, so honoring prefix there would corrupt paths.
@@ -357,7 +357,7 @@ fn parseHeader(block: *const [block_size]u8) Hdr {
         .uid = @truncate(octal(block[108..116])),
         .gid = @truncate(octal(block[116..124])),
         .mtime = @bitCast(octal(block[136..148])),
-        .size = sizeField(block[124..136]),
+        .size = try sizeField(block[124..136]),
         .typeflag = block[156],
     };
 }
@@ -408,8 +408,15 @@ fn octal(field: []const u8) u64 {
 }
 
 /// The size field: octal, or GNU/star base-256 when the leading byte is 0x80.
-fn sizeField(field: []const u8) u64 {
+/// Base-256 carries an 88-bit magnitude (the 11 bytes after the marker); only
+/// the low 64 of those fit `u64` (`field[4..12]`), so a header whose magnitude
+/// sets any of the high 3 bytes (`field[1..4]`) encodes a size >= 2^64 and is
+/// rejected rather than silently truncated to its low 64 bits.
+fn sizeField(field: []const u8) error{BadHeader}!u64 {
     if (field.len == 12 and field[0] == 0x80) {
+        for (field[1..4]) |b| {
+            if (b != 0) return error.BadHeader;
+        }
         var v: u64 = 0;
         for (field[4..12]) |b| v = (v << 8) | b;
         return v;
@@ -794,7 +801,7 @@ test "octal + size parsing" {
     try testing.expectEqual(@as(u64, 0), octal("\x00\x00\x00"));
     try testing.expectEqual(@as(u64, 0), octal("garbage!"));
     var big: [12]u8 = .{ 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0 };
-    try testing.expectEqual(@as(u64, 0x1000), sizeField(&big));
+    try testing.expectEqual(@as(u64, 0x1000), try sizeField(&big));
 }
 
 test "padding to 512" {
@@ -820,11 +827,39 @@ test "size field base-256 round-trip (>8 GiB)" {
     var field: [12]u8 = undefined;
     writeSizeField(&field, huge);
     try testing.expectEqual(@as(u8, 0x80), field[0]);
-    try testing.expectEqual(huge, sizeField(&field));
+    try testing.expectEqual(huge, try sizeField(&field));
     // and the octal path is untouched below the cutoff
     writeSizeField(&field, 12);
     try testing.expectEqualStrings("00000000014\x00", &field);
-    try testing.expectEqual(@as(u64, 12), sizeField(&field));
+    try testing.expectEqual(@as(u64, 12), try sizeField(&field));
+}
+
+test "base-256 size with magnitude >= 2^64 -> error.BadHeader, not truncated" {
+    // Audit finding tar W4: sizeField only read the low 8 of the 11
+    // base-256 magnitude bytes (field[4..12]); the top 3 (field[1..4]) were
+    // ignored. A crafted header encoding 2^64 + 5 used to read back as
+    // size = 5 with a valid checksum instead of being rejected.
+    var field: [12]u8 = .{ 0x80, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5 };
+    try testing.expectError(error.BadHeader, sizeField(&field));
+
+    // Full-header reproduction: same magnitude, through the actual reader.
+    var buf: [2 * block_size]u8 = undefined;
+    var dst: std.Io.Writer = .fixed(&buf);
+    var block: [block_size]u8 = undefined;
+    emitHeader(&block, "evil.bin", "", 0o644, 0, 0, 5, 0, '0');
+    @memcpy(block[124..136], &field);
+    // Recompute the checksum emitHeader wrote for the octal-encoded size 5.
+    @memset(block[148..156], ' ');
+    var sum: u64 = 0;
+    for (block) |b| sum += b;
+    writeOctalField(block[148..155], sum);
+    block[155] = ' ';
+
+    try dst.writeAll(&block);
+    var src: std.Io.Reader = .fixed(dst.buffered());
+    var tr = Reader.init(testing.allocator, &src);
+    defer tr.deinit();
+    try testing.expectError(error.BadHeader, tr.next());
 }
 
 // ── tests: golden header bytes ──────────────────────────────────────────────

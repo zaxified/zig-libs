@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix (P1, no in-repo consumer): **base-256 `size` field
+  ignored 3 of its 11 magnitude bytes.** `sizeField` only read `field[4..12]`
+  (the low 64 bits); a crafted header whose magnitude set any of `field[1..4]`
+  (bits 64-87) silently reported the truncated low-64-bit value instead of the
+  size actually encoded — a header claiming `2^64 + 5` read back as `size = 5`
+  behind a valid checksum. Now `error.BadHeader` whenever those 3 bytes are
+  non-zero, matching the existing overflow guard's stance that a header this
+  close to `maxInt(u64)` is malformed, not a legitimately huge file.
+  `parseHeader`/`sizeField` are now fallible.
+
 - **2026-09-07** — Fuzz reach: `fuzzReader` never saw an archive. It opened
   `smith.bytes(&buf)` and then drew the length with `smith.valueRangeAtMost`; `bytes`
   consumes `@min(buf.len, in.len)` octets and a ranged draw reads EIGHT more as a
