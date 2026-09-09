@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `NOTICE` said "no third-party source was ported" and contradicted
+  itself 80 lines later, where it says the two decode cores are "exact ports of the
+  reference's `reed_solomon_decode`/`reed_muller_decode`/`fft.c`". Four source files agree
+  with the second version; the summary was simply wrong. Corrected, and the upstream's
+  terms are now REPRODUCED rather than cited — `gitlab.com/pqc-hqc/hqc` tag `v5.0.0` is
+  released into the public domain, re-verified by download 2026-09-09, and the file's own
+  hedge about incorporated FIPS202 code ("BELIEVED to be in the public domain") is quoted
+  rather than trimmed.
+
+  ⭐ The kind stays `provenance note`, which DIVERGES from what the audit recommended. The
+  first line of a NOTICE declares whether a CONDITION travels, and none does: a public-domain
+  upstream owes a consumer nothing, so tagging it `third-party attribution` would make the
+  one line readers are told to trust less true, and would drag the file under
+  `check-copyleft` for no reason. The defect was two false sentences, not the kind.
+
+  ⛔ Also corrected: a heading called all three vendored KAT files "Test-vector oracles".
+  Only `src/kat_vectors_code.zig` is — the reference C was compiled and RUN. `kat_vectors.zig`
+  and `kat_vectors_kem.zig` are files READ out of the upstream repository, which root
+  `NOTICE` §0 separates explicitly. Nothing is owed either way here, but mislabelling read
+  data as oracle output is how a module with a non-public-domain upstream quietly exempts
+  itself.
+
+  No code or data changed.
 - **2026-09-09** — Security fix: `prng.writeSupportToVector`'s mask is laundered through
   an `asm volatile ("" : "+r" (mask))` barrier. The scatter was written branch-free — a
   masked select with no `if` in the source — and LLVM recognised the identity and rewrote

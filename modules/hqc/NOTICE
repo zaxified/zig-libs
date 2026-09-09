@@ -8,11 +8,37 @@ not folded into the root NOTICE).
 Provenance
 ----------
 
-hqc — clean-room implementation from the official HQC specification
-("Hamming Quasi-Cyclic (HQC)", 22/08/2025, pqc-hqc.org — the spec
-accompanying NIST's March-2025 selection of HQC as a code-based KEM
-backup to ML-KEM). A public specification, not a copyrightable work; no
-third-party source was ported.
+⛔ CORRECTED 2026-09-09. This section used to end "A public specification, not
+a copyrightable work; no third-party source was ported." THE SECOND HALF WAS
+FALSE, and the same file contradicted it 80 lines further down, where it says
+the two decode cores are "implemented as exact ports of the reference's
+`reed_solomon_decode`/`reed_muller_decode`/`fft.c`". Four source files say the
+same in their own headers: `reedsolomon.zig` ("mechanical port"),
+`reedmuller.zig` ("direct, mechanical port"), `root.zig` and `prng.zig`
+("transcribed from the reference"). The sources are right and the summary was
+wrong.
+
+⭐ WHY THE KIND IS STILL `provenance note`, AND WHY THAT DIVERGES FROM WHAT THE
+AUDIT RECOMMENDED. The finding proposed re-tagging this file `third-party
+attribution`. That would be wrong: the first line of a NOTICE in this repository
+declares whether a CONDITION travels with the module, and none does. The
+reference implementation is released into the PUBLIC DOMAIN — re-verified by
+download 2026-09-09 from `gitlab.com/pqc-hqc/hqc` at tag `v5.0.0`, reproduced
+verbatim below — so a consumer owes nothing, and declaring a condition that does
+not exist would make the one line a reader is told to trust (`head -1
+modules/*/NOTICE`, root `NOTICE` §1) less true rather than more.
+
+It would also have a side effect nobody wants: `zig build check-copyleft` holds
+only ATTRIBUTION files to its formal shape, so re-tagging a module purely to
+look more cautious drags it under a gate for no reason. The defect here was
+never the kind. It was two sentences that said the opposite of what the module
+does.
+
+hqc — the CODE is written from the official HQC specification ("Hamming
+Quasi-Cyclic (HQC)", 22/08/2025, pqc-hqc.org — the spec accompanying NIST's
+March-2025 selection of HQC as a code-based KEM backup to ML-KEM), with the
+exceptions inventoried below: the two decode cores are ports, and several
+tables and layout quirks are transcribed from the reference source.
 
 Design reference (behavior/byte-layout only, no source copied): the
 reference implementation, https://gitlab.com/pqc-hqc/hqc, tag `v5.0.0`
@@ -58,7 +84,7 @@ exact algorithmic behavior the spec's prose leaves underspecified:
   `crypto_kem_dec`, `src/ref/vector.c`'s `vect_compare`, and
   `src/ref/parsing.c`'s `hqc_c_kem_to_string`/`hqc_c_kem_from_string`.
 
-Test-vector oracles (also design-reference, not ported source):
+Reproduced test data (⛔ NOT all of it "oracle output" — see below):
 - Part 1: the same tag's `kats/ref/hqc-1/intermediates_values` file — a
   byte-exact, independently-verified fixture embedded in
   `src/kat_vectors.zig` (fetched via `curl` directly from gitlab.com and
@@ -81,11 +107,60 @@ Test-vector oracles (also design-reference, not ported source):
   transcription, no LLM-summarized hex); the first 3 `count`s per
   parameter set are embedded in `src/kat_vectors_kem.zig`.
 
+⛔ THE HEADING ABOVE USED TO SAY "Test-vector oracles (also design-reference,
+not ported source)", and that mislabelled two of the three. Root `NOTICE` §0's
+black-box-oracle carve-out covers "the program's observable behavior" and says
+in as many words that it "stops at data that was never observed from a running
+program at all — numbers read out of an upstream source file by a script are
+reproduced data". By that line:
+
+  * `src/kat_vectors_code.zig` IS oracle output — the reference C was compiled
+    and RUN against messages we chose, and its stdout captured.
+  * `src/kat_vectors.zig` is NOT — `intermediates_values` is a file in the
+    upstream repository, read by a script.
+  * `src/kat_vectors_kem.zig` is NOT — the `PQCkemKAT_*.rsp` files are likewise
+    read, not observed.
+
+Nothing is owed for either, because the upstream is public domain and the terms
+are reproduced above. But calling read data "oracle output" is how a module with
+a NON-public-domain upstream ends up quietly exempting itself, so the labels are
+corrected here rather than left to be copied.
+
 See SPEC.md's Verification section for exactly which primitives are
 numeric-KAT-pinned against these fixtures vs. transcribed-from-source-only.
 
-No other third-party source was ported or consulted. Uses only the Zig
+Nothing outside the inventory above was ported or consulted. Uses only the Zig
 standard library (`std.crypto.hash.sha3`: SHAKE256, SHA3-256, SHA3-512).
+
+Upstream terms, reproduced
+--------------------------
+
+Root `NOTICE` §0 asks that ported third-party source travel with its licence
+terms reproduced, not merely cited. Until 2026-09-09 this file cited them
+("public-domain license — see that repo's own LICENSE"), which sends the reader
+to a file that is not in this tree. `gitlab.com/pqc-hqc/hqc`, tag `v5.0.0`,
+`LICENSE`, fetched 2026-09-09:
+
+    This software is released into the public domain.
+
+    You are free to use, modify, and distribute this software for any purpose,
+    with or without fee, and without any warranty.
+
+    This project incorporates third-party code from the FIPS202 implementation
+    used in the PQClean project, which is itself based on public domain code:
+
+    - crypto_hash/keccakc512/simple/ from http://bench.cr.yp.to/supercop.html
+      by Ronny Van Keer
+    - TweetFips202 by Gilles Van Assche, Daniel J. Bernstein, and Peter Schwabe
+      (https://twitter.com/tweetfips202)
+
+    All of the included code is believed to be in the public domain.
+
+⭐ Worth noting rather than eliding: upstream's own text says its FIPS202 code is
+"BELIEVED to be in the public domain". This module ports none of that code — it
+uses Zig std's SHA-3 — so the hedge does not reach here, and it is quoted rather
+than trimmed because a licence quoted selectively is the defect `encoding`'s
+NOTICE was carrying until the same day.
 
 This is the complete arc (Parts 1-3): ring + PRNG foundation, the
 complete RS/RM concatenated codec (both ENCODE and the two DECODE cores,
