@@ -226,16 +226,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.debug.print("sig={x}\n", .{sig});
         },
         .ratchet => {
-            var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
+            // ONE binding for the whole target. These six uses each named
+            // `std.heap.page_allocator` at the call site, which meant six
+            // separate gate exemptions alive for a single reason -- and an
+            // exemption must not outlive its reason, so six of them is five
+            // too many chances for one to. Same shape the bbs, bulletproofs
+            // and coconut harnesses already use.
+            const allocator = std.heap.page_allocator; // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
+
+            var threaded = std.Io.Threaded.init(allocator, .{});
             defer threaded.deinit();
             const io = threaded.io();
 
-            const session = try buildSession(std.heap.page_allocator, io); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
+            const session = try buildSession(allocator, io);
             var alice = session.alice;
             var bob = session.bob;
 
-            var msg = try alice.encrypt(std.heap.page_allocator, "ctgrind-signal-harness-plaintext"); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
-            defer msg.deinit(std.heap.page_allocator); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
+            var msg = try alice.encrypt(allocator, "ctgrind-signal-harness-plaintext");
+            defer msg.deinit(allocator);
 
             // Bob's root key and his current ratchet private key -- both
             // secret, both inputs to the DH-ratchet's `rootRatchet` ->
@@ -254,8 +262,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // printed plaintext is the propagation witness -- proof the
             // taint travelled root key -> DH ratchet -> chain key ->
             // message key -> AEAD open, not just into a dead intermediate.
-            const pt = try bob.decrypt(std.heap.page_allocator, msg.header, msg.ciphertext, io); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
-            defer std.heap.page_allocator.free(pt); // global-alloc-ok: one-shot ctgrind diagnostic binary, no caller to take one from
+            const pt = try bob.decrypt(allocator, msg.header, msg.ciphertext, io);
+            defer allocator.free(pt);
             std.debug.print("plaintext={x}\n", .{pt});
         },
     }
