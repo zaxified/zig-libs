@@ -162,10 +162,36 @@ pub const KeyPair = struct {
         if (d.isZero()) return error.InvalidSecretKey;
         const p = Secp256k1.combMulBase(sk.bytes, .big) catch return error.InvalidSecretKey;
         const xy = p.affineCoordinates();
-        const effective: [32]u8 = if (xy.y.isOdd())
-            scalar.neg(sk.bytes, .big) catch unreachable // sk.bytes already canonical (validated above)
-        else
-            sk.bytes;
+        // BIP340 "Default Signing" step 3: d = d' if has_even_y(P) else n - d'.
+        //
+        // ⛔ Constant-time masked select, NOT an `if` -- deliberately the same
+        // shape `sign`'s step 7 uses for the nonce parity 140 lines below.
+        // Both bits have the identical structure (the parity of a point
+        // derived from a secret), and having one hardened and the other not
+        // was an inconsistency this module could not justify.
+        //
+        // ⚠ What this bit actually is, so nobody "simplifies" it back: it says
+        // whether the STORED secret is `d` or `n - d`. Both sign identically,
+        // so leaking it narrows a search from 2^256 to 2^255 -- worthless to an
+        // attacker. It is hardened because it is cheap and because the module
+        // claims constant-time signing, not because a leak here is dangerous.
+        //
+        // ⭐ The reference implementation branches here instead
+        // (`secp256k1_schnorrsig_sign_internal`: `if (secp256k1_fe_is_odd(&pk.y))
+        // secp256k1_scalar_negate(&sk, &sk);`), and its constant-time CI passes
+        // because `secp256k1_keypair_load` declassifies the whole pubkey. ⚠ That
+        // defence does not transfer: libsecp256k1's keypair hands out the FULL
+        // 33-byte pubkey, so the parity really is public there. `KeyPair` here
+        // exposes an x-only key, so this module never publishes the bit.
+        // ⚠ `d.neg()` and NOT `scalar.neg(sk.bytes, .big)`: the byte-slice form
+        // returns an error union, and its `catch` is a branch memcheck reports
+        // even though the input was validated above and it can never be taken.
+        // The `Scalar` method cannot fail, so the branch does not exist at all
+        // -- again exactly what step 7 does with `k0.neg()`.
+        const negated = d.neg().toBytes(.big);
+        const mask: u8 = @as(u8, 0) -% @intFromBool(xy.y.isOdd());
+        var effective: [32]u8 = undefined;
+        for (&effective, sk.bytes, negated) |*ei, even, odd| ei.* = (even & ~mask) | (odd & mask);
         return .{ .secret = effective, .public = .{ .x = xy.x.toBytes(.big) } };
     }
 

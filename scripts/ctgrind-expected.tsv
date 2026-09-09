@@ -326,7 +326,7 @@ falcon	ReleaseFast	sign	1	<=133	d6b62d587b79541c	3f5a6dbb61a76d9d
 bls12_381	ReleaseFast	field	1	1	397efcbf4800ff52	c1e8a3c184eada53
 bls12_381	ReleaseFast	g1_scalarmul	1	5	1def823fc775a7a6	b53b0d7808e48c1c
 bls12_381	ReleaseFast	g2_scalarmul	1	8	b20728e96d38eb2c	7f4e15a241002b3f
-bip340	ReleaseFast	sign	1	<=80	5b0d1bc260a6af95	0ce3274dc49157be
+bip340	ReleaseFast	sign	1	<=79	a1dc0ab00018aed2	0ce3274dc49157be
 blindrsa	ReleaseFast	blind	1	<=477	56e9b79636971444	39331e35c8b9371e
 blindrsa	ReleaseFast	sign	1	<=218	56e9b79636971444	4d5e3740a158032d
 threshold_ecdsa	ReleaseFast	share	1	<=127	0949d91bca3d536a	4a6777ac538b5e90

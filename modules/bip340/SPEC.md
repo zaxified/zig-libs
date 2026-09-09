@@ -120,6 +120,29 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
   dependent branching/timing in the scalar arithmetic std already gives
   constant-time; the risk surface here is in code this module's `sign`
   itself adds around it, e.g. any early-return based on secret bits).
+  **Both even-y normalizations are constant-time masked selects**: step 7's
+  nonce parity (`root.zig`, `sign`) and step 3's KEY parity
+  (`KeyPair.fromSecretKey`). ⭐ The second one was a plain `if` until
+  2026-09-09 — two structurally identical bits treated two different ways in
+  one file — and the audit that found it is why they now match.
+  ⚠ **What the key-parity bit is, so it does not get "simplified" back:** it
+  says whether the STORED secret is `d` or `n − d`. Both sign identically, so
+  leaking it narrows a search from 2^256 to 2^255 — worthless to an attacker.
+  It is hardened because it is cheap (measured: the cost is below this
+  machine's noise floor, spreads overlap) and because this module claims
+  constant-time signing, NOT because a leak here is dangerous.
+  ⭐ For the record, **the reference implementation branches here instead**:
+  `secp256k1_schnorrsig_sign_internal` does
+  `if (secp256k1_fe_is_odd(&pk.y)) secp256k1_scalar_negate(&sk, &sk);`, and its
+  valgrind-based constant-time CI passes because `secp256k1_keypair_load`
+  declassifies the whole pubkey. ⛔ That defence does not transfer to us:
+  libsecp256k1's keypair hands out the FULL 33-byte pubkey, so the parity
+  genuinely is public there, whereas `KeyPair` here exposes an x-only key and
+  never publishes the bit. (Note also that libsecp256k1's declassify carries a
+  comment about a different reason — `pubkey_load`'s ARG_CHECK — not an
+  explicit "the parity is public" claim, unlike the one it writes for the
+  nonce: *"We declassify r to allow using it as a branch point. This is fine
+  because r is not a secret."*)
 - **Batch verification's randomness**: the `a_2..a_u` coefficients
   (`verifyBatch`) must be drawn AFTER every `(pubkey, msg, sig)` triple in
   the batch is fixed, and must be unpredictable to whoever supplied the
