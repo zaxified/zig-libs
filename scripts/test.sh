@@ -363,6 +363,7 @@ harness_smoke() {
     # the ctgrind gate. This disassembly check is the only thing that fails when
     # the emulation is bypassed. See the script header.
     step "check-fp-freedom" ./scripts/check-fp-freedom.sh
+    step "check-ct-compare" ./scripts/check-ct-compare.py
     step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
 
     # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
@@ -1199,7 +1200,7 @@ cmd_changed() {
                 # Might have changed the graph — ask the graph, do not assume.
                 trigger_graph=1
                 ;;
-            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/check-fp-freedom.sh|scripts/check-skip-as-pass.py|scripts/check-fuzz-reach.py|scripts/check-example-assert.py|scripts/check-changelog-entry.py|scripts/hooks/*)
+            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/check-fp-freedom.sh|scripts/check-skip-as-pass.py|scripts/check-ct-compare.py|scripts/ct-compare-expected.tsv|scripts/check-fuzz-reach.py|scripts/check-example-assert.py|scripts/check-changelog-entry.py|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed.
@@ -1456,6 +1457,7 @@ cmd_changed() {
     # the ctgrind gate. This disassembly check is the only thing that fails when
     # the emulation is bypassed. See the script header.
     step "check-fp-freedom" ./scripts/check-fp-freedom.sh
+    step "check-ct-compare" ./scripts/check-ct-compare.py
     step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
 
     # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
@@ -1627,6 +1629,7 @@ phase_checks() {
     # the ctgrind gate. This disassembly check is the only thing that fails when
     # the emulation is bypassed. See the script header.
     step "check-fp-freedom" ./scripts/check-fp-freedom.sh
+    step "check-ct-compare" ./scripts/check-ct-compare.py
     step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
 
     # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its

@@ -1,0 +1,47 @@
+# Constant-time comparison sites, pinned. See scripts/check-ct-compare.py for
+# why this file exists -- in short: swapping `std.crypto.timing_safe.eql` for
+# `std.mem.eql` is invisible to every value test AND to ctgrind (measured on
+# ctap2pin, 2026-09-09: not one context moves), so the only thing that can hold
+# the decision in place is a count that goes red when it changes.
+#
+# path<TAB>constant-time compares<TAB>plain std.mem compares in the same file
+#
+# ⚠ The second column is context, not a verdict: plenty of files legitimately
+# compare public bytes with `std.mem.eql`. It is pinned so that a swap shows up
+# as BOTH a drop on the left and a rise on the right, which is what a mutation
+# looks like and what a refactor usually does not.
+modules/aaa-gate/src/root.zig	4	1
+modules/aeadframe/src/channel.zig	1	5
+modules/aeskw/src/root.zig	1	0
+modules/blindrsa/src/root.zig	1	1
+modules/chachapoly/src/root.zig	1	0
+modules/ctap2pin/src/root.zig	2	0
+modules/dkg/src/core.zig	2	0
+modules/dnssec/src/ds.zig	1	0
+modules/dtls/src/Connection.zig	4	8
+modules/dtls/src/keyschedule.zig	2	2
+modules/ecvrf/src/ecvrf.zig	1	0
+modules/idempotency/src/root.zig	1	0
+modules/iec62351/src/acse.zig	1	0
+modules/iec62351/src/goose.zig	5	2
+modules/jwe/src/enc.zig	1	0
+modules/jwt/src/root.zig	1	30
+modules/megolm/src/cipher.zig	1	1
+modules/minisign/src/root.zig	1	17
+modules/mls/src/keyschedule.zig	2	14
+modules/opaque/src/root.zig	3	0
+modules/opcua/src/security.zig	1	1
+modules/opcua/src/server.zig	1	13
+modules/otp/src/root.zig	3	0
+modules/rsa/src/root.zig	3	20
+modules/sessions/src/csrf.zig	1	2
+modules/signal/src/xeddsa.zig	2	0
+modules/snmp/src/usm.zig	5	0
+modules/spake2plus/src/root.zig	2	1
+modules/sphinx/src/core.zig	1	0
+modules/ssh/src/transport.zig	2	38
+modules/stun/src/root.zig	1	1
+modules/tlsresume/src/psk.zig	1	0
+modules/voprf/src/root.zig	1	1
+modules/webhooksig/src/root.zig	2	2
+modules/wireguard/src/handshake.zig	4	11
