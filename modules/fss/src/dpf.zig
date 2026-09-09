@@ -79,9 +79,30 @@ inline fn selectBit(cond: u1, a: u1, b: u1) u1 {
     return (a & cond) | (b & ~cond);
 }
 
+/// Optimization barrier (montint `b199192` leak class): launder a value through
+/// an empty inline-asm so LLVM loses all equality and range knowledge about it.
+/// No-op at runtime. Same idiom as `p256/src/group.zig`, `k256/src/field.zig`
+/// and `montint`.
+inline fn blackBox(x: u8) u8 {
+    return asm volatile (""
+        : [ret] "=r" (-> u8),
+        : [x] "0" (x),
+    );
+}
+
 /// branch-free `if (cond == 1) dst ^= src`.
+///
+/// ⛔ The mask is laundered, and that is LOAD-BEARING, not defensive. `cond` is
+/// a `u1`, so without the barrier LLVM can recover "`cond == 0` makes `m` zero
+/// and the whole loop a no-op" and emit a jump over it. Measured 2026-09-09:
+/// this same function, at ReleaseFast, compiled BOTH ways in one binary — the
+/// two call sites in `genWithSeeds` stayed branch-free (`cmovne`), while the
+/// one in `eval` (`dpf.zig`, the descent) became `test $0x1,%r9b` / `je` on the
+/// secret control bit `t`, which memcheck reported as a conditional jump on
+/// uninitialised data. Writing the mask correctly is not enough; the optimiser
+/// has to be denied the provenance that lets it undo the masking.
 inline fn xorMasked(dst: *Seed, src: Seed, cond: u1) void {
-    const m: u8 = 0 -% @as(u8, cond);
+    const m: u8 = blackBox(0 -% @as(u8, cond));
     for (dst, src) |*d, q| d.* ^= q & m;
 }
 

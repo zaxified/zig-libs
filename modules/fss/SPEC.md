@@ -481,6 +481,18 @@ every key, every α and every control-bit pattern. `x` in `eval` is a public
 query index but is masked the same way, so no reader has to reason about which
 of the two is secret.
 
+⛔ **`xorMasked`'s mask goes through an optimization barrier, and removing it
+reintroduces the leak.** Writing the select branch-free is not sufficient here,
+and this was measured rather than assumed: at ReleaseFast on 2026-09-09 the very
+same `xorMasked` compiled BOTH ways inside one binary — branch-free (`cmovne`)
+at `genWithSeeds`' two call sites, and `test $0x1,%r9b` / `je` on the secret
+control bit `t` at `eval`'s. `cond` is a `u1`, so LLVM could recover that a zero
+mask makes the byte loop a no-op and jump over it. Laundering the mask through
+an empty inline-asm (the montint `b199192` idiom, as in `p256`, `k256` and
+`montint`) denies it that provenance. `zig build ctgrind` measures this claim
+directly: `fss/eval` reports 0 in-file contexts, and did report one before the
+barrier was added.
+
 What remains, and it is in the PRG rather than the tree: on a target where
 `std.crypto.core.aes.has_hardware_support` is false, std falls back to a T-table
 AES whose table indices depend on the data. std applies cache-line-granular

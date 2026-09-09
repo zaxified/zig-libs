@@ -366,16 +366,13 @@ ctap2pin	ReleaseFast	ecdh	1	4	01668687f2e11343	4596df5a3f29ae3b
 ctap2pin	ReleaseFast	one	1	7	01668687f2e11343	12de2588e792c80e
 ctap2pin	ReleaseFast	two	1	7	01668687f2e11343	4f76909ff534c3cc
 ctap2pin	ReleaseFast	token	1	0	01668687f2e11343	076a3a6729a924b0
-fss	ReleaseFast	gen	1	0	4c5e39d39bbe05bd	b40b02f9cf423f05
-# ⛔ DEFECT, and the bound is deliberate. `dpf.zig:326`'s xorMasked compiles to
-# `test $0x1,%r9b` / `je` on the secret `t` -- disassembled 2026-09-09, still there.
-# The audit recorded "a jump on 7 of 8 levels"; those 7 are TREE LEVELS, not
-# contexts. memcheck aggregates by ADDRESS, and in this build the level loop is
-# rolled (the `je` targets the loop tail), so all 8 levels share one address and
-# one context is the most that can ever be reported. Pinning 7 pinned the
-# compiler's unrolling decision. `>=1` pins what is actually stable: this module
-# has a secret-dependent branch here, and the day it drops to 0 something moved.
-fss	ReleaseFast	eval	1	>=1	4c5e39d39bbe05bd	da79011b1ab46d96
+fss	ReleaseFast	gen	1	0	3a5ad9154e5aa436	b40b02f9cf423f05
+# Was `>=1` and a confirmed defect: `dpf.zig:326`'s xorMasked compiled to
+# `test $0x1,%r9b` / `je` on the secret control bit at THIS call site while
+# staying branch-free at genWithSeeds'. Fixed by laundering the mask through
+# an optimization barrier (dpf.zig `blackBox`), so 0 is now the claim and the
+# barrier is what holds it -- deleting it puts the branch back.
+fss	ReleaseFast	eval	1	0	3a5ad9154e5aa436	da79011b1ab46d96
 bfv	ReleaseFast	keygen	1	<=29	b3ff258fd2f8dd50	85d334608120f4fc
 bfv	ReleaseFast	encrypt	1	<=17	b3ff258fd2f8dd50	e4cdbb1aa2e9c9dc
 bfv	ReleaseFast	decrypt	1	<=6	b3ff258fd2f8dd50	51de1d1011ed3c4c
