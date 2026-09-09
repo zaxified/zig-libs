@@ -278,9 +278,9 @@ ed448	ReleaseFast	ladder	1	0	dc6585ac248e91ee	43db8426e0d6c6e7
 # was NOT measured; that is different and much more expensive work. The claim
 # is "the module's stated property does not hold and nothing was testing it",
 # not "the key is out".
-hqc	ReleaseFast	decaps	1	14	7f5013197dbadfab	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	4	7f5013197dbadfab	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	6	7f5013197dbadfab	e91a390cf03fd6ad
+hqc	ReleaseFast	decaps	1	14	f422f2cd7d2fc4d5	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	f422f2cd7d2fc4d5	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	6	f422f2cd7d2fc4d5	e91a390cf03fd6ad
 hqc	ReleaseFast	sampler	1	2	2a6058d658bd6789	b93fa60c89578576
 k256	ReleaseFast	field	1	0	2642e053d442bcc0	4f13cccddea81376
 k256	ReleaseFast	mul	1	2	5f54a05906a76759	729cb9458ddf4051

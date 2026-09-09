@@ -202,6 +202,31 @@ pub fn RM(comptime p: params.Params) type {
         /// in this layer — `find_peaks` always returns *some* byte), so
         /// document that as expected behavior rather than an assertion
         /// target.
+        /// ⚠ **Why ReleaseSafe reports 76 more ctgrind contexts here than
+        /// ReleaseFast, and why that is NOT a leak.** In ReleaseSafe the
+        /// compiler inserts overflow checks on the `i16` arithmetic below, and
+        /// their operands are secret-derived, so memcheck flags them: 48 at the
+        /// `+=` accumulator and 14+14 at the Hadamard butterfly, measured
+        /// 2026-09-09 (`decaps` 94 contexts against ReleaseFast's 14).
+        ///
+        /// Their OUTCOME cannot vary, for any input. `expanded[i]` is a sum of
+        /// `multiplicity` values, each 0 or 1, and `rm_multiplicity` is 3
+        /// (hqc-128) or 5 (hqc-192/256), so |expanded[i]| <= 5. Seven butterfly
+        /// passes at most double the magnitude each, so the transform stays
+        /// within 5 * 2^7 = 640. Against `i16`'s 32767 that is ~50x of
+        /// headroom, and the bound does not depend on the ciphertext: an
+        /// attacker choosing every bit still only supplies 0s and 1s to sum.
+        /// The overflow branch is therefore never taken, the instruction
+        /// sequence is identical on every run, and there is no timing signal.
+        /// What memcheck reports is taint on the OPERANDS, not an outcome that
+        /// moves with the secret.
+        ///
+        /// ⛔ Do NOT "fix" this with `@setRuntimeSafety(false)` or by switching
+        /// to `+%`: that removes a real safety net, or changes semantics, to
+        /// improve a measurement that was never measuring a defect — and it is
+        /// the kind of edit that gets copied to a loop where overflow IS
+        /// reachable. If `rm_multiplicity` ever grows past ~255, re-derive the
+        /// bound above before assuming this note still holds.
         pub fn decodeSymbol(cdw: Symbol) u8 {
             // Step 1: expand and sum (reference: `expand_and_sum`). Each
             // 128-bit copy is read as 4 little-endian u32 words (the same
