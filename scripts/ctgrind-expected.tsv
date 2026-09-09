@@ -218,50 +218,75 @@ ed448	ReleaseFast	ladder	1	0	dc6585ac248e91ee	43db8426e0d6c6e7
 # are the first ones in this file that are. The convention above says an
 # unaccounted non-zero is recorded here anyway and marked DEFECT, because an
 # unrecorded defect is invisible and a row that goes red when it is FIXED is
-# how the fix gets noticed. This is that case.
+# how the fix gets noticed. This is that case — and on 2026-09-09 it did
+# exactly that: the counts below were 52 / 26 / 33 and are now 14 / 4 / 6.
 #
 # The module's own docs said it has no secret-dependent branches because it
 # structurally matches the reference. It does match — and the compiler undoes
-# it. `writeSupportToVector` (prng.zig:285-291) is a masked select with no `if`
-# in the source; LLVM recognises the identity and rewrites it back into a
-# branch that loads `bit_tab[k]` only on the taken path. Adjudicated in the
-# disassembly as real `je`/`jne`/`jb`, not the known `cmov` false positive.
+# it. `writeSupportToVector` is a masked select with no `if` in the source;
+# LLVM recognised the identity and rewrote it back into a branch that loads
+# `bit_tab[k]` only on the taken path. Adjudicated in the disassembly as real
+# `je`/`jne`/`jb`, not the known `cmov` false positive. That is now stopped by
+# an `asm volatile ("" : "+r" (mask))` barrier in the inner loop — an opaque
+# identity the compiler cannot see through, so it can no longer prove the
+# select. THE BARRIER IS LOAD-BEARING: deleting it puts 38 contexts back, and
+# these rows are what says so.
 #
-# Attribution, ReleaseFast, decaps (52):
-#   prng.zig:289   38   `val |= btab & mask` — the scatter above. THE defect.
+# WHAT THE FIX COST, measured before it was applied (min of 200 calls,
+# ReleaseFast -Dcpu=native, three alternating runs per arm; the spread inside
+# each arm was ≤1%, so the gap is far outside the noise):
+#
+#             without barrier   with barrier    delta
+#   keypair       141 175 ns      150 978 ns    +6.9%
+#   encaps        274 923 ns      298 035 ns    +8.4%
+#   decaps        442 039 ns      469 334 ns    +6.2%
+#
+#   Re-derive with `modules/hqc/src/bench.zig` (opt in via HQC_BENCH=1); it was
+#   written for this measurement. The trade taken: 38 secret-dependent branch
+#   contexts out of the module's hottest secret path, for ~7% on a PQ KEM.
+#
+# Attribution, ReleaseFast, decaps (14) — `prng.zig:289`, which was 38 of the
+# old 52, is GONE; everything below is what it always was:
 #   gf256.zig:114   4   `if (s >= 255) s -= 255` — log-table reduction.
-#   prng.zig:268    3   `if (found) support[idx] = …` — duplicate fixup.
 #   gf256.zig:113   3   `if (a == 0 or b == 0)` — GF(256) multiply short-circuit.
+#   prng.zig:268    3   `if (found) support[idx] = …` — duplicate fixup.
 #   reedsolomon     2   inlined, no line info (computeElp and encode).
 #   prng.zig:216    1   `if (val < threshold) break` — rejection sampling.
 #   prng.zig:223    1   `if (s == val) dup = true` — duplicate detection.
+#
+#   keygen (4): prng.zig:216 ×2, prng.zig:223 ×2 — the rejection loop only.
+#   encaps (6): prng.zig:268 ×3, gf256.zig:114 ×2, reedsolomon ×1.
 #
 # `sampler` is 2, not 40, ON PURPOSE: that target drives the fixed-weight
 # rejection sampler only (prng.zig:216 and :223) and never reaches the scatter,
 # which runs later when the support is turned into a bit vector. It isolates
 # the loop so a change there is attributable; it is not a smaller measurement
-# of the same thing.
+# of the same thing. It is unchanged by the barrier, which is the expected
+# result and a small check that the drop elsewhere is the scatter and not a
+# measurement artefact.
 #
-# ⚠ The count is WORSE in the mode a cautious consumer deploys: measured on
-# decaps, ReleaseFast 52, **ReleaseSafe 130** (the overflow checks in
-# reedmuller.decodeSymbol become branches on secret-derived data), Debug 38,
-# ReleaseSmall 18. Only ReleaseFast is pinned — a second mode doubles the rows
-# for a claim of the same shape, and Debug cannot be measured at all.
+# ⚠ The count is STILL WORSE in the mode a cautious consumer deploys, and the
+# barrier does not fix that: measured on decaps, ReleaseFast 14, **ReleaseSafe
+# 92** (was 130). The remaining ~78 are the overflow checks in
+# reedmuller.decodeSymbol becoming branches on secret-derived data — a
+# different defect in the same module, untouched by this fix. Only ReleaseFast
+# is pinned; a second mode doubles the rows for a claim of the same shape, and
+# Debug cannot be measured at all.
 #
 # ⚠ HONEST BOUND: memcheck says "Conditional jump OR MOVE". These were
 # adjudicated as real jumps. Whether a key is practically extractable from them
 # was NOT measured; that is different and much more expensive work. The claim
 # is "the module's stated property does not hold and nothing was testing it",
 # not "the key is out".
-hqc	ReleaseFast	decaps	1	52	b61903eb27eed445	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	26	b61903eb27eed445	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	33	b61903eb27eed445	e91a390cf03fd6ad
-hqc	ReleaseFast	sampler	1	2	8f68fc6d6b7a3b0b	b93fa60c89578576
+hqc	ReleaseFast	decaps	1	14	bc317361f873da09	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	bc317361f873da09	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	6	bc317361f873da09	e91a390cf03fd6ad
+hqc	ReleaseFast	sampler	1	2	2a6058d658bd6789	b93fa60c89578576
 k256	ReleaseFast	field	1	0	2642e053d442bcc0	4f13cccddea81376
 k256	ReleaseFast	mul	1	2	5f54a05906a76759	729cb9458ddf4051
 k256	ReleaseFast	comb	1	1	5f54a05906a76759	2ac21fe395f35487
 k256	ReleaseFast	sign	1	11	e951ae5b872d185a	bb06c2ed85209b8d
-k256	ReleaseFast	ecdsa	1	10	0f0337cd425a3ba6	8ff4812d21149442
+k256	ReleaseFast	ecdsa	1	10	59cc96a03b882aad	8ff4812d21149442
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,

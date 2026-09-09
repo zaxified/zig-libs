@@ -5,25 +5,34 @@
 //! and several doc comments used to say the implementation has no
 //! secret-dependent branches because it structurally matches the reference.
 //! It does structurally match — and the compiler undoes it. `prng.zig`'s
-//! `writeSupportToVector` is a masked select with no `if` in the source, and
-//! LLVM recognises the identity and rewrites it back into a branch that loads
+//! `writeSupportToVector` was a masked select with no `if` in the source, and
+//! LLVM recognised the identity and rewrote it back into a branch that loads
 //! `bit_tab[k]` only on the taken path. Adjudicated in the disassembly as real
 //! `je`/`jne`/`jb`, not the known `cmov` false positive (audit finding, 2026).
+//!
+//! ⭐ THE HARNESS DID ITS JOB ON 2026-09-09. The scatter is now behind an
+//! `asm volatile ("" : "+r" (mask))` barrier and the pinned counts moved
+//! `decaps` 52 → 14, `keygen` 26 → 4, `encaps` 33 → 6 — the rows went red on a
+//! FIX, which is exactly the direction this file was written to catch. What is
+//! left is elsewhere in the module (`gf256`'s multiply, the rejection loop) and
+//! is still a recorded defect.
 //!
 //! So the point of this harness is not to prove the module clean. It is to
 //! make the defect VISIBLE and to fail the moment its size changes — in either
 //! direction. A row that goes red when the leak is FIXED is how the fix gets
 //! noticed; a row that goes red when a compiler upgrade makes it worse is how
 //! a silent regression gets noticed. Without it, every fix quietly falls apart
-//! at the next Zig upgrade and nothing says so.
+//! at the next Zig upgrade and nothing says so — and that now includes the
+//! barrier itself, which is one deletable line holding 38 contexts shut.
 //!
 //! Usage: ctgrind-hqc <target> <yes|no>
 //!   targets: decaps | keygen | encaps | sampler
 //!
 //! ## Why ReleaseFast only, when the count is WORSE elsewhere
 //!
-//! Measured across modes on `decaps`: ReleaseFast 52, ReleaseSafe 130, Debug
-//! 38, ReleaseSmall 18. ReleaseSafe is worse because the overflow checks in
+//! Measured across modes on `decaps`, post-barrier: ReleaseFast 14,
+//! ReleaseSafe 92 (pre-barrier those were 52 and 130).
+//! ReleaseSafe is worse because the overflow checks in
 //! `reedmuller.decodeSymbol` become branches on secret-derived data — and
 //! ReleaseSafe is the mode a security-conscious consumer deploys. That is
 //! itself a finding and it is written down in `SPEC.md`; it is not pinned here

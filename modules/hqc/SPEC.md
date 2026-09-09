@@ -97,41 +97,66 @@ below). See [README.md](README.md) for purpose and API.
   carries the four rows as a **recorded defect**, which is what this
   repository does with a non-zero nobody can account for.
 
+  ⭐ **The scatter defect is FIXED as of 2026-09-09.** The counts below are
+  post-fix; the pre-fix ones were 52 / 26 / 33 / 2.
+
   | target | tainted | contexts | in-file | untainted control | no-`-fvalgrind` trap |
   |---|---|---:|---:|---:|---:|
-  | `decaps` | `dk_pke ‖ sigma` | 54 | **52** | 0 | 0 |
-  | `keygen` | the seed | 28 | **26** | 0 | 0 |
-  | `encaps` | `m` (the FO secret) | 35 | **33** | 0 | 0 |
-  | `sampler` | the sampler seed | 7 | **2** | 0 | 0 |
+  | `decaps` | `dk_pke ‖ sigma` | 16 | **14** | 0 | 0 |
+  | `keygen` | the seed | 6 | **4** | 0 | 0 |
+  | `encaps` | `m` (the FO secret) | 8 | **6** | 0 | 0 |
+  | `sampler` | the sampler seed | 4 | **2** | 0 | 0 |
 
-  Attribution on `decaps`: `prng.zig:289` **38×**, `gf256.zig:114` 4×,
-  `prng.zig:268` 3×, `gf256.zig:113` 3×, `reedsolomon` 2× (inlined, no line
-  info), `prng.zig:216` and `:223` 1× each.
+  Attribution on `decaps` (14): `gf256.zig:114` 4×, `gf256.zig:113` 3×,
+  `prng.zig:268` 3×, `reedsolomon` 2× (inlined, no line info),
+  `prng.zig:216` and `:223` 1× each. `keygen` (4) is `prng.zig:216` ×2 and
+  `:223` ×2; `encaps` (6) is `prng.zig:268` ×3, `gf256.zig:114` ×2 and
+  `reedsolomon` ×1.
 
-  The 38 are `writeSupportToVector`: `val |= btab & mask`, a masked select
-  with **no `if` in the source**. LLVM recognises the identity and rewrites
-  it back into a branch that loads `bit_tab[k]` only on the taken path.
-  Adjudicated in the disassembly as real `je`/`jne`/`jb`, not the known
-  `cmov` false positive. `gf256.zig:113` (`if (a == 0 or b == 0)`) and
-  `:114` (`if (s >= 255) s -= 255`) are branches on secret field elements
-  in the GF(256) multiply; `prng.zig:216/223/268` are the rejection loop's
-  own comparisons.
+  **What was removed, and how.** `prng.zig:289` was **38 of the old 52**:
+  `val |= btab & mask` in `writeSupportToVector`, a masked select with **no
+  `if` in the source**. LLVM recognised the identity and rewrote it back
+  into a branch that loads `bit_tab[k]` only on the taken path — adjudicated
+  in the disassembly as real `je`/`jne`/`jb`, not the known `cmov` false
+  positive. The mask is now laundered through
+  `asm volatile ("" : "+r" (mask))`: an opaque identity the compiler must
+  assume may have changed the value, so it can no longer prove the select.
+  The barrier is load-bearing — deleting it puts all 38 back — and
+  `scripts/ctgrind.sh --check` pins the count, so a deletion turns that red
+  instead of passing quietly.
 
-  ⚠ **It is WORSE in the mode a cautious consumer deploys.** Measured on
-  `decaps`: ReleaseFast 52, **ReleaseSafe 130**, Debug 38, ReleaseSmall 18.
-  The extra ReleaseSafe contexts are in `reedmuller.decodeSymbol`, where the
-  overflow checks on `expanded[…] += …` and the butterfly become branches on
-  secret-derived data. Only ReleaseFast is pinned, because a second mode
-  doubles the rows for a claim of the same shape.
+  **What it cost.** Measured before it was applied, min of 200 calls,
+  ReleaseFast `-Dcpu=native`, three alternating runs per arm; the spread
+  inside each arm was ≤1 %, so the gap is far outside the noise:
 
-  ⭐ **A candidate fix is measured and cheap, and is NOT applied here.**
-  Laundering the mask through an `asm volatile ("" : "+r" (mask))` barrier
-  in `writeSupportToVector` takes `decaps` from **52 in-file contexts to
-  14**, `keygen` from 26 to 4 and `encaps` from 33 to 6 — one line removing
-  38 of the 52. It is left for the fix campaign rather than slipped in with
-  the instrument: it changes crypto code and owes its own KAT and
-  performance evidence. `sampler` stays at 2 either way, because that target
-  drives the rejection loop and never reaches the scatter.
+  | op | without barrier | with barrier | delta |
+  |---|---:|---:|---:|
+  | `keypair` | 141 175 ns | 150 978 ns | **+6.9 %** |
+  | `encaps` | 274 923 ns | 298 035 ns | **+8.4 %** |
+  | `decaps` | 442 039 ns | 469 334 ns | **+6.2 %** |
+
+  Re-derive with [`src/bench.zig`](src/bench.zig) (`HQC_BENCH=1`), which was
+  written for this measurement. The trade taken: 38 secret-dependent branch
+  contexts out of the module's hottest secret path, for ~7 % on a PQ KEM.
+
+  Two independent checks that the barrier changed no VALUE: the full KAT
+  suite passes byte-exact in Debug, ReleaseSafe and ReleaseFast, and the
+  ctgrind table's output pin (`out_sha`, the harness's own printed bytes) is
+  unchanged for all four targets.
+
+  What remains — `gf256.zig:113` (`if (a == 0 or b == 0)`) and `:114`
+  (`if (s >= 255) s -= 255`), branches on secret field elements in the
+  GF(256) multiply, plus the rejection loop's own comparisons at
+  `prng.zig:216/223/268` — is untouched by this fix and is still a recorded
+  defect.
+
+  ⚠ **It is STILL WORSE in the mode a cautious consumer deploys, and the
+  barrier does not fix that.** Measured on `decaps`: ReleaseFast **14**,
+  **ReleaseSafe 92** (was 130 before the barrier). The remaining ~78 are in
+  `reedmuller.decodeSymbol`, where the overflow checks on `expanded[…] += …`
+  and the butterfly become branches on secret-derived data — a different
+  defect in the same module. Only ReleaseFast is pinned, because a second
+  mode doubles the rows for a claim of the same shape.
 
   ⚠ **Honest bound.** memcheck says "Conditional jump **or move**"; these
   were adjudicated as real jumps. Whether a key is *practically* extractable

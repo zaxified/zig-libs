@@ -33,10 +33,16 @@
 //!   `(K'[i] & result) ^ (K_bar[i] & ~result)` (reference's
 //!   `vect_compare`-based mask trick) — reproduced here bit-for-bit via
 //!   `ctCompare`, not a source-level `if`/`select`, so there is no
-//!   secret-dependent branch in the selection itself (though whether the
-//!   *compiler* keeps it branchless is, as with every constant-time claim
-//!   elsewhere in this arc, unverified by tooling — see prng.zig's
-//!   posture note).
+//!   secret-dependent branch in the selection itself. ⭐ As of 2026-09-09 the
+//!   second half of that sentence is no longer a hope: `scripts/ctgrind.sh`
+//!   measures `decaps` under memcheck with the decapsulation key tainted, and
+//!   NEITHER `ctCompare` NOR this selection appears among the remaining
+//!   contexts (`SPEC.md` lists all 14 by line, and they are in `gf256`'s
+//!   multiply and the rejection loop). The compiler does keep this one
+//!   branchless — unlike `prng.writeSupportToVector`, written in the same
+//!   style, where it did not and a barrier was needed. Which is the point:
+//!   "written branch-free" and "compiled branch-free" are different claims
+//!   and only the second one is measurable.
 
 const std = @import("std");
 const params = @import("params.zig");

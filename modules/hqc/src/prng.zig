@@ -273,6 +273,26 @@ pub fn sampleFixedWeightBiased(
 /// positions) into a bit-packed bit vector. Full constant-access-pattern
 /// scan (every output word tested against every support entry) matching
 /// the reference exactly — this is secret-key/randomness material.
+///
+/// ⛔⛔ THE MASK IS LAUNDERED, AND THE SOURCE BEING BRANCH-FREE IS NOT ENOUGH.
+/// `val |= btab & mask` has no `if` in it, and until 2026-09-09 that was the
+/// whole argument for calling this constant-time. It was wrong: LLVM
+/// recognises the select identity and rewrites it back into a branch that
+/// loads `bit_tab[k]` only on the taken path. Measured with ctgrind (memcheck,
+/// taint = the decapsulation key), this ONE loop was 38 of `decaps`'s 52
+/// secret-dependent branch contexts, and they were adjudicated in the
+/// disassembly as real `je`/`jne`/`jb`, not the known `cmov` false positive.
+///
+/// `asm volatile ("" : "+r" (mask))` is an opaque identity: the compiler must
+/// assume the asm block may have changed `mask`, so it can no longer prove the
+/// select and cannot re-derive the branch. Measured effect, ReleaseFast, in-file
+/// contexts: decaps 52 → 14, keygen 26 → 4, encaps 33 → 6. The remaining ones
+/// are elsewhere (`gf256.zig:113/114`, the rejection loop) and are recorded in
+/// `SPEC.md` and `scripts/ctgrind-expected.tsv`.
+///
+/// ⚠ The barrier is not decoration and must not be "cleaned up": deleting it
+/// puts the 38 back. `scripts/ctgrind.sh --check` pins the count, so a deletion
+/// turns that red rather than passing silently.
 pub fn writeSupportToVector(comptime weight: u16, support: *const [weight]u32, out: []u64) void {
     var index_tab: [weight]u32 = undefined;
     var bit_tab: [weight]u64 = undefined;
@@ -285,7 +305,10 @@ pub fn writeSupportToVector(comptime weight: u16, support: *const [weight]u32, o
         for (index_tab, bit_tab) |itab, btab| {
             const tmp = @as(u32, @intCast(i)) -% itab;
             const val1: u32 = 1 ^ ((tmp | (0 -% tmp)) >> 31);
-            const mask: u64 = 0 -% @as(u64, val1);
+            var mask: u64 = 0 -% @as(u64, val1);
+            asm volatile (""
+                : [m] "+r" (mask),
+            );
             val |= btab & mask;
         }
         word.* |= val;
